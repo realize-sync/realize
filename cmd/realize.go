@@ -20,7 +20,7 @@ var (
 	rootArg    = flag.String("root", "", "Directory to look for soft links in")
 	remoteArg  = flag.String("remote", "", "Remote directory to realize soft links for")
 	deleteArg  = flag.Bool("delete", false, "Delete linked file after copying")
-	bwLimitArg = flag.String("bwlimit", "", "Bandwidth limit, in bytes. Units: K, M, G")
+	bwLimitArg = flag.String("bwlimit", "", "Bandwidth limit per second. Units: B (default), K, M, G")
 	timeout    = flag.Duration("timeout", time.Duration(0), "Give up after that much time has passed.")
 )
 
