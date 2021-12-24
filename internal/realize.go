@@ -47,6 +47,9 @@ func RunRealize(ctx context.Context, root string, remote string, options Options
 				continue
 			}
 			if err := realize(ctx, target.remotePath, target.localPath, options.RateLimiter); err != nil {
+				if err == context.DeadlineExceeded || err == context.Canceled {
+					return err
+				}
 				logrus.Warnf("%s: failed to realize: %s", target.localPath, err)
 				errorCount++
 				continue

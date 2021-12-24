@@ -95,3 +95,17 @@ func TestDeleteOption(t *testing.T) {
 	// dir source1 should have been kept because it's not empty
 	assert.True(f.Exists("remote/sourcedir/source1"))
 }
+
+func TestTimeout(t *testing.T) {
+	assert := assert.New(t)
+
+	f := rtesting.SetupDir()
+	defer f.TearDown()
+
+	setupLocalRemote(f, 2)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 0)
+	defer cancel()
+	err := RunRealize(ctx, f.Path("local"), f.Path("remote"), Options{})
+	assert.Equal(context.DeadlineExceeded, err)
+}
