@@ -16,11 +16,18 @@ import (
 )
 
 type Options struct {
+	// If true, just print the soft links that were found.
+	DryRun bool
+
+	// If true, delete the remote file after realizing the soft links.
+	// Also deletes the containing directory, if it is empty.
+	Delete bool
+
+	// If non-nil, limit read rate (in bytes).
 	RateLimiter *rate.Limiter
-	Delete      bool
-	DryRun      bool
 }
 
+// RunRealize transforms soft links to remote in root into real links
 func RunRealize(ctx context.Context, root string, remote string, options Options) error {
 	processed := make(map[string]bool)
 	errorCount := 0
@@ -37,10 +44,8 @@ func RunRealize(ctx context.Context, root string, remote string, options Options
 			processed[target.localPath] = true
 			processedThisRound++
 			if options.DryRun {
-				fmt.Printf("%s -> %s\n", target.remotePath, target.localPath)
 				continue
 			}
-
 			if err := realize(ctx, target.remotePath, target.localPath, options.RateLimiter); err != nil {
 				logrus.Warnf("%s: failed to realize: %s", target.localPath, err)
 				errorCount++
@@ -50,7 +55,7 @@ func RunRealize(ctx context.Context, root string, remote string, options Options
 				err := os.Remove(target.remotePath)
 				logrus.Debugf("Delete %s -> %s", target.remotePath, err)
 				containingDir := filepath.Dir(target.remotePath)
-				if empty, _ := isEmpty(containingDir); empty {
+				if isEmpty(containingDir) {
 					err := os.Remove(containingDir)
 					logrus.Debugf("Delete dir %s -> %s", containingDir, err)
 				}
@@ -66,27 +71,30 @@ func RunRealize(ctx context.Context, root string, remote string, options Options
 	return nil
 }
 
-type targetDefinition struct {
+type target struct {
 	remotePath string
 	localPath  string
 }
 
-func collectTargets(root string, remote string) ([]*targetDefinition, error) {
+// collectTargets returns soft links within roots that point within remote
+func collectTargets(root string, remote string) ([]*target, error) {
 	remotePrefix := remote
 	if !strings.HasSuffix(remotePrefix, "/") {
 		remotePrefix += "/"
 	}
-	var targets []*targetDefinition
+	var targets []*target
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || (d.Type()&fs.ModeSymlink) == 0 {
-			return nil
+		if err != nil {
+			return err
 		}
-		dest, _ := os.Readlink(path)
-		if strings.HasPrefix(dest, remotePrefix) {
-			targets = append(targets, &targetDefinition{
-				remotePath: dest,
-				localPath:  path,
-			})
+		if (d.Type() & fs.ModeSymlink) != 0 {
+			dest, _ := os.Readlink(path)
+			if strings.HasPrefix(dest, remotePrefix) {
+				targets = append(targets, &target{
+					remotePath: dest,
+					localPath:  path,
+				})
+			}
 		}
 		return nil
 	})
@@ -107,8 +115,15 @@ func realize(ctx context.Context, remotePath string, localPath string, limiter *
 	if err = os.Rename(tempPath, localPath); err != nil {
 		return err
 	}
-	bytePerSecond := uint64(byteCount / uint64(time.Since(startTime)/time.Second))
-	logrus.Infof("%s: OK [%s/s]", localPath, bytefmt.ByteSize(bytePerSecond))
+	bytesPerSecond := float64(0)
+	duration := time.Since(startTime)
+	if duration != 0 {
+		bytesPerSecond = float64(byteCount) / float64(duration) * float64(time.Second)
+	}
+	logrus.Infof("%s: OK [%s, %s/s]",
+		localPath,
+		bytefmt.ByteSize(byteCount),
+		bytefmt.ByteSize(uint64(bytesPerSecond)))
 	return nil
 }
 
@@ -152,15 +167,16 @@ func copy(ctx context.Context, fromPath string, toPath string, limiter *rate.Lim
 	}
 }
 
-func isEmpty(name string) (bool, error) {
+// isEmpty returns true if the directory is empty.
+//
+// On error, the directory is considered non-empty.
+func isEmpty(name string) bool {
 	h, err := os.Open(name)
 	if err != nil {
-		return false, err
+		return false
 	}
 	defer h.Close()
 
-	if _, err = h.Readdir(1); err == io.EOF {
-		return true, nil
-	}
-	return false, err
+	_, err = h.Readdir(1)
+	return err == io.EOF
 }
