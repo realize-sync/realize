@@ -5,9 +5,12 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
+	"code.cloudfoundry.org/bytefmt"
 	"github.com/sirupsen/logrus"
 	realize "github.com/szermatt/realize/internal"
+	"golang.org/x/time/rate"
 )
 
 var (
@@ -17,7 +20,8 @@ var (
 	rootArg    = flag.String("root", "", "Directory to look for soft links in")
 	remoteArg  = flag.String("remote", "", "Remote directory to realize soft links for")
 	deleteArg  = flag.Bool("delete", false, "Delete linked file after copying")
-	bwLimitArg = flag.Int("bwlimit", 500, "Bandwidth limit, in kb/s")
+	bwLimitArg = flag.String("bwlimit", "", "Bandwidth limit, in bytes. Units: K, M, G")
+	timeout    = flag.Duration("timeout", time.Duration(0), "Give up after that much time has passed.")
 )
 
 func main() {
@@ -36,11 +40,38 @@ func main() {
 		logrus.Warn("Dry-run mode on")
 	}
 
-	if err := realize.RunRealize(
-		context.Background(), *rootArg, *remoteArg, *bwLimitArg, *deleteArg, *dryRunArg); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %s\n", err)
-		os.Exit(10)
+	options := realize.Options{
+		Delete: *deleteArg,
+		DryRun: *dryRunArg,
 	}
+	if len(*bwLimitArg) > 0 {
+		limitBytes := uint64(0)
+		var err error
+		limitBytes, err = bytefmt.ToBytes(*bwLimitArg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: invalid format for --bwlimit argument: %s", err)
+			os.Exit(1)
+		}
+		burstSize := min(int(limitBytes/10), 32*bytefmt.KILOBYTE)
+		options.RateLimiter = rate.NewLimiter(rate.Limit(limitBytes), burstSize)
+	}
+	ctx := context.Background()
+	if *timeout > 0 {
+		timeoutCtx, cancel := context.WithTimeout(ctx, *timeout)
+		defer cancel()
+		ctx = timeoutCtx
+	}
+	if err := realize.RunRealize(ctx, *rootArg, *remoteArg, options); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		os.Exit(1)
+	}
+}
+
+func min(a int, b int) int {
+	if b < a {
+		return b
+	}
+	return a
 }
 
 type PlainTextFormatter struct{}

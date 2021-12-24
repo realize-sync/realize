@@ -3,25 +3,25 @@ package internal
 import (
 	"context"
 	"fmt"
-	"golang.org/x/time/rate"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"code.cloudfoundry.org/bytefmt"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/time/rate"
 )
 
-const bufSize = 16
-
-type targetDefinition struct {
-	remotePath string
-	localPath  string
+type Options struct {
+	RateLimiter *rate.Limiter
+	Delete      bool
+	DryRun      bool
 }
 
-func RunRealize(ctx context.Context, root string, remote string, bwLimit int, delete bool, dryRun bool) error {
-	limiter := rate.NewLimiter(rate.Limit(bwLimit), bufSize)
+func RunRealize(ctx context.Context, root string, remote string, options Options) error {
 	processed := make(map[string]bool)
 	errorCount := 0
 	for {
@@ -36,19 +36,24 @@ func RunRealize(ctx context.Context, root string, remote string, bwLimit int, de
 			}
 			processed[target.localPath] = true
 			processedThisRound++
-			if dryRun {
+			if options.DryRun {
 				fmt.Printf("%s -> %s\n", target.remotePath, target.localPath)
 				continue
 			}
 
-			if err := realize(ctx, target.remotePath, target.localPath, limiter); err != nil {
+			if err := realize(ctx, target.remotePath, target.localPath, options.RateLimiter); err != nil {
 				logrus.Warnf("%s: failed to realize: %s", target.localPath, err)
 				errorCount++
 				continue
 			}
-			if delete {
-				os.Remove(target.remotePath)
-				// TODO: delete containing directory, if it's now empty
+			if options.Delete {
+				err := os.Remove(target.remotePath)
+				logrus.Debugf("Delete %s -> %s", target.remotePath, err)
+				containingDir := filepath.Dir(target.remotePath)
+				if empty, _ := isEmpty(containingDir); empty {
+					err := os.Remove(containingDir)
+					logrus.Debugf("Delete dir %s -> %s", containingDir, err)
+				}
 			}
 		}
 		if processedThisRound == 0 {
@@ -59,6 +64,11 @@ func RunRealize(ctx context.Context, root string, remote string, bwLimit int, de
 		return fmt.Errorf("Failed to realize %d/%d files.", errorCount, len(processed))
 	}
 	return nil
+}
+
+type targetDefinition struct {
+	remotePath string
+	localPath  string
 }
 
 func collectTargets(root string, remote string) ([]*targetDefinition, error) {
@@ -88,42 +98,69 @@ func realize(ctx context.Context, remotePath string, localPath string, limiter *
 	tempPath := localPath + ".part"
 	defer os.Remove(tempPath)
 
+	startTime := time.Now()
 	logrus.Debugf("%s -> %s...", remotePath, localPath)
-	if err := copy(ctx, remotePath, tempPath, limiter); err != nil {
+	byteCount, err := copy(ctx, remotePath, tempPath, limiter)
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tempPath, localPath); err != nil {
+	if err = os.Rename(tempPath, localPath); err != nil {
 		return err
 	}
-	logrus.Infof("%s: OK", localPath)
+	bytePerSecond := uint64(byteCount / uint64(time.Since(startTime)/time.Second))
+	logrus.Infof("%s: OK [%s/s]", localPath, bytefmt.ByteSize(bytePerSecond))
 	return nil
 }
 
 // copy does a rate-limited copy of a file.
-func copy(ctx context.Context, fromPath string, toPath string, limiter *rate.Limiter) error {
+func copy(ctx context.Context, fromPath string, toPath string, limiter *rate.Limiter) (uint64, error) {
 	source, err := os.Open(fromPath)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer source.Close()
 	dest, err := os.Create(toPath)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer dest.Close()
-	buf := make([]byte, bufSize*1024)
+	buf := make([]byte, 16*bytefmt.KILOBYTE)
+	byteCount := uint64(0)
 	for {
-		limiter.WaitN(ctx, bufSize)
+		var err error
+		if limiter != nil {
+			err = limiter.WaitN(ctx, len(buf))
+		} else {
+			err = ctx.Err()
+		}
+		if err != nil {
+			return byteCount, err
+		}
 		n, err := source.Read(buf)
 		if err != nil && err != io.EOF {
-			return err
+			return byteCount, err
 		}
 		if n == 0 {
-			return nil
+			return byteCount, nil
 		}
-
+		if n > 0 {
+			byteCount += uint64(n)
+		}
 		if _, err := dest.Write(buf[:n]); err != nil {
-			return err
+			return byteCount, err
 		}
 	}
+}
+
+func isEmpty(name string) (bool, error) {
+	h, err := os.Open(name)
+	if err != nil {
+		return false, err
+	}
+	defer h.Close()
+
+	if _, err = h.Readdir(1); err == io.EOF {
+		return true, nil
+	}
+	return false, err
 }
