@@ -29,6 +29,7 @@ type Options struct {
 
 // RunRealize transforms soft links to remote in root into real links
 func RunRealize(ctx context.Context, root string, remote string, options Options) error {
+	logrus.Debugf("Looking for symlinks to %s in %s...", remote, root)
 	processed := make(map[string]bool)
 	errorCount := 0
 	for {
@@ -44,23 +45,25 @@ func RunRealize(ctx context.Context, root string, remote string, options Options
 			processed[target.localPath] = true
 			processedThisRound++
 			if options.DryRun {
+				fmt.Printf("realize %s <- %s\n", target.localPath, target.remotePath)
 				continue
 			}
+			logrus.Debugf("realize %s <- %s\n", target.localPath, target.remotePath)
 			if err := realize(ctx, target.remotePath, target.localPath, options.RateLimiter); err != nil {
 				if err == context.DeadlineExceeded || err == context.Canceled {
-					return err
+					return fmt.Errorf("Timed out or cancelled. Realized %d files.", len(processed)-1)
 				}
-				logrus.Warnf("%s: failed to realize: %s", target.localPath, err)
+				logrus.Errorf("failed to realize %s: %s", target.localPath, err)
 				errorCount++
 				continue
 			}
 			if options.Delete {
 				err := os.Remove(target.remotePath)
-				logrus.Debugf("Delete %s -> %s", target.remotePath, err)
+				logrus.Debugf("Deleted %s: %s", target.remotePath, errorToString(err))
 				containingDir := filepath.Dir(target.remotePath)
 				if isEmpty(containingDir) {
 					err := os.Remove(containingDir)
-					logrus.Debugf("Delete dir %s -> %s", containingDir, err)
+					logrus.Debugf("Deleted dir %s: %s", containingDir, errorToString(err))
 				}
 			}
 		}
@@ -71,6 +74,7 @@ func RunRealize(ctx context.Context, root string, remote string, options Options
 	if errorCount > 0 {
 		return fmt.Errorf("Failed to realize %d/%d files.", errorCount, len(processed))
 	}
+	logrus.Debugf("Successfully realized %d files.", len(processed))
 	return nil
 }
 
@@ -110,7 +114,6 @@ func realize(ctx context.Context, remotePath string, localPath string, limiter *
 	defer os.Remove(tempPath)
 
 	startTime := time.Now()
-	logrus.Debugf("%s -> %s...", remotePath, localPath)
 	byteCount, err := copy(ctx, remotePath, tempPath, limiter)
 	if err != nil {
 		return err
@@ -145,14 +148,16 @@ func copy(ctx context.Context, fromPath string, toPath string, limiter *rate.Lim
 	buf := make([]byte, 16*bytefmt.KILOBYTE)
 	byteCount := uint64(0)
 	for {
-		var err error
-		if limiter != nil {
-			err = limiter.WaitN(ctx, len(buf))
-		} else {
-			err = ctx.Err()
+		if ctx.Err() != nil {
+			return byteCount, ctx.Err()
 		}
-		if err != nil {
-			return byteCount, err
+		if limiter != nil {
+			if err = limiter.WaitN(ctx, len(buf)); err != nil {
+				// This might fails when the deadline is about to be
+				// exceeded. Report it as if the deadline was exceeded
+				// already.
+				return byteCount, context.DeadlineExceeded
+			}
 		}
 		n, err := source.Read(buf)
 		if err != nil && err != io.EOF {
@@ -182,4 +187,12 @@ func isEmpty(name string) bool {
 
 	_, err = h.Readdir(1)
 	return err == io.EOF
+}
+
+// errorToString converts an error into a string.
+func errorToString(err error) string {
+	if err == nil {
+		return "OK"
+	}
+	return err.Error()
 }

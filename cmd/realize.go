@@ -54,12 +54,15 @@ func main() {
 		}
 		burstSize := min(int(limitBytes/10), 32*bytefmt.KILOBYTE)
 		options.RateLimiter = rate.NewLimiter(rate.Limit(limitBytes), burstSize)
+		logrus.Debugf("Bandwidth limit: %s/s", bytefmt.ByteSize(limitBytes))
 	}
 	ctx := context.Background()
 	if *timeout > 0 {
 		timeoutCtx, cancel := context.WithTimeout(ctx, *timeout)
 		defer cancel()
 		ctx = timeoutCtx
+		deadline, _ := ctx.Deadline()
+		logrus.Debugf("Stopping at %s", deadline.Local())
 	}
 	if err := realize.RunRealize(ctx, *rootArg, *remoteArg, options); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
