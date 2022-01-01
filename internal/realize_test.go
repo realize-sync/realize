@@ -105,8 +105,8 @@ func TestDeleteDirOption(t *testing.T) {
 
 	err := RunRealize(
 		context.Background(), f.Path("local"), f.Path("remote"), Options{
-			Delete:               true,
-			DeleteDirAndLeftover: true,
+			Delete:        true,
+			DeleteDirGlob: f.Path("remote/*dir/source?"),
 		})
 	assert.Nil(err)
 	assert.False(f.IsSymlink("local/dest0_dir/dest0"))
@@ -136,8 +136,8 @@ func TestDeleteDirOptionWithError(t *testing.T) {
 
 	err := RunRealize(
 		context.Background(), f.Path("local"), f.Path("remote"), Options{
-			Delete:               true,
-			DeleteDirAndLeftover: true,
+			Delete:        true,
+			DeleteDirGlob: f.Path("remote/*dir/source?"),
 		})
 	assert.NotNil(err)
 	assert.Equal("Failed to realize 1/3 files.", err.Error())

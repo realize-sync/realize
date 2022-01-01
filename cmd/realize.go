@@ -20,7 +20,7 @@ var (
 	rootArg      = flag.String("root", "", "Directory to look for soft links in")
 	remoteArg    = flag.String("remote", "", "Remote directory to realize soft links for")
 	deleteArg    = flag.Bool("delete", false, "Delete linked file after copying")
-	deleteDirArg = flag.Bool("deletedir", false, "After deleting the file, delete containing directory and leftover files")
+	deleteDirArg = flag.String("deletedir", "", "After deleting the file, delete containing directory if pattern matches")
 	bwLimitArg   = flag.String("bwlimit", "", "Bandwidth limit per second. Units: B (default), K, M, G")
 	timeout      = flag.Duration("timeout", time.Duration(0), "Give up after that much time has passed.")
 )
@@ -42,9 +42,9 @@ func main() {
 	}
 
 	options := realize.Options{
-		Delete:               *deleteArg,
-		DeleteDirAndLeftover: *deleteDirArg,
-		DryRun:               *dryRunArg,
+		Delete:        *deleteArg,
+		DeleteDirGlob: *deleteDirArg,
+		DryRun:        *dryRunArg,
 	}
 	if len(*bwLimitArg) > 0 {
 		limitBytes := uint64(0)

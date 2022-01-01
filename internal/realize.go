@@ -23,9 +23,9 @@ type Options struct {
 	// Also deletes the containing directory, if it is empty.
 	Delete bool
 
-	// If true, delete containing directory and leftover files after
-	// deleting the file.
-	DeleteDirAndLeftover bool
+	// If true, delete containing directory and any leftover files
+	// after deleting the file, if the globbing pattern matches.
+	DeleteDirGlob string
 
 	// If non-nil, limit read rate (in bytes).
 	RateLimiter *rate.Limiter
@@ -55,6 +55,9 @@ func RunRealize(ctx context.Context, root string, remote string, options Options
 			}
 			logrus.Debugf("realize %s <- %s\n", target.localPath, target.remotePath)
 			dir := filepath.Dir(target.remotePath)
+			if _, ok := containingDirs[dir]; !ok {
+				containingDirs[dir] = true
+			}
 			if err := realize(ctx, target.remotePath, target.localPath, options.RateLimiter); err != nil {
 				if err == context.DeadlineExceeded || err == context.Canceled {
 					return fmt.Errorf("Timed out or cancelled. Realized %d files.", len(processed)-1)
@@ -67,20 +70,26 @@ func RunRealize(ctx context.Context, root string, remote string, options Options
 			if options.Delete {
 				err := os.Remove(target.remotePath)
 				logrus.Debugf("Deleted %s: %s", target.remotePath, errorToString(err))
-				if _, ok := containingDirs[dir]; !ok {
-					containingDirs[dir] = true
-				}
 			}
 		}
 		if processedThisRound == 0 {
 			break
 		}
-		if options.DeleteDirAndLeftover {
+		if len(options.DeleteDirGlob) > 0 {
 			for dir, shouldDelete := range containingDirs {
-				if !shouldDelete {
+				matched, err := filepath.Match(options.DeleteDirGlob, dir)
+				if err != nil {
+					return err
+				}
+				if !matched {
+					logrus.Debugf("Not deleting dir %s; pattern %s doesn't match", dir, options.DeleteDirGlob)
 					continue
 				}
-				err := os.RemoveAll(dir)
+				if !shouldDelete {
+					logrus.Debugf("Not deleting dir %s because of errors", dir)
+					continue
+				}
+				err = os.RemoveAll(dir)
 				logrus.Debugf("Deleted dir %s: %s", dir, errorToString(err))
 			}
 		}
