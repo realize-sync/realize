@@ -77,7 +77,7 @@ func TestDeleteOption(t *testing.T) {
 	defer f.TearDown()
 
 	setupLocalRemote(f, 2)
-	f.Touch("remote/sourcedir/source1/force_keep")
+	f.Touch("remote/sourcedir/source1/leftover")
 
 	err := RunRealize(
 		context.Background(), f.Path("local"), f.Path("remote"), Options{
@@ -89,11 +89,63 @@ func TestDeleteOption(t *testing.T) {
 	assert.False(f.Exists("remote/sourcedir/source0/content0"))
 	assert.False(f.Exists("remote/sourcedir/source1/content1"))
 
-	// dir source0 has been deleted
-	assert.False(f.Exists("remote/sourcedir/source0"))
-
-	// dir source1 should have been kept because it's not empty
+	// dirs should not have been deleted
+	assert.True(f.Exists("remote/sourcedir/source0"))
 	assert.True(f.Exists("remote/sourcedir/source1"))
+}
+
+func TestDeleteDirOption(t *testing.T) {
+	assert := assert.New(t)
+
+	f := rtesting.SetupDir()
+	defer f.TearDown()
+
+	setupLocalRemote(f, 2)
+	f.Touch("remote/sourcedir/source1/leftover")
+
+	err := RunRealize(
+		context.Background(), f.Path("local"), f.Path("remote"), Options{
+			Delete:               true,
+			DeleteDirAndLeftover: true,
+		})
+	assert.Nil(err)
+	assert.False(f.IsSymlink("local/dest0_dir/dest0"))
+	assert.False(f.IsSymlink("local/dest1_dir/dest1"))
+	assert.False(f.Exists("remote/sourcedir/source0/content0"))
+	assert.False(f.Exists("remote/sourcedir/source1/content1"))
+
+	// dirs should have been deleted
+	assert.False(f.Exists("remote/sourcedir/source0"))
+	assert.False(f.Exists("remote/sourcedir/source1"))
+}
+
+func TestDeleteDirOptionWithError(t *testing.T) {
+	assert := assert.New(t)
+
+	f := rtesting.SetupDir()
+	defer f.TearDown()
+
+	f.MakeDir("remote/sourcedir")
+	f.MakeDir("local")
+	f.WriteFile("remote/sourcedir/source0/content0", "content")
+	f.WriteFile("remote/sourcedir/source0/content1", "content")
+	f.SymLink("remote/sourcedir/source0/content0", "local/dest0")
+	f.SymLink("remote/sourcedir/source0/content1", "local/dest1")
+	// content2 doesn't exist
+	f.SymLink("remote/sourcedir/source0/content2", "local/dest2")
+
+	err := RunRealize(
+		context.Background(), f.Path("local"), f.Path("remote"), Options{
+			Delete:               true,
+			DeleteDirAndLeftover: true,
+		})
+	assert.NotNil(err)
+	assert.Equal("Failed to realize 1/3 files.", err.Error())
+	assert.False(f.IsSymlink("local/dest0"))
+	assert.False(f.IsSymlink("local/dest1"))
+	assert.True(f.IsSymlink("local/dest2"))
+
+	assert.True(f.Exists("remote/sourcedir"))
 }
 
 func TestTimeout(t *testing.T) {
@@ -107,5 +159,5 @@ func TestTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 0)
 	defer cancel()
 	err := RunRealize(ctx, f.Path("local"), f.Path("remote"), Options{})
-	assert.Equal(context.DeadlineExceeded, err)
+	assert.Equal("Timed out or cancelled. Realized 0 files.", err.Error())
 }

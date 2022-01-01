@@ -23,6 +23,10 @@ type Options struct {
 	// Also deletes the containing directory, if it is empty.
 	Delete bool
 
+	// If true, delete containing directory and leftover files after
+	// deleting the file.
+	DeleteDirAndLeftover bool
+
 	// If non-nil, limit read rate (in bytes).
 	RateLimiter *rate.Limiter
 }
@@ -31,6 +35,7 @@ type Options struct {
 func RunRealize(ctx context.Context, root string, remote string, options Options) error {
 	logrus.Debugf("Looking for symlinks to %s in %s...", remote, root)
 	processed := make(map[string]bool)
+	containingDirs := make(map[string]bool)
 	errorCount := 0
 	for {
 		targets, err := collectTargets(root, remote)
@@ -49,26 +54,35 @@ func RunRealize(ctx context.Context, root string, remote string, options Options
 				continue
 			}
 			logrus.Debugf("realize %s <- %s\n", target.localPath, target.remotePath)
+			dir := filepath.Dir(target.remotePath)
 			if err := realize(ctx, target.remotePath, target.localPath, options.RateLimiter); err != nil {
 				if err == context.DeadlineExceeded || err == context.Canceled {
 					return fmt.Errorf("Timed out or cancelled. Realized %d files.", len(processed)-1)
 				}
 				logrus.Errorf("failed to realize %s: %s", target.localPath, err)
 				errorCount++
+				containingDirs[dir] = false
 				continue
 			}
 			if options.Delete {
 				err := os.Remove(target.remotePath)
 				logrus.Debugf("Deleted %s: %s", target.remotePath, errorToString(err))
-				containingDir := filepath.Dir(target.remotePath)
-				if isEmpty(containingDir) {
-					err := os.Remove(containingDir)
-					logrus.Debugf("Deleted dir %s: %s", containingDir, errorToString(err))
+				if _, ok := containingDirs[dir]; !ok {
+					containingDirs[dir] = true
 				}
 			}
 		}
 		if processedThisRound == 0 {
 			break
+		}
+		if options.DeleteDirAndLeftover {
+			for dir, shouldDelete := range containingDirs {
+				if !shouldDelete {
+					continue
+				}
+				err := os.RemoveAll(dir)
+				logrus.Debugf("Deleted dir %s: %s", dir, errorToString(err))
+			}
 		}
 	}
 	if errorCount > 0 {
@@ -173,20 +187,6 @@ func copy(ctx context.Context, fromPath string, toPath string, limiter *rate.Lim
 			return byteCount, err
 		}
 	}
-}
-
-// isEmpty returns true if the directory is empty.
-//
-// On error, the directory is considered non-empty.
-func isEmpty(name string) bool {
-	h, err := os.Open(name)
-	if err != nil {
-		return false
-	}
-	defer h.Close()
-
-	_, err = h.Readdir(1)
-	return err == io.EOF
 }
 
 // errorToString converts an error into a string.

@@ -14,14 +14,15 @@ import (
 )
 
 var (
-	verboseArg = flag.Bool("v", false, "Enable verbose output.")
-	debugArg   = flag.Bool("debug", false, "Enable debug output.")
-	dryRunArg  = flag.Bool("n", false, "Enable dry-run mode.")
-	rootArg    = flag.String("root", "", "Directory to look for soft links in")
-	remoteArg  = flag.String("remote", "", "Remote directory to realize soft links for")
-	deleteArg  = flag.Bool("delete", false, "Delete linked file after copying")
-	bwLimitArg = flag.String("bwlimit", "", "Bandwidth limit per second. Units: B (default), K, M, G")
-	timeout    = flag.Duration("timeout", time.Duration(0), "Give up after that much time has passed.")
+	verboseArg   = flag.Bool("v", false, "Enable verbose output.")
+	debugArg     = flag.Bool("debug", false, "Enable debug output.")
+	dryRunArg    = flag.Bool("n", false, "Enable dry-run mode.")
+	rootArg      = flag.String("root", "", "Directory to look for soft links in")
+	remoteArg    = flag.String("remote", "", "Remote directory to realize soft links for")
+	deleteArg    = flag.Bool("delete", false, "Delete linked file after copying")
+	deleteDirArg = flag.Bool("deletedir", false, "After deleting the file, delete containing directory and leftover files")
+	bwLimitArg   = flag.String("bwlimit", "", "Bandwidth limit per second. Units: B (default), K, M, G")
+	timeout      = flag.Duration("timeout", time.Duration(0), "Give up after that much time has passed.")
 )
 
 func main() {
@@ -41,8 +42,9 @@ func main() {
 	}
 
 	options := realize.Options{
-		Delete: *deleteArg,
-		DryRun: *dryRunArg,
+		Delete:               *deleteArg,
+		DeleteDirAndLeftover: *deleteDirArg,
+		DryRun:               *dryRunArg,
 	}
 	if len(*bwLimitArg) > 0 {
 		limitBytes := uint64(0)
