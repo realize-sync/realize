@@ -141,6 +141,9 @@ func realize(ctx context.Context, remotePath string, localPath string, limiter *
 	if err != nil {
 		return err
 	}
+	if err = copyTimestamp(remotePath, tempPath); err != nil {
+		logrus.Warnf("%s: failed to copy timestamps: %s", localPath, err)
+	}
 	if err = os.Rename(tempPath, localPath); err != nil {
 		return err
 	}
@@ -196,6 +199,15 @@ func copy(ctx context.Context, fromPath string, toPath string, limiter *rate.Lim
 			return byteCount, err
 		}
 	}
+}
+
+// copyTimestamp copies the mtime of source to dest.
+func copyTimestamp(source string, dest string) error {
+	info, err := os.Stat(source)
+	if err != nil {
+		return err
+	}
+	return os.Chtimes(dest, time.Now(), info.ModTime())
 }
 
 // errorToString converts an error into a string.

@@ -3,7 +3,9 @@ package internal
 import (
 	"context"
 	"fmt"
+	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 
@@ -160,4 +162,28 @@ func TestTimeout(t *testing.T) {
 	defer cancel()
 	err := RunRealize(ctx, f.Path("local"), f.Path("remote"), Options{})
 	assert.Equal("Timed out or cancelled. Realized 0 files.", err.Error())
+}
+
+func TestCopyTimestamp(t *testing.T) {
+	assert := assert.New(t)
+
+	f := rtesting.SetupDir()
+	defer f.TearDown()
+
+	setupLocalRemote(f, 1)
+
+	mtime := time.Date(2006, time.February, 1, 3, 4, 5, 0, time.Local)
+	atime := time.Date(2007, time.March, 2, 4, 5, 6, 0, time.Local)
+	if err := os.Chtimes(f.Path("remote/sourcedir/source0/content0"), atime, mtime); err != nil {
+		panic(err)
+	}
+
+	err := RunRealize(
+		context.Background(), f.Path("local"), f.Path("remote"), Options{})
+	assert.Nil(err)
+	assert.False(f.IsSymlink("local/dest0_dir/dest0"))
+
+	info, err := os.Stat(f.Path("local/dest0_dir/dest0"))
+	assert.Nil(err)
+	assert.Equal(mtime, info.ModTime())
 }
