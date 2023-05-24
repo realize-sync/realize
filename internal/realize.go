@@ -27,6 +27,9 @@ type Options struct {
 	// after deleting the file, if the globbing pattern matches.
 	DeleteDirGlob string
 
+	// If true, delete dangling soft links pointing to the remote directory.
+	DeleteDangling bool
+
 	// If non-nil, limit read rate (in bytes).
 	RateLimiter *rate.Limiter
 }
@@ -49,6 +52,17 @@ func RunRealize(ctx context.Context, root string, remote string, options Options
 			}
 			processed[target.localPath] = true
 			processedThisRound++
+			if fileDoesNotExist(target.remotePath) {
+				if options.DeleteDangling {
+					if options.DryRun {
+						fmt.Printf("delete dangling link %s <- (not found) %s\n", target.localPath, target.remotePath)
+					} else {
+						err := os.Remove(target.localPath)
+						logrus.Debugf("Deleted dangling link %s: %s", target.localPath, errorToString(err))
+					}
+				}
+				continue
+			}
 			if options.DryRun {
 				fmt.Printf("realize %s <- %s\n", target.localPath, target.remotePath)
 				continue
@@ -216,4 +230,13 @@ func errorToString(err error) string {
 		return "OK"
 	}
 	return err.Error()
+}
+
+// fileDoesNotExist returns true if the file doesn't exist.
+//
+// It returns false if the file exists OR if accessing the file failed
+// for some reason.
+func fileDoesNotExist(path string) bool {
+	_, err := os.Stat(path)
+	return os.IsNotExist(err)
 }

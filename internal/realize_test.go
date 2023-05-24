@@ -121,7 +121,7 @@ func TestDeleteDirOption(t *testing.T) {
 	assert.False(f.Exists("remote/sourcedir/source1"))
 }
 
-func TestDeleteDirOptionWithError(t *testing.T) {
+func TestDeleteDirOptionKeepDangling(t *testing.T) {
 	assert := assert.New(t)
 
 	f := rtesting.SetupDir()
@@ -130,22 +130,51 @@ func TestDeleteDirOptionWithError(t *testing.T) {
 	f.MakeDir("remote/sourcedir")
 	f.MakeDir("local")
 	f.WriteFile("remote/sourcedir/source0/content0", "content")
-	f.WriteFile("remote/sourcedir/source0/content1", "content")
+	f.WriteFile("remote/sourcedir/source0/content2", "content")
 	f.SymLink("remote/sourcedir/source0/content0", "local/dest0")
+	// content1 doesn't exist; it's just skipped
 	f.SymLink("remote/sourcedir/source0/content1", "local/dest1")
-	// content2 doesn't exist
 	f.SymLink("remote/sourcedir/source0/content2", "local/dest2")
 
 	err := RunRealize(
 		context.Background(), f.Path("local"), f.Path("remote"), Options{
-			Delete:        true,
-			DeleteDirGlob: f.Path("remote/*dir/source?"),
+			Delete:         true,
+			DeleteDirGlob:  f.Path("remote/*dir/source?"),
+			DeleteDangling: false,
 		})
-	assert.NotNil(err)
-	assert.Equal("Failed to realize 1/3 files.", err.Error())
+	assert.Nil(err)
 	assert.False(f.IsSymlink("local/dest0"))
-	assert.False(f.IsSymlink("local/dest1"))
-	assert.True(f.IsSymlink("local/dest2"))
+	assert.True(f.IsSymlink("local/dest1"))
+	assert.False(f.IsSymlink("local/dest2"))
+
+	assert.True(f.Exists("remote/sourcedir"))
+}
+
+func TestDeleteDirOptionDeleteDangling(t *testing.T) {
+	assert := assert.New(t)
+
+	f := rtesting.SetupDir()
+	defer f.TearDown()
+
+	f.MakeDir("remote/sourcedir")
+	f.MakeDir("local")
+	f.WriteFile("remote/sourcedir/source0/content0", "content")
+	f.WriteFile("remote/sourcedir/source0/content2", "content")
+	f.SymLink("remote/sourcedir/source0/content0", "local/dest0")
+	// content1 doesn't exist; the symlink is deleted
+	f.SymLink("remote/sourcedir/source0/content1", "local/dest1")
+	f.SymLink("remote/sourcedir/source0/content2", "local/dest2")
+
+	err := RunRealize(
+		context.Background(), f.Path("local"), f.Path("remote"), Options{
+			Delete:         true,
+			DeleteDirGlob:  f.Path("remote/*dir/source?"),
+			DeleteDangling: true,
+		})
+	assert.Nil(err)
+	assert.False(f.IsSymlink("local/dest0"))
+	assert.False(f.Exists("local/dest1"))
+	assert.False(f.IsSymlink("local/dest2"))
 
 	assert.True(f.Exists("remote/sourcedir"))
 }
