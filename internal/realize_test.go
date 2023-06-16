@@ -107,8 +107,8 @@ func TestDeleteDirOption(t *testing.T) {
 
 	err := RunRealize(
 		context.Background(), f.Path("local"), f.Path("remote"), Options{
-			Delete:        true,
-			DeleteDirGlob: f.Path("remote/*dir/source?"),
+			Delete:          true,
+			DeleteDirRegexp: f.Path("remote/[^/]*dir/source."),
 		})
 	assert.Nil(err)
 	assert.False(f.IsSymlink("local/dest0_dir/dest0"))
@@ -138,9 +138,9 @@ func TestDeleteDirOptionKeepDangling(t *testing.T) {
 
 	err := RunRealize(
 		context.Background(), f.Path("local"), f.Path("remote"), Options{
-			Delete:         true,
-			DeleteDirGlob:  f.Path("remote/*dir/source?"),
-			DeleteDangling: false,
+			Delete:          true,
+			DeleteDirRegexp: f.Path("remote/[^/]*dir/source."),
+			DeleteDangling:  false,
 		})
 	assert.Nil(err)
 	assert.False(f.IsSymlink("local/dest0"))
@@ -167,9 +167,9 @@ func TestDeleteDirOptionDeleteDangling(t *testing.T) {
 
 	err := RunRealize(
 		context.Background(), f.Path("local"), f.Path("remote"), Options{
-			Delete:         true,
-			DeleteDirGlob:  f.Path("remote/*dir/source?"),
-			DeleteDangling: true,
+			Delete:          true,
+			DeleteDirRegexp: f.Path("remote/[^/]*dir/source."),
+			DeleteDangling:  true,
 		})
 	assert.Nil(err)
 	assert.False(f.IsSymlink("local/dest0"))

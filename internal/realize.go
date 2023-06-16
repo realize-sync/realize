@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -25,7 +26,7 @@ type Options struct {
 
 	// If true, delete containing directory and any leftover files
 	// after deleting the file, if the globbing pattern matches.
-	DeleteDirGlob string
+	DeleteDirRegexp string
 
 	// If true, delete dangling soft links pointing to the remote directory.
 	DeleteDangling bool
@@ -89,14 +90,14 @@ func RunRealize(ctx context.Context, root string, remote string, options Options
 		if processedThisRound == 0 {
 			break
 		}
-		if len(options.DeleteDirGlob) > 0 {
+		if len(options.DeleteDirRegexp) > 0 {
 			for dir, shouldDelete := range containingDirs {
-				matched, err := filepath.Match(options.DeleteDirGlob, dir)
+				matched, err := regexp.MatchString(options.DeleteDirRegexp, dir)
 				if err != nil {
 					return err
 				}
 				if !matched {
-					logrus.Debugf("Not deleting dir %s; pattern %s doesn't match", dir, options.DeleteDirGlob)
+					logrus.Debugf("Not deleting dir %s; pattern %s doesn't match", dir, options.DeleteDirRegexp)
 					continue
 				}
 				if !shouldDelete {
