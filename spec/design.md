@@ -219,31 +219,45 @@ authority).
 
 Implemented using rust
 
-- Continue interrupted syncing of large files: https://crates.io/crates/fast_rsync
+- Continue interrupted syncing of large files:
+  https://crates.io/crates/fast_rsync version 0.2
 
-- Verify files after sync, before delete: https://crates.io/crates/sha2
+- Verify files after sync, before delete:
+  https://crates.io/crates/sha2 version 0.10
 
-- RPC: https://crates.io/crates/tarpc
+- RPC: https://crates.io/crates/tarpc version 0.36
 
-- Security: https://crates.io/crates/rustls (using TLS, likely through tokio)
+- Security: https://crates.io/crates/rustls through tokie_rultls
   Example: https://github.com/google/tarpc/blob/master/tarpc/examples/tls_over_tcp.rs
 
-- Command-line parsing: https://crates.io/crates/clap (with derive feature)
+- Command-line parsing: https://crates.io/crates/clap (with derive
+  feature) version 4.5
 
-- Progress output on the command line: https://crates.io/crates/indicatif
+- Progress output on the command line:
+  https://crates.io/crates/indicatif version 0.17
 
-- Errors: https://crates.io/crates/anyhow, https://docs.rs/thiserror/latest/thiserror/
+- Errors: https://crates.io/crates/anyhow version 1.0,
+          https://docs.rs/thiserror/latest/thiserror/ version 2.0
 
-- Logging: env_logger
+- Logging: env_logger version 0.11
 
   (Note, however, that logging should only be for debugging the
   library. Command-line output and printing errors must be done by the
   command.)
 
+- async, task, network connections and futures: tokio version 1.45
+
 - Testing utilities (as needed):
-  - assert_fs: fixtures (tempdir) and assertions to work with files
-  - dir-diff: compare the content of two directories
-  - assert_cmd: running a command and checking its status and output, for integration tests
-  - predicates-rs: general predicates
-  - assert_unordered: assert for comparing containers
+
+  - assert_fs v1.1: fixtures (tempdir) and assertions to work with
+    files
+
+  - dir-diff v0.3: compare the content of two directories
+
+  - assert_cmd v2.0: running a command and checking its status and
+    output, for integration tests
+
+  - predicates-rs v3.0: general predicates
+
+  - assert_unordered v0.3: assert for comparing containers
 
