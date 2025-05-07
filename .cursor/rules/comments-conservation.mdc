@@ -1,0 +1,54 @@
+---
+description:
+globs: *.rs
+alwaysApply: false
+---
+# Comments Conservation Rule
+
+This rule enforces that all comments (including doc comments and
+inline comments) must be preserved during code moves and refactorings.
+Comments should be updated if the code they refer to changes, but must
+not be removed or lost.
+
+<rule>
+name: comments_conservation
+
+description: Enforces that comments are preserved and updated during code moves and refactorings
+filters:
+  - type: event
+    pattern: "code_move|refactor"
+    file_pattern: "*.rs"
+
+actions:
+  - type: validate
+    patterns:
+      - pattern: "//|///"
+        message: "All comments must be preserved and updated as needed during code moves and refactorings. Do not remove or lose comments."
+  - type: suggest
+    message: |
+      When moving or refactoring code:
+      1. Copy all doc comments (///) and inline comments (//) with the code.
+      2. Update comments if the code's context or meaning changes.
+      3. Never remove comments unless they are clearly obsolete or misleading after the change.
+      4. Review all comments after a move/refactor to ensure they are still accurate.
+
+examples:
+  - input: |
+      // Bad: Comments lost during move
+      // This function does X
+      fn foo() {}
+      // ...move foo() to another file, but omit the comment...
+
+      // Good: Comments preserved
+      // This function does X
+      fn foo() {}
+
+      // Good: Comments updated if needed
+      // This function does Y (updated after refactor)
+      fn foo() {}
+    output: "Always preserve and update comments during code moves and refactorings."
+
+metadata:
+  priority: high
+  version: 1.0
+</rule>

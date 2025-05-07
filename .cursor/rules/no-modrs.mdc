@@ -1,0 +1,36 @@
+---
+description: NEVER create any mod.rs file
+globs: mod.rs
+alwaysApply: false
+---
+# NEVER create any mod.rs file
+
+This rule enforces that module root files must not be named `mod.rs`. Instead, use `modulename.rs` for all module roots.
+
+<rule>
+name: no_modrs
+filters:
+  - type: file
+    pattern: "mod.rs"
+actions:
+  - type: reject
+    message: |
+      Do not use mod.rs for module roots. Use modulename.rs instead (e.g., src/media.rs, src/commands.rs).
+  - type: suggest
+    message: |
+      Please rename any mod.rs file to modulename.rs and update all references accordingly.
+examples:
+  - input: |
+      // Bad
+      src/media/mod.rs
+      src/commands/mod.rs
+    output: |
+      // Good
+      src/media.rs
+      src/commands.rs
+metadata:
+  priority: high
+  version: 1.0
+  rationale: |
+    Using modulename.rs for module roots improves discoverability and avoids confusion. The mod.rs pattern is deprecated in modern Rust projects.
+</rule>

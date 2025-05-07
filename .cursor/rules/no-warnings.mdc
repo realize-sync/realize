@@ -1,0 +1,65 @@
+---
+description: No Warnings
+globs: *.rs
+alwaysApply: false
+---
+# No Warnings
+
+This rule ensures that code cannot be committed if it generates any Rust compiler warnings.
+
+<rule>
+name: no_warnings
+description: Prevents commits that would introduce Rust compiler warnings
+filters:
+  - type: event
+    pattern: "pre_commit"
+    file_pattern: "*.rs"
+
+actions:
+  - type: shell
+    command: "RUSTFLAGS='-D warnings' cargo build"
+    on_error:
+      type: reject
+      message: |
+        Build failed because warnings are treated as errors.
+        Fix all warnings before committing.
+        Run `cargo build` to see the warnings.
+
+  - type: suggest
+    message: |
+      Common warnings to fix:
+      1. Unused variables: prefix with _ or remove
+      2. Dead code: remove unused functions and types
+      3. Unused imports: remove them
+      4. Missing documentation: add doc comments
+      5. Type inference issues: specify types explicitly
+      6. Pattern matching issues: handle all cases
+
+examples:
+  - input: |
+      // Bad: Unused variable
+      fn process(data: String) {
+          let size = data.len(); // Warning: unused variable
+          println!("Processing {}", data);
+      }
+
+      // Good: Either use the variable or prefix with _
+      fn process(data: String) {
+          let _size = data.len(); // No warning
+          println!("Processing {}", data);
+      }
+
+      // Bad: Unused import
+      use std::collections::HashMap; // Warning if not used
+      
+      // Good: Only import what you use
+      use std::fmt::Write;
+      fn main() {
+          let mut s = String::new();
+          write!(s, "Hello").unwrap();
+      }
+    output: "Fix all warnings before committing"
+
+metadata:
+  priority: high
+  version: 1.0

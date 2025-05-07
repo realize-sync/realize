@@ -1,0 +1,28 @@
+---
+description: Cargo Format Pre-Commit
+globs: *.rs
+alwaysApply: false
+---
+# Cargo Format Pre-Commit
+
+This rule ensures that `cargo fmt` is run before committing any Rust files.
+
+<rule>
+name: cargo_fmt_precommit
+description: Runs cargo fmt before committing Rust files
+filters:
+  - type: event
+    pattern: "pre_commit"
+    file_pattern: "*.rs"
+
+actions:
+  - type: shell
+    command: "cargo fmt"
+    on_error:
+      type: reject
+      message: "Please run cargo fmt before committing"
+
+metadata:
+  priority: high
+  version: 1.0
+</rule>

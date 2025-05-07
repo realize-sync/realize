@@ -1,0 +1,72 @@
+---
+description: No Unused Code
+globs: *.rs
+alwaysApply: false
+---
+# No Unused Code
+
+This rule ensures that no unused code exists in the codebase, even if it might be useful in the future.
+
+<rule>
+name: no_unused_code
+description: Enforces that all code must be used by the command-line tool
+filters:
+  - type: event
+    pattern: "pre_commit"
+    file_pattern: "*.rs"
+
+actions:
+  - type: shell
+    command: "cargo build"
+    on_error:
+      type: reject
+      message: "Build failed"
+    on_output:
+      type: reject
+      pattern: "warning: (.*) is never used"
+      message: |
+        Unused code detected. Remove it even if it might be useful in the future.
+        Code should only exist if it's currently used by the command-line tool.
+        If you need this functionality later, you can add it back then.
+
+  - type: suggest
+    message: |
+      To fix unused code warnings:
+      1. Remove unused functions, methods, and types completely
+      2. Don't keep code just because it might be useful in the future
+      3. Don't use #[allow(dead_code)] - remove the code instead
+      4. For test-only code, either:
+         - Remove it if the tests can be rewritten to use public API
+         - Move it to the test module if absolutely necessary
+         - Test-only code only allowed on "testing" submodules,
+           providing test utilities for a given module.
+
+examples:
+  - input: |
+      // Bad: Keeping unused code with allow attribute
+      #[allow(dead_code)]
+      fn might_be_useful_later() {}
+
+      // Bad: Test-only code in main implementation
+      impl Foo {
+          #[cfg(test)]
+          pub fn test_only_method() {}
+      }
+
+      // Good: Only used code
+      impl Foo {
+          pub fn actually_used_method() {}
+      }
+
+      // Good: Test code in test module
+      #[cfg(test)]
+      mod tests {
+          impl super::Foo {
+              fn test_helper() {}
+          }
+      }
+    output: "Remove unused code and move test code to test modules"
+
+metadata:
+  priority: high
+  version: 1.0

@@ -1,0 +1,82 @@
+---
+description:
+globs:
+alwaysApply: false
+---
+# Integration Test Organization
+
+This rule enforces proper organization and implementation of integration tests.
+
+<rule>
+name: integration_test_organization
+description: Enforces proper integration test organization and implementation
+
+filters:
+  - type: file
+    pattern: "tests/*_integration_test.rs"
+
+actions:
+  # Enforce file naming convention
+  - type: reject
+    conditions:
+      - pattern: "tests/integration/"
+        message: "Integration tests must be in tests/ directory with _integration_test.rs suffix"
+
+  # Enforce use of assert_cmd::Command
+  - type: reject
+    conditions:
+      - pattern: "env!\\(\"CARGO_BIN_EXE_hoarder\"\\)"
+        message: "Use Command::cargo_bin(\"hoarder\") instead of env!(\"CARGO_BIN_EXE_hoarder\")"
+      - pattern: "std::process::Command"
+        message: "Use assert_cmd::Command instead of std::process::Command"
+
+  # Enforce required imports
+  - type: validate
+    patterns:
+      - pattern: "use assert_cmd::Command;"
+        message: "Integration tests must use assert_cmd::Command"
+      - pattern: "use assert_fs::(TempDir|prelude::*);"
+        message: "Integration tests should use assert_fs for file system operations"
+
+  # Enforce test function structure
+  - type: suggest
+    message: |
+      Integration tests should:
+      1. Use _integration_test.rs suffix
+      2. Use assert_cmd::Command for running the binary
+      3. Use assert_fs for file system operations
+      4. Test one command per file
+      5. Focus on CLI behavior and output
+
+examples:
+  - input: |
+      // Bad: Using std::process::Command
+      use std::process::Command;
+
+      #[test]
+      fn test_command() {
+          let output = Command::new(env!("CARGO_BIN_EXE_hoarder"))
+              .arg("--help")
+              .output()
+              .unwrap();
+      }
+
+      // Good: Using assert_cmd::Command
+      use assert_cmd::Command;
+
+      #[test]
+      fn test_command() {
+          Command::cargo_bin("hoarder")
+              .unwrap()
+              .arg("--help")
+              .assert()
+              .success();
+      }
+    output: "Use assert_cmd::Command for consistent CLI testing"
+
+metadata:
+  priority: high
+  version: 1.0
+  references:
+    - "specs/technical.md#test-organization"
+</rule>

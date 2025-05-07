@@ -1,0 +1,65 @@
+---
+description: Test Organization
+globs: *.rs
+alwaysApply: false
+---
+# Unit Test Organization
+
+This rule ensures that tests are properly organized and use the public API whenever possible.
+
+<rule>
+name: test_organization
+description: Enforces proper test organization and usage of public API
+filters:
+  - type: event
+    pattern: "pre_commit"
+    file_pattern: "*.rs"
+
+actions:
+  - type: suggest
+    message: |
+      When writing tests:
+      1. Use the API of the component under test
+      2. Tests should mimic expected usage
+      3. Don't add test-only methods to production code
+      4. Test the behavior that matters to users
+      5. Test helpers in unit tests go in the test module.
+      6. Test helpers in integration tests don't need to be tagged with cfg(test)
+
+  - type: validate
+    patterns:
+      - pattern: "#\\[cfg\\(test\\)\\]\\s+impl\\s+\\w+"
+        message: "Move test-only implementations into the test module instead of using cfg(test) on impl blocks"
+      - pattern: "#\\[cfg\\(not\\(test\\)\\)\\]\\s+impl\\s+\\w+"
+        message: "Do not implement different behavior in test and non-test"
+      - pattern: "pub\\s+fn\\s+\\w+_test"
+        message: "Don't prefix test helper functions with 'test_', use a descriptive name instead"
+
+examples:
+  - input: |
+      // Bad: Test-only implementation outside test module
+      #[cfg(test)]
+      impl MyStruct {
+          pub fn test_helper() {}
+      }
+
+      // Good: Test module with helper functions
+      #[cfg(test)]
+      mod tests {
+          use super::*;
+
+          fn create_test_instance() -> MyStruct {
+              // ...
+          }
+
+          #[test]
+          fn verify_actual_behavior() {
+              let instance = create_test_instance();
+              assert!(instance.public_method());
+          }
+      }
+    output: "Keep test code in test modules"
+
+metadata:
+  priority: high
+  version: 1.0
