@@ -215,6 +215,29 @@ Connection must be made using TLS with a client key known to the
 server and a server key known to the client (no certificate
 authority).
 
+### Code organization
+
+- crate/lib - library
+    - src/lib.rs
+    - src/model/service.rs - service definition
+    - src/server.rs - service implementation
+    - src/algo.rs - algorithm implementations
+    - src/algo/sync.rs - sync algorithm
+    - src/
+
+    Tests are inside each .rs file, as test submodule.
+
+- crate/daemon - daemon (realized) command
+    - src/main.rs
+    - test/<x>_integration_test.rs - integration test for <x>
+- crate/cli - command-line tool (realize)
+    - src/main.rs
+    - test/<x>_integration_test.rs - integration test for <x>
+
+Note that <modulename>.rs is used to define the module <modulename>.
+*NOT* <modulename>/mod.rs. See the rule "NEVER create any mod.rs file"
+in .cursor/rules/no-modrs.mdc
+
 ### Implementation and Dependencies
 
 Implemented using rust
