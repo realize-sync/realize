@@ -5,10 +5,35 @@
 use crate::model::error::Result;
 use std::path::PathBuf;
 
-pub type DirectoryId = String;
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct DirectoryId(String);
+impl From<String> for DirectoryId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for DirectoryId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+impl std::fmt::Display for DirectoryId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl DirectoryId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
 pub type ByteRange = (u64, u64);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SyncedFile {
     pub path: PathBuf,
     pub size: u64,

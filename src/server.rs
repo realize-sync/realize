@@ -27,10 +27,14 @@ impl RealizeServer {
         }
     }
 
+    pub fn for_dir(id: &DirectoryId, path: &Path) -> Self {
+        RealizeServer::new(vec![Directory::new(id, path)])
+    }
+
     fn find_directory(&self, dir_id: &DirectoryId) -> Result<&Rc<Directory>> {
-        self.dirs
-            .get(dir_id)
-            .ok_or_else(|| RealizeError::BadRequest(format!("Unknown directory ID: '{}'", dir_id)))
+        self.dirs.get(dir_id).ok_or_else(|| {
+            RealizeError::BadRequest(format!("Unknown directory ID: '{:?}'", dir_id))
+        })
     }
 }
 
@@ -39,7 +43,7 @@ impl RealizeService for RealizeServer {
         let dir = self.find_directory(&dir_id)?;
         let mut files = Vec::new();
         for entry in WalkDir::new(dir.path()).into_iter().flatten() {
-            if let Some((state, logical)) = LogicalPath::from_actual(&dir, entry.path()) {
+            if let Some((state, logical)) = LogicalPath::from_actual(dir, entry.path()) {
                 // TODO: What if a file exists for both the partial
                 // and final form of the logical path? Only one entry
                 // should be returned and its state should be final.
@@ -76,7 +80,11 @@ impl RealizeService for RealizeServer {
                 fs::create_dir_all(parent)?;
             }
         }
-        let mut file = OpenOptions::new().create(true).write(true).open(&path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)?;
         file.seek(SeekFrom::Start(range.0))?;
         file.write_all(&data)?;
 
@@ -152,7 +160,8 @@ impl LogicalPath {
                 return Some((SyncedFileState::Final, LogicalPath::new(dir, &relative)));
             }
         }
-        return None;
+
+        None
     }
 
     // Look for a file for the logical path.
@@ -173,20 +182,19 @@ impl LogicalPath {
             return Ok((SyncedFileState::Partial, partial));
         }
 
-        return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound).into())
     }
 
     /// Return the final form of the logical path.
     fn final_path(&self) -> PathBuf {
-        self.0.path().join(self.1.to_path_buf())
+        self.0.path().join(&self.1)
     }
 
     /// Return the partial form of the logical path.
     fn partial_path(&self) -> PathBuf {
         let mut partial = self.0.path().to_path_buf();
-        if let Some(p) = self.1.parent() {
-            partial.push(p);
-        }
+        partial.push(&self.1);
+
         let mut part_filename = OsString::from(".");
         if let Some(fname) = self.1.file_name() {
             part_filename.push(OsString::from(fname.to_string_lossy().to_string()));
@@ -205,7 +213,7 @@ impl LogicalPath {
 
 impl From<walkdir::Error> for RealizeError {
     fn from(err: walkdir::Error) -> Self {
-        if let Some(_) = err.io_error() {
+        if err.io_error().is_some() {
             // We know err contains an io error; unwrap will succeed.
             err.into_io_error().unwrap().into()
         } else {
@@ -219,104 +227,210 @@ mod tests {
     use super::*;
     use assert_fs::prelude::*;
     use assert_fs::TempDir;
-    use std::collections::HashMap;
+    use assert_unordered::assert_eq_unordered;
     use std::fs;
-    use std::io::Read;
 
-    fn setup_server_with_dir() -> (RealizeServer, TempDir, DirectoryId) {
-        let temp = TempDir::new().unwrap();
-        let dir_id = "testdir".to_string();
-        let mut dirs = HashMap::new();
-        dirs.insert(dir_id.clone(), temp.path().to_path_buf());
-        (RealizeServer::new(dirs), temp, dir_id)
+    fn setup_server_with_dir() -> anyhow::Result<(RealizeServer, TempDir, Rc<Directory>)> {
+        let temp = TempDir::new()?;
+        let dir = Rc::new(Directory::new(&DirectoryId::from("testdir"), temp.path()));
+
+        Ok((RealizeServer::for_dir(dir.id(), dir.path()), temp, dir))
     }
 
     #[test]
-    fn test_list_empty() {
-        let (server, _temp, dir_id) = setup_server_with_dir();
-        let files = server.list(dir_id).unwrap();
+    fn test_final_and_partial_paths() -> anyhow::Result<()> {
+        let dir = Rc::new(Directory::new(
+            &DirectoryId::from("testdir"),
+            &PathBuf::from("/doesnotexist/testdir"),
+        ));
+
+        let file1 = LogicalPath::new(&dir, &PathBuf::from("file1.txt"));
+        assert_eq!(
+            PathBuf::from("/doesnotexist/testdir/file1.txt"),
+            file1.final_path()
+        );
+        assert_eq!(
+            PathBuf::from("/doesnotexist/testdir/.file1.txt.part"),
+            file1.partial_path()
+        );
+
+        let file2 = LogicalPath::new(&dir, &PathBuf::from("subdir/file2.txt"));
+        assert_eq!(
+            PathBuf::from("/doesnotexist/testdir/subdir/file2.txt"),
+            file2.final_path()
+        );
+        assert_eq!(
+            PathBuf::from("/doesnotexist/testdir/subdir/.file2.txt.part"),
+            file2.partial_path()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_logical_path() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let dir = Rc::new(Directory::new(&DirectoryId::from("testdir"), temp.path()));
+
+        temp.child("foo.txt").write_str("test")?;
+        assert_eq!(
+            (SyncedFileState::Final, temp.child("foo.txt").to_path_buf()),
+            LogicalPath::new(&dir, &PathBuf::from("foo.txt")).find()?
+        );
+
+        temp.child("subdir/foo2.txt").write_str("test")?;
+        assert_eq!(
+            (
+                SyncedFileState::Final,
+                temp.child("subdir/foo2.txt").to_path_buf()
+            ),
+            LogicalPath::new(&dir, &PathBuf::from("subdir/foo2.txt")).find()?
+        );
+
+        temp.child(".bar.txt.part").write_str("test")?;
+        assert_eq!(
+            (
+                SyncedFileState::Partial,
+                temp.child(".bar.txt.part").to_path_buf()
+            ),
+            LogicalPath::new(&dir, &PathBuf::from("bar.txt")).find()?
+        );
+
+        temp.child("subdir/.bar2.txt.part").write_str("test")?;
+        assert_eq!(
+            (
+                SyncedFileState::Partial,
+                temp.child("subdir/.bar2.txt.part").to_path_buf()
+            ),
+            LogicalPath::new(&dir, &PathBuf::from("subdir/bar2.txt")).find()?
+        );
+
+        temp.child("foo3.txt").write_str("test")?;
+        temp.child(".foo3.txt.part").write_str("test")?;
+        assert_eq!(
+            (SyncedFileState::Final, temp.child("foo3.txt").to_path_buf()),
+            LogicalPath::new(&dir, &PathBuf::from("foo3.txt")).find()?
+        );
+
+        assert!(matches!(
+            LogicalPath::new(&dir, &PathBuf::from("notfound.txt")).find(),
+            Err(RealizeError::Io(err)) if err.kind()== std::io::ErrorKind::NotFound,
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_list_empty() -> anyhow::Result<()> {
+        let (server, _temp, dir) = setup_server_with_dir()?;
+        let files = server.list(dir.id().clone()).unwrap();
         assert!(files.is_empty());
+
+        Ok(())
     }
 
     #[test]
-    fn test_list_files_and_partial() {
-        let (server, temp, dir_id) = setup_server_with_dir();
-        let file = temp.child("foo.txt");
-        file.write_str("hello").unwrap();
-        let part_file = temp.child("bar.txt.part");
-        part_file.write_str("partial").unwrap();
-        let files = server.list(dir_id).unwrap();
-        let mut found_foo = false;
-        let mut found_bar = false;
-        for f in files {
-            if f.path == PathBuf::from("foo.txt") {
-                assert!(!f.is_partial);
-                found_foo = true;
-            }
-            if f.path == PathBuf::from("bar.txt") {
-                assert!(f.is_partial);
-                found_bar = true;
-            }
-            // Path must not start with '.' or end with '.part'
-            assert!(!f.path.to_string_lossy().starts_with("."));
-            assert!(!f.path.to_string_lossy().ends_with(".part"));
-        }
-        assert!(found_foo);
-        assert!(found_bar);
+    fn test_list_files_and_partial() -> anyhow::Result<()> {
+        let (server, temp, dir) = setup_server_with_dir()?;
+
+        fs::create_dir_all(temp.child("subdir"))?;
+
+        temp.child("foo.txt").write_str("hello")?;
+        temp.child("subdir/foo2.txt").write_str("hello")?;
+        temp.child(".bar.txt.part").write_str("partial")?;
+        temp.child("subdir/.bar2.txt.part").write_str("partial")?;
+
+        let files = server.list(dir.id().clone())?;
+        assert_eq_unordered!(
+            files,
+            vec![
+                SyncedFile {
+                    path: PathBuf::from("foo.txt"),
+                    size: 5,
+                    state: SyncedFileState::Final
+                },
+                SyncedFile {
+                    path: PathBuf::from("subdir/foo2.txt"),
+                    size: 5,
+                    state: SyncedFileState::Final
+                },
+                SyncedFile {
+                    path: PathBuf::from("bar.txt"),
+                    size: 7,
+                    state: SyncedFileState::Partial
+                },
+                SyncedFile {
+                    path: PathBuf::from("subdir/bar2.txt"),
+                    size: 7,
+                    state: SyncedFileState::Partial
+                },
+            ]
+        );
+
+        Ok(())
     }
 
     #[test]
-    fn test_send_and_finish_partial() {
-        let (server, temp, dir_id) = setup_server_with_dir();
-        let data = b"abcde".to_vec();
-        let path = PathBuf::from("file1.txt");
-        // Send to partial file
-        server
-            .send(dir_id.clone(), path.clone(), (0, 5), data.clone())
-            .unwrap();
-        let part_path = temp.path().join("file1.txt.part");
-        assert!(part_path.exists());
-        let mut buf = Vec::new();
-        fs::File::open(&part_path)
-            .unwrap()
-            .read_to_end(&mut buf)
-            .unwrap();
-        assert_eq!(buf, data);
-        // Finish (rename to non-partial)
-        server.finish(dir_id.clone(), path.clone()).unwrap();
-        let final_path = temp.path().join("file1.txt");
-        assert!(final_path.exists());
-        assert!(!part_path.exists());
-        let mut buf2 = Vec::new();
-        fs::File::open(&final_path)
-            .unwrap()
-            .read_to_end(&mut buf2)
-            .unwrap();
-        assert_eq!(buf2, data);
+    fn test_send_wrong_order() -> anyhow::Result<()> {
+        let (server, _temp, dir) = setup_server_with_dir()?;
+
+        let fpath = LogicalPath::new(&dir, &PathBuf::from("wrong_order.txt"));
+
+        server.send(
+            dir.id().clone(),
+            fpath.relative_path().to_path_buf(),
+            (5, 10),
+            b"fghij".to_vec(),
+        )?;
+        assert!(fpath.partial_path().exists());
+        assert!(!fpath.final_path().exists());
+        assert_eq!(
+            std::fs::read_to_string(fpath.partial_path())?,
+            "\0\0\0\0\0fghij"
+        );
+
+        server.send(
+            dir.id().clone(),
+            fpath.relative_path().to_path_buf(),
+            (0, 5),
+            b"abcde".to_vec(),
+        )?;
+        assert!(fpath.partial_path().exists());
+        assert!(!fpath.final_path().exists());
+        assert_eq!(std::fs::read_to_string(fpath.partial_path())?, "abcdefghij");
+
+        Ok(())
     }
 
     #[test]
-    fn test_send_and_finish_on_existing_nonpartial() {
-        let (server, temp, dir_id) = setup_server_with_dir();
-        let orig_data = b"orig";
-        let path = PathBuf::from("file2.txt");
-        let final_path = temp.path().join("file2.txt");
-        fs::write(&final_path, orig_data).unwrap();
-        // Send new data (should write to .part)
-        let new_data = b"newdata".to_vec();
-        server
-            .send(dir_id.clone(), path.clone(), (0, 7), new_data.clone())
-            .unwrap();
-        let part_path = temp.path().join("file2.txt.part");
-        assert!(part_path.exists());
-        // Finish (should overwrite non-partial)
-        server.finish(dir_id.clone(), path.clone()).unwrap();
-        assert!(final_path.exists());
-        let mut buf = Vec::new();
-        fs::File::open(&final_path)
-            .unwrap()
-            .read_to_end(&mut buf)
-            .unwrap();
-        assert_eq!(buf, new_data);
+    fn test_finish_partial() -> anyhow::Result<()> {
+        let (server, _temp, dir) = setup_server_with_dir()?;
+
+        let fpath = LogicalPath::new(&dir, &PathBuf::from("finish_partial.txt"));
+        fs::write(fpath.partial_path(), "abcde")?;
+
+        server.finish(dir.id().clone(), fpath.relative_path().to_path_buf())?;
+
+        assert!(fpath.final_path().exists());
+        assert!(!fpath.partial_path().exists());
+        assert_eq!(std::fs::read_to_string(fpath.final_path())?, "abcde");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_finish_final() -> anyhow::Result<()> {
+        let (server, _temp, dir) = setup_server_with_dir()?;
+
+        let fpath = LogicalPath::new(&dir, &PathBuf::from("finish_partial.txt"));
+        fs::write(fpath.final_path(), "abcde")?;
+
+        server.finish(dir.id().clone(), fpath.relative_path().to_path_buf())?;
+
+        assert!(fpath.final_path().exists());
+        assert!(!fpath.partial_path().exists());
+        assert_eq!(std::fs::read_to_string(fpath.final_path())?, "abcde");
+
+        Ok(())
     }
 }
