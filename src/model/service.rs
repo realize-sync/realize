@@ -61,6 +61,10 @@ pub trait RealizeService {
         data: Vec<u8>,
     ) -> Result<()>;
 
+    // Reade a byte range from a file
+    async fn read(dir_id: DirectoryId, relative_path: PathBuf, range: ByteRange)
+        -> Result<Vec<u8>>;
+
     // Mark a partial file as complete
     async fn finish(dir_id: DirectoryId, relative_path: PathBuf) -> Result<()>;
 }

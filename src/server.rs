@@ -4,7 +4,7 @@ use crate::model::service::{
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -62,6 +62,28 @@ impl RealizeService for RealizeServer {
         }
 
         Ok(files)
+    }
+
+    async fn read(
+        self,
+        _: tarpc::context::Context,
+        dir_id: DirectoryId,
+        relative_path: PathBuf,
+        range: ByteRange,
+    ) -> Result<Vec<u8>> {
+        let dir = self.find_directory(&dir_id)?;
+        let logical = LogicalPath::new(dir, &relative_path);
+        let (_, actual) = logical.find()?;
+        let mut file = OpenOptions::new()
+            .create(false)
+            .read(true)
+            .write(false)
+            .open(&actual)?;
+        file.seek(SeekFrom::Start(range.0))?;
+        let mut buffer = vec![0; (range.1 - range.0) as usize];
+        file.read_exact(&mut buffer)?;
+
+        return Ok(buffer);
     }
 
     async fn send(
@@ -427,6 +449,49 @@ mod tests {
         assert!(fpath.partial_path().exists());
         assert!(!fpath.final_path().exists());
         assert_eq!(std::fs::read_to_string(fpath.partial_path())?, "abcdefghij");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read() -> anyhow::Result<()> {
+        let (server, _temp, dir) = setup_server_with_dir()?;
+
+        let fpath = LogicalPath::new(&dir, &PathBuf::from("wrong_order.txt"));
+        fs::write(fpath.final_path(), "abcdefghij")?;
+
+        let data = server
+            .clone()
+            .read(
+                tarpc::context::Context::current(),
+                dir.id().clone(),
+                fpath.relative_path().to_path_buf(),
+                (5, 10),
+            )
+            .await?;
+        assert_eq!(String::from_utf8(data)?, "fghij");
+
+        let data = server
+            .clone()
+            .read(
+                tarpc::context::Context::current(),
+                dir.id().clone(),
+                fpath.relative_path().to_path_buf(),
+                (0, 5),
+            )
+            .await?;
+        assert_eq!(String::from_utf8(data)?, "abcde");
+
+        let result = server
+            .clone()
+            .read(
+                tarpc::context::Context::current(),
+                dir.id().clone(),
+                fpath.relative_path().to_path_buf(),
+                (0, 15),
+            )
+            .await;
+        assert!(matches!(result, Err(RealizeError::Io(_))));
 
         Ok(())
     }
