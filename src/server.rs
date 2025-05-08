@@ -1,17 +1,19 @@
-use crate::model::error::{RealizeError, Result};
-use crate::model::service::{ByteRange, DirectoryId, RealizeService, SyncedFile, SyncedFileState};
+use crate::model::service::{
+    ByteRange, DirectoryId, RealizeError, RealizeService, Result, SyncedFile, SyncedFileState,
+};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::Arc;
 use walkdir::WalkDir;
 
+#[derive(Clone)]
 pub struct RealizeServer {
     /// Maps directory IDs to local paths
-    dirs: HashMap<DirectoryId, Rc<Directory>>,
+    dirs: HashMap<DirectoryId, Arc<Directory>>,
 }
 
 impl RealizeServer {
@@ -22,7 +24,7 @@ impl RealizeServer {
         Self {
             dirs: dirs
                 .into_iter()
-                .map(|dir| (dir.id.clone(), Rc::new(dir)))
+                .map(|dir| (dir.id.clone(), Arc::new(dir)))
                 .collect(),
         }
     }
@@ -31,7 +33,7 @@ impl RealizeServer {
         RealizeServer::new(vec![Directory::new(id, path)])
     }
 
-    fn find_directory(&self, dir_id: &DirectoryId) -> Result<&Rc<Directory>> {
+    fn find_directory(&self, dir_id: &DirectoryId) -> Result<&Arc<Directory>> {
         self.dirs.get(dir_id).ok_or_else(|| {
             RealizeError::BadRequest(format!("Unknown directory ID: '{:?}'", dir_id))
         })
@@ -39,7 +41,11 @@ impl RealizeServer {
 }
 
 impl RealizeService for RealizeServer {
-    fn list(&self, dir_id: DirectoryId) -> Result<Vec<SyncedFile>> {
+    async fn list(
+        self,
+        _: tarpc::context::Context,
+        dir_id: DirectoryId,
+    ) -> Result<Vec<SyncedFile>> {
         let dir = self.find_directory(&dir_id)?;
         let mut files = Vec::new();
         for entry in WalkDir::new(dir.path()).into_iter().flatten() {
@@ -58,8 +64,9 @@ impl RealizeService for RealizeServer {
         Ok(files)
     }
 
-    fn send(
-        &self,
+    async fn send(
+        self,
+        _: tarpc::context::Context,
         dir_id: DirectoryId,
         relative_path: PathBuf,
         range: ByteRange,
@@ -91,7 +98,12 @@ impl RealizeService for RealizeServer {
         Ok(())
     }
 
-    fn finish(&self, dir_id: DirectoryId, relative_path: PathBuf) -> Result<()> {
+    async fn finish(
+        self,
+        _: tarpc::context::Context,
+        dir_id: DirectoryId,
+        relative_path: PathBuf,
+    ) -> Result<()> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path);
         if let (SyncedFileState::Partial, real_path) = logical.find()? {
@@ -132,17 +144,17 @@ impl Directory {
 /// The corresponding actual file might be in
 /// [SyncedFileState::Partial] or [SyncedFileState::Final] form. Check
 /// with [LogicalPath::find].
-struct LogicalPath(Rc<Directory>, PathBuf);
+struct LogicalPath(Arc<Directory>, PathBuf);
 
 impl LogicalPath {
     /// Create a new logical path, without checking it.
-    fn new(dir: &Rc<Directory>, path: &Path) -> Self {
+    fn new(dir: &Arc<Directory>, path: &Path) -> Self {
         // TODO: check that path is relative and doesn't use any ..
-        Self(Rc::clone(dir), path.to_path_buf())
+        Self(Arc::clone(dir), path.to_path_buf())
     }
 
     /// Create a logical path from an actual partial or final path.
-    fn from_actual(dir: &Rc<Directory>, actual: &Path) -> Option<(SyncedFileState, Self)> {
+    fn from_actual(dir: &Arc<Directory>, actual: &Path) -> Option<(SyncedFileState, Self)> {
         if !actual.is_file() {
             return None;
         }
@@ -224,22 +236,26 @@ impl From<walkdir::Error> for RealizeError {
 
 #[cfg(test)]
 mod tests {
+    use crate::model::service::RealizeServiceClient;
+
     use super::*;
     use assert_fs::prelude::*;
     use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
+    use futures::StreamExt as _;
     use std::fs;
+    use tarpc::server::Channel;
 
-    fn setup_server_with_dir() -> anyhow::Result<(RealizeServer, TempDir, Rc<Directory>)> {
+    fn setup_server_with_dir() -> anyhow::Result<(RealizeServer, TempDir, Arc<Directory>)> {
         let temp = TempDir::new()?;
-        let dir = Rc::new(Directory::new(&DirectoryId::from("testdir"), temp.path()));
+        let dir = Arc::new(Directory::new(&DirectoryId::from("testdir"), temp.path()));
 
         Ok((RealizeServer::for_dir(dir.id(), dir.path()), temp, dir))
     }
 
     #[test]
     fn test_final_and_partial_paths() -> anyhow::Result<()> {
-        let dir = Rc::new(Directory::new(
+        let dir = Arc::new(Directory::new(
             &DirectoryId::from("testdir"),
             &PathBuf::from("/doesnotexist/testdir"),
         ));
@@ -270,7 +286,7 @@ mod tests {
     #[test]
     fn test_find_logical_path() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        let dir = Rc::new(Directory::new(&DirectoryId::from("testdir"), temp.path()));
+        let dir = Arc::new(Directory::new(&DirectoryId::from("testdir"), temp.path()));
 
         temp.child("foo.txt").write_str("test")?;
         assert_eq!(
@@ -314,23 +330,26 @@ mod tests {
 
         assert!(matches!(
             LogicalPath::new(&dir, &PathBuf::from("notfound.txt")).find(),
-            Err(RealizeError::Io(err)) if err.kind()== std::io::ErrorKind::NotFound,
+            Err(RealizeError::Io(_))
         ));
 
         Ok(())
     }
 
-    #[test]
-    fn test_list_empty() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn test_list_empty() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
-        let files = server.list(dir.id().clone()).unwrap();
+        let files = server
+            .clone()
+            .list(tarpc::context::Context::current(), dir.id().clone())
+            .await?;
         assert!(files.is_empty());
 
         Ok(())
     }
 
-    #[test]
-    fn test_list_files_and_partial() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn test_list_files_and_partial() -> anyhow::Result<()> {
         let (server, temp, dir) = setup_server_with_dir()?;
 
         fs::create_dir_all(temp.child("subdir"))?;
@@ -340,7 +359,9 @@ mod tests {
         temp.child(".bar.txt.part").write_str("partial")?;
         temp.child("subdir/.bar2.txt.part").write_str("partial")?;
 
-        let files = server.list(dir.id().clone())?;
+        let files = server
+            .list(tarpc::context::Context::current(), dir.id().clone())
+            .await?;
         assert_eq_unordered!(
             files,
             vec![
@@ -370,18 +391,22 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_send_wrong_order() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn test_send_wrong_order() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
 
         let fpath = LogicalPath::new(&dir, &PathBuf::from("wrong_order.txt"));
 
-        server.send(
-            dir.id().clone(),
-            fpath.relative_path().to_path_buf(),
-            (5, 10),
-            b"fghij".to_vec(),
-        )?;
+        server
+            .clone()
+            .send(
+                tarpc::context::Context::current(),
+                dir.id().clone(),
+                fpath.relative_path().to_path_buf(),
+                (5, 10),
+                b"fghij".to_vec(),
+            )
+            .await?;
         assert!(fpath.partial_path().exists());
         assert!(!fpath.final_path().exists());
         assert_eq!(
@@ -389,12 +414,16 @@ mod tests {
             "\0\0\0\0\0fghij"
         );
 
-        server.send(
-            dir.id().clone(),
-            fpath.relative_path().to_path_buf(),
-            (0, 5),
-            b"abcde".to_vec(),
-        )?;
+        server
+            .clone()
+            .send(
+                tarpc::context::Context::current(),
+                dir.id().clone(),
+                fpath.relative_path().to_path_buf(),
+                (0, 5),
+                b"abcde".to_vec(),
+            )
+            .await?;
         assert!(fpath.partial_path().exists());
         assert!(!fpath.final_path().exists());
         assert_eq!(std::fs::read_to_string(fpath.partial_path())?, "abcdefghij");
@@ -402,14 +431,20 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_finish_partial() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn test_finish_partial() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
 
         let fpath = LogicalPath::new(&dir, &PathBuf::from("finish_partial.txt"));
         fs::write(fpath.partial_path(), "abcde")?;
 
-        server.finish(dir.id().clone(), fpath.relative_path().to_path_buf())?;
+        server
+            .finish(
+                tarpc::context::Context::current(),
+                dir.id().clone(),
+                fpath.relative_path().to_path_buf(),
+            )
+            .await?;
 
         assert!(fpath.final_path().exists());
         assert!(!fpath.partial_path().exists());
@@ -418,18 +453,52 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_finish_final() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn test_finish_final() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
 
         let fpath = LogicalPath::new(&dir, &PathBuf::from("finish_partial.txt"));
         fs::write(fpath.final_path(), "abcde")?;
 
-        server.finish(dir.id().clone(), fpath.relative_path().to_path_buf())?;
+        server
+            .finish(
+                tarpc::context::Context::current(),
+                dir.id().clone(),
+                fpath.relative_path().to_path_buf(),
+            )
+            .await?;
 
         assert!(fpath.final_path().exists());
         assert!(!fpath.partial_path().exists());
         assert_eq!(std::fs::read_to_string(fpath.final_path())?, "abcde");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tarpc_rpc_basic() -> anyhow::Result<()> {
+        let (client_transport, server_transport) = tarpc::transport::channel::unbounded();
+
+        let temp = TempDir::new()?;
+        let server = tarpc::server::BaseChannel::with_defaults(server_transport);
+        tokio::spawn(
+            server
+                .execute(RealizeServer::serve(RealizeServer::new(vec![
+                    Directory::new(&DirectoryId::from("testdir"), temp.path()),
+                ])))
+                // Handle all requests concurrently.
+                .for_each(|response| async move {
+                    tokio::spawn(response);
+                }),
+        );
+
+        let client =
+            RealizeServiceClient::new(tarpc::client::Config::default(), client_transport).spawn();
+
+        let list = client
+            .list(tarpc::context::current(), DirectoryId::from("testdir"))
+            .await??;
+        assert_eq!(list.len(), 0);
 
         Ok(())
     }

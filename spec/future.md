@@ -3,35 +3,6 @@
 This file lists changes that are planned but that haven't been
 integrated into the spec yet.
 
-## Implement the initial service {#serviceimpl}
-
-Implement the methods List, Send and Finish of RealizeService.
-
-Review and apply any relevant Cursor rules, including (but not limited
-to):
- - .cursor/rules/no-modr.mdc
- - .cursor/rules/rust-error-handling.mdc
- - .cursor/rules/rust-type-system.mdc
- - .cursor/rules/test-imports.mdc
- - .cursor/rules/test-organization.mdc
-
-Review and apply the relevant sections of spec/design.md, including
-but not limited to the sections "Details" "Service Definition", "Code
-organization" and "Implementation and Dependencies"
-
-Task list:
-
-1. Implement the skeleton in src/server.rs. See the description in the
-   "Service Definition" section of spec/design.md, or more generally
-   in the "Overview" section.
-
-2. Use "cargo check" to make sure the code compile. Fix any issues.
-
-4. Extend the existing tests and add new ones. Use assert_fs for
-   creating directories and checking files.
-
-5. Use "cargo test" to make sure the test passes. Fix any issues.
-
 ## Implement the unoptimized algorithm {#algoimpl}
 
 Implement the algorithm described in the section "Sync Algorithm: Move
@@ -40,8 +11,12 @@ files from A to B" in spec/design.md
 Add a good module definition, as an overview. Add thorough method
 description and usage examples.
 
-The algorithm should take two instances of the RealizeService, defined
-in src/model/service.rs, one for A (source) one for B (destination).
+The algorithm function should take two object that implement the RealizeService
+trait, defined in src/model/service.rs and modified by
+#[tarpc::service], one for A (source) one for B (destination). The function should
+also take a tarpc::Context::context instance to pass to the
+RealizeService methods when calling them (tarpc::service implicitly
+adds an argument of type tarpc::Context::context to each function).
 
 The implementation should leave out step 4, which is an optimization,
 and treat files that are present in A and partially in B as in step 3,
@@ -50,28 +25,25 @@ that is, overwrite the file that's partially in B.
 The tests should call the implementation of the service defined in
 src/server.rs, using an in-process channel.
 
-Review and apply any relevant Cursor rules, including (but not limited
-to):
- - .cursor/rules/no-modr.mdc
- - .cursor/rules/rust-error-handling.mdc
- - .cursor/rules/rust-type-system.mdc
- - .cursor/rules/test-imports.mdc
- - .cursor/rules/test-organization.mdc
+Review and apply any relevant Cursor rules.
 
-Review and apply the relevant sections of spec/design.md, including but not limited to the sections "Details" "Service Definition", "Code organization" and "Implementation and Dependencies"
-
-1. Read spec/design.md and keep it in mind
+1. Read:
+  - spec/design.md
+  - src/model/service.rs
+  and keep it in mind
 
 2. Create the new module in src/algo/move.rs
 
-3. Add a new function that takes two RealizeService instances to work
-   on
+3. Add a new async function that takes a tarpc::context::Context and
+   two RealizeService implementations to work on
 
 4. Implement that function as described
 
 5. Run "cargo check" to make sure everything compiles, fix any issues
 
-6. Add a test for that function
+6. Add a test for that function, use instances of RealizeServer pass
+   to the function as RealizeService implementation. See src/server.rs
+   and its tests for how to create such instances.
 
 7. Run "cargo test" to make sure the tests pass, fix any issues
 
@@ -85,11 +57,10 @@ src/transport.rs
 
 Review and apply any relevant Cursor rules, including (but not limited
 to):
- - .cursor/rules/no-modr.mdc
  - .cursor/rules/rust-error-handling.mdc
  - .cursor/rules/rust-type-system.mdc
- - .cursor/rules/test-imports.mdc
- - .cursor/rules/test-organization.mdc
+ - .cursor/rules/rust-safety.mdc
+ - .cursor/rules/rust-documentation.mdc
 
 Review and apply the relevant sections of spec/design.md, including
 but not limited to the sections "Details" "Service Definition", "Code
