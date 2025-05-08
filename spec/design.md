@@ -157,6 +157,11 @@ Methods:
     - whether the file is complete or partial (if partial, the path is
       the final path, without the ".part" suffix or "." prefix)
 
+- `Read(DirectoryId, Path, ByteRange) -> Result<Vec<u8>>`
+
+  Read the given range of data from path (final or partial) and return
+  the result. The range *must* be correct.
+
 - `Send(DirectoryId, Path, ByteRange, Data) -> Result<()>`
 
   Path is from the `SyncedFile`. This is the final path, even if the
@@ -205,6 +210,11 @@ Methods:
 - `Hash(DirectoryId, Path)  -> Result<Hash>`
 
   Compute a hash (SHA-256) of Path (partial or complete)
+
+- `Delete(DirectoryId, Path) -> Result<()>`
+
+  Delete the path, partial *and* complete (both may exist). Succeeds
+  if the paths already don't exist.
 
 ### Security
 
