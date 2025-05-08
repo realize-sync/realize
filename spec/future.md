@@ -3,44 +3,21 @@
 This file lists changes that are planned but that haven't been
 integrated into the spec yet.
 
-## Create initial service {#servicedef}
-
-Define a service for use with tarpc 0.36 as described in
-spec/design.md, in the section "Service Definition".
-
-From that section, the service RealizeService should include the
-following methods:
-
-- List
-- Send
-- Finish
-
-It should *not* include any other method.
-
-To test it, write a dummy implementation of that service and write a
-test that uses that implementation through an in-process channel
-tarpc::transport::channel.
-
-Task list:
-
-1. Put service definition in the library the service module, in the
-   library in src/model/service.rs (As described in "Code
-   Organization" in the file spec/design.md)
-
-2. Put a skeleton implementation in the library in the impl module, in
-   src/server.rs (As described in "Code Organization" in the file
-   spec/design.md)
-
-3. Use "cargo check" to make sure the code compile. Fix any issues.
-
-4. Add a test inside src/server.rs that create a server and client for
-   that service and have them communicate with an in-process channel
-
-5. Use "cargo test" to make sure the test passes. Fix any issues.
-
 ## Implement the initial service {#serviceimpl}
 
 Implement the methods List, Send and Finish of RealizeService.
+
+Review and apply any relevant Cursor rules, including (but not limited
+to):
+ - .cursor/rules/no-modr.mdc
+ - .cursor/rules/rust-error-handling.mdc
+ - .cursor/rules/rust-type-system.mdc
+ - .cursor/rules/test-imports.mdc
+ - .cursor/rules/test-organization.mdc
+
+Review and apply the relevant sections of spec/design.md, including
+but not limited to the sections "Details" "Service Definition", "Code
+organization" and "Implementation and Dependencies"
 
 Task list:
 
@@ -60,6 +37,9 @@ Task list:
 Implement the algorithm described in the section "Sync Algorithm: Move
 files from A to B" in spec/design.md
 
+Add a good module definition, as an overview. Add thorough method
+description and usage examples.
+
 The algorithm should take two instances of the RealizeService, defined
 in src/model/service.rs, one for A (source) one for B (destination).
 
@@ -69,6 +49,16 @@ that is, overwrite the file that's partially in B.
 
 The tests should call the implementation of the service defined in
 src/server.rs, using an in-process channel.
+
+Review and apply any relevant Cursor rules, including (but not limited
+to):
+ - .cursor/rules/no-modr.mdc
+ - .cursor/rules/rust-error-handling.mdc
+ - .cursor/rules/rust-type-system.mdc
+ - .cursor/rules/test-imports.mdc
+ - .cursor/rules/test-organization.mdc
+
+Review and apply the relevant sections of spec/design.md, including but not limited to the sections "Details" "Service Definition", "Code organization" and "Implementation and Dependencies"
 
 1. Read spec/design.md and keep it in mind
 
@@ -89,9 +79,21 @@ src/server.rs, using an in-process channel.
 
 Add code for setting up an unencrypted TCP transport and built a
 server and a client for it. The code for the server goes into
-src/server.rs, the code for the client into src/client.rs, the code
-for TCP, shared by the client and server, into src/transport.rs.
+src/server.rs, the code for the client into src/client.rs, any code
+shared by the client and server but not part of the model can do into
+src/transport.rs
 
+Review and apply any relevant Cursor rules, including (but not limited
+to):
+ - .cursor/rules/no-modr.mdc
+ - .cursor/rules/rust-error-handling.mdc
+ - .cursor/rules/rust-type-system.mdc
+ - .cursor/rules/test-imports.mdc
+ - .cursor/rules/test-organization.mdc
+
+Review and apply the relevant sections of spec/design.md, including
+but not limited to the sections "Details" "Service Definition", "Code
+organization" and "Implementation and Dependencies"
 
 1. Implement functions to build a server and client using a TCP
    transport
@@ -117,6 +119,12 @@ The server code should parse the command line arguments, call the code
 from the library (src/server.rs), process the result. On success, exit
 with status 0. On error, display the error to stderr, exit with
 status 1. (It's not enough to log the error)
+
+Review and apply any relevant Cursor rules.
+
+Review and apply the relevant sections of spec/design.md, including
+but not limited to the sections "Details" "Service Definition", "Code
+organization" and "Implementation and Dependencies"
 
 1. Write a description of the command into spec/realized_man.md,
    format it like a UNIX manpage, based on its description in
@@ -164,6 +172,13 @@ instance, process the result.
 
 On success, exit with status 0. On error, display the error to stderr,
 exit with status 1. (It's not enough to log the error)
+
+Review and apply any relevant Cursor rules.
+
+Review and apply the relevant sections of spec/design.md, including
+but not limited to the sections "Details" "Service Definition", "Code
+organization" and "Implementation and Dependencies"
+
 
 1. Write a description of the command into spec/realize_man.md,
    format it like a UNIX manpage. Include usage examples and command
