@@ -4,4 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0"
+pathdiff = "0.2.3"
 tarpc = "0.36"
+thiserror = "2.0"
+walkdir = "2.5"
+
+[dev-dependencies]
+assert_fs = "1.1"
+futures = "0.3.31"
+tokio = "1.45.0"
