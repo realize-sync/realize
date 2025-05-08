@@ -50,10 +50,13 @@ pub enum SyncedFileState {
 /// The service trait for file synchronization.
 #[tarpc::service]
 pub trait RealizeService {
-    // List files in a directory
+    /// List files in a directory
     async fn list(dir_id: DirectoryId) -> Result<Vec<SyncedFile>>;
 
-    // Send a byte range of a file
+    /// Send a byte range of a file.
+    ///
+    /// TODO: add "at end" boolean, so send knows to truncate the file
+    /// if it is bigger than range end.
     async fn send(
         dir_id: DirectoryId,
         relative_path: PathBuf,
@@ -61,11 +64,11 @@ pub trait RealizeService {
         data: Vec<u8>,
     ) -> Result<()>;
 
-    // Reade a byte range from a file
+    /// Read a byte range from a file
     async fn read(dir_id: DirectoryId, relative_path: PathBuf, range: ByteRange)
         -> Result<Vec<u8>>;
 
-    // Mark a partial file as complete
+    /// Mark a partial file as complete
     async fn finish(dir_id: DirectoryId, relative_path: PathBuf) -> Result<()>;
 }
 
