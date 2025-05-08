@@ -8,7 +8,14 @@ alwaysApply: false
 This rule enforces proper organization of test-only dependency imports in Rust code.
 
 ## Description
-Test dependencies and imports must be placed inside the test module to maintain clear separation between production and test code.
+
+Test-only dependencies and imports must be placed inside the test
+module to maintain clear separation between production and test code.
+
+This does not mean that any dependency used in test must be placed
+inside of the test module. This only applies to the dependencies that
+are *only* used in tests. If a dependency is needed to implement the
+feature of the module, it must not only be used in tests.
 
 ## Rule Details
 
