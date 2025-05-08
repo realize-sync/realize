@@ -3,24 +3,6 @@
 This file lists changes that are planned but that haven't been
 integrated into the spec yet.
 
-## Create Rust workspace {#workspace}
-
-Create a Rust workspace for the realize project that:
- - uses Rust edition 2024
- - contains a library crate, to include all reusable code
- - contains a command crate for the daemon (that uses the library)
- - contains a command crate for the realize command-line tool (that uses the library)
-
-See the sections:
- - "Components of the system" in the file spec/design.md
- - "Code Organization" in the file spec/design.md
-
-Task list:
-
-1. Create the workspace and the crates (library, daemon and cli).
-2. Make the two command-line tools depend on the library crate
-3. run ant build to build anything. It should not fail.
-
 ## Create initial service {#servicedef}
 
 Define a service for use with tarpc 0.36 as described in
@@ -42,7 +24,7 @@ tarpc::transport::channel.
 Task list:
 
 1. Put service definition in the library the service module, in the
-   library crate in src/model/service.rs (As described in "Code
+   library in src/model/service.rs (As described in "Code
    Organization" in the file spec/design.md)
 
 2. Put a skeleton implementation in the library in the impl module, in
@@ -62,9 +44,9 @@ Implement the methods List, Send and Finish of RealizeService.
 
 Task list:
 
-1. Implement the skeleton in the lib crate in src/server.rs. See the
-   description in the "Service Definition" section of spec/design.md,
-   or more generally in the "Overview" section.
+1. Implement the skeleton in src/server.rs. See the description in the
+   "Service Definition" section of spec/design.md, or more generally
+   in the "Overview" section.
 
 2. Use "cargo check" to make sure the code compile. Fix any issues.
 
@@ -105,11 +87,10 @@ src/server.rs, using an in-process channel.
 
 ## Utilities for setting up a TCP transport {#tcp}
 
-Add code to the library crate for setting up an unencrypted TCP
-transport and built a server and a client for it. The code for the
-server goes into src/server.rs, the code for the client into
-src/client.rs, the code for TCP, shared by the client and server, into
-src/transport.rs.
+Add code for setting up an unencrypted TCP transport and built a
+server and a client for it. The code for the server goes into
+src/server.rs, the code for the client into src/client.rs, the code
+for TCP, shared by the client and server, into src/transport.rs.
 
 
 1. Implement functions to build a server and client using a TCP
@@ -124,7 +105,7 @@ src/transport.rs.
 
 ## Write the daemon code {#daemon}
 
-Implement the server "realized" in the crate "daemon". The server
+Implement the server "realized" in "src/bin/realized.rs". The server
 should be a command-line tool tat work as described in the section
 "Overview" of spec/design.md
 
@@ -133,28 +114,33 @@ now. The server just exposes a public service available through TCP at
 the port it's given.
 
 The server code should parse the command line arguments, call the code
-from the library crate (crate/lib/src/server.rs), process the result.
-On success, exit with status 0. On error, display the error to stderr,
-exit with status 1. (It's not enough to log the error)
+from the library (src/server.rs), process the result. On success, exit
+with status 0. On error, display the error to stderr, exit with
+status 1. (It's not enough to log the error)
 
-1. Write the server code in crate/daemon/src/main.rs, putting in code
-   that parses the command line that clap (use derive feature).
+1. Write a description of the command into spec/realized_man.md,
+   format it like a UNIX manpage, based on its description in
+   spec/design.md. Include usage examples and command output.
+
+2. Keeping spec/realized_man.md and spec/design.md in mind, write the
+   server code in src/bin/realized.rs, putting in code that parses the
+   command line that clap (use derive feature).
 
 2. Implement the server using the tools from the library crate,
-   notably crate/lib/src/server.rs. Put any code that's needed to setup
-   a TCP transport into crate/lib/src/server.rs and *not* in main.rs
+   notably src/server.rs. Put any code that's needed to setup
+   a TCP transport into src/server.rs and *not* in bin/*.rs
 
 3. Run "cargo check" to make sure everything compiles, fix any errors
 
 4. Write an integration test in
-   crate/daemon/test/daemon_integration_test.rs that starts the
+   test/daemon_integration_test.rs that starts the
    server and calls its List method, then makes sure the result is
    as expected.
 
 ## Write the command line code {#cli}
 
-Implement the command-line tool "realize" in the crate "cli". See that
-command described in the section "Overview" of spec/design.md
+Implement the command-line tool "realize" in src/bin/realize.rs. See
+that command described in the section "Overview" of spec/design.md
 
 
 The command-line tool should:
@@ -164,31 +150,36 @@ The command-line tool should:
 - start an in-process instance of RealizeService for the directory and
   directory id given in the command-line arguments
 
-- call the move algorithm from the library crate crate/lib/src/algo/move.rs
+- call the move algorithm from src/algo/move.rs
 
 - report success with exit status code 0, write any error to stderr
   and exit with status code 0. (Note that logging is not enough to
   report errors.)
 
 The server code should parse the command line arguments, call code
-from the library crate to connect to the server using TCP, calling
-crate/lib/src/client.rs, create an in-process service instance using
-crate/lib/src/server.rs, call the move algo from
-crate/lib/src/algo/move.rs on both instance, process the result.
+from the library to connect to the server using TCP, calling
+src/client.rs, create an in-process service instance using
+src/server.rs, call the move algo from src/algo/move.rs on both
+instance, process the result.
 
 On success, exit with status 0. On error, display the error to stderr,
 exit with status 1. (It's not enough to log the error)
 
-1. Write the server code in crate/cli/src/main.rs, putting in code
-   that parses the command line that clap (use derive feature).
+1. Write a description of the command into spec/realize_man.md,
+   format it like a UNIX manpage. Include usage examples and command
+   output.
 
-2. Implement the cli using the tools from the library crate, as
-   described above. Keep any code that's needed to setup the service
-   in crate/lib, extending it if necessary, and not in main.rs.
+2. Keeping specs/design.md and spec/realize_man.md in mind, write the
+   server code in src/bin/realize.rs, putting in code that
+   parses the command line that clap (use derive feature).
 
-3. Run "cargo check" to make sure everything compiles, fix any errors
+3. Implement the cli using the tools from the library, as described
+   above. Keep any code that's needed to setup the service in
+   the library, extending it if necessary, and *not* in bin/*.rs.
 
-4. Write an integration test in
+4. Run "cargo check" to make sure everything compiles, fix any errors
+
+5. Write an integration test in
    crate/daemon/test/daemon_integration_test.rs that starts the
    server and calls its List method, then makes sure the result is
    as expected.
