@@ -277,7 +277,9 @@ Implemented using rust
   library. Command-line output and printing errors must be done by the
   command.)
 
-- async, task, network connections and futures: tokio version 1.45
+- async, task, network connections and futures:
+  - tokio version 1.45
+  - rayon
 
 - Testing utilities (as needed):
 
