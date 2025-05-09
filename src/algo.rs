@@ -6,7 +6,6 @@
 use crate::model::service::{DirectoryId, RealizeService, Result, SyncedFile, SyncedFileState};
 use futures::future::{join, join_all};
 use tarpc::context::Context;
-use tokio::task;
 
 const CHUNK_SIZE: u64 = 1024 * 1024; // 1MB
 
