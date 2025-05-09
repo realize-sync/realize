@@ -15,10 +15,23 @@ RealizeService instances.
 
 ## Use rayon to parallelize copy_files {#rayon}
 
-- rewrite copy_files to use iterators instead of for loops
+1. rewrite copy_files to use iterators instead of for loops
 
-- adapt logic to use rayon, so it can parallelize. Make sure to Run
-  things like listing files on both source and dest in parallel.
+  - run "cargo check", fix any issues
+
+  - run "cargo test", fix any issues
+
+  - run "cargo fmt", then commit the change (See Cursor Rule about commits)
+
+2. adapt logic to use rayon, so it can parallelize. Make sure to Run
+   things like listing files on both source and dest in parallel, then
+   process each file in parallel. File updates (send + finalize) must
+   be run in sequence.
+
+  - run "cargo check", fix any issues
+
+  - run "cargo test", fix any issues
+
 
 ## Transform copy_files into move_files {#move}
 
