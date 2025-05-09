@@ -13,15 +13,6 @@ RealizeService instances.
 
 - run "cargo test", fix any issues
 
-## Tell RealizeService.send about a final chunk {#sendfinal}
-
-So send can truncate the file if it is larger.
-
-- update RealizeService::send to take an argument saying it is final
-- update RealizeServer::send implementation to truncate file to the final size
-- add test that sets up a file that's larger and is truncated by the send method
-- run "cargo test" and fix any issues
-
 ## Use rayon to parallelize copy_files {#rayon}
 
 - rewrite copy_files to use iterators instead of for loops

@@ -55,18 +55,18 @@ pub trait RealizeService {
 
     /// Send a byte range of a file.
     ///
-    /// TODO: add "at end" boolean, so send knows to truncate the file
-    /// if it is bigger than range end.
+    /// The 'file_size' argument indicates the intended final size of the file. If the file is larger than this after writing, it should be truncated.
     async fn send(
         dir_id: DirectoryId,
         relative_path: PathBuf,
         range: ByteRange,
+        file_size: u64,
         data: Vec<u8>,
     ) -> Result<()>;
 
     /// Read a byte range from a file
     async fn read(dir_id: DirectoryId, relative_path: PathBuf, range: ByteRange)
-        -> Result<Vec<u8>>;
+    -> Result<Vec<u8>>;
 
     /// Mark a partial file as complete
     async fn finish(dir_id: DirectoryId, relative_path: PathBuf) -> Result<()>;

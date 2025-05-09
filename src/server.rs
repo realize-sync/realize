@@ -92,6 +92,7 @@ impl RealizeService for RealizeServer {
         dir_id: DirectoryId,
         relative_path: PathBuf,
         range: ByteRange,
+        file_size: u64,
         data: Vec<u8>,
     ) -> Result<()> {
         let dir = self.find_directory(&dir_id)?;
@@ -116,6 +117,11 @@ impl RealizeService for RealizeServer {
             .open(&path)?;
         file.seek(SeekFrom::Start(range.0))?;
         file.write_all(&data)?;
+
+        let file_len = file.metadata()?.len();
+        if file_len > file_size {
+            file.set_len(file_size)?;
+        }
 
         Ok(())
     }
@@ -261,8 +267,8 @@ mod tests {
     use crate::model::service::RealizeServiceClient;
 
     use super::*;
-    use assert_fs::prelude::*;
     use assert_fs::TempDir;
+    use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
     use futures::StreamExt as _;
     use std::fs;
@@ -426,6 +432,7 @@ mod tests {
                 dir.id().clone(),
                 fpath.relative_path().to_path_buf(),
                 (5, 10),
+                10,
                 b"fghij".to_vec(),
             )
             .await?;
@@ -443,6 +450,7 @@ mod tests {
                 dir.id().clone(),
                 fpath.relative_path().to_path_buf(),
                 (0, 5),
+                10,
                 b"abcde".to_vec(),
             )
             .await?;
@@ -537,6 +545,29 @@ mod tests {
         assert!(!fpath.partial_path().exists());
         assert_eq!(std::fs::read_to_string(fpath.final_path())?, "abcde");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_send_truncates_file() -> anyhow::Result<()> {
+        let (server, _temp, dir) = setup_server_with_dir()?;
+        let fpath = LogicalPath::new(&dir, &PathBuf::from("truncate.txt"));
+        // Write a file with more data than we will send
+        std::fs::write(fpath.partial_path(), b"abcdefghij")?;
+        // Now send a chunk that should truncate the file to 7 bytes
+        server
+            .clone()
+            .send(
+                tarpc::context::Context::current(),
+                dir.id().clone(),
+                fpath.relative_path().to_path_buf(),
+                (0, 7),
+                7,
+                b"1234567".to_vec(),
+            )
+            .await?;
+        let content = std::fs::read_to_string(fpath.partial_path())?;
+        assert_eq!(content, "1234567");
         Ok(())
     }
 

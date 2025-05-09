@@ -70,7 +70,14 @@ where
             .read(ctx.clone(), dir_id.clone(), file.path.clone(), range)
             .await?;
         dst.clone()
-            .send(ctx.clone(), dir_id.clone(), file.path.clone(), range, data)
+            .send(
+                ctx.clone(),
+                dir_id.clone(),
+                file.path.clone(),
+                range,
+                file.size,
+                data,
+            )
             .await?;
         offset = end;
     }
@@ -86,8 +93,8 @@ mod tests {
     use super::*;
     use crate::model::service::DirectoryId;
     use crate::server::RealizeServer;
-    use assert_fs::prelude::*;
     use assert_fs::TempDir;
+    use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
     use std::sync::Arc;
 
