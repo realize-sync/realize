@@ -34,7 +34,8 @@ realized --port 9771 --privkey private_key_b.key --config config
 ```
 
 `private_key_b.key` is a file containing the private SSL key of the
-daemon on Host B, containing a PEM-encoded private key.
+daemon on Host B, containing a PEM-encoded private key generated using
+the ed25519 algorithm.
 
 `config` is a YAML file that contains:
 
@@ -576,6 +577,17 @@ Each host has:
  - a private key
  - a set of public keys it accepts connections from
 This is configured at command startup.
+
+Keys must use the ed25519 algorithm and be in the PEM format.
+
+Example command-line to generate a key pair for a peer (client or
+server) using openssl. The private key goes into `peer.key` and the
+public key into `peer-spki.pem`
+
+``bash
+openssl genpkey -algorithm ed25519 -out peer.key
+openssl pkey -in peer.key -pubout -out peer-spki.pem
+```
 
 ### Service Discovery
 

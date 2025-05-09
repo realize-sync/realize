@@ -15,6 +15,12 @@ serde = {version = "1.0", features = ["derive"] }
 futures = "0.3"
 sha2 = "0.10"
 fast_rsync = "0.2"
+rustls = "0.23.27"
+tokio-rustls = "0.26.2"
+rustls-pemfile = "2.2.0"
+base64 = "0.22.1"
+env_logger = "0.11.8"
+log = "0.4.27"
 
 [dev-dependencies]
 assert_fs = "1.1"

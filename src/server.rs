@@ -363,8 +363,8 @@ impl From<walkdir::Error> for RealizeError {
 mod tests {
     use super::*;
     use crate::model::service::Hash as FileHash;
-    use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
     use std::fs;
 
@@ -666,23 +666,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tarpc_rpc_basic() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let server_impl = RealizeServer::new(vec![Directory::new(
-            &DirectoryId::from("testdir"),
-            temp.path(),
-        )]);
-        let client = server_impl.as_inprocess_client();
-
-        let list = client
-            .list(tarpc::context::current(), DirectoryId::from("testdir"))
-            .await??;
-        assert_eq!(list.len(), 0);
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_hash_final_and_partial() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
         let content = b"hello world";
@@ -747,6 +730,23 @@ mod tests {
                 PathBuf::from("foo.txt"),
             )
             .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tarpc_rpc_inprocess() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let server_impl = RealizeServer::new(vec![Directory::new(
+            &DirectoryId::from("testdir"),
+            temp.path(),
+        )]);
+        let client = server_impl.as_inprocess_client();
+
+        let list = client
+            .list(tarpc::context::current(), DirectoryId::from("testdir"))
+            .await??;
+        assert_eq!(list.len(), 0);
+
         Ok(())
     }
 }
