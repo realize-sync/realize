@@ -6,17 +6,13 @@
 use crate::model::service::{DirectoryId, RealizeService, Result, SyncedFile, SyncedFileState};
 use futures::future::{join, join_all};
 use tarpc::context::Context;
+use tokio::task;
 
 const CHUNK_SIZE: u64 = 1024 * 1024; // 1MB
 
-/// Copies files from source to destination using the RealizeService interface.
-///
-/// # Arguments
-/// * `ctx` - tarpc context to pass to service methods
-/// * `src` - Source implementing RealizeService
-/// * `dst` - Destination implementing RealizeService
-/// * `dir_id` - DirectoryId to copy
-pub async fn copy_files<S, D>(ctx: Context, src: &S, dst: &D, dir_id: DirectoryId) -> Result<()>
+/// Moves files from source to destination using the RealizeService interface.
+/// After a successful move and hash match, deletes the file from the source.
+pub async fn move_files<S, D>(ctx: Context, src: &S, dst: &D, dir_id: DirectoryId) -> Result<()>
 where
     S: RealizeService + Clone + Send + Sync + 'static,
     D: RealizeService + Clone + Send + Sync + 'static,
@@ -34,8 +30,8 @@ where
     use std::collections::HashMap;
     let dst_map: HashMap<_, _> = dst_files.into_iter().map(|f| (f.path, f.state)).collect();
 
-    // 3. For all files in src, use iterator and run copy_file concurrently with join_all
-    let files_to_copy: Vec<_> = src_files
+    // 3. For all files in src, use iterator and run move_file concurrently with join_all
+    let files_to_move: Vec<_> = src_files
         .iter()
         .filter(|file| {
             matches!(
@@ -45,9 +41,9 @@ where
         })
         .collect();
 
-    let futures = files_to_copy
+    let futures = files_to_move
         .iter()
-        .map(|file| copy_file(file, src, dst, &ctx, &dir_id));
+        .map(|file| move_file(file, src, dst, &ctx, &dir_id));
     join_all(futures)
         .await
         .into_iter()
@@ -55,7 +51,7 @@ where
     Ok(())
 }
 
-async fn copy_file<S, D>(
+async fn move_file<S, D>(
     file: &SyncedFile,
     src: &S,
     dst: &D,
@@ -66,6 +62,15 @@ where
     S: RealizeService + Clone + Send + Sync + 'static,
     D: RealizeService + Clone + Send + Sync + 'static,
 {
+    let file_path = file.path.clone();
+    let dir_id_clone = dir_id.clone();
+    let ctx_clone = *ctx;
+    // Start src_hash and dst_hash in parallel
+    let src_hash_fut = src
+        .clone()
+        .hash(ctx_clone, dir_id_clone.clone(), file_path.clone());
+
+    // File transfer
     let mut offset: u64 = 0;
     while offset < file.size {
         let mut end = offset + CHUNK_SIZE;
@@ -89,10 +94,24 @@ where
             .await?;
         offset = end;
     }
-    dst.clone()
-        .finish(*ctx, dir_id.clone(), file.path.clone())
-        .await?;
 
+    // Await both hashes in parallel
+    let dst_hash_fut = dst
+        .clone()
+        .hash(ctx_clone, dir_id_clone.clone(), file_path.clone());
+    let (src_hash, dst_hash) = tokio::join!(src_hash_fut, dst_hash_fut);
+    let src_hash = src_hash?;
+    let dst_hash = dst_hash?;
+    if src_hash == dst_hash {
+        // Only finish and delete if hashes match
+        dst.clone()
+            .finish(*ctx, dir_id.clone(), file.path.clone())
+            .await?;
+        src.clone()
+            .delete(*ctx, dir_id.clone(), file.path.clone())
+            .await?;
+    }
+    // If hashes differ, leave file on both sides (future: handle with rsync/delta)
     Ok(())
 }
 
@@ -107,7 +126,7 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn test_copy_files() -> anyhow::Result<()> {
+    async fn test_move_files() -> anyhow::Result<()> {
         // Setup source directory with files
         let src_temp = TempDir::new()?;
         src_temp.child("foo.txt").write_str("hello")?;
@@ -126,7 +145,7 @@ mod tests {
         ));
         let dst_server = RealizeServer::for_dir(dst_dir.id(), dst_dir.path());
 
-        copy_files(
+        move_files(
             tarpc::context::Context::current(),
             &src_server,
             &dst_server,
@@ -134,7 +153,7 @@ mod tests {
         )
         .await?;
 
-        // Check that files are present in destination
+        // Check that files are present in destination and not in source
         let files = dst_server
             .clone()
             .list(
@@ -150,6 +169,15 @@ mod tests {
             file_names,
             vec!["foo.txt".to_string(), "bar.txt".to_string()]
         );
+        // Source should be empty
+        let src_files = src_server
+            .clone()
+            .list(
+                tarpc::context::Context::current(),
+                DirectoryId::from("testdir"),
+            )
+            .await?;
+        assert!(src_files.is_empty());
         Ok(())
     }
 }

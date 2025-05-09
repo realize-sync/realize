@@ -13,23 +13,6 @@ RealizeService instances.
 
 - run "cargo test", fix any issues
 
-## Transform copy_files into move_files {#move}
-
-1. Add the following methods to RealizeService:
- - compute sha-256 hash
- - check sha-256 hash
- - delete a file
- See the section "Service Definition" in spec/design.md
-
-2. Implement the new methods in RealizeServer and test them.
-
-3. Transform copy_files into move_files in src/algo.rs
- - implement step 6 described in section "Sync Algorithm: Move files from A to B" in spec/design.md
-   use the newly added methods
- - rename copy_files to move_files and copy_file to move_file
- - update the test to make sure the files are now moved and not just copied
- - add a test to make sure that a final file that was different in the destination is updated
-
 ## Setup a TCP transport for RealizeService {#tcp}
 
 Add code for setting up an unencrypted TCP transport and built a
