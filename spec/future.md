@@ -2,17 +2,6 @@
 
 This file lists planned changes.
 
-## Update copy_files to take a RealizeClient {#copy_file_client}
-
-copy_files() should always work on tarpc clients, not directly on
-RealizeService instances.
-
-- add a test that uses copy_files on two RealizeClient RPC instances
-  built using an in-process channel. See the RPC test in src/server.rs
-  for how to do that.
-
-- run "cargo test", fix any issues
-
 ## Setup a TCP transport for RealizeService {#tcp}
 
 Add code for setting up an unencrypted TCP transport and built a
