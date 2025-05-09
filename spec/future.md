@@ -164,29 +164,3 @@ organization" and "Implementation and Dependencies"
    server and calls its List method, then makes sure the result is
    as expected.
 
-## Design Review Findings {#design_review}
-
-This section lists issues identified in the design doc (spec/design.md) and proposed updates. Each item is numbered for future reference.
-
-### Issues and Proposed Updates
-
-1. **Conflict Resolution**: Add a section on how file conflicts are detected and resolved (e.g., last-writer-wins, manual intervention).
-2. **Partial File Handling**: Clarify the lifecycle and cleanup of partial files (e.g., `.part`), including recovery from interrupted or failed transfers.
-3. **Error Handling and Retries**: Add a section describing error handling strategy, including which errors are retried and how.
-4. **Directory Structure Sync**: Specify which file types are supported (e.g., regular files, directories, symlinks) and how directory structure is mirrored.
-5. **Security Details**: Expand the security section to cover key management, rotation, and revocation procedures.
-6. **Scalability and Performance**: Add notes on expected performance, bottlenecks, and any planned optimizations for large numbers of files or directories.
-7. **Configuration File Format**: Add a formal schema or comprehensive example for the config file, listing all possible fields.
-8. **API Versioning**: Add a note on API versioning and backward compatibility.
-9. **Logging and Monitoring**: Add a section on operational monitoring, log levels, and metrics.
-10. **Testing Strategy**: Add a brief section describing the overall testing approach (unit, integration, end-to-end).
-11. **Ownership Model**: Clarify how directory ownership is established and enforced.
-12. **Sync Directionality**: Clarify if sync is always unidirectional or can be bidirectional.
-13. **Service Discovery**: Clarify how peers are discovered and connected (manual config or discovery mechanism).
-14. **File Deletion Semantics**: Specify file deletion propagation rules (e.g., what happens if a file is deleted on A or B).
-15. **Progress Reporting**: Clarify what progress information is shown to the user (per file, per directory, etc.).
-16. **CLI Path Arguments**: Fix inconsistencies in CLI examples and comments regarding directory paths.
-17. **Partial File Naming**: Standardize and clarify the naming convention for partial files.
-18. **Key File Naming**: Fix inconsistencies in comments and examples regarding key file naming.
-
-Refer to this section for future design updates and clarifications.
