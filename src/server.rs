@@ -1,6 +1,7 @@
 use crate::model::service::{
     ByteRange, DirectoryId, RealizeError, RealizeService, Result, SyncedFile, SyncedFileState,
 };
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -139,6 +140,85 @@ impl RealizeService for RealizeServer {
         }
         Ok(())
     }
+
+    async fn hash(
+        self,
+        _ctx: tarpc::context::Context,
+        dir_id: DirectoryId,
+        relative_path: PathBuf,
+    ) -> Result<crate::model::service::Hash> {
+        let dir = self.find_directory(&dir_id)?;
+        let logical = LogicalPath::new(dir, &relative_path);
+        let (_state, actual) = logical.find()?;
+        let mut file = fs::File::open(&actual)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 8192];
+        loop {
+            let n = file.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buffer[..n]);
+        }
+        let hash = hasher.finalize();
+        Ok(crate::model::service::Hash(hash.into()))
+    }
+
+    async fn delete(
+        self,
+        _ctx: tarpc::context::Context,
+        dir_id: DirectoryId,
+        relative_path: PathBuf,
+    ) -> Result<()> {
+        let dir = self.find_directory(&dir_id)?;
+        let logical = LogicalPath::new(dir, &relative_path);
+        let mut any_deleted = false;
+        let final_path = logical.final_path();
+        let partial_path = logical.partial_path();
+        if final_path.exists() {
+            fs::remove_file(&final_path)?;
+            any_deleted = true;
+        }
+        if partial_path.exists() {
+            fs::remove_file(&partial_path)?;
+            any_deleted = true;
+        }
+        // Succeed even if neither existed
+        Ok(())
+    }
+
+    async fn calculate_signature(
+        self,
+        _ctx: tarpc::context::Context,
+        _dir_id: DirectoryId,
+        _relative_path: PathBuf,
+        _range: ByteRange,
+    ) -> Result<Option<crate::model::service::Signature>> {
+        unimplemented!("calculate_signature method not yet implemented")
+    }
+
+    async fn diff(
+        self,
+        _ctx: tarpc::context::Context,
+        _dir_id: DirectoryId,
+        _relative_path: PathBuf,
+        _range: ByteRange,
+        _signature: crate::model::service::Signature,
+    ) -> Result<crate::model::service::Delta> {
+        unimplemented!("diff method not yet implemented")
+    }
+
+    async fn apply_delta(
+        self,
+        _ctx: tarpc::context::Context,
+        _dir_id: DirectoryId,
+        _relative_path: PathBuf,
+        _range: ByteRange,
+        _file_size: u64,
+        _delta: crate::model::service::Delta,
+    ) -> Result<()> {
+        unimplemented!("apply_delta method not yet implemented")
+    }
 }
 
 // A directory, stored in RealizeServer and in LogicalPath.
@@ -267,6 +347,7 @@ mod tests {
     use crate::model::service::RealizeServiceClient;
 
     use super::*;
+    use crate::model::service::Hash as FileHash;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
@@ -596,6 +677,74 @@ mod tests {
             .await??;
         assert_eq!(list.len(), 0);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_hash_final_and_partial() -> anyhow::Result<()> {
+        let (server, temp, dir) = setup_server_with_dir()?;
+        let content = b"hello world";
+        let fpath = LogicalPath::new(&dir, &PathBuf::from("foo.txt"));
+        std::fs::write(fpath.final_path(), content)?;
+        let hash = server
+            .clone()
+            .hash(
+                tarpc::context::Context::current(),
+                dir.id().clone(),
+                PathBuf::from("foo.txt"),
+            )
+            .await?;
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+        let expected = FileHash(hasher.finalize().into());
+        assert_eq!(hash, expected);
+
+        // Now test partial
+        let content2 = b"partial content";
+        let fpath2 = LogicalPath::new(&dir, &PathBuf::from("bar.txt"));
+        std::fs::write(fpath2.partial_path(), content2)?;
+        let hash2 = server
+            .clone()
+            .hash(
+                tarpc::context::Context::current(),
+                dir.id().clone(),
+                PathBuf::from("bar.txt"),
+            )
+            .await?;
+        let mut hasher2 = Sha256::new();
+        hasher2.update(content2);
+        let expected2 = FileHash(hasher2.finalize().into());
+        assert_eq!(hash2, expected2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete_final_and_partial() -> anyhow::Result<()> {
+        let (server, temp, dir) = setup_server_with_dir()?;
+        let fpath = LogicalPath::new(&dir, &PathBuf::from("foo.txt"));
+        std::fs::write(fpath.final_path(), b"data")?;
+        std::fs::write(fpath.partial_path(), b"data2")?;
+        assert!(fpath.final_path().exists());
+        assert!(fpath.partial_path().exists());
+        server
+            .clone()
+            .delete(
+                tarpc::context::Context::current(),
+                dir.id().clone(),
+                PathBuf::from("foo.txt"),
+            )
+            .await?;
+        assert!(!fpath.final_path().exists());
+        assert!(!fpath.partial_path().exists());
+        // Should succeed if called again (idempotent)
+        server
+            .clone()
+            .delete(
+                tarpc::context::Context::current(),
+                dir.id().clone(),
+                PathBuf::from("foo.txt"),
+            )
+            .await?;
         Ok(())
     }
 }

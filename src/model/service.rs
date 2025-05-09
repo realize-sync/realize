@@ -47,6 +47,15 @@ pub enum SyncedFileState {
     Partial,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Hash(pub [u8; 32]);
+
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Signature(pub Vec<u8>);
+
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Delta(pub Vec<u8>);
+
 /// The service trait for file synchronization.
 #[tarpc::service]
 pub trait RealizeService {
@@ -70,6 +79,36 @@ pub trait RealizeService {
 
     /// Mark a partial file as complete
     async fn finish(dir_id: DirectoryId, relative_path: PathBuf) -> Result<()>;
+
+    /// Compute a SHA-256 hash of the file at the given path (final or partial).
+    async fn hash(dir_id: DirectoryId, relative_path: PathBuf) -> Result<Hash>;
+
+    /// Delete the file at the given path (both partial and final forms).
+    async fn delete(dir_id: DirectoryId, relative_path: PathBuf) -> Result<()>;
+
+    /// Calculate a signature for the file at the given path and byte range.
+    async fn calculate_signature(
+        dir_id: DirectoryId,
+        relative_path: PathBuf,
+        range: ByteRange,
+    ) -> Result<Option<Signature>>;
+
+    /// Compute a delta from the file at the given path and a given signature.
+    async fn diff(
+        dir_id: DirectoryId,
+        relative_path: PathBuf,
+        range: ByteRange,
+        signature: Signature,
+    ) -> Result<Delta>;
+
+    /// Apply a delta to the file at the given path and byte range.
+    async fn apply_delta(
+        dir_id: DirectoryId,
+        relative_path: PathBuf,
+        range: ByteRange,
+        file_size: u64,
+        delta: Delta,
+    ) -> Result<()>;
 }
 
 /// Error type used by [RealizeService].
