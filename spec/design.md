@@ -306,14 +306,210 @@ Path = "subdir1/file4.txt" would write to
 
 ### The `realized` daemon
 
-TODO: document the daemon described for now only in section "Scenario
-1: Move from A to B" and "Components of the System".
+The `realized` daemon is the long-running background service that
+manages and synchronizes one or more directories on a host. It exposes
+the RealizeService RPC interface over a secure TCP connection and
+enforces access control based on configured peer keys.
+
+#### Command Line Arguments
+
+```
+realized --port <port> --privkey <private_key_file> --config <config_file>
+```
+
+- `--port <port>`: TCP port to listen on for incoming RPC connections
+  (default: 9771).
+
+- `--privkey <private_key_file>`: Path to the PEM-encoded private key
+  file for this daemon.
+
+- `--config <config_file>`: Path to the YAML configuration file
+  specifying directory mappings and allowed peers.
+
+#### Inputs
+
+- **Private Key File**: PEM-encoded private key for TLS server authentication.
+- **Config File**: YAML file containing:
+  - `dirs`: Mapping from directory IDs to local paths.
+  - `peers`: Mapping from peer IDs to their PEM-encoded public keys.
+
+Example config:
+
+```yaml
+dirs:
+  - synceddir: /store/b/dir
+  - otherdir: /store/b/other
+peers:
+  - peer1: |
+      -----BEGIN PUBLIC KEY-----
+      ...
+      -----END PUBLIC KEY-----
+  - peer2: ...
+```
+
+#### Outputs
+
+- **Logs**: Diagnostic and audit logs (if enabled via RUSTLOG),
+  including file finalization and deletion events.
+
+- **Exit Codes**:
+  - `0`: Success (clean shutdown)
+  - `1`: Error (e.g., invalid config, failed to bind port, etc.)
+
+- **Errors**: Printed to stderr for user-visible failures (not just
+  logged).
+
+#### Behavior
+
+- Starts an RPC server on the specified port, using TLS with the
+  provided private key.
+
+- Loads the directory and peer configuration from the YAML config
+  file.
+
+- Accepts incoming connections only from peers with public keys listed
+  in the config.
+
+- Exposes the RealizeService API for directory listing, file transfer,
+  and sync operations.
+
+- Manages the local state of each configured directory, including
+  handling partial files and file finalization.
+
+- Logs key events (file finalization, deletion) at INFO level if
+  logging is enabled.
+
+- On fatal error (e.g., config parse failure, port in use), prints
+  error to stderr and exits with code 1.
+
+- Designed to be robust to interruptions: can be restarted without
+  data loss or corruption.
+
+#### Example Usage
+
+```
+realized --port 9771 --privkey private_key_b.key --config config.yaml
+```
+
+This starts the daemon on port 9771, using the specified private key
+and configuration file.
 
 ### The `realize` command
 
-TODO: document the command-line tool described for now only in section
-"Scenario 1: Move from A to B" and "Components of the System". Include
-an example output with progress.
+The `realize` command is a CLI tool used to initiate and control the
+synchronization of a local directory with a remote directory managed
+by a `realized` daemon. It acts as a client, connecting to the daemon
+over a secure TCP connection and invoking the move/sync algorithm.
+
+#### Command Line Arguments
+
+```
+realize --privkey <private_key_file> <host:port> <directory_id> <local_path>
+```
+
+- `--privkey <private_key_file>`: Path to the PEM-encoded private key
+  file for this client.
+
+- `<host:port>`: Address and port of the remote `realized` daemon to
+  connect to (e.g., hostb:9771).
+
+- `<directory_id>`: The ID of the directory to sync (must match an ID
+  in the daemon's config).
+
+- `<local_path>`: The local path containing the root of the directory
+  to sync.
+
+#### Inputs
+
+- **Private Key File**: PEM-encoded private key for TLS client
+  authentication.
+
+- **Remote Host/Port**: Network address of the target daemon.
+
+- **Directory ID**: Identifier for the directory to sync.
+
+- **Local Path**: Path to the local directory to be synchronized.
+
+#### Outputs
+
+- **Progress Output**: Progress information is printed to stdout
+  (using indicatif), showing sync status per file and overall.
+
+- **Errors**: Any errors are printed to stderr. Logging is not used
+  for user-facing errors.
+
+- **Exit Codes**:
+  - `0`: Success (all files synced as intended)
+  - `1`: Error (e.g., connection failure, sync error, invalid arguments)
+
+#### Behavior
+
+- Parses command line arguments and validates inputs.
+
+- Connects to the specified `realized` daemon using TLS,
+  authenticating with the provided private key.
+
+- Starts an in-process RealizeService instance for the local directory
+  and directory ID.
+
+- Invokes the move/sync algorithm (from `src/algo/move.rs`) to
+  synchronize files between the local directory and the remote daemon.
+
+- Reports progress to stdout, including per-file and overall sync
+  status.
+
+- On success, exits with code 0. On error, prints a message to stderr
+  and exits with code 1.
+
+- Designed to be restartable and robust to interruptions; re-running
+  the command resumes any incomplete sync.
+
+#### Example Usage
+
+```
+realize --privkey private_key_a.key hostb:9771 synceddir /store/a/dir
+```
+
+This command syncs the local directory `/store/a/dir` with the remote
+directory `synceddir` managed by the daemon at `hostb:9771`, using the
+provided private key for authentication.
+
+*Example* output of a successful command:
+
+```
+[1/4] Sent subdir1/file1.txt 3G SHA-256 A8382919827839811893
+[2/4] Sent subdir1/file2.txt 100M SHA-256 AE0031343989EAA7888F
+[4/3] Stored   ~/Downloads/image3.png as 6f6f6f3d19999999.jpg
+Success 2 files imported
+```
+
+Note: everything is sent to stdout.
+
+*Example* output of a command in progress:
+
+```
+[1/4] Sent subdir1/file1.txt 3G SHA-256 A8382919827839811893
+[2/4] Sent subdir1/file2.txt 100M SHA-256 AE0031343989EAA7888F
+[3/4] Sending [=======>                    ] (300 k/s) subdir1/file3.txt 2.5G
+[4/4] Sending [============>               ] (150 k/s) subdir1/file4.txt 110M
+[4/3] Stored   ~/Downloads/image3.png as 6f6f6f3d19999999.jpg
+Success 2 files imported
+```
+
+Note: everything is sent to stdout.
+
+*Example* output of the same command, once finished and failed:
+
+```
+[1/4] Sent   subdir1/file1.txt 3G SHA-256 A8382919827839811893
+[2/4] Sent   subdir1/file2.txt 100M SHA-256 AE0031343989EAA7888F
+[2/4] Sent   subdir1/file3.txt 2.5G SHA-256 001030E77AA710033331
+[3/4] Failed subdir1/file3.txt 2.5G: I/O error: disk full
+Error 1 file failed.2 files imported
+```
+
+Note: the lines "[3/4] Failed ..." and "Error ..." and sent to stderr,
+the rest to stdout.
 
 ### What is synced?
 
