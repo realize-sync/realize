@@ -1,6 +1,8 @@
+use crate::model::service::RealizeServiceClient;
 use crate::model::service::{
     ByteRange, DirectoryId, RealizeError, RealizeService, Result, SyncedFile, SyncedFileState,
 };
+use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -9,6 +11,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tarpc::server::Channel;
 use walkdir::WalkDir;
 
 #[derive(Clone)]
@@ -38,6 +41,20 @@ impl RealizeServer {
         self.dirs.get(dir_id).ok_or_else(|| {
             RealizeError::BadRequest(format!("Unknown directory ID: '{:?}'", dir_id))
         })
+    }
+
+    /// Create an in-process RealizeServiceClient for this server instance.
+    pub fn as_inprocess_client(self) -> RealizeServiceClient {
+        let (client_transport, server_transport) = tarpc::transport::channel::unbounded();
+        let server = tarpc::server::BaseChannel::with_defaults(server_transport);
+        tokio::spawn(
+            server
+                .execute(RealizeServer::serve(self))
+                .for_each(|response| async move {
+                    tokio::spawn(response);
+                }),
+        );
+        RealizeServiceClient::new(tarpc::client::Config::default(), client_transport).spawn()
     }
 }
 
@@ -172,16 +189,16 @@ impl RealizeService for RealizeServer {
     ) -> Result<()> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path);
-        let mut any_deleted = false;
+        let mut _any_deleted = false;
         let final_path = logical.final_path();
         let partial_path = logical.partial_path();
         if final_path.exists() {
             fs::remove_file(&final_path)?;
-            any_deleted = true;
+            _any_deleted = true;
         }
         if partial_path.exists() {
             fs::remove_file(&partial_path)?;
-            any_deleted = true;
+            _any_deleted = true;
         }
         // Succeed even if neither existed
         Ok(())
@@ -344,16 +361,12 @@ impl From<walkdir::Error> for RealizeError {
 
 #[cfg(test)]
 mod tests {
-    use crate::model::service::RealizeServiceClient;
-
     use super::*;
     use crate::model::service::Hash as FileHash;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
-    use futures::StreamExt as _;
     use std::fs;
-    use tarpc::server::Channel;
 
     fn setup_server_with_dir() -> anyhow::Result<(RealizeServer, TempDir, Arc<Directory>)> {
         let temp = TempDir::new()?;
@@ -654,23 +667,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_tarpc_rpc_basic() -> anyhow::Result<()> {
-        let (client_transport, server_transport) = tarpc::transport::channel::unbounded();
-
         let temp = TempDir::new()?;
-        let server = tarpc::server::BaseChannel::with_defaults(server_transport);
-        tokio::spawn(
-            server
-                .execute(RealizeServer::serve(RealizeServer::new(vec![
-                    Directory::new(&DirectoryId::from("testdir"), temp.path()),
-                ])))
-                // Handle all requests concurrently.
-                .for_each(|response| async move {
-                    tokio::spawn(response);
-                }),
-        );
-
-        let client =
-            RealizeServiceClient::new(tarpc::client::Config::default(), client_transport).spawn();
+        let server_impl = RealizeServer::new(vec![Directory::new(
+            &DirectoryId::from("testdir"),
+            temp.path(),
+        )]);
+        let client = server_impl.as_inprocess_client();
 
         let list = client
             .list(tarpc::context::current(), DirectoryId::from("testdir"))
@@ -682,7 +684,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hash_final_and_partial() -> anyhow::Result<()> {
-        let (server, temp, dir) = setup_server_with_dir()?;
+        let (server, _temp, dir) = setup_server_with_dir()?;
         let content = b"hello world";
         let fpath = LogicalPath::new(&dir, &PathBuf::from("foo.txt"));
         std::fs::write(fpath.final_path(), content)?;
@@ -720,7 +722,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_final_and_partial() -> anyhow::Result<()> {
-        let (server, temp, dir) = setup_server_with_dir()?;
+        let (server, _temp, dir) = setup_server_with_dir()?;
         let fpath = LogicalPath::new(&dir, &PathBuf::from("foo.txt"));
         std::fs::write(fpath.final_path(), b"data")?;
         std::fs::write(fpath.partial_path(), b"data2")?;
