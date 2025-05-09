@@ -4,7 +4,7 @@
 //! using the RealizeService trait. See spec/design.md for details.
 
 use crate::model::service::{DirectoryId, RealizeService, Result, SyncedFile, SyncedFileState};
-use std::path::PathBuf;
+use futures::future::{join, join_all};
 use tarpc::context::Context;
 
 const CHUNK_SIZE: u64 = 1024 * 1024; // 1MB
@@ -21,29 +21,37 @@ where
     S: RealizeService + Clone + Send + Sync + 'static,
     D: RealizeService + Clone + Send + Sync + 'static,
 {
-    // 1. List files on src and dst
-    let src_files = src.clone().list(ctx.clone(), dir_id.clone()).await?;
-    let dst_files = dst.clone().list(ctx.clone(), dir_id.clone()).await?;
+    // 1. List files on src and dst in parallel
+    let (src_files, dst_files) = join(
+        src.clone().list(ctx, dir_id.clone()),
+        dst.clone().list(ctx, dir_id.clone()),
+    )
+    .await;
+    let src_files = src_files?;
+    let dst_files = dst_files?;
 
     // 2. Build lookup for dst
     use std::collections::HashMap;
-    let mut dst_map: HashMap<PathBuf, SyncedFileState> = HashMap::new();
-    for f in dst_files {
-        dst_map.insert(f.path.clone(), f.state);
-    }
+    let dst_map: HashMap<_, _> = dst_files.into_iter().map(|f| (f.path, f.state)).collect();
 
-    // 3. For all files in src
-    for file in src_files {
-        match dst_map.get(&file.path) {
-            None | Some(SyncedFileState::Partial) => {
-                // Not in B or partial in B: copy/overwrite
-                copy_file(&file, src, dst, &ctx, &dir_id).await?;
-            }
-            Some(SyncedFileState::Final) => {
-                // Already present and final, skip
-            }
-        }
-    }
+    // 3. For all files in src, use iterator and run copy_file concurrently with join_all
+    let files_to_copy: Vec<_> = src_files
+        .iter()
+        .filter(|file| {
+            matches!(
+                dst_map.get(&file.path),
+                None | Some(SyncedFileState::Partial)
+            )
+        })
+        .collect();
+
+    let futures = files_to_copy
+        .iter()
+        .map(|file| copy_file(file, src, dst, &ctx, &dir_id));
+    join_all(futures)
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
     Ok(())
 }
 
@@ -67,11 +75,11 @@ where
         let range = (offset, end);
         let data = src
             .clone()
-            .read(ctx.clone(), dir_id.clone(), file.path.clone(), range)
+            .read(*ctx, dir_id.clone(), file.path.clone(), range)
             .await?;
         dst.clone()
             .send(
-                ctx.clone(),
+                *ctx,
                 dir_id.clone(),
                 file.path.clone(),
                 range,
@@ -82,7 +90,7 @@ where
         offset = end;
     }
     dst.clone()
-        .finish(ctx.clone(), dir_id.clone(), file.path.clone())
+        .finish(*ctx, dir_id.clone(), file.path.clone())
         .await?;
 
     Ok(())

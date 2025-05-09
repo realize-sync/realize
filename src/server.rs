@@ -83,7 +83,7 @@ impl RealizeService for RealizeServer {
         let mut buffer = vec![0; (range.1 - range.0) as usize];
         file.read_exact(&mut buffer)?;
 
-        return Ok(buffer);
+        Ok(buffer)
     }
 
     async fn send(
