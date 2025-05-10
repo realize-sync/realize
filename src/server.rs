@@ -363,8 +363,8 @@ impl From<walkdir::Error> for RealizeError {
 mod tests {
     use super::*;
     use crate::model::service::Hash as FileHash;
-    use assert_fs::prelude::*;
     use assert_fs::TempDir;
+    use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
     use std::fs;
 

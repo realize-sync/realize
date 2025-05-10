@@ -106,8 +106,8 @@ mod tests {
     use super::*;
     use crate::model::service::DirectoryId;
     use crate::server::RealizeServer;
-    use assert_fs::prelude::*;
     use assert_fs::TempDir;
+    use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
     use std::sync::Arc;
 

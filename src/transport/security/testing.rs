@@ -1,4 +1,4 @@
-use rustls::pki_types::{pem::PemObject as _, PrivateKeyDer, SubjectPublicKeyInfoDer};
+use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer, pem::PemObject as _};
 
 pub fn client_public_key() -> SubjectPublicKeyInfoDer<'static> {
     SubjectPublicKeyInfoDer::from_pem_slice(
