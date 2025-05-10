@@ -178,28 +178,21 @@ mod tests {
     use crate::server::Directory;
     use crate::testing::AbortJoinHandleOnDrop;
     use assert_fs::TempDir;
+    use rustls::pki_types::PrivateKeyDer;
+    use rustls::pki_types::pem::PemObject;
     use tarpc::context;
 
-    #[tokio::test]
-    async fn test_tarpc_rpc_tcp_tls() -> anyhow::Result<()> {
-        // do this in main
-        env_logger::init();
-        let crypto = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-
-        let mut verifier = PeerVerifier::new(&crypto);
-        verifier.add_peer(&security::testing::client_public_key());
-        verifier.add_peer(&security::testing::server_public_key());
-        let verifier = Arc::new(verifier);
-
+    // Helper to setup a test server and return (server_addr, server_handle, crypto, temp_dir)
+    async fn setup_test_server(
+        verifier: Arc<PeerVerifier>,
+    ) -> anyhow::Result<(SocketAddr, AbortJoinHandleOnDrop<()>, TempDir)> {
         let temp = TempDir::new()?;
         let server_impl = RealizeServer::new(vec![Directory::new(
             &DirectoryId::from("testdir"),
             temp.path(),
         )]);
-
-        let server_privkey = crypto
-            .key_provider
-            .load_private_key(security::testing::server_private_key())?;
+        let server_privkey =
+            load_private_key(crate::transport::security::testing::server_private_key())?;
         let server = RunningServer::bind(
             "localhost:0",
             server_impl,
@@ -207,23 +200,138 @@ mod tests {
             server_privkey,
         )
         .await?;
-
-        // Binding to localhost:0 lets the OS choose the port. We need
-        // to know what it is for the client.
         let addr = server.local_addr()?;
-        let _server_handle = AbortJoinHandleOnDrop::new(server.spawn());
+        let server_handle = AbortJoinHandleOnDrop::new(server.spawn());
+        Ok((addr, server_handle, temp))
+    }
 
-        let client_privkey = crypto
+    // Helper to create a PeerVerifier with only the server key
+    fn verifier_server_only() -> Arc<PeerVerifier> {
+        let crypto = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut verifier = PeerVerifier::new(&crypto);
+        verifier.add_peer(&crate::transport::security::testing::server_public_key());
+        Arc::new(verifier)
+    }
+
+    // Helper to create a PeerVerifier with only the client key
+    fn verifier_client_only() -> Arc<PeerVerifier> {
+        let crypto = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut verifier = PeerVerifier::new(&crypto);
+        verifier.add_peer(&crate::transport::security::testing::client_public_key());
+        Arc::new(verifier)
+    }
+
+    // Helper to create a PeerVerifier with both keys
+    fn verifier_both() -> Arc<PeerVerifier> {
+        let crypto = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut verifier = PeerVerifier::new(&crypto);
+        verifier.add_peer(&crate::transport::security::testing::client_public_key());
+        verifier.add_peer(&crate::transport::security::testing::server_public_key());
+        Arc::new(verifier)
+    }
+
+    // Helper to load an ECDSA private key (wrong algorithm)
+    //
+    // Generated with:
+    //  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:secp521r1 -out -
+    fn ecdsa_private_key() -> PrivateKeyDer<'static> {
+        PrivateKeyDer::from_pem_slice(
+            br#"
+-----BEGIN PRIVATE KEY-----
+MIHuAgEAMBAGByqGSM49AgEGBSuBBAAjBIHWMIHTAgEBBEIBdmUEGjRjKtFVKy4x
+8W8K2LqM1sYMOmR/j9F5hVer8c1HJpMKayEvIKPOXdz4zkCYzOIObeYQYViKwYVM
+mS4Q8IShgYkDgYYABAFRqTnrP2pV1WUT3Lh2equo3FHynH7NHLal4POdPMjOBoJY
+18l5B8EFR8GDaVCZOInmjAljmojgHGzE4mtaJxlIdQABnDgmYcZVCeF3z6L9Xqxi
+nuvOs8dx4/JaO4c3f+8m4U2FW+j1o5jei5GbZIgVaOWZICbVJj3vtW0JTzgipnhm
+KQ==
+-----END PRIVATE KEY-----
+"#,
+        )
+        .expect("Invalid ECDSA private key")
+    }
+
+    fn load_private_key(
+        private_key: PrivateKeyDer<'static>,
+    ) -> anyhow::Result<Arc<dyn SigningKey>> {
+        Ok(rustls::crypto::aws_lc_rs::default_provider()
             .key_provider
-            .load_private_key(security::testing::client_private_key())?;
+            .load_private_key(private_key)?)
+    }
 
-        let client =
-            connect_client("localhost", addr, Arc::clone(&verifier), client_privkey).await?;
+    #[tokio::test]
+    async fn test_tarpc_rpc_tcp_tls() -> anyhow::Result<()> {
+        env_logger::init();
 
+        let verifier = verifier_both();
+        let (addr, _server_handle, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
+        let client_privkey =
+            load_private_key(crate::transport::security::testing::client_private_key())?;
+        let client = connect_client("localhost", addr, verifier_both(), client_privkey).await?;
         let list = client
             .list(context::current(), DirectoryId::from("testdir"))
             .await??;
         assert_eq!(list.len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_client_not_in_server_verifier_fails() -> anyhow::Result<()> {
+        let verifier = verifier_server_only();
+        let (addr, _server_handle, _temp) = setup_test_server(Arc::clone(&verifier)).await.unwrap();
+        let client_privkey =
+            load_private_key(crate::transport::security::testing::client_private_key())?;
+        let client_result =
+            connect_client("localhost", addr, Arc::clone(&verifier), client_privkey).await;
+        match client_result {
+            Ok(client) => {
+                let list_result = client
+                    .list(context::current(), DirectoryId::from("testdir"))
+                    .await;
+                assert!(
+                    list_result.is_err(),
+                    "Expected error when client is not in server verifier on first RPC"
+                );
+            }
+            Err(_) => {
+                // If handshake fails, that's also acceptable
+                assert!(true);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_not_in_client_verifier_fails() -> anyhow::Result<()> {
+        let verifier = verifier_client_only();
+        let (addr, _server_handle, _temp) = setup_test_server(Arc::clone(&verifier)).await.unwrap();
+        let client_privkey =
+            load_private_key(crate::transport::security::testing::client_private_key())?;
+        let result = connect_client("localhost", addr, Arc::clone(&verifier), client_privkey).await;
+        assert!(
+            result.is_err(),
+            "Expected error when server is not in client verifier"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wrong_algorithm_private_key_fails() -> anyhow::Result<()> {
+        let ecdsa_privkey = load_private_key(ecdsa_private_key())?;
+
+        let crypto = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut verifier = PeerVerifier::new(&crypto);
+        verifier.add_peer(&crate::transport::security::testing::client_public_key());
+        verifier.add_peer(&ecdsa_privkey.public_key().expect("Incomplete private key"));
+        let verifier = Arc::new(verifier);
+
+        let (addr, _server_handle, _temp) = setup_test_server(Arc::clone(&verifier)).await.unwrap();
+        let result = connect_client("localhost", addr, Arc::clone(&verifier), ecdsa_privkey).await;
+        assert!(
+            result.is_err(),
+            "Expected error when server is not in client verifier"
+        );
 
         Ok(())
     }
