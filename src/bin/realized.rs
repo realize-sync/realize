@@ -98,14 +98,7 @@ async fn main() {
     let verifier = Arc::new(verifier);
 
     // Load private key
-    let privkey = match fs::read(&args.privkey) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            eprintln!("Failed to read private key: {e}");
-            std::process::exit(1);
-        }
-    };
-    let privkey = match PrivateKeyDer::from_pem_slice(&privkey) {
+    let privkey = match PrivateKeyDer::from_pem_file(&args.privkey) {
         Ok(key) => key,
         Err(e) => {
             eprintln!("Failed to parse private key: {e}");

@@ -27,20 +27,18 @@ async fn test_move_files_integration() -> anyhow::Result<()> {
     src_dir.child("bar.txt").write_str("world")?;
 
     // Setup keys
-    let privkey_b = fs::read("resources/test/b.key")?;
-    let pubkey_a = fs::read_to_string("resources/test/a-spki.pem")?;
+    let privkey_b_path = PathBuf::from("resources/test/b.key");
+    let pubkey_a_path = PathBuf::from("resources/test/a-spki.pem");
 
     // Start server (daemon) in background
     let crypto = Arc::new(security::default_provider());
     let mut verifier = PeerVerifier::new(&crypto);
-    verifier.add_peer(&SubjectPublicKeyInfoDer::from_pem_slice(
-        pubkey_a.as_bytes(),
-    )?);
+    verifier.add_peer(&SubjectPublicKeyInfoDer::from_pem_file(&pubkey_a_path)?);
     let verifier = Arc::new(verifier);
     let privkey = Arc::from(
         crypto
             .key_provider
-            .load_private_key(PrivateKeyDer::from_pem_slice(&privkey_b)?)?,
+            .load_private_key(PrivateKeyDer::from_pem_file(&privkey_b_path)?)?,
     );
     let server = RealizeServer::for_dir(&"testdir".into(), dst_dir.path());
     let running = RunningServer::bind("127.0.0.1:0", server, verifier, privkey).await?;

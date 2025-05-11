@@ -27,20 +27,8 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
     fs::create_dir(&testdir_server).await?;
     testdir_server.child("foo.txt").write_str("hello")?;
 
-    // Generate a test private key and public key (ed25519, PEM)
-    let privkey = r#"-----BEGIN PRIVATE KEY-----
-MC4CAQAwBQYDK2VwBCIEIPaGEL0B7EAMQb5anN+DTH0vZ/qI90AQpbwYuklDABpV
------END PRIVATE KEY-----
-"#;
-
-    let pubkey = r#"-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEA/CMSGfePPViYEUoHMNTrywE+mwTmB0poO0A1ATNIJGo=
------END PUBLIC KEY-----
-"#;
-
-    // Write keys to temp files
-    let privkey_file = temp_dir.child("test.key");
-    privkey_file.write_str(privkey)?;
+    let privkey_file = PathBuf::from("resources/test/a.key");
+    let pubkey_file = PathBuf::from("resources/test/a-spki.pem");
 
     // Write config YAML
     let config_yaml = format!(
@@ -51,7 +39,7 @@ peers:
       {}
 "#,
         testdir_server.display(),
-        pubkey.replace("\n", "\n      ")
+        std::fs::read_to_string(&pubkey_file)?.replace("\n", "\n      ")
     );
     let config_file = temp_dir.child("config.yaml");
     config_file.write_str(&config_yaml)?;
@@ -62,7 +50,7 @@ peers:
         cmd.arg("--address")
             .arg("localhost:0")
             .arg("--privkey")
-            .arg(privkey_file.path())
+            .arg(&privkey_file)
             .arg("--config")
             .arg(config_file.path())
             .stdin(std::process::Stdio::null())
@@ -88,7 +76,7 @@ peers:
     // Connect to the port the daemon listens to.
     let crypto = Arc::new(security::default_provider());
     let mut verifier = PeerVerifier::new(&crypto);
-    verifier.add_peer(&SubjectPublicKeyInfoDer::from_pem_slice(pubkey.as_bytes())?);
+    verifier.add_peer(&SubjectPublicKeyInfoDer::from_pem_file(&pubkey_file)?);
     let verifier = Arc::new(verifier);
 
     let client = tcp::connect_client(
@@ -97,7 +85,7 @@ peers:
         verifier,
         crypto
             .key_provider
-            .load_private_key(PrivateKeyDer::from_pem_slice(privkey.as_bytes())?)?,
+            .load_private_key(PrivateKeyDer::from_pem_file(&privkey_file)?)?,
     )
     .await?;
     let files = client

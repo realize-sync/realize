@@ -5,6 +5,7 @@ use realize::transport::security::{self, PeerVerifier};
 use realize::transport::tcp;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
+use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
 
@@ -18,15 +19,15 @@ struct Cli {
 
     /// Path to the private key
     #[arg(long)]
-    private_key: String,
+    private_key: PathBuf,
 
     /// Server public key
     #[arg(long)]
-    server_public_key: String,
+    server_public_key: PathBuf,
 
     /// Directory to operate on
     #[arg(long)]
-    directory: String,
+    directory: PathBuf,
 
     /// Directory id
     #[arg(long)]
@@ -53,14 +54,7 @@ async fn main() {
     let cli = Cli::parse();
 
     // Parse private key
-    let privkey_bytes = match std::fs::read(&cli.private_key) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            eprintln!("Failed to read private key: {e}");
-            process::exit(1);
-        }
-    };
-    let privkey = match PrivateKeyDer::from_pem_slice(&privkey_bytes) {
+    let privkey = match PrivateKeyDer::from_pem_file(cli.private_key) {
         Ok(key) => key,
         Err(e) => {
             eprintln!("Failed to parse private key: {e}");
