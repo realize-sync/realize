@@ -5,7 +5,7 @@ This file lists planned changes.
 ## Write the daemon code {#daemon}
 
 Implement the server "realized" in "src/bin/realized.rs". The server
-should be a command-line tool tat work as described in the section
+should be a command-line tool that work as described in the section
 "Overview" of spec/design.md
 
 Leave out anything that has to do with security and authentication for

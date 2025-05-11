@@ -51,13 +51,13 @@ dirs:
  - directory_id2: /store/c/dir
 
 peers:
- - peer1: | # public key as a string (PEM-encoded Public Key)
+ - peer1: | # public key as a string (PEM-encoded ED25519 Public Key)
  -----BEGIN PUBLIC KEY-----
  MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAw1603u9y/gRa194d
  ... (rest of the base64-encoded public key) ...
  -----END PUBLIC KEY-----
 
- - peer2: ... # public key as a string (PEM-encoded Public Key)
+ - peer2: ... # public key as a string (PEM-encoded ED25519 Public Key)
 ```
 
 Host A runs the realize command-line tool with the following arguments:
@@ -68,7 +68,7 @@ realize --privkey private_key_a.key hostb:9771 synceddir /store/a/dir
 
 `private_key_a.key` is a file containing the private SSL key of Host B
 (Host B has the equivalent public key), containing a PEM-encoded
-private key.
+ED25519 private key.
 
 `hostb:9771` is the host and port of the daemon on Host B to connect
 to
@@ -321,8 +321,8 @@ realized --port <port> --privkey <private_key_file> --config <config_file>
 - `--port <port>`: TCP port to listen on for incoming RPC connections
   (default: 9771).
 
-- `--privkey <private_key_file>`: Path to the PEM-encoded private key
-  file for this daemon.
+- `--privkey <private_key_file>`: Path to the PEM-encoded ED25519
+  private key file for this daemon.
 
 - `--config <config_file>`: Path to the YAML configuration file
   specifying directory mappings and allowed peers.
@@ -332,7 +332,7 @@ realized --port <port> --privkey <private_key_file> --config <config_file>
 - **Private Key File**: PEM-encoded private key for TLS server authentication.
 - **Config File**: YAML file containing:
   - `dirs`: Mapping from directory IDs to local paths.
-  - `peers`: Mapping from peer IDs to their PEM-encoded public keys.
+  - `peers`: Mapping from peer IDs to their PEM-encoded ED25519 public keys.
 
 Example config:
 
