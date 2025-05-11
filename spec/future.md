@@ -107,7 +107,7 @@ Extend realize with usage metrics. See also the metrics section in
 docs/design.md.
 
 Open issue: realize is a command, how should it send metrics to
-prometheus for collection?
+prometheus for collection? https://last9.io/blog/prometheus-pushgateway/
 
 ## Design and add useful logging to realized {#daemonlog}
 
