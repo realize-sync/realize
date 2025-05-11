@@ -2,30 +2,6 @@
 
 This file lists planned changes.
 
-## Setup a TCP transport for RealizeService {#tcp}
-
-Add code for setting up an unencrypted TCP transport and built a
-server and a client for it. The code for the server goes into
-src/server.rs, the code for the client into src/client.rs, any code
-shared by the client and server but not part of the model can do into
-src/transport.rs
-
-Review and apply any relevant Cursor rules.
-
-Review and apply the relevant sections of spec/design.md, including
-but not limited to the sections "Details" "Service Definition", "Code
-organization" and "Implementation and Dependencies"
-
-1. Implement functions to build a server and client using a TCP
-   transport
-
-2. Run "cargo check" to make sure everything compiles, fix any issues
-
-3. Write tests to test the server and client, make sure they can
-   communicate using localhost as an address.
-
-4. Run "cargo test" to make sure all test pass, fix any issues
-
 ## Write the daemon code {#daemon}
 
 Implement the server "realized" in "src/bin/realized.rs". The server
