@@ -1,18 +1,27 @@
 use crate::model::service::RealizeServiceClient;
 use crate::model::service::{
-    ByteRange, DirectoryId, RealizeError, RealizeService, Result, SyncedFile, SyncedFileState,
+    ByteRange, DirectoryId, RealizeError, RealizeService, Result, RsyncOperation, SyncedFile,
+    SyncedFileState,
+};
+use fast_rsync::{
+    Signature as RsyncSignature, SignatureOptions, apply_limited as rsync_apply_limited,
+    diff as rsync_diff,
 };
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
+use std::cmp::min;
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tarpc::server::Channel;
 use walkdir::WalkDir;
+
+// Move this to the top-level, outside any impl
+const RSYNC_BLOCK_SIZE: usize = 4096;
 
 #[derive(Clone)]
 pub struct RealizeServer {
@@ -207,35 +216,101 @@ impl RealizeService for RealizeServer {
     async fn calculate_signature(
         self,
         _ctx: tarpc::context::Context,
-        _dir_id: DirectoryId,
-        _relative_path: PathBuf,
-        _range: ByteRange,
-    ) -> Result<Option<crate::model::service::Signature>> {
-        unimplemented!("calculate_signature method not yet implemented")
+        dir_id: DirectoryId,
+        relative_path: PathBuf,
+        range: ByteRange,
+    ) -> Result<crate::model::service::Signature> {
+        let dir = self.find_directory(&dir_id)?;
+        let logical = LogicalPath::new(dir, &relative_path);
+        let (_, actual) = logical.find()?;
+        let mut file = std::fs::File::open(&actual)?;
+        file.seek(std::io::SeekFrom::Start(range.0))?;
+        let mut buffer = vec![0u8; (range.1 - range.0) as usize];
+        file.read_exact(&mut buffer)?;
+        let opts = SignatureOptions {
+            block_size: RSYNC_BLOCK_SIZE as u32,
+            crypto_hash_size: 8,
+        };
+        let sig = RsyncSignature::calculate(&buffer, opts);
+        Ok(crate::model::service::Signature(sig.into_serialized()))
     }
 
     async fn diff(
         self,
         _ctx: tarpc::context::Context,
-        _dir_id: DirectoryId,
-        _relative_path: PathBuf,
-        _range: ByteRange,
-        _signature: crate::model::service::Signature,
+        dir_id: DirectoryId,
+        relative_path: PathBuf,
+        range: ByteRange,
+        signature: crate::model::service::Signature,
     ) -> Result<crate::model::service::Delta> {
-        unimplemented!("diff method not yet implemented")
+        let dir = self.find_directory(&dir_id)?;
+        let logical = LogicalPath::new(dir, &relative_path);
+        let mut buffer = vec![0u8; (range.1 - range.0) as usize];
+        if let Ok((_, actual)) = logical.find() {
+            let mut file = std::fs::File::open(&actual)?;
+            partial_read(&mut file, &range, &mut buffer)?;
+        }
+        let sig = RsyncSignature::deserialize(signature.0)?;
+        let mut delta = Vec::new();
+        rsync_diff(&sig.index(), &buffer, &mut delta)?;
+        Ok(crate::model::service::Delta(delta))
     }
 
     async fn apply_delta(
         self,
         _ctx: tarpc::context::Context,
-        _dir_id: DirectoryId,
-        _relative_path: PathBuf,
-        _range: ByteRange,
-        _file_size: u64,
-        _delta: crate::model::service::Delta,
+        dir_id: DirectoryId,
+        relative_path: PathBuf,
+        range: ByteRange,
+        file_size: u64,
+        delta: crate::model::service::Delta,
     ) -> Result<()> {
-        unimplemented!("apply_delta method not yet implemented")
+        let dir = self.find_directory(&dir_id)?;
+        let logical = LogicalPath::new(dir, &relative_path);
+        let (state, actual) = logical.find()?;
+        // Always apply to partial file
+        let partial_path = logical.partial_path();
+        if state == SyncedFileState::Final {
+            std::fs::rename(&actual, &partial_path)?;
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&partial_path)?;
+        let mut base = vec![0u8; (range.1 - range.0) as usize];
+        partial_read(&mut file, &range, &mut base)?;
+        let mut out = Vec::new();
+        rsync_apply_limited(&base, &delta.0, &mut out, (range.1 - range.0) as usize)?;
+        if out.len() as u64 != range.1 - range.0 {
+            return Err(RealizeError::BadRequest(
+                "Delta output size mismatch".to_string(),
+            ));
+        }
+        file.seek(std::io::SeekFrom::Start(range.0))?;
+        file.write_all(&out)?;
+        let file_len = file.metadata()?.len();
+        if file_len > file_size {
+            file.set_len(file_size)?;
+        }
+        Ok(())
     }
+}
+
+fn partial_read(
+    file: &mut File,
+    range: &ByteRange,
+    buf: &mut [u8],
+) -> std::result::Result<(), std::io::Error> {
+    let initial_size = file.metadata()?.size();
+    if initial_size > range.0 {
+        file.seek(std::io::SeekFrom::Start(range.0))?;
+        let read_end = (min(range.1, initial_size) - range.0) as usize;
+        file.read_exact(&mut buf[0..read_end])?;
+    }
+
+    Ok(())
 }
 
 // A directory, stored in RealizeServer and in LogicalPath.
@@ -356,6 +431,24 @@ impl From<walkdir::Error> for RealizeError {
         } else {
             anyhow::Error::new(err).into()
         }
+    }
+}
+
+// Add error conversions for fast_rsync errors
+impl From<fast_rsync::DiffError> for RealizeError {
+    fn from(e: fast_rsync::DiffError) -> Self {
+        RealizeError::Rsync(RsyncOperation::Diff, e.to_string())
+    }
+}
+impl From<fast_rsync::ApplyError> for RealizeError {
+    fn from(e: fast_rsync::ApplyError) -> Self {
+        RealizeError::Rsync(RsyncOperation::Apply, e.to_string())
+    }
+}
+
+impl From<fast_rsync::SignatureParseError> for RealizeError {
+    fn from(e: fast_rsync::SignatureParseError) -> Self {
+        RealizeError::Rsync(RsyncOperation::Sign, e.to_string())
     }
 }
 
@@ -747,6 +840,165 @@ mod tests {
             .await??;
         assert_eq!(list.len(), 0);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_calculate_signature_and_diff_and_apply_delta() -> anyhow::Result<()> {
+        let (server, temp, dir) = setup_server_with_dir()?;
+        let file_path = PathBuf::from("foo.txt");
+        let file_content = b"hello world, this is a test of rsync signature!";
+        temp.child("foo.txt").write_binary(file_content)?;
+
+        // Calculate signature for the whole file
+        let sig = server
+            .clone()
+            .calculate_signature(
+                tarpc::context::Context::current(),
+                dir.id().clone(),
+                file_path.clone(),
+                (0, file_content.len() as u64),
+            )
+            .await?;
+
+        // Change file content and write to a new file
+        let new_content = b"hello world, this is A tost of rsync signature! (changed)";
+        temp.child("foo.txt").write_binary(new_content)?;
+
+        // Diff: get delta from old signature to new content
+        let delta = server
+            .clone()
+            .diff(
+                tarpc::context::Context::current(),
+                dir.id().clone(),
+                file_path.clone(),
+                (0, new_content.len() as u64),
+                sig.clone(),
+            )
+            .await?;
+        assert!(!delta.0.is_empty());
+
+        // Revert file to old content, then apply delta
+        temp.child("foo.txt").write_binary(file_content)?;
+        let res = server
+            .clone()
+            .apply_delta(
+                tarpc::context::Context::current(),
+                dir.id().clone(),
+                file_path.clone(),
+                (0, new_content.len() as u64),
+                new_content.len() as u64,
+                delta,
+            )
+            .await;
+        assert!(res.is_ok());
+        // File should now match new_content
+        let logical = LogicalPath::new(&dir, &file_path);
+        let (_state, actual) = logical.find()?;
+        let mut buf = Vec::new();
+        std::fs::File::open(&actual)?.read_to_end(&mut buf)?;
+        assert_eq!(&buf[..new_content.len()], new_content);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_signature_on_nonexisting_file() -> anyhow::Result<()> {
+        let (server, _temp, dir) = setup_server_with_dir()?;
+        // Nonexistent file
+        let result = server
+            .clone()
+            .calculate_signature(
+                tarpc::context::Context::current(),
+                dir.id().clone(),
+                PathBuf::from("notfound.txt"),
+                (0, 10),
+            )
+            .await;
+        assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_apply_delta_error_case() -> anyhow::Result<()> {
+        let (server, temp, dir) = setup_server_with_dir()?;
+        let file_path = PathBuf::from("foo.txt");
+        temp.child("foo.txt").write_str("abc")?;
+        // Try to apply a bogus delta
+        let result = server
+            .clone()
+            .apply_delta(
+                tarpc::context::Context::current(),
+                dir.id().clone(),
+                file_path,
+                (0, 3),
+                3,
+                crate::model::service::Delta(vec![1, 2, 3]),
+            )
+            .await;
+        if let Err(ref e) = result {
+            let msg = format!("{e}");
+            println!("Error: {msg}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_diff_and_apply_delta_with_shorter_content() -> anyhow::Result<()> {
+        let (server, temp, dir) = setup_server_with_dir()?;
+        let file_path = PathBuf::from("shorten.txt");
+        let original_content = b"this is the original, longer content";
+        temp.child("shorten.txt").write_binary(original_content)?;
+
+        // Calculate signature for the whole file
+        let sig = server
+            .clone()
+            .calculate_signature(
+                tarpc::context::Context::current(),
+                dir.id().clone(),
+                file_path.clone(),
+                (0, original_content.len() as u64),
+            )
+            .await?;
+
+        // Prepare shorter new content
+        let new_content = b"short";
+        temp.child("shorten.txt").write_binary(new_content)?;
+
+        // Diff: get delta from old signature to new (shorter) content
+        let delta = server
+            .clone()
+            .diff(
+                tarpc::context::Context::current(),
+                dir.id().clone(),
+                file_path.clone(),
+                (0, new_content.len() as u64),
+                sig.clone(),
+            )
+            .await?;
+        assert!(!delta.0.is_empty());
+
+        // Revert file to original content, then apply delta
+        temp.child("shorten.txt").write_binary(original_content)?;
+        let res = server
+            .clone()
+            .apply_delta(
+                tarpc::context::Context::current(),
+                dir.id().clone(),
+                file_path.clone(),
+                (0, new_content.len() as u64),
+                new_content.len() as u64,
+                delta,
+            )
+            .await;
+        assert!(res.is_ok());
+        // File should now match new_content and be truncated
+        let logical = LogicalPath::new(&dir, &file_path);
+        let (_state, actual) = logical.find()?;
+        let mut buf = Vec::new();
+        std::fs::File::open(&actual)?.read_to_end(&mut buf)?;
+        assert_eq!(&buf, new_content);
         Ok(())
     }
 }

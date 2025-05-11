@@ -91,9 +91,12 @@ pub trait RealizeService {
         dir_id: DirectoryId,
         relative_path: PathBuf,
         range: ByteRange,
-    ) -> Result<Option<Signature>>;
+    ) -> Result<Signature>;
 
     /// Compute a delta from the file at the given path and a given signature.
+    ///
+    /// If the file is empty or too short, the delta is created as if
+    /// that specific range contained only 0.
     async fn diff(
         dir_id: DirectoryId,
         relative_path: PathBuf,
@@ -123,8 +126,18 @@ pub enum RealizeError {
     #[error("I/O error: {0}")]
     Io(String),
 
+    #[error("RSync {0:?} error: {1}")]
+    Rsync(RsyncOperation, String),
+
     #[error("Unexpected: {0}")]
     Other(String),
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub enum RsyncOperation {
+    Diff,
+    Apply,
+    Sign,
 }
 
 impl From<std::io::Error> for RealizeError {

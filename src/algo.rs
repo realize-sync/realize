@@ -7,7 +7,7 @@ use crate::model::service::{DirectoryId, RealizeServiceClient, SyncedFile, Synce
 use futures::future::{join, join_all};
 use tarpc::context::Context;
 
-const CHUNK_SIZE: u64 = 1024 * 1024; // 1MB
+const CHUNK_SIZE: u64 = 8 * 1024 * 1024; // 8MB
 
 /// Moves files from source to destination using the RealizeService interface.
 /// After a successful move and hash match, deletes the file from the source.
