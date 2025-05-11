@@ -95,3 +95,28 @@ As described in the design doc.
 5. Handle partial results and ensure no resource leaks on timeout.
 6. Add tests to verify correct timeout behavior, including edge cases (e.g., timeout during heavy load, idle, or shutdown).
 7. Update documentation to describe the new option, shutdown semantics, and edge cases.
+
+## Add monitoring with prometheus to realized {#daemonmetrics}
+
+Extend realized with server and usage metrics. See also the metrics
+section in docs/design.md.
+
+## Add monitoring with prometeus to realize {#cmdmetrics}
+
+Extend realize with usage metrics. See also the metrics section in
+docs/design.md.
+
+Open issue: realize is a command, how should it send metrics to
+prometheus for collection?
+
+## Design and add useful logging to realized {#daemonlog}
+
+Think about what should be logged at the error, warning info and debug
+level. What format should be followed. What information should be
+sent.
+
+## Design and add useful logging to realize {#cmdlog}
+
+Think about what should be logged at the error, warning info and debug
+level. What format should be followed. What information should be
+sent.
