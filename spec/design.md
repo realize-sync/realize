@@ -63,15 +63,21 @@ peers:
 Host A runs the realize command-line tool with the following arguments:
 
 ```bash
-realize --privkey private_key_a.key hostb:9771 synceddir /store/a/dir
+realize --privkey private_key_a.key --serverkey public_key_b.pem --address hostb:9771 synceddir /store/a/dir
 ```
 
-`private_key_a.key` is a file containing the private SSL key of Host B
-(Host B has the equivalent public key), containing a PEM-encoded
-ED25519 private key.
+--privkey `private_key_a.key` is a file containing the private SSL key
+of Host A containing a PEM-encoded ED25519 private key. Host B must
+have the equivalent public key in its config file or the connection
+will be rejected.
 
-`hostb:9771` is the host and port of the daemon on Host B to connect
-to
+--serverkey `public_key_b.key` is a file containing the public SSL key
+(SPKI) of Host B, containing a PEM-encoded ED25519 public key. Host B
+must have been run with the equivalent private key or the connection
+will be rejected.
+
+--address `hostb:9771` is the host and port of the daemon on Host B to
+connect to
 
 `synceddir` is the directory Id to sync
 
@@ -404,13 +410,16 @@ over a secure TCP connection and invoking the move/sync algorithm.
 #### Command Line Arguments
 
 ```
-realize --privkey <private_key_file> <host:port> <directory_id> <local_path>
+realize --privkey <private_key_file> --server_key <public_key_file> --address <host:port> <directory_id> <local_path>
 ```
 
 - `--privkey <private_key_file>`: Path to the PEM-encoded private key
   file for this client.
 
-- `<host:port>`: Address and port of the remote `realized` daemon to
+- `--server_key <public_key_file>`: Path to the PEM-encoded public
+  key (SPKI) file for the server.
+
+- `--address <host:port>`: Address and port of the remote `realized` daemon to
   connect to (e.g., hostb:9771).
 
 - `<directory_id>`: The ID of the directory to sync (must match an ID

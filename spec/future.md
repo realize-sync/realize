@@ -1,53 +1,7 @@
-## Write the command line code {#cli}
+# Future work
 
-Implement the command-line tool "realize" in src/bin/realize.rs. See
-that command described in the section "The `realize` command" of
-spec/design.md, put it into src/bin/realize.rs as specified in the
-section "Code organization" of spec/design.md.
-
-The command-line tool should:
-
- - init env_logger to log nothing unless the env variable is set
-
- - parse the command-line arguments using clap
-
- - connect to an instance of RealizeService using TCP at the given
-   address with the given private key and the server public key as
-   only peer in the PeerVerifier.
-
- - start an in-process instance of RealizeService for the directory and
-   directory id given in the command-line arguments (See
-   RealizeServer::as_inprocess_client)
-
- - call move_files on the two RealizeServiceClient instances from src/algo.rs
-
- - report success with exit status code 0, write any error to stderr
-   and exit with status code 0. (Note that logging is not enough to
-   report errors.)
-
-On success, exit with status 0. On error, display the error to stderr,
-exit with status 1. (It's not enough to log the error)
-
-Review and apply any relevant Cursor rules.
-
-Review and apply the relevant sections of spec/design.md, including
-but not limited to the sections "Details" "Service Definition", "Code
-organization" and "Implementation and Dependencies"
-
-
-1. Write the server code in src/bin/realize.rs, putting in code that
-   parses the command line that clap (use derive feature).
-
-3. Implement the cli using the tools from the library, as described
-   above.
-
-4. Run "cargo check" to make sure everything compiles, fix any errors
-
-5. Write an integration test in
-   crate/daemon/test/daemon_integration_test.rs that starts the server
-   using TCP transport, the use the command-line tool on it, then
-   makes sure files were moved from one directory to the other as
-   expected.
+Each section describes a planned change. Sections should be tagged,
+for easy reference, and end with a detailled and numbered task list.
 
 ## Throttle a TCP connection {#throttle}
 
