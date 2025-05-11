@@ -14,6 +14,8 @@ use std::sync::Arc;
 use tokio_rustls::rustls::{self, server::danger::ClientCertVerifier};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
+pub use rustls::crypto::aws_lc_rs::default_provider;
+
 /// Create a TlsAcceptor (server-side) for the given peers and private key.
 pub fn make_tls_acceptor(
     verifier: Arc<PeerVerifier>,
@@ -223,7 +225,11 @@ impl RawPublicKeyResolver {
         let pubkey_as_cert = rustls::pki_types::CertificateDer::from(pubkey.to_vec());
         let certified_key = Arc::new(CertifiedKey::new(vec![pubkey_as_cert], privkey));
 
-        Ok(Arc::new(Self { certified_key }))
+        Ok(RawPublicKeyResolver::create_internal(certified_key))
+    }
+
+    fn create_internal(certified_key: Arc<CertifiedKey>) -> Arc<Self> {
+        Arc::new(Self { certified_key })
     }
 }
 
@@ -252,5 +258,202 @@ impl rustls::server::ResolvesServerCert for RawPublicKeyResolver {
 
     fn only_raw_public_keys(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_provider;
+    use super::*;
+    use crate::testing::AbortJoinHandleOnDrop;
+    use crate::transport::security::testing;
+    use rustls::pki_types::PrivateKeyDer;
+    use rustls::pki_types::pem::PemObject as _;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn test_tls_acceptor_connector() -> anyhow::Result<()> {
+        test_connect(complete_verifier()).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tls_unknown_client_peer() -> anyhow::Result<()> {
+        let crypto = Arc::new(default_provider());
+        let mut verifier = PeerVerifier::new(&crypto);
+        // client public key missing from verifier
+        verifier.add_peer(&testing::server_public_key());
+
+        assert!(test_connect(verifier).await.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tls_unknown_server_peer() -> anyhow::Result<()> {
+        let crypto = Arc::new(default_provider());
+        let mut verifier = PeerVerifier::new(&crypto);
+        verifier.add_peer(&testing::client_public_key());
+        // server public key missing from verifier
+
+        assert!(test_connect(verifier).await.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tls_reject_client_with_bad_private_key() -> anyhow::Result<()> {
+        let crypto = Arc::new(default_provider());
+        let mut verifier = PeerVerifier::new(&crypto);
+        verifier.add_peer(&testing::client_public_key());
+        verifier.add_peer(&testing::server_public_key());
+
+        let verifier = Arc::new(verifier);
+
+        let server_priv = load_signing_key(testing::server_private_key())?;
+        let acceptor = make_tls_acceptor(Arc::clone(&verifier), server_priv)?;
+
+        // Misconfigured connector; public and private keys don't match.  (Uses
+        // private functions in super)
+        let other_priv = load_signing_key(testing::other_private_key())?;
+        let bad_connector = {
+            let pubkey = testing::client_public_key();
+            let pubkey_as_cert = rustls::pki_types::CertificateDer::from(pubkey.to_vec());
+            let certified_key = Arc::new(CertifiedKey::new(vec![pubkey_as_cert], other_priv));
+
+            let config = ClientConfig::builder_with_protocol_versions(&[&TLS13])
+                .dangerous()
+                .with_custom_certificate_verifier(verifier.clone())
+                .with_client_cert_resolver(RawPublicKeyResolver::create_internal(certified_key));
+
+            TlsConnector::from(Arc::new(config))
+        };
+
+        assert!(test_connect_1(acceptor, bad_connector).await.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tls_reject_server_with_bad_private_key() -> anyhow::Result<()> {
+        let crypto = Arc::new(default_provider());
+        let mut verifier = PeerVerifier::new(&crypto);
+        verifier.add_peer(&testing::client_public_key());
+        verifier.add_peer(&testing::server_public_key());
+
+        let verifier = Arc::new(verifier);
+
+        // Misconfigured acceptor; public and private keys don't
+        // match. (Uses private functions in super)
+        let other_priv = load_signing_key(testing::other_private_key())?;
+        let bad_acceptor = {
+            let pubkey = testing::client_public_key();
+            let pubkey_as_cert = rustls::pki_types::CertificateDer::from(pubkey.to_vec());
+            let certified_key = Arc::new(CertifiedKey::new(vec![pubkey_as_cert], other_priv));
+
+            let config = ServerConfig::builder_with_protocol_versions(&[&TLS13])
+                .with_client_cert_verifier(verifier.clone())
+                .with_cert_resolver(RawPublicKeyResolver::create_internal(certified_key));
+
+            TlsAcceptor::from(Arc::new(config))
+        };
+
+        let client_priv = load_signing_key(testing::client_private_key())?;
+        let connector = make_tls_connector(Arc::clone(&verifier), client_priv)?;
+
+        assert!(test_connect_1(bad_acceptor, connector).await.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tls_bad_private_key_algo() -> anyhow::Result<()> {
+        let verifier = Arc::new(complete_verifier());
+
+        let server_priv = load_signing_key(testing::server_private_key())?;
+        let acceptor = make_tls_acceptor(verifier.clone(), server_priv)?;
+
+        // Wrong key algorithm
+        let ecdsa_client_priv = load_signing_key(ecdsa_private_key())?;
+        let connector = make_tls_connector(verifier.clone(), ecdsa_client_priv)?;
+
+        assert!(test_connect_1(acceptor, connector).await.is_err());
+
+        Ok(())
+    }
+
+    async fn test_connect(verifier: PeerVerifier) -> anyhow::Result<()> {
+        let verifier = Arc::new(verifier);
+
+        let server_priv = load_signing_key(testing::server_private_key())?;
+        let acceptor = make_tls_acceptor(Arc::clone(&verifier), server_priv)?;
+
+        let client_priv = load_signing_key(testing::client_private_key())?;
+        let connector = make_tls_connector(Arc::clone(&verifier), client_priv)?;
+
+        test_connect_1(acceptor, connector).await
+    }
+
+    async fn test_connect_1(acceptor: TlsAcceptor, connector: TlsConnector) -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let server: AbortJoinHandleOnDrop<anyhow::Result<()>> =
+            AbortJoinHandleOnDrop::new(tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await?;
+
+                let mut tls = acceptor.accept(tcp).await?;
+                tls.write_all(b"foobar").await?;
+                tls.shutdown().await?;
+
+                Ok(())
+            }));
+
+        let tcp = TcpStream::connect(addr).await?;
+        let domain = rustls::pki_types::ServerName::try_from("localhost")?;
+        let mut tls = connector.connect(domain, tcp).await?;
+        let mut buf = vec![0u8; 6];
+        tls.read_exact(&mut buf).await?;
+        assert_eq!(&buf, b"foobar");
+
+        server.as_handle().await??;
+        Ok(())
+    }
+
+    fn load_signing_key(
+        key: rustls::pki_types::PrivateKeyDer<'static>,
+    ) -> Result<Arc<dyn SigningKey>, rustls::Error> {
+        super::default_provider().key_provider.load_private_key(key)
+    }
+
+    fn complete_verifier() -> PeerVerifier {
+        let crypto = Arc::new(default_provider());
+        let mut verifier = PeerVerifier::new(&crypto);
+        verifier.add_peer(&testing::client_public_key());
+        verifier.add_peer(&testing::server_public_key());
+
+        verifier
+    }
+
+    // Helper to load an ECDSA private key (wrong algorithm)
+    //
+    // Generated with:
+    //  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:secp521r1 -out -
+    fn ecdsa_private_key() -> PrivateKeyDer<'static> {
+        PrivateKeyDer::from_pem_slice(
+            br#"
+-----BEGIN PRIVATE KEY-----
+MIHuAgEAMBAGByqGSM49AgEGBSuBBAAjBIHWMIHTAgEBBEIBdmUEGjRjKtFVKy4x
+8W8K2LqM1sYMOmR/j9F5hVer8c1HJpMKayEvIKPOXdz4zkCYzOIObeYQYViKwYVM
+mS4Q8IShgYkDgYYABAFRqTnrP2pV1WUT3Lh2equo3FHynH7NHLal4POdPMjOBoJY
+18l5B8EFR8GDaVCZOInmjAljmojgHGzE4mtaJxlIdQABnDgmYcZVCeF3z6L9Xqxi
+nuvOs8dx4/JaO4c3f+8m4U2FW+j1o5jei5GbZIgVaOWZICbVJj3vtW0JTzgipnhm
+KQ==
+-----END PRIVATE KEY-----
+"#,
+        )
+        .expect("Invalid ECDSA private key")
     }
 }

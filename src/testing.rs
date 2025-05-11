@@ -10,6 +10,12 @@ impl<T> AbortJoinHandleOnDrop<T> {
             handle: Some(handle),
         }
     }
+
+    pub fn as_handle(mut self) -> JoinHandle<T> {
+        // The handle should be there, because it's only removed by
+        // drop.
+        self.handle.take().expect("missing handle")
+    }
 }
 impl<T> Drop for AbortJoinHandleOnDrop<T> {
     #[inline]
