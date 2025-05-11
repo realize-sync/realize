@@ -56,9 +56,10 @@ peers:
     let config_file = temp_dir.child("config.yaml");
     config_file.write_str(&config_yaml)?;
 
-    let mut daemon = TokioCommandWrap::with_new(cargo_bin!("realized"), |command| {
-        command
-            .arg("--port")
+    // Run process in the background and in a way that allows reading
+    // its output, so we know what port to connect to.
+    let mut daemon = TokioCommandWrap::with_new(cargo_bin!("realized"), |cmd| {
+        cmd.arg("--port")
             .arg("0")
             .arg("--privkey")
             .arg(privkey_file.path())
@@ -71,6 +72,8 @@ peers:
     .wrap(ProcessGroup::leader())
     .spawn()?;
 
+    // The first line that's output to stdout must be Listening on
+    // <address>:<port>. Anything else is an error.
     let stdout = daemon.stdout().as_mut().unwrap();
     let reader = tokio::io::BufReader::new(stdout);
     let mut lines = reader.lines();
@@ -82,6 +85,7 @@ peers:
     );
     let portstr = line.split(":").last().expect("Unexpected output: {line}");
 
+    // Connect to the port the daemon listens to.
     let crypto = Arc::new(security::default_provider());
     let mut verifier = PeerVerifier::new(&crypto);
     verifier.add_peer(&SubjectPublicKeyInfoDer::from_pem_slice(pubkey.as_bytes())?);
