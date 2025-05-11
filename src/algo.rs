@@ -225,6 +225,79 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_move_files_chunked() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+        const FILE_SIZE: usize = (1.25 * CHUNK_SIZE as f32) as usize; // 10MB
+        let chunk = vec![0xAB; FILE_SIZE];
+        let chunk2 = vec![0xCD; FILE_SIZE];
+        let chunk3 = vec![0xEF; FILE_SIZE];
+        let chunk4 = vec![0x12; FILE_SIZE];
+        let chunk5 = vec![0x34; FILE_SIZE];
+
+        let src_temp = TempDir::new()?;
+        let src_dir = Arc::new(crate::server::Directory::new(
+            &DirectoryId::from("testdir"),
+            src_temp.path(),
+        ));
+        let src_server = RealizeServer::for_dir(src_dir.id(), src_dir.path()).as_inprocess_client();
+
+        let dst_temp = TempDir::new()?;
+        let dst_dir = Arc::new(crate::server::Directory::new(
+            &DirectoryId::from("testdir"),
+            dst_temp.path(),
+        ));
+        let dst_server = RealizeServer::for_dir(dst_dir.id(), dst_dir.path()).as_inprocess_client();
+
+        // Case 1: source > 8M, destination empty
+        src_temp.child("large_empty").write_binary(&chunk)?;
+        // Case 2: source > 8M, destination same size, but content is different
+        src_temp.child("large_diff").write_binary(&chunk)?;
+        dst_temp.child("large_diff").write_binary(&chunk2)?;
+        // Case 3: source > 8M, destination truncated, shorter than 8M
+        src_temp.child("large_trunc_short").write_binary(&chunk)?;
+        dst_temp
+            .child("large_trunc_short")
+            .write_binary(&chunk3[..4 * 1024 * 1024])?;
+        // Case 4: source > 8M, destination truncated, longer than 8M
+        src_temp.child("large_trunc_long").write_binary(&chunk)?;
+        dst_temp
+            .child("large_trunc_long")
+            .write_binary(&chunk4[..9 * 1024 * 1024])?;
+        // Case 5: source > 8M, destination same content, with garbage at the end
+        src_temp.child("large_garbage").write_binary(&chunk)?;
+        let mut garbage = chunk.clone();
+        garbage.extend_from_slice(&chunk5[..1024 * 1024]); // 1MB garbage
+        dst_temp.child("large_garbage").write_binary(&garbage)?;
+
+        move_files(
+            tarpc::context::Context::current(),
+            &src_server,
+            &dst_server,
+            DirectoryId::from("testdir"),
+        )
+        .await?;
+
+        // Check that files are present in destination and not in source
+        assert_eq_unordered!(snapshot_dir(src_temp.path())?, vec![]);
+        let expected = vec![
+            (PathBuf::from("large_empty"), chunk.clone()),
+            (PathBuf::from("large_diff"), chunk.clone()),
+            (PathBuf::from("large_trunc_short"), chunk.clone()),
+            (PathBuf::from("large_trunc_long"), chunk.clone()),
+            (PathBuf::from("large_garbage"), chunk.clone()),
+        ];
+        let actual = snapshot_dir_bin(dst_temp.path())?;
+        for (path, data) in expected {
+            let found = actual
+                .iter()
+                .find(|(p, _)| *p == path)
+                .expect(&format!("missing {path:?}"));
+            assert_eq!(&found.1, &data, "content mismatch for {path:?}");
+        }
+        Ok(())
+    }
+
     /// Return the set of files in [dir] and their content.
     fn snapshot_dir(dir: &Path) -> anyhow::Result<Vec<(PathBuf, String)>> {
         let mut result = vec![];
@@ -239,6 +312,22 @@ mod tests {
             }
         }
 
+        Ok(result)
+    }
+
+    /// Return the set of files in [dir] and their content (binary).
+    fn snapshot_dir_bin(dir: &Path) -> anyhow::Result<Vec<(PathBuf, Vec<u8>)>> {
+        let mut result = vec![];
+        for entry in WalkDir::new(dir).into_iter().flatten() {
+            if !entry.path().is_file() {
+                continue;
+            }
+            let relpath = pathdiff::diff_paths(entry.path(), dir);
+            if let Some(relpath) = relpath {
+                let content = std::fs::read(entry.path())?;
+                result.push((relpath, content));
+            }
+        }
         Ok(result)
     }
 }
