@@ -1,6 +1,6 @@
 ---
-description:
-globs:
+description: How and where to write Integration tests
+globs: 
 alwaysApply: false
 ---
 # Integration Test Organization
