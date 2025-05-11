@@ -107,48 +107,6 @@ impl RunningServer {
     }
 }
 
-/// Listen to the given TCP address for connections for
-/// [RealizeService].
-pub async fn spawn_server<T>(
-    addr: T,
-    server: RealizeServer,
-    verifier: Arc<PeerVerifier>,
-    privkey: Arc<dyn SigningKey>,
-) -> anyhow::Result<JoinHandle<()>>
-where
-    T: tokio::net::ToSocketAddrs + std::fmt::Debug,
-{
-    let acceptor = security::make_tls_acceptor(verifier, privkey)?;
-    let listener = TcpListener::bind(&addr).await?;
-
-    log::info!("Listening for RPC connections on {:?}", addr);
-    let accept = async move |stream: TcpStream| -> anyhow::Result<()> {
-        let tls_stream = acceptor.accept(stream).await?;
-        let framed = LengthDelimitedCodec::builder().new_framed(tls_stream);
-
-        tokio::spawn(
-            BaseChannel::with_defaults(transport::new(framed, Bincode::default()))
-                .execute(RealizeServer::serve(server.clone()))
-                .for_each(async move |fut| {
-                    tokio::spawn(fut);
-                }),
-        );
-
-        Ok(())
-    };
-
-    Ok(tokio::spawn(async move {
-        loop {
-            if let Ok((stream, peer)) = listener.accept().await {
-                match accept(stream).await {
-                    Ok(_) => {}
-                    Err(err) => log::error!("{}: connection failed: {}", peer, err),
-                };
-            }
-        }
-    }))
-}
-
 /// Create a [RealizeServiceClient] connected to the given TCP address.
 pub async fn connect_client<T>(
     server_name: &str,
