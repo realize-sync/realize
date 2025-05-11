@@ -30,7 +30,7 @@ copy of that directory in Host A and must be moved to Host B.
 Host B runs the service as a deamon:
 
 ```bash
-realized --port 9771 --privkey private_key_b.key --config config
+realized --address localhost:9771 --privkey private_key_b.key --config config
 ```
 
 `private_key_b.key` is a file containing the private SSL key of the
@@ -315,11 +315,10 @@ enforces access control based on configured peer keys.
 #### Command Line Arguments
 
 ```
-realized --port <port> --privkey <private_key_file> --config <config_file>
+realized --address localhost:9771 --privkey private_key_b.key --config config
 ```
 
-- `--port <port>`: TCP port to listen on for incoming RPC connections
-  (default: 9771).
+- `--address <host:port>`: TCP address to listen on for incoming RPC connections (default: localhost:9771).
 
 - `--privkey <private_key_file>`: Path to the PEM-encoded ED25519
   private key file for this daemon.
@@ -362,7 +361,7 @@ peers:
 
 #### Behavior
 
-- Starts an RPC server on the specified port, using TLS with the
+- Starts an RPC server on the specified address, using TLS with the
   provided private key.
 
 - Loads the directory and peer configuration from the YAML config
@@ -389,10 +388,10 @@ peers:
 #### Example Usage
 
 ```
-realized --port 9771 --privkey private_key_b.key --config config.yaml
+realized --address localhost:9771 --privkey private_key_b.key --config config.yaml
 ```
 
-This starts the daemon on port 9771, using the specified private key
+This starts the daemon on address localhost:9771, using the specified private key
 and configuration file.
 
 ### The `realize` command

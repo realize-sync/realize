@@ -16,9 +16,9 @@ use std::sync::Arc;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// TCP port to listen on (default: 9771)
-    #[arg(long, default_value_t = 9771)]
-    port: u16,
+    /// TCP address to listen on (default: localhost:9771)
+    #[arg(long, default_value = "localhost:9771")]
+    address: String,
 
     /// Path to the PEM-encoded ED25519 private key file
     #[arg(long)]
@@ -121,7 +121,7 @@ async fn main() {
     };
 
     // Start the server (tokio runtime)
-    match RunningServer::bind(format!("0.0.0.0:{}", args.port), server, verifier, privkey).await {
+    match RunningServer::bind(&args.address, server, verifier, privkey).await {
         Err(err) => {
             eprintln!("Failed to start server: {err}");
             std::process::exit(1);

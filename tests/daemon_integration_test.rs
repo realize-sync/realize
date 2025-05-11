@@ -59,8 +59,8 @@ peers:
     // Run process in the background and in a way that allows reading
     // its output, so we know what port to connect to.
     let mut daemon = TokioCommandWrap::with_new(cargo_bin!("realized"), |cmd| {
-        cmd.arg("--port")
-            .arg("0")
+        cmd.arg("--address")
+            .arg("localhost:0")
             .arg("--privkey")
             .arg(privkey_file.path())
             .arg("--config")
