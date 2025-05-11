@@ -85,7 +85,7 @@ async fn main() {
     let crypto = Arc::new(security::default_provider());
     let mut verifier = PeerVerifier::new(&crypto);
     for peer in &config.peers {
-        for (_id, pubkey_pem) in &peer.map {
+        for pubkey_pem in peer.map.values() {
             match SubjectPublicKeyInfoDer::from_pem_slice(pubkey_pem.as_bytes()) {
                 Ok(spki) => verifier.add_peer(&spki),
                 Err(e) => {
@@ -106,7 +106,7 @@ async fn main() {
         }
     };
     let privkey = match crypto.key_provider.load_private_key(privkey) {
-        Ok(k) => Arc::from(k),
+        Ok(key) => key,
         Err(e) => {
             eprintln!("Failed to load private key: {e}");
             std::process::exit(1);

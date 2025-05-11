@@ -49,7 +49,7 @@ struct Cli {
 #[tokio::main]
 async fn main() {
     // Only log if env variable is set
-    let _ = env_logger::init();
+    env_logger::init();
 
     let cli = Cli::parse();
 
@@ -63,7 +63,7 @@ async fn main() {
     };
     let crypto = Arc::new(security::default_provider());
     let privkey = match crypto.key_provider.load_private_key(privkey) {
-        Ok(k) => Arc::from(k),
+        Ok(k) => k,
         Err(e) => {
             eprintln!("Failed to load private key: {e}");
             process::exit(1);
