@@ -3,8 +3,9 @@
 //! Implements the unoptimized algorithm to move files from source (A) to destination (B)
 //! using the RealizeService trait. See spec/design.md for details.
 
-use crate::model::service::{DirectoryId, RealizeServiceClient, SyncedFile, SyncedFileState};
+use crate::model::service::{DirectoryId, RealizeError, RealizeServiceClient, SyncedFile};
 use futures::future::{join, join_all};
+use std::{collections::HashMap, path::Path};
 use tarpc::context::Context;
 
 const CHUNK_SIZE: u64 = 8 * 1024 * 1024; // 8MB
@@ -24,23 +25,14 @@ pub async fn move_files(
     let dst_files = dst_files??;
 
     // 2. Build lookup for dst
-    use std::collections::HashMap;
-    let dst_map: HashMap<_, _> = dst_files.into_iter().map(|f| (f.path, f.state)).collect();
 
-    // 3. For all files in src, use iterator and run move_file concurrently with join_all
-    let files_to_move: Vec<_> = src_files
-        .iter()
-        .filter(|file| {
-            matches!(
-                dst_map.get(&file.path),
-                None | Some(SyncedFileState::Partial)
-            )
-        })
+    let dst_map: HashMap<_, _> = dst_files
+        .into_iter()
+        .map(|f| (f.path.to_path_buf(), f))
         .collect();
-
-    let futures = files_to_move
+    let futures = src_files
         .iter()
-        .map(|file| move_file(file, src, dst, &ctx, &dir_id));
+        .map(|file| move_file(src, file, dst, dst_map.get(&file.path), &ctx, &dir_id));
     join_all(futures)
         .await
         .into_iter()
@@ -49,56 +41,116 @@ pub async fn move_files(
 }
 
 async fn move_file(
-    file: &SyncedFile,
+    src: &RealizeServiceClient,
+    src_file: &SyncedFile,
+    dst: &RealizeServiceClient,
+    dst_file: Option<&SyncedFile>,
+    ctx: &Context,
+    dir_id: &DirectoryId,
+) -> anyhow::Result<()> {
+    let path = src_file.path.as_path();
+    let src_size = src_file.size;
+    let dst_size = dst_file.map(|f| f.size).unwrap_or(0);
+
+    if src_size == dst_size && check_hashes_and_delete(src, dst, ctx, dir_id, &path).await? {
+        return Ok(());
+    }
+
+    log::info!(
+        "{}:{:?} transferring (src size: {}, dst size: {})",
+        dir_id,
+        path,
+        src_size,
+        dst_size
+    );
+
+    // Chunked Transfer
+    let mut offset: u64 = 0;
+    while offset < src_size {
+        let mut end = offset + CHUNK_SIZE;
+        if end > src_file.size {
+            end = src_file.size;
+        }
+        let range = (offset, end);
+        if dst_size <= offset {
+            // Send data
+            log::debug!("{}:{:?} sending range {:?}", dir_id, path, range);
+            let data = src
+                .read(*ctx, dir_id.clone(), path.to_path_buf(), range)
+                .await??;
+            dst.send(
+                *ctx,
+                dir_id.clone(),
+                path.to_path_buf(),
+                range,
+                src_file.size,
+                data,
+            )
+            .await??;
+        } else {
+            // Compute diff and apply
+            log::debug!("{}:{:?} rsync on range {:?}", dir_id, path, range);
+            let sig = dst
+                .calculate_signature(*ctx, dir_id.clone(), path.to_path_buf(), range)
+                .await??;
+            let delta = src
+                .diff(*ctx, dir_id.clone(), path.to_path_buf(), range, sig)
+                .await??;
+            dst.apply_delta(
+                *ctx,
+                dir_id.clone(),
+                path.to_path_buf(),
+                range,
+                src_file.size,
+                delta,
+            )
+            .await??;
+        }
+        offset = end;
+    }
+
+    if !check_hashes_and_delete(src, dst, ctx, dir_id, &path).await? {
+        return Err(RealizeError::Sync(
+            path.to_path_buf(),
+            "Data still inconsistent after sync".to_string(),
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+/// Check hashes and, if they match, finish the dest file and delete the source.
+///
+/// Return true if the hashes matched, false otherwise.
+async fn check_hashes_and_delete(
     src: &RealizeServiceClient,
     dst: &RealizeServiceClient,
     ctx: &Context,
     dir_id: &DirectoryId,
-) -> anyhow::Result<()> {
-    let file_path = file.path.clone();
-    let dir_id_clone = dir_id.clone();
-    let ctx_clone = *ctx;
-    // Start src_hash and dst_hash in parallel
-    let src_hash_fut = src.hash(ctx_clone, dir_id_clone.clone(), file_path.clone());
-
-    // File transfer
-    let mut offset: u64 = 0;
-    while offset < file.size {
-        let mut end = offset + CHUNK_SIZE;
-        if end > file.size {
-            end = file.size;
-        }
-        let range = (offset, end);
-        let data = src
-            .clone()
-            .read(*ctx, dir_id.clone(), file.path.clone(), range)
-            .await??;
-        dst.send(
-            *ctx,
-            dir_id.clone(),
-            file.path.clone(),
-            range,
-            file.size,
-            data,
-        )
-        .await??;
-        offset = end;
-    }
-
-    // Await both hashes in parallel
-    let dst_hash_fut = dst.hash(ctx_clone, dir_id_clone.clone(), file_path.clone());
-    let (src_hash, dst_hash) = tokio::join!(src_hash_fut, dst_hash_fut);
+    path: &Path,
+) -> Result<bool, anyhow::Error> {
+    let (src_hash, dst_hash) = tokio::join!(
+        src.hash(*ctx, dir_id.clone(), path.to_path_buf()),
+        dst.hash(*ctx, dir_id.clone(), path.to_path_buf()),
+    );
     let src_hash = src_hash??;
     let dst_hash = dst_hash??;
-    if src_hash == dst_hash {
-        // Only finish and delete if hashes match
-        dst.finish(*ctx, dir_id.clone(), file.path.clone())
-            .await??;
-        src.delete(*ctx, dir_id.clone(), file.path.clone())
-            .await??;
+    if src_hash != dst_hash {
+        log::info!("{}:{:?} inconsistent hashes", dir_id, path);
+        return Ok(false);
     }
-    // If hashes differ, leave file on both sides (future: handle with rsync/delta)
-    Ok(())
+    log::info!(
+        "{}:{:?} OK (hash match); finishing and deleting",
+        dir_id,
+        path
+    );
+    // Hashes match, finish and delete
+    dst.finish(*ctx, dir_id.clone(), path.to_path_buf())
+        .await??;
+    src.delete(*ctx, dir_id.clone(), path.to_path_buf())
+        .await??;
+    return Ok(true);
 }
 
 #[cfg(test)]
@@ -113,6 +165,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_move_files() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+
         // Setup source directory with files
         let src_temp = TempDir::new()?;
         src_temp.child("foo.txt").write_str("hello")?;
@@ -131,6 +185,33 @@ mod tests {
         ));
         let dst_server = RealizeServer::for_dir(dst_dir.id(), dst_dir.path()).as_inprocess_client();
 
+        // Pre-populate destination with a file of the same length as source (should trigger rsync optimization)
+        dst_temp.child("foo.txt").write_str("xxxxx")?; // same length as "hello"
+
+        // Corrupted dst file in partial state
+        dst_temp.child(".bar.txt.part").write_str("corrupt")?;
+
+        // Corrupted dst file in final state
+        dst_temp.child("baz.txt").write_str("corruptfinal")?;
+        src_temp.child("baz.txt").write_str("bazgood")?;
+
+        // Partially copied dst file (shorter than src)
+        dst_temp.child("quux.txt").write_str("par")?;
+        src_temp.child("quux.txt").write_str("partialcopy")?;
+
+        // Dst file too long
+        dst_temp.child("foobar.txt").write_str("foobarfoobar")?;
+        src_temp.child("foobar.txt").write_str("foobar")?;
+
+        // Interrupted file (partial file, correct prefix)
+        dst_temp
+            .child(".interrupted.txt.part")
+            .write_str("interr")?;
+        src_temp
+            .child("interrupted.txt")
+            .write_str("interruptedfull")?;
+
+        println!("test_move_files: all files set up");
         move_files(
             tarpc::context::Context::current(),
             &src_server,
@@ -153,7 +234,14 @@ mod tests {
             .collect();
         assert_eq_unordered!(
             file_names,
-            vec!["foo.txt".to_string(), "bar.txt".to_string()]
+            vec![
+                "foo.txt".to_string(),
+                "bar.txt".to_string(),
+                "baz.txt".to_string(),
+                "foobar.txt".to_string(),
+                "quux.txt".to_string(),
+                "interrupted.txt".to_string()
+            ]
         );
         // Source should be empty
         let src_files = src_server
@@ -163,7 +251,23 @@ mod tests {
                 DirectoryId::from("testdir"),
             )
             .await??;
+        if !src_files.is_empty() {
+            println!("Remaining files in source: {:?}", src_files);
+        }
         assert!(src_files.is_empty());
+        // Check that all files have the correct content in destination
+        let foo_content = std::fs::read_to_string(dst_temp.child("foo.txt"))?;
+        let bar_content = std::fs::read_to_string(dst_temp.child("bar.txt"))?;
+        let baz_content = std::fs::read_to_string(dst_temp.child("baz.txt"))?;
+        let foobar_content = std::fs::read_to_string(dst_temp.child("foobar.txt"))?;
+        let quux_content = std::fs::read_to_string(dst_temp.child("quux.txt"))?;
+        let interrupted_content = std::fs::read_to_string(dst_temp.child("interrupted.txt"))?;
+        assert_eq!(foo_content, "hello");
+        assert_eq!(bar_content, "world");
+        assert_eq!(baz_content, "bazgood");
+        assert_eq!(foobar_content, "foobar");
+        assert_eq!(quux_content, "partialcopy");
+        assert_eq!(interrupted_content, "interruptedfull");
         Ok(())
     }
 }

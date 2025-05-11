@@ -106,9 +106,8 @@ impl RealizeService for RealizeServer {
             .read(true)
             .write(false)
             .open(&actual)?;
-        file.seek(SeekFrom::Start(range.0))?;
         let mut buffer = vec![0; (range.1 - range.0) as usize];
-        file.read_exact(&mut buffer)?;
+        partial_read(&mut file, &range, &mut buffer)?;
 
         Ok(buffer)
     }
@@ -224,9 +223,8 @@ impl RealizeService for RealizeServer {
         let logical = LogicalPath::new(dir, &relative_path);
         let (_, actual) = logical.find()?;
         let mut file = std::fs::File::open(&actual)?;
-        file.seek(std::io::SeekFrom::Start(range.0))?;
         let mut buffer = vec![0u8; (range.1 - range.0) as usize];
-        file.read_exact(&mut buffer)?;
+        partial_read(&mut file, &range, &mut buffer)?;
         let opts = SignatureOptions {
             block_size: RSYNC_BLOCK_SIZE as u32,
             crypto_hash_size: 8,
@@ -308,8 +306,10 @@ fn partial_read(
         file.seek(std::io::SeekFrom::Start(range.0))?;
         let read_end = (min(range.1, initial_size) - range.0) as usize;
         file.read_exact(&mut buf[0..read_end])?;
+        buf[read_end..].fill(0);
+    } else {
+        buf.fill(0);
     }
-
     Ok(())
 }
 
@@ -685,8 +685,9 @@ mod tests {
                 fpath.relative_path().to_path_buf(),
                 (0, 15),
             )
-            .await;
-        assert!(matches!(result, Err(RealizeError::Io(_))));
+            .await?;
+        assert_eq!(result.len(), 15);
+        assert_eq!(result, b"abcdefghij\0\0\0\0\0");
 
         Ok(())
     }

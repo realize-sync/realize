@@ -129,6 +129,9 @@ pub enum RealizeError {
     #[error("RSync {0:?} error: {1}")]
     Rsync(RsyncOperation, String),
 
+    #[error("Sync of {0} failed: {1}")]
+    Sync(PathBuf, String),
+
     #[error("Unexpected: {0}")]
     Other(String),
 }
