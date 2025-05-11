@@ -12,6 +12,11 @@ be applied to the owner's copy or be rejected. Other machines may
 *either* accept new file (file drop) (a Source) or serve, cache and
 keep copies of the Owner's files (a Copy).
 
+File copy and moves are restartable and keep partial files to avoid
+re-uploading content, using the rsync approach to sending out patches.
+Files are checked after being copied and fixed also without having to
+re-upload everything.
+
 ### Future
 
 While the implementation and this design doc concentrates on syncing,
@@ -157,6 +162,10 @@ again should continue the work that was interrupted.
 
 Partial files should be clearly marked as partial, stored in the same
 directory as the destination .<filename>.part
+
+This algorithm is written in such a way that in can restart if
+interrupted without losing work. See the section "Errors and retries"
+for more details on restartable
 
 ### Service Definition (RealizeService)
 
@@ -410,7 +419,7 @@ over a secure TCP connection and invoking the move/sync algorithm.
 #### Command Line Arguments
 
 ```
-realize --privkey <private_key_file> --server_key <public_key_file> --address <host:port> <directory_id> <local_path>
+realize --privkey <private_key_file> --server_key <public_key_file> --address <host:port> {options...} <directory_id> <local_path>
 ```
 
 - `--privkey <private_key_file>`: Path to the PEM-encoded private key
@@ -427,6 +436,14 @@ realize --privkey <private_key_file> --server_key <public_key_file> --address <h
 
 - `<local_path>`: The local path containing the root of the directory
   to sync.
+
+options:
+
+- `--max-duration 30m`: Maximum time the command is allowed to run. if
+  the operation is not finished by that time, it is interrupted and
+  the tools returns status code 2. The argument is a duration with
+  human-readable units (m for minutes, h for hours, s for seconds;
+  default to seconds)
 
 #### Inputs
 
@@ -472,6 +489,23 @@ realize --privkey <private_key_file> --server_key <public_key_file> --address <h
 
 - Designed to be restartable and robust to interruptions; re-running
   the command resumes any incomplete sync.
+
+### Errors and retries
+
+If communication with the remote host is lost, this command retries
+with exponential backoff (5s, 15s, 30s, 1m, 2m, 5m, then always 5m)
+until communication can be re-established or duration set with
+--max-duration is reached.
+
+Retries only apply to network errors. They don't apply to the
+following errors:
+ - Local errors
+ - Disk I/O errors (either)
+ - Authentication error (communication not authorized)
+
+Retry applies on the move_files operation as a whole, so will require
+reading the full file lists again. This is to make sure that changes
+to the filesystem are taken into account.
 
 #### Example Usage
 
@@ -732,6 +766,3 @@ Implemented using rust
   future feature, but there is no detail on how it will be implemented
   or how it will interact with Owner/Source.
 
-- **Error Handling and Retries**: There is no section describing which
-  errors are retried, which are fatal, and how users are notified of
-  failures.
