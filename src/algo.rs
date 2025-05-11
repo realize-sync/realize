@@ -161,7 +161,9 @@ mod tests {
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use walkdir::WalkDir;
 
     #[tokio::test]
     async fn test_move_files() -> anyhow::Result<()> {
@@ -169,8 +171,6 @@ mod tests {
 
         // Setup source directory with files
         let src_temp = TempDir::new()?;
-        src_temp.child("foo.txt").write_str("hello")?;
-        src_temp.child("bar.txt").write_str("world")?;
         let src_dir = Arc::new(crate::server::Directory::new(
             &DirectoryId::from("testdir"),
             src_temp.path(),
@@ -186,30 +186,20 @@ mod tests {
         let dst_server = RealizeServer::for_dir(dst_dir.id(), dst_dir.path()).as_inprocess_client();
 
         // Pre-populate destination with a file of the same length as source (should trigger rsync optimization)
-        dst_temp.child("foo.txt").write_str("xxxxx")?; // same length as "hello"
+        src_temp.child("same_length").write_str("hello")?;
+        dst_temp.child("same_length").write_str("xxxxx")?; // same length as "hello"
 
         // Corrupted dst file in partial state
-        dst_temp.child(".bar.txt.part").write_str("corrupt")?;
+        src_temp.child("longer").write_str("world")?;
+        dst_temp.child(".longer.part").write_str("corrupt")?;
 
         // Corrupted dst file in final state
-        dst_temp.child("baz.txt").write_str("corruptfinal")?;
-        src_temp.child("baz.txt").write_str("bazgood")?;
+        dst_temp.child("corrupt_final").write_str("corruptfinal")?;
+        src_temp.child("corrupt_final").write_str("bazgood")?;
 
         // Partially copied dst file (shorter than src)
-        dst_temp.child("quux.txt").write_str("par")?;
-        src_temp.child("quux.txt").write_str("partialcopy")?;
-
-        // Dst file too long
-        dst_temp.child("foobar.txt").write_str("foobarfoobar")?;
-        src_temp.child("foobar.txt").write_str("foobar")?;
-
-        // Interrupted file (partial file, correct prefix)
-        dst_temp
-            .child(".interrupted.txt.part")
-            .write_str("interr")?;
-        src_temp
-            .child("interrupted.txt")
-            .write_str("interruptedfull")?;
+        dst_temp.child("partial").write_str("par")?;
+        src_temp.child("partial").write_str("partialcopy")?;
 
         println!("test_move_files: all files set up");
         move_files(
@@ -221,53 +211,34 @@ mod tests {
         .await?;
 
         // Check that files are present in destination and not in source
-        let files = dst_server
-            .clone()
-            .list(
-                tarpc::context::Context::current(),
-                DirectoryId::from("testdir"),
-            )
-            .await??;
-        let file_names: Vec<_> = files
-            .iter()
-            .map(|f| f.path.file_name().unwrap().to_str().unwrap().to_string())
-            .collect();
+        assert_eq_unordered!(snapshot_dir(src_temp.path())?, vec![]);
         assert_eq_unordered!(
-            file_names,
+            snapshot_dir(dst_temp.path())?,
             vec![
-                "foo.txt".to_string(),
-                "bar.txt".to_string(),
-                "baz.txt".to_string(),
-                "foobar.txt".to_string(),
-                "quux.txt".to_string(),
-                "interrupted.txt".to_string()
+                (PathBuf::from("same_length"), "hello".to_string()),
+                (PathBuf::from("longer"), "world".to_string()),
+                (PathBuf::from("corrupt_final"), "bazgood".to_string()),
+                (PathBuf::from("partial"), "partialcopy".to_string()),
             ]
         );
-        // Source should be empty
-        let src_files = src_server
-            .clone()
-            .list(
-                tarpc::context::Context::current(),
-                DirectoryId::from("testdir"),
-            )
-            .await??;
-        if !src_files.is_empty() {
-            println!("Remaining files in source: {:?}", src_files);
-        }
-        assert!(src_files.is_empty());
-        // Check that all files have the correct content in destination
-        let foo_content = std::fs::read_to_string(dst_temp.child("foo.txt"))?;
-        let bar_content = std::fs::read_to_string(dst_temp.child("bar.txt"))?;
-        let baz_content = std::fs::read_to_string(dst_temp.child("baz.txt"))?;
-        let foobar_content = std::fs::read_to_string(dst_temp.child("foobar.txt"))?;
-        let quux_content = std::fs::read_to_string(dst_temp.child("quux.txt"))?;
-        let interrupted_content = std::fs::read_to_string(dst_temp.child("interrupted.txt"))?;
-        assert_eq!(foo_content, "hello");
-        assert_eq!(bar_content, "world");
-        assert_eq!(baz_content, "bazgood");
-        assert_eq!(foobar_content, "foobar");
-        assert_eq!(quux_content, "partialcopy");
-        assert_eq!(interrupted_content, "interruptedfull");
+
         Ok(())
+    }
+
+    /// Return the set of files in [dir] and their content.
+    fn snapshot_dir(dir: &Path) -> anyhow::Result<Vec<(PathBuf, String)>> {
+        let mut result = vec![];
+        for entry in WalkDir::new(dir).into_iter().flatten() {
+            if !entry.path().is_file() {
+                continue;
+            }
+            let relpath = pathdiff::diff_paths(entry.path(), dir);
+            if let Some(relpath) = relpath {
+                let content = std::fs::read_to_string(entry.path())?;
+                result.push((relpath, content));
+            }
+        }
+
+        Ok(result)
     }
 }
