@@ -4,7 +4,7 @@
 use clap::Parser;
 use realize::server::{Directory, RealizeServer};
 use realize::transport::security::{self, PeerVerifier};
-use realize::transport::tcp::RunningServer;
+use realize::transport::tcp;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use serde::Deserialize;
@@ -114,15 +114,14 @@ async fn main() {
     };
 
     // Start the server (tokio runtime)
-    match RunningServer::bind(&args.address, server, verifier, privkey).await {
+    match tcp::start_server(&args.address, server, verifier, privkey).await {
         Err(err) => {
             eprintln!("Failed to start server: {err}");
             std::process::exit(1);
         }
-        Ok(running) => {
-            let addr = running.local_addr().unwrap();
+        Ok((addr, handle)) => {
             println!("Listening on {addr}");
-            if let Err(err) = running.spawn().await {
+            if let Err(err) = handle.join().await {
                 eprintln!("Server stopped: {err}");
                 std::process::exit(1);
             }

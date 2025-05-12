@@ -330,16 +330,12 @@ enforces access control based on configured peer keys.
 #### Command Line Arguments
 
 ```
-realized --address localhost:9771 --privkey private_key_b.key --config config
+realized --address <host:port> --privkey <private_key_file> --config <config_file>
 ```
 
 - `--address <host:port>`: TCP address to listen on for incoming RPC connections (default: localhost:9771).
-
-- `--privkey <private_key_file>`: Path to the PEM-encoded ED25519
-  private key file for this daemon.
-
-- `--config <config_file>`: Path to the YAML configuration file
-  specifying directory mappings and allowed peers.
+- `--privkey <private_key_file>`: Path to the PEM-encoded ED25519 private key file for this daemon.
+- `--config <config_file>`: Path to the YAML configuration file specifying directory mappings and allowed peers.
 
 #### Inputs
 
@@ -364,41 +360,22 @@ peers:
 
 #### Outputs
 
-- **Logs**: Diagnostic and audit logs (if enabled via RUSTLOG),
-  including file finalization and deletion events.
-
+- **Logs**: Diagnostic and audit logs (if enabled via RUSTLOG), including file finalization and deletion events.
 - **Exit Codes**:
   - `0`: Success (clean shutdown)
   - `1`: Error (e.g., invalid config, failed to bind port, etc.)
-
-- **Errors**: Printed to stderr for user-visible failures (not just
-  logged).
+- **Errors**: Printed to stderr for user-visible failures (not just logged).
 
 #### Behavior
 
-- Starts an RPC server on the specified address, using TLS with the
-  provided private key.
-
-- Loads the directory and peer configuration from the YAML config
-  file.
-
-- Accepts incoming connections only from peers with public keys listed
-  in the config.
-
-- Exposes the RealizeService API for directory listing, file transfer,
-  and sync operations.
-
-- Manages the local state of each configured directory, including
-  handling partial files and file finalization.
-
-- Logs key events (file finalization, deletion) at INFO level if
-  logging is enabled.
-
-- On fatal error (e.g., config parse failure, port in use), prints
-  error to stderr and exits with code 1.
-
-- Designed to be robust to interruptions: can be restarted without
-  data loss or corruption.
+- Starts an RPC server on the specified address, using TLS with the provided private key.
+- Loads the directory and peer configuration from the YAML config file.
+- Accepts incoming connections only from peers with public keys listed in the config.
+- Exposes the RealizeService API for directory listing, file transfer, and sync operations.
+- Manages the local state of each configured directory, including handling partial files and file finalization.
+- Logs key events (file finalization, deletion) at INFO level if logging is enabled.
+- On fatal error (e.g., config parse failure, port in use), prints error to stderr and exits with code 1.
+- Designed to be robust to interruptions: can be restarted without data loss or corruption.
 
 #### Example Usage
 
@@ -406,64 +383,67 @@ peers:
 realized --address localhost:9771 --privkey private_key_b.key --config config.yaml
 ```
 
-This starts the daemon on address localhost:9771, using the specified private key
-and configuration file.
+This starts the daemon on address localhost:9771, using the specified private key and configuration file.
 
 ### The `realize` command
 
-The `realize` command is a CLI tool used to initiate and control the
-synchronization of a local directory with a remote directory managed
-by a `realized` daemon. It acts as a client, connecting to the daemon
-over a secure TCP connection and invoking the move/sync algorithm.
+The `realize` command is a CLI tool used to initiate and control the synchronization of a local directory with a remote directory managed by a `realized` daemon. It acts as a client, connecting to the daemon over a secure TCP connection and invoking the move/sync algorithm.
 
 #### Command Line Arguments
 
 ```
-realize --privkey <private_key_file> --server_key <public_key_file> --address <host:port> {options...} <directory_id> <local_path>
+# Local to remote
+realize --src-path <local_path> --dst-addr <host:port> --privkey <private_key_file> --peers <peers_pem_file> --directory-id <directory_id>
+
+# Remote to local
+realize --src-addr <host:port> --dst-path <local_path> --privkey <private_key_file> --peers <peers_pem_file> --directory-id <directory_id>
+
+# Both remote
+realize --src-addr <host:port> --dst-addr <host:port> --privkey <private_key_file> --peers <peers_pem_file> --directory-id <directory_id>
+
+# Both local
+realize --src-path <local_path> --dst-path <local_path>
 ```
 
-- `--privkey <private_key_file>`: Path to the PEM-encoded private key
-  file for this client.
-
-- `--server_key <public_key_file>`: Path to the PEM-encoded public
-  key (SPKI) file for the server.
-
-- `--address <host:port>`: Address and port of the remote `realized` daemon to
-  connect to (e.g., hostb:9771).
-
-- `<directory_id>`: The ID of the directory to sync (must match an ID
-  in the daemon's config).
-
-- `<local_path>`: The local path containing the root of the directory
-  to sync.
-
-options:
-
-- `--max-duration 30m`: Maximum time the command is allowed to run. if
-  the operation is not finished by that time, it is interrupted and
-  the tools returns status code 2. The argument is a duration with
-  human-readable units (m for minutes, h for hours, s for seconds;
-  default to seconds)
+- `--src-path <local_path>`: Local source directory path
+- `--dst-path <local_path>`: Local destination directory path
+- `--src-addr <host:port>`: Source remote address
+- `--dst-addr <host:port>`: Destination remote address
+- `--privkey <private_key_file>`: Path to the PEM-encoded private key file (required for remote)
+- `--peers <peers_pem_file>`: Path to PEM file with one or more peer public keys (required for remote)
+- `--directory-id <directory_id>`: Directory id (optional, defaults to 'dir' for local/local)
+- `--throttle <rate>`: Throttle upload and download (e.g. 1M)
+- `--throttle-up <rate>`: Throttle upload (e.g. 1M)
+- `--throttle-down <rate>`: Throttle download (e.g. 512k)
 
 #### Inputs
 
-- **Private Key File**: PEM-encoded private key for TLS client
-  authentication.
+- **Private Key File**: PEM-encoded private key for TLS client authentication (required for remote endpoints).
+- **Peers File**: PEM file containing one or more public keys for the servers that the client can connect to (required for remote endpoints).
+- **Directory ID**: Identifier for the directory to sync (optional for local/local, required otherwise).
+- **Local Path**: Path to the local directory to be synchronized (for local endpoints).
+- **Remote Host/Port**: Network address of the remote `realized` daemon (for remote endpoints).
 
-- **Remote Host/Port**: Network address of the target daemon.
+#### Example Usage
 
-- **Directory ID**: Identifier for the directory to sync.
+```
+# Local to remote
+realize --src-path /store/a/dir --dst-addr hostb:9771 --privkey private_key_a.key --peers peers.pem --directory-id synceddir
 
-- **Local Path**: Path to the local directory to be synchronized.
+# Remote to local
+realize --src-addr hosta:9771 --dst-path /store/b/dir --privkey private_key_b.key --peers peers.pem --directory-id synceddir
+
+# Both remote
+realize --src-addr hosta:9771 --dst-addr hostb:9771 --privkey private_key.key --peers peers.pem --directory-id synceddir
+
+# Both local
+realize --src-path /store/a/dir --dst-path /store/b/dir
+```
 
 #### Outputs
 
-- **Progress Output**: Progress information is printed to stdout
-  (using indicatif), showing sync status per file and overall.
-
-- **Errors**: Any errors are printed to stderr. Logging is not used
-  for user-facing errors.
-
+- **Progress Output**: Progress information is printed to stdout (using indicatif), showing sync status per file and overall.
+- **Errors**: Any errors are printed to stderr. Logging is not used for user-facing errors.
 - **Exit Codes**:
   - `0`: Success (all files synced as intended)
   - `1`: Error (e.g., connection failure, sync error, invalid arguments)
@@ -471,24 +451,12 @@ options:
 #### Behavior
 
 - Parses command line arguments and validates inputs.
-
-- Connects to the specified `realized` daemon using TLS,
-  authenticating with the provided private key.
-
-- Starts an in-process RealizeService instance for the local directory
-  and directory ID.
-
-- Invokes the move/sync algorithm (from `src/algo/move.rs`) to
-  synchronize files between the local directory and the remote daemon.
-
-- Reports progress to stdout, including per-file and overall sync
-  status.
-
-- On success, exits with code 0. On error, prints a message to stderr
-  and exits with code 1.
-
-- Designed to be restartable and robust to interruptions; re-running
-  the command resumes any incomplete sync.
+- Connects to the specified `realized` daemon(s) using TLS, authenticating with the provided private key and verifying peers.
+- Starts an in-process RealizeService instance for local directories.
+- Invokes the move/sync algorithm to synchronize files between the source and destination.
+- Reports progress to stdout, including per-file and overall sync status.
+- On success, exits with code 0. On error, prints a message to stderr and exits with code 1.
+- Designed to be restartable and robust to interruptions; re-running the command resumes any incomplete sync.
 
 ### Errors and retries
 
