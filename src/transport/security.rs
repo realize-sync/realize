@@ -265,10 +265,10 @@ impl rustls::server::ResolvesServerCert for RawPublicKeyResolver {
 mod tests {
     use super::default_provider;
     use super::*;
-    use crate::testing::AbortJoinHandleOnDrop;
     use crate::transport::security::testing;
-    use rustls::pki_types::PrivateKeyDer;
+    use crate::utils::async_utils::AbortOnDrop;
     use rustls::pki_types::pem::PemObject as _;
+    use rustls::pki_types::PrivateKeyDer;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -427,16 +427,15 @@ mod tests {
     async fn test_connect_1(acceptor: TlsAcceptor, connector: TlsConnector) -> anyhow::Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
-        let server: AbortJoinHandleOnDrop<anyhow::Result<()>> =
-            AbortJoinHandleOnDrop::new(tokio::spawn(async move {
-                let (tcp, _) = listener.accept().await?;
+        let server: AbortOnDrop<anyhow::Result<()>> = AbortOnDrop::new(tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await?;
 
-                let mut tls = acceptor.accept(tcp).await?;
-                tls.write_all(b"foobar").await?;
-                tls.shutdown().await?;
+            let mut tls = acceptor.accept(tcp).await?;
+            tls.write_all(b"foobar").await?;
+            tls.shutdown().await?;
 
-                Ok(())
-            }));
+            Ok(())
+        }));
 
         let tcp = TcpStream::connect(addr).await?;
         let domain = rustls::pki_types::ServerName::try_from("localhost")?;

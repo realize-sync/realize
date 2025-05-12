@@ -18,6 +18,7 @@ use crate::model::service::{RealizeService, RealizeServiceClient};
 use crate::server::RealizeServer;
 use crate::transport::security;
 use crate::transport::security::PeerVerifier;
+use crate::utils::async_utils::AbortOnDrop;
 
 /// Start the server, listening on the given address.
 pub async fn start_server<T>(
@@ -25,17 +26,41 @@ pub async fn start_server<T>(
     server: RealizeServer,
     verifier: Arc<PeerVerifier>,
     privkey: Arc<dyn SigningKey>,
-) -> anyhow::Result<JoinHandle<()>>
+) -> anyhow::Result<(SocketAddr, AbortOnDrop<()>)>
 where
     T: tokio::net::ToSocketAddrs,
 {
-    Ok(RunningServer::bind(addr, server, verifier, privkey)
-        .await?
-        .spawn())
+    let server = RunningServer::bind(addr, server, verifier, privkey).await?;
+    let addr = server.local_addr()?;
+    let handle = AbortOnDrop::new(server.spawn());
+
+    Ok((addr, handle))
+}
+
+/// Create a [RealizeServiceClient] connected to the given TCP address.
+pub async fn connect_client<T>(
+    server_name: &str,
+    server_addr: T,
+    verifier: Arc<PeerVerifier>,
+    privkey: Arc<dyn SigningKey>,
+) -> anyhow::Result<RealizeServiceClient>
+where
+    T: tokio::net::ToSocketAddrs,
+{
+    let connector = security::make_tls_connector(verifier, privkey)?;
+
+    let stream = TcpStream::connect(server_addr).await?;
+    let domain = ServerName::try_from(server_name.to_string())?;
+    let stream = connector.connect(domain, stream).await?;
+
+    let codec_builder = LengthDelimitedCodec::builder();
+    let transport = transport::new(codec_builder.new_framed(stream), Bincode::default());
+
+    Ok(RealizeServiceClient::new(Default::default(), transport).spawn())
 }
 
 /// A TCP server bound to an address.
-pub struct RunningServer {
+struct RunningServer {
     acceptor: TlsAcceptor,
     listener: TcpListener,
     server: RealizeServer,
@@ -43,7 +68,7 @@ pub struct RunningServer {
 
 impl RunningServer {
     /// Bind to the address, but don't process client requests yet.
-    pub async fn bind<T>(
+    async fn bind<T>(
         addr: T,
         server: RealizeServer,
         verifier: Arc<PeerVerifier>,
@@ -73,12 +98,12 @@ impl RunningServer {
     /// Return the address the server is listening to.
     ///
     /// This is useful when the port given to [start_server] is 0, which means that the OS should choose.
-    pub fn local_addr(&self) -> anyhow::Result<SocketAddr> {
+    fn local_addr(&self) -> anyhow::Result<SocketAddr> {
         Ok(self.listener.local_addr()?)
     }
 
     /// Run the server; listen to client connections.
-    pub fn spawn(self) -> JoinHandle<()> {
+    fn spawn(self) -> JoinHandle<()> {
         let accept = async move |stream: TcpStream| -> anyhow::Result<()> {
             let tls_stream = self.acceptor.accept(stream).await?;
             let framed = LengthDelimitedCodec::builder().new_framed(tls_stream);
@@ -107,34 +132,12 @@ impl RunningServer {
     }
 }
 
-/// Create a [RealizeServiceClient] connected to the given TCP address.
-pub async fn connect_client<T>(
-    server_name: &str,
-    server_addr: T,
-    verifier: Arc<PeerVerifier>,
-    privkey: Arc<dyn SigningKey>,
-) -> anyhow::Result<RealizeServiceClient>
-where
-    T: tokio::net::ToSocketAddrs,
-{
-    let connector = security::make_tls_connector(verifier, privkey)?;
-
-    let stream = TcpStream::connect(server_addr).await?;
-    let domain = ServerName::try_from(server_name.to_string())?;
-    let stream = connector.connect(domain, stream).await?;
-
-    let codec_builder = LengthDelimitedCodec::builder();
-    let transport = transport::new(codec_builder.new_framed(stream), Bincode::default());
-
-    Ok(RealizeServiceClient::new(Default::default(), transport).spawn())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::service::DirectoryId;
     use crate::server::Directory;
-    use crate::testing::AbortJoinHandleOnDrop;
+    use crate::utils::async_utils::AbortOnDrop;
     use assert_fs::TempDir;
     use rustls::pki_types::PrivateKeyDer;
     use tarpc::context;
@@ -142,7 +145,7 @@ mod tests {
     // Helper to setup a test server and return (server_addr, server_handle, crypto, temp_dir)
     async fn setup_test_server(
         verifier: Arc<PeerVerifier>,
-    ) -> anyhow::Result<(SocketAddr, AbortJoinHandleOnDrop<()>, TempDir)> {
+    ) -> anyhow::Result<(SocketAddr, AbortOnDrop<()>, TempDir)> {
         let temp = TempDir::new()?;
         let server_impl = RealizeServer::new(vec![Directory::new(
             &DirectoryId::from("testdir"),
@@ -158,7 +161,7 @@ mod tests {
         )
         .await?;
         let addr = server.local_addr()?;
-        let server_handle = AbortJoinHandleOnDrop::new(server.spawn());
+        let server_handle = AbortOnDrop::new(server.spawn());
         Ok((addr, server_handle, temp))
     }
 
