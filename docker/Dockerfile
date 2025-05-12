@@ -1,3 +1,8 @@
+# This docker container runs the daemon
+#
+# Build it with:
+#  docker build -t realize-daemon -f docker/Dockerfile $PWD
+
 # Use a Rust base image with Cargo installed
 FROM rust:1.86.0-alpine3.20 AS builder
 RUN apk add gcc make musl-dev
@@ -23,14 +28,40 @@ RUN cargo build --release --bin realized
 
 # --- Runtime stage ---
 FROM alpine:3.20
-WORKDIR /app
-# Install runtime dependencies (openssl, ca-certificates, etc.)
 RUN apk add --no-cache ca-certificates openssl
+
+COPY ./docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Env setup
+WORKDIR /app
+ENV UID=500
+ENV GID=500
+
+RUN addgroup \
+    --gid "$GID" \
+    "realized" \
+&&  adduser \
+    --disabled-password \
+    --gecos "" \
+    --home "$(pwd)" \
+    --ingroup "realized" \
+    --no-create-home \
+    --uid "$UID" \
+    realized \
+&& chown "$GID:$UID" .
+
+EXPOSE 9771
+ENV ADDRESS=0.0.0.0:9771
+
+# Server private key
+ENV PRIVKEY=/config/private.key
+
+# Server configuration
+ENV CONFIG=/config/config.yaml
 
 # Copy the realized binary from the builder
 COPY --from=builder /usr/src/app/target/release/realized /usr/local/bin/realized
 
-# Copy any required runtime files (config, resources, etc.)
-
-ENTRYPOINT ["/usr/local/bin/realized"]
-CMD ["--help"] 
+USER realized
+ENTRYPOINT [ "/entrypoint.sh" ]
