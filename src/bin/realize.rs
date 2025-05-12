@@ -187,9 +187,7 @@ async fn main() {
     }
 
     // Move files
-    match realize::algo::move_files(tarpc::context::current(), &src_client, &dst_client, dir_id)
-        .await
-    {
+    match realize::algo::move_files(&src_client, &dst_client, dir_id).await {
         Ok(_) => process::exit(0),
         Err(e) => {
             eprintln!("Error: {e}");

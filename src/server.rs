@@ -1,8 +1,9 @@
-use crate::model::service::RealizeServiceClient;
+use crate::client::DeadlineSetter;
 use crate::model::service::{
     ByteRange, DirectoryId, RealizeError, RealizeService, Result, RsyncOperation, SyncedFile,
     SyncedFileState,
 };
+use crate::model::service::{RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse};
 use fast_rsync::{
     Signature as RsyncSignature, SignatureOptions, apply_limited as rsync_apply_limited,
     diff as rsync_diff,
@@ -53,7 +54,11 @@ impl RealizeServer {
     }
 
     /// Create an in-process RealizeServiceClient for this server instance.
-    pub fn as_inprocess_client(self) -> RealizeServiceClient {
+    pub fn as_inprocess_client(
+        self,
+    ) -> RealizeServiceClient<
+        DeadlineSetter<tarpc::client::Channel<RealizeServiceRequest, RealizeServiceResponse>>,
+    > {
         let (client_transport, server_transport) = tarpc::transport::channel::unbounded();
         let server = tarpc::server::BaseChannel::with_defaults(server_transport);
         tokio::spawn(
@@ -63,7 +68,10 @@ impl RealizeServer {
                     tokio::spawn(response);
                 }),
         );
-        RealizeServiceClient::new(tarpc::client::Config::default(), client_transport).spawn()
+        let client = tarpc::client::new(tarpc::client::Config::default(), client_transport).spawn();
+        let client = RealizeServiceClient::from(DeadlineSetter::new(client));
+
+        client
     }
 }
 

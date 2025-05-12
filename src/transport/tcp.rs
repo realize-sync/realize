@@ -14,6 +14,9 @@ use tarpc::server::{BaseChannel, Channel};
 use tarpc::tokio_serde::formats::Bincode;
 use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
 
+use crate::client::DeadlineSetter;
+use crate::model::service::RealizeServiceRequest;
+use crate::model::service::RealizeServiceResponse;
 use crate::model::service::{RealizeService, RealizeServiceClient};
 use crate::server::RealizeServer;
 use crate::transport::security;
@@ -43,7 +46,11 @@ pub async fn connect_client<T>(
     server_addr: T,
     verifier: Arc<PeerVerifier>,
     privkey: Arc<dyn SigningKey>,
-) -> anyhow::Result<RealizeServiceClient>
+) -> anyhow::Result<
+    RealizeServiceClient<
+        DeadlineSetter<tarpc::client::Channel<RealizeServiceRequest, RealizeServiceResponse>>,
+    >,
+>
 where
     T: tokio::net::ToSocketAddrs,
 {
@@ -56,7 +63,10 @@ where
     let codec_builder = LengthDelimitedCodec::builder();
     let transport = transport::new(codec_builder.new_framed(stream), Bincode::default());
 
-    Ok(RealizeServiceClient::new(Default::default(), transport).spawn())
+    let client = tarpc::client::new(Default::default(), transport).spawn();
+    let client = RealizeServiceClient::from(DeadlineSetter::new(client));
+
+    Ok(client)
 }
 
 /// A TCP server bound to an address.

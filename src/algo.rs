@@ -3,24 +3,33 @@
 //! Implements the unoptimized algorithm to move files from source (A) to destination (B)
 //! using the RealizeService trait. See spec/design.md for details.
 
-use crate::model::service::{DirectoryId, RealizeError, RealizeServiceClient, SyncedFile};
+use crate::model::service::{
+    DirectoryId, RealizeError, RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse,
+    SyncedFile,
+};
 use futures::future::{join, join_all};
 use std::{collections::HashMap, path::Path};
-use tarpc::context::Context;
+use tarpc::{client::stub::Stub, context};
 
 const CHUNK_SIZE: u64 = 8 * 1024 * 1024; // 8MB
 
 /// Moves files from source to destination using the RealizeService interface.
 /// After a successful move and hash match, deletes the file from the source.
-pub async fn move_files(
-    ctx: Context,
-    src: &RealizeServiceClient,
-    dst: &RealizeServiceClient,
+pub async fn move_files<T, U>(
+    src: &RealizeServiceClient<T>,
+    dst: &RealizeServiceClient<U>,
     dir_id: DirectoryId,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+    U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+{
     // 1. List files on src and dst in parallel
-    let (src_files, dst_files) =
-        join(src.list(ctx, dir_id.clone()), dst.list(ctx, dir_id.clone())).await;
+    let (src_files, dst_files) = join(
+        src.list(context::current(), dir_id.clone()),
+        dst.list(context::current(), dir_id.clone()),
+    )
+    .await;
     let src_files = src_files??;
     let dst_files = dst_files??;
 
@@ -32,7 +41,7 @@ pub async fn move_files(
         .collect();
     let futures = src_files
         .iter()
-        .map(|file| move_file(src, file, dst, dst_map.get(&file.path), &ctx, &dir_id));
+        .map(|file| move_file(src, file, dst, dst_map.get(&file.path), &dir_id));
     join_all(futures)
         .await
         .into_iter()
@@ -40,19 +49,22 @@ pub async fn move_files(
     Ok(())
 }
 
-async fn move_file(
-    src: &RealizeServiceClient,
+async fn move_file<T, U>(
+    src: &RealizeServiceClient<T>,
     src_file: &SyncedFile,
-    dst: &RealizeServiceClient,
+    dst: &RealizeServiceClient<U>,
     dst_file: Option<&SyncedFile>,
-    ctx: &Context,
     dir_id: &DirectoryId,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+    U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+{
     let path = src_file.path.as_path();
     let src_size = src_file.size;
     let dst_size = dst_file.map(|f| f.size).unwrap_or(0);
 
-    if src_size == dst_size && check_hashes_and_delete(src, dst, ctx, dir_id, &path).await? {
+    if src_size == dst_size && check_hashes_and_delete(src, dst, dir_id, &path).await? {
         return Ok(());
     }
 
@@ -76,10 +88,15 @@ async fn move_file(
             // Send data
             log::debug!("{}:{:?} sending range {:?}", dir_id, path, range);
             let data = src
-                .read(*ctx, dir_id.clone(), path.to_path_buf(), range)
+                .read(
+                    context::current(),
+                    dir_id.clone(),
+                    path.to_path_buf(),
+                    range,
+                )
                 .await??;
             dst.send(
-                *ctx,
+                context::current(),
                 dir_id.clone(),
                 path.to_path_buf(),
                 range,
@@ -91,13 +108,24 @@ async fn move_file(
             // Compute diff and apply
             log::debug!("{}:{:?} rsync on range {:?}", dir_id, path, range);
             let sig = dst
-                .calculate_signature(*ctx, dir_id.clone(), path.to_path_buf(), range)
+                .calculate_signature(
+                    context::current(),
+                    dir_id.clone(),
+                    path.to_path_buf(),
+                    range,
+                )
                 .await??;
             let delta = src
-                .diff(*ctx, dir_id.clone(), path.to_path_buf(), range, sig)
+                .diff(
+                    context::current(),
+                    dir_id.clone(),
+                    path.to_path_buf(),
+                    range,
+                    sig,
+                )
                 .await??;
             dst.apply_delta(
-                *ctx,
+                context::current(),
                 dir_id.clone(),
                 path.to_path_buf(),
                 range,
@@ -109,7 +137,7 @@ async fn move_file(
         offset = end;
     }
 
-    if !check_hashes_and_delete(src, dst, ctx, dir_id, &path).await? {
+    if !check_hashes_and_delete(src, dst, dir_id, &path).await? {
         return Err(RealizeError::Sync(
             path.to_path_buf(),
             "Data still inconsistent after sync".to_string(),
@@ -123,16 +151,19 @@ async fn move_file(
 /// Check hashes and, if they match, finish the dest file and delete the source.
 ///
 /// Return true if the hashes matched, false otherwise.
-async fn check_hashes_and_delete(
-    src: &RealizeServiceClient,
-    dst: &RealizeServiceClient,
-    ctx: &Context,
+async fn check_hashes_and_delete<T, U>(
+    src: &RealizeServiceClient<T>,
+    dst: &RealizeServiceClient<U>,
     dir_id: &DirectoryId,
     path: &Path,
-) -> Result<bool, anyhow::Error> {
+) -> Result<bool, anyhow::Error>
+where
+    T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+    U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+{
     let (src_hash, dst_hash) = tokio::join!(
-        src.hash(*ctx, dir_id.clone(), path.to_path_buf()),
-        dst.hash(*ctx, dir_id.clone(), path.to_path_buf()),
+        src.hash(context::current(), dir_id.clone(), path.to_path_buf()),
+        dst.hash(context::current(), dir_id.clone(), path.to_path_buf()),
     );
     let src_hash = src_hash??;
     let dst_hash = dst_hash??;
@@ -146,9 +177,9 @@ async fn check_hashes_and_delete(
         path
     );
     // Hashes match, finish and delete
-    dst.finish(*ctx, dir_id.clone(), path.to_path_buf())
+    dst.finish(context::current(), dir_id.clone(), path.to_path_buf())
         .await??;
-    src.delete(*ctx, dir_id.clone(), path.to_path_buf())
+    src.delete(context::current(), dir_id.clone(), path.to_path_buf())
         .await??;
     return Ok(true);
 }
@@ -158,8 +189,8 @@ mod tests {
     use super::*;
     use crate::model::service::DirectoryId;
     use crate::server::RealizeServer;
-    use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -202,13 +233,7 @@ mod tests {
         src_temp.child("partial").write_str("partialcopy")?;
 
         println!("test_move_files: all files set up");
-        move_files(
-            tarpc::context::Context::current(),
-            &src_server,
-            &dst_server,
-            DirectoryId::from("testdir"),
-        )
-        .await?;
+        move_files(&src_server, &dst_server, DirectoryId::from("testdir")).await?;
 
         // Check that files are present in destination and not in source
         assert_eq_unordered!(snapshot_dir(src_temp.path())?, vec![]);
@@ -270,13 +295,7 @@ mod tests {
         garbage.extend_from_slice(&chunk5[..1024 * 1024]); // 1MB garbage
         dst_temp.child("large_garbage").write_binary(&garbage)?;
 
-        move_files(
-            tarpc::context::Context::current(),
-            &src_server,
-            &dst_server,
-            DirectoryId::from("testdir"),
-        )
-        .await?;
+        move_files(&src_server, &dst_server, DirectoryId::from("testdir")).await?;
 
         // Check that files are present in destination and not in source
         assert_eq_unordered!(snapshot_dir(src_temp.path())?, vec![]);
