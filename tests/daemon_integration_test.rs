@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use assert_cmd::cargo::cargo_bin;
-use assert_fs::TempDir;
 use assert_fs::prelude::*;
+use assert_fs::TempDir;
 use predicates::prelude::*;
 use process_wrap::tokio::ProcessGroup;
 use process_wrap::tokio::TokioCommandWrap;
@@ -11,9 +11,9 @@ use realize::model::service::DirectoryId;
 use realize::transport::security;
 use realize::transport::security::PeerVerifier;
 use realize::transport::tcp;
+use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::SubjectPublicKeyInfoDer;
-use rustls::pki_types::pem::PemObject as _;
 use tokio::fs;
 use tokio::io::AsyncBufReadExt as _;
 
@@ -48,7 +48,7 @@ peers:
     // its output, so we know what port to connect to.
     let mut daemon = TokioCommandWrap::with_new(cargo_bin!("realized"), |cmd| {
         cmd.arg("--address")
-            .arg("localhost:0")
+            .arg("127.0.0.1:0")
             .arg("--privkey")
             .arg(&privkey_file)
             .arg("--config")
