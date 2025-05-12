@@ -120,3 +120,48 @@ sent.
 Think about what should be logged at the error, warning info and debug
 level. What format should be followed. What information should be
 sent.
+
+## Realize supports local/remote src and dest {#localremote}
+
+Currently realize hardcodes that the source is local and the
+destination remote. Let's support other combinations:
+
+- Both remote
+
+```
+ realize --privkey <keyfile> --src-addr <host:port> --dst-addr <host:port> --peers <peers> <directory_id>
+```
+
+`<peers>` is a PEM file containing one or more public keys for the
+servers that the client can connect to. --peers replaces --server-key,
+--src-addr/--dst-addr replace --address and local path.
+
+On the implementation side, `PemObject::pem_file_iter` can be used
+instead of `PemObject::from_pem_file` to read multiple keys from a file.
+
+- Both local
+
+```
+ realize --src-path <local_path> --dst-path <local_path>
+```
+
+The directory id doesn't need to be specified in this case. It defaults to just "dir".
+
+--privkey and --peers are also not necessary in this case.
+
+- One remote, one local
+
+```
+ realize --privkey <keyfile> --src-addr <host:port> --dst-path <local_path> --peers <peers> <directory_id>
+```
+
+```
+ realize --privkey <keyfile> --src-path <local_path> --dst-addr <host:port> --peers <peers> <directory_id>
+```
+
+Task list:
+
+- Update the code in src/bin/realize.rs
+- Update the integration test in src/tests/move_files_integration_test.rs
+- Run "cargo test --test move_files_integration_test" to make sure everything compiles and that the test run
+
