@@ -7,7 +7,6 @@ use realize::transport::security::{self, PeerVerifier};
 use realize::transport::tcp;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
-use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,32 +15,23 @@ async fn test_local_to_remote() -> anyhow::Result<()> {
     env_logger::try_init().ok();
     let tempdir = TempDir::new()?;
     let src_dir = tempdir.child("src");
-    let src_dir_path = src_dir.path().to_path_buf();
-    let src_dir_path_for_cmd = src_dir_path.clone();
-    fs::create_dir(&src_dir_path)?;
     let dst_dir = tempdir.child("dst");
+    let src_dir_path = src_dir.path().to_path_buf();
     let dst_dir_path = dst_dir.path().to_path_buf();
-    fs::create_dir(&dst_dir_path)?;
-    src_dir.child("foo.txt").write_str("hello")?;
-    src_dir.child("bar.txt").write_str("world")?;
-    let privkey_a_path = Arc::new(PathBuf::from("resources/test/a.key"));
-    let privkey_b_path = Arc::new(PathBuf::from("resources/test/b.key"));
-    let pubkey_a_path = PathBuf::from("resources/test/a-spki.pem");
-    let pubkey_b_path = PathBuf::from("resources/test/b-spki.pem");
-    let peers_path = PathBuf::from("resources/test/peers.pem");
-    let crypto = Arc::new(security::default_provider());
-    let mut verifier = PeerVerifier::new(&crypto);
-    verifier.add_peer(&SubjectPublicKeyInfoDer::from_pem_file(&pubkey_a_path)?);
-    verifier.add_peer(&SubjectPublicKeyInfoDer::from_pem_file(&pubkey_b_path)?);
-    let verifier = Arc::new(verifier);
+    util::create_dir_with_files(&src_dir, &[("foo.txt", "hello"), ("bar.txt", "world")])?;
+    std::fs::create_dir(&dst_dir_path)?;
+    let keys = util::test_keys();
+    let (crypto, verifier): (Arc<rustls::crypto::CryptoProvider>, Arc<PeerVerifier>) =
+        util::setup_crypto_and_verifier();
     let privkey_b = Arc::from(
         crypto
             .key_provider
-            .load_private_key(PrivateKeyDer::from_pem_file(privkey_b_path.as_ref())?)?,
+            .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_b_path.as_ref())?)?,
     );
     let server = RealizeServer::for_dir(&"testdir".into(), dst_dir.path());
     let (addr, server_handle) =
         tcp::start_server("127.0.0.1:0", server, verifier, privkey_b).await?;
+    let src_dir_path_for_cmd = src_dir_path.clone();
     let test = tokio::spawn(async move {
         let status = tokio::process::Command::new(cargo_bin!("realize"))
             .arg("--src-path")
@@ -49,9 +39,9 @@ async fn test_local_to_remote() -> anyhow::Result<()> {
             .arg("--dst-addr")
             .arg(&addr.to_string())
             .arg("--privkey")
-            .arg(privkey_a_path.as_ref())
+            .arg(keys.privkey_a_path.as_ref())
             .arg("--peers")
-            .arg(&peers_path)
+            .arg(&keys.peers_path)
             .arg("--directory-id")
             .arg("testdir")
             .stdout(std::process::Stdio::inherit())
@@ -64,24 +54,11 @@ async fn test_local_to_remote() -> anyhow::Result<()> {
     let result = test.await;
     server_handle.abort();
     result??;
-    assert_eq_unordered!(
-        dst_dir
-            .read_dir()?
-            .flatten()
-            .flat_map(|d| pathdiff::diff_paths(d.path(), &dst_dir_path))
-            .collect::<Vec<_>>(),
+    util::assert_dir_contents(
+        &dst_dir,
         vec![PathBuf::from("foo.txt"), PathBuf::from("bar.txt")],
-        "dst dir must contain all files from src dir"
-    );
-    assert_eq_unordered!(
-        src_dir
-            .read_dir()?
-            .flatten()
-            .flat_map(|d| pathdiff::diff_paths(d.path(), &src_dir_path))
-            .collect::<Vec<_>>(),
-        vec![],
-        "src dir must be empty"
-    );
+    )?;
+    util::assert_dir_empty(&src_dir)?;
     Ok(())
 }
 
@@ -90,32 +67,22 @@ async fn test_remote_to_local() -> anyhow::Result<()> {
     env_logger::try_init().ok();
     let tempdir = TempDir::new()?;
     let src_dir = tempdir.child("src");
-    let src_dir_path = src_dir.path().to_path_buf();
-    fs::create_dir(&src_dir_path)?;
     let dst_dir = tempdir.child("dst");
     let dst_dir_path = dst_dir.path().to_path_buf();
-    let dst_dir_path_for_cmd = dst_dir_path.clone();
-    fs::create_dir(&dst_dir_path)?;
-    src_dir.child("foo.txt").write_str("hello")?;
-    src_dir.child("bar.txt").write_str("world")?;
-    let privkey_a_path = Arc::new(PathBuf::from("resources/test/a.key"));
-    let privkey_b_path = Arc::new(PathBuf::from("resources/test/b.key"));
-    let pubkey_a_path = PathBuf::from("resources/test/a-spki.pem");
-    let pubkey_b_path = PathBuf::from("resources/test/b-spki.pem");
-    let peers_path = PathBuf::from("resources/test/peers.pem");
-    let crypto = Arc::new(security::default_provider());
-    let mut verifier = PeerVerifier::new(&crypto);
-    verifier.add_peer(&SubjectPublicKeyInfoDer::from_pem_file(&pubkey_a_path)?);
-    verifier.add_peer(&SubjectPublicKeyInfoDer::from_pem_file(&pubkey_b_path)?);
-    let verifier = Arc::new(verifier);
+    util::create_dir_with_files(&src_dir, &[("foo.txt", "hello"), ("bar.txt", "world")])?;
+    std::fs::create_dir(&dst_dir_path)?;
+    let keys = util::test_keys();
+    let (crypto, verifier): (Arc<rustls::crypto::CryptoProvider>, Arc<PeerVerifier>) =
+        util::setup_crypto_and_verifier();
     let privkey_a = Arc::from(
         crypto
             .key_provider
-            .load_private_key(PrivateKeyDer::from_pem_file(privkey_a_path.as_ref())?)?,
+            .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_a_path.as_ref())?)?,
     );
     let server = RealizeServer::for_dir(&"testdir2".into(), src_dir.path());
     let (src_addr, server_handle) =
         tcp::start_server("127.0.0.1:0", server, verifier, privkey_a).await?;
+    let dst_dir_path_for_cmd = dst_dir_path.clone();
     let test = tokio::spawn(async move {
         let status = tokio::process::Command::new(cargo_bin!("realize"))
             .arg("--src-addr")
@@ -123,9 +90,9 @@ async fn test_remote_to_local() -> anyhow::Result<()> {
             .arg("--dst-path")
             .arg(&dst_dir_path_for_cmd)
             .arg("--privkey")
-            .arg(privkey_b_path.as_ref())
+            .arg(keys.privkey_b_path.as_ref())
             .arg("--peers")
-            .arg(&peers_path)
+            .arg(&keys.peers_path)
             .arg("--directory-id")
             .arg("testdir2")
             .stdout(std::process::Stdio::inherit())
@@ -138,24 +105,11 @@ async fn test_remote_to_local() -> anyhow::Result<()> {
     let result = test.await;
     server_handle.abort();
     result??;
-    assert_eq_unordered!(
-        dst_dir
-            .read_dir()?
-            .flatten()
-            .flat_map(|d| pathdiff::diff_paths(d.path(), &dst_dir_path))
-            .collect::<Vec<_>>(),
+    util::assert_dir_contents(
+        &dst_dir,
         vec![PathBuf::from("foo.txt"), PathBuf::from("bar.txt")],
-        "dst dir must contain all files from src dir"
-    );
-    assert_eq_unordered!(
-        src_dir
-            .read_dir()?
-            .flatten()
-            .flat_map(|d| pathdiff::diff_paths(d.path(), &src_dir_path))
-            .collect::<Vec<_>>(),
-        vec![],
-        "src dir must be empty"
-    );
+    )?;
+    util::assert_dir_empty(&src_dir)?;
     Ok(())
 }
 
@@ -167,9 +121,7 @@ async fn test_local_to_local() -> anyhow::Result<()> {
     let dst_dir = tempdir.child("dst2");
     let src2_path = src_dir.path().to_path_buf();
     let dst2_path = dst_dir.path().to_path_buf();
-    fs::create_dir(&src2_path)?;
-    fs::create_dir(&dst2_path)?;
-    src_dir.child("baz.txt").write_str("baz")?;
+    util::create_dir_with_files(&src_dir, &[("baz.txt", "baz")])?;
     let status = tokio::process::Command::new(cargo_bin!("realize"))
         .arg("--src-path")
         .arg(&src2_path)
@@ -180,24 +132,8 @@ async fn test_local_to_local() -> anyhow::Result<()> {
         .status()
         .await?;
     assert!(status.success());
-    assert_eq_unordered!(
-        dst_dir
-            .read_dir()?
-            .flatten()
-            .flat_map(|d| pathdiff::diff_paths(d.path(), &dst2_path))
-            .collect::<Vec<_>>(),
-        vec![PathBuf::from("baz.txt")],
-        "dst2 dir must contain all files from src2 dir"
-    );
-    assert_eq_unordered!(
-        src_dir
-            .read_dir()?
-            .flatten()
-            .flat_map(|d| pathdiff::diff_paths(d.path(), &src2_path))
-            .collect::<Vec<_>>(),
-        vec![],
-        "src2 dir must be empty"
-    );
+    util::assert_dir_contents(&dst_dir, vec![PathBuf::from("baz.txt")])?;
+    util::assert_dir_empty(&src_dir)?;
     Ok(())
 }
 
@@ -207,30 +143,19 @@ async fn test_remote_to_remote() -> anyhow::Result<()> {
     let tempdir = TempDir::new()?;
     let src_dir = tempdir.child("src3");
     let dst_dir = tempdir.child("dst3");
-    let src3_path = src_dir.path().to_path_buf();
-    let dst3_path = dst_dir.path().to_path_buf();
-    fs::create_dir(&src3_path)?;
-    fs::create_dir(&dst3_path)?;
-    src_dir.child("qux.txt").write_str("qux")?;
-    let privkey_a_path = Arc::new(PathBuf::from("resources/test/a.key"));
-    let privkey_b_path = Arc::new(PathBuf::from("resources/test/b.key"));
-    let pubkey_a_path = PathBuf::from("resources/test/a-spki.pem");
-    let pubkey_b_path = PathBuf::from("resources/test/b-spki.pem");
-    let peers_path = PathBuf::from("resources/test/peers.pem");
-    let crypto = Arc::new(security::default_provider());
-    let mut verifier = PeerVerifier::new(&crypto);
-    verifier.add_peer(&SubjectPublicKeyInfoDer::from_pem_file(&pubkey_a_path)?);
-    verifier.add_peer(&SubjectPublicKeyInfoDer::from_pem_file(&pubkey_b_path)?);
-    let verifier = Arc::new(verifier);
+    util::create_dir_with_files(&src_dir, &[("qux.txt", "qux")])?;
+    let keys = util::test_keys();
+    let (crypto, verifier): (Arc<rustls::crypto::CryptoProvider>, Arc<PeerVerifier>) =
+        util::setup_crypto_and_verifier();
     let privkey_a = Arc::from(
         crypto
             .key_provider
-            .load_private_key(PrivateKeyDer::from_pem_file(privkey_a_path.as_ref())?)?,
+            .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_a_path.as_ref())?)?,
     );
     let privkey_b = Arc::from(
         crypto
             .key_provider
-            .load_private_key(PrivateKeyDer::from_pem_file(privkey_b_path.as_ref())?)?,
+            .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_b_path.as_ref())?)?,
     );
     let server_src = RealizeServer::for_dir(&"dir".into(), src_dir.path());
     let (src_addr3, server_handle_src) =
@@ -245,9 +170,9 @@ async fn test_remote_to_remote() -> anyhow::Result<()> {
             .arg("--dst-addr")
             .arg(&dst_addr3.to_string())
             .arg("--privkey")
-            .arg(privkey_a_path.as_ref())
+            .arg(keys.privkey_a_path.as_ref())
             .arg("--peers")
-            .arg(&peers_path)
+            .arg(&keys.peers_path)
             .arg("--directory-id")
             .arg("dir")
             .stdout(std::process::Stdio::inherit())
@@ -261,23 +186,76 @@ async fn test_remote_to_remote() -> anyhow::Result<()> {
     server_handle_src.abort();
     server_handle_dst.abort();
     result??;
-    assert_eq_unordered!(
-        dst_dir
-            .read_dir()?
-            .flatten()
-            .flat_map(|d| pathdiff::diff_paths(d.path(), &dst3_path))
-            .collect::<Vec<_>>(),
-        vec![PathBuf::from("qux.txt")],
-        "dst3 dir must contain all files from src3 dir"
-    );
-    assert_eq_unordered!(
-        src_dir
-            .read_dir()?
-            .flatten()
-            .flat_map(|d| pathdiff::diff_paths(d.path(), &src3_path))
-            .collect::<Vec<_>>(),
-        vec![],
-        "src3 dir must be empty"
-    );
+    util::assert_dir_contents(&dst_dir, vec![PathBuf::from("qux.txt")])?;
+    util::assert_dir_empty(&src_dir)?;
     Ok(())
+}
+
+mod util {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    pub struct TestKeys {
+        pub privkey_a_path: Arc<PathBuf>,
+        pub privkey_b_path: Arc<PathBuf>,
+        pub pubkey_a_path: PathBuf,
+        pub pubkey_b_path: PathBuf,
+        pub peers_path: PathBuf,
+    }
+
+    pub fn test_keys() -> TestKeys {
+        TestKeys {
+            privkey_a_path: Arc::new(PathBuf::from("resources/test/a.key")),
+            privkey_b_path: Arc::new(PathBuf::from("resources/test/b.key")),
+            pubkey_a_path: PathBuf::from("resources/test/a-spki.pem"),
+            pubkey_b_path: PathBuf::from("resources/test/b-spki.pem"),
+            peers_path: PathBuf::from("resources/test/peers.pem"),
+        }
+    }
+
+    pub fn create_dir_with_files(
+        dir: &assert_fs::fixture::ChildPath,
+        files: &[(&str, &str)],
+    ) -> anyhow::Result<()> {
+        std::fs::create_dir(dir.path())?;
+        for (name, content) in files {
+            dir.child(name).write_str(content)?;
+        }
+        Ok(())
+    }
+
+    pub fn assert_dir_contents(
+        dir: &assert_fs::fixture::ChildPath,
+        expected: Vec<PathBuf>,
+    ) -> anyhow::Result<()> {
+        assert_eq_unordered!(
+            dir.read_dir()?
+                .flatten()
+                .flat_map(|d| pathdiff::diff_paths(d.path(), dir.path()))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        Ok(())
+    }
+
+    pub fn assert_dir_empty(dir: &assert_fs::fixture::ChildPath) -> anyhow::Result<()> {
+        assert_eq_unordered!(
+            dir.read_dir()?
+                .flatten()
+                .flat_map(|d| pathdiff::diff_paths(d.path(), dir.path()))
+                .collect::<Vec<_>>(),
+            Vec::<PathBuf>::new()
+        );
+        Ok(())
+    }
+
+    pub fn setup_crypto_and_verifier() -> (Arc<rustls::crypto::CryptoProvider>, Arc<PeerVerifier>) {
+        let crypto = Arc::new(security::default_provider());
+        let keys = test_keys();
+        let mut verifier = PeerVerifier::new(&crypto);
+        verifier.add_peer(&SubjectPublicKeyInfoDer::from_pem_file(&keys.pubkey_a_path).unwrap());
+        verifier.add_peer(&SubjectPublicKeyInfoDer::from_pem_file(&keys.pubkey_b_path).unwrap());
+        (crypto, Arc::new(verifier))
+    }
 }
