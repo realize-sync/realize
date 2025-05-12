@@ -338,6 +338,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_tls_reject_client_without_cert() -> anyhow::Result<()> {
+        let crypto = Arc::new(default_provider());
+        let mut verifier = PeerVerifier::new(&crypto);
+        verifier.add_peer(&testing::client_public_key());
+        verifier.add_peer(&testing::server_public_key());
+
+        let verifier = Arc::new(verifier);
+
+        let server_priv = load_signing_key(testing::server_private_key())?;
+        let acceptor = make_tls_acceptor(Arc::clone(&verifier), server_priv)?;
+
+        // Misconfigured connector; no client auth.
+        let bad_connector = {
+            let config = ClientConfig::builder_with_protocol_versions(&[&TLS13])
+                .dangerous()
+                .with_custom_certificate_verifier(verifier.clone())
+                .with_no_client_auth();
+
+            TlsConnector::from(Arc::new(config))
+        };
+
+        assert!(test_connect_1(acceptor, bad_connector).await.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_tls_reject_server_with_bad_private_key() -> anyhow::Result<()> {
         let crypto = Arc::new(default_provider());
         let mut verifier = PeerVerifier::new(&crypto);
