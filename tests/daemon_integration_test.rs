@@ -8,6 +8,7 @@ use predicates::prelude::*;
 use process_wrap::tokio::ProcessGroup;
 use process_wrap::tokio::TokioCommandWrap;
 use realize::model::service::DirectoryId;
+use realize::model::service::Options;
 use realize::transport::security;
 use realize::transport::security::PeerVerifier;
 use realize::transport::tcp;
@@ -89,7 +90,7 @@ peers:
     )
     .await?;
     let files = client
-        .list(tarpc::context::current(), DirectoryId::from("testdir"))
+        .list(tarpc::context::current(), DirectoryId::from("testdir"), Options::default())
         .await??;
     assert_unordered::assert_eq_unordered!(
         files.into_iter().map(|f| f.path).collect(),

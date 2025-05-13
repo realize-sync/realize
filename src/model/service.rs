@@ -56,11 +56,16 @@ pub struct Signature(pub Vec<u8>);
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Delta(pub Vec<u8>);
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+pub struct Options {
+    pub ignore_partial: bool,
+}
+
 /// The service trait for file synchronization.
 #[tarpc::service]
 pub trait RealizeService {
     /// List files in a directory
-    async fn list(dir_id: DirectoryId) -> Result<Vec<SyncedFile>>;
+    async fn list(dir_id: DirectoryId, options: Options) -> Result<Vec<SyncedFile>>;
 
     /// Send a byte range of a file.
     ///
@@ -71,26 +76,28 @@ pub trait RealizeService {
         range: ByteRange,
         file_size: u64,
         data: Vec<u8>,
+        options: Options,
     ) -> Result<()>;
 
     /// Read a byte range from a file
-    async fn read(dir_id: DirectoryId, relative_path: PathBuf, range: ByteRange)
+    async fn read(dir_id: DirectoryId, relative_path: PathBuf, range: ByteRange, options: Options)
     -> Result<Vec<u8>>;
 
     /// Mark a partial file as complete
-    async fn finish(dir_id: DirectoryId, relative_path: PathBuf) -> Result<()>;
+    async fn finish(dir_id: DirectoryId, relative_path: PathBuf, options: Options) -> Result<()>;
 
     /// Compute a SHA-256 hash of the file at the given path (final or partial).
-    async fn hash(dir_id: DirectoryId, relative_path: PathBuf) -> Result<Hash>;
+    async fn hash(dir_id: DirectoryId, relative_path: PathBuf, options: Options) -> Result<Hash>;
 
     /// Delete the file at the given path (both partial and final forms).
-    async fn delete(dir_id: DirectoryId, relative_path: PathBuf) -> Result<()>;
+    async fn delete(dir_id: DirectoryId, relative_path: PathBuf, options: Options) -> Result<()>;
 
     /// Calculate a signature for the file at the given path and byte range.
     async fn calculate_signature(
         dir_id: DirectoryId,
         relative_path: PathBuf,
         range: ByteRange,
+        options: Options,
     ) -> Result<Signature>;
 
     /// Compute a delta from the file at the given path and a given signature.
@@ -102,6 +109,7 @@ pub trait RealizeService {
         relative_path: PathBuf,
         range: ByteRange,
         signature: Signature,
+        options: Options,
     ) -> Result<Delta>;
 
     /// Apply a delta to the file at the given path and byte range.
@@ -111,6 +119,7 @@ pub trait RealizeService {
         range: ByteRange,
         file_size: u64,
         delta: Delta,
+        options: Options,
     ) -> Result<()>;
 }
 

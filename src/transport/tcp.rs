@@ -145,7 +145,7 @@ impl RunningServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::service::DirectoryId;
+    use crate::model::service::{DirectoryId, Options};
     use crate::server::Directory;
     use crate::utils::async_utils::AbortOnDrop;
     use assert_fs::TempDir;
@@ -216,7 +216,11 @@ mod tests {
             load_private_key(crate::transport::security::testing::client_private_key())?;
         let client = connect_client("localhost", addr, verifier_both(), client_privkey).await?;
         let list = client
-            .list(context::current(), DirectoryId::from("testdir"))
+            .list(
+                context::current(),
+                DirectoryId::from("testdir"),
+                Options::default(),
+            )
             .await??;
         assert_eq!(list.len(), 0);
         Ok(())
@@ -233,7 +237,11 @@ mod tests {
         match client_result {
             Ok(client) => {
                 let list_result = client
-                    .list(context::current(), DirectoryId::from("testdir"))
+                    .list(
+                        context::current(),
+                        DirectoryId::from("testdir"),
+                        Options::default(),
+                    )
                     .await;
                 assert!(
                     list_result.is_err(),

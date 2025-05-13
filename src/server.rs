@@ -1,12 +1,13 @@
 use crate::client::DeadlineSetter;
+use crate::model::service::Options;
 use crate::model::service::{
     ByteRange, DirectoryId, RealizeError, RealizeService, Result, RsyncOperation, SyncedFile,
     SyncedFileState,
 };
 use crate::model::service::{RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse};
 use fast_rsync::{
-    Signature as RsyncSignature, SignatureOptions, apply_limited as rsync_apply_limited,
-    diff as rsync_diff,
+    apply_limited as rsync_apply_limited, diff as rsync_diff, Signature as RsyncSignature,
+    SignatureOptions,
 };
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
@@ -80,23 +81,25 @@ impl RealizeService for RealizeServer {
         self,
         _: tarpc::context::Context,
         dir_id: DirectoryId,
+        options: Options,
     ) -> Result<Vec<SyncedFile>> {
         let dir = self.find_directory(&dir_id)?;
-        let mut files = Vec::new();
+        let mut files = std::collections::HashMap::new();
         for entry in WalkDir::new(dir.path()).into_iter().flatten() {
             if let Some((state, logical)) = LogicalPath::from_actual(dir, entry.path()) {
-                // TODO: What if a file exists for both the partial
-                // and final form of the logical path? Only one entry
-                // should be returned and its state should be final.
-                files.push(SyncedFile {
-                    path: logical.relative_path().to_path_buf(),
-                    size: entry.metadata()?.size(),
-                    state,
-                });
+                if options.ignore_partial && state == SyncedFileState::Partial {
+                    continue;
+                }
+                let path = logical.relative_path().to_path_buf();
+                if state == SyncedFileState::Final && files.contains_key(&path) {
+                    continue;
+                }
+                let size = entry.metadata()?.size();
+                files.insert(path.clone(), SyncedFile { path, size, state });
             }
         }
 
-        Ok(files)
+        Ok(files.into_iter().map(|(_, v)| v).collect())
     }
 
     async fn read(
@@ -105,10 +108,11 @@ impl RealizeService for RealizeServer {
         dir_id: DirectoryId,
         relative_path: PathBuf,
         range: ByteRange,
+        options: Options,
     ) -> Result<Vec<u8>> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path);
-        let (_, actual) = logical.find()?;
+        let (_, actual) = logical.find(&options)?;
         let mut file = OpenOptions::new()
             .create(false)
             .read(true)
@@ -116,7 +120,6 @@ impl RealizeService for RealizeServer {
             .open(&actual)?;
         let mut buffer = vec![0; (range.1 - range.0) as usize];
         partial_read(&mut file, &range, &mut buffer)?;
-
         Ok(buffer)
     }
 
@@ -128,11 +131,12 @@ impl RealizeService for RealizeServer {
         range: ByteRange,
         file_size: u64,
         data: Vec<u8>,
+        options: Options,
     ) -> Result<()> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path);
         let path = logical.partial_path();
-        if let Ok((state, actual)) = logical.find() {
+        if let Ok((state, actual)) = logical.find(&options) {
             // File already exists
             if state == SyncedFileState::Final {
                 fs::rename(actual, &path)?;
@@ -165,10 +169,16 @@ impl RealizeService for RealizeServer {
         _: tarpc::context::Context,
         dir_id: DirectoryId,
         relative_path: PathBuf,
+        options: Options,
     ) -> Result<()> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path);
-        if let (SyncedFileState::Partial, real_path) = logical.find()? {
+        if options.ignore_partial {
+            return Err(RealizeError::BadRequest(
+                "Invalid option for finish: ignore_partial=true".to_string(),
+            ));
+        }
+        if let (SyncedFileState::Partial, real_path) = logical.find(&options)? {
             fs::rename(real_path, logical.final_path())?;
         }
         Ok(())
@@ -179,10 +189,11 @@ impl RealizeService for RealizeServer {
         _ctx: tarpc::context::Context,
         dir_id: DirectoryId,
         relative_path: PathBuf,
+        options: Options,
     ) -> Result<crate::model::service::Hash> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path);
-        let (_state, actual) = logical.find()?;
+        let (_state, actual) = logical.find(&options)?;
         let mut file = fs::File::open(&actual)?;
         let mut hasher = Sha256::new();
         let mut buffer = [0u8; 8192];
@@ -202,6 +213,7 @@ impl RealizeService for RealizeServer {
         _ctx: tarpc::context::Context,
         dir_id: DirectoryId,
         relative_path: PathBuf,
+        options: Options,
     ) -> Result<()> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path);
@@ -212,7 +224,7 @@ impl RealizeService for RealizeServer {
             fs::remove_file(&final_path)?;
             _any_deleted = true;
         }
-        if partial_path.exists() {
+        if partial_path.exists() && !options.ignore_partial {
             fs::remove_file(&partial_path)?;
             _any_deleted = true;
         }
@@ -226,10 +238,11 @@ impl RealizeService for RealizeServer {
         dir_id: DirectoryId,
         relative_path: PathBuf,
         range: ByteRange,
+        options: Options,
     ) -> Result<crate::model::service::Signature> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path);
-        let (_, actual) = logical.find()?;
+        let (_, actual) = logical.find(&options)?;
         let mut file = std::fs::File::open(&actual)?;
         let mut buffer = vec![0u8; (range.1 - range.0) as usize];
         partial_read(&mut file, &range, &mut buffer)?;
@@ -248,11 +261,12 @@ impl RealizeService for RealizeServer {
         relative_path: PathBuf,
         range: ByteRange,
         signature: crate::model::service::Signature,
+        options: Options,
     ) -> Result<crate::model::service::Delta> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path);
         let mut buffer = vec![0u8; (range.1 - range.0) as usize];
-        if let Ok((_, actual)) = logical.find() {
+        if let Ok((_, actual)) = logical.find(&options) {
             let mut file = std::fs::File::open(&actual)?;
             partial_read(&mut file, &range, &mut buffer)?;
         }
@@ -270,10 +284,11 @@ impl RealizeService for RealizeServer {
         range: ByteRange,
         file_size: u64,
         delta: crate::model::service::Delta,
+        options: Options,
     ) -> Result<()> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path);
-        let (state, actual) = logical.find()?;
+        let (state, actual) = logical.find(&options)?;
         // Always apply to partial file
         let partial_path = logical.partial_path();
         if state == SyncedFileState::Final {
@@ -392,16 +407,17 @@ impl LogicalPath {
     //
     // File with an I/O error of kind [std::io::ErrorKind::NotFound]
     // if no file exists for the logical path.
-    fn find(&self) -> Result<(SyncedFileState, PathBuf)> {
+    fn find(&self, options: &Options) -> Result<(SyncedFileState, PathBuf)> {
+        if !options.ignore_partial {
+            let partial = self.partial_path();
+            if partial.exists() {
+                return Ok((SyncedFileState::Partial, partial));
+            }
+        }
         let fpath = self.final_path();
         if fpath.exists() {
             return Ok((SyncedFileState::Final, fpath));
         }
-        let partial = self.partial_path();
-        if partial.exists() {
-            return Ok((SyncedFileState::Partial, partial));
-        }
-
         Err(std::io::Error::from(std::io::ErrorKind::NotFound).into())
     }
 
@@ -464,8 +480,8 @@ impl From<fast_rsync::SignatureParseError> for RealizeError {
 mod tests {
     use super::*;
     use crate::model::service::Hash as FileHash;
-    use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
     use std::fs;
 
@@ -510,11 +526,12 @@ mod tests {
     fn test_find_logical_path() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let dir = Arc::new(Directory::new(&DirectoryId::from("testdir"), temp.path()));
+        let opts = Options::default();
 
         temp.child("foo.txt").write_str("test")?;
         assert_eq!(
             (SyncedFileState::Final, temp.child("foo.txt").to_path_buf()),
-            LogicalPath::new(&dir, &PathBuf::from("foo.txt")).find()?
+            LogicalPath::new(&dir, &PathBuf::from("foo.txt")).find(&opts)?
         );
 
         temp.child("subdir/foo2.txt").write_str("test")?;
@@ -523,7 +540,7 @@ mod tests {
                 SyncedFileState::Final,
                 temp.child("subdir/foo2.txt").to_path_buf()
             ),
-            LogicalPath::new(&dir, &PathBuf::from("subdir/foo2.txt")).find()?
+            LogicalPath::new(&dir, &PathBuf::from("subdir/foo2.txt")).find(&opts)?
         );
 
         temp.child(".bar.txt.part").write_str("test")?;
@@ -532,7 +549,7 @@ mod tests {
                 SyncedFileState::Partial,
                 temp.child(".bar.txt.part").to_path_buf()
             ),
-            LogicalPath::new(&dir, &PathBuf::from("bar.txt")).find()?
+            LogicalPath::new(&dir, &PathBuf::from("bar.txt")).find(&opts)?
         );
 
         temp.child("subdir/.bar2.txt.part").write_str("test")?;
@@ -541,20 +558,61 @@ mod tests {
                 SyncedFileState::Partial,
                 temp.child("subdir/.bar2.txt.part").to_path_buf()
             ),
-            LogicalPath::new(&dir, &PathBuf::from("subdir/bar2.txt")).find()?
-        );
-
-        temp.child("foo3.txt").write_str("test")?;
-        temp.child(".foo3.txt.part").write_str("test")?;
-        assert_eq!(
-            (SyncedFileState::Final, temp.child("foo3.txt").to_path_buf()),
-            LogicalPath::new(&dir, &PathBuf::from("foo3.txt")).find()?
+            LogicalPath::new(&dir, &PathBuf::from("subdir/bar2.txt")).find(&opts)?
         );
 
         assert!(matches!(
-            LogicalPath::new(&dir, &PathBuf::from("notfound.txt")).find(),
+            LogicalPath::new(&dir, &PathBuf::from("notfound.txt")).find(&opts),
             Err(RealizeError::Io(_))
         ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_logical_path_partial_and_final() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let dir = Arc::new(Directory::new(&DirectoryId::from("testdir"), temp.path()));
+        let opts = Options::default();
+        let nopartial = Options {
+            ignore_partial: true,
+        };
+
+        temp.child(".foo.txt.part").write_str("test")?;
+        temp.child("foo.txt").write_str("test")?;
+        assert_eq!(
+            (
+                SyncedFileState::Partial,
+                temp.child(".foo.txt.part").to_path_buf()
+            ),
+            LogicalPath::new(&dir, &PathBuf::from("foo.txt")).find(&opts)?
+        );
+        assert_eq!(
+            (SyncedFileState::Final, temp.child("foo.txt").to_path_buf()),
+            LogicalPath::new(&dir, &PathBuf::from("foo.txt")).find(&nopartial)?
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_logical_path_ignore_partial() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let dir = Arc::new(Directory::new(&DirectoryId::from("testdir"), temp.path()));
+        let nopartial = Options {
+            ignore_partial: true,
+        };
+
+        temp.child(".foo.txt.part").write_str("test")?;
+        assert!(LogicalPath::new(&dir, &PathBuf::from("foo.txt"))
+            .find(&nopartial)
+            .is_err());
+
+        temp.child("bar.txt").write_str("test")?;
+        assert_eq!(
+            (SyncedFileState::Final, temp.child("bar.txt").to_path_buf()),
+            LogicalPath::new(&dir, &PathBuf::from("bar.txt")).find(&nopartial)?
+        );
 
         Ok(())
     }
@@ -564,7 +622,11 @@ mod tests {
         let (server, _temp, dir) = setup_server_with_dir()?;
         let files = server
             .clone()
-            .list(tarpc::context::Context::current(), dir.id().clone())
+            .list(
+                tarpc::context::current(),
+                dir.id().clone(),
+                Options::default(),
+            )
             .await?;
         assert!(files.is_empty());
 
@@ -583,7 +645,11 @@ mod tests {
         temp.child("subdir/.bar2.txt.part").write_str("partial")?;
 
         let files = server
-            .list(tarpc::context::Context::current(), dir.id().clone())
+            .list(
+                tarpc::context::current(),
+                dir.id().clone(),
+                Options::default(),
+            )
             .await?;
         assert_eq_unordered!(
             files,
@@ -623,12 +689,13 @@ mod tests {
         server
             .clone()
             .send(
-                tarpc::context::Context::current(),
+                tarpc::context::current(),
                 dir.id().clone(),
                 fpath.relative_path().to_path_buf(),
                 (5, 10),
                 10,
                 b"fghij".to_vec(),
+                Options::default(),
             )
             .await?;
         assert!(fpath.partial_path().exists());
@@ -641,12 +708,13 @@ mod tests {
         server
             .clone()
             .send(
-                tarpc::context::Context::current(),
+                tarpc::context::current(),
                 dir.id().clone(),
                 fpath.relative_path().to_path_buf(),
                 (0, 5),
                 10,
                 b"abcde".to_vec(),
+                Options::default(),
             )
             .await?;
         assert!(fpath.partial_path().exists());
@@ -666,10 +734,11 @@ mod tests {
         let data = server
             .clone()
             .read(
-                tarpc::context::Context::current(),
+                tarpc::context::current(),
                 dir.id().clone(),
                 fpath.relative_path().to_path_buf(),
                 (5, 10),
+                Options::default(),
             )
             .await?;
         assert_eq!(String::from_utf8(data)?, "fghij");
@@ -677,10 +746,11 @@ mod tests {
         let data = server
             .clone()
             .read(
-                tarpc::context::Context::current(),
+                tarpc::context::current(),
                 dir.id().clone(),
                 fpath.relative_path().to_path_buf(),
                 (0, 5),
+                Options::default(),
             )
             .await?;
         assert_eq!(String::from_utf8(data)?, "abcde");
@@ -688,10 +758,11 @@ mod tests {
         let result = server
             .clone()
             .read(
-                tarpc::context::Context::current(),
+                tarpc::context::current(),
                 dir.id().clone(),
                 fpath.relative_path().to_path_buf(),
                 (0, 15),
+                Options::default(),
             )
             .await?;
         assert_eq!(result.len(), 15);
@@ -709,9 +780,10 @@ mod tests {
 
         server
             .finish(
-                tarpc::context::Context::current(),
+                tarpc::context::current(),
                 dir.id().clone(),
                 fpath.relative_path().to_path_buf(),
+                Options::default(),
             )
             .await?;
 
@@ -731,9 +803,10 @@ mod tests {
 
         server
             .finish(
-                tarpc::context::Context::current(),
+                tarpc::context::current(),
                 dir.id().clone(),
                 fpath.relative_path().to_path_buf(),
+                Options::default(),
             )
             .await?;
 
@@ -754,12 +827,13 @@ mod tests {
         server
             .clone()
             .send(
-                tarpc::context::Context::current(),
+                tarpc::context::current(),
                 dir.id().clone(),
                 fpath.relative_path().to_path_buf(),
                 (0, 7),
                 7,
                 b"1234567".to_vec(),
+                Options::default(),
             )
             .await?;
         let content = std::fs::read_to_string(fpath.partial_path())?;
@@ -776,9 +850,10 @@ mod tests {
         let hash = server
             .clone()
             .hash(
-                tarpc::context::Context::current(),
+                tarpc::context::current(),
                 dir.id().clone(),
                 PathBuf::from("foo.txt"),
+                Options::default(),
             )
             .await?;
         let mut hasher = Sha256::new();
@@ -793,9 +868,10 @@ mod tests {
         let hash2 = server
             .clone()
             .hash(
-                tarpc::context::Context::current(),
+                tarpc::context::current(),
                 dir.id().clone(),
                 PathBuf::from("bar.txt"),
+                Options::default(),
             )
             .await?;
         let mut hasher2 = Sha256::new();
@@ -816,9 +892,10 @@ mod tests {
         server
             .clone()
             .delete(
-                tarpc::context::Context::current(),
+                tarpc::context::current(),
                 dir.id().clone(),
                 PathBuf::from("foo.txt"),
+                Options::default(),
             )
             .await?;
         assert!(!fpath.final_path().exists());
@@ -827,9 +904,10 @@ mod tests {
         server
             .clone()
             .delete(
-                tarpc::context::Context::current(),
+                tarpc::context::current(),
                 dir.id().clone(),
                 PathBuf::from("foo.txt"),
+                Options::default(),
             )
             .await?;
         Ok(())
@@ -845,7 +923,11 @@ mod tests {
         let client = server_impl.as_inprocess_client();
 
         let list = client
-            .list(tarpc::context::current(), DirectoryId::from("testdir"))
+            .list(
+                tarpc::context::current(),
+                DirectoryId::from("testdir"),
+                Options::default(),
+            )
             .await??;
         assert_eq!(list.len(), 0);
 
@@ -863,10 +945,11 @@ mod tests {
         let sig = server
             .clone()
             .calculate_signature(
-                tarpc::context::Context::current(),
+                tarpc::context::current(),
                 dir.id().clone(),
                 file_path.clone(),
                 (0, file_content.len() as u64),
+                Options::default(),
             )
             .await?;
 
@@ -878,11 +961,12 @@ mod tests {
         let delta = server
             .clone()
             .diff(
-                tarpc::context::Context::current(),
+                tarpc::context::current(),
                 dir.id().clone(),
                 file_path.clone(),
                 (0, new_content.len() as u64),
                 sig.clone(),
+                Options::default(),
             )
             .await?;
         assert!(!delta.0.is_empty());
@@ -892,18 +976,19 @@ mod tests {
         let res = server
             .clone()
             .apply_delta(
-                tarpc::context::Context::current(),
+                tarpc::context::current(),
                 dir.id().clone(),
                 file_path.clone(),
                 (0, new_content.len() as u64),
                 new_content.len() as u64,
                 delta,
+                Options::default(),
             )
             .await;
         assert!(res.is_ok());
         // File should now match new_content
         let logical = LogicalPath::new(&dir, &file_path);
-        let (_state, actual) = logical.find()?;
+        let (_state, actual) = logical.find(&Options::default())?;
         let mut buf = Vec::new();
         std::fs::File::open(&actual)?.read_to_end(&mut buf)?;
         assert_eq!(&buf[..new_content.len()], new_content);
@@ -918,10 +1003,11 @@ mod tests {
         let result = server
             .clone()
             .calculate_signature(
-                tarpc::context::Context::current(),
+                tarpc::context::current(),
                 dir.id().clone(),
                 PathBuf::from("notfound.txt"),
                 (0, 10),
+                Options::default(),
             )
             .await;
         assert!(result.is_err());
@@ -938,12 +1024,13 @@ mod tests {
         let result = server
             .clone()
             .apply_delta(
-                tarpc::context::Context::current(),
+                tarpc::context::current(),
                 dir.id().clone(),
                 file_path,
                 (0, 3),
                 3,
                 crate::model::service::Delta(vec![1, 2, 3]),
+                Options::default(),
             )
             .await;
         if let Err(ref e) = result {
@@ -964,10 +1051,11 @@ mod tests {
         let sig = server
             .clone()
             .calculate_signature(
-                tarpc::context::Context::current(),
+                tarpc::context::current(),
                 dir.id().clone(),
                 file_path.clone(),
                 (0, original_content.len() as u64),
+                Options::default(),
             )
             .await?;
 
@@ -979,11 +1067,12 @@ mod tests {
         let delta = server
             .clone()
             .diff(
-                tarpc::context::Context::current(),
+                tarpc::context::current(),
                 dir.id().clone(),
                 file_path.clone(),
                 (0, new_content.len() as u64),
                 sig.clone(),
+                Options::default(),
             )
             .await?;
         assert!(!delta.0.is_empty());
@@ -993,21 +1082,124 @@ mod tests {
         let res = server
             .clone()
             .apply_delta(
-                tarpc::context::Context::current(),
+                tarpc::context::current(),
                 dir.id().clone(),
                 file_path.clone(),
                 (0, new_content.len() as u64),
                 new_content.len() as u64,
                 delta,
+                Options::default(),
             )
             .await;
         assert!(res.is_ok());
         // File should now match new_content and be truncated
         let logical = LogicalPath::new(&dir, &file_path);
-        let (_state, actual) = logical.find()?;
+        let (_state, actual) = logical.find(&Options::default())?;
         let mut buf = Vec::new();
         std::fs::File::open(&actual)?.read_to_end(&mut buf)?;
         assert_eq!(&buf, new_content);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_partial_vs_final() -> anyhow::Result<()> {
+        let (server, temp, dir) = setup_server_with_dir()?;
+        temp.child("foo.txt").write_str("final")?;
+        temp.child(".foo.txt.part").write_str("partial")?;
+        // Default: partial preferred
+        let files = server
+            .clone()
+            .list(
+                tarpc::context::current(),
+                dir.id().clone(),
+                Options {
+                    ignore_partial: false,
+                },
+            )
+            .await?;
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].state, SyncedFileState::Partial);
+        // With ignore_partial: final preferred
+        let files = server
+            .clone()
+            .list(
+                tarpc::context::current(),
+                dir.id().clone(),
+                Options {
+                    ignore_partial: true,
+                },
+            )
+            .await?;
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].state, SyncedFileState::Final);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_ignore_partial() -> anyhow::Result<()> {
+        let (server, temp, dir) = setup_server_with_dir()?;
+        temp.child(".foo.txt.part").write_str("partial")?;
+        // Default: return partial
+        let files = server
+            .clone()
+            .list(
+                tarpc::context::current(),
+                dir.id().clone(),
+                Options {
+                    ignore_partial: false,
+                },
+            )
+            .await?;
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].state, SyncedFileState::Partial);
+        // With ignore_partial: don't return partial
+        let files = server
+            .clone()
+            .list(
+                tarpc::context::current(),
+                dir.id().clone(),
+                Options {
+                    ignore_partial: true,
+                },
+            )
+            .await?;
+        assert_eq!(files.len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_partial_vs_final() -> anyhow::Result<()> {
+        let (server, temp, dir) = setup_server_with_dir()?;
+        temp.child("foo.txt").write_str("final")?;
+        temp.child(".foo.txt.part").write_str("partial")?;
+        // Default: partial preferred
+        let data = server
+            .clone()
+            .read(
+                tarpc::context::current(),
+                dir.id().clone(),
+                PathBuf::from("foo.txt"),
+                (0, 7),
+                Options {
+                    ignore_partial: false,
+                },
+            )
+            .await?;
+        assert_eq!(String::from_utf8(data)?, "partial");
+        // With ignore_partial: final preferred
+        let data = server
+            .clone()
+            .read(
+                tarpc::context::current(),
+                dir.id().clone(),
+                PathBuf::from("foo.txt"),
+                (0, 5),
+                Options {
+                    ignore_partial: true,
+                },
+            )
+            .await?;
+        assert_eq!(String::from_utf8(data)?, "final");
         Ok(())
     }
 }

@@ -5,7 +5,7 @@
 
 use crate::model::service::{
     DirectoryId, RealizeError, RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse,
-    SyncedFile,
+    SyncedFile, Options,
 };
 use futures::future::{join, join_all};
 use std::{collections::HashMap, path::Path};
@@ -72,8 +72,8 @@ where
 {
     // 1. List files on src and dst in parallel
     let (src_files, dst_files) = join(
-        src.list(context::current(), dir_id.clone()),
-        dst.list(context::current(), dir_id.clone()),
+        src.list(context::current(), dir_id.clone(), Options::default()),
+        dst.list(context::current(), dir_id.clone(), Options::default()),
     )
     .await;
     let src_files = src_files??;
@@ -168,6 +168,7 @@ where
                     dir_id.clone(),
                     path.to_path_buf(),
                     range,
+                    Options::default(),
                 )
                 .await??;
             dst.send(
@@ -177,6 +178,7 @@ where
                 range,
                 src_file.size,
                 data.clone(),
+                Options::default(),
             )
             .await??;
             progress.inc((end - offset) as u64);
@@ -189,6 +191,7 @@ where
                     dir_id.clone(),
                     path.to_path_buf(),
                     range,
+                    Options::default(),
                 )
                 .await??;
             let delta = src
@@ -198,6 +201,7 @@ where
                     path.to_path_buf(),
                     range,
                     sig,
+                    Options::default(),
                 )
                 .await??;
             dst.apply_delta(
@@ -207,6 +211,7 @@ where
                 range,
                 src_file.size,
                 delta,
+                Options::default(),
             )
             .await??;
             progress.inc((end - offset) as u64);
@@ -239,8 +244,8 @@ where
     U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
 {
     let (src_hash, dst_hash) = tokio::join!(
-        src.hash(context::current(), dir_id.clone(), path.to_path_buf()),
-        dst.hash(context::current(), dir_id.clone(), path.to_path_buf()),
+        src.hash(context::current(), dir_id.clone(), path.to_path_buf(), Options::default()),
+        dst.hash(context::current(), dir_id.clone(), path.to_path_buf(), Options::default()),
     );
     let src_hash = src_hash.map_err(MoveFileError::from)??;
     let dst_hash = dst_hash.map_err(MoveFileError::from)??;
@@ -254,10 +259,10 @@ where
         path
     );
     // Hashes match, finish and delete
-    dst.finish(context::current(), dir_id.clone(), path.to_path_buf())
+    dst.finish(context::current(), dir_id.clone(), path.to_path_buf(), Options::default())
         .await
         .map_err(MoveFileError::from)??;
-    src.delete(context::current(), dir_id.clone(), path.to_path_buf())
+    src.delete(context::current(), dir_id.clone(), path.to_path_buf(), Options::default())
         .await
         .map_err(MoveFileError::from)??;
     return Ok(true);
