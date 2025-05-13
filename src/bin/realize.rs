@@ -10,8 +10,8 @@ use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Realize command-line tool
 #[derive(Parser, Debug)]
@@ -318,15 +318,28 @@ impl CliFileProgress {
         let (_, pb) = self.bar.get_or_insert_with(|| {
             let file_index = self.next_file_index.fetch_add(1, Ordering::Relaxed);
             let pb = self.multi.insert_from_back(1, ProgressBar::new(self.bytes));
+            let tag = format!("[{}/{}]", file_index, self.total_files);
+            let path = self.path.clone();
             pb.set_style(
                 ProgressStyle::with_template(
-                    "{msg} {prefix} [{bar:40.cyan/blue}] {pos}/{len} bytes",
+                    "{tag} {prefix} {path} [{bar:40.cyan/blue}] {pos}/{len} bytes",
                 )
                 .unwrap()
-                .progress_chars("=> "),
+                .progress_chars("=> ")
+                .with_key(
+                    "tag",
+                    move |_state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
+                        let _ = w.write_str(&tag);
+                    },
+                )
+                .with_key(
+                    "path",
+                    move |_state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
+                        let _ = w.write_str(&path);
+                    },
+                ),
             );
             pb.set_prefix("Checking");
-            pb.set_message(format!("[{}/{}]", file_index, self.total_files));
 
             (file_index, pb)
         });
