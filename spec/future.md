@@ -213,3 +213,52 @@ specified as download and upload limits on the command-line:
 6. Log all throttle changes and errors.
 7. Document usage, configuration, and edge cases, including how updates are applied.
 
+# Partial and final files both present {#partial}
+
+On the source, only final files matter, on the dest, partial file
+matter more than final.
+
+Let's add an options: Options argument to all commands. For now,
+Options only contains one boolean, ignore_partial, which means that
+partials should not be taken into account for this command.
+
+- list()
+
+When both partial and final files are present, return only the partial
+file, UNLESS option.ignore_partial is true.
+
+- read(), send(), ...
+
+When both partial and final files are present, read from the partial
+or write to the partial, UNLESS option.ignore_partial is true.
+
+- finish()
+
+Ignore option.ignore_partial = true.
+
+Task list
+
+1. Add an Option struct to src/model/service.rs and add it as an
+   argument to all methods of RealizeService. Update all callers to
+   just pass Option::default()
+
+   - Update the code
+   - Run "cargo check", make sure there are no errors or warnings
+
+2. Implement the behavior described above in src/server.rs: When both
+   partial and final files are present read/write/list only the partial
+   file unless option.ignore_partial is true
+
+   - Update the code
+   - Add new tests to cover the new behavior to src/server.rs
+   - Run "cargo test", make sure all tests pass, fix any issues
+
+3. In src/algo.rs, set option.ignore_partial to true for all methods
+   called on dst and leave option.ignore_partial to false for all methods
+   called on src.
+
+   - Update the code
+   - Add new tests to src/algo.rs to make sure partial files are
+     ignored in src
+   - Run "cargo test", make sure all tests pass, fix any issues
+
