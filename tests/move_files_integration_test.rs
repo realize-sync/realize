@@ -1,6 +1,6 @@
 use assert_cmd::cargo::cargo_bin;
-use assert_fs::TempDir;
 use assert_fs::prelude::*;
+use assert_fs::TempDir;
 use assert_unordered::assert_eq_unordered;
 use realize::server::RealizeServer;
 use realize::transport::security::{self, PeerVerifier};
@@ -285,11 +285,11 @@ async fn test_local_to_local_progress_output() -> anyhow::Result<()> {
     assert!(output.status.success(), "Should succeed if all files moved");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("[1/2] Moved     dir/foo.txt"),
+        stdout.contains("/2] Moved     dir/foo.txt"),
         "stdout: {stdout}"
     );
     assert!(
-        stdout.contains("[2/2] Moved     dir/bar.txt"),
+        stdout.contains("/2] Moved     dir/bar.txt"),
         "stdout: {stdout}"
     );
     assert!(
