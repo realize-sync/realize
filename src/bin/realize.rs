@@ -10,8 +10,8 @@ use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Realize command-line tool
 #[derive(Parser, Debug)]
@@ -98,7 +98,7 @@ async fn main() {
         let privkey = match &cli.privkey {
             Some(path) => match PrivateKeyDer::from_pem_file(path) {
                 Ok(key) => match crypto.key_provider.load_private_key(key) {
-                    Ok(k) => Arc::from(k),
+                    Ok(key) => key,
                     Err(e) => {
                         print_error_with_path(path, &format!("Invalid private key file: {e}",));
                         process::exit(1);
@@ -353,7 +353,7 @@ impl AlgoFileProgress for CliFileProgress {
         if let Some((index, pb)) = self.bar.take() {
             pb.finish_and_clear();
             if !self.quiet {
-                let _ = self.multi.suspend(|| {
+                self.multi.suspend(|| {
                     println!(
                         "[{}/{}] {:<9} {}/{}",
                         index,

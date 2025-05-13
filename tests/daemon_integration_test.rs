@@ -90,7 +90,11 @@ peers:
     )
     .await?;
     let files = client
-        .list(tarpc::context::current(), DirectoryId::from("testdir"), Options::default())
+        .list(
+            tarpc::context::current(),
+            DirectoryId::from("testdir"),
+            Options::default(),
+        )
         .await??;
     assert_unordered::assert_eq_unordered!(
         files.into_iter().map(|f| f.path).collect(),

@@ -60,7 +60,6 @@ impl FileProgress for NoFileProgress {
 fn src_options() -> Options {
     Options {
         ignore_partial: true,
-        ..Options::default()
     }
 }
 
@@ -68,7 +67,6 @@ fn src_options() -> Options {
 fn dst_options() -> Options {
     Options {
         ignore_partial: false,
-        ..Options::default()
     }
 }
 
@@ -154,7 +152,7 @@ where
     let dst_size = dst_file.map(|f| f.size).unwrap_or(0);
 
     progress.verifying();
-    if src_size == dst_size && check_hashes_and_delete(src, dst, dir_id, &path).await? {
+    if src_size == dst_size && check_hashes_and_delete(src, dst, dir_id, path).await? {
         return Ok(());
     }
 
@@ -197,7 +195,7 @@ where
                 dst_options(),
             )
             .await??;
-            progress.inc((end - offset) as u64);
+            progress.inc(end - offset);
         } else {
             // Compute diff and apply
             log::debug!("{}:{:?} rsync on range {:?}", dir_id, path, range);
@@ -230,13 +228,13 @@ where
                 dst_options(),
             )
             .await??;
-            progress.inc((end - offset) as u64);
+            progress.inc(end - offset);
         }
         offset = end;
     }
 
     progress.verifying();
-    if !check_hashes_and_delete(src, dst, dir_id, &path).await? {
+    if !check_hashes_and_delete(src, dst, dir_id, path).await? {
         return Err(MoveFileError::Realize(RealizeError::Sync(
             path.to_path_buf(),
             "Data still inconsistent after sync".to_string(),
@@ -301,7 +299,8 @@ where
     )
     .await
     .map_err(MoveFileError::from)??;
-    return Ok(true);
+
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -602,7 +601,9 @@ mod tests {
         let dst_server = RealizeServer::for_dir(dst_dir.id(), dst_dir.path()).as_inprocess_client();
         // Create a final file and a partial file in src
         src_temp.child("final.txt").write_str("finaldata")?;
-        src_temp.child(".partial.txt.part").write_str("partialdata")?;
+        src_temp
+            .child(".partial.txt.part")
+            .write_str("partialdata")?;
         // Run move_files
         let (success, error) = move_files(
             &src_server,

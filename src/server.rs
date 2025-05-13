@@ -70,9 +70,8 @@ impl RealizeServer {
                 }),
         );
         let client = tarpc::client::new(tarpc::client::Config::default(), client_transport).spawn();
-        let client = RealizeServiceClient::from(DeadlineSetter::new(client));
 
-        client
+        RealizeServiceClient::from(DeadlineSetter::new(client))
     }
 }
 
@@ -99,7 +98,7 @@ impl RealizeService for RealizeServer {
             }
         }
 
-        Ok(files.into_iter().map(|(_, v)| v).collect())
+        Ok(files.into_values().collect())
     }
 
     async fn read(
