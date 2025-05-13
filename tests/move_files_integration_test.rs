@@ -1,6 +1,6 @@
 use assert_cmd::cargo::cargo_bin;
-use assert_fs::prelude::*;
 use assert_fs::TempDir;
+use assert_fs::prelude::*;
 use assert_unordered::assert_eq_unordered;
 use realize::server::RealizeServer;
 use realize::transport::security::{self, PeerVerifier};
@@ -202,17 +202,28 @@ async fn test_local_to_local_partial_failure() -> anyhow::Result<()> {
     util::create_dir_with_files(&src_dir, &[("good.txt", "ok"), ("bad.txt", "fail")])?;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(src_dir.child("bad.txt").path(), fs::Permissions::from_mode(0o000))?;
+    fs::set_permissions(
+        src_dir.child("bad.txt").path(),
+        fs::Permissions::from_mode(0o000),
+    )?;
     let output = tokio::process::Command::new(cargo_bin!("realize"))
-        .arg("--src-path").arg(&src4_path)
-        .arg("--dst-path").arg(&dst4_path)
+        .arg("--src-path")
+        .arg(&src4_path)
+        .arg("--dst-path")
+        .arg(&dst4_path)
         .output()
         .await?;
     // Restore permissions for cleanup
-    fs::set_permissions(src_dir.child("bad.txt").path(), fs::Permissions::from_mode(0o644))?;
+    fs::set_permissions(
+        src_dir.child("bad.txt").path(),
+        fs::Permissions::from_mode(0o644),
+    )?;
     assert!(!output.status.success(), "Should fail if any file fails");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Moved 1 file(s), 1 failed"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("Moved 1 file(s), 1 failed"),
+        "stderr: {stderr}"
+    );
     util::assert_dir_contents(&dst_dir, vec![PathBuf::from("good.txt")])?;
     Ok(())
 }
@@ -227,14 +238,19 @@ async fn test_local_to_local_success_output() -> anyhow::Result<()> {
     let dst5_path = dst_dir.path().to_path_buf();
     util::create_dir_with_files(&src_dir, &[("foo.txt", "hello"), ("bar.txt", "world")])?;
     let output = tokio::process::Command::new(cargo_bin!("realize"))
-        .arg("--src-path").arg(&src5_path)
-        .arg("--dst-path").arg(&dst5_path)
+        .arg("--src-path")
+        .arg(&src5_path)
+        .arg("--dst-path")
+        .arg(&dst5_path)
         .output()
         .await?;
     assert!(output.status.success(), "Should succeed if all files moved");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Moved 2 file(s)"), "stdout: {stdout}");
-    util::assert_dir_contents(&dst_dir, vec![PathBuf::from("foo.txt"), PathBuf::from("bar.txt")])?;
+    util::assert_dir_contents(
+        &dst_dir,
+        vec![PathBuf::from("foo.txt"), PathBuf::from("bar.txt")],
+    )?;
     util::assert_dir_empty(&src_dir)?;
     Ok(())
 }

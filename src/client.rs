@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use tarpc::{
-    client::{stub::Stub, RpcError},
+    client::{RpcError, stub::Stub},
     context::Context,
 };
 
