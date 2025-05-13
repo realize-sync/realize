@@ -188,7 +188,15 @@ async fn main() {
 
     // Move files
     match realize::algo::move_files(&src_client, &dst_client, dir_id).await {
-        Ok(_) => process::exit(0),
+        Ok((success, error)) => {
+            if error == 0 {
+                println!("Moved {success} file(s)");
+                process::exit(0);
+            } else {
+                eprintln!("Moved {success} file(s), {error} failed");
+                process::exit(1);
+            }
+        }
         Err(e) => {
             eprintln!("Error: {e}");
             process::exit(1);

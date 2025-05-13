@@ -15,11 +15,12 @@ const CHUNK_SIZE: u64 = 8 * 1024 * 1024; // 8MB
 
 /// Moves files from source to destination using the RealizeService interface.
 /// After a successful move and hash match, deletes the file from the source.
+/// Returns (success_count, error_count).
 pub async fn move_files<T, U>(
     src: &RealizeServiceClient<T>,
     dst: &RealizeServiceClient<U>,
     dir_id: DirectoryId,
-) -> anyhow::Result<()>
+) -> anyhow::Result<(usize, usize)>
 where
     T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
     U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
@@ -34,19 +35,33 @@ where
     let dst_files = dst_files??;
 
     // 2. Build lookup for dst
-
     let dst_map: HashMap<_, _> = dst_files
         .into_iter()
         .map(|f| (f.path.to_path_buf(), f))
         .collect();
-    let futures = src_files
-        .iter()
-        .map(|file| move_file(src, file, dst, dst_map.get(&file.path), &dir_id));
-    join_all(futures)
-        .await
-        .into_iter()
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(())
+    let mut success_count = 0;
+    let mut error_count = 0;
+    let mut handles = vec![];
+    for file in src_files.iter() {
+        let fut = move_file(src, file, dst, dst_map.get(&file.path), &dir_id);
+        handles.push((file.path.clone(), fut));
+    }
+    let results = join_all(
+        handles
+            .into_iter()
+            .map(|(path, fut)| async move { (path, fut.await) }),
+    )
+    .await;
+    for (path, res) in results {
+        match res {
+            Ok(_) => success_count += 1,
+            Err(e) => {
+                log::error!("{}:{:?} failed to move: {}", dir_id, path, e);
+                error_count += 1;
+            }
+        }
+    }
+    Ok((success_count, error_count))
 }
 
 async fn move_file<T, U>(
@@ -189,8 +204,8 @@ mod tests {
     use super::*;
     use crate::model::service::DirectoryId;
     use crate::server::RealizeServer;
-    use assert_fs::prelude::*;
     use assert_fs::TempDir;
+    use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -233,8 +248,10 @@ mod tests {
         src_temp.child("partial").write_str("partialcopy")?;
 
         println!("test_move_files: all files set up");
-        move_files(&src_server, &dst_server, DirectoryId::from("testdir")).await?;
-
+        let (success, error) =
+            move_files(&src_server, &dst_server, DirectoryId::from("testdir")).await?;
+        assert_eq!(error, 0, "No errors expected");
+        assert_eq!(success, 4, "All files should be moved");
         // Check that files are present in destination and not in source
         assert_eq_unordered!(snapshot_dir(src_temp.path())?, vec![]);
         assert_eq_unordered!(
@@ -295,8 +312,10 @@ mod tests {
         garbage.extend_from_slice(&chunk5[..1024 * 1024]); // 1MB garbage
         dst_temp.child("large_garbage").write_binary(&garbage)?;
 
-        move_files(&src_server, &dst_server, DirectoryId::from("testdir")).await?;
-
+        let (success, error) =
+            move_files(&src_server, &dst_server, DirectoryId::from("testdir")).await?;
+        assert_eq!(error, 0, "No errors expected");
+        assert_eq!(success, 5, "All files should be moved");
         // Check that files are present in destination and not in source
         assert_eq_unordered!(snapshot_dir(src_temp.path())?, vec![]);
         let expected = vec![
@@ -314,6 +333,38 @@ mod tests {
                 .expect(&format!("missing {path:?}"));
             assert_eq!(&found.1, &data, "content mismatch for {path:?}");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_move_files_partial_error() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+        let src_temp = TempDir::new()?;
+        let src_dir = Arc::new(crate::server::Directory::new(
+            &DirectoryId::from("testdir"),
+            src_temp.path(),
+        ));
+        let src_server = RealizeServer::for_dir(src_dir.id(), src_dir.path()).as_inprocess_client();
+        let dst_temp = TempDir::new()?;
+        let dst_dir = Arc::new(crate::server::Directory::new(
+            &DirectoryId::from("testdir"),
+            dst_temp.path(),
+        ));
+        let dst_server = RealizeServer::for_dir(dst_dir.id(), dst_dir.path()).as_inprocess_client();
+        // Good file
+        src_temp.child("good").write_str("ok")?;
+        // Unreadable file
+        let unreadable = src_temp.child("bad");
+        unreadable.write_str("fail")?;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(unreadable.path(), fs::Permissions::from_mode(0o000))?;
+        let (success, error) =
+            move_files(&src_server, &dst_server, DirectoryId::from("testdir")).await?;
+        assert_eq!(success, 1, "One file should succeed");
+        assert_eq!(error, 1, "One file should fail");
+        // Restore permissions for cleanup
+        fs::set_permissions(unreadable.path(), fs::Permissions::from_mode(0o644))?;
         Ok(())
     }
 

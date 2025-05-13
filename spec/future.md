@@ -3,38 +3,6 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
-## Error handling in move_files {#moverrors}
-
-Task list
-
-1. In src/algo.rs, move_files should count and return:
-  - the number of files that were successfully processed by move_file
-  - the number of files that were unsuccessfully processed by move_file
-
-  Instead of forwarding the error, it should log that error with
-  log::error!. The log message includes the directory id and path
-  of the files that were unsuccessfully moved.
-
-- Update the code
-
-- Run "cargo check" to make sure it still compiles, fix any issues, including any warnings
-
-- Add a new test case to cover the case of a partially successful
-  move_files. One way to cause an error one one file in a test would
-  be to make that file not readable.
-
-
-2. Have move_file and move_files in src/algo.rs return a custom error
-   type instead of anyhow::Error. That error type should be an enum
-   type MoveFileErrors created with thiserror that covers all type of
-   error found while executing move_file and move_files. There should
-   at least be one enum for tarpc::RpcError and one for RealizeError.
-
-- Update the code
-
-- Run "cargo check" to make sure it still compiles, fix any issues,
-  including any warnings
-
 ## Progress in the realize command {#progress1}
 
    Write a trait for forwarding progress information from move_files,

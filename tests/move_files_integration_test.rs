@@ -191,6 +191,54 @@ async fn test_remote_to_remote() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_local_to_local_partial_failure() -> anyhow::Result<()> {
+    env_logger::try_init().ok();
+    let tempdir = TempDir::new()?;
+    let src_dir = tempdir.child("src4");
+    let dst_dir = tempdir.child("dst4");
+    let src4_path = src_dir.path().to_path_buf();
+    let dst4_path = dst_dir.path().to_path_buf();
+    util::create_dir_with_files(&src_dir, &[("good.txt", "ok"), ("bad.txt", "fail")])?;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(src_dir.child("bad.txt").path(), fs::Permissions::from_mode(0o000))?;
+    let output = tokio::process::Command::new(cargo_bin!("realize"))
+        .arg("--src-path").arg(&src4_path)
+        .arg("--dst-path").arg(&dst4_path)
+        .output()
+        .await?;
+    // Restore permissions for cleanup
+    fs::set_permissions(src_dir.child("bad.txt").path(), fs::Permissions::from_mode(0o644))?;
+    assert!(!output.status.success(), "Should fail if any file fails");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Moved 1 file(s), 1 failed"), "stderr: {stderr}");
+    util::assert_dir_contents(&dst_dir, vec![PathBuf::from("good.txt")])?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_local_to_local_success_output() -> anyhow::Result<()> {
+    env_logger::try_init().ok();
+    let tempdir = TempDir::new()?;
+    let src_dir = tempdir.child("src5");
+    let dst_dir = tempdir.child("dst5");
+    let src5_path = src_dir.path().to_path_buf();
+    let dst5_path = dst_dir.path().to_path_buf();
+    util::create_dir_with_files(&src_dir, &[("foo.txt", "hello"), ("bar.txt", "world")])?;
+    let output = tokio::process::Command::new(cargo_bin!("realize"))
+        .arg("--src-path").arg(&src5_path)
+        .arg("--dst-path").arg(&dst5_path)
+        .output()
+        .await?;
+    assert!(output.status.success(), "Should succeed if all files moved");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Moved 2 file(s)"), "stdout: {stdout}");
+    util::assert_dir_contents(&dst_dir, vec![PathBuf::from("foo.txt"), PathBuf::from("bar.txt")])?;
+    util::assert_dir_empty(&src_dir)?;
+    Ok(())
+}
+
 mod util {
     use super::*;
     use std::path::PathBuf;
