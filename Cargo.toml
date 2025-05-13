@@ -34,4 +34,5 @@ assert_cmd = "2.0"
 predicates = "3.0"
 process-wrap = { version = "8.2", features = ["tokio1"] }
 tempfile = "3.10"
+test-tag = "0.1.4"
 

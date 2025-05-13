@@ -433,6 +433,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[test_tag::tag(slow)]
     async fn test_move_files_chunked() -> anyhow::Result<()> {
         let _ = env_logger::try_init();
         const FILE_SIZE: usize = (1.25 * CHUNK_SIZE as f32) as usize; // 10MB
