@@ -3,77 +3,173 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
-## Handle SIGTERM {#sigterm}
+## Error handling in move_files {#moverrors}
 
-`realize` and `realized` should handle SIGTERM gracefully and
-terminate immediately.
+Task list
 
-**Proposal:**
-- Use Rust's signal handling libraries (e.g., `signal-hook`) to listen for SIGTERM in both `realize` and `realized` processes.
-- On receiving SIGTERM, ensure all resources are cleaned up, including closing open files, network sockets, and terminating child processes.
-- Handle SIGTERM in all operational states (idle, processing, waiting for I/O, etc.).
-- Ensure child processes are terminated safely, using process groups or explicit tracking, and handle any errors during termination.
-- Log the receipt of SIGTERM and the shutdown sequence for debugging and audit purposes.
-- If cleanup fails, log the error and exit with a non-zero status code.
+1. In src/algo.rs, move_files should count and return:
+  - the number of files that were successfully processed by move_file
+  - the number of files that were unsuccessfully processed by move_file
 
-**Task List:**
-1. Add `signal-hook` as a dependency if not present.
-2. Register a SIGTERM handler in both binaries.
-3. Implement cleanup logic: close files, sockets, and terminate child processes, ensuring all are handled even if errors occur.
-4. Ensure the handler logs the event, the cleanup steps, and exits with the correct code (0 for clean, non-zero for errors).
-5. Test SIGTERM handling in all operational states (idle, busy, waiting, etc.).
-6. Write integration tests to send SIGTERM and verify graceful shutdown and resource cleanup.
-7. Document the behavior, including edge cases, in the README and code comments.
+  Instead of forwarding the error, it should log that error with
+  log::error!. The log message includes the directory id and path
+  of the files that were unsuccessfully moved.
 
-## Handle SIGHUP {#sighup}
+- Update the code
 
-`realized` should handle SIGHUP by re-loading the config file.
+- Run "cargo check" to make sure it still compiles, fix any issues, including any warnings
 
-**Proposal:**
-- Use `signal-hook` to listen for SIGHUP in the `realized` process.
-- On SIGHUP, reload the configuration file and apply changes without restarting the process.
-- Clearly define which configuration fields are reloadable and which require a restart.
-- Ensure thread safety and synchronization when applying new configuration.
-- If reload fails, log the error, retain the previous configuration, and do not apply partial changes.
-- Log the reload event, including success or failure, and the reason for any failure.
+- Add a new test case to cover the case of a partially successful
+  move_files. One way to cause an error one one file in a test would
+  be to make that file not readable.
 
-**Task List:**
-1. Register a SIGHUP handler in `realized`.
-2. Implement config reload logic, specifying which fields can be hot-reloaded and which cannot.
-3. Ensure thread safety and atomicity when updating configuration.
-4. On reload failure, log the error and keep the previous configuration active.
-5. Log all reload attempts and outcomes, including reasons for failure.
-6. Add tests to send SIGHUP and verify config reload, including error scenarios and partial reload attempts.
-7. Update documentation to describe SIGHUP behavior, reloadable fields, and error handling.
 
-## Throttle a TCP connection {#throttle}
+2. Have move_file and move_files in src/algo.rs return a custom error
+   type instead of anyhow::Error. That error type should be an enum
+   type MoveFileErrors created with thiserror that covers all type of
+   error found while executing move_file and move_files. There should
+   at least be one enum for tarpc::RpcError and one for RealizeError.
 
-The bytes sent per second in a specific TCP connection should be
-limited. This should be done by making a RPC call that sets the upper
-limit in bytes per second for the bytes they *send*.
+- Update the code
 
-The limits are set by the `realize` command on both RPC services and
-specified as download and upload limits on the command-line:
---throttle 1M to throttle both to 1M/s, --throttle-up 1M
---throttle-down 512k to throttle upload to 1M and download to
-512k/s.
+- Run "cargo check" to make sure it still compiles, fix any issues,
+  including any warnings
 
-**Proposal:**
-- Extend the RPC protocol to support throttle commands, specifying whether limits are per-connection, per-service, or global (document the choice).
-- Implement rate limiting in the TCP connection handler using a token bucket or leaky bucket algorithm, ensuring accuracy and low overhead.
-- Parse and validate new CLI options in `realize`, including error handling for invalid or conflicting options.
-- Ensure limits can be updated at runtime via RPC, and clarify how existing connections are affected (immediate or on next transfer).
-- Provide clear error messages and logs for invalid throttle updates or failures.
-- Test throttling with unit, integration, and performance tests, including dynamic updates and edge cases (e.g., burst traffic, limit changes).
+## Progress in the realize command {#progress1}
 
-**Task List:**
-1. Design and document the throttle RPC message format, specifying the scope (per-connection, per-service, or global).
-2. Implement CLI parsing for throttle options, including validation and error handling.
-3. Add rate limiting logic to TCP handlers, ensuring correct behavior under all traffic patterns.
-4. Implement RPC handlers to update limits at runtime, and define how updates affect existing connections.
-5. Write unit, integration, and performance tests for throttling behavior, CLI parsing, and dynamic updates.
-6. Log all throttle changes and errors.
-7. Document usage, configuration, and edge cases, including how updates are applied.
+   Write a trait for forwarding progress information from move_files,
+   defined in src/algo.rs, call it Progress.
+
+   The Progress trait should look like this (pseudo-code):
+
+   ```
+   // Progress instance passed to move_files()
+   trait Progress {
+     // Once the number of files to move is known, report it
+     fn set_length(&mut self, total_files, total_bytes)
+
+     // Process a file
+     fn for_file(&mut self, path, bytes) -> FileProgress
+
+     // There was an error not tied to a file
+     fn error(&mut self, err: FileMoveError)
+   }
+
+   // File-specific progress instance passed to move_file()
+   trait FileProgress {
+     // Checking the hash at the beginning or end
+     fn veryfying(&mut self)
+
+     // Transferring data
+     fn moving(&mut self)
+
+     // Increment byte count for the file and overally byte
+     // count by this amount.
+     fn inc(&mut self, bytecount)
+
+     // File was moved, finished and deleted on the source.
+     // File is done, increment file count by 1.
+     fn success(&mut self)
+
+     // Moving the file failed.
+     // File is done, increment file count by 1.
+     fn error(&mut self, err: FileMoveError)
+   }
+   ```
+
+   There should be one empty implementation of that trait, called
+   NoProgress that can be used everywhere move_files doesn't support
+   progress, that is, everywhere is called from currently.
+
+  Task list:
+
+   - Write the trait and its empty implementation
+   - Run "cargo check" to make sure it compiles, fix any errors
+   - Call the trait from move_files
+   - Run "cargo check" to make sure it compiles, fix any errors
+   - Add one ore more unit tests that makes sure progress information is
+     called correctly in move_files
+   - Run "cargo test <testname>" to make sure the test passes, fix any errors
+   - Run "cargo test" to make sure everything all tests pass, fix any errors
+
+## Progress in the realize command {#progress2}
+
+  Implement the Progress trait defined in src/algo.rs in
+  src/bin/realize.rs.
+
+  The realize command should display progress information to stdout
+  using the package indicatif. It should report status messages to
+  stdout using println! and error messages to stderr using eprintln!.
+
+  Messages should follow the format:
+
+  ```
+    [{file}/{total file}] {prefix} {directory-id}/{path} {progress}: {msg}
+  ```
+
+  {file} is the current file index, 1-based and {total file} is the
+  total number of files to process. So [1/10] is the first file
+  processed out of 10.
+
+  {prefix} describes what is happening or has happened
+   - Copying
+   - Hashing
+   - Deleting
+   - Checking
+   - ERROR
+   - Moved
+  It has a fixed width of 9 chars, so the paths align on the messages
+  that are output.
+
+  {directory-id}/{path} is the directory id and path as it appears in
+  arguments to RealizeService.
+
+  {progress} is a progress bar, such as [==>   ]
+
+  {msg} gives more information on what happens, usually an error message
+  when {prefix} is ERROR.
+
+  Not all component need to be there. File count is only there when
+  processing files. ": {msg}" is only there for errors
+
+  For example:
+
+  ```
+    [1/2] Copying  dirid/subdir/foo.txt [====>                  ]
+    [1/2] Deleting dirid/subdir/foo.txt
+    [1/2] ERROR   dirid/subdir/foo.txt: File not found
+    [3/5] Moved   dirid/subdir/foo.txt
+    Checking dirid [======>              ]
+    ERROR dirid: network connection failed
+  ```
+
+  File progress messages (Copying, Deleting, Moving, Hashing, Checking)
+  should look like the following (ProgressStyle template):
+
+    [{pos}/{len}] {prefix:<9.cyan.bold} [{bar:57.cyan/blue}]
+
+  with progress_chars "=> "
+
+  Success reports (Moved) should be written to stdout with the
+  progress suspended. Moved takes 9 chars and is written in bold green
+  (console::style("Moved").for_stdout().bold().green()).
+
+  Error reports (ERROR) should be written to stderr with the progress
+  suspended. ERROR takes 9 chars and is written in bold red
+  (console::style("ERROR").for_stderr().bold().red()).
+
+  For an example, check out the following implementation, which does
+  something very much like this:
+
+  /Users/stephane/projects/hoarder/src/commands/output.rs
+
+  Task list:
+
+  - Implement the Progress trait using indicatif in src/realize.rs as described
+  - Run "cargo check" and fix any issues, including any warnings
+  - Write an integration test that verifies that stdout at the end
+    of the command is as it should be.
+  - Run "cargo test" and fix any issues
 
 ## Implement --max-duration in the realize command {#max-duration}
 
@@ -120,4 +216,33 @@ sent.
 Think about what should be logged at the error, warning info and debug
 level. What format should be followed. What information should be
 sent.
+
+## Throttle a TCP connection {#throttle}
+
+The bytes sent per second in a specific TCP connection should be
+limited. This should be done by making a RPC call that sets the upper
+limit in bytes per second for the bytes they *send*.
+
+The limits are set by the `realize` command on both RPC services and
+specified as download and upload limits on the command-line:
+--throttle 1M to throttle both to 1M/s, --throttle-up 1M
+--throttle-down 512k to throttle upload to 1M and download to
+512k/s.
+
+**Proposal:**
+- Extend the RPC protocol to support throttle commands, specifying whether limits are per-connection, per-service, or global (document the choice).
+- Implement rate limiting in the TCP connection handler using a token bucket or leaky bucket algorithm, ensuring accuracy and low overhead.
+- Parse and validate new CLI options in `realize`, including error handling for invalid or conflicting options.
+- Ensure limits can be updated at runtime via RPC, and clarify how existing connections are affected (immediate or on next transfer).
+- Provide clear error messages and logs for invalid throttle updates or failures.
+- Test throttling with unit, integration, and performance tests, including dynamic updates and edge cases (e.g., burst traffic, limit changes).
+
+**Task List:**
+1. Design and document the throttle RPC message format, specifying the scope (per-connection, per-service, or global).
+2. Implement CLI parsing for throttle options, including validation and error handling.
+3. Add rate limiting logic to TCP handlers, ensuring correct behavior under all traffic patterns.
+4. Implement RPC handlers to update limits at runtime, and define how updates affect existing connections.
+5. Write unit, integration, and performance tests for throttling behavior, CLI parsing, and dynamic updates.
+6. Log all throttle changes and errors.
+7. Document usage, configuration, and edge cases, including how updates are applied.
 
