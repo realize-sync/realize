@@ -1,6 +1,6 @@
 use assert_cmd::cargo::cargo_bin;
-use assert_fs::prelude::*;
 use assert_fs::TempDir;
+use assert_fs::prelude::*;
 use assert_unordered::assert_eq_unordered;
 use realize::server::RealizeServer;
 use realize::transport::security::{self, PeerVerifier};
@@ -34,6 +34,7 @@ async fn test_local_to_remote() -> anyhow::Result<()> {
     let src_dir_path_for_cmd = src_dir_path.clone();
     let test = tokio::spawn(async move {
         let status = tokio::process::Command::new(cargo_bin!("realize"))
+            .arg("--quiet")
             .arg("--src-path")
             .arg(&src_dir_path_for_cmd)
             .arg("--dst-addr")
@@ -85,6 +86,7 @@ async fn test_remote_to_local() -> anyhow::Result<()> {
     let dst_dir_path_for_cmd = dst_dir_path.clone();
     let test = tokio::spawn(async move {
         let status = tokio::process::Command::new(cargo_bin!("realize"))
+            .arg("--quiet")
             .arg("--src-addr")
             .arg(&src_addr.to_string())
             .arg("--dst-path")
@@ -123,6 +125,7 @@ async fn test_local_to_local() -> anyhow::Result<()> {
     let dst2_path = dst_dir.path().to_path_buf();
     util::create_dir_with_files(&src_dir, &[("baz.txt", "baz")])?;
     let status = tokio::process::Command::new(cargo_bin!("realize"))
+        .arg("--quiet")
         .arg("--src-path")
         .arg(&src2_path)
         .arg("--dst-path")
@@ -165,6 +168,7 @@ async fn test_remote_to_remote() -> anyhow::Result<()> {
         tcp::start_server("127.0.0.1:0", server_dst, verifier.clone(), privkey_b).await?;
     let test = tokio::spawn(async move {
         let status = tokio::process::Command::new(cargo_bin!("realize"))
+            .arg("--quiet")
             .arg("--src-addr")
             .arg(&src_addr3.to_string())
             .arg("--dst-addr")
@@ -297,6 +301,85 @@ async fn test_local_to_local_progress_output() -> anyhow::Result<()> {
         vec![PathBuf::from("foo.txt"), PathBuf::from("bar.txt")],
     )?;
     util::assert_dir_empty(&src_dir)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_local_to_local_quiet_success() -> anyhow::Result<()> {
+    env_logger::try_init().ok();
+    let tempdir = TempDir::new()?;
+    let src_dir = tempdir.child("src_quiet");
+    let dst_dir = tempdir.child("dst_quiet");
+    let src_path = src_dir.path().to_path_buf();
+    let dst_path = dst_dir.path().to_path_buf();
+    util::create_dir_with_files(&src_dir, &[("foo.txt", "hello"), ("bar.txt", "world")])?;
+    let output = tokio::process::Command::new(cargo_bin!("realize"))
+        .arg("--quiet")
+        .arg("--src-path")
+        .arg(&src_path)
+        .arg("--dst-path")
+        .arg(&dst_path)
+        .output()
+        .await?;
+    assert!(output.status.success(), "Should succeed if all files moved");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.trim().is_empty(),
+        "stdout should be empty in quiet mode, got: {stdout}"
+    );
+    assert!(
+        stderr.trim().is_empty(),
+        "stderr should be empty in quiet mode on success, got: {stderr}"
+    );
+    util::assert_dir_contents(
+        &dst_dir,
+        vec![PathBuf::from("foo.txt"), PathBuf::from("bar.txt")],
+    )?;
+    util::assert_dir_empty(&src_dir)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_local_to_local_quiet_failure() -> anyhow::Result<()> {
+    env_logger::try_init().ok();
+    let tempdir = TempDir::new()?;
+    let src_dir = tempdir.child("src_quiet_fail");
+    let dst_dir = tempdir.child("dst_quiet_fail");
+    let src_path = src_dir.path().to_path_buf();
+    let dst_path = dst_dir.path().to_path_buf();
+    util::create_dir_with_files(&src_dir, &[("good.txt", "ok"), ("bad.txt", "fail")])?;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(
+        src_dir.child("bad.txt").path(),
+        fs::Permissions::from_mode(0o000),
+    )?;
+    let output = tokio::process::Command::new(cargo_bin!("realize"))
+        .arg("--quiet")
+        .arg("--src-path")
+        .arg(&src_path)
+        .arg("--dst-path")
+        .arg(&dst_path)
+        .output()
+        .await?;
+    // Restore permissions for cleanup
+    fs::set_permissions(
+        src_dir.child("bad.txt").path(),
+        fs::Permissions::from_mode(0o644),
+    )?;
+    assert!(!output.status.success(), "Should fail if any file fails");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.trim().is_empty(),
+        "stdout should be empty in quiet mode, got: {stdout}"
+    );
+    assert!(
+        stderr.contains("ERROR"),
+        "stderr should contain error in quiet mode, got: {stderr}"
+    );
+    util::assert_dir_contents(&dst_dir, vec![PathBuf::from("good.txt")])?;
     Ok(())
 }
 

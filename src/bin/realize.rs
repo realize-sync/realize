@@ -10,8 +10,8 @@ use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Realize command-line tool
 #[derive(Parser, Debug)]
@@ -56,6 +56,10 @@ struct Cli {
     /// Throttle download (e.g. 512k)
     #[arg(long, alias = "throttle-down")]
     throttle_down: Option<String>,
+
+    /// Suppress all output except errors
+    #[arg(long)]
+    quiet: bool,
 }
 
 #[tokio::main]
@@ -188,17 +192,19 @@ async fn main() {
     }
 
     // Move files
-    let mut progress = CliProgress::new(&dir_id);
+    let mut progress = CliProgress::new(&dir_id, cli.quiet);
     let result = realize::algo::move_files(&src_client, &dst_client, dir_id, &mut progress).await;
     progress.finish_and_clear();
     match result {
         Ok((success, error)) => {
             if error == 0 {
-                println!(
-                    "{} {} file(s) moved",
-                    style("SUCCESS").for_stdout().green().bold(),
-                    success
-                );
+                if !cli.quiet {
+                    println!(
+                        "{} {} file(s) moved",
+                        style("SUCCESS").for_stdout().green().bold(),
+                        success
+                    );
+                }
                 process::exit(0);
             } else {
                 print_error(&format!(
@@ -237,11 +243,16 @@ struct CliProgress {
     overall_pb: ProgressBar,
     next_file_index: Arc<AtomicUsize>,
     dirid: String,
+    quiet: bool,
 }
 
 impl CliProgress {
-    fn new(dirid: &DirectoryId) -> Self {
-        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stdout());
+    fn new(dirid: &DirectoryId, quiet: bool) -> Self {
+        let multi = MultiProgress::with_draw_target(if quiet {
+            ProgressDrawTarget::hidden()
+        } else {
+            ProgressDrawTarget::stdout()
+        });
         let overall_pb = multi.add(ProgressBar::no_length());
         overall_pb.set_style(
             ProgressStyle::with_template(
@@ -258,6 +269,7 @@ impl CliProgress {
             overall_pb,
             next_file_index: Arc::new(AtomicUsize::new(1)),
             dirid: dirid.to_string(),
+            quiet,
         }
     }
 
@@ -285,6 +297,7 @@ impl Progress for CliProgress {
             dirid: self.dirid.clone(),
             path: path.display().to_string(),
             multi: self.multi.clone(),
+            quiet: self.quiet,
         })
     }
 }
@@ -297,6 +310,7 @@ struct CliFileProgress {
     dirid: String,
     path: String,
     multi: MultiProgress,
+    quiet: bool,
 }
 
 impl CliFileProgress {
@@ -338,16 +352,18 @@ impl AlgoFileProgress for CliFileProgress {
     fn success(&mut self) {
         if let Some((index, pb)) = self.bar.take() {
             pb.finish_and_clear();
-            let _ = self.multi.suspend(|| {
-                println!(
-                    "[{}/{}] {:<9} {}/{}",
-                    index,
-                    self.total_files,
-                    style("Moved").for_stdout().green().bold(),
-                    self.dirid,
-                    self.path
-                );
-            });
+            if !self.quiet {
+                let _ = self.multi.suspend(|| {
+                    println!(
+                        "[{}/{}] {:<9} {}/{}",
+                        index,
+                        self.total_files,
+                        style("Moved").for_stdout().green().bold(),
+                        self.dirid,
+                        self.path
+                    );
+                });
+            }
         }
     }
 
