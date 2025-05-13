@@ -134,7 +134,7 @@ impl RunningServer {
                 if let Ok((stream, peer)) = self.listener.accept().await {
                     match accept(stream).await {
                         Ok(_) => {}
-                        Err(err) => log::error!("{}: connection failed: {}", peer, err),
+                        Err(err) => log::debug!("{}: connection rejected: {}", peer, err),
                     };
                 }
             }
