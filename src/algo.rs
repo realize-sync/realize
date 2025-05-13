@@ -4,8 +4,8 @@
 //! using the RealizeService trait. See spec/design.md for details.
 
 use crate::model::service::{
-    DirectoryId, RealizeError, RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse,
-    SyncedFile, Options,
+    DirectoryId, Options, RealizeError, RealizeServiceClient, RealizeServiceRequest,
+    RealizeServiceResponse, SyncedFile,
 };
 use futures::future::{join, join_all};
 use std::{collections::HashMap, path::Path};
@@ -56,6 +56,22 @@ impl FileProgress for NoFileProgress {
     fn error(&mut self, _err: &MoveFileError) {}
 }
 
+/// Options used for RPC calls on the source.
+fn src_options() -> Options {
+    Options {
+        ignore_partial: true,
+        ..Options::default()
+    }
+}
+
+/// Options used for RPC calls on the destination.
+fn dst_options() -> Options {
+    Options {
+        ignore_partial: false,
+        ..Options::default()
+    }
+}
+
 /// Moves files from source to destination using the RealizeService interface.
 /// After a successful move and hash match, deletes the file from the source.
 /// Returns (success_count, error_count).
@@ -72,8 +88,8 @@ where
 {
     // 1. List files on src and dst in parallel
     let (src_files, dst_files) = join(
-        src.list(context::current(), dir_id.clone(), Options::default()),
-        dst.list(context::current(), dir_id.clone(), Options::default()),
+        src.list(context::current(), dir_id.clone(), src_options()),
+        dst.list(context::current(), dir_id.clone(), dst_options()),
     )
     .await;
     let src_files = src_files??;
@@ -168,7 +184,7 @@ where
                     dir_id.clone(),
                     path.to_path_buf(),
                     range,
-                    Options::default(),
+                    src_options(),
                 )
                 .await??;
             dst.send(
@@ -178,7 +194,7 @@ where
                 range,
                 src_file.size,
                 data.clone(),
-                Options::default(),
+                dst_options(),
             )
             .await??;
             progress.inc((end - offset) as u64);
@@ -191,7 +207,7 @@ where
                     dir_id.clone(),
                     path.to_path_buf(),
                     range,
-                    Options::default(),
+                    dst_options(),
                 )
                 .await??;
             let delta = src
@@ -201,7 +217,7 @@ where
                     path.to_path_buf(),
                     range,
                     sig,
-                    Options::default(),
+                    src_options(),
                 )
                 .await??;
             dst.apply_delta(
@@ -211,7 +227,7 @@ where
                 range,
                 src_file.size,
                 delta,
-                Options::default(),
+                dst_options(),
             )
             .await??;
             progress.inc((end - offset) as u64);
@@ -244,8 +260,18 @@ where
     U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
 {
     let (src_hash, dst_hash) = tokio::join!(
-        src.hash(context::current(), dir_id.clone(), path.to_path_buf(), Options::default()),
-        dst.hash(context::current(), dir_id.clone(), path.to_path_buf(), Options::default()),
+        src.hash(
+            context::current(),
+            dir_id.clone(),
+            path.to_path_buf(),
+            src_options(),
+        ),
+        dst.hash(
+            context::current(),
+            dir_id.clone(),
+            path.to_path_buf(),
+            dst_options(),
+        ),
     );
     let src_hash = src_hash.map_err(MoveFileError::from)??;
     let dst_hash = dst_hash.map_err(MoveFileError::from)??;
@@ -259,12 +285,22 @@ where
         path
     );
     // Hashes match, finish and delete
-    dst.finish(context::current(), dir_id.clone(), path.to_path_buf(), Options::default())
-        .await
-        .map_err(MoveFileError::from)??;
-    src.delete(context::current(), dir_id.clone(), path.to_path_buf(), Options::default())
-        .await
-        .map_err(MoveFileError::from)??;
+    dst.finish(
+        context::current(),
+        dir_id.clone(),
+        path.to_path_buf(),
+        dst_options(),
+    )
+    .await
+    .map_err(MoveFileError::from)??;
+    src.delete(
+        context::current(),
+        dir_id.clone(),
+        path.to_path_buf(),
+        src_options(),
+    )
+    .await
+    .map_err(MoveFileError::from)??;
     return Ok(true);
 }
 
@@ -546,6 +582,46 @@ mod tests {
         assert_eq!(error, 1, "One file should fail");
         // Restore permissions for cleanup
         fs::set_permissions(unreadable.path(), fs::Permissions::from_mode(0o644))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_move_files_ignores_partial_in_src() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+        let src_temp = TempDir::new()?;
+        let dst_temp = TempDir::new()?;
+        let src_dir = Arc::new(crate::server::Directory::new(
+            &DirectoryId::from("testdir"),
+            src_temp.path(),
+        ));
+        let dst_dir = Arc::new(crate::server::Directory::new(
+            &DirectoryId::from("testdir"),
+            dst_temp.path(),
+        ));
+        let src_server = RealizeServer::for_dir(src_dir.id(), src_dir.path()).as_inprocess_client();
+        let dst_server = RealizeServer::for_dir(dst_dir.id(), dst_dir.path()).as_inprocess_client();
+        // Create a final file and a partial file in src
+        src_temp.child("final.txt").write_str("finaldata")?;
+        src_temp.child(".partial.txt.part").write_str("partialdata")?;
+        // Run move_files
+        let (success, error) = move_files(
+            &src_server,
+            &dst_server,
+            DirectoryId::from("testdir"),
+            &mut NoProgress,
+        )
+        .await?;
+        // Only the final file should be moved
+        assert_eq!(success, 1, "Only one file should be moved");
+        assert_eq!(error, 0, "No errors expected");
+        // Check that only final.txt is present in dst
+        let files = WalkDir::new(dst_temp.path())
+            .into_iter()
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(files, vec!["final.txt"]);
         Ok(())
     }
 
