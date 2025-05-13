@@ -6,8 +6,8 @@ use crate::model::service::{
 };
 use crate::model::service::{RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse};
 use fast_rsync::{
-    apply_limited as rsync_apply_limited, diff as rsync_diff, Signature as RsyncSignature,
-    SignatureOptions,
+    Signature as RsyncSignature, SignatureOptions, apply_limited as rsync_apply_limited,
+    diff as rsync_diff,
 };
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
@@ -479,8 +479,8 @@ impl From<fast_rsync::SignatureParseError> for RealizeError {
 mod tests {
     use super::*;
     use crate::model::service::Hash as FileHash;
-    use assert_fs::prelude::*;
     use assert_fs::TempDir;
+    use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
     use std::fs;
 
@@ -603,9 +603,11 @@ mod tests {
         };
 
         temp.child(".foo.txt.part").write_str("test")?;
-        assert!(LogicalPath::new(&dir, &PathBuf::from("foo.txt"))
-            .find(&nopartial)
-            .is_err());
+        assert!(
+            LogicalPath::new(&dir, &PathBuf::from("foo.txt"))
+                .find(&nopartial)
+                .is_err()
+        );
 
         temp.child("bar.txt").write_str("test")?;
         assert_eq!(
