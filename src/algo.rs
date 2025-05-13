@@ -10,6 +10,7 @@ use crate::model::service::{
 use futures::future::{join, join_all};
 use std::{collections::HashMap, path::Path};
 use tarpc::{client::stub::Stub, context};
+use thiserror::Error;
 
 const CHUNK_SIZE: u64 = 8 * 1024 * 1024; // 8MB
 
@@ -20,7 +21,7 @@ pub async fn move_files<T, U>(
     src: &RealizeServiceClient<T>,
     dst: &RealizeServiceClient<U>,
     dir_id: DirectoryId,
-) -> anyhow::Result<(usize, usize)>
+) -> Result<(usize, usize), MoveFileError>
 where
     T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
     U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
@@ -70,7 +71,7 @@ async fn move_file<T, U>(
     dst: &RealizeServiceClient<U>,
     dst_file: Option<&SyncedFile>,
     dir_id: &DirectoryId,
-) -> anyhow::Result<()>
+) -> Result<(), MoveFileError>
 where
     T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
     U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
@@ -153,11 +154,10 @@ where
     }
 
     if !check_hashes_and_delete(src, dst, dir_id, &path).await? {
-        return Err(RealizeError::Sync(
+        return Err(MoveFileError::Realize(RealizeError::Sync(
             path.to_path_buf(),
             "Data still inconsistent after sync".to_string(),
-        )
-        .into());
+        )));
     }
 
     Ok(())
@@ -171,7 +171,7 @@ async fn check_hashes_and_delete<T, U>(
     dst: &RealizeServiceClient<U>,
     dir_id: &DirectoryId,
     path: &Path,
-) -> Result<bool, anyhow::Error>
+) -> Result<bool, MoveFileError>
 where
     T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
     U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
@@ -180,8 +180,8 @@ where
         src.hash(context::current(), dir_id.clone(), path.to_path_buf()),
         dst.hash(context::current(), dir_id.clone(), path.to_path_buf()),
     );
-    let src_hash = src_hash??;
-    let dst_hash = dst_hash??;
+    let src_hash = src_hash.map_err(MoveFileError::from)??;
+    let dst_hash = dst_hash.map_err(MoveFileError::from)??;
     if src_hash != dst_hash {
         log::info!("{}:{:?} inconsistent hashes", dir_id, path);
         return Ok(false);
@@ -193,9 +193,11 @@ where
     );
     // Hashes match, finish and delete
     dst.finish(context::current(), dir_id.clone(), path.to_path_buf())
-        .await??;
+        .await
+        .map_err(MoveFileError::from)??;
     src.delete(context::current(), dir_id.clone(), path.to_path_buf())
-        .await??;
+        .await
+        .map_err(MoveFileError::from)??;
     return Ok(true);
 }
 
@@ -400,4 +402,17 @@ mod tests {
         }
         Ok(result)
     }
+}
+
+/// Errors returned by [move_files]
+#[derive(Debug, Error)]
+pub enum MoveFileError {
+    #[error("RPC error: {0}")]
+    Rpc(#[from] tarpc::client::RpcError),
+    #[error("Error: {0}")]
+    Realize(#[from] RealizeError),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }
