@@ -1,12 +1,16 @@
 use clap::Parser;
+use console::style;
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use realize::algo::{FileProgress as AlgoFileProgress, MoveFileError, Progress};
 use realize::model::service::DirectoryId;
 use realize::server::RealizeServer;
 use realize::transport::security::{self, PeerVerifier};
 use realize::transport::tcp;
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Realize command-line tool
@@ -69,11 +73,11 @@ async fn main() {
 
     // Validate combinations
     if (src_is_remote && dst_is_remote) && (src_is_local || dst_is_local) {
-        eprintln!("Cannot mix local and remote for the same endpoint");
+        print_error("Cannot mix local and remote for the same endpoint");
         process::exit(1);
     }
     if !(src_is_remote || src_is_local) || !(dst_is_remote || dst_is_local) {
-        eprintln!("Must specify both source and destination (local or remote)");
+        print_error("Must specify both source and destination (local or remote)");
         process::exit(1);
     }
 
@@ -92,17 +96,17 @@ async fn main() {
                 Ok(key) => match crypto.key_provider.load_private_key(key) {
                     Ok(k) => Arc::from(k),
                     Err(e) => {
-                        eprintln!("Failed to load private key: {e}");
+                        print_error_with_path(path, &format!("Invalid private key file: {e}",));
                         process::exit(1);
                     }
                 },
                 Err(e) => {
-                    eprintln!("Failed to parse private key: {e}");
+                    print_error_with_path(path, &format!("Invalid private key file: {e}",));
                     process::exit(1);
                 }
             },
             None => {
-                eprintln!("--privkey is required for remote endpoint");
+                print_error("--privkey is required for remote endpoint");
                 process::exit(1);
             }
         };
@@ -113,17 +117,14 @@ async fn main() {
             .expect("--peers required for remote endpoint");
         let file = peers_path;
         let pem_iter = SubjectPublicKeyInfoDer::pem_file_iter(file).unwrap_or_else(|e| {
-            eprintln!("{:?}: Failed to open peers file: {}", peers_path, e);
+            print_error_with_path(peers_path, &format!("Failed to open peers file: {e}",));
             process::exit(1);
         });
         for pem in pem_iter {
             match pem {
                 Ok(spki) => verifier.add_peer(&spki),
                 Err(e) => {
-                    eprintln!(
-                        "{:?}: Failed to parse public key in peer file: {}",
-                        peers_path, e
-                    );
+                    print_error_with_path(peers_path, &format!("Failed to parse peers file: {e}"));
                     process::exit(1);
                 }
             }
@@ -151,7 +152,7 @@ async fn main() {
         {
             Ok(client) => client,
             Err(e) => {
-                eprintln!("Failed to connect to src remote: {e}");
+                print_error(&format!("Failed to connect to src {addr}: {e}"));
                 process::exit(1);
             }
         }
@@ -175,7 +176,7 @@ async fn main() {
         {
             Ok(client) => client,
             Err(e) => {
-                eprintln!("Failed to connect to dst remote: {e}");
+                print_error(&format!("Failed to connect to dst {addr}: {e}"));
                 process::exit(1);
             }
         }
@@ -187,19 +188,187 @@ async fn main() {
     }
 
     // Move files
-    match realize::algo::move_files(&src_client, &dst_client, dir_id).await {
+    let mut progress = CliProgress::new(&dir_id);
+    let result = realize::algo::move_files(&src_client, &dst_client, dir_id, &mut progress).await;
+    progress.finish_and_clear();
+    match result {
         Ok((success, error)) => {
             if error == 0 {
-                println!("Moved {success} file(s)");
+                println!(
+                    "{} {} file(s) moved",
+                    style("SUCCESS").for_stdout().green().bold(),
+                    success
+                );
                 process::exit(0);
             } else {
-                eprintln!("Moved {success} file(s), {error} failed");
+                print_error(&format!(
+                    "{} file(s) failed, and {} files(s) moved",
+                    error, success
+                ));
                 process::exit(1);
             }
         }
-        Err(e) => {
-            eprintln!("Error: {e}");
+        Err(err) => {
+            print_error(&format!("{err}"));
             process::exit(1);
         }
+    }
+}
+
+/// Print an error message to stderr, with standard format.
+fn print_error(msg: &str) {
+    eprintln!("{}: {}", style("ERROR").for_stderr().red().bold(), msg);
+}
+
+/// Print an error message to stderr, with standard format.
+fn print_error_with_path(path: &Path, msg: &str) {
+    eprintln!(
+        "{} {}: {}",
+        style("ERROR").for_stderr().red().bold(),
+        path.display(),
+        msg
+    );
+}
+
+struct CliProgress {
+    multi: MultiProgress,
+    total_files: usize,
+    total_bytes: u64,
+    overall_pb: ProgressBar,
+    next_file_index: Arc<AtomicUsize>,
+    dirid: String,
+}
+
+impl CliProgress {
+    fn new(dirid: &DirectoryId) -> Self {
+        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stdout());
+        let overall_pb = multi.add(ProgressBar::no_length());
+        overall_pb.set_style(
+            ProgressStyle::with_template(
+                "{prefix:<9.cyan.bold} [{bar:40.cyan/blue}] {pos}/{len} files",
+            )
+            .unwrap()
+            .progress_chars("=> "),
+        );
+        overall_pb.set_prefix("Listing");
+        Self {
+            multi,
+            total_files: 0,
+            total_bytes: 0,
+            overall_pb,
+            next_file_index: Arc::new(AtomicUsize::new(1)),
+            dirid: dirid.to_string(),
+        }
+    }
+
+    fn finish_and_clear(&self) {
+        self.overall_pb.finish_and_clear();
+        let _ = self.multi.clear();
+    }
+}
+
+impl Progress for CliProgress {
+    fn set_length(&mut self, total_files: usize, total_bytes: u64) {
+        self.total_files = total_files;
+        self.total_bytes = total_bytes;
+        self.overall_pb.set_length(total_files as u64);
+        self.overall_pb.set_position(0);
+        self.overall_pb.set_prefix("Moving");
+    }
+
+    fn for_file(&self, path: &std::path::Path, bytes: u64) -> Box<dyn AlgoFileProgress> {
+        Box::new(CliFileProgress {
+            bar: None,
+            next_file_index: self.next_file_index.clone(),
+            total_files: self.total_files,
+            bytes,
+            dirid: self.dirid.clone(),
+            path: path.display().to_string(),
+            multi: self.multi.clone(),
+        })
+    }
+}
+
+struct CliFileProgress {
+    bar: Option<(usize, ProgressBar)>,
+    next_file_index: Arc<AtomicUsize>,
+    total_files: usize,
+    bytes: u64,
+    dirid: String,
+    path: String,
+    multi: MultiProgress,
+}
+
+impl CliFileProgress {
+    fn get_or_create_bar(&mut self) -> &mut ProgressBar {
+        let (_, pb) = self.bar.get_or_insert_with(|| {
+            let file_index = self.next_file_index.fetch_add(1, Ordering::Relaxed);
+            let pb = self.multi.insert_from_back(1, ProgressBar::new(self.bytes));
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "{msg} {prefix} [{bar:40.cyan/blue}] {pos}/{len} bytes",
+                )
+                .unwrap()
+                .progress_chars("=> "),
+            );
+            pb.set_prefix("Checking");
+            pb.set_message(format!("[{}/{}]", file_index, self.total_files));
+
+            (file_index, pb)
+        });
+
+        pb
+    }
+}
+
+impl AlgoFileProgress for CliFileProgress {
+    fn verifying(&mut self) {
+        let pb = self.get_or_create_bar();
+        pb.set_prefix("Verifying");
+    }
+    fn moving(&mut self) {
+        let pb = self.get_or_create_bar();
+        pb.set_prefix("Copying");
+    }
+    fn inc(&mut self, bytecount: u64) {
+        if let Some((_, pb)) = &mut self.bar {
+            pb.inc(bytecount);
+        }
+    }
+    fn success(&mut self) {
+        if let Some((index, pb)) = self.bar.take() {
+            pb.finish_and_clear();
+            let _ = self.multi.suspend(|| {
+                println!(
+                    "[{}/{}] {:<9} {}/{}",
+                    index,
+                    self.total_files,
+                    style("Moved").for_stdout().green().bold(),
+                    self.dirid,
+                    self.path
+                );
+            });
+        }
+    }
+
+    fn error(&mut self, err: &MoveFileError) {
+        // Write report even if no bar was ever created.
+        let tag = if let Some((index, pb)) = self.bar.take() {
+            pb.finish_and_clear();
+
+            format!("[{}/{}] ", index, self.total_files)
+        } else {
+            "".to_string()
+        };
+        self.multi.suspend(|| {
+            eprintln!(
+                "{}{:<9} {}/{}: {}",
+                tag,
+                style("ERROR").for_stderr().red().bold(),
+                self.dirid,
+                self.path,
+                err,
+            );
+        });
     }
 }

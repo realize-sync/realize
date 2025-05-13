@@ -14,17 +14,61 @@ use thiserror::Error;
 
 const CHUNK_SIZE: u64 = 8 * 1024 * 1024; // 8MB
 
+// Progress instance passed to move_files()
+pub trait Progress: Sync + Send {
+    /// Once the number of files to move is known, report it
+    fn set_length(&mut self, total_files: usize, total_bytes: u64);
+
+    /// Process a file
+    fn for_file(&self, path: &std::path::Path, bytes: u64) -> Box<dyn FileProgress>;
+}
+
+pub trait FileProgress: Sync + Send {
+    /// Checking the hash at the beginning or end
+    fn verifying(&mut self);
+    /// Transferring data
+    fn moving(&mut self);
+    /// Increment byte count for the file and overall byte count by this amount.
+    fn inc(&mut self, bytecount: u64);
+    /// File was moved, finished and deleted on the source. File is done, increment file count by 1.
+    fn success(&mut self);
+    /// Moving the file failed. File is done, increment file count by 1.
+    fn error(&mut self, err: &MoveFileError);
+}
+
+/// Empty implementation of Progress trait
+pub struct NoProgress;
+
+impl Progress for NoProgress {
+    fn set_length(&mut self, _total_files: usize, _total_bytes: u64) {}
+    fn for_file(&self, _path: &std::path::Path, _bytes: u64) -> Box<dyn FileProgress> {
+        Box::new(NoFileProgress)
+    }
+}
+
+pub struct NoFileProgress;
+
+impl FileProgress for NoFileProgress {
+    fn verifying(&mut self) {}
+    fn moving(&mut self) {}
+    fn inc(&mut self, _bytecount: u64) {}
+    fn success(&mut self) {}
+    fn error(&mut self, _err: &MoveFileError) {}
+}
+
 /// Moves files from source to destination using the RealizeService interface.
 /// After a successful move and hash match, deletes the file from the source.
 /// Returns (success_count, error_count).
-pub async fn move_files<T, U>(
+pub async fn move_files<T, U, P>(
     src: &RealizeServiceClient<T>,
     dst: &RealizeServiceClient<U>,
     dir_id: DirectoryId,
+    progress: &mut P,
 ) -> Result<(usize, usize), MoveFileError>
 where
     T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
     U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+    P: Progress,
 {
     // 1. List files on src and dst in parallel
     let (src_files, dst_files) = join(
@@ -42,24 +86,36 @@ where
         .collect();
     let mut success_count = 0;
     let mut error_count = 0;
+    let total_files = src_files.len();
+    let total_bytes = src_files.iter().map(|f| f.size).sum();
+    progress.set_length(total_files, total_bytes);
     let mut handles = vec![];
     for file in src_files.iter() {
-        let fut = move_file(src, file, dst, dst_map.get(&file.path), &dir_id);
-        handles.push((file.path.clone(), fut));
-    }
-    let results = join_all(
-        handles
-            .into_iter()
-            .map(|(path, fut)| async move { (path, fut.await) }),
-    )
-    .await;
-    for (path, res) in results {
-        match res {
-            Ok(_) => success_count += 1,
-            Err(e) => {
-                log::error!("{}:{:?} failed to move: {}", dir_id, path, e);
-                error_count += 1;
+        let mut file_progress = progress.for_file(&file.path, file.size);
+        let dst_file = dst_map.get(&file.path);
+        let dir_id = dir_id.clone();
+        let fut = async move {
+            let result = move_file(src, file, dst, dst_file, &dir_id, &mut *file_progress).await;
+            match result {
+                Ok(_) => {
+                    file_progress.success();
+
+                    true
+                }
+                Err(err) => {
+                    file_progress.error(&err);
+
+                    false
+                }
             }
+        };
+        handles.push(fut);
+    }
+    for res in join_all(handles).await {
+        if res {
+            success_count += 1;
+        } else {
+            error_count += 1;
         }
     }
     Ok((success_count, error_count))
@@ -71,6 +127,7 @@ async fn move_file<T, U>(
     dst: &RealizeServiceClient<U>,
     dst_file: Option<&SyncedFile>,
     dir_id: &DirectoryId,
+    progress: &mut dyn FileProgress,
 ) -> Result<(), MoveFileError>
 where
     T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
@@ -80,6 +137,7 @@ where
     let src_size = src_file.size;
     let dst_size = dst_file.map(|f| f.size).unwrap_or(0);
 
+    progress.verifying();
     if src_size == dst_size && check_hashes_and_delete(src, dst, dir_id, &path).await? {
         return Ok(());
     }
@@ -100,6 +158,7 @@ where
             end = src_file.size;
         }
         let range = (offset, end);
+        progress.moving();
         if dst_size <= offset {
             // Send data
             log::debug!("{}:{:?} sending range {:?}", dir_id, path, range);
@@ -117,9 +176,10 @@ where
                 path.to_path_buf(),
                 range,
                 src_file.size,
-                data,
+                data.clone(),
             )
             .await??;
+            progress.inc((end - offset) as u64);
         } else {
             // Compute diff and apply
             log::debug!("{}:{:?} rsync on range {:?}", dir_id, path, range);
@@ -149,10 +209,12 @@ where
                 delta,
             )
             .await??;
+            progress.inc((end - offset) as u64);
         }
         offset = end;
     }
 
+    progress.verifying();
     if !check_hashes_and_delete(src, dst, dir_id, &path).await? {
         return Err(MoveFileError::Realize(RealizeError::Sync(
             path.to_path_buf(),
@@ -206,12 +268,108 @@ mod tests {
     use super::*;
     use crate::model::service::DirectoryId;
     use crate::server::RealizeServer;
-    use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use walkdir::WalkDir;
+
+    struct MockFileProgress {
+        log: Arc<Mutex<Vec<String>>>,
+        id: String,
+    }
+
+    impl FileProgress for MockFileProgress {
+        fn verifying(&mut self) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}:verifying", self.id));
+        }
+        fn moving(&mut self) {
+            self.log.lock().unwrap().push(format!("{}:moving", self.id));
+        }
+        fn inc(&mut self, bytecount: u64) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}:inc:{}", self.id, bytecount));
+        }
+        fn success(&mut self) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}:success", self.id));
+        }
+        fn error(&mut self, _err: &MoveFileError) {
+            self.log.lock().unwrap().push(format!("{}:error", self.id));
+        }
+    }
+
+    struct MockProgress {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Progress for MockProgress {
+        fn set_length(&mut self, total_files: usize, total_bytes: u64) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("set_length:{}:{}", total_files, total_bytes));
+        }
+        fn for_file(&self, path: &std::path::Path, bytes: u64) -> Box<dyn FileProgress> {
+            let id = path.to_string_lossy().to_string();
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("for_file:{}:{}", id, bytes));
+            Box::new(MockFileProgress {
+                log: Arc::clone(&self.log),
+                id,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_progress_trait_is_called() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+        let src_temp = TempDir::new()?;
+        let dst_temp = TempDir::new()?;
+        src_temp.child("foo").write_str("abc")?;
+        let src_dir = Arc::new(crate::server::Directory::new(
+            &DirectoryId::from("testdir"),
+            src_temp.path(),
+        ));
+        let dst_dir = Arc::new(crate::server::Directory::new(
+            &DirectoryId::from("testdir"),
+            dst_temp.path(),
+        ));
+        let src_server = RealizeServer::for_dir(src_dir.id(), src_dir.path()).as_inprocess_client();
+        let dst_server = RealizeServer::for_dir(dst_dir.id(), dst_dir.path()).as_inprocess_client();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut progress = MockProgress {
+            log: Arc::clone(&log),
+        };
+        let (_success, _error) = move_files(
+            &src_server,
+            &dst_server,
+            DirectoryId::from("testdir"),
+            &mut progress,
+        )
+        .await?;
+        let log = log.lock().unwrap();
+        // Check that set_length, for_file, and at least one FileProgress method were called
+        assert!(log.iter().any(|l| l.starts_with("set_length:")));
+        assert!(log.iter().any(|l| l.starts_with("for_file:")));
+        assert!(log.iter().any(|l| l.contains(":verifying")));
+        assert!(
+            log.iter().any(|l| l.contains(":success")) || log.iter().any(|l| l.contains(":error"))
+        );
+        // Existing tests continue to use NoProgress
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_move_files() -> anyhow::Result<()> {
@@ -250,8 +408,13 @@ mod tests {
         src_temp.child("partial").write_str("partialcopy")?;
 
         println!("test_move_files: all files set up");
-        let (success, error) =
-            move_files(&src_server, &dst_server, DirectoryId::from("testdir")).await?;
+        let (success, error) = move_files(
+            &src_server,
+            &dst_server,
+            DirectoryId::from("testdir"),
+            &mut NoProgress,
+        )
+        .await?;
         assert_eq!(error, 0, "No errors expected");
         assert_eq!(success, 4, "All files should be moved");
         // Check that files are present in destination and not in source
@@ -314,8 +477,13 @@ mod tests {
         garbage.extend_from_slice(&chunk5[..1024 * 1024]); // 1MB garbage
         dst_temp.child("large_garbage").write_binary(&garbage)?;
 
-        let (success, error) =
-            move_files(&src_server, &dst_server, DirectoryId::from("testdir")).await?;
+        let (success, error) = move_files(
+            &src_server,
+            &dst_server,
+            DirectoryId::from("testdir"),
+            &mut NoProgress,
+        )
+        .await?;
         assert_eq!(error, 0, "No errors expected");
         assert_eq!(success, 5, "All files should be moved");
         // Check that files are present in destination and not in source
@@ -361,8 +529,13 @@ mod tests {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(unreadable.path(), fs::Permissions::from_mode(0o000))?;
-        let (success, error) =
-            move_files(&src_server, &dst_server, DirectoryId::from("testdir")).await?;
+        let (success, error) = move_files(
+            &src_server,
+            &dst_server,
+            DirectoryId::from("testdir"),
+            &mut NoProgress,
+        )
+        .await?;
         assert_eq!(success, 1, "One file should succeed");
         assert_eq!(error, 1, "One file should fail");
         // Restore permissions for cleanup

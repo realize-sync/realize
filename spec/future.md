@@ -51,14 +51,13 @@ for easy reference, and end with a detailled and numbered task list.
 
   Task list:
 
-   - Write the trait and its empty implementation
-   - Run "cargo check" to make sure it compiles, fix any errors
-   - Call the trait from move_files
-   - Run "cargo check" to make sure it compiles, fix any errors
-   - Add one ore more unit tests that makes sure progress information is
-     called correctly in move_files
-   - Run "cargo test <testname>" to make sure the test passes, fix any errors
-   - Run "cargo test" to make sure everything all tests pass, fix any errors
+   1. Write the trait and its empty implementation
+     - Run "cargo check" to make sure it compiles, fix any errors
+   2. Call the trait from move_files
+     - Run "cargo check" to make sure it compiles, fix any errors
+   3. Add one ore more unit tests that makes sure progress information is
+      called correctly in move_files
+     - Run "cargo test" to make sure all tests pass, fix any errors
 
 ## Progress in the realize command {#progress2}
 

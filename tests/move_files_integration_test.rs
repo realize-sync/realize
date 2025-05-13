@@ -1,6 +1,6 @@
 use assert_cmd::cargo::cargo_bin;
-use assert_fs::TempDir;
 use assert_fs::prelude::*;
+use assert_fs::TempDir;
 use assert_unordered::assert_eq_unordered;
 use realize::server::RealizeServer;
 use realize::transport::security::{self, PeerVerifier};
@@ -221,7 +221,11 @@ async fn test_local_to_local_partial_failure() -> anyhow::Result<()> {
     assert!(!output.status.success(), "Should fail if any file fails");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Moved 1 file(s), 1 failed"),
+        stderr.contains("ERROR     dir/bad.txt: "),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("ERROR: 1 file(s) failed, and 1 files(s) moved"),
         "stderr: {stderr}"
     );
     util::assert_dir_contents(&dst_dir, vec![PathBuf::from("good.txt")])?;
@@ -246,7 +250,48 @@ async fn test_local_to_local_success_output() -> anyhow::Result<()> {
         .await?;
     assert!(output.status.success(), "Should succeed if all files moved");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Moved 2 file(s)"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("SUCCESS 2 file(s) moved"),
+        "stdout: {stdout}"
+    );
+    util::assert_dir_contents(
+        &dst_dir,
+        vec![PathBuf::from("foo.txt"), PathBuf::from("bar.txt")],
+    )?;
+    util::assert_dir_empty(&src_dir)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_local_to_local_progress_output() -> anyhow::Result<()> {
+    env_logger::try_init().ok();
+    let tempdir = TempDir::new()?;
+    let src_dir = tempdir.child("src6");
+    let dst_dir = tempdir.child("dst6");
+    let src6_path = src_dir.path().to_path_buf();
+    let dst6_path = dst_dir.path().to_path_buf();
+    util::create_dir_with_files(&src_dir, &[("foo.txt", "hello"), ("bar.txt", "world")])?;
+    let output = tokio::process::Command::new(cargo_bin!("realize"))
+        .arg("--src-path")
+        .arg(&src6_path)
+        .arg("--dst-path")
+        .arg(&dst6_path)
+        .output()
+        .await?;
+    assert!(output.status.success(), "Should succeed if all files moved");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("[1/2] Moved     dir/foo.txt"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("[2/2] Moved     dir/bar.txt"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("SUCCESS 2 file(s) moved"),
+        "stdout: {stdout}"
+    );
     util::assert_dir_contents(
         &dst_dir,
         vec![PathBuf::from("foo.txt"), PathBuf::from("bar.txt")],
