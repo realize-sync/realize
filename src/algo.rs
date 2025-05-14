@@ -28,8 +28,10 @@ pub trait Progress: Sync + Send {
 pub trait FileProgress: Sync + Send {
     /// Checking the hash at the beginning or end
     fn verifying(&mut self);
+    /// Comparing and fixing data using the rsync algorithm.
+    fn rsyncing(&mut self);
     /// Transferring data
-    fn moving(&mut self);
+    fn copying(&mut self);
     /// Increment byte count for the file and overall byte count by this amount.
     fn inc(&mut self, bytecount: u64);
     /// File was moved, finished and deleted on the source. File is done, increment file count by 1.
@@ -52,7 +54,8 @@ pub struct NoFileProgress;
 
 impl FileProgress for NoFileProgress {
     fn verifying(&mut self) {}
-    fn moving(&mut self) {}
+    fn rsyncing(&mut self) {}
+    fn copying(&mut self) {}
     fn inc(&mut self, _bytecount: u64) {}
     fn success(&mut self) {}
     fn error(&mut self, _err: &MoveFileError) {}
@@ -168,14 +171,20 @@ where
 
     // Chunked Transfer
     let mut offset: u64 = 0;
+    let mut rsyncing = true;
+    progress.rsyncing();
     while offset < src_size {
         let mut end = offset + CHUNK_SIZE;
         if end > src_file.size {
             end = src_file.size;
         }
         let range = (offset, end);
-        progress.moving();
+
         if dst_size <= offset {
+            if rsyncing {
+                progress.copying();
+                rsyncing = false;
+            }
             // Send data
             log::debug!("{}:{:?} sending range {:?}", dir_id, path, range);
             let data = src
@@ -330,8 +339,17 @@ mod tests {
                 .unwrap()
                 .push(format!("{}:verifying", self.id));
         }
-        fn moving(&mut self) {
-            self.log.lock().unwrap().push(format!("{}:moving", self.id));
+        fn rsyncing(&mut self) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}:rsyncing", self.id));
+        }
+        fn copying(&mut self) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}:copying", self.id));
         }
         fn inc(&mut self, bytecount: u64) {
             self.log

@@ -353,11 +353,16 @@ impl AlgoFileProgress for CliFileProgress {
         let pb = self.get_or_create_bar();
         pb.set_prefix("Verifying");
     }
-    fn moving(&mut self) {
+    fn rsyncing(&mut self) {
+        let pb = self.get_or_create_bar();
+        pb.set_prefix("Rsyncing");
+    }
+    fn copying(&mut self) {
         let pb = self.get_or_create_bar();
         pb.set_prefix("Copying");
     }
     fn inc(&mut self, bytecount: u64) {
+        self.overall_pb.inc(bytecount);
         if let Some((_, pb)) = &mut self.bar {
             pb.inc(bytecount);
         }
