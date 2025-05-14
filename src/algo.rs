@@ -7,12 +7,14 @@ use crate::model::service::{
     DirectoryId, Options, RealizeError, RealizeServiceClient, RealizeServiceRequest,
     RealizeServiceResponse, SyncedFile,
 };
-use futures::future::{join, join_all};
+use futures::future::join;
+use futures::stream::StreamExt as _;
 use std::{collections::HashMap, path::Path};
 use tarpc::{client::stub::Stub, context};
 use thiserror::Error;
 
 const CHUNK_SIZE: u64 = 8 * 1024 * 1024; // 8MB
+const PARALLEL_FILE_COUNT: usize = 8;
 
 // Progress instance passed to move_files()
 pub trait Progress: Sync + Send {
@@ -98,40 +100,40 @@ where
         .into_iter()
         .map(|f| (f.path.to_path_buf(), f))
         .collect();
-    let mut success_count = 0;
-    let mut error_count = 0;
     let total_files = src_files.len();
     let total_bytes = src_files.iter().map(|f| f.size).sum();
     progress.set_length(total_files, total_bytes);
-    let mut handles = vec![];
-    for file in src_files.iter() {
-        let mut file_progress = progress.for_file(&file.path, file.size);
-        let dst_file = dst_map.get(&file.path);
-        let dir_id = dir_id.clone();
-        let fut = async move {
-            let result = move_file(src, file, dst, dst_file, &dir_id, &mut *file_progress).await;
-            match result {
-                Ok(_) => {
-                    file_progress.success();
+    let (success_count, error_count) = futures::stream::iter(src_files.into_iter())
+        .map(|file| {
+            let mut file_progress = progress.for_file(&file.path, file.size);
+            let dst_file = dst_map.get(&file.path);
+            let dir_id = dir_id.clone();
+            async move {
+                let result =
+                    move_file(src, &file, dst, dst_file, &dir_id, &mut *file_progress).await;
+                match result {
+                    Ok(_) => {
+                        file_progress.success();
 
-                    true
-                }
-                Err(err) => {
-                    file_progress.error(&err);
+                        true
+                    }
+                    Err(err) => {
+                        file_progress.error(&err);
 
-                    false
+                        false
+                    }
                 }
             }
-        };
-        handles.push(fut);
-    }
-    for res in join_all(handles).await {
-        if res {
-            success_count += 1;
-        } else {
-            error_count += 1;
-        }
-    }
+        })
+        .buffer_unordered(PARALLEL_FILE_COUNT)
+        .collect::<Vec<bool>>()
+        .await
+        .into_iter()
+        .fold(
+            (0, 0),
+            |(s, e), ret| if ret { (s + 1, e) } else { (s, e + 1) },
+        );
+
     Ok((success_count, error_count))
 }
 
