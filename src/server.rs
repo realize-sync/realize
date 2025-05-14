@@ -83,7 +83,7 @@ impl RealizeService for RealizeServer {
         options: Options,
     ) -> Result<Vec<SyncedFile>> {
         let dir = self.find_directory(&dir_id)?;
-        let mut files = std::collections::HashMap::new();
+        let mut files = std::collections::BTreeMap::new();
         for entry in WalkDir::new(dir.path()).into_iter().flatten() {
             if let Some((state, logical)) = LogicalPath::from_actual(dir, entry.path()) {
                 if options.ignore_partial && state == SyncedFileState::Partial {

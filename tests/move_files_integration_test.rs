@@ -225,7 +225,7 @@ async fn test_local_to_local_partial_failure() -> anyhow::Result<()> {
     assert!(!output.status.success(), "Should fail if any file fails");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("ERROR     dir/bad.txt: "),
+        stderr.contains("ERROR     [1/2] bad.txt: "),
         "stderr: {stderr}"
     );
     assert!(
@@ -285,11 +285,11 @@ async fn test_local_to_local_progress_output() -> anyhow::Result<()> {
     assert!(output.status.success(), "Should succeed if all files moved");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("/2] Moved     dir/foo.txt"),
+        stdout.contains("Moved     [1/2] bar.txt"),
         "stdout: {stdout}"
     );
     assert!(
-        stdout.contains("/2] Moved     dir/bar.txt"),
+        stdout.contains("Moved     [2/2] foo.txt"),
         "stdout: {stdout}"
     );
     assert!(
