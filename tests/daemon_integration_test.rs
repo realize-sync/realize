@@ -1,9 +1,10 @@
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use assert_cmd::cargo::cargo_bin;
-use assert_fs::prelude::*;
 use assert_fs::TempDir;
+use assert_fs::prelude::*;
 use predicates::prelude::*;
 use process_wrap::tokio::ProcessGroup;
 use process_wrap::tokio::TokioCommandWrap;
@@ -12,6 +13,7 @@ use realize::model::service::Options;
 use realize::transport::security;
 use realize::transport::security::PeerVerifier;
 use realize::transport::tcp;
+use reqwest::Client;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::SubjectPublicKeyInfoDer;
 use rustls::pki_types::pem::PemObject as _;
@@ -31,19 +33,12 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
     let privkey_file = PathBuf::from("resources/test/a.key");
     let pubkey_file = PathBuf::from("resources/test/a-spki.pem");
 
-    // Write config YAML
-    let config_yaml = format!(
-        r#"dirs:
-  - testdir: {}
-peers:
-  - testpeer: |
-      {}
-"#,
-        testdir_server.display(),
-        std::fs::read_to_string(&pubkey_file)?.replace("\n", "\n      ")
-    );
     let config_file = temp_dir.child("config.yaml");
-    config_file.write_str(&config_yaml)?;
+    write_config_file(
+        config_file.path(),
+        testdir_server.path(),
+        pubkey_file.as_path(),
+    )?;
 
     // Run process in the background and in a way that allows reading
     // its output, so we know what port to connect to.
@@ -130,6 +125,97 @@ peers:
         stderr.contains("Accepted peer testpeer from "),
         "stderr: {stderr}"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn metrics_endpoint_works() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let testdir_server = temp_dir.child("server");
+    fs::create_dir(&testdir_server).await?;
+    let privkey_file = PathBuf::from("resources/test/a.key");
+    let pubkey_file = PathBuf::from("resources/test/a-spki.pem");
+    let config_file = temp_dir.child("config.yaml");
+    write_config_file(
+        config_file.path(),
+        testdir_server.path(),
+        pubkey_file.as_path(),
+    )?;
+
+    let metrics_port = portpicker::pick_unused_port().expect("No ports free");
+    let metrics_addr = format!("127.0.0.1:{}", metrics_port);
+    let mut daemon = TokioCommandWrap::with_new(cargo_bin!("realized"), |cmd| {
+        cmd.arg("--address")
+            .arg("127.0.0.1:0")
+            .arg("--privkey")
+            .arg(&privkey_file)
+            .arg("--config")
+            .arg(config_file.path())
+            .arg("--metrics-addr")
+            .arg(&metrics_addr)
+            .env("RUST_LOG", "realized=debug")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+    })
+    .wrap(ProcessGroup::leader())
+    .spawn()?;
+
+    // Wait for metrics endpoint to be up by reading log output.
+    let stderr = daemon.stderr().as_mut().unwrap();
+    let mut err_reader = tokio::io::BufReader::new(stderr).lines();
+    let mut found = false;
+    let mut captured = vec![];
+    for _ in 0..100 {
+        if let Some(line) = err_reader.next_line().await? {
+            if line.contains("[metrics] server listening on") {
+                found = true;
+                break;
+            }
+            captured.push(line);
+        }
+    }
+    assert!(
+        found,
+        "Metrics server did not print listening message. captured: {}",
+        captured.join("\n")
+    );
+
+    // Now test the endpoint
+    let client = Client::new();
+    let metrics_url = format!("http://{}/metrics", metrics_addr);
+    let resp = client.get(&metrics_url).send().await?;
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await?;
+    assert_eq!(body, "{}");
+    let notfound = client
+        .get(format!("http://{}/notfound", metrics_addr))
+        .send()
+        .await?;
+    assert_eq!(notfound.status(), 404);
+
+    Ok(())
+}
+
+fn write_config_file(
+    config_file: &Path,
+    testdir_server: &Path,
+    pubkey_file: &Path,
+) -> anyhow::Result<()> {
+    // Write config YAML
+    let config_yaml = format!(
+        r#"dirs:
+  - testdir: {}
+peers:
+  - testpeer: |
+      {}
+"#,
+        testdir_server.display(),
+        std::fs::read_to_string(&pubkey_file)?.replace("\n", "\n      ")
+    );
+    std::fs::write(config_file, config_yaml)?;
 
     Ok(())
 }

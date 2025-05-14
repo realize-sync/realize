@@ -27,6 +27,7 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "fs", "
 tokio-rustls = "0.26"
 tracing = "0.1"
 walkdir = "2.5"
+rouille = "3.6"
 # keep sorted
 
 [dev-dependencies]
@@ -37,4 +38,6 @@ predicates = "3.0"
 process-wrap = { version = "8.2", features = ["tokio1"] }
 tempfile = "3.10"
 test-tag = "0.1"
+reqwest = { version = "0.11", features = ["json"] }
+portpicker = "0.1"
 # keep sorted

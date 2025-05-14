@@ -11,6 +11,7 @@ use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::thread;
 
 /// Command-line arguments for the realized daemon
 #[derive(Parser, Debug)]
@@ -27,6 +28,10 @@ struct Args {
     /// Path to the YAML configuration file
     #[arg(long)]
     config: PathBuf,
+
+    /// Address to export prometheus metrics (host:port, optional)
+    #[arg(long)]
+    metrics_addr: Option<String>,
 }
 
 /// Config file structure (stub, to be expanded)
@@ -113,6 +118,8 @@ async fn main() {
         }
     };
 
+    export_metrics(args.metrics_addr);
+
     // Start the server (tokio runtime)
     match tcp::start_server(&args.address, server, verifier, privkey).await {
         Err(err) => {
@@ -126,6 +133,23 @@ async fn main() {
                 std::process::exit(1);
             }
             std::process::exit(0);
+        }
+    }
+
+    fn export_metrics(metrics_addr: Option<String>) {
+        if let Some(metrics_addr) = &metrics_addr {
+            let metrics_addr = metrics_addr.to_string();
+            thread::spawn(move || {
+                log::info!("[metrics] server listening on {}", metrics_addr);
+                rouille::start_server(metrics_addr, move |request| {
+                    if request.url() != "/metrics" {
+                        return rouille::Response::empty_404();
+                    }
+
+                    // TODO: build metrics using prometheus
+                    rouille::Response::text("{}")
+                });
+            });
         }
     }
 }
