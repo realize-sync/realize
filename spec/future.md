@@ -43,13 +43,79 @@ Have daemon export metrics.
   to test the output of "http://host:port/metrics" This should
   include process metrics, so shouldn't be empty.
 
-## Add prometeus to realize {#cmdmetrics}
+## Add prometheus to realize {#cmdmetrics}
 
 Extend realize with usage metrics. See also the metrics section in
 docs/design.md.
 
-Open issue: realize is a command, how should it send metrics to
-prometheus for collection? https://last9.io/blog/prometheus-pushgateway/
+Since realize isn't meant to always be up, it makes sense for it to
+support pushing its final metrics, so we can see it's run even if it's
+for less than a minute. See example:
+https://raw.githubusercontent.com/tikv/rust-prometheus/refs/heads/master/examples/example_push.rs
+
+Since realize is expected to run for hours in some cases, it makes
+sense for it to support pull metrics, though the prometheus server
+must be configured to be ok with not finding anything.
+
+`realize` should support both, turned on by --metrics-addr (like
+realized, address to bind to) and --metrics-pushgateway (gateway
+address).
+
+Code for handling metrics should be put into src/metrics.rs, so the
+commands can just call one or two functions. Code for pull metric
+that's currently in realized should be moved to src/metrics.rs so it
+can be called from realize as well.
+
+Task list
+
+1. Move export_metrics from src/bin/realized.rs to src/metrics.rs (do
+   remember to register the new metrics module in src/lib.rs)
+
+   Run "cargo check" to make sure everything still compiles, fix
+   any issues.
+
+2. Add the command-line argument --metrics-addr to src/bin/realize.rs,
+   call export_metrics. Also add METRIC_UP to src/bin/realize.rs,
+   which is just incremented to 1 just before calling move_files.
+
+   Run "cargo check" to make sure everything still compiles, fix
+   any issues.
+
+3. Extend the integration test move_files_integration_test.rs to
+   add a test that checks that the metrics are exposed. Just like
+   for the ctrlc test, it might be a good idea to point to to an
+   address that will never return then kill it, so the command won't
+   return before we could fetch the /metrics URL.
+
+   Run "cargo test --tests move_files_integration_test" and make sure
+   everything passes. Fix any issues.
+
+4. Add the command-line argument --metrics-pushgateway to
+   src/bin/realize.rs and --metrics-jobid (defaults to realize) Put
+   most of the code for that into src/metrics.rs, so realize can just
+   call a function at the end to push the metrics.
+
+   No need to support authentication; it should be a simple HTTP
+   request. The job id passed to push (instead of "example_push")
+   should code from the command-line argument --metrics-jobid and
+   there should not be any labels for now.
+
+   Run "cargo check" to make sure everything still compiles, fix
+   any issues.
+
+5. Add an integration test into tests/move_files_integration_test.rs
+   for metrics gateway.
+
+   For that, start a fake gateway in a tokio::spawn defined using
+   rouille that accepts a single POST at the expected URL
+   (http://gatewayaddress/metrics/job/<job-id>) then make the data
+   available to the main thread, using a oneshot channel, for example.
+
+   Point the command to that gateway and check that the data was
+   posted as expected.
+
+   Run "cargo test --tests move_files_integration_test" and make
+   sure everything passes. Fix any issues.
 
 ## Design and add useful logging to realized {#daemonlog}
 
