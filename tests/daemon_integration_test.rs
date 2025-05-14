@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use assert_cmd::cargo::cargo_bin;
-use assert_fs::TempDir;
 use assert_fs::prelude::*;
+use assert_fs::TempDir;
 use predicates::prelude::*;
 use process_wrap::tokio::ProcessGroup;
 use process_wrap::tokio::TokioCommandWrap;
@@ -12,9 +12,9 @@ use realize::model::service::Options;
 use realize::transport::security;
 use realize::transport::security::PeerVerifier;
 use realize::transport::tcp;
+use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::SubjectPublicKeyInfoDer;
-use rustls::pki_types::pem::PemObject as _;
 use tokio::fs;
 use tokio::io::AsyncBufReadExt as _;
 
@@ -77,7 +77,7 @@ peers:
     // Connect to the port the daemon listens to.
     let crypto = Arc::new(security::default_provider());
     let mut verifier = PeerVerifier::new(&crypto);
-    verifier.add_peer(&SubjectPublicKeyInfoDer::from_pem_file(&pubkey_file)?);
+    verifier.add_peer(SubjectPublicKeyInfoDer::from_pem_file(&pubkey_file)?);
     let verifier = Arc::new(verifier);
 
     let client = tcp::connect_client(

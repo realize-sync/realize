@@ -1,6 +1,6 @@
 use assert_cmd::cargo::cargo_bin;
-use assert_fs::TempDir;
 use assert_fs::prelude::*;
+use assert_fs::TempDir;
 use assert_unordered::assert_eq_unordered;
 use realize::server::RealizeServer;
 use realize::transport::security::{self, PeerVerifier};
@@ -475,8 +475,8 @@ mod util {
         let crypto = Arc::new(security::default_provider());
         let keys = test_keys();
         let mut verifier = PeerVerifier::new(&crypto);
-        verifier.add_peer(&SubjectPublicKeyInfoDer::from_pem_file(&keys.pubkey_a_path).unwrap());
-        verifier.add_peer(&SubjectPublicKeyInfoDer::from_pem_file(&keys.pubkey_b_path).unwrap());
+        verifier.add_peer(SubjectPublicKeyInfoDer::from_pem_file(&keys.pubkey_a_path).unwrap());
+        verifier.add_peer(SubjectPublicKeyInfoDer::from_pem_file(&keys.pubkey_b_path).unwrap());
         (crypto, Arc::new(verifier))
     }
 }

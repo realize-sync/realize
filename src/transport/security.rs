@@ -1,14 +1,12 @@
 #[cfg(test)]
 pub mod testing;
 
-use base64::Engine as _;
 use rustls::client::danger::ServerCertVerifier;
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::sign::{CertifiedKey, SigningKey};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, Error, ServerConfig};
-use sha2::Digest as _;
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 use std::sync::Arc;
 use tokio_rustls::rustls::{self, server::danger::ClientCertVerifier};
@@ -47,7 +45,7 @@ pub fn make_tls_connector(
 /// Add public keys to the verifier before using it.
 #[derive(Debug)]
 pub struct PeerVerifier {
-    allowed_peers: HashSet<String>,
+    allowed_peers: BTreeSet<Vec<u8>>,
     algos: WebPkiSupportedAlgorithms,
 }
 
@@ -55,7 +53,7 @@ impl PeerVerifier {
     /// Create a new, empty verifier.
     pub fn new(crypto: &Arc<CryptoProvider>) -> Self {
         Self {
-            allowed_peers: HashSet::new(),
+            allowed_peers: BTreeSet::new(),
             algos: crypto.signature_verification_algorithms,
         }
     }
@@ -65,12 +63,12 @@ impl PeerVerifier {
     /// Accept connections to the peer with the given public key.
     ///
     /// The SPKI must be the public part of a ED25519 key.
-    pub fn add_peer(&mut self, spki: &rustls::pki_types::SubjectPublicKeyInfoDer) {
-        self.allowed_peers.insert(hash_spki(spki));
+    pub fn add_peer(&mut self, spki: rustls::pki_types::SubjectPublicKeyInfoDer) {
+        self.allowed_peers.insert(spki.to_vec());
     }
 
     fn accept_peer(&self, spki: &rustls::pki_types::SubjectPublicKeyInfoDer) -> bool {
-        self.allowed_peers.contains(&hash_spki(spki))
+        self.allowed_peers.contains(spki.as_ref())
     }
 
     fn verify_peer(
@@ -208,10 +206,6 @@ impl ServerCertVerifier for PeerVerifier {
     }
 }
 
-fn hash_spki(spki: &rustls::pki_types::SubjectPublicKeyInfoDer) -> String {
-    base64::prelude::BASE64_STANDARD.encode(sha2::Sha256::digest(spki))
-}
-
 #[derive(Debug)]
 struct RawPublicKeyResolver {
     certified_key: Arc<CertifiedKey>,
@@ -267,8 +261,8 @@ mod tests {
     use super::*;
     use crate::transport::security::testing;
     use crate::utils::async_utils::AbortOnDrop;
-    use rustls::pki_types::PrivateKeyDer;
     use rustls::pki_types::pem::PemObject as _;
+    use rustls::pki_types::PrivateKeyDer;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -285,7 +279,7 @@ mod tests {
         let crypto = Arc::new(default_provider());
         let mut verifier = PeerVerifier::new(&crypto);
         // client public key missing from verifier
-        verifier.add_peer(&testing::server_public_key());
+        verifier.add_peer(testing::server_public_key());
 
         assert!(test_connect(verifier).await.is_err());
 
@@ -296,7 +290,7 @@ mod tests {
     async fn test_tls_unknown_server_peer() -> anyhow::Result<()> {
         let crypto = Arc::new(default_provider());
         let mut verifier = PeerVerifier::new(&crypto);
-        verifier.add_peer(&testing::client_public_key());
+        verifier.add_peer(testing::client_public_key());
         // server public key missing from verifier
 
         assert!(test_connect(verifier).await.is_err());
@@ -308,8 +302,8 @@ mod tests {
     async fn test_tls_reject_client_with_bad_private_key() -> anyhow::Result<()> {
         let crypto = Arc::new(default_provider());
         let mut verifier = PeerVerifier::new(&crypto);
-        verifier.add_peer(&testing::client_public_key());
-        verifier.add_peer(&testing::server_public_key());
+        verifier.add_peer(testing::client_public_key());
+        verifier.add_peer(testing::server_public_key());
 
         let verifier = Arc::new(verifier);
 
@@ -341,8 +335,8 @@ mod tests {
     async fn test_tls_reject_client_without_cert() -> anyhow::Result<()> {
         let crypto = Arc::new(default_provider());
         let mut verifier = PeerVerifier::new(&crypto);
-        verifier.add_peer(&testing::client_public_key());
-        verifier.add_peer(&testing::server_public_key());
+        verifier.add_peer(testing::client_public_key());
+        verifier.add_peer(testing::server_public_key());
 
         let verifier = Arc::new(verifier);
 
@@ -368,8 +362,8 @@ mod tests {
     async fn test_tls_reject_server_with_bad_private_key() -> anyhow::Result<()> {
         let crypto = Arc::new(default_provider());
         let mut verifier = PeerVerifier::new(&crypto);
-        verifier.add_peer(&testing::client_public_key());
-        verifier.add_peer(&testing::server_public_key());
+        verifier.add_peer(testing::client_public_key());
+        verifier.add_peer(testing::server_public_key());
 
         let verifier = Arc::new(verifier);
 
@@ -457,8 +451,8 @@ mod tests {
     fn complete_verifier() -> PeerVerifier {
         let crypto = Arc::new(default_provider());
         let mut verifier = PeerVerifier::new(&crypto);
-        verifier.add_peer(&testing::client_public_key());
-        verifier.add_peer(&testing::server_public_key());
+        verifier.add_peer(testing::client_public_key());
+        verifier.add_peer(testing::server_public_key());
 
         verifier
     }

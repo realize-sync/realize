@@ -87,7 +87,7 @@ async fn main() {
     for peer in &config.peers {
         for pubkey_pem in peer.map.values() {
             match SubjectPublicKeyInfoDer::from_pem_slice(pubkey_pem.as_bytes()) {
-                Ok(spki) => verifier.add_peer(&spki),
+                Ok(spki) => verifier.add_peer(spki),
                 Err(e) => {
                     eprintln!("Failed to parse peer public key: {e}");
                     std::process::exit(1);

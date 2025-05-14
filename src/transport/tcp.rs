@@ -179,7 +179,7 @@ mod tests {
     fn verifier_server_only() -> Arc<PeerVerifier> {
         let crypto = Arc::new(security::default_provider());
         let mut verifier = PeerVerifier::new(&crypto);
-        verifier.add_peer(&crate::transport::security::testing::server_public_key());
+        verifier.add_peer(crate::transport::security::testing::server_public_key());
         Arc::new(verifier)
     }
 
@@ -187,7 +187,7 @@ mod tests {
     fn verifier_client_only() -> Arc<PeerVerifier> {
         let crypto = Arc::new(security::default_provider());
         let mut verifier = PeerVerifier::new(&crypto);
-        verifier.add_peer(&crate::transport::security::testing::client_public_key());
+        verifier.add_peer(crate::transport::security::testing::client_public_key());
         Arc::new(verifier)
     }
 
@@ -195,8 +195,8 @@ mod tests {
     fn verifier_both() -> Arc<PeerVerifier> {
         let crypto = Arc::new(security::default_provider());
         let mut verifier = PeerVerifier::new(&crypto);
-        verifier.add_peer(&crate::transport::security::testing::client_public_key());
-        verifier.add_peer(&crate::transport::security::testing::server_public_key());
+        verifier.add_peer(crate::transport::security::testing::client_public_key());
+        verifier.add_peer(crate::transport::security::testing::server_public_key());
         Arc::new(verifier)
     }
 

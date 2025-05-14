@@ -149,7 +149,7 @@ async fn main() {
         });
         for pem in pem_iter {
             match pem {
-                Ok(spki) => verifier.add_peer(&spki),
+                Ok(spki) => verifier.add_peer(spki),
                 Err(e) => {
                     print_error_with_path(peers_path, &format!("Failed to parse peers file: {e}"));
                     process::exit(1);
