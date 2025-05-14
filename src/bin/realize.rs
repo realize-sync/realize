@@ -12,8 +12,8 @@ use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Realize command-line tool
 #[derive(Parser, Debug)]
@@ -279,7 +279,7 @@ impl CliProgress {
         let overall_pb = multi.add(ProgressBar::no_length());
         overall_pb.set_style(
             ProgressStyle::with_template(
-                "{prefix:<9.cyan.bold} [{bar:40.cyan/blue}] ({bytes}/{total_bytes}) {bytes_per_sec} {percent}%",
+                "{prefix:<9.cyan.bold} [{wide_bar:.cyan/blue}] ({bytes}/{total_bytes}) {bytes_per_sec} {percent}%",
             )
             .unwrap()
             .progress_chars("=> "),
