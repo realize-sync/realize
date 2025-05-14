@@ -279,7 +279,7 @@ impl CliProgress {
         let overall_pb = multi.add(ProgressBar::no_length());
         overall_pb.set_style(
             ProgressStyle::with_template(
-                "{prefix:<9.cyan.bold} [{wide_bar:.cyan/blue}] ({bytes}/{total_bytes}) {bytes_per_sec} {percent}%",
+                "{prefix:<9.cyan.bold} [{wide_bar:.cyan/blue}] {bytes_per_sec} ({bytes}/{total_bytes}) {percent}%",
             )
             .unwrap()
             .progress_chars("=> "),
