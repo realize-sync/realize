@@ -92,3 +92,27 @@ specified as download and upload limits on the command-line:
 6. Log all throttle changes and errors.
 7. Document usage, configuration, and edge cases, including how updates are applied.
 
+## Optimize hash verification logic in move_files {#hasverification}
+
+src.hash() should be called only once, at the beginning of move_file,
+since it won't change (and computing the hash is a very slow operation
+for large files).
+
+The value might need to be read twice, once for the initial
+verification (optional) and once for the final verification.
+Unfortunately, a future can only be awaited once. There should be some
+way of dealing with that while keeping the code reasonable.
+
+Task list
+
+- update the code
+- run "cargo test -- --skip :slow:", fix any issues
+
+## Optimize reads {#readopt}
+
+Since move_files works on multiple files at once:
+ - there's opportunity to write/read for one file while another file computes hash
+ - the write and reads are scattered, making it hard on the OS buffers
+
+Experiment with different ways of organizing the work that maybe speed
+things up.
