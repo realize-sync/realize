@@ -75,7 +75,6 @@ async fn main() {
 
     let cli = Cli::parse();
 
-    // Start timeout task if --max-duration is set and nonzero
     let _timeout_guard = if let Some(duration) = cli.max_duration {
         let handle = tokio::spawn(async move {
             tokio::time::sleep(duration.into()).await;
@@ -88,6 +87,10 @@ async fn main() {
     } else {
         None
     };
+    let _ = ctrlc::set_handler(|| {
+        print_error("Interrupted");
+        process::exit(20);
+    });
 
     // Determine mode
     let src_is_remote = cli.src_addr.is_some();
