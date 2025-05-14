@@ -192,7 +192,7 @@ async fn main() {
     }
 
     // Move files
-    let mut progress = CliProgress::new(&dir_id, cli.quiet);
+    let mut progress = CliProgress::new(cli.quiet);
     let result = realize::algo::move_files(&src_client, &dst_client, dir_id, &mut progress).await;
     progress.finish_and_clear();
     match result {
@@ -242,12 +242,11 @@ struct CliProgress {
     total_bytes: u64,
     overall_pb: ProgressBar,
     next_file_index: Arc<AtomicUsize>,
-    dirid: String,
     quiet: bool,
 }
 
 impl CliProgress {
-    fn new(dirid: &DirectoryId, quiet: bool) -> Self {
+    fn new(quiet: bool) -> Self {
         let multi = MultiProgress::with_draw_target(if quiet {
             ProgressDrawTarget::hidden()
         } else {
@@ -256,7 +255,7 @@ impl CliProgress {
         let overall_pb = multi.add(ProgressBar::no_length());
         overall_pb.set_style(
             ProgressStyle::with_template(
-                "{prefix:<9.cyan.bold} [{bar:40.cyan/blue}] {pos}/{len} files",
+                "{prefix:<9.cyan.bold} [{bar:40.cyan/blue}] ({bytes}/{total_bytes}) {bytes_per_sec} {percent}%",
             )
             .unwrap()
             .progress_chars("=> "),
@@ -268,7 +267,6 @@ impl CliProgress {
             total_bytes: 0,
             overall_pb,
             next_file_index: Arc::new(AtomicUsize::new(1)),
-            dirid: dirid.to_string(),
             quiet,
         }
     }
@@ -283,7 +281,7 @@ impl Progress for CliProgress {
     fn set_length(&mut self, total_files: usize, total_bytes: u64) {
         self.total_files = total_files;
         self.total_bytes = total_bytes;
-        self.overall_pb.set_length(total_files as u64);
+        self.overall_pb.set_length(total_bytes);
         self.overall_pb.set_position(0);
         self.overall_pb.set_prefix("Moving");
     }
@@ -294,9 +292,9 @@ impl Progress for CliProgress {
             next_file_index: self.next_file_index.clone(),
             total_files: self.total_files,
             bytes,
-            dirid: self.dirid.clone(),
             path: path.display().to_string(),
             multi: self.multi.clone(),
+            overall_pb: self.overall_pb.clone(),
             quiet: self.quiet,
         })
     }
@@ -307,9 +305,9 @@ struct CliFileProgress {
     next_file_index: Arc<AtomicUsize>,
     total_files: usize,
     bytes: u64,
-    dirid: String,
     path: String,
     multi: MultiProgress,
+    overall_pb: ProgressBar,
     quiet: bool,
 }
 
@@ -319,10 +317,10 @@ impl CliFileProgress {
             let file_index = self.next_file_index.fetch_add(1, Ordering::Relaxed);
             let pb = self.multi.insert_from_back(1, ProgressBar::new(self.bytes));
             let tag = format!("[{}/{}]", file_index, self.total_files);
-            let path = self.path.clone();
+            pb.set_message(self.path.clone());
             pb.set_style(
                 ProgressStyle::with_template(
-                    "{tag} {prefix} {path} [{bar:40.cyan/blue}] {pos}/{len} bytes",
+                    "{prefix:<9.cyan.bold} {tag} {wide_msg} ({bytes}/{total_bytes}) {percent}%",
                 )
                 .unwrap()
                 .progress_chars("=> ")
@@ -330,12 +328,6 @@ impl CliFileProgress {
                     "tag",
                     move |_state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
                         let _ = w.write_str(&tag);
-                    },
-                )
-                .with_key(
-                    "path",
-                    move |_state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
-                        let _ = w.write_str(&path);
                     },
                 ),
             );
@@ -373,11 +365,10 @@ impl AlgoFileProgress for CliFileProgress {
             if !self.quiet {
                 self.multi.suspend(|| {
                     println!(
-                        "[{}/{}] {:<9} {}/{}",
+                        "{:<9} [{}/{}] {}",
+                        style("Moved").for_stdout().green().bold(),
                         index,
                         self.total_files,
-                        style("Moved").for_stdout().green().bold(),
-                        self.dirid,
                         self.path
                     );
                 });
@@ -396,10 +387,9 @@ impl AlgoFileProgress for CliFileProgress {
         };
         self.multi.suspend(|| {
             eprintln!(
-                "{}{:<9} {}/{}: {}",
-                tag,
+                "{:<9} {}{}: {}",
                 style("ERROR").for_stderr().red().bold(),
-                self.dirid,
+                tag,
                 self.path,
                 err,
             );
