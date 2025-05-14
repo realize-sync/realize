@@ -12,9 +12,9 @@ use realize::model::service::Options;
 use realize::transport::security;
 use realize::transport::security::PeerVerifier;
 use realize::transport::tcp;
-use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::SubjectPublicKeyInfoDer;
+use rustls::pki_types::pem::PemObject as _;
 use tokio::fs;
 use tokio::io::AsyncBufReadExt as _;
 
@@ -36,7 +36,7 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
         r#"dirs:
   - testdir: {}
 peers:
-  - test: |
+  - testpeer: |
       {}
 "#,
         testdir_server.display(),
@@ -54,25 +54,33 @@ peers:
             .arg(&privkey_file)
             .arg("--config")
             .arg(config_file.path())
+            .env("RUST_LOG", "realize::transport::tcp=debug")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit());
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
     })
     .wrap(ProcessGroup::leader())
     .spawn()?;
 
     // The first line that's output to stdout must be Listening on
     // <address>:<port>. Anything else is an error.
-    let stdout = daemon.stdout().as_mut().unwrap();
-    let reader = tokio::io::BufReader::new(stdout);
-    let mut lines = reader.lines();
-    let line = lines.next_line().await?.unwrap();
-    assert_eq!(
-        true,
-        predicate::str::starts_with("Listening on").eval(&line),
-        "Unexpected output: {line}"
-    );
-    let portstr = line.split(":").last().expect("Unexpected output: {line}");
+    let portstr = {
+        let stdout = daemon.stdout().as_mut().unwrap();
+        let reader = tokio::io::BufReader::new(stdout);
+        let mut lines = reader.lines();
+        let line = lines.next_line().await?.unwrap();
+        assert_eq!(
+            true,
+            predicate::str::starts_with("Listening on").eval(&line),
+            "Unexpected output: {line}"
+        );
+
+        line.split(":")
+            .last()
+            .expect("Unexpected output: {line}")
+            .to_string()
+    };
 
     // Connect to the port the daemon listens to.
     let crypto = Arc::new(security::default_provider());
@@ -99,6 +107,28 @@ peers:
     assert_unordered::assert_eq_unordered!(
         files.into_iter().map(|f| f.path).collect(),
         vec![PathBuf::from("foo.txt")]
+    );
+
+    // Kill to make sure stderr ends
+    daemon.start_kill()?;
+
+    // Collect all of stderr
+    let stderr = {
+        let stderr = daemon.stderr().as_mut().unwrap();
+        let reader = tokio::io::BufReader::new(stderr);
+        let mut lines = reader.lines();
+        let mut all_lines = vec![];
+        while let Ok(Some(line)) = lines.next_line().await {
+            all_lines.push(line);
+        }
+
+        all_lines.join("\n")
+    };
+
+    // Make sure stderr contains the expected log message.
+    assert!(
+        stderr.contains("Accepted peer testpeer from "),
+        "stderr: {stderr}"
     );
 
     Ok(())

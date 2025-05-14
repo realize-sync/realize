@@ -1,12 +1,14 @@
 #[cfg(test)]
 pub mod testing;
 
+use base64::Engine as _;
 use rustls::client::danger::ServerCertVerifier;
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::sign::{CertifiedKey, SigningKey};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, Error, ServerConfig};
-use std::collections::BTreeSet;
+use sha2::Digest as _;
+use std::collections::BTreeMap;
 
 use std::sync::Arc;
 use tokio_rustls::rustls::{self, server::danger::ClientCertVerifier};
@@ -45,7 +47,7 @@ pub fn make_tls_connector(
 /// Add public keys to the verifier before using it.
 #[derive(Debug)]
 pub struct PeerVerifier {
-    allowed_peers: BTreeSet<Vec<u8>>,
+    allowed_peers: BTreeMap<Vec<u8>, String>,
     algos: WebPkiSupportedAlgorithms,
 }
 
@@ -53,7 +55,7 @@ impl PeerVerifier {
     /// Create a new, empty verifier.
     pub fn new(crypto: &Arc<CryptoProvider>) -> Self {
         Self {
-            allowed_peers: BTreeSet::new(),
+            allowed_peers: BTreeMap::new(),
             algos: crypto.signature_verification_algorithms,
         }
     }
@@ -64,11 +66,42 @@ impl PeerVerifier {
     ///
     /// The SPKI must be the public part of a ED25519 key.
     pub fn add_peer(&mut self, spki: rustls::pki_types::SubjectPublicKeyInfoDer) {
-        self.allowed_peers.insert(spki.to_vec());
+        let peer_id = hash_spki(&spki);
+        self.add_peer_with_id(spki, &peer_id);
     }
 
+    /// Accept connections to the peer with the given public key and ID.
+    ///
+    /// The ID meant to identify the peer in logs.
+    ///
+    /// The SPKI must be the public part of a ED25519 key.
+    pub fn add_peer_with_id(
+        &mut self,
+        spki: rustls::pki_types::SubjectPublicKeyInfoDer,
+        peer_id: &str,
+    ) {
+        self.allowed_peers
+            .insert(spki.to_vec(), peer_id.to_string());
+    }
+
+    /// Check whether the given spki is authorized.
     fn accept_peer(&self, spki: &rustls::pki_types::SubjectPublicKeyInfoDer) -> bool {
-        self.allowed_peers.contains(spki.as_ref())
+        self.allowed_peers.get(spki.as_ref()).is_some()
+    }
+
+    /// Return the ID of the stream's peer.
+    pub fn connection_peer_id<T>(
+        &self,
+        stream: &tokio_rustls::server::TlsStream<T>,
+    ) -> Option<&str> {
+        let (_, conn) = stream.get_ref();
+        if let Some(cert) = conn.peer_certificates() {
+            if cert.len() > 0 {
+                return self.allowed_peers.get(cert[0].as_ref()).map(String::as_ref);
+            }
+        }
+
+        None
     }
 
     fn verify_peer(
@@ -82,7 +115,6 @@ impl PeerVerifier {
                 rustls::CertificateError::ApplicationVerificationFailure,
             ));
         }
-        // TODO: store the peer id whose key this is and use it for logging.
 
         Ok(())
     }
@@ -206,6 +238,10 @@ impl ServerCertVerifier for PeerVerifier {
     }
 }
 
+fn hash_spki(spki: &rustls::pki_types::SubjectPublicKeyInfoDer) -> String {
+    base64::prelude::BASE64_STANDARD.encode(sha2::Sha256::digest(spki))
+}
+
 #[derive(Debug)]
 struct RawPublicKeyResolver {
     certified_key: Arc<CertifiedKey>,
@@ -261,8 +297,8 @@ mod tests {
     use super::*;
     use crate::transport::security::testing;
     use crate::utils::async_utils::AbortOnDrop;
-    use rustls::pki_types::pem::PemObject as _;
     use rustls::pki_types::PrivateKeyDer;
+    use rustls::pki_types::pem::PemObject as _;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};

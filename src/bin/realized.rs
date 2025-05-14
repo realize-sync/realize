@@ -85,9 +85,9 @@ async fn main() {
     let crypto = Arc::new(security::default_provider());
     let mut verifier = PeerVerifier::new(&crypto);
     for peer in &config.peers {
-        for pubkey_pem in peer.map.values() {
+        for (peer_id, pubkey_pem) in &peer.map {
             match SubjectPublicKeyInfoDer::from_pem_slice(pubkey_pem.as_bytes()) {
-                Ok(spki) => verifier.add_peer(spki),
+                Ok(spki) => verifier.add_peer_with_id(spki, peer_id),
                 Err(e) => {
                     eprintln!("Failed to parse peer public key: {e}");
                     std::process::exit(1);

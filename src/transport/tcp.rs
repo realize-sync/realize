@@ -74,6 +74,7 @@ struct RunningServer {
     acceptor: TlsAcceptor,
     listener: TcpListener,
     server: RealizeServer,
+    verifier: Arc<PeerVerifier>,
 }
 
 impl RunningServer {
@@ -87,7 +88,7 @@ impl RunningServer {
     where
         T: tokio::net::ToSocketAddrs,
     {
-        let acceptor = security::make_tls_acceptor(verifier, privkey)?;
+        let acceptor = security::make_tls_acceptor(Arc::clone(&verifier), privkey)?;
         let listener = TcpListener::bind(&addr).await?;
 
         log::info!(
@@ -102,6 +103,7 @@ impl RunningServer {
             acceptor,
             listener,
             server,
+            verifier,
         })
     }
 
@@ -115,7 +117,16 @@ impl RunningServer {
     /// Run the server; listen to client connections.
     fn spawn(self) -> JoinHandle<()> {
         let accept = async move |stream: TcpStream| -> anyhow::Result<()> {
+            let peer_addr = stream.peer_addr()?;
             let tls_stream = self.acceptor.accept(stream).await?;
+
+            log::info!(
+                "Accepted peer {} from {}",
+                self.verifier
+                    .connection_peer_id(&tls_stream)
+                    .expect("Peer MUST be known"), // Guards against bugs in the auth code; worth dying
+                peer_addr
+            );
             let framed = LengthDelimitedCodec::builder().new_framed(tls_stream);
 
             tokio::spawn(
