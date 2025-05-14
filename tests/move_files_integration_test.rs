@@ -55,11 +55,11 @@ async fn test_local_to_remote() -> anyhow::Result<()> {
     let result = test.await;
     server_handle.abort();
     result??;
-    util::assert_dir_contents(
-        &dst_dir,
-        vec![PathBuf::from("foo.txt"), PathBuf::from("bar.txt")],
-    )?;
-    util::assert_dir_empty(&src_dir)?;
+    assert_eq_unordered!(
+        util::dir_content(&dst_dir)?,
+        vec![PathBuf::from("foo.txt"), PathBuf::from("bar.txt")]
+    );
+    assert_eq_unordered!(util::dir_content(&src_dir)?, vec![]);
     Ok(())
 }
 
@@ -107,11 +107,11 @@ async fn test_remote_to_local() -> anyhow::Result<()> {
     let result = test.await;
     server_handle.abort();
     result??;
-    util::assert_dir_contents(
-        &dst_dir,
-        vec![PathBuf::from("foo.txt"), PathBuf::from("bar.txt")],
-    )?;
-    util::assert_dir_empty(&src_dir)?;
+    assert_eq_unordered!(
+        util::dir_content(&dst_dir)?,
+        vec![PathBuf::from("foo.txt"), PathBuf::from("bar.txt")]
+    );
+    assert_eq_unordered!(util::dir_content(&src_dir)?, vec![]);
     Ok(())
 }
 
@@ -135,8 +135,8 @@ async fn test_local_to_local() -> anyhow::Result<()> {
         .status()
         .await?;
     assert!(status.success());
-    util::assert_dir_contents(&dst_dir, vec![PathBuf::from("baz.txt")])?;
-    util::assert_dir_empty(&src_dir)?;
+    assert_eq_unordered!(util::dir_content(&dst_dir)?, vec![PathBuf::from("baz.txt")]);
+    assert_eq_unordered!(util::dir_content(&src_dir)?, vec![]);
     Ok(())
 }
 
@@ -190,8 +190,8 @@ async fn test_remote_to_remote() -> anyhow::Result<()> {
     server_handle_src.abort();
     server_handle_dst.abort();
     result??;
-    util::assert_dir_contents(&dst_dir, vec![PathBuf::from("qux.txt")])?;
-    util::assert_dir_empty(&src_dir)?;
+    assert_eq_unordered!(util::dir_content(&dst_dir)?, vec![PathBuf::from("qux.txt")]);
+    assert_eq_unordered!(util::dir_content(&src_dir)?, vec![]);
     Ok(())
 }
 
@@ -232,7 +232,10 @@ async fn test_local_to_local_partial_failure() -> anyhow::Result<()> {
         stderr.contains("ERROR: 1 file(s) failed, and 1 files(s) moved"),
         "stderr: {stderr}"
     );
-    util::assert_dir_contents(&dst_dir, vec![PathBuf::from("good.txt")])?;
+    assert_eq_unordered!(
+        util::dir_content(&dst_dir)?,
+        vec![PathBuf::from("good.txt")]
+    );
     Ok(())
 }
 
@@ -258,11 +261,11 @@ async fn test_local_to_local_success_output() -> anyhow::Result<()> {
         stdout.contains("SUCCESS 2 file(s) moved"),
         "stdout: {stdout}"
     );
-    util::assert_dir_contents(
-        &dst_dir,
-        vec![PathBuf::from("foo.txt"), PathBuf::from("bar.txt")],
-    )?;
-    util::assert_dir_empty(&src_dir)?;
+    assert_eq_unordered!(
+        util::dir_content(&dst_dir)?,
+        vec![PathBuf::from("foo.txt"), PathBuf::from("bar.txt")]
+    );
+    assert_eq_unordered!(util::dir_content(&src_dir)?, vec![]);
     Ok(())
 }
 
@@ -296,11 +299,11 @@ async fn test_local_to_local_progress_output() -> anyhow::Result<()> {
         stdout.contains("SUCCESS 2 file(s) moved"),
         "stdout: {stdout}"
     );
-    util::assert_dir_contents(
-        &dst_dir,
-        vec![PathBuf::from("foo.txt"), PathBuf::from("bar.txt")],
-    )?;
-    util::assert_dir_empty(&src_dir)?;
+    assert_eq_unordered!(
+        util::dir_content(&dst_dir)?,
+        vec![PathBuf::from("foo.txt"), PathBuf::from("bar.txt")]
+    );
+    assert_eq_unordered!(util::dir_content(&src_dir)?, vec![]);
     Ok(())
 }
 
@@ -332,11 +335,11 @@ async fn test_local_to_local_quiet_success() -> anyhow::Result<()> {
         stderr.trim().is_empty(),
         "stderr should be empty in quiet mode on success, got: {stderr}"
     );
-    util::assert_dir_contents(
-        &dst_dir,
-        vec![PathBuf::from("foo.txt"), PathBuf::from("bar.txt")],
-    )?;
-    util::assert_dir_empty(&src_dir)?;
+    assert_eq_unordered!(
+        util::dir_content(&dst_dir)?,
+        vec![PathBuf::from("foo.txt"), PathBuf::from("bar.txt")]
+    );
+    assert_eq_unordered!(util::dir_content(&src_dir)?, vec![]);
     Ok(())
 }
 
@@ -379,7 +382,10 @@ async fn test_local_to_local_quiet_failure() -> anyhow::Result<()> {
         stderr.contains("ERROR"),
         "stderr should contain error in quiet mode, got: {stderr}"
     );
-    util::assert_dir_contents(&dst_dir, vec![PathBuf::from("good.txt")])?;
+    assert_eq_unordered!(
+        util::dir_content(&dst_dir)?,
+        vec![PathBuf::from("good.txt")]
+    );
     Ok(())
 }
 
@@ -417,29 +423,12 @@ mod util {
         Ok(())
     }
 
-    pub fn assert_dir_contents(
-        dir: &assert_fs::fixture::ChildPath,
-        expected: Vec<PathBuf>,
-    ) -> anyhow::Result<()> {
-        assert_eq_unordered!(
-            dir.read_dir()?
-                .flatten()
-                .flat_map(|d| pathdiff::diff_paths(d.path(), dir.path()))
-                .collect::<Vec<_>>(),
-            expected
-        );
-        Ok(())
-    }
-
-    pub fn assert_dir_empty(dir: &assert_fs::fixture::ChildPath) -> anyhow::Result<()> {
-        assert_eq_unordered!(
-            dir.read_dir()?
-                .flatten()
-                .flat_map(|d| pathdiff::diff_paths(d.path(), dir.path()))
-                .collect::<Vec<_>>(),
-            Vec::<PathBuf>::new()
-        );
-        Ok(())
+    pub fn dir_content(dir: &assert_fs::fixture::ChildPath) -> anyhow::Result<Vec<PathBuf>> {
+        Ok(dir
+            .read_dir()?
+            .flatten()
+            .flat_map(|d| pathdiff::diff_paths(d.path(), dir.path()))
+            .collect::<Vec<_>>())
     }
 
     pub fn setup_crypto_and_verifier() -> (Arc<rustls::crypto::CryptoProvider>, Arc<PeerVerifier>) {
