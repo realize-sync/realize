@@ -2,6 +2,7 @@
 //! Implements the server as described in spec/design.md and spec/future.md
 
 use clap::Parser;
+use prometheus::{Encoder, IntCounter, TextEncoder, register_int_counter};
 use realize::server::{Directory, RealizeServer};
 use realize::transport::security::{self, PeerVerifier};
 use realize::transport::tcp;
@@ -51,6 +52,11 @@ struct DirEntry {
 struct PeerEntry {
     #[serde(flatten)]
     map: std::collections::HashMap<String, String>,
+}
+
+lazy_static::lazy_static! {
+    static ref METRIC_UP: IntCounter =
+        register_int_counter!("up", "Server is up").unwrap();
 }
 
 #[tokio::main]
@@ -128,6 +134,8 @@ async fn main() {
         }
         Ok((addr, handle)) => {
             println!("Listening on {addr}");
+            METRIC_UP.inc();
+
             if let Err(err) = handle.join().await {
                 eprintln!("Server stopped: {err}");
                 std::process::exit(1);
@@ -135,21 +143,32 @@ async fn main() {
             std::process::exit(0);
         }
     }
+}
 
-    fn export_metrics(metrics_addr: Option<String>) {
-        if let Some(metrics_addr) = &metrics_addr {
-            let metrics_addr = metrics_addr.to_string();
-            thread::spawn(move || {
-                log::info!("[metrics] server listening on {}", metrics_addr);
-                rouille::start_server(metrics_addr, move |request| {
-                    if request.url() != "/metrics" {
-                        return rouille::Response::empty_404();
-                    }
-
-                    // TODO: build metrics using prometheus
-                    rouille::Response::text("{}")
-                });
+fn export_metrics(metrics_addr: Option<String>) {
+    if let Some(metrics_addr) = &metrics_addr {
+        let metrics_addr = metrics_addr.to_string();
+        thread::spawn(move || {
+            log::info!("[metrics] server listening on {}", metrics_addr);
+            rouille::start_server(metrics_addr, move |request| {
+                if request.url() == "/metrics" {
+                    handle_metrics_request().unwrap_or_else(|_| {
+                        rouille::Response::text("Internal error").with_status_code(500)
+                    })
+                } else {
+                    rouille::Response::empty_404()
+                }
             });
-        }
+        });
     }
+}
+
+fn handle_metrics_request() -> anyhow::Result<rouille::Response> {
+    let metrics = prometheus::gather();
+    let mut buffer = vec![];
+    let encoder = TextEncoder::new();
+    let content_type = encoder.format_type().to_string();
+    encoder.encode(&metrics, &mut buffer)?;
+
+    Ok(rouille::Response::from_data(content_type, buffer))
 }

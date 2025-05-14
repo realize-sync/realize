@@ -28,6 +28,9 @@ tokio-rustls = "0.26"
 tracing = "0.1"
 walkdir = "2.5"
 rouille = "3.6"
+prometheus = "0.14"
+once_cell = "1.19"
+lazy_static = "1.5.0"
 # keep sorted
 
 [dev-dependencies]

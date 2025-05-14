@@ -188,8 +188,15 @@ async fn metrics_endpoint_works() -> anyhow::Result<()> {
     let metrics_url = format!("http://{}/metrics", metrics_addr);
     let resp = client.get(&metrics_url).send().await?;
     assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["Content-Type"], "text/plain; version=0.0.4");
     let body = resp.text().await?;
-    assert_eq!(body, "{}");
+    assert!(
+        body.contains("up 1"),
+        "metrics output missing expected Prometheus format: {}",
+        body
+    );
+
+    // Random paths should not return anything
     let notfound = client
         .get(format!("http://{}/notfound", metrics_addr))
         .send()
