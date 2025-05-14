@@ -3,35 +3,6 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
-## Implement --max-duration in the realize command {#max-duration}
-
-The command `realize` should accept a --max-duration option. That
-option takes should have the type humantime::Duration, which is a
-wrapper for std::time::Duration that accept human-readable durations
-such as "5m" for 5 minutes or "3s" for 3 seconds. a human-readable
-duration.
-
-When given a nonzero max duration, `realize` should call tokio::spawn
-early on, before connecting to any remote server, to use
-tokio::time::Sleep and, when back from sleep, print out an error to
-stderr and call process::exit to end the application with status code
-11.
-
-Task list
-
-1. Document new command and status code in docs/design.md in the
-   section "The `realize` command".
-
-2. Implement the code
-   - Run "cargo check" to make sure it compiles
-
-3. Add a test to tests/move_files_integration_test.rs to cover the
-   case. Use a very short duration. Direct `realize` to a fake server
-   that just hangs. To set up that server, call TcpListener::bind but
-   never call accept on that listener afterwards.
-
-   `realize` should end with the correct error message and status.
-
 ## Add monitoring with prometheus to realized {#daemonmetrics}
 
 Extend realized with server and usage metrics. See also the metrics

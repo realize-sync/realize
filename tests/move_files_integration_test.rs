@@ -7,7 +7,9 @@ use realize::transport::security::{self, PeerVerifier};
 use realize::transport::tcp;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
+use std::net::TcpListener;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 
 #[tokio::test]
@@ -385,6 +387,44 @@ async fn test_local_to_local_quiet_failure() -> anyhow::Result<()> {
     assert_eq_unordered!(
         util::dir_content(&dst_dir)?,
         vec![PathBuf::from("good.txt")]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_max_duration_timeout() -> anyhow::Result<()> {
+    // Bind a TCP port but never accept connections
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+
+    // Run realize with a very short max-duration
+    let output = tokio::process::Command::new(cargo_bin!("realize"))
+        .arg("--quiet")
+        .arg("--src-path")
+        .arg("/tmp") // any existing dir, won't be used
+        .arg("--dst-addr")
+        .arg(addr.to_string())
+        .arg("--privkey")
+        .arg("resources/test/a.key")
+        .arg("--peers")
+        .arg("resources/test/peers.pem")
+        .arg("--directory-id")
+        .arg("testdir")
+        .arg("--max-duration")
+        .arg("100ms")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let output = output.wait_with_output().await?;
+    assert_eq!(
+        output.status.code(),
+        Some(11),
+        "Should exit with code 11 on timeout"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Maximum duration (100ms) exceeded. Giving up."),
+        "stderr: {stderr}"
     );
     Ok(())
 }

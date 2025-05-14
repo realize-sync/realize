@@ -1,11 +1,13 @@
 use clap::Parser;
 use console::style;
+use humantime;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use realize::algo::{FileProgress as AlgoFileProgress, MoveFileError, Progress};
 use realize::model::service::DirectoryId;
 use realize::server::RealizeServer;
 use realize::transport::security::{self, PeerVerifier};
 use realize::transport::tcp;
+use realize::utils::async_utils::AbortOnDrop;
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use std::path::{Path, PathBuf};
@@ -60,6 +62,10 @@ struct Cli {
     /// Suppress all output except errors
     #[arg(long)]
     quiet: bool,
+
+    /// Maximum total duration for the operation (e.g. "5m", "30s"). If exceeded, the process exits with code 11.
+    #[arg(long)]
+    max_duration: Option<humantime::Duration>,
 }
 
 #[tokio::main]
@@ -68,6 +74,20 @@ async fn main() {
     env_logger::init();
 
     let cli = Cli::parse();
+
+    // Start timeout task if --max-duration is set and nonzero
+    let _timeout_guard = if let Some(duration) = cli.max_duration {
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(duration.into()).await;
+            print_error(&format!(
+                "Maximum duration ({duration}) exceeded. Giving up."
+            ));
+            process::exit(11);
+        });
+        Some(AbortOnDrop::new(handle))
+    } else {
+        None
+    };
 
     // Determine mode
     let src_is_remote = cli.src_addr.is_some();
@@ -195,6 +215,7 @@ async fn main() {
     let mut progress = CliProgress::new(cli.quiet);
     let result = realize::algo::move_files(&src_client, &dst_client, dir_id, &mut progress).await;
     progress.finish_and_clear();
+
     match result {
         Ok((success, error)) => {
             if error == 0 {

@@ -415,6 +415,7 @@ realize --src-path <local_path> --dst-path <local_path>
 - `--throttle <rate>`: Throttle upload and download (e.g. 1M)
 - `--throttle-up <rate>`: Throttle upload (e.g. 1M)
 - `--throttle-down <rate>`: Throttle download (e.g. 512k)
+- `--max-duration <duration>`: Maximum total duration for the operation. Accepts human-readable durations (e.g. "5m", "30s"). Parsed as `humantime::Duration`. If the operation does not complete within this time, an error is printed to stderr and the process exits with status code 11.
 
 #### Inputs
 
@@ -447,6 +448,7 @@ realize --src-path /store/a/dir --dst-path /store/b/dir
 - **Exit Codes**:
   - `0`: Success (all files synced as intended)
   - `1`: Error (e.g., connection failure, sync error, invalid arguments)
+  - `11`: Timed out (--max-duration exceeded)
 
 #### Behavior
 
@@ -455,7 +457,7 @@ realize --src-path /store/a/dir --dst-path /store/b/dir
 - Starts an in-process RealizeService instance for local directories.
 - Invokes the move/sync algorithm to synchronize files between the source and destination.
 - Reports progress to stdout, including per-file and overall sync status.
-- On success, exits with code 0. On error, prints a message to stderr and exits with code 1.
+- On success, exits with code 0. On error, prints a message to stderr and exits with code 1. If the operation times out due to --max-duration, prints an error message to stderr and exits with code 11.
 - Designed to be restartable and robust to interruptions; re-running the command resumes any incomplete sync.
 
 ### Errors and retries
@@ -463,7 +465,7 @@ realize --src-path /store/a/dir --dst-path /store/b/dir
 If communication with the remote host is lost, this command retries
 with exponential backoff (5s, 15s, 30s, 1m, 2m, 5m, then always 5m)
 until communication can be re-established or duration set with
---max-duration is reached.
+--max-duration is reached. If --max-duration is exceeded, the command prints an error message to stderr and exits with status code 11.
 
 Retries only apply to network errors. They don't apply to the
 following errors:

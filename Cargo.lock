@@ -1222,6 +1222,7 @@ dependencies = [
  "env_logger",
  "fast_rsync",
  "futures",
+ "humantime",
  "indicatif",
  "log",
  "pathdiff",

@@ -25,6 +25,7 @@ fast_rsync = "0.2"
 tracing = "0.1"
 indicatif = "0.17"
 console = "0.15"
+humantime = "2.1"
 
 [dev-dependencies]
 assert_fs = "1.1"
