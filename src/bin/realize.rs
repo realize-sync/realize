@@ -16,8 +16,6 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-#[macro_use]
-extern crate lazy_static;
 
 /// Realize command-line tool
 #[derive(Parser, Debug)]
@@ -74,9 +72,21 @@ struct Cli {
     /// Address to export prometheus metrics (host:port, optional)
     #[arg(long)]
     metrics_addr: Option<String>,
+
+    /// Address of prometheus pushgateway (optional)
+    #[arg(long)]
+    metrics_pushgateway: Option<String>,
+
+    /// Job name for prometheus pushgateway (default: realize)
+    #[arg(long, default_value = "realize")]
+    metrics_job: String,
+
+    /// Instance label for prometheus pushgateway (optional)
+    #[arg(long)]
+    metrics_instance: Option<String>,
 }
 
-lazy_static! {
+lazy_static::lazy_static! {
     static ref METRIC_UP: IntCounter =
         register_int_counter!("realize_cmd_up", "Command is up").unwrap();
 }
@@ -236,6 +246,7 @@ async fn main() {
     let result = realize::algo::move_files(&src_client, &dst_client, dir_id, &mut progress).await;
     progress.finish_and_clear();
 
+    let mut status;
     match result {
         Ok((success, error)) => {
             if error == 0 {
@@ -246,25 +257,42 @@ async fn main() {
                         success
                     );
                 }
-                process::exit(0);
+                status = 0;
             } else {
                 print_error(&format!(
                     "{} file(s) failed, and {} files(s) moved",
                     error, success
                 ));
-                process::exit(1);
+                status = 1;
             }
         }
         Err(err) => {
             print_error(&format!("{err}"));
-            process::exit(1);
+            status = 1;
         }
     }
+
+    if let Some(pushgw) = &cli.metrics_pushgateway {
+        if let Err(err) =
+            metrics::push_metrics(pushgw, &cli.metrics_job, cli.metrics_instance.as_deref()).await
+        {
+            print_warning(&format!("Failed to push metrics to {pushgw}: {err}"));
+            if status == 0 {
+                status = 12;
+            }
+        }
+    }
+    process::exit(status);
 }
 
 /// Print an error message to stderr, with standard format.
 fn print_error(msg: &str) {
     eprintln!("{}: {}", style("ERROR").for_stderr().red().bold(), msg);
+}
+
+/// Print a warning message to stderr, with standard format.
+fn print_warning(msg: &str) {
+    eprintln!("{}: {}", style("WARNING").for_stderr().red(), msg);
 }
 
 /// Print an error message to stderr, with standard format.

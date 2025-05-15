@@ -449,6 +449,7 @@ realize --src-path /store/a/dir --dst-path /store/b/dir
   - `0`: Success (all files synced as intended)
   - `1`: Error (e.g., connection failure, sync error, invalid arguments)
   - `11`: Timed out (--max-duration exceeded)
+  - `12`: Succeeded, but failed to push metrics
   - `20`: Interrupted (Ctrl-C)
 
 #### Behavior
