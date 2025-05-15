@@ -157,20 +157,20 @@ async fn metrics_endpoint_works() -> anyhow::Result<()> {
             .env("RUST_LOG", "realize::metrics=debug")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true); // TODO: is this enough? Is the TokioCommandWrap actually necessary?
     })
     .wrap(ProcessGroup::leader())
     .spawn()?;
 
     // Wait for metrics endpoint to be up by reading log output.
-    let stderr = daemon.stderr().as_mut().unwrap();
+    let stderr = daemon.stdout().as_mut().unwrap();
     let mut err_reader = tokio::io::BufReader::new(stderr).lines();
     let mut found = false;
     let mut captured = vec![];
     for _ in 0..100 {
         if let Some(line) = err_reader.next_line().await? {
-            if line.contains("[metrics] server listening on") {
+            if line.contains("Listening on") {
                 found = true;
                 break;
             }

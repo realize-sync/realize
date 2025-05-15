@@ -1,31 +1,44 @@
+use hyper::server::conn::http1;
+use hyper_util::rt::TokioIo;
 use prometheus::Encoder;
+use tokio::net::TcpListener;
 
 pub async fn export_metrics(metrics_addr: &str) -> anyhow::Result<()> {
-    let metrics_addr = metrics_addr.to_string();
-    std::thread::spawn(move || {
-        log::info!("[metrics] server listening on {}", metrics_addr);
-        rouille::start_server(metrics_addr, move |request| {
-            if request.url() == "/metrics" {
-                handle_metrics_request().unwrap_or_else(|_| {
-                    rouille::Response::text("Internal error").with_status_code(500)
-                })
-            } else {
-                rouille::Response::empty_404()
+    let listener = TcpListener::bind(metrics_addr).await?;
+    log::info!("[metrics] server listening on {}", listener.local_addr()?);
+    tokio::spawn(async move {
+        loop {
+            if let Ok((stream, _)) = listener.accept().await {
+                let io = TokioIo::new(stream);
+                let _ = http1::Builder::new()
+                    .serve_connection(io, hyper::service::service_fn(serve_metrics))
+                    .await;
             }
-        });
+        }
     });
 
     Ok(())
 }
 
-fn handle_metrics_request() -> anyhow::Result<rouille::Response> {
-    let metrics = prometheus::gather();
-    let mut buffer = vec![];
-    let encoder = prometheus::TextEncoder::new();
-    let content_type = encoder.format_type().to_string();
-    encoder.encode(&metrics, &mut buffer)?;
+async fn serve_metrics(
+    req: hyper::Request<hyper::body::Incoming>,
+) -> anyhow::Result<hyper::Response<String>> {
+    if req.uri().path() != "/metrics" {
+        return Ok(hyper::Response::builder()
+            .status(hyper::StatusCode::NOT_FOUND)
+            .body("Not found".to_string())?);
+    }
 
-    Ok(rouille::Response::from_data(content_type, buffer))
+    let metrics = prometheus::gather();
+    let encoder = prometheus::TextEncoder::new();
+
+    Ok(hyper::Response::builder()
+        .status(hyper::StatusCode::OK)
+        .header(
+            hyper::header::CONTENT_TYPE,
+            encoder.format_type().to_string(),
+        )
+        .body(encoder.encode_to_string(&metrics)?)?)
 }
 
 pub async fn push_metrics(

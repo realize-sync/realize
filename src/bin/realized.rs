@@ -113,8 +113,8 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("Server failed to start on {}", cli.address))?;
 
-    println!("Listening on {addr}");
     METRIC_UP.inc();
+    println!("Listening on {addr}");
 
     handle.join().await.context("Server stopped")?;
 
