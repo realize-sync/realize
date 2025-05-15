@@ -3,20 +3,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use assert_cmd::cargo::cargo_bin;
-use assert_fs::TempDir;
 use assert_fs::prelude::*;
+use assert_fs::TempDir;
 use predicates::prelude::*;
-use process_wrap::tokio::ProcessGroup;
-use process_wrap::tokio::TokioCommandWrap;
 use realize::model::service::DirectoryId;
 use realize::model::service::Options;
 use realize::transport::security;
 use realize::transport::security::PeerVerifier;
 use realize::transport::tcp;
 use reqwest::Client;
+use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::SubjectPublicKeyInfoDer;
-use rustls::pki_types::pem::PemObject as _;
 use tokio::fs;
 use tokio::io::AsyncBufReadExt as _;
 
@@ -42,40 +40,23 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
 
     // Run process in the background and in a way that allows reading
     // its output, so we know what port to connect to.
-    let mut daemon = TokioCommandWrap::with_new(cargo_bin!("realized"), |cmd| {
-        cmd.arg("--address")
-            .arg("127.0.0.1:0")
-            .arg("--privkey")
-            .arg(&privkey_file)
-            .arg("--config")
-            .arg(config_file.path())
-            .env("RUST_LOG", "realize::transport::tcp=debug")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-    })
-    .wrap(ProcessGroup::leader())
-    .spawn()?;
+    let mut daemon = tokio::process::Command::new(cargo_bin!("realized"))
+        .arg("--address")
+        .arg("127.0.0.1:0")
+        .arg("--privkey")
+        .arg(&privkey_file)
+        .arg("--config")
+        .arg(config_file.path())
+        .env("RUST_LOG", "realize::transport::tcp=debug")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
 
     // The first line that's output to stdout must be Listening on
     // <address>:<port>. Anything else is an error.
-    let portstr = {
-        let stdout = daemon.stdout().as_mut().unwrap();
-        let reader = tokio::io::BufReader::new(stdout);
-        let mut lines = reader.lines();
-        let line = lines.next_line().await?.unwrap();
-        assert_eq!(
-            true,
-            predicate::str::starts_with("Listening on").eval(&line),
-            "Unexpected output: {line}"
-        );
-
-        line.split(":")
-            .last()
-            .expect("Unexpected output: {line}")
-            .to_string()
-    };
+    let portstr = wait_for_listening_port(daemon.stdout.as_mut().unwrap()).await?;
 
     // Connect to the port the daemon listens to.
     let crypto = Arc::new(security::default_provider());
@@ -107,20 +88,8 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
     // Kill to make sure stderr ends
     daemon.start_kill()?;
 
-    // Collect all of stderr
-    let stderr = {
-        let stderr = daemon.stderr().as_mut().unwrap();
-        let reader = tokio::io::BufReader::new(stderr);
-        let mut lines = reader.lines();
-        let mut all_lines = vec![];
-        while let Ok(Some(line)) = lines.next_line().await {
-            all_lines.push(line);
-        }
-
-        all_lines.join("\n")
-    };
-
     // Make sure stderr contains the expected log message.
+    let stderr = collect_stderr(daemon.stderr.as_mut().unwrap()).await?;
     assert!(
         stderr.contains("Accepted peer testpeer from "),
         "stderr: {stderr}"
@@ -145,43 +114,24 @@ async fn metrics_endpoint_works() -> anyhow::Result<()> {
 
     let metrics_port = portpicker::pick_unused_port().expect("No ports free");
     let metrics_addr = format!("127.0.0.1:{}", metrics_port);
-    let mut daemon = TokioCommandWrap::with_new(cargo_bin!("realized"), |cmd| {
-        cmd.arg("--address")
-            .arg("127.0.0.1:0")
-            .arg("--privkey")
-            .arg(&privkey_file)
-            .arg("--config")
-            .arg(config_file.path())
-            .arg("--metrics-addr")
-            .arg(&metrics_addr)
-            .env("RUST_LOG", "realize::metrics=debug")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .kill_on_drop(true); // TODO: is this enough? Is the TokioCommandWrap actually necessary?
-    })
-    .wrap(ProcessGroup::leader())
-    .spawn()?;
+    let mut daemon = tokio::process::Command::new(cargo_bin!("realized"))
+        .arg("--address")
+        .arg("127.0.0.1:0")
+        .arg("--privkey")
+        .arg(&privkey_file)
+        .arg("--config")
+        .arg(config_file.path())
+        .arg("--metrics-addr")
+        .arg(&metrics_addr)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()?;
 
-    // Wait for metrics endpoint to be up by reading log output.
-    let stderr = daemon.stdout().as_mut().unwrap();
-    let mut err_reader = tokio::io::BufReader::new(stderr).lines();
-    let mut found = false;
-    let mut captured = vec![];
-    for _ in 0..100 {
-        if let Some(line) = err_reader.next_line().await? {
-            if line.contains("Listening on") {
-                found = true;
-                break;
-            }
-            captured.push(line);
-        }
-    }
-    assert!(
-        found,
-        "Metrics server did not print listening message. captured: {}",
-        captured.join("\n")
-    );
+    // Waiting for the daemon to be ready, to be sure the metrics
+    // endpoint is up.
+    wait_for_listening_port(daemon.stdout.as_mut().unwrap()).await?;
 
     // Now test the endpoint
     let client = Client::new();
@@ -226,4 +176,34 @@ peers:
     std::fs::write(config_file, config_yaml)?;
 
     Ok(())
+}
+
+async fn collect_stderr(stderr: &mut tokio::process::ChildStderr) -> anyhow::Result<String> {
+    let reader = tokio::io::BufReader::new(stderr);
+    let mut lines = reader.lines();
+    let mut all_lines = vec![];
+    while let Ok(Some(line)) = lines.next_line().await {
+        all_lines.push(line);
+    }
+
+    Ok(all_lines.join("\n"))
+}
+
+async fn wait_for_listening_port(
+    stdout: &mut tokio::process::ChildStdout,
+) -> anyhow::Result<String> {
+    let reader = tokio::io::BufReader::new(stdout);
+    let mut lines = reader.lines();
+    let line = lines.next_line().await?.unwrap();
+    assert_eq!(
+        true,
+        predicate::str::starts_with("Listening on").eval(&line),
+        "Unexpected output: {line}"
+    );
+
+    Ok(line
+        .split(":")
+        .last()
+        .expect("Unexpected output: {line}")
+        .to_string())
 }
