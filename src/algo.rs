@@ -4,10 +4,10 @@
 //! using the RealizeService trait. See spec/design.md for details.
 
 use crate::model::service::{
-    DirectoryId, Options, RealizeError, RealizeServiceClient, RealizeServiceRequest,
+    DirectoryId, Hash, Options, RealizeError, RealizeServiceClient, RealizeServiceRequest,
     RealizeServiceResponse, SyncedFile,
 };
-use futures::future::join;
+use futures::future::{Either, join};
 use futures::stream::StreamExt as _;
 use std::{collections::HashMap, path::Path};
 use tarpc::{client::stub::Stub, context};
@@ -157,8 +157,24 @@ where
     let dst_size = dst_file.map(|f| f.size).unwrap_or(0);
 
     progress.verifying();
-    if src_size == dst_size && check_hashes_and_delete(src, dst, dir_id, path).await? {
-        return Ok(());
+
+    // Important: Compute source hash only once, though it might be
+    // used twice; it's very slow to compute on large files.
+    let mut src_hash = Either::Left(src.hash(
+        context::current(),
+        dir_id.clone(),
+        path.to_path_buf(),
+        src_options(),
+    ));
+    if src_size == dst_size {
+        let hash = match src_hash {
+            Either::Left(fut) => fut.await??,
+            Either::Right(hash) => hash,
+        };
+        if check_hashes_and_delete_with_src_hash(&hash, src, dst, dir_id, path).await? {
+            return Ok(());
+        }
+        src_hash = Either::Right(hash);
     }
 
     log::info!(
@@ -245,7 +261,11 @@ where
     }
 
     progress.verifying();
-    if !check_hashes_and_delete(src, dst, dir_id, path).await? {
+    let hash = match src_hash {
+        Either::Left(hash) => hash.await??,
+        Either::Right(hash) => hash,
+    };
+    if !check_hashes_and_delete_with_src_hash(&hash, src, dst, dir_id, path).await? {
         return Err(MoveFileError::Realize(RealizeError::Sync(
             path.to_path_buf(),
             "Data still inconsistent after sync".to_string(),
@@ -258,7 +278,8 @@ where
 /// Check hashes and, if they match, finish the dest file and delete the source.
 ///
 /// Return true if the hashes matched, false otherwise.
-async fn check_hashes_and_delete<T, U>(
+async fn check_hashes_and_delete_with_src_hash<T, U>(
+    src_hash: &Hash,
     src: &RealizeServiceClient<T>,
     dst: &RealizeServiceClient<U>,
     dir_id: &DirectoryId,
@@ -268,23 +289,15 @@ where
     T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
     U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
 {
-    let (src_hash, dst_hash) = tokio::join!(
-        src.hash(
-            context::current(),
-            dir_id.clone(),
-            path.to_path_buf(),
-            src_options(),
-        ),
-        dst.hash(
+    let dst_hash = dst
+        .hash(
             context::current(),
             dir_id.clone(),
             path.to_path_buf(),
             dst_options(),
-        ),
-    );
-    let src_hash = src_hash.map_err(MoveFileError::from)??;
-    let dst_hash = dst_hash.map_err(MoveFileError::from)??;
-    if src_hash != dst_hash {
+        )
+        .await??;
+    if *src_hash != dst_hash {
         log::info!("{}:{:?} inconsistent hashes", dir_id, path);
         return Ok(false);
     }
@@ -300,16 +313,14 @@ where
         path.to_path_buf(),
         dst_options(),
     )
-    .await
-    .map_err(MoveFileError::from)??;
+    .await??;
     src.delete(
         context::current(),
         dir_id.clone(),
         path.to_path_buf(),
         src_options(),
     )
-    .await
-    .map_err(MoveFileError::from)??;
+    .await??;
 
     Ok(true)
 }

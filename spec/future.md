@@ -216,22 +216,6 @@ effect. Let's ignore that for now.)
    Extend the integration tests to use such units, make sure the test
    passes, fix any issues.
 
-## Optimize hash verification logic in move_files {#hasverification}
-
-src.hash() should be called only once, at the beginning of move_file,
-since it won't change (and computing the hash is a very slow operation
-for large files).
-
-The value might need to be read twice, once for the initial
-verification (optional) and once for the final verification.
-Unfortunately, a future can only be awaited once. There should be some
-way of dealing with that while keeping the code reasonable.
-
-Task list
-
-- update the code
-- run "cargo test -- --skip :slow:", fix any issues
-
 ## Optimize reads {#readopt}
 
 Since move_files works on multiple files at once:
