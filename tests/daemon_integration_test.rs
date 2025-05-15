@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use assert_cmd::cargo::cargo_bin;
-use assert_fs::TempDir;
 use assert_fs::prelude::*;
+use assert_fs::TempDir;
 use predicates::prelude::*;
 use process_wrap::tokio::ProcessGroup;
 use process_wrap::tokio::TokioCommandWrap;
@@ -14,9 +14,9 @@ use realize::transport::security;
 use realize::transport::security::PeerVerifier;
 use realize::transport::tcp;
 use reqwest::Client;
+use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::SubjectPublicKeyInfoDer;
-use rustls::pki_types::pem::PemObject as _;
 use tokio::fs;
 use tokio::io::AsyncBufReadExt as _;
 
@@ -191,7 +191,7 @@ async fn metrics_endpoint_works() -> anyhow::Result<()> {
     assert_eq!(resp.headers()["Content-Type"], "text/plain; version=0.0.4");
     let body = resp.text().await?;
     assert!(
-        body.contains("up 1"),
+        body.contains("realize_daemon_up 1"),
         "metrics output missing expected Prometheus format: {}",
         body
     );

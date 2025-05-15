@@ -76,7 +76,8 @@ Task list
 
 2. Add the command-line argument --metrics-addr to src/bin/realize.rs,
    call export_metrics. Also add METRIC_UP to src/bin/realize.rs,
-   which is just incremented to 1 just before calling move_files.
+   (realize_command_up) which is just incremented to 1 just before
+   calling move_files.
 
    Run "cargo check" to make sure everything still compiles, fix
    any issues.

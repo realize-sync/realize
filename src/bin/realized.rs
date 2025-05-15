@@ -2,7 +2,7 @@
 //! Implements the server as described in spec/design.md and spec/future.md
 
 use clap::Parser;
-use prometheus::{Encoder, IntCounter, TextEncoder, register_int_counter};
+use prometheus::{register_int_counter, Encoder, IntCounter, TextEncoder};
 use realize::server::{Directory, RealizeServer};
 use realize::transport::security::{self, PeerVerifier};
 use realize::transport::tcp;
@@ -56,7 +56,7 @@ struct PeerEntry {
 
 lazy_static::lazy_static! {
     static ref METRIC_UP: IntCounter =
-        register_int_counter!("up", "Server is up").unwrap();
+        register_int_counter!("realize_daemon_up", "Server is up").unwrap();
 }
 
 #[tokio::main]
