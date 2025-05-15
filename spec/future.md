@@ -143,22 +143,78 @@ specified as download and upload limits on the command-line:
 --throttle-down 512k to throttle upload to 1M and download to
 512k/s.
 
-**Proposal:**
-- Extend the RPC protocol to support throttle commands, specifying whether limits are per-connection, per-service, or global (document the choice).
-- Implement rate limiting in the TCP connection handler using a token bucket or leaky bucket algorithm, ensuring accuracy and low overhead.
-- Parse and validate new CLI options in `realize`, including error handling for invalid or conflicting options.
-- Ensure limits can be updated at runtime via RPC, and clarify how existing connections are affected (immediate or on next transfer).
-- Provide clear error messages and logs for invalid throttle updates or failures.
-- Test throttling with unit, integration, and performance tests, including dynamic updates and edge cases (e.g., burst traffic, limit changes).
+### Computing the rate limit
 
-**Task List:**
-1. Design and document the throttle RPC message format, specifying the scope (per-connection, per-service, or global).
-2. Implement CLI parsing for throttle options, including validation and error handling.
-3. Add rate limiting logic to TCP handlers, ensuring correct behavior under all traffic patterns.
-4. Implement RPC handlers to update limits at runtime, and define how updates affect existing connections.
-5. Write unit, integration, and performance tests for throttling behavior, CLI parsing, and dynamic updates.
-6. Log all throttle changes and errors.
-7. Document usage, configuration, and edge cases, including how updates are applied.
+Use governor for tracking the limits:
+https://docs.rs/governor/latest/governor/ See also user guide on
+https://docs.rs/governor/latest/governor/_guide/index.html
+
+### Applying the rate limit to a tokio Stream
+
+Apply the rate limit on Stream, for correctness, by writing and the
+using RateLimitStream combinator.
+
+Only the writes should be limited and delayed.
+
+To get started, see this Stream combinator:
+  https://docs.rs/governor/latest/governor/state/direct/struct.RatelimitedStream.html
+However:
+  - this limits the reads, but we want to rate-limit writes (AsyncWrite)
+  - this is a combinator for std Stream, and TcpStream is a tokio Stream
+
+For TCP, the stream will be a TCP stream, See RunningServer::bind.
+
+PROBLEM: In-process uses a Channel, not a Stream so rate-limiting
+would only be for remote connections.
+
+### Setting the rate limit
+
+Rate limiting should be configurable an a RPC service by calling the
+new service method RealizeService.configure(config: Config).
+
+The new Config type contains an optional write rate-limit that can be
+set. Setting the config sets the rate-limit on the RateLimitStream
+combinator, so RealizeServer needs to have access to that or
+RealizeServer and RateLimitStream should share an object that
+RealizeServer can modify.
+
+When given a write limit, the `realize` command sets the limit on the
+dst RPC service. When given a read limit, the `realize` command sets
+the limit on the src RPC service. (Setting the rate-limit config only
+has effects on TCP services, on in-process service it won't have any
+effect. Let's ignore that for now.)
+
+### Task List
+
+1. Write a RateLimitStream combinator, unit-test it thoroughly.
+
+2. Add RealizeService.configure as described above, leave the
+   implementation in RealizeServer a no-op. Write thorough unit tests,
+   make sure all tests pass, fix any issues.
+
+3. Apply that combinator in RunningServer::bind src/transport/tcp.rs
+   and bind it to RealizeServer so RealizeServer.configure can set
+   the write limit. Write thorough unit tests, make sure all tests
+   pass, fix any issues.
+
+4. Extend the `realize` command in src/bin/realize.rs to call
+   RealizeService.configure as configured by the command-line
+   arguments throttle_up/down in bytes-per-second. Make sure
+   everything compiles, fix any issues.
+
+5. Add an integration test that sets these and checks for a log
+   entry (log::info!) that says that rate-limiting has and what it is
+   deep in the code. Make sure the test passes, fix any issues.
+
+6. Change throttle_up/down command-line argument type to a type that
+   accepts shortcuts like, for example, 1K or 1M for 1024 and
+   1024*1024 bytes, respectively. Use that instead of a raw number.
+
+   Possibly parse_size can help:
+   https://docs.rs/parse-size/latest/parse_size/
+
+   Extend the integration tests to use such units, make sure the test
+   passes, fix any issues.
 
 ## Optimize hash verification logic in move_files {#hasverification}
 
