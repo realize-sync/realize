@@ -2,20 +2,19 @@ use assert_cmd::cargo::cargo_bin;
 use assert_fs::TempDir;
 use assert_fs::prelude::*;
 use assert_unordered::assert_eq_unordered;
-use portpicker;
 use realize::server::RealizeServer;
 use realize::transport::security::{self, PeerVerifier};
 use realize::transport::tcp;
+use realize::utils::async_utils::AbortOnDrop;
 use reqwest;
 use reqwest::Client;
-use rouille;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 use tokio::io::AsyncBufReadExt as _;
 
 #[tokio::test]
@@ -515,25 +514,33 @@ async fn test_realize_metrics_export() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_realize_metrics_pushgateway() -> anyhow::Result<()> {
-    // Start a fake pushgateway
-    let port = portpicker::pick_unused_port().expect("no free port");
-    let addr = format!("127.0.0.1:{}", port);
-    let push_url = format!("http://127.0.0.1:{}", port);
-    let pushed = Arc::new(AtomicBool::new(false));
-    let pushed_for_handler = Arc::clone(&pushed);
-    let http_handler = move |request: &rouille::Request| {
-        assert_eq!(
-            "PUT /metrics/job/testjob".to_string(),
-            format!("{} {}", request.method(), request.url())
-        );
-        pushed_for_handler.store(true, std::sync::atomic::Ordering::Relaxed);
-        rouille::Response::text("OK")
-    };
-    let http_server = rouille::Server::new(addr, http_handler).unwrap();
-    let (http_handle, http_stop) = http_server.stoppable();
-    std::thread::spawn(move || {
-        http_handle.join().unwrap();
-    });
+    // A fake pushgateway that expect one specific request and then
+    // dies.
+    let pushgw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let pushgw_addr = pushgw_listener.local_addr()?;
+    let pushgw_handle: AbortOnDrop<anyhow::Result<()>> =
+        AbortOnDrop::new(tokio::spawn(async move {
+            let (stream, _) = pushgw_listener.accept().await?;
+            let io = hyper_util::rt::TokioIo::new(stream);
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    io,
+                    hyper::service::service_fn(async move |req| {
+                        assert_eq!(
+                            "PUT /metrics/job/testjob".to_string(),
+                            format!("{} {}", req.method(), req.uri())
+                        );
+                        Ok::<hyper::Response<String>, anyhow::Error>(
+                            hyper::Response::builder()
+                                .status(hyper::StatusCode::OK)
+                                .body("OK".to_string())?,
+                        )
+                    }),
+                )
+                .await?;
+
+            Ok(())
+        }));
 
     // Prepare test dirs
     let tempdir = TempDir::new()?;
@@ -550,7 +557,7 @@ async fn test_realize_metrics_pushgateway() -> anyhow::Result<()> {
         .arg("--dst-path")
         .arg(dst_dir.path())
         .arg("--metrics-pushgateway")
-        .arg(&push_url)
+        .arg(&format!("http://{}/", pushgw_addr))
         .arg("--metrics-job")
         .arg("testjob")
         .stdout(Stdio::inherit())
@@ -563,11 +570,9 @@ async fn test_realize_metrics_pushgateway() -> anyhow::Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Stop the HTTP server
-    http_stop.send(()).unwrap();
-
-    // Make sure the HTTP PUT call was received.
-    assert!(pushed.load(std::sync::atomic::Ordering::Relaxed));
+    // The HTTP server task must have died successfully after having
+    // received the expected request.
+    tokio::time::timeout(Duration::ZERO, pushgw_handle.join()).await???;
 
     Ok(())
 }
