@@ -101,9 +101,13 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
     let verifier = Arc::new(verifier);
 
     let privkey = load_private_key_file(&cli.privkey)
-        .with_context(|| format!("{}: failed to parse private key", cli.privkey.display()))?;
+        .with_context(|| format!("{}: Failed to parse private key", cli.privkey.display()))?;
 
-    metrics::export_metrics(cli.metrics_addr.as_deref());
+    if let Some(addr) = &cli.metrics_addr {
+        metrics::export_metrics(addr)
+            .await
+            .with_context(|| format!("Failed to export metrics on {addr}"))?;
+    }
 
     let (addr, handle) = tcp::start_server(&cli.address, server, verifier, privkey)
         .await

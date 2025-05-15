@@ -122,8 +122,12 @@ async fn main() {
 }
 
 async fn execute(cli: &Cli) -> anyhow::Result<()> {
-    metrics::export_metrics(cli.metrics_addr.as_deref());
-    METRIC_UP.reset();
+    METRIC_UP.reset(); // Set it to 0, so it's available
+    if let Some(addr) = &cli.metrics_addr {
+        metrics::export_metrics(addr)
+            .await
+            .with_context(|| format!("Failed to export metrics on {addr}"))?;
+    }
 
     // Directory id
     let dir_id = DirectoryId::from(

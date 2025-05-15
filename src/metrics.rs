@@ -1,21 +1,21 @@
 use prometheus::Encoder;
 
-pub fn export_metrics(metrics_addr: Option<&str>) {
-    if let Some(metrics_addr) = &metrics_addr {
-        let metrics_addr = metrics_addr.to_string();
-        std::thread::spawn(move || {
-            log::info!("[metrics] server listening on {}", metrics_addr);
-            rouille::start_server(metrics_addr, move |request| {
-                if request.url() == "/metrics" {
-                    handle_metrics_request().unwrap_or_else(|_| {
-                        rouille::Response::text("Internal error").with_status_code(500)
-                    })
-                } else {
-                    rouille::Response::empty_404()
-                }
-            });
+pub async fn export_metrics(metrics_addr: &str) -> anyhow::Result<()> {
+    let metrics_addr = metrics_addr.to_string();
+    std::thread::spawn(move || {
+        log::info!("[metrics] server listening on {}", metrics_addr);
+        rouille::start_server(metrics_addr, move |request| {
+            if request.url() == "/metrics" {
+                handle_metrics_request().unwrap_or_else(|_| {
+                    rouille::Response::text("Internal error").with_status_code(500)
+                })
+            } else {
+                rouille::Response::empty_404()
+            }
         });
-    }
+    });
+
+    Ok(())
 }
 
 fn handle_metrics_request() -> anyhow::Result<rouille::Response> {
