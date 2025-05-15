@@ -2,7 +2,8 @@
 //! Implements the server as described in spec/design.md and spec/future.md
 
 use clap::Parser;
-use prometheus::{Encoder, IntCounter, TextEncoder, register_int_counter};
+use prometheus::{register_int_counter, IntCounter};
+use realize::metrics;
 use realize::server::{Directory, RealizeServer};
 use realize::transport::security::{self, PeerVerifier};
 use realize::transport::tcp;
@@ -12,7 +13,6 @@ use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::thread;
 
 /// Command-line arguments for the realized daemon
 #[derive(Parser, Debug)]
@@ -124,7 +124,7 @@ async fn main() {
         }
     };
 
-    export_metrics(args.metrics_addr);
+    metrics::export_metrics(args.metrics_addr);
 
     // Start the server (tokio runtime)
     match tcp::start_server(&args.address, server, verifier, privkey).await {
@@ -143,32 +143,4 @@ async fn main() {
             std::process::exit(0);
         }
     }
-}
-
-fn export_metrics(metrics_addr: Option<String>) {
-    if let Some(metrics_addr) = &metrics_addr {
-        let metrics_addr = metrics_addr.to_string();
-        thread::spawn(move || {
-            log::info!("[metrics] server listening on {}", metrics_addr);
-            rouille::start_server(metrics_addr, move |request| {
-                if request.url() == "/metrics" {
-                    handle_metrics_request().unwrap_or_else(|_| {
-                        rouille::Response::text("Internal error").with_status_code(500)
-                    })
-                } else {
-                    rouille::Response::empty_404()
-                }
-            });
-        });
-    }
-}
-
-fn handle_metrics_request() -> anyhow::Result<rouille::Response> {
-    let metrics = prometheus::gather();
-    let mut buffer = vec![];
-    let encoder = TextEncoder::new();
-    let content_type = encoder.format_type().to_string();
-    encoder.encode(&metrics, &mut buffer)?;
-
-    Ok(rouille::Response::from_data(content_type, buffer))
 }
