@@ -2,7 +2,9 @@ use clap::Parser;
 use console::style;
 use humantime;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use prometheus::{IntCounter, register_int_counter};
 use realize::algo::{FileProgress as AlgoFileProgress, MoveFileError, Progress};
+use realize::metrics;
 use realize::model::service::DirectoryId;
 use realize::server::RealizeServer;
 use realize::transport::security::{self, PeerVerifier};
@@ -14,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[macro_use]
+extern crate lazy_static;
 
 /// Realize command-line tool
 #[derive(Parser, Debug)]
@@ -66,6 +70,15 @@ struct Cli {
     /// Maximum total duration for the operation (e.g. "5m", "30s"). If exceeded, the process exits with code 11.
     #[arg(long)]
     max_duration: Option<humantime::Duration>,
+
+    /// Address to export prometheus metrics (host:port, optional)
+    #[arg(long)]
+    metrics_addr: Option<String>,
+}
+
+lazy_static! {
+    static ref METRIC_UP: IntCounter =
+        register_int_counter!("realize_cmd_up", "Command is up").unwrap();
 }
 
 #[tokio::main]
@@ -91,6 +104,9 @@ async fn main() {
         print_error("Interrupted");
         process::exit(20);
     });
+
+    metrics::export_metrics(cli.metrics_addr);
+    METRIC_UP.reset();
 
     // Determine mode
     let src_is_remote = cli.src_addr.is_some();
@@ -216,6 +232,7 @@ async fn main() {
 
     // Move files
     let mut progress = CliProgress::new(cli.quiet);
+    METRIC_UP.inc();
     let result = realize::algo::move_files(&src_client, &dst_client, dir_id, &mut progress).await;
     progress.finish_and_clear();
 

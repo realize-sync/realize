@@ -154,11 +154,11 @@ async fn metrics_endpoint_works() -> anyhow::Result<()> {
             .arg(config_file.path())
             .arg("--metrics-addr")
             .arg(&metrics_addr)
-            .env("RUST_LOG", "realized=debug")
+            .env("RUST_LOG", "realize::metrics=debug")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
+            .kill_on_drop(true); // TODO: is this enough? Is the TokioCommandWrap actually necessary?
     })
     .wrap(ProcessGroup::leader())
     .spawn()?;
@@ -197,6 +197,7 @@ async fn metrics_endpoint_works() -> anyhow::Result<()> {
     );
 
     // Random paths should not return anything
+    // TODO: move to a unit test in src/metrics.rs
     let notfound = client
         .get(format!("http://{}/notfound", metrics_addr))
         .send()

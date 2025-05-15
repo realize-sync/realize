@@ -5,12 +5,15 @@ use assert_unordered::assert_eq_unordered;
 use realize::server::RealizeServer;
 use realize::transport::security::{self, PeerVerifier};
 use realize::transport::tcp;
+use reqwest;
+use reqwest::Client;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use tokio::io::AsyncBufReadExt as _;
 
 #[tokio::test]
 async fn test_local_to_remote() -> anyhow::Result<()> {
@@ -414,6 +417,7 @@ async fn test_max_duration_timeout() -> anyhow::Result<()> {
         .arg("100ms")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()?;
     let output = output.wait_with_output().await?;
     assert_eq!(
@@ -426,6 +430,83 @@ async fn test_max_duration_timeout() -> anyhow::Result<()> {
         stderr.contains("Maximum duration (100ms) exceeded. Giving up."),
         "stderr: {stderr}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_realize_metrics_export() -> anyhow::Result<()> {
+    env_logger::try_init().ok();
+    let tempdir = TempDir::new()?;
+    let src_dir = tempdir.child("src_metrics");
+    let dst_dir = tempdir.child("dst_metrics");
+    util::create_dir_with_files(&src_dir, &[("foo.txt", "hello")])?;
+    std::fs::create_dir(dst_dir.path())?;
+
+    // Pick a random available port for metrics
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let metrics_addr = listener.local_addr()?;
+    drop(listener); // release port for realize
+    let metrics_addr_str = format!("{}", metrics_addr);
+
+    // We want to have time to check the metrics. Make sure it'll
+    // hang by giving it an address that won't ever answer.
+    let nonanswering_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let nonanswering_addr = nonanswering_listener.local_addr()?.to_string();
+    let keys = util::test_keys();
+    let realize_metrics_addr = metrics_addr_str.clone();
+    let mut child = tokio::process::Command::new(cargo_bin!("realize"))
+        .arg("--quiet")
+        .arg("--src-addr")
+        .arg(&nonanswering_addr)
+        .arg("--dst-addr")
+        .arg(&nonanswering_addr)
+        .arg("--privkey")
+        .arg(keys.privkey_a_path.as_ref())
+        .arg("--peers")
+        .arg(&keys.peers_path)
+        .arg("--metrics-addr")
+        .arg(&realize_metrics_addr)
+        .env("RUST_LOG", "realize::metrics=debug")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+
+    // Wait for metrics endpoint to be up by reading log output.
+    let stderr = child.stderr.as_mut().unwrap();
+    let mut err_reader = tokio::io::BufReader::new(stderr).lines();
+    let mut found = false;
+    let mut captured = vec![];
+    for _ in 0..100 {
+        if let Some(line) = err_reader.next_line().await? {
+            eprintln!("{}", line);
+            if line.contains("[metrics] server listening on") {
+                found = true;
+                break;
+            }
+            captured.push(line);
+        }
+    }
+    assert!(
+        found,
+        "Metrics server did not print listening message. captured: {}",
+        captured.join("\n")
+    );
+
+    // Now test the endpoint
+    let client = Client::new();
+    let metrics_url = format!("http://{}/metrics", metrics_addr);
+    let resp = client.get(&metrics_url).send().await?;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["Content-Type"], "text/plain; version=0.0.4");
+    let body = resp.text().await?;
+    // The command can't connect, so up stays 0.
+    assert!(
+        body.contains("realize_cmd_up 0"),
+        "metrics output missing expected Prometheus format: {}",
+        body
+    );
+
     Ok(())
 }
 

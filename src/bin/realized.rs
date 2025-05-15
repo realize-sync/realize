@@ -2,7 +2,7 @@
 //! Implements the server as described in spec/design.md and spec/future.md
 
 use clap::Parser;
-use prometheus::{register_int_counter, IntCounter};
+use prometheus::{IntCounter, register_int_counter};
 use realize::metrics;
 use realize::server::{Directory, RealizeServer};
 use realize::transport::security::{self, PeerVerifier};
