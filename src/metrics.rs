@@ -1,6 +1,6 @@
 use prometheus::Encoder;
 
-pub fn export_metrics(metrics_addr: Option<String>) {
+pub fn export_metrics(metrics_addr: Option<&str>) {
     if let Some(metrics_addr) = &metrics_addr {
         let metrics_addr = metrics_addr.to_string();
         std::thread::spawn(move || {

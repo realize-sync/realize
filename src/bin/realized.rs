@@ -124,7 +124,7 @@ async fn main() {
         }
     };
 
-    metrics::export_metrics(args.metrics_addr);
+    metrics::export_metrics(args.metrics_addr.as_deref());
 
     // Start the server (tokio runtime)
     match tcp::start_server(&args.address, server, verifier, privkey).await {
