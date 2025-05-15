@@ -91,14 +91,15 @@ Task list
    everything passes. Fix any issues.
 
 4. Add the command-line argument --metrics-pushgateway to
-   src/bin/realize.rs and --metrics-jobid (defaults to realize) Put
-   most of the code for that into src/metrics.rs, so realize can just
-   call a function at the end to push the metrics.
+   src/bin/realize.rs --metrics-job (defaults to realize) and
+   --metrics-instance (no defaults) Put most of the code for that into
+   src/metrics.rs, so realize can just call a function at the end to
+   push the metrics.
 
    No need to support authentication; it should be a simple HTTP
    request. The job id passed to push (instead of "example_push")
-   should code from the command-line argument --metrics-jobid and
-   there should not be any labels for now.
+   should code from the command-line argument --metrics-job and there
+   should be an instance label if --metrics-instance is set.
 
    Run "cargo check" to make sure everything still compiles, fix
    any issues.
