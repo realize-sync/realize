@@ -1,6 +1,7 @@
 //! Daemon binary for the realized server
 //! Implements the server as described in spec/design.md and spec/future.md
 
+use anyhow::Context as _;
 use clap::Parser;
 use prometheus::{IntCounter, register_int_counter};
 use realize::metrics;
@@ -9,15 +10,16 @@ use realize::transport::security::{self, PeerVerifier};
 use realize::transport::tcp;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
+use rustls::sign::SigningKey;
 use serde::Deserialize;
-use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::{fs, process};
 
 /// Command-line arguments for the realized daemon
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
-struct Args {
+struct Cli {
     /// TCP address to listen on (default: localhost:9771)
     #[arg(long, default_value = "localhost:9771")]
     address: String,
@@ -64,24 +66,18 @@ async fn main() {
     // Init env_logger (log nothing unless env variable is set)
     env_logger::init();
 
-    // Parse command-line arguments
-    let args = Args::parse();
+    let cli = Cli::parse();
 
-    // Parse YAML config file
-    let config_content = match fs::read_to_string(&args.config) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Failed to read config file: {e}");
-            std::process::exit(1);
-        }
+    if let Err(err) = execute(cli).await {
+        eprintln!("ERROR: {err:#}");
+        process::exit(1);
     };
-    let config: Config = match serde_yaml::from_str(&config_content) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            eprintln!("Failed to parse config file: {e}");
-            std::process::exit(1);
-        }
-    };
+    process::exit(0);
+}
+
+async fn execute(cli: Cli) -> anyhow::Result<()> {
+    let config = parse_config(&cli.config)
+        .with_context(|| format!("{}: failed to read YAML config file", cli.config.display()))?;
 
     // Build directory list
     let mut dirs = Vec::new();
@@ -97,50 +93,41 @@ async fn main() {
     let mut verifier = PeerVerifier::new(&crypto);
     for peer in &config.peers {
         for (peer_id, pubkey_pem) in &peer.map {
-            match SubjectPublicKeyInfoDer::from_pem_slice(pubkey_pem.as_bytes()) {
-                Ok(spki) => verifier.add_peer_with_id(spki, peer_id),
-                Err(e) => {
-                    eprintln!("Failed to parse peer public key: {e}");
-                    std::process::exit(1);
-                }
-            }
+            let spki = SubjectPublicKeyInfoDer::from_pem_slice(pubkey_pem.as_bytes())
+                .with_context(|| "Failed to parse public key for peer {peer_id}")?;
+            verifier.add_peer_with_id(spki, peer_id);
         }
     }
     let verifier = Arc::new(verifier);
 
-    // Load private key
-    let privkey = match PrivateKeyDer::from_pem_file(&args.privkey) {
-        Ok(key) => key,
-        Err(e) => {
-            eprintln!("Failed to parse private key: {e}");
-            std::process::exit(1);
-        }
-    };
-    let privkey = match crypto.key_provider.load_private_key(privkey) {
-        Ok(key) => key,
-        Err(e) => {
-            eprintln!("Failed to load private key: {e}");
-            std::process::exit(1);
-        }
-    };
+    let privkey = load_private_key_file(&cli.privkey)
+        .with_context(|| format!("{}: failed to parse private key", cli.privkey.display()))?;
 
-    metrics::export_metrics(args.metrics_addr.as_deref());
+    metrics::export_metrics(cli.metrics_addr.as_deref());
 
-    // Start the server (tokio runtime)
-    match tcp::start_server(&args.address, server, verifier, privkey).await {
-        Err(err) => {
-            eprintln!("Failed to start server: {err}");
-            std::process::exit(1);
-        }
-        Ok((addr, handle)) => {
-            println!("Listening on {addr}");
-            METRIC_UP.inc();
+    let (addr, handle) = tcp::start_server(&cli.address, server, verifier, privkey)
+        .await
+        .with_context(|| format!("Server failed to start on {}", cli.address))?;
 
-            if let Err(err) = handle.join().await {
-                eprintln!("Server stopped: {err}");
-                std::process::exit(1);
-            }
-            std::process::exit(0);
-        }
-    }
+    println!("Listening on {addr}");
+    METRIC_UP.inc();
+
+    handle.join().await.context("Server stopped")?;
+
+    Ok(())
+}
+
+fn parse_config(path: &Path) -> anyhow::Result<Config> {
+    let content = fs::read_to_string(path)?;
+    let config = serde_yaml::from_str(&content)?;
+
+    Ok(config)
+}
+
+fn load_private_key_file(path: &Path) -> anyhow::Result<Arc<dyn SigningKey>> {
+    let key = PrivateKeyDer::from_pem_file(path)?;
+
+    Ok(security::default_provider()
+        .key_provider
+        .load_private_key(key)?)
 }
