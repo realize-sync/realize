@@ -403,6 +403,9 @@ realize --src-addr <host:port> --dst-addr <host:port> --privkey <private_key_fil
 
 # Both local
 realize --src-path <local_path> --dst-path <local_path>
+
+# Metrics (optional)
+realize ... [--metrics-addr <host:port>] [--metrics-pushgateway <url>] [--metrics-job <job>] [--metrics-instance <instance>]
 ```
 
 - `--src-path <local_path>`: Local source directory path
@@ -416,6 +419,10 @@ realize --src-path <local_path> --dst-path <local_path>
 - `--throttle-up <rate>`: Throttle upload (e.g. 1M)
 - `--throttle-down <rate>`: Throttle download (e.g. 512k)
 - `--max-duration <duration>`: Maximum total duration for the operation. Accepts human-readable durations (e.g. "5m", "30s"). Parsed as `humantime::Duration`. If the operation does not complete within this time, an error is printed to stderr and the process exits with status code 11.
+- `--metrics-addr <host:port>`: (Optional) Address to bind a Prometheus metrics HTTP endpoint (pull mode)
+- `--metrics-pushgateway <url>`: (Optional) URL of Prometheus Pushgateway to push metrics at the end of the run (push mode)
+- `--metrics-job <job>`: (Optional) Job name for Prometheus metrics (default: "realize")
+- `--metrics-instance <instance>`: (Optional) Instance label for Prometheus metrics
 
 #### Inputs
 
@@ -424,27 +431,17 @@ realize --src-path <local_path> --dst-path <local_path>
 - **Directory ID**: Identifier for the directory to sync (optional for local/local, required otherwise).
 - **Local Path**: Path to the local directory to be synchronized (for local endpoints).
 - **Remote Host/Port**: Network address of the remote `realized` daemon (for remote endpoints).
-
-#### Example Usage
-
-```
-# Local to remote
-realize --src-path /store/a/dir --dst-addr hostb:9771 --privkey private_key_a.key --peers peers.pem --directory-id synceddir
-
-# Remote to local
-realize --src-addr hosta:9771 --dst-path /store/b/dir --privkey private_key_b.key --peers peers.pem --directory-id synceddir
-
-# Both remote
-realize --src-addr hosta:9771 --dst-addr hostb:9771 --privkey private_key.key --peers peers.pem --directory-id synceddir
-
-# Both local
-realize --src-path /store/a/dir --dst-path /store/b/dir
-```
+- **Metrics Options**:
+  - `--metrics-addr`: If set, realize will serve Prometheus metrics on the given address (pull mode)
+  - `--metrics-pushgateway`: If set, realize will push metrics to the given Pushgateway URL at the end of the run (push mode)
+  - `--metrics-job`: Job name for metrics (default: "realize")
+  - `--metrics-instance`: Instance label for metrics (optional)
 
 #### Outputs
 
 - **Progress Output**: Progress information is printed to stdout (using indicatif), showing sync status per file and overall.
 - **Errors**: Any errors are printed to stderr. Logging is not used for user-facing errors.
+- **Prometheus Metrics**: If metrics options are set, realize will export Prometheus metrics via HTTP (pull) or push to a Pushgateway (push).
 - **Exit Codes**:
   - `0`: Success (all files synced as intended)
   - `1`: Error (e.g., connection failure, sync error, invalid arguments)
@@ -459,6 +456,7 @@ realize --src-path /store/a/dir --dst-path /store/b/dir
 - Starts an in-process RealizeService instance for local directories.
 - Invokes the move/sync algorithm to synchronize files between the source and destination.
 - Reports progress to stdout, including per-file and overall sync status.
+- If metrics options are set, exports Prometheus metrics (see above).
 - On success, exits with code 0. On error, prints a message to stderr and exits with code 1. If the operation times out due to --max-duration, prints an error message to stderr and exits with code 11.
 - Designed to be restartable and robust to interruptions; re-running the command resumes any incomplete sync.
 
