@@ -1,7 +1,6 @@
 use anyhow::Context as _;
 use clap::Parser;
 use console::style;
-use humantime;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use prometheus::{IntCounter, register_int_counter};
 use realize::algo::{FileProgress as AlgoFileProgress, MoveFileError, Progress};

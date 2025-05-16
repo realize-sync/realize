@@ -86,7 +86,7 @@ impl PeerVerifier {
 
     /// Check whether the given spki is authorized.
     fn accept_peer(&self, spki: &rustls::pki_types::SubjectPublicKeyInfoDer) -> bool {
-        self.allowed_peers.get(spki.as_ref()).is_some()
+        self.allowed_peers.contains_key(spki.as_ref())
     }
 
     /// Return the ID of the stream's peer.
@@ -96,7 +96,7 @@ impl PeerVerifier {
     ) -> Option<&str> {
         let (_, conn) = stream.get_ref();
         if let Some(cert) = conn.peer_certificates() {
-            if cert.len() > 0 {
+            if !cert.is_empty() {
                 return self.allowed_peers.get(cert[0].as_ref()).map(String::as_ref);
             }
         }

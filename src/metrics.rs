@@ -112,7 +112,7 @@ fn status_label<T>(res: &Result<RealizeServiceResponse, T>) -> &'static str {
     match res {
         Err(_) => "RpcError",
         Ok(res) => {
-            if realize_error(&res).is_none() {
+            if realize_error(res).is_none() {
                 "OK"
             } else {
                 "AppError"
@@ -194,7 +194,7 @@ fn range_bytes(req: &RealizeServiceRequest) -> Option<u64> {
         _ => None,
     };
 
-    range.map(|r| (r.1 - r.0) as u64)
+    range.map(|r| r.1 - r.0)
 }
 
 /// Extract data size in bytes from a request for the data_in metrics.

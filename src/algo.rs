@@ -258,7 +258,7 @@ where
                 .inc_by(data.len() as u64);
             METRIC_RANGE_READ_BYTES
                 .with_label_values(&["read"])
-                .inc_by((range.1 - range.0) as u64);
+                .inc_by(range.1 - range.0);
             dst.send(
                 context::current(),
                 dir_id.clone(),
@@ -274,7 +274,7 @@ where
                 .inc_by(data.len() as u64);
             METRIC_RANGE_WRITE_BYTES
                 .with_label_values(&["send"])
-                .inc_by((range.1 - range.0) as u64);
+                .inc_by(range.1 - range.0);
             progress.inc(end - offset);
         } else {
             // Compute diff and apply
@@ -303,7 +303,7 @@ where
                 .inc_by(delta.0.len() as u64);
             METRIC_RANGE_READ_BYTES
                 .with_label_values(&["diff"])
-                .inc_by((range.1 - range.0) as u64);
+                .inc_by(range.1 - range.0);
             dst.apply_delta(
                 context::current(),
                 dir_id.clone(),
@@ -319,7 +319,7 @@ where
                 .inc_by(delta.0.len() as u64);
             METRIC_RANGE_WRITE_BYTES
                 .with_label_values(&["apply_delta"])
-                .inc_by((range.1 - range.0) as u64);
+                .inc_by(range.1 - range.0);
             progress.inc(end - offset);
         }
         offset = end;
