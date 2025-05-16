@@ -1,0 +1,237 @@
+use assert_fs::prelude::*;
+use assert_fs::TempDir;
+use prometheus::proto::MetricType;
+use realize::algo::move_files;
+use realize::algo::NoProgress;
+use realize::algo::METRIC_END_COUNT;
+use realize::algo::METRIC_FILE_END_COUNT;
+use realize::algo::METRIC_FILE_START_COUNT;
+use realize::algo::METRIC_RANGE_READ_BYTES;
+use realize::algo::METRIC_RANGE_WRITE_BYTES;
+use realize::algo::METRIC_READ_BYTES;
+use realize::algo::METRIC_START_COUNT;
+use realize::algo::METRIC_WRITE_BYTES;
+use realize::client::DeadlineSetter;
+use realize::metrics::MetricsRealizeClient;
+use realize::model::service::RealizeServiceClient;
+use realize::model::service::RealizeServiceRequest;
+use realize::model::service::RealizeServiceResponse;
+use realize::model::service::{DirectoryId, Options};
+use realize::server::RealizeServer;
+use std::sync::Arc;
+
+// Metric tests are kept in their own binary to avoid other test
+// running in parallel interfering with the counts.
+//
+// serial_test::serial ensures that tests in this file are run in
+// sequence.
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_client_success_call_count() -> anyhow::Result<()> {
+    let (_temp, dir_id, client) = setup_inprocess_client();
+    let before = get_metric_value(
+        "realize_client_call_count",
+        &[("method", "list"), ("status", "OK"), ("error", "OK")],
+    );
+    client
+        .list(
+            tarpc::context::current(),
+            dir_id.clone(),
+            Options::default(),
+        )
+        .await??;
+    let after = get_metric_value(
+        "realize_client_call_count",
+        &[("method", "list"), ("status", "OK"), ("error", "OK")],
+    );
+    assert_eq!(after, before + 1.0);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_client_error_call_count() -> anyhow::Result<()> {
+    let (_temp, _dir_id, client) = setup_inprocess_client();
+    let before_err = get_metric_value(
+        "realize_client_call_count",
+        &[
+            ("method", "list"),
+            ("status", "AppError"),
+            ("error", "BadRequest"),
+        ],
+    );
+    assert!(client
+        .list(
+            tarpc::context::current(),
+            DirectoryId::from("doesnotexist"),
+            Options::default(),
+        )
+        .await?
+        .is_err());
+    let after_err = get_metric_value(
+        "realize_client_call_count",
+        &[
+            ("method", "list"),
+            ("status", "AppError"),
+            ("error", "BadRequest"),
+        ],
+    );
+    assert_eq!(after_err, before_err + 1.0);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_server_success_call_count() -> anyhow::Result<()> {
+    let (_temp, dir_id, client) = setup_inprocess_client();
+    let before_srv = get_metric_value(
+        "realize_server_call_count",
+        &[("method", "list"), ("status", "OK"), ("error", "OK")],
+    );
+    client
+        .list(
+            tarpc::context::current(),
+            dir_id.clone(),
+            Options::default(),
+        )
+        .await??;
+    let after_srv = get_metric_value(
+        "realize_server_call_count",
+        &[("method", "list"), ("status", "OK"), ("error", "OK")],
+    );
+    assert_eq!(after_srv, before_srv + 1.0);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_server_error_call_count() -> anyhow::Result<()> {
+    let (_temp, _dir_id, client) = setup_inprocess_client();
+    let before_srv_err = get_metric_value(
+        "realize_server_call_count",
+        &[
+            ("method", "list"),
+            ("status", "AppError"),
+            ("error", "BadRequest"),
+        ],
+    );
+    assert!(client
+        .list(
+            tarpc::context::current(),
+            DirectoryId::from("doesnotexist"),
+            Options::default(),
+        )
+        .await?
+        .is_err());
+    let after_srv_err = get_metric_value(
+        "realize_server_call_count",
+        &[
+            ("method", "list"),
+            ("status", "AppError"),
+            ("error", "BadRequest"),
+        ],
+    );
+    assert_eq!(after_srv_err, before_srv_err + 1.0);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_move_files_metrics() -> anyhow::Result<()> {
+    // Reset metrics (set to zero) by clearing the registry and re-registering
+    // Not strictly necessary for IntCounter, but ensures test isolation
+    METRIC_START_COUNT.reset();
+    METRIC_END_COUNT.reset();
+    METRIC_FILE_START_COUNT.reset();
+    METRIC_FILE_END_COUNT.reset();
+    METRIC_READ_BYTES.reset();
+    METRIC_WRITE_BYTES.reset();
+    METRIC_RANGE_READ_BYTES.reset();
+    METRIC_RANGE_WRITE_BYTES.reset();
+
+    let src_temp = TempDir::new()?;
+    let dst_temp = TempDir::new()?;
+    src_temp.child("foo").write_str("abc")?;
+    let src_dir = Arc::new(realize::server::Directory::new(
+        &DirectoryId::from("testdir"),
+        src_temp.path(),
+    ));
+    let dst_dir = Arc::new(realize::server::Directory::new(
+        &DirectoryId::from("testdir"),
+        dst_temp.path(),
+    ));
+    let (success, error) = move_files(
+        &RealizeServer::for_dir(src_dir.id(), src_dir.path()).as_inprocess_client(),
+        &RealizeServer::for_dir(dst_dir.id(), dst_dir.path()).as_inprocess_client(),
+        DirectoryId::from("testdir"),
+        &mut NoProgress,
+    )
+    .await?;
+    assert_eq!(success, 1);
+    assert_eq!(error, 0);
+    // Check that metrics counters incremented
+    assert_eq!(METRIC_START_COUNT.get(), 1);
+    assert_eq!(METRIC_END_COUNT.get(), 1);
+    assert_eq!(METRIC_FILE_START_COUNT.get(), 1);
+    assert_eq!(METRIC_FILE_END_COUNT.with_label_values(&["Ok"]).get(), 1);
+    // At least some bytes should have been read/written
+    assert_eq!(METRIC_READ_BYTES.with_label_values(&["read"]).get(), 3);
+    assert_eq!(METRIC_WRITE_BYTES.with_label_values(&["send"]).get(), 3);
+    assert_eq!(
+        METRIC_RANGE_READ_BYTES.with_label_values(&["read"]).get(),
+        3
+    );
+    assert_eq!(
+        METRIC_RANGE_WRITE_BYTES.with_label_values(&["send"]).get(),
+        3
+    );
+    Ok(())
+}
+
+fn setup_inprocess_client() -> (
+    TempDir,
+    DirectoryId,
+    RealizeServiceClient<
+        DeadlineSetter<
+            MetricsRealizeClient<
+                tarpc::client::Channel<RealizeServiceRequest, RealizeServiceResponse>,
+            >,
+        >,
+    >,
+) {
+    let temp = TempDir::new().unwrap();
+    let dir_id = DirectoryId::from("testdir");
+    let server_impl =
+        RealizeServer::new(vec![realize::server::Directory::new(&dir_id, temp.path())]);
+    let client = server_impl.as_inprocess_client();
+    (temp, dir_id, client)
+}
+
+fn get_metric_value(name: &str, label_pairs: &[(&str, &str)]) -> f64 {
+    let metric_families = prometheus::gather();
+    for mf in metric_families {
+        if mf.name() == name {
+            for m in &mf.metric {
+                let mut all_match = true;
+                for (k, v) in label_pairs {
+                    let found = m.label.iter().any(|lp| lp.name() == *k && lp.value() == *v);
+                    if !found {
+                        all_match = false;
+                        break;
+                    }
+                }
+                if all_match {
+                    match mf.get_field_type() {
+                        MetricType::COUNTER => return m.get_counter().value(),
+                        MetricType::HISTOGRAM => {
+                            return m.get_histogram().get_sample_count() as f64;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    0.0
+}

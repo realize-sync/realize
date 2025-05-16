@@ -17,25 +17,25 @@ use tokio::net::TcpListener;
 use crate::model::service::{RealizeError, RealizeServiceRequest, RealizeServiceResponse};
 
 lazy_static::lazy_static! {
-    static ref METRIC_SERVER_DATA_IN_BYTES: HistogramVec =
+    pub static ref METRIC_SERVER_DATA_IN_BYTES: HistogramVec =
         register_histogram_vec!(
             "realize_server_data_in_bytes",
             "Size of the file data received by the server, embedded in RPC calls",
             &["method", "status"],
             bytes_buckets()).unwrap();
-    static ref METRIC_SERVER_DATA_RANGE_BYTES: HistogramVec =
+    pub static ref METRIC_SERVER_DATA_RANGE_BYTES: HistogramVec =
         register_histogram_vec!(
             "realize_server_data_range_bytes",
             "Size of the data range of RPC calls. Always >= data in or out.",
             &["method", "status"],
             bytes_buckets()).unwrap();
-    static ref METRIC_SERVER_DATA_OUT_BYTES: HistogramVec =
+    pub static ref METRIC_SERVER_DATA_OUT_BYTES: HistogramVec =
         register_histogram_vec!(
             "realize_server_data_out_bytes",
             "Size of the file data sent by the server, embedded in RPC calls",
             &["method"],
             bytes_buckets()).unwrap();
-    static ref METRIC_SERVER_DURATION_SECONDS: HistogramVec =
+    pub static ref METRIC_SERVER_DURATION_SECONDS: HistogramVec =
         register_histogram_vec!(
             "realize_server_duration_seconds",
             "RPC method duration, in seconds",
@@ -43,31 +43,31 @@ lazy_static::lazy_static! {
             // Default buckets are designed for just this use case
             prometheus::DEFAULT_BUCKETS.to_vec()
             ).unwrap();
-    static ref METRIC_SERVER_CALL_COUNT: IntCounterVec =
+    pub static ref METRIC_SERVER_CALL_COUNT: IntCounterVec =
         register_int_counter_vec!(
             "realize_server_call_count",
             "RPC call count, grouped by status and errors",
             &["method", "status", "error"]).unwrap();
 
-    static ref METRIC_CLIENT_DATA_IN_BYTES: HistogramVec =
+    pub static ref METRIC_CLIENT_DATA_IN_BYTES: HistogramVec =
         register_histogram_vec!(
             "realize_client_data_in_bytes",
             "Size of the file data received by the client, embedded in RPC calls",
             &["method", "status"],
             bytes_buckets()).unwrap();
-    static ref METRIC_CLIENT_DATA_RANGE_BYTES: HistogramVec =
+    pub static ref METRIC_CLIENT_DATA_RANGE_BYTES: HistogramVec =
         register_histogram_vec!(
             "realize_client_data_range_bytes",
             "Size of the data range of RPC calls. Always >= data in or out.",
             &["method", "status"],
             bytes_buckets()).unwrap();
-    static ref METRIC_CLIENT_DATA_OUT_BYTES: HistogramVec =
+    pub static ref METRIC_CLIENT_DATA_OUT_BYTES: HistogramVec =
         register_histogram_vec!(
             "realize_client_data_out_bytes",
             "Size of the file data sent by the client, embedded in RPC calls",
             &["method"],
             bytes_buckets()).unwrap();
-    static ref METRIC_CLIENT_DURATION_SECONDS: HistogramVec =
+    pub static ref METRIC_CLIENT_DURATION_SECONDS: HistogramVec =
         register_histogram_vec!(
             "realize_client_duration_seconds",
             "RPC method duration, in seconds",
@@ -75,13 +75,13 @@ lazy_static::lazy_static! {
             // Default buckets are designed for just this use case
             prometheus::DEFAULT_BUCKETS.to_vec()
             ).unwrap();
-    static ref METRIC_CLIENT_CALL_COUNT: IntCounterVec =
+    pub static ref METRIC_CLIENT_CALL_COUNT: IntCounterVec =
         register_int_counter_vec!(
             "realize_client_call_count",
             "RPC call count, grouped by status and errors",
             &["method", "status", "error"]).unwrap();
 
-    static ref METRIC_SERVER_IN_FLIGHT_REQUEST_COUNT: IntGauge =
+    pub static ref METRIC_SERVER_IN_FLIGHT_REQUEST_COUNT: IntGauge =
     register_int_gauge!(
         "realize_server_in_flight_request_count",
         "Number of RPCs currently in-flight on the server").unwrap();
@@ -416,174 +416,4 @@ where
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::model::service::{DirectoryId, Options};
-    use crate::server::RealizeServer;
-    use assert_fs::TempDir;
-    use prometheus::proto::MetricType;
-
-    fn get_metric_value(name: &str, label_pairs: &[(&str, &str)]) -> f64 {
-        let metric_families = prometheus::gather();
-        for mf in metric_families {
-            if mf.name() == name {
-                for m in &mf.metric {
-                    let mut all_match = true;
-                    for (k, v) in label_pairs {
-                        let found = m.label.iter().any(|lp| lp.name() == *k && lp.value() == *v);
-                        if !found {
-                            all_match = false;
-                            break;
-                        }
-                    }
-                    if all_match {
-                        match mf.get_field_type() {
-                            MetricType::COUNTER => return m.get_counter().value(),
-                            MetricType::HISTOGRAM => {
-                                return m.get_histogram().get_sample_count() as f64;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
-        0.0
-    }
-
-    fn setup_inprocess_client() -> (
-        assert_fs::TempDir,
-        crate::model::service::DirectoryId,
-        crate::model::service::RealizeServiceClient<
-            crate::client::DeadlineSetter<
-                super::MetricsRealizeClient<
-                    tarpc::client::Channel<
-                        crate::model::service::RealizeServiceRequest,
-                        crate::model::service::RealizeServiceResponse,
-                    >,
-                >,
-            >,
-        >,
-    ) {
-        let temp = TempDir::new().unwrap();
-        let dir_id = DirectoryId::from("testdir");
-        let server_impl =
-            RealizeServer::new(vec![crate::server::Directory::new(&dir_id, temp.path())]);
-        let client = server_impl.as_inprocess_client();
-        (temp, dir_id, client)
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn test_client_success_call_count() -> anyhow::Result<()> {
-        let (_temp, dir_id, client) = setup_inprocess_client();
-        let before = get_metric_value(
-            "realize_client_call_count",
-            &[("method", "list"), ("status", "OK"), ("error", "OK")],
-        );
-        client
-            .list(
-                tarpc::context::current(),
-                dir_id.clone(),
-                Options::default(),
-            )
-            .await??;
-        let after = get_metric_value(
-            "realize_client_call_count",
-            &[("method", "list"), ("status", "OK"), ("error", "OK")],
-        );
-        assert_eq!(after, before + 1.0);
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn test_client_error_call_count() -> anyhow::Result<()> {
-        let (_temp, _dir_id, client) = setup_inprocess_client();
-        let before_err = get_metric_value(
-            "realize_client_call_count",
-            &[
-                ("method", "list"),
-                ("status", "AppError"),
-                ("error", "BadRequest"),
-            ],
-        );
-        assert!(
-            client
-                .list(
-                    tarpc::context::current(),
-                    DirectoryId::from("doesnotexist"),
-                    Options::default(),
-                )
-                .await?
-                .is_err()
-        );
-        let after_err = get_metric_value(
-            "realize_client_call_count",
-            &[
-                ("method", "list"),
-                ("status", "AppError"),
-                ("error", "BadRequest"),
-            ],
-        );
-        assert_eq!(after_err, before_err + 1.0);
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn test_server_success_call_count() -> anyhow::Result<()> {
-        let (_temp, dir_id, client) = setup_inprocess_client();
-        let before_srv = get_metric_value(
-            "realize_server_call_count",
-            &[("method", "list"), ("status", "OK"), ("error", "OK")],
-        );
-        client
-            .list(
-                tarpc::context::current(),
-                dir_id.clone(),
-                Options::default(),
-            )
-            .await??;
-        let after_srv = get_metric_value(
-            "realize_server_call_count",
-            &[("method", "list"), ("status", "OK"), ("error", "OK")],
-        );
-        assert_eq!(after_srv, before_srv + 1.0);
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn test_server_error_call_count() -> anyhow::Result<()> {
-        let (_temp, _dir_id, client) = setup_inprocess_client();
-        let before_srv_err = get_metric_value(
-            "realize_server_call_count",
-            &[
-                ("method", "list"),
-                ("status", "AppError"),
-                ("error", "BadRequest"),
-            ],
-        );
-        assert!(
-            client
-                .list(
-                    tarpc::context::current(),
-                    DirectoryId::from("doesnotexist"),
-                    Options::default(),
-                )
-                .await?
-                .is_err()
-        );
-        let after_srv_err = get_metric_value(
-            "realize_server_call_count",
-            &[
-                ("method", "list"),
-                ("status", "AppError"),
-                ("error", "BadRequest"),
-            ],
-        );
-        assert_eq!(after_srv_err, before_srv_err + 1.0);
-        Ok(())
-    }
-}
+// Unit tests are kept in tests/metric_test.rs to avoid interferences.

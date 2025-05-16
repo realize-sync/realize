@@ -18,37 +18,37 @@ const CHUNK_SIZE: u64 = 8 * 1024 * 1024; // 8MB
 const PARALLEL_FILE_COUNT: usize = 8;
 
 lazy_static::lazy_static! {
-    static ref METRIC_START_COUNT: IntCounter =
+    pub static ref METRIC_START_COUNT: IntCounter =
         register_int_counter!("realize_move_start_count", "Number of times move_files() was called").unwrap();
-    static ref METRIC_END_COUNT: IntCounter =
+    pub static ref METRIC_END_COUNT: IntCounter =
         register_int_counter!("realize_move_end_count", "Number of times move_files() finished").unwrap();
-    static ref METRIC_FILE_START_COUNT: IntCounter =
+    pub static ref METRIC_FILE_START_COUNT: IntCounter =
         register_int_counter!("realize_move_file_start_count", "Number of files started by move_files").unwrap();
-    static ref METRIC_FILE_END_COUNT: IntCounterVec =
+    pub static ref METRIC_FILE_END_COUNT: IntCounterVec =
         register_int_counter_vec!(
             "realize_move_file_end_count",
             "Number of files synced (status is Ok or Inconsistent)",
             &["status"]
         ).unwrap();
-    static ref METRIC_READ_BYTES: IntCounterVec =
+    pub static ref METRIC_READ_BYTES: IntCounterVec =
         register_int_counter_vec!(
             "realize_move_read_bytes",
             "Number of bytes read, with method label (read or diff)",
             &["method"]
         ).unwrap();
-    static ref METRIC_WRITE_BYTES: IntCounterVec =
+    pub static ref METRIC_WRITE_BYTES: IntCounterVec =
         register_int_counter_vec!(
             "realize_move_write_bytes",
             "Number of bytes written, with method label (send or apply_patch)",
             &["method"]
         ).unwrap();
-    static ref METRIC_RANGE_READ_BYTES: IntCounterVec =
+    pub static ref METRIC_RANGE_READ_BYTES: IntCounterVec =
         register_int_counter_vec!(
             "realize_move_range_read_bytes",
             "Number of bytes read (range), with method label (read or diff)",
             &["method"]
         ).unwrap();
-    static ref METRIC_RANGE_WRITE_BYTES: IntCounterVec =
+    pub static ref METRIC_RANGE_WRITE_BYTES: IntCounterVec =
         register_int_counter_vec!(
             "realize_move_range_write_bytes",
             "Number of bytes written (range), with method label (send or apply_patch)",
@@ -758,59 +758,6 @@ mod tests {
             }
         }
         Ok(result)
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn test_metrics_incremented() -> anyhow::Result<()> {
-        // Reset metrics (set to zero) by clearing the registry and re-registering
-        // Not strictly necessary for IntCounter, but ensures test isolation
-        METRIC_START_COUNT.reset();
-        METRIC_END_COUNT.reset();
-        METRIC_FILE_START_COUNT.reset();
-        METRIC_FILE_END_COUNT.reset();
-        METRIC_READ_BYTES.reset();
-        METRIC_WRITE_BYTES.reset();
-        METRIC_RANGE_READ_BYTES.reset();
-        METRIC_RANGE_WRITE_BYTES.reset();
-
-        let src_temp = TempDir::new()?;
-        let dst_temp = TempDir::new()?;
-        src_temp.child("foo").write_str("abc")?;
-        let src_dir = Arc::new(crate::server::Directory::new(
-            &DirectoryId::from("testdir"),
-            src_temp.path(),
-        ));
-        let dst_dir = Arc::new(crate::server::Directory::new(
-            &DirectoryId::from("testdir"),
-            dst_temp.path(),
-        ));
-        let (success, error) = move_files(
-            &RealizeServer::for_dir(src_dir.id(), src_dir.path()).as_inprocess_client(),
-            &RealizeServer::for_dir(dst_dir.id(), dst_dir.path()).as_inprocess_client(),
-            DirectoryId::from("testdir"),
-            &mut NoProgress,
-        )
-        .await?;
-        assert_eq!(success, 1);
-        assert_eq!(error, 0);
-        // Check that metrics counters incremented
-        assert_eq!(METRIC_START_COUNT.get(), 1);
-        assert_eq!(METRIC_END_COUNT.get(), 1);
-        assert_eq!(METRIC_FILE_START_COUNT.get(), 1);
-        assert_eq!(METRIC_FILE_END_COUNT.with_label_values(&["Ok"]).get(), 1);
-        // At least some bytes should have been read/written
-        assert_eq!(METRIC_READ_BYTES.with_label_values(&["read"]).get(), 3);
-        assert_eq!(METRIC_WRITE_BYTES.with_label_values(&["send"]).get(), 3);
-        assert_eq!(
-            METRIC_RANGE_READ_BYTES.with_label_values(&["read"]).get(),
-            3
-        );
-        assert_eq!(
-            METRIC_RANGE_WRITE_BYTES.with_label_values(&["send"]).get(),
-            3
-        );
-        Ok(())
     }
 }
 
