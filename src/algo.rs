@@ -27,31 +27,31 @@ lazy_static::lazy_static! {
     static ref METRIC_FILE_END_COUNT: IntCounterVec =
         register_int_counter_vec!(
             "realize_move_file_end_count",
-            "Number of files synced, with status label",
+            "Number of files synced (status is Ok or Inconsistent)",
             &["status"]
         ).unwrap();
     static ref METRIC_READ_BYTES: IntCounterVec =
         register_int_counter_vec!(
             "realize_move_read_bytes",
-            "Number of bytes read, with method label",
+            "Number of bytes read, with method label (read or diff)",
             &["method"]
         ).unwrap();
     static ref METRIC_WRITE_BYTES: IntCounterVec =
         register_int_counter_vec!(
             "realize_move_write_bytes",
-            "Number of bytes written, with method label",
+            "Number of bytes written, with method label (send or apply_patch)",
             &["method"]
         ).unwrap();
     static ref METRIC_RANGE_READ_BYTES: IntCounterVec =
         register_int_counter_vec!(
             "realize_move_range_read_bytes",
-            "Number of bytes read (range), with method label",
+            "Number of bytes read (range), with method label (read or diff)",
             &["method"]
         ).unwrap();
     static ref METRIC_RANGE_WRITE_BYTES: IntCounterVec =
         register_int_counter_vec!(
             "realize_move_range_write_bytes",
-            "Number of bytes written (range), with method label",
+            "Number of bytes written (range), with method label (send or apply_patch)",
             &["method"]
         ).unwrap();
 }
