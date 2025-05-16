@@ -1,5 +1,5 @@
 use crate::client::DeadlineSetter;
-use crate::metrics::MetricsRealizeClient;
+use crate::metrics::{MetricsRealizeClient, MetricsRealizeServer};
 use crate::model::service::Options;
 use crate::model::service::{
     ByteRange, DirectoryId, RealizeError, RealizeService, Result, RsyncOperation, SyncedFile,
@@ -69,7 +69,7 @@ impl RealizeServer {
         let server = tarpc::server::BaseChannel::with_defaults(server_transport);
         tokio::spawn(
             server
-                .execute(RealizeServer::serve(self))
+                .execute(MetricsRealizeServer::new(RealizeServer::serve(self)))
                 .for_each(|response| async move {
                     tokio::spawn(response);
                 }),
