@@ -405,17 +405,15 @@ impl LogicalPath {
 
         let relative = pathdiff::diff_paths(actual, dir.path());
         if let Some(mut relative) = relative {
-            if let Ok(logical) = LogicalPath::new(dir, &relative) {
-                if let Some(filename) = actual.file_name() {
-                    let name_bytes = filename.to_string_lossy();
-                    if name_bytes.starts_with(".") && name_bytes.ends_with(".part") {
-                        let stripped_name =
-                            OsString::from(name_bytes[1..name_bytes.len() - 5].to_string());
-                        relative.set_file_name(&stripped_name);
-                        return Some((SyncedFileState::Partial, logical));
-                    }
-                    return Some((SyncedFileState::Final, logical));
+            if let Some(filename) = actual.file_name() {
+                let name_bytes = filename.to_string_lossy();
+                if name_bytes.starts_with(".") && name_bytes.ends_with(".part") {
+                    let stripped_name =
+                        OsString::from(name_bytes[1..name_bytes.len() - 5].to_string());
+                    relative.set_file_name(&stripped_name);
+                    return Some((SyncedFileState::Partial, Self(Arc::clone(dir), relative)));
                 }
+                return Some((SyncedFileState::Final, Self(Arc::clone(dir), relative)));
             }
         }
 
