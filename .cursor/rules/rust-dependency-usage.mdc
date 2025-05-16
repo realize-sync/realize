@@ -1,0 +1,87 @@
+---
+description: Rust dev dependencies are only available in test code
+globs: *.rs
+alwaysApply: false
+---
+# Rust Dependency Usage Rule
+
+## Name
+rust-dependency-usage
+
+## Description
+This rule enforces the correct usage and placement of production and development (dev) dependencies in Rust projects. Production dependencies must be available to all code, while dev dependencies must only be used in test, example, or benchmark code, and must be imported only within `#[cfg(test)]` modules.
+
+## Rule
+
+- **Production dependencies:**
+  - Add to `[dependencies]` in `Cargo.toml`.
+  - May be imported and used anywhere in the codebase.
+
+- **Development dependencies:**
+  - Add to `[dev-dependencies]` in `Cargo.toml`.
+  - Must only be imported and used inside modules or code blocks marked with `#[cfg(test)]`, `#[cfg(bench)]`, or `#[cfg(example)]`.
+  - **Do not import dev dependencies at the file/module header**; always import them inside the test/bench/example module.
+
+- **Enforcement:**
+  - If a crate is listed under `[dev-dependencies]`, it must not be imported outside of a `#[cfg(test)]`/`#[cfg(bench)]`/`#[cfg(example)]` module.
+  - If a crate is needed in both production and test code, it must be listed under `[dependencies]`.
+
+If you get an error from cargo that some dependency is not available
+that is listed under dev-dependencies in `Cargo.toml`, check the
+section where that dependency is referenced from. Most likely, it
+needs to be moved inside of the `mod test` section in the same file.
+
+## Rationale
+
+This ensures that dev dependencies are not available in production builds, keeping the production binary lean and secure, and avoiding accidental reliance on test-only crates in production code.
+
+## Examples
+
+✅ **Correct:**
+
+`Cargo.toml`:
+```toml
+[dependencies]
+serde = "1.0"
+
+[dev-dependencies]
+pretty_assertions = "1"
+```
+
+`src/lib.rs`:
+```rust
+use serde::Serialize; // OK: production dependency
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq; // OK: dev dependency imported inside test module
+
+    #[test]
+    fn test_add() {
+        assert_eq!(2 + 2, 4);
+    }
+}
+```
+
+❌ **Incorrect:**
+
+`src/lib.rs`:
+```rust
+use pretty_assertions::assert_eq; // ERROR: dev dependency imported at file header
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_add() {
+        assert_eq!(2 + 2, 4);
+    }
+}
+```
+
+## References
+
+- [Rust By Example: Development dependencies](https://doc.rust-lang.org/rust-by-example/testing/dev_dependencies.html)
+- [Cargo Book: Specifying dependencies](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html)
