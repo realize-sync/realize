@@ -7,13 +7,12 @@ use crate::model::service::{
     DirectoryId, Hash, Options, RealizeError, RealizeServiceClient, RealizeServiceRequest,
     RealizeServiceResponse, SyncedFile,
 };
-use futures::future::{Either, join};
+use futures::future::{join, Either};
 use futures::stream::StreamExt as _;
-use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
+use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
 use std::{collections::HashMap, path::Path};
 use tarpc::{client::stub::Stub, context};
 use thiserror::Error;
-
 const CHUNK_SIZE: u64 = 8 * 1024 * 1024; // 8MB
 const PARALLEL_FILE_COUNT: usize = 8;
 
@@ -400,8 +399,8 @@ mod tests {
     use super::*;
     use crate::model::service::DirectoryId;
     use crate::server::RealizeServer;
-    use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
     use std::path::PathBuf;
     use std::sync::Arc;
