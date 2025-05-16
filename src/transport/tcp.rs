@@ -15,6 +15,7 @@ use tarpc::tokio_serde::formats::Bincode;
 use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
 
 use crate::client::DeadlineSetter;
+use crate::metrics;
 use crate::metrics::MetricsRealizeClient;
 use crate::metrics::MetricsRealizeServer;
 use crate::model::service::RealizeServiceRequest;
@@ -141,7 +142,7 @@ impl RunningServer {
                         self.server.clone(),
                     )))
                     .for_each(async move |fut| {
-                        tokio::spawn(fut);
+                        tokio::spawn(metrics::track_in_flight_request(fut));
                     }),
             );
 
