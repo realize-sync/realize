@@ -108,3 +108,19 @@ Since move_files works on multiple files at once:
 
 Experiment with different ways of organizing the work that maybe speed
 things up.
+
+## Delete empty parent directories {#emptydir}
+
+In RealizeService.delete, in server.rs, after deleting a file, check
+whether its containing directory is empty. If it is, delete it. And so
+on up to the directory associated with the current DirectoryId, which
+must not be deleted, even if it is empty.
+
+- Write the code in server.rs
+
+- Add integration tests to server.rs to cover the case. Make sure to
+  cover the case where multiple levels of directories are deleted, up
+  to the directory associated with the current DirectoryId.
+
+- Run "cargo test -- --skip :slow" to make sure all tests pass. Fix
+  any issues.
