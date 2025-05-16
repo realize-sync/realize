@@ -7,14 +7,54 @@ use crate::model::service::{
     DirectoryId, Hash, Options, RealizeError, RealizeServiceClient, RealizeServiceRequest,
     RealizeServiceResponse, SyncedFile,
 };
-use futures::future::{Either, join};
+use futures::future::{join, Either};
 use futures::stream::StreamExt as _;
+use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
 use std::{collections::HashMap, path::Path};
 use tarpc::{client::stub::Stub, context};
 use thiserror::Error;
 
 const CHUNK_SIZE: u64 = 8 * 1024 * 1024; // 8MB
 const PARALLEL_FILE_COUNT: usize = 8;
+
+lazy_static::lazy_static! {
+    static ref METRIC_START_COUNT: IntCounter =
+        register_int_counter!("realize_move_start_count", "Number of times move_files() was called").unwrap();
+    static ref METRIC_END_COUNT: IntCounter =
+        register_int_counter!("realize_move_end_count", "Number of times move_files() finished").unwrap();
+    static ref METRIC_FILE_START_COUNT: IntCounter =
+        register_int_counter!("realize_move_file_start_count", "Number of files started by move_files").unwrap();
+    static ref METRIC_FILE_END_COUNT: IntCounterVec =
+        register_int_counter_vec!(
+            "realize_move_file_end_count",
+            "Number of files synced, with status label",
+            &["status"]
+        ).unwrap();
+    static ref METRIC_READ_BYTES: IntCounterVec =
+        register_int_counter_vec!(
+            "realize_move_read_bytes",
+            "Number of bytes read, with method label",
+            &["method"]
+        ).unwrap();
+    static ref METRIC_WRITE_BYTES: IntCounterVec =
+        register_int_counter_vec!(
+            "realize_move_write_bytes",
+            "Number of bytes written, with method label",
+            &["method"]
+        ).unwrap();
+    static ref METRIC_RANGE_READ_BYTES: IntCounterVec =
+        register_int_counter_vec!(
+            "realize_move_range_read_bytes",
+            "Number of bytes read (range), with method label",
+            &["method"]
+        ).unwrap();
+    static ref METRIC_RANGE_WRITE_BYTES: IntCounterVec =
+        register_int_counter_vec!(
+            "realize_move_range_write_bytes",
+            "Number of bytes written (range), with method label",
+            &["method"]
+        ).unwrap();
+}
 
 // Progress instance passed to move_files()
 pub trait Progress: Sync + Send {
@@ -89,6 +129,7 @@ where
     U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
     P: Progress,
 {
+    METRIC_START_COUNT.inc();
     // 1. List files on src and dst in parallel
     let (src_files, dst_files) = join(
         src.list(context::current(), dir_id.clone(), src_options()),
@@ -114,14 +155,14 @@ where
             async move {
                 let result =
                     move_file(src, &file, dst, dst_file, &dir_id, &mut *file_progress).await;
-                match result {
+                match &result {
                     Ok(_) => {
                         file_progress.success();
 
                         true
                     }
                     Err(err) => {
-                        file_progress.error(&err);
+                        file_progress.error(err);
 
                         false
                     }
@@ -136,7 +177,7 @@ where
             (0, 0),
             |(s, e), ret| if ret { (s + 1, e) } else { (s, e + 1) },
         );
-
+    METRIC_END_COUNT.inc();
     Ok((success_count, error_count))
 }
 
@@ -152,6 +193,7 @@ where
     T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
     U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
 {
+    METRIC_FILE_START_COUNT.inc();
     let path = src_file.path.as_path();
     let src_size = src_file.size;
     let dst_size = dst_file.map(|f| f.size).unwrap_or(0);
@@ -212,6 +254,12 @@ where
                     src_options(),
                 )
                 .await??;
+            METRIC_READ_BYTES
+                .with_label_values(&["read"])
+                .inc_by(data.len() as u64);
+            METRIC_RANGE_READ_BYTES
+                .with_label_values(&["read"])
+                .inc_by((range.1 - range.0) as u64);
             dst.send(
                 context::current(),
                 dir_id.clone(),
@@ -222,6 +270,12 @@ where
                 dst_options(),
             )
             .await??;
+            METRIC_WRITE_BYTES
+                .with_label_values(&["send"])
+                .inc_by(data.len() as u64);
+            METRIC_RANGE_WRITE_BYTES
+                .with_label_values(&["send"])
+                .inc_by((range.1 - range.0) as u64);
             progress.inc(end - offset);
         } else {
             // Compute diff and apply
@@ -245,16 +299,28 @@ where
                     src_options(),
                 )
                 .await??;
+            METRIC_READ_BYTES
+                .with_label_values(&["diff"])
+                .inc_by(delta.0.len() as u64);
+            METRIC_RANGE_READ_BYTES
+                .with_label_values(&["diff"])
+                .inc_by((range.1 - range.0) as u64);
             dst.apply_delta(
                 context::current(),
                 dir_id.clone(),
                 path.to_path_buf(),
                 range,
                 src_file.size,
-                delta,
+                delta.clone(),
                 dst_options(),
             )
             .await??;
+            METRIC_WRITE_BYTES
+                .with_label_values(&["apply_delta"])
+                .inc_by(delta.0.len() as u64);
+            METRIC_RANGE_WRITE_BYTES
+                .with_label_values(&["apply_delta"])
+                .inc_by((range.1 - range.0) as u64);
             progress.inc(end - offset);
         }
         offset = end;
@@ -299,6 +365,9 @@ where
         .await??;
     if *src_hash != dst_hash {
         log::info!("{}:{:?} inconsistent hashes", dir_id, path);
+        METRIC_FILE_END_COUNT
+            .with_label_values(&["Inconsistent"])
+            .inc();
         return Ok(false);
     }
     log::info!(
@@ -322,6 +391,7 @@ where
     )
     .await??;
 
+    METRIC_FILE_END_COUNT.with_label_values(&["Ok"]).inc();
     Ok(true)
 }
 
@@ -330,8 +400,8 @@ mod tests {
     use super::*;
     use crate::model::service::DirectoryId;
     use crate::server::RealizeServer;
-    use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -688,6 +758,59 @@ mod tests {
             }
         }
         Ok(result)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_metrics_incremented() -> anyhow::Result<()> {
+        // Reset metrics (set to zero) by clearing the registry and re-registering
+        // Not strictly necessary for IntCounter, but ensures test isolation
+        METRIC_START_COUNT.reset();
+        METRIC_END_COUNT.reset();
+        METRIC_FILE_START_COUNT.reset();
+        METRIC_FILE_END_COUNT.reset();
+        METRIC_READ_BYTES.reset();
+        METRIC_WRITE_BYTES.reset();
+        METRIC_RANGE_READ_BYTES.reset();
+        METRIC_RANGE_WRITE_BYTES.reset();
+
+        let src_temp = TempDir::new()?;
+        let dst_temp = TempDir::new()?;
+        src_temp.child("foo").write_str("abc")?;
+        let src_dir = Arc::new(crate::server::Directory::new(
+            &DirectoryId::from("testdir"),
+            src_temp.path(),
+        ));
+        let dst_dir = Arc::new(crate::server::Directory::new(
+            &DirectoryId::from("testdir"),
+            dst_temp.path(),
+        ));
+        let (success, error) = move_files(
+            &RealizeServer::for_dir(src_dir.id(), src_dir.path()).as_inprocess_client(),
+            &RealizeServer::for_dir(dst_dir.id(), dst_dir.path()).as_inprocess_client(),
+            DirectoryId::from("testdir"),
+            &mut NoProgress,
+        )
+        .await?;
+        assert_eq!(success, 1);
+        assert_eq!(error, 0);
+        // Check that metrics counters incremented
+        assert_eq!(METRIC_START_COUNT.get(), 1);
+        assert_eq!(METRIC_END_COUNT.get(), 1);
+        assert_eq!(METRIC_FILE_START_COUNT.get(), 1);
+        assert_eq!(METRIC_FILE_END_COUNT.with_label_values(&["Ok"]).get(), 1);
+        // At least some bytes should have been read/written
+        assert_eq!(METRIC_READ_BYTES.with_label_values(&["read"]).get(), 3);
+        assert_eq!(METRIC_WRITE_BYTES.with_label_values(&["send"]).get(), 3);
+        assert_eq!(
+            METRIC_RANGE_READ_BYTES.with_label_values(&["read"]).get(),
+            3
+        );
+        assert_eq!(
+            METRIC_RANGE_WRITE_BYTES.with_label_values(&["send"]).get(),
+            3
+        );
+        Ok(())
     }
 }
 

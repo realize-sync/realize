@@ -15,54 +15,6 @@ Think about what should be logged at the error, warning info and debug
 level. What format should be followed. What information should be
 sent.
 
-## Add monitoring to move_files {#movemon}
-
-move_files should be monitored and measure:
- - metric: realize_move_start_count (int counter) the number of times
-   move_files() was called
-
- - metric: realize_move_end_count (int counter) the number of times
-   move_files() finished, sucessfully or not
-
- - metric: realize_move_file_start_count (int counter) the number of
-   files started
-
- - metric: realize_move_file_end_count (int counter vec) the number of
-   files synced, with a status label "Ok" (if finished and deleted) or
-   "Sync Failed"
-
- - metric: realize_move_read_bytes (int counter vec) the number of
-   bytes read (the size of the successful return value of read and
-   diff), with a statul label method "read" or "diff" using
-   metrics::method_label()
-
- - metric: realize_move_write_bytes (int counter vec) the number of
-   bytes sent to the server (The size of the argument data passed to
-   send, and te size of the argument patch passed to apply_patch), for
-   successful calls, grouped by method using metrics::method_label()
-
- - metric: realize_move_range_read_bytes (int counter vec) same as
-   realize_move_read_bytes but for diff, use the size of the range
-   argument not the size of the result
-
- - metric: realize_move_range_write_bytes (int counter vec) same as
-   realize_move_write_bytes but for apply_patch, use the size of the
-   range argument, not size of the patch
-
- See src/metrics.rs for example metrics. Note that all the metrics
- above use register_int_counter or register_int_counter_vec; there are
- no histogram.
-
- Task list:
-  1. define the metrics in a lazy_static range at the beginning of
-     move_file.rs. Run "cargo check" and fix any issues.
-  2. increment the metrics in the code. Run "cargo check" and fix any
-     issues. Run "cargo check" and fix any issues.
-  3. add a unit test to verify that the metrics are incremented. See
-     the tests in src/metrics.rs for an example. Make sure to add
-     #[serial_test::serial] to the test to avoid interferences. Run
-     "cargo test -- --skip :slow:" and fix any issues.
-
 ## Throttle a TCP connection {#throttle}
 
 The bytes sent per second in a specific TCP connection should be
