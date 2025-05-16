@@ -232,7 +232,7 @@ impl RealizeService for RealizeServer {
             fs::remove_file(&partial_path)?;
             _any_deleted = true;
         }
-        // Succeed even if neither existed
+        delete_containing_dir(dir.path(), &relative_path);
         Ok(())
     }
 
@@ -477,6 +477,27 @@ impl From<fast_rsync::ApplyError> for RealizeError {
 impl From<fast_rsync::SignatureParseError> for RealizeError {
     fn from(e: fast_rsync::SignatureParseError) -> Self {
         RealizeError::Rsync(RsyncOperation::Sign, e.to_string())
+    }
+}
+
+/// Remove empty parent directories of [relative_path].
+///
+/// Errors are ignored. Deleting just stops.
+fn delete_containing_dir(root: &Path, relative_path: &Path) {
+    let mut current = relative_path;
+    while let Some(parent) = current.parent() {
+        if parent.as_os_str().is_empty() {
+            return;
+        }
+        let full_path = root.join(parent);
+        let is_empty = full_path
+            .read_dir()
+            .map(|mut i| i.next().is_none())
+            .unwrap_or(false);
+        if !is_empty || fs::remove_dir(full_path).is_err() {
+            return;
+        }
+        current = parent;
     }
 }
 
@@ -1206,6 +1227,65 @@ mod tests {
             )
             .await?;
         assert_eq!(String::from_utf8(data)?, "final");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete_removes_empty_parent_dirs() -> anyhow::Result<()> {
+        let (server, temp, dir) = setup_server_with_dir()?;
+        // Create nested directories: a/b/c/file.txt
+        let nested_dir = temp.child("a/b/c");
+        std::fs::create_dir_all(nested_dir.path())?;
+        let file_path = PathBuf::from("a/b/c/file.txt");
+        let logical = LogicalPath::new(&dir, &file_path);
+        std::fs::write(logical.final_path(), b"data")?;
+        // Delete the file
+        server
+            .clone()
+            .delete(
+                tarpc::context::current(),
+                dir.id().clone(),
+                file_path.clone(),
+                Options::default(),
+            )
+            .await?;
+        // All parent dirs except the root should be deleted
+        assert!(!logical.final_path().exists());
+        assert!(!temp.child("a/b/c").exists());
+        assert!(!temp.child("a/b").exists());
+        assert!(!temp.child("a").exists());
+        // Root dir should still exist
+        assert!(temp.path().exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete_does_not_remove_nonempty_parent_dirs() -> anyhow::Result<()> {
+        let (server, temp, dir) = setup_server_with_dir()?;
+        // Create nested directories: a/b/c/file.txt and a/b/c/keep.txt
+        let nested_dir = temp.child("a/b/c");
+        std::fs::create_dir_all(nested_dir.path())?;
+        let file_path = PathBuf::from("a/b/c/file.txt");
+        let keep_path = temp.child("a/b/c/keep.txt");
+        let logical = LogicalPath::new(&dir, &file_path);
+        std::fs::write(logical.final_path(), b"data")?;
+        std::fs::write(keep_path.path(), b"keep")?;
+        // Delete the file
+        server
+            .clone()
+            .delete(
+                tarpc::context::current(),
+                dir.id().clone(),
+                file_path.clone(),
+                Options::default(),
+            )
+            .await?;
+        // Only the file should be deleted, parent dirs should remain
+        assert!(!logical.final_path().exists());
+        assert!(temp.child("a/b/c").exists());
+        assert!(temp.child("a/b").exists());
+        assert!(temp.child("a").exists());
+        assert!(temp.child("a/b/c/keep.txt").exists());
         Ok(())
     }
 }
