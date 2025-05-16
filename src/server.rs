@@ -115,7 +115,7 @@ impl RealizeService for RealizeServer {
         options: Options,
     ) -> Result<Vec<u8>> {
         let dir = self.find_directory(&dir_id)?;
-        let logical = LogicalPath::new(dir, &relative_path);
+        let logical = LogicalPath::new(dir, &relative_path)?;
         let (_, actual) = logical.find(&options)?;
         let mut file = OpenOptions::new()
             .create(false)
@@ -138,7 +138,7 @@ impl RealizeService for RealizeServer {
         options: Options,
     ) -> Result<()> {
         let dir = self.find_directory(&dir_id)?;
-        let logical = LogicalPath::new(dir, &relative_path);
+        let logical = LogicalPath::new(dir, &relative_path)?;
         let path = logical.partial_path();
         if let Ok((state, actual)) = logical.find(&options) {
             // File already exists
@@ -176,7 +176,7 @@ impl RealizeService for RealizeServer {
         options: Options,
     ) -> Result<()> {
         let dir = self.find_directory(&dir_id)?;
-        let logical = LogicalPath::new(dir, &relative_path);
+        let logical = LogicalPath::new(dir, &relative_path)?;
         if options.ignore_partial {
             return Err(RealizeError::BadRequest(
                 "Invalid option for finish: ignore_partial=true".to_string(),
@@ -196,7 +196,7 @@ impl RealizeService for RealizeServer {
         options: Options,
     ) -> Result<crate::model::service::Hash> {
         let dir = self.find_directory(&dir_id)?;
-        let logical = LogicalPath::new(dir, &relative_path);
+        let logical = LogicalPath::new(dir, &relative_path)?;
         let (_state, actual) = logical.find(&options)?;
         let mut file = fs::File::open(&actual)?;
         let mut hasher = Sha256::new();
@@ -220,7 +220,7 @@ impl RealizeService for RealizeServer {
         options: Options,
     ) -> Result<()> {
         let dir = self.find_directory(&dir_id)?;
-        let logical = LogicalPath::new(dir, &relative_path);
+        let logical = LogicalPath::new(dir, &relative_path)?;
         let mut _any_deleted = false;
         let final_path = logical.final_path();
         let partial_path = logical.partial_path();
@@ -245,7 +245,7 @@ impl RealizeService for RealizeServer {
         options: Options,
     ) -> Result<crate::model::service::Signature> {
         let dir = self.find_directory(&dir_id)?;
-        let logical = LogicalPath::new(dir, &relative_path);
+        let logical = LogicalPath::new(dir, &relative_path)?;
         let (_, actual) = logical.find(&options)?;
         let mut file = std::fs::File::open(&actual)?;
         let mut buffer = vec![0u8; (range.1 - range.0) as usize];
@@ -268,7 +268,7 @@ impl RealizeService for RealizeServer {
         options: Options,
     ) -> Result<crate::model::service::Delta> {
         let dir = self.find_directory(&dir_id)?;
-        let logical = LogicalPath::new(dir, &relative_path);
+        let logical = LogicalPath::new(dir, &relative_path)?;
         let mut buffer = vec![0u8; (range.1 - range.0) as usize];
         if let Ok((_, actual)) = logical.find(&options) {
             let mut file = std::fs::File::open(&actual)?;
@@ -291,7 +291,7 @@ impl RealizeService for RealizeServer {
         options: Options,
     ) -> Result<()> {
         let dir = self.find_directory(&dir_id)?;
-        let logical = LogicalPath::new(dir, &relative_path);
+        let logical = LogicalPath::new(dir, &relative_path)?;
         let (state, actual) = logical.find(&options)?;
         // Always apply to partial file
         let partial_path = logical.partial_path();
@@ -374,10 +374,27 @@ impl Directory {
 struct LogicalPath(Arc<Directory>, PathBuf);
 
 impl LogicalPath {
-    /// Create a new logical path, without checking it.
-    fn new(dir: &Arc<Directory>, path: &Path) -> Self {
-        // TODO: check that path is relative and doesn't use any ..
-        Self(Arc::clone(dir), path.to_path_buf())
+    /// Create a new logical path.
+    ///
+    /// The given path must be relative and cannot reference any
+    /// hidden directory or file.
+    fn new(dir: &Arc<Directory>, path: &Path) -> std::result::Result<Self, RealizeError> {
+        if path.as_os_str().is_empty() {
+            return Err(RealizeError::BadRequest(
+                "Invalid Relative path; empty".to_string(),
+            ));
+        }
+        for component in path.components() {
+            match component {
+                std::path::Component::Normal(_) => {}
+                _ => {
+                    return Err(RealizeError::BadRequest(
+                        "Invalid relative path".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(Self(Arc::clone(dir), path.to_path_buf()))
     }
 
     /// Create a logical path from an actual partial or final path.
@@ -388,15 +405,17 @@ impl LogicalPath {
 
         let relative = pathdiff::diff_paths(actual, dir.path());
         if let Some(mut relative) = relative {
-            if let Some(filename) = actual.file_name() {
-                let name_bytes = filename.to_string_lossy();
-                if name_bytes.starts_with(".") && name_bytes.ends_with(".part") {
-                    let stripped_name =
-                        OsString::from(name_bytes[1..name_bytes.len() - 5].to_string());
-                    relative.set_file_name(&stripped_name);
-                    return Some((SyncedFileState::Partial, LogicalPath::new(dir, &relative)));
+            if let Ok(logical) = LogicalPath::new(dir, &relative) {
+                if let Some(filename) = actual.file_name() {
+                    let name_bytes = filename.to_string_lossy();
+                    if name_bytes.starts_with(".") && name_bytes.ends_with(".part") {
+                        let stripped_name =
+                            OsString::from(name_bytes[1..name_bytes.len() - 5].to_string());
+                        relative.set_file_name(&stripped_name);
+                        return Some((SyncedFileState::Partial, logical));
+                    }
+                    return Some((SyncedFileState::Final, logical));
                 }
-                return Some((SyncedFileState::Final, LogicalPath::new(dir, &relative)));
             }
         }
 
@@ -524,7 +543,7 @@ mod tests {
             &PathBuf::from("/doesnotexist/testdir"),
         ));
 
-        let file1 = LogicalPath::new(&dir, &PathBuf::from("file1.txt"));
+        let file1 = LogicalPath::new(&dir, &PathBuf::from("file1.txt"))?;
         assert_eq!(
             PathBuf::from("/doesnotexist/testdir/file1.txt"),
             file1.final_path()
@@ -534,7 +553,7 @@ mod tests {
             file1.partial_path()
         );
 
-        let file2 = LogicalPath::new(&dir, &PathBuf::from("subdir/file2.txt"));
+        let file2 = LogicalPath::new(&dir, &PathBuf::from("subdir/file2.txt"))?;
         assert_eq!(
             PathBuf::from("/doesnotexist/testdir/subdir/file2.txt"),
             file2.final_path()
@@ -556,7 +575,7 @@ mod tests {
         temp.child("foo.txt").write_str("test")?;
         assert_eq!(
             (SyncedFileState::Final, temp.child("foo.txt").to_path_buf()),
-            LogicalPath::new(&dir, &PathBuf::from("foo.txt")).find(&opts)?
+            LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?.find(&opts)?
         );
 
         temp.child("subdir/foo2.txt").write_str("test")?;
@@ -565,7 +584,7 @@ mod tests {
                 SyncedFileState::Final,
                 temp.child("subdir/foo2.txt").to_path_buf()
             ),
-            LogicalPath::new(&dir, &PathBuf::from("subdir/foo2.txt")).find(&opts)?
+            LogicalPath::new(&dir, &PathBuf::from("subdir/foo2.txt"))?.find(&opts)?
         );
 
         temp.child(".bar.txt.part").write_str("test")?;
@@ -574,7 +593,7 @@ mod tests {
                 SyncedFileState::Partial,
                 temp.child(".bar.txt.part").to_path_buf()
             ),
-            LogicalPath::new(&dir, &PathBuf::from("bar.txt")).find(&opts)?
+            LogicalPath::new(&dir, &PathBuf::from("bar.txt"))?.find(&opts)?
         );
 
         temp.child("subdir/.bar2.txt.part").write_str("test")?;
@@ -583,11 +602,11 @@ mod tests {
                 SyncedFileState::Partial,
                 temp.child("subdir/.bar2.txt.part").to_path_buf()
             ),
-            LogicalPath::new(&dir, &PathBuf::from("subdir/bar2.txt")).find(&opts)?
+            LogicalPath::new(&dir, &PathBuf::from("subdir/bar2.txt"))?.find(&opts)?
         );
 
         assert!(matches!(
-            LogicalPath::new(&dir, &PathBuf::from("notfound.txt")).find(&opts),
+            LogicalPath::new(&dir, &PathBuf::from("notfound.txt"))?.find(&opts),
             Err(RealizeError::Io(_))
         ));
 
@@ -610,11 +629,11 @@ mod tests {
                 SyncedFileState::Partial,
                 temp.child(".foo.txt.part").to_path_buf()
             ),
-            LogicalPath::new(&dir, &PathBuf::from("foo.txt")).find(&opts)?
+            LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?.find(&opts)?
         );
         assert_eq!(
             (SyncedFileState::Final, temp.child("foo.txt").to_path_buf()),
-            LogicalPath::new(&dir, &PathBuf::from("foo.txt")).find(&nopartial)?
+            LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?.find(&nopartial)?
         );
 
         Ok(())
@@ -630,7 +649,7 @@ mod tests {
 
         temp.child(".foo.txt.part").write_str("test")?;
         assert!(
-            LogicalPath::new(&dir, &PathBuf::from("foo.txt"))
+            LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?
                 .find(&nopartial)
                 .is_err()
         );
@@ -638,10 +657,49 @@ mod tests {
         temp.child("bar.txt").write_str("test")?;
         assert_eq!(
             (SyncedFileState::Final, temp.child("bar.txt").to_path_buf()),
-            LogicalPath::new(&dir, &PathBuf::from("bar.txt")).find(&nopartial)?
+            LogicalPath::new(&dir, &PathBuf::from("bar.txt"))?.find(&nopartial)?
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn test_logical_path_validation_relative() {
+        let dir = Arc::new(Directory::new(
+            &DirectoryId::from("testdir"),
+            &PathBuf::from("/tmp/testdir"),
+        ));
+
+        // Empty path
+        let empty = PathBuf::from("");
+        assert!(matches!(
+            LogicalPath::new(&dir, &empty),
+            Err(RealizeError::BadRequest(_))
+        ));
+
+        // Absolute path
+        let abs = PathBuf::from("/foo/bar.txt");
+        assert!(matches!(
+            LogicalPath::new(&dir, &abs),
+            Err(RealizeError::BadRequest(_))
+        ));
+
+        // Path with '..'
+        let dotdot = PathBuf::from("foo/../bar.txt");
+        assert!(matches!(
+            LogicalPath::new(&dir, &dotdot),
+            Err(RealizeError::BadRequest(_))
+        ));
+
+        // Valid path
+        let valid = PathBuf::from("foo/bar.txt");
+        assert!(LogicalPath::new(&dir, &valid).is_ok());
+        let valid2 = PathBuf::from("subdir/file.txt");
+        assert!(LogicalPath::new(&dir, &valid2).is_ok());
+        let hidden_file = PathBuf::from("foo/.bar.txt");
+        assert!(LogicalPath::new(&dir, &hidden_file).is_ok());
+        let hidden_dir = PathBuf::from(".subdir/file.txt");
+        assert!(LogicalPath::new(&dir, &hidden_dir).is_ok());
     }
 
     #[tokio::test]
@@ -711,7 +769,7 @@ mod tests {
     async fn test_send_wrong_order() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
 
-        let fpath = LogicalPath::new(&dir, &PathBuf::from("wrong_order.txt"));
+        let fpath = LogicalPath::new(&dir, &PathBuf::from("wrong_order.txt"))?;
 
         server
             .clone()
@@ -755,7 +813,7 @@ mod tests {
     async fn test_read() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
 
-        let fpath = LogicalPath::new(&dir, &PathBuf::from("wrong_order.txt"));
+        let fpath = LogicalPath::new(&dir, &PathBuf::from("wrong_order.txt"))?;
         fs::write(fpath.final_path(), "abcdefghij")?;
 
         let data = server
@@ -802,7 +860,7 @@ mod tests {
     async fn test_finish_partial() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
 
-        let fpath = LogicalPath::new(&dir, &PathBuf::from("finish_partial.txt"));
+        let fpath = LogicalPath::new(&dir, &PathBuf::from("finish_partial.txt"))?;
         fs::write(fpath.partial_path(), "abcde")?;
 
         server
@@ -825,7 +883,7 @@ mod tests {
     async fn test_finish_final() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
 
-        let fpath = LogicalPath::new(&dir, &PathBuf::from("finish_partial.txt"));
+        let fpath = LogicalPath::new(&dir, &PathBuf::from("finish_partial.txt"))?;
         fs::write(fpath.final_path(), "abcde")?;
 
         server
@@ -847,7 +905,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_truncates_file() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
-        let fpath = LogicalPath::new(&dir, &PathBuf::from("truncate.txt"));
+        let fpath = LogicalPath::new(&dir, &PathBuf::from("truncate.txt"))?;
         // Write a file with more data than we will send
         std::fs::write(fpath.partial_path(), b"abcdefghij")?;
         // Now send a chunk that should truncate the file to 7 bytes
@@ -872,7 +930,7 @@ mod tests {
     async fn test_hash_final_and_partial() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
         let content = b"hello world";
-        let fpath = LogicalPath::new(&dir, &PathBuf::from("foo.txt"));
+        let fpath = LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?;
         std::fs::write(fpath.final_path(), content)?;
         let hash = server
             .clone()
@@ -890,7 +948,7 @@ mod tests {
 
         // Now test partial
         let content2 = b"partial content";
-        let fpath2 = LogicalPath::new(&dir, &PathBuf::from("bar.txt"));
+        let fpath2 = LogicalPath::new(&dir, &PathBuf::from("bar.txt"))?;
         std::fs::write(fpath2.partial_path(), content2)?;
         let hash2 = server
             .clone()
@@ -911,7 +969,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_final_and_partial() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
-        let fpath = LogicalPath::new(&dir, &PathBuf::from("foo.txt"));
+        let fpath = LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?;
         std::fs::write(fpath.final_path(), b"data")?;
         std::fs::write(fpath.partial_path(), b"data2")?;
         assert!(fpath.final_path().exists());
@@ -1014,7 +1072,7 @@ mod tests {
             .await;
         assert!(res.is_ok());
         // File should now match new_content
-        let logical = LogicalPath::new(&dir, &file_path);
+        let logical = LogicalPath::new(&dir, &file_path)?;
         let (_state, actual) = logical.find(&Options::default())?;
         let mut buf = Vec::new();
         std::fs::File::open(&actual)?.read_to_end(&mut buf)?;
@@ -1120,7 +1178,7 @@ mod tests {
             .await;
         assert!(res.is_ok());
         // File should now match new_content and be truncated
-        let logical = LogicalPath::new(&dir, &file_path);
+        let logical = LogicalPath::new(&dir, &file_path)?;
         let (_state, actual) = logical.find(&Options::default())?;
         let mut buf = Vec::new();
         std::fs::File::open(&actual)?.read_to_end(&mut buf)?;
@@ -1237,7 +1295,7 @@ mod tests {
         let nested_dir = temp.child("a/b/c");
         std::fs::create_dir_all(nested_dir.path())?;
         let file_path = PathBuf::from("a/b/c/file.txt");
-        let logical = LogicalPath::new(&dir, &file_path);
+        let logical = LogicalPath::new(&dir, &file_path)?;
         std::fs::write(logical.final_path(), b"data")?;
         // Delete the file
         server
@@ -1267,7 +1325,7 @@ mod tests {
         std::fs::create_dir_all(nested_dir.path())?;
         let file_path = PathBuf::from("a/b/c/file.txt");
         let keep_path = temp.child("a/b/c/keep.txt");
-        let logical = LogicalPath::new(&dir, &file_path);
+        let logical = LogicalPath::new(&dir, &file_path)?;
         std::fs::write(logical.final_path(), b"data")?;
         std::fs::write(keep_path.path(), b"keep")?;
         // Delete the file
