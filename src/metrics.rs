@@ -3,13 +3,13 @@ use std::time::Instant;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use prometheus::{
-    register_histogram_vec, register_int_counter_vec, Encoder, HistogramVec, IntCounterVec,
+    Encoder, HistogramVec, IntCounterVec, register_histogram_vec, register_int_counter_vec,
 };
 use tarpc::{
-    client::{stub::Stub, RpcError},
+    ServerError,
+    client::{RpcError, stub::Stub},
     context::Context,
     server::Serve,
-    ServerError,
 };
 use tokio::net::TcpListener;
 
@@ -427,7 +427,7 @@ mod tests {
                         match mf.get_field_type() {
                             MetricType::COUNTER => return m.get_counter().value(),
                             MetricType::HISTOGRAM => {
-                                return m.get_histogram().get_sample_count() as f64
+                                return m.get_histogram().get_sample_count() as f64;
                             }
                             _ => {}
                         }
@@ -495,14 +495,16 @@ mod tests {
                 ("error", "BadRequest"),
             ],
         );
-        assert!(client
-            .list(
-                tarpc::context::current(),
-                DirectoryId::from("doesnotexist"),
-                Options::default(),
-            )
-            .await?
-            .is_err());
+        assert!(
+            client
+                .list(
+                    tarpc::context::current(),
+                    DirectoryId::from("doesnotexist"),
+                    Options::default(),
+                )
+                .await?
+                .is_err()
+        );
         let after_err = get_metric_value(
             "realize_client_call_count",
             &[
@@ -550,14 +552,16 @@ mod tests {
                 ("error", "BadRequest"),
             ],
         );
-        assert!(client
-            .list(
-                tarpc::context::current(),
-                DirectoryId::from("doesnotexist"),
-                Options::default(),
-            )
-            .await?
-            .is_err());
+        assert!(
+            client
+                .list(
+                    tarpc::context::current(),
+                    DirectoryId::from("doesnotexist"),
+                    Options::default(),
+                )
+                .await?
+                .is_err()
+        );
         let after_srv_err = get_metric_value(
             "realize_server_call_count",
             &[
