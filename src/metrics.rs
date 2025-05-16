@@ -1,7 +1,15 @@
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use prometheus::Encoder;
+use tarpc::{
+    ServerError,
+    client::{RpcError, stub::Stub},
+    context::Context,
+    server::Serve,
+};
 use tokio::net::TcpListener;
+
+use crate::model::service::{RealizeServiceRequest, RealizeServiceResponse};
 
 pub async fn export_metrics(metrics_addr: &str) -> anyhow::Result<()> {
     let listener = TcpListener::bind(metrics_addr).await?;
@@ -65,4 +73,61 @@ pub async fn push_metrics(
     .await??;
 
     Ok(())
+}
+
+/// Add service-specific metrics to a [ServeRealizeService] instance.
+#[derive(Clone)]
+pub struct MetricsRealizeServer<T> {
+    inner: T,
+}
+impl<T> MetricsRealizeServer<T>
+where
+    T: Serve<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+{
+    pub fn new(inner: T) -> Self {
+        Self { inner }
+    }
+}
+impl<T> Serve for MetricsRealizeServer<T>
+where
+    T: Serve<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+{
+    type Req = RealizeServiceRequest;
+    type Resp = RealizeServiceResponse;
+
+    async fn serve(self, ctx: Context, req: Self::Req) -> Result<Self::Resp, ServerError> {
+        self.inner.serve(ctx, req).await
+    }
+}
+
+/// Stub that sets default deadlines based on method type.
+#[derive(Clone)]
+pub struct MetricsRealizeClient<T>
+where
+    T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse> + Clone,
+{
+    inner: T,
+}
+
+impl<T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse> + Clone>
+    MetricsRealizeClient<T>
+{
+    pub fn new(stub: T) -> Self {
+        Self { inner: stub }
+    }
+}
+
+impl<T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse> + Clone> Stub
+    for MetricsRealizeClient<T>
+{
+    type Req = RealizeServiceRequest;
+    type Resp = RealizeServiceResponse;
+
+    async fn call(
+        &self,
+        ctx: Context,
+        req: RealizeServiceRequest,
+    ) -> Result<RealizeServiceResponse, RpcError> {
+        self.inner.call(ctx, req).await
+    }
 }

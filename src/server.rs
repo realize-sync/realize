@@ -1,4 +1,5 @@
 use crate::client::DeadlineSetter;
+use crate::metrics::MetricsRealizeClient;
 use crate::model::service::Options;
 use crate::model::service::{
     ByteRange, DirectoryId, RealizeError, RealizeService, Result, RsyncOperation, SyncedFile,
@@ -58,7 +59,11 @@ impl RealizeServer {
     pub fn as_inprocess_client(
         self,
     ) -> RealizeServiceClient<
-        DeadlineSetter<tarpc::client::Channel<RealizeServiceRequest, RealizeServiceResponse>>,
+        DeadlineSetter<
+            MetricsRealizeClient<
+                tarpc::client::Channel<RealizeServiceRequest, RealizeServiceResponse>,
+            >,
+        >,
     > {
         let (client_transport, server_transport) = tarpc::transport::channel::unbounded();
         let server = tarpc::server::BaseChannel::with_defaults(server_transport);
@@ -71,7 +76,7 @@ impl RealizeServer {
         );
         let client = tarpc::client::new(tarpc::client::Config::default(), client_transport).spawn();
 
-        RealizeServiceClient::from(DeadlineSetter::new(client))
+        RealizeServiceClient::from(DeadlineSetter::new(MetricsRealizeClient::new(client)))
     }
 }
 

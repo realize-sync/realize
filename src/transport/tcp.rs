@@ -15,6 +15,8 @@ use tarpc::tokio_serde::formats::Bincode;
 use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
 
 use crate::client::DeadlineSetter;
+use crate::metrics::MetricsRealizeClient;
+use crate::metrics::MetricsRealizeServer;
 use crate::model::service::RealizeServiceRequest;
 use crate::model::service::RealizeServiceResponse;
 use crate::model::service::{RealizeService, RealizeServiceClient};
@@ -48,7 +50,11 @@ pub async fn connect_client<T>(
     privkey: Arc<dyn SigningKey>,
 ) -> anyhow::Result<
     RealizeServiceClient<
-        DeadlineSetter<tarpc::client::Channel<RealizeServiceRequest, RealizeServiceResponse>>,
+        DeadlineSetter<
+            MetricsRealizeClient<
+                tarpc::client::Channel<RealizeServiceRequest, RealizeServiceResponse>,
+            >,
+        >,
     >,
 >
 where
@@ -64,7 +70,7 @@ where
     let transport = transport::new(codec_builder.new_framed(stream), Bincode::default());
 
     let client = tarpc::client::new(Default::default(), transport).spawn();
-    let client = RealizeServiceClient::from(DeadlineSetter::new(client));
+    let client = RealizeServiceClient::from(DeadlineSetter::new(MetricsRealizeClient::new(client)));
 
     Ok(client)
 }
@@ -131,7 +137,9 @@ impl RunningServer {
 
             tokio::spawn(
                 BaseChannel::with_defaults(transport::new(framed, Bincode::default()))
-                    .execute(RealizeServer::serve(self.server.clone()))
+                    .execute(MetricsRealizeServer::new(RealizeServer::serve(
+                        self.server.clone(),
+                    )))
                     .for_each(async move |fut| {
                         tokio::spawn(fut);
                     }),
