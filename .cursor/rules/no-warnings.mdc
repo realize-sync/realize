@@ -1,18 +1,19 @@
 ---
-description: No Warnings
+description: Fix any warnings from cargo output
 globs: *.rs
 alwaysApply: false
 ---
+
 # No Warnings
 
-This rule ensures that code cannot be committed if it generates any Rust compiler warnings.
+This rule ensures that code cannot be built or tested if it generates any Rust compiler warnings.
 
 <rule>
 name: no_warnings
-description: Prevents commits that would introduce Rust compiler warnings
+description: Prevents any build or test that would introduce Rust compiler warnings
 filters:
   - type: event
-    pattern: "pre_commit"
+    pattern: "cargo_output|pre_commit"
     file_pattern: "*.rs"
 
 actions:
@@ -22,7 +23,7 @@ actions:
       type: reject
       message: |
         Build failed because warnings are treated as errors.
-        Fix all warnings before committing.
+        Fix all warnings before proceeding.
         Run `cargo build` to see the warnings.
 
   - type: suggest
@@ -51,15 +52,16 @@ examples:
 
       // Bad: Unused import
       use std::collections::HashMap; // Warning if not used
-      
+
       // Good: Only import what you use
       use std::fmt::Write;
       fn main() {
           let mut s = String::new();
           write!(s, "Hello").unwrap();
       }
-    output: "Fix all warnings before committing"
+    output: "Fix all warnings before proceeding"
 
 metadata:
   priority: high
-  version: 1.0
+  version: 1.1
+</rule>
