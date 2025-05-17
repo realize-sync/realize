@@ -657,6 +657,85 @@ async fn test_set_rate_limits() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_remote_to_remote_multiple_directory_ids() -> anyhow::Result<()> {
+    env_logger::try_init().ok();
+    let tempdir = TempDir::new()?;
+    let src_dir1 = tempdir.child("src_multi1");
+    let src_dir2 = tempdir.child("src_multi2");
+    let dst_dir1 = tempdir.child("dst_multi1");
+    let dst_dir2 = tempdir.child("dst_multi2");
+    util::create_dir_with_files(&src_dir1, &[("foo1.txt", "foo1")])?;
+    util::create_dir_with_files(&src_dir2, &[("foo2.txt", "foo2")])?;
+    std::fs::create_dir(dst_dir1.path())?;
+    std::fs::create_dir(dst_dir2.path())?;
+    let keys = util::test_keys();
+    let (crypto, verifier): (Arc<rustls::crypto::CryptoProvider>, Arc<PeerVerifier>) =
+        util::setup_crypto_and_verifier();
+    let privkey_a = Arc::from(
+        crypto
+            .key_provider
+            .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_a_path.as_ref())?)?,
+    );
+    let privkey_b = Arc::from(
+        crypto
+            .key_provider
+            .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_b_path.as_ref())?)?,
+    );
+    // Setup src server with two directories
+    let src_dirs = DirectoryMap::new([
+        realize::server::Directory::new(&DirectoryId::from("dir1"), src_dir1.path()),
+        realize::server::Directory::new(&DirectoryId::from("dir2"), src_dir2.path()),
+    ]);
+    let (src_addr, src_handle) =
+        tcp::start_server("127.0.0.1:0", src_dirs, verifier.clone(), privkey_a).await?;
+    // Setup dst server with two directories
+    let dst_dirs = DirectoryMap::new([
+        realize::server::Directory::new(&DirectoryId::from("dir1"), dst_dir1.path()),
+        realize::server::Directory::new(&DirectoryId::from("dir2"), dst_dir2.path()),
+    ]);
+    let (dst_addr, dst_handle) =
+        tcp::start_server("127.0.0.1:0", dst_dirs, verifier, privkey_b).await?;
+    // Run realize with two --directory-id arguments
+    let test = tokio::spawn(async move {
+        let status = tokio::process::Command::new(cargo_bin!("realize"))
+            .arg("--quiet")
+            .arg("--src-addr")
+            .arg(&src_addr.to_string())
+            .arg("--dst-addr")
+            .arg(&dst_addr.to_string())
+            .arg("--privkey")
+            .arg(keys.privkey_a_path.as_ref())
+            .arg("--peers")
+            .arg(&keys.peers_path)
+            .arg("--directory-id")
+            .arg("dir1")
+            .arg("--directory-id")
+            .arg("dir2")
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()
+            .await?;
+        assert!(status.success());
+        Ok::<(), anyhow::Error>(())
+    });
+    let result = test.await;
+    src_handle.abort();
+    dst_handle.abort();
+    result??;
+    assert_eq_unordered!(
+        util::dir_content(&dst_dir1)?,
+        vec![PathBuf::from("foo1.txt")]
+    );
+    assert_eq_unordered!(
+        util::dir_content(&dst_dir2)?,
+        vec![PathBuf::from("foo2.txt")]
+    );
+    assert_eq_unordered!(util::dir_content(&src_dir1)?, vec![]);
+    assert_eq_unordered!(util::dir_content(&src_dir2)?, vec![]);
+    Ok(())
+}
+
 mod util {
     use super::*;
     use std::path::PathBuf;

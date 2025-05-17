@@ -1,10 +1,10 @@
 use anyhow::Context as _;
-use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
+use async_speed_limit::Limiter;
 use clap::Parser;
 use console::style;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use prometheus::{IntCounter, register_int_counter};
+use prometheus::{register_int_counter, IntCounter};
 use realize::algo::{FileProgress as AlgoFileProgress, MoveFileError, Progress};
 use realize::metrics;
 use realize::model::service::DirectoryId;
@@ -17,8 +17,8 @@ use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use rustls::sign::SigningKey;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 lazy_static::lazy_static! {
     static ref METRIC_UP: IntCounter =
@@ -53,9 +53,10 @@ struct Cli {
     #[arg(long, required = false)]
     peers: Option<PathBuf>,
 
-    /// Directory id (optional, defaults to 'dir' for local/local)
-    #[arg(long, required = false)]
-    directory_id: Option<String>,
+    /// Directory id(s) (optional, defaults to 'dir' for local/local).
+    // When both --src-addr and --dst-addr are set, you may specify multiple --directory-id arguments.
+    #[arg(long = "directory-id", required = false, num_args = 0.., value_name = "ID")]
+    directory_ids: Vec<String>,
 
     /// Suppress all output except errors
     #[arg(long)]
@@ -143,12 +144,12 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
             .with_context(|| format!("Failed to export metrics on {addr}"))?;
     }
 
-    // Directory id
-    let dir_id = DirectoryId::from(
-        cli.directory_id
-            .clone()
-            .unwrap_or_else(|| "dir".to_string()),
-    );
+    // Directory id(s)
+    let directory_ids = if cli.directory_ids.is_empty() {
+        vec!["dir".to_string()]
+    } else {
+        cli.directory_ids.clone()
+    };
 
     // Determine mode
     let src_is_remote = cli.src_addr.is_some();
@@ -165,6 +166,11 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
     if !(src_is_remote || src_is_local) || !(dst_is_remote || dst_is_local) {
         return Err(anyhow::anyhow!(
             "Must specify both source and destination (local or remote)"
+        ));
+    }
+    if !(src_is_remote && dst_is_remote) && directory_ids.len() > 1 {
+        return Err(anyhow::anyhow!(
+            "Multiple --directory-id values are only allowed when both --src-addr and --dst-addr are set."
         ));
     }
 
@@ -194,7 +200,7 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
     // Build src client
     let src_client = if src_is_local {
         let src_path = cli.src_path.as_ref().unwrap();
-        let server = RealizeServer::for_dir(&dir_id, src_path);
+        let server = RealizeServer::for_dir(&DirectoryId::from(directory_ids[0].clone()), src_path);
         server.as_inprocess_client()
     } else {
         let addr = cli.src_addr.as_ref().unwrap();
@@ -212,7 +218,7 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
     // Build dst client
     let dst_client = if dst_is_local {
         let dst_path = cli.dst_path.as_ref().unwrap();
-        let server = RealizeServer::for_dir(&dir_id, dst_path);
+        let server = RealizeServer::for_dir(&DirectoryId::from(directory_ids[0].clone()), dst_path);
         server.as_inprocess_client()
     } else {
         let addr = cli.dst_addr.as_ref().unwrap();
@@ -241,23 +247,32 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
         }
     }
 
-    // Move files
-    let mut progress = CliProgress::new(cli.quiet);
     METRIC_UP.inc();
-    let result = realize::algo::move_files(&src_client, &dst_client, dir_id, &mut progress).await;
-    progress.finish_and_clear();
-    let (success, error) = result?;
 
-    if error > 0 {
+    // Move files for each directory id
+    let mut total_success = 0;
+    let mut total_error = 0;
+    let mut progress = CliProgress::new(cli.quiet);
+    for dir_id_str in directory_ids {
+        let dir_id = DirectoryId::from(dir_id_str);
+        let result =
+            realize::algo::move_files(&src_client, &dst_client, dir_id, &mut progress).await;
+        let (success, error) = result?;
+        total_success += success;
+        total_error += error;
+    }
+    progress.finish_and_clear();
+
+    if total_error > 0 {
         return Err(anyhow::anyhow!(
-            "{error} file(s) failed, and {success} files(s) moved"
+            "{total_error} file(s) failed, and {total_success} files(s) moved"
         ));
     }
     if !cli.quiet {
         println!(
             "{} {} file(s) moved",
             style("SUCCESS").for_stdout().green().bold(),
-            success
+            total_success
         );
     }
 
