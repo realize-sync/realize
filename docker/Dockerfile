@@ -3,41 +3,43 @@
 # Build it with:
 #  docker build -t realize-daemon -f docker/Dockerfile $PWD
 
-# Use a Rust base image with Cargo installed
-FROM rust:1.86.0-alpine3.20 AS builder
+# --- 1. Build stage
+FROM rust:1.87.0-alpine3.21 AS builder
 RUN apk add gcc make musl-dev
-
-# Set the working directory inside the container
 WORKDIR /usr/src/app
 
-# Copy the Cargo.toml and Cargo.lock files
+# --- 1.1 fetch dependencies
 COPY Cargo.toml Cargo.lock ./
-
-# Create an empty src directory to trick Cargo into thinking it's a valid Rust project
 RUN mkdir src && echo "fn main() {}" > src/main.rs
-
-# Build the dependencies without the actual source code to cache dependencies separately
 RUN cargo build --release
 
-# Now copy the source code
+# --- 1.2 build application
 RUN rm src/main.rs
 COPY ./src ./src
-
-# Build the application
 RUN cargo build --release --bin realized
 
-# --- Runtime stage ---
-FROM alpine:3.20
-RUN apk add --no-cache ca-certificates openssl
+# --- 2. Runtime stage
+FROM alpine:3.21 AS runtime
+#RUN apk add --no-cache ca-certificates openssl
 
+# --- 2.1 Configuration
+ENV PORT=9771
+ENV UID=500
+ENV GID=500
+ENV ADDRESS=0.0.0.0:9771
+
+# Server private key
+ENV PRIVKEY=/config/private.key
+
+# Config file
+ENV CONFIG=/config/config.yaml
+
+# --- 2.2 entry point
 COPY ./docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# Env setup
+# --- 2.3 environment
 WORKDIR /app
-ENV UID=500
-ENV GID=500
-
 RUN addgroup \
     --gid "$GID" \
     "realized" \
@@ -51,17 +53,10 @@ RUN addgroup \
     realized \
 && chown "$GID:$UID" .
 
-EXPOSE 9771
-ENV ADDRESS=0.0.0.0:9771
-
-# Server private key
-ENV PRIVKEY=/config/private.key
-
-# Server configuration
-ENV CONFIG=/config/config.yaml
-
-# Copy the realized binary from the builder
+# --- 2.4 binary
 COPY --from=builder /usr/src/app/target/release/realized /usr/local/bin/realized
 
+# --- 2.5 run
+EXPOSE $PORT
 USER realized
 ENTRYPOINT [ "/entrypoint.sh" ]
