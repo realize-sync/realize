@@ -3,7 +3,7 @@ use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
 use clap::Parser;
 use console::style;
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use prometheus::{IntCounter, register_int_counter};
 use realize::algo::{FileProgress as AlgoFileProgress, MoveFileError, Progress};
 use realize::metrics;
@@ -19,6 +19,11 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+lazy_static::lazy_static! {
+    static ref METRIC_UP: IntCounter =
+        register_int_counter!("realize_cmd_up", "Command is up").unwrap();
+}
 
 /// Realize command-line tool
 #[derive(Parser, Debug)]
@@ -77,17 +82,17 @@ struct Cli {
     metrics_instance: Option<String>,
 
     /// Throttle download (reading from src) in bytes/sec. Only applies to remote services.
-    #[arg(long, required = false)]
+    #[arg(long, required = false, value_parser = |s: &str| parse_bytes(s))]
     throttle_down: Option<u64>,
 
     /// Throttle uploads (writing to dst) in bytes/sec.  Only applies to remote services.
-    #[arg(long, required = false)]
+    #[arg(long, required = false, value_parser = |s: &str| parse_bytes(s))]
     throttle_up: Option<u64>,
 }
 
-lazy_static::lazy_static! {
-    static ref METRIC_UP: IntCounter =
-        register_int_counter!("realize_cmd_up", "Command is up").unwrap();
+/// Parse byte arguments
+fn parse_bytes(str: &str) -> Result<u64, parse_size::Error> {
+    parse_size::Config::new().with_binary().parse_size(str)
 }
 
 #[tokio::main]
@@ -213,7 +218,7 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
         let addr = cli.dst_addr.as_ref().unwrap();
         let mut options = tcp::ClientOptions::default();
         if let Some(limit) = cli.throttle_up {
-            log::info!("Throttling uploads: {limit} bytes/sec");
+            log::info!("Throttling uploads: {}/s", HumanBytes(limit));
             options.limiter = Some(Limiter::<StandardClock>::new(limit as f64));
         }
         tcp::connect_client(
@@ -232,7 +237,7 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
             .await
             .with_context(|| format!("Failed to apply --throttle-down={limit}"))?
         {
-            log::info!("Throttling downloads: {val} bytes/sec");
+            log::info!("Throttling downloads: {}/s", HumanBytes(val));
         }
     }
 

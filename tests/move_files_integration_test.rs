@@ -637,9 +637,9 @@ async fn test_set_rate_limits() -> anyhow::Result<()> {
         .arg("--directory-id")
         .arg(dir_id.to_string())
         .arg("--throttle-down")
-        .arg("2048")
+        .arg("2k")
         .arg("--throttle-up")
-        .arg("1024")
+        .arg("1k")
         .env("RUST_LOG", "debug")
         .output()
         .await?;
@@ -647,11 +647,11 @@ async fn test_set_rate_limits() -> anyhow::Result<()> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stderr.contains("Throttling downloads: 2048 bytes/sec"),
+        stderr.contains("Throttling downloads: 2.00 KiB/s"),
         "ERR: {stderr}\nOUT: {stdout}"
     );
     assert!(
-        stderr.contains("Throttling uploads: 1024 bytes/sec"),
+        stderr.contains("Throttling uploads: 1.00 KiB/s"),
         "ERR: {stderr}\nOUT: {stdout}"
     );
     Ok(())

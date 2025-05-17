@@ -20,6 +20,7 @@ hyper-util = "0.1"
 indicatif = "0.17"
 lazy_static = "1.5"
 log = "0.4"
+parse-size = "1.1"
 pathdiff = "0.2"
 prometheus = { version = "0.14", features = ["push"] }
 rustls = "0.23"
