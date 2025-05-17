@@ -76,11 +76,11 @@ struct Cli {
     #[arg(long)]
     metrics_instance: Option<String>,
 
-    /// Throttle download (reading from src) in bytes/sec
+    /// Throttle download (reading from src) in bytes/sec. Only applies to remote services.
     #[arg(long, required = false)]
     throttle_down: Option<u64>,
 
-    /// Throttle uploads (writing to dst) in bytes/sec
+    /// Throttle uploads (writing to dst) in bytes/sec.  Only applies to remote services.
     #[arg(long, required = false)]
     throttle_up: Option<u64>,
 }
