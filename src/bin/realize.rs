@@ -253,7 +253,7 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
     let mut total_success = 0;
     let mut total_error = 0;
     let mut progress = CliProgress::new(cli.quiet);
-    let display_dirid = directory_ids.len() > 0;
+    let display_dirid = directory_ids.len() >= 2;
     for dir_id_str in directory_ids {
         let dir_id = DirectoryId::from(dir_id_str);
         if display_dirid {
