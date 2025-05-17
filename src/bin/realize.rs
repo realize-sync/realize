@@ -1,10 +1,10 @@
 use anyhow::Context as _;
-use async_speed_limit::clock::StandardClock;
 use async_speed_limit::Limiter;
+use async_speed_limit::clock::StandardClock;
 use clap::Parser;
 use console::style;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use prometheus::{register_int_counter, IntCounter};
+use prometheus::{IntCounter, register_int_counter};
 use realize::algo::{FileProgress as AlgoFileProgress, MoveFileError, Progress};
 use realize::metrics;
 use realize::model::service::DirectoryId;
@@ -17,8 +17,8 @@ use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use rustls::sign::SigningKey;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 lazy_static::lazy_static! {
     static ref METRIC_UP: IntCounter =
@@ -54,8 +54,8 @@ struct Cli {
     peers: Option<PathBuf>,
 
     /// Directory id(s) (optional, defaults to 'dir' for local/local).
-    // When both --src-addr and --dst-addr are set, you may specify multiple --directory-id arguments.
-    #[arg(long = "directory-id", required = false, num_args = 0.., value_name = "ID")]
+    /// When both --src-addr and --dst-addr are set, you may specify multiple directory ids as positional arguments.
+    #[arg(value_name = "ID", required = false, num_args = 0..)]
     directory_ids: Vec<String>,
 
     /// Suppress all output except errors
@@ -170,7 +170,7 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
     }
     if !(src_is_remote && dst_is_remote) && directory_ids.len() > 1 {
         return Err(anyhow::anyhow!(
-            "Multiple --directory-id values are only allowed when both --src-addr and --dst-addr are set."
+            "Multiple directory ids are only allowed when both --src-addr and --dst-addr are set."
         ));
     }
 
