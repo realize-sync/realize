@@ -29,6 +29,13 @@ use walkdir::WalkDir;
 // Move this to the top-level, outside any impl
 const RSYNC_BLOCK_SIZE: usize = 4096;
 
+/// Type shortcut for client type.
+pub type DefaultRealizeServiceClient = RealizeServiceClient<
+    DeadlineSetter<
+        MetricsRealizeClient<tarpc::client::Channel<RealizeServiceRequest, RealizeServiceResponse>>,
+    >,
+>;
+
 #[derive(Clone)]
 pub struct DirectoryMap {
     dirs: Arc<HashMap<DirectoryId, Arc<Directory>>>,
@@ -92,15 +99,7 @@ impl RealizeServer {
     }
 
     /// Create an in-process RealizeServiceClient for this server instance.
-    pub fn as_inprocess_client(
-        self,
-    ) -> RealizeServiceClient<
-        DeadlineSetter<
-            MetricsRealizeClient<
-                tarpc::client::Channel<RealizeServiceRequest, RealizeServiceResponse>,
-            >,
-        >,
-    > {
+    pub fn as_inprocess_client(self) -> DefaultRealizeServiceClient {
         let (client_transport, server_transport) = tarpc::transport::channel::unbounded();
         let server = tarpc::server::BaseChannel::with_defaults(server_transport);
         tokio::spawn(
@@ -366,15 +365,16 @@ impl RealizeService for RealizeServer {
         if let (Some(limiter), Some(limit)) = (self.limiter.as_ref(), config.write_limit) {
             limiter.set_speed_limit(limit as f64);
         }
-        let write_limit = self.limiter.as_ref().and_then(|l| {
-            let lim = l.speed_limit();
-            if lim.is_finite() {
-                Some(lim as u64)
-            } else {
-                None
-            }
-        });
-        Ok(Config { write_limit })
+        Ok(Config {
+            write_limit: self.limiter.as_ref().and_then(|l| {
+                let lim = l.speed_limit();
+                if lim.is_finite() {
+                    Some(lim as u64)
+                } else {
+                    None
+                }
+            }),
+        })
     }
 }
 

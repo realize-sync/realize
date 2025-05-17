@@ -22,9 +22,8 @@ use crate::client::DeadlineSetter;
 use crate::metrics;
 use crate::metrics::MetricsRealizeClient;
 use crate::metrics::MetricsRealizeServer;
-use crate::model::service::RealizeServiceRequest;
-use crate::model::service::RealizeServiceResponse;
 use crate::model::service::{RealizeService, RealizeServiceClient};
+use crate::server::DefaultRealizeServiceClient;
 use crate::server::RealizeServer;
 use crate::transport::security;
 use crate::transport::security::PeerVerifier;
@@ -58,15 +57,7 @@ pub async fn connect_client<T>(
     server_addr: T,
     verifier: Arc<PeerVerifier>,
     privkey: Arc<dyn SigningKey>,
-) -> anyhow::Result<
-    RealizeServiceClient<
-        DeadlineSetter<
-            MetricsRealizeClient<
-                tarpc::client::Channel<RealizeServiceRequest, RealizeServiceResponse>,
-            >,
-        >,
-    >,
->
+) -> anyhow::Result<DefaultRealizeServiceClient>
 where
     T: tokio::net::ToSocketAddrs,
 {

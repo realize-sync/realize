@@ -73,6 +73,10 @@ struct Cli {
     /// Instance label for prometheus pushgateway (optional)
     #[arg(long)]
     metrics_instance: Option<String>,
+
+    /// Throttle download (src) in bytes/sec (applies to remote source)
+    #[arg(long, required = false)]
+    throttle_down: Option<u64>,
 }
 
 lazy_static::lazy_static! {
@@ -214,6 +218,16 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
         .with_context(|| format!("Connection to dst {addr} failed"))?
     };
 
+    // Apply throttle limits if set
+    if let Some(limit) = cli.throttle_down {
+        if let Some(val) = configure_limit(&src_client, limit)
+            .await
+            .with_context(|| format!("Failed to apply --throttle-down={limit}"))?
+        {
+            log::info!("Throttling src: {val} bytes/sec");
+        }
+    }
+
     // Move files
     let mut progress = CliProgress::new(cli.quiet);
     METRIC_UP.inc();
@@ -235,6 +249,26 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Set server-site write rate limit on client, return it.
+///
+/// Not all servers support setting rate limit; It's not an error if
+/// this function returns None.
+async fn configure_limit(
+    client: &realize::server::DefaultRealizeServiceClient,
+    limit: u64,
+) -> anyhow::Result<Option<u64>> {
+    let config = client
+        .configure(
+            tarpc::context::current(),
+            realize::model::service::Config {
+                write_limit: Some(limit),
+            },
+        )
+        .await??;
+
+    Ok(config.write_limit)
 }
 
 /// Print a warning message to stderr, with standard format.

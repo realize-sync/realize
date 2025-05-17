@@ -2,6 +2,8 @@ use assert_cmd::cargo::cargo_bin;
 use assert_fs::TempDir;
 use assert_fs::prelude::*;
 use assert_unordered::assert_eq_unordered;
+use realize::model::service::DirectoryId;
+use realize::server::DirectoryMap;
 use realize::server::RealizeServer;
 use realize::transport::security::{self, PeerVerifier};
 use realize::transport::tcp;
@@ -584,6 +586,68 @@ async fn test_realize_metrics_pushgateway() -> anyhow::Result<()> {
     // received the expected request.
     tokio::time::timeout(Duration::ZERO, pushgw_handle.join()).await???;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_throttle() -> anyhow::Result<()> {
+    env_logger::try_init().ok();
+
+    let tempdir = TempDir::new()?;
+    let src_dir = tempdir.child("src");
+    util::create_dir_with_files(&src_dir, &[("foo.txt", "hello")])?;
+
+    let dst_dir = tempdir.child("dst");
+    dst_dir.create_dir_all()?;
+
+    let keys = util::test_keys();
+    let (crypto, verifier): (Arc<rustls::crypto::CryptoProvider>, Arc<PeerVerifier>) =
+        util::setup_crypto_and_verifier();
+    let privkey_b = Arc::from(
+        crypto
+            .key_provider
+            .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_b_path.as_ref())?)?,
+    );
+    let dir_id = DirectoryId::from("testdir");
+    let (src_addr, _src_handle) = tcp::start_server(
+        "127.0.0.1:0",
+        DirectoryMap::for_dir(&dir_id, src_dir.path()),
+        Arc::clone(&verifier),
+        Arc::clone(&privkey_b),
+    )
+    .await?;
+    let (dst_addr, _dst_handle) = tcp::start_server(
+        "127.0.0.1:0",
+        DirectoryMap::for_dir(&dir_id, dst_dir.path()),
+        verifier,
+        privkey_b,
+    )
+    .await?;
+
+    let output = tokio::process::Command::new(cargo_bin!("realize"))
+        .arg("--quiet")
+        .arg("--src-addr")
+        .arg(&src_addr.to_string())
+        .arg("--dst-addr")
+        .arg(&dst_addr.to_string())
+        .arg("--privkey")
+        .arg(keys.privkey_a_path.as_ref())
+        .arg("--peers")
+        .arg(&keys.peers_path)
+        .arg("--directory-id")
+        .arg(dir_id.to_string())
+        .arg("--throttle-down")
+        .arg("2048")
+        .env("RUST_LOG", "debug")
+        .output()
+        .await?;
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stderr.contains("Throttling src: 2048 bytes/sec"),
+        "ERR: {stderr}\nOUT: {stdout}"
+    );
     Ok(())
 }
 
