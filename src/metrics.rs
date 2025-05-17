@@ -104,6 +104,7 @@ fn method_label(req: &RealizeServiceRequest) -> &'static str {
         RealizeServiceRequest::CalculateSignature { .. } => "calculate_signature",
         RealizeServiceRequest::Diff { .. } => "diff",
         RealizeServiceRequest::ApplyDelta { .. } => "apply_delta",
+        RealizeServiceRequest::Configure { .. } => "configure",
     }
 }
 
@@ -149,6 +150,7 @@ fn realize_error(res: &RealizeServiceResponse) -> Option<&RealizeError> {
         RealizeServiceResponse::CalculateSignature(Err(err)) => Some(err),
         RealizeServiceResponse::Diff(Err(err)) => Some(err),
         RealizeServiceResponse::ApplyDelta(Err(err)) => Some(err),
+        RealizeServiceResponse::Configure(Err(err)) => Some(err),
         RealizeServiceResponse::List(Ok(_)) => None,
         RealizeServiceResponse::Send(Ok(_)) => None,
         RealizeServiceResponse::Read(Ok(_)) => None,
@@ -158,6 +160,7 @@ fn realize_error(res: &RealizeServiceResponse) -> Option<&RealizeError> {
         RealizeServiceResponse::CalculateSignature(Ok(_)) => None,
         RealizeServiceResponse::Diff(Ok(_)) => None,
         RealizeServiceResponse::ApplyDelta(Ok(_)) => None,
+        RealizeServiceResponse::Configure(Ok(_)) => None,
     }
 }
 
@@ -191,7 +194,11 @@ fn range_bytes(req: &RealizeServiceRequest) -> Option<u64> {
         RealizeServiceRequest::CalculateSignature { range, .. } => Some(range),
         RealizeServiceRequest::Diff { range, .. } => Some(range),
         RealizeServiceRequest::ApplyDelta { range, .. } => Some(range),
-        _ => None,
+        RealizeServiceRequest::List { .. }
+        | RealizeServiceRequest::Finish { .. }
+        | RealizeServiceRequest::Hash { .. }
+        | RealizeServiceRequest::Delete { .. }
+        | RealizeServiceRequest::Configure { .. } => None,
     };
 
     range.map(|r| r.1 - r.0)
@@ -203,7 +210,13 @@ fn bytes_in(req: &RealizeServiceRequest) -> Option<u64> {
         RealizeServiceRequest::Send { data, .. } => Some(data.len() as u64),
         RealizeServiceRequest::Diff { signature, .. } => Some(signature.0.len() as u64),
         RealizeServiceRequest::ApplyDelta { delta, .. } => Some(delta.0.len() as u64),
-        _ => None,
+        RealizeServiceRequest::List { .. }
+        | RealizeServiceRequest::Read { .. }
+        | RealizeServiceRequest::Finish { .. }
+        | RealizeServiceRequest::Hash { .. }
+        | RealizeServiceRequest::Delete { .. }
+        | RealizeServiceRequest::CalculateSignature { .. }
+        | RealizeServiceRequest::Configure { .. } => None,
     }
 }
 

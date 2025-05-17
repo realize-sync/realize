@@ -321,6 +321,14 @@ impl RealizeService for RealizeServer {
         }
         Ok(())
     }
+
+    async fn configure(
+        self,
+        _ctx: tarpc::context::Context,
+        _config: crate::model::service::Config,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 fn partial_read(

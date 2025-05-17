@@ -64,6 +64,12 @@ pub struct Options {
     pub ignore_partial: bool,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+pub struct Config {
+    /// Optional write rate limit in bytes per second.
+    pub write_limit: Option<u64>,
+}
+
 /// The service trait for file synchronization.
 #[tarpc::service]
 pub trait RealizeService {
@@ -128,6 +134,9 @@ pub trait RealizeService {
         delta: Delta,
         options: Options,
     ) -> Result<()>;
+
+    /// Configure the service with the given config (e.g., set write rate limit).
+    async fn configure(config: Config) -> Result<()>;
 }
 
 /// Error type used by [RealizeService].

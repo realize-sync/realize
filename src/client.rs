@@ -47,7 +47,8 @@ impl<T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse> + Clone
                 | RealizeServiceRequest::Delete { .. }
                 | RealizeServiceRequest::CalculateSignature { .. }
                 | RealizeServiceRequest::Diff { .. }
-                | RealizeServiceRequest::ApplyDelta { .. } => {}
+                | RealizeServiceRequest::ApplyDelta { .. }
+                | RealizeServiceRequest::Configure { .. } => {}
             }
         };
 
