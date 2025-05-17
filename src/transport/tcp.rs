@@ -1,7 +1,7 @@
-use async_speed_limit::Limiter;
 use async_speed_limit::clock::Clock;
 use async_speed_limit::clock::StandardClock;
 use async_speed_limit::limiter::Consume;
+use async_speed_limit::Limiter;
 use futures::prelude::*;
 use rustls::pki_types::ServerName;
 use rustls::sign::SigningKey;
@@ -133,7 +133,11 @@ impl RunningServer {
     fn spawn(self) -> JoinHandle<()> {
         let accept = async move |stream: TcpStream| -> anyhow::Result<()> {
             let peer_addr = stream.peer_addr()?;
-            let tls_stream = self.acceptor.accept(stream).await?;
+            let limiter = Limiter::<StandardClock>::new(f64::INFINITY);
+            let tls_stream = self
+                .acceptor
+                .accept(RateLimitedStream::new(stream, limiter.clone()))
+                .await?;
 
             log::info!(
                 "Accepted peer {} from {}",

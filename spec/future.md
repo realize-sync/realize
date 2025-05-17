@@ -27,13 +27,12 @@ specified as download and upload limits on the command-line:
 --throttle-down 512k to throttle upload to 1M and download to
 512k/s.
 
-### Computing the rate limit
+### Computing the rate limit (DONE)
 
-Use governor for tracking the limits:
-https://docs.rs/governor/latest/governor/ See also user guide on
-https://docs.rs/governor/latest/governor/_guide/index.html
+Add async_speed_limit as a dependency for tracking the limits:
+https://docs.rs/async-speed-limit/0.4.2/async_speed_limit/index.html
 
-### Applying the rate limit to a tokio Stream
+### Applying the rate limit to a tokio Stream (DONE)
 
 Apply the rate limit on Stream, for correctness, by writing and the
 using RateLimitStream combinator.
@@ -49,7 +48,7 @@ However:
 For TCP, the stream will be a TCP stream, See RunningServer::bind.
 
 PROBLEM: In-process uses a Channel, not a Stream so rate-limiting
-would only be for remote connections.
+would only be for TCP connections, no in-process ones.
 
 ### Setting the rate limit
 
@@ -70,16 +69,16 @@ effect. Let's ignore that for now.)
 
 ### Task List
 
-1. Write a RateLimitStream combinator, unit-test it thoroughly.
+1. (DONE) Write a RateLimitStream combinator, unit-test it thoroughly.
 
 2. Add RealizeService.configure as described above, leave the
    implementation in RealizeServer a no-op. Write thorough unit tests,
    make sure all tests pass, fix any issues.
 
-3. Apply that combinator in RunningServer::bind src/transport/tcp.rs
-   and bind it to RealizeServer so RealizeServer.configure can set
-   the write limit. Write thorough unit tests, make sure all tests
-   pass, fix any issues.
+3. Create RateLimitStream in RunningServer::bind src/transport/tcp.rs
+   and pass the limiter to RealizeServer so RealizeServer.configure
+   can call Limiter::set_limit to set a different rate limit. Write
+   unit tests, make sure all tests pass, fix any issues.
 
 4. Extend the `realize` command in src/bin/realize.rs to call
    RealizeService.configure as configured by the command-line
