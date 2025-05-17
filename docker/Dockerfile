@@ -24,8 +24,6 @@ FROM alpine:3.21 AS runtime
 
 # --- 2.1 Configuration
 ENV PORT=9771
-ENV UID=500
-ENV GID=500
 ENV ADDRESS=0.0.0.0:9771
 
 # Server private key
@@ -34,24 +32,15 @@ ENV PRIVKEY=/config/private.key
 # Config file
 ENV CONFIG=/config/config.yaml
 
+# Configure logging
+ENV RUST_LOG=warn,realize::transport::tcp=info,realize::security=debug,realize::server=info
+
 # --- 2.2 entry point
 COPY ./docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 # --- 2.3 environment
 WORKDIR /app
-RUN addgroup \
-    --gid "$GID" \
-    "realized" \
-&&  adduser \
-    --disabled-password \
-    --gecos "" \
-    --home "$(pwd)" \
-    --ingroup "realized" \
-    --no-create-home \
-    --uid "$UID" \
-    realized \
-&& chown "$GID:$UID" .
 
 # --- 2.4 binary
 COPY --from=builder /usr/src/app/target/release/realized /usr/local/bin/realized
