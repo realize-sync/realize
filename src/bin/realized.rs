@@ -5,7 +5,7 @@ use anyhow::Context as _;
 use clap::Parser;
 use prometheus::{IntCounter, register_int_counter};
 use realize::metrics;
-use realize::server::{Directory, RealizeServer};
+use realize::server::{Directory, DirectoryMap};
 use realize::transport::security::{self, PeerVerifier};
 use realize::transport::tcp;
 use rustls::pki_types::pem::PemObject;
@@ -86,7 +86,7 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
             dirs.push(Directory::new(&id.as_str().into(), path.as_ref()));
         }
     }
-    let server = RealizeServer::new(dirs);
+    let dirs = DirectoryMap::new(dirs);
 
     // Build PeerVerifier
     let crypto = Arc::new(security::default_provider());
@@ -109,7 +109,7 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
             .with_context(|| format!("Failed to export metrics on {addr}"))?;
     }
 
-    let (addr, handle) = tcp::start_server(&cli.address, server, verifier, privkey)
+    let (addr, handle) = tcp::start_server(&cli.address, dirs, verifier, privkey)
         .await
         .with_context(|| format!("Server failed to start on {}", cli.address))?;
 

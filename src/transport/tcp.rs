@@ -1,7 +1,7 @@
+use async_speed_limit::Limiter;
 use async_speed_limit::clock::Clock;
 use async_speed_limit::clock::StandardClock;
 use async_speed_limit::limiter::Consume;
-use async_speed_limit::Limiter;
 use futures::prelude::*;
 use rustls::pki_types::ServerName;
 use rustls::sign::SigningKey;
@@ -30,6 +30,7 @@ use crate::transport::security;
 use crate::transport::security::PeerVerifier;
 use crate::utils::async_utils::AbortOnDrop;
 
+use crate::server::DirectoryMap;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -37,14 +38,14 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// Start the server, listening on the given address.
 pub async fn start_server<T>(
     addr: T,
-    server: RealizeServer,
+    dirs: DirectoryMap,
     verifier: Arc<PeerVerifier>,
     privkey: Arc<dyn SigningKey>,
 ) -> anyhow::Result<(SocketAddr, AbortOnDrop<()>)>
 where
     T: tokio::net::ToSocketAddrs,
 {
-    let server = RunningServer::bind(addr, server, verifier, privkey).await?;
+    let server = RunningServer::bind(addr, dirs, verifier, privkey).await?;
     let addr = server.local_addr()?;
     let handle = AbortOnDrop::new(server.spawn());
 
@@ -88,7 +89,7 @@ where
 struct RunningServer {
     acceptor: TlsAcceptor,
     listener: TcpListener,
-    server: RealizeServer,
+    dirs: DirectoryMap,
     verifier: Arc<PeerVerifier>,
 }
 
@@ -96,7 +97,7 @@ impl RunningServer {
     /// Bind to the address, but don't process client requests yet.
     async fn bind<T>(
         addr: T,
-        server: RealizeServer,
+        dirs: DirectoryMap,
         verifier: Arc<PeerVerifier>,
         privkey: Arc<dyn SigningKey>,
     ) -> anyhow::Result<Self>
@@ -105,7 +106,6 @@ impl RunningServer {
     {
         let acceptor = security::make_tls_acceptor(Arc::clone(&verifier), privkey)?;
         let listener = TcpListener::bind(&addr).await?;
-
         log::info!(
             "Listening for RPC connections on {:?}",
             listener
@@ -113,11 +113,10 @@ impl RunningServer {
                 .map(|addr| addr.to_string())
                 .unwrap_or_else(|err| err.to_string())
         );
-
         Ok(Self {
             acceptor,
             listener,
-            server,
+            dirs,
             verifier,
         })
     }
@@ -147,11 +146,11 @@ impl RunningServer {
                 peer_addr
             );
             let framed = LengthDelimitedCodec::builder().new_framed(tls_stream);
-
+            let server = RealizeServer::new_limited(self.dirs.clone(), limiter.clone());
             tokio::spawn(
                 BaseChannel::with_defaults(transport::new(framed, Bincode::default()))
                     .execute(MetricsRealizeServer::new(RealizeServer::serve(
-                        self.server.clone(),
+                        server.clone(),
                     )))
                     .for_each(async move |fut| {
                         tokio::spawn(metrics::track_in_flight_request(fut));
@@ -256,8 +255,7 @@ impl<S: Unpin, C: Clock> Unpin for RateLimitedStream<S, C> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::service::{DirectoryId, Options};
-    use crate::server::Directory;
+    use crate::model::service::{Config, DirectoryId, Options};
     use crate::utils::async_utils::AbortOnDrop;
     use assert_fs::TempDir;
     use async_speed_limit::clock::{ManualClock, Nanoseconds};
@@ -270,19 +268,10 @@ mod tests {
         verifier: Arc<PeerVerifier>,
     ) -> anyhow::Result<(SocketAddr, AbortOnDrop<()>, TempDir)> {
         let temp = TempDir::new()?;
-        let server_impl = RealizeServer::new(vec![Directory::new(
-            &DirectoryId::from("testdir"),
-            temp.path(),
-        )]);
+        let dirs = DirectoryMap::for_dir(&DirectoryId::from("testdir"), temp.path());
         let server_privkey =
             load_private_key(crate::transport::security::testing::server_private_key())?;
-        let server = RunningServer::bind(
-            "localhost:0",
-            server_impl,
-            Arc::clone(&verifier),
-            server_privkey,
-        )
-        .await?;
+        let server = RunningServer::bind("localhost:0", dirs, verifier, server_privkey).await?;
         let addr = server.local_addr()?;
         let server_handle = AbortOnDrop::new(server.spawn());
         Ok((addr, server_handle, temp))
@@ -449,6 +438,83 @@ mod tests {
         assert_eq!(limiter.total_bytes_consumed(), 9);
         assert_eq!(limiter.clock().now(), Nanoseconds(2_000_000_000));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_configure_tcp_returns_limit() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let dirs = DirectoryMap::for_dir(&DirectoryId::from("testdir"), temp.path());
+        let verifier = verifier_both();
+        let server_privkey =
+            load_private_key(crate::transport::security::testing::server_private_key())?;
+        let server = RunningServer::bind(
+            "localhost:0",
+            dirs.clone(),
+            verifier.clone(),
+            server_privkey,
+        )
+        .await?;
+        let addr = server.local_addr()?;
+        let server_handle = AbortOnDrop::new(server.spawn());
+        let client_privkey =
+            load_private_key(crate::transport::security::testing::client_private_key())?;
+        let client = connect_client("localhost", addr, verifier.clone(), client_privkey).await?;
+        let limit = 12345u64;
+        let config = client
+            .configure(
+                context::current(),
+                Config {
+                    write_limit: Some(limit),
+                },
+            )
+            .await?;
+        assert_eq!(config.unwrap().write_limit, Some(limit));
+        let config = client
+            .configure(context::current(), Config { write_limit: None })
+            .await?;
+        assert_eq!(config.unwrap().write_limit, Some(limit));
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_configure_tcp_per_connection_limit() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let dirs = DirectoryMap::for_dir(&DirectoryId::from("testdir"), temp.path());
+        let verifier = verifier_both();
+        let server_privkey =
+            load_private_key(crate::transport::security::testing::server_private_key())?;
+        let server = RunningServer::bind(
+            "localhost:0",
+            dirs.clone(),
+            verifier.clone(),
+            server_privkey,
+        )
+        .await?;
+        let addr = server.local_addr()?;
+        let server_handle = AbortOnDrop::new(server.spawn());
+        let client_privkey1 =
+            load_private_key(crate::transport::security::testing::client_private_key())?;
+        let client_privkey2 =
+            load_private_key(crate::transport::security::testing::client_private_key())?;
+        let client1 = connect_client("localhost", addr, verifier.clone(), client_privkey1).await?;
+        let client2 = connect_client("localhost", addr, verifier.clone(), client_privkey2).await?;
+        let limit = 54321u64;
+        let config1 = client1
+            .configure(
+                context::current(),
+                Config {
+                    write_limit: Some(limit),
+                },
+            )
+            .await?;
+        assert_eq!(config1.unwrap().write_limit, Some(limit));
+        let config2 = client2
+            .configure(context::current(), Config { write_limit: None })
+            .await?;
+        assert_eq!(config2.unwrap().write_limit, None);
+        server_handle.abort();
         Ok(())
     }
 }

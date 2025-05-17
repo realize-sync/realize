@@ -71,23 +71,33 @@ effect. Let's ignore that for now.)
 
 1. (DONE) Write a RateLimitStream combinator, unit-test it thoroughly.
 
-2. Add RealizeService.configure as described above, leave the
-   implementation in RealizeServer a no-op. Write thorough unit tests,
-   make sure all tests pass, fix any issues.
+2. (DONE) Add RealizeService.configure as described above, leave the
+   implementation in RealizeServer a no-op. Compile, fix any issues.
 
-3. Create RateLimitStream in RunningServer::bind src/transport/tcp.rs
-   and pass the limiter to RealizeServer so RealizeServer.configure
-   can call Limiter::set_limit to set a different rate limit. Write
-   unit tests, make sure all tests pass, fix any issues.
+3. (DONE) Modify RunningServer::bind src/transport/tcp.rs to pass the
+   limiter to RealizeServer so RealizeServer.configure can call
+   Limiter::set_limit to set a different rate limit.
+
+   To do that, modify RealizeServer constructor to take an
+   Arc<HashMap<DirectoryId, Arc<Directory>>> as well as a
+   Option<Limiter>, then, in RunningServer, instead of taking in a
+   RealizeServer instance, take in an Arc<HashMap<DirectoryId,
+   Arc<Directory>>> and use it and the existing limiter to build
+   per-connection RealiseServer instances.
+
+   Write unit tests, make sure all tests pass, fix any issues.
 
 4. Extend the `realize` command in src/bin/realize.rs to call
    RealizeService.configure as configured by the command-line
-   arguments throttle_up/down in bytes-per-second. Make sure
-   everything compiles, fix any issues.
+   arguments throttle_up/down in bytes-per-second (throttle_up sets
+   the limit on dst, throttle_down on src, both time using
+   RealizeService.configure()). Make sure everything compiles, fix any
+   issues.
 
-5. Add an integration test that sets these and checks for a log
-   entry (log::info!) that says that rate-limiting has and what it is
-   deep in the code. Make sure the test passes, fix any issues.
+5. Add an integration test that sets these and checks for a log entry
+   (log::info!) that says that rate-limiting has changed and what it
+   is in RealizeServer.configure. Make sure the test passes, fix any
+   issues.
 
 6. Change throttle_up/down command-line argument type to a type that
    accepts shortcuts like, for example, 1K or 1M for 1024 and

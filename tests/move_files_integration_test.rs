@@ -37,7 +37,7 @@ async fn test_local_to_remote() -> anyhow::Result<()> {
     );
     let server = RealizeServer::for_dir(&"testdir".into(), dst_dir.path());
     let (addr, server_handle) =
-        tcp::start_server("127.0.0.1:0", server, verifier, privkey_b).await?;
+        tcp::start_server("127.0.0.1:0", server.dirs.clone(), verifier, privkey_b).await?;
     let src_dir_path_for_cmd = src_dir_path.clone();
     let test = tokio::spawn(async move {
         let status = tokio::process::Command::new(cargo_bin!("realize"))
@@ -89,7 +89,7 @@ async fn test_remote_to_local() -> anyhow::Result<()> {
     );
     let server = RealizeServer::for_dir(&"testdir2".into(), src_dir.path());
     let (src_addr, server_handle) =
-        tcp::start_server("127.0.0.1:0", server, verifier, privkey_a).await?;
+        tcp::start_server("127.0.0.1:0", server.dirs.clone(), verifier, privkey_a).await?;
     let dst_dir_path_for_cmd = dst_dir_path.clone();
     let test = tokio::spawn(async move {
         let status = tokio::process::Command::new(cargo_bin!("realize"))
@@ -168,11 +168,21 @@ async fn test_remote_to_remote() -> anyhow::Result<()> {
             .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_b_path.as_ref())?)?,
     );
     let server_src = RealizeServer::for_dir(&"dir".into(), src_dir.path());
-    let (src_addr3, server_handle_src) =
-        tcp::start_server("127.0.0.1:0", server_src, verifier.clone(), privkey_a).await?;
+    let (src_addr3, server_handle_src) = tcp::start_server(
+        "127.0.0.1:0",
+        server_src.dirs.clone(),
+        verifier.clone(),
+        privkey_a,
+    )
+    .await?;
     let server_dst = RealizeServer::for_dir(&"dir".into(), dst_dir.path());
-    let (dst_addr3, server_handle_dst) =
-        tcp::start_server("127.0.0.1:0", server_dst, verifier.clone(), privkey_b).await?;
+    let (dst_addr3, server_handle_dst) = tcp::start_server(
+        "127.0.0.1:0",
+        server_dst.dirs.clone(),
+        verifier.clone(),
+        privkey_b,
+    )
+    .await?;
     let test = tokio::spawn(async move {
         let status = tokio::process::Command::new(cargo_bin!("realize"))
             .arg("--quiet")

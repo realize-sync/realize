@@ -136,7 +136,7 @@ pub trait RealizeService {
     ) -> Result<()>;
 
     /// Configure the service with the given config (e.g., set write rate limit).
-    async fn configure(config: Config) -> Result<()>;
+    async fn configure(config: Config) -> Result<Config>;
 }
 
 /// Error type used by [RealizeService].

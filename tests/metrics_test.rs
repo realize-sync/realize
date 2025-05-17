@@ -206,9 +206,8 @@ fn setup_inprocess_client() -> (
 ) {
     let temp = TempDir::new().unwrap();
     let dir_id = DirectoryId::from("testdir");
-    let server_impl =
-        RealizeServer::new(vec![realize::server::Directory::new(&dir_id, temp.path())]);
-    let client = server_impl.as_inprocess_client();
+    let client = RealizeServer::for_dir(&dir_id, temp.path()).as_inprocess_client();
+
     (temp, dir_id, client)
 }
 

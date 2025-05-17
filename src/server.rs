@@ -1,11 +1,14 @@
 use crate::client::DeadlineSetter;
 use crate::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
+use crate::model::service::Config;
 use crate::model::service::Options;
 use crate::model::service::{
     ByteRange, DirectoryId, RealizeError, RealizeService, Result, RsyncOperation, SyncedFile,
     SyncedFileState,
 };
 use crate::model::service::{RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse};
+use async_speed_limit::Limiter;
+use async_speed_limit::clock::StandardClock;
 use fast_rsync::{
     Signature as RsyncSignature, SignatureOptions, apply_limited as rsync_apply_limited,
     diff as rsync_diff,
@@ -27,26 +30,59 @@ use walkdir::WalkDir;
 const RSYNC_BLOCK_SIZE: usize = 4096;
 
 #[derive(Clone)]
-pub struct RealizeServer {
-    /// Maps directory IDs to local paths
-    dirs: HashMap<DirectoryId, Arc<Directory>>,
+pub struct DirectoryMap {
+    dirs: Arc<HashMap<DirectoryId, Arc<Directory>>>,
 }
 
-impl RealizeServer {
+impl DirectoryMap {
     pub fn new<T>(dirs: T) -> Self
     where
         T: IntoIterator<Item = Directory>,
     {
+        let map = dirs
+            .into_iter()
+            .map(|dir| (dir.id.clone(), Arc::new(dir)))
+            .collect();
         Self {
-            dirs: dirs
-                .into_iter()
-                .map(|dir| (dir.id.clone(), Arc::new(dir)))
-                .collect(),
+            dirs: Arc::new(map),
+        }
+    }
+    pub fn for_dir(id: &DirectoryId, path: &Path) -> Self {
+        let dir = Arc::new(Directory::new(id, path));
+        let mut map = HashMap::new();
+        map.insert(id.clone(), dir);
+        Self {
+            dirs: Arc::new(map),
+        }
+    }
+    pub fn get(&self, id: &DirectoryId) -> Option<&Arc<Directory>> {
+        self.dirs.get(id)
+    }
+}
+
+#[derive(Clone)]
+pub struct RealizeServer {
+    pub dirs: DirectoryMap,
+    pub limiter: Option<Limiter<StandardClock>>,
+}
+
+impl RealizeServer {
+    pub fn new(dirs: DirectoryMap) -> Self {
+        Self {
+            dirs,
+            limiter: None,
+        }
+    }
+
+    pub fn new_limited(dirs: DirectoryMap, limiter: Limiter<StandardClock>) -> Self {
+        Self {
+            dirs,
+            limiter: Some(limiter),
         }
     }
 
     pub fn for_dir(id: &DirectoryId, path: &Path) -> Self {
-        RealizeServer::new(vec![Directory::new(id, path)])
+        RealizeServer::new(DirectoryMap::for_dir(id, path))
     }
 
     fn find_directory(&self, dir_id: &DirectoryId) -> Result<&Arc<Directory>> {
@@ -325,9 +361,20 @@ impl RealizeService for RealizeServer {
     async fn configure(
         self,
         _ctx: tarpc::context::Context,
-        _config: crate::model::service::Config,
-    ) -> Result<()> {
-        Ok(())
+        config: crate::model::service::Config,
+    ) -> Result<crate::model::service::Config> {
+        if let (Some(limiter), Some(limit)) = (self.limiter.as_ref(), config.write_limit) {
+            limiter.set_speed_limit(limit as f64);
+        }
+        let write_limit = self.limiter.as_ref().and_then(|l| {
+            let lim = l.speed_limit();
+            if lim.is_finite() {
+                Some(lim as u64)
+            } else {
+                None
+            }
+        });
+        Ok(Config { write_limit })
     }
 }
 
@@ -1007,10 +1054,7 @@ mod tests {
     #[tokio::test]
     async fn test_tarpc_rpc_inprocess() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        let server_impl = RealizeServer::new(vec![Directory::new(
-            &DirectoryId::from("testdir"),
-            temp.path(),
-        )]);
+        let server_impl = RealizeServer::for_dir(&DirectoryId::from("testdir"), temp.path());
         let client = server_impl.as_inprocess_client();
 
         let list = client
@@ -1351,5 +1395,46 @@ mod tests {
         assert!(temp.child("a").exists());
         assert!(temp.child("a/b/c/keep.txt").exists());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_configure_noop_returns_none() {
+        let server = RealizeServer::for_dir(
+            &DirectoryId::from("testdir"),
+            &PathBuf::from("/tmp/testdir"),
+        );
+        let returned = server
+            .clone()
+            .configure(
+                tarpc::context::current(),
+                Config {
+                    write_limit: Some(12345),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(returned.write_limit, None);
+    }
+
+    #[tokio::test]
+    async fn test_configure_limited_sets_and_returns_limit() {
+        let dirs = DirectoryMap::for_dir(
+            &DirectoryId::from("testdir"),
+            &PathBuf::from("/tmp/testdir"),
+        );
+        let limiter = Limiter::<StandardClock>::new(f64::INFINITY);
+        let server = RealizeServer::new_limited(dirs, limiter.clone());
+        let limit = 55555u64;
+        let returned = server
+            .clone()
+            .configure(
+                tarpc::context::current(),
+                Config {
+                    write_limit: Some(limit),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(returned.write_limit, Some(limit));
     }
 }
