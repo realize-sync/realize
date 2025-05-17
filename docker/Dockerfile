@@ -23,8 +23,8 @@ FROM alpine:3.21 AS runtime
 #RUN apk add --no-cache ca-certificates openssl
 
 # --- 2.1 Configuration
-ENV PORT=9771
 ENV ADDRESS=0.0.0.0:9771
+ENV METRICS_ADDRESS=0.0.0.0:9772
 
 # Server private key
 ENV PRIVKEY=/config/private.key
@@ -46,6 +46,7 @@ WORKDIR /app
 COPY --from=builder /usr/src/app/target/release/realized /usr/local/bin/realized
 
 # --- 2.5 run
-EXPOSE $PORT
+EXPOSE 9771
+EXPOSE 9772
 USER realized
 ENTRYPOINT [ "/entrypoint.sh" ]
