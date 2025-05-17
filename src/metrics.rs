@@ -271,6 +271,7 @@ async fn serve_metrics(
 }
 
 /// Send metrics to a prometheus push gateway.
+#[cfg(feature = "push")]
 pub async fn push_metrics(
     pushgateway: &str,
     job: &str,

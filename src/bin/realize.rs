@@ -71,6 +71,7 @@ struct Cli {
     metrics_addr: Option<String>,
 
     /// Address of prometheus pushgateway (optional)
+    #[cfg(feature = "push")]
     #[arg(long)]
     metrics_pushgateway: Option<String>,
 
@@ -123,6 +124,7 @@ async fn main() {
         print_error(&format!("{err:#}"));
         status = 1;
     };
+    #[cfg(feature = "push")]
     if let Some(pushgw) = &cli.metrics_pushgateway {
         if let Err(err) =
             metrics::push_metrics(pushgw, &cli.metrics_job, cli.metrics_instance.as_deref()).await
@@ -304,6 +306,7 @@ async fn configure_limit(
 }
 
 /// Print a warning message to stderr, with standard format.
+#[cfg(feature = "push")]
 fn print_warning(msg: &str) {
     eprintln!("{}: {}", style("WARNING").for_stderr().red(), msg);
 }

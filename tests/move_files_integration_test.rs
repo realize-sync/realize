@@ -7,17 +7,12 @@ use realize::server::DirectoryMap;
 use realize::server::RealizeServer;
 use realize::transport::security::{self, PeerVerifier};
 use realize::transport::tcp;
-use realize::utils::async_utils::AbortOnDrop;
-use reqwest;
-use reqwest::Client;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::AsyncBufReadExt as _;
 
 #[tokio::test]
 async fn test_local_to_remote() -> anyhow::Result<()> {
@@ -443,7 +438,11 @@ async fn test_max_duration_timeout() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+#[cfg(feature = "push")]
 async fn test_realize_metrics_export() -> anyhow::Result<()> {
+    use reqwest::Client;
+    use tokio::io::AsyncBufReadExt as _;
+
     env_logger::try_init().ok();
     let tempdir = TempDir::new()?;
     let src_dir = tempdir.child("src_metrics");
@@ -520,7 +519,10 @@ async fn test_realize_metrics_export() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+#[cfg(feature = "push")]
 async fn test_realize_metrics_pushgateway() -> anyhow::Result<()> {
+    use realize::utils::async_utils::AbortOnDrop;
+
     // A fake pushgateway that expect one specific request and then
     // dies.
     let pushgw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -579,7 +581,7 @@ async fn test_realize_metrics_pushgateway() -> anyhow::Result<()> {
 
     // The HTTP server task must have died successfully after having
     // received the expected request.
-    tokio::time::timeout(Duration::ZERO, pushgw_handle.join()).await???;
+    tokio::time::timeout(std::time::Duration::ZERO, pushgw_handle.join()).await???;
 
     Ok(())
 }

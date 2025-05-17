@@ -3,6 +3,9 @@ name = "realize"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+push = ["prometheus/push"]
+
 [dependencies]
 anyhow = "1.0"
 assert_unordered = "0.3"
@@ -16,13 +19,13 @@ fast_rsync = "0.2"
 futures = "0.3"
 humantime = "2.2"
 hyper = { version = "1.6", features = ["http1", "server"] }
-hyper-util = "0.1"
+hyper-util = { version = "0.1", features = ["tokio"] }
 indicatif = "0.17"
 lazy_static = "1.5"
 log = "0.4"
 parse-size = "1.1"
 pathdiff = "0.2"
-prometheus = { version = "0.14", features = ["push"] }
+prometheus = { version = "0.14", features = [] }
 rustls = "0.23"
 serde = {version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
