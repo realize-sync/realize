@@ -253,8 +253,12 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
     let mut total_success = 0;
     let mut total_error = 0;
     let mut progress = CliProgress::new(cli.quiet);
+    let display_dirid = directory_ids.len() > 0;
     for dir_id_str in directory_ids {
         let dir_id = DirectoryId::from(dir_id_str);
+        if display_dirid {
+            progress.set_path_prefix(format!("{}/", &dir_id));
+        }
         let result =
             realize::algo::move_files(&src_client, &dst_client, dir_id, &mut progress).await;
         let (success, error) = result?;
@@ -316,6 +320,7 @@ struct CliProgress {
     overall_pb: ProgressBar,
     next_file_index: Arc<AtomicUsize>,
     quiet: bool,
+    path_prefix: String,
 }
 
 impl CliProgress {
@@ -341,7 +346,12 @@ impl CliProgress {
             overall_pb,
             next_file_index: Arc::new(AtomicUsize::new(1)),
             quiet,
+            path_prefix: "".to_string(),
         }
+    }
+
+    fn set_path_prefix(&mut self, prefix: String) {
+        self.path_prefix = prefix;
     }
 
     fn finish_and_clear(&self) {
@@ -352,9 +362,9 @@ impl CliProgress {
 
 impl Progress for CliProgress {
     fn set_length(&mut self, total_files: usize, total_bytes: u64) {
-        self.total_files = total_files;
-        self.total_bytes = total_bytes;
-        self.overall_pb.set_length(total_bytes);
+        self.total_files += total_files;
+        self.total_bytes += total_bytes;
+        self.overall_pb.set_length(self.total_bytes);
         self.overall_pb.set_position(0);
         self.overall_pb.set_prefix("Moving");
     }
@@ -365,7 +375,7 @@ impl Progress for CliProgress {
             next_file_index: self.next_file_index.clone(),
             total_files: self.total_files,
             bytes,
-            path: path.display().to_string(),
+            path: format!("{}{}", self.path_prefix, path.display()),
             multi: self.multi.clone(),
             overall_pb: self.overall_pb.clone(),
             quiet: self.quiet,

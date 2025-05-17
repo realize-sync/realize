@@ -652,7 +652,7 @@ async fn test_set_rate_limits() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn test_remote_to_remote_multiple_directory_ids() -> anyhow::Result<()> {
+async fn test_multiple_directory_ids() -> anyhow::Result<()> {
     env_logger::try_init().ok();
     let tempdir = TempDir::new()?;
     let src_dir1 = tempdir.child("src_multi1");
@@ -690,31 +690,25 @@ async fn test_remote_to_remote_multiple_directory_ids() -> anyhow::Result<()> {
     ]);
     let (dst_addr, dst_handle) =
         tcp::start_server("127.0.0.1:0", dst_dirs, verifier, privkey_b).await?;
-    // Run realize with two --directory-id arguments
-    let test = tokio::spawn(async move {
-        let status = tokio::process::Command::new(cargo_bin!("realize"))
-            .arg("--quiet")
-            .arg("--src-addr")
-            .arg(&src_addr.to_string())
-            .arg("--dst-addr")
-            .arg(&dst_addr.to_string())
-            .arg("--privkey")
-            .arg(keys.privkey_a_path.as_ref())
-            .arg("--peers")
-            .arg(&keys.peers_path)
-            .arg("dir1")
-            .arg("dir2")
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .status()
-            .await?;
-        assert!(status.success());
-        Ok::<(), anyhow::Error>(())
-    });
-    let result = test.await;
+
+    // Run realize with two directory ids
+    let output = tokio::process::Command::new(cargo_bin!("realize"))
+        .arg("--src-addr")
+        .arg(&src_addr.to_string())
+        .arg("--dst-addr")
+        .arg(&dst_addr.to_string())
+        .arg("--privkey")
+        .arg(keys.privkey_a_path.as_ref())
+        .arg("--peers")
+        .arg(&keys.peers_path)
+        .arg("dir1")
+        .arg("dir2")
+        .output()
+        .await?;
+    assert!(output.status.success());
+
     src_handle.abort();
     dst_handle.abort();
-    result??;
     assert_eq_unordered!(
         util::dir_content(&dst_dir1)?,
         vec![PathBuf::from("foo1.txt")]
@@ -725,6 +719,20 @@ async fn test_remote_to_remote_multiple_directory_ids() -> anyhow::Result<()> {
     );
     assert_eq_unordered!(util::dir_content(&src_dir1)?, vec![]);
     assert_eq_unordered!(util::dir_content(&src_dir2)?, vec![]);
+
+    // When multiple directory ids are specified, they must be
+    // displayed as part of the path.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("[1/1] dir1/foo1.txt"),
+        "OUT: {stdout} ERR: {stderr}"
+    );
+    assert!(
+        stdout.contains("[2/2] dir2/foo2.txt"),
+        "OUT: {stdout} ERR: {stderr}"
+    );
+
     Ok(())
 }
 
