@@ -590,7 +590,7 @@ async fn test_realize_metrics_pushgateway() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn test_throttle() -> anyhow::Result<()> {
+async fn test_set_rate_limits() -> anyhow::Result<()> {
     env_logger::try_init().ok();
 
     let tempdir = TempDir::new()?;
@@ -638,6 +638,8 @@ async fn test_throttle() -> anyhow::Result<()> {
         .arg(dir_id.to_string())
         .arg("--throttle-down")
         .arg("2048")
+        .arg("--throttle-up")
+        .arg("1024")
         .env("RUST_LOG", "debug")
         .output()
         .await?;
@@ -645,7 +647,11 @@ async fn test_throttle() -> anyhow::Result<()> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stderr.contains("Throttling src: 2048 bytes/sec"),
+        stderr.contains("Throttling downloads: 2048 bytes/sec"),
+        "ERR: {stderr}\nOUT: {stdout}"
+    );
+    assert!(
+        stderr.contains("Throttling uploads: 1024 bytes/sec"),
         "ERR: {stderr}\nOUT: {stdout}"
     );
     Ok(())

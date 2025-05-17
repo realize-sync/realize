@@ -1,4 +1,6 @@
 use anyhow::Context as _;
+use async_speed_limit::Limiter;
+use async_speed_limit::clock::StandardClock;
 use clap::Parser;
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -74,9 +76,13 @@ struct Cli {
     #[arg(long)]
     metrics_instance: Option<String>,
 
-    /// Throttle download (src) in bytes/sec (applies to remote source)
+    /// Throttle download (reading from src) in bytes/sec
     #[arg(long, required = false)]
     throttle_down: Option<u64>,
+
+    /// Throttle uploads (writing to dst) in bytes/sec
+    #[arg(long, required = false)]
+    throttle_up: Option<u64>,
 }
 
 lazy_static::lazy_static! {
@@ -187,13 +193,12 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
         server.as_inprocess_client()
     } else {
         let addr = cli.src_addr.as_ref().unwrap();
-        let domain = addr.split(':').next().unwrap();
 
         tcp::connect_client(
-            domain,
             addr,
             Arc::clone(verifier.as_ref().unwrap()),
             Arc::clone(privkey.as_ref().unwrap()),
+            tcp::ClientOptions::default(),
         )
         .await
         .with_context(|| format!("Connection to src {addr} failed"))?
@@ -206,13 +211,16 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
         server.as_inprocess_client()
     } else {
         let addr = cli.dst_addr.as_ref().unwrap();
-        let domain = addr.split(':').next().unwrap();
-
+        let mut options = tcp::ClientOptions::default();
+        if let Some(limit) = cli.throttle_up {
+            log::info!("Throttling uploads: {limit} bytes/sec");
+            options.limiter = Some(Limiter::<StandardClock>::new(limit as f64));
+        }
         tcp::connect_client(
-            domain,
             addr,
             Arc::clone(verifier.as_ref().unwrap()),
             Arc::clone(privkey.as_ref().unwrap()),
+            options,
         )
         .await
         .with_context(|| format!("Connection to dst {addr} failed"))?
@@ -224,7 +232,7 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
             .await
             .with_context(|| format!("Failed to apply --throttle-down={limit}"))?
         {
-            log::info!("Throttling src: {val} bytes/sec");
+            log::info!("Throttling downloads: {val} bytes/sec");
         }
     }
 

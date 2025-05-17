@@ -65,12 +65,12 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
     let verifier = Arc::new(verifier);
 
     let client = tcp::connect_client(
-        "localhost",
         format!("127.0.0.1:{}", portstr),
         verifier,
         crypto
             .key_provider
             .load_private_key(PrivateKeyDer::from_pem_file(&privkey_file)?)?,
+        tcp::ClientOptions::default(),
     )
     .await?;
     let files = client

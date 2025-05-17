@@ -51,12 +51,18 @@ where
     Ok((addr, handle))
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ClientOptions {
+    pub domain: Option<String>,
+    pub limiter: Option<Limiter<StandardClock>>,
+}
+
 /// Create a [RealizeServiceClient] connected to the given TCP address.
 pub async fn connect_client<T>(
-    server_name: &str,
     server_addr: T,
     verifier: Arc<PeerVerifier>,
     privkey: Arc<dyn SigningKey>,
+    options: ClientOptions,
 ) -> anyhow::Result<DefaultRealizeServiceClient>
 where
     T: tokio::net::ToSocketAddrs,
@@ -64,8 +70,13 @@ where
     let connector = security::make_tls_connector(verifier, privkey)?;
 
     let stream = TcpStream::connect(server_addr).await?;
-    let domain = ServerName::try_from(server_name.to_string())?;
-    let stream = connector.connect(domain, stream).await?;
+    let domain = ServerName::try_from(options.domain.unwrap_or_else(|| "localhost".to_string()))?;
+    let limiter = options
+        .limiter
+        .unwrap_or_else(|| Limiter::<StandardClock>::new(f64::INFINITY));
+    let stream = connector
+        .connect(domain, RateLimitedStream::new(stream, limiter.clone()))
+        .await?;
 
     let codec_builder = LengthDelimitedCodec::builder();
     let transport = transport::new(codec_builder.new_framed(stream), Bincode::default());
@@ -307,7 +318,13 @@ mod tests {
         let (addr, _server_handle, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
         let client_privkey =
             load_private_key(crate::transport::security::testing::client_private_key())?;
-        let client = connect_client("localhost", addr, verifier_both(), client_privkey).await?;
+        let client = connect_client(
+            addr,
+            verifier_both(),
+            client_privkey,
+            ClientOptions::default(),
+        )
+        .await?;
         let list = client
             .list(
                 context::current(),
@@ -325,8 +342,13 @@ mod tests {
         let (addr, _server_handle, _temp) = setup_test_server(Arc::clone(&verifier)).await.unwrap();
         let client_privkey =
             load_private_key(crate::transport::security::testing::client_private_key())?;
-        let client_result =
-            connect_client("localhost", addr, Arc::clone(&verifier), client_privkey).await;
+        let client_result = connect_client(
+            addr,
+            Arc::clone(&verifier),
+            client_privkey,
+            ClientOptions::default(),
+        )
+        .await;
         match client_result {
             Ok(client) => {
                 let list_result = client
@@ -356,7 +378,13 @@ mod tests {
         let (addr, _server_handle, _temp) = setup_test_server(Arc::clone(&verifier)).await.unwrap();
         let client_privkey =
             load_private_key(crate::transport::security::testing::client_private_key())?;
-        let result = connect_client("localhost", addr, Arc::clone(&verifier), client_privkey).await;
+        let result = connect_client(
+            addr,
+            Arc::clone(&verifier),
+            client_privkey,
+            ClientOptions::default(),
+        )
+        .await;
         assert!(
             result.is_err(),
             "Expected error when server is not in client verifier"
@@ -450,7 +478,13 @@ mod tests {
         let server_handle = AbortOnDrop::new(server.spawn());
         let client_privkey =
             load_private_key(crate::transport::security::testing::client_private_key())?;
-        let client = connect_client("localhost", addr, verifier.clone(), client_privkey).await?;
+        let client = connect_client(
+            addr,
+            verifier.clone(),
+            client_privkey,
+            ClientOptions::default(),
+        )
+        .await?;
         let limit = 12345u64;
         let config = client
             .configure(
@@ -489,8 +523,20 @@ mod tests {
             load_private_key(crate::transport::security::testing::client_private_key())?;
         let client_privkey2 =
             load_private_key(crate::transport::security::testing::client_private_key())?;
-        let client1 = connect_client("localhost", addr, verifier.clone(), client_privkey1).await?;
-        let client2 = connect_client("localhost", addr, verifier.clone(), client_privkey2).await?;
+        let client1 = connect_client(
+            addr,
+            Arc::clone(&verifier),
+            client_privkey1,
+            ClientOptions::default(),
+        )
+        .await?;
+        let client2 = connect_client(
+            addr,
+            Arc::clone(&verifier),
+            client_privkey2,
+            ClientOptions::default(),
+        )
+        .await?;
         let limit = 54321u64;
         let config1 = client1
             .configure(
