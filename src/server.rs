@@ -94,7 +94,7 @@ impl RealizeServer {
 
     fn find_directory(&self, dir_id: &DirectoryId) -> Result<&Arc<Directory>> {
         self.dirs.get(dir_id).ok_or_else(|| {
-            RealizeError::BadRequest(format!("Unknown directory ID: '{:?}'", dir_id))
+            RealizeError::BadRequest(format!("Unknown directory \"{}\"", dir_id.to_string()))
         })
     }
 

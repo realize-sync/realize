@@ -761,14 +761,17 @@ mod tests {
 }
 
 /// Errors returned by [move_files]
+///
+/// Error messages are kept short, to avoid repetition when printed
+/// with anyhow {:#}.
 #[derive(Debug, Error)]
 pub enum MoveFileError {
-    #[error("RPC error: {0}")]
+    #[error("RPC error")]
     Rpc(#[from] tarpc::client::RpcError),
-    #[error("Error: {0}")]
+    #[error("Remote Error")]
     Realize(#[from] RealizeError),
-    #[error("IO error: {0}")]
+    #[error("IO error")]
     Io(#[from] std::io::Error),
-    #[error(transparent)]
+    #[error("Error")]
     Other(#[from] anyhow::Error),
 }
