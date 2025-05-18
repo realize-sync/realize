@@ -53,6 +53,12 @@ pub enum SyncedFileState {
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Hash(pub [u8; 32]);
 
+impl Hash {
+    pub fn zero() -> Self {
+        Self([0u8; 32])
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Signature(pub Vec<u8>);
 
@@ -100,7 +106,12 @@ pub trait RealizeService {
     async fn finish(dir_id: DirectoryId, relative_path: PathBuf, options: Options) -> Result<()>;
 
     /// Compute a SHA-256 hash of the file at the given path (final or partial).
-    async fn hash(dir_id: DirectoryId, relative_path: PathBuf, options: Options) -> Result<Hash>;
+    async fn hash(
+        dir_id: DirectoryId,
+        relative_path: PathBuf,
+        range: ByteRange,
+        options: Options,
+    ) -> Result<Hash>;
 
     /// Delete the file at the given path (both partial and final forms).
     async fn delete(dir_id: DirectoryId, relative_path: PathBuf, options: Options) -> Result<()>;

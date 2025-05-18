@@ -7,14 +7,18 @@ use crate::model::service::{
     DirectoryId, Hash, Options, RealizeError, RealizeServiceClient, RealizeServiceRequest,
     RealizeServiceResponse, SyncedFile,
 };
-use futures::future::{Either, join};
+use futures::future;
+use futures::future::Either;
 use futures::stream::StreamExt as _;
 use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
+use std::cmp::min;
 use std::{collections::HashMap, path::Path};
 use tarpc::{client::stub::Stub, context};
 use thiserror::Error;
-const CHUNK_SIZE: u64 = 4 * 1024 * 1024; // 4MB
+const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 const PARALLEL_FILE_COUNT: usize = 8;
+const HASH_FILE_CHUNK: u64 = 256 * 1024 * 1024; // 256M
+const PARALLEL_FILE_HASH: usize = 4;
 
 lazy_static::lazy_static! {
     pub static ref METRIC_START_COUNT: IntCounter =
@@ -130,7 +134,7 @@ where
 {
     METRIC_START_COUNT.inc();
     // 1. List files on src and dst in parallel
-    let (src_files, dst_files) = join(
+    let (src_files, dst_files) = future::join(
         src.list(context::current(), dir_id.clone(), src_options()),
         dst.list(context::current(), dir_id.clone(), dst_options()),
     )
@@ -201,18 +205,20 @@ where
 
     // Important: Compute source hash only once, though it might be
     // used twice; it's very slow to compute on large files.
-    let mut src_hash = Either::Left(src.hash(
-        context::current(),
-        dir_id.clone(),
-        path.to_path_buf(),
+    let mut src_hash = Either::Left(hash_file(
+        src,
+        dir_id,
+        path,
+        src_size,
+        HASH_FILE_CHUNK,
         src_options(),
     ));
     if src_size == dst_size {
         let hash = match src_hash {
-            Either::Left(fut) => fut.await??,
+            Either::Left(fut) => fut.await?,
             Either::Right(hash) => hash,
         };
-        if check_hashes_and_delete_with_src_hash(&hash, src, dst, dir_id, path).await? {
+        if check_hashes_and_delete_with_src_hash(&hash, src_size, src, dst, dir_id, path).await? {
             return Ok(());
         }
         src_hash = Either::Right(hash);
@@ -327,10 +333,10 @@ where
 
     progress.verifying();
     let hash = match src_hash {
-        Either::Left(hash) => hash.await??,
+        Either::Left(hash) => hash.await?,
         Either::Right(hash) => hash,
     };
-    if !check_hashes_and_delete_with_src_hash(&hash, src, dst, dir_id, path).await? {
+    if !check_hashes_and_delete_with_src_hash(&hash, src_size, src, dst, dir_id, path).await? {
         return Err(MoveFileError::Realize(RealizeError::Sync(
             path.to_path_buf(),
             "Data still inconsistent after sync".to_string(),
@@ -344,7 +350,8 @@ where
 ///
 /// Return true if the hashes matched, false otherwise.
 async fn check_hashes_and_delete_with_src_hash<T, U>(
-    src_hash: &Hash,
+    src_hash: &Vec<Hash>,
+    file_size: u64,
     src: &RealizeServiceClient<T>,
     dst: &RealizeServiceClient<U>,
     dir_id: &DirectoryId,
@@ -354,14 +361,7 @@ where
     T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
     U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
 {
-    let dst_hash = dst
-        .hash(
-            context::current(),
-            dir_id.clone(),
-            path.to_path_buf(),
-            dst_options(),
-        )
-        .await??;
+    let dst_hash = hash_file(dst, dir_id, path, file_size, HASH_FILE_CHUNK, dst_options()).await?;
     if *src_hash != dst_hash {
         log::info!("{}:{:?} inconsistent hashes", dir_id, path);
         METRIC_FILE_END_COUNT
@@ -402,6 +402,7 @@ mod tests {
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
+    use sha2::Digest as _;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -726,6 +727,92 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_hash_file() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+
+        let temp = TempDir::new()?;
+        let file = temp.child("somefile");
+        let content = b"baa, baa, black sheep";
+        file.write_binary(content)?;
+
+        let dir_id = DirectoryId::from("dir");
+        let server = RealizeServer::for_dir(&dir_id, temp.path()).as_inprocess_client();
+        let hashvec = hash_file(
+            &server,
+            &dir_id,
+            &PathBuf::from("somefile"),
+            content.len() as u64,
+            HASH_FILE_CHUNK,
+            Options::default(),
+        )
+        .await?;
+        assert_eq!(hashvec, vec![Hash(sha2::Sha256::digest(content).into())]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_hash_file_chunked() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+
+        let temp = TempDir::new()?;
+        let file = temp.child("somefile");
+        let content = b"baa, baa, black sheep";
+        file.write_binary(content)?;
+
+        let dir_id = DirectoryId::from("dir");
+        let server = RealizeServer::for_dir(&dir_id, temp.path()).as_inprocess_client();
+        let hashvec = hash_file(
+            &server,
+            &dir_id,
+            &PathBuf::from("somefile"),
+            content.len() as u64,
+            4,
+            Options::default(),
+        )
+        .await?;
+        assert_eq!(
+            hashvec,
+            vec![
+                Hash(sha2::Sha256::digest(b"baa,").into()),
+                Hash(sha2::Sha256::digest(b" baa").into()),
+                Hash(sha2::Sha256::digest(b", bl").into()),
+                Hash(sha2::Sha256::digest(b"ack ").into()),
+                Hash(sha2::Sha256::digest(b"shee").into()),
+                Hash(sha2::Sha256::digest(b"p").into()),
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_hash_file_wrong_size() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+
+        let temp = TempDir::new()?;
+        let file = temp.child("somefile");
+        let content = b"baa, baa, black sheep";
+        file.write_binary(content)?;
+
+        let dir_id = DirectoryId::from("dir");
+        let server = RealizeServer::for_dir(&dir_id, temp.path()).as_inprocess_client();
+        let hashvec = hash_file(
+            &server,
+            &dir_id,
+            &PathBuf::from("somefile"),
+            content.len() as u64 * 2,
+            12,
+            Options::default(),
+        )
+        .await?;
+        assert_eq!(hashvec.len(), 4);
+        assert_eq!(hashvec[1], Hash::zero());
+
+        Ok(())
+    }
+
     /// Return the set of files in [dir] and their content.
     fn snapshot_dir(dir: &Path) -> anyhow::Result<Vec<(PathBuf, String)>> {
         let mut result = vec![];
@@ -758,6 +845,48 @@ mod tests {
         }
         Ok(result)
     }
+}
+
+/// Hash file in chunks and return the result.
+pub async fn hash_file<T>(
+    client: &RealizeServiceClient<T>,
+    dir_id: &DirectoryId,
+    relative_path: &Path,
+    file_size: u64,
+    chunk_size: u64,
+    options: Options,
+) -> Result<Vec<Hash>, MoveFileError>
+where
+    T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+{
+    let mut offset = 0;
+    let mut ranges = vec![];
+    while offset < file_size {
+        let end = min(file_size, offset + chunk_size);
+        ranges.push((offset, end));
+        offset = end;
+    }
+
+    let results = futures::stream::iter(ranges.into_iter())
+        .map(|range| {
+            client.hash(
+                context::current(),
+                dir_id.clone(),
+                relative_path.to_path_buf(),
+                range,
+                options.clone(),
+            )
+        })
+        .buffer_unordered(PARALLEL_FILE_HASH)
+        .collect::<Vec<_>>()
+        .await;
+
+    let mut all_hashes = vec![];
+    for res in results.into_iter() {
+        all_hashes.push(res??);
+    }
+
+    Ok(all_hashes)
 }
 
 /// Errors returned by [move_files]

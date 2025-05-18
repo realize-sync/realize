@@ -1,11 +1,11 @@
 use crate::client::WithDeadline;
 use crate::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
-use crate::model::service::Config;
 use crate::model::service::Options;
 use crate::model::service::{
     ByteRange, DirectoryId, RealizeError, RealizeService, Result, RsyncOperation, SyncedFile,
     SyncedFileState,
 };
+use crate::model::service::{Config, Hash};
 use crate::model::service::{RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse};
 use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
@@ -228,23 +228,41 @@ impl RealizeService for RealizeServer {
         _ctx: tarpc::context::Context,
         dir_id: DirectoryId,
         relative_path: PathBuf,
+        range: ByteRange,
         options: Options,
-    ) -> Result<crate::model::service::Hash> {
+    ) -> Result<Hash> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
         let (_state, actual) = logical.find(&options)?;
         let mut file = fs::File::open(&actual)?;
+        if !file.seek(std::io::SeekFrom::Start(range.0)).is_ok() {
+            // We return an empty hash instead of failing, because we
+            // want hash comparison to fail if the file isn't of the
+            // expected size, not get an I/O error.
+            return Ok(Hash::zero());
+        }
+
         let mut hasher = Sha256::new();
         let mut buffer = [0u8; 8192];
-        loop {
-            let n = file.read(&mut buffer)?;
+        let mut remaining = range.1 - range.0;
+        while remaining > 0 {
+            let mut bufsize = buffer.len();
+            if bufsize as u64 > remaining {
+                bufsize = remaining as usize;
+            }
+            let n = file.read(&mut buffer[0..bufsize])?;
             if n == 0 {
                 break;
             }
             hasher.update(&buffer[..n]);
+            remaining -= n as u64;
+        }
+        if remaining > 0 {
+            // Short read. Make sure the hashes don't match.
+            return Ok(Hash::zero());
         }
         let hash = hasher.finalize();
-        Ok(crate::model::service::Hash(hash.into()))
+        Ok(Hash(hash.into()))
     }
 
     async fn delete(
@@ -576,7 +594,7 @@ fn delete_containing_dir(root: &Path, relative_path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::service::Hash as FileHash;
+    use crate::model::service::Hash;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
@@ -991,12 +1009,13 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 PathBuf::from("foo.txt"),
+                (0, content.len() as u64),
                 Options::default(),
             )
             .await?;
         let mut hasher = Sha256::new();
         hasher.update(content);
-        let expected = FileHash(hasher.finalize().into());
+        let expected = Hash(hasher.finalize().into());
         assert_eq!(hash, expected);
 
         // Now test partial
@@ -1009,13 +1028,56 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 PathBuf::from("bar.txt"),
+                (0, content2.len() as u64),
                 Options::default(),
             )
             .await?;
         let mut hasher2 = Sha256::new();
         hasher2.update(content2);
-        let expected2 = FileHash(hasher2.finalize().into());
+        let expected2 = Hash(hasher2.finalize().into());
         assert_eq!(hash2, expected2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_hash_past_file_end() -> anyhow::Result<()> {
+        let (server, _temp, dir) = setup_server_with_dir()?;
+        let content = b"hello world";
+        let fpath = LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?;
+        std::fs::write(fpath.final_path(), content)?;
+        let hash = server
+            .clone()
+            .hash(
+                tarpc::context::current(),
+                dir.id().clone(),
+                PathBuf::from("foo.txt"),
+                (100, 200),
+                Options::default(),
+            )
+            .await?;
+        assert_eq!(hash, Hash::zero());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_hash_short_read() -> anyhow::Result<()> {
+        let (server, _temp, dir) = setup_server_with_dir()?;
+        let content = b"hello world";
+        let fpath = LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?;
+        std::fs::write(fpath.final_path(), content)?;
+        let hash = server
+            .clone()
+            .hash(
+                tarpc::context::current(),
+                dir.id().clone(),
+                PathBuf::from("foo.txt"),
+                (0, 200),
+                Options::default(),
+            )
+            .await?;
+        assert_eq!(hash, Hash::zero());
+
         Ok(())
     }
 

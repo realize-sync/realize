@@ -23,7 +23,7 @@ impl<T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse> + Clone
         Self {
             inner,
             short_deadline: Duration::from_secs(10),
-            long_deadline: Duration::from_secs(5 * 60),
+            long_deadline: Duration::from_secs(30),
         }
     }
 
