@@ -3,6 +3,32 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
+## Fix error message output {#errormsg}
+
+When caught by with_context, error cause are printed.
+
+When not caught by with_context, in move_files, error causes are not
+printed. Also, in move_files, remote errors don't say which end (src
+or dst) threw this.
+
+- Fix error messages so that causes are printed. Keep error type cruft
+  to a minimum.
+
+- Add with_context to errors returned by a client (give a name to a
+  client? use the address?)
+
+- Print app errors in client at debug level
+
+## Close connections {#closeconn}
+
+TLS connections should be closed. Do it properly. Suppress or update
+error logs complaining about it; for now they just say "read|write
+errored out".
+
+## Implement retries {#retry}
+
+See the section "Error and retries" of spec/design.md.
+
 ## Design and add useful logging to realized {#daemonlog}
 
 Think about what should be logged at the error, warning info and debug

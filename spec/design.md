@@ -465,17 +465,25 @@ realize ... [--metrics-addr <host:port>] [--metrics-pushgateway <url>] [--metric
 If communication with the remote host is lost, this command retries
 with exponential backoff (5s, 15s, 30s, 1m, 2m, 5m, then always 5m)
 until communication can be re-established or duration set with
---max-duration is reached. If --max-duration is exceeded, the command prints an error message to stderr and exits with status code 11.
+--max-duration is reached. If --max-duration is exceeded, the command
+prints an error message to stderr and exits with status code 11.
 
 Retries only apply to network errors. They don't apply to the
 following errors:
  - Local errors
+ - App errors (errors embedded into RealizeServiceResponse)
  - Disk I/O errors (either)
  - Authentication error (communication not authorized)
 
-Retry applies on the move_files operation as a whole, so will require
-reading the full file lists again. This is to make sure that changes
-to the filesystem are taken into account.
+Open issues:
+
+- at which level should retry apply. If retrying after time has
+  passed, it might be worth retrying the whole move_files operation.
+  If just reconnecting, it might be enough to do it inside the loop in
+  tcp.rs.
+
+- how to deal with service::Config ? Ideally, it or the limiter should
+  be conserved with retries without having to do anything.
 
 #### Example Usage
 
