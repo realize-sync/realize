@@ -13,7 +13,7 @@ use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_c
 use std::{collections::HashMap, path::Path};
 use tarpc::{client::stub::Stub, context};
 use thiserror::Error;
-const CHUNK_SIZE: u64 = 8 * 1024 * 1024; // 8MB
+const CHUNK_SIZE: u64 = 4 * 1024 * 1024; // 4MB
 const PARALLEL_FILE_COUNT: usize = 8;
 
 lazy_static::lazy_static! {
@@ -576,7 +576,7 @@ mod tests {
     #[test_tag::tag(slow)]
     async fn test_move_files_chunked() -> anyhow::Result<()> {
         let _ = env_logger::try_init();
-        const FILE_SIZE: usize = (1.25 * CHUNK_SIZE as f32) as usize; // 10MB
+        const FILE_SIZE: usize = (1.25 * CHUNK_SIZE as f32) as usize;
         let chunk = vec![0xAB; FILE_SIZE];
         let chunk2 = vec![0xCD; FILE_SIZE];
         let chunk3 = vec![0xEF; FILE_SIZE];
@@ -597,22 +597,22 @@ mod tests {
         ));
         let dst_server = RealizeServer::for_dir(dst_dir.id(), dst_dir.path()).as_inprocess_client();
 
-        // Case 1: source > 8M, destination empty
+        // Case 1: source > CHUNK_SIZE, destination empty
         src_temp.child("large_empty").write_binary(&chunk)?;
-        // Case 2: source > 8M, destination same size, but content is different
+        // Case 2: source > CHUNK_SIZE, destination same size, but content is different
         src_temp.child("large_diff").write_binary(&chunk)?;
         dst_temp.child("large_diff").write_binary(&chunk2)?;
-        // Case 3: source > 8M, destination truncated, shorter than 8M
+        // Case 3: source > CHUNK_SIZE, destination truncated, shorter than CHUNK_SIZE
         src_temp.child("large_trunc_short").write_binary(&chunk)?;
         dst_temp
             .child("large_trunc_short")
-            .write_binary(&chunk3[..4 * 1024 * 1024])?;
-        // Case 4: source > 8M, destination truncated, longer than 8M
+            .write_binary(&chunk3[..(0.5 * CHUNK_SIZE as f32) as usize])?;
+        // Case 4: source > CHUNK_SIZE, destination truncated, longer than CHUNK_SIZE
         src_temp.child("large_trunc_long").write_binary(&chunk)?;
         dst_temp
             .child("large_trunc_long")
-            .write_binary(&chunk4[..9 * 1024 * 1024])?;
-        // Case 5: source > 8M, destination same content, with garbage at the end
+            .write_binary(&chunk4[..(1.25 * CHUNK_SIZE as f32) as usize])?;
+        // Case 5: source > CHUNK_SIZE, destination same content, with garbage at the end
         src_temp.child("large_garbage").write_binary(&chunk)?;
         let mut garbage = chunk.clone();
         garbage.extend_from_slice(&chunk5[..1024 * 1024]); // 1MB garbage
