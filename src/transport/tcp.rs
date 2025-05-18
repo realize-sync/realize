@@ -1,7 +1,7 @@
-use async_speed_limit::Limiter;
 use async_speed_limit::clock::Clock;
 use async_speed_limit::clock::StandardClock;
 use async_speed_limit::limiter::Consume;
+use async_speed_limit::Limiter;
 use futures::prelude::*;
 use rustls::pki_types::ServerName;
 use rustls::sign::SigningKey;
@@ -90,11 +90,10 @@ where
     let transport = transport::new(codec_builder.new_framed(stream), Bincode::default());
 
     let client = tarpc::client::new(Default::default(), transport).spawn();
-    let client = RealizeServiceClient::from(
-        WithDeadline::new(MetricsRealizeClient::new(client))
-            .with_long_deadline(Duration::from_secs(5 * 60))
-            .with_short_deadline(Duration::from_secs(60)),
-    );
+    let client = RealizeServiceClient::from(WithDeadline::new(
+        MetricsRealizeClient::new(client),
+        Duration::from_secs(60),
+    ));
 
     Ok(client)
 }

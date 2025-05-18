@@ -1,4 +1,3 @@
-use crate::client::WithDeadline;
 use crate::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
 use crate::model::service::Options;
 use crate::model::service::{
@@ -7,11 +6,11 @@ use crate::model::service::{
 };
 use crate::model::service::{Config, Hash};
 use crate::model::service::{RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse};
-use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
+use async_speed_limit::Limiter;
 use fast_rsync::{
-    Signature as RsyncSignature, SignatureOptions, apply_limited as rsync_apply_limited,
-    diff as rsync_diff,
+    apply_limited as rsync_apply_limited, diff as rsync_diff, Signature as RsyncSignature,
+    SignatureOptions,
 };
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
@@ -31,9 +30,7 @@ const RSYNC_BLOCK_SIZE: usize = 4096;
 
 /// Type shortcut for client type.
 pub type InProcessRealizeServiceClient = RealizeServiceClient<
-    WithDeadline<
-        MetricsRealizeClient<tarpc::client::Channel<RealizeServiceRequest, RealizeServiceResponse>>,
-    >,
+    MetricsRealizeClient<tarpc::client::Channel<RealizeServiceRequest, RealizeServiceResponse>>,
 >;
 
 #[derive(Clone)]
@@ -111,7 +108,7 @@ impl RealizeServer {
         );
         let client = tarpc::client::new(tarpc::client::Config::default(), client_transport).spawn();
 
-        RealizeServiceClient::from(WithDeadline::new(MetricsRealizeClient::new(client)))
+        RealizeServiceClient::from(MetricsRealizeClient::new(client))
     }
 }
 
@@ -595,8 +592,8 @@ fn delete_containing_dir(root: &Path, relative_path: &Path) {
 mod tests {
     use super::*;
     use crate::model::service::Hash;
-    use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
     use std::fs;
 
@@ -719,11 +716,9 @@ mod tests {
         };
 
         temp.child(".foo.txt.part").write_str("test")?;
-        assert!(
-            LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?
-                .find(&nopartial)
-                .is_err()
-        );
+        assert!(LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?
+            .find(&nopartial)
+            .is_err());
 
         temp.child("bar.txt").write_str("test")?;
         assert_eq!(
