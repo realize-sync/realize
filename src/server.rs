@@ -1,4 +1,4 @@
-use crate::client::DeadlineSetter;
+use crate::client::WithDeadline;
 use crate::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
 use crate::model::service::Config;
 use crate::model::service::Options;
@@ -30,8 +30,8 @@ use walkdir::WalkDir;
 const RSYNC_BLOCK_SIZE: usize = 4096;
 
 /// Type shortcut for client type.
-pub type DefaultRealizeServiceClient = RealizeServiceClient<
-    DeadlineSetter<
+pub type InProcessRealizeServiceClient = RealizeServiceClient<
+    WithDeadline<
         MetricsRealizeClient<tarpc::client::Channel<RealizeServiceRequest, RealizeServiceResponse>>,
     >,
 >;
@@ -99,7 +99,7 @@ impl RealizeServer {
     }
 
     /// Create an in-process RealizeServiceClient for this server instance.
-    pub fn as_inprocess_client(self) -> DefaultRealizeServiceClient {
+    pub fn as_inprocess_client(self) -> InProcessRealizeServiceClient {
         let (client_transport, server_transport) = tarpc::transport::channel::unbounded();
         let server = tarpc::server::BaseChannel::with_defaults(server_transport);
         tokio::spawn(
@@ -111,7 +111,7 @@ impl RealizeServer {
         );
         let client = tarpc::client::new(tarpc::client::Config::default(), client_transport).spawn();
 
-        RealizeServiceClient::from(DeadlineSetter::new(MetricsRealizeClient::new(client)))
+        RealizeServiceClient::from(WithDeadline::new(MetricsRealizeClient::new(client)))
     }
 }
 

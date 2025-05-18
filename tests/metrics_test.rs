@@ -11,7 +11,7 @@ use realize::algo::METRIC_START_COUNT;
 use realize::algo::METRIC_WRITE_BYTES;
 use realize::algo::NoProgress;
 use realize::algo::move_files;
-use realize::client::DeadlineSetter;
+use realize::client::WithDeadline;
 use realize::metrics::MetricsRealizeClient;
 use realize::model::service::RealizeServiceClient;
 use realize::model::service::RealizeServiceRequest;
@@ -197,7 +197,7 @@ fn setup_inprocess_client() -> (
     TempDir,
     DirectoryId,
     RealizeServiceClient<
-        DeadlineSetter<
+        WithDeadline<
             MetricsRealizeClient<
                 tarpc::client::Channel<RealizeServiceRequest, RealizeServiceResponse>,
             >,

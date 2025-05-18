@@ -1,23 +1,23 @@
 use anyhow::Context as _;
-use async_speed_limit::clock::StandardClock;
 use async_speed_limit::Limiter;
+use async_speed_limit::clock::StandardClock;
 use clap::Parser;
 use console::style;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use prometheus::{register_int_counter, IntCounter};
+use prometheus::{IntCounter, register_int_counter};
 use realize::algo::{FileProgress as AlgoFileProgress, MoveFileError, Progress};
 use realize::metrics;
 use realize::model::service::DirectoryId;
 use realize::transport::security::{self, PeerVerifier};
-use realize::transport::tcp;
+use realize::transport::tcp::{self, TcpRealizeServiceClient};
 use realize::utils::async_utils::AbortOnDrop;
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use rustls::sign::SigningKey;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 lazy_static::lazy_static! {
     static ref METRIC_UP: IntCounter =
@@ -221,7 +221,7 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
 /// Not all servers support setting rate limit; It's not an error if
 /// this function returns None.
 async fn configure_limit(
-    client: &realize::server::DefaultRealizeServiceClient,
+    client: &TcpRealizeServiceClient,
     limit: u64,
 ) -> anyhow::Result<Option<u64>> {
     let config = client

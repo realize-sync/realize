@@ -1,7 +1,7 @@
 use assert_cmd::cargo::cargo_bin;
+use assert_fs::TempDir;
 use assert_fs::fixture::ChildPath;
 use assert_fs::prelude::*;
-use assert_fs::TempDir;
 use assert_unordered::assert_eq_unordered;
 use realize::model::service::DirectoryId;
 use realize::server::DirectoryMap;

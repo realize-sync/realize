@@ -10,6 +10,7 @@ use tokio_rustls::TlsAcceptor;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
@@ -18,12 +19,13 @@ use tarpc::server::{BaseChannel, Channel};
 use tarpc::tokio_serde::formats::Bincode;
 use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
 
-use crate::client::DeadlineSetter;
+use crate::client::WithDeadline;
 use crate::metrics;
 use crate::metrics::MetricsRealizeClient;
 use crate::metrics::MetricsRealizeServer;
+use crate::model::service::RealizeServiceRequest;
+use crate::model::service::RealizeServiceResponse;
 use crate::model::service::{RealizeService, RealizeServiceClient};
-use crate::server::DefaultRealizeServiceClient;
 use crate::server::RealizeServer;
 use crate::transport::security;
 use crate::transport::security::PeerVerifier;
@@ -33,6 +35,12 @@ use crate::server::DirectoryMap;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
+
+pub type TcpRealizeServiceClient = RealizeServiceClient<
+    WithDeadline<
+        MetricsRealizeClient<tarpc::client::Channel<RealizeServiceRequest, RealizeServiceResponse>>,
+    >,
+>;
 
 /// Start the server, listening on the given address.
 pub async fn start_server<T>(
@@ -63,7 +71,7 @@ pub async fn connect_client<T>(
     verifier: Arc<PeerVerifier>,
     privkey: Arc<dyn SigningKey>,
     options: ClientOptions,
-) -> anyhow::Result<DefaultRealizeServiceClient>
+) -> anyhow::Result<TcpRealizeServiceClient>
 where
     T: tokio::net::ToSocketAddrs,
 {
@@ -82,7 +90,11 @@ where
     let transport = transport::new(codec_builder.new_framed(stream), Bincode::default());
 
     let client = tarpc::client::new(Default::default(), transport).spawn();
-    let client = RealizeServiceClient::from(DeadlineSetter::new(MetricsRealizeClient::new(client)));
+    let client = RealizeServiceClient::from(
+        WithDeadline::new(MetricsRealizeClient::new(client))
+            .with_long_deadline(Duration::from_secs(5 * 60))
+            .with_short_deadline(Duration::from_secs(60)),
+    );
 
     Ok(client)
 }
