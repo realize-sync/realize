@@ -1,14 +1,13 @@
 use anyhow::Context as _;
-use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
+use async_speed_limit::Limiter;
 use clap::Parser;
 use console::style;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use prometheus::{IntCounter, register_int_counter};
+use prometheus::{register_int_counter, IntCounter};
 use realize::algo::{FileProgress as AlgoFileProgress, MoveFileError, Progress};
 use realize::metrics;
 use realize::model::service::DirectoryId;
-use realize::server::RealizeServer;
 use realize::transport::security::{self, PeerVerifier};
 use realize::transport::tcp;
 use realize::utils::async_utils::AbortOnDrop;
@@ -17,8 +16,8 @@ use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use rustls::sign::SigningKey;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 lazy_static::lazy_static! {
     static ref METRIC_UP: IntCounter =
@@ -29,33 +28,26 @@ lazy_static::lazy_static! {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// Source local path
-    #[arg(long, required = false)]
-    src_path: Option<PathBuf>,
-
-    /// Destination local path
-    #[arg(long, required = false)]
-    dst_path: Option<PathBuf>,
-
     /// Source remote address (host:port)
     #[arg(long, required = false)]
-    src_addr: Option<String>,
+    src_addr: String,
 
     /// Destination remote address (host:port)
     #[arg(long, required = false)]
-    dst_addr: Option<String>,
+    dst_addr: String,
 
-    /// Path to the private key (required for remote)
-    #[arg(long, required = false)]
-    privkey: Option<PathBuf>,
+    /// Path to the private key
+    #[arg(long, required = true)]
+    privkey: PathBuf,
 
-    /// Path to the PEM file with one or more peer public keys (required for remote)
-    #[arg(long, required = false)]
-    peers: Option<PathBuf>,
+    /// Path to the PEM file with one or more peer public keys
+    #[arg(long, required = true)]
+    peers: PathBuf,
 
-    /// Directory id(s) (optional, defaults to 'dir' for local/local).
-    /// When both --src-addr and --dst-addr are set, you may specify multiple directory ids as positional arguments.
-    #[arg(value_name = "ID", required = false, num_args = 0..)]
+    /// IDs of the directories to process.
+    ///
+    /// Source and dest must support these directories.
+    #[arg(value_name = "ID", required = true, num_args = 1..)]
     directory_ids: Vec<String>,
 
     /// Suppress all output except errors
@@ -146,98 +138,21 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
             .with_context(|| format!("Failed to export metrics on {addr}"))?;
     }
 
-    // Directory id(s)
-    let directory_ids = if cli.directory_ids.is_empty() {
-        vec!["dir".to_string()]
-    } else {
-        cli.directory_ids.clone()
-    };
+    let privkey = load_private_key_file(&cli.privkey)
+        .with_context(|| format!("{}: Invalid private key file", cli.privkey.display()))?;
 
-    // Determine mode
-    let src_is_remote = cli.src_addr.is_some();
-    let dst_is_remote = cli.dst_addr.is_some();
-    let src_is_local = cli.src_path.is_some();
-    let dst_is_local = cli.dst_path.is_some();
-
-    // Validate command-line arguments
-    if (src_is_remote && dst_is_remote) && (src_is_local || dst_is_local) {
-        return Err(anyhow::anyhow!(
-            "Cannot mix local and remote for the same endpoint"
-        ));
-    }
-    if !(src_is_remote || src_is_local) || !(dst_is_remote || dst_is_local) {
-        return Err(anyhow::anyhow!(
-            "Must specify both source and destination (local or remote)"
-        ));
-    }
-    if !(src_is_remote && dst_is_remote) && directory_ids.len() > 1 {
-        return Err(anyhow::anyhow!(
-            "Multiple directory ids are only allowed when both --src-addr and --dst-addr are set."
-        ));
-    }
-
-    // Setup crypto and peer verifier if needed
-    let (privkey, verifier) = if src_is_remote || dst_is_remote {
-        let key_path = cli
-            .privkey
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("--privkey is required for remote endpoint"))?;
-        let privkey = load_private_key_file(key_path)
-            .with_context(|| format!("{}: Invalid private key file", key_path.display()))?;
-
-        let crypto = Arc::new(security::default_provider());
-        let mut verifier = PeerVerifier::new(&crypto);
-        let peers_path = cli
-            .peers
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("--peers required for remote endpoint"))?;
-        add_peers_from_file(peers_path, &mut verifier)
-            .with_context(|| format!("{}: Invalid peer file", peers_path.display()))?;
-
-        (Some(privkey), Some(Arc::new(verifier)))
-    } else {
-        (None, None)
-    };
+    let verifier = build_peer_verifier(&cli.peers)
+        .with_context(|| format!("{}: Invalid peer file", cli.peers.display()))?;
 
     // Build src client
-    let src_client = if src_is_local {
-        let src_path = cli.src_path.as_ref().unwrap();
-        let server = RealizeServer::for_dir(&DirectoryId::from(directory_ids[0].clone()), src_path);
-        server.as_inprocess_client()
-    } else {
-        let addr = cli.src_addr.as_ref().unwrap();
-
-        tcp::connect_client(
-            addr,
-            Arc::clone(verifier.as_ref().unwrap()),
-            Arc::clone(privkey.as_ref().unwrap()),
-            tcp::ClientOptions::default(),
-        )
-        .await
-        .with_context(|| format!("Connection to src {addr} failed"))?
-    };
-
-    // Build dst client
-    let dst_client = if dst_is_local {
-        let dst_path = cli.dst_path.as_ref().unwrap();
-        let server = RealizeServer::for_dir(&DirectoryId::from(directory_ids[0].clone()), dst_path);
-        server.as_inprocess_client()
-    } else {
-        let addr = cli.dst_addr.as_ref().unwrap();
-        let mut options = tcp::ClientOptions::default();
-        if let Some(limit) = cli.throttle_up {
-            log::info!("Throttling uploads: {}/s", HumanBytes(limit));
-            options.limiter = Some(Limiter::<StandardClock>::new(limit as f64));
-        }
-        tcp::connect_client(
-            addr,
-            Arc::clone(verifier.as_ref().unwrap()),
-            Arc::clone(privkey.as_ref().unwrap()),
-            options,
-        )
-        .await
-        .with_context(|| format!("Connection to dst {addr} failed"))?
-    };
+    let src_client = tcp::connect_client(
+        &cli.src_addr,
+        Arc::clone(&verifier),
+        Arc::clone(&privkey),
+        tcp::ClientOptions::default(),
+    )
+    .await
+    .with_context(|| format!("Connection to src {} failed", cli.src_addr))?;
 
     // Apply throttle limits if set
     if let Some(limit) = cli.throttle_down {
@@ -249,21 +164,37 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
         }
     }
 
+    // Build dst client
+    let dst_client = {
+        let addr = &cli.dst_addr;
+        let mut options = tcp::ClientOptions::default();
+        if let Some(limit) = cli.throttle_up {
+            log::info!("Throttling uploads: {}/s", HumanBytes(limit));
+            options.limiter = Some(Limiter::<StandardClock>::new(limit as f64));
+        }
+        tcp::connect_client(addr, Arc::clone(&verifier), Arc::clone(&privkey), options)
+            .await
+            .with_context(|| format!("Connection to dst {addr} failed"))?
+    };
+
     METRIC_UP.inc();
 
     // Move files for each directory id
     let mut total_success = 0;
     let mut total_error = 0;
     let mut progress = CliProgress::new(cli.quiet);
-    let display_dirid = directory_ids.len() >= 2;
-    for dir_id_str in directory_ids {
-        let dir_id = DirectoryId::from(dir_id_str);
-        if display_dirid {
-            progress.set_path_prefix(format!("{}/", &dir_id));
+    let should_show_dir = cli.directory_ids.len() >= 2;
+    for dir_id in &cli.directory_ids {
+        if should_show_dir {
+            progress.set_path_prefix(format!("{}/", dir_id));
         }
-        let result =
-            realize::algo::move_files(&src_client, &dst_client, dir_id, &mut progress).await;
-        let (success, error) = result?;
+        let (success, error) = realize::algo::move_files(
+            &src_client,
+            &dst_client,
+            DirectoryId::from(dir_id.to_string()),
+            &mut progress,
+        )
+        .await?;
         total_success += success;
         total_error += error;
     }
@@ -489,6 +420,14 @@ fn load_private_key_file(path: &Path) -> anyhow::Result<Arc<dyn SigningKey>> {
     Ok(security::default_provider()
         .key_provider
         .load_private_key(key)?)
+}
+
+fn build_peer_verifier(path: &Path) -> anyhow::Result<Arc<PeerVerifier>> {
+    let crypto = Arc::new(security::default_provider());
+    let mut verifier = PeerVerifier::new(&crypto);
+    add_peers_from_file(path, &mut verifier)?;
+
+    Ok(Arc::new(verifier))
 }
 
 fn add_peers_from_file(path: &Path, verifier: &mut PeerVerifier) -> anyhow::Result<()> {
