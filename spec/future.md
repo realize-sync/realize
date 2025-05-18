@@ -3,6 +3,31 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
+## Split into multiple crates {#crates}
+
+To avoid the issue with openssl-sys being dragged into the daemon because
+the command-line wants it, do the following:
+
+- split out realize into three crates:
+ crate/realize-lib (src/lib.rs and all its dependencies go there)
+ crate/realize-daemon (src/bin/realized.rs goes there)
+ crate/realize-cmd (src/bin/realize.rs, its dependencies and anything under the push feature goes there)
+ and transform the root into a workspace
+
+This way, the command can dependend on openssl-sys and leave it out of
+the daemon. No need for the push feature anymore; everything push-related goes into crate/realize-cmd
+
+## Detect access right errors early in daemon {#daemonaccess}
+
+At startup, the daemon in realized.rs might try to write and delete a
+file in the dir it's given, to make sure it has read/write access to
+the directory it's given.
+
+Checks:
+- directory doesn't exist -> error (fail to start)
+- no read access to directory -> error (fail to start)
+- no write access to directory -> warning (start)
+
 ## Fix error message output {#errormsg}
 
 When caught by with_context, error cause are printed.
