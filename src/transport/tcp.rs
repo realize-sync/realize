@@ -1,12 +1,16 @@
-use async_speed_limit::Limiter;
 use async_speed_limit::clock::Clock;
 use async_speed_limit::clock::StandardClock;
 use async_speed_limit::limiter::Consume;
+use async_speed_limit::Limiter;
 use futures::prelude::*;
 use rustls::pki_types::ServerName;
 use rustls::sign::SigningKey;
+use tarpc::client::stub::Stub;
+use tarpc::client::RpcError;
+use tarpc::context;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
+use tokio_rustls::TlsConnector;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -36,11 +40,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-pub type TcpRealizeServiceClient = RealizeServiceClient<
-    WithDeadline<
-        MetricsRealizeClient<tarpc::client::Channel<RealizeServiceRequest, RealizeServiceResponse>>,
-    >,
->;
+pub type TcpRealizeServiceClient = RealizeServiceClient<TcpStub>;
 
 /// Start the server, listening on the given address.
 pub async fn start_server<T>(
@@ -76,26 +76,55 @@ where
     T: tokio::net::ToSocketAddrs,
 {
     let connector = security::make_tls_connector(verifier, privkey)?;
-
     let stream = TcpStream::connect(server_addr).await?;
-    let domain = ServerName::try_from(options.domain.unwrap_or_else(|| "localhost".to_string()))?;
-    let limiter = options
-        .limiter
-        .unwrap_or_else(|| Limiter::<StandardClock>::new(f64::INFINITY));
-    let stream = connector
-        .connect(domain, RateLimitedStream::new(stream, limiter.clone()))
-        .await?;
+    let stub = TcpStub::new(stream, connector, options).await?;
+    Ok(RealizeServiceClient::from(stub))
+}
 
-    let codec_builder = LengthDelimitedCodec::builder();
-    let transport = transport::new(codec_builder.new_framed(stream), Bincode::default());
+/// A type that encapsulates and hides the actual stub type.
+///
+/// Most usage should be through the alias [TcpRealizeServiceClient].
+pub struct TcpStub {
+    inner: WithDeadline<
+        MetricsRealizeClient<tarpc::client::Channel<RealizeServiceRequest, RealizeServiceResponse>>,
+    >,
+}
 
-    let client = tarpc::client::new(Default::default(), transport).spawn();
-    let client = RealizeServiceClient::from(WithDeadline::new(
-        MetricsRealizeClient::new(client),
-        Duration::from_secs(60),
-    ));
+impl TcpStub {
+    async fn new(
+        stream: TcpStream,
+        connector: TlsConnector,
+        options: ClientOptions,
+    ) -> anyhow::Result<Self> {
+        let domain =
+            ServerName::try_from(options.domain.unwrap_or_else(|| "localhost".to_string()))?;
+        let limiter = options
+            .limiter
+            .unwrap_or_else(|| Limiter::<StandardClock>::new(f64::INFINITY));
+        let stream = connector
+            .connect(domain, RateLimitedStream::new(stream, limiter.clone()))
+            .await?;
 
-    Ok(client)
+        let codec_builder = LengthDelimitedCodec::builder();
+        let transport = transport::new(codec_builder.new_framed(stream), Bincode::default());
+        let channel = tarpc::client::new(Default::default(), transport).spawn();
+        Ok(Self {
+            inner: WithDeadline::new(MetricsRealizeClient::new(channel), Duration::from_secs(60)),
+        })
+    }
+}
+
+impl Stub for TcpStub {
+    type Req = RealizeServiceRequest;
+    type Resp = RealizeServiceResponse;
+
+    async fn call(
+        &self,
+        ctx: context::Context,
+        request: RealizeServiceRequest,
+    ) -> std::result::Result<RealizeServiceResponse, RpcError> {
+        self.inner.call(ctx, request).await
+    }
 }
 
 /// A TCP server bound to an address.
