@@ -19,7 +19,7 @@ use tarpc::server::{BaseChannel, Channel};
 use tarpc::tokio_serde::formats::Bincode;
 use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
 
-use crate::client::WithDeadline;
+use crate::client::deadline::WithDeadline;
 use crate::metrics;
 use crate::metrics::MetricsRealizeClient;
 use crate::metrics::MetricsRealizeServer;
