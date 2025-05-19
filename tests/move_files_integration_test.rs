@@ -134,7 +134,7 @@ impl Fixture {
 }
 
 #[tokio::test]
-async fn test_move_file() -> anyhow::Result<()> {
+async fn move_file() -> anyhow::Result<()> {
     let fixture = Fixture::setup().await?;
     create_files(&fixture.src_dir, &[("qux.txt", "qux")])?;
 
@@ -150,7 +150,7 @@ async fn test_move_file() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn test_partial_failure() -> anyhow::Result<()> {
+async fn partial_failure() -> anyhow::Result<()> {
     let fixture = Fixture::setup().await?;
     create_files(&fixture.src_dir, &[("good.txt", "ok"), ("bad.txt", "fail")])?;
     fs::set_permissions(
@@ -187,7 +187,7 @@ async fn test_partial_failure() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn test_success_output() -> anyhow::Result<()> {
+async fn success_output() -> anyhow::Result<()> {
     let fixture = Fixture::setup().await?;
     create_files(
         &fixture.src_dir,
@@ -209,7 +209,7 @@ async fn test_success_output() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn test_progress_output() -> anyhow::Result<()> {
+async fn progress_output() -> anyhow::Result<()> {
     let fixture = Fixture::setup().await?;
     create_files(
         &fixture.src_dir,
@@ -239,7 +239,7 @@ async fn test_progress_output() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn test_quiet_success() -> anyhow::Result<()> {
+async fn quiet_success() -> anyhow::Result<()> {
     let fixture = Fixture::setup().await?;
     create_files(
         &fixture.src_dir,
@@ -266,7 +266,7 @@ async fn test_quiet_success() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn test_quiet_failure() -> anyhow::Result<()> {
+async fn quiet_failure() -> anyhow::Result<()> {
     let fixture = Fixture::setup().await?;
     create_files(&fixture.src_dir, &[("good.txt", "ok"), ("bad.txt", "fail")])?;
     use std::fs;
@@ -301,7 +301,7 @@ async fn test_quiet_failure() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn test_max_duration_timeout() -> anyhow::Result<()> {
+async fn max_duration_timeout() -> anyhow::Result<()> {
     let mut fixture = Fixture::setup().await?;
 
     // Make sure the command doesn't stop unless killed by --max-duration
@@ -326,7 +326,7 @@ async fn test_max_duration_timeout() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[cfg(feature = "push")]
-async fn test_realize_metrics_export() -> anyhow::Result<()> {
+async fn realize_metrics_export() -> anyhow::Result<()> {
     use reqwest::Client;
     use tokio::io::AsyncBufReadExt as _;
 
@@ -391,7 +391,7 @@ async fn test_realize_metrics_export() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[cfg(feature = "push")]
-async fn test_realize_metrics_pushgateway() -> anyhow::Result<()> {
+async fn realize_metrics_pushgateway() -> anyhow::Result<()> {
     use realize::utils::async_utils::AbortOnDrop;
 
     // A fake pushgateway that expect one specific request and then
@@ -448,7 +448,7 @@ async fn test_realize_metrics_pushgateway() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn test_set_rate_limits() -> anyhow::Result<()> {
+async fn set_rate_limits() -> anyhow::Result<()> {
     let fixture = Fixture::setup().await?;
 
     create_files(&fixture.src_dir, &[("foo.txt", "hello")])?;
@@ -476,7 +476,7 @@ async fn test_set_rate_limits() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn test_multiple_directory_ids() -> anyhow::Result<()> {
+async fn multiple_directory_ids() -> anyhow::Result<()> {
     env_logger::try_init().ok();
     let tempdir = TempDir::new()?;
     let src_dir1 = tempdir.child("src_multi1");

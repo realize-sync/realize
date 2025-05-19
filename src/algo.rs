@@ -474,7 +474,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_progress_trait_is_called() -> anyhow::Result<()> {
+    async fn progress_trait_is_called() -> anyhow::Result<()> {
         let _ = env_logger::try_init();
         let src_temp = TempDir::new()?;
         let dst_temp = TempDir::new()?;
@@ -513,7 +513,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_move_files() -> anyhow::Result<()> {
+    async fn move_some_files() -> anyhow::Result<()> {
         let _ = env_logger::try_init();
 
         // Setup source directory with files
@@ -575,7 +575,7 @@ mod tests {
 
     #[tokio::test]
     #[test_tag::tag(slow)]
-    async fn test_move_files_chunked() -> anyhow::Result<()> {
+    async fn move_files_chunked() -> anyhow::Result<()> {
         let _ = env_logger::try_init();
         const FILE_SIZE: usize = (1.25 * CHUNK_SIZE as f32) as usize;
         let chunk = vec![0xAB; FILE_SIZE];
@@ -649,7 +649,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_move_files_partial_error() -> anyhow::Result<()> {
+    async fn move_files_partial_error() -> anyhow::Result<()> {
         let _ = env_logger::try_init();
         let src_temp = TempDir::new()?;
         let src_dir = Arc::new(crate::server::Directory::new(
@@ -686,7 +686,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_move_files_ignores_partial_in_src() -> anyhow::Result<()> {
+    async fn move_files_ignores_partial_in_src() -> anyhow::Result<()> {
         let _ = env_logger::try_init();
         let src_temp = TempDir::new()?;
         let dst_temp = TempDir::new()?;
@@ -728,7 +728,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hash_file() -> anyhow::Result<()> {
+    async fn hash_file_non_chunked() -> anyhow::Result<()> {
         let _ = env_logger::try_init();
 
         let temp = TempDir::new()?;
@@ -753,7 +753,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hash_file_chunked() -> anyhow::Result<()> {
+    async fn hash_file_chunked() -> anyhow::Result<()> {
         let _ = env_logger::try_init();
 
         let temp = TempDir::new()?;
@@ -788,7 +788,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hash_file_wrong_size() -> anyhow::Result<()> {
+    async fn hash_file_wrong_size() -> anyhow::Result<()> {
         let _ = env_logger::try_init();
 
         let temp = TempDir::new()?;

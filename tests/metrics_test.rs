@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 #[tokio::test]
 #[serial_test::serial]
-async fn test_client_success_call_count() -> anyhow::Result<()> {
+async fn client_success_call_count() -> anyhow::Result<()> {
     let (_temp, dir_id, client) = setup_inprocess_client();
     let before = get_metric_value(
         "realize_client_call_count",
@@ -47,7 +47,7 @@ async fn test_client_success_call_count() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn test_client_error_call_count() -> anyhow::Result<()> {
+async fn client_error_call_count() -> anyhow::Result<()> {
     let (_temp, _dir_id, client) = setup_inprocess_client();
     let before_err = get_metric_value(
         "realize_client_call_count",
@@ -81,7 +81,7 @@ async fn test_client_error_call_count() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn test_server_success_call_count() -> anyhow::Result<()> {
+async fn server_success_call_count() -> anyhow::Result<()> {
     let (_temp, dir_id, client) = setup_inprocess_client();
     let before_srv = get_metric_value(
         "realize_server_call_count",
@@ -104,7 +104,7 @@ async fn test_server_success_call_count() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn test_server_error_call_count() -> anyhow::Result<()> {
+async fn server_error_call_count() -> anyhow::Result<()> {
     let (_temp, _dir_id, client) = setup_inprocess_client();
     let before_srv_err = get_metric_value(
         "realize_server_call_count",
@@ -138,7 +138,7 @@ async fn test_server_error_call_count() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn test_move_files_metrics() -> anyhow::Result<()> {
+async fn move_files_metrics() -> anyhow::Result<()> {
     // Reset metrics (set to zero) by clearing the registry and re-registering
     // Not strictly necessary for IntCounter, but ensures test isolation
     METRIC_START_COUNT.reset();

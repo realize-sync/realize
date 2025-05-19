@@ -324,7 +324,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tarpc_rpc_tcp_tls() -> anyhow::Result<()> {
+    async fn tarpc_rpc_tcp_tls() -> anyhow::Result<()> {
         let verifier = verifier_both();
         let (addr, _server_handle, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
         let client_privkey =
@@ -348,7 +348,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_client_not_in_server_verifier_fails() -> anyhow::Result<()> {
+    async fn client_not_in_server_verifier_fails() -> anyhow::Result<()> {
         let verifier = verifier_server_only();
         let (addr, _server_handle, _temp) = setup_test_server(Arc::clone(&verifier)).await.unwrap();
         let client_privkey =
@@ -384,7 +384,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_server_not_in_client_verifier_fails() -> anyhow::Result<()> {
+    async fn server_not_in_client_verifier_fails() -> anyhow::Result<()> {
         let verifier = verifier_client_only();
         let (addr, _server_handle, _temp) = setup_test_server(Arc::clone(&verifier)).await.unwrap();
         let client_privkey =
@@ -405,7 +405,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rate_limited_stream() -> anyhow::Result<()> {
+    async fn rate_limited_stream() -> anyhow::Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let mut a = TcpStream::connect(listener.local_addr()?).await?;
         let (b, _) = listener.accept().await?;
@@ -472,7 +472,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_configure_tcp_returns_limit() -> anyhow::Result<()> {
+    async fn configure_tcp_returns_limit() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let dirs = DirectoryMap::for_dir(&DirectoryId::from("testdir"), temp.path());
         let verifier = verifier_both();
@@ -515,7 +515,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_configure_tcp_per_connection_limit() -> anyhow::Result<()> {
+    async fn configure_tcp_per_connection_limit() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let dirs = DirectoryMap::for_dir(&DirectoryId::from("testdir"), temp.path());
         let verifier = verifier_both();

@@ -304,14 +304,14 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     #[tokio::test]
-    async fn test_tls_acceptor_connector() -> anyhow::Result<()> {
+    async fn tls_acceptor_connector() -> anyhow::Result<()> {
         test_connect(complete_verifier()).await?;
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_tls_unknown_client_peer() -> anyhow::Result<()> {
+    async fn tls_unknown_client_peer() -> anyhow::Result<()> {
         let crypto = Arc::new(default_provider());
         let mut verifier = PeerVerifier::new(&crypto);
         // client public key missing from verifier
@@ -323,7 +323,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tls_unknown_server_peer() -> anyhow::Result<()> {
+    async fn tls_unknown_server_peer() -> anyhow::Result<()> {
         let crypto = Arc::new(default_provider());
         let mut verifier = PeerVerifier::new(&crypto);
         verifier.add_peer(testing::client_public_key());
@@ -335,7 +335,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tls_reject_client_with_bad_private_key() -> anyhow::Result<()> {
+    async fn tls_reject_client_with_bad_private_key() -> anyhow::Result<()> {
         let crypto = Arc::new(default_provider());
         let mut verifier = PeerVerifier::new(&crypto);
         verifier.add_peer(testing::client_public_key());
@@ -368,7 +368,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tls_reject_client_without_cert() -> anyhow::Result<()> {
+    async fn tls_reject_client_without_cert() -> anyhow::Result<()> {
         let crypto = Arc::new(default_provider());
         let mut verifier = PeerVerifier::new(&crypto);
         verifier.add_peer(testing::client_public_key());
@@ -395,7 +395,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tls_reject_server_with_bad_private_key() -> anyhow::Result<()> {
+    async fn tls_reject_server_with_bad_private_key() -> anyhow::Result<()> {
         let crypto = Arc::new(default_provider());
         let mut verifier = PeerVerifier::new(&crypto);
         verifier.add_peer(testing::client_public_key());
@@ -427,7 +427,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tls_bad_private_key_algo() -> anyhow::Result<()> {
+    async fn tls_bad_private_key_algo() -> anyhow::Result<()> {
         let verifier = Arc::new(complete_verifier());
 
         let server_priv = load_signing_key(testing::server_private_key())?;

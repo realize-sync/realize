@@ -771,7 +771,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_empty() -> anyhow::Result<()> {
+    async fn list_empty() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
         let files = server
             .clone()
@@ -787,7 +787,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_files_and_partial() -> anyhow::Result<()> {
+    async fn list_files_and_partial() -> anyhow::Result<()> {
         let (server, temp, dir) = setup_server_with_dir()?;
 
         fs::create_dir_all(temp.child("subdir"))?;
@@ -834,7 +834,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_wrong_order() -> anyhow::Result<()> {
+    async fn send_wrong_order() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
 
         let fpath = LogicalPath::new(&dir, &PathBuf::from("wrong_order.txt"))?;
@@ -878,7 +878,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read() -> anyhow::Result<()> {
+    async fn read() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
 
         let fpath = LogicalPath::new(&dir, &PathBuf::from("wrong_order.txt"))?;
@@ -925,7 +925,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_finish_partial() -> anyhow::Result<()> {
+    async fn finish_partial() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
 
         let fpath = LogicalPath::new(&dir, &PathBuf::from("finish_partial.txt"))?;
@@ -948,7 +948,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_finish_final() -> anyhow::Result<()> {
+    async fn finish_final() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
 
         let fpath = LogicalPath::new(&dir, &PathBuf::from("finish_partial.txt"))?;
@@ -971,7 +971,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_truncates_file() -> anyhow::Result<()> {
+    async fn send_truncates_file() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
         let fpath = LogicalPath::new(&dir, &PathBuf::from("truncate.txt"))?;
         // Write a file with more data than we will send
@@ -995,7 +995,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hash_final_and_partial() -> anyhow::Result<()> {
+    async fn hash_final_and_partial() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
         let content = b"hello world";
         let fpath = LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?;
@@ -1037,7 +1037,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hash_past_file_end() -> anyhow::Result<()> {
+    async fn hash_past_file_end() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
         let content = b"hello world";
         let fpath = LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?;
@@ -1058,7 +1058,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hash_short_read() -> anyhow::Result<()> {
+    async fn hash_short_read() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
         let content = b"hello world";
         let fpath = LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?;
@@ -1079,7 +1079,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_final_and_partial() -> anyhow::Result<()> {
+    async fn delete_final_and_partial() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
         let fpath = LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?;
         std::fs::write(fpath.final_path(), b"data")?;
@@ -1111,7 +1111,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tarpc_rpc_inprocess() -> anyhow::Result<()> {
+    async fn tarpc_rpc_inprocess() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let server_impl = RealizeServer::for_dir(&DirectoryId::from("testdir"), temp.path());
         let client = server_impl.as_inprocess_client();
@@ -1129,7 +1129,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_calculate_signature_and_diff_and_apply_delta() -> anyhow::Result<()> {
+    async fn calculate_signature_and_diff_and_apply_delta() -> anyhow::Result<()> {
         let (server, temp, dir) = setup_server_with_dir()?;
         let file_path = PathBuf::from("foo.txt");
         let file_content = b"hello world, this is a test of rsync signature!";
@@ -1191,7 +1191,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_signature_on_nonexisting_file() -> anyhow::Result<()> {
+    async fn signature_on_nonexisting_file() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
         // Nonexistent file
         let result = server
@@ -1210,7 +1210,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_apply_delta_error_case() -> anyhow::Result<()> {
+    async fn apply_delta_error_case() -> anyhow::Result<()> {
         let (server, temp, dir) = setup_server_with_dir()?;
         let file_path = PathBuf::from("foo.txt");
         temp.child("foo.txt").write_str("abc")?;
@@ -1235,7 +1235,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_diff_and_apply_delta_with_shorter_content() -> anyhow::Result<()> {
+    async fn diff_and_apply_delta_with_shorter_content() -> anyhow::Result<()> {
         let (server, temp, dir) = setup_server_with_dir()?;
         let file_path = PathBuf::from("shorten.txt");
         let original_content = b"this is the original, longer content";
@@ -1296,7 +1296,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_partial_vs_final() -> anyhow::Result<()> {
+    async fn list_partial_vs_final() -> anyhow::Result<()> {
         let (server, temp, dir) = setup_server_with_dir()?;
         temp.child("foo.txt").write_str("final")?;
         temp.child(".foo.txt.part").write_str("partial")?;
@@ -1330,7 +1330,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_ignore_partial() -> anyhow::Result<()> {
+    async fn list_ignore_partial() -> anyhow::Result<()> {
         let (server, temp, dir) = setup_server_with_dir()?;
         temp.child(".foo.txt.part").write_str("partial")?;
         // Default: return partial
@@ -1362,7 +1362,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_partial_vs_final() -> anyhow::Result<()> {
+    async fn read_partial_vs_final() -> anyhow::Result<()> {
         let (server, temp, dir) = setup_server_with_dir()?;
         temp.child("foo.txt").write_str("final")?;
         temp.child(".foo.txt.part").write_str("partial")?;
@@ -1398,7 +1398,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_removes_empty_parent_dirs() -> anyhow::Result<()> {
+    async fn delete_removes_empty_parent_dirs() -> anyhow::Result<()> {
         let (server, temp, dir) = setup_server_with_dir()?;
         // Create nested directories: a/b/c/file.txt
         let nested_dir = temp.child("a/b/c");
@@ -1427,7 +1427,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_does_not_remove_nonempty_parent_dirs() -> anyhow::Result<()> {
+    async fn delete_does_not_remove_nonempty_parent_dirs() -> anyhow::Result<()> {
         let (server, temp, dir) = setup_server_with_dir()?;
         // Create nested directories: a/b/c/file.txt and a/b/c/keep.txt
         let nested_dir = temp.child("a/b/c");
@@ -1457,7 +1457,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_configure_noop_returns_none() {
+    async fn configure_noop_returns_none() {
         let server = RealizeServer::for_dir(
             &DirectoryId::from("testdir"),
             &PathBuf::from("/tmp/testdir"),
@@ -1476,7 +1476,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_configure_limited_sets_and_returns_limit() {
+    async fn configure_limited_sets_and_returns_limit() {
         let dirs = DirectoryMap::for_dir(
             &DirectoryId::from("testdir"),
             &PathBuf::from("/tmp/testdir"),
