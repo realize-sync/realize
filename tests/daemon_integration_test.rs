@@ -86,7 +86,7 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
     let verifier = Arc::new(verifier);
 
     let client = tcp::connect_client(
-        format!("127.0.0.1:{}", portstr),
+        &tcp::lookup_addr(&format!("127.0.0.1:{portstr}")).await?,
         verifier,
         crypto
             .key_provider

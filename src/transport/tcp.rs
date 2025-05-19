@@ -1,14 +1,15 @@
+use async_speed_limit::Limiter;
 use async_speed_limit::clock::Clock;
 use async_speed_limit::clock::StandardClock;
 use async_speed_limit::limiter::Consume;
-use async_speed_limit::Limiter;
 use futures::prelude::*;
 use rustls::pki_types::ServerName;
 use rustls::sign::SigningKey;
-use tarpc::client::stub::Stub;
 use tarpc::client::RpcError;
+use tarpc::client::stub::Stub;
 use tarpc::context;
 use tokio::task::JoinHandle;
+use tokio_retry::strategy::ExponentialBackoff;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 
@@ -24,6 +25,8 @@ use tarpc::tokio_serde::formats::Bincode;
 use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
 
 use crate::client::deadline::WithDeadline;
+use crate::client::reconnect::Connect;
+use crate::client::reconnect::Reconnect;
 use crate::metrics;
 use crate::metrics::MetricsRealizeClient;
 use crate::metrics::MetricsRealizeServer;
@@ -41,6 +44,14 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 pub type TcpRealizeServiceClient = RealizeServiceClient<TcpStub>;
+
+/// Lookup an address as a string.
+pub async fn lookup_addr(addr: &str) -> anyhow::Result<SocketAddr> {
+    tokio::net::lookup_host(addr)
+        .await?
+        .next()
+        .ok_or(anyhow::anyhow!("DNS lookup failed for {addr}"))
+}
 
 /// Start the server, listening on the given address.
 pub async fn start_server<T>(
@@ -66,51 +77,100 @@ pub struct ClientOptions {
 }
 
 /// Create a [RealizeServiceClient] connected to the given TCP address.
-pub async fn connect_client<T>(
-    server_addr: T,
+pub async fn connect_client(
+    server_addr: &SocketAddr,
     verifier: Arc<PeerVerifier>,
     privkey: Arc<dyn SigningKey>,
     options: ClientOptions,
-) -> anyhow::Result<TcpRealizeServiceClient>
-where
-    T: tokio::net::ToSocketAddrs,
-{
+) -> anyhow::Result<TcpRealizeServiceClient> {
     let connector = security::make_tls_connector(verifier, privkey)?;
-    let stream = TcpStream::connect(server_addr).await?;
-    let stub = TcpStub::new(stream, connector, options).await?;
+    let stub = TcpStub::new(server_addr, connector, options).await?;
     Ok(RealizeServiceClient::from(stub))
 }
 
-/// A type that encapsulates and hides the actual stub type.
-///
-/// Most usage should be through the alias [TcpRealizeServiceClient].
-pub struct TcpStub {
-    inner: WithDeadline<
-        MetricsRealizeClient<tarpc::client::Channel<RealizeServiceRequest, RealizeServiceResponse>>,
-    >,
+#[derive(Clone)]
+struct TcpConnect {
+    server_addr: SocketAddr,
+    connector: TlsConnector,
+    options: ClientOptions,
 }
 
-impl TcpStub {
-    async fn new(
-        stream: TcpStream,
-        connector: TlsConnector,
-        options: ClientOptions,
-    ) -> anyhow::Result<Self> {
-        let domain =
-            ServerName::try_from(options.domain.unwrap_or_else(|| "localhost".to_string()))?;
-        let limiter = options
+impl
+    Connect<
+        WithDeadline<tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>>,
+    > for TcpConnect
+{
+    async fn run(
+        &self,
+    ) -> anyhow::Result<
+        WithDeadline<tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>>,
+    > {
+        let stream = TcpStream::connect(&self.server_addr).await?;
+        let domain = ServerName::try_from(
+            self.options
+                .clone()
+                .domain
+                .unwrap_or_else(|| "localhost".to_string()),
+        )?;
+        let limiter = self
+            .options
             .limiter
+            .clone()
             .unwrap_or_else(|| Limiter::<StandardClock>::new(f64::INFINITY));
-        let stream = connector
+        let stream = self
+            .connector
             .connect(domain, RateLimitedStream::new(stream, limiter.clone()))
             .await?;
 
         let codec_builder = LengthDelimitedCodec::builder();
         let transport = transport::new(codec_builder.new_framed(stream), Bincode::default());
         let channel = tarpc::client::new(Default::default(), transport).spawn();
-        Ok(Self {
-            inner: WithDeadline::new(MetricsRealizeClient::new(channel), Duration::from_secs(60)),
-        })
+        let stub = WithDeadline::new(channel, Duration::from_secs(60));
+
+        Ok(stub)
+    }
+}
+
+/// A type that encapsulates and hides the actual stub type.
+///
+/// Most usage should be through the alias [TcpRealizeServiceClient].
+pub struct TcpStub {
+    inner: MetricsRealizeClient<
+        Reconnect<
+            WithDeadline<
+                tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>,
+            >,
+            TcpConnect,
+            ExponentialBackoff,
+        >,
+    >,
+}
+
+impl TcpStub {
+    async fn new(
+        server_addr: &SocketAddr,
+        connector: TlsConnector,
+        options: ClientOptions,
+    ) -> anyhow::Result<Self> {
+        let retry_strategy = ExponentialBackoff::from_millis(500)
+            .factor(2)
+            .max_delay(Duration::from_secs(5 * 60));
+
+        let connect = TcpConnect {
+            server_addr: server_addr.clone(),
+            connector,
+            options,
+        };
+
+        let reconnect: Reconnect<
+            WithDeadline<
+                tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>,
+            >,
+            TcpConnect,
+            ExponentialBackoff,
+        > = Reconnect::new(retry_strategy, connect).await?;
+        let stub = MetricsRealizeClient::new(reconnect);
+        Ok(Self { inner: stub })
     }
 }
 
@@ -353,13 +413,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tarpc_rpc_tcp_tls() -> anyhow::Result<()> {
+    async fn tarpc_tcp_connect() -> anyhow::Result<()> {
         let verifier = verifier_both();
         let (addr, _server_handle, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
         let client_privkey =
             load_private_key(crate::transport::security::testing::client_private_key())?;
         let client = connect_client(
-            addr,
+            &addr,
             verifier_both(),
             client_privkey,
             ClientOptions::default(),
@@ -383,7 +443,7 @@ mod tests {
         let client_privkey =
             load_private_key(crate::transport::security::testing::client_private_key())?;
         let client_result = connect_client(
-            addr,
+            &addr,
             Arc::clone(&verifier),
             client_privkey,
             ClientOptions::default(),
@@ -419,7 +479,7 @@ mod tests {
         let client_privkey =
             load_private_key(crate::transport::security::testing::client_private_key())?;
         let result = connect_client(
-            addr,
+            &addr,
             Arc::clone(&verifier),
             client_privkey,
             ClientOptions::default(),
@@ -519,7 +579,7 @@ mod tests {
         let client_privkey =
             load_private_key(crate::transport::security::testing::client_private_key())?;
         let client = connect_client(
-            addr,
+            &addr,
             verifier.clone(),
             client_privkey,
             ClientOptions::default(),
@@ -564,14 +624,14 @@ mod tests {
         let client_privkey2 =
             load_private_key(crate::transport::security::testing::client_private_key())?;
         let client1 = connect_client(
-            addr,
+            &addr,
             Arc::clone(&verifier),
             client_privkey1,
             ClientOptions::default(),
         )
         .await?;
         let client2 = connect_client(
-            addr,
+            &addr,
             Arc::clone(&verifier),
             client_privkey2,
             ClientOptions::default(),

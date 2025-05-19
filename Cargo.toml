@@ -33,6 +33,7 @@ sha2 = "0.10"
 tarpc = { version = "0.36", features = ["serde1", "tokio1", "serde-transport", "serde-transport-bincode", "tcp"] }
 thiserror = "2.0"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "fs", "io-util"] }
+tokio-retry = "0.3.0"
 tokio-rustls = "0.26"
 tracing = "0.1"
 walkdir = "2.5"

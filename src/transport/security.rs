@@ -2,6 +2,7 @@
 pub mod testing;
 
 use base64::Engine as _;
+use rustls::client::Resumption;
 use rustls::client::danger::ServerCertVerifier;
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::sign::{CertifiedKey, SigningKey};
@@ -33,10 +34,12 @@ pub fn make_tls_connector(
     verifier: Arc<PeerVerifier>,
     privkey: Arc<dyn SigningKey>,
 ) -> Result<TlsConnector, anyhow::Error> {
-    let config = ClientConfig::builder_with_protocol_versions(&[&TLS13])
+    let mut config = ClientConfig::builder_with_protocol_versions(&[&TLS13])
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_client_cert_resolver(RawPublicKeyResolver::create(privkey)?);
+    config.resumption = Resumption::disabled();
+    config.enable_sni = false;
     let connector = TlsConnector::from(Arc::new(config));
     Ok(connector)
 }

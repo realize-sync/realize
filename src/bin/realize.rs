@@ -9,7 +9,7 @@ use realize::algo::{FileProgress as AlgoFileProgress, MoveFileError, Progress};
 use realize::metrics;
 use realize::model::service::DirectoryId;
 use realize::transport::security::{self, PeerVerifier};
-use realize::transport::tcp::{self, TcpRealizeServiceClient};
+use realize::transport::tcp::{self, TcpRealizeServiceClient, lookup_addr};
 use realize::utils::async_utils::AbortOnDrop;
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
@@ -146,7 +146,7 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
 
     // Build src client
     let src_client = tcp::connect_client(
-        &cli.src_addr,
+        &lookup_addr(&cli.src_addr).await.context("--src-addr")?,
         Arc::clone(&verifier),
         Arc::clone(&privkey),
         tcp::ClientOptions::default(),
@@ -166,13 +166,13 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
 
     // Build dst client
     let dst_client = {
-        let addr = &cli.dst_addr;
+        let addr = lookup_addr(&cli.dst_addr).await.context("--dst-addr")?;
         let mut options = tcp::ClientOptions::default();
         if let Some(limit) = cli.throttle_up {
             log::info!("Throttling uploads: {}/s", HumanBytes(limit));
             options.limiter = Some(Limiter::<StandardClock>::new(limit as f64));
         }
-        tcp::connect_client(addr, Arc::clone(&verifier), Arc::clone(&privkey), options)
+        tcp::connect_client(&addr, Arc::clone(&verifier), Arc::clone(&privkey), options)
             .await
             .with_context(|| format!("Connection to dst {addr} failed"))?
     };
