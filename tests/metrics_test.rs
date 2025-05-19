@@ -1,8 +1,6 @@
-use assert_fs::prelude::*;
 use assert_fs::TempDir;
+use assert_fs::prelude::*;
 use prometheus::proto::MetricType;
-use realize::algo::move_files;
-use realize::algo::NoProgress;
 use realize::algo::METRIC_END_COUNT;
 use realize::algo::METRIC_FILE_END_COUNT;
 use realize::algo::METRIC_FILE_START_COUNT;
@@ -11,6 +9,8 @@ use realize::algo::METRIC_RANGE_WRITE_BYTES;
 use realize::algo::METRIC_READ_BYTES;
 use realize::algo::METRIC_START_COUNT;
 use realize::algo::METRIC_WRITE_BYTES;
+use realize::algo::NoProgress;
+use realize::algo::move_files;
 use realize::model::service::{DirectoryId, Options};
 use realize::server::InProcessRealizeServiceClient;
 use realize::server::RealizeServer;
@@ -57,14 +57,16 @@ async fn test_client_error_call_count() -> anyhow::Result<()> {
             ("error", "BadRequest"),
         ],
     );
-    assert!(client
-        .list(
-            tarpc::context::current(),
-            DirectoryId::from("doesnotexist"),
-            Options::default(),
-        )
-        .await?
-        .is_err());
+    assert!(
+        client
+            .list(
+                tarpc::context::current(),
+                DirectoryId::from("doesnotexist"),
+                Options::default(),
+            )
+            .await?
+            .is_err()
+    );
     let after_err = get_metric_value(
         "realize_client_call_count",
         &[
@@ -112,14 +114,16 @@ async fn test_server_error_call_count() -> anyhow::Result<()> {
             ("error", "BadRequest"),
         ],
     );
-    assert!(client
-        .list(
-            tarpc::context::current(),
-            DirectoryId::from("doesnotexist"),
-            Options::default(),
-        )
-        .await?
-        .is_err());
+    assert!(
+        client
+            .list(
+                tarpc::context::current(),
+                DirectoryId::from("doesnotexist"),
+                Options::default(),
+            )
+            .await?
+            .is_err()
+    );
     let after_srv_err = get_metric_value(
         "realize_server_call_count",
         &[
