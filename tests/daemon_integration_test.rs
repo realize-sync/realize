@@ -15,44 +15,63 @@ use reqwest::Client;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::SubjectPublicKeyInfoDer;
 use rustls::pki_types::pem::PemObject as _;
-use tokio::fs;
 use tokio::io::AsyncBufReadExt as _;
+use tokio::process::Command;
+
+struct Fixture {
+    pub config_file: PathBuf,
+    _temp_dir: TempDir,
+}
+
+impl Fixture {
+    pub async fn setup() -> anyhow::Result<Self> {
+        let _ = env_logger::try_init();
+
+        // Setup temp directory for the daemon to serve
+        let temp_dir = TempDir::new()?;
+        let testdir_server = temp_dir.child("server");
+        testdir_server.create_dir_all()?;
+        testdir_server.child("foo.txt").write_str("hello")?;
+
+        let config_file = temp_dir.child("config.yaml").to_path_buf();
+        write_config_file(
+            &config_file,
+            testdir_server.path(),
+            &PathBuf::from("resources/test/a-spki.pem"),
+        )?;
+
+        Ok(Self {
+            config_file,
+            _temp_dir: temp_dir,
+        })
+    }
+
+    pub fn command(&self) -> Command {
+        let mut cmd = tokio::process::Command::new(cargo_bin!("realized"));
+
+        cmd.arg("--address")
+            .arg("127.0.0.1:0")
+            .arg("--privkey")
+            .arg(&PathBuf::from("resources/test/a.key"))
+            .arg("--config")
+            .arg(&self.config_file)
+            .env("RUST_LOG", "realize::transport::tcp=debug")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+
+        cmd
+    }
+}
 
 #[tokio::test]
 async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
-    env_logger::init();
-
-    // Setup temp directory for the daemon to serve
-    let temp_dir = TempDir::new()?;
-    let testdir_server = temp_dir.child("server");
-    fs::create_dir(&testdir_server).await?;
-    testdir_server.child("foo.txt").write_str("hello")?;
-
-    let privkey_file = PathBuf::from("resources/test/a.key");
-    let pubkey_file = PathBuf::from("resources/test/a-spki.pem");
-
-    let config_file = temp_dir.child("config.yaml");
-    write_config_file(
-        config_file.path(),
-        testdir_server.path(),
-        pubkey_file.as_path(),
-    )?;
+    let fixture = Fixture::setup().await?;
 
     // Run process in the background and in a way that allows reading
     // its output, so we know what port to connect to.
-    let mut daemon = tokio::process::Command::new(cargo_bin!("realized"))
-        .arg("--address")
-        .arg("127.0.0.1:0")
-        .arg("--privkey")
-        .arg(&privkey_file)
-        .arg("--config")
-        .arg(config_file.path())
-        .env("RUST_LOG", "realize::transport::tcp=debug")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
+    let mut daemon = fixture.command().spawn()?;
 
     // The first line that's output to stdout must be Listening on
     // <address>:<port>. Anything else is an error.
@@ -61,7 +80,9 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
     // Connect to the port the daemon listens to.
     let crypto = Arc::new(security::default_provider());
     let mut verifier = PeerVerifier::new(&crypto);
-    verifier.add_peer(SubjectPublicKeyInfoDer::from_pem_file(&pubkey_file)?);
+    verifier.add_peer(SubjectPublicKeyInfoDer::from_pem_file(&PathBuf::from(
+        "resources/test/a-spki.pem",
+    ))?);
     let verifier = Arc::new(verifier);
 
     let client = tcp::connect_client(
@@ -69,7 +90,9 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
         verifier,
         crypto
             .key_provider
-            .load_private_key(PrivateKeyDer::from_pem_file(&privkey_file)?)?,
+            .load_private_key(PrivateKeyDer::from_pem_file(&PathBuf::from(
+                "resources/test/a.key",
+            ))?)?,
         tcp::ClientOptions::default(),
     )
     .await?;
@@ -100,33 +123,17 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn metrics_endpoint_works() -> anyhow::Result<()> {
-    let temp_dir = TempDir::new()?;
-    let testdir_server = temp_dir.child("server");
-    fs::create_dir(&testdir_server).await?;
-    let privkey_file = PathBuf::from("resources/test/a.key");
-    let pubkey_file = PathBuf::from("resources/test/a-spki.pem");
-    let config_file = temp_dir.child("config.yaml");
-    write_config_file(
-        config_file.path(),
-        testdir_server.path(),
-        pubkey_file.as_path(),
-    )?;
+    let fixture = Fixture::setup().await?;
 
     let metrics_port = portpicker::pick_unused_port().expect("No ports free");
     let metrics_addr = format!("127.0.0.1:{}", metrics_port);
-    let mut daemon = tokio::process::Command::new(cargo_bin!("realized"))
-        .arg("--address")
-        .arg("127.0.0.1:0")
-        .arg("--privkey")
-        .arg(&privkey_file)
-        .arg("--config")
-        .arg(config_file.path())
+
+    // Run process in the background and in a way that allows reading
+    // its output, so we know what port to connect to.
+    let mut daemon = fixture
+        .command()
         .arg("--metrics-addr")
         .arg(&metrics_addr)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .kill_on_drop(true)
         .spawn()?;
 
     // Waiting for the daemon to be ready, to be sure the metrics
