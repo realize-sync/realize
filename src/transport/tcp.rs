@@ -6,9 +6,7 @@ use rustls::sign::SigningKey;
 use tarpc::client::RpcError;
 use tarpc::client::stub::Stub;
 use tarpc::context;
-use tokio::task::JoinHandle;
 use tokio_retry::strategy::ExponentialBackoff;
-use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 
 use std::net::SocketAddr;
@@ -59,9 +57,57 @@ pub async fn start_server<T>(
 where
     T: tokio::net::ToSocketAddrs,
 {
-    let server = RunningServer::bind(addr, dirs, verifier, privkey).await?;
-    let addr = server.local_addr()?;
-    let handle = AbortOnDrop::new(server.spawn());
+    let acceptor = security::make_tls_acceptor(Arc::clone(&verifier), privkey)?;
+    let listener = TcpListener::bind(&addr).await?;
+    log::info!(
+        "Listening for RPC connections on {:?}",
+        listener
+            .local_addr()
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|err| err.to_string())
+    );
+
+    let addr = listener.local_addr()?;
+
+    let accept = async move |stream: TcpStream| -> anyhow::Result<()> {
+        let peer_addr = stream.peer_addr()?;
+        let limiter = Limiter::<StandardClock>::new(f64::INFINITY);
+        let tls_stream = acceptor
+            .accept(RateLimitedStream::new(stream, limiter.clone()))
+            .await?;
+
+        log::info!(
+            "Accepted peer {} from {}",
+            verifier
+                .connection_peer_id(&tls_stream)
+                .expect("Peer MUST be known"), // Guards against bugs in the auth code; worth dying
+            peer_addr
+        );
+        let framed = LengthDelimitedCodec::builder().new_framed(tls_stream);
+        let server = RealizeServer::new_limited(dirs.clone(), limiter.clone());
+        tokio::spawn(
+            BaseChannel::with_defaults(transport::new(framed, Bincode::default()))
+                .execute(MetricsRealizeServer::new(RealizeServer::serve(
+                    server.clone(),
+                )))
+                .for_each(async move |fut| {
+                    tokio::spawn(metrics::track_in_flight_request(fut));
+                }),
+        );
+
+        Ok(())
+    };
+
+    let handle = AbortOnDrop::new(tokio::spawn(async move {
+        loop {
+            if let Ok((stream, peer)) = listener.accept().await {
+                match accept(stream).await {
+                    Ok(_) => {}
+                    Err(err) => log::debug!("{}: connection rejected: {}", peer, err),
+                };
+            }
+        }
+    }));
 
     Ok((addr, handle))
 }
@@ -175,94 +221,6 @@ impl Stub for TcpStub {
     }
 }
 
-/// A TCP server bound to an address.
-struct RunningServer {
-    acceptor: TlsAcceptor,
-    listener: TcpListener,
-    dirs: DirectoryMap,
-    verifier: Arc<PeerVerifier>,
-}
-
-impl RunningServer {
-    /// Bind to the address, but don't process client requests yet.
-    async fn bind<T>(
-        addr: T,
-        dirs: DirectoryMap,
-        verifier: Arc<PeerVerifier>,
-        privkey: Arc<dyn SigningKey>,
-    ) -> anyhow::Result<Self>
-    where
-        T: tokio::net::ToSocketAddrs,
-    {
-        let acceptor = security::make_tls_acceptor(Arc::clone(&verifier), privkey)?;
-        let listener = TcpListener::bind(&addr).await?;
-        log::info!(
-            "Listening for RPC connections on {:?}",
-            listener
-                .local_addr()
-                .map(|addr| addr.to_string())
-                .unwrap_or_else(|err| err.to_string())
-        );
-        Ok(Self {
-            acceptor,
-            listener,
-            dirs,
-            verifier,
-        })
-    }
-
-    /// Return the address the server is listening to.
-    ///
-    /// This is useful when the port given to [start_server] is 0, which means that the OS should choose.
-    fn local_addr(&self) -> anyhow::Result<SocketAddr> {
-        Ok(self.listener.local_addr()?)
-    }
-
-    /// Run the server; listen to client connections.
-    fn spawn(self) -> JoinHandle<()> {
-        let accept = async move |stream: TcpStream| -> anyhow::Result<()> {
-            let peer_addr = stream.peer_addr()?;
-            let limiter = Limiter::<StandardClock>::new(f64::INFINITY);
-            let tls_stream = self
-                .acceptor
-                .accept(RateLimitedStream::new(stream, limiter.clone()))
-                .await?;
-
-            log::info!(
-                "Accepted peer {} from {}",
-                self.verifier
-                    .connection_peer_id(&tls_stream)
-                    .expect("Peer MUST be known"), // Guards against bugs in the auth code; worth dying
-                peer_addr
-            );
-            let framed = LengthDelimitedCodec::builder().new_framed(tls_stream);
-            let server = RealizeServer::new_limited(self.dirs.clone(), limiter.clone());
-            tokio::spawn(
-                BaseChannel::with_defaults(transport::new(framed, Bincode::default()))
-                    .execute(MetricsRealizeServer::new(RealizeServer::serve(
-                        server.clone(),
-                    )))
-                    .for_each(async move |fut| {
-                        tokio::spawn(metrics::track_in_flight_request(fut));
-                    }),
-            );
-
-            Ok(())
-        };
-
-        tokio::spawn(async move {
-            loop {
-                if let Ok((stream, peer)) = self.listener.accept().await {
-                    match accept(stream).await {
-                        Ok(_) => {}
-                        Err(err) => log::debug!("{}: connection rejected: {}", peer, err),
-                    };
-                }
-            }
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,9 +238,9 @@ mod tests {
         let dirs = DirectoryMap::for_dir(&DirectoryId::from("testdir"), temp.path());
         let server_privkey =
             load_private_key(crate::transport::security::testing::server_private_key())?;
-        let server = RunningServer::bind("localhost:0", dirs, verifier, server_privkey).await?;
-        let addr = server.local_addr()?;
-        let server_handle = AbortOnDrop::new(server.spawn());
+        let (addr, server_handle) =
+            start_server("localhost:0", dirs, verifier, server_privkey).await?;
+
         Ok((addr, server_handle, temp))
     }
 
@@ -407,15 +365,13 @@ mod tests {
         let verifier = verifier_both();
         let server_privkey =
             load_private_key(crate::transport::security::testing::server_private_key())?;
-        let server = RunningServer::bind(
+        let (addr, server_handle) = start_server(
             "localhost:0",
             dirs.clone(),
             verifier.clone(),
             server_privkey,
         )
         .await?;
-        let addr = server.local_addr()?;
-        let server_handle = AbortOnDrop::new(server.spawn());
         let client_privkey =
             load_private_key(crate::transport::security::testing::client_private_key())?;
         let client = connect_client(
@@ -450,15 +406,13 @@ mod tests {
         let verifier = verifier_both();
         let server_privkey =
             load_private_key(crate::transport::security::testing::server_private_key())?;
-        let server = RunningServer::bind(
+        let (addr, server_handle) = start_server(
             "localhost:0",
             dirs.clone(),
             verifier.clone(),
             server_privkey,
         )
         .await?;
-        let addr = server.local_addr()?;
-        let server_handle = AbortOnDrop::new(server.spawn());
         let client_privkey1 =
             load_private_key(crate::transport::security::testing::client_private_key())?;
         let client_privkey2 =
