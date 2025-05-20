@@ -1,9 +1,12 @@
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use tarpc::{
     RequestName,
     client::{RpcError, stub::Stub},
-    context,
+    context::Context,
 };
 use tokio::sync::RwLock;
 
@@ -23,6 +26,7 @@ pub struct Reconnect<T, C: Connect<T>, S> {
     inner: Arc<RwLock<Reconnectable<T>>>,
     connect: C,
     strategy: S,
+    short_deadline: Option<Duration>,
 }
 
 /// Holds an object that can be reconnected.
@@ -53,7 +57,11 @@ where
     C: Connect<T>,
     S: Iterator<Item = std::time::Duration> + Clone,
 {
-    pub async fn new(strategy: S, connect: C) -> anyhow::Result<Self> {
+    pub async fn new(
+        strategy: S,
+        connect: C,
+        short_deadline: Option<Duration>,
+    ) -> anyhow::Result<Self> {
         let inner = connect.run().await?;
 
         Ok(Self {
@@ -64,6 +72,7 @@ where
             })),
             connect,
             strategy,
+            short_deadline,
         })
     }
 
@@ -71,20 +80,42 @@ where
     ///
     /// How long to wait and how many times to try is controlled by the
     /// strategy.
-    async fn reconnect(&self, connection_count: u64) -> Reconnectable<T> {
+    async fn reconnect(
+        &self,
+        deadline: &Instant,
+        connection_count: u64,
+    ) -> Result<Reconnectable<T>, RpcError> {
         let strategy = self.strategy.clone();
         for duration in strategy {
+            let sleep_end = Instant::now() + duration;
+            if sleep_end >= *deadline {
+                return Err(RpcError::DeadlineExceeded);
+            }
+
             tokio::time::sleep(duration).await;
             if let Ok(new_stub) = self.connect.run().await {
-                return Reconnectable::Connected {
+                return Ok(Reconnectable::Connected {
                     inner: new_stub,
                     connection_count: connection_count + 1,
                     confirmed: true,
-                };
+                });
             }
         }
 
-        Reconnectable::GiveUp
+        Ok(Reconnectable::GiveUp)
+    }
+
+    /// Create a context with a possibly shorter deadline.
+    fn short_ctx(&self, ctx: &Context) -> Context {
+        let mut short_ctx = ctx.clone();
+        if let Some(duration) = self.short_deadline {
+            let short_deadline = Instant::now() + duration;
+            if short_deadline < ctx.deadline {
+                short_ctx.deadline = short_deadline;
+            }
+        }
+
+        short_ctx
     }
 }
 
@@ -100,7 +131,7 @@ where
 
     async fn call(
         &self,
-        ctx: context::Context,
+        ctx: Context,
         request: Self::Req,
     ) -> std::result::Result<Self::Resp, RpcError> {
         let request = Arc::new(request);
@@ -115,7 +146,10 @@ where
                     confirmed: false,
                     ..
                 } => {
-                    let resp = inner.call(ctx, Arc::clone(&request)).await;
+                    let resp = inner.call(self.short_ctx(&ctx), Arc::clone(&request)).await;
+                    if should_retry(&resp, &ctx.deadline) {
+                        continue;
+                    }
                     if resp.is_ok() {
                         drop(guard);
 
@@ -131,8 +165,11 @@ where
                     connection_count,
                     confirmed: true,
                 } => {
-                    let resp = inner.call(ctx, Arc::clone(&request)).await;
+                    let resp = inner.call(self.short_ctx(&ctx), Arc::clone(&request)).await;
 
+                    if should_retry(&resp, &ctx.deadline) {
+                        continue;
+                    }
                     if !should_reconnect(&resp) {
                         return resp;
                     }
@@ -153,12 +190,19 @@ where
                             // We're the winner! We get to reconnect
                             // and increment the connection count,
                             // while holding on to the write lock.
-                            *guard = self.reconnect(idx).await;
+                            *guard = self.reconnect(&ctx.deadline, idx).await?;
                         }
                     }
                 }
             }
         }
+    }
+}
+
+fn should_retry<T>(result: &Result<T, RpcError>, deadline: &Instant) -> bool {
+    match result {
+        Err(RpcError::DeadlineExceeded) => Instant::now() < *deadline,
+        _ => false,
     }
 }
 
@@ -174,6 +218,7 @@ fn should_reconnect<T>(result: &Result<T, RpcError>) -> bool {
 mod tests {
     use std::{
         collections::HashSet,
+        result::Result,
         sync::atomic::{AtomicU32, Ordering},
         time::Duration,
     };
@@ -198,13 +243,13 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct TestStub {
+    struct LimitedCallsStub {
         max_count: u32,
         counter: Arc<AtomicU32>,
     }
 
-    impl TestStub {
-        fn new(max_count: u32) -> TestStub {
+    impl LimitedCallsStub {
+        fn new(max_count: u32) -> LimitedCallsStub {
             Self {
                 max_count,
                 counter: Arc::new(AtomicU32::new(0)),
@@ -212,15 +257,11 @@ mod tests {
         }
     }
 
-    impl Stub for TestStub {
+    impl Stub for LimitedCallsStub {
         type Req = Arc<String>;
         type Resp = String;
 
-        async fn call(
-            &self,
-            _ctx: Context,
-            req: Arc<String>,
-        ) -> std::result::Result<String, RpcError> {
+        async fn call(&self, _ctx: Context, req: Arc<String>) -> Result<String, RpcError> {
             let count = self.counter.fetch_add(1, Ordering::Relaxed);
             if count == self.max_count {
                 return Err(RpcError::Channel(ChannelError::Write(Arc::new(
@@ -255,14 +296,14 @@ mod tests {
             self.fail.insert(call_count);
         }
     }
-    impl Connect<TestStub> for TestStubConnect {
-        async fn run(&self) -> anyhow::Result<TestStub> {
+    impl Connect<LimitedCallsStub> for TestStubConnect {
+        async fn run(&self) -> anyhow::Result<LimitedCallsStub> {
             let count = self.counter.fetch_add(1, Ordering::Relaxed);
 
             if self.fail.contains(&count) {
                 return Err(anyhow::anyhow!("connection {count} failed"));
             }
-            Ok(TestStub::new(2))
+            Ok(LimitedCallsStub::new(2))
         }
     }
 
@@ -273,6 +314,7 @@ mod tests {
         let reconnect = Reconnect::new(
             strategy,
             TestStubConnect::new(Arc::clone(&connection_count)),
+            None,
         )
         .await?;
 
@@ -297,6 +339,7 @@ mod tests {
         let reconnect = Reconnect::new(
             strategy,
             TestStubConnect::new(Arc::clone(&connection_count)),
+            None,
         )
         .await?;
 
@@ -331,7 +374,7 @@ mod tests {
         connect.add_failure(3);
         connect.add_failure(4);
         connect.add_failure(5);
-        let reconnect = Reconnect::new(strategy, connect).await?;
+        let reconnect = Reconnect::new(strategy, connect, None).await?;
 
         for _ in 0..10 {
             assert_eq!(
@@ -360,7 +403,7 @@ mod tests {
         connect.add_failure(3);
         connect.add_failure(4);
         connect.add_failure(5);
-        let reconnect = Reconnect::new(strategy, connect).await?;
+        let reconnect = Reconnect::new(strategy, connect, None).await?;
 
         // The first 4 calls work, with one successful reconnection.
         for _ in 0..4 {
@@ -393,6 +436,191 @@ mod tests {
             ));
         }
         assert_eq!(5, connection_count.load(Ordering::Relaxed));
+
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    pub struct DeadlineStub {
+        counter: Arc<AtomicU32>,
+        fail: HashSet<u32>,
+    }
+
+    impl Stub for DeadlineStub {
+        type Req = Arc<String>;
+        type Resp = Duration;
+
+        async fn call(&self, ctx: Context, _req: Arc<String>) -> Result<Duration, RpcError> {
+            let count = self.counter.fetch_add(1, Ordering::Relaxed);
+            if self.fail.contains(&count) {
+                return Err(RpcError::DeadlineExceeded);
+            }
+            Ok(ctx.deadline.duration_since(Instant::now()))
+        }
+    }
+
+    #[derive(Clone)]
+    struct DeadlineStubConnect {
+        counter: Arc<AtomicU32>,
+        fail: HashSet<u32>,
+    }
+    impl DeadlineStubConnect {
+        fn new() -> DeadlineStubConnect {
+            Self {
+                counter: Arc::new(AtomicU32::new(0)),
+                fail: HashSet::new(),
+            }
+        }
+
+        fn add_fail(&mut self, count: u32) {
+            self.fail.insert(count);
+        }
+
+        fn counter(&self) -> Arc<AtomicU32> {
+            Arc::clone(&self.counter)
+        }
+    }
+    impl Connect<DeadlineStub> for DeadlineStubConnect {
+        async fn run(&self) -> anyhow::Result<DeadlineStub> {
+            Ok(DeadlineStub {
+                counter: Arc::clone(&self.counter),
+                fail: self.fail.clone(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_set_short_deadline() -> anyhow::Result<()> {
+        let reconnect = Reconnect::new(
+            ExponentialBackoff::from_millis(1),
+            DeadlineStubConnect::new(),
+            Some(Duration::from_secs(3)),
+        )
+        .await?;
+
+        let mut ctx = context::current();
+        ctx.deadline = Instant::now() + Duration::from_secs(60);
+
+        for _ in 0..3 {
+            let remaining = reconnect.call(ctx.clone(), "test".to_string()).await?;
+            assert!(
+                remaining.as_secs() > 0 && remaining.as_secs() <= 3,
+                "remaining={remaining:?}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconnect_dont_set_short_deadline_if_shorter_than_overall() -> anyhow::Result<()> {
+        let reconnect = Reconnect::new(
+            ExponentialBackoff::from_millis(1),
+            DeadlineStubConnect::new(),
+            Some(Duration::from_secs(30)),
+        )
+        .await?;
+
+        let mut ctx = context::current();
+        ctx.deadline = Instant::now() + Duration::from_secs(10);
+
+        let remaining = reconnect.call(ctx.clone(), "test".to_string()).await?;
+        assert!(
+            remaining.as_secs() > 0 && remaining.as_secs() <= 10,
+            "remaining={remaining:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconnect_retry_deadline_exceeded() -> anyhow::Result<()> {
+        let mut connect = DeadlineStubConnect::new();
+        let call_counter = connect.counter();
+        connect.add_fail(1);
+        connect.add_fail(2);
+        let reconnect = Reconnect::new(
+            ExponentialBackoff::from_millis(1),
+            connect,
+            Some(Duration::from_secs(10)),
+        )
+        .await?;
+
+        let mut ctx = context::current();
+        ctx.deadline = Instant::now() + Duration::from_secs(60);
+
+        // First call succeeds without retries
+        reconnect.call(ctx.clone(), "test".to_string()).await?;
+        assert_eq!(1, call_counter.load(Ordering::Relaxed));
+
+        // Second call is retried twice and eventually succeeds (3 calls)
+        reconnect.call(ctx.clone(), "test".to_string()).await?;
+        assert_eq!(4, call_counter.load(Ordering::Relaxed));
+
+        // Third call succeeds without retries
+        reconnect.call(ctx.clone(), "test".to_string()).await?;
+        assert_eq!(5, call_counter.load(Ordering::Relaxed));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconnect_stop_retrying_at_end() -> anyhow::Result<()> {
+        let mut connect = DeadlineStubConnect::new();
+        for i in 0..10000 {
+            connect.add_fail(i);
+        }
+        let reconnect = Reconnect::new(
+            ExponentialBackoff::from_millis(1),
+            connect,
+            Some(Duration::from_millis(1)),
+        )
+        .await?;
+
+        let mut ctx = context::current();
+        ctx.deadline = Instant::now() + Duration::from_millis(3);
+
+        assert!(matches!(
+            reconnect.call(ctx.clone(), "test".to_string()).await,
+            Err(RpcError::DeadlineExceeded)
+        ),);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconnect_stop_reconnecting_at_deadline() -> anyhow::Result<()> {
+        let strategy = ExponentialBackoff::from_millis(1);
+        let mut connect = TestStubConnect::new(Arc::new(AtomicU32::new(0)));
+        for i in 1..10 {
+            connect.add_failure(i);
+        }
+        let reconnect = Reconnect::new(strategy, connect, None).await?;
+
+        // Use up the first stub
+        for _ in 0..2 {
+            assert_eq!(
+                "pong",
+                reconnect
+                    .call(context::current(), "ping".to_string())
+                    .await?
+            );
+        }
+
+        // Stub stops reconnecting after hitting deadline. Deadline
+        // only allows 3 attempts.
+        let mut ctx = context::current();
+        ctx.deadline = Instant::now() + Duration::from_millis(3);
+        let res = reconnect.call(ctx.clone(), "ping".to_string()).await;
+        assert!(matches!(res, Err(RpcError::DeadlineExceeded)), "{res:?}");
+
+        // Stub works again given longer deadline
+        assert_eq!(
+            "pong",
+            reconnect
+                .call(context::current(), "ping".to_string())
+                .await?
+        );
 
         Ok(())
     }

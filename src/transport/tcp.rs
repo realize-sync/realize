@@ -168,7 +168,7 @@ impl TcpStub {
             >,
             TcpConnect,
             ExponentialBackoff,
-        > = Reconnect::new(retry_strategy, connect).await?;
+        > = Reconnect::new(retry_strategy, connect, None).await?;
         let stub = MetricsRealizeClient::new(reconnect);
         Ok(Self { inner: stub })
     }
