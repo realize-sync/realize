@@ -37,6 +37,10 @@ the command-line wants it, do the following:
 This way, the command can dependend on openssl-sys and leave it out of
 the daemon. No need for the push feature anymore; everything push-related goes into crate/realize-cmd
 
+## Addresses {#addr}
+
+Take addresses as string, extract the domain name and pass it to TLS.
+
 ## Detect access right errors early in daemon {#daemonaccess}
 
 At startup, the daemon in realized.rs might try to write and delete a
