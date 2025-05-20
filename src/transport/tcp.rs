@@ -1,12 +1,12 @@
-use async_speed_limit::Limiter;
 use async_speed_limit::clock::Clock;
 use async_speed_limit::clock::StandardClock;
 use async_speed_limit::limiter::Consume;
+use async_speed_limit::Limiter;
 use futures::prelude::*;
 use rustls::pki_types::ServerName;
 use rustls::sign::SigningKey;
-use tarpc::client::RpcError;
 use tarpc::client::stub::Stub;
+use tarpc::client::RpcError;
 use tarpc::context;
 use tokio::task::JoinHandle;
 use tokio_retry::strategy::ExponentialBackoff;
@@ -24,7 +24,6 @@ use tarpc::server::{BaseChannel, Channel};
 use tarpc::tokio_serde::formats::Bincode;
 use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
 
-use crate::client::deadline::WithDeadline;
 use crate::client::reconnect::Connect;
 use crate::client::reconnect::Reconnect;
 use crate::metrics;
@@ -95,16 +94,13 @@ struct TcpConnect {
     options: ClientOptions,
 }
 
-impl
-    Connect<
-        WithDeadline<tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>>,
-    > for TcpConnect
+impl Connect<tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>>
+    for TcpConnect
 {
     async fn run(
         &self,
-    ) -> anyhow::Result<
-        WithDeadline<tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>>,
-    > {
+    ) -> anyhow::Result<tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>>
+    {
         let stream = TcpStream::connect(&self.server_addr).await?;
         let domain = ServerName::try_from(
             self.options
@@ -125,9 +121,8 @@ impl
         let codec_builder = LengthDelimitedCodec::builder();
         let transport = transport::new(codec_builder.new_framed(stream), Bincode::default());
         let channel = tarpc::client::new(Default::default(), transport).spawn();
-        let stub = WithDeadline::new(channel, Duration::from_secs(60));
 
-        Ok(stub)
+        Ok(channel)
     }
 }
 
@@ -137,9 +132,7 @@ impl
 pub struct TcpStub {
     inner: MetricsRealizeClient<
         Reconnect<
-            WithDeadline<
-                tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>,
-            >,
+            tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>,
             TcpConnect,
             ExponentialBackoff,
         >,
@@ -163,12 +156,10 @@ impl TcpStub {
         };
 
         let reconnect: Reconnect<
-            WithDeadline<
-                tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>,
-            >,
+            tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>,
             TcpConnect,
             ExponentialBackoff,
-        > = Reconnect::new(retry_strategy, connect, None).await?;
+        > = Reconnect::new(retry_strategy, connect, Some(Duration::from_secs(60))).await?;
         let stub = MetricsRealizeClient::new(reconnect);
         Ok(Self { inner: stub })
     }
