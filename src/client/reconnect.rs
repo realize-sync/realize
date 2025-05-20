@@ -4,11 +4,14 @@ use std::{
 };
 
 use tarpc::{
-    RequestName,
-    client::{RpcError, stub::Stub},
+    client::{stub::Stub, RpcError},
     context::Context,
+    RequestName,
 };
 use tokio::sync::RwLock;
+
+/// Maximum number of retries for DeadlineExceeded
+const MAX_RETRY_COUNT: u32 = 1;
 
 #[allow(async_fn_in_trait)] // TODO: fix
 pub trait Connect<T>: Clone {
@@ -134,6 +137,7 @@ where
         ctx: Context,
         request: Self::Req,
     ) -> std::result::Result<Self::Resp, RpcError> {
+        let mut retry_count = 0;
         let request = Arc::new(request);
         loop {
             let guard = self.inner.read().await;
@@ -147,7 +151,7 @@ where
                     ..
                 } => {
                     let resp = inner.call(self.short_ctx(&ctx), Arc::clone(&request)).await;
-                    if should_retry(&resp, &ctx.deadline) {
+                    if should_retry(&resp, &ctx.deadline, &mut retry_count) {
                         continue;
                     }
                     if resp.is_ok() {
@@ -166,8 +170,7 @@ where
                     confirmed: true,
                 } => {
                     let resp = inner.call(self.short_ctx(&ctx), Arc::clone(&request)).await;
-
-                    if should_retry(&resp, &ctx.deadline) {
+                    if should_retry(&resp, &ctx.deadline, &mut retry_count) {
                         continue;
                     }
                     if !should_reconnect(&resp) {
@@ -179,6 +182,7 @@ where
                     // changed so that only one control flow actually
                     // reconnects, while others just wait.
                     let idx = *connection_count;
+                    retry_count = 0;
                     drop(guard);
 
                     let mut guard = self.inner.write().await;
@@ -199,11 +203,27 @@ where
     }
 }
 
-fn should_retry<T>(result: &Result<T, RpcError>, deadline: &Instant) -> bool {
-    match result {
-        Err(RpcError::DeadlineExceeded) => Instant::now() < *deadline,
-        _ => false,
+/// Check whether the request should be retried.
+///
+/// Request that fail with DeadlineExceeded are retried once if
+/// there's enough time in the overall deadline.
+fn should_retry<T>(
+    result: &Result<T, RpcError>,
+    overall_deadline: &Instant,
+    retry_count: &mut u32,
+) -> bool {
+    if let Err(RpcError::DeadlineExceeded) = result {
+        if Instant::now() < *overall_deadline {
+            *retry_count += 1;
+            if *retry_count > MAX_RETRY_COUNT {
+                return false;
+            }
+
+            return true;
+        }
     }
+
+    false
 }
 
 fn should_reconnect<T>(result: &Result<T, RpcError>) -> bool {
@@ -223,10 +243,11 @@ mod tests {
         time::Duration,
     };
 
+    use anyhow::Context as _;
     use futures::future::join_all;
     use tarpc::{
-        ChannelError,
         context::{self, Context},
+        ChannelError,
     };
     use tokio_retry::strategy::ExponentialBackoff;
 
@@ -538,7 +559,8 @@ mod tests {
         let mut connect = DeadlineStubConnect::new();
         let call_counter = connect.counter();
         connect.add_fail(1);
-        connect.add_fail(2);
+        connect.add_fail(3);
+        connect.add_fail(4);
         let reconnect = Reconnect::new(
             ExponentialBackoff::from_millis(1),
             connect,
@@ -549,17 +571,34 @@ mod tests {
         let mut ctx = context::current();
         ctx.deadline = Instant::now() + Duration::from_secs(60);
 
-        // First call succeeds without retries
-        reconnect.call(ctx.clone(), "test".to_string()).await?;
+        // 1st call succeeds without retries
+        reconnect
+            .call(ctx.clone(), "test".to_string())
+            .await
+            .context("1st call")?;
         assert_eq!(1, call_counter.load(Ordering::Relaxed));
 
-        // Second call is retried twice and eventually succeeds (3 calls)
-        reconnect.call(ctx.clone(), "test".to_string()).await?;
-        assert_eq!(4, call_counter.load(Ordering::Relaxed));
+        // 2nd call is retried once and eventually succeeds (2 calls)
+        reconnect
+            .call(ctx.clone(), "test".to_string())
+            .await
+            .context("2nd call")?;
+        assert_eq!(3, call_counter.load(Ordering::Relaxed));
 
-        // Third call succeeds without retries
-        reconnect.call(ctx.clone(), "test".to_string()).await?;
+        // 3rd call returns DeadlineExceeded twice, which is
+        // forwarded.
+        assert!(matches!(
+            reconnect.call(ctx.clone(), "test".to_string()).await,
+            Err(RpcError::DeadlineExceeded)
+        ));
         assert_eq!(5, call_counter.load(Ordering::Relaxed));
+
+        // 4th call succeeds
+        reconnect
+            .call(ctx.clone(), "test".to_string())
+            .await
+            .context("4th call")?;
+        assert_eq!(6, call_counter.load(Ordering::Relaxed));
 
         Ok(())
     }
