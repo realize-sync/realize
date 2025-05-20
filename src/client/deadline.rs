@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use tarpc::{
-    client::{RpcError, stub::Stub},
+    client::{stub::Stub, RpcError},
     context::Context,
 };
 
@@ -26,10 +26,43 @@ impl<T: Stub + Clone> Stub for WithDeadline<T> {
     type Resp = T::Resp;
 
     async fn call(&self, mut ctx: Context, req: Self::Req) -> Result<Self::Resp, RpcError> {
-        if tracing::Span::current().is_disabled() {
-            ctx.deadline = Instant::now() + self.deadline;
-        };
-
+        ctx.deadline = Instant::now() + self.deadline;
         self.inner.call(ctx, req).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tarpc::context;
+
+    use super::*;
+
+    #[derive(Clone)]
+    pub struct TestStub {}
+
+    impl Stub for TestStub {
+        type Req = String;
+        type Resp = Duration;
+
+        async fn call(
+            &self,
+            ctx: Context,
+            _req: String,
+        ) -> std::result::Result<Duration, tarpc::client::RpcError> {
+            Ok(ctx.deadline.duration_since(Instant::now()))
+        }
+    }
+
+    #[tokio::test]
+    async fn set_deadline() -> anyhow::Result<()> {
+        let with_60s = WithDeadline::new(TestStub {}, Duration::from_secs(60));
+
+        let remaining = with_60s
+            .call(context::current(), "test".to_string())
+            .await?;
+        assert!(remaining.as_secs() > 10); // 10 is the hardcoded default for context::current()
+        assert!(remaining.as_secs() <= 60);
+
+        Ok(())
     }
 }
