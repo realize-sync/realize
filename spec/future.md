@@ -3,6 +3,26 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
+## Deadlines {#deadlines}
+
+Set an overall deadline for realize (24h) set by --max-duration, have reconnect handle deadlines.
+
+Reconnect should:
+ - stop reconnecting on overall deadline exceeded (before waiting for backoff, if now+backoff >= deadline)
+ - limit individual deadline to some small value (1m), make sure small deadline < overall deadline
+ - retry requests with deadline exceeded if overall deadline is not exceeded
+
+non-tcp client without reconnect just have one large deadline.
+
+move_files again takes one context and pass it to all the RPCs it
+makes instead of using current_context.
+
+WithDuration can be removed.
+
+Goal: max-duration is now implemented using deadline. No need to kill
+the process when max-duration is exceeded (test! allow some extra time
+for shutdown in the test)
+
 ## Split into multiple crates {#crates}
 
 To avoid the issue with openssl-sys being dragged into the daemon because
