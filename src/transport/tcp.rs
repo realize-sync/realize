@@ -1,11 +1,12 @@
-use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
+use async_speed_limit::Limiter;
 use futures::prelude::*;
 use rustls::pki_types::ServerName;
 use rustls::sign::SigningKey;
-use tarpc::client::RpcError;
 use tarpc::client::stub::Stub;
+use tarpc::client::RpcError;
 use tarpc::context;
+use tokio::sync::Mutex;
 use tokio_retry::strategy::ExponentialBackoff;
 use tokio_rustls::TlsConnector;
 
@@ -25,6 +26,7 @@ use crate::client::reconnect::Reconnect;
 use crate::metrics;
 use crate::metrics::MetricsRealizeClient;
 use crate::metrics::MetricsRealizeServer;
+use crate::model::service::Config;
 use crate::model::service::RealizeServiceRequest;
 use crate::model::service::RealizeServiceResponse;
 use crate::model::service::{RealizeService, RealizeServiceClient};
@@ -135,6 +137,7 @@ struct TcpConnect {
     server_addr: SocketAddr,
     connector: TlsConnector,
     options: ClientOptions,
+    config: Arc<Mutex<Option<Config>>>,
 }
 
 impl Connect<tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>>
@@ -165,6 +168,14 @@ impl Connect<tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceRe
         let transport = transport::new(codec_builder.new_framed(stream), Bincode::default());
         let channel = tarpc::client::new(Default::default(), transport).spawn();
 
+        // Recover stored configuration
+        if let Some(config) = self.config.lock().await.as_ref() {
+            let req = Arc::new(RealizeServiceRequest::Configure {
+                config: config.clone(),
+            });
+            channel.call(context::current(), req).await?;
+        }
+
         Ok(channel)
     }
 }
@@ -180,6 +191,7 @@ pub struct TcpStub {
             ExponentialBackoff,
         >,
     >,
+    config: Arc<Mutex<Option<Config>>>,
 }
 
 impl TcpStub {
@@ -192,10 +204,12 @@ impl TcpStub {
             .factor(2)
             .max_delay(Duration::from_secs(5 * 60));
 
+        let config = Arc::new(Mutex::new(None));
         let connect = TcpConnect {
             server_addr: server_addr.clone(),
             connector,
             options,
+            config: Arc::clone(&config),
         };
 
         let reconnect: Reconnect<
@@ -204,7 +218,10 @@ impl TcpStub {
             ExponentialBackoff,
         > = Reconnect::new(retry_strategy, connect, Some(Duration::from_secs(60))).await?;
         let stub = MetricsRealizeClient::new(reconnect);
-        Ok(Self { inner: stub })
+        Ok(Self {
+            inner: stub,
+            config,
+        })
     }
 }
 
@@ -217,18 +234,32 @@ impl Stub for TcpStub {
         ctx: context::Context,
         request: RealizeServiceRequest,
     ) -> std::result::Result<RealizeServiceResponse, RpcError> {
-        self.inner.call(ctx, request).await
+        let res = self.inner.call(ctx, request).await;
+
+        // Store configuration to recover it on reconnection.
+        if let Ok(RealizeServiceResponse::Configure(Ok(config))) = &res {
+            *(self.config.lock().await) = if *config == Config::default() {
+                None
+            } else {
+                Some(config.clone())
+            };
+        }
+
+        res
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
     use super::*;
     use crate::model::service::{Config, DirectoryId, Options};
     use crate::utils::async_utils::AbortOnDrop;
     use assert_fs::TempDir;
     use rustls::pki_types::PrivateKeyDer;
     use tarpc::context;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     // Helper to setup a test server and return (server_addr, server_handle, crypto, temp_dir)
     async fn setup_test_server(
@@ -447,5 +478,149 @@ mod tests {
         assert_eq!(config2.unwrap().write_limit, None);
         server_handle.abort();
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn tcp_reconnect() -> anyhow::Result<()> {
+        let verifier = verifier_both();
+        let (addr, _server_handle, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
+
+        let connection_count = Arc::new(AtomicU32::new(0));
+        let (shutdown, _) = tokio::sync::broadcast::channel(1);
+        let (proxy_addr, _proxy_handle) =
+            proxy_tcp(&addr, shutdown.clone(), connection_count.clone()).await?;
+
+        let client_privkey =
+            load_private_key(crate::transport::security::testing::client_private_key())?;
+        let client = connect_client(
+            &proxy_addr,
+            verifier_both(),
+            client_privkey,
+            ClientOptions::default(),
+        )
+        .await?;
+
+        client
+            .list(
+                context::current(),
+                DirectoryId::from("testdir"),
+                Options::default(),
+            )
+            .await??;
+        shutdown.send(())?;
+        client
+            .list(
+                context::current(),
+                DirectoryId::from("testdir"),
+                Options::default(),
+            )
+            .await??;
+        assert_eq!(connection_count.load(Ordering::Relaxed), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tcp_reconnect_keeps_config() -> anyhow::Result<()> {
+        let verifier = verifier_both();
+        let (addr, _server_handle, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
+
+        let connection_count = Arc::new(AtomicU32::new(0));
+        let (shutdown, _) = tokio::sync::broadcast::channel(1);
+        let (proxy_addr, _proxy_handle) =
+            proxy_tcp(&addr, shutdown.clone(), connection_count.clone()).await?;
+
+        let client_privkey =
+            load_private_key(crate::transport::security::testing::client_private_key())?;
+        let client = connect_client(
+            &proxy_addr,
+            verifier_both(),
+            client_privkey,
+            ClientOptions::default(),
+        )
+        .await?;
+
+        let mut config = Config::default();
+        config.write_limit = Some(1024);
+        assert_eq!(
+            config,
+            client
+                .configure(context::current(), config.clone())
+                .await??
+        );
+        assert_eq!(
+            config,
+            client
+                .configure(context::current(), Config::default())
+                .await??
+        );
+
+        shutdown.send(())?;
+        assert_eq!(
+            config,
+            client
+                .configure(context::current(), Config::default())
+                .await??
+        );
+        assert_eq!(connection_count.load(Ordering::Relaxed), 2);
+
+        Ok(())
+    }
+
+    /// Create a listener that proxies data to [server_addr].
+    ///
+    /// There can be only one connection at a time. Sending a message
+    /// to [shutdown] shuts down that connection.
+    ///
+    /// This proxy is geared towards simplicity, not efficiency or
+    /// correctness. It ignores errors. This is barely acceptable for
+    /// a simple test.
+    async fn proxy_tcp(
+        server_addr: &SocketAddr,
+        shutdown: tokio::sync::broadcast::Sender<()>,
+        connection_count: Arc<AtomicU32>,
+    ) -> anyhow::Result<(SocketAddr, AbortOnDrop<()>)> {
+        let listener = TcpListener::bind("localhost:0").await?;
+
+        let addr = listener.local_addr()?;
+        let server_addr = server_addr.clone();
+
+        let handle = AbortOnDrop::new(tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                if let Ok(mut outbound) = TcpStream::connect(server_addr.clone()).await {
+                    connection_count.fetch_add(1, Ordering::Relaxed);
+
+                    let mut shutdown = shutdown.subscribe();
+                    let mut buf_in_to_out = [0u8; 8 * 1024];
+                    let mut buf_out_to_in = [0u8; 8 * 1024];
+                    loop {
+                        tokio::select! {
+                            res = inbound.read(&mut buf_in_to_out) => {
+                                if let Ok(n) = res {
+                                    if n > 0 && outbound.write_all(&buf_in_to_out[0..n]).await.is_ok() {
+                                        continue
+                                    }
+                                }
+                                break;
+                            },
+                            res = outbound.read(&mut buf_out_to_in) => {
+                                if let Ok(n) = res {
+                                    if n > 0 && inbound.write_all(&buf_out_to_in[0..n]).await.is_ok() {
+                                        continue;
+                                    }
+                                }
+                                break;
+                            },
+                            _ = shutdown.recv() => {
+                                break;
+                            }
+                        }
+                    }
+                    let _ = tokio::join!(inbound.shutdown(), outbound.shutdown());
+                }
+            }
+        }));
+
+        Ok((addr, handle))
     }
 }
