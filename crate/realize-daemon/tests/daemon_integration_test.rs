@@ -1,3 +1,5 @@
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,7 +36,8 @@ fn command_path() -> PathBuf {
 struct Fixture {
     pub config_file: PathBuf,
     pub resources: PathBuf,
-    _temp_dir: TempDir,
+    pub testdir: PathBuf,
+    pub _temp_dir: TempDir,
 }
 
 impl Fixture {
@@ -43,22 +46,19 @@ impl Fixture {
 
         // Setup temp directory for the daemon to serve
         let temp_dir = TempDir::new()?;
-        let testdir_server = temp_dir.child("server");
-        testdir_server.create_dir_all()?;
-        testdir_server.child("foo.txt").write_str("hello")?;
+        let testdir = temp_dir.child("server");
+        testdir.create_dir_all()?;
+        testdir.child("foo.txt").write_str("hello")?;
 
         let resources = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
             .join("../../resources/test");
         let config_file = temp_dir.child("config.yaml").to_path_buf();
-        write_config_file(
-            &config_file,
-            testdir_server.path(),
-            &resources.join("a-spki.pem"),
-        )?;
+        write_config_file(&config_file, testdir.path(), &resources.join("a-spki.pem"))?;
 
         Ok(Self {
             config_file,
             resources,
+            testdir: testdir.path().to_path_buf(),
             _temp_dir: temp_dir,
         })
     }
@@ -72,7 +72,10 @@ impl Fixture {
             .arg(self.resources.join("a.key"))
             .arg("--config")
             .arg(&self.config_file)
-            .env("RUST_LOG", "realize_lib::transport::tcp=debug")
+            .env(
+                "RUST_LOG",
+                "realize_lib::transport::tcp=debug,realize_daemon=debug",
+            )
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -179,6 +182,62 @@ async fn metrics_endpoint_works() -> anyhow::Result<()> {
         .await?;
     assert_eq!(notfound.status(), 404);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_fails_on_missing_directory() -> anyhow::Result<()> {
+    let fixture = Fixture::setup().await?;
+    fs::remove_dir_all(&fixture.testdir)?;
+
+    let output = fixture.command().output().await?;
+    assert!(!output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("does not exist"),
+        "stderr: {stderr}, stdout: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_fails_on_unreadable_directory() -> anyhow::Result<()> {
+    let fixture = Fixture::setup().await?;
+    std::fs::set_permissions(&fixture.testdir, std::fs::Permissions::from_mode(0o000))?;
+
+    let output = fixture.command().output().await?;
+    assert!(!output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("No read access"),
+        "stderr: {stderr}, stdout: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_warns_on_unwritable_directory() -> anyhow::Result<()> {
+    let fixture = Fixture::setup().await?;
+    std::fs::set_permissions(&fixture.testdir, std::fs::Permissions::from_mode(0o500))?; // read+exec only
+
+    let mut daemon = fixture.command().spawn()?;
+    let _ = wait_for_listening_port(daemon.stdout.as_mut().unwrap()).await?;
+
+    // Kill to make sure stderr ends
+    daemon.start_kill()?;
+
+    let stdout = collect_stdout(daemon.stdout.as_mut().unwrap()).await?;
+    let stderr = collect_stderr(daemon.stderr.as_mut().unwrap()).await?;
+    assert!(
+        stderr.contains("No write access"),
+        "stderr: {stderr}, stdout: {stdout}"
+    );
     Ok(())
 }
 

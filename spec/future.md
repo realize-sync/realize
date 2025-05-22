@@ -3,17 +3,6 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
-## Detect access right errors early in daemon {#daemonaccess}
-
-At startup, the daemon in realized.rs might try to write and delete a
-file in the dir it's given, to make sure it has read/write access to
-the directory it's given.
-
-Checks:
-- directory doesn't exist -> error (fail to start)
-- no read access to directory -> error (fail to start)
-- no write access to directory -> warning (start)
-
 ## Fix error message output {#errormsg}
 
 When caught by with_context, error cause are printed.

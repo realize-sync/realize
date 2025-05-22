@@ -1756,6 +1756,7 @@ dependencies = [
  "clap",
  "env_logger",
  "lazy_static",
+ "log",
  "portpicker",
  "predicates",
  "prometheus",

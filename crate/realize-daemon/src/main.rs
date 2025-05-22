@@ -79,6 +79,9 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
     let config = parse_config(&cli.config)
         .with_context(|| format!("{}: failed to read YAML config file", cli.config.display()))?;
 
+    // Directory access checks (see spec/future.md #daemonaccess)
+    check_directory_access(&config.dirs)?;
+
     // Build directory list
     let mut dirs = Vec::new();
     for dir in &config.dirs {
@@ -120,6 +123,54 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
     println!("Listening on {addr}");
 
     handle.join().await.context("Server stopped")?;
+
+    Ok(())
+}
+
+/// Checks that all directories in the config file are accessible.
+fn check_directory_access(dirs: &Vec<DirEntry>) -> anyhow::Result<()> {
+    for dir in dirs {
+        for (id, path) in &dir.map {
+            let path = std::path::Path::new(path);
+            if !path.exists() {
+                anyhow::bail!("Directory '{}' (id: {}) does not exist", path.display(), id);
+            }
+            if !fs::metadata(path)
+                .and_then(|m| Ok(m.is_dir()))
+                .unwrap_or(false)
+            {
+                anyhow::bail!("Path '{}' (id: {}) is not a directory", path.display(), id);
+            }
+
+            // Check read access
+            if fs::read_dir(path).is_err() {
+                anyhow::bail!(
+                    "No read access to directory '{}' (id: {})",
+                    path.display(),
+                    id
+                );
+            }
+
+            // Check write access (warn only)
+            let testfile = path.join(".realize_write_test");
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&testfile)
+            {
+                Ok(_) => {
+                    let _ = fs::remove_file(&testfile);
+                }
+                Err(_) => {
+                    log::warn!(
+                        "No write access to directory '{}' (id: {})",
+                        path.display(),
+                        id
+                    );
+                }
+            }
+        }
+    }
 
     Ok(())
 }
