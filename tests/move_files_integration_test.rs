@@ -1,7 +1,7 @@
 use assert_cmd::cargo::cargo_bin;
-use assert_fs::TempDir;
 use assert_fs::fixture::ChildPath;
 use assert_fs::prelude::*;
+use assert_fs::TempDir;
 use assert_unordered::assert_eq_unordered;
 use realize::model::service::DirectoryId;
 use realize::server::DirectoryMap;
@@ -12,7 +12,6 @@ use realize::utils::async_utils::AbortOnDrop;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use std::fs;
-use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Output;
@@ -26,7 +25,6 @@ pub struct Fixture {
     pub keys: TestKeys,
     pub src_addr: String,
     pub dst_addr: String,
-    listener: Option<TcpListener>,
     _src_server_handle: AbortOnDrop<()>,
     _dst_server_handle: AbortOnDrop<()>,
 }
@@ -79,24 +77,9 @@ impl Fixture {
             keys,
             src_addr: src_addr3.to_string(),
             dst_addr: dst_addr3.to_string(),
-            listener: None,
             _src_server_handle: server_handle_src,
             _dst_server_handle: server_handle_dst,
         })
-    }
-
-    /// Make the command hang by giving it an address
-    /// that won't ever be answered.
-    ///
-    /// This is useful to test cases where the command shouldn't
-    /// return too quickly.
-    fn make_it_hang(&mut self) -> anyhow::Result<()> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let addr = listener.local_addr()?;
-        self.src_addr = addr.to_string();
-        self.listener = Some(listener);
-
-        Ok(())
     }
 
     /// A command with all required args.
@@ -138,7 +121,13 @@ async fn move_file() -> anyhow::Result<()> {
     let fixture = Fixture::setup().await?;
     create_files(&fixture.src_dir, &[("qux.txt", "qux")])?;
 
-    assert!(fixture.run().await?.status.success());
+    let output = fixture.run().await?;
+    assert!(
+        fixture.run().await?.status.success(),
+        "stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     assert_eq_unordered!(
         dir_content(&fixture.dst_dir)?,
@@ -175,7 +164,7 @@ async fn partial_failure() -> anyhow::Result<()> {
         "stderr: {stderr}"
     );
     assert!(
-        stderr.contains("ERROR: 1 file(s) failed, and 1 files(s) moved"),
+        stderr.contains("ERROR: 1 file(s) failed, 1 file(s) moved, 0 interrupted"),
         "stderr: {stderr}"
     );
     assert_eq_unordered!(
@@ -302,13 +291,10 @@ async fn quiet_failure() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn max_duration_timeout() -> anyhow::Result<()> {
-    let mut fixture = Fixture::setup().await?;
-
-    // Make sure the command doesn't stop unless killed by --max-duration
-    fixture.make_it_hang()?;
+    let fixture = Fixture::setup().await?;
 
     let output = fixture
-        .run_with_args(vec!["--max-duration", "100ms"])
+        .run_with_args(vec!["--max-duration", "10ms"])
         .await?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -318,7 +304,7 @@ async fn max_duration_timeout() -> anyhow::Result<()> {
         "Should exit with code 11 on timeout. stderr: {stderr} stdout: {stdout}"
     );
     assert!(
-        stderr.contains("Maximum duration (100ms) exceeded. Giving up."),
+        stderr.contains("INTERRUPTED 0 file(s) moved, 0 interrupted"),
         "stderr: {stderr} stdout: {stdout}"
     );
     Ok(())
@@ -330,7 +316,7 @@ async fn realize_metrics_export() -> anyhow::Result<()> {
     use reqwest::Client;
     use tokio::io::AsyncBufReadExt as _;
 
-    let mut fixture = Fixture::setup().await?;
+    let fixture = Fixture::setup().await?;
 
     // Pick a random available port for metrics
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -340,7 +326,6 @@ async fn realize_metrics_export() -> anyhow::Result<()> {
 
     // We want to have time to check the metrics. Make sure it'll
     // hang by giving it an address that won't ever answer.
-    fixture.make_it_hang();
     fixture
         .command()
         .arg("--metrics-addr")

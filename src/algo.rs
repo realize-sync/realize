@@ -10,10 +10,10 @@ use crate::model::service::{
 use futures::future;
 use futures::future::Either;
 use futures::stream::StreamExt as _;
-use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
+use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
 use std::cmp::min;
 use std::{collections::HashMap, path::Path};
-use tarpc::{client::stub::Stub, context};
+use tarpc::client::stub::Stub;
 use thiserror::Error;
 const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 const PARALLEL_FILE_COUNT: usize = 8;
@@ -120,13 +120,14 @@ fn dst_options() -> Options {
 
 /// Moves files from source to destination using the RealizeService interface.
 /// After a successful move and hash match, deletes the file from the source.
-/// Returns (success_count, error_count).
+/// Returns (success_count, error_count, interrupted_count).
 pub async fn move_files<T, U, P>(
+    ctx: tarpc::context::Context,
     src: &RealizeServiceClient<T>,
     dst: &RealizeServiceClient<U>,
     dir_id: DirectoryId,
     progress: &mut P,
-) -> Result<(usize, usize), MoveFileError>
+) -> Result<(usize, usize, usize), MoveFileError>
 where
     T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
     U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
@@ -135,8 +136,8 @@ where
     METRIC_START_COUNT.inc();
     // 1. List files on src and dst in parallel
     let (src_files, dst_files) = future::join(
-        src.list(context::current(), dir_id.clone(), src_options()),
-        dst.list(context::current(), dir_id.clone(), dst_options()),
+        src.list(ctx.clone(), dir_id.clone(), src_options()),
+        dst.list(ctx.clone(), dir_id.clone(), dst_options()),
     )
     .await;
     let src_files = src_files??;
@@ -150,41 +151,55 @@ where
     let total_files = src_files.len();
     let total_bytes = src_files.iter().map(|f| f.size).sum();
     progress.set_length(total_files, total_bytes);
-    let (success_count, error_count) = futures::stream::iter(src_files.into_iter())
+    let results = futures::stream::iter(src_files.into_iter())
         .map(|file| {
             let mut file_progress = progress.for_file(&file.path, file.size);
             let dst_file = dst_map.get(&file.path);
             let dir_id = dir_id.clone();
+            let ctx = ctx.clone();
             async move {
-                let result =
-                    move_file(src, &file, dst, dst_file, &dir_id, &mut *file_progress).await;
-                match &result {
+                let result = move_file(
+                    ctx.clone(),
+                    src,
+                    &file,
+                    dst,
+                    dst_file,
+                    &dir_id,
+                    &mut *file_progress,
+                )
+                .await;
+                match result {
                     Ok(_) => {
                         file_progress.success();
-
-                        true
+                        (1, 0, 0)
+                    }
+                    Err(MoveFileError::Rpc(tarpc::client::RpcError::DeadlineExceeded)) => {
+                        file_progress.error(&MoveFileError::Rpc(
+                            tarpc::client::RpcError::DeadlineExceeded,
+                        ));
+                        (0, 0, 1)
                     }
                     Err(err) => {
-                        file_progress.error(err);
-
-                        false
+                        file_progress.error(&err);
+                        (0, 1, 0)
                     }
                 }
             }
         })
         .buffer_unordered(PARALLEL_FILE_COUNT)
-        .collect::<Vec<bool>>()
-        .await
+        .collect::<Vec<(usize, usize, usize)>>()
+        .await;
+    let (success_count, error_count, interrupted_count) = results
         .into_iter()
-        .fold(
-            (0, 0),
-            |(s, e), ret| if ret { (s + 1, e) } else { (s, e + 1) },
-        );
+        .fold((0, 0, 0), |(s, e, i), (s1, e1, i1)| {
+            (s + s1, e + e1, i + i1)
+        });
     METRIC_END_COUNT.inc();
-    Ok((success_count, error_count))
+    Ok((success_count, error_count, interrupted_count))
 }
 
 async fn move_file<T, U>(
+    ctx: tarpc::context::Context,
     src: &RealizeServiceClient<T>,
     src_file: &SyncedFile,
     dst: &RealizeServiceClient<U>,
@@ -206,6 +221,7 @@ where
     // Important: Compute source hash only once, though it might be
     // used twice; it's very slow to compute on large files.
     let mut src_hash = Either::Left(hash_file(
+        ctx.clone(),
         src,
         dir_id,
         path,
@@ -218,7 +234,17 @@ where
             Either::Left(fut) => fut.await?,
             Either::Right(hash) => hash,
         };
-        if check_hashes_and_delete_with_src_hash(&hash, src_size, src, dst, dir_id, path).await? {
+        if check_hashes_and_delete_with_src_hash(
+            ctx.clone(),
+            &hash,
+            src_size,
+            src,
+            dst,
+            dir_id,
+            path,
+        )
+        .await?
+        {
             return Ok(());
         }
         src_hash = Either::Right(hash);
@@ -252,7 +278,7 @@ where
             log::debug!("{}:{:?} sending range {:?}", dir_id, path, range);
             let data = src
                 .read(
-                    context::current(),
+                    ctx.clone(),
                     dir_id.clone(),
                     path.to_path_buf(),
                     range,
@@ -266,7 +292,7 @@ where
                 .with_label_values(&["read"])
                 .inc_by(range.1 - range.0);
             dst.send(
-                context::current(),
+                ctx.clone(),
                 dir_id.clone(),
                 path.to_path_buf(),
                 range,
@@ -287,7 +313,7 @@ where
             log::debug!("{}:{:?} rsync on range {:?}", dir_id, path, range);
             let sig = dst
                 .calculate_signature(
-                    context::current(),
+                    ctx.clone(),
                     dir_id.clone(),
                     path.to_path_buf(),
                     range,
@@ -296,7 +322,7 @@ where
                 .await??;
             let delta = src
                 .diff(
-                    context::current(),
+                    ctx.clone(),
                     dir_id.clone(),
                     path.to_path_buf(),
                     range,
@@ -311,7 +337,7 @@ where
                 .with_label_values(&["diff"])
                 .inc_by(range.1 - range.0);
             dst.apply_delta(
-                context::current(),
+                ctx.clone(),
                 dir_id.clone(),
                 path.to_path_buf(),
                 range,
@@ -336,7 +362,7 @@ where
         Either::Left(hash) => hash.await?,
         Either::Right(hash) => hash,
     };
-    if !check_hashes_and_delete_with_src_hash(&hash, src_size, src, dst, dir_id, path).await? {
+    if !check_hashes_and_delete_with_src_hash(ctx, &hash, src_size, src, dst, dir_id, path).await? {
         return Err(MoveFileError::Realize(RealizeError::Sync(
             path.to_path_buf(),
             "Data still inconsistent after sync".to_string(),
@@ -350,6 +376,7 @@ where
 ///
 /// Return true if the hashes matched, false otherwise.
 async fn check_hashes_and_delete_with_src_hash<T, U>(
+    ctx: tarpc::context::Context,
     src_hash: &Vec<Hash>,
     file_size: u64,
     src: &RealizeServiceClient<T>,
@@ -361,7 +388,16 @@ where
     T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
     U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
 {
-    let dst_hash = hash_file(dst, dir_id, path, file_size, HASH_FILE_CHUNK, dst_options()).await?;
+    let dst_hash = hash_file(
+        ctx.clone(),
+        dst,
+        dir_id,
+        path,
+        file_size,
+        HASH_FILE_CHUNK,
+        dst_options(),
+    )
+    .await?;
     if *src_hash != dst_hash {
         log::info!("{}:{:?} inconsistent hashes", dir_id, path);
         METRIC_FILE_END_COUNT
@@ -376,19 +412,14 @@ where
     );
     // Hashes match, finish and delete
     dst.finish(
-        context::current(),
+        ctx.clone(),
         dir_id.clone(),
         path.to_path_buf(),
         dst_options(),
     )
     .await??;
-    src.delete(
-        context::current(),
-        dir_id.clone(),
-        path.to_path_buf(),
-        src_options(),
-    )
-    .await??;
+    src.delete(ctx, dir_id.clone(), path.to_path_buf(), src_options())
+        .await??;
 
     METRIC_FILE_END_COUNT.with_label_values(&["Ok"]).inc();
     Ok(true)
@@ -399,8 +430,8 @@ mod tests {
     use super::*;
     use crate::model::service::DirectoryId;
     use crate::server::RealizeServer;
-    use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
     use sha2::Digest as _;
     use std::path::PathBuf;
@@ -493,7 +524,8 @@ mod tests {
         let mut progress = MockProgress {
             log: Arc::clone(&log),
         };
-        let (_success, _error) = move_files(
+        let (_, _, _) = move_files(
+            tarpc::context::current(),
             &src_server,
             &dst_server,
             DirectoryId::from("testdir"),
@@ -549,7 +581,8 @@ mod tests {
         src_temp.child("partial").write_str("partialcopy")?;
 
         println!("test_move_files: all files set up");
-        let (success, error) = move_files(
+        let (success, error, _interrupted) = move_files(
+            tarpc::context::current(),
             &src_server,
             &dst_server,
             DirectoryId::from("testdir"),
@@ -619,7 +652,8 @@ mod tests {
         garbage.extend_from_slice(&chunk5[..1024 * 1024]); // 1MB garbage
         dst_temp.child("large_garbage").write_binary(&garbage)?;
 
-        let (success, error) = move_files(
+        let (success, error, _interrupted) = move_files(
+            tarpc::context::current(),
             &src_server,
             &dst_server,
             DirectoryId::from("testdir"),
@@ -671,7 +705,8 @@ mod tests {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(unreadable.path(), fs::Permissions::from_mode(0o000))?;
-        let (success, error) = move_files(
+        let (success, error, _interrupted) = move_files(
+            tarpc::context::current(),
             &src_server,
             &dst_server,
             DirectoryId::from("testdir"),
@@ -706,7 +741,8 @@ mod tests {
             .child(".partial.txt.part")
             .write_str("partialdata")?;
         // Run move_files
-        let (success, error) = move_files(
+        let (success, error, _interrupted) = move_files(
+            tarpc::context::current(),
             &src_server,
             &dst_server,
             DirectoryId::from("testdir"),
@@ -739,6 +775,7 @@ mod tests {
         let dir_id = DirectoryId::from("dir");
         let server = RealizeServer::for_dir(&dir_id, temp.path()).as_inprocess_client();
         let hashvec = hash_file(
+            tarpc::context::current(),
             &server,
             &dir_id,
             &PathBuf::from("somefile"),
@@ -764,6 +801,7 @@ mod tests {
         let dir_id = DirectoryId::from("dir");
         let server = RealizeServer::for_dir(&dir_id, temp.path()).as_inprocess_client();
         let hashvec = hash_file(
+            tarpc::context::current(),
             &server,
             &dir_id,
             &PathBuf::from("somefile"),
@@ -799,6 +837,7 @@ mod tests {
         let dir_id = DirectoryId::from("dir");
         let server = RealizeServer::for_dir(&dir_id, temp.path()).as_inprocess_client();
         let hashvec = hash_file(
+            tarpc::context::current(),
             &server,
             &dir_id,
             &PathBuf::from("somefile"),
@@ -849,6 +888,7 @@ mod tests {
 
 /// Hash file in chunks and return the result.
 pub async fn hash_file<T>(
+    ctx: tarpc::context::Context,
     client: &RealizeServiceClient<T>,
     dir_id: &DirectoryId,
     relative_path: &Path,
@@ -870,7 +910,7 @@ where
     let results = futures::stream::iter(ranges.into_iter())
         .map(|range| {
             client.hash(
-                context::current(),
+                ctx.clone(),
                 dir_id.clone(),
                 relative_path.to_path_buf(),
                 range,

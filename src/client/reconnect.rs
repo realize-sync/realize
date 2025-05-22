@@ -4,9 +4,9 @@ use std::{
 };
 
 use tarpc::{
-    client::{stub::Stub, RpcError},
-    context::Context,
     RequestName,
+    client::{RpcError, stub::Stub},
+    context::Context,
 };
 use tokio::sync::RwLock;
 
@@ -246,8 +246,8 @@ mod tests {
     use anyhow::Context as _;
     use futures::future::join_all;
     use tarpc::{
-        context::{self, Context},
         ChannelError,
+        context::{self, Context},
     };
     use tokio_retry::strategy::ExponentialBackoff;
 

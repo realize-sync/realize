@@ -1,10 +1,10 @@
-use async_speed_limit::clock::StandardClock;
 use async_speed_limit::Limiter;
+use async_speed_limit::clock::StandardClock;
 use futures::prelude::*;
 use rustls::pki_types::ServerName;
 use rustls::sign::SigningKey;
-use tarpc::client::stub::Stub;
 use tarpc::client::RpcError;
+use tarpc::client::stub::Stub;
 use tarpc::context;
 use tokio::sync::Mutex;
 use tokio_retry::strategy::ExponentialBackoff;

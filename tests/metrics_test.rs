@@ -161,7 +161,8 @@ async fn move_files_metrics() -> anyhow::Result<()> {
         &DirectoryId::from("testdir"),
         dst_temp.path(),
     ));
-    let (success, error) = move_files(
+    let (success, error, _interrupted) = move_files(
+        tarpc::context::current(),
         &RealizeServer::for_dir(src_dir.id(), src_dir.path()).as_inprocess_client(),
         &RealizeServer::for_dir(dst_dir.id(), dst_dir.path()).as_inprocess_client(),
         DirectoryId::from("testdir"),

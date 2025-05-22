@@ -10,7 +10,6 @@ use realize::metrics;
 use realize::model::service::DirectoryId;
 use realize::transport::security::{self, PeerVerifier};
 use realize::transport::tcp::{self, TcpRealizeServiceClient, lookup_addr};
-use realize::utils::async_utils::AbortOnDrop;
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use rustls::sign::SigningKey;
@@ -18,6 +17,9 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
+use tarpc::client::RpcError;
+use tarpc::context;
 
 lazy_static::lazy_static! {
     static ref METRIC_UP: IntCounter =
@@ -98,21 +100,17 @@ async fn main() {
     env_logger::init();
 
     let cli = Cli::parse();
-    let _timeout_guard = if let Some(duration) = cli.max_duration {
-        let handle = tokio::spawn(async move {
-            tokio::time::sleep(duration.into()).await;
-            print_error(&format!(
-                "Maximum duration ({duration}) exceeded. Giving up."
-            ));
-            process::exit(11);
-        });
-        Some(AbortOnDrop::new(handle))
-    } else {
-        None
-    };
+    // Set deadline context
+    let max_duration = cli
+        .max_duration
+        .map(|d| d.into())
+        .unwrap_or_else(|| std::time::Duration::from_secs(24 * 60 * 60));
+    let deadline = std::time::Instant::now() + max_duration;
+    let mut ctx = context::current();
+    ctx.deadline = deadline;
 
     let mut status = 0;
-    if let Err(err) = execute(&cli).await {
+    if let Err(err) = execute(&cli, ctx).await {
         print_error(&format!("{err:#}"));
         status = 1;
     };
@@ -130,7 +128,7 @@ async fn main() {
     process::exit(status);
 }
 
-async fn execute(cli: &Cli) -> anyhow::Result<()> {
+async fn execute(cli: &Cli, ctx: context::Context) -> anyhow::Result<()> {
     METRIC_UP.reset(); // Set it to 0, so it's available
     if let Some(addr) = &cli.metrics_addr {
         metrics::export_metrics(addr)
@@ -182,34 +180,64 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
     // Move files for each directory id
     let mut total_success = 0;
     let mut total_error = 0;
+    let mut total_interrupted = 0;
     let mut progress = CliProgress::new(cli.quiet);
+    let mut interrupted = false;
     let should_show_dir = cli.directory_ids.len() >= 2;
     for dir_id in &cli.directory_ids {
         if should_show_dir {
             progress.set_path_prefix(format!("{}/", dir_id));
         }
-        let (success, error) = realize::algo::move_files(
+        let result = realize::algo::move_files(
+            ctx.clone(),
             &src_client,
             &dst_client,
             DirectoryId::from(dir_id.to_string()),
             &mut progress,
         )
-        .await?;
-        total_success += success;
-        total_error += error;
+        .await;
+
+        match result {
+            Ok((success, error, interrupted)) => {
+                total_success += success;
+                total_error += error;
+                total_interrupted += interrupted;
+            }
+            Err(MoveFileError::Rpc(RpcError::DeadlineExceeded)) => {
+                interrupted = true;
+                break;
+            }
+            Err(err) => {
+                return Err(err.into());
+            }
+        }
     }
     progress.finish_and_clear();
 
     if total_error > 0 {
         return Err(anyhow::anyhow!(
-            "{total_error} file(s) failed, and {total_success} files(s) moved"
+            "{total_error} file(s) failed, {total_success} file(s) moved, {total_interrupted} interrupted"
         ));
+    }
+    if interrupted || ctx.deadline <= Instant::now() {
+        eprintln!(
+            "{} {} file(s) moved, {} interrupted",
+            style("INTERRUPTED").for_stderr().red(),
+            total_success,
+            total_interrupted
+        );
+        process::exit(11);
     }
     if !cli.quiet {
         println!(
-            "{} {} file(s) moved",
+            "{} {} file(s) moved{}",
             style("SUCCESS").for_stdout().green().bold(),
-            total_success
+            total_success,
+            if total_interrupted > 0 {
+                format!(", {} interrupted", total_interrupted)
+            } else {
+                String::new()
+            }
         );
     }
 
@@ -226,7 +254,7 @@ async fn configure_limit(
 ) -> anyhow::Result<Option<u64>> {
     let config = client
         .configure(
-            tarpc::context::current(),
+            context::current(),
             realize::model::service::Config {
                 write_limit: Some(limit),
             },
