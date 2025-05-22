@@ -10,7 +10,7 @@ use crate::model::service::{
 use futures::future;
 use futures::future::Either;
 use futures::stream::StreamExt as _;
-use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
+use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
 use std::cmp::min;
 use std::sync::Arc;
 use std::{collections::HashMap, path::Path};
@@ -271,9 +271,8 @@ where
             if rsyncing {
                 progress.copying();
                 rsyncing = false;
-                if let Ok(lock) = copy_sem.acquire().await {
-                    _copy_lock = Some(lock);
-                }
+                _copy_lock = Some(copy_sem.acquire().await.unwrap());
+                log::debug!("Copy semaphore locked for {}", src_file.path.display());
             }
             // Send data
             log::debug!("{}:{:?} sending range {:?}", dir_id, path, range);
@@ -353,7 +352,11 @@ where
     }
 
     progress.verifying();
-    _copy_lock = None;
+    if let Some(_) = _copy_lock {
+        log::debug!("Copy semaphore unlocked for {}", src_file.path.display());
+    }
+    drop(_copy_lock);
+
     let hash = match src_hash {
         Either::Left(hash) => hash.await?,
         Either::Right(hash) => hash,
@@ -421,8 +424,8 @@ mod tests {
     use super::*;
     use crate::model::service::DirectoryId;
     use crate::server::{self, DirectoryMap};
-    use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
     use sha2::Digest as _;
     use std::path::PathBuf;
