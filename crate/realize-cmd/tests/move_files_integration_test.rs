@@ -1,14 +1,12 @@
-use assert_cmd::cargo::cargo_bin;
 use assert_fs::fixture::ChildPath;
 use assert_fs::prelude::*;
 use assert_fs::TempDir;
 use assert_unordered::assert_eq_unordered;
-use realize::model::service::DirectoryId;
-use realize::server::DirectoryMap;
-use realize::server::RealizeServer;
-use realize::transport::security::{self, PeerVerifier};
-use realize::transport::tcp;
-use realize::utils::async_utils::AbortOnDrop;
+use realize_lib::model::service::DirectoryId;
+use realize_lib::server::{DirectoryMap, RealizeServer};
+use realize_lib::transport::security::{self, PeerVerifier};
+use realize_lib::transport::tcp;
+use realize_lib::utils::async_utils::AbortOnDrop;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use std::fs;
@@ -17,6 +15,20 @@ use std::path::PathBuf;
 use std::process::Output;
 use std::sync::Arc;
 use tokio::process::Command;
+
+fn command_path() -> PathBuf {
+    /// Expecting a path for the current exe to look like
+    /// target/debug/deps/move_file_integration_test
+    // TODO: fix this. CARGO_BIN_EXE_ mysteriously stopped working
+    // after transitioning to a workspace.
+    std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("realize-cmd")
+}
 
 pub struct Fixture {
     pub tempdir: TempDir,
@@ -84,7 +96,7 @@ impl Fixture {
 
     /// A command with all required args.
     pub fn command(&self) -> Command {
-        let mut cmd = Command::new(cargo_bin!("realize"));
+        let mut cmd = Command::new(command_path());
         cmd.arg("--src-addr")
             .arg(&self.src_addr)
             .arg("--dst-addr")
@@ -330,7 +342,7 @@ async fn realize_metrics_export() -> anyhow::Result<()> {
         .command()
         .arg("--metrics-addr")
         .arg(&realize_metrics_addr)
-        .env("RUST_LOG", "realize::metrics=debug")
+        .env("RUST_LOG", "realize_lib::metrics=debug")
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -495,22 +507,22 @@ async fn multiple_directory_ids() -> anyhow::Result<()> {
 
     // Setup src server with two directories
     let src_dirs = DirectoryMap::new([
-        realize::server::Directory::new(&DirectoryId::from("dir1"), src_dir1.path()),
-        realize::server::Directory::new(&DirectoryId::from("dir2"), src_dir2.path()),
+        realize_lib::server::Directory::new(&DirectoryId::from("dir1"), src_dir1.path()),
+        realize_lib::server::Directory::new(&DirectoryId::from("dir2"), src_dir2.path()),
     ]);
     let (src_addr, _src_handle) =
         tcp::start_server("127.0.0.1:0", src_dirs, verifier.clone(), privkey_a).await?;
 
     // Setup dst server with two directories
     let dst_dirs = DirectoryMap::new([
-        realize::server::Directory::new(&DirectoryId::from("dir1"), dst_dir1.path()),
-        realize::server::Directory::new(&DirectoryId::from("dir2"), dst_dir2.path()),
+        realize_lib::server::Directory::new(&DirectoryId::from("dir1"), dst_dir1.path()),
+        realize_lib::server::Directory::new(&DirectoryId::from("dir2"), dst_dir2.path()),
     ]);
     let (dst_addr, _dst_handle) =
         tcp::start_server("127.0.0.1:0", dst_dirs, verifier, privkey_b).await?;
 
     // Run realize with two directory ids
-    let output = tokio::process::Command::new(cargo_bin!("realize"))
+    let output = tokio::process::Command::new(command_path())
         .arg("--src-addr")
         .arg(&src_addr.to_string())
         .arg("--dst-addr")
@@ -555,12 +567,14 @@ pub struct TestKeys {
 }
 
 pub fn test_keys() -> TestKeys {
+    let resources =
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../resources/test");
     TestKeys {
-        privkey_a_path: Arc::new(PathBuf::from("resources/test/a.key")),
-        privkey_b_path: Arc::new(PathBuf::from("resources/test/b.key")),
-        pubkey_a_path: PathBuf::from("resources/test/a-spki.pem"),
-        pubkey_b_path: PathBuf::from("resources/test/b-spki.pem"),
-        peers_path: PathBuf::from("resources/test/peers.pem"),
+        privkey_a_path: Arc::new(resources.join("a.key")),
+        privkey_b_path: Arc::new(resources.join("b.key")),
+        pubkey_a_path: resources.join("a-spki.pem"),
+        pubkey_b_path: resources.join("b-spki.pem"),
+        peers_path: resources.join("peers.pem"),
     }
 }
 

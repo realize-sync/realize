@@ -2,24 +2,40 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use assert_cmd::cargo::cargo_bin;
-use assert_fs::TempDir;
 use assert_fs::prelude::*;
+use assert_fs::TempDir;
+use assert_unordered::assert_eq_unordered;
 use predicates::prelude::*;
-use realize::model::service::DirectoryId;
-use realize::model::service::Options;
-use realize::transport::security;
-use realize::transport::security::PeerVerifier;
-use realize::transport::tcp;
+use realize_lib::model::service::{DirectoryId, Options};
+use realize_lib::transport::security;
+use realize_lib::transport::security::PeerVerifier;
+use realize_lib::transport::tcp;
 use reqwest::Client;
+use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::SubjectPublicKeyInfoDer;
-use rustls::pki_types::pem::PemObject as _;
+use std::env;
+use tarpc::context;
 use tokio::io::AsyncBufReadExt as _;
 use tokio::process::Command;
 
+fn command_path() -> PathBuf {
+    // Expecting a path for the current exe to look like
+    // target/debug/deps/integration_test
+    // TODO: fix this. CARGO_BIN_EXE_ mysteriously stopped working
+    // after transitioning to a workspace.
+    std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("realize-daemon")
+}
+
 struct Fixture {
     pub config_file: PathBuf,
+    pub resources: PathBuf,
     _temp_dir: TempDir,
 }
 
@@ -33,29 +49,32 @@ impl Fixture {
         testdir_server.create_dir_all()?;
         testdir_server.child("foo.txt").write_str("hello")?;
 
+        let resources = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("../../resources/test");
         let config_file = temp_dir.child("config.yaml").to_path_buf();
         write_config_file(
             &config_file,
             testdir_server.path(),
-            &PathBuf::from("resources/test/a-spki.pem"),
+            &resources.join("a-spki.pem"),
         )?;
 
         Ok(Self {
             config_file,
+            resources,
             _temp_dir: temp_dir,
         })
     }
 
     pub fn command(&self) -> Command {
-        let mut cmd = tokio::process::Command::new(cargo_bin!("realized"));
+        let mut cmd = tokio::process::Command::new(command_path());
 
         cmd.arg("--address")
             .arg("127.0.0.1:0")
             .arg("--privkey")
-            .arg(&PathBuf::from("resources/test/a.key"))
+            .arg(&self.resources.join("a.key"))
             .arg("--config")
             .arg(&self.config_file)
-            .env("RUST_LOG", "realize::transport::tcp=debug")
+            .env("RUST_LOG", "realize_lib::transport::tcp=debug")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -80,9 +99,9 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
     // Connect to the port the daemon listens to.
     let crypto = Arc::new(security::default_provider());
     let mut verifier = PeerVerifier::new(&crypto);
-    verifier.add_peer(SubjectPublicKeyInfoDer::from_pem_file(&PathBuf::from(
-        "resources/test/a-spki.pem",
-    ))?);
+    verifier.add_peer(SubjectPublicKeyInfoDer::from_pem_file(
+        &fixture.resources.join("a-spki.pem"),
+    )?);
     let verifier = Arc::new(verifier);
 
     let client = tcp::connect_client(
@@ -90,15 +109,15 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
         verifier,
         crypto
             .key_provider
-            .load_private_key(PrivateKeyDer::from_pem_file(&PathBuf::from(
-                "resources/test/a.key",
-            ))?)?,
+            .load_private_key(PrivateKeyDer::from_pem_file(
+                &fixture.resources.join("a.key"),
+            )?)?,
         tcp::ClientOptions::default(),
     )
     .await?;
     let files = client
         .list(
-            tarpc::context::current(),
+            context::current(),
             DirectoryId::from("testdir"),
             Options::default(),
         )
@@ -112,10 +131,11 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
     daemon.start_kill()?;
 
     // Make sure stderr contains the expected log message.
+    let stdout = collect_stdout(daemon.stdout.as_mut().unwrap()).await?;
     let stderr = collect_stderr(daemon.stderr.as_mut().unwrap()).await?;
     assert!(
         stderr.contains("Accepted peer testpeer from "),
-        "stderr: {stderr}"
+        "stderr: {stderr} stdout: {stdout}"
     );
 
     Ok(())
@@ -190,6 +210,19 @@ async fn collect_stderr(stderr: &mut tokio::process::ChildStderr) -> anyhow::Res
     let mut lines = reader.lines();
     let mut all_lines = vec![];
     while let Ok(Some(line)) = lines.next_line().await {
+        eprintln!("{}", line);
+        all_lines.push(line);
+    }
+
+    Ok(all_lines.join("\n"))
+}
+
+async fn collect_stdout(stdout: &mut tokio::process::ChildStdout) -> anyhow::Result<String> {
+    let reader = tokio::io::BufReader::new(stdout);
+    let mut lines = reader.lines();
+    let mut all_lines = vec![];
+    while let Ok(Some(line)) = lines.next_line().await {
+        eprintln!("{}", line);
         all_lines.push(line);
     }
 

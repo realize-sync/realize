@@ -1,19 +1,19 @@
 use assert_fs::TempDir;
 use assert_fs::prelude::*;
 use prometheus::proto::MetricType;
-use realize::algo::METRIC_END_COUNT;
-use realize::algo::METRIC_FILE_END_COUNT;
-use realize::algo::METRIC_FILE_START_COUNT;
-use realize::algo::METRIC_RANGE_READ_BYTES;
-use realize::algo::METRIC_RANGE_WRITE_BYTES;
-use realize::algo::METRIC_READ_BYTES;
-use realize::algo::METRIC_START_COUNT;
-use realize::algo::METRIC_WRITE_BYTES;
-use realize::algo::NoProgress;
-use realize::algo::move_files;
-use realize::model::service::{DirectoryId, Options};
-use realize::server::InProcessRealizeServiceClient;
-use realize::server::RealizeServer;
+use realize_lib::algo::METRIC_END_COUNT;
+use realize_lib::algo::METRIC_FILE_END_COUNT;
+use realize_lib::algo::METRIC_FILE_START_COUNT;
+use realize_lib::algo::METRIC_RANGE_READ_BYTES;
+use realize_lib::algo::METRIC_RANGE_WRITE_BYTES;
+use realize_lib::algo::METRIC_READ_BYTES;
+use realize_lib::algo::METRIC_START_COUNT;
+use realize_lib::algo::METRIC_WRITE_BYTES;
+use realize_lib::algo::NoProgress;
+use realize_lib::algo::move_files;
+use realize_lib::model::service::{DirectoryId, Options};
+use realize_lib::server::InProcessRealizeServiceClient;
+use realize_lib::server::RealizeServer;
 use std::sync::Arc;
 
 // Metric tests are kept in their own binary to avoid other test
@@ -153,11 +153,11 @@ async fn move_files_metrics() -> anyhow::Result<()> {
     let src_temp = TempDir::new()?;
     let dst_temp = TempDir::new()?;
     src_temp.child("foo").write_str("abc")?;
-    let src_dir = Arc::new(realize::server::Directory::new(
+    let src_dir = Arc::new(realize_lib::server::Directory::new(
         &DirectoryId::from("testdir"),
         src_temp.path(),
     ));
-    let dst_dir = Arc::new(realize::server::Directory::new(
+    let dst_dir = Arc::new(realize_lib::server::Directory::new(
         &DirectoryId::from("testdir"),
         dst_temp.path(),
     ));

@@ -1640,11 +1640,9 @@ dependencies = [
  "cfg-if",
  "fnv",
  "lazy_static",
- "libc",
  "memchr",
  "parking_lot",
  "protobuf",
- "reqwest",
  "thiserror 2.0.12",
 ]
 
@@ -1714,7 +1712,64 @@ dependencies = [
 ]
 
 [[package]]
-name = "realize"
+name = "realize-cmd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "assert_fs",
+ "assert_unordered",
+ "async-speed-limit",
+ "clap",
+ "console",
+ "ctrlc",
+ "env_logger",
+ "humantime",
+ "indicatif",
+ "lazy_static",
+ "log",
+ "parse-size",
+ "pathdiff",
+ "predicates",
+ "prometheus",
+ "realize-lib",
+ "reqwest",
+ "rustls",
+ "serde",
+ "tarpc",
+ "tempfile",
+ "test-tag",
+ "tokio",
+]
+
+[[package]]
+name = "realize-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "assert_fs",
+ "assert_unordered",
+ "clap",
+ "env_logger",
+ "lazy_static",
+ "log",
+ "portpicker",
+ "predicates",
+ "prometheus",
+ "realize-lib",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_yaml",
+ "tarpc",
+ "tempfile",
+ "test-tag",
+ "tokio",
+]
+
+[[package]]
+name = "realize-lib"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1804,7 +1859,6 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
- "futures-channel",
  "futures-core",
  "futures-util",
  "h2",

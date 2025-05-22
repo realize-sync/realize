@@ -1,0 +1,48 @@
+[package]
+name = "realize-lib"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+assert_unordered = "0.3"
+async-speed-limit = { version = "0.4.2", features = ["futures-timer","futures-core"] }
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+console = "0.15"
+ctrlc = "3.4"
+env_logger = "0.11"
+fast_rsync = "0.2"
+futures = "0.3"
+humantime = "2.2"
+hyper = { version = "1.6", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+indicatif = "0.17"
+lazy_static = "1.5"
+log = "0.4"
+parse-size = "1.1"
+pathdiff = "0.2"
+prometheus = { version = "0.14", features = [] }
+rustls = "0.23"
+serde = {version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+sha2 = "0.10"
+tarpc = { version = "0.36", features = ["serde1", "tokio1", "serde-transport", "serde-transport-bincode", "tcp"] }
+thiserror = "2.0"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "fs", "io-util"] }
+tokio-retry = "0.3.0"
+tokio-rustls = "0.26"
+tracing = "0.1"
+walkdir = "2.5"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+assert_fs = "1.1"
+futures = "0.3"
+portpicker = "0.1"
+predicates = "3.1"
+reqwest = "0.12"
+serial_test = "3.2.0"
+tempfile = "3.20"
+test-tag = "0.1"
+tokio = { version = "1", features = ["process"] }

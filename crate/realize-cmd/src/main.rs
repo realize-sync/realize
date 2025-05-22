@@ -5,11 +5,11 @@ use clap::Parser;
 use console::style;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use prometheus::{IntCounter, register_int_counter};
-use realize::algo::{FileProgress as AlgoFileProgress, MoveFileError, Progress};
-use realize::metrics;
-use realize::model::service::DirectoryId;
-use realize::transport::security::{self, PeerVerifier};
-use realize::transport::tcp::{self, TcpRealizeServiceClient, lookup_addr};
+use realize_lib::algo::{FileProgress as AlgoFileProgress, MoveFileError, Progress};
+use realize_lib::metrics;
+use realize_lib::model::service::DirectoryId;
+use realize_lib::transport::security::{self, PeerVerifier};
+use realize_lib::transport::tcp::{self, TcpRealizeServiceClient, lookup_addr};
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use rustls::sign::SigningKey;
@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use tarpc::client::RpcError;
 use tarpc::context;
+use humantime;
 
 lazy_static::lazy_static! {
     static ref METRIC_UP: IntCounter =
@@ -188,7 +189,7 @@ async fn execute(cli: &Cli, ctx: context::Context) -> anyhow::Result<()> {
         if should_show_dir {
             progress.set_path_prefix(format!("{}/", dir_id));
         }
-        let result = realize::algo::move_files(
+        let result = realize_lib::algo::move_files(
             ctx.clone(),
             &src_client,
             &dst_client,
@@ -255,7 +256,7 @@ async fn configure_limit(
     let config = client
         .configure(
             context::current(),
-            realize::model::service::Config {
+            realize_lib::model::service::Config {
                 write_limit: Some(limit),
             },
         )

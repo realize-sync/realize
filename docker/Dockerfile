@@ -33,7 +33,7 @@ ENV PRIVKEY=/config/private.key
 ENV CONFIG=/config/config.yaml
 
 # Configure logging
-ENV RUST_LOG=warn,realize::transport::tcp=info,realize::security=debug,realize::server=info
+ENV RUST_LOG=warn,realize_lib::transport::tcp=info,realize_lib::security=debug,realize_lib::server=info
 
 # --- 2.2 entry point
 COPY ./docker/entrypoint.sh /entrypoint.sh

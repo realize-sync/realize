@@ -4,10 +4,10 @@
 use anyhow::Context as _;
 use clap::Parser;
 use prometheus::{IntCounter, register_int_counter};
-use realize::metrics;
-use realize::server::{Directory, DirectoryMap};
-use realize::transport::security::{self, PeerVerifier};
-use realize::transport::tcp;
+use realize_lib::metrics;
+use realize_lib::server::{Directory, DirectoryMap};
+use realize_lib::transport::security::{self, PeerVerifier};
+use realize_lib::transport::tcp;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use rustls::sign::SigningKey;
