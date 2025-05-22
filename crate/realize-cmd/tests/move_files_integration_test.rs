@@ -17,8 +17,8 @@ use std::sync::Arc;
 use tokio::process::Command;
 
 fn command_path() -> PathBuf {
-    /// Expecting a path for the current exe to look like
-    /// target/debug/deps/move_file_integration_test
+    // Expecting a path for the current exe to look like
+    // target/debug/deps/move_file_integration_test
     // TODO: fix this. CARGO_BIN_EXE_ mysteriously stopped working
     // after transitioning to a workspace.
     std::env::current_exe()
