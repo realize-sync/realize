@@ -72,7 +72,8 @@ async fn main() {
         eprintln!("ERROR: {err:#}");
         process::exit(1);
     };
-    process::exit(0);
+    // Use Result<!> as return type once it's available in stable.
+    unreachable!("execute should never execute successfully");
 }
 
 async fn execute(cli: Cli) -> anyhow::Result<()> {
@@ -115,6 +116,7 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
     let hostport = HostPort::parse(&cli.address)
         .await
         .with_context(|| format!("Failed to parse --address {}", cli.address))?;
+    log::debug!("Starting server on {}/{:?}...", hostport, hostport.addr());
     let (addr, handle) = tcp::start_server(&hostport, dirs, verifier, privkey)
         .await
         .with_context(|| format!("Failed to start server on {}", hostport))?;
@@ -122,15 +124,16 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
     METRIC_UP.inc();
     println!("Listening on {addr}");
 
-    handle.join().await.context("Server stopped")?;
+    handle.join().await?;
 
-    Ok(())
+    Err(anyhow::anyhow!("Server shut down"))
 }
 
 /// Checks that all directories in the config file are accessible.
 fn check_directory_access(dirs: &Vec<DirEntry>) -> anyhow::Result<()> {
     for dir in dirs {
         for (id, path) in &dir.map {
+            log::debug!("Checking directory {}: {}", id, path);
             let path = std::path::Path::new(path);
             if !path.exists() {
                 anyhow::bail!("Directory '{}' (id: {}) does not exist", path.display(), id);
