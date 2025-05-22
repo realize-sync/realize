@@ -11,7 +11,7 @@ use tarpc::{
 use tokio::sync::RwLock;
 
 /// Maximum number of retries for DeadlineExceeded
-const MAX_RETRY_COUNT: u32 = 1;
+const MAX_RETRY_COUNT: u32 = 10;
 
 #[allow(async_fn_in_trait)] // TODO: fix
 pub(crate) trait Connect<T>: Clone {
@@ -555,8 +555,9 @@ mod tests {
         let mut connect = DeadlineStubConnect::new();
         let call_counter = connect.counter();
         connect.add_fail(1);
-        connect.add_fail(3);
-        connect.add_fail(4);
+        for i in 3..(3 + MAX_RETRY_COUNT + 1) {
+            connect.add_fail(i);
+        }
         let reconnect = Reconnect::new(
             ExponentialBackoff::from_millis(1),
             connect,
@@ -581,20 +582,26 @@ mod tests {
             .context("2nd call")?;
         assert_eq!(3, call_counter.load(Ordering::Relaxed));
 
-        // 3rd call returns DeadlineExceeded twice, which is
-        // forwarded.
+        // 3rd call returns DeadlineExceeded MAX_RETRY_COUNT+1 times,
+        // which is forwarded.
         assert!(matches!(
             reconnect.call(ctx, "test".to_string()).await,
             Err(RpcError::DeadlineExceeded)
         ));
-        assert_eq!(5, call_counter.load(Ordering::Relaxed));
+        assert_eq!(
+            3 + MAX_RETRY_COUNT + 1,
+            call_counter.load(Ordering::Relaxed)
+        );
 
         // 4th call succeeds
         reconnect
             .call(ctx, "test".to_string())
             .await
             .context("4th call")?;
-        assert_eq!(6, call_counter.load(Ordering::Relaxed));
+        assert_eq!(
+            3 + MAX_RETRY_COUNT + 2,
+            call_counter.load(Ordering::Relaxed)
+        );
 
         Ok(())
     }
