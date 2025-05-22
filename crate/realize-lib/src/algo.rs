@@ -939,12 +939,12 @@ where
 /// with anyhow {:#}.
 #[derive(Debug, Error)]
 pub enum MoveFileError {
-    #[error("RPC error")]
+    #[error("RPC error: {0}")]
     Rpc(#[from] tarpc::client::RpcError),
-    #[error("Remote Error")]
+    #[error("Remote Error: {0}")]
     Realize(#[from] RealizeError),
-    #[error("IO error")]
+    #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Error")]
+    #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
