@@ -206,7 +206,7 @@ impl TcpStub {
 
         let config = Arc::new(Mutex::new(None));
         let connect = TcpConnect {
-            server_addr: server_addr.clone(),
+            server_addr: *server_addr,
             connector,
             options,
             config: Arc::clone(&config),
@@ -328,7 +328,7 @@ mod tests {
                 Options::default(),
             )
             .await??;
-        assert_eq!(list.len(), 0);
+        assert!(list.is_empty());
         Ok(())
     }
 
@@ -345,25 +345,19 @@ mod tests {
             ClientOptions::default(),
         )
         .await;
-        match client_result {
-            Ok(client) => {
-                let list_result = client
-                    .list(
-                        context::current(),
-                        DirectoryId::from("testdir"),
-                        Options::default(),
-                    )
-                    .await;
-                assert!(
-                    list_result.is_err(),
-                    "Expected error when client is not in server verifier on first RPC"
-                );
-            }
-            Err(_) => {
-                // If handshake fails, that's also acceptable
-                assert!(true);
-            }
-        }
+        let failed = match client_result {
+            Ok(client) => client
+                .list(
+                    context::current(),
+                    DirectoryId::from("testdir"),
+                    Options::default(),
+                )
+                .await
+                .is_err(),
+            // If handshake fails, that's also acceptable
+            Err(_) => true,
+        };
+        assert!(failed);
 
         Ok(())
     }
@@ -540,8 +534,9 @@ mod tests {
         )
         .await?;
 
-        let mut config = Config::default();
-        config.write_limit = Some(1024);
+        let config = Config {
+            write_limit: Some(1024),
+        };
         assert_eq!(
             config,
             client
@@ -583,11 +578,11 @@ mod tests {
         let listener = TcpListener::bind("localhost:0").await?;
 
         let addr = listener.local_addr()?;
-        let server_addr = server_addr.clone();
+        let server_addr = *server_addr;
 
         let handle = AbortOnDrop::new(tokio::spawn(async move {
             while let Ok((mut inbound, _)) = listener.accept().await {
-                if let Ok(mut outbound) = TcpStream::connect(server_addr.clone()).await {
+                if let Ok(mut outbound) = TcpStream::connect(server_addr).await {
                     connection_count.fetch_add(1, Ordering::Relaxed);
 
                     let mut shutdown = shutdown.subscribe();

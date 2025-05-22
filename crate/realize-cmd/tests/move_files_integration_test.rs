@@ -1,9 +1,7 @@
+use assert_fs::TempDir;
 use assert_fs::fixture::ChildPath;
 use assert_fs::prelude::*;
-use assert_fs::TempDir;
 use assert_unordered::assert_eq_unordered;
-use hyper;
-use hyper_util;
 use hyper_util::rt::TokioIo;
 use realize_lib::model::service::DirectoryId;
 use realize_lib::server::{DirectoryMap, RealizeServer};
@@ -59,16 +57,12 @@ impl Fixture {
         let keys = test_keys();
         let (crypto, verifier): (Arc<rustls::crypto::CryptoProvider>, Arc<PeerVerifier>) =
             setup_crypto_and_verifier();
-        let privkey_a = Arc::from(
-            crypto
-                .key_provider
-                .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_a_path.as_ref())?)?,
-        );
-        let privkey_b = Arc::from(
-            crypto
-                .key_provider
-                .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_b_path.as_ref())?)?,
-        );
+        let privkey_a = crypto
+            .key_provider
+            .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_a_path.as_ref())?)?;
+        let privkey_b = crypto
+            .key_provider
+            .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_b_path.as_ref())?)?;
         let server_src = RealizeServer::for_dir(&"dir".into(), src_dir.path());
         let (src_addr3, server_handle_src) = tcp::start_server(
             "127.0.0.1:0",
@@ -429,7 +423,7 @@ async fn realize_metrics_pushgateway() -> anyhow::Result<()> {
     let output = fixture
         .command()
         .arg("--metrics-pushgateway")
-        .arg(&format!("http://{}/", pushgw_addr))
+        .arg(format!("http://{}/", pushgw_addr))
         .arg("--metrics-job")
         .arg("dir")
         .output()
@@ -497,16 +491,12 @@ async fn multiple_directory_ids() -> anyhow::Result<()> {
     let keys = test_keys();
     let (crypto, verifier): (Arc<rustls::crypto::CryptoProvider>, Arc<PeerVerifier>) =
         setup_crypto_and_verifier();
-    let privkey_a = Arc::from(
-        crypto
-            .key_provider
-            .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_a_path.as_ref())?)?,
-    );
-    let privkey_b = Arc::from(
-        crypto
-            .key_provider
-            .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_b_path.as_ref())?)?,
-    );
+    let privkey_a = crypto
+        .key_provider
+        .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_a_path.as_ref())?)?;
+    let privkey_b = crypto
+        .key_provider
+        .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_b_path.as_ref())?)?;
 
     // Setup src server with two directories
     let src_dirs = DirectoryMap::new([
@@ -527,9 +517,9 @@ async fn multiple_directory_ids() -> anyhow::Result<()> {
     // Run realize with two directory ids
     let output = tokio::process::Command::new(command_path())
         .arg("--src-addr")
-        .arg(&src_addr.to_string())
+        .arg(src_addr.to_string())
         .arg("--dst-addr")
-        .arg(&dst_addr.to_string())
+        .arg(dst_addr.to_string())
         .arg("--privkey")
         .arg(keys.privkey_a_path.as_ref())
         .arg("--peers")

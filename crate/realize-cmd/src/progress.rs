@@ -1,8 +1,8 @@
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use realize_lib::algo::{FileProgress as AlgoFileProgress, MoveFileError, Progress};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(crate) struct CliProgress {
     multi: MultiProgress,

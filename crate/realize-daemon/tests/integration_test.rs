@@ -2,17 +2,17 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use assert_fs::prelude::*;
 use assert_fs::TempDir;
+use assert_fs::prelude::*;
 use predicates::prelude::*;
 use realize_lib::model::service::{DirectoryId, Options};
 use realize_lib::transport::security;
 use realize_lib::transport::security::PeerVerifier;
 use realize_lib::transport::tcp;
 use reqwest::Client;
-use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::SubjectPublicKeyInfoDer;
+use rustls::pki_types::pem::PemObject as _;
 use tarpc::context;
 use tokio::io::AsyncBufReadExt as _;
 use tokio::process::Command;
@@ -69,7 +69,7 @@ impl Fixture {
         cmd.arg("--address")
             .arg("127.0.0.1:0")
             .arg("--privkey")
-            .arg(&self.resources.join("a.key"))
+            .arg(self.resources.join("a.key"))
             .arg("--config")
             .arg(&self.config_file)
             .env("RUST_LOG", "realize_lib::transport::tcp=debug")
@@ -98,7 +98,7 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
     let crypto = Arc::new(security::default_provider());
     let mut verifier = PeerVerifier::new(&crypto);
     verifier.add_peer(SubjectPublicKeyInfoDer::from_pem_file(
-        &fixture.resources.join("a-spki.pem"),
+        fixture.resources.join("a-spki.pem"),
     )?);
     let verifier = Arc::new(verifier);
 
@@ -108,7 +108,7 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
         crypto
             .key_provider
             .load_private_key(PrivateKeyDer::from_pem_file(
-                &fixture.resources.join("a.key"),
+                fixture.resources.join("a.key"),
             )?)?,
         tcp::ClientOptions::default(),
     )
@@ -196,7 +196,7 @@ peers:
       {}
 "#,
         testdir_server.display(),
-        std::fs::read_to_string(&pubkey_file)?.replace("\n", "\n      ")
+        std::fs::read_to_string(pubkey_file)?.replace("\n", "\n      ")
     );
     std::fs::write(config_file, config_yaml)?;
 
@@ -233,8 +233,7 @@ async fn wait_for_listening_port(
     let reader = tokio::io::BufReader::new(stdout);
     let mut lines = reader.lines();
     let line = lines.next_line().await?.unwrap();
-    assert_eq!(
-        true,
+    assert!(
         predicate::str::starts_with("Listening on").eval(&line),
         "Unexpected output: {line}"
     );

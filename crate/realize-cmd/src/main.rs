@@ -1,16 +1,16 @@
 use crate::progress::CliProgress;
 use anyhow::Context as _;
-use async_speed_limit::clock::StandardClock;
 use async_speed_limit::Limiter;
+use async_speed_limit::clock::StandardClock;
 use clap::Parser;
 use console::style;
 use indicatif::HumanBytes;
-use prometheus::{register_int_counter, IntCounter};
+use prometheus::{IntCounter, register_int_counter};
 use realize_lib::algo::MoveFileError;
 use realize_lib::metrics;
 use realize_lib::model::service::DirectoryId;
 use realize_lib::transport::security::{self, PeerVerifier};
-use realize_lib::transport::tcp::{self, lookup_addr, TcpRealizeServiceClient};
+use realize_lib::transport::tcp::{self, TcpRealizeServiceClient, lookup_addr};
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use rustls::sign::SigningKey;
@@ -190,7 +190,7 @@ async fn execute(cli: &Cli, ctx: context::Context) -> anyhow::Result<()> {
             progress.set_path_prefix(format!("{}/", dir_id));
         }
         let result = realize_lib::algo::move_files(
-            ctx.clone(),
+            ctx,
             &src_client,
             &dst_client,
             DirectoryId::from(dir_id.to_string()),

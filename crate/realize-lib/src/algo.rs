@@ -10,7 +10,7 @@ use crate::model::service::{
 use futures::future;
 use futures::future::Either;
 use futures::stream::StreamExt as _;
-use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
+use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
 use std::cmp::min;
 use std::{collections::HashMap, path::Path};
 use tarpc::client::stub::Stub;
@@ -136,8 +136,8 @@ where
     METRIC_START_COUNT.inc();
     // 1. List files on src and dst in parallel
     let (src_files, dst_files) = future::join(
-        src.list(ctx.clone(), dir_id.clone(), src_options()),
-        dst.list(ctx.clone(), dir_id.clone(), dst_options()),
+        src.list(ctx, dir_id.clone(), src_options()),
+        dst.list(ctx, dir_id.clone(), dst_options()),
     )
     .await;
     let src_files = src_files??;
@@ -156,18 +156,9 @@ where
             let mut file_progress = progress.for_file(&file.path, file.size);
             let dst_file = dst_map.get(&file.path);
             let dir_id = dir_id.clone();
-            let ctx = ctx.clone();
             async move {
-                let result = move_file(
-                    ctx.clone(),
-                    src,
-                    &file,
-                    dst,
-                    dst_file,
-                    &dir_id,
-                    &mut *file_progress,
-                )
-                .await;
+                let result =
+                    move_file(ctx, src, &file, dst, dst_file, &dir_id, &mut *file_progress).await;
                 match result {
                     Ok(_) => {
                         file_progress.success();
@@ -221,7 +212,7 @@ where
     // Important: Compute source hash only once, though it might be
     // used twice; it's very slow to compute on large files.
     let mut src_hash = Either::Left(hash_file(
-        ctx.clone(),
+        ctx,
         src,
         dir_id,
         path,
@@ -234,16 +225,8 @@ where
             Either::Left(fut) => fut.await?,
             Either::Right(hash) => hash,
         };
-        if check_hashes_and_delete_with_src_hash(
-            ctx.clone(),
-            &hash,
-            src_size,
-            src,
-            dst,
-            dir_id,
-            path,
-        )
-        .await?
+        if check_hashes_and_delete_with_src_hash(ctx, &hash, src_size, src, dst, dir_id, path)
+            .await?
         {
             return Ok(());
         }
@@ -278,7 +261,7 @@ where
             log::debug!("{}:{:?} sending range {:?}", dir_id, path, range);
             let data = src
                 .read(
-                    ctx.clone(),
+                    ctx,
                     dir_id.clone(),
                     path.to_path_buf(),
                     range,
@@ -292,7 +275,7 @@ where
                 .with_label_values(&["read"])
                 .inc_by(range.1 - range.0);
             dst.send(
-                ctx.clone(),
+                ctx,
                 dir_id.clone(),
                 path.to_path_buf(),
                 range,
@@ -313,7 +296,7 @@ where
             log::debug!("{}:{:?} rsync on range {:?}", dir_id, path, range);
             let sig = dst
                 .calculate_signature(
-                    ctx.clone(),
+                    ctx,
                     dir_id.clone(),
                     path.to_path_buf(),
                     range,
@@ -322,7 +305,7 @@ where
                 .await??;
             let delta = src
                 .diff(
-                    ctx.clone(),
+                    ctx,
                     dir_id.clone(),
                     path.to_path_buf(),
                     range,
@@ -337,7 +320,7 @@ where
                 .with_label_values(&["diff"])
                 .inc_by(range.1 - range.0);
             dst.apply_delta(
-                ctx.clone(),
+                ctx,
                 dir_id.clone(),
                 path.to_path_buf(),
                 range,
@@ -346,12 +329,6 @@ where
                 dst_options(),
             )
             .await??;
-            METRIC_WRITE_BYTES
-                .with_label_values(&["apply_delta"])
-                .inc_by(delta.0.len() as u64);
-            METRIC_RANGE_WRITE_BYTES
-                .with_label_values(&["apply_delta"])
-                .inc_by(range.1 - range.0);
             progress.inc(end - offset);
         }
         offset = end;
@@ -389,7 +366,7 @@ where
     U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
 {
     let dst_hash = hash_file(
-        ctx.clone(),
+        ctx,
         dst,
         dir_id,
         path,
@@ -411,13 +388,8 @@ where
         path
     );
     // Hashes match, finish and delete
-    dst.finish(
-        ctx.clone(),
-        dir_id.clone(),
-        path.to_path_buf(),
-        dst_options(),
-    )
-    .await??;
+    dst.finish(ctx, dir_id.clone(), path.to_path_buf(), dst_options())
+        .await??;
     src.delete(ctx, dir_id.clone(), path.to_path_buf(), src_options())
         .await??;
 
@@ -430,8 +402,8 @@ mod tests {
     use super::*;
     use crate::model::service::DirectoryId;
     use crate::server::RealizeServer;
-    use assert_fs::prelude::*;
     use assert_fs::TempDir;
+    use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
     use sha2::Digest as _;
     use std::path::PathBuf;
@@ -676,7 +648,7 @@ mod tests {
             let found = actual
                 .iter()
                 .find(|(p, _)| *p == path)
-                .expect(&format!("missing {path:?}"));
+                .unwrap_or_else(|| panic!("missing {path:?}"));
             assert_eq!(&found.1, &data, "content mismatch for {path:?}");
         }
         Ok(())
@@ -910,11 +882,11 @@ where
     let results = futures::stream::iter(ranges.into_iter())
         .map(|range| {
             client.hash(
-                ctx.clone(),
+                ctx,
                 dir_id.clone(),
                 relative_path.to_path_buf(),
                 range,
-                options.clone(),
+                options,
             )
         })
         .buffer_unordered(PARALLEL_FILE_HASH)

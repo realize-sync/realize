@@ -90,9 +90,9 @@ impl RealizeServer {
     }
 
     fn find_directory(&self, dir_id: &DirectoryId) -> Result<&Arc<Directory>> {
-        self.dirs.get(dir_id).ok_or_else(|| {
-            RealizeError::BadRequest(format!("Unknown directory \"{}\"", dir_id.to_string()))
-        })
+        self.dirs
+            .get(dir_id)
+            .ok_or_else(|| RealizeError::BadRequest(format!("Unknown directory \"{}\"", dir_id)))
     }
 
     /// Create an in-process RealizeServiceClient for this server instance.
@@ -232,7 +232,7 @@ impl RealizeService for RealizeServer {
         let logical = LogicalPath::new(dir, &relative_path)?;
         let (_state, actual) = logical.find(&options)?;
         let mut file = fs::File::open(&actual)?;
-        if !file.seek(std::io::SeekFrom::Start(range.0)).is_ok() {
+        if file.seek(std::io::SeekFrom::Start(range.0)).is_err() {
             // We return an empty hash instead of failing, because we
             // want hash comparison to fail if the file isn't of the
             // expected size, not get an I/O error.

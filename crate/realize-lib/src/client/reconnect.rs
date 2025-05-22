@@ -110,7 +110,7 @@ where
 
     /// Create a context with a possibly shorter deadline.
     fn short_ctx(&self, ctx: &Context) -> Context {
-        let mut short_ctx = ctx.clone();
+        let mut short_ctx = *ctx;
         if let Some(duration) = self.short_deadline {
             let short_deadline = Instant::now() + duration;
             if short_deadline < ctx.deadline {
@@ -227,11 +227,7 @@ fn should_retry<T>(
 }
 
 fn should_reconnect<T>(result: &Result<T, RpcError>) -> bool {
-    match result {
-        Err(RpcError::Shutdown) => true,
-        Err(RpcError::Channel(_)) => true,
-        _ => false,
-    }
+    matches!(result, Err(RpcError::Shutdown) | Err(RpcError::Channel(_)))
 }
 
 #[cfg(test)]
@@ -523,7 +519,7 @@ mod tests {
         ctx.deadline = Instant::now() + Duration::from_secs(60);
 
         for _ in 0..3 {
-            let remaining = reconnect.call(ctx.clone(), "test".to_string()).await?;
+            let remaining = reconnect.call(ctx, "test".to_string()).await?;
             assert!(
                 remaining.as_secs() > 0 && remaining.as_secs() <= 3,
                 "remaining={remaining:?}"
@@ -545,7 +541,7 @@ mod tests {
         let mut ctx = context::current();
         ctx.deadline = Instant::now() + Duration::from_secs(10);
 
-        let remaining = reconnect.call(ctx.clone(), "test".to_string()).await?;
+        let remaining = reconnect.call(ctx, "test".to_string()).await?;
         assert!(
             remaining.as_secs() > 0 && remaining.as_secs() <= 10,
             "remaining={remaining:?}"
@@ -573,14 +569,14 @@ mod tests {
 
         // 1st call succeeds without retries
         reconnect
-            .call(ctx.clone(), "test".to_string())
+            .call(ctx, "test".to_string())
             .await
             .context("1st call")?;
         assert_eq!(1, call_counter.load(Ordering::Relaxed));
 
         // 2nd call is retried once and eventually succeeds (2 calls)
         reconnect
-            .call(ctx.clone(), "test".to_string())
+            .call(ctx, "test".to_string())
             .await
             .context("2nd call")?;
         assert_eq!(3, call_counter.load(Ordering::Relaxed));
@@ -588,14 +584,14 @@ mod tests {
         // 3rd call returns DeadlineExceeded twice, which is
         // forwarded.
         assert!(matches!(
-            reconnect.call(ctx.clone(), "test".to_string()).await,
+            reconnect.call(ctx, "test".to_string()).await,
             Err(RpcError::DeadlineExceeded)
         ));
         assert_eq!(5, call_counter.load(Ordering::Relaxed));
 
         // 4th call succeeds
         reconnect
-            .call(ctx.clone(), "test".to_string())
+            .call(ctx, "test".to_string())
             .await
             .context("4th call")?;
         assert_eq!(6, call_counter.load(Ordering::Relaxed));
@@ -620,7 +616,7 @@ mod tests {
         ctx.deadline = Instant::now() + Duration::from_millis(3);
 
         assert!(matches!(
-            reconnect.call(ctx.clone(), "test".to_string()).await,
+            reconnect.call(ctx, "test".to_string()).await,
             Err(RpcError::DeadlineExceeded)
         ),);
 
@@ -650,7 +646,7 @@ mod tests {
         // only allows 3 attempts.
         let mut ctx = context::current();
         ctx.deadline = Instant::now() + Duration::from_millis(3);
-        let res = reconnect.call(ctx.clone(), "ping".to_string()).await;
+        let res = reconnect.call(ctx, "ping".to_string()).await;
         assert!(matches!(res, Err(RpcError::DeadlineExceeded)), "{res:?}");
 
         // Stub works again given longer deadline
