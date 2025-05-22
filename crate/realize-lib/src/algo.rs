@@ -10,11 +10,13 @@ use crate::model::service::{
 use futures::future;
 use futures::future::Either;
 use futures::stream::StreamExt as _;
-use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
+use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
 use std::cmp::min;
+use std::sync::Arc;
 use std::{collections::HashMap, path::Path};
 use tarpc::client::stub::Stub;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 const PARALLEL_FILE_COUNT: usize = 8;
 const HASH_FILE_CHUNK: u64 = 256 * 1024 * 1024; // 256M
@@ -151,14 +153,25 @@ where
     let total_files = src_files.len();
     let total_bytes = src_files.iter().map(|f| f.size).sum();
     progress.set_length(total_files, total_bytes);
+    let copy_sem = Arc::new(Semaphore::new(1));
     let results = futures::stream::iter(src_files.into_iter())
         .map(|file| {
             let mut file_progress = progress.for_file(&file.path, file.size);
             let dst_file = dst_map.get(&file.path);
             let dir_id = dir_id.clone();
+            let copy_sem = copy_sem.clone();
             async move {
-                let result =
-                    move_file(ctx, src, &file, dst, dst_file, &dir_id, &mut *file_progress).await;
+                let result = move_file(
+                    ctx,
+                    src,
+                    &file,
+                    dst,
+                    dst_file,
+                    &dir_id,
+                    copy_sem.clone(),
+                    &mut *file_progress,
+                )
+                .await;
                 match result {
                     Ok(_) => {
                         file_progress.success();
@@ -196,6 +209,7 @@ async fn move_file<T, U>(
     dst: &RealizeServiceClient<U>,
     dst_file: Option<&SyncedFile>,
     dir_id: &DirectoryId,
+    copy_sem: Arc<Semaphore>,
     progress: &mut dyn FileProgress,
 ) -> Result<(), MoveFileError>
 where
@@ -244,6 +258,7 @@ where
     // Chunked Transfer
     let mut offset: u64 = 0;
     let mut rsyncing = true;
+    let mut _copy_lock = None;
     progress.rsyncing();
     while offset < src_size {
         let mut end = offset + CHUNK_SIZE;
@@ -256,6 +271,9 @@ where
             if rsyncing {
                 progress.copying();
                 rsyncing = false;
+                if let Ok(lock) = copy_sem.acquire().await {
+                    _copy_lock = Some(lock);
+                }
             }
             // Send data
             log::debug!("{}:{:?} sending range {:?}", dir_id, path, range);
@@ -335,6 +353,7 @@ where
     }
 
     progress.verifying();
+    _copy_lock = None;
     let hash = match src_hash {
         Either::Left(hash) => hash.await?,
         Either::Right(hash) => hash,
@@ -402,8 +421,8 @@ mod tests {
     use super::*;
     use crate::model::service::DirectoryId;
     use crate::server::{self, DirectoryMap};
-    use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
     use sha2::Digest as _;
     use std::path::PathBuf;
