@@ -10,7 +10,7 @@ use realize_lib::algo::MoveFileError;
 use realize_lib::metrics;
 use realize_lib::model::service::DirectoryId;
 use realize_lib::transport::security::{self, PeerVerifier};
-use realize_lib::transport::tcp::{self, TcpRealizeServiceClient, lookup_addr};
+use realize_lib::transport::tcp::{self, HostPort, TcpRealizeServiceClient};
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use rustls::sign::SigningKey;
@@ -144,8 +144,11 @@ async fn execute(cli: &Cli, ctx: context::Context) -> anyhow::Result<()> {
         .with_context(|| format!("{}: Invalid peer file", cli.peers.display()))?;
 
     // Build src client
+    let src_hostport = HostPort::parse(&cli.src_addr)
+        .await
+        .with_context(|| format!("Failed to resolve --src-addr {}", cli.src_addr))?;
     let src_client = tcp::connect_client(
-        &lookup_addr(&cli.src_addr).await.context("--src-addr")?,
+        &src_hostport,
         Arc::clone(&verifier),
         Arc::clone(&privkey),
         tcp::ClientOptions::default(),
@@ -164,16 +167,23 @@ async fn execute(cli: &Cli, ctx: context::Context) -> anyhow::Result<()> {
     }
 
     // Build dst client
+    let dst_hostport = HostPort::parse(&cli.dst_addr)
+        .await
+        .with_context(|| format!("Failed to resolve --dst-addr {}", cli.dst_addr))?;
     let dst_client = {
-        let addr = lookup_addr(&cli.dst_addr).await.context("--dst-addr")?;
         let mut options = tcp::ClientOptions::default();
         if let Some(limit) = cli.throttle_up {
             log::info!("Throttling uploads: {}/s", HumanBytes(limit));
             options.limiter = Some(Limiter::<StandardClock>::new(limit as f64));
         }
-        tcp::connect_client(&addr, Arc::clone(&verifier), Arc::clone(&privkey), options)
-            .await
-            .with_context(|| format!("Connection to dst {addr} failed"))?
+        tcp::connect_client(
+            &dst_hostport,
+            Arc::clone(&verifier),
+            Arc::clone(&privkey),
+            options,
+        )
+        .await
+        .with_context(|| format!("Connection to dst {dst_hostport} failed"))?
     };
 
     METRIC_UP.inc();

@@ -54,55 +54,6 @@ the daemon. No need for the push feature anymore; everything push-related goes i
 7. Run "crate check" and "crate test" in the project dir. Fix any
    issues, including any warnings.
 
-## Addresses {#addr}
-
-Take addresses as string, extract the domain name and pass it to TLS.
-
-Create a HostPort struct in the crate realize-lib, in
-src/transport/tcp.rs that can be used as follows:
-
-```rust
- let hostport = HostPort::parse("localhost:1234").await?;
- assert_eq!(1234, hostport.port());
- assert_eq!("localhost", hostport.host());
- assert_eq!(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1234), hostport.addr());
-
- let hostport = HostPort::parse("example.com:8888").await?;
- assert_eq!(8888, hostport.port());
- assert_eq!("example.com", hostport.host());
-
- assert_eq!(HostPort::parse("myhost").await.is_err());
- assert_eq!(HostPort::parse("doesnotexist:1000").await.is_err());
-
- // Also supports IPV6 addresses made up of numbers and colons, here ::1 for IPV6 localhost.
- let hostport = HostPort::parse("[::1]:8000").await?;
- assert_eq!("::1", hostport.host());
- assert_eq!(8000, hostport.port());
-
- // A HostPort can be created from a SocketAddr, using HostPort::from(SocketAddr) (implements the trait From<SocketAddr>)
- assert_eq(HostPort::parse("127.0.0.1:8000").await?, HostPort::from(HostPort::parse("127.0.0.1:8000").await?.addr()))
-```
-
-HostPort defines Debug and Clone, Eq, and Hash. It has a nice Display
-representation that's "{host}:{port}".
-
-HostPort::parse() fails if it cannot resolve the DNS address. It uses
-tokio::net::lookup_host to resolve hostnames.
-
-### Task list
-
-1. Define HostPort in in the crate realize-lib, in src/transport/tcp.rs
-   and add unit tests
-
-   - write the code as described above
-   - run "cargo check" to make sure it builds, "cargo test --lib" to make sure the unit tests pass, fix any issues including any warnings, even the minor ones
-
-2. Update connect_client() and start_server() to take a HostPort instead of a SocktAddr or a ToSocketAddrs.
-   - update the code
-   - fix any tests that call the methods
-   - run "cargo check" to make sure it builds, "cargo test --lib" to make sure the unit tests pass, fix any issues including any warnings, even the minor ones
-
-
 ## Reduce visibility {#visibility}
 
 1. Turn all types marked "pub" in crate/realize-lib/src into

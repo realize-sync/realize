@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
 use futures::prelude::*;
@@ -39,28 +40,83 @@ use crate::server::DirectoryMap;
 
 use super::rate_limit::RateLimitedStream;
 
+use std::fmt;
+use std::net::IpAddr;
+
 pub type TcpRealizeServiceClient = RealizeServiceClient<TcpStub>;
 
-/// Lookup an address as a string.
-pub async fn lookup_addr(addr: &str) -> anyhow::Result<SocketAddr> {
-    tokio::net::lookup_host(addr)
-        .await?
-        .next()
-        .ok_or(anyhow::anyhow!("DNS lookup failed for {addr}"))
+/// HostPort represents a resolved host:port pair, with DNS resolution.
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub struct HostPort {
+    host: String,
+    port: u16,
+    addr: SocketAddr,
+}
+
+impl HostPort {
+    /// Parse a host:port string, resolve DNS, and return a HostPort.
+    pub async fn parse(s: &str) -> anyhow::Result<Self> {
+        // Handle [::1]:port for IPv6
+        let (host, port) = if let Some(idx) = s.rfind(':') {
+            let (host, port_str) = s.split_at(idx);
+            let port = port_str[1..]
+                .parse::<u16>()
+                .map_err(|_| anyhow::anyhow!("Invalid port in address: {s}"))?;
+            let host = if host.starts_with('[') && host.ends_with(']') {
+                &host[1..host.len() - 1]
+            } else {
+                host
+            };
+            (host.to_string(), port)
+        } else {
+            return Err(anyhow::anyhow!("Missing port in address: {s}"));
+        };
+        // DNS resolution
+        let mut addrs = tokio::net::lookup_host(s)
+            .await
+            .with_context(|| format!("DNS lookup failed for {s}"))?;
+        let addr = addrs
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("DNS lookup failed for {s}"))?;
+        Ok(HostPort { host, port, addr })
+    }
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
+impl fmt::Display for HostPort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.host, self.port)
+    }
+}
+
+impl From<SocketAddr> for HostPort {
+    fn from(addr: SocketAddr) -> Self {
+        let host = match addr.ip() {
+            IpAddr::V4(ip) => ip.to_string(),
+            IpAddr::V6(ip) => ip.to_string(),
+        };
+        let port = addr.port();
+        HostPort { host, port, addr }
+    }
 }
 
 /// Start the server, listening on the given address.
-pub async fn start_server<T>(
-    addr: T,
+pub async fn start_server(
+    hostport: &HostPort,
     dirs: DirectoryMap,
     verifier: Arc<PeerVerifier>,
     privkey: Arc<dyn SigningKey>,
-) -> anyhow::Result<(SocketAddr, AbortOnDrop<()>)>
-where
-    T: tokio::net::ToSocketAddrs,
-{
+) -> anyhow::Result<(SocketAddr, AbortOnDrop<()>)> {
     let acceptor = security::make_tls_acceptor(Arc::clone(&verifier), privkey)?;
-    let listener = TcpListener::bind(&addr).await?;
+    let listener = TcpListener::bind(hostport.addr()).await?;
     log::info!(
         "Listening for RPC connections on {:?}",
         listener
@@ -122,19 +178,19 @@ pub struct ClientOptions {
 
 /// Create a [RealizeServiceClient] connected to the given TCP address.
 pub async fn connect_client(
-    server_addr: &SocketAddr,
+    hostport: &HostPort,
     verifier: Arc<PeerVerifier>,
     privkey: Arc<dyn SigningKey>,
     options: ClientOptions,
 ) -> anyhow::Result<TcpRealizeServiceClient> {
     let connector = security::make_tls_connector(verifier, privkey)?;
-    let stub = TcpStub::new(server_addr, connector, options).await?;
+    let stub = TcpStub::new(hostport, connector, options).await?;
     Ok(RealizeServiceClient::from(stub))
 }
 
 #[derive(Clone)]
 struct TcpConnect {
-    server_addr: SocketAddr,
+    hostport: HostPort,
     connector: TlsConnector,
     options: ClientOptions,
     config: Arc<Mutex<Option<Config>>>,
@@ -147,12 +203,12 @@ impl Connect<tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceRe
         &self,
     ) -> anyhow::Result<tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>>
     {
-        let stream = TcpStream::connect(&self.server_addr).await?;
+        let stream = TcpStream::connect(self.hostport.addr()).await?;
         let domain = ServerName::try_from(
             self.options
                 .clone()
                 .domain
-                .unwrap_or_else(|| "localhost".to_string()),
+                .unwrap_or_else(|| self.hostport.host().to_string()),
         )?;
         let limiter = self
             .options
@@ -196,7 +252,7 @@ pub struct TcpStub {
 
 impl TcpStub {
     async fn new(
-        server_addr: &SocketAddr,
+        hostport: &HostPort,
         connector: TlsConnector,
         options: ClientOptions,
     ) -> anyhow::Result<Self> {
@@ -206,7 +262,7 @@ impl TcpStub {
 
         let config = Arc::new(Mutex::new(None));
         let connect = TcpConnect {
-            server_addr: *server_addr,
+            hostport: hostport.clone(),
             connector,
             options,
             config: Arc::clone(&config),
@@ -269,8 +325,13 @@ mod tests {
         let dirs = DirectoryMap::for_dir(&DirectoryId::from("testdir"), temp.path());
         let server_privkey =
             load_private_key(crate::transport::security::testing::server_private_key())?;
-        let (addr, server_handle) =
-            start_server("localhost:0", dirs, verifier, server_privkey).await?;
+        let (addr, server_handle) = start_server(
+            &HostPort::parse("127.0.0.1:0").await?,
+            dirs,
+            verifier,
+            server_privkey,
+        )
+        .await?;
 
         Ok((addr, server_handle, temp))
     }
@@ -315,7 +376,7 @@ mod tests {
         let client_privkey =
             load_private_key(crate::transport::security::testing::client_private_key())?;
         let client = connect_client(
-            &addr,
+            &HostPort::from(addr),
             verifier_both(),
             client_privkey,
             ClientOptions::default(),
@@ -339,7 +400,7 @@ mod tests {
         let client_privkey =
             load_private_key(crate::transport::security::testing::client_private_key())?;
         let client_result = connect_client(
-            &addr,
+            &HostPort::from(addr),
             Arc::clone(&verifier),
             client_privkey,
             ClientOptions::default(),
@@ -369,7 +430,7 @@ mod tests {
         let client_privkey =
             load_private_key(crate::transport::security::testing::client_private_key())?;
         let result = connect_client(
-            &addr,
+            &HostPort::from(addr),
             Arc::clone(&verifier),
             client_privkey,
             ClientOptions::default(),
@@ -391,7 +452,7 @@ mod tests {
         let server_privkey =
             load_private_key(crate::transport::security::testing::server_private_key())?;
         let (addr, server_handle) = start_server(
-            "localhost:0",
+            &HostPort::parse("127.0.0.1:0").await?,
             dirs.clone(),
             verifier.clone(),
             server_privkey,
@@ -400,7 +461,7 @@ mod tests {
         let client_privkey =
             load_private_key(crate::transport::security::testing::client_private_key())?;
         let client = connect_client(
-            &addr,
+            &HostPort::from(addr),
             verifier.clone(),
             client_privkey,
             ClientOptions::default(),
@@ -432,7 +493,7 @@ mod tests {
         let server_privkey =
             load_private_key(crate::transport::security::testing::server_private_key())?;
         let (addr, server_handle) = start_server(
-            "localhost:0",
+            &HostPort::parse("127.0.0.1:0").await?,
             dirs.clone(),
             verifier.clone(),
             server_privkey,
@@ -443,14 +504,14 @@ mod tests {
         let client_privkey2 =
             load_private_key(crate::transport::security::testing::client_private_key())?;
         let client1 = connect_client(
-            &addr,
+            &HostPort::from(addr),
             Arc::clone(&verifier),
             client_privkey1,
             ClientOptions::default(),
         )
         .await?;
         let client2 = connect_client(
-            &addr,
+            &HostPort::from(addr),
             Arc::clone(&verifier),
             client_privkey2,
             ClientOptions::default(),
@@ -487,7 +548,7 @@ mod tests {
         let client_privkey =
             load_private_key(crate::transport::security::testing::client_private_key())?;
         let client = connect_client(
-            &proxy_addr,
+            &HostPort::from(proxy_addr),
             verifier_both(),
             client_privkey,
             ClientOptions::default(),
@@ -527,7 +588,7 @@ mod tests {
         let client_privkey =
             load_private_key(crate::transport::security::testing::client_private_key())?;
         let client = connect_client(
-            &proxy_addr,
+            &HostPort::from(proxy_addr),
             verifier_both(),
             client_privkey,
             ClientOptions::default(),
@@ -617,5 +678,53 @@ mod tests {
         }));
 
         Ok((addr, handle))
+    }
+
+    #[tokio::test]
+    async fn test_parse_ipv4() {
+        let hp = HostPort::parse("127.0.0.1:8000").await.unwrap();
+        assert_eq!(hp.host(), "127.0.0.1");
+        assert_eq!(hp.port(), 8000);
+        assert_eq!(hp.addr().port(), 8000);
+    }
+
+    #[tokio::test]
+    async fn test_parse_ipv6() {
+        let hp = HostPort::parse("[::1]:8000").await.unwrap();
+        assert_eq!(hp.host(), "::1");
+        assert_eq!(hp.port(), 8000);
+        assert_eq!(hp.addr().port(), 8000);
+    }
+
+    #[tokio::test]
+    async fn test_parse_hostname() {
+        let hp = HostPort::parse("localhost:1234").await.unwrap();
+        assert_eq!(hp.host(), "localhost");
+        assert_eq!(hp.port(), 1234);
+        assert_eq!(hp.addr().port(), 1234);
+
+        let hp = HostPort::parse("www.google.com:1234").await.unwrap();
+        assert_eq!(hp.host(), "www.google.com");
+        assert_eq!(hp.port(), 1234);
+        assert_eq!(hp.addr().port(), 1234);
+    }
+
+    #[tokio::test]
+    async fn test_parse_invalid() {
+        assert!(HostPort::parse("myhost").await.is_err());
+        assert!(HostPort::parse("doesnotexist:1000").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_from_socketaddr() {
+        let hp1 = HostPort::parse("127.0.0.1:8000").await.unwrap();
+        let hp2 = HostPort::from(hp1.addr());
+        assert_eq!(hp1, hp2);
+    }
+
+    #[tokio::test]
+    async fn test_display() {
+        let hp = HostPort::parse("127.0.0.1:8000").await.unwrap();
+        assert_eq!(format!("{}", hp), "127.0.0.1:8000");
     }
 }

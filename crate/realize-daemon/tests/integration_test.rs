@@ -8,7 +8,7 @@ use predicates::prelude::*;
 use realize_lib::model::service::{DirectoryId, Options};
 use realize_lib::transport::security;
 use realize_lib::transport::security::PeerVerifier;
-use realize_lib::transport::tcp;
+use realize_lib::transport::tcp::{self, HostPort};
 use reqwest::Client;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::SubjectPublicKeyInfoDer;
@@ -103,7 +103,7 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
     let verifier = Arc::new(verifier);
 
     let client = tcp::connect_client(
-        &tcp::lookup_addr(&format!("127.0.0.1:{portstr}")).await?,
+        &HostPort::parse(&format!("127.0.0.1:{portstr}")).await?,
         verifier,
         crypto
             .key_provider

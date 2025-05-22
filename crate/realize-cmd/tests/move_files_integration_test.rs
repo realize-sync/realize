@@ -6,7 +6,7 @@ use hyper_util::rt::TokioIo;
 use realize_lib::model::service::DirectoryId;
 use realize_lib::server::{DirectoryMap, RealizeServer};
 use realize_lib::transport::security::{self, PeerVerifier};
-use realize_lib::transport::tcp;
+use realize_lib::transport::tcp::{self, HostPort};
 use realize_lib::utils::async_utils::AbortOnDrop;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
@@ -65,18 +65,18 @@ impl Fixture {
             .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_b_path.as_ref())?)?;
         let server_src = RealizeServer::for_dir(&"dir".into(), src_dir.path());
         let (src_addr3, server_handle_src) = tcp::start_server(
-            "127.0.0.1:0",
+            &HostPort::parse("127.0.0.1:0").await?,
             server_src.dirs.clone(),
             verifier.clone(),
-            privkey_a,
+            privkey_a.clone(),
         )
         .await?;
         let server_dst = RealizeServer::for_dir(&"dir".into(), dst_dir.path());
         let (dst_addr3, server_handle_dst) = tcp::start_server(
-            "127.0.0.1:0",
+            &HostPort::parse("127.0.0.1:0").await?,
             server_dst.dirs.clone(),
             verifier.clone(),
-            privkey_b,
+            privkey_b.clone(),
         )
         .await?;
 
@@ -503,16 +503,26 @@ async fn multiple_directory_ids() -> anyhow::Result<()> {
         realize_lib::server::Directory::new(&DirectoryId::from("dir1"), src_dir1.path()),
         realize_lib::server::Directory::new(&DirectoryId::from("dir2"), src_dir2.path()),
     ]);
-    let (src_addr, _src_handle) =
-        tcp::start_server("127.0.0.1:0", src_dirs, verifier.clone(), privkey_a).await?;
+    let (src_addr, _src_handle) = tcp::start_server(
+        &HostPort::parse("127.0.0.1:0").await?,
+        src_dirs,
+        verifier.clone(),
+        privkey_a,
+    )
+    .await?;
 
     // Setup dst server with two directories
     let dst_dirs = DirectoryMap::new([
         realize_lib::server::Directory::new(&DirectoryId::from("dir1"), dst_dir1.path()),
         realize_lib::server::Directory::new(&DirectoryId::from("dir2"), dst_dir2.path()),
     ]);
-    let (dst_addr, _dst_handle) =
-        tcp::start_server("127.0.0.1:0", dst_dirs, verifier, privkey_b).await?;
+    let (dst_addr, _dst_handle) = tcp::start_server(
+        &HostPort::parse("127.0.0.1:0").await?,
+        dst_dirs,
+        verifier,
+        privkey_b,
+    )
+    .await?;
 
     // Run realize with two directory ids
     let output = tokio::process::Command::new(command_path())

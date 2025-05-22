@@ -7,7 +7,7 @@ use prometheus::{IntCounter, register_int_counter};
 use realize_lib::metrics;
 use realize_lib::server::{Directory, DirectoryMap};
 use realize_lib::transport::security::{self, PeerVerifier};
-use realize_lib::transport::tcp;
+use realize_lib::transport::tcp::{self, HostPort};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use rustls::sign::SigningKey;
@@ -109,9 +109,12 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
             .with_context(|| format!("Failed to export metrics on {addr}"))?;
     }
 
-    let (addr, handle) = tcp::start_server(&cli.address, dirs, verifier, privkey)
+    let hostport = HostPort::parse(&cli.address)
         .await
-        .with_context(|| format!("Server failed to start on {}", cli.address))?;
+        .with_context(|| format!("Failed to parse --address {}", cli.address))?;
+    let (addr, handle) = tcp::start_server(&hostport, dirs, verifier, privkey)
+        .await
+        .with_context(|| format!("Failed to start server on {}", hostport))?;
 
     METRIC_UP.inc();
     println!("Listening on {addr}");
