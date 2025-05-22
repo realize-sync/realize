@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use assert_fs::prelude::*;
 use assert_fs::TempDir;
-use assert_unordered::assert_eq_unordered;
 use predicates::prelude::*;
 use realize_lib::model::service::{DirectoryId, Options};
 use realize_lib::transport::security;
@@ -14,7 +13,6 @@ use reqwest::Client;
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::SubjectPublicKeyInfoDer;
-use std::env;
 use tarpc::context;
 use tokio::io::AsyncBufReadExt as _;
 use tokio::process::Command;
