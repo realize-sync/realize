@@ -103,6 +103,18 @@ tokio::net::lookup_host to resolve hostnames.
    - run "cargo check" to make sure it builds, "cargo test --lib" to make sure the unit tests pass, fix any issues including any warnings, even the minor ones
 
 
+## Reduce visibility {#visibility}
+
+1. Turn all types marked "pub" in crate/realize-lib/src into
+   "pub(crate)".
+
+2. Run "cargo check" and make "pub" again everything that is needed to
+   compile the other crates.
+
+3. Run "cargo check --tests" and list everything that is needed for
+   the tests to compile, to decide on a case-by-case basis if it
+   should be exposed.
+
 ## Detect access right errors early in daemon {#daemonaccess}
 
 At startup, the daemon in realized.rs might try to write and delete a
