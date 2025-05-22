@@ -8,7 +8,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Apply the given bps limit on writes to this stream.
-pub struct RateLimitedStream<S, C = StandardClock>
+pub(crate) struct RateLimitedStream<S, C = StandardClock>
 where
     C: Clock,
 {
@@ -21,7 +21,7 @@ impl<S, C> RateLimitedStream<S, C>
 where
     C: Clock,
 {
-    pub fn new(inner: S, limiter: Limiter<C>) -> Self {
+    pub(crate) fn new(inner: S, limiter: Limiter<C>) -> Self {
         Self {
             inner,
             limiter,

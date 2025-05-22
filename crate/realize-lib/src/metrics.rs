@@ -17,25 +17,25 @@ use tokio::net::TcpListener;
 use crate::model::service::{RealizeError, RealizeServiceRequest, RealizeServiceResponse};
 
 lazy_static::lazy_static! {
-    pub static ref METRIC_SERVER_DATA_IN_BYTES: HistogramVec =
+    pub(crate) static ref METRIC_SERVER_DATA_IN_BYTES: HistogramVec =
         register_histogram_vec!(
             "realize_server_data_in_bytes",
             "Size of the file data received by the server, embedded in RPC calls",
             &["method", "status"],
             bytes_buckets()).unwrap();
-    pub static ref METRIC_SERVER_DATA_RANGE_BYTES: HistogramVec =
+    pub(crate) static ref METRIC_SERVER_DATA_RANGE_BYTES: HistogramVec =
         register_histogram_vec!(
             "realize_server_data_range_bytes",
             "Size of the data range of RPC calls. Always >= data in or out.",
             &["method", "status"],
             bytes_buckets()).unwrap();
-    pub static ref METRIC_SERVER_DATA_OUT_BYTES: HistogramVec =
+    pub(crate) static ref METRIC_SERVER_DATA_OUT_BYTES: HistogramVec =
         register_histogram_vec!(
             "realize_server_data_out_bytes",
             "Size of the file data sent by the server, embedded in RPC calls",
             &["method"],
             bytes_buckets()).unwrap();
-    pub static ref METRIC_SERVER_DURATION_SECONDS: HistogramVec =
+    pub(crate) static ref METRIC_SERVER_DURATION_SECONDS: HistogramVec =
         register_histogram_vec!(
             "realize_server_duration_seconds",
             "RPC method duration, in seconds",
@@ -43,31 +43,31 @@ lazy_static::lazy_static! {
             // Default buckets are designed for just this use case
             prometheus::DEFAULT_BUCKETS.to_vec()
             ).unwrap();
-    pub static ref METRIC_SERVER_CALL_COUNT: IntCounterVec =
+    pub(crate) static ref METRIC_SERVER_CALL_COUNT: IntCounterVec =
         register_int_counter_vec!(
             "realize_server_call_count",
             "RPC call count, grouped by status and errors",
             &["method", "status", "error"]).unwrap();
 
-    pub static ref METRIC_CLIENT_DATA_IN_BYTES: HistogramVec =
+    pub(crate) static ref METRIC_CLIENT_DATA_IN_BYTES: HistogramVec =
         register_histogram_vec!(
             "realize_client_data_in_bytes",
             "Size of the file data received by the client, embedded in RPC calls",
             &["method", "status"],
             bytes_buckets()).unwrap();
-    pub static ref METRIC_CLIENT_DATA_RANGE_BYTES: HistogramVec =
+    pub(crate) static ref METRIC_CLIENT_DATA_RANGE_BYTES: HistogramVec =
         register_histogram_vec!(
             "realize_client_data_range_bytes",
             "Size of the data range of RPC calls. Always >= data in or out.",
             &["method", "status"],
             bytes_buckets()).unwrap();
-    pub static ref METRIC_CLIENT_DATA_OUT_BYTES: HistogramVec =
+    pub(crate) static ref METRIC_CLIENT_DATA_OUT_BYTES: HistogramVec =
         register_histogram_vec!(
             "realize_client_data_out_bytes",
             "Size of the file data sent by the client, embedded in RPC calls",
             &["method"],
             bytes_buckets()).unwrap();
-    pub static ref METRIC_CLIENT_DURATION_SECONDS: HistogramVec =
+    pub(crate) static ref METRIC_CLIENT_DURATION_SECONDS: HistogramVec =
         register_histogram_vec!(
             "realize_client_duration_seconds",
             "RPC method duration, in seconds",
@@ -75,13 +75,13 @@ lazy_static::lazy_static! {
             // Default buckets are designed for just this use case
             prometheus::DEFAULT_BUCKETS.to_vec()
             ).unwrap();
-    pub static ref METRIC_CLIENT_CALL_COUNT: IntCounterVec =
+    pub(crate) static ref METRIC_CLIENT_CALL_COUNT: IntCounterVec =
         register_int_counter_vec!(
             "realize_client_call_count",
             "RPC call count, grouped by status and errors",
             &["method", "status", "error"]).unwrap();
 
-    pub static ref METRIC_SERVER_IN_FLIGHT_REQUEST_COUNT: IntGauge =
+    pub(crate) static ref METRIC_SERVER_IN_FLIGHT_REQUEST_COUNT: IntGauge =
     register_int_gauge!(
         "realize_server_in_flight_request_count",
         "Number of RPCs currently in-flight on the server").unwrap();
@@ -272,7 +272,7 @@ async fn serve_metrics(
 
 /// [RealizeService] Stub that fills in client-side metrics.
 #[derive(Clone)]
-pub struct MetricsRealizeClient<T>
+pub(crate) struct MetricsRealizeClient<T>
 where
     T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse> + Clone,
 {
@@ -282,7 +282,7 @@ where
 impl<T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse> + Clone>
     MetricsRealizeClient<T>
 {
-    pub fn new(stub: T) -> Self {
+    pub(crate) fn new(stub: T) -> Self {
         Self { inner: stub }
     }
 }
@@ -337,7 +337,7 @@ impl<T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse> + Clone
 }
 
 /// Decorate the given future with a counter for in-flight requests.
-pub async fn track_in_flight_request(fut: impl Future<Output = ()>) {
+pub(crate) async fn track_in_flight_request(fut: impl Future<Output = ()>) {
     METRIC_SERVER_IN_FLIGHT_REQUEST_COUNT.inc();
     fut.await;
     METRIC_SERVER_IN_FLIGHT_REQUEST_COUNT.dec();
@@ -345,14 +345,14 @@ pub async fn track_in_flight_request(fut: impl Future<Output = ()>) {
 
 /// [RealizeService] serve function that fills in server-side metrics.
 #[derive(Clone)]
-pub struct MetricsRealizeServer<T> {
+pub(crate) struct MetricsRealizeServer<T> {
     inner: T,
 }
 impl<T> MetricsRealizeServer<T>
 where
     T: Serve<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
 {
-    pub fn new(inner: T) -> Self {
+    pub(crate) fn new(inner: T) -> Self {
         Self { inner }
     }
 }

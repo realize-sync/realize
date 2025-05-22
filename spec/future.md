@@ -3,18 +3,6 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
-## Reduce visibility {#visibility}
-
-1. Turn all types marked "pub" in crate/realize-lib/src into
-   "pub(crate)".
-
-2. Run "cargo check" and make "pub" again everything that is needed to
-   compile the other crates.
-
-3. Run "cargo check --tests" and list everything that is needed for
-   the tests to compile, to decide on a case-by-case basis if it
-   should be exposed.
-
 ## Detect access right errors early in daemon {#daemonaccess}
 
 At startup, the daemon in realized.rs might try to write and delete a

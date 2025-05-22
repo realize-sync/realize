@@ -93,7 +93,7 @@ impl Progress for NoProgress {
     }
 }
 
-pub struct NoFileProgress;
+pub(crate) struct NoFileProgress;
 
 impl FileProgress for NoFileProgress {
     fn verifying(&mut self) {}
@@ -401,7 +401,7 @@ where
 mod tests {
     use super::*;
     use crate::model::service::DirectoryId;
-    use crate::server::RealizeServer;
+    use crate::server::{self, DirectoryMap};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
@@ -490,8 +490,10 @@ mod tests {
             &DirectoryId::from("testdir"),
             dst_temp.path(),
         ));
-        let src_server = RealizeServer::for_dir(src_dir.id(), src_dir.path()).as_inprocess_client();
-        let dst_server = RealizeServer::for_dir(dst_dir.id(), dst_dir.path()).as_inprocess_client();
+        let src_server =
+            server::create_inprocess_client(DirectoryMap::for_dir(src_dir.id(), src_dir.path()));
+        let dst_server =
+            server::create_inprocess_client(DirectoryMap::for_dir(dst_dir.id(), dst_dir.path()));
         let log = Arc::new(Mutex::new(Vec::new()));
         let mut progress = MockProgress {
             log: Arc::clone(&log),
@@ -526,7 +528,8 @@ mod tests {
             &DirectoryId::from("testdir"),
             src_temp.path(),
         ));
-        let src_server = RealizeServer::for_dir(src_dir.id(), src_dir.path()).as_inprocess_client();
+        let src_server =
+            server::create_inprocess_client(DirectoryMap::for_dir(src_dir.id(), src_dir.path()));
 
         // Setup destination directory (empty)
         let dst_temp = TempDir::new()?;
@@ -534,7 +537,8 @@ mod tests {
             &DirectoryId::from("testdir"),
             dst_temp.path(),
         ));
-        let dst_server = RealizeServer::for_dir(dst_dir.id(), dst_dir.path()).as_inprocess_client();
+        let dst_server =
+            server::create_inprocess_client(DirectoryMap::for_dir(dst_dir.id(), dst_dir.path()));
 
         // Pre-populate destination with a file of the same length as source (should trigger rsync optimization)
         src_temp.child("same_length").write_str("hello")?;
@@ -594,14 +598,16 @@ mod tests {
             &DirectoryId::from("testdir"),
             src_temp.path(),
         ));
-        let src_server = RealizeServer::for_dir(src_dir.id(), src_dir.path()).as_inprocess_client();
+        let src_server =
+            server::create_inprocess_client(DirectoryMap::for_dir(src_dir.id(), src_dir.path()));
 
         let dst_temp = TempDir::new()?;
         let dst_dir = Arc::new(crate::server::Directory::new(
             &DirectoryId::from("testdir"),
             dst_temp.path(),
         ));
-        let dst_server = RealizeServer::for_dir(dst_dir.id(), dst_dir.path()).as_inprocess_client();
+        let dst_server =
+            server::create_inprocess_client(DirectoryMap::for_dir(dst_dir.id(), dst_dir.path()));
 
         // Case 1: source > CHUNK_SIZE, destination empty
         src_temp.child("large_empty").write_binary(&chunk)?;
@@ -662,13 +668,15 @@ mod tests {
             &DirectoryId::from("testdir"),
             src_temp.path(),
         ));
-        let src_server = RealizeServer::for_dir(src_dir.id(), src_dir.path()).as_inprocess_client();
+        let src_server =
+            server::create_inprocess_client(DirectoryMap::for_dir(src_dir.id(), src_dir.path()));
         let dst_temp = TempDir::new()?;
         let dst_dir = Arc::new(crate::server::Directory::new(
             &DirectoryId::from("testdir"),
             dst_temp.path(),
         ));
-        let dst_server = RealizeServer::for_dir(dst_dir.id(), dst_dir.path()).as_inprocess_client();
+        let dst_server =
+            server::create_inprocess_client(DirectoryMap::for_dir(dst_dir.id(), dst_dir.path()));
         // Good file
         src_temp.child("good").write_str("ok")?;
         // Unreadable file
@@ -705,8 +713,10 @@ mod tests {
             &DirectoryId::from("testdir"),
             dst_temp.path(),
         ));
-        let src_server = RealizeServer::for_dir(src_dir.id(), src_dir.path()).as_inprocess_client();
-        let dst_server = RealizeServer::for_dir(dst_dir.id(), dst_dir.path()).as_inprocess_client();
+        let src_server =
+            server::create_inprocess_client(DirectoryMap::for_dir(src_dir.id(), src_dir.path()));
+        let dst_server =
+            server::create_inprocess_client(DirectoryMap::for_dir(dst_dir.id(), dst_dir.path()));
         // Create a final file and a partial file in src
         src_temp.child("final.txt").write_str("finaldata")?;
         src_temp
@@ -745,7 +755,7 @@ mod tests {
         file.write_binary(content)?;
 
         let dir_id = DirectoryId::from("dir");
-        let server = RealizeServer::for_dir(&dir_id, temp.path()).as_inprocess_client();
+        let server = server::create_inprocess_client(DirectoryMap::for_dir(&dir_id, temp.path()));
         let hashvec = hash_file(
             tarpc::context::current(),
             &server,
@@ -771,7 +781,7 @@ mod tests {
         file.write_binary(content)?;
 
         let dir_id = DirectoryId::from("dir");
-        let server = RealizeServer::for_dir(&dir_id, temp.path()).as_inprocess_client();
+        let server = server::create_inprocess_client(DirectoryMap::for_dir(&dir_id, temp.path()));
         let hashvec = hash_file(
             tarpc::context::current(),
             &server,
@@ -807,7 +817,7 @@ mod tests {
         file.write_binary(content)?;
 
         let dir_id = DirectoryId::from("dir");
-        let server = RealizeServer::for_dir(&dir_id, temp.path()).as_inprocess_client();
+        let server = server::create_inprocess_client(DirectoryMap::for_dir(&dir_id, temp.path()));
         let hashvec = hash_file(
             tarpc::context::current(),
             &server,
@@ -859,7 +869,7 @@ mod tests {
 }
 
 /// Hash file in chunks and return the result.
-pub async fn hash_file<T>(
+pub(crate) async fn hash_file<T>(
     ctx: tarpc::context::Context,
     client: &RealizeServiceClient<T>,
     dir_id: &DirectoryId,

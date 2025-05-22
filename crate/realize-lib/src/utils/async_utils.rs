@@ -12,13 +12,6 @@ impl<T> AbortOnDrop<T> {
         }
     }
 
-    /// Take the original join handle.
-    pub fn as_handle(mut self) -> JoinHandle<T> {
-        // The handle should be there, because it's only removed by
-        // drop.
-        self.handle.take().expect("missing handle")
-    }
-
     /// Abort right now.
     pub fn abort(self) {
         self.as_handle().abort();
@@ -27,6 +20,13 @@ impl<T> AbortOnDrop<T> {
     /// Wait for the task to finish.
     pub async fn join(self) -> Result<T, JoinError> {
         self.as_handle().await
+    }
+
+    /// Take the original join handle.
+    fn as_handle(mut self) -> JoinHandle<T> {
+        // The handle should be there, because it's only removed by
+        // drop.
+        self.handle.take().expect("missing handle")
     }
 }
 impl<T> Drop for AbortOnDrop<T> {

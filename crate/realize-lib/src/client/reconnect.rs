@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 const MAX_RETRY_COUNT: u32 = 1;
 
 #[allow(async_fn_in_trait)] // TODO: fix
-pub trait Connect<T>: Clone {
+pub(crate) trait Connect<T>: Clone {
     async fn run(&self) -> anyhow::Result<T>;
 }
 
@@ -25,7 +25,7 @@ impl<T, F: (AsyncFn() -> anyhow::Result<T>) + Clone> Connect<T> for F {
 }
 
 #[derive(Clone)]
-pub struct Reconnect<T, C: Connect<T>, S> {
+pub(crate) struct Reconnect<T, C: Connect<T>, S> {
     inner: Arc<RwLock<Reconnectable<T>>>,
     connect: C,
     strategy: S,
@@ -60,7 +60,7 @@ where
     C: Connect<T>,
     S: Iterator<Item = std::time::Duration> + Clone,
 {
-    pub async fn new(
+    pub(crate) async fn new(
         strategy: S,
         connect: C,
         short_deadline: Option<Duration>,
@@ -458,7 +458,7 @@ mod tests {
     }
 
     #[derive(Clone)]
-    pub struct DeadlineStub {
+    pub(crate) struct DeadlineStub {
         counter: Arc<AtomicU32>,
         fail: HashSet<u32>,
     }

@@ -1,5 +1,5 @@
 #[cfg(test)]
-pub mod testing;
+pub(crate) mod testing;
 
 use base64::Engine as _;
 use rustls::client::Resumption;
@@ -18,7 +18,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 pub use rustls::crypto::aws_lc_rs::default_provider;
 
 /// Create a TlsAcceptor (server-side) for the given peers and private key.
-pub fn make_tls_acceptor(
+pub(crate) fn make_tls_acceptor(
     verifier: Arc<PeerVerifier>,
     privkey: Arc<dyn SigningKey>,
 ) -> Result<TlsAcceptor, anyhow::Error> {
@@ -30,7 +30,7 @@ pub fn make_tls_acceptor(
 }
 
 /// Create af TlsConnector (client-side) for the given peer and private key.
-pub fn make_tls_connector(
+pub(crate) fn make_tls_connector(
     verifier: Arc<PeerVerifier>,
     privkey: Arc<dyn SigningKey>,
 ) -> Result<TlsConnector, anyhow::Error> {
@@ -62,9 +62,7 @@ impl PeerVerifier {
             algos: crypto.signature_verification_algorithms,
         }
     }
-}
 
-impl PeerVerifier {
     /// Accept connections to the peer with the given public key.
     ///
     /// The SPKI must be the public part of a ED25519 key.
@@ -93,7 +91,7 @@ impl PeerVerifier {
     }
 
     /// Return the ID of the stream's peer.
-    pub fn connection_peer_id<T>(
+    pub(crate) fn connection_peer_id<T>(
         &self,
         stream: &tokio_rustls::server::TlsStream<T>,
     ) -> Option<&str> {
@@ -460,7 +458,7 @@ mod tests {
     async fn test_connect_1(acceptor: TlsAcceptor, connector: TlsConnector) -> anyhow::Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
-        let server: AbortOnDrop<anyhow::Result<()>> = AbortOnDrop::new(tokio::spawn(async move {
+        let handle: AbortOnDrop<anyhow::Result<()>> = AbortOnDrop::new(tokio::spawn(async move {
             let (tcp, _) = listener.accept().await?;
 
             let mut tls = acceptor.accept(tcp).await?;
@@ -477,7 +475,7 @@ mod tests {
         tls.read_exact(&mut buf).await?;
         assert_eq!(&buf, b"foobar");
 
-        server.as_handle().await??;
+        handle.join().await??;
         Ok(())
     }
 

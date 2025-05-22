@@ -12,8 +12,7 @@ use realize_lib::algo::METRIC_WRITE_BYTES;
 use realize_lib::algo::NoProgress;
 use realize_lib::algo::move_files;
 use realize_lib::model::service::{DirectoryId, Options};
-use realize_lib::server::InProcessRealizeServiceClient;
-use realize_lib::server::RealizeServer;
+use realize_lib::server::{self, DirectoryMap, InProcessRealizeServiceClient};
 use std::sync::Arc;
 
 // Metric tests are kept in their own binary to avoid other test
@@ -163,8 +162,8 @@ async fn move_files_metrics() -> anyhow::Result<()> {
     ));
     let (success, error, _interrupted) = move_files(
         tarpc::context::current(),
-        &RealizeServer::for_dir(src_dir.id(), src_dir.path()).as_inprocess_client(),
-        &RealizeServer::for_dir(dst_dir.id(), dst_dir.path()).as_inprocess_client(),
+        &server::create_inprocess_client(DirectoryMap::for_dir(src_dir.id(), src_dir.path())),
+        &server::create_inprocess_client(DirectoryMap::for_dir(dst_dir.id(), dst_dir.path())),
         DirectoryId::from("testdir"),
         &mut NoProgress,
     )
@@ -193,7 +192,7 @@ async fn move_files_metrics() -> anyhow::Result<()> {
 fn setup_inprocess_client() -> (TempDir, DirectoryId, InProcessRealizeServiceClient) {
     let temp = TempDir::new().unwrap();
     let dir_id = DirectoryId::from("testdir");
-    let client = RealizeServer::for_dir(&dir_id, temp.path()).as_inprocess_client();
+    let client = server::create_inprocess_client(DirectoryMap::for_dir(&dir_id, temp.path()));
 
     (temp, dir_id, client)
 }

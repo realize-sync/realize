@@ -22,6 +22,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tarpc::client::RpcError;
+use tarpc::client::stub::Stub;
+use tarpc::context;
 use tarpc::server::Channel;
 use walkdir::WalkDir;
 
@@ -29,9 +32,7 @@ use walkdir::WalkDir;
 const RSYNC_BLOCK_SIZE: usize = 4096;
 
 /// Type shortcut for client type.
-pub type InProcessRealizeServiceClient = RealizeServiceClient<
-    MetricsRealizeClient<tarpc::client::Channel<RealizeServiceRequest, RealizeServiceResponse>>,
->;
+pub type InProcessRealizeServiceClient = RealizeServiceClient<InProcessStub>;
 
 #[derive(Clone)]
 pub struct DirectoryMap {
@@ -64,29 +65,48 @@ impl DirectoryMap {
     }
 }
 
+/// Creates a in-process client that works on the given directories.
+pub fn create_inprocess_client(dirs: DirectoryMap) -> InProcessRealizeServiceClient {
+    RealizeServer::new(dirs).as_inprocess_client()
+}
+
+pub struct InProcessStub {
+    inner:
+        MetricsRealizeClient<tarpc::client::Channel<RealizeServiceRequest, RealizeServiceResponse>>,
+}
+
+impl Stub for InProcessStub {
+    type Req = RealizeServiceRequest;
+    type Resp = RealizeServiceResponse;
+
+    async fn call(
+        &self,
+        ctx: context::Context,
+        request: RealizeServiceRequest,
+    ) -> std::result::Result<RealizeServiceResponse, RpcError> {
+        self.inner.call(ctx, request).await
+    }
+}
+
 #[derive(Clone)]
-pub struct RealizeServer {
-    pub dirs: DirectoryMap,
-    pub limiter: Option<Limiter<StandardClock>>,
+pub(crate) struct RealizeServer {
+    pub(crate) dirs: DirectoryMap,
+    pub(crate) limiter: Option<Limiter<StandardClock>>,
 }
 
 impl RealizeServer {
-    pub fn new(dirs: DirectoryMap) -> Self {
+    pub(crate) fn new(dirs: DirectoryMap) -> Self {
         Self {
             dirs,
             limiter: None,
         }
     }
 
-    pub fn new_limited(dirs: DirectoryMap, limiter: Limiter<StandardClock>) -> Self {
+    pub(crate) fn new_limited(dirs: DirectoryMap, limiter: Limiter<StandardClock>) -> Self {
         Self {
             dirs,
             limiter: Some(limiter),
         }
-    }
-
-    pub fn for_dir(id: &DirectoryId, path: &Path) -> Self {
-        RealizeServer::new(DirectoryMap::for_dir(id, path))
     }
 
     fn find_directory(&self, dir_id: &DirectoryId) -> Result<&Arc<Directory>> {
@@ -96,7 +116,7 @@ impl RealizeServer {
     }
 
     /// Create an in-process RealizeServiceClient for this server instance.
-    pub fn as_inprocess_client(self) -> InProcessRealizeServiceClient {
+    pub(crate) fn as_inprocess_client(self) -> InProcessRealizeServiceClient {
         let (client_transport, server_transport) = tarpc::transport::channel::unbounded();
         let server = tarpc::server::BaseChannel::with_defaults(server_transport);
         tokio::spawn(
@@ -107,8 +127,11 @@ impl RealizeServer {
                 }),
         );
         let client = tarpc::client::new(tarpc::client::Config::default(), client_transport).spawn();
+        let stub = InProcessStub {
+            inner: MetricsRealizeClient::new(client),
+        };
 
-        RealizeServiceClient::from(MetricsRealizeClient::new(client))
+        RealizeServiceClient::from(stub)
     }
 }
 
@@ -601,7 +624,11 @@ mod tests {
         let temp = TempDir::new()?;
         let dir = Arc::new(Directory::new(&DirectoryId::from("testdir"), temp.path()));
 
-        Ok((RealizeServer::for_dir(dir.id(), dir.path()), temp, dir))
+        Ok((
+            RealizeServer::new(DirectoryMap::for_dir(dir.id(), dir.path())),
+            temp,
+            dir,
+        ))
     }
 
     #[test]
@@ -1113,9 +1140,10 @@ mod tests {
     #[tokio::test]
     async fn tarpc_rpc_inprocess() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        let server_impl = RealizeServer::for_dir(&DirectoryId::from("testdir"), temp.path());
-        let client = server_impl.as_inprocess_client();
-
+        let client = create_inprocess_client(DirectoryMap::for_dir(
+            &DirectoryId::from("testdir"),
+            temp.path(),
+        ));
         let list = client
             .list(
                 tarpc::context::current(),
@@ -1458,10 +1486,10 @@ mod tests {
 
     #[tokio::test]
     async fn configure_noop_returns_none() {
-        let server = RealizeServer::for_dir(
+        let server = RealizeServer::new(DirectoryMap::for_dir(
             &DirectoryId::from("testdir"),
             &PathBuf::from("/tmp/testdir"),
-        );
+        ));
         let returned = server
             .clone()
             .configure(

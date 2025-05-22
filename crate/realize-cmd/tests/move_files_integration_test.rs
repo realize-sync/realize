@@ -4,7 +4,7 @@ use assert_fs::prelude::*;
 use assert_unordered::assert_eq_unordered;
 use hyper_util::rt::TokioIo;
 use realize_lib::model::service::DirectoryId;
-use realize_lib::server::{DirectoryMap, RealizeServer};
+use realize_lib::server::DirectoryMap;
 use realize_lib::transport::security::{self, PeerVerifier};
 use realize_lib::transport::tcp::{self, HostPort};
 use realize_lib::utils::async_utils::AbortOnDrop;
@@ -63,18 +63,16 @@ impl Fixture {
         let privkey_b = crypto
             .key_provider
             .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_b_path.as_ref())?)?;
-        let server_src = RealizeServer::for_dir(&"dir".into(), src_dir.path());
         let (src_addr3, server_handle_src) = tcp::start_server(
             &HostPort::parse("127.0.0.1:0").await?,
-            server_src.dirs.clone(),
+            DirectoryMap::for_dir(&"dir".into(), src_dir.path()),
             verifier.clone(),
             privkey_a.clone(),
         )
         .await?;
-        let server_dst = RealizeServer::for_dir(&"dir".into(), dst_dir.path());
         let (dst_addr3, server_handle_dst) = tcp::start_server(
             &HostPort::parse("127.0.0.1:0").await?,
-            server_dst.dirs.clone(),
+            DirectoryMap::for_dir(&"dir".into(), dst_dir.path()),
             verifier.clone(),
             privkey_b.clone(),
         )

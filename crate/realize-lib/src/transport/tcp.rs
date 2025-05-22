@@ -451,7 +451,7 @@ mod tests {
         let verifier = verifier_both();
         let server_privkey =
             load_private_key(crate::transport::security::testing::server_private_key())?;
-        let (addr, server_handle) = start_server(
+        let (addr, _handle) = start_server(
             &HostPort::parse("127.0.0.1:0").await?,
             dirs.clone(),
             verifier.clone(),
@@ -481,7 +481,6 @@ mod tests {
             .configure(context::current(), Config { write_limit: None })
             .await?;
         assert_eq!(config.unwrap().write_limit, Some(limit));
-        server_handle.abort();
         Ok(())
     }
 
@@ -492,7 +491,7 @@ mod tests {
         let verifier = verifier_both();
         let server_privkey =
             load_private_key(crate::transport::security::testing::server_private_key())?;
-        let (addr, server_handle) = start_server(
+        let (addr, _handle) = start_server(
             &HostPort::parse("127.0.0.1:0").await?,
             dirs.clone(),
             verifier.clone(),
@@ -531,7 +530,6 @@ mod tests {
             .configure(context::current(), Config { write_limit: None })
             .await?;
         assert_eq!(config2.unwrap().write_limit, None);
-        server_handle.abort();
         Ok(())
     }
 
