@@ -2,6 +2,9 @@ use assert_fs::fixture::ChildPath;
 use assert_fs::prelude::*;
 use assert_fs::TempDir;
 use assert_unordered::assert_eq_unordered;
+use hyper;
+use hyper_util;
+use hyper_util::rt::TokioIo;
 use realize_lib::model::service::DirectoryId;
 use realize_lib::server::{DirectoryMap, RealizeServer};
 use realize_lib::transport::security::{self, PeerVerifier};
@@ -13,6 +16,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Output;
+use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
 
@@ -323,7 +327,6 @@ async fn max_duration_timeout() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-#[cfg(feature = "push")]
 async fn realize_metrics_export() -> anyhow::Result<()> {
     use reqwest::Client;
     use tokio::io::AsyncBufReadExt as _;
@@ -338,7 +341,8 @@ async fn realize_metrics_export() -> anyhow::Result<()> {
 
     // We want to have time to check the metrics. Make sure it'll
     // hang by giving it an address that won't ever answer.
-    fixture
+    let realize_metrics_addr = metrics_addr.clone();
+    let mut child = fixture
         .command()
         .arg("--metrics-addr")
         .arg(&realize_metrics_addr)
@@ -387,9 +391,8 @@ async fn realize_metrics_export() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-#[cfg(feature = "push")]
 async fn realize_metrics_pushgateway() -> anyhow::Result<()> {
-    use realize::utils::async_utils::AbortOnDrop;
+    use realize_lib::utils::async_utils::AbortOnDrop;
 
     // A fake pushgateway that expect one specific request and then
     // dies.
@@ -398,13 +401,13 @@ async fn realize_metrics_pushgateway() -> anyhow::Result<()> {
     let pushgw_handle: AbortOnDrop<anyhow::Result<()>> =
         AbortOnDrop::new(tokio::spawn(async move {
             let (stream, _) = pushgw_listener.accept().await?;
-            let io = hyper_rt::TokioIo::new(stream);
+            let io = TokioIo::new(stream);
             hyper::server::conn::http1::Builder::new()
                 .serve_connection(
                     io,
                     hyper::service::service_fn(async move |req| {
                         assert_eq!(
-                            "PUT /metrics/job/testjob".to_string(),
+                            "PUT /metrics/job/dir",
                             format!("{} {}", req.method(), req.uri())
                         );
                         Ok::<hyper::Response<String>, anyhow::Error>(

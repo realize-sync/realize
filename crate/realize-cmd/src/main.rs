@@ -21,6 +21,7 @@ use std::time::Instant;
 use tarpc::client::RpcError;
 use tarpc::context;
 use humantime;
+mod metrics_push;
 
 lazy_static::lazy_static! {
     static ref METRIC_UP: IntCounter =
@@ -66,7 +67,6 @@ struct Cli {
     metrics_addr: Option<String>,
 
     /// Address of prometheus pushgateway (optional)
-    #[cfg(feature = "push")]
     #[arg(long)]
     metrics_pushgateway: Option<String>,
 
@@ -115,10 +115,9 @@ async fn main() {
         print_error(&format!("{err:#}"));
         status = 1;
     };
-    #[cfg(feature = "push")]
     if let Some(pushgw) = &cli.metrics_pushgateway {
         if let Err(err) =
-            metrics::push_metrics(pushgw, &cli.metrics_job, cli.metrics_instance.as_deref()).await
+            metrics_push::push_metrics(pushgw, &cli.metrics_job, cli.metrics_instance.as_deref()).await
         {
             print_warning(&format!("Failed to push metrics to {pushgw}: {err}"));
             if status == 0 {
@@ -266,7 +265,6 @@ async fn configure_limit(
 }
 
 /// Print a warning message to stderr, with standard format.
-#[cfg(feature = "push")]
 fn print_warning(msg: &str) {
     eprintln!("{}: {}", style("WARNING").for_stderr().red(), msg);
 }

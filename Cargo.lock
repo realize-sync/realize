@@ -1640,9 +1640,11 @@ dependencies = [
  "cfg-if",
  "fnv",
  "lazy_static",
+ "libc",
  "memchr",
  "parking_lot",
  "protobuf",
+ "reqwest",
  "thiserror 2.0.12",
 ]
 
@@ -1725,6 +1727,8 @@ dependencies = [
  "ctrlc",
  "env_logger",
  "humantime",
+ "hyper",
+ "hyper-util",
  "indicatif",
  "lazy_static",
  "log",
@@ -1849,6 +1853,7 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
