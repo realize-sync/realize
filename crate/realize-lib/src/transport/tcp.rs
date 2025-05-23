@@ -274,9 +274,8 @@ impl TcpStub {
         connector: TlsConnector,
         options: ClientOptions,
     ) -> anyhow::Result<Self> {
-        let retry_strategy = ExponentialBackoff::from_millis(500)
-            .factor(2)
-            .max_delay(Duration::from_secs(5 * 60));
+        let retry_strategy =
+            ExponentialBackoff::from_millis(500).max_delay(Duration::from_secs(5 * 60));
 
         let config = Arc::new(Mutex::new(None));
 
