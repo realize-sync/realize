@@ -7,6 +7,8 @@
 
 use std::path::PathBuf;
 
+use base64::Engine as _;
+
 pub type Result<T> = std::result::Result<T, RealizeError>;
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
@@ -50,10 +52,26 @@ pub enum SyncedFileState {
     Partial,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Hash(pub [u8; 32]);
 
+impl std::fmt::Debug for Hash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.base64())
+    }
+}
+
+impl std::fmt::Display for Hash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.base64())
+    }
+}
+
 impl Hash {
+    fn base64(&self) -> String {
+        base64::prelude::BASE64_STANDARD_NO_PAD.encode(&self.0)
+    }
+
     pub fn zero() -> Self {
         Self([0u8; 32])
     }
