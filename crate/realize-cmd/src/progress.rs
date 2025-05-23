@@ -1,12 +1,12 @@
 use console::style;
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use realize_lib::algo::ProgressEvent;
 use realize_lib::model::service::DirectoryId;
 use realize_lib::transport::tcp::ClientConnectionState;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc::Receiver;
 
 pub(crate) struct CliProgress {
@@ -61,7 +61,17 @@ impl CliProgress {
         let _ = self.multi.clear();
     }
 
-    fn set_length(&mut self, total_files: usize, total_bytes: u64) {
+    fn set_length(&mut self, dir_id: &DirectoryId, total_files: usize, total_bytes: u64) {
+        log::info!(
+            "{}: {} files to move ({})",
+            dir_id,
+            total_files,
+            HumanBytes(total_bytes)
+        );
+
+        if self.should_show_dir {
+            self.set_path_prefix(format!("{}/", dir_id));
+        }
         self.total_files += total_files;
         self.total_bytes += total_bytes;
         self.overall_pb.set_length(self.total_bytes);
@@ -70,12 +80,15 @@ impl CliProgress {
     }
 
     fn for_file(&self, path: &std::path::Path, bytes: u64) -> CliFileProgress {
+        let path = format!("{}{}", self.path_prefix, path.display());
+        log::info!("Preparing to move {} ({})", path, HumanBytes(bytes));
+
         CliFileProgress {
             bar: None,
             next_file_index: self.next_file_index.clone(),
             total_files: self.total_files,
             bytes,
-            path: format!("{}{}", self.path_prefix, path.display()),
+            path,
             multi: self.multi.clone(),
             overall_pb: self.overall_pb.clone(),
             quiet: self.quiet,
@@ -89,10 +102,20 @@ impl CliProgress {
     ) {
         use realize_lib::transport::tcp::ClientConnectionState::*;
 
+        let old_state = self.connection_state;
         self.connection_state = match (src_state, dst_state) {
             (Connected, Connected) => Connected,
             _ => Connecting,
         };
+        match (old_state, self.connection_state) {
+            (Connected, Connecting) => {
+                log::warn!("Connection lost. Reconnecting...");
+            }
+            (Connecting, Connected) => {
+                log::info!("Connected!");
+            }
+            _ => {}
+        }
         self.update_overall_prefix();
     }
 
@@ -146,10 +169,7 @@ impl CliProgress {
                         total_bytes,
                         ..
                     }) => {
-                        if self.should_show_dir {
-                            self.set_path_prefix(format!("{}/", dir_id));
-                        }
-                        self.set_length(total_files, total_bytes);
+                        self.set_length(&dir_id, total_files, total_bytes);
                     }
                     Some(MovingFile {
                         dir_id,
@@ -247,14 +267,20 @@ impl CliFileProgress {
     }
 
     fn verifying(&mut self) {
+        log::info!("Verifying {} ({})", self.path, HumanBytes(self.bytes));
+
         let pb = self.get_or_create_bar();
         pb.set_prefix("Verifying");
     }
     fn rsyncing(&mut self) {
+        log::info!("Rsyncing {} ({})", self.path, HumanBytes(self.bytes));
+
         let pb = self.get_or_create_bar();
         pb.set_prefix("Rsyncing");
     }
     fn copying(&mut self) {
+        log::info!("Copying {} ({})", self.path, HumanBytes(self.bytes));
+
         let pb = self.get_or_create_bar();
         pb.set_prefix("Copying");
     }
@@ -265,6 +291,8 @@ impl CliFileProgress {
         }
     }
     fn success(&mut self) {
+        log::info!("Moved {} ({})", self.path, HumanBytes(self.bytes));
+
         if let Some((index, pb)) = self.bar.take() {
             pb.finish_and_clear();
             if !self.quiet {
@@ -282,6 +310,13 @@ impl CliFileProgress {
     }
 
     fn error(&mut self, err: &str) {
+        log::warn!(
+            "Failed to copy {} ({}): {}",
+            self.path,
+            HumanBytes(self.bytes),
+            err
+        );
+
         // Write report even if no bar was ever created.
         let tag = if let Some((index, pb)) = self.bar.take() {
             pb.finish_and_clear();

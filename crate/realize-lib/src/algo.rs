@@ -296,13 +296,6 @@ where
         }
         src_hash = Either::Right(hash);
     }
-    log::info!(
-        "{}:{:?} transferring (src size: {}, dst size: {})",
-        dir_id,
-        path,
-        src_size,
-        dst_size
-    );
     // Chunked Transfer
     let mut offset: u64 = 0;
     let mut rsyncing = true;
