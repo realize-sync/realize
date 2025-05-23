@@ -240,7 +240,7 @@ impl ServerCertVerifier for PeerVerifier {
 }
 
 fn hash_spki(spki: &rustls::pki_types::SubjectPublicKeyInfoDer) -> String {
-    base64::prelude::BASE64_STANDARD.encode(sha2::Sha256::digest(spki))
+    base64::prelude::BASE64_STANDARD_NO_PAD.encode(sha2::Sha256::digest(spki))
 }
 
 #[derive(Debug)]
