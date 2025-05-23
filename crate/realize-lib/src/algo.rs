@@ -10,13 +10,14 @@ use crate::model::service::{
 use futures::future;
 use futures::future::Either;
 use futures::stream::StreamExt as _;
-use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
+use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
 use std::cmp::min;
 use std::sync::Arc;
 use std::{collections::HashMap, path::Path};
 use tarpc::client::stub::Stub;
 use thiserror::Error;
 use tokio::sync::Semaphore;
+use tokio::sync::mpsc::Sender;
 const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 const PARALLEL_FILE_COUNT: usize = 8;
 const HASH_FILE_CHUNK: u64 = 256 * 1024 * 1024; // 256M
@@ -61,51 +62,6 @@ lazy_static::lazy_static! {
         ).unwrap();
 }
 
-// Progress instance passed to move_files()
-pub trait Progress: Sync + Send {
-    /// Once the number of files to move is known, report it
-    fn set_length(&mut self, total_files: usize, total_bytes: u64);
-
-    /// Process a file
-    fn for_file(&self, path: &std::path::Path, bytes: u64) -> Box<dyn FileProgress>;
-}
-
-pub trait FileProgress: Sync + Send {
-    /// Checking the hash at the beginning or end
-    fn verifying(&mut self);
-    /// Comparing and fixing data using the rsync algorithm.
-    fn rsyncing(&mut self);
-    /// Transferring data
-    fn copying(&mut self);
-    /// Increment byte count for the file and overall byte count by this amount.
-    fn inc(&mut self, bytecount: u64);
-    /// File was moved, finished and deleted on the source. File is done, increment file count by 1.
-    fn success(&mut self);
-    /// Moving the file failed. File is done, increment file count by 1.
-    fn error(&mut self, err: &MoveFileError);
-}
-
-/// Empty implementation of Progress trait
-pub struct NoProgress;
-
-impl Progress for NoProgress {
-    fn set_length(&mut self, _total_files: usize, _total_bytes: u64) {}
-    fn for_file(&self, _path: &std::path::Path, _bytes: u64) -> Box<dyn FileProgress> {
-        Box::new(NoFileProgress)
-    }
-}
-
-pub(crate) struct NoFileProgress;
-
-impl FileProgress for NoFileProgress {
-    fn verifying(&mut self) {}
-    fn rsyncing(&mut self) {}
-    fn copying(&mut self) {}
-    fn inc(&mut self, _bytecount: u64) {}
-    fn success(&mut self) {}
-    fn error(&mut self, _err: &MoveFileError) {}
-}
-
 /// Options used for RPC calls on the source.
 fn src_options() -> Options {
     Options {
@@ -120,20 +76,66 @@ fn dst_options() -> Options {
     }
 }
 
-/// Moves files from source to destination using the RealizeService interface.
-/// After a successful move and hash match, deletes the file from the source.
-/// Returns (success_count, error_count, interrupted_count).
-pub async fn move_files<T, U, P>(
+/// Event enum for channel-based progress reporting.
+#[derive(Debug, Clone)]
+pub enum ProgressEvent {
+    /// Indicates the start of moving a directory, with total files and bytes.
+    MovingDir {
+        dir_id: DirectoryId,
+        total_files: usize,
+        total_bytes: u64,
+    },
+    /// Indicates a file is being processed (start), with its path and size.
+    MovingFile {
+        dir_id: DirectoryId,
+        path: std::path::PathBuf,
+        bytes: u64,
+    },
+    /// File is being verified (hash check).
+    VerifyingFile {
+        dir_id: DirectoryId,
+        path: std::path::PathBuf,
+    },
+    /// File is being rsynced (diff/patch).
+    RsyncingFile {
+        dir_id: DirectoryId,
+        path: std::path::PathBuf,
+    },
+    /// File is being copied (data transfer).
+    CopyingFile {
+        dir_id: DirectoryId,
+        path: std::path::PathBuf,
+    },
+    /// Increment byte count for a file and overall progress.
+    IncrementByteCount {
+        dir_id: DirectoryId,
+        path: std::path::PathBuf,
+        bytecount: u64,
+    },
+    /// File was moved successfully.
+    FileSuccess {
+        dir_id: DirectoryId,
+        path: std::path::PathBuf,
+    },
+    /// Moving the file failed.
+    FileError {
+        dir_id: DirectoryId,
+        path: std::path::PathBuf,
+        error: String,
+    },
+}
+
+/// Moves files from source to destination using the RealizeService interface, sending progress events to a channel.
+pub async fn move_files<T, U>(
     ctx: tarpc::context::Context,
     src: &RealizeServiceClient<T>,
     dst: &RealizeServiceClient<U>,
     dir_id: DirectoryId,
-    progress: &mut P,
+    progress_tx: Option<Sender<ProgressEvent>>,
 ) -> Result<(usize, usize, usize), MoveFileError>
 where
     T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
     U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
-    P: Progress,
 {
     METRIC_START_COUNT.inc();
     // 1. List files on src and dst in parallel
@@ -152,15 +154,36 @@ where
         .collect();
     let total_files = src_files.len();
     let total_bytes = src_files.iter().map(|f| f.size).sum();
-    progress.set_length(total_files, total_bytes);
+    if let Some(tx) = &progress_tx {
+        let _ = tx
+            .send(ProgressEvent::MovingDir {
+                dir_id: dir_id.clone(),
+                total_files,
+                total_bytes,
+            })
+            .await;
+    }
     let copy_sem = Arc::new(Semaphore::new(1));
     let results = futures::stream::iter(src_files.into_iter())
         .map(|file| {
-            let mut file_progress = progress.for_file(&file.path, file.size);
             let dst_file = dst_map.get(&file.path);
             let dir_id = dir_id.clone();
             let copy_sem = copy_sem.clone();
+            let tx = progress_tx.clone();
+            let file_path = file.path.clone();
+
             async move {
+                let tx = tx.clone();
+                if let Some(tx) = &tx {
+                    let _ = tx
+                        .send(ProgressEvent::MovingFile {
+                            dir_id: dir_id.clone(),
+                            path: file.path.clone(),
+                            bytes: file.size,
+                        })
+                        .await;
+                }
+
                 let result = move_file(
                     ctx,
                     src,
@@ -169,22 +192,45 @@ where
                     dst_file,
                     &dir_id,
                     copy_sem.clone(),
-                    &mut *file_progress,
+                    tx.clone(),
                 )
                 .await;
                 match result {
                     Ok(_) => {
-                        file_progress.success();
+                        if let Some(tx) = &tx {
+                            let _ = tx
+                                .send(ProgressEvent::FileSuccess {
+                                    dir_id: dir_id.clone(),
+                                    path: file_path.clone(),
+                                })
+                                .await;
+                        }
+
                         (1, 0, 0)
                     }
                     Err(MoveFileError::Rpc(tarpc::client::RpcError::DeadlineExceeded)) => {
-                        file_progress.error(&MoveFileError::Rpc(
-                            tarpc::client::RpcError::DeadlineExceeded,
-                        ));
+                        if let Some(tx) = &tx {
+                            let _ = tx
+                                .send(ProgressEvent::FileError {
+                                    dir_id: dir_id.clone(),
+                                    path: file_path.clone(),
+                                    error: "Deadline exceeded".to_string(),
+                                })
+                                .await;
+                        }
+
                         (0, 0, 1)
                     }
-                    Err(err) => {
-                        file_progress.error(&err);
+                    Err(ref err) => {
+                        if let Some(tx) = &tx {
+                            let _ = tx
+                                .send(ProgressEvent::FileError {
+                                    dir_id: dir_id.clone(),
+                                    path: file_path.clone(),
+                                    error: format!("{}", err),
+                                })
+                                .await;
+                        }
                         (0, 1, 0)
                     }
                 }
@@ -210,7 +256,7 @@ async fn move_file<T, U>(
     dst_file: Option<&SyncedFile>,
     dir_id: &DirectoryId,
     copy_sem: Arc<Semaphore>,
-    progress: &mut dyn FileProgress,
+    progress_tx: Option<Sender<ProgressEvent>>,
 ) -> Result<(), MoveFileError>
 where
     T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
@@ -220,15 +266,21 @@ where
     let path = src_file.path.as_path();
     let src_size = src_file.size;
     let dst_size = dst_file.map(|f| f.size).unwrap_or(0);
-
-    progress.verifying();
-
-    // Important: Compute source hash only once, though it might be
-    // used twice; it's very slow to compute on large files.
+    let path_buf = src_file.path.clone();
+    let dir_id = dir_id.clone();
+    if let Some(tx) = &progress_tx {
+        let _ = tx
+            .send(ProgressEvent::VerifyingFile {
+                dir_id: dir_id.clone(),
+                path: path_buf.clone(),
+            })
+            .await;
+    }
+    // Compute source hash only once
     let mut src_hash = Either::Left(hash_file(
         ctx,
         src,
-        dir_id,
+        &dir_id,
         path,
         src_size,
         HASH_FILE_CHUNK,
@@ -239,12 +291,11 @@ where
             Either::Left(fut) => fut.await?,
             Either::Right(hash) => hash,
         };
-        if check_hashes_and_delete(ctx, &hash, src_size, src, dst, dir_id, path).await? {
+        if check_hashes_and_delete(ctx, &hash, src_size, src, dst, &dir_id, path).await? {
             return Ok(());
         }
         src_hash = Either::Right(hash);
     }
-
     log::info!(
         "{}:{:?} transferring (src size: {}, dst size: {})",
         dir_id,
@@ -252,22 +303,34 @@ where
         src_size,
         dst_size
     );
-
     // Chunked Transfer
     let mut offset: u64 = 0;
     let mut rsyncing = true;
     let mut _copy_lock = None;
-    progress.rsyncing();
+    if let Some(tx) = &progress_tx {
+        let _ = tx
+            .send(ProgressEvent::RsyncingFile {
+                dir_id: dir_id.clone(),
+                path: path_buf.clone(),
+            })
+            .await;
+    }
     while offset < src_size {
         let mut end = offset + CHUNK_SIZE;
         if end > src_file.size {
             end = src_file.size;
         }
         let range = (offset, end);
-
         if dst_size <= offset {
             if rsyncing {
-                progress.copying();
+                if let Some(tx) = &progress_tx {
+                    let _ = tx
+                        .send(ProgressEvent::CopyingFile {
+                            dir_id: dir_id.clone(),
+                            path: path_buf.clone(),
+                        })
+                        .await;
+                }
                 rsyncing = false;
                 _copy_lock = Some(copy_sem.acquire().await.unwrap());
                 log::debug!("Copy semaphore locked for {}", src_file.path.display());
@@ -305,7 +368,15 @@ where
             METRIC_RANGE_WRITE_BYTES
                 .with_label_values(&["send"])
                 .inc_by(range.1 - range.0);
-            progress.inc(end - offset);
+            if let Some(tx) = &progress_tx {
+                let _ = tx
+                    .send(ProgressEvent::IncrementByteCount {
+                        dir_id: dir_id.clone(),
+                        path: path_buf.clone(),
+                        bytecount: end - offset,
+                    })
+                    .await;
+            }
         } else {
             // Compute diff and apply
             log::debug!("{}:{:?} rsync on range {:?}", dir_id, path, range);
@@ -344,25 +415,38 @@ where
                 dst_options(),
             )
             .await??;
-            progress.inc(end - offset);
+            if let Some(tx) = &progress_tx {
+                let _ = tx
+                    .send(ProgressEvent::IncrementByteCount {
+                        dir_id: dir_id.clone(),
+                        path: path_buf.clone(),
+                        bytecount: end - offset,
+                    })
+                    .await;
+            }
         }
         offset = end;
     }
-
-    progress.verifying();
+    if let Some(tx) = &progress_tx {
+        let _ = tx
+            .send(ProgressEvent::VerifyingFile {
+                dir_id: dir_id.clone(),
+                path: path_buf.clone(),
+            })
+            .await;
+    }
     if let Some(_) = _copy_lock {
         log::debug!("Copy semaphore unlocked for {}", src_file.path.display());
     }
     drop(_copy_lock);
-
     let hash = match src_hash {
         Either::Left(hash) => hash.await?,
         Either::Right(hash) => hash,
     };
-    if !check_hashes_and_delete(ctx, &hash, src_size, src, dst, dir_id, path).await? {
+    if !check_hashes_and_delete(ctx, &hash, src_size, src, dst, &dir_id, path).await? {
+        // Only emit FileError here for FailedToSync, all other errors are handled by the caller
         return Err(MoveFileError::FailedToSync);
     }
-
     Ok(())
 }
 
@@ -419,82 +503,16 @@ mod tests {
     use super::*;
     use crate::model::service::DirectoryId;
     use crate::server::{self, DirectoryMap};
-    use assert_fs::prelude::*;
     use assert_fs::TempDir;
+    use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
     use sha2::Digest as _;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::Mutex;
     use walkdir::WalkDir;
 
-    struct MockFileProgress {
-        log: Arc<Mutex<Vec<String>>>,
-        id: String,
-    }
-
-    impl FileProgress for MockFileProgress {
-        fn verifying(&mut self) {
-            self.log
-                .lock()
-                .unwrap()
-                .push(format!("{}:verifying", self.id));
-        }
-        fn rsyncing(&mut self) {
-            self.log
-                .lock()
-                .unwrap()
-                .push(format!("{}:rsyncing", self.id));
-        }
-        fn copying(&mut self) {
-            self.log
-                .lock()
-                .unwrap()
-                .push(format!("{}:copying", self.id));
-        }
-        fn inc(&mut self, bytecount: u64) {
-            self.log
-                .lock()
-                .unwrap()
-                .push(format!("{}:inc:{}", self.id, bytecount));
-        }
-        fn success(&mut self) {
-            self.log
-                .lock()
-                .unwrap()
-                .push(format!("{}:success", self.id));
-        }
-        fn error(&mut self, _err: &MoveFileError) {
-            self.log.lock().unwrap().push(format!("{}:error", self.id));
-        }
-    }
-
-    struct MockProgress {
-        log: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl Progress for MockProgress {
-        fn set_length(&mut self, total_files: usize, total_bytes: u64) {
-            self.log
-                .lock()
-                .unwrap()
-                .push(format!("set_length:{}:{}", total_files, total_bytes));
-        }
-        fn for_file(&self, path: &std::path::Path, bytes: u64) -> Box<dyn FileProgress> {
-            let id = path.to_string_lossy().to_string();
-            self.log
-                .lock()
-                .unwrap()
-                .push(format!("for_file:{}:{}", id, bytes));
-            Box::new(MockFileProgress {
-                log: Arc::clone(&self.log),
-                id,
-            })
-        }
-    }
-
     #[tokio::test]
-    async fn progress_trait_is_called() -> anyhow::Result<()> {
+    async fn events_are_sent() -> anyhow::Result<()> {
         let _ = env_logger::try_init();
         let src_temp = TempDir::new()?;
         let dst_temp = TempDir::new()?;
@@ -511,27 +529,52 @@ mod tests {
             server::create_inprocess_client(DirectoryMap::for_dir(src_dir.id(), src_dir.path()));
         let dst_server =
             server::create_inprocess_client(DirectoryMap::for_dir(dst_dir.id(), dst_dir.path()));
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let mut progress = MockProgress {
-            log: Arc::clone(&log),
-        };
-        let (_, _, _) = move_files(
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let (success, error, _) = move_files(
             tarpc::context::current(),
             &src_server,
             &dst_server,
             DirectoryId::from("testdir"),
-            &mut progress,
+            Some(tx),
         )
         .await?;
-        let log = log.lock().unwrap();
-        // Check that set_length, for_file, and at least one FileProgress method were called
-        assert!(log.iter().any(|l| l.starts_with("set_length:")));
-        assert!(log.iter().any(|l| l.starts_with("for_file:")));
-        assert!(log.iter().any(|l| l.contains(":verifying")));
+
+        assert_eq!(success, 1);
+        assert_eq!(error, 0);
+
+        // Collect all events
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+
+        // Verify essential events were sent
         assert!(
-            log.iter().any(|l| l.contains(":success")) || log.iter().any(|l| l.contains(":error"))
+            events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::MovingDir { .. })),
+            "MovingDir event not found"
         );
-        // Existing tests continue to use NoProgress
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::MovingFile { .. })),
+            "MovingFile event not found"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::VerifyingFile { .. })),
+            "VerifyingFile event not found"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::FileSuccess { .. })),
+            "FileSuccess event not found"
+        );
+
         Ok(())
     }
 
@@ -579,7 +622,7 @@ mod tests {
             &src_server,
             &dst_server,
             DirectoryId::from("testdir"),
-            &mut NoProgress,
+            None,
         )
         .await?;
         assert_eq!(error, 0, "No errors expected");
@@ -652,7 +695,7 @@ mod tests {
             &src_server,
             &dst_server,
             DirectoryId::from("testdir"),
-            &mut NoProgress,
+            None,
         )
         .await?;
         assert_eq!(error, 0, "No errors expected");
@@ -707,7 +750,7 @@ mod tests {
             &src_server,
             &dst_server,
             DirectoryId::from("testdir"),
-            &mut NoProgress,
+            None,
         )
         .await?;
         assert_eq!(success, 1, "One file should succeed");
@@ -745,7 +788,7 @@ mod tests {
             &src_server,
             &dst_server,
             DirectoryId::from("testdir"),
-            &mut NoProgress,
+            None,
         )
         .await?;
         // Only the final file should be moved

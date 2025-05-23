@@ -1,8 +1,12 @@
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use realize_lib::algo::{FileProgress as AlgoFileProgress, MoveFileError, Progress};
+use realize_lib::algo::ProgressEvent;
+use realize_lib::model::service::DirectoryId;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::mpsc::Receiver;
 
 pub(crate) struct CliProgress {
     multi: MultiProgress,
@@ -12,10 +16,11 @@ pub(crate) struct CliProgress {
     next_file_index: Arc<AtomicUsize>,
     quiet: bool,
     path_prefix: String,
+    should_show_dir: bool,
 }
 
 impl CliProgress {
-    pub(crate) fn new(quiet: bool) -> Self {
+    pub(crate) fn new(quiet: bool, dir_count: usize) -> Self {
         let multi = MultiProgress::with_draw_target(if quiet {
             ProgressDrawTarget::hidden()
         } else {
@@ -38,6 +43,7 @@ impl CliProgress {
             next_file_index: Arc::new(AtomicUsize::new(1)),
             quiet,
             path_prefix: "".to_string(),
+            should_show_dir: dir_count > 1,
         }
     }
 
@@ -49,9 +55,7 @@ impl CliProgress {
         self.overall_pb.finish_and_clear();
         let _ = self.multi.clear();
     }
-}
 
-impl Progress for CliProgress {
     fn set_length(&mut self, total_files: usize, total_bytes: u64) {
         self.total_files += total_files;
         self.total_bytes += total_bytes;
@@ -60,8 +64,8 @@ impl Progress for CliProgress {
         self.overall_pb.set_prefix("Moving");
     }
 
-    fn for_file(&self, path: &std::path::Path, bytes: u64) -> Box<dyn AlgoFileProgress> {
-        Box::new(CliFileProgress {
+    fn for_file(&self, path: &std::path::Path, bytes: u64) -> CliFileProgress {
+        CliFileProgress {
             bar: None,
             next_file_index: self.next_file_index.clone(),
             total_files: self.total_files,
@@ -70,7 +74,78 @@ impl Progress for CliProgress {
             multi: self.multi.clone(),
             overall_pb: self.overall_pb.clone(),
             quiet: self.quiet,
-        })
+        }
+    }
+
+    pub async fn update(&mut self, mut rx: Receiver<ProgressEvent>) {
+        use ProgressEvent::*;
+        let mut file_progress_map: HashMap<(DirectoryId, PathBuf), CliFileProgress> =
+            HashMap::new();
+        while let Some(event) = rx.recv().await {
+            match event {
+                MovingDir {
+                    dir_id,
+                    total_files,
+                    total_bytes,
+                    ..
+                } => {
+                    if self.should_show_dir {
+                        self.set_path_prefix(format!("{}/", dir_id));
+                    }
+                    self.set_length(total_files, total_bytes);
+                }
+                MovingFile {
+                    dir_id,
+                    path,
+                    bytes,
+                    ..
+                } => {
+                    let fp = self.for_file(&path, bytes);
+                    file_progress_map.insert((dir_id, path), fp);
+                }
+                VerifyingFile { dir_id, path, .. } => {
+                    if let Some(fp) = file_progress_map.get_mut(&(dir_id, path)) {
+                        fp.verifying();
+                    }
+                }
+                RsyncingFile { dir_id, path, .. } => {
+                    if let Some(fp) = file_progress_map.get_mut(&(dir_id, path)) {
+                        fp.rsyncing();
+                    }
+                }
+                CopyingFile { dir_id, path, .. } => {
+                    if let Some(fp) = file_progress_map.get_mut(&(dir_id, path)) {
+                        fp.copying();
+                    }
+                }
+                IncrementByteCount {
+                    dir_id,
+                    path,
+                    bytecount,
+                    ..
+                } => {
+                    if let Some(fp) = file_progress_map.get_mut(&(dir_id, path)) {
+                        fp.inc(bytecount);
+                    }
+                }
+                FileSuccess { dir_id, path, .. } => {
+                    if let Some(mut fp) = file_progress_map.remove(&(dir_id, path)) {
+                        fp.success();
+                    }
+                }
+                FileError {
+                    dir_id,
+                    path,
+                    error,
+                    ..
+                } => {
+                    if let Some(mut fp) = file_progress_map.remove(&(dir_id, path)) {
+                        // Use a generic error for display
+                        fp.error(&error);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -112,9 +187,7 @@ impl CliFileProgress {
 
         pb
     }
-}
 
-impl AlgoFileProgress for CliFileProgress {
     fn verifying(&mut self) {
         let pb = self.get_or_create_bar();
         pb.set_prefix("Verifying");
@@ -150,7 +223,7 @@ impl AlgoFileProgress for CliFileProgress {
         }
     }
 
-    fn error(&mut self, err: &MoveFileError) {
+    fn error(&mut self, err: &str) {
         // Write report even if no bar was ever created.
         let tag = if let Some((index, pb)) = self.bar.take() {
             pb.finish_and_clear();

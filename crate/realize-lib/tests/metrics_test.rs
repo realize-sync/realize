@@ -1,6 +1,7 @@
 use assert_fs::TempDir;
 use assert_fs::prelude::*;
 use prometheus::proto::MetricType;
+use realize_lib::algo;
 use realize_lib::algo::METRIC_END_COUNT;
 use realize_lib::algo::METRIC_FILE_END_COUNT;
 use realize_lib::algo::METRIC_FILE_START_COUNT;
@@ -9,8 +10,6 @@ use realize_lib::algo::METRIC_RANGE_WRITE_BYTES;
 use realize_lib::algo::METRIC_READ_BYTES;
 use realize_lib::algo::METRIC_START_COUNT;
 use realize_lib::algo::METRIC_WRITE_BYTES;
-use realize_lib::algo::NoProgress;
-use realize_lib::algo::move_files;
 use realize_lib::model::service::{DirectoryId, Options};
 use realize_lib::server::{self, DirectoryMap, InProcessRealizeServiceClient};
 use std::sync::Arc;
@@ -160,12 +159,12 @@ async fn move_files_metrics() -> anyhow::Result<()> {
         &DirectoryId::from("testdir"),
         dst_temp.path(),
     ));
-    let (success, error, _interrupted) = move_files(
+    let (success, error, _interrupted) = algo::move_files(
         tarpc::context::current(),
         &server::create_inprocess_client(DirectoryMap::for_dir(src_dir.id(), src_dir.path())),
         &server::create_inprocess_client(DirectoryMap::for_dir(dst_dir.id(), dst_dir.path())),
         DirectoryId::from("testdir"),
-        &mut NoProgress,
+        None,
     )
     .await?;
     assert_eq!(success, 1);

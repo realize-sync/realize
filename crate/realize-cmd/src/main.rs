@@ -1,10 +1,10 @@
-use crate::progress::CliProgress;
 use anyhow::Context as _;
 use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
 use clap::Parser;
 use console::style;
 use indicatif::HumanBytes;
+use progress::CliProgress;
 use prometheus::{IntCounter, register_int_counter};
 use realize_lib::algo::MoveFileError;
 use realize_lib::metrics;
@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tarpc::client::RpcError;
 use tarpc::context;
+use tokio::sync::mpsc;
 
 mod progress;
 mod push;
@@ -189,42 +190,45 @@ async fn execute(cli: &Cli, ctx: context::Context) -> anyhow::Result<()> {
     METRIC_UP.inc();
 
     // Move files for each directory id
-    let mut total_success = 0;
-    let mut total_error = 0;
-    let mut total_interrupted = 0;
-    let mut progress = CliProgress::new(cli.quiet);
-    let mut interrupted = false;
-    let should_show_dir = cli.directory_ids.len() >= 2;
-    for dir_id in &cli.directory_ids {
-        if should_show_dir {
-            progress.set_path_prefix(format!("{}/", dir_id));
-        }
-        let result = realize_lib::algo::move_files(
-            ctx,
-            &src_client,
-            &dst_client,
-            DirectoryId::from(dir_id.to_string()),
-            &mut progress,
-        )
-        .await;
+    let mut cli_progress = CliProgress::new(cli.quiet, cli.directory_ids.len());
+    let (progress_tx, progress_rx) = mpsc::channel(32);
+    let (res, _) = tokio::join!(
+        async move {
+            let mut total_success = 0;
+            let mut total_error = 0;
+            let mut total_interrupted = 0;
+            let mut interrupted = false;
+            for dir_id in &cli.directory_ids {
+                let result = realize_lib::algo::move_files(
+                    ctx,
+                    &src_client,
+                    &dst_client,
+                    DirectoryId::from(dir_id.to_string()),
+                    Some(progress_tx.clone()),
+                )
+                .await;
+                match result {
+                    Ok((success, error, interrupted_count)) => {
+                        total_success += success;
+                        total_error += error;
+                        total_interrupted += interrupted_count;
+                    }
+                    Err(MoveFileError::Rpc(RpcError::DeadlineExceeded)) => {
+                        interrupted = true;
+                        break;
+                    }
+                    Err(err) => {
+                        return Err(anyhow::Error::from(err));
+                    }
+                }
+            }
+            Ok((total_success, total_error, total_interrupted, interrupted))
+        },
+        cli_progress.update(progress_rx),
+    );
+    cli_progress.finish_and_clear();
 
-        match result {
-            Ok((success, error, interrupted)) => {
-                total_success += success;
-                total_error += error;
-                total_interrupted += interrupted;
-            }
-            Err(MoveFileError::Rpc(RpcError::DeadlineExceeded)) => {
-                interrupted = true;
-                break;
-            }
-            Err(err) => {
-                return Err(err.into());
-            }
-        }
-    }
-    progress.finish_and_clear();
-
+    let (total_success, total_error, total_interrupted, interrupted) = res?;
     if total_error > 0 {
         return Err(anyhow::anyhow!(
             "{total_error} file(s) failed, {total_success} file(s) moved, {total_interrupted} interrupted"
