@@ -170,10 +170,22 @@ pub async fn start_server(
     Ok((addr, handle))
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct ClientOptions {
     pub domain: Option<String>,
     pub limiter: Option<Limiter<StandardClock>>,
+    pub connection_events: Option<tokio::sync::watch::Sender<ClientConnectionState>>,
+}
+
+/// What happened to a client connection.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ClientConnectionState {
+    /// Initial state
+    NotConnected,
+    /// The client is attempting to connect.
+    Connecting,
+    /// The client is connected.
+    Connected,
 }
 
 /// Create a [RealizeServiceClient] connected to the given TCP address.
@@ -199,10 +211,13 @@ struct TcpConnect {
 impl Connect<tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>>
     for TcpConnect
 {
-    async fn run(
+    async fn try_connect(
         &self,
     ) -> anyhow::Result<tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>>
     {
+        if let Some(tx) = &self.options.connection_events {
+            let _ = tx.send(ClientConnectionState::Connecting);
+        }
         let stream = TcpStream::connect(self.hostport.addr()).await?;
         let domain = ServerName::try_from(
             self.options
@@ -232,6 +247,9 @@ impl Connect<tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceRe
             channel.call(context::current(), req).await?;
         }
 
+        if let Some(tx) = &self.options.connection_events {
+            let _ = tx.send(ClientConnectionState::Connected);
+        }
         Ok(channel)
     }
 }
@@ -261,6 +279,10 @@ impl TcpStub {
             .max_delay(Duration::from_secs(5 * 60));
 
         let config = Arc::new(Mutex::new(None));
+
+        if let Some(tx) = &options.connection_events {
+            let _ = tx.send(ClientConnectionState::NotConnected);
+        }
         let connect = TcpConnect {
             hostport: hostport.clone(),
             connector,
@@ -617,6 +639,69 @@ mod tests {
                 .await??
         );
         assert_eq!(connection_count.load(Ordering::Relaxed), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tcp_reconnect_events() -> anyhow::Result<()> {
+        let verifier = verifier_both();
+        let (addr, _server_handle, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
+
+        let (shutdown, _) = tokio::sync::broadcast::channel(1);
+        let (proxy_addr, _proxy_handle) =
+            proxy_tcp(&addr, shutdown.clone(), Arc::new(AtomicU32::new(0))).await?;
+
+        let (conn_tx, mut conn_rx) =
+            tokio::sync::watch::channel(ClientConnectionState::NotConnected);
+        let history = tokio::spawn(async move {
+            let mut history = vec![];
+            loop {
+                history.push(*conn_rx.borrow_and_update());
+                if conn_rx.changed().await.is_err() {
+                    return history;
+                }
+            }
+        });
+
+        let client = connect_client(
+            &HostPort::from(proxy_addr),
+            verifier_both(),
+            load_private_key(crate::transport::security::testing::client_private_key())?,
+            ClientOptions {
+                connection_events: Some(conn_tx),
+                ..ClientOptions::default()
+            },
+        )
+        .await?;
+
+        client
+            .list(
+                context::current(),
+                DirectoryId::from("testdir"),
+                Options::default(),
+            )
+            .await??;
+        shutdown.send(())?;
+        client
+            .list(
+                context::current(),
+                DirectoryId::from("testdir"),
+                Options::default(),
+            )
+            .await??;
+        drop(client); // also closes conn_tx
+
+        let history = history.await?;
+        assert_eq!(
+            vec![
+                ClientConnectionState::Connecting,
+                ClientConnectionState::Connected,
+                ClientConnectionState::Connecting,
+                ClientConnectionState::Connected,
+            ],
+            history
+        );
 
         Ok(())
     }

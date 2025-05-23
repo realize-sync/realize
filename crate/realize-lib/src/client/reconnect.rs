@@ -15,11 +15,12 @@ const MAX_RETRY_COUNT: u32 = 10;
 
 #[allow(async_fn_in_trait)] // TODO: fix
 pub(crate) trait Connect<T>: Clone {
-    async fn run(&self) -> anyhow::Result<T>;
+    /// Attempt to create a new connection.
+    async fn try_connect(&self) -> anyhow::Result<T>;
 }
 
 impl<T, F: (AsyncFn() -> anyhow::Result<T>) + Clone> Connect<T> for F {
-    async fn run(&self) -> anyhow::Result<T> {
+    async fn try_connect(&self) -> anyhow::Result<T> {
         self().await
     }
 }
@@ -65,7 +66,7 @@ where
         connect: C,
         short_deadline: Option<Duration>,
     ) -> anyhow::Result<Self> {
-        let inner = connect.run().await?;
+        let inner = connect.try_connect().await?;
 
         Ok(Self {
             inner: Arc::new(RwLock::new(Reconnectable::Connected {
@@ -96,7 +97,7 @@ where
             }
 
             tokio::time::sleep(duration).await;
-            if let Ok(new_stub) = self.connect.run().await {
+            if let Ok(new_stub) = self.connect.try_connect().await {
                 return Ok(Reconnectable::Connected {
                     inner: new_stub,
                     connection_count: connection_count + 1,
@@ -104,7 +105,6 @@ where
                 });
             }
         }
-
         Ok(Reconnectable::GiveUp)
     }
 
@@ -314,7 +314,7 @@ mod tests {
         }
     }
     impl Connect<LimitedCallsStub> for TestStubConnect {
-        async fn run(&self) -> anyhow::Result<LimitedCallsStub> {
+        async fn try_connect(&self) -> anyhow::Result<LimitedCallsStub> {
             let count = self.counter.fetch_add(1, Ordering::Relaxed);
 
             if self.fail.contains(&count) {
@@ -498,7 +498,7 @@ mod tests {
         }
     }
     impl Connect<DeadlineStub> for DeadlineStubConnect {
-        async fn run(&self) -> anyhow::Result<DeadlineStub> {
+        async fn try_connect(&self) -> anyhow::Result<DeadlineStub> {
             Ok(DeadlineStub {
                 counter: Arc::clone(&self.counter),
                 fail: self.fail.clone(),
