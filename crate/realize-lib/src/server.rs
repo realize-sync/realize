@@ -227,13 +227,8 @@ impl RealizeService for RealizeServer {
             .truncate(false)
             .open(&path)
             .await?;
-        file.seek(SeekFrom::Start(range.0)).await?;
-        file.write_all(&data).await?;
-
-        let file_len = file.metadata().await?.len();
-        if file_len > file_size {
-            file.set_len(file_size).await?;
-        }
+        write_at_offset(&mut file, range.0, &data).await?;
+        shorten_file(&mut file, file_size).await?;
 
         Ok(())
     }
@@ -403,12 +398,9 @@ impl RealizeService for RealizeServer {
                 "Delta output size mismatch".to_string(),
             ));
         }
-        file.seek(std::io::SeekFrom::Start(range.0)).await?;
-        file.write_all(&out).await?;
-        let file_len = file.metadata().await?.len();
-        if file_len > file_size {
-            file.set_len(file_size).await?;
-        }
+        write_at_offset(&mut file, range.0, &out).await?;
+        shorten_file(&mut file, file_size).await?;
+
         Ok(())
     }
 
@@ -447,6 +439,23 @@ async fn partial_read(
     } else {
         buf.fill(0);
     }
+    Ok(())
+}
+
+async fn shorten_file(file: &mut File, file_size: u64) -> Result<()> {
+    let file_len = file.metadata().await?.len();
+    if file_len > file_size {
+        file.set_len(file_size).await?;
+    }
+
+    Ok(())
+}
+
+async fn write_at_offset(file: &mut File, offset: u64, data: &Vec<u8>) -> Result<()> {
+    file.seek(SeekFrom::Start(offset)).await?;
+    file.write_all(&data).await?;
+    file.flush().await?;
+
     Ok(())
 }
 
