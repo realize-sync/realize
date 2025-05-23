@@ -3,14 +3,14 @@ use std::time::Instant;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use prometheus::{
-    Encoder, HistogramVec, IntCounterVec, IntGauge, register_histogram_vec,
-    register_int_counter_vec, register_int_gauge,
+    register_histogram_vec, register_int_counter_vec, register_int_gauge, Encoder, HistogramVec,
+    IntCounterVec, IntGauge,
 };
 use tarpc::{
-    ServerError,
-    client::{RpcError, stub::Stub},
+    client::{stub::Stub, RpcError},
     context::Context,
     server::Serve,
+    ServerError,
 };
 use tokio::net::TcpListener;
 
@@ -170,7 +170,6 @@ fn realize_error_label(err: &RealizeError) -> &'static str {
         RealizeError::BadRequest(_) => "BadRequest",
         RealizeError::Io(_) => "Io",
         RealizeError::Rsync(_, _) => "Rsync",
-        RealizeError::Sync(_, _) => "Sync",
         RealizeError::Other(_) => "Other",
     }
 }

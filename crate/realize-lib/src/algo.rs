@@ -10,7 +10,7 @@ use crate::model::service::{
 use futures::future;
 use futures::future::Either;
 use futures::stream::StreamExt as _;
-use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
+use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
 use std::cmp::min;
 use std::sync::Arc;
 use std::{collections::HashMap, path::Path};
@@ -239,9 +239,7 @@ where
             Either::Left(fut) => fut.await?,
             Either::Right(hash) => hash,
         };
-        if check_hashes_and_delete_with_src_hash(ctx, &hash, src_size, src, dst, dir_id, path)
-            .await?
-        {
+        if check_hashes_and_delete(ctx, &hash, src_size, src, dst, dir_id, path).await? {
             return Ok(());
         }
         src_hash = Either::Right(hash);
@@ -361,11 +359,8 @@ where
         Either::Left(hash) => hash.await?,
         Either::Right(hash) => hash,
     };
-    if !check_hashes_and_delete_with_src_hash(ctx, &hash, src_size, src, dst, dir_id, path).await? {
-        return Err(MoveFileError::Realize(RealizeError::Sync(
-            path.to_path_buf(),
-            "Data still inconsistent after sync".to_string(),
-        )));
+    if !check_hashes_and_delete(ctx, &hash, src_size, src, dst, dir_id, path).await? {
+        return Err(MoveFileError::FailedToSync);
     }
 
     Ok(())
@@ -374,7 +369,7 @@ where
 /// Check hashes and, if they match, finish the dest file and delete the source.
 ///
 /// Return true if the hashes matched, false otherwise.
-async fn check_hashes_and_delete_with_src_hash<T, U>(
+async fn check_hashes_and_delete<T, U>(
     ctx: tarpc::context::Context,
     src_hash: &Vec<Hash>,
     file_size: u64,
@@ -424,8 +419,8 @@ mod tests {
     use super::*;
     use crate::model::service::DirectoryId;
     use crate::server::{self, DirectoryMap};
-    use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
     use sha2::Digest as _;
     use std::path::PathBuf;
@@ -945,6 +940,8 @@ pub enum MoveFileError {
     Realize(#[from] RealizeError),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Data still inconsistent after sync")]
+    FailedToSync,
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
