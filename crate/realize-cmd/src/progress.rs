@@ -2,10 +2,11 @@ use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use realize_lib::algo::ProgressEvent;
 use realize_lib::model::service::DirectoryId;
+use realize_lib::transport::tcp::ClientConnectionState;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
 
 pub(crate) struct CliProgress {
@@ -17,6 +18,7 @@ pub(crate) struct CliProgress {
     quiet: bool,
     path_prefix: String,
     should_show_dir: bool,
+    connection_state: ClientConnectionState,
 }
 
 impl CliProgress {
@@ -29,13 +31,12 @@ impl CliProgress {
         let overall_pb = multi.add(ProgressBar::no_length());
         overall_pb.set_style(
             ProgressStyle::with_template(
-                "{prefix:<9.cyan.bold} [{wide_bar:.cyan/blue}] {bytes_per_sec} ({bytes}/{total_bytes}) {percent}%",
+                "{prefix:<10.cyan.bold} [{wide_bar:.cyan/blue}] {bytes_per_sec} ({bytes}/{total_bytes}) {percent}%",
             )
-            .unwrap()
-            .progress_chars("=> "),
+                .unwrap()
+                .progress_chars("=> "),
         );
-        overall_pb.set_prefix("Listing");
-        Self {
+        let res = Self {
             multi,
             total_files: 0,
             total_bytes: 0,
@@ -44,7 +45,11 @@ impl CliProgress {
             quiet,
             path_prefix: "".to_string(),
             should_show_dir: dir_count > 1,
-        }
+            connection_state: ClientConnectionState::NotConnected,
+        };
+        res.update_overall_prefix();
+
+        res
     }
 
     pub(crate) fn set_path_prefix(&mut self, prefix: String) {
@@ -61,7 +66,7 @@ impl CliProgress {
         self.total_bytes += total_bytes;
         self.overall_pb.set_length(self.total_bytes);
         self.overall_pb.set_position(0);
-        self.overall_pb.set_prefix("Moving");
+        self.update_overall_prefix();
     }
 
     fn for_file(&self, path: &std::path::Path, bytes: u64) -> CliFileProgress {
@@ -77,74 +82,127 @@ impl CliProgress {
         }
     }
 
-    pub async fn update(&mut self, mut rx: Receiver<ProgressEvent>) {
+    fn set_connection_state(
+        &mut self,
+        src_state: ClientConnectionState,
+        dst_state: ClientConnectionState,
+    ) {
+        use realize_lib::transport::tcp::ClientConnectionState::*;
+
+        self.connection_state = match (src_state, dst_state) {
+            (Connected, Connected) => Connected,
+            _ => Connecting,
+        };
+        self.update_overall_prefix();
+    }
+
+    fn update_overall_prefix(&self) {
+        use realize_lib::transport::tcp::ClientConnectionState::*;
+        self.overall_pb.set_prefix(match self.connection_state {
+            NotConnected | Connecting => "Connecting",
+            Connected => {
+                if self.total_files == 0 {
+                    "Listing"
+                } else {
+                    "Moving"
+                }
+            }
+        });
+    }
+
+    pub async fn update(
+        &mut self,
+        mut rx: Receiver<ProgressEvent>,
+        mut src_watch_rx: tokio::sync::watch::Receiver<ClientConnectionState>,
+        mut dst_watch_rx: tokio::sync::watch::Receiver<ClientConnectionState>,
+    ) {
         use ProgressEvent::*;
         let mut file_progress_map: HashMap<(DirectoryId, PathBuf), CliFileProgress> =
             HashMap::new();
-        while let Some(event) = rx.recv().await {
-            match event {
-                MovingDir {
-                    dir_id,
-                    total_files,
-                    total_bytes,
-                    ..
-                } => {
-                    if self.should_show_dir {
-                        self.set_path_prefix(format!("{}/", dir_id));
+
+        self.set_connection_state(
+            *src_watch_rx.borrow_and_update(),
+            *dst_watch_rx.borrow_and_update(),
+        );
+        loop {
+            tokio::select!(
+                _ = src_watch_rx.changed() => {
+                    self.set_connection_state(
+                        *src_watch_rx.borrow_and_update(),
+                        *dst_watch_rx.borrow_and_update(),
+                    );
+                },
+                _ = dst_watch_rx.changed() => {
+                    self.set_connection_state(
+                        *src_watch_rx.borrow_and_update(),
+                        *dst_watch_rx.borrow_and_update(),
+                    );
+                },
+                ev = rx.recv() => match ev {
+                    None => return,
+                    Some(MovingDir {
+                        dir_id,
+                        total_files,
+                        total_bytes,
+                        ..
+                    }) => {
+                        if self.should_show_dir {
+                            self.set_path_prefix(format!("{}/", dir_id));
+                        }
+                        self.set_length(total_files, total_bytes);
                     }
-                    self.set_length(total_files, total_bytes);
-                }
-                MovingFile {
-                    dir_id,
-                    path,
-                    bytes,
-                    ..
-                } => {
-                    let fp = self.for_file(&path, bytes);
-                    file_progress_map.insert((dir_id, path), fp);
-                }
-                VerifyingFile { dir_id, path, .. } => {
-                    if let Some(fp) = file_progress_map.get_mut(&(dir_id, path)) {
-                        fp.verifying();
+                    Some(MovingFile {
+                        dir_id,
+                        path,
+                        bytes,
+                        ..
+                    }) => {
+                        let fp = self.for_file(&path, bytes);
+                        file_progress_map.insert((dir_id, path), fp);
                     }
-                }
-                RsyncingFile { dir_id, path, .. } => {
-                    if let Some(fp) = file_progress_map.get_mut(&(dir_id, path)) {
-                        fp.rsyncing();
+                    Some(VerifyingFile { dir_id, path, .. }) => {
+                        if let Some(fp) = file_progress_map.get_mut(&(dir_id, path)) {
+                            fp.verifying();
+                        }
                     }
-                }
-                CopyingFile { dir_id, path, .. } => {
-                    if let Some(fp) = file_progress_map.get_mut(&(dir_id, path)) {
-                        fp.copying();
+                    Some(RsyncingFile { dir_id, path, .. }) => {
+                        if let Some(fp) = file_progress_map.get_mut(&(dir_id, path)) {
+                            fp.rsyncing();
+                        }
                     }
-                }
-                IncrementByteCount {
-                    dir_id,
-                    path,
-                    bytecount,
-                    ..
-                } => {
-                    if let Some(fp) = file_progress_map.get_mut(&(dir_id, path)) {
-                        fp.inc(bytecount);
+                    Some(CopyingFile { dir_id, path, .. }) => {
+                        if let Some(fp) = file_progress_map.get_mut(&(dir_id, path)) {
+                            fp.copying();
+                        }
                     }
-                }
-                FileSuccess { dir_id, path, .. } => {
-                    if let Some(mut fp) = file_progress_map.remove(&(dir_id, path)) {
-                        fp.success();
+                    Some(IncrementByteCount {
+                        dir_id,
+                        path,
+                        bytecount,
+                        ..
+                    }) => {
+                        if let Some(fp) = file_progress_map.get_mut(&(dir_id, path)) {
+                            fp.inc(bytecount);
+                        }
                     }
-                }
-                FileError {
-                    dir_id,
-                    path,
-                    error,
-                    ..
-                } => {
-                    if let Some(mut fp) = file_progress_map.remove(&(dir_id, path)) {
-                        // Use a generic error for display
-                        fp.error(&error);
+                    Some(FileSuccess { dir_id, path, .. }) => {
+                        if let Some(mut fp) = file_progress_map.remove(&(dir_id, path)) {
+                            fp.success();
+                        }
                     }
-                }
-            }
+                    Some(FileError {
+                        dir_id,
+                        path,
+                        error,
+                        ..
+                    }) => {
+                        if let Some(mut fp) = file_progress_map.remove(&(dir_id, path)) {
+                            // Use a generic error for display
+                            fp.error(&error);
+                        }
+                    }
+                },
+            );
         }
     }
 }
@@ -169,7 +227,7 @@ impl CliFileProgress {
             pb.set_message(self.path.clone());
             pb.set_style(
                 ProgressStyle::with_template(
-                    "{prefix:<9.cyan.bold} {tag} {wide_msg} ({bytes}/{total_bytes}) {percent}%",
+                    "{prefix:<10.cyan.bold} {tag} {wide_msg} ({bytes}/{total_bytes}) {percent}%",
                 )
                 .unwrap()
                 .progress_chars("=> ")
@@ -212,7 +270,7 @@ impl CliFileProgress {
             if !self.quiet {
                 self.multi.suspend(|| {
                     println!(
-                        "{:<9} [{}/{}] {}",
+                        "{:<10} [{}/{}] {}",
                         style("Moved").for_stdout().green().bold(),
                         index,
                         self.total_files,
@@ -234,7 +292,7 @@ impl CliFileProgress {
         };
         self.multi.suspend(|| {
             eprintln!(
-                "{:<9} {}{}: {}",
+                "{:<10} {}{}: {}",
                 style("ERROR").for_stderr().red().bold(),
                 tag,
                 self.path,

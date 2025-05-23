@@ -1,6 +1,6 @@
-use assert_fs::TempDir;
 use assert_fs::fixture::ChildPath;
 use assert_fs::prelude::*;
+use assert_fs::TempDir;
 use assert_unordered::assert_eq_unordered;
 use hyper_util::rt::TokioIo;
 use realize_lib::model::service::DirectoryId;
@@ -168,7 +168,7 @@ async fn partial_failure() -> anyhow::Result<()> {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("ERROR     [1/2] bad.txt: "),
+        stderr.contains("ERROR      [1/2] bad.txt: "),
         "stderr: {stderr}"
     );
     assert!(
@@ -216,11 +216,11 @@ async fn progress_output() -> anyhow::Result<()> {
     assert!(output.status.success(), "Should succeed if all files moved");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("Moved     [1/2] bar.txt"),
+        stdout.contains("Moved      [1/2] bar.txt"),
         "stdout: {stdout}"
     );
     assert!(
-        stdout.contains("Moved     [2/2] foo.txt"),
+        stdout.contains("Moved      [2/2] foo.txt"),
         "stdout: {stdout}"
     );
     assert!(

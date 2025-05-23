@@ -1,16 +1,16 @@
 use anyhow::Context as _;
-use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
+use async_speed_limit::Limiter;
 use clap::Parser;
 use console::style;
 use indicatif::HumanBytes;
 use progress::CliProgress;
-use prometheus::{IntCounter, register_int_counter};
+use prometheus::{register_int_counter, IntCounter};
 use realize_lib::algo::MoveFileError;
 use realize_lib::metrics;
 use realize_lib::model::service::DirectoryId;
 use realize_lib::transport::security::{self, PeerVerifier};
-use realize_lib::transport::tcp::{self, HostPort, TcpRealizeServiceClient};
+use realize_lib::transport::tcp::{self, ClientConnectionState, HostPort, TcpRealizeServiceClient};
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use rustls::sign::SigningKey;
@@ -143,42 +143,48 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
     let verifier = build_peer_verifier(&cli.peers)
         .with_context(|| format!("{}: Invalid peer file", cli.peers.display()))?;
 
-    let (src_client, dst_client) = tokio::join!(
-        connect(
-            "--src-addr",
-            &cli.src_addr,
-            None,
-            privkey.clone(),
-            verifier.clone(),
-        ),
-        connect(
-            "--dst-addr",
-            &cli.dst_addr,
-            cli.throttle_up,
-            privkey,
-            verifier,
-        )
-    );
-
-    let src_client = src_client?;
-    let dst_client = dst_client?;
-
-    if let Some(limit) = cli.throttle_down {
-        if let Some(val) = configure_limit(&src_client, limit)
-            .await
-            .with_context(|| format!("Failed to apply --throttle-down={limit}"))?
-        {
-            log::info!("Throttling downloads: {}/s", HumanBytes(val));
-        }
-    }
-
-    METRIC_UP.inc();
-
     let mut cli_progress = CliProgress::new(cli.quiet, cli.directory_ids.len());
     let (progress_tx, progress_rx) = mpsc::channel(32);
-
-    let (res, _) = tokio::join!(
+    let (src_watch_tx, src_watch_rx) =
+        tokio::sync::watch::channel(ClientConnectionState::NotConnected);
+    let (dst_watch_tx, dst_watch_rx) =
+        tokio::sync::watch::channel(ClientConnectionState::NotConnected);
+    let (_, res) = tokio::join!(
+        cli_progress.update(progress_rx, src_watch_rx, dst_watch_rx),
         async move {
+            let (src_client, dst_client) = tokio::join!(
+                connect(
+                    "--src-addr",
+                    &cli.src_addr,
+                    None,
+                    privkey.clone(),
+                    verifier.clone(),
+                    src_watch_tx,
+                ),
+                connect(
+                    "--dst-addr",
+                    &cli.dst_addr,
+                    cli.throttle_up,
+                    privkey,
+                    verifier,
+                    dst_watch_tx,
+                )
+            );
+
+            let src_client = src_client?;
+            let dst_client = dst_client?;
+
+            if let Some(limit) = cli.throttle_down {
+                if let Some(val) = configure_limit(&src_client, limit)
+                    .await
+                    .with_context(|| format!("Failed to apply --throttle-down={limit}"))?
+                {
+                    log::info!("Throttling downloads: {}/s", HumanBytes(val));
+                }
+            }
+
+            METRIC_UP.inc();
+
             let mut total_success = 0;
             let mut total_error = 0;
             let mut total_interrupted = 0;
@@ -209,7 +215,6 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
             }
             Ok((total_success, total_error, total_interrupted, interrupted))
         },
-        cli_progress.update(progress_rx),
     );
     cli_progress.finish_and_clear();
 
@@ -250,6 +255,7 @@ async fn connect(
     limit: Option<u64>,
     privkey: Arc<dyn SigningKey>,
     verifier: Arc<PeerVerifier>,
+    conn_status: tokio::sync::watch::Sender<ClientConnectionState>,
 ) -> anyhow::Result<realize_lib::model::service::RealizeServiceClient<tcp::TcpStub>, anyhow::Error>
 {
     let addr = HostPort::parse(addr)
@@ -260,6 +266,7 @@ async fn connect(
         log::info!("Throttling uploads: {}/s", HumanBytes(limit));
         options.limiter = Some(Limiter::<StandardClock>::new(limit as f64));
     }
+    options.connection_events = Some(conn_status);
 
     Ok(
         tcp::connect_client(&addr, Arc::clone(&verifier), Arc::clone(&privkey), options)
