@@ -3,6 +3,17 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
+## Compression {#compress}
+
+Implement compression as shown on:
+https://raw.githubusercontent.com/google/tarpc/refs/heads/master/tarpc/examples/compression.rs
+
+See whether it improves download. Currently we're at a surprisingly
+stable 1.8MB/s when limited to 2MB/s (I assume 0.2MB/s for TLS)
+
+This might not help much as long as the data is already compressed
+(audio or video).
+
 ## Fix error message output {#errormsg}
 
 When caught by with_context, error cause are printed.
