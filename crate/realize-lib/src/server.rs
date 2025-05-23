@@ -17,8 +17,7 @@ use sha2::{Digest, Sha256};
 use std::cmp::min;
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read as _, Seek as _};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,6 +25,12 @@ use tarpc::client::RpcError;
 use tarpc::client::stub::Stub;
 use tarpc::context;
 use tarpc::server::Channel;
+use tokio::fs::{self, File, OpenOptions};
+use tokio::io::AsyncReadExt as _;
+use tokio::io::AsyncSeekExt as _;
+use tokio::io::AsyncWriteExt as _;
+use tokio::io::SeekFrom;
+use tokio::task::JoinError;
 use walkdir::WalkDir;
 
 // Move this to the top-level, outside any impl
@@ -136,29 +141,37 @@ impl RealizeServer {
 }
 
 impl RealizeService for RealizeServer {
+    // IMPORTANT: Use async tokio::fs operations or use
+    // spawn_blocking, do *not* use blocking std::fs operations
+    // outside of spawn_blocking.
+
     async fn list(
         self,
         _: tarpc::context::Context,
         dir_id: DirectoryId,
         options: Options,
     ) -> Result<Vec<SyncedFile>> {
-        let dir = self.find_directory(&dir_id)?;
-        let mut files = std::collections::BTreeMap::new();
-        for entry in WalkDir::new(dir.path()).into_iter().flatten() {
-            if let Some((state, logical)) = LogicalPath::from_actual(dir, entry.path()) {
-                if options.ignore_partial && state == SyncedFileState::Partial {
-                    continue;
-                }
-                let path = logical.relative_path().to_path_buf();
-                if state == SyncedFileState::Final && files.contains_key(&path) {
-                    continue;
-                }
-                let size = entry.metadata()?.size();
-                files.insert(path.clone(), SyncedFile { path, size, state });
-            }
-        }
+        let dir = self.find_directory(&dir_id)?.clone();
 
-        Ok(files.into_values().collect())
+        tokio::task::spawn_blocking(move || {
+            let mut files = std::collections::BTreeMap::new();
+            for entry in WalkDir::new(dir.path()).into_iter().flatten() {
+                if let Some((state, logical)) = LogicalPath::from_actual(&dir, entry.path()) {
+                    if options.ignore_partial && state == SyncedFileState::Partial {
+                        continue;
+                    }
+                    let path = logical.relative_path().to_path_buf();
+                    if state == SyncedFileState::Final && files.contains_key(&path) {
+                        continue;
+                    }
+                    let size = entry.metadata()?.size();
+                    files.insert(path.clone(), SyncedFile { path, size, state });
+                }
+            }
+
+            Ok::<Vec<SyncedFile>, RealizeError>(files.into_values().collect())
+        })
+        .await?
     }
 
     async fn read(
@@ -171,14 +184,15 @@ impl RealizeService for RealizeServer {
     ) -> Result<Vec<u8>> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
-        let (_, actual) = logical.find(&options)?;
+        let (_, actual) = logical.find(&options).await?;
         let mut file = OpenOptions::new()
             .create(false)
             .read(true)
             .write(false)
-            .open(&actual)?;
+            .open(&actual)
+            .await?;
         let mut buffer = vec![0; (range.1 - range.0) as usize];
-        partial_read(&mut file, &range, &mut buffer)?;
+        partial_read(&mut file, &range, &mut buffer).await?;
         Ok(buffer)
     }
 
@@ -195,29 +209,30 @@ impl RealizeService for RealizeServer {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
         let path = logical.partial_path();
-        if let Ok((state, actual)) = logical.find(&options) {
+        if let Ok((state, actual)) = logical.find(&options).await {
             // File already exists
             if state == SyncedFileState::Final {
-                fs::rename(actual, &path)?;
+                fs::rename(actual, &path).await?;
             }
         } else {
             // Open will need to create the file. Ensure parent
             // directory exists beforehand.
             if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
+                fs::create_dir_all(parent).await?;
             }
         }
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
-            .open(&path)?;
-        file.seek(SeekFrom::Start(range.0))?;
-        file.write_all(&data)?;
+            .open(&path)
+            .await?;
+        file.seek(SeekFrom::Start(range.0)).await?;
+        file.write_all(&data).await?;
 
-        let file_len = file.metadata()?.len();
+        let file_len = file.metadata().await?.len();
         if file_len > file_size {
-            file.set_len(file_size)?;
+            file.set_len(file_size).await?;
         }
 
         Ok(())
@@ -237,8 +252,8 @@ impl RealizeService for RealizeServer {
                 "Invalid option for finish: ignore_partial=true".to_string(),
             ));
         }
-        if let (SyncedFileState::Partial, real_path) = logical.find(&options)? {
-            fs::rename(real_path, logical.final_path())?;
+        if let (SyncedFileState::Partial, real_path) = logical.find(&options).await? {
+            fs::rename(real_path, logical.final_path()).await?;
         }
         Ok(())
     }
@@ -253,36 +268,40 @@ impl RealizeService for RealizeServer {
     ) -> Result<Hash> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
-        let (_state, actual) = logical.find(&options)?;
-        let mut file = fs::File::open(&actual)?;
-        if file.seek(std::io::SeekFrom::Start(range.0)).is_err() {
-            // We return an empty hash instead of failing, because we
-            // want hash comparison to fail if the file isn't of the
-            // expected size, not get an I/O error.
-            return Ok(Hash::zero());
-        }
+        let (_, actual) = logical.find(&options).await?;
 
-        let mut hasher = Sha256::new();
-        let mut buffer = [0u8; 8192];
-        let mut remaining = range.1 - range.0;
-        while remaining > 0 {
-            let mut bufsize = buffer.len();
-            if bufsize as u64 > remaining {
-                bufsize = remaining as usize;
+        tokio::task::spawn_blocking(move || {
+            let mut file = std::fs::File::open(&actual)?;
+            if file.seek(std::io::SeekFrom::Start(range.0)).is_err() {
+                // We return an empty hash instead of failing, because we
+                // want hash comparison to fail if the file isn't of the
+                // expected size, not get an I/O error.
+                return Ok(Hash::zero());
             }
-            let n = file.read(&mut buffer[0..bufsize])?;
-            if n == 0 {
-                break;
+            let mut hasher = Sha256::new();
+            let mut buffer = [0u8; 8192];
+            let mut remaining = range.1 - range.0;
+            while remaining > 0 {
+                let mut bufsize = buffer.len();
+                if bufsize as u64 > remaining {
+                    bufsize = remaining as usize;
+                }
+                let n = file.read(&mut buffer[0..bufsize])?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..n]);
+                remaining -= n as u64;
             }
-            hasher.update(&buffer[..n]);
-            remaining -= n as u64;
-        }
-        if remaining > 0 {
-            // Short read. Make sure the hashes don't match.
-            return Ok(Hash::zero());
-        }
-        let hash = hasher.finalize();
-        Ok(Hash(hash.into()))
+            if remaining > 0 {
+                // Short read. Make sure the hashes don't match.
+                return Ok(Hash::zero());
+            }
+
+            let hash = hasher.finalize();
+            Ok(Hash(hash.into()))
+        })
+        .await?
     }
 
     async fn delete(
@@ -294,18 +313,15 @@ impl RealizeService for RealizeServer {
     ) -> Result<()> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
-        let mut _any_deleted = false;
         let final_path = logical.final_path();
         let partial_path = logical.partial_path();
         if final_path.exists() {
-            fs::remove_file(&final_path)?;
-            _any_deleted = true;
+            fs::remove_file(&final_path).await?;
         }
         if partial_path.exists() && !options.ignore_partial {
-            fs::remove_file(&partial_path)?;
-            _any_deleted = true;
+            fs::remove_file(&partial_path).await?;
         }
-        delete_containing_dir(dir.path(), &relative_path);
+        delete_containing_dir(dir.path(), &relative_path).await;
         Ok(())
     }
 
@@ -319,10 +335,10 @@ impl RealizeService for RealizeServer {
     ) -> Result<crate::model::service::Signature> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
-        let (_, actual) = logical.find(&options)?;
-        let mut file = std::fs::File::open(&actual)?;
+        let (_, actual) = logical.find(&options).await?;
+        let mut file = File::open(&actual).await?;
         let mut buffer = vec![0u8; (range.1 - range.0) as usize];
-        partial_read(&mut file, &range, &mut buffer)?;
+        partial_read(&mut file, &range, &mut buffer).await?;
         let opts = SignatureOptions {
             block_size: RSYNC_BLOCK_SIZE as u32,
             crypto_hash_size: 8,
@@ -343,9 +359,9 @@ impl RealizeService for RealizeServer {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
         let mut buffer = vec![0u8; (range.1 - range.0) as usize];
-        if let Ok((_, actual)) = logical.find(&options) {
-            let mut file = std::fs::File::open(&actual)?;
-            partial_read(&mut file, &range, &mut buffer)?;
+        if let Ok((_, actual)) = logical.find(&options).await {
+            let mut file = File::open(&actual).await?;
+            partial_read(&mut file, &range, &mut buffer).await?;
         }
         let sig = RsyncSignature::deserialize(signature.0)?;
         let mut delta = Vec::new();
@@ -365,7 +381,7 @@ impl RealizeService for RealizeServer {
     ) -> Result<()> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
-        let (state, actual) = logical.find(&options)?;
+        let (state, actual) = logical.find(&options).await?;
         // Always apply to partial file
         let partial_path = logical.partial_path();
         if state == SyncedFileState::Final {
@@ -376,9 +392,10 @@ impl RealizeService for RealizeServer {
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&partial_path)?;
+            .open(&partial_path)
+            .await?;
         let mut base = vec![0u8; (range.1 - range.0) as usize];
-        partial_read(&mut file, &range, &mut base)?;
+        partial_read(&mut file, &range, &mut base).await?;
         let mut out = Vec::new();
         rsync_apply_limited(&base, &delta.0, &mut out, (range.1 - range.0) as usize)?;
         if out.len() as u64 != range.1 - range.0 {
@@ -386,11 +403,11 @@ impl RealizeService for RealizeServer {
                 "Delta output size mismatch".to_string(),
             ));
         }
-        file.seek(std::io::SeekFrom::Start(range.0))?;
-        file.write_all(&out)?;
-        let file_len = file.metadata()?.len();
+        file.seek(std::io::SeekFrom::Start(range.0)).await?;
+        file.write_all(&out).await?;
+        let file_len = file.metadata().await?.len();
         if file_len > file_size {
-            file.set_len(file_size)?;
+            file.set_len(file_size).await?;
         }
         Ok(())
     }
@@ -416,16 +433,16 @@ impl RealizeService for RealizeServer {
     }
 }
 
-fn partial_read(
+async fn partial_read(
     file: &mut File,
     range: &ByteRange,
     buf: &mut [u8],
 ) -> std::result::Result<(), std::io::Error> {
-    let initial_size = file.metadata()?.size();
+    let initial_size = file.metadata().await?.size();
     if initial_size > range.0 {
-        file.seek(std::io::SeekFrom::Start(range.0))?;
+        file.seek(std::io::SeekFrom::Start(range.0)).await?;
         let read_end = (min(range.1, initial_size) - range.0) as usize;
-        file.read_exact(&mut buf[0..read_end])?;
+        file.read_exact(&mut buf[0..read_end]).await?;
         buf[read_end..].fill(0);
     } else {
         buf.fill(0);
@@ -521,15 +538,15 @@ impl LogicalPath {
     //
     // File with an I/O error of kind [std::io::ErrorKind::NotFound]
     // if no file exists for the logical path.
-    fn find(&self, options: &Options) -> Result<(SyncedFileState, PathBuf)> {
+    async fn find(&self, options: &Options) -> Result<(SyncedFileState, PathBuf)> {
         if !options.ignore_partial {
             let partial = self.partial_path();
-            if partial.exists() {
+            if fs::metadata(&partial).await.is_ok() {
                 return Ok((SyncedFileState::Partial, partial));
             }
         }
         let fpath = self.final_path();
-        if fpath.exists() {
+        if fs::metadata(&fpath).await.is_ok() {
             return Ok((SyncedFileState::Final, fpath));
         }
         Err(std::io::Error::from(std::io::ErrorKind::NotFound).into())
@@ -572,6 +589,12 @@ impl From<walkdir::Error> for RealizeError {
     }
 }
 
+impl From<JoinError> for RealizeError {
+    fn from(err: JoinError) -> Self {
+        anyhow::Error::new(err).into()
+    }
+}
+
 // Add error conversions for fast_rsync errors
 impl From<fast_rsync::DiffError> for RealizeError {
     fn from(e: fast_rsync::DiffError) -> Self {
@@ -593,22 +616,34 @@ impl From<fast_rsync::SignatureParseError> for RealizeError {
 /// Remove empty parent directories of [relative_path].
 ///
 /// Errors are ignored. Deleting just stops.
-fn delete_containing_dir(root: &Path, relative_path: &Path) {
+async fn delete_containing_dir(root: &Path, relative_path: &Path) {
     let mut current = relative_path;
     while let Some(parent) = current.parent() {
         if parent.as_os_str().is_empty() {
             return;
         }
         let full_path = root.join(parent);
-        let is_empty = full_path
-            .read_dir()
-            .map(|mut i| i.next().is_none())
-            .unwrap_or(false);
-        if !is_empty || fs::remove_dir(full_path).is_err() {
+        let is_empty = is_empty_dir(&full_path).await;
+        if !is_empty || fs::remove_dir(full_path).await.is_err() {
             return;
         }
         current = parent;
     }
+}
+
+async fn is_empty_dir(path: &Path) -> bool {
+    let path = path.to_path_buf();
+    let ret = tokio::task::spawn_blocking(move || {
+        std::fs::read_dir(path)
+            .map(|mut i| i.next().is_none())
+            .unwrap_or(false)
+    })
+    .await;
+
+    if let Ok(is_empty) = ret {
+        return is_empty;
+    }
+    return false;
 }
 
 #[cfg(test)]
@@ -631,8 +666,8 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn test_final_and_partial_paths() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn test_final_and_partial_paths() -> anyhow::Result<()> {
         let dir = Arc::new(Directory::new(
             &DirectoryId::from("testdir"),
             &PathBuf::from("/doesnotexist/testdir"),
@@ -661,8 +696,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_find_logical_path() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn test_find_logical_path() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let dir = Arc::new(Directory::new(&DirectoryId::from("testdir"), temp.path()));
         let opts = Options::default();
@@ -670,7 +705,9 @@ mod tests {
         temp.child("foo.txt").write_str("test")?;
         assert_eq!(
             (SyncedFileState::Final, temp.child("foo.txt").to_path_buf()),
-            LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?.find(&opts)?
+            LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?
+                .find(&opts)
+                .await?
         );
 
         temp.child("subdir/foo2.txt").write_str("test")?;
@@ -679,7 +716,9 @@ mod tests {
                 SyncedFileState::Final,
                 temp.child("subdir/foo2.txt").to_path_buf()
             ),
-            LogicalPath::new(&dir, &PathBuf::from("subdir/foo2.txt"))?.find(&opts)?
+            LogicalPath::new(&dir, &PathBuf::from("subdir/foo2.txt"))?
+                .find(&opts)
+                .await?
         );
 
         temp.child(".bar.txt.part").write_str("test")?;
@@ -688,7 +727,9 @@ mod tests {
                 SyncedFileState::Partial,
                 temp.child(".bar.txt.part").to_path_buf()
             ),
-            LogicalPath::new(&dir, &PathBuf::from("bar.txt"))?.find(&opts)?
+            LogicalPath::new(&dir, &PathBuf::from("bar.txt"))?
+                .find(&opts)
+                .await?
         );
 
         temp.child("subdir/.bar2.txt.part").write_str("test")?;
@@ -697,19 +738,23 @@ mod tests {
                 SyncedFileState::Partial,
                 temp.child("subdir/.bar2.txt.part").to_path_buf()
             ),
-            LogicalPath::new(&dir, &PathBuf::from("subdir/bar2.txt"))?.find(&opts)?
+            LogicalPath::new(&dir, &PathBuf::from("subdir/bar2.txt"))?
+                .find(&opts)
+                .await?
         );
 
         assert!(matches!(
-            LogicalPath::new(&dir, &PathBuf::from("notfound.txt"))?.find(&opts),
+            LogicalPath::new(&dir, &PathBuf::from("notfound.txt"))?
+                .find(&opts)
+                .await,
             Err(RealizeError::Io(_))
         ));
 
         Ok(())
     }
 
-    #[test]
-    fn test_find_logical_path_partial_and_final() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn test_find_logical_path_partial_and_final() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let dir = Arc::new(Directory::new(&DirectoryId::from("testdir"), temp.path()));
         let opts = Options::default();
@@ -724,18 +769,22 @@ mod tests {
                 SyncedFileState::Partial,
                 temp.child(".foo.txt.part").to_path_buf()
             ),
-            LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?.find(&opts)?
+            LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?
+                .find(&opts)
+                .await?
         );
         assert_eq!(
             (SyncedFileState::Final, temp.child("foo.txt").to_path_buf()),
-            LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?.find(&nopartial)?
+            LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?
+                .find(&nopartial)
+                .await?
         );
 
         Ok(())
     }
 
-    #[test]
-    fn test_find_logical_path_ignore_partial() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn test_find_logical_path_ignore_partial() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let dir = Arc::new(Directory::new(&DirectoryId::from("testdir"), temp.path()));
         let nopartial = Options {
@@ -746,20 +795,23 @@ mod tests {
         assert!(
             LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?
                 .find(&nopartial)
+                .await
                 .is_err()
         );
 
         temp.child("bar.txt").write_str("test")?;
         assert_eq!(
             (SyncedFileState::Final, temp.child("bar.txt").to_path_buf()),
-            LogicalPath::new(&dir, &PathBuf::from("bar.txt"))?.find(&nopartial)?
+            LogicalPath::new(&dir, &PathBuf::from("bar.txt"))?
+                .find(&nopartial)
+                .await?
         );
 
         Ok(())
     }
 
-    #[test]
-    fn test_logical_path_validation_relative() {
+    #[tokio::test]
+    async fn test_logical_path_validation_relative() {
         let dir = Arc::new(Directory::new(
             &DirectoryId::from("testdir"),
             &PathBuf::from("/tmp/testdir"),
@@ -1210,7 +1262,7 @@ mod tests {
         assert!(res.is_ok());
         // File should now match new_content
         let logical = LogicalPath::new(&dir, &file_path)?;
-        let (_state, actual) = logical.find(&Options::default())?;
+        let (_state, actual) = logical.find(&Options::default()).await?;
         let mut buf = Vec::new();
         std::fs::File::open(&actual)?.read_to_end(&mut buf)?;
         assert_eq!(&buf[..new_content.len()], new_content);
@@ -1316,7 +1368,7 @@ mod tests {
         assert!(res.is_ok());
         // File should now match new_content and be truncated
         let logical = LogicalPath::new(&dir, &file_path)?;
-        let (_state, actual) = logical.find(&Options::default())?;
+        let (_state, actual) = logical.find(&Options::default()).await?;
         let mut buf = Vec::new();
         std::fs::File::open(&actual)?.read_to_end(&mut buf)?;
         assert_eq!(&buf, new_content);
