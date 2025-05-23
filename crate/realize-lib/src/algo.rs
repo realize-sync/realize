@@ -4,14 +4,13 @@
 //! using the RealizeService trait. See spec/design.md for details.
 
 use crate::model::service::{
-    DirectoryId, Hash, Options, RealizeError, RealizeServiceClient, RealizeServiceRequest,
-    RealizeServiceResponse, SyncedFile,
+    ByteRange, DirectoryId, Hash, Options, RealizeError, RealizeServiceClient,
+    RealizeServiceRequest, RealizeServiceResponse, SyncedFile,
 };
 use futures::future;
 use futures::future::Either;
 use futures::stream::StreamExt as _;
 use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
-use std::cmp::min;
 use std::sync::Arc;
 use std::{collections::HashMap, path::Path};
 use tarpc::client::stub::Stub;
@@ -266,17 +265,9 @@ where
     let path = src_file.path.as_path();
     let src_size = src_file.size;
     let dst_size = dst_file.map(|f| f.size).unwrap_or(0);
-    let path_buf = src_file.path.clone();
     let dir_id = dir_id.clone();
-    if let Some(tx) = &progress_tx {
-        let _ = tx
-            .send(ProgressEvent::VerifyingFile {
-                dir_id: dir_id.clone(),
-                path: path_buf.clone(),
-            })
-            .await;
-    }
-    // Compute source hash only once
+
+    // Check the file if it already exists
     let mut src_hash = Either::Left(hash_file(
         ctx,
         src,
@@ -287,6 +278,7 @@ where
         src_options(),
     ));
     if src_size == dst_size {
+        report_verifying(&progress_tx, &dir_id, path).await;
         let hash = match src_hash {
             Either::Left(fut) => fut.await?,
             Either::Right(hash) => hash,
@@ -296,83 +288,20 @@ where
         }
         src_hash = Either::Right(hash);
     }
+
     // Chunked Transfer
-    let mut offset: u64 = 0;
-    let mut rsyncing = true;
-    let mut _copy_lock = None;
-    if let Some(tx) = &progress_tx {
-        let _ = tx
-            .send(ProgressEvent::RsyncingFile {
-                dir_id: dir_id.clone(),
-                path: path_buf.clone(),
-            })
-            .await;
-    }
-    while offset < src_size {
-        let mut end = offset + CHUNK_SIZE;
-        if end > src_file.size {
-            end = src_file.size;
-        }
-        let range = (offset, end);
-        if dst_size <= offset {
-            if rsyncing {
-                if let Some(tx) = &progress_tx {
-                    let _ = tx
-                        .send(ProgressEvent::CopyingFile {
-                            dir_id: dir_id.clone(),
-                            path: path_buf.clone(),
-                        })
-                        .await;
-                }
-                rsyncing = false;
-                _copy_lock = Some(copy_sem.acquire().await.unwrap());
-                log::debug!("Copy semaphore locked for {}", src_file.path.display());
-            }
-            // Send data
-            log::debug!("{}:{:?} sending range {:?}", dir_id, path, range);
-            let data = src
-                .read(
-                    ctx,
-                    dir_id.clone(),
-                    path.to_path_buf(),
-                    range,
-                    src_options(),
-                )
-                .await??;
-            METRIC_READ_BYTES
-                .with_label_values(&["read"])
-                .inc_by(data.len() as u64);
-            METRIC_RANGE_READ_BYTES
-                .with_label_values(&["read"])
-                .inc_by(range.1 - range.0);
-            dst.send(
-                ctx,
-                dir_id.clone(),
-                path.to_path_buf(),
-                range,
-                src_file.size,
-                data.clone(),
-                dst_options(),
-            )
-            .await??;
-            METRIC_WRITE_BYTES
-                .with_label_values(&["send"])
-                .inc_by(data.len() as u64);
-            METRIC_RANGE_WRITE_BYTES
-                .with_label_values(&["send"])
-                .inc_by(range.1 - range.0);
-            if let Some(tx) = &progress_tx {
-                let _ = tx
-                    .send(ProgressEvent::IncrementByteCount {
-                        dir_id: dir_id.clone(),
-                        path: path_buf.clone(),
-                        bytecount: end - offset,
-                    })
-                    .await;
-            }
-        } else {
-            // Compute diff and apply
-            log::debug!("{}:{:?} rsync on range {:?}", dir_id, path, range);
+    let ranges = ByteRangeIterator::new(src_size, CHUNK_SIZE);
+    let mut rsync_ranges = ranges
+        .clone()
+        .filter(|(offset, _)| *offset < dst_size)
+        .peekable();
+    let mut copy_ranges = ranges.filter(|(offset, _)| *offset >= dst_size).peekable();
+
+    // 1. Check existing data (rsyncing)
+    if rsync_ranges.peek().is_some() {
+        report_rsyncing(&progress_tx, &dir_id, path).await;
+
+        for range in rsync_ranges {
             let sig = dst
                 .calculate_signature(
                     ctx,
@@ -408,39 +337,123 @@ where
                 dst_options(),
             )
             .await??;
-            if let Some(tx) = &progress_tx {
-                let _ = tx
-                    .send(ProgressEvent::IncrementByteCount {
-                        dir_id: dir_id.clone(),
-                        path: path_buf.clone(),
-                        bytecount: end - offset,
-                    })
-                    .await;
-            }
+            report_range_progress(&progress_tx, &dir_id, path, &range).await;
         }
-        offset = end;
     }
-    if let Some(tx) = &progress_tx {
-        let _ = tx
-            .send(ProgressEvent::VerifyingFile {
-                dir_id: dir_id.clone(),
-                path: path_buf.clone(),
-            })
-            .await;
+
+    // 2. Copy missyng data
+    if copy_ranges.peek().is_some() {
+        report_copying(&progress_tx, &dir_id, path).await;
+
+        let _lock = copy_sem.acquire().await;
+        for range in copy_ranges {
+            let data = src
+                .read(
+                    ctx,
+                    dir_id.clone(),
+                    path.to_path_buf(),
+                    range,
+                    src_options(),
+                )
+                .await??;
+            METRIC_READ_BYTES
+                .with_label_values(&["read"])
+                .inc_by(data.len() as u64);
+            METRIC_RANGE_READ_BYTES
+                .with_label_values(&["read"])
+                .inc_by(range.1 - range.0);
+            dst.send(
+                ctx,
+                dir_id.clone(),
+                path.to_path_buf(),
+                range,
+                src_file.size,
+                data.clone(),
+                dst_options(),
+            )
+            .await??;
+            METRIC_WRITE_BYTES
+                .with_label_values(&["send"])
+                .inc_by(data.len() as u64);
+            METRIC_RANGE_WRITE_BYTES
+                .with_label_values(&["send"])
+                .inc_by(range.1 - range.0);
+            report_range_progress(&progress_tx, &dir_id, path, &range).await;
+        }
     }
-    if let Some(_) = _copy_lock {
-        log::debug!("Copy semaphore unlocked for {}", src_file.path.display());
-    }
-    drop(_copy_lock);
+
+    // 3. Check full file and delete
+    report_verifying(&progress_tx, &dir_id, path).await;
     let hash = match src_hash {
         Either::Left(hash) => hash.await?,
         Either::Right(hash) => hash,
     };
     if !check_hashes_and_delete(ctx, &hash, src_size, src, dst, &dir_id, path).await? {
-        // Only emit FileError here for FailedToSync, all other errors are handled by the caller
         return Err(MoveFileError::FailedToSync);
     }
     Ok(())
+}
+
+async fn report_copying(
+    progress_tx: &Option<Sender<ProgressEvent>>,
+    dir_id: &DirectoryId,
+    path: &Path,
+) {
+    if let Some(tx) = progress_tx {
+        let _ = tx
+            .send(ProgressEvent::CopyingFile {
+                dir_id: dir_id.clone(),
+                path: path.to_path_buf(),
+            })
+            .await;
+    }
+}
+
+async fn report_rsyncing(
+    progress_tx: &Option<Sender<ProgressEvent>>,
+    dir_id: &DirectoryId,
+    path: &Path,
+) {
+    if let Some(tx) = progress_tx {
+        let _ = tx
+            .send(ProgressEvent::RsyncingFile {
+                dir_id: dir_id.clone(),
+                path: path.to_path_buf(),
+            })
+            .await;
+    }
+}
+
+async fn report_verifying(
+    progress_tx: &Option<Sender<ProgressEvent>>,
+    dir_id: &DirectoryId,
+    path: &Path,
+) {
+    if let Some(tx) = progress_tx {
+        let _ = tx
+            .send(ProgressEvent::VerifyingFile {
+                dir_id: dir_id.clone(),
+                path: path.to_path_buf(),
+            })
+            .await;
+    }
+}
+
+async fn report_range_progress(
+    progress_tx: &Option<Sender<ProgressEvent>>,
+    dir_id: &DirectoryId,
+    path: &Path,
+    range: &ByteRange,
+) {
+    if let Some(tx) = progress_tx {
+        let _ = tx
+            .send(ProgressEvent::IncrementByteCount {
+                dir_id: dir_id.clone(),
+                path: path.to_path_buf(),
+                bytecount: range.1 - range.0,
+            })
+            .await;
+    }
 }
 
 /// Check hashes and, if they match, finish the dest file and delete the source.
@@ -934,15 +947,7 @@ pub(crate) async fn hash_file<T>(
 where
     T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
 {
-    let mut offset = 0;
-    let mut ranges = vec![];
-    while offset < file_size {
-        let end = min(file_size, offset + chunk_size);
-        ranges.push((offset, end));
-        offset = end;
-    }
-
-    let results = futures::stream::iter(ranges.into_iter())
+    let results = futures::stream::iter(ByteRangeIterator::new(file_size, chunk_size))
         .map(|range| {
             client.hash(
                 ctx,
@@ -962,6 +967,41 @@ where
     }
 
     Ok(all_hashes)
+}
+
+/// Split [0, total) into chunks of the given size.
+#[derive(Clone)]
+struct ByteRangeIterator {
+    total: u64,
+    chunk_size: u64,
+    offset: u64,
+}
+impl ByteRangeIterator {
+    fn new(total: u64, chunk_size: u64) -> Self {
+        ByteRangeIterator {
+            total,
+            chunk_size,
+            offset: 0,
+        }
+    }
+}
+impl Iterator for ByteRangeIterator {
+    type Item = ByteRange;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset >= self.total {
+            return None;
+        }
+
+        let mut end = self.offset + self.chunk_size;
+        if end > self.total {
+            end = self.total;
+        }
+        let range = (self.offset, end);
+        self.offset = end;
+
+        Some(range)
+    }
 }
 
 /// Errors returned by [move_files]
