@@ -10,7 +10,7 @@ use crate::model::service::{
 use futures::future;
 use futures::future::Either;
 use futures::stream::StreamExt as _;
-use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
+use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
 use std::cmp::min;
 use std::sync::Arc;
 use std::{collections::HashMap, path::Path};
@@ -424,8 +424,8 @@ mod tests {
     use super::*;
     use crate::model::service::DirectoryId;
     use crate::server::{self, DirectoryMap};
-    use assert_fs::prelude::*;
     use assert_fs::TempDir;
+    use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
     use sha2::Digest as _;
     use std::path::PathBuf;
@@ -921,7 +921,7 @@ where
                 options,
             )
         })
-        .buffer_unordered(PARALLEL_FILE_HASH)
+        .buffered(PARALLEL_FILE_HASH)
         .collect::<Vec<_>>()
         .await;
 
