@@ -1,0 +1,146 @@
+---
+description: 
+globs: crate/realize-lib/src/server.rs
+alwaysApply: false
+---
+
+## Description
+
+Server must only use async FS and I/O operations
+
+## Name
+
+async-io-only-in-server
+
+## Rule
+Whenever changing code in the RealizeServer, remember that *all* FS or
+I/O operations must be async.
+
+* Use async I/O and FS functions instead of sync I/O and FS (see definition below)
+
+* When no equivalent exist or are practical, use sync I/O or FS functions 
+  but inside a `tokio::task::spawn_blocking`
+
+* When making many small operations, such reads or writes with a small
+  buffer, use sync functions inside a `tokio::task::spawn_blocking`
+
+Non-async I/O and FS functions:
+
+ - functions and methods in `std::fs:*`
+
+ - functions and methods `std::io:*`
+
+ - methods on `std::path:Path.*` such as `exists()` that access the
+   filesystem, but those that just manipulate the path, such as
+   parent() are OK to use in all situations.
+
+Async I/O and FS functions:
+
+ - `tokio::fs:*`
+
+ - `tokio::io:*`
+
+ - `tokio::task::spawn_blocking(move || { ... non-async I/O is ok here ... })`
+
+Note: enums and such from `std::fs` or `std::io` are sometimes used in
+`tokio::fs` functions, like `std::io::SeekFrom`. That's ok, since
+these don't *do* anything they're not non-async.
+
+## Rationale
+
+* RealizeServer implements RPCs to serve on the daemon
+* RPCs are processed concurrently using Tokio async, but not necessarily in parallel
+* Running blocking FS or I/O locks up the thread and prevent concurrent operations
+
+## Examples
+
+### Use Tokio equivalent when available
+
+```rust
+  use std::io::Seek as _;
+  use std::io::Read as _;
+
+  let mut file = std::fs::File::open(&path)?; // BAD
+  file.seek(std::io::SeekFrom::Start(range.0))?; // BAD
+  let mut buffer = [0u8; 8192];
+  let n = file.read(&buf)?; // BAD
+```
+
+```rust
+  use tokio::io::AsyncSeekExt as _;
+  use tokio::io::AsyncReadExt as _;
+
+  let mut file = tokio::fs::File::open(&path).await?; // GOOD
+  file.seek(std::io::SeekFrom::Start(range.0)).await?; // GOOD
+  let mut buffer = [0u8; 8192];
+  let n = file.read(&buf).await?; // GOOD
+```
+
+### Use spawn_blocking when no equivalent exist
+
+```rust
+  for entry in WalkDir::new(dir.path()).into_iter() { // BAD
+    ...
+  }
+```
+
+```rust
+  tokio::task::spawn_blocking(move || {  // OK; inside spawn_blocking
+    for entry in WalkDir::new(dir.path()).into_iter() {
+      ...
+    }
+
+    Ok(())
+  }.await??;
+```
+
+Note the two ? on `.await??`: one ? is for spawn_blocking failing, one
+? is for the code inside of spawn_blocking failing. The returned type
+would be, here `Result<Result<(), RealizeError>, JoinError>`.
+
+If we just wanted a `Result<T, RealizeError>` instead, to return from
+a RealizeServer function, we have just done `.await?` with one ?
+instead.
+
+### Remember to flush after an async write
+
+```rust
+  use tokio::io::AsyncWriteEx as _;
+
+  async fn do_write(path: &Path) -> anyhow::Result<()> {
+    let mut file = tokio::fs::OpenOptions::new().write(true).open(&path).await?;
+    file.write_all(&out).await?;
+    // BAD: file is closed without flushing
+  }
+```
+
+```rust
+  use tokio::io::AsyncWriteEx as _;
+
+  async fn do_write(path: &Path) -> anyhow::Result<()> {
+    let mut file = tokio::fs::OpenOptions::new().write(true).open(&path).await?;
+    file.write_all(&out).await?;
+    file.flush().await? // GOOD
+  }
+```
+
+### Non-async I/O hidden inside of Path/PathBuf
+
+```rust
+  let path: PathBuf;
+  if path.exists() { // BAD
+     do_something_with_path(&path);
+  }
+```
+
+```rust
+  let path: PathBuf;
+  if tokio::fs::metadata(&path).await.is_ok() { // GOOD
+    do_something_with_path(&path);
+  }
+```
+
+## Reference
+
+- [Documentation of the tokio module FS](https://docs.rs/tokio/latest/tokio/fs/index.html)
+
