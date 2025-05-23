@@ -103,17 +103,9 @@ async fn main() {
     env_logger::init();
 
     let cli = Cli::parse();
-    // Set deadline context
-    let max_duration = cli
-        .max_duration
-        .map(|d| d.into())
-        .unwrap_or_else(|| std::time::Duration::from_secs(24 * 60 * 60));
-    let deadline = std::time::Instant::now() + max_duration;
-    let mut ctx = context::current();
-    ctx.deadline = deadline;
 
     let mut status = 0;
-    if let Err(err) = execute(&cli, ctx).await {
+    if let Err(err) = execute(&cli).await {
         print_error(&format!("{err:#}"));
         status = 1;
     };
@@ -130,7 +122,7 @@ async fn main() {
     process::exit(status);
 }
 
-async fn execute(cli: &Cli, ctx: context::Context) -> anyhow::Result<()> {
+async fn execute(cli: &Cli) -> anyhow::Result<()> {
     METRIC_UP.reset(); // Set it to 0, so it's available
     if let Some(addr) = &cli.metrics_addr {
         metrics::export_metrics(addr)
@@ -138,26 +130,39 @@ async fn execute(cli: &Cli, ctx: context::Context) -> anyhow::Result<()> {
             .with_context(|| format!("Failed to export metrics on {addr}"))?;
     }
 
+    let mut ctx = context::current();
+    ctx.deadline = std::time::Instant::now()
+        + cli
+            .max_duration
+            .map(|d| d.into())
+            .unwrap_or_else(|| std::time::Duration::from_secs(24 * 60 * 60));
+
     let privkey = load_private_key_file(&cli.privkey)
         .with_context(|| format!("{}: Invalid private key file", cli.privkey.display()))?;
 
     let verifier = build_peer_verifier(&cli.peers)
         .with_context(|| format!("{}: Invalid peer file", cli.peers.display()))?;
 
-    // Build src client
-    let src_hostport = HostPort::parse(&cli.src_addr)
-        .await
-        .with_context(|| format!("Failed to resolve --src-addr {}", cli.src_addr))?;
-    let src_client = tcp::connect_client(
-        &src_hostport,
-        Arc::clone(&verifier),
-        Arc::clone(&privkey),
-        tcp::ClientOptions::default(),
-    )
-    .await
-    .with_context(|| format!("Connection to src {} failed", cli.src_addr))?;
+    let (src_client, dst_client) = tokio::join!(
+        connect(
+            "--src-addr",
+            &cli.src_addr,
+            None,
+            privkey.clone(),
+            verifier.clone(),
+        ),
+        connect(
+            "--dst-addr",
+            &cli.dst_addr,
+            cli.throttle_up,
+            privkey,
+            verifier,
+        )
+    );
 
-    // Apply throttle limits if set
+    let src_client = src_client?;
+    let dst_client = dst_client?;
+
     if let Some(limit) = cli.throttle_down {
         if let Some(val) = configure_limit(&src_client, limit)
             .await
@@ -167,31 +172,11 @@ async fn execute(cli: &Cli, ctx: context::Context) -> anyhow::Result<()> {
         }
     }
 
-    // Build dst client
-    let dst_hostport = HostPort::parse(&cli.dst_addr)
-        .await
-        .with_context(|| format!("Failed to resolve --dst-addr {}", cli.dst_addr))?;
-    let dst_client = {
-        let mut options = tcp::ClientOptions::default();
-        if let Some(limit) = cli.throttle_up {
-            log::info!("Throttling uploads: {}/s", HumanBytes(limit));
-            options.limiter = Some(Limiter::<StandardClock>::new(limit as f64));
-        }
-        tcp::connect_client(
-            &dst_hostport,
-            Arc::clone(&verifier),
-            Arc::clone(&privkey),
-            options,
-        )
-        .await
-        .with_context(|| format!("Connection to dst {dst_hostport} failed"))?
-    };
-
     METRIC_UP.inc();
 
-    // Move files for each directory id
     let mut cli_progress = CliProgress::new(cli.quiet, cli.directory_ids.len());
     let (progress_tx, progress_rx) = mpsc::channel(32);
+
     let (res, _) = tokio::join!(
         async move {
             let mut total_success = 0;
@@ -257,6 +242,30 @@ async fn execute(cli: &Cli, ctx: context::Context) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn connect(
+    argument: &str,
+    addr: &str,
+    limit: Option<u64>,
+    privkey: Arc<dyn SigningKey>,
+    verifier: Arc<PeerVerifier>,
+) -> anyhow::Result<realize_lib::model::service::RealizeServiceClient<tcp::TcpStub>, anyhow::Error>
+{
+    let addr = HostPort::parse(addr)
+        .await
+        .with_context(|| format!("Failed to resolve {} {}", argument, addr))?;
+    let mut options = tcp::ClientOptions::default();
+    if let Some(limit) = limit {
+        log::info!("Throttling uploads: {}/s", HumanBytes(limit));
+        options.limiter = Some(Limiter::<StandardClock>::new(limit as f64));
+    }
+
+    Ok(
+        tcp::connect_client(&addr, Arc::clone(&verifier), Arc::clone(&privkey), options)
+            .await
+            .with_context(|| format!("Connection to {argument} {addr} failed"))?,
+    )
 }
 
 /// Set server-site write rate limit on client, return it.
