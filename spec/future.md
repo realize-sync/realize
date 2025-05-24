@@ -3,6 +3,34 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
+## Check all writes {#checkall}
+
+Extend RealizeService method to carry a hash together with the data so
+it can be verified:
+
+- RealizeService::diff returns Delta + Hash
+
+- RealizeService::apply_delta takes a Hash in addition to the delta
+  and fails with a new error RealizeError::HashMismatch if the data to
+  be written doesn't match the hash (don't bother writing the data)
+
+- RealizeService::read returns data + Hash
+
+- RealizeService::write takes data + Hash and fails with
+  RealizeError::HashMismatch if the data it receives doesn't match the
+  hash.
+
+### Task list
+
+1. Extend the methods in crate/realize-lib/src/model/service.rs, check with "cargo check"
+2. Extend the algorithm in move_file crate/realize-lib/src/algo.rs to forward the hashes, check with "cargo check"
+3. In move_file, if apply_diff fails with RealizeError::HashMismatch,
+   log an error at debug level and add the range of the failed
+   operation to copy_ranges so it'll be copied. Check with "cargo check".
+4. Run all tests wih "cargo test"
+
+TODO: find a way of testing apply_diff failures.
+
 ## Ranges {#ranges}
 
 Let's make ByteRange a proper, useful type and use it to optimize
