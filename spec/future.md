@@ -3,6 +3,56 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
+## Extend Hash type {#rehash}
+
+Extend Hash, defined in crate/realize-lib/src/model/service.rs.
+
+Add a new type RangedHash that's a struct that stores hashes and the range they apply to:
+
+  [(ByteRange, Hash), (ByteRange, Hash) ...]
+
+- Add derive for Clone, PartialEq and Eq.
+
+- Extend the output for Debug output to include the ranges. The output
+  for Display should only display the hashes as base64 in order.
+  Display zero hashes as just None.
+
+- methods: add(range, hash) and add_ranged(ranged_hash) - New hashes
+  can be added. The values must be sorted by byterange.
+
+- method: is_complete(filesize) - given the size of the file, make
+  sure all hashes are available (even if they're none )and sorted
+
+- method: diff(other_hash) -> (Vec<ByteRange>, Vec<ByteRange>) - given
+  another hash, return the ranges in which they matches, the ranges in
+  which they don't match. Keep vectors sorted and merge contiguous
+  ranges. Identical hashes would just return the range:
+  somehash.diff(somehash) -> ([(0, filesize)], [])
+
+Use that RangedHash everywhere Hash or Vec<Hash> was used, especially
+in hash_file, defined in crate/realize-lib/src/algo.rs. Update
+check_hash_and_delete to give more information when hashes are
+inconsistent:
+ - the two hashes, as debug output
+ - whether the hash range matched the file's (using is_complete)
+ - what range matched or did not match (from diff)
+
+### Task List
+
+1. Add the new type RangedHash and unit tests for it in
+   crate/realize-lib/src/model/service.rs. Use "cargo check" to make
+   sure it compliles and "cargo test --lib" to make sure the tests
+   pass. Fix any issues.
+
+2. List the places where Hash is used and replace them with
+   RangedHash. Use "cargo check" to make sure it compliles and "cargo
+   test" to make sure the tests pass. Fix any issues.
+
+3. Update hash_file() and check_hash_and_delete() in
+   crate/realize-lib/src/algo.rs to add more information using the new
+   RangedHash methods.
+
+
 ## Command Output {#cmdoutput}
 
 Change argument to control log output in realize-cmd, instead of just --quiet:
