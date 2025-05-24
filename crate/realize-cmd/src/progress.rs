@@ -79,15 +79,21 @@ impl CliProgress {
         self.update_overall_prefix();
     }
 
-    fn for_file(&self, path: &std::path::Path, bytes: u64) -> CliFileProgress {
+    fn for_file(&self, path: &std::path::Path, bytes: u64, available: u64) -> CliFileProgress {
         let path = format!("{}{}", self.path_prefix, path.display());
-        log::info!("Preparing to move {} ({})", path, HumanBytes(bytes));
+        log::info!(
+            "Preparing to move {} ({}/{})",
+            path,
+            HumanBytes(available),
+            HumanBytes(bytes)
+        );
 
         CliFileProgress {
             bar: None,
             next_file_index: self.next_file_index.clone(),
             total_files: self.total_files,
             bytes,
+            available,
             path,
             multi: self.multi.clone(),
             overall_pb: self.overall_pb.clone(),
@@ -175,9 +181,10 @@ impl CliProgress {
                         dir_id,
                         path,
                         bytes,
+                        available,
                         ..
                     }) => {
-                        let fp = self.for_file(&path, bytes);
+                        let fp = self.for_file(&path, bytes, available);
                         file_progress_map.insert((dir_id, path), fp);
                     }
                     Some(VerifyingFile { dir_id, path, .. }) => {
@@ -232,6 +239,10 @@ struct CliFileProgress {
     next_file_index: Arc<AtomicUsize>,
     total_files: usize,
     bytes: u64,
+
+    // Bytes already available at the beginning of the operation; They
+    // are rsynced instead of copied.
+    available: u64,
     path: String,
     multi: MultiProgress,
     overall_pb: ProgressBar,
@@ -273,13 +284,23 @@ impl CliFileProgress {
         pb.set_prefix("Verifying");
     }
     fn rsyncing(&mut self) {
-        log::info!("Rsyncing {} ({})", self.path, HumanBytes(self.bytes));
+        log::info!(
+            "Rsyncing {} ({}/{})",
+            self.path,
+            HumanBytes(self.available),
+            HumanBytes(self.bytes)
+        );
 
         let pb = self.get_or_create_bar();
         pb.set_prefix("Rsyncing");
     }
     fn copying(&mut self) {
-        log::info!("Copying {} ({})", self.path, HumanBytes(self.bytes));
+        log::info!(
+            "Copying {} ({}/{})",
+            self.path,
+            HumanBytes(self.available),
+            HumanBytes(self.bytes)
+        );
 
         let pb = self.get_or_create_bar();
         pb.set_prefix("Copying");

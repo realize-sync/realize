@@ -89,6 +89,9 @@ pub enum ProgressEvent {
         dir_id: DirectoryId,
         path: std::path::PathBuf,
         bytes: u64,
+
+        /// Bytes already available, to be r-synced.
+        available: u64,
     },
     /// File is being verified (hash check).
     VerifyingFile {
@@ -179,6 +182,7 @@ where
                             dir_id: dir_id.clone(),
                             path: file.path.clone(),
                             bytes: file.size,
+                            available: dst_file.map_or(0, |f| f.size),
                         })
                         .await;
                 }
