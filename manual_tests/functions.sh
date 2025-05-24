@@ -3,12 +3,12 @@
 this="$(realpath "$(dirname "$0")")"
 root="$(realpath "${this}/..")"
 bindir="${root}/target/release"
-realize_bin="${bindir}/realize"
-realized_bin="${bindir}/realized"
+realize_bin="${bindir}/realize-cmd"
+realized_bin="${bindir}/realize-daemon"
 rust_log="debug"
 
 function rebuild {
-    cd "${root}" && cargo build --release --bin $1
+    cd "${root}" && cargo build --release -p $1
 }
 
 function maybe_rebuild {
@@ -16,11 +16,11 @@ function maybe_rebuild {
 }
 
 function rebuild_all {
-    cd "${root}" && cargo build --release --bin realize --bin realized
+    rebuild realize-cmd && rebuild realize-daemon
 }
 
 function up_all {
-    maybe_rebuild realized && up a 7001 7002 && up b 8001 8002
+    maybe_rebuild realize-daemon && up a 7001 7002 && up b 8001 8002
 }
 
 function down_all {
@@ -51,7 +51,7 @@ function up {
         echo $pid >"${pidfile}"
     }
     sleep 0.25
-    if pgrep -q -F "${pidfile}" realized 2>/dev/null; then
+    if pgrep -F "${pidfile}" realize-daemon 2>/dev/null; then
         echo "== ${inst} STARTED: PID $pid out ${outfile}"
         head "${outfile}"
         return 0
@@ -66,7 +66,7 @@ function down {
     inst=$1
     pidfile="${this}/${inst}.pid"
 
-    if [ -f "${pidfile}" ] && pgrep -q -F "${pidfile}" realized 2>/dev/null; then
+    if [ -f "${pidfile}" ] && pgrep -F "${pidfile}" realize-daemon 2>/dev/null; then
         pkill -F "${pidfile}"
         echo "=== ${inst} killed"
     else
@@ -85,10 +85,10 @@ function status {
     outfile="${this}/${inst}.out"
     pidfile="${this}/${inst}.pid"
 
-    if [ -f "${pidfile}" ] && pgrep -q -F "${pidfile}" realized 2>/dev/null; then
-        echo "== a UP $(cat "${pidfile}")"
+    if [ -f "${pidfile}" ] && pgrep -F "${pidfile}" realize-daemon 2>/dev/null; then
+        echo "== ${inst} UP $(cat "${pidfile}")"
     else
-        echo "== a DOWN"
+        echo "== ${inst} DOWN"
     fi
     tail "${outfile}"
 }
@@ -105,7 +105,7 @@ function metrics {
     esac
 
     echo "=== metrics $inst at ${port}"
-    curl http://localhost:${port}/metrics
+    curl http://127.0.0.1:${port}/metrics
     echo
 }
 
@@ -113,12 +113,12 @@ function moveall {
     keyfile="${root}/resources/test/client.key"
     peersfile="${root}/resources/test/peers.pem"
 
-    maybe_rebuild realize && \
+    maybe_rebuild realize-cmd && \
         exec "${realize_bin}" \
              --privkey "${keyfile}"\
              --peers "${peersfile}" \
-             --src-addr "localhost:7001" \
-             --dst-addr "localhost:8001" \
+             --src-addr "127.0.0.1:7001" \
+             --dst-addr "127.0.0.1:8001" \
              "$@"
 }
 
