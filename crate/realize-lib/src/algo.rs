@@ -315,6 +315,15 @@ where
         }
     }
 
+    log::debug!(
+        "{}/{} overall: {}, rsync: {}, copy: {}",
+        dir_id,
+        path.display(),
+        ranges,
+        rsync_ranges,
+        copy_ranges
+    );
+
     // 1. Check existing data (rsyncing)
     if !rsync_ranges.is_empty() {
         report_rsyncing(&progress_tx, &dir_id, path).await;
