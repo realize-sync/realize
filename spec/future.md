@@ -41,6 +41,8 @@ ByteRange should implement the methods:
 
  - chunked(&self, chunk_size) -> Vec<ByteRange> to split a range into chunks
 
+*Document the new types, method and module thoroughly*
+
 There should be another type called `ByteRanges` to keep set of `ByteRange`:
 
 ByteRanges should keep ByteRanges sorted and non-overlapping. The

@@ -8,17 +8,17 @@ use crate::model::service::{
     DirectoryId, Options, RangedHash, RealizeError, RealizeServiceClient, RealizeServiceRequest,
     RealizeServiceResponse, SyncedFile,
 };
-use futures::FutureExt;
 use futures::future;
 use futures::future::Either;
 use futures::stream::StreamExt as _;
-use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
+use futures::FutureExt;
+use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
 use std::sync::Arc;
 use std::{collections::HashMap, path::Path};
 use tarpc::client::stub::Stub;
 use thiserror::Error;
-use tokio::sync::Semaphore;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::Semaphore;
 const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 const PARALLEL_FILE_COUNT: usize = 8;
 const HASH_FILE_CHUNK: u64 = 256 * 1024 * 1024; // 256M
@@ -283,21 +283,32 @@ where
         HASH_FILE_CHUNK,
         src_options(),
     ));
-    if src_size == dst_size {
+    let mut correct = ByteRanges::new();
+    if dst_size > HASH_FILE_CHUNK {
         report_verifying(&progress_tx, &dir_id, path).await;
         let hash = match src_hash {
             Either::Left(fut) => fut.await?,
             Either::Right(hash) => hash,
         };
-        if check_hashes_and_delete(ctx, &hash, src_size, src, dst, &dir_id, path).await? {
-            return Ok(());
+        match check_hashes_and_delete(ctx, &hash, src_size, src, dst, &dir_id, path).await? {
+            HashCheck::Match => {
+                return Ok(());
+            }
+            HashCheck::Mismatch {
+                partial_match: matches,
+                ..
+            } => {
+                correct = matches;
+            }
         }
         src_hash = Either::Right(hash);
     }
 
     // Chunked Transfer
     let ranges = ByteRanges::single(0, src_size);
-    let rsync_ranges = ranges.intersection(&ByteRanges::single(0, dst_size));
+    let rsync_ranges = ranges
+        .intersection(&ByteRanges::single(0, dst_size))
+        .subtraction(&correct);
     let copy_ranges = ranges.intersection(&ByteRanges::single(dst_size, src_size));
 
     // 1. Check existing data (rsyncing)
@@ -391,10 +402,10 @@ where
         Either::Left(hash) => hash.await?,
         Either::Right(hash) => hash,
     };
-    if !check_hashes_and_delete(ctx, &hash, src_size, src, dst, &dir_id, path).await? {
-        return Err(MoveFileError::FailedToSync);
+    match check_hashes_and_delete(ctx, &hash, src_size, src, dst, &dir_id, path).await? {
+        HashCheck::Mismatch { .. } => Err(MoveFileError::FailedToSync),
+        HashCheck::Match => Ok(()),
     }
-    Ok(())
 }
 
 async fn report_copying(
@@ -497,6 +508,17 @@ where
     Ok(ranged)
 }
 
+/// Return value for [check_hashes_and_delete]
+enum HashCheck {
+    /// The hashes matched.
+    Match,
+
+    /// The hashes didn't match.
+    ///
+    /// If some hash range matched, it is reported as partial match.
+    Mismatch { partial_match: ByteRanges },
+}
+
 /// Check hashes and, if they match, finish the dest file and delete the source.
 ///
 /// Return true if the hashes matched, false otherwise.
@@ -508,7 +530,7 @@ async fn check_hashes_and_delete<T, U>(
     dst: &RealizeServiceClient<U>,
     dir_id: &DirectoryId,
     path: &std::path::Path,
-) -> Result<bool, MoveFileError>
+) -> Result<HashCheck, MoveFileError>
 where
     T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
     U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
@@ -539,7 +561,9 @@ where
         METRIC_FILE_END_COUNT
             .with_label_values(&["Inconsistent"])
             .inc();
-        return Ok(false);
+        return Ok(HashCheck::Mismatch {
+            partial_match: matches,
+        });
     }
     log::info!(
         "{}:{:?} OK (hash match); finishing and deleting",
@@ -553,7 +577,7 @@ where
         .await??;
 
     METRIC_FILE_END_COUNT.with_label_values(&["Ok"]).inc();
-    Ok(true)
+    Ok(HashCheck::Match)
 }
 
 #[cfg(test)]
@@ -562,8 +586,8 @@ mod tests {
     use crate::model::service::DirectoryId;
     use crate::model::service::Hash;
     use crate::server::{self, DirectoryMap};
-    use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
     use sha2::Digest as _;
     use std::path::PathBuf;
