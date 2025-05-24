@@ -303,13 +303,17 @@ where
         }
         src_hash = Either::Right(hash);
     }
-
     // Chunked Transfer
     let ranges = ByteRanges::single(0, src_size);
+    let copy_ranges = ranges.intersection(&ByteRanges::single(dst_size, src_size));
     let rsync_ranges = ranges
         .intersection(&ByteRanges::single(0, dst_size))
         .subtraction(&correct);
-    let copy_ranges = ranges.intersection(&ByteRanges::single(dst_size, src_size));
+    if !correct.is_empty() {
+        for range in correct.into_iter() {
+            report_range_progress(&progress_tx, &dir_id, path, &range).await;
+        }
+    }
 
     // 1. Check existing data (rsyncing)
     if !rsync_ranges.is_empty() {
