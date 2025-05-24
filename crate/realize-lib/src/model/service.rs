@@ -122,16 +122,17 @@ pub trait RealizeService {
         range: ByteRange,
         file_size: u64,
         data: Vec<u8>,
+        hash: Hash,
         options: Options,
     ) -> Result<()>;
 
-    /// Read a byte range from a file
+    /// Read a byte range from a file, returning data and its hash
     async fn read(
         dir_id: DirectoryId,
         relative_path: PathBuf,
         range: ByteRange,
         options: Options,
-    ) -> Result<Vec<u8>>;
+    ) -> Result<(Vec<u8>, Hash)>;
 
     /// Mark a partial file as complete
     async fn finish(dir_id: DirectoryId, relative_path: PathBuf, options: Options) -> Result<()>;
@@ -157,23 +158,23 @@ pub trait RealizeService {
 
     /// Compute a delta from the file at the given path and a given signature.
     ///
-    /// If the file is empty or too short, the delta is created as if
-    /// that specific range contained only 0.
+    /// Returns the delta and the hash of the data used to compute it.
     async fn diff(
         dir_id: DirectoryId,
         relative_path: PathBuf,
         range: ByteRange,
         signature: Signature,
         options: Options,
-    ) -> Result<Delta>;
+    ) -> Result<(Delta, Hash)>;
 
-    /// Apply a delta to the file at the given path and byte range.
+    /// Apply a delta to the file at the given path and byte range, verifying the hash
     async fn apply_delta(
         dir_id: DirectoryId,
         relative_path: PathBuf,
         range: ByteRange,
         file_size: u64,
         delta: Delta,
+        hash: Hash,
         options: Options,
     ) -> Result<()>;
 
@@ -198,6 +199,9 @@ pub enum RealizeError {
 
     #[error("Unexpected: {0}")]
     Other(String),
+
+    #[error("Hash mismatch")]
+    HashMismatch,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]

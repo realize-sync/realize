@@ -56,6 +56,15 @@ impl ByteRange {
     pub fn is_empty(&self) -> bool {
         self.end <= self.start
     }
+    /// Returns the number of bytes in this range.
+    pub fn bytecount(&self) -> u64 {
+        // TODO: guarantee that in a range
+        if self.end > self.start {
+            self.end - self.start
+        } else {
+            0
+        }
+    }
     /// Returns true if this range overlaps with `other` (i.e., they share any bytes).
     ///
     /// Overlap is defined as: `self.start < other.end && other.start < self.end`.
@@ -138,42 +147,6 @@ impl Iterator for ChunkIterator {
     }
 }
 
-pub struct ChunksIterator {
-    current: Option<ChunkIterator>,
-    remaining: <Vec<ChunkIterator> as std::iter::IntoIterator>::IntoIter,
-}
-impl ChunksIterator {
-    fn new(iterators: Vec<ChunkIterator>) -> Self {
-        Self {
-            current: None,
-            remaining: iterators.into_iter(),
-        }
-    }
-}
-
-impl Iterator for ChunksIterator {
-    type Item = ByteRange;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.current.is_none() {
-                self.current = self.remaining.next();
-            }
-            match &mut self.current {
-                None => {
-                    return None;
-                }
-                Some(current) => {
-                    let val = current.next();
-                    if val.is_some() {
-                        return val;
-                    }
-                    self.current = None;
-                }
-            }
-        }
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +157,13 @@ mod tests {
         assert!(ByteRange::empty().is_empty());
         assert!(ByteRange::new(2, 2).is_empty());
         assert!(!ByteRange::new(1, 2).is_empty());
+    }
+    #[test]
+    fn test_bytecount() {
+        assert_eq!(ByteRange::empty().bytecount(), 0);
+        assert_eq!(ByteRange::new(2, 2).bytecount(), 0);
+        assert_eq!(ByteRange::new(0, 10).bytecount(), 10);
+        assert_eq!(ByteRange::new(10, 20).bytecount(), 10);
     }
     /// Test overlap logic.
     #[test]
@@ -295,13 +275,11 @@ impl ByteRanges {
     }
 
     /// Split all ranges into chunks of at most [chunk_size] bytes.
-    pub fn chunked(&self, chunk_size: u64) -> ChunksIterator {
-        ChunksIterator::new(
-            self.ranges
-                .iter()
-                .map(|r| ChunkIterator::new(r, chunk_size))
-                .collect(),
-        )
+    pub fn chunked(&self, chunk_size: u64) -> impl Iterator<Item = ByteRange> {
+        self.ranges
+            .iter()
+            .map(move |r| ChunkIterator::new(r, chunk_size))
+            .flatten()
     }
 
     /// Returns true if there are no ranges.

@@ -61,6 +61,16 @@ lazy_static::lazy_static! {
             "Number of bytes written (range), with method label (send or apply_patch)",
             &["method"]
         ).unwrap();
+    pub static ref METRIC_APPLY_DELTA_FALLBACK_COUNT: IntCounter =
+        register_int_counter!(
+            "realize_apply_delta_fallback_count",
+            "Number of times copy had to be used as fallback to apply_delta",
+        ).unwrap();
+    pub static ref METRIC_APPLY_DELTA_FALLBACK_BYTES: IntCounter =
+        register_int_counter!(
+            "realize_apply_delta_fallback_bytes",
+            "Bytes for which copy had to be used as fallback to apply_delta",
+        ).unwrap();
 }
 
 /// Options used for RPC calls on the source.
@@ -305,7 +315,7 @@ where
     }
     // Chunked Transfer
     let ranges = ByteRanges::single(0, src_size);
-    let copy_ranges = ranges.intersection(&ByteRanges::single(dst_size, src_size));
+    let mut copy_ranges = ranges.intersection(&ByteRanges::single(dst_size, src_size));
     let rsync_ranges = ranges
         .intersection(&ByteRanges::single(0, dst_size))
         .subtraction(&correct);
@@ -327,6 +337,14 @@ where
     // 1. Check existing data (rsyncing)
     if !rsync_ranges.is_empty() {
         report_rsyncing(&progress_tx, &dir_id, path).await;
+        log::debug!(
+            "{}/{} overall: {}, rsync: {}, (later) copy: {}",
+            dir_id,
+            path.display(),
+            ranges,
+            rsync_ranges,
+            copy_ranges
+        );
 
         for range in rsync_ranges.chunked(CHUNK_SIZE) {
             let sig = dst
@@ -338,7 +356,7 @@ where
                     dst_options(),
                 )
                 .await??;
-            let delta = src
+            let (delta, hash) = src
                 .diff(
                     ctx,
                     dir_id.clone(),
@@ -353,28 +371,62 @@ where
                 .inc_by(delta.0.len() as u64);
             METRIC_RANGE_READ_BYTES
                 .with_label_values(&["diff"])
-                .inc_by(range.end - range.start);
-            dst.apply_delta(
-                ctx,
-                dir_id.clone(),
-                path.to_path_buf(),
-                range.clone(),
-                src_file.size,
-                delta.clone(),
-                dst_options(),
-            )
-            .await??;
-            report_range_progress(&progress_tx, &dir_id, path, &range).await;
+                .inc_by(range.bytecount());
+            let delta_len = delta.0.len();
+            match dst
+                .apply_delta(
+                    ctx,
+                    dir_id.clone(),
+                    path.to_path_buf(),
+                    range.clone(),
+                    src_file.size,
+                    delta,
+                    hash,
+                    dst_options(),
+                )
+                .await?
+            {
+                Ok(_) => {
+                    METRIC_WRITE_BYTES
+                        .with_label_values(&["apply_delta"])
+                        .inc_by(delta_len as u64);
+                    METRIC_RANGE_WRITE_BYTES
+                        .with_label_values(&["apply_delta"])
+                        .inc_by(range.bytecount());
+                    report_range_progress(&progress_tx, &dir_id, path, &range).await;
+                }
+                Err(RealizeError::HashMismatch) => {
+                    copy_ranges.add(&range);
+                    log::debug!(
+                        "{}/{}:{} hash mismatch after apply_delta, will copy",
+                        dir_id,
+                        path.display(),
+                        range
+                    );
+                    METRIC_APPLY_DELTA_FALLBACK_COUNT.inc();
+                    METRIC_APPLY_DELTA_FALLBACK_BYTES.inc_by(range.bytecount());
+                }
+                Err(err) => {
+                    return Err(MoveFileError::from(err));
+                }
+            };
         }
     }
 
     // 2. Copy missyng data
     if !copy_ranges.is_empty() {
         report_copying(&progress_tx, &dir_id, path).await;
+        log::debug!(
+            "{}/{} overall: {}, copy: {}",
+            dir_id,
+            path.display(),
+            ranges,
+            copy_ranges
+        );
 
         let _lock = copy_sem.acquire().await;
         for range in copy_ranges.chunked(CHUNK_SIZE) {
-            let data = src
+            let (data, hash) = src
                 .read(
                     ctx,
                     dir_id.clone(),
@@ -388,23 +440,25 @@ where
                 .inc_by(data.len() as u64);
             METRIC_RANGE_READ_BYTES
                 .with_label_values(&["read"])
-                .inc_by(range.end - range.start);
+                .inc_by(range.bytecount());
+            let data_len = data.len();
             dst.send(
                 ctx,
                 dir_id.clone(),
                 path.to_path_buf(),
                 range.clone(),
                 src_file.size,
-                data.clone(),
+                data,
+                hash,
                 dst_options(),
             )
             .await??;
             METRIC_WRITE_BYTES
                 .with_label_values(&["send"])
-                .inc_by(data.len() as u64);
+                .inc_by(data_len as u64);
             METRIC_RANGE_WRITE_BYTES
                 .with_label_values(&["send"])
-                .inc_by(range.end - range.start);
+                .inc_by(range.bytecount());
             report_range_progress(&progress_tx, &dir_id, path, &range).await;
         }
     }
@@ -477,7 +531,7 @@ async fn report_range_progress(
             .send(ProgressEvent::IncrementByteCount {
                 dir_id: dir_id.clone(),
                 path: path.to_path_buf(),
-                bytecount: range.end - range.start,
+                bytecount: range.bytecount(),
             })
             .await;
     }
@@ -786,16 +840,22 @@ mod tests {
         garbage.extend_from_slice(&chunk5[..1024 * 1024]); // 1MB garbage
         dst_temp.child("large_garbage").write_binary(&garbage)?;
 
+        let mut ctx = tarpc::context::current();
+        ctx.deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+
         let (success, error, _interrupted) = move_files(
-            tarpc::context::current(),
+            ctx,
             &src_server,
             &dst_server,
             DirectoryId::from("testdir"),
             None,
         )
         .await?;
-        assert_eq!(error, 0, "No errors expected");
-        assert_eq!(success, 5, "All files should be moved");
+        assert_eq!(
+            (5, 0),
+            (success, error),
+            "should be: 5 files moved, 0 errors"
+        );
         // Check that files are present in destination and not in source
         assert_eq_unordered!(snapshot_dir(src_temp.path())?, vec![]);
         let expected = vec![

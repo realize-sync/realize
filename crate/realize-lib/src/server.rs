@@ -1,16 +1,16 @@
 use crate::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
+use crate::model::byterange::ByteRange;
 use crate::model::service::Options;
-use crate::model::service::{
-    DirectoryId, RealizeError, RealizeService, Result, RsyncOperation, SyncedFile,
-    SyncedFileState,
-};
 use crate::model::service::{Config, Hash};
+use crate::model::service::{
+    DirectoryId, RealizeError, RealizeService, Result, RsyncOperation, SyncedFile, SyncedFileState,
+};
 use crate::model::service::{RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse};
-use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
+use async_speed_limit::Limiter;
 use fast_rsync::{
-    Signature as RsyncSignature, SignatureOptions, apply_limited as rsync_apply_limited,
-    diff as rsync_diff,
+    apply_limited as rsync_apply_limited, diff as rsync_diff, Signature as RsyncSignature,
+    SignatureOptions,
 };
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
@@ -21,8 +21,8 @@ use std::io::{Read as _, Seek as _};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tarpc::client::RpcError;
 use tarpc::client::stub::Stub;
+use tarpc::client::RpcError;
 use tarpc::context;
 use tarpc::server::Channel;
 use tokio::fs::{self, File, OpenOptions};
@@ -32,7 +32,6 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::io::SeekFrom;
 use tokio::task::JoinError;
 use walkdir::WalkDir;
-use crate::model::byterange::ByteRange;
 
 // Move this to the top-level, outside any impl
 const RSYNC_BLOCK_SIZE: usize = 4096;
@@ -182,7 +181,7 @@ impl RealizeService for RealizeServer {
         relative_path: PathBuf,
         range: ByteRange,
         options: Options,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(Vec<u8>, Hash)> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
         let (_, actual) = logical.find(&options).await?;
@@ -192,9 +191,11 @@ impl RealizeService for RealizeServer {
             .write(false)
             .open(&actual)
             .await?;
-        let mut buffer = vec![0; (range.end - range.start) as usize];
+        let mut buffer = vec![0; range.bytecount() as usize];
         partial_read(&mut file, &range, &mut buffer).await?;
-        Ok(buffer)
+
+        let hash = hash_data(&buffer);
+        Ok((buffer, hash))
     }
 
     async fn send(
@@ -205,19 +206,20 @@ impl RealizeService for RealizeServer {
         range: ByteRange,
         file_size: u64,
         data: Vec<u8>,
+        hash: Hash,
         options: Options,
     ) -> Result<()> {
+        if hash_data(&data) != hash {
+            return Err(RealizeError::HashMismatch);
+        }
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
         let path = logical.partial_path();
         if let Ok((state, actual)) = logical.find(&options).await {
-            // File already exists
             if state == SyncedFileState::Final {
                 fs::rename(actual, &path).await?;
             }
         } else {
-            // Open will need to create the file. Ensure parent
-            // directory exists beforehand.
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).await?;
             }
@@ -276,7 +278,7 @@ impl RealizeService for RealizeServer {
             }
             let mut hasher = Sha256::new();
             let mut buffer = [0u8; 8192];
-            let mut remaining = range.end - range.start;
+            let mut remaining = range.bytecount();
             while remaining > 0 {
                 let mut bufsize = buffer.len();
                 if bufsize as u64 > remaining {
@@ -333,7 +335,7 @@ impl RealizeService for RealizeServer {
         let logical = LogicalPath::new(dir, &relative_path)?;
         let (_, actual) = logical.find(&options).await?;
         let mut file = File::open(&actual).await?;
-        let mut buffer = vec![0u8; (range.end - range.start) as usize];
+        let mut buffer = vec![0u8; range.bytecount() as usize];
         partial_read(&mut file, &range, &mut buffer).await?;
         let opts = SignatureOptions {
             block_size: RSYNC_BLOCK_SIZE as u32,
@@ -351,10 +353,10 @@ impl RealizeService for RealizeServer {
         range: ByteRange,
         signature: crate::model::service::Signature,
         options: Options,
-    ) -> Result<crate::model::service::Delta> {
+    ) -> Result<(crate::model::service::Delta, Hash)> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
-        let mut buffer = vec![0u8; (range.end - range.start) as usize];
+        let mut buffer = vec![0u8; range.bytecount() as usize];
         if let Ok((_, actual)) = logical.find(&options).await {
             let mut file = File::open(&actual).await?;
             partial_read(&mut file, &range, &mut buffer).await?;
@@ -362,7 +364,10 @@ impl RealizeService for RealizeServer {
         let sig = RsyncSignature::deserialize(signature.0)?;
         let mut delta = Vec::new();
         rsync_diff(&sig.index(), &buffer, &mut delta)?;
-        Ok(crate::model::service::Delta(delta))
+
+        let hash = hash_data(&buffer);
+
+        Ok((crate::model::service::Delta(delta), hash))
     }
 
     async fn apply_delta(
@@ -373,12 +378,12 @@ impl RealizeService for RealizeServer {
         range: ByteRange,
         file_size: u64,
         delta: crate::model::service::Delta,
+        hash: Hash,
         options: Options,
     ) -> Result<()> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
         let (state, actual) = logical.find(&options).await?;
-        // Always apply to partial file
         let partial_path = logical.partial_path();
         if state == SyncedFileState::Final {
             std::fs::rename(&actual, &partial_path)?;
@@ -390,18 +395,21 @@ impl RealizeService for RealizeServer {
             .truncate(false)
             .open(&partial_path)
             .await?;
-        let mut base = vec![0u8; (range.end - range.start) as usize];
+        let mut base = vec![0u8; range.bytecount() as usize];
         partial_read(&mut file, &range, &mut base).await?;
         let mut out = Vec::new();
-        rsync_apply_limited(&base, &delta.0, &mut out, (range.end - range.start) as usize)?;
-        if out.len() as u64 != range.end - range.start {
+        rsync_apply_limited(&base, &delta.0, &mut out, range.bytecount() as usize)?;
+        if out.len() as u64 != range.bytecount() {
             return Err(RealizeError::BadRequest(
                 "Delta output size mismatch".to_string(),
             ));
         }
+        if hash_data(&out) != hash {
+            return Err(RealizeError::HashMismatch);
+        }
         write_at_offset(&mut file, range.start, &out).await?;
-        shorten_file(&mut file, file_size).await?;
 
+        shorten_file(&mut file, file_size).await?;
         Ok(())
     }
 
@@ -424,6 +432,11 @@ impl RealizeService for RealizeServer {
             }),
         })
     }
+}
+
+/// Compute a hash for a data buffer.
+fn hash_data(data: impl AsRef<[u8]>) -> Hash {
+    Hash(Sha256::digest(data).into())
 }
 
 async fn partial_read(
@@ -660,8 +673,8 @@ async fn is_empty_dir(path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::model::service::Hash;
-    use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
     use std::fs;
 
@@ -802,12 +815,10 @@ mod tests {
         };
 
         temp.child(".foo.txt.part").write_str("test")?;
-        assert!(
-            LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?
-                .find(&nopartial)
-                .await
-                .is_err()
-        );
+        assert!(LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?
+            .find(&nopartial)
+            .await
+            .is_err());
 
         temp.child("bar.txt").write_str("test")?;
         assert_eq!(
@@ -925,9 +936,11 @@ mod tests {
     #[tokio::test]
     async fn send_wrong_order() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
-
         let fpath = LogicalPath::new(&dir, &PathBuf::from("wrong_order.txt"))?;
-
+        let data1 = b"fghij".to_vec();
+        let mut hasher1 = Sha256::new();
+        hasher1.update(&data1);
+        let hash1 = Hash(hasher1.finalize().into());
         server
             .clone()
             .send(
@@ -936,7 +949,8 @@ mod tests {
                 fpath.relative_path().to_path_buf(),
                 ByteRange { start: 5, end: 10 },
                 10,
-                b"fghij".to_vec(),
+                data1.clone(),
+                hash1,
                 Options::default(),
             )
             .await?;
@@ -946,7 +960,10 @@ mod tests {
             std::fs::read_to_string(fpath.partial_path())?,
             "\0\0\0\0\0fghij"
         );
-
+        let data2 = b"abcde".to_vec();
+        let mut hasher2 = Sha256::new();
+        hasher2.update(&data2);
+        let hash2 = Hash(hasher2.finalize().into());
         server
             .clone()
             .send(
@@ -955,14 +972,14 @@ mod tests {
                 fpath.relative_path().to_path_buf(),
                 ByteRange { start: 0, end: 5 },
                 10,
-                b"abcde".to_vec(),
+                data2.clone(),
+                hash2,
                 Options::default(),
             )
             .await?;
         assert!(fpath.partial_path().exists());
         assert!(!fpath.final_path().exists());
         assert_eq!(std::fs::read_to_string(fpath.partial_path())?, "abcdefghij");
-
         Ok(())
     }
 
@@ -983,7 +1000,7 @@ mod tests {
                 Options::default(),
             )
             .await?;
-        assert_eq!(String::from_utf8(data)?, "fghij");
+        assert_eq!(String::from_utf8(data.0)?, "fghij");
 
         let data = server
             .clone()
@@ -995,7 +1012,7 @@ mod tests {
                 Options::default(),
             )
             .await?;
-        assert_eq!(String::from_utf8(data)?, "abcde");
+        assert_eq!(String::from_utf8(data.0)?, "abcde");
 
         let result = server
             .clone()
@@ -1007,8 +1024,8 @@ mod tests {
                 Options::default(),
             )
             .await?;
-        assert_eq!(result.len(), 15);
-        assert_eq!(result, b"abcdefghij\0\0\0\0\0");
+        assert_eq!(result.0.len(), 15);
+        assert_eq!(result.0, b"abcdefghij\0\0\0\0\0");
 
         Ok(())
     }
@@ -1063,9 +1080,11 @@ mod tests {
     async fn send_truncates_file() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
         let fpath = LogicalPath::new(&dir, &PathBuf::from("truncate.txt"))?;
-        // Write a file with more data than we will send
         std::fs::write(fpath.partial_path(), b"abcdefghij")?;
-        // Now send a chunk that should truncate the file to 7 bytes
+        let data = b"1234567".to_vec();
+        let mut hasher = Sha256::new();
+        hasher.update(&data);
+        let hash = Hash(hasher.finalize().into());
         server
             .clone()
             .send(
@@ -1074,7 +1093,8 @@ mod tests {
                 fpath.relative_path().to_path_buf(),
                 ByteRange { start: 0, end: 7 },
                 7,
-                b"1234567".to_vec(),
+                data.clone(),
+                hash,
                 Options::default(),
             )
             .await?;
@@ -1095,7 +1115,10 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 PathBuf::from("foo.txt"),
-                ByteRange { start: 0, end: content.len() as u64 },
+                ByteRange {
+                    start: 0,
+                    end: content.len() as u64,
+                },
                 Options::default(),
             )
             .await?;
@@ -1114,7 +1137,10 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 PathBuf::from("bar.txt"),
-                ByteRange { start: 0, end: content2.len() as u64 },
+                ByteRange {
+                    start: 0,
+                    end: content2.len() as u64,
+                },
                 Options::default(),
             )
             .await?;
@@ -1137,7 +1163,10 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 PathBuf::from("foo.txt"),
-                ByteRange { start: 100, end: 200 },
+                ByteRange {
+                    start: 100,
+                    end: 200,
+                },
                 Options::default(),
             )
             .await?;
@@ -1232,7 +1261,10 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 file_path.clone(),
-                ByteRange { start: 0, end: file_content.len() as u64 },
+                ByteRange {
+                    start: 0,
+                    end: file_content.len() as u64,
+                },
                 Options::default(),
             )
             .await?;
@@ -1248,12 +1280,15 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 file_path.clone(),
-                ByteRange { start: 0, end: new_content.len() as u64 },
+                ByteRange {
+                    start: 0,
+                    end: new_content.len() as u64,
+                },
                 sig.clone(),
                 Options::default(),
             )
             .await?;
-        assert!(!delta.0.is_empty());
+        assert!(!delta.0 .0.is_empty());
 
         // Revert file to old content, then apply delta
         temp.child("foo.txt").write_binary(file_content)?;
@@ -1263,9 +1298,13 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 file_path.clone(),
-                ByteRange { start: 0, end: new_content.len() as u64 },
+                ByteRange {
+                    start: 0,
+                    end: new_content.len() as u64,
+                },
                 new_content.len() as u64,
-                delta,
+                delta.0,
+                delta.1,
                 Options::default(),
             )
             .await;
@@ -1314,6 +1353,7 @@ mod tests {
                 ByteRange { start: 0, end: 3 },
                 3,
                 crate::model::service::Delta(vec![1, 2, 3]),
+                Hash::zero(),
                 Options::default(),
             )
             .await;
@@ -1338,7 +1378,10 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 file_path.clone(),
-                ByteRange { start: 0, end: original_content.len() as u64 },
+                ByteRange {
+                    start: 0,
+                    end: original_content.len() as u64,
+                },
                 Options::default(),
             )
             .await?;
@@ -1354,12 +1397,15 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 file_path.clone(),
-                ByteRange { start: 0, end: new_content.len() as u64 },
+                ByteRange {
+                    start: 0,
+                    end: new_content.len() as u64,
+                },
                 sig.clone(),
                 Options::default(),
             )
             .await?;
-        assert!(!delta.0.is_empty());
+        assert!(!delta.0 .0.is_empty());
 
         // Revert file to original content, then apply delta
         temp.child("shorten.txt").write_binary(original_content)?;
@@ -1369,9 +1415,13 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 file_path.clone(),
-                ByteRange { start: 0, end: new_content.len() as u64 },
+                ByteRange {
+                    start: 0,
+                    end: new_content.len() as u64,
+                },
                 new_content.len() as u64,
-                delta,
+                delta.0,
+                delta.1,
                 Options::default(),
             )
             .await;
@@ -1469,7 +1519,7 @@ mod tests {
                 },
             )
             .await?;
-        assert_eq!(String::from_utf8(data)?, "partial");
+        assert_eq!(String::from_utf8(data.0)?, "partial");
         // With ignore_partial: final preferred
         let data = server
             .clone()
@@ -1483,7 +1533,7 @@ mod tests {
                 },
             )
             .await?;
-        assert_eq!(String::from_utf8(data)?, "final");
+        assert_eq!(String::from_utf8(data.0)?, "final");
         Ok(())
     }
 

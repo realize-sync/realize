@@ -3,19 +3,19 @@ use std::time::Instant;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use prometheus::{
-    Encoder, HistogramVec, IntCounterVec, IntGauge, register_histogram_vec,
-    register_int_counter_vec, register_int_gauge,
+    register_histogram_vec, register_int_counter_vec, register_int_gauge, Encoder, HistogramVec,
+    IntCounterVec, IntGauge,
 };
 use tarpc::{
-    ServerError,
-    client::{RpcError, stub::Stub},
+    client::{stub::Stub, RpcError},
     context::Context,
     server::Serve,
+    ServerError,
 };
 use tokio::net::TcpListener;
 
-use crate::model::service::{RealizeError, RealizeServiceRequest, RealizeServiceResponse};
 use crate::model::byterange::ByteRange;
+use crate::model::service::{RealizeError, RealizeServiceRequest, RealizeServiceResponse};
 
 lazy_static::lazy_static! {
     pub(crate) static ref METRIC_SERVER_DATA_IN_BYTES: HistogramVec =
@@ -172,6 +172,7 @@ fn realize_error_label(err: &RealizeError) -> &'static str {
         RealizeError::Io(_) => "Io",
         RealizeError::Rsync(_, _) => "Rsync",
         RealizeError::Other(_) => "Other",
+        RealizeError::HashMismatch => "HashMismatch",
     }
 }
 
@@ -223,9 +224,9 @@ fn bytes_in(req: &RealizeServiceRequest) -> Option<u64> {
 /// Extract data size in bytes from a response for the data_out metrics.
 fn bytes_out<T>(res: &Result<RealizeServiceResponse, T>) -> Option<u64> {
     match res {
-        Ok(RealizeServiceResponse::Read(Ok(data))) => Some(data.len() as u64),
+        Ok(RealizeServiceResponse::Read(Ok((data, _)))) => Some(data.len() as u64),
         Ok(RealizeServiceResponse::CalculateSignature(Ok(sig))) => Some(sig.0.len() as u64),
-        Ok(RealizeServiceResponse::Diff(Ok(delta))) => Some(delta.0.len() as u64),
+        Ok(RealizeServiceResponse::Diff(Ok((delta, _)))) => Some(delta.0.len() as u64),
         _ => None,
     }
 }
