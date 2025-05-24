@@ -19,7 +19,7 @@ use thiserror::Error;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::Semaphore;
 const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
-const PARALLEL_FILE_COUNT: usize = 8;
+const PARALLEL_FILE_COUNT: usize = 4;
 const HASH_FILE_CHUNK: u64 = 256 * 1024 * 1024; // 256M
 const PARALLEL_FILE_HASH: usize = 4;
 

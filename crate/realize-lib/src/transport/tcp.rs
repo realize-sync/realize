@@ -293,7 +293,7 @@ impl TcpStub {
             tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>,
             TcpConnect,
             ExponentialBackoff,
-        > = Reconnect::new(retry_strategy, connect, Some(Duration::from_secs(60))).await?;
+        > = Reconnect::new(retry_strategy, connect, Some(Duration::from_secs(5 * 60))).await?;
         let stub = MetricsRealizeClient::new(reconnect);
         Ok(Self {
             inner: stub,
