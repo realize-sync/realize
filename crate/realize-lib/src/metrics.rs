@@ -15,6 +15,7 @@ use tarpc::{
 use tokio::net::TcpListener;
 
 use crate::model::service::{RealizeError, RealizeServiceRequest, RealizeServiceResponse};
+use crate::model::byterange::ByteRange;
 
 lazy_static::lazy_static! {
     pub(crate) static ref METRIC_SERVER_DATA_IN_BYTES: HistogramVec =
@@ -200,7 +201,7 @@ fn range_bytes(req: &RealizeServiceRequest) -> Option<u64> {
         | RealizeServiceRequest::Configure { .. } => None,
     };
 
-    range.map(|r| r.1 - r.0)
+    range.map(|r| r.end - r.start)
 }
 
 /// Extract data size in bytes from a request for the data_in metrics.
@@ -402,3 +403,7 @@ where
 }
 
 // Unit tests are kept in tests/metric_test.rs to avoid interferences.
+
+pub fn range_len(range: Option<&ByteRange>) -> u64 {
+    range.map(|r| r.end - r.start).unwrap_or(0)
+}
