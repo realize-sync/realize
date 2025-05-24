@@ -1,6 +1,6 @@
+use assert_fs::TempDir;
 use assert_fs::fixture::ChildPath;
 use assert_fs::prelude::*;
-use assert_fs::TempDir;
 use assert_unordered::assert_eq_unordered;
 use hyper_util::rt::TokioIo;
 use realize_lib::model::service::DirectoryId;
@@ -242,7 +242,7 @@ async fn quiet_success() -> anyhow::Result<()> {
         &fixture.src_dir,
         &[("foo.txt", "hello"), ("bar.txt", "world")],
     )?;
-    let output = fixture.run_with_args(vec!["--quiet"]).await?;
+    let output = fixture.run_with_args(vec!["--output", "quiet"]).await?;
     assert!(output.status.success(), "Should succeed if all files moved");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -272,7 +272,7 @@ async fn quiet_failure() -> anyhow::Result<()> {
         fixture.src_dir.child("bad.txt").path(),
         fs::Permissions::from_mode(0o000),
     )?;
-    let result = fixture.run_with_args(vec!["--quiet"]).await;
+    let result = fixture.run_with_args(vec!["--output", "quiet"]).await;
     // Restore permissions for cleanup
     fs::set_permissions(
         fixture.src_dir.child("bad.txt").path(),
@@ -293,6 +293,70 @@ async fn quiet_failure() -> anyhow::Result<()> {
     assert_eq_unordered!(
         dir_content(&fixture.dst_dir)?,
         vec![PathBuf::from("good.txt")]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn log_output_events() -> anyhow::Result<()> {
+    let fixture = Fixture::setup().await?;
+    create_files(
+        &fixture.src_dir,
+        &[("foo.txt", "hello"), ("bar.txt", "world")],
+    )?;
+    // Run with --output log, clear RUST_LOG so code sets it
+    let output = fixture
+        .command()
+        .arg("--output")
+        .arg("log")
+        .env_remove("RUST_LOG")
+        .output()
+        .await?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // 1. stdout must be empty
+    assert!(
+        stdout.trim().is_empty(),
+        "stdout should be empty in log mode, got: {stdout}"
+    );
+
+    // 2. stderr must contain log entries for all expected events
+    // (MovingDir, MovingFile, CopyingFile, FileSuccess, summary)
+    let mut found = vec![];
+    for line in stderr.lines() {
+        if line.contains("files to move") {
+            found.push("MovingDir");
+        }
+        if line.contains("Preparing to move") {
+            found.push("MovingFile");
+        }
+        if line.contains("Copying") {
+            found.push("CopyingFile");
+        }
+        if line.contains("Moved") {
+            found.push("FileSuccess");
+        }
+        if line.contains("SUCCESS") {
+            found.push("Summary");
+        }
+        // There should be no ERROR or WARN lines in a successful run
+        assert!(
+            !line.contains("ERROR") && !line.contains("WARN"),
+            "Unexpected error/warning in log: {line}"
+        );
+    }
+    // Each event should be present at least once
+    for event in &["MovingDir", "MovingFile", "CopyingFile", "FileSuccess", "Summary"] {
+        assert!(
+            found.contains(event),
+            "Missing log entry for {event} in log output: {stderr}"
+        );
+    }
+    // 3. stderr should not be empty (should contain logs)
+    assert!(
+        !stderr.trim().is_empty(),
+        "stderr should contain log output in log mode"
     );
     Ok(())
 }

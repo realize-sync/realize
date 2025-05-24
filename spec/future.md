@@ -3,51 +3,6 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
-## Command Output {#cmdoutput}
-
-Change argument to control log output in realize-cmd, instead of just --quiet:
-
---output=quiet : error only
---output=progress : progress + errors [default]
---output=log : log with custom RUST_LOG if unset, errors are logged and not printed
-
-Implementation wise, --output=log disabling errors means that
-everything that's output to stderr should also be sent to the log at
-warning or error level.
-
-### Task list
-
-1. Replace --quiet with --output argument, an enum-type argument,
-   which default to --output=progress.
-
-2. Everywhere quiet is used, use that new enum type.
-
-3. When --output=log and RUST_LOG is unset, set it to "warn,realize_cmd=info,realize_cmd::progress=info"
-
-4. Find all the places in crate/realize-cmd/src/main.rs and crate/realize-cmd/src/progress.rs where some information is printed only to stdout or stderr and
-
-  - add it to the log in addition at info (for stdout) warn or error
-    level (for stderr), do that always, regardless of --output value.
-    Don't attempt to print it nicely with index ([n/M]) colors or
-    alignment {:<10}, make it just a plain message.
-
-  - don't print to stdout or stderr if --output=log, print only to
-    stderr if --output=quiet (effect of the current boolean quiet)
-
-5. Run "cargo check" to make sure everything compiles, fix any issues.
-
-6. Update the tests in
-   crate/realize-cmd/tests/move_files_integration_test.rs that set or
-   test --quiet to use --output.
-
-7. Add a test for --output=log that checks that :
-   - messages are not printed
-   - errors are only logged, not printed anymore
-   - the events MovingDir, MovingFile, CopyingFile, FileSuccess and FileError produce a log entry (and what that entry is)
-   - the summary is logged, not printed
-
-8. Run "cargo test --tests move_files_integration_test" to make sure the relevant tests pass, fix any issues.
-
 ## Compression {#compress}
 
 Implement compression as shown on:
