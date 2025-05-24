@@ -13,15 +13,17 @@ COPY ./Cargo.lock ./Cargo.toml ./
 COPY ./crate/realize-lib/Cargo.toml  ./crate/realize-lib/
 COPY ./crate/realize-daemon/Cargo.toml  ./crate/realize-daemon/
 COPY ./crate/realize-cmd/Cargo.toml  ./crate/realize-cmd/
-RUN mkdir crate/realize-lib/src && echo "" > crate/realize-lib/src/lib.rs
-RUN mkdir crate/realize-daemon/src && echo "fn main() {}" > crate/realize-daemon/src/main.rs
-RUN mkdir crate/realize-cmd/src && echo "fn main() {}" > crate/realize-cmd/src/main.rs
 
-RUN cargo build -p realize-daemon --release
+# RUN mkdir crate/realize-lib/src && echo "" > crate/realize-lib/src/lib.rs
+# RUN mkdir crate/realize-daemon/src && echo "fn main() {}" > crate/realize-daemon/src/main.rs
+# RUN mkdir crate/realize-cmd/src && echo "fn main() {}" > crate/realize-cmd/src/main.rs
+#
+# RUN cargo build -p realize-daemon --release
 
 # --- 1.2 build application
 COPY ./crate/realize-daemon/src  ./crate/realize-daemon/src
 COPY ./crate/realize-lib/src  ./crate/realize-lib/src
+COPY ./crate/realize-cmd/src  ./crate/realize-cmd/src
 
 RUN cargo build -p realize-daemon --release
 
