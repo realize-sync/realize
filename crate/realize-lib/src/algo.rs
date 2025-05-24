@@ -4,19 +4,20 @@
 //! using the RealizeService trait. See spec/design.md for details.
 
 use crate::model::service::{
-    ByteRange, DirectoryId, Hash, Options, RealizeError, RealizeServiceClient,
+    ByteRange, DirectoryId, Options, RangedHash, RealizeError, RealizeServiceClient,
     RealizeServiceRequest, RealizeServiceResponse, SyncedFile,
 };
 use futures::future;
 use futures::future::Either;
 use futures::stream::StreamExt as _;
-use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
+use futures::FutureExt;
+use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
 use std::sync::Arc;
 use std::{collections::HashMap, path::Path};
 use tarpc::client::stub::Stub;
 use thiserror::Error;
-use tokio::sync::Semaphore;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::Semaphore;
 const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 const PARALLEL_FILE_COUNT: usize = 8;
 const HASH_FILE_CHUNK: u64 = 256 * 1024 * 1024; // 256M
@@ -460,17 +461,54 @@ async fn report_range_progress(
     }
 }
 
+/// Hash file in chunks and return the result.
+pub(crate) async fn hash_file<T>(
+    ctx: tarpc::context::Context,
+    client: &RealizeServiceClient<T>,
+    dir_id: &DirectoryId,
+    relative_path: &std::path::Path,
+    file_size: u64,
+    chunk_size: u64,
+    options: Options,
+) -> Result<RangedHash, MoveFileError>
+where
+    T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+{
+    let results = futures::stream::iter(ByteRangeIterator::new(file_size, chunk_size))
+        .map(|range| {
+            client
+                .hash(
+                    ctx,
+                    dir_id.clone(),
+                    relative_path.to_path_buf(),
+                    range,
+                    options,
+                )
+                .map(move |res| res.map(|h| (range, h)))
+        })
+        .buffer_unordered(PARALLEL_FILE_HASH)
+        .collect::<Vec<_>>()
+        .await;
+
+    let mut ranged = RangedHash::new();
+    for res in results.into_iter() {
+        let (range, hash_res) = res?;
+        ranged.add(range, hash_res?);
+    }
+    Ok(ranged)
+}
+
 /// Check hashes and, if they match, finish the dest file and delete the source.
 ///
 /// Return true if the hashes matched, false otherwise.
 async fn check_hashes_and_delete<T, U>(
     ctx: tarpc::context::Context,
-    src_hash: &Vec<Hash>,
+    src_hash: &RangedHash,
     file_size: u64,
     src: &RealizeServiceClient<T>,
     dst: &RealizeServiceClient<U>,
     dir_id: &DirectoryId,
-    path: &Path,
+    path: &std::path::Path,
 ) -> Result<bool, MoveFileError>
 where
     T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
@@ -486,8 +524,19 @@ where
         dst_options(),
     )
     .await?;
-    if *src_hash != dst_hash {
-        log::info!("{}:{:?} inconsistent hashes", dir_id, path);
+    let is_complete_src = src_hash.is_complete(file_size);
+    let is_complete_dst = dst_hash.is_complete(file_size);
+    let (matches, mismatches) = src_hash.diff(&dst_hash);
+    if !mismatches.is_empty() || !is_complete_src || !is_complete_dst {
+        log::warn!(
+            "{}:{:?} inconsistent hashes\nsrc: {}\ndst: {}\nmatched: {:?}\nmismatched: {:?}",
+            dir_id,
+            path,
+            src_hash,
+            dst_hash,
+            matches,
+            mismatches
+        );
         METRIC_FILE_END_COUNT
             .with_label_values(&["Inconsistent"])
             .inc();
@@ -512,9 +561,10 @@ where
 mod tests {
     use super::*;
     use crate::model::service::DirectoryId;
+    use crate::model::service::Hash;
     use crate::server::{self, DirectoryMap};
-    use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
     use sha2::Digest as _;
     use std::path::PathBuf;
@@ -826,7 +876,7 @@ mod tests {
 
         let dir_id = DirectoryId::from("dir");
         let server = server::create_inprocess_client(DirectoryMap::for_dir(&dir_id, temp.path()));
-        let hashvec = hash_file(
+        let ranged = hash_file(
             tarpc::context::current(),
             &server,
             &dir_id,
@@ -836,8 +886,13 @@ mod tests {
             Options::default(),
         )
         .await?;
-        assert_eq!(hashvec, vec![Hash(sha2::Sha256::digest(content).into())]);
-
+        assert_eq!(
+            RangedHash::single(
+                (0, content.len() as u64),
+                Hash(sha2::Sha256::digest(content).into())
+            ),
+            ranged
+        );
         Ok(())
     }
 
@@ -852,7 +907,7 @@ mod tests {
 
         let dir_id = DirectoryId::from("dir");
         let server = server::create_inprocess_client(DirectoryMap::for_dir(&dir_id, temp.path()));
-        let hashvec = hash_file(
+        let ranged = hash_file(
             tarpc::context::current(),
             &server,
             &dir_id,
@@ -862,17 +917,15 @@ mod tests {
             Options::default(),
         )
         .await?;
-        assert_eq!(
-            hashvec,
-            vec![
-                Hash(sha2::Sha256::digest(b"baa,").into()),
-                Hash(sha2::Sha256::digest(b" baa").into()),
-                Hash(sha2::Sha256::digest(b", bl").into()),
-                Hash(sha2::Sha256::digest(b"ack ").into()),
-                Hash(sha2::Sha256::digest(b"shee").into()),
-                Hash(sha2::Sha256::digest(b"p").into()),
-            ]
-        );
+        let mut expected = RangedHash::new();
+        expected.add((0, 4), Hash(sha2::Sha256::digest(b"baa,").into()));
+        expected.add((4, 8), Hash(sha2::Sha256::digest(b" baa").into()));
+        expected.add((8, 12), Hash(sha2::Sha256::digest(b", bl").into()));
+        expected.add((12, 16), Hash(sha2::Sha256::digest(b"ack ").into()));
+        expected.add((16, 20), Hash(sha2::Sha256::digest(b"shee").into()));
+        expected.add((20, 21), Hash(sha2::Sha256::digest(b"p").into()));
+
+        assert_eq!(ranged, expected);
 
         Ok(())
     }
@@ -883,23 +936,25 @@ mod tests {
 
         let temp = TempDir::new()?;
         let file = temp.child("somefile");
-        let content = b"baa, baa, black sheep";
+        let content = b"foobar";
         file.write_binary(content)?;
 
         let dir_id = DirectoryId::from("dir");
         let server = server::create_inprocess_client(DirectoryMap::for_dir(&dir_id, temp.path()));
-        let hashvec = hash_file(
+        let ranged = hash_file(
             tarpc::context::current(),
             &server,
             &dir_id,
             &PathBuf::from("somefile"),
-            content.len() as u64 * 2,
-            12,
+            8,
+            4,
             Options::default(),
         )
         .await?;
-        assert_eq!(hashvec.len(), 4);
-        assert_eq!(hashvec[1], Hash::zero());
+        let mut expected = RangedHash::new();
+        expected.add((0, 4), Hash(sha2::Sha256::digest(b"foob").into()));
+        expected.add((4, 8), Hash::zero());
+        assert_eq!(ranged, expected);
 
         Ok(())
     }
@@ -936,41 +991,6 @@ mod tests {
         }
         Ok(result)
     }
-}
-
-/// Hash file in chunks and return the result.
-pub(crate) async fn hash_file<T>(
-    ctx: tarpc::context::Context,
-    client: &RealizeServiceClient<T>,
-    dir_id: &DirectoryId,
-    relative_path: &Path,
-    file_size: u64,
-    chunk_size: u64,
-    options: Options,
-) -> Result<Vec<Hash>, MoveFileError>
-where
-    T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
-{
-    let results = futures::stream::iter(ByteRangeIterator::new(file_size, chunk_size))
-        .map(|range| {
-            client.hash(
-                ctx,
-                dir_id.clone(),
-                relative_path.to_path_buf(),
-                range,
-                options,
-            )
-        })
-        .buffered(PARALLEL_FILE_HASH)
-        .collect::<Vec<_>>()
-        .await;
-
-    let mut all_hashes = vec![];
-    for res in results.into_iter() {
-        all_hashes.push(res??);
-    }
-
-    Ok(all_hashes)
 }
 
 /// Split [0, total) into chunks of the given size.

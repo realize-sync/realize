@@ -55,18 +55,6 @@ pub enum SyncedFileState {
 #[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Hash(pub [u8; 32]);
 
-impl std::fmt::Debug for Hash {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.base64())
-    }
-}
-
-impl std::fmt::Display for Hash {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.base64())
-    }
-}
-
 impl Hash {
     fn base64(&self) -> String {
         base64::prelude::BASE64_STANDARD_NO_PAD.encode(&self.0)
@@ -74,6 +62,32 @@ impl Hash {
 
     pub fn zero() -> Self {
         Self([0u8; 32])
+    }
+
+    fn is_zero(&self) -> bool {
+        for v in self.0 {
+            if v != 0 {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+impl std::fmt::Debug for Hash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::fmt::Display for Hash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_zero() {
+            f.write_str("None")
+        } else {
+            f.write_str(&self.base64())
+        }
     }
 }
 
@@ -203,5 +217,231 @@ impl From<std::io::Error> for RealizeError {
 impl From<anyhow::Error> for RealizeError {
     fn from(value: anyhow::Error) -> Self {
         RealizeError::Other(value.to_string())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RangedHash {
+    hashes: Vec<RangedHashEntry>,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct RangedHashEntry {
+    range: ByteRange,
+    hash: Hash,
+}
+
+impl std::fmt::Display for RangedHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.hashes.is_empty() {
+            write!(f, "Empty")
+        } else {
+            let range = self.range();
+            write!(f, "{}-{}", range.0, range.1)?;
+            let complete = self.is_complete(range.1);
+            if !complete {
+                f.write_str(" INCOMPLETE")?;
+            }
+            f.write_str(": [")?;
+            let mut first = true;
+            for RangedHashEntry { range, hash } in &self.hashes {
+                if !first {
+                    write!(f, " ")?;
+                }
+                if complete {
+                    write!(f, "{}: {}", range.0, hash)?;
+                } else {
+                    write!(f, "{}-{}: {}", range.0, range.1, hash)?;
+                }
+                first = false;
+            }
+            f.write_str("]")?;
+
+            Ok(())
+        }
+    }
+}
+
+impl RangedHash {
+    pub fn new() -> Self {
+        Self { hashes: vec![] }
+    }
+
+    pub fn single(range: ByteRange, hash: Hash) -> Self {
+        Self {
+            hashes: vec![RangedHashEntry { range, hash }],
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.hashes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hashes.is_empty()
+    }
+
+    pub fn add(&mut self, range: ByteRange, hash: Hash) {
+        self.hashes.push(RangedHashEntry { range, hash });
+        self.hashes.sort_by_key(|e| e.range);
+    }
+
+    pub fn range(&self) -> ByteRange {
+        (
+            self.hashes.first().map_or(0, |e| e.range.0),
+            self.hashes.last().map_or(0, |e| e.range.1),
+        )
+    }
+
+    pub fn is_complete(&self, filesize: u64) -> bool {
+        if self.hashes.is_empty() {
+            return false;
+        }
+        let mut expected = 0;
+        for e in &self.hashes {
+            if e.range.0 != expected {
+                return false;
+            }
+            expected = e.range.1;
+        }
+
+        expected == filesize
+    }
+    pub fn diff(&self, other: &RangedHash) -> (Vec<ByteRange>, Vec<ByteRange>) {
+        let mut matches = Vec::new();
+        let mut mismatches = Vec::new();
+        let mut i = 0;
+        let mut j = 0;
+        while i < self.hashes.len() && j < other.hashes.len() {
+            let a = &self.hashes[i];
+            let b = &other.hashes[j];
+            if a.range == b.range {
+                if a.hash == b.hash {
+                    matches.push(a.range);
+                } else {
+                    mismatches.push(a.range);
+                }
+                i += 1;
+                j += 1;
+            } else if a.range.0 < b.range.0 {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+        // Merge contiguous ranges
+        let merge = |ranges: Vec<ByteRange>| {
+            let mut merged: Vec<ByteRange> = Vec::new();
+            for r in ranges {
+                if let Some(last) = merged.last_mut() {
+                    if (*last).1 == r.0 {
+                        (*last).1 = r.1;
+                        continue;
+                    }
+                }
+                merged.push(r);
+            }
+            merged
+        };
+        (merge(matches), merge(mismatches))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_rangedhash_single() {
+        let mut hash = RangedHash { hashes: vec![] };
+        hash.add((0, 10), Hash([1; 32]));
+
+        assert_eq!((0, 10), hash.range());
+        assert!(hash.is_complete(10));
+        assert_eq!(
+            "0-10: [0: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE]",
+            hash.to_string()
+        );
+    }
+
+    #[test]
+    fn test_rangedhash_multiple() {
+        let mut hash = RangedHash { hashes: vec![] };
+        hash.add((0, 10), Hash([1; 32]));
+        hash.add((10, 20), Hash([2; 32]));
+        assert_eq!(
+            format!("{}", hash),
+            format!("0-20: [0: {} 10: {}]", Hash([1; 32]), Hash([2; 32]))
+        );
+    }
+
+    #[test]
+    fn test_rangedhash_is_complete() {
+        let mut incomplete = RangedHash { hashes: vec![] };
+        incomplete.add((0, 10), Hash([1; 32]));
+        incomplete.add((10, 20), Hash([2; 32]));
+        assert_eq!((0, 20), incomplete.range());
+
+        assert!(incomplete.is_complete(20));
+        assert!(!incomplete.is_complete(30));
+        assert!(!incomplete.is_complete(10));
+    }
+
+    #[test]
+    fn test_rangedhash_with_holes() {
+        let mut incomplete = RangedHash { hashes: vec![] };
+        incomplete.add((0, 10), Hash([1; 32]));
+        incomplete.add((20, 30), Hash([2; 32]));
+
+        assert_eq!((0, 30), incomplete.range());
+        assert!(!incomplete.is_complete(10));
+        assert!(!incomplete.is_complete(20));
+        assert!(!incomplete.is_complete(30));
+
+        assert_eq!(
+            format!(
+                "0-30 INCOMPLETE: [0-10: {} 20-30: {}]",
+                Hash([1; 32]),
+                Hash([2; 32])
+            ),
+            incomplete.to_string()
+        );
+    }
+
+    #[test]
+    fn test_rangedhash_empty() {
+        let empty = RangedHash { hashes: vec![] };
+        assert_eq!((0, 0), empty.range());
+        assert!(!empty.is_complete(0));
+        assert_eq!("Empty", empty.to_string());
+    }
+
+    #[test]
+    fn test_rangedhash_diff() {
+        let mut a = RangedHash { hashes: vec![] };
+        a.add((0, 10), Hash([1; 32]));
+        a.add((10, 20), Hash([2; 32]));
+        let mut b = RangedHash { hashes: vec![] };
+        b.add((0, 10), Hash([1; 32]));
+        b.add((10, 20), Hash([3; 32]));
+
+        let (matches, mismatches) = a.diff(&b);
+        assert_eq!(matches, vec![(0, 10)]);
+        assert_eq!(mismatches, vec![(10, 20)]);
+
+        assert_eq!(a.diff(&b), b.diff(&a));
+        assert_eq!(a.diff(&a), (vec![(0, 20)], vec![]));
+    }
+
+    #[test]
+    fn test_rangedhash_eq_ignores_add_order() {
+        let mut unordered_add = RangedHash { hashes: vec![] };
+        unordered_add.add((10, 20), Hash([2; 32]));
+        unordered_add.add((0, 10), Hash([1; 32]));
+
+        let mut ordered_add = RangedHash { hashes: vec![] };
+        ordered_add.add((0, 10), Hash([1; 32]));
+        ordered_add.add((10, 20), Hash([2; 32]));
+
+        assert_eq!(unordered_add, ordered_add);
     }
 }
