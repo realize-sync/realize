@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 
+use crate::model::byterange::{ByteRange, ByteRanges};
 use base64::Engine as _;
 
 pub type Result<T> = std::result::Result<T, RealizeError>;
@@ -36,8 +37,6 @@ impl DirectoryId {
         self.0
     }
 }
-
-pub type ByteRange = (u64, u64);
 
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SyncedFile {
@@ -236,9 +235,9 @@ impl std::fmt::Display for RangedHash {
         if self.hashes.is_empty() {
             write!(f, "Empty")
         } else {
-            let range = self.range();
-            write!(f, "{}-{}", range.0, range.1)?;
-            let complete = self.is_complete(range.1);
+            let range = self.span();
+            write!(f, "{}-{}", range.start, range.end)?;
+            let complete = self.is_complete(range.end);
             if !complete {
                 f.write_str(" INCOMPLETE")?;
             }
@@ -249,9 +248,9 @@ impl std::fmt::Display for RangedHash {
                     write!(f, " ")?;
                 }
                 if complete {
-                    write!(f, "{}: {}", range.0, hash)?;
+                    write!(f, "{}: {}", range.start, hash)?;
                 } else {
-                    write!(f, "{}-{}: {}", range.0, range.1, hash)?;
+                    write!(f, "{}-{}: {}", range.start, range.end, hash)?;
                 }
                 first = false;
             }
@@ -268,9 +267,9 @@ impl RangedHash {
     }
 
     pub fn single(range: ByteRange, hash: Hash) -> Self {
-        Self {
-            hashes: vec![RangedHashEntry { range, hash }],
-        }
+        let mut hashes = Vec::new();
+        hashes.push(RangedHashEntry { range, hash });
+        RangedHash { hashes }
     }
 
     pub fn len(&self) -> usize {
@@ -283,14 +282,18 @@ impl RangedHash {
 
     pub fn add(&mut self, range: ByteRange, hash: Hash) {
         self.hashes.push(RangedHashEntry { range, hash });
-        self.hashes.sort_by_key(|e| e.range);
+        self.hashes.sort_by_key(|e| e.range.clone());
     }
 
-    pub fn range(&self) -> ByteRange {
-        (
-            self.hashes.first().map_or(0, |e| e.range.0),
-            self.hashes.last().map_or(0, |e| e.range.1),
-        )
+    pub fn span(&self) -> ByteRange {
+        ByteRange {
+            start: self.hashes.first().map_or(0, |e| e.range.start),
+            end: self.hashes.last().map_or(0, |e| e.range.end),
+        }
+    }
+
+    pub fn ranges(&self) -> ByteRanges {
+        ByteRanges::from_range_refs(self.hashes.iter().map(|e| &e.range))
     }
 
     pub fn is_complete(&self, filesize: u64) -> bool {
@@ -299,15 +302,15 @@ impl RangedHash {
         }
         let mut expected = 0;
         for e in &self.hashes {
-            if e.range.0 != expected {
+            if e.range.start != expected {
                 return false;
             }
-            expected = e.range.1;
+            expected = e.range.end;
         }
 
         expected == filesize
     }
-    pub fn diff(&self, other: &RangedHash) -> (Vec<ByteRange>, Vec<ByteRange>) {
+    pub fn diff(&self, other: &RangedHash) -> (ByteRanges, ByteRanges) {
         let mut matches = Vec::new();
         let mut mismatches = Vec::new();
         let mut i = 0;
@@ -317,33 +320,23 @@ impl RangedHash {
             let b = &other.hashes[j];
             if a.range == b.range {
                 if a.hash == b.hash {
-                    matches.push(a.range);
+                    matches.push(a.range.clone());
                 } else {
-                    mismatches.push(a.range);
+                    mismatches.push(a.range.clone());
                 }
                 i += 1;
                 j += 1;
-            } else if a.range.0 < b.range.0 {
+            } else if a.range.start < b.range.start {
                 i += 1;
             } else {
                 j += 1;
             }
         }
-        // Merge contiguous ranges
-        let merge = |ranges: Vec<ByteRange>| {
-            let mut merged: Vec<ByteRange> = Vec::new();
-            for r in ranges {
-                if let Some(last) = merged.last_mut() {
-                    if (*last).1 == r.0 {
-                        (*last).1 = r.1;
-                        continue;
-                    }
-                }
-                merged.push(r);
-            }
-            merged
-        };
-        (merge(matches), merge(mismatches))
+
+        (
+            ByteRanges::from_ranges(matches),
+            ByteRanges::from_ranges(mismatches),
+        )
     }
 }
 
@@ -353,9 +346,9 @@ mod tests {
     #[test]
     fn test_rangedhash_single() {
         let mut hash = RangedHash { hashes: vec![] };
-        hash.add((0, 10), Hash([1; 32]));
+        hash.add(ByteRange { start: 0, end: 10 }, Hash([1; 32]));
 
-        assert_eq!((0, 10), hash.range());
+        assert_eq!(ByteRange { start: 0, end: 10 }, hash.span());
         assert!(hash.is_complete(10));
         assert_eq!(
             "0-10: [0: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE]",
@@ -366,8 +359,8 @@ mod tests {
     #[test]
     fn test_rangedhash_multiple() {
         let mut hash = RangedHash { hashes: vec![] };
-        hash.add((0, 10), Hash([1; 32]));
-        hash.add((10, 20), Hash([2; 32]));
+        hash.add(ByteRange { start: 0, end: 10 }, Hash([1; 32]));
+        hash.add(ByteRange { start: 10, end: 20 }, Hash([2; 32]));
         assert_eq!(
             format!("{}", hash),
             format!("0-20: [0: {} 10: {}]", Hash([1; 32]), Hash([2; 32]))
@@ -377,9 +370,9 @@ mod tests {
     #[test]
     fn test_rangedhash_is_complete() {
         let mut incomplete = RangedHash { hashes: vec![] };
-        incomplete.add((0, 10), Hash([1; 32]));
-        incomplete.add((10, 20), Hash([2; 32]));
-        assert_eq!((0, 20), incomplete.range());
+        incomplete.add(ByteRange { start: 0, end: 10 }, Hash([1; 32]));
+        incomplete.add(ByteRange { start: 10, end: 20 }, Hash([2; 32]));
+        assert_eq!(ByteRange { start: 0, end: 20 }, incomplete.span());
 
         assert!(incomplete.is_complete(20));
         assert!(!incomplete.is_complete(30));
@@ -389,10 +382,10 @@ mod tests {
     #[test]
     fn test_rangedhash_with_holes() {
         let mut incomplete = RangedHash { hashes: vec![] };
-        incomplete.add((0, 10), Hash([1; 32]));
-        incomplete.add((20, 30), Hash([2; 32]));
+        incomplete.add(ByteRange { start: 0, end: 10 }, Hash([1; 32]));
+        incomplete.add(ByteRange { start: 20, end: 30 }, Hash([2; 32]));
 
-        assert_eq!((0, 30), incomplete.range());
+        assert_eq!(ByteRange { start: 0, end: 30 }, incomplete.span());
         assert!(!incomplete.is_complete(10));
         assert!(!incomplete.is_complete(20));
         assert!(!incomplete.is_complete(30));
@@ -410,7 +403,7 @@ mod tests {
     #[test]
     fn test_rangedhash_empty() {
         let empty = RangedHash { hashes: vec![] };
-        assert_eq!((0, 0), empty.range());
+        assert_eq!(ByteRange { start: 0, end: 0 }, empty.span());
         assert!(!empty.is_complete(0));
         assert_eq!("Empty", empty.to_string());
     }
@@ -418,29 +411,35 @@ mod tests {
     #[test]
     fn test_rangedhash_diff() {
         let mut a = RangedHash { hashes: vec![] };
-        a.add((0, 10), Hash([1; 32]));
-        a.add((10, 20), Hash([2; 32]));
+        a.add(ByteRange { start: 0, end: 10 }, Hash([1; 32]));
+        a.add(ByteRange { start: 10, end: 20 }, Hash([2; 32]));
         let mut b = RangedHash { hashes: vec![] };
-        b.add((0, 10), Hash([1; 32]));
-        b.add((10, 20), Hash([3; 32]));
+        b.add(ByteRange { start: 0, end: 10 }, Hash([1; 32]));
+        b.add(ByteRange { start: 10, end: 20 }, Hash([3; 32]));
 
         let (matches, mismatches) = a.diff(&b);
-        assert_eq!(matches, vec![(0, 10)]);
-        assert_eq!(mismatches, vec![(10, 20)]);
+        assert_eq!(matches, ByteRanges::for_range(ByteRange::new(0, 10)));
+        assert_eq!(mismatches, ByteRanges::for_range(ByteRange::new(10, 20)));
 
         assert_eq!(a.diff(&b), b.diff(&a));
-        assert_eq!(a.diff(&a), (vec![(0, 20)], vec![]));
+        assert_eq!(
+            a.diff(&a),
+            (
+                ByteRanges::for_range(ByteRange::new(0, 20)),
+                ByteRanges::new()
+            )
+        );
     }
 
     #[test]
     fn test_rangedhash_eq_ignores_add_order() {
         let mut unordered_add = RangedHash { hashes: vec![] };
-        unordered_add.add((10, 20), Hash([2; 32]));
-        unordered_add.add((0, 10), Hash([1; 32]));
+        unordered_add.add(ByteRange { start: 10, end: 20 }, Hash([2; 32]));
+        unordered_add.add(ByteRange { start: 0, end: 10 }, Hash([1; 32]));
 
         let mut ordered_add = RangedHash { hashes: vec![] };
-        ordered_add.add((0, 10), Hash([1; 32]));
-        ordered_add.add((10, 20), Hash([2; 32]));
+        ordered_add.add(ByteRange { start: 0, end: 10 }, Hash([1; 32]));
+        ordered_add.add(ByteRange { start: 10, end: 20 }, Hash([2; 32]));
 
         assert_eq!(unordered_add, ordered_add);
     }

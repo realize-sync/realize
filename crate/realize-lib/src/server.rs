@@ -1,7 +1,7 @@
 use crate::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
 use crate::model::service::Options;
 use crate::model::service::{
-    ByteRange, DirectoryId, RealizeError, RealizeService, Result, RsyncOperation, SyncedFile,
+    DirectoryId, RealizeError, RealizeService, Result, RsyncOperation, SyncedFile,
     SyncedFileState,
 };
 use crate::model::service::{Config, Hash};
@@ -32,6 +32,7 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::io::SeekFrom;
 use tokio::task::JoinError;
 use walkdir::WalkDir;
+use crate::model::byterange::ByteRange;
 
 // Move this to the top-level, outside any impl
 const RSYNC_BLOCK_SIZE: usize = 4096;
@@ -191,7 +192,7 @@ impl RealizeService for RealizeServer {
             .write(false)
             .open(&actual)
             .await?;
-        let mut buffer = vec![0; (range.1 - range.0) as usize];
+        let mut buffer = vec![0; (range.end - range.start) as usize];
         partial_read(&mut file, &range, &mut buffer).await?;
         Ok(buffer)
     }
@@ -227,7 +228,7 @@ impl RealizeService for RealizeServer {
             .truncate(false)
             .open(&path)
             .await?;
-        write_at_offset(&mut file, range.0, &data).await?;
+        write_at_offset(&mut file, range.start, &data).await?;
         shorten_file(&mut file, file_size).await?;
 
         Ok(())
@@ -267,7 +268,7 @@ impl RealizeService for RealizeServer {
 
         tokio::task::spawn_blocking(move || {
             let mut file = std::fs::File::open(&actual)?;
-            if file.seek(std::io::SeekFrom::Start(range.0)).is_err() {
+            if file.seek(std::io::SeekFrom::Start(range.start)).is_err() {
                 // We return an empty hash instead of failing, because we
                 // want hash comparison to fail if the file isn't of the
                 // expected size, not get an I/O error.
@@ -275,7 +276,7 @@ impl RealizeService for RealizeServer {
             }
             let mut hasher = Sha256::new();
             let mut buffer = [0u8; 8192];
-            let mut remaining = range.1 - range.0;
+            let mut remaining = range.end - range.start;
             while remaining > 0 {
                 let mut bufsize = buffer.len();
                 if bufsize as u64 > remaining {
@@ -332,7 +333,7 @@ impl RealizeService for RealizeServer {
         let logical = LogicalPath::new(dir, &relative_path)?;
         let (_, actual) = logical.find(&options).await?;
         let mut file = File::open(&actual).await?;
-        let mut buffer = vec![0u8; (range.1 - range.0) as usize];
+        let mut buffer = vec![0u8; (range.end - range.start) as usize];
         partial_read(&mut file, &range, &mut buffer).await?;
         let opts = SignatureOptions {
             block_size: RSYNC_BLOCK_SIZE as u32,
@@ -353,7 +354,7 @@ impl RealizeService for RealizeServer {
     ) -> Result<crate::model::service::Delta> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
-        let mut buffer = vec![0u8; (range.1 - range.0) as usize];
+        let mut buffer = vec![0u8; (range.end - range.start) as usize];
         if let Ok((_, actual)) = logical.find(&options).await {
             let mut file = File::open(&actual).await?;
             partial_read(&mut file, &range, &mut buffer).await?;
@@ -389,16 +390,16 @@ impl RealizeService for RealizeServer {
             .truncate(false)
             .open(&partial_path)
             .await?;
-        let mut base = vec![0u8; (range.1 - range.0) as usize];
+        let mut base = vec![0u8; (range.end - range.start) as usize];
         partial_read(&mut file, &range, &mut base).await?;
         let mut out = Vec::new();
-        rsync_apply_limited(&base, &delta.0, &mut out, (range.1 - range.0) as usize)?;
-        if out.len() as u64 != range.1 - range.0 {
+        rsync_apply_limited(&base, &delta.0, &mut out, (range.end - range.start) as usize)?;
+        if out.len() as u64 != range.end - range.start {
             return Err(RealizeError::BadRequest(
                 "Delta output size mismatch".to_string(),
             ));
         }
-        write_at_offset(&mut file, range.0, &out).await?;
+        write_at_offset(&mut file, range.start, &out).await?;
         shorten_file(&mut file, file_size).await?;
 
         Ok(())
@@ -431,9 +432,9 @@ async fn partial_read(
     buf: &mut [u8],
 ) -> std::result::Result<(), std::io::Error> {
     let initial_size = file.metadata().await?.size();
-    if initial_size > range.0 {
-        file.seek(std::io::SeekFrom::Start(range.0)).await?;
-        let read_end = (min(range.1, initial_size) - range.0) as usize;
+    if initial_size > range.start {
+        file.seek(std::io::SeekFrom::Start(range.start)).await?;
+        let read_end = (min(range.end, initial_size) - range.start) as usize;
         file.read_exact(&mut buf[0..read_end]).await?;
         buf[read_end..].fill(0);
     } else {
@@ -933,7 +934,7 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 fpath.relative_path().to_path_buf(),
-                (5, 10),
+                ByteRange { start: 5, end: 10 },
                 10,
                 b"fghij".to_vec(),
                 Options::default(),
@@ -952,7 +953,7 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 fpath.relative_path().to_path_buf(),
-                (0, 5),
+                ByteRange { start: 0, end: 5 },
                 10,
                 b"abcde".to_vec(),
                 Options::default(),
@@ -978,7 +979,7 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 fpath.relative_path().to_path_buf(),
-                (5, 10),
+                ByteRange { start: 5, end: 10 },
                 Options::default(),
             )
             .await?;
@@ -990,7 +991,7 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 fpath.relative_path().to_path_buf(),
-                (0, 5),
+                ByteRange { start: 0, end: 5 },
                 Options::default(),
             )
             .await?;
@@ -1002,7 +1003,7 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 fpath.relative_path().to_path_buf(),
-                (0, 15),
+                ByteRange { start: 0, end: 15 },
                 Options::default(),
             )
             .await?;
@@ -1071,7 +1072,7 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 fpath.relative_path().to_path_buf(),
-                (0, 7),
+                ByteRange { start: 0, end: 7 },
                 7,
                 b"1234567".to_vec(),
                 Options::default(),
@@ -1094,7 +1095,7 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 PathBuf::from("foo.txt"),
-                (0, content.len() as u64),
+                ByteRange { start: 0, end: content.len() as u64 },
                 Options::default(),
             )
             .await?;
@@ -1113,7 +1114,7 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 PathBuf::from("bar.txt"),
-                (0, content2.len() as u64),
+                ByteRange { start: 0, end: content2.len() as u64 },
                 Options::default(),
             )
             .await?;
@@ -1136,7 +1137,7 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 PathBuf::from("foo.txt"),
-                (100, 200),
+                ByteRange { start: 100, end: 200 },
                 Options::default(),
             )
             .await?;
@@ -1157,7 +1158,7 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 PathBuf::from("foo.txt"),
-                (0, 200),
+                ByteRange { start: 0, end: 200 },
                 Options::default(),
             )
             .await?;
@@ -1231,7 +1232,7 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 file_path.clone(),
-                (0, file_content.len() as u64),
+                ByteRange { start: 0, end: file_content.len() as u64 },
                 Options::default(),
             )
             .await?;
@@ -1247,7 +1248,7 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 file_path.clone(),
-                (0, new_content.len() as u64),
+                ByteRange { start: 0, end: new_content.len() as u64 },
                 sig.clone(),
                 Options::default(),
             )
@@ -1262,7 +1263,7 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 file_path.clone(),
-                (0, new_content.len() as u64),
+                ByteRange { start: 0, end: new_content.len() as u64 },
                 new_content.len() as u64,
                 delta,
                 Options::default(),
@@ -1289,7 +1290,7 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 PathBuf::from("notfound.txt"),
-                (0, 10),
+                ByteRange { start: 0, end: 10 },
                 Options::default(),
             )
             .await;
@@ -1310,7 +1311,7 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 file_path,
-                (0, 3),
+                ByteRange { start: 0, end: 3 },
                 3,
                 crate::model::service::Delta(vec![1, 2, 3]),
                 Options::default(),
@@ -1337,7 +1338,7 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 file_path.clone(),
-                (0, original_content.len() as u64),
+                ByteRange { start: 0, end: original_content.len() as u64 },
                 Options::default(),
             )
             .await?;
@@ -1353,7 +1354,7 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 file_path.clone(),
-                (0, new_content.len() as u64),
+                ByteRange { start: 0, end: new_content.len() as u64 },
                 sig.clone(),
                 Options::default(),
             )
@@ -1368,7 +1369,7 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 file_path.clone(),
-                (0, new_content.len() as u64),
+                ByteRange { start: 0, end: new_content.len() as u64 },
                 new_content.len() as u64,
                 delta,
                 Options::default(),
@@ -1462,7 +1463,7 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 PathBuf::from("foo.txt"),
-                (0, 7),
+                ByteRange { start: 0, end: 7 },
                 Options {
                     ignore_partial: false,
                 },
@@ -1476,7 +1477,7 @@ mod tests {
                 tarpc::context::current(),
                 dir.id().clone(),
                 PathBuf::from("foo.txt"),
-                (0, 5),
+                ByteRange { start: 0, end: 5 },
                 Options {
                     ignore_partial: true,
                 },

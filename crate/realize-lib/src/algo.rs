@@ -3,9 +3,10 @@
 //! Implements the unoptimized algorithm to move files from source (A) to destination (B)
 //! using the RealizeService trait. See spec/design.md for details.
 
+use crate::model::byterange::{ByteRange, ByteRanges};
 use crate::model::service::{
-    ByteRange, DirectoryId, Options, RangedHash, RealizeError, RealizeServiceClient,
-    RealizeServiceRequest, RealizeServiceResponse, SyncedFile,
+    DirectoryId, Options, RangedHash, RealizeError, RealizeServiceClient, RealizeServiceRequest,
+    RealizeServiceResponse, SyncedFile,
 };
 use futures::future;
 use futures::future::Either;
@@ -282,37 +283,45 @@ where
         HASH_FILE_CHUNK,
         src_options(),
     ));
-    if src_size == dst_size {
+    let mut correct = ByteRanges::new();
+    if dst_size > HASH_FILE_CHUNK {
         report_verifying(&progress_tx, &dir_id, path).await;
         let hash = match src_hash {
             Either::Left(fut) => fut.await?,
             Either::Right(hash) => hash,
         };
-        if check_hashes_and_delete(ctx, &hash, src_size, src, dst, &dir_id, path).await? {
-            return Ok(());
+        match check_hashes_and_delete(ctx, &hash, src_size, src, dst, &dir_id, path).await? {
+            HashCheck::Match => {
+                return Ok(());
+            }
+            HashCheck::Mismatch {
+                partial_match: matches,
+                ..
+            } => {
+                correct = matches;
+            }
         }
         src_hash = Either::Right(hash);
     }
 
     // Chunked Transfer
-    let ranges = ByteRangeIterator::new(src_size, CHUNK_SIZE);
-    let mut rsync_ranges = ranges
-        .clone()
-        .filter(|(offset, _)| *offset < dst_size)
-        .peekable();
-    let mut copy_ranges = ranges.filter(|(offset, _)| *offset >= dst_size).peekable();
+    let ranges = ByteRanges::single(0, src_size);
+    let rsync_ranges = ranges
+        .intersection(&ByteRanges::single(0, dst_size))
+        .subtraction(&correct);
+    let copy_ranges = ranges.intersection(&ByteRanges::single(dst_size, src_size));
 
     // 1. Check existing data (rsyncing)
-    if rsync_ranges.peek().is_some() {
+    if !rsync_ranges.is_empty() {
         report_rsyncing(&progress_tx, &dir_id, path).await;
 
-        for range in rsync_ranges {
+        for range in rsync_ranges.chunked(CHUNK_SIZE) {
             let sig = dst
                 .calculate_signature(
                     ctx,
                     dir_id.clone(),
                     path.to_path_buf(),
-                    range,
+                    range.clone(),
                     dst_options(),
                 )
                 .await??;
@@ -321,7 +330,7 @@ where
                     ctx,
                     dir_id.clone(),
                     path.to_path_buf(),
-                    range,
+                    range.clone(),
                     sig,
                     src_options(),
                 )
@@ -331,12 +340,12 @@ where
                 .inc_by(delta.0.len() as u64);
             METRIC_RANGE_READ_BYTES
                 .with_label_values(&["diff"])
-                .inc_by(range.1 - range.0);
+                .inc_by(range.end - range.start);
             dst.apply_delta(
                 ctx,
                 dir_id.clone(),
                 path.to_path_buf(),
-                range,
+                range.clone(),
                 src_file.size,
                 delta.clone(),
                 dst_options(),
@@ -347,17 +356,17 @@ where
     }
 
     // 2. Copy missyng data
-    if copy_ranges.peek().is_some() {
+    if !copy_ranges.is_empty() {
         report_copying(&progress_tx, &dir_id, path).await;
 
         let _lock = copy_sem.acquire().await;
-        for range in copy_ranges {
+        for range in copy_ranges.chunked(CHUNK_SIZE) {
             let data = src
                 .read(
                     ctx,
                     dir_id.clone(),
                     path.to_path_buf(),
-                    range,
+                    range.clone(),
                     src_options(),
                 )
                 .await??;
@@ -366,12 +375,12 @@ where
                 .inc_by(data.len() as u64);
             METRIC_RANGE_READ_BYTES
                 .with_label_values(&["read"])
-                .inc_by(range.1 - range.0);
+                .inc_by(range.end - range.start);
             dst.send(
                 ctx,
                 dir_id.clone(),
                 path.to_path_buf(),
-                range,
+                range.clone(),
                 src_file.size,
                 data.clone(),
                 dst_options(),
@@ -382,7 +391,7 @@ where
                 .inc_by(data.len() as u64);
             METRIC_RANGE_WRITE_BYTES
                 .with_label_values(&["send"])
-                .inc_by(range.1 - range.0);
+                .inc_by(range.end - range.start);
             report_range_progress(&progress_tx, &dir_id, path, &range).await;
         }
     }
@@ -393,10 +402,10 @@ where
         Either::Left(hash) => hash.await?,
         Either::Right(hash) => hash,
     };
-    if !check_hashes_and_delete(ctx, &hash, src_size, src, dst, &dir_id, path).await? {
-        return Err(MoveFileError::FailedToSync);
+    match check_hashes_and_delete(ctx, &hash, src_size, src, dst, &dir_id, path).await? {
+        HashCheck::Mismatch { .. } => Err(MoveFileError::FailedToSync),
+        HashCheck::Match => Ok(()),
     }
-    Ok(())
 }
 
 async fn report_copying(
@@ -455,7 +464,7 @@ async fn report_range_progress(
             .send(ProgressEvent::IncrementByteCount {
                 dir_id: dir_id.clone(),
                 path: path.to_path_buf(),
-                bytecount: range.1 - range.0,
+                bytecount: range.end - range.start,
             })
             .await;
     }
@@ -474,21 +483,22 @@ pub(crate) async fn hash_file<T>(
 where
     T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
 {
-    let results = futures::stream::iter(ByteRangeIterator::new(file_size, chunk_size))
-        .map(|range| {
-            client
-                .hash(
-                    ctx,
-                    dir_id.clone(),
-                    relative_path.to_path_buf(),
-                    range,
-                    options,
-                )
-                .map(move |res| res.map(|h| (range, h)))
-        })
-        .buffer_unordered(PARALLEL_FILE_HASH)
-        .collect::<Vec<_>>()
-        .await;
+    let results =
+        futures::stream::iter(ByteRange::new(0, file_size).chunked(chunk_size).into_iter())
+            .map(|range| {
+                client
+                    .hash(
+                        ctx,
+                        dir_id.clone(),
+                        relative_path.to_path_buf(),
+                        range.clone(),
+                        options,
+                    )
+                    .map(move |res| res.map(|h| (range.clone(), h)))
+            })
+            .buffer_unordered(PARALLEL_FILE_HASH)
+            .collect::<Vec<_>>()
+            .await;
 
     let mut ranged = RangedHash::new();
     for res in results.into_iter() {
@@ -496,6 +506,17 @@ where
         ranged.add(range, hash_res?);
     }
     Ok(ranged)
+}
+
+/// Return value for [check_hashes_and_delete]
+enum HashCheck {
+    /// The hashes matched.
+    Match,
+
+    /// The hashes didn't match.
+    ///
+    /// If some hash range matched, it is reported as partial match.
+    Mismatch { partial_match: ByteRanges },
 }
 
 /// Check hashes and, if they match, finish the dest file and delete the source.
@@ -509,7 +530,7 @@ async fn check_hashes_and_delete<T, U>(
     dst: &RealizeServiceClient<U>,
     dir_id: &DirectoryId,
     path: &std::path::Path,
-) -> Result<bool, MoveFileError>
+) -> Result<HashCheck, MoveFileError>
 where
     T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
     U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
@@ -529,7 +550,7 @@ where
     let (matches, mismatches) = src_hash.diff(&dst_hash);
     if !mismatches.is_empty() || !is_complete_src || !is_complete_dst {
         log::warn!(
-            "{}:{:?} inconsistent hashes\nsrc: {}\ndst: {}\nmatched: {:?}\nmismatched: {:?}",
+            "{}:{:?} inconsistent hashes\nsrc: {}\ndst: {}\nmatches: {}\nmismatches: {}",
             dir_id,
             path,
             src_hash,
@@ -540,7 +561,9 @@ where
         METRIC_FILE_END_COUNT
             .with_label_values(&["Inconsistent"])
             .inc();
-        return Ok(false);
+        return Ok(HashCheck::Mismatch {
+            partial_match: matches,
+        });
     }
     log::info!(
         "{}:{:?} OK (hash match); finishing and deleting",
@@ -554,7 +577,7 @@ where
         .await??;
 
     METRIC_FILE_END_COUNT.with_label_values(&["Ok"]).inc();
-    Ok(true)
+    Ok(HashCheck::Match)
 }
 
 #[cfg(test)]
@@ -888,7 +911,10 @@ mod tests {
         .await?;
         assert_eq!(
             RangedHash::single(
-                (0, content.len() as u64),
+                ByteRange {
+                    start: 0,
+                    end: content.len() as u64
+                },
                 Hash(sha2::Sha256::digest(content).into())
             ),
             ranged
@@ -918,12 +944,30 @@ mod tests {
         )
         .await?;
         let mut expected = RangedHash::new();
-        expected.add((0, 4), Hash(sha2::Sha256::digest(b"baa,").into()));
-        expected.add((4, 8), Hash(sha2::Sha256::digest(b" baa").into()));
-        expected.add((8, 12), Hash(sha2::Sha256::digest(b", bl").into()));
-        expected.add((12, 16), Hash(sha2::Sha256::digest(b"ack ").into()));
-        expected.add((16, 20), Hash(sha2::Sha256::digest(b"shee").into()));
-        expected.add((20, 21), Hash(sha2::Sha256::digest(b"p").into()));
+        expected.add(
+            ByteRange { start: 0, end: 4 },
+            Hash(sha2::Sha256::digest(b"baa,").into()),
+        );
+        expected.add(
+            ByteRange { start: 4, end: 8 },
+            Hash(sha2::Sha256::digest(b" baa").into()),
+        );
+        expected.add(
+            ByteRange { start: 8, end: 12 },
+            Hash(sha2::Sha256::digest(b", bl").into()),
+        );
+        expected.add(
+            ByteRange { start: 12, end: 16 },
+            Hash(sha2::Sha256::digest(b"ack ").into()),
+        );
+        expected.add(
+            ByteRange { start: 16, end: 20 },
+            Hash(sha2::Sha256::digest(b"shee").into()),
+        );
+        expected.add(
+            ByteRange { start: 20, end: 21 },
+            Hash(sha2::Sha256::digest(b"p").into()),
+        );
 
         assert_eq!(ranged, expected);
 
@@ -952,8 +996,11 @@ mod tests {
         )
         .await?;
         let mut expected = RangedHash::new();
-        expected.add((0, 4), Hash(sha2::Sha256::digest(b"foob").into()));
-        expected.add((4, 8), Hash::zero());
+        expected.add(
+            ByteRange { start: 0, end: 4 },
+            Hash(sha2::Sha256::digest(b"foob").into()),
+        );
+        expected.add(ByteRange { start: 4, end: 8 }, Hash::zero());
         assert_eq!(ranged, expected);
 
         Ok(())
@@ -990,41 +1037,6 @@ mod tests {
             }
         }
         Ok(result)
-    }
-}
-
-/// Split [0, total) into chunks of the given size.
-#[derive(Clone)]
-struct ByteRangeIterator {
-    total: u64,
-    chunk_size: u64,
-    offset: u64,
-}
-impl ByteRangeIterator {
-    fn new(total: u64, chunk_size: u64) -> Self {
-        ByteRangeIterator {
-            total,
-            chunk_size,
-            offset: 0,
-        }
-    }
-}
-impl Iterator for ByteRangeIterator {
-    type Item = ByteRange;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.offset >= self.total {
-            return None;
-        }
-
-        let mut end = self.offset + self.chunk_size;
-        if end > self.total {
-            end = self.total;
-        }
-        let range = (self.offset, end);
-        self.offset = end;
-
-        Some(range)
     }
 }
 
