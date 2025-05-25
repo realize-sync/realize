@@ -334,9 +334,6 @@ async fn log_output_events() -> anyhow::Result<()> {
         if line.contains("Copying") {
             found.push("CopyingFile");
         }
-        if line.contains("Pending") {
-            found.push("PendingFile");
-        }
         if line.contains("Moved") {
             found.push("FileSuccess");
         }
@@ -354,7 +351,6 @@ async fn log_output_events() -> anyhow::Result<()> {
         "MovingDir",
         "MovingFile",
         "CopyingFile",
-        "PendingFile",
         "FileSuccess",
         "Summary",
     ] {

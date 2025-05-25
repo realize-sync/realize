@@ -310,8 +310,6 @@ impl CliFileProgress {
         pb.set_prefix("Copying");
     }
     fn pending(&mut self) {
-        log::info!("Pending {} ({})", self.path, HumanBytes(self.bytes));
-
         let pb = self.get_or_create_bar();
         pb.set_prefix("Pending");
     }
