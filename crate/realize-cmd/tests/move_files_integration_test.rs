@@ -1,6 +1,6 @@
+use assert_fs::TempDir;
 use assert_fs::fixture::ChildPath;
 use assert_fs::prelude::*;
-use assert_fs::TempDir;
 use assert_unordered::assert_eq_unordered;
 use hyper_util::rt::TokioIo;
 use realize_lib::model::service::DirectoryId;
@@ -365,6 +365,31 @@ async fn log_output_events() -> anyhow::Result<()> {
         "stderr should contain log output in log mode"
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn systemd_log_output_format() -> anyhow::Result<()> {
+    let fixture = Fixture::setup().await?;
+    create_files(&fixture.src_dir, &[("foo.txt", "bar")])?;
+    let output = fixture
+        .command()
+        .arg("--output")
+        .arg("log")
+        .env_remove("RUST_LOG")
+        .env("RUST_LOG_FORMAT", "SYSTEMD")
+        .output()
+        .await?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for line in stderr.lines() {
+        eprintln!("{}", line);
+
+        if line.starts_with("<5>realize_cmd::progress: Moved foo.txt") {
+            return Ok(());
+        }
+    }
+
+    panic!("stderr did not contain the expected message. stderr: {stderr} stdout: {stdout}",)
 }
 
 #[tokio::test]

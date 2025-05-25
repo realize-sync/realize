@@ -8,6 +8,7 @@ use realize_lib::metrics;
 use realize_lib::server::{Directory, DirectoryMap};
 use realize_lib::transport::security::{self, PeerVerifier};
 use realize_lib::transport::tcp::{self, HostPort};
+use realize_lib::utils::logging;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use rustls::sign::SigningKey;
@@ -16,9 +17,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fs, process};
 
-/// Command-line arguments for the realized daemon
+/// Run the realize daemon in the foreground.
+///
+/// Exposes the realize RPC service at the given address. The RPC
+/// service gives access to the directories configured in the YAML
+/// configuration file to known peers. Stop it with SIGTERM.
+///
+/// By default, outputs errors and warnings to stderr. To configure
+/// the output, set the env variable RUST_LOG. Set the env variable
+/// RUST_LOG_FORMAT=SYSTEMD to a systemd-friendly log output.
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about, long_about, verbatim_doc_comment)]
 struct Cli {
     /// TCP address to listen on (default: localhost:9771)
     #[arg(long, default_value = "localhost:9771")]
@@ -63,10 +72,8 @@ lazy_static::lazy_static! {
 
 #[tokio::main]
 async fn main() {
-    // Init env_logger (log nothing unless env variable is set)
-    env_logger::init();
-
     let cli = Cli::parse();
+    logging::init_with_info_modules(vec!["realize_daemon"]);
 
     if let Err(err) = execute(cli).await {
         eprintln!("ERROR: {err:#}");
@@ -111,6 +118,7 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
         metrics::export_metrics(addr)
             .await
             .with_context(|| format!("Failed to export metrics on {addr}"))?;
+        log::info!("Metrics available on http://{addr}/metrics");
     }
 
     let hostport = HostPort::parse(&cli.address)
@@ -123,6 +131,7 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
 
     METRIC_UP.inc();
     println!("Listening on {addr}");
+    log::info!("Listening on {addr}");
 
     handle.join().await?;
 

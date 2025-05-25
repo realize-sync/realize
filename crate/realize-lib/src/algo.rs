@@ -8,17 +8,17 @@ use crate::model::service::{
     DirectoryId, Options, RangedHash, RealizeError, RealizeServiceClient, RealizeServiceRequest,
     RealizeServiceResponse, SyncedFile,
 };
+use futures::FutureExt;
 use futures::future;
 use futures::future::Either;
 use futures::stream::StreamExt as _;
-use futures::FutureExt;
-use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
+use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
 use std::sync::Arc;
 use std::{collections::HashMap, path::Path};
 use tarpc::client::stub::Stub;
 use thiserror::Error;
-use tokio::sync::mpsc::Sender;
 use tokio::sync::Semaphore;
+use tokio::sync::mpsc::Sender;
 
 pub mod hash;
 
@@ -635,7 +635,7 @@ where
     let is_complete_dst = dst_hash.is_complete(file_size);
     let (matches, mismatches) = src_hash.diff(&dst_hash);
     if !mismatches.is_empty() || !is_complete_src || !is_complete_dst {
-        log::warn!(
+        log::debug!(
             "{}:{:?} inconsistent hashes\nsrc: {}\ndst: {}\nmatches: {}\nmismatches: {}",
             dir_id,
             path,
@@ -668,8 +668,8 @@ mod tests {
     use crate::model::service::DirectoryId;
     use crate::model::service::Hash;
     use crate::server::{self, DirectoryMap};
-    use assert_fs::prelude::*;
     use assert_fs::TempDir;
+    use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
     use std::path::PathBuf;
     use std::sync::Arc;

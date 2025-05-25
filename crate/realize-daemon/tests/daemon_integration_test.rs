@@ -72,10 +72,7 @@ impl Fixture {
             .arg(self.resources.join("a.key"))
             .arg("--config")
             .arg(&self.config_file)
-            .env(
-                "RUST_LOG",
-                "realize_lib::transport::tcp=debug,realize_daemon=debug",
-            )
+            .env_remove("RUST_LOG")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -91,7 +88,13 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
 
     // Run process in the background and in a way that allows reading
     // its output, so we know what port to connect to.
-    let mut daemon = fixture.command().spawn()?;
+    let mut daemon = fixture
+        .command()
+        .env(
+            "RUST_LOG",
+            "realize_lib::transport::tcp=debug,realize_daemon=debug",
+        )
+        .spawn()?;
 
     // The first line that's output to stdout must be Listening on
     // <address>:<port>. Anything else is an error.
@@ -238,6 +241,32 @@ async fn daemon_warns_on_unwritable_directory() -> anyhow::Result<()> {
         stderr.contains("No write access"),
         "stderr: {stderr}, stdout: {stdout}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_systemd_log_output_format() -> anyhow::Result<()> {
+    let fixture = Fixture::setup().await?;
+
+    // Run process in the background and in a way that allows reading
+    // its output, so we know what port to connect to.
+    let mut daemon = fixture
+        .command()
+        .env("RUST_LOG_FORMAT", "SYSTEMD")
+        .spawn()?;
+
+    wait_for_listening_port(daemon.stdout.as_mut().unwrap()).await?;
+    // Kill to make sure stderr ends
+    daemon.start_kill()?;
+
+    // Make sure stderr contains the expected log message.
+    let stdout = collect_stdout(daemon.stdout.as_mut().unwrap()).await?;
+    let stderr = collect_stderr(daemon.stderr.as_mut().unwrap()).await?;
+    assert!(
+        stderr.contains("<5>realize_daemon: Listening on 127.0.0.1:"),
+        "stderr: {stderr} stdout: {stdout}"
+    );
+
     Ok(())
 }
 

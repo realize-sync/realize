@@ -1,17 +1,18 @@
 use anyhow::Context as _;
-use async_speed_limit::clock::StandardClock;
 use async_speed_limit::Limiter;
+use async_speed_limit::clock::StandardClock;
 use clap::Parser;
 use clap::ValueEnum;
 use console::style;
 use indicatif::HumanBytes;
 use progress::CliProgress;
-use prometheus::{register_int_counter, IntCounter};
+use prometheus::{IntCounter, register_int_counter};
 use realize_lib::algo::MoveFileError;
 use realize_lib::metrics;
 use realize_lib::model::service::DirectoryId;
 use realize_lib::transport::security::{self, PeerVerifier};
 use realize_lib::transport::tcp::{self, ClientConnectionState, HostPort, TcpRealizeServiceClient};
+use realize_lib::utils::logging;
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use rustls::sign::SigningKey;
@@ -45,37 +46,52 @@ lazy_static::lazy_static! {
         register_int_counter!("realize_cmd_up", "Command is up").unwrap();
 }
 
-/// Realize command-line tool
+/// Move files between Realize RPC server instances.
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about, long_about=None)]
 struct Cli {
-    /// Source remote address (host:port)
+    /// Address of the source RPC server instance (host:port).
     #[arg(long, required = false)]
     src_addr: String,
 
-    /// Destination remote address (host:port)
+    /// Address of the destination RPC server instance (host:port).
     #[arg(long, required = false)]
     dst_addr: String,
 
-    /// Path to the private key
+    /// Path to the private key used to identify this command to the
+    /// RPC servers.
+    ///
+    /// The server needs to be configured with the equivalent public
+    /// key for the connection to succeed.
     #[arg(long, required = true)]
     privkey: PathBuf,
 
-    /// Path to the PEM file with one or more peer public keys
+    /// Path to the PEM file with one or more server public keys.
+    ///
+    /// The command only connects to known servers, whose public key
+    /// is listed in this file.
     #[arg(long, required = true)]
     peers: PathBuf,
 
     /// IDs of the directories to process.
     ///
-    /// Source and dest must support these directories.
+    /// The directory ID must be configured on both the source and
+    /// destination RPC servers.
     #[arg(value_name = "ID", required = true, num_args = 1..)]
     directory_ids: Vec<String>,
 
-    /// Output mode: quiet, progress, or log
-    #[arg(long, value_enum, default_value = "progress")]
+    /// Output mode.
+    ///
+    /// Logging can be further configured by setting the env var
+    /// RUST_LOG. For a systemd-friendly output format, set the env
+    /// var RUST_LOG_FORMAT=SYSTEMD
+    #[arg(long, value_enum, default_value = "progress", verbatim_doc_comment)]
     output: OutputMode,
 
-    /// Maximum total duration for the operation (e.g. "5m", "30s"). If exceeded, the process exits with code 11.
+    /// Maximum total duration for the operation (e.g. "5m", "30s").
+    ///
+    /// Once exceeded, file transfers time out and the process exits
+    /// with status code 11.
     #[arg(long, default_value = "24h")]
     max_duration: humantime::Duration,
 
@@ -95,11 +111,11 @@ struct Cli {
     #[arg(long)]
     metrics_instance: Option<String>,
 
-    /// Throttle download (reading from src) in bytes/sec. Only applies to remote services.
+    /// Throttle download (reading from src) in bytes/sec.
     #[arg(long, required = false, value_parser = |s: &str| parse_bytes(s))]
     throttle_down: Option<u64>,
 
-    /// Throttle uploads (writing to dst) in bytes/sec.  Only applies to remote services.
+    /// Throttle uploads (writing to dst) in bytes/sec.
     #[arg(long, required = false, value_parser = |s: &str| parse_bytes(s))]
     throttle_up: Option<u64>,
 }
@@ -115,14 +131,9 @@ async fn main() {
     let output_mode = cli.output;
 
     if output_mode == OutputMode::Log {
-        env_logger::Builder::new()
-            .filter_level(log::LevelFilter::Warn)
-            .filter_module("realize_cmd", log::LevelFilter::Info)
-            .filter_module("realize_cmd::progress", log::LevelFilter::Info)
-            .parse_default_env() // Override the above with RUST_LOG
-            .init();
+        logging::init_with_info_modules(vec!["realize_cmd", "realize_cmd::progress"]);
     } else {
-        env_logger::init();
+        logging::init();
     }
 
     let _ = ctrlc::set_handler(move || {
