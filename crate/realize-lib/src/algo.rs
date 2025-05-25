@@ -224,6 +224,7 @@ where
                         (1, 0, 0)
                     }
                     Err(MoveFileError::Rpc(tarpc::client::RpcError::DeadlineExceeded)) => {
+                        log::debug!("{}/{}: Deadline exceeded", dir_id, file_path.display());
                         if let Some(tx) = &tx {
                             let _ = tx
                                 .send(ProgressEvent::FileError {
@@ -237,6 +238,7 @@ where
                         (0, 0, 1)
                     }
                     Err(ref err) => {
+                        log::debug!("{}/{}: {}", dir_id, file_path.display(), err);
                         if let Some(tx) = &tx {
                             let _ = tx
                                 .send(ProgressEvent::FileError {
@@ -763,8 +765,7 @@ mod tests {
             None,
         )
         .await?;
-        assert_eq!(error, 0, "No errors expected");
-        assert_eq!(success, 4, "All files should be moved");
+        assert_eq!((success, error), (4, 0));
         // Check that files are present in destination and not in source
         assert_eq_unordered!(snapshot_dir(src_temp.path())?, vec![]);
         assert_eq_unordered!(
