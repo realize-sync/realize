@@ -1,10 +1,10 @@
 use crate::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
 use crate::model::byterange::ByteRange;
-use crate::model::service::Options;
 use crate::model::service::{Config, Hash};
 use crate::model::service::{
     DirectoryId, RealizeError, RealizeService, Result, RsyncOperation, SyncedFile, SyncedFileState,
 };
+use crate::model::service::{HashMismatchSource, Options};
 use crate::model::service::{RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse};
 use async_speed_limit::clock::StandardClock;
 use async_speed_limit::Limiter;
@@ -17,7 +17,6 @@ use sha2::{Digest, Sha256};
 use std::cmp::min;
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::io::{Read as _, Seek as _};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -185,14 +184,9 @@ impl RealizeService for RealizeServer {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
         let (_, actual) = logical.find(&options).await?;
-        let mut file = OpenOptions::new()
-            .create(false)
-            .read(true)
-            .write(false)
-            .open(&actual)
-            .await?;
+        let mut file = open_for_range_read(&actual).await?;
         let mut buffer = vec![0; range.bytecount() as usize];
-        partial_read(&mut file, &range, &mut buffer).await?;
+        read_padded(&mut file, &range, &mut buffer).await?;
 
         let hash = hash_data(&buffer);
         Ok((buffer, hash))
@@ -209,31 +203,23 @@ impl RealizeService for RealizeServer {
         hash: Hash,
         options: Options,
     ) -> Result<()> {
-        if hash_data(&data) != hash {
-            return Err(RealizeError::HashMismatch);
-        }
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
-        let path = logical.partial_path();
-        if let Ok((state, actual)) = logical.find(&options).await {
-            if state == SyncedFileState::Final {
-                fs::rename(actual, &path).await?;
+        let path = prepare_for_write(&options, logical).await?;
+        for _ in 0..3 {
+            {
+                let mut file = open_for_range_write(&path).await?;
+                shorten_file(&mut file, &range, file_size).await?;
+
+                write_at_offset(&mut file, range.start, &data).await?;
             }
-        } else {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).await?;
+
+            if hash_range_padded(&path, &range).await? == hash {
+                return Ok(());
             }
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .await?;
-        write_at_offset(&mut file, range.start, &data).await?;
-        shorten_file(&mut file, file_size).await?;
 
-        Ok(())
+        Err(RealizeError::HashMismatch(HashMismatchSource::Send))
     }
 
     async fn finish(
@@ -266,40 +252,20 @@ impl RealizeService for RealizeServer {
     ) -> Result<Hash> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
-        let (_, actual) = logical.find(&options).await?;
+        let (_, path) = logical.find(&options).await?;
 
-        tokio::task::spawn_blocking(move || {
-            let mut file = std::fs::File::open(&actual)?;
-            if file.seek(std::io::SeekFrom::Start(range.start)).is_err() {
-                // We return an empty hash instead of failing, because we
-                // want hash comparison to fail if the file isn't of the
-                // expected size, not get an I/O error.
-                return Ok(Hash::zero());
-            }
-            let mut hasher = Sha256::new();
-            let mut buffer = [0u8; 8192];
-            let mut remaining = range.bytecount();
-            while remaining > 0 {
-                let mut bufsize = buffer.len();
-                if bufsize as u64 > remaining {
-                    bufsize = remaining as usize;
-                }
-                let n = file.read(&mut buffer[0..bufsize])?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buffer[..n]);
-                remaining -= n as u64;
-            }
-            if remaining > 0 {
-                // Short read. Make sure the hashes don't match.
-                return Ok(Hash::zero());
-            }
+        let (hash1, hash2) = tokio::join!(
+            hash_large_range_exact(&path, &range),
+            hash_large_range_exact(&path, &range)
+        );
+        let hash1 = hash1?;
+        let hash2 = hash2?;
 
-            let hash = hasher.finalize();
-            Ok(Hash(hash.into()))
-        })
-        .await?
+        if hash1 != hash2 {
+            return Err(RealizeError::HashMismatch(HashMismatchSource::Hash));
+        }
+
+        Ok(hash1)
     }
 
     async fn delete(
@@ -336,7 +302,7 @@ impl RealizeService for RealizeServer {
         let (_, actual) = logical.find(&options).await?;
         let mut file = File::open(&actual).await?;
         let mut buffer = vec![0u8; range.bytecount() as usize];
-        partial_read(&mut file, &range, &mut buffer).await?;
+        read_padded(&mut file, &range, &mut buffer).await?;
         let opts = SignatureOptions {
             block_size: RSYNC_BLOCK_SIZE as u32,
             crypto_hash_size: 8,
@@ -356,16 +322,16 @@ impl RealizeService for RealizeServer {
     ) -> Result<(crate::model::service::Delta, Hash)> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
-        let mut buffer = vec![0u8; range.bytecount() as usize];
-        if let Ok((_, actual)) = logical.find(&options).await {
-            let mut file = File::open(&actual).await?;
-            partial_read(&mut file, &range, &mut buffer).await?;
-        }
+        let (_, actual) = logical.find(&options).await?;
+        let mut file = open_for_range_read(&actual).await?;
+        let mut buffer = vec![0; range.bytecount() as usize];
+        read_padded(&mut file, &range, &mut buffer).await?;
+
+        let hash = hash_data(&buffer);
+
         let sig = RsyncSignature::deserialize(signature.0)?;
         let mut delta = Vec::new();
         rsync_diff(&sig.index(), &buffer, &mut delta)?;
-
-        let hash = hash_data(&buffer);
 
         Ok((crate::model::service::Delta(delta), hash))
     }
@@ -383,34 +349,32 @@ impl RealizeService for RealizeServer {
     ) -> Result<()> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
-        let (state, actual) = logical.find(&options).await?;
-        let partial_path = logical.partial_path();
-        if state == SyncedFileState::Final {
-            std::fs::rename(&actual, &partial_path)?;
-        }
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&partial_path)
-            .await?;
-        let mut base = vec![0u8; range.bytecount() as usize];
-        partial_read(&mut file, &range, &mut base).await?;
-        let mut out = Vec::new();
-        rsync_apply_limited(&base, &delta.0, &mut out, range.bytecount() as usize)?;
-        if out.len() as u64 != range.bytecount() {
-            return Err(RealizeError::BadRequest(
-                "Delta output size mismatch".to_string(),
-            ));
-        }
-        if hash_data(&out) != hash {
-            return Err(RealizeError::HashMismatch);
-        }
-        write_at_offset(&mut file, range.start, &out).await?;
+        let path = prepare_for_write(&options, logical).await?;
+        for _ in 0..3 {
+            {
+                let mut file = open_for_range_write(&path).await?;
+                shorten_file(&mut file, &range, file_size).await?;
 
-        shorten_file(&mut file, file_size).await?;
-        Ok(())
+                let mut base = vec![0u8; range.bytecount() as usize];
+                read_padded(&mut file, &range, &mut base).await?;
+                let mut out = Vec::new();
+                rsync_apply_limited(&base, &delta.0, &mut out, range.bytecount() as usize)?;
+                if out.len() as u64 != range.bytecount() {
+                    return Err(RealizeError::BadRequest(
+                        "Delta output size mismatch".to_string(),
+                    ));
+                }
+                if hash_data(&out) != hash {
+                    return Err(RealizeError::HashMismatch(HashMismatchSource::Rsync));
+                }
+                write_at_offset(&mut file, range.start, &out).await?;
+            }
+
+            if hash_range_padded(&path, &range).await? == hash {
+                return Ok(());
+            }
+        }
+        return Err(RealizeError::HashMismatch(HashMismatchSource::ApplyPatch));
     }
 
     async fn configure(
@@ -434,12 +398,92 @@ impl RealizeService for RealizeServer {
     }
 }
 
+async fn open_for_range_write(path: &Path) -> Result<File> {
+    Ok(OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .await?)
+}
+async fn open_for_range_read(path: &Path) -> Result<File> {
+    Ok(OpenOptions::new()
+        .create(false)
+        .read(true)
+        .write(false)
+        .open(path)
+        .await?)
+}
+
+async fn prepare_for_write(options: &Options, logical: LogicalPath) -> Result<PathBuf> {
+    let path = logical.partial_path();
+    if let Ok((state, actual)) = logical.find(&options).await {
+        if state == SyncedFileState::Final {
+            fs::rename(actual, &path).await?;
+        }
+    } else {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+    }
+    Ok(path)
+}
+
 /// Compute a hash for a data buffer.
 fn hash_data(data: impl AsRef<[u8]>) -> Hash {
     Hash(Sha256::digest(data).into())
 }
 
-async fn partial_read(
+/// Hash a range that is small enough to kept in memory.
+///
+/// Missing data is padded with 0.
+async fn hash_range_padded(path: &Path, range: &ByteRange) -> Result<Hash> {
+    let mut file = open_for_range_read(path).await?;
+    let mut buffer = vec![0; range.bytecount() as usize];
+    read_padded(&mut file, &range, &mut buffer).await?;
+    Ok(hash_data(&buffer))
+}
+
+/// Hash a range that is too large to be kept in memory.
+///
+/// Return a zero hash if data is missing.
+async fn hash_large_range_exact(path: &Path, range: &ByteRange) -> Result<Hash> {
+    let mut file = open_for_range_read(&path).await?;
+    let file_size = file.metadata().await?.len();
+    if range.end > file_size {
+        // We return an empty hash instead of failing, because we
+        // want hash comparison to fail if the file isn't of the
+        // expected size, not get an I/O error.
+        return Ok(Hash::zero());
+    }
+
+    file.seek(std::io::SeekFrom::Start(range.start)).await?;
+
+    let mut hasher = Sha256::new();
+
+    // Using a large buffer as async operations are more
+    // expensive. Using a spawn_block would make the computation
+    // of the hash run on the limited block threads, which is also
+    // a problem.
+    let mut buffer = [0u8; 1024 * 1024];
+    let mut remaining = range.bytecount();
+    while remaining > 0 {
+        let mut bufsize = buffer.len();
+        if bufsize as u64 > remaining {
+            bufsize = remaining as usize;
+        }
+        let n = file.read(&mut buffer[0..bufsize]).await?;
+        assert!(remaining >= n as u64);
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+        remaining -= n as u64;
+    }
+    Ok(Hash(hasher.finalize().into()))
+}
+
+async fn read_padded(
     file: &mut File,
     range: &ByteRange,
     buf: &mut [u8],
@@ -456,10 +500,10 @@ async fn partial_read(
     Ok(())
 }
 
-async fn shorten_file(file: &mut File, file_size: u64) -> Result<()> {
-    let file_len = file.metadata().await?.len();
-    if file_len > file_size {
+async fn shorten_file(file: &mut File, range: &ByteRange, file_size: u64) -> Result<()> {
+    if range.end == file_size && file.metadata().await?.len() > file_size {
         file.set_len(file_size).await?;
+        file.flush().await?;
     }
 
     Ok(())
@@ -677,6 +721,7 @@ mod tests {
     use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
     use std::fs;
+    use std::io::Read as _;
 
     fn setup_server_with_dir() -> anyhow::Result<(RealizeServer, TempDir, Arc<Directory>)> {
         let temp = TempDir::new()?;

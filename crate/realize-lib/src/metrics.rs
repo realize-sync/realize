@@ -14,8 +14,8 @@ use tarpc::{
 };
 use tokio::net::TcpListener;
 
-use crate::model::byterange::ByteRange;
 use crate::model::service::{RealizeError, RealizeServiceRequest, RealizeServiceResponse};
+use crate::model::{byterange::ByteRange, service::HashMismatchSource};
 
 lazy_static::lazy_static! {
     pub(crate) static ref METRIC_SERVER_DATA_IN_BYTES: HistogramVec =
@@ -172,7 +172,8 @@ fn realize_error_label(err: &RealizeError) -> &'static str {
         RealizeError::Io(_) => "Io",
         RealizeError::Rsync(_, _) => "Rsync",
         RealizeError::Other(_) => "Other",
-        RealizeError::HashMismatch => "HashMismatch",
+        RealizeError::HashMismatch(HashMismatchSource::Rsync) => "HashMismatchAfterRsync",
+        RealizeError::HashMismatch(_) => "HashMismatch",
     }
 }
 

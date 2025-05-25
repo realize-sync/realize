@@ -200,8 +200,17 @@ pub enum RealizeError {
     #[error("Unexpected: {0}")]
     Other(String),
 
-    #[error("Hash mismatch")]
-    HashMismatch,
+    #[error("Hash mismatch [{0:?}]")]
+    HashMismatch(HashMismatchSource),
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub enum HashMismatchSource {
+    Read,
+    Send,
+    ApplyPatch,
+    Hash,
+    Rsync,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]

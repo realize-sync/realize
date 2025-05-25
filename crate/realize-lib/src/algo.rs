@@ -325,15 +325,6 @@ where
         }
     }
 
-    log::debug!(
-        "{}/{} overall: {}, rsync: {}, copy: {}",
-        dir_id,
-        path.display(),
-        ranges,
-        rsync_ranges,
-        copy_ranges
-    );
-
     // 1. Check existing data (rsyncing)
     if !rsync_ranges.is_empty() {
         report_rsyncing(&progress_tx, &dir_id, path).await;
@@ -395,13 +386,14 @@ where
                         .inc_by(range.bytecount());
                     report_range_progress(&progress_tx, &dir_id, path, &range).await;
                 }
-                Err(RealizeError::HashMismatch) => {
+                Err(RealizeError::HashMismatch(source)) => {
                     copy_ranges.add(&range);
-                    log::debug!(
-                        "{}/{}:{} hash mismatch after apply_delta, will copy",
+                    log::error!(
+                        "{}/{}:{} hash mismatch [{:?}] after apply_delta, will copy",
                         dir_id,
                         path.display(),
-                        range
+                        range,
+                        source,
                     );
                     METRIC_APPLY_DELTA_FALLBACK_COUNT.inc();
                     METRIC_APPLY_DELTA_FALLBACK_BYTES.inc_by(range.bytecount());
@@ -632,11 +624,7 @@ where
             partial_match: matches,
         });
     }
-    log::info!(
-        "{}:{:?} OK (hash match); finishing and deleting",
-        dir_id,
-        path
-    );
+    log::debug!("{}/{} MOVED", dir_id, path.display());
     // Hashes match, finish and delete
     dst.finish(ctx, dir_id.clone(), path.to_path_buf(), dst_options())
         .await??;
