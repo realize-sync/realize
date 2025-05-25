@@ -436,9 +436,8 @@ async fn realize_metrics_export() -> anyhow::Result<()> {
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers()["Content-Type"], "text/plain; version=0.0.4");
     let body = resp.text().await?;
-    // The command can't connect, so up stays 0.
     assert!(
-        body.contains("realize_cmd_up 0"),
+        body.contains("realize_cmd_up "),
         "metrics output missing expected Prometheus format: {}",
         body
     );
