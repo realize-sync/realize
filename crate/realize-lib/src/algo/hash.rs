@@ -1,11 +1,13 @@
 //! Produce hashes using the appropriate algorithm.
 
 use crate::model::service::Hash;
-use sha2::Digest as _;
+use blake2::{digest::consts::U32, Blake2b, Digest};
+
+type Blake2b256 = Blake2b<U32>;
 
 /// Produce a hash from an in-memory buffer.
 pub fn digest(data: impl AsRef<[u8]>) -> Hash {
-    Hash(sha2::Sha256::digest(data).into())
+    Hash(Blake2b256::digest(data).into())
 }
 
 /// Produce a hash by appending multiple buffers.
@@ -22,12 +24,12 @@ pub fn digest(data: impl AsRef<[u8]>) -> Hash {
 /// ```
 pub fn running() -> RunningHash {
     RunningHash {
-        digest: sha2::Sha256::new(),
+        digest: Blake2b256::new(),
     }
 }
 
 pub struct RunningHash {
-    digest: sha2::Sha256,
+    digest: Blake2b256,
 }
 
 impl RunningHash {
