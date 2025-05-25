@@ -1,3 +1,4 @@
+use crate::algo::hash;
 use crate::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
 use crate::model::byterange::ByteRange;
 use crate::model::service::Options;
@@ -6,22 +7,21 @@ use crate::model::service::{
     DirectoryId, RealizeError, RealizeService, Result, RsyncOperation, SyncedFile, SyncedFileState,
 };
 use crate::model::service::{RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse};
-use async_speed_limit::clock::StandardClock;
 use async_speed_limit::Limiter;
+use async_speed_limit::clock::StandardClock;
 use fast_rsync::{
-    apply_limited as rsync_apply_limited, diff as rsync_diff, Signature as RsyncSignature,
-    SignatureOptions,
+    Signature as RsyncSignature, SignatureOptions, apply_limited as rsync_apply_limited,
+    diff as rsync_diff,
 };
 use futures::StreamExt;
-use sha2::{Digest, Sha256};
 use std::cmp::min;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tarpc::client::stub::Stub;
 use tarpc::client::RpcError;
+use tarpc::client::stub::Stub;
 use tarpc::context;
 use tarpc::server::Channel;
 use tokio::fs::{self, File, OpenOptions};
@@ -305,7 +305,7 @@ impl RealizeService for RealizeServer {
         let mut buffer = vec![0; range.bytecount() as usize];
         read_padded(&mut file, &range, &mut buffer).await?;
 
-        let hash = hash_data(&buffer);
+        let hash = hash::digest(&buffer);
 
         let sig = RsyncSignature::deserialize(signature.0)?;
         let mut delta = Vec::new();
@@ -341,7 +341,7 @@ impl RealizeService for RealizeServer {
                 "Delta output size mismatch".to_string(),
             ));
         }
-        if hash_data(&out) != hash {
+        if hash::digest(&out) != hash {
             return Err(RealizeError::HashMismatch);
         }
         write_at_offset(&mut file, range.start, &out).await?;
@@ -402,11 +402,6 @@ async fn prepare_for_write(options: &Options, logical: LogicalPath) -> Result<Pa
     Ok(path)
 }
 
-/// Compute a hash for a data buffer.
-fn hash_data(data: impl AsRef<[u8]>) -> Hash {
-    Hash(Sha256::digest(data).into())
-}
-
 /// Hash a range that is too large to be kept in memory.
 ///
 /// Return a zero hash if data is missing.
@@ -422,7 +417,7 @@ async fn hash_large_range_exact(path: &Path, range: &ByteRange) -> Result<Hash> 
 
     file.seek(std::io::SeekFrom::Start(range.start)).await?;
 
-    let mut hasher = Sha256::new();
+    let mut hasher = hash::running();
 
     // Using a large buffer as async operations are more
     // expensive. Using a spawn_block would make the computation
@@ -438,7 +433,7 @@ async fn hash_large_range_exact(path: &Path, range: &ByteRange) -> Result<Hash> 
         hasher.update(&buffer[0..n]);
     }
 
-    Ok(Hash(hasher.finalize().into()))
+    Ok(hasher.finalize())
 }
 
 async fn read_padded(
@@ -676,8 +671,8 @@ async fn is_empty_dir(path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::model::service::Hash;
-    use assert_fs::prelude::*;
     use assert_fs::TempDir;
+    use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
     use std::fs;
     use std::io::Read as _;
@@ -819,10 +814,12 @@ mod tests {
         };
 
         temp.child(".foo.txt.part").write_str("test")?;
-        assert!(LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?
-            .find(&nopartial)
-            .await
-            .is_err());
+        assert!(
+            LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?
+                .find(&nopartial)
+                .await
+                .is_err()
+        );
 
         temp.child("bar.txt").write_str("test")?;
         assert_eq!(
@@ -1114,9 +1111,7 @@ mod tests {
                 Options::default(),
             )
             .await?;
-        let mut hasher = Sha256::new();
-        hasher.update(content);
-        let expected = Hash(hasher.finalize().into());
+        let expected = hash::digest(content);
         assert_eq!(hash, expected);
 
         // Now test partial
@@ -1136,9 +1131,7 @@ mod tests {
                 Options::default(),
             )
             .await?;
-        let mut hasher2 = Sha256::new();
-        hasher2.update(content2);
-        let expected2 = Hash(hasher2.finalize().into());
+        let expected2 = hash::digest(content2);
         assert_eq!(hash2, expected2);
         Ok(())
     }
@@ -1280,7 +1273,7 @@ mod tests {
                 Options::default(),
             )
             .await?;
-        assert!(!delta.0 .0.is_empty());
+        assert!(!delta.0.0.is_empty());
 
         // Revert file to old content, then apply delta
         temp.child("foo.txt").write_binary(file_content)?;
@@ -1397,7 +1390,7 @@ mod tests {
                 Options::default(),
             )
             .await?;
-        assert!(!delta.0 .0.is_empty());
+        assert!(!delta.0.0.is_empty());
 
         // Revert file to original content, then apply delta
         temp.child("shorten.txt").write_binary(original_content)?;

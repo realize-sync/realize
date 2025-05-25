@@ -8,17 +8,20 @@ use crate::model::service::{
     DirectoryId, Options, RangedHash, RealizeError, RealizeServiceClient, RealizeServiceRequest,
     RealizeServiceResponse, SyncedFile,
 };
+use futures::FutureExt;
 use futures::future;
 use futures::future::Either;
 use futures::stream::StreamExt as _;
-use futures::FutureExt;
-use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
+use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
 use std::sync::Arc;
 use std::{collections::HashMap, path::Path};
 use tarpc::client::stub::Stub;
 use thiserror::Error;
-use tokio::sync::mpsc::Sender;
 use tokio::sync::Semaphore;
+use tokio::sync::mpsc::Sender;
+
+pub mod hash;
+
 const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 const PARALLEL_FILE_COUNT: usize = 4;
 const HASH_FILE_CHUNK: u64 = 256 * 1024 * 1024; // 256M
@@ -641,10 +644,9 @@ mod tests {
     use crate::model::service::DirectoryId;
     use crate::model::service::Hash;
     use crate::server::{self, DirectoryMap};
-    use assert_fs::prelude::*;
     use assert_fs::TempDir;
+    use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
-    use sha2::Digest as _;
     use std::path::PathBuf;
     use std::sync::Arc;
     use walkdir::WalkDir;
@@ -975,7 +977,7 @@ mod tests {
                     start: 0,
                     end: content.len() as u64
                 },
-                Hash(sha2::Sha256::digest(content).into())
+                hash::digest(content)
             ),
             ranged
         );
@@ -1004,30 +1006,12 @@ mod tests {
         )
         .await?;
         let mut expected = RangedHash::new();
-        expected.add(
-            ByteRange { start: 0, end: 4 },
-            Hash(sha2::Sha256::digest(b"baa,").into()),
-        );
-        expected.add(
-            ByteRange { start: 4, end: 8 },
-            Hash(sha2::Sha256::digest(b" baa").into()),
-        );
-        expected.add(
-            ByteRange { start: 8, end: 12 },
-            Hash(sha2::Sha256::digest(b", bl").into()),
-        );
-        expected.add(
-            ByteRange { start: 12, end: 16 },
-            Hash(sha2::Sha256::digest(b"ack ").into()),
-        );
-        expected.add(
-            ByteRange { start: 16, end: 20 },
-            Hash(sha2::Sha256::digest(b"shee").into()),
-        );
-        expected.add(
-            ByteRange { start: 20, end: 21 },
-            Hash(sha2::Sha256::digest(b"p").into()),
-        );
+        expected.add(ByteRange { start: 0, end: 4 }, hash::digest(b"baa,"));
+        expected.add(ByteRange { start: 4, end: 8 }, hash::digest(b" baa"));
+        expected.add(ByteRange { start: 8, end: 12 }, hash::digest(b", bl"));
+        expected.add(ByteRange { start: 12, end: 16 }, hash::digest(b"ack "));
+        expected.add(ByteRange { start: 16, end: 20 }, hash::digest(b"shee"));
+        expected.add(ByteRange { start: 20, end: 21 }, hash::digest(b"p"));
 
         assert_eq!(ranged, expected);
 
@@ -1056,10 +1040,7 @@ mod tests {
         )
         .await?;
         let mut expected = RangedHash::new();
-        expected.add(
-            ByteRange { start: 0, end: 4 },
-            Hash(sha2::Sha256::digest(b"foob").into()),
-        );
+        expected.add(ByteRange { start: 0, end: 4 }, hash::digest(b"foob"));
         expected.add(ByteRange { start: 4, end: 8 }, Hash::zero());
         assert_eq!(ranged, expected);
 
