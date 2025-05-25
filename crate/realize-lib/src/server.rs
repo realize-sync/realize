@@ -402,6 +402,7 @@ async fn open_for_range_write(path: &Path) -> Result<File> {
     Ok(OpenOptions::new()
         .create(true)
         .write(true)
+        .read(true)
         .truncate(false)
         .open(path)
         .await?)
