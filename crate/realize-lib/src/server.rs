@@ -508,6 +508,7 @@ async fn write_at_offset(file: &mut File, offset: u64, data: &Vec<u8>) -> Result
     file.seek(SeekFrom::Start(offset)).await?;
     file.write_all(&data).await?;
     file.flush().await?;
+    file.sync_all().await?;
 
     Ok(())
 }
