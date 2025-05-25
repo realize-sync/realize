@@ -115,24 +115,27 @@ pub trait RealizeService {
 
     /// Send a byte range of a file.
     ///
-    /// The 'file_size' argument indicates the intended final size of the file. If the file is larger than this after writing, it should be truncated.
+    /// The 'file_size' argument indicates the intended final size of
+    /// the file. If the file is larger than this after writing, it
+    /// should be truncated.
     async fn send(
         dir_id: DirectoryId,
         relative_path: PathBuf,
         range: ByteRange,
         file_size: u64,
         data: Vec<u8>,
-        hash: Hash,
         options: Options,
     ) -> Result<()>;
 
-    /// Read a byte range from a file, returning data and its hash
+    /// Read a byte range from a file, returning the data.
+    ///
+    /// Data outside of the range [0, file_size) is returned filled with 0.
     async fn read(
         dir_id: DirectoryId,
         relative_path: PathBuf,
         range: ByteRange,
         options: Options,
-    ) -> Result<(Vec<u8>, Hash)>;
+    ) -> Result<Vec<u8>>;
 
     /// Mark a partial file as complete
     async fn finish(dir_id: DirectoryId, relative_path: PathBuf, options: Options) -> Result<()>;
@@ -168,6 +171,9 @@ pub trait RealizeService {
     ) -> Result<(Delta, Hash)>;
 
     /// Apply a delta to the file at the given path and byte range, verifying the hash
+    ///
+    /// Returns the error [RealizeError::HashMismatch] if, after
+    /// applying the patch, the data doesn't match the given hash.
     async fn apply_delta(
         dir_id: DirectoryId,
         relative_path: PathBuf,
@@ -200,17 +206,8 @@ pub enum RealizeError {
     #[error("Unexpected: {0}")]
     Other(String),
 
-    #[error("Hash mismatch [{0:?}]")]
-    HashMismatch(HashMismatchSource),
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub enum HashMismatchSource {
-    Read,
-    Send,
-    ApplyPatch,
-    Hash,
-    Rsync,
+    #[error("Hash mismatch after rsync")]
+    HashMismatch,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]

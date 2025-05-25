@@ -1,10 +1,10 @@
 use crate::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
 use crate::model::byterange::ByteRange;
+use crate::model::service::Options;
 use crate::model::service::{Config, Hash};
 use crate::model::service::{
     DirectoryId, RealizeError, RealizeService, Result, RsyncOperation, SyncedFile, SyncedFileState,
 };
-use crate::model::service::{HashMismatchSource, Options};
 use crate::model::service::{RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse};
 use async_speed_limit::clock::StandardClock;
 use async_speed_limit::Limiter;
@@ -180,7 +180,7 @@ impl RealizeService for RealizeServer {
         relative_path: PathBuf,
         range: ByteRange,
         options: Options,
-    ) -> Result<(Vec<u8>, Hash)> {
+    ) -> Result<Vec<u8>> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
         let (_, actual) = logical.find(&options).await?;
@@ -188,8 +188,7 @@ impl RealizeService for RealizeServer {
         let mut buffer = vec![0; range.bytecount() as usize];
         read_padded(&mut file, &range, &mut buffer).await?;
 
-        let hash = hash_data(&buffer);
-        Ok((buffer, hash))
+        Ok(buffer)
     }
 
     async fn send(
@@ -200,26 +199,16 @@ impl RealizeService for RealizeServer {
         range: ByteRange,
         file_size: u64,
         data: Vec<u8>,
-        hash: Hash,
         options: Options,
     ) -> Result<()> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
         let path = prepare_for_write(&options, logical).await?;
-        for _ in 0..3 {
-            {
-                let mut file = open_for_range_write(&path).await?;
-                shorten_file(&mut file, &range, file_size).await?;
+        let mut file = open_for_range_write(&path).await?;
+        shorten_file(&mut file, &range, file_size).await?;
+        write_at_offset(&mut file, range.start, &data).await?;
 
-                write_at_offset(&mut file, range.start, &data).await?;
-            }
-
-            if hash_range_padded(&path, &range).await? == hash {
-                return Ok(());
-            }
-        }
-
-        Err(RealizeError::HashMismatch(HashMismatchSource::Send))
+        Ok(())
     }
 
     async fn finish(
@@ -254,18 +243,7 @@ impl RealizeService for RealizeServer {
         let logical = LogicalPath::new(dir, &relative_path)?;
         let (_, path) = logical.find(&options).await?;
 
-        let (hash1, hash2) = tokio::join!(
-            hash_large_range_exact(&path, &range),
-            hash_large_range_exact(&path, &range)
-        );
-        let hash1 = hash1?;
-        let hash2 = hash2?;
-
-        if hash1 != hash2 {
-            return Err(RealizeError::HashMismatch(HashMismatchSource::Hash));
-        }
-
-        Ok(hash1)
+        hash_large_range_exact(&path, &range).await
     }
 
     async fn delete(
@@ -350,31 +328,25 @@ impl RealizeService for RealizeServer {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
         let path = prepare_for_write(&options, logical).await?;
-        for _ in 0..3 {
-            {
-                let mut file = open_for_range_write(&path).await?;
-                shorten_file(&mut file, &range, file_size).await?;
 
-                let mut base = vec![0u8; range.bytecount() as usize];
-                read_padded(&mut file, &range, &mut base).await?;
-                let mut out = Vec::new();
-                rsync_apply_limited(&base, &delta.0, &mut out, range.bytecount() as usize)?;
-                if out.len() as u64 != range.bytecount() {
-                    return Err(RealizeError::BadRequest(
-                        "Delta output size mismatch".to_string(),
-                    ));
-                }
-                if hash_data(&out) != hash {
-                    return Err(RealizeError::HashMismatch(HashMismatchSource::Rsync));
-                }
-                write_at_offset(&mut file, range.start, &out).await?;
-            }
+        let mut file = open_for_range_write(&path).await?;
+        shorten_file(&mut file, &range, file_size).await?;
 
-            if hash_range_padded(&path, &range).await? == hash {
-                return Ok(());
-            }
+        let mut base = vec![0u8; range.bytecount() as usize];
+        read_padded(&mut file, &range, &mut base).await?;
+        let mut out = Vec::new();
+        rsync_apply_limited(&base, &delta.0, &mut out, range.bytecount() as usize)?;
+        if out.len() as u64 != range.bytecount() {
+            return Err(RealizeError::BadRequest(
+                "Delta output size mismatch".to_string(),
+            ));
         }
-        return Err(RealizeError::HashMismatch(HashMismatchSource::ApplyPatch));
+        if hash_data(&out) != hash {
+            return Err(RealizeError::HashMismatch);
+        }
+        write_at_offset(&mut file, range.start, &out).await?;
+
+        return Ok(());
     }
 
     async fn configure(
@@ -433,16 +405,6 @@ async fn prepare_for_write(options: &Options, logical: LogicalPath) -> Result<Pa
 /// Compute a hash for a data buffer.
 fn hash_data(data: impl AsRef<[u8]>) -> Hash {
     Hash(Sha256::digest(data).into())
-}
-
-/// Hash a range that is small enough to kept in memory.
-///
-/// Missing data is padded with 0.
-async fn hash_range_padded(path: &Path, range: &ByteRange) -> Result<Hash> {
-    let mut file = open_for_range_read(path).await?;
-    let mut buffer = vec![0; range.bytecount() as usize];
-    read_padded(&mut file, &range, &mut buffer).await?;
-    Ok(hash_data(&buffer))
 }
 
 /// Hash a range that is too large to be kept in memory.
@@ -980,9 +942,6 @@ mod tests {
         let (server, _temp, dir) = setup_server_with_dir()?;
         let fpath = LogicalPath::new(&dir, &PathBuf::from("wrong_order.txt"))?;
         let data1 = b"fghij".to_vec();
-        let mut hasher1 = Sha256::new();
-        hasher1.update(&data1);
-        let hash1 = Hash(hasher1.finalize().into());
         server
             .clone()
             .send(
@@ -992,7 +951,6 @@ mod tests {
                 ByteRange { start: 5, end: 10 },
                 10,
                 data1.clone(),
-                hash1,
                 Options::default(),
             )
             .await?;
@@ -1003,9 +961,6 @@ mod tests {
             "\0\0\0\0\0fghij"
         );
         let data2 = b"abcde".to_vec();
-        let mut hasher2 = Sha256::new();
-        hasher2.update(&data2);
-        let hash2 = Hash(hasher2.finalize().into());
         server
             .clone()
             .send(
@@ -1015,7 +970,6 @@ mod tests {
                 ByteRange { start: 0, end: 5 },
                 10,
                 data2.clone(),
-                hash2,
                 Options::default(),
             )
             .await?;
@@ -1042,7 +996,7 @@ mod tests {
                 Options::default(),
             )
             .await?;
-        assert_eq!(String::from_utf8(data.0)?, "fghij");
+        assert_eq!(String::from_utf8(data)?, "fghij");
 
         let data = server
             .clone()
@@ -1054,7 +1008,7 @@ mod tests {
                 Options::default(),
             )
             .await?;
-        assert_eq!(String::from_utf8(data.0)?, "abcde");
+        assert_eq!(String::from_utf8(data)?, "abcde");
 
         let result = server
             .clone()
@@ -1066,8 +1020,8 @@ mod tests {
                 Options::default(),
             )
             .await?;
-        assert_eq!(result.0.len(), 15);
-        assert_eq!(result.0, b"abcdefghij\0\0\0\0\0");
+        assert_eq!(result.len(), 15);
+        assert_eq!(result, b"abcdefghij\0\0\0\0\0");
 
         Ok(())
     }
@@ -1124,9 +1078,6 @@ mod tests {
         let fpath = LogicalPath::new(&dir, &PathBuf::from("truncate.txt"))?;
         std::fs::write(fpath.partial_path(), b"abcdefghij")?;
         let data = b"1234567".to_vec();
-        let mut hasher = Sha256::new();
-        hasher.update(&data);
-        let hash = Hash(hasher.finalize().into());
         server
             .clone()
             .send(
@@ -1136,7 +1087,6 @@ mod tests {
                 ByteRange { start: 0, end: 7 },
                 7,
                 data.clone(),
-                hash,
                 Options::default(),
             )
             .await?;
@@ -1561,7 +1511,7 @@ mod tests {
                 },
             )
             .await?;
-        assert_eq!(String::from_utf8(data.0)?, "partial");
+        assert_eq!(String::from_utf8(data)?, "partial");
         // With ignore_partial: final preferred
         let data = server
             .clone()
@@ -1575,7 +1525,7 @@ mod tests {
                 },
             )
             .await?;
-        assert_eq!(String::from_utf8(data.0)?, "final");
+        assert_eq!(String::from_utf8(data)?, "final");
         Ok(())
     }
 

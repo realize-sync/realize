@@ -14,8 +14,8 @@ use tarpc::{
 };
 use tokio::net::TcpListener;
 
+use crate::model::byterange::ByteRange;
 use crate::model::service::{RealizeError, RealizeServiceRequest, RealizeServiceResponse};
-use crate::model::{byterange::ByteRange, service::HashMismatchSource};
 
 lazy_static::lazy_static! {
     pub(crate) static ref METRIC_SERVER_DATA_IN_BYTES: HistogramVec =
@@ -172,8 +172,7 @@ fn realize_error_label(err: &RealizeError) -> &'static str {
         RealizeError::Io(_) => "Io",
         RealizeError::Rsync(_, _) => "Rsync",
         RealizeError::Other(_) => "Other",
-        RealizeError::HashMismatch(HashMismatchSource::Rsync) => "HashMismatchAfterRsync",
-        RealizeError::HashMismatch(_) => "HashMismatch",
+        RealizeError::HashMismatch => "HashMismatch",
     }
 }
 
@@ -225,7 +224,7 @@ fn bytes_in(req: &RealizeServiceRequest) -> Option<u64> {
 /// Extract data size in bytes from a response for the data_out metrics.
 fn bytes_out<T>(res: &Result<RealizeServiceResponse, T>) -> Option<u64> {
     match res {
-        Ok(RealizeServiceResponse::Read(Ok((data, _)))) => Some(data.len() as u64),
+        Ok(RealizeServiceResponse::Read(Ok(data))) => Some(data.len() as u64),
         Ok(RealizeServiceResponse::CalculateSignature(Ok(sig))) => Some(sig.0.len() as u64),
         Ok(RealizeServiceResponse::Diff(Ok((delta, _)))) => Some(delta.0.len() as u64),
         _ => None,

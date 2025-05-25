@@ -388,14 +388,13 @@ where
                         .inc_by(range.bytecount());
                     report_range_progress(&progress_tx, &dir_id, path, &range).await;
                 }
-                Err(RealizeError::HashMismatch(source)) => {
+                Err(RealizeError::HashMismatch) => {
                     copy_ranges.add(&range);
                     log::error!(
-                        "{}/{}:{} hash mismatch [{:?}] after apply_delta, will copy",
+                        "{}/{}:{} hash mismatch after apply_delta, will copy",
                         dir_id,
                         path.display(),
                         range,
-                        source,
                     );
                     METRIC_APPLY_DELTA_FALLBACK_COUNT.inc();
                     METRIC_APPLY_DELTA_FALLBACK_BYTES.inc_by(range.bytecount());
@@ -420,7 +419,7 @@ where
 
         let _lock = copy_sem.acquire().await;
         for range in copy_ranges.chunked(CHUNK_SIZE) {
-            let (data, hash) = src
+            let data = src
                 .read(
                     ctx,
                     dir_id.clone(),
@@ -443,7 +442,6 @@ where
                 range.clone(),
                 src_file.size,
                 data,
-                hash,
                 dst_options(),
             )
             .await??;
