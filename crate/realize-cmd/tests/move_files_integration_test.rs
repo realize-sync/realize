@@ -1,6 +1,6 @@
-use assert_fs::TempDir;
 use assert_fs::fixture::ChildPath;
 use assert_fs::prelude::*;
+use assert_fs::TempDir;
 use assert_unordered::assert_eq_unordered;
 use hyper_util::rt::TokioIo;
 use realize_lib::model::service::DirectoryId;
@@ -334,6 +334,9 @@ async fn log_output_events() -> anyhow::Result<()> {
         if line.contains("Copying") {
             found.push("CopyingFile");
         }
+        if line.contains("Pending") {
+            found.push("PendingFile");
+        }
         if line.contains("Moved") {
             found.push("FileSuccess");
         }
@@ -347,7 +350,14 @@ async fn log_output_events() -> anyhow::Result<()> {
         );
     }
     // Each event should be present at least once
-    for event in &["MovingDir", "MovingFile", "CopyingFile", "FileSuccess", "Summary"] {
+    for event in &[
+        "MovingDir",
+        "MovingFile",
+        "CopyingFile",
+        "PendingFile",
+        "FileSuccess",
+        "Summary",
+    ] {
         assert!(
             found.contains(event),
             "Missing log entry for {event} in log output: {stderr}"

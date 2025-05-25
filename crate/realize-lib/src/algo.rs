@@ -8,17 +8,17 @@ use crate::model::service::{
     DirectoryId, Options, RangedHash, RealizeError, RealizeServiceClient, RealizeServiceRequest,
     RealizeServiceResponse, SyncedFile,
 };
-use futures::FutureExt;
 use futures::future;
 use futures::future::Either;
 use futures::stream::StreamExt as _;
-use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
+use futures::FutureExt;
+use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
 use std::sync::Arc;
 use std::{collections::HashMap, path::Path};
 use tarpc::client::stub::Stub;
 use thiserror::Error;
-use tokio::sync::Semaphore;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::Semaphore;
 
 pub mod hash;
 
@@ -120,6 +120,11 @@ pub enum ProgressEvent {
     },
     /// File is being copied (data transfer).
     CopyingFile {
+        dir_id: DirectoryId,
+        path: std::path::PathBuf,
+    },
+    /// File is waiting its turn to be copied.
+    PendingFile {
         dir_id: DirectoryId,
         path: std::path::PathBuf,
     },
@@ -411,6 +416,11 @@ where
 
     // 2. Copy missyng data
     if !copy_ranges.is_empty() {
+        // It can take some time for a permit to become available, so
+        // go back to showing the file as Pending until then.
+        report_pending(&progress_tx, &dir_id, path).await;
+        let _lock = copy_sem.acquire().await;
+
         report_copying(&progress_tx, &dir_id, path).await;
         log::debug!(
             "{}/{} overall: {}, copy: {}",
@@ -420,7 +430,6 @@ where
             copy_ranges
         );
 
-        let _lock = copy_sem.acquire().await;
         for range in copy_ranges.chunked(CHUNK_SIZE) {
             let data = src
                 .read(
@@ -467,6 +476,21 @@ where
     match check_hashes_and_delete(ctx, &hash, src_size, src, dst, &dir_id, path).await? {
         HashCheck::Mismatch { .. } => Err(MoveFileError::FailedToSync),
         HashCheck::Match => Ok(()),
+    }
+}
+
+async fn report_pending(
+    progress_tx: &Option<Sender<ProgressEvent>>,
+    dir_id: &DirectoryId,
+    path: &Path,
+) {
+    if let Some(tx) = progress_tx {
+        let _ = tx
+            .send(ProgressEvent::PendingFile {
+                dir_id: dir_id.clone(),
+                path: path.to_path_buf(),
+            })
+            .await;
     }
 }
 
@@ -644,8 +668,8 @@ mod tests {
     use crate::model::service::DirectoryId;
     use crate::model::service::Hash;
     use crate::server::{self, DirectoryMap};
-    use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
     use std::path::PathBuf;
     use std::sync::Arc;

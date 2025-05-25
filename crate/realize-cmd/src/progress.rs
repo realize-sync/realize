@@ -5,8 +5,8 @@ use realize_lib::model::service::DirectoryId;
 use realize_lib::transport::tcp::ClientConnectionState;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
 
 pub(crate) struct CliProgress {
@@ -202,6 +202,11 @@ impl CliProgress {
                             fp.copying();
                         }
                     }
+                    Some(PendingFile { dir_id, path, .. }) => {
+                        if let Some(fp) = file_progress_map.get_mut(&(dir_id, path)) {
+                            fp.pending();
+                        }
+                    }
                     Some(IncrementByteCount {
                         dir_id,
                         path,
@@ -269,14 +274,13 @@ impl CliFileProgress {
                     },
                 ),
             );
-            pb.set_prefix("Checking");
+            pb.set_prefix("Pending");
 
             (file_index, pb)
         });
 
         pb
     }
-
     fn verifying(&mut self) {
         log::info!("Verifying {} ({})", self.path, HumanBytes(self.bytes));
 
@@ -304,6 +308,12 @@ impl CliFileProgress {
 
         let pb = self.get_or_create_bar();
         pb.set_prefix("Copying");
+    }
+    fn pending(&mut self) {
+        log::info!("Pending {} ({})", self.path, HumanBytes(self.bytes));
+
+        let pb = self.get_or_create_bar();
+        pb.set_prefix("Pending");
     }
     fn inc(&mut self, bytecount: u64) {
         self.overall_pb.inc(bytecount);
