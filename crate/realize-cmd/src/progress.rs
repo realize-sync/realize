@@ -5,8 +5,8 @@ use realize_lib::model::service::DirectoryId;
 use realize_lib::transport::tcp::ClientConnectionState;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc::Receiver;
 
 pub(crate) struct CliProgress {

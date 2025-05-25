@@ -1,7 +1,7 @@
 //! Produce hashes using the appropriate algorithm.
 
 use crate::model::service::Hash;
-use blake2::{digest::consts::U32, Blake2b, Digest};
+use blake2::{Blake2b, Digest, digest::consts::U32};
 
 type Blake2b256 = Blake2b<U32>;
 
