@@ -465,21 +465,16 @@ async fn hash_large_range_exact(path: &Path, range: &ByteRange) -> Result<Hash> 
     // expensive. Using a spawn_block would make the computation
     // of the hash run on the limited block threads, which is also
     // a problem.
-    let mut buffer = [0u8; 1024 * 1024];
-    let mut remaining = range.bytecount();
-    while remaining > 0 {
-        let mut bufsize = buffer.len();
-        if bufsize as u64 > remaining {
-            bufsize = remaining as usize;
-        }
-        let n = file.read(&mut buffer[0..bufsize]).await?;
-        assert!(remaining >= n as u64);
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut limited = file.take(range.bytecount());
+    loop {
+        let n = limited.read(&mut buffer).await?;
         if n == 0 {
             break;
         }
-        hasher.update(&buffer[..n]);
-        remaining -= n as u64;
+        hasher.update(&buffer[0..n]);
     }
+
     Ok(Hash(hasher.finalize().into()))
 }
 
