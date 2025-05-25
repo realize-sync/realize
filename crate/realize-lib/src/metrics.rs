@@ -1,3 +1,16 @@
+//! Prometheus metrics for Realize - Symmetric File Syncer
+//!
+//! This module provides Prometheus metrics integration for both client and server sides.
+//! It tracks RPC call counts, durations, data transferred, and in-flight requests.
+//! Metrics are exported via HTTP for Prometheus scraping.
+//!
+//! # Example
+//!
+//! To export metrics on an HTTP endpoint:
+//! ```rust
+//! realize_lib::metrics::export_metrics("127.0.0.1:9000");
+//! ```
+
 use std::time::Instant;
 
 use hyper::server::conn::http1;

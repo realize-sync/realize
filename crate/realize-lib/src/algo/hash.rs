@@ -1,4 +1,26 @@
-//! Produce hashes using the appropriate algorithm.
+//! Hashing utilities for Realize - Symmetric File Syncer
+//!
+//! This module provides BLAKE2b-256 hashing for file and buffer
+//! content, used for file verification and delta computation.
+//! It exposes both one-shot and incremental hash APIs, as required by
+//! the sync protocol.
+//!
+//! # Examples
+//!
+//! Hash a buffer in one shot:
+//! ```rust
+//! use realize_lib::algo::hash::digest;
+//! let hash = digest(b"hello world");
+//! ```
+//!
+//! Incrementally hash data:
+//! ```rust
+//! use realize_lib::algo::hash::running;
+//! let mut hasher = running();
+//! hasher.update(b"foo");
+//! hasher.update(b"bar");
+//! let hash = hasher.finalize();
+//! ```
 
 use crate::model::service::Hash;
 use blake2::{Blake2b, Digest, digest::consts::U32};

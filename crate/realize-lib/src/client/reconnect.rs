@@ -1,3 +1,9 @@
+//! Connection retry and reconnection logic for Realize - Symmetric File Syncer
+//!
+//! This module provides the `Reconnect` wrapper and `Connect` trait for robust, retrying client connections.
+//! It is used by the TCP transport to transparently reconnect on
+//! network errors.
+
 use std::{
     sync::Arc,
     time::{Duration, Instant},

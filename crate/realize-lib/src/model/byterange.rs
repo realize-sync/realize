@@ -274,7 +274,7 @@ impl ByteRanges {
         ranges
     }
 
-    /// Split all ranges into chunks of at most [chunk_size] bytes.
+    /// Split all ranges into chunks of at most `chunk_size` bytes.
     pub fn chunked(&self, chunk_size: u64) -> impl Iterator<Item = ByteRange> {
         self.ranges
             .iter()

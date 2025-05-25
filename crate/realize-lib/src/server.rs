@@ -1,3 +1,9 @@
+//! RealizeService server implementation for Realize - Symmetric File Syncer
+//!
+//! This module implements the RealizeService trait, providing directory management,
+//! file operations, and in-process server/client utilities. It is robust to interruptions
+//! and supports secure, restartable sync.
+
 use crate::algo::hash;
 use crate::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
 use crate::model::byterange::ByteRange;

@@ -1,3 +1,8 @@
+//! TCP transport for Realize - Symmetric File Syncer
+//!
+//! This module provides secure, rate-limited, and reconnecting TCP transport for the RealizeService RPC interface.
+//! It handles TLS setup, peer authentication, DNS resolution, and connection retry logic.
+
 use anyhow::Context as _;
 use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;

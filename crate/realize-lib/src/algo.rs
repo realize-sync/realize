@@ -1,7 +1,8 @@
-//! Move algorithm for Realize - Symmetric File Syncer
+//! Move and sync algorithms for Realize - Symmetric File Syncer
 //!
-//! Implements the unoptimized algorithm to move files from source (A) to destination (B)
-//! using the RealizeService trait. See spec/design.md for details.
+//! This module implements the core file move and synchronization algorithms, including
+//! rsync-based partial transfer, progress reporting, and error handling. It operates
+//! over the RealizeService trait and is designed to be robust and restartable.
 
 use crate::model::byterange::{ByteRange, ByteRanges};
 use crate::model::service::{

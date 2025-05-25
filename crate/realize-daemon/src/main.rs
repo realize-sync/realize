@@ -1,5 +1,4 @@
 //! Daemon binary for the realized server
-//! Implements the server as described in spec/design.md and spec/future.md
 
 use anyhow::Context as _;
 use clap::Parser;

@@ -10,8 +10,11 @@ use std::path::PathBuf;
 use crate::model::byterange::{ByteRange, ByteRanges};
 use base64::Engine as _;
 
+/// Convenient shortcut for results containing [RealizeError].
 pub type Result<T> = std::result::Result<T, RealizeError>;
 
+/// Identifies a root directory whose content is made available
+/// through the service.
 #[derive(Debug, Clone, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct DirectoryId(String);
 impl From<String> for DirectoryId {
@@ -38,19 +41,34 @@ impl DirectoryId {
     }
 }
 
+/// A file that can be synced through the service, within a directory.
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SyncedFile {
+    /// Relative path to a file within the directory.
+    ///
+    /// Absolute paths and .. are not supported.
     pub path: PathBuf,
+
+    /// Size of the file on the current instance, in bytes.
     pub size: u64,
+
+    /// If state is partial, the file is still incomplete.
     pub state: SyncedFileState,
 }
 
+/// State of a [SyncedFile].
 #[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SyncedFileState {
+    /// The file is complete.
     Final,
+
+    /// The file is incomplete. It is likely being moved.
     Partial,
 }
 
+/// Hash for a range within a [SyncedFile].
+///
+/// It is created by [RealizeService::hash].
 #[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Hash(pub [u8; 32]);
 
@@ -59,10 +77,12 @@ impl Hash {
         base64::prelude::BASE64_STANDARD_NO_PAD.encode(&self.0)
     }
 
+    /// Hash that indicates the absence of any data.
     pub fn zero() -> Self {
         Self([0u8; 32])
     }
 
+    /// True if the hash is [Hash::zero]
     fn is_zero(&self) -> bool {
         for v in self.0 {
             if v != 0 {
@@ -90,17 +110,34 @@ impl std::fmt::Display for Hash {
     }
 }
 
+/// A rsync-type signature created from a partial file range.
+///
+/// This is created from [RealizeService::calculate_signature] on the
+/// source instance and later on passed to [RealizeService::diff] on
+/// the destination instance to create a [Delta].
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Signature(pub Vec<u8>);
 
+/// A rsync-type delta that can be applied to modify a file.
+///
+/// This is the result of comparing some range of data on the source
+/// instance and the destination instance using
+/// [RealizeService::diff]. It can be applied by calling
+/// [RealizeService::apply_delta] on the destination instance.
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Delta(pub Vec<u8>);
 
+/// Configures the behavior of a method on [RealizeService].
 #[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub struct Options {
+    /// If true, only take final files into account. This is usually
+    /// set on the source instance, to only move final files.
     pub ignore_partial: bool,
 }
 
+/// Configure a specific connection to a [RealizeService] instance.
+///
+/// This is passed to [RealizeService::configure].
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub struct Config {
     /// Optional write rate limit in bytes per second.
@@ -206,6 +243,8 @@ pub enum RealizeError {
     #[error("Unexpected: {0}")]
     Other(String),
 
+    /// Returned by [RealizeService::apply_delta] when the resulting
+    /// patch didn't match the hash created by [RealizeService::diff].
     #[error("Hash mismatch after rsync")]
     HashMismatch,
 }
@@ -229,6 +268,7 @@ impl From<anyhow::Error> for RealizeError {
     }
 }
 
+/// A set of range-specific [struct@Hash]es for a file.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RangedHash {
     hashes: Vec<RangedHashEntry>,
@@ -272,29 +312,36 @@ impl std::fmt::Display for RangedHash {
 }
 
 impl RangedHash {
+    /// Create an empty [RangedHash].
     pub fn new() -> Self {
         Self { hashes: vec![] }
     }
 
+    /// Create a [RangedHash] with a single hash.
     pub fn single(range: ByteRange, hash: Hash) -> Self {
         let mut hashes = Vec::new();
         hashes.push(RangedHashEntry { range, hash });
         RangedHash { hashes }
     }
 
+    /// The number of hashes within this instance.
     pub fn len(&self) -> usize {
         self.hashes.len()
     }
 
+    /// Return true if there are any hashes within this instance.
     pub fn is_empty(&self) -> bool {
         self.hashes.is_empty()
     }
 
+    /// Add a hash to this instance.
     pub fn add(&mut self, range: ByteRange, hash: Hash) {
         self.hashes.push(RangedHashEntry { range, hash });
         self.hashes.sort_by_key(|e| e.range.clone());
     }
 
+    /// Return the byte range covered by the hashes in this instance,
+    /// ignoring any holes.
     pub fn span(&self) -> ByteRange {
         ByteRange {
             start: self.hashes.first().map_or(0, |e| e.range.start),
@@ -302,10 +349,17 @@ impl RangedHash {
         }
     }
 
+    /// Return a representation of the ranges covered by hashes within
+    /// this instance.
+    ///
+    /// Ideally, there's just one range, starting at 0 and ending at
+    /// `file_size`, but that's not always the case. Check it with
+    /// [RangedHash::is_complete].
     pub fn ranges(&self) -> ByteRanges {
         ByteRanges::from_range_refs(self.hashes.iter().map(|e| &e.range))
     }
 
+    /// Return true if the range covers the range [0, `filesize`).
     pub fn is_complete(&self, filesize: u64) -> bool {
         if self.hashes.is_empty() {
             return false;
@@ -320,6 +374,10 @@ impl RangedHash {
 
         expected == filesize
     }
+
+    /// Detailled comparison of this instance with another.
+    ///
+    /// Return two [ByteRanges]: (matching, non-matching)
     pub fn diff(&self, other: &RangedHash) -> (ByteRanges, ByteRanges) {
         let mut matches = Vec::new();
         let mut mismatches = Vec::new();
