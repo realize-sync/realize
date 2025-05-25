@@ -264,7 +264,7 @@ to connect to that RPC.
 
 - `Hash(DirectoryId, Path)  -> Result<Hash>`
 
-  Compute a hash (SHA-256) of Path (as reported in `SyncedFile`)
+  Compute a hash (BLAKE2) of Path (as reported in `SyncedFile`)
 
   The file might be complete or partial; it doesn't matter to this
   call.
@@ -498,8 +498,8 @@ provided private key for authentication.
 *Example* output of a successful command:
 
 ```
-[1/4] Sent subdir1/file1.txt 3G SHA-256 A8382919827839811893
-[2/4] Sent subdir1/file2.txt 100M SHA-256 AE0031343989EAA7888F
+[1/4] Sent subdir1/file1.txt 3G BLAKE2 A8382919827839811893
+[2/4] Sent subdir1/file2.txt 100M BLAKE2 AE0031343989EAA7888F
 [4/3] Stored   ~/Downloads/image3.png as 6f6f6f3d19999999.jpg
 Success 2 files imported
 ```
@@ -509,8 +509,8 @@ Note: everything is sent to stdout.
 *Example* output of a command in progress:
 
 ```
-[1/4] Sent subdir1/file1.txt 3G SHA-256 A8382919827839811893
-[2/4] Sent subdir1/file2.txt 100M SHA-256 AE0031343989EAA7888F
+[1/4] Sent subdir1/file1.txt 3G BLAKE2 A8382919827839811893
+[2/4] Sent subdir1/file2.txt 100M BLAKE2 AE0031343989EAA7888F
 [3/4] Sending [=======>                    ] (300 k/s) subdir1/file3.txt 2.5G
 [4/4] Sending [============>               ] (150 k/s) subdir1/file4.txt 110M
 [4/3] Stored   ~/Downloads/image3.png as 6f6f6f3d19999999.jpg
@@ -522,9 +522,9 @@ Note: everything is sent to stdout.
 *Example* output of the same command, once finished and failed:
 
 ```
-[1/4] Sent   subdir1/file1.txt 3G SHA-256 A8382919827839811893
-[2/4] Sent   subdir1/file2.txt 100M SHA-256 AE0031343989EAA7888F
-[2/4] Sent   subdir1/file3.txt 2.5G SHA-256 001030E77AA710033331
+[1/4] Sent   subdir1/file1.txt 3G BLAKE2 A8382919827839811893
+[2/4] Sent   subdir1/file2.txt 100M BLAKE2 AE0031343989EAA7888F
+[2/4] Sent   subdir1/file3.txt 2.5G BLAKE2 001030E77AA710033331
 [3/4] Failed subdir1/file3.txt 2.5G: I/O error: disk full
 Error 1 file failed.2 files imported
 ```
@@ -555,7 +555,7 @@ destination (B) before a sync operation completes.
 
 #### Conflict Detection
 
-A conflict is detected if the checksum (SHA-256) of a file on A and B
+A conflict is detected if the checksum (BLAKE2) of a file on A and B
 differs after both have been modified since the last successful sync.
 
 The sync algorithm compares file hashes after transfer. If the hashes
@@ -640,7 +640,7 @@ The following events are logged at INFO level, with timestamp:
   - the ID of the peer that made the change, as defined in the YAML
     config file, if made through RPC or "local" otherwise
 
-  - the size and SHA-256 hash of the file
+  - the size and BLAKE2 hash of the file
 
 - deleting a final file, which includes:
 
