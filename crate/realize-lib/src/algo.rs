@@ -336,84 +336,28 @@ where
         }
     }
 
-    // 1. Check existing data (rsyncing)
-    if !rsync_ranges.is_empty() {
-        report_rsyncing(&progress_tx, &dir_id, path).await;
-        log::debug!(
-            "{}/{} overall: {}, rsync: {}, (later) copy: {}",
-            dir_id,
-            path.display(),
-            ranges,
-            rsync_ranges,
-            copy_ranges
-        );
+    log::debug!(
+        "{}/{} overall: {}, rsync: {}, copy: {}",
+        dir_id,
+        path.display(),
+        ranges,
+        rsync_ranges,
+        copy_ranges
+    );
 
-        for range in rsync_ranges.chunked(CHUNK_SIZE) {
-            let sig = dst
-                .calculate_signature(
-                    ctx,
-                    dir_id.clone(),
-                    path.to_path_buf(),
-                    range.clone(),
-                    dst_options(),
-                )
-                .await??;
-            let (delta, hash) = src
-                .diff(
-                    ctx,
-                    dir_id.clone(),
-                    path.to_path_buf(),
-                    range.clone(),
-                    sig,
-                    src_options(),
-                )
-                .await??;
-            METRIC_READ_BYTES
-                .with_label_values(&["diff"])
-                .inc_by(delta.0.len() as u64);
-            METRIC_RANGE_READ_BYTES
-                .with_label_values(&["diff"])
-                .inc_by(range.bytecount());
-            let delta_len = delta.0.len();
-            match dst
-                .apply_delta(
-                    ctx,
-                    dir_id.clone(),
-                    path.to_path_buf(),
-                    range.clone(),
-                    src_file.size,
-                    delta,
-                    hash,
-                    dst_options(),
-                )
-                .await?
-            {
-                Ok(_) => {
-                    METRIC_WRITE_BYTES
-                        .with_label_values(&["apply_delta"])
-                        .inc_by(delta_len as u64);
-                    METRIC_RANGE_WRITE_BYTES
-                        .with_label_values(&["apply_delta"])
-                        .inc_by(range.bytecount());
-                    report_range_progress(&progress_tx, &dir_id, path, &range).await;
-                }
-                Err(RealizeError::HashMismatch) => {
-                    copy_ranges.add(&range);
-                    log::error!(
-                        "{}/{}:{} hash mismatch after apply_delta, will copy",
-                        dir_id,
-                        path.display(),
-                        range,
-                    );
-                    METRIC_APPLY_DELTA_FALLBACK_COUNT.inc();
-                    METRIC_APPLY_DELTA_FALLBACK_BYTES.inc_by(range.bytecount());
-                }
-                Err(err) => {
-                    return Err(MoveFileError::from(err));
-                }
-            };
-        }
-    }
+    // 1. Check existing data (rsyncing)
+    rsync_file_range(
+        ctx,
+        &dir_id,
+        path,
+        src_file.size,
+        src,
+        dst,
+        &progress_tx,
+        &rsync_ranges,
+        &mut copy_ranges,
+    )
+    .await?;
 
     // 2. Copy missyng data
     if !copy_ranges.is_empty() {
@@ -423,13 +367,6 @@ where
         let _lock = copy_sem.acquire().await;
 
         report_copying(&progress_tx, &dir_id, path).await;
-        log::debug!(
-            "{}/{} overall: {}, copy: {}",
-            dir_id,
-            path.display(),
-            ranges,
-            copy_ranges
-        );
 
         for range in copy_ranges.chunked(CHUNK_SIZE) {
             let data = src
@@ -478,6 +415,96 @@ where
         HashCheck::Mismatch { .. } => Err(MoveFileError::FailedToSync),
         HashCheck::Match => Ok(()),
     }
+}
+
+async fn rsync_file_range<T, U>(
+    ctx: tarpc::context::Context,
+    dir_id: &DirectoryId,
+    path: &Path,
+    file_size: u64,
+    src: &RealizeServiceClient<T>,
+    dst: &RealizeServiceClient<U>,
+    progress_tx: &Option<Sender<ProgressEvent>>,
+    rsync_ranges: &ByteRanges,
+    copy_ranges: &mut ByteRanges,
+) -> Result<(), MoveFileError>
+where
+    T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+    U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+{
+    if rsync_ranges.is_empty() {
+        return Ok(());
+    }
+
+    report_rsyncing(&progress_tx, &dir_id, path).await;
+
+    for range in rsync_ranges.chunked(CHUNK_SIZE) {
+        let sig = dst
+            .calculate_signature(
+                ctx,
+                dir_id.clone(),
+                path.to_path_buf(),
+                range.clone(),
+                dst_options(),
+            )
+            .await??;
+        let (delta, hash) = src
+            .diff(
+                ctx,
+                dir_id.clone(),
+                path.to_path_buf(),
+                range.clone(),
+                sig,
+                src_options(),
+            )
+            .await??;
+        METRIC_READ_BYTES
+            .with_label_values(&["diff"])
+            .inc_by(delta.0.len() as u64);
+        METRIC_RANGE_READ_BYTES
+            .with_label_values(&["diff"])
+            .inc_by(range.bytecount());
+        let delta_len = delta.0.len();
+        match dst
+            .apply_delta(
+                ctx,
+                dir_id.clone(),
+                path.to_path_buf(),
+                range.clone(),
+                file_size,
+                delta,
+                hash,
+                dst_options(),
+            )
+            .await?
+        {
+            Ok(_) => {
+                METRIC_WRITE_BYTES
+                    .with_label_values(&["apply_delta"])
+                    .inc_by(delta_len as u64);
+                METRIC_RANGE_WRITE_BYTES
+                    .with_label_values(&["apply_delta"])
+                    .inc_by(range.bytecount());
+                report_range_progress(&progress_tx, &dir_id, path, &range).await;
+            }
+            Err(RealizeError::HashMismatch) => {
+                copy_ranges.add(&range);
+                log::error!(
+                    "{}/{}:{} hash mismatch after apply_delta, will copy",
+                    dir_id,
+                    path.display(),
+                    range,
+                );
+                METRIC_APPLY_DELTA_FALLBACK_COUNT.inc();
+                METRIC_APPLY_DELTA_FALLBACK_BYTES.inc_by(range.bytecount());
+            }
+            Err(err) => {
+                return Err(MoveFileError::from(err));
+            }
+        };
+    }
+
+    Ok(())
 }
 
 async fn report_pending(
