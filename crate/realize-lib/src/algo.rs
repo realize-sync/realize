@@ -337,7 +337,7 @@ where
     }
 
     log::debug!(
-        "{}/{} overall: {}, rsync: {}, copy: {}",
+        "{}/{} {}, rsync: {}, copy: {}",
         dir_id,
         path.display(),
         ranges,
@@ -359,51 +359,19 @@ where
     )
     .await?;
 
-    // 2. Copy missyng data
-    if !copy_ranges.is_empty() {
-        // It can take some time for a permit to become available, so
-        // go back to showing the file as Pending until then.
-        report_pending(&progress_tx, &dir_id, path).await;
-        let _lock = copy_sem.acquire().await;
-
-        report_copying(&progress_tx, &dir_id, path).await;
-
-        for range in copy_ranges.chunked(CHUNK_SIZE) {
-            let data = src
-                .read(
-                    ctx,
-                    dir_id.clone(),
-                    path.to_path_buf(),
-                    range.clone(),
-                    src_options(),
-                )
-                .await??;
-            METRIC_READ_BYTES
-                .with_label_values(&["read"])
-                .inc_by(data.len() as u64);
-            METRIC_RANGE_READ_BYTES
-                .with_label_values(&["read"])
-                .inc_by(range.bytecount());
-            let data_len = data.len();
-            dst.send(
-                ctx,
-                dir_id.clone(),
-                path.to_path_buf(),
-                range.clone(),
-                src_file.size,
-                data,
-                dst_options(),
-            )
-            .await??;
-            METRIC_WRITE_BYTES
-                .with_label_values(&["send"])
-                .inc_by(data_len as u64);
-            METRIC_RANGE_WRITE_BYTES
-                .with_label_values(&["send"])
-                .inc_by(range.bytecount());
-            report_range_progress(&progress_tx, &dir_id, path, &range).await;
-        }
-    }
+    // 2. Copy missing data
+    copy_file_range(
+        ctx,
+        &dir_id,
+        path,
+        src_file.size,
+        src,
+        dst,
+        &progress_tx,
+        copy_sem.clone(),
+        &copy_ranges,
+    )
+    .await?;
 
     // 3. Check full file and delete
     report_verifying(&progress_tx, &dir_id, path).await;
@@ -502,6 +470,70 @@ where
                 return Err(MoveFileError::from(err));
             }
         };
+    }
+
+    Ok(())
+}
+
+async fn copy_file_range<T, U>(
+    ctx: tarpc::context::Context,
+    dir_id: &DirectoryId,
+    path: &Path,
+    file_size: u64,
+    src: &RealizeServiceClient<T>,
+    dst: &RealizeServiceClient<U>,
+    progress_tx: &Option<Sender<ProgressEvent>>,
+    copy_sem: Arc<Semaphore>,
+    copy_ranges: &ByteRanges,
+) -> Result<(), MoveFileError>
+where
+    T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+    U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+{
+    if copy_ranges.is_empty() {
+        return Ok(());
+    }
+    // It can take some time for a permit to become available, so
+    // go back to showing the file as Pending until then.
+    report_pending(&progress_tx, &dir_id, path).await;
+    let _lock = copy_sem.acquire().await;
+
+    report_copying(&progress_tx, &dir_id, path).await;
+
+    for range in copy_ranges.chunked(CHUNK_SIZE) {
+        let data = src
+            .read(
+                ctx,
+                dir_id.clone(),
+                path.to_path_buf(),
+                range.clone(),
+                src_options(),
+            )
+            .await??;
+        METRIC_READ_BYTES
+            .with_label_values(&["read"])
+            .inc_by(data.len() as u64);
+        METRIC_RANGE_READ_BYTES
+            .with_label_values(&["read"])
+            .inc_by(range.bytecount());
+        let data_len = data.len();
+        dst.send(
+            ctx,
+            dir_id.clone(),
+            path.to_path_buf(),
+            range.clone(),
+            file_size,
+            data,
+            dst_options(),
+        )
+        .await??;
+        METRIC_WRITE_BYTES
+            .with_label_values(&["send"])
+            .inc_by(data_len as u64);
+        METRIC_RANGE_WRITE_BYTES
+            .with_label_values(&["send"])
+            .inc_by(range.bytecount());
+        report_range_progress(&progress_tx, &dir_id, path, &range).await;
     }
 
     Ok(())
