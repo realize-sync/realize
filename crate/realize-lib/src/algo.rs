@@ -10,7 +10,6 @@ use crate::model::service::{
     RealizeServiceResponse, SyncedFile,
 };
 use futures::future;
-use futures::future::Either;
 use futures::stream::StreamExt as _;
 use futures::FutureExt;
 use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
@@ -92,7 +91,7 @@ fn dst_options() -> Options {
 }
 
 /// Event enum for channel-based progress reporting.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProgressEvent {
     /// Indicates the start of moving a directory, with total files and bytes.
     MovingDir {
@@ -131,6 +130,13 @@ pub enum ProgressEvent {
     },
     /// Increment byte count for a file and overall progress.
     IncrementByteCount {
+        dir_id: DirectoryId,
+        path: std::path::PathBuf,
+        bytecount: u64,
+    },
+    /// Decrement byte count for a file and overall progress, when
+    /// retrying a range previously assumed to be correct.
+    DecrementByteCount {
         dir_id: DirectoryId,
         path: std::path::PathBuf,
         bytecount: u64,
@@ -294,58 +300,78 @@ where
     let dst_size = dst_file.map(|f| f.size).unwrap_or(0);
     let dir_id = dir_id.clone();
 
-    // Check the file if it already exists
-    let mut src_hash = Either::Left(hash_file(
-        ctx,
-        src,
-        &dir_id,
-        path,
-        src_size,
-        HASH_FILE_CHUNK,
-        src_options(),
-    ));
-    let mut correct = ByteRanges::new();
-    if dst_size > HASH_FILE_CHUNK {
-        report_verifying(&progress_tx, &dir_id, path).await;
-        let hash = match src_hash {
-            Either::Left(fut) => fut.await?,
-            Either::Right(hash) => hash,
-        };
-        match check_hashes_and_delete(ctx, &hash, src_size, src, dst, &dir_id, path).await? {
-            HashCheck::Match => {
-                return Ok(());
-            }
-            HashCheck::Mismatch {
-                partial_match: matches,
-                ..
-            } => {
-                correct = matches;
-            }
-        }
-        src_hash = Either::Right(hash);
-    }
-    // Chunked Transfer
     let ranges = ByteRanges::single(0, src_size);
-    let mut copy_ranges = ranges.intersection(&ByteRanges::single(dst_size, src_size));
-    let rsync_ranges = ranges
-        .intersection(&ByteRanges::single(0, dst_size))
-        .subtraction(&correct);
-    if !correct.is_empty() {
-        for range in correct.into_iter() {
-            report_range_progress(&progress_tx, &dir_id, path, &range).await;
+
+    // Assume existing to be correct for now and report it as such in
+    // the progress.
+    let existing = ByteRanges::single(0, dst_size);
+    report_increment_bytecount(&progress_tx, &dir_id, path, existing.bytecount()).await;
+
+    let (copy, src_hash) = tokio::join!(
+        async {
+            // 1. Copy missing data
+            let copy_ranges = ranges.subtraction(&existing);
+            log::debug!("{}/{:?} {} copy {}", dir_id, path, ranges, copy_ranges);
+            copy_file_range(
+                ctx,
+                &dir_id,
+                path,
+                src,
+                dst,
+                &progress_tx,
+                copy_sem.clone(),
+                &copy_ranges,
+            )
+            .await?;
+
+            // 2. Truncate if necessary
+            if dst_file.map_or(0, |f| f.size) > src_file.size {
+                dst.truncate(
+                    ctx,
+                    dir_id.clone(),
+                    path.to_path_buf(),
+                    src_file.size,
+                    dst_options(),
+                )
+                .await??;
+            }
+
+            Ok::<(), MoveFileError>(())
+        },
+        // Compute the source file hash while doing the copy
+        hash_file(
+            ctx,
+            src,
+            &dir_id,
+            path,
+            src_size,
+            HASH_FILE_CHUNK,
+            src_options(),
+        ),
+    );
+    copy?;
+    let src_hash = src_hash?;
+
+    // 3. Check hash, return if succeeds
+    let correct;
+    report_verifying(&progress_tx, &dir_id, path).await;
+    match check_hashes_and_delete(ctx, &src_hash, src_size, src, dst, &dir_id, path).await? {
+        HashCheck::Match => {
+            return Ok(());
+        }
+        HashCheck::Mismatch {
+            partial_match: matches,
+            ..
+        } => {
+            correct = matches;
         }
     }
 
-    log::debug!(
-        "{}/{} {}, rsync: {}, copy: {}",
-        dir_id,
-        path.display(),
-        ranges,
-        rsync_ranges,
-        copy_ranges
-    );
-
-    // 1. Check existing data (rsyncing)
+    // 4. Use rsync to fix any mismatch
+    let mut fallback_ranges = ByteRanges::new();
+    let rsync_ranges = ranges.subtraction(&correct);
+    log::debug!("{}/{:?} {} rsync {}", dir_id, path, ranges, rsync_ranges);
+    report_decrement_bytecount(&progress_tx, &dir_id, path, rsync_ranges.bytecount()).await;
     rsync_file_range(
         ctx,
         &dir_id,
@@ -354,11 +380,11 @@ where
         dst,
         &progress_tx,
         &rsync_ranges,
-        &mut copy_ranges,
+        &mut fallback_ranges,
     )
     .await?;
 
-    // 2. Copy missing data
+    // 5. Fallback to copy if necessary
     copy_file_range(
         ctx,
         &dir_id,
@@ -367,28 +393,13 @@ where
         dst,
         &progress_tx,
         copy_sem.clone(),
-        &copy_ranges,
+        &fallback_ranges,
     )
     .await?;
 
-    if dst_file.map_or(0, |f| f.size) > src_file.size {
-        dst.truncate(
-            ctx,
-            dir_id.clone(),
-            path.to_path_buf(),
-            src_file.size,
-            dst_options(),
-        )
-        .await??;
-    }
-
-    // 3. Check full file and delete
+    // 6. Check again against hash
     report_verifying(&progress_tx, &dir_id, path).await;
-    let hash = match src_hash {
-        Either::Left(hash) => hash.await?,
-        Either::Right(hash) => hash,
-    };
-    match check_hashes_and_delete(ctx, &hash, src_size, src, dst, &dir_id, path).await? {
+    match check_hashes_and_delete(ctx, &src_hash, src_size, src, dst, &dir_id, path).await? {
         HashCheck::Mismatch { .. } => Err(MoveFileError::FailedToSync),
         HashCheck::Match => Ok(()),
     }
@@ -460,7 +471,7 @@ where
                 METRIC_RANGE_WRITE_BYTES
                     .with_label_values(&["apply_delta"])
                     .inc_by(range.bytecount());
-                report_range_progress(&progress_tx, &dir_id, path, &range).await;
+                report_increment_bytecount(&progress_tx, &dir_id, path, range.bytecount()).await;
             }
             Err(RealizeError::HashMismatch) => {
                 copy_ranges.add(&range);
@@ -538,7 +549,7 @@ where
         METRIC_RANGE_WRITE_BYTES
             .with_label_values(&["send"])
             .inc_by(range.bytecount());
-        report_range_progress(&progress_tx, &dir_id, path, &range).await;
+        report_increment_bytecount(&progress_tx, &dir_id, path, range.bytecount()).await;
     }
 
     Ok(())
@@ -604,18 +615,41 @@ async fn report_verifying(
     }
 }
 
-async fn report_range_progress(
+async fn report_increment_bytecount(
     progress_tx: &Option<Sender<ProgressEvent>>,
     dir_id: &DirectoryId,
     path: &Path,
-    range: &ByteRange,
+    bytecount: u64,
 ) {
+    if bytecount == 0 {
+        return;
+    }
     if let Some(tx) = progress_tx {
         let _ = tx
             .send(ProgressEvent::IncrementByteCount {
                 dir_id: dir_id.clone(),
                 path: path.to_path_buf(),
-                bytecount: range.bytecount(),
+                bytecount,
+            })
+            .await;
+    }
+}
+
+async fn report_decrement_bytecount(
+    progress_tx: &Option<Sender<ProgressEvent>>,
+    dir_id: &DirectoryId,
+    path: &Path,
+    bytecount: u64,
+) {
+    if bytecount == 0 {
+        return;
+    }
+    if let Some(tx) = progress_tx {
+        let _ = tx
+            .send(ProgressEvent::DecrementByteCount {
+                dir_id: dir_id.clone(),
+                path: path.to_path_buf(),
+                bytecount,
             })
             .await;
     }
@@ -741,7 +775,7 @@ mod tests {
     use walkdir::WalkDir;
 
     #[tokio::test]
-    async fn events_are_sent() -> anyhow::Result<()> {
+    async fn events_for_successful_copy() -> anyhow::Result<()> {
         let _ = env_logger::try_init();
         let src_temp = TempDir::new()?;
         let dst_temp = TempDir::new()?;
@@ -777,31 +811,233 @@ mod tests {
         while let Some(event) = rx.recv().await {
             events.push(event);
         }
+        use ProgressEvent::*;
+        assert_eq!(
+            vec![
+                MovingDir {
+                    dir_id: DirectoryId::from("testdir"),
+                    total_files: 1,
+                    total_bytes: 3
+                },
+                MovingFile {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo"),
+                    bytes: 3,
+                    available: 0
+                },
+                PendingFile {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo")
+                },
+                CopyingFile {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo")
+                },
+                IncrementByteCount {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo"),
+                    bytecount: 3
+                },
+                VerifyingFile {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo")
+                },
+                FileSuccess {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo")
+                },
+            ],
+            events
+        );
 
-        // Verify essential events were sent
-        assert!(
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn events_for_continued_copy() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+        let src_temp = TempDir::new()?;
+        let dst_temp = TempDir::new()?;
+        let src_dir = Arc::new(crate::server::Directory::new(
+            &DirectoryId::from("testdir"),
+            src_temp.path(),
+        ));
+        let dst_dir = Arc::new(crate::server::Directory::new(
+            &DirectoryId::from("testdir"),
+            dst_temp.path(),
+        ));
+        src_temp.child("foo").write_str("abcdefghi")?;
+        dst_temp.child(".foo.part").write_str("abc")?;
+
+        let src_server =
+            server::create_inprocess_client(DirectoryMap::for_dir(src_dir.id(), src_dir.path()));
+        let dst_server =
+            server::create_inprocess_client(DirectoryMap::for_dir(dst_dir.id(), dst_dir.path()));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let (success, error, _) = move_files(
+            tarpc::context::current(),
+            &src_server,
+            &dst_server,
+            DirectoryId::from("testdir"),
+            Some(tx),
+        )
+        .await?;
+
+        assert_eq!(success, 1);
+        assert_eq!(error, 0);
+
+        // Collect all events
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        use ProgressEvent::*;
+        assert_eq!(
+            vec![
+                MovingDir {
+                    dir_id: DirectoryId::from("testdir"),
+                    total_files: 1,
+                    total_bytes: 9
+                },
+                MovingFile {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo"),
+                    bytes: 9,
+                    available: 3
+                },
+                IncrementByteCount {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo"),
+                    bytecount: 3
+                },
+                PendingFile {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo")
+                },
+                CopyingFile {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo")
+                },
+                IncrementByteCount {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo"),
+                    bytecount: 6
+                },
+                VerifyingFile {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo")
+                },
+                FileSuccess {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo")
+                },
+            ],
             events
-                .iter()
-                .any(|e| matches!(e, ProgressEvent::MovingDir { .. })),
-            "MovingDir event not found"
         );
-        assert!(
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn events_for_failed_copy() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+        let src_temp = TempDir::new()?;
+        let dst_temp = TempDir::new()?;
+        let src_dir = Arc::new(crate::server::Directory::new(
+            &DirectoryId::from("testdir"),
+            src_temp.path(),
+        ));
+        let dst_dir = Arc::new(crate::server::Directory::new(
+            &DirectoryId::from("testdir"),
+            dst_temp.path(),
+        ));
+        src_temp.child("foo").write_str("abcdefghi")?;
+        dst_temp.child(".foo.part").write_str("xxx")?;
+
+        let src_server =
+            server::create_inprocess_client(DirectoryMap::for_dir(src_dir.id(), src_dir.path()));
+        let dst_server =
+            server::create_inprocess_client(DirectoryMap::for_dir(dst_dir.id(), dst_dir.path()));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let (success, error, _) = move_files(
+            tarpc::context::current(),
+            &src_server,
+            &dst_server,
+            DirectoryId::from("testdir"),
+            Some(tx),
+        )
+        .await?;
+
+        assert_eq!(success, 1);
+        assert_eq!(error, 0);
+
+        // Collect all events
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        use ProgressEvent::*;
+        assert_eq!(
+            vec![
+                MovingDir {
+                    dir_id: DirectoryId::from("testdir"),
+                    total_files: 1,
+                    total_bytes: 9
+                },
+                MovingFile {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo"),
+                    bytes: 9,
+                    available: 3
+                },
+                IncrementByteCount {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo"),
+                    bytecount: 3
+                },
+                PendingFile {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo")
+                },
+                CopyingFile {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo")
+                },
+                IncrementByteCount {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo"),
+                    bytecount: 6
+                },
+                VerifyingFile {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo")
+                },
+                DecrementByteCount {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo"),
+                    bytecount: 9
+                },
+                RsyncingFile {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo")
+                },
+                IncrementByteCount {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo"),
+                    bytecount: 9
+                },
+                VerifyingFile {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo")
+                },
+                FileSuccess {
+                    dir_id: DirectoryId::from("testdir"),
+                    path: PathBuf::from("foo")
+                },
+            ],
             events
-                .iter()
-                .any(|e| matches!(e, ProgressEvent::MovingFile { .. })),
-            "MovingFile event not found"
-        );
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, ProgressEvent::VerifyingFile { .. })),
-            "VerifyingFile event not found"
-        );
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, ProgressEvent::FileSuccess { .. })),
-            "FileSuccess event not found"
         );
 
         Ok(())

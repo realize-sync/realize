@@ -290,6 +290,12 @@ impl ByteRanges {
     pub fn len(&self) -> usize {
         self.ranges.len()
     }
+    /// Returns the of all the bytes within the ranges.
+    pub fn bytecount(&self) -> u64 {
+        self.ranges
+            .iter()
+            .fold(0, |sum, range| sum + range.bytecount())
+    }
     /// Adds a new ByteRange, merging as needed to maintain minimal, sorted, non-overlapping invariants.
     pub fn add(&mut self, range: &ByteRange) {
         if range.is_empty() {
@@ -490,6 +496,20 @@ mod byteranges_tests {
         assert!(b.intersects(&ByteRange::new(3, 12)));
         assert!(b.overlaps(&ByteRange::new(3, 12)));
         assert!(!b.intersects(&ByteRange::new(20, 25)));
+    }
+    #[test]
+    fn test_bytecount() {
+        assert_eq!(0, ByteRanges::new().bytecount());
+        assert_eq!(10, ByteRanges::single(10, 20).bytecount());
+        assert_eq!(
+            20,
+            ByteRanges::from_ranges(vec![
+                ByteRange::new(5, 12),
+                ByteRange::new(10, 15),
+                ByteRange::new(30, 40)
+            ])
+            .bytecount()
+        );
     }
     #[test]
     fn test_iter() {

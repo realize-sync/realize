@@ -217,6 +217,16 @@ impl CliProgress {
                             fp.inc(bytecount);
                         }
                     }
+                    Some(DecrementByteCount {
+                        dir_id,
+                        path,
+                        bytecount,
+                        ..
+                    }) => {
+                        if let Some(fp) = file_progress_map.get_mut(&(dir_id, path)) {
+                            fp.dec(bytecount);
+                        }
+                    }
                     Some(FileSuccess { dir_id, path, .. }) => {
                         if let Some(mut fp) = file_progress_map.remove(&(dir_id, path)) {
                             fp.success();
@@ -317,6 +327,12 @@ impl CliFileProgress {
         self.overall_pb.inc(bytecount);
         if let Some((_, pb)) = &mut self.bar {
             pb.inc(bytecount);
+        }
+    }
+    fn dec(&mut self, bytecount: u64) {
+        self.overall_pb.dec(bytecount);
+        if let Some((_, pb)) = &mut self.bar {
+            pb.dec(bytecount);
         }
     }
     fn success(&mut self) {
