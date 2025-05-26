@@ -16,14 +16,14 @@ use std::time::Instant;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use prometheus::{
-    register_histogram_vec, register_int_counter_vec, register_int_gauge, Encoder, HistogramVec,
-    IntCounterVec, IntGauge,
+    Encoder, HistogramVec, IntCounterVec, IntGauge, register_histogram_vec,
+    register_int_counter_vec, register_int_gauge,
 };
 use tarpc::{
-    client::{stub::Stub, RpcError},
+    ServerError,
+    client::{RpcError, stub::Stub},
     context::Context,
     server::Serve,
-    ServerError,
 };
 use tokio::net::TcpListener;
 

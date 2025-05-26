@@ -13,11 +13,11 @@ use crate::model::service::{
     DirectoryId, RealizeError, RealizeService, Result, RsyncOperation, SyncedFile, SyncedFileState,
 };
 use crate::model::service::{RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse};
-use async_speed_limit::clock::StandardClock;
 use async_speed_limit::Limiter;
+use async_speed_limit::clock::StandardClock;
 use fast_rsync::{
-    apply_limited as rsync_apply_limited, diff as rsync_diff, Signature as RsyncSignature,
-    SignatureOptions,
+    Signature as RsyncSignature, SignatureOptions, apply_limited as rsync_apply_limited,
+    diff as rsync_diff,
 };
 use futures::StreamExt;
 use std::cmp::min;
@@ -26,8 +26,8 @@ use std::ffi::OsString;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tarpc::client::stub::Stub;
 use tarpc::client::RpcError;
+use tarpc::client::stub::Stub;
 use tarpc::context;
 use tarpc::server::Channel;
 use tokio::fs::{self, File, OpenOptions};
@@ -691,8 +691,8 @@ async fn is_empty_dir(path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::model::service::Hash;
-    use assert_fs::prelude::*;
     use assert_fs::TempDir;
+    use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
     use std::fs;
     use std::io::Read as _;
@@ -834,10 +834,12 @@ mod tests {
         };
 
         temp.child(".foo.txt.part").write_str("test")?;
-        assert!(LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?
-            .find(&nopartial)
-            .await
-            .is_err());
+        assert!(
+            LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?
+                .find(&nopartial)
+                .await
+                .is_err()
+        );
 
         temp.child("bar.txt").write_str("test")?;
         assert_eq!(
@@ -1286,7 +1288,7 @@ mod tests {
                 Options::default(),
             )
             .await?;
-        assert!(!delta.0 .0.is_empty());
+        assert!(!delta.0.0.is_empty());
 
         // Revert file to old content, then apply delta
         temp.child("foo.txt").write_binary(file_content)?;
