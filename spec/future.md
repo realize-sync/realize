@@ -3,6 +3,62 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
+## New move algo {#newmove}
+
+When moving do:
+ 1. copy from dst_size to src_size
+ 2. truncate
+ 3. verify using hash, pass => MOVED
+ 4. rsync parts that didn't pass verification
+ 5. copy parts rsync couldn't fix in 4
+ 6. verify using hash, pass => MOVED
+ 7. give up
+
+### Task list
+
+1. Split truncate out from send/apply_patch
+2. update logic (likely requires on #testretries)
+
+## Fs design {#fs1}
+
+Design and write a fuse frontend to RealizeService that allows running
+basic operations. Extend RealizeService as needed.
+
+The frontend exposes all dirids at the root, which can contain / but
+cannot conflict (so no "test" and "test/a"), then all files inside and
+does that my making RPC calls to a RealizeService instance.
+
+The frontend use an in-memory map for keeping inode <-> dirid+path
+
+Missing operations:
+ - list dirid
+ - list directory content (not just everything in a dirid)
+ - rename (even across dirids)
+ - link (even across dirids)
+ - mkdir/rmdir (now empty dirs exist!)
+ - stat
+ - fs stat
+
+Next step, expose a merged view of a RealizeService from two RealizeService, from within the server (server configuration, the fuse frontend doesn't know
+about that).
+
+## Test retries {#testretries}
+
+Make it possible to intercept RealizeService operations in tests to test:
+
+- write errors later fixed by rsync
+- rsync producing a bad chunk, handled as a copy later on
+
+## Drop empty delta {#emptydelta}
+
+Detect empty deltas from the rsync algorithm and skip sending a RPC
+for them.
+
+## Drop hash past dest filesize {#sizebeforehash}
+
+Check dest filesize before sending a hash RPC and just store None in
+the RangedHash.
+
 ## Compression {#compress}
 
 Implement compression as shown on:
