@@ -265,36 +265,25 @@ struct CliFileProgress {
 }
 
 impl CliFileProgress {
-    fn get_or_create_bar(&mut self) -> &mut ProgressBar {
-        let (_, pb) = self.bar.get_or_insert_with(|| {
+    fn get_or_create_bar(&mut self) -> (usize, &mut ProgressBar) {
+        let (index, pb) = self.bar.get_or_insert_with(|| {
             let file_index = self.next_file_index.fetch_add(1, Ordering::Relaxed);
             let pb = self.multi.insert_from_back(1, ProgressBar::new(self.bytes));
-            let tag = format!("[{}/{}]", file_index, self.total_files);
             pb.set_message(self.path.clone());
-            pb.set_style(
-                ProgressStyle::with_template(
-                    "{prefix:<10.cyan.bold} {tag} {wide_msg} ({bytes}/{total_bytes}) {percent}%",
-                )
-                .unwrap()
-                .progress_chars("=> ")
-                .with_key(
-                    "tag",
-                    move |_state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
-                        let _ = w.write_str(&tag);
-                    },
-                ),
-            );
+
+            set_bar_style(file_index, self.total_files, &pb, false);
             pb.set_prefix("Pending");
 
             (file_index, pb)
         });
 
-        pb
+        (*index, pb)
     }
     fn verifying(&mut self) {
         log::info!("Verifying {} ({})", self.path, HumanBytes(self.bytes));
 
-        let pb = self.get_or_create_bar();
+        let (_, pb) = self.get_or_create_bar();
+
         pb.set_prefix("Verifying");
     }
     fn rsyncing(&mut self) {
@@ -305,9 +294,14 @@ impl CliFileProgress {
             HumanBytes(self.bytes)
         );
 
-        let pb = self.get_or_create_bar();
+        let total_files = self.total_files;
+
+        // If we enter this state, things have gone wrong. Change the color to yellow.
+        let (index, pb) = self.get_or_create_bar();
+        set_bar_style(index, total_files, pb, true);
         pb.set_prefix("Rsyncing");
     }
+
     fn copying(&mut self) {
         log::info!(
             "Copying {} ({}/{})",
@@ -316,11 +310,11 @@ impl CliFileProgress {
             HumanBytes(self.bytes)
         );
 
-        let pb = self.get_or_create_bar();
+        let (_, pb) = self.get_or_create_bar();
         pb.set_prefix("Copying");
     }
     fn pending(&mut self) {
-        let pb = self.get_or_create_bar();
+        let (_, pb) = self.get_or_create_bar();
         pb.set_prefix("Pending");
     }
     fn inc(&mut self, bytecount: u64) {
@@ -380,4 +374,26 @@ impl CliFileProgress {
             );
         });
     }
+}
+
+/// Set the style of a file copy bar.
+///
+/// There are two variants: blue (warn=false) and yellow (warn-true).
+fn set_bar_style(file_index: usize, total_files: usize, pb: &ProgressBar, warn: bool) {
+    let tag = format!("[{}/{}]", file_index, total_files);
+    pb.set_style(
+        ProgressStyle::with_template(if warn {
+            "{prefix:<10.yellow.bold} {tag} {wide_msg} ({bytes}/{total_bytes}) {percent}%"
+        } else {
+            "{prefix:<10.cyan.bold} {tag} {wide_msg} ({bytes}/{total_bytes}) {percent}%"
+        })
+        .unwrap()
+        .progress_chars("=> ")
+        .with_key(
+            "tag",
+            move |_state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
+                let _ = w.write_str(&tag);
+            },
+        ),
+    );
 }
