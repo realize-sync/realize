@@ -305,7 +305,6 @@ where
     // Assume existing to be correct for now and report it as such in
     // the progress.
     let existing = ByteRanges::single(0, dst_size);
-    report_increment_bytecount(&progress_tx, &dir_id, path, existing.bytecount()).await;
 
     let (copy, src_hash) = tokio::join!(
         async {
@@ -370,7 +369,14 @@ where
     // 4. Use rsync to fix any mismatch
     let mut fallback_ranges = ByteRanges::new();
     let rsync_ranges = ranges.subtraction(&correct);
-    log::debug!("{}/{:?} {} rsync {}", dir_id, path, ranges, rsync_ranges);
+    log::debug!(
+        "{}/{:?} {} rsync {} DEC:{}",
+        dir_id,
+        path,
+        ranges,
+        rsync_ranges,
+        rsync_ranges.bytecount()
+    );
     report_decrement_bytecount(&progress_tx, &dir_id, path, rsync_ranges.bytecount()).await;
     rsync_file_range(
         ctx,
@@ -471,6 +477,7 @@ where
                 METRIC_RANGE_WRITE_BYTES
                     .with_label_values(&["apply_delta"])
                     .inc_by(range.bytecount());
+                log::debug!("{}/{:?} INC {}", &dir_id, path, range.bytecount());
                 report_increment_bytecount(&progress_tx, &dir_id, path, range.bytecount()).await;
             }
             Err(RealizeError::HashMismatch) => {
@@ -906,11 +913,6 @@ mod tests {
                     bytes: 9,
                     available: 3
                 },
-                IncrementByteCount {
-                    dir_id: DirectoryId::from("testdir"),
-                    path: PathBuf::from("foo"),
-                    bytecount: 3
-                },
                 PendingFile {
                     dir_id: DirectoryId::from("testdir"),
                     path: PathBuf::from("foo")
@@ -991,11 +993,6 @@ mod tests {
                     path: PathBuf::from("foo"),
                     bytes: 9,
                     available: 3
-                },
-                IncrementByteCount {
-                    dir_id: DirectoryId::from("testdir"),
-                    path: PathBuf::from("foo"),
-                    bytecount: 3
                 },
                 PendingFile {
                     dir_id: DirectoryId::from("testdir"),

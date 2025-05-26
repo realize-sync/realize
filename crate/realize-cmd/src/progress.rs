@@ -5,8 +5,8 @@ use realize_lib::model::service::DirectoryId;
 use realize_lib::transport::tcp::ClientConnectionState;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
 
 pub(crate) struct CliProgress {
@@ -266,6 +266,8 @@ struct CliFileProgress {
 
 impl CliFileProgress {
     fn get_or_create_bar(&mut self) -> (usize, &mut ProgressBar) {
+        // Is it worth creating the bar on demand? Won't MoveFileEvent only be sent
+        // when the bar should be shown?
         let (index, pb) = self.bar.get_or_insert_with(|| {
             let file_index = self.next_file_index.fetch_add(1, Ordering::Relaxed);
             let pb = self.multi.insert_from_back(1, ProgressBar::new(self.bytes));
@@ -273,6 +275,7 @@ impl CliFileProgress {
 
             set_bar_style(file_index, self.total_files, &pb, false);
             pb.set_prefix("Pending");
+            pb.inc(self.available);
 
             (file_index, pb)
         });
