@@ -13,11 +13,11 @@ use crate::model::service::{
     DirectoryId, RealizeError, RealizeService, Result, RsyncOperation, SyncedFile, SyncedFileState,
 };
 use crate::model::service::{RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse};
-use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
+use async_speed_limit::Limiter;
 use fast_rsync::{
-    Signature as RsyncSignature, SignatureOptions, apply_limited as rsync_apply_limited,
-    diff as rsync_diff,
+    apply_limited as rsync_apply_limited, diff as rsync_diff, Signature as RsyncSignature,
+    SignatureOptions,
 };
 use futures::StreamExt;
 use std::cmp::min;
@@ -26,8 +26,8 @@ use std::ffi::OsString;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tarpc::client::RpcError;
 use tarpc::client::stub::Stub;
+use tarpc::client::RpcError;
 use tarpc::context;
 use tarpc::server::Channel;
 use tokio::fs::{self, File, OpenOptions};
@@ -203,7 +203,6 @@ impl RealizeService for RealizeServer {
         dir_id: DirectoryId,
         relative_path: PathBuf,
         range: ByteRange,
-        file_size: u64,
         data: Vec<u8>,
         options: Options,
     ) -> Result<()> {
@@ -211,7 +210,6 @@ impl RealizeService for RealizeServer {
         let logical = LogicalPath::new(dir, &relative_path)?;
         let path = prepare_for_write(&options, logical).await?;
         let mut file = open_for_range_write(&path).await?;
-        shorten_file(&mut file, &range, file_size).await?;
         write_at_offset(&mut file, range.start, &data).await?;
 
         Ok(())
@@ -326,7 +324,6 @@ impl RealizeService for RealizeServer {
         dir_id: DirectoryId,
         relative_path: PathBuf,
         range: ByteRange,
-        file_size: u64,
         delta: crate::model::service::Delta,
         hash: Hash,
         options: Options,
@@ -336,8 +333,6 @@ impl RealizeService for RealizeServer {
         let path = prepare_for_write(&options, logical).await?;
 
         let mut file = open_for_range_write(&path).await?;
-        shorten_file(&mut file, &range, file_size).await?;
-
         let mut base = vec![0u8; range.bytecount() as usize];
         read_padded(&mut file, &range, &mut base).await?;
         let mut out = Vec::new();
@@ -351,6 +346,24 @@ impl RealizeService for RealizeServer {
             return Err(RealizeError::HashMismatch);
         }
         write_at_offset(&mut file, range.start, &out).await?;
+
+        return Ok(());
+    }
+
+    async fn truncate(
+        self,
+        _ctx: tarpc::context::Context,
+        dir_id: DirectoryId,
+        relative_path: PathBuf,
+        file_size: u64,
+        options: Options,
+    ) -> Result<()> {
+        let dir = self.find_directory(&dir_id)?;
+        let logical = LogicalPath::new(dir, &relative_path)?;
+        let path = prepare_for_write(&options, logical).await?;
+
+        let mut file = open_for_range_write(&path).await?;
+        shorten_file(&mut file, file_size).await?;
 
         return Ok(());
     }
@@ -459,10 +472,11 @@ async fn read_padded(
     Ok(())
 }
 
-async fn shorten_file(file: &mut File, range: &ByteRange, file_size: u64) -> Result<()> {
-    if range.end == file_size && file.metadata().await?.len() > file_size {
+async fn shorten_file(file: &mut File, file_size: u64) -> Result<()> {
+    if file.metadata().await?.len() > file_size {
         file.set_len(file_size).await?;
         file.flush().await?;
+        file.sync_all().await?;
     }
 
     Ok(())
@@ -677,8 +691,8 @@ async fn is_empty_dir(path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::model::service::Hash;
-    use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
     use std::fs;
     use std::io::Read as _;
@@ -820,12 +834,10 @@ mod tests {
         };
 
         temp.child(".foo.txt.part").write_str("test")?;
-        assert!(
-            LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?
-                .find(&nopartial)
-                .await
-                .is_err()
-        );
+        assert!(LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?
+            .find(&nopartial)
+            .await
+            .is_err());
 
         temp.child("bar.txt").write_str("test")?;
         assert_eq!(
@@ -952,7 +964,6 @@ mod tests {
                 dir.id().clone(),
                 fpath.relative_path().to_path_buf(),
                 ByteRange { start: 5, end: 10 },
-                10,
                 data1.clone(),
                 Options::default(),
             )
@@ -971,7 +982,6 @@ mod tests {
                 dir.id().clone(),
                 fpath.relative_path().to_path_buf(),
                 ByteRange { start: 0, end: 5 },
-                10,
                 data2.clone(),
                 Options::default(),
             )
@@ -1076,25 +1086,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_truncates_file() -> anyhow::Result<()> {
+    async fn truncate() -> anyhow::Result<()> {
         let (server, _temp, dir) = setup_server_with_dir()?;
         let fpath = LogicalPath::new(&dir, &PathBuf::from("truncate.txt"))?;
         std::fs::write(fpath.partial_path(), b"abcdefghij")?;
-        let data = b"1234567".to_vec();
         server
             .clone()
-            .send(
+            .truncate(
                 tarpc::context::current(),
                 dir.id().clone(),
                 fpath.relative_path().to_path_buf(),
-                ByteRange { start: 0, end: 7 },
                 7,
-                data.clone(),
                 Options::default(),
             )
             .await?;
         let content = std::fs::read_to_string(fpath.partial_path())?;
-        assert_eq!(content, "1234567");
+        assert_eq!(content, "abcdefg");
         Ok(())
     }
 
@@ -1279,7 +1286,7 @@ mod tests {
                 Options::default(),
             )
             .await?;
-        assert!(!delta.0.0.is_empty());
+        assert!(!delta.0 .0.is_empty());
 
         // Revert file to old content, then apply delta
         temp.child("foo.txt").write_binary(file_content)?;
@@ -1293,7 +1300,6 @@ mod tests {
                     start: 0,
                     end: new_content.len() as u64,
                 },
-                new_content.len() as u64,
                 delta.0,
                 delta.1,
                 Options::default(),
@@ -1342,7 +1348,6 @@ mod tests {
                 dir.id().clone(),
                 file_path,
                 ByteRange { start: 0, end: 3 },
-                3,
                 crate::model::service::Delta(vec![1, 2, 3]),
                 Hash::zero(),
                 Options::default(),
@@ -1352,77 +1357,6 @@ mod tests {
             let msg = format!("{e}");
             println!("Error: {msg}");
         }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn diff_and_apply_delta_with_shorter_content() -> anyhow::Result<()> {
-        let (server, temp, dir) = setup_server_with_dir()?;
-        let file_path = PathBuf::from("shorten.txt");
-        let original_content = b"this is the original, longer content";
-        temp.child("shorten.txt").write_binary(original_content)?;
-
-        // Calculate signature for the whole file
-        let sig = server
-            .clone()
-            .calculate_signature(
-                tarpc::context::current(),
-                dir.id().clone(),
-                file_path.clone(),
-                ByteRange {
-                    start: 0,
-                    end: original_content.len() as u64,
-                },
-                Options::default(),
-            )
-            .await?;
-
-        // Prepare shorter new content
-        let new_content = b"short";
-        temp.child("shorten.txt").write_binary(new_content)?;
-
-        // Diff: get delta from old signature to new (shorter) content
-        let delta = server
-            .clone()
-            .diff(
-                tarpc::context::current(),
-                dir.id().clone(),
-                file_path.clone(),
-                ByteRange {
-                    start: 0,
-                    end: new_content.len() as u64,
-                },
-                sig.clone(),
-                Options::default(),
-            )
-            .await?;
-        assert!(!delta.0.0.is_empty());
-
-        // Revert file to original content, then apply delta
-        temp.child("shorten.txt").write_binary(original_content)?;
-        let res = server
-            .clone()
-            .apply_delta(
-                tarpc::context::current(),
-                dir.id().clone(),
-                file_path.clone(),
-                ByteRange {
-                    start: 0,
-                    end: new_content.len() as u64,
-                },
-                new_content.len() as u64,
-                delta.0,
-                delta.1,
-                Options::default(),
-            )
-            .await;
-        assert!(res.is_ok());
-        // File should now match new_content and be truncated
-        let logical = LogicalPath::new(&dir, &file_path)?;
-        let (_state, actual) = logical.find(&Options::default()).await?;
-        let mut buf = Vec::new();
-        std::fs::File::open(&actual)?.read_to_end(&mut buf)?;
-        assert_eq!(&buf, new_content);
         Ok(())
     }
 

@@ -151,15 +151,10 @@ pub trait RealizeService {
     async fn list(dir_id: DirectoryId, options: Options) -> Result<Vec<SyncedFile>>;
 
     /// Send a byte range of a file.
-    ///
-    /// The 'file_size' argument indicates the intended final size of
-    /// the file. If the file is larger than this after writing, it
-    /// should be truncated.
     async fn send(
         dir_id: DirectoryId,
         relative_path: PathBuf,
         range: ByteRange,
-        file_size: u64,
         data: Vec<u8>,
         options: Options,
     ) -> Result<()>;
@@ -215,9 +210,16 @@ pub trait RealizeService {
         dir_id: DirectoryId,
         relative_path: PathBuf,
         range: ByteRange,
-        file_size: u64,
         delta: Delta,
         hash: Hash,
+        options: Options,
+    ) -> Result<()>;
+
+    /// Truncate file to the given size.
+    async fn truncate(
+        dir_id: DirectoryId,
+        relative_path: PathBuf,
+        file_size: u64,
         options: Options,
     ) -> Result<()>;
 

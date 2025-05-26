@@ -16,14 +16,14 @@ use std::time::Instant;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use prometheus::{
-    Encoder, HistogramVec, IntCounterVec, IntGauge, register_histogram_vec,
-    register_int_counter_vec, register_int_gauge,
+    register_histogram_vec, register_int_counter_vec, register_int_gauge, Encoder, HistogramVec,
+    IntCounterVec, IntGauge,
 };
 use tarpc::{
-    ServerError,
-    client::{RpcError, stub::Stub},
+    client::{stub::Stub, RpcError},
     context::Context,
     server::Serve,
+    ServerError,
 };
 use tokio::net::TcpListener;
 
@@ -118,6 +118,7 @@ fn method_label(req: &RealizeServiceRequest) -> &'static str {
         RealizeServiceRequest::CalculateSignature { .. } => "calculate_signature",
         RealizeServiceRequest::Diff { .. } => "diff",
         RealizeServiceRequest::ApplyDelta { .. } => "apply_delta",
+        RealizeServiceRequest::Truncate { .. } => "truncate",
         RealizeServiceRequest::Configure { .. } => "configure",
     }
 }
@@ -164,6 +165,7 @@ fn realize_error(res: &RealizeServiceResponse) -> Option<&RealizeError> {
         RealizeServiceResponse::CalculateSignature(Err(err)) => Some(err),
         RealizeServiceResponse::Diff(Err(err)) => Some(err),
         RealizeServiceResponse::ApplyDelta(Err(err)) => Some(err),
+        RealizeServiceResponse::Truncate(Err(err)) => Some(err),
         RealizeServiceResponse::Configure(Err(err)) => Some(err),
         RealizeServiceResponse::List(Ok(_)) => None,
         RealizeServiceResponse::Send(Ok(_)) => None,
@@ -174,6 +176,7 @@ fn realize_error(res: &RealizeServiceResponse) -> Option<&RealizeError> {
         RealizeServiceResponse::CalculateSignature(Ok(_)) => None,
         RealizeServiceResponse::Diff(Ok(_)) => None,
         RealizeServiceResponse::ApplyDelta(Ok(_)) => None,
+        RealizeServiceResponse::Truncate(Ok(_)) => None,
         RealizeServiceResponse::Configure(Ok(_)) => None,
     }
 }
@@ -212,6 +215,7 @@ fn range_bytes(req: &RealizeServiceRequest) -> Option<u64> {
         | RealizeServiceRequest::Finish { .. }
         | RealizeServiceRequest::Hash { .. }
         | RealizeServiceRequest::Delete { .. }
+        | RealizeServiceRequest::Truncate { .. }
         | RealizeServiceRequest::Configure { .. } => None,
     };
 
@@ -230,6 +234,7 @@ fn bytes_in(req: &RealizeServiceRequest) -> Option<u64> {
         | RealizeServiceRequest::Hash { .. }
         | RealizeServiceRequest::Delete { .. }
         | RealizeServiceRequest::CalculateSignature { .. }
+        | RealizeServiceRequest::Truncate { .. }
         | RealizeServiceRequest::Configure { .. } => None,
     }
 }

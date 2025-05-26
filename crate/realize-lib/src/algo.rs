@@ -9,17 +9,17 @@ use crate::model::service::{
     DirectoryId, Options, RangedHash, RealizeError, RealizeServiceClient, RealizeServiceRequest,
     RealizeServiceResponse, SyncedFile,
 };
-use futures::FutureExt;
 use futures::future;
 use futures::future::Either;
 use futures::stream::StreamExt as _;
-use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
+use futures::FutureExt;
+use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
 use std::sync::Arc;
 use std::{collections::HashMap, path::Path};
 use tarpc::client::stub::Stub;
 use thiserror::Error;
-use tokio::sync::Semaphore;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::Semaphore;
 
 pub mod hash;
 
@@ -350,7 +350,6 @@ where
         ctx,
         &dir_id,
         path,
-        src_file.size,
         src,
         dst,
         &progress_tx,
@@ -364,7 +363,6 @@ where
         ctx,
         &dir_id,
         path,
-        src_file.size,
         src,
         dst,
         &progress_tx,
@@ -372,6 +370,17 @@ where
         &copy_ranges,
     )
     .await?;
+
+    if dst_file.map_or(0, |f| f.size) > src_file.size {
+        dst.truncate(
+            ctx,
+            dir_id.clone(),
+            path.to_path_buf(),
+            src_file.size,
+            dst_options(),
+        )
+        .await??;
+    }
 
     // 3. Check full file and delete
     report_verifying(&progress_tx, &dir_id, path).await;
@@ -389,7 +398,6 @@ async fn rsync_file_range<T, U>(
     ctx: tarpc::context::Context,
     dir_id: &DirectoryId,
     path: &Path,
-    file_size: u64,
     src: &RealizeServiceClient<T>,
     dst: &RealizeServiceClient<U>,
     progress_tx: &Option<Sender<ProgressEvent>>,
@@ -439,7 +447,6 @@ where
                 dir_id.clone(),
                 path.to_path_buf(),
                 range.clone(),
-                file_size,
                 delta,
                 hash,
                 dst_options(),
@@ -479,7 +486,6 @@ async fn copy_file_range<T, U>(
     ctx: tarpc::context::Context,
     dir_id: &DirectoryId,
     path: &Path,
-    file_size: u64,
     src: &RealizeServiceClient<T>,
     dst: &RealizeServiceClient<U>,
     progress_tx: &Option<Sender<ProgressEvent>>,
@@ -522,7 +528,6 @@ where
             dir_id.clone(),
             path.to_path_buf(),
             range.clone(),
-            file_size,
             data,
             dst_options(),
         )
@@ -728,8 +733,8 @@ mod tests {
     use crate::model::service::DirectoryId;
     use crate::model::service::Hash;
     use crate::server::{self, DirectoryMap};
-    use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
     use std::path::PathBuf;
     use std::sync::Arc;
