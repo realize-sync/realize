@@ -3,6 +3,18 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
+## IPV6 + IPV4 {#ipv64}
+
+Localhost is currently resolved to ipv6 address, which isn't what's
+expected in the tests, so all tests use 127.0.0.1.
+
+This isn't right; it should be possible to specify localhost (or any
+address that resolves to both an ipv6 address and an ipv4 address) and
+have it work normally (try ipv6, fallback to ipv4).
+
+This is normally automatic, I expect, but the custom transformation to
+SocketAddr screws that up.
+
 ## Fs design {#fs1}
 
 Design and write a fuse frontend to RealizeService that allows running
