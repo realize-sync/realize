@@ -129,8 +129,8 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
         .with_context(|| format!("Failed to start server on {}", hostport))?;
 
     METRIC_UP.inc();
-    println!("Listening on {addr}");
     log::info!("Listening on {addr}");
+    println!("Listening on {addr}");
 
     handle.join().await?;
 
