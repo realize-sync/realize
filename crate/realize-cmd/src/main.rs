@@ -226,28 +226,27 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
             let mut total_error = 0;
             let mut total_interrupted = 0;
             let mut interrupted = false;
-            for dir_id in &cli.directory_ids {
-                let result = realize_lib::algo::move_dir(
-                    ctx,
-                    &src_client,
-                    &dst_client,
-                    DirectoryId::from(dir_id.to_string()),
-                    Some(progress_tx.clone()),
-                )
-                .await;
-                match result {
-                    Ok((success, error, interrupted_count)) => {
-                        total_success += success;
-                        total_error += error;
-                        total_interrupted += interrupted_count;
-                    }
-                    Err(MoveFileError::Rpc(RpcError::DeadlineExceeded)) => {
-                        interrupted = true;
-                        break;
-                    }
-                    Err(err) => {
-                        return Err(anyhow::Error::from(err));
-                    }
+            let result = realize_lib::algo::move_dirs(
+                ctx,
+                &src_client,
+                &dst_client,
+                cli.directory_ids
+                    .iter()
+                    .map(|s| DirectoryId::from(s.to_string())),
+                Some(progress_tx.clone()),
+            )
+            .await;
+            match result {
+                Ok((success, error, interrupted_count)) => {
+                    total_success += success;
+                    total_error += error;
+                    total_interrupted += interrupted_count;
+                }
+                Err(MoveFileError::Rpc(RpcError::DeadlineExceeded)) => {
+                    interrupted = true;
+                }
+                Err(err) => {
+                    return Err(anyhow::Error::from(err));
                 }
             }
             Ok((total_success, total_error, total_interrupted, interrupted))

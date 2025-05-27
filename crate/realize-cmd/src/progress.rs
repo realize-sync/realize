@@ -14,7 +14,6 @@ pub(crate) struct CliProgress {
     overall_pb: ProgressBar,
     next_file_index: usize,
     quiet: bool,
-    path_prefix: String,
     should_show_dir: bool,
     connection_state: ClientConnectionState,
 }
@@ -41,17 +40,12 @@ impl CliProgress {
             overall_pb,
             next_file_index: 1,
             quiet,
-            path_prefix: "".to_string(),
             should_show_dir: dir_count > 1,
             connection_state: ClientConnectionState::NotConnected,
         };
         res.update_overall_prefix();
 
         res
-    }
-
-    pub(crate) fn set_path_prefix(&mut self, prefix: String) {
-        self.path_prefix = prefix;
     }
 
     pub(crate) fn finish_and_clear(&self) {
@@ -67,9 +61,6 @@ impl CliProgress {
             HumanBytes(total_bytes)
         );
 
-        if self.should_show_dir {
-            self.set_path_prefix(format!("{}/", dir_id));
-        }
         self.total_files += total_files;
         self.total_bytes += total_bytes;
         self.overall_pb.set_length(self.total_bytes);
@@ -77,8 +68,18 @@ impl CliProgress {
         self.update_overall_prefix();
     }
 
-    fn for_file(&mut self, path: &std::path::Path, bytes: u64, available: u64) -> CliFileProgress {
-        let path = format!("{}{}", self.path_prefix, path.display());
+    fn for_file(
+        &mut self,
+        dir_id: &DirectoryId,
+        path: &std::path::Path,
+        bytes: u64,
+        available: u64,
+    ) -> CliFileProgress {
+        let path = if self.should_show_dir {
+            format!("{}/{}", dir_id, path.display())
+        } else {
+            format!("{}", path.display())
+        };
         log::info!(
             "Preparing to move {} ({}/{})",
             path,
@@ -190,7 +191,7 @@ impl CliProgress {
                         available,
                         ..
                     }) => {
-                        let fp = self.for_file(&path, bytes, available);
+                        let fp = self.for_file(&dir_id, &path, bytes, available);
                         file_progress_map.insert((dir_id, path), fp);
                     }
                     Some(VerifyingFile { dir_id, path, .. }) => {

@@ -154,7 +154,6 @@ pub enum ProgressEvent {
     },
 }
 
-/// Moves files from source to destination using the RealizeService interface, sending progress events to a channel.
 pub async fn move_dir<T, U>(
     ctx: tarpc::context::Context,
     src: &RealizeServiceClient<T>,
@@ -166,8 +165,31 @@ where
     T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
     U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
 {
+    move_dirs(ctx, src, dst, vec![dir_id], progress_tx).await
+}
+
+/// Moves files from source to destination using the RealizeService interface, sending progress events to a channel.
+pub async fn move_dirs<T, U>(
+    ctx: tarpc::context::Context,
+    src: &RealizeServiceClient<T>,
+    dst: &RealizeServiceClient<U>,
+    dir_ids: impl IntoIterator<Item = DirectoryId>,
+    progress_tx: Option<Sender<ProgressEvent>>,
+) -> Result<(usize, usize, usize), MoveFileError>
+where
+    T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+    U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+{
     METRIC_START_COUNT.inc();
-    let files_to_sync = collect_files_to_sync(ctx, src, dst, &dir_id, &progress_tx).await?;
+    let mut files_to_sync = vec![];
+    for collected in futures::stream::iter(dir_ids.into_iter())
+        .map(|dir_id| collect_files_to_sync(ctx, src, dst, dir_id, &progress_tx))
+        .buffered(8)
+        .collect::<Vec<_>>()
+        .await
+    {
+        files_to_sync.append(&mut (collected?));
+    }
 
     let copy_sem = Arc::new(Semaphore::new(1));
     let results = futures::stream::iter(files_to_sync.into_iter())
@@ -262,7 +284,7 @@ async fn collect_files_to_sync<T, U>(
     ctx: tarpc::context::Context,
     src: &RealizeServiceClient<T>,
     dst: &RealizeServiceClient<U>,
-    dir_id: &DirectoryId,
+    dir_id: DirectoryId,
     progress_tx: &Option<Sender<ProgressEvent>>,
 ) -> Result<Vec<(DirectoryId, SyncedFile, Option<SyncedFile>)>, MoveFileError>
 where

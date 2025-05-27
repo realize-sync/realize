@@ -642,7 +642,7 @@ async fn multiple_directory_ids() -> anyhow::Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("[1/1] dir1/foo1.txt"),
+        stdout.contains("[1/2] dir1/foo1.txt"),
         "OUT: {stdout} ERR: {stderr}"
     );
     assert!(
