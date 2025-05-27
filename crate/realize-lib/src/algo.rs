@@ -98,6 +98,7 @@ pub enum ProgressEvent {
         dir_id: DirectoryId,
         total_files: usize,
         total_bytes: u64,
+        available_bytes: u64,
     },
     /// Indicates a file is being processed (start), with its path and size.
     MovingFile {
@@ -304,26 +305,30 @@ where
         .into_iter()
         .map(|f| (f.path.to_path_buf(), f))
         .collect();
-    let total_files = src_files.len();
-    let total_bytes = src_files.iter().fold(0, |acc, f| acc + f.size);
-    if let Some(tx) = &progress_tx {
-        let _ = tx
-            .send(ProgressEvent::MovingDir {
-                dir_id: dir_id.clone(),
-                total_files,
-                total_bytes,
-            })
-            .await;
-    }
 
-    Ok(src_files
+    let files_to_sync = src_files
         .into_iter()
         .map(|src_file| {
             let dst_file = dst_map.remove(&src_file.path);
 
             (dir_id.clone(), src_file, dst_file)
         })
-        .collect())
+        .collect::<Vec<_>>();
+
+    if let Some(tx) = &progress_tx {
+        let _ = tx
+            .send(ProgressEvent::MovingDir {
+                dir_id: dir_id.clone(),
+                total_files: files_to_sync.len(),
+                total_bytes: files_to_sync.iter().fold(0, |acc, (_, f, _)| acc + f.size),
+                available_bytes: files_to_sync
+                    .iter()
+                    .fold(0, |acc, (_, _, f)| acc + f.as_ref().map_or(0, |f| f.size)),
+            })
+            .await;
+    }
+
+    Ok(files_to_sync)
 }
 
 async fn move_file<T, U>(
@@ -870,7 +875,8 @@ mod tests {
                 MovingDir {
                     dir_id: DirectoryId::from("testdir"),
                     total_files: 1,
-                    total_bytes: 3
+                    total_bytes: 3,
+                    available_bytes: 0,
                 },
                 MovingFile {
                     dir_id: DirectoryId::from("testdir"),
@@ -951,7 +957,8 @@ mod tests {
                 MovingDir {
                     dir_id: DirectoryId::from("testdir"),
                     total_files: 1,
-                    total_bytes: 9
+                    total_bytes: 9,
+                    available_bytes: 3,
                 },
                 MovingFile {
                     dir_id: DirectoryId::from("testdir"),
@@ -1032,7 +1039,8 @@ mod tests {
                 MovingDir {
                     dir_id: DirectoryId::from("testdir"),
                     total_files: 1,
-                    total_bytes: 9
+                    total_bytes: 9,
+                    available_bytes: 3,
                 },
                 MovingFile {
                     dir_id: DirectoryId::from("testdir"),

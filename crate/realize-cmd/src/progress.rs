@@ -53,7 +53,13 @@ impl CliProgress {
         let _ = self.multi.clear();
     }
 
-    fn set_length(&mut self, dir_id: &DirectoryId, total_files: usize, total_bytes: u64) {
+    fn set_length(
+        &mut self,
+        dir_id: &DirectoryId,
+        total_files: usize,
+        total_bytes: u64,
+        available_bytes: u64,
+    ) {
         log::info!(
             "{}: {} files to move ({})",
             dir_id,
@@ -64,7 +70,7 @@ impl CliProgress {
         self.total_files += total_files;
         self.total_bytes += total_bytes;
         self.overall_pb.set_length(self.total_bytes);
-        self.overall_pb.set_position(0);
+        self.overall_pb.inc(available_bytes);
         self.update_overall_prefix();
     }
 
@@ -91,6 +97,7 @@ impl CliProgress {
         pb.set_message(path.to_string());
         pb.set_prefix("Pending");
         pb.inc(available);
+        // overall_pb already took MoveDirEvent.available_bytes into account
         let index = self.next_file_index;
         self.next_file_index += 1;
         let tag = format!("{}/{}", index, self.total_files);
@@ -180,9 +187,10 @@ impl CliProgress {
                         dir_id,
                         total_files,
                         total_bytes,
+                        available_bytes,
                         ..
                     }) => {
-                        self.set_length(&dir_id, total_files, total_bytes);
+                        self.set_length(&dir_id, total_files, total_bytes, available_bytes);
                     }
                     Some(MovingFile {
                         dir_id,
