@@ -155,7 +155,7 @@ pub enum ProgressEvent {
 }
 
 /// Moves files from source to destination using the RealizeService interface, sending progress events to a channel.
-pub async fn move_files<T, U>(
+pub async fn move_dir<T, U>(
     ctx: tarpc::context::Context,
     src: &RealizeServiceClient<T>,
     dst: &RealizeServiceClient<U>,
@@ -167,39 +167,14 @@ where
     U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
 {
     METRIC_START_COUNT.inc();
-    // 1. List files on src and dst in parallel
-    let (src_files, dst_files) = future::join(
-        src.list(ctx, dir_id.clone(), src_options()),
-        dst.list(ctx, dir_id.clone(), dst_options()),
-    )
-    .await;
-    let src_files = src_files??;
-    let dst_files = dst_files??;
+    let files_to_sync = collect_files_to_sync(ctx, src, dst, &dir_id, &progress_tx).await?;
 
-    // 2. Build lookup for dst
-    let dst_map: HashMap<_, _> = dst_files
-        .into_iter()
-        .map(|f| (f.path.to_path_buf(), f))
-        .collect();
-    let total_files = src_files.len();
-    let total_bytes = src_files.iter().map(|f| f.size).sum();
-    if let Some(tx) = &progress_tx {
-        let _ = tx
-            .send(ProgressEvent::MovingDir {
-                dir_id: dir_id.clone(),
-                total_files,
-                total_bytes,
-            })
-            .await;
-    }
     let copy_sem = Arc::new(Semaphore::new(1));
-    let results = futures::stream::iter(src_files.into_iter())
-        .map(|file| {
-            let dst_file = dst_map.get(&file.path);
-            let dir_id = dir_id.clone();
+    let results = futures::stream::iter(files_to_sync.into_iter())
+        .map(|(dir_id, src_file, dst_file)| {
             let copy_sem = copy_sem.clone();
             let tx = progress_tx.clone();
-            let file_path = file.path.clone();
+            let file_path = src_file.path.clone();
 
             async move {
                 let tx = tx.clone();
@@ -207,9 +182,9 @@ where
                     let _ = tx
                         .send(ProgressEvent::MovingFile {
                             dir_id: dir_id.clone(),
-                            path: file.path.clone(),
-                            bytes: file.size,
-                            available: dst_file.map_or(0, |f| f.size),
+                            path: file_path.clone(),
+                            bytes: src_file.size,
+                            available: dst_file.as_ref().map_or(0, |f| f.size),
                         })
                         .await;
                 }
@@ -217,7 +192,7 @@ where
                 let result = move_file(
                     ctx,
                     src,
-                    &file,
+                    src_file,
                     dst,
                     dst_file,
                     &dir_id,
@@ -280,12 +255,61 @@ where
     Ok((success_count, error_count, interrupted_count))
 }
 
+/// Collect pair of files to sync from a directory.
+///
+/// Also issues the [ProgressEvent::MovingDir] progress calls
+async fn collect_files_to_sync<T, U>(
+    ctx: tarpc::context::Context,
+    src: &RealizeServiceClient<T>,
+    dst: &RealizeServiceClient<U>,
+    dir_id: &DirectoryId,
+    progress_tx: &Option<Sender<ProgressEvent>>,
+) -> Result<Vec<(DirectoryId, SyncedFile, Option<SyncedFile>)>, MoveFileError>
+where
+    T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+    U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+{
+    // 1. List files on src and dst in parallel
+    let (src_files, dst_files) = future::join(
+        src.list(ctx, dir_id.clone(), src_options()),
+        dst.list(ctx, dir_id.clone(), dst_options()),
+    )
+    .await;
+    let src_files = src_files??;
+    let dst_files = dst_files??;
+
+    let mut dst_map: HashMap<_, _> = dst_files
+        .into_iter()
+        .map(|f| (f.path.to_path_buf(), f))
+        .collect();
+    let total_files = src_files.len();
+    let total_bytes = src_files.iter().fold(0, |acc, f| acc + f.size);
+    if let Some(tx) = &progress_tx {
+        let _ = tx
+            .send(ProgressEvent::MovingDir {
+                dir_id: dir_id.clone(),
+                total_files,
+                total_bytes,
+            })
+            .await;
+    }
+
+    Ok(src_files
+        .into_iter()
+        .map(|src_file| {
+            let dst_file = dst_map.remove(&src_file.path);
+
+            (dir_id.clone(), src_file, dst_file)
+        })
+        .collect())
+}
+
 async fn move_file<T, U>(
     ctx: tarpc::context::Context,
     src: &RealizeServiceClient<T>,
-    src_file: &SyncedFile,
+    src_file: SyncedFile,
     dst: &RealizeServiceClient<U>,
-    dst_file: Option<&SyncedFile>,
+    dst_file: Option<SyncedFile>,
     dir_id: &DirectoryId,
     copy_sem: Arc<Semaphore>,
     progress_tx: Option<Sender<ProgressEvent>>,
@@ -297,7 +321,7 @@ where
     METRIC_FILE_START_COUNT.inc();
     let path = src_file.path.as_path();
     let src_size = src_file.size;
-    let dst_size = dst_file.map(|f| f.size).unwrap_or(0);
+    let dst_size = dst_file.as_ref().map(|f| f.size).unwrap_or(0);
     let dir_id = dir_id.clone();
 
     let ranges = ByteRanges::single(0, src_size);
@@ -324,7 +348,7 @@ where
             .await?;
 
             // 2. Truncate if necessary
-            if dst_file.map_or(0, |f| f.size) > src_file.size {
+            if dst_file.as_ref().map_or(0, |f| f.size) > src_file.size {
                 dst.truncate(
                     ctx,
                     dir_id.clone(),
@@ -801,7 +825,7 @@ mod tests {
             server::create_inprocess_client(DirectoryMap::for_dir(dst_dir.id(), dst_dir.path()));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-        let (success, error, _) = move_files(
+        let (success, error, _) = move_dir(
             tarpc::context::current(),
             &src_server,
             &dst_server,
@@ -882,7 +906,7 @@ mod tests {
             server::create_inprocess_client(DirectoryMap::for_dir(dst_dir.id(), dst_dir.path()));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-        let (success, error, _) = move_files(
+        let (success, error, _) = move_dir(
             tarpc::context::current(),
             &src_server,
             &dst_server,
@@ -963,7 +987,7 @@ mod tests {
             server::create_inprocess_client(DirectoryMap::for_dir(dst_dir.id(), dst_dir.path()));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-        let (success, error, _) = move_files(
+        let (success, error, _) = move_dir(
             tarpc::context::current(),
             &src_server,
             &dst_server,
@@ -1079,7 +1103,7 @@ mod tests {
         src_temp.child("partial").write_str("partialcopy")?;
 
         println!("test_move_files: all files set up");
-        let (success, error, _interrupted) = move_files(
+        let (success, error, _interrupted) = move_dir(
             tarpc::context::current(),
             &src_server,
             &dst_server,
@@ -1154,7 +1178,7 @@ mod tests {
         let mut ctx = tarpc::context::current();
         ctx.deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
 
-        let (success, error, _interrupted) = move_files(
+        let (success, error, _interrupted) = move_dir(
             ctx,
             &src_server,
             &dst_server,
@@ -1212,7 +1236,7 @@ mod tests {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(unreadable.path(), fs::Permissions::from_mode(0o000))?;
-        let (success, error, _interrupted) = move_files(
+        let (success, error, _interrupted) = move_dir(
             tarpc::context::current(),
             &src_server,
             &dst_server,
@@ -1250,7 +1274,7 @@ mod tests {
             .child(".partial.txt.part")
             .write_str("partialdata")?;
         // Run move_files
-        let (success, error, _interrupted) = move_files(
+        let (success, error, _interrupted) = move_dir(
             tarpc::context::current(),
             &src_server,
             &dst_server,

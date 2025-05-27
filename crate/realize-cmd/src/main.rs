@@ -227,7 +227,7 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
             let mut total_interrupted = 0;
             let mut interrupted = false;
             for dir_id in &cli.directory_ids {
-                let result = realize_lib::algo::move_files(
+                let result = realize_lib::algo::move_dir(
                     ctx,
                     &src_client,
                     &dst_client,

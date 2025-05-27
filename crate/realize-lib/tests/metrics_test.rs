@@ -159,7 +159,7 @@ async fn move_files_metrics() -> anyhow::Result<()> {
         &DirectoryId::from("testdir"),
         dst_temp.path(),
     ));
-    let (success, error, _interrupted) = algo::move_files(
+    let (success, error, _interrupted) = algo::move_dir(
         tarpc::context::current(),
         &server::create_inprocess_client(DirectoryMap::for_dir(src_dir.id(), src_dir.path())),
         &server::create_inprocess_client(DirectoryMap::for_dir(dst_dir.id(), dst_dir.path())),
