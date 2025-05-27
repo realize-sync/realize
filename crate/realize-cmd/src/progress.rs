@@ -5,8 +5,6 @@ use realize_lib::model::service::DirectoryId;
 use realize_lib::transport::tcp::ClientConnectionState;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
 
 pub(crate) struct CliProgress {
@@ -14,7 +12,7 @@ pub(crate) struct CliProgress {
     total_files: usize,
     total_bytes: u64,
     overall_pb: ProgressBar,
-    next_file_index: Arc<AtomicUsize>,
+    next_file_index: usize,
     quiet: bool,
     path_prefix: String,
     should_show_dir: bool,
@@ -41,7 +39,7 @@ impl CliProgress {
             total_files: 0,
             total_bytes: 0,
             overall_pb,
-            next_file_index: Arc::new(AtomicUsize::new(1)),
+            next_file_index: 1,
             quiet,
             path_prefix: "".to_string(),
             should_show_dir: dir_count > 1,
@@ -79,7 +77,7 @@ impl CliProgress {
         self.update_overall_prefix();
     }
 
-    fn for_file(&self, path: &std::path::Path, bytes: u64, available: u64) -> CliFileProgress {
+    fn for_file(&mut self, path: &std::path::Path, bytes: u64, available: u64) -> CliFileProgress {
         let path = format!("{}{}", self.path_prefix, path.display());
         log::info!(
             "Preparing to move {} ({}/{})",
@@ -88,15 +86,23 @@ impl CliProgress {
             HumanBytes(bytes)
         );
 
+        let mut pb = self.multi.insert_from_back(1, ProgressBar::new(bytes));
+        pb.set_message(path.to_string());
+        pb.set_prefix("Pending");
+        pb.inc(available);
+        let index = self.next_file_index;
+        self.next_file_index += 1;
+        let tag = format!("{}/{}", index, self.total_files);
+        set_bar_style(&mut pb, &tag, false);
+
         CliFileProgress {
-            bar: None,
-            next_file_index: self.next_file_index.clone(),
-            total_files: self.total_files,
+            pb,
+            tag,
             bytes,
             available,
             path,
-            multi: self.multi.clone(),
             overall_pb: self.overall_pb.clone(),
+            multi: self.multi.clone(),
             quiet: self.quiet,
         }
     }
@@ -250,44 +256,24 @@ impl CliProgress {
 }
 
 struct CliFileProgress {
-    bar: Option<(usize, ProgressBar)>,
-    next_file_index: Arc<AtomicUsize>,
-    total_files: usize,
+    pb: ProgressBar,
+    tag: String,
     bytes: u64,
 
     // Bytes already available at the beginning of the operation; They
     // are rsynced instead of copied.
     available: u64,
     path: String,
-    multi: MultiProgress,
     overall_pb: ProgressBar,
+    multi: MultiProgress,
     quiet: bool,
 }
 
 impl CliFileProgress {
-    fn get_or_create_bar(&mut self) -> (usize, &mut ProgressBar) {
-        // Is it worth creating the bar on demand? Won't MoveFileEvent only be sent
-        // when the bar should be shown?
-        let (index, pb) = self.bar.get_or_insert_with(|| {
-            let file_index = self.next_file_index.fetch_add(1, Ordering::Relaxed);
-            let pb = self.multi.insert_from_back(1, ProgressBar::new(self.bytes));
-            pb.set_message(self.path.clone());
-
-            set_bar_style(file_index, self.total_files, &pb, false);
-            pb.set_prefix("Pending");
-            pb.inc(self.available);
-
-            (file_index, pb)
-        });
-
-        (*index, pb)
-    }
     fn verifying(&mut self) {
         log::info!("Verifying {} ({})", self.path, HumanBytes(self.bytes));
 
-        let (_, pb) = self.get_or_create_bar();
-
-        pb.set_prefix("Verifying");
+        self.pb.set_prefix("Verifying");
     }
     fn rsyncing(&mut self) {
         log::info!(
@@ -297,12 +283,10 @@ impl CliFileProgress {
             HumanBytes(self.bytes)
         );
 
-        let total_files = self.total_files;
-
-        // If we enter this state, things have gone wrong. Change the color to yellow.
-        let (index, pb) = self.get_or_create_bar();
-        set_bar_style(index, total_files, pb, true);
-        pb.set_prefix("Rsyncing");
+        // If we enter this state, things have gone wrong. Change the
+        // color to yellow.
+        set_bar_style(&mut self.pb, &self.tag, true);
+        self.pb.set_prefix("Rsyncing");
     }
 
     fn copying(&mut self) {
@@ -313,42 +297,34 @@ impl CliFileProgress {
             HumanBytes(self.bytes)
         );
 
-        let (_, pb) = self.get_or_create_bar();
-        pb.set_prefix("Copying");
+        self.pb.set_prefix("Copying");
     }
     fn pending(&mut self) {
-        let (_, pb) = self.get_or_create_bar();
-        pb.set_prefix("Pending");
+        self.pb.set_prefix("Pending");
     }
     fn inc(&mut self, bytecount: u64) {
         self.overall_pb.inc(bytecount);
-        if let Some((_, pb)) = &mut self.bar {
-            pb.inc(bytecount);
-        }
+        self.pb.inc(bytecount);
     }
     fn dec(&mut self, bytecount: u64) {
         self.overall_pb.dec(bytecount);
-        if let Some((_, pb)) = &mut self.bar {
-            pb.dec(bytecount);
-        }
+        self.pb.dec(bytecount);
     }
     fn success(&mut self) {
         log::info!("Moved {} ({})", self.path, HumanBytes(self.bytes));
 
-        if let Some((index, pb)) = self.bar.take() {
-            pb.finish_and_clear();
-            if !self.quiet {
-                self.multi.suspend(|| {
-                    println!(
-                        "{:<10} [{}/{}] {}",
-                        style("Moved").for_stdout().green().bold(),
-                        index,
-                        self.total_files,
-                        self.path
-                    );
-                });
-            }
+        self.pb.finish_and_clear();
+        if self.quiet {
+            return;
         }
+        self.multi.suspend(|| {
+            println!(
+                "{:<10} [{}] {}",
+                style("Moved").for_stdout().green().bold(),
+                self.tag,
+                self.path
+            );
+        });
     }
 
     fn error(&mut self, err: &str) {
@@ -359,19 +335,12 @@ impl CliFileProgress {
             err
         );
 
-        // Write report even if no bar was ever created.
-        let tag = if let Some((index, pb)) = self.bar.take() {
-            pb.finish_and_clear();
-
-            format!("[{}/{}] ", index, self.total_files)
-        } else {
-            "".to_string()
-        };
+        self.pb.finish_and_clear();
         self.multi.suspend(|| {
             eprintln!(
-                "{:<10} {}{}: {}",
+                "{:<10} [{}] {}: {}",
                 style("ERROR").for_stderr().red().bold(),
-                tag,
+                self.tag,
                 self.path,
                 err,
             );
@@ -382,13 +351,13 @@ impl CliFileProgress {
 /// Set the style of a file copy bar.
 ///
 /// There are two variants: blue (warn=false) and yellow (warn-true).
-fn set_bar_style(file_index: usize, total_files: usize, pb: &ProgressBar, warn: bool) {
-    let tag = format!("[{}/{}]", file_index, total_files);
+fn set_bar_style(pb: &ProgressBar, tag: &str, warn: bool) {
+    let tag = tag.to_string();
     pb.set_style(
         ProgressStyle::with_template(if warn {
-            "{prefix:<10.yellow.bold} {tag} {wide_msg} ({bytes}/{total_bytes}) {percent}%"
+            "{prefix:<10.yellow.bold} [{tag}] {wide_msg} ({bytes}/{total_bytes}) {percent}%"
         } else {
-            "{prefix:<10.cyan.bold} {tag} {wide_msg} ({bytes}/{total_bytes}) {percent}%"
+            "{prefix:<10.cyan.bold} [{tag}] {wide_msg} ({bytes}/{total_bytes}) {percent}%"
         })
         .unwrap()
         .progress_chars("=> ")
