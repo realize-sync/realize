@@ -3,6 +3,10 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
+## Gate copy by file size {#sizegate}
+
+Instead of allowing one file to copy at a time, allow multiple for a total of up to CHUNK_SIZE bytes. A file > CHUNK_SIZE gets copied one at a time, but smaller files can be grouped together. Might be worth increasing the number of parallel files for that.
+
 ## IPV6 + IPV4 {#ipv64}
 
 Localhost is currently resolved to ipv6 address, which isn't what's
