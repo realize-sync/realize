@@ -15,29 +15,6 @@ have it work normally (try ipv6, fallback to ipv4).
 This is normally automatic, I expect, but the custom transformation to
 SocketAddr screws that up.
 
-## Fs design {#fs1}
-
-Design and write a fuse frontend to RealizeService that allows running
-basic operations. Extend RealizeService as needed.
-
-The frontend exposes all dirids at the root, which can contain / but
-cannot conflict (so no "test" and "test/a"), then all files inside and
-does that my making RPC calls to a RealizeService instance.
-
-The frontend use an in-memory map for keeping inode <-> dirid+path
-
-Missing operations:
- - list dirid
- - list directory content (not just everything in a dirid)
- - rename (even across dirids)
- - link (even across dirids)
- - mkdir/rmdir (now empty dirs exist!)
- - stat
- - fs stat
-
-Next step, expose a merged view of a RealizeService from two RealizeService, from within the server (server configuration, the fuse frontend doesn't know
-about that).
-
 ## Test retries {#testretries}
 
 Make it possible to intercept RealizeService operations in tests to test:
