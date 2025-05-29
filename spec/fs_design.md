@@ -17,7 +17,16 @@ demand only.
 
 Peers keep a local history of local modifications to both the Real and
 the Unreal (create, delete, rename, edit, overwrite) to be sent to
-other peers.
+other peers. History entries are ordered by time. History entries at
+or before T are deleted once all peers have caught up to T.
+
+If history grows too large before of a lagging peer, that peer can be
+marked inactive and older history entries deleted. Inactive peers will
+not be able to take part in consensus and will have to be treated as
+new peers.
+
+New peers start empty, so reaching consensus is trivial. Modifications
+can later be made to the peer.
 
 Extra operations are available on the files and directories of the
 filesystem to mark them as :
@@ -78,6 +87,15 @@ is only kept in the Real.
 
   - *Create* link a blob to a path
 
+  - *Consensus* is achieved for an area when all peers agree on the
+    set of paths the blob each path is assigned to.
+
+  - *Reaching Consensus* is the process of two peers sending their
+    changes and agreeing on the set of paths and the assigned blobs.
+
+  - *Conflict* is when two peers want to assign a different blob, or
+    no blobs at all, to the same path
+
 ## Details
 
 ### The Real
@@ -98,23 +116,38 @@ The Unreal contains remotely-available files, with, for each peer:
   size (+more information? what about duplicates?)
 
 While connected, the local server gets notified whenever files are
-added, removed or changed (with a delay to make sure file is stable).
-This way, the file list is always available locally.
+added, removed or changed, with a delay to make sure file is stable.
+This way, the file list is always available locally. Notifications are
+rate-limited and batched in case of heavy load.
 
 While disconnected, the local server can still serve the last known
-list of files, and the cached files.
+list of files, and the cached files. A batch of all history change is
+sent to a peer upon connection.
 
 Making change a file that's part of the Unreal moves it into the Real,
 like when deleting, renaming, overwriting or editing.
 
 File data that's part of the Unreal works as a cache: data that's
 worked on often is kept in cache, older data is evicted as needed to
-make space. The Real and the Unreal of an Area might compete for space
-(cache data might need to be removed to allow a Real file to be
-added.)
+make space. The Real and the Unreal of an Area compete for space, that
+is cache data might need to be removed to allow a Real file to be
+added. Real files take priority over cache content. This means that
+the cache can be filled up to the quota allocated for real files and
+cache data, as cache data can always be evicted to make space for real
+files when necessary.
 
-Different Areas might also compete for space, depending on the local
-settings.
+When multiple areas are supported, two modes are possible:
+
+ - different areas have shared quotas and caches; they must be
+   on the same filesystem for this to make sense
+
+ - different areas have separate quotas and caches
+
+Initial cache eviction stategy:
+ - LRU with priorities:
+   1. delete unlinked blob data (starting with least recently used)
+   2. delete linked blob data (starting with least recently used)
+Manual commands allow the cache to be cleared or shrunk.
 
 ### Local History
 
@@ -139,7 +172,49 @@ Consensus time can be:
 After consensus has been reached, a file that was Real can become
 Unreal, depending on the local settings and cache size.
 
-TODO: resolve conflicts during consensus.
+#### Conflict resolution
+
+Possible resolutions:
+
+ - Don't resolve conflicts at all, keep local modifications local and
+ provide remote modifications as alternatives
+
+ - Resolve conflicts automatically and silently by applying a rule
+ such as "most recent wins" (this unfortunately relies on local clocks
+ being set correctly)
+
+Whatever the solution, conflicting versions should be available,
+somehow, some ideas:
+
+ - Keep a "conflicts" subdirectory at the root, next to the areas.
+ Each conflicting file (area name + path) is a directory with all
+ versions available inside as peer + hash + ext, with their
+ modification time set.
+
+ - Provide a list of conflicts and access to the different versions in
+ a separate management interface.
+
+In addition, it would be possible to prevent a file from being edited
+locally - even a real file - until the change has been downloaded if a
+remote modification is known to exist. If the peer that made the
+change is not connectable, protection would change to read-only and
+(chmod +w) would override it. This could be a setting on real files.
+Such a behavior would be too surprising to be a good default for a
+file that's supposed to be local. It would fail rather easily,
+unfortunately, unless peers tend to remain connected.
+
+Unfortunately, this is a UI problem and filesystems don't really have
+much on an UI.
+
+Decision:
+
+ 1. start with "don't resolve conflict", so conflicting changes remain
+    available.
+
+ 2. add a "conflicts" subdirectory to list conflicts and make
+    alternatives available
+
+ 3. at this point, consider whether to switch to "most recent wins"
 
 ### Unreal → Real
 
@@ -174,34 +249,34 @@ a file, but only for a time (how long?)
 
 1. [redb](https://github.com/cberner/redb/tree/master)
 
-   - ➕ Maintained
-   - ➕ Simple, good performance
-   - ➕ Crash-safe
-   - ➕ Designed for a read-heavy workload
-   - ➕ Type-safe
+   - 👍 Maintained
+   - 👍 Simple, good performance
+   - 👍 Crash-safe
+   - 👍 Designed for a read-heavy workload
+   - 👍 Type-safe
 
 2. [sled](https://github.com/spacejam/sled)
 
-   - ➕ Maintained
-   - ➖ Being rewritten
-   - ➕ Powerful merge operators
-   - ➖ Regular fsync (every 500ms) for crash safetly
-   - ➖ Slightly worse performance than redb according to
+   - 👍 Maintained
+   - 🤦 Being rewritten
+   - 👍 Powerful merge operators
+   - 🤦 Regular fsync (every 500ms) for crash safetly
+   - 🤦 Slightly worse performance than redb according to
      [benchmarks](https://github.com/cberner/redb/tree/master?tab=readme-ov-file#benchmarks)
 
 ### FUSE library: fuse-backend-rs
 
 1. [fuse-backend-rs](https://github.com/cloud-hypervisor/fuse-backend-rs)
-   - ➕ Maintained
-   - ➕ Real usage
-   - ➕ Great passthrough support
-   - ➕ Sync and async
-   - ➖ Uses raw C types everywhere (for passthrough)
+   - 👍 Maintained
+   - 👍 Real usage
+   - 👍 Great passthrough support
+   - 👍 Sync and async
+   - 🤦 Uses raw C types everywhere (for passthrough)
 
 2. [fuse-rs](https://github.com/zargony/fuse-rs)
-   - ➕ Good rust types everywhere
-   - ➕ Easy to use
-   - ➖ Is it still maintained? Last commit was 5 years ago!
+   - 👍 Good rust types everywhere
+   - 👍 Easy to use
+   - 🤦 Is it still maintained? Last commit was 5 years ago!
 
 ### FUSE vs NFSv3
 
@@ -212,20 +287,34 @@ server, then bind it using existing OS tools.
 
 FUSE
 
- - ➕ Powerful
- - ➖ Linux-only, some support on MacOs, no support on Window
+ - 👍 Powerful
+ - 🤦 Linux-only, some support on MacOs, no support on Window
 
 NFSv3
 
- - ➖ Limited: no xattr, no file watch
- - ➖ Some apps that are storage-based don't work well on NFS, but
+ - 🤦 Limited: no xattr, no file watch
+ - 🤦 Some apps that are storage-based don't work well on NFS, but
    have no problems on a FUSE passthrough
+
+Decision: Implementation starts with FUSE, with a more limited NFSv3
+implementation planned later for better compatibility, for use in the
+cases where NFSv3 limitations are acceptable.
 
 ## Security
 
 Peers of a household know all other peers by their public key.
 Connections are made using TLS 1.3 with raw keys (ED25519). Both
 client and server only accept connections made with a known peer key.
+
+Cache and files belong to the user who's running the application and
+access is restricted to that used by the OS; no extra security
+guarantees is given on top of what the OS provides. The caches and the
+files should be stored in an encrypted filesystem by the OS for better
+privacy.
+
+Peers keeps a trimmed-down version of its history and of the history
+it's been sent by other peers in text mode as an audit log, with
+configurable storage location and retention.
 
 ## Testing
 
