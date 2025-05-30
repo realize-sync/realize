@@ -4,7 +4,8 @@
 //! rsync-based partial transfer, progress reporting, and error handling. It operates
 //! over the RealizeService trait and is designed to be robust and restartable.
 
-use crate::model::arena::Arena;
+use crate::model;
+use crate::model::Arena;
 use crate::network::rpc::realize::{
     Options, RangedHash, RealizeServiceClient, RealizeServiceError, RealizeServiceRequest,
     RealizeServiceResponse, SyncedFile,
@@ -14,8 +15,8 @@ use futures::future;
 use futures::stream::StreamExt as _;
 use futures::FutureExt;
 use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::{collections::HashMap, path::Path};
 use tarpc::client::stub::Stub;
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
@@ -102,7 +103,7 @@ pub enum ProgressEvent {
     /// Indicates a file is being processed (start), with its path and size.
     MovingFile {
         arena: Arena,
-        path: std::path::PathBuf,
+        path: model::Path,
         bytes: u64,
 
         /// Bytes already available, to be r-synced.
@@ -111,45 +112,45 @@ pub enum ProgressEvent {
     /// File is being verified (hash check).
     VerifyingFile {
         arena: Arena,
-        path: std::path::PathBuf,
+        path: model::Path,
     },
     /// File is being rsynced (diff/patch).
     RsyncingFile {
         arena: Arena,
-        path: std::path::PathBuf,
+        path: model::Path,
     },
     /// File is being copied (data transfer).
     CopyingFile {
         arena: Arena,
-        path: std::path::PathBuf,
+        path: model::Path,
     },
     /// File is waiting its turn to be copied.
     PendingFile {
         arena: Arena,
-        path: std::path::PathBuf,
+        path: model::Path,
     },
     /// Increment byte count for a file and overall progress.
     IncrementByteCount {
         arena: Arena,
-        path: std::path::PathBuf,
+        path: model::Path,
         bytecount: u64,
     },
     /// Decrement byte count for a file and overall progress, when
     /// retrying a range previously assumed to be correct.
     DecrementByteCount {
         arena: Arena,
-        path: std::path::PathBuf,
+        path: model::Path,
         bytecount: u64,
     },
     /// File was moved successfully.
     FileSuccess {
         arena: Arena,
-        path: std::path::PathBuf,
+        path: model::Path,
     },
     /// Moving the file failed.
     FileError {
         arena: Arena,
-        path: std::path::PathBuf,
+        path: model::Path,
         error: String,
     },
 }
@@ -236,7 +237,7 @@ where
                         (1, 0, 0)
                     }
                     Err(MoveFileError::Rpc(tarpc::client::RpcError::DeadlineExceeded)) => {
-                        log::debug!("{}/{}: Deadline exceeded", arena, file_path.display());
+                        log::debug!("{}/{}: Deadline exceeded", arena, file_path);
                         if let Some(tx) = &tx {
                             let _ = tx
                                 .send(ProgressEvent::FileError {
@@ -250,7 +251,7 @@ where
                         (0, 0, 1)
                     }
                     Err(ref err) => {
-                        log::debug!("{}/{}: {}", arena, file_path.display(), err);
+                        log::debug!("{}/{}: {}", arena, file_path, err);
                         if let Some(tx) = &tx {
                             let _ = tx
                                 .send(ProgressEvent::FileError {
@@ -300,10 +301,7 @@ where
     let src_files = src_files??;
     let dst_files = dst_files??;
 
-    let mut dst_map: HashMap<_, _> = dst_files
-        .into_iter()
-        .map(|f| (f.path.to_path_buf(), f))
-        .collect();
+    let mut dst_map: HashMap<_, _> = dst_files.into_iter().map(|f| (f.path.clone(), f)).collect();
 
     let files_to_sync = src_files
         .into_iter()
@@ -345,7 +343,7 @@ where
     U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
 {
     METRIC_FILE_START_COUNT.inc();
-    let path = src_file.path.as_path();
+    let path = src_file.path;
     let src_size = src_file.size;
     let dst_size = dst_file.as_ref().map(|f| f.size).unwrap_or(0);
     let arena = arena.clone();
@@ -364,7 +362,7 @@ where
             copy_file_range(
                 ctx,
                 &arena,
-                path,
+                &path,
                 src,
                 dst,
                 &progress_tx,
@@ -378,7 +376,7 @@ where
                 dst.truncate(
                     ctx,
                     arena.clone(),
-                    path.to_path_buf(),
+                    path.clone(),
                     src_file.size,
                     dst_options(),
                 )
@@ -392,7 +390,7 @@ where
             ctx,
             src,
             &arena,
-            path,
+            &path,
             src_size,
             HASH_FILE_CHUNK,
             src_options(),
@@ -403,8 +401,8 @@ where
 
     // 3. Check hash, return if succeeds
     let correct;
-    report_verifying(&progress_tx, &arena, path).await;
-    match check_hashes_and_delete(ctx, &src_hash, src_size, src, dst, &arena, path).await? {
+    report_verifying(&progress_tx, &arena, &path).await;
+    match check_hashes_and_delete(ctx, &src_hash, src_size, src, dst, &arena, &path).await? {
         HashCheck::Match => {
             return Ok(());
         }
@@ -427,11 +425,11 @@ where
         rsync_ranges,
         rsync_ranges.bytecount()
     );
-    report_decrement_bytecount(&progress_tx, &arena, path, rsync_ranges.bytecount()).await;
+    report_decrement_bytecount(&progress_tx, &arena, &path, rsync_ranges.bytecount()).await;
     rsync_file_range(
         ctx,
         &arena,
-        path,
+        &path,
         src,
         dst,
         &progress_tx,
@@ -444,7 +442,7 @@ where
     copy_file_range(
         ctx,
         &arena,
-        path,
+        &path,
         src,
         dst,
         &progress_tx,
@@ -454,8 +452,8 @@ where
     .await?;
 
     // 6. Check again against hash
-    report_verifying(&progress_tx, &arena, path).await;
-    match check_hashes_and_delete(ctx, &src_hash, src_size, src, dst, &arena, path).await? {
+    report_verifying(&progress_tx, &arena, &path).await;
+    match check_hashes_and_delete(ctx, &src_hash, src_size, src, dst, &arena, &path).await? {
         HashCheck::Mismatch { .. } => Err(MoveFileError::FailedToSync),
         HashCheck::Match => Ok(()),
     }
@@ -464,7 +462,7 @@ where
 async fn rsync_file_range<T, U>(
     ctx: tarpc::context::Context,
     arena: &Arena,
-    path: &Path,
+    path: &model::Path,
     src: &RealizeServiceClient<T>,
     dst: &RealizeServiceClient<U>,
     progress_tx: &Option<Sender<ProgressEvent>>,
@@ -486,7 +484,7 @@ where
             .calculate_signature(
                 ctx,
                 arena.clone(),
-                path.to_path_buf(),
+                path.clone(),
                 range.clone(),
                 dst_options(),
             )
@@ -495,7 +493,7 @@ where
             .diff(
                 ctx,
                 arena.clone(),
-                path.to_path_buf(),
+                path.clone(),
                 range.clone(),
                 sig,
                 src_options(),
@@ -512,7 +510,7 @@ where
             .apply_delta(
                 ctx,
                 arena.clone(),
-                path.to_path_buf(),
+                path.clone(),
                 range.clone(),
                 delta,
                 hash,
@@ -535,7 +533,7 @@ where
                 log::error!(
                     "{}/{}:{} hash mismatch after apply_delta, will copy",
                     arena,
-                    path.display(),
+                    path,
                     range,
                 );
                 METRIC_APPLY_DELTA_FALLBACK_COUNT.inc();
@@ -553,7 +551,7 @@ where
 async fn copy_file_range<T, U>(
     ctx: tarpc::context::Context,
     arena: &Arena,
-    path: &Path,
+    path: &model::Path,
     src: &RealizeServiceClient<T>,
     dst: &RealizeServiceClient<U>,
     progress_tx: &Option<Sender<ProgressEvent>>,
@@ -579,7 +577,7 @@ where
             .read(
                 ctx,
                 arena.clone(),
-                path.to_path_buf(),
+                path.clone(),
                 range.clone(),
                 src_options(),
             )
@@ -594,7 +592,7 @@ where
         dst.send(
             ctx,
             arena.clone(),
-            path.to_path_buf(),
+            path.clone(),
             range.clone(),
             data,
             dst_options(),
@@ -612,45 +610,61 @@ where
     Ok(())
 }
 
-async fn report_pending(progress_tx: &Option<Sender<ProgressEvent>>, arena: &Arena, path: &Path) {
+async fn report_pending(
+    progress_tx: &Option<Sender<ProgressEvent>>,
+    arena: &Arena,
+    path: &model::Path,
+) {
     if let Some(tx) = progress_tx {
         let _ = tx
             .send(ProgressEvent::PendingFile {
                 arena: arena.clone(),
-                path: path.to_path_buf(),
+                path: path.clone(),
             })
             .await;
     }
 }
 
-async fn report_copying(progress_tx: &Option<Sender<ProgressEvent>>, arena: &Arena, path: &Path) {
+async fn report_copying(
+    progress_tx: &Option<Sender<ProgressEvent>>,
+    arena: &Arena,
+    path: &model::Path,
+) {
     if let Some(tx) = progress_tx {
         let _ = tx
             .send(ProgressEvent::CopyingFile {
                 arena: arena.clone(),
-                path: path.to_path_buf(),
+                path: path.clone(),
             })
             .await;
     }
 }
 
-async fn report_rsyncing(progress_tx: &Option<Sender<ProgressEvent>>, arena: &Arena, path: &Path) {
+async fn report_rsyncing(
+    progress_tx: &Option<Sender<ProgressEvent>>,
+    arena: &Arena,
+    path: &model::Path,
+) {
     if let Some(tx) = progress_tx {
         let _ = tx
             .send(ProgressEvent::RsyncingFile {
                 arena: arena.clone(),
-                path: path.to_path_buf(),
+                path: path.clone(),
             })
             .await;
     }
 }
 
-async fn report_verifying(progress_tx: &Option<Sender<ProgressEvent>>, arena: &Arena, path: &Path) {
+async fn report_verifying(
+    progress_tx: &Option<Sender<ProgressEvent>>,
+    arena: &Arena,
+    path: &model::Path,
+) {
     if let Some(tx) = progress_tx {
         let _ = tx
             .send(ProgressEvent::VerifyingFile {
                 arena: arena.clone(),
-                path: path.to_path_buf(),
+                path: path.clone(),
             })
             .await;
     }
@@ -659,7 +673,7 @@ async fn report_verifying(progress_tx: &Option<Sender<ProgressEvent>>, arena: &A
 async fn report_increment_bytecount(
     progress_tx: &Option<Sender<ProgressEvent>>,
     arena: &Arena,
-    path: &Path,
+    path: &model::Path,
     bytecount: u64,
 ) {
     if bytecount == 0 {
@@ -669,7 +683,7 @@ async fn report_increment_bytecount(
         let _ = tx
             .send(ProgressEvent::IncrementByteCount {
                 arena: arena.clone(),
-                path: path.to_path_buf(),
+                path: path.clone(),
                 bytecount,
             })
             .await;
@@ -679,7 +693,7 @@ async fn report_increment_bytecount(
 async fn report_decrement_bytecount(
     progress_tx: &Option<Sender<ProgressEvent>>,
     arena: &Arena,
-    path: &Path,
+    path: &model::Path,
     bytecount: u64,
 ) {
     if bytecount == 0 {
@@ -689,7 +703,7 @@ async fn report_decrement_bytecount(
         let _ = tx
             .send(ProgressEvent::DecrementByteCount {
                 arena: arena.clone(),
-                path: path.to_path_buf(),
+                path: path.clone(),
                 bytecount,
             })
             .await;
@@ -701,7 +715,7 @@ pub(crate) async fn hash_file<T>(
     ctx: tarpc::context::Context,
     client: &RealizeServiceClient<T>,
     arena: &Arena,
-    relative_path: &std::path::Path,
+    relative_path: &model::Path,
     file_size: u64,
     chunk_size: u64,
     options: Options,
@@ -716,7 +730,7 @@ where
                     .hash(
                         ctx,
                         arena.clone(),
-                        relative_path.to_path_buf(),
+                        relative_path.clone(),
                         range.clone(),
                         options,
                     )
@@ -755,7 +769,7 @@ async fn check_hashes_and_delete<T, U>(
     src: &RealizeServiceClient<T>,
     dst: &RealizeServiceClient<U>,
     arena: &Arena,
-    path: &std::path::Path,
+    path: &model::Path,
 ) -> Result<HashCheck, MoveFileError>
 where
     T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
@@ -791,11 +805,11 @@ where
             partial_match: matches,
         });
     }
-    log::debug!("{}/{} MOVED", arena, path.display());
+    log::debug!("{}/{} MOVED", arena, path);
     // Hashes match, finish and delete
-    dst.finish(ctx, arena.clone(), path.to_path_buf(), dst_options())
+    dst.finish(ctx, arena.clone(), path.clone(), dst_options())
         .await??;
-    src.delete(ctx, arena.clone(), path.to_path_buf(), src_options())
+    src.delete(ctx, arena.clone(), path.clone(), src_options())
         .await??;
 
     METRIC_FILE_END_COUNT.with_label_values(&["Ok"]).inc();
@@ -805,7 +819,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::arena::{Arena, LocalArena, LocalArenas};
+    use crate::model::{Arena, LocalArena, LocalArenas};
     use crate::network::rpc::realize::server::{self};
     use crate::network::rpc::realize::Hash;
     use crate::utils::hash;
@@ -858,30 +872,30 @@ mod tests {
                 },
                 MovingFile {
                     arena: Arena::from("testdir"),
-                    path: PathBuf::from("foo"),
+                    path: model::Path::parse("foo")?,
                     bytes: 3,
                     available: 0
                 },
                 PendingFile {
                     arena: Arena::from("testdir"),
-                    path: PathBuf::from("foo")
+                    path: model::Path::parse("foo")?
                 },
                 CopyingFile {
                     arena: Arena::from("testdir"),
-                    path: PathBuf::from("foo")
+                    path: model::Path::parse("foo")?
                 },
                 IncrementByteCount {
                     arena: Arena::from("testdir"),
-                    path: PathBuf::from("foo"),
+                    path: model::Path::parse("foo")?,
                     bytecount: 3
                 },
                 VerifyingFile {
                     arena: Arena::from("testdir"),
-                    path: PathBuf::from("foo")
+                    path: model::Path::parse("foo")?
                 },
                 FileSuccess {
                     arena: Arena::from("testdir"),
-                    path: PathBuf::from("foo")
+                    path: model::Path::parse("foo")?
                 },
             ],
             events
@@ -934,30 +948,30 @@ mod tests {
                 },
                 MovingFile {
                     arena: Arena::from("testdir"),
-                    path: PathBuf::from("foo"),
+                    path: model::Path::parse("foo")?,
                     bytes: 9,
                     available: 3
                 },
                 PendingFile {
                     arena: Arena::from("testdir"),
-                    path: PathBuf::from("foo")
+                    path: model::Path::parse("foo")?
                 },
                 CopyingFile {
                     arena: Arena::from("testdir"),
-                    path: PathBuf::from("foo")
+                    path: model::Path::parse("foo")?
                 },
                 IncrementByteCount {
                     arena: Arena::from("testdir"),
-                    path: PathBuf::from("foo"),
+                    path: model::Path::parse("foo")?,
                     bytecount: 6
                 },
                 VerifyingFile {
                     arena: Arena::from("testdir"),
-                    path: PathBuf::from("foo")
+                    path: model::Path::parse("foo")?
                 },
                 FileSuccess {
                     arena: Arena::from("testdir"),
-                    path: PathBuf::from("foo")
+                    path: model::Path::parse("foo")?
                 },
             ],
             events
@@ -1010,48 +1024,48 @@ mod tests {
                 },
                 MovingFile {
                     arena: Arena::from("testdir"),
-                    path: PathBuf::from("foo"),
+                    path: model::Path::parse("foo")?,
                     bytes: 9,
                     available: 3
                 },
                 PendingFile {
                     arena: Arena::from("testdir"),
-                    path: PathBuf::from("foo")
+                    path: model::Path::parse("foo")?
                 },
                 CopyingFile {
                     arena: Arena::from("testdir"),
-                    path: PathBuf::from("foo")
+                    path: model::Path::parse("foo")?
                 },
                 IncrementByteCount {
                     arena: Arena::from("testdir"),
-                    path: PathBuf::from("foo"),
+                    path: model::Path::parse("foo")?,
                     bytecount: 6
                 },
                 VerifyingFile {
                     arena: Arena::from("testdir"),
-                    path: PathBuf::from("foo")
+                    path: model::Path::parse("foo")?
                 },
                 DecrementByteCount {
                     arena: Arena::from("testdir"),
-                    path: PathBuf::from("foo"),
+                    path: model::Path::parse("foo")?,
                     bytecount: 9
                 },
                 RsyncingFile {
                     arena: Arena::from("testdir"),
-                    path: PathBuf::from("foo")
+                    path: model::Path::parse("foo")?
                 },
                 IncrementByteCount {
                     arena: Arena::from("testdir"),
-                    path: PathBuf::from("foo"),
+                    path: model::Path::parse("foo")?,
                     bytecount: 9
                 },
                 VerifyingFile {
                     arena: Arena::from("testdir"),
-                    path: PathBuf::from("foo")
+                    path: model::Path::parse("foo")?
                 },
                 FileSuccess {
                     arena: Arena::from("testdir"),
-                    path: PathBuf::from("foo")
+                    path: model::Path::parse("foo")?
                 },
             ],
             events
@@ -1277,7 +1291,7 @@ mod tests {
             tarpc::context::current(),
             &server,
             &arena,
-            &PathBuf::from("somefile"),
+            &model::Path::parse("somefile")?,
             content.len() as u64,
             HASH_FILE_CHUNK,
             Options::default(),
@@ -1311,7 +1325,7 @@ mod tests {
             tarpc::context::current(),
             &server,
             &arena,
-            &PathBuf::from("somefile"),
+            &model::Path::parse("somefile")?,
             content.len() as u64,
             4,
             Options::default(),
@@ -1345,7 +1359,7 @@ mod tests {
             tarpc::context::current(),
             &server,
             &arena,
-            &PathBuf::from("somefile"),
+            &model::Path::parse("somefile")?,
             8,
             4,
             Options::default(),
@@ -1360,7 +1374,7 @@ mod tests {
     }
 
     /// Return the set of files in [dir] and their content.
-    fn snapshot_dir(dir: &Path) -> anyhow::Result<Vec<(PathBuf, String)>> {
+    fn snapshot_dir(dir: &std::path::Path) -> anyhow::Result<Vec<(PathBuf, String)>> {
         let mut result = vec![];
         for entry in WalkDir::new(dir).into_iter().flatten() {
             if !entry.path().is_file() {
@@ -1377,7 +1391,7 @@ mod tests {
     }
 
     /// Return the set of files in [dir] and their content (binary).
-    fn snapshot_dir_bin(dir: &Path) -> anyhow::Result<Vec<(PathBuf, Vec<u8>)>> {
+    fn snapshot_dir_bin(dir: &std::path::Path) -> anyhow::Result<Vec<(PathBuf, Vec<u8>)>> {
         let mut result = vec![];
         for entry in WalkDir::new(dir).into_iter().flatten() {
             if !entry.path().is_file() {

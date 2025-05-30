@@ -7,7 +7,8 @@ use std::sync::Arc;
 use assert_fs::prelude::*;
 use assert_fs::TempDir;
 use predicates::prelude::*;
-use realize_lib::model::arena::Arena;
+use realize_lib::model;
+use realize_lib::model::Arena;
 use realize_lib::network::rpc::realize::Options;
 use realize_lib::network::security;
 use realize_lib::network::security::PeerVerifier;
@@ -129,7 +130,7 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
         .await??;
     assert_unordered::assert_eq_unordered!(
         files.into_iter().map(|f| f.path).collect(),
-        vec![PathBuf::from("foo.txt")]
+        vec![model::Path::parse("foo.txt")?]
     );
 
     // Kill to make sure stderr ends

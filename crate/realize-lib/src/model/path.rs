@@ -7,7 +7,9 @@ use crate::errors::RealizeError;
 /// Arena paths are simple nonempty relative paths, with directories
 /// separated by / and without '.' or '..' or empty parts. Directory
 /// and file names must be valid unicode and not contain a colon.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
+)]
 pub struct Path(String);
 
 impl Path {
@@ -66,11 +68,11 @@ impl Path {
     ///
     /// Return a non-empty parent path or None.
     pub fn parent(&self) -> Option<Path> {
-        self.0
-            .rsplit('/')
-            .skip(1)
-            .next()
-            .map(|s| Path(s.to_string()))
+        if let Some(slash) = self.0.rfind('/') {
+            Some(Path(self.0[0..slash].to_string()))
+        } else {
+            None
+        }
     }
 
     /// Return this path as a real path.
@@ -223,8 +225,13 @@ mod tests {
 
     #[test]
     fn parent() -> anyhow::Result<()> {
-        assert_eq!(Some(Path::parse("foo")?), Path::parse("foo/bar")?.parent());
-        assert_eq!(None, Path::parse("foo")?.parent());
+        assert_eq!(
+            Some(Path::parse("a/b/c")?),
+            Path::parse("a/b/c/d")?.parent()
+        );
+        assert_eq!(Some(Path::parse("a/b")?), Path::parse("a/b/c")?.parent());
+        assert_eq!(Some(Path::parse("a")?), Path::parse("a/b")?.parent());
+        assert_eq!(None, Path::parse("a")?.parent());
 
         Ok(())
     }

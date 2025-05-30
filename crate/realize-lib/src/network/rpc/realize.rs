@@ -8,9 +8,8 @@
 pub mod metrics;
 pub mod server;
 
-use std::path::PathBuf;
-
-use crate::model::arena::Arena;
+use crate::model;
+use crate::model::Arena;
 use crate::utils::byterange::{ByteRange, ByteRanges};
 use base64::Engine as _;
 
@@ -23,7 +22,7 @@ pub struct SyncedFile {
     /// Relative path to a file within the directory.
     ///
     /// Absolute paths and .. are not supported.
-    pub path: PathBuf,
+    pub path: model::Path,
 
     /// Size of the file on the current instance, in bytes.
     pub size: u64,
@@ -129,7 +128,7 @@ pub trait RealizeService {
     /// Send a byte range of a file.
     async fn send(
         arena: Arena,
-        relative_path: PathBuf,
+        relative_path: model::Path,
         range: ByteRange,
         data: Vec<u8>,
         options: Options,
@@ -140,29 +139,31 @@ pub trait RealizeService {
     /// Data outside of the range [0, file_size) is returned filled with 0.
     async fn read(
         arena: Arena,
-        relative_path: PathBuf,
+        relative_path: model::Path,
         range: ByteRange,
         options: Options,
     ) -> Result<Vec<u8>>;
 
     /// Mark a partial file as complete
-    async fn finish(arena: Arena, relative_path: PathBuf, options: Options) -> Result<()>;
+    async fn finish(arena: Arena, relative_path: model::Path, options: Options)
+        -> Result<()>;
 
     /// Compute a SHA-256 hash of the file at the given path (final or partial).
     async fn hash(
         arena: Arena,
-        relative_path: PathBuf,
+        relative_path: model::Path,
         range: ByteRange,
         options: Options,
     ) -> Result<Hash>;
 
     /// Delete the file at the given path (both partial and final forms).
-    async fn delete(arena: Arena, relative_path: PathBuf, options: Options) -> Result<()>;
+    async fn delete(arena: Arena, relative_path: model::Path, options: Options)
+        -> Result<()>;
 
     /// Calculate a signature for the file at the given path and byte range.
     async fn calculate_signature(
         arena: Arena,
-        relative_path: PathBuf,
+        relative_path: model::Path,
         range: ByteRange,
         options: Options,
     ) -> Result<Signature>;
@@ -172,7 +173,7 @@ pub trait RealizeService {
     /// Returns the delta and the hash of the data used to compute it.
     async fn diff(
         arena: Arena,
-        relative_path: PathBuf,
+        relative_path: model::Path,
         range: ByteRange,
         signature: Signature,
         options: Options,
@@ -184,7 +185,7 @@ pub trait RealizeService {
     /// applying the patch, the data doesn't match the given hash.
     async fn apply_delta(
         arena: Arena,
-        relative_path: PathBuf,
+        relative_path: model::Path,
         range: ByteRange,
         delta: Delta,
         hash: Hash,
@@ -194,7 +195,7 @@ pub trait RealizeService {
     /// Truncate file to the given size.
     async fn truncate(
         arena: Arena,
-        relative_path: PathBuf,
+        relative_path: model::Path,
         file_size: u64,
         options: Options,
     ) -> Result<()>;

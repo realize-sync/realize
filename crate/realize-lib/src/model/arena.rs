@@ -9,7 +9,9 @@ use std::{
 /// This types is an identifier. An arena is identified by its name,
 /// which must be unique and known to all peers that want to share
 /// data.
-#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
 pub struct Arena {
     name: String,
 }
@@ -40,7 +42,7 @@ impl Arena {
 }
 
 /// Local location of a shared [Arena].
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub struct LocalArena {
     arena: Arena,
     path: PathBuf,

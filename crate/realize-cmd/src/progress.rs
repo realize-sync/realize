@@ -1,10 +1,10 @@
 use console::style;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use realize_lib::model::arena::Arena;
 use realize_lib::logic::consensus::movedirs::ProgressEvent;
+use realize_lib::model;
+use realize_lib::model::Arena;
 use realize_lib::network::tcp::ClientConnectionState;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use tokio::sync::mpsc::Receiver;
 
 pub(crate) struct CliProgress {
@@ -77,14 +77,14 @@ impl CliProgress {
     fn for_file(
         &mut self,
         arena: &Arena,
-        path: &std::path::Path,
+        path: &model::Path,
         bytes: u64,
         available: u64,
     ) -> CliFileProgress {
         let path = if self.should_show_dir {
-            format!("{}/{}", arena, path.display())
+            format!("{}/{}", arena, path)
         } else {
-            format!("{}", path.display())
+            format!("{}", path)
         };
         log::info!(
             "Preparing to move {} ({}/{})",
@@ -160,7 +160,8 @@ impl CliProgress {
         mut dst_watch_rx: tokio::sync::watch::Receiver<ClientConnectionState>,
     ) {
         use ProgressEvent::*;
-        let mut file_progress_map: HashMap<(Arena, PathBuf), CliFileProgress> = HashMap::new();
+        let mut file_progress_map: HashMap<(Arena, model::Path), CliFileProgress> =
+            HashMap::new();
 
         self.set_connection_state(
             *src_watch_rx.borrow_and_update(),

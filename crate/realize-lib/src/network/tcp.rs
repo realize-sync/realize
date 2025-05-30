@@ -27,7 +27,7 @@ use tarpc::server::{BaseChannel, Channel};
 use tarpc::tokio_serde::formats::Bincode;
 use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
 
-use crate::model::arena::LocalArenas;
+use crate::model::LocalArenas;
 use crate::network::rate_limit::RateLimitedStream;
 use crate::network::reconnect::Connect;
 use crate::network::reconnect::Reconnect;
@@ -334,7 +334,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
-    use crate::model::arena::Arena;
+    use crate::model::Arena;
     use crate::network::rpc::realize::{Config, Options};
     use crate::utils::async_utils::AbortOnDrop;
     use assert_fs::TempDir;
