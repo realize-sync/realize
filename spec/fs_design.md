@@ -224,6 +224,24 @@ Once fully available, it is realized, that is, turned into a file.
 When a file is needed, it *might* be fully downloaded and turned into
 a file, but only for a time (how long?)
 
+## Milestones
+
+1. Move files from one peer to the other (current as of 2025-05-29)
+
+2. A passthrough filesystem that makes the real layer of areas
+   available, tracks history for peers. On Consensus time (started
+   manually), path (re)assignments and blobs from history.
+
+3. Add unreal layer to filesystem. Track remove file list locally.
+   Unreal files can be read, but that requires network access. History
+   is sent to connected peers as soon as possible. Consensus remains a
+   manual operation; conflicts are not resolved and blobs assigned to
+   paths just diverge, as conflicting changes stay local.
+
+4. Add cache to unreal layer.
+
+5. …
+
 ## Components and layers {#layers}
 
 ```
@@ -308,25 +326,6 @@ crate/
        └─ util/                    Random layer-agnostic utilities
 
 ```
-
-## Milestones
-
-1. Move files from one peer to the other (current as of 2025-05-29)
-
-2. A passthrough filesystem that makes the real layer of areas
-   available, tracks history for peers. On Consensus time (started
-   manually), path (re)assignments and blobs from history.
-
-3. Add unreal layer to filesystem. Track remove file list locally.
-   Unreal files can be read, but that requires network access. History
-   is sent to connected peers as soon as possible. Consensus remains a
-   manual operation; conflicts are not resolved and blobs assigned to
-   paths just diverge, as conflicting changes stay local.
-
-4. Add cache to unreal layer.
-
-5. …
-
 
 ## Choices
 
