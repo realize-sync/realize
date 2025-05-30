@@ -27,8 +27,8 @@ use tarpc::server::{BaseChannel, Channel};
 use tarpc::tokio_serde::formats::Bincode;
 use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
 
-use crate::client::reconnect::Connect;
-use crate::client::reconnect::Reconnect;
+use crate::network::reconnect::Connect;
+use crate::network::reconnect::Reconnect;
 use crate::network::services::realize::metrics;
 use crate::network::services::realize::metrics::MetricsRealizeClient;
 use crate::network::services::realize::metrics::MetricsRealizeServer;
