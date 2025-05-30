@@ -9,7 +9,7 @@ use crate::network::rpc::realize::metrics::{self, MetricsRealizeClient, MetricsR
 use crate::network::rpc::realize::Options;
 use crate::network::rpc::realize::{Config, Hash};
 use crate::network::rpc::realize::{
-    RealizeError, RealizeService, Result, RsyncOperation, SyncedFile, SyncedFileState,
+    RealizeService, RealizeServiceError, Result, RsyncOperation, SyncedFile, SyncedFileState,
 };
 use crate::network::rpc::realize::{
     RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse,
@@ -91,9 +91,9 @@ impl RealizeServer {
     }
 
     fn find_directory(&self, arena: &Arena) -> Result<&Arc<LocalArena>> {
-        self.dirs
-            .get(arena)
-            .ok_or_else(|| RealizeError::BadRequest(format!("Unknown directory \"{}\"", arena)))
+        self.dirs.get(arena).ok_or_else(|| {
+            RealizeServiceError::BadRequest(format!("Unknown directory \"{}\"", arena))
+        })
     }
 
     /// Create an in-process RealizeServiceClient for this server instance.
@@ -145,7 +145,7 @@ impl RealizeService for RealizeServer {
                 }
             }
 
-            Ok::<Vec<SyncedFile>, RealizeError>(files.into_values().collect())
+            Ok::<Vec<SyncedFile>, RealizeServiceError>(files.into_values().collect())
         })
         .await?
     }
@@ -196,7 +196,7 @@ impl RealizeService for RealizeServer {
         let dir = self.find_directory(&arena)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
         if options.ignore_partial {
-            return Err(RealizeError::BadRequest(
+            return Err(RealizeServiceError::BadRequest(
                 "Invalid option for finish: ignore_partial=true".to_string(),
             ));
         }
@@ -311,12 +311,12 @@ impl RealizeService for RealizeServer {
         let mut out = Vec::new();
         rsync_apply_limited(&base, &delta.0, &mut out, range.bytecount() as usize)?;
         if out.len() as u64 != range.bytecount() {
-            return Err(RealizeError::BadRequest(
+            return Err(RealizeServiceError::BadRequest(
                 "Delta output size mismatch".to_string(),
             ));
         }
         if hash::digest(&out) != hash {
-            return Err(RealizeError::HashMismatch);
+            return Err(RealizeServiceError::HashMismatch);
         }
         write_at_offset(&mut file, range.start, &out).await?;
 
@@ -476,9 +476,9 @@ impl LogicalPath {
     ///
     /// The given path must be relative and cannot reference any
     /// hidden directory or file.
-    fn new(dir: &Arc<LocalArena>, path: &Path) -> std::result::Result<Self, RealizeError> {
+    fn new(dir: &Arc<LocalArena>, path: &Path) -> std::result::Result<Self, RealizeServiceError> {
         if path.as_os_str().is_empty() {
-            return Err(RealizeError::BadRequest(
+            return Err(RealizeServiceError::BadRequest(
                 "Invalid Relative path; empty".to_string(),
             ));
         }
@@ -486,7 +486,7 @@ impl LogicalPath {
             match component {
                 std::path::Component::Normal(_) => {}
                 _ => {
-                    return Err(RealizeError::BadRequest(
+                    return Err(RealizeServiceError::BadRequest(
                         "Invalid relative path".to_string(),
                     ));
                 }
@@ -566,7 +566,7 @@ impl LogicalPath {
     }
 }
 
-impl From<walkdir::Error> for RealizeError {
+impl From<walkdir::Error> for RealizeServiceError {
     fn from(err: walkdir::Error) -> Self {
         if err.io_error().is_some() {
             // We know err contains an io error; unwrap will succeed.
@@ -577,27 +577,27 @@ impl From<walkdir::Error> for RealizeError {
     }
 }
 
-impl From<JoinError> for RealizeError {
+impl From<JoinError> for RealizeServiceError {
     fn from(err: JoinError) -> Self {
         anyhow::Error::new(err).into()
     }
 }
 
 // Add error conversions for fast_rsync errors
-impl From<fast_rsync::DiffError> for RealizeError {
+impl From<fast_rsync::DiffError> for RealizeServiceError {
     fn from(e: fast_rsync::DiffError) -> Self {
-        RealizeError::Rsync(RsyncOperation::Diff, e.to_string())
+        RealizeServiceError::Rsync(RsyncOperation::Diff, e.to_string())
     }
 }
-impl From<fast_rsync::ApplyError> for RealizeError {
+impl From<fast_rsync::ApplyError> for RealizeServiceError {
     fn from(e: fast_rsync::ApplyError) -> Self {
-        RealizeError::Rsync(RsyncOperation::Apply, e.to_string())
+        RealizeServiceError::Rsync(RsyncOperation::Apply, e.to_string())
     }
 }
 
-impl From<fast_rsync::SignatureParseError> for RealizeError {
+impl From<fast_rsync::SignatureParseError> for RealizeServiceError {
     fn from(e: fast_rsync::SignatureParseError) -> Self {
-        RealizeError::Rsync(RsyncOperation::Sign, e.to_string())
+        RealizeServiceError::Rsync(RsyncOperation::Sign, e.to_string())
     }
 }
 
@@ -737,7 +737,7 @@ mod tests {
             LogicalPath::new(&dir, &PathBuf::from("notfound.txt"))?
                 .find(&opts)
                 .await,
-            Err(RealizeError::Io(_))
+            Err(RealizeServiceError::Io(_))
         ));
 
         Ok(())
@@ -809,21 +809,21 @@ mod tests {
         let empty = PathBuf::from("");
         assert!(matches!(
             LogicalPath::new(&dir, &empty),
-            Err(RealizeError::BadRequest(_))
+            Err(RealizeServiceError::BadRequest(_))
         ));
 
         // Absolute path
         let abs = PathBuf::from("/foo/bar.txt");
         assert!(matches!(
             LogicalPath::new(&dir, &abs),
-            Err(RealizeError::BadRequest(_))
+            Err(RealizeServiceError::BadRequest(_))
         ));
 
         // Path with '..'
         let dotdot = PathBuf::from("foo/../bar.txt");
         assert!(matches!(
             LogicalPath::new(&dir, &dotdot),
-            Err(RealizeError::BadRequest(_))
+            Err(RealizeServiceError::BadRequest(_))
         ));
 
         // Valid path

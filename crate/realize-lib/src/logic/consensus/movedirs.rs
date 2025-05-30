@@ -6,7 +6,7 @@
 
 use crate::config::Arena;
 use crate::network::rpc::realize::{
-    Options, RangedHash, RealizeError, RealizeServiceClient, RealizeServiceRequest,
+    Options, RangedHash, RealizeServiceClient, RealizeServiceError, RealizeServiceRequest,
     RealizeServiceResponse, SyncedFile,
 };
 use crate::utils::byterange::{ByteRange, ByteRanges};
@@ -530,7 +530,7 @@ where
                 log::debug!("{}/{:?} INC {}", &arena, path, range.bytecount());
                 report_increment_bytecount(&progress_tx, &arena, path, range.bytecount()).await;
             }
-            Err(RealizeError::HashMismatch) => {
+            Err(RealizeServiceError::HashMismatch) => {
                 copy_ranges.add(&range);
                 log::error!(
                     "{}/{}:{} hash mismatch after apply_delta, will copy",
@@ -645,11 +645,7 @@ async fn report_rsyncing(progress_tx: &Option<Sender<ProgressEvent>>, arena: &Ar
     }
 }
 
-async fn report_verifying(
-    progress_tx: &Option<Sender<ProgressEvent>>,
-    arena: &Arena,
-    path: &Path,
-) {
+async fn report_verifying(progress_tx: &Option<Sender<ProgressEvent>>, arena: &Arena, path: &Path) {
     if let Some(tx) = progress_tx {
         let _ = tx
             .send(ProgressEvent::VerifyingFile {
@@ -1406,7 +1402,7 @@ pub enum MoveFileError {
     #[error("RPC error: {0}")]
     Rpc(#[from] tarpc::client::RpcError),
     #[error("Remote Error: {0}")]
-    Realize(#[from] RealizeError),
+    Realize(#[from] RealizeServiceError),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("Data still inconsistent after sync")]

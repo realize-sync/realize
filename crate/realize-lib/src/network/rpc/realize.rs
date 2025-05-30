@@ -15,7 +15,7 @@ use crate::utils::byterange::{ByteRange, ByteRanges};
 use base64::Engine as _;
 
 /// Convenient shortcut for results containing [RealizeError].
-pub type Result<T> = std::result::Result<T, RealizeError>;
+pub type Result<T> = std::result::Result<T, RealizeServiceError>;
 
 /// A file that can be synced through the service, within a directory.
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -207,7 +207,7 @@ pub trait RealizeService {
 ///
 /// This is limited, to remain usable through a RPC.
 #[derive(thiserror::Error, Debug, serde::Serialize, serde::Deserialize)]
-pub enum RealizeError {
+pub enum RealizeServiceError {
     /// Returned by the RealizeService when given an invalid request.
     #[error("Bad request: {0}")]
     BadRequest(String),
@@ -234,15 +234,15 @@ pub enum RsyncOperation {
     Sign,
 }
 
-impl From<std::io::Error> for RealizeError {
+impl From<std::io::Error> for RealizeServiceError {
     fn from(value: std::io::Error) -> Self {
-        RealizeError::Io(value.to_string())
+        RealizeServiceError::Io(value.to_string())
     }
 }
 
-impl From<anyhow::Error> for RealizeError {
+impl From<anyhow::Error> for RealizeServiceError {
     fn from(value: anyhow::Error) -> Self {
-        RealizeError::Other(value.to_string())
+        RealizeServiceError::Other(value.to_string())
     }
 }
 

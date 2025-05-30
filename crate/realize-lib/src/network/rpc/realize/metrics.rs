@@ -16,19 +16,21 @@ use std::time::Instant;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use prometheus::{
-    Encoder, HistogramVec, IntCounterVec, IntGauge, register_histogram_vec,
-    register_int_counter_vec, register_int_gauge,
+    register_histogram_vec, register_int_counter_vec, register_int_gauge, Encoder, HistogramVec,
+    IntCounterVec, IntGauge,
 };
 use tarpc::{
-    ServerError,
-    client::{RpcError, stub::Stub},
+    client::{stub::Stub, RpcError},
     context::Context,
     server::Serve,
+    ServerError,
 };
 use tokio::net::TcpListener;
 
+use crate::network::rpc::realize::{
+    RealizeServiceError, RealizeServiceRequest, RealizeServiceResponse,
+};
 use crate::utils::byterange::ByteRange;
-use crate::network::rpc::realize::{RealizeError, RealizeServiceRequest, RealizeServiceResponse};
 
 lazy_static::lazy_static! {
     pub(crate) static ref METRIC_SERVER_DATA_IN_BYTES: HistogramVec =
@@ -154,7 +156,7 @@ fn error_label_server(res: &Result<RealizeServiceResponse, ServerError>) -> &'st
 }
 
 /// Extract an error from a [RealizeServiceResponse].
-fn realize_error(res: &RealizeServiceResponse) -> Option<&RealizeError> {
+fn realize_error(res: &RealizeServiceResponse) -> Option<&RealizeServiceError> {
     match res {
         RealizeServiceResponse::List(Err(err)) => Some(err),
         RealizeServiceResponse::Send(Err(err)) => Some(err),
@@ -182,13 +184,13 @@ fn realize_error(res: &RealizeServiceResponse) -> Option<&RealizeError> {
 }
 
 /// Label that describes a [RealizeError] in metrics.
-fn realize_error_label(err: &RealizeError) -> &'static str {
+fn realize_error_label(err: &RealizeServiceError) -> &'static str {
     match err {
-        RealizeError::BadRequest(_) => "BadRequest",
-        RealizeError::Io(_) => "Io",
-        RealizeError::Rsync(_, _) => "Rsync",
-        RealizeError::Other(_) => "Other",
-        RealizeError::HashMismatch => "HashMismatch",
+        RealizeServiceError::BadRequest(_) => "BadRequest",
+        RealizeServiceError::Io(_) => "Io",
+        RealizeServiceError::Rsync(_, _) => "Rsync",
+        RealizeServiceError::Other(_) => "Other",
+        RealizeServiceError::HashMismatch => "HashMismatch",
     }
 }
 
