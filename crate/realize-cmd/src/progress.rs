@@ -1,6 +1,6 @@
 use console::style;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use realize_lib::algo::ProgressEvent;
+use realize_lib::logic::consensus::movedirs::ProgressEvent;
 use realize_lib::model::service::DirectoryId;
 use realize_lib::transport::tcp::ClientConnectionState;
 use std::collections::HashMap;

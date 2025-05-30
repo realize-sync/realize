@@ -7,7 +7,7 @@ use console::style;
 use indicatif::HumanBytes;
 use progress::CliProgress;
 use prometheus::{IntCounter, register_int_counter};
-use realize_lib::algo::MoveFileError;
+use realize_lib::logic::consensus::movedirs::MoveFileError;
 use realize_lib::metrics;
 use realize_lib::model::service::DirectoryId;
 use realize_lib::transport::security::{self, PeerVerifier};
@@ -226,7 +226,7 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
             let mut total_error = 0;
             let mut total_interrupted = 0;
             let mut interrupted = false;
-            let result = realize_lib::algo::move_dirs(
+            let result = realize_lib::logic::consensus::movedirs::move_dirs(
                 ctx,
                 &src_client,
                 &dst_client,

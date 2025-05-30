@@ -1,15 +1,15 @@
-use assert_fs::TempDir;
 use assert_fs::prelude::*;
+use assert_fs::TempDir;
 use prometheus::proto::MetricType;
-use realize_lib::algo;
-use realize_lib::algo::METRIC_END_COUNT;
-use realize_lib::algo::METRIC_FILE_END_COUNT;
-use realize_lib::algo::METRIC_FILE_START_COUNT;
-use realize_lib::algo::METRIC_RANGE_READ_BYTES;
-use realize_lib::algo::METRIC_RANGE_WRITE_BYTES;
-use realize_lib::algo::METRIC_READ_BYTES;
-use realize_lib::algo::METRIC_START_COUNT;
-use realize_lib::algo::METRIC_WRITE_BYTES;
+use realize_lib::logic::consensus::movedirs;
+use realize_lib::logic::consensus::movedirs::METRIC_END_COUNT;
+use realize_lib::logic::consensus::movedirs::METRIC_FILE_END_COUNT;
+use realize_lib::logic::consensus::movedirs::METRIC_FILE_START_COUNT;
+use realize_lib::logic::consensus::movedirs::METRIC_RANGE_READ_BYTES;
+use realize_lib::logic::consensus::movedirs::METRIC_RANGE_WRITE_BYTES;
+use realize_lib::logic::consensus::movedirs::METRIC_READ_BYTES;
+use realize_lib::logic::consensus::movedirs::METRIC_START_COUNT;
+use realize_lib::logic::consensus::movedirs::METRIC_WRITE_BYTES;
 use realize_lib::model::service::{DirectoryId, Options};
 use realize_lib::server::{self, DirectoryMap, InProcessRealizeServiceClient};
 use std::sync::Arc;
@@ -55,16 +55,14 @@ async fn client_error_call_count() -> anyhow::Result<()> {
             ("error", "BadRequest"),
         ],
     );
-    assert!(
-        client
-            .list(
-                tarpc::context::current(),
-                DirectoryId::from("doesnotexist"),
-                Options::default(),
-            )
-            .await?
-            .is_err()
-    );
+    assert!(client
+        .list(
+            tarpc::context::current(),
+            DirectoryId::from("doesnotexist"),
+            Options::default(),
+        )
+        .await?
+        .is_err());
     let after_err = get_metric_value(
         "realize_client_call_count",
         &[
@@ -112,16 +110,14 @@ async fn server_error_call_count() -> anyhow::Result<()> {
             ("error", "BadRequest"),
         ],
     );
-    assert!(
-        client
-            .list(
-                tarpc::context::current(),
-                DirectoryId::from("doesnotexist"),
-                Options::default(),
-            )
-            .await?
-            .is_err()
-    );
+    assert!(client
+        .list(
+            tarpc::context::current(),
+            DirectoryId::from("doesnotexist"),
+            Options::default(),
+        )
+        .await?
+        .is_err());
     let after_srv_err = get_metric_value(
         "realize_server_call_count",
         &[
@@ -159,7 +155,7 @@ async fn move_files_metrics() -> anyhow::Result<()> {
         &DirectoryId::from("testdir"),
         dst_temp.path(),
     ));
-    let (success, error, _interrupted) = algo::move_dir(
+    let (success, error, _interrupted) = movedirs::move_dir(
         tarpc::context::current(),
         &server::create_inprocess_client(DirectoryMap::for_dir(src_dir.id(), src_dir.path())),
         &server::create_inprocess_client(DirectoryMap::for_dir(dst_dir.id(), dst_dir.path())),
