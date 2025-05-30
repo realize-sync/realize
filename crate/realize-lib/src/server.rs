@@ -6,7 +6,7 @@
 
 use crate::utils::hash;
 use crate::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
-use crate::model::byterange::ByteRange;
+use crate::utils::byterange::ByteRange;
 use crate::network::services::realize::Options;
 use crate::network::services::realize::{Config, Hash};
 use crate::network::services::realize::{

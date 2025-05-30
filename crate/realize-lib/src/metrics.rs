@@ -27,7 +27,7 @@ use tarpc::{
 };
 use tokio::net::TcpListener;
 
-use crate::model::byterange::ByteRange;
+use crate::utils::byterange::ByteRange;
 use crate::network::services::realize::{RealizeError, RealizeServiceRequest, RealizeServiceResponse};
 
 lazy_static::lazy_static! {

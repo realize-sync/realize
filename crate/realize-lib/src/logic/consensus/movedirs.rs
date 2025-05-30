@@ -4,7 +4,7 @@
 //! rsync-based partial transfer, progress reporting, and error handling. It operates
 //! over the RealizeService trait and is designed to be robust and restartable.
 
-use crate::model::byterange::{ByteRange, ByteRanges};
+use crate::utils::byterange::{ByteRange, ByteRanges};
 use crate::network::services::realize::{
     DirectoryId, Options, RangedHash, RealizeError, RealizeServiceClient, RealizeServiceRequest,
     RealizeServiceResponse, SyncedFile,

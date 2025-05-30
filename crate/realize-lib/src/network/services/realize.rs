@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use crate::model::byterange::{ByteRange, ByteRanges};
+use crate::utils::byterange::{ByteRange, ByteRanges};
 use base64::Engine as _;
 
 /// Convenient shortcut for results containing [RealizeError].
