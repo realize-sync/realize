@@ -6,7 +6,7 @@ use hyper_util::rt::TokioIo;
 use realize_lib::network::services::realize::DirectoryId;
 use realize_lib::server::DirectoryMap;
 use realize_lib::network::security::{self, PeerVerifier};
-use realize_lib::transport::tcp::{self, HostPort};
+use realize_lib::network::tcp::{self, HostPort};
 use realize_lib::utils::async_utils::AbortOnDrop;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};

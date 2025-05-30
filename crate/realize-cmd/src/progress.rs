@@ -2,7 +2,7 @@ use console::style;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use realize_lib::logic::consensus::movedirs::ProgressEvent;
 use realize_lib::network::services::realize::DirectoryId;
-use realize_lib::transport::tcp::ClientConnectionState;
+use realize_lib::network::tcp::ClientConnectionState;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::sync::mpsc::Receiver;
@@ -120,7 +120,7 @@ impl CliProgress {
         src_state: ClientConnectionState,
         dst_state: ClientConnectionState,
     ) {
-        use realize_lib::transport::tcp::ClientConnectionState::*;
+        use realize_lib::network::tcp::ClientConnectionState::*;
 
         let old_state = self.connection_state;
         self.connection_state = match (src_state, dst_state) {
@@ -140,7 +140,7 @@ impl CliProgress {
     }
 
     fn update_overall_prefix(&self) {
-        use realize_lib::transport::tcp::ClientConnectionState::*;
+        use realize_lib::network::tcp::ClientConnectionState::*;
         self.overall_pb.set_prefix(match self.connection_state {
             NotConnected | Connecting => "Connecting",
             Connected => {

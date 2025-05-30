@@ -10,7 +10,7 @@ use predicates::prelude::*;
 use realize_lib::network::services::realize::{DirectoryId, Options};
 use realize_lib::network::security;
 use realize_lib::network::security::PeerVerifier;
-use realize_lib::transport::tcp::{self, HostPort};
+use realize_lib::network::tcp::{self, HostPort};
 use reqwest::Client;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::SubjectPublicKeyInfoDer;
@@ -92,7 +92,7 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
         .command()
         .env(
             "RUST_LOG",
-            "realize_lib::transport::tcp=debug,realize_daemon=debug",
+            "realize_lib::network::tcp=debug,realize_daemon=debug",
         )
         .spawn()?;
 

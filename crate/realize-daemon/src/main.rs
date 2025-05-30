@@ -6,7 +6,7 @@ use prometheus::{IntCounter, register_int_counter};
 use realize_lib::metrics;
 use realize_lib::server::{Directory, DirectoryMap};
 use realize_lib::network::security::{self, PeerVerifier};
-use realize_lib::transport::tcp::{self, HostPort};
+use realize_lib::network::tcp::{self, HostPort};
 use realize_lib::utils::logging;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
