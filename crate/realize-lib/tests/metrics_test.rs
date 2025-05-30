@@ -10,7 +10,7 @@ use realize_lib::logic::consensus::movedirs::METRIC_RANGE_WRITE_BYTES;
 use realize_lib::logic::consensus::movedirs::METRIC_READ_BYTES;
 use realize_lib::logic::consensus::movedirs::METRIC_START_COUNT;
 use realize_lib::logic::consensus::movedirs::METRIC_WRITE_BYTES;
-use realize_lib::model::service::{DirectoryId, Options};
+use realize_lib::network::services::realize::{DirectoryId, Options};
 use realize_lib::server::{self, DirectoryMap, InProcessRealizeServiceClient};
 use std::sync::Arc;
 

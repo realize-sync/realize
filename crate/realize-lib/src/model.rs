@@ -4,4 +4,3 @@
 //! - `byterange`: Byte range and range set types for efficient file operations.
 //! - `service`: Service trait, error types, and protocol structures.
 pub mod byterange;
-pub mod service;

@@ -28,7 +28,7 @@ use tarpc::{
 use tokio::net::TcpListener;
 
 use crate::model::byterange::ByteRange;
-use crate::model::service::{RealizeError, RealizeServiceRequest, RealizeServiceResponse};
+use crate::network::services::realize::{RealizeError, RealizeServiceRequest, RealizeServiceResponse};
 
 lazy_static::lazy_static! {
     pub(crate) static ref METRIC_SERVER_DATA_IN_BYTES: HistogramVec =

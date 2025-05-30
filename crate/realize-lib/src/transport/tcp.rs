@@ -32,10 +32,10 @@ use crate::client::reconnect::Reconnect;
 use crate::metrics;
 use crate::metrics::MetricsRealizeClient;
 use crate::metrics::MetricsRealizeServer;
-use crate::model::service::Config;
-use crate::model::service::RealizeServiceRequest;
-use crate::model::service::RealizeServiceResponse;
-use crate::model::service::{RealizeService, RealizeServiceClient};
+use crate::network::services::realize::Config;
+use crate::network::services::realize::RealizeServiceRequest;
+use crate::network::services::realize::RealizeServiceResponse;
+use crate::network::services::realize::{RealizeService, RealizeServiceClient};
 use crate::server::RealizeServer;
 use crate::transport::security;
 use crate::transport::security::PeerVerifier;
@@ -336,7 +336,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
-    use crate::model::service::{Config, DirectoryId, Options};
+    use crate::network::services::realize::{Config, DirectoryId, Options};
     use crate::utils::async_utils::AbortOnDrop;
     use assert_fs::TempDir;
     use rustls::pki_types::PrivateKeyDer;

@@ -5,7 +5,7 @@
 //! over the RealizeService trait and is designed to be robust and restartable.
 
 use crate::model::byterange::{ByteRange, ByteRanges};
-use crate::model::service::{
+use crate::network::services::realize::{
     DirectoryId, Options, RangedHash, RealizeError, RealizeServiceClient, RealizeServiceRequest,
     RealizeServiceResponse, SyncedFile,
 };
@@ -820,8 +820,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::service::DirectoryId;
-    use crate::model::service::Hash;
+    use crate::network::services::realize::DirectoryId;
+    use crate::network::services::realize::Hash;
     use crate::server::{self, DirectoryMap};
     use crate::utils::hash;
     use assert_fs::prelude::*;

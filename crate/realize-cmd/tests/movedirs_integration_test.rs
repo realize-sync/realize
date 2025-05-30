@@ -3,7 +3,7 @@ use assert_fs::fixture::ChildPath;
 use assert_fs::prelude::*;
 use assert_unordered::assert_eq_unordered;
 use hyper_util::rt::TokioIo;
-use realize_lib::model::service::DirectoryId;
+use realize_lib::network::services::realize::DirectoryId;
 use realize_lib::server::DirectoryMap;
 use realize_lib::transport::security::{self, PeerVerifier};
 use realize_lib::transport::tcp::{self, HostPort};
