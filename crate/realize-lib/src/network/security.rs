@@ -296,7 +296,7 @@ impl rustls::server::ResolvesServerCert for RawPublicKeyResolver {
 mod tests {
     use super::default_provider;
     use super::*;
-    use crate::transport::security::testing;
+    use crate::network::security::testing;
     use crate::utils::async_utils::AbortOnDrop;
     use rustls::pki_types::PrivateKeyDer;
     use rustls::pki_types::pem::PemObject as _;

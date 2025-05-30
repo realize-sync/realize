@@ -5,7 +5,7 @@ use assert_unordered::assert_eq_unordered;
 use hyper_util::rt::TokioIo;
 use realize_lib::network::services::realize::DirectoryId;
 use realize_lib::server::DirectoryMap;
-use realize_lib::transport::security::{self, PeerVerifier};
+use realize_lib::network::security::{self, PeerVerifier};
 use realize_lib::transport::tcp::{self, HostPort};
 use realize_lib::utils::async_utils::AbortOnDrop;
 use rustls::pki_types::pem::PemObject;

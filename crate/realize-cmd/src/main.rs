@@ -10,7 +10,7 @@ use prometheus::{IntCounter, register_int_counter};
 use realize_lib::logic::consensus::movedirs::MoveFileError;
 use realize_lib::metrics;
 use realize_lib::network::services::realize::DirectoryId;
-use realize_lib::transport::security::{self, PeerVerifier};
+use realize_lib::network::security::{self, PeerVerifier};
 use realize_lib::transport::tcp::{self, ClientConnectionState, HostPort, TcpRealizeServiceClient};
 use realize_lib::utils::logging;
 use rustls::pki_types::pem::PemObject as _;

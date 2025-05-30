@@ -38,8 +38,8 @@ use crate::network::services::realize::RealizeServiceRequest;
 use crate::network::services::realize::RealizeServiceResponse;
 use crate::network::services::realize::{RealizeService, RealizeServiceClient};
 use crate::server::RealizeServer;
-use crate::transport::security;
-use crate::transport::security::PeerVerifier;
+use crate::network::security;
+use crate::network::security::PeerVerifier;
 use crate::utils::async_utils::AbortOnDrop;
 
 use crate::server::DirectoryMap;
@@ -349,7 +349,7 @@ mod tests {
         let temp = TempDir::new()?;
         let dirs = DirectoryMap::for_dir(&DirectoryId::from("testdir"), temp.path());
         let server_privkey =
-            load_private_key(crate::transport::security::testing::server_private_key())?;
+            load_private_key(crate::network::security::testing::server_private_key())?;
         let (addr, server_handle) = start_server(
             &HostPort::parse("127.0.0.1:0").await?,
             dirs,
@@ -365,7 +365,7 @@ mod tests {
     fn verifier_server_only() -> Arc<PeerVerifier> {
         let crypto = Arc::new(security::default_provider());
         let mut verifier = PeerVerifier::new(&crypto);
-        verifier.add_peer(crate::transport::security::testing::server_public_key());
+        verifier.add_peer(crate::network::security::testing::server_public_key());
         Arc::new(verifier)
     }
 
@@ -373,7 +373,7 @@ mod tests {
     fn verifier_client_only() -> Arc<PeerVerifier> {
         let crypto = Arc::new(security::default_provider());
         let mut verifier = PeerVerifier::new(&crypto);
-        verifier.add_peer(crate::transport::security::testing::client_public_key());
+        verifier.add_peer(crate::network::security::testing::client_public_key());
         Arc::new(verifier)
     }
 
@@ -381,8 +381,8 @@ mod tests {
     fn verifier_both() -> Arc<PeerVerifier> {
         let crypto = Arc::new(security::default_provider());
         let mut verifier = PeerVerifier::new(&crypto);
-        verifier.add_peer(crate::transport::security::testing::client_public_key());
-        verifier.add_peer(crate::transport::security::testing::server_public_key());
+        verifier.add_peer(crate::network::security::testing::client_public_key());
+        verifier.add_peer(crate::network::security::testing::server_public_key());
         Arc::new(verifier)
     }
 
@@ -399,7 +399,7 @@ mod tests {
         let verifier = verifier_both();
         let (addr, _server_handle, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
         let client_privkey =
-            load_private_key(crate::transport::security::testing::client_private_key())?;
+            load_private_key(crate::network::security::testing::client_private_key())?;
         let client = connect_client(
             &HostPort::from(addr),
             verifier_both(),
@@ -423,7 +423,7 @@ mod tests {
         let verifier = verifier_server_only();
         let (addr, _server_handle, _temp) = setup_test_server(Arc::clone(&verifier)).await.unwrap();
         let client_privkey =
-            load_private_key(crate::transport::security::testing::client_private_key())?;
+            load_private_key(crate::network::security::testing::client_private_key())?;
         let client_result = connect_client(
             &HostPort::from(addr),
             Arc::clone(&verifier),
@@ -453,7 +453,7 @@ mod tests {
         let verifier = verifier_client_only();
         let (addr, _server_handle, _temp) = setup_test_server(Arc::clone(&verifier)).await.unwrap();
         let client_privkey =
-            load_private_key(crate::transport::security::testing::client_private_key())?;
+            load_private_key(crate::network::security::testing::client_private_key())?;
         let result = connect_client(
             &HostPort::from(addr),
             Arc::clone(&verifier),
@@ -475,7 +475,7 @@ mod tests {
         let dirs = DirectoryMap::for_dir(&DirectoryId::from("testdir"), temp.path());
         let verifier = verifier_both();
         let server_privkey =
-            load_private_key(crate::transport::security::testing::server_private_key())?;
+            load_private_key(crate::network::security::testing::server_private_key())?;
         let (addr, _handle) = start_server(
             &HostPort::parse("127.0.0.1:0").await?,
             dirs.clone(),
@@ -484,7 +484,7 @@ mod tests {
         )
         .await?;
         let client_privkey =
-            load_private_key(crate::transport::security::testing::client_private_key())?;
+            load_private_key(crate::network::security::testing::client_private_key())?;
         let client = connect_client(
             &HostPort::from(addr),
             verifier.clone(),
@@ -515,7 +515,7 @@ mod tests {
         let dirs = DirectoryMap::for_dir(&DirectoryId::from("testdir"), temp.path());
         let verifier = verifier_both();
         let server_privkey =
-            load_private_key(crate::transport::security::testing::server_private_key())?;
+            load_private_key(crate::network::security::testing::server_private_key())?;
         let (addr, _handle) = start_server(
             &HostPort::parse("127.0.0.1:0").await?,
             dirs.clone(),
@@ -524,9 +524,9 @@ mod tests {
         )
         .await?;
         let client_privkey1 =
-            load_private_key(crate::transport::security::testing::client_private_key())?;
+            load_private_key(crate::network::security::testing::client_private_key())?;
         let client_privkey2 =
-            load_private_key(crate::transport::security::testing::client_private_key())?;
+            load_private_key(crate::network::security::testing::client_private_key())?;
         let client1 = connect_client(
             &HostPort::from(addr),
             Arc::clone(&verifier),
@@ -569,7 +569,7 @@ mod tests {
             proxy_tcp(&addr, shutdown.clone(), connection_count.clone()).await?;
 
         let client_privkey =
-            load_private_key(crate::transport::security::testing::client_private_key())?;
+            load_private_key(crate::network::security::testing::client_private_key())?;
         let client = connect_client(
             &HostPort::from(proxy_addr),
             verifier_both(),
@@ -609,7 +609,7 @@ mod tests {
             proxy_tcp(&addr, shutdown.clone(), connection_count.clone()).await?;
 
         let client_privkey =
-            load_private_key(crate::transport::security::testing::client_private_key())?;
+            load_private_key(crate::network::security::testing::client_private_key())?;
         let client = connect_client(
             &HostPort::from(proxy_addr),
             verifier_both(),
@@ -670,7 +670,7 @@ mod tests {
         let client = connect_client(
             &HostPort::from(proxy_addr),
             verifier_both(),
-            load_private_key(crate::transport::security::testing::client_private_key())?,
+            load_private_key(crate::network::security::testing::client_private_key())?,
             ClientOptions {
                 connection_events: Some(conn_tx),
                 ..ClientOptions::default()
