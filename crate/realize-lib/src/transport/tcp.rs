@@ -4,13 +4,13 @@
 //! It handles TLS setup, peer authentication, DNS resolution, and connection retry logic.
 
 use anyhow::Context as _;
-use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
+use async_speed_limit::Limiter;
 use futures::prelude::*;
 use rustls::pki_types::ServerName;
 use rustls::sign::SigningKey;
-use tarpc::client::RpcError;
 use tarpc::client::stub::Stub;
+use tarpc::client::RpcError;
 use tarpc::context;
 use tokio::sync::Mutex;
 use tokio_retry::strategy::ExponentialBackoff;
@@ -32,6 +32,7 @@ use crate::client::reconnect::Reconnect;
 use crate::metrics;
 use crate::metrics::MetricsRealizeClient;
 use crate::metrics::MetricsRealizeServer;
+use crate::network::rate_limit::RateLimitedStream;
 use crate::network::services::realize::Config;
 use crate::network::services::realize::RealizeServiceRequest;
 use crate::network::services::realize::RealizeServiceResponse;
@@ -42,8 +43,6 @@ use crate::transport::security::PeerVerifier;
 use crate::utils::async_utils::AbortOnDrop;
 
 use crate::server::DirectoryMap;
-
-use super::rate_limit::RateLimitedStream;
 
 use std::fmt;
 use std::net::IpAddr;

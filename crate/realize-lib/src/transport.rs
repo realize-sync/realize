@@ -4,6 +4,5 @@
 //! - `security`: TLS and peer authentication utilities.
 //! - `tcp`: TCP transport and connection management.
 //! - `rate_limit`: Bandwidth limiting for streams.
-pub(crate) mod rate_limit;
 pub mod security;
 pub mod tcp;
