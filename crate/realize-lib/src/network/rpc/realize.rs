@@ -10,39 +10,12 @@ pub mod server;
 
 use std::path::PathBuf;
 
+use crate::config::Arena;
 use crate::utils::byterange::{ByteRange, ByteRanges};
 use base64::Engine as _;
 
 /// Convenient shortcut for results containing [RealizeError].
 pub type Result<T> = std::result::Result<T, RealizeError>;
-
-/// Identifies a root directory whose content is made available
-/// through the service.
-#[derive(Debug, Clone, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct DirectoryId(String);
-impl From<String> for DirectoryId {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-impl From<&str> for DirectoryId {
-    fn from(value: &str) -> Self {
-        Self(value.to_string())
-    }
-}
-impl std::fmt::Display for DirectoryId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-impl DirectoryId {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-    pub fn into_string(self) -> String {
-        self.0
-    }
-}
 
 /// A file that can be synced through the service, within a directory.
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -151,11 +124,11 @@ pub struct Config {
 #[tarpc::service]
 pub trait RealizeService {
     /// List files in a directory
-    async fn list(dir_id: DirectoryId, options: Options) -> Result<Vec<SyncedFile>>;
+    async fn list(arena: Arena, options: Options) -> Result<Vec<SyncedFile>>;
 
     /// Send a byte range of a file.
     async fn send(
-        dir_id: DirectoryId,
+        arena: Arena,
         relative_path: PathBuf,
         range: ByteRange,
         data: Vec<u8>,
@@ -166,29 +139,29 @@ pub trait RealizeService {
     ///
     /// Data outside of the range [0, file_size) is returned filled with 0.
     async fn read(
-        dir_id: DirectoryId,
+        arena: Arena,
         relative_path: PathBuf,
         range: ByteRange,
         options: Options,
     ) -> Result<Vec<u8>>;
 
     /// Mark a partial file as complete
-    async fn finish(dir_id: DirectoryId, relative_path: PathBuf, options: Options) -> Result<()>;
+    async fn finish(arena: Arena, relative_path: PathBuf, options: Options) -> Result<()>;
 
     /// Compute a SHA-256 hash of the file at the given path (final or partial).
     async fn hash(
-        dir_id: DirectoryId,
+        arena: Arena,
         relative_path: PathBuf,
         range: ByteRange,
         options: Options,
     ) -> Result<Hash>;
 
     /// Delete the file at the given path (both partial and final forms).
-    async fn delete(dir_id: DirectoryId, relative_path: PathBuf, options: Options) -> Result<()>;
+    async fn delete(arena: Arena, relative_path: PathBuf, options: Options) -> Result<()>;
 
     /// Calculate a signature for the file at the given path and byte range.
     async fn calculate_signature(
-        dir_id: DirectoryId,
+        arena: Arena,
         relative_path: PathBuf,
         range: ByteRange,
         options: Options,
@@ -198,7 +171,7 @@ pub trait RealizeService {
     ///
     /// Returns the delta and the hash of the data used to compute it.
     async fn diff(
-        dir_id: DirectoryId,
+        arena: Arena,
         relative_path: PathBuf,
         range: ByteRange,
         signature: Signature,
@@ -210,7 +183,7 @@ pub trait RealizeService {
     /// Returns the error [RealizeError::HashMismatch] if, after
     /// applying the patch, the data doesn't match the given hash.
     async fn apply_delta(
-        dir_id: DirectoryId,
+        arena: Arena,
         relative_path: PathBuf,
         range: ByteRange,
         delta: Delta,
@@ -220,7 +193,7 @@ pub trait RealizeService {
 
     /// Truncate file to the given size.
     async fn truncate(
-        dir_id: DirectoryId,
+        arena: Arena,
         relative_path: PathBuf,
         file_size: u64,
         options: Options,

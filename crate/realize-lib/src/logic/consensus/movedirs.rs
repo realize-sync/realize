@@ -4,11 +4,12 @@
 //! rsync-based partial transfer, progress reporting, and error handling. It operates
 //! over the RealizeService trait and is designed to be robust and restartable.
 
-use crate::utils::byterange::{ByteRange, ByteRanges};
+use crate::config::Arena;
 use crate::network::rpc::realize::{
-    DirectoryId, Options, RangedHash, RealizeError, RealizeServiceClient, RealizeServiceRequest,
+    Options, RangedHash, RealizeError, RealizeServiceClient, RealizeServiceRequest,
     RealizeServiceResponse, SyncedFile,
 };
+use crate::utils::byterange::{ByteRange, ByteRanges};
 use futures::future;
 use futures::stream::StreamExt as _;
 use futures::FutureExt;
@@ -93,14 +94,14 @@ fn dst_options() -> Options {
 pub enum ProgressEvent {
     /// Indicates the start of moving a directory, with total files and bytes.
     MovingDir {
-        dir_id: DirectoryId,
+        arena: Arena,
         total_files: usize,
         total_bytes: u64,
         available_bytes: u64,
     },
     /// Indicates a file is being processed (start), with its path and size.
     MovingFile {
-        dir_id: DirectoryId,
+        arena: Arena,
         path: std::path::PathBuf,
         bytes: u64,
 
@@ -109,45 +110,45 @@ pub enum ProgressEvent {
     },
     /// File is being verified (hash check).
     VerifyingFile {
-        dir_id: DirectoryId,
+        arena: Arena,
         path: std::path::PathBuf,
     },
     /// File is being rsynced (diff/patch).
     RsyncingFile {
-        dir_id: DirectoryId,
+        arena: Arena,
         path: std::path::PathBuf,
     },
     /// File is being copied (data transfer).
     CopyingFile {
-        dir_id: DirectoryId,
+        arena: Arena,
         path: std::path::PathBuf,
     },
     /// File is waiting its turn to be copied.
     PendingFile {
-        dir_id: DirectoryId,
+        arena: Arena,
         path: std::path::PathBuf,
     },
     /// Increment byte count for a file and overall progress.
     IncrementByteCount {
-        dir_id: DirectoryId,
+        arena: Arena,
         path: std::path::PathBuf,
         bytecount: u64,
     },
     /// Decrement byte count for a file and overall progress, when
     /// retrying a range previously assumed to be correct.
     DecrementByteCount {
-        dir_id: DirectoryId,
+        arena: Arena,
         path: std::path::PathBuf,
         bytecount: u64,
     },
     /// File was moved successfully.
     FileSuccess {
-        dir_id: DirectoryId,
+        arena: Arena,
         path: std::path::PathBuf,
     },
     /// Moving the file failed.
     FileError {
-        dir_id: DirectoryId,
+        arena: Arena,
         path: std::path::PathBuf,
         error: String,
     },
@@ -157,14 +158,14 @@ pub async fn move_dir<T, U>(
     ctx: tarpc::context::Context,
     src: &RealizeServiceClient<T>,
     dst: &RealizeServiceClient<U>,
-    dir_id: DirectoryId,
+    arena: Arena,
     progress_tx: Option<Sender<ProgressEvent>>,
 ) -> Result<(usize, usize, usize), MoveFileError>
 where
     T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
     U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
 {
-    move_dirs(ctx, src, dst, vec![dir_id], progress_tx).await
+    move_dirs(ctx, src, dst, vec![arena], progress_tx).await
 }
 
 /// Moves files from source to destination using the RealizeService interface, sending progress events to a channel.
@@ -172,7 +173,7 @@ pub async fn move_dirs<T, U>(
     ctx: tarpc::context::Context,
     src: &RealizeServiceClient<T>,
     dst: &RealizeServiceClient<U>,
-    dir_ids: impl IntoIterator<Item = DirectoryId>,
+    arenas: impl IntoIterator<Item = Arena>,
     progress_tx: Option<Sender<ProgressEvent>>,
 ) -> Result<(usize, usize, usize), MoveFileError>
 where
@@ -181,8 +182,8 @@ where
 {
     METRIC_START_COUNT.inc();
     let mut files_to_sync = vec![];
-    for collected in futures::stream::iter(dir_ids.into_iter())
-        .map(|dir_id| collect_files_to_sync(ctx, src, dst, dir_id, &progress_tx))
+    for collected in futures::stream::iter(arenas.into_iter())
+        .map(|arena| collect_files_to_sync(ctx, src, dst, arena, &progress_tx))
         .buffered(8)
         .collect::<Vec<_>>()
         .await
@@ -192,7 +193,7 @@ where
 
     let copy_sem = Arc::new(Semaphore::new(1));
     let results = futures::stream::iter(files_to_sync.into_iter())
-        .map(|(dir_id, src_file, dst_file)| {
+        .map(|(arena, src_file, dst_file)| {
             let copy_sem = copy_sem.clone();
             let tx = progress_tx.clone();
             let file_path = src_file.path.clone();
@@ -202,7 +203,7 @@ where
                 if let Some(tx) = &tx {
                     let _ = tx
                         .send(ProgressEvent::MovingFile {
-                            dir_id: dir_id.clone(),
+                            arena: arena.clone(),
                             path: file_path.clone(),
                             bytes: src_file.size,
                             available: dst_file.as_ref().map_or(0, |f| f.size),
@@ -216,7 +217,7 @@ where
                     src_file,
                     dst,
                     dst_file,
-                    &dir_id,
+                    &arena,
                     copy_sem.clone(),
                     tx.clone(),
                 )
@@ -226,7 +227,7 @@ where
                         if let Some(tx) = &tx {
                             let _ = tx
                                 .send(ProgressEvent::FileSuccess {
-                                    dir_id: dir_id.clone(),
+                                    arena: arena.clone(),
                                     path: file_path.clone(),
                                 })
                                 .await;
@@ -235,11 +236,11 @@ where
                         (1, 0, 0)
                     }
                     Err(MoveFileError::Rpc(tarpc::client::RpcError::DeadlineExceeded)) => {
-                        log::debug!("{}/{}: Deadline exceeded", dir_id, file_path.display());
+                        log::debug!("{}/{}: Deadline exceeded", arena, file_path.display());
                         if let Some(tx) = &tx {
                             let _ = tx
                                 .send(ProgressEvent::FileError {
-                                    dir_id: dir_id.clone(),
+                                    arena: arena.clone(),
                                     path: file_path.clone(),
                                     error: "Deadline exceeded".to_string(),
                                 })
@@ -249,11 +250,11 @@ where
                         (0, 0, 1)
                     }
                     Err(ref err) => {
-                        log::debug!("{}/{}: {}", dir_id, file_path.display(), err);
+                        log::debug!("{}/{}: {}", arena, file_path.display(), err);
                         if let Some(tx) = &tx {
                             let _ = tx
                                 .send(ProgressEvent::FileError {
-                                    dir_id: dir_id.clone(),
+                                    arena: arena.clone(),
                                     path: file_path.clone(),
                                     error: format!("{}", err),
                                 })
@@ -283,17 +284,17 @@ async fn collect_files_to_sync<T, U>(
     ctx: tarpc::context::Context,
     src: &RealizeServiceClient<T>,
     dst: &RealizeServiceClient<U>,
-    dir_id: DirectoryId,
+    arena: Arena,
     progress_tx: &Option<Sender<ProgressEvent>>,
-) -> Result<Vec<(DirectoryId, SyncedFile, Option<SyncedFile>)>, MoveFileError>
+) -> Result<Vec<(Arena, SyncedFile, Option<SyncedFile>)>, MoveFileError>
 where
     T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
     U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
 {
     // 1. List files on src and dst in parallel
     let (src_files, dst_files) = future::join(
-        src.list(ctx, dir_id.clone(), src_options()),
-        dst.list(ctx, dir_id.clone(), dst_options()),
+        src.list(ctx, arena.clone(), src_options()),
+        dst.list(ctx, arena.clone(), dst_options()),
     )
     .await;
     let src_files = src_files??;
@@ -309,14 +310,14 @@ where
         .map(|src_file| {
             let dst_file = dst_map.remove(&src_file.path);
 
-            (dir_id.clone(), src_file, dst_file)
+            (arena.clone(), src_file, dst_file)
         })
         .collect::<Vec<_>>();
 
     if let Some(tx) = &progress_tx {
         let _ = tx
             .send(ProgressEvent::MovingDir {
-                dir_id: dir_id.clone(),
+                arena: arena.clone(),
                 total_files: files_to_sync.len(),
                 total_bytes: files_to_sync.iter().fold(0, |acc, (_, f, _)| acc + f.size),
                 available_bytes: files_to_sync
@@ -335,7 +336,7 @@ async fn move_file<T, U>(
     src_file: SyncedFile,
     dst: &RealizeServiceClient<U>,
     dst_file: Option<SyncedFile>,
-    dir_id: &DirectoryId,
+    arena: &Arena,
     copy_sem: Arc<Semaphore>,
     progress_tx: Option<Sender<ProgressEvent>>,
 ) -> Result<(), MoveFileError>
@@ -347,7 +348,7 @@ where
     let path = src_file.path.as_path();
     let src_size = src_file.size;
     let dst_size = dst_file.as_ref().map(|f| f.size).unwrap_or(0);
-    let dir_id = dir_id.clone();
+    let arena = arena.clone();
 
     let ranges = ByteRanges::single(0, src_size);
 
@@ -359,10 +360,10 @@ where
         async {
             // 1. Copy missing data
             let copy_ranges = ranges.subtraction(&existing);
-            log::debug!("{}/{:?} {} copy {}", dir_id, path, ranges, copy_ranges);
+            log::debug!("{}/{:?} {} copy {}", arena, path, ranges, copy_ranges);
             copy_file_range(
                 ctx,
-                &dir_id,
+                &arena,
                 path,
                 src,
                 dst,
@@ -376,7 +377,7 @@ where
             if dst_file.as_ref().map_or(0, |f| f.size) > src_file.size {
                 dst.truncate(
                     ctx,
-                    dir_id.clone(),
+                    arena.clone(),
                     path.to_path_buf(),
                     src_file.size,
                     dst_options(),
@@ -390,7 +391,7 @@ where
         hash_file(
             ctx,
             src,
-            &dir_id,
+            &arena,
             path,
             src_size,
             HASH_FILE_CHUNK,
@@ -402,8 +403,8 @@ where
 
     // 3. Check hash, return if succeeds
     let correct;
-    report_verifying(&progress_tx, &dir_id, path).await;
-    match check_hashes_and_delete(ctx, &src_hash, src_size, src, dst, &dir_id, path).await? {
+    report_verifying(&progress_tx, &arena, path).await;
+    match check_hashes_and_delete(ctx, &src_hash, src_size, src, dst, &arena, path).await? {
         HashCheck::Match => {
             return Ok(());
         }
@@ -420,16 +421,16 @@ where
     let rsync_ranges = ranges.subtraction(&correct);
     log::debug!(
         "{}/{:?} {} rsync {} DEC:{}",
-        dir_id,
+        arena,
         path,
         ranges,
         rsync_ranges,
         rsync_ranges.bytecount()
     );
-    report_decrement_bytecount(&progress_tx, &dir_id, path, rsync_ranges.bytecount()).await;
+    report_decrement_bytecount(&progress_tx, &arena, path, rsync_ranges.bytecount()).await;
     rsync_file_range(
         ctx,
-        &dir_id,
+        &arena,
         path,
         src,
         dst,
@@ -442,7 +443,7 @@ where
     // 5. Fallback to copy if necessary
     copy_file_range(
         ctx,
-        &dir_id,
+        &arena,
         path,
         src,
         dst,
@@ -453,8 +454,8 @@ where
     .await?;
 
     // 6. Check again against hash
-    report_verifying(&progress_tx, &dir_id, path).await;
-    match check_hashes_and_delete(ctx, &src_hash, src_size, src, dst, &dir_id, path).await? {
+    report_verifying(&progress_tx, &arena, path).await;
+    match check_hashes_and_delete(ctx, &src_hash, src_size, src, dst, &arena, path).await? {
         HashCheck::Mismatch { .. } => Err(MoveFileError::FailedToSync),
         HashCheck::Match => Ok(()),
     }
@@ -462,7 +463,7 @@ where
 
 async fn rsync_file_range<T, U>(
     ctx: tarpc::context::Context,
-    dir_id: &DirectoryId,
+    arena: &Arena,
     path: &Path,
     src: &RealizeServiceClient<T>,
     dst: &RealizeServiceClient<U>,
@@ -478,13 +479,13 @@ where
         return Ok(());
     }
 
-    report_rsyncing(&progress_tx, &dir_id, path).await;
+    report_rsyncing(&progress_tx, &arena, path).await;
 
     for range in rsync_ranges.chunked(CHUNK_SIZE) {
         let sig = dst
             .calculate_signature(
                 ctx,
-                dir_id.clone(),
+                arena.clone(),
                 path.to_path_buf(),
                 range.clone(),
                 dst_options(),
@@ -493,7 +494,7 @@ where
         let (delta, hash) = src
             .diff(
                 ctx,
-                dir_id.clone(),
+                arena.clone(),
                 path.to_path_buf(),
                 range.clone(),
                 sig,
@@ -510,7 +511,7 @@ where
         match dst
             .apply_delta(
                 ctx,
-                dir_id.clone(),
+                arena.clone(),
                 path.to_path_buf(),
                 range.clone(),
                 delta,
@@ -526,14 +527,14 @@ where
                 METRIC_RANGE_WRITE_BYTES
                     .with_label_values(&["apply_delta"])
                     .inc_by(range.bytecount());
-                log::debug!("{}/{:?} INC {}", &dir_id, path, range.bytecount());
-                report_increment_bytecount(&progress_tx, &dir_id, path, range.bytecount()).await;
+                log::debug!("{}/{:?} INC {}", &arena, path, range.bytecount());
+                report_increment_bytecount(&progress_tx, &arena, path, range.bytecount()).await;
             }
             Err(RealizeError::HashMismatch) => {
                 copy_ranges.add(&range);
                 log::error!(
                     "{}/{}:{} hash mismatch after apply_delta, will copy",
-                    dir_id,
+                    arena,
                     path.display(),
                     range,
                 );
@@ -551,7 +552,7 @@ where
 
 async fn copy_file_range<T, U>(
     ctx: tarpc::context::Context,
-    dir_id: &DirectoryId,
+    arena: &Arena,
     path: &Path,
     src: &RealizeServiceClient<T>,
     dst: &RealizeServiceClient<U>,
@@ -568,16 +569,16 @@ where
     }
     // It can take some time for a permit to become available, so
     // go back to showing the file as Pending until then.
-    report_pending(&progress_tx, &dir_id, path).await;
+    report_pending(&progress_tx, &arena, path).await;
     let _lock = copy_sem.acquire().await;
 
-    report_copying(&progress_tx, &dir_id, path).await;
+    report_copying(&progress_tx, &arena, path).await;
 
     for range in copy_ranges.chunked(CHUNK_SIZE) {
         let data = src
             .read(
                 ctx,
-                dir_id.clone(),
+                arena.clone(),
                 path.to_path_buf(),
                 range.clone(),
                 src_options(),
@@ -592,7 +593,7 @@ where
         let data_len = data.len();
         dst.send(
             ctx,
-            dir_id.clone(),
+            arena.clone(),
             path.to_path_buf(),
             range.clone(),
             data,
@@ -605,51 +606,39 @@ where
         METRIC_RANGE_WRITE_BYTES
             .with_label_values(&["send"])
             .inc_by(range.bytecount());
-        report_increment_bytecount(&progress_tx, &dir_id, path, range.bytecount()).await;
+        report_increment_bytecount(&progress_tx, &arena, path, range.bytecount()).await;
     }
 
     Ok(())
 }
 
-async fn report_pending(
-    progress_tx: &Option<Sender<ProgressEvent>>,
-    dir_id: &DirectoryId,
-    path: &Path,
-) {
+async fn report_pending(progress_tx: &Option<Sender<ProgressEvent>>, arena: &Arena, path: &Path) {
     if let Some(tx) = progress_tx {
         let _ = tx
             .send(ProgressEvent::PendingFile {
-                dir_id: dir_id.clone(),
+                arena: arena.clone(),
                 path: path.to_path_buf(),
             })
             .await;
     }
 }
 
-async fn report_copying(
-    progress_tx: &Option<Sender<ProgressEvent>>,
-    dir_id: &DirectoryId,
-    path: &Path,
-) {
+async fn report_copying(progress_tx: &Option<Sender<ProgressEvent>>, arena: &Arena, path: &Path) {
     if let Some(tx) = progress_tx {
         let _ = tx
             .send(ProgressEvent::CopyingFile {
-                dir_id: dir_id.clone(),
+                arena: arena.clone(),
                 path: path.to_path_buf(),
             })
             .await;
     }
 }
 
-async fn report_rsyncing(
-    progress_tx: &Option<Sender<ProgressEvent>>,
-    dir_id: &DirectoryId,
-    path: &Path,
-) {
+async fn report_rsyncing(progress_tx: &Option<Sender<ProgressEvent>>, arena: &Arena, path: &Path) {
     if let Some(tx) = progress_tx {
         let _ = tx
             .send(ProgressEvent::RsyncingFile {
-                dir_id: dir_id.clone(),
+                arena: arena.clone(),
                 path: path.to_path_buf(),
             })
             .await;
@@ -658,13 +647,13 @@ async fn report_rsyncing(
 
 async fn report_verifying(
     progress_tx: &Option<Sender<ProgressEvent>>,
-    dir_id: &DirectoryId,
+    arena: &Arena,
     path: &Path,
 ) {
     if let Some(tx) = progress_tx {
         let _ = tx
             .send(ProgressEvent::VerifyingFile {
-                dir_id: dir_id.clone(),
+                arena: arena.clone(),
                 path: path.to_path_buf(),
             })
             .await;
@@ -673,7 +662,7 @@ async fn report_verifying(
 
 async fn report_increment_bytecount(
     progress_tx: &Option<Sender<ProgressEvent>>,
-    dir_id: &DirectoryId,
+    arena: &Arena,
     path: &Path,
     bytecount: u64,
 ) {
@@ -683,7 +672,7 @@ async fn report_increment_bytecount(
     if let Some(tx) = progress_tx {
         let _ = tx
             .send(ProgressEvent::IncrementByteCount {
-                dir_id: dir_id.clone(),
+                arena: arena.clone(),
                 path: path.to_path_buf(),
                 bytecount,
             })
@@ -693,7 +682,7 @@ async fn report_increment_bytecount(
 
 async fn report_decrement_bytecount(
     progress_tx: &Option<Sender<ProgressEvent>>,
-    dir_id: &DirectoryId,
+    arena: &Arena,
     path: &Path,
     bytecount: u64,
 ) {
@@ -703,7 +692,7 @@ async fn report_decrement_bytecount(
     if let Some(tx) = progress_tx {
         let _ = tx
             .send(ProgressEvent::DecrementByteCount {
-                dir_id: dir_id.clone(),
+                arena: arena.clone(),
                 path: path.to_path_buf(),
                 bytecount,
             })
@@ -715,7 +704,7 @@ async fn report_decrement_bytecount(
 pub(crate) async fn hash_file<T>(
     ctx: tarpc::context::Context,
     client: &RealizeServiceClient<T>,
-    dir_id: &DirectoryId,
+    arena: &Arena,
     relative_path: &std::path::Path,
     file_size: u64,
     chunk_size: u64,
@@ -730,7 +719,7 @@ where
                 client
                     .hash(
                         ctx,
-                        dir_id.clone(),
+                        arena.clone(),
                         relative_path.to_path_buf(),
                         range.clone(),
                         options,
@@ -769,7 +758,7 @@ async fn check_hashes_and_delete<T, U>(
     file_size: u64,
     src: &RealizeServiceClient<T>,
     dst: &RealizeServiceClient<U>,
-    dir_id: &DirectoryId,
+    arena: &Arena,
     path: &std::path::Path,
 ) -> Result<HashCheck, MoveFileError>
 where
@@ -779,7 +768,7 @@ where
     let dst_hash = hash_file(
         ctx,
         dst,
-        dir_id,
+        arena,
         path,
         file_size,
         HASH_FILE_CHUNK,
@@ -792,7 +781,7 @@ where
     if !mismatches.is_empty() || !is_complete_src || !is_complete_dst {
         log::debug!(
             "{}:{:?} inconsistent hashes\nsrc: {}\ndst: {}\nmatches: {}\nmismatches: {}",
-            dir_id,
+            arena,
             path,
             src_hash,
             dst_hash,
@@ -806,11 +795,11 @@ where
             partial_match: matches,
         });
     }
-    log::debug!("{}/{} MOVED", dir_id, path.display());
+    log::debug!("{}/{} MOVED", arena, path.display());
     // Hashes match, finish and delete
-    dst.finish(ctx, dir_id.clone(), path.to_path_buf(), dst_options())
+    dst.finish(ctx, arena.clone(), path.to_path_buf(), dst_options())
         .await??;
-    src.delete(ctx, dir_id.clone(), path.to_path_buf(), src_options())
+    src.delete(ctx, arena.clone(), path.to_path_buf(), src_options())
         .await??;
 
     METRIC_FILE_END_COUNT.with_label_values(&["Ok"]).inc();
@@ -820,9 +809,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::rpc::realize::DirectoryId;
+    use crate::config::{Arena, LocalArena, LocalArenas};
+    use crate::network::rpc::realize::server::{self};
     use crate::network::rpc::realize::Hash;
-    use crate::network::rpc::realize::server::{self, DirectoryMap};
     use crate::utils::hash;
     use assert_fs::prelude::*;
     use assert_fs::TempDir;
@@ -837,25 +826,19 @@ mod tests {
         let src_temp = TempDir::new()?;
         let dst_temp = TempDir::new()?;
         src_temp.child("foo").write_str("abc")?;
-        let src_dir = Arc::new(crate::network::rpc::realize::server::Directory::new(
-            &DirectoryId::from("testdir"),
-            src_temp.path(),
-        ));
-        let dst_dir = Arc::new(crate::network::rpc::realize::server::Directory::new(
-            &DirectoryId::from("testdir"),
-            dst_temp.path(),
-        ));
+        let src_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), src_temp.path()));
+        let dst_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), dst_temp.path()));
         let src_server =
-            server::create_inprocess_client(DirectoryMap::for_dir(src_dir.id(), src_dir.path()));
+            server::create_inprocess_client(LocalArenas::single(src_dir.arena(), src_dir.path()));
         let dst_server =
-            server::create_inprocess_client(DirectoryMap::for_dir(dst_dir.id(), dst_dir.path()));
+            server::create_inprocess_client(LocalArenas::single(dst_dir.arena(), dst_dir.path()));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let (success, error, _) = move_dir(
             tarpc::context::current(),
             &src_server,
             &dst_server,
-            DirectoryId::from("testdir"),
+            Arena::from("testdir"),
             Some(tx),
         )
         .await?;
@@ -872,36 +855,36 @@ mod tests {
         assert_eq!(
             vec![
                 MovingDir {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     total_files: 1,
                     total_bytes: 3,
                     available_bytes: 0,
                 },
                 MovingFile {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     path: PathBuf::from("foo"),
                     bytes: 3,
                     available: 0
                 },
                 PendingFile {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     path: PathBuf::from("foo")
                 },
                 CopyingFile {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     path: PathBuf::from("foo")
                 },
                 IncrementByteCount {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     path: PathBuf::from("foo"),
                     bytecount: 3
                 },
                 VerifyingFile {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     path: PathBuf::from("foo")
                 },
                 FileSuccess {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     path: PathBuf::from("foo")
                 },
             ],
@@ -916,28 +899,22 @@ mod tests {
         let _ = env_logger::try_init();
         let src_temp = TempDir::new()?;
         let dst_temp = TempDir::new()?;
-        let src_dir = Arc::new(crate::network::rpc::realize::server::Directory::new(
-            &DirectoryId::from("testdir"),
-            src_temp.path(),
-        ));
-        let dst_dir = Arc::new(crate::network::rpc::realize::server::Directory::new(
-            &DirectoryId::from("testdir"),
-            dst_temp.path(),
-        ));
+        let src_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), src_temp.path()));
+        let dst_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), dst_temp.path()));
         src_temp.child("foo").write_str("abcdefghi")?;
         dst_temp.child(".foo.part").write_str("abc")?;
 
         let src_server =
-            server::create_inprocess_client(DirectoryMap::for_dir(src_dir.id(), src_dir.path()));
+            server::create_inprocess_client(LocalArenas::single(src_dir.arena(), src_dir.path()));
         let dst_server =
-            server::create_inprocess_client(DirectoryMap::for_dir(dst_dir.id(), dst_dir.path()));
+            server::create_inprocess_client(LocalArenas::single(dst_dir.arena(), dst_dir.path()));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let (success, error, _) = move_dir(
             tarpc::context::current(),
             &src_server,
             &dst_server,
-            DirectoryId::from("testdir"),
+            Arena::from("testdir"),
             Some(tx),
         )
         .await?;
@@ -954,36 +931,36 @@ mod tests {
         assert_eq!(
             vec![
                 MovingDir {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     total_files: 1,
                     total_bytes: 9,
                     available_bytes: 3,
                 },
                 MovingFile {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     path: PathBuf::from("foo"),
                     bytes: 9,
                     available: 3
                 },
                 PendingFile {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     path: PathBuf::from("foo")
                 },
                 CopyingFile {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     path: PathBuf::from("foo")
                 },
                 IncrementByteCount {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     path: PathBuf::from("foo"),
                     bytecount: 6
                 },
                 VerifyingFile {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     path: PathBuf::from("foo")
                 },
                 FileSuccess {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     path: PathBuf::from("foo")
                 },
             ],
@@ -998,28 +975,22 @@ mod tests {
         let _ = env_logger::try_init();
         let src_temp = TempDir::new()?;
         let dst_temp = TempDir::new()?;
-        let src_dir = Arc::new(crate::network::rpc::realize::server::Directory::new(
-            &DirectoryId::from("testdir"),
-            src_temp.path(),
-        ));
-        let dst_dir = Arc::new(crate::network::rpc::realize::server::Directory::new(
-            &DirectoryId::from("testdir"),
-            dst_temp.path(),
-        ));
+        let src_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), src_temp.path()));
+        let dst_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), dst_temp.path()));
         src_temp.child("foo").write_str("abcdefghi")?;
         dst_temp.child(".foo.part").write_str("xxx")?;
 
         let src_server =
-            server::create_inprocess_client(DirectoryMap::for_dir(src_dir.id(), src_dir.path()));
+            server::create_inprocess_client(LocalArenas::single(src_dir.arena(), src_dir.path()));
         let dst_server =
-            server::create_inprocess_client(DirectoryMap::for_dir(dst_dir.id(), dst_dir.path()));
+            server::create_inprocess_client(LocalArenas::single(dst_dir.arena(), dst_dir.path()));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let (success, error, _) = move_dir(
             tarpc::context::current(),
             &src_server,
             &dst_server,
-            DirectoryId::from("testdir"),
+            Arena::from("testdir"),
             Some(tx),
         )
         .await?;
@@ -1036,54 +1007,54 @@ mod tests {
         assert_eq!(
             vec![
                 MovingDir {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     total_files: 1,
                     total_bytes: 9,
                     available_bytes: 3,
                 },
                 MovingFile {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     path: PathBuf::from("foo"),
                     bytes: 9,
                     available: 3
                 },
                 PendingFile {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     path: PathBuf::from("foo")
                 },
                 CopyingFile {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     path: PathBuf::from("foo")
                 },
                 IncrementByteCount {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     path: PathBuf::from("foo"),
                     bytecount: 6
                 },
                 VerifyingFile {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     path: PathBuf::from("foo")
                 },
                 DecrementByteCount {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     path: PathBuf::from("foo"),
                     bytecount: 9
                 },
                 RsyncingFile {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     path: PathBuf::from("foo")
                 },
                 IncrementByteCount {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     path: PathBuf::from("foo"),
                     bytecount: 9
                 },
                 VerifyingFile {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     path: PathBuf::from("foo")
                 },
                 FileSuccess {
-                    dir_id: DirectoryId::from("testdir"),
+                    arena: Arena::from("testdir"),
                     path: PathBuf::from("foo")
                 },
             ],
@@ -1099,21 +1070,15 @@ mod tests {
 
         // Setup source directory with files
         let src_temp = TempDir::new()?;
-        let src_dir = Arc::new(crate::network::rpc::realize::server::Directory::new(
-            &DirectoryId::from("testdir"),
-            src_temp.path(),
-        ));
+        let src_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), src_temp.path()));
         let src_server =
-            server::create_inprocess_client(DirectoryMap::for_dir(src_dir.id(), src_dir.path()));
+            server::create_inprocess_client(LocalArenas::single(src_dir.arena(), src_dir.path()));
 
         // Setup destination directory (empty)
         let dst_temp = TempDir::new()?;
-        let dst_dir = Arc::new(crate::network::rpc::realize::server::Directory::new(
-            &DirectoryId::from("testdir"),
-            dst_temp.path(),
-        ));
+        let dst_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), dst_temp.path()));
         let dst_server =
-            server::create_inprocess_client(DirectoryMap::for_dir(dst_dir.id(), dst_dir.path()));
+            server::create_inprocess_client(LocalArenas::single(dst_dir.arena(), dst_dir.path()));
 
         // Pre-populate destination with a file of the same length as source (should trigger rsync optimization)
         src_temp.child("same_length").write_str("hello")?;
@@ -1136,7 +1101,7 @@ mod tests {
             tarpc::context::current(),
             &src_server,
             &dst_server,
-            DirectoryId::from("testdir"),
+            Arena::from("testdir"),
             None,
         )
         .await?;
@@ -1168,20 +1133,14 @@ mod tests {
         let chunk5 = vec![0x34; FILE_SIZE];
 
         let src_temp = TempDir::new()?;
-        let src_dir = Arc::new(crate::network::rpc::realize::server::Directory::new(
-            &DirectoryId::from("testdir"),
-            src_temp.path(),
-        ));
+        let src_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), src_temp.path()));
         let src_server =
-            server::create_inprocess_client(DirectoryMap::for_dir(src_dir.id(), src_dir.path()));
+            server::create_inprocess_client(LocalArenas::single(src_dir.arena(), src_dir.path()));
 
         let dst_temp = TempDir::new()?;
-        let dst_dir = Arc::new(crate::network::rpc::realize::server::Directory::new(
-            &DirectoryId::from("testdir"),
-            dst_temp.path(),
-        ));
+        let dst_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), dst_temp.path()));
         let dst_server =
-            server::create_inprocess_client(DirectoryMap::for_dir(dst_dir.id(), dst_dir.path()));
+            server::create_inprocess_client(LocalArenas::single(dst_dir.arena(), dst_dir.path()));
 
         // Case 1: source > CHUNK_SIZE, destination empty
         src_temp.child("large_empty").write_binary(&chunk)?;
@@ -1207,14 +1166,8 @@ mod tests {
         let mut ctx = tarpc::context::current();
         ctx.deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
 
-        let (success, error, _interrupted) = move_dir(
-            ctx,
-            &src_server,
-            &dst_server,
-            DirectoryId::from("testdir"),
-            None,
-        )
-        .await?;
+        let (success, error, _interrupted) =
+            move_dir(ctx, &src_server, &dst_server, Arena::from("testdir"), None).await?;
         assert_eq!(
             (5, 0),
             (success, error),
@@ -1244,19 +1197,13 @@ mod tests {
     async fn move_files_partial_error() -> anyhow::Result<()> {
         let _ = env_logger::try_init();
         let src_temp = TempDir::new()?;
-        let src_dir = Arc::new(crate::network::rpc::realize::server::Directory::new(
-            &DirectoryId::from("testdir"),
-            src_temp.path(),
-        ));
+        let src_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), src_temp.path()));
         let src_server =
-            server::create_inprocess_client(DirectoryMap::for_dir(src_dir.id(), src_dir.path()));
+            server::create_inprocess_client(LocalArenas::single(src_dir.arena(), src_dir.path()));
         let dst_temp = TempDir::new()?;
-        let dst_dir = Arc::new(crate::network::rpc::realize::server::Directory::new(
-            &DirectoryId::from("testdir"),
-            dst_temp.path(),
-        ));
+        let dst_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), dst_temp.path()));
         let dst_server =
-            server::create_inprocess_client(DirectoryMap::for_dir(dst_dir.id(), dst_dir.path()));
+            server::create_inprocess_client(LocalArenas::single(dst_dir.arena(), dst_dir.path()));
         // Good file
         src_temp.child("good").write_str("ok")?;
         // Unreadable file
@@ -1269,7 +1216,7 @@ mod tests {
             tarpc::context::current(),
             &src_server,
             &dst_server,
-            DirectoryId::from("testdir"),
+            Arena::from("testdir"),
             None,
         )
         .await?;
@@ -1285,18 +1232,12 @@ mod tests {
         let _ = env_logger::try_init();
         let src_temp = TempDir::new()?;
         let dst_temp = TempDir::new()?;
-        let src_dir = Arc::new(crate::network::rpc::realize::server::Directory::new(
-            &DirectoryId::from("testdir"),
-            src_temp.path(),
-        ));
-        let dst_dir = Arc::new(crate::network::rpc::realize::server::Directory::new(
-            &DirectoryId::from("testdir"),
-            dst_temp.path(),
-        ));
+        let src_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), src_temp.path()));
+        let dst_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), dst_temp.path()));
         let src_server =
-            server::create_inprocess_client(DirectoryMap::for_dir(src_dir.id(), src_dir.path()));
+            server::create_inprocess_client(LocalArenas::single(src_dir.arena(), src_dir.path()));
         let dst_server =
-            server::create_inprocess_client(DirectoryMap::for_dir(dst_dir.id(), dst_dir.path()));
+            server::create_inprocess_client(LocalArenas::single(dst_dir.arena(), dst_dir.path()));
         // Create a final file and a partial file in src
         src_temp.child("final.txt").write_str("finaldata")?;
         src_temp
@@ -1307,7 +1248,7 @@ mod tests {
             tarpc::context::current(),
             &src_server,
             &dst_server,
-            DirectoryId::from("testdir"),
+            Arena::from("testdir"),
             None,
         )
         .await?;
@@ -1334,12 +1275,12 @@ mod tests {
         let content = b"baa, baa, black sheep";
         file.write_binary(content)?;
 
-        let dir_id = DirectoryId::from("dir");
-        let server = server::create_inprocess_client(DirectoryMap::for_dir(&dir_id, temp.path()));
+        let arena = Arena::from("dir");
+        let server = server::create_inprocess_client(LocalArenas::single(&arena, temp.path()));
         let ranged = hash_file(
             tarpc::context::current(),
             &server,
-            &dir_id,
+            &arena,
             &PathBuf::from("somefile"),
             content.len() as u64,
             HASH_FILE_CHUNK,
@@ -1368,12 +1309,12 @@ mod tests {
         let content = b"baa, baa, black sheep";
         file.write_binary(content)?;
 
-        let dir_id = DirectoryId::from("dir");
-        let server = server::create_inprocess_client(DirectoryMap::for_dir(&dir_id, temp.path()));
+        let arena = Arena::from("dir");
+        let server = server::create_inprocess_client(LocalArenas::single(&arena, temp.path()));
         let ranged = hash_file(
             tarpc::context::current(),
             &server,
-            &dir_id,
+            &arena,
             &PathBuf::from("somefile"),
             content.len() as u64,
             4,
@@ -1402,12 +1343,12 @@ mod tests {
         let content = b"foobar";
         file.write_binary(content)?;
 
-        let dir_id = DirectoryId::from("dir");
-        let server = server::create_inprocess_client(DirectoryMap::for_dir(&dir_id, temp.path()));
+        let arena = Arena::from("dir");
+        let server = server::create_inprocess_client(LocalArenas::single(&arena, temp.path()));
         let ranged = hash_file(
             tarpc::context::current(),
             &server,
-            &dir_id,
+            &arena,
             &PathBuf::from("somefile"),
             8,
             4,

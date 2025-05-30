@@ -2,9 +2,9 @@
 
 use anyhow::Context as _;
 use clap::Parser;
-use prometheus::{IntCounter, register_int_counter};
+use prometheus::{register_int_counter, IntCounter};
+use realize_lib::config::{LocalArena, LocalArenas};
 use realize_lib::network::rpc::realize::metrics;
-use realize_lib::network::rpc::realize::server::{Directory, DirectoryMap};
 use realize_lib::network::security::{self, PeerVerifier};
 use realize_lib::network::tcp::{self, HostPort};
 use realize_lib::utils::logging;
@@ -86,17 +86,17 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
     let config = parse_config(&cli.config)
         .with_context(|| format!("{}: failed to read YAML config file", cli.config.display()))?;
 
-    // Directory access checks (see spec/future.md #daemonaccess)
+    // LocalArena access checks (see spec/future.md #daemonaccess)
     check_directory_access(&config.dirs)?;
 
     // Build directory list
     let mut dirs = Vec::new();
     for dir in &config.dirs {
         for (id, path) in &dir.map {
-            dirs.push(Directory::new(&id.as_str().into(), path.as_ref()));
+            dirs.push(LocalArena::new(&id.as_str().into(), path.as_ref()));
         }
     }
-    let dirs = DirectoryMap::new(dirs);
+    let dirs = LocalArenas::new(dirs);
 
     // Build PeerVerifier
     let crypto = Arc::new(security::default_provider());
@@ -144,7 +144,11 @@ fn check_directory_access(dirs: &Vec<DirEntry>) -> anyhow::Result<()> {
             log::debug!("Checking directory {}: {}", id, path);
             let path = std::path::Path::new(path);
             if !path.exists() {
-                anyhow::bail!("Directory '{}' (id: {}) does not exist", path.display(), id);
+                anyhow::bail!(
+                    "LocalArena '{}' (id: {}) does not exist",
+                    path.display(),
+                    id
+                );
             }
             if !fs::metadata(path)
                 .and_then(|m| Ok(m.is_dir()))

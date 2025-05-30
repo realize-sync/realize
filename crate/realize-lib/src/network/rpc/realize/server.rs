@@ -4,30 +4,32 @@
 //! file operations, and in-process server/client utilities. It is robust to interruptions
 //! and supports secure, restartable sync.
 
-use crate::utils::hash;
+use crate::config::{Arena, LocalArena, LocalArenas};
 use crate::network::rpc::realize::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
-use crate::utils::byterange::ByteRange;
 use crate::network::rpc::realize::Options;
 use crate::network::rpc::realize::{Config, Hash};
 use crate::network::rpc::realize::{
-    DirectoryId, RealizeError, RealizeService, Result, RsyncOperation, SyncedFile, SyncedFileState,
+    RealizeError, RealizeService, Result, RsyncOperation, SyncedFile, SyncedFileState,
 };
-use crate::network::rpc::realize::{RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse};
-use async_speed_limit::Limiter;
+use crate::network::rpc::realize::{
+    RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse,
+};
+use crate::utils::byterange::ByteRange;
+use crate::utils::hash;
 use async_speed_limit::clock::StandardClock;
+use async_speed_limit::Limiter;
 use fast_rsync::{
-    Signature as RsyncSignature, SignatureOptions, apply_limited as rsync_apply_limited,
-    diff as rsync_diff,
+    apply_limited as rsync_apply_limited, diff as rsync_diff, Signature as RsyncSignature,
+    SignatureOptions,
 };
 use futures::StreamExt;
 use std::cmp::min;
-use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tarpc::client::RpcError;
 use tarpc::client::stub::Stub;
+use tarpc::client::RpcError;
 use tarpc::context;
 use tarpc::server::Channel;
 use tokio::fs::{self, File, OpenOptions};
@@ -44,39 +46,8 @@ const RSYNC_BLOCK_SIZE: usize = 4096;
 /// Type shortcut for client type.
 pub type InProcessRealizeServiceClient = RealizeServiceClient<InProcessStub>;
 
-#[derive(Clone)]
-pub struct DirectoryMap {
-    dirs: Arc<HashMap<DirectoryId, Arc<Directory>>>,
-}
-
-impl DirectoryMap {
-    pub fn new<T>(dirs: T) -> Self
-    where
-        T: IntoIterator<Item = Directory>,
-    {
-        let map = dirs
-            .into_iter()
-            .map(|dir| (dir.id.clone(), Arc::new(dir)))
-            .collect();
-        Self {
-            dirs: Arc::new(map),
-        }
-    }
-    pub fn for_dir(id: &DirectoryId, path: &Path) -> Self {
-        let dir = Arc::new(Directory::new(id, path));
-        let mut map = HashMap::new();
-        map.insert(id.clone(), dir);
-        Self {
-            dirs: Arc::new(map),
-        }
-    }
-    pub fn get(&self, id: &DirectoryId) -> Option<&Arc<Directory>> {
-        self.dirs.get(id)
-    }
-}
-
 /// Creates a in-process client that works on the given directories.
-pub fn create_inprocess_client(dirs: DirectoryMap) -> InProcessRealizeServiceClient {
+pub fn create_inprocess_client(dirs: LocalArenas) -> InProcessRealizeServiceClient {
     RealizeServer::new(dirs).as_inprocess_client()
 }
 
@@ -100,29 +71,29 @@ impl Stub for InProcessStub {
 
 #[derive(Clone)]
 pub(crate) struct RealizeServer {
-    pub(crate) dirs: DirectoryMap,
+    pub(crate) dirs: LocalArenas,
     pub(crate) limiter: Option<Limiter<StandardClock>>,
 }
 
 impl RealizeServer {
-    pub(crate) fn new(dirs: DirectoryMap) -> Self {
+    pub(crate) fn new(dirs: LocalArenas) -> Self {
         Self {
             dirs,
             limiter: None,
         }
     }
 
-    pub(crate) fn new_limited(dirs: DirectoryMap, limiter: Limiter<StandardClock>) -> Self {
+    pub(crate) fn new_limited(dirs: LocalArenas, limiter: Limiter<StandardClock>) -> Self {
         Self {
             dirs,
             limiter: Some(limiter),
         }
     }
 
-    fn find_directory(&self, dir_id: &DirectoryId) -> Result<&Arc<Directory>> {
+    fn find_directory(&self, arena: &Arena) -> Result<&Arc<LocalArena>> {
         self.dirs
-            .get(dir_id)
-            .ok_or_else(|| RealizeError::BadRequest(format!("Unknown directory \"{}\"", dir_id)))
+            .get(arena)
+            .ok_or_else(|| RealizeError::BadRequest(format!("Unknown directory \"{}\"", arena)))
     }
 
     /// Create an in-process RealizeServiceClient for this server instance.
@@ -153,10 +124,10 @@ impl RealizeService for RealizeServer {
     async fn list(
         self,
         _: tarpc::context::Context,
-        dir_id: DirectoryId,
+        arena: Arena,
         options: Options,
     ) -> Result<Vec<SyncedFile>> {
-        let dir = self.find_directory(&dir_id)?.clone();
+        let dir = self.find_directory(&arena)?.clone();
 
         tokio::task::spawn_blocking(move || {
             let mut files = std::collections::BTreeMap::new();
@@ -182,12 +153,12 @@ impl RealizeService for RealizeServer {
     async fn read(
         self,
         _: tarpc::context::Context,
-        dir_id: DirectoryId,
+        arena: Arena,
         relative_path: PathBuf,
         range: ByteRange,
         options: Options,
     ) -> Result<Vec<u8>> {
-        let dir = self.find_directory(&dir_id)?;
+        let dir = self.find_directory(&arena)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
         let (_, actual) = logical.find(&options).await?;
         let mut file = open_for_range_read(&actual).await?;
@@ -200,13 +171,13 @@ impl RealizeService for RealizeServer {
     async fn send(
         self,
         _: tarpc::context::Context,
-        dir_id: DirectoryId,
+        arena: Arena,
         relative_path: PathBuf,
         range: ByteRange,
         data: Vec<u8>,
         options: Options,
     ) -> Result<()> {
-        let dir = self.find_directory(&dir_id)?;
+        let dir = self.find_directory(&arena)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
         let path = prepare_for_write(&options, logical).await?;
         let mut file = open_for_range_write(&path).await?;
@@ -218,11 +189,11 @@ impl RealizeService for RealizeServer {
     async fn finish(
         self,
         _: tarpc::context::Context,
-        dir_id: DirectoryId,
+        arena: Arena,
         relative_path: PathBuf,
         options: Options,
     ) -> Result<()> {
-        let dir = self.find_directory(&dir_id)?;
+        let dir = self.find_directory(&arena)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
         if options.ignore_partial {
             return Err(RealizeError::BadRequest(
@@ -238,12 +209,12 @@ impl RealizeService for RealizeServer {
     async fn hash(
         self,
         _ctx: tarpc::context::Context,
-        dir_id: DirectoryId,
+        arena: Arena,
         relative_path: PathBuf,
         range: ByteRange,
         options: Options,
     ) -> Result<Hash> {
-        let dir = self.find_directory(&dir_id)?;
+        let dir = self.find_directory(&arena)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
         let (_, path) = logical.find(&options).await?;
 
@@ -253,11 +224,11 @@ impl RealizeService for RealizeServer {
     async fn delete(
         self,
         _ctx: tarpc::context::Context,
-        dir_id: DirectoryId,
+        arena: Arena,
         relative_path: PathBuf,
         options: Options,
     ) -> Result<()> {
-        let dir = self.find_directory(&dir_id)?;
+        let dir = self.find_directory(&arena)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
         let final_path = logical.final_path();
         let partial_path = logical.partial_path();
@@ -274,12 +245,12 @@ impl RealizeService for RealizeServer {
     async fn calculate_signature(
         self,
         _ctx: tarpc::context::Context,
-        dir_id: DirectoryId,
+        arena: Arena,
         relative_path: PathBuf,
         range: ByteRange,
         options: Options,
     ) -> Result<crate::network::rpc::realize::Signature> {
-        let dir = self.find_directory(&dir_id)?;
+        let dir = self.find_directory(&arena)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
         let (_, actual) = logical.find(&options).await?;
         let mut file = File::open(&actual).await?;
@@ -290,19 +261,21 @@ impl RealizeService for RealizeServer {
             crypto_hash_size: 8,
         };
         let sig = RsyncSignature::calculate(&buffer, opts);
-        Ok(crate::network::rpc::realize::Signature(sig.into_serialized()))
+        Ok(crate::network::rpc::realize::Signature(
+            sig.into_serialized(),
+        ))
     }
 
     async fn diff(
         self,
         _ctx: tarpc::context::Context,
-        dir_id: DirectoryId,
+        arena: Arena,
         relative_path: PathBuf,
         range: ByteRange,
         signature: crate::network::rpc::realize::Signature,
         options: Options,
     ) -> Result<(crate::network::rpc::realize::Delta, Hash)> {
-        let dir = self.find_directory(&dir_id)?;
+        let dir = self.find_directory(&arena)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
         let (_, actual) = logical.find(&options).await?;
         let mut file = open_for_range_read(&actual).await?;
@@ -321,14 +294,14 @@ impl RealizeService for RealizeServer {
     async fn apply_delta(
         self,
         _ctx: tarpc::context::Context,
-        dir_id: DirectoryId,
+        arena: Arena,
         relative_path: PathBuf,
         range: ByteRange,
         delta: crate::network::rpc::realize::Delta,
         hash: Hash,
         options: Options,
     ) -> Result<()> {
-        let dir = self.find_directory(&dir_id)?;
+        let dir = self.find_directory(&arena)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
         let path = prepare_for_write(&options, logical).await?;
 
@@ -353,12 +326,12 @@ impl RealizeService for RealizeServer {
     async fn truncate(
         self,
         _ctx: tarpc::context::Context,
-        dir_id: DirectoryId,
+        arena: Arena,
         relative_path: PathBuf,
         file_size: u64,
         options: Options,
     ) -> Result<()> {
-        let dir = self.find_directory(&dir_id)?;
+        let dir = self.find_directory(&arena)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
         let path = prepare_for_write(&options, logical).await?;
 
@@ -491,45 +464,19 @@ async fn write_at_offset(file: &mut File, offset: u64, data: &Vec<u8>) -> Result
     Ok(())
 }
 
-// A directory, stored in RealizeServer and in LogicalPath.
-pub struct Directory {
-    id: DirectoryId,
-    path: PathBuf,
-}
-
-impl Directory {
-    /// Create a directory with the given id and path.
-    pub fn new(id: &DirectoryId, path: &Path) -> Self {
-        Self {
-            id: id.clone(),
-            path: path.to_path_buf(),
-        }
-    }
-
-    /// Directory ID, as found in Service calls.
-    pub fn id(&self) -> &DirectoryId {
-        &self.id
-    }
-
-    /// Local directory path that correspond to the ID.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-/// A logical path is a relative path inside of a [Directory].
+/// A logical path is a relative path inside of a [LocalArena].
 //
 /// The corresponding actual file might be in
 /// [SyncedFileState::Partial] or [SyncedFileState::Final] form. Check
 /// with [LogicalPath::find].
-struct LogicalPath(Arc<Directory>, PathBuf);
+struct LogicalPath(Arc<LocalArena>, PathBuf);
 
 impl LogicalPath {
     /// Create a new logical path.
     ///
     /// The given path must be relative and cannot reference any
     /// hidden directory or file.
-    fn new(dir: &Arc<Directory>, path: &Path) -> std::result::Result<Self, RealizeError> {
+    fn new(dir: &Arc<LocalArena>, path: &Path) -> std::result::Result<Self, RealizeError> {
         if path.as_os_str().is_empty() {
             return Err(RealizeError::BadRequest(
                 "Invalid Relative path; empty".to_string(),
@@ -549,7 +496,7 @@ impl LogicalPath {
     }
 
     /// Create a logical path from an actual partial or final path.
-    fn from_actual(dir: &Arc<Directory>, actual: &Path) -> Option<(SyncedFileState, Self)> {
+    fn from_actual(dir: &Arc<LocalArena>, actual: &Path) -> Option<(SyncedFileState, Self)> {
         if !actual.is_file() {
             return None;
         }
@@ -691,18 +638,19 @@ async fn is_empty_dir(path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::network::rpc::realize::Hash;
-    use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
     use std::fs;
     use std::io::Read as _;
 
-    fn setup_server_with_dir() -> anyhow::Result<(RealizeServer, TempDir, Arc<Directory>)> {
+    fn setup_server_with_dir() -> anyhow::Result<(RealizeServer, TempDir, Arc<LocalArena>)> {
         let temp = TempDir::new()?;
-        let dir = Arc::new(Directory::new(&DirectoryId::from("testdir"), temp.path()));
+        let arena = Arena::from("testdir");
+        let dir = Arc::new(LocalArena::new(&arena, temp.path()));
 
         Ok((
-            RealizeServer::new(DirectoryMap::for_dir(dir.id(), dir.path())),
+            RealizeServer::new(LocalArenas::single(&arena, dir.path())),
             temp,
             dir,
         ))
@@ -710,8 +658,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_final_and_partial_paths() -> anyhow::Result<()> {
-        let dir = Arc::new(Directory::new(
-            &DirectoryId::from("testdir"),
+        let dir = Arc::new(LocalArena::new(
+            &Arena::from("testdir"),
             &PathBuf::from("/doesnotexist/testdir"),
         ));
 
@@ -741,7 +689,7 @@ mod tests {
     #[tokio::test]
     async fn test_find_logical_path() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        let dir = Arc::new(Directory::new(&DirectoryId::from("testdir"), temp.path()));
+        let dir = Arc::new(LocalArena::new(&Arena::from("testdir"), temp.path()));
         let opts = Options::default();
 
         temp.child("foo.txt").write_str("test")?;
@@ -798,7 +746,7 @@ mod tests {
     #[tokio::test]
     async fn test_find_logical_path_partial_and_final() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        let dir = Arc::new(Directory::new(&DirectoryId::from("testdir"), temp.path()));
+        let dir = Arc::new(LocalArena::new(&Arena::from("testdir"), temp.path()));
         let opts = Options::default();
         let nopartial = Options {
             ignore_partial: true,
@@ -828,18 +776,16 @@ mod tests {
     #[tokio::test]
     async fn test_find_logical_path_ignore_partial() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        let dir = Arc::new(Directory::new(&DirectoryId::from("testdir"), temp.path()));
+        let dir = Arc::new(LocalArena::new(&Arena::from("testdir"), temp.path()));
         let nopartial = Options {
             ignore_partial: true,
         };
 
         temp.child(".foo.txt.part").write_str("test")?;
-        assert!(
-            LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?
-                .find(&nopartial)
-                .await
-                .is_err()
-        );
+        assert!(LogicalPath::new(&dir, &PathBuf::from("foo.txt"))?
+            .find(&nopartial)
+            .await
+            .is_err());
 
         temp.child("bar.txt").write_str("test")?;
         assert_eq!(
@@ -854,8 +800,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_logical_path_validation_relative() {
-        let dir = Arc::new(Directory::new(
-            &DirectoryId::from("testdir"),
+        let dir = Arc::new(LocalArena::new(
+            &Arena::from("testdir"),
             &PathBuf::from("/tmp/testdir"),
         ));
 
@@ -898,7 +844,7 @@ mod tests {
             .clone()
             .list(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 Options::default(),
             )
             .await?;
@@ -921,7 +867,7 @@ mod tests {
         let files = server
             .list(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 Options::default(),
             )
             .await?;
@@ -963,7 +909,7 @@ mod tests {
             .clone()
             .send(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 fpath.relative_path().to_path_buf(),
                 ByteRange { start: 5, end: 10 },
                 data1.clone(),
@@ -981,7 +927,7 @@ mod tests {
             .clone()
             .send(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 fpath.relative_path().to_path_buf(),
                 ByteRange { start: 0, end: 5 },
                 data2.clone(),
@@ -1005,7 +951,7 @@ mod tests {
             .clone()
             .read(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 fpath.relative_path().to_path_buf(),
                 ByteRange { start: 5, end: 10 },
                 Options::default(),
@@ -1017,7 +963,7 @@ mod tests {
             .clone()
             .read(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 fpath.relative_path().to_path_buf(),
                 ByteRange { start: 0, end: 5 },
                 Options::default(),
@@ -1029,7 +975,7 @@ mod tests {
             .clone()
             .read(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 fpath.relative_path().to_path_buf(),
                 ByteRange { start: 0, end: 15 },
                 Options::default(),
@@ -1051,7 +997,7 @@ mod tests {
         server
             .finish(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 fpath.relative_path().to_path_buf(),
                 Options::default(),
             )
@@ -1074,7 +1020,7 @@ mod tests {
         server
             .finish(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 fpath.relative_path().to_path_buf(),
                 Options::default(),
             )
@@ -1096,7 +1042,7 @@ mod tests {
             .clone()
             .truncate(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 fpath.relative_path().to_path_buf(),
                 7,
                 Options::default(),
@@ -1117,7 +1063,7 @@ mod tests {
             .clone()
             .hash(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 PathBuf::from("foo.txt"),
                 ByteRange {
                     start: 0,
@@ -1137,7 +1083,7 @@ mod tests {
             .clone()
             .hash(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 PathBuf::from("bar.txt"),
                 ByteRange {
                     start: 0,
@@ -1161,7 +1107,7 @@ mod tests {
             .clone()
             .hash(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 PathBuf::from("foo.txt"),
                 ByteRange {
                     start: 100,
@@ -1185,7 +1131,7 @@ mod tests {
             .clone()
             .hash(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 PathBuf::from("foo.txt"),
                 ByteRange { start: 0, end: 200 },
                 Options::default(),
@@ -1208,7 +1154,7 @@ mod tests {
             .clone()
             .delete(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 PathBuf::from("foo.txt"),
                 Options::default(),
             )
@@ -1220,7 +1166,7 @@ mod tests {
             .clone()
             .delete(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 PathBuf::from("foo.txt"),
                 Options::default(),
             )
@@ -1231,14 +1177,12 @@ mod tests {
     #[tokio::test]
     async fn tarpc_rpc_inprocess() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        let client = create_inprocess_client(DirectoryMap::for_dir(
-            &DirectoryId::from("testdir"),
-            temp.path(),
-        ));
+        let client =
+            create_inprocess_client(LocalArenas::single(&Arena::from("testdir"), temp.path()));
         let list = client
             .list(
                 tarpc::context::current(),
-                DirectoryId::from("testdir"),
+                Arena::from("testdir"),
                 Options::default(),
             )
             .await??;
@@ -1259,7 +1203,7 @@ mod tests {
             .clone()
             .calculate_signature(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 file_path.clone(),
                 ByteRange {
                     start: 0,
@@ -1278,7 +1222,7 @@ mod tests {
             .clone()
             .diff(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 file_path.clone(),
                 ByteRange {
                     start: 0,
@@ -1288,7 +1232,7 @@ mod tests {
                 Options::default(),
             )
             .await?;
-        assert!(!delta.0.0.is_empty());
+        assert!(!delta.0 .0.is_empty());
 
         // Revert file to old content, then apply delta
         temp.child("foo.txt").write_binary(file_content)?;
@@ -1296,7 +1240,7 @@ mod tests {
             .clone()
             .apply_delta(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 file_path.clone(),
                 ByteRange {
                     start: 0,
@@ -1326,7 +1270,7 @@ mod tests {
             .clone()
             .calculate_signature(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 PathBuf::from("notfound.txt"),
                 ByteRange { start: 0, end: 10 },
                 Options::default(),
@@ -1347,7 +1291,7 @@ mod tests {
             .clone()
             .apply_delta(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 file_path,
                 ByteRange { start: 0, end: 3 },
                 crate::network::rpc::realize::Delta(vec![1, 2, 3]),
@@ -1372,7 +1316,7 @@ mod tests {
             .clone()
             .list(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 Options {
                     ignore_partial: false,
                 },
@@ -1385,7 +1329,7 @@ mod tests {
             .clone()
             .list(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 Options {
                     ignore_partial: true,
                 },
@@ -1405,7 +1349,7 @@ mod tests {
             .clone()
             .list(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 Options {
                     ignore_partial: false,
                 },
@@ -1418,7 +1362,7 @@ mod tests {
             .clone()
             .list(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 Options {
                     ignore_partial: true,
                 },
@@ -1438,7 +1382,7 @@ mod tests {
             .clone()
             .read(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 PathBuf::from("foo.txt"),
                 ByteRange { start: 0, end: 7 },
                 Options {
@@ -1452,7 +1396,7 @@ mod tests {
             .clone()
             .read(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 PathBuf::from("foo.txt"),
                 ByteRange { start: 0, end: 5 },
                 Options {
@@ -1478,7 +1422,7 @@ mod tests {
             .clone()
             .delete(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 file_path.clone(),
                 Options::default(),
             )
@@ -1509,7 +1453,7 @@ mod tests {
             .clone()
             .delete(
                 tarpc::context::current(),
-                dir.id().clone(),
+                dir.arena().clone(),
                 file_path.clone(),
                 Options::default(),
             )
@@ -1525,8 +1469,8 @@ mod tests {
 
     #[tokio::test]
     async fn configure_noop_returns_none() {
-        let server = RealizeServer::new(DirectoryMap::for_dir(
-            &DirectoryId::from("testdir"),
+        let server = RealizeServer::new(LocalArenas::single(
+            &Arena::from("testdir"),
             &PathBuf::from("/tmp/testdir"),
         ));
         let returned = server
@@ -1544,10 +1488,7 @@ mod tests {
 
     #[tokio::test]
     async fn configure_limited_sets_and_returns_limit() {
-        let dirs = DirectoryMap::for_dir(
-            &DirectoryId::from("testdir"),
-            &PathBuf::from("/tmp/testdir"),
-        );
+        let dirs = LocalArenas::single(&Arena::from("testdir"), &PathBuf::from("/tmp/testdir"));
         let limiter = Limiter::<StandardClock>::new(f64::INFINITY);
         let server = RealizeServer::new_limited(dirs, limiter.clone());
         let limit = 55555u64;

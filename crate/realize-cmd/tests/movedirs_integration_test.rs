@@ -1,10 +1,9 @@
-use assert_fs::TempDir;
 use assert_fs::fixture::ChildPath;
 use assert_fs::prelude::*;
+use assert_fs::TempDir;
 use assert_unordered::assert_eq_unordered;
 use hyper_util::rt::TokioIo;
-use realize_lib::network::rpc::realize::DirectoryId;
-use realize_lib::network::rpc::realize::server::DirectoryMap;
+use realize_lib::config::{Arena, LocalArena, LocalArenas};
 use realize_lib::network::security::{self, PeerVerifier};
 use realize_lib::network::tcp::{self, HostPort};
 use realize_lib::utils::async_utils::AbortOnDrop;
@@ -65,14 +64,14 @@ impl Fixture {
             .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_b_path.as_ref())?)?;
         let (src_addr3, server_handle_src) = tcp::start_server(
             &HostPort::parse("127.0.0.1:0").await?,
-            DirectoryMap::for_dir(&"dir".into(), src_dir.path()),
+            LocalArenas::single(&"dir".into(), src_dir.path()),
             verifier.clone(),
             privkey_a.clone(),
         )
         .await?;
         let (dst_addr3, server_handle_dst) = tcp::start_server(
             &HostPort::parse("127.0.0.1:0").await?,
-            DirectoryMap::for_dir(&"dir".into(), dst_dir.path()),
+            LocalArenas::single(&"dir".into(), dst_dir.path()),
             verifier.clone(),
             privkey_b.clone(),
         )
@@ -433,7 +432,10 @@ async fn realize_metrics_export() -> anyhow::Result<()> {
         .command()
         .arg("--metrics-addr")
         .arg(&realize_metrics_addr)
-        .env("RUST_LOG", "realize_lib::network::rpc::realize::metrics=debug")
+        .env(
+            "RUST_LOG",
+            "realize_lib::network::rpc::realize::metrics=debug",
+        )
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -591,9 +593,9 @@ async fn multiple_directory_ids() -> anyhow::Result<()> {
         .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_b_path.as_ref())?)?;
 
     // Setup src server with two directories
-    let src_dirs = DirectoryMap::new([
-        realize_lib::network::rpc::realize::server::Directory::new(&DirectoryId::from("dir1"), src_dir1.path()),
-        realize_lib::network::rpc::realize::server::Directory::new(&DirectoryId::from("dir2"), src_dir2.path()),
+    let src_dirs = LocalArenas::new([
+        LocalArena::new(&Arena::from("dir1"), src_dir1.path()),
+        LocalArena::new(&Arena::from("dir2"), src_dir2.path()),
     ]);
     let (src_addr, _src_handle) = tcp::start_server(
         &HostPort::parse("127.0.0.1:0").await?,
@@ -604,9 +606,9 @@ async fn multiple_directory_ids() -> anyhow::Result<()> {
     .await?;
 
     // Setup dst server with two directories
-    let dst_dirs = DirectoryMap::new([
-        realize_lib::network::rpc::realize::server::Directory::new(&DirectoryId::from("dir1"), dst_dir1.path()),
-        realize_lib::network::rpc::realize::server::Directory::new(&DirectoryId::from("dir2"), dst_dir2.path()),
+    let dst_dirs = LocalArenas::new([
+        LocalArena::new(&Arena::from("dir1"), dst_dir1.path()),
+        LocalArena::new(&Arena::from("dir2"), dst_dir2.path()),
     ]);
     let (dst_addr, _dst_handle) = tcp::start_server(
         &HostPort::parse("127.0.0.1:0").await?,

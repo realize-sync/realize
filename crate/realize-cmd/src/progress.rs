@@ -1,7 +1,7 @@
 use console::style;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use realize_lib::config::Arena;
 use realize_lib::logic::consensus::movedirs::ProgressEvent;
-use realize_lib::network::rpc::realize::DirectoryId;
 use realize_lib::network::tcp::ClientConnectionState;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -55,14 +55,14 @@ impl CliProgress {
 
     fn set_length(
         &mut self,
-        dir_id: &DirectoryId,
+        arena: &Arena,
         total_files: usize,
         total_bytes: u64,
         available_bytes: u64,
     ) {
         log::info!(
             "{}: {} files to move ({})",
-            dir_id,
+            arena,
             total_files,
             HumanBytes(total_bytes)
         );
@@ -76,13 +76,13 @@ impl CliProgress {
 
     fn for_file(
         &mut self,
-        dir_id: &DirectoryId,
+        arena: &Arena,
         path: &std::path::Path,
         bytes: u64,
         available: u64,
     ) -> CliFileProgress {
         let path = if self.should_show_dir {
-            format!("{}/{}", dir_id, path.display())
+            format!("{}/{}", arena, path.display())
         } else {
             format!("{}", path.display())
         };
@@ -160,8 +160,7 @@ impl CliProgress {
         mut dst_watch_rx: tokio::sync::watch::Receiver<ClientConnectionState>,
     ) {
         use ProgressEvent::*;
-        let mut file_progress_map: HashMap<(DirectoryId, PathBuf), CliFileProgress> =
-            HashMap::new();
+        let mut file_progress_map: HashMap<(Arena, PathBuf), CliFileProgress> = HashMap::new();
 
         self.set_connection_state(
             *src_watch_rx.borrow_and_update(),
@@ -184,76 +183,76 @@ impl CliProgress {
                 ev = rx.recv() => match ev {
                     None => return,
                     Some(MovingDir {
-                        dir_id,
+                        arena,
                         total_files,
                         total_bytes,
                         available_bytes,
                         ..
                     }) => {
-                        self.set_length(&dir_id, total_files, total_bytes, available_bytes);
+                        self.set_length(&arena, total_files, total_bytes, available_bytes);
                     }
                     Some(MovingFile {
-                        dir_id,
+                        arena,
                         path,
                         bytes,
                         available,
                         ..
                     }) => {
-                        let fp = self.for_file(&dir_id, &path, bytes, available);
-                        file_progress_map.insert((dir_id, path), fp);
+                        let fp = self.for_file(&arena, &path, bytes, available);
+                        file_progress_map.insert((arena, path), fp);
                     }
-                    Some(VerifyingFile { dir_id, path, .. }) => {
-                        if let Some(fp) = file_progress_map.get_mut(&(dir_id, path)) {
+                    Some(VerifyingFile { arena, path, .. }) => {
+                        if let Some(fp) = file_progress_map.get_mut(&(arena, path)) {
                             fp.verifying();
                         }
                     }
-                    Some(RsyncingFile { dir_id, path, .. }) => {
-                        if let Some(fp) = file_progress_map.get_mut(&(dir_id, path)) {
+                    Some(RsyncingFile { arena, path, .. }) => {
+                        if let Some(fp) = file_progress_map.get_mut(&(arena, path)) {
                             fp.rsyncing();
                         }
                     }
-                    Some(CopyingFile { dir_id, path, .. }) => {
-                        if let Some(fp) = file_progress_map.get_mut(&(dir_id, path)) {
+                    Some(CopyingFile { arena, path, .. }) => {
+                        if let Some(fp) = file_progress_map.get_mut(&(arena, path)) {
                             fp.copying();
                         }
                     }
-                    Some(PendingFile { dir_id, path, .. }) => {
-                        if let Some(fp) = file_progress_map.get_mut(&(dir_id, path)) {
+                    Some(PendingFile { arena, path, .. }) => {
+                        if let Some(fp) = file_progress_map.get_mut(&(arena, path)) {
                             fp.pending();
                         }
                     }
                     Some(IncrementByteCount {
-                        dir_id,
+                        arena,
                         path,
                         bytecount,
                         ..
                     }) => {
-                        if let Some(fp) = file_progress_map.get_mut(&(dir_id, path)) {
+                        if let Some(fp) = file_progress_map.get_mut(&(arena, path)) {
                             fp.inc(bytecount);
                         }
                     }
                     Some(DecrementByteCount {
-                        dir_id,
+                        arena,
                         path,
                         bytecount,
                         ..
                     }) => {
-                        if let Some(fp) = file_progress_map.get_mut(&(dir_id, path)) {
+                        if let Some(fp) = file_progress_map.get_mut(&(arena, path)) {
                             fp.dec(bytecount);
                         }
                     }
-                    Some(FileSuccess { dir_id, path, .. }) => {
-                        if let Some(mut fp) = file_progress_map.remove(&(dir_id, path)) {
+                    Some(FileSuccess { arena, path, .. }) => {
+                        if let Some(mut fp) = file_progress_map.remove(&(arena, path)) {
                             fp.success();
                         }
                     }
                     Some(FileError {
-                        dir_id,
+                        arena,
                         path,
                         error,
                         ..
                     }) => {
-                        if let Some(mut fp) = file_progress_map.remove(&(dir_id, path)) {
+                        if let Some(mut fp) = file_progress_map.remove(&(arena, path)) {
                             // Use a generic error for display
                             fp.error(&error);
                         }

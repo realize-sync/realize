@@ -1,6 +1,7 @@
 use assert_fs::prelude::*;
 use assert_fs::TempDir;
 use prometheus::proto::MetricType;
+use realize_lib::config::{Arena, LocalArena, LocalArenas};
 use realize_lib::logic::consensus::movedirs;
 use realize_lib::logic::consensus::movedirs::METRIC_END_COUNT;
 use realize_lib::logic::consensus::movedirs::METRIC_FILE_END_COUNT;
@@ -10,8 +11,8 @@ use realize_lib::logic::consensus::movedirs::METRIC_RANGE_WRITE_BYTES;
 use realize_lib::logic::consensus::movedirs::METRIC_READ_BYTES;
 use realize_lib::logic::consensus::movedirs::METRIC_START_COUNT;
 use realize_lib::logic::consensus::movedirs::METRIC_WRITE_BYTES;
-use realize_lib::network::rpc::realize::{DirectoryId, Options};
-use realize_lib::network::rpc::realize::server::{self, DirectoryMap, InProcessRealizeServiceClient};
+use realize_lib::network::rpc::realize::server::{self, InProcessRealizeServiceClient};
+use realize_lib::network::rpc::realize::Options;
 use std::sync::Arc;
 
 // Metric tests are kept in their own binary to avoid other test
@@ -23,7 +24,7 @@ use std::sync::Arc;
 #[tokio::test]
 #[serial_test::serial]
 async fn client_success_call_count() -> anyhow::Result<()> {
-    let (_temp, dir_id, client) = setup_inprocess_client();
+    let (_temp, arena, client) = setup_inprocess_client();
     let before = get_metric_value(
         "realize_client_call_count",
         &[("method", "list"), ("status", "OK"), ("error", "OK")],
@@ -31,7 +32,7 @@ async fn client_success_call_count() -> anyhow::Result<()> {
     client
         .list(
             tarpc::context::current(),
-            dir_id.clone(),
+            arena.clone(),
             Options::default(),
         )
         .await??;
@@ -46,7 +47,7 @@ async fn client_success_call_count() -> anyhow::Result<()> {
 #[tokio::test]
 #[serial_test::serial]
 async fn client_error_call_count() -> anyhow::Result<()> {
-    let (_temp, _dir_id, client) = setup_inprocess_client();
+    let (_temp, _arena, client) = setup_inprocess_client();
     let before_err = get_metric_value(
         "realize_client_call_count",
         &[
@@ -58,7 +59,7 @@ async fn client_error_call_count() -> anyhow::Result<()> {
     assert!(client
         .list(
             tarpc::context::current(),
-            DirectoryId::from("doesnotexist"),
+            Arena::from("doesnotexist"),
             Options::default(),
         )
         .await?
@@ -78,7 +79,7 @@ async fn client_error_call_count() -> anyhow::Result<()> {
 #[tokio::test]
 #[serial_test::serial]
 async fn server_success_call_count() -> anyhow::Result<()> {
-    let (_temp, dir_id, client) = setup_inprocess_client();
+    let (_temp, arena, client) = setup_inprocess_client();
     let before_srv = get_metric_value(
         "realize_server_call_count",
         &[("method", "list"), ("status", "OK"), ("error", "OK")],
@@ -86,7 +87,7 @@ async fn server_success_call_count() -> anyhow::Result<()> {
     client
         .list(
             tarpc::context::current(),
-            dir_id.clone(),
+            arena.clone(),
             Options::default(),
         )
         .await??;
@@ -101,7 +102,7 @@ async fn server_success_call_count() -> anyhow::Result<()> {
 #[tokio::test]
 #[serial_test::serial]
 async fn server_error_call_count() -> anyhow::Result<()> {
-    let (_temp, _dir_id, client) = setup_inprocess_client();
+    let (_temp, _arena, client) = setup_inprocess_client();
     let before_srv_err = get_metric_value(
         "realize_server_call_count",
         &[
@@ -113,7 +114,7 @@ async fn server_error_call_count() -> anyhow::Result<()> {
     assert!(client
         .list(
             tarpc::context::current(),
-            DirectoryId::from("doesnotexist"),
+            Arena::from("doesnotexist"),
             Options::default(),
         )
         .await?
@@ -147,19 +148,13 @@ async fn move_files_metrics() -> anyhow::Result<()> {
     let src_temp = TempDir::new()?;
     let dst_temp = TempDir::new()?;
     src_temp.child("foo").write_str("abc")?;
-    let src_dir = Arc::new(realize_lib::network::rpc::realize::server::Directory::new(
-        &DirectoryId::from("testdir"),
-        src_temp.path(),
-    ));
-    let dst_dir = Arc::new(realize_lib::network::rpc::realize::server::Directory::new(
-        &DirectoryId::from("testdir"),
-        dst_temp.path(),
-    ));
+    let src_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), src_temp.path()));
+    let dst_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), dst_temp.path()));
     let (success, error, _interrupted) = movedirs::move_dir(
         tarpc::context::current(),
-        &server::create_inprocess_client(DirectoryMap::for_dir(src_dir.id(), src_dir.path())),
-        &server::create_inprocess_client(DirectoryMap::for_dir(dst_dir.id(), dst_dir.path())),
-        DirectoryId::from("testdir"),
+        &server::create_inprocess_client(LocalArenas::single(src_dir.arena(), src_dir.path())),
+        &server::create_inprocess_client(LocalArenas::single(dst_dir.arena(), dst_dir.path())),
+        Arena::from("testdir"),
         None,
     )
     .await?;
@@ -184,12 +179,12 @@ async fn move_files_metrics() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn setup_inprocess_client() -> (TempDir, DirectoryId, InProcessRealizeServiceClient) {
+fn setup_inprocess_client() -> (TempDir, Arena, InProcessRealizeServiceClient) {
     let temp = TempDir::new().unwrap();
-    let dir_id = DirectoryId::from("testdir");
-    let client = server::create_inprocess_client(DirectoryMap::for_dir(&dir_id, temp.path()));
+    let arena = Arena::from("testdir");
+    let client = server::create_inprocess_client(LocalArenas::single(&arena, temp.path()));
 
-    (temp, dir_id, client)
+    (temp, arena, client)
 }
 
 fn get_metric_value(name: &str, label_pairs: &[(&str, &str)]) -> f64 {

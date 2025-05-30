@@ -47,7 +47,7 @@ is only kept in the Real.
   - *The Unreal* Remote paths, copied locally and blobs not
     available or not completely available locally
 
-  - *An Area* a set of path and their assignment to blobs. Note that
+  - *An Arena* a set of path and their assignment to blobs. Note that
     directories only exist as path elements in the Unreal.
 
   - *Realize* put data from the Unreal into a local file
@@ -55,8 +55,8 @@ is only kept in the Real.
   - *Unrealize* move a local file to cache and let cache eviction
     strategy deal with it
 
-  - *The Household* set of peers that sync some areas of data. Some peers
-    might only be interested in a subset of the Household's areas.
+  - *The Household* set of peers that sync some arenas of data. Some peers
+    might only be interested in a subset of the Household's arenas.
 
   - *A peer* member of the Houshold, known by its public key, with which
     communication is possible.
@@ -87,7 +87,7 @@ is only kept in the Real.
 
   - *Create* link a blob to a path
 
-  - *Consensus* is achieved for an area when all peers agree on the
+  - *Consensus* is achieved for an arena when all peers agree on the
     set of paths the blob each path is assigned to.
 
   - *Reaching Consensus* is the process of two peers sending their
@@ -100,7 +100,7 @@ is only kept in the Real.
 
 ### The Real
 
-The Real contains locally-available files, split by Area.
+The Real contains locally-available files, split by Arena.
 
 ### The Unreal
 
@@ -110,9 +110,9 @@ The Unreal contains remotely-available files, with, for each peer:
 
 - the address to connect to (unless the peer is the one to connect)
 
-- a list Areas, identified by their name
+- a list Arenas, identified by their name
 
-- for each Area, list of remotely-available files (path) and their
+- for each Arena, list of remotely-available files (path) and their
   size (+more information? what about duplicates?)
 
 While connected, the local server gets notified whenever files are
@@ -129,19 +129,19 @@ like when deleting, renaming, overwriting or editing.
 
 File data that's part of the Unreal works as a cache: data that's
 worked on often is kept in cache, older data is evicted as needed to
-make space. The Real and the Unreal of an Area compete for space, that
+make space. The Real and the Unreal of an Arena compete for space, that
 is cache data might need to be removed to allow a Real file to be
 added. Real files take priority over cache content. This means that
 the cache can be filled up to the quota allocated for real files and
 cache data, as cache data can always be evicted to make space for real
 files when necessary.
 
-When multiple areas are supported, two modes are possible:
+When multiple arenas are supported, two modes are possible:
 
- - different areas have shared quotas and caches; they must be
+ - different arenas have shared quotas and caches; they must be
    on the same filesystem for this to make sense
 
- - different areas have separate quotas and caches
+ - different arenas have separate quotas and caches
 
 Initial cache eviction stategy:
  - LRU with priorities:
@@ -151,7 +151,7 @@ Manual commands allow the cache to be cleared or shrunk.
 
 ### Local History
 
-For each Area, a history of file addition, edit, overwrite, move and
+For each Arena, a history of file addition, edit, overwrite, move and
 deletion that are yet to be sent to peers. History sections are
 removed once it's been sent to all known peers.
 
@@ -186,8 +186,8 @@ Possible resolutions:
 Whatever the solution, conflicting versions should be available,
 somehow, some ideas:
 
- - Keep a "conflicts" subdirectory at the root, next to the areas.
- Each conflicting file (area name + path) is a directory with all
+ - Keep a "conflicts" subdirectory at the root, next to the arenas.
+ Each conflicting file (arena name + path) is a directory with all
  versions available inside as peer + hash + ext, with their
  modification time set.
 
@@ -228,7 +228,7 @@ a file, but only for a time (how long?)
 
 1. Move files from one peer to the other (current as of 2025-05-29)
 
-2. A passthrough filesystem that makes the real layer of areas
+2. A passthrough filesystem that makes the real layer of arenas
    available, tracks history for peers. On Consensus time (started
    manually), path (re)assignments and blobs from history.
 
@@ -325,6 +325,8 @@ crate/
        │  │                        │
        │  └─ history/              │     Local change history
        │                           └─
+       │
+       ├─ config.rs                Layer-agnostic definitions and config
        │
        └─ util/                    Random layer-agnostic utilities
 

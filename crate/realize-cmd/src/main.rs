@@ -1,15 +1,15 @@
 use anyhow::Context as _;
-use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
+use async_speed_limit::Limiter;
 use clap::Parser;
 use clap::ValueEnum;
 use console::style;
 use indicatif::HumanBytes;
 use progress::CliProgress;
-use prometheus::{IntCounter, register_int_counter};
+use prometheus::{register_int_counter, IntCounter};
+use realize_lib::config::Arena;
 use realize_lib::logic::consensus::movedirs::MoveFileError;
 use realize_lib::network::rpc::realize::metrics;
-use realize_lib::network::rpc::realize::DirectoryId;
 use realize_lib::network::security::{self, PeerVerifier};
 use realize_lib::network::tcp::{self, ClientConnectionState, HostPort, TcpRealizeServiceClient};
 use realize_lib::utils::logging;
@@ -230,9 +230,7 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
                 ctx,
                 &src_client,
                 &dst_client,
-                cli.directory_ids
-                    .iter()
-                    .map(|s| DirectoryId::from(s.to_string())),
+                cli.directory_ids.iter().map(|s| Arena::from(s.to_string())),
                 Some(progress_tx.clone()),
             )
             .await;
@@ -330,8 +328,10 @@ async fn connect(
     privkey: Arc<dyn SigningKey>,
     verifier: Arc<PeerVerifier>,
     conn_status: tokio::sync::watch::Sender<ClientConnectionState>,
-) -> anyhow::Result<realize_lib::network::rpc::realize::RealizeServiceClient<tcp::TcpStub>, anyhow::Error>
-{
+) -> anyhow::Result<
+    realize_lib::network::rpc::realize::RealizeServiceClient<tcp::TcpStub>,
+    anyhow::Error,
+> {
     let addr = HostPort::parse(addr)
         .await
         .with_context(|| format!("Failed to resolve {} {}", argument, addr))?;

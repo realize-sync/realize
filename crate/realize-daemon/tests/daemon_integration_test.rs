@@ -4,17 +4,18 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use assert_fs::TempDir;
 use assert_fs::prelude::*;
+use assert_fs::TempDir;
 use predicates::prelude::*;
-use realize_lib::network::rpc::realize::{DirectoryId, Options};
+use realize_lib::config::Arena;
+use realize_lib::network::rpc::realize::Options;
 use realize_lib::network::security;
 use realize_lib::network::security::PeerVerifier;
 use realize_lib::network::tcp::{self, HostPort};
 use reqwest::Client;
+use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::SubjectPublicKeyInfoDer;
-use rustls::pki_types::pem::PemObject as _;
 use tarpc::context;
 use tokio::io::AsyncBufReadExt as _;
 use tokio::process::Command;
@@ -122,7 +123,7 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
     let files = client
         .list(
             context::current(),
-            DirectoryId::from("testdir"),
+            Arena::from("testdir"),
             Options::default(),
         )
         .await??;

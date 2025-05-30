@@ -27,22 +27,21 @@ use tarpc::server::{BaseChannel, Channel};
 use tarpc::tokio_serde::formats::Bincode;
 use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
 
+use crate::config::LocalArenas;
+use crate::network::rate_limit::RateLimitedStream;
 use crate::network::reconnect::Connect;
 use crate::network::reconnect::Reconnect;
 use crate::network::rpc::realize::metrics;
 use crate::network::rpc::realize::metrics::MetricsRealizeClient;
 use crate::network::rpc::realize::metrics::MetricsRealizeServer;
-use crate::network::rate_limit::RateLimitedStream;
+use crate::network::rpc::realize::server::RealizeServer;
 use crate::network::rpc::realize::Config;
 use crate::network::rpc::realize::RealizeServiceRequest;
 use crate::network::rpc::realize::RealizeServiceResponse;
 use crate::network::rpc::realize::{RealizeService, RealizeServiceClient};
-use crate::network::rpc::realize::server::RealizeServer;
 use crate::network::security;
 use crate::network::security::PeerVerifier;
 use crate::utils::async_utils::AbortOnDrop;
-
-use crate::network::rpc::realize::server::DirectoryMap;
 
 use std::fmt;
 use std::net::IpAddr;
@@ -115,7 +114,7 @@ impl From<SocketAddr> for HostPort {
 /// Start the server, listening on the given address.
 pub async fn start_server(
     hostport: &HostPort,
-    dirs: DirectoryMap,
+    dirs: LocalArenas,
     verifier: Arc<PeerVerifier>,
     privkey: Arc<dyn SigningKey>,
 ) -> anyhow::Result<(SocketAddr, AbortOnDrop<()>)> {
@@ -335,7 +334,8 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
-    use crate::network::rpc::realize::{Config, DirectoryId, Options};
+    use crate::config::Arena;
+    use crate::network::rpc::realize::{Config, Options};
     use crate::utils::async_utils::AbortOnDrop;
     use assert_fs::TempDir;
     use rustls::pki_types::PrivateKeyDer;
@@ -347,7 +347,7 @@ mod tests {
         verifier: Arc<PeerVerifier>,
     ) -> anyhow::Result<(SocketAddr, AbortOnDrop<()>, TempDir)> {
         let temp = TempDir::new()?;
-        let dirs = DirectoryMap::for_dir(&DirectoryId::from("testdir"), temp.path());
+        let dirs = LocalArenas::single(&Arena::from("testdir"), temp.path());
         let server_privkey =
             load_private_key(crate::network::security::testing::server_private_key())?;
         let (addr, server_handle) = start_server(
@@ -410,7 +410,7 @@ mod tests {
         let list = client
             .list(
                 context::current(),
-                DirectoryId::from("testdir"),
+                Arena::from("testdir"),
                 Options::default(),
             )
             .await??;
@@ -435,7 +435,7 @@ mod tests {
             Ok(client) => client
                 .list(
                     context::current(),
-                    DirectoryId::from("testdir"),
+                    Arena::from("testdir"),
                     Options::default(),
                 )
                 .await
@@ -472,7 +472,7 @@ mod tests {
     #[tokio::test]
     async fn configure_tcp_returns_limit() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        let dirs = DirectoryMap::for_dir(&DirectoryId::from("testdir"), temp.path());
+        let dirs = LocalArenas::single(&Arena::from("testdir"), temp.path());
         let verifier = verifier_both();
         let server_privkey =
             load_private_key(crate::network::security::testing::server_private_key())?;
@@ -512,7 +512,7 @@ mod tests {
     #[tokio::test]
     async fn configure_tcp_per_connection_limit() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        let dirs = DirectoryMap::for_dir(&DirectoryId::from("testdir"), temp.path());
+        let dirs = LocalArenas::single(&Arena::from("testdir"), temp.path());
         let verifier = verifier_both();
         let server_privkey =
             load_private_key(crate::network::security::testing::server_private_key())?;
@@ -581,7 +581,7 @@ mod tests {
         client
             .list(
                 context::current(),
-                DirectoryId::from("testdir"),
+                Arena::from("testdir"),
                 Options::default(),
             )
             .await??;
@@ -589,7 +589,7 @@ mod tests {
         client
             .list(
                 context::current(),
-                DirectoryId::from("testdir"),
+                Arena::from("testdir"),
                 Options::default(),
             )
             .await??;
@@ -681,7 +681,7 @@ mod tests {
         client
             .list(
                 context::current(),
-                DirectoryId::from("testdir"),
+                Arena::from("testdir"),
                 Options::default(),
             )
             .await??;
@@ -689,7 +689,7 @@ mod tests {
         client
             .list(
                 context::current(),
-                DirectoryId::from("testdir"),
+                Arena::from("testdir"),
                 Options::default(),
             )
             .await??;
