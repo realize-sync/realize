@@ -7,7 +7,7 @@ use std::sync::Arc;
 use assert_fs::TempDir;
 use assert_fs::prelude::*;
 use predicates::prelude::*;
-use realize_lib::network::services::realize::{DirectoryId, Options};
+use realize_lib::network::rpc::realize::{DirectoryId, Options};
 use realize_lib::network::security;
 use realize_lib::network::security::PeerVerifier;
 use realize_lib::network::tcp::{self, HostPort};

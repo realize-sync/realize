@@ -8,7 +8,7 @@
 //!
 //! To export metrics on an HTTP endpoint:
 //! ```rust
-//! realize_lib::network::services::realize::metrics::export_metrics("127.0.0.1:9000");
+//! realize_lib::network::rpc::realize::metrics::export_metrics("127.0.0.1:9000");
 //! ```
 
 use std::time::Instant;
@@ -28,7 +28,7 @@ use tarpc::{
 use tokio::net::TcpListener;
 
 use crate::utils::byterange::ByteRange;
-use crate::network::services::realize::{RealizeError, RealizeServiceRequest, RealizeServiceResponse};
+use crate::network::rpc::realize::{RealizeError, RealizeServiceRequest, RealizeServiceResponse};
 
 lazy_static::lazy_static! {
     pub(crate) static ref METRIC_SERVER_DATA_IN_BYTES: HistogramVec =

@@ -304,13 +304,16 @@ crate/
        │                           ┌─
        ├─ network/                 │ Network Layer
        │  │                        │
-       │  ├─ services/             │     TARPC service definitions
+       │  ├─ rpc/                  │     TARPC service definitions
+       │  │  │                     │
+       │  │  ├─ <servicename>.rs   │
+       │  │  …  │                  │
+       │  │     └─ server.rs       │
+       │  ├─ tcp.rs                │     TCP transport for TARPC
        │  │                        │
-       │  ├─ transport/            │     TCP transport for TARPC
+       │  ├─ reconnect.rs          │     TCP service clients
        │  │                        │
-       │  ├─ client/               │     TCP service clients
-       │  │                        │
-       │  └─ security/             │     TLS and authorization (peer list)
+       │  └─ security.rs           │     TLS and authorization (peer list)
        │                           └─
        │
        │                           ┌─

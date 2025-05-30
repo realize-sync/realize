@@ -8,15 +8,18 @@ for easy reference, and end with a detailled and numbered task list.
 Move file layout and service name to match the proposal in fs_design.md
 
 ``
-algo.rs -> logic/consensus/movedirs.rs
-algo/hash.rs -> util/hash.rs
-model/service.rs -> src/network/services/<servicename>.rs
-model/byterange.rs -> src/network/services/byterange.rs
+OK algo.rs -> logic/consensus/movedirs.rs
+OK algo/hash.rs -> util/hash.rs
+OK model/service.rs -> src/network/rpc/<servicename>.rs
+OK model/byterange.rs -> src/utils/byterange.rs
 server.rs -> logic/emissaries/<servicename>.rs
+             OK network/rpc/<servicename>/server.rs
              storage.rs
-transport/rate_limit.rs -> network/rate_limit.rs
-transport/security -> network/security.rs
-transport/tcp.rs network/tcp.rs
+OK transport/rate_limit.rs -> network/rate_limit.rs
+OK transport/security -> network/security.rs
+OK transport/tcp.rs network/tcp.rs
+OK metrics.rs -> network/rpc/<servicename>/metrics.rs
+OK client.rs -> network/rpc/<servicename>/client.rs
 utils -> utils
 
 <servicename> local_store.rs RPC LocalStore

@@ -29,20 +29,20 @@ use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
 
 use crate::network::reconnect::Connect;
 use crate::network::reconnect::Reconnect;
-use crate::network::services::realize::metrics;
-use crate::network::services::realize::metrics::MetricsRealizeClient;
-use crate::network::services::realize::metrics::MetricsRealizeServer;
+use crate::network::rpc::realize::metrics;
+use crate::network::rpc::realize::metrics::MetricsRealizeClient;
+use crate::network::rpc::realize::metrics::MetricsRealizeServer;
 use crate::network::rate_limit::RateLimitedStream;
-use crate::network::services::realize::Config;
-use crate::network::services::realize::RealizeServiceRequest;
-use crate::network::services::realize::RealizeServiceResponse;
-use crate::network::services::realize::{RealizeService, RealizeServiceClient};
-use crate::network::services::realize::server::RealizeServer;
+use crate::network::rpc::realize::Config;
+use crate::network::rpc::realize::RealizeServiceRequest;
+use crate::network::rpc::realize::RealizeServiceResponse;
+use crate::network::rpc::realize::{RealizeService, RealizeServiceClient};
+use crate::network::rpc::realize::server::RealizeServer;
 use crate::network::security;
 use crate::network::security::PeerVerifier;
 use crate::utils::async_utils::AbortOnDrop;
 
-use crate::network::services::realize::server::DirectoryMap;
+use crate::network::rpc::realize::server::DirectoryMap;
 
 use std::fmt;
 use std::net::IpAddr;
@@ -335,7 +335,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
-    use crate::network::services::realize::{Config, DirectoryId, Options};
+    use crate::network::rpc::realize::{Config, DirectoryId, Options};
     use crate::utils::async_utils::AbortOnDrop;
     use assert_fs::TempDir;
     use rustls::pki_types::PrivateKeyDer;

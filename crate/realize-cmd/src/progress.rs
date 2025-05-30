@@ -1,7 +1,7 @@
 use console::style;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use realize_lib::logic::consensus::movedirs::ProgressEvent;
-use realize_lib::network::services::realize::DirectoryId;
+use realize_lib::network::rpc::realize::DirectoryId;
 use realize_lib::network::tcp::ClientConnectionState;
 use std::collections::HashMap;
 use std::path::PathBuf;

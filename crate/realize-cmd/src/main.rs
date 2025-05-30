@@ -8,8 +8,8 @@ use indicatif::HumanBytes;
 use progress::CliProgress;
 use prometheus::{IntCounter, register_int_counter};
 use realize_lib::logic::consensus::movedirs::MoveFileError;
-use realize_lib::network::services::realize::metrics;
-use realize_lib::network::services::realize::DirectoryId;
+use realize_lib::network::rpc::realize::metrics;
+use realize_lib::network::rpc::realize::DirectoryId;
 use realize_lib::network::security::{self, PeerVerifier};
 use realize_lib::network::tcp::{self, ClientConnectionState, HostPort, TcpRealizeServiceClient};
 use realize_lib::utils::logging;
@@ -330,7 +330,7 @@ async fn connect(
     privkey: Arc<dyn SigningKey>,
     verifier: Arc<PeerVerifier>,
     conn_status: tokio::sync::watch::Sender<ClientConnectionState>,
-) -> anyhow::Result<realize_lib::network::services::realize::RealizeServiceClient<tcp::TcpStub>, anyhow::Error>
+) -> anyhow::Result<realize_lib::network::rpc::realize::RealizeServiceClient<tcp::TcpStub>, anyhow::Error>
 {
     let addr = HostPort::parse(addr)
         .await
@@ -360,7 +360,7 @@ async fn configure_limit(
     let config = client
         .configure(
             context::current(),
-            realize_lib::network::services::realize::Config {
+            realize_lib::network::rpc::realize::Config {
                 write_limit: Some(limit),
             },
         )

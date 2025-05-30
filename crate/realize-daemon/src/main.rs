@@ -3,8 +3,8 @@
 use anyhow::Context as _;
 use clap::Parser;
 use prometheus::{IntCounter, register_int_counter};
-use realize_lib::network::services::realize::metrics;
-use realize_lib::network::services::realize::server::{Directory, DirectoryMap};
+use realize_lib::network::rpc::realize::metrics;
+use realize_lib::network::rpc::realize::server::{Directory, DirectoryMap};
 use realize_lib::network::security::{self, PeerVerifier};
 use realize_lib::network::tcp::{self, HostPort};
 use realize_lib::utils::logging;

@@ -5,14 +5,14 @@
 //! and supports secure, restartable sync.
 
 use crate::utils::hash;
-use crate::network::services::realize::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
+use crate::network::rpc::realize::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
 use crate::utils::byterange::ByteRange;
-use crate::network::services::realize::Options;
-use crate::network::services::realize::{Config, Hash};
-use crate::network::services::realize::{
+use crate::network::rpc::realize::Options;
+use crate::network::rpc::realize::{Config, Hash};
+use crate::network::rpc::realize::{
     DirectoryId, RealizeError, RealizeService, Result, RsyncOperation, SyncedFile, SyncedFileState,
 };
-use crate::network::services::realize::{RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse};
+use crate::network::rpc::realize::{RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse};
 use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
 use fast_rsync::{
@@ -278,7 +278,7 @@ impl RealizeService for RealizeServer {
         relative_path: PathBuf,
         range: ByteRange,
         options: Options,
-    ) -> Result<crate::network::services::realize::Signature> {
+    ) -> Result<crate::network::rpc::realize::Signature> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
         let (_, actual) = logical.find(&options).await?;
@@ -290,7 +290,7 @@ impl RealizeService for RealizeServer {
             crypto_hash_size: 8,
         };
         let sig = RsyncSignature::calculate(&buffer, opts);
-        Ok(crate::network::services::realize::Signature(sig.into_serialized()))
+        Ok(crate::network::rpc::realize::Signature(sig.into_serialized()))
     }
 
     async fn diff(
@@ -299,9 +299,9 @@ impl RealizeService for RealizeServer {
         dir_id: DirectoryId,
         relative_path: PathBuf,
         range: ByteRange,
-        signature: crate::network::services::realize::Signature,
+        signature: crate::network::rpc::realize::Signature,
         options: Options,
-    ) -> Result<(crate::network::services::realize::Delta, Hash)> {
+    ) -> Result<(crate::network::rpc::realize::Delta, Hash)> {
         let dir = self.find_directory(&dir_id)?;
         let logical = LogicalPath::new(dir, &relative_path)?;
         let (_, actual) = logical.find(&options).await?;
@@ -315,7 +315,7 @@ impl RealizeService for RealizeServer {
         let mut delta = Vec::new();
         rsync_diff(&sig.index(), &buffer, &mut delta)?;
 
-        Ok((crate::network::services::realize::Delta(delta), hash))
+        Ok((crate::network::rpc::realize::Delta(delta), hash))
     }
 
     async fn apply_delta(
@@ -324,7 +324,7 @@ impl RealizeService for RealizeServer {
         dir_id: DirectoryId,
         relative_path: PathBuf,
         range: ByteRange,
-        delta: crate::network::services::realize::Delta,
+        delta: crate::network::rpc::realize::Delta,
         hash: Hash,
         options: Options,
     ) -> Result<()> {
@@ -371,8 +371,8 @@ impl RealizeService for RealizeServer {
     async fn configure(
         self,
         _ctx: tarpc::context::Context,
-        config: crate::network::services::realize::Config,
-    ) -> Result<crate::network::services::realize::Config> {
+        config: crate::network::rpc::realize::Config,
+    ) -> Result<crate::network::rpc::realize::Config> {
         if let (Some(limiter), Some(limit)) = (self.limiter.as_ref(), config.write_limit) {
             limiter.set_speed_limit(limit as f64);
         }
@@ -690,7 +690,7 @@ async fn is_empty_dir(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::services::realize::Hash;
+    use crate::network::rpc::realize::Hash;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
@@ -1350,7 +1350,7 @@ mod tests {
                 dir.id().clone(),
                 file_path,
                 ByteRange { start: 0, end: 3 },
-                crate::network::services::realize::Delta(vec![1, 2, 3]),
+                crate::network::rpc::realize::Delta(vec![1, 2, 3]),
                 Hash::zero(),
                 Options::default(),
             )

@@ -10,8 +10,8 @@ use realize_lib::logic::consensus::movedirs::METRIC_RANGE_WRITE_BYTES;
 use realize_lib::logic::consensus::movedirs::METRIC_READ_BYTES;
 use realize_lib::logic::consensus::movedirs::METRIC_START_COUNT;
 use realize_lib::logic::consensus::movedirs::METRIC_WRITE_BYTES;
-use realize_lib::network::services::realize::{DirectoryId, Options};
-use realize_lib::network::services::realize::server::{self, DirectoryMap, InProcessRealizeServiceClient};
+use realize_lib::network::rpc::realize::{DirectoryId, Options};
+use realize_lib::network::rpc::realize::server::{self, DirectoryMap, InProcessRealizeServiceClient};
 use std::sync::Arc;
 
 // Metric tests are kept in their own binary to avoid other test
@@ -147,11 +147,11 @@ async fn move_files_metrics() -> anyhow::Result<()> {
     let src_temp = TempDir::new()?;
     let dst_temp = TempDir::new()?;
     src_temp.child("foo").write_str("abc")?;
-    let src_dir = Arc::new(realize_lib::network::services::realize::server::Directory::new(
+    let src_dir = Arc::new(realize_lib::network::rpc::realize::server::Directory::new(
         &DirectoryId::from("testdir"),
         src_temp.path(),
     ));
-    let dst_dir = Arc::new(realize_lib::network::services::realize::server::Directory::new(
+    let dst_dir = Arc::new(realize_lib::network::rpc::realize::server::Directory::new(
         &DirectoryId::from("testdir"),
         dst_temp.path(),
     ));
