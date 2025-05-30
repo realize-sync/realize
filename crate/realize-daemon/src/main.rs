@@ -3,7 +3,7 @@
 use anyhow::Context as _;
 use clap::Parser;
 use prometheus::{register_int_counter, IntCounter};
-use realize_lib::config::{LocalArena, LocalArenas};
+use realize_lib::model::arena::{LocalArena, LocalArenas};
 use realize_lib::network::rpc::realize::metrics;
 use realize_lib::network::security::{self, PeerVerifier};
 use realize_lib::network::tcp::{self, HostPort};

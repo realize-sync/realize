@@ -1,7 +1,7 @@
 use assert_fs::prelude::*;
 use assert_fs::TempDir;
 use prometheus::proto::MetricType;
-use realize_lib::config::{Arena, LocalArena, LocalArenas};
+use realize_lib::model::arena::{Arena, LocalArena, LocalArenas};
 use realize_lib::logic::consensus::movedirs;
 use realize_lib::logic::consensus::movedirs::METRIC_END_COUNT;
 use realize_lib::logic::consensus::movedirs::METRIC_FILE_END_COUNT;

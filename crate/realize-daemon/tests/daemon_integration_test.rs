@@ -7,7 +7,7 @@ use std::sync::Arc;
 use assert_fs::prelude::*;
 use assert_fs::TempDir;
 use predicates::prelude::*;
-use realize_lib::config::Arena;
+use realize_lib::model::arena::Arena;
 use realize_lib::network::rpc::realize::Options;
 use realize_lib::network::security;
 use realize_lib::network::security::PeerVerifier;

@@ -1,6 +1,6 @@
 use console::style;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use realize_lib::config::Arena;
+use realize_lib::model::arena::Arena;
 use realize_lib::logic::consensus::movedirs::ProgressEvent;
 use realize_lib::network::tcp::ClientConnectionState;
 use std::collections::HashMap;

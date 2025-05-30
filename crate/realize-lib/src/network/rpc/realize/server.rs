@@ -4,7 +4,7 @@
 //! file operations, and in-process server/client utilities. It is robust to interruptions
 //! and supports secure, restartable sync.
 
-use crate::config::{Arena, LocalArena, LocalArenas};
+use crate::model::arena::{Arena, LocalArena, LocalArenas};
 use crate::network::rpc::realize::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
 use crate::network::rpc::realize::Options;
 use crate::network::rpc::realize::{Config, Hash};

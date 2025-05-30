@@ -10,7 +10,7 @@ pub mod server;
 
 use std::path::PathBuf;
 
-use crate::config::Arena;
+use crate::model::arena::Arena;
 use crate::utils::byterange::{ByteRange, ByteRanges};
 use base64::Engine as _;
 

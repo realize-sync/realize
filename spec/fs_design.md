@@ -326,7 +326,7 @@ crate/
        │  └─ history/              │     Local change history
        │                           └─
        │
-       ├─ config.rs                Layer-agnostic definitions and config
+       ├─ model/                   Types shared across layers
        │
        └─ util/                    Random layer-agnostic utilities
 

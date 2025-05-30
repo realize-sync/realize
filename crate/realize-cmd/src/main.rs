@@ -7,7 +7,7 @@ use console::style;
 use indicatif::HumanBytes;
 use progress::CliProgress;
 use prometheus::{register_int_counter, IntCounter};
-use realize_lib::config::Arena;
+use realize_lib::model::arena::Arena;
 use realize_lib::logic::consensus::movedirs::MoveFileError;
 use realize_lib::network::rpc::realize::metrics;
 use realize_lib::network::security::{self, PeerVerifier};

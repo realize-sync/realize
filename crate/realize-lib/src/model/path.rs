@@ -1,5 +1,7 @@
 use std::path::{self};
 
+use crate::errors::RealizeError;
+
 /// A path within an Arena.
 ///
 /// Arena paths are simple nonempty relative paths, with directories
@@ -12,7 +14,7 @@ impl Path {
     /// Build a path from a string.
     ///
     /// If parsing works, the path is guaranteed to be acceptable.
-    pub fn parse(str: impl Into<String>) -> Result<Path, StorageError> {
+    pub fn parse(str: impl Into<String>) -> Result<Path, RealizeError> {
         let str = str.into();
         if str.is_empty()
             || str.find(':').is_some()
@@ -20,7 +22,7 @@ impl Path {
                 .split('/')
                 .any(|s| s.is_empty() || s == "." || s == "..")
         {
-            return Err(StorageError::InvalidPath);
+            return Err(RealizeError::InvalidPath);
         }
 
         Ok(Path(str))
@@ -30,17 +32,17 @@ impl Path {
     ///
     /// Not all real paths can be transformed. They must be relative,
     /// non-empty paths containing only valid unicode strings.
-    pub fn from_real_path(path: &path::Path) -> Result<Path, StorageError> {
+    pub fn from_real_path(path: &path::Path) -> Result<Path, RealizeError> {
         for component in path.components() {
             match component {
                 std::path::Component::Normal(_) => {}
                 _ => {
-                    return Err(StorageError::InvalidPath);
+                    return Err(RealizeError::InvalidPath);
                 }
             }
         }
 
-        Path::parse(path.to_str().ok_or(StorageError::InvalidPath)?)
+        Path::parse(path.to_str().ok_or(RealizeError::InvalidPath)?)
     }
 
     /// The name part of the path, without any parent element.
@@ -99,15 +101,6 @@ impl std::fmt::Display for Path {
     }
 }
 
-/// Errors returned by functions in the Storage layer.
-#[derive(Debug, thiserror::Error)]
-pub enum StorageError {
-    #[error("Invalid path. Paths must be valid unicode and not contain ., .. or :")]
-    InvalidPath,
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-}
-
 #[cfg(test)]
 mod tests {
     use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
@@ -126,35 +119,35 @@ mod tests {
 
     #[test]
     fn parse_invalid_paths() -> anyhow::Result<()> {
-        assert!(matches!(Path::parse(""), Err(StorageError::InvalidPath),));
-        assert!(matches!(Path::parse("/"), Err(StorageError::InvalidPath),));
+        assert!(matches!(Path::parse(""), Err(RealizeError::InvalidPath),));
+        assert!(matches!(Path::parse("/"), Err(RealizeError::InvalidPath),));
         assert!(matches!(
             Path::parse("/foo"),
-            Err(StorageError::InvalidPath),
+            Err(RealizeError::InvalidPath),
         ));
         assert!(matches!(
             Path::parse("foo/"),
-            Err(StorageError::InvalidPath),
+            Err(RealizeError::InvalidPath),
         ));
         assert!(matches!(
             Path::parse("foo//bar"),
-            Err(StorageError::InvalidPath),
+            Err(RealizeError::InvalidPath),
         ));
         assert!(matches!(
             Path::parse("c:foo"),
-            Err(StorageError::InvalidPath),
+            Err(RealizeError::InvalidPath),
         ));
         assert!(matches!(
             Path::parse("c:/foo"),
-            Err(StorageError::InvalidPath),
+            Err(RealizeError::InvalidPath),
         ));
         assert!(matches!(
             Path::parse("foo/../bar"),
-            Err(StorageError::InvalidPath),
+            Err(RealizeError::InvalidPath),
         ));
         assert!(matches!(
             Path::parse("foo/./bar"),
-            Err(StorageError::InvalidPath),
+            Err(RealizeError::InvalidPath),
         ));
 
         Ok(())
@@ -186,24 +179,24 @@ mod tests {
     fn from_real_path_invalid() -> anyhow::Result<()> {
         assert!(matches!(
             Path::from_real_path(path::Path::new("foo/./bar")),
-            Err(StorageError::InvalidPath),
+            Err(RealizeError::InvalidPath),
         ));
 
         assert!(matches!(
             Path::from_real_path(path::Path::new("/foo")),
-            Err(StorageError::InvalidPath),
+            Err(RealizeError::InvalidPath),
         ));
 
         assert!(matches!(
             Path::from_real_path(path::Path::new("//foo")),
-            Err(StorageError::InvalidPath),
+            Err(RealizeError::InvalidPath),
         ));
 
         assert!(matches!(
             Path::from_real_path(path::Path::new(OsStr::from_bytes(&[
                 0x66, 0x6f, 0x80, 0x6f
             ]))),
-            Err(StorageError::InvalidPath),
+            Err(RealizeError::InvalidPath),
         ));
 
         Ok(())

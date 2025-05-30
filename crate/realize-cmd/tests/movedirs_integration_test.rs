@@ -3,7 +3,7 @@ use assert_fs::prelude::*;
 use assert_fs::TempDir;
 use assert_unordered::assert_eq_unordered;
 use hyper_util::rt::TokioIo;
-use realize_lib::config::{Arena, LocalArena, LocalArenas};
+use realize_lib::model::arena::{Arena, LocalArena, LocalArenas};
 use realize_lib::network::security::{self, PeerVerifier};
 use realize_lib::network::tcp::{self, HostPort};
 use realize_lib::utils::async_utils::AbortOnDrop;

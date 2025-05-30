@@ -4,7 +4,7 @@
 //! rsync-based partial transfer, progress reporting, and error handling. It operates
 //! over the RealizeService trait and is designed to be robust and restartable.
 
-use crate::config::Arena;
+use crate::model::arena::Arena;
 use crate::network::rpc::realize::{
     Options, RangedHash, RealizeServiceClient, RealizeServiceError, RealizeServiceRequest,
     RealizeServiceResponse, SyncedFile,
@@ -805,7 +805,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Arena, LocalArena, LocalArenas};
+    use crate::model::arena::{Arena, LocalArena, LocalArenas};
     use crate::network::rpc::realize::server::{self};
     use crate::network::rpc::realize::Hash;
     use crate::utils::hash;
