@@ -4,7 +4,7 @@ use assert_fs::prelude::*;
 use assert_unordered::assert_eq_unordered;
 use hyper_util::rt::TokioIo;
 use realize_lib::network::services::realize::DirectoryId;
-use realize_lib::server::DirectoryMap;
+use realize_lib::network::services::realize::server::DirectoryMap;
 use realize_lib::network::security::{self, PeerVerifier};
 use realize_lib::network::tcp::{self, HostPort};
 use realize_lib::utils::async_utils::AbortOnDrop;
@@ -592,8 +592,8 @@ async fn multiple_directory_ids() -> anyhow::Result<()> {
 
     // Setup src server with two directories
     let src_dirs = DirectoryMap::new([
-        realize_lib::server::Directory::new(&DirectoryId::from("dir1"), src_dir1.path()),
-        realize_lib::server::Directory::new(&DirectoryId::from("dir2"), src_dir2.path()),
+        realize_lib::network::services::realize::server::Directory::new(&DirectoryId::from("dir1"), src_dir1.path()),
+        realize_lib::network::services::realize::server::Directory::new(&DirectoryId::from("dir2"), src_dir2.path()),
     ]);
     let (src_addr, _src_handle) = tcp::start_server(
         &HostPort::parse("127.0.0.1:0").await?,
@@ -605,8 +605,8 @@ async fn multiple_directory_ids() -> anyhow::Result<()> {
 
     // Setup dst server with two directories
     let dst_dirs = DirectoryMap::new([
-        realize_lib::server::Directory::new(&DirectoryId::from("dir1"), dst_dir1.path()),
-        realize_lib::server::Directory::new(&DirectoryId::from("dir2"), dst_dir2.path()),
+        realize_lib::network::services::realize::server::Directory::new(&DirectoryId::from("dir1"), dst_dir1.path()),
+        realize_lib::network::services::realize::server::Directory::new(&DirectoryId::from("dir2"), dst_dir2.path()),
     ]);
     let (dst_addr, _dst_handle) = tcp::start_server(
         &HostPort::parse("127.0.0.1:0").await?,

@@ -6,6 +6,7 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod metrics;
+pub mod server;
 
 use std::path::PathBuf;
 

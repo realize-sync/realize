@@ -822,7 +822,7 @@ mod tests {
     use super::*;
     use crate::network::services::realize::DirectoryId;
     use crate::network::services::realize::Hash;
-    use crate::server::{self, DirectoryMap};
+    use crate::network::services::realize::server::{self, DirectoryMap};
     use crate::utils::hash;
     use assert_fs::prelude::*;
     use assert_fs::TempDir;
@@ -837,11 +837,11 @@ mod tests {
         let src_temp = TempDir::new()?;
         let dst_temp = TempDir::new()?;
         src_temp.child("foo").write_str("abc")?;
-        let src_dir = Arc::new(crate::server::Directory::new(
+        let src_dir = Arc::new(crate::network::services::realize::server::Directory::new(
             &DirectoryId::from("testdir"),
             src_temp.path(),
         ));
-        let dst_dir = Arc::new(crate::server::Directory::new(
+        let dst_dir = Arc::new(crate::network::services::realize::server::Directory::new(
             &DirectoryId::from("testdir"),
             dst_temp.path(),
         ));
@@ -916,11 +916,11 @@ mod tests {
         let _ = env_logger::try_init();
         let src_temp = TempDir::new()?;
         let dst_temp = TempDir::new()?;
-        let src_dir = Arc::new(crate::server::Directory::new(
+        let src_dir = Arc::new(crate::network::services::realize::server::Directory::new(
             &DirectoryId::from("testdir"),
             src_temp.path(),
         ));
-        let dst_dir = Arc::new(crate::server::Directory::new(
+        let dst_dir = Arc::new(crate::network::services::realize::server::Directory::new(
             &DirectoryId::from("testdir"),
             dst_temp.path(),
         ));
@@ -998,11 +998,11 @@ mod tests {
         let _ = env_logger::try_init();
         let src_temp = TempDir::new()?;
         let dst_temp = TempDir::new()?;
-        let src_dir = Arc::new(crate::server::Directory::new(
+        let src_dir = Arc::new(crate::network::services::realize::server::Directory::new(
             &DirectoryId::from("testdir"),
             src_temp.path(),
         ));
-        let dst_dir = Arc::new(crate::server::Directory::new(
+        let dst_dir = Arc::new(crate::network::services::realize::server::Directory::new(
             &DirectoryId::from("testdir"),
             dst_temp.path(),
         ));
@@ -1099,7 +1099,7 @@ mod tests {
 
         // Setup source directory with files
         let src_temp = TempDir::new()?;
-        let src_dir = Arc::new(crate::server::Directory::new(
+        let src_dir = Arc::new(crate::network::services::realize::server::Directory::new(
             &DirectoryId::from("testdir"),
             src_temp.path(),
         ));
@@ -1108,7 +1108,7 @@ mod tests {
 
         // Setup destination directory (empty)
         let dst_temp = TempDir::new()?;
-        let dst_dir = Arc::new(crate::server::Directory::new(
+        let dst_dir = Arc::new(crate::network::services::realize::server::Directory::new(
             &DirectoryId::from("testdir"),
             dst_temp.path(),
         ));
@@ -1168,7 +1168,7 @@ mod tests {
         let chunk5 = vec![0x34; FILE_SIZE];
 
         let src_temp = TempDir::new()?;
-        let src_dir = Arc::new(crate::server::Directory::new(
+        let src_dir = Arc::new(crate::network::services::realize::server::Directory::new(
             &DirectoryId::from("testdir"),
             src_temp.path(),
         ));
@@ -1176,7 +1176,7 @@ mod tests {
             server::create_inprocess_client(DirectoryMap::for_dir(src_dir.id(), src_dir.path()));
 
         let dst_temp = TempDir::new()?;
-        let dst_dir = Arc::new(crate::server::Directory::new(
+        let dst_dir = Arc::new(crate::network::services::realize::server::Directory::new(
             &DirectoryId::from("testdir"),
             dst_temp.path(),
         ));
@@ -1244,14 +1244,14 @@ mod tests {
     async fn move_files_partial_error() -> anyhow::Result<()> {
         let _ = env_logger::try_init();
         let src_temp = TempDir::new()?;
-        let src_dir = Arc::new(crate::server::Directory::new(
+        let src_dir = Arc::new(crate::network::services::realize::server::Directory::new(
             &DirectoryId::from("testdir"),
             src_temp.path(),
         ));
         let src_server =
             server::create_inprocess_client(DirectoryMap::for_dir(src_dir.id(), src_dir.path()));
         let dst_temp = TempDir::new()?;
-        let dst_dir = Arc::new(crate::server::Directory::new(
+        let dst_dir = Arc::new(crate::network::services::realize::server::Directory::new(
             &DirectoryId::from("testdir"),
             dst_temp.path(),
         ));
@@ -1285,11 +1285,11 @@ mod tests {
         let _ = env_logger::try_init();
         let src_temp = TempDir::new()?;
         let dst_temp = TempDir::new()?;
-        let src_dir = Arc::new(crate::server::Directory::new(
+        let src_dir = Arc::new(crate::network::services::realize::server::Directory::new(
             &DirectoryId::from("testdir"),
             src_temp.path(),
         ));
-        let dst_dir = Arc::new(crate::server::Directory::new(
+        let dst_dir = Arc::new(crate::network::services::realize::server::Directory::new(
             &DirectoryId::from("testdir"),
             dst_temp.path(),
         ));

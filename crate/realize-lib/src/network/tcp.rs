@@ -37,12 +37,12 @@ use crate::network::services::realize::Config;
 use crate::network::services::realize::RealizeServiceRequest;
 use crate::network::services::realize::RealizeServiceResponse;
 use crate::network::services::realize::{RealizeService, RealizeServiceClient};
-use crate::server::RealizeServer;
+use crate::network::services::realize::server::RealizeServer;
 use crate::network::security;
 use crate::network::security::PeerVerifier;
 use crate::utils::async_utils::AbortOnDrop;
 
-use crate::server::DirectoryMap;
+use crate::network::services::realize::server::DirectoryMap;
 
 use std::fmt;
 use std::net::IpAddr;
