@@ -8,7 +8,7 @@ use indicatif::HumanBytes;
 use progress::CliProgress;
 use prometheus::{IntCounter, register_int_counter};
 use realize_lib::logic::consensus::movedirs::MoveFileError;
-use realize_lib::metrics;
+use realize_lib::network::services::realize::metrics;
 use realize_lib::network::services::realize::DirectoryId;
 use realize_lib::network::security::{self, PeerVerifier};
 use realize_lib::network::tcp::{self, ClientConnectionState, HostPort, TcpRealizeServiceClient};

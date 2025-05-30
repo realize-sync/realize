@@ -433,7 +433,7 @@ async fn realize_metrics_export() -> anyhow::Result<()> {
         .command()
         .arg("--metrics-addr")
         .arg(&realize_metrics_addr)
-        .env("RUST_LOG", "realize_lib::metrics=debug")
+        .env("RUST_LOG", "realize_lib::network::services::realize::metrics=debug")
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
         .kill_on_drop(true)

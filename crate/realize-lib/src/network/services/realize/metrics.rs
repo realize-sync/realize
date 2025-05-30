@@ -8,7 +8,7 @@
 //!
 //! To export metrics on an HTTP endpoint:
 //! ```rust
-//! realize_lib::metrics::export_metrics("127.0.0.1:9000");
+//! realize_lib::network::services::realize::metrics::export_metrics("127.0.0.1:9000");
 //! ```
 
 use std::time::Instant;

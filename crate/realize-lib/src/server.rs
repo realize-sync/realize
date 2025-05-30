@@ -5,7 +5,7 @@
 //! and supports secure, restartable sync.
 
 use crate::utils::hash;
-use crate::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
+use crate::network::services::realize::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
 use crate::utils::byterange::ByteRange;
 use crate::network::services::realize::Options;
 use crate::network::services::realize::{Config, Hash};

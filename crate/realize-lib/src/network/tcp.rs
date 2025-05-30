@@ -29,9 +29,9 @@ use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
 
 use crate::client::reconnect::Connect;
 use crate::client::reconnect::Reconnect;
-use crate::metrics;
-use crate::metrics::MetricsRealizeClient;
-use crate::metrics::MetricsRealizeServer;
+use crate::network::services::realize::metrics;
+use crate::network::services::realize::metrics::MetricsRealizeClient;
+use crate::network::services::realize::metrics::MetricsRealizeServer;
 use crate::network::rate_limit::RateLimitedStream;
 use crate::network::services::realize::Config;
 use crate::network::services::realize::RealizeServiceRequest;
