@@ -9,18 +9,16 @@ use crate::model::service::{
     DirectoryId, Options, RangedHash, RealizeError, RealizeServiceClient, RealizeServiceRequest,
     RealizeServiceResponse, SyncedFile,
 };
-use futures::FutureExt;
 use futures::future;
 use futures::stream::StreamExt as _;
-use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
+use futures::FutureExt;
+use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
 use std::sync::Arc;
 use std::{collections::HashMap, path::Path};
 use tarpc::client::stub::Stub;
 use thiserror::Error;
-use tokio::sync::Semaphore;
 use tokio::sync::mpsc::Sender;
-
-pub mod hash;
+use tokio::sync::Semaphore;
 
 const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 const PARALLEL_FILE_COUNT: usize = 4;
@@ -825,8 +823,9 @@ mod tests {
     use crate::model::service::DirectoryId;
     use crate::model::service::Hash;
     use crate::server::{self, DirectoryMap};
-    use assert_fs::TempDir;
+    use crate::utils::hash;
     use assert_fs::prelude::*;
+    use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
     use std::path::PathBuf;
     use std::sync::Arc;

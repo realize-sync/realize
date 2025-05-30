@@ -4,7 +4,7 @@
 //! file operations, and in-process server/client utilities. It is robust to interruptions
 //! and supports secure, restartable sync.
 
-use crate::algo::hash;
+use crate::utils::hash;
 use crate::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
 use crate::model::byterange::ByteRange;
 use crate::model::service::Options;
