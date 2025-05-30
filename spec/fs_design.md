@@ -224,6 +224,91 @@ Once fully available, it is realized, that is, turned into a file.
 When a file is needed, it *might* be fully downloaded and turned into
 a file, but only for a time (how long?)
 
+## Components and layers {#layers}
+
+```
+ FUSE
+  ^
+  |
+  v
+┌──────────────────────┬─────────────────────────────────────────┐
+│ Filesystem           │ Application and command─line tools      │  Interface layer
+└──────────────────────┴─────────────────────────────────────────┘
+  │
+  │  ┌───────────────────────────────────────────────────────────┐
+p │  │ The Fastness                                              │  Logic layer
+a │  └───────────────────────────────────────────────────────────┘
+s │
+s │  ┌─────────────────────────────┐  ┌──────────────────────────┐
+t │  │ Storage Layer               │  │ Network Layer            │  Data Layers
+h │  └─────────────────────────────┘  └──────────────────────────┘
+r │
+u │         ┌────────────┬─────────┐  ┌────────────────┐
+  │         │ The Unreal │ History │  │ RPC Services   │
+  V         │   Cache    │         │  │                │
+┌───────────┼────────────┴─────────┤  ├────────────────┴─────────┐
+│ The Real  │   redb               │  │ Transport (TPC+TLS)      │
+└───────────┴──────────────────────┘  └──────────────────────────┘
+
+^^^^^^^^^^^^^^ (disk) ^^^^^^^^^^^^^^  ^^^^^^^^ (network) ^^^^^^^^^
+
+```
+
+### Source layout {#layout}
+
+```
+crate/
+│                                  ┌─
+│                                  │ Interface Layer
+│                                  │
+│── realize─cmd/                   │     Command-line utility
+│                                  │
+│── realize─daemon/                │     Background process (RPC + Fuse)
+│                                  │
+├── realize─fs/                    │     Fuse-specific code
+│                                  └─
+└── realize─lib/
+    │
+    └─ src/
+       │                           ┌─
+       ├─ logic/                   │ Logic Layer
+       │  │                        │
+       │  ├─ emissaries/           │     External-facing service impl
+       │  │                        │
+       │  ├─ forest/               │     Consolidated real/unreal tree view
+       │  │                        │       and blob assignment
+       │  │                        │
+       │  ├─ consensus/            │     Bridging local and remote data
+       │  │                        │
+       │  └─ houshold/             │     Remote peer definition and state
+       │                           └─
+       │
+       │                           ┌─
+       ├─ network/                 │ Network Layer
+       │  │                        │
+       │  ├─ services/             │     TARPC service definitions
+       │  │                        │
+       │  ├─ transport/            │     TCP transport for TARPC
+       │  │                        │
+       │  ├─ client/               │     TCP service clients
+       │  │                        │
+       │  └─ security/             │     TLS and authorization (peer list)
+       │                           └─
+       │
+       │                           ┌─
+       ├─ storage/                 │ Storage Layer
+       │  │                        │
+       │  ├─ real/                 │     Data stored locally as files
+       │  │                        │
+       │  ├─ unreal/               │     Cached remote data
+       │  │                        │
+       │  └─ history/              │     Local change history
+       │                           └─
+       │
+       └─ util/                    Random layer-agnostic utilities
+
+```
+
 ## Milestones
 
 1. Move files from one peer to the other (current as of 2025-05-29)
