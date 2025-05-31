@@ -8,10 +8,7 @@
 pub mod metrics;
 pub mod server;
 
-use crate::model;
-use crate::model::Arena;
-use crate::utils::byterange::{ByteRange, ByteRanges};
-use base64::Engine as _;
+use crate::model::{self, Arena, ByteRange, ByteRanges, Delta, Hash, Signature};
 
 /// Convenient shortcut for results containing [RealizeError].
 pub type Result<T> = std::result::Result<T, RealizeServiceError>;
@@ -40,67 +37,6 @@ pub enum SyncedFileState {
     /// The file is incomplete. It is likely being moved.
     Partial,
 }
-
-/// Hash for a range within a [SyncedFile].
-///
-/// It is created by [RealizeService::hash].
-#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Hash(pub [u8; 32]);
-
-impl Hash {
-    fn base64(&self) -> String {
-        base64::prelude::BASE64_STANDARD_NO_PAD.encode(&self.0)
-    }
-
-    /// Hash that indicates the absence of any data.
-    pub fn zero() -> Self {
-        Self([0u8; 32])
-    }
-
-    /// True if the hash is [Hash::zero]
-    fn is_zero(&self) -> bool {
-        for v in self.0 {
-            if v != 0 {
-                return false;
-            }
-        }
-
-        true
-    }
-}
-
-impl std::fmt::Debug for Hash {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(self, f)
-    }
-}
-
-impl std::fmt::Display for Hash {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.is_zero() {
-            f.write_str("None")
-        } else {
-            f.write_str(&self.base64())
-        }
-    }
-}
-
-/// A rsync-type signature created from a partial file range.
-///
-/// This is created from [RealizeService::calculate_signature] on the
-/// source instance and later on passed to [RealizeService::diff] on
-/// the destination instance to create a [Delta].
-#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Signature(pub Vec<u8>);
-
-/// A rsync-type delta that can be applied to modify a file.
-///
-/// This is the result of comparing some range of data on the source
-/// instance and the destination instance using
-/// [RealizeService::diff]. It can be applied by calling
-/// [RealizeService::apply_delta] on the destination instance.
-#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Delta(pub Vec<u8>);
 
 /// Configures the behavior of a method on [RealizeService].
 #[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize, Default)]
@@ -145,8 +81,7 @@ pub trait RealizeService {
     ) -> Result<Vec<u8>>;
 
     /// Mark a partial file as complete
-    async fn finish(arena: Arena, relative_path: model::Path, options: Options)
-        -> Result<()>;
+    async fn finish(arena: Arena, relative_path: model::Path, options: Options) -> Result<()>;
 
     /// Compute a SHA-256 hash of the file at the given path (final or partial).
     async fn hash(
@@ -157,8 +92,7 @@ pub trait RealizeService {
     ) -> Result<Hash>;
 
     /// Delete the file at the given path (both partial and final forms).
-    async fn delete(arena: Arena, relative_path: model::Path, options: Options)
-        -> Result<()>;
+    async fn delete(arena: Arena, relative_path: model::Path, options: Options) -> Result<()>;
 
     /// Calculate a signature for the file at the given path and byte range.
     async fn calculate_signature(

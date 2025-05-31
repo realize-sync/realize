@@ -22,7 +22,7 @@
 //! let hash = hasher.finalize();
 //! ```
 
-use crate::network::rpc::realize::Hash;
+use crate::model::Hash;
 use blake2::{Blake2b, Digest, digest::consts::U32};
 
 type Blake2b256 = Blake2b<U32>;

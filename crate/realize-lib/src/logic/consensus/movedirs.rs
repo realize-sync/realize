@@ -10,7 +10,7 @@ use crate::network::rpc::realize::{
     Options, RangedHash, RealizeServiceClient, RealizeServiceError, RealizeServiceRequest,
     RealizeServiceResponse, SyncedFile,
 };
-use crate::utils::byterange::{ByteRange, ByteRanges};
+use crate::model::{ByteRange, ByteRanges};
 use futures::future;
 use futures::stream::StreamExt as _;
 use futures::FutureExt;
@@ -821,7 +821,7 @@ mod tests {
     use super::*;
     use crate::model::{Arena, LocalArena, LocalArenas};
     use crate::network::rpc::realize::server::{self};
-    use crate::network::rpc::realize::Hash;
+    use crate::model::Hash;
     use crate::utils::hash;
     use assert_fs::prelude::*;
     use assert_fs::TempDir;

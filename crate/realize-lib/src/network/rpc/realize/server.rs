@@ -5,17 +5,18 @@
 //! and supports secure, restartable sync.
 
 use crate::model;
+use crate::model::ByteRange;
 use crate::model::{Arena, LocalArena, LocalArenas};
 use crate::network::rpc::realize::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
+use crate::network::rpc::realize::Config;
+use crate::model::Hash;
 use crate::network::rpc::realize::Options;
-use crate::network::rpc::realize::{Config, Hash};
 use crate::network::rpc::realize::{
     RealizeService, RealizeServiceError, Result, RsyncOperation, SyncedFile, SyncedFileState,
 };
 use crate::network::rpc::realize::{
     RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse,
 };
-use crate::utils::byterange::ByteRange;
 use crate::utils::hash;
 use async_speed_limit::clock::StandardClock;
 use async_speed_limit::Limiter;
@@ -250,7 +251,7 @@ impl RealizeService for RealizeServer {
         relative_path: model::Path,
         range: ByteRange,
         options: Options,
-    ) -> Result<crate::network::rpc::realize::Signature> {
+    ) -> Result<crate::model::Signature> {
         let dir = self.find_directory(&arena)?;
         let logical = LogicalPath::new(dir, &relative_path);
         let (_, actual) = logical.find(&options).await?;
@@ -262,7 +263,7 @@ impl RealizeService for RealizeServer {
             crypto_hash_size: 8,
         };
         let sig = RsyncSignature::calculate(&buffer, opts);
-        Ok(crate::network::rpc::realize::Signature(
+        Ok(crate::model::Signature(
             sig.into_serialized(),
         ))
     }
@@ -273,9 +274,9 @@ impl RealizeService for RealizeServer {
         arena: Arena,
         relative_path: model::Path,
         range: ByteRange,
-        signature: crate::network::rpc::realize::Signature,
+        signature: crate::model::Signature,
         options: Options,
-    ) -> Result<(crate::network::rpc::realize::Delta, Hash)> {
+    ) -> Result<(crate::model::Delta, Hash)> {
         let dir = self.find_directory(&arena)?;
         let logical = LogicalPath::new(dir, &relative_path);
         let (_, actual) = logical.find(&options).await?;
@@ -289,7 +290,7 @@ impl RealizeService for RealizeServer {
         let mut delta = Vec::new();
         rsync_diff(&sig.index(), &buffer, &mut delta)?;
 
-        Ok((crate::network::rpc::realize::Delta(delta), hash))
+        Ok((crate::model::Delta(delta), hash))
     }
 
     async fn apply_delta(
@@ -298,7 +299,7 @@ impl RealizeService for RealizeServer {
         arena: Arena,
         relative_path: model::Path,
         range: ByteRange,
-        delta: crate::network::rpc::realize::Delta,
+        delta: crate::model::Delta,
         hash: Hash,
         options: Options,
     ) -> Result<()> {
@@ -626,7 +627,7 @@ async fn is_empty_dir(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::rpc::realize::Hash;
+    use crate::model::Hash;
     use assert_fs::prelude::*;
     use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
@@ -771,12 +772,10 @@ mod tests {
         };
 
         temp.child(".foo.txt.part").write_str("test")?;
-        assert!(
-            LogicalPath::new(&dir, &model::Path::parse("foo.txt")?)
-                .find(&nopartial)
-                .await
-                .is_err()
-        );
+        assert!(LogicalPath::new(&dir, &model::Path::parse("foo.txt")?)
+            .find(&nopartial)
+            .await
+            .is_err());
 
         temp.child("bar.txt").write_str("test")?;
         assert_eq!(
@@ -1246,7 +1245,7 @@ mod tests {
                 dir.arena().clone(),
                 file_path,
                 ByteRange { start: 0, end: 3 },
-                crate::network::rpc::realize::Delta(vec![1, 2, 3]),
+                crate::model::Delta(vec![1, 2, 3]),
                 Hash::zero(),
                 Options::default(),
             )

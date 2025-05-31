@@ -30,7 +30,7 @@ use tokio::net::TcpListener;
 use crate::network::rpc::realize::{
     RealizeServiceError, RealizeServiceRequest, RealizeServiceResponse,
 };
-use crate::utils::byterange::ByteRange;
+use crate::model::ByteRange;
 
 lazy_static::lazy_static! {
     pub(crate) static ref METRIC_SERVER_DATA_IN_BYTES: HistogramVec =
