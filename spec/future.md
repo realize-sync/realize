@@ -3,28 +3,6 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
-## New file Layout {#layout1}
-
-Move file layout and service name to match the proposal in fs_design.md
-
-``
-OK algo.rs -> logic/consensus/movedirs.rs
-OK algo/hash.rs -> util/hash.rs
-OK model/service.rs -> src/network/rpc/<servicename>.rs
-OK model/byterange.rs -> src/utils/byterange.rs
-server.rs -> logic/emissaries/<servicename>.rs
-             OK network/rpc/<servicename>/server.rs
-             storage.rs
-OK transport/rate_limit.rs -> network/rate_limit.rs
-OK transport/security -> network/security.rs
-OK transport/tcp.rs network/tcp.rs
-OK metrics.rs -> network/rpc/<servicename>/metrics.rs
-OK client.rs -> network/rpc/<servicename>/client.rs
-utils -> utils
-
-<servicename> local_store.rs RPC LocalStore
-```
-
 ## Gate copy by file size {#sizegate}
 
 Instead of allowing one file to copy at a time, allow multiple for a total of up to CHUNK_SIZE bytes. A file > CHUNK_SIZE gets copied one at a time, but smaller files can be grouped together. Might be worth increasing the number of parallel files for that.
