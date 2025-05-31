@@ -85,39 +85,6 @@ or dst) threw this.
 
 - Print app errors in client at debug level
 
-## Close connections {#closeconn}
-
-TLS connections should be closed. Do it properly. Suppress or update
-error logs complaining about it; for now they just say "read|write
-errored out".
-
-Use tokio::sync::broadcast::channel to tell all tasks owning a
-BaseChannel to close it.
-
-Might use something like the following, using
-[signal-hook](https://crates.io/crates/signal-hook):
-
-```
-    let handle = spawn(move || {
-        server_loop();
-    });
-
-    // main thread
-    let mut signals = Signals::new(TERM_SIGNALS).unwrap();
-    for _sig in signals.forever() { // or tokio equivalent
-        break;
-    }
-
-    kill_server(); // Example: close a channel, send a broadcast
-
-    let _ = handle.join();
-
-    Ok(())
-```
-
-Or a Tokio equivalent, from
-[signal_hook_tokio](https://docs.rs/signal-hook-tokio/latest/signal_hook_tokio/)
-
 ## Implement retries {#retry}
 
 See the section "Error and retries" of spec/design.md.
