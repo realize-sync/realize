@@ -1,7 +1,6 @@
 use assert_fs::prelude::*;
 use assert_fs::TempDir;
 use prometheus::proto::MetricType;
-use realize_lib::model::{Arena, LocalArena, LocalArenas};
 use realize_lib::logic::consensus::movedirs;
 use realize_lib::logic::consensus::movedirs::METRIC_END_COUNT;
 use realize_lib::logic::consensus::movedirs::METRIC_FILE_END_COUNT;
@@ -11,8 +10,10 @@ use realize_lib::logic::consensus::movedirs::METRIC_RANGE_WRITE_BYTES;
 use realize_lib::logic::consensus::movedirs::METRIC_READ_BYTES;
 use realize_lib::logic::consensus::movedirs::METRIC_START_COUNT;
 use realize_lib::logic::consensus::movedirs::METRIC_WRITE_BYTES;
+use realize_lib::model::{Arena, LocalArena};
 use realize_lib::network::rpc::realize::server::{self, InProcessRealizeServiceClient};
 use realize_lib::network::rpc::realize::Options;
+use realize_lib::storage::real::LocalStorage;
 use std::sync::Arc;
 
 // Metric tests are kept in their own binary to avoid other test
@@ -30,11 +31,7 @@ async fn client_success_call_count() -> anyhow::Result<()> {
         &[("method", "list"), ("status", "OK"), ("error", "OK")],
     );
     client
-        .list(
-            tarpc::context::current(),
-            arena.clone(),
-            Options::default(),
-        )
+        .list(tarpc::context::current(), arena.clone(), Options::default())
         .await??;
     let after = get_metric_value(
         "realize_client_call_count",
@@ -85,11 +82,7 @@ async fn server_success_call_count() -> anyhow::Result<()> {
         &[("method", "list"), ("status", "OK"), ("error", "OK")],
     );
     client
-        .list(
-            tarpc::context::current(),
-            arena.clone(),
-            Options::default(),
-        )
+        .list(tarpc::context::current(), arena.clone(), Options::default())
         .await??;
     let after_srv = get_metric_value(
         "realize_server_call_count",
@@ -152,8 +145,8 @@ async fn move_files_metrics() -> anyhow::Result<()> {
     let dst_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), dst_temp.path()));
     let (success, error, _interrupted) = movedirs::move_dir(
         tarpc::context::current(),
-        &server::create_inprocess_client(LocalArenas::single(src_dir.arena(), src_dir.path())),
-        &server::create_inprocess_client(LocalArenas::single(dst_dir.arena(), dst_dir.path())),
+        &server::create_inprocess_client(LocalStorage::single(src_dir.arena(), src_dir.path())),
+        &server::create_inprocess_client(LocalStorage::single(dst_dir.arena(), dst_dir.path())),
         Arena::from("testdir"),
         None,
     )
@@ -182,7 +175,7 @@ async fn move_files_metrics() -> anyhow::Result<()> {
 fn setup_inprocess_client() -> (TempDir, Arena, InProcessRealizeServiceClient) {
     let temp = TempDir::new().unwrap();
     let arena = Arena::from("testdir");
-    let client = server::create_inprocess_client(LocalArenas::single(&arena, temp.path()));
+    let client = server::create_inprocess_client(LocalStorage::single(&arena, temp.path()));
 
     (temp, arena, client)
 }

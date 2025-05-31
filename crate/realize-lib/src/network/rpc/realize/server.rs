@@ -6,10 +6,10 @@
 
 use crate::model;
 use crate::model::ByteRange;
-use crate::model::{Arena, LocalArena, LocalArenas};
+use crate::model::Hash;
+use crate::model::{Arena, LocalArena};
 use crate::network::rpc::realize::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
 use crate::network::rpc::realize::Config;
-use crate::model::Hash;
 use crate::network::rpc::realize::Options;
 use crate::network::rpc::realize::{
     RealizeService, RealizeServiceError, Result, RsyncOperation, SyncedFile, SyncedFileState,
@@ -17,6 +17,7 @@ use crate::network::rpc::realize::{
 use crate::network::rpc::realize::{
     RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse,
 };
+use crate::storage::real::LocalStorage;
 use crate::utils::hash;
 use async_speed_limit::clock::StandardClock;
 use async_speed_limit::Limiter;
@@ -49,8 +50,8 @@ const RSYNC_BLOCK_SIZE: usize = 4096;
 pub type InProcessRealizeServiceClient = RealizeServiceClient<InProcessStub>;
 
 /// Creates a in-process client that works on the given directories.
-pub fn create_inprocess_client(dirs: LocalArenas) -> InProcessRealizeServiceClient {
-    RealizeServer::new(dirs).as_inprocess_client()
+pub fn create_inprocess_client(storage: LocalStorage) -> InProcessRealizeServiceClient {
+    RealizeServer::new(storage).as_inprocess_client()
 }
 
 pub struct InProcessStub {
@@ -73,27 +74,27 @@ impl Stub for InProcessStub {
 
 #[derive(Clone)]
 pub(crate) struct RealizeServer {
-    pub(crate) dirs: LocalArenas,
+    pub(crate) storage: LocalStorage,
     pub(crate) limiter: Option<Limiter<StandardClock>>,
 }
 
 impl RealizeServer {
-    pub(crate) fn new(dirs: LocalArenas) -> Self {
+    pub(crate) fn new(storage: LocalStorage) -> Self {
         Self {
-            dirs,
+            storage,
             limiter: None,
         }
     }
 
-    pub(crate) fn new_limited(dirs: LocalArenas, limiter: Limiter<StandardClock>) -> Self {
+    pub(crate) fn new_limited(storage: LocalStorage, limiter: Limiter<StandardClock>) -> Self {
         Self {
-            dirs,
+            storage,
             limiter: Some(limiter),
         }
     }
 
     fn find_directory(&self, arena: &Arena) -> Result<&Arc<LocalArena>> {
-        self.dirs.get(arena).ok_or_else(|| {
+        self.storage.get(arena).ok_or_else(|| {
             RealizeServiceError::BadRequest(format!("Unknown directory \"{}\"", arena))
         })
     }
@@ -263,9 +264,7 @@ impl RealizeService for RealizeServer {
             crypto_hash_size: 8,
         };
         let sig = RsyncSignature::calculate(&buffer, opts);
-        Ok(crate::model::Signature(
-            sig.into_serialized(),
-        ))
+        Ok(crate::model::Signature(sig.into_serialized()))
     }
 
     async fn diff(
@@ -640,7 +639,7 @@ mod tests {
         let dir = Arc::new(LocalArena::new(&arena, temp.path()));
 
         Ok((
-            RealizeServer::new(LocalArenas::single(&arena, dir.path())),
+            RealizeServer::new(LocalStorage::single(&arena, dir.path())),
             temp,
             dir,
         ))
@@ -1129,7 +1128,7 @@ mod tests {
     async fn tarpc_rpc_inprocess() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let client =
-            create_inprocess_client(LocalArenas::single(&Arena::from("testdir"), temp.path()));
+            create_inprocess_client(LocalStorage::single(&Arena::from("testdir"), temp.path()));
         let list = client
             .list(
                 tarpc::context::current(),
@@ -1420,7 +1419,7 @@ mod tests {
 
     #[tokio::test]
     async fn configure_noop_returns_none() {
-        let server = RealizeServer::new(LocalArenas::single(
+        let server = RealizeServer::new(LocalStorage::single(
             &Arena::from("testdir"),
             &PathBuf::from("/tmp/testdir"),
         ));
@@ -1439,7 +1438,7 @@ mod tests {
 
     #[tokio::test]
     async fn configure_limited_sets_and_returns_limit() {
-        let dirs = LocalArenas::single(&Arena::from("testdir"), &PathBuf::from("/tmp/testdir"));
+        let dirs = LocalStorage::single(&Arena::from("testdir"), &PathBuf::from("/tmp/testdir"));
         let limiter = Limiter::<StandardClock>::new(f64::INFINITY);
         let server = RealizeServer::new_limited(dirs, limiter.clone());
         let limit = 55555u64;

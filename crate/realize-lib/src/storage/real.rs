@@ -33,7 +33,7 @@ pub struct LocalStorage {
 }
 
 impl LocalStorage {
-    /// Create a [LocalArenas] from an iterator of [LocalArena].
+    /// Create a [LocalStorage] from an iterator of [LocalArena].
     pub fn new<T>(arenas: T) -> Self
     where
         T: IntoIterator<Item = LocalArena>,
@@ -51,6 +51,11 @@ impl LocalStorage {
         let mut map = HashMap::new();
         map.insert(arena.clone(), dir);
         Self { map: Arc::new(map) }
+    }
+
+    /// Get a [LocalArena] if one exists for the given arena.
+    pub fn get(&self, arena: &Arena) -> Option<&Arc<LocalArena>> {
+        self.map.get(arena)
     }
 
     /// Build a path resolver for a read-only view of the arena.

@@ -5,7 +5,6 @@ mod path;
 
 pub use arena::Arena;
 pub use arena::LocalArena;
-pub use arena::LocalArenas;
 pub use byterange::ByteRange;
 pub use byterange::ByteRanges;
 pub use data::Delta;

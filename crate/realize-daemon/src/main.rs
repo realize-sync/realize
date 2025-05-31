@@ -3,10 +3,11 @@
 use anyhow::Context as _;
 use clap::Parser;
 use prometheus::{register_int_counter, IntCounter};
-use realize_lib::model::{LocalArena, LocalArenas};
+use realize_lib::model::LocalArena;
 use realize_lib::network::rpc::realize::metrics;
 use realize_lib::network::security::{self, PeerVerifier};
 use realize_lib::network::tcp::{self, HostPort};
+use realize_lib::storage::real::LocalStorage;
 use realize_lib::utils::logging;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
@@ -96,7 +97,7 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
             dirs.push(LocalArena::new(&id.as_str().into(), path.as_ref()));
         }
     }
-    let dirs = LocalArenas::new(dirs);
+    let dirs = LocalStorage::new(dirs);
 
     // Build PeerVerifier
     let crypto = Arc::new(security::default_provider());

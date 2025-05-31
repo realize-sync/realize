@@ -27,7 +27,6 @@ use tarpc::server::{BaseChannel, Channel};
 use tarpc::tokio_serde::formats::Bincode;
 use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
 
-use crate::model::LocalArenas;
 use crate::network::rate_limit::RateLimitedStream;
 use crate::network::reconnect::Connect;
 use crate::network::reconnect::Reconnect;
@@ -41,6 +40,7 @@ use crate::network::rpc::realize::RealizeServiceResponse;
 use crate::network::rpc::realize::{RealizeService, RealizeServiceClient};
 use crate::network::security;
 use crate::network::security::PeerVerifier;
+use crate::storage::real::LocalStorage;
 use crate::utils::async_utils::AbortOnDrop;
 
 use std::fmt;
@@ -114,7 +114,7 @@ impl From<SocketAddr> for HostPort {
 /// Start the server, listening on the given address.
 pub async fn start_server(
     hostport: &HostPort,
-    dirs: LocalArenas,
+    storage: LocalStorage,
     verifier: Arc<PeerVerifier>,
     privkey: Arc<dyn SigningKey>,
 ) -> anyhow::Result<(SocketAddr, AbortOnDrop<()>)> {
@@ -145,7 +145,7 @@ pub async fn start_server(
             peer_addr
         );
         let framed = LengthDelimitedCodec::builder().new_framed(tls_stream);
-        let server = RealizeServer::new_limited(dirs.clone(), limiter.clone());
+        let server = RealizeServer::new_limited(storage.clone(), limiter.clone());
         tokio::spawn(
             BaseChannel::with_defaults(transport::new(framed, Bincode::default()))
                 .execute(MetricsRealizeServer::new(RealizeServer::serve(
@@ -347,7 +347,7 @@ mod tests {
         verifier: Arc<PeerVerifier>,
     ) -> anyhow::Result<(SocketAddr, AbortOnDrop<()>, TempDir)> {
         let temp = TempDir::new()?;
-        let dirs = LocalArenas::single(&Arena::from("testdir"), temp.path());
+        let dirs = LocalStorage::single(&Arena::from("testdir"), temp.path());
         let server_privkey =
             load_private_key(crate::network::security::testing::server_private_key())?;
         let (addr, server_handle) = start_server(
@@ -472,7 +472,7 @@ mod tests {
     #[tokio::test]
     async fn configure_tcp_returns_limit() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        let dirs = LocalArenas::single(&Arena::from("testdir"), temp.path());
+        let dirs = LocalStorage::single(&Arena::from("testdir"), temp.path());
         let verifier = verifier_both();
         let server_privkey =
             load_private_key(crate::network::security::testing::server_private_key())?;
@@ -512,7 +512,7 @@ mod tests {
     #[tokio::test]
     async fn configure_tcp_per_connection_limit() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        let dirs = LocalArenas::single(&Arena::from("testdir"), temp.path());
+        let dirs = LocalStorage::single(&Arena::from("testdir"), temp.path());
         let verifier = verifier_both();
         let server_privkey =
             load_private_key(crate::network::security::testing::server_private_key())?;
