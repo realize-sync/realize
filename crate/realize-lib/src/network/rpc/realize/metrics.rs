@@ -16,21 +16,21 @@ use std::time::Instant;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use prometheus::{
-    register_histogram_vec, register_int_counter_vec, register_int_gauge, Encoder, HistogramVec,
-    IntCounterVec, IntGauge,
+    Encoder, HistogramVec, IntCounterVec, IntGauge, register_histogram_vec,
+    register_int_counter_vec, register_int_gauge,
 };
 use tarpc::{
-    client::{stub::Stub, RpcError},
+    ServerError,
+    client::{RpcError, stub::Stub},
     context::Context,
     server::Serve,
-    ServerError,
 };
 use tokio::net::TcpListener;
 
+use crate::model::ByteRange;
 use crate::network::rpc::realize::{
     RealizeServiceError, RealizeServiceRequest, RealizeServiceResponse,
 };
-use crate::model::ByteRange;
 
 lazy_static::lazy_static! {
     pub(crate) static ref METRIC_SERVER_DATA_IN_BYTES: HistogramVec =

@@ -1,5 +1,5 @@
-use assert_fs::prelude::*;
 use assert_fs::TempDir;
+use assert_fs::prelude::*;
 use prometheus::proto::MetricType;
 use realize_lib::logic::consensus::movedirs;
 use realize_lib::logic::consensus::movedirs::METRIC_END_COUNT;
@@ -11,8 +11,8 @@ use realize_lib::logic::consensus::movedirs::METRIC_READ_BYTES;
 use realize_lib::logic::consensus::movedirs::METRIC_START_COUNT;
 use realize_lib::logic::consensus::movedirs::METRIC_WRITE_BYTES;
 use realize_lib::model::{Arena, LocalArena};
-use realize_lib::network::rpc::realize::server::{self, InProcessRealizeServiceClient};
 use realize_lib::network::rpc::realize::Options;
+use realize_lib::network::rpc::realize::server::{self, InProcessRealizeServiceClient};
 use realize_lib::storage::real::LocalStorage;
 use std::sync::Arc;
 
@@ -53,14 +53,16 @@ async fn client_error_call_count() -> anyhow::Result<()> {
             ("error", "BadRequest"),
         ],
     );
-    assert!(client
-        .list(
-            tarpc::context::current(),
-            Arena::from("doesnotexist"),
-            Options::default(),
-        )
-        .await?
-        .is_err());
+    assert!(
+        client
+            .list(
+                tarpc::context::current(),
+                Arena::from("doesnotexist"),
+                Options::default(),
+            )
+            .await?
+            .is_err()
+    );
     let after_err = get_metric_value(
         "realize_client_call_count",
         &[
@@ -104,14 +106,16 @@ async fn server_error_call_count() -> anyhow::Result<()> {
             ("error", "BadRequest"),
         ],
     );
-    assert!(client
-        .list(
-            tarpc::context::current(),
-            Arena::from("doesnotexist"),
-            Options::default(),
-        )
-        .await?
-        .is_err());
+    assert!(
+        client
+            .list(
+                tarpc::context::current(),
+                Arena::from("doesnotexist"),
+                Options::default(),
+            )
+            .await?
+            .is_err()
+    );
     let after_srv_err = get_metric_value(
         "realize_server_call_count",
         &[

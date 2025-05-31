@@ -1,14 +1,14 @@
 use anyhow::Context as _;
-use async_speed_limit::clock::StandardClock;
 use async_speed_limit::Limiter;
+use async_speed_limit::clock::StandardClock;
 use clap::Parser;
 use clap::ValueEnum;
 use console::style;
 use indicatif::HumanBytes;
 use progress::CliProgress;
-use prometheus::{register_int_counter, IntCounter};
-use realize_lib::model::Arena;
+use prometheus::{IntCounter, register_int_counter};
 use realize_lib::logic::consensus::movedirs::MoveFileError;
+use realize_lib::model::Arena;
 use realize_lib::network::rpc::realize::metrics;
 use realize_lib::network::security::{self, PeerVerifier};
 use realize_lib::network::tcp::{self, ClientConnectionState, HostPort, TcpRealizeServiceClient};

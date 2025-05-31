@@ -11,16 +11,16 @@ use crate::network::rpc::realize::{
     Options, RangedHash, RealizeServiceClient, RealizeServiceError, RealizeServiceRequest,
     RealizeServiceResponse, SyncedFile,
 };
+use futures::FutureExt;
 use futures::future;
 use futures::stream::StreamExt as _;
-use futures::FutureExt;
-use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
+use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tarpc::client::stub::Stub;
 use thiserror::Error;
-use tokio::sync::mpsc::Sender;
 use tokio::sync::Semaphore;
+use tokio::sync::mpsc::Sender;
 
 const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 const PARALLEL_FILE_COUNT: usize = 4;
@@ -809,8 +809,8 @@ mod tests {
     use crate::network::rpc::realize::server::{self};
     use crate::storage::real::LocalStorage;
     use crate::utils::hash;
-    use assert_fs::prelude::*;
     use assert_fs::TempDir;
+    use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
     use std::path::PathBuf;
     use std::sync::Arc;

@@ -160,8 +160,7 @@ impl CliProgress {
         mut dst_watch_rx: tokio::sync::watch::Receiver<ClientConnectionState>,
     ) {
         use ProgressEvent::*;
-        let mut file_progress_map: HashMap<(Arena, model::Path), CliFileProgress> =
-            HashMap::new();
+        let mut file_progress_map: HashMap<(Arena, model::Path), CliFileProgress> = HashMap::new();
 
         self.set_connection_state(
             *src_watch_rx.borrow_and_update(),

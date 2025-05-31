@@ -2,7 +2,7 @@
 
 use anyhow::Context as _;
 use clap::Parser;
-use prometheus::{register_int_counter, IntCounter};
+use prometheus::{IntCounter, register_int_counter};
 use realize_lib::model::LocalArena;
 use realize_lib::network::rpc::realize::metrics;
 use realize_lib::network::security::{self, PeerVerifier};

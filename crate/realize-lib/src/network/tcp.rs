@@ -4,13 +4,13 @@
 //! It handles TLS setup, peer authentication, DNS resolution, and connection retry logic.
 
 use anyhow::Context as _;
-use async_speed_limit::clock::StandardClock;
 use async_speed_limit::Limiter;
+use async_speed_limit::clock::StandardClock;
 use futures::prelude::*;
 use rustls::pki_types::ServerName;
 use rustls::sign::SigningKey;
-use tarpc::client::stub::Stub;
 use tarpc::client::RpcError;
+use tarpc::client::stub::Stub;
 use tarpc::context;
 use tokio::sync::Mutex;
 use tokio_retry::strategy::ExponentialBackoff;
@@ -30,13 +30,13 @@ use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
 use crate::network::rate_limit::RateLimitedStream;
 use crate::network::reconnect::Connect;
 use crate::network::reconnect::Reconnect;
+use crate::network::rpc::realize::Config;
+use crate::network::rpc::realize::RealizeServiceRequest;
+use crate::network::rpc::realize::RealizeServiceResponse;
 use crate::network::rpc::realize::metrics;
 use crate::network::rpc::realize::metrics::MetricsRealizeClient;
 use crate::network::rpc::realize::metrics::MetricsRealizeServer;
 use crate::network::rpc::realize::server::RealizeServer;
-use crate::network::rpc::realize::Config;
-use crate::network::rpc::realize::RealizeServiceRequest;
-use crate::network::rpc::realize::RealizeServiceResponse;
 use crate::network::rpc::realize::{RealizeService, RealizeServiceClient};
 use crate::network::security;
 use crate::network::security::PeerVerifier;
