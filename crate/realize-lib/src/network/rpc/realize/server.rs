@@ -5,19 +5,22 @@
 //! and supports secure, restartable sync.
 
 use crate::model;
+use crate::model::Arena;
 use crate::model::ByteRange;
 use crate::model::Hash;
-use crate::model::{Arena, LocalArena};
 use crate::network::rpc::realize::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
 use crate::network::rpc::realize::Config;
 use crate::network::rpc::realize::Options;
 use crate::network::rpc::realize::{
-    RealizeService, RealizeServiceError, Result, RsyncOperation, SyncedFile, SyncedFileState,
+    RealizeService, RealizeServiceError, Result, RsyncOperation, SyncedFile,
 };
 use crate::network::rpc::realize::{
     RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse,
 };
 use crate::storage::real::LocalStorage;
+use crate::storage::real::PathResolver;
+use crate::storage::real::PathType;
+use crate::storage::real::StorageAccess;
 use crate::utils::hash;
 use async_speed_limit::clock::StandardClock;
 use async_speed_limit::Limiter;
@@ -27,10 +30,8 @@ use fast_rsync::{
 };
 use futures::StreamExt;
 use std::cmp::min;
-use std::ffi::OsString;
 use std::os::unix::fs::MetadataExt as _;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
 use tarpc::client::stub::Stub;
 use tarpc::client::RpcError;
 use tarpc::context;
@@ -93,10 +94,17 @@ impl RealizeServer {
         }
     }
 
-    fn find_directory(&self, arena: &Arena) -> Result<&Arc<LocalArena>> {
-        self.storage.get(arena).ok_or_else(|| {
-            RealizeServiceError::BadRequest(format!("Unknown directory \"{}\"", arena))
-        })
+    fn path_resolver(&self, arena: &Arena, opts: &Options) -> Result<PathResolver> {
+        self.storage
+            .path_resolver(
+                arena,
+                if opts.ignore_partial {
+                    StorageAccess::Read
+                } else {
+                    StorageAccess::ReadWrite
+                },
+            )
+            .ok_or(unknown_arena())
     }
 
     /// Create an in-process RealizeServiceClient for this server instance.
@@ -130,21 +138,20 @@ impl RealizeService for RealizeServer {
         arena: Arena,
         options: Options,
     ) -> Result<Vec<SyncedFile>> {
-        let dir = self.find_directory(&arena)?.clone();
+        let resolver = self.path_resolver(&arena, &options)?.clone();
 
         tokio::task::spawn_blocking(move || {
             let mut files = std::collections::BTreeMap::new();
-            for entry in WalkDir::new(dir.path()).into_iter().flatten() {
-                if let Some((state, logical)) = LogicalPath::from_actual(&dir, entry.path()) {
-                    if options.ignore_partial && state == SyncedFileState::Partial {
-                        continue;
-                    }
-                    let path = logical.relative_path().clone();
-                    if state == SyncedFileState::Final && files.contains_key(&path) {
+            for entry in WalkDir::new(resolver.root()).into_iter().flatten() {
+                if !entry.metadata().is_ok_and(|m| m.is_file()) {
+                    continue;
+                }
+                if let Some((path_type, path)) = resolver.reverse(entry.path()) {
+                    if path_type == PathType::Final && files.contains_key(&path) {
                         continue;
                     }
                     let size = entry.metadata()?.size();
-                    files.insert(path.clone(), SyncedFile { path, size, state });
+                    files.insert(path.clone(), SyncedFile { path, size });
                 }
             }
 
@@ -161,9 +168,8 @@ impl RealizeService for RealizeServer {
         range: ByteRange,
         options: Options,
     ) -> Result<Vec<u8>> {
-        let dir = self.find_directory(&arena)?;
-        let logical = LogicalPath::new(dir, &relative_path);
-        let (_, actual) = logical.find(&options).await?;
+        let resolver = self.path_resolver(&arena, &options)?;
+        let actual = resolver.resolve(&relative_path).await?;
         let mut file = open_for_range_read(&actual).await?;
         let mut buffer = vec![0; range.bytecount() as usize];
         read_padded(&mut file, &range, &mut buffer).await?;
@@ -180,9 +186,8 @@ impl RealizeService for RealizeServer {
         data: Vec<u8>,
         options: Options,
     ) -> Result<()> {
-        let dir = self.find_directory(&arena)?;
-        let logical = LogicalPath::new(dir, &relative_path);
-        let path = prepare_for_write(&options, logical).await?;
+        let resolver = self.path_resolver(&arena, &options)?;
+        let path = resolver.partial_path(&relative_path).ok_or(bad_path())?;
         let mut file = open_for_range_write(&path).await?;
         write_at_offset(&mut file, range.start, &data).await?;
 
@@ -196,15 +201,20 @@ impl RealizeService for RealizeServer {
         relative_path: model::Path,
         options: Options,
     ) -> Result<()> {
-        let dir = self.find_directory(&arena)?;
-        let logical = LogicalPath::new(dir, &relative_path);
         if options.ignore_partial {
             return Err(RealizeServiceError::BadRequest(
                 "Invalid option for finish: ignore_partial=true".to_string(),
             ));
         }
-        if let (SyncedFileState::Partial, real_path) = logical.find(&options).await? {
-            fs::rename(real_path, logical.final_path()).await?;
+        let resolver = self.path_resolver(&arena, &options)?;
+        let partial_path = resolver.partial_path(&relative_path).ok_or(bad_path())?;
+        let actual = resolver.resolve(&relative_path).await?;
+        if actual == partial_path {
+            fs::rename(
+                actual,
+                resolver.final_path(&relative_path).ok_or(bad_path())?,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -217,9 +227,8 @@ impl RealizeService for RealizeServer {
         range: ByteRange,
         options: Options,
     ) -> Result<Hash> {
-        let dir = self.find_directory(&arena)?;
-        let logical = LogicalPath::new(dir, &relative_path);
-        let (_, path) = logical.find(&options).await?;
+        let resolver = self.path_resolver(&arena, &options)?;
+        let path = resolver.resolve(&relative_path).await?;
 
         hash_large_range_exact(&path, &range).await
     }
@@ -231,17 +240,17 @@ impl RealizeService for RealizeServer {
         relative_path: model::Path,
         options: Options,
     ) -> Result<()> {
-        let dir = self.find_directory(&arena)?;
-        let logical = LogicalPath::new(dir, &relative_path);
-        let final_path = logical.final_path();
-        let partial_path = logical.partial_path();
-        if final_path.exists() {
-            fs::remove_file(&final_path).await?;
+        let resolver = self.path_resolver(&arena, &options)?;
+        let final_path = resolver.final_path(&relative_path).ok_or(bad_path())?;
+        if fs::metadata(&final_path).await.is_ok() {
+            fs::remove_file(final_path).await?;
         }
-        if partial_path.exists() && !options.ignore_partial {
-            fs::remove_file(&partial_path).await?;
+
+        let partial_path = resolver.partial_path(&relative_path).ok_or(bad_path())?;
+        if fs::metadata(&partial_path).await.is_ok() {
+            fs::remove_file(partial_path).await?;
         }
-        delete_containing_dir(dir.path(), &relative_path).await;
+        delete_containing_dir(resolver.root(), &relative_path).await;
         Ok(())
     }
 
@@ -253,9 +262,8 @@ impl RealizeService for RealizeServer {
         range: ByteRange,
         options: Options,
     ) -> Result<crate::model::Signature> {
-        let dir = self.find_directory(&arena)?;
-        let logical = LogicalPath::new(dir, &relative_path);
-        let (_, actual) = logical.find(&options).await?;
+        let resolver = self.path_resolver(&arena, &options)?;
+        let actual = resolver.resolve(&relative_path).await?;
         let mut file = File::open(&actual).await?;
         let mut buffer = vec![0u8; range.bytecount() as usize];
         read_padded(&mut file, &range, &mut buffer).await?;
@@ -276,9 +284,8 @@ impl RealizeService for RealizeServer {
         signature: crate::model::Signature,
         options: Options,
     ) -> Result<(crate::model::Delta, Hash)> {
-        let dir = self.find_directory(&arena)?;
-        let logical = LogicalPath::new(dir, &relative_path);
-        let (_, actual) = logical.find(&options).await?;
+        let resolver = self.path_resolver(&arena, &options)?;
+        let actual = resolver.resolve(&relative_path).await?;
         let mut file = open_for_range_read(&actual).await?;
         let mut buffer = vec![0; range.bytecount() as usize];
         read_padded(&mut file, &range, &mut buffer).await?;
@@ -302,10 +309,8 @@ impl RealizeService for RealizeServer {
         hash: Hash,
         options: Options,
     ) -> Result<()> {
-        let dir = self.find_directory(&arena)?;
-        let logical = LogicalPath::new(dir, &relative_path);
-        let path = prepare_for_write(&options, logical).await?;
-
+        let resolver = self.path_resolver(&arena, &options)?;
+        let path = resolver.partial_path(&relative_path).ok_or(bad_path())?;
         let mut file = open_for_range_write(&path).await?;
         let mut base = vec![0u8; range.bytecount() as usize];
         read_padded(&mut file, &range, &mut base).await?;
@@ -332,10 +337,8 @@ impl RealizeService for RealizeServer {
         file_size: u64,
         options: Options,
     ) -> Result<()> {
-        let dir = self.find_directory(&arena)?;
-        let logical = LogicalPath::new(dir, &relative_path);
-        let path = prepare_for_write(&options, logical).await?;
-
+        let resolver = self.path_resolver(&arena, &options)?;
+        let path = resolver.partial_path(&relative_path).ok_or(bad_path())?;
         let mut file = open_for_range_write(&path).await?;
         shorten_file(&mut file, file_size).await?;
 
@@ -364,6 +367,9 @@ impl RealizeService for RealizeServer {
 }
 
 async fn open_for_range_write(path: &Path) -> Result<File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
     Ok(OpenOptions::new()
         .create(true)
         .write(true)
@@ -379,20 +385,6 @@ async fn open_for_range_read(path: &Path) -> Result<File> {
         .write(false)
         .open(path)
         .await?)
-}
-
-async fn prepare_for_write(options: &Options, logical: LogicalPath) -> Result<PathBuf> {
-    let path = logical.partial_path();
-    if let Ok((state, actual)) = logical.find(&options).await {
-        if state == SyncedFileState::Final {
-            fs::rename(actual, &path).await?;
-        }
-    } else {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-    }
-    Ok(path)
 }
 
 /// Hash a range that is too large to be kept in memory.
@@ -465,99 +457,6 @@ async fn write_at_offset(file: &mut File, offset: u64, data: &Vec<u8>) -> Result
     Ok(())
 }
 
-/// A logical path is a relative path inside of a [LocalArena].
-//
-/// The corresponding actual file might be in
-/// [SyncedFileState::Partial] or [SyncedFileState::Final] form. Check
-/// with [LogicalPath::find].
-struct LogicalPath(Arc<LocalArena>, model::Path);
-
-impl LogicalPath {
-    /// Create a new logical path.
-    ///
-    /// The given path must be relative and cannot reference any
-    /// hidden directory or file.
-    fn new(dir: &Arc<LocalArena>, path: &model::Path) -> Self {
-        Self(Arc::clone(dir), path.clone())
-    }
-
-    /// Create a logical path from an actual partial or final path.
-    fn from_actual(dir: &Arc<LocalArena>, actual: &Path) -> Option<(SyncedFileState, Self)> {
-        if !actual.is_file() {
-            return None;
-        }
-
-        let relative = pathdiff::diff_paths(actual, dir.path());
-        if let Some(mut relative) = relative {
-            if let Some(filename) = actual.file_name() {
-                let name_bytes = filename.to_string_lossy();
-                if name_bytes.starts_with(".") && name_bytes.ends_with(".part") {
-                    let stripped_name =
-                        OsString::from(name_bytes[1..name_bytes.len() - 5].to_string());
-                    relative.set_file_name(&stripped_name);
-                    if let Ok(p) = model::Path::from_real_path(&relative) {
-                        return Some((SyncedFileState::Partial, Self(Arc::clone(dir), p)));
-                    } else {
-                        return None;
-                    }
-                }
-                if let Ok(p) = model::Path::from_real_path(&relative) {
-                    return Some((SyncedFileState::Final, Self(Arc::clone(dir), p)));
-                } else {
-                    return None;
-                }
-            }
-        }
-
-        None
-    }
-
-    // Look for a file for the logical path.
-    //
-    // The path can be found in final or partial found. Return both
-    // the [SyncedFileState] and the actual path of the file that was
-    // found.
-    //
-    // File with an I/O error of kind [std::io::ErrorKind::NotFound]
-    // if no file exists for the logical path.
-    async fn find(&self, options: &Options) -> Result<(SyncedFileState, PathBuf)> {
-        if !options.ignore_partial {
-            let partial = self.partial_path();
-            if fs::metadata(&partial).await.is_ok() {
-                return Ok((SyncedFileState::Partial, partial));
-            }
-        }
-        let fpath = self.final_path();
-        if fs::metadata(&fpath).await.is_ok() {
-            return Ok((SyncedFileState::Final, fpath));
-        }
-        Err(std::io::Error::from(std::io::ErrorKind::NotFound).into())
-    }
-
-    /// Return the final form of the logical path.
-    fn final_path(&self) -> PathBuf {
-        self.1.within(self.0.path())
-    }
-
-    /// Return the partial form of the logical path.
-    fn partial_path(&self) -> PathBuf {
-        let mut partial = self.0.path().to_path_buf();
-        partial.push(&self.1.as_real_path());
-
-        let mut part_filename = OsString::from(".");
-        part_filename.push(OsString::from(self.1.name()));
-        part_filename.push(OsString::from(".part"));
-        partial.set_file_name(part_filename);
-
-        partial
-    }
-
-    /// Return the relative path of the logical path.
-    fn relative_path(&self) -> &model::Path {
-        &self.1
-    }
-}
-
 impl From<walkdir::Error> for RealizeServiceError {
     fn from(err: walkdir::Error) -> Self {
         if err.io_error().is_some() {
@@ -623,6 +522,14 @@ async fn is_empty_dir(path: &Path) -> bool {
     return false;
 }
 
+fn unknown_arena() -> RealizeServiceError {
+    RealizeServiceError::BadRequest("Unknown arena".to_string())
+}
+
+fn bad_path() -> RealizeServiceError {
+    RealizeServiceError::BadRequest("Path is invalid".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,8 +537,42 @@ mod tests {
     use assert_fs::prelude::*;
     use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
+    use model::LocalArena;
+    use std::ffi::OsString;
     use std::fs;
     use std::io::Read as _;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    struct LogicalPath {
+        arena: Arc<LocalArena>,
+        path: model::Path,
+    }
+
+    impl LogicalPath {
+        fn new(arena: &Arc<LocalArena>, path: &model::Path) -> Self {
+            Self {
+                arena: arena.clone(),
+                path: path.clone(),
+            }
+        }
+
+        fn final_path(&self) -> PathBuf {
+            self.path.within(self.arena.path())
+        }
+
+        fn partial_path(&self) -> PathBuf {
+            let mut path = self.final_path();
+            let mut part_filename = OsString::from(".");
+            // Since the path is built from a model path, there will
+            // be a filename.
+            part_filename.push(path.file_name().expect("no file name"));
+            part_filename.push(OsString::from(".part"));
+            path.set_file_name(part_filename);
+
+            path
+        }
+    }
 
     fn setup_server_with_dir() -> anyhow::Result<(RealizeServer, TempDir, Arc<LocalArena>)> {
         let temp = TempDir::new()?;
@@ -643,148 +584,6 @@ mod tests {
             temp,
             dir,
         ))
-    }
-
-    #[tokio::test]
-    async fn test_final_and_partial_paths() -> anyhow::Result<()> {
-        let dir = Arc::new(LocalArena::new(
-            &Arena::from("testdir"),
-            &PathBuf::from("/doesnotexist/testdir"),
-        ));
-
-        let file1 = LogicalPath::new(&dir, &model::Path::parse("file1.txt")?);
-        assert_eq!(
-            PathBuf::from("/doesnotexist/testdir/file1.txt"),
-            file1.final_path()
-        );
-        assert_eq!(
-            PathBuf::from("/doesnotexist/testdir/.file1.txt.part"),
-            file1.partial_path()
-        );
-
-        let file2 = LogicalPath::new(&dir, &model::Path::parse("subdir/file2.txt")?);
-        assert_eq!(
-            PathBuf::from("/doesnotexist/testdir/subdir/file2.txt"),
-            file2.final_path()
-        );
-        assert_eq!(
-            PathBuf::from("/doesnotexist/testdir/subdir/.file2.txt.part"),
-            file2.partial_path()
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_find_logical_path() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let dir = Arc::new(LocalArena::new(&Arena::from("testdir"), temp.path()));
-        let opts = Options::default();
-
-        temp.child("foo.txt").write_str("test")?;
-        assert_eq!(
-            (SyncedFileState::Final, temp.child("foo.txt").to_path_buf()),
-            LogicalPath::new(&dir, &model::Path::parse("foo.txt")?)
-                .find(&opts)
-                .await?
-        );
-
-        temp.child("subdir/foo2.txt").write_str("test")?;
-        assert_eq!(
-            (
-                SyncedFileState::Final,
-                temp.child("subdir/foo2.txt").to_path_buf()
-            ),
-            LogicalPath::new(&dir, &model::Path::parse("subdir/foo2.txt")?)
-                .find(&opts)
-                .await?
-        );
-
-        temp.child(".bar.txt.part").write_str("test")?;
-        assert_eq!(
-            (
-                SyncedFileState::Partial,
-                temp.child(".bar.txt.part").to_path_buf()
-            ),
-            LogicalPath::new(&dir, &model::Path::parse("bar.txt")?)
-                .find(&opts)
-                .await?
-        );
-
-        temp.child("subdir/.bar2.txt.part").write_str("test")?;
-        assert_eq!(
-            (
-                SyncedFileState::Partial,
-                temp.child("subdir/.bar2.txt.part").to_path_buf()
-            ),
-            LogicalPath::new(&dir, &model::Path::parse("subdir/bar2.txt")?)
-                .find(&opts)
-                .await?
-        );
-
-        assert!(matches!(
-            LogicalPath::new(&dir, &model::Path::parse("notfound.txt")?)
-                .find(&opts)
-                .await,
-            Err(RealizeServiceError::Io(_))
-        ));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_find_logical_path_partial_and_final() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let dir = Arc::new(LocalArena::new(&Arena::from("testdir"), temp.path()));
-        let opts = Options::default();
-        let nopartial = Options {
-            ignore_partial: true,
-        };
-
-        temp.child(".foo.txt.part").write_str("test")?;
-        temp.child("foo.txt").write_str("test")?;
-        assert_eq!(
-            (
-                SyncedFileState::Partial,
-                temp.child(".foo.txt.part").to_path_buf()
-            ),
-            LogicalPath::new(&dir, &model::Path::parse("foo.txt")?)
-                .find(&opts)
-                .await?
-        );
-        assert_eq!(
-            (SyncedFileState::Final, temp.child("foo.txt").to_path_buf()),
-            LogicalPath::new(&dir, &model::Path::parse("foo.txt")?)
-                .find(&nopartial)
-                .await?
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_find_logical_path_ignore_partial() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let dir = Arc::new(LocalArena::new(&Arena::from("testdir"), temp.path()));
-        let nopartial = Options {
-            ignore_partial: true,
-        };
-
-        temp.child(".foo.txt.part").write_str("test")?;
-        assert!(LogicalPath::new(&dir, &model::Path::parse("foo.txt")?)
-            .find(&nopartial)
-            .await
-            .is_err());
-
-        temp.child("bar.txt").write_str("test")?;
-        assert_eq!(
-            (SyncedFileState::Final, temp.child("bar.txt").to_path_buf()),
-            LogicalPath::new(&dir, &model::Path::parse("bar.txt")?)
-                .find(&nopartial)
-                .await?
-        );
-
-        Ok(())
     }
 
     #[tokio::test]
@@ -827,22 +626,18 @@ mod tests {
                 SyncedFile {
                     path: model::Path::parse("foo.txt")?,
                     size: 5,
-                    state: SyncedFileState::Final
                 },
                 SyncedFile {
                     path: model::Path::parse("subdir/foo2.txt")?,
                     size: 5,
-                    state: SyncedFileState::Final
                 },
                 SyncedFile {
                     path: model::Path::parse("bar.txt")?,
                     size: 7,
-                    state: SyncedFileState::Partial
                 },
                 SyncedFile {
                     path: model::Path::parse("subdir/bar2.txt")?,
                     size: 7,
-                    state: SyncedFileState::Partial
                 },
             ]
         );
@@ -860,7 +655,7 @@ mod tests {
             .send(
                 tarpc::context::current(),
                 dir.arena().clone(),
-                fpath.relative_path().clone(),
+                fpath.path.clone(),
                 ByteRange { start: 5, end: 10 },
                 data1.clone(),
                 Options::default(),
@@ -878,7 +673,7 @@ mod tests {
             .send(
                 tarpc::context::current(),
                 dir.arena().clone(),
-                fpath.relative_path().clone(),
+                fpath.path.clone(),
                 ByteRange { start: 0, end: 5 },
                 data2.clone(),
                 Options::default(),
@@ -902,7 +697,7 @@ mod tests {
             .read(
                 tarpc::context::current(),
                 dir.arena().clone(),
-                fpath.relative_path().clone(),
+                fpath.path.clone(),
                 ByteRange { start: 5, end: 10 },
                 Options::default(),
             )
@@ -914,7 +709,7 @@ mod tests {
             .read(
                 tarpc::context::current(),
                 dir.arena().clone(),
-                fpath.relative_path().clone(),
+                fpath.path.clone(),
                 ByteRange { start: 0, end: 5 },
                 Options::default(),
             )
@@ -926,7 +721,7 @@ mod tests {
             .read(
                 tarpc::context::current(),
                 dir.arena().clone(),
-                fpath.relative_path().clone(),
+                fpath.path.clone(),
                 ByteRange { start: 0, end: 15 },
                 Options::default(),
             )
@@ -948,7 +743,7 @@ mod tests {
             .finish(
                 tarpc::context::current(),
                 dir.arena().clone(),
-                fpath.relative_path().clone(),
+                fpath.path.clone(),
                 Options::default(),
             )
             .await?;
@@ -971,7 +766,7 @@ mod tests {
             .finish(
                 tarpc::context::current(),
                 dir.arena().clone(),
-                fpath.relative_path().clone(),
+                fpath.path.clone(),
                 Options::default(),
             )
             .await?;
@@ -993,7 +788,7 @@ mod tests {
             .truncate(
                 tarpc::context::current(),
                 dir.arena().clone(),
-                fpath.relative_path().clone(),
+                fpath.path.clone(),
                 7,
                 Options::default(),
             )
@@ -1185,7 +980,7 @@ mod tests {
         assert!(!delta.0 .0.is_empty());
 
         // Revert file to old content, then apply delta
-        temp.child("foo.txt").write_binary(file_content)?;
+        temp.child(".foo.txt.part").write_binary(file_content)?;
         let res = server
             .clone()
             .apply_delta(
@@ -1202,11 +997,8 @@ mod tests {
             )
             .await;
         assert!(res.is_ok());
-        // File should now match new_content
-        let logical = LogicalPath::new(&dir, &file_path);
-        let (_state, actual) = logical.find(&Options::default()).await?;
         let mut buf = Vec::new();
-        std::fs::File::open(&actual)?.read_to_end(&mut buf)?;
+        std::fs::File::open(temp.child(".foo.txt.part").path())?.read_to_end(&mut buf)?;
         assert_eq!(&buf[..new_content.len()], new_content);
 
         Ok(())
@@ -1273,7 +1065,6 @@ mod tests {
             )
             .await?;
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0].state, SyncedFileState::Partial);
         // With ignore_partial: final preferred
         let files = server
             .clone()
@@ -1286,7 +1077,6 @@ mod tests {
             )
             .await?;
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0].state, SyncedFileState::Final);
         Ok(())
     }
 
@@ -1306,7 +1096,6 @@ mod tests {
             )
             .await?;
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0].state, SyncedFileState::Partial);
         // With ignore_partial: don't return partial
         let files = server
             .clone()

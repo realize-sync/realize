@@ -23,19 +23,6 @@ pub struct SyncedFile {
 
     /// Size of the file on the current instance, in bytes.
     pub size: u64,
-
-    /// If state is partial, the file is still incomplete.
-    pub state: SyncedFileState,
-}
-
-/// State of a [SyncedFile].
-#[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum SyncedFileState {
-    /// The file is complete.
-    Final,
-
-    /// The file is incomplete. It is likely being moved.
-    Partial,
 }
 
 /// Configures the behavior of a method on [RealizeService].
