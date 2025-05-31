@@ -2,7 +2,8 @@
 
 use anyhow::Context as _;
 use clap::Parser;
-use prometheus::{IntCounter, register_int_counter};
+use futures_util::stream::StreamExt as _;
+use prometheus::{register_int_counter, IntCounter};
 use realize_lib::model::LocalArena;
 use realize_lib::network::rpc::realize::metrics;
 use realize_lib::network::security::{self, PeerVerifier};
@@ -13,6 +14,7 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use rustls::sign::SigningKey;
 use serde::Deserialize;
+use signal_hook_tokio::Signals;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fs, process};
@@ -79,8 +81,6 @@ async fn main() {
         eprintln!("ERROR: {err:#}");
         process::exit(1);
     };
-    // Use Result<!> as return type once it's available in stable.
-    unreachable!("execute should never execute successfully");
 }
 
 async fn execute(cli: Cli) -> anyhow::Result<()> {
@@ -125,17 +125,30 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("Failed to parse --address {}", cli.address))?;
     log::debug!("Starting server on {}/{:?}...", hostport, hostport.addr());
-    let (addr, handle) = tcp::start_server(&hostport, dirs, verifier, privkey)
+    let (addr, shutdown) = tcp::start_server(&hostport, dirs, verifier, privkey)
         .await
         .with_context(|| format!("Failed to start server on {}", hostport))?;
+
+    let mut signals = Signals::new(&[
+        signal_hook::consts::SIGHUP,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGQUIT,
+    ])?;
 
     METRIC_UP.inc();
     log::info!("Listening on {addr}");
     println!("Listening on {addr}");
 
-    handle.join().await?;
+    let _ = signals.next().await;
 
-    Err(anyhow::anyhow!("Server shut down"))
+    log::info!("Interrupted. Shutting down..");
+    signals.handle().close(); // A 2nd signal kills the process
+    shutdown.send(())?;
+
+    shutdown.closed().await;
+
+    Ok(())
 }
 
 /// Checks that all directories in the config file are accessible.

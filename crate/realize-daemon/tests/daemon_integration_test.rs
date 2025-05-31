@@ -4,8 +4,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use assert_fs::TempDir;
 use assert_fs::prelude::*;
+use assert_fs::TempDir;
 use predicates::prelude::*;
 use realize_lib::model;
 use realize_lib::model::Arena;
@@ -14,9 +14,9 @@ use realize_lib::network::security;
 use realize_lib::network::security::PeerVerifier;
 use realize_lib::network::tcp::{self, HostPort};
 use reqwest::Client;
+use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::SubjectPublicKeyInfoDer;
-use rustls::pki_types::pem::PemObject as _;
 use tarpc::context;
 use tokio::io::AsyncBufReadExt as _;
 use tokio::process::Command;
@@ -266,6 +266,39 @@ async fn daemon_systemd_log_output_format() -> anyhow::Result<()> {
     let stderr = collect_stderr(daemon.stderr.as_mut().unwrap()).await?;
     assert!(
         stderr.contains("<5>realize_daemon: Listening on 127.0.0.1:"),
+        "stderr: {stderr} stdout: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_interrupted() -> anyhow::Result<()> {
+    let fixture = Fixture::setup().await?;
+
+    let mut daemon = fixture
+        .command()
+        .env(
+            "RUST_LOG",
+            "realize_lib::network::tcp=debug,realize_daemon=debug",
+        )
+        .spawn()?;
+
+    let _ = wait_for_listening_port(daemon.stdout.as_mut().unwrap()).await?;
+    let pid = daemon.id().expect("no pid");
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )?;
+
+    let status = daemon.wait().await?;
+    assert_eq!(status.code(), Some(0));
+
+    // Make sure stderr contains the expected log message.
+    let stdout = collect_stdout(daemon.stdout.as_mut().unwrap()).await?;
+    let stderr = collect_stderr(daemon.stderr.as_mut().unwrap()).await?;
+    assert!(
+        stderr.contains("Interrupted"),
         "stderr: {stderr} stdout: {stdout}"
     );
 

@@ -4,13 +4,13 @@
 //! It handles TLS setup, peer authentication, DNS resolution, and connection retry logic.
 
 use anyhow::Context as _;
-use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
+use async_speed_limit::Limiter;
 use futures::prelude::*;
 use rustls::pki_types::ServerName;
 use rustls::sign::SigningKey;
-use tarpc::client::RpcError;
 use tarpc::client::stub::Stub;
+use tarpc::client::RpcError;
 use tarpc::context;
 use tokio::sync::Mutex;
 use tokio_retry::strategy::ExponentialBackoff;
@@ -30,18 +30,17 @@ use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
 use crate::network::rate_limit::RateLimitedStream;
 use crate::network::reconnect::Connect;
 use crate::network::reconnect::Reconnect;
-use crate::network::rpc::realize::Config;
-use crate::network::rpc::realize::RealizeServiceRequest;
-use crate::network::rpc::realize::RealizeServiceResponse;
 use crate::network::rpc::realize::metrics;
 use crate::network::rpc::realize::metrics::MetricsRealizeClient;
 use crate::network::rpc::realize::metrics::MetricsRealizeServer;
 use crate::network::rpc::realize::server::RealizeServer;
+use crate::network::rpc::realize::Config;
+use crate::network::rpc::realize::RealizeServiceRequest;
+use crate::network::rpc::realize::RealizeServiceResponse;
 use crate::network::rpc::realize::{RealizeService, RealizeServiceClient};
 use crate::network::security;
 use crate::network::security::PeerVerifier;
 use crate::storage::real::LocalStorage;
-use crate::utils::async_utils::AbortOnDrop;
 
 use std::fmt;
 use std::net::IpAddr;
@@ -112,12 +111,19 @@ impl From<SocketAddr> for HostPort {
 }
 
 /// Start the server, listening on the given address.
+///
+/// Returns (address, shutdown, handle)
+///
+/// To stop the server cleanly, send a message to the shutdown channel
+/// then wait for that channel to be closed. Dropping the shutdown
+/// channel also eventually shuts down the server.
 pub async fn start_server(
     hostport: &HostPort,
     storage: LocalStorage,
     verifier: Arc<PeerVerifier>,
     privkey: Arc<dyn SigningKey>,
-) -> anyhow::Result<(SocketAddr, AbortOnDrop<()>)> {
+) -> anyhow::Result<(SocketAddr, tokio::sync::broadcast::Sender<()>)> {
+    let (shutdown_tx, mut shutdown_listener_rx) = tokio::sync::broadcast::channel(1);
     let acceptor = security::make_tls_acceptor(Arc::clone(&verifier), privkey)?;
     let listener = TcpListener::bind(hostport.addr()).await?;
     log::info!(
@@ -130,6 +136,7 @@ pub async fn start_server(
 
     let addr = listener.local_addr()?;
 
+    let shutdown_accept_tx = shutdown_tx.downgrade();
     let accept = async move |stream: TcpStream| -> anyhow::Result<()> {
         let peer_addr = stream.peer_addr()?;
         let limiter = Limiter::<StandardClock>::new(f64::INFINITY);
@@ -146,31 +153,55 @@ pub async fn start_server(
         );
         let framed = LengthDelimitedCodec::builder().new_framed(tls_stream);
         let server = RealizeServer::new_limited(storage.clone(), limiter.clone());
-        tokio::spawn(
-            BaseChannel::with_defaults(transport::new(framed, Bincode::default()))
-                .execute(MetricsRealizeServer::new(RealizeServer::serve(
-                    server.clone(),
-                )))
-                .for_each(async move |fut| {
-                    tokio::spawn(metrics::track_in_flight_request(fut));
-                }),
-        );
+        if let Some(mut shutdown_rx) = shutdown_accept_tx.upgrade().map(|s| s.subscribe()) {
+            tokio::spawn(async move {
+                let mut stream = Box::pin(
+                    BaseChannel::with_defaults(transport::new(framed, Bincode::default())).execute(
+                        MetricsRealizeServer::new(RealizeServer::serve(server.clone())),
+                    ),
+                );
+                loop {
+                    tokio::select!(
+                        _ = shutdown_rx.recv() => {
+                            log::debug!("Shutting peer connection {}", peer_addr);
+                            break;
+                        }
+                        next = stream.next() => {
+                            match next {
+                                None => {
+                                    break;
+                                },
+                                Some(fut) => {
+                                    tokio::spawn(metrics::track_in_flight_request(fut));
+                                }
+                            }
+                        }
+                    )
+                }
+            });
+        }
 
         Ok(())
     };
 
-    let handle = AbortOnDrop::new(tokio::spawn(async move {
+    tokio::spawn(async move {
         loop {
-            if let Ok((stream, peer)) = listener.accept().await {
-                match accept(stream).await {
-                    Ok(_) => {}
-                    Err(err) => log::debug!("{}: connection rejected: {}", peer, err),
-                };
-            }
+            tokio::select!(
+                _ = shutdown_listener_rx.recv() => {
+                    log::debug!("Shutting down listener");
+                    return;
+                }
+                Ok((stream, peer)) = listener.accept() => {
+                    match accept(stream).await {
+                        Ok(_) => {}
+                        Err(err) => log::debug!("{}: connection rejected: {}", peer, err),
+                    };
+                }
+            );
         }
-    }));
+    });
 
-    Ok((addr, handle))
+    Ok((addr, shutdown_tx))
 }
 
 #[derive(Clone, Default)]
@@ -345,12 +376,12 @@ mod tests {
     // Helper to setup a test server and return (server_addr, server_handle, crypto, temp_dir)
     async fn setup_test_server(
         verifier: Arc<PeerVerifier>,
-    ) -> anyhow::Result<(SocketAddr, AbortOnDrop<()>, TempDir)> {
+    ) -> anyhow::Result<(SocketAddr, tokio::sync::broadcast::Sender<()>, TempDir)> {
         let temp = TempDir::new()?;
         let dirs = LocalStorage::single(&Arena::from("testdir"), temp.path());
         let server_privkey =
             load_private_key(crate::network::security::testing::server_private_key())?;
-        let (addr, server_handle) = start_server(
+        let (addr, shutdown) = start_server(
             &HostPort::parse("127.0.0.1:0").await?,
             dirs,
             verifier,
@@ -358,7 +389,7 @@ mod tests {
         )
         .await?;
 
-        Ok((addr, server_handle, temp))
+        Ok((addr, shutdown, temp))
     }
 
     // Helper to create a PeerVerifier with only the server key
@@ -397,7 +428,7 @@ mod tests {
     #[tokio::test]
     async fn tarpc_tcp_connect() -> anyhow::Result<()> {
         let verifier = verifier_both();
-        let (addr, _server_handle, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
+        let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
         let client_privkey =
             load_private_key(crate::network::security::testing::client_private_key())?;
         let client = connect_client(
@@ -421,7 +452,7 @@ mod tests {
     #[tokio::test]
     async fn client_not_in_server_verifier_fails() -> anyhow::Result<()> {
         let verifier = verifier_server_only();
-        let (addr, _server_handle, _temp) = setup_test_server(Arc::clone(&verifier)).await.unwrap();
+        let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await.unwrap();
         let client_privkey =
             load_private_key(crate::network::security::testing::client_private_key())?;
         let client_result = connect_client(
@@ -451,7 +482,7 @@ mod tests {
     #[tokio::test]
     async fn server_not_in_client_verifier_fails() -> anyhow::Result<()> {
         let verifier = verifier_client_only();
-        let (addr, _server_handle, _temp) = setup_test_server(Arc::clone(&verifier)).await.unwrap();
+        let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await.unwrap();
         let client_privkey =
             load_private_key(crate::network::security::testing::client_private_key())?;
         let result = connect_client(
@@ -561,7 +592,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_reconnect() -> anyhow::Result<()> {
         let verifier = verifier_both();
-        let (addr, _server_handle, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
+        let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
 
         let connection_count = Arc::new(AtomicU32::new(0));
         let (shutdown, _) = tokio::sync::broadcast::channel(1);
@@ -601,7 +632,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_reconnect_keeps_config() -> anyhow::Result<()> {
         let verifier = verifier_both();
-        let (addr, _server_handle, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
+        let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
 
         let connection_count = Arc::new(AtomicU32::new(0));
         let (shutdown, _) = tokio::sync::broadcast::channel(1);
@@ -649,7 +680,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_reconnect_events() -> anyhow::Result<()> {
         let verifier = verifier_both();
-        let (addr, _server_handle, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
+        let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
 
         let (shutdown, _) = tokio::sync::broadcast::channel(1);
         let (proxy_addr, _proxy_handle) =
@@ -812,5 +843,41 @@ mod tests {
     async fn test_display() {
         let hp = HostPort::parse("127.0.0.1:8000").await.unwrap();
         assert_eq!(format!("{}", hp), "127.0.0.1:8000");
+    }
+
+    #[tokio::test]
+    async fn server_shutdown() -> anyhow::Result<()> {
+        let verifier = verifier_both();
+        let (addr, shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
+
+        // Before shutdown, connection succeeds.
+        let client_privkey =
+            load_private_key(crate::network::security::testing::client_private_key())?;
+        connect_client(
+            &HostPort::from(addr),
+            Arc::clone(&verifier_both()),
+            Arc::clone(&client_privkey),
+            ClientOptions::default(),
+        )
+        .await?;
+
+        shutdown.send(())?;
+        shutdown.closed().await;
+
+        // After shutdown, connection fails
+        let ret = connect_client(
+            &HostPort::from(addr),
+            verifier_both(),
+            client_privkey,
+            ClientOptions::default(),
+        )
+        .await
+        .err();
+        let err = ret.expect("client connection didn't fail");
+        let ioerr = err.downcast_ref::<std::io::Error>();
+        let ioerr = ioerr.expect("not an I/O error: {err:?}");
+        assert_eq!(ioerr.kind(), std::io::ErrorKind::ConnectionRefused);
+
+        Ok(())
     }
 }

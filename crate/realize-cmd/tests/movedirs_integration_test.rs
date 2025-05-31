@@ -1,13 +1,12 @@
-use assert_fs::TempDir;
 use assert_fs::fixture::ChildPath;
 use assert_fs::prelude::*;
+use assert_fs::TempDir;
 use assert_unordered::assert_eq_unordered;
 use hyper_util::rt::TokioIo;
 use realize_lib::model::{Arena, LocalArena};
 use realize_lib::network::security::{self, PeerVerifier};
 use realize_lib::network::tcp::{self, HostPort};
 use realize_lib::storage::real::LocalStorage;
-use realize_lib::utils::async_utils::AbortOnDrop;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use std::fs;
@@ -39,8 +38,8 @@ pub struct Fixture {
     pub keys: TestKeys,
     pub src_addr: String,
     pub dst_addr: String,
-    _src_server_handle: AbortOnDrop<()>,
-    _dst_server_handle: AbortOnDrop<()>,
+    _shutdown_src: tokio::sync::broadcast::Sender<()>,
+    _shutdown_dst: tokio::sync::broadcast::Sender<()>,
 }
 
 impl Fixture {
@@ -63,14 +62,14 @@ impl Fixture {
         let privkey_b = crypto
             .key_provider
             .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_b_path.as_ref())?)?;
-        let (src_addr3, server_handle_src) = tcp::start_server(
+        let (src_addr3, shutdown_src) = tcp::start_server(
             &HostPort::parse("127.0.0.1:0").await?,
             LocalStorage::single(&"dir".into(), src_dir.path()),
             verifier.clone(),
             privkey_a.clone(),
         )
         .await?;
-        let (dst_addr3, server_handle_dst) = tcp::start_server(
+        let (dst_addr3, shutdown_dst) = tcp::start_server(
             &HostPort::parse("127.0.0.1:0").await?,
             LocalStorage::single(&"dir".into(), dst_dir.path()),
             verifier.clone(),
@@ -85,8 +84,8 @@ impl Fixture {
             keys,
             src_addr: src_addr3.to_string(),
             dst_addr: dst_addr3.to_string(),
-            _src_server_handle: server_handle_src,
-            _dst_server_handle: server_handle_dst,
+            _shutdown_src: shutdown_src,
+            _shutdown_dst: shutdown_dst,
         })
     }
 
