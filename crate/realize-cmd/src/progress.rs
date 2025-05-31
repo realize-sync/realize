@@ -53,6 +53,10 @@ impl CliProgress {
         let _ = self.multi.clear();
     }
 
+    pub(crate) fn finish(&self) {
+        self.overall_pb.finish();
+    }
+
     fn set_length(
         &mut self,
         arena: &Arena,

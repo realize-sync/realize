@@ -9,7 +9,6 @@ anyhow = "1.0"
 async-speed-limit = { version = "0.4.2", features = ["futures-timer","futures-core"] }
 clap = { version = "4.5", features = ["derive"] }
 console = "0.15"
-ctrlc = "3.4"
 env_logger = "0.11"
 indicatif = "0.17"
 lazy_static = "1.5"
@@ -20,6 +19,9 @@ rustls = "0.23"
 tarpc = { version = "0.36", features = ["serde1", "tokio1", "serde-transport", "serde-transport-bincode", "tcp"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "fs", "io-util"] }
 humantime = "2.2"
+signal-hook = "0.3"
+signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
+futures-util = "0.3"
 
 [dev-dependencies]
 assert_cmd = "2.0"

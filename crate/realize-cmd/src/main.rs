@@ -1,12 +1,13 @@
 use anyhow::Context as _;
-use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
+use async_speed_limit::Limiter;
 use clap::Parser;
 use clap::ValueEnum;
 use console::style;
+use futures_util::stream::StreamExt as _;
 use indicatif::HumanBytes;
 use progress::CliProgress;
-use prometheus::{IntCounter, register_int_counter};
+use prometheus::{register_int_counter, IntCounter};
 use realize_lib::logic::consensus::movedirs::MoveFileError;
 use realize_lib::model::Arena;
 use realize_lib::network::rpc::realize::metrics;
@@ -16,6 +17,7 @@ use realize_lib::utils::logging;
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use rustls::sign::SigningKey;
+use signal_hook_tokio::Signals;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
@@ -133,18 +135,16 @@ async fn main() {
     if output_mode == OutputMode::Log {
         logging::init_with_info_modules(vec!["realize_cmd", "realize_cmd::progress"]);
     } else {
-        logging::init();
+        logging::init(log::LevelFilter::Off);
     }
 
-    let _ = ctrlc::set_handler(move || {
-        print_error(output_mode, "Interrupted");
-        process::exit(20);
-    });
+    let mut status = match execute(&cli).await {
+        Ok(code) => code,
+        Err(err) => {
+            print_error(output_mode, &format!("{err:#}"));
 
-    let mut status = 0;
-    if let Err(err) = execute(&cli).await {
-        print_error(output_mode, &format!("{err:#}"));
-        status = 1;
+            1
+        }
     };
     if let Some(pushgw) = &cli.metrics_pushgateway {
         if let Err(err) =
@@ -162,7 +162,7 @@ async fn main() {
     process::exit(status);
 }
 
-async fn execute(cli: &Cli) -> anyhow::Result<()> {
+async fn execute(cli: &Cli) -> anyhow::Result<i32> {
     METRIC_UP.reset(); // Set it to 0, so it's available
     if let Some(addr) = &cli.metrics_addr {
         metrics::export_metrics(addr)
@@ -179,8 +179,37 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
     let verifier = build_peer_verifier(&cli.peers)
         .with_context(|| format!("{}: Invalid peer file", cli.peers.display()))?;
 
+    let mut signals = Signals::new(&[
+        signal_hook::consts::SIGHUP,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGQUIT,
+    ])?;
+
     let mut cli_progress =
         CliProgress::new(cli.output != OutputMode::Progress, cli.directory_ids.len());
+    let output_mode = cli.output;
+
+    tokio::select!(
+    ret = run_with_progress(cli, ctx, privkey, verifier, &mut cli_progress) => {
+        ret.map(|_| 0)
+    }
+    _ = signals.next() => {
+        cli_progress.finish();
+        signals.handle().close();
+        print_warning(output_mode, "Interrupted");
+
+        Ok(20)
+    })
+}
+
+async fn run_with_progress(
+    cli: &Cli,
+    ctx: context::Context,
+    privkey: Arc<dyn SigningKey>,
+    verifier: Arc<PeerVerifier>,
+    cli_progress: &mut CliProgress,
+) -> anyhow::Result<()> {
     let (progress_tx, progress_rx) = mpsc::channel(32);
     let (src_watch_tx, src_watch_rx) =
         tokio::sync::watch::channel(ClientConnectionState::NotConnected);
@@ -251,7 +280,6 @@ async fn execute(cli: &Cli) -> anyhow::Result<()> {
         },
     );
     cli_progress.finish_and_clear();
-
     let (total_success, total_error, total_interrupted, interrupted) = res?;
     if total_error > 0 {
         log::error!(

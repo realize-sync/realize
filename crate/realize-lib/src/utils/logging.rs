@@ -7,8 +7,11 @@ use std::io::Write;
 ///
 /// Output format can be made systemd-friendly by setting
 /// RUST_LOG_FORMAT to SYSTEMD.
-pub fn init() {
-    init_with_info_modules(vec![])
+pub fn init(filter: log::LevelFilter) {
+    env_logger::Builder::new()
+        .filter_level(filter)
+        .parse_default_env()
+        .init();
 }
 
 /// Create a builder with app-wide defaults.
