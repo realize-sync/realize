@@ -13,6 +13,10 @@ For file hashes, build a Merkle tree:
 - even incomplete trees are useful (just the root, or at depth N)
 - file digest = blob identifier
 
+## Allow : in model:Path {#colon}
+
+Forbidding just brings trouble on Linux.
+
 ## Design: Multi-peer syncing {#multi-peer}
 
 This needs more thoughts: do peer get told about non-local (indirect)
