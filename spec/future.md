@@ -3,6 +3,23 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
+## File hash as as Merkle tree {#merkle}
+
+For file hashes, build a Merkle tree:
+  https://docs.kernel.org/filesystems/fsverity.html
+
+- it can be built in chunks, in parallel
+- in case of mismatches, it can pinpoint where the mismatch happened
+- even incomplete trees are useful (just the root, or at depth N)
+- file digest = blob identifier
+
+## Design: Multi-peer syncing {#multi-peer}
+
+This needs more thoughts: do peer get told about non-local (indirect)
+changes? do all peers need to be told about a non-local change?
+
+What does it look like to add a new peer?
+
 ## Gate copy by file size {#sizegate}
 
 Instead of allowing one file to copy at a time, allow multiple for a total of up to CHUNK_SIZE bytes. A file > CHUNK_SIZE gets copied one at a time, but smaller files can be grouped together. Might be worth increasing the number of parallel files for that.
