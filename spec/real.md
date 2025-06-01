@@ -41,8 +41,8 @@ As OverlayFS stores renames and deletions in xattrs, it should be
 enough to look at OverlayFS to figure out what local changes need to
 be sent to remote files.
 
-[inotify](https://man7.org/linux/man-pages/man7/inotify.7.html) or
-[fanotify](https://man7.org/linux/man-pages/man7/fanotify.7.html) can
-be used to make that real-time.
+[inotify](https://man7.org/linux/man-pages/man7/inotify.7.html) or can
+be used to make that real-time. See [an
+example](https://github.com/hannobraun/inotify-rs/blob/main/examples/stream.rs)
 
 
