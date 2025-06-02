@@ -3,6 +3,36 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
+## Household definition {#houshold}
+
+Define, in `src/realize_lib/src/network/config.rs`, a Houshold type
+that can be deserialized from toml using the [toml
+crate](https://docs.rs/toml/latest/toml/)
+
+This is meant to replace `peers.pem` of realize-cmd as well as the
+yaml configuration of realize-daemon. With the extra information,
+realize-cmd can just be given a peer id to connect to listening peers.
+
+A household defines a set of peers and for each peer their public key
+(required) and address (optional).
+
+```toml
+[peers.bob]
+address = "bob.private:7961"
+pubkey = """
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAPjsIFMiDLwPSdJ90P6Dh+jbpk/EoeorE+2OsdTzxX+s=
+-----END PUBLIC KEY-----
+"""
+
+[peers.alice]
+pubkey = ""
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAZvriEx8hZEAildpfeifrv0Z5xED/kkK7wzT5Gel+w/w=
+-----END PUBLIC KEY-----
+"""
+```
+
 ## File hash as as Merkle tree {#merkle}
 
 For file hashes, build a Merkle tree:
