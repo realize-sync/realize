@@ -4,14 +4,16 @@
 //! It handles TLS setup, peer authentication, DNS resolution, and connection retry logic.
 
 use anyhow::Context as _;
-use async_speed_limit::clock::StandardClock;
 use async_speed_limit::Limiter;
+use async_speed_limit::clock::StandardClock;
 use futures::prelude::*;
 use rustls::pki_types::ServerName;
 use rustls::sign::SigningKey;
-use tarpc::client::stub::Stub;
 use tarpc::client::RpcError;
+use tarpc::client::stub::Stub;
 use tarpc::context;
+use tokio::io::AsyncReadExt as _;
+use tokio::io::AsyncWriteExt as _;
 use tokio::sync::Mutex;
 use tokio_retry::strategy::ExponentialBackoff;
 use tokio_rustls::TlsConnector;
@@ -30,13 +32,14 @@ use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
 use crate::network::rate_limit::RateLimitedStream;
 use crate::network::reconnect::Connect;
 use crate::network::reconnect::Reconnect;
+use crate::network::rpc::realize;
+use crate::network::rpc::realize::Config;
+use crate::network::rpc::realize::RealizeServiceRequest;
+use crate::network::rpc::realize::RealizeServiceResponse;
 use crate::network::rpc::realize::metrics;
 use crate::network::rpc::realize::metrics::MetricsRealizeClient;
 use crate::network::rpc::realize::metrics::MetricsRealizeServer;
 use crate::network::rpc::realize::server::RealizeServer;
-use crate::network::rpc::realize::Config;
-use crate::network::rpc::realize::RealizeServiceRequest;
-use crate::network::rpc::realize::RealizeServiceResponse;
 use crate::network::rpc::realize::{RealizeService, RealizeServiceClient};
 use crate::network::security;
 use crate::network::security::PeerVerifier;
@@ -140,17 +143,26 @@ pub async fn start_server(
     let accept = async move |stream: TcpStream| -> anyhow::Result<()> {
         let peer_addr = stream.peer_addr()?;
         let limiter = Limiter::<StandardClock>::new(f64::INFINITY);
-        let tls_stream = acceptor
+        let mut tls_stream = acceptor
             .accept(RateLimitedStream::new(stream, limiter.clone()))
             .await?;
+        // Guards against bugs in the auth code; worth dying
+        let peer = verifier
+            .connection_peer_id(&tls_stream)
+            .expect("Peer must be known at this point");
+        log::info!("Accepted peer {} from {}", peer, peer_addr);
 
-        log::info!(
-            "Accepted peer {} from {}",
-            verifier
-                .connection_peer_id(&tls_stream)
-                .expect("Peer MUST be known"), // Guards against bugs in the auth code; worth dying
-            peer_addr
-        );
+        let mut tag = [0u8; 4];
+        tls_stream.read_exact(&mut tag).await?;
+        if tag != *realize::TAG {
+            // Log this separately from generic errors; it's
+            // interesting.
+            log::info!("Got unsupported RPC service tag '{tag:?}' from {peer}");
+
+            let _ = tls_stream.shutdown().await;
+            return Err(anyhow::anyhow!("Unknown RPC service tag"));
+        }
+
         let framed = LengthDelimitedCodec::builder().new_framed(tls_stream);
         let server = RealizeServer::new_limited(storage.clone(), limiter.clone());
         if let Some(mut shutdown_rx) = shutdown_accept_tx.upgrade().map(|s| s.subscribe()) {
@@ -264,13 +276,14 @@ impl Connect<tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceRe
             .limiter
             .clone()
             .unwrap_or_else(|| Limiter::<StandardClock>::new(f64::INFINITY));
-        let stream = self
+        let mut tls_stream = self
             .connector
             .connect(domain, RateLimitedStream::new(stream, limiter.clone()))
             .await?;
+        tls_stream.write_all(realize::TAG).await?;
 
         let codec_builder = LengthDelimitedCodec::builder();
-        let transport = transport::new(codec_builder.new_framed(stream), Bincode::default());
+        let transport = transport::new(codec_builder.new_framed(tls_stream), Bincode::default());
         let channel = tarpc::client::new(Default::default(), transport).spawn();
 
         // Recover stored configuration
@@ -371,7 +384,6 @@ mod tests {
     use assert_fs::TempDir;
     use rustls::pki_types::PrivateKeyDer;
     use tarpc::context;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     // Helper to setup a test server and return (server_addr, server_handle, crypto, temp_dir)
     async fn setup_test_server(
@@ -446,6 +458,26 @@ mod tests {
             )
             .await??;
         assert!(list.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tarpc_tcp_reject_bad_tag() -> anyhow::Result<()> {
+        let verifier = verifier_both();
+        let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
+        let client_privkey =
+            load_private_key(crate::network::security::testing::client_private_key())?;
+
+        let connector = security::make_tls_connector(verifier_both(), client_privkey)?;
+        let stream = TcpStream::connect(addr).await?;
+        let domain = ServerName::try_from("localhost")?;
+        let mut tls_stream = connector.connect(domain, stream).await?;
+        tls_stream.write_all(b"BADD").await?;
+        tls_stream.flush().await?;
+
+        // Stream must disconnect right after reading the bad tag.
+        let mut buf = [0u8; 12];
+        assert_eq!(tls_stream.read(&mut buf).await?, 0);
         Ok(())
     }
 

@@ -42,6 +42,9 @@ pub struct Config {
     pub write_limit: Option<u64>,
 }
 
+/// Tag that identifies [RealizeService] when connecting.
+pub const TAG: &[u8; 4] = b"REAL";
+
 /// The service trait for file synchronization.
 #[tarpc::service]
 pub trait RealizeService {
