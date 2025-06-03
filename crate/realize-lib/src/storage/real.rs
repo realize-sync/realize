@@ -195,8 +195,8 @@ fn not_found() -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use assert_fs::{
-        prelude::{FileWriteStr as _, PathChild as _},
         TempDir,
+        prelude::{FileWriteStr as _, PathChild as _},
     };
 
     use super::*;

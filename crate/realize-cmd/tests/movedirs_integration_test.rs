@@ -1,6 +1,6 @@
+use assert_fs::TempDir;
 use assert_fs::fixture::ChildPath;
 use assert_fs::prelude::*;
-use assert_fs::TempDir;
 use assert_unordered::assert_eq_unordered;
 use hyper_util::rt::TokioIo;
 use realize_lib::model::Arena;

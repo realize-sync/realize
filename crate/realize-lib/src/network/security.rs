@@ -2,11 +2,11 @@
 pub(crate) mod testing;
 
 use anyhow::Context as _;
-use rustls::client::danger::ServerCertVerifier;
 use rustls::client::Resumption;
+use rustls::client::danger::ServerCertVerifier;
 use rustls::crypto::WebPkiSupportedAlgorithms;
-use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::SubjectPublicKeyInfoDer;
+use rustls::pki_types::pem::PemObject as _;
 use rustls::sign::{CertifiedKey, SigningKey};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, Error, ServerConfig};
@@ -300,8 +300,8 @@ mod tests {
     use super::*;
     use crate::network::security::testing;
     use crate::utils::async_utils::AbortOnDrop;
-    use rustls::pki_types::pem::PemObject as _;
     use rustls::pki_types::PrivateKeyDer;
+    use rustls::pki_types::pem::PemObject as _;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};

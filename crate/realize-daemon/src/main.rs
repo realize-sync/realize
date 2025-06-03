@@ -3,7 +3,7 @@
 use anyhow::Context as _;
 use clap::Parser;
 use futures_util::stream::StreamExt as _;
-use prometheus::{register_int_counter, IntCounter};
+use prometheus::{IntCounter, register_int_counter};
 use realize_lib::model::{Arena, Peer};
 use realize_lib::network::config::PeerConfig;
 use realize_lib::network::rpc::realize::metrics;
@@ -12,8 +12,8 @@ use realize_lib::network::tcp::{self, HostPort};
 use realize_lib::storage::config::ArenaConfig;
 use realize_lib::storage::real::LocalStorage;
 use realize_lib::utils::logging;
-use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::PrivateKeyDer;
+use rustls::pki_types::pem::PemObject;
 use rustls::sign::SigningKey;
 use serde::Deserialize;
 use signal_hook_tokio::Signals;
