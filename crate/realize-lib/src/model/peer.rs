@@ -24,3 +24,11 @@ impl fmt::Display for Peer {
         f.write_str(&self.0)
     }
 }
+impl Peer {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
