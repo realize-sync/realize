@@ -3,8 +3,8 @@ use assert_fs::prelude::*;
 use assert_fs::TempDir;
 use assert_unordered::assert_eq_unordered;
 use hyper_util::rt::TokioIo;
+use realize_lib::model::Arena;
 use realize_lib::model::Peer;
-use realize_lib::model::{Arena, LocalArena};
 use realize_lib::network::security::{self, PeerVerifier};
 use realize_lib::network::tcp::{self, HostPort};
 use realize_lib::storage::real::LocalStorage;
@@ -602,8 +602,8 @@ async fn multiple_directory_ids() -> anyhow::Result<()> {
 
     // Setup src server with two directories
     let src_dirs = LocalStorage::new([
-        LocalArena::new(&Arena::from("dir1"), src_dir1.path()),
-        LocalArena::new(&Arena::from("dir2"), src_dir2.path()),
+        (Arena::from("dir1"), src_dir1.to_path_buf()),
+        (Arena::from("dir2"), src_dir2.to_path_buf()),
     ]);
     let (src_addr, _src_handle) = tcp::start_server(
         &HostPort::parse("127.0.0.1:0").await?,
@@ -615,8 +615,8 @@ async fn multiple_directory_ids() -> anyhow::Result<()> {
 
     // Setup dst server with two directories
     let dst_dirs = LocalStorage::new([
-        LocalArena::new(&Arena::from("dir1"), dst_dir1.path()),
-        LocalArena::new(&Arena::from("dir2"), dst_dir2.path()),
+        (Arena::from("dir1"), dst_dir1.to_path_buf()),
+        (Arena::from("dir2"), dst_dir2.to_path_buf()),
     ]);
     let (dst_addr, _dst_handle) = tcp::start_server(
         &HostPort::parse("127.0.0.1:0").await?,

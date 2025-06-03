@@ -1,14 +1,14 @@
 use std::{
     collections::HashMap,
     ffi::OsString,
-    io,
-    path::{self},
+    io, iter,
+    path::{self, PathBuf},
     sync::Arc,
 };
 
 use tokio::fs;
 
-use crate::model::{self, Arena, LocalArena};
+use crate::model::{self, Arena};
 
 use super::config::ArenaConfig;
 
@@ -27,7 +27,7 @@ pub enum PathType {
 /// Local storage, for all [Arena]s.
 #[derive(Clone, Debug)]
 pub struct LocalStorage {
-    map: Arc<HashMap<Arena, Arc<LocalArena>>>,
+    map: Arc<HashMap<Arena, PathBuf>>,
 }
 
 impl LocalStorage {
@@ -36,68 +36,63 @@ impl LocalStorage {
         Self::new(
             arenas
                 .iter()
-                .map(|(arena, config)| LocalArena::new(arena, &config.path)),
+                .map(|(arena, config)| (arena.clone(), config.path.to_path_buf())),
         )
     }
 
-    /// Create a [LocalStorage] from an iterator of [LocalArena].
+    /// Create and fill a [LocalStorage].
     pub fn new<T>(arenas: T) -> Self
     where
-        T: IntoIterator<Item = LocalArena>,
+        T: IntoIterator<Item = (Arena, PathBuf)>,
     {
-        let map = arenas
-            .into_iter()
-            .map(|e| (e.arena().clone(), Arc::new(e)))
-            .collect();
-        Self { map: Arc::new(map) }
+        Self {
+            map: Arc::new(arenas.into_iter().collect()),
+        }
     }
 
     /// Define a single local arena.
     pub fn single(arena: &Arena, path: &path::Path) -> Self {
-        let dir = Arc::new(LocalArena::new(arena, path));
-        let mut map = HashMap::new();
-        map.insert(arena.clone(), dir);
-        Self { map: Arc::new(map) }
+        Self::new(iter::once((arena.clone(), path.to_path_buf())))
     }
 
     /// Get a [LocalArena] if one exists for the given arena.
-    pub fn get(&self, arena: &Arena) -> Option<&Arc<LocalArena>> {
-        self.map.get(arena)
+    pub fn path(&self, arena: &Arena) -> Option<&path::Path> {
+        self.map.get(arena).map(|p| p.as_path())
     }
 
     /// Builds a path resolver for the given arena.
     pub fn path_resolver(&self, arena: &Arena, access: StorageAccess) -> Option<PathResolver> {
         self.map
             .get(arena)
-            .map(|local_arena| PathResolver::new(Arc::clone(local_arena), access))
+            .map(|p| PathResolver::new(p.clone(), access))
     }
 }
 
 #[derive(Clone)]
 pub struct PathResolver {
-    arena: Arc<LocalArena>,
+    path: PathBuf,
     access: StorageAccess,
 }
 
 impl PathResolver {
-    fn new(arena: Arc<LocalArena>, access: StorageAccess) -> Self {
-        Self { arena, access }
+    fn new(path: PathBuf, access: StorageAccess) -> Self {
+        Self { path, access }
     }
 
     /// Return the OS path that'll be the parent of all returned OS
     /// paths.
     pub fn root(&self) -> &path::Path {
-        self.arena.path()
+        self.path.as_ref()
     }
 
     pub fn partial_path(&self, path: &model::Path) -> Option<path::PathBuf> {
-        let full_path = to_full_path(self.arena.path(), path)?;
+        let full_path = to_full_path(&self.path, path)?;
 
         Some(to_partial(&full_path))
     }
 
     pub fn final_path(&self, path: &model::Path) -> Option<path::PathBuf> {
-        to_full_path(self.arena.path(), path)
+        to_full_path(&self.path, path)
     }
 
     /// Resolve a model path into an OS path.
@@ -105,7 +100,7 @@ impl PathResolver {
     /// The OS path might not exist or some error might prevent it
     /// from being accessible.
     pub async fn resolve(&self, path: &model::Path) -> Result<path::PathBuf, io::Error> {
-        let full_path = to_full_path(self.arena.path(), path).ok_or(not_found())?;
+        let full_path = to_full_path(&self.path, path).ok_or(not_found())?;
 
         if self.access == StorageAccess::ReadWrite {
             let partial_path = to_partial(&full_path);
@@ -127,7 +122,7 @@ impl PathResolver {
         if self.access == StorageAccess::Read && is_partial(actual) {
             return None;
         }
-        let relative = pathdiff::diff_paths(actual, self.arena.path());
+        let relative = pathdiff::diff_paths(actual, &self.path);
         if let Some(mut relative) = relative {
             let mut path_type = PathType::Final;
             if self.access == StorageAccess::ReadWrite {

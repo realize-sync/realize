@@ -8,9 +8,9 @@ use crate::model;
 use crate::model::Arena;
 use crate::model::ByteRange;
 use crate::model::Hash;
+use crate::network::rpc::realize::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
 use crate::network::rpc::realize::Config;
 use crate::network::rpc::realize::Options;
-use crate::network::rpc::realize::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
 use crate::network::rpc::realize::{
     RealizeService, RealizeServiceError, Result, RsyncOperation, SyncedFile,
 };
@@ -22,18 +22,18 @@ use crate::storage::real::PathResolver;
 use crate::storage::real::PathType;
 use crate::storage::real::StorageAccess;
 use crate::utils::hash;
-use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
+use async_speed_limit::Limiter;
 use fast_rsync::{
-    Signature as RsyncSignature, SignatureOptions, apply_limited as rsync_apply_limited,
-    diff as rsync_diff,
+    apply_limited as rsync_apply_limited, diff as rsync_diff, Signature as RsyncSignature,
+    SignatureOptions,
 };
 use futures::StreamExt;
 use std::cmp::min;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
-use tarpc::client::RpcError;
 use tarpc::client::stub::Stub;
+use tarpc::client::RpcError;
 use tarpc::context;
 use tarpc::server::Channel;
 use tokio::fs::{self, File, OpenOptions};
@@ -534,31 +534,30 @@ fn bad_path() -> RealizeServiceError {
 mod tests {
     use super::*;
     use crate::model::Hash;
-    use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
-    use model::LocalArena;
     use std::ffi::OsString;
     use std::fs;
     use std::io::Read as _;
+    use std::path;
     use std::path::PathBuf;
-    use std::sync::Arc;
 
     struct LogicalPath {
-        arena: Arc<LocalArena>,
+        arena_path: PathBuf,
         path: model::Path,
     }
 
     impl LogicalPath {
-        fn new(arena: &Arc<LocalArena>, path: &model::Path) -> Self {
+        fn new(arena_path: &path::Path, path: &model::Path) -> Self {
             Self {
-                arena: arena.clone(),
+                arena_path: arena_path.to_path_buf(),
                 path: path.clone(),
             }
         }
 
         fn final_path(&self) -> PathBuf {
-            self.path.within(self.arena.path())
+            self.path.within(&self.arena_path)
         }
 
         fn partial_path(&self) -> PathBuf {
@@ -574,28 +573,23 @@ mod tests {
         }
     }
 
-    fn setup_server_with_dir() -> anyhow::Result<(RealizeServer, TempDir, Arc<LocalArena>)> {
+    fn setup_server() -> anyhow::Result<(RealizeServer, TempDir, Arena)> {
         let temp = TempDir::new()?;
         let arena = Arena::from("testdir");
-        let dir = Arc::new(LocalArena::new(&arena, temp.path()));
 
         Ok((
-            RealizeServer::new(LocalStorage::single(&arena, dir.path())),
+            RealizeServer::new(LocalStorage::single(&arena, temp.path())),
             temp,
-            dir,
+            arena,
         ))
     }
 
     #[tokio::test]
     async fn list_empty() -> anyhow::Result<()> {
-        let (server, _temp, dir) = setup_server_with_dir()?;
+        let (server, _temp, arena) = setup_server()?;
         let files = server
             .clone()
-            .list(
-                tarpc::context::current(),
-                dir.arena().clone(),
-                Options::default(),
-            )
+            .list(tarpc::context::current(), arena.clone(), Options::default())
             .await?;
         assert!(files.is_empty());
 
@@ -604,7 +598,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_files_and_partial() -> anyhow::Result<()> {
-        let (server, temp, dir) = setup_server_with_dir()?;
+        let (server, temp, arena) = setup_server()?;
 
         fs::create_dir_all(temp.child("subdir"))?;
 
@@ -614,11 +608,7 @@ mod tests {
         temp.child("subdir/.bar2.txt.part").write_str("partial")?;
 
         let files = server
-            .list(
-                tarpc::context::current(),
-                dir.arena().clone(),
-                Options::default(),
-            )
+            .list(tarpc::context::current(), arena.clone(), Options::default())
             .await?;
         assert_eq_unordered!(
             files,
@@ -647,14 +637,14 @@ mod tests {
 
     #[tokio::test]
     async fn send_wrong_order() -> anyhow::Result<()> {
-        let (server, _temp, dir) = setup_server_with_dir()?;
-        let fpath = LogicalPath::new(&dir, &model::Path::parse("wrong_order.txt")?);
+        let (server, temp, arena) = setup_server()?;
+        let fpath = LogicalPath::new(temp.path(), &model::Path::parse("wrong_order.txt")?);
         let data1 = b"fghij".to_vec();
         server
             .clone()
             .send(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 fpath.path.clone(),
                 ByteRange { start: 5, end: 10 },
                 data1.clone(),
@@ -672,7 +662,7 @@ mod tests {
             .clone()
             .send(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 fpath.path.clone(),
                 ByteRange { start: 0, end: 5 },
                 data2.clone(),
@@ -687,16 +677,16 @@ mod tests {
 
     #[tokio::test]
     async fn read() -> anyhow::Result<()> {
-        let (server, _temp, dir) = setup_server_with_dir()?;
+        let (server, temp, arena) = setup_server()?;
 
-        let fpath = LogicalPath::new(&dir, &model::Path::parse("wrong_order.txt")?);
+        let fpath = LogicalPath::new(temp.path(), &model::Path::parse("wrong_order.txt")?);
         fs::write(fpath.final_path(), "abcdefghij")?;
 
         let data = server
             .clone()
             .read(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 fpath.path.clone(),
                 ByteRange { start: 5, end: 10 },
                 Options::default(),
@@ -708,7 +698,7 @@ mod tests {
             .clone()
             .read(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 fpath.path.clone(),
                 ByteRange { start: 0, end: 5 },
                 Options::default(),
@@ -720,7 +710,7 @@ mod tests {
             .clone()
             .read(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 fpath.path.clone(),
                 ByteRange { start: 0, end: 15 },
                 Options::default(),
@@ -734,15 +724,15 @@ mod tests {
 
     #[tokio::test]
     async fn finish_partial() -> anyhow::Result<()> {
-        let (server, _temp, dir) = setup_server_with_dir()?;
+        let (server, temp, arena) = setup_server()?;
 
-        let fpath = LogicalPath::new(&dir, &model::Path::parse("finish_partial.txt")?);
+        let fpath = LogicalPath::new(temp.path(), &model::Path::parse("finish_partial.txt")?);
         fs::write(fpath.partial_path(), "abcde")?;
 
         server
             .finish(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 fpath.path.clone(),
                 Options::default(),
             )
@@ -757,15 +747,15 @@ mod tests {
 
     #[tokio::test]
     async fn finish_final() -> anyhow::Result<()> {
-        let (server, _temp, dir) = setup_server_with_dir()?;
+        let (server, temp, arena) = setup_server()?;
 
-        let fpath = LogicalPath::new(&dir, &model::Path::parse("finish_partial.txt")?);
+        let fpath = LogicalPath::new(temp.path(), &model::Path::parse("finish_partial.txt")?);
         fs::write(fpath.final_path(), "abcde")?;
 
         server
             .finish(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 fpath.path.clone(),
                 Options::default(),
             )
@@ -780,14 +770,14 @@ mod tests {
 
     #[tokio::test]
     async fn truncate() -> anyhow::Result<()> {
-        let (server, _temp, dir) = setup_server_with_dir()?;
-        let fpath = LogicalPath::new(&dir, &model::Path::parse("truncate.txt")?);
+        let (server, temp, arena) = setup_server()?;
+        let fpath = LogicalPath::new(temp.path(), &model::Path::parse("truncate.txt")?);
         std::fs::write(fpath.partial_path(), b"abcdefghij")?;
         server
             .clone()
             .truncate(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 fpath.path.clone(),
                 7,
                 Options::default(),
@@ -800,15 +790,15 @@ mod tests {
 
     #[tokio::test]
     async fn hash_final_and_partial() -> anyhow::Result<()> {
-        let (server, _temp, dir) = setup_server_with_dir()?;
+        let (server, temp, arena) = setup_server()?;
         let content = b"hello world";
-        let fpath = LogicalPath::new(&dir, &model::Path::parse("foo.txt")?);
+        let fpath = LogicalPath::new(temp.path(), &model::Path::parse("foo.txt")?);
         std::fs::write(fpath.final_path(), content)?;
         let hash = server
             .clone()
             .hash(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 model::Path::parse("foo.txt")?,
                 ByteRange {
                     start: 0,
@@ -822,13 +812,13 @@ mod tests {
 
         // Now test partial
         let content2 = b"partial content";
-        let fpath2 = LogicalPath::new(&dir, &model::Path::parse("bar.txt")?);
+        let fpath2 = LogicalPath::new(temp.path(), &model::Path::parse("bar.txt")?);
         std::fs::write(fpath2.partial_path(), content2)?;
         let hash2 = server
             .clone()
             .hash(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 model::Path::parse("bar.txt")?,
                 ByteRange {
                     start: 0,
@@ -844,15 +834,15 @@ mod tests {
 
     #[tokio::test]
     async fn hash_past_file_end() -> anyhow::Result<()> {
-        let (server, _temp, dir) = setup_server_with_dir()?;
+        let (server, temp, arena) = setup_server()?;
         let content = b"hello world";
-        let fpath = LogicalPath::new(&dir, &model::Path::parse("foo.txt")?);
+        let fpath = LogicalPath::new(temp.path(), &model::Path::parse("foo.txt")?);
         std::fs::write(fpath.final_path(), content)?;
         let hash = server
             .clone()
             .hash(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 model::Path::parse("foo.txt")?,
                 ByteRange {
                     start: 100,
@@ -868,15 +858,15 @@ mod tests {
 
     #[tokio::test]
     async fn hash_short_read() -> anyhow::Result<()> {
-        let (server, _temp, dir) = setup_server_with_dir()?;
+        let (server, temp, arena) = setup_server()?;
         let content = b"hello world";
-        let fpath = LogicalPath::new(&dir, &model::Path::parse("foo.txt")?);
+        let fpath = LogicalPath::new(temp.path(), &model::Path::parse("foo.txt")?);
         std::fs::write(fpath.final_path(), content)?;
         let hash = server
             .clone()
             .hash(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 model::Path::parse("foo.txt")?,
                 ByteRange { start: 0, end: 200 },
                 Options::default(),
@@ -889,8 +879,8 @@ mod tests {
 
     #[tokio::test]
     async fn delete_final_and_partial() -> anyhow::Result<()> {
-        let (server, _temp, dir) = setup_server_with_dir()?;
-        let fpath = LogicalPath::new(&dir, &model::Path::parse("foo.txt")?);
+        let (server, temp, arena) = setup_server()?;
+        let fpath = LogicalPath::new(temp.path(), &model::Path::parse("foo.txt")?);
         std::fs::write(fpath.final_path(), b"data")?;
         std::fs::write(fpath.partial_path(), b"data2")?;
         assert!(fpath.final_path().exists());
@@ -899,7 +889,7 @@ mod tests {
             .clone()
             .delete(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 model::Path::parse("foo.txt")?,
                 Options::default(),
             )
@@ -911,7 +901,7 @@ mod tests {
             .clone()
             .delete(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 model::Path::parse("foo.txt")?,
                 Options::default(),
             )
@@ -938,7 +928,7 @@ mod tests {
 
     #[tokio::test]
     async fn calculate_signature_and_diff_and_apply_delta() -> anyhow::Result<()> {
-        let (server, temp, dir) = setup_server_with_dir()?;
+        let (server, temp, arena) = setup_server()?;
         let file_path = model::Path::parse("foo.txt")?;
         let file_content = b"hello world, this is a test of rsync signature!";
         temp.child("foo.txt").write_binary(file_content)?;
@@ -948,7 +938,7 @@ mod tests {
             .clone()
             .calculate_signature(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 file_path.clone(),
                 ByteRange {
                     start: 0,
@@ -967,7 +957,7 @@ mod tests {
             .clone()
             .diff(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 file_path.clone(),
                 ByteRange {
                     start: 0,
@@ -977,7 +967,7 @@ mod tests {
                 Options::default(),
             )
             .await?;
-        assert!(!delta.0.0.is_empty());
+        assert!(!delta.0 .0.is_empty());
 
         // Revert file to old content, then apply delta
         temp.child(".foo.txt.part").write_binary(file_content)?;
@@ -985,7 +975,7 @@ mod tests {
             .clone()
             .apply_delta(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 file_path.clone(),
                 ByteRange {
                     start: 0,
@@ -1006,13 +996,13 @@ mod tests {
 
     #[tokio::test]
     async fn signature_on_nonexisting_file() -> anyhow::Result<()> {
-        let (server, _temp, dir) = setup_server_with_dir()?;
+        let (server, _temp, arena) = setup_server()?;
         // Nonexistent file
         let result = server
             .clone()
             .calculate_signature(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 model::Path::parse("notfound.txt")?,
                 ByteRange { start: 0, end: 10 },
                 Options::default(),
@@ -1025,7 +1015,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_delta_error_case() -> anyhow::Result<()> {
-        let (server, temp, dir) = setup_server_with_dir()?;
+        let (server, temp, arena) = setup_server()?;
         let file_path = model::Path::parse("foo.txt")?;
         temp.child("foo.txt").write_str("abc")?;
         // Try to apply a bogus delta
@@ -1033,7 +1023,7 @@ mod tests {
             .clone()
             .apply_delta(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 file_path,
                 ByteRange { start: 0, end: 3 },
                 crate::model::Delta(vec![1, 2, 3]),
@@ -1050,7 +1040,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_partial_vs_final() -> anyhow::Result<()> {
-        let (server, temp, dir) = setup_server_with_dir()?;
+        let (server, temp, arena) = setup_server()?;
         temp.child("foo.txt").write_str("final")?;
         temp.child(".foo.txt.part").write_str("partial")?;
         // Default: partial preferred
@@ -1058,7 +1048,7 @@ mod tests {
             .clone()
             .list(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 Options {
                     ignore_partial: false,
                 },
@@ -1070,7 +1060,7 @@ mod tests {
             .clone()
             .list(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 Options {
                     ignore_partial: true,
                 },
@@ -1082,14 +1072,14 @@ mod tests {
 
     #[tokio::test]
     async fn list_ignore_partial() -> anyhow::Result<()> {
-        let (server, temp, dir) = setup_server_with_dir()?;
+        let (server, temp, arena) = setup_server()?;
         temp.child(".foo.txt.part").write_str("partial")?;
         // Default: return partial
         let files = server
             .clone()
             .list(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 Options {
                     ignore_partial: false,
                 },
@@ -1101,7 +1091,7 @@ mod tests {
             .clone()
             .list(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 Options {
                     ignore_partial: true,
                 },
@@ -1113,7 +1103,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_partial_vs_final() -> anyhow::Result<()> {
-        let (server, temp, dir) = setup_server_with_dir()?;
+        let (server, temp, arena) = setup_server()?;
         temp.child("foo.txt").write_str("final")?;
         temp.child(".foo.txt.part").write_str("partial")?;
         // Default: partial preferred
@@ -1121,7 +1111,7 @@ mod tests {
             .clone()
             .read(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 model::Path::parse("foo.txt")?,
                 ByteRange { start: 0, end: 7 },
                 Options {
@@ -1135,7 +1125,7 @@ mod tests {
             .clone()
             .read(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 model::Path::parse("foo.txt")?,
                 ByteRange { start: 0, end: 5 },
                 Options {
@@ -1149,19 +1139,19 @@ mod tests {
 
     #[tokio::test]
     async fn delete_removes_empty_parent_dirs() -> anyhow::Result<()> {
-        let (server, temp, dir) = setup_server_with_dir()?;
+        let (server, temp, arena) = setup_server()?;
         // Create nested directories: a/b/c/file.txt
         let nested_dir = temp.child("a/b/c");
         std::fs::create_dir_all(nested_dir.path())?;
         let file_path = model::Path::parse("a/b/c/file.txt")?;
-        let logical = LogicalPath::new(&dir, &file_path);
+        let logical = LogicalPath::new(temp.path(), &file_path);
         std::fs::write(logical.final_path(), b"data")?;
         // Delete the file
         server
             .clone()
             .delete(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 file_path.clone(),
                 Options::default(),
             )
@@ -1178,13 +1168,13 @@ mod tests {
 
     #[tokio::test]
     async fn delete_does_not_remove_nonempty_parent_dirs() -> anyhow::Result<()> {
-        let (server, temp, dir) = setup_server_with_dir()?;
+        let (server, temp, arena) = setup_server()?;
         // Create nested directories: a/b/c/file.txt and a/b/c/keep.txt
         let nested_dir = temp.child("a/b/c");
         std::fs::create_dir_all(nested_dir.path())?;
         let file_path = model::Path::parse("a/b/c/file.txt")?;
         let keep_path = temp.child("a/b/c/keep.txt");
-        let logical = LogicalPath::new(&dir, &file_path);
+        let logical = LogicalPath::new(temp.path(), &file_path);
         std::fs::write(logical.final_path(), b"data")?;
         std::fs::write(keep_path.path(), b"keep")?;
         // Delete the file
@@ -1192,7 +1182,7 @@ mod tests {
             .clone()
             .delete(
                 tarpc::context::current(),
-                dir.arena().clone(),
+                arena.clone(),
                 file_path.clone(),
                 Options::default(),
             )

@@ -1,5 +1,3 @@
-use std::path::{Path, PathBuf};
-
 /// A set of path and associated data shared between peers.
 ///
 /// This types is an identifier. An arena is identified by its name,
@@ -35,32 +33,5 @@ impl Arena {
     }
     pub fn into_string(self) -> String {
         self.name
-    }
-}
-
-/// Local location of a shared [Arena].
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-pub struct LocalArena {
-    arena: Arena,
-    path: PathBuf,
-}
-
-impl LocalArena {
-    /// Set local location of the given arena to the given path.
-    pub fn new(arena: &Arena, path: &Path) -> Self {
-        Self {
-            arena: arena.clone(),
-            path: path.to_path_buf(),
-        }
-    }
-
-    /// LocalArena ID, as found in Service calls.
-    pub fn arena(&self) -> &Arena {
-        &self.arena
-    }
-
-    /// Local directory path that correspond to the ID.
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 }

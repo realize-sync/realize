@@ -11,16 +11,16 @@ use crate::network::rpc::realize::{
     Options, RangedHash, RealizeServiceClient, RealizeServiceError, RealizeServiceRequest,
     RealizeServiceResponse, SyncedFile,
 };
-use futures::FutureExt;
 use futures::future;
 use futures::stream::StreamExt as _;
-use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
+use futures::FutureExt;
+use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tarpc::client::stub::Stub;
 use thiserror::Error;
-use tokio::sync::Semaphore;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::Semaphore;
 
 const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 const PARALLEL_FILE_COUNT: usize = 4;
@@ -804,16 +804,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Arena;
     use crate::model::Hash;
-    use crate::model::{Arena, LocalArena};
     use crate::network::rpc::realize::server::{self};
     use crate::storage::real::LocalStorage;
     use crate::utils::hash;
-    use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
     use std::path::PathBuf;
-    use std::sync::Arc;
     use walkdir::WalkDir;
 
     #[tokio::test]
@@ -822,12 +821,11 @@ mod tests {
         let src_temp = TempDir::new()?;
         let dst_temp = TempDir::new()?;
         src_temp.child("foo").write_str("abc")?;
-        let src_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), src_temp.path()));
-        let dst_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), dst_temp.path()));
-        let src_server =
-            server::create_inprocess_client(LocalStorage::single(src_dir.arena(), src_dir.path()));
-        let dst_server =
-            server::create_inprocess_client(LocalStorage::single(dst_dir.arena(), dst_dir.path()));
+        let arena = Arena::from("testdir");
+        let src_dir = src_temp.path();
+        let dst_dir = dst_temp.path();
+        let src_server = server::create_inprocess_client(LocalStorage::single(&arena, src_dir));
+        let dst_server = server::create_inprocess_client(LocalStorage::single(&arena, dst_dir));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let (success, error, _) = move_dir(
@@ -893,17 +891,16 @@ mod tests {
     #[tokio::test]
     async fn events_for_continued_copy() -> anyhow::Result<()> {
         let _ = env_logger::try_init();
+        let arena = Arena::from("testdir");
         let src_temp = TempDir::new()?;
         let dst_temp = TempDir::new()?;
-        let src_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), src_temp.path()));
-        let dst_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), dst_temp.path()));
         src_temp.child("foo").write_str("abcdefghi")?;
         dst_temp.child(".foo.part").write_str("abc")?;
 
         let src_server =
-            server::create_inprocess_client(LocalStorage::single(src_dir.arena(), src_dir.path()));
+            server::create_inprocess_client(LocalStorage::single(&arena, src_temp.path()));
         let dst_server =
-            server::create_inprocess_client(LocalStorage::single(dst_dir.arena(), dst_dir.path()));
+            server::create_inprocess_client(LocalStorage::single(&arena, dst_temp.path()));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let (success, error, _) = move_dir(
@@ -971,15 +968,14 @@ mod tests {
         let _ = env_logger::try_init();
         let src_temp = TempDir::new()?;
         let dst_temp = TempDir::new()?;
-        let src_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), src_temp.path()));
-        let dst_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), dst_temp.path()));
+        let arena = Arena::from("testdir");
         src_temp.child("foo").write_str("abcdefghi")?;
         dst_temp.child(".foo.part").write_str("xxx")?;
 
         let src_server =
-            server::create_inprocess_client(LocalStorage::single(src_dir.arena(), src_dir.path()));
+            server::create_inprocess_client(LocalStorage::single(&arena, src_temp.path()));
         let dst_server =
-            server::create_inprocess_client(LocalStorage::single(dst_dir.arena(), dst_dir.path()));
+            server::create_inprocess_client(LocalStorage::single(&arena, dst_temp.path()));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let (success, error, _) = move_dir(
@@ -1064,17 +1060,17 @@ mod tests {
     async fn move_some_files() -> anyhow::Result<()> {
         let _ = env_logger::try_init();
 
+        let arena = Arena::from("testdir");
+
         // Setup source directory with files
         let src_temp = TempDir::new()?;
-        let src_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), src_temp.path()));
         let src_server =
-            server::create_inprocess_client(LocalStorage::single(src_dir.arena(), src_dir.path()));
+            server::create_inprocess_client(LocalStorage::single(&arena, src_temp.path()));
 
         // Setup destination directory (empty)
         let dst_temp = TempDir::new()?;
-        let dst_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), dst_temp.path()));
         let dst_server =
-            server::create_inprocess_client(LocalStorage::single(dst_dir.arena(), dst_dir.path()));
+            server::create_inprocess_client(LocalStorage::single(&arena, dst_temp.path()));
 
         // Pre-populate destination with a file of the same length as source (should trigger rsync optimization)
         src_temp.child("same_length").write_str("hello")?;
@@ -1128,15 +1124,14 @@ mod tests {
         let chunk4 = vec![0x12; FILE_SIZE];
         let chunk5 = vec![0x34; FILE_SIZE];
 
+        let arena = Arena::from("testdir");
         let src_temp = TempDir::new()?;
-        let src_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), src_temp.path()));
         let src_server =
-            server::create_inprocess_client(LocalStorage::single(src_dir.arena(), src_dir.path()));
+            server::create_inprocess_client(LocalStorage::single(&arena, src_temp.path()));
 
         let dst_temp = TempDir::new()?;
-        let dst_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), dst_temp.path()));
         let dst_server =
-            server::create_inprocess_client(LocalStorage::single(dst_dir.arena(), dst_dir.path()));
+            server::create_inprocess_client(LocalStorage::single(&arena, dst_temp.path()));
 
         // Case 1: source > CHUNK_SIZE, destination empty
         src_temp.child("large_empty").write_binary(&chunk)?;
@@ -1192,14 +1187,13 @@ mod tests {
     #[tokio::test]
     async fn move_files_partial_error() -> anyhow::Result<()> {
         let _ = env_logger::try_init();
+        let arena = Arena::from("testdir");
         let src_temp = TempDir::new()?;
-        let src_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), src_temp.path()));
         let src_server =
-            server::create_inprocess_client(LocalStorage::single(src_dir.arena(), src_dir.path()));
+            server::create_inprocess_client(LocalStorage::single(&arena, src_temp.path()));
         let dst_temp = TempDir::new()?;
-        let dst_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), dst_temp.path()));
         let dst_server =
-            server::create_inprocess_client(LocalStorage::single(dst_dir.arena(), dst_dir.path()));
+            server::create_inprocess_client(LocalStorage::single(&arena, dst_temp.path()));
         // Good file
         src_temp.child("good").write_str("ok")?;
         // Unreadable file
@@ -1228,12 +1222,11 @@ mod tests {
         let _ = env_logger::try_init();
         let src_temp = TempDir::new()?;
         let dst_temp = TempDir::new()?;
-        let src_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), src_temp.path()));
-        let dst_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), dst_temp.path()));
-        let src_server =
-            server::create_inprocess_client(LocalStorage::single(src_dir.arena(), src_dir.path()));
-        let dst_server =
-            server::create_inprocess_client(LocalStorage::single(dst_dir.arena(), dst_dir.path()));
+        let arena = Arena::from("testdir");
+        let src_dir = src_temp.path();
+        let dst_dir = dst_temp.path();
+        let src_server = server::create_inprocess_client(LocalStorage::single(&arena, src_dir));
+        let dst_server = server::create_inprocess_client(LocalStorage::single(&arena, dst_dir));
         // Create a final file and a partial file in src
         src_temp.child("final.txt").write_str("finaldata")?;
         src_temp

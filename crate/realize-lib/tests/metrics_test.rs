@@ -1,5 +1,5 @@
-use assert_fs::TempDir;
 use assert_fs::prelude::*;
+use assert_fs::TempDir;
 use prometheus::proto::MetricType;
 use realize_lib::logic::consensus::movedirs;
 use realize_lib::logic::consensus::movedirs::METRIC_END_COUNT;
@@ -10,11 +10,10 @@ use realize_lib::logic::consensus::movedirs::METRIC_RANGE_WRITE_BYTES;
 use realize_lib::logic::consensus::movedirs::METRIC_READ_BYTES;
 use realize_lib::logic::consensus::movedirs::METRIC_START_COUNT;
 use realize_lib::logic::consensus::movedirs::METRIC_WRITE_BYTES;
-use realize_lib::model::{Arena, LocalArena};
-use realize_lib::network::rpc::realize::Options;
+use realize_lib::model::Arena;
 use realize_lib::network::rpc::realize::server::{self, InProcessRealizeServiceClient};
+use realize_lib::network::rpc::realize::Options;
 use realize_lib::storage::real::LocalStorage;
-use std::sync::Arc;
 
 // Metric tests are kept in their own binary to avoid other test
 // running in parallel interfering with the counts.
@@ -53,16 +52,14 @@ async fn client_error_call_count() -> anyhow::Result<()> {
             ("error", "BadRequest"),
         ],
     );
-    assert!(
-        client
-            .list(
-                tarpc::context::current(),
-                Arena::from("doesnotexist"),
-                Options::default(),
-            )
-            .await?
-            .is_err()
-    );
+    assert!(client
+        .list(
+            tarpc::context::current(),
+            Arena::from("doesnotexist"),
+            Options::default(),
+        )
+        .await?
+        .is_err());
     let after_err = get_metric_value(
         "realize_client_call_count",
         &[
@@ -106,16 +103,14 @@ async fn server_error_call_count() -> anyhow::Result<()> {
             ("error", "BadRequest"),
         ],
     );
-    assert!(
-        client
-            .list(
-                tarpc::context::current(),
-                Arena::from("doesnotexist"),
-                Options::default(),
-            )
-            .await?
-            .is_err()
-    );
+    assert!(client
+        .list(
+            tarpc::context::current(),
+            Arena::from("doesnotexist"),
+            Options::default(),
+        )
+        .await?
+        .is_err());
     let after_srv_err = get_metric_value(
         "realize_server_call_count",
         &[
@@ -145,12 +140,12 @@ async fn move_files_metrics() -> anyhow::Result<()> {
     let src_temp = TempDir::new()?;
     let dst_temp = TempDir::new()?;
     src_temp.child("foo").write_str("abc")?;
-    let src_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), src_temp.path()));
-    let dst_dir = Arc::new(LocalArena::new(&Arena::from("testdir"), dst_temp.path()));
+
+    let arena = Arena::from("testdir");
     let (success, error, _interrupted) = movedirs::move_dir(
         tarpc::context::current(),
-        &server::create_inprocess_client(LocalStorage::single(src_dir.arena(), src_dir.path())),
-        &server::create_inprocess_client(LocalStorage::single(dst_dir.arena(), dst_dir.path())),
+        &server::create_inprocess_client(LocalStorage::single(&arena, src_temp.path())),
+        &server::create_inprocess_client(LocalStorage::single(&arena, dst_temp.path())),
         Arena::from("testdir"),
         None,
     )
