@@ -4,7 +4,7 @@ use anyhow::Context as _;
 use clap::Parser;
 use futures_util::stream::StreamExt as _;
 use prometheus::{register_int_counter, IntCounter};
-use realize_lib::model::{Arena, LocalArena, Peer};
+use realize_lib::model::{Arena, Peer};
 use realize_lib::network::config::PeerConfig;
 use realize_lib::network::rpc::realize::metrics;
 use realize_lib::network::security::{self, PeerVerifier};
@@ -82,11 +82,7 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
     check_directory_access(&config.arenas)?;
 
     // Build directory list
-    let mut dirs = Vec::new();
-    for (arena, config) in &config.arenas {
-        dirs.push(LocalArena::new(arena, &config.path));
-    }
-    let dirs = LocalStorage::new(dirs);
+    let dirs = LocalStorage::from_config(&config.arenas);
 
     let verifier = PeerVerifier::from_config(&config.peers)?;
     let privkey = load_private_key_file(&cli.privkey)

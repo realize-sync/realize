@@ -10,6 +10,8 @@ use tokio::fs;
 
 use crate::model::{self, Arena, LocalArena};
 
+use super::config::ArenaConfig;
+
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum StorageAccess {
     Read,
@@ -29,6 +31,15 @@ pub struct LocalStorage {
 }
 
 impl LocalStorage {
+    /// Create a [LocalStorage] from a set of [ArenaConfig].
+    pub fn from_config(arenas: &HashMap<Arena, ArenaConfig>) -> Self {
+        Self::new(
+            arenas
+                .iter()
+                .map(|(arena, config)| LocalArena::new(arena, &config.path)),
+        )
+    }
+
     /// Create a [LocalStorage] from an iterator of [LocalArena].
     pub fn new<T>(arenas: T) -> Self
     where
@@ -189,8 +200,8 @@ fn not_found() -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use assert_fs::{
-        TempDir,
         prelude::{FileWriteStr as _, PathChild as _},
+        TempDir,
     };
 
     use super::*;
