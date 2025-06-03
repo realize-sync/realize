@@ -34,27 +34,27 @@ realized --address localhost:9771 --privkey private_key_b.key --config config
 daemon on Host B, containing a PEM-encoded private key generated using
 the ed25519 algorithm.
 
-`config` is a YAML file that contains:
+`config` is a TOML file that contains:
 
 - the mapping from directory id to local path
 
 - the mapping from peer id to its public SSL key for all peers allowed
   to connect to this daemon.
 
-```yaml
+```toml
+[arenas]
+directory_id1.path = "/store/b/dir"
+directory_id2.path = "/store/c/dir"
 
-dirs:
- - directory_id1: /store/b/dir
- - directory_id2: /store/c/dir
-
-peers:
- - peer1: | # public key as a string (PEM-encoded ED25519 Public Key)
+[peers]
+# public key as a string (PEM-encoded ED25519 Public Key)
+peer1.pubkey="""
  -----BEGIN PUBLIC KEY-----
  MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAw1603u9y/gRa194d
  ... (rest of the base64-encoded public key) ...
  -----END PUBLIC KEY-----
-
- - peer2: ... # public key as a string (PEM-encoded ED25519 Public Key)
+"""
+peer2.pubkey: ... # public key as a string (PEM-encoded ED25519 Public Key)
 ```
 
 Host A runs the realize command-line tool with the following arguments:
@@ -327,27 +327,36 @@ realized --address <host:port> --privkey <private_key_file> --config <config_fil
 
 - `--address <host:port>`: TCP address to listen on for incoming RPC connections (default: localhost:9771).
 - `--privkey <private_key_file>`: Path to the PEM-encoded ED25519 private key file for this daemon.
-- `--config <config_file>`: Path to the YAML configuration file specifying directory mappings and allowed peers.
+- `--config <config_file>`: Path to the TOML configuration file specifying directory mappings and allowed peers.
 
 #### Inputs
 
 - **Private Key File**: PEM-encoded private key for TLS server authentication.
-- **Config File**: YAML file containing:
-  - `dirs`: Mapping from directory IDs to local paths.
+- **Config File**: TOML file containing:
+  - `arenas`: Mapping from directory IDs to local paths.
   - `peers`: Mapping from peer IDs to their PEM-encoded ED25519 public keys.
 
 Example config:
 
-```yaml
-dirs:
-  - synceddir: /store/b/dir
-  - otherdir: /store/b/other
-peers:
-  - peer1: |
-      -----BEGIN PUBLIC KEY-----
-      ...
-      -----END PUBLIC KEY-----
-  - peer2: ...
+```toml
+[arenas]
+synceddir.path = "/store/b/dir
+otherdir.path = "/store/b/dir
+
+[peers.peer1]
+address = "localhost:1235"
+pubkey = """
+-----BEGIN PUBLIC KEY-----
+...
+-----END PUBLIC KEY-----
+"""
+
+[peers.peer2]
+pubkey = """
+-----BEGIN PUBLIC KEY-----
+...
+-----END PUBLIC KEY-----
+"""
 ```
 
 #### Outputs
@@ -361,7 +370,7 @@ peers:
 #### Behavior
 
 - Starts an RPC server on the specified address, using TLS with the provided private key.
-- Loads the directory and peer configuration from the YAML config file.
+- Loads the directory and peer configuration from the TOML config file.
 - Accepts incoming connections only from peers with public keys listed in the config.
 - Exposes the RealizeService API for directory listing, file transfer, and sync operations.
 - Manages the local state of each configured directory, including handling partial files and file finalization.
@@ -372,7 +381,7 @@ peers:
 #### Example Usage
 
 ```
-realized --address localhost:9771 --privkey private_key_b.key --config config.yaml
+realized --address localhost:9771 --privkey private_key_b.key --config config.toml
 ```
 
 This starts the daemon on address localhost:9771, using the specified private key and configuration file.
@@ -384,29 +393,16 @@ The `realize` command is a CLI tool used to initiate and control the synchroniza
 #### Command Line Arguments
 
 ```
-# Local to remote
-realize --src-path <local_path> --dst-addr <host:port> --privkey <private_key_file> --peers <peers_pem_file> --directory-id <directory_id>
-
-# Remote to local
-realize --src-addr <host:port> --dst-path <local_path> --privkey <private_key_file> --peers <peers_pem_file> --directory-id <directory_id>
-
-# Both remote
-realize --src-addr <host:port> --dst-addr <host:port> --privkey <private_key_file> --peers <peers_pem_file> --directory-id <directory_id>
-
-# Both local
-realize --src-path <local_path> --dst-path <local_path>
+realize --src <peer_id> --dst <peer_id> --privkey <private_key_file> --config <config_file> <directory_id>...
 
 # Metrics (optional)
 realize ... [--metrics-addr <host:port>] [--metrics-pushgateway <url>] [--metrics-job <job>] [--metrics-instance <instance>]
 ```
 
-- `--src-path <local_path>`: Local source directory path
-- `--dst-path <local_path>`: Local destination directory path
-- `--src-addr <host:port>`: Source remote address
-- `--dst-addr <host:port>`: Destination remote address
+- `--src <peer-id>`: ID of the source peer, defined in the configuration file.
+- `--dst <peer-id>`: ID of the destination peer, defined in the configuration file.
 - `--privkey <private_key_file>`: Path to the PEM-encoded private key file (required for remote)
-- `--peers <peers_pem_file>`: Path to PEM file with one or more peer public keys (required for remote)
-- `--directory-id <directory_id>`: Directory id (optional, defaults to 'dir' for local/local)
+- `--config <config_file>`: Path to TOML file containing peer definition, address and public key
 - `--throttle <rate>`: Throttle upload and download (e.g. 1M)
 - `--throttle-up <rate>`: Throttle upload (e.g. 1M)
 - `--throttle-down <rate>`: Throttle download (e.g. 512k)
@@ -419,7 +415,7 @@ realize ... [--metrics-addr <host:port>] [--metrics-pushgateway <url>] [--metric
 #### Inputs
 
 - **Private Key File**: PEM-encoded private key for TLS client authentication (required for remote endpoints).
-- **Peers File**: PEM file containing one or more public keys for the servers that the client can connect to (required for remote endpoints).
+- **Config File**: TOML file defining peers, their address and public keys
 - **Directory ID**: Identifier for the directory to sync (optional for local/local, required otherwise).
 - **Local Path**: Path to the local directory to be synchronized (for local endpoints).
 - **Remote Host/Port**: Network address of the remote `realized` daemon (for remote endpoints).
@@ -629,14 +625,14 @@ The following events are logged at INFO level, with timestamp:
 
 - making a file final, which includes:
 
-  - the ID of the peer that made the change, as defined in the YAML
+  - the ID of the peer that made the change, as defined in the TOML
     config file, if made through RPC or "local" otherwise
 
   - the size and BLAKE2 hash of the file
 
 - deleting a final file, which includes:
 
-  - the ID of the peer that made the change, as defined in the YAML
+  - the ID of the peer that made the change, as defined in the TOML
     config file, if made through RPC or "local" othrewise
 
 More TBD
