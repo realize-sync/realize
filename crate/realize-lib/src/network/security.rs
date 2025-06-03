@@ -2,8 +2,8 @@
 pub(crate) mod testing;
 
 use base64::Engine as _;
-use rustls::client::Resumption;
 use rustls::client::danger::ServerCertVerifier;
+use rustls::client::Resumption;
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::sign::{CertifiedKey, SigningKey};
 use rustls::version::TLS13;
@@ -55,8 +55,12 @@ pub struct PeerVerifier {
 }
 
 impl PeerVerifier {
+    pub fn new() -> Self {
+        PeerVerifier::with_crypto(Arc::new(default_provider()))
+    }
+
     /// Create a new, empty verifier.
-    pub fn new(crypto: &Arc<CryptoProvider>) -> Self {
+    pub fn with_crypto(crypto: Arc<CryptoProvider>) -> Self {
         Self {
             allowed_peers: BTreeMap::new(),
             algos: crypto.signature_verification_algorithms,
@@ -294,12 +298,11 @@ impl rustls::server::ResolvesServerCert for RawPublicKeyResolver {
 
 #[cfg(test)]
 mod tests {
-    use super::default_provider;
     use super::*;
     use crate::network::security::testing;
     use crate::utils::async_utils::AbortOnDrop;
-    use rustls::pki_types::PrivateKeyDer;
     use rustls::pki_types::pem::PemObject as _;
+    use rustls::pki_types::PrivateKeyDer;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -313,8 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn tls_unknown_client_peer() -> anyhow::Result<()> {
-        let crypto = Arc::new(default_provider());
-        let mut verifier = PeerVerifier::new(&crypto);
+        let mut verifier = PeerVerifier::new();
         // client public key missing from verifier
         verifier.add_peer(testing::server_public_key());
 
@@ -325,8 +327,7 @@ mod tests {
 
     #[tokio::test]
     async fn tls_unknown_server_peer() -> anyhow::Result<()> {
-        let crypto = Arc::new(default_provider());
-        let mut verifier = PeerVerifier::new(&crypto);
+        let mut verifier = PeerVerifier::new();
         verifier.add_peer(testing::client_public_key());
         // server public key missing from verifier
 
@@ -337,8 +338,7 @@ mod tests {
 
     #[tokio::test]
     async fn tls_reject_client_with_bad_private_key() -> anyhow::Result<()> {
-        let crypto = Arc::new(default_provider());
-        let mut verifier = PeerVerifier::new(&crypto);
+        let mut verifier = PeerVerifier::new();
         verifier.add_peer(testing::client_public_key());
         verifier.add_peer(testing::server_public_key());
 
@@ -370,8 +370,7 @@ mod tests {
 
     #[tokio::test]
     async fn tls_reject_client_without_cert() -> anyhow::Result<()> {
-        let crypto = Arc::new(default_provider());
-        let mut verifier = PeerVerifier::new(&crypto);
+        let mut verifier = PeerVerifier::new();
         verifier.add_peer(testing::client_public_key());
         verifier.add_peer(testing::server_public_key());
 
@@ -397,8 +396,7 @@ mod tests {
 
     #[tokio::test]
     async fn tls_reject_server_with_bad_private_key() -> anyhow::Result<()> {
-        let crypto = Arc::new(default_provider());
-        let mut verifier = PeerVerifier::new(&crypto);
+        let mut verifier = PeerVerifier::new();
         verifier.add_peer(testing::client_public_key());
         verifier.add_peer(testing::server_public_key());
 
@@ -486,8 +484,7 @@ mod tests {
     }
 
     fn complete_verifier() -> PeerVerifier {
-        let crypto = Arc::new(default_provider());
-        let mut verifier = PeerVerifier::new(&crypto);
+        let mut verifier = PeerVerifier::new();
         verifier.add_peer(testing::client_public_key());
         verifier.add_peer(testing::server_public_key());
 

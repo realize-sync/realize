@@ -451,8 +451,7 @@ fn load_private_key_file(path: &Path) -> anyhow::Result<Arc<dyn SigningKey>> {
 }
 
 fn build_peer_verifier(config: &Config) -> anyhow::Result<Arc<PeerVerifier>> {
-    let crypto = Arc::new(security::default_provider());
-    let mut verifier = PeerVerifier::new(&crypto);
+    let mut verifier = PeerVerifier::new();
 
     for (peer, config) in &config.peers {
         let spki = SubjectPublicKeyInfoDer::from_pem_slice(config.pubkey.as_bytes())

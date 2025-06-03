@@ -103,8 +103,7 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
     let portstr = wait_for_listening_port(daemon.stdout.as_mut().unwrap()).await?;
 
     // Connect to the port the daemon listens to.
-    let crypto = Arc::new(security::default_provider());
-    let mut verifier = PeerVerifier::new(&crypto);
+    let mut verifier = PeerVerifier::new();
     verifier.add_peer(SubjectPublicKeyInfoDer::from_pem_file(
         fixture.resources.join("a-spki.pem"),
     )?);
@@ -113,11 +112,9 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
     let client = tcp::connect_client(
         &HostPort::parse(&format!("127.0.0.1:{portstr}")).await?,
         verifier,
-        crypto
-            .key_provider
-            .load_private_key(PrivateKeyDer::from_pem_file(
-                fixture.resources.join("a.key"),
-            )?)?,
+        security::default_provider().key_provider.load_private_key(
+            PrivateKeyDer::from_pem_file(fixture.resources.join("a.key"))?,
+        )?,
         tcp::ClientOptions::default(),
     )
     .await?;

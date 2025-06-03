@@ -89,8 +89,7 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
     let dirs = LocalStorage::new(dirs);
 
     // Build PeerVerifier
-    let crypto = Arc::new(security::default_provider());
-    let mut verifier = PeerVerifier::new(&crypto);
+    let mut verifier = PeerVerifier::new();
     for (peer, config) in &config.peers {
         let spki = SubjectPublicKeyInfoDer::from_pem_slice(config.pubkey.as_bytes())
             .with_context(|| "Failed to parse public key for peer {peer_id}")?;

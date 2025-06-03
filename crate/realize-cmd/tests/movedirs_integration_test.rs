@@ -56,8 +56,8 @@ impl Fixture {
 
         let keys = test_keys();
 
-        let (crypto, verifier): (Arc<rustls::crypto::CryptoProvider>, Arc<PeerVerifier>) =
-            setup_crypto_and_verifier();
+        let verifier = setup_verifier();
+        let crypto = security::default_provider();
         let privkey_a = crypto
             .key_provider
             .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_a_path.as_ref())?)?;
@@ -590,8 +590,8 @@ async fn multiple_directory_ids() -> anyhow::Result<()> {
     create_files(&src_dir2, &[("foo2.txt", "foo2")])?;
 
     let keys = test_keys();
-    let (crypto, verifier): (Arc<rustls::crypto::CryptoProvider>, Arc<PeerVerifier>) =
-        setup_crypto_and_verifier();
+    let verifier = setup_verifier();
+    let crypto = security::default_provider();
     let privkey_a = crypto
         .key_provider
         .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_a_path.as_ref())?)?;
@@ -703,13 +703,13 @@ pub fn dir_content(dir: &assert_fs::fixture::ChildPath) -> anyhow::Result<Vec<Pa
         .collect::<Vec<_>>())
 }
 
-pub fn setup_crypto_and_verifier() -> (Arc<rustls::crypto::CryptoProvider>, Arc<PeerVerifier>) {
-    let crypto = Arc::new(security::default_provider());
+pub fn setup_verifier() -> Arc<PeerVerifier> {
     let keys = test_keys();
-    let mut verifier = PeerVerifier::new(&crypto);
+    let mut verifier = PeerVerifier::new();
     verifier.add_peer(SubjectPublicKeyInfoDer::from_pem_file(&keys.pubkey_a_path).unwrap());
     verifier.add_peer(SubjectPublicKeyInfoDer::from_pem_file(&keys.pubkey_b_path).unwrap());
-    (crypto, Arc::new(verifier))
+
+    Arc::new(verifier)
 }
 
 /// Write configuration to file in tempdir and return it.
