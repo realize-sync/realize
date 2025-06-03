@@ -4,10 +4,12 @@ use anyhow::Context as _;
 use clap::Parser;
 use futures_util::stream::StreamExt as _;
 use prometheus::{register_int_counter, IntCounter};
-use realize_lib::model::LocalArena;
+use realize_lib::model::{Arena, LocalArena, Peer};
+use realize_lib::network::config::PeerConfig;
 use realize_lib::network::rpc::realize::metrics;
 use realize_lib::network::security::{self, PeerVerifier};
 use realize_lib::network::tcp::{self, HostPort};
+use realize_lib::storage::config::ArenaConfig;
 use realize_lib::storage::real::LocalStorage;
 use realize_lib::utils::logging;
 use rustls::pki_types::pem::PemObject;
@@ -15,6 +17,7 @@ use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use rustls::sign::SigningKey;
 use serde::Deserialize;
 use signal_hook_tokio::Signals;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fs, process};
@@ -22,7 +25,7 @@ use std::{fs, process};
 /// Run the realize daemon in the foreground.
 ///
 /// Exposes the realize RPC service at the given address. The RPC
-/// service gives access to the directories configured in the YAML
+/// service gives access to the directories configured in the TOML
 /// configuration file to known peers. Stop it with SIGTERM.
 ///
 /// By default, outputs errors and warnings to stderr. To configure
@@ -39,7 +42,7 @@ struct Cli {
     #[arg(long)]
     privkey: PathBuf,
 
-    /// Path to the YAML configuration file
+    /// Path to the TOML configuration file
     #[arg(long)]
     config: PathBuf,
 
@@ -48,23 +51,11 @@ struct Cli {
     metrics_addr: Option<String>,
 }
 
-/// Config file structure (stub, to be expanded)
+/// Config file structure
 #[derive(Debug, Deserialize)]
 struct Config {
-    dirs: Vec<DirEntry>,
-    peers: Vec<PeerEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DirEntry {
-    #[serde(flatten)]
-    map: std::collections::HashMap<String, String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PeerEntry {
-    #[serde(flatten)]
-    map: std::collections::HashMap<String, String>,
+    arenas: HashMap<Arena, ArenaConfig>,
+    peers: HashMap<Peer, PeerConfig>,
 }
 
 lazy_static::lazy_static! {
@@ -85,29 +76,25 @@ async fn main() {
 
 async fn execute(cli: Cli) -> anyhow::Result<()> {
     let config = parse_config(&cli.config)
-        .with_context(|| format!("{}: failed to read YAML config file", cli.config.display()))?;
+        .with_context(|| format!("{}: failed to read TOML config file", cli.config.display()))?;
 
     // LocalArena access checks (see spec/future.md #daemonaccess)
-    check_directory_access(&config.dirs)?;
+    check_directory_access(&config.arenas)?;
 
     // Build directory list
     let mut dirs = Vec::new();
-    for dir in &config.dirs {
-        for (id, path) in &dir.map {
-            dirs.push(LocalArena::new(&id.as_str().into(), path.as_ref()));
-        }
+    for (arena, config) in &config.arenas {
+        dirs.push(LocalArena::new(arena, &config.path));
     }
     let dirs = LocalStorage::new(dirs);
 
     // Build PeerVerifier
     let crypto = Arc::new(security::default_provider());
     let mut verifier = PeerVerifier::new(&crypto);
-    for peer in &config.peers {
-        for (peer_id, pubkey_pem) in &peer.map {
-            let spki = SubjectPublicKeyInfoDer::from_pem_slice(pubkey_pem.as_bytes())
-                .with_context(|| "Failed to parse public key for peer {peer_id}")?;
-            verifier.add_peer_with_id(spki, peer_id);
-        }
+    for (peer, config) in &config.peers {
+        let spki = SubjectPublicKeyInfoDer::from_pem_slice(config.pubkey.as_bytes())
+            .with_context(|| "Failed to parse public key for peer {peer_id}")?;
+        verifier.add_peer_with_id(spki, &peer.to_string());
     }
     let verifier = Arc::new(verifier);
 
@@ -152,51 +139,53 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
 }
 
 /// Checks that all directories in the config file are accessible.
-fn check_directory_access(dirs: &Vec<DirEntry>) -> anyhow::Result<()> {
-    for dir in dirs {
-        for (id, path) in &dir.map {
-            log::debug!("Checking directory {}: {}", id, path);
-            let path = std::path::Path::new(path);
-            if !path.exists() {
-                anyhow::bail!(
-                    "LocalArena '{}' (id: {}) does not exist",
-                    path.display(),
-                    id
-                );
-            }
-            if !fs::metadata(path)
-                .and_then(|m| Ok(m.is_dir()))
-                .unwrap_or(false)
-            {
-                anyhow::bail!("Path '{}' (id: {}) is not a directory", path.display(), id);
-            }
+fn check_directory_access(arenas: &HashMap<Arena, ArenaConfig>) -> anyhow::Result<()> {
+    for (arena, config) in arenas {
+        let path = &config.path;
+        log::debug!("Checking directory {}: {}", arena, config.path.display());
+        if !path.exists() {
+            anyhow::bail!(
+                "LocalArena '{}' (id: {}) does not exist",
+                path.display(),
+                arena
+            );
+        }
+        if !fs::metadata(path)
+            .and_then(|m| Ok(m.is_dir()))
+            .unwrap_or(false)
+        {
+            anyhow::bail!(
+                "Path '{}' (id: {}) is not a directory",
+                path.display(),
+                arena
+            );
+        }
 
-            // Check read access
-            if fs::read_dir(path).is_err() {
-                anyhow::bail!(
-                    "No read access to directory '{}' (id: {})",
-                    path.display(),
-                    id
-                );
-            }
+        // Check read access
+        if fs::read_dir(path).is_err() {
+            anyhow::bail!(
+                "No read access to directory '{}' (id: {})",
+                path.display(),
+                arena
+            );
+        }
 
-            // Check write access (warn only)
-            let testfile = path.join(".realize_write_test");
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&testfile)
-            {
-                Ok(_) => {
-                    let _ = fs::remove_file(&testfile);
-                }
-                Err(_) => {
-                    log::warn!(
-                        "No write access to directory '{}' (id: {})",
-                        path.display(),
-                        id
-                    );
-                }
+        // Check write access (warn only)
+        let testfile = path.join(".realize_write_test");
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&testfile)
+        {
+            Ok(_) => {
+                let _ = fs::remove_file(&testfile);
+            }
+            Err(_) => {
+                log::warn!(
+                    "No write access to directory '{}' (id: {})",
+                    path.display(),
+                    arena
+                );
             }
         }
     }
@@ -206,9 +195,8 @@ fn check_directory_access(dirs: &Vec<DirEntry>) -> anyhow::Result<()> {
 
 fn parse_config(path: &Path) -> anyhow::Result<Config> {
     let content = fs::read_to_string(path)?;
-    let config = serde_yaml::from_str(&content)?;
 
-    Ok(config)
+    Ok(toml::from_str(&content)?)
 }
 
 fn load_private_key_file(path: &Path) -> anyhow::Result<Arc<dyn SigningKey>> {

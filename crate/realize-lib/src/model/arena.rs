@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 #[derive(
     Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
 )]
+#[serde(transparent)]
 pub struct Arena {
     name: String,
 }

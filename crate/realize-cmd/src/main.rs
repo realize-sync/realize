@@ -10,6 +10,8 @@ use progress::CliProgress;
 use prometheus::{register_int_counter, IntCounter};
 use realize_lib::logic::consensus::movedirs::MoveFileError;
 use realize_lib::model::Arena;
+use realize_lib::model::Peer;
+use realize_lib::network::config::PeerConfig;
 use realize_lib::network::rpc::realize::metrics;
 use realize_lib::network::security::{self, PeerVerifier};
 use realize_lib::network::tcp::{self, ClientConnectionState, HostPort, TcpRealizeServiceClient};
@@ -18,6 +20,8 @@ use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use rustls::sign::SigningKey;
 use signal_hook_tokio::Signals;
+use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
@@ -52,13 +56,19 @@ lazy_static::lazy_static! {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about=None)]
 struct Cli {
-    /// Address of the source RPC server instance (host:port).
+    /// Name of the source peer.
+    ///
+    /// The peer name and address must be listed in the file passed to
+    /// --config.
     #[arg(long, required = false)]
-    src_addr: String,
+    src: String,
 
-    /// Address of the destination RPC server instance (host:port).
+    /// Name of the destination peer.
+    ///
+    /// The peer name and address must be listed in the file passed to
+    /// --config.
     #[arg(long, required = false)]
-    dst_addr: String,
+    dst: String,
 
     /// Path to the private key used to identify this command to the
     /// RPC servers.
@@ -68,12 +78,12 @@ struct Cli {
     #[arg(long, required = true)]
     privkey: PathBuf,
 
-    /// Path to the PEM file with one or more server public keys.
+    /// Path to a TOML config file defining the peers.
     ///
     /// The command only connects to known servers, whose public key
     /// is listed in this file.
     #[arg(long, required = true)]
-    peers: PathBuf,
+    config: PathBuf,
 
     /// IDs of the directories to process.
     ///
@@ -120,6 +130,12 @@ struct Cli {
     /// Throttle uploads (writing to dst) in bytes/sec.
     #[arg(long, required = false, value_parser = |s: &str| parse_bytes(s))]
     throttle_up: Option<u64>,
+}
+
+/// Config file structure
+#[derive(Debug, serde::Deserialize)]
+struct Config {
+    peers: HashMap<Peer, PeerConfig>,
 }
 
 /// Parse byte arguments
@@ -176,8 +192,16 @@ async fn execute(cli: &Cli) -> anyhow::Result<i32> {
     let privkey = load_private_key_file(&cli.privkey)
         .with_context(|| format!("{}: Invalid private key file", cli.privkey.display()))?;
 
-    let verifier = build_peer_verifier(&cli.peers)
-        .with_context(|| format!("{}: Invalid peer file", cli.peers.display()))?;
+    let config = parse_config(&cli.config)
+        .with_context(|| format!("{}: failed to read TOML config file", cli.config.display()))?;
+
+    let verifier = build_peer_verifier(&config)?;
+    let src_addr = peer_address(&config, &cli.src)
+        .await
+        .with_context(|| format!("invalid --src"))?;
+    let dst_addr = peer_address(&config, &cli.dst)
+        .await
+        .with_context(|| format!("invalid --dst"))?;
 
     let mut signals = Signals::new(&[
         signal_hook::consts::SIGHUP,
@@ -191,7 +215,7 @@ async fn execute(cli: &Cli) -> anyhow::Result<i32> {
     let output_mode = cli.output;
 
     tokio::select!(
-    ret = run_with_progress(cli, ctx, privkey, verifier, &mut cli_progress) => {
+        ret = run_with_progress(cli, src_addr, dst_addr, ctx, privkey, verifier, &mut cli_progress) => {
         ret.map(|_| 0)
     }
     _ = signals.next() => {
@@ -205,6 +229,8 @@ async fn execute(cli: &Cli) -> anyhow::Result<i32> {
 
 async fn run_with_progress(
     cli: &Cli,
+    src_addr: HostPort,
+    dst_addr: HostPort,
     ctx: context::Context,
     privkey: Arc<dyn SigningKey>,
     verifier: Arc<PeerVerifier>,
@@ -220,16 +246,16 @@ async fn run_with_progress(
         async move {
             let (src_client, dst_client) = tokio::join!(
                 connect(
-                    "--src-addr",
-                    &cli.src_addr,
+                    "--src",
+                    &src_addr,
                     None,
                     privkey.clone(),
                     verifier.clone(),
                     src_watch_tx,
                 ),
                 connect(
-                    "--dst-addr",
-                    &cli.dst_addr,
+                    "--dst",
+                    &dst_addr,
                     cli.throttle_up,
                     privkey,
                     verifier,
@@ -351,7 +377,7 @@ async fn run_with_progress(
 
 async fn connect(
     argument: &str,
-    addr: &str,
+    addr: &HostPort,
     limit: Option<u64>,
     privkey: Arc<dyn SigningKey>,
     verifier: Arc<PeerVerifier>,
@@ -360,9 +386,6 @@ async fn connect(
     realize_lib::network::rpc::realize::RealizeServiceClient<tcp::TcpStub>,
     anyhow::Error,
 > {
-    let addr = HostPort::parse(addr)
-        .await
-        .with_context(|| format!("Failed to resolve {} {}", argument, addr))?;
     let mut options = tcp::ClientOptions::default();
     if let Some(limit) = limit {
         log::info!("Throttling uploads: {}/s", HumanBytes(limit));
@@ -427,25 +450,35 @@ fn load_private_key_file(path: &Path) -> anyhow::Result<Arc<dyn SigningKey>> {
         .load_private_key(key)?)
 }
 
-fn build_peer_verifier(path: &Path) -> anyhow::Result<Arc<PeerVerifier>> {
+fn build_peer_verifier(config: &Config) -> anyhow::Result<Arc<PeerVerifier>> {
     let crypto = Arc::new(security::default_provider());
     let mut verifier = PeerVerifier::new(&crypto);
-    add_peers_from_file(path, &mut verifier)?;
 
+    for (peer, config) in &config.peers {
+        let spki = SubjectPublicKeyInfoDer::from_pem_slice(config.pubkey.as_bytes())
+            .with_context(|| "Failed to parse public key for peer {peer}")?;
+        verifier.add_peer_with_id(spki, &peer.to_string());
+    }
     Ok(Arc::new(verifier))
 }
 
-fn add_peers_from_file(path: &Path, verifier: &mut PeerVerifier) -> anyhow::Result<()> {
-    let mut got_peer = false;
+async fn peer_address(config: &Config, peer: &str) -> anyhow::Result<HostPort> {
+    let peer = Peer::from(peer.to_string());
+    let config = config.peers.get(&peer).ok_or(anyhow::anyhow!(
+        "no peer named {peer} found in the configuration"
+    ))?;
+    let address = config
+        .address
+        .as_ref()
+        .ok_or(anyhow::anyhow!("no address for peer {peer}"))?;
 
-    for spki in SubjectPublicKeyInfoDer::pem_file_iter(path)? {
-        verifier.add_peer(spki?);
-        got_peer = true;
-    }
+    Ok(HostPort::parse(&address)
+        .await
+        .with_context(|| format!("invalid address configured for {peer}"))?)
+}
 
-    if !got_peer {
-        anyhow::bail!("No PEM-encoded public key found");
-    }
+fn parse_config(path: &Path) -> anyhow::Result<Config> {
+    let content = fs::read_to_string(path)?;
 
-    Ok(())
+    Ok(toml::from_str(&content)?)
 }

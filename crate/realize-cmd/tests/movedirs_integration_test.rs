@@ -10,6 +10,7 @@ use realize_lib::storage::real::LocalStorage;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use std::fs;
+use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Output;
@@ -36,8 +37,8 @@ pub struct Fixture {
     pub src_dir: ChildPath,
     pub dst_dir: ChildPath,
     pub keys: TestKeys,
-    pub src_addr: String,
-    pub dst_addr: String,
+    pub src_addr: SocketAddr,
+    pub dst_addr: SocketAddr,
     _shutdown_src: tokio::sync::broadcast::Sender<()>,
     _shutdown_dst: tokio::sync::broadcast::Sender<()>,
 }
@@ -54,6 +55,7 @@ impl Fixture {
         dst_dir.create_dir_all()?;
 
         let keys = test_keys();
+
         let (crypto, verifier): (Arc<rustls::crypto::CryptoProvider>, Arc<PeerVerifier>) =
             setup_crypto_and_verifier();
         let privkey_a = crypto
@@ -62,14 +64,14 @@ impl Fixture {
         let privkey_b = crypto
             .key_provider
             .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_b_path.as_ref())?)?;
-        let (src_addr3, shutdown_src) = tcp::start_server(
+        let (src_addr, shutdown_src) = tcp::start_server(
             &HostPort::parse("127.0.0.1:0").await?,
             LocalStorage::single(&"dir".into(), src_dir.path()),
             verifier.clone(),
             privkey_a.clone(),
         )
         .await?;
-        let (dst_addr3, shutdown_dst) = tcp::start_server(
+        let (dst_addr, shutdown_dst) = tcp::start_server(
             &HostPort::parse("127.0.0.1:0").await?,
             LocalStorage::single(&"dir".into(), dst_dir.path()),
             verifier.clone(),
@@ -82,33 +84,38 @@ impl Fixture {
             src_dir,
             dst_dir,
             keys,
-            src_addr: src_addr3.to_string(),
-            dst_addr: dst_addr3.to_string(),
+            src_addr,
+            dst_addr,
             _shutdown_src: shutdown_src,
             _shutdown_dst: shutdown_dst,
         })
     }
 
     /// A command with all required args.
-    pub fn command(&self) -> Command {
+    pub fn command(&self) -> anyhow::Result<Command> {
         let mut cmd = Command::new(command_path());
-        cmd.arg("--src-addr")
-            .arg(&self.src_addr)
-            .arg("--dst-addr")
-            .arg(&self.dst_addr)
+        cmd.arg("--config")
+            .arg(write_config(
+                self.tempdir.child("config.toml"),
+                self.src_addr,
+                self.dst_addr,
+                &self.keys,
+            )?)
+            .arg("--src")
+            .arg("a")
+            .arg("--dst")
+            .arg("b")
             .arg("--privkey")
             .arg(self.keys.privkey_a_path.as_ref())
-            .arg("--peers")
-            .arg(&self.keys.peers_path)
             .arg("dir")
             .kill_on_drop(true);
 
-        cmd
+        Ok(cmd)
     }
 
     /// A command with extra arguments.
     pub async fn run_with_args(&self, args: Vec<&str>) -> anyhow::Result<Output> {
-        let mut cmd = self.command();
+        let mut cmd = self.command()?;
         for arg in args {
             cmd.arg(arg);
         }
@@ -119,7 +126,7 @@ impl Fixture {
 
     /// Run the command and return its output.
     pub async fn run(&self) -> anyhow::Result<Output> {
-        Ok(self.command().output().await?)
+        Ok(self.command()?.output().await?)
     }
 }
 
@@ -305,7 +312,7 @@ async fn log_output_events() -> anyhow::Result<()> {
     )?;
     // Run with --output log, clear RUST_LOG so code sets it
     let output = fixture
-        .command()
+        .command()?
         .arg("--output")
         .arg("log")
         .env_remove("RUST_LOG")
@@ -371,7 +378,7 @@ async fn systemd_log_output_format() -> anyhow::Result<()> {
     let fixture = Fixture::setup().await?;
     create_files(&fixture.src_dir, &[("foo.txt", "bar")])?;
     let output = fixture
-        .command()
+        .command()?
         .arg("--output")
         .arg("log")
         .env_remove("RUST_LOG")
@@ -429,7 +436,7 @@ async fn realize_metrics_export() -> anyhow::Result<()> {
     // hang by giving it an address that won't ever answer.
     let realize_metrics_addr = metrics_addr.clone();
     let mut child = fixture
-        .command()
+        .command()?
         .arg("--metrics-addr")
         .arg(&realize_metrics_addr)
         .env(
@@ -515,7 +522,7 @@ async fn realize_metrics_pushgateway() -> anyhow::Result<()> {
 
     // Run realize with pushgateway
     let output = fixture
-        .command()
+        .command()?
         .arg("--metrics-pushgateway")
         .arg(format!("http://{}/", pushgw_addr))
         .arg("--metrics-job")
@@ -541,7 +548,7 @@ async fn set_rate_limits() -> anyhow::Result<()> {
 
     create_files(&fixture.src_dir, &[("foo.txt", "hello")])?;
     let output = fixture
-        .command()
+        .command()?
         .arg("--throttle-down")
         .arg("2k")
         .arg("--throttle-up")
@@ -620,14 +627,19 @@ async fn multiple_directory_ids() -> anyhow::Result<()> {
 
     // Run realize with two directory ids
     let output = tokio::process::Command::new(command_path())
-        .arg("--src-addr")
-        .arg(src_addr.to_string())
-        .arg("--dst-addr")
-        .arg(dst_addr.to_string())
+        .arg("--config")
+        .arg(write_config(
+            tempdir.child("config.toml"),
+            src_addr,
+            dst_addr,
+            &keys,
+        )?)
+        .arg("--src")
+        .arg("a")
+        .arg("--dst")
+        .arg("b")
         .arg("--privkey")
         .arg(keys.privkey_a_path.as_ref())
-        .arg("--peers")
-        .arg(&keys.peers_path)
         .arg("dir1")
         .arg("dir2")
         .output()
@@ -660,7 +672,6 @@ pub struct TestKeys {
     pub privkey_b_path: Arc<PathBuf>,
     pub pubkey_a_path: PathBuf,
     pub pubkey_b_path: PathBuf,
-    pub peers_path: PathBuf,
 }
 
 pub fn test_keys() -> TestKeys {
@@ -671,7 +682,6 @@ pub fn test_keys() -> TestKeys {
         privkey_b_path: Arc::new(resources.join("b.key")),
         pubkey_a_path: resources.join("a-spki.pem"),
         pubkey_b_path: resources.join("b-spki.pem"),
-        peers_path: resources.join("peers.pem"),
     }
 }
 
@@ -700,4 +710,34 @@ pub fn setup_crypto_and_verifier() -> (Arc<rustls::crypto::CryptoProvider>, Arc<
     verifier.add_peer(SubjectPublicKeyInfoDer::from_pem_file(&keys.pubkey_a_path).unwrap());
     verifier.add_peer(SubjectPublicKeyInfoDer::from_pem_file(&keys.pubkey_b_path).unwrap());
     (crypto, Arc::new(verifier))
+}
+
+/// Write configuration to file in tempdir and return it.
+pub fn write_config(
+    tempfile: ChildPath,
+    src_addr: SocketAddr,
+    dst_addr: SocketAddr,
+    keys: &TestKeys,
+) -> anyhow::Result<PathBuf> {
+    tempfile.write_str(&format!(
+        r#"
+[peers.a]
+address = "{}"
+pubkey = """
+{}
+"""
+
+[peers.b]
+address = "{}"
+pubkey = """
+{}
+"""
+"#,
+        src_addr.to_string(),
+        fs::read_to_string(&keys.pubkey_a_path)?,
+        dst_addr.to_string(),
+        fs::read_to_string(&keys.pubkey_b_path)?,
+    ))?;
+
+    Ok(tempfile.to_path_buf())
 }

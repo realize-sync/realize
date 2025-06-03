@@ -54,7 +54,7 @@ impl Fixture {
 
         let resources = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
             .join("../../resources/test");
-        let config_file = temp_dir.child("config.yaml").to_path_buf();
+        let config_file = temp_dir.child("config.toml").to_path_buf();
         write_config_file(&config_file, testdir.path(), &resources.join("a-spki.pem"))?;
 
         Ok(Self {
@@ -310,18 +310,21 @@ fn write_config_file(
     testdir_server: &Path,
     pubkey_file: &Path,
 ) -> anyhow::Result<()> {
-    // Write config YAML
-    let config_yaml = format!(
-        r#"dirs:
-  - testdir: {}
-peers:
-  - testpeer: |
-      {}
+    // Write config TOML
+    let config_toml = format!(
+        r#"
+[arenas]
+testdir.path = "{}"
+
+[peers]
+testpeer.pubkey = """
+{}
+"""
 "#,
         testdir_server.display(),
-        std::fs::read_to_string(pubkey_file)?.replace("\n", "\n      ")
+        std::fs::read_to_string(pubkey_file)?
     );
-    std::fs::write(config_file, config_yaml)?;
+    std::fs::write(config_file, config_toml)?;
 
     Ok(())
 }
