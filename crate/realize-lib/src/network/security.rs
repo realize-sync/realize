@@ -1,13 +1,16 @@
 #[cfg(test)]
 pub(crate) mod testing;
 
+use anyhow::Context as _;
 use rustls::client::danger::ServerCertVerifier;
 use rustls::client::Resumption;
-use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
+use rustls::crypto::WebPkiSupportedAlgorithms;
+use rustls::pki_types::pem::PemObject as _;
+use rustls::pki_types::SubjectPublicKeyInfoDer;
 use rustls::sign::{CertifiedKey, SigningKey};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, Error, ServerConfig};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use std::sync::Arc;
 use tokio_rustls::rustls::{self, server::danger::ClientCertVerifier};
@@ -16,6 +19,8 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 pub use rustls::crypto::aws_lc_rs::default_provider;
 
 use crate::model::Peer;
+
+use super::config::PeerConfig;
 
 /// Create a TlsAcceptor (server-side) for the given peers and private key.
 pub(crate) fn make_tls_acceptor(
@@ -55,16 +60,27 @@ pub struct PeerVerifier {
 }
 
 impl PeerVerifier {
+    /// Create a new, empty verifier
     pub fn new() -> Self {
-        PeerVerifier::with_crypto(Arc::new(default_provider()))
+        {
+            let crypto = Arc::new(default_provider());
+            Self {
+                allowed_peers: BTreeMap::new(),
+                algos: crypto.signature_verification_algorithms,
+            }
+        }
     }
 
-    /// Create a new, empty verifier.
-    pub fn with_crypto(crypto: Arc<CryptoProvider>) -> Self {
-        Self {
-            allowed_peers: BTreeMap::new(),
-            algos: crypto.signature_verification_algorithms,
+    /// Create a verifier and fill it from [PeerConfig] instances.
+    pub fn from_config(peers: &HashMap<Peer, PeerConfig>) -> anyhow::Result<Arc<Self>> {
+        let mut verifier = Self::new();
+        for (peer, config) in peers {
+            let spki = SubjectPublicKeyInfoDer::from_pem_slice(config.pubkey.as_bytes())
+                .with_context(|| "Failed to parse public key for peer {peer}")?;
+            verifier.add_peer(peer, spki);
         }
+
+        Ok(Arc::new(verifier))
     }
 
     /// Accept connections to the peer with the given public key and ID.

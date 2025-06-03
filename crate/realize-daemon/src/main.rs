@@ -13,7 +13,7 @@ use realize_lib::storage::config::ArenaConfig;
 use realize_lib::storage::real::LocalStorage;
 use realize_lib::utils::logging;
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
+use rustls::pki_types::PrivateKeyDer;
 use rustls::sign::SigningKey;
 use serde::Deserialize;
 use signal_hook_tokio::Signals;
@@ -88,15 +88,7 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
     }
     let dirs = LocalStorage::new(dirs);
 
-    // Build PeerVerifier
-    let mut verifier = PeerVerifier::new();
-    for (peer, config) in &config.peers {
-        let spki = SubjectPublicKeyInfoDer::from_pem_slice(config.pubkey.as_bytes())
-            .with_context(|| "Failed to parse public key for peer {peer_id}")?;
-        verifier.add_peer(peer, spki);
-    }
-    let verifier = Arc::new(verifier);
-
+    let verifier = PeerVerifier::from_config(&config.peers)?;
     let privkey = load_private_key_file(&cli.privkey)
         .with_context(|| format!("{}: Failed to parse private key", cli.privkey.display()))?;
 

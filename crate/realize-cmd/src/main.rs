@@ -17,7 +17,7 @@ use realize_lib::network::security::{self, PeerVerifier};
 use realize_lib::network::tcp::{self, ClientConnectionState, HostPort, TcpRealizeServiceClient};
 use realize_lib::utils::logging;
 use rustls::pki_types::pem::PemObject as _;
-use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
+use rustls::pki_types::PrivateKeyDer;
 use rustls::sign::SigningKey;
 use signal_hook_tokio::Signals;
 use std::collections::HashMap;
@@ -195,7 +195,7 @@ async fn execute(cli: &Cli) -> anyhow::Result<i32> {
     let config = parse_config(&cli.config)
         .with_context(|| format!("{}: failed to read TOML config file", cli.config.display()))?;
 
-    let verifier = build_peer_verifier(&config)?;
+    let verifier = PeerVerifier::from_config(&config.peers)?;
     let src_addr = peer_address(&config, &cli.src)
         .await
         .with_context(|| format!("invalid --src"))?;
@@ -448,17 +448,6 @@ fn load_private_key_file(path: &Path) -> anyhow::Result<Arc<dyn SigningKey>> {
     Ok(security::default_provider()
         .key_provider
         .load_private_key(key)?)
-}
-
-fn build_peer_verifier(config: &Config) -> anyhow::Result<Arc<PeerVerifier>> {
-    let mut verifier = PeerVerifier::new();
-
-    for (peer, config) in &config.peers {
-        let spki = SubjectPublicKeyInfoDer::from_pem_slice(config.pubkey.as_bytes())
-            .with_context(|| "Failed to parse public key for peer {peer}")?;
-        verifier.add_peer(peer, spki);
-    }
-    Ok(Arc::new(verifier))
 }
 
 async fn peer_address(config: &Config, peer: &str) -> anyhow::Result<HostPort> {
