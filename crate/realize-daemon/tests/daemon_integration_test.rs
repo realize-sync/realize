@@ -9,6 +9,7 @@ use assert_fs::TempDir;
 use predicates::prelude::*;
 use realize_lib::model;
 use realize_lib::model::Arena;
+use realize_lib::model::Peer;
 use realize_lib::network::rpc::realize::Options;
 use realize_lib::network::security;
 use realize_lib::network::security::PeerVerifier;
@@ -104,9 +105,10 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
 
     // Connect to the port the daemon listens to.
     let mut verifier = PeerVerifier::new();
-    verifier.add_peer(SubjectPublicKeyInfoDer::from_pem_file(
-        fixture.resources.join("a-spki.pem"),
-    )?);
+    verifier.add_peer(
+        &Peer::from("a"),
+        SubjectPublicKeyInfoDer::from_pem_file(fixture.resources.join("a-spki.pem"))?,
+    );
     let verifier = Arc::new(verifier);
 
     let client = tcp::connect_client(

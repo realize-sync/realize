@@ -13,6 +13,12 @@ impl From<String> for Peer {
     }
 }
 
+impl From<&str> for Peer {
+    fn from(value: &str) -> Self {
+        Peer(value.to_string())
+    }
+}
+
 impl fmt::Display for Peer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)

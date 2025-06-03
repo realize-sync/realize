@@ -378,8 +378,9 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
-    use crate::model::Arena;
+    use crate::model::{Arena, Peer};
     use crate::network::rpc::realize::{Config, Options};
+    use crate::network::security::testing;
     use crate::utils::async_utils::AbortOnDrop;
     use assert_fs::TempDir;
     use rustls::pki_types::PrivateKeyDer;
@@ -391,8 +392,7 @@ mod tests {
     ) -> anyhow::Result<(SocketAddr, tokio::sync::broadcast::Sender<()>, TempDir)> {
         let temp = TempDir::new()?;
         let dirs = LocalStorage::single(&Arena::from("testdir"), temp.path());
-        let server_privkey =
-            load_private_key(crate::network::security::testing::server_private_key())?;
+        let server_privkey = load_private_key(testing::server_private_key())?;
         let (addr, shutdown) = start_server(
             &HostPort::parse("127.0.0.1:0").await?,
             dirs,
@@ -407,22 +407,22 @@ mod tests {
     // Helper to create a PeerVerifier with only the server key
     fn verifier_server_only() -> Arc<PeerVerifier> {
         let mut verifier = PeerVerifier::new();
-        verifier.add_peer(crate::network::security::testing::server_public_key());
+        verifier.add_peer(&Peer::from("server"), testing::server_public_key());
         Arc::new(verifier)
     }
 
     // Helper to create a PeerVerifier with only the client key
     fn verifier_client_only() -> Arc<PeerVerifier> {
         let mut verifier = PeerVerifier::new();
-        verifier.add_peer(crate::network::security::testing::client_public_key());
+        verifier.add_peer(&Peer::from("client"), testing::client_public_key());
         Arc::new(verifier)
     }
 
     // Helper to create a PeerVerifier with both keys
     fn verifier_both() -> Arc<PeerVerifier> {
         let mut verifier = PeerVerifier::new();
-        verifier.add_peer(crate::network::security::testing::client_public_key());
-        verifier.add_peer(crate::network::security::testing::server_public_key());
+        verifier.add_peer(&Peer::from("client"), testing::client_public_key());
+        verifier.add_peer(&Peer::from("server"), testing::server_public_key());
         Arc::new(verifier)
     }
 
@@ -438,8 +438,7 @@ mod tests {
     async fn tarpc_tcp_connect() -> anyhow::Result<()> {
         let verifier = verifier_both();
         let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
-        let client_privkey =
-            load_private_key(crate::network::security::testing::client_private_key())?;
+        let client_privkey = load_private_key(testing::client_private_key())?;
         let client = connect_client(
             &HostPort::from(addr),
             verifier_both(),
@@ -462,8 +461,7 @@ mod tests {
     async fn tarpc_tcp_reject_bad_tag() -> anyhow::Result<()> {
         let verifier = verifier_both();
         let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
-        let client_privkey =
-            load_private_key(crate::network::security::testing::client_private_key())?;
+        let client_privkey = load_private_key(testing::client_private_key())?;
 
         let connector = security::make_tls_connector(verifier_both(), client_privkey)?;
         let stream = TcpStream::connect(addr).await?;
@@ -482,8 +480,7 @@ mod tests {
     async fn client_not_in_server_verifier_fails() -> anyhow::Result<()> {
         let verifier = verifier_server_only();
         let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await.unwrap();
-        let client_privkey =
-            load_private_key(crate::network::security::testing::client_private_key())?;
+        let client_privkey = load_private_key(testing::client_private_key())?;
         let client_result = connect_client(
             &HostPort::from(addr),
             Arc::clone(&verifier),
@@ -512,8 +509,7 @@ mod tests {
     async fn server_not_in_client_verifier_fails() -> anyhow::Result<()> {
         let verifier = verifier_client_only();
         let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await.unwrap();
-        let client_privkey =
-            load_private_key(crate::network::security::testing::client_private_key())?;
+        let client_privkey = load_private_key(testing::client_private_key())?;
         let result = connect_client(
             &HostPort::from(addr),
             Arc::clone(&verifier),
@@ -534,8 +530,7 @@ mod tests {
         let temp = TempDir::new()?;
         let dirs = LocalStorage::single(&Arena::from("testdir"), temp.path());
         let verifier = verifier_both();
-        let server_privkey =
-            load_private_key(crate::network::security::testing::server_private_key())?;
+        let server_privkey = load_private_key(testing::server_private_key())?;
         let (addr, _handle) = start_server(
             &HostPort::parse("127.0.0.1:0").await?,
             dirs.clone(),
@@ -543,8 +538,7 @@ mod tests {
             server_privkey,
         )
         .await?;
-        let client_privkey =
-            load_private_key(crate::network::security::testing::client_private_key())?;
+        let client_privkey = load_private_key(testing::client_private_key())?;
         let client = connect_client(
             &HostPort::from(addr),
             verifier.clone(),
@@ -574,8 +568,7 @@ mod tests {
         let temp = TempDir::new()?;
         let dirs = LocalStorage::single(&Arena::from("testdir"), temp.path());
         let verifier = verifier_both();
-        let server_privkey =
-            load_private_key(crate::network::security::testing::server_private_key())?;
+        let server_privkey = load_private_key(testing::server_private_key())?;
         let (addr, _handle) = start_server(
             &HostPort::parse("127.0.0.1:0").await?,
             dirs.clone(),
@@ -583,10 +576,8 @@ mod tests {
             server_privkey,
         )
         .await?;
-        let client_privkey1 =
-            load_private_key(crate::network::security::testing::client_private_key())?;
-        let client_privkey2 =
-            load_private_key(crate::network::security::testing::client_private_key())?;
+        let client_privkey1 = load_private_key(testing::client_private_key())?;
+        let client_privkey2 = load_private_key(testing::client_private_key())?;
         let client1 = connect_client(
             &HostPort::from(addr),
             Arc::clone(&verifier),
@@ -628,8 +619,7 @@ mod tests {
         let (proxy_addr, _proxy_handle) =
             proxy_tcp(&addr, shutdown.clone(), connection_count.clone()).await?;
 
-        let client_privkey =
-            load_private_key(crate::network::security::testing::client_private_key())?;
+        let client_privkey = load_private_key(testing::client_private_key())?;
         let client = connect_client(
             &HostPort::from(proxy_addr),
             verifier_both(),
@@ -668,8 +658,7 @@ mod tests {
         let (proxy_addr, _proxy_handle) =
             proxy_tcp(&addr, shutdown.clone(), connection_count.clone()).await?;
 
-        let client_privkey =
-            load_private_key(crate::network::security::testing::client_private_key())?;
+        let client_privkey = load_private_key(testing::client_private_key())?;
         let client = connect_client(
             &HostPort::from(proxy_addr),
             verifier_both(),
@@ -730,7 +719,7 @@ mod tests {
         let client = connect_client(
             &HostPort::from(proxy_addr),
             verifier_both(),
-            load_private_key(crate::network::security::testing::client_private_key())?,
+            load_private_key(testing::client_private_key())?,
             ClientOptions {
                 connection_events: Some(conn_tx),
                 ..ClientOptions::default()
@@ -880,8 +869,7 @@ mod tests {
         let (addr, shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
 
         // Before shutdown, connection succeeds.
-        let client_privkey =
-            load_private_key(crate::network::security::testing::client_private_key())?;
+        let client_privkey = load_private_key(testing::client_private_key())?;
         connect_client(
             &HostPort::from(addr),
             Arc::clone(&verifier_both()),

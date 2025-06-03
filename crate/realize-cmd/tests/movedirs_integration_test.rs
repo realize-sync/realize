@@ -3,6 +3,7 @@ use assert_fs::prelude::*;
 use assert_fs::TempDir;
 use assert_unordered::assert_eq_unordered;
 use hyper_util::rt::TokioIo;
+use realize_lib::model::Peer;
 use realize_lib::model::{Arena, LocalArena};
 use realize_lib::network::security::{self, PeerVerifier};
 use realize_lib::network::tcp::{self, HostPort};
@@ -706,8 +707,14 @@ pub fn dir_content(dir: &assert_fs::fixture::ChildPath) -> anyhow::Result<Vec<Pa
 pub fn setup_verifier() -> Arc<PeerVerifier> {
     let keys = test_keys();
     let mut verifier = PeerVerifier::new();
-    verifier.add_peer(SubjectPublicKeyInfoDer::from_pem_file(&keys.pubkey_a_path).unwrap());
-    verifier.add_peer(SubjectPublicKeyInfoDer::from_pem_file(&keys.pubkey_b_path).unwrap());
+    verifier.add_peer(
+        &Peer::from("a"),
+        SubjectPublicKeyInfoDer::from_pem_file(&keys.pubkey_a_path).unwrap(),
+    );
+    verifier.add_peer(
+        &Peer::from("b"),
+        SubjectPublicKeyInfoDer::from_pem_file(&keys.pubkey_b_path).unwrap(),
+    );
 
     Arc::new(verifier)
 }

@@ -456,7 +456,7 @@ fn build_peer_verifier(config: &Config) -> anyhow::Result<Arc<PeerVerifier>> {
     for (peer, config) in &config.peers {
         let spki = SubjectPublicKeyInfoDer::from_pem_slice(config.pubkey.as_bytes())
             .with_context(|| "Failed to parse public key for peer {peer}")?;
-        verifier.add_peer_with_id(spki, &peer.to_string());
+        verifier.add_peer(peer, spki);
     }
     Ok(Arc::new(verifier))
 }

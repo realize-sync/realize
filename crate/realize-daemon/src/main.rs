@@ -93,7 +93,7 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
     for (peer, config) in &config.peers {
         let spki = SubjectPublicKeyInfoDer::from_pem_slice(config.pubkey.as_bytes())
             .with_context(|| "Failed to parse public key for peer {peer_id}")?;
-        verifier.add_peer_with_id(spki, &peer.to_string());
+        verifier.add_peer(peer, spki);
     }
     let verifier = Arc::new(verifier);
 
