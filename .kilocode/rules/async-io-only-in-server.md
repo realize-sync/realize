@@ -1,8 +1,8 @@
 # Server must only use async FS and I/O operations
 
 Whenever changing code in
-@/crate/realize-lib/src/network/rpc/realize.rs, remember that *all* FS
-or I/O operations must be async.
+[@/crate/realize-lib/src/network/rpc/realize.rs](../../crate/realize-lib/src/network/rpc/realize.rs),
+remember that *all* FS or I/O operations must be async.
 
 * Use async I/O and FS functions instead of sync I/O and FS (see definition below)
 

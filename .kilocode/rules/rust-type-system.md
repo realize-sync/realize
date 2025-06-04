@@ -29,6 +29,8 @@
 ## Examples
 
 ### Good
+(Assume proper imports at the beginning of the file)
+
 ```rust
 /// A generic container that can hold any type implementing `Display`
 /// and can be cloned.

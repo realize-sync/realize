@@ -4,7 +4,7 @@
 
 1. **Test Organization**
    - Place unit tests in the same file as the code being tested
-   - Make sure unit tests cover all cases, avoid relying only no integration tests
+   - Make sure unit tests cover all cases, avoid relying only on integration tests
    - Use integration tests for testing the command line behavior and output
    - Follow the AAA (Arrange-Act-Assert) pattern
 

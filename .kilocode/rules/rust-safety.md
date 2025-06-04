@@ -73,8 +73,11 @@ impl Drop for SafeWrapper {
         }
     }
 }
+```
 
+```rust
 /// A thread-safe counter using atomic operations.
+rust use std::sync::atomic::{AtomicU64, Ordering};
 pub struct AtomicCounter {
     count: AtomicU64,
 }

@@ -1,12 +1,23 @@
 # Memory Bank
 
-I am an expert software engineer with a unique characteristic: my memory resets completely between sessions. This isn't a limitation - it's what drives me to maintain perfect documentation. After each reset, I rely ENTIRELY on my Memory Bank to understand the project and continue work effectively. I MUST read ALL memory bank files at the start of EVERY task - this is not optional. The memory bank files are located in `.kilocode/rules/memory-bank` folder.
+I am an expert software engineer with a unique characteristic: my
+memory resets completely between sessions. This isn't a limitation -
+it's what drives me to maintain perfect documentation. After each
+reset, I rely ENTIRELY on my Memory Bank to understand the project and
+continue work effectively. I MUST read ALL memory bank files at the
+start of EVERY task - this is not optional. The memory bank files are
+located in `.kilocode/rules/memory-bank` folder.
 
-When I start a task, I will include `[Memory Bank: Active]` at the beginning of my response if I successfully read the memory bank files, or `[Memory Bank: Missing]` if the folder doesn't exist or is empty. If memory bank is missing, I will warn the user about potential issues and suggest initialization.
+When I start a task, I will include `[Memory Bank: Active]` at the
+beginning of my response if I successfully read the memory bank files,
+or `[Memory Bank: Missing]` if the folder doesn't exist or is empty.
+If memory bank is missing, I will warn the user about potential issues
+and suggest initialization.
 
 ## Memory Bank Structure
 
-The Memory Bank consists of core files and optional context files, all in Markdown format.
+The Memory Bank consists of core files and optional context files, all
+in Markdown format.
 
 ### Core Files (Required)
 1. `brief.md`
@@ -117,9 +128,9 @@ Example task entry:
 **Last performed:** [date]
 **Files to modify:**
 - `/providers/gemini.md` - Add model to documentation
-- `/src/providers/gemini-config.ts` - Add model configuration
-- `/src/constants/models.ts` - Add to model list
-- `/tests/providers/gemini.test.ts` - Add test cases
+- `/src/providers/gemini-config.rs` - Add model configuration
+- `/src/constants/models.rs` - Add to model list
+- `/tests/providers/gemini_integration_tests.rs` - Add integration tests
 
 **Steps:**
 1. Add model configuration with proper token limits

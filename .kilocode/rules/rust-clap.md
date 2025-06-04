@@ -105,7 +105,7 @@ impl Cli {
     }
 
     /// Execute the command
-    pub async fn execute(&self) -> Result<(), Error> {
+    pub async fn execute(&self) -> anyhow::Result<()> {
         match &self.command {
             Commands::Init { name, version } => {
                 println!("Initializing database {} version {}", name, version);
