@@ -4,7 +4,7 @@
 
 pub mod client;
 
-use crate::{model::Arena, storage::real::HistoryNotification};
+use crate::{model::Arena, storage::real::Notification};
 
 /// Tag that identifies [HistoryService] when connecting.
 pub const TAG: &[u8; 4] = b"HIST";
@@ -17,5 +17,5 @@ pub trait HistoryService {
     async fn arenas() -> Vec<Arena>;
 
     /// Receive a batch of history notifications.
-    async fn notify(batch: Vec<HistoryNotification>);
+    async fn notify(batch: Vec<Notification>);
 }

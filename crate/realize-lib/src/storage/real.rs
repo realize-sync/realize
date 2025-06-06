@@ -13,7 +13,7 @@ use crate::model::{self, Arena};
 use super::config::ArenaConfig;
 
 mod history;
-pub use history::HistoryNotification;
+pub use history::Notification;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum StorageAccess {
@@ -62,7 +62,7 @@ impl LocalStorage {
     pub async fn subscribe(
         &self,
         arena: &Arena,
-        tx: mpsc::Sender<HistoryNotification>,
+        tx: mpsc::Sender<Notification>,
     ) -> anyhow::Result<()> {
         if let Some(resolver) = self.path_resolver(arena, StorageAccess::Read) {
             self.history.subscribe(arena, resolver, tx).await?;
