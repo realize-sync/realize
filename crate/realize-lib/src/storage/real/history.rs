@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fs::Metadata,
     io,
     path::{self, PathBuf},
     time::SystemTime,
@@ -122,7 +123,7 @@ async fn run_collector(
                         log::debug!("watch: {arena}");
                         let root = path_resolver.root().to_path_buf();
                         watched.insert(arena.clone(), ArenaWatch { path_resolver, enabled:false, subscribers: vec![tx] });
-                        spawn_walk_dir(arena, root, new_dirs_tx.clone());
+                        spawn_walk_dir(arena, root, WalkDirMode::Initial, new_dirs_tx.clone());
                     }
                 }
                 continue;
@@ -133,7 +134,7 @@ async fn run_collector(
                         log::debug!("walkdir arena complete {arena}");
                         if let Some(watch) = watched.get_mut(&arena) {
                             log::debug!("got {arena}");
-                            if !watch.enabled {
+                            if !watch.enabled  {
                                 log::debug!("{arena} not enabled");
                                 watch.enabled = true;
 
@@ -166,6 +167,23 @@ async fn run_collector(
                             }
                         }
                     }
+                    WalkDirResult::AddFile(arena, path, metadata) =>{
+                        if let Some(watch) = watched.get(&arena) {
+                            if let Some((PathType::Final, resolved)) = watch.path_resolver.reverse(&path) {
+                                let notification = HistoryNotification::Link {
+                                    arena: arena.clone(),
+                                    path: resolved,
+                                    size: metadata.len(),
+                                    mtime: metadata.modified()
+                                    .expect("OS must support mtime"),
+                                };
+                                for sub in &watch.subscribers {
+                                    // TODO: remove dead subscribers, and then arenas without subscribers.
+                                    let _ = sub.send(notification.clone()).await;
+                                }
+                            }
+                        }
+                    }
                 }
                 continue;
             },
@@ -181,7 +199,9 @@ async fn run_collector(
                     log::debug!("inotify ev: {ev:?}");
                     if let Some(PathWatch { arena, path }) = wd.get(&ev.wd) {
                         if ev.mask.contains(EventMask::CREATE | EventMask::ISDIR) {
-                            new_dirs_tx.send(WalkDirResult::AddDir(arena.clone(), path.clone())).await?;
+                            if let Some(filename) = ev.name {
+                                spawn_walk_dir(arena.clone(), path.join(filename), WalkDirMode::NewDir, new_dirs_tx.clone());
+                            }
                         } else if ev.mask.contains(EventMask::CLOSE_WRITE) {
                             if let Some(filename) = ev.name {
                                 let path = path.join(filename);
@@ -219,12 +239,20 @@ async fn run_collector(
     Ok(())
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WalkDirMode {
+    Initial,
+    NewDir,
+}
+
+#[derive(Clone)]
 enum WalkDirResult {
     AddDir(Arena, PathBuf),
+    AddFile(Arena, PathBuf, Metadata),
     Complete(Arena),
 }
 
-fn spawn_walk_dir(arena: Arena, root: PathBuf, tx: mpsc::Sender<WalkDirResult>) {
+fn spawn_walk_dir(arena: Arena, root: PathBuf, mode: WalkDirMode, tx: mpsc::Sender<WalkDirResult>) {
     tokio::task::spawn_blocking(move || {
         log::debug!("walkdir {arena} {root:?}");
         for entry in WalkDir::new(&root)
@@ -242,10 +270,20 @@ fn spawn_walk_dir(arena: Arena, root: PathBuf, tx: mpsc::Sender<WalkDirResult>) 
                     arena.clone(),
                     root.join(entry.path()),
                 ))?;
+            } else if mode == WalkDirMode::NewDir && entry.file_type().is_file() {
+                if let Ok(metadata) = entry.metadata() {
+                    tx.blocking_send(WalkDirResult::AddFile(
+                        arena.clone(),
+                        root.join(entry.path()),
+                        metadata,
+                    ))?;
+                }
             }
         }
         log::debug!("walkdir {arena} done");
-        tx.blocking_send(WalkDirResult::Complete(arena))?;
+        if mode == WalkDirMode::Initial {
+            tx.blocking_send(WalkDirResult::Complete(arena))?;
+        }
 
         Ok::<(), anyhow::Error>(())
     });
@@ -257,7 +295,7 @@ mod tests {
     use crate::storage::real::LocalStorage;
     use anyhow::Context as _;
     use assert_fs::{
-        prelude::{FileWriteStr as _, PathChild as _},
+        prelude::{FileWriteStr as _, PathChild as _, PathCreateDir as _},
         TempDir,
     };
     use std::time::Duration;
@@ -283,7 +321,7 @@ mod tests {
             Ok(Self {
                 tempdir,
                 arena,
-                storage,
+                _storage: storage,
                 notifications: notifications_rx,
             })
         }
@@ -299,6 +337,7 @@ mod tests {
                 .ok_or(anyhow::anyhow!("channel closed before {}", msg))
         }
     }
+
     #[tokio::test]
     async fn create_file() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
@@ -314,6 +353,35 @@ mod tests {
             HistoryNotification::Link {
                 arena: fixture.arena(),
                 path: Path::parse("child.txt")?,
+                size: 7,
+                mtime: child.metadata()?.modified()?,
+            },
+            fixture.next("child.txt").await?,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_file_in_subdir() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        assert_eq!(
+            HistoryNotification::Ready(fixture.arena()),
+            fixture.next("ready").await?
+        );
+
+        let subdirs = fixture.tempdir.child("subdir1/subdir2");
+        log::debug!("creating subdirs");
+        subdirs.create_dir_all()?;
+        log::debug!("creating subdirs... done");
+        log::debug!("creating child");
+        let child = subdirs.child("child.txt");
+        child.write_str("content")?;
+        log::debug!("creating child... done");
+
+        assert_eq!(
+            HistoryNotification::Link {
+                arena: fixture.arena(),
+                path: Path::parse("subdir1/subdir2/child.txt")?,
                 size: 7,
                 mtime: child.metadata()?.modified()?,
             },
