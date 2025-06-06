@@ -201,8 +201,8 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn partial_and_final_paths() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn partial_and_final_paths() -> anyhow::Result<()> {
         let arena = &Arena::from("test");
         let resolver = LocalStorage::single(arena, &path::Path::new("/doesnotexist/test"))
             .path_resolver(arena, StorageAccess::Read)
@@ -424,8 +424,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn reverse_in_readonly_arena() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn reverse_in_readonly_arena() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let arena = &Arena::from("test");
         let storage = LocalStorage::single(arena, temp.path())
@@ -447,8 +447,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn reverse_in_writable_arena() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn reverse_in_writable_arena() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let arena = &Arena::from("test");
         let storage = LocalStorage::single(arena, temp.path())
