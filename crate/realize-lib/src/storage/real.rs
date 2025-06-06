@@ -6,11 +6,14 @@ use std::{
     sync::Arc,
 };
 
-use tokio::fs;
+use tokio::{fs, sync::mpsc};
 
 use crate::model::{self, Arena};
 
 use super::config::ArenaConfig;
+
+mod history;
+pub use history::HistoryNotification;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum StorageAccess {
@@ -25,9 +28,10 @@ pub enum PathType {
 }
 
 /// Local storage, for all [Arena]s.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LocalStorage {
     map: Arc<HashMap<Arena, PathBuf>>,
+    history: history::History,
 }
 
 impl LocalStorage {
@@ -47,7 +51,24 @@ impl LocalStorage {
     {
         Self {
             map: Arc::new(arenas.into_iter().collect()),
+            // TODO: handle this case
+            history: history::History::new().expect("inotify required"),
         }
+    }
+
+    /// Subscribe to notification for the given arena.
+    ///
+    /// Does nothing if the arena is unknown.
+    pub async fn subscribe(
+        &self,
+        arena: &Arena,
+        tx: mpsc::Sender<HistoryNotification>,
+    ) -> anyhow::Result<()> {
+        if let Some(resolver) = self.path_resolver(arena, StorageAccess::Read) {
+            self.history.subscribe(arena, resolver, tx).await?;
+        }
+
+        Ok(())
     }
 
     /// Define a single local arena.
@@ -195,8 +216,8 @@ fn not_found() -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use assert_fs::{
-        TempDir,
         prelude::{FileWriteStr as _, PathChild as _},
+        TempDir,
     };
 
     use super::*;
