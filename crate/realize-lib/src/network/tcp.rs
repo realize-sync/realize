@@ -4,13 +4,13 @@
 //! It handles TLS setup, peer authentication, DNS resolution, and connection retry logic.
 
 use anyhow::Context as _;
-use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
+use async_speed_limit::Limiter;
 use futures::prelude::*;
 use rustls::pki_types::ServerName;
 use rustls::sign::SigningKey;
-use tarpc::client::RpcError;
 use tarpc::client::stub::Stub;
+use tarpc::client::RpcError;
 use tarpc::context;
 use tokio::io::AsyncReadExt as _;
 use tokio::io::AsyncWriteExt as _;
@@ -32,14 +32,16 @@ use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
 use crate::network::rate_limit::RateLimitedStream;
 use crate::network::reconnect::Connect;
 use crate::network::reconnect::Reconnect;
+use crate::network::rpc;
+use crate::network::rpc::history::{self, HistoryServiceClient};
 use crate::network::rpc::realize;
-use crate::network::rpc::realize::Config;
-use crate::network::rpc::realize::RealizeServiceRequest;
-use crate::network::rpc::realize::RealizeServiceResponse;
 use crate::network::rpc::realize::metrics;
 use crate::network::rpc::realize::metrics::MetricsRealizeClient;
 use crate::network::rpc::realize::metrics::MetricsRealizeServer;
 use crate::network::rpc::realize::server::RealizeServer;
+use crate::network::rpc::realize::Config;
+use crate::network::rpc::realize::RealizeServiceRequest;
+use crate::network::rpc::realize::RealizeServiceResponse;
 use crate::network::rpc::realize::{RealizeService, RealizeServiceClient};
 use crate::network::security;
 use crate::network::security::PeerVerifier;
@@ -141,6 +143,11 @@ pub async fn start_server(
 
     let shutdown_accept_tx = shutdown_tx.downgrade();
     let accept = async move |stream: TcpStream| -> anyhow::Result<()> {
+        let mut shutdown_rx = shutdown_accept_tx
+            .upgrade()
+            .map(|s| s.subscribe())
+            .ok_or(anyhow::anyhow!("Shutdown initiated"))?;
+
         let peer_addr = stream.peer_addr()?;
         let limiter = Limiter::<StandardClock>::new(f64::INFINITY);
         let mut tls_stream = acceptor
@@ -149,48 +156,65 @@ pub async fn start_server(
         // Guards against bugs in the auth code; worth dying
         let peer = verifier
             .connection_peer_id(&tls_stream)
-            .expect("Peer must be known at this point");
+            .expect("Peer must be known at this point")
+            .clone();
         log::info!("Accepted peer {} from {}", peer, peer_addr);
 
         let mut tag = [0u8; 4];
         tls_stream.read_exact(&mut tag).await?;
-        if tag != *realize::TAG {
-            // Log this separately from generic errors; it's
-            // interesting.
-            log::info!("Got unsupported RPC service tag '{tag:?}' from {peer}");
-
-            let _ = tls_stream.shutdown().await;
-            return Err(anyhow::anyhow!("Unknown RPC service tag"));
-        }
-
-        let framed = LengthDelimitedCodec::builder().new_framed(tls_stream);
-        let server = RealizeServer::new_limited(storage.clone(), limiter.clone());
-        if let Some(mut shutdown_rx) = shutdown_accept_tx.upgrade().map(|s| s.subscribe()) {
-            tokio::spawn(async move {
-                let mut stream = Box::pin(
-                    BaseChannel::with_defaults(transport::new(framed, Bincode::default())).execute(
-                        MetricsRealizeServer::new(RealizeServer::serve(server.clone())),
-                    ),
-                );
-                loop {
-                    tokio::select!(
-                        _ = shutdown_rx.recv() => {
-                            log::debug!("Shutting peer connection {}", peer_addr);
-                            break;
-                        }
-                        next = stream.next() => {
-                            match next {
-                                None => {
-                                    break;
-                                },
-                                Some(fut) => {
-                                    tokio::spawn(metrics::track_in_flight_request(fut));
+        match &tag {
+            rpc::realize::TAG => {
+                let framed = LengthDelimitedCodec::builder().new_framed(tls_stream);
+                let server = RealizeServer::new_limited(storage.clone(), limiter.clone());
+                tokio::spawn(async move {
+                    let mut stream = Box::pin(
+                        BaseChannel::with_defaults(transport::new(framed, Bincode::default()))
+                            .execute(MetricsRealizeServer::new(RealizeServer::serve(
+                                server.clone(),
+                            ))),
+                    );
+                    loop {
+                        tokio::select!(
+                            _ = shutdown_rx.recv() => {
+                                log::debug!("Shutting connection to {}", peer);
+                                break;
+                            }
+                            next = stream.next() => {
+                                match next {
+                                    None => {
+                                        break;
+                                    },
+                                    Some(fut) => {
+                                        tokio::spawn(metrics::track_in_flight_request(fut));
+                                    }
                                 }
                             }
-                        }
-                    )
-                }
-            });
+                        )
+                    }
+                });
+            }
+            rpc::history::TAG => {
+                let framed = LengthDelimitedCodec::builder().new_framed(tls_stream);
+                let transport = transport::new(framed, Bincode::default());
+                let channel = tarpc::client::new(Default::default(), transport).spawn();
+                let client = HistoryServiceClient::from(channel);
+
+                let peer = peer.clone();
+                let storage = storage.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = history::client::collect(client, storage, shutdown_rx).await {
+                        log::debug!("{}: history collection failed: {}", peer, err);
+                    }
+                });
+            }
+            _ => {
+                log::info!("Got unsupported RPC service tag '{tag:?}' from {peer}");
+                // We log this separately from generic errors, because
+                // bad tags might highlight peer versioning issues.
+
+                let _ = tls_stream.shutdown().await;
+                return Err(anyhow::anyhow!("Unknown RPC service tag"));
+            }
         }
 
         Ok(())

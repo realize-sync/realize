@@ -1,4 +1,4 @@
-//! Service definition for Realize - Symmetric File Syncer
+//! Service definition for RealizeService
 //!
 //! This module defines the RealizeService trait for use with tarpc 0.36.
 
