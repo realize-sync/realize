@@ -15,15 +15,16 @@ pub(crate) async fn collect<T>(
 where
     T: Stub<Req = HistoryServiceRequest, Resp = HistoryServiceResponse> + Clone,
 {
+    let arenas = client.arenas(context::current()).await?;
+
     let (tx, mut rx) = mpsc::channel(100);
-    for arena in client.arenas(context::current()).await? {
-        storage.subscribe(&arena, tx.clone()).await?;
+    for res in
+        futures::future::join_all(arenas.into_iter().map(|a| storage.subscribe(a, tx.clone())))
+            .await
+    {
+        res?
     }
     drop(tx);
-
-    // TODO:wait for all available arenas to be ready before returning, so
-    // the caller knows that notifications are ready and that it can query
-    // the full list, if it needs it.
 
     // While there are notifications
     loop {

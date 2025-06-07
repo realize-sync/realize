@@ -9,7 +9,10 @@ use std::{
 
 use futures::StreamExt as _;
 use inotify::{Event, EventMask, Inotify, WatchDescriptor, WatchMask, Watches};
-use tokio::{fs, sync::mpsc};
+use tokio::{
+    fs,
+    sync::{mpsc, oneshot},
+};
 use walkdir::WalkDir;
 
 use crate::{
@@ -22,7 +25,6 @@ use super::PathResolver;
 /// Report something happening in arenas of the local file system.
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Notification {
-    Ready(Arena),
     Link {
         arena: Arena,
         path: Path,
@@ -40,7 +42,6 @@ impl Notification {
     fn arena(&self) -> &Arena {
         use Notification::*;
         match self {
-            Ready(arena) => arena,
             Link { arena, .. } => arena,
             Unlink { arena, .. } => arena,
         }
@@ -52,6 +53,9 @@ struct Subscription {
     arena: Arena,
     path_resolver: PathResolver,
     tx: mpsc::Sender<Notification>,
+
+    // Channel to notify when all watches have been created.
+    ready_tx: oneshot::Sender<()>,
 }
 
 /// A file watcher that can be used to get notifications.
@@ -85,19 +89,30 @@ impl History {
     /// Subscribe to notifications for the given arena and root path.
     ///
     /// Dropping the receiver drops the subscription.
+    ///
+    /// All required inotify watches are guaranteed to have been
+    /// created when this command ends so any changes after that will
+    /// be caught. Note that this might take some time as creating
+    /// watches requires going through the whole arena, so use a join
+    /// if you need to subscribe to multiple arenas at the same time.
     pub(crate) async fn subscribe(
         &self,
         arena: &Arena,
         path_resolver: PathResolver,
         tx: mpsc::Sender<Notification>,
     ) -> anyhow::Result<()> {
+        let (ready_tx, ready_rx) = oneshot::channel();
         self.subscribe
             .send(Subscription {
                 arena: arena.clone(),
                 path_resolver,
                 tx,
+                ready_tx,
             })
             .await?;
+
+        // Wait until all watches have been created
+        ready_rx.await?;
 
         Ok(())
     }
@@ -125,8 +140,8 @@ async fn run_collector(
             res = rx.recv() => {
                 match res {
                     None => { break; }
-                    Some(Subscription { arena, path_resolver, tx }) => {
-                        collector.subscribe(arena, path_resolver, tx).await?;
+                    Some(Subscription { arena, path_resolver, tx, ready_tx }) => {
+                        collector.subscribe(arena, path_resolver, tx, ready_tx).await?;
                     }
                 }
             },
@@ -179,8 +194,11 @@ struct Collector {
 struct ArenaWatch {
     path_resolver: PathResolver,
 
-    /// Set to true once the Ready notification has been sent.
-    enabled: bool,
+    /// Oneshot channels to send a message to once the watches fro
+    /// this arena have all been created.
+    ///
+    /// When this is empty, the channel is ready.
+    ready: Vec<oneshot::Sender<()>>,
 
     /// Set of active subscribers.
     subscribers: Vec<Option<mpsc::Sender<Notification>>>,
@@ -201,13 +219,16 @@ impl Collector {
         arena: Arena,
         path_resolver: PathResolver,
         tx: mpsc::Sender<Notification>,
+        ready_tx: oneshot::Sender<()>,
     ) -> anyhow::Result<()> {
         match self.watched.get_mut(&arena) {
             Some(existing) => {
                 log::debug!("new subscriber for {arena}");
                 existing.subscribers.push(Some(tx));
-                if existing.enabled {
-                    self.send_notification(Notification::Ready(arena)).await;
+                if existing.ready.is_empty() {
+                    let _ = ready_tx.send(());
+                } else {
+                    existing.ready.push(ready_tx);
                 }
             }
             None => {
@@ -217,7 +238,7 @@ impl Collector {
                     arena.clone(),
                     ArenaWatch {
                         path_resolver,
-                        enabled: false,
+                        ready: vec![ready_tx],
                         subscribers: vec![Some(tx)],
                     },
                 );
@@ -231,11 +252,12 @@ impl Collector {
     /// Send a Ready notification for the given arena.
     async fn mark_ready(&mut self, arena: Arena) -> anyhow::Result<()> {
         if let Some(watch) = self.watched.get_mut(&arena) {
-            if !watch.enabled {
-                watch.enabled = true;
-
-                self.send_notification(Notification::Ready(arena)).await;
+            if !watch.ready.is_empty() {
+                for tx in std::mem::take(&mut watch.ready).into_iter() {
+                    let _ = tx.send(());
+                }
             }
+            assert!(watch.ready.is_empty());
         }
 
         Ok(())
@@ -448,7 +470,7 @@ mod tests {
 
             let storage = LocalStorage::single(&arena, arena_dir.path());
             let (notifications_tx, notifications_rx) = mpsc::channel(10);
-            storage.subscribe(&arena, notifications_tx).await?;
+            storage.subscribe(arena.clone(), notifications_tx).await?;
 
             Ok(Self {
                 _tempdir: tempdir,
@@ -474,11 +496,6 @@ mod tests {
     #[tokio::test]
     async fn create_file() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
-        assert_eq!(
-            Notification::Ready(fixture.arena()),
-            fixture.next("ready").await?
-        );
-
         let child = fixture.arena_dir.child("child.txt");
         child.write_str("content")?;
 
@@ -497,11 +514,6 @@ mod tests {
     #[tokio::test]
     async fn create_file_in_subdir() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
-        assert_eq!(
-            Notification::Ready(fixture.arena()),
-            fixture.next("ready").await?
-        );
-
         let subdirs = fixture.arena_dir.child("subdir1/subdir2");
         subdirs.create_dir_all()?;
         let child = subdirs.child("child.txt");
