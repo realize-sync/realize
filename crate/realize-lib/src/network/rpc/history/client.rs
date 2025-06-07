@@ -26,6 +26,8 @@ where
     }
     drop(tx);
 
+    client.ready(context::current()).await?;
+
     // While there are notifications
     loop {
         let mut notifications = Vec::new();

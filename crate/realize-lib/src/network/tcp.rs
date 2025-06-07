@@ -12,15 +12,21 @@ use rustls::sign::SigningKey;
 use tarpc::client::stub::Stub;
 use tarpc::client::RpcError;
 use tarpc::context;
+use tarpc::context::Context;
 use tokio::io::AsyncReadExt as _;
 use tokio::io::AsyncWriteExt as _;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
 use tokio_retry::strategy::ExponentialBackoff;
 use tokio_rustls::TlsConnector;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
@@ -29,6 +35,8 @@ use tarpc::server::{BaseChannel, Channel};
 use tarpc::tokio_serde::formats::Bincode;
 use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
 
+use crate::model::Arena;
+use crate::model::Peer;
 use crate::network::rate_limit::RateLimitedStream;
 use crate::network::reconnect::Connect;
 use crate::network::reconnect::Reconnect;
@@ -46,6 +54,8 @@ use crate::network::rpc::realize::{RealizeService, RealizeServiceClient};
 use crate::network::security;
 use crate::network::security::PeerVerifier;
 use crate::storage::real::LocalStorage;
+use crate::storage::real::Notification;
+use crate::utils::async_utils::AbortOnDrop;
 
 use std::fmt;
 use std::net::IpAddr;
@@ -240,6 +250,61 @@ pub async fn start_server(
     Ok((addr, shutdown_tx))
 }
 
+/// Forward history for the given peer to a mpsc channel.
+///
+/// Connect to the peer, then ask it to send history for the given
+/// arenas.
+///
+/// When this function returns successfully, the connection to the
+/// peer has succeeded and the peer has declared itself ready to
+/// report any file changes. This might take a while.
+///
+/// After a successful connection, the forwarder runs until either the
+/// channel is closed or the connection is lost. Check the
+/// [JoinHandle].
+pub async fn forward_peer_history(
+    ctx: Context,
+    peer: Peer,
+    addr: HostPort,
+    verifier: Arc<PeerVerifier>,
+    privkey: Arc<dyn SigningKey>,
+    arenas: Vec<Arena>,
+    tx: mpsc::Sender<(Peer, Notification)>,
+) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
+    let connector = security::make_tls_connector(verifier, privkey)?;
+    let stream = TcpStream::connect(addr.addr()).await?;
+    let mut tls_stream = connector
+        .connect(ServerName::try_from(addr.host().to_string())?, stream)
+        .await?;
+    tls_stream.write_all(history::TAG).await?;
+
+    let transport = transport::new(
+        LengthDelimitedCodec::builder().new_framed(tls_stream),
+        Bincode::default(),
+    );
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let handle = AbortOnDrop::new(tokio::spawn(async move {
+        history::server::run_forwarder(
+            peer,
+            arenas,
+            BaseChannel::with_defaults(transport),
+            tx,
+            Some(ready_tx),
+        )
+        .await
+    }));
+
+    // Wait for the peer to declare itself ready before returning.
+    // This might take a while.
+    //
+    // If the context deadline is reached, abort the forwarder and
+    // return a deadline error.
+    let _ = timeout(ctx.deadline.duration_since(Instant::now()), ready_rx).await?;
+
+    Ok(handle.as_handle())
+}
+
 #[derive(Clone, Default)]
 pub struct ClientOptions {
     pub domain: Option<String>,
@@ -402,13 +467,15 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
-    use crate::model::{Arena, Peer};
+    use crate::model::{self, Arena, Peer};
     use crate::network::rpc::realize::{Config, Options};
     use crate::network::security::testing;
     use crate::utils::async_utils::AbortOnDrop;
+    use assert_fs::prelude::{FileWriteStr as _, PathChild as _};
     use assert_fs::TempDir;
     use rustls::pki_types::PrivateKeyDer;
     use tarpc::context;
+    use tokio::time::timeout;
 
     // Helper to setup a test server and return (server_addr, server_handle, crypto, temp_dir)
     async fn setup_test_server(
@@ -914,10 +981,58 @@ mod tests {
         )
         .await
         .err();
+
         let err = ret.expect("client connection didn't fail");
         let ioerr = err.downcast_ref::<std::io::Error>();
         let ioerr = ioerr.expect("not an I/O error: {err:?}");
         assert_eq!(ioerr.kind(), std::io::ErrorKind::ConnectionRefused);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forward_history_notifications() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+
+        let verifier = verifier_both();
+        let (addr, _shutdown, tempdir) = setup_test_server(Arc::clone(&verifier)).await?;
+        let privkey = load_private_key(testing::client_private_key())?;
+
+        let arena = Arena::from("testdir");
+        let (tx, mut rx) = mpsc::channel(10);
+        let handle = forward_peer_history(
+            context::current(),
+            Peer::from("server"),
+            addr.into(),
+            verifier,
+            privkey,
+            vec![arena.clone()],
+            tx,
+        )
+        .await?;
+
+        // The forwarder is ready; a new file will generate a notification.
+
+        let foobar = tempdir.child("foobar.txt");
+        foobar.write_str("test")?;
+        let foobar_mtime = foobar.metadata()?.modified()?;
+
+        let (peer, notif) = timeout(Duration::from_secs(1), rx.recv()).await?.unwrap();
+        assert_eq!(Peer::from("server"), peer);
+
+        assert_eq!(
+            Notification::Link {
+                arena,
+                path: model::Path::parse("foobar.txt")?,
+                size: 4,
+                mtime: foobar_mtime
+            },
+            notif
+        );
+
+        // Dropping rx stops the forwarder.
+        drop(rx);
+        timeout(Duration::from_secs(1), handle).await???;
 
         Ok(())
     }

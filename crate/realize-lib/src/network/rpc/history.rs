@@ -3,6 +3,7 @@
 //! This module defines the HistoryService trait for use with tarpc 0.36.
 
 pub mod client;
+pub mod server;
 
 use crate::{model::Arena, storage::real::Notification};
 
@@ -15,6 +16,11 @@ pub trait HistoryService {
     ///
     /// Caller will ignore arenas for which it has no local data.
     async fn arenas() -> Vec<Arena>;
+
+    /// Called before sending any notifications, to let the history
+    /// service know any filesystem change will be reported from then
+    /// on.
+    async fn ready();
 
     /// Receive a batch of history notifications.
     async fn notify(batch: Vec<Notification>);
