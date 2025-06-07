@@ -89,6 +89,10 @@ impl Path {
     pub fn within(&self, path: &path::Path) -> path::PathBuf {
         path.join(self.as_real_path())
     }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl Into<path::PathBuf> for Path {
