@@ -242,7 +242,12 @@ impl Collector {
                         subscribers: vec![Some(tx)],
                     },
                 );
-                spawn_walk_dir(arena, root, WalkDirMode::Initial, self.new_dirs_tx.clone());
+                spawn_walk_dir(
+                    arena,
+                    root,
+                    WalkDirMode::InitialWatchDirs,
+                    self.new_dirs_tx.clone(),
+                );
             }
         }
 
@@ -290,29 +295,56 @@ impl Collector {
     async fn handle_event(&mut self, ev: Event<OsString>) -> anyhow::Result<()> {
         log::debug!("inotify ev: {ev:?}");
         if let Some(PathWatch { arena, path }) = self.wd.get(&ev.wd) {
-            if ev.mask.contains(EventMask::CREATE | EventMask::ISDIR) {
-                if let Some(filename) = ev.name {
-                    spawn_walk_dir(
-                        arena.clone(),
-                        path.join(filename),
-                        WalkDirMode::NewDir,
-                        self.new_dirs_tx.clone(),
-                    );
-                }
-            } else if ev.mask.contains(EventMask::CLOSE_WRITE) {
-                if let Some(filename) = ev.name {
-                    let path = path.join(filename);
-                    if let Ok(metadata) = fs::metadata(&path).await {
-                        self.send_link(arena.clone(), path, metadata).await;
+            let arena = arena.clone();
+            if let Some(filename) = &ev.name {
+                let full_path = path.join(filename);
+
+                if ev.mask.contains(EventMask::ISDIR) {
+                    if ev.mask.contains(EventMask::CREATE) || ev.mask.contains(EventMask::MOVED_TO)
+                    {
+                        // Watch directory and report its content as new.
+                        spawn_walk_dir(
+                            arena,
+                            full_path,
+                            WalkDirMode::WatchDirRecursivelyAndReportFiles,
+                            self.new_dirs_tx.clone(),
+                        );
+                    }
+                // Deletion of directory is implicitly handled by inotify removing the watch.
+                // We should have received events for file deletions inside it before this.
+                } else {
+                    // It's a file event
+                    if ev.mask.contains(EventMask::MOVED_TO)
+                        || ev.mask.contains(EventMask::CLOSE_WRITE)
+                    {
+                        if let Ok(metadata) = fs::metadata(&full_path).await {
+                            self.send_link(arena, full_path, metadata).await;
+                        }
+                    } else if ev.mask.contains(EventMask::DELETE)
+                        || ev.mask.contains(EventMask::MOVED_FROM)
+                    {
+                        self.send_unlink(full_path, arena).await;
                     }
                 }
             }
         }
-
         Ok(())
     }
 
-    /// Send Link notifications.
+    /// Send Unlink notification.
+    async fn send_unlink(&mut self, full_path: PathBuf, arena: Arena) {
+        if let Some(watch) = self.watched.get(&arena) {
+            if let Some((PathType::Final, resolved)) = watch.path_resolver.reverse(&full_path) {
+                self.send_notification(Notification::Unlink {
+                    arena,
+                    path: resolved,
+                })
+                .await;
+            }
+        }
+    }
+
+    /// Send Link notification.
     async fn send_link(&mut self, arena: Arena, path: PathBuf, metadata: Metadata) {
         if !metadata.is_file() {
             return;
@@ -374,7 +406,7 @@ enum WalkDirMode {
     /// Mode used for the very first walkdir in an arena.
     ///
     /// The first walkdir collects directories to ask inotify to watch.
-    Initial,
+    InitialWatchDirs,
 
     /// Modu used for new directories in an arena.
     ///
@@ -382,7 +414,7 @@ enum WalkDirMode {
     /// subdirectories, including files or directories created between
     /// the time the directory was initially created and the time the
     /// inotify event was processed.
-    NewDir,
+    WatchDirRecursivelyAndReportFiles,
 }
 
 #[derive(Clone)]
@@ -418,19 +450,21 @@ fn spawn_walk_dir(arena: Arena, root: PathBuf, mode: WalkDirMode, tx: mpsc::Send
             if entry.file_type().is_dir() {
                 tx.blocking_send(WalkDirResult::AddDir(
                     arena.clone(),
-                    root.join(entry.path()),
+                    entry.path().to_path_buf(),
                 ))?;
-            } else if mode == WalkDirMode::NewDir && entry.file_type().is_file() {
+            } else if mode == WalkDirMode::WatchDirRecursivelyAndReportFiles
+                && entry.file_type().is_file()
+            {
                 if let Ok(metadata) = entry.metadata() {
                     tx.blocking_send(WalkDirResult::AddFile(
                         arena.clone(),
-                        root.join(entry.path()),
+                        entry.path().to_path_buf(),
                         metadata,
                     ))?;
                 }
             }
         }
-        if mode == WalkDirMode::Initial {
+        if mode == WalkDirMode::InitialWatchDirs {
             tx.blocking_send(WalkDirResult::Complete(arena))?;
         }
 
@@ -455,8 +489,9 @@ mod tests {
         _tempdir: TempDir,
         arena: Arena,
         arena_dir: ChildPath,
-        _storage: LocalStorage,
-        notifications: mpsc::Receiver<Notification>,
+        storage: LocalStorage,
+        notifications_tx: mpsc::Sender<Notification>,
+        notifications_rx: mpsc::Receiver<Notification>,
     }
 
     impl Fixture {
@@ -470,15 +505,25 @@ mod tests {
 
             let storage = LocalStorage::single(&arena, arena_dir.path());
             let (notifications_tx, notifications_rx) = mpsc::channel(10);
-            storage.subscribe(arena.clone(), notifications_tx).await?;
 
             Ok(Self {
                 _tempdir: tempdir,
                 arena,
                 arena_dir,
-                _storage: storage,
-                notifications: notifications_rx,
+                storage,
+                notifications_tx,
+                notifications_rx,
             })
+        }
+
+        async fn subscribe(&self) -> anyhow::Result<()> {
+            let subscribed = self
+                .storage
+                .subscribe(self.arena.clone(), self.notifications_tx.clone())
+                .await?;
+            assert!(subscribed);
+
+            Ok(())
         }
 
         fn arena(&self) -> Arena {
@@ -486,7 +531,7 @@ mod tests {
         }
 
         async fn next(&mut self, msg: &'static str) -> anyhow::Result<Notification> {
-            timeout(Duration::from_secs(1), self.notifications.recv())
+            timeout(Duration::from_secs(1), self.notifications_rx.recv())
                 .await
                 .context(msg)?
                 .ok_or(anyhow::anyhow!("channel closed before {}", msg))
@@ -496,6 +541,8 @@ mod tests {
     #[tokio::test]
     async fn create_file() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
+        fixture.subscribe().await?;
+
         let child = fixture.arena_dir.child("child.txt");
         child.write_str("content")?;
 
@@ -514,6 +561,8 @@ mod tests {
     #[tokio::test]
     async fn create_file_in_subdir() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
+        fixture.subscribe().await?;
+
         let subdirs = fixture.arena_dir.child("subdir1/subdir2");
         subdirs.create_dir_all()?;
         let child = subdirs.child("child.txt");
@@ -531,20 +580,172 @@ mod tests {
         Ok(())
     }
 
-    // TODO: Add tests for the following cases:
-    // - file that exists before subscription is deleted. Events:Unlink
-    // - file that exists before subscription gets re-written. Events:Link (with new size and mtime)
-    // - file that exists before subscription gets partially modified. Events:Link (with new size and mtime)
-    // - dir (with subdirs and files) that exists before subscription is deleted recursively. Events:Unlink for all files in dir, recursively
-    // - file that exists before subscription is moved out of the arena. Events:Unlink
-    // - file that exists before subscription is moved into the arena. Events: Link
-    // - file that exists before subscription is moved within the arena. Events: Unlink, Link
-    // - file that exists before subscription is moved within the arena, from subdir1 to subdir2. Events: Unlink, Link
-    // - file gets created after subscription, then deleted. Events:Link, then Unlink
-    // - dir (with subdirs and files) that exists before subscription is moved out of the arena. Events:Unlink for all files in dir, recursively
-    // - dir (with subdirs and files) that exists before subscription is moved into the arena. Events: Link for all files in dir, recursively
-    // - dir (with subdirs and files) that exists before subscription is moved within the arena. Events: Unlink and Link for all files in dir, recursively
-    //
-    // Make sure to run the test with debug logging enabled. For example:
-    //   RUST_LOG=debug cargo test -p realize-lib --lib real::history::tests
+    #[tokio::test]
+    async fn delete_existing_file() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        let child = fixture.arena_dir.child("child.txt");
+        child.write_str("content")?;
+
+        fixture.subscribe().await?;
+
+        std::fs::remove_file(child.path())?;
+        assert_eq!(
+            Notification::Unlink {
+                arena: fixture.arena(),
+                path: Path::parse("child.txt")?,
+            },
+            fixture.next("unlink").await?,
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn rewrite_existing_file() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        let child = fixture.arena_dir.child("child.txt");
+        child.write_str("content")?;
+
+        fixture.subscribe().await?;
+
+        child.write_str("new content")?;
+        assert_eq!(
+            Notification::Link {
+                arena: fixture.arena(),
+                path: Path::parse("child.txt")?,
+                size: 11,
+                mtime: child.metadata()?.modified()?,
+            },
+            fixture.next("rewrite").await?,
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn delete_existing_dir_recursively() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        let subdir = fixture.arena_dir.child("subdir");
+        subdir.create_dir_all()?;
+        let child1 = subdir.child("child1.txt");
+        child1.write_str("c1")?;
+        let child2 = subdir.child("child2.txt");
+        child2.write_str("c2")?;
+
+        fixture.subscribe().await?;
+
+        std::fs::remove_dir_all(subdir.path())?;
+        let n1 = fixture.next("unlink 1").await?;
+        let n2 = fixture.next("unlink 2").await?;
+        let p1 = Path::parse("subdir/child1.txt")?;
+        let p2 = Path::parse("subdir/child2.txt")?;
+        let unlink1 = Notification::Unlink {
+            arena: fixture.arena(),
+            path: p1,
+        };
+        let unlink2 = Notification::Unlink {
+            arena: fixture.arena(),
+            path: p2,
+        };
+        if n1 == unlink1 {
+            assert_eq!(n2, unlink2);
+        } else {
+            assert_eq!(n1, unlink2);
+            assert_eq!(n2, unlink1);
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn move_file_out_of_arena() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        let child = fixture.arena_dir.child("child.txt");
+        child.write_str("content")?;
+
+        fixture.subscribe().await?;
+
+        let dest = fixture._tempdir.child("dest.txt");
+        std::fs::rename(child.path(), dest.path())?;
+        assert_eq!(
+            Notification::Unlink {
+                arena: fixture.arena(),
+                path: Path::parse("child.txt")?,
+            },
+            fixture.next("move out").await?,
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn move_file_into_arena() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        let source = fixture._tempdir.child("source.txt");
+        source.write_str("content")?;
+
+        fixture.subscribe().await?;
+
+        let dest = fixture.arena_dir.child("dest.txt");
+        std::fs::rename(source.path(), dest.path())?;
+        assert_eq!(
+            Notification::Link {
+                arena: fixture.arena(),
+                path: Path::parse("dest.txt")?,
+                size: 7,
+                mtime: dest.metadata()?.modified()?,
+            },
+            fixture.next("move in").await?,
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn move_file_within_arena() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        let source = fixture.arena_dir.child("source.txt");
+        source.write_str("content")?;
+
+        fixture.subscribe().await?;
+
+        let dest = fixture.arena_dir.child("dest.txt");
+        std::fs::rename(source.path(), dest.path())?;
+        let n1 = fixture.next("move within 1").await?;
+        let n2 = fixture.next("move within 2").await?;
+        let unlink = Notification::Unlink {
+            arena: fixture.arena(),
+            path: Path::parse("source.txt")?,
+        };
+        let link = Notification::Link {
+            arena: fixture.arena(),
+            path: Path::parse("dest.txt")?,
+            size: 7,
+            mtime: dest.metadata()?.modified()?,
+        };
+        if n1 == unlink {
+            assert_eq!(n2, link);
+        } else {
+            assert_eq!(n1, link);
+            assert_eq!(n2, unlink);
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn create_then_delete_file() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        fixture.subscribe().await?;
+
+        let child = fixture.arena_dir.child("child.txt");
+        child.write_str("content")?;
+        assert_eq!(
+            Notification::Link {
+                arena: fixture.arena(),
+                path: Path::parse("child.txt")?,
+                size: 7,
+                mtime: child.metadata()?.modified()?,
+            },
+            fixture.next("create").await?,
+        );
+
+        std::fs::remove_file(child.path())?;
+        assert_eq!(
+            Notification::Unlink {
+                arena: fixture.arena(),
+                path: Path::parse("child.txt")?,
+            },
+            fixture.next("delete").await?,
+        );
+        Ok(())
+    }
 }
