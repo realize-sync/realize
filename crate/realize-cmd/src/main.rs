@@ -14,7 +14,10 @@ use realize_lib::model::Peer;
 use realize_lib::network::config::PeerConfig;
 use realize_lib::network::rpc::realize::metrics;
 use realize_lib::network::security::{self, PeerVerifier};
-use realize_lib::network::tcp::{self, ClientConnectionState, HostPort, TcpRealizeServiceClient};
+use realize_lib::network::{
+    hostport::HostPort,
+    tcp::{self, ClientConnectionState, TcpRealizeServiceClient},
+};
 use realize_lib::utils::logging;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::pem::PemObject as _;

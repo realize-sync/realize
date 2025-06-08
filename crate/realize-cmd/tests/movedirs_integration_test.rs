@@ -6,7 +6,7 @@ use hyper_util::rt::TokioIo;
 use realize_lib::model::Arena;
 use realize_lib::model::Peer;
 use realize_lib::network::security::{self, PeerVerifier};
-use realize_lib::network::tcp::{self, HostPort};
+use realize_lib::network::{hostport::HostPort, tcp};
 use realize_lib::storage::real::LocalStorage;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};

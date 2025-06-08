@@ -13,7 +13,7 @@ use realize_lib::model::Peer;
 use realize_lib::network::rpc::realize::Options;
 use realize_lib::network::security;
 use realize_lib::network::security::PeerVerifier;
-use realize_lib::network::tcp::{self, HostPort};
+use realize_lib::network::{hostport::HostPort, tcp};
 use reqwest::Client;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::SubjectPublicKeyInfoDer;

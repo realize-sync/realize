@@ -8,7 +8,7 @@ use realize_lib::model::{Arena, Peer};
 use realize_lib::network::config::PeerConfig;
 use realize_lib::network::rpc::realize::metrics;
 use realize_lib::network::security::{self, PeerVerifier};
-use realize_lib::network::tcp::{self, HostPort};
+use realize_lib::network::{hostport::HostPort, tcp};
 use realize_lib::storage::config::ArenaConfig;
 use realize_lib::storage::real::LocalStorage;
 use realize_lib::utils::logging;
