@@ -196,6 +196,105 @@ impl Networking {
     }
 }
 
+pub struct Server {
+    networking: Networking,
+    handlers: HashMap<
+        &'static [u8; 4],
+        Box<
+            dyn Fn(
+                    Peer,
+                    tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
+                    Limiter,
+                    broadcast::Receiver<()>,
+                ) + Send
+                + Sync,
+        >,
+    >,
+    shutdown_tx: broadcast::Sender<()>,
+}
+
+impl Server {
+    pub fn new(networking: Networking) -> Self {
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        Self {
+            networking,
+            handlers: HashMap::new(),
+            shutdown_tx,
+        }
+    }
+
+    fn register(
+        &mut self,
+        tag: &'static [u8; 4],
+        handler: impl Fn(
+                Peer,
+                tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
+                Limiter,
+                broadcast::Receiver<()>,
+            ) + Send
+            + Sync
+            + 'static,
+    ) {
+        self.handlers.insert(tag, Box::new(handler));
+    }
+
+    pub fn shutdown(&self) -> anyhow::Result<()> {
+        self.shutdown_tx.send(())?;
+
+        Ok(())
+    }
+
+    pub async fn listen(self: Arc<Self>, hostport: &HostPort) -> anyhow::Result<SocketAddr> {
+        let listener = TcpListener::bind(hostport.addr()).await?;
+        log::info!(
+            "Listening for RPC connections on {:?}",
+            listener
+                .local_addr()
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|err| err.to_string())
+        );
+
+        let addr = listener.local_addr()?;
+        let mut shutdown_listener_rx = self.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                tokio::select!(
+                    _ = shutdown_listener_rx.recv() => {
+                        log::debug!("Shutting down listener");
+                        return;
+                    }
+                    Ok((stream, peer)) = listener.accept() => {
+                        match self.accept(stream).await {
+                            Ok(_) => {}
+                            Err(err) => log::debug!("{}: connection rejected: {}", peer, err),
+                        };
+                    }
+                );
+            }
+        });
+
+        Ok(addr)
+    }
+
+    async fn accept(&self, stream: TcpStream) -> anyhow::Result<()> {
+        let shutdown_rx = self.shutdown_tx.subscribe();
+        let limiter = Limiter::<StandardClock>::new(f64::INFINITY);
+        let (peer, tag, mut tls_stream) = self.networking.accept(stream, limiter.clone()).await?;
+        if let Some(handler) = self.handlers.get(&tag) {
+            (*handler)(peer, tls_stream, limiter, shutdown_rx);
+        } else {
+            log::info!("Got unsupported RPC service tag '{tag:?}' from {peer}");
+            // We log this separately from generic errors, because
+            // bad tags might highlight peer versioning issues.
+
+            let _ = tls_stream.shutdown().await;
+            return Err(anyhow::anyhow!("Unknown RPC service tag"));
+        }
+
+        Ok(())
+    }
+}
+
 /// Start the server, listening on the given address.
 ///
 /// Returns (address, shutdown, handle)
@@ -210,131 +309,67 @@ pub async fn start_server(
     privkey: Arc<dyn SigningKey>,
 ) -> anyhow::Result<(SocketAddr, tokio::sync::broadcast::Sender<()>)> {
     let networking = Networking::new(vec![], privkey, verifier);
-    let (shutdown_tx, mut shutdown_listener_rx) = tokio::sync::broadcast::channel(1);
-    let listener = TcpListener::bind(hostport.addr()).await?;
-    log::info!(
-        "Listening for RPC connections on {:?}",
-        listener
-            .local_addr()
-            .map(|addr| addr.to_string())
-            .unwrap_or_else(|err| err.to_string())
-    );
+    let mut server = Server::new(networking);
 
-    let addr = listener.local_addr()?;
-
-    let mut handlers: HashMap<
-        &[u8; 4],
-        Box<
-            dyn Fn(
-                    Peer,
-                    tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
-                    Limiter,
-                    broadcast::Receiver<()>,
-                ) + Send
-                + Sync,
-        >,
-    > = HashMap::new();
     let realize_storage = storage.clone();
     let history_storage = storage.clone();
-    handlers.insert(
+    server.register(
         rpc::realize::TAG,
-        Box::new(
-            move |peer: Peer,
-                  tls_stream,
-                  limiter: Limiter,
-                  mut shutdown_rx: broadcast::Receiver<()>| {
-                let framed = LengthDelimitedCodec::builder().new_framed(tls_stream);
-                let server = RealizeServer::new_limited(realize_storage.clone(), limiter);
-                tokio::spawn(async move {
-                    let mut stream = Box::pin(
-                        BaseChannel::with_defaults(transport::new(framed, Bincode::default()))
-                            .execute(MetricsRealizeServer::new(RealizeServer::serve(
-                                server.clone(),
-                            ))),
-                    );
-                    loop {
-                        tokio::select!(
-                            _ = shutdown_rx.recv() => {
-                                log::debug!("Shutting connection to {}", peer);
-                                break;
-                            }
-                            next = stream.next() => {
-                                match next {
-                                    None => {
-                                        break;
-                                    },
-                                    Some(fut) => {
-                                        tokio::spawn(metrics::track_in_flight_request(fut));
-                                    }
+        move |peer: Peer,
+              tls_stream,
+              limiter: Limiter,
+              mut shutdown_rx: broadcast::Receiver<()>| {
+            let framed = LengthDelimitedCodec::builder().new_framed(tls_stream);
+            let server = RealizeServer::new_limited(realize_storage.clone(), limiter);
+            tokio::spawn(async move {
+                let mut stream = Box::pin(
+                    BaseChannel::with_defaults(transport::new(framed, Bincode::default())).execute(
+                        MetricsRealizeServer::new(RealizeServer::serve(server.clone())),
+                    ),
+                );
+                loop {
+                    tokio::select!(
+                        _ = shutdown_rx.recv() => {
+                            log::debug!("Shutting connection to {}", peer);
+                            break;
+                        }
+                        next = stream.next() => {
+                            match next {
+                                None => {
+                                    break;
+                                },
+                                Some(fut) => {
+                                    tokio::spawn(metrics::track_in_flight_request(fut));
                                 }
                             }
-                        )
-                    }
-                });
-            },
-        ),
+                        }
+                    )
+                }
+            });
+        },
     );
-    handlers.insert(
+    server.register(
         rpc::history::TAG,
-        Box::new(
-            move |peer: Peer, tls_stream, _limiter: Limiter, shutdown_rx| {
-                let framed = LengthDelimitedCodec::builder().new_framed(tls_stream);
-                let transport = transport::new(framed, Bincode::default());
-                let channel = tarpc::client::new(Default::default(), transport).spawn();
-                let client = HistoryServiceClient::from(channel);
+        move |peer: Peer, tls_stream, _limiter: Limiter, shutdown_rx| {
+            let framed = LengthDelimitedCodec::builder().new_framed(tls_stream);
+            let transport = transport::new(framed, Bincode::default());
+            let channel = tarpc::client::new(Default::default(), transport).spawn();
+            let client = HistoryServiceClient::from(channel);
 
-                let peer = peer.clone();
-                let storage = history_storage.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = history::client::collect(client, storage, shutdown_rx).await {
-                        log::debug!("{}: history collection failed: {}", peer, err);
-                    }
-                });
-            },
-        ),
+            let peer = peer.clone();
+            let storage = history_storage.clone();
+            tokio::spawn(async move {
+                if let Err(err) = history::client::collect(client, storage, shutdown_rx).await {
+                    log::debug!("{}: history collection failed: {}", peer, err);
+                }
+            });
+        },
     );
 
-    let shutdown_accept_tx = shutdown_tx.downgrade();
-    let accept = async move |stream: TcpStream| -> anyhow::Result<()> {
-        let shutdown_rx = shutdown_accept_tx
-            .upgrade()
-            .map(|s| s.subscribe())
-            .ok_or(anyhow::anyhow!("Shutdown initiated"))?;
+    let server = Arc::new(server);
+    let addr = Arc::clone(&server).listen(hostport).await?;
 
-        let limiter = Limiter::<StandardClock>::new(f64::INFINITY);
-        let (peer, tag, mut tls_stream) = networking.accept(stream, limiter.clone()).await?;
-        if let Some(handler) = handlers.get(&tag) {
-            (*handler)(peer, tls_stream, limiter, shutdown_rx);
-        } else {
-            log::info!("Got unsupported RPC service tag '{tag:?}' from {peer}");
-            // We log this separately from generic errors, because
-            // bad tags might highlight peer versioning issues.
-
-            let _ = tls_stream.shutdown().await;
-            return Err(anyhow::anyhow!("Unknown RPC service tag"));
-        }
-
-        Ok(())
-    };
-
-    tokio::spawn(async move {
-        loop {
-            tokio::select!(
-                _ = shutdown_listener_rx.recv() => {
-                    log::debug!("Shutting down listener");
-                    return;
-                }
-                Ok((stream, peer)) = listener.accept() => {
-                    match accept(stream).await {
-                        Ok(_) => {}
-                        Err(err) => log::debug!("{}: connection rejected: {}", peer, err),
-                    };
-                }
-            );
-        }
-    });
-
-    Ok((addr, shutdown_tx))
+    Ok((addr, server.shutdown_tx.clone()))
 }
 
 /// Forward history for the given peer to a mpsc channel.
