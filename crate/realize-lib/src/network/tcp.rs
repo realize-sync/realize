@@ -163,6 +163,36 @@ impl Networking {
 
         Ok(transport)
     }
+
+    async fn accept(
+        &self,
+        stream: TcpStream,
+        limiter: Limiter,
+    ) -> Result<
+        (
+            Peer,
+            [u8; 4],
+            tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
+        ),
+        anyhow::Error,
+    > {
+        let peer_addr = stream.peer_addr()?;
+        let stream = RateLimitedStream::new(stream, limiter);
+        let acceptor =
+            security::make_tls_acceptor(Arc::clone(&self.verifier), Arc::clone(&self.privkey))?;
+        let mut tls_stream = acceptor.accept(stream).await?;
+        // Guards against bugs in the auth code; worth dying
+        let peer = self
+            .verifier
+            .connection_peer_id(&tls_stream)
+            .expect("Peer must be known at this point")
+            .clone();
+        log::info!("Accepted peer {} from {}", peer, peer_addr);
+        let mut tag = [0u8; 4];
+        tls_stream.read_exact(&mut tag).await?;
+
+        Ok((peer, tag, tls_stream))
+    }
 }
 
 /// Start the server, listening on the given address.
@@ -178,8 +208,8 @@ pub async fn start_server(
     verifier: Arc<PeerVerifier>,
     privkey: Arc<dyn SigningKey>,
 ) -> anyhow::Result<(SocketAddr, tokio::sync::broadcast::Sender<()>)> {
+    let networking = Networking::new(vec![], privkey, verifier);
     let (shutdown_tx, mut shutdown_listener_rx) = tokio::sync::broadcast::channel(1);
-    let acceptor = security::make_tls_acceptor(Arc::clone(&verifier), privkey)?;
     let listener = TcpListener::bind(hostport.addr()).await?;
     log::info!(
         "Listening for RPC connections on {:?}",
@@ -198,20 +228,8 @@ pub async fn start_server(
             .map(|s| s.subscribe())
             .ok_or(anyhow::anyhow!("Shutdown initiated"))?;
 
-        let peer_addr = stream.peer_addr()?;
         let limiter = Limiter::<StandardClock>::new(f64::INFINITY);
-        let mut tls_stream = acceptor
-            .accept(RateLimitedStream::new(stream, limiter.clone()))
-            .await?;
-        // Guards against bugs in the auth code; worth dying
-        let peer = verifier
-            .connection_peer_id(&tls_stream)
-            .expect("Peer must be known at this point")
-            .clone();
-        log::info!("Accepted peer {} from {}", peer, peer_addr);
-
-        let mut tag = [0u8; 4];
-        tls_stream.read_exact(&mut tag).await?;
+        let (peer, tag, mut tls_stream) = networking.accept(stream, limiter.clone()).await?;
         match &tag {
             rpc::realize::TAG => {
                 let framed = LengthDelimitedCodec::builder().new_framed(tls_stream);
