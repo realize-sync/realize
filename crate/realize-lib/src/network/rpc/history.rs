@@ -20,7 +20,12 @@ pub trait HistoryService {
     /// Called before sending any notifications, to let the history
     /// service know any filesystem change will be reported from then
     /// on.
-    async fn ready();
+    ///
+    /// Only the first call matters; further calls are ignored.
+    ///
+    /// The arena vector is the subset of arenas that are watched. It
+    /// might be empty.
+    async fn ready(arenas: Vec<Arena>);
 
     /// Receive a batch of history notifications.
     async fn notify(batch: Vec<Notification>);

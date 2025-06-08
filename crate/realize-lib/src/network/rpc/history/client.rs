@@ -18,15 +18,22 @@ where
     let arenas = client.arenas(context::current()).await?;
 
     let (tx, mut rx) = mpsc::channel(100);
-    for res in
-        futures::future::join_all(arenas.into_iter().map(|a| storage.subscribe(a, tx.clone())))
-            .await
-    {
-        res?
+    let res = futures::future::join_all(
+        arenas
+            .iter()
+            .map(|a| storage.subscribe(a.clone(), tx.clone())),
+    )
+    .await;
+
+    let mut watched_arenas = vec![];
+    for (arena, watched) in arenas.into_iter().zip(res.into_iter()) {
+        if watched? {
+            watched_arenas.push(arena);
+        }
     }
     drop(tx);
 
-    client.ready(context::current()).await?;
+    client.ready(context::current(), watched_arenas).await?;
 
     // While there are notifications
     loop {

@@ -1,7 +1,4 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 
 use futures::StreamExt as _;
 use tarpc::{
@@ -9,7 +6,7 @@ use tarpc::{
     server::{BaseChannel, Channel},
     ClientMessage, Response, Transport,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::{
     model::{Arena, Peer},
@@ -30,35 +27,34 @@ pub async fn run_forwarder<T>(
     arenas: Vec<Arena>,
     channel: BaseChannel<HistoryServiceRequest, HistoryServiceResponse, T>,
     tx: mpsc::Sender<(Peer, Notification)>,
-    mut ready_tx: Option<oneshot::Sender<()>>,
+    ready_tx: Option<oneshot::Sender<Vec<Arena>>>,
 ) -> anyhow::Result<()>
 where
     T: Transport<Response<HistoryServiceResponse>, ClientMessage<HistoryServiceRequest>>,
 {
-    let server = HistoryServer::new(peer, arenas, tx);
+    let server = HistoryServer {
+        peer,
+        arenas,
+        tx,
+        watched: Arc::new(Mutex::new(ready_tx)),
+    };
     let mut requests = Box::pin(channel.requests());
     loop {
-        tokio::select!(@{
-    start = {
-        tokio::macros::support::thread_rng_n(BRANCHES)
-    };
-    ()
-}_ = server.tx.closed() => {
-    break;
-}next = requests.next() => {
-    match next {
-        None => {
-            break;
-        }Some(req) => {
-            req?.execute(server.clone().serve()).await;
-            if ready_tx.is_some()&&server.ready.load(Ordering::Relaxed){
-                if let Some(ready_tx) = ready_tx.take(){
-                    let _ = ready_tx.send(());
-                }
+        tokio::select!(
+            _ = server.tx.closed() => {
+                break;
             }
-        }
-    }
-},);
+            next = requests.next() => {
+                match next {
+                    None => {
+                        break;
+                    },
+                    Some(req) => {
+                        req?.execute(server.clone().serve()).await;
+                    }
+                }
+            },
+        );
     }
 
     Ok(())
@@ -69,18 +65,7 @@ struct HistoryServer {
     peer: Peer,
     arenas: Vec<Arena>,
     tx: mpsc::Sender<(Peer, Notification)>,
-    ready: Arc<AtomicBool>,
-}
-
-impl HistoryServer {
-    fn new(peer: Peer, arenas: Vec<Arena>, tx: mpsc::Sender<(Peer, Notification)>) -> Self {
-        Self {
-            peer,
-            arenas,
-            tx,
-            ready: Arc::new(AtomicBool::new(false)),
-        }
-    }
+    watched: Arc<Mutex<Option<oneshot::Sender<Vec<Arena>>>>>,
 }
 
 impl HistoryService for HistoryServer {
@@ -88,9 +73,11 @@ impl HistoryService for HistoryServer {
         self.arenas
     }
 
-    async fn ready(self, _context: Context) -> () {
-        log::debug!("READY");
-        self.ready.store(true, Ordering::Relaxed);
+    async fn ready(self, _context: Context, arenas: Vec<Arena>) -> () {
+        log::debug!("Arenas watched by {}: {:?}", self.peer, &arenas);
+        if let Some(tx) = self.watched.lock().await.take() {
+            let _ = tx.send(arenas);
+        }
     }
 
     async fn notify(self, _context: Context, batch: Vec<Notification>) -> () {

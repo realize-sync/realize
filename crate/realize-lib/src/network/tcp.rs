@@ -270,7 +270,7 @@ pub async fn forward_peer_history(
     privkey: Arc<dyn SigningKey>,
     arenas: Vec<Arena>,
     tx: mpsc::Sender<(Peer, Notification)>,
-) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
+) -> anyhow::Result<(Vec<Arena>, JoinHandle<anyhow::Result<()>>)> {
     let connector = security::make_tls_connector(verifier, privkey)?;
     let stream = TcpStream::connect(addr.addr()).await?;
     let mut tls_stream = connector
@@ -284,25 +284,32 @@ pub async fn forward_peer_history(
     );
 
     let (ready_tx, ready_rx) = oneshot::channel();
-    let handle = AbortOnDrop::new(tokio::spawn(async move {
-        history::server::run_forwarder(
-            peer,
-            arenas,
-            BaseChannel::with_defaults(transport),
-            tx,
-            Some(ready_tx),
-        )
-        .await
-    }));
+    let handle = AbortOnDrop::new(tokio::spawn(history::server::run_forwarder(
+        peer,
+        arenas,
+        BaseChannel::with_defaults(transport),
+        tx,
+        Some(ready_tx),
+    )));
 
     // Wait for the peer to declare itself ready before returning.
     // This might take a while.
     //
     // If the context deadline is reached, abort the forwarder and
     // return a deadline error.
-    let _ = timeout(ctx.deadline.duration_since(Instant::now()), ready_rx).await?;
+    match timeout(ctx.deadline.duration_since(Instant::now()), ready_rx).await? {
+        Err(oneshot::error::RecvError { .. }) => {
+            // The forwarder must have already died if the oneshot was
+            // killed before anything was sent. Attempt to recover the original error.
+            handle.join().await??;
 
-    Ok(handle.as_handle())
+            // The following should never be reached:
+            anyhow::bail!("Connection failed");
+        }
+        Ok(watched) => {
+            return Ok((watched, handle.as_handle()));
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -979,19 +986,18 @@ mod tests {
             client_privkey,
             ClientOptions::default(),
         )
-        .await
-        .err();
+        .await;
 
-        let err = ret.expect("client connection didn't fail");
-        let ioerr = err.downcast_ref::<std::io::Error>();
-        let ioerr = ioerr.expect("not an I/O error: {err:?}");
-        assert_eq!(ioerr.kind(), std::io::ErrorKind::ConnectionRefused);
+        assert_eq!(
+            Some(std::io::ErrorKind::ConnectionRefused),
+            io_error_kind(ret.err())
+        );
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn forward_history_notifications() -> anyhow::Result<()> {
+    async fn forward_history() -> anyhow::Result<()> {
         let _ = env_logger::try_init();
 
         let verifier = verifier_both();
@@ -1000,7 +1006,7 @@ mod tests {
 
         let arena = Arena::from("testdir");
         let (tx, mut rx) = mpsc::channel(10);
-        let handle = forward_peer_history(
+        let (watched, handle) = forward_peer_history(
             context::current(),
             Peer::from("server"),
             addr.into(),
@@ -1010,6 +1016,8 @@ mod tests {
             tx,
         )
         .await?;
+
+        assert_eq!(vec![arena.clone()], watched);
 
         // The forwarder is ready; a new file will generate a notification.
 
@@ -1035,5 +1043,70 @@ mod tests {
         timeout(Duration::from_secs(1), handle).await???;
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn forward_history_loses_connection() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+
+        let verifier = verifier_both();
+        let (addr, shutdown, _tempdir) = setup_test_server(Arc::clone(&verifier)).await?;
+        let privkey = load_private_key(testing::client_private_key())?;
+
+        let arena = Arena::from("testdir");
+        let (tx, _rx) = mpsc::channel(10);
+        let (watched, handle) = forward_peer_history(
+            context::current(),
+            Peer::from("server"),
+            addr.into(),
+            verifier,
+            privkey,
+            vec![arena.clone()],
+            tx,
+        )
+        .await?;
+
+        assert_eq!(vec![arena.clone()], watched);
+
+        shutdown.send(())?;
+
+        // The server shutting down stops the forwarder
+        timeout(Duration::from_secs(1), handle).await???;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forward_history_fails_to_connect() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+
+        let verifier = verifier_both();
+        let privkey = load_private_key(testing::client_private_key())?;
+        let arena = Arena::from("testdir");
+        let (tx, rx) = mpsc::channel(10);
+        let ret = forward_peer_history(
+            context::current(),
+            Peer::from("server"),
+            HostPort::parse("localhost:0").await?,
+            verifier,
+            privkey,
+            vec![arena.clone()],
+            tx,
+        )
+        .await;
+
+        assert_eq!(
+            Some(std::io::ErrorKind::ConnectionRefused),
+            io_error_kind(ret.err())
+        );
+
+        assert!(rx.is_closed());
+
+        Ok(())
+    }
+
+    /// Extract I/O error kind from an anyhow error, if possible.
+    fn io_error_kind(err: Option<anyhow::Error>) -> Option<std::io::ErrorKind> {
+        Some(err?.downcast_ref::<std::io::Error>()?.kind())
     }
 }

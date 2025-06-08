@@ -58,25 +58,31 @@ impl LocalStorage {
 
     /// Subscribe to notification for the given arena.
     ///
+    /// If the arena is unknown, do nothing and return false. This is
+    /// not considered an error.
+    ///
     /// Dropping the receiver drops the subscription.
     ///
     /// Does nothing if the arena is unknown.
     ///
     /// All required inotify watches are guaranteed to have been
-    /// created when this command ends so any changes after that will
-    /// be caught. Note that this might take some time as creating
-    /// watches requires going through the whole arena, so use a join
-    /// if you need to subscribe to multiple arenas at the same time.
+    /// created when this function returns true, so any changes after
+    /// that will be caught. Note that this might take some time as
+    /// creating watches requires going through the whole arena, so
+    /// use a join if you need to subscribe to multiple arenas at the
+    /// same time.
     pub async fn subscribe(
         &self,
         arena: Arena,
         tx: mpsc::Sender<Notification>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         if let Some(resolver) = self.path_resolver(&arena, StorageAccess::Read) {
             self.history.subscribe(&arena, resolver, tx).await?;
-        }
 
-        Ok(())
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Define a single local arena.
