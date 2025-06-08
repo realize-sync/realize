@@ -3,3 +3,5 @@ manual_tests/one-*/*
 manual_tests/two-*/*
 manual_tests/*.pid
 manual_tests/*.out
+.vscode
+packages.microsoft.*
