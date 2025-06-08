@@ -17,6 +17,7 @@ use tarpc::context;
 use tarpc::context::Context;
 use tokio::io::AsyncReadExt as _;
 use tokio::io::AsyncWriteExt as _;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::Mutex;
@@ -221,19 +222,29 @@ pub async fn start_server(
 
     let addr = listener.local_addr()?;
 
-    let shutdown_accept_tx = shutdown_tx.downgrade();
-    let accept = async move |stream: TcpStream| -> anyhow::Result<()> {
-        let mut shutdown_rx = shutdown_accept_tx
-            .upgrade()
-            .map(|s| s.subscribe())
-            .ok_or(anyhow::anyhow!("Shutdown initiated"))?;
-
-        let limiter = Limiter::<StandardClock>::new(f64::INFINITY);
-        let (peer, tag, mut tls_stream) = networking.accept(stream, limiter.clone()).await?;
-        match &tag {
-            rpc::realize::TAG => {
+    let mut handlers: HashMap<
+        &[u8; 4],
+        Box<
+            dyn Fn(
+                    Peer,
+                    tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
+                    Limiter,
+                    broadcast::Receiver<()>,
+                ) + Send
+                + Sync,
+        >,
+    > = HashMap::new();
+    let realize_storage = storage.clone();
+    let history_storage = storage.clone();
+    handlers.insert(
+        rpc::realize::TAG,
+        Box::new(
+            move |peer: Peer,
+                  tls_stream,
+                  limiter: Limiter,
+                  mut shutdown_rx: broadcast::Receiver<()>| {
                 let framed = LengthDelimitedCodec::builder().new_framed(tls_stream);
-                let server = RealizeServer::new_limited(storage.clone(), limiter.clone());
+                let server = RealizeServer::new_limited(realize_storage.clone(), limiter);
                 tokio::spawn(async move {
                     let mut stream = Box::pin(
                         BaseChannel::with_defaults(transport::new(framed, Bincode::default()))
@@ -260,29 +271,47 @@ pub async fn start_server(
                         )
                     }
                 });
-            }
-            rpc::history::TAG => {
+            },
+        ),
+    );
+    handlers.insert(
+        rpc::history::TAG,
+        Box::new(
+            move |peer: Peer, tls_stream, _limiter: Limiter, shutdown_rx| {
                 let framed = LengthDelimitedCodec::builder().new_framed(tls_stream);
                 let transport = transport::new(framed, Bincode::default());
                 let channel = tarpc::client::new(Default::default(), transport).spawn();
                 let client = HistoryServiceClient::from(channel);
 
                 let peer = peer.clone();
-                let storage = storage.clone();
+                let storage = history_storage.clone();
                 tokio::spawn(async move {
                     if let Err(err) = history::client::collect(client, storage, shutdown_rx).await {
                         log::debug!("{}: history collection failed: {}", peer, err);
                     }
                 });
-            }
-            _ => {
-                log::info!("Got unsupported RPC service tag '{tag:?}' from {peer}");
-                // We log this separately from generic errors, because
-                // bad tags might highlight peer versioning issues.
+            },
+        ),
+    );
 
-                let _ = tls_stream.shutdown().await;
-                return Err(anyhow::anyhow!("Unknown RPC service tag"));
-            }
+    let shutdown_accept_tx = shutdown_tx.downgrade();
+    let accept = async move |stream: TcpStream| -> anyhow::Result<()> {
+        let shutdown_rx = shutdown_accept_tx
+            .upgrade()
+            .map(|s| s.subscribe())
+            .ok_or(anyhow::anyhow!("Shutdown initiated"))?;
+
+        let limiter = Limiter::<StandardClock>::new(f64::INFINITY);
+        let (peer, tag, mut tls_stream) = networking.accept(stream, limiter.clone()).await?;
+        if let Some(handler) = handlers.get(&tag) {
+            (*handler)(peer, tls_stream, limiter, shutdown_rx);
+        } else {
+            log::info!("Got unsupported RPC service tag '{tag:?}' from {peer}");
+            // We log this separately from generic errors, because
+            // bad tags might highlight peer versioning issues.
+
+            let _ = tls_stream.shutdown().await;
+            return Err(anyhow::anyhow!("Unknown RPC service tag"));
         }
 
         Ok(())
