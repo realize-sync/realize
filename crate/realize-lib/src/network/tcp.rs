@@ -203,7 +203,10 @@ pub struct Server {
         Box<
             dyn Fn(
                     Peer,
-                    tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
+                    tarpc::tokio_util::codec::Framed<
+                        tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
+                        LengthDelimitedCodec,
+                    >,
                     Limiter,
                     broadcast::Receiver<()>,
                 ) + Send
@@ -228,7 +231,10 @@ impl Server {
         tag: &'static [u8; 4],
         handler: impl Fn(
                 Peer,
-                tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
+                tarpc::tokio_util::codec::Framed<
+                    tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
+                    LengthDelimitedCodec,
+                >,
                 Limiter,
                 broadcast::Receiver<()>,
             ) + Send
@@ -236,6 +242,55 @@ impl Server {
             + 'static,
     ) {
         self.handlers.insert(tag, Box::new(handler));
+    }
+
+    fn register_server<T, S, F>(&mut self, tag: &'static [u8; 4], handler: T)
+    where
+        T: Fn(
+                &Peer,
+                Limiter,
+                tarpc::tokio_util::codec::Framed<
+                    tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
+                    LengthDelimitedCodec,
+                >,
+            ) -> S
+            + Send
+            + Sync
+            + 'static,
+        S: Stream<Item = F> + Send + 'static,
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.register(
+            tag,
+            move |peer: Peer,
+                  framed,
+                  limiter: Limiter,
+                  mut shutdown_rx: broadcast::Receiver<()>| {
+                let stream = handler(&peer, limiter, framed);
+
+                tokio::spawn(async move {
+                    let mut stream = Box::pin(stream);
+                    loop {
+                        tokio::select!(
+                            _ = shutdown_rx.recv() => {
+                                log::debug!("Shutting connection to {}", peer);
+                                break;
+                            }
+                            next = stream.next() => {
+                                match next {
+                                    None => {
+                                        break;
+                                    },
+                                    Some(fut) => {
+                                        tokio::spawn(metrics::track_in_flight_request(fut));
+                                    }
+                                }
+                            }
+                        )
+                    }
+                });
+            },
+        );
     }
 
     pub fn shutdown(&self) -> anyhow::Result<()> {
@@ -281,7 +336,9 @@ impl Server {
         let limiter = Limiter::<StandardClock>::new(f64::INFINITY);
         let (peer, tag, mut tls_stream) = self.networking.accept(stream, limiter.clone()).await?;
         if let Some(handler) = self.handlers.get(&tag) {
-            (*handler)(peer, tls_stream, limiter, shutdown_rx);
+            let framed = LengthDelimitedCodec::builder().new_framed(tls_stream);
+
+            (*handler)(peer, framed, limiter, shutdown_rx);
         } else {
             log::info!("Got unsupported RPC service tag '{tag:?}' from {peer}");
             // We log this separately from generic errors, because
@@ -313,45 +370,12 @@ pub async fn start_server(
 
     let realize_storage = storage.clone();
     let history_storage = storage.clone();
-    server.register(
-        rpc::realize::TAG,
-        move |peer: Peer,
-              tls_stream,
-              limiter: Limiter,
-              mut shutdown_rx: broadcast::Receiver<()>| {
-            let framed = LengthDelimitedCodec::builder().new_framed(tls_stream);
-            let server = RealizeServer::new_limited(realize_storage.clone(), limiter);
-            tokio::spawn(async move {
-                let mut stream = Box::pin(
-                    BaseChannel::with_defaults(transport::new(framed, Bincode::default())).execute(
-                        MetricsRealizeServer::new(RealizeServer::serve(server.clone())),
-                    ),
-                );
-                loop {
-                    tokio::select!(
-                        _ = shutdown_rx.recv() => {
-                            log::debug!("Shutting connection to {}", peer);
-                            break;
-                        }
-                        next = stream.next() => {
-                            match next {
-                                None => {
-                                    break;
-                                },
-                                Some(fut) => {
-                                    tokio::spawn(metrics::track_in_flight_request(fut));
-                                }
-                            }
-                        }
-                    )
-                }
-            });
-        },
-    );
+    server.register_server(rpc::realize::TAG, move |_peer, limiter, framed| {
+        realize_requests(realize_storage.clone(), limiter, framed)
+    });
     server.register(
         rpc::history::TAG,
-        move |peer: Peer, tls_stream, _limiter: Limiter, shutdown_rx| {
-            let framed = LengthDelimitedCodec::builder().new_framed(tls_stream);
+        move |peer: Peer, framed, _limiter: Limiter, shutdown_rx| {
             let transport = transport::new(framed, Bincode::default());
             let channel = tarpc::client::new(Default::default(), transport).spawn();
             let client = HistoryServiceClient::from(channel);
@@ -370,6 +394,21 @@ pub async fn start_server(
     let addr = Arc::clone(&server).listen(hostport).await?;
 
     Ok((addr, server.shutdown_tx.clone()))
+}
+
+fn realize_requests(
+    storage: LocalStorage,
+    limiter: Limiter,
+    framed: tarpc::tokio_util::codec::Framed<
+        tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
+        LengthDelimitedCodec,
+    >,
+) -> impl Stream<Item = impl Future<Output = ()>> {
+    let transport = transport::new(framed, Bincode::default());
+    let server = RealizeServer::new_limited(storage, limiter);
+    let serve_fn = MetricsRealizeServer::new(RealizeServer::serve(server.clone()));
+    let stream = BaseChannel::with_defaults(transport).execute(serve_fn);
+    stream
 }
 
 /// Forward history for the given peer to a mpsc channel.
