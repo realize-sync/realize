@@ -8,34 +8,36 @@ use crate::model;
 use crate::model::Arena;
 use crate::model::ByteRange;
 use crate::model::Hash;
+use crate::network::rpc::realize::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
 use crate::network::rpc::realize::Config;
 use crate::network::rpc::realize::Options;
-use crate::network::rpc::realize::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
 use crate::network::rpc::realize::{
     RealizeService, RealizeServiceError, Result, RsyncOperation, SyncedFile,
 };
 use crate::network::rpc::realize::{
     RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse,
 };
+use crate::network::tcp::Server;
 use crate::storage::real::LocalStorage;
 use crate::storage::real::PathResolver;
 use crate::storage::real::PathType;
 use crate::storage::real::StorageAccess;
 use crate::utils::hash;
-use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
+use async_speed_limit::Limiter;
 use fast_rsync::{
-    Signature as RsyncSignature, SignatureOptions, apply_limited as rsync_apply_limited,
-    diff as rsync_diff,
+    apply_limited as rsync_apply_limited, diff as rsync_diff, Signature as RsyncSignature,
+    SignatureOptions,
 };
 use futures::StreamExt;
 use std::cmp::min;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
-use tarpc::client::RpcError;
 use tarpc::client::stub::Stub;
+use tarpc::client::RpcError;
 use tarpc::context;
 use tarpc::server::Channel;
+use tarpc::tokio_serde::formats::Bincode;
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::AsyncReadExt as _;
 use tokio::io::AsyncSeekExt as _;
@@ -71,6 +73,17 @@ impl Stub for InProcessStub {
     ) -> std::result::Result<RealizeServiceResponse, RpcError> {
         self.inner.call(ctx, request).await
     }
+}
+
+pub fn register(server: &mut Server, realize_storage: LocalStorage) {
+    server.register_server(super::TAG, move |_peer, limiter, framed| {
+        let storage = realize_storage.clone();
+        let transport = tarpc::serde_transport::new(framed, Bincode::default());
+        let server = RealizeServer::new_limited(storage, limiter);
+        let serve_fn = MetricsRealizeServer::new(RealizeServer::serve(server.clone()));
+
+        tarpc::server::BaseChannel::with_defaults(transport).execute(serve_fn)
+    });
 }
 
 #[derive(Clone)]
@@ -534,8 +547,8 @@ fn bad_path() -> RealizeServiceError {
 mod tests {
     use super::*;
     use crate::model::Hash;
-    use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
     use std::ffi::OsString;
     use std::fs;
@@ -967,7 +980,7 @@ mod tests {
                 Options::default(),
             )
             .await?;
-        assert!(!delta.0.0.is_empty());
+        assert!(!delta.0 .0.is_empty());
 
         // Revert file to old content, then apply delta
         temp.child(".foo.txt.part").write_binary(file_content)?;

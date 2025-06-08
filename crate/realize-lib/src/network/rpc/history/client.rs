@@ -1,8 +1,10 @@
 use tarpc::client::stub::Stub;
 use tarpc::context;
+use tarpc::tokio_serde::formats::Bincode;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::network::rpc::history::HistoryServiceClient;
+use crate::model::Peer;
+use crate::network::{rpc::history::HistoryServiceClient, tcp::Server};
 use crate::storage::real::LocalStorage;
 
 use super::{HistoryServiceRequest, HistoryServiceResponse};
@@ -56,4 +58,20 @@ where
     }
 
     Ok(())
+}
+
+pub fn register(server: &mut Server, storage: LocalStorage) {
+    server.register(super::TAG, move |peer: Peer, framed, _, shutdown_rx| {
+        let transport = tarpc::serde_transport::new(framed, Bincode::default());
+        let channel = tarpc::client::new(Default::default(), transport).spawn();
+        let client = HistoryServiceClient::from(channel);
+
+        let peer = peer.clone();
+        let storage = storage.clone();
+        tokio::spawn(async move {
+            if let Err(err) = collect(client, storage, shutdown_rx).await {
+                log::debug!("{}: history collection failed: {}", peer, err);
+            }
+        });
+    });
 }

@@ -35,7 +35,7 @@ use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
 use tarpc::serde_transport as transport;
-use tarpc::server::{BaseChannel, Channel};
+use tarpc::server::BaseChannel;
 use tarpc::tokio_serde::formats::Bincode;
 use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
 
@@ -44,17 +44,14 @@ use crate::model::Peer;
 use crate::network::rate_limit::RateLimitedStream;
 use crate::network::reconnect::Connect;
 use crate::network::reconnect::Reconnect;
-use crate::network::rpc;
-use crate::network::rpc::history::{self, HistoryServiceClient};
+use crate::network::rpc::history::{self};
 use crate::network::rpc::realize;
 use crate::network::rpc::realize::metrics;
 use crate::network::rpc::realize::metrics::MetricsRealizeClient;
-use crate::network::rpc::realize::metrics::MetricsRealizeServer;
-use crate::network::rpc::realize::server::RealizeServer;
 use crate::network::rpc::realize::Config;
+use crate::network::rpc::realize::RealizeServiceClient;
 use crate::network::rpc::realize::RealizeServiceRequest;
 use crate::network::rpc::realize::RealizeServiceResponse;
-use crate::network::rpc::realize::{RealizeService, RealizeServiceClient};
 use crate::network::security;
 use crate::network::security::PeerVerifier;
 use crate::storage::real::LocalStorage;
@@ -226,7 +223,7 @@ impl Server {
         }
     }
 
-    fn register(
+    pub(crate) fn register(
         &mut self,
         tag: &'static [u8; 4],
         handler: impl Fn(
@@ -244,7 +241,7 @@ impl Server {
         self.handlers.insert(tag, Box::new(handler));
     }
 
-    fn register_server<T, S, F>(&mut self, tag: &'static [u8; 4], handler: T)
+    pub(crate) fn register_server<T, S, F>(&mut self, tag: &'static [u8; 4], handler: T)
     where
         T: Fn(
                 &Peer,
@@ -368,47 +365,13 @@ pub async fn start_server(
     let networking = Networking::new(vec![], privkey, verifier);
     let mut server = Server::new(networking);
 
-    let realize_storage = storage.clone();
-    let history_storage = storage.clone();
-    server.register_server(rpc::realize::TAG, move |_peer, limiter, framed| {
-        realize_requests(realize_storage.clone(), limiter, framed)
-    });
-    server.register(
-        rpc::history::TAG,
-        move |peer: Peer, framed, _limiter: Limiter, shutdown_rx| {
-            let transport = transport::new(framed, Bincode::default());
-            let channel = tarpc::client::new(Default::default(), transport).spawn();
-            let client = HistoryServiceClient::from(channel);
-
-            let peer = peer.clone();
-            let storage = history_storage.clone();
-            tokio::spawn(async move {
-                if let Err(err) = history::client::collect(client, storage, shutdown_rx).await {
-                    log::debug!("{}: history collection failed: {}", peer, err);
-                }
-            });
-        },
-    );
+    realize::server::register(&mut server, storage.clone());
+    history::client::register(&mut server, storage.clone());
 
     let server = Arc::new(server);
     let addr = Arc::clone(&server).listen(hostport).await?;
 
     Ok((addr, server.shutdown_tx.clone()))
-}
-
-fn realize_requests(
-    storage: LocalStorage,
-    limiter: Limiter,
-    framed: tarpc::tokio_util::codec::Framed<
-        tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
-        LengthDelimitedCodec,
-    >,
-) -> impl Stream<Item = impl Future<Output = ()>> {
-    let transport = transport::new(framed, Bincode::default());
-    let server = RealizeServer::new_limited(storage, limiter);
-    let serve_fn = MetricsRealizeServer::new(RealizeServer::serve(server.clone()));
-    let stream = BaseChannel::with_defaults(transport).execute(serve_fn);
-    stream
 }
 
 /// Forward history for the given peer to a mpsc channel.
