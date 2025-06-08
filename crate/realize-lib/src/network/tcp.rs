@@ -3,9 +3,12 @@
 //! This module provides secure, rate-limited, and reconnecting TCP transport for the RealizeService RPC interface.
 //! It handles TLS setup, peer authentication, DNS resolution, and connection retry logic.
 
+use anyhow::Context as _;
 use async_speed_limit::clock::StandardClock;
 use async_speed_limit::Limiter;
 use futures::prelude::*;
+use rustls::pki_types::pem::PemObject as _;
+use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::ServerName;
 use rustls::sign::SigningKey;
 use tarpc::client::stub::Stub;
@@ -22,7 +25,9 @@ use tokio::time::timeout;
 use tokio_retry::strategy::ExponentialBackoff;
 use tokio_rustls::TlsConnector;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -56,9 +61,107 @@ use crate::storage::real::LocalStorage;
 use crate::storage::real::Notification;
 use crate::utils::async_utils::AbortOnDrop;
 
+use super::config::PeerConfig;
 use super::hostport::HostPort;
 
 pub type TcpRealizeServiceClient = RealizeServiceClient<TcpStub>;
+
+pub struct Networking {
+    addresses: HashMap<Peer, String>,
+    privkey: Arc<dyn SigningKey>,
+    verifier: Arc<PeerVerifier>,
+}
+
+impl Networking {
+    pub fn from_config(
+        peers: &HashMap<Peer, PeerConfig>,
+        privkey: PathBuf,
+    ) -> anyhow::Result<Self> {
+        let verifier = PeerVerifier::from_config(&peers)?;
+        let privkey =
+            security::default_provider()
+                .key_provider
+                .load_private_key(PrivateKeyDer::from_pem_file(&privkey).with_context(|| {
+                    format!("not a PEM-encoded private key: {}", privkey.display())
+                })?)
+                .with_context(|| format!("invalid private key in {}", privkey.display()))?;
+
+        Ok(Self::new(
+            peers.iter().flat_map(|(p, c)| {
+                if let Some(addr) = &c.address {
+                    Some((p, addr.as_ref()))
+                } else {
+                    None
+                }
+            }),
+            privkey,
+            verifier,
+        ))
+    }
+
+    pub fn new<'a, T>(
+        addresses: T,
+        privkey: Arc<dyn SigningKey>,
+        verifier: Arc<PeerVerifier>,
+    ) -> Self
+    where
+        T: IntoIterator<Item = (&'a Peer, &'a str)>,
+    {
+        Self {
+            addresses: addresses
+                .into_iter()
+                .map(|(p, addr)| (p.clone(), addr.to_string()))
+                .collect(),
+            privkey,
+            verifier,
+        }
+    }
+
+    async fn connect<Req, Resp>(
+        &self,
+        peer: &Peer,
+        tag: &[u8; 4],
+        limiter: Option<Limiter>,
+    ) -> Result<
+        transport::Transport<
+            tokio_rustls::client::TlsStream<RateLimitedStream<TcpStream>>,
+            tarpc::ClientMessage<Req>,
+            tarpc::Response<Resp>,
+            Bincode<tarpc::ClientMessage<Req>, tarpc::Response<Resp>>,
+        >,
+        anyhow::Error,
+    >
+    where
+        Req: for<'de> serde::Deserialize<'de>,
+        Resp: serde::Serialize,
+    {
+        let addr = self
+            .addresses
+            .get(&peer)
+            .ok_or(anyhow::anyhow!("no address known for {peer}"))?;
+        let addr = HostPort::parse(addr)
+            .await
+            .with_context(|| format!("address for {peer} is invalid"))?;
+        let domain = ServerName::try_from(addr.host().to_string())?;
+        let connector =
+            security::make_tls_connector(Arc::clone(&self.verifier), Arc::clone(&self.privkey))?;
+
+        let stream = TcpStream::connect(addr.addr()).await?;
+        let stream = RateLimitedStream::new(
+            stream,
+            limiter.unwrap_or_else(|| Limiter::<StandardClock>::new(f64::INFINITY)),
+        );
+        let mut tls_stream = connector.connect(domain, stream).await?;
+        tls_stream.write_all(tag).await?;
+
+        let transport = transport::new(
+            LengthDelimitedCodec::builder().new_framed(tls_stream),
+            Bincode::default(),
+        );
+
+        Ok(transport)
+    }
+}
 
 /// Start the server, listening on the given address.
 ///
@@ -197,28 +300,27 @@ pub async fn start_server(
 /// After a successful connection, the forwarder runs until either the
 /// channel is closed or the connection is lost. Check the
 /// [JoinHandle].
-pub async fn forward_peer_history(
+pub async fn forward_peer_history<T>(
+    networking: &Networking,
     ctx: Context,
-    peer: Peer,
-    addr: HostPort,
-    verifier: Arc<PeerVerifier>,
-    privkey: Arc<dyn SigningKey>,
-    arenas: Vec<Arena>,
+    peer: &Peer,
+    arenas: T,
     tx: mpsc::Sender<(Peer, Notification)>,
-) -> anyhow::Result<(Vec<Arena>, JoinHandle<anyhow::Result<()>>)> {
-    let connector = security::make_tls_connector(verifier, privkey)?;
-    let stream = TcpStream::connect(addr.addr()).await?;
-    let mut tls_stream = connector
-        .connect(ServerName::try_from(addr.host().to_string())?, stream)
+) -> anyhow::Result<(Vec<Arena>, JoinHandle<anyhow::Result<()>>)>
+where
+    T: IntoIterator<Item = Arena>,
+{
+    let transport = networking
+        .connect::<history::HistoryServiceRequest, history::HistoryServiceResponse>(
+            &peer,
+            history::TAG,
+            None,
+        )
         .await?;
-    tls_stream.write_all(history::TAG).await?;
-
-    let transport = transport::new(
-        LengthDelimitedCodec::builder().new_framed(tls_stream),
-        Bincode::default(),
-    );
 
     let (ready_tx, ready_rx) = oneshot::channel();
+    let peer = peer.clone();
+    let arenas = arenas.into_iter().collect();
     let handle = AbortOnDrop::new(tokio::spawn(history::server::run_forwarder(
         peer,
         arenas,
@@ -848,7 +950,6 @@ mod tests {
         Ok((addr, handle))
     }
 
-
     #[tokio::test]
     async fn server_shutdown() -> anyhow::Result<()> {
         let verifier = verifier_both();
@@ -891,19 +992,17 @@ mod tests {
         let verifier = verifier_both();
         let (addr, _shutdown, tempdir) = setup_test_server(Arc::clone(&verifier)).await?;
         let privkey = load_private_key(testing::client_private_key())?;
-
+        let server = Peer::from("server");
+        let net = Networking::new(
+            vec![(&server, addr.to_string().as_ref())],
+            privkey,
+            verifier,
+        );
         let arena = Arena::from("testdir");
         let (tx, mut rx) = mpsc::channel(10);
-        let (watched, handle) = forward_peer_history(
-            context::current(),
-            Peer::from("server"),
-            addr.into(),
-            verifier,
-            privkey,
-            vec![arena.clone()],
-            tx,
-        )
-        .await?;
+        let (watched, handle) =
+            forward_peer_history(&net, context::current(), &server, vec![arena.clone()], tx)
+                .await?;
 
         assert_eq!(vec![arena.clone()], watched);
 
@@ -940,19 +1039,18 @@ mod tests {
         let verifier = verifier_both();
         let (addr, shutdown, _tempdir) = setup_test_server(Arc::clone(&verifier)).await?;
         let privkey = load_private_key(testing::client_private_key())?;
+        let server = Peer::from("server");
+        let net = Networking::new(
+            vec![(&server, addr.to_string().as_ref())],
+            privkey,
+            verifier,
+        );
 
         let arena = Arena::from("testdir");
         let (tx, _rx) = mpsc::channel(10);
-        let (watched, handle) = forward_peer_history(
-            context::current(),
-            Peer::from("server"),
-            addr.into(),
-            verifier,
-            privkey,
-            vec![arena.clone()],
-            tx,
-        )
-        .await?;
+        let (watched, handle) =
+            forward_peer_history(&net, context::current(), &server, vec![arena.clone()], tx)
+                .await?;
 
         assert_eq!(vec![arena.clone()], watched);
 
@@ -970,18 +1068,12 @@ mod tests {
 
         let verifier = verifier_both();
         let privkey = load_private_key(testing::client_private_key())?;
+        let server = Peer::from("server");
+        let net = Networking::new(vec![(&server, "localhost:0")], privkey, verifier);
         let arena = Arena::from("testdir");
         let (tx, rx) = mpsc::channel(10);
-        let ret = forward_peer_history(
-            context::current(),
-            Peer::from("server"),
-            HostPort::parse("localhost:0").await?,
-            verifier,
-            privkey,
-            vec![arena.clone()],
-            tx,
-        )
-        .await;
+        let ret =
+            forward_peer_history(&net, context::current(), &server, vec![arena.clone()], tx).await;
 
         assert_eq!(
             Some(std::io::ErrorKind::ConnectionRefused),
