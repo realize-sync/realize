@@ -1,33 +1,26 @@
 use anyhow::Context as _;
-use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
+use async_speed_limit::Limiter;
 use clap::Parser;
 use clap::ValueEnum;
 use console::style;
 use futures_util::stream::StreamExt as _;
 use indicatif::HumanBytes;
 use progress::CliProgress;
-use prometheus::{IntCounter, register_int_counter};
+use prometheus::{register_int_counter, IntCounter};
 use realize_lib::logic::consensus::movedirs::MoveFileError;
 use realize_lib::model::Arena;
 use realize_lib::model::Peer;
 use realize_lib::network::config::PeerConfig;
 use realize_lib::network::rpc::realize::metrics;
-use realize_lib::network::security::{self, PeerVerifier};
-use realize_lib::network::{
-    hostport::HostPort,
-    tcp::{self, ClientConnectionState, TcpRealizeServiceClient},
-};
+use realize_lib::network::tcp::Networking;
+use realize_lib::network::tcp::{self, ClientConnectionState, TcpRealizeServiceClient};
 use realize_lib::utils::logging;
-use rustls::pki_types::PrivateKeyDer;
-use rustls::pki_types::pem::PemObject as _;
-use rustls::sign::SigningKey;
 use signal_hook_tokio::Signals;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::Arc;
 use std::time::Instant;
 use tarpc::client::RpcError;
 use tarpc::context;
@@ -192,19 +185,9 @@ async fn execute(cli: &Cli) -> anyhow::Result<i32> {
     let mut ctx = context::current();
     ctx.deadline = std::time::Instant::now() + cli.max_duration.into();
 
-    let privkey = load_private_key_file(&cli.privkey)
-        .with_context(|| format!("{}: Invalid private key file", cli.privkey.display()))?;
-
     let config = parse_config(&cli.config)
         .with_context(|| format!("{}: failed to read TOML config file", cli.config.display()))?;
-
-    let verifier = PeerVerifier::from_config(&config.peers)?;
-    let src_addr = peer_address(&config, &cli.src)
-        .await
-        .with_context(|| format!("invalid --src"))?;
-    let dst_addr = peer_address(&config, &cli.dst)
-        .await
-        .with_context(|| format!("invalid --dst"))?;
+    let networking = Networking::from_config(&config.peers, &cli.privkey)?;
 
     let mut signals = Signals::new(&[
         signal_hook::consts::SIGHUP,
@@ -218,7 +201,7 @@ async fn execute(cli: &Cli) -> anyhow::Result<i32> {
     let output_mode = cli.output;
 
     tokio::select!(
-        ret = run_with_progress(cli, src_addr, dst_addr, ctx, privkey, verifier, &mut cli_progress) => {
+        ret = run_with_progress(cli, ctx, networking, &mut cli_progress) => {
         ret.map(|_| 0)
     }
     _ = signals.next() => {
@@ -232,11 +215,8 @@ async fn execute(cli: &Cli) -> anyhow::Result<i32> {
 
 async fn run_with_progress(
     cli: &Cli,
-    src_addr: HostPort,
-    dst_addr: HostPort,
     ctx: context::Context,
-    privkey: Arc<dyn SigningKey>,
-    verifier: Arc<PeerVerifier>,
+    networking: Networking,
     cli_progress: &mut CliProgress,
 ) -> anyhow::Result<()> {
     let (progress_tx, progress_rx) = mpsc::channel(32);
@@ -248,22 +228,8 @@ async fn run_with_progress(
         cli_progress.update(progress_rx, src_watch_rx, dst_watch_rx),
         async move {
             let (src_client, dst_client) = tokio::join!(
-                connect(
-                    "--src",
-                    &src_addr,
-                    None,
-                    privkey.clone(),
-                    verifier.clone(),
-                    src_watch_tx,
-                ),
-                connect(
-                    "--dst",
-                    &dst_addr,
-                    cli.throttle_up,
-                    privkey,
-                    verifier,
-                    dst_watch_tx,
-                )
+                connect(&networking, &cli.src, None, src_watch_tx),
+                connect(&networking, &cli.dst, cli.throttle_up, dst_watch_tx)
             );
 
             let src_client = src_client?;
@@ -379,11 +345,9 @@ async fn run_with_progress(
 }
 
 async fn connect(
-    argument: &str,
-    addr: &HostPort,
+    networking: &Networking,
+    peer: &str,
     limit: Option<u64>,
-    privkey: Arc<dyn SigningKey>,
-    verifier: Arc<PeerVerifier>,
     conn_status: tokio::sync::watch::Sender<ClientConnectionState>,
 ) -> anyhow::Result<
     realize_lib::network::rpc::realize::RealizeServiceClient<tcp::TcpStub>,
@@ -396,11 +360,7 @@ async fn connect(
     }
     options.connection_events = Some(conn_status);
 
-    Ok(
-        tcp::connect_client(&addr, Arc::clone(&verifier), Arc::clone(&privkey), options)
-            .await
-            .with_context(|| format!("Connection to {argument} {addr} failed"))?,
-    )
+    Ok(tcp::connect_client(networking, &Peer::from(peer), options).await?)
 }
 
 /// Set server-site write rate limit on client, return it.
@@ -443,29 +403,6 @@ fn print_error(mode: OutputMode, msg: &str) {
             eprintln!("{}: {}", style("ERROR").for_stderr().red().bold(), msg);
         }
     }
-}
-
-fn load_private_key_file(path: &Path) -> anyhow::Result<Arc<dyn SigningKey>> {
-    let key = PrivateKeyDer::from_pem_file(path)?;
-
-    Ok(security::default_provider()
-        .key_provider
-        .load_private_key(key)?)
-}
-
-async fn peer_address(config: &Config, peer: &str) -> anyhow::Result<HostPort> {
-    let peer = Peer::from(peer.to_string());
-    let config = config.peers.get(&peer).ok_or(anyhow::anyhow!(
-        "no peer named {peer} found in the configuration"
-    ))?;
-    let address = config
-        .address
-        .as_ref()
-        .ok_or(anyhow::anyhow!("no address for peer {peer}"))?;
-
-    Ok(HostPort::parse(&address)
-        .await
-        .with_context(|| format!("invalid address configured for {peer}"))?)
 }
 
 fn parse_config(path: &Path) -> anyhow::Result<Config> {

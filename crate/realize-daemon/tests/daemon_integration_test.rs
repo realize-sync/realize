@@ -4,8 +4,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use assert_fs::TempDir;
 use assert_fs::prelude::*;
+use assert_fs::TempDir;
 use predicates::prelude::*;
 use realize_lib::model;
 use realize_lib::model::Arena;
@@ -13,11 +13,12 @@ use realize_lib::model::Peer;
 use realize_lib::network::rpc::realize::Options;
 use realize_lib::network::security;
 use realize_lib::network::security::PeerVerifier;
-use realize_lib::network::{hostport::HostPort, tcp};
+use realize_lib::network::tcp;
+use realize_lib::network::tcp::Networking;
 use reqwest::Client;
+use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::SubjectPublicKeyInfoDer;
-use rustls::pki_types::pem::PemObject as _;
 use tarpc::context;
 use tokio::io::AsyncBufReadExt as _;
 use tokio::process::Command;
@@ -110,16 +111,15 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
         SubjectPublicKeyInfoDer::from_pem_file(fixture.resources.join("a-spki.pem"))?,
     );
     let verifier = Arc::new(verifier);
-
-    let client = tcp::connect_client(
-        &HostPort::parse(&format!("127.0.0.1:{portstr}")).await?,
-        verifier,
+    let peer = Peer::from("server");
+    let networking = Networking::new(
+        vec![(&peer, format!("127.0.0.1:{portstr}").as_ref())],
         security::default_provider().key_provider.load_private_key(
             PrivateKeyDer::from_pem_file(fixture.resources.join("a.key"))?,
         )?,
-        tcp::ClientOptions::default(),
-    )
-    .await?;
+        verifier,
+    );
+    let client = tcp::connect_client(&networking, &peer, tcp::ClientOptions::default()).await?;
     let files = client
         .list(
             context::current(),

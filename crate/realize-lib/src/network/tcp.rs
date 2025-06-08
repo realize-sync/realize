@@ -23,11 +23,10 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_retry::strategy::ExponentialBackoff;
-use tokio_rustls::TlsConnector;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -66,8 +65,9 @@ use super::hostport::HostPort;
 
 pub type TcpRealizeServiceClient = RealizeServiceClient<TcpStub>;
 
+#[derive(Clone)]
 pub struct Networking {
-    addresses: HashMap<Peer, String>,
+    addresses: Arc<HashMap<Peer, String>>,
     privkey: Arc<dyn SigningKey>,
     verifier: Arc<PeerVerifier>,
 }
@@ -75,13 +75,13 @@ pub struct Networking {
 impl Networking {
     pub fn from_config(
         peers: &HashMap<Peer, PeerConfig>,
-        privkey: PathBuf,
+        privkey: &path::Path,
     ) -> anyhow::Result<Self> {
         let verifier = PeerVerifier::from_config(&peers)?;
         let privkey =
             security::default_provider()
                 .key_provider
-                .load_private_key(PrivateKeyDer::from_pem_file(&privkey).with_context(|| {
+                .load_private_key(PrivateKeyDer::from_pem_file(privkey).with_context(|| {
                     format!("not a PEM-encoded private key: {}", privkey.display())
                 })?)
                 .with_context(|| format!("invalid private key in {}", privkey.display()))?;
@@ -108,10 +108,12 @@ impl Networking {
         T: IntoIterator<Item = (&'a Peer, &'a str)>,
     {
         Self {
-            addresses: addresses
-                .into_iter()
-                .map(|(p, addr)| (p.clone(), addr.to_string()))
-                .collect(),
+            addresses: Arc::new(
+                addresses
+                    .into_iter()
+                    .map(|(p, addr)| (p.clone(), addr.to_string()))
+                    .collect(),
+            ),
             privkey,
             verifier,
         }
@@ -125,9 +127,9 @@ impl Networking {
     ) -> Result<
         transport::Transport<
             tokio_rustls::client::TlsStream<RateLimitedStream<TcpStream>>,
-            tarpc::ClientMessage<Req>,
-            tarpc::Response<Resp>,
-            Bincode<tarpc::ClientMessage<Req>, tarpc::Response<Resp>>,
+            Req,
+            Resp,
+            Bincode<Req, Resp>,
         >,
         anyhow::Error,
     >
@@ -310,13 +312,7 @@ pub async fn forward_peer_history<T>(
 where
     T: IntoIterator<Item = Arena>,
 {
-    let transport = networking
-        .connect::<history::HistoryServiceRequest, history::HistoryServiceResponse>(
-            &peer,
-            history::TAG,
-            None,
-        )
-        .await?;
+    let transport = networking.connect(&peer, history::TAG, None).await?;
 
     let (ready_tx, ready_rx) = oneshot::channel();
     let peer = peer.clone();
@@ -351,7 +347,6 @@ where
 
 #[derive(Clone, Default)]
 pub struct ClientOptions {
-    pub domain: Option<String>,
     pub limiter: Option<Limiter<StandardClock>>,
     pub connection_events: Option<tokio::sync::watch::Sender<ClientConnectionState>>,
 }
@@ -369,20 +364,18 @@ pub enum ClientConnectionState {
 
 /// Create a [RealizeServiceClient] connected to the given TCP address.
 pub async fn connect_client(
-    hostport: &HostPort,
-    verifier: Arc<PeerVerifier>,
-    privkey: Arc<dyn SigningKey>,
+    networking: &Networking,
+    peer: &Peer,
     options: ClientOptions,
 ) -> anyhow::Result<TcpRealizeServiceClient> {
-    let connector = security::make_tls_connector(verifier, privkey)?;
-    let stub = TcpStub::new(hostport, connector, options).await?;
+    let stub = TcpStub::new(networking, peer, options).await?;
     Ok(RealizeServiceClient::from(stub))
 }
 
 #[derive(Clone)]
 struct TcpConnect {
-    hostport: HostPort,
-    connector: TlsConnector,
+    networking: Networking,
+    peer: Peer,
     options: ClientOptions,
     config: Arc<Mutex<Option<Config>>>,
 }
@@ -397,26 +390,10 @@ impl Connect<tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceRe
         if let Some(tx) = &self.options.connection_events {
             let _ = tx.send(ClientConnectionState::Connecting);
         }
-        let stream = TcpStream::connect(self.hostport.addr()).await?;
-        let domain = ServerName::try_from(
-            self.options
-                .clone()
-                .domain
-                .unwrap_or_else(|| self.hostport.host().to_string()),
-        )?;
-        let limiter = self
-            .options
-            .limiter
-            .clone()
-            .unwrap_or_else(|| Limiter::<StandardClock>::new(f64::INFINITY));
-        let mut tls_stream = self
-            .connector
-            .connect(domain, RateLimitedStream::new(stream, limiter.clone()))
+        let transport = self
+            .networking
+            .connect(&self.peer, realize::TAG, self.options.limiter.clone())
             .await?;
-        tls_stream.write_all(realize::TAG).await?;
-
-        let codec_builder = LengthDelimitedCodec::builder();
-        let transport = transport::new(codec_builder.new_framed(tls_stream), Bincode::default());
         let channel = tarpc::client::new(Default::default(), transport).spawn();
 
         // Recover stored configuration
@@ -450,8 +427,8 @@ pub struct TcpStub {
 
 impl TcpStub {
     async fn new(
-        hostport: &HostPort,
-        connector: TlsConnector,
+        networking: &Networking,
+        peer: &Peer,
         options: ClientOptions,
     ) -> anyhow::Result<Self> {
         let retry_strategy =
@@ -463,8 +440,8 @@ impl TcpStub {
             let _ = tx.send(ClientConnectionState::NotConnected);
         }
         let connect = TcpConnect {
-            hostport: hostport.clone(),
-            connector,
+            networking: networking.clone(),
+            peer: peer.clone(),
             options,
             config: Arc::clone(&config),
         };
@@ -574,13 +551,14 @@ mod tests {
         let verifier = verifier_both();
         let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
         let client_privkey = load_private_key(testing::client_private_key())?;
-        let client = connect_client(
-            &HostPort::from(addr),
-            verifier_both(),
+        let options = ClientOptions::default();
+        let peer = Peer::from("server");
+        let networking = Networking::new(
+            vec![(&peer, addr.to_string().as_ref())],
             client_privkey,
-            ClientOptions::default(),
-        )
-        .await?;
+            verifier,
+        );
+        let client = connect_client(&networking, &peer, options).await?;
         let list = client
             .list(
                 context::current(),
@@ -616,13 +594,14 @@ mod tests {
         let verifier = verifier_server_only();
         let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await.unwrap();
         let client_privkey = load_private_key(testing::client_private_key())?;
-        let client_result = connect_client(
-            &HostPort::from(addr),
-            Arc::clone(&verifier),
+        let options = ClientOptions::default();
+        let peer = Peer::from("server");
+        let networking = Networking::new(
+            vec![(&peer, addr.to_string().as_ref())],
             client_privkey,
-            ClientOptions::default(),
-        )
-        .await;
+            verifier,
+        );
+        let client_result = connect_client(&networking, &peer, options).await;
         let failed = match client_result {
             Ok(client) => client
                 .list(
@@ -645,13 +624,14 @@ mod tests {
         let verifier = verifier_client_only();
         let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await.unwrap();
         let client_privkey = load_private_key(testing::client_private_key())?;
-        let result = connect_client(
-            &HostPort::from(addr),
-            Arc::clone(&verifier),
+        let options = ClientOptions::default();
+        let peer = Peer::from("server");
+        let networking = Networking::new(
+            vec![(&peer, addr.to_string().as_ref())],
             client_privkey,
-            ClientOptions::default(),
-        )
-        .await;
+            verifier,
+        );
+        let result = connect_client(&networking, &peer, options).await;
         assert!(
             result.is_err(),
             "Expected error when server is not in client verifier"
@@ -674,13 +654,14 @@ mod tests {
         )
         .await?;
         let client_privkey = load_private_key(testing::client_private_key())?;
-        let client = connect_client(
-            &HostPort::from(addr),
-            verifier.clone(),
+        let options = ClientOptions::default();
+        let peer = Peer::from("server");
+        let networking = Networking::new(
+            vec![(&peer, addr.to_string().as_ref())],
             client_privkey,
-            ClientOptions::default(),
-        )
-        .await?;
+            verifier,
+        );
+        let client = connect_client(&networking, &peer, options).await?;
         let limit = 12345u64;
         let config = client
             .configure(
@@ -713,17 +694,24 @@ mod tests {
         .await?;
         let client_privkey1 = load_private_key(testing::client_private_key())?;
         let client_privkey2 = load_private_key(testing::client_private_key())?;
+        let peer = Peer::from("server");
         let client1 = connect_client(
-            &HostPort::from(addr),
-            Arc::clone(&verifier),
-            client_privkey1,
+            &Networking::new(
+                vec![(&peer, addr.to_string().as_ref())],
+                client_privkey1,
+                Arc::clone(&verifier),
+            ),
+            &peer,
             ClientOptions::default(),
         )
         .await?;
         let client2 = connect_client(
-            &HostPort::from(addr),
-            Arc::clone(&verifier),
-            client_privkey2,
+            &Networking::new(
+                vec![(&peer, addr.to_string().as_ref())],
+                client_privkey2,
+                Arc::clone(&verifier),
+            ),
+            &peer,
             ClientOptions::default(),
         )
         .await?;
@@ -755,13 +743,13 @@ mod tests {
             proxy_tcp(&addr, shutdown.clone(), connection_count.clone()).await?;
 
         let client_privkey = load_private_key(testing::client_private_key())?;
-        let client = connect_client(
-            &HostPort::from(proxy_addr),
-            verifier_both(),
+        let peer = Peer::from("server");
+        let networking = Networking::new(
+            vec![(&peer, proxy_addr.to_string().as_ref())],
             client_privkey,
-            ClientOptions::default(),
-        )
-        .await?;
+            verifier,
+        );
+        let client = connect_client(&networking, &peer, ClientOptions::default()).await?;
 
         client
             .list(
@@ -794,13 +782,13 @@ mod tests {
             proxy_tcp(&addr, shutdown.clone(), connection_count.clone()).await?;
 
         let client_privkey = load_private_key(testing::client_private_key())?;
-        let client = connect_client(
-            &HostPort::from(proxy_addr),
-            verifier_both(),
+        let peer = Peer::from("server");
+        let networking = Networking::new(
+            vec![(&peer, proxy_addr.to_string().as_ref())],
             client_privkey,
-            ClientOptions::default(),
-        )
-        .await?;
+            verifier,
+        );
+        let client = connect_client(&networking, &peer, ClientOptions::default()).await?;
 
         let config = Config {
             write_limit: Some(1024),
@@ -851,16 +839,17 @@ mod tests {
             }
         });
 
-        let client = connect_client(
-            &HostPort::from(proxy_addr),
-            verifier_both(),
+        let peer = Peer::from("server");
+        let networking = Networking::new(
+            vec![(&peer, proxy_addr.to_string().as_ref())],
             load_private_key(testing::client_private_key())?,
-            ClientOptions {
-                connection_events: Some(conn_tx),
-                ..ClientOptions::default()
-            },
-        )
-        .await?;
+            verifier_both(),
+        );
+        let options = ClientOptions {
+            connection_events: Some(conn_tx),
+            ..ClientOptions::default()
+        };
+        let client = connect_client(&networking, &peer, options).await?;
 
         client
             .list(
@@ -955,27 +944,18 @@ mod tests {
         let verifier = verifier_both();
         let (addr, shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
 
-        // Before shutdown, connection succeeds.
-        let client_privkey = load_private_key(testing::client_private_key())?;
-        connect_client(
-            &HostPort::from(addr),
-            Arc::clone(&verifier_both()),
-            Arc::clone(&client_privkey),
-            ClientOptions::default(),
-        )
-        .await?;
+        let privkey = load_private_key(testing::client_private_key())?;
+        let peer = Peer::from("server");
+        let networking =
+            Networking::new(vec![(&peer, addr.to_string().as_ref())], privkey, verifier);
+
+        connect_client(&networking, &peer, ClientOptions::default()).await?;
 
         shutdown.send(())?;
         shutdown.closed().await;
 
         // After shutdown, connection fails
-        let ret = connect_client(
-            &HostPort::from(addr),
-            verifier_both(),
-            client_privkey,
-            ClientOptions::default(),
-        )
-        .await;
+        let ret = connect_client(&networking, &peer, ClientOptions::default()).await;
 
         assert_eq!(
             Some(std::io::ErrorKind::ConnectionRefused),
