@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod server;
 
 use crate::model::{self, Arena, ByteRange, ByteRanges, Delta, Hash, Signature};
+use std::time::SystemTime;
 
 /// Convenient shortcut for results containing [RealizeError].
 pub type Result<T> = std::result::Result<T, RealizeServiceError>;
@@ -24,6 +25,9 @@ pub struct SyncedFile {
 
     /// Size of the file on the current instance, in bytes.
     pub size: u64,
+
+    /// Modification time of the file.
+    pub mtime: SystemTime,
 }
 
 /// Configures the behavior of a method on [RealizeService].

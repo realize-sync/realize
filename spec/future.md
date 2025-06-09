@@ -30,23 +30,6 @@ deleted.
 
 Fix the tests and make sure they all pass.
 
-## Add mtime to RealizeService::list {#listtime}
-
-The SyncedFile struct defined in
-[@/crate/realize-lib/src/network/rpc/realize.rs](../crate/realize-lib/src/network/rpc/realize.rs)
-should take an extra field `mtime: SystemTime` which mirrors the mtime
-field used in `Notification` in
-[@/crate/realize-lib/src/storage/real/history.rs](../crate/realize-lib/src/storage/real/history.rs)
-
-In the implementation, in
-[@/crate/realize-lib/src/network/rpc/realize/server.rs](../crate/realize-lib/src/network/rpc/realize/server.rs),
-to get the mtime of a file, take the modification time from its
-metadata with `metadata.modified().expect("OS must support mtime")`
-
-Fix the tests, extend list_files_and_partial to check the mtime, make
-sure all tests pass.
-
-
 ## The beginnig of the Unreal {#unreal}
 
 Let's start implementing the file cache described in [@/spec/design.md](design.md).

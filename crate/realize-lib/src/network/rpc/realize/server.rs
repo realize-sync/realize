@@ -163,8 +163,17 @@ impl RealizeService for RealizeServer {
                     if path_type == PathType::Final && files.contains_key(&path) {
                         continue;
                     }
-                    let size = entry.metadata()?.size();
-                    files.insert(path.clone(), SyncedFile { path, size });
+                    let metadata = entry.metadata()?;
+                    let size = metadata.size();
+                    let mtime = metadata.modified().expect("OS must support mtime");
+                    files.insert(
+                        path.clone(),
+                        SyncedFile {
+                            path,
+                            size,
+                            mtime,
+                        },
+                    );
                 }
             }
 
@@ -615,10 +624,14 @@ mod tests {
 
         fs::create_dir_all(temp.child("subdir"))?;
 
-        temp.child("foo.txt").write_str("hello")?;
-        temp.child("subdir/foo2.txt").write_str("hello")?;
-        temp.child(".bar.txt.part").write_str("partial")?;
-        temp.child("subdir/.bar2.txt.part").write_str("partial")?;
+        let foo = temp.child("foo.txt");
+        foo.write_str("hello")?;
+        let foo2 = temp.child("subdir/foo2.txt");
+        foo2.write_str("hello")?;
+        let bar = temp.child(".bar.txt.part");
+        bar.write_str("partial")?;
+        let bar2 = temp.child("subdir/.bar2.txt.part");
+        bar2.write_str("partial")?;
 
         let files = server
             .list(tarpc::context::current(), arena.clone(), Options::default())
@@ -629,18 +642,22 @@ mod tests {
                 SyncedFile {
                     path: model::Path::parse("foo.txt")?,
                     size: 5,
+                    mtime: foo.metadata()?.modified()?,
                 },
                 SyncedFile {
                     path: model::Path::parse("subdir/foo2.txt")?,
                     size: 5,
+                    mtime: foo2.metadata()?.modified()?,
                 },
                 SyncedFile {
                     path: model::Path::parse("bar.txt")?,
                     size: 7,
+                    mtime: bar.metadata()?.modified()?,
                 },
                 SyncedFile {
                     path: model::Path::parse("subdir/bar2.txt")?,
                     size: 7,
+                    mtime: bar2.metadata()?.modified()?,
                 },
             ]
         );
