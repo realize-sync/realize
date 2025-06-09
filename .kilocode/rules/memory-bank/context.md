@@ -14,6 +14,7 @@ The specification documents outline a more comprehensive system involving "Real"
     *   `storage`: Implements `LocalStorage` for "Real" files, including path resolution and partial file handling. `ArenaConfig` for storage paths.
     *   `logic`: Contains the `movedirs` algorithm for synchronizing directories between two peers.
     *   `utils`: Provides helpers for async operations, hashing (BLAKE2b-256), and logging.
+    *   In progress implementation of inotify-based file change notification between remote peers in `network/rpc/history.rs`, `storage/real.rs`, `storage/history.rs`
 *   **Daemon (`realize-daemon`):** Implements the server-side executable that hosts `RealizeService`. Handles configuration loading (TOML) and signal handling.
 *   **CLI (`realize-cmd`):** Implements the client-side tool for initiating sync operations. Handles CLI arguments, progress display, and metrics reporting.
 *   **Specification:**
@@ -29,7 +30,6 @@ The specification documents outline a more comprehensive system involving "Real"
 *   **Merkle Tree Hashing:** Integrate Merkle trees for file hashing.
 *   **Unreal Filesystem Implementation:** Develop the `redb`-based cache and `nfsserve` integration for the "Unreal" filesystem.
 *   **Real Filesystem (OverlayFS):** Implement OverlayFS integration for Linux.
-*   **History Service:** Fully implement the `HistoryService` RPC and history tracking mechanisms.
 *   **Multi-Peer Syncing:** Design and implement robust multi-peer synchronization logic beyond the initial two-peer `movedirs` algorithm.
 *   **Conflict Resolution:** Enhance conflict resolution beyond the initial "don't resolve" strategy.
 *   **Cross-Platform Read-Write Unreal:** Extend the "Unreal" filesystem to be read-write for macOS and Windows.

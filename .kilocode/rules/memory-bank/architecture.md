@@ -67,10 +67,17 @@ graph TD
 *   **`network/`**: Handles peer-to-peer communication.
     *   [`network/config.rs`](crate/realize-lib/src/network/config.rs): `PeerConfig` for peer connection details.
     *   [`network/rpc/realize.rs`](crate/realize-lib/src/network/rpc/realize.rs): Defines the `RealizeService` trait (using `tarpc`).
+    *   [`network/rpc/realize/client.rs`](crate/realize-lib/src/network/rpc/realize/client.rs): Connect to a server using `connect`
     *   [`network/rpc/realize/server.rs`](crate/realize-lib/src/network/rpc/realize/server.rs): Server-side implementation of `RealizeService`.
-    *   [`network/rpc/realize/metrics.rs`](crate/realize-lib/src/network/rpc/realize/metrics.rs): Prometheus metrics for RPC.
+    *   [`network/rpc/realize/metrics.rs`](crate/realize-lib/src/network/rpc/realize/metrics.rs): Prometheus metrics for `RealizeService` RPC.
+    *   [`network/rpc/history.rs`](crate/history-lib/src/network/rpc/history.rs): Defines the `HistoryService` trait (using `tarpc`)
+    *   [`network/rpc/history/client.rs`](crate/history-lib/src/network/rpc/history/client.rs): `register` a service that'll report file changes in `LocalStorage` to connected peers.
+    *   [`network/rpc/history/server.rs`](crate/history-lib/src/network/rpc/history/server.rs): `forward_peer_history` local file change notification happening on a remote peer to a tokio channel
+    *   [`network/rpc/history/metrics.rs`](crate/history-lib/src/network/rpc/history/metrics.rs): Prometheus metrics for `HistoryService` RPC.
     *   [`network/security.rs`](crate/realize-lib/src/network/security.rs): TLS setup and raw public key peer verification.
-    *   [`network/tcp.rs`](crate/realize-lib/src/network/tcp.rs): TCP transport for `tarpc`.
+    *   [`network/hostport.rs`](crate/realize-lib/src/network/hostport.rs): `HostPort` utility for resolving address strings
+    *   [`network/metrics.rs`](crate/realize-lib/src/network/metrics.rs): Prometheus metrics for the server(track in-flight requests)
+    *   [`network.rs`](crate/realize-lib/src/network.rs): `Networking` type for tracking and connecting to peers, `Server` for service service on a TCP port.
     *   `network/rate_limit.rs`: (Internal) Rate limiting for network traffic.
     *   `network/reconnect.rs`: (Internal) Logic for reconnecting to peers.
 *   **`storage/`**: Manages local file storage and caching.
@@ -96,7 +103,7 @@ graph TD
 *   **RPC Framework:** `tarpc` for efficient, typed, asynchronous RPC between peers.
 *   **Differential Sync:** `fast_rsync` principles (signatures and deltas) for minimizing data transfer for updates.
 *   **Security:** TLS 1.3 with raw ED25519 public key verification (no CAs) for secure peer-to-peer channels.
-*   **Local Cache (`Unreal`):** `redb` key-value store for metadata and blob storage for cached file content. Merkle trees for blob hashing.
+*   **Local Cache (`Unreal`):** `redb` key-value store for metadata and blob rstorage for cached file content. Merkle trees for blob hashing.
 *   **Filesystem Presentation:**
     *   NFSv3 server (via `nfsserve`) for cross-platform access to the "Unreal" cache (initially read-only).
     *   Kernel OverlayFS (Linux-only) for merging "Real" (local writable) and "Unreal" (remote read-only) views.

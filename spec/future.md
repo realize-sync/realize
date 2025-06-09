@@ -3,35 +3,37 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
-## Household definition {#houshold}
+## The beginnig of the Unreal {#unreal}
 
-Define, in `src/realize_lib/src/network/config.rs`, a Houshold type
-that can be deserialized from toml using the [toml
-crate](https://docs.rs/toml/latest/toml/)
+Let's start implementing the file cache described in [@/spec/design.md](design.md).
 
-This is meant to replace `peers.pem` of realize-cmd as well as the
-yaml configuration of realize-daemon. With the extra information,
-realize-cmd can just be given a peer id to connect to listening peers.
+The design describe a system based on blobs, but for now we just have file paths; let's get started with that and add blobs in a later step.
 
-A household defines a set of peers and for each peer their public key
-(required) and address (optional).
+1. Fetch list of remote files using RealizeService::list and store it in a [redb](https://github.com/cberner/redb/tree/master) database. 
+   - The database stores file availability in a table: 
+      key: (arena, path), arena as model::Arena, path as model::Path
+      value: a struct containing, for each peer for which data is avalible: presence (available or deleted), file size (if available), mtime
 
-```toml
-[peers.bob]
-address = "bob.private:7961"
-pubkey = """
------BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAPjsIFMiDLwPSdJ90P6Dh+jbpk/EoeorE+2OsdTzxX+s=
------END PUBLIC KEY-----
-"""
+2. Make the file list available through [nfsserve](https://github.com/xetdata/nfsserve). Don't bother serving file content just yet; reading file data should just fail, but listing files should work.
 
-[peers.alice]
-pubkey = ""
------BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAZvriEx8hZEAildpfeifrv0Z5xED/kkK7wzT5Gel+w/w=
------END PUBLIC KEY-----
-"""
-```
+    - use the uid and gid of the daemon process for the files and directories
+    - for files, use mode u=rw,g=rw,o=r 
+    - for directories, use mode u=rwx,g=rwx,o=rx
+
+3. Track changes made remotely, so the filesystem view is up-to-date (Using HistoryService). Keep a connection to all listening peers, as defined in the peer list. Reconnect as necessary. 
+    Algorithm:
+    
+     For all peers for which an address is known in PeerConfig,
+     
+     1. connect to the peer using a client from [@/crate/realize-lib/src/network/rpc/realize/client.rs](../crate/realize-lib/src/network/rpc/realize/client.rs)
+     2. once connected, as reported by `ClientOptions::connection_events` connect to same peer using `forward_peer_history` defined in [@/crate/realize-lib/src/network/rpc/history/server.rs](../crate/realize-lib/src/network/rpc/history/server.rs)
+     3. once `forward_peer_history` has returned, fetch the file list using `RealizeService::list`, using a client from [@/crate/realize-lib/src/network/rpc/realize/client.rs](../crate/realize-lib/src/network/rpc/realize/client.rs) and update the database
+     4. whenever a file change notification is received, update the database (note that this can happen before the files list has been read. Use mtime to resolve conflicts)
+     5. when disconnected, as reported by `ClientOptions::connection_events`, let `forward_peer_history` shut down and go back to point 2, waiting for a reconnection
+
+4. Serve file content through `nfsserve` by making a request for a
+   range of file content using [RealizeService] when connected. Fail
+   immediately when disconnected.
 
 ## File hash as as Merkle tree {#merkle}
 

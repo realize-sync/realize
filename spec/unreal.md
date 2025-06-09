@@ -28,7 +28,7 @@ each file, the hash and size of its content (blob).
 
 The database stores:
 
-- Paths: path -> peer(s) to connect to, blob, size
+- Paths: (arena, path (model::Path)) -> peer(s) to connect to, blob, size
 - Blobs: hash -> reference count + (set of blob hash)|(path of block)
 
 Blob Hash are built as a Merkle tree, that is, files are split into
