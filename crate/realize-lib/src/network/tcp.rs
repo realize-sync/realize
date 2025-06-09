@@ -12,15 +12,10 @@ use rustls::sign::SigningKey;
 use tarpc::client::stub::Stub;
 use tarpc::client::RpcError;
 use tarpc::context;
-use tarpc::context::Context;
 use tokio::io::AsyncReadExt as _;
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::broadcast;
-use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
-use tokio::time::timeout;
 use tokio_retry::strategy::ExponentialBackoff;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
@@ -30,16 +25,13 @@ use std::net::SocketAddr;
 use std::path;
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
 use tarpc::serde_transport as transport;
-use tarpc::server::BaseChannel;
 use tarpc::tokio_serde::formats::Bincode;
 use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
 
-use crate::model::Arena;
 use crate::model::Peer;
 use crate::network::rate_limit::RateLimitedStream;
 use crate::network::reconnect::Connect;
@@ -55,8 +47,6 @@ use crate::network::rpc::realize::RealizeServiceResponse;
 use crate::network::security;
 use crate::network::security::PeerVerifier;
 use crate::storage::real::LocalStorage;
-use crate::storage::real::Notification;
-use crate::utils::async_utils::AbortOnDrop;
 
 use super::config::PeerConfig;
 use super::hostport::HostPort;
@@ -116,7 +106,7 @@ impl Networking {
         }
     }
 
-    async fn connect<Req, Resp>(
+    pub(crate) async fn connect<Req, Resp>(
         &self,
         peer: &Peer,
         tag: &[u8; 4],
@@ -368,61 +358,6 @@ pub async fn start_server(
     Ok((addr, server.shutdown_tx.clone()))
 }
 
-/// Forward history for the given peer to a mpsc channel.
-///
-/// Connect to the peer, then ask it to send history for the given
-/// arenas.
-///
-/// When this function returns successfully, the connection to the
-/// peer has succeeded and the peer has declared itself ready to
-/// report any file changes. This might take a while.
-///
-/// After a successful connection, the forwarder runs until either the
-/// channel is closed or the connection is lost. Check the
-/// [JoinHandle].
-pub async fn forward_peer_history<T>(
-    networking: &Networking,
-    ctx: Context,
-    peer: &Peer,
-    arenas: T,
-    tx: mpsc::Sender<(Peer, Notification)>,
-) -> anyhow::Result<(Vec<Arena>, JoinHandle<anyhow::Result<()>>)>
-where
-    T: IntoIterator<Item = Arena>,
-{
-    let transport = networking.connect(&peer, history::TAG, None).await?;
-
-    let (ready_tx, ready_rx) = oneshot::channel();
-    let peer = peer.clone();
-    let arenas = arenas.into_iter().collect();
-    let handle = AbortOnDrop::new(tokio::spawn(history::server::run_forwarder(
-        peer,
-        arenas,
-        BaseChannel::with_defaults(transport),
-        tx,
-        Some(ready_tx),
-    )));
-
-    // Wait for the peer to declare itself ready before returning.
-    // This might take a while.
-    //
-    // If the context deadline is reached, abort the forwarder and
-    // return a deadline error.
-    match timeout(ctx.deadline.duration_since(Instant::now()), ready_rx).await? {
-        Err(oneshot::error::RecvError { .. }) => {
-            // The forwarder must have already died if the oneshot was
-            // killed before anything was sent. Attempt to recover the original error.
-            handle.join().await??;
-
-            // The following should never be reached:
-            anyhow::bail!("Connection failed");
-        }
-        Ok(watched) => {
-            return Ok((watched, handle.as_handle()));
-        }
-    }
-}
-
 #[derive(Clone, Default)]
 pub struct ClientOptions {
     pub limiter: Option<Limiter<StandardClock>>,
@@ -566,15 +501,14 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
-    use crate::model::{self, Arena, Peer};
+    use crate::model::{Arena, Peer};
+    use crate::network;
     use crate::network::rpc::realize::{Config, Options};
     use crate::network::security::testing;
     use crate::utils::async_utils::AbortOnDrop;
-    use assert_fs::prelude::{FileWriteStr as _, PathChild as _};
     use assert_fs::TempDir;
     use rustls::pki_types::PrivateKeyDer;
     use tarpc::context;
-    use tokio::time::timeout;
 
     // Helper to setup a test server and return (server_addr, server_handle, crypto, temp_dir)
     async fn setup_test_server(
@@ -1019,115 +953,9 @@ mod tests {
 
         assert_eq!(
             Some(std::io::ErrorKind::ConnectionRefused),
-            io_error_kind(ret.err())
+            network::testing::io_error_kind(ret.err())
         );
 
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn forward_history() -> anyhow::Result<()> {
-        let _ = env_logger::try_init();
-
-        let verifier = verifier_both();
-        let (addr, _shutdown, tempdir) = setup_test_server(Arc::clone(&verifier)).await?;
-        let server = Peer::from("server");
-        let net = Networking::new(
-            vec![(&server, addr.to_string().as_ref())],
-            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
-            verifier,
-        );
-        let arena = Arena::from("testdir");
-        let (tx, mut rx) = mpsc::channel(10);
-        let (watched, handle) =
-            forward_peer_history(&net, context::current(), &server, vec![arena.clone()], tx)
-                .await?;
-
-        assert_eq!(vec![arena.clone()], watched);
-
-        // The forwarder is ready; a new file will generate a notification.
-
-        let foobar = tempdir.child("foobar.txt");
-        foobar.write_str("test")?;
-        let foobar_mtime = foobar.metadata()?.modified()?;
-
-        let (peer, notif) = timeout(Duration::from_secs(1), rx.recv()).await?.unwrap();
-        assert_eq!(Peer::from("server"), peer);
-
-        assert_eq!(
-            Notification::Link {
-                arena,
-                path: model::Path::parse("foobar.txt")?,
-                size: 4,
-                mtime: foobar_mtime
-            },
-            notif
-        );
-
-        // Dropping rx stops the forwarder.
-        drop(rx);
-        timeout(Duration::from_secs(1), handle).await???;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn forward_history_loses_connection() -> anyhow::Result<()> {
-        let _ = env_logger::try_init();
-
-        let verifier = verifier_both();
-        let (addr, shutdown, _tempdir) = setup_test_server(Arc::clone(&verifier)).await?;
-        let server = Peer::from("server");
-        let net = Networking::new(
-            vec![(&server, addr.to_string().as_ref())],
-            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
-            verifier,
-        );
-
-        let arena = Arena::from("testdir");
-        let (tx, _rx) = mpsc::channel(10);
-        let (watched, handle) =
-            forward_peer_history(&net, context::current(), &server, vec![arena.clone()], tx)
-                .await?;
-
-        assert_eq!(vec![arena.clone()], watched);
-
-        shutdown.send(())?;
-
-        // The server shutting down stops the forwarder
-        timeout(Duration::from_secs(1), handle).await???;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn forward_history_fails_to_connect() -> anyhow::Result<()> {
-        let _ = env_logger::try_init();
-
-        let verifier = verifier_both();
-        let server = Peer::from("server");
-        let net = Networking::new(
-            vec![(&server, "localhost:0")],
-            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
-            verifier,
-        );
-        let arena = Arena::from("testdir");
-        let (tx, rx) = mpsc::channel(10);
-        let ret =
-            forward_peer_history(&net, context::current(), &server, vec![arena.clone()], tx).await;
-
-        assert_eq!(
-            Some(std::io::ErrorKind::ConnectionRefused),
-            io_error_kind(ret.err())
-        );
-
-        assert!(rx.is_closed());
-
-        Ok(())
-    }
-
-    /// Extract I/O error kind from an anyhow error, if possible.
-    fn io_error_kind(err: Option<anyhow::Error>) -> Option<std::io::ErrorKind> {
-        Some(err?.downcast_ref::<std::io::Error>()?.kind())
     }
 }

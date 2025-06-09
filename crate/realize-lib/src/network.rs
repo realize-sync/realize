@@ -5,3 +5,6 @@ pub(crate) mod reconnect;
 pub mod rpc;
 pub mod security;
 pub mod tcp;
+
+#[cfg(test)]
+pub(crate) mod testing;
