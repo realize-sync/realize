@@ -9,7 +9,27 @@ use crate::storage::real::LocalStorage;
 
 use super::{HistoryServiceRequest, HistoryServiceResponse};
 
-pub(crate) async fn collect<T>(
+/// Register history collection to the given server.
+///
+/// With this call, the server answers to HIST calls by reporting file
+/// history of the arenas in the local storage.
+pub fn register(server: &mut Server, storage: LocalStorage) {
+    server.register(super::TAG, move |peer: Peer, framed, _, shutdown_rx| {
+        let transport = tarpc::serde_transport::new(framed, Bincode::default());
+        let channel = tarpc::client::new(Default::default(), transport).spawn();
+        let client = HistoryServiceClient::from(channel);
+
+        let peer = peer.clone();
+        let storage = storage.clone();
+        tokio::spawn(async move {
+            if let Err(err) = collect(client, storage, shutdown_rx).await {
+                log::debug!("{}: history collection failed: {}", peer, err);
+            }
+        });
+    });
+}
+
+async fn collect<T>(
     client: HistoryServiceClient<T>,
     storage: LocalStorage,
     mut shutdown: broadcast::Receiver<()>,
@@ -60,18 +80,5 @@ where
     Ok(())
 }
 
-pub fn register(server: &mut Server, storage: LocalStorage) {
-    server.register(super::TAG, move |peer: Peer, framed, _, shutdown_rx| {
-        let transport = tarpc::serde_transport::new(framed, Bincode::default());
-        let channel = tarpc::client::new(Default::default(), transport).spawn();
-        let client = HistoryServiceClient::from(channel);
-
-        let peer = peer.clone();
-        let storage = storage.clone();
-        tokio::spawn(async move {
-            if let Err(err) = collect(client, storage, shutdown_rx).await {
-                log::debug!("{}: history collection failed: {}", peer, err);
-            }
-        });
-    });
-}
+// This is tested in module super::server::tests, which puts client
+// and server together.
