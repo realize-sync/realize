@@ -12,6 +12,7 @@ Write integration tests in
 * Test functions are declared with `#[test]` or `#[tokio::test]`
 
 * Test functions must always return the type `anyhow::Result<()>` and end with `Ok(())`.
+* Test functions must not use `unwrap()`. Instead, use the `?` operator for error propagation.
 
 * Test functions describe the component that is tested and the
   situation the component is tested in using name such as
