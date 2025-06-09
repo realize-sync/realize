@@ -186,7 +186,7 @@ mod tests {
             let _ = env_logger::try_init();
 
             let port = portpicker::pick_unused_port().expect("No ports free");
-            let address = HostPort::parse(&format!("127.0.0.1:{port}")).await?;
+            let address = HostPort::localhost(port);
             let peer = Peer::from("self");
             let mut verifier = PeerVerifier::new();
             verifier.add_peer(&peer, testing::client_public_key());

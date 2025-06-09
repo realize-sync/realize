@@ -1,15 +1,19 @@
-use assert_fs::TempDir;
 use assert_fs::fixture::ChildPath;
 use assert_fs::prelude::*;
+use assert_fs::TempDir;
 use assert_unordered::assert_eq_unordered;
 use hyper_util::rt::TokioIo;
 use realize_lib::model::Arena;
 use realize_lib::model::Peer;
-use realize_lib::network::security::{self, PeerVerifier};
-use realize_lib::network::{hostport::HostPort, tcp};
+use realize_lib::network::hostport::HostPort;
+use realize_lib::network::rpc::realize;
+use realize_lib::network::security::PeerVerifier;
+use realize_lib::network::security::RawPublicKeyResolver;
+use realize_lib::network::tcp::Networking;
+use realize_lib::network::tcp::Server;
 use realize_lib::storage::real::LocalStorage;
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
+use rustls::pki_types::SubjectPublicKeyInfoDer;
 use std::fs;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
@@ -33,19 +37,27 @@ fn command_path() -> PathBuf {
         .join("realize-cmd")
 }
 
-pub struct Fixture {
-    pub tempdir: TempDir,
-    pub src_dir: ChildPath,
-    pub dst_dir: ChildPath,
-    pub keys: TestKeys,
-    pub src_addr: SocketAddr,
-    pub dst_addr: SocketAddr,
-    _shutdown_src: tokio::sync::broadcast::Sender<()>,
-    _shutdown_dst: tokio::sync::broadcast::Sender<()>,
+struct Fixture {
+    tempdir: TempDir,
+    arenas: Vec<(Arena, PathBuf, PathBuf)>,
+    src_dir: ChildPath,
+    dst_dir: ChildPath,
+    arena: Arena,
+    keys: TestKeys,
+    src_addr: Option<SocketAddr>,
+    dst_addr: Option<SocketAddr>,
+    _src_server: Option<Arc<Server>>,
+    _dst_server: Option<Arc<Server>>,
 }
 
 impl Fixture {
-    pub async fn setup() -> anyhow::Result<Self> {
+    async fn setup_and_start_servers() -> anyhow::Result<Self> {
+        let mut fixture = Self::setup().await?;
+        fixture.start_servers().await?;
+
+        Ok(fixture)
+    }
+    async fn setup() -> anyhow::Result<Self> {
         env_logger::try_init().ok();
 
         let tempdir = TempDir::new()?;
@@ -55,51 +67,79 @@ impl Fixture {
         let dst_dir = tempdir.child("dst");
         dst_dir.create_dir_all()?;
 
-        let keys = test_keys();
+        let arena = Arena::from("dir");
 
-        let verifier = setup_verifier();
-        let crypto = security::default_provider();
-        let privkey_a = crypto
-            .key_provider
-            .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_a_path.as_ref())?)?;
-        let privkey_b = crypto
-            .key_provider
-            .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_b_path.as_ref())?)?;
-        let (src_addr, shutdown_src) = tcp::start_server(
-            &HostPort::parse("127.0.0.1:0").await?,
-            LocalStorage::single(&"dir".into(), src_dir.path()),
-            verifier.clone(),
-            privkey_a.clone(),
-        )
-        .await?;
-        let (dst_addr, shutdown_dst) = tcp::start_server(
-            &HostPort::parse("127.0.0.1:0").await?,
-            LocalStorage::single(&"dir".into(), dst_dir.path()),
-            verifier.clone(),
-            privkey_b.clone(),
-        )
-        .await?;
+        let keys = test_keys();
 
         Ok(Self {
             tempdir,
+            arenas: vec![(arena.clone(), src_dir.to_path_buf(), dst_dir.to_path_buf())],
             src_dir,
             dst_dir,
+            arena,
             keys,
-            src_addr,
-            dst_addr,
-            _shutdown_src: shutdown_src,
-            _shutdown_dst: shutdown_dst,
+            src_addr: None,
+            dst_addr: None,
+            _src_server: None,
+            _dst_server: None,
         })
     }
 
+    async fn start_servers(&mut self) -> anyhow::Result<()> {
+        let verifier = setup_verifier(&self.keys);
+
+        let mut src_server = Server::new(Networking::new(
+            vec![],
+            RawPublicKeyResolver::from_private_key_file(&self.keys.privkey_a_path)?,
+            Arc::clone(&verifier),
+        ));
+        realize::server::register(
+            &mut src_server,
+            LocalStorage::new(
+                self.arenas
+                    .iter()
+                    .map(|(a, src_path, _)| (a.clone(), src_path.clone())),
+            ),
+        );
+        let src_server = Arc::new(src_server);
+        let src_addr = Arc::clone(&src_server)
+            .listen(&HostPort::localhost(0))
+            .await?;
+
+        let mut dst_server = Server::new(Networking::new(
+            vec![],
+            RawPublicKeyResolver::from_private_key_file(&self.keys.privkey_b_path)?,
+            verifier,
+        ));
+        realize::server::register(
+            &mut dst_server,
+            LocalStorage::new(
+                self.arenas
+                    .iter()
+                    .map(|(a, _, dst_path)| (a.clone(), dst_path.clone())),
+            ),
+        );
+        let dst_server = Arc::new(dst_server);
+        let dst_addr = Arc::clone(&dst_server)
+            .listen(&HostPort::localhost(0))
+            .await?;
+
+        self._src_server = Some(src_server);
+        self.src_addr = Some(src_addr);
+        self._dst_server = Some(dst_server);
+        self.dst_addr = Some(dst_addr);
+
+        Ok(())
+    }
+
     /// A command with all required args.
-    pub fn command(&self) -> anyhow::Result<Command> {
+    fn command(&self) -> anyhow::Result<Command> {
         let mut cmd = Command::new(command_path());
         cmd.arg("--config")
             .arg(write_config(
                 self.tempdir.child("config.toml"),
-                self.src_addr,
-                self.dst_addr,
+                self.src_addr.expect("src server started"),
+                self.dst_addr.expect("dst server started"),
                 &self.keys,
             )?)
             .arg("--src")
@@ -108,14 +148,14 @@ impl Fixture {
             .arg("b")
             .arg("--privkey")
             .arg(self.keys.privkey_a_path.as_ref())
-            .arg("dir")
+            .arg(self.arena.as_str())
             .kill_on_drop(true);
 
         Ok(cmd)
     }
 
     /// A command with extra arguments.
-    pub async fn run_with_args(&self, args: Vec<&str>) -> anyhow::Result<Output> {
+    async fn run_with_args(&self, args: Vec<&str>) -> anyhow::Result<Output> {
         let mut cmd = self.command()?;
         for arg in args {
             cmd.arg(arg);
@@ -126,14 +166,14 @@ impl Fixture {
     }
 
     /// Run the command and return its output.
-    pub async fn run(&self) -> anyhow::Result<Output> {
+    async fn run(&self) -> anyhow::Result<Output> {
         Ok(self.command()?.output().await?)
     }
 }
 
 #[tokio::test]
 async fn move_file() -> anyhow::Result<()> {
-    let fixture = Fixture::setup().await?;
+    let fixture = Fixture::setup_and_start_servers().await?;
     create_files(&fixture.src_dir, &[("qux.txt", "qux")])?;
 
     let output = fixture.run().await?;
@@ -155,7 +195,7 @@ async fn move_file() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn partial_failure() -> anyhow::Result<()> {
-    let fixture = Fixture::setup().await?;
+    let fixture = Fixture::setup_and_start_servers().await?;
     create_files(&fixture.src_dir, &[("good.txt", "ok"), ("bad.txt", "fail")])?;
     fs::set_permissions(
         fixture.src_dir.child("bad.txt").path(),
@@ -192,7 +232,7 @@ async fn partial_failure() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn success_output() -> anyhow::Result<()> {
-    let fixture = Fixture::setup().await?;
+    let fixture = Fixture::setup_and_start_servers().await?;
     create_files(
         &fixture.src_dir,
         &[("foo.txt", "hello"), ("bar.txt", "world")],
@@ -214,7 +254,7 @@ async fn success_output() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn progress_output() -> anyhow::Result<()> {
-    let fixture = Fixture::setup().await?;
+    let fixture = Fixture::setup_and_start_servers().await?;
     create_files(
         &fixture.src_dir,
         &[("foo.txt", "hello"), ("bar.txt", "world")],
@@ -244,7 +284,7 @@ async fn progress_output() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn quiet_success() -> anyhow::Result<()> {
-    let fixture = Fixture::setup().await?;
+    let fixture = Fixture::setup_and_start_servers().await?;
     create_files(
         &fixture.src_dir,
         &[("foo.txt", "hello"), ("bar.txt", "world")],
@@ -271,7 +311,7 @@ async fn quiet_success() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn quiet_failure() -> anyhow::Result<()> {
-    let fixture = Fixture::setup().await?;
+    let fixture = Fixture::setup_and_start_servers().await?;
     create_files(&fixture.src_dir, &[("good.txt", "ok"), ("bad.txt", "fail")])?;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -306,7 +346,7 @@ async fn quiet_failure() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn log_output_events() -> anyhow::Result<()> {
-    let fixture = Fixture::setup().await?;
+    let fixture = Fixture::setup_and_start_servers().await?;
     create_files(
         &fixture.src_dir,
         &[("foo.txt", "hello"), ("bar.txt", "world")],
@@ -376,7 +416,7 @@ async fn log_output_events() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn systemd_log_output_format() -> anyhow::Result<()> {
-    let fixture = Fixture::setup().await?;
+    let fixture = Fixture::setup_and_start_servers().await?;
     create_files(&fixture.src_dir, &[("foo.txt", "bar")])?;
     let output = fixture
         .command()?
@@ -401,7 +441,7 @@ async fn systemd_log_output_format() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn max_duration_timeout() -> anyhow::Result<()> {
-    let fixture = Fixture::setup().await?;
+    let fixture = Fixture::setup_and_start_servers().await?;
 
     let output = fixture
         .run_with_args(vec!["--max-duration", "10ms"])
@@ -425,7 +465,7 @@ async fn realize_metrics_export() -> anyhow::Result<()> {
     use reqwest::Client;
     use tokio::io::AsyncBufReadExt as _;
 
-    let fixture = Fixture::setup().await?;
+    let fixture = Fixture::setup_and_start_servers().await?;
 
     // Pick a random available port for metrics
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -518,7 +558,7 @@ async fn realize_metrics_pushgateway() -> anyhow::Result<()> {
             Ok(())
         }));
 
-    let fixture = Fixture::setup().await?;
+    let fixture = Fixture::setup_and_start_servers().await?;
     create_files(&fixture.src_dir, &[("foo.txt", "hello")])?;
 
     // Run realize with pushgateway
@@ -545,7 +585,7 @@ async fn realize_metrics_pushgateway() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn set_rate_limits() -> anyhow::Result<()> {
-    let fixture = Fixture::setup().await?;
+    let fixture = Fixture::setup_and_start_servers().await?;
 
     create_files(&fixture.src_dir, &[("foo.txt", "hello")])?;
     let output = fixture
@@ -573,83 +613,31 @@ async fn set_rate_limits() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn multiple_directory_ids() -> anyhow::Result<()> {
-    env_logger::try_init().ok();
-    let tempdir = TempDir::new()?;
-    let src_dir1 = tempdir.child("src_multi1");
-    src_dir1.create_dir_all()?;
+    let mut fixture = Fixture::setup().await?;
+    let arena2 = Arena::from("dir2");
+    let src_dir2 = fixture.tempdir.child("src2");
+    let dst_dir2 = fixture.tempdir.child("dst2");
+    fixture.arenas.push((
+        arena2.clone(),
+        src_dir2.to_path_buf(),
+        dst_dir2.to_path_buf(),
+    ));
 
-    let src_dir2 = tempdir.child("src_multi2");
-    src_dir2.create_dir_all()?;
+    fixture.start_servers().await?;
 
-    let dst_dir1 = tempdir.child("dst_multi1");
-    dst_dir1.create_dir_all()?;
-
-    let dst_dir2 = tempdir.child("dst_multi2");
-    dst_dir2.create_dir_all()?;
-
-    create_files(&src_dir1, &[("foo1.txt", "foo1")])?;
+    create_files(&fixture.src_dir, &[("foo1.txt", "foo1")])?;
     create_files(&src_dir2, &[("foo2.txt", "foo2")])?;
 
-    let keys = test_keys();
-    let verifier = setup_verifier();
-    let crypto = security::default_provider();
-    let privkey_a = crypto
-        .key_provider
-        .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_a_path.as_ref())?)?;
-    let privkey_b = crypto
-        .key_provider
-        .load_private_key(PrivateKeyDer::from_pem_file(keys.privkey_b_path.as_ref())?)?;
-
-    // Setup src server with two directories
-    let src_dirs = LocalStorage::new([
-        (Arena::from("dir1"), src_dir1.to_path_buf()),
-        (Arena::from("dir2"), src_dir2.to_path_buf()),
-    ]);
-    let (src_addr, _src_handle) = tcp::start_server(
-        &HostPort::parse("127.0.0.1:0").await?,
-        src_dirs,
-        verifier.clone(),
-        privkey_a,
-    )
-    .await?;
-
-    // Setup dst server with two directories
-    let dst_dirs = LocalStorage::new([
-        (Arena::from("dir1"), dst_dir1.to_path_buf()),
-        (Arena::from("dir2"), dst_dir2.to_path_buf()),
-    ]);
-    let (dst_addr, _dst_handle) = tcp::start_server(
-        &HostPort::parse("127.0.0.1:0").await?,
-        dst_dirs,
-        verifier,
-        privkey_b,
-    )
-    .await?;
-
     // Run realize with two directory ids
-    let output = tokio::process::Command::new(command_path())
-        .arg("--config")
-        .arg(write_config(
-            tempdir.child("config.toml"),
-            src_addr,
-            dst_addr,
-            &keys,
-        )?)
-        .arg("--src")
-        .arg("a")
-        .arg("--dst")
-        .arg("b")
-        .arg("--privkey")
-        .arg(keys.privkey_a_path.as_ref())
-        .arg("dir1")
-        .arg("dir2")
-        .output()
-        .await?;
+    let output = fixture.command()?.arg(arena2.as_str()).output().await?;
     assert!(output.status.success());
 
-    assert_eq_unordered!(dir_content(&dst_dir1)?, vec![PathBuf::from("foo1.txt")]);
+    assert_eq_unordered!(
+        dir_content(&fixture.dst_dir)?,
+        vec![PathBuf::from("foo1.txt")]
+    );
     assert_eq_unordered!(dir_content(&dst_dir2)?, vec![PathBuf::from("foo2.txt")]);
-    assert_eq_unordered!(dir_content(&src_dir1)?, vec![]);
+    assert_eq_unordered!(dir_content(&fixture.src_dir)?, vec![]);
     assert_eq_unordered!(dir_content(&src_dir2)?, vec![]);
 
     // When multiple directory ids are specified, they must be
@@ -657,7 +645,7 @@ async fn multiple_directory_ids() -> anyhow::Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("[1/2] dir1/foo1.txt"),
+        stdout.contains("[1/2] dir/foo1.txt"),
         "OUT: {stdout} ERR: {stderr}"
     );
     assert!(
@@ -704,8 +692,7 @@ pub fn dir_content(dir: &assert_fs::fixture::ChildPath) -> anyhow::Result<Vec<Pa
         .collect::<Vec<_>>())
 }
 
-pub fn setup_verifier() -> Arc<PeerVerifier> {
-    let keys = test_keys();
+pub fn setup_verifier(keys: &TestKeys) -> Arc<PeerVerifier> {
     let mut verifier = PeerVerifier::new();
     verifier.add_peer(
         &Peer::from("a"),

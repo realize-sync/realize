@@ -1,6 +1,6 @@
 use anyhow::Context as _;
 use std::fmt;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 /// HostPort represents a resolved host:port pair, with DNS resolution.
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
@@ -37,6 +37,12 @@ impl HostPort {
             .ok_or_else(|| anyhow::anyhow!("DNS lookup failed for {s}"))?;
         Ok(HostPort { host, port, addr })
     }
+
+    /// Create a hostport on 127.0.0.1 with the given port.
+    pub fn localhost(port: u16) -> Self {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port).into()
+    }
+
     pub fn host(&self) -> &str {
         &self.host
     }
