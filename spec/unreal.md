@@ -19,29 +19,81 @@ stores local modifications for MacOS and Windows support.
 
 ## Details
 
-TODO
+The Unreal cache is built upon a `redb` database that tracks the state of files across a household of peers. This allows the system to maintain a local understanding of remote file availability without constant network communication.
 
-### Database storage
+The initial implementation focuses on tracking file paths and their state. The more advanced blob-based storage with Merkle trees will be built on top of this foundation.
 
-Remote peer share a list of files they have available in full and, for
-each file, the hash and size of its content (blob).
+### Database Schema
 
-The database stores:
+The `redb` database will contain a primary table to store file availability information.
 
-- Paths: (arena, path (model::Path)) -> peer(s) to connect to, blob, size
-- Blobs: hash -> reference count + (set of blob hash)|(path of block)
+```mermaid
+graph TD
+    subgraph redb Database Schema
+        subgraph file_availability_table["file_availability Table"]
+            direction LR
+            Key["Key<br>(arena: ArenaId, path: Path)"] --> Value["Value<br>Map<PeerId, FilePeerState>"]
+        end
 
-Blob Hash are built as a Merkle tree, that is, files are split into
-4Mb blocks which are hashed separately, then (size + hashes in order)
-are hashed again to get the hash of the containing blob and so on
-until we get only one hash.
+        subgraph FilePeerStateStruct["FilePeerState Struct"]
+            direction TB
+            presence["presence: Presence (Available/Deleted)"]
+            size["size: u64"]
+            mtime["mtime: SystemTime"]
+        end
+    end
 
-Blocks are stored on disk, as a file whose name is the hash.
+    Value --> FilePeerStateStruct
+```
 
-When the reference count of a blob reaches 0, it can be deleted.
-Reference count can be > 1 if the same data is present in multiple
-files.
+#### `file_availability` Table
 
-While redb is crash resistant and should guarantee reference count
-stay up-to-date, external files might be lost or left over. Some
-periodic GC and file content check passes might be necessary.
+This is the core table for tracking file status.
+
+*   **Key**: `(model::Arena, model::Path)`
+    *   A composite key made of the arena identifier and the file path. This provides a unique identifier for every file across all arenas.
+    *   Using `model::Arena` and `model::Path` directly allows for type-safe queries. `redb` requires keys to be `Storable` and `Comparable`.
+
+*   **Value**: `HashMap<model::PeerId, FilePeerState>`
+    *   A map where each key is a peer's unique ID and the value is a struct describing the file's state on that specific peer. This provides a consolidated view of a file's status across the network.
+
+### Data Structures
+
+#### `FilePeerState`
+
+This struct holds the metadata for a single file on a single peer.
+
+```rust
+// Conceptual representation
+pub struct FilePeerState {
+    pub presence: Presence,
+    pub size: u64,
+    pub mtime: SystemTime,
+}
+```
+
+*   `presence`: An enum indicating whether the file is available or has been deleted on the peer.
+*   `size`: The size of the file in bytes.
+*   `mtime`: The last modification time of the file.
+
+#### `Presence`
+
+An enum to clearly represent the state of a file.
+
+```rust
+// Conceptual representation
+pub enum Presence {
+    Available,
+    Deleted,
+}
+```
+
+### Future Blob Storage (Recap)
+
+While not part of the initial implementation step, the database will be extended to support blob-based storage:
+
+*   **Blobs Table**: `hash -> reference count + (set of blob hash)|(path of block)`
+*   **Merkle Trees**: File hashes will be constructed as Merkle trees to efficiently verify partial content.
+*   **Block Storage**: Individual file blocks will be stored on disk, named by their hash.
+
+This phased approach allows for an incremental build-out of the Unreal cache, starting with the essential file tracking mechanism.
