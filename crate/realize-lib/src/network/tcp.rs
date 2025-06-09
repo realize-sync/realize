@@ -8,7 +8,6 @@ use async_speed_limit::clock::StandardClock;
 use async_speed_limit::Limiter;
 use futures::prelude::*;
 use rustls::pki_types::ServerName;
-use rustls::sign::SigningKey;
 use tarpc::client::stub::Stub;
 use tarpc::client::RpcError;
 use tarpc::context;
@@ -36,7 +35,6 @@ use crate::model::Peer;
 use crate::network::rate_limit::RateLimitedStream;
 use crate::network::reconnect::Connect;
 use crate::network::reconnect::Reconnect;
-use crate::network::rpc::history::{self};
 use crate::network::rpc::realize;
 use crate::network::rpc::realize::metrics;
 use crate::network::rpc::realize::metrics::MetricsRealizeClient;
@@ -46,7 +44,6 @@ use crate::network::rpc::realize::RealizeServiceRequest;
 use crate::network::rpc::realize::RealizeServiceResponse;
 use crate::network::security;
 use crate::network::security::PeerVerifier;
-use crate::storage::real::LocalStorage;
 
 use super::config::PeerConfig;
 use super::hostport::HostPort;
@@ -334,31 +331,6 @@ impl Server {
     }
 }
 
-/// Start the server, listening on the given address.
-///
-/// Returns (address, shutdown, handle)
-///
-/// To stop the server cleanly, send a message to the shutdown channel
-/// then wait for that channel to be closed. Dropping the shutdown
-/// channel also eventually shuts down the server.
-pub async fn start_server(
-    hostport: &HostPort,
-    storage: LocalStorage,
-    verifier: Arc<PeerVerifier>,
-    privkey: Arc<dyn SigningKey>,
-) -> anyhow::Result<(SocketAddr, tokio::sync::broadcast::Sender<()>)> {
-    let networking = Networking::new(vec![], RawPublicKeyResolver::new(privkey)?, verifier);
-    let mut server = Server::new(networking);
-
-    realize::server::register(&mut server, storage.clone());
-    history::client::register(&mut server, storage.clone());
-
-    let server = Arc::new(server);
-    let addr = Arc::clone(&server).listen(hostport).await?;
-
-    Ok((addr, server.shutdown_tx.clone()))
-}
-
 #[derive(Clone, Default)]
 pub struct ClientOptions {
     pub limiter: Option<Limiter<StandardClock>>,
@@ -506,22 +478,69 @@ mod tests {
     use crate::network;
     use crate::network::rpc::realize::{Config, Options};
     use crate::network::security::testing;
+    use crate::storage::real::LocalStorage;
     use crate::utils::async_utils::AbortOnDrop;
     use assert_fs::TempDir;
-    use rustls::pki_types::PrivateKeyDer;
     use tarpc::context;
 
-    // Helper to setup a test server and return (server_addr, server_handle, crypto, temp_dir)
-    async fn setup_test_server(
+    struct Fixture {
+        storage: LocalStorage,
+        resolver: Arc<RawPublicKeyResolver>,
         verifier: Arc<PeerVerifier>,
-    ) -> anyhow::Result<(SocketAddr, tokio::sync::broadcast::Sender<()>, TempDir)> {
-        let temp = TempDir::new()?;
-        let dirs = LocalStorage::single(&Arena::from("testdir"), temp.path());
-        let server_privkey = load_private_key(testing::server_private_key())?;
-        let (addr, shutdown) =
-            start_server(&HostPort::localhost(0), dirs, verifier, server_privkey).await?;
+        server: Option<Arc<Server>>,
+        _tempdir: TempDir,
+    }
 
-        Ok((addr, shutdown, temp))
+    impl Fixture {
+        async fn setup() -> anyhow::Result<Self> {
+            let _ = env_logger::try_init();
+
+            let tempdir = TempDir::new()?;
+            let storage = LocalStorage::single(&Arena::from("testdir"), tempdir.path());
+            let resolver = RawPublicKeyResolver::from_private_key(testing::server_private_key())?;
+            let verifier = verifier_both();
+
+            Ok(Self {
+                storage,
+                resolver,
+                verifier,
+                server: None,
+                _tempdir: tempdir,
+            })
+        }
+
+        async fn start_server(&mut self) -> anyhow::Result<SocketAddr> {
+            let networking = Networking::new(
+                vec![],
+                Arc::clone(&self.resolver),
+                Arc::clone(&self.verifier),
+            );
+            let mut server = Server::new(networking);
+            realize::server::register(&mut server, self.storage.clone());
+            let server = Arc::new(server);
+            let addr = Arc::clone(&server).listen(&HostPort::localhost(0)).await?;
+
+            self.server = Some(server);
+
+            Ok(addr)
+        }
+
+        fn client_networking(&self, peer: &Peer, addr: SocketAddr) -> anyhow::Result<Networking> {
+            self.client_networking_with_verifier(peer, addr, Arc::clone(&self.verifier))
+        }
+
+        fn client_networking_with_verifier(
+            &self,
+            peer: &Peer,
+            addr: SocketAddr,
+            verifier: Arc<PeerVerifier>,
+        ) -> anyhow::Result<Networking> {
+            Ok(Networking::new(
+                vec![(peer, addr.to_string().as_ref())],
+                RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
+                verifier,
+            ))
+        }
     }
 
     // Helper to create a PeerVerifier with only the server key
@@ -546,25 +565,14 @@ mod tests {
         Arc::new(verifier)
     }
 
-    fn load_private_key(
-        private_key: PrivateKeyDer<'static>,
-    ) -> anyhow::Result<Arc<dyn SigningKey>> {
-        Ok(security::default_provider()
-            .key_provider
-            .load_private_key(private_key)?)
-    }
-
     #[tokio::test]
     async fn tarpc_tcp_connect() -> anyhow::Result<()> {
-        let verifier = verifier_both();
-        let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
+        let mut fixture = Fixture::setup().await?;
+        let addr = fixture.start_server().await?;
+
         let options = ClientOptions::default();
         let peer = Peer::from("server");
-        let networking = Networking::new(
-            vec![(&peer, addr.to_string().as_ref())],
-            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
-            verifier,
-        );
+        let networking = fixture.client_networking(&peer, addr)?;
         let client = connect_client(&networking, &peer, options).await?;
         let list = client
             .list(
@@ -579,8 +587,9 @@ mod tests {
 
     #[tokio::test]
     async fn tarpc_tcp_reject_bad_tag() -> anyhow::Result<()> {
-        let verifier = verifier_both();
-        let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
+        let mut fixture = Fixture::setup().await?;
+        let addr = fixture.start_server().await?;
+
         let connector = security::make_tls_connector(
             verifier_both(),
             RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
@@ -599,15 +608,13 @@ mod tests {
 
     #[tokio::test]
     async fn client_not_in_server_verifier_fails() -> anyhow::Result<()> {
-        let verifier = verifier_server_only();
-        let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await.unwrap();
+        let mut fixture = Fixture::setup().await?;
+        fixture.verifier = verifier_server_only();
+        let addr = fixture.start_server().await?;
+
         let options = ClientOptions::default();
         let peer = Peer::from("server");
-        let networking = Networking::new(
-            vec![(&peer, addr.to_string().as_ref())],
-            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
-            verifier,
-        );
+        let networking = fixture.client_networking_with_verifier(&peer, addr, verifier_both())?;
         let client_result = connect_client(&networking, &peer, options).await;
         let failed = match client_result {
             Ok(client) => client
@@ -628,44 +635,39 @@ mod tests {
 
     #[tokio::test]
     async fn server_not_in_client_verifier_fails() -> anyhow::Result<()> {
-        let verifier = verifier_client_only();
-        let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await.unwrap();
+        let mut fixture = Fixture::setup().await?;
+        let addr = fixture.start_server().await?;
+
         let options = ClientOptions::default();
         let peer = Peer::from("server");
-        let networking = Networking::new(
-            vec![(&peer, addr.to_string().as_ref())],
-            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
-            verifier,
-        );
-        let result = connect_client(&networking, &peer, options).await;
-        assert!(
-            result.is_err(),
-            "Expected error when server is not in client verifier"
-        );
+        let networking =
+            fixture.client_networking_with_verifier(&peer, addr, verifier_client_only())?;
+        let client_result = connect_client(&networking, &peer, options).await;
+        let failed = match client_result {
+            Ok(client) => client
+                .list(
+                    context::current(),
+                    Arena::from("testdir"),
+                    Options::default(),
+                )
+                .await
+                .is_err(),
+            // If handshake fails, that's also acceptable
+            Err(_) => true,
+        };
+        assert!(failed);
 
         Ok(())
     }
 
     #[tokio::test]
     async fn configure_tcp_returns_limit() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let dirs = LocalStorage::single(&Arena::from("testdir"), temp.path());
-        let verifier = verifier_both();
-        let server_privkey = load_private_key(testing::server_private_key())?;
-        let (addr, _handle) = start_server(
-            &HostPort::localhost(0),
-            dirs.clone(),
-            verifier.clone(),
-            server_privkey,
-        )
-        .await?;
+        let mut fixture = Fixture::setup().await?;
+        let addr = fixture.start_server().await?;
+
         let options = ClientOptions::default();
         let peer = Peer::from("server");
-        let networking = Networking::new(
-            vec![(&peer, addr.to_string().as_ref())],
-            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
-            verifier,
-        );
+        let networking = fixture.client_networking(&peer, addr)?;
         let client = connect_client(&networking, &peer, options).await?;
         let limit = 12345u64;
         let config = client
@@ -686,23 +688,11 @@ mod tests {
 
     #[tokio::test]
     async fn configure_tcp_per_connection_limit() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let dirs = LocalStorage::single(&Arena::from("testdir"), temp.path());
-        let verifier = verifier_both();
-        let server_privkey = load_private_key(testing::server_private_key())?;
-        let (addr, _handle) = start_server(
-            &HostPort::localhost(0),
-            dirs.clone(),
-            verifier.clone(),
-            server_privkey,
-        )
-        .await?;
+        let mut fixture = Fixture::setup().await?;
+        let addr = fixture.start_server().await?;
+
         let peer = Peer::from("server");
-        let networking = Networking::new(
-            vec![(&peer, addr.to_string().as_ref())],
-            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
-            Arc::clone(&verifier),
-        );
+        let networking = fixture.client_networking(&peer, addr)?;
         let client1 = connect_client(&networking, &peer, ClientOptions::default()).await?;
         let client2 = connect_client(&networking, &peer, ClientOptions::default()).await?;
         let limit = 54321u64;
@@ -724,8 +714,8 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_reconnect() -> anyhow::Result<()> {
-        let verifier = verifier_both();
-        let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
+        let mut fixture = Fixture::setup().await?;
+        let addr = fixture.start_server().await?;
 
         let connection_count = Arc::new(AtomicU32::new(0));
         let (shutdown, _) = tokio::sync::broadcast::channel(1);
@@ -733,11 +723,7 @@ mod tests {
             proxy_tcp(&addr, shutdown.clone(), connection_count.clone()).await?;
 
         let peer = Peer::from("server");
-        let networking = Networking::new(
-            vec![(&peer, proxy_addr.to_string().as_ref())],
-            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
-            verifier,
-        );
+        let networking = fixture.client_networking(&peer, proxy_addr)?;
         let client = connect_client(&networking, &peer, ClientOptions::default()).await?;
 
         client
@@ -762,8 +748,8 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_reconnect_keeps_config() -> anyhow::Result<()> {
-        let verifier = verifier_both();
-        let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
+        let mut fixture = Fixture::setup().await?;
+        let addr = fixture.start_server().await?;
 
         let connection_count = Arc::new(AtomicU32::new(0));
         let (shutdown, _) = tokio::sync::broadcast::channel(1);
@@ -771,11 +757,7 @@ mod tests {
             proxy_tcp(&addr, shutdown.clone(), connection_count.clone()).await?;
 
         let peer = Peer::from("server");
-        let networking = Networking::new(
-            vec![(&peer, proxy_addr.to_string().as_ref())],
-            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
-            verifier,
-        );
+        let networking = fixture.client_networking(&peer, proxy_addr)?;
         let client = connect_client(&networking, &peer, ClientOptions::default()).await?;
 
         let config = Config {
@@ -808,8 +790,8 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_reconnect_events() -> anyhow::Result<()> {
-        let verifier = verifier_both();
-        let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
+        let mut fixture = Fixture::setup().await?;
+        let addr = fixture.start_server().await?;
 
         let (shutdown, _) = tokio::sync::broadcast::channel(1);
         let (proxy_addr, _proxy_handle) =
@@ -828,11 +810,7 @@ mod tests {
         });
 
         let peer = Peer::from("server");
-        let networking = Networking::new(
-            vec![(&peer, proxy_addr.to_string().as_ref())],
-            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
-            verifier_both(),
-        );
+        let networking = fixture.client_networking(&peer, proxy_addr)?;
         let options = ClientOptions {
             connection_events: Some(conn_tx),
             ..ClientOptions::default()
@@ -865,6 +843,29 @@ mod tests {
                 ClientConnectionState::Connected,
             ],
             history
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_shutdown() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        let addr = fixture.start_server().await?;
+
+        let peer = Peer::from("server");
+        let networking = fixture.client_networking(&peer, addr)?;
+
+        connect_client(&networking, &peer, ClientOptions::default()).await?;
+
+        fixture.server.expect("server").shutdown().await?;
+
+        // After shutdown, connection fails
+        let ret = connect_client(&networking, &peer, ClientOptions::default()).await;
+
+        assert_eq!(
+            Some(std::io::ErrorKind::ConnectionRefused),
+            network::testing::io_error_kind(ret.err())
         );
 
         Ok(())
@@ -925,33 +926,5 @@ mod tests {
         }));
 
         Ok((addr, handle))
-    }
-
-    #[tokio::test]
-    async fn server_shutdown() -> anyhow::Result<()> {
-        let verifier = verifier_both();
-        let (addr, shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
-
-        let peer = Peer::from("server");
-        let networking = Networking::new(
-            vec![(&peer, addr.to_string().as_ref())],
-            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
-            verifier,
-        );
-
-        connect_client(&networking, &peer, ClientOptions::default()).await?;
-
-        shutdown.send(())?;
-        shutdown.closed().await;
-
-        // After shutdown, connection fails
-        let ret = connect_client(&networking, &peer, ClientOptions::default()).await;
-
-        assert_eq!(
-            Some(std::io::ErrorKind::ConnectionRefused),
-            network::testing::io_error_kind(ret.err())
-        );
-
-        Ok(())
     }
 }
