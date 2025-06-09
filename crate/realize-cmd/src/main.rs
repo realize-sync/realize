@@ -12,9 +12,11 @@ use realize_lib::logic::consensus::movedirs::MoveFileError;
 use realize_lib::model::Arena;
 use realize_lib::model::Peer;
 use realize_lib::network::config::PeerConfig;
+use realize_lib::network::rpc::realize;
+use realize_lib::network::rpc::realize::client::ClientConnectionState;
+use realize_lib::network::rpc::realize::client::ClientOptions;
 use realize_lib::network::rpc::realize::metrics;
 use realize_lib::network::tcp::Networking;
-use realize_lib::network::tcp::{self, ClientConnectionState, TcpRealizeServiceClient};
 use realize_lib::utils::logging;
 use signal_hook_tokio::Signals;
 use std::collections::HashMap;
@@ -349,18 +351,15 @@ async fn connect(
     peer: &str,
     limit: Option<u64>,
     conn_status: tokio::sync::watch::Sender<ClientConnectionState>,
-) -> anyhow::Result<
-    realize_lib::network::rpc::realize::RealizeServiceClient<tcp::TcpStub>,
-    anyhow::Error,
-> {
-    let mut options = tcp::ClientOptions::default();
+) -> anyhow::Result<realize::client::ClientType, anyhow::Error> {
+    let mut options = ClientOptions::default();
     if let Some(limit) = limit {
         log::info!("Throttling uploads: {}/s", HumanBytes(limit));
         options.limiter = Some(Limiter::<StandardClock>::new(limit as f64));
     }
     options.connection_events = Some(conn_status);
 
-    Ok(tcp::connect_client(networking, &Peer::from(peer), options).await?)
+    Ok(realize::client::connect(networking, &Peer::from(peer), options).await?)
 }
 
 /// Set server-site write rate limit on client, return it.
@@ -368,7 +367,7 @@ async fn connect(
 /// Not all servers support setting rate limit; It's not an error if
 /// this function returns None.
 async fn configure_limit(
-    client: &TcpRealizeServiceClient,
+    client: &realize::client::ClientType,
     limit: u64,
 ) -> anyhow::Result<Option<u64>> {
     let config = client

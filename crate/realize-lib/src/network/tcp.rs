@@ -8,14 +8,9 @@ use async_speed_limit::clock::StandardClock;
 use async_speed_limit::Limiter;
 use futures::prelude::*;
 use rustls::pki_types::ServerName;
-use tarpc::client::stub::Stub;
-use tarpc::client::RpcError;
-use tarpc::context;
 use tokio::io::AsyncReadExt as _;
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::broadcast;
-use tokio::sync::Mutex;
-use tokio_retry::strategy::ExponentialBackoff;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 
@@ -23,7 +18,6 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
@@ -33,23 +27,13 @@ use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
 
 use crate::model::Peer;
 use crate::network::rate_limit::RateLimitedStream;
-use crate::network::reconnect::Connect;
-use crate::network::reconnect::Reconnect;
-use crate::network::rpc::realize;
 use crate::network::rpc::realize::metrics;
-use crate::network::rpc::realize::metrics::MetricsRealizeClient;
-use crate::network::rpc::realize::Config;
-use crate::network::rpc::realize::RealizeServiceClient;
-use crate::network::rpc::realize::RealizeServiceRequest;
-use crate::network::rpc::realize::RealizeServiceResponse;
 use crate::network::security;
 use crate::network::security::PeerVerifier;
 
 use super::config::PeerConfig;
 use super::hostport::HostPort;
 use super::security::RawPublicKeyResolver;
-
-pub type TcpRealizeServiceClient = RealizeServiceClient<TcpStub>;
 
 #[derive(Clone)]
 pub struct Networking {
@@ -362,181 +346,33 @@ impl Server {
     }
 }
 
-#[derive(Clone, Default)]
-pub struct ClientOptions {
-    pub limiter: Option<Limiter<StandardClock>>,
-    pub connection_events: Option<tokio::sync::watch::Sender<ClientConnectionState>>,
-}
-
-/// What happened to a client connection.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum ClientConnectionState {
-    /// Initial state
-    NotConnected,
-    /// The client is attempting to connect.
-    Connecting,
-    /// The client is connected.
-    Connected,
-}
-
-/// Create a [RealizeServiceClient] connected to the given TCP address.
-pub async fn connect_client(
-    networking: &Networking,
-    peer: &Peer,
-    options: ClientOptions,
-) -> anyhow::Result<TcpRealizeServiceClient> {
-    let stub = TcpStub::new(networking, peer, options).await?;
-    Ok(RealizeServiceClient::from(stub))
-}
-
-#[derive(Clone)]
-struct TcpConnect {
-    networking: Networking,
-    peer: Peer,
-    options: ClientOptions,
-    config: Arc<Mutex<Option<Config>>>,
-}
-
-impl Connect<tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>>
-    for TcpConnect
-{
-    async fn try_connect(
-        &self,
-    ) -> anyhow::Result<tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>>
-    {
-        if let Some(tx) = &self.options.connection_events {
-            let _ = tx.send(ClientConnectionState::Connecting);
-        }
-        let transport = self
-            .networking
-            .connect(&self.peer, realize::TAG, self.options.limiter.clone())
-            .await?;
-        let channel = tarpc::client::new(Default::default(), transport).spawn();
-
-        // Recover stored configuration
-        if let Some(config) = self.config.lock().await.as_ref() {
-            let req = Arc::new(RealizeServiceRequest::Configure {
-                config: config.clone(),
-            });
-            channel.call(context::current(), req).await?;
-        }
-
-        if let Some(tx) = &self.options.connection_events {
-            let _ = tx.send(ClientConnectionState::Connected);
-        }
-        Ok(channel)
-    }
-}
-
-/// A type that encapsulates and hides the actual stub type.
-///
-/// Most usage should be through the alias [TcpRealizeServiceClient].
-pub struct TcpStub {
-    inner: MetricsRealizeClient<
-        Reconnect<
-            tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>,
-            TcpConnect,
-            ExponentialBackoff,
-        >,
-    >,
-    config: Arc<Mutex<Option<Config>>>,
-}
-
-impl TcpStub {
-    async fn new(
-        networking: &Networking,
-        peer: &Peer,
-        options: ClientOptions,
-    ) -> anyhow::Result<Self> {
-        let retry_strategy =
-            ExponentialBackoff::from_millis(500).max_delay(Duration::from_secs(5 * 60));
-
-        let config = Arc::new(Mutex::new(None));
-
-        if let Some(tx) = &options.connection_events {
-            let _ = tx.send(ClientConnectionState::NotConnected);
-        }
-        let connect = TcpConnect {
-            networking: networking.clone(),
-            peer: peer.clone(),
-            options,
-            config: Arc::clone(&config),
-        };
-
-        let reconnect: Reconnect<
-            tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>,
-            TcpConnect,
-            ExponentialBackoff,
-        > = Reconnect::new(retry_strategy, connect, Some(Duration::from_secs(5 * 60))).await?;
-        let stub = MetricsRealizeClient::new(reconnect);
-        Ok(Self {
-            inner: stub,
-            config,
-        })
-    }
-}
-
-impl Stub for TcpStub {
-    type Req = RealizeServiceRequest;
-    type Resp = RealizeServiceResponse;
-
-    async fn call(
-        &self,
-        ctx: context::Context,
-        request: RealizeServiceRequest,
-    ) -> std::result::Result<RealizeServiceResponse, RpcError> {
-        let res = self.inner.call(ctx, request).await;
-
-        // Store configuration to recover it on reconnection.
-        if let Ok(RealizeServiceResponse::Configure(Ok(config))) = &res {
-            *(self.config.lock().await) = if *config == Config::default() {
-                None
-            } else {
-                Some(config.clone())
-            };
-        }
-
-        res
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
-    use crate::model::{Arena, Peer};
+    use crate::model::Peer;
     use crate::network;
-    use crate::network::rpc::realize::{Config, Options};
     use crate::network::security::testing;
-    use crate::storage::real::LocalStorage;
-    use crate::utils::async_utils::AbortOnDrop;
-    use assert_fs::TempDir;
     use tarpc::context;
+    use tarpc::server::Channel as _;
 
     struct Fixture {
-        storage: LocalStorage,
         resolver: Arc<RawPublicKeyResolver>,
         verifier: Arc<PeerVerifier>,
         server: Option<Arc<Server>>,
-        _tempdir: TempDir,
     }
 
     impl Fixture {
         async fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
 
-            let tempdir = TempDir::new()?;
-            let storage = LocalStorage::single(&Arena::from("testdir"), tempdir.path());
             let resolver = RawPublicKeyResolver::from_private_key(testing::server_private_key())?;
             let verifier = verifier_both();
 
             Ok(Self {
-                storage,
                 resolver,
                 verifier,
                 server: None,
-                _tempdir: tempdir,
             })
         }
 
@@ -547,7 +383,7 @@ mod tests {
                 Arc::clone(&self.verifier),
             );
             let mut server = Server::new(networking);
-            realize::server::register(&mut server, self.storage.clone());
+            register_ping(&mut server);
             let server = Arc::new(server);
             let addr = Arc::clone(&server).listen(&HostPort::localhost(0)).await?;
 
@@ -601,18 +437,11 @@ mod tests {
         let mut fixture = Fixture::setup().await?;
         let addr = fixture.start_server().await?;
 
-        let options = ClientOptions::default();
         let peer = Peer::from("server");
         let networking = fixture.client_networking(&peer, addr)?;
-        let client = connect_client(&networking, &peer, options).await?;
-        let list = client
-            .list(
-                context::current(),
-                Arena::from("testdir"),
-                Options::default(),
-            )
-            .await??;
-        assert!(list.is_empty());
+        let client = connect_ping(&networking, &peer).await?;
+        assert_eq!("pong", client.ping(context::current()).await?);
+
         Ok(())
     }
 
@@ -643,19 +472,11 @@ mod tests {
         fixture.verifier = verifier_server_only();
         let addr = fixture.start_server().await?;
 
-        let options = ClientOptions::default();
         let peer = Peer::from("server");
         let networking = fixture.client_networking_with_verifier(&peer, addr, verifier_both())?;
-        let client_result = connect_client(&networking, &peer, options).await;
+        let client_result = connect_ping(&networking, &peer).await;
         let failed = match client_result {
-            Ok(client) => client
-                .list(
-                    context::current(),
-                    Arena::from("testdir"),
-                    Options::default(),
-                )
-                .await
-                .is_err(),
+            Ok(client) => client.ping(context::current()).await.is_err(),
             // If handshake fails, that's also acceptable
             Err(_) => true,
         };
@@ -669,212 +490,16 @@ mod tests {
         let mut fixture = Fixture::setup().await?;
         let addr = fixture.start_server().await?;
 
-        let options = ClientOptions::default();
         let peer = Peer::from("server");
         let networking =
             fixture.client_networking_with_verifier(&peer, addr, verifier_client_only())?;
-        let client_result = connect_client(&networking, &peer, options).await;
+        let client_result = connect_ping(&networking, &peer).await;
         let failed = match client_result {
-            Ok(client) => client
-                .list(
-                    context::current(),
-                    Arena::from("testdir"),
-                    Options::default(),
-                )
-                .await
-                .is_err(),
+            Ok(client) => client.ping(context::current()).await.is_err(),
             // If handshake fails, that's also acceptable
             Err(_) => true,
         };
         assert!(failed);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn configure_tcp_returns_limit() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup().await?;
-        let addr = fixture.start_server().await?;
-
-        let options = ClientOptions::default();
-        let peer = Peer::from("server");
-        let networking = fixture.client_networking(&peer, addr)?;
-        let client = connect_client(&networking, &peer, options).await?;
-        let limit = 12345u64;
-        let config = client
-            .configure(
-                context::current(),
-                Config {
-                    write_limit: Some(limit),
-                },
-            )
-            .await?;
-        assert_eq!(config.unwrap().write_limit, Some(limit));
-        let config = client
-            .configure(context::current(), Config { write_limit: None })
-            .await?;
-        assert_eq!(config.unwrap().write_limit, Some(limit));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn configure_tcp_per_connection_limit() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup().await?;
-        let addr = fixture.start_server().await?;
-
-        let peer = Peer::from("server");
-        let networking = fixture.client_networking(&peer, addr)?;
-        let client1 = connect_client(&networking, &peer, ClientOptions::default()).await?;
-        let client2 = connect_client(&networking, &peer, ClientOptions::default()).await?;
-        let limit = 54321u64;
-        let config1 = client1
-            .configure(
-                context::current(),
-                Config {
-                    write_limit: Some(limit),
-                },
-            )
-            .await?;
-        assert_eq!(config1.unwrap().write_limit, Some(limit));
-        let config2 = client2
-            .configure(context::current(), Config { write_limit: None })
-            .await?;
-        assert_eq!(config2.unwrap().write_limit, None);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn tcp_reconnect() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup().await?;
-        let addr = fixture.start_server().await?;
-
-        let connection_count = Arc::new(AtomicU32::new(0));
-        let (shutdown, _) = tokio::sync::broadcast::channel(1);
-        let (proxy_addr, _proxy_handle) =
-            proxy_tcp(&addr, shutdown.clone(), connection_count.clone()).await?;
-
-        let peer = Peer::from("server");
-        let networking = fixture.client_networking(&peer, proxy_addr)?;
-        let client = connect_client(&networking, &peer, ClientOptions::default()).await?;
-
-        client
-            .list(
-                context::current(),
-                Arena::from("testdir"),
-                Options::default(),
-            )
-            .await??;
-        shutdown.send(())?;
-        client
-            .list(
-                context::current(),
-                Arena::from("testdir"),
-                Options::default(),
-            )
-            .await??;
-        assert_eq!(connection_count.load(Ordering::Relaxed), 2);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn tcp_reconnect_keeps_config() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup().await?;
-        let addr = fixture.start_server().await?;
-
-        let connection_count = Arc::new(AtomicU32::new(0));
-        let (shutdown, _) = tokio::sync::broadcast::channel(1);
-        let (proxy_addr, _proxy_handle) =
-            proxy_tcp(&addr, shutdown.clone(), connection_count.clone()).await?;
-
-        let peer = Peer::from("server");
-        let networking = fixture.client_networking(&peer, proxy_addr)?;
-        let client = connect_client(&networking, &peer, ClientOptions::default()).await?;
-
-        let config = Config {
-            write_limit: Some(1024),
-        };
-        assert_eq!(
-            config,
-            client
-                .configure(context::current(), config.clone())
-                .await??
-        );
-        assert_eq!(
-            config,
-            client
-                .configure(context::current(), Config::default())
-                .await??
-        );
-
-        shutdown.send(())?;
-        assert_eq!(
-            config,
-            client
-                .configure(context::current(), Config::default())
-                .await??
-        );
-        assert_eq!(connection_count.load(Ordering::Relaxed), 2);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn tcp_reconnect_events() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup().await?;
-        let addr = fixture.start_server().await?;
-
-        let (shutdown, _) = tokio::sync::broadcast::channel(1);
-        let (proxy_addr, _proxy_handle) =
-            proxy_tcp(&addr, shutdown.clone(), Arc::new(AtomicU32::new(0))).await?;
-
-        let (conn_tx, mut conn_rx) =
-            tokio::sync::watch::channel(ClientConnectionState::NotConnected);
-        let history = tokio::spawn(async move {
-            let mut history = vec![];
-            loop {
-                history.push(*conn_rx.borrow_and_update());
-                if conn_rx.changed().await.is_err() {
-                    return history;
-                }
-            }
-        });
-
-        let peer = Peer::from("server");
-        let networking = fixture.client_networking(&peer, proxy_addr)?;
-        let options = ClientOptions {
-            connection_events: Some(conn_tx),
-            ..ClientOptions::default()
-        };
-        let client = connect_client(&networking, &peer, options).await?;
-
-        client
-            .list(
-                context::current(),
-                Arena::from("testdir"),
-                Options::default(),
-            )
-            .await??;
-        shutdown.send(())?;
-        client
-            .list(
-                context::current(),
-                Arena::from("testdir"),
-                Options::default(),
-            )
-            .await??;
-        drop(client); // also closes conn_tx
-
-        let history = history.await?;
-        assert_eq!(
-            vec![
-                ClientConnectionState::Connecting,
-                ClientConnectionState::Connected,
-                ClientConnectionState::Connecting,
-                ClientConnectionState::Connected,
-            ],
-            history
-        );
 
         Ok(())
     }
@@ -887,12 +512,12 @@ mod tests {
         let peer = Peer::from("server");
         let networking = fixture.client_networking(&peer, addr)?;
 
-        connect_client(&networking, &peer, ClientOptions::default()).await?;
+        connect_ping(&networking, &peer).await?;
 
         fixture.server.expect("server").shutdown().await?;
 
         // After shutdown, connection fails
-        let ret = connect_client(&networking, &peer, ClientOptions::default()).await;
+        let ret = connect_ping(&networking, &peer).await;
 
         assert_eq!(
             Some(std::io::ErrorKind::ConnectionRefused),
@@ -910,7 +535,7 @@ mod tests {
         let peer = Peer::from("server");
         let networking = fixture.client_networking(&peer, addr)?;
 
-        connect_client(&networking, &peer, ClientOptions::default()).await?;
+        connect_ping(&networking, &peer).await?;
 
         fixture.server.take();
 
@@ -920,66 +545,46 @@ mod tests {
         // Connection fails from now on. The exact error isn't known,
         // as the server could be in different steps of the shutdown
         // when the client attempts to connect.
-        let ret = connect_client(&networking, &peer, ClientOptions::default()).await;
+        let ret = connect_ping(&networking, &peer).await;
         assert!(ret.is_err());
 
         Ok(())
     }
 
-    /// Create a listener that proxies data to [server_addr].
-    ///
-    /// There can be only one connection at a time. Sending a message
-    /// to [shutdown] shuts down that connection.
-    ///
-    /// This proxy is geared towards simplicity, not efficiency or
-    /// correctness. It ignores errors. This is barely acceptable for
-    /// a simple test.
-    async fn proxy_tcp(
-        server_addr: &SocketAddr,
-        shutdown: tokio::sync::broadcast::Sender<()>,
-        connection_count: Arc<AtomicU32>,
-    ) -> anyhow::Result<(SocketAddr, AbortOnDrop<()>)> {
-        let listener = TcpListener::bind("localhost:0").await?;
+    /// A dummy test service, for testing client and server framework.
+    #[tarpc::service]
+    trait PingService {
+        async fn ping() -> String;
+    }
+    const PING_TAG: &[u8; 4] = b"PING";
 
-        let addr = listener.local_addr()?;
-        let server_addr = *server_addr;
+    #[derive(Clone)]
+    struct PingServer {}
 
-        let handle = AbortOnDrop::new(tokio::spawn(async move {
-            while let Ok((mut inbound, _)) = listener.accept().await {
-                if let Ok(mut outbound) = TcpStream::connect(server_addr).await {
-                    connection_count.fetch_add(1, Ordering::Relaxed);
+    impl PingService for PingServer {
+        async fn ping(self, _ctx: context::Context) -> String {
+            "pong".to_string()
+        }
+    }
 
-                    let mut shutdown = shutdown.subscribe();
-                    let mut buf_in_to_out = [0u8; 8 * 1024];
-                    let mut buf_out_to_in = [0u8; 8 * 1024];
-                    loop {
-                        tokio::select! {
-                            res = inbound.read(&mut buf_in_to_out) => {
-                                if let Ok(n) = res {
-                                    if n > 0 && outbound.write_all(&buf_in_to_out[0..n]).await.is_ok() {
-                                        continue
-                                    }
-                                }
-                                break;
-                            },
-                            res = outbound.read(&mut buf_out_to_in) => {
-                                if let Ok(n) = res {
-                                    if n > 0 && inbound.write_all(&buf_out_to_in[0..n]).await.is_ok() {
-                                        continue;
-                                    }
-                                }
-                                break;
-                            },
-                            _ = shutdown.recv() => {
-                                break;
-                            }
-                        }
-                    }
-                    let _ = tokio::join!(inbound.shutdown(), outbound.shutdown());
-                }
-            }
-        }));
+    /// Register a [PingService] to the given server.
+    fn register_ping(server: &mut Server) {
+        server.register_server(PING_TAG, move |_, _, framed| {
+            let transport = tarpc::serde_transport::new(framed, Bincode::default());
+            let server = PingServer {};
+            let serve_fn = PingServer::serve(server.clone());
 
-        Ok((addr, handle))
+            tarpc::server::BaseChannel::with_defaults(transport).execute(serve_fn)
+        })
+    }
+
+    /// Connect to the given peer as [PingService].
+    async fn connect_ping(
+        networking: &Networking,
+        peer: &Peer,
+    ) -> anyhow::Result<PingServiceClient> {
+        let transport = networking.connect(peer, PING_TAG, None).await?;
+
+        Ok(PingServiceClient::new(tarpc::client::Config::default(), transport).spawn())
     }
 }
