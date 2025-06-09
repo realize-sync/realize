@@ -279,7 +279,7 @@ mod tests {
         )
         .await?;
 
-        server.shutdown()?;
+        server.shutdown().await?;
 
         // The server shutting down stops the forwarder
         timeout(Duration::from_secs(1), handle).await???;

@@ -274,8 +274,9 @@ impl Server {
         );
     }
 
-    pub fn shutdown(&self) -> anyhow::Result<()> {
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
         self.shutdown_tx.send(())?;
+        self.shutdown_tx.closed().await;
 
         Ok(())
     }

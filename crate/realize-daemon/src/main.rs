@@ -3,18 +3,15 @@
 use anyhow::Context as _;
 use clap::Parser;
 use futures_util::stream::StreamExt as _;
-use prometheus::{IntCounter, register_int_counter};
+use prometheus::{register_int_counter, IntCounter};
 use realize_lib::model::{Arena, Peer};
 use realize_lib::network::config::PeerConfig;
-use realize_lib::network::rpc::realize::metrics;
-use realize_lib::network::security::{self, PeerVerifier};
-use realize_lib::network::{hostport::HostPort, tcp};
+use realize_lib::network::hostport::HostPort;
+use realize_lib::network::rpc::realize::{self, metrics};
+use realize_lib::network::tcp::{Networking, Server};
 use realize_lib::storage::config::ArenaConfig;
 use realize_lib::storage::real::LocalStorage;
 use realize_lib::utils::logging;
-use rustls::pki_types::PrivateKeyDer;
-use rustls::pki_types::pem::PemObject;
-use rustls::sign::SigningKey;
 use serde::Deserialize;
 use signal_hook_tokio::Signals;
 use std::collections::HashMap;
@@ -82,11 +79,8 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
     check_directory_access(&config.arenas)?;
 
     // Build directory list
-    let dirs = LocalStorage::from_config(&config.arenas);
-
-    let verifier = PeerVerifier::from_config(&config.peers)?;
-    let privkey = load_private_key_file(&cli.privkey)
-        .with_context(|| format!("{}: Failed to parse private key", cli.privkey.display()))?;
+    let storage = LocalStorage::from_config(&config.arenas);
+    let networking = Networking::from_config(&config.peers, &cli.privkey)?;
 
     if let Some(addr) = &cli.metrics_addr {
         metrics::export_metrics(addr)
@@ -99,7 +93,11 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("Failed to parse --address {}", cli.address))?;
     log::debug!("Starting server on {}/{:?}...", hostport, hostport.addr());
-    let (addr, shutdown) = tcp::start_server(&hostport, dirs, verifier, privkey)
+    let mut server = Server::new(networking);
+    realize::server::register(&mut server, storage);
+    let server = Arc::new(server);
+    let addr = Arc::clone(&server)
+        .listen(&hostport)
         .await
         .with_context(|| format!("Failed to start server on {}", hostport))?;
 
@@ -118,9 +116,7 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
 
     log::info!("Interrupted. Shutting down..");
     signals.handle().close(); // A 2nd signal kills the process
-    shutdown.send(())?;
-
-    shutdown.closed().await;
+    server.shutdown().await?;
 
     Ok(())
 }
@@ -184,12 +180,4 @@ fn parse_config(path: &Path) -> anyhow::Result<Config> {
     let content = fs::read_to_string(path)?;
 
     Ok(toml::from_str(&content)?)
-}
-
-fn load_private_key_file(path: &Path) -> anyhow::Result<Arc<dyn SigningKey>> {
-    let key = PrivateKeyDer::from_pem_file(path)?;
-
-    Ok(security::default_provider()
-        .key_provider
-        .load_private_key(key)?)
 }
