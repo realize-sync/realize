@@ -3,33 +3,6 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
-## Add mtime to Unlink notification {#unlinktime}
-
-We need mtime available in notifications to make sure things are in
-the right order, especially when mixing calls to RealizeService::list
-with notifications that might happen while the list is being prepared.
-
-Notification::Unlink, defined in
-[@/crate/realize-lib/src/storage/real/history.rs](../crate/realize-lib/src/storage/real/history.rs)
-should have a new field `mtime: SystemTime`. 
-
-To find it, do the following:
-- take the metadata of the containing directory, if it's there, use the directory mtime as mtime for unlink
-- if the metadata of the containing directory could be accessed, take the metadata of the deleted file, if it's there, don't send the notification (presumably the file has been re-created)
-- if the metadata of the containing directory could not be accessed, take the metadata of its parent
-- if it's there, use the mtime as mtime
-- if it's not there, try the parent parent... and so one until the Arena root is reached and if that path isn't available, return an error
-
-Write the code and make sure it compiles.
-
-To test this, first extend the unit tests that already send unlink.
-Pay attention to delete_existing_dir_recursively as this is a test
-where finding a parent dir's mtime might be difficult since at the
-time the notification is handled, an entire tree might have been
-deleted.
-
-Fix the tests and make sure they all pass.
-
 ## The beginnig of the Unreal {#unreal}
 
 Let's start implementing the file cache described in [@/spec/design.md](design.md).

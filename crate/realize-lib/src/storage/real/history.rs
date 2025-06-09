@@ -35,6 +35,7 @@ pub enum Notification {
     Unlink {
         arena: Arena,
         path: Path,
+        mtime: SystemTime,
     },
 }
 
@@ -323,7 +324,7 @@ impl Collector {
                     } else if ev.mask.contains(EventMask::DELETE)
                         || ev.mask.contains(EventMask::MOVED_FROM)
                     {
-                        self.send_unlink(full_path, arena).await;
+                        self.send_unlink(full_path, arena).await?;
                     }
                 }
             }
@@ -332,16 +333,21 @@ impl Collector {
     }
 
     /// Send Unlink notification.
-    async fn send_unlink(&mut self, full_path: PathBuf, arena: Arena) {
+    async fn send_unlink(&mut self, full_path: PathBuf, arena: Arena) -> anyhow::Result<()> {
         if let Some(watch) = self.watched.get(&arena) {
             if let Some((PathType::Final, resolved)) = watch.path_resolver.reverse(&full_path) {
-                self.send_notification(Notification::Unlink {
-                    arena,
-                    path: resolved,
-                })
-                .await;
+                if let Some(mtime) = find_mtime_for_unlink(&watch.path_resolver, &resolved).await? {
+                    self.send_notification(Notification::Unlink {
+                        arena,
+                        path: resolved,
+                        mtime,
+                    })
+                    .await;
+                }
             }
         }
+
+        Ok(())
     }
 
     /// Send Link notification.
@@ -472,6 +478,41 @@ fn spawn_walk_dir(arena: Arena, root: PathBuf, mode: WalkDirMode, tx: mpsc::Send
     });
 }
 
+/// Find the modification time for a file that has been unlinked.
+///
+/// This is tricky because the file is gone and the containing
+/// directory might be gone, too.
+async fn find_mtime_for_unlink(
+    resolver: &PathResolver,
+    path: &Path,
+) -> anyhow::Result<Option<SystemTime>> {
+    let full_path = path.within(resolver.root());
+    if fs::metadata(&full_path).await.is_ok() {
+        // File was re-created, so we don't send an unlink notification.
+        return Ok(None);
+    }
+
+    let mut current = path.parent();
+    while let Some(parent_path) = current {
+        let parent_full_path = parent_path.within(resolver.root());
+        if let Ok(metadata) = fs::metadata(&parent_full_path).await {
+            return Ok(Some(metadata.modified().expect("OS must support mtime")));
+        }
+        current = parent_path.parent();
+    }
+
+    // Fallback to arena root
+    if let Ok(metadata) = fs::metadata(resolver.root()).await {
+        return Ok(Some(metadata.modified().expect("OS must support mtime")));
+    }
+
+    Err(anyhow::anyhow!(
+        "arena root {:?} is gone; cannot report unlink of {:?}",
+        resolver.root(),
+        path
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,11 +629,13 @@ mod tests {
 
         fixture.subscribe().await?;
 
+        let mtime = fixture.arena_dir.metadata()?.modified()?;
         std::fs::remove_file(child.path())?;
         assert_eq!(
             Notification::Unlink {
                 arena: fixture.arena(),
                 path: Path::parse("child.txt")?,
+                mtime,
             },
             fixture.next("unlink").await?,
         );
@@ -630,6 +673,7 @@ mod tests {
 
         fixture.subscribe().await?;
 
+        let mtime = fixture.arena_dir.metadata()?.modified()?;
         std::fs::remove_dir_all(subdir.path())?;
         let n1 = fixture.next("unlink 1").await?;
         let n2 = fixture.next("unlink 2").await?;
@@ -638,10 +682,12 @@ mod tests {
         let unlink1 = Notification::Unlink {
             arena: fixture.arena(),
             path: p1,
+            mtime,
         };
         let unlink2 = Notification::Unlink {
             arena: fixture.arena(),
             path: p2,
+            mtime,
         };
         if n1 == unlink1 {
             assert_eq!(n2, unlink2);
@@ -661,10 +707,12 @@ mod tests {
 
         let dest = fixture._tempdir.child("dest.txt");
         std::fs::rename(child.path(), dest.path())?;
+        let mtime = fixture.arena_dir.metadata()?.modified()?;
         assert_eq!(
             Notification::Unlink {
                 arena: fixture.arena(),
                 path: Path::parse("child.txt")?,
+                mtime,
             },
             fixture.next("move out").await?,
         );
@@ -703,9 +751,11 @@ mod tests {
         std::fs::rename(source.path(), dest.path())?;
         let n1 = fixture.next("move within 1").await?;
         let n2 = fixture.next("move within 2").await?;
+        let mtime = fixture.arena_dir.metadata()?.modified()?;
         let unlink = Notification::Unlink {
             arena: fixture.arena(),
             path: Path::parse("source.txt")?,
+            mtime,
         };
         let link = Notification::Link {
             arena: fixture.arena(),
@@ -738,11 +788,13 @@ mod tests {
             fixture.next("create").await?,
         );
 
+        let mtime = fixture.arena_dir.metadata()?.modified()?;
         std::fs::remove_file(child.path())?;
         assert_eq!(
             Notification::Unlink {
                 arena: fixture.arena(),
                 path: Path::parse("child.txt")?,
+                mtime,
             },
             fixture.next("delete").await?,
         );
