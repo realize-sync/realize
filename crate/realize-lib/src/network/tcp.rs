@@ -174,6 +174,10 @@ impl Networking {
     }
 }
 
+/// A server that that listens on a port.
+///
+/// Which services are served depends on what's registered to the
+/// server.
 pub struct Server {
     networking: Networking,
     handlers: HashMap<
@@ -195,6 +199,7 @@ pub struct Server {
 }
 
 impl Server {
+    /// Create a new server, with the given networking configuration.
     pub fn new(networking: Networking) -> Self {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         Self {
@@ -204,6 +209,11 @@ impl Server {
         }
     }
 
+    /// Register a handler for the given tag.
+    ///
+    /// If registering a TARPC service listener, use
+    /// [Server::register_server] instead. This method is mostly
+    /// useful for registering TARPC clients.
     pub(crate) fn register(
         &mut self,
         tag: &'static [u8; 4],
@@ -222,6 +232,7 @@ impl Server {
         self.handlers.insert(tag, Box::new(handler));
     }
 
+    /// Register a handler for a TARPC service.
     pub(crate) fn register_server<T, S, F>(&mut self, tag: &'static [u8; 4], handler: T)
     where
         T: Fn(
@@ -271,6 +282,10 @@ impl Server {
         );
     }
 
+    /// Shutdown any listener and wait for the shutdown to happen.
+    ///
+    /// The listener is also shutdown when the server instance is
+    /// dropped.
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         self.shutdown_tx.send(())?;
         self.shutdown_tx.closed().await;
@@ -278,6 +293,12 @@ impl Server {
         Ok(())
     }
 
+    /// Listen or the given address.
+    ///
+    /// The server spawns a task for listening in the background. The
+    /// task runs as long as there is at least one server instance
+    /// available through the Arc, or until [Server::shutdown] is
+    /// called.
     pub async fn listen(self: Arc<Self>, hostport: &HostPort) -> anyhow::Result<SocketAddr> {
         let listener = TcpListener::bind(hostport.addr()).await?;
         log::info!(
@@ -290,6 +311,7 @@ impl Server {
 
         let addr = listener.local_addr()?;
         let mut shutdown_listener_rx = self.shutdown_tx.subscribe();
+        let weak_self = Arc::downgrade(&self);
         tokio::spawn(async move {
             loop {
                 tokio::select!(
@@ -298,10 +320,19 @@ impl Server {
                         return;
                     }
                     Ok((stream, peer)) = listener.accept() => {
-                        match self.accept(stream).await {
-                            Ok(_) => {}
-                            Err(err) => log::debug!("{}: connection rejected: {}", peer, err),
-                        };
+                        match weak_self.upgrade() {
+                            Some(strong_self) => {
+                                match strong_self.accept(stream).await {
+                                    Ok(_) => {}
+                                    Err(err) => log::debug!("{}: connection rejected: {}", peer, err),
+                                };
+                            }
+                            None => {
+                                // Server has been dropped; Shutdown listener.
+                                return;
+                            }
+
+                        }
                     }
                 );
             }
@@ -867,6 +898,30 @@ mod tests {
             Some(std::io::ErrorKind::ConnectionRefused),
             network::testing::io_error_kind(ret.err())
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_shutdown_when_dropped() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        let addr = fixture.start_server().await?;
+
+        let peer = Peer::from("server");
+        let networking = fixture.client_networking(&peer, addr)?;
+
+        connect_client(&networking, &peer, ClientOptions::default()).await?;
+
+        fixture.server.take();
+
+        // Allow tasks to notice.
+        tokio::task::yield_now().await;
+
+        // Connection fails from now on. The exact error isn't known,
+        // as the server could be in different steps of the shutdown
+        // when the client attempts to connect.
+        let ret = connect_client(&networking, &peer, ClientOptions::default()).await;
+        assert!(ret.is_err());
 
         Ok(())
     }
