@@ -11,4 +11,5 @@ pub use data::Delta;
 pub use data::Hash;
 pub use data::Signature;
 pub use path::Path;
+pub use path::PathError;
 pub use peer::Peer;
