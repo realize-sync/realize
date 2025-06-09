@@ -61,6 +61,6 @@
 *   **Asynchronous Everywhere:** All I/O operations (network, filesystem) are asynchronous, managed by Tokio.
 *   **Custom Path Type:** [`model::Path`](crate/realize-lib/src/model/path.rs) is used internally, with conversions to/from `std::path::PathBuf`.
 *   **Raw Public Key TLS:** Security relies on direct verification of peer ED25519 public keys, bypassing traditional Certificate Authorities.
-*   **Partial File Handling:** Files being transferred are often stored with a `.partial` suffix until complete.
+*   **Partial File Handling:** Files being transferred are often stored with a `.partial` suffix until complete; this is managed via a PathResolver, obtained from LocalStorage.
 *   **Modularity:** The `realize-lib` crate is divided into `model`, `network`, `storage`, `logic`, and `utils` modules.
 *   **Configuration via TOML:** Daemon settings, peer lists, and arena configurations are managed through TOML files.

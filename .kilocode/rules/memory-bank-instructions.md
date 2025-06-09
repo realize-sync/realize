@@ -152,6 +152,8 @@ The memory bank files are located in `.kilocode/rules/memory-bank` folder. If th
 
 "[Memory Bank: Active] I understand we're building a React inventory system with barcode scanning. Currently implementing the scanner component that needs to work with the backend API."
 
+(This is just an example, don't actually say the above verbatim. Adapt the text after "I understand" to the actual project.)
+
 When starting a task that matches a documented task in `tasks.md`, I should mention this and follow the documented workflow to ensure no steps are missed.
 
 If the task was repetitive and might be needed again, I should suggest: "Would you like me to add this task to the memory bank for future reference?"
