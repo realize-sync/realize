@@ -7,18 +7,26 @@ for easy reference, and end with a detailled and numbered task list.
 
 Let's start implementing the file cache described in [@/spec/design.md](design.md).
 
-The design describe a system based on blobs, but for now we just have file paths; let's get started with that and add blobs in a later step.
+The design describe a system based on blobs, but for now we just have
+file paths; let's get started with that and add blobs in a later step.
+
 
 1. Fetch list of remote files using RealizeService::list and store it in a [redb](https://github.com/cberner/redb/tree/master) database. 
    - The database stores file availability in a table: 
       key: (arena, path), arena as model::Arena, path as model::Path
       value: a struct containing, for each peer for which data is avalible: presence (available or deleted), file size (if available), mtime
+      
+   1.1 fill the details section of [@/spec/unreal.md](unreal.md) with a good description of the database
+   1.2 implement the database, keeping it as a goal to expose it through `nfsserve` (next step)
 
 2. Make the file list available through [nfsserve](https://github.com/xetdata/nfsserve). Don't bother serving file content just yet; reading file data should just fail, but listing files should work.
 
     - use the uid and gid of the daemon process for the files and directories
     - for files, use mode u=rw,g=rw,o=r 
     - for directories, use mode u=rwx,g=rwx,o=rx
+    
+  2.1 fill the details section of [@/spec/unreal.md](unreal.md) with a good description how this will work
+  2.2 make the file list in the database created in step 1 available through NFS in the daemon
 
 3. Track changes made remotely, so the filesystem view is up-to-date (Using HistoryService). Keep a connection to all listening peers, as defined in the peer list. Reconnect as necessary. 
     Algorithm:
@@ -30,10 +38,21 @@ The design describe a system based on blobs, but for now we just have file paths
      3. once `forward_peer_history` has returned, fetch the file list using `RealizeService::list`, using a client from [@/crate/realize-lib/src/network/rpc/realize/client.rs](../crate/realize-lib/src/network/rpc/realize/client.rs) and update the database
      4. whenever a file change notification is received, update the database (note that this can happen before the files list has been read. Use mtime to resolve conflicts)
      5. when disconnected, as reported by `ClientOptions::connection_events`, let `forward_peer_history` shut down and go back to point 2, waiting for a reconnection
+     
+  3.1 fill the details section of [@/spec/unreal.md](unreal.md) with a good description of the algorithm and how it all fits together
+  3.2 implement the algorithm
 
 4. Serve file content through `nfsserve` by making a request for a
    range of file content using [RealizeService] when connected. Fail
    immediately when disconnected.
+
+  4.1 fill the details section of [@/spec/unreal.md](unreal.md) with a description of how this would go
+  4.2 implement the algorithm without storing data to the database
+  
+5. Store file data (ranges) to the database, as a cache
+
+  5.1 fill the details section of [@/spec/unreal.md](unreal.md) with a description of how this would go
+  5.2 implement
 
 ## File hash as as Merkle tree {#merkle}
 
