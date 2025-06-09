@@ -518,13 +518,8 @@ mod tests {
         let temp = TempDir::new()?;
         let dirs = LocalStorage::single(&Arena::from("testdir"), temp.path());
         let server_privkey = load_private_key(testing::server_private_key())?;
-        let (addr, shutdown) = start_server(
-            &HostPort::parse("127.0.0.1:0").await?,
-            dirs,
-            verifier,
-            server_privkey,
-        )
-        .await?;
+        let (addr, shutdown) =
+            start_server(&HostPort::localhost(0), dirs, verifier, server_privkey).await?;
 
         Ok((addr, shutdown, temp))
     }
@@ -658,7 +653,7 @@ mod tests {
         let verifier = verifier_both();
         let server_privkey = load_private_key(testing::server_private_key())?;
         let (addr, _handle) = start_server(
-            &HostPort::parse("127.0.0.1:0").await?,
+            &HostPort::localhost(0),
             dirs.clone(),
             verifier.clone(),
             server_privkey,
@@ -696,7 +691,7 @@ mod tests {
         let verifier = verifier_both();
         let server_privkey = load_private_key(testing::server_private_key())?;
         let (addr, _handle) = start_server(
-            &HostPort::parse("127.0.0.1:0").await?,
+            &HostPort::localhost(0),
             dirs.clone(),
             verifier.clone(),
             server_privkey,
