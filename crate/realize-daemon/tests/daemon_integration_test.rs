@@ -15,7 +15,7 @@ use realize_lib::network::rpc::realize::client::ClientOptions;
 use realize_lib::network::rpc::realize::Options;
 use realize_lib::network::security::PeerVerifier;
 use realize_lib::network::security::RawPublicKeyResolver;
-use realize_lib::network::tcp::Networking;
+use realize_lib::network::Networking;
 use reqwest::Client;
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::SubjectPublicKeyInfoDer;
@@ -96,7 +96,7 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
         .command()
         .env(
             "RUST_LOG",
-            "realize_lib::network::tcp=debug,realize_daemon=debug",
+            "realize_lib::network=debug,realize_daemon=debug",
         )
         .spawn()?;
 

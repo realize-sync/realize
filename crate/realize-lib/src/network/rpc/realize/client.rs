@@ -18,7 +18,7 @@ use crate::network::rpc::realize::Config;
 use crate::network::rpc::realize::RealizeServiceClient;
 use crate::network::rpc::realize::RealizeServiceRequest;
 use crate::network::rpc::realize::RealizeServiceResponse;
-use crate::network::tcp::Networking;
+use crate::network::Networking;
 
 pub type ClientType = RealizeServiceClient<RealizeStub>;
 
@@ -170,7 +170,7 @@ mod tests {
     use crate::network::hostport::HostPort;
     use crate::network::rpc::realize::{Config, Options};
     use crate::network::security::{testing, PeerVerifier, RawPublicKeyResolver};
-    use crate::network::tcp::Server;
+    use crate::network::Server;
     use crate::storage::real::LocalStorage;
     use crate::utils::async_utils::AbortOnDrop;
     use assert_fs::TempDir;

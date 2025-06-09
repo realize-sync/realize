@@ -4,7 +4,7 @@ use tarpc::tokio_serde::formats::Bincode;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::model::Peer;
-use crate::network::{rpc::history::HistoryServiceClient, tcp::Server};
+use crate::network::{rpc::history::HistoryServiceClient, Server};
 use crate::storage::real::LocalStorage;
 
 use super::{HistoryServiceRequest, HistoryServiceResponse};

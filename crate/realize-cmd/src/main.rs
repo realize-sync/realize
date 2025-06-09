@@ -16,7 +16,7 @@ use realize_lib::network::rpc::realize;
 use realize_lib::network::rpc::realize::client::ClientConnectionState;
 use realize_lib::network::rpc::realize::client::ClientOptions;
 use realize_lib::network::rpc::realize::metrics;
-use realize_lib::network::tcp::Networking;
+use realize_lib::network::Networking;
 use realize_lib::utils::logging;
 use signal_hook_tokio::Signals;
 use std::collections::HashMap;

@@ -16,14 +16,13 @@ use std::time::Instant;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use prometheus::{
-    Encoder, HistogramVec, IntCounterVec, IntGauge, register_histogram_vec,
-    register_int_counter_vec, register_int_gauge,
+    register_histogram_vec, register_int_counter_vec, Encoder, HistogramVec, IntCounterVec,
 };
 use tarpc::{
-    ServerError,
-    client::{RpcError, stub::Stub},
+    client::{stub::Stub, RpcError},
     context::Context,
     server::Serve,
+    ServerError,
 };
 use tokio::net::TcpListener;
 
@@ -96,11 +95,6 @@ lazy_static::lazy_static! {
             "realize_client_call_count",
             "RPC call count, grouped by status and errors",
             &["method", "status", "error"]).unwrap();
-
-    pub(crate) static ref METRIC_SERVER_IN_FLIGHT_REQUEST_COUNT: IntGauge =
-    register_int_gauge!(
-        "realize_server_in_flight_request_count",
-        "Number of RPCs currently in-flight on the server").unwrap();
 }
 
 /// 1M to 64G in 16 buckets.
@@ -355,13 +349,6 @@ impl<T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse> + Clone
 
         res
     }
-}
-
-/// Decorate the given future with a counter for in-flight requests.
-pub(crate) async fn track_in_flight_request(fut: impl Future<Output = ()>) {
-    METRIC_SERVER_IN_FLIGHT_REQUEST_COUNT.inc();
-    fut.await;
-    METRIC_SERVER_IN_FLIGHT_REQUEST_COUNT.dec();
 }
 
 /// [RealizeService] serve function that fills in server-side metrics.

@@ -8,7 +8,7 @@ use crate::model;
 use crate::model::Arena;
 use crate::model::ByteRange;
 use crate::model::Hash;
-use crate::network::rpc::realize::metrics::{self, MetricsRealizeClient, MetricsRealizeServer};
+use crate::network::rpc::realize::metrics::{MetricsRealizeClient, MetricsRealizeServer};
 use crate::network::rpc::realize::Config;
 use crate::network::rpc::realize::Options;
 use crate::network::rpc::realize::{
@@ -17,7 +17,7 @@ use crate::network::rpc::realize::{
 use crate::network::rpc::realize::{
     RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse,
 };
-use crate::network::tcp::Server;
+use crate::network::Server;
 use crate::storage::real::LocalStorage;
 use crate::storage::real::PathResolver;
 use crate::storage::real::PathType;
@@ -128,7 +128,7 @@ impl RealizeServer {
             server
                 .execute(MetricsRealizeServer::new(RealizeServer::serve(self)))
                 .for_each(|fut| async move {
-                    tokio::spawn(metrics::track_in_flight_request(fut));
+                    tokio::spawn(fut);
                 }),
         );
         let client = tarpc::client::new(tarpc::client::Config::default(), client_transport).spawn();

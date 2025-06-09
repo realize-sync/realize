@@ -14,7 +14,7 @@ use tokio::{
 
 use crate::{
     model::{Arena, Peer},
-    network::tcp::Networking,
+    network::Networking,
     storage::real::Notification,
     utils::async_utils::AbortOnDrop,
 };
@@ -166,7 +166,7 @@ mod tests {
             hostport::HostPort,
             rpc::history,
             security::{testing, PeerVerifier, RawPublicKeyResolver},
-            tcp::Server,
+            Server,
         },
         storage::real::LocalStorage,
     };
