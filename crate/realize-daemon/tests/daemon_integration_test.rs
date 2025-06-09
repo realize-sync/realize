@@ -11,13 +11,12 @@ use realize_lib::model;
 use realize_lib::model::Arena;
 use realize_lib::model::Peer;
 use realize_lib::network::rpc::realize::Options;
-use realize_lib::network::security;
 use realize_lib::network::security::PeerVerifier;
+use realize_lib::network::security::RawPublicKeyResolver;
 use realize_lib::network::tcp;
 use realize_lib::network::tcp::Networking;
 use reqwest::Client;
 use rustls::pki_types::pem::PemObject as _;
-use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::SubjectPublicKeyInfoDer;
 use tarpc::context;
 use tokio::io::AsyncBufReadExt as _;
@@ -114,9 +113,7 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
     let peer = Peer::from("server");
     let networking = Networking::new(
         vec![(&peer, format!("127.0.0.1:{portstr}").as_ref())],
-        security::default_provider().key_provider.load_private_key(
-            PrivateKeyDer::from_pem_file(fixture.resources.join("a.key"))?,
-        )?,
+        RawPublicKeyResolver::from_private_key_file(&fixture.resources.join("a.key"))?,
         verifier,
     );
     let client = tcp::connect_client(&networking, &peer, tcp::ClientOptions::default()).await?;

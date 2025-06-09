@@ -7,8 +7,6 @@ use anyhow::Context as _;
 use async_speed_limit::clock::StandardClock;
 use async_speed_limit::Limiter;
 use futures::prelude::*;
-use rustls::pki_types::pem::PemObject as _;
-use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::ServerName;
 use rustls::sign::SigningKey;
 use tarpc::client::stub::Stub;
@@ -24,6 +22,8 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_retry::strategy::ExponentialBackoff;
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::TlsConnector;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -60,14 +60,16 @@ use crate::utils::async_utils::AbortOnDrop;
 
 use super::config::PeerConfig;
 use super::hostport::HostPort;
+use super::security::RawPublicKeyResolver;
 
 pub type TcpRealizeServiceClient = RealizeServiceClient<TcpStub>;
 
 #[derive(Clone)]
 pub struct Networking {
     addresses: Arc<HashMap<Peer, String>>,
-    privkey: Arc<dyn SigningKey>,
     verifier: Arc<PeerVerifier>,
+    acceptor: Arc<TlsAcceptor>,
+    connector: Arc<TlsConnector>,
 }
 
 impl Networking {
@@ -76,14 +78,7 @@ impl Networking {
         privkey: &path::Path,
     ) -> anyhow::Result<Self> {
         let verifier = PeerVerifier::from_config(&peers)?;
-        let privkey =
-            security::default_provider()
-                .key_provider
-                .load_private_key(PrivateKeyDer::from_pem_file(privkey).with_context(|| {
-                    format!("not a PEM-encoded private key: {}", privkey.display())
-                })?)
-                .with_context(|| format!("invalid private key in {}", privkey.display()))?;
-
+        let resolver = RawPublicKeyResolver::from_private_key_file(privkey)?;
         Ok(Self::new(
             peers.iter().flat_map(|(p, c)| {
                 if let Some(addr) = &c.address {
@@ -92,14 +87,14 @@ impl Networking {
                     None
                 }
             }),
-            privkey,
+            resolver,
             verifier,
         ))
     }
 
     pub fn new<'a, T>(
         addresses: T,
-        privkey: Arc<dyn SigningKey>,
+        resolver: Arc<RawPublicKeyResolver>,
         verifier: Arc<PeerVerifier>,
     ) -> Self
     where
@@ -112,8 +107,12 @@ impl Networking {
                     .map(|(p, addr)| (p.clone(), addr.to_string()))
                     .collect(),
             ),
-            privkey,
-            verifier,
+            verifier: Arc::clone(&verifier),
+            acceptor: Arc::new(security::make_tls_acceptor(
+                Arc::clone(&verifier),
+                Arc::clone(&resolver),
+            )),
+            connector: Arc::new(security::make_tls_connector(verifier, resolver)),
         }
     }
 
@@ -143,15 +142,12 @@ impl Networking {
             .await
             .with_context(|| format!("address for {peer} is invalid"))?;
         let domain = ServerName::try_from(addr.host().to_string())?;
-        let connector =
-            security::make_tls_connector(Arc::clone(&self.verifier), Arc::clone(&self.privkey))?;
-
         let stream = TcpStream::connect(addr.addr()).await?;
         let stream = RateLimitedStream::new(
             stream,
             limiter.unwrap_or_else(|| Limiter::<StandardClock>::new(f64::INFINITY)),
         );
-        let mut tls_stream = connector.connect(domain, stream).await?;
+        let mut tls_stream = self.connector.connect(domain, stream).await?;
         tls_stream.write_all(tag).await?;
 
         let transport = transport::new(
@@ -176,9 +172,7 @@ impl Networking {
     > {
         let peer_addr = stream.peer_addr()?;
         let stream = RateLimitedStream::new(stream, limiter);
-        let acceptor =
-            security::make_tls_acceptor(Arc::clone(&self.verifier), Arc::clone(&self.privkey))?;
-        let mut tls_stream = acceptor.accept(stream).await?;
+        let mut tls_stream = self.acceptor.accept(stream).await?;
         // Guards against bugs in the auth code; worth dying
         let peer = self
             .verifier
@@ -362,7 +356,7 @@ pub async fn start_server(
     verifier: Arc<PeerVerifier>,
     privkey: Arc<dyn SigningKey>,
 ) -> anyhow::Result<(SocketAddr, tokio::sync::broadcast::Sender<()>)> {
-    let networking = Networking::new(vec![], privkey, verifier);
+    let networking = Networking::new(vec![], RawPublicKeyResolver::new(privkey)?, verifier);
     let mut server = Server::new(networking);
 
     realize::server::register(&mut server, storage.clone());
@@ -634,12 +628,11 @@ mod tests {
     async fn tarpc_tcp_connect() -> anyhow::Result<()> {
         let verifier = verifier_both();
         let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
-        let client_privkey = load_private_key(testing::client_private_key())?;
         let options = ClientOptions::default();
         let peer = Peer::from("server");
         let networking = Networking::new(
             vec![(&peer, addr.to_string().as_ref())],
-            client_privkey,
+            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
             verifier,
         );
         let client = connect_client(&networking, &peer, options).await?;
@@ -658,9 +651,10 @@ mod tests {
     async fn tarpc_tcp_reject_bad_tag() -> anyhow::Result<()> {
         let verifier = verifier_both();
         let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
-        let client_privkey = load_private_key(testing::client_private_key())?;
-
-        let connector = security::make_tls_connector(verifier_both(), client_privkey)?;
+        let connector = security::make_tls_connector(
+            verifier_both(),
+            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
+        );
         let stream = TcpStream::connect(addr).await?;
         let domain = ServerName::try_from("localhost")?;
         let mut tls_stream = connector.connect(domain, stream).await?;
@@ -677,12 +671,11 @@ mod tests {
     async fn client_not_in_server_verifier_fails() -> anyhow::Result<()> {
         let verifier = verifier_server_only();
         let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await.unwrap();
-        let client_privkey = load_private_key(testing::client_private_key())?;
         let options = ClientOptions::default();
         let peer = Peer::from("server");
         let networking = Networking::new(
             vec![(&peer, addr.to_string().as_ref())],
-            client_privkey,
+            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
             verifier,
         );
         let client_result = connect_client(&networking, &peer, options).await;
@@ -707,12 +700,11 @@ mod tests {
     async fn server_not_in_client_verifier_fails() -> anyhow::Result<()> {
         let verifier = verifier_client_only();
         let (addr, _shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await.unwrap();
-        let client_privkey = load_private_key(testing::client_private_key())?;
         let options = ClientOptions::default();
         let peer = Peer::from("server");
         let networking = Networking::new(
             vec![(&peer, addr.to_string().as_ref())],
-            client_privkey,
+            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
             verifier,
         );
         let result = connect_client(&networking, &peer, options).await;
@@ -737,12 +729,11 @@ mod tests {
             server_privkey,
         )
         .await?;
-        let client_privkey = load_private_key(testing::client_private_key())?;
         let options = ClientOptions::default();
         let peer = Peer::from("server");
         let networking = Networking::new(
             vec![(&peer, addr.to_string().as_ref())],
-            client_privkey,
+            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
             verifier,
         );
         let client = connect_client(&networking, &peer, options).await?;
@@ -776,29 +767,14 @@ mod tests {
             server_privkey,
         )
         .await?;
-        let client_privkey1 = load_private_key(testing::client_private_key())?;
-        let client_privkey2 = load_private_key(testing::client_private_key())?;
         let peer = Peer::from("server");
-        let client1 = connect_client(
-            &Networking::new(
-                vec![(&peer, addr.to_string().as_ref())],
-                client_privkey1,
-                Arc::clone(&verifier),
-            ),
-            &peer,
-            ClientOptions::default(),
-        )
-        .await?;
-        let client2 = connect_client(
-            &Networking::new(
-                vec![(&peer, addr.to_string().as_ref())],
-                client_privkey2,
-                Arc::clone(&verifier),
-            ),
-            &peer,
-            ClientOptions::default(),
-        )
-        .await?;
+        let networking = Networking::new(
+            vec![(&peer, addr.to_string().as_ref())],
+            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
+            Arc::clone(&verifier),
+        );
+        let client1 = connect_client(&networking, &peer, ClientOptions::default()).await?;
+        let client2 = connect_client(&networking, &peer, ClientOptions::default()).await?;
         let limit = 54321u64;
         let config1 = client1
             .configure(
@@ -826,11 +802,10 @@ mod tests {
         let (proxy_addr, _proxy_handle) =
             proxy_tcp(&addr, shutdown.clone(), connection_count.clone()).await?;
 
-        let client_privkey = load_private_key(testing::client_private_key())?;
         let peer = Peer::from("server");
         let networking = Networking::new(
             vec![(&peer, proxy_addr.to_string().as_ref())],
-            client_privkey,
+            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
             verifier,
         );
         let client = connect_client(&networking, &peer, ClientOptions::default()).await?;
@@ -865,11 +840,10 @@ mod tests {
         let (proxy_addr, _proxy_handle) =
             proxy_tcp(&addr, shutdown.clone(), connection_count.clone()).await?;
 
-        let client_privkey = load_private_key(testing::client_private_key())?;
         let peer = Peer::from("server");
         let networking = Networking::new(
             vec![(&peer, proxy_addr.to_string().as_ref())],
-            client_privkey,
+            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
             verifier,
         );
         let client = connect_client(&networking, &peer, ClientOptions::default()).await?;
@@ -926,7 +900,7 @@ mod tests {
         let peer = Peer::from("server");
         let networking = Networking::new(
             vec![(&peer, proxy_addr.to_string().as_ref())],
-            load_private_key(testing::client_private_key())?,
+            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
             verifier_both(),
         );
         let options = ClientOptions {
@@ -1028,10 +1002,12 @@ mod tests {
         let verifier = verifier_both();
         let (addr, shutdown, _temp) = setup_test_server(Arc::clone(&verifier)).await?;
 
-        let privkey = load_private_key(testing::client_private_key())?;
         let peer = Peer::from("server");
-        let networking =
-            Networking::new(vec![(&peer, addr.to_string().as_ref())], privkey, verifier);
+        let networking = Networking::new(
+            vec![(&peer, addr.to_string().as_ref())],
+            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
+            verifier,
+        );
 
         connect_client(&networking, &peer, ClientOptions::default()).await?;
 
@@ -1055,11 +1031,10 @@ mod tests {
 
         let verifier = verifier_both();
         let (addr, _shutdown, tempdir) = setup_test_server(Arc::clone(&verifier)).await?;
-        let privkey = load_private_key(testing::client_private_key())?;
         let server = Peer::from("server");
         let net = Networking::new(
             vec![(&server, addr.to_string().as_ref())],
-            privkey,
+            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
             verifier,
         );
         let arena = Arena::from("testdir");
@@ -1102,11 +1077,10 @@ mod tests {
 
         let verifier = verifier_both();
         let (addr, shutdown, _tempdir) = setup_test_server(Arc::clone(&verifier)).await?;
-        let privkey = load_private_key(testing::client_private_key())?;
         let server = Peer::from("server");
         let net = Networking::new(
             vec![(&server, addr.to_string().as_ref())],
-            privkey,
+            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
             verifier,
         );
 
@@ -1131,9 +1105,12 @@ mod tests {
         let _ = env_logger::try_init();
 
         let verifier = verifier_both();
-        let privkey = load_private_key(testing::client_private_key())?;
         let server = Peer::from("server");
-        let net = Networking::new(vec![(&server, "localhost:0")], privkey, verifier);
+        let net = Networking::new(
+            vec![(&server, "localhost:0")],
+            RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
+            verifier,
+        );
         let arena = Arena::from("testdir");
         let (tx, rx) = mpsc::channel(10);
         let ret =

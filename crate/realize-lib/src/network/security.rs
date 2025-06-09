@@ -2,16 +2,17 @@
 pub(crate) mod testing;
 
 use anyhow::Context as _;
-use rustls::client::Resumption;
 use rustls::client::danger::ServerCertVerifier;
+use rustls::client::Resumption;
 use rustls::crypto::WebPkiSupportedAlgorithms;
-use rustls::pki_types::SubjectPublicKeyInfoDer;
 use rustls::pki_types::pem::PemObject as _;
-use rustls::sign::{CertifiedKey, SigningKey};
+use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
+use rustls::sign::CertifiedKey;
 use rustls::version::TLS13;
 use rustls::{ClientConfig, Error, ServerConfig};
 use std::collections::{BTreeMap, HashMap};
 
+use std::path::Path;
 use std::sync::Arc;
 use tokio_rustls::rustls::{self, server::danger::ClientCertVerifier};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -25,28 +26,28 @@ use super::config::PeerConfig;
 /// Create a TlsAcceptor (server-side) for the given peers and private key.
 pub(crate) fn make_tls_acceptor(
     verifier: Arc<PeerVerifier>,
-    privkey: Arc<dyn SigningKey>,
-) -> Result<TlsAcceptor, anyhow::Error> {
+    resolver: Arc<RawPublicKeyResolver>,
+) -> TlsAcceptor {
     let config = ServerConfig::builder_with_protocol_versions(&[&TLS13])
         .with_client_cert_verifier(verifier)
-        .with_cert_resolver(RawPublicKeyResolver::create(privkey)?);
-    let acceptor = TlsAcceptor::from(Arc::new(config));
-    Ok(acceptor)
+        .with_cert_resolver(resolver);
+
+    TlsAcceptor::from(Arc::new(config))
 }
 
 /// Create af TlsConnector (client-side) for the given peer and private key.
 pub(crate) fn make_tls_connector(
     verifier: Arc<PeerVerifier>,
-    privkey: Arc<dyn SigningKey>,
-) -> Result<TlsConnector, anyhow::Error> {
+    resolver: Arc<RawPublicKeyResolver>,
+) -> TlsConnector {
     let mut config = ClientConfig::builder_with_protocol_versions(&[&TLS13])
         .dangerous()
         .with_custom_certificate_verifier(verifier)
-        .with_client_cert_resolver(RawPublicKeyResolver::create(privkey)?);
+        .with_client_cert_resolver(resolver);
     config.resumption = Resumption::disabled();
     config.enable_sni = false;
-    let connector = TlsConnector::from(Arc::new(config));
-    Ok(connector)
+
+    TlsConnector::from(Arc::new(config))
 }
 
 /// Check client and server certificates.
@@ -246,13 +247,36 @@ impl ServerCertVerifier for PeerVerifier {
     }
 }
 
+/// A type that holds the identity of the current peer.
 #[derive(Debug)]
-struct RawPublicKeyResolver {
+pub struct RawPublicKeyResolver {
     certified_key: Arc<CertifiedKey>,
 }
 
 impl RawPublicKeyResolver {
-    fn create(privkey: Arc<dyn rustls::sign::SigningKey>) -> anyhow::Result<Arc<Self>> {
+    /// Load the private key from the given pat and use it for the resolver.
+    pub fn from_private_key_file(path: &Path) -> anyhow::Result<Arc<Self>> {
+        let private_key = PrivateKeyDer::from_pem_file(path)
+            .with_context(|| format!("invalid private key file {}", path.display()))?;
+        let resolver = Self::from_private_key(private_key)
+            .with_context(|| format!("invalid private key in file {}", path.display()))?;
+
+        Ok(resolver)
+    }
+
+    /// Load the private key and use it for the resolver.
+    pub fn from_private_key(
+        private_key: PrivateKeyDer<'static>,
+    ) -> Result<Arc<Self>, rustls::Error> {
+        Self::new(
+            default_provider()
+                .key_provider
+                .load_private_key(private_key)?,
+        )
+    }
+
+    /// Create a resolver from a loaded signing key.
+    pub fn new(privkey: Arc<dyn rustls::sign::SigningKey>) -> Result<Arc<Self>, rustls::Error> {
         let pubkey = privkey
             .public_key()
             .ok_or(Error::InconsistentKeys(rustls::InconsistentKeys::Unknown))?;
@@ -300,8 +324,9 @@ mod tests {
     use super::*;
     use crate::network::security::testing;
     use crate::utils::async_utils::AbortOnDrop;
-    use rustls::pki_types::PrivateKeyDer;
     use rustls::pki_types::pem::PemObject as _;
+    use rustls::pki_types::PrivateKeyDer;
+    use rustls::sign::SigningKey;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -344,7 +369,10 @@ mod tests {
         let verifier = Arc::new(verifier);
 
         let server_priv = load_signing_key(testing::server_private_key())?;
-        let acceptor = make_tls_acceptor(Arc::clone(&verifier), server_priv)?;
+        let acceptor = make_tls_acceptor(
+            Arc::clone(&verifier),
+            RawPublicKeyResolver::new(server_priv)?,
+        );
 
         // Misconfigured connector; public and private keys don't match.  (Uses
         // private functions in super)
@@ -376,7 +404,10 @@ mod tests {
         let verifier = Arc::new(verifier);
 
         let server_priv = load_signing_key(testing::server_private_key())?;
-        let acceptor = make_tls_acceptor(Arc::clone(&verifier), server_priv)?;
+        let acceptor = make_tls_acceptor(
+            Arc::clone(&verifier),
+            RawPublicKeyResolver::new(server_priv)?,
+        );
 
         // Misconfigured connector; no client auth.
         let bad_connector = {
@@ -417,7 +448,10 @@ mod tests {
         };
 
         let client_priv = load_signing_key(testing::client_private_key())?;
-        let connector = make_tls_connector(Arc::clone(&verifier), client_priv)?;
+        let connector = make_tls_connector(
+            Arc::clone(&verifier),
+            RawPublicKeyResolver::new(client_priv)?,
+        );
 
         assert!(test_connect_1(bad_acceptor, connector).await.is_err());
 
@@ -429,11 +463,14 @@ mod tests {
         let verifier = Arc::new(complete_verifier());
 
         let server_priv = load_signing_key(testing::server_private_key())?;
-        let acceptor = make_tls_acceptor(verifier.clone(), server_priv)?;
+        let acceptor = make_tls_acceptor(verifier.clone(), RawPublicKeyResolver::new(server_priv)?);
 
         // Wrong key algorithm
         let ecdsa_client_priv = load_signing_key(ecdsa_private_key())?;
-        let connector = make_tls_connector(verifier.clone(), ecdsa_client_priv)?;
+        let connector = make_tls_connector(
+            verifier.clone(),
+            RawPublicKeyResolver::new(ecdsa_client_priv)?,
+        );
 
         assert!(test_connect_1(acceptor, connector).await.is_err());
 
@@ -444,10 +481,16 @@ mod tests {
         let verifier = Arc::new(verifier);
 
         let server_priv = load_signing_key(testing::server_private_key())?;
-        let acceptor = make_tls_acceptor(Arc::clone(&verifier), server_priv)?;
+        let acceptor = make_tls_acceptor(
+            Arc::clone(&verifier),
+            RawPublicKeyResolver::new(server_priv)?,
+        );
 
         let client_priv = load_signing_key(testing::client_private_key())?;
-        let connector = make_tls_connector(Arc::clone(&verifier), client_priv)?;
+        let connector = make_tls_connector(
+            Arc::clone(&verifier),
+            RawPublicKeyResolver::new(client_priv)?,
+        );
 
         test_connect_1(acceptor, connector).await
     }
