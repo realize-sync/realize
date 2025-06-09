@@ -286,7 +286,7 @@ impl Server {
     /// task runs as long as there is at least one server instance
     /// available through the Arc, or until [Server::shutdown] is
     /// called.
-    pub async fn listen(self: Arc<Self>, hostport: &HostPort) -> anyhow::Result<SocketAddr> {
+    pub async fn listen(self: &Arc<Self>, hostport: &HostPort) -> anyhow::Result<SocketAddr> {
         let listener = TcpListener::bind(hostport.addr()).await?;
         log::info!(
             "Listening for RPC connections on {:?}",
