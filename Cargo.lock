@@ -1811,6 +1811,7 @@ dependencies = [
  "assert_unordered",
  "async-speed-limit",
  "base64",
+ "bincode",
  "blake2",
  "env_logger",
  "fast_rsync",
@@ -1824,6 +1825,7 @@ dependencies = [
  "portpicker",
  "predicates",
  "prometheus",
+ "redb",
  "reqwest",
  "rustls",
  "serde",
@@ -1837,6 +1839,16 @@ dependencies = [
  "tokio-retry",
  "tokio-rustls",
  "walkdir",
+]
+
+[[package]]
+name = "redb"
+version = "2.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cef6a6d3a65ea334d6cdfb31fa2525c20184b7aa7bd1ad1e2e37502610d4609f"
+dependencies = [
+ "libc",
+ "log",
 ]
 
 [[package]]
