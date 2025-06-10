@@ -100,26 +100,26 @@ below.
 ```
 // Access pattern 1:
 
-async fn readdir(inode) -> Result<Iterator<ReadDirEntry>>;
-async fn lookup(inode, name) -> Result<Option<ReadDirEntry>>;
+fn readdir(inode) -> anyhow::Result<Iterator<ReadDirEntry>>;
+fn lookup(inode, name) -> anyhow::Result<Option<ReadDirEntry>>;
 
 // Access pattern 2:
 
-async fn link(peer, arena, path, size, mtime) -> Result<()>;
-async fn unlink(peer, arena, path, mtime) -> Result<()>;
+fn link(peer, arena, path, size, mtime) -> anyhow::Result<()>;
+fn unlink(peer, arena, path, mtime) -> anyhow::Result<()>;
 
 // Access pattern 3:
 
 /// Mark all files belonging to a specific peer.
-async fn mark_peer_files(peer) -> Result<()>;
+fn mark_peer_files(peer) -> anyhow::Result<()>;
 
 /// Delete marked files belonging to a specific peer that
 /// have not been refreshed by a link() call since mark_peer_files.
-async fn delete_marked_files(peer) -> Result<()>;
+fn delete_marked_files(peer) -> anyhow::Result<()>;
 
 // Access pattern 4:
 
-async fn delete_arena(arena) ->Result<()>;
+fn delete_arena(arena) ->anyhow::Result<()>;
 
 ```
 
@@ -131,6 +131,10 @@ that is returned, even though they'll likely diverge later.
 
 Note that this proposal lacks a "read" call. This is TBD in a later
 step.
+
+Note that this proposal uses non-async (blocking) functions, since
+redb is blocking. An async wrapper that runs tokio::spawn_blocking
+might be necessary to call conveniently from the rest of the code.
 
 #### readdir
 
