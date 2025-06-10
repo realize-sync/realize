@@ -5,11 +5,26 @@
 *   **Rust:** The primary programming language used for the entire project, chosen for its performance, safety, and concurrency features.
 *   **Tokio:** Asynchronous runtime for managing concurrent operations, network I/O, and file system interactions.
 
+## Errors
+
+*   Reuse existing single error types if possible (For example, if
+    writing a function that fails only because of io::Error, return a
+    Result<..., io::Error>)
+
+*   Otherwise, return anyhow::Error, through anyhow::Result<...>
+
+*   In error code, always return anyhow::Result, especially in test
+    functions
+
+*   Special case: RPC service must have their own error type that is
+    serializable. Build it with thiserror, to group by type, but don't
+    store the original error. See implementation of RealStoreServiceError.
+
 ## Key Crates and Libraries
 
 ### Networking & RPC
 
-*   **`tarpc`**: Used for defining and implementing the RPC (Remote Procedure Call) services between peers (e.g., `RealizeService`). Provides typed, asynchronous communication.
+*   **`tarpc`**: Used for defining and implementing the RPC (Remote Procedure Call) services between peers (e.g., `RealStoreService`). Provides typed, asynchronous communication.
 *   **`rustls` / `tokio-rustls`**: For implementing TLS 1.3 to secure peer-to-peer connections using raw ED25519 public key verification.
 *   **`hyper` / `hyper-util`**: Used by `prometheus` for exposing metrics via HTTP and potentially for other HTTP client/server needs.
 *   **`async-speed-limit`**: For throttling network upload and download speeds.

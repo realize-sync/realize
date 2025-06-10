@@ -10,16 +10,16 @@ The specification documents outline a more comprehensive system involving "Real"
 
 *   **Core Library (`realize-lib`):**
     *   `model`: Defines `Arena`, `Peer`, `Path`, `ByteRange(s)`, `Hash`, `Signature`, `Delta`.
-    *   `network`: Implements `RealizeService` RPC (via `tarpc`) with TLS security (raw public keys), TCP transport, metrics, and peer configuration.
+    *   `network`: Implements `RealStoreService` RPC (via `tarpc`) with TLS security (raw public keys), TCP transport, metrics, and peer configuration.
     *   `storage`: Implements `LocalStorage` for "Real" files, including path resolution and partial file handling. `ArenaConfig` for storage paths.
     *   `logic`: Contains the `movedirs` algorithm for synchronizing directories between two peers.
     *   `utils`: Provides helpers for async operations, hashing (BLAKE2b-256), and logging.
     *   In progress implementation of inotify-based file change notification between remote peers in `network/rpc/history.rs`, `storage/real.rs`, `storage/history.rs`
-*   **Daemon (`realize-daemon`):** Implements the server-side executable that hosts `RealizeService`. Handles configuration loading (TOML) and signal handling.
+*   **Daemon (`realize-daemon`):** Implements the server-side executable that hosts `RealStoreService`. Handles configuration loading (TOML) and signal handling.
 *   **CLI (`realize-cmd`):** Implements the client-side tool for initiating sync operations. Handles CLI arguments, progress display, and metrics reporting.
 *   **Specification:**
     *   `design.md`: Overall system design, including Real/Unreal concepts, layers, and technical choices (redb, NFSv3, OverlayFS).
-    *   `movedirs.md`: Details the initial sync algorithm and `RealizeService` definition.
+    *   `movedirs.md`: Details the initial sync algorithm and `RealStoreService` definition.
     *   `unreal.md`: Describes the cache-based remote filesystem (NFSv3, redb, Merkle tree blobs).
     *   `real.md`: Describes merging local and Unreal filesystems (OverlayFS, history tracking via inotify/xattrs).
     *   `future.md`: Lists planned enhancements like household definitions, Merkle tree file hashes, multi-peer syncing design, and various optimizations.

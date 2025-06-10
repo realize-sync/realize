@@ -41,7 +41,7 @@ graph TD
     end
 
     subgraph Network Details
-        I[RPC Services (RealizeService, HistoryService)]
+        I[RPC Services (RealStoreService, HistoryService)]
         J[Transport (TCP+TLS)]
     end
 
@@ -66,10 +66,10 @@ graph TD
     *   [`model/peer.rs`](crate/realize-lib/src/model/peer.rs): `Peer` identifier.
 *   **`network/`**: Handles peer-to-peer communication.
     *   [`network/config.rs`](crate/realize-lib/src/network/config.rs): `PeerConfig` for peer connection details.
-    *   [`network/rpc/realize.rs`](crate/realize-lib/src/network/rpc/realize.rs): Defines the `RealizeService` trait (using `tarpc`).
-    *   [`network/rpc/realize/client.rs`](crate/realize-lib/src/network/rpc/realize/client.rs): Connect to a server using `connect`
-    *   [`network/rpc/realize/server.rs`](crate/realize-lib/src/network/rpc/realize/server.rs): Server-side implementation of `RealizeService`.
-    *   [`network/rpc/realize/metrics.rs`](crate/realize-lib/src/network/rpc/realize/metrics.rs): Prometheus metrics for `RealizeService` RPC.
+    *   [`network/rpc/realstore.rs`](crate/realstore-lib/src/network/rpc/realstore.rs): Defines the `RealStoreService` trait (using `tarpc`).
+    *   [`network/rpc/realstore/client.rs`](crate/realstore-lib/src/network/rpc/realstore/client.rs): Connect to a server using `connect`
+    *   [`network/rpc/realstore/server.rs`](crate/realstore-lib/src/network/rpc/realstore/server.rs): Server-side implementation of `RealStoreService`.
+    *   [`network/rpc/realstore/metrics.rs`](crate/realstore-lib/src/network/rpc/realstore/metrics.rs): Prometheus metrics for `RealStoreService` RPC.
     *   [`network/rpc/history.rs`](crate/history-lib/src/network/rpc/history.rs): Defines the `HistoryService` trait (using `tarpc`)
     *   [`network/rpc/history/client.rs`](crate/history-lib/src/network/rpc/history/client.rs): `register` a service that'll report file changes in `LocalStorage` to connected peers.
     *   [`network/rpc/history/server.rs`](crate/history-lib/src/network/rpc/history/server.rs): `forward_peer_history` local file change notification happening on a remote peer to a tokio channel
@@ -87,7 +87,6 @@ graph TD
 *   **`logic/`**: Contains the core synchronization algorithms and state management.
     *   [`logic/consensus/movedirs.rs`](crate/realize-lib/src/logic/consensus/movedirs.rs): Implements the initial "move directories" sync algorithm.
     *   (Future: `logic/consensus/*` for broader consensus, `logic/forest/*` for unified tree view, `logic/household/*` for peer management)
-*   **`errors.rs`**: Defines `RealizeError` and other error types.
 *   **`utils/`**: Utility functions.
     *   [`utils/async_utils.rs`](crate/realize-lib/src/utils/async_utils.rs): Async helper like `AbortOnDrop`.
     *   [`utils/hash.rs`](crate/realize-lib/src/utils/hash.rs): BLAKE2b-256 hashing utilities.
@@ -96,7 +95,7 @@ graph TD
 ### Executable Crates
 
 *   **`crate/realize-cmd/`**: Command-line interface tool (`realize`) for initiating sync operations and managing the system.
-*   **`crate/realize-daemon/`**: Background daemon (`realized`) that runs on each peer, hosting the `RealizeService` and managing local storage/cache.
+*   **`crate/realize-daemon/`**: Background daemon (`realized`) that runs on each peer, hosting the `RealStoreService` and managing local storage/cache.
 
 ## Key Technical Decisions & Design Patterns
 
@@ -114,8 +113,8 @@ graph TD
 
 ## Critical Implementation Paths
 
-*   **`RealizeService` Implementation:** The server-side logic in [`network/rpc/realize/server.rs`](crate/realize-lib/src/network/rpc/realize/server.rs) is central to all peer interactions.
+*   **`RealStoreService` Implementation:** The server-side logic in [`network/rpc/realize/server.rs`](crate/realize-lib/src/network/rpc/realize/server.rs) is central to all peer interactions.
 *   **`movedirs.rs` Sync Algorithm:** The core logic for the initial file synchronization mechanism.
-*   **Storage Interaction:** How `RealizeService` methods interact with `LocalStorage` ([`storage/real.rs`](crate/realize-lib/src/storage/real.rs)) and eventually the "Unreal" cache.
+*   **Storage Interaction:** How `RealStoreService` methods interact with `LocalStorage` ([`storage/real.rs`](crate/realize-lib/src/storage/real.rs)) and eventually the "Unreal" cache.
 *   **TLS Handshake and Peer Verification:** Critical for secure communication, implemented in [`network/security.rs`](crate/realize-lib/src/network/security.rs) and used by [`network/tcp.rs`](crate/realize-lib/src/network/tcp.rs).
 *   **Partial File Handling:** Management of `.partial` files during transfers and their finalization.

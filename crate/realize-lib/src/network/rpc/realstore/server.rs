@@ -1,6 +1,6 @@
-//! RealizeService server implementation for Realize - Symmetric File Syncer
+//! RealStoreService server implementation for Realize - Symmetric File Syncer
 //!
-//! This module implements the RealizeService trait, providing directory management,
+//! This module implements the RealStoreService trait, providing directory management,
 //! file operations, and in-process server/client utilities. It is robust to interruptions
 //! and supports secure, restartable sync.
 
@@ -8,14 +8,14 @@ use crate::model;
 use crate::model::Arena;
 use crate::model::ByteRange;
 use crate::model::Hash;
-use crate::network::rpc::realize::metrics::{MetricsRealizeClient, MetricsRealizeServer};
-use crate::network::rpc::realize::Config;
-use crate::network::rpc::realize::Options;
-use crate::network::rpc::realize::{
-    RealizeService, RealizeServiceError, Result, RsyncOperation, SyncedFile,
+use crate::network::rpc::realstore::metrics::{MetricsRealizeClient, MetricsRealizeServer};
+use crate::network::rpc::realstore::Config;
+use crate::network::rpc::realstore::Options;
+use crate::network::rpc::realstore::{
+    RealStoreService, RealStoreServiceError, RsyncOperation, SyncedFile,
 };
-use crate::network::rpc::realize::{
-    RealizeServiceClient, RealizeServiceRequest, RealizeServiceResponse,
+use crate::network::rpc::realstore::{
+    RealStoreServiceClient, RealStoreServiceRequest, RealStoreServiceResponse,
 };
 use crate::network::Server;
 use crate::storage::real::LocalStorage;
@@ -50,27 +50,28 @@ use walkdir::WalkDir;
 const RSYNC_BLOCK_SIZE: usize = 4096;
 
 /// Type shortcut for client type.
-pub type InProcessRealizeServiceClient = RealizeServiceClient<InProcessStub>;
+pub type InProcessRealStoreServiceClient = RealStoreServiceClient<InProcessStub>;
 
 /// Creates a in-process client that works on the given directories.
-pub fn create_inprocess_client(storage: LocalStorage) -> InProcessRealizeServiceClient {
+pub fn create_inprocess_client(storage: LocalStorage) -> InProcessRealStoreServiceClient {
     RealizeServer::new(storage).as_inprocess_client()
 }
 
 pub struct InProcessStub {
-    inner:
-        MetricsRealizeClient<tarpc::client::Channel<RealizeServiceRequest, RealizeServiceResponse>>,
+    inner: MetricsRealizeClient<
+        tarpc::client::Channel<RealStoreServiceRequest, RealStoreServiceResponse>,
+    >,
 }
 
 impl Stub for InProcessStub {
-    type Req = RealizeServiceRequest;
-    type Resp = RealizeServiceResponse;
+    type Req = RealStoreServiceRequest;
+    type Resp = RealStoreServiceResponse;
 
     async fn call(
         &self,
         ctx: context::Context,
-        request: RealizeServiceRequest,
-    ) -> std::result::Result<RealizeServiceResponse, RpcError> {
+        request: RealStoreServiceRequest,
+    ) -> std::result::Result<RealStoreServiceResponse, RpcError> {
         self.inner.call(ctx, request).await
     }
 }
@@ -107,7 +108,11 @@ impl RealizeServer {
         }
     }
 
-    fn path_resolver(&self, arena: &Arena, opts: &Options) -> Result<PathResolver> {
+    fn path_resolver(
+        &self,
+        arena: &Arena,
+        opts: &Options,
+    ) -> Result<PathResolver, RealStoreServiceError> {
         self.storage
             .path_resolver(
                 arena,
@@ -120,8 +125,8 @@ impl RealizeServer {
             .ok_or(unknown_arena())
     }
 
-    /// Create an in-process RealizeServiceClient for this server instance.
-    pub(crate) fn as_inprocess_client(self) -> InProcessRealizeServiceClient {
+    /// Create an in-process RealStoreServiceClient for this server instance.
+    pub(crate) fn as_inprocess_client(self) -> InProcessRealStoreServiceClient {
         let (client_transport, server_transport) = tarpc::transport::channel::unbounded();
         let server = tarpc::server::BaseChannel::with_defaults(server_transport);
         tokio::spawn(
@@ -136,11 +141,11 @@ impl RealizeServer {
             inner: MetricsRealizeClient::new(client),
         };
 
-        RealizeServiceClient::from(stub)
+        RealStoreServiceClient::from(stub)
     }
 }
 
-impl RealizeService for RealizeServer {
+impl RealStoreService for RealizeServer {
     // IMPORTANT: Use async tokio::fs operations or use
     // spawn_blocking, do *not* use blocking std::fs operations
     // outside of spawn_blocking.
@@ -150,7 +155,7 @@ impl RealizeService for RealizeServer {
         _: tarpc::context::Context,
         arena: Arena,
         options: Options,
-    ) -> Result<Vec<SyncedFile>> {
+    ) -> Result<Vec<SyncedFile>, RealStoreServiceError> {
         let resolver = self.path_resolver(&arena, &options)?.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -166,18 +171,11 @@ impl RealizeService for RealizeServer {
                     let metadata = entry.metadata()?;
                     let size = metadata.size();
                     let mtime = metadata.modified().expect("OS must support mtime");
-                    files.insert(
-                        path.clone(),
-                        SyncedFile {
-                            path,
-                            size,
-                            mtime,
-                        },
-                    );
+                    files.insert(path.clone(), SyncedFile { path, size, mtime });
                 }
             }
 
-            Ok::<Vec<SyncedFile>, RealizeServiceError>(files.into_values().collect())
+            Ok::<Vec<SyncedFile>, RealStoreServiceError>(files.into_values().collect())
         })
         .await?
     }
@@ -189,7 +187,7 @@ impl RealizeService for RealizeServer {
         relative_path: model::Path,
         range: ByteRange,
         options: Options,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Vec<u8>, RealStoreServiceError> {
         let resolver = self.path_resolver(&arena, &options)?;
         let actual = resolver.resolve(&relative_path).await?;
         let mut file = open_for_range_read(&actual).await?;
@@ -207,7 +205,7 @@ impl RealizeService for RealizeServer {
         range: ByteRange,
         data: Vec<u8>,
         options: Options,
-    ) -> Result<()> {
+    ) -> Result<(), RealStoreServiceError> {
         let resolver = self.path_resolver(&arena, &options)?;
         let path = resolver.partial_path(&relative_path).ok_or(bad_path())?;
         let mut file = open_for_range_write(&path).await?;
@@ -222,9 +220,9 @@ impl RealizeService for RealizeServer {
         arena: Arena,
         relative_path: model::Path,
         options: Options,
-    ) -> Result<()> {
+    ) -> Result<(), RealStoreServiceError> {
         if options.ignore_partial {
-            return Err(RealizeServiceError::BadRequest(
+            return Err(RealStoreServiceError::BadRequest(
                 "Invalid option for finish: ignore_partial=true".to_string(),
             ));
         }
@@ -248,7 +246,7 @@ impl RealizeService for RealizeServer {
         relative_path: model::Path,
         range: ByteRange,
         options: Options,
-    ) -> Result<Hash> {
+    ) -> Result<Hash, RealStoreServiceError> {
         let resolver = self.path_resolver(&arena, &options)?;
         let path = resolver.resolve(&relative_path).await?;
 
@@ -261,7 +259,7 @@ impl RealizeService for RealizeServer {
         arena: Arena,
         relative_path: model::Path,
         options: Options,
-    ) -> Result<()> {
+    ) -> Result<(), RealStoreServiceError> {
         let resolver = self.path_resolver(&arena, &options)?;
         let final_path = resolver.final_path(&relative_path).ok_or(bad_path())?;
         if fs::metadata(&final_path).await.is_ok() {
@@ -283,7 +281,7 @@ impl RealizeService for RealizeServer {
         relative_path: model::Path,
         range: ByteRange,
         options: Options,
-    ) -> Result<crate::model::Signature> {
+    ) -> Result<crate::model::Signature, RealStoreServiceError> {
         let resolver = self.path_resolver(&arena, &options)?;
         let actual = resolver.resolve(&relative_path).await?;
         let mut file = File::open(&actual).await?;
@@ -305,7 +303,7 @@ impl RealizeService for RealizeServer {
         range: ByteRange,
         signature: crate::model::Signature,
         options: Options,
-    ) -> Result<(crate::model::Delta, Hash)> {
+    ) -> Result<(crate::model::Delta, Hash), RealStoreServiceError> {
         let resolver = self.path_resolver(&arena, &options)?;
         let actual = resolver.resolve(&relative_path).await?;
         let mut file = open_for_range_read(&actual).await?;
@@ -330,7 +328,7 @@ impl RealizeService for RealizeServer {
         delta: crate::model::Delta,
         hash: Hash,
         options: Options,
-    ) -> Result<()> {
+    ) -> Result<(), RealStoreServiceError> {
         let resolver = self.path_resolver(&arena, &options)?;
         let path = resolver.partial_path(&relative_path).ok_or(bad_path())?;
         let mut file = open_for_range_write(&path).await?;
@@ -339,12 +337,12 @@ impl RealizeService for RealizeServer {
         let mut out = Vec::new();
         rsync_apply_limited(&base, &delta.0, &mut out, range.bytecount() as usize)?;
         if out.len() as u64 != range.bytecount() {
-            return Err(RealizeServiceError::BadRequest(
+            return Err(RealStoreServiceError::BadRequest(
                 "Delta output size mismatch".to_string(),
             ));
         }
         if hash::digest(&out) != hash {
-            return Err(RealizeServiceError::HashMismatch);
+            return Err(RealStoreServiceError::HashMismatch);
         }
         write_at_offset(&mut file, range.start, &out).await?;
 
@@ -358,7 +356,7 @@ impl RealizeService for RealizeServer {
         relative_path: model::Path,
         file_size: u64,
         options: Options,
-    ) -> Result<()> {
+    ) -> Result<(), RealStoreServiceError> {
         let resolver = self.path_resolver(&arena, &options)?;
         let path = resolver.partial_path(&relative_path).ok_or(bad_path())?;
         let mut file = open_for_range_write(&path).await?;
@@ -370,8 +368,8 @@ impl RealizeService for RealizeServer {
     async fn configure(
         self,
         _ctx: tarpc::context::Context,
-        config: crate::network::rpc::realize::Config,
-    ) -> Result<crate::network::rpc::realize::Config> {
+        config: crate::network::rpc::realstore::Config,
+    ) -> Result<crate::network::rpc::realstore::Config, RealStoreServiceError> {
         if let (Some(limiter), Some(limit)) = (self.limiter.as_ref(), config.write_limit) {
             limiter.set_speed_limit(limit as f64);
         }
@@ -388,7 +386,7 @@ impl RealizeService for RealizeServer {
     }
 }
 
-async fn open_for_range_write(path: &Path) -> Result<File> {
+async fn open_for_range_write(path: &Path) -> Result<File, RealStoreServiceError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).await?;
     }
@@ -400,7 +398,7 @@ async fn open_for_range_write(path: &Path) -> Result<File> {
         .open(path)
         .await?)
 }
-async fn open_for_range_read(path: &Path) -> Result<File> {
+async fn open_for_range_read(path: &Path) -> Result<File, RealStoreServiceError> {
     Ok(OpenOptions::new()
         .create(false)
         .read(true)
@@ -412,7 +410,10 @@ async fn open_for_range_read(path: &Path) -> Result<File> {
 /// Hash a range that is too large to be kept in memory.
 ///
 /// Return a zero hash if data is missing.
-async fn hash_large_range_exact(path: &Path, range: &ByteRange) -> Result<Hash> {
+async fn hash_large_range_exact(
+    path: &Path,
+    range: &ByteRange,
+) -> Result<Hash, RealStoreServiceError> {
     let mut file = open_for_range_read(&path).await?;
     let file_size = file.metadata().await?.len();
     if range.end > file_size {
@@ -460,7 +461,7 @@ async fn read_padded(
     Ok(())
 }
 
-async fn shorten_file(file: &mut File, file_size: u64) -> Result<()> {
+async fn shorten_file(file: &mut File, file_size: u64) -> Result<(), RealStoreServiceError> {
     if file.metadata().await?.len() > file_size {
         file.set_len(file_size).await?;
         file.flush().await?;
@@ -470,7 +471,11 @@ async fn shorten_file(file: &mut File, file_size: u64) -> Result<()> {
     Ok(())
 }
 
-async fn write_at_offset(file: &mut File, offset: u64, data: &Vec<u8>) -> Result<()> {
+async fn write_at_offset(
+    file: &mut File,
+    offset: u64,
+    data: &Vec<u8>,
+) -> Result<(), RealStoreServiceError> {
     file.seek(SeekFrom::Start(offset)).await?;
     file.write_all(&data).await?;
     file.flush().await?;
@@ -479,7 +484,7 @@ async fn write_at_offset(file: &mut File, offset: u64, data: &Vec<u8>) -> Result
     Ok(())
 }
 
-impl From<walkdir::Error> for RealizeServiceError {
+impl From<walkdir::Error> for RealStoreServiceError {
     fn from(err: walkdir::Error) -> Self {
         if err.io_error().is_some() {
             // We know err contains an io error; unwrap will succeed.
@@ -490,27 +495,27 @@ impl From<walkdir::Error> for RealizeServiceError {
     }
 }
 
-impl From<JoinError> for RealizeServiceError {
+impl From<JoinError> for RealStoreServiceError {
     fn from(err: JoinError) -> Self {
         anyhow::Error::new(err).into()
     }
 }
 
 // Add error conversions for fast_rsync errors
-impl From<fast_rsync::DiffError> for RealizeServiceError {
+impl From<fast_rsync::DiffError> for RealStoreServiceError {
     fn from(e: fast_rsync::DiffError) -> Self {
-        RealizeServiceError::Rsync(RsyncOperation::Diff, e.to_string())
+        RealStoreServiceError::Rsync(RsyncOperation::Diff, e.to_string())
     }
 }
-impl From<fast_rsync::ApplyError> for RealizeServiceError {
+impl From<fast_rsync::ApplyError> for RealStoreServiceError {
     fn from(e: fast_rsync::ApplyError) -> Self {
-        RealizeServiceError::Rsync(RsyncOperation::Apply, e.to_string())
+        RealStoreServiceError::Rsync(RsyncOperation::Apply, e.to_string())
     }
 }
 
-impl From<fast_rsync::SignatureParseError> for RealizeServiceError {
+impl From<fast_rsync::SignatureParseError> for RealStoreServiceError {
     fn from(e: fast_rsync::SignatureParseError) -> Self {
-        RealizeServiceError::Rsync(RsyncOperation::Sign, e.to_string())
+        RealStoreServiceError::Rsync(RsyncOperation::Sign, e.to_string())
     }
 }
 
@@ -544,12 +549,12 @@ async fn is_empty_dir(path: &Path) -> bool {
     return false;
 }
 
-fn unknown_arena() -> RealizeServiceError {
-    RealizeServiceError::BadRequest("Unknown arena".to_string())
+fn unknown_arena() -> RealStoreServiceError {
+    RealStoreServiceError::BadRequest("Unknown arena".to_string())
 }
 
-fn bad_path() -> RealizeServiceError {
-    RealizeServiceError::BadRequest("Path is invalid".to_string())
+fn bad_path() -> RealStoreServiceError {
+    RealStoreServiceError::BadRequest("Path is invalid".to_string())
 }
 
 #[cfg(test)]

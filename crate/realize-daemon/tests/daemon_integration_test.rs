@@ -10,9 +10,9 @@ use predicates::prelude::*;
 use realize_lib::model;
 use realize_lib::model::Arena;
 use realize_lib::model::Peer;
-use realize_lib::network::rpc::realize;
-use realize_lib::network::rpc::realize::client::ClientOptions;
-use realize_lib::network::rpc::realize::Options;
+use realize_lib::network::rpc::realstore;
+use realize_lib::network::rpc::realstore::client::ClientOptions;
+use realize_lib::network::rpc::realstore::Options;
 use realize_lib::network::security::PeerVerifier;
 use realize_lib::network::security::RawPublicKeyResolver;
 use realize_lib::network::Networking;
@@ -117,7 +117,7 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
         RawPublicKeyResolver::from_private_key_file(&fixture.resources.join("a.key"))?,
         verifier,
     );
-    let client = realize::client::connect(&networking, &peer, ClientOptions::default()).await?;
+    let client = realstore::client::connect(&networking, &peer, ClientOptions::default()).await?;
     let files = client
         .list(
             context::current(),

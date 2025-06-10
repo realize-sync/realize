@@ -8,7 +8,7 @@
 //!
 //! To export metrics on an HTTP endpoint:
 //! ```rust
-//! realize_lib::network::rpc::realize::metrics::export_metrics("127.0.0.1:9000");
+//! realize_lib::network::rpc::realstore::metrics::export_metrics("127.0.0.1:9000");
 //! ```
 
 use std::time::Instant;
@@ -27,8 +27,8 @@ use tarpc::{
 use tokio::net::TcpListener;
 
 use crate::model::ByteRange;
-use crate::network::rpc::realize::{
-    RealizeServiceError, RealizeServiceRequest, RealizeServiceResponse,
+use crate::network::rpc::realstore::{
+    RealStoreServiceError, RealStoreServiceRequest, RealStoreServiceResponse,
 };
 
 lazy_static::lazy_static! {
@@ -103,24 +103,24 @@ fn bytes_buckets() -> Vec<f64> {
 }
 
 /// Label that identifies methods in metrics.
-fn method_label(req: &RealizeServiceRequest) -> &'static str {
+fn method_label(req: &RealStoreServiceRequest) -> &'static str {
     match req {
-        RealizeServiceRequest::List { .. } => "list",
-        RealizeServiceRequest::Send { .. } => "send",
-        RealizeServiceRequest::Read { .. } => "read",
-        RealizeServiceRequest::Finish { .. } => "finish",
-        RealizeServiceRequest::Hash { .. } => "hash",
-        RealizeServiceRequest::Delete { .. } => "delete",
-        RealizeServiceRequest::CalculateSignature { .. } => "calculate_signature",
-        RealizeServiceRequest::Diff { .. } => "diff",
-        RealizeServiceRequest::ApplyDelta { .. } => "apply_delta",
-        RealizeServiceRequest::Truncate { .. } => "truncate",
-        RealizeServiceRequest::Configure { .. } => "configure",
+        RealStoreServiceRequest::List { .. } => "list",
+        RealStoreServiceRequest::Send { .. } => "send",
+        RealStoreServiceRequest::Read { .. } => "read",
+        RealStoreServiceRequest::Finish { .. } => "finish",
+        RealStoreServiceRequest::Hash { .. } => "hash",
+        RealStoreServiceRequest::Delete { .. } => "delete",
+        RealStoreServiceRequest::CalculateSignature { .. } => "calculate_signature",
+        RealStoreServiceRequest::Diff { .. } => "diff",
+        RealStoreServiceRequest::ApplyDelta { .. } => "apply_delta",
+        RealStoreServiceRequest::Truncate { .. } => "truncate",
+        RealStoreServiceRequest::Configure { .. } => "configure",
     }
 }
 
 /// Label that describes whether a method call suceeded.
-fn status_label<T>(res: &Result<RealizeServiceResponse, T>) -> &'static str {
+fn status_label<T>(res: &Result<RealStoreServiceResponse, T>) -> &'static str {
     match res {
         Err(_) => "RpcError",
         Ok(res) => {
@@ -134,7 +134,7 @@ fn status_label<T>(res: &Result<RealizeServiceResponse, T>) -> &'static str {
 }
 
 /// Label that describes the error type, client-side.
-fn error_label_client(res: &Result<RealizeServiceResponse, RpcError>) -> &'static str {
+fn error_label_client(res: &Result<RealStoreServiceResponse, RpcError>) -> &'static str {
     match res {
         Err(err) => rpc_error_label(err),
         Ok(res) => realize_error(res).map(realize_error_label).unwrap_or("OK"),
@@ -142,49 +142,49 @@ fn error_label_client(res: &Result<RealizeServiceResponse, RpcError>) -> &'stati
 }
 
 /// Label that describes the error type, server-side.
-fn error_label_server(res: &Result<RealizeServiceResponse, ServerError>) -> &'static str {
+fn error_label_server(res: &Result<RealStoreServiceResponse, ServerError>) -> &'static str {
     match res {
         Err(_) => "ServerError",
         Ok(res) => realize_error(res).map(realize_error_label).unwrap_or("OK"),
     }
 }
 
-/// Extract an error from a [RealizeServiceResponse].
-fn realize_error(res: &RealizeServiceResponse) -> Option<&RealizeServiceError> {
+/// Extract an error from a [RealStoreServiceResponse].
+fn realize_error(res: &RealStoreServiceResponse) -> Option<&RealStoreServiceError> {
     match res {
-        RealizeServiceResponse::List(Err(err)) => Some(err),
-        RealizeServiceResponse::Send(Err(err)) => Some(err),
-        RealizeServiceResponse::Read(Err(err)) => Some(err),
-        RealizeServiceResponse::Finish(Err(err)) => Some(err),
-        RealizeServiceResponse::Hash(Err(err)) => Some(err),
-        RealizeServiceResponse::Delete(Err(err)) => Some(err),
-        RealizeServiceResponse::CalculateSignature(Err(err)) => Some(err),
-        RealizeServiceResponse::Diff(Err(err)) => Some(err),
-        RealizeServiceResponse::ApplyDelta(Err(err)) => Some(err),
-        RealizeServiceResponse::Truncate(Err(err)) => Some(err),
-        RealizeServiceResponse::Configure(Err(err)) => Some(err),
-        RealizeServiceResponse::List(Ok(_)) => None,
-        RealizeServiceResponse::Send(Ok(_)) => None,
-        RealizeServiceResponse::Read(Ok(_)) => None,
-        RealizeServiceResponse::Finish(Ok(_)) => None,
-        RealizeServiceResponse::Hash(Ok(_)) => None,
-        RealizeServiceResponse::Delete(Ok(_)) => None,
-        RealizeServiceResponse::CalculateSignature(Ok(_)) => None,
-        RealizeServiceResponse::Diff(Ok(_)) => None,
-        RealizeServiceResponse::ApplyDelta(Ok(_)) => None,
-        RealizeServiceResponse::Truncate(Ok(_)) => None,
-        RealizeServiceResponse::Configure(Ok(_)) => None,
+        RealStoreServiceResponse::List(Err(err)) => Some(err),
+        RealStoreServiceResponse::Send(Err(err)) => Some(err),
+        RealStoreServiceResponse::Read(Err(err)) => Some(err),
+        RealStoreServiceResponse::Finish(Err(err)) => Some(err),
+        RealStoreServiceResponse::Hash(Err(err)) => Some(err),
+        RealStoreServiceResponse::Delete(Err(err)) => Some(err),
+        RealStoreServiceResponse::CalculateSignature(Err(err)) => Some(err),
+        RealStoreServiceResponse::Diff(Err(err)) => Some(err),
+        RealStoreServiceResponse::ApplyDelta(Err(err)) => Some(err),
+        RealStoreServiceResponse::Truncate(Err(err)) => Some(err),
+        RealStoreServiceResponse::Configure(Err(err)) => Some(err),
+        RealStoreServiceResponse::List(Ok(_)) => None,
+        RealStoreServiceResponse::Send(Ok(_)) => None,
+        RealStoreServiceResponse::Read(Ok(_)) => None,
+        RealStoreServiceResponse::Finish(Ok(_)) => None,
+        RealStoreServiceResponse::Hash(Ok(_)) => None,
+        RealStoreServiceResponse::Delete(Ok(_)) => None,
+        RealStoreServiceResponse::CalculateSignature(Ok(_)) => None,
+        RealStoreServiceResponse::Diff(Ok(_)) => None,
+        RealStoreServiceResponse::ApplyDelta(Ok(_)) => None,
+        RealStoreServiceResponse::Truncate(Ok(_)) => None,
+        RealStoreServiceResponse::Configure(Ok(_)) => None,
     }
 }
 
 /// Label that describes a [RealizeError] in metrics.
-fn realize_error_label(err: &RealizeServiceError) -> &'static str {
+fn realize_error_label(err: &RealStoreServiceError) -> &'static str {
     match err {
-        RealizeServiceError::BadRequest(_) => "BadRequest",
-        RealizeServiceError::Io(_) => "Io",
-        RealizeServiceError::Rsync(_, _) => "Rsync",
-        RealizeServiceError::Other(_) => "Other",
-        RealizeServiceError::HashMismatch => "HashMismatch",
+        RealStoreServiceError::BadRequest(_) => "BadRequest",
+        RealStoreServiceError::Io(_) => "Io",
+        RealStoreServiceError::Rsync(_, _) => "Rsync",
+        RealStoreServiceError::Other(_) => "Other",
+        RealStoreServiceError::HashMismatch => "HashMismatch",
     }
 }
 
@@ -200,47 +200,47 @@ fn rpc_error_label(err: &RpcError) -> &'static str {
 }
 
 /// Extract range from a request for the range metrics.
-fn range_bytes(req: &RealizeServiceRequest) -> Option<u64> {
+fn range_bytes(req: &RealStoreServiceRequest) -> Option<u64> {
     let range = match req {
-        RealizeServiceRequest::Send { range, .. } => Some(range),
-        RealizeServiceRequest::Read { range, .. } => Some(range),
-        RealizeServiceRequest::CalculateSignature { range, .. } => Some(range),
-        RealizeServiceRequest::Diff { range, .. } => Some(range),
-        RealizeServiceRequest::ApplyDelta { range, .. } => Some(range),
-        RealizeServiceRequest::List { .. }
-        | RealizeServiceRequest::Finish { .. }
-        | RealizeServiceRequest::Hash { .. }
-        | RealizeServiceRequest::Delete { .. }
-        | RealizeServiceRequest::Truncate { .. }
-        | RealizeServiceRequest::Configure { .. } => None,
+        RealStoreServiceRequest::Send { range, .. } => Some(range),
+        RealStoreServiceRequest::Read { range, .. } => Some(range),
+        RealStoreServiceRequest::CalculateSignature { range, .. } => Some(range),
+        RealStoreServiceRequest::Diff { range, .. } => Some(range),
+        RealStoreServiceRequest::ApplyDelta { range, .. } => Some(range),
+        RealStoreServiceRequest::List { .. }
+        | RealStoreServiceRequest::Finish { .. }
+        | RealStoreServiceRequest::Hash { .. }
+        | RealStoreServiceRequest::Delete { .. }
+        | RealStoreServiceRequest::Truncate { .. }
+        | RealStoreServiceRequest::Configure { .. } => None,
     };
 
     range.map(|r| r.end - r.start)
 }
 
 /// Extract data size in bytes from a request for the data_in metrics.
-fn bytes_in(req: &RealizeServiceRequest) -> Option<u64> {
+fn bytes_in(req: &RealStoreServiceRequest) -> Option<u64> {
     match req {
-        RealizeServiceRequest::Send { data, .. } => Some(data.len() as u64),
-        RealizeServiceRequest::Diff { signature, .. } => Some(signature.0.len() as u64),
-        RealizeServiceRequest::ApplyDelta { delta, .. } => Some(delta.0.len() as u64),
-        RealizeServiceRequest::List { .. }
-        | RealizeServiceRequest::Read { .. }
-        | RealizeServiceRequest::Finish { .. }
-        | RealizeServiceRequest::Hash { .. }
-        | RealizeServiceRequest::Delete { .. }
-        | RealizeServiceRequest::CalculateSignature { .. }
-        | RealizeServiceRequest::Truncate { .. }
-        | RealizeServiceRequest::Configure { .. } => None,
+        RealStoreServiceRequest::Send { data, .. } => Some(data.len() as u64),
+        RealStoreServiceRequest::Diff { signature, .. } => Some(signature.0.len() as u64),
+        RealStoreServiceRequest::ApplyDelta { delta, .. } => Some(delta.0.len() as u64),
+        RealStoreServiceRequest::List { .. }
+        | RealStoreServiceRequest::Read { .. }
+        | RealStoreServiceRequest::Finish { .. }
+        | RealStoreServiceRequest::Hash { .. }
+        | RealStoreServiceRequest::Delete { .. }
+        | RealStoreServiceRequest::CalculateSignature { .. }
+        | RealStoreServiceRequest::Truncate { .. }
+        | RealStoreServiceRequest::Configure { .. } => None,
     }
 }
 
 /// Extract data size in bytes from a response for the data_out metrics.
-fn bytes_out<T>(res: &Result<RealizeServiceResponse, T>) -> Option<u64> {
+fn bytes_out<T>(res: &Result<RealStoreServiceResponse, T>) -> Option<u64> {
     match res {
-        Ok(RealizeServiceResponse::Read(Ok(data))) => Some(data.len() as u64),
-        Ok(RealizeServiceResponse::CalculateSignature(Ok(sig))) => Some(sig.0.len() as u64),
-        Ok(RealizeServiceResponse::Diff(Ok((delta, _)))) => Some(delta.0.len() as u64),
+        Ok(RealStoreServiceResponse::Read(Ok(data))) => Some(data.len() as u64),
+        Ok(RealStoreServiceResponse::CalculateSignature(Ok(sig))) => Some(sig.0.len() as u64),
+        Ok(RealStoreServiceResponse::Diff(Ok((delta, _)))) => Some(delta.0.len() as u64),
         _ => None,
     }
 }
@@ -285,16 +285,16 @@ async fn serve_metrics(
         .body(encoder.encode_to_string(&metrics)?)?)
 }
 
-/// [RealizeService] Stub that fills in client-side metrics.
+/// [RealStoreService] Stub that fills in client-side metrics.
 #[derive(Clone)]
 pub(crate) struct MetricsRealizeClient<T>
 where
-    T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse> + Clone,
+    T: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse> + Clone,
 {
     inner: T,
 }
 
-impl<T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse> + Clone>
+impl<T: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse> + Clone>
     MetricsRealizeClient<T>
 {
     pub(crate) fn new(stub: T) -> Self {
@@ -302,17 +302,17 @@ impl<T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse> + Clone
     }
 }
 
-impl<T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse> + Clone> Stub
+impl<T: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse> + Clone> Stub
     for MetricsRealizeClient<T>
 {
-    type Req = RealizeServiceRequest;
-    type Resp = RealizeServiceResponse;
+    type Req = RealStoreServiceRequest;
+    type Resp = RealStoreServiceResponse;
 
     async fn call(
         &self,
         ctx: Context,
-        req: RealizeServiceRequest,
-    ) -> Result<RealizeServiceResponse, RpcError> {
+        req: RealStoreServiceRequest,
+    ) -> Result<RealStoreServiceResponse, RpcError> {
         let method = method_label(&req);
         let range_bytes = range_bytes(&req);
         let bytes_in = bytes_in(&req);
@@ -351,14 +351,14 @@ impl<T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse> + Clone
     }
 }
 
-/// [RealizeService] serve function that fills in server-side metrics.
+/// [RealStoreService] serve function that fills in server-side metrics.
 #[derive(Clone)]
 pub(crate) struct MetricsRealizeServer<T> {
     inner: T,
 }
 impl<T> MetricsRealizeServer<T>
 where
-    T: Serve<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+    T: Serve<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse>,
 {
     pub(crate) fn new(inner: T) -> Self {
         Self { inner }
@@ -366,10 +366,10 @@ where
 }
 impl<T> Serve for MetricsRealizeServer<T>
 where
-    T: Serve<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+    T: Serve<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse>,
 {
-    type Req = RealizeServiceRequest;
-    type Resp = RealizeServiceResponse;
+    type Req = RealStoreServiceRequest;
+    type Resp = RealStoreServiceResponse;
 
     async fn serve(self, ctx: Context, req: Self::Req) -> Result<Self::Resp, ServerError> {
         let method = method_label(&req);

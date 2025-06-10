@@ -159,7 +159,7 @@ This algorithm is written in such a way that in can restart if
 interrupted without losing work. See the section "Errors and retries"
 for more details on restartable
 
-### Service Definition (RealizeService)
+### Service Definition (RealStoreService)
 
 This is the service exposed by the RPC (tarpc). See Security for how
 to connect to that RPC.
@@ -316,7 +316,7 @@ Path = "subdir1/file4.txt" would write to
 
 The `realized` daemon is the long-running background service that
 manages and synchronizes one or more directories on a host. It exposes
-the RealizeService RPC interface over a secure TCP connection and
+the RealStoreService RPC interface over a secure TCP connection and
 enforces access control based on configured peer keys.
 
 #### Command Line Arguments
@@ -372,7 +372,7 @@ pubkey = """
 - Starts an RPC server on the specified address, using TLS with the provided private key.
 - Loads the directory and peer configuration from the TOML config file.
 - Accepts incoming connections only from peers with public keys listed in the config.
-- Exposes the RealizeService API for directory listing, file transfer, and sync operations.
+- Exposes the RealStoreService API for directory listing, file transfer, and sync operations.
 - Manages the local state of each configured directory, including handling partial files and file finalization.
 - Logs key events (file finalization, deletion) at INFO level if logging is enabled.
 - On fatal error (e.g., config parse failure, port in use), prints error to stderr and exits with code 1.
@@ -441,7 +441,7 @@ realize ... [--metrics-addr <host:port>] [--metrics-pushgateway <url>] [--metric
 
 - Parses command line arguments and validates inputs.
 - Connects to the specified `realized` daemon(s) using TLS, authenticating with the provided private key and verifying peers.
-- Starts an in-process RealizeService instance for local directories.
+- Starts an in-process RealStoreService instance for local directories.
 - Invokes the move/sync algorithm to synchronize files between the source and destination.
 - Reports progress to stdout, including per-file and overall sync status.
 - If metrics options are set, exports Prometheus metrics (see above).
@@ -459,7 +459,7 @@ prints an error message to stderr and exits with status code 11.
 Retries only apply to network errors. They don't apply to the
 following errors:
  - Local errors
- - App errors (errors embedded into RealizeServiceResponse)
+ - App errors (errors embedded into RealStoreServiceResponse)
  - Disk I/O errors (either)
  - Authentication error (communication not authorized)
 
@@ -526,7 +526,7 @@ The following is synced:
  - regular files and their containing directories
  - the file content
 
-The following is *NOT* synced and ignored by RealizeService if they
+The following is *NOT* synced and ignored by RealStoreService if they
 exist in the directory:
  - empty directories
  - permission and file ownership

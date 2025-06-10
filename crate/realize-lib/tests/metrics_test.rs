@@ -11,8 +11,8 @@ use realize_lib::logic::consensus::movedirs::METRIC_READ_BYTES;
 use realize_lib::logic::consensus::movedirs::METRIC_START_COUNT;
 use realize_lib::logic::consensus::movedirs::METRIC_WRITE_BYTES;
 use realize_lib::model::Arena;
-use realize_lib::network::rpc::realize::Options;
-use realize_lib::network::rpc::realize::server::{self, InProcessRealizeServiceClient};
+use realize_lib::network::rpc::realstore::Options;
+use realize_lib::network::rpc::realstore::server::{self, InProcessRealStoreServiceClient};
 use realize_lib::storage::real::LocalStorage;
 
 // Metric tests are kept in their own binary to avoid other test
@@ -175,7 +175,7 @@ async fn move_files_metrics() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn setup_inprocess_client() -> (TempDir, Arena, InProcessRealizeServiceClient) {
+fn setup_inprocess_client() -> (TempDir, Arena, InProcessRealStoreServiceClient) {
     let temp = TempDir::new().unwrap();
     let arena = Arena::from("testdir");
     let client = server::create_inprocess_client(LocalStorage::single(&arena, temp.path()));

@@ -63,7 +63,7 @@ called "docs" and another called "docs_office".
 This is very common and typically done in the foreground, with the
 user waiting for the result. It must be done efficiently
 
-2. writing from remote peer data (through RealizeService::list and
+2. writing from remote peer data (through RealStoreService::list and
    HistoryService::notify)
 
   - a list of (peer, arena, path, size, mtime) (in the future (peer,
@@ -78,10 +78,10 @@ less of a priority for this access pattern than for access pattern 1
 because it is run in the background, in batch operations.
 
 3. after a long disconnection, data is re-read through
-   RealizeService::list and compared with content
+   RealStoreService::list and compared with content
 
   - go through the entire content known from a peer, compare with
-    RealizeService::list output then apply modifications
+    RealStoreService::list output then apply modifications
 
 This should not happen often in the final design, as peers must store
 history between disconnections to serve to other peers. Additionally,

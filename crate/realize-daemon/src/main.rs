@@ -7,7 +7,7 @@ use prometheus::{register_int_counter, IntCounter};
 use realize_lib::model::{Arena, Peer};
 use realize_lib::network::config::PeerConfig;
 use realize_lib::network::hostport::HostPort;
-use realize_lib::network::rpc::realize::{self, metrics};
+use realize_lib::network::rpc::realstore::{self, metrics};
 use realize_lib::network::{Networking, Server};
 use realize_lib::storage::config::ArenaConfig;
 use realize_lib::storage::real::LocalStorage;
@@ -94,7 +94,7 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
         .with_context(|| format!("Failed to parse --address {}", cli.address))?;
     log::debug!("Starting server on {}/{:?}...", hostport, hostport.addr());
     let mut server = Server::new(networking);
-    realize::server::register(&mut server, storage);
+    realstore::server::register(&mut server, storage);
     let server = Arc::new(server);
     let addr = Arc::clone(&server)
         .listen(&hostport)

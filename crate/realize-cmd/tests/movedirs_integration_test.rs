@@ -6,7 +6,7 @@ use hyper_util::rt::TokioIo;
 use realize_lib::model::Arena;
 use realize_lib::model::Peer;
 use realize_lib::network::hostport::HostPort;
-use realize_lib::network::rpc::realize;
+use realize_lib::network::rpc::realstore;
 use realize_lib::network::security::PeerVerifier;
 use realize_lib::network::security::RawPublicKeyResolver;
 use realize_lib::network::Networking;
@@ -93,7 +93,7 @@ impl Fixture {
             RawPublicKeyResolver::from_private_key_file(&self.keys.privkey_a_path)?,
             Arc::clone(&verifier),
         ));
-        realize::server::register(
+        realstore::server::register(
             &mut src_server,
             LocalStorage::new(
                 self.arenas
@@ -111,7 +111,7 @@ impl Fixture {
             RawPublicKeyResolver::from_private_key_file(&self.keys.privkey_b_path)?,
             verifier,
         ));
-        realize::server::register(
+        realstore::server::register(
             &mut dst_server,
             LocalStorage::new(
                 self.arenas
@@ -482,7 +482,7 @@ async fn realize_metrics_export() -> anyhow::Result<()> {
         .arg(&realize_metrics_addr)
         .env(
             "RUST_LOG",
-            "realize_lib::network::rpc::realize::metrics=debug",
+            "realize_lib::network::rpc::realstore::metrics=debug",
         )
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())

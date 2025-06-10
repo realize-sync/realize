@@ -11,7 +11,7 @@ The design describe a system based on blobs, but for now we just have
 file paths; let's get started with that and add blobs in a later step.
 
 
-1. Fetch list of remote files using RealizeService::list and store it in a [redb](https://github.com/cberner/redb/tree/master) database. 
+1. Fetch list of remote files using RealStoreService::list and store it in a [redb](https://github.com/cberner/redb/tree/master) database. 
    - The database stores file availability in a table: 
       key: (arena, path), arena as model::Arena, path as model::Path
       value: a struct containing, for each peer for which data is avalible: presence (available or deleted), file size (if available), mtime
@@ -35,7 +35,7 @@ file paths; let's get started with that and add blobs in a later step.
      
      1. connect to the peer using a client from [@/crate/realize-lib/src/network/rpc/realize/client.rs](../crate/realize-lib/src/network/rpc/realize/client.rs)
      2. once connected, as reported by `ClientOptions::connection_events` connect to same peer using `forward_peer_history` defined in [@/crate/realize-lib/src/network/rpc/history/server.rs](../crate/realize-lib/src/network/rpc/history/server.rs)
-     3. once `forward_peer_history` has returned, fetch the file list using `RealizeService::list`, using a client from [@/crate/realize-lib/src/network/rpc/realize/client.rs](../crate/realize-lib/src/network/rpc/realize/client.rs) and update the database
+     3. once `forward_peer_history` has returned, fetch the file list using `RealStoreService::list`, using a client from [@/crate/realize-lib/src/network/rpc/realize/client.rs](../crate/realize-lib/src/network/rpc/realize/client.rs) and update the database
      4. whenever a file change notification is received, update the database (note that this can happen before the files list has been read. Use mtime to resolve conflicts)
      5. when disconnected, as reported by `ClientOptions::connection_events`, let `forward_peer_history` shut down and go back to point 2, waiting for a reconnection
      
@@ -43,7 +43,7 @@ file paths; let's get started with that and add blobs in a later step.
   3.2 implement the algorithm
 
 4. Serve file content through `nfsserve` by making a request for a
-   range of file content using [RealizeService] when connected. Fail
+   range of file content using [RealStoreService] when connected. Fail
    immediately when disconnected.
 
   4.1 fill the details section of [@/spec/unreal.md](unreal.md) with a description of how this would go
@@ -93,7 +93,7 @@ SocketAddr screws that up.
 
 ## Test retries {#testretries}
 
-Make it possible to intercept RealizeService operations in tests to test:
+Make it possible to intercept RealStoreService operations in tests to test:
 
 - write errors later fixed by rsync
 - rsync producing a bad chunk, handled as a copy later on

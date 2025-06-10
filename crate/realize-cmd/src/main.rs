@@ -12,10 +12,10 @@ use realize_lib::logic::consensus::movedirs::MoveFileError;
 use realize_lib::model::Arena;
 use realize_lib::model::Peer;
 use realize_lib::network::config::PeerConfig;
-use realize_lib::network::rpc::realize;
-use realize_lib::network::rpc::realize::client::ClientConnectionState;
-use realize_lib::network::rpc::realize::client::ClientOptions;
-use realize_lib::network::rpc::realize::metrics;
+use realize_lib::network::rpc::realstore;
+use realize_lib::network::rpc::realstore::client::ClientConnectionState;
+use realize_lib::network::rpc::realstore::client::ClientOptions;
+use realize_lib::network::rpc::realstore::metrics;
 use realize_lib::network::Networking;
 use realize_lib::utils::logging;
 use signal_hook_tokio::Signals;
@@ -351,7 +351,7 @@ async fn connect(
     peer: &str,
     limit: Option<u64>,
     conn_status: tokio::sync::watch::Sender<ClientConnectionState>,
-) -> anyhow::Result<realize::client::ClientType, anyhow::Error> {
+) -> anyhow::Result<realstore::client::ClientType, anyhow::Error> {
     let mut options = ClientOptions::default();
     if let Some(limit) = limit {
         log::info!("Throttling uploads: {}/s", HumanBytes(limit));
@@ -359,7 +359,7 @@ async fn connect(
     }
     options.connection_events = Some(conn_status);
 
-    Ok(realize::client::connect(networking, &Peer::from(peer), options).await?)
+    Ok(realstore::client::connect(networking, &Peer::from(peer), options).await?)
 }
 
 /// Set server-site write rate limit on client, return it.
@@ -367,13 +367,13 @@ async fn connect(
 /// Not all servers support setting rate limit; It's not an error if
 /// this function returns None.
 async fn configure_limit(
-    client: &realize::client::ClientType,
+    client: &realstore::client::ClientType,
     limit: u64,
 ) -> anyhow::Result<Option<u64>> {
     let config = client
         .configure(
             context::current(),
-            realize_lib::network::rpc::realize::Config {
+            realize_lib::network::rpc::realstore::Config {
                 write_limit: Some(limit),
             },
         )

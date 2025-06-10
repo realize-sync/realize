@@ -2,14 +2,14 @@
 //!
 //! This module implements the core file move and synchronization algorithms, including
 //! rsync-based partial transfer, progress reporting, and error handling. It operates
-//! over the RealizeService trait and is designed to be robust and restartable.
+//! over the RealStoreService trait and is designed to be robust and restartable.
 
 use crate::model;
 use crate::model::Arena;
 use crate::model::{ByteRange, ByteRanges};
-use crate::network::rpc::realize::{
-    Options, RangedHash, RealizeServiceClient, RealizeServiceError, RealizeServiceRequest,
-    RealizeServiceResponse, SyncedFile,
+use crate::network::rpc::realstore::{
+    Options, RangedHash, RealStoreServiceClient, RealStoreServiceError, RealStoreServiceRequest,
+    RealStoreServiceResponse, SyncedFile,
 };
 use futures::FutureExt;
 use futures::future;
@@ -142,29 +142,29 @@ pub enum ProgressEvent {
 
 pub async fn move_dir<T, U>(
     ctx: tarpc::context::Context,
-    src: &RealizeServiceClient<T>,
-    dst: &RealizeServiceClient<U>,
+    src: &RealStoreServiceClient<T>,
+    dst: &RealStoreServiceClient<U>,
     arena: Arena,
     progress_tx: Option<Sender<ProgressEvent>>,
 ) -> Result<(usize, usize, usize), MoveFileError>
 where
-    T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
-    U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+    T: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse>,
+    U: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse>,
 {
     move_dirs(ctx, src, dst, vec![arena], progress_tx).await
 }
 
-/// Moves files from source to destination using the RealizeService interface, sending progress events to a channel.
+/// Moves files from source to destination using the RealStoreService interface, sending progress events to a channel.
 pub async fn move_dirs<T, U>(
     ctx: tarpc::context::Context,
-    src: &RealizeServiceClient<T>,
-    dst: &RealizeServiceClient<U>,
+    src: &RealStoreServiceClient<T>,
+    dst: &RealStoreServiceClient<U>,
     arenas: impl IntoIterator<Item = Arena>,
     progress_tx: Option<Sender<ProgressEvent>>,
 ) -> Result<(usize, usize, usize), MoveFileError>
 where
-    T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
-    U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+    T: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse>,
+    U: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse>,
 {
     METRIC_START_COUNT.inc();
     let mut files_to_sync = vec![];
@@ -268,14 +268,14 @@ where
 /// Also issues the [ProgressEvent::MovingDir] progress calls
 async fn collect_files_to_sync<T, U>(
     ctx: tarpc::context::Context,
-    src: &RealizeServiceClient<T>,
-    dst: &RealizeServiceClient<U>,
+    src: &RealStoreServiceClient<T>,
+    dst: &RealStoreServiceClient<U>,
     arena: Arena,
     progress_tx: &Option<Sender<ProgressEvent>>,
 ) -> Result<Vec<(Arena, SyncedFile, Option<SyncedFile>)>, MoveFileError>
 where
-    T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
-    U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+    T: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse>,
+    U: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse>,
 {
     // 1. List files on src and dst in parallel
     let (src_files, dst_files) = future::join(
@@ -315,17 +315,17 @@ where
 
 async fn move_file<T, U>(
     ctx: tarpc::context::Context,
-    src: &RealizeServiceClient<T>,
+    src: &RealStoreServiceClient<T>,
     src_file: SyncedFile,
-    dst: &RealizeServiceClient<U>,
+    dst: &RealStoreServiceClient<U>,
     dst_file: Option<SyncedFile>,
     arena: &Arena,
     copy_sem: Arc<Semaphore>,
     progress_tx: Option<Sender<ProgressEvent>>,
 ) -> Result<(), MoveFileError>
 where
-    T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
-    U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+    T: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse>,
+    U: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse>,
 {
     METRIC_FILE_START_COUNT.inc();
     let path = src_file.path;
@@ -448,15 +448,15 @@ async fn rsync_file_range<T, U>(
     ctx: tarpc::context::Context,
     arena: &Arena,
     path: &model::Path,
-    src: &RealizeServiceClient<T>,
-    dst: &RealizeServiceClient<U>,
+    src: &RealStoreServiceClient<T>,
+    dst: &RealStoreServiceClient<U>,
     progress_tx: &Option<Sender<ProgressEvent>>,
     rsync_ranges: &ByteRanges,
     copy_ranges: &mut ByteRanges,
 ) -> Result<(), MoveFileError>
 where
-    T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
-    U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+    T: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse>,
+    U: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse>,
 {
     if rsync_ranges.is_empty() {
         return Ok(());
@@ -513,7 +513,7 @@ where
                 log::debug!("{}/{:?} INC {}", &arena, path, range.bytecount());
                 report_increment_bytecount(&progress_tx, &arena, path, range.bytecount()).await;
             }
-            Err(RealizeServiceError::HashMismatch) => {
+            Err(RealStoreServiceError::HashMismatch) => {
                 copy_ranges.add(&range);
                 log::error!(
                     "{}/{}:{} hash mismatch after apply_delta, will copy",
@@ -537,15 +537,15 @@ async fn copy_file_range<T, U>(
     ctx: tarpc::context::Context,
     arena: &Arena,
     path: &model::Path,
-    src: &RealizeServiceClient<T>,
-    dst: &RealizeServiceClient<U>,
+    src: &RealStoreServiceClient<T>,
+    dst: &RealStoreServiceClient<U>,
     progress_tx: &Option<Sender<ProgressEvent>>,
     copy_sem: Arc<Semaphore>,
     copy_ranges: &ByteRanges,
 ) -> Result<(), MoveFileError>
 where
-    T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
-    U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+    T: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse>,
+    U: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse>,
 {
     if copy_ranges.is_empty() {
         return Ok(());
@@ -698,7 +698,7 @@ async fn report_decrement_bytecount(
 /// Hash file in chunks and return the result.
 pub(crate) async fn hash_file<T>(
     ctx: tarpc::context::Context,
-    client: &RealizeServiceClient<T>,
+    client: &RealStoreServiceClient<T>,
     arena: &Arena,
     relative_path: &model::Path,
     file_size: u64,
@@ -706,7 +706,7 @@ pub(crate) async fn hash_file<T>(
     options: Options,
 ) -> Result<RangedHash, MoveFileError>
 where
-    T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+    T: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse>,
 {
     let results =
         futures::stream::iter(ByteRange::new(0, file_size).chunked(chunk_size).into_iter())
@@ -751,14 +751,14 @@ async fn check_hashes_and_delete<T, U>(
     ctx: tarpc::context::Context,
     src_hash: &RangedHash,
     file_size: u64,
-    src: &RealizeServiceClient<T>,
-    dst: &RealizeServiceClient<U>,
+    src: &RealStoreServiceClient<T>,
+    dst: &RealStoreServiceClient<U>,
     arena: &Arena,
     path: &model::Path,
 ) -> Result<HashCheck, MoveFileError>
 where
-    T: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
-    U: Stub<Req = RealizeServiceRequest, Resp = RealizeServiceResponse>,
+    T: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse>,
+    U: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse>,
 {
     let dst_hash = hash_file(
         ctx,
@@ -806,7 +806,7 @@ mod tests {
     use super::*;
     use crate::model::Arena;
     use crate::model::Hash;
-    use crate::network::rpc::realize::server::{self};
+    use crate::network::rpc::realstore::server::{self};
     use crate::storage::real::LocalStorage;
     use crate::utils::hash;
     use assert_fs::TempDir;
@@ -1395,7 +1395,7 @@ pub enum MoveFileError {
     #[error("RPC error: {0}")]
     Rpc(#[from] tarpc::client::RpcError),
     #[error("Remote Error: {0}")]
-    Realize(#[from] RealizeServiceError),
+    Realize(#[from] RealStoreServiceError),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("Data still inconsistent after sync")]

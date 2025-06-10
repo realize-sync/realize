@@ -12,15 +12,15 @@ use std::time::Duration;
 use crate::model::Peer;
 use crate::network::reconnect::Connect;
 use crate::network::reconnect::Reconnect;
-use crate::network::rpc::realize;
-use crate::network::rpc::realize::metrics::MetricsRealizeClient;
-use crate::network::rpc::realize::Config;
-use crate::network::rpc::realize::RealizeServiceClient;
-use crate::network::rpc::realize::RealizeServiceRequest;
-use crate::network::rpc::realize::RealizeServiceResponse;
+use crate::network::rpc::realstore;
+use crate::network::rpc::realstore::metrics::MetricsRealizeClient;
+use crate::network::rpc::realstore::Config;
+use crate::network::rpc::realstore::RealStoreServiceClient;
+use crate::network::rpc::realstore::RealStoreServiceRequest;
+use crate::network::rpc::realstore::RealStoreServiceResponse;
 use crate::network::Networking;
 
-pub type ClientType = RealizeServiceClient<RealizeStub>;
+pub type ClientType = RealStoreServiceClient<RealizeStub>;
 
 #[derive(Clone, Default)]
 pub struct ClientOptions {
@@ -39,14 +39,14 @@ pub enum ClientConnectionState {
     Connected,
 }
 
-/// Create a [RealizeServiceClient] connected to the given TCP address.
+/// Create a [RealStoreServiceClient] connected to the given TCP address.
 pub async fn connect(
     networking: &Networking,
     peer: &Peer,
     options: ClientOptions,
 ) -> anyhow::Result<ClientType> {
     let stub = RealizeStub::new(networking, peer, options).await?;
-    Ok(RealizeServiceClient::from(stub))
+    Ok(RealStoreServiceClient::from(stub))
 }
 
 #[derive(Clone)]
@@ -57,25 +57,26 @@ struct TcpConnect {
     config: Arc<Mutex<Option<Config>>>,
 }
 
-impl Connect<tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>>
+impl Connect<tarpc::client::Channel<Arc<RealStoreServiceRequest>, RealStoreServiceResponse>>
     for TcpConnect
 {
     async fn try_connect(
         &self,
-    ) -> anyhow::Result<tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>>
-    {
+    ) -> anyhow::Result<
+        tarpc::client::Channel<Arc<RealStoreServiceRequest>, RealStoreServiceResponse>,
+    > {
         if let Some(tx) = &self.options.connection_events {
             let _ = tx.send(ClientConnectionState::Connecting);
         }
         let transport = self
             .networking
-            .connect(&self.peer, realize::TAG, self.options.limiter.clone())
+            .connect(&self.peer, realstore::TAG, self.options.limiter.clone())
             .await?;
         let channel = tarpc::client::new(Default::default(), transport).spawn();
 
         // Recover stored configuration
         if let Some(config) = self.config.lock().await.as_ref() {
-            let req = Arc::new(RealizeServiceRequest::Configure {
+            let req = Arc::new(RealStoreServiceRequest::Configure {
                 config: config.clone(),
             });
             channel.call(context::current(), req).await?;
@@ -90,11 +91,11 @@ impl Connect<tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceRe
 
 /// A type that encapsulates and hides the actual stub type.
 ///
-/// Most usage should be through the alias [TcpRealizeServiceClient].
+/// Most usage should be through the alias [TcpRealStoreServiceClient].
 pub struct RealizeStub {
     inner: MetricsRealizeClient<
         Reconnect<
-            tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>,
+            tarpc::client::Channel<Arc<RealStoreServiceRequest>, RealStoreServiceResponse>,
             TcpConnect,
             ExponentialBackoff,
         >,
@@ -124,7 +125,7 @@ impl RealizeStub {
         };
 
         let reconnect: Reconnect<
-            tarpc::client::Channel<Arc<RealizeServiceRequest>, RealizeServiceResponse>,
+            tarpc::client::Channel<Arc<RealStoreServiceRequest>, RealStoreServiceResponse>,
             TcpConnect,
             ExponentialBackoff,
         > = Reconnect::new(retry_strategy, connect, Some(Duration::from_secs(5 * 60))).await?;
@@ -137,18 +138,18 @@ impl RealizeStub {
 }
 
 impl Stub for RealizeStub {
-    type Req = RealizeServiceRequest;
-    type Resp = RealizeServiceResponse;
+    type Req = RealStoreServiceRequest;
+    type Resp = RealStoreServiceResponse;
 
     async fn call(
         &self,
         ctx: context::Context,
-        request: RealizeServiceRequest,
-    ) -> std::result::Result<RealizeServiceResponse, RpcError> {
+        request: RealStoreServiceRequest,
+    ) -> std::result::Result<RealStoreServiceResponse, RpcError> {
         let res = self.inner.call(ctx, request).await;
 
         // Store configuration to recover it on reconnection.
-        if let Ok(RealizeServiceResponse::Configure(Ok(config))) = &res {
+        if let Ok(RealStoreServiceResponse::Configure(Ok(config))) = &res {
             *(self.config.lock().await) = if *config == Config::default() {
                 None
             } else {
@@ -168,7 +169,7 @@ mod tests {
     use super::*;
     use crate::model::{Arena, Peer};
     use crate::network::hostport::HostPort;
-    use crate::network::rpc::realize::{Config, Options};
+    use crate::network::rpc::realstore::{Config, Options};
     use crate::network::security::{testing, PeerVerifier, RawPublicKeyResolver};
     use crate::network::Server;
     use crate::storage::real::LocalStorage;
@@ -214,7 +215,7 @@ mod tests {
                 Arc::clone(&self.verifier),
             );
             let mut server = Server::new(networking);
-            realize::server::register(&mut server, self.storage.clone());
+            realstore::server::register(&mut server, self.storage.clone());
             let server = Arc::new(server);
             let addr = Arc::clone(&server).listen(&HostPort::localhost(0)).await?;
 
