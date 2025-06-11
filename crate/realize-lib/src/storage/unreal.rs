@@ -3,7 +3,7 @@
 //! See `spec/unreal.md` for details.
 
 use crate::model::{self, Arena, Path, Peer};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadTransaction, ReadableTable, TableDefinition};
 use std::cmp::max;
 use std::path;
 use std::time::SystemTime;
@@ -230,15 +230,25 @@ impl UnrealCache {
         Ok(())
     }
 
-    pub fn lookup(&self, parent_inode: u64, name: &str) -> Result<ReadDirEntry, UnrealCacheError> {
+    pub fn lookup(
+        &self,
+        parent_inode: u64,
+        name: &str,
+    ) -> Result<(ReadDirEntry, Option<FileMetadata>), UnrealCacheError> {
         let txn = self.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
         let entry = dir_table
             .get((parent_inode, name))?
             .ok_or(UnrealCacheError::NotFound)?;
         let entry: ReadDirEntry = bincode::deserialize(entry.value())?;
+        match &entry.assignment {
+            InodeAssignment::File => {
+                let metadata = do_get_file_metadata(&txn, entry.inode)?;
 
-        Ok(entry)
+                Ok((entry, Some(metadata)))
+            }
+            InodeAssignment::Directory => Ok((entry, None)),
+        }
     }
 
     pub fn readdir(
@@ -265,25 +275,27 @@ impl UnrealCache {
 
         Ok(entries.into_iter())
     }
+}
 
-    pub fn get_file_metadata(&self, inode: u64) -> Result<FileMetadata, UnrealCacheError> {
-        let txn = self.db.begin_read()?;
-        let file_table = txn.open_table(FILE_TABLE)?;
-        let mut best = None;
-        for entry in file_table.range((inode, "")..)? {
-            let entry: FileEntry = bincode::deserialize(entry?.1.value())?;
-            match &best {
-                None => best = Some(entry.metadata),
-                Some(best_metadata) => {
-                    if entry.metadata.mtime > best_metadata.mtime {
-                        best = Some(entry.metadata)
-                    }
+fn do_get_file_metadata(
+    txn: &ReadTransaction,
+    inode: u64,
+) -> Result<FileMetadata, UnrealCacheError> {
+    let file_table = txn.open_table(FILE_TABLE)?;
+    let mut best = None;
+    for entry in file_table.range((inode, "")..)? {
+        let entry: FileEntry = bincode::deserialize(entry?.1.value())?;
+        match &best {
+            None => best = Some(entry.metadata),
+            Some(best_metadata) => {
+                if entry.metadata.mtime > best_metadata.mtime {
+                    best = Some(entry.metadata)
                 }
             }
         }
-
-        best.ok_or(UnrealCacheError::NotFound)
     }
+
+    best.ok_or(UnrealCacheError::NotFound)
 }
 
 /// Error returned by the [UnrealCache].
@@ -511,12 +523,16 @@ mod tests {
         cache.link(&peer, &arena, &file_path, 100, mtime)?;
 
         // Lookup directory
-        let dir_entry = cache.lookup(1, "a")?;
+        let (dir_entry, metadata) = cache.lookup(1, "a")?;
         assert_eq!(dir_entry.assignment, InodeAssignment::Directory);
+        assert_eq!(metadata, None);
 
         // Lookup file
-        let file_entry = cache.lookup(dir_entry.inode, "file.txt")?;
+        let (file_entry, metadata) = cache.lookup(dir_entry.inode, "file.txt")?;
         assert_eq!(file_entry.assignment, InodeAssignment::File);
+        let metadata = metadata.expect("files must have metadata");
+        assert_eq!(metadata.mtime, mtime);
+        assert_eq!(metadata.size, 100);
 
         Ok(())
     }
@@ -558,7 +574,7 @@ mod tests {
             mtime,
         )?;
 
-        let dir_entry = cache.lookup(1, "dir")?;
+        let (dir_entry, _) = cache.lookup(1, "dir")?;
         let entries: Vec<_> = cache.readdir(dir_entry.inode)?.collect::<Vec<_>>();
 
         assert_eq!(entries.len(), 3);
@@ -600,9 +616,8 @@ mod tests {
         cache.link(&peer1, &arena, &file_path, 100, mtime1)?;
         cache.link(&peer2, &arena, &file_path, 200, mtime2)?;
 
-        let file_entry = cache.lookup(1, "file.txt")?;
-        let metadata = cache.get_file_metadata(file_entry.inode)?;
-
+        let (_, metadata) = cache.lookup(1, "file.txt")?;
+        let metadata = metadata.expect("files must have metadata");
         assert_eq!(metadata.size, 200);
         assert_eq!(metadata.mtime, mtime2);
 
