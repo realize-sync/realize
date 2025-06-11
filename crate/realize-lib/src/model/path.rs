@@ -73,6 +73,11 @@ impl Path {
         }
     }
 
+    /// Split a path into one or more components.
+    pub fn components(&self) -> impl Iterator<Item = &str> {
+        self.0.split('/')
+    }
+
     /// Return this path as a real path.
     pub fn as_real_path(&self) -> &path::Path {
         path::Path::new(&self.0)
@@ -229,6 +234,20 @@ mod tests {
         assert_eq!(Some(Path::parse("a/b")?), Path::parse("a/b/c")?.parent());
         assert_eq!(Some(Path::parse("a")?), Path::parse("a/b")?.parent());
         assert_eq!(None, Path::parse("a")?.parent());
+
+        Ok(())
+    }
+
+    #[test]
+    fn components() -> anyhow::Result<()> {
+        assert_eq!(
+            Path::parse("a")?.components().collect::<Vec<_>>(),
+            vec!["a"]
+        );
+        assert_eq!(
+            Path::parse("a/b/c/d")?.components().collect::<Vec<_>>(),
+            vec!["a", "b", "c", "d"]
+        );
 
         Ok(())
     }

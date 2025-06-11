@@ -109,14 +109,9 @@ impl UnrealCache {
 
             let mut current_inode = 1;
 
-            let components: Vec<_> = path
-                .as_real_path()
-                .iter()
-                .map(|c| c.to_str().unwrap())
-                .collect();
-
-            for (i, &component_str) in components.iter().enumerate() {
-                let is_last = i == components.len() - 1;
+            let mut components = path.components().peekable();
+            while let Some(component_str) = components.next() {
+                let is_last = components.peek().is_none();
 
                 let (inode, assignment) = {
                     if let Some(entry) = dir_table.get((current_inode, component_str))? {
@@ -186,16 +181,10 @@ impl UnrealCache {
         let mut last_component = "";
         let mut found = false;
 
-        let components: Vec<_> = path
-            .as_real_path()
-            .iter()
-            .map(|c| c.to_str().unwrap())
-            .collect();
-
         {
             let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-            for component_str in &components {
-                if let Some(entry) = dir_table.get((current_inode, *component_str))? {
+            for component_str in path.components() {
+                if let Some(entry) = dir_table.get((current_inode, component_str))? {
                     let entry: ReadDirEntry = bincode::deserialize(entry.value())?;
                     parent_inode = current_inode;
                     current_inode = entry.inode;
