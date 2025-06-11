@@ -3,15 +3,15 @@
 //! See `spec/unreal.md` for details.
 
 use crate::model::{self, Arena, Path, Peer};
-use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
+use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, Value, WriteTransaction};
 use std::cmp::max;
 use std::path;
 use std::time::SystemTime;
 
-const DIRECTORY_TABLE: TableDefinition<(u64, &str), &[u8]> =
+const DIRECTORY_TABLE: TableDefinition<(u64, &str), ReadDirEntry> =
     TableDefinition::new("directory_table");
 
-const FILE_TABLE: TableDefinition<(u64, &str), &[u8]> = TableDefinition::new("file_table");
+const FILE_TABLE: TableDefinition<(u64, &str), FileEntry> = TableDefinition::new("file_table");
 
 /// An entry in a directory listing.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -20,6 +20,40 @@ pub struct ReadDirEntry {
     pub inode: u64,
     /// The type of the entry.
     pub assignment: InodeAssignment,
+}
+
+impl Value for ReadDirEntry {
+    type SelfType<'a>
+        = ReadDirEntry
+    where
+        Self: 'a;
+
+    type AsBytes<'a>
+        = Vec<u8>
+    where
+        Self: 'a;
+
+    fn fixed_width() -> Option<usize> {
+        None
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
+    where
+        Self: 'a,
+    {
+        bincode::deserialize::<ReadDirEntry>(data).unwrap()
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
+    where
+        Self: 'b,
+    {
+        bincode::serialize(value).unwrap()
+    }
+
+    fn type_name() -> redb::TypeName {
+        redb::TypeName::new("ReadDirEntry")
+    }
 }
 
 /// The type of an inode.
@@ -60,6 +94,40 @@ pub struct FileEntry {
     ///
     /// See mark_peer_files and delete_marked_files above.
     pub marked: bool,
+}
+
+impl Value for FileEntry {
+    type SelfType<'a>
+        = FileEntry
+    where
+        Self: 'a;
+
+    type AsBytes<'a>
+        = Vec<u8>
+    where
+        Self: 'a;
+
+    fn fixed_width() -> Option<usize> {
+        None
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
+    where
+        Self: 'a,
+    {
+        bincode::deserialize::<FileEntry>(data).unwrap()
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
+    where
+        Self: 'b,
+    {
+        bincode::serialize(value).unwrap()
+    }
+
+    fn type_name() -> redb::TypeName {
+        redb::TypeName::new("FileEntry")
+    }
 }
 
 /// The metadata of a file.
@@ -127,7 +195,7 @@ impl UnrealCache {
             let dir_table = txn.open_table(DIRECTORY_TABLE)?;
             for component_str in path.components() {
                 if let Some(entry) = dir_table.get((current_inode, component_str))? {
-                    let entry: ReadDirEntry = bincode::deserialize(entry.value())?;
+                    let entry = entry.value();
                     parent_inode = current_inode;
                     current_inode = entry.inode;
                     last_component = component_str;
@@ -149,8 +217,7 @@ impl UnrealCache {
         {
             let mut file_table = txn.open_table(FILE_TABLE)?;
             if let Some(existing) = file_table.get((current_inode, peer.as_str()))? {
-                let existing: FileEntry = bincode::deserialize(existing.value())?;
-                if existing.metadata.mtime > mtime {
+                if existing.value().metadata.mtime > mtime {
                     remove_file_entry = false;
                     remove_directory_entry = false;
                 }
@@ -179,8 +246,8 @@ impl UnrealCache {
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
         let entry = dir_table
             .get((parent_inode, name))?
-            .ok_or(UnrealCacheError::NotFound)?;
-        let entry: ReadDirEntry = bincode::deserialize(entry.value())?;
+            .ok_or(UnrealCacheError::NotFound)?
+            .value();
         match &entry.assignment {
             InodeAssignment::File => {
                 let metadata = do_get_file_metadata(&txn, entry.inode)?;
@@ -209,8 +276,7 @@ impl UnrealCache {
                 break;
             }
             let name = key.value().1.to_string();
-            let entry: ReadDirEntry = bincode::deserialize(value.value())?;
-            entries.push((name, entry));
+            entries.push((name, value.value().clone()));
         }
 
         Ok(entries.into_iter())
@@ -224,7 +290,7 @@ fn do_get_file_metadata(
     let file_table = txn.open_table(FILE_TABLE)?;
     let mut best = None;
     for entry in file_table.range((inode, "")..)? {
-        let entry: FileEntry = bincode::deserialize(entry?.1.value())?;
+        let entry: FileEntry = entry?.1.value();
         match &best {
             None => best = Some(entry.metadata),
             Some(best_metadata) => {
@@ -251,7 +317,8 @@ fn do_link(
 
     let filename = path.name();
     let parent_inode = do_mkdirs(&mut dir_table, &file_table, path.parent())?;
-    let inode = match get_dir_entry(&mut dir_table, parent_inode, filename)? {
+    let dir_entry = dir_table.get((parent_inode, filename))?.map(|e| e.value());
+    let inode = match dir_entry {
         None => add_dir_entry(
             &mut dir_table,
             &file_table,
@@ -259,34 +326,32 @@ fn do_link(
             filename,
             InodeAssignment::File,
         )?,
-        Some(entry) => {
-            if let Some(existing) = file_table.get((entry.inode, peer.as_str()))? {
-                let existing: FileEntry = bincode::deserialize(existing.value())?;
-                if existing.metadata.mtime > mtime {
+        Some(dir_entry) => {
+            if let Some(existing) = file_table.get((dir_entry.inode, peer.as_str()))? {
+                if existing.value().metadata.mtime > mtime {
                     return Ok(());
                 }
             }
 
-            entry.inode
+            dir_entry.inode
         }
     };
     file_table.insert(
         (inode, peer.as_str()),
-        bincode::serialize(&FileEntry {
+        FileEntry {
             arena: arena.clone(),
             path: path.clone(),
             metadata: FileMetadata { size, mtime },
             marked: false,
-        })?
-        .as_slice(),
+        },
     )?;
 
     Ok(())
 }
 
 fn do_mkdirs(
-    dir_table: &mut redb::Table<'_, (u64, &str), &[u8]>,
-    file_table: &redb::Table<'_, (u64, &str), &[u8]>,
+    dir_table: &mut redb::Table<'_, (u64, &str), ReadDirEntry>,
+    file_table: &redb::Table<'_, (u64, &str), FileEntry>,
     path: Option<Path>,
 ) -> Result<u64, UnrealCacheError> {
     match path {
@@ -317,20 +382,20 @@ fn do_mkdirs(
 }
 
 fn get_dir_entry(
-    dir_table: &mut redb::Table<'_, (u64, &str), &[u8]>,
+    dir_table: &mut redb::Table<'_, (u64, &str), ReadDirEntry>,
     parent_inode: u64,
     name: &str,
 ) -> Result<Option<ReadDirEntry>, UnrealCacheError> {
     if let Some(entry) = dir_table.get((parent_inode, name))? {
-        Ok(Some(bincode::deserialize(entry.value())?))
+        Ok(Some(entry.value()))
     } else {
         Ok(None)
     }
 }
 
 fn add_dir_entry(
-    dir_table: &mut redb::Table<'_, (u64, &str), &[u8]>,
-    file_table: &redb::Table<'_, (u64, &str), &[u8]>,
+    dir_table: &mut redb::Table<'_, (u64, &str), ReadDirEntry>,
+    file_table: &redb::Table<'_, (u64, &str), FileEntry>,
     parent_inode: u64,
     name: &str,
     assignment: InodeAssignment,
@@ -339,11 +404,13 @@ fn add_dir_entry(
         dir_table.last()?.map(|(k, _)| k.value().0).unwrap_or(1),
         file_table.last()?.map(|(k, _)| k.value().0).unwrap_or(1),
     );
-    let dir_entry = bincode::serialize(&ReadDirEntry {
-        inode: new_inode,
-        assignment,
-    })?;
-    dir_table.insert((parent_inode, name), dir_entry.as_slice())?;
+    dir_table.insert(
+        (parent_inode, name),
+        ReadDirEntry {
+            inode: new_inode,
+            assignment,
+        },
+    )?;
 
     Ok(new_inode)
 }
@@ -356,9 +423,6 @@ fn add_dir_entry(
 pub enum UnrealCacheError {
     #[error("redb error {0}")]
     DatabaseError(#[from] redb::Error),
-
-    #[error("bincode error {0}")]
-    SerializationError(#[from] Box<bincode::ErrorKind>),
 
     #[error{"not found"}]
     NotFound,
@@ -443,12 +507,10 @@ mod tests {
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-        let entry = dir_table.get((1, "a"))?.unwrap();
-        let entry: ReadDirEntry = bincode::deserialize(entry.value()).unwrap();
+        let entry = dir_table.get((1, "a"))?.unwrap().value();
         assert_eq!(entry.assignment, InodeAssignment::Directory);
 
-        let entry = dir_table.get((entry.inode, "b"))?.unwrap();
-        let entry: ReadDirEntry = bincode::deserialize(entry.value()).unwrap();
+        let entry = dir_table.get((entry.inode, "b"))?.unwrap().value();
         assert_eq!(entry.assignment, InodeAssignment::Directory);
 
         Ok(())
@@ -472,12 +534,13 @@ mod tests {
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-        let entry = dir_table.get((1, "file.txt"))?.unwrap();
-        let dir_entry: ReadDirEntry = bincode::deserialize(entry.value())?;
+        let dir_entry = dir_table.get((1, "file.txt"))?.unwrap().value();
 
         let file_table = txn.open_table(FILE_TABLE)?;
-        let file_entry = file_table.get((dir_entry.inode, peer.as_str()))?.unwrap();
-        let entry: FileEntry = bincode::deserialize(file_entry.value())?;
+        let entry = file_table
+            .get((dir_entry.inode, peer.as_str()))?
+            .unwrap()
+            .value();
         assert_eq!(entry.metadata.size, 200);
         assert_eq!(entry.metadata.mtime, new_mtime);
 
@@ -502,12 +565,13 @@ mod tests {
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-        let entry = dir_table.get((1, "file.txt"))?.unwrap();
-        let dir_entry: ReadDirEntry = bincode::deserialize(entry.value()).unwrap();
+        let dir_entry = dir_table.get((1, "file.txt"))?.unwrap().value();
 
         let file_table = txn.open_table(FILE_TABLE)?;
-        let file_entry = file_table.get((dir_entry.inode, peer.as_str()))?.unwrap();
-        let entry: FileEntry = bincode::deserialize(file_entry.value()).unwrap();
+        let entry = file_table
+            .get((dir_entry.inode, peer.as_str()))?
+            .unwrap()
+            .value();
         assert_eq!(entry.metadata.size, 100);
         assert_eq!(entry.metadata.mtime, new_mtime);
 
