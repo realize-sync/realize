@@ -11,7 +11,7 @@ use std::time::SystemTime;
 const DIRECTORY_TABLE: TableDefinition<(u64, &str), &[u8]> =
     TableDefinition::new("directory_table");
 
-const FILE_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("file_table");
+const FILE_TABLE: TableDefinition<(u64, &str), &[u8]> = TableDefinition::new("file_table");
 
 /// An entry in a directory listing.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -125,7 +125,7 @@ impl UnrealCache {
                     } else {
                         let new_inode = 1 + max(
                             dir_table.last()?.map(|(k, _)| k.value().0).unwrap_or(1),
-                            file_table.last()?.map(|(k, _)| k.value()).unwrap_or(1),
+                            file_table.last()?.map(|(k, _)| k.value().0).unwrap_or(1),
                         );
                         let assignment = if is_last {
                             InodeAssignment::File
@@ -148,32 +148,25 @@ impl UnrealCache {
                 }
             }
 
-            let files_vec = if let Some(file_entry) = file_table.get(current_inode)? {
-                bincode::deserialize(file_entry.value())?
-            } else {
-                Vec::new()
-            };
-
-            let mut files: Vec<(Peer, FileEntry)> = files_vec;
-
-            if let Some((_, entry)) = files.iter_mut().find(|(p, _)| p == peer) {
-                if mtime > entry.metadata.mtime {
-                    entry.metadata.mtime = mtime;
-                    entry.metadata.size = size;
+            let mut insert_file = true;
+            if let Some(existing) = file_table.get((current_inode, peer.as_str()))? {
+                let existing: FileEntry = bincode::deserialize(existing.value())?;
+                if existing.metadata.mtime > mtime {
+                    insert_file = false;
                 }
-            } else {
-                files.push((
-                    peer.clone(),
-                    FileEntry {
+            };
+            if insert_file {
+                file_table.insert(
+                    (current_inode, peer.as_str()),
+                    bincode::serialize(&FileEntry {
                         arena: arena.clone(),
                         path: path.clone(),
                         metadata: FileMetadata { size, mtime },
                         marked: false,
-                    },
-                ));
+                    })?
+                    .as_slice(),
+                )?;
             }
-
-            file_table.insert(current_inode, bincode::serialize(&files)?.as_slice())?;
         }
         txn.commit()?;
         Ok(())
@@ -220,36 +213,26 @@ impl UnrealCache {
             return Ok(());
         }
 
-        let files_data = {
-            let file_table = txn.open_table(FILE_TABLE)?;
-            if let Some(entry) = file_table.get(current_inode)? {
-                Some(bincode::deserialize::<Vec<(Peer, FileEntry)>>(
-                    entry.value(),
-                )?)
-            } else {
-                None
+        let mut remove_file_entry = true;
+        let mut remove_directory_entry = false;
+        {
+            let mut file_table = txn.open_table(FILE_TABLE)?;
+            if let Some(existing) = file_table.get((current_inode, peer.as_str()))? {
+                let existing: FileEntry = bincode::deserialize(existing.value())?;
+                if existing.metadata.mtime > mtime {
+                    remove_file_entry = false;
+                    remove_directory_entry = false;
+                }
+            }
+            if remove_file_entry {
+                file_table.remove((current_inode, peer.as_str()))?;
+                remove_directory_entry = file_table.range((current_inode, "")..)?.count() == 0;
             }
         };
 
-        if let Some(mut files) = files_data {
-            let initial_len = files.len();
-            files.retain(|(p, f)| {
-                if p == peer {
-                    mtime <= f.metadata.mtime
-                } else {
-                    true
-                }
-            });
-
-            if files.is_empty() {
-                let mut file_table = txn.open_table(FILE_TABLE)?;
-                file_table.remove(current_inode)?;
-                let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
-                dir_table.remove((parent_inode, last_component))?;
-            } else if files.len() < initial_len {
-                let mut file_table = txn.open_table(FILE_TABLE)?;
-                file_table.insert(current_inode, bincode::serialize(&files)?.as_slice())?;
-            }
+        if remove_directory_entry {
+            let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
+            dir_table.remove((parent_inode, last_component))?;
         }
 
         txn.commit()?;
@@ -300,13 +283,20 @@ impl UnrealCache {
     pub fn get_file_metadata(&self, inode: u64) -> Result<Option<FileMetadata>, anyhow::Error> {
         let txn = self.db.begin_read()?;
         let file_table = txn.open_table(FILE_TABLE)?;
-        if let Some(entry) = file_table.get(inode)? {
-            let files: Vec<(Peer, FileEntry)> = bincode::deserialize(entry.value())?;
-            let best_entry = files.into_iter().max_by_key(|(_, e)| e.metadata.mtime);
-            Ok(best_entry.map(|(_, e)| e.metadata))
-        } else {
-            Ok(None)
+        let mut best = None;
+        for entry in file_table.range((inode, "")..)? {
+            let entry: FileEntry = bincode::deserialize(entry?.1.value())?;
+            match &best {
+                None => best = Some(entry.metadata),
+                Some(best_metadata) => {
+                    if entry.metadata.mtime > best_metadata.mtime {
+                        best = Some(entry.metadata)
+                    }
+                }
+            }
         }
+
+        Ok(best)
     }
 }
 
@@ -384,13 +374,13 @@ mod tests {
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
         let entry = dir_table.get((1, "file.txt"))?.unwrap();
-        let dir_entry: ReadDirEntry = bincode::deserialize(entry.value()).unwrap();
+        let dir_entry: ReadDirEntry = bincode::deserialize(entry.value())?;
 
         let file_table = txn.open_table(FILE_TABLE)?;
-        let file_entry = file_table.get(dir_entry.inode)?.unwrap();
-        let files: Vec<(Peer, FileEntry)> = bincode::deserialize(file_entry.value()).unwrap();
-        assert_eq!(files[0].1.metadata.size, 200);
-        assert_eq!(files[0].1.metadata.mtime, new_mtime);
+        let file_entry = file_table.get((dir_entry.inode, peer.as_str()))?.unwrap();
+        let entry: FileEntry = bincode::deserialize(file_entry.value())?;
+        assert_eq!(entry.metadata.size, 200);
+        assert_eq!(entry.metadata.mtime, new_mtime);
 
         Ok(())
     }
@@ -417,10 +407,10 @@ mod tests {
         let dir_entry: ReadDirEntry = bincode::deserialize(entry.value()).unwrap();
 
         let file_table = txn.open_table(FILE_TABLE)?;
-        let file_entry = file_table.get(dir_entry.inode)?.unwrap();
-        let files: Vec<(Peer, FileEntry)> = bincode::deserialize(file_entry.value()).unwrap();
-        assert_eq!(files[0].1.metadata.size, 100);
-        assert_eq!(files[0].1.metadata.mtime, new_mtime);
+        let file_entry = file_table.get((dir_entry.inode, peer.as_str()))?.unwrap();
+        let entry: FileEntry = bincode::deserialize(file_entry.value()).unwrap();
+        assert_eq!(entry.metadata.size, 100);
+        assert_eq!(entry.metadata.mtime, new_mtime);
 
         Ok(())
     }
