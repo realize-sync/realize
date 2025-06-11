@@ -83,7 +83,7 @@ impl UnrealCache {
     }
 
     /// Open or create an UnrealCache at the given path.
-    pub fn open(path: &path::Path) -> Result<Self, anyhow::Error> {
+    pub fn open(path: &path::Path) -> Result<Self, UnrealCacheError> {
         let db = Database::create(path)?;
         let write_txn = db.begin_write()?;
         {
@@ -101,7 +101,7 @@ impl UnrealCache {
         path: &Path,
         size: u64,
         mtime: SystemTime,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), UnrealCacheError> {
         let txn = self.db.begin_write()?;
         {
             let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
@@ -138,7 +138,9 @@ impl UnrealCache {
                 };
 
                 match assignment {
-                    InodeAssignment::File if !is_last => anyhow::bail!("Not a directory"),
+                    InodeAssignment::File if !is_last => {
+                        return Err(UnrealCacheError::NotADirectory);
+                    }
                     _ => current_inode = inode,
                 }
             }
@@ -173,7 +175,7 @@ impl UnrealCache {
         _arena: &Arena,
         path: &Path,
         mtime: SystemTime,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), UnrealCacheError> {
         let txn = self.db.begin_write()?;
 
         let mut current_inode = 1;
@@ -228,26 +230,21 @@ impl UnrealCache {
         Ok(())
     }
 
-    pub fn lookup(
-        &self,
-        parent_inode: u64,
-        name: &str,
-    ) -> Result<Option<ReadDirEntry>, anyhow::Error> {
+    pub fn lookup(&self, parent_inode: u64, name: &str) -> Result<ReadDirEntry, UnrealCacheError> {
         let txn = self.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-        if let Some(entry) = dir_table.get((parent_inode, name))? {
-            let entry: ReadDirEntry = bincode::deserialize(entry.value())?;
-            Ok(Some(entry))
-        } else {
-            Ok(None)
-        }
+        let entry = dir_table
+            .get((parent_inode, name))?
+            .ok_or(UnrealCacheError::NotFound)?;
+        let entry: ReadDirEntry = bincode::deserialize(entry.value())?;
+
+        Ok(entry)
     }
 
     pub fn readdir(
         &self,
         inode: u64,
-    ) -> Result<impl Iterator<Item = Result<(String, ReadDirEntry), anyhow::Error>>, anyhow::Error>
-    {
+    ) -> Result<impl Iterator<Item = (String, ReadDirEntry)>, UnrealCacheError> {
         let txn = self.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
 
@@ -263,13 +260,13 @@ impl UnrealCache {
             }
             let name = key.value().1.to_string();
             let entry: ReadDirEntry = bincode::deserialize(value.value())?;
-            entries.push(Ok((name, entry)));
+            entries.push((name, entry));
         }
 
         Ok(entries.into_iter())
     }
 
-    pub fn get_file_metadata(&self, inode: u64) -> Result<Option<FileMetadata>, anyhow::Error> {
+    pub fn get_file_metadata(&self, inode: u64) -> Result<FileMetadata, UnrealCacheError> {
         let txn = self.db.begin_read()?;
         let file_table = txn.open_table(FILE_TABLE)?;
         let mut best = None;
@@ -285,7 +282,58 @@ impl UnrealCache {
             }
         }
 
-        Ok(best)
+        best.ok_or(UnrealCacheError::NotFound)
+    }
+}
+
+/// Error returned by the [UnrealCache].
+///
+/// This type exists mainly so that errors can be converted when
+/// needed to OS I/O errors.
+#[derive(Debug, thiserror::Error)]
+pub enum UnrealCacheError {
+    #[error("redb error {0}")]
+    DatabaseError(#[from] redb::Error),
+
+    #[error("bincode error {0}")]
+    SerializationError(#[from] Box<bincode::ErrorKind>),
+
+    #[error{"not found"}]
+    NotFound,
+
+    #[error{"not a directory"}]
+    NotADirectory,
+
+    #[error{"is a directory"}]
+    IsADirectory,
+}
+
+impl From<redb::TableError> for UnrealCacheError {
+    fn from(value: redb::TableError) -> Self {
+        UnrealCacheError::DatabaseError(value.into())
+    }
+}
+
+impl From<redb::StorageError> for UnrealCacheError {
+    fn from(value: redb::StorageError) -> Self {
+        UnrealCacheError::DatabaseError(value.into())
+    }
+}
+
+impl From<redb::TransactionError> for UnrealCacheError {
+    fn from(value: redb::TransactionError) -> Self {
+        UnrealCacheError::DatabaseError(value.into())
+    }
+}
+
+impl From<redb::DatabaseError> for UnrealCacheError {
+    fn from(value: redb::DatabaseError) -> Self {
+        UnrealCacheError::DatabaseError(value.into())
+    }
+}
+impl From<redb::CommitError> for UnrealCacheError {
+    fn from(value: redb::CommitError) -> Self {
+        UnrealCacheError::DatabaseError(value.into())
     }
 }
 
@@ -463,25 +511,28 @@ mod tests {
         cache.link(&peer, &arena, &file_path, 100, mtime)?;
 
         // Lookup directory
-        let dir_entry = cache.lookup(1, "a")?.unwrap();
+        let dir_entry = cache.lookup(1, "a")?;
         assert_eq!(dir_entry.assignment, InodeAssignment::Directory);
 
         // Lookup file
-        let file_entry = cache.lookup(dir_entry.inode, "file.txt")?.unwrap();
+        let file_entry = cache.lookup(dir_entry.inode, "file.txt")?;
         assert_eq!(file_entry.assignment, InodeAssignment::File);
 
         Ok(())
     }
 
     #[test]
-    fn lookup_returns_none_for_missing_entry() -> anyhow::Result<()> {
+    fn lookup_returns_notfound_for_missing_entry() -> anyhow::Result<()> {
         let _ = env_logger::try_init();
 
         let dir = tempdir()?;
         let path = dir.path().join("unreal.db");
         let cache = UnrealCache::open(&path)?;
 
-        assert!(cache.lookup(1, "nonexistent")?.is_none());
+        assert!(matches!(
+            cache.lookup(1, "nonexistent"),
+            Err(UnrealCacheError::NotFound),
+        ));
 
         Ok(())
     }
@@ -507,10 +558,8 @@ mod tests {
             mtime,
         )?;
 
-        let dir_entry = cache.lookup(1, "dir")?.unwrap();
-        let entries: Vec<_> = cache
-            .readdir(dir_entry.inode)?
-            .collect::<Result<Vec<_>, _>>()?;
+        let dir_entry = cache.lookup(1, "dir")?;
+        let entries: Vec<_> = cache.readdir(dir_entry.inode)?.collect::<Vec<_>>();
 
         assert_eq!(entries.len(), 3);
 
@@ -551,8 +600,8 @@ mod tests {
         cache.link(&peer1, &arena, &file_path, 100, mtime1)?;
         cache.link(&peer2, &arena, &file_path, 200, mtime2)?;
 
-        let file_entry = cache.lookup(1, "file.txt")?.unwrap();
-        let metadata = cache.get_file_metadata(file_entry.inode)?.unwrap();
+        let file_entry = cache.lookup(1, "file.txt")?;
+        let metadata = cache.get_file_metadata(file_entry.inode)?;
 
         assert_eq!(metadata.size, 200);
         assert_eq!(metadata.mtime, mtime2);
