@@ -3,7 +3,7 @@
 //! See `spec/unreal.md` for details.
 
 use crate::model::{self, Arena, Path, Peer};
-use redb::{Database, ReadTransaction, ReadableTable, TableDefinition};
+use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
 use std::cmp::max;
 use std::path;
 use std::time::SystemTime;
@@ -103,69 +103,9 @@ impl UnrealCache {
         mtime: SystemTime,
     ) -> Result<(), UnrealCacheError> {
         let txn = self.db.begin_write()?;
-        {
-            let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
-            let mut file_table = txn.open_table(FILE_TABLE)?;
-
-            let mut current_inode = 1;
-
-            let mut components = path.components().peekable();
-            while let Some(component_str) = components.next() {
-                let is_last = components.peek().is_none();
-
-                let (inode, assignment) = {
-                    if let Some(entry) = dir_table.get((current_inode, component_str))? {
-                        let entry: ReadDirEntry = bincode::deserialize(entry.value())?;
-                        (entry.inode, entry.assignment)
-                    } else {
-                        let new_inode = 1 + max(
-                            dir_table.last()?.map(|(k, _)| k.value().0).unwrap_or(1),
-                            file_table.last()?.map(|(k, _)| k.value().0).unwrap_or(1),
-                        );
-                        let assignment = if is_last {
-                            InodeAssignment::File
-                        } else {
-                            InodeAssignment::Directory
-                        };
-                        let new_entry = ReadDirEntry {
-                            inode: new_inode,
-                            assignment: assignment.clone(),
-                        };
-                        let entry_val = bincode::serialize(&new_entry)?;
-                        dir_table.insert((current_inode, component_str), entry_val.as_slice())?;
-                        (new_inode, assignment)
-                    }
-                };
-
-                match assignment {
-                    InodeAssignment::File if !is_last => {
-                        return Err(UnrealCacheError::NotADirectory);
-                    }
-                    _ => current_inode = inode,
-                }
-            }
-
-            let mut insert_file = true;
-            if let Some(existing) = file_table.get((current_inode, peer.as_str()))? {
-                let existing: FileEntry = bincode::deserialize(existing.value())?;
-                if existing.metadata.mtime > mtime {
-                    insert_file = false;
-                }
-            };
-            if insert_file {
-                file_table.insert(
-                    (current_inode, peer.as_str()),
-                    bincode::serialize(&FileEntry {
-                        arena: arena.clone(),
-                        path: path.clone(),
-                        metadata: FileMetadata { size, mtime },
-                        marked: false,
-                    })?
-                    .as_slice(),
-                )?;
-            }
-        }
+        do_link(&txn, peer, arena, path, size, mtime)?;
         txn.commit()?;
+
         Ok(())
     }
 
@@ -296,6 +236,116 @@ fn do_get_file_metadata(
     }
 
     best.ok_or(UnrealCacheError::NotFound)
+}
+
+fn do_link(
+    txn: &WriteTransaction,
+    peer: &Peer,
+    arena: &Arena,
+    path: &Path,
+    size: u64,
+    mtime: SystemTime,
+) -> Result<(), UnrealCacheError> {
+    let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
+    let mut file_table = txn.open_table(FILE_TABLE)?;
+
+    let filename = path.name();
+    let parent_inode = do_mkdirs(&mut dir_table, &file_table, path.parent())?;
+    let inode = match get_dir_entry(&mut dir_table, parent_inode, filename)? {
+        None => add_dir_entry(
+            &mut dir_table,
+            &file_table,
+            parent_inode,
+            filename,
+            InodeAssignment::File,
+        )?,
+        Some(entry) => {
+            if let Some(existing) = file_table.get((entry.inode, peer.as_str()))? {
+                let existing: FileEntry = bincode::deserialize(existing.value())?;
+                if existing.metadata.mtime > mtime {
+                    return Ok(());
+                }
+            }
+
+            entry.inode
+        }
+    };
+    file_table.insert(
+        (inode, peer.as_str()),
+        bincode::serialize(&FileEntry {
+            arena: arena.clone(),
+            path: path.clone(),
+            metadata: FileMetadata { size, mtime },
+            marked: false,
+        })?
+        .as_slice(),
+    )?;
+
+    Ok(())
+}
+
+fn do_mkdirs(
+    dir_table: &mut redb::Table<'_, (u64, &str), &[u8]>,
+    file_table: &redb::Table<'_, (u64, &str), &[u8]>,
+    path: Option<Path>,
+) -> Result<u64, UnrealCacheError> {
+    match path {
+        None => Ok(1),
+        Some(path) => {
+            let mut inode = 1;
+            for component in path.components() {
+                inode = if let Some(entry) = get_dir_entry(dir_table, inode, component)? {
+                    if entry.assignment != InodeAssignment::Directory {
+                        return Err(UnrealCacheError::NotADirectory);
+                    }
+
+                    entry.inode
+                } else {
+                    add_dir_entry(
+                        dir_table,
+                        file_table,
+                        inode,
+                        component,
+                        InodeAssignment::Directory,
+                    )?
+                };
+            }
+
+            Ok(inode)
+        }
+    }
+}
+
+fn get_dir_entry(
+    dir_table: &mut redb::Table<'_, (u64, &str), &[u8]>,
+    parent_inode: u64,
+    name: &str,
+) -> Result<Option<ReadDirEntry>, UnrealCacheError> {
+    if let Some(entry) = dir_table.get((parent_inode, name))? {
+        Ok(Some(bincode::deserialize(entry.value())?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn add_dir_entry(
+    dir_table: &mut redb::Table<'_, (u64, &str), &[u8]>,
+    file_table: &redb::Table<'_, (u64, &str), &[u8]>,
+    parent_inode: u64,
+    name: &str,
+    assignment: InodeAssignment,
+) -> Result<u64, UnrealCacheError> {
+    let new_inode = 1 + max(
+        dir_table.last()?.map(|(k, _)| k.value().0).unwrap_or(1),
+        file_table.last()?.map(|(k, _)| k.value().0).unwrap_or(1),
+    );
+    let dir_entry = bincode::serialize(&ReadDirEntry {
+        inode: new_inode,
+        assignment,
+    })?;
+    dir_table.insert((parent_inode, name), dir_entry.as_slice())?;
+
+    Ok(new_inode)
 }
 
 /// Error returned by the [UnrealCache].
