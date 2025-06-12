@@ -73,9 +73,17 @@ impl Path {
         }
     }
 
-    /// Split a path into one or more components.
-    pub fn components(&self) -> impl Iterator<Item = &str> {
-        self.0.split('/')
+    /// Split a possibly empty path into zero or more components.
+    pub fn components<'a>(path: &'a Option<Self>) -> impl Iterator<Item = &'a str> {
+        if let Some(path) = path {
+            path.0.split('/')
+        } else {
+            // An empty iterator of the same type as above.
+            let mut ret = "".split('/');
+            ret.next();
+
+            ret
+        }
     }
 
     /// Return this path as a real path.
@@ -241,12 +249,22 @@ mod tests {
     #[test]
     fn components() -> anyhow::Result<()> {
         assert_eq!(
-            Path::parse("a")?.components().collect::<Vec<_>>(),
-            vec!["a"]
+            Path::components(&Some(Path::parse("a/b/c")?)).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
         );
         assert_eq!(
-            Path::parse("a/b/c/d")?.components().collect::<Vec<_>>(),
-            vec!["a", "b", "c", "d"]
+            Path::components(&Path::parse("a/b/c")?.parent()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+
+        assert_eq!(
+            Path::components(&Some(Path::parse("file")?)).collect::<Vec<_>>(),
+            vec!["file"]
+        );
+
+        assert_eq!(
+            Path::components(&Path::parse("file")?.parent()).collect::<Vec<_>>(),
+            Vec::<&str>::new()
         );
 
         Ok(())

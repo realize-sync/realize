@@ -185,54 +185,7 @@ impl UnrealCache {
         mtime: SystemTime,
     ) -> Result<(), UnrealCacheError> {
         let txn = self.db.begin_write()?;
-
-        let mut current_inode = 1;
-        let mut parent_inode = 1;
-        let mut last_component = "";
-        let mut found = false;
-
-        {
-            let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-            for component_str in path.components() {
-                if let Some(entry) = dir_table.get((current_inode, component_str))? {
-                    let entry = entry.value();
-                    parent_inode = current_inode;
-                    current_inode = entry.inode;
-                    last_component = component_str;
-                    found = true;
-                } else {
-                    found = false;
-                    break;
-                }
-            }
-        }
-
-        if !found {
-            txn.abort()?;
-            return Ok(());
-        }
-
-        let mut remove_file_entry = true;
-        let mut remove_directory_entry = false;
-        {
-            let mut file_table = txn.open_table(FILE_TABLE)?;
-            if let Some(existing) = file_table.get((current_inode, peer.as_str()))? {
-                if existing.value().metadata.mtime > mtime {
-                    remove_file_entry = false;
-                    remove_directory_entry = false;
-                }
-            }
-            if remove_file_entry {
-                file_table.remove((current_inode, peer.as_str()))?;
-                remove_directory_entry = file_table.range((current_inode, "")..)?.count() == 0;
-            }
-        };
-
-        if remove_directory_entry {
-            let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
-            dir_table.remove((parent_inode, last_component))?;
-        }
-
+        do_unlink(&txn, peer, path, mtime)?;
         txn.commit()?;
         Ok(())
     }
@@ -250,9 +203,9 @@ impl UnrealCache {
             .value();
         match &entry.assignment {
             InodeAssignment::File => {
-                let metadata = do_get_file_metadata(&txn, entry.inode)?;
+                let file_entry = get_best_file_entry(&txn, entry.inode)?;
 
-                Ok((entry, Some(metadata)))
+                Ok((entry, Some(file_entry.metadata)))
             }
             InodeAssignment::Directory => Ok((entry, None)),
         }
@@ -283,27 +236,73 @@ impl UnrealCache {
     }
 }
 
-fn do_get_file_metadata(
-    txn: &ReadTransaction,
+/// Implement [UnrealCache::unlink] within a transaction.
+fn do_unlink(
+    txn: &WriteTransaction,
+    peer: &Peer,
+    path: &Path,
+    mtime: SystemTime,
+) -> Result<(), UnrealCacheError> {
+    let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
+    let (parent_inode, parent_assignment) = do_lookup_path(&mut dir_table, &path.parent())?;
+    if parent_assignment != InodeAssignment::Directory {
+        return Err(UnrealCacheError::NotADirectory);
+    }
+
+    let dir_entry =
+        get_dir_entry(&dir_table, parent_inode, path.name())?.ok_or(UnrealCacheError::NotFound)?;
+    if dir_entry.assignment != InodeAssignment::File {
+        return Err(UnrealCacheError::IsADirectory);
+    }
+
+    let inode = dir_entry.inode;
+    let mut file_table = txn.open_table(FILE_TABLE)?;
+    if let Some(file_entry) = get_file_entry(&file_table, inode, peer)? {
+        if file_entry.metadata.mtime > mtime {
+            // The file is more recent than the unlink; nothing to do.
+            return Ok(());
+        }
+        file_table.remove((inode, peer.as_str()))?;
+    }
+    dir_table.remove((parent_inode, path.name()))?;
+
+    Ok(())
+}
+
+/// Get a [FileEntry] for a specific peer.
+fn get_file_entry(
+    file_table: &redb::Table<'_, (u64, &str), FileEntry>,
     inode: u64,
-) -> Result<FileMetadata, UnrealCacheError> {
+    peer: &Peer,
+) -> Result<Option<FileEntry>, UnrealCacheError> {
+    Ok(file_table.get((inode, peer.as_str()))?.map(|e| e.value()))
+}
+
+/// Choose the best available [FileEntry] from all peer's entries.
+///
+/// Strictly-speaking, there might be several best ones, with the same
+/// mtime, from multiple peers. This implementation just returns the
+/// first one.
+fn get_best_file_entry(txn: &ReadTransaction, inode: u64) -> Result<FileEntry, UnrealCacheError> {
     let file_table = txn.open_table(FILE_TABLE)?;
-    let mut best = None;
+
+    let mut best: Option<FileEntry> = None;
     for entry in file_table.range((inode, "")..)? {
-        let entry: FileEntry = entry?.1.value();
-        match &best {
-            None => best = Some(entry.metadata),
-            Some(best_metadata) => {
-                if entry.metadata.mtime > best_metadata.mtime {
-                    best = Some(entry.metadata)
-                }
-            }
+        let entry = entry?;
+        let file_entry: FileEntry = entry.1.value();
+        let replace = match &best {
+            None => true,
+            Some(best) => file_entry.metadata.mtime > best.metadata.mtime,
+        };
+        if replace {
+            best = Some(file_entry);
         }
     }
 
     best.ok_or(UnrealCacheError::NotFound)
 }
 
+/// Implement [UnrealCache::link] in a transaction.
 fn do_link(
     txn: &WriteTransaction,
     peer: &Peer,
@@ -316,8 +315,8 @@ fn do_link(
     let mut file_table = txn.open_table(FILE_TABLE)?;
 
     let filename = path.name();
-    let parent_inode = do_mkdirs(&mut dir_table, &file_table, path.parent())?;
-    let dir_entry = dir_table.get((parent_inode, filename))?.map(|e| e.value());
+    let parent_inode = do_mkdirs(&mut dir_table, &file_table, &path.parent())?;
+    let dir_entry = get_dir_entry(&dir_table, parent_inode, filename)?;
     let inode = match dir_entry {
         None => add_dir_entry(
             &mut dir_table,
@@ -327,8 +326,8 @@ fn do_link(
             InodeAssignment::File,
         )?,
         Some(dir_entry) => {
-            if let Some(existing) = file_table.get((dir_entry.inode, peer.as_str()))? {
-                if existing.value().metadata.mtime > mtime {
+            if let Some(existing) = get_file_entry(&file_table, dir_entry.inode, peer)? {
+                if existing.metadata.mtime > mtime {
                     return Ok(());
                 }
             }
@@ -349,50 +348,67 @@ fn do_link(
     Ok(())
 }
 
+/// Make sure that the given path is a directory; create it if necessary.
+///
+/// Returns the inode of the directory pointed to by the path.
 fn do_mkdirs(
     dir_table: &mut redb::Table<'_, (u64, &str), ReadDirEntry>,
     file_table: &redb::Table<'_, (u64, &str), FileEntry>,
-    path: Option<Path>,
+    path: &Option<Path>,
 ) -> Result<u64, UnrealCacheError> {
-    match path {
-        None => Ok(1),
-        Some(path) => {
-            let mut inode = 1;
-            for component in path.components() {
-                inode = if let Some(entry) = get_dir_entry(dir_table, inode, component)? {
-                    if entry.assignment != InodeAssignment::Directory {
-                        return Err(UnrealCacheError::NotADirectory);
-                    }
-
-                    entry.inode
-                } else {
-                    add_dir_entry(
-                        dir_table,
-                        file_table,
-                        inode,
-                        component,
-                        InodeAssignment::Directory,
-                    )?
-                };
+    let mut current = 1;
+    for component in Path::components(path) {
+        current = if let Some(entry) = get_dir_entry(dir_table, current, component)? {
+            if entry.assignment != InodeAssignment::Directory {
+                return Err(UnrealCacheError::NotADirectory);
             }
 
-            Ok(inode)
-        }
+            entry.inode
+        } else {
+            add_dir_entry(
+                dir_table,
+                file_table,
+                current,
+                component,
+                InodeAssignment::Directory,
+            )?
+        };
     }
+
+    Ok(current)
 }
 
-fn get_dir_entry(
+/// Find the file or directory pointed to by the given path.
+fn do_lookup_path(
     dir_table: &mut redb::Table<'_, (u64, &str), ReadDirEntry>,
+    path: &Option<Path>,
+) -> Result<(u64, InodeAssignment), UnrealCacheError> {
+    let mut current = (1, InodeAssignment::Directory);
+    for component in Path::components(path) {
+        if let Some(entry) = get_dir_entry(dir_table, current.0, component)? {
+            if entry.assignment != InodeAssignment::Directory {
+                return Err(UnrealCacheError::NotADirectory);
+            }
+
+            current = (entry.inode, entry.assignment);
+        } else {
+            return Err(UnrealCacheError::NotFound);
+        };
+    }
+
+    Ok(current)
+}
+
+/// Get a [ReadDirEntry] from a directory, if it exists.
+fn get_dir_entry(
+    dir_table: &redb::Table<'_, (u64, &str), ReadDirEntry>,
     parent_inode: u64,
     name: &str,
 ) -> Result<Option<ReadDirEntry>, UnrealCacheError> {
-    if let Some(entry) = dir_table.get((parent_inode, name))? {
-        Ok(Some(entry.value()))
-    } else {
-        Ok(None)
-    }
+    Ok(dir_table.get((parent_inode, name))?.map(|e| e.value()))
 }
 
+/// Add an entry to the given directory.
 fn add_dir_entry(
     dir_table: &mut redb::Table<'_, (u64, &str), ReadDirEntry>,
     file_table: &redb::Table<'_, (u64, &str), FileEntry>,
