@@ -50,9 +50,10 @@ file paths; let's get started with that and add blobs in a later step.
   /crate/realize-fs/src/storage/fs.rs and should be tested using the
   unit test /create/realize-fs/tests/nfsserve_test.rs
 
-  2.1 fill the details section of [@/spec/unreal.md](unreal.md) with a good description how this will work
-  2.2 write the integration in /crate/realize-fs/src/storage/fs.rs and unit-test it thoroughly
-  2.3 write an integration test in /create/realize-fs/tests/nfsserve_test.rs that creates a NFS service
+  3.1 write the code for calling nfsserve from an unreal cache in
+  /crate/realize-fs/src/storage/fs.rs and unit-test it thoroughly
+  
+  3.2 write an integration test in /create/realize-fs/tests/nfsserve_test.rs that creates a NFS service
       and connects to it using [nfs3_client 0.4](https://crates.io/crates/nfs3_client/0.4.1)
 
 4. Serve file content through `nfsserve` by making a request for a
