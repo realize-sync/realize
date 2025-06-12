@@ -138,7 +138,7 @@ async fn run_loop(
             Some(result) = new_dirs_rx.recv() => {
                 handle_walk_dir_result(result, &mut collector, &mut ready_tx).await?;
             },
-            ev = inotify.next() => {
+            ev = inotify.next(), if ready_tx.is_none() => {
                 match ev {
                     None => { break; }
                     Some(Err(err)) =>{
@@ -751,6 +751,91 @@ mod tests {
                 }
             ],
             vec![n1, n2]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hold_off_notifications_during_catchup() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+
+        let root = fixture.arena_dir.to_path_buf();
+        std::fs::write(root.join("one.txt"), "1")?;
+        std::fs::write(root.join("three.txt"), "3")?;
+        let (res1, res2) = tokio::join!(
+            async move {
+                fs::remove_file(root.join("one.txt")).await?;
+                fs::write(root.join("two.txt"), "3").await?;
+                fs::write(root.join("one.txt"), "111").await?;
+                fs::remove_file(root.join("one.txt")).await?;
+                fs::write(root.join("one.txt"), "1111").await?;
+                fs::write(root.join("four.txt"), "4").await?;
+
+                Ok::<(), anyhow::Error>(())
+            },
+            fixture.subscribe(true),
+        );
+        res1?;
+        res2?;
+
+        let mut collected = Vec::new();
+        while let Ok(Some(notif)) =
+            timeout(Duration::from_millis(100), fixture.notifications_rx.recv()).await
+        {
+            collected.push(notif);
+        }
+
+        // Whatever happens, he catchup must come first, then the
+        // notifications. They must not be mixed together.
+        let first_non_catchup = collected
+            .iter()
+            .enumerate()
+            .find(|(_, n)| !matches!(n, Notification::Catchup { .. }))
+            .unwrap()
+            .0;
+        let last_catchup = collected
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| matches!(n, Notification::Catchup { .. }))
+            .last()
+            .unwrap()
+            .0;
+        assert_eq!(last_catchup + 1, first_non_catchup);
+
+        // Processing the notifications, we should end up with the
+        // final result.
+        let mut files: HashMap<Path, (SystemTime, u64)> = HashMap::new();
+        for notif in collected {
+            match notif {
+                Notification::Catchup {
+                    path, size, mtime, ..
+                }
+                | Notification::Link {
+                    path, size, mtime, ..
+                } => {
+                    if files.get(&path).is_none() || files.get(&path).unwrap().0 < mtime {
+                        files.insert(path, (mtime, size));
+                    }
+                }
+                Notification::Unlink { path, mtime, .. } => {
+                    if files.get(&path).is_some() && files.get(&path).unwrap().0 < mtime {
+                        files.remove(&path);
+                    }
+                }
+            }
+        }
+        assert_unordered::assert_eq_unordered!(
+            vec![
+                ("one.txt".to_string(), 4),
+                ("two.txt".to_string(), 1),
+                ("three.txt".to_string(), 1),
+                ("four.txt".to_string(), 1)
+            ],
+            files
+                .into_iter()
+                .map(|(p, (_, size))| (p.to_string(), size))
+                .collect::<Vec<_>>()
         );
 
         Ok(())

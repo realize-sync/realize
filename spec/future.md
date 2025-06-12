@@ -67,44 +67,6 @@ file paths; let's get started with that and add blobs in a later step.
   5.1 fill the details section of [@/spec/unreal.md](unreal.md) with a description of how this would go
   5.2 implement
 
-## Catch up history on (re)connection {#reconnecthistory}
-
-Let's update `History`, defined in
-[@/crate/realize-lib/src/storage/real/history.rs](../crate/realize-lib/src/storage/real/history.rs)
-to take into account the latest plans, [detailed in the section
-#unreal of this file](#unreal)
-
-1. **DONE* `History` should not attempt to allow multiple subscribers for a
-  given arena. Spawn a task in `History::subscribe` instead of
-  `History::new` that tracks the given arena and sends to the given
-  channel and that's it.
-  
-  1.1 implement the change
-  1.2 update the tests and make sure they all pass
-  
-2. **DONE**Have `History` optionally send `Notification::Link` for existing
-   files when going through the file list for the first time. These notifications
-   have a 'catchup' flag set.
-  
-  2.1 implement the change
-  2.2 update the unit tests and make sure they all pass; existing tests disable
-  catchup so they don't get unexpected notifications.
-  2.3 add a unit test to make sure that existing files are reported
-  
-4. Cover the case where a file is deleted while `History` is going
-   through the file list.
-   
-   There's a race condition in this case, as catchup link and unlink
-   notification can be received out of order. To avoid that, buffer
-   notifications while going through the files for the first time, then
-   send them all at once. 
-  
-   4.1 implement the change 
-   4.2 add a unit test that adds and removes files just after creating
-   the subscriber, without waiting for it to be ready (That is,
-   without waiting for `History::subscribe().await` to return; spawn
-   it or use a join.)
-
 ## File hash as as Merkle tree {#merkle}
 
 For file hashes, build a Merkle tree:
