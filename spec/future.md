@@ -10,35 +10,40 @@ Let's start implementing the file cache described in [@/spec/design.md](design.m
 The design describe a system based on blobs, but for now we just have
 file paths; let's get started with that and add blobs in a later step.
 
-
-1. Fetch list of remote files using RealStoreService::list and store it in a [redb](https://github.com/cberner/redb/tree/master) database. 
-   - The database stores file availability in a table: 
+1. **DONE** Fetch list of remote files using RealStoreService::list and store it in a [redb](https://github.com/cberner/redb/tree/master) database.
+   - The database stores file availability in a table:
       key: (arena, path), arena as model::Arena, path as model::Path
       value: a struct containing, for each peer for which data is avalible: presence (available or deleted), file size (if available), mtime
-      
+
    1.1 fill the details section of [@/spec/unreal.md](unreal.md) with a good description of the database
    1.2 implement the database, keeping it as a goal to expose it through `nfsserve` (next step)
 
 2. Make the file list available through [nfsserve](https://github.com/xetdata/nfsserve). Don't bother serving file content just yet; reading file data should just fail, but listing files should work.
 
     - use the uid and gid of the daemon process for the files and directories
-    - for files, use mode u=rw,g=rw,o=r 
+    - for files, use mode u=rw,g=rw,o=r
     - for directories, use mode u=rwx,g=rwx,o=rx
-    
-  2.1 fill the details section of [@/spec/unreal.md](unreal.md) with a good description how this will work
-  2.2 make the file list in the database created in step 1 available through NFS in the daemon
 
-3. Track changes made remotely, so the filesystem view is up-to-date (Using HistoryService). Keep a connection to all listening peers, as defined in the peer list. Reconnect as necessary. 
+  The code should go into the library crate
+  /crate/realize-fs/src/storage/fs.rs and should be tested using the
+  unit test /create/realize-fs/tests/nfsserve_test.rs
+
+  2.1 fill the details section of [@/spec/unreal.md](unreal.md) with a good description how this will work
+  2.2 write the integration in /crate/realize-fs/src/storage/fs.rs and unit-test it thoroughly
+  2.3 write an integration test in /create/realize-fs/tests/nfsserve_test.rs that creates a NFS service
+      and connects to it using [nfs3_client 0.4](https://crates.io/crates/nfs3_client/0.4.1)
+
+3. Track changes made remotely, so the filesystem view is up-to-date (Using HistoryService). Keep a connection to all listening peers, as defined in the peer list. Reconnect as necessary.
     Algorithm:
-    
+
      For all peers for which an address is known in PeerConfig,
-     
+
      1. connect to the peer using a client from [@/crate/realize-lib/src/network/rpc/realize/client.rs](../crate/realize-lib/src/network/rpc/realize/client.rs)
      2. once connected, as reported by `ClientOptions::connection_events` connect to same peer using `forward_peer_history` defined in [@/crate/realize-lib/src/network/rpc/history/server.rs](../crate/realize-lib/src/network/rpc/history/server.rs)
      3. once `forward_peer_history` has returned, fetch the file list using `RealStoreService::list`, using a client from [@/crate/realize-lib/src/network/rpc/realize/client.rs](../crate/realize-lib/src/network/rpc/realize/client.rs) and update the database
      4. whenever a file change notification is received, update the database (note that this can happen before the files list has been read. Use mtime to resolve conflicts)
      5. when disconnected, as reported by `ClientOptions::connection_events`, let `forward_peer_history` shut down and go back to point 2, waiting for a reconnection
-     
+
   3.1 fill the details section of [@/spec/unreal.md](unreal.md) with a good description of the algorithm and how it all fits together
   3.2 implement the algorithm
 
@@ -48,7 +53,7 @@ file paths; let's get started with that and add blobs in a later step.
 
   4.1 fill the details section of [@/spec/unreal.md](unreal.md) with a description of how this would go
   4.2 implement the algorithm without storing data to the database
-  
+
 5. Store file data (ranges) to the database, as a cache
 
   5.1 fill the details section of [@/spec/unreal.md](unreal.md) with a description of how this would go
@@ -153,4 +158,3 @@ Since move_files works on multiple files at once:
 
 Experiment with different ways of organizing the work that maybe speed
 things up.
-

@@ -283,8 +283,10 @@ crate/
 ├── realize─cmd/                   │     Command-line utility
 │                                  │
 ├── realize─daemon/                │     Background process (RPC + Fuse)
-│                                  │
-├── realize─fs/                    │     Fuse-specific code
+│                                  └─
+│                                  ┌─
+│                                  │ Filesystem Layer
+├── realize─fs/                    │     A library crate
 │                                  └─
 └── realize─lib/
     │
@@ -432,5 +434,3 @@ the OS for better privacy.
 Peers keeps a trimmed-down version of its history and of the history
 it's been sent by other peers in text mode as an audit log, with
 configurable storage location and retention.
-
-
