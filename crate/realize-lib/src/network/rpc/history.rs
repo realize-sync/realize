@@ -25,6 +25,10 @@ pub trait HistoryService {
     ///
     /// The arena vector is the subset of arenas that are watched. It
     /// might be empty.
+    ///
+    /// Note that notifications might be sent before this is called.
+    /// [Notification::Catchup] are only ever sent before ready is
+    /// called.
     async fn ready(arenas: Vec<Arena>);
 
     /// Receive a batch of history notifications.

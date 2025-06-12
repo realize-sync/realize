@@ -43,7 +43,7 @@ where
     let res = futures::future::join_all(
         arenas
             .iter()
-            .map(|a| storage.subscribe(a.clone(), tx.clone(), false)),
+            .map(|a| storage.subscribe(a.clone(), tx.clone(), true)),
     )
     .await;
 

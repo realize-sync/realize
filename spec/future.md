@@ -82,7 +82,7 @@ to take into account the latest plans, [detailed in the section
   1.1 implement the change
   1.2 update the tests and make sure they all pass
   
-2. Have `History` optionally send `Notification::Link` for existing
+2. **DONE**Have `History` optionally send `Notification::Link` for existing
    files when going through the file list for the first time. These notifications
    have a 'catchup' flag set.
   

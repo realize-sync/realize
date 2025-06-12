@@ -265,6 +265,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forward_history_catchup() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+
+        let foobar = fixture.tempdir.child("foobar.txt");
+        foobar.write_str("test")?;
+        let foobar_mtime = foobar.metadata()?.modified()?;
+
+        let _server = fixture.start_server().await?;
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let _ = forward_peer_history(
+            &fixture.networking,
+            context::current(),
+            &fixture.peer,
+            vec![fixture.arena.clone()],
+            tx,
+        )
+        .await?;
+
+        let (peer, notif) = timeout(Duration::from_secs(1), rx.recv()).await?.unwrap();
+        assert_eq!(fixture.peer, peer);
+        assert_eq!(
+            Notification::Catchup {
+                arena: fixture.arena,
+                path: model::Path::parse("foobar.txt")?,
+                size: 4,
+                mtime: foobar_mtime,
+            },
+            notif
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn forward_history_loses_connection() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let server = fixture.start_server().await?;
