@@ -252,7 +252,7 @@ mod tests {
                 arena: fixture.arena,
                 path: model::Path::parse("foobar.txt")?,
                 size: 4,
-                mtime: foobar_mtime
+                mtime: foobar_mtime,
             },
             notif
         );

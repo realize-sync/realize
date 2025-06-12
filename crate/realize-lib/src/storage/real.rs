@@ -72,9 +72,10 @@ impl LocalStorage {
         &self,
         arena: Arena,
         tx: mpsc::Sender<Notification>,
+        catchup: bool,
     ) -> anyhow::Result<bool> {
         if let Some(resolver) = self.path_resolver(&arena, StorageAccess::Read) {
-            history::subscribe(&arena, resolver, tx).await?;
+            history::subscribe(&arena, resolver, tx, catchup).await?;
 
             Ok(true)
         } else {
