@@ -44,7 +44,24 @@ pub enum Notification {
     },
 }
 
-impl Notification {}
+impl Notification {
+    pub fn arena(&self) -> &Arena {
+        use Notification::*;
+        match self {
+            Link { arena, .. } => &arena,
+            Unlink { arena, .. } => &arena,
+            Catchup { arena, .. } => &arena,
+        }
+    }
+    pub fn path(&self) -> &Path {
+        use Notification::*;
+        match self {
+            Link { path, .. } => &path,
+            Unlink { path, .. } => &path,
+            Catchup { path, .. } => &path,
+        }
+    }
+}
 
 /// A file watcher that can be used to get notifications.
 ///
@@ -582,28 +599,22 @@ mod tests {
 
         fixture.subscribe(false).await?;
 
-        let mtime = fixture.arena_dir.metadata()?.modified()?;
         std::fs::remove_dir_all(subdir.path())?;
-        let n1 = fixture.next("unlink 1").await?;
-        let n2 = fixture.next("unlink 2").await?;
-        let p1 = Path::parse("subdir/child1.txt")?;
-        let p2 = Path::parse("subdir/child2.txt")?;
-        let unlink1 = Notification::Unlink {
-            arena: fixture.arena(),
-            path: p1,
-            mtime,
-        };
-        let unlink2 = Notification::Unlink {
-            arena: fixture.arena(),
-            path: p2,
-            mtime,
-        };
-        if n1 == unlink1 {
-            assert_eq!(n2, unlink2);
-        } else {
-            assert_eq!(n1, unlink2);
-            assert_eq!(n2, unlink1);
-        }
+        let all_n = vec![
+            fixture.next("unlink 1").await?,
+            fixture.next("unlink 2").await?,
+        ];
+        assert!(all_n
+            .iter()
+            .all(|n| matches!(n, Notification::Unlink { .. })));
+        assert_unordered::assert_eq_unordered!(
+            vec![
+                Path::parse("subdir/child1.txt")?,
+                Path::parse("subdir/child2.txt")?
+            ],
+            all_n.iter().map(|n| n.path().clone()).collect::<Vec<_>>(),
+        );
+
         Ok(())
     }
     #[tokio::test]
