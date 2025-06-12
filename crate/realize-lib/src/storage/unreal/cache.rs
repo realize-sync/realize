@@ -2,7 +2,7 @@
 //!
 //! See `spec/unreal.md` for details.
 
-use super::UnrealCacheError;
+use super::{UnrealCacheAsync, UnrealCacheError};
 use crate::model::{self, Arena, Path, Peer};
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, Value, WriteTransaction};
 use std::cmp::max;
@@ -161,6 +161,11 @@ impl UnrealCacheBlocking {
         }
         write_txn.commit()?;
         Ok(Self::new(db))
+    }
+
+    /// Transform this cache into an async cache.
+    pub fn into_async(self) -> UnrealCacheAsync {
+        UnrealCacheAsync::new(self)
     }
 
     pub fn link(

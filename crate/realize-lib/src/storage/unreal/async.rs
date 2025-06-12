@@ -11,12 +11,14 @@ pub struct UnrealCacheAsync {
 }
 
 impl UnrealCacheAsync {
+    /// Create a new cache from a blocking one.
     pub fn new(inner: UnrealCacheBlocking) -> Self {
         Self {
             inner: Arc::new(inner),
         }
     }
 
+    /// Create a new cache with the database at the given path.
     pub async fn open(path: &path::Path) -> Result<Self, UnrealCacheError> {
         let path = path.to_path_buf();
         Ok(Self::new(
@@ -24,6 +26,12 @@ impl UnrealCacheAsync {
         ))
     }
 
+    /// Return a reference on the blocking cache.
+    pub fn blocking(&self) -> Arc<UnrealCacheBlocking> {
+        Arc::clone(&self.inner)
+    }
+
+    /// Async version of [BlockingUnrealCache::link]
     pub async fn link(
         &self,
         peer: &Peer,
@@ -40,6 +48,7 @@ impl UnrealCacheAsync {
         Ok(task::spawn_blocking(move || inner.link(&peer, &arena, &path, size, mtime)).await??)
     }
 
+    /// Async version of [BlockingUnrealCache::unlink]
     pub async fn unlink(
         &self,
         peer: &Peer,
