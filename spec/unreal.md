@@ -100,26 +100,26 @@ below.
 ```
 // Access pattern 1:
 
-fn readdir(inode) -> anyhow::Result<Iterator<ReadDirEntry>>;
-fn lookup(inode, name) -> anyhow::Result<Option<ReadDirEntry>>;
+fn readdir(inode) -> anyhow::Result<Iterator<ReadDirEntry>, UnrealCacheError>;
+fn lookup(inode, name) -> anyhow::Result<Option<ReadDirEntry>, UnrealCacheError>;
 
 // Access pattern 2:
 
-fn link(peer, arena, path, size, mtime) -> anyhow::Result<()>;
-fn unlink(peer, arena, path, mtime) -> anyhow::Result<()>;
+fn link(peer, arena, path, size, mtime) -> anyhow::Result<(), UnrealCacheError>;
+fn unlink(peer, arena, path, mtime) -> anyhow::Result<(), UnrealCacheError>;
 
 // Access pattern 3:
 
 /// Mark all files belonging to a specific peer.
-fn mark_peer_files(peer) -> anyhow::Result<()>;
+fn mark_peer_files(peer) -> anyhow::Result<(), UnrealCacheError>;
 
 /// Delete marked files belonging to a specific peer that
 /// have not been refreshed by a link() call since mark_peer_files.
-fn delete_marked_files(peer) -> anyhow::Result<()>;
+fn delete_marked_files(peer) -> anyhow::Result<(), UnrealCacheError>;
 
 // Access pattern 4:
 
-fn delete_arena(arena) ->anyhow::Result<()>;
+fn delete_arena(arena) ->anyhow::Result<(), UnrealCacheError>;
 
 ```
 
@@ -129,12 +129,19 @@ See definition of `ReadDirEntry`, `FileEntry` and `ConsensusDecision`
 in the next section. Initially, the type that is stored is the type
 that is returned, even though they'll likely diverge later.
 
-Note that this proposal lacks a "read" call. This is TBD in a later
-step.
+`UnrealCacheError` is an error implemented with `thiserror` that
+collects the different error variants, so they can be transformed into
+`std::io::Error` when implementing the filesystem. Define custom
+errors when not forwarding another error. Write a From when forwarding
+a redb error.
 
-Note that this proposal uses non-async (blocking) functions, since
-redb is blocking. An async wrapper that runs tokio::spawn_blocking
-might be necessary to call conveniently from the rest of the code.
+NOTE This proposal lacks a "read" call. This is TBD in a later step.
+
+NOTE These are non-async (blocking) functions, since redb is blocking.
+An async wrapper (UnrealCacheAsync) that just runs the methods on
+tokio::spawn_blocking will be necessary to make calling these function
+conveniently from the async parts of the code.
+
 
 #### readdir
 
