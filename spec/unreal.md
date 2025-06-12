@@ -93,9 +93,9 @@ This must be possible but doesn't need to be efficient.
 
 ### Interface
 
-The `UnrealCache` type exposes the following methods, corresponding to
-the access patterns above. Each method is described in its own section
-below.
+The `UnrealCacheBlocking` type exposes the following methods,
+corresponding to the access patterns above. Each method is described
+in its own section below.
 
 ```
 // Access pattern 1:
@@ -123,7 +123,7 @@ fn delete_arena(arena) ->anyhow::Result<(), UnrealCacheError>;
 
 ```
 
-Code location: crate/realize-lib/src/storage/unreal.rs
+Code location: crate/realize-lib/src/storage/unreal/cache.rs
 
 See definition of `ReadDirEntry`, `FileEntry` and `ConsensusDecision`
 in the next section. Initially, the type that is stored is the type
