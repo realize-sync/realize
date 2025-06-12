@@ -10,21 +10,43 @@ Let's start implementing the file cache described in [@/spec/design.md](design.m
 The design describe a system based on blobs, but for now we just have
 file paths; let's get started with that and add blobs in a later step.
 
-1. **DONE** Fetch list of remote files using RealStoreService::list and store it in a [redb](https://github.com/cberner/redb/tree/master) database.
+1. **DONE** in `UnrealCacheBlocking` and `UnrealCacheAsync`
+
+   Define a database to store file list a [redb](https://github.com/cberner/redb/tree/master) database.
    - The database stores file availability in a table:
       key: (arena, path), arena as model::Arena, path as model::Path
       value: a struct containing, for each peer for which data is avalible: presence (available or deleted), file size (if available), mtime
 
-   1.1 fill the details section of [@/spec/unreal.md](unreal.md) with a good description of the database
-   1.2 implement the database, keeping it as a goal to expose it through `nfsserve` (next step)
-
-2. Make the file list available through [nfsserve](https://github.com/xetdata/nfsserve). Don't bother serving file content just yet; reading file data should just fail, but listing files should work.
+   1.1 **DONE** fill the details section of [@/spec/unreal.md](unreal.md) with a good description of the database
+   1.2 **DONE** implement the database, keeping it as a goal to expose it through `nfsserve` (next step)
+   
+   
+2. Define a task that keeps the file list up-to-date for a specific peek.
+ 
+   Algorithm:
+    1. connect to a peer using forward_peer_history
+    2. if it fails, wait according to policy
+       `ExponentialBackoff::from_millis(500).max_delay(Duration::from_secs(5 *
+       60))` and go back to 1. If it suceeds, move on to 2.
+    3. listens to `Notification::Link` and `Notification::Unlink` and apply them to the database
+    4. when `forward_peer_history` is disconnected (the join handle fails), go back to point 1
+    
+   This algorithm runs forever or until it is shut down. To shutdown,
+   keep a `shutdown_tx: broadcast::Sender<()>`. See the way `Server`
+   is implemented in
+   [@crate/realize-lib/src/network.rs](../crate/realize-lib/src/network.rs)
+   for an example of such a task that has a shutdown method.
+   
+   2.1 Design, implement and unit test the proposed task into
+   /crate/realize-lib/src/logic/cache_updater.rs
+    
+3. Make the file list available through [nfsserve](https://github.com/xetdata/nfsserve). Don't bother serving file content just yet; reading file data should just fail, but listing files should work.
 
     - use the uid and gid of the daemon process for the files and directories
     - for files, use mode u=rw,g=rw,o=r
     - for directories, use mode u=rwx,g=rwx,o=rx
 
-  The code should go into the library crate
+  The code for exposing the cache should go into the library crate
   /crate/realize-fs/src/storage/fs.rs and should be tested using the
   unit test /create/realize-fs/tests/nfsserve_test.rs
 
@@ -32,20 +54,6 @@ file paths; let's get started with that and add blobs in a later step.
   2.2 write the integration in /crate/realize-fs/src/storage/fs.rs and unit-test it thoroughly
   2.3 write an integration test in /create/realize-fs/tests/nfsserve_test.rs that creates a NFS service
       and connects to it using [nfs3_client 0.4](https://crates.io/crates/nfs3_client/0.4.1)
-
-3. Track changes made remotely, so the filesystem view is up-to-date (Using HistoryService). Keep a connection to all listening peers, as defined in the peer list. Reconnect as necessary.
-    Algorithm:
-
-     For all peers for which an address is known in PeerConfig,
-
-     1. connect to the peer using a client from [@/crate/realize-lib/src/network/rpc/realize/client.rs](../crate/realize-lib/src/network/rpc/realize/client.rs)
-     2. once connected, as reported by `ClientOptions::connection_events` connect to same peer using `forward_peer_history` defined in [@/crate/realize-lib/src/network/rpc/history/server.rs](../crate/realize-lib/src/network/rpc/history/server.rs)
-     3. once `forward_peer_history` has returned, fetch the file list using `RealStoreService::list`, using a client from [@/crate/realize-lib/src/network/rpc/realize/client.rs](../crate/realize-lib/src/network/rpc/realize/client.rs) and update the database
-     4. whenever a file change notification is received, update the database (note that this can happen before the files list has been read. Use mtime to resolve conflicts)
-     5. when disconnected, as reported by `ClientOptions::connection_events`, let `forward_peer_history` shut down and go back to point 2, waiting for a reconnection
-
-  3.1 fill the details section of [@/spec/unreal.md](unreal.md) with a good description of the algorithm and how it all fits together
-  3.2 implement the algorithm
 
 4. Serve file content through `nfsserve` by making a request for a
    range of file content using [RealStoreService] when connected. Fail
@@ -58,6 +66,44 @@ file paths; let's get started with that and add blobs in a later step.
 
   5.1 fill the details section of [@/spec/unreal.md](unreal.md) with a description of how this would go
   5.2 implement
+
+## Catch up history on (re)connection {#reconnecthistory}
+
+Let's update `History`, defined in
+[@/crate/realize-lib/src/storage/real/history.rs](../crate/realize-lib/src/storage/real/history.rs)
+to take into account the latest plans, [detailed in the section
+#unreal of this file](#unreal)
+
+1. `History` should not attempt to allow multiple subscribers for a
+  given arena. Spawn a task in `History::subscribe` instead of
+  `History::new` that tracks the given arena and sends to the given
+  channel and that's it.
+  
+  1.1 implement the change
+  1.2 update the tests and make sure they all pass
+  
+2. Have `History` optionally send `Notification::Link` for existing
+   files when going through the file list for the first time. These notifications
+   have a 'catchup' flag set.
+  
+  2.1 implement the change
+  2.2 update the unit tests and make sure they all pass; existing tests disable
+  catchup so they don't get unexpected notifications.
+  2.3 add a unit test to make sure that existing files are reported
+  
+4. Cover the case where a file is deleted while `History` is going
+   through the file list.
+   
+   There's a race condition in this case, as catchup link and unlink
+   notification can be received out of order. To avoid that, buffer
+   notifications while going through the files for the first time, then
+   send them all at once. 
+  
+   4.1 implement the change 
+   4.2 add a unit test that adds and removes files just after creating
+   the subscriber, without waiting for it to be ready (That is,
+   without waiting for `History::subscribe().await` to return; spawn
+   it or use a join.)
 
 ## File hash as as Merkle tree {#merkle}
 

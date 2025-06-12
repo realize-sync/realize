@@ -93,9 +93,9 @@ This must be possible but doesn't need to be efficient.
 
 ### Interface
 
-The `UnrealCacheBlocking` type exposes the following methods,
-corresponding to the access patterns above. Each method is described
-in its own section below.
+The `UnrealCacheBlocking` type exposes the following methods, corresponding to
+the access patterns above. Each method is described in its own section
+below.
 
 ```
 // Access pattern 1:
@@ -123,11 +123,9 @@ fn delete_arena(arena) ->anyhow::Result<(), UnrealCacheError>;
 
 ```
 
-Code location: crate/realize-lib/src/storage/unreal/cache.rs
-
-See definition of `ReadDirEntry`, `FileEntry` and `ConsensusDecision`
-in the next section. Initially, the type that is stored is the type
-that is returned, even though they'll likely diverge later.
+See definition of `ReadDirEntry`, and `FileEntry` in the next section.
+Initially, the type that is stored is the type that is returned, even
+though they'll likely diverge later.
 
 `UnrealCacheError` is an error implemented with `thiserror` that
 collects the different error variants, so they can be transformed into
@@ -135,13 +133,19 @@ collects the different error variants, so they can be transformed into
 errors when not forwarding another error. Write a From when forwarding
 a redb error.
 
-NOTE This proposal lacks a "read" call. This is TBD in a later step.
-
-NOTE These are non-async (blocking) functions, since redb is blocking.
-An async wrapper (UnrealCacheAsync) that just runs the methods on
+These are non-async (blocking) functions, since redb is blocking. An
+async wrapper (UnrealCacheAsync) that just runs the methods on
 tokio::spawn_blocking will be necessary to make calling these function
 conveniently from the async parts of the code.
 
+
+NOTE This proposal lacks a "read" call. This is TBD in a later step.
+
+
+Code location:
+ - crate/realize-lib/src/storage/unreal/cache.rs
+ - crate/realize-lib/src/storage/unreal/error.rs
+ - crate/realize-lib/src/storage/unreal/async.rs
 
 #### readdir
 
