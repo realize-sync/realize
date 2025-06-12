@@ -483,8 +483,8 @@ impl From<redb::CommitError> for UnrealCacheError {
 mod tests {
     use super::*;
     use crate::model::{Arena, Path, Peer};
+    use assert_fs::TempDir;
     use std::time::{Duration, SystemTime};
-    use tempfile::tempdir;
 
     fn test_peer() -> Peer {
         Peer::from("test_peer")
@@ -494,13 +494,29 @@ mod tests {
         Arena::from("test_arena")
     }
 
+    struct Fixture {
+        cache: UnrealCache,
+        _tempdir: TempDir,
+    }
+    impl Fixture {
+        fn setup() -> anyhow::Result<Fixture> {
+            let _ = env_logger::try_init();
+            let tempdir = TempDir::new()?;
+            let path = tempdir.path().join("unreal.db");
+            let cache = UnrealCache::open(&path)?;
+
+            Ok(Self {
+                cache,
+                _tempdir: tempdir,
+            })
+        }
+    }
+
     #[test]
     fn open_creates_tables() -> anyhow::Result<()> {
-        let _ = env_logger::try_init();
+        let fixture = Fixture::setup()?;
+        let cache = &fixture.cache;
 
-        let dir = tempdir()?;
-        let path = dir.path().join("unreal.db");
-        let cache = UnrealCache::open(&path)?;
         let txn = cache.db.begin_read()?;
         assert!(txn.open_table(DIRECTORY_TABLE).is_ok());
         assert!(txn.open_table(FILE_TABLE).is_ok());
@@ -509,11 +525,8 @@ mod tests {
 
     #[test]
     fn link_creates_directories() -> anyhow::Result<()> {
-        let _ = env_logger::try_init();
-
-        let dir = tempdir()?;
-        let path = dir.path().join("unreal.db");
-        let cache = UnrealCache::open(&path)?;
+        let fixture = Fixture::setup()?;
+        let cache = &fixture.cache;
         let peer = test_peer();
         let arena = test_arena();
         let file_path = Path::parse("a/b/c.txt")?;
@@ -534,11 +547,8 @@ mod tests {
 
     #[test]
     fn link_updates_existing_file() -> anyhow::Result<()> {
-        let _ = env_logger::try_init();
-
-        let dir = tempdir()?;
-        let path = dir.path().join("unreal.db");
-        let cache = UnrealCache::open(&path)?;
+        let fixture = Fixture::setup()?;
+        let cache = &fixture.cache;
         let peer = test_peer();
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
@@ -565,11 +575,8 @@ mod tests {
 
     #[test]
     fn link_ignores_older_mtime() -> anyhow::Result<()> {
-        let _ = env_logger::try_init();
-
-        let dir = tempdir()?;
-        let path = dir.path().join("unreal.db");
-        let cache = UnrealCache::open(&path)?;
+        let fixture = Fixture::setup()?;
+        let cache = &fixture.cache;
         let peer = test_peer();
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
@@ -596,11 +603,8 @@ mod tests {
 
     #[test]
     fn unlink_removes_file() -> anyhow::Result<()> {
-        let _ = env_logger::try_init();
-
-        let dir = tempdir()?;
-        let path = dir.path().join("unreal.db");
-        let cache = UnrealCache::open(&path)?;
+        let fixture = Fixture::setup()?;
+        let cache = &fixture.cache;
         let peer = test_peer();
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
@@ -618,11 +622,8 @@ mod tests {
 
     #[test]
     fn unlink_ignores_older_mtime() -> anyhow::Result<()> {
-        let _ = env_logger::try_init();
-
-        let dir = tempdir()?;
-        let path = dir.path().join("unreal.db");
-        let cache = UnrealCache::open(&path)?;
+        let fixture = Fixture::setup()?;
+        let cache = &fixture.cache;
         let peer = test_peer();
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
@@ -640,11 +641,8 @@ mod tests {
 
     #[test]
     fn lookup_finds_entry() -> anyhow::Result<()> {
-        let _ = env_logger::try_init();
-
-        let dir = tempdir()?;
-        let path = dir.path().join("unreal.db");
-        let cache = UnrealCache::open(&path)?;
+        let fixture = Fixture::setup()?;
+        let cache = &fixture.cache;
         let peer = test_peer();
         let arena = test_arena();
         let file_path = Path::parse("a/file.txt")?;
@@ -669,11 +667,8 @@ mod tests {
 
     #[test]
     fn lookup_returns_notfound_for_missing_entry() -> anyhow::Result<()> {
-        let _ = env_logger::try_init();
-
-        let dir = tempdir()?;
-        let path = dir.path().join("unreal.db");
-        let cache = UnrealCache::open(&path)?;
+        let fixture = Fixture::setup()?;
+        let cache = &fixture.cache;
 
         assert!(matches!(
             cache.lookup(1, "nonexistent"),
@@ -685,11 +680,8 @@ mod tests {
 
     #[test]
     fn readdir_returns_all_entries() -> anyhow::Result<()> {
-        let _ = env_logger::try_init();
-
-        let dir = tempdir()?;
-        let path = dir.path().join("unreal.db");
-        let cache = UnrealCache::open(&path)?;
+        let fixture = Fixture::setup()?;
+        let cache = &fixture.cache;
         let peer = test_peer();
         let arena = test_arena();
         let mtime = SystemTime::now();
@@ -729,11 +721,8 @@ mod tests {
 
     #[test]
     fn get_file_metadata_resolves_conflict() -> anyhow::Result<()> {
-        let _ = env_logger::try_init();
-
-        let dir = tempdir()?;
-        let path = dir.path().join("unreal.db");
-        let cache = UnrealCache::open(&path)?;
+        let fixture = Fixture::setup()?;
+        let cache = &fixture.cache;
 
         let peer1 = Peer::from("peer1");
         let peer2 = Peer::from("peer2");
