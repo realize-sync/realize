@@ -31,7 +31,6 @@ pub enum PathType {
 #[derive(Clone)]
 pub struct LocalStorage {
     map: Arc<HashMap<Arena, PathBuf>>,
-    history: history::History,
 }
 
 impl LocalStorage {
@@ -51,8 +50,6 @@ impl LocalStorage {
     {
         Self {
             map: Arc::new(arenas.into_iter().collect()),
-            // TODO: handle this case
-            history: history::History::new().expect("inotify required"),
         }
     }
 
@@ -77,7 +74,7 @@ impl LocalStorage {
         tx: mpsc::Sender<Notification>,
     ) -> anyhow::Result<bool> {
         if let Some(resolver) = self.path_resolver(&arena, StorageAccess::Read) {
-            self.history.subscribe(&arena, resolver, tx).await?;
+            history::subscribe(&arena, resolver, tx).await?;
 
             Ok(true)
         } else {

@@ -74,7 +74,7 @@ Let's update `History`, defined in
 to take into account the latest plans, [detailed in the section
 #unreal of this file](#unreal)
 
-1. `History` should not attempt to allow multiple subscribers for a
+1. **DONE* `History` should not attempt to allow multiple subscribers for a
   given arena. Spawn a task in `History::subscribe` instead of
   `History::new` that tracks the given arena and sends to the given
   channel and that's it.
