@@ -6,6 +6,7 @@ use crate::model::{Arena, Path, Peer};
 
 use super::{UnrealCacheBlocking, UnrealCacheError};
 
+#[derive(Clone)]
 pub struct UnrealCacheAsync {
     inner: Arc<UnrealCacheBlocking>,
 }
