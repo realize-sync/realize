@@ -55,7 +55,7 @@ where
     }
     drop(tx);
 
-    client.ready(context::current(), watched_arenas).await?;
+    client.available(context::current(), watched_arenas).await?;
 
     // While there are notifications
     loop {

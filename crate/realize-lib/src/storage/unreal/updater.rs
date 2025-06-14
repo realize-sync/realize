@@ -12,13 +12,14 @@ pub async fn keep_cache_updated(
 ) {
     while let Some((peer, notification)) = rx.recv().await {
         if let Err(err) = match &notification {
-            // TODO: Connected(arena) => mark all, Ready(arena) => delete`all marked
+            Notification::CatchingUp { .. } => Ok(()),
             Notification::Catchup {
                 arena,
                 path,
                 size,
                 mtime,
             } => cache.link(&peer, arena, path, *size, *mtime).await,
+            Notification::Ready { .. } => Ok(()),
             Notification::Link {
                 arena,
                 path,
@@ -30,7 +31,7 @@ pub async fn keep_cache_updated(
             }
         } {
             log::warn!(
-                "Error updating {}/{} in cache: {}",
+                "Error updating {}/{:?} in cache: {}",
                 notification.arena(),
                 notification.path(),
                 err

@@ -17,19 +17,9 @@ pub trait HistoryService {
     /// Caller will ignore arenas for which it has no local data.
     async fn arenas() -> Vec<Arena>;
 
-    /// Called before sending any notifications, to let the history
-    /// service know any filesystem change will be reported from then
-    /// on.
-    ///
-    /// Only the first call matters; further calls are ignored.
-    ///
-    /// The arena vector is the subset of arenas that are watched. It
-    /// might be empty.
-    ///
-    /// Note that notifications might be sent before this is called.
-    /// [Notification::Catchup] are only ever sent before ready is
-    /// called.
-    async fn ready(arenas: Vec<Arena>);
+    /// Reports the subset of arenas for which notifications
+    /// will be sent.
+    async fn available(arenas: Vec<Arena>);
 
     /// Receive a batch of history notifications.
     async fn notify(batch: Vec<Notification>);

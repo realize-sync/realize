@@ -26,9 +26,8 @@ use super::{HistoryService, HistoryServiceRequest, HistoryServiceResponse};
 /// Connect to the peer, then ask it to send history for the given
 /// arenas.
 ///
-/// When this function returns successfully, the connection to the
-/// peer has succeeded and the peer has declared itself ready to
-/// report any file changes. This might take a while.
+/// Returns the arenas the peer has to send notifications about, which
+/// might be empty.
 ///
 /// After a successful connection, the forwarder runs until either the
 /// channel is closed or the connection is lost. Check the
@@ -45,7 +44,7 @@ where
 {
     let transport = networking.connect(&peer, super::TAG, None).await?;
 
-    let (ready_tx, ready_rx) = oneshot::channel();
+    let (available_tx, available_rx) = oneshot::channel();
     let peer = peer.clone();
     let arenas = arenas.into_iter().collect();
     let handle = AbortOnDrop::new(tokio::spawn(run_forwarder(
@@ -53,15 +52,14 @@ where
         arenas,
         BaseChannel::with_defaults(transport),
         tx,
-        Some(ready_tx),
+        Some(available_tx),
     )));
 
-    // Wait for the peer to declare itself ready before returning.
-    // This might take a while.
+    // Wait for the peer to report available arenas before returning.
     //
     // If the context deadline is reached, abort the forwarder and
     // return a deadline error.
-    match timeout(ctx.deadline.duration_since(Instant::now()), ready_rx).await? {
+    match timeout(ctx.deadline.duration_since(Instant::now()), available_rx).await? {
         Err(oneshot::error::RecvError { .. }) => {
             // The forwarder must have already died if the oneshot was
             // killed before anything was sent. Attempt to recover the original error.
@@ -134,7 +132,7 @@ impl HistoryService for HistoryServer {
         self.arenas
     }
 
-    async fn ready(self, _context: Context, arenas: Vec<Arena>) -> () {
+    async fn available(self, _context: Context, arenas: Vec<Arena>) -> () {
         log::debug!("Arenas watched by {}: {:?}", self.peer, &arenas);
         if let Some(tx) = self.watched.lock().await.take() {
             let _ = tx.send(arenas);
@@ -239,17 +237,34 @@ mod tests {
 
         assert_eq!(vec![fixture.arena.clone()], watched);
 
+        let (peer, notif) = timeout(Duration::from_secs(5), rx.recv()).await?.unwrap();
+        assert_eq!(fixture.peer, peer);
+        assert_eq!(
+            Notification::CatchingUp {
+                arena: fixture.arena.clone(),
+            },
+            notif
+        );
+        let (peer, notif) = timeout(Duration::from_secs(5), rx.recv()).await?.unwrap();
+        assert_eq!(fixture.peer, peer);
+        assert_eq!(
+            Notification::Ready {
+                arena: fixture.arena.clone(),
+            },
+            notif
+        );
+
         // The forwarder is ready; a new file will generate a notification.
 
         let foobar = fixture.tempdir.child("foobar.txt");
         foobar.write_str("test")?;
         let foobar_mtime = foobar.metadata()?.modified()?;
 
-        let (peer, notif) = timeout(Duration::from_secs(1), rx.recv()).await?.unwrap();
+        let (peer, notif) = timeout(Duration::from_secs(5), rx.recv()).await?.unwrap();
         assert_eq!(fixture.peer, peer);
         assert_eq!(
             Notification::Link {
-                arena: fixture.arena,
+                arena: fixture.arena.clone(),
                 path: model::Path::parse("foobar.txt")?,
                 size: 4,
                 mtime: foobar_mtime,
@@ -287,8 +302,17 @@ mod tests {
         let (peer, notif) = timeout(Duration::from_secs(1), rx.recv()).await?.unwrap();
         assert_eq!(fixture.peer, peer);
         assert_eq!(
+            Notification::CatchingUp {
+                arena: fixture.arena.clone(),
+            },
+            notif
+        );
+
+        let (peer, notif) = timeout(Duration::from_secs(1), rx.recv()).await?.unwrap();
+        assert_eq!(fixture.peer, peer);
+        assert_eq!(
             Notification::Catchup {
-                arena: fixture.arena,
+                arena: fixture.arena.clone(),
                 path: model::Path::parse("foobar.txt")?,
                 size: 4,
                 mtime: foobar_mtime,

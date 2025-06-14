@@ -3,7 +3,7 @@ use std::{collections::HashMap, ffi::OsString, fs::Metadata, path::PathBuf, time
 use futures::StreamExt as _;
 use inotify::{Event, EventMask, Inotify, WatchDescriptor, WatchMask, Watches};
 use tokio::fs;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use walkdir::WalkDir;
 
 use crate::{
@@ -33,6 +33,13 @@ pub enum Notification {
         mtime: SystemTime,
     },
 
+    /// Report that the area needs catching up. After that
+    /// notification, all existing files are reported as
+    /// [Notification::Catchup].
+    ///
+    /// Catchup ends with [Notification::Ready]
+    CatchingUp { arena: Arena },
+
     /// Report an already existing file at the time notifications were
     /// setup. Catchup notifications only ever sent at the beginning,
     /// before History reports itself ready.
@@ -42,28 +49,37 @@ pub enum Notification {
         size: u64,
         mtime: SystemTime,
     },
+
+    /// Report that the arena is done catching up. After that
+    /// [Notification::Link] and [Notification::Unlink] are sent and
+    /// no [Notification::Catcheup].
+    Ready { arena: Arena },
 }
 
 impl Notification {
     pub fn arena(&self) -> &Arena {
         use Notification::*;
         match self {
+            CatchingUp { arena, .. } => &arena,
+            Ready { arena, .. } => &arena,
             Link { arena, .. } => &arena,
             Unlink { arena, .. } => &arena,
             Catchup { arena, .. } => &arena,
         }
     }
-    pub fn path(&self) -> &Path {
+    pub fn path(&self) -> Option<&Path> {
         use Notification::*;
         match self {
-            Link { path, .. } => &path,
-            Unlink { path, .. } => &path,
-            Catchup { path, .. } => &path,
+            CatchingUp { .. } => None,
+            Ready { .. } => None,
+            Link { path, .. } => Some(&path),
+            Unlink { path, .. } => Some(&path),
+            Catchup { path, .. } => Some(&path),
         }
     }
 }
 
-/// A file watcher that can be used to get notifications.
+/// Spawn a file watcher task that can be used to get notifications.
 ///
 /// The watcher can safely be cloned as necessary.
 ///
@@ -71,29 +87,22 @@ impl Notification {
 ///
 /// Dropping the receiver drops the subscription.
 ///
-/// All required inotify watches are guaranteed to have been
-/// created when this command ends so any changes after that will
-/// be caught. Note that this might take some time as creating
-/// watches requires going through the whole arena, so use a join
-/// if you need to subscribe to multiple arenas at the same time.
+/// To wait for inotify watches to have been created, wait
+/// for [Notification::Ready] before moving on.
 pub(crate) async fn subscribe(
     arena: &Arena,
     path_resolver: PathResolver,
     tx: mpsc::Sender<Notification>,
     catchup: bool,
 ) -> anyhow::Result<()> {
-    let (ready_tx, ready_rx) = oneshot::channel();
     let inotify = Inotify::init()?;
     let arena = arena.clone();
 
     tokio::spawn(async move {
-        if let Err(err) = run_loop(inotify, arena, path_resolver, tx, ready_tx, catchup).await {
+        if let Err(err) = run_loop(inotify, arena, path_resolver, tx, catchup).await {
             log::warn!("history loop was shut down: {}", err)
         }
     });
-
-    // Wait until all watches have been created
-    ready_rx.await?;
 
     Ok(())
 }
@@ -104,12 +113,9 @@ async fn run_loop(
     arena: Arena,
     path_resolver: PathResolver,
     tx: mpsc::Sender<Notification>,
-    ready_tx: oneshot::Sender<()>,
     catchup: bool,
 ) -> anyhow::Result<()> {
     let (new_dirs_tx, mut new_dirs_rx) = mpsc::channel(10);
-    let mut ready_tx = Some(ready_tx);
-
     let mut collector = Collector {
         watches: inotify.watches(),
         path_resolver,
@@ -117,11 +123,15 @@ async fn run_loop(
         arena,
         wd: HashMap::new(),
         new_dirs_tx,
+        ready: false,
     };
 
     let mut buffer = [0; 1024];
     let mut inotify = Box::pin(inotify.into_event_stream(&mut buffer)?);
 
+    if catchup {
+        collector.send_catching_up().await?;
+    }
     let mode = if catchup {
         WalkDirMode::InitialWatchDirsAndReportFiles
     } else {
@@ -136,9 +146,9 @@ async fn run_loop(
     loop {
         tokio::select! {
             Some(result) = new_dirs_rx.recv() => {
-                handle_walk_dir_result(result, &mut collector, &mut ready_tx).await?;
+                handle_walk_dir_result(result, &mut collector).await?;
             },
-            ev = inotify.next(), if ready_tx.is_none() => {
+            ev = inotify.next(), if collector.ready => {
                 match ev {
                     None => { break; }
                     Some(Err(err)) =>{
@@ -162,12 +172,12 @@ async fn run_loop(
 async fn handle_walk_dir_result(
     result: WalkDirResult,
     collector: &mut Collector,
-    ready_tx: &mut Option<oneshot::Sender<()>>,
 ) -> anyhow::Result<()> {
     match result {
         WalkDirResult::Complete => {
-            if let Some(tx) = ready_tx.take() {
-                let _ = tx.send(());
+            if !collector.ready {
+                collector.ready = true;
+                collector.send_ready().await?;
             }
         }
         WalkDirResult::AddDir(path) => {
@@ -196,6 +206,10 @@ struct Collector {
 
     /// Channel used to get back results from spawn_walk_dir.
     new_dirs_tx: mpsc::Sender<WalkDirResult>,
+
+    /// Collector is ready after having gone through the
+    /// whole hierarchy, adding watches to directories.
+    ready: bool,
 }
 
 impl Collector {
@@ -260,7 +274,25 @@ impl Collector {
         Ok(())
     }
 
-    /// Send Unlink notification.
+    async fn send_catching_up(&mut self) -> anyhow::Result<()> {
+        self.send_notification(Notification::CatchingUp {
+            arena: self.arena.clone(),
+        })
+        .await;
+
+        Ok(())
+    }
+
+    async fn send_ready(&mut self) -> anyhow::Result<()> {
+        self.send_notification(Notification::Ready {
+            arena: self.arena.clone(),
+        })
+        .await;
+
+        Ok(())
+    }
+
+    /// Report a deleted file.
     async fn send_unlink(&mut self, full_path: PathBuf) -> anyhow::Result<()> {
         if let Some((PathType::Final, resolved)) = self.path_resolver.reverse(&full_path) {
             if let Some(mtime) = find_mtime_for_unlink(&self.path_resolver, &resolved).await? {
@@ -276,7 +308,7 @@ impl Collector {
         Ok(())
     }
 
-    /// Send Link notification.
+    /// Report a file that was just created or a catchup..
     async fn send_link(&mut self, path: PathBuf, metadata: Metadata, catchup: bool) {
         if !metadata.is_file() {
             return;
@@ -498,7 +530,7 @@ mod tests {
         }
 
         async fn next(&mut self, msg: &'static str) -> anyhow::Result<Notification> {
-            timeout(Duration::from_secs(1), self.notifications_rx.recv())
+            timeout(Duration::from_secs(5), self.notifications_rx.recv())
                 .await
                 .context(msg)?
                 .ok_or(anyhow::anyhow!("channel closed before {}", msg))
@@ -509,6 +541,12 @@ mod tests {
     async fn create_file() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
         fixture.subscribe(false).await?;
+        assert_eq!(
+            Notification::Ready {
+                arena: fixture.arena(),
+            },
+            fixture.next("ready").await?,
+        );
 
         let child = fixture.arena_dir.child("child.txt");
         child.write_str("content")?;
@@ -529,6 +567,12 @@ mod tests {
     async fn create_file_in_subdir() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
         fixture.subscribe(false).await?;
+        assert_eq!(
+            Notification::Ready {
+                arena: fixture.arena(),
+            },
+            fixture.next("ready").await?,
+        );
 
         let subdirs = fixture.arena_dir.child("subdir1/subdir2");
         subdirs.create_dir_all()?;
@@ -554,6 +598,12 @@ mod tests {
         child.write_str("content")?;
 
         fixture.subscribe(false).await?;
+        assert_eq!(
+            Notification::Ready {
+                arena: fixture.arena(),
+            },
+            fixture.next("ready").await?,
+        );
 
         let mtime = fixture.arena_dir.metadata()?.modified()?;
         std::fs::remove_file(child.path())?;
@@ -574,6 +624,12 @@ mod tests {
         child.write_str("content")?;
 
         fixture.subscribe(false).await?;
+        assert_eq!(
+            Notification::Ready {
+                arena: fixture.arena(),
+            },
+            fixture.next("ready").await?,
+        );
 
         child.write_str("new content")?;
         assert_eq!(
@@ -598,6 +654,12 @@ mod tests {
         child2.write_str("c2")?;
 
         fixture.subscribe(false).await?;
+        assert_eq!(
+            Notification::Ready {
+                arena: fixture.arena(),
+            },
+            fixture.next("ready").await?,
+        );
 
         std::fs::remove_dir_all(subdir.path())?;
         let all_n = vec![
@@ -609,10 +671,13 @@ mod tests {
             .all(|n| matches!(n, Notification::Unlink { .. })));
         assert_unordered::assert_eq_unordered!(
             vec![
-                Path::parse("subdir/child1.txt")?,
-                Path::parse("subdir/child2.txt")?
+                Some(Path::parse("subdir/child1.txt")?),
+                Some(Path::parse("subdir/child2.txt")?)
             ],
-            all_n.iter().map(|n| n.path().clone()).collect::<Vec<_>>(),
+            all_n
+                .iter()
+                .map(|n| n.path().map(|p| p.clone()))
+                .collect::<Vec<_>>(),
         );
 
         Ok(())
@@ -624,6 +689,12 @@ mod tests {
         child.write_str("content")?;
 
         fixture.subscribe(false).await?;
+        assert_eq!(
+            Notification::Ready {
+                arena: fixture.arena(),
+            },
+            fixture.next("ready").await?,
+        );
 
         let dest = fixture._tempdir.child("dest.txt");
         std::fs::rename(child.path(), dest.path())?;
@@ -645,6 +716,12 @@ mod tests {
         source.write_str("content")?;
 
         fixture.subscribe(false).await?;
+        assert_eq!(
+            Notification::Ready {
+                arena: fixture.arena(),
+            },
+            fixture.next("ready").await?,
+        );
 
         let dest = fixture.arena_dir.child("dest.txt");
         std::fs::rename(source.path(), dest.path())?;
@@ -666,6 +743,12 @@ mod tests {
         source.write_str("content")?;
 
         fixture.subscribe(false).await?;
+        assert_eq!(
+            Notification::Ready {
+                arena: fixture.arena(),
+            },
+            fixture.next("ready").await?,
+        );
 
         let dest = fixture.arena_dir.child("dest.txt");
         std::fs::rename(source.path(), dest.path())?;
@@ -695,6 +778,12 @@ mod tests {
     async fn create_then_delete_file() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
         fixture.subscribe(false).await?;
+        assert_eq!(
+            Notification::Ready {
+                arena: fixture.arena(),
+            },
+            fixture.next("ready").await?,
+        );
 
         let child = fixture.arena_dir.child("child.txt");
         child.write_str("content")?;
@@ -722,35 +811,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catchup_reports_existing_files() -> anyhow::Result<()> {
+    async fn catchup_reports_existing_file() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
         let child = fixture.arena_dir.child("child.txt");
         child.write_str("content")?;
-        let child_in_subdir = fixture.arena_dir.child("subdir/child.txt");
-        std::fs::create_dir_all(child_in_subdir.parent().unwrap())?;
-        child_in_subdir.write_str("content2")?;
 
         fixture.subscribe(true).await?;
 
-        let n1 = fixture.next("catchup 1").await?;
-        let n2 = fixture.next("catchup 2").await?;
+        let mut notifications = vec![];
+        let mut ready = false;
+        while !ready {
+            let n = fixture.next("notifications").await?;
+            ready = matches!(n, Notification::Ready { .. });
+            notifications.push(n);
+        }
 
-        assert_unordered::assert_eq_unordered!(
+        assert_eq!(
             vec![
+                Notification::CatchingUp {
+                    arena: fixture.arena()
+                },
                 Notification::Catchup {
                     arena: fixture.arena(),
                     path: Path::parse("child.txt")?,
                     size: 7,
                     mtime: child.metadata()?.modified()?,
                 },
+                Notification::Ready {
+                    arena: fixture.arena()
+                },
+            ],
+            notifications,
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catchup_reports_existing_files_in_dirs() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        fixture.arena_dir.child("a/b").create_dir_all()?;
+        let child1 = fixture.arena_dir.child("a/child1.txt");
+        child1.write_str("1")?;
+        let child2 = fixture.arena_dir.child("a/b/child2.txt");
+        child2.write_str("2")?;
+
+        fixture.subscribe(true).await?;
+
+        let mut notifications = vec![];
+        let mut ready = false;
+        while !ready {
+            let n = fixture.next("notifications").await?;
+            ready = matches!(n, Notification::Ready { .. });
+            if matches!(n, Notification::Catchup { .. }) {
+                notifications.push(n);
+            }
+        }
+
+        assert_unordered::assert_eq_unordered!(
+            vec![
                 Notification::Catchup {
                     arena: fixture.arena(),
-                    path: Path::parse("subdir/child.txt")?,
-                    size: 8,
-                    mtime: child_in_subdir.metadata()?.modified()?,
-                }
+                    path: Path::parse("a/child1.txt")?,
+                    size: 1,
+                    mtime: child1.metadata()?.modified()?,
+                },
+                Notification::Catchup {
+                    arena: fixture.arena(),
+                    path: Path::parse("a/b/child2.txt")?,
+                    size: 1,
+                    mtime: child2.metadata()?.modified()?,
+                },
             ],
-            vec![n1, n2]
+            notifications,
         );
 
         Ok(())
@@ -779,64 +912,85 @@ mod tests {
         res1?;
         res2?;
 
-        let mut collected = Vec::new();
-        while let Ok(Some(notif)) =
-            timeout(Duration::from_millis(100), fixture.notifications_rx.recv()).await
-        {
-            collected.push(notif);
-        }
-
-        // Whatever happens, he catchup must come first, then the
-        // notifications. They must not be mixed together.
-        let first_non_catchup = collected
-            .iter()
-            .enumerate()
-            .find(|(_, n)| !matches!(n, Notification::Catchup { .. }))
-            .unwrap()
-            .0;
-        let last_catchup = collected
-            .iter()
-            .enumerate()
-            .filter(|(_, n)| matches!(n, Notification::Catchup { .. }))
-            .last()
-            .unwrap()
-            .0;
-        assert_eq!(last_catchup + 1, first_non_catchup);
-
-        // Processing the notifications, we should end up with the
-        // final result.
+        // Processing the notifications, we should end up with goal.
+        let goal: Option<Vec<(String, u64)>> = Some(vec![
+            ("four.txt".to_string(), 1),
+            ("one.txt".to_string(), 4),
+            ("three.txt".to_string(), 1),
+            ("two.txt".to_string(), 1),
+            // sorted
+        ]);
         let mut files: HashMap<Path, (SystemTime, u64)> = HashMap::new();
-        for notif in collected {
-            match notif {
+        fn process(
+            files: &mut HashMap<Path, (SystemTime, u64)>,
+            n: Notification,
+        ) -> Vec<(String, u64)> {
+            match n {
                 Notification::Catchup {
                     path, size, mtime, ..
                 }
                 | Notification::Link {
                     path, size, mtime, ..
                 } => {
-                    if files.get(&path).is_none() || files.get(&path).unwrap().0 < mtime {
+                    if files.get(&path).is_none() || files.get(&path).unwrap().0 <= mtime {
                         files.insert(path, (mtime, size));
                     }
                 }
                 Notification::Unlink { path, mtime, .. } => {
-                    if files.get(&path).is_some() && files.get(&path).unwrap().0 < mtime {
+                    if files.get(&path).is_some() && files.get(&path).unwrap().0 <= mtime {
                         files.remove(&path);
                     }
                 }
+                Notification::CatchingUp { .. } | Notification::Ready { .. } => {
+                    panic!("Unexpected: {n:?}");
+                }
+            }
+
+            // Build a summary to compare to goal
+            let mut got = files
+                .iter()
+                .map(|(p, (_, size))| (p.to_string(), *size))
+                .collect::<Vec<_>>();
+            got.sort();
+
+            got
+        }
+
+        // We process notifications until the goal is reached
+        // (goal==got) or reading notifications times out.
+
+        // Processing also checks that notifications come in the right order.
+
+        let mut matching = false;
+        let mut got = None;
+        assert_eq!(
+            Notification::CatchingUp {
+                arena: fixture.arena().clone()
+            },
+            fixture.next("catching_up").await?
+        );
+        loop {
+            let n = fixture.next("catchup").await?;
+            if matches!(n, Notification::Ready { .. }) {
+                break;
+            }
+            assert!(matches!(n, Notification::Catchup { .. }), "{n:?}");
+
+            got = Some(process(&mut files, n));
+            matching = goal == got;
+        }
+        while !matching {
+            if let Ok(n) = fixture.next("(un)link").await {
+                assert!(
+                    matches!(n, Notification::Link { .. } | Notification::Unlink { .. }),
+                    "{n:?}"
+                );
+                got = Some(process(&mut files, n));
+                matching = goal == got;
+            } else {
+                panic!("{goal:?} != {got:?}")
             }
         }
-        assert_unordered::assert_eq_unordered!(
-            vec![
-                ("one.txt".to_string(), 4),
-                ("two.txt".to_string(), 1),
-                ("three.txt".to_string(), 1),
-                ("four.txt".to_string(), 1)
-            ],
-            files
-                .into_iter()
-                .map(|(p, (_, size))| (p.to_string(), size))
-                .collect::<Vec<_>>()
-        );
 
         Ok(())
     }
