@@ -1,10 +1,15 @@
-use std::{collections::HashMap, ffi::OsString, fs::Metadata, path::PathBuf, time::SystemTime};
+use std::{
+    collections::{HashMap, VecDeque},
+    ffi::OsString,
+    fs::Metadata,
+    path::PathBuf,
+    time::SystemTime,
+};
 
 use futures::StreamExt as _;
 use inotify::{Event, EventMask, Inotify, WatchDescriptor, WatchMask, Watches};
 use tokio::fs;
 use tokio::sync::mpsc;
-use walkdir::WalkDir;
 
 use crate::{
     model::{Arena, Path},
@@ -115,81 +120,47 @@ async fn run_loop(
     tx: mpsc::Sender<Notification>,
     catchup: bool,
 ) -> anyhow::Result<()> {
-    let (new_dirs_tx, mut new_dirs_rx) = mpsc::channel(10);
     let mut collector = Collector {
         watches: inotify.watches(),
         path_resolver,
         tx,
         arena,
         wd: HashMap::new(),
-        new_dirs_tx,
-        ready: false,
     };
 
     let mut buffer = [0; 1024];
-    let mut inotify = Box::pin(inotify.into_event_stream(&mut buffer)?);
+    let mut inotify = inotify.into_event_stream(&mut buffer)?;
 
     if catchup {
         collector.send_catching_up().await?;
     }
-    let mode = if catchup {
-        WalkDirMode::InitialWatchDirsAndReportFiles
-    } else {
-        WalkDirMode::InitialWatchDirs
-    };
-    spawn_walk_dir(
-        collector.path_resolver.root().to_path_buf(),
-        mode,
-        collector.new_dirs_tx.clone(),
-    );
-
-    loop {
-        tokio::select! {
-            Some(result) = new_dirs_rx.recv() => {
-                handle_walk_dir_result(result, &mut collector).await?;
+    collector
+        .walk_dir(
+            collector.path_resolver.root().to_path_buf(),
+            if catchup {
+                WalkDirFileMode::ReportAsCatchup
+            } else {
+                WalkDirFileMode::Ignore
             },
-            ev = inotify.next(), if collector.ready => {
-                match ev {
-                    None => { break; }
-                    Some(Err(err)) =>{
-                        log::warn!("inotify error:{err}")
-                    }
-                    Some(Ok(ev)) => {
-                        log::debug!("inotify ev: {ev:?}");
-                        if let Err(err) = collector.handle_event(ev).await {
-                            log::warn!("failed to handle inotify event: {err}");
-                        }
-                    }
-                };
+        )
+        .await?;
+    collector.send_ready().await?;
+
+    while let Some(ev) = inotify.next().await {
+        match ev {
+            Err(err) => {
+                log::warn!("inotify error: {err}")
             }
-        };
+            Ok(ev) => {
+                log::debug!("inotify ev: {ev:?}");
+                if let Err(err) = collector.handle_event(ev).await {
+                    log::warn!("failed to handle inotify event: {err}");
+                }
+            }
+        }
     }
     log::debug!("collector loop ends");
 
-    Ok(())
-}
-
-async fn handle_walk_dir_result(
-    result: WalkDirResult,
-    collector: &mut Collector,
-) -> anyhow::Result<()> {
-    match result {
-        WalkDirResult::Complete => {
-            if !collector.ready {
-                collector.ready = true;
-                collector.send_ready().await?;
-            }
-        }
-        WalkDirResult::AddDir(path) => {
-            collector.watch_dir(path).await?;
-        }
-        WalkDirResult::AddFile(path, metadata) => {
-            collector.send_link(path, metadata, false).await;
-        }
-        WalkDirResult::AddCatchupFile(path, metadata) => {
-            collector.send_link(path, metadata, true).await;
-        }
-    }
     Ok(())
 }
 
@@ -203,19 +174,15 @@ struct Collector {
 
     /// Tracks watched directories.
     wd: HashMap<WatchDescriptor, PathBuf>,
-
-    /// Channel used to get back results from spawn_walk_dir.
-    new_dirs_tx: mpsc::Sender<WalkDirResult>,
-
-    /// Collector is ready after having gone through the
-    /// whole hierarchy, adding watches to directories.
-    ready: bool,
 }
 
 impl Collector {
     /// Tell inotify to watch the given path, which must be a directory.
-    async fn watch_dir(&mut self, path: PathBuf) -> anyhow::Result<()> {
-        match self.watches.add(
+    async fn watch_dir(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
+        // TODO: handle the case where a directory that was not
+        // accessible becomes accessible; the whole directory needs to
+        // be processed.
+        let descr = self.watches.add(
             &path,
             WatchMask::CREATE
                 | WatchMask::CLOSE_WRITE
@@ -223,13 +190,54 @@ impl Collector {
                 | WatchMask::MOVE
                 | WatchMask::DONT_FOLLOW
                 | WatchMask::EXCL_UNLINK,
-        ) {
-            Ok(descr) => {
-                log::debug!("watch path: {path:?} for {}", self.arena);
-                self.wd.insert(descr, path);
-            }
-            Err(err) => {
-                log::debug!("inotify failed to watch {path:?}: {err}");
+        )?;
+        log::debug!("watching {:?}", path);
+        self.wd.insert(descr, path.to_path_buf());
+
+        Ok(())
+    }
+
+    /// Go through the directory recursively, adding watches to directories.
+    async fn walk_dir(&mut self, root: PathBuf, mode: WalkDirFileMode) -> anyhow::Result<()> {
+        let mut queue = VecDeque::new();
+        self.watch_dir(&root).await?;
+        queue.push_back(root);
+
+        while let Some(path) = queue.pop_front() {
+            if let Ok(mut readdir) = fs::read_dir(path).await {
+                loop {
+                    match readdir.next_entry().await {
+                        Err(_) => {} // skip
+                        Ok(None) => {
+                            break;
+                        }
+                        Ok(Some(entry)) => {
+                            if let Ok(m) = entry.metadata().await {
+                                if m.file_type().is_dir() {
+                                    let dir = entry.path();
+                                    match self.watch_dir(&dir).await {
+                                        Ok(()) => {
+                                            queue.push_back(dir);
+                                        }
+                                        Err(err) => {
+                                            log::debug!("failed to add watch to {:?}: {}", dir, err)
+                                        }
+                                    }
+                                } else if m.file_type().is_file() {
+                                    match mode {
+                                        WalkDirFileMode::Ignore => {}
+                                        WalkDirFileMode::ReportAsCatchup => {
+                                            self.send_link(entry.path(), m, true).await;
+                                        }
+                                        WalkDirFileMode::ReportAsLink => {
+                                            self.send_link(entry.path(), m, false).await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -246,12 +254,11 @@ impl Collector {
                 if ev.mask.contains(EventMask::ISDIR) {
                     if ev.mask.contains(EventMask::CREATE) || ev.mask.contains(EventMask::MOVED_TO)
                     {
-                        // Watch directory and report its content as new.
-                        spawn_walk_dir(
-                            full_path,
-                            WalkDirMode::WatchDirRecursivelyAndReportFiles,
-                            self.new_dirs_tx.clone(),
-                        );
+                        // Watch directory and report its content as new; note that the directory might
+                        // not be readable, in which case it should be ignored.
+                        let _ = self
+                            .walk_dir(full_path, WalkDirFileMode::ReportAsLink)
+                            .await;
                     }
                 // Deletion of directory is implicitly handled by inotify removing the watch.
                 // We should have received events for file deletions inside it before this.
@@ -354,86 +361,10 @@ impl Collector {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum WalkDirMode {
-    /// Mode used for the very first walkdir in an arena.
-    ///
-    /// The first walkdir collects directories to ask inotify to watch.
-    InitialWatchDirs,
-    InitialWatchDirsAndReportFiles,
-
-    /// Modu used for new directories in an arena.
-    ///
-    /// A walkdir is necessary to catch existing files and
-    /// subdirectories, including files or directories created between
-    /// the time the directory was initially created and the time the
-    /// inotify event was processed.
-    WatchDirRecursivelyAndReportFiles,
-}
-
-#[derive(Clone)]
-enum WalkDirResult {
-    /// Report a directory.
-    AddDir(PathBuf),
-
-    /// Report a file and its metadata.
-    AddFile(PathBuf, Metadata),
-
-    /// Report a file and its metadata during catchup.
-    AddCatchupFile(PathBuf, Metadata),
-
-    /// Report that the initial walkdir is complete.
-    Complete,
-}
-
-/// Recursively go through the given path and send result to a channel.
-///
-/// - in mode [WalkDirMode::Initial], report only directories and
-///   finish with [WalkDirResult::Complete].
-///
-/// - in mode [WalkDirMode::NewDir], report directories and files.
-///   Don't report the end.
-fn spawn_walk_dir(root: PathBuf, mode: WalkDirMode, tx: mpsc::Sender<WalkDirResult>) {
-    tokio::task::spawn_blocking(move || {
-        for entry in WalkDir::new(&root)
-            .follow_links(false)
-            .same_file_system(true)
-            .into_iter()
-            .flatten()
-        {
-            if entry.file_type().is_symlink() {
-                continue; // ignore
-            }
-            if entry.file_type().is_dir() {
-                tx.blocking_send(WalkDirResult::AddDir(entry.path().to_path_buf()))?;
-            } else if entry.file_type().is_file() {
-                if let Ok(metadata) = entry.metadata() {
-                    match mode {
-                        WalkDirMode::InitialWatchDirs => {}
-                        WalkDirMode::InitialWatchDirsAndReportFiles => {
-                            tx.blocking_send(WalkDirResult::AddCatchupFile(
-                                entry.path().to_path_buf(),
-                                metadata,
-                            ))?;
-                        }
-                        WalkDirMode::WatchDirRecursivelyAndReportFiles => {
-                            tx.blocking_send(WalkDirResult::AddFile(
-                                entry.path().to_path_buf(),
-                                metadata,
-                            ))?;
-                        }
-                    }
-                }
-            }
-        }
-        if matches!(
-            mode,
-            WalkDirMode::InitialWatchDirs | WalkDirMode::InitialWatchDirsAndReportFiles
-        ) {
-            tx.blocking_send(WalkDirResult::Complete)?;
-        }
-
-        Ok::<(), anyhow::Error>(())
-    });
+enum WalkDirFileMode {
+    Ignore,
+    ReportAsCatchup,
+    ReportAsLink,
 }
 
 /// Find the modification time for a file that has been unlinked.
