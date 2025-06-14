@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Instant};
+use std::{sync::Arc, time::Duration};
 
 use futures::StreamExt as _;
 use tarpc::{
@@ -6,17 +6,12 @@ use tarpc::{
     server::{BaseChannel, Channel},
     ClientMessage, Response, Transport,
 };
-use tokio::{
-    sync::{mpsc, oneshot, Mutex},
-    task::JoinHandle,
-    time::timeout,
-};
+use tokio::sync::mpsc;
 
 use crate::{
     model::{Arena, Peer},
     network::Networking,
     storage::real::Notification,
-    utils::async_utils::AbortOnDrop,
 };
 
 use super::{HistoryService, HistoryServiceRequest, HistoryServiceResponse};
@@ -26,58 +21,49 @@ use super::{HistoryService, HistoryServiceRequest, HistoryServiceResponse};
 /// Connect to the peer, then ask it to send history for the given
 /// arenas.
 ///
-/// Returns the arenas the peer has to send notifications about, which
-/// might be empty.
+/// A connection to the peer is kept up and running as long as
+/// possible. When the peer disconnects, attempts will be made to
+/// reconnect as long as allowed by `retry_strategy` - forever if
+/// necessary.
 ///
-/// After a successful connection, the forwarder runs until either the
-/// channel is closed or the connection is lost. Check the
-/// [JoinHandle].
+/// Close the channel to stop these reconnection attempts.
 pub async fn forward_peer_history<T>(
-    networking: &Networking,
-    ctx: Context,
-    peer: &Peer,
+    networking: Networking,
+    peer: Peer,
     arenas: T,
+    retry_strategy: impl Iterator<Item = Duration> + Clone,
     tx: mpsc::Sender<(Peer, Notification)>,
-) -> anyhow::Result<(Vec<Arena>, JoinHandle<anyhow::Result<()>>)>
+) -> anyhow::Result<()>
 where
     T: IntoIterator<Item = Arena>,
 {
-    let transport = networking.connect(&peer, super::TAG, None).await?;
+    let arenas: Vec<Arena> = arenas.into_iter().collect();
 
-    let (available_tx, available_rx) = oneshot::channel();
-    let peer = peer.clone();
-    let arenas = arenas.into_iter().collect();
-    let handle = AbortOnDrop::new(tokio::spawn(run_forwarder(
-        peer,
-        arenas,
-        BaseChannel::with_defaults(transport),
-        tx,
-        Some(available_tx),
-    )));
-
-    // Wait for the peer to report available arenas before returning.
-    //
-    // If the context deadline is reached, abort the forwarder and
-    // return a deadline error.
-    match timeout(ctx.deadline.duration_since(Instant::now()), available_rx).await? {
-        Err(oneshot::error::RecvError { .. }) => {
-            // The forwarder must have already died if the oneshot was
-            // killed before anything was sent. Attempt to recover the original error.
-            handle.join().await??;
-
-            // The following should never be reached:
-            anyhow::bail!("Connection failed");
-        }
-        Ok(watched) => {
-            return Ok((watched, handle.as_handle()));
-        }
+    loop {
+        tokio::select!(
+        _ = tx.closed() => {
+            return Ok(());
+        },
+        transport = networking
+        .connect_with_retries(&peer, super::TAG, None, retry_strategy.clone(), None) => {
+            match transport {
+                Err(err) => {
+                    return Err(err);
+                }
+                Ok(transport) => {
+                    let _= run_forwarder(
+                        peer.clone(),
+                        arenas.clone(),
+                        BaseChannel::with_defaults(transport),
+                        tx.clone(),
+                    ).await;
+                }
+            }
+        });
     }
 }
 
 /// Forward notifications the given TARPC channel to a mpsc channel.
-///
-/// To know when the remote end declared itself ready, pass a oneshot
-/// channel and await it.
 ///
 /// The forwarder stops when the given mpsc channel is closed or when
 /// there's a RPC error (usually due to a connection error.)
@@ -86,17 +72,11 @@ async fn run_forwarder<T>(
     arenas: Vec<Arena>,
     channel: BaseChannel<HistoryServiceRequest, HistoryServiceResponse, T>,
     tx: mpsc::Sender<(Peer, Notification)>,
-    ready_tx: Option<oneshot::Sender<Vec<Arena>>>,
 ) -> anyhow::Result<()>
 where
     T: Transport<Response<HistoryServiceResponse>, ClientMessage<HistoryServiceRequest>>,
 {
-    let server = HistoryServer {
-        peer,
-        arenas,
-        tx,
-        watched: Arc::new(Mutex::new(ready_tx)),
-    };
+    let server = HistoryServer { peer, arenas, tx };
     let mut requests = Box::pin(channel.requests());
     loop {
         tokio::select!(
@@ -124,19 +104,11 @@ struct HistoryServer {
     peer: Peer,
     arenas: Vec<Arena>,
     tx: mpsc::Sender<(Peer, Notification)>,
-    watched: Arc<Mutex<Option<oneshot::Sender<Vec<Arena>>>>>,
 }
 
 impl HistoryService for HistoryServer {
     async fn arenas(self, _context: Context) -> Vec<Arena> {
         self.arenas
-    }
-
-    async fn available(self, _context: Context, arenas: Vec<Arena>) -> () {
-        log::debug!("Arenas watched by {}: {:?}", self.peer, &arenas);
-        if let Some(tx) = self.watched.lock().await.take() {
-            let _ = tx.send(arenas);
-        }
     }
 
     async fn notify(self, _context: Context, batch: Vec<Notification>) -> () {
@@ -154,8 +126,8 @@ mod tests {
         prelude::{FileWriteStr as _, PathChild as _},
         TempDir,
     };
-    use tarpc::context;
     use tokio::time::timeout;
+    use tokio_retry::strategy::{ExponentialBackoff, FixedInterval};
 
     use crate::{
         model,
@@ -226,16 +198,13 @@ mod tests {
         let _server = fixture.start_server().await?;
 
         let (tx, mut rx) = mpsc::channel(10);
-        let (watched, handle) = forward_peer_history(
-            &fixture.networking,
-            context::current(),
-            &fixture.peer,
+        let handle = tokio::spawn(forward_peer_history(
+            fixture.networking.clone(),
+            fixture.peer.clone(),
             vec![fixture.arena.clone()],
+            ExponentialBackoff::from_millis(10).take(0),
             tx,
-        )
-        .await?;
-
-        assert_eq!(vec![fixture.arena.clone()], watched);
+        ));
 
         let (peer, notif) = timeout(Duration::from_secs(5), rx.recv()).await?.unwrap();
         assert_eq!(fixture.peer, peer);
@@ -290,14 +259,13 @@ mod tests {
         let _server = fixture.start_server().await?;
 
         let (tx, mut rx) = mpsc::channel(10);
-        let _ = forward_peer_history(
-            &fixture.networking,
-            context::current(),
-            &fixture.peer,
+        let _ = tokio::spawn(forward_peer_history(
+            fixture.networking.clone(),
+            fixture.peer.clone(),
             vec![fixture.arena.clone()],
+            ExponentialBackoff::from_millis(1).take(0),
             tx,
-        )
-        .await?;
+        ));
 
         let (peer, notif) = timeout(Duration::from_secs(1), rx.recv()).await?.unwrap();
         assert_eq!(fixture.peer, peer);
@@ -324,24 +292,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_history_loses_connection() -> anyhow::Result<()> {
+    async fn forward_loses_connection() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
+
         let server = fixture.start_server().await?;
 
-        let (tx, _rx) = mpsc::channel(10);
-        let (_, handle) = forward_peer_history(
-            &fixture.networking,
-            context::current(),
-            &fixture.peer,
+        let (tx, mut rx) = mpsc::channel(10);
+        let handle = tokio::spawn(forward_peer_history(
+            fixture.networking.clone(),
+            fixture.peer.clone(),
             vec![fixture.arena.clone()],
+            ExponentialBackoff::from_millis(1).take(0),
             tx,
-        )
-        .await?;
+        ));
 
+        let _ = timeout(Duration::from_secs(1), rx.recv()).await?;
+
+        // The server shutting down stops the forwarder, since retries
+        // are turned off. The returned error is a "connection
+        // refused" from the single failed reconnection attempt.
         server.shutdown().await?;
-
-        // The server shutting down stops the forwarder
-        timeout(Duration::from_secs(1), handle).await???;
+        assert!(timeout(Duration::from_secs(1), handle).await??.is_err());
 
         Ok(())
     }
@@ -352,10 +323,10 @@ mod tests {
 
         let (tx, rx) = mpsc::channel(10);
         let ret = forward_peer_history(
-            &fixture.networking,
-            context::current(),
-            &fixture.peer,
+            fixture.networking,
+            fixture.peer,
             vec![fixture.arena.clone()],
+            ExponentialBackoff::from_millis(10).take(0),
             tx,
         )
         .await;
@@ -366,6 +337,40 @@ mod tests {
         );
 
         assert!(rx.is_closed());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forward_history_reconnects() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let handle = tokio::spawn(forward_peer_history(
+            fixture.networking.clone(),
+            fixture.peer.clone(),
+            vec![fixture.arena.clone()],
+            FixedInterval::from_millis(10),
+            tx,
+        ));
+
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            let server = fixture.start_server().await?;
+            assert!(matches!(
+                timeout(Duration::from_secs(5), rx.recv()).await?.unwrap(),
+                (_, Notification::CatchingUp { .. })
+            ));
+            assert!(matches!(
+                timeout(Duration::from_secs(5), rx.recv()).await?.unwrap(),
+                (_, Notification::Ready { .. })
+            ));
+            server.shutdown().await?;
+        }
+
+        // Dropping rx stops the forwarder from trying to reconnect.
+        drop(rx);
+        timeout(Duration::from_secs(1), handle).await???;
 
         Ok(())
     }

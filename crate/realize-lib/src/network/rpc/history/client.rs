@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use tarpc::client::stub::Stub;
 use tarpc::context;
 use tarpc::tokio_serde::formats::Bincode;
@@ -47,15 +48,10 @@ where
     )
     .await;
 
-    let mut watched_arenas = vec![];
     for (arena, watched) in arenas.into_iter().zip(res.into_iter()) {
-        if watched? {
-            watched_arenas.push(arena);
-        }
+        watched.with_context(|| format!("failed to watch {arena}"))?;
     }
     drop(tx);
-
-    client.available(context::current(), watched_arenas).await?;
 
     // While there are notifications
     loop {
