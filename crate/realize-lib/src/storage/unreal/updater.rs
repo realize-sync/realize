@@ -12,14 +12,14 @@ pub async fn keep_cache_updated(
 ) {
     while let Some((peer, notification)) = rx.recv().await {
         if let Err(err) = match &notification {
-            Notification::CatchingUp { .. } => Ok(()),
+            Notification::CatchingUp { arena } => cache.mark_peer_files(&peer, arena).await,
             Notification::Catchup {
                 arena,
                 path,
                 size,
                 mtime,
-            } => cache.link(&peer, arena, path, *size, *mtime).await,
-            Notification::Ready { .. } => Ok(()),
+            } => cache.catchup(&peer, arena, path, *size, *mtime).await,
+            Notification::Ready { arena } => cache.delete_marked_files(&peer, arena).await,
             Notification::Link {
                 arena,
                 path,
@@ -47,6 +47,7 @@ mod tests {
 
     use super::*;
     use crate::model::Arena;
+    use crate::model::Path;
     use crate::storage::real::LocalStorage;
     use crate::storage::real::Notification;
     use assert_fs::fixture::ChildPath;
@@ -113,6 +114,30 @@ mod tests {
 
             Ok(())
         }
+
+        async fn wait_for_goal_file_set(&self, goal: Vec<String>) -> anyhow::Result<()> {
+            let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
+            loop {
+                let mut got = self
+                    .cache
+                    .blocking()
+                    .readdir(1)?
+                    .map(|(n, _)| n)
+                    .collect::<Vec<_>>();
+                got.sort();
+
+                if got == goal {
+                    break;
+                }
+                if let Some(delay) = retry.next() {
+                    tokio::time::sleep(delay).await;
+                } else {
+                    assert_unordered::assert_eq_unordered!(goal.clone(), got);
+                }
+            }
+
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -127,27 +152,52 @@ mod tests {
         fixture.arena_root.child("three.txt").write_str("test")?;
 
         // It may take some time, but eventually, we should end up
-        // with just the goal files.
-        let goal = vec!["one.txt".to_string(), "three.txt".to_string()];
-        let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
-        loop {
-            let mut got = fixture
-                .cache
-                .blocking()
-                .readdir(1)?
-                .map(|(n, _)| n)
-                .collect::<Vec<_>>();
-            got.sort();
+        // with just the two files.
+        fixture
+            .wait_for_goal_file_set(vec!["one.txt".to_string(), "three.txt".to_string()])
+            .await?;
 
-            if got == goal {
-                break;
-            }
-            if let Some(delay) = retry.next() {
-                tokio::time::sleep(delay).await;
-            } else {
-                assert_unordered::assert_eq_unordered!(goal.clone(), got);
-            }
-        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cache_updater_delete_outdated_peer_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+
+        let file2 = fixture.arena_root.child("file2");
+        file2.write_str("test")?;
+
+        let mtime = file2.metadata()?.modified()?;
+
+        // There existed, in the past, a file called "file1", which
+        // isn't there anymore. It should be removed when the peer
+        // reconnects and fails to report it during catchup.
+        fixture
+            .cache
+            .link(
+                &fixture.peer,
+                &fixture.arena,
+                &Path::parse("file1")?,
+                4,
+                mtime,
+            )
+            .await?;
+        fixture
+            .cache
+            .link(
+                &fixture.peer,
+                &fixture.arena,
+                &Path::parse("file2")?,
+                4,
+                mtime,
+            )
+            .await?;
+
+        fixture.subscribe().await?;
+
+        fixture
+            .wait_for_goal_file_set(vec!["file2".to_string()])
+            .await?;
 
         Ok(())
     }

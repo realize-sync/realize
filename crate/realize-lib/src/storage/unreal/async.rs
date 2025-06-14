@@ -64,4 +64,48 @@ impl UnrealCacheAsync {
 
         Ok(task::spawn_blocking(move || inner.unlink(&peer, &arena, &path, mtime)).await??)
     }
+
+    /// Async version of [BlockingUnrealCache::catchup]
+    pub async fn catchup(
+        &self,
+        peer: &Peer,
+        arena: &Arena,
+        path: &Path,
+        size: u64,
+        mtime: SystemTime,
+    ) -> Result<(), UnrealCacheError> {
+        let peer = peer.clone();
+        let arena = arena.clone();
+        let path = path.clone();
+        let inner = Arc::clone(&self.inner);
+
+        Ok(
+            task::spawn_blocking(move || inner.catchup(&peer, &arena, &path, size, mtime))
+                .await??,
+        )
+    }
+
+    pub async fn mark_peer_files(
+        &self,
+        peer: &Peer,
+        arena: &Arena,
+    ) -> Result<(), UnrealCacheError> {
+        let peer = peer.clone();
+        let arena = arena.clone();
+        let inner = Arc::clone(&self.inner);
+
+        Ok(task::spawn_blocking(move || inner.mark_peer_files(&peer, &arena)).await??)
+    }
+
+    pub async fn delete_marked_files(
+        &self,
+        peer: &Peer,
+        arena: &Arena,
+    ) -> Result<(), UnrealCacheError> {
+        let peer = peer.clone();
+        let arena = arena.clone();
+        let inner = Arc::clone(&self.inner);
+
+        Ok(task::spawn_blocking(move || inner.delete_marked_files(&peer, &arena)).await??)
+    }
 }

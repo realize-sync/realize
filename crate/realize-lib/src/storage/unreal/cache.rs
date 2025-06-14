@@ -13,6 +13,8 @@ const DIRECTORY_TABLE: TableDefinition<(u64, &str), ReadDirEntry> =
     TableDefinition::new("directory_table");
 
 const FILE_TABLE: TableDefinition<(u64, &str), FileEntry> = TableDefinition::new("file_table");
+const PENDING_CATCHUP_TABLE: TableDefinition<(&str, u64), u64> =
+    TableDefinition::new("pending_catchup");
 
 /// An entry in a directory listing.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -91,10 +93,8 @@ pub struct FileEntry {
     /// The metadata of the file.
     pub metadata: FileMetadata,
 
-    /// File is marked for deletion.
-    ///
-    /// See mark_peer_files and delete_marked_files above.
-    pub marked: bool,
+    /// Inode of the containing directory
+    parent_inode: u64,
 }
 
 impl Value for FileEntry {
@@ -166,6 +166,22 @@ impl UnrealCacheBlocking {
     /// Transform this cache into an async cache.
     pub fn into_async(self) -> UnrealCacheAsync {
         UnrealCacheAsync::new(self)
+    }
+
+    pub fn catchup(
+        &self,
+        peer: &Peer,
+        arena: &Arena,
+        path: &Path,
+        size: u64,
+        mtime: SystemTime,
+    ) -> Result<(), UnrealCacheError> {
+        let txn = self.db.begin_write()?;
+        let inode = do_link(&txn, peer, arena, path, size, mtime)?;
+        do_unmark_peer_file(&txn, peer, inode)?;
+        txn.commit()?;
+
+        Ok(())
     }
 
     pub fn link(
@@ -240,6 +256,22 @@ impl UnrealCacheBlocking {
 
         Ok(entries.into_iter())
     }
+
+    pub fn mark_peer_files(&self, peer: &Peer, _arena: &Arena) -> Result<(), UnrealCacheError> {
+        // TODO: take arena into account
+        let txn = self.db.begin_write()?;
+        do_mark_peer_files(&txn, peer)?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_marked_files(&self, peer: &Peer, _arena: &Arena) -> Result<(), UnrealCacheError> {
+        // TODO: take arena into account
+        let txn = self.db.begin_write()?;
+        do_delete_marked_files(&txn, peer)?;
+        txn.commit()?;
+        Ok(())
+    }
 }
 
 /// Implement [UnrealCache::unlink] within a transaction.
@@ -263,14 +295,14 @@ fn do_unlink(
 
     let inode = dir_entry.inode;
     let mut file_table = txn.open_table(FILE_TABLE)?;
-    if let Some(file_entry) = get_file_entry(&file_table, inode, peer)? {
-        if file_entry.metadata.mtime > mtime {
-            // The file is more recent than the unlink; nothing to do.
-            return Ok(());
-        }
-        file_table.remove((inode, peer.as_str()))?;
-    }
-    dir_table.remove((parent_inode, path.name()))?;
+    do_rm_file_entry(
+        &mut file_table,
+        &mut dir_table,
+        parent_inode,
+        inode,
+        peer,
+        Some(mtime),
+    )?;
 
     Ok(())
 }
@@ -309,6 +341,8 @@ fn get_best_file_entry(txn: &ReadTransaction, inode: u64) -> Result<FileEntry, U
 }
 
 /// Implement [UnrealCache::link] in a transaction.
+///
+/// Return the inode of the file.
 fn do_link(
     txn: &WriteTransaction,
     peer: &Peer,
@@ -316,7 +350,7 @@ fn do_link(
     path: &Path,
     size: u64,
     mtime: SystemTime,
-) -> Result<(), UnrealCacheError> {
+) -> Result<u64, UnrealCacheError> {
     let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
     let mut file_table = txn.open_table(FILE_TABLE)?;
 
@@ -334,7 +368,7 @@ fn do_link(
         Some(dir_entry) => {
             if let Some(existing) = get_file_entry(&file_table, dir_entry.inode, peer)? {
                 if existing.metadata.mtime > mtime {
-                    return Ok(());
+                    return Ok(dir_entry.inode);
                 }
             }
 
@@ -347,11 +381,11 @@ fn do_link(
             arena: arena.clone(),
             path: path.clone(),
             metadata: FileMetadata { size, mtime },
-            marked: false,
+            parent_inode,
         },
     )?;
 
-    Ok(())
+    Ok(inode)
 }
 
 /// Make sure that the given path is a directory; create it if necessary.
@@ -435,6 +469,94 @@ fn add_dir_entry(
     )?;
 
     Ok(new_inode)
+}
+
+fn do_mark_peer_files(txn: &WriteTransaction, peer: &Peer) -> Result<(), UnrealCacheError> {
+    let file_table = txn.open_table(FILE_TABLE)?;
+    let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
+    let peer_str = peer.as_str();
+    for elt in file_table.iter()? {
+        let (k, v) = elt?;
+        let k = k.value();
+        if k.1 != peer_str {
+            continue;
+        }
+        let inode = k.0;
+        pending_catchup_table.insert((peer_str, inode), v.value().parent_inode)?;
+    }
+
+    Ok(())
+}
+
+fn do_unmark_peer_file(
+    txn: &WriteTransaction,
+    peer: &Peer,
+    inode: u64,
+) -> Result<(), UnrealCacheError> {
+    let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
+    pending_catchup_table.remove((peer.as_str(), inode))?;
+
+    Ok(())
+}
+
+fn do_delete_marked_files(txn: &WriteTransaction, peer: &Peer) -> Result<(), UnrealCacheError> {
+    let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
+    let mut file_table = txn.open_table(FILE_TABLE)?;
+    let mut directory_table = txn.open_table(DIRECTORY_TABLE)?;
+    let peer_str = peer.as_str();
+    for elt in
+        pending_catchup_table.extract_from_if((peer_str, 0)..(peer_str, u64::MAX), |_, _| true)?
+    {
+        let elt = elt?;
+        let (_, inode) = elt.0.value();
+        let parent_inode = elt.1.value();
+        do_rm_file_entry(
+            &mut file_table,
+            &mut directory_table,
+            parent_inode,
+            inode,
+            peer,
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+fn do_rm_file_entry(
+    file_table: &mut redb::Table<'_, (u64, &str), FileEntry>,
+    dir_table: &mut redb::Table<'_, (u64, &str), ReadDirEntry>,
+    parent_inode: u64,
+    inode: u64,
+    peer: &Peer,
+    mtime: Option<SystemTime>,
+) -> Result<(), UnrealCacheError> {
+    let mut range_size = 0;
+    let mut delete = false;
+    let peer_str = peer.as_str();
+    for elt in file_table.range((inode, "")..(inode + 1, ""))? {
+        range_size += 1;
+        let elt = elt?;
+        if peer_str == elt.0.value().1
+            && mtime
+                .as_ref()
+                .map(|t| elt.1.value().metadata.mtime <= *t)
+                .unwrap_or(true)
+        {
+            delete = true;
+        }
+    }
+
+    if delete {
+        file_table.remove((inode, peer_str))?;
+        range_size -= 1;
+    }
+    if range_size == 0 {
+        dir_table.retain_in((parent_inode, "")..(parent_inode + 1, ""), |_, v| {
+            v.inode != inode
+        })?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -697,6 +819,65 @@ mod tests {
         let metadata = metadata.expect("files must have metadata");
         assert_eq!(metadata.size, 200);
         assert_eq!(metadata.mtime, mtime2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn mark_and_delete_peer_files() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let cache = &fixture.cache;
+        let arena = test_arena();
+        let peer1 = Peer::from("1");
+        let peer2 = Peer::from("2");
+        let peer3 = Peer::from("3");
+        let file1 = Path::parse("file1")?;
+        let file2 = Path::parse("afile2")?;
+        let file3 = Path::parse("file3")?;
+        let file4 = Path::parse("file4")?;
+
+        let mtime = SystemTime::now();
+
+        cache.link(&peer1, &arena, &file1, 10, mtime)?;
+
+        cache.link(&peer1, &arena, &file2, 10, mtime)?;
+        cache.link(&peer2, &arena, &file2, 10, mtime)?;
+
+        cache.link(&peer1, &arena, &file1, 10, mtime)?;
+        cache.link(&peer2, &arena, &file2, 10, mtime)?;
+        cache.link(&peer3, &arena, &file3, 10, mtime)?;
+
+        cache.link(&peer1, &arena, &file4, 10, mtime)?;
+
+        let file1_inode = cache.lookup(1, file1.name())?.0.inode;
+
+        // Simulate a catchup that only reports file2 and file4.
+        cache.mark_peer_files(&peer1, &arena)?;
+        cache.catchup(&peer1, &arena, &file2, 10, mtime)?;
+        cache.catchup(&peer1, &arena, &file4, 10, mtime)?;
+        cache.delete_marked_files(&peer1, &arena)?;
+
+        // File1 should have been deleted, since it was only on peer1,
+        assert!(matches!(
+            cache.lookup(1, file1.name()),
+            Err(UnrealCacheError::NotFound)
+        ));
+        // File2 and 3 should still be available, from other peers
+        let file2_inode = cache.lookup(1, file2.name())?.0.inode;
+        let file3_inode = cache.lookup(1, file3.name())?.0.inode;
+
+        // File4 should still be available, from peer1
+        let file4_inode = cache.lookup(1, file4.name())?.0.inode;
+
+        // Check file table entries directly
+        {
+            let txn = cache.db.begin_read()?;
+            let file_table = txn.open_table(FILE_TABLE)?;
+            assert!(file_table.get((file1_inode, peer1.as_str()))?.is_none());
+            assert!(file_table.get((file2_inode, peer1.as_str()))?.is_some());
+            assert!(file_table.get((file3_inode, peer1.as_str()))?.is_none());
+            assert!(file_table.get((file4_inode, peer1.as_str()))?.is_some());
+        }
 
         Ok(())
     }
