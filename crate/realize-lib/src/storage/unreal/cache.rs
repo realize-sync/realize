@@ -9,6 +9,9 @@ use std::collections::HashMap;
 use std::path;
 use std::time::SystemTime;
 
+/// Inode of the root dir.
+pub const ROOT_DIR: u64 = 1;
+
 /// Maps arena to their root directory inode.
 ///
 /// Arenas in this table can also be accessed as subdirectories of the
@@ -434,7 +437,7 @@ fn do_add_arena(txn: &WriteTransaction, arena: &Arena) -> anyhow::Result<u64> {
     let inode = do_mkdirs(
         txn,
         &mut dir_table,
-        1,
+        ROOT_DIR,
         // TODO: constrain arena names to valid paths at creation, to get earlier error
         &Some(Path::parse(arena.as_str())?),
     )?;
@@ -651,7 +654,7 @@ fn alloc_inode(txn: &WriteTransaction) -> Result<u64, UnrealCacheError> {
     let max_inode = if let Some(v) = table.get(())? {
         v.value()
     } else {
-        1
+        ROOT_DIR
     };
     let inode = max_inode + 1;
     table.insert((), inode)?;
@@ -820,7 +823,7 @@ mod tests {
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-        let entry = dir_table.get((1, "test_arena"))?.unwrap().value();
+        let entry = dir_table.get((ROOT_DIR, "test_arena"))?.unwrap().value();
         assert_eq!(entry.assignment, InodeAssignment::Directory);
 
         let entry = dir_table.get((entry.inode, "a"))?.unwrap().value();
@@ -847,7 +850,7 @@ mod tests {
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-        let dir_entry = dir_table.get((1, "test_arena"))?.unwrap().value();
+        let dir_entry = dir_table.get((ROOT_DIR, "test_arena"))?.unwrap().value();
         let dir_entry = dir_table
             .get((dir_entry.inode, "file.txt"))?
             .unwrap()
@@ -879,7 +882,7 @@ mod tests {
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-        let dir_entry = dir_table.get((1, "test_arena"))?.unwrap().value();
+        let dir_entry = dir_table.get((ROOT_DIR, "test_arena"))?.unwrap().value();
         let dir_entry = dir_table
             .get((dir_entry.inode, "file.txt"))?
             .unwrap()
@@ -910,7 +913,7 @@ mod tests {
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-        assert!(dir_table.get((1, "file.txt"))?.is_none());
+        assert!(dir_table.get((ROOT_DIR, "file.txt"))?.is_none());
 
         Ok(())
     }
@@ -929,7 +932,7 @@ mod tests {
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-        let dir_entry = dir_table.get((1, "test_arena"))?.unwrap().value();
+        let dir_entry = dir_table.get((ROOT_DIR, "test_arena"))?.unwrap().value();
         assert!(dir_table.get((dir_entry.inode, "file.txt"))?.is_some());
 
         Ok(())
@@ -967,7 +970,7 @@ mod tests {
         let cache = &fixture.cache;
 
         assert!(matches!(
-            cache.lookup(1, "nonexistent"),
+            cache.lookup(ROOT_DIR, "nonexistent"),
             Err(UnrealCacheError::NotFound),
         ));
 
@@ -995,13 +998,13 @@ mod tests {
         assert_unordered::assert_eq_unordered!(
             vec![(arena.to_string(), InodeAssignment::Directory),],
             cache
-                .readdir(1)?
+                .readdir(ROOT_DIR)?
                 .into_iter()
                 .map(|(name, entry)| (name, entry.assignment))
                 .collect::<Vec<_>>(),
         );
 
-        let (dir_entry, _) = cache.lookup(1, arena.as_str())?;
+        let (dir_entry, _) = cache.lookup(ROOT_DIR, arena.as_str())?;
         assert_unordered::assert_eq_unordered!(
             vec![("dir".to_string(), InodeAssignment::Directory),],
             cache
@@ -1089,7 +1092,7 @@ mod tests {
 
         // File1 should have been deleted, since it was only on peer1,
         assert!(matches!(
-            cache.lookup(1, file1.name()),
+            cache.lookup(ROOT_DIR, file1.name()),
             Err(UnrealCacheError::NotFound)
         ));
         // File2 and 3 should still be available, from other peers
