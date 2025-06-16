@@ -4,6 +4,7 @@ mod error;
 mod updater;
 
 pub use cache::FileEntry;
+pub use cache::FileMetadata;
 pub use cache::ReadDirEntry;
 pub use cache::UnrealCacheBlocking;
 pub use cache::ROOT_DIR;

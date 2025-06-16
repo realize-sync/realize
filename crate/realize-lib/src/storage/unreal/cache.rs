@@ -354,10 +354,7 @@ impl UnrealCacheBlocking {
         }
     }
 
-    pub fn readdir(
-        &self,
-        inode: u64,
-    ) -> Result<impl Iterator<Item = (String, ReadDirEntry)>, UnrealCacheError> {
+    pub fn readdir(&self, inode: u64) -> Result<Vec<(String, ReadDirEntry)>, UnrealCacheError> {
         let txn = self.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
 
@@ -375,7 +372,7 @@ impl UnrealCacheBlocking {
             entries.push((name, value.value().clone()));
         }
 
-        Ok(entries.into_iter())
+        Ok(entries)
     }
 
     pub fn mark_peer_files(&self, peer: &Peer, arena: &Arena) -> Result<(), UnrealCacheError> {

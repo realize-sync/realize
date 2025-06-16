@@ -4,7 +4,7 @@ use tokio::task;
 
 use crate::model::{Arena, Path, Peer};
 
-use super::{UnrealCacheBlocking, UnrealCacheError};
+use super::{FileMetadata, ReadDirEntry, UnrealCacheBlocking, UnrealCacheError};
 
 #[derive(Clone)]
 pub struct UnrealCacheAsync {
@@ -30,6 +30,14 @@ impl UnrealCacheAsync {
     /// Return a reference on the blocking cache.
     pub fn blocking(&self) -> Arc<UnrealCacheBlocking> {
         Arc::clone(&self.inner)
+    }
+
+    pub fn arenas(&self) -> impl Iterator<Item = &Arena> {
+        self.inner.arenas()
+    }
+
+    pub fn arena_root(&self, arena: &Arena) -> Result<u64, UnrealCacheError> {
+        self.inner.arena_root(arena)
     }
 
     /// Async version of [BlockingUnrealCache::link]
@@ -83,6 +91,26 @@ impl UnrealCacheAsync {
             task::spawn_blocking(move || inner.catchup(&peer, &arena, &path, size, mtime))
                 .await??,
         )
+    }
+
+    pub async fn lookup(
+        &self,
+        parent_inode: u64,
+        name: &str,
+    ) -> Result<(ReadDirEntry, Option<FileMetadata>), UnrealCacheError> {
+        let name = name.to_string();
+        let inner = Arc::clone(&self.inner);
+
+        Ok(task::spawn_blocking(move || inner.lookup(parent_inode, &name)).await??)
+    }
+
+    pub async fn readdir(
+        &self,
+        inode: u64,
+    ) -> Result<Vec<(String, ReadDirEntry)>, UnrealCacheError> {
+        let inner = Arc::clone(&self.inner);
+
+        Ok(task::spawn_blocking(move || inner.readdir(inode)).await??)
     }
 
     pub async fn mark_peer_files(

@@ -126,6 +126,7 @@ mod tests {
                     .cache
                     .blocking()
                     .readdir(arena_root)?
+                    .into_iter()
                     .map(|(n, _)| n)
                     .collect::<Vec<_>>();
                 got.sort();
