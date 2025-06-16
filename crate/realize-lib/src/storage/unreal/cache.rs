@@ -9,13 +9,68 @@ use std::collections::HashMap;
 use std::path;
 use std::time::SystemTime;
 
+/// Maps arena to their root directory inode.
+///
+/// Arenas in this table can also be accessed as subdirectories of the
+/// root directory (1).
+///
+/// Key: arena name
+/// Value: root inode of arena
 const ARENA_TABLE: TableDefinition<&str, u64> = TableDefinition::new("arena");
+
+/// Tracks directory content.
+///
+/// Each entry in a directory has an entry in this table, keyed with
+/// the directory inode and the entry name.
+///
+/// To list directory content, do a range scan.
+///
+/// Empty directories have no entries in this table.
+///
+/// Key: (inode, name)
+/// Value: ReadDirEntry
 const DIRECTORY_TABLE: TableDefinition<(u64, &str), ReadDirEntry> =
     TableDefinition::new("directory");
+
+/// Track peer files.
+///
+/// Each known peer file has an entry in this table, keyed with the
+/// file inode and the peer name. More than one peer might have the
+/// same entry.
+///
+/// An inode available in no peers should be remove from all
+/// directories. This is handled by [do_rm_file_entry].
+///
+/// Key: (inode, peer)
+/// Value: FileEntry
 const FILE_TABLE: TableDefinition<(u64, &str), FileEntry> = TableDefinition::new("file");
+
+/// Track max inode.
+///
+/// This table contains a single entry, whose value is the maximum
+/// inode that's been used in the database. It defaults to 1, the root
+/// inode.
+///
+/// This table is used by [alloc_inode].
+///
+/// Key: ()
+/// Value: inode
+const MAX_INODE_TABLE: TableDefinition<(), u64> = TableDefinition::new("max_inode");
+
+/// Track peer files that might have been deleted remotely.
+///
+/// When a peer starts catchup of an arena, all its files are added to
+/// this table. Calls to catchup for that peer and arena removes the
+/// corresponding entry in the table. At the end of catchup, files
+/// still in this table are deleted.
+///
+/// This is handled by [do_mark_peer_files], [do_delete_marked_files]
+/// and [do_unmark_peer_file].
+///
+/// Key: (peer, arena, file inode)
+/// Value: parent dir inode
 const PENDING_CATCHUP_TABLE: TableDefinition<(&str, &str, u64), u64> =
     TableDefinition::new("pending_catchup");
-const MAX_INODE_TABLE: TableDefinition<u64, u64> = TableDefinition::new("max_inode");
 
 /// An entry in a directory listing.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -593,13 +648,13 @@ fn add_dir_entry(
 
 fn alloc_inode(txn: &WriteTransaction) -> Result<u64, UnrealCacheError> {
     let mut table = txn.open_table(MAX_INODE_TABLE)?;
-    let max_inode = if let Some(v) = table.get(0)? {
+    let max_inode = if let Some(v) = table.get(())? {
         v.value()
     } else {
         1
     };
     let inode = max_inode + 1;
-    table.insert(0, inode)?;
+    table.insert((), inode)?;
 
     Ok(inode)
 }
