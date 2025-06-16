@@ -50,6 +50,7 @@ mod tests {
     use crate::model::Path;
     use crate::storage::real::LocalStorage;
     use crate::storage::real::Notification;
+    use crate::storage::unreal::UnrealCacheBlocking;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::FileWriteStr as _;
     use assert_fs::prelude::PathChild as _;
@@ -78,7 +79,9 @@ mod tests {
             let peer = Peer::from("remote");
             let (tx, rx) = mpsc::channel(10);
 
-            let cache = UnrealCacheAsync::open(tempdir.child("cache.redb").path()).await?;
+            let mut cache = UnrealCacheBlocking::open(tempdir.child("cache.redb").path())?;
+            cache.add_arena(&arena)?;
+            let cache = cache.into_async();
 
             tokio::spawn(keep_cache_updated(cache.clone(), rx));
 
@@ -118,10 +121,11 @@ mod tests {
         async fn wait_for_goal_file_set(&self, goal: Vec<String>) -> anyhow::Result<()> {
             let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
             loop {
+                let arena_root = self.cache.blocking().lookup(1, "test")?.0.inode;
                 let mut got = self
                     .cache
                     .blocking()
-                    .readdir(1)?
+                    .readdir(arena_root)?
                     .map(|(n, _)| n)
                     .collect::<Vec<_>>();
                 got.sort();

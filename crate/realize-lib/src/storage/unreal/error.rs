@@ -1,5 +1,7 @@
 use tokio::task::JoinError;
 
+use crate::model::Arena;
+
 /// Error returned by the [UnrealCache].
 ///
 /// This type exists mainly so that errors can be converted when
@@ -20,6 +22,9 @@ pub enum UnrealCacheError {
 
     #[error(transparent)]
     JoinError(#[from] JoinError),
+
+    #[error("unknown arena: {0}")]
+    UnknownArena(Arena),
 }
 
 impl From<redb::TableError> for UnrealCacheError {

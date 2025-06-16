@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use futures::StreamExt as _;
 use tarpc::{
@@ -120,7 +120,7 @@ impl HistoryService for HistoryServer {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
     use assert_fs::{
         prelude::{FileWriteStr as _, PathChild as _},
