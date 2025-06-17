@@ -5,3 +5,4 @@ manual_tests/*.pid
 manual_tests/*.out
 .vscode
 packages.microsoft.*
+Test-local.toml
