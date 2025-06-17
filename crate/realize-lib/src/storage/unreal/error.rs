@@ -9,7 +9,10 @@ use crate::model::Arena;
 #[derive(Debug, thiserror::Error)]
 pub enum UnrealCacheError {
     #[error("redb error {0}")]
-    DatabaseError(#[from] redb::Error),
+    Database(redb::Error),
+
+    #[error("I/O error {0}")]
+    Io(#[from] std::io::Error),
 
     #[error{"not found"}]
     NotFound,
@@ -27,31 +30,50 @@ pub enum UnrealCacheError {
     UnknownArena(Arena),
 }
 
+impl UnrealCacheError {
+    fn from_redb(err: redb::Error) -> UnrealCacheError {
+        if let redb::Error::Io(_) = &err {
+            match err {
+                redb::Error::Io(err) => UnrealCacheError::Io(err),
+                _ => unreachable!(),
+            }
+        } else {
+            UnrealCacheError::Database(err)
+        }
+    }
+}
+
+impl From<redb::Error> for UnrealCacheError {
+    fn from(value: redb::Error) -> Self {
+        UnrealCacheError::from_redb(value)
+    }
+}
+
 impl From<redb::TableError> for UnrealCacheError {
     fn from(value: redb::TableError) -> Self {
-        UnrealCacheError::DatabaseError(value.into())
+        UnrealCacheError::from_redb(value.into())
     }
 }
 
 impl From<redb::StorageError> for UnrealCacheError {
     fn from(value: redb::StorageError) -> Self {
-        UnrealCacheError::DatabaseError(value.into())
+        UnrealCacheError::from_redb(value.into())
     }
 }
 
 impl From<redb::TransactionError> for UnrealCacheError {
     fn from(value: redb::TransactionError) -> Self {
-        UnrealCacheError::DatabaseError(value.into())
+        UnrealCacheError::from_redb(value.into())
     }
 }
 
 impl From<redb::DatabaseError> for UnrealCacheError {
     fn from(value: redb::DatabaseError) -> Self {
-        UnrealCacheError::DatabaseError(value.into())
+        UnrealCacheError::from_redb(value.into())
     }
 }
 impl From<redb::CommitError> for UnrealCacheError {
     fn from(value: redb::CommitError) -> Self {
-        UnrealCacheError::DatabaseError(value.into())
+        UnrealCacheError::from_redb(value.into())
     }
 }

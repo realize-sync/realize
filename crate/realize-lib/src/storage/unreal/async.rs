@@ -97,11 +97,17 @@ impl UnrealCacheAsync {
         &self,
         parent_inode: u64,
         name: &str,
-    ) -> Result<(ReadDirEntry, Option<FileMetadata>), UnrealCacheError> {
+    ) -> Result<ReadDirEntry, UnrealCacheError> {
         let name = name.to_string();
         let inner = Arc::clone(&self.inner);
 
         Ok(task::spawn_blocking(move || inner.lookup(parent_inode, &name)).await??)
+    }
+
+    pub async fn file_metadata(&self, inode: u64) -> Result<FileMetadata, UnrealCacheError> {
+        let inner = Arc::clone(&self.inner);
+
+        Ok(task::spawn_blocking(move || inner.file_metadata(inode)).await??)
     }
 
     pub async fn readdir(

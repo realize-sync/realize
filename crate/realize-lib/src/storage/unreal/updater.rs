@@ -121,7 +121,7 @@ mod tests {
         async fn wait_for_goal_file_set(&self, goal: Vec<String>) -> anyhow::Result<()> {
             let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
             loop {
-                let arena_root = self.cache.blocking().lookup(1, "test")?.0.inode;
+                let arena_root = self.cache.blocking().lookup(1, "test")?.inode;
                 let mut got = self
                     .cache
                     .blocking()

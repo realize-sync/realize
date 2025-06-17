@@ -333,25 +333,21 @@ impl UnrealCacheBlocking {
         Ok(())
     }
 
-    pub fn lookup(
-        &self,
-        parent_inode: u64,
-        name: &str,
-    ) -> Result<(ReadDirEntry, Option<FileMetadata>), UnrealCacheError> {
+    pub fn lookup(&self, parent_inode: u64, name: &str) -> Result<ReadDirEntry, UnrealCacheError> {
         let txn = self.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-        let entry = dir_table
+
+        Ok(dir_table
             .get((parent_inode, name))?
             .ok_or(UnrealCacheError::NotFound)?
-            .value();
-        match &entry.assignment {
-            InodeAssignment::File => {
-                let file_entry = get_best_file_entry(&txn, entry.inode)?;
+            .value())
+    }
 
-                Ok((entry, Some(file_entry.metadata)))
-            }
-            InodeAssignment::Directory => Ok((entry, None)),
-        }
+    pub fn file_metadata(&self, inode: u64) -> Result<FileMetadata, UnrealCacheError> {
+        let txn = self.db.begin_read()?;
+        let file_entry = get_best_file_entry(&txn, inode)?;
+
+        Ok(file_entry.metadata)
     }
 
     pub fn readdir(&self, inode: u64) -> Result<Vec<(String, ReadDirEntry)>, UnrealCacheError> {
@@ -947,14 +943,14 @@ mod tests {
         cache.link(&peer, &arena, &file_path, 100, mtime)?;
 
         // Lookup directory
-        let (dir_entry, metadata) = cache.lookup(cache.arena_root(&arena)?, "a")?;
+        let dir_entry = cache.lookup(cache.arena_root(&arena)?, "a")?;
         assert_eq!(dir_entry.assignment, InodeAssignment::Directory);
-        assert_eq!(metadata, None);
 
         // Lookup file
-        let (file_entry, metadata) = cache.lookup(dir_entry.inode, "file.txt")?;
+        let file_entry = cache.lookup(dir_entry.inode, "file.txt")?;
         assert_eq!(file_entry.assignment, InodeAssignment::File);
-        let metadata = metadata.expect("files must have metadata");
+
+        let metadata = cache.file_metadata(file_entry.inode)?;
         assert_eq!(metadata.mtime, mtime);
         assert_eq!(metadata.size, 100);
 
@@ -1001,7 +997,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
 
-        let (dir_entry, _) = cache.lookup(ROOT_DIR, arena.as_str())?;
+        let dir_entry = cache.lookup(ROOT_DIR, arena.as_str())?;
         assert_unordered::assert_eq_unordered!(
             vec![("dir".to_string(), InodeAssignment::Directory),],
             cache
@@ -1011,7 +1007,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
 
-        let (dir_entry, _) = cache.lookup(dir_entry.inode, "dir")?;
+        let dir_entry = cache.lookup(dir_entry.inode, "dir")?;
         assert_unordered::assert_eq_unordered!(
             vec![
                 ("file1.txt".to_string(), InodeAssignment::File),
@@ -1044,8 +1040,8 @@ mod tests {
         cache.link(&peer1, &arena, &file_path, 100, mtime1)?;
         cache.link(&peer2, &arena, &file_path, 200, mtime2)?;
 
-        let (_, metadata) = cache.lookup(cache.arena_root(&arena)?, "file.txt")?;
-        let metadata = metadata.expect("files must have metadata");
+        let file_entry = cache.lookup(cache.arena_root(&arena)?, "file.txt")?;
+        let metadata = cache.file_metadata(file_entry.inode)?;
         assert_eq!(metadata.size, 200);
         assert_eq!(metadata.mtime, mtime2);
 
@@ -1079,7 +1075,7 @@ mod tests {
         cache.link(&peer1, &arena, &file4, 10, mtime)?;
 
         let arena_root = cache.arena_root(&arena)?;
-        let file1_inode = cache.lookup(arena_root, file1.name())?.0.inode;
+        let file1_inode = cache.lookup(arena_root, file1.name())?.inode;
 
         // Simulate a catchup that only reports file2 and file4.
         cache.mark_peer_files(&peer1, &arena)?;
@@ -1093,11 +1089,11 @@ mod tests {
             Err(UnrealCacheError::NotFound)
         ));
         // File2 and 3 should still be available, from other peers
-        let file2_inode = cache.lookup(arena_root, file2.name())?.0.inode;
-        let file3_inode = cache.lookup(arena_root, file3.name())?.0.inode;
+        let file2_inode = cache.lookup(arena_root, file2.name())?.inode;
+        let file3_inode = cache.lookup(arena_root, file3.name())?.inode;
 
         // File4 should still be available, from peer1
-        let file4_inode = cache.lookup(arena_root, file4.name())?.0.inode;
+        let file4_inode = cache.lookup(arena_root, file4.name())?.inode;
 
         // Check file table entries directly
         {
