@@ -1,14 +1,12 @@
 use common::mountpoint;
-use realize_lib::model::Arena;
+use realize_lib::{model::Arena, storage::unreal::UnrealCacheBlocking};
 
 mod common;
 
 #[tokio::test]
 #[test_tag::tag(nfs)]
 async fn export_arena() -> anyhow::Result<()> {
-    let mut cache = realize_lib::storage::unreal::UnrealCacheBlocking::new(
-        redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?,
-    )?;
+    let mut cache = in_memory_cache()?;
     let arena = Arena::from("test");
     cache.add_arena(&arena)?;
     let cache = cache.into_async();
@@ -29,4 +27,12 @@ async fn export_arena() -> anyhow::Result<()> {
     assert!(dir_content.next_entry().await?.is_none());
 
     Ok(())
+}
+
+fn in_memory_cache() -> anyhow::Result<UnrealCacheBlocking> {
+    let cache = realize_lib::storage::unreal::UnrealCacheBlocking::new(
+        redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?,
+    )?;
+
+    Ok(cache)
 }
