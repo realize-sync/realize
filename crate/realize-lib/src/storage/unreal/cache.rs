@@ -492,7 +492,7 @@ fn get_best_file_entry(txn: &ReadTransaction, inode: u64) -> Result<FileEntry, U
     let file_table = txn.open_table(FILE_TABLE)?;
 
     let mut best: Option<FileEntry> = None;
-    for entry in file_table.range((inode, "")..)? {
+    for entry in file_table.range((inode, "")..(inode + 1, ""))? {
         let entry = entry?;
         let file_entry: FileEntry = entry.1.value();
         let replace = match &best {
@@ -543,6 +543,7 @@ fn do_link(
             dir_entry.inode
         }
     };
+    log::debug!("new file entry ({inode} {peer})");
     file_table.insert(
         (inode, peer.as_str()),
         FileEntry {
@@ -630,7 +631,7 @@ fn add_dir_entry(
     assignment: InodeAssignment,
 ) -> Result<u64, UnrealCacheError> {
     let new_inode = alloc_inode(txn)?;
-    log::debug!("new inode: {new_inode}");
+    log::debug!("new dir entry {parent_inode} {name} -> {new_inode} {assignment:?}");
     dir_table.insert(
         (parent_inode, name),
         ReadDirEntry {
