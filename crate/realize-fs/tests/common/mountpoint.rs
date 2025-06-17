@@ -1,6 +1,6 @@
-use std::{path::PathBuf, process::Stdio};
+use std::{fs::File, path::PathBuf, process::Stdio, time::Duration};
 
-use nix::fcntl::FlockArg;
+use nix::fcntl::{Flock, FlockArg};
 use realize_lib::{
     network::hostport::HostPort, storage::unreal::UnrealCacheAsync, utils::async_utils::AbortOnDrop,
 };
@@ -10,7 +10,8 @@ use crate::common::config::Config;
 
 pub struct Fixture {
     pub mountpoint: PathBuf,
-    _export: AbortOnDrop<std::io::Result<()>>,
+    _export: Option<AbortOnDrop<std::io::Result<()>>>,
+    _lock: Flock<File>,
 }
 impl Fixture {
     pub async fn setup(cache: UnrealCacheAsync) -> anyhow::Result<Fixture> {
@@ -26,7 +27,7 @@ impl Fixture {
                 std::fs::create_dir_all(p)?;
             }
         }
-        let _lock = nix::fcntl::Flock::lock(
+        let lock = Flock::lock(
             std::fs::File::create(&nfs_config.flock)?,
             FlockArg::LockExclusive,
         )
@@ -40,12 +41,10 @@ impl Fixture {
         log::debug!("Obtained lock {}", nfs_config.flock.display());
 
         log::debug!("Exporting UnrealFs on localhost:{}", nfs_config.port);
-        let export = AbortOnDrop::new(
-            realize_fs::nfs::export(cache, HostPort::localhost(nfs_config.port).addr()).await?,
-        );
+        let export = export_retry(cache, nfs_config.port).await?;
 
         if nfs_config.mountpoint.exists() {
-            log::debug!("Unmounting {}", nfs_config.mountpoint.display());
+            log::debug!("Unmounting {} (cleanup)", nfs_config.mountpoint.display());
             let _ = Command::new("umount")
                 .stdin(Stdio::null())
                 .arg(&nfs_config.mountpoint)
@@ -69,8 +68,9 @@ impl Fixture {
         log::debug!("UnrealFs mounted on {}", nfs_config.mountpoint.display());
 
         Ok(Fixture {
+            _lock: lock,
             mountpoint: nfs_config.mountpoint,
-            _export: export,
+            _export: Some(export),
         })
     }
 }
@@ -78,11 +78,38 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let mountpoint = &self.mountpoint;
-        log::debug!("Unmounting {}", mountpoint.display());
+        log::debug!("Unmounting {} (on drop)", mountpoint.display());
 
         let _ = std::process::Command::new("umount")
             .stdin(Stdio::null())
             .arg(mountpoint)
-            .spawn();
+            .status();
     }
+}
+
+/// It might take some time for the address to be freed between runs.
+/// Retry exporting for 1s.
+async fn export_retry(
+    cache: UnrealCacheAsync,
+    port: u16,
+) -> std::io::Result<AbortOnDrop<std::io::Result<()>>> {
+    let addr = HostPort::localhost(port).addr();
+    for _ in 0..10 {
+        match realize_fs::nfs::export(cache.clone(), addr).await {
+            Ok(handle) => {
+                return Ok(AbortOnDrop::new(handle));
+            }
+            Err(err) => {
+                if err.kind() == std::io::ErrorKind::AddrInUse {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        "Address already in use (retried)",
+    ))
 }
