@@ -55,7 +55,7 @@ impl UnrealFs {
     ) -> Result<fileid3, UnrealFsError> {
         Ok(self
             .cache
-            .lookup(dirid, str::from_utf8(filename)?)
+            .lookup(dirid, std::str::from_utf8(filename)?)
             .await?
             .inode)
     }
