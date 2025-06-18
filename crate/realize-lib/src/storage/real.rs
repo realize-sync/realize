@@ -6,13 +6,19 @@ use std::{
     sync::Arc,
 };
 
-use tokio::{fs, sync::mpsc};
+use tokio::fs;
+
+#[cfg(target_os = "linux")]
+use tokio::sync::mpsc;
 
 use crate::model::{self, Arena};
 
 use super::config::ArenaConfig;
 
+#[cfg(target_os = "linux")]
 mod history;
+
+#[cfg(target_os = "linux")]
 pub use history::Notification;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -68,6 +74,7 @@ impl LocalStorage {
     /// creating watches requires going through the whole arena, so
     /// use a join if you need to subscribe to multiple arenas at the
     /// same time.
+    #[cfg(target_os = "linux")]
     pub async fn subscribe(
         &self,
         arena: Arena,

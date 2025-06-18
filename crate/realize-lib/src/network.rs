@@ -134,6 +134,7 @@ impl Networking {
         Ok(transport)
     }
 
+    #[allow(dead_code)] // only on macos, without inotify support
     pub(crate) async fn connect_with_retries<Req, Resp>(
         &self,
         peer: &Peer,
