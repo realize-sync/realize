@@ -1,5 +1,7 @@
 use std::time::{Duration, SystemTime};
 
+use assert_fs::prelude::FileWriteStr as _;
+use assert_fs::prelude::PathChild as _;
 use common::mountpoint;
 use realize_lib::model::Path;
 use std::os::unix::fs::PermissionsExt as _;
@@ -66,6 +68,29 @@ async fn export_linked_files() -> anyhow::Result<()> {
     assert!(metadata.file_type().is_file());
     assert_eq!(0o0440, metadata.permissions().mode() & 0o7777);
     assert_eq!(test_mtime, metadata.modified().unwrap());
+
+    Ok(())
+}
+
+#[tokio::test]
+#[test_tag::tag(nfs)]
+async fn read_file() -> anyhow::Result<()> {
+    let fixture = mountpoint::Fixture::setup().await?;
+    let cache = &fixture.cache;
+    let peer = realize_lib::model::Peer::from("server");
+    let arena = &fixture.arena;
+    let path = Path::parse("testfile.txt")?;
+    let testfile = fixture.tempdir.child("testfile.txt");
+    testfile.write_str("hello, world")?;
+    let m = tokio::fs::metadata(&testfile.path()).await?;
+    cache
+        .link(&peer, arena, &path, m.len(), m.modified()?)
+        .await?;
+
+    assert_eq!(
+        "hello, world",
+        tokio::fs::read_to_string(&fixture.mountpoint.join("test/testfile.txt")).await?
+    );
 
     Ok(())
 }

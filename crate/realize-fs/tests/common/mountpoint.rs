@@ -25,10 +25,10 @@ pub struct Fixture {
     pub arena: Arena,
     pub cache: UnrealCacheAsync,
     pub mountpoint: PathBuf,
+    pub tempdir: TempDir,
     _export: Option<AbortOnDrop<std::io::Result<()>>>,
     _lock: Flock<File>,
     _server: Arc<Server>,
-    _tempdir: TempDir,
 }
 impl Fixture {
     pub async fn setup() -> anyhow::Result<Self> {
@@ -39,7 +39,7 @@ impl Fixture {
         let store = LocalStorage::new(vec![(arena.clone(), tempdir.path().to_path_buf())]);
         let keys = test_keys();
         let verifier = setup_verifier(&keys);
-        let client = Peer::from("b");
+        let client = Peer::from("server");
         let mut server = Server::new(Networking::new(
             vec![],
             RawPublicKeyResolver::from_private_key_file(&keys.privkey_a_path)?,
@@ -120,7 +120,7 @@ impl Fixture {
             mountpoint: nfs_config.mountpoint,
             _export: Some(export),
             _server: server,
-            _tempdir: tempdir,
+            tempdir,
         })
     }
 }
