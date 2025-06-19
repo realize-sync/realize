@@ -209,6 +209,7 @@ impl UnrealCacheBlocking {
         Ok(())
     }
 
+    /// Lookup a directory entry.
     pub fn lookup(&self, parent_inode: u64, name: &str) -> Result<ReadDirEntry, UnrealCacheError> {
         let txn = self.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
@@ -217,6 +218,18 @@ impl UnrealCacheBlocking {
             .get((parent_inode, name))?
             .ok_or(UnrealCacheError::NotFound)?
             .value())
+    }
+
+    /// Lookup the inode and type of the file or directory pointed to by a path.
+    pub fn lookup_path(
+        &self,
+        parent_inode: u64,
+        path: &Path,
+    ) -> Result<(u64, InodeAssignment), UnrealCacheError> {
+        let txn = self.db.begin_read()?;
+        let dir_table = txn.open_table(DIRECTORY_TABLE)?;
+
+        do_lookup_path(&dir_table, parent_inode, &Some(path.clone()))
     }
 
     /// Return the best metadata for the file.
@@ -339,8 +352,7 @@ fn do_unlink(
     mtime: SystemTime,
 ) -> Result<(), UnrealCacheError> {
     let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
-    let (parent_inode, parent_assignment) =
-        do_lookup_path(&mut dir_table, arena_root, &path.parent())?;
+    let (parent_inode, parent_assignment) = do_lookup_path(&dir_table, arena_root, &path.parent())?;
     if parent_assignment != InodeAssignment::Directory {
         return Err(UnrealCacheError::NotADirectory);
     }
@@ -481,17 +493,16 @@ fn do_mkdirs(
 
 /// Find the file or directory pointed to by the given path.
 fn do_lookup_path(
-    dir_table: &mut redb::Table<'_, (u64, &str), ReadDirEntry>,
+    dir_table: &impl redb::ReadableTable<(u64, &'static str), ReadDirEntry>,
     root_inode: u64,
     path: &Option<Path>,
 ) -> Result<(u64, InodeAssignment), UnrealCacheError> {
     let mut current = (root_inode, InodeAssignment::Directory);
     for component in Path::components(path) {
+        if current.1 != InodeAssignment::Directory {
+            return Err(UnrealCacheError::NotADirectory);
+        }
         if let Some(entry) = get_dir_entry(dir_table, current.0, component)? {
-            if entry.assignment != InodeAssignment::Directory {
-                return Err(UnrealCacheError::NotADirectory);
-            }
-
             current = (entry.inode, entry.assignment);
         } else {
             return Err(UnrealCacheError::NotFound);
@@ -503,7 +514,7 @@ fn do_lookup_path(
 
 /// Get a [ReadDirEntry] from a directory, if it exists.
 fn get_dir_entry(
-    dir_table: &redb::Table<'_, (u64, &str), ReadDirEntry>,
+    dir_table: &impl redb::ReadableTable<(u64, &'static str), ReadDirEntry>,
     parent_inode: u64,
     name: &str,
 ) -> Result<Option<ReadDirEntry>, UnrealCacheError> {
@@ -860,6 +871,27 @@ mod tests {
     }
 
     #[test]
+    fn lookup_path_finds_entry() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let cache = &fixture.cache;
+        let peer = test_peer();
+        let arena = test_arena();
+        let path = Path::parse("a/b/c/file.txt")?;
+        let mtime = SystemTime::now();
+
+        cache.link(&peer, &arena, &path, 100, mtime)?;
+
+        let (inode, assignment) = cache.lookup_path(cache.arena_root(&arena)?, &path)?;
+        assert_eq!(assignment, InodeAssignment::File);
+
+        let metadata = cache.file_metadata(inode)?;
+        assert_eq!(metadata.mtime, mtime);
+        assert_eq!(metadata.size, 100);
+
+        Ok(())
+    }
+
+    #[test]
     fn readdir_returns_all_entries() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let cache = &fixture.cache;
@@ -933,6 +965,60 @@ mod tests {
         let metadata = cache.file_metadata(file_entry.inode)?;
         assert_eq!(metadata.size, 200);
         assert_eq!(metadata.mtime, mtime2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn file_available_from_multiple_peers() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let cache = &fixture.cache;
+
+        let a = Peer::from("a");
+        let b = Peer::from("b");
+        let c = Peer::from("c");
+        let arena = test_arena();
+        let path = Path::parse("file.txt")?;
+
+        let mtime1 = SystemTime::now();
+        let mtime2 = mtime1 + Duration::from_secs(1);
+
+        cache.link(&a, &arena, &path, 100, mtime1)?;
+        cache.link(&b, &arena, &path, 200, mtime2)?;
+        cache.link(&c, &arena, &path, 200, mtime2)?;
+
+        let parent_inode = cache.arena_root(&arena)?;
+        let inode = cache.lookup(parent_inode, "file.txt")?.inode;
+        let avail = cache.file_availability(inode)?;
+        assert_unordered::assert_eq_unordered!(
+            vec![
+                (
+                    b.clone(),
+                    FileEntry {
+                        arena: arena.clone(),
+                        path: path.clone(),
+                        metadata: FileMetadata {
+                            size: 200,
+                            mtime: mtime2,
+                        },
+                        parent_inode
+                    }
+                ),
+                (
+                    c.clone(),
+                    FileEntry {
+                        arena: arena.clone(),
+                        path: path.clone(),
+                        metadata: FileMetadata {
+                            size: 200,
+                            mtime: mtime2,
+                        },
+                        parent_inode
+                    }
+                )
+            ],
+            avail
+        );
 
         Ok(())
     }

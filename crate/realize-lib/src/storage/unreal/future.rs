@@ -4,7 +4,9 @@ use tokio::task;
 
 use crate::model::{Arena, Path, Peer};
 
-use super::{FileEntry, FileMetadata, ReadDirEntry, UnrealCacheBlocking, UnrealCacheError};
+use super::{
+    FileEntry, FileMetadata, InodeAssignment, ReadDirEntry, UnrealCacheBlocking, UnrealCacheError,
+};
 
 #[derive(Clone)]
 pub struct UnrealCacheAsync {
@@ -102,6 +104,17 @@ impl UnrealCacheAsync {
         let inner = Arc::clone(&self.inner);
 
         Ok(task::spawn_blocking(move || inner.lookup(parent_inode, &name)).await??)
+    }
+
+    pub async fn lookup_path(
+        &self,
+        parent_inode: u64,
+        path: &Path,
+    ) -> Result<(u64, InodeAssignment), UnrealCacheError> {
+        let path = path.clone();
+        let inner = Arc::clone(&self.inner);
+
+        Ok(task::spawn_blocking(move || inner.lookup_path(parent_inode, &path)).await??)
     }
 
     pub async fn file_metadata(&self, inode: u64) -> Result<FileMetadata, UnrealCacheError> {
