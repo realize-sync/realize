@@ -1,4 +1,43 @@
-use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer, pem::PemObject as _};
+use std::sync::Arc;
+
+use rustls::pki_types::{pem::PemObject as _, PrivateKeyDer, SubjectPublicKeyInfoDer};
+
+use crate::model::Peer;
+
+use super::{PeerVerifier, RawPublicKeyResolver};
+
+/// Standard client peer for testing.
+pub fn client_peer() -> Peer {
+    Peer::from("client")
+}
+
+/// Standard server peer for testing.
+pub fn server_peer() -> Peer {
+    Peer::from("server")
+}
+
+/// Verifier that knows public and client peers.
+pub fn client_server_verifier() -> Arc<PeerVerifier> {
+    let mut verifier = PeerVerifier::new();
+    verifier.add_peer(&client_peer(), client_public_key());
+    verifier.add_peer(&server_peer(), server_public_key());
+
+    Arc::new(verifier)
+}
+
+/// Resolver for server peer.
+pub fn server_resolver() -> anyhow::Result<Arc<RawPublicKeyResolver>> {
+    let resolver = RawPublicKeyResolver::from_private_key(server_private_key())?;
+
+    Ok(resolver)
+}
+
+/// Resolver for client peer.
+pub fn client_resolver() -> anyhow::Result<Arc<RawPublicKeyResolver>> {
+    let resolver = RawPublicKeyResolver::from_private_key(client_private_key())?;
+
+    Ok(resolver)
+}
 
 /// Public key for test clients.
 ///
