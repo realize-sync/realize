@@ -32,6 +32,7 @@ use super::{FileEntry, UnrealCacheAsync, UnrealCacheError};
 const MIN_CHUNK_SIZE: usize = 8 * 1024;
 const MAX_CHUNK_SIZE: usize = 32 * 1024;
 
+#[derive(Clone)]
 pub struct Downloader {
     networking: Networking,
     cache: UnrealCacheAsync,
@@ -49,7 +50,7 @@ impl Downloader {
         }
     }
 
-    pub async fn reader(&mut self, inode: u64) -> Result<Download, UnrealCacheError> {
+    pub async fn reader(&self, inode: u64) -> Result<Download, UnrealCacheError> {
         let avail = self.cache.file_availability(inode).await?;
         if avail.is_empty() {
             return Err(UnrealCacheError::NotFound);
@@ -118,7 +119,13 @@ pub struct Download {
     avail: VecDeque<(ByteRange, Vec<u8>)>,
     pending: Option<(
         ByteRange,
-        Pin<Box<dyn Future<Output = Result<Result<Vec<u8>, RealStoreServiceError>, RpcError>>>>,
+        Pin<
+            Box<
+                dyn Future<Output = Result<Result<Vec<u8>, RealStoreServiceError>, RpcError>>
+                    + Send
+                    + Sync,
+            >,
+        >,
     )>,
 }
 
@@ -133,6 +140,11 @@ impl Download {
             avail: VecDeque::new(),
             pending: None,
         }
+    }
+
+    /// Check whether the current offset is at or past the file end.
+    pub fn at_end(&self) -> bool {
+        self.offset >= self.entry.metadata.size
     }
 
     fn fill(&mut self, buf: &mut ReadBuf<'_>) -> bool {
@@ -174,7 +186,13 @@ impl Download {
         bufsize: usize,
     ) -> (
         ByteRange,
-        Pin<Box<dyn Future<Output = Result<Result<Vec<u8>, RealStoreServiceError>, RpcError>>>>,
+        Pin<
+            Box<
+                dyn Future<Output = Result<Result<Vec<u8>, RealStoreServiceError>, RpcError>>
+                    + Send
+                    + Sync,
+            >,
+        >,
     ) {
         let offset = self.offset;
         let end = self.entry.metadata.size;
@@ -415,7 +433,7 @@ mod tests {
         let inode = fixture
             .add_file_with_content("test.txt", "File content")
             .await?;
-        let mut downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
+        let downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
         let mut reader = downloader.reader(inode).await?;
 
         assert_eq!("File content", read_string(&mut reader).await?);
@@ -428,7 +446,7 @@ mod tests {
         let inode = fixture
             .add_file_with_content("test.txt", "baa, baa, black sheep")
             .await?;
-        let mut downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
+        let downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
         let mut reader = downloader.reader(inode).await?;
 
         reader.seek(SeekFrom::Start(10)).await?;
@@ -456,7 +474,7 @@ mod tests {
         let inode = fixture
             .add_file_with_content("test.txt", "baa, baa, black sheep")
             .await?;
-        let mut downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
+        let downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
         let mut reader = downloader.reader(inode).await?;
 
         reader.seek(SeekFrom::Start(100)).await?;
@@ -478,7 +496,7 @@ mod tests {
         let inode = fixture
             .add_file_with_content("test.txt", "baa, baa, black sheep")
             .await?;
-        let mut downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
+        let downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
         let mut reader = downloader.reader(inode).await?;
 
         assert!(reader.seek(SeekFrom::End(-100)).await.is_err());
@@ -500,7 +518,7 @@ mod tests {
         }
 
         let inode = fixture.add_file(path).await?;
-        let mut downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
+        let downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
         let mut reader = downloader.reader(inode).await?;
 
         let mut buf = [0u8; 16];
@@ -563,7 +581,7 @@ mod tests {
             .write_binary(&vec![0xAB; file_size])?;
 
         let inode = fixture.add_file(path).await?;
-        let mut downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
+        let downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
         let mut reader = downloader.reader(inode).await?;
 
         if allow_short_reads {

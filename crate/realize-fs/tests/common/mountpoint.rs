@@ -1,21 +1,67 @@
-use std::{fs::File, path::PathBuf, process::Stdio, time::Duration};
+use std::{fs::File, path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 
+use assert_fs::TempDir;
 use nix::fcntl::{Flock, FlockArg};
 use realize_lib::{
-    network::hostport::HostPort, storage::unreal::UnrealCacheAsync, utils::async_utils::AbortOnDrop,
+    model::{Arena, Peer},
+    network::{
+        hostport::HostPort,
+        rpc::realstore,
+        security::{PeerVerifier, RawPublicKeyResolver},
+        Networking, Server,
+    },
+    storage::{
+        real::LocalStorage,
+        unreal::{Downloader, UnrealCacheAsync, UnrealCacheBlocking},
+    },
+    utils::async_utils::AbortOnDrop,
 };
+use rustls::pki_types::pem::PemObject as _;
 use tokio::process::Command;
 
 use crate::common::config::Config;
 
 pub struct Fixture {
+    pub arena: Arena,
+    pub cache: UnrealCacheAsync,
     pub mountpoint: PathBuf,
     _export: Option<AbortOnDrop<std::io::Result<()>>>,
     _lock: Flock<File>,
+    _server: Arc<Server>,
+    _tempdir: TempDir,
 }
 impl Fixture {
-    pub async fn setup(cache: UnrealCacheAsync) -> anyhow::Result<Fixture> {
+    pub async fn setup() -> anyhow::Result<Self> {
         let _ = env_logger::try_init();
+
+        let tempdir = TempDir::new()?;
+        let arena = Arena::from("test");
+        let store = LocalStorage::new(vec![(arena.clone(), tempdir.path().to_path_buf())]);
+        let keys = test_keys();
+        let verifier = setup_verifier(&keys);
+        let client = Peer::from("b");
+        let mut server = Server::new(Networking::new(
+            vec![],
+            RawPublicKeyResolver::from_private_key_file(&keys.privkey_a_path)?,
+            Arc::clone(&verifier),
+        ));
+        realstore::server::register(&mut server, store);
+        let server = Arc::new(server);
+        let addr = server.listen(&HostPort::localhost(0)).await?;
+
+        let mut cache = in_memory_cache()?;
+        cache.add_arena(&arena)?;
+        let cache = cache.into_async();
+
+        let downloader = Downloader::new(
+            Networking::new(
+                vec![(&client, addr.to_string().as_ref())],
+                RawPublicKeyResolver::from_private_key_file(&keys.privkey_b_path)?,
+                Arc::clone(&verifier),
+            ),
+            cache.clone(),
+        );
+
         let config = Config::read()?;
         let nfs_config = config.nfs.ok_or_else(|| {
             anyhow::anyhow!("NFS should be configure in {}", Config::path().display())
@@ -41,7 +87,7 @@ impl Fixture {
         log::debug!("Obtained lock {}", nfs_config.flock.display());
 
         log::debug!("Exporting UnrealFs on localhost:{}", nfs_config.port);
-        let export = export_retry(cache, nfs_config.port).await?;
+        let export = export_retry(cache.clone(), downloader, nfs_config.port).await?;
 
         if nfs_config.mountpoint.exists() {
             log::debug!("Unmounting {} (cleanup)", nfs_config.mountpoint.display());
@@ -69,8 +115,12 @@ impl Fixture {
 
         Ok(Fixture {
             _lock: lock,
+            arena,
+            cache,
             mountpoint: nfs_config.mountpoint,
             _export: Some(export),
+            _server: server,
+            _tempdir: tempdir,
         })
     }
 }
@@ -91,11 +141,12 @@ impl Drop for Fixture {
 /// Retry exporting for 1s.
 async fn export_retry(
     cache: UnrealCacheAsync,
+    downloader: Downloader,
     port: u16,
 ) -> std::io::Result<AbortOnDrop<std::io::Result<()>>> {
     let addr = HostPort::localhost(port).addr();
     for _ in 0..10 {
-        match realize_fs::nfs::export(cache.clone(), addr).await {
+        match realize_fs::nfs::export(cache.clone(), downloader.clone(), addr).await {
             Ok(handle) => {
                 return Ok(AbortOnDrop::new(handle));
             }
@@ -112,4 +163,44 @@ async fn export_retry(
         std::io::ErrorKind::AddrInUse,
         "Address already in use (retried)",
     ))
+}
+
+fn in_memory_cache() -> anyhow::Result<UnrealCacheBlocking> {
+    let cache = realize_lib::storage::unreal::UnrealCacheBlocking::new(
+        redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?,
+    )?;
+
+    Ok(cache)
+}
+
+pub struct TestKeys {
+    pub privkey_a_path: Arc<PathBuf>,
+    pub privkey_b_path: Arc<PathBuf>,
+    pub pubkey_a_path: PathBuf,
+    pub pubkey_b_path: PathBuf,
+}
+
+pub fn test_keys() -> TestKeys {
+    let resources =
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../resources/test");
+    TestKeys {
+        privkey_a_path: Arc::new(resources.join("a.key")),
+        privkey_b_path: Arc::new(resources.join("b.key")),
+        pubkey_a_path: resources.join("a-spki.pem"),
+        pubkey_b_path: resources.join("b-spki.pem"),
+    }
+}
+
+pub fn setup_verifier(keys: &TestKeys) -> Arc<PeerVerifier> {
+    let mut verifier = PeerVerifier::new();
+    verifier.add_peer(
+        &Peer::from("a"),
+        rustls::pki_types::SubjectPublicKeyInfoDer::from_pem_file(&keys.pubkey_a_path).unwrap(),
+    );
+    verifier.add_peer(
+        &Peer::from("b"),
+        rustls::pki_types::SubjectPublicKeyInfoDer::from_pem_file(&keys.pubkey_b_path).unwrap(),
+    );
+
+    Arc::new(verifier)
 }

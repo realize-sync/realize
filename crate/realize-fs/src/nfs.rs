@@ -1,9 +1,12 @@
 use std::{
+    io::{ErrorKind, SeekFrom},
     net::SocketAddr,
     str::Utf8Error,
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
+use moka::future::Cache;
 use nfsserve::{
     nfs::{
         fattr3, fileid3, filename3, ftype3, gid3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
@@ -15,17 +18,23 @@ use nfsserve::{
 
 use async_trait::async_trait;
 use realize_lib::storage::unreal::{
-    self, FileMetadata, InodeAssignment, UnrealCacheAsync, UnrealCacheError,
+    self, Download, Downloader, FileMetadata, InodeAssignment, UnrealCacheAsync, UnrealCacheError,
 };
-use tokio::task::JoinHandle;
+use tokio::{
+    io::{AsyncReadExt as _, AsyncSeekExt as _},
+    sync::Mutex,
+    task::JoinHandle,
+};
 
 /// Export the given cache at the given socket address.
 pub async fn export(
     cache: UnrealCacheAsync,
+    downloader: Downloader,
     addr: SocketAddr,
 ) -> std::io::Result<JoinHandle<std::io::Result<()>>> {
     log::debug!("Listening to {}", addr);
-    let listener = NFSTcpListener::bind(&addr.to_string(), UnrealFs::new(cache)).await?;
+    let listener =
+        NFSTcpListener::bind(&addr.to_string(), UnrealFs::new(cache, downloader)).await?;
 
     Ok(tokio::spawn(async move {
         log::debug!("Running listener to {}", addr);
@@ -35,17 +44,40 @@ pub async fn export(
 
 struct UnrealFs {
     cache: UnrealCacheAsync,
+    downloader: Downloader,
+    readers: Cache<u64, Arc<Mutex<Download>>>,
     uid: uid3,
     gid: gid3,
 }
 
 impl UnrealFs {
-    fn new(cache: UnrealCacheAsync) -> UnrealFs {
+    fn new(cache: UnrealCacheAsync, downloader: Downloader) -> UnrealFs {
         Self {
             cache,
+            downloader,
             uid: nix::unistd::getuid().into(),
             gid: nix::unistd::getgid().into(),
+            // TODO: get notified when file modified or deleted and keep for a longer time.
+            readers: Cache::builder()
+                .max_capacity(128)
+                .time_to_idle(Duration::from_secs(10))
+                .build(),
         }
+    }
+
+    async fn do_read(
+        &self,
+        reader: Arc<Mutex<Download>>,
+        offset: u64,
+        count: u32,
+    ) -> Result<(Vec<u8>, bool), UnrealFsError> {
+        let mut reader = reader.lock().await;
+        reader.seek(SeekFrom::Start(offset)).await?;
+        let mut vec = vec![0; count as usize];
+        let n = reader.read(&mut vec).await?;
+        vec.truncate(n);
+
+        Ok((vec, reader.at_end()))
     }
 
     async fn do_lookup(
@@ -195,11 +227,23 @@ impl NFSFileSystem for UnrealFs {
 
     async fn read(
         &self,
-        _id: fileid3,
-        _offset: u64,
-        _count: u32,
+        id: fileid3,
+        offset: u64,
+        count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
-        return Err(nfsstat3::NFS3ERR_NOTSUPP);
+        let reader = self
+            .readers
+            .entry(id)
+            .or_try_insert_with(async {
+                let reader = self.downloader.reader(id).await?;
+
+                Ok::<_, UnrealCacheError>(Arc::new(Mutex::new(reader)))
+            })
+            .await
+            .map_err(|e| unreal_to_nfsstat3(e.as_ref()))?
+            .into_value();
+
+        Ok(self.do_read(reader, offset, count).await?)
     }
 
     async fn readdir(
@@ -258,21 +302,46 @@ enum UnrealFsError {
 
     #[error("invalid UTF-8 string")]
     Utf8(#[from] Utf8Error),
+
+    #[error("I/O error")]
+    Io(#[from] std::io::Error),
 }
 
 impl From<UnrealFsError> for nfsstat3 {
     fn from(err: UnrealFsError) -> nfsstat3 {
         use nfsstat3::*;
-        use UnrealCacheError::*;
-        use UnrealFsError::*;
         match err {
-            Utf8(_) => NFS3ERR_NOENT,
-            Cache(NotFound) => NFS3ERR_NOENT,
-            Cache(NotADirectory) => NFS3ERR_NOTDIR,
-            Cache(IsADirectory) => NFS3ERR_ISDIR,
-            Cache(Io(_)) => NFS3ERR_IO,
-            _ => NFS3ERR_SERVERFAULT,
+            UnrealFsError::Utf8(_) => NFS3ERR_NOENT,
+            UnrealFsError::Cache(e) => unreal_to_nfsstat3(&e),
+            UnrealFsError::Io(e) => io_to_nfsstat3(&e),
         }
+    }
+}
+
+fn unreal_to_nfsstat3(err: &UnrealCacheError) -> nfsstat3 {
+    use nfsstat3::*;
+    use UnrealCacheError::*;
+    match err {
+        NotFound => NFS3ERR_NOENT,
+        NotADirectory => NFS3ERR_NOTDIR,
+        IsADirectory => NFS3ERR_ISDIR,
+        Io(e) => io_to_nfsstat3(e),
+        _ => NFS3ERR_SERVERFAULT,
+    }
+}
+
+fn io_to_nfsstat3(err: &std::io::Error) -> nfsstat3 {
+    use nfsstat3::*;
+    match err.kind() {
+        ErrorKind::NotFound => NFS3ERR_NOENT,
+        ErrorKind::NotADirectory => NFS3ERR_NOTDIR,
+        ErrorKind::IsADirectory => NFS3ERR_ISDIR,
+        ErrorKind::PermissionDenied => NFS3ERR_PERM,
+        ErrorKind::AlreadyExists => NFS3ERR_EXIST,
+        ErrorKind::InvalidInput => NFS3ERR_INVAL,
+        ErrorKind::DirectoryNotEmpty => NFS3ERR_NOTEMPTY,
+        // TODO: Go through the list again to find matches
+        _ => NFS3ERR_IO,
     }
 }
 
