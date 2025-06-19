@@ -219,11 +219,26 @@ impl UnrealCacheBlocking {
             .value())
     }
 
+    /// Return the best metadata for the file.
     pub fn file_metadata(&self, inode: u64) -> Result<FileMetadata, UnrealCacheError> {
         let txn = self.db.begin_read()?;
-        let file_entry = get_best_file_entry(&txn, inode)?;
+        if let Some((_, entry)) = do_file_availability(&txn, inode)?.into_iter().next() {
+            return Ok(entry.metadata);
+        }
 
-        Ok(file_entry.metadata)
+        Err(UnrealCacheError::NotFound)
+    }
+
+    /// Return valid peer file entries for the file.
+    ///
+    /// The returned vector might be empty if the file isn't available in any peer.
+    pub fn file_availability(
+        &self,
+        inode: u64,
+    ) -> Result<Vec<(Peer, FileEntry)>, UnrealCacheError> {
+        let txn = self.db.begin_read()?;
+
+        do_file_availability(&txn, inode)
     }
 
     pub fn readdir(&self, inode: u64) -> Result<Vec<(String, ReadDirEntry)>, UnrealCacheError> {
@@ -359,28 +374,25 @@ fn get_file_entry(
     Ok(file_table.get((inode, peer.as_str()))?.map(|e| e.value()))
 }
 
-/// Choose the best available [FileEntry] from all peer's entries.
-///
-/// Strictly-speaking, there might be several best ones, with the same
-/// mtime, from multiple peers. This implementation just returns the
-/// first one.
-fn get_best_file_entry(txn: &ReadTransaction, inode: u64) -> Result<FileEntry, UnrealCacheError> {
+fn do_file_availability(
+    txn: &ReadTransaction,
+    inode: u64,
+) -> Result<Vec<(Peer, FileEntry)>, UnrealCacheError> {
     let file_table = txn.open_table(FILE_TABLE)?;
 
-    let mut best: Option<FileEntry> = None;
+    let mut all = vec![];
     for entry in file_table.range((inode, "")..(inode + 1, ""))? {
         let entry = entry?;
+        let peer = Peer::from(entry.0.value().1);
         let file_entry: FileEntry = entry.1.value();
-        let replace = match &best {
-            None => true,
-            Some(best) => file_entry.metadata.mtime > best.metadata.mtime,
-        };
-        if replace {
-            best = Some(file_entry);
-        }
+        all.push((peer, file_entry));
     }
 
-    best.ok_or(UnrealCacheError::NotFound)
+    if let Some(best_mtime) = all.iter().map(|(_, e)| e.metadata.mtime).max() {
+        all.retain(|(_, e)| e.metadata.mtime == best_mtime);
+    }
+
+    Ok(all)
 }
 
 /// Implement [UnrealCache::link] in a transaction.

@@ -4,7 +4,7 @@ use tokio::task;
 
 use crate::model::{Arena, Path, Peer};
 
-use super::{FileMetadata, ReadDirEntry, UnrealCacheBlocking, UnrealCacheError};
+use super::{FileEntry, FileMetadata, ReadDirEntry, UnrealCacheBlocking, UnrealCacheError};
 
 #[derive(Clone)]
 pub struct UnrealCacheAsync {
@@ -108,6 +108,15 @@ impl UnrealCacheAsync {
         let inner = Arc::clone(&self.inner);
 
         Ok(task::spawn_blocking(move || inner.file_metadata(inode)).await??)
+    }
+
+    pub async fn file_availability(
+        &self,
+        inode: u64,
+    ) -> Result<Vec<(Peer, FileEntry)>, UnrealCacheError> {
+        let inner = Arc::clone(&self.inner);
+
+        Ok(task::spawn_blocking(move || inner.file_availability(inode)).await??)
     }
 
     pub async fn readdir(
