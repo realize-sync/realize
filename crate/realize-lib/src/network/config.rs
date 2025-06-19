@@ -1,3 +1,12 @@
+use std::collections::HashMap;
+
+use crate::model::Peer;
+
+#[derive(Clone, serde::Deserialize, Debug)]
+pub struct NetworkConfig {
+    pub peers: HashMap<Peer, PeerConfig>,
+}
+
 /// Define a peer.
 ///
 /// A peer is identified by [crate::model::Peer].

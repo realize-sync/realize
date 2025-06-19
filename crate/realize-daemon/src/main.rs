@@ -4,19 +4,18 @@ use anyhow::Context as _;
 use clap::Parser;
 use futures_util::stream::StreamExt as _;
 use prometheus::{register_int_counter, IntCounter};
-use realize_lib::model::{Arena, Peer};
-use realize_lib::network::config::PeerConfig;
+use realize_fs::nfs;
+use realize_lib::logic::setup;
+use realize_lib::network::config::NetworkConfig;
 use realize_lib::network::hostport::HostPort;
-use realize_lib::network::rpc::realstore::{self, metrics};
-use realize_lib::network::{Networking, Server};
-use realize_lib::storage::config::ArenaConfig;
-use realize_lib::storage::real::LocalStorage;
+use realize_lib::network::rpc::realstore::metrics;
+use realize_lib::network::Networking;
+use realize_lib::storage::config::StorageConfig;
+use realize_lib::storage::unreal::Downloader;
 use realize_lib::utils::logging;
 use serde::Deserialize;
 use signal_hook_tokio::Signals;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::{fs, process};
 
 /// Run the realize daemon in the foreground.
@@ -35,6 +34,10 @@ struct Cli {
     #[arg(long, default_value = "localhost:9771")]
     address: String,
 
+    /// TCP address to export NFS on.
+    #[arg(long)]
+    nfs: Option<String>,
+
     /// Path to the PEM-encoded ED25519 private key file
     #[arg(long)]
     privkey: PathBuf,
@@ -51,8 +54,10 @@ struct Cli {
 /// Config file structure
 #[derive(Debug, Deserialize)]
 struct Config {
-    arenas: HashMap<Arena, ArenaConfig>,
-    peers: HashMap<Peer, PeerConfig>,
+    #[serde(flatten)]
+    network: NetworkConfig,
+    #[serde(flatten)]
+    storage: StorageConfig,
 }
 
 lazy_static::lazy_static! {
@@ -75,12 +80,7 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
     let config = parse_config(&cli.config)
         .with_context(|| format!("{}: failed to read TOML config file", cli.config.display()))?;
 
-    // LocalArena access checks (see spec/future.md #daemonaccess)
-    check_directory_access(&config.arenas)?;
-
-    // Build directory list
-    let storage = LocalStorage::from_config(&config.arenas);
-    let networking = Networking::from_config(&config.peers, &cli.privkey)?;
+    let networking = Networking::from_config(&config.network.peers, &cli.privkey)?;
 
     if let Some(addr) = &cli.metrics_addr {
         metrics::export_metrics(addr)
@@ -89,14 +89,26 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
         log::info!("Metrics available on http://{addr}/metrics");
     }
 
+    if let Some(addr) = &cli.nfs {
+        let cache = setup::setup_cache(&networking, &config.storage, &config.network)?;
+        nfs::export(
+            cache.clone(),
+            Downloader::new(networking.clone(), cache),
+            HostPort::parse(addr)
+                .await
+                .with_context(|| format!("Failed to parse --nfs {}", addr))?
+                .addr(),
+        )
+        .await?;
+    }
+
     let hostport = HostPort::parse(&cli.address)
         .await
         .with_context(|| format!("Failed to parse --address {}", cli.address))?;
     log::debug!("Starting server on {}/{:?}...", hostport, hostport.addr());
-    let mut server = Server::new(networking);
-    realstore::server::register(&mut server, storage);
-    let server = Arc::new(server);
-    let addr = Arc::clone(&server)
+    let server = setup::setup_server(&networking, &config.storage)?;
+
+    let addr = server
         .listen(&hostport)
         .await
         .with_context(|| format!("Failed to start server on {}", hostport))?;
@@ -117,61 +129,6 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
     log::info!("Interrupted. Shutting down..");
     signals.handle().close(); // A 2nd signal kills the process
     server.shutdown().await?;
-
-    Ok(())
-}
-
-/// Checks that all directories in the config file are accessible.
-fn check_directory_access(arenas: &HashMap<Arena, ArenaConfig>) -> anyhow::Result<()> {
-    for (arena, config) in arenas {
-        let path = &config.path;
-        log::debug!("Checking directory {}: {}", arena, config.path.display());
-        if !path.exists() {
-            anyhow::bail!(
-                "LocalArena '{}' (id: {}) does not exist",
-                path.display(),
-                arena
-            );
-        }
-        if !fs::metadata(path)
-            .and_then(|m| Ok(m.is_dir()))
-            .unwrap_or(false)
-        {
-            anyhow::bail!(
-                "Path '{}' (id: {}) is not a directory",
-                path.display(),
-                arena
-            );
-        }
-
-        // Check read access
-        if fs::read_dir(path).is_err() {
-            anyhow::bail!(
-                "No read access to directory '{}' (id: {})",
-                path.display(),
-                arena
-            );
-        }
-
-        // Check write access (warn only)
-        let testfile = path.join(".realize_write_test");
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&testfile)
-        {
-            Ok(_) => {
-                let _ = fs::remove_file(&testfile);
-            }
-            Err(_) => {
-                log::warn!(
-                    "No write access to directory '{}' (id: {})",
-                    path.display(),
-                    arena
-                );
-            }
-        }
-    }
 
     Ok(())
 }

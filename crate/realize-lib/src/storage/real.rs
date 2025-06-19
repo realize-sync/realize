@@ -59,6 +59,11 @@ impl LocalStorage {
         }
     }
 
+    /// Returns the arenas configured in this store.
+    pub fn arenas(&self) -> Vec<Arena> {
+        self.map.keys().map(|a| a.clone()).collect()
+    }
+
     /// Subscribe to notification for the given arena.
     ///
     /// If the arena is unknown, do nothing and return false. This is

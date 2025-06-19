@@ -2,7 +2,10 @@ use std::{path, sync::Arc, time::SystemTime};
 
 use tokio::task;
 
-use crate::model::{Arena, Path, Peer};
+use crate::{
+    model::{Arena, Path, Peer},
+    storage::config::StorageConfig,
+};
 
 use super::{
     FileEntry, FileMetadata, InodeAssignment, ReadDirEntry, UnrealCacheBlocking, UnrealCacheError,
@@ -14,6 +17,19 @@ pub struct UnrealCacheAsync {
 }
 
 impl UnrealCacheAsync {
+    /// Create and configure a cache from configuration.
+    pub fn from_config(config: &StorageConfig) -> anyhow::Result<Self> {
+        let cache_config = config
+            .cache
+            .as_ref()
+            .ok_or(anyhow::anyhow!("cache section missing from config file"))?;
+        let mut cache = UnrealCacheBlocking::open(&cache_config.db)?;
+        for (arena, _) in &config.arenas {
+            cache.add_arena(arena)?;
+        }
+        Ok(cache.into_async())
+    }
+
     /// Create a new cache from a blocking one.
     pub fn new(inner: UnrealCacheBlocking) -> Self {
         Self {

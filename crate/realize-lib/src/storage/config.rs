@@ -1,4 +1,13 @@
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
+
+use crate::model::Arena;
+
+/// Storage configuration.
+#[derive(Clone, serde::Deserialize, Debug)]
+pub struct StorageConfig {
+    pub arenas: HashMap<Arena, ArenaConfig>,
+    pub cache: Option<CacheConfig>,
+}
 
 /// Define an Arena available locally.
 ///
@@ -10,4 +19,10 @@ pub struct ArenaConfig {
     ///
     /// That directory must be writable by the current user.
     pub path: PathBuf,
+}
+
+#[derive(Clone, serde::Deserialize, Debug)]
+pub struct CacheConfig {
+    /// Path to the cache database.
+    pub db: PathBuf,
 }
