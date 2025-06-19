@@ -351,7 +351,7 @@ async fn connect(
     peer: &str,
     limit: Option<u64>,
     conn_status: tokio::sync::watch::Sender<ClientConnectionState>,
-) -> anyhow::Result<realstore::client::ClientType, anyhow::Error> {
+) -> anyhow::Result<realstore::client::RealStoreClient, anyhow::Error> {
     let mut options = ClientOptions::default();
     if let Some(limit) = limit {
         log::info!("Throttling uploads: {}/s", HumanBytes(limit));
@@ -367,7 +367,7 @@ async fn connect(
 /// Not all servers support setting rate limit; It's not an error if
 /// this function returns None.
 async fn configure_limit(
-    client: &realstore::client::ClientType,
+    client: &realstore::client::RealStoreClient,
     limit: u64,
 ) -> anyhow::Result<Option<u64>> {
     let config = client

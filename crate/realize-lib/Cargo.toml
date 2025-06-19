@@ -29,6 +29,7 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "fs", "
 tokio-retry = "0.3.0"
 tokio-rustls = "0.26"
 walkdir = "2.5"
+moka = { version = "0.12.10", features = ["future"] }
 
 [target.'cfg(target_os="linux")'.dependencies]
 inotify = "0.11.0"

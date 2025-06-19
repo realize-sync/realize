@@ -102,6 +102,11 @@ impl ByteRange {
     pub fn chunked(&self, chunk_size: u64) -> ChunkIterator {
         ChunkIterator::new(self, chunk_size)
     }
+
+    /// Check whether a value is within the range.
+    pub fn contains(&self, val: u64) -> bool {
+        return val >= self.start && val < self.end;
+    }
 }
 
 impl fmt::Display for ByteRange {

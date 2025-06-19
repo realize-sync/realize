@@ -1,0 +1,426 @@
+use std::{
+    cmp::{max, min},
+    collections::VecDeque,
+    io::{ErrorKind, SeekFrom},
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
+
+use moka::future::{Cache, CacheBuilder};
+use tarpc::{client::RpcError, context};
+use tokio::{
+    io::{AsyncRead, AsyncSeek, ReadBuf},
+    task::JoinSet,
+};
+
+use crate::{
+    model::{ByteRange, Peer},
+    network::{
+        rpc::realstore::{
+            self,
+            client::{ClientOptions, RealStoreClient},
+            Options, RealStoreServiceError,
+        },
+        Networking,
+    },
+};
+
+use super::{FileEntry, UnrealCacheAsync, UnrealCacheError};
+
+const MIN_CHUNK_SIZE: usize = 8 * 1024;
+const MAX_CHUNK_SIZE: usize = 32 * 1024;
+
+pub struct Downloader {
+    networking: Networking,
+    cache: UnrealCacheAsync,
+    clients: Cache<Peer, Arc<RealStoreClient>>,
+}
+
+impl Downloader {
+    pub fn new(networking: Networking, cache: UnrealCacheAsync) -> Self {
+        Self {
+            networking,
+            cache,
+            clients: CacheBuilder::new(8)
+                .time_to_idle(Duration::from_secs(5 * 60))
+                .build(),
+        }
+    }
+
+    pub async fn reader(&mut self, inode: u64) -> Result<Download, UnrealCacheError> {
+        let avail = self.cache.file_availability(inode).await?;
+        if avail.is_empty() {
+            return Err(UnrealCacheError::NotFound);
+        }
+
+        let (client, peer, entry) = self.choose(avail).await?;
+
+        Ok(Download::new(client, peer, entry))
+    }
+
+    async fn choose(
+        &self,
+        avail: Vec<(Peer, FileEntry)>,
+    ) -> Result<(Arc<RealStoreClient>, Peer, FileEntry), UnrealCacheError> {
+        for (peer, entry) in &avail {
+            if let Some(client) = self.clients.get(peer).await {
+                // TODO: check if client is still connected, if no,
+                // connecting to another client would be better.
+                log::debug!(
+                    "Reusing connection to {peer} to download {}/{:?}",
+                    entry.arena,
+                    entry.path
+                );
+                return Ok((client, peer.clone(), entry.clone()));
+            }
+        }
+
+        let mut set = JoinSet::new();
+        for (peer, entry) in avail {
+            let networking = self.networking.clone();
+            set.spawn(async move {
+                let client =
+                    realstore::client::connect(&networking, &peer, ClientOptions::default())
+                        .await?;
+
+                log::debug!(
+                    "Connected to {peer} to download {}/{:?}",
+                    entry.arena,
+                    entry.path
+                );
+
+                Ok::<_, anyhow::Error>((client, peer, entry))
+            });
+        }
+        while let Some(res) = set.join_next().await {
+            if let Ok(res) = res {
+                if let Ok((client, peer, entry)) = res {
+                    let client = Arc::new(client);
+                    self.clients.insert(peer.clone(), Arc::clone(&client)).await;
+                    // TODO: consider keeping any other successful
+                    // connections here instead of discarding them.
+                    return Ok((client, peer, entry));
+                }
+            }
+        }
+        Err(UnrealCacheError::Unavailable)
+    }
+}
+
+pub struct Download {
+    client: Arc<RealStoreClient>,
+    peer: Peer,
+    entry: FileEntry,
+    offset: u64,
+    pending_seek: Option<u64>,
+    avail: VecDeque<(ByteRange, Vec<u8>)>,
+    pending: Option<(
+        ByteRange,
+        Pin<Box<dyn Future<Output = Result<Result<Vec<u8>, RealStoreServiceError>, RpcError>>>>,
+    )>,
+}
+
+impl Download {
+    fn new(client: Arc<RealStoreClient>, peer: Peer, entry: FileEntry) -> Self {
+        Self {
+            client,
+            peer,
+            entry,
+            offset: 0,
+            pending_seek: None,
+            avail: VecDeque::new(),
+            pending: None,
+        }
+    }
+
+    fn fill(&mut self, buf: &mut ReadBuf<'_>) -> bool {
+        let requested = ByteRange::new(self.offset, self.offset + buf.remaining() as u64);
+        let mut filled = false;
+        while let Some((range, data)) = self.avail.front() {
+            let intersection = requested.intersection(&range);
+            if !intersection.is_empty() && intersection.start == self.offset {
+                log::debug!(
+                    "From {}, return {}/{:?} {}",
+                    self.peer,
+                    self.entry.arena,
+                    self.entry.path,
+                    intersection
+                );
+
+                buf.put_slice(
+                    &data[(intersection.start - range.start) as usize
+                        ..(intersection.end - range.start) as usize],
+                );
+                self.offset += intersection.bytecount();
+
+                filled = true;
+                if intersection.end <= range.end {
+                    return true;
+                }
+                self.avail.pop_front();
+                if buf.remaining() == 0 {
+                    return true;
+                }
+            }
+        }
+
+        filled
+    }
+
+    fn next_request(
+        &mut self,
+        bufsize: usize,
+    ) -> (
+        ByteRange,
+        Pin<Box<dyn Future<Output = Result<Result<Vec<u8>, RealStoreServiceError>, RpcError>>>>,
+    ) {
+        let offset = self.offset;
+        let end = self.entry.metadata.size;
+        let next = self
+            .avail
+            .back()
+            .map(|(range, _)| range.end)
+            .unwrap_or(offset);
+
+        let range = ByteRange::new(
+            next,
+            min(
+                end,
+                next + min(MAX_CHUNK_SIZE, max(MIN_CHUNK_SIZE, bufsize)) as u64,
+            ),
+        );
+
+        log::debug!(
+            "From {}, download {}/{:?} {}",
+            self.peer,
+            self.entry.arena,
+            self.entry.path,
+            range
+        );
+
+        let fut = {
+            let client = Arc::clone(&self.client);
+            let arena = self.entry.arena.clone();
+            let path = self.entry.path.clone();
+            let range = range.clone();
+
+            Box::pin(async move {
+                client
+                    .read(context::current(), arena, path, range, Options::default())
+                    .await
+            })
+        };
+
+        (range, fut)
+    }
+
+    fn inner_poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.offset >= self.entry.metadata.size || self.fill(buf) {
+            return Poll::Ready(Ok(()));
+        }
+        let (range, mut fut) = match self.pending.take() {
+            Some(existing) => existing,
+            None => self.next_request(buf.capacity()),
+        };
+        match fut.as_mut().poll(cx) {
+            Poll::Ready(Err(err)) => Poll::Ready(Err(rpc_to_io_error(err))),
+            Poll::Ready(Ok(Err(err))) => Poll::Ready(Err(real_store_to_io_error(err))),
+            Poll::Ready(Ok(Ok(data))) => {
+                self.avail.push_back((range, data));
+
+                self.inner_poll_read(cx, buf)
+            }
+            Poll::Pending => {
+                self.pending = Some((range, fut));
+
+                Poll::Pending
+            }
+        }
+    }
+}
+
+/// Add the given offset to the base.
+///
+/// Return an error if the shift would be below 0.
+fn relative_offset(offset: i64, base: u64) -> Result<u64, std::io::Error> {
+    if offset < 0 {
+        let diff = (-offset) as u64;
+        if diff > base {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "Seek before start",
+            ));
+        }
+
+        Ok(base - diff)
+    } else {
+        Ok(base + offset as u64)
+    }
+}
+
+impl AsyncSeek for Download {
+    fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> std::io::Result<()> {
+        let end = self.entry.metadata.size;
+        let goal = std::cmp::min(
+            end,
+            match position {
+                SeekFrom::Current(offset) => relative_offset(offset, self.offset)?,
+                SeekFrom::End(offset) => relative_offset(offset, end)?,
+                SeekFrom::Start(offset) => offset,
+            },
+        );
+        self.get_mut().pending_seek = Some(goal);
+
+        Ok(())
+    }
+
+    fn poll_complete(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
+        let this = self.get_mut();
+        match this.pending_seek.take() {
+            None => Poll::Ready(Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "No pending seek",
+            ))),
+            Some(goal) => {
+                if let Some((range, _)) = &this.pending {
+                    if !range.contains(goal) {
+                        this.pending = None;
+                    }
+                }
+                while this
+                    .avail
+                    .front()
+                    .map(|(range, _)| !range.contains(goal))
+                    .unwrap_or(false)
+                {
+                    this.avail.pop_front();
+                }
+                this.offset = goal;
+
+                Poll::Ready(Ok(this.offset))
+            }
+        }
+    }
+}
+
+impl AsyncRead for Download {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.get_mut().inner_poll_read(cx, buf)
+    }
+}
+
+fn rpc_to_io_error(err: RpcError) -> std::io::Error {
+    match &err {
+        RpcError::Shutdown => std::io::Error::new(ErrorKind::ConnectionReset, err),
+        RpcError::Server(_) => std::io::Error::new(ErrorKind::ConnectionReset, err),
+        RpcError::DeadlineExceeded => std::io::Error::new(ErrorKind::TimedOut, err),
+        _ => std::io::Error::new(ErrorKind::Other, err),
+    }
+}
+
+fn real_store_to_io_error(err: RealStoreServiceError) -> std::io::Error {
+    std::io::Error::new(ErrorKind::Other, err)
+}
+
+#[cfg(test)]
+mod tests {
+    use assert_fs::{
+        prelude::{FileWriteStr as _, PathChild as _},
+        TempDir,
+    };
+    use tokio::io::AsyncReadExt as _;
+
+    use crate::{
+        model::{Arena, Path},
+        network::{self, hostport::HostPort, security, Server},
+        storage::{real::LocalStorage, unreal},
+    };
+
+    use super::*;
+
+    struct Fixture {
+        tempdir: TempDir,
+        arena: Arena,
+        _local: LocalStorage,
+        _server: Arc<Server>,
+        networking: Networking,
+        cache: UnrealCacheAsync,
+    }
+    impl Fixture {
+        async fn setup() -> anyhow::Result<Fixture> {
+            let _ = env_logger::try_init()?;
+            let tempdir = TempDir::new()?;
+            let arena = Arena::from("test");
+            let local = LocalStorage::new(vec![(arena.clone(), tempdir.path().to_path_buf())]);
+            let mut server = Server::new(network::testing::server_networking()?);
+            realstore::server::register(&mut server, local.clone());
+            let server = Arc::new(server);
+            let addr = server.listen(&HostPort::localhost(0)).await?;
+            let networking = network::testing::client_networking(addr)?;
+
+            let mut cache = unreal::testing::in_memory_cache()?;
+            cache.add_arena(&arena)?;
+
+            Ok(Self {
+                tempdir,
+                arena,
+                _local: local,
+                _server: server,
+                networking,
+                cache: cache.into_async(),
+            })
+        }
+
+        async fn add_file(&self, name: &str, content: &str) -> anyhow::Result<u64> {
+            let path = Path::parse(name)?;
+            assert!(
+                path.parent().is_none(),
+                "add_file only supports files the arena root, not \"{name}\""
+            );
+
+            let file = self.tempdir.child(path.name());
+            file.write_str(content)?;
+            let metadata = tokio::fs::metadata(file.path()).await?;
+            self.cache
+                .link(
+                    &security::testing::server_peer(),
+                    &self.arena,
+                    &path,
+                    metadata.len(),
+                    metadata.modified()?,
+                )
+                .await?;
+            let inode = self
+                .cache
+                .lookup(self.cache.arena_root(&self.arena)?, name)
+                .await?
+                .inode;
+
+            Ok(inode)
+        }
+    }
+
+    #[tokio::test]
+    async fn read_small_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let inode = fixture.add_file("test.txt", "File content").await?;
+        let mut downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
+        let mut reader = downloader.reader(inode).await?;
+
+        let mut buffer = String::new();
+        reader.read_to_string(&mut buffer).await?;
+
+        assert_eq!("File content", buffer);
+        Ok(())
+    }
+}

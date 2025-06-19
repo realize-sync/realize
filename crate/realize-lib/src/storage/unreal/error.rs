@@ -14,6 +14,9 @@ pub enum UnrealCacheError {
     #[error("I/O error {0}")]
     Io(#[from] std::io::Error),
 
+    #[error{"Data not available at this time"}]
+    Unavailable,
+
     #[error{"not found"}]
     NotFound,
 

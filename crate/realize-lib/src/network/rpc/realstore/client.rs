@@ -20,7 +20,7 @@ use crate::network::rpc::realstore::RealStoreServiceRequest;
 use crate::network::rpc::realstore::RealStoreServiceResponse;
 use crate::network::Networking;
 
-pub type ClientType = RealStoreServiceClient<RealizeStub>;
+pub type RealStoreClient = RealStoreServiceClient<RealizeStub>;
 
 #[derive(Clone, Default)]
 pub struct ClientOptions {
@@ -44,7 +44,7 @@ pub async fn connect(
     networking: &Networking,
     peer: &Peer,
     options: ClientOptions,
-) -> anyhow::Result<ClientType> {
+) -> anyhow::Result<RealStoreClient> {
     let stub = RealizeStub::new(networking, peer, options).await?;
     Ok(RealStoreServiceClient::from(stub))
 }
