@@ -282,11 +282,9 @@ impl AsyncSeek for Download {
 
     fn poll_complete(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
         let this = self.get_mut();
+
         match this.pending_seek.take() {
-            None => Poll::Ready(Err(std::io::Error::new(
-                ErrorKind::InvalidInput,
-                "No pending seek",
-            ))),
+            None => Poll::Ready(Ok(this.offset)),
             Some(goal) => {
                 if let Some((range, _)) = &this.pending {
                     if !range.contains(goal) {
@@ -334,11 +332,13 @@ fn real_store_to_io_error(err: RealStoreServiceError) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use assert_fs::{
         prelude::{FileWriteBin as _, FileWriteStr as _, PathChild as _},
         TempDir,
     };
-    use tokio::io::AsyncReadExt as _;
+    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
     use crate::{
         model::{Arena, Path},
@@ -418,65 +418,148 @@ mod tests {
         let mut downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
         let mut reader = downloader.reader(inode).await?;
 
-        let mut buffer = String::new();
-        reader.read_to_string(&mut buffer).await?;
+        assert_eq!("File content", read_string(&mut reader).await?);
+        Ok(())
+    }
 
-        assert_eq!("File content", buffer);
+    #[tokio::test]
+    async fn seek() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let inode = fixture
+            .add_file_with_content("test.txt", "baa, baa, black sheep")
+            .await?;
+        let mut downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
+        let mut reader = downloader.reader(inode).await?;
+
+        reader.seek(SeekFrom::Start(10)).await?;
+        assert_eq!("black sheep", read_string(&mut reader).await?);
+
+        reader.seek(SeekFrom::Start(5)).await?;
+        assert_eq!("baa, black sheep", read_string(&mut reader).await?);
+
+        reader.seek(SeekFrom::Start(5)).await?;
+        reader.seek(SeekFrom::Current(5)).await?;
+        assert_eq!("black sheep", read_string(&mut reader).await?);
+
+        reader.seek(SeekFrom::Current(-5)).await?;
+        assert_eq!("sheep", read_string(&mut reader).await?);
+
+        reader.seek(SeekFrom::End(-11)).await?;
+        assert_eq!("black sheep", read_string(&mut reader).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seek_past_end() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let inode = fixture
+            .add_file_with_content("test.txt", "baa, baa, black sheep")
+            .await?;
+        let mut downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
+        let mut reader = downloader.reader(inode).await?;
+
+        reader.seek(SeekFrom::Start(100)).await?;
+        assert_eq!("", read_string(&mut reader).await?);
+
+        reader.seek(SeekFrom::End(5)).await?;
+        assert_eq!("", read_string(&mut reader).await?);
+
+        reader.seek(SeekFrom::Start(5)).await?;
+        reader.seek(SeekFrom::Current(100)).await?;
+        assert_eq!("", read_string(&mut reader).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seek_before_start() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let inode = fixture
+            .add_file_with_content("test.txt", "baa, baa, black sheep")
+            .await?;
+        let mut downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
+        let mut reader = downloader.reader(inode).await?;
+
+        assert!(reader.seek(SeekFrom::End(-100)).await.is_err());
+        assert!(reader.seek(SeekFrom::Current(-100)).await.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seek_mixed_with_read() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+
+        let path = Path::parse("large_file")?;
+        {
+            let mut f = std::fs::File::create(path.within(fixture.tempdir.path()))?;
+            f.write(&[1u8; 8 * 1024])?;
+            f.write(&[0u8; 8 * 1024])?;
+            f.write(&[2u8; 8 * 1024])?;
+        }
+
+        let inode = fixture.add_file(path).await?;
+        let mut downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
+        let mut reader = downloader.reader(inode).await?;
+
+        let mut buf = [0u8; 16];
+        reader.read_exact(&mut buf).await?;
+        assert_eq!([1u8; 16], buf);
+
+        reader.seek(SeekFrom::End(-100)).await?;
+        reader.read_exact(&mut buf).await?;
+        assert_eq!([2u8; 16], buf);
+
+        reader.seek(SeekFrom::Start(100)).await?;
+        reader.read_exact(&mut buf).await?;
+        assert_eq!([1u8; 16], buf);
+
+        reader.seek(SeekFrom::Start(8 * 1024)).await?;
+        reader.read_exact(&mut buf).await?;
+        assert_eq!([0u8; 16], buf);
+
         Ok(())
     }
 
     #[tokio::test]
     async fn read_large_file_small_buffer() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        test_read_file(&fixture, Path::parse("large_file")?, 12 * 1024, 1024, false).await?;
+        test_read_file(&fixture, 12 * 1024, 1024, false).await?;
         Ok(())
     }
 
     #[tokio::test]
     async fn read_large_file_unusual_buffer_size() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        test_read_file(&fixture, Path::parse("large_file")?, 12 * 1024, 2000, true).await?;
+        test_read_file(&fixture, 12 * 1024, 2000, true).await?;
         Ok(())
     }
 
     #[tokio::test]
     async fn read_large_file_large_buffer() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        test_read_file(
-            &fixture,
-            Path::parse("large_file")?,
-            48 * 1024,
-            32 * 1024,
-            false,
-        )
-        .await?;
+        test_read_file(&fixture, 48 * 1024, 32 * 1024, false).await?;
         Ok(())
     }
 
     #[tokio::test]
     async fn read_large_file_overly_large_buffer() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        test_read_file(
-            &fixture,
-            Path::parse("large_file")?,
-            64 * 1024,
-            48 * 1024,
-            true,
-        )
-        .await?;
+        test_read_file(&fixture, 64 * 1024, 48 * 1024, true).await?;
         Ok(())
     }
 
     async fn test_read_file(
         fixture: &Fixture,
-        path: Path,
         file_size: usize,
         buf_size: usize,
         allow_short_reads: bool,
     ) -> anyhow::Result<()> {
+        let path = Path::parse("large_file")?;
         fixture
             .tempdir
-            .child("large_file")
+            .child(path.to_string())
             .write_binary(&vec![0xAB; file_size])?;
 
         let inode = fixture.add_file(path).await?;
@@ -519,5 +602,11 @@ mod tests {
         assert_eq!(0, reader.read(&mut vec![0u8; buf_size]).await?);
 
         Ok(())
+    }
+
+    async fn read_string(reader: &mut Download) -> anyhow::Result<String> {
+        let mut buffer = String::new();
+        reader.read_to_string(&mut buffer).await?;
+        return Ok(buffer);
     }
 }
