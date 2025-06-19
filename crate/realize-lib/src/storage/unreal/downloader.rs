@@ -156,7 +156,7 @@ impl Download {
                 self.offset += intersection.bytecount();
 
                 filled = true;
-                if intersection.end <= range.end {
+                if intersection.end < range.end {
                     return true;
                 }
                 self.avail.pop_front();
@@ -335,7 +335,7 @@ fn real_store_to_io_error(err: RealStoreServiceError) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use assert_fs::{
-        prelude::{FileWriteStr as _, PathChild as _},
+        prelude::{FileWriteBin as _, FileWriteStr as _, PathChild as _},
         TempDir,
     };
     use tokio::io::AsyncReadExt as _;
@@ -358,7 +358,7 @@ mod tests {
     }
     impl Fixture {
         async fn setup() -> anyhow::Result<Fixture> {
-            let _ = env_logger::try_init()?;
+            let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
             let arena = Arena::from("test");
             let local = LocalStorage::new(vec![(arena.clone(), tempdir.path().to_path_buf())]);
@@ -381,16 +381,16 @@ mod tests {
             })
         }
 
-        async fn add_file(&self, name: &str, content: &str) -> anyhow::Result<u64> {
+        async fn add_file_with_content(&self, name: &str, content: &str) -> anyhow::Result<u64> {
             let path = Path::parse(name)?;
-            assert!(
-                path.parent().is_none(),
-                "add_file only supports files the arena root, not \"{name}\""
-            );
-
             let file = self.tempdir.child(path.name());
             file.write_str(content)?;
-            let metadata = tokio::fs::metadata(file.path()).await?;
+
+            self.add_file(path).await
+        }
+
+        async fn add_file(&self, path: Path) -> Result<u64, anyhow::Error> {
+            let metadata = tokio::fs::metadata(path.within(self.tempdir.path())).await?;
             self.cache
                 .link(
                     &security::testing::server_peer(),
@@ -400,11 +400,10 @@ mod tests {
                     metadata.modified()?,
                 )
                 .await?;
-            let inode = self
+            let (inode, _) = self
                 .cache
-                .lookup(self.cache.arena_root(&self.arena)?, name)
-                .await?
-                .inode;
+                .lookup_path(self.cache.arena_root(&self.arena)?, &path)
+                .await?;
 
             Ok(inode)
         }
@@ -413,7 +412,9 @@ mod tests {
     #[tokio::test]
     async fn read_small_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let inode = fixture.add_file("test.txt", "File content").await?;
+        let inode = fixture
+            .add_file_with_content("test.txt", "File content")
+            .await?;
         let mut downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
         let mut reader = downloader.reader(inode).await?;
 
@@ -421,6 +422,102 @@ mod tests {
         reader.read_to_string(&mut buffer).await?;
 
         assert_eq!("File content", buffer);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_large_file_small_buffer() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        test_read_file(&fixture, Path::parse("large_file")?, 12 * 1024, 1024, false).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_large_file_unusual_buffer_size() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        test_read_file(&fixture, Path::parse("large_file")?, 12 * 1024, 2000, true).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_large_file_large_buffer() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        test_read_file(
+            &fixture,
+            Path::parse("large_file")?,
+            48 * 1024,
+            32 * 1024,
+            false,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_large_file_overly_large_buffer() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        test_read_file(
+            &fixture,
+            Path::parse("large_file")?,
+            64 * 1024,
+            48 * 1024,
+            true,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn test_read_file(
+        fixture: &Fixture,
+        path: Path,
+        file_size: usize,
+        buf_size: usize,
+        allow_short_reads: bool,
+    ) -> anyhow::Result<()> {
+        fixture
+            .tempdir
+            .child("large_file")
+            .write_binary(&vec![0xAB; file_size])?;
+
+        let inode = fixture.add_file(path).await?;
+        let mut downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
+        let mut reader = downloader.reader(inode).await?;
+
+        if allow_short_reads {
+            let mut bytes_read = 0;
+            while bytes_read < file_size {
+                let mut buf = vec![0u8; buf_size];
+                let n = reader.read(&mut buf).await?;
+                assert!(n > 0);
+                for i in 0..n {
+                    assert_eq!(0xAB, buf[i]);
+                }
+                for i in n..buf_size {
+                    assert_eq!(0, buf[i]);
+                }
+                bytes_read += n;
+            }
+        } else {
+            for i in 0..(file_size / buf_size) {
+                let mut buf = vec![0u8; buf_size];
+                assert_eq!(buf_size, reader.read(&mut buf).await?);
+                assert_eq!(vec![0xAB; buf_size], buf, "chunk {i}");
+            }
+            let rest = file_size % buf_size;
+            if rest > 0 {
+                let mut buf = vec![0u8; buf_size];
+                assert_eq!(rest, reader.read(&mut buf).await?);
+                for i in 0..rest {
+                    assert_eq!(0xAB, buf[i]);
+                }
+                for i in rest..buf_size {
+                    assert_eq!(0, buf[i]);
+                }
+            }
+        }
+
+        assert_eq!(0, reader.read(&mut vec![0u8; buf_size]).await?);
+
         Ok(())
     }
 }
