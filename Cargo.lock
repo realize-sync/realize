@@ -2071,6 +2071,7 @@ dependencies = [
  "tempfile",
  "test-tag",
  "tokio",
+ "tokio-retry",
  "toml",
 ]
 

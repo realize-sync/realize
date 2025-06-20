@@ -44,6 +44,8 @@ struct Fixture {
     pub resources: PathBuf,
     pub testdir: PathBuf,
     pub tempdir: TempDir,
+    pub server_address: String,
+    pub server_privkey: PathBuf,
 }
 
 impl Fixture {
@@ -85,11 +87,15 @@ impl Fixture {
             },
         );
 
+        let server_privkey = resources.join("a.key");
+        let server_address = "127.0.0.1:0".to_string(); // dynamic
         Ok(Self {
             config,
             resources,
             testdir: testdir.to_path_buf(),
             tempdir,
+            server_address,
+            server_privkey,
         })
     }
 
@@ -100,9 +106,9 @@ impl Fixture {
         std::fs::write(&config_file, toml::to_string_pretty(&self.config)?)?;
 
         cmd.arg("--address")
-            .arg("127.0.0.1:0")
+            .arg(&self.server_address)
             .arg("--privkey")
-            .arg(self.resources.join("a.key"))
+            .arg(&self.server_privkey)
             .arg("--config")
             .arg(config_file)
             .env_remove("RUST_LOG")
@@ -336,13 +342,7 @@ async fn daemon_exports_nfs() -> anyhow::Result<()> {
 
     // Run process in the background and in a way that allows reading
     // its output, so we know what port to connect to.
-    let mut daemon = fixture
-        .command()?
-        .arg("--nfs")
-        .arg(nfs_addr)
-        .env("RUST_LOG", "debug")
-        .stderr(std::process::Stdio::inherit())
-        .spawn()?;
+    let mut daemon = fixture.command()?.arg("--nfs").arg(nfs_addr).spawn()?;
 
     // The first line that's output to stdout must be Listening on
     // <address>:<port>. Anything else is an error.
@@ -384,6 +384,116 @@ async fn daemon_exports_nfs() -> anyhow::Result<()> {
     let _ = connection.unmount().await;
 
     daemon.start_kill()?;
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn daemon_updates_cache() -> anyhow::Result<()> {
+    use std::time::Duration;
+
+    use nfs3_types::nfs3::{diropargs3, nfs_fh3, LOOKUP3args, READ3args};
+    use tokio_retry::strategy::FixedInterval;
+
+    let fixture_a = Fixture::setup().await?;
+    let mut daemon_a = fixture_a.command()?.spawn()?;
+    let a_port = wait_for_listening_port(daemon_a.stdout.as_mut().unwrap()).await?;
+
+    let mut fixture_b = Fixture::setup().await?;
+    fixture_b.server_privkey = fixture_b.resources.join("b.key");
+    fixture_b
+        .config
+        .network
+        .peers
+        .get_mut(&Peer::from("a"))
+        .expect("peer a")
+        .address = Some(format!("127.0.0.1:{a_port}"));
+
+    let nfs_port = portpicker::pick_unused_port().expect("No ports free");
+    let nfs_addr = format!("127.0.0.1:{}", nfs_port);
+    fixture_b.config.storage.cache = Some(CacheConfig {
+        db: fixture_b.tempdir.child("cache.db").to_path_buf(),
+    });
+
+    let mut daemon_b = fixture_b.command()?.arg("--nfs").arg(nfs_addr).spawn()?;
+
+    // The first line that's output to stdout must be Listening on
+    // <address>:<port>. Anything else is an error.
+    wait_for_listening_port(daemon_b.stdout.as_mut().unwrap()).await?;
+
+    tokio::fs::write(fixture_a.testdir.join("hello.txt"), "Hello, world!").await?;
+
+    log::debug!("Connecting to NFS port {nfs_port}");
+    let mut connection =
+        Nfs3ConnectionBuilder::new(TokioConnector, "127.0.0.1".to_string(), "/".to_string())
+            .connect_from_privileged_port(false)
+            .mount_port(nfs_port)
+            .nfs3_port(nfs_port)
+            .mount()
+            .await?;
+
+    let root_fh3 = connection.root_nfs_fh3();
+    let lookup = connection
+        .lookup(LOOKUP3args {
+            what: diropargs3 {
+                dir: root_fh3,
+                name: "testdir".as_bytes().into(),
+            },
+        })
+        .await?;
+    let testdir_fh3 = match lookup {
+        Nfs3Result::Err(e) => panic!("testdir lookup: {e:?}"),
+        Nfs3Result::Ok(res) => res.object,
+    };
+
+    // It might take a while for the new file to be reported by
+    // inotify and then daemon_a.
+    let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
+    let hello_txt_fh3: nfs_fh3;
+    loop {
+        let lookup = connection
+            .lookup(LOOKUP3args {
+                what: diropargs3 {
+                    dir: testdir_fh3.clone(),
+                    name: "hello.txt".as_bytes().into(),
+                },
+            })
+            .await?;
+        match lookup {
+            Nfs3Result::Err(e) => {
+                if let Some(delay) = retry.next() {
+                    tokio::time::sleep(delay).await;
+                    continue;
+                } else {
+                    panic!("hello.txt lookup: {:?}", e);
+                }
+            }
+            Nfs3Result::Ok(res) => {
+                hello_txt_fh3 = res.object;
+                break;
+            }
+        };
+    }
+
+    let read = connection
+        .read(READ3args {
+            file: hello_txt_fh3,
+            offset: 0,
+            count: 100,
+        })
+        .await?;
+    let hello_txt_content = match read {
+        Nfs3Result::Err(e) => panic!("hello.txt read: {e:?}"),
+        Nfs3Result::Ok(res) => String::from_utf8(res.data.to_vec())?,
+    };
+
+    assert_eq!("Hello, world!", hello_txt_content);
+
+    let _ = connection.unmount().await;
+
+    daemon_b.start_kill()?;
+    daemon_a.start_kill()?;
 
     Ok(())
 }
