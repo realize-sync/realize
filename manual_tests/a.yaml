@@ -1,9 +1,0 @@
-dirs:
-  - "one": "one-a"
-  - "two": "two-a"
-
-peers:
-  - client: |
-      -----BEGIN PUBLIC KEY-----
-      MCowBQYDK2VwAyEA5Fk9nDDOyj9z4bjRHmuQ0+yIksTrkLq8tjRH63xTAqs=
-      -----END PUBLIC KEY-----

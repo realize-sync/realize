@@ -32,7 +32,7 @@ function up {
     inst=$1
     port=$2
     metrics_port=$3
-    configfile="${this}/${inst}.yaml"
+    configfile="${this}/${inst}.toml"
     keyfile="${root}/resources/test/${inst}.key"
     outfile="${this}/${inst}.out"
     pidfile="${this}/${inst}.pid"
@@ -111,14 +111,14 @@ function metrics {
 
 function moveall {
     keyfile="${root}/resources/test/client.key"
-    peersfile="${root}/resources/test/peers.pem"
+    peersfile="${this}/client.toml"
 
     maybe_rebuild realize-cmd && \
         exec "${realize_bin}" \
              --privkey "${keyfile}"\
-             --peers "${peersfile}" \
-             --src-addr "127.0.0.1:7001" \
-             --dst-addr "127.0.0.1:8001" \
+             --config "${peersfile}" \
+             --src a \
+             --dst b \
              "$@"
 }
 
