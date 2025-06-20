@@ -8,13 +8,12 @@ use tarpc::{
 };
 use tokio::sync::mpsc;
 
+use super::{HistoryService, HistoryServiceRequest, HistoryServiceResponse};
+use crate::storage::real::Notification;
 use crate::{
     model::{Arena, Peer},
     network::Networking,
-    storage::real::Notification,
 };
-
-use super::{HistoryService, HistoryServiceRequest, HistoryServiceResponse};
 
 /// Forward history for the given peer to a mpsc channel.
 ///
@@ -118,6 +117,10 @@ impl HistoryService for HistoryServer {
     }
 }
 
+// These tests use inotify to generate the notifications, which is
+// linux-only. TODO: rewrite the tests to remove this dependency so
+// they can run without inotify.
+#[cfg(target_os = "linux")]
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, time::Duration};

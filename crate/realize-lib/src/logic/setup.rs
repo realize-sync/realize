@@ -5,13 +5,13 @@ use tokio_retry::strategy::ExponentialBackoff;
 
 use crate::model::Arena;
 use crate::network::config::NetworkConfig;
-use crate::network::rpc::history;
 use crate::network::rpc::history::server::forward_peer_history;
 use crate::network::rpc::realstore;
 use crate::network::{Networking, Server};
 use crate::storage::config::{ArenaConfig, StorageConfig};
 use crate::storage::real::LocalStorage;
-use crate::storage::unreal::{keep_cache_updated, UnrealCacheAsync};
+use crate::storage::unreal::keep_cache_updated;
+use crate::storage::unreal::UnrealCacheAsync;
 
 /// Setup server as specified in the configuration.
 ///
@@ -27,7 +27,7 @@ pub fn setup_server(
     realstore::server::register(&mut server, store.clone());
 
     #[cfg(target_os = "linux")]
-    history::client::register(&mut server, store.clone());
+    crate::network::rpc::history::client::register(&mut server, store.clone());
 
     Ok(Arc::new(server))
 }

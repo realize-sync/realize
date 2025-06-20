@@ -40,6 +40,10 @@ pub async fn keep_cache_updated(
     }
 }
 
+// These tests use inotify to generate the notifications, which is
+// linux-only. TODO: rewrite the tests to remove this dependency so
+// they can run without inotify.
+#[cfg(target_os = "linux")]
 #[cfg(test)]
 mod tests {
     use std::fs;

@@ -2,6 +2,7 @@
 //!
 //! This module defines the HistoryService trait for use with tarpc 0.36.
 
+#[cfg(target_os = "linux")]
 pub mod client;
 pub mod server;
 
