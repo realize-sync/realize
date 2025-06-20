@@ -148,6 +148,12 @@ impl UnrealCacheAsync {
         Ok(task::spawn_blocking(move || inner.file_availability(inode)).await??)
     }
 
+    pub async fn dir_mtime(&self, inode: u64) -> Result<SystemTime, UnrealCacheError> {
+        let inner = Arc::clone(&self.inner);
+
+        Ok(task::spawn_blocking(move || inner.dir_mtime(inode)).await??)
+    }
+
     pub async fn readdir(
         &self,
         inode: u64,

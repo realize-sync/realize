@@ -110,14 +110,13 @@ impl UnrealFs {
                 fileid: entry.inode,
                 name: name.as_bytes().into(),
                 attr: match entry.assignment {
-                    InodeAssignment::Directory => self.build_dir_attr(entry.inode),
-                    InodeAssignment::File => {
-                        self.build_file_attr(
-                            entry.inode,
-                            &self.cache.file_metadata(entry.inode).await?,
-                        )
-                        .await?
+                    InodeAssignment::Directory => {
+                        self.build_dir_attr(entry.inode, self.cache.dir_mtime(entry.inode).await?)
                     }
+                    InodeAssignment::File => self.build_file_attr(
+                        entry.inode,
+                        &self.cache.file_metadata(entry.inode).await?,
+                    ),
                 },
             });
             if res.entries.len() >= max_entries {
@@ -130,24 +129,18 @@ impl UnrealFs {
     }
 
     async fn do_getattr(&self, id: fileid3) -> Result<fattr3, UnrealFsError> {
-        match self.cache.file_metadata(id).await {
-            Ok(metadata) => Ok(self.build_file_attr(id, &metadata).await?),
-
-            // TODO: check that it exists and that it is indeed a
-            // directory; we're just assuming.
-            Err(UnrealCacheError::NotFound) => Ok(self.build_dir_attr(id)),
-            Err(err) => Err(err.into()),
+        let (file_metadata, dir_mtime) =
+            tokio::join!(self.cache.file_metadata(id), self.cache.dir_mtime(id));
+        if let Ok(mtime) = dir_mtime {
+            return Ok(self.build_dir_attr(id, mtime));
         }
+        return Ok(self.build_file_attr(id, &file_metadata?));
     }
 
-    async fn build_file_attr(
-        &self,
-        inode: u64,
-        metadata: &FileMetadata,
-    ) -> Result<fattr3, UnrealFsError> {
+    fn build_file_attr(&self, inode: u64, metadata: &FileMetadata) -> fattr3 {
         let mtime = system_to_nfs_time(metadata.mtime);
 
-        Ok(fattr3 {
+        fattr3 {
             ftype: ftype3::NF3REG,
             mode: 0o0440,
             nlink: 1,
@@ -161,10 +154,11 @@ impl UnrealFs {
             atime: nfstime3::default(),
             mtime,
             ctime: mtime,
-        })
+        }
     }
 
-    fn build_dir_attr(&self, inode: u64) -> fattr3 {
+    fn build_dir_attr(&self, inode: u64, mtime: SystemTime) -> fattr3 {
+        let mtime = system_to_nfs_time(mtime);
         fattr3 {
             ftype: ftype3::NF3DIR,
             mode: 0o0550,
@@ -177,8 +171,8 @@ impl UnrealFs {
             fsid: 0,
             fileid: inode,
             atime: nfstime3::default(),
-            mtime: nfstime3::default(),
-            ctime: nfstime3::default(),
+            mtime,
+            ctime: mtime,
         }
     }
 }

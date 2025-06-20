@@ -18,42 +18,8 @@ pub struct ReadDirEntry {
     pub assignment: InodeAssignment,
 }
 
-impl Value for ReadDirEntry {
-    type SelfType<'a>
-        = ReadDirEntry
-    where
-        Self: 'a;
-
-    type AsBytes<'a>
-        = Vec<u8>
-    where
-        Self: 'a;
-
-    fn fixed_width() -> Option<usize> {
-        None
-    }
-
-    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
-    where
-        Self: 'a,
-    {
-        bincode::deserialize::<ReadDirEntry>(data).unwrap()
-    }
-
-    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
-    where
-        Self: 'b,
-    {
-        bincode::serialize(value).unwrap()
-    }
-
-    fn type_name() -> redb::TypeName {
-        redb::TypeName::new("ReadDirEntry")
-    }
-}
-
 /// The type of an inode.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum InodeAssignment {
     /// The inode of a file, look it up in the file table.
     File,
