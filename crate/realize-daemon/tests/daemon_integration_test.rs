@@ -6,6 +6,10 @@ use std::sync::Arc;
 
 use assert_fs::prelude::*;
 use assert_fs::TempDir;
+use nfs3_client::tokio::TokioConnector;
+use nfs3_client::Nfs3ConnectionBuilder;
+use nfs3_types::nfs3::Nfs3Result;
+use nfs3_types::nfs3::READDIR3args;
 use predicates::prelude::*;
 use realize_lib::model;
 use realize_lib::model::Arena;
@@ -50,6 +54,7 @@ impl Fixture {
 
         // Setup temp directory for the daemon to serve
         let temp_dir = TempDir::new()?;
+        let db = temp_dir.child("cache.db");
         let testdir = temp_dir.child("server");
         testdir.create_dir_all()?;
         testdir.child("foo.txt").write_str("hello")?;
@@ -57,7 +62,12 @@ impl Fixture {
         let resources = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
             .join("../../resources/test");
         let config_file = temp_dir.child("config.toml").to_path_buf();
-        write_config_file(&config_file, testdir.path(), &resources.join("a-spki.pem"))?;
+        write_config_file(
+            &config_file,
+            testdir.path(),
+            db.path(),
+            &resources.join("a-spki.pem"),
+        )?;
 
         Ok(Self {
             config_file,
@@ -302,9 +312,71 @@ async fn daemon_interrupted() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn daemon_exports_nfs() -> anyhow::Result<()> {
+    let fixture = Fixture::setup().await?;
+
+    let nfs_port = portpicker::pick_unused_port().expect("No ports free");
+    let nfs_addr = format!("127.0.0.1:{}", nfs_port);
+
+    // Run process in the background and in a way that allows reading
+    // its output, so we know what port to connect to.
+    let mut daemon = fixture
+        .command()
+        .arg("--nfs")
+        .arg(nfs_addr)
+        .env("RUST_LOG", "debug")
+        .stderr(std::process::Stdio::inherit())
+        .spawn()?;
+
+    // The first line that's output to stdout must be Listening on
+    // <address>:<port>. Anything else is an error.
+    wait_for_listening_port(daemon.stdout.as_mut().unwrap()).await?;
+
+    log::debug!("Connecting to NFS port {nfs_port}");
+    let mut connection =
+        Nfs3ConnectionBuilder::new(TokioConnector, "127.0.0.1".to_string(), "/".to_string())
+            .connect_from_privileged_port(false)
+            .mount_port(nfs_port)
+            .nfs3_port(nfs_port)
+            .mount()
+            .await?;
+
+    log::debug!("Connected to NFS port {nfs_port}");
+    let root = connection.root_nfs_fh3();
+    let readdir = connection
+        .readdir(READDIR3args {
+            dir: root,
+            cookie: 0,
+            cookieverf: nfs3_types::nfs3::cookieverf3::default(),
+            count: 128 * 1024 * 1024,
+        })
+        .await?;
+    match readdir {
+        Nfs3Result::Err(err) => panic!("readdir failed:{:?}", err),
+        Nfs3Result::Ok(res) => {
+            assert_unordered::assert_eq_unordered!(
+                vec!["testdir"],
+                res.reply
+                    .entries
+                    .0
+                    .iter()
+                    .map(|e| std::str::from_utf8(e.name.as_ref()).expect("utf-8"))
+                    .collect::<Vec<_>>()
+            );
+        }
+    };
+    let _ = connection.unmount().await;
+
+    daemon.start_kill()?;
+
+    Ok(())
+}
+
 fn write_config_file(
     config_file: &Path,
     testdir_server: &Path,
+    cache_path: &Path,
     pubkey_file: &Path,
 ) -> anyhow::Result<()> {
     // Write config TOML
@@ -313,12 +385,16 @@ fn write_config_file(
 [arenas]
 testdir.path = "{}"
 
+[cache]
+db = "{}"
+
 [peers]
 testpeer.pubkey = """
 {}
 """
 "#,
         testdir_server.display(),
+        cache_path.display(),
         std::fs::read_to_string(pubkey_file)?
     );
     std::fs::write(config_file, config_toml)?;
