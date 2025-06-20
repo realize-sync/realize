@@ -2060,7 +2060,6 @@ dependencies = [
  "portpicker",
  "predicates",
  "prometheus",
- "realize-fs",
  "realize-lib",
  "reqwest",
  "rustls",
@@ -2076,28 +2075,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "realize-fs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "assert_fs",
- "async-trait",
- "env_logger",
- "log",
- "moka",
- "nfsserve",
- "nix",
- "realize-lib",
- "redb",
- "rustls",
- "serde",
- "test-tag",
- "thiserror 2.0.12",
- "tokio",
- "toml",
-]
-
-[[package]]
 name = "realize-lib"
 version = "0.1.0"
 dependencies = [
@@ -2106,6 +2083,7 @@ dependencies = [
  "assert_fs",
  "assert_unordered",
  "async-speed-limit",
+ "async-trait",
  "base64",
  "bincode",
  "blake2",
@@ -2118,6 +2096,8 @@ dependencies = [
  "lazy_static",
  "log",
  "moka",
+ "nfsserve",
+ "nix",
  "pathdiff",
  "portpicker",
  "predicates",
@@ -2135,6 +2115,7 @@ dependencies = [
  "tokio",
  "tokio-retry",
  "tokio-rustls",
+ "toml",
  "walkdir",
 ]
 

@@ -4,7 +4,7 @@ use anyhow::Context as _;
 use clap::Parser;
 use futures_util::stream::StreamExt as _;
 use prometheus::{register_int_counter, IntCounter};
-use realize_fs::nfs;
+use realize_lib::fs::nfs;
 use realize_lib::logic::config::Config;
 use realize_lib::logic::setup;
 use realize_lib::network::hostport::HostPort;

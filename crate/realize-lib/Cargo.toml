@@ -7,9 +7,10 @@ edition = "2024"
 anyhow = "1.0"
 assert_unordered = "0.3"
 async-speed-limit = { version = "0.4.2", features = ["futures-timer","futures-core"] }
+async-trait = "0.1.88"
 base64 = "0.22"
-blake2 = "0.10.6"
 bincode = "1.3.3"
+blake2 = "0.10.6"
 env_logger = "0.11"
 fast_rsync = "0.2"
 futures = "0.3"
@@ -17,6 +18,9 @@ hyper = { version = "1.6", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 lazy_static = "1.5"
 log = "0.4"
+moka = { version = "0.12.10", features = ["future"] }
+nfsserve = "0.10.2"
+nix = { version = "0.30.1", features = ["user"] }
 pathdiff = "0.2"
 prometheus = { version = "0.14", features = [] }
 redb = "2.6.0"
@@ -29,7 +33,7 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "fs", "
 tokio-retry = "0.3.0"
 tokio-rustls = "0.26"
 walkdir = "2.5"
-moka = { version = "0.12.10", features = ["future"] }
+
 
 [target.'cfg(target_os="linux")'.dependencies]
 inotify = "0.11.0"
@@ -46,3 +50,5 @@ tempfile = "3.20"
 test-tag = "0.1"
 tokio = { version = "1", features = ["process"] }
 redb = { version = "2.6.0", features = ["logging"] }
+nix = { version = "0.30.1", features = ["fs"] }
+toml = { version = "0.8.23", features = ["display", "parse"] }

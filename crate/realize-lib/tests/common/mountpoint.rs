@@ -146,7 +146,7 @@ async fn export_retry(
 ) -> std::io::Result<AbortOnDrop<std::io::Result<()>>> {
     let addr = HostPort::localhost(port).addr();
     for _ in 0..10 {
-        match realize_fs::nfs::export(cache.clone(), downloader.clone(), addr).await {
+        match realize_lib::fs::nfs::export(cache.clone(), downloader.clone(), addr).await {
             Ok(handle) => {
                 return Ok(AbortOnDrop::new(handle));
             }
