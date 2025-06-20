@@ -20,7 +20,7 @@ function rebuild_all {
 }
 
 function up_all {
-    maybe_rebuild realize-daemon && up a 7001 7002 && up b 8001 8002
+    maybe_rebuild realize-daemon && up a 7001 7002 7003 && up b 8001 8002 8003
 }
 
 function down_all {
@@ -32,6 +32,7 @@ function up {
     inst=$1
     port=$2
     metrics_port=$3
+    nfs_port=$4
     configfile="${this}/${inst}.toml"
     keyfile="${root}/resources/test/${inst}.key"
     outfile="${this}/${inst}.out"
@@ -45,6 +46,7 @@ function up {
             --config "${configfile}" \
             --privkey "${keyfile}" \
             --address "127.0.0.1:${port}" \
+            --nfs "127.0.0.1:${nfs_port}" \
             --metrics-addr "127.0.0.1:${metrics_port}" \
             </dev/null >"${outfile}" 2>&1 &
         pid=$!
@@ -122,3 +124,31 @@ function moveall {
              "$@"
 }
 
+function mount {
+    inst="$1"
+
+    case "${inst}" in
+        a) port=7003 ;;
+        b) port=8003 ;;
+        *) echo >&2 "error: unknown instance ${inst}"
+    esac
+         
+    mkdir -p "${inst}-nfs"
+    sudo mount -t nfs \
+         -o user,noauto,noatime,nodiratime,noacl,nolock,vers=3,tcp,wsize=1048576,rsize=131072,actimeo=120,port=${port},mountport=${port} \
+         127.0.0.1:/ "${inst}-nfs"
+}
+
+function mount_all {
+    mount a
+    mount b
+}
+
+function unmount {
+    sudo umount "$1-nfs"
+}
+
+function unmount_all {
+    unmount a
+    unmount b
+}

@@ -2,9 +2,20 @@
 one.path = "one-a"
 two.path = "two-a"
 
-[peers]
-client.pubkey = """
+[peers.client]
+pubkey = """
 -----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEA5Fk9nDDOyj9z4bjRHmuQ0+yIksTrkLq8tjRH63xTAqs=
 -----END PUBLIC KEY-----
-""""
+"""
+
+[peers.b]
+address = "127.0.0.1:8001"
+pubkey = """
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAZvriEx8hZEAildpfeifrv0Z5xED/kkK7wzT5Gel+w/w=
+-----END PUBLIC KEY-----
+"""
+
+[cache]
+db = "a.db"
