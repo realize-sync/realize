@@ -1,8 +1,6 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use assert_fs::prelude::*;
 use assert_fs::TempDir;
@@ -11,18 +9,18 @@ use nfs3_client::Nfs3ConnectionBuilder;
 use nfs3_types::nfs3::Nfs3Result;
 use nfs3_types::nfs3::READDIR3args;
 use predicates::prelude::*;
+use realize_lib::logic::config::Config;
 use realize_lib::model;
 use realize_lib::model::Arena;
 use realize_lib::model::Peer;
+use realize_lib::network::config::PeerConfig;
 use realize_lib::network::rpc::realstore;
 use realize_lib::network::rpc::realstore::client::ClientOptions;
 use realize_lib::network::rpc::realstore::Options;
-use realize_lib::network::security::PeerVerifier;
-use realize_lib::network::security::RawPublicKeyResolver;
 use realize_lib::network::Networking;
+use realize_lib::storage::config::ArenaConfig;
+use realize_lib::storage::config::CacheConfig;
 use reqwest::Client;
-use rustls::pki_types::pem::PemObject as _;
-use rustls::pki_types::SubjectPublicKeyInfoDer;
 use tarpc::context;
 use tokio::io::AsyncBufReadExt as _;
 use tokio::process::Command;
@@ -42,57 +40,78 @@ fn command_path() -> PathBuf {
 }
 
 struct Fixture {
-    pub config_file: PathBuf,
+    pub config: Config,
     pub resources: PathBuf,
     pub testdir: PathBuf,
-    pub _temp_dir: TempDir,
+    pub tempdir: TempDir,
 }
 
 impl Fixture {
     pub async fn setup() -> anyhow::Result<Self> {
         let _ = env_logger::try_init();
 
+        let mut config = Config::new();
+        let arena = Arena::from("testdir");
+
         // Setup temp directory for the daemon to serve
-        let temp_dir = TempDir::new()?;
-        let db = temp_dir.child("cache.db");
-        let testdir = temp_dir.child("server");
+        let tempdir = TempDir::new()?;
+
+        let testdir = tempdir.child("testdir");
         testdir.create_dir_all()?;
+        config.storage.arenas.insert(
+            arena.clone(),
+            ArenaConfig {
+                path: testdir.to_path_buf(),
+            },
+        );
+
         testdir.child("foo.txt").write_str("hello")?;
 
         let resources = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
             .join("../../resources/test");
-        let config_file = temp_dir.child("config.toml").to_path_buf();
-        write_config_file(
-            &config_file,
-            testdir.path(),
-            db.path(),
-            &resources.join("a-spki.pem"),
-        )?;
+
+        config.network.peers.insert(
+            Peer::from("a"),
+            PeerConfig {
+                address: None,
+                pubkey: std::fs::read_to_string(resources.join("a-spki.pem"))?,
+            },
+        );
+        config.network.peers.insert(
+            Peer::from("b"),
+            PeerConfig {
+                address: None,
+                pubkey: std::fs::read_to_string(resources.join("b-spki.pem"))?,
+            },
+        );
 
         Ok(Self {
-            config_file,
+            config,
             resources,
-            testdir: testdir.path().to_path_buf(),
-            _temp_dir: temp_dir,
+            testdir: testdir.to_path_buf(),
+            tempdir,
         })
     }
 
-    pub fn command(&self) -> Command {
+    pub fn command(&self) -> anyhow::Result<Command> {
         let mut cmd = tokio::process::Command::new(command_path());
+
+        let config_file = self.tempdir.child("config.toml").to_path_buf();
+        std::fs::write(&config_file, toml::to_string_pretty(&self.config)?)?;
 
         cmd.arg("--address")
             .arg("127.0.0.1:0")
             .arg("--privkey")
             .arg(self.resources.join("a.key"))
             .arg("--config")
-            .arg(&self.config_file)
+            .arg(config_file)
             .env_remove("RUST_LOG")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
 
-        cmd
+        Ok(cmd)
     }
 }
 
@@ -103,7 +122,7 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
     // Run process in the background and in a way that allows reading
     // its output, so we know what port to connect to.
     let mut daemon = fixture
-        .command()
+        .command()?
         .env(
             "RUST_LOG",
             "realize_lib::network=debug,realize_daemon=debug",
@@ -114,20 +133,12 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
     // <address>:<port>. Anything else is an error.
     let portstr = wait_for_listening_port(daemon.stdout.as_mut().unwrap()).await?;
 
-    // Connect to the port the daemon listens to.
-    let mut verifier = PeerVerifier::new();
-    verifier.add_peer(
-        &Peer::from("a"),
-        SubjectPublicKeyInfoDer::from_pem_file(fixture.resources.join("a-spki.pem"))?,
-    );
-    let verifier = Arc::new(verifier);
-    let peer = Peer::from("server");
-    let networking = Networking::new(
-        vec![(&peer, format!("127.0.0.1:{portstr}").as_ref())],
-        RawPublicKeyResolver::from_private_key_file(&fixture.resources.join("a.key"))?,
-        verifier,
-    );
-    let client = realstore::client::connect(&networking, &peer, ClientOptions::default()).await?;
+    let a = Peer::from("a");
+    let mut peers = fixture.config.network.peers.clone();
+    peers.get_mut(&a).expect("PeerConfig of a").address = Some(format!("127.0.0.1:{portstr}"));
+
+    let networking = Networking::from_config(&peers, &fixture.resources.join("b.key"))?;
+    let client = realstore::client::connect(&networking, &a, ClientOptions::default()).await?;
     let files = client
         .list(
             context::current(),
@@ -147,7 +158,7 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
     let stdout = collect_stdout(daemon.stdout.as_mut().unwrap()).await?;
     let stderr = collect_stderr(daemon.stderr.as_mut().unwrap()).await?;
     assert!(
-        stderr.contains("Accepted peer testpeer from "),
+        stderr.contains("Accepted peer b from "),
         "stderr: {stderr} stdout: {stdout}"
     );
 
@@ -164,7 +175,7 @@ async fn metrics_endpoint_works() -> anyhow::Result<()> {
     // Run process in the background and in a way that allows reading
     // its output, so we know what port to connect to.
     let mut daemon = fixture
-        .command()
+        .command()?
         .arg("--metrics-addr")
         .arg(&metrics_addr)
         .spawn()?;
@@ -202,7 +213,7 @@ async fn daemon_fails_on_missing_directory() -> anyhow::Result<()> {
     let fixture = Fixture::setup().await?;
     fs::remove_dir_all(&fixture.testdir)?;
 
-    let output = fixture.command().output().await?;
+    let output = fixture.command()?.output().await?;
     assert!(!output.status.success());
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -220,7 +231,7 @@ async fn daemon_fails_on_unreadable_directory() -> anyhow::Result<()> {
     let fixture = Fixture::setup().await?;
     std::fs::set_permissions(&fixture.testdir, std::fs::Permissions::from_mode(0o000))?;
 
-    let output = fixture.command().output().await?;
+    let output = fixture.command()?.output().await?;
     assert!(!output.status.success());
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -238,7 +249,7 @@ async fn daemon_warns_on_unwritable_directory() -> anyhow::Result<()> {
     let fixture = Fixture::setup().await?;
     std::fs::set_permissions(&fixture.testdir, std::fs::Permissions::from_mode(0o500))?; // read+exec only
 
-    let mut daemon = fixture.command().spawn()?;
+    let mut daemon = fixture.command()?.spawn()?;
     let _ = wait_for_listening_port(daemon.stdout.as_mut().unwrap()).await?;
 
     // Kill to make sure stderr ends
@@ -260,7 +271,7 @@ async fn daemon_systemd_log_output_format() -> anyhow::Result<()> {
     // Run process in the background and in a way that allows reading
     // its output, so we know what port to connect to.
     let mut daemon = fixture
-        .command()
+        .command()?
         .env("RUST_LOG_FORMAT", "SYSTEMD")
         .spawn()?;
 
@@ -284,7 +295,7 @@ async fn daemon_interrupted() -> anyhow::Result<()> {
     let fixture = Fixture::setup().await?;
 
     let mut daemon = fixture
-        .command()
+        .command()?
         .env(
             "RUST_LOG",
             "realize_lib::network::tcp=debug,realize_daemon=debug",
@@ -314,15 +325,19 @@ async fn daemon_interrupted() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn daemon_exports_nfs() -> anyhow::Result<()> {
-    let fixture = Fixture::setup().await?;
+    let mut fixture = Fixture::setup().await?;
 
     let nfs_port = portpicker::pick_unused_port().expect("No ports free");
     let nfs_addr = format!("127.0.0.1:{}", nfs_port);
 
+    fixture.config.storage.cache = Some(CacheConfig {
+        db: fixture.tempdir.child("cache.db").to_path_buf(),
+    });
+
     // Run process in the background and in a way that allows reading
     // its output, so we know what port to connect to.
     let mut daemon = fixture
-        .command()
+        .command()?
         .arg("--nfs")
         .arg(nfs_addr)
         .env("RUST_LOG", "debug")
@@ -369,35 +384,6 @@ async fn daemon_exports_nfs() -> anyhow::Result<()> {
     let _ = connection.unmount().await;
 
     daemon.start_kill()?;
-
-    Ok(())
-}
-
-fn write_config_file(
-    config_file: &Path,
-    testdir_server: &Path,
-    cache_path: &Path,
-    pubkey_file: &Path,
-) -> anyhow::Result<()> {
-    // Write config TOML
-    let config_toml = format!(
-        r#"
-[arenas]
-testdir.path = "{}"
-
-[cache]
-db = "{}"
-
-[peers]
-testpeer.pubkey = """
-{}
-"""
-"#,
-        testdir_server.display(),
-        cache_path.display(),
-        std::fs::read_to_string(pubkey_file)?
-    );
-    std::fs::write(config_file, config_toml)?;
 
     Ok(())
 }

@@ -2,15 +2,23 @@ use std::collections::HashMap;
 
 use crate::model::Peer;
 
-#[derive(Clone, serde::Deserialize, Debug)]
+#[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
 pub struct NetworkConfig {
     pub peers: HashMap<Peer, PeerConfig>,
+}
+
+impl NetworkConfig {
+    pub fn new() -> Self {
+        NetworkConfig {
+            peers: HashMap::new(),
+        }
+    }
 }
 
 /// Define a peer.
 ///
 /// A peer is identified by [crate::model::Peer].
-#[derive(Clone, serde::Deserialize, Debug)]
+#[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
 pub struct PeerConfig {
     /// Address of the peer, if available.
     ///

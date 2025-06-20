@@ -5,15 +5,13 @@ use clap::Parser;
 use futures_util::stream::StreamExt as _;
 use prometheus::{register_int_counter, IntCounter};
 use realize_fs::nfs;
+use realize_lib::logic::config::Config;
 use realize_lib::logic::setup;
-use realize_lib::network::config::NetworkConfig;
 use realize_lib::network::hostport::HostPort;
 use realize_lib::network::rpc::realstore::metrics;
 use realize_lib::network::Networking;
-use realize_lib::storage::config::StorageConfig;
 use realize_lib::storage::unreal::Downloader;
 use realize_lib::utils::logging;
-use serde::Deserialize;
 use signal_hook_tokio::Signals;
 use std::path::{Path, PathBuf};
 use std::{fs, process};
@@ -49,15 +47,6 @@ struct Cli {
     /// Address to export prometheus metrics (host:port, optional)
     #[arg(long)]
     metrics_addr: Option<String>,
-}
-
-/// Config file structure
-#[derive(Debug, Deserialize)]
-struct Config {
-    #[serde(flatten)]
-    network: NetworkConfig,
-    #[serde(flatten)]
-    storage: StorageConfig,
 }
 
 lazy_static::lazy_static! {
