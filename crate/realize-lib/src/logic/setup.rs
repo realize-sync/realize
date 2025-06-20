@@ -3,22 +3,15 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tokio_retry::strategy::ExponentialBackoff;
 
-use crate::{
-    model::Arena,
-    network::{
-        config::NetworkConfig,
-        rpc::{
-            history::{self, server::forward_peer_history},
-            realstore,
-        },
-        Networking, Server,
-    },
-    storage::{
-        config::{ArenaConfig, StorageConfig},
-        real::LocalStorage,
-        unreal::{keep_cache_updated, UnrealCacheAsync},
-    },
-};
+use crate::model::Arena;
+use crate::network::config::NetworkConfig;
+use crate::network::rpc::history;
+use crate::network::rpc::history::server::forward_peer_history;
+use crate::network::rpc::realstore;
+use crate::network::{Networking, Server};
+use crate::storage::config::{ArenaConfig, StorageConfig};
+use crate::storage::real::LocalStorage;
+use crate::storage::unreal::{keep_cache_updated, UnrealCacheAsync};
 
 /// Setup server as specified in the configuration.
 ///
