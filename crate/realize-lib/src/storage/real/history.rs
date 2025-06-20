@@ -16,7 +16,7 @@ use crate::{
     storage::real::PathType,
 };
 
-use super::PathResolver;
+use super::{Notification, PathResolver};
 
 /// Spawn a file watcher task that can be used to get notifications.
 ///
