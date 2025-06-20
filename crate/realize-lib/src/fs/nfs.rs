@@ -320,7 +320,11 @@ fn unreal_to_nfsstat3(err: &UnrealCacheError) -> nfsstat3 {
         NotADirectory => NFS3ERR_NOTDIR,
         IsADirectory => NFS3ERR_ISDIR,
         Io(e) => io_to_nfsstat3(e),
-        _ => NFS3ERR_SERVERFAULT,
+        _ => {
+            log::debug!("Unexpected error {err:?}");
+
+            NFS3ERR_SERVERFAULT
+        }
     }
 }
 
@@ -346,5 +350,183 @@ fn system_to_nfs_time(t: SystemTime) -> nfstime3 {
     nfstime3 {
         seconds: epoch_time.as_secs() as u32,
         nseconds: epoch_time.subsec_nanos(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        model::{Arena, Path},
+        network::{self, hostport::HostPort, rpc::realstore, security, Server},
+        storage::real::LocalStorage,
+    };
+    use assert_fs::{
+        prelude::{FileWriteStr as _, PathChild as _},
+        TempDir,
+    };
+    use nfsserve::nfs::nfsstring;
+
+    use super::*;
+
+    struct Fixture {
+        start_time: Duration,
+        arena: Arena,
+        cache: UnrealCacheAsync,
+        fs: UnrealFs,
+        tempdir: TempDir,
+        _server: Arc<Server>,
+    }
+    impl Fixture {
+        async fn setup() -> anyhow::Result<Fixture> {
+            let start_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?;
+            let _ = env_logger::try_init();
+            let tempdir = TempDir::new()?;
+            let arena = Arena::from("test");
+            let local = LocalStorage::new(vec![(arena.clone(), tempdir.path().to_path_buf())]);
+            let mut server = Server::new(network::testing::server_networking()?);
+            realstore::server::register(&mut server, local.clone());
+            let server = Arc::new(server);
+            let addr = server.listen(&HostPort::localhost(0)).await?;
+            let networking = network::testing::client_networking(addr)?;
+
+            let mut cache = unreal::testing::in_memory_cache()?;
+            cache.add_arena(&arena)?;
+            let cache = cache.into_async();
+
+            let fs = UnrealFs::new(cache.clone(), Downloader::new(networking, cache.clone()));
+
+            Ok(Self {
+                start_time,
+                tempdir,
+                arena,
+                cache,
+                fs,
+                _server: server,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn root_dir() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let fs = &fixture.fs;
+
+        assert_eq!(unreal::ROOT_DIR, fs.root_dir());
+
+        let attrs = fs.getattr(unreal::ROOT_DIR).await.map_err(to_anyhow)?;
+        assert_eq!(0o0550, attrs.mode);
+        assert_eq!(nix::unistd::getuid().as_raw(), attrs.uid);
+        assert_eq!(nix::unistd::getgid().as_raw(), attrs.gid);
+
+        // mtime should have been set when the arena was added
+        assert!(attrs.mtime.seconds >= fixture.start_time.as_secs() as u32);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn arena_dir() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let fs = &fixture.fs;
+
+        let arena_root = fs
+            .lookup(unreal::ROOT_DIR, &nfsstring::from("test".as_bytes()))
+            .await
+            .map_err(to_anyhow)?;
+        assert_eq!(fixture.cache.arena_root(&fixture.arena)?, arena_root);
+
+        let attrs = fs.getattr(arena_root).await.map_err(to_anyhow)?;
+        assert_eq!(0o0550, attrs.mode);
+        assert_eq!(nix::unistd::getuid().as_raw(), attrs.uid);
+        assert_eq!(nix::unistd::getgid().as_raw(), attrs.gid);
+        // mtime should have been set when the arena was added
+        assert!(attrs.mtime.seconds >= fixture.start_time.as_secs() as u32);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn file_attrs() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let fs = &fixture.fs;
+
+        let mtime = SystemTime::now();
+        fixture
+            .cache
+            .link(
+                &security::testing::server_peer(),
+                &fixture.arena,
+                &Path::parse("somefile.txt")?,
+                5,
+                mtime,
+            )
+            .await?;
+
+        let arena_root = fixture.cache.arena_root(&fixture.arena).expect("arena");
+        let somefile_inode = fs
+            .lookup(arena_root, &nfsstring::from("somefile.txt".as_bytes()))
+            .await
+            .map_err(to_anyhow)?;
+
+        let attrs = fs.getattr(somefile_inode).await.map_err(to_anyhow)?;
+        assert_eq!(0o0440, attrs.mode);
+        assert_eq!(nix::unistd::getuid().as_raw(), attrs.uid);
+        assert_eq!(nix::unistd::getgid().as_raw(), attrs.gid);
+        assert_eq!(5, attrs.size);
+        assert_eq!(5, attrs.used);
+
+        let mtime_unix = mtime.duration_since(SystemTime::UNIX_EPOCH)?;
+        assert_eq!(
+            (mtime_unix.as_secs(), mtime_unix.subsec_nanos()),
+            (attrs.mtime.seconds as u64, attrs.mtime.nseconds)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn file_content() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let fs = &fixture.fs;
+
+        let file = fixture.tempdir.child("hello.txt");
+        file.write_str("world")?;
+
+        let m = tokio::fs::metadata(&file).await?;
+        fixture
+            .cache
+            .link(
+                &security::testing::server_peer(),
+                &fixture.arena,
+                &Path::parse("hello.txt")?,
+                m.len(),
+                m.modified()?,
+            )
+            .await?;
+
+        let arena_root = fixture.cache.arena_root(&fixture.arena).expect("arena");
+        let somefile_inode = fs
+            .lookup(arena_root, &nfsstring::from("hello.txt".as_bytes()))
+            .await
+            .map_err(to_anyhow)?;
+
+        let (vec, at_end) = fs.read(somefile_inode, 0, 2).await.map_err(to_anyhow)?;
+        let content = String::from_utf8(vec)?;
+        assert_eq!("wo", content);
+        assert!(!at_end);
+
+        let (vec, at_end) = fs.read(somefile_inode, 2, 2).await.map_err(to_anyhow)?;
+        let content = String::from_utf8(vec)?;
+        assert_eq!("rl", content);
+        assert!(!at_end);
+
+        let (vec, at_end) = fs.read(somefile_inode, 0, 100).await.map_err(to_anyhow)?;
+        let content = String::from_utf8(vec)?;
+        assert_eq!("world", content);
+        assert!(at_end);
+
+        Ok(())
+    }
+
+    fn to_anyhow(code: nfsstat3) -> anyhow::Error {
+        anyhow::anyhow!("NFS error {:?}", code)
     }
 }
