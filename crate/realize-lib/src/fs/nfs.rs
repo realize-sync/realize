@@ -17,7 +17,7 @@ use nfsserve::{
 };
 
 use crate::storage::unreal::{
-    self, Download, Downloader, FileMetadata, InodeAssignment, UnrealCacheAsync, UnrealCacheError,
+    self, Download, Downloader, FileMetadata, InodeAssignment, UnrealCacheAsync, UnrealError,
 };
 use async_trait::async_trait;
 use tokio::{
@@ -231,7 +231,7 @@ impl NFSFileSystem for UnrealFs {
             .or_try_insert_with(async {
                 let reader = self.downloader.reader(id).await?;
 
-                Ok::<_, UnrealCacheError>(Arc::new(Mutex::new(reader)))
+                Ok::<_, UnrealError>(Arc::new(Mutex::new(reader)))
             })
             .await
             .map_err(|e| unreal_to_nfsstat3(e.as_ref()))?
@@ -292,7 +292,7 @@ impl NFSFileSystem for UnrealFs {
 #[derive(Debug, thiserror::Error)]
 enum UnrealFsError {
     #[error(transparent)]
-    Cache(#[from] UnrealCacheError),
+    Cache(#[from] UnrealError),
 
     #[error("invalid UTF-8 string")]
     Utf8(#[from] Utf8Error),
@@ -312,9 +312,9 @@ impl From<UnrealFsError> for nfsstat3 {
     }
 }
 
-fn unreal_to_nfsstat3(err: &UnrealCacheError) -> nfsstat3 {
+fn unreal_to_nfsstat3(err: &UnrealError) -> nfsstat3 {
     use nfsstat3::*;
-    use UnrealCacheError::*;
+    use UnrealError::*;
     match err {
         NotFound => NFS3ERR_NOENT,
         NotADirectory => NFS3ERR_NOTDIR,

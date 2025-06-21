@@ -3,8 +3,7 @@
 //! See `spec/unreal.md` for details.
 
 use super::{
-    FileEntry, FileMetadata, InodeAssignment, ReadDirEntry, UnrealCacheAsync, UnrealCacheError,
-    ROOT_DIR,
+    FileEntry, FileMetadata, InodeAssignment, ReadDirEntry, UnrealCacheAsync, UnrealError, ROOT_DIR,
 };
 use crate::model::{Arena, Path, Peer};
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, Value, WriteTransaction};
@@ -134,7 +133,7 @@ pub struct UnrealCacheBlocking {
 
 impl UnrealCacheBlocking {
     /// Create a new UnrealCache from a redb database.
-    pub fn new(db: Database) -> Result<Self, UnrealCacheError> {
+    pub fn new(db: Database) -> Result<Self, UnrealError> {
         {
             let txn = db.begin_write()?;
             txn.open_table(ARENA_TABLE)?;
@@ -153,7 +152,7 @@ impl UnrealCacheBlocking {
     }
 
     /// Open or create an UnrealCache at the given path.
-    pub fn open(path: &path::Path) -> Result<Self, UnrealCacheError> {
+    pub fn open(path: &path::Path) -> Result<Self, UnrealError> {
         Self::new(Database::create(path)?)
     }
 
@@ -166,11 +165,11 @@ impl UnrealCacheBlocking {
     ///
     /// Will return [UnrealCacheError::UnknownArena] unless the arena
     /// is available in the cache.
-    pub fn arena_root(&self, arena: &Arena) -> Result<u64, UnrealCacheError> {
+    pub fn arena_root(&self, arena: &Arena) -> Result<u64, UnrealError> {
         self.arena_map
             .get(arena)
             .map(|inode| *inode)
-            .ok_or_else(|| UnrealCacheError::UnknownArena(arena.clone()))
+            .ok_or_else(|| UnrealError::UnknownArena(arena.clone()))
     }
 
     /// Add an arena to the database.
@@ -207,7 +206,7 @@ impl UnrealCacheBlocking {
         path: &Path,
         size: u64,
         mtime: SystemTime,
-    ) -> Result<(), UnrealCacheError> {
+    ) -> Result<(), UnrealError> {
         let txn = self.db.begin_write()?;
         let inode = do_link(
             &txn,
@@ -231,7 +230,7 @@ impl UnrealCacheBlocking {
         path: &Path,
         size: u64,
         mtime: SystemTime,
-    ) -> Result<(), UnrealCacheError> {
+    ) -> Result<(), UnrealError> {
         let txn = self.db.begin_write()?;
         do_link(
             &txn,
@@ -253,7 +252,7 @@ impl UnrealCacheBlocking {
         arena: &Arena,
         path: &Path,
         mtime: SystemTime,
-    ) -> Result<(), UnrealCacheError> {
+    ) -> Result<(), UnrealError> {
         let txn = self.db.begin_write()?;
         do_unlink(&txn, peer, self.arena_root(arena)?, path, mtime)?;
         txn.commit()?;
@@ -261,13 +260,13 @@ impl UnrealCacheBlocking {
     }
 
     /// Lookup a directory entry.
-    pub fn lookup(&self, parent_inode: u64, name: &str) -> Result<ReadDirEntry, UnrealCacheError> {
+    pub fn lookup(&self, parent_inode: u64, name: &str) -> Result<ReadDirEntry, UnrealError> {
         let txn = self.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
 
         Ok(dir_table
             .get((parent_inode, name))?
-            .ok_or(UnrealCacheError::NotFound)?
+            .ok_or(UnrealError::NotFound)?
             .value()
             .as_readdir_entry(parent_inode))
     }
@@ -277,7 +276,7 @@ impl UnrealCacheBlocking {
         &self,
         parent_inode: u64,
         path: &Path,
-    ) -> Result<(u64, InodeAssignment), UnrealCacheError> {
+    ) -> Result<(u64, InodeAssignment), UnrealError> {
         let txn = self.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
 
@@ -285,17 +284,17 @@ impl UnrealCacheBlocking {
     }
 
     /// Return the best metadata for the file.
-    pub fn file_metadata(&self, inode: u64) -> Result<FileMetadata, UnrealCacheError> {
+    pub fn file_metadata(&self, inode: u64) -> Result<FileMetadata, UnrealError> {
         let txn = self.db.begin_read()?;
         if let Some((_, entry)) = do_file_availability(&txn, inode)?.into_iter().next() {
             return Ok(entry.metadata);
         }
 
-        Err(UnrealCacheError::NotFound)
+        Err(UnrealError::NotFound)
     }
 
     /// Return the mtime of the directory.
-    pub fn dir_mtime(&self, inode: u64) -> Result<SystemTime, UnrealCacheError> {
+    pub fn dir_mtime(&self, inode: u64) -> Result<SystemTime, UnrealError> {
         let txn = self.db.begin_read()?;
 
         do_dir_mtime(&txn, inode)
@@ -304,16 +303,13 @@ impl UnrealCacheBlocking {
     /// Return valid peer file entries for the file.
     ///
     /// The returned vector might be empty if the file isn't available in any peer.
-    pub fn file_availability(
-        &self,
-        inode: u64,
-    ) -> Result<Vec<(Peer, FileEntry)>, UnrealCacheError> {
+    pub fn file_availability(&self, inode: u64) -> Result<Vec<(Peer, FileEntry)>, UnrealError> {
         let txn = self.db.begin_read()?;
 
         do_file_availability(&txn, inode)
     }
 
-    pub fn readdir(&self, inode: u64) -> Result<Vec<(String, ReadDirEntry)>, UnrealCacheError> {
+    pub fn readdir(&self, inode: u64) -> Result<Vec<(String, ReadDirEntry)>, UnrealError> {
         let txn = self.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
 
@@ -336,14 +332,14 @@ impl UnrealCacheBlocking {
         Ok(entries)
     }
 
-    pub fn mark_peer_files(&self, peer: &Peer, arena: &Arena) -> Result<(), UnrealCacheError> {
+    pub fn mark_peer_files(&self, peer: &Peer, arena: &Arena) -> Result<(), UnrealError> {
         let txn = self.db.begin_write()?;
         do_mark_peer_files(&txn, peer, arena)?;
         txn.commit()?;
         Ok(())
     }
 
-    pub fn delete_marked_files(&self, peer: &Peer, arena: &Arena) -> Result<(), UnrealCacheError> {
+    pub fn delete_marked_files(&self, peer: &Peer, arena: &Arena) -> Result<(), UnrealError> {
         let txn = self.db.begin_write()?;
         do_delete_marked_files(&txn, peer, arena)?;
         txn.commit()?;
@@ -351,7 +347,7 @@ impl UnrealCacheBlocking {
     }
 }
 
-fn do_dir_mtime(txn: &ReadTransaction, inode: u64) -> Result<SystemTime, UnrealCacheError> {
+fn do_dir_mtime(txn: &ReadTransaction, inode: u64) -> Result<SystemTime, UnrealError> {
     let dir_table = txn.open_table(DIRECTORY_TABLE)?;
     if let Some(DirTableEntry::Dot(mtime)) = dir_table.get((inode, "."))?.map(|e| e.value()) {
         Ok(mtime)
@@ -360,11 +356,11 @@ fn do_dir_mtime(txn: &ReadTransaction, inode: u64) -> Result<SystemTime, UnrealC
         // have a mtime. This is not an error.
         Ok(SystemTime::UNIX_EPOCH)
     } else {
-        Err(UnrealCacheError::NotFound)
+        Err(UnrealError::NotFound)
     }
 }
 
-fn do_read_arena_map(txn: &ReadTransaction) -> Result<HashMap<Arena, u64>, UnrealCacheError> {
+fn do_read_arena_map(txn: &ReadTransaction) -> Result<HashMap<Arena, u64>, UnrealError> {
     let mut map = HashMap::new();
     let arena_table = txn.open_table(ARENA_TABLE)?;
     for elt in arena_table.iter()? {
@@ -422,17 +418,17 @@ fn do_unlink(
     arena_root: u64,
     path: &Path,
     mtime: SystemTime,
-) -> Result<(), UnrealCacheError> {
+) -> Result<(), UnrealError> {
     let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
     let (parent_inode, parent_assignment) = do_lookup_path(&dir_table, arena_root, &path.parent())?;
     if parent_assignment != InodeAssignment::Directory {
-        return Err(UnrealCacheError::NotADirectory);
+        return Err(UnrealError::NotADirectory);
     }
 
     let dir_entry =
-        get_dir_entry(&dir_table, parent_inode, path.name())?.ok_or(UnrealCacheError::NotFound)?;
+        get_dir_entry(&dir_table, parent_inode, path.name())?.ok_or(UnrealError::NotFound)?;
     if dir_entry.assignment != InodeAssignment::File {
-        return Err(UnrealCacheError::IsADirectory);
+        return Err(UnrealError::IsADirectory);
     }
 
     let inode = dir_entry.inode;
@@ -454,14 +450,14 @@ fn get_file_entry(
     file_table: &redb::Table<'_, (u64, &str), FileEntry>,
     inode: u64,
     peer: &Peer,
-) -> Result<Option<FileEntry>, UnrealCacheError> {
+) -> Result<Option<FileEntry>, UnrealError> {
     Ok(file_table.get((inode, peer.as_str()))?.map(|e| e.value()))
 }
 
 fn do_file_availability(
     txn: &ReadTransaction,
     inode: u64,
-) -> Result<Vec<(Peer, FileEntry)>, UnrealCacheError> {
+) -> Result<Vec<(Peer, FileEntry)>, UnrealError> {
     let file_table = txn.open_table(FILE_TABLE)?;
 
     let mut all = vec![];
@@ -490,7 +486,7 @@ fn do_link(
     path: &Path,
     size: u64,
     mtime: SystemTime,
-) -> Result<u64, UnrealCacheError> {
+) -> Result<u64, UnrealError> {
     let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
     let mut file_table = txn.open_table(FILE_TABLE)?;
 
@@ -537,13 +533,13 @@ fn do_mkdirs(
     dir_table: &mut redb::Table<'_, (u64, &str), DirTableEntry>,
     root_inode: u64,
     path: &Option<Path>,
-) -> Result<u64, UnrealCacheError> {
+) -> Result<u64, UnrealError> {
     log::debug!("mkdirs {root_inode} {path:?}");
     let mut current = root_inode;
     for component in Path::components(path) {
         current = if let Some(entry) = get_dir_entry(dir_table, current, component)? {
             if entry.assignment != InodeAssignment::Directory {
-                return Err(UnrealCacheError::NotADirectory);
+                return Err(UnrealError::NotADirectory);
             }
             log::debug!("found {component} in {current} -> {entry:?}");
             entry.inode
@@ -568,16 +564,16 @@ fn do_lookup_path(
     dir_table: &impl redb::ReadableTable<(u64, &'static str), DirTableEntry>,
     root_inode: u64,
     path: &Option<Path>,
-) -> Result<(u64, InodeAssignment), UnrealCacheError> {
+) -> Result<(u64, InodeAssignment), UnrealError> {
     let mut current = (root_inode, InodeAssignment::Directory);
     for component in Path::components(path) {
         if current.1 != InodeAssignment::Directory {
-            return Err(UnrealCacheError::NotADirectory);
+            return Err(UnrealError::NotADirectory);
         }
         if let Some(entry) = get_dir_entry(dir_table, current.0, component)? {
             current = (entry.inode, entry.assignment);
         } else {
-            return Err(UnrealCacheError::NotFound);
+            return Err(UnrealError::NotFound);
         };
     }
 
@@ -589,7 +585,7 @@ fn get_dir_entry(
     dir_table: &impl redb::ReadableTable<(u64, &'static str), DirTableEntry>,
     parent_inode: u64,
     name: &str,
-) -> Result<Option<ReadDirEntry>, UnrealCacheError> {
+) -> Result<Option<ReadDirEntry>, UnrealError> {
     Ok(dir_table
         .get((parent_inode, name))?
         .map(|e| e.value().as_readdir_entry(parent_inode)))
@@ -602,7 +598,7 @@ fn add_dir_entry(
     parent_inode: u64,
     name: &str,
     assignment: InodeAssignment,
-) -> Result<u64, UnrealCacheError> {
+) -> Result<u64, UnrealError> {
     let new_inode = alloc_inode(txn)?;
     log::debug!("new dir entry {parent_inode} {name} -> {new_inode} {assignment:?}");
     dir_table.insert(
@@ -621,7 +617,7 @@ fn add_dir_entry(
     Ok(new_inode)
 }
 
-fn alloc_inode(txn: &WriteTransaction) -> Result<u64, UnrealCacheError> {
+fn alloc_inode(txn: &WriteTransaction) -> Result<u64, UnrealError> {
     let mut table = txn.open_table(MAX_INODE_TABLE)?;
     let max_inode = if let Some(v) = table.get(())? {
         v.value()
@@ -638,7 +634,7 @@ fn do_mark_peer_files(
     txn: &WriteTransaction,
     peer: &Peer,
     arena: &Arena,
-) -> Result<(), UnrealCacheError> {
+) -> Result<(), UnrealError> {
     let file_table = txn.open_table(FILE_TABLE)?;
     let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
     let peer_str = peer.as_str();
@@ -664,7 +660,7 @@ fn do_unmark_peer_file(
     peer: &Peer,
     arena: &Arena,
     inode: u64,
-) -> Result<(), UnrealCacheError> {
+) -> Result<(), UnrealError> {
     let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
     pending_catchup_table.remove((peer.as_str(), arena.as_str(), inode))?;
 
@@ -675,7 +671,7 @@ fn do_delete_marked_files(
     txn: &WriteTransaction,
     peer: &Peer,
     arena: &Arena,
-) -> Result<(), UnrealCacheError> {
+) -> Result<(), UnrealError> {
     let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
     let mut file_table = txn.open_table(FILE_TABLE)?;
     let mut directory_table = txn.open_table(DIRECTORY_TABLE)?;
@@ -707,7 +703,7 @@ fn do_rm_file_entry(
     inode: u64,
     peer: &Peer,
     mtime: Option<SystemTime>,
-) -> Result<(), UnrealCacheError> {
+) -> Result<(), UnrealError> {
     let mut range_size = 0;
     let mut delete = false;
     let peer_str = peer.as_str();
@@ -1024,7 +1020,7 @@ mod tests {
 
         assert!(matches!(
             cache.lookup(ROOT_DIR, "nonexistent"),
-            Err(UnrealCacheError::NotFound),
+            Err(UnrealError::NotFound),
         ));
 
         Ok(())
@@ -1221,7 +1217,7 @@ mod tests {
         // File1 should have been deleted, since it was only on peer1,
         assert!(matches!(
             cache.lookup(ROOT_DIR, file1.name()),
-            Err(UnrealCacheError::NotFound)
+            Err(UnrealError::NotFound)
         ));
         // File2 and 3 should still be available, from other peers
         let file2_inode = cache.lookup(arena_root, file2.name())?.inode;

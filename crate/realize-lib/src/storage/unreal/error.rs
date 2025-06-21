@@ -7,14 +7,14 @@ use crate::model::Arena;
 /// This type exists mainly so that errors can be converted when
 /// needed to OS I/O errors.
 #[derive(Debug, thiserror::Error)]
-pub enum UnrealCacheError {
+pub enum UnrealError {
     #[error("redb error {0}")]
     Database(redb::Error),
 
     #[error("I/O error {0}")]
     Io(#[from] std::io::Error),
 
-    #[error{"Data not available at this time"}]
+    #[error{"data not available at this time"}]
     Unavailable,
 
     #[error{"not found"}]
@@ -33,50 +33,50 @@ pub enum UnrealCacheError {
     UnknownArena(Arena),
 }
 
-impl UnrealCacheError {
-    fn from_redb(err: redb::Error) -> UnrealCacheError {
+impl UnrealError {
+    fn from_redb(err: redb::Error) -> UnrealError {
         if let redb::Error::Io(_) = &err {
             match err {
-                redb::Error::Io(err) => UnrealCacheError::Io(err),
+                redb::Error::Io(err) => UnrealError::Io(err),
                 _ => unreachable!(),
             }
         } else {
-            UnrealCacheError::Database(err)
+            UnrealError::Database(err)
         }
     }
 }
 
-impl From<redb::Error> for UnrealCacheError {
+impl From<redb::Error> for UnrealError {
     fn from(value: redb::Error) -> Self {
-        UnrealCacheError::from_redb(value)
+        UnrealError::from_redb(value)
     }
 }
 
-impl From<redb::TableError> for UnrealCacheError {
+impl From<redb::TableError> for UnrealError {
     fn from(value: redb::TableError) -> Self {
-        UnrealCacheError::from_redb(value.into())
+        UnrealError::from_redb(value.into())
     }
 }
 
-impl From<redb::StorageError> for UnrealCacheError {
+impl From<redb::StorageError> for UnrealError {
     fn from(value: redb::StorageError) -> Self {
-        UnrealCacheError::from_redb(value.into())
+        UnrealError::from_redb(value.into())
     }
 }
 
-impl From<redb::TransactionError> for UnrealCacheError {
+impl From<redb::TransactionError> for UnrealError {
     fn from(value: redb::TransactionError) -> Self {
-        UnrealCacheError::from_redb(value.into())
+        UnrealError::from_redb(value.into())
     }
 }
 
-impl From<redb::DatabaseError> for UnrealCacheError {
+impl From<redb::DatabaseError> for UnrealError {
     fn from(value: redb::DatabaseError) -> Self {
-        UnrealCacheError::from_redb(value.into())
+        UnrealError::from_redb(value.into())
     }
 }
-impl From<redb::CommitError> for UnrealCacheError {
+impl From<redb::CommitError> for UnrealError {
     fn from(value: redb::CommitError) -> Self {
-        UnrealCacheError::from_redb(value.into())
+        UnrealError::from_redb(value.into())
     }
 }

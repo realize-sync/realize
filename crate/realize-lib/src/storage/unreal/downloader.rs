@@ -27,7 +27,7 @@ use crate::{
     },
 };
 
-use super::{FileEntry, UnrealCacheAsync, UnrealCacheError};
+use super::{FileEntry, UnrealCacheAsync, UnrealError};
 
 const MIN_CHUNK_SIZE: usize = 8 * 1024;
 const MAX_CHUNK_SIZE: usize = 32 * 1024;
@@ -50,10 +50,10 @@ impl Downloader {
         }
     }
 
-    pub async fn reader(&self, inode: u64) -> Result<Download, UnrealCacheError> {
+    pub async fn reader(&self, inode: u64) -> Result<Download, UnrealError> {
         let avail = self.cache.file_availability(inode).await?;
         if avail.is_empty() {
-            return Err(UnrealCacheError::NotFound);
+            return Err(UnrealError::NotFound);
         }
 
         let (client, peer, entry) = self.choose(avail).await?;
@@ -64,7 +64,7 @@ impl Downloader {
     async fn choose(
         &self,
         avail: Vec<(Peer, FileEntry)>,
-    ) -> Result<(Arc<RealStoreClient>, Peer, FileEntry), UnrealCacheError> {
+    ) -> Result<(Arc<RealStoreClient>, Peer, FileEntry), UnrealError> {
         for (peer, entry) in &avail {
             if let Some(client) = self.clients.get(peer).await {
                 // TODO: check if client is still connected, if no,
@@ -106,7 +106,7 @@ impl Downloader {
                 }
             }
         }
-        Err(UnrealCacheError::Unavailable)
+        Err(UnrealError::Unavailable)
     }
 }
 

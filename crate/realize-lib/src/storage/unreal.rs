@@ -15,7 +15,7 @@ mod unreal_capnp {
 
 pub use downloader::Download;
 pub use downloader::Downloader;
-pub use error::UnrealCacheError;
+pub use error::UnrealError;
 pub use future::UnrealCacheAsync;
 pub use sync::UnrealCacheBlocking;
 pub use updater::keep_cache_updated;

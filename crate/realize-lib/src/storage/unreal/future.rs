@@ -8,7 +8,7 @@ use crate::{
 };
 
 use super::{
-    FileEntry, FileMetadata, InodeAssignment, ReadDirEntry, UnrealCacheBlocking, UnrealCacheError,
+    FileEntry, FileMetadata, InodeAssignment, ReadDirEntry, UnrealCacheBlocking, UnrealError,
 };
 
 #[derive(Clone)]
@@ -38,7 +38,7 @@ impl UnrealCacheAsync {
     }
 
     /// Create a new cache with the database at the given path.
-    pub async fn open(path: &path::Path) -> Result<Self, UnrealCacheError> {
+    pub async fn open(path: &path::Path) -> Result<Self, UnrealError> {
         let path = path.to_path_buf();
         Ok(Self::new(
             task::spawn_blocking(move || UnrealCacheBlocking::open(&path)).await??,
@@ -54,7 +54,7 @@ impl UnrealCacheAsync {
         self.inner.arenas()
     }
 
-    pub fn arena_root(&self, arena: &Arena) -> Result<u64, UnrealCacheError> {
+    pub fn arena_root(&self, arena: &Arena) -> Result<u64, UnrealError> {
         self.inner.arena_root(arena)
     }
 
@@ -66,7 +66,7 @@ impl UnrealCacheAsync {
         path: &Path,
         size: u64,
         mtime: SystemTime,
-    ) -> Result<(), UnrealCacheError> {
+    ) -> Result<(), UnrealError> {
         let peer = peer.clone();
         let arena = arena.clone();
         let path = path.clone();
@@ -82,7 +82,7 @@ impl UnrealCacheAsync {
         arena: &Arena,
         path: &Path,
         mtime: SystemTime,
-    ) -> Result<(), UnrealCacheError> {
+    ) -> Result<(), UnrealError> {
         let peer = peer.clone();
         let arena = arena.clone();
         let path = path.clone();
@@ -99,7 +99,7 @@ impl UnrealCacheAsync {
         path: &Path,
         size: u64,
         mtime: SystemTime,
-    ) -> Result<(), UnrealCacheError> {
+    ) -> Result<(), UnrealError> {
         let peer = peer.clone();
         let arena = arena.clone();
         let path = path.clone();
@@ -111,11 +111,7 @@ impl UnrealCacheAsync {
         )
     }
 
-    pub async fn lookup(
-        &self,
-        parent_inode: u64,
-        name: &str,
-    ) -> Result<ReadDirEntry, UnrealCacheError> {
+    pub async fn lookup(&self, parent_inode: u64, name: &str) -> Result<ReadDirEntry, UnrealError> {
         let name = name.to_string();
         let inner = Arc::clone(&self.inner);
 
@@ -126,14 +122,14 @@ impl UnrealCacheAsync {
         &self,
         parent_inode: u64,
         path: &Path,
-    ) -> Result<(u64, InodeAssignment), UnrealCacheError> {
+    ) -> Result<(u64, InodeAssignment), UnrealError> {
         let path = path.clone();
         let inner = Arc::clone(&self.inner);
 
         Ok(task::spawn_blocking(move || inner.lookup_path(parent_inode, &path)).await??)
     }
 
-    pub async fn file_metadata(&self, inode: u64) -> Result<FileMetadata, UnrealCacheError> {
+    pub async fn file_metadata(&self, inode: u64) -> Result<FileMetadata, UnrealError> {
         let inner = Arc::clone(&self.inner);
 
         Ok(task::spawn_blocking(move || inner.file_metadata(inode)).await??)
@@ -142,32 +138,25 @@ impl UnrealCacheAsync {
     pub async fn file_availability(
         &self,
         inode: u64,
-    ) -> Result<Vec<(Peer, FileEntry)>, UnrealCacheError> {
+    ) -> Result<Vec<(Peer, FileEntry)>, UnrealError> {
         let inner = Arc::clone(&self.inner);
 
         Ok(task::spawn_blocking(move || inner.file_availability(inode)).await??)
     }
 
-    pub async fn dir_mtime(&self, inode: u64) -> Result<SystemTime, UnrealCacheError> {
+    pub async fn dir_mtime(&self, inode: u64) -> Result<SystemTime, UnrealError> {
         let inner = Arc::clone(&self.inner);
 
         Ok(task::spawn_blocking(move || inner.dir_mtime(inode)).await??)
     }
 
-    pub async fn readdir(
-        &self,
-        inode: u64,
-    ) -> Result<Vec<(String, ReadDirEntry)>, UnrealCacheError> {
+    pub async fn readdir(&self, inode: u64) -> Result<Vec<(String, ReadDirEntry)>, UnrealError> {
         let inner = Arc::clone(&self.inner);
 
         Ok(task::spawn_blocking(move || inner.readdir(inode)).await??)
     }
 
-    pub async fn mark_peer_files(
-        &self,
-        peer: &Peer,
-        arena: &Arena,
-    ) -> Result<(), UnrealCacheError> {
+    pub async fn mark_peer_files(&self, peer: &Peer, arena: &Arena) -> Result<(), UnrealError> {
         let peer = peer.clone();
         let arena = arena.clone();
         let inner = Arc::clone(&self.inner);
@@ -175,11 +164,7 @@ impl UnrealCacheAsync {
         Ok(task::spawn_blocking(move || inner.mark_peer_files(&peer, &arena)).await??)
     }
 
-    pub async fn delete_marked_files(
-        &self,
-        peer: &Peer,
-        arena: &Arena,
-    ) -> Result<(), UnrealCacheError> {
+    pub async fn delete_marked_files(&self, peer: &Peer, arena: &Arena) -> Result<(), UnrealError> {
         let peer = peer.clone();
         let arena = arena.clone();
         let inner = Arc::clone(&self.inner);
