@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  on-linux:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build
+      run: cargo build
+    - name: Run tests
+      run: cargo test -- --skip :nfsmount:
+      
+  on-macos:
+    runs-on: macos-15
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build
+      run: cargo build 
+    - name: Run tests
+      run: cargo test 
