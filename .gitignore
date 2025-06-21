@@ -3,6 +3,7 @@ manual_tests/one-*/*
 manual_tests/two-*/*
 manual_tests/*.pid
 manual_tests/*.out
+manual_tests/*.db
 .vscode
 packages.microsoft.*
 Test-local.toml
