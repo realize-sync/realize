@@ -3,10 +3,11 @@
 //! See `spec/unreal.md` for details.
 
 use super::{
-    FileEntry, FileMetadata, InodeAssignment, ReadDirEntry, UnrealCacheAsync, UnrealError, ROOT_DIR,
+    DirTableEntry, FileEntry, FileMetadata, Holder, InodeAssignment, ReadDirEntry,
+    UnrealCacheAsync, UnrealError, ROOT_DIR,
 };
 use crate::model::{Arena, Path, Peer};
-use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, Value, WriteTransaction};
+use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
 use std::collections::HashMap;
 use std::path;
 use std::time::SystemTime;
@@ -32,7 +33,7 @@ const ARENA_TABLE: TableDefinition<&str, u64> = TableDefinition::new("arena");
 ///
 /// Key: (inode, name)
 /// Value: DirTableEntry
-const DIRECTORY_TABLE: TableDefinition<(u64, &str), DirTableEntry> =
+const DIRECTORY_TABLE: TableDefinition<(u64, &str), Holder<DirTableEntry>> =
     TableDefinition::new("directory");
 
 /// Track peer files.
@@ -46,7 +47,7 @@ const DIRECTORY_TABLE: TableDefinition<(u64, &str), DirTableEntry> =
 ///
 /// Key: (inode, peer)
 /// Value: FileEntry
-const FILE_TABLE: TableDefinition<(u64, &str), FileEntry> = TableDefinition::new("file");
+const FILE_TABLE: TableDefinition<(u64, &str), Holder<FileEntry>> = TableDefinition::new("file");
 
 /// Track max inode.
 ///
@@ -74,56 +75,6 @@ const MAX_INODE_TABLE: TableDefinition<(), u64> = TableDefinition::new("max_inod
 /// Value: parent dir inode
 const PENDING_CATCHUP_TABLE: TableDefinition<(&str, &str, u64), u64> =
     TableDefinition::new("pending_catchup");
-
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-enum DirTableEntry {
-    Regular(ReadDirEntry),
-    Dot(SystemTime),
-}
-impl DirTableEntry {
-    fn as_readdir_entry(self, inode: u64) -> ReadDirEntry {
-        match self {
-            DirTableEntry::Regular(e) => e,
-            DirTableEntry::Dot(_) => ReadDirEntry {
-                inode,
-                assignment: InodeAssignment::Directory,
-            },
-        }
-    }
-}
-impl Value for DirTableEntry {
-    type SelfType<'a>
-        = DirTableEntry
-    where
-        Self: 'a;
-
-    type AsBytes<'a>
-        = Vec<u8>
-    where
-        Self: 'a;
-
-    fn fixed_width() -> Option<usize> {
-        None
-    }
-
-    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
-    where
-        Self: 'a,
-    {
-        bincode::deserialize::<DirTableEntry>(data).unwrap()
-    }
-
-    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
-    where
-        Self: 'b,
-    {
-        bincode::serialize(value).unwrap()
-    }
-
-    fn type_name() -> redb::TypeName {
-        redb::TypeName::new("DirTableEntry")
-    }
-}
 
 /// A cache of remote files.
 pub struct UnrealCacheBlocking {
@@ -268,6 +219,7 @@ impl UnrealCacheBlocking {
             .get((parent_inode, name))?
             .ok_or(UnrealError::NotFound)?
             .value()
+            .parse()?
             .as_readdir_entry(parent_inode))
     }
 
@@ -324,7 +276,7 @@ impl UnrealCacheBlocking {
                 break;
             }
             let name = key.value().1.to_string();
-            if let DirTableEntry::Regular(entry) = value.value() {
+            if let DirTableEntry::Regular(entry) = value.value().parse()? {
                 entries.push((name, entry.clone()));
             }
         }
@@ -349,15 +301,22 @@ impl UnrealCacheBlocking {
 
 fn do_dir_mtime(txn: &ReadTransaction, inode: u64) -> Result<SystemTime, UnrealError> {
     let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-    if let Some(DirTableEntry::Dot(mtime)) = dir_table.get((inode, "."))?.map(|e| e.value()) {
-        Ok(mtime)
-    } else if inode == ROOT_DIR {
-        // When the filesystem is empty, the root dir might not
-        // have a mtime. This is not an error.
-        Ok(SystemTime::UNIX_EPOCH)
-    } else {
-        Err(UnrealError::NotFound)
+    match dir_table.get((inode, "."))? {
+        Some(e) => {
+            if let DirTableEntry::Dot(mtime) = e.value().parse()? {
+                return Ok(mtime);
+            }
+        }
+        None => {
+            if inode == ROOT_DIR {
+                // When the filesystem is empty, the root dir might not
+                // have a mtime. This is not an error.
+                return Ok(SystemTime::UNIX_EPOCH);
+            }
+        }
     }
+
+    Err(UnrealError::NotFound)
 }
 
 fn do_read_arena_map(txn: &ReadTransaction) -> Result<HashMap<Arena, u64>, UnrealError> {
@@ -447,11 +406,14 @@ fn do_unlink(
 
 /// Get a [FileEntry] for a specific peer.
 fn get_file_entry(
-    file_table: &redb::Table<'_, (u64, &str), FileEntry>,
+    file_table: &redb::Table<'_, (u64, &str), Holder<FileEntry>>,
     inode: u64,
     peer: &Peer,
 ) -> Result<Option<FileEntry>, UnrealError> {
-    Ok(file_table.get((inode, peer.as_str()))?.map(|e| e.value()))
+    match file_table.get((inode, peer.as_str()))? {
+        None => Ok(None),
+        Some(e) => Ok(Some(e.value().parse()?)),
+    }
 }
 
 fn do_file_availability(
@@ -464,7 +426,7 @@ fn do_file_availability(
     for entry in file_table.range((inode, "")..(inode + 1, ""))? {
         let entry = entry?;
         let peer = Peer::from(entry.0.value().1);
-        let file_entry: FileEntry = entry.1.value();
+        let file_entry: FileEntry = entry.1.value().parse()?;
         all.push((peer, file_entry));
     }
 
@@ -514,12 +476,12 @@ fn do_link(
     log::debug!("new file entry ({inode} {peer})");
     file_table.insert(
         (inode, peer.as_str()),
-        FileEntry {
+        Holder::new(FileEntry {
             arena: arena.clone(),
             path: path.clone(),
             metadata: FileMetadata { size, mtime },
             parent_inode,
-        },
+        })?,
     )?;
 
     Ok(inode)
@@ -530,7 +492,7 @@ fn do_link(
 /// Returns the inode of the directory pointed to by the path.
 fn do_mkdirs(
     txn: &WriteTransaction,
-    dir_table: &mut redb::Table<'_, (u64, &str), DirTableEntry>,
+    dir_table: &mut redb::Table<'_, (u64, &str), Holder<DirTableEntry>>,
     root_inode: u64,
     path: &Option<Path>,
 ) -> Result<u64, UnrealError> {
@@ -561,7 +523,7 @@ fn do_mkdirs(
 
 /// Find the file or directory pointed to by the given path.
 fn do_lookup_path(
-    dir_table: &impl redb::ReadableTable<(u64, &'static str), DirTableEntry>,
+    dir_table: &impl redb::ReadableTable<(u64, &'static str), Holder<'static, DirTableEntry>>,
     root_inode: u64,
     path: &Option<Path>,
 ) -> Result<(u64, InodeAssignment), UnrealError> {
@@ -582,19 +544,20 @@ fn do_lookup_path(
 
 /// Get a [ReadDirEntry] from a directory, if it exists.
 fn get_dir_entry(
-    dir_table: &impl redb::ReadableTable<(u64, &'static str), DirTableEntry>,
+    dir_table: &impl redb::ReadableTable<(u64, &'static str), Holder<'static, DirTableEntry>>,
     parent_inode: u64,
     name: &str,
 ) -> Result<Option<ReadDirEntry>, UnrealError> {
-    Ok(dir_table
-        .get((parent_inode, name))?
-        .map(|e| e.value().as_readdir_entry(parent_inode)))
+    match dir_table.get((parent_inode, name))? {
+        None => Ok(None),
+        Some(e) => Ok(Some(e.value().parse()?.as_readdir_entry(parent_inode))),
+    }
 }
 
 /// Add an entry to the given directory.
 fn add_dir_entry(
     txn: &WriteTransaction,
-    dir_table: &mut redb::Table<'_, (u64, &str), DirTableEntry>,
+    dir_table: &mut redb::Table<'_, (u64, &str), Holder<DirTableEntry>>,
     parent_inode: u64,
     name: &str,
     assignment: InodeAssignment,
@@ -603,15 +566,16 @@ fn add_dir_entry(
     log::debug!("new dir entry {parent_inode} {name} -> {new_inode} {assignment:?}");
     dir_table.insert(
         (parent_inode, name),
-        DirTableEntry::Regular(ReadDirEntry {
+        Holder::new(DirTableEntry::Regular(ReadDirEntry {
             inode: new_inode,
             assignment,
-        }),
+        }))?,
     )?;
     let mtime = SystemTime::now();
-    dir_table.insert((parent_inode, "."), DirTableEntry::Dot(mtime))?;
+    let dot = Holder::new(DirTableEntry::Dot(mtime))?;
+    dir_table.insert((parent_inode, "."), dot.clone())?;
     if assignment == InodeAssignment::Directory {
-        dir_table.insert((new_inode, "."), DirTableEntry::Dot(mtime))?;
+        dir_table.insert((new_inode, "."), dot.clone())?;
     }
 
     Ok(new_inode)
@@ -644,7 +608,7 @@ fn do_mark_peer_files(
         if k.1 != peer_str {
             continue;
         }
-        let v = v.value();
+        let v = v.value().parse()?;
         if v.arena != *arena {
             continue;
         }
@@ -697,8 +661,8 @@ fn do_delete_marked_files(
 }
 
 fn do_rm_file_entry(
-    file_table: &mut redb::Table<'_, (u64, &str), FileEntry>,
-    dir_table: &mut redb::Table<'_, (u64, &str), DirTableEntry>,
+    file_table: &mut redb::Table<'_, (u64, &str), Holder<FileEntry>>,
+    dir_table: &mut redb::Table<'_, (u64, &str), Holder<DirTableEntry>>,
     parent_inode: u64,
     inode: u64,
     peer: &Peer,
@@ -710,13 +674,17 @@ fn do_rm_file_entry(
     for elt in file_table.range((inode, "")..(inode + 1, ""))? {
         range_size += 1;
         let elt = elt?;
-        if peer_str == elt.0.value().1
-            && mtime
-                .as_ref()
-                .map(|t| elt.1.value().metadata.mtime <= *t)
-                .unwrap_or(true)
-        {
-            delete = true;
+        if peer_str != elt.0.value().1 {
+            continue;
+        }
+        match mtime {
+            None => delete = true,
+            Some(mtime) => {
+                let m = elt.1.value().parse()?.metadata.mtime;
+                if m <= mtime {
+                    delete = true;
+                }
+            }
         }
     }
 
@@ -725,11 +693,16 @@ fn do_rm_file_entry(
         range_size -= 1;
     }
     if range_size == 0 {
-        dir_table.retain_in((parent_inode, "")..(parent_inode + 1, ""), |_, v| match v {
-            DirTableEntry::Regular(v) => v.inode != inode,
-            _ => true,
+        dir_table.retain_in((parent_inode, "")..(parent_inode + 1, ""), |_, v| {
+            match v.parse() {
+                Ok(DirTableEntry::Regular(v)) => v.inode != inode,
+                _ => true,
+            }
         })?;
-        dir_table.insert((parent_inode, "."), DirTableEntry::Dot(SystemTime::now()))?;
+        dir_table.insert(
+            (parent_inode, "."),
+            Holder::new(DirTableEntry::Dot(SystemTime::now()))?,
+        )?;
     }
 
     Ok(())
@@ -805,21 +778,21 @@ mod tests {
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-        let entry = dir_table.get((ROOT_DIR, "test_arena"))?.unwrap().value();
-        let entry = match entry {
+        let entry = dir_table.get((ROOT_DIR, "test_arena"))?.unwrap();
+        let entry = match entry.value().parse()? {
             DirTableEntry::Dot(_) => panic!("Unexpected dot entry"),
             DirTableEntry::Regular(e) => e,
         };
 
-        let entry = dir_table.get((entry.inode, "a"))?.unwrap().value();
-        let entry = match entry {
+        let entry = dir_table.get((entry.inode, "a"))?.unwrap();
+        let entry = match entry.value().parse()? {
             DirTableEntry::Dot(_) => panic!("Unexpected dot entry"),
             DirTableEntry::Regular(e) => e,
         };
         assert_eq!(entry.assignment, InodeAssignment::Directory);
 
-        let entry = dir_table.get((entry.inode, "b"))?.unwrap().value();
-        let entry = match entry {
+        let entry = dir_table.get((entry.inode, "b"))?.unwrap();
+        let entry = match entry.value().parse()? {
             DirTableEntry::Dot(_) => panic!("Unexpected dot entry"),
             DirTableEntry::Regular(e) => e,
         };
@@ -861,16 +834,13 @@ mod tests {
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-        let dir_entry = dir_table.get((ROOT_DIR, "test_arena"))?.unwrap().value();
-        let dir_entry = match dir_entry {
+        let dir_entry = dir_table.get((ROOT_DIR, "test_arena"))?.unwrap();
+        let dir_entry = match dir_entry.value().parse()? {
             DirTableEntry::Dot(_) => panic!("Unexpected dot entry"),
             DirTableEntry::Regular(e) => e,
         };
-        let dir_entry = dir_table
-            .get((dir_entry.inode, "file.txt"))?
-            .unwrap()
-            .value();
-        let dir_entry = match dir_entry {
+        let dir_entry = dir_table.get((dir_entry.inode, "file.txt"))?.unwrap();
+        let dir_entry = match dir_entry.value().parse()? {
             DirTableEntry::Dot(_) => panic!("Unexpected dot entry"),
             DirTableEntry::Regular(e) => e,
         };
@@ -879,7 +849,8 @@ mod tests {
         let entry = file_table
             .get((dir_entry.inode, peer.as_str()))?
             .unwrap()
-            .value();
+            .value()
+            .parse()?;
         assert_eq!(entry.metadata.size, 200);
         assert_eq!(entry.metadata.mtime, new_mtime);
 
@@ -901,16 +872,13 @@ mod tests {
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-        let dir_entry = dir_table.get((ROOT_DIR, "test_arena"))?.unwrap().value();
-        let dir_entry = match dir_entry {
+        let dir_entry = dir_table.get((ROOT_DIR, "test_arena"))?.unwrap();
+        let dir_entry = match dir_entry.value().parse()? {
             DirTableEntry::Dot(_) => panic!("Unexpected dot entry"),
             DirTableEntry::Regular(e) => e,
         };
-        let dir_entry = dir_table
-            .get((dir_entry.inode, "file.txt"))?
-            .unwrap()
-            .value();
-        let dir_entry = match dir_entry {
+        let dir_entry = dir_table.get((dir_entry.inode, "file.txt"))?.unwrap();
+        let dir_entry = match dir_entry.value().parse()? {
             DirTableEntry::Dot(_) => panic!("Unexpected dot entry"),
             DirTableEntry::Regular(e) => e,
         };
@@ -919,7 +887,8 @@ mod tests {
         let entry = file_table
             .get((dir_entry.inode, peer.as_str()))?
             .unwrap()
-            .value();
+            .value()
+            .parse()?;
         assert_eq!(entry.metadata.size, 100);
         assert_eq!(entry.metadata.mtime, new_mtime);
 
@@ -977,8 +946,8 @@ mod tests {
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-        let dir_entry = dir_table.get((ROOT_DIR, "test_arena"))?.unwrap().value();
-        let dir_entry = match dir_entry {
+        let dir_entry = dir_table.get((ROOT_DIR, "test_arena"))?.unwrap();
+        let dir_entry = match dir_entry.value().parse()? {
             DirTableEntry::Dot(_) => panic!("Unexpected dot entry"),
             DirTableEntry::Regular(e) => e,
         };

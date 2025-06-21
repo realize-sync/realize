@@ -14,6 +14,9 @@ pub enum UnrealError {
     #[error("I/O error {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("bincode error {0}")]
+    Bincode(#[from] Box<bincode::ErrorKind>),
+
     #[error{"data not available at this time"}]
     Unavailable,
 

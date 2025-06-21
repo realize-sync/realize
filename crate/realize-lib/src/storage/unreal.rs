@@ -1,5 +1,6 @@
 use crate::model::{self};
 use redb::Value;
+use std::marker::PhantomData;
 use std::time::SystemTime;
 
 mod downloader;
@@ -70,14 +71,140 @@ pub struct FileEntry {
     pub(crate) parent_inode: u64,
 }
 
-impl Value for FileEntry {
+impl NamedType for FileEntry {
+    fn typename() -> &'static str {
+        "FileEntry"
+    }
+}
+
+impl ByteConvertible<FileEntry> for FileEntry {
+    fn from_bytes(data: &[u8]) -> Result<FileEntry, UnrealError> {
+        Ok(bincode::deserialize::<FileEntry>(data)?)
+    }
+
+    fn to_bytes(self) -> Result<Vec<u8>, UnrealError> {
+        Ok(bincode::serialize(&self)?)
+    }
+}
+
+/// The metadata of a file.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FileMetadata {
+    /// The size of the file in bytes.
+    pub size: u64,
+    /// The modification time of the file.
+    pub mtime: SystemTime,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+enum DirTableEntry {
+    Regular(ReadDirEntry),
+    Dot(SystemTime),
+}
+impl DirTableEntry {
+    fn as_readdir_entry(self, inode: u64) -> ReadDirEntry {
+        match self {
+            DirTableEntry::Regular(e) => e,
+            DirTableEntry::Dot(_) => ReadDirEntry {
+                inode,
+                assignment: InodeAssignment::Directory,
+            },
+        }
+    }
+}
+
+impl NamedType for DirTableEntry {
+    fn typename() -> &'static str {
+        "DirTableEntry"
+    }
+}
+
+impl ByteConvertible<DirTableEntry> for DirTableEntry {
+    fn from_bytes(data: &[u8]) -> Result<DirTableEntry, UnrealError> {
+        Ok(bincode::deserialize::<DirTableEntry>(data)?)
+    }
+
+    fn to_bytes(self) -> Result<Vec<u8>, UnrealError> {
+        Ok(bincode::serialize(&self)?)
+    }
+}
+
+/// A type that can be converted to and from bytes.
+///
+/// Either conversion are allowed to fail without causing a panic..
+trait ByteConvertible<T> {
+    fn from_bytes(data: &[u8]) -> Result<T, UnrealError>;
+    fn to_bytes(self) -> Result<Vec<u8>, UnrealError>;
+}
+
+/// Give a name to the type; used by redb.
+trait NamedType {
+    fn typename() -> &'static str;
+}
+
+/// A convenient type to use as value in redb tables.
+///
+/// All this type does is make parsing and generating [redb::Value]s
+/// convenient and typesafe.
+///
+/// One big difference between this type and implementing
+/// [redb::Value] directly is that serialization and deserialization
+/// can fail without causing a panic.
+///
+/// To use a type in a holder, make it implement both [NamedType] and
+/// [ByteConvertible].
+#[derive(Clone, Debug)]
+enum Holder<'a, T> {
+    Borrowed(&'a [u8], PhantomData<T>),
+    Owned(Vec<u8>, PhantomData<T>),
+}
+
+impl<'a, T> Holder<'a, T> {
+    /// Return the data in the holder as a slice.
+    fn as_bytes(&self) -> &'_ [u8] {
+        match self {
+            Holder::Owned(vec, _) => vec.as_slice(),
+            Holder::Borrowed(arr, _) => *arr,
+        }
+    }
+}
+
+impl<'a, T> Holder<'a, T>
+where
+    T: ByteConvertible<T>,
+{
+    /// Create a Holder containing the byte representation of the
+    /// given instance.
+    fn new(obj: T) -> Result<Self, UnrealError> {
+        Ok(Holder::Owned(obj.to_bytes()?, PhantomData))
+    }
+
+    /// Converts the Holder into an instance of the expected type.
+    fn parse(self) -> Result<T, UnrealError> {
+        match self {
+            Holder::Owned(vec, _) => T::from_bytes(vec.as_slice()),
+            Holder::Borrowed(arr, _) => T::from_bytes(arr),
+        }
+    }
+}
+
+impl<'a, T> From<&'a [u8]> for Holder<'a, T> {
+    fn from(arr: &'a [u8]) -> Self {
+        Holder::Borrowed::<T>(arr, PhantomData)
+    }
+}
+
+impl<T> Value for Holder<'_, T>
+where
+    T: NamedType + std::fmt::Debug,
+{
     type SelfType<'a>
-        = FileEntry
+        = Holder<'a, T>
     where
         Self: 'a;
 
     type AsBytes<'a>
-        = Vec<u8>
+        = &'a [u8]
     where
         Self: 'a;
 
@@ -89,26 +216,17 @@ impl Value for FileEntry {
     where
         Self: 'a,
     {
-        bincode::deserialize::<FileEntry>(data).unwrap()
+        data.into()
     }
 
     fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
     where
         Self: 'b,
     {
-        bincode::serialize(value).unwrap()
+        value.as_bytes()
     }
 
     fn type_name() -> redb::TypeName {
-        redb::TypeName::new("FileEntry")
+        redb::TypeName::new(T::typename())
     }
-}
-
-/// The metadata of a file.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct FileMetadata {
-    /// The size of the file in bytes.
-    pub size: u64,
-    /// The modification time of the file.
-    pub mtime: SystemTime,
 }
