@@ -16,24 +16,28 @@ certain limitations).
 
 ## **Work In Progress**
 
-> [!IMPORTANT] The Realize project is currently under development and
-> is not yet usable. It is in the early stages of design and
-> implementation. As such, **it should not be used by anyone**. There
-> are no guarantees of backward compatibility. Expect things to break.
+> [!IMPORTANT]
+> The Realize project is currently under development and is not yet
+> usable. It is in the early stages of design and implementation. As
+> such, **it should not be used by anyone**. There are no guarantees
+> of backward compatibility. Expect things to break.
 
-## Project Stages
+## Design
+
+For a detailed description of the project architecture and features,
+refer to the [design document](spec/design.md).
 
 Realize will advance through several key stages:
 
 1. Implement basic file transfer between peers via a command line
-   tool. See [movedirs](./movedirs.md) for details. *available*
+   tool. See [movedirs](spec/movedirs.md) for details. *available*
 
 2. Expose remote files, partially cached locally, as a filesystem. See
-   [The Unreal](./unreal.md). *available*
+   [The Unreal](spec/unreal.md). *available*
 
 3. Provide a customizable, high-performance merged view of local and
    remote files on Linux, and a read-only view on MacOS. See [The
-   Real](./real.md). *in progress*
+   Real](spec/real.md). *in progress*
 
 4. Add a user interface for MacOS and Linux. *planned*
 
@@ -42,9 +46,6 @@ Realize will advance through several key stages:
 6. Develop a customizable merged view for MacOS. *planned*
 
 7. Include support for Windows. *planned*
-
-For a detailed description of the project architecture and features,
-refer to the [design document](./design.md).
 
 ## Development
 
