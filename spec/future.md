@@ -3,6 +3,25 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
+## Switch to Cap'n Proto
+
+Try converting Realize to Cap'n Proto https://capnproto.org/ to
+replace both bincode and tarpc.
+
+This would provide:
+ - representation in redb with good backward-compatibility guarantees
+ - RPCs with backward-compatibility guarantees
+
+While this all looks overly complex and having to build protos from a
+custom language is a pain, there are aspects of Cap'n Proto that seem
+to be a good fit for Realize:
+
+- the RPC system is bi-directional and well suited to peer-to-peer
+  communication
+
+- the no-copy support is great when transferring or working with
+  binary data
+
 ## Allow : in model:Path {#colon}
 
 Forbidding just brings trouble on Linux.
