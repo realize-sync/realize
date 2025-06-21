@@ -7,43 +7,74 @@ Export a filesystem using
 [redb](https://github.com/cberner/redb/tree/master) database and local
 (blob) storage.
 
-The filesystem works as a cache for remote data. It caches all files
-available on remote peers and makes them visible through the FS. When
-a file is accessed, it is downloaded and added into the cache.
+The filesystem works as a cache for remote data. It caches the file
+hierarchy available on remote peers and makes them visible through the
+FS. When a file is accessed or when the user asks for it, the file is
+downloaded and added into the cache.
 
-Initial implementation is read-only and rely on another filesystem
-storing any local changes. See [The Real](real.md).
+This relies on another, Linux-only, filesystem storing local data and
+sending notifications about changes, [The Real](real.md).
 
-This will be extended later into a read-write implementation that
-stores local modifications for MacOS and Windows support.
+Initial implementation is read-only. This will be extended later into
+a read-write implementation that stores local modifications for MacOS
+and Windows support.
+
+## Stages
+
+Design and implementation happens in stages, incrementally:
+
+1. Store file hierarchy, described and implemented.
+2. Serve data from network, described and implemented.
+3. Store file content, in an expiring cache, see [Future].
+4. Store file data as blob, see [Future].
 
 ## Details
 
 The Unreal cache is built upon a `redb` database that tracks the state
-of files across a household of peers. This allows the system to
-maintain a local understanding of remote file availability without
-constant network communication.
+of files across a set of peers, called the Household. This allows the
+system to maintain a local understanding of remote file availability
+without constant network communication.
 
-The initial implementation focuses on tracking file paths and their
-state. The more advanced blob-based storage with Merkle trees will be
-built on top of this foundation.
+The initial implementation described here tracks file paths and their
+last modification time. The more advanced blob-based storage with
+Merkle trees will be built on top of this foundation.
 
 File hierarchy and path assignment is never evicted from the cache.
 There must be enough place to store file hierarchy from all peers.
-Cache eviction only applies to file data, which isn't described yet.
+Cache eviction only applies to file data.
 
-File hierarchy starts with a list of arenas, treating arenas whose
-name has a slash as a directory. So given a server with the arenas:
-movies, docs/office, docs/official, the root will contain [movies,
-docs], docs will contain [office, official].
+File hierarchy starts with a list of arenas, a named collection of
+files, which are represented as directories sitting just under root.
+The files containing within each arena are put under the arena's
+directory. So the file "foo/bar" in the arena "test" is represented as
+"/test/foo/bar". Arenas names can have slashes in them, so might be
+represented by more than one directory; The file "blurg" in the arena
+"documents/office" is represented as "/documents/office/blurg"
 
-Note that, for this reason, it is an error for an arena name plus / to
-be the prefix of another arena; this is checked at startup, when the
-config file is loaded. For example, you couldn't have an arena called
-"docs" and another called "docs/office", but you could have an arena
-called "docs" and another called "docs_office".
+### Arenas
+
+Arenas are separate collections of files, kept in the same cache.
+They're part of the startup configuration. They're passed to the cache
+when it is created.
+
+The cache create initial directories for each configured arenas. These
+directories are called "Arena roots" and treated specially by the
+cache.
+
+Since arena names can contain slashes, an arena can be represented by
+a hierarchy of directories.
+
+To avoid mixing arenas roots with arena content in the same directory,
+it is an error for an arena name plus / to be the prefix of another
+arena; this is checked at startup, when arenas are created. For
+example, you couldn't have an arena called "docs" and another called
+"docs/office", but you could have an arena called "docs" and another
+called "docs_office".
 
 ### Access patterns
+
+The design described below is meant to meet the needs of the following
+expected access patterns.
 
 1. as a filesystem
 
@@ -63,11 +94,11 @@ called "docs" and another called "docs_office".
 This is very common and typically done in the foreground, with the
 user waiting for the result. It must be done efficiently
 
-2. writing from remote peer data (through RealStoreService::list and
-   HistoryService::notify)
+2. writing from remote peer hierarchy notification (through
+   RealStoreService::list and HistoryService::notify)
 
-  - a list of (peer, arena, path, size, mtime) (in the future (peer,
-    arena, path, blob id) + (peer, blob id, blob content))
+  - a list of (peer, arena, path, size, mtime) and, in the future
+    (peer, arena, path, blob id) + (peer, blob id, blob content))
 
   - as notifications come in (Notification::Unlink and
     Notification::Link from HistoryService), the internal state must
@@ -75,19 +106,25 @@ user waiting for the result. It must be done efficiently
 
 This is common and should be done efficiently enough. Efficiency is
 less of a priority for this access pattern than for access pattern 1
-because it is run in the background, in batch operations.
+because it is run in the background, in batch operations and redb
+allows concurrent read access while those modifications are being
+applied.
 
-3. after a long disconnection, data is re-read through
-   RealStoreService::list and compared with content
+3. after a long disconnection, data from a remote peer is (re-)reported
+   in its entirety and compared with the current content for that peer.
 
-  - go through the entire content known from a peer, compare with
-    RealStoreService::list output then apply modifications
+  - add entries that are reported into the cache, allowing re-reporting
+  - go through the entire content known from a peer to remove entries
+    that where not reported again.
 
-This should not happen often in the final design, as peers must store
-history between disconnections to serve to other peers. Additionally,
-this is typically run in the background.
+Efficiency is not a priority, as this is done in the background and
+read access is allowed while the cache is being modified.
 
-4. whole arenas can be deleted
+The [overall design](../design.md) calls for peers storing history
+between disconnection to serve other peers, so this should be a rather
+uncommon operation.
+
+4. whole arenas can be renamed or deleted
 
 This must be possible but doesn't need to be efficient.
 
@@ -102,6 +139,9 @@ below.
 
 fn readdir(inode) -> anyhow::Result<Iterator<ReadDirEntry>, UnrealCacheError>;
 fn lookup(inode, name) -> anyhow::Result<Option<ReadDirEntry>, UnrealCacheError>;
+fn file_metadata(inode) -> anyhow::Result<FileMetadata, UnrealCacheError>;
+fn dir_mtime(inode) -> anyhow::result<SystemTime, UnrealCacheError>;
+fn read(inode) -> anyhow::Result<impl AsyncRead+AsyncSeek, UnrealCacheError>;
 
 // Access pattern 2:
 
@@ -138,39 +178,52 @@ async wrapper (UnrealCacheAsync) that just runs the methods on
 tokio::spawn_blocking will be necessary to make calling these function
 conveniently from the async parts of the code.
 
-
-NOTE This proposal lacks a "read" call. This is TBD in a later step.
-
-
 Code location:
  - crate/realize-lib/src/storage/unreal/cache.rs
  - crate/realize-lib/src/storage/unreal/error.rs
- - crate/realize-lib/src/storage/unreal/async.rs
+ - crate/realize-lib/src/storage/unreal/sync.rs
+ - crate/realize-lib/src/storage/unreal/future.rs
+
+Public types are exposed as being in realize-lib::storage::unreal.
 
 #### readdir
 
 This corresponds to the operations readdir and readdirplus of NFS and
-FUSE: return the entries of a directory, optionally with metadata:
- - ownership and protection, which are hardcoded
- - size for file, a fixed size (1 block) for directories
- - mtime, coming from the file entry for file
+FUSE: return the entries of a directory, with file attributes.
 
- OPEN ISSUE: What mtime value to report for directories?
+- ownership and protection (hardcoded)
+
+- size for file, a fixed size (1 block) for directories
+
+- mtime, coming from the file entry for file, local last modification
+  for directories
 
  OPEN ISSUE: Is it worth storing a copy of the metadata in the
  directory entry, to speed things up? Profile and add if necessary.
 
 #### lookup
 
-Look up the metadata of one one entry in a directory. The returned
-metadata is the same as readdir.
+Look up one entry in a directory and return its inode.
 
-#### link
+#### file_metadata dir_mtime
 
-Add a file for a peer.
+Return the file metadata or the last modification time of a directory.
 
-If the same file already exist for that peer, use the file with the
-highest mtime.
+#### link/catchup
+
+Report availability of a remote file from a peer.
+
+If the same file already exists for that peer, overwrite the entry if
+the new mtime >= the old mtime.
+
+If the same file already exists for another peer, keep both but serve
+only the one with the highest mtime value. If both have the same mtime
+value, either might be served.
+
+`catchup` is a variant of link that is sent by a peer upon
+reconnection for (re-)reporting files. In addition to linking the
+file, catchup also removes the file deletion mark. See
+`mark_peer_files`/`delete_marked_files` below.
 
 OPEN ISSUE: is a table for path -> inode needed to avoid having to
 traverse the hierarchy for path-based operations ? This is an
@@ -178,39 +231,64 @@ optimization, to be added later after profiling, if necessary.
 
 #### unlink
 
-Remove a file for a peer.
+Report a remote file becoming unavailable from a peer.
 
-If a file exists for the same peer with a higher mtime, ignore that unlink.
+If a file exists for the same peer with a higher mtime, ignore the call.
 
-If no file exists yet, for the peer, ignore the call.
+If no file exists yet for the same peer, ignore the call.
 
-NOTE: It's the responsibility of the caller to deal with the case
-where unlink comes before link for a specific file (unlink mtime >=
-link mtime) because data for the race condition needs to be kept but
-only for a short time and only in specific conditions; this is not
-something that is worth storing.
+If the same file still exists from other peer, the file is kept and
+might be served from these other peers, otherwise it is removed from
+the hierarchy.
+
+A race condition is possible: what if `unlink` for a file is sent
+before the `link` ? With the above algorithm, the `unlink` would be
+lost. It's the responsibility of the caller to deal with this case. In
+practice, this means that the peer must only send `unlink`
+notifications after having reported all the `catchup` notifications.
 
 #### mark_peer_files/delete_marked_files
 
-This is meant to be used together with mark_peer_files when
-a peer reconnects, to delete any file not mentioned again:
+This is meant to be used together with `mark_peer_files` when a peer
+reconnects, to delete any file not mentioned again:
 
-1. call mark_peer_files
-2. call link for all files provided by the peer
-3. when file list is complete, delete_marked_files
+1. call `mark_peer_files`, which goes through the set of files from that peer and
+   marks them for deletion
+2. call `catchup` for all files provided by the peer
+3. catchup ends, call `delete_marked_files`
 
-This requires link() overwriting the old content and removing the mark.
+This requires catchup removing the mark.
 
 OPEN ISSUE: With the proposed database schema, this require going
-through all files twice, first to mark, then to unmark. Is this
-efficient enough? Probably, for a background call. Worse case
-scenario, a file deleted on the remote peer says for longer than
-strictly necessary. Profile and add an index if necessary.
+through all files to mark them. Is this efficient enough? Probably, for
+a background call. Worse case scenario, a file deleted on the remote
+peer says for longer than strictly necessary. Profile and add an index
+if necessary.
 
 #### delete_arena(arena)
 
 This works exactly like recursive directory deletion, since arenas are
 just directories in the proposed design.
+
+#### rename_arena(arena, new_name)
+
+This updates the arena root and otherwise works like renaming
+directories, since arenas are mapped as directories. The same restrictions
+apply on the new name as for the initial set of arenas. See [Arenas]
+
+#### read(inode)
+
+The `read` method returns type that implements `AsyncRead` and
+`AsyncSeek` from `tokio::io`, so it can be accessed with all the bells
+and whistles through `AsyncReadExt` and `AsyncSeekExt`.
+
+`read` chooses one of the peers that reported having the most recent
+version of the file available and connects to it to retrieve it
+through `RealStoreService`. It caches just one "chunk" of data,
+between 8k and 32k.
+
+Eventually, `read` will be able to serve partially or fully from the
+database. See the [Future] section.
 
 ### Database Schema
 
@@ -218,18 +296,15 @@ File hierarchy should be stored as a filesystem would, so it can be
 served quickly for the access pattern that matters the most
 (filesystem access).
 
-Note that there's no inode table. Inodes should be looked up either as
-a file or as a directory.
+Inodes should be looked up either as a file or as a directory; there's
+no global inode table.
 
 Everything starts with inode 1, which is always a directory, though
 possibly empty.
 
-New inode values are allocated sequentially, using
-`max(directory_table.last().key.0, file_table.last().key.0, 1) + 1`.
-
-This requires making sure that last() is really the highest numbered
-inode. If necessary, the key and key serialization is to be
-configured so that lexicographical order = natural order.
+New inode values are allocated sequentially, using the single-entry
+table `max_inode` which just stores the highest inode allocated so
+far.
 
 Inodes aren't reused. If we reach the max value for u64, new files or
 dirs cannot be created anymore. It's hard to justify anything more
@@ -242,6 +317,11 @@ Key: `(u64, String)` (directory inode, name)
 Value:
 
 ```rust
+enum DirtableEntry {
+  Regular(ReadDirEntry),
+  Dot(SystemTime), // A special entry named "."
+}
+
 struct ReadDirEntry {
   inode:u64
 
@@ -308,14 +388,40 @@ can be fetched from any of these.
 If data is available from more than one arenas, choose the one from
 the first arena, as declared in the config file.
 
-NOTE: This "on the fly" conflict resolution is good enough for a
-start. A more configurable conflict resolution mechanism will have to
-be built later on.
+NOTE: This "on the fly" conflict resolution is good enough for the
+cache, which just reports what is available. A more configurable
+conflict resolution happens when peers sync; this outside the scope of
+the unreal cache.
 
-## Future: Blob Storage (Recap)
+**File Table**
 
-While not part of the initial implementation step, the database will
-be extended to support blob-based storage:
+Key: `(u64, String)` (file inode, peer)
+Value:
+
+## Future
+
+These changes are planned and described in [the overall
+design](./design.md) but not yet integrated into this design and its
+implementation.
+
+### Store File Content
+
+In the future, the cache will store file content, so `read` can serve
+directly from the cache, without connecting to a peer. For that to
+work, everything read from a peer should be added to the cache.
+
+File content is subject to cache eviction strategy (LRU), to make
+room, if necessary.
+
+Details TBD
+
+### Blob Storage
+
+The database will be extended to support blob-based storage, the
+database will store blobs, identified by their hash. The file
+hierarchy gives names to blobs.
+
+Some rough ideas:
 
 *   **Blobs Table**: `hash -> reference count + (set of blob
     hash)|(path of block)`
@@ -324,5 +430,7 @@ be extended to support blob-based storage:
 *   **Block Storage**: Individual file blocks will be stored on disk,
     named by their hash.
 
-This phased approach allows for an incremental build-out of the Unreal
-cache, starting with the essential file tracking mechanism.
+This require `RealStoreService` to work with blobs as well, so work
+needs to start in [The Real](./real.md)
+
+Details TBD
