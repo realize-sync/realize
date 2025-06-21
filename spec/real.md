@@ -2,7 +2,7 @@
 
 ## Overview
 
-Use [overlayfs](https://docs.kernel.org/filesystems/overlayfs.html) to
+Use [OverlayFS](https://docs.kernel.org/filesystems/overlayfs.html) to
 expose a merged view of the local files and [The Unreal](unreal.md)
 filesystem exporting remote files. 
 
@@ -27,21 +27,26 @@ and is outside the scope of this document.
 
 Design and implementation happens in stages, incrementally:
 
-1. Report local changes as `link`, `unlink` notifications with a
+1. In this phase, consensus consists of copying entire arenas from one
+   peer to another using a command line tool, described in
+   [movedirs](./movedirs.md)
+
+2. Report local changes as `link`, `unlink` notifications with a
    catchup phase to deals with unknown changes happening between
    disconnections, described in [The Unreal](./unreal.md) and
    implemented based on
    [inotify](https://man7.org/linux/man-pages/man7/inotify.7.html).
    
-2. Track changes and file content hash in an index table. Upon
+3. Track changes and file content hash in an index table. Upon
    restart, catchup with the latest changes by comparing index with
-   directory content, is a requirement for phase 3 and 4. [Index]
+   directory content, is a requirement for the next two phases. [Index]
    
-3. Report local change to remote data to peers and update local data
-   on interested peers (sync) using such reports. Remove local data
-   after synced for files we don't want to keep locally. [History]
+4. Report local change to remote data to peers and update local data
+   on interested peers (consensus) using such reports. Remove local
+   data after synced for files we don't want to keep locally.
+   [History] and [Consensus]
 
-4. Switch `RealStoreService` to using blobs, identified with hashes to
+5. Switch `RealStoreService` to using blobs, identified with hashes to
    download data. This allows [The Unreal](./unreal.md) to store and
    serve file data. [Future](./unreal.md#Future)
 
@@ -136,6 +141,65 @@ Peer B calls the following RPC on peer A:
 ```
 
 `Notification` is described in the previous section.
+
+### Consensus
+
+Peers listen to notifications from remote peer's [History] and apply
+`Link` and `Unlink` modifications locally as follow:
+
+- if local file has been reported as `Unlink` with a more recent
+  mtime, delete it
+
+- if local file has been report as `Link` with a more recent mtime and
+  a different blob, download that blob and replace the local version
+  with that .
+
+- if no local file reported by `Link` exists and it is in a *own*
+  directory, download it
+
+- if local file marked *watch* has been reported as `Available` with
+  the same mtime and blob, delete it
+
+
+For that to work, files, directories and arenas roots can be marked
+*watch* or *own*.
+
+- if a directory or arena root is marked *own*, remote files should
+  be replicated locally
+
+- if a directory or arena root is marked *watch*, files in it are
+  recursively marked *watch*
+
+- if a directory is not marked either, it inherits from its parent,
+  all the way up to the area root
+
+- if a file is marked *own* it is kept locally. If there is no local
+  copy yet, it should be downloaded.
+
+- if a file is marked *watch* it is not kept locally. If there is a
+  local copy, it should be deleted once another peer has it
+
+- if a file is not marked either, it inherits from its parent directory
+
+Marking of arenas is done in the configuration file and defaults here
+to *watch*.
+
+Marking of files and directories is done by setting an xattr on a
+directory or a file. Exact xattr TDB.
+
+The xattr might be replicated in the index, for convenience/speed, but
+doesn't need to. This design relies on being able to apply xattrs on
+files that are not available locally, through OverlayFS metacopy.
+
+When the rule above call for downloading a file from a remote peer,
+the desired action is kept into a queue to be executed later:
+
+- When triggered from a command (as in phase 0, but limited to owned files)
+- On a timer; it should be possible to configure times within which
+  such download can happen, globally or per arena.
+  
+Downloading a file from a remote peer can be subject to rate-limits,
+configurable globally or per arena.
 
 ## Future
 
