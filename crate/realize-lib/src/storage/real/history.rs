@@ -470,16 +470,20 @@ mod tests {
             fixture.next("ready").await?,
         );
 
-        let mtime = fixture.arena_dir.metadata()?.modified()?;
+        let start = fixture.arena_dir.metadata()?.modified()?;
         std::fs::remove_file(child.path())?;
-        assert_eq!(
-            Notification::Unlink {
-                arena: fixture.arena(),
-                path: Path::parse("child.txt")?,
-                mtime,
-            },
-            fixture.next("unlink").await?,
-        );
+        let notification = fixture.next("unlink").await?;
+        match &notification {
+            Notification::Unlink { arena, path, mtime } => {
+                assert_eq!(fixture.arena(), *arena);
+                assert_eq!("child.txt", path.as_str());
+                assert!(*mtime >= start);
+            }
+            _ => {
+                panic!("unexpected: {notification:?}");
+            }
+        }
+
         Ok(())
     }
     #[tokio::test]
