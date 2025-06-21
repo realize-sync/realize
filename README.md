@@ -62,7 +62,7 @@ Realize will advance through several key stages:
 1. Clone the repository:
 
    ```bash
-   git clone https://github.com/realize-rs/realize.git
+   git clone https://github.com/realize-sync/realize.git
    ```
 
 2. Navigate to the project directory:
@@ -91,8 +91,8 @@ For more details, see [LICENSE-MIT](LICENSE-MIT) and
 ## Contact
 
 For questions or support, please [open a discussion
-thread](https://github.com/realize-rs/realize/discussions) or [create
-an issue](https://github.com/realize-rs/realize/issues) in the
+thread](https://github.com/realize-sync/realize/discussions) or [create
+an issue](https://github.com/realize-sync/realize/issues) in the
 repository.
 
 ## Get Involved
