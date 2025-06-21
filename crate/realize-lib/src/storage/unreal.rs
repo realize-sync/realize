@@ -6,6 +6,9 @@ mod sync;
 #[cfg(test)]
 pub mod testing;
 mod updater;
+mod unreal_capnp {
+    include!(concat!(env!("OUT_DIR"), "/unreal_capnp.rs"));
+}
 
 pub use cache::FileEntry;
 pub use cache::FileMetadata;

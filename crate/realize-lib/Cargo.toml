@@ -11,6 +11,7 @@ async-trait = "0.1.88"
 base64 = "0.22"
 bincode = "1.3.3"
 blake2 = "0.10.6"
+capnp = "0.21.1"
 env_logger = "0.11"
 fast_rsync = "0.2"
 futures = "0.3"
@@ -52,3 +53,7 @@ tokio = { version = "1", features = ["process"] }
 redb = { version = "2.6.0", features = ["logging"] }
 nix = { version = "0.30.1", features = ["fs"] }
 toml = { version = "0.8.23", features = ["display", "parse"] }
+
+[build-dependencies]
+anyhow = "1.0"
+capnpc = "0.21.0"
