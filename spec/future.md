@@ -3,81 +3,6 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
-## The beginnig of the Unreal {#unreal}
-
-Let's start implementing the file cache described in [@/spec/design.md](design.md).
-
-The design describe a system based on blobs, but for now we just have
-file paths; let's get started with that and add blobs in a later step.
-
-1. **DONE** in `UnrealCacheBlocking` and `UnrealCacheAsync`
-
-   Define a database to store file list a [redb](https://github.com/cberner/redb/tree/master) database.
-   - The database stores file availability in a table:
-      key: (arena, path), arena as model::Arena, path as model::Path
-      value: a struct containing, for each peer for which data is avalible: presence (available or deleted), file size (if available), mtime
-
-   1.1 **DONE** fill the details section of [@/spec/unreal.md](unreal.md) with a good description of the database
-   1.2 **DONE** implement the database, keeping it as a goal to expose it through `nfsserve` (next step)
-   
-   
-2. Define a task that keeps the file list up-to-date for a specific peek.
- 
-   Algorithm:
-    1. connect to a peer using forward_peer_history
-    2. if it fails, wait according to policy
-       `ExponentialBackoff::from_millis(500).max_delay(Duration::from_secs(5 *
-       60))` and go back to 1. If it suceeds, move on to 2.
-    3. listens to `Notification::Link` and `Notification::Unlink` and apply them to the database
-    4. when `forward_peer_history` is disconnected (the join handle fails), go back to point 1
-    
-   This algorithm runs forever or until it is shut down. To shutdown,
-   keep a `shutdown_tx: broadcast::Sender<()>`. See the way `Server`
-   is implemented in
-   [@crate/realize-lib/src/network.rs](../crate/realize-lib/src/network.rs)
-   for an example of such a task that has a shutdown method.
-   
-   2.1 Design, implement and unit test the proposed task into
-   /crate/realize-lib/src/logic/cache_updater.rs
-    
-3. Make the file list available through [nfsserve](https://github.com/xetdata/nfsserve). Don't bother serving file content just yet; reading file data should just fail, but listing files should work.
-
-    - use the uid and gid of the daemon process for the files and directories
-    - for files, use mode u=rw,g=rw,o=r
-    - for directories, use mode u=rwx,g=rwx,o=rx
-
-  The code for exposing the cache should go into the library crate
-  /crate/realize-fs/src/storage/fs.rs and should be tested using the
-  unit test /create/realize-fs/tests/nfsserve_test.rs
-
-  3.1 write the code for calling nfsserve from an unreal cache in
-  /crate/realize-fs/src/storage/fs.rs and unit-test it thoroughly
-  
-  3.2 write an integration test in /create/realize-fs/tests/nfsserve_test.rs that creates a NFS service
-      and connects to it using [nfs3_client 0.4](https://crates.io/crates/nfs3_client/0.4.1)
-
-4. Serve file content through `nfsserve` by making a request for a
-   range of file content using [RealStoreService] when connected. Fail
-   immediately when disconnected.
-
-  4.1 fill the details section of [@/spec/unreal.md](unreal.md) with a description of how this would go
-  4.2 implement the algorithm without storing data to the database
-
-5. Store file data (ranges) to the database, as a cache
-
-  5.1 fill the details section of [@/spec/unreal.md](unreal.md) with a description of how this would go
-  5.2 implement
-
-## File hash as as Merkle tree {#merkle}
-
-For file hashes, build a Merkle tree:
-  https://docs.kernel.org/filesystems/fsverity.html
-
-- it can be built in chunks, in parallel
-- in case of mismatches, it can pinpoint where the mismatch happened
-- even incomplete trees are useful (just the root, or at depth N)
-- file digest = blob identifier
-
 ## Allow : in model:Path {#colon}
 
 Forbidding just brings trouble on Linux.
@@ -91,7 +16,10 @@ What does it look like to add a new peer?
 
 ## Gate copy by file size {#sizegate}
 
-Instead of allowing one file to copy at a time, allow multiple for a total of up to CHUNK_SIZE bytes. A file > CHUNK_SIZE gets copied one at a time, but smaller files can be grouped together. Might be worth increasing the number of parallel files for that.
+Instead of allowing one file to copy at a time, allow multiple for a
+total of up to CHUNK_SIZE bytes. A file > CHUNK_SIZE gets copied one
+at a time, but smaller files can be grouped together. Might be worth
+increasing the number of parallel files for that.
 
 ## IPV6 + IPV4 {#ipv64}
 
@@ -107,7 +35,8 @@ SocketAddr screws that up.
 
 ## Test retries {#testretries}
 
-Make it possible to intercept RealStoreService operations in tests to test:
+Make it possible to intercept RealStoreService operations in tests to
+test:
 
 - write errors later fixed by rsync
 - rsync producing a bad chunk, handled as a copy later on
@@ -149,21 +78,3 @@ or dst) threw this.
 
 - Print app errors in client at debug level
 
-## Implement retries {#retry}
-
-See the section "Error and retries" of spec/design.md.
-
-## Design and add useful logging to realized {#daemonlog}
-
-Think about what should be logged at the error, warning info and debug
-level. What format should be followed. What information should be
-sent.
-
-## Optimize reads {#readopt}
-
-Since move_files works on multiple files at once:
- - there's opportunity to write/read for one file while another file computes hash
- - the write and reads are scattered, making it hard on the OS buffers
-
-Experiment with different ways of organizing the work that maybe speed
-things up.
