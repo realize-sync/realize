@@ -1,3 +1,5 @@
+[![CI](https://github.com/realize-sync/realize/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/realize-sync/realize/actions/workflows/ci.yml)
+
 # Realize
 
 ## Overview
