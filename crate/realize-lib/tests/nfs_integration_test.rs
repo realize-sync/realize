@@ -11,7 +11,7 @@ use std::os::unix::fs::PermissionsExt as _;
 mod common;
 
 #[tokio::test]
-#[test_tag::tag(nfs)]
+#[test_tag::tag(nfsmount)]
 async fn export_arena() -> anyhow::Result<()> {
     let fixture = mountpoint::Fixture::setup().await?;
 
@@ -32,7 +32,7 @@ async fn export_arena() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-#[test_tag::tag(nfs)]
+#[test_tag::tag(nfsmount)]
 async fn export_linked_files() -> anyhow::Result<()> {
     let fixture = mountpoint::Fixture::setup().await?;
     let cache = &fixture.cache;
@@ -75,7 +75,7 @@ async fn export_linked_files() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-#[test_tag::tag(nfs)]
+#[test_tag::tag(nfsmount)]
 async fn read_file() -> anyhow::Result<()> {
     let fixture = mountpoint::Fixture::setup().await?;
     let cache = &fixture.cache;
