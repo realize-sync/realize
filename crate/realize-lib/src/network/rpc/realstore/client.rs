@@ -169,10 +169,10 @@ mod tests {
     use super::*;
     use crate::model::{Arena, Peer};
     use crate::network::hostport::HostPort;
-    use crate::network::rpc::realstore::{Config, Options};
+    use crate::network::rpc::realstore::Config;
     use crate::network::security::{testing, PeerVerifier, RawPublicKeyResolver};
     use crate::network::Server;
-    use crate::storage::real::RealStore;
+    use crate::storage::real::{self, RealStore};
     use crate::utils::async_utils::AbortOnDrop;
     use assert_fs::TempDir;
     use tarpc::context;
@@ -255,7 +255,7 @@ mod tests {
             .list(
                 context::current(),
                 Arena::from("testdir"),
-                Options::default(),
+                real::Options::default(),
             )
             .await??;
         assert!(list.is_empty());
@@ -332,7 +332,7 @@ mod tests {
             .list(
                 context::current(),
                 Arena::from("testdir"),
-                Options::default(),
+                real::Options::default(),
             )
             .await??;
         shutdown.send(())?;
@@ -340,7 +340,7 @@ mod tests {
             .list(
                 context::current(),
                 Arena::from("testdir"),
-                Options::default(),
+                real::Options::default(),
             )
             .await??;
         assert_eq!(connection_count.load(Ordering::Relaxed), 2);
@@ -423,7 +423,7 @@ mod tests {
             .list(
                 context::current(),
                 Arena::from("testdir"),
-                Options::default(),
+                real::Options::default(),
             )
             .await??;
         shutdown.send(())?;
@@ -431,7 +431,7 @@ mod tests {
             .list(
                 context::current(),
                 Arena::from("testdir"),
-                Options::default(),
+                real::Options::default(),
             )
             .await??;
         drop(client); // also closes conn_tx

@@ -21,10 +21,10 @@ use crate::{
         rpc::realstore::{
             self,
             client::{ClientOptions, RealStoreClient},
-            Options, RealStoreServiceError,
         },
         Networking,
     },
+    storage::real::{self, RealStoreError},
 };
 
 use super::{FileTableEntry, UnrealCacheAsync, UnrealError};
@@ -116,7 +116,7 @@ pub struct Download {
         ByteRange,
         Pin<
             Box<
-                dyn Future<Output = Result<Result<Vec<u8>, RealStoreServiceError>, RpcError>>
+                dyn Future<Output = Result<Result<Vec<u8>, RealStoreError>, RpcError>>
                     + Send
                     + Sync,
             >,
@@ -182,7 +182,7 @@ impl Download {
         ByteRange,
         Pin<
             Box<
-                dyn Future<Output = Result<Result<Vec<u8>, RealStoreServiceError>, RpcError>>
+                dyn Future<Output = Result<Result<Vec<u8>, RealStoreError>, RpcError>>
                     + Send
                     + Sync,
             >,
@@ -219,7 +219,13 @@ impl Download {
 
             Box::pin(async move {
                 client
-                    .read(context::current(), arena, path, range, Options::default())
+                    .read(
+                        context::current(),
+                        arena,
+                        path,
+                        range,
+                        real::Options::default(),
+                    )
                     .await
             })
         };
@@ -337,7 +343,7 @@ fn rpc_to_io_error(err: RpcError) -> std::io::Error {
     }
 }
 
-fn real_store_to_io_error(err: RealStoreServiceError) -> std::io::Error {
+fn real_store_to_io_error(err: RealStoreError) -> std::io::Error {
     std::io::Error::new(ErrorKind::Other, err)
 }
 

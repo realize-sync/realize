@@ -6,10 +6,13 @@ use crate::model::UnixTime;
 mod history;
 mod store;
 
+pub use store::Options;
 pub use store::PathResolver;
 pub use store::PathType;
 pub use store::RealStore;
-pub use store::StorageAccess;
+pub use store::RealStoreError;
+pub use store::RsyncOperation;
+pub use store::SyncedFile;
 
 /// Report something happening in arenas of the local file system.
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]

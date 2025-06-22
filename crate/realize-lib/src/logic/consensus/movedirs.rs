@@ -8,19 +8,19 @@ use crate::model;
 use crate::model::Arena;
 use crate::model::{ByteRange, ByteRanges};
 use crate::network::rpc::realstore::{
-    Options, RangedHash, RealStoreServiceClient, RealStoreServiceError, RealStoreServiceRequest,
-    RealStoreServiceResponse, SyncedFile,
+    RangedHash, RealStoreServiceClient, RealStoreServiceRequest, RealStoreServiceResponse,
 };
-use futures::FutureExt;
+use crate::storage::real::{self, RealStoreError, SyncedFile};
 use futures::future;
 use futures::stream::StreamExt as _;
-use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
+use futures::FutureExt;
+use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tarpc::client::stub::Stub;
 use thiserror::Error;
-use tokio::sync::Semaphore;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::Semaphore;
 
 const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 const PARALLEL_FILE_COUNT: usize = 4;
@@ -77,15 +77,15 @@ lazy_static::lazy_static! {
 }
 
 /// Options used for RPC calls on the source.
-fn src_options() -> Options {
-    Options {
+fn src_options() -> real::Options {
+    real::Options {
         ignore_partial: true,
     }
 }
 
 /// Options used for RPC calls on the destination.
-fn dst_options() -> Options {
-    Options {
+fn dst_options() -> real::Options {
+    real::Options {
         ignore_partial: false,
     }
 }
@@ -513,7 +513,7 @@ where
                 log::debug!("{}/{:?} INC {}", &arena, path, range.bytecount());
                 report_increment_bytecount(&progress_tx, &arena, path, range.bytecount()).await;
             }
-            Err(RealStoreServiceError::HashMismatch) => {
+            Err(RealStoreError::HashMismatch) => {
                 copy_ranges.add(&range);
                 log::error!(
                     "{}/{}:{} hash mismatch after apply_delta, will copy",
@@ -703,7 +703,7 @@ pub(crate) async fn hash_file<T>(
     relative_path: &model::Path,
     file_size: u64,
     chunk_size: u64,
-    options: Options,
+    options: real::Options,
 ) -> Result<RangedHash, MoveFileError>
 where
     T: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse>,
@@ -809,8 +809,8 @@ mod tests {
     use crate::network::rpc::realstore::server::{self};
     use crate::storage::real::RealStore;
     use crate::utils::hash;
-    use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use assert_fs::TempDir;
     use assert_unordered::assert_eq_unordered;
     use std::path::PathBuf;
     use walkdir::WalkDir;
@@ -1273,7 +1273,7 @@ mod tests {
             &model::Path::parse("somefile")?,
             content.len() as u64,
             HASH_FILE_CHUNK,
-            Options::default(),
+            real::Options::default(),
         )
         .await?;
         assert_eq!(
@@ -1307,7 +1307,7 @@ mod tests {
             &model::Path::parse("somefile")?,
             content.len() as u64,
             4,
-            Options::default(),
+            real::Options::default(),
         )
         .await?;
         let mut expected = RangedHash::new();
@@ -1341,7 +1341,7 @@ mod tests {
             &model::Path::parse("somefile")?,
             8,
             4,
-            Options::default(),
+            real::Options::default(),
         )
         .await?;
         let mut expected = RangedHash::new();
@@ -1395,7 +1395,7 @@ pub enum MoveFileError {
     #[error("RPC error: {0}")]
     Rpc(#[from] tarpc::client::RpcError),
     #[error("Remote Error: {0}")]
-    Realize(#[from] RealStoreServiceError),
+    Realize(#[from] RealStoreError),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("Data still inconsistent after sync")]

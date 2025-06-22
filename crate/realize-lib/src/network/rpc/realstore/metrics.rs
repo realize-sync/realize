@@ -26,10 +26,8 @@ use tarpc::{
 };
 use tokio::net::TcpListener;
 
-use crate::model::ByteRange;
-use crate::network::rpc::realstore::{
-    RealStoreServiceError, RealStoreServiceRequest, RealStoreServiceResponse,
-};
+use crate::network::rpc::realstore::{RealStoreServiceRequest, RealStoreServiceResponse};
+use crate::{model::ByteRange, storage::real::RealStoreError};
 
 lazy_static::lazy_static! {
     pub(crate) static ref METRIC_SERVER_DATA_IN_BYTES: HistogramVec =
@@ -150,7 +148,7 @@ fn error_label_server(res: &Result<RealStoreServiceResponse, ServerError>) -> &'
 }
 
 /// Extract an error from a [RealStoreServiceResponse].
-fn realize_error(res: &RealStoreServiceResponse) -> Option<&RealStoreServiceError> {
+fn realize_error(res: &RealStoreServiceResponse) -> Option<&RealStoreError> {
     match res {
         RealStoreServiceResponse::List(Err(err)) => Some(err),
         RealStoreServiceResponse::Send(Err(err)) => Some(err),
@@ -178,13 +176,13 @@ fn realize_error(res: &RealStoreServiceResponse) -> Option<&RealStoreServiceErro
 }
 
 /// Label that describes a [RealizeError] in metrics.
-fn realize_error_label(err: &RealStoreServiceError) -> &'static str {
+fn realize_error_label(err: &RealStoreError) -> &'static str {
     match err {
-        RealStoreServiceError::BadRequest(_) => "BadRequest",
-        RealStoreServiceError::Io(_) => "Io",
-        RealStoreServiceError::Rsync(_, _) => "Rsync",
-        RealStoreServiceError::Other(_) => "Other",
-        RealStoreServiceError::HashMismatch => "HashMismatch",
+        RealStoreError::BadRequest(_) => "BadRequest",
+        RealStoreError::Io(_) => "Io",
+        RealStoreError::Rsync(_, _) => "Rsync",
+        RealStoreError::Other(_) => "Other",
+        RealStoreError::HashMismatch => "HashMismatch",
     }
 }
 

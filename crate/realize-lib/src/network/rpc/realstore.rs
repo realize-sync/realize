@@ -9,31 +9,10 @@ pub mod client;
 pub mod metrics;
 pub mod server;
 
-use crate::model::{self, Arena, ByteRange, ByteRanges, Delta, Hash, Signature};
-use std::time::SystemTime;
-
-/// A file that can be synced through the service, within a directory.
-#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct SyncedFile {
-    /// Relative path to a file within the directory.
-    ///
-    /// Absolute paths and .. are not supported.
-    pub path: model::Path,
-
-    /// Size of the file on the current instance, in bytes.
-    pub size: u64,
-
-    /// Modification time of the file.
-    pub mtime: SystemTime,
-}
-
-/// Configures the behavior of a method on [RealStoreService].
-#[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize, Default)]
-pub struct Options {
-    /// If true, only take final files into account. This is usually
-    /// set on the source instance, to only move final files.
-    pub ignore_partial: bool,
-}
+use crate::{
+    model::{self, Arena, ByteRange, ByteRanges, Delta, Hash, Signature},
+    storage::real::{self, RealStoreError, SyncedFile},
+};
 
 /// Configure a specific connection to a [RealStoreService] instance.
 ///
@@ -51,8 +30,7 @@ pub const TAG: &[u8; 4] = b"REAL";
 #[tarpc::service]
 pub trait RealStoreService {
     /// List files in a directory
-    async fn list(arena: Arena, options: Options)
-        -> Result<Vec<SyncedFile>, RealStoreServiceError>;
+    async fn list(arena: Arena, options: real::Options) -> Result<Vec<SyncedFile>, RealStoreError>;
 
     /// Send a byte range of a file.
     async fn send(
@@ -60,8 +38,8 @@ pub trait RealStoreService {
         relative_path: model::Path,
         range: ByteRange,
         data: Vec<u8>,
-        options: Options,
-    ) -> Result<(), RealStoreServiceError>;
+        options: real::Options,
+    ) -> Result<(), RealStoreError>;
 
     /// Read a byte range from a file, returning the data.
     ///
@@ -70,38 +48,38 @@ pub trait RealStoreService {
         arena: Arena,
         relative_path: model::Path,
         range: ByteRange,
-        options: Options,
-    ) -> Result<Vec<u8>, RealStoreServiceError>;
+        options: real::Options,
+    ) -> Result<Vec<u8>, RealStoreError>;
 
     /// Mark a partial file as complete
     async fn finish(
         arena: Arena,
         relative_path: model::Path,
-        options: Options,
-    ) -> Result<(), RealStoreServiceError>;
+        options: real::Options,
+    ) -> Result<(), RealStoreError>;
 
     /// Compute a SHA-256 hash of the file at the given path (final or partial).
     async fn hash(
         arena: Arena,
         relative_path: model::Path,
         range: ByteRange,
-        options: Options,
-    ) -> Result<Hash, RealStoreServiceError>;
+        options: real::Options,
+    ) -> Result<Hash, RealStoreError>;
 
     /// Delete the file at the given path (both partial and final forms).
     async fn delete(
         arena: Arena,
         relative_path: model::Path,
-        options: Options,
-    ) -> Result<(), RealStoreServiceError>;
+        options: real::Options,
+    ) -> Result<(), RealStoreError>;
 
     /// Calculate a signature for the file at the given path and byte range.
     async fn calculate_signature(
         arena: Arena,
         relative_path: model::Path,
         range: ByteRange,
-        options: Options,
-    ) -> Result<Signature, RealStoreServiceError>;
+        options: real::Options,
+    ) -> Result<Signature, RealStoreError>;
 
     /// Compute a delta from the file at the given path and a given signature.
     ///
@@ -111,8 +89,8 @@ pub trait RealStoreService {
         relative_path: model::Path,
         range: ByteRange,
         signature: Signature,
-        options: Options,
-    ) -> Result<(Delta, Hash), RealStoreServiceError>;
+        options: real::Options,
+    ) -> Result<(Delta, Hash), RealStoreError>;
 
     /// Apply a delta to the file at the given path and byte range, verifying the hash
     ///
@@ -124,63 +102,19 @@ pub trait RealStoreService {
         range: ByteRange,
         delta: Delta,
         hash: Hash,
-        options: Options,
-    ) -> Result<(), RealStoreServiceError>;
+        options: real::Options,
+    ) -> Result<(), RealStoreError>;
 
     /// Truncate file to the given size.
     async fn truncate(
         arena: Arena,
         relative_path: model::Path,
         file_size: u64,
-        options: Options,
-    ) -> Result<(), RealStoreServiceError>;
+        options: real::Options,
+    ) -> Result<(), RealStoreError>;
 
     /// Configure the service with the given config (e.g., set write rate limit).
-    async fn configure(config: Config) -> Result<Config, RealStoreServiceError>;
-}
-
-/// Error type used by [RealStoreService].
-///
-/// The data stored in this error is limited, to remain usable through
-/// a RPC.
-#[derive(thiserror::Error, Debug, serde::Serialize, serde::Deserialize)]
-pub enum RealStoreServiceError {
-    /// Returned by the RealStoreService when given an invalid request.
-    #[error("Bad request: {0}")]
-    BadRequest(String),
-
-    #[error("I/O error: {0}")]
-    Io(String),
-
-    #[error("RSync {0:?} error: {1}")]
-    Rsync(RsyncOperation, String),
-
-    #[error("Unexpected: {0}")]
-    Other(String),
-
-    /// Returned by [RealStoreService::apply_delta] when the resulting
-    /// patch didn't match the hash created by [RealStoreService::diff].
-    #[error("Hash mismatch after rsync")]
-    HashMismatch,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub enum RsyncOperation {
-    Diff,
-    Apply,
-    Sign,
-}
-
-impl From<std::io::Error> for RealStoreServiceError {
-    fn from(value: std::io::Error) -> Self {
-        RealStoreServiceError::Io(value.to_string())
-    }
-}
-
-impl From<anyhow::Error> for RealStoreServiceError {
-    fn from(value: anyhow::Error) -> Self {
-        RealStoreServiceError::Other(value.to_string())
-    }
+    async fn configure(config: Config) -> Result<Config, RealStoreError>;
 }
 
 /// A set of range-specific [struct@Hash]es for a file.
