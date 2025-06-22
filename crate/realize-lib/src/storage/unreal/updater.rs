@@ -53,7 +53,7 @@ mod tests {
     use crate::model::Arena;
     use crate::model::Path;
     use crate::model::UnixTime;
-    use crate::storage::real::LocalStorage;
+    use crate::storage::real::RealStore;
     use crate::storage::real::Notification;
     use crate::storage::unreal::UnrealCacheBlocking;
     use assert_fs::fixture::ChildPath;
@@ -64,7 +64,7 @@ mod tests {
     use tokio_retry::strategy::FixedInterval;
 
     struct Fixture {
-        storage: LocalStorage,
+        storage: RealStore,
         arena: Arena,
         arena_root: ChildPath,
         cache: UnrealCacheAsync,
@@ -80,7 +80,7 @@ mod tests {
             let arena_root = tempdir.child("arena");
             arena_root.create_dir_all()?;
 
-            let storage = LocalStorage::single(&arena, arena_root.path());
+            let storage = RealStore::single(&arena, arena_root.path());
             let peer = Peer::from("remote");
             let (tx, rx) = mpsc::channel(10);
 

@@ -354,7 +354,7 @@ mod tests {
     use crate::{
         model::{Arena, Path, UnixTime},
         network::{self, hostport::HostPort, security, Server},
-        storage::{real::LocalStorage, unreal},
+        storage::{real::RealStore, unreal},
     };
 
     use super::*;
@@ -362,7 +362,7 @@ mod tests {
     struct Fixture {
         tempdir: TempDir,
         arena: Arena,
-        _local: LocalStorage,
+        _local: RealStore,
         _server: Arc<Server>,
         networking: Networking,
         cache: UnrealCacheAsync,
@@ -372,7 +372,7 @@ mod tests {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
             let arena = Arena::from("test");
-            let local = LocalStorage::new(vec![(arena.clone(), tempdir.path().to_path_buf())]);
+            let local = RealStore::new(vec![(arena.clone(), tempdir.path().to_path_buf())]);
             let mut server = Server::new(network::testing::server_networking()?);
             realstore::server::register(&mut server, local.clone());
             let server = Arc::new(server);

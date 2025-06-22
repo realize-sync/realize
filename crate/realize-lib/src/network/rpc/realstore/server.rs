@@ -18,7 +18,7 @@ use crate::network::rpc::realstore::{
     RealStoreServiceClient, RealStoreServiceRequest, RealStoreServiceResponse,
 };
 use crate::network::Server;
-use crate::storage::real::LocalStorage;
+use crate::storage::real::RealStore;
 use crate::storage::real::PathResolver;
 use crate::storage::real::PathType;
 use crate::storage::real::StorageAccess;
@@ -53,7 +53,7 @@ const RSYNC_BLOCK_SIZE: usize = 4096;
 pub type InProcessRealStoreServiceClient = RealStoreServiceClient<InProcessStub>;
 
 /// Creates a in-process client that works on the given directories.
-pub fn create_inprocess_client(storage: LocalStorage) -> InProcessRealStoreServiceClient {
+pub fn create_inprocess_client(storage: RealStore) -> InProcessRealStoreServiceClient {
     RealizeServer::new(storage).as_inprocess_client()
 }
 
@@ -76,7 +76,7 @@ impl Stub for InProcessStub {
     }
 }
 
-pub fn register(server: &mut Server, realize_storage: LocalStorage) {
+pub fn register(server: &mut Server, realize_storage: RealStore) {
     server.register_server(super::TAG, move |_peer, limiter, framed| {
         let storage = realize_storage.clone();
         let transport = tarpc::serde_transport::new(framed, Bincode::default());
@@ -89,19 +89,19 @@ pub fn register(server: &mut Server, realize_storage: LocalStorage) {
 
 #[derive(Clone)]
 pub(crate) struct RealizeServer {
-    pub(crate) storage: LocalStorage,
+    pub(crate) storage: RealStore,
     pub(crate) limiter: Option<Limiter<StandardClock>>,
 }
 
 impl RealizeServer {
-    pub(crate) fn new(storage: LocalStorage) -> Self {
+    pub(crate) fn new(storage: RealStore) -> Self {
         Self {
             storage,
             limiter: None,
         }
     }
 
-    pub(crate) fn new_limited(storage: LocalStorage, limiter: Limiter<StandardClock>) -> Self {
+    pub(crate) fn new_limited(storage: RealStore, limiter: Limiter<StandardClock>) -> Self {
         Self {
             storage,
             limiter: Some(limiter),
@@ -605,7 +605,7 @@ mod tests {
         let arena = Arena::from("testdir");
 
         Ok((
-            RealizeServer::new(LocalStorage::single(&arena, temp.path())),
+            RealizeServer::new(RealStore::single(&arena, temp.path())),
             temp,
             arena,
         ))
@@ -948,7 +948,7 @@ mod tests {
     async fn tarpc_rpc_inprocess() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let client =
-            create_inprocess_client(LocalStorage::single(&Arena::from("testdir"), temp.path()));
+            create_inprocess_client(RealStore::single(&Arena::from("testdir"), temp.path()));
         let list = client
             .list(
                 tarpc::context::current(),
@@ -1233,7 +1233,7 @@ mod tests {
 
     #[tokio::test]
     async fn configure_noop_returns_none() {
-        let server = RealizeServer::new(LocalStorage::single(
+        let server = RealizeServer::new(RealStore::single(
             &Arena::from("testdir"),
             &PathBuf::from("/tmp/testdir"),
         ));
@@ -1252,7 +1252,7 @@ mod tests {
 
     #[tokio::test]
     async fn configure_limited_sets_and_returns_limit() {
-        let dirs = LocalStorage::single(&Arena::from("testdir"), &PathBuf::from("/tmp/testdir"));
+        let dirs = RealStore::single(&Arena::from("testdir"), &PathBuf::from("/tmp/testdir"));
         let limiter = Limiter::<StandardClock>::new(f64::INFINITY);
         let server = RealizeServer::new_limited(dirs, limiter.clone());
         let limit = 55555u64;

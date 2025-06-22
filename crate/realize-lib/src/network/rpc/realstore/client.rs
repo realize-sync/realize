@@ -172,7 +172,7 @@ mod tests {
     use crate::network::rpc::realstore::{Config, Options};
     use crate::network::security::{testing, PeerVerifier, RawPublicKeyResolver};
     use crate::network::Server;
-    use crate::storage::real::LocalStorage;
+    use crate::storage::real::RealStore;
     use crate::utils::async_utils::AbortOnDrop;
     use assert_fs::TempDir;
     use tarpc::context;
@@ -180,7 +180,7 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     struct Fixture {
-        storage: LocalStorage,
+        storage: RealStore,
         resolver: Arc<RawPublicKeyResolver>,
         verifier: Arc<PeerVerifier>,
         server: Option<Arc<Server>>,
@@ -192,7 +192,7 @@ mod tests {
             let _ = env_logger::try_init();
 
             let tempdir = TempDir::new()?;
-            let storage = LocalStorage::single(&Arena::from("testdir"), tempdir.path());
+            let storage = RealStore::single(&Arena::from("testdir"), tempdir.path());
             let resolver = RawPublicKeyResolver::from_private_key(testing::server_private_key())?;
             let mut verifier = PeerVerifier::new();
             verifier.add_peer(&Peer::from("client"), testing::client_public_key());

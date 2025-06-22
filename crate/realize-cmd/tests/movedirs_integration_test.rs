@@ -11,7 +11,7 @@ use realize_lib::network::security::PeerVerifier;
 use realize_lib::network::security::RawPublicKeyResolver;
 use realize_lib::network::Networking;
 use realize_lib::network::Server;
-use realize_lib::storage::real::LocalStorage;
+use realize_lib::storage::real::RealStore;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::SubjectPublicKeyInfoDer;
 use std::fs;
@@ -95,7 +95,7 @@ impl Fixture {
         ));
         realstore::server::register(
             &mut src_server,
-            LocalStorage::new(
+            RealStore::new(
                 self.arenas
                     .iter()
                     .map(|(a, src_path, _)| (a.clone(), src_path.clone())),
@@ -113,7 +113,7 @@ impl Fixture {
         ));
         realstore::server::register(
             &mut dst_server,
-            LocalStorage::new(
+            RealStore::new(
                 self.arenas
                     .iter()
                     .map(|(a, _, dst_path)| (a.clone(), dst_path.clone())),

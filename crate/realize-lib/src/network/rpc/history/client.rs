@@ -6,7 +6,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::model::Peer;
 use crate::network::{rpc::history::HistoryServiceClient, Server};
-use crate::storage::real::LocalStorage;
+use crate::storage::real::RealStore;
 
 use super::{HistoryServiceRequest, HistoryServiceResponse};
 
@@ -14,7 +14,7 @@ use super::{HistoryServiceRequest, HistoryServiceResponse};
 ///
 /// With this call, the server answers to HIST calls by reporting file
 /// history of the arenas in the local storage.
-pub fn register(server: &mut Server, storage: LocalStorage) {
+pub fn register(server: &mut Server, storage: RealStore) {
     server.register(super::TAG, move |peer: Peer, framed, _, shutdown_rx| {
         let transport = tarpc::serde_transport::new(framed, Bincode::default());
         let channel = tarpc::client::new(Default::default(), transport).spawn();
@@ -32,7 +32,7 @@ pub fn register(server: &mut Server, storage: LocalStorage) {
 
 async fn collect<T>(
     client: HistoryServiceClient<T>,
-    storage: LocalStorage,
+    storage: RealStore,
     mut shutdown: broadcast::Receiver<()>,
 ) -> anyhow::Result<()>
 where

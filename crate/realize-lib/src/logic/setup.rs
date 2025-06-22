@@ -9,7 +9,7 @@ use crate::network::rpc::history::server::forward_peer_history;
 use crate::network::rpc::realstore;
 use crate::network::{Networking, Server};
 use crate::storage::config::{ArenaConfig, StorageConfig};
-use crate::storage::real::LocalStorage;
+use crate::storage::real::RealStore;
 use crate::storage::unreal::keep_cache_updated;
 use crate::storage::unreal::UnrealCacheAsync;
 
@@ -21,7 +21,7 @@ pub fn setup_server(
     storage_config: &StorageConfig,
 ) -> anyhow::Result<Arc<Server>> {
     check_directory_access(&storage_config.arenas)?;
-    let store = LocalStorage::from_config(&storage_config.arenas);
+    let store = RealStore::from_config(&storage_config.arenas);
 
     let mut server = Server::new(networking.clone());
     realstore::server::register(&mut server, store.clone());

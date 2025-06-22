@@ -11,7 +11,7 @@ use realize_lib::{
         Networking, Server,
     },
     storage::{
-        real::LocalStorage,
+        real::RealStore,
         unreal::{Downloader, UnrealCacheAsync, UnrealCacheBlocking},
     },
     utils::async_utils::AbortOnDrop,
@@ -36,7 +36,7 @@ impl Fixture {
 
         let tempdir = TempDir::new()?;
         let arena = Arena::from("test");
-        let store = LocalStorage::new(vec![(arena.clone(), tempdir.path().to_path_buf())]);
+        let store = RealStore::new(vec![(arena.clone(), tempdir.path().to_path_buf())]);
         let keys = test_keys();
         let verifier = setup_verifier(&keys);
         let client = Peer::from("server");

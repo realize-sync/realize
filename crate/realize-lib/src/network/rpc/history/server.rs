@@ -141,7 +141,7 @@ mod tests {
             security::{testing, PeerVerifier, RawPublicKeyResolver},
             Server,
         },
-        storage::real::LocalStorage,
+        storage::real::RealStore,
     };
 
     use super::*;
@@ -151,7 +151,7 @@ mod tests {
         address: HostPort,
         networking: Networking,
         tempdir: TempDir,
-        storage: LocalStorage,
+        storage: RealStore,
         arena: Arena,
     }
     impl Fixture {
@@ -172,7 +172,7 @@ mod tests {
 
             let tempdir = TempDir::new()?;
             let arena = Arena::from("testdir");
-            let storage = LocalStorage::single(&arena, tempdir.path());
+            let storage = RealStore::single(&arena, tempdir.path());
 
             Ok(Self {
                 peer,

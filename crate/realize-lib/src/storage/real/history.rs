@@ -351,7 +351,7 @@ fn unix_mtime(metadata: &std::fs::Metadata) -> anyhow::Result<UnixTime, SystemTi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::real::LocalStorage;
+    use crate::storage::real::RealStore;
     use anyhow::Context as _;
     use assert_fs::{
         fixture::ChildPath,
@@ -365,7 +365,7 @@ mod tests {
         _tempdir: TempDir,
         arena: Arena,
         arena_dir: ChildPath,
-        storage: LocalStorage,
+        storage: RealStore,
         notifications_tx: mpsc::Sender<Notification>,
         notifications_rx: mpsc::Receiver<Notification>,
     }
@@ -379,7 +379,7 @@ mod tests {
             let arena_dir = tempdir.child("a");
             arena_dir.create_dir_all()?;
 
-            let storage = LocalStorage::single(&arena, arena_dir.path());
+            let storage = RealStore::single(&arena, arena_dir.path());
             let (notifications_tx, notifications_rx) = mpsc::channel(10);
 
             Ok(Self {

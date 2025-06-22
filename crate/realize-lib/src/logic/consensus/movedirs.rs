@@ -807,7 +807,7 @@ mod tests {
     use crate::model::Arena;
     use crate::model::Hash;
     use crate::network::rpc::realstore::server::{self};
-    use crate::storage::real::LocalStorage;
+    use crate::storage::real::RealStore;
     use crate::utils::hash;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
@@ -824,8 +824,8 @@ mod tests {
         let arena = Arena::from("testdir");
         let src_dir = src_temp.path();
         let dst_dir = dst_temp.path();
-        let src_server = server::create_inprocess_client(LocalStorage::single(&arena, src_dir));
-        let dst_server = server::create_inprocess_client(LocalStorage::single(&arena, dst_dir));
+        let src_server = server::create_inprocess_client(RealStore::single(&arena, src_dir));
+        let dst_server = server::create_inprocess_client(RealStore::single(&arena, dst_dir));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let (success, error, _) = move_dir(
@@ -898,9 +898,9 @@ mod tests {
         dst_temp.child(".foo.part").write_str("abc")?;
 
         let src_server =
-            server::create_inprocess_client(LocalStorage::single(&arena, src_temp.path()));
+            server::create_inprocess_client(RealStore::single(&arena, src_temp.path()));
         let dst_server =
-            server::create_inprocess_client(LocalStorage::single(&arena, dst_temp.path()));
+            server::create_inprocess_client(RealStore::single(&arena, dst_temp.path()));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let (success, error, _) = move_dir(
@@ -973,9 +973,9 @@ mod tests {
         dst_temp.child(".foo.part").write_str("xxx")?;
 
         let src_server =
-            server::create_inprocess_client(LocalStorage::single(&arena, src_temp.path()));
+            server::create_inprocess_client(RealStore::single(&arena, src_temp.path()));
         let dst_server =
-            server::create_inprocess_client(LocalStorage::single(&arena, dst_temp.path()));
+            server::create_inprocess_client(RealStore::single(&arena, dst_temp.path()));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let (success, error, _) = move_dir(
@@ -1065,12 +1065,12 @@ mod tests {
         // Setup source directory with files
         let src_temp = TempDir::new()?;
         let src_server =
-            server::create_inprocess_client(LocalStorage::single(&arena, src_temp.path()));
+            server::create_inprocess_client(RealStore::single(&arena, src_temp.path()));
 
         // Setup destination directory (empty)
         let dst_temp = TempDir::new()?;
         let dst_server =
-            server::create_inprocess_client(LocalStorage::single(&arena, dst_temp.path()));
+            server::create_inprocess_client(RealStore::single(&arena, dst_temp.path()));
 
         // Pre-populate destination with a file of the same length as source (should trigger rsync optimization)
         src_temp.child("same_length").write_str("hello")?;
@@ -1127,11 +1127,11 @@ mod tests {
         let arena = Arena::from("testdir");
         let src_temp = TempDir::new()?;
         let src_server =
-            server::create_inprocess_client(LocalStorage::single(&arena, src_temp.path()));
+            server::create_inprocess_client(RealStore::single(&arena, src_temp.path()));
 
         let dst_temp = TempDir::new()?;
         let dst_server =
-            server::create_inprocess_client(LocalStorage::single(&arena, dst_temp.path()));
+            server::create_inprocess_client(RealStore::single(&arena, dst_temp.path()));
 
         // Case 1: source > CHUNK_SIZE, destination empty
         src_temp.child("large_empty").write_binary(&chunk)?;
@@ -1190,10 +1190,10 @@ mod tests {
         let arena = Arena::from("testdir");
         let src_temp = TempDir::new()?;
         let src_server =
-            server::create_inprocess_client(LocalStorage::single(&arena, src_temp.path()));
+            server::create_inprocess_client(RealStore::single(&arena, src_temp.path()));
         let dst_temp = TempDir::new()?;
         let dst_server =
-            server::create_inprocess_client(LocalStorage::single(&arena, dst_temp.path()));
+            server::create_inprocess_client(RealStore::single(&arena, dst_temp.path()));
         // Good file
         src_temp.child("good").write_str("ok")?;
         // Unreadable file
@@ -1225,8 +1225,8 @@ mod tests {
         let arena = Arena::from("testdir");
         let src_dir = src_temp.path();
         let dst_dir = dst_temp.path();
-        let src_server = server::create_inprocess_client(LocalStorage::single(&arena, src_dir));
-        let dst_server = server::create_inprocess_client(LocalStorage::single(&arena, dst_dir));
+        let src_server = server::create_inprocess_client(RealStore::single(&arena, src_dir));
+        let dst_server = server::create_inprocess_client(RealStore::single(&arena, dst_dir));
         // Create a final file and a partial file in src
         src_temp.child("final.txt").write_str("finaldata")?;
         src_temp
@@ -1265,7 +1265,7 @@ mod tests {
         file.write_binary(content)?;
 
         let arena = Arena::from("dir");
-        let server = server::create_inprocess_client(LocalStorage::single(&arena, temp.path()));
+        let server = server::create_inprocess_client(RealStore::single(&arena, temp.path()));
         let ranged = hash_file(
             tarpc::context::current(),
             &server,
@@ -1299,7 +1299,7 @@ mod tests {
         file.write_binary(content)?;
 
         let arena = Arena::from("dir");
-        let server = server::create_inprocess_client(LocalStorage::single(&arena, temp.path()));
+        let server = server::create_inprocess_client(RealStore::single(&arena, temp.path()));
         let ranged = hash_file(
             tarpc::context::current(),
             &server,
@@ -1333,7 +1333,7 @@ mod tests {
         file.write_binary(content)?;
 
         let arena = Arena::from("dir");
-        let server = server::create_inprocess_client(LocalStorage::single(&arena, temp.path()));
+        let server = server::create_inprocess_client(RealStore::single(&arena, temp.path()));
         let ranged = hash_file(
             tarpc::context::current(),
             &server,

@@ -360,7 +360,7 @@ mod tests {
     use crate::{
         model::{Arena, Path},
         network::{self, hostport::HostPort, rpc::realstore, security, Server},
-        storage::real::LocalStorage,
+        storage::real::RealStore,
     };
     use assert_fs::{
         prelude::{FileWriteStr as _, PathChild as _},
@@ -384,7 +384,7 @@ mod tests {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
             let arena = Arena::from("test");
-            let local = LocalStorage::new(vec![(arena.clone(), tempdir.path().to_path_buf())]);
+            let local = RealStore::new(vec![(arena.clone(), tempdir.path().to_path_buf())]);
             let mut server = Server::new(network::testing::server_networking()?);
             realstore::server::register(&mut server, local.clone());
             let server = Arc::new(server);

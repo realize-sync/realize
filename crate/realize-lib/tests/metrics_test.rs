@@ -13,7 +13,7 @@ use realize_lib::logic::consensus::movedirs::METRIC_WRITE_BYTES;
 use realize_lib::model::Arena;
 use realize_lib::network::rpc::realstore::Options;
 use realize_lib::network::rpc::realstore::server::{self, InProcessRealStoreServiceClient};
-use realize_lib::storage::real::LocalStorage;
+use realize_lib::storage::real::RealStore;
 
 // Metric tests are kept in their own binary to avoid other test
 // running in parallel interfering with the counts.
@@ -148,8 +148,8 @@ async fn move_files_metrics() -> anyhow::Result<()> {
     let arena = Arena::from("testdir");
     let (success, error, _interrupted) = movedirs::move_dir(
         tarpc::context::current(),
-        &server::create_inprocess_client(LocalStorage::single(&arena, src_temp.path())),
-        &server::create_inprocess_client(LocalStorage::single(&arena, dst_temp.path())),
+        &server::create_inprocess_client(RealStore::single(&arena, src_temp.path())),
+        &server::create_inprocess_client(RealStore::single(&arena, dst_temp.path())),
         Arena::from("testdir"),
         None,
     )
@@ -178,7 +178,7 @@ async fn move_files_metrics() -> anyhow::Result<()> {
 fn setup_inprocess_client() -> (TempDir, Arena, InProcessRealStoreServiceClient) {
     let temp = TempDir::new().unwrap();
     let arena = Arena::from("testdir");
-    let client = server::create_inprocess_client(LocalStorage::single(&arena, temp.path()));
+    let client = server::create_inprocess_client(RealStore::single(&arena, temp.path()));
 
     (temp, arena, client)
 }
