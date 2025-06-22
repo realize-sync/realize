@@ -25,6 +25,8 @@ jobs:
   on-linux:
     runs-on: ubuntu-24.04
     steps:
+    - name: Install build dependencies
+      run: "apt-get install capnproto"
     - uses: actions/checkout@v4
     - name: Build
       run: cargo build
@@ -34,6 +36,8 @@ jobs:
   on-macos:
     runs-on: macos-15
     steps:
+    - name: Install build dependencies
+      run: "brew install capnp"
     - uses: actions/checkout@v4
     - name: Build
       run: "cargo build"
