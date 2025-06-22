@@ -52,6 +52,7 @@ mod tests {
     use super::*;
     use crate::model::Arena;
     use crate::model::Path;
+    use crate::model::UnixTime;
     use crate::storage::real::LocalStorage;
     use crate::storage::real::Notification;
     use crate::storage::unreal::UnrealCacheBlocking;
@@ -176,7 +177,7 @@ mod tests {
         let file2 = fixture.arena_root.child("file2");
         file2.write_str("test")?;
 
-        let mtime = file2.metadata()?.modified()?;
+        let mtime = UnixTime::from_system_time(file2.metadata()?.modified()?)?;
 
         // There existed, in the past, a file called "file1", which
         // isn't there anymore. It should be removed when the peer
@@ -188,7 +189,7 @@ mod tests {
                 &fixture.arena,
                 &Path::parse("file1")?,
                 4,
-                mtime,
+                &mtime,
             )
             .await?;
         fixture
@@ -198,7 +199,7 @@ mod tests {
                 &fixture.arena,
                 &Path::parse("file2")?,
                 4,
-                mtime,
+                &mtime,
             )
             .await?;
 

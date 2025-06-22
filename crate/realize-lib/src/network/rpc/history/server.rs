@@ -133,7 +133,7 @@ mod tests {
     use tokio_retry::strategy::{ExponentialBackoff, FixedInterval};
 
     use crate::{
-        model,
+        model::{self, UnixTime},
         network::{
             self,
             hostport::HostPort,
@@ -230,7 +230,7 @@ mod tests {
 
         let foobar = fixture.tempdir.child("foobar.txt");
         foobar.write_str("test")?;
-        let foobar_mtime = foobar.metadata()?.modified()?;
+        let foobar_mtime = UnixTime::from_system_time(foobar.metadata()?.modified()?)?;
 
         let (peer, notif) = timeout(Duration::from_secs(5), rx.recv()).await?.unwrap();
         assert_eq!(fixture.peer, peer);
@@ -257,7 +257,7 @@ mod tests {
 
         let foobar = fixture.tempdir.child("foobar.txt");
         foobar.write_str("test")?;
-        let foobar_mtime = foobar.metadata()?.modified()?;
+        let foobar_mtime = UnixTime::from_system_time(foobar.metadata()?.modified()?)?;
 
         let _server = fixture.start_server().await?;
 

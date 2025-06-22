@@ -1,11 +1,10 @@
 #![cfg(target_os = "linux")]
 
-use std::time::{Duration, SystemTime};
-
 use assert_fs::prelude::FileWriteStr as _;
 use assert_fs::prelude::PathChild as _;
 use common::mountpoint;
 use realize_lib::model::Path;
+use realize_lib::model::UnixTime;
 use std::os::unix::fs::PermissionsExt as _;
 
 mod common;
@@ -38,14 +37,12 @@ async fn export_linked_files() -> anyhow::Result<()> {
     let cache = &fixture.cache;
     let peer = realize_lib::model::Peer::from("peer");
     let arena = &fixture.arena;
-    let test_mtime = SystemTime::UNIX_EPOCH
-        .checked_add(Duration::from_secs(1234567890))
-        .unwrap();
+    let test_mtime = UnixTime::from_secs(1234567890);
     cache
-        .link(&peer, arena, &Path::parse("a/b/c.txt")?, 1024, test_mtime)
+        .link(&peer, arena, &Path::parse("a/b/c.txt")?, 1024, &test_mtime)
         .await?;
     cache
-        .link(&peer, arena, &Path::parse("a/b/d.txt")?, 2048, test_mtime)
+        .link(&peer, arena, &Path::parse("a/b/d.txt")?, 2048, &test_mtime)
         .await?;
 
     let mut entries = vec![];
@@ -63,13 +60,19 @@ async fn export_linked_files() -> anyhow::Result<()> {
     let metadata = c.metadata().await?;
     assert!(metadata.file_type().is_file());
     assert_eq!(0o0440, metadata.permissions().mode() & 0o7777);
-    assert_eq!(test_mtime, metadata.modified().unwrap());
+    assert_eq!(
+        test_mtime,
+        UnixTime::from_system_time(metadata.modified().unwrap())?
+    );
 
     assert_eq!("d.txt", d.file_name().to_string_lossy());
     let metadata = d.metadata().await?;
     assert!(metadata.file_type().is_file());
     assert_eq!(0o0440, metadata.permissions().mode() & 0o7777);
-    assert_eq!(test_mtime, metadata.modified().unwrap());
+    assert_eq!(
+        test_mtime,
+        UnixTime::from_system_time(metadata.modified().unwrap())?
+    );
 
     Ok(())
 }
@@ -86,7 +89,13 @@ async fn read_file() -> anyhow::Result<()> {
     testfile.write_str("hello, world")?;
     let m = tokio::fs::metadata(&testfile.path()).await?;
     cache
-        .link(&peer, arena, &path, m.len(), m.modified()?)
+        .link(
+            &peer,
+            arena,
+            &path,
+            m.len(),
+            &UnixTime::from_system_time(m.modified()?)?,
+        )
         .await?;
 
     assert_eq!(
