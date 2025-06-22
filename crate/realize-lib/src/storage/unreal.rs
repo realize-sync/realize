@@ -24,7 +24,7 @@ mod unreal_capnp {
 pub const ROOT_DIR: u64 = 1;
 
 /// An entry in a directory listing.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReadDirEntry {
     /// The inode of the entry.
     pub inode: u64,
@@ -33,7 +33,7 @@ pub struct ReadDirEntry {
 }
 
 /// The type of an inode.
-#[derive(Debug, Copy, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum InodeAssignment {
     /// The inode of a file, look it up in the file table.
     File,
@@ -45,7 +45,7 @@ pub enum InodeAssignment {
 }
 
 /// An entry in the file table.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FileTableEntry {
     /// The metadata of the file.
     pub metadata: FileMetadata,
@@ -57,7 +57,7 @@ pub struct FileTableEntry {
 }
 
 /// Information needed to fetch a file from a remote peer.
-#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq)]
 pub struct FileContent {
     /// The arena to use to fetch file content in the peer.
     ///
@@ -135,7 +135,7 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
 }
 
 /// The metadata of a file.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FileMetadata {
     /// The size of the file in bytes.
     pub size: u64,
@@ -145,7 +145,7 @@ pub struct FileMetadata {
     pub mtime: UnixTime,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug, Clone)]
+#[derive(PartialEq, Debug, Clone)]
 enum DirTableEntry {
     Regular(ReadDirEntry),
     Dot(UnixTime),

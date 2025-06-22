@@ -110,9 +110,6 @@ where
 /// project.
 #[derive(Debug, thiserror::Error)]
 pub enum ByteConversionError {
-    #[error("bincode error {0}")]
-    Bincode(#[from] Box<bincode::ErrorKind>),
-
     #[error("capnp error {0}")]
     Capnp(#[from] capnp::Error),
 
