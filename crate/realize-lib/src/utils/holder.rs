@@ -1,6 +1,8 @@
-use std::marker::PhantomData;
+use std::{marker::PhantomData, str::Utf8Error};
 
 use redb::Value;
+
+use crate::model::PathError;
 
 /// A type that can be converted to and from bytes.
 ///
@@ -110,4 +112,16 @@ where
 pub enum ByteConversionError {
     #[error("bincode error {0}")]
     Bincode(#[from] Box<bincode::ErrorKind>),
+
+    #[error("capnp error {0}")]
+    Capnp(#[from] capnp::Error),
+
+    #[error(transparent)]
+    Path(#[from] PathError),
+
+    #[error("invalid string: {0}")]
+    Utf8(#[from] Utf8Error),
+
+    #[error("invalid {0}")]
+    Invalid(&'static str),
 }

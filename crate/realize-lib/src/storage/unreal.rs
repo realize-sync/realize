@@ -1,5 +1,7 @@
-use crate::model::{self, UnixTime};
+use crate::model::{self, Arena, Path, UnixTime};
 use crate::utils::holder::{ByteConversionError, ByteConvertible, NamedType};
+use capnp::message::ReaderOptions;
+use capnp::serialize_packed;
 pub use downloader::Download;
 pub use downloader::Downloader;
 pub use error::UnrealError;
@@ -88,11 +90,47 @@ impl NamedType for FileTableEntry {
 
 impl ByteConvertible<FileTableEntry> for FileTableEntry {
     fn from_bytes(data: &[u8]) -> Result<FileTableEntry, ByteConversionError> {
-        Ok(bincode::deserialize::<FileTableEntry>(data)?)
+        let message_reader = serialize_packed::read_message(&mut &data[..], ReaderOptions::new())?;
+        let msg: unreal_capnp::file_table_entry::Reader =
+            message_reader.get_root::<unreal_capnp::file_table_entry::Reader>()?;
+
+        let content = msg.get_content()?;
+        let metadata = msg.get_metadata()?;
+        let mtime = metadata.get_mtime()?;
+        Ok(FileTableEntry {
+            metadata: FileMetadata {
+                size: metadata.get_size(),
+                mtime: UnixTime::new(mtime.get_secs(), mtime.get_nsecs()),
+            },
+            content: FileContent {
+                arena: Arena::from(content.get_arena()?.to_str()?),
+                path: Path::parse(content.get_path()?.to_str()?)?,
+            },
+            parent_inode: msg.get_parent(),
+        })
     }
 
     fn to_bytes(self) -> Result<Vec<u8>, ByteConversionError> {
-        Ok(bincode::serialize(&self)?)
+        let mut message = ::capnp::message::Builder::new_default();
+        let mut builder: unreal_capnp::file_table_entry::Builder =
+            message.init_root::<unreal_capnp::file_table_entry::Builder>();
+
+        builder.set_parent(self.parent_inode);
+
+        let mut content = builder.reborrow().init_content();
+        content.set_arena(self.content.arena.as_str());
+        content.set_path(self.content.path.as_str());
+
+        let mut metadata = builder.init_metadata();
+        metadata.set_size(self.metadata.size);
+        let mut mtime = metadata.init_mtime();
+        mtime.set_secs(self.metadata.mtime.as_secs());
+        mtime.set_nsecs(self.metadata.mtime.subsec_nanos());
+
+        let mut buffer: Vec<u8> = Vec::new();
+        serialize_packed::write_message(&mut buffer, &message)?;
+
+        Ok(buffer)
     }
 }
 
@@ -137,5 +175,32 @@ impl ByteConvertible<DirTableEntry> for DirTableEntry {
 
     fn to_bytes(self) -> Result<Vec<u8>, ByteConversionError> {
         Ok(bincode::serialize(&self)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn convert_file_table_entry() -> anyhow::Result<()> {
+        let entry = FileTableEntry {
+            content: FileContent {
+                arena: Arena::from("test"),
+                path: Path::parse("foo/bar.txt")?,
+            },
+            metadata: FileMetadata {
+                size: 200,
+                mtime: UnixTime::from_secs(1234567890),
+            },
+            parent_inode: 1234,
+        };
+
+        assert_eq!(
+            entry,
+            FileTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
+        );
+
+        Ok(())
     }
 }

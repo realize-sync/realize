@@ -22,11 +22,11 @@ enum InodeAssignment {
 # An entry in the file table.
 struct FileTableEntry {
   metadata @0: FileMetadata;
-  parent @1: UInt64;
-  content @2: ContentRef;
+  content @1: FileContent;
+  parent @2: UInt64;
 }
 
-struct ContentRef {
+struct FileContent {
   arena @0: Text;
   path @1: Text;
 }
