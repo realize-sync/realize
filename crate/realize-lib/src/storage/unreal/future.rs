@@ -1,9 +1,9 @@
-use std::{path, sync::Arc, time::SystemTime};
+use std::{path, sync::Arc};
 
 use tokio::task;
 
 use crate::{
-    model::{Arena, Path, Peer},
+    model::{Arena, Path, Peer, UnixTime},
     storage::config::StorageConfig,
 };
 
@@ -65,14 +65,15 @@ impl UnrealCacheAsync {
         arena: &Arena,
         path: &Path,
         size: u64,
-        mtime: SystemTime,
+        mtime: &UnixTime,
     ) -> Result<(), UnrealError> {
         let peer = peer.clone();
         let arena = arena.clone();
         let path = path.clone();
+        let mtime = mtime.clone();
         let inner = Arc::clone(&self.inner);
 
-        Ok(task::spawn_blocking(move || inner.link(&peer, &arena, &path, size, mtime)).await??)
+        Ok(task::spawn_blocking(move || inner.link(&peer, &arena, &path, size, &mtime)).await??)
     }
 
     /// Async version of [BlockingUnrealCache::unlink]
@@ -81,14 +82,15 @@ impl UnrealCacheAsync {
         peer: &Peer,
         arena: &Arena,
         path: &Path,
-        mtime: SystemTime,
+        mtime: &UnixTime,
     ) -> Result<(), UnrealError> {
         let peer = peer.clone();
         let arena = arena.clone();
         let path = path.clone();
+        let mtime = mtime.clone();
         let inner = Arc::clone(&self.inner);
 
-        Ok(task::spawn_blocking(move || inner.unlink(&peer, &arena, &path, mtime)).await??)
+        Ok(task::spawn_blocking(move || inner.unlink(&peer, &arena, &path, &mtime)).await??)
     }
 
     /// Async version of [BlockingUnrealCache::catchup]
@@ -98,15 +100,16 @@ impl UnrealCacheAsync {
         arena: &Arena,
         path: &Path,
         size: u64,
-        mtime: SystemTime,
+        mtime: &UnixTime,
     ) -> Result<(), UnrealError> {
         let peer = peer.clone();
         let arena = arena.clone();
         let path = path.clone();
+        let mtime = mtime.clone();
         let inner = Arc::clone(&self.inner);
 
         Ok(
-            task::spawn_blocking(move || inner.catchup(&peer, &arena, &path, size, mtime))
+            task::spawn_blocking(move || inner.catchup(&peer, &arena, &path, size, &mtime))
                 .await??,
         )
     }
@@ -144,7 +147,7 @@ impl UnrealCacheAsync {
         Ok(task::spawn_blocking(move || inner.file_availability(inode)).await??)
     }
 
-    pub async fn dir_mtime(&self, inode: u64) -> Result<SystemTime, UnrealError> {
+    pub async fn dir_mtime(&self, inode: u64) -> Result<UnixTime, UnrealError> {
         let inner = Arc::clone(&self.inner);
 
         Ok(task::spawn_blocking(move || inner.dir_mtime(inode)).await??)

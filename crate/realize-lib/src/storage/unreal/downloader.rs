@@ -352,7 +352,7 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
     use crate::{
-        model::{Arena, Path},
+        model::{Arena, Path, UnixTime},
         network::{self, hostport::HostPort, security, Server},
         storage::{real::LocalStorage, unreal},
     };
@@ -408,7 +408,7 @@ mod tests {
                     &self.arena,
                     &path,
                     metadata.len(),
-                    metadata.modified()?,
+                    &UnixTime::from_system_time(metadata.modified()?)?,
                 )
                 .await?;
             let (inode, _) = self

@@ -18,16 +18,16 @@ pub async fn keep_cache_updated(
                 path,
                 size,
                 mtime,
-            } => cache.catchup(&peer, arena, path, *size, *mtime).await,
+            } => cache.catchup(&peer, arena, path, *size, mtime).await,
             Notification::Ready { arena } => cache.delete_marked_files(&peer, arena).await,
             Notification::Link {
                 arena,
                 path,
                 size,
                 mtime,
-            } => cache.link(&peer, arena, path, *size, *mtime).await,
+            } => cache.link(&peer, arena, path, *size, mtime).await,
             Notification::Unlink { arena, path, mtime } => {
-                cache.unlink(&peer, arena, path, *mtime).await
+                cache.unlink(&peer, arena, path, mtime).await
             }
         } {
             log::warn!(

@@ -1,6 +1,11 @@
-use crate::model::{self};
+use crate::model::{self, UnixTime};
 use crate::utils::holder::{ByteConversionError, ByteConvertible, NamedType};
-use std::time::SystemTime;
+pub use downloader::Download;
+pub use downloader::Downloader;
+pub use error::UnrealError;
+pub use future::UnrealCacheAsync;
+pub use sync::UnrealCacheBlocking;
+pub use updater::keep_cache_updated;
 
 mod downloader;
 mod error;
@@ -12,13 +17,6 @@ mod updater;
 mod unreal_capnp {
     include!(concat!(env!("OUT_DIR"), "/unreal_capnp.rs"));
 }
-
-pub use downloader::Download;
-pub use downloader::Downloader;
-pub use error::UnrealError;
-pub use future::UnrealCacheAsync;
-pub use sync::UnrealCacheBlocking;
-pub use updater::keep_cache_updated;
 
 /// Inode of the root dir.
 pub const ROOT_DIR: u64 = 1;
@@ -104,13 +102,15 @@ pub struct FileMetadata {
     /// The size of the file in bytes.
     pub size: u64,
     /// The modification time of the file.
-    pub mtime: SystemTime,
+    ///
+    /// This is the duration since the start of the UNIX epoch.
+    pub mtime: UnixTime,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 enum DirTableEntry {
     Regular(ReadDirEntry),
-    Dot(SystemTime),
+    Dot(UnixTime),
 }
 impl DirTableEntry {
     fn as_readdir_entry(self, inode: u64) -> ReadDirEntry {

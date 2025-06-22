@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
     str::Utf8Error,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use moka::future::Cache;
@@ -16,8 +16,11 @@ use nfsserve::{
     vfs::{NFSFileSystem, ReadDirResult, VFSCapabilities},
 };
 
-use crate::storage::unreal::{
-    self, Download, Downloader, FileMetadata, InodeAssignment, UnrealCacheAsync, UnrealError,
+use crate::{
+    model::UnixTime,
+    storage::unreal::{
+        self, Download, Downloader, FileMetadata, InodeAssignment, UnrealCacheAsync, UnrealError,
+    },
 };
 use async_trait::async_trait;
 use tokio::{
@@ -111,7 +114,7 @@ impl UnrealFs {
                 name: name.as_bytes().into(),
                 attr: match entry.assignment {
                     InodeAssignment::Directory => {
-                        self.build_dir_attr(entry.inode, self.cache.dir_mtime(entry.inode).await?)
+                        self.build_dir_attr(entry.inode, &self.cache.dir_mtime(entry.inode).await?)
                     }
                     InodeAssignment::File => self.build_file_attr(
                         entry.inode,
@@ -132,13 +135,13 @@ impl UnrealFs {
         let (file_metadata, dir_mtime) =
             tokio::join!(self.cache.file_metadata(id), self.cache.dir_mtime(id));
         if let Ok(mtime) = dir_mtime {
-            return Ok(self.build_dir_attr(id, mtime));
+            return Ok(self.build_dir_attr(id, &mtime));
         }
         return Ok(self.build_file_attr(id, &file_metadata?));
     }
 
     fn build_file_attr(&self, inode: u64, metadata: &FileMetadata) -> fattr3 {
-        let mtime = system_to_nfs_time(metadata.mtime);
+        let mtime = to_nfs_time(&metadata.mtime);
 
         fattr3 {
             ftype: ftype3::NF3REG,
@@ -157,8 +160,8 @@ impl UnrealFs {
         }
     }
 
-    fn build_dir_attr(&self, inode: u64, mtime: SystemTime) -> fattr3 {
-        let mtime = system_to_nfs_time(mtime);
+    fn build_dir_attr(&self, inode: u64, mtime: &UnixTime) -> fattr3 {
+        let mtime = to_nfs_time(mtime);
         fattr3 {
             ftype: ftype3::NF3DIR,
             mode: 0o0550,
@@ -343,18 +346,17 @@ fn io_to_nfsstat3(err: &std::io::Error) -> nfsstat3 {
     }
 }
 
-fn system_to_nfs_time(t: SystemTime) -> nfstime3 {
-    let epoch_time = t
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO);
+fn to_nfs_time(time: &UnixTime) -> nfstime3 {
     nfstime3 {
-        seconds: epoch_time.as_secs() as u32,
-        nseconds: epoch_time.subsec_nanos(),
+        seconds: time.as_secs() as u32,
+        nseconds: time.subsec_nanos(),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use crate::{
         model::{Arena, Path},
         network::{self, hostport::HostPort, rpc::realstore, security, Server},
@@ -448,7 +450,7 @@ mod tests {
         let fixture = Fixture::setup().await?;
         let fs = &fixture.fs;
 
-        let mtime = SystemTime::now();
+        let mtime = UnixTime::now();
         fixture
             .cache
             .link(
@@ -456,7 +458,7 @@ mod tests {
                 &fixture.arena,
                 &Path::parse("somefile.txt")?,
                 5,
-                mtime,
+                &mtime,
             )
             .await?;
 
@@ -473,9 +475,8 @@ mod tests {
         assert_eq!(5, attrs.size);
         assert_eq!(5, attrs.used);
 
-        let mtime_unix = mtime.duration_since(SystemTime::UNIX_EPOCH)?;
         assert_eq!(
-            (mtime_unix.as_secs(), mtime_unix.subsec_nanos()),
+            (mtime.as_secs(), mtime.subsec_nanos()),
             (attrs.mtime.seconds as u64, attrs.mtime.nseconds)
         );
 
@@ -498,7 +499,7 @@ mod tests {
                 &fixture.arena,
                 &Path::parse("hello.txt")?,
                 m.len(),
-                m.modified()?,
+                &UnixTime::from_system_time(m.modified()?)?,
             )
             .await?;
 

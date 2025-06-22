@@ -6,13 +6,12 @@ use super::{
     DirTableEntry, FileMetadata, FileTableEntry, InodeAssignment, ReadDirEntry, UnrealCacheAsync,
     UnrealError, ROOT_DIR,
 };
-use crate::model::{Arena, Path, Peer};
+use crate::model::{Arena, Path, Peer, UnixTime};
 use crate::storage::unreal::FileContent;
 use crate::utils::holder::Holder;
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
 use std::collections::HashMap;
 use std::path;
-use std::time::SystemTime;
 
 /// Maps arena to their root directory inode.
 ///
@@ -159,7 +158,7 @@ impl UnrealCacheBlocking {
         arena: &Arena,
         path: &Path,
         size: u64,
-        mtime: SystemTime,
+        mtime: &UnixTime,
     ) -> Result<(), UnrealError> {
         let txn = self.db.begin_write()?;
         let inode = do_link(
@@ -183,7 +182,7 @@ impl UnrealCacheBlocking {
         arena: &Arena,
         path: &Path,
         size: u64,
-        mtime: SystemTime,
+        mtime: &UnixTime,
     ) -> Result<(), UnrealError> {
         let txn = self.db.begin_write()?;
         do_link(
@@ -205,10 +204,10 @@ impl UnrealCacheBlocking {
         peer: &Peer,
         arena: &Arena,
         path: &Path,
-        mtime: SystemTime,
+        mtime: &UnixTime,
     ) -> Result<(), UnrealError> {
         let txn = self.db.begin_write()?;
-        do_unlink(&txn, peer, self.arena_root(arena)?, path, mtime)?;
+        do_unlink(&txn, peer, self.arena_root(arena)?, path, &mtime)?;
         txn.commit()?;
         Ok(())
     }
@@ -249,7 +248,7 @@ impl UnrealCacheBlocking {
     }
 
     /// Return the mtime of the directory.
-    pub fn dir_mtime(&self, inode: u64) -> Result<SystemTime, UnrealError> {
+    pub fn dir_mtime(&self, inode: u64) -> Result<UnixTime, UnrealError> {
         let txn = self.db.begin_read()?;
 
         do_dir_mtime(&txn, inode)
@@ -305,7 +304,7 @@ impl UnrealCacheBlocking {
     }
 }
 
-fn do_dir_mtime(txn: &ReadTransaction, inode: u64) -> Result<SystemTime, UnrealError> {
+fn do_dir_mtime(txn: &ReadTransaction, inode: u64) -> Result<UnixTime, UnrealError> {
     let dir_table = txn.open_table(DIRECTORY_TABLE)?;
     match dir_table.get((inode, "."))? {
         Some(e) => {
@@ -317,7 +316,7 @@ fn do_dir_mtime(txn: &ReadTransaction, inode: u64) -> Result<SystemTime, UnrealE
             if inode == ROOT_DIR {
                 // When the filesystem is empty, the root dir might not
                 // have a mtime. This is not an error.
-                return Ok(SystemTime::UNIX_EPOCH);
+                return Ok(UnixTime::ZERO);
             }
         }
     }
@@ -382,7 +381,7 @@ fn do_unlink(
     peer: &Peer,
     arena_root: u64,
     path: &Path,
-    mtime: SystemTime,
+    mtime: &UnixTime,
 ) -> Result<(), UnrealError> {
     let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
     let (parent_inode, parent_assignment) = do_lookup_path(&dir_table, arena_root, &path.parent())?;
@@ -436,7 +435,7 @@ fn do_file_availability(
         all.push((peer, file_entry));
     }
 
-    if let Some(best_mtime) = all.iter().map(|(_, e)| e.metadata.mtime).max() {
+    if let Some(best_mtime) = all.iter().map(|(_, e)| e.metadata.mtime.clone()).max() {
         all.retain(|(_, e)| e.metadata.mtime == best_mtime);
     }
 
@@ -453,7 +452,7 @@ fn do_link(
     arena_root: u64,
     path: &Path,
     size: u64,
-    mtime: SystemTime,
+    mtime: &UnixTime,
 ) -> Result<u64, UnrealError> {
     let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
     let mut file_table = txn.open_table(FILE_TABLE)?;
@@ -471,7 +470,7 @@ fn do_link(
         )?,
         Some(dir_entry) => {
             if let Some(existing) = get_file_entry(&file_table, dir_entry.inode, peer)? {
-                if existing.metadata.mtime > mtime {
+                if existing.metadata.mtime > *mtime {
                     return Ok(dir_entry.inode);
                 }
             }
@@ -483,7 +482,10 @@ fn do_link(
     file_table.insert(
         (inode, peer.as_str()),
         Holder::new(FileTableEntry {
-            metadata: FileMetadata { size, mtime },
+            metadata: FileMetadata {
+                size,
+                mtime: mtime.clone(),
+            },
             content: FileContent {
                 arena: arena.clone(),
                 path: path.clone(),
@@ -579,7 +581,7 @@ fn add_dir_entry(
             assignment,
         }))?,
     )?;
-    let mtime = SystemTime::now();
+    let mtime = UnixTime::now();
     let dot = Holder::new(DirTableEntry::Dot(mtime))?;
     dir_table.insert((parent_inode, "."), dot.clone())?;
     if assignment == InodeAssignment::Directory {
@@ -674,7 +676,7 @@ fn do_rm_file_entry(
     parent_inode: u64,
     inode: u64,
     peer: &Peer,
-    mtime: Option<SystemTime>,
+    mtime: Option<&UnixTime>,
 ) -> Result<(), UnrealError> {
     let mut range_size = 0;
     let mut delete = false;
@@ -689,7 +691,7 @@ fn do_rm_file_entry(
             None => delete = true,
             Some(mtime) => {
                 let m = elt.1.value().parse()?.metadata.mtime;
-                if m <= mtime {
+                if m <= *mtime {
                     delete = true;
                 }
             }
@@ -709,7 +711,7 @@ fn do_rm_file_entry(
         })?;
         dir_table.insert(
             (parent_inode, "."),
-            Holder::new(DirTableEntry::Dot(SystemTime::now()))?,
+            Holder::new(DirTableEntry::Dot(UnixTime::now()))?,
         )?;
     }
 
@@ -721,7 +723,8 @@ mod tests {
     use super::*;
     use crate::model::{Arena, Path, Peer};
     use assert_fs::TempDir;
-    use std::time::{Duration, SystemTime};
+
+    const TEST_TIME: u64 = 1234567890;
 
     fn test_peer() -> Peer {
         Peer::from("test_peer")
@@ -729,6 +732,18 @@ mod tests {
 
     fn test_arena() -> Arena {
         Arena::from("test_arena")
+    }
+
+    fn test_time() -> UnixTime {
+        UnixTime::from_secs(TEST_TIME)
+    }
+
+    fn later_time() -> UnixTime {
+        UnixTime::from_secs(TEST_TIME + 1)
+    }
+
+    fn earlier_time() -> UnixTime {
+        UnixTime::from_secs(TEST_TIME - 1)
     }
 
     struct Fixture {
@@ -749,7 +764,7 @@ mod tests {
             })
         }
 
-        fn parent_dir_mtime(&self, arena: &Arena, path: &Path) -> anyhow::Result<SystemTime> {
+        fn parent_dir_mtime(&self, arena: &Arena, path: &Path) -> anyhow::Result<UnixTime> {
             let arena_root = self.cache.arena_root(arena).expect("arena was added");
             match path.parent() {
                 None => Ok(self.cache.dir_mtime(arena_root)?),
@@ -780,9 +795,9 @@ mod tests {
         let peer = test_peer();
         let arena = test_arena();
         let file_path = Path::parse("a/b/c.txt")?;
-        let mtime = SystemTime::now();
+        let mtime = test_time();
 
-        cache.link(&peer, &arena, &file_path, 100, mtime)?;
+        cache.link(&peer, &arena, &file_path, 100, &mtime)?;
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
@@ -815,13 +830,13 @@ mod tests {
         let cache = &fixture.cache;
         let peer = test_peer();
         let arena = test_arena();
-        let mtime = SystemTime::now();
+        let mtime = test_time();
         let path1 = Path::parse("a/b/1.txt")?;
-        cache.link(&peer, &arena, &path1, 100, mtime)?;
+        cache.link(&peer, &arena, &path1, 100, &mtime)?;
         let dir_mtime = fixture.parent_dir_mtime(&arena, &path1)?;
 
         let path2 = Path::parse("a/b/2.txt")?;
-        cache.link(&peer, &arena, &path2, 100, mtime)?;
+        cache.link(&peer, &arena, &path2, 100, &mtime)?;
 
         assert!(fixture.parent_dir_mtime(&arena, &path2)? > dir_mtime);
         Ok(())
@@ -834,11 +849,11 @@ mod tests {
         let peer = test_peer();
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
-        let old_mtime = SystemTime::now();
-        let new_mtime = old_mtime + Duration::from_secs(1);
+        let old_mtime = test_time();
+        let new_mtime = later_time();
 
-        cache.link(&peer, &arena, &file_path, 100, old_mtime)?;
-        cache.link(&peer, &arena, &file_path, 200, new_mtime)?;
+        cache.link(&peer, &arena, &file_path, 100, &old_mtime)?;
+        cache.link(&peer, &arena, &file_path, 200, &new_mtime)?;
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
@@ -872,11 +887,11 @@ mod tests {
         let peer = test_peer();
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
-        let new_mtime = SystemTime::now();
-        let old_mtime = new_mtime - Duration::from_secs(1);
+        let new_mtime = test_time();
+        let old_mtime = earlier_time();
 
-        cache.link(&peer, &arena, &file_path, 100, new_mtime)?;
-        cache.link(&peer, &arena, &file_path, 200, old_mtime)?;
+        cache.link(&peer, &arena, &file_path, 100, &new_mtime)?;
+        cache.link(&peer, &arena, &file_path, 200, &old_mtime)?;
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
@@ -910,10 +925,10 @@ mod tests {
         let peer = test_peer();
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
-        let mtime = SystemTime::now();
+        let mtime = test_time();
 
-        cache.link(&peer, &arena, &file_path, 100, mtime)?;
-        cache.unlink(&peer, &arena, &file_path, mtime + Duration::from_secs(1))?;
+        cache.link(&peer, &arena, &file_path, 100, &mtime)?;
+        cache.unlink(&peer, &arena, &file_path, &later_time())?;
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
@@ -929,11 +944,11 @@ mod tests {
         let peer = test_peer();
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
-        let mtime = SystemTime::now();
+        let mtime = test_time();
 
-        cache.link(&peer, &arena, &file_path, 100, mtime)?;
+        cache.link(&peer, &arena, &file_path, 100, &mtime)?;
         let dir_mtime = fixture.parent_dir_mtime(&arena, &file_path)?;
-        cache.unlink(&peer, &arena, &file_path, mtime + Duration::from_secs(1))?;
+        cache.unlink(&peer, &arena, &file_path, &later_time())?;
 
         assert!(fixture.parent_dir_mtime(&arena, &file_path)? > dir_mtime);
 
@@ -947,10 +962,10 @@ mod tests {
         let peer = test_peer();
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
-        let mtime = SystemTime::now();
+        let mtime = test_time();
 
-        cache.link(&peer, &arena, &file_path, 100, mtime)?;
-        cache.unlink(&peer, &arena, &file_path, mtime - Duration::from_secs(1))?;
+        cache.link(&peer, &arena, &file_path, 100, &mtime)?;
+        cache.unlink(&peer, &arena, &file_path, &earlier_time())?;
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
@@ -971,9 +986,9 @@ mod tests {
         let peer = test_peer();
         let arena = test_arena();
         let file_path = Path::parse("a/file.txt")?;
-        let mtime = SystemTime::now();
+        let mtime = test_time();
 
-        cache.link(&peer, &arena, &file_path, 100, mtime)?;
+        cache.link(&peer, &arena, &file_path, 100, &mtime)?;
 
         // Lookup directory
         let dir_entry = cache.lookup(cache.arena_root(&arena)?, "a")?;
@@ -1010,9 +1025,9 @@ mod tests {
         let peer = test_peer();
         let arena = test_arena();
         let path = Path::parse("a/b/c/file.txt")?;
-        let mtime = SystemTime::now();
+        let mtime = test_time();
 
-        cache.link(&peer, &arena, &path, 100, mtime)?;
+        cache.link(&peer, &arena, &path, 100, &mtime)?;
 
         let (inode, assignment) = cache.lookup_path(cache.arena_root(&arena)?, &path)?;
         assert_eq!(assignment, InodeAssignment::File);
@@ -1030,16 +1045,16 @@ mod tests {
         let cache = &fixture.cache;
         let peer = test_peer();
         let arena = test_arena();
-        let mtime = SystemTime::now();
+        let mtime = test_time();
 
-        cache.link(&peer, &arena, &Path::parse("dir/file1.txt")?, 100, mtime)?;
-        cache.link(&peer, &arena, &Path::parse("dir/file2.txt")?, 200, mtime)?;
+        cache.link(&peer, &arena, &Path::parse("dir/file1.txt")?, 100, &mtime)?;
+        cache.link(&peer, &arena, &Path::parse("dir/file2.txt")?, 200, &mtime)?;
         cache.link(
             &peer,
             &arena,
             &Path::parse("dir/subdir/file3.txt")?,
             300,
-            mtime,
+            &mtime,
         )?;
 
         assert_unordered::assert_eq_unordered!(
@@ -1088,11 +1103,11 @@ mod tests {
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
 
-        let mtime1 = SystemTime::now();
-        let mtime2 = mtime1 + Duration::from_secs(1);
+        let mtime1 = test_time();
+        let mtime2 = later_time();
 
-        cache.link(&peer1, &arena, &file_path, 100, mtime1)?;
-        cache.link(&peer2, &arena, &file_path, 200, mtime2)?;
+        cache.link(&peer1, &arena, &file_path, 100, &mtime1)?;
+        cache.link(&peer2, &arena, &file_path, 200, &mtime2)?;
 
         let file_entry = cache.lookup(cache.arena_root(&arena)?, "file.txt")?;
         let metadata = cache.file_metadata(file_entry.inode)?;
@@ -1113,12 +1128,12 @@ mod tests {
         let arena = test_arena();
         let path = Path::parse("file.txt")?;
 
-        let mtime1 = SystemTime::now();
-        let mtime2 = mtime1 + Duration::from_secs(1);
+        let mtime1 = test_time();
+        let mtime2 = later_time();
 
-        cache.link(&a, &arena, &path, 100, mtime1)?;
-        cache.link(&b, &arena, &path, 200, mtime2)?;
-        cache.link(&c, &arena, &path, 200, mtime2)?;
+        cache.link(&a, &arena, &path, 100, &mtime1)?;
+        cache.link(&b, &arena, &path, 200, &mtime2)?;
+        cache.link(&c, &arena, &path, 200, &mtime2)?;
 
         let parent_inode = cache.arena_root(&arena)?;
         let inode = cache.lookup(parent_inode, "file.txt")?.inode;
@@ -1134,7 +1149,7 @@ mod tests {
                         },
                         metadata: FileMetadata {
                             size: 200,
-                            mtime: mtime2,
+                            mtime: mtime2.clone(),
                         },
                         parent_inode
                     }
@@ -1148,7 +1163,7 @@ mod tests {
                         },
                         metadata: FileMetadata {
                             size: 200,
-                            mtime: mtime2,
+                            mtime: mtime2.clone(),
                         },
                         parent_inode
                     }
@@ -1173,26 +1188,26 @@ mod tests {
         let file3 = Path::parse("file3")?;
         let file4 = Path::parse("file4")?;
 
-        let mtime = SystemTime::now();
+        let mtime = test_time();
 
-        cache.link(&peer1, &arena, &file1, 10, mtime)?;
+        cache.link(&peer1, &arena, &file1, 10, &mtime)?;
 
-        cache.link(&peer1, &arena, &file2, 10, mtime)?;
-        cache.link(&peer2, &arena, &file2, 10, mtime)?;
+        cache.link(&peer1, &arena, &file2, 10, &mtime)?;
+        cache.link(&peer2, &arena, &file2, 10, &mtime)?;
 
-        cache.link(&peer1, &arena, &file1, 10, mtime)?;
-        cache.link(&peer2, &arena, &file2, 10, mtime)?;
-        cache.link(&peer3, &arena, &file3, 10, mtime)?;
+        cache.link(&peer1, &arena, &file1, 10, &mtime)?;
+        cache.link(&peer2, &arena, &file2, 10, &mtime)?;
+        cache.link(&peer3, &arena, &file3, 10, &mtime)?;
 
-        cache.link(&peer1, &arena, &file4, 10, mtime)?;
+        cache.link(&peer1, &arena, &file4, 10, &mtime)?;
 
         let arena_root = cache.arena_root(&arena)?;
         let file1_inode = cache.lookup(arena_root, file1.name())?.inode;
 
         // Simulate a catchup that only reports file2 and file4.
         cache.mark_peer_files(&peer1, &arena)?;
-        cache.catchup(&peer1, &arena, &file2, 10, mtime)?;
-        cache.catchup(&peer1, &arena, &file4, 10, mtime)?;
+        cache.catchup(&peer1, &arena, &file2, 10, &mtime)?;
+        cache.catchup(&peer1, &arena, &file4, 10, &mtime)?;
         cache.delete_marked_files(&peer1, &arena)?;
 
         // File1 should have been deleted, since it was only on peer1,

@@ -3,6 +3,7 @@ mod byterange;
 mod data;
 mod path;
 mod peer;
+mod time;
 
 pub use arena::Arena;
 pub use byterange::ByteRange;
@@ -13,3 +14,4 @@ pub use data::Signature;
 pub use path::Path;
 pub use path::PathError;
 pub use peer::Peer;
+pub use time::UnixTime;

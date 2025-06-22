@@ -4,7 +4,6 @@ use std::{
     io, iter,
     path::{self, PathBuf},
     sync::Arc,
-    time::SystemTime,
 };
 
 use tokio::fs;
@@ -12,7 +11,7 @@ use tokio::fs;
 #[cfg(target_os = "linux")]
 use tokio::sync::mpsc;
 
-use crate::model::{self, Arena, Path};
+use crate::model::{self, Arena, Path, UnixTime};
 
 use super::config::ArenaConfig;
 
@@ -244,7 +243,7 @@ pub enum Notification {
         arena: Arena,
         path: Path,
         size: u64,
-        mtime: SystemTime,
+        mtime: UnixTime,
     },
 
     /// Report that a file has been deleted or moved out of the given
@@ -252,7 +251,7 @@ pub enum Notification {
     Unlink {
         arena: Arena,
         path: Path,
-        mtime: SystemTime,
+        mtime: UnixTime,
     },
 
     /// Report that the area needs catching up. After that
@@ -269,7 +268,7 @@ pub enum Notification {
         arena: Arena,
         path: Path,
         size: u64,
-        mtime: SystemTime,
+        mtime: UnixTime,
     },
 
     /// Report that the arena is done catching up. After that
