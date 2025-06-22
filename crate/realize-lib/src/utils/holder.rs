@@ -116,6 +116,9 @@ pub enum ByteConversionError {
     #[error("capnp error {0}")]
     Capnp(#[from] capnp::Error),
 
+    #[error("capnp error {0}")]
+    CapnpNotInSchema(#[from] capnp::NotInSchema),
+
     #[error(transparent)]
     Path(#[from] PathError),
 

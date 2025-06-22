@@ -145,7 +145,7 @@ pub struct FileMetadata {
     pub mtime: UnixTime,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug, Clone)]
 enum DirTableEntry {
     Regular(ReadDirEntry),
     Dot(UnixTime),
@@ -170,11 +170,57 @@ impl NamedType for DirTableEntry {
 
 impl ByteConvertible<DirTableEntry> for DirTableEntry {
     fn from_bytes(data: &[u8]) -> Result<DirTableEntry, ByteConversionError> {
-        Ok(bincode::deserialize::<DirTableEntry>(data)?)
+        let message_reader = serialize_packed::read_message(&mut &data[..], ReaderOptions::new())?;
+        let msg: unreal_capnp::dir_table_entry::Reader =
+            message_reader.get_root::<unreal_capnp::dir_table_entry::Reader>()?;
+
+        match msg.which()? {
+            unreal_capnp::dir_table_entry::Regular(entry) => {
+                let entry = entry?;
+                Ok(DirTableEntry::Regular(ReadDirEntry {
+                    inode: entry.get_inode(),
+                    assignment: match entry.get_assignment()? {
+                        unreal_capnp::InodeAssignment::File => InodeAssignment::File,
+                        unreal_capnp::InodeAssignment::Directory => InodeAssignment::Directory,
+                    },
+                }))
+            }
+            unreal_capnp::dir_table_entry::Dot(group) => {
+                let mtime = group.get_mtime()?;
+
+                Ok(DirTableEntry::Dot(UnixTime::new(
+                    mtime.get_secs(),
+                    mtime.get_nsecs(),
+                )))
+            }
+        }
     }
 
     fn to_bytes(self) -> Result<Vec<u8>, ByteConversionError> {
-        Ok(bincode::serialize(&self)?)
+        let mut message = ::capnp::message::Builder::new_default();
+        let builder: unreal_capnp::dir_table_entry::Builder =
+            message.init_root::<unreal_capnp::dir_table_entry::Builder>();
+
+        match self {
+            DirTableEntry::Regular(entry) => {
+                let mut builder = builder.init_regular();
+                builder.set_inode(entry.inode);
+                builder.set_assignment(match entry.assignment {
+                    InodeAssignment::Directory => unreal_capnp::InodeAssignment::Directory,
+                    InodeAssignment::File => unreal_capnp::InodeAssignment::File,
+                })
+            }
+            DirTableEntry::Dot(mtime) => {
+                let mut builder = builder.init_dot().init_mtime();
+                builder.set_secs(mtime.as_secs());
+                builder.set_nsecs(mtime.subsec_nanos())
+            }
+        }
+
+        let mut buffer: Vec<u8> = Vec::new();
+        serialize_packed::write_message(&mut buffer, &message)?;
+
+        Ok(buffer)
     }
 }
 
@@ -199,6 +245,35 @@ mod tests {
         assert_eq!(
             entry,
             FileTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn convert_dir_table_entry() -> anyhow::Result<()> {
+        let dot = DirTableEntry::Dot(UnixTime::from_secs(1234567890));
+        assert_eq!(
+            dot,
+            DirTableEntry::from_bytes(dot.clone().to_bytes()?.as_slice())?
+        );
+
+        let regular_dir = DirTableEntry::Regular(ReadDirEntry {
+            inode: 1234,
+            assignment: InodeAssignment::Directory,
+        });
+        assert_eq!(
+            regular_dir,
+            DirTableEntry::from_bytes(regular_dir.clone().to_bytes()?.as_slice())?
+        );
+
+        let regular_file = DirTableEntry::Regular(ReadDirEntry {
+            inode: 1234,
+            assignment: InodeAssignment::Directory,
+        });
+        assert_eq!(
+            regular_file,
+            DirTableEntry::from_bytes(regular_file.clone().to_bytes()?.as_slice())?
         );
 
         Ok(())
