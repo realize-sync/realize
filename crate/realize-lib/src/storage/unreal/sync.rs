@@ -3,10 +3,11 @@
 //! See `spec/unreal.md` for details.
 
 use super::{
-    DirTableEntry, FileEntry, FileMetadata, Holder, InodeAssignment, ReadDirEntry,
-    UnrealCacheAsync, UnrealError, ROOT_DIR,
+    DirTableEntry, FileEntry, FileMetadata, InodeAssignment, ReadDirEntry, UnrealCacheAsync,
+    UnrealError, ROOT_DIR,
 };
 use crate::model::{Arena, Path, Peer};
+use crate::utils::holder::Holder;
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
 use std::collections::HashMap;
 use std::path;

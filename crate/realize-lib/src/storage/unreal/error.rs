@@ -1,6 +1,6 @@
 use tokio::task::JoinError;
 
-use crate::model::Arena;
+use crate::{model::Arena, utils::holder::ByteConversionError};
 
 /// Error returned by the [UnrealCache].
 ///
@@ -15,7 +15,7 @@ pub enum UnrealError {
     Io(#[from] std::io::Error),
 
     #[error("bincode error {0}")]
-    Bincode(#[from] Box<bincode::ErrorKind>),
+    ByteConversion(#[from] ByteConversionError),
 
     #[error{"data not available at this time"}]
     Unavailable,
