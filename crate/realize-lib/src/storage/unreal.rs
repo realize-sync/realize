@@ -78,7 +78,7 @@ pub struct FileContent {
 
 impl std::fmt::Debug for FileContent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", self.arena, self.path)
+        write!(f, "[{}]/{}", self.arena, self.path)
     }
 }
 
