@@ -8,7 +8,7 @@ use crate::{
 };
 
 use super::{
-    FileEntry, FileMetadata, InodeAssignment, ReadDirEntry, UnrealCacheBlocking, UnrealError,
+    FileMetadata, FileTableEntry, InodeAssignment, ReadDirEntry, UnrealCacheBlocking, UnrealError,
 };
 
 #[derive(Clone)]
@@ -138,7 +138,7 @@ impl UnrealCacheAsync {
     pub async fn file_availability(
         &self,
         inode: u64,
-    ) -> Result<Vec<(Peer, FileEntry)>, UnrealError> {
+    ) -> Result<Vec<(Peer, FileTableEntry)>, UnrealError> {
         let inner = Arc::clone(&self.inner);
 
         Ok(task::spawn_blocking(move || inner.file_availability(inode)).await??)

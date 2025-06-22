@@ -3,10 +3,11 @@
 //! See `spec/unreal.md` for details.
 
 use super::{
-    DirTableEntry, FileEntry, FileMetadata, InodeAssignment, ReadDirEntry, UnrealCacheAsync,
+    DirTableEntry, FileMetadata, FileTableEntry, InodeAssignment, ReadDirEntry, UnrealCacheAsync,
     UnrealError, ROOT_DIR,
 };
 use crate::model::{Arena, Path, Peer};
+use crate::storage::unreal::FileContent;
 use crate::utils::holder::Holder;
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
 use std::collections::HashMap;
@@ -48,7 +49,8 @@ const DIRECTORY_TABLE: TableDefinition<(u64, &str), Holder<DirTableEntry>> =
 ///
 /// Key: (inode, peer)
 /// Value: FileEntry
-const FILE_TABLE: TableDefinition<(u64, &str), Holder<FileEntry>> = TableDefinition::new("file");
+const FILE_TABLE: TableDefinition<(u64, &str), Holder<FileTableEntry>> =
+    TableDefinition::new("file");
 
 /// Track max inode.
 ///
@@ -256,7 +258,10 @@ impl UnrealCacheBlocking {
     /// Return valid peer file entries for the file.
     ///
     /// The returned vector might be empty if the file isn't available in any peer.
-    pub fn file_availability(&self, inode: u64) -> Result<Vec<(Peer, FileEntry)>, UnrealError> {
+    pub fn file_availability(
+        &self,
+        inode: u64,
+    ) -> Result<Vec<(Peer, FileTableEntry)>, UnrealError> {
         let txn = self.db.begin_read()?;
 
         do_file_availability(&txn, inode)
@@ -407,10 +412,10 @@ fn do_unlink(
 
 /// Get a [FileEntry] for a specific peer.
 fn get_file_entry(
-    file_table: &redb::Table<'_, (u64, &str), Holder<FileEntry>>,
+    file_table: &redb::Table<'_, (u64, &str), Holder<FileTableEntry>>,
     inode: u64,
     peer: &Peer,
-) -> Result<Option<FileEntry>, UnrealError> {
+) -> Result<Option<FileTableEntry>, UnrealError> {
     match file_table.get((inode, peer.as_str()))? {
         None => Ok(None),
         Some(e) => Ok(Some(e.value().parse()?)),
@@ -420,14 +425,14 @@ fn get_file_entry(
 fn do_file_availability(
     txn: &ReadTransaction,
     inode: u64,
-) -> Result<Vec<(Peer, FileEntry)>, UnrealError> {
+) -> Result<Vec<(Peer, FileTableEntry)>, UnrealError> {
     let file_table = txn.open_table(FILE_TABLE)?;
 
     let mut all = vec![];
     for entry in file_table.range((inode, "")..(inode + 1, ""))? {
         let entry = entry?;
         let peer = Peer::from(entry.0.value().1);
-        let file_entry: FileEntry = entry.1.value().parse()?;
+        let file_entry: FileTableEntry = entry.1.value().parse()?;
         all.push((peer, file_entry));
     }
 
@@ -477,10 +482,12 @@ fn do_link(
     log::debug!("new file entry ({inode} {peer})");
     file_table.insert(
         (inode, peer.as_str()),
-        Holder::new(FileEntry {
-            arena: arena.clone(),
-            path: path.clone(),
+        Holder::new(FileTableEntry {
             metadata: FileMetadata { size, mtime },
+            content: FileContent {
+                arena: arena.clone(),
+                path: path.clone(),
+            },
             parent_inode,
         })?,
     )?;
@@ -610,7 +617,7 @@ fn do_mark_peer_files(
             continue;
         }
         let v = v.value().parse()?;
-        if v.arena != *arena {
+        if v.content.arena != *arena {
             continue;
         }
         let inode = k.0;
@@ -662,7 +669,7 @@ fn do_delete_marked_files(
 }
 
 fn do_rm_file_entry(
-    file_table: &mut redb::Table<'_, (u64, &str), Holder<FileEntry>>,
+    file_table: &mut redb::Table<'_, (u64, &str), Holder<FileTableEntry>>,
     dir_table: &mut redb::Table<'_, (u64, &str), Holder<DirTableEntry>>,
     parent_inode: u64,
     inode: u64,
@@ -1120,9 +1127,11 @@ mod tests {
             vec![
                 (
                     b.clone(),
-                    FileEntry {
-                        arena: arena.clone(),
-                        path: path.clone(),
+                    FileTableEntry {
+                        content: FileContent {
+                            arena: arena.clone(),
+                            path: path.clone(),
+                        },
                         metadata: FileMetadata {
                             size: 200,
                             mtime: mtime2,
@@ -1132,9 +1141,11 @@ mod tests {
                 ),
                 (
                     c.clone(),
-                    FileEntry {
-                        arena: arena.clone(),
-                        path: path.clone(),
+                    FileTableEntry {
+                        content: FileContent {
+                            arena: arena.clone(),
+                            path: path.clone(),
+                        },
                         metadata: FileMetadata {
                             size: 200,
                             mtime: mtime2,

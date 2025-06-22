@@ -46,12 +46,24 @@ pub enum InodeAssignment {
 
 /// An entry in the file table.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct FileEntry {
+pub struct FileTableEntry {
+    /// The metadata of the file.
+    pub metadata: FileMetadata,
+    /// How the file can be fetched from the peer.
+    pub content: FileContent,
+
+    /// Inode of the containing directory
+    parent_inode: u64,
+}
+
+/// Information needed to fetch a file from a remote peer.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FileContent {
     /// The arena to use to fetch file content in the peer.
     ///
     /// This is stored here as a key to fetch file content,
     /// to be replaced by a blob id.
-    pub arena: model::Arena,
+    arena: model::Arena,
 
     /// The path to use to fetch file content in the peer.
     ///
@@ -61,24 +73,24 @@ pub struct FileEntry {
     ///
     /// This is stored here as a key to fetch file content,
     /// to be replaced by a blob id.
-    pub path: model::Path,
-
-    /// The metadata of the file.
-    pub metadata: FileMetadata,
-
-    /// Inode of the containing directory
-    pub(crate) parent_inode: u64,
+    path: model::Path,
 }
 
-impl NamedType for FileEntry {
+impl std::fmt::Debug for FileContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.arena, self.path)
+    }
+}
+
+impl NamedType for FileTableEntry {
     fn typename() -> &'static str {
         "FileEntry"
     }
 }
 
-impl ByteConvertible<FileEntry> for FileEntry {
-    fn from_bytes(data: &[u8]) -> Result<FileEntry, ByteConversionError> {
-        Ok(bincode::deserialize::<FileEntry>(data)?)
+impl ByteConvertible<FileTableEntry> for FileTableEntry {
+    fn from_bytes(data: &[u8]) -> Result<FileTableEntry, ByteConversionError> {
+        Ok(bincode::deserialize::<FileTableEntry>(data)?)
     }
 
     fn to_bytes(self) -> Result<Vec<u8>, ByteConversionError> {

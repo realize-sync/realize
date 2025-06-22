@@ -27,7 +27,7 @@ use crate::{
     },
 };
 
-use super::{FileEntry, UnrealCacheAsync, UnrealError};
+use super::{FileTableEntry, UnrealCacheAsync, UnrealError};
 
 const MIN_CHUNK_SIZE: usize = 8 * 1024;
 const MAX_CHUNK_SIZE: usize = 32 * 1024;
@@ -63,16 +63,15 @@ impl Downloader {
 
     async fn choose(
         &self,
-        avail: Vec<(Peer, FileEntry)>,
-    ) -> Result<(Arc<RealStoreClient>, Peer, FileEntry), UnrealError> {
+        avail: Vec<(Peer, FileTableEntry)>,
+    ) -> Result<(Arc<RealStoreClient>, Peer, FileTableEntry), UnrealError> {
         for (peer, entry) in &avail {
             if let Some(client) = self.clients.get(peer).await {
                 // TODO: check if client is still connected, if no,
                 // connecting to another client would be better.
                 log::debug!(
-                    "Reusing connection to {peer} to download {}/{:?}",
-                    entry.arena,
-                    entry.path
+                    "Reusing connection to {peer} to download {:?}",
+                    entry.content,
                 );
                 return Ok((client, peer.clone(), entry.clone()));
             }
@@ -86,11 +85,7 @@ impl Downloader {
                     realstore::client::connect(&networking, &peer, ClientOptions::default())
                         .await?;
 
-                log::debug!(
-                    "Connected to {peer} to download {}/{:?}",
-                    entry.arena,
-                    entry.path
-                );
+                log::debug!("Connected to {peer} to download {:?}", entry.content);
 
                 Ok::<_, anyhow::Error>((client, peer, entry))
             });
@@ -113,7 +108,7 @@ impl Downloader {
 pub struct Download {
     client: Arc<RealStoreClient>,
     peer: Peer,
-    entry: FileEntry,
+    entry: FileTableEntry,
     offset: u64,
     pending_seek: Option<u64>,
     avail: VecDeque<(ByteRange, Vec<u8>)>,
@@ -130,7 +125,7 @@ pub struct Download {
 }
 
 impl Download {
-    fn new(client: Arc<RealStoreClient>, peer: Peer, entry: FileEntry) -> Self {
+    fn new(client: Arc<RealStoreClient>, peer: Peer, entry: FileTableEntry) -> Self {
         Self {
             client,
             peer,
@@ -154,10 +149,9 @@ impl Download {
             let intersection = requested.intersection(&range);
             if !intersection.is_empty() && intersection.start == self.offset {
                 log::debug!(
-                    "From {}, return {}/{:?} {}",
+                    "From {}, return {:?} {}",
                     self.peer,
-                    self.entry.arena,
-                    self.entry.path,
+                    self.entry.content,
                     intersection
                 );
 
@@ -211,17 +205,16 @@ impl Download {
         );
 
         log::debug!(
-            "From {}, download {}/{:?} {}",
+            "From {}, download {:?} {}",
             self.peer,
-            self.entry.arena,
-            self.entry.path,
+            self.entry.content,
             range
         );
 
         let fut = {
             let client = Arc::clone(&self.client);
-            let arena = self.entry.arena.clone();
-            let path = self.entry.path.clone();
+            let arena = self.entry.content.arena.clone();
+            let path = self.entry.content.path.clone();
             let range = range.clone();
 
             Box::pin(async move {
