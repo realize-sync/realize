@@ -110,6 +110,22 @@ impl Networking {
         Req: for<'de> serde::Deserialize<'de>,
         Resp: serde::Serialize,
     {
+        let tls_stream = self.connect_raw(peer, tag, limiter).await?;
+
+        let transport = transport::new(
+            LengthDelimitedCodec::builder().new_framed(tls_stream),
+            Bincode::default(),
+        );
+
+        Ok(transport)
+    }
+
+    pub(crate) async fn connect_raw(
+        &self,
+        peer: &Peer,
+        tag: &[u8; 4],
+        limiter: Option<Limiter>,
+    ) -> anyhow::Result<tokio_rustls::client::TlsStream<RateLimitedStream<TcpStream>>> {
         let addr = self
             .addresses
             .get(&peer)
@@ -119,6 +135,8 @@ impl Networking {
             .with_context(|| format!("address for {peer} is invalid"))?;
         let domain = ServerName::try_from(addr.host().to_string())?;
         let stream = TcpStream::connect(addr.addr()).await?;
+        stream.set_nodelay(true)?;
+
         let stream = RateLimitedStream::new(
             stream,
             limiter.unwrap_or_else(|| Limiter::<StandardClock>::new(f64::INFINITY)),
@@ -126,12 +144,7 @@ impl Networking {
         let mut tls_stream = self.connector.connect(domain, stream).await?;
         tls_stream.write_all(tag).await?;
 
-        let transport = transport::new(
-            LengthDelimitedCodec::builder().new_framed(tls_stream),
-            Bincode::default(),
-        );
-
-        Ok(transport)
+        Ok(tls_stream)
     }
 
     #[allow(dead_code)] // only on macos, without inotify support
@@ -217,10 +230,7 @@ pub struct Server {
         Box<
             dyn Fn(
                     Peer,
-                    tarpc::tokio_util::codec::Framed<
-                        tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
-                        LengthDelimitedCodec,
-                    >,
+                    tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
                     Limiter,
                     broadcast::Receiver<()>,
                 ) + Send
@@ -261,7 +271,10 @@ impl Server {
             + Sync
             + 'static,
     ) {
-        self.handlers.insert(tag, Box::new(handler));
+        self.register_raw(tag, move |peer, stream, limiter, shutdown_rx| {
+            let framed = LengthDelimitedCodec::builder().new_framed(stream);
+            handler(peer, framed, limiter, shutdown_rx);
+        });
     }
 
     /// Register a handler for a TARPC service.
@@ -281,12 +294,13 @@ impl Server {
         S: Stream<Item = F> + Send + 'static,
         F: Future<Output = ()> + Send + 'static,
     {
-        self.register(
+        self.register_raw(
             tag,
             move |peer: Peer,
-                  framed,
+                  stream,
                   limiter: Limiter,
                   mut shutdown_rx: broadcast::Receiver<()>| {
+                let framed = LengthDelimitedCodec::builder().new_framed(stream);
                 let stream = handler(&peer, limiter, framed);
 
                 tokio::spawn(async move {
@@ -312,6 +326,22 @@ impl Server {
                 });
             },
         );
+    }
+
+    /// Register a handler for the given tagged stream.
+    pub(crate) fn register_raw(
+        &mut self,
+        tag: &'static [u8; 4],
+        handler: impl Fn(
+                Peer,
+                tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
+                Limiter,
+                broadcast::Receiver<()>,
+            ) + Send
+            + Sync
+            + 'static,
+    ) {
+        self.handlers.insert(tag, Box::new(handler));
     }
 
     /// Shutdown any listener and wait for the shutdown to happen.
@@ -374,13 +404,13 @@ impl Server {
     }
 
     async fn accept(&self, stream: TcpStream) -> anyhow::Result<()> {
+        stream.set_nodelay(true)?;
+
         let shutdown_rx = self.shutdown_tx.subscribe();
         let limiter = Limiter::<StandardClock>::new(f64::INFINITY);
         let (peer, tag, mut tls_stream) = self.networking.accept(stream, limiter.clone()).await?;
         if let Some(handler) = self.handlers.get(&tag) {
-            let framed = LengthDelimitedCodec::builder().new_framed(tls_stream);
-
-            (*handler)(peer, framed, limiter, shutdown_rx);
+            (*handler)(peer, tls_stream, limiter, shutdown_rx);
         } else {
             log::info!("Got unsupported RPC service tag '{tag:?}' from {peer}");
             // We log this separately from generic errors, because

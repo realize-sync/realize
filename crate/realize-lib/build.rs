@@ -32,8 +32,8 @@ fn rpc_capnpc() -> anyhow::Result<()> {
         .src_prefix("capnp/network/rpc")
         .default_parent_module(module_name_as_vec("network::rpc"))
         .file("capnp/network/rpc/peer.capnp")
+        .file("capnp/network/rpc/store.capnp")
         .file("capnp/network/rpc/result.capnp")
-        .file("capnp/network/rpc/realstore.capnp")
         .run()?;
 
     Ok(())

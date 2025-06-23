@@ -8,8 +8,8 @@ mod peer_capnp {
 }
 
 #[allow(dead_code)]
-mod realstore_capnp {
-    include!(concat!(env!("OUT_DIR"), "/realstore_capnp.rs"));
+mod store_capnp {
+    include!(concat!(env!("OUT_DIR"), "/store_capnp.rs"));
 }
 
 #[allow(dead_code)]
@@ -17,4 +17,4 @@ mod result_capnp {
     include!(concat!(env!("OUT_DIR"), "/result_capnp.rs"));
 }
 
-pub use capnp::ConnectedPeer;
+pub use capnp::Household;
