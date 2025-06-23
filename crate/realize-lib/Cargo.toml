@@ -12,6 +12,7 @@ base64 = "0.22"
 bincode = "1.3.3"
 blake2 = "0.10.6"
 capnp = "0.21.1"
+capnp-rpc = "0.21.0"
 env_logger = "0.11"
 fast_rsync = "0.2"
 futures = "0.3"
@@ -33,6 +34,7 @@ thiserror = "2.0"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "fs", "io-util"] }
 tokio-retry = "0.3.0"
 tokio-rustls = "0.26"
+tokio-util = { version = "0.7.15", features = ["compat"] }
 walkdir = "2.5"
 
 

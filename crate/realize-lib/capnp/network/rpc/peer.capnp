@@ -1,9 +1,10 @@
 @0x8b094bf663d40cea;
 
-using import "realstore.capnp".RealStore;
+#using import "realstore.capnp".RealStore;
 
-interface Peer {
-  store @0 () -> (store: RealStore);
-
+interface ConnectedPeer {
+  ping @0 (text: Text) -> (response: Text);
+  # store @0 () -> (store: RealStore);
+  #
   # Add history publish/subscribe.
 }
