@@ -37,11 +37,11 @@ pub struct Household {
 impl Household {
     /// Spawn an new RPC thread and return th Household instance that
     /// manages it.
-    pub fn spawn(store: RealStore) -> anyhow::Result<Self> {
+    pub fn spawn(store: RealStore) -> anyhow::Result<(Self, thread::JoinHandle<()>)> {
         let (connect_tx, connect_rx) = mpsc::unbounded_channel();
-        CapnpRpcThread::new(store).spawn(connect_rx)?;
+        let handle = CapnpRpcThread::new(store).spawn(connect_rx)?;
 
-        Ok(Self { connect_tx })
+        Ok((Self { connect_tx }, handle))
     }
 
     /// Register peer connections to the given server.
@@ -84,14 +84,17 @@ impl CapnpRpcThread {
         capnp_rpc::new_client(ConnectedPeerServer::new(peer, self.store.clone()))
     }
 
-    fn spawn(self, mut rx: mpsc::UnboundedReceiver<HouseholdConnection>) -> anyhow::Result<()> {
+    fn spawn(
+        self,
+        mut rx: mpsc::UnboundedReceiver<HouseholdConnection>,
+    ) -> anyhow::Result<thread::JoinHandle<()>> {
         //let main_rt = Runtime::handle();
         let rt = runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
 
-        thread::Builder::new()
+        Ok(thread::Builder::new()
             .name("capnprpc".into())
             .spawn(move || {
                 let local = LocalSet::new();
@@ -121,12 +124,11 @@ impl CapnpRpcThread {
                         }
                     }
                     }
+                    log::debug!("finished ---");
                 });
 
                 rt.block_on(local);
-            })?;
-
-        Ok(())
+            })?)
     }
 }
 
@@ -188,7 +190,7 @@ impl store::Server for ConnectedPeerServer {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{net::SocketAddr, sync::Arc};
 
     use assert_fs::TempDir;
     use tokio::task::LocalSet;
@@ -200,51 +202,106 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
-    async fn household_listens() -> anyhow::Result<()> {
-        let _ = env_logger::try_init();
+    struct Fixture {
+        _tempdir: TempDir,
+        arena: Arena,
+        store: RealStore,
+    }
+    impl Fixture {
+        async fn setup() -> anyhow::Result<Self> {
+            let _ = env_logger::try_init();
 
-        let tempdir = TempDir::new()?;
-        let arena = Arena::from("test");
-        let store = RealStore::new(vec![(arena.clone(), tempdir.path().to_path_buf())]);
-        let household = Household::spawn(store.clone())?;
+            let tempdir = TempDir::new()?;
+            let arena = Arena::from("test");
+            let store = RealStore::new(vec![(arena.clone(), tempdir.path().to_path_buf())]);
+
+            Ok(Self {
+                _tempdir: tempdir,
+                arena,
+                store,
+            })
+        }
+    }
+
+    fn test_server(household: &Household) -> anyhow::Result<Arc<Server>> {
         let mut server = Server::new(network::testing::server_networking()?);
         household.register(&mut server);
-        let server = Arc::new(server);
+
+        Ok(Arc::new(server))
+    }
+
+    async fn connect(addr: SocketAddr) -> anyhow::Result<connected_peer::Client> {
+        let networking = network::testing::client_networking(addr)?;
+        let stream = networking
+            .connect_raw(&security::testing::server_peer(), TAG, None)
+            .await?;
+        let (r, w) = TokioAsyncReadCompatExt::compat(stream).split();
+        let net = Box::new(VatNetwork::new(
+            BufReader::new(r),
+            BufWriter::new(w),
+            Side::Client,
+            Default::default(),
+        ));
+        let mut system = RpcSystem::new(net, None);
+        let client: connected_peer::Client = system.bootstrap(Side::Server);
+        tokio::task::spawn_local(system);
+
+        Ok(client)
+    }
+
+    #[tokio::test]
+    async fn household_listens() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+
+        let (household, _) = Household::spawn(fixture.store.clone())?;
+        let server = test_server(&household)?;
         let addr = server.listen(&HostPort::localhost(0)).await?;
 
-        let networking = network::testing::client_networking(addr)?;
         LocalSet::new()
             .run_until(async move {
-                let stream = networking
-                    .connect_raw(&security::testing::server_peer(), TAG, None)
-                    .await?;
-                let (r, w) = TokioAsyncReadCompatExt::compat(stream).split();
-                let net = Box::new(VatNetwork::new(
-                    BufReader::new(r),
-                    BufWriter::new(w),
-                    Side::Client,
-                    Default::default(),
-                ));
-                let mut system = RpcSystem::new(net, None);
-                let client: connected_peer::Client = system.bootstrap(Side::Server);
-                tokio::task::spawn_local(system);
+                let client = connect(addr).await?;
 
                 let request = client.store_request();
-
                 let reply = request.send().promise.await?;
-
                 let store = reply.get()?.get_store()?;
 
                 let request = store.arenas_request();
                 let reply = request.send().promise.await?;
                 let arenas = reply.get()?.get_arenas()?;
                 assert_eq!(1, arenas.len());
-                assert_eq!(arena.as_str(), arenas.get(0)?.to_str()?);
+                assert_eq!(fixture.arena.as_str(), arenas.get(0)?.to_str()?);
 
                 Ok::<(), anyhow::Error>(())
             })
             .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn capnprpc_thread_shutdown() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+
+        let (household, thread_join) = Household::spawn(fixture.store.clone())?;
+        let server = test_server(&household)?;
+        let addr = server.listen(&HostPort::localhost(0)).await?;
+
+        LocalSet::new()
+            .run_until(async move {
+                let client = connect(addr).await?;
+                let request = client.store_request();
+                let reply = request.send().promise.await?;
+                assert!(reply.get()?.has_store());
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        // The thread shuts down once the channel is unused.
+        server.shutdown().await?;
+        drop(server);
+        drop(household);
+        assert!(thread_join.join().is_ok());
 
         Ok(())
     }
