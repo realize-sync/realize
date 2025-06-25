@@ -92,6 +92,11 @@ impl Networking {
         }
     }
 
+    /// Set of peers that have a known address.
+    pub fn connectable_peers(&self) -> impl Iterator<Item = &Peer> {
+        self.addresses.keys()
+    }
+
     pub(crate) async fn connect<Req, Resp>(
         &self,
         peer: &Peer,
@@ -153,7 +158,7 @@ impl Networking {
         peer: &Peer,
         tag: &[u8; 4],
         limiter: Option<Limiter>,
-        mut retry_strategy: impl Iterator<Item = Duration>,
+        retry_strategy: impl Iterator<Item = Duration>,
         deadline: Option<Instant>,
     ) -> Result<
         transport::Transport<
@@ -168,10 +173,29 @@ impl Networking {
         Req: for<'de> serde::Deserialize<'de>,
         Resp: serde::Serialize,
     {
+        let tls_stream = self
+            .connect_with_retries_raw(peer, tag, limiter, retry_strategy, deadline)
+            .await?;
+        let transport = transport::new(
+            LengthDelimitedCodec::builder().new_framed(tls_stream),
+            Bincode::default(),
+        );
+
+        Ok(transport)
+    }
+
+    pub(crate) async fn connect_with_retries_raw(
+        &self,
+        peer: &Peer,
+        tag: &[u8; 4],
+        limiter: Option<Limiter>,
+        mut retry_strategy: impl Iterator<Item = Duration>,
+        deadline: Option<Instant>,
+    ) -> Result<tokio_rustls::client::TlsStream<RateLimitedStream<TcpStream>>, anyhow::Error> {
         loop {
-            match self.connect(peer, tag, limiter.clone()).await {
-                Ok(transport) => {
-                    return Ok(transport);
+            match self.connect_raw(peer, tag, limiter.clone()).await {
+                Ok(stream) => {
+                    return Ok(stream);
                 }
                 Err(err) => {
                     if let Some(duration) = retry_strategy.next() {
