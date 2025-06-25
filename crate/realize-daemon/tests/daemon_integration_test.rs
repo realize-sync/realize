@@ -16,10 +16,10 @@ use realize_lib::model::Peer;
 use realize_lib::network::config::PeerConfig;
 use realize_lib::network::rpc::realstore;
 use realize_lib::network::rpc::realstore::client::ClientOptions;
-use realize_lib::network::rpc::realstore::Options;
 use realize_lib::network::Networking;
 use realize_lib::storage::config::ArenaConfig;
 use realize_lib::storage::config::CacheConfig;
+use realize_lib::storage::real;
 use reqwest::Client;
 use tarpc::context;
 use tokio::io::AsyncBufReadExt as _;
@@ -149,7 +149,7 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
         .list(
             context::current(),
             Arena::from("testdir"),
-            Options::default(),
+            real::Options::default(),
         )
         .await??;
     assert_unordered::assert_eq_unordered!(

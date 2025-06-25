@@ -1,5 +1,5 @@
-use assert_fs::TempDir;
 use assert_fs::prelude::*;
+use assert_fs::TempDir;
 use prometheus::proto::MetricType;
 use realize_lib::logic::consensus::movedirs;
 use realize_lib::logic::consensus::movedirs::METRIC_END_COUNT;
@@ -11,8 +11,8 @@ use realize_lib::logic::consensus::movedirs::METRIC_READ_BYTES;
 use realize_lib::logic::consensus::movedirs::METRIC_START_COUNT;
 use realize_lib::logic::consensus::movedirs::METRIC_WRITE_BYTES;
 use realize_lib::model::Arena;
-use realize_lib::network::rpc::realstore::Options;
 use realize_lib::network::rpc::realstore::server::{self, InProcessRealStoreServiceClient};
+use realize_lib::storage::real;
 use realize_lib::storage::real::RealStore;
 
 // Metric tests are kept in their own binary to avoid other test
@@ -30,7 +30,11 @@ async fn client_success_call_count() -> anyhow::Result<()> {
         &[("method", "list"), ("status", "OK"), ("error", "OK")],
     );
     client
-        .list(tarpc::context::current(), arena.clone(), Options::default())
+        .list(
+            tarpc::context::current(),
+            arena.clone(),
+            real::Options::default(),
+        )
         .await??;
     let after = get_metric_value(
         "realize_client_call_count",
@@ -52,16 +56,14 @@ async fn client_error_call_count() -> anyhow::Result<()> {
             ("error", "BadRequest"),
         ],
     );
-    assert!(
-        client
-            .list(
-                tarpc::context::current(),
-                Arena::from("doesnotexist"),
-                Options::default(),
-            )
-            .await?
-            .is_err()
-    );
+    assert!(client
+        .list(
+            tarpc::context::current(),
+            Arena::from("doesnotexist"),
+            real::Options::default(),
+        )
+        .await?
+        .is_err());
     let after_err = get_metric_value(
         "realize_client_call_count",
         &[
@@ -83,7 +85,11 @@ async fn server_success_call_count() -> anyhow::Result<()> {
         &[("method", "list"), ("status", "OK"), ("error", "OK")],
     );
     client
-        .list(tarpc::context::current(), arena.clone(), Options::default())
+        .list(
+            tarpc::context::current(),
+            arena.clone(),
+            real::Options::default(),
+        )
         .await??;
     let after_srv = get_metric_value(
         "realize_server_call_count",
@@ -105,16 +111,14 @@ async fn server_error_call_count() -> anyhow::Result<()> {
             ("error", "BadRequest"),
         ],
     );
-    assert!(
-        client
-            .list(
-                tarpc::context::current(),
-                Arena::from("doesnotexist"),
-                Options::default(),
-            )
-            .await?
-            .is_err()
-    );
+    assert!(client
+        .list(
+            tarpc::context::current(),
+            Arena::from("doesnotexist"),
+            real::Options::default(),
+        )
+        .await?
+        .is_err());
     let after_srv_err = get_metric_value(
         "realize_server_call_count",
         &[
