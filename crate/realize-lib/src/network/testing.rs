@@ -1,7 +1,10 @@
 use rustls::pki_types::{pem::PemObject as _, PrivateKeyDer, SubjectPublicKeyInfoDer};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use super::config::PeerConfig;
+use super::hostport::HostPort;
 use super::security::{PeerVerifier, RawPublicKeyResolver};
 use super::Networking;
 use crate::model::Peer;
@@ -38,19 +41,34 @@ pub fn client_resolver() -> anyhow::Result<Arc<RawPublicKeyResolver>> {
     Ok(resolver)
 }
 
+/// Public key for test client, in PEM format.
+pub const CLIENT_PUBLIC_KEY_PEM: &[u8] = br#"
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEA/CMSGfePPViYEUoHMNTrywE+mwTmB0poO0A1ATNIJGo=
+-----END PUBLIC KEY-----
+"#;
+
+/// Public key for test servers, in PEM format.
+const SERVER_PUBLIC_KEY_PEM: &[u8] = br#"
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAIckr1J3xrgglc6pseuCDWDAupSMzA1TJyitkgJi/SPg=
+-----END PUBLIC KEY-----
+"#;
+
+/// Another test public key, in PEM format.
+const OTHER_PUBLIC_KEY_PEM: &[u8] = br#"
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAJ7KIbhdPS2ESzYMeQXoqHJv8Vdmi+pJlkFChY8K+IVg=
+-----END PUBLIC KEY-----
+"#;
+
 /// Public key for test clients.
 ///
 /// Generated from [client_private_key] with:
 ///   openssl pkey -in peer.key -pubout -out -
 pub(crate) fn client_public_key() -> SubjectPublicKeyInfoDer<'static> {
-    SubjectPublicKeyInfoDer::from_pem_slice(
-        br#"
------BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEA/CMSGfePPViYEUoHMNTrywE+mwTmB0poO0A1ATNIJGo=
------END PUBLIC KEY-----
-"#,
-    )
-    .expect("Invalid test client public key")
+    SubjectPublicKeyInfoDer::from_pem_slice(CLIENT_PUBLIC_KEY_PEM)
+        .expect("Invalid test client public key")
 }
 
 /// Public key for test servers.
@@ -58,14 +76,8 @@ MCowBQYDK2VwAyEA/CMSGfePPViYEUoHMNTrywE+mwTmB0poO0A1ATNIJGo=
 /// Generated from [server_private_key] with:
 ///   openssl pkey -in peer.key -pubout -out -
 pub(crate) fn server_public_key() -> SubjectPublicKeyInfoDer<'static> {
-    SubjectPublicKeyInfoDer::from_pem_slice(
-        br#"
------BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAIckr1J3xrgglc6pseuCDWDAupSMzA1TJyitkgJi/SPg=
------END PUBLIC KEY-----
-"#,
-    )
-    .expect("Invalid test server public key")
+    SubjectPublicKeyInfoDer::from_pem_slice(SERVER_PUBLIC_KEY_PEM)
+        .expect("Invalid test server public key")
 }
 
 /// Private key for test servers.
@@ -132,4 +144,126 @@ pub fn client_networking(addr: SocketAddr) -> anyhow::Result<Networking> {
         client_resolver()?,
         client_server_verifier(),
     ))
+}
+
+/// Helper for building [Networking] for multiple peers that can
+/// communicate with each other.
+pub struct TestingPeers {
+    addresses: HashMap<Peer, HostPort>,
+    peers: HashMap<Peer, PeerConfig>,
+    private_keys: HashMap<Peer, PrivateKeyDer<'static>>,
+}
+
+#[allow(dead_code)]
+impl TestingPeers {
+    pub fn a() -> Peer {
+        Peer::from("a")
+    }
+    pub fn b() -> Peer {
+        Peer::from("b")
+    }
+    pub fn c() -> Peer {
+        Peer::from("c")
+    }
+
+    /// Build an empty instance.
+    pub fn empty() -> Self {
+        Self {
+            addresses: HashMap::new(),
+            peers: HashMap::new(),
+            private_keys: HashMap::new(),
+        }
+    }
+
+    /// Build an instance with the three peers, [TestingPeers::a],
+    /// [TestingPeers::b] and [TestingPeers::c], pre-configured.
+    pub fn new() -> anyhow::Result<Self> {
+        let mut peers = Self::empty();
+        peers.add(
+            &TestingPeers::a(),
+            CLIENT_PUBLIC_KEY_PEM,
+            client_private_key(),
+        )?;
+        peers.add(
+            &TestingPeers::b(),
+            SERVER_PUBLIC_KEY_PEM,
+            server_private_key(),
+        )?;
+        peers.add(
+            &TestingPeers::c(),
+            OTHER_PUBLIC_KEY_PEM,
+            other_private_key(),
+        )?;
+
+        Ok(peers)
+    }
+
+    /// Add a peer.
+    pub fn add(
+        &mut self,
+        peer: &Peer,
+        pubkey: &[u8],
+        private_key: PrivateKeyDer<'static>,
+    ) -> anyhow::Result<()> {
+        self.peers.insert(
+            peer.clone(),
+            PeerConfig {
+                pubkey: String::from_utf8(pubkey.to_vec())?,
+                address: None,
+            },
+        );
+        self.private_keys.insert(peer.clone(), private_key);
+
+        Ok(())
+    }
+
+    /// Choose an address for the given peer, store it and return it.
+    pub fn pick_port(&mut self, peer: &Peer) -> anyhow::Result<HostPort> {
+        let port = portpicker::pick_unused_port().ok_or(anyhow::anyhow!("No free port"))?;
+        let hostport = HostPort::localhost(port);
+        self.set_addr(peer, hostport.addr());
+
+        Ok(hostport)
+    }
+
+    /// Set address of the given peer.
+    pub fn set_addr(&mut self, peer: &Peer, addr: SocketAddr) {
+        self.set_hostport(peer, HostPort::from(addr))
+    }
+
+    pub fn set_hostport(&mut self, peer: &Peer, hostport: HostPort) {
+        self.addresses.insert(peer.clone(), hostport);
+    }
+
+    /// Get the address configured for peer.
+    pub async fn hostport(&self, peer: &Peer) -> Option<&HostPort> {
+        self.addresses.get(peer)
+    }
+
+    /// Build a [Networking] instance for the given peer.
+    ///
+    /// Other peer public keys and addreses will be available.
+    pub fn networking(&self, peer: &Peer) -> anyhow::Result<Networking> {
+        let mut others = self.peers.clone();
+        others.remove(peer);
+
+        let verifier = PeerVerifier::from_config(&others)?;
+        let resolver = RawPublicKeyResolver::from_private_key(
+            self.private_keys
+                .get(&peer)
+                .ok_or(anyhow::anyhow!("No private key for {peer}"))?
+                .clone_key(),
+        )?;
+
+        let addresses = self
+            .addresses
+            .iter()
+            .map(|(p, hostport)| (p.clone(), hostport.to_string()))
+            .collect::<Vec<_>>();
+        Ok(Networking::new(
+            addresses.iter().map(|(p, addr)| (p, addr.as_ref())),
+            resolver,
+            verifier,
+        ))
+    }
 }
