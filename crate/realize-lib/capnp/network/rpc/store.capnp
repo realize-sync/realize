@@ -9,11 +9,11 @@ interface Store {
   arenas @0 () -> (arenas: List(Text));
   
   # Read a blob from the store
-  read @1 (req: ReadRequest) -> (result: Result(Data));
+  read @1 (req: ReadRequest) -> (result: Result(ReadResponse, ReadError));
 
   # Subscribe to notifications to receive and be kept 
   # up-to-date on the store file list
-  subscribe @2 (req: SubscribeRequest) -> (result: Result(SubscribeResponse));
+  subscribe @2 (req: SubscribeRequest) -> (result: Result(SubscribeResponse, SubscribeError));
 }
 
 struct ReadRequest {
@@ -22,13 +22,25 @@ struct ReadRequest {
   offset @2: UInt64;
   size @3: UInt32;
 }
+struct ReadResponse {
+  data @0: Data;
+}
+struct ReadError {
+ message @0:Text;
+}
+
+
 
 struct SubscribeRequest {
   subscriber @0: Subscriber;
-  arena @1: List(Text);
+  arenas @1: List(Text);
 }
 
 struct SubscribeResponse {
+}
+
+struct SubscribeError {
+ message @0:Text;
 }
 
 interface Subscriber {
