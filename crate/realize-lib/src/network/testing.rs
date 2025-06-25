@@ -258,6 +258,7 @@ impl TestingPeers {
         let addresses = self
             .addresses
             .iter()
+            .filter(|(p, _)| **p != *peer)
             .map(|(p, hostport)| (p.clone(), hostport.to_string()))
             .collect::<Vec<_>>();
         Ok(Networking::new(

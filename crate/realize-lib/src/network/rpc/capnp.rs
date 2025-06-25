@@ -9,7 +9,7 @@ use crate::storage::real::RealStore;
 use capnp::capability::Promise;
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
-use capnp_rpc::RpcSystem;
+use capnp_rpc::{RpcSystem, VatNetwork as _};
 use futures::io::{BufReader, BufWriter};
 use futures::AsyncReadExt;
 use std::cell::RefCell;
@@ -79,9 +79,13 @@ impl Household {
     /// PeerConnection, defined in `capnp/peer.capnp`.
     pub fn register(&self, server: &mut Server) {
         let tx = self.tx.clone();
-        server.register_raw(TAG, move |peer, stream, _, _| {
+        server.register_raw(TAG, move |peer, stream, _, shutdown_rx| {
             // TODO: support shutdown_rx
-            let _ = tx.send(HouseholdConnection::Incoming { peer, stream });
+            let _ = tx.send(HouseholdConnection::Incoming {
+                peer,
+                stream,
+                shutdown_rx,
+            });
         })
     }
 }
@@ -93,6 +97,7 @@ enum HouseholdConnection {
     Incoming {
         peer: Peer,
         stream: tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
+        shutdown_rx: broadcast::Receiver<()>,
     },
     KeepConnected,
 }
@@ -124,8 +129,8 @@ fn spawn_rpc_thread(
                         HouseholdConnection::Incoming {
                             peer,
                             stream,
-                            .. // TODO: handle shutdown
-                        } => ctx.accept(peer, stream),
+                            shutdown_rx,
+                        } => ctx.accept(peer, stream, shutdown_rx),
                         HouseholdConnection::KeepConnected => ctx.keep_connected(),
                     }
                 }
@@ -166,6 +171,7 @@ impl AppContext {
         self: &Rc<Self>,
         peer: Peer,
         stream: tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
+        mut shutdown_rx: broadcast::Receiver<()>,
     ) {
         let client = ConnectedPeerServer::new(peer.clone(), Rc::clone(self)).into_connected_peer();
         tokio::task::spawn_local(async move {
@@ -177,6 +183,11 @@ impl AppContext {
                 Default::default(),
             ));
             let system = RpcSystem::new(net, Some(client.clone().client));
+            let disconnector = system.get_disconnector();
+            tokio::task::spawn_local(async move {
+                let _ = shutdown_rx.recv().await;
+                let _ = disconnector.await;
+            });
             if let Err(err) = system.await {
                 log::debug!("RPC System from {peer} failed: {err}")
             }
@@ -223,43 +234,31 @@ impl AppContext {
                 )
                 .await?;
             let (r, w) = TokioAsyncReadCompatExt::compat(stream).split();
-            let net = Box::new(VatNetwork::new(
+            let mut net = Box::new(VatNetwork::new(
                 BufReader::new(r),
                 BufWriter::new(w),
                 Side::Client,
                 Default::default(),
             ));
+            let until_shutdown = net.drive_until_shutdown();
             let mut system = RpcSystem::new(net, None);
             let mut client: connected_peer::Client = system.bootstrap(Side::Server);
-            let setup = tokio::task::spawn_local({
-                let this = Rc::clone(&self);
-                let peer = peer.clone();
-                async move {
-                    let store = get_connected_peer_store(&mut client).await?;
-                    this.set_tracked_client(&peer, Some(store.clone()));
+            tokio::task::spawn_local(system);
 
-                    let _ = this.broadcast_tx.send(PeerStatus::Connected(peer.clone()));
+            let store = get_connected_peer_store(&mut client).await?;
+            self.set_tracked_client(&peer, Some(store.clone()));
 
-                    //this.register_self(&client);
-                    //this.subscribe_self(&peer, &mut store).await?;
+            let _ = self.broadcast_tx.send(PeerStatus::Connected(peer.clone()));
 
-                    Ok::<_, anyhow::Error>(())
-                }
-            });
+            //this.register_self(&client);
+            //this.subscribe_self(&peer, &mut store).await?;
 
-            let ret = system.await;
-            let setup_ret = setup.await; // wait to avoid race condition with set_tracked_client
+            let _ = until_shutdown.await;
+
             self.set_tracked_client(peer, None);
             let _ = self
                 .broadcast_tx
                 .send(PeerStatus::Disconnected(peer.clone()));
-
-            if let Err(err) = ret {
-                log::debug!("Disconnected from {peer}: {err}. Will reconnect.");
-            }
-            if let Err(err) = setup_ret {
-                log::debug!("Error during setup for {peer}: {err}.");
-            }
         }
     }
 
@@ -538,5 +537,32 @@ mod tests {
         Ok(())
     }
 
-    // TODO: test reconnections
+    #[tokio::test]
+    async fn household_reconnects() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+
+        let a = &fixture.peer_a.clone();
+        fixture.peers.pick_port(&a)?;
+
+        let b = &fixture.peer_b.clone();
+        fixture.peers.pick_port(&b)?;
+
+        let (household_a, _) = Household::spawn(fixture.peers.networking(a)?, fixture.store(a)?)?;
+        let _server_a = fixture.run_server(a, &household_a).await?;
+
+        let (household_b, _) = Household::spawn(fixture.peers.networking(b)?, fixture.store(b)?)?;
+        let server_b = fixture.run_server(b, &household_b).await?;
+
+        let mut status_a = household_a.peer_status();
+        household_a.keep_connected()?;
+
+        assert_eq!(PeerStatus::Connected(b.clone()), status_a.recv().await?);
+        server_b.shutdown().await?;
+        assert_eq!(PeerStatus::Disconnected(b.clone()), status_a.recv().await?);
+
+        let _server_b = fixture.run_server(b, &household_b).await?;
+        assert_eq!(PeerStatus::Connected(b.clone()), status_a.recv().await?);
+
+        Ok(())
+    }
 }
