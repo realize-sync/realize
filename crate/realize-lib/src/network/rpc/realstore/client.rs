@@ -170,7 +170,8 @@ mod tests {
     use crate::model::{Arena, Peer};
     use crate::network::hostport::HostPort;
     use crate::network::rpc::realstore::Config;
-    use crate::network::security::{testing, PeerVerifier, RawPublicKeyResolver};
+    use crate::network::security::{PeerVerifier, RawPublicKeyResolver};
+    use crate::network::testing;
     use crate::network::Server;
     use crate::storage::real::{self, RealStore};
     use crate::utils::async_utils::AbortOnDrop;

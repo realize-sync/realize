@@ -430,7 +430,7 @@ mod tests {
     use super::*;
     use crate::model::Peer;
     use crate::network;
-    use crate::network::security::testing;
+    use crate::network::testing;
     use tarpc::context;
     use tarpc::server::Channel as _;
     use tokio_retry::strategy::FixedInterval;

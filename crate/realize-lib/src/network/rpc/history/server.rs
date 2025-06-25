@@ -138,8 +138,8 @@ mod tests {
             self,
             hostport::HostPort,
             rpc::history,
-            security::{testing, PeerVerifier, RawPublicKeyResolver},
-            Server,
+            security::{PeerVerifier, RawPublicKeyResolver},
+            testing, Server,
         },
         storage::real::RealStore,
     };

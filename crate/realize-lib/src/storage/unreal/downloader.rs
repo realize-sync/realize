@@ -359,7 +359,7 @@ mod tests {
 
     use crate::{
         model::{Arena, Path, UnixTime},
-        network::{self, hostport::HostPort, security, Server},
+        network::{self, hostport::HostPort, Server},
         storage::{real::RealStore, unreal},
     };
 
@@ -410,7 +410,7 @@ mod tests {
             let metadata = tokio::fs::metadata(path.within(self.tempdir.path())).await?;
             self.cache
                 .link(
-                    &security::testing::server_peer(),
+                    &network::testing::server_peer(),
                     &self.arena,
                     &path,
                     metadata.len(),

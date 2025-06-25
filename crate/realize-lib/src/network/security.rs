@@ -1,6 +1,3 @@
-#[cfg(test)]
-pub(crate) mod testing;
-
 use anyhow::Context as _;
 use rustls::client::danger::ServerCertVerifier;
 use rustls::client::Resumption;
@@ -322,7 +319,7 @@ impl rustls::server::ResolvesServerCert for RawPublicKeyResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::security::testing;
+    use crate::network::testing;
     use crate::utils::async_utils::AbortOnDrop;
     use rustls::pki_types::pem::PemObject as _;
     use rustls::pki_types::PrivateKeyDer;

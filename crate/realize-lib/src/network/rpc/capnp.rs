@@ -197,7 +197,7 @@ mod tests {
 
     use crate::{
         model::Arena,
-        network::{self, hostport::HostPort, security},
+        network::{self, hostport::HostPort},
     };
 
     use super::*;
@@ -233,7 +233,7 @@ mod tests {
     async fn connect(addr: SocketAddr) -> anyhow::Result<connected_peer::Client> {
         let networking = network::testing::client_networking(addr)?;
         let stream = networking
-            .connect_raw(&security::testing::server_peer(), TAG, None)
+            .connect_raw(&network::testing::server_peer(), TAG, None)
             .await?;
         let (r, w) = TokioAsyncReadCompatExt::compat(stream).split();
         let net = Box::new(VatNetwork::new(

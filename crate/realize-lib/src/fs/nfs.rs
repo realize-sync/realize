@@ -359,7 +359,7 @@ mod tests {
 
     use crate::{
         model::{Arena, Path},
-        network::{self, hostport::HostPort, rpc::realstore, security, Server},
+        network::{self, hostport::HostPort, rpc::realstore, Server},
         storage::real::RealStore,
     };
     use assert_fs::{
@@ -454,7 +454,7 @@ mod tests {
         fixture
             .cache
             .link(
-                &security::testing::server_peer(),
+                &network::testing::server_peer(),
                 &fixture.arena,
                 &Path::parse("somefile.txt")?,
                 5,
@@ -495,7 +495,7 @@ mod tests {
         fixture
             .cache
             .link(
-                &security::testing::server_peer(),
+                &network::testing::server_peer(),
                 &fixture.arena,
                 &Path::parse("hello.txt")?,
                 m.len(),
