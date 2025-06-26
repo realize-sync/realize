@@ -1,14 +1,12 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc};
 
 use tokio::sync::mpsc;
-use tokio_retry::strategy::ExponentialBackoff;
 
-use crate::model::Arena;
-use crate::network::rpc::history::server::forward_peer_history;
-use crate::network::rpc::realstore;
+use crate::model::{Arena, Peer};
+use crate::network::rpc::{realstore, Household};
 use crate::network::{Networking, Server};
 use crate::storage::config::ArenaConfig;
-use crate::storage::real::RealStore;
+use crate::storage::real::{Notification, RealStore};
 use crate::storage::unreal::UnrealCacheAsync;
 use crate::storage::unreal::{keep_cache_updated, Downloader};
 
@@ -17,13 +15,18 @@ use super::config::Config;
 pub struct Setup {
     networking: Networking,
     config: Config,
+    notification_tx: Option<mpsc::Sender<(Peer, Notification)>>,
 }
 
 impl Setup {
     pub fn new(config: Config, privkey: &std::path::Path) -> anyhow::Result<Self> {
         let networking = Networking::from_config(&config.network.peers, privkey)?;
 
-        Ok(Self { networking, config })
+        Ok(Self {
+            networking,
+            config,
+            notification_tx: None,
+        })
     }
 
     /// Setup cache as specified in the configuration.
@@ -32,31 +35,9 @@ impl Setup {
     /// possible by connecting to other peers to track changes.
     pub fn setup_cache(&mut self) -> anyhow::Result<(UnrealCacheAsync, Downloader)> {
         let cache = UnrealCacheAsync::from_config(&self.config.storage)?;
-        let retry_strategy =
-            ExponentialBackoff::from_millis(500).max_delay(Duration::from_secs(5 * 60));
-
-        let arenas = self
-            .config
-            .storage
-            .arenas
-            .keys()
-            .map(|a| a.clone())
-            .collect::<Vec<Arena>>();
         let (tx, rx) = mpsc::channel(100);
         tokio::spawn(keep_cache_updated(cache.clone(), rx));
-
-        for (peer, peer_config) in &self.config.network.peers {
-            if !peer_config.address.is_some() {
-                continue;
-            }
-            tokio::spawn(forward_peer_history(
-                self.networking.clone(),
-                peer.clone(),
-                arenas.clone(),
-                retry_strategy.clone(),
-                tx.clone(),
-            ));
-        }
+        self.notification_tx = Some(tx);
 
         let downloader = Downloader::new(self.networking.clone(), cache.clone());
 
@@ -68,13 +49,23 @@ impl Setup {
     /// The returned server is configured, but not started.
     pub fn setup_server(self) -> anyhow::Result<Arc<Server>> {
         check_directory_access(&self.config.storage.arenas)?;
-        let store = RealStore::from_config(&self.config.storage.arenas);
+        let Setup {
+            networking,
+            config,
+            notification_tx,
+        } = self;
 
-        let mut server = Server::new(self.networking.clone());
+        let store = RealStore::from_config(&config.storage.arenas);
+
+        let mut server = Server::new(networking.clone());
         realstore::server::register(&mut server, store.clone());
 
-        #[cfg(target_os = "linux")]
-        crate::network::rpc::history::client::register(&mut server, store.clone());
+        let has_notifications = notification_tx.is_some();
+        let (household, _) = Household::spawn(networking, Arc::new(store), notification_tx)?;
+        if has_notifications {
+            household.keep_connected()?;
+        }
+        household.register(&mut server);
 
         Ok(Arc::new(server))
     }
