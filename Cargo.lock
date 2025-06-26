@@ -2154,6 +2154,7 @@ dependencies = [
  "redb",
  "reqwest",
  "rustls",
+ "scopeguard",
  "serde",
  "serial_test",
  "sha2",

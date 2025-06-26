@@ -143,7 +143,7 @@ fn spawn_rpc_thread(
 #[derive(Default)]
 struct TrackedPeerConnections {
     tracked_client: Option<store::Client>,
-    tracker: Option<JoinHandle<anyhow::Result<()>>>,
+    tracker: Option<JoinHandle<()>>,
 }
 
 struct AppContext {
@@ -176,21 +176,27 @@ impl AppContext {
         let client = ConnectedPeerServer::new(peer.clone(), Rc::clone(self)).into_connected_peer();
         tokio::task::spawn_local(async move {
             let (r, w) = TokioAsyncReadCompatExt::compat(stream).split();
-            let net = Box::new(VatNetwork::new(
+            let mut net = Box::new(VatNetwork::new(
                 BufReader::new(r),
                 BufWriter::new(w),
                 Side::Server,
                 Default::default(),
             ));
+            let until_shutdown = net.drive_until_shutdown();
             let system = RpcSystem::new(net, Some(client.clone().client));
             let disconnector = system.get_disconnector();
-            tokio::task::spawn_local(async move {
-                let _ = shutdown_rx.recv().await;
-                let _ = disconnector.await;
-            });
-            if let Err(err) = system.await {
-                log::debug!("RPC System from {peer} failed: {err}")
-            }
+            tokio::task::spawn_local(system);
+
+            tokio::select!(
+                _ = shutdown_rx.recv() => {
+                    let _ = disconnector.await;
+                },
+                res = until_shutdown => {
+                    if let Err(err) = res {
+                        log::debug!("RPC connection from {peer} failed: {err}")
+                    }
+                }
+            );
         });
     }
 
@@ -221,18 +227,34 @@ impl AppContext {
         todo!();
     }
 
-    async fn track_peer(self: &Rc<Self>, peer: &Peer) -> anyhow::Result<()> {
+    async fn track_peer(self: &Rc<Self>, peer: &Peer) {
+        let retry_strategy =
+            ExponentialBackoff::from_millis(500).max_delay(Duration::from_secs(5 * 60));
+        let mut current_backoff: Option<ExponentialBackoff> = None;
         loop {
-            let stream = self
-                .networking
-                .connect_with_retries_raw(
-                    peer,
-                    TAG,
-                    None,
-                    ExponentialBackoff::from_millis(500).max_delay(Duration::from_secs(5 * 60)),
-                    None,
-                )
-                .await?;
+            match &mut current_backoff {
+                Some(backoff) => match backoff.next() {
+                    None => {
+                        log::warn!("Giving up connecting to {peer}");
+                        return;
+                    }
+                    Some(delay) => {
+                        tokio::time::sleep(delay).await;
+                    }
+                },
+                None => {
+                    // Execute immediately, and install backoff for next time.
+                    current_backoff = Some(retry_strategy.clone());
+                }
+            }
+            let stream = match self.networking.connect_raw(peer, TAG, None).await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    log::debug!("Failed to connect to {peer}: {err}; Will retry.");
+                    continue;
+                }
+            };
+
             let (r, w) = TokioAsyncReadCompatExt::compat(stream).split();
             let mut net = Box::new(VatNetwork::new(
                 BufReader::new(r),
@@ -243,22 +265,37 @@ impl AppContext {
             let until_shutdown = net.drive_until_shutdown();
             let mut system = RpcSystem::new(net, None);
             let mut client: connected_peer::Client = system.bootstrap(Side::Server);
+            let disconnector = system.get_disconnector();
+            scopeguard::defer!({
+                tokio::task::spawn_local(disconnector);
+            });
             tokio::task::spawn_local(system);
 
-            let store = get_connected_peer_store(&mut client).await?;
-            self.set_tracked_client(&peer, Some(store.clone()));
-
+            let store = match get_connected_peer_store(&mut client).await {
+                Ok(store) => store,
+                Err(err) => {
+                    log::debug!("Failed to get store from {peer}: {err}; Will retry.");
+                    continue;
+                }
+            };
+            self.set_tracked_client(peer, Some(store));
             let _ = self.broadcast_tx.send(PeerStatus::Connected(peer.clone()));
+            scopeguard::defer!({
+                self.set_tracked_client(peer, None);
+                let _ = self
+                    .broadcast_tx
+                    .send(PeerStatus::Disconnected(peer.clone()));
+            });
 
             //this.register_self(&client);
             //this.subscribe_self(&peer, &mut store).await?;
 
-            let _ = until_shutdown.await;
+            // We're fully connected. Reset the backoff delay for next time.
+            current_backoff = None;
 
-            self.set_tracked_client(peer, None);
-            let _ = self
-                .broadcast_tx
-                .send(PeerStatus::Disconnected(peer.clone()));
+            if let Err(err) = until_shutdown.await {
+                log::debug!("Connection to {peer} was shutdown: {err}; Will reconnect.")
+            }
         }
     }
 
