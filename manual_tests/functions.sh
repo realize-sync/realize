@@ -55,11 +55,11 @@ function up {
     sleep 0.25
     if pgrep -F "${pidfile}" realize-daemon 2>/dev/null; then
         echo "== ${inst} STARTED: PID $pid out ${outfile}"
-        head "${outfile}"
+        tail "${outfile}"
         return 0
     else
         echo "== ${inst} FAILED: out ${outfile}"
-        head "${outfile}"
+        tail "${outfile}"
         return 1
     fi
 }
