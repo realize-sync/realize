@@ -908,7 +908,6 @@ mod tests {
 
         let arena = &fixture.arena;
 
-        log::debug!("connected. send notifications");
         let store = fixture.stores.get(b).unwrap();
         store
             .send(Notification::CatchingUp {
@@ -929,7 +928,6 @@ mod tests {
             })
             .await?;
 
-        log::debug!("read notifications");
         let b = TestingPeers::b();
         assert_eq!(
             Some((
