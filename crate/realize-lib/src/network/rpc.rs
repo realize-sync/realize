@@ -1,5 +1,4 @@
 mod capnp;
-pub mod history;
 pub mod realstore;
 
 #[allow(dead_code)]

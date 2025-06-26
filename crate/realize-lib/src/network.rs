@@ -18,8 +18,6 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path;
 use std::sync::Arc;
-use std::time::Duration;
-use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
@@ -152,68 +150,6 @@ impl Networking {
         Ok(tls_stream)
     }
 
-    #[allow(dead_code)] // only on macos, without inotify support
-    pub(crate) async fn connect_with_retries<Req, Resp>(
-        &self,
-        peer: &Peer,
-        tag: &[u8; 4],
-        limiter: Option<Limiter>,
-        retry_strategy: impl Iterator<Item = Duration>,
-        deadline: Option<Instant>,
-    ) -> Result<
-        transport::Transport<
-            tokio_rustls::client::TlsStream<RateLimitedStream<TcpStream>>,
-            Req,
-            Resp,
-            Bincode<Req, Resp>,
-        >,
-        anyhow::Error,
-    >
-    where
-        Req: for<'de> serde::Deserialize<'de>,
-        Resp: serde::Serialize,
-    {
-        let tls_stream = self
-            .connect_with_retries_raw(peer, tag, limiter, retry_strategy, deadline)
-            .await?;
-        let transport = transport::new(
-            LengthDelimitedCodec::builder().new_framed(tls_stream),
-            Bincode::default(),
-        );
-
-        Ok(transport)
-    }
-
-    pub(crate) async fn connect_with_retries_raw(
-        &self,
-        peer: &Peer,
-        tag: &[u8; 4],
-        limiter: Option<Limiter>,
-        mut retry_strategy: impl Iterator<Item = Duration>,
-        deadline: Option<Instant>,
-    ) -> Result<tokio_rustls::client::TlsStream<RateLimitedStream<TcpStream>>, anyhow::Error> {
-        loop {
-            match self.connect_raw(peer, tag, limiter.clone()).await {
-                Ok(stream) => {
-                    return Ok(stream);
-                }
-                Err(err) => {
-                    if let Some(duration) = retry_strategy.next() {
-                        if let Some(deadline) = &deadline {
-                            let sleep_end = Instant::now() + duration;
-                            if sleep_end >= *deadline {
-                                return Err(err);
-                            }
-                        }
-                        tokio::time::sleep(duration).await;
-                    } else {
-                        return Err(err);
-                    }
-                }
-            }
-        }
-    }
-
     async fn accept(
         &self,
         stream: TcpStream,
@@ -273,32 +209,6 @@ impl Server {
             handlers: HashMap::new(),
             shutdown_tx,
         }
-    }
-
-    /// Register a handler for the given tag.
-    ///
-    /// If registering a TARPC service listener, use
-    /// [Server::register_server] instead. This method is mostly
-    /// useful for registering TARPC clients.
-    pub(crate) fn register(
-        &mut self,
-        tag: &'static [u8; 4],
-        handler: impl Fn(
-                Peer,
-                tarpc::tokio_util::codec::Framed<
-                    tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
-                    LengthDelimitedCodec,
-                >,
-                Limiter,
-                broadcast::Receiver<()>,
-            ) + Send
-            + Sync
-            + 'static,
-    ) {
-        self.register_raw(tag, move |peer, stream, limiter, shutdown_rx| {
-            let framed = LengthDelimitedCodec::builder().new_framed(stream);
-            handler(peer, framed, limiter, shutdown_rx);
-        });
     }
 
     /// Register a handler for a TARPC service.
@@ -450,14 +360,12 @@ impl Server {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
     use crate::model::Peer;
     use crate::network;
     use crate::network::testing;
     use tarpc::context;
     use tarpc::server::Channel as _;
-    use tokio_retry::strategy::FixedInterval;
 
     struct Fixture {
         resolver: Arc<RawPublicKeyResolver>,
@@ -548,71 +456,6 @@ mod tests {
         let networking = fixture.client_networking(&peer, addr)?;
         let client = connect_ping(&networking, &peer).await?;
         assert_eq!("pong", client.ping(context::current()).await?);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn tarpc_tcp_connect_with_retries() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup().await?;
-        fixture.port = portpicker::pick_unused_port().expect("no free port");
-        let addr = HostPort::localhost(fixture.port).addr();
-
-        let peer = Peer::from("server");
-        let networking = fixture.client_networking(&peer, addr)?;
-        let (client, server) = tokio::join!(
-            connect_ping_with_retries(&networking, &peer, FixedInterval::from_millis(10), None),
-            async {
-                // Wait long enough for 2 tries to fail.
-                tokio::time::sleep(Duration::from_millis(15)).await;
-
-                fixture.start_server().await
-            }
-        );
-        server?;
-        let client = client?;
-
-        assert_eq!("pong", client.ping(context::current()).await?);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn tarpc_tcp_connect_with_retries_fails() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup().await?;
-        fixture.port = portpicker::pick_unused_port().expect("no free port");
-        let addr = HostPort::localhost(fixture.port).addr();
-
-        let peer = Peer::from("server");
-        let networking = fixture.client_networking(&peer, addr)?;
-        let res = connect_ping_with_retries(
-            &networking,
-            &peer,
-            FixedInterval::from_millis(1).take(10),
-            None,
-        )
-        .await;
-        assert!(matches!(res, Err(_)));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn tarpc_tcp_connect_with_deadline_fails() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup().await?;
-        fixture.port = portpicker::pick_unused_port().expect("no free port");
-        let addr = HostPort::localhost(fixture.port).addr();
-
-        let peer = Peer::from("server");
-        let networking = fixture.client_networking(&peer, addr)?;
-        let res = connect_ping_with_retries(
-            &networking,
-            &peer,
-            FixedInterval::from_millis(1),
-            Some(Instant::now() + Duration::from_millis(5)),
-        )
-        .await;
-        assert!(matches!(res, Err(_)));
 
         Ok(())
     }
@@ -756,20 +599,6 @@ mod tests {
         peer: &Peer,
     ) -> anyhow::Result<PingServiceClient> {
         let transport = networking.connect(peer, PING_TAG, None).await?;
-
-        Ok(PingServiceClient::new(tarpc::client::Config::default(), transport).spawn())
-    }
-
-    /// Connect to the given peer as [PingService], with retries enabled..
-    async fn connect_ping_with_retries(
-        networking: &Networking,
-        peer: &Peer,
-        retry_strategy: impl Iterator<Item = Duration>,
-        deadline: Option<Instant>,
-    ) -> anyhow::Result<PingServiceClient> {
-        let transport = networking
-            .connect_with_retries(peer, PING_TAG, None, retry_strategy, deadline)
-            .await?;
 
         Ok(PingServiceClient::new(tarpc::client::Config::default(), transport).spawn())
     }
