@@ -79,4 +79,15 @@ impl Notification {
             Catchup { path, .. } => Some(&path),
         }
     }
+
+    pub fn is_catchup(&self) -> bool {
+        use Notification::*;
+        match self {
+            Link { .. } => false,
+            Unlink { .. } => false,
+            CatchingUp { .. } => true,
+            Catchup { .. } => true,
+            Ready { .. } => true,
+        }
+    }
 }

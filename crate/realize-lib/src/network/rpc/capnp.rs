@@ -674,22 +674,17 @@ fn fill_time(
 mod tests {
     use std::sync::Arc;
 
-    use assert_fs::{
-        prelude::{FileWriteStr as _, PathChild as _, PathCreateDir as _},
-        TempDir,
-    };
-    use tokio::task::LocalSet;
+    use tokio::{task::LocalSet, time::timeout};
 
     use crate::{
         model::Arena,
         network::{hostport::HostPort, testing::TestingPeers},
-        storage::real::RealStore,
+        storage::testing::FakeStoreSubscribe,
     };
 
     use super::*;
 
     struct Fixture {
-        tempdir: TempDir,
         arena: Arena,
         peers: TestingPeers,
         peer_a: Peer,
@@ -697,17 +692,21 @@ mod tests {
         peer_b: Peer,
         #[allow(dead_code)]
         peer_c: Peer,
+        stores: HashMap<Peer, Arc<FakeStoreSubscribe>>,
     }
     impl Fixture {
         async fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
 
-            let tempdir = TempDir::new()?;
             let arena = Arena::from("test");
 
+            let mut stores = HashMap::new();
+            for peer in vec![TestingPeers::a(), TestingPeers::b(), TestingPeers::c()] {
+                stores.insert(peer, FakeStoreSubscribe::new(vec![arena.clone()]));
+            }
             Ok(Self {
-                tempdir,
                 arena,
+                stores,
                 peers: TestingPeers::new()?,
                 peer_a: TestingPeers::a(),
                 peer_b: TestingPeers::b(),
@@ -720,18 +719,16 @@ mod tests {
             peer: &Peer,
             notification_tx: Option<mpsc::Sender<(Peer, Notification)>>,
         ) -> anyhow::Result<(Household, thread::JoinHandle<()>)> {
+            let store: Arc<dyn StoreSubscribe + Send + Sync> = self
+                .stores
+                .get(peer)
+                .ok_or(anyhow::anyhow!("No store defined for {peer}"))?
+                .clone();
             Ok(Household::spawn(
                 self.peers.networking(peer)?,
-                Arc::new(self.store(peer)?),
+                store,
                 notification_tx,
             )?)
-        }
-
-        fn store(&self, peer: &Peer) -> anyhow::Result<RealStore> {
-            let dir = self.tempdir.child(peer.as_str());
-            dir.create_dir_all()?;
-
-            Ok(RealStore::single(&self.arena, &dir.path()))
         }
 
         async fn run_server(
@@ -910,6 +907,29 @@ mod tests {
         household_a.keep_connected()?;
 
         let arena = &fixture.arena;
+
+        log::debug!("connected. send notifications");
+        let store = fixture.stores.get(b).unwrap();
+        store
+            .send(Notification::CatchingUp {
+                arena: arena.clone(),
+            })
+            .await?;
+        store
+            .send(Notification::Ready {
+                arena: arena.clone(),
+            })
+            .await?;
+        store
+            .send(Notification::Link {
+                arena: arena.clone(),
+                path: Path::parse("a/b/test.txt")?,
+                size: 4,
+                mtime: UnixTime::new(1234567890, 111),
+            })
+            .await?;
+
+        log::debug!("read notifications");
         let b = TestingPeers::b();
         assert_eq!(
             Some((
@@ -918,7 +938,7 @@ mod tests {
                     arena: arena.clone()
                 }
             )),
-            rx.recv().await
+            timeout(Duration::from_secs(5), rx.recv()).await?,
         );
         assert_eq!(
             Some((
@@ -927,22 +947,20 @@ mod tests {
                     arena: arena.clone()
                 }
             )),
-            rx.recv().await
+            timeout(Duration::from_secs(5), rx.recv()).await?,
         );
 
-        let file_in_b = fixture.tempdir.child("b/test.txt");
-        file_in_b.write_str("test")?;
         assert_eq!(
             Some((
                 b.clone(),
                 Notification::Link {
                     arena: arena.clone(),
-                    path: Path::parse("test.txt")?,
+                    path: Path::parse("a/b/test.txt")?,
                     size: 4,
-                    mtime: UnixTime::from_system_time(file_in_b.metadata()?.modified()?)?,
+                    mtime: UnixTime::new(1234567890, 111),
                 }
             )),
-            rx.recv().await
+            timeout(Duration::from_secs(5), rx.recv()).await?,
         );
 
         Ok(())
