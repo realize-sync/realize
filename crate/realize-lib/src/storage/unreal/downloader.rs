@@ -360,7 +360,7 @@ mod tests {
     use crate::{
         model::{Arena, Path, UnixTime},
         network::{self, hostport::HostPort, Server},
-        storage::{real::RealStore, unreal},
+        storage::{self, real::RealStore},
     };
 
     use super::*;
@@ -385,7 +385,7 @@ mod tests {
             let addr = server.listen(&HostPort::localhost(0)).await?;
             let networking = network::testing::client_networking(addr)?;
 
-            let mut cache = unreal::testing::in_memory_cache()?;
+            let mut cache = storage::testing::in_memory_cache()?;
             cache.add_arena(&arena)?;
 
             Ok(Self {

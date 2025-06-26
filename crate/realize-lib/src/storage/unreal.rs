@@ -13,8 +13,6 @@ mod downloader;
 mod error;
 mod future;
 mod sync;
-#[cfg(test)]
-pub mod testing;
 mod updater;
 mod unreal_capnp {
     include!(concat!(env!("OUT_DIR"), "/unreal_capnp.rs"));

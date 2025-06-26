@@ -360,7 +360,7 @@ mod tests {
     use crate::{
         model::{Arena, Path},
         network::{self, hostport::HostPort, rpc::realstore, Server},
-        storage::real::RealStore,
+        storage::{self, real::RealStore},
     };
     use assert_fs::{
         prelude::{FileWriteStr as _, PathChild as _},
@@ -391,7 +391,7 @@ mod tests {
             let addr = server.listen(&HostPort::localhost(0)).await?;
             let networking = network::testing::client_networking(addr)?;
 
-            let mut cache = unreal::testing::in_memory_cache()?;
+            let mut cache = storage::testing::in_memory_cache()?;
             cache.add_arena(&arena)?;
             let cache = cache.into_async();
 

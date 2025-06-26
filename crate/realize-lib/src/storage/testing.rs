@@ -1,4 +1,4 @@
-use super::UnrealCacheBlocking;
+use super::unreal::UnrealCacheBlocking;
 
 pub fn in_memory_cache() -> anyhow::Result<UnrealCacheBlocking> {
     let cache = UnrealCacheBlocking::new(
