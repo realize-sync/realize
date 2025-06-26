@@ -19,7 +19,6 @@ use tokio::{
     task::JoinError,
 };
 
-#[cfg(target_os = "linux")]
 use tokio::sync::mpsc;
 use walkdir::WalkDir;
 
@@ -164,9 +163,9 @@ impl RealStore {
     #[cfg(not(target_os = "linux"))]
     pub fn subscribe(
         &self,
-        arena: Arena,
-        tx: mpsc::Sender<super::Notification>,
-        catchup: bool,
+        _arena: Arena,
+        _tx: mpsc::Sender<super::Notification>,
+        _catchup: bool,
     ) -> anyhow::Result<bool> {
         Err(anyhow::anyhow!("Not available on this OS"))
     }
