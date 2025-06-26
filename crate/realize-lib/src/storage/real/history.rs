@@ -28,7 +28,7 @@ use super::{Notification, PathResolver};
 ///
 /// To wait for inotify watches to have been created, wait
 /// for [Notification::Ready] before moving on.
-pub(crate) async fn subscribe(
+pub(crate) fn subscribe(
     arena: &Arena,
     path_resolver: PathResolver,
     tx: mpsc::Sender<Notification>,
@@ -392,10 +392,11 @@ mod tests {
         }
 
         async fn subscribe(&self, catchup: bool) -> anyhow::Result<()> {
-            let subscribed = self
-                .storage
-                .subscribe(self.arena.clone(), self.notifications_tx.clone(), catchup)
-                .await?;
+            let subscribed = self.storage.subscribe(
+                self.arena.clone(),
+                self.notifications_tx.clone(),
+                catchup,
+            )?;
             assert!(subscribed);
 
             Ok(())

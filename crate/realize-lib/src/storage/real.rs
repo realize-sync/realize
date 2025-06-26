@@ -12,6 +12,7 @@ pub use store::PathType;
 pub use store::RealStore;
 pub use store::RealStoreError;
 pub use store::RsyncOperation;
+pub use store::StoreSubscribe;
 pub use store::SyncedFile;
 
 /// Report something happening in arenas of the local file system.

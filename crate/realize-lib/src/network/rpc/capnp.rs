@@ -8,7 +8,7 @@ use super::store_capnp::subscriber::{self, NotifyParams, NotifyResults};
 use crate::model::{Arena, Path, Peer, UnixTime};
 use crate::network::rate_limit::RateLimitedStream;
 use crate::network::{Networking, Server};
-use crate::storage::real::{Notification, RealStore};
+use crate::storage::real::{Notification, StoreSubscribe};
 use capnp::capability::Promise;
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
@@ -18,6 +18,7 @@ use futures::AsyncReadExt;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -50,12 +51,15 @@ pub struct Household {
     broadcast_tx: broadcast::Sender<PeerStatus>,
 }
 
+/// Subset of [RealStore] Household requires.
+type StoreType = Arc<dyn StoreSubscribe + Sync + Send>;
+
 impl Household {
     /// Spawn a new RPC thread and return the Household instance that
     /// manages it.
     pub fn spawn(
         networking: Networking,
-        store: RealStore,
+        store: StoreType,
         notification_tx: Option<mpsc::Sender<(Peer, Notification)>>,
     ) -> anyhow::Result<(Self, thread::JoinHandle<()>)> {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -112,7 +116,7 @@ enum HouseholdConnection {
 /// To communicate with the thread, send [HousehholdConnection]s to the channel.
 fn spawn_rpc_thread(
     networking: Networking,
-    store: RealStore,
+    store: StoreType,
     mut rx: mpsc::UnboundedReceiver<HouseholdConnection>,
     notification_tx: Option<mpsc::Sender<(Peer, Notification)>>,
     broadcast_tx: broadcast::Sender<PeerStatus>,
@@ -154,7 +158,7 @@ struct TrackedPeerConnections {
 
 struct AppContext {
     networking: Networking,
-    store: RealStore,
+    store: StoreType,
     broadcast_tx: broadcast::Sender<PeerStatus>,
     notification_tx: Option<mpsc::Sender<(Peer, Notification)>>,
     main_rt: runtime::Handle,
@@ -164,7 +168,7 @@ struct AppContext {
 impl AppContext {
     fn new(
         networking: Networking,
-        store: RealStore,
+        store: StoreType,
         notification_tx: Option<mpsc::Sender<(Peer, Notification)>>,
         broadcast_tx: broadcast::Sender<PeerStatus>,
         main_rt: runtime::Handle,
@@ -558,12 +562,12 @@ async fn do_subscribe(
     let subscriber = req.get_subscriber()?;
 
     let (tx, mut rx) = mpsc::channel(100);
-    let store = ctx.store.clone();
+    let store = Arc::clone(&ctx.store);
     if let Err(err) = ctx
         .main_rt
         .spawn(async move {
             for arena in arenas {
-                store.subscribe(arena, tx.clone(), true).await?;
+                store.subscribe(arena, tx.clone(), true)?;
             }
 
             Ok::<(), anyhow::Error>(())
@@ -679,6 +683,7 @@ mod tests {
     use crate::{
         model::Arena,
         network::{hostport::HostPort, testing::TestingPeers},
+        storage::real::RealStore,
     };
 
     use super::*;
@@ -708,6 +713,18 @@ mod tests {
                 peer_b: TestingPeers::b(),
                 peer_c: TestingPeers::c(),
             })
+        }
+
+        fn household(
+            &self,
+            peer: &Peer,
+            notification_tx: Option<mpsc::Sender<(Peer, Notification)>>,
+        ) -> anyhow::Result<(Household, thread::JoinHandle<()>)> {
+            Ok(Household::spawn(
+                self.peers.networking(peer)?,
+                Arc::new(self.store(peer)?),
+                notification_tx,
+            )?)
         }
 
         fn store(&self, peer: &Peer) -> anyhow::Result<RealStore> {
@@ -763,8 +780,7 @@ mod tests {
         let mut fixture = Fixture::setup().await?;
 
         let peer = &fixture.peer_a.clone();
-        let (household, _) =
-            Household::spawn(fixture.peers.networking(peer)?, fixture.store(peer)?, None)?;
+        let (household, _) = fixture.household(peer, None)?;
         let _server = fixture.run_server(peer, &household).await?;
 
         let networking = fixture.peers.networking(&fixture.peer_b)?;
@@ -794,8 +810,7 @@ mod tests {
         let mut fixture = Fixture::setup().await?;
 
         let peer = &fixture.peer_a.clone();
-        let (household, thread_join) =
-            Household::spawn(fixture.peers.networking(peer)?, fixture.store(peer)?, None)?;
+        let (household, thread_join) = fixture.household(peer, None)?;
         let server = fixture.run_server(peer, &household).await?;
 
         let networking = fixture.peers.networking(&fixture.peer_b)?;
@@ -829,12 +844,10 @@ mod tests {
         let b = &fixture.peer_b.clone();
         fixture.peers.pick_port(&b)?;
 
-        let (household_a, _) =
-            Household::spawn(fixture.peers.networking(a)?, fixture.store(a)?, None)?;
+        let (household_a, _) = fixture.household(a, None)?;
         let _server_a = fixture.run_server(a, &household_a).await?;
 
-        let (household_b, _) =
-            Household::spawn(fixture.peers.networking(b)?, fixture.store(b)?, None)?;
+        let (household_b, _) = fixture.household(b, None)?;
         let _server_b = fixture.run_server(b, &household_b).await?;
 
         let mut status_a = household_a.peer_status();
@@ -859,12 +872,10 @@ mod tests {
         let b = &fixture.peer_b.clone();
         fixture.peers.pick_port(&b)?;
 
-        let (household_a, _) =
-            Household::spawn(fixture.peers.networking(a)?, fixture.store(a)?, None)?;
+        let (household_a, _) = fixture.household(a, None)?;
         let _server_a = fixture.run_server(a, &household_a).await?;
 
-        let (household_b, _) =
-            Household::spawn(fixture.peers.networking(b)?, fixture.store(b)?, None)?;
+        let (household_b, _) = fixture.household(b, None)?;
         let server_b = fixture.run_server(b, &household_b).await?;
 
         let mut status_a = household_a.peer_status();
@@ -891,12 +902,10 @@ mod tests {
         fixture.peers.pick_port(&b)?;
 
         let (tx, mut rx) = mpsc::channel(10);
-        let (household_a, _) =
-            Household::spawn(fixture.peers.networking(a)?, fixture.store(a)?, Some(tx))?;
+        let (household_a, _) = fixture.household(a, Some(tx))?;
         let _server_a = fixture.run_server(a, &household_a).await?;
 
-        let (household_b, _) =
-            Household::spawn(fixture.peers.networking(b)?, fixture.store(b)?, None)?;
+        let (household_b, _) = fixture.household(b, None)?;
         let _server_b = fixture.run_server(b, &household_b).await?;
         household_a.keep_connected()?;
 

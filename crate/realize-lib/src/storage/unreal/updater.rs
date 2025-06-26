@@ -53,8 +53,8 @@ mod tests {
     use crate::model::Arena;
     use crate::model::Path;
     use crate::model::UnixTime;
-    use crate::storage::real::RealStore;
     use crate::storage::real::Notification;
+    use crate::storage::real::RealStore;
     use crate::storage::unreal::UnrealCacheBlocking;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::FileWriteStr as _;
@@ -103,10 +103,9 @@ mod tests {
 
         async fn subscribe(&self) -> anyhow::Result<()> {
             let (peerless_tx, mut peerless_rx) = mpsc::channel(10);
-            let subscribed = self
-                .storage
-                .subscribe(self.arena.clone(), peerless_tx, true /*catchup*/)
-                .await?;
+            let subscribed =
+                self.storage
+                    .subscribe(self.arena.clone(), peerless_tx, true /*catchup*/)?;
             assert!(subscribed);
 
             // Pretend the notifications come from a remote peer

@@ -1,4 +1,3 @@
-use anyhow::Context as _;
 use tarpc::client::stub::Stub;
 use tarpc::context;
 use tarpc::tokio_serde::formats::Bincode;
@@ -41,15 +40,8 @@ where
     let arenas = client.arenas(context::current()).await?;
 
     let (tx, mut rx) = mpsc::channel(100);
-    let res = futures::future::join_all(
-        arenas
-            .iter()
-            .map(|a| storage.subscribe(a.clone(), tx.clone(), true)),
-    )
-    .await;
-
-    for (arena, watched) in arenas.into_iter().zip(res.into_iter()) {
-        watched.with_context(|| format!("failed to watch {arena}"))?;
+    for arena in arenas {
+        storage.subscribe(arena, tx.clone(), true)?;
     }
     drop(tx);
 
