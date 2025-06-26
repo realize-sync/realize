@@ -1,8 +1,8 @@
-use super::peer_capnp::connected_peer::{self, RegisterParams, RegisterResults};
+use super::peer_capnp::connected_peer;
 use super::result_capnp;
 use super::store_capnp::notification;
 use super::store_capnp::store::{
-    self, ArenasParams, ArenasResults, ReadParams, ReadResults, SubscribeParams, SubscribeResults,
+    self, ArenasParams, ArenasResults, SubscribeParams, SubscribeResults,
 };
 use super::store_capnp::subscriber::{self, NotifyParams, NotifyResults};
 use crate::model::{Arena, Path, Peer, UnixTime};
@@ -239,10 +239,6 @@ impl AppContext {
         }
     }
 
-    fn register_peer(self: &Rc<Self>, _peer: &Peer, _store: store::Client) {
-        todo!();
-    }
-
     async fn track_peer(self: &Rc<Self>, peer: &Peer) {
         let retry_strategy =
             ExponentialBackoff::from_millis(500).max_delay(Duration::from_secs(5 * 60));
@@ -442,19 +438,6 @@ impl connected_peer::Server for ConnectedPeerServer {
 
         Promise::ok(())
     }
-
-    fn register(
-        &mut self,
-        params: RegisterParams,
-        _: RegisterResults,
-    ) -> Promise<(), capnp::Error> {
-        self.ctx.register_peer(
-            &self.peer,
-            capnp_rpc::pry!(capnp_rpc::pry!(params.get()).get_store()),
-        );
-
-        Promise::ok(())
-    }
 }
 
 impl store::Server for ConnectedPeerServer {
@@ -466,12 +449,6 @@ impl store::Server for ConnectedPeerServer {
         }
 
         Promise::ok(())
-    }
-
-    fn read(&mut self, _: ReadParams, _: ReadResults) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented(
-            "method store::Server::read not implemented".to_string(),
-        ))
     }
 
     fn subscribe(
