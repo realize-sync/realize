@@ -180,7 +180,6 @@ impl Collector {
 
     /// Handle inotify events.
     async fn handle_event(&mut self, ev: Event<OsString>) -> anyhow::Result<()> {
-        log::debug!("inotify ev: {ev:?}");
         if let Some(path) = self.wd.get(&ev.wd) {
             if let Some(filename) = &ev.name {
                 let full_path = path.join(filename);
