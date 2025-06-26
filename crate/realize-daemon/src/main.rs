@@ -6,11 +6,9 @@ use futures_util::stream::StreamExt as _;
 use prometheus::{register_int_counter, IntCounter};
 use realize_lib::fs::nfs;
 use realize_lib::logic::config::Config;
-use realize_lib::logic::setup;
+use realize_lib::logic::setup::Setup;
 use realize_lib::network::hostport::HostPort;
 use realize_lib::network::rpc::realstore::metrics;
-use realize_lib::network::Networking;
-use realize_lib::storage::unreal::Downloader;
 use realize_lib::utils::logging;
 use signal_hook_tokio::Signals;
 use std::path::{Path, PathBuf};
@@ -69,7 +67,7 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
     let config = parse_config(&cli.config)
         .with_context(|| format!("{}: failed to read TOML config file", cli.config.display()))?;
 
-    let networking = Networking::from_config(&config.network.peers, &cli.privkey)?;
+    let mut setup = Setup::new(config, &cli.privkey)?;
 
     if let Some(addr) = &cli.metrics_addr {
         metrics::export_metrics(addr)
@@ -79,10 +77,10 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
     }
 
     if let Some(addr) = &cli.nfs {
-        let cache = setup::setup_cache(&networking, &config.storage, &config.network)?;
+        let (cache, downloader) = setup.setup_cache()?;
         nfs::export(
-            cache.clone(),
-            Downloader::new(networking.clone(), cache),
+            cache,
+            downloader,
             HostPort::parse(addr)
                 .await
                 .with_context(|| format!("Failed to parse --nfs {}", addr))?
@@ -95,7 +93,7 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("Failed to parse --address {}", cli.address))?;
     log::debug!("Starting server on {}/{:?}...", hostport, hostport.addr());
-    let server = setup::setup_server(&networking, &config.storage)?;
+    let server = setup.setup_server()?;
 
     let addr = server
         .listen(&hostport)

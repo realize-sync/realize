@@ -4,69 +4,80 @@ use tokio::sync::mpsc;
 use tokio_retry::strategy::ExponentialBackoff;
 
 use crate::model::Arena;
-use crate::network::config::NetworkConfig;
 use crate::network::rpc::history::server::forward_peer_history;
 use crate::network::rpc::realstore;
 use crate::network::{Networking, Server};
-use crate::storage::config::{ArenaConfig, StorageConfig};
+use crate::storage::config::ArenaConfig;
 use crate::storage::real::RealStore;
-use crate::storage::unreal::keep_cache_updated;
 use crate::storage::unreal::UnrealCacheAsync;
+use crate::storage::unreal::{keep_cache_updated, Downloader};
 
-/// Setup server as specified in the configuration.
-///
-/// The returned server is configured, but not started.
-pub fn setup_server(
-    networking: &Networking,
-    storage_config: &StorageConfig,
-) -> anyhow::Result<Arc<Server>> {
-    check_directory_access(&storage_config.arenas)?;
-    let store = RealStore::from_config(&storage_config.arenas);
+use super::config::Config;
 
-    let mut server = Server::new(networking.clone());
-    realstore::server::register(&mut server, store.clone());
-
-    #[cfg(target_os = "linux")]
-    crate::network::rpc::history::client::register(&mut server, store.clone());
-
-    Ok(Arc::new(server))
+pub struct Setup {
+    networking: Networking,
+    config: Config,
 }
 
-/// Setup cache as specified in the configuration.
-///
-/// The content of the returned cache is kept up-to-date as much as
-/// possible by connecting to other peers to track changes.
-pub fn setup_cache(
-    networking: &Networking,
-    storage_config: &StorageConfig,
-    network_config: &NetworkConfig,
-) -> anyhow::Result<UnrealCacheAsync> {
-    let cache = UnrealCacheAsync::from_config(storage_config)?;
-    let retry_strategy =
-        ExponentialBackoff::from_millis(500).max_delay(Duration::from_secs(5 * 60));
+impl Setup {
+    pub fn new(config: Config, privkey: &std::path::Path) -> anyhow::Result<Self> {
+        let networking = Networking::from_config(&config.network.peers, privkey)?;
 
-    let arenas = storage_config
-        .arenas
-        .keys()
-        .map(|a| a.clone())
-        .collect::<Vec<Arena>>();
-    let (tx, rx) = mpsc::channel(100);
-    tokio::spawn(keep_cache_updated(cache.clone(), rx));
-
-    for (peer, peer_config) in &network_config.peers {
-        if !peer_config.address.is_some() {
-            continue;
-        }
-        tokio::spawn(forward_peer_history(
-            networking.clone(),
-            peer.clone(),
-            arenas.clone(),
-            retry_strategy.clone(),
-            tx.clone(),
-        ));
+        Ok(Self { networking, config })
     }
 
-    Ok(cache)
+    /// Setup cache as specified in the configuration.
+    ///
+    /// The content of the returned cache is kept up-to-date as much as
+    /// possible by connecting to other peers to track changes.
+    pub fn setup_cache(&mut self) -> anyhow::Result<(UnrealCacheAsync, Downloader)> {
+        let cache = UnrealCacheAsync::from_config(&self.config.storage)?;
+        let retry_strategy =
+            ExponentialBackoff::from_millis(500).max_delay(Duration::from_secs(5 * 60));
+
+        let arenas = self
+            .config
+            .storage
+            .arenas
+            .keys()
+            .map(|a| a.clone())
+            .collect::<Vec<Arena>>();
+        let (tx, rx) = mpsc::channel(100);
+        tokio::spawn(keep_cache_updated(cache.clone(), rx));
+
+        for (peer, peer_config) in &self.config.network.peers {
+            if !peer_config.address.is_some() {
+                continue;
+            }
+            tokio::spawn(forward_peer_history(
+                self.networking.clone(),
+                peer.clone(),
+                arenas.clone(),
+                retry_strategy.clone(),
+                tx.clone(),
+            ));
+        }
+
+        let downloader = Downloader::new(self.networking.clone(), cache.clone());
+
+        Ok((cache, downloader))
+    }
+
+    /// Setup server as specified in the configuration.
+    ///
+    /// The returned server is configured, but not started.
+    pub fn setup_server(self) -> anyhow::Result<Arc<Server>> {
+        check_directory_access(&self.config.storage.arenas)?;
+        let store = RealStore::from_config(&self.config.storage.arenas);
+
+        let mut server = Server::new(self.networking.clone());
+        realstore::server::register(&mut server, store.clone());
+
+        #[cfg(target_os = "linux")]
+        crate::network::rpc::history::client::register(&mut server, store.clone());
+
+        Ok(Arc::new(server))
+    }
 }
 
 /// Checks that all directories in the config file are accessible.
