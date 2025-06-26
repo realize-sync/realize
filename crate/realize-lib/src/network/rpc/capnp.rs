@@ -1,11 +1,14 @@
 use super::peer_capnp::connected_peer::{self, RegisterParams, RegisterResults};
+use super::result_capnp;
+use super::store_capnp::notification;
 use super::store_capnp::store::{
     self, ArenasParams, ArenasResults, ReadParams, ReadResults, SubscribeParams, SubscribeResults,
 };
-use crate::model::Peer;
+use super::store_capnp::subscriber::{self, NotifyParams, NotifyResults};
+use crate::model::{Arena, Path, Peer, UnixTime};
 use crate::network::rate_limit::RateLimitedStream;
 use crate::network::{Networking, Server};
-use crate::storage::real::RealStore;
+use crate::storage::real::{Notification, RealStore};
 use capnp::capability::Promise;
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
@@ -13,7 +16,7 @@ use capnp_rpc::{RpcSystem, VatNetwork as _};
 use futures::io::{BufReader, BufWriter};
 use futures::AsyncReadExt;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::thread;
 use std::time::Duration;
@@ -48,15 +51,17 @@ pub struct Household {
 }
 
 impl Household {
-    /// Spawn an new RPC thread and return th Household instance that
+    /// Spawn a new RPC thread and return the Household instance that
     /// manages it.
     pub fn spawn(
         networking: Networking,
         store: RealStore,
+        notification_tx: Option<mpsc::Sender<(Peer, Notification)>>,
     ) -> anyhow::Result<(Self, thread::JoinHandle<()>)> {
-        let (tx, connect_rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::unbounded_channel();
         let (broadcast_tx, _) = broadcast::channel(128);
-        let handle = spawn_rpc_thread(networking, store, connect_rx, broadcast_tx.clone())?;
+        let handle =
+            spawn_rpc_thread(networking, store, rx, notification_tx, broadcast_tx.clone())?;
 
         Ok((Self { tx, broadcast_tx }, handle))
     }
@@ -109,9 +114,10 @@ fn spawn_rpc_thread(
     networking: Networking,
     store: RealStore,
     mut rx: mpsc::UnboundedReceiver<HouseholdConnection>,
+    notification_tx: Option<mpsc::Sender<(Peer, Notification)>>,
     broadcast_tx: broadcast::Sender<PeerStatus>,
 ) -> anyhow::Result<thread::JoinHandle<()>> {
-    //let main_rt = runtime::Handle::current();
+    let main_rt = runtime::Handle::current();
     let rt = runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -120,7 +126,7 @@ fn spawn_rpc_thread(
     Ok(thread::Builder::new()
         .name("capnprpc".into())
         .spawn(move || {
-            let ctx = AppContext::new(networking, store, broadcast_tx);
+            let ctx = AppContext::new(networking, store, notification_tx, broadcast_tx, main_rt);
             let local = LocalSet::new();
 
             local.spawn_local(async move {
@@ -150,6 +156,8 @@ struct AppContext {
     networking: Networking,
     store: RealStore,
     broadcast_tx: broadcast::Sender<PeerStatus>,
+    notification_tx: Option<mpsc::Sender<(Peer, Notification)>>,
+    main_rt: runtime::Handle,
     connections: RefCell<HashMap<Peer, TrackedPeerConnections>>,
 }
 
@@ -157,12 +165,16 @@ impl AppContext {
     fn new(
         networking: Networking,
         store: RealStore,
+        notification_tx: Option<mpsc::Sender<(Peer, Notification)>>,
         broadcast_tx: broadcast::Sender<PeerStatus>,
+        main_rt: runtime::Handle,
     ) -> Rc<Self> {
         Rc::new(Self {
             networking,
             store,
+            notification_tx,
             broadcast_tx,
+            main_rt,
             connections: RefCell::new(HashMap::new()),
         })
     }
@@ -271,14 +283,14 @@ impl AppContext {
             });
             tokio::task::spawn_local(system);
 
-            let store = match get_connected_peer_store(&mut client).await {
+            let mut store = match get_connected_peer_store(&mut client).await {
                 Ok(store) => store,
                 Err(err) => {
                     log::debug!("Failed to get store from {peer}: {err}; Will retry.");
                     continue;
                 }
             };
-            self.set_tracked_client(peer, Some(store));
+            self.set_tracked_client(peer, Some(store.clone()));
             let _ = self.broadcast_tx.send(PeerStatus::Connected(peer.clone()));
             scopeguard::defer!({
                 self.set_tracked_client(peer, None);
@@ -288,7 +300,9 @@ impl AppContext {
             });
 
             //this.register_self(&client);
-            //this.subscribe_self(&peer, &mut store).await?;
+            if let Err(err) = self.subscribe_self(&peer, &mut store).await {
+                log::debug!("Failed to subscribe to {peer}: {err}");
+            }
 
             // We're fully connected. Reset the backoff delay for next time.
             current_backoff = None;
@@ -299,6 +313,56 @@ impl AppContext {
         }
     }
 
+    async fn subscribe_self(
+        self: &Rc<Self>,
+        peer: &Peer,
+        client: &mut store::Client,
+    ) -> anyhow::Result<()> {
+        if self.notification_tx.is_none() {
+            return Ok(());
+        }
+
+        let request = client.arenas_request();
+        let reply = request.send().promise.await?;
+        let arenas = reply.get()?.get_arenas()?;
+        let peer_arenas = parse_arena_set(arenas)?;
+
+        let mut goal_arenas = self.store.arenas();
+        goal_arenas.retain(|a| peer_arenas.contains(a));
+        if goal_arenas.is_empty() {
+            return Ok(());
+        }
+        log::debug!(
+            "Subscribe to {} on {peer}",
+            goal_arenas
+                .iter()
+                .map(|a| a.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        let mut request = client.subscribe_request();
+        let mut request_builder = request.get().init_req();
+        let mut arenas_builder = request_builder
+            .reborrow()
+            .init_arenas(goal_arenas.len() as u32);
+        for (i, arena) in goal_arenas.into_iter().enumerate() {
+            arenas_builder.set(i as u32, arena.as_str());
+        }
+        request_builder
+            .set_subscriber(ConnectedPeerServer::new(peer.clone(), self.clone()).into_subscriber());
+
+        let reply = request.send().promise.await?;
+        let result = reply.get()?.get_result()?;
+
+        if let result_capnp::result::Err(err) = result.which()? {
+            return Err(anyhow::anyhow!(err?.get_message()?.to_string()?));
+        }
+
+        Ok(())
+    }
+
+    /// Associate the given client with the peer.
     fn set_tracked_client(self: &Rc<Self>, peer: &Peer, client: Option<store::Client>) {
         self.connections
             .borrow_mut()
@@ -316,6 +380,26 @@ async fn get_connected_peer_store(
     let store = reply.get()?.get_store()?;
 
     Ok(store)
+}
+
+fn parse_arena(reader: capnp::text::Reader<'_>) -> Result<Arena, capnp::Error> {
+    Ok(Arena::from(reader.to_str()?))
+}
+
+fn parse_arena_set(arenas: capnp::text_list::Reader<'_>) -> Result<HashSet<Arena>, capnp::Error> {
+    let mut set = HashSet::new();
+    for arena in arenas.iter() {
+        set.insert(parse_arena(arena?)?);
+    }
+    Ok(set)
+}
+
+fn parse_mtime(reader: super::store_capnp::time::Reader<'_>) -> UnixTime {
+    UnixTime::new(reader.get_secs(), reader.get_nsecs())
+}
+
+fn parse_path(reader: capnp::text::Reader<'_>) -> Result<Path, capnp::Error> {
+    Path::parse(reader.to_str()?).map_err(|e| capnp::Error::failed(e.to_string()))
 }
 
 /// Implement capnp interface ConnectedPeer, defined in
@@ -336,6 +420,10 @@ impl ConnectedPeerServer {
     }
 
     fn into_store(self) -> store::Client {
+        capnp_rpc::new_client(self)
+    }
+
+    fn into_subscriber(self) -> subscriber::Client {
         capnp_rpc::new_client(self)
     }
 }
@@ -384,13 +472,198 @@ impl store::Server for ConnectedPeerServer {
 
     fn subscribe(
         &mut self,
-        _: SubscribeParams,
-        _: SubscribeResults,
-    ) -> Promise<(), ::capnp::Error> {
-        Promise::err(capnp::Error::unimplemented(
-            "method store::Server::subscribe not implemented".to_string(),
-        ))
+        params: SubscribeParams,
+        results: SubscribeResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::from_future(do_subscribe(Rc::clone(&self.ctx), params, results))
     }
+}
+
+impl subscriber::Server for ConnectedPeerServer {
+    fn notify(
+        &mut self,
+        params: NotifyParams,
+        _: NotifyResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        if let Some(tx) = &self.ctx.notification_tx {
+            Promise::from_future(do_notify(tx.clone(), self.peer.clone(), params))
+        } else {
+            Promise::ok(())
+        }
+    }
+}
+
+async fn do_notify(
+    notification_tx: mpsc::Sender<(Peer, Notification)>,
+    peer: Peer,
+    params: NotifyParams,
+) -> Result<(), capnp::Error> {
+    for n in params.get()?.get_notifications()?.iter() {
+        let to_send = match n.which()? {
+            notification::Which::Link(link) => {
+                let link = link?;
+
+                Notification::Link {
+                    arena: parse_arena(link.get_arena()?)?,
+                    path: parse_path(link.get_path()?)?,
+                    size: link.get_size(),
+                    mtime: parse_mtime(link.get_mtime()?),
+                }
+            }
+            notification::Which::Unlink(unlink) => {
+                let unlink = unlink?;
+
+                Notification::Unlink {
+                    arena: parse_arena(unlink.get_arena()?)?,
+                    path: parse_path(unlink.get_path()?)?,
+                    mtime: parse_mtime(unlink.get_mtime()?),
+                }
+            }
+            notification::Which::CatchingUp(catching_up) => Notification::CatchingUp {
+                arena: parse_arena(catching_up?.get_arena()?)?,
+            },
+            notification::Which::Catchup(catchup) => {
+                let catchup = catchup?;
+
+                Notification::Catchup {
+                    arena: parse_arena(catchup.get_arena()?)?,
+                    path: parse_path(catchup.get_path()?)?,
+                    size: catchup.get_size(),
+                    mtime: parse_mtime(catchup.get_mtime()?),
+                }
+            }
+            notification::Which::Ready(ready) => Notification::Ready {
+                arena: parse_arena(ready?.get_arena()?)?,
+            },
+        };
+        let _ = notification_tx.send((peer.clone(), to_send)).await;
+    }
+
+    Ok(())
+}
+
+async fn do_subscribe(
+    ctx: Rc<AppContext>,
+    params: SubscribeParams,
+    mut results: SubscribeResults,
+) -> Result<(), capnp::Error> {
+    let req = params.get()?.get_req()?;
+    let result = results.get().init_result();
+    let arenas = parse_arena_set(req.get_arenas()?)?;
+    if arenas.is_empty() {
+        result.init_ok();
+        return Ok(());
+    }
+
+    let subscriber = req.get_subscriber()?;
+
+    let (tx, mut rx) = mpsc::channel(100);
+    let store = ctx.store.clone();
+    if let Err(err) = ctx
+        .main_rt
+        .spawn(async move {
+            for arena in arenas {
+                store.subscribe(arena, tx.clone(), true).await?;
+            }
+
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+    {
+        result.init_err().set_message(err.to_string());
+        return Ok(());
+    }
+
+    tokio::task::spawn_local(async move {
+        let mut notifications = Vec::new();
+        loop {
+            let count = rx.recv_many(&mut notifications, 25).await;
+            if count == 0 {
+                // Channel has been closed
+                return;
+            }
+            if let Err(err) = send_notifications(notifications.as_slice(), &subscriber).await {
+                if err.kind == capnp::ErrorKind::Disconnected {
+                    return;
+                }
+            }
+            notifications.clear();
+        }
+    });
+
+    result.init_ok();
+    Ok(())
+}
+
+async fn send_notifications(
+    notifications: &[Notification],
+    client: &subscriber::Client,
+) -> Result<(), capnp::Error> {
+    let mut request = client.notify_request();
+    let mut builder = request.get().init_notifications(notifications.len() as u32);
+    for (i, notif) in notifications.iter().enumerate() {
+        let notif_builder = builder.reborrow().get(i as u32);
+        match notif {
+            Notification::Link {
+                arena,
+                path,
+                size,
+                mtime,
+            } => fill_link(notif_builder.init_link(), arena, path, *size, mtime),
+
+            Notification::Catchup {
+                arena,
+                path,
+                size,
+                mtime,
+            } => fill_link(notif_builder.init_catchup(), arena, path, *size, mtime),
+
+            Notification::Unlink { arena, path, mtime } => {
+                fill_unlink(notif_builder.init_unlink(), arena, path, mtime)
+            }
+
+            Notification::CatchingUp { arena } => {
+                notif_builder.init_catching_up().set_arena(arena.as_str())
+            }
+
+            Notification::Ready { arena } => notif_builder.init_ready().set_arena(arena.as_str()),
+        }
+    }
+    let _ = request.send().promise.await?;
+
+    Ok(())
+}
+
+fn fill_link(
+    mut builder: super::store_capnp::link::Builder<'_>,
+    arena: &Arena,
+    path: &crate::model::Path,
+    size: u64,
+    mtime: &crate::model::UnixTime,
+) {
+    builder.set_arena(arena.as_str());
+    builder.set_path(path.as_str());
+    builder.set_size(size);
+    fill_time(builder.init_mtime(), mtime);
+}
+
+fn fill_unlink(
+    mut builder: super::store_capnp::unlink::Builder<'_>,
+    arena: &Arena,
+    path: &crate::model::Path,
+    mtime: &crate::model::UnixTime,
+) {
+    builder.set_arena(arena.as_str());
+    builder.set_path(path.as_str());
+    fill_time(builder.init_mtime(), mtime);
+}
+
+fn fill_time(
+    mut mtime_builder: super::store_capnp::time::Builder<'_>,
+    mtime: &crate::model::UnixTime,
+) {
+    mtime_builder.set_secs(mtime.as_secs());
+    mtime_builder.set_nsecs(mtime.subsec_nanos());
 }
 
 #[cfg(test)]
@@ -398,7 +671,7 @@ mod tests {
     use std::sync::Arc;
 
     use assert_fs::{
-        prelude::{PathChild as _, PathCreateDir as _},
+        prelude::{FileWriteStr as _, PathChild as _, PathCreateDir as _},
         TempDir,
     };
     use tokio::task::LocalSet;
@@ -491,7 +764,7 @@ mod tests {
 
         let peer = &fixture.peer_a.clone();
         let (household, _) =
-            Household::spawn(fixture.peers.networking(peer)?, fixture.store(peer)?)?;
+            Household::spawn(fixture.peers.networking(peer)?, fixture.store(peer)?, None)?;
         let _server = fixture.run_server(peer, &household).await?;
 
         let networking = fixture.peers.networking(&fixture.peer_b)?;
@@ -522,7 +795,7 @@ mod tests {
 
         let peer = &fixture.peer_a.clone();
         let (household, thread_join) =
-            Household::spawn(fixture.peers.networking(peer)?, fixture.store(peer)?)?;
+            Household::spawn(fixture.peers.networking(peer)?, fixture.store(peer)?, None)?;
         let server = fixture.run_server(peer, &household).await?;
 
         let networking = fixture.peers.networking(&fixture.peer_b)?;
@@ -556,10 +829,12 @@ mod tests {
         let b = &fixture.peer_b.clone();
         fixture.peers.pick_port(&b)?;
 
-        let (household_a, _) = Household::spawn(fixture.peers.networking(a)?, fixture.store(a)?)?;
+        let (household_a, _) =
+            Household::spawn(fixture.peers.networking(a)?, fixture.store(a)?, None)?;
         let _server_a = fixture.run_server(a, &household_a).await?;
 
-        let (household_b, _) = Household::spawn(fixture.peers.networking(b)?, fixture.store(b)?)?;
+        let (household_b, _) =
+            Household::spawn(fixture.peers.networking(b)?, fixture.store(b)?, None)?;
         let _server_b = fixture.run_server(b, &household_b).await?;
 
         let mut status_a = household_a.peer_status();
@@ -584,10 +859,12 @@ mod tests {
         let b = &fixture.peer_b.clone();
         fixture.peers.pick_port(&b)?;
 
-        let (household_a, _) = Household::spawn(fixture.peers.networking(a)?, fixture.store(a)?)?;
+        let (household_a, _) =
+            Household::spawn(fixture.peers.networking(a)?, fixture.store(a)?, None)?;
         let _server_a = fixture.run_server(a, &household_a).await?;
 
-        let (household_b, _) = Household::spawn(fixture.peers.networking(b)?, fixture.store(b)?)?;
+        let (household_b, _) =
+            Household::spawn(fixture.peers.networking(b)?, fixture.store(b)?, None)?;
         let server_b = fixture.run_server(b, &household_b).await?;
 
         let mut status_a = household_a.peer_status();
@@ -599,6 +876,65 @@ mod tests {
 
         let _server_b = fixture.run_server(b, &household_b).await?;
         assert_eq!(PeerStatus::Connected(b.clone()), status_a.recv().await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn household_subscribes() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+
+        let a = &fixture.peer_a.clone();
+        fixture.peers.pick_port(&a)?;
+
+        let b = &fixture.peer_b.clone();
+        fixture.peers.pick_port(&b)?;
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let (household_a, _) =
+            Household::spawn(fixture.peers.networking(a)?, fixture.store(a)?, Some(tx))?;
+        let _server_a = fixture.run_server(a, &household_a).await?;
+
+        let (household_b, _) =
+            Household::spawn(fixture.peers.networking(b)?, fixture.store(b)?, None)?;
+        let _server_b = fixture.run_server(b, &household_b).await?;
+        household_a.keep_connected()?;
+
+        let arena = &fixture.arena;
+        let b = TestingPeers::b();
+        assert_eq!(
+            Some((
+                b.clone(),
+                Notification::CatchingUp {
+                    arena: arena.clone()
+                }
+            )),
+            rx.recv().await
+        );
+        assert_eq!(
+            Some((
+                b.clone(),
+                Notification::Ready {
+                    arena: arena.clone()
+                }
+            )),
+            rx.recv().await
+        );
+
+        let file_in_b = fixture.tempdir.child("b/test.txt");
+        file_in_b.write_str("test")?;
+        assert_eq!(
+            Some((
+                b.clone(),
+                Notification::Link {
+                    arena: arena.clone(),
+                    path: Path::parse("test.txt")?,
+                    size: 4,
+                    mtime: UnixTime::from_system_time(file_in_b.metadata()?.modified()?)?,
+                }
+            )),
+            rx.recv().await
+        );
 
         Ok(())
     }

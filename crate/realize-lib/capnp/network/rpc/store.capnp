@@ -44,38 +44,40 @@ struct SubscribeError {
 }
 
 interface Subscriber {
-  notify @0 (notification: List(Notification));
+  notify @0 (notifications: List(Notification));
 }
 
 struct Notification {
   union {
-    link: group {
-      arena @0: Text;
-      path @1: Text;
-      size @2: UInt64;
-      mtime @3: Time;
-    }
-    unlink: group {
-      arena @4: Text;
-      path @5: Text;
-      mtime @6: Time;
-    }
-    catchingUp: group {
-      arena @7: Text;
-    }
-    catchup: group {
-      arena @8: Text;
-      path @9: Text;
-      size @10: UInt64;
-      mtime @11: Time;    
-    }
-    ready: group {
-      arena @12:Text; 
-   }
+    link @0: Link;
+    unlink @1: Unlink;
+    catchingUp @2: CatchingUp;
+    catchup @3: Link;
+    ready @4: Ready;
   }
+}
+
+struct CatchingUp {
+  arena @0: Text;
+}
+struct Ready {
+  arena @0: Text;
+}
+struct Link {
+  arena @0: Text;
+  path @1: Text;
+  size @2: UInt64;
+  mtime @3: Time;
+}
+
+struct Unlink {
+  arena @0: Text;
+  path @1: Text;
+  size @2: UInt64;
+  mtime @3: Time;
 }
 
 struct Time {
   secs @0: UInt64;
-  nsecs @1: UInt64;
+  nsecs @1: UInt32;
 }
