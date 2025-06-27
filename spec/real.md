@@ -37,18 +37,19 @@ Design and implementation happens in stages, incrementally:
    implemented based on
    [inotify](https://man7.org/linux/man-pages/man7/inotify.7.html).
    
-3. Track changes and file content hash in an index table. Upon
-   restart, catchup with the latest changes by comparing index with
-   directory content, is a requirement for the next two phases. [Index]
+3. Track changes and file content hash, used as both integrity check
+   and version, in an index table. Upon restart, catchup with the
+   latest changes by comparing index with directory content. This is a
+   requirement for the next two phases. [Index]
    
 4. Report local change to remote data to peers and update local data
    on interested peers (consensus) using such reports. Remove local
    data after synced for files we don't want to keep locally.
    [History] and [Consensus]
 
-5. Switch `RealStoreService` to using blobs, identified with hashes to
-   download data. This allows [The Unreal](./unreal.md) to store and
-   serve file data. [Future](./unreal.md#Future)
+5. Use hashes to download the right version of a file or make sure
+   file content is consistent. This allows [The Unreal](./unreal.md)
+   to store and serve file data. [Future](./unreal.md#Future)
 
 ## Details
 
@@ -97,13 +98,18 @@ design](./design.md)), the following modifications:
 
 `Notification`:
 
-- `Link(arena, path, mtime, blob)`: file content set to blob, identified by its hash
+- `Link(arena, path, mtime, size, hash, old_hash)`: set file content,
+  versioned by its hash. old_hash optionally identifies previous
+  content for the path.
 
-- `Available(arena, path, mtime, blob)`: remote file was downloaded and made available locally
+- `Available(arena, path, mtime, size, hash)`: remote file was
+  downloaded and made available locally
 
-- `Unlink(arena, path, mtime)`: file has no content anymore
+- `Unlink(arena, path, old_hash)`: file has no content anymore.
+  old_hash identifies the version that was removed
 
-- `Drop(arena, path, mtime)`: file was removed locally, but is still available remotely
+- `Drop(arena, path, hash)`: file was removed locally, but is still
+  available remotely
 
 > [!NOTE] Phase 1 also includes CatchupStart(arena), Catchup(arena,
 > path, mtime), Ready(arena) This is gone in phase 2, described here.
@@ -123,21 +129,27 @@ being reported as deleted and moved in the history.
 
 Exact mapping TBD.
 
-These notifications are sent to peers through the `HistoryService`
+These notifications are sent to peers through the `Store` interface.
 
-#### HistoryService
+#### Store interface
 
-The history service allows peer A connecting to peer B to be notified
-of changes on peer B local store. 
+This RPC interface, define in `store.capnp` allows peer A connecting
+to peer B to be notified of changes on peer B local store.
 
 Peer B calls the following RPC on peer A:
 
-```rust
+```
+interface Store {
     /// Arenas the connecting peer is interested in. 
-    async fn arenas() -> Vec<Arena>;
+    arenas @0 () -> (arenas: List(Text));
     
     /// Local modifications reported by the connected peer.
-    async fn notify(batch: Vec<Notification>);
+    subscribe @1 (arenas: List(Text), sub: Subscriber);
+}
+
+interface Subscriber {
+    notify @0 (n: List(Notification));
+}
 ```
 
 `Notification` is described in the previous section.
@@ -145,21 +157,25 @@ Peer B calls the following RPC on peer A:
 ### Consensus
 
 Peers listen to notifications from remote peer's [History] and apply
-`Link` and `Unlink` modifications locally as follow:
+`Link` and `Unlink` modifications locally.
 
-- if local file has been reported as `Unlink` with a more recent
-  mtime, delete it
+`Unlink` and `Link` are ignored if old_hash doesn't match the current version, unless history is known to have been lost (catching up)
 
-- if local file has been report as `Link` with a more recent mtime and
-  a different blob, download that blob and replace the local version
-  with that .
-
-- if no local file reported by `Link` exists and it is in a *own*
-  directory, download it
+- if local file with matching hash has been reported as `Unlink`,
+  delete it
+  
+- if local file with matching hash has been reported as being
+  modified by `Link`, download the new version 
+  
+- if no local file exists reported by `Link` and it is in an 
+  *own* directory, download it
 
 - if local file marked *watch* has been reported as `Available` with
-  the same mtime and blob, delete it
+  the same hash, delete it
 
+This leaves local file with a different hash than the hash reported by
+a notification. Such conflict should be added to a table of conflicts
+requiring manual intervention.
 
 For that to work, files, directories and arenas roots can be marked
 *watch* or *own*.

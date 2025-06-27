@@ -5,7 +5,7 @@
 Export a filesystem using
 [nfsserve](https://github.com/xetdata/nfsserve) based on a
 [redb](https://github.com/cberner/redb/tree/master) database and local
-(blob) storage.
+storage.
 
 The filesystem works as a cache for remote data. It caches the file
 hierarchy available on remote peers and makes them visible through the
@@ -26,7 +26,6 @@ Design and implementation happens in stages, incrementally:
 1. Store file hierarchy, described and implemented.
 2. Serve data from network, described and implemented.
 3. Store file content, in an expiring cache, see [Future].
-4. Store file data as blob, see [Future].
 
 ## Details
 
@@ -36,8 +35,8 @@ system to maintain a local understanding of remote file availability
 without constant network communication.
 
 The initial implementation described here tracks file paths and their
-last modification time. The more advanced blob-based storage with
-Merkle trees will be built on top of this foundation.
+last modification time. The more advanced storage, versioned with
+hashes will be built on top of this foundation.
 
 File hierarchy and path assignment is never evicted from the cache.
 There must be enough place to store file hierarchy from all peers.
@@ -98,7 +97,7 @@ user waiting for the result. It must be done efficiently
    RealStoreService::list and HistoryService::notify)
 
   - a list of (peer, arena, path, size, mtime) and, in the future
-    (peer, arena, path, blob id) + (peer, blob id, blob content))
+    (peer, arena, path, size, mtime, hash)
 
   - as notifications come in (Notification::Unlink and
     Notification::Link from HistoryService), the internal state must
@@ -351,18 +350,16 @@ Value:
 struct FileEntry {
   /// The arena to use to fetch file content in the peer.
   ///
-  /// This is stored here as a key to fetch file content,
-  /// to be replaced by a blob id.
+  /// This is stored here as a key to fetch file content.
   arena: model::Arena,
 
   /// The path to use to fetch file content in the peer.
   ///
   /// Note that it shouldn't matter whether the path
   /// here matches the path which led to this file. This
-  /// is to be treated as a key for downloading and nothing else..
+  /// is to be treated as a key for downloading.
   ///
-  /// This is stored here as a key to fetch file content,
-  /// to be replaced by a blob id.
+  /// This is stored here as a key to fetch file content.
   path: model::Path,
 
   metadata:FileMetadata,
@@ -415,22 +412,10 @@ room, if necessary.
 
 Details TBD
 
-### Blob Storage
+### Versioned Storage
 
-The database will be extended to support blob-based storage, the
-database will store blobs, identified by their hash. The file
-hierarchy gives names to blobs.
-
-Some rough ideas:
-
-*   **Blobs Table**: `hash -> reference count + (set of blob
-    hash)|(path of block)`
-*   **Merkle Trees**: File hashes will be constructed as Merkle trees
-    to efficiently verify partial content.
-*   **Block Storage**: Individual file blocks will be stored on disk,
-    named by their hash.
-
-This require `RealStoreService` to work with blobs as well, so work
-needs to start in [The Real](./real.md)
+The database will be extended to support versioning of file content,
+using their hashes. Hashes can be used to identify file content in the
+database (blob storage).
 
 Details TBD
