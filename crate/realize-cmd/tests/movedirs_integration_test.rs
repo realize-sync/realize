@@ -439,9 +439,7 @@ async fn systemd_log_output_format() -> anyhow::Result<()> {
 async fn max_duration_timeout() -> anyhow::Result<()> {
     let fixture = Fixture::setup_and_start_servers().await?;
 
-    let output = fixture
-        .run_with_args(vec!["--max-duration", "10ms"])
-        .await?;
+    let output = fixture.run_with_args(vec!["--max-duration", "1ms"]).await?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
