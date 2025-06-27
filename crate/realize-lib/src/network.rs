@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path;
 use std::sync::Arc;
-use tarpc::serde_transport as transport;
 use tarpc::tokio_serde::formats::Bincode;
 use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -90,7 +89,7 @@ impl Networking {
         tag: &[u8; 4],
         limiter: Option<Limiter>,
     ) -> Result<
-        transport::Transport<
+        tarpc::serde_transport::Transport<
             tokio_rustls::client::TlsStream<RateLimitedStream<TcpStream>>,
             Req,
             Resp,
@@ -104,7 +103,7 @@ impl Networking {
     {
         let tls_stream = self.connect_raw(peer, tag, limiter).await?;
 
-        let transport = transport::new(
+        let transport = tarpc::serde_transport::new(
             LengthDelimitedCodec::builder().new_framed(tls_stream),
             Bincode::default(),
         );
