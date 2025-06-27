@@ -673,11 +673,7 @@ async fn shorten_file(file: &mut File, file_size: u64) -> Result<(), RealStoreEr
     Ok(())
 }
 
-async fn write_at_offset(
-    file: &mut File,
-    offset: u64,
-    data: &Vec<u8>,
-) -> Result<(), RealStoreError> {
+async fn write_at_offset(file: &mut File, offset: u64, data: &[u8]) -> Result<(), RealStoreError> {
     file.seek(SeekFrom::Start(offset)).await?;
     file.write_all(data).await?;
     file.flush().await?;

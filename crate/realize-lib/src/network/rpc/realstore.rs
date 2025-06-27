@@ -172,9 +172,9 @@ impl RangedHash {
 
     /// Create a [RangedHash] with a single hash.
     pub fn single(range: ByteRange, hash: Hash) -> Self {
-        let mut hashes = Vec::new();
-        hashes.push(RangedHashEntry { range, hash });
-        RangedHash { hashes }
+        RangedHash {
+            hashes: vec![RangedHashEntry { range, hash }],
+        }
     }
 
     /// The number of hashes within this instance.

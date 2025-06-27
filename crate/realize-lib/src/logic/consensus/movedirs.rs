@@ -383,19 +383,17 @@ where
     let src_hash = src_hash?;
 
     // 3. Check hash, return if succeeds
-    let correct;
     report_verifying(&progress_tx, &arena, &path).await;
-    match check_hashes_and_delete(ctx, &src_hash, src_size, src, dst, &arena, &path).await? {
-        HashCheck::Match => {
-            return Ok(());
-        }
-        HashCheck::Mismatch {
-            partial_match: matches,
-            ..
-        } => {
-            correct = matches;
-        }
-    }
+    let correct =
+        match check_hashes_and_delete(ctx, &src_hash, src_size, src, dst, &arena, &path).await? {
+            HashCheck::Match => {
+                return Ok(());
+            }
+            HashCheck::Mismatch {
+                partial_match: matches,
+                ..
+            } => matches,
+        };
 
     // 4. Use rsync to fix any mismatch
     let mut fallback_ranges = ByteRanges::new();

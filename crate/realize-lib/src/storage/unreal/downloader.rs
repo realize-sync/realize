@@ -5,7 +5,7 @@ use crate::network::rpc::realstore::client::{ClientOptions, RealStoreClient};
 use crate::network::rpc::realstore::{self};
 use crate::storage::real::{self, RealStoreError};
 use moka::future::{Cache, CacheBuilder};
-use std::cmp::{max, min};
+use std::cmp::min;
 use std::collections::VecDeque;
 use std::io::{ErrorKind, SeekFrom};
 use std::pin::Pin;
@@ -79,14 +79,12 @@ impl Downloader {
             });
         }
         while let Some(res) = set.join_next().await {
-            if let Ok(res) = res {
-                if let Ok((client, peer, entry)) = res {
-                    let client = Arc::new(client);
-                    self.clients.insert(peer.clone(), Arc::clone(&client)).await;
-                    // TODO: consider keeping any other successful
-                    // connections here instead of discarding them.
-                    return Ok((client, peer, entry));
-                }
+            if let Ok(Ok((client, peer, entry))) = res {
+                let client = Arc::new(client);
+                self.clients.insert(peer.clone(), Arc::clone(&client)).await;
+                // TODO: consider keeping any other successful
+                // connections here instead of discarding them.
+                return Ok((client, peer, entry));
             }
         }
         Err(UnrealError::Unavailable)
@@ -188,7 +186,7 @@ impl Download {
             next,
             min(
                 end,
-                next + min(MAX_CHUNK_SIZE, max(MIN_CHUNK_SIZE, bufsize)) as u64,
+                next + bufsize.clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE) as u64,
             ),
         );
 

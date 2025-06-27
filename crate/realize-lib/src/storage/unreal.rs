@@ -13,6 +13,10 @@ mod error;
 mod future;
 mod sync;
 mod updater;
+#[allow(dead_code)]
+#[allow(unknown_lints)]
+#[allow(clippy::uninlined_format_args)]
+#[allow(clippy::extra_unused_type_parameters)]
 mod unreal_capnp {
     include!(concat!(env!("OUT_DIR"), "/unreal_capnp.rs"));
 }
@@ -148,7 +152,7 @@ enum DirTableEntry {
     Dot(UnixTime),
 }
 impl DirTableEntry {
-    fn as_readdir_entry(self, inode: u64) -> ReadDirEntry {
+    fn into_readdir_entry(self, inode: u64) -> ReadDirEntry {
         match self {
             DirTableEntry::Regular(e) => e,
             DirTableEntry::Dot(_) => ReadDirEntry {

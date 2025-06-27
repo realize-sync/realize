@@ -222,7 +222,7 @@ impl UnrealCacheBlocking {
             .ok_or(UnrealError::NotFound)?
             .value()
             .parse()?
-            .as_readdir_entry(parent_inode))
+            .into_readdir_entry(parent_inode))
     }
 
     /// Lookup the inode and type of the file or directory pointed to by a path.
@@ -560,7 +560,7 @@ fn get_dir_entry(
 ) -> Result<Option<ReadDirEntry>, UnrealError> {
     match dir_table.get((parent_inode, name))? {
         None => Ok(None),
-        Some(e) => Ok(Some(e.value().parse()?.as_readdir_entry(parent_inode))),
+        Some(e) => Ok(Some(e.value().parse()?.into_readdir_entry(parent_inode))),
     }
 }
 

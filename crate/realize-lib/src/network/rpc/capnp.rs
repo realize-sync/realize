@@ -92,7 +92,7 @@ impl Household {
             // TODO: support shutdown_rx
             let _ = tx.send(HouseholdConnection::Incoming {
                 peer,
-                stream,
+                stream: Box::new(stream),
                 shutdown_rx,
             });
         })
@@ -105,7 +105,7 @@ enum HouseholdConnection {
     /// be handled there.
     Incoming {
         peer: Peer,
-        stream: tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
+        stream: Box<tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>>,
         shutdown_rx: broadcast::Receiver<()>,
     },
     KeepConnected,
@@ -186,7 +186,7 @@ impl AppContext {
     fn accept(
         self: &Rc<Self>,
         peer: Peer,
-        stream: tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
+        stream: Box<tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>>,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) {
         let client = ConnectedPeerServer::new(peer.clone(), Rc::clone(self)).into_connected_peer();

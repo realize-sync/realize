@@ -97,7 +97,7 @@ impl CliProgress {
             HumanBytes(bytes)
         );
 
-        let mut pb = self.multi.insert_from_back(1, ProgressBar::new(bytes));
+        let pb = self.multi.insert_from_back(1, ProgressBar::new(bytes));
         pb.set_message(path.to_string());
         pb.set_prefix("Pending");
         pb.inc(available);
@@ -105,7 +105,7 @@ impl CliProgress {
         let index = self.next_file_index;
         self.next_file_index += 1;
         let tag = format!("{}/{}", index, self.total_files);
-        set_bar_style(&mut pb, &tag, false);
+        set_bar_style(&pb, &tag, false);
 
         CliFileProgress {
             pb,
@@ -297,7 +297,7 @@ impl CliFileProgress {
 
         // If we enter this state, things have gone wrong. Change the
         // color to yellow.
-        set_bar_style(&mut self.pb, &self.tag, true);
+        set_bar_style(&self.pb, &self.tag, true);
         self.pb.set_prefix("Rsyncing");
     }
 

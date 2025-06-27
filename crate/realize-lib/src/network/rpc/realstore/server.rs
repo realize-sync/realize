@@ -28,7 +28,7 @@ pub type InProcessRealStoreServiceClient = RealStoreServiceClient<InProcessStub>
 
 /// Creates a in-process client that works on the given directories.
 pub fn create_inprocess_client(storage: RealStore) -> InProcessRealStoreServiceClient {
-    RealStoreServer::new(storage).as_inprocess_client()
+    RealStoreServer::new(storage).into_inprocess_client()
 }
 
 pub struct InProcessStub {
@@ -83,7 +83,7 @@ impl RealStoreServer {
     }
 
     /// Create an in-process RealStoreServiceClient for this server instance.
-    pub(crate) fn as_inprocess_client(self) -> InProcessRealStoreServiceClient {
+    pub(crate) fn into_inprocess_client(self) -> InProcessRealStoreServiceClient {
         let (client_transport, server_transport) = tarpc::transport::channel::unbounded();
         let server = tarpc::server::BaseChannel::with_defaults(server_transport);
         tokio::spawn(
