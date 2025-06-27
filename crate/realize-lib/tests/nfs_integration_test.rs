@@ -50,7 +50,7 @@ async fn export_linked_files() -> anyhow::Result<()> {
     while let Some(entry) = dir_content.next_entry().await? {
         entries.push(entry);
     }
-    entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    entries.sort_by_key(|a| a.file_name());
     assert_eq!(2, entries.len());
 
     let c = &entries[0];

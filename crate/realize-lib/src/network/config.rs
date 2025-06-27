@@ -7,6 +7,12 @@ pub struct NetworkConfig {
     pub peers: HashMap<Peer, PeerConfig>,
 }
 
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NetworkConfig {
     pub fn new() -> Self {
         NetworkConfig {

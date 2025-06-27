@@ -86,9 +86,9 @@ impl CliProgress {
         available: u64,
     ) -> CliFileProgress {
         let path = if self.should_show_dir {
-            format!("{}/{}", arena, path)
+            format!("{arena}/{path}")
         } else {
-            format!("{}", path)
+            format!("{path}")
         };
         log::info!(
             "Preparing to move {} ({}/{})",

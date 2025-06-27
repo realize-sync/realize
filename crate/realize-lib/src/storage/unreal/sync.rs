@@ -120,8 +120,7 @@ impl UnrealCacheBlocking {
     /// is available in the cache.
     pub fn arena_root(&self, arena: &Arena) -> Result<u64, UnrealError> {
         self.arena_map
-            .get(arena)
-            .map(|inode| *inode)
+            .get(arena).copied()
             .ok_or_else(|| UnrealError::UnknownArena(arena.clone()))
     }
 
@@ -207,7 +206,7 @@ impl UnrealCacheBlocking {
         mtime: &UnixTime,
     ) -> Result<(), UnrealError> {
         let txn = self.db.begin_write()?;
-        do_unlink(&txn, peer, self.arena_root(arena)?, path, &mtime)?;
+        do_unlink(&txn, peer, self.arena_root(arena)?, path, mtime)?;
         txn.commit()?;
         Ok(())
     }

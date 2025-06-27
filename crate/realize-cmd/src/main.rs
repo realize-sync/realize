@@ -191,7 +191,7 @@ async fn execute(cli: &Cli) -> anyhow::Result<i32> {
         .with_context(|| format!("{}: failed to read TOML config file", cli.config.display()))?;
     let networking = Networking::from_config(&config.peers, &cli.privkey)?;
 
-    let mut signals = Signals::new(&[
+    let mut signals = Signals::new([
         signal_hook::consts::SIGHUP,
         signal_hook::consts::SIGTERM,
         signal_hook::consts::SIGINT,
@@ -280,10 +280,7 @@ async fn run_with_progress(
     let (total_success, total_error, total_interrupted, interrupted) = res?;
     if total_error > 0 {
         log::error!(
-            "{} file(s) failed, {} file(s) moved, {} interrupted",
-            total_error,
-            total_success,
-            total_interrupted
+            "{total_error} file(s) failed, {total_success} file(s) moved, {total_interrupted} interrupted"
         );
         match cli.output {
             OutputMode::Log => {}
@@ -325,7 +322,7 @@ async fn run_with_progress(
         "SUCCESS {} file(s) moved{}",
         total_success,
         if total_interrupted > 0 {
-            format!(", {} interrupted", total_interrupted)
+            format!(", {total_interrupted} interrupted")
         } else {
             String::new()
         }
@@ -336,7 +333,7 @@ async fn run_with_progress(
             style("SUCCESS").for_stdout().green().bold(),
             total_success,
             if total_interrupted > 0 {
-                format!(", {} interrupted", total_interrupted)
+                format!(", {total_interrupted} interrupted")
             } else {
                 String::new()
             }
@@ -359,7 +356,7 @@ async fn connect(
     }
     options.connection_events = Some(conn_status);
 
-    Ok(realstore::client::connect(networking, &Peer::from(peer), options).await?)
+    realstore::client::connect(networking, &Peer::from(peer), options).await
 }
 
 /// Set server-site write rate limit on client, return it.
@@ -384,7 +381,7 @@ async fn configure_limit(
 
 /// Print a warning message to stderr, with standard format.
 fn print_warning(mode: OutputMode, msg: &str) {
-    log::warn!("{}", msg);
+    log::warn!("{msg}");
     match mode {
         OutputMode::Log => {}
         OutputMode::Quiet | OutputMode::Progress => {
@@ -395,7 +392,7 @@ fn print_warning(mode: OutputMode, msg: &str) {
 
 /// Print an error message to stderr, with standard format.
 fn print_error(mode: OutputMode, msg: &str) {
-    log::error!("{}", msg);
+    log::error!("{msg}");
     match mode {
         OutputMode::Log => {}
         OutputMode::Quiet | OutputMode::Progress => {

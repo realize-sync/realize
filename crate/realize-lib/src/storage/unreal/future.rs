@@ -24,7 +24,7 @@ impl UnrealCacheAsync {
             .as_ref()
             .ok_or(anyhow::anyhow!("cache section missing from config file"))?;
         let mut cache = UnrealCacheBlocking::open(&cache_config.db)?;
-        for (arena, _) in &config.arenas {
+        for arena in config.arenas.keys() {
             cache.add_arena(arena)?;
         }
         Ok(cache.into_async())
@@ -73,7 +73,7 @@ impl UnrealCacheAsync {
         let mtime = mtime.clone();
         let inner = Arc::clone(&self.inner);
 
-        Ok(task::spawn_blocking(move || inner.link(&peer, &arena, &path, size, &mtime)).await??)
+        task::spawn_blocking(move || inner.link(&peer, &arena, &path, size, &mtime)).await?
     }
 
     /// Async version of [BlockingUnrealCache::unlink]
@@ -90,7 +90,7 @@ impl UnrealCacheAsync {
         let mtime = mtime.clone();
         let inner = Arc::clone(&self.inner);
 
-        Ok(task::spawn_blocking(move || inner.unlink(&peer, &arena, &path, &mtime)).await??)
+        task::spawn_blocking(move || inner.unlink(&peer, &arena, &path, &mtime)).await?
     }
 
     /// Async version of [BlockingUnrealCache::catchup]
@@ -108,17 +108,15 @@ impl UnrealCacheAsync {
         let mtime = mtime.clone();
         let inner = Arc::clone(&self.inner);
 
-        Ok(
-            task::spawn_blocking(move || inner.catchup(&peer, &arena, &path, size, &mtime))
-                .await??,
-        )
+        task::spawn_blocking(move || inner.catchup(&peer, &arena, &path, size, &mtime))
+                .await?
     }
 
     pub async fn lookup(&self, parent_inode: u64, name: &str) -> Result<ReadDirEntry, UnrealError> {
         let name = name.to_string();
         let inner = Arc::clone(&self.inner);
 
-        Ok(task::spawn_blocking(move || inner.lookup(parent_inode, &name)).await??)
+        task::spawn_blocking(move || inner.lookup(parent_inode, &name)).await?
     }
 
     pub async fn lookup_path(
@@ -129,13 +127,13 @@ impl UnrealCacheAsync {
         let path = path.clone();
         let inner = Arc::clone(&self.inner);
 
-        Ok(task::spawn_blocking(move || inner.lookup_path(parent_inode, &path)).await??)
+        task::spawn_blocking(move || inner.lookup_path(parent_inode, &path)).await?
     }
 
     pub async fn file_metadata(&self, inode: u64) -> Result<FileMetadata, UnrealError> {
         let inner = Arc::clone(&self.inner);
 
-        Ok(task::spawn_blocking(move || inner.file_metadata(inode)).await??)
+        task::spawn_blocking(move || inner.file_metadata(inode)).await?
     }
 
     pub async fn file_availability(
@@ -144,19 +142,19 @@ impl UnrealCacheAsync {
     ) -> Result<Vec<(Peer, FileTableEntry)>, UnrealError> {
         let inner = Arc::clone(&self.inner);
 
-        Ok(task::spawn_blocking(move || inner.file_availability(inode)).await??)
+        task::spawn_blocking(move || inner.file_availability(inode)).await?
     }
 
     pub async fn dir_mtime(&self, inode: u64) -> Result<UnixTime, UnrealError> {
         let inner = Arc::clone(&self.inner);
 
-        Ok(task::spawn_blocking(move || inner.dir_mtime(inode)).await??)
+        task::spawn_blocking(move || inner.dir_mtime(inode)).await?
     }
 
     pub async fn readdir(&self, inode: u64) -> Result<Vec<(String, ReadDirEntry)>, UnrealError> {
         let inner = Arc::clone(&self.inner);
 
-        Ok(task::spawn_blocking(move || inner.readdir(inode)).await??)
+        task::spawn_blocking(move || inner.readdir(inode)).await?
     }
 
     pub async fn mark_peer_files(&self, peer: &Peer, arena: &Arena) -> Result<(), UnrealError> {
@@ -164,7 +162,7 @@ impl UnrealCacheAsync {
         let arena = arena.clone();
         let inner = Arc::clone(&self.inner);
 
-        Ok(task::spawn_blocking(move || inner.mark_peer_files(&peer, &arena)).await??)
+        task::spawn_blocking(move || inner.mark_peer_files(&peer, &arena)).await?
     }
 
     pub async fn delete_marked_files(&self, peer: &Peer, arena: &Arena) -> Result<(), UnrealError> {
@@ -172,6 +170,6 @@ impl UnrealCacheAsync {
         let arena = arena.clone();
         let inner = Arc::clone(&self.inner);
 
-        Ok(task::spawn_blocking(move || inner.delete_marked_files(&peer, &arena)).await??)
+        task::spawn_blocking(move || inner.delete_marked_files(&peer, &arena)).await?
     }
 }

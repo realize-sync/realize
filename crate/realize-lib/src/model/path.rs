@@ -66,15 +66,11 @@ impl Path {
     ///
     /// Return a non-empty parent path or None.
     pub fn parent(&self) -> Option<Path> {
-        if let Some(slash) = self.0.rfind('/') {
-            Some(Path(self.0[0..slash].to_string()))
-        } else {
-            None
-        }
+        self.0.rfind('/').map(|slash| Path(self.0[0..slash].to_string()))
     }
 
     /// Split a possibly empty path into zero or more components.
-    pub fn components<'a>(path: &'a Option<Self>) -> impl Iterator<Item = &'a str> {
+    pub fn components(path: &Option<Self>) -> impl Iterator<Item = &str> {
         if let Some(path) = path {
             path.0.split('/')
         } else {
@@ -106,9 +102,9 @@ impl Path {
     }
 }
 
-impl Into<path::PathBuf> for Path {
-    fn into(self) -> path::PathBuf {
-        self.as_real_path().to_path_buf()
+impl From<Path> for path::PathBuf {
+    fn from(val: Path) -> Self {
+        val.as_real_path().to_path_buf()
     }
 }
 

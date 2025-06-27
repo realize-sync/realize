@@ -146,7 +146,7 @@ impl Download {
         let requested = ByteRange::new(self.offset, self.offset + buf.remaining() as u64);
         let mut filled = false;
         while let Some((range, data)) = self.avail.front() {
-            let intersection = requested.intersection(&range);
+            let intersection = requested.intersection(range);
             if !intersection.is_empty() && intersection.start == self.offset {
                 log::debug!(
                     "From {}, return {:?} {}",
@@ -339,12 +339,12 @@ fn rpc_to_io_error(err: RpcError) -> std::io::Error {
         RpcError::Shutdown => std::io::Error::new(ErrorKind::ConnectionReset, err),
         RpcError::Server(_) => std::io::Error::new(ErrorKind::ConnectionReset, err),
         RpcError::DeadlineExceeded => std::io::Error::new(ErrorKind::TimedOut, err),
-        _ => std::io::Error::new(ErrorKind::Other, err),
+        _ => std::io::Error::other(err),
     }
 }
 
 fn real_store_to_io_error(err: RealStoreError) -> std::io::Error {
-    std::io::Error::new(ErrorKind::Other, err)
+    std::io::Error::other(err)
 }
 
 #[cfg(test)]
@@ -624,6 +624,6 @@ mod tests {
     async fn read_string(reader: &mut Download) -> anyhow::Result<String> {
         let mut buffer = String::new();
         reader.read_to_string(&mut buffer).await?;
-        return Ok(buffer);
+        Ok(buffer)
     }
 }

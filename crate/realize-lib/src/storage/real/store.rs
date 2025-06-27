@@ -126,7 +126,7 @@ impl RealStore {
 
     /// Returns the arenas configured in this store.
     pub fn arenas(&self) -> Vec<Arena> {
-        self.map.keys().map(|a| a.clone()).collect()
+        self.map.keys().cloned().collect()
     }
 
     /// Subscribe to notification for the given arena.
@@ -176,7 +176,7 @@ impl RealStore {
         arena: &Arena,
         options: &Options,
     ) -> Result<Vec<SyncedFile>, RealStoreError> {
-        let resolver = self.path_resolver_from_opts(&arena, &options)?.clone();
+        let resolver = self.path_resolver_from_opts(arena, options)?.clone();
 
         tokio::task::spawn_blocking(move || {
             let mut files = std::collections::BTreeMap::new();
@@ -209,8 +209,8 @@ impl RealStore {
         data: Vec<u8>,
         options: &Options,
     ) -> Result<(), RealStoreError> {
-        let resolver = self.path_resolver_from_opts(&arena, &options)?;
-        let path = resolver.partial_path(&relative_path).ok_or(bad_path())?;
+        let resolver = self.path_resolver_from_opts(arena, options)?;
+        let path = resolver.partial_path(relative_path).ok_or(bad_path())?;
         let mut file = open_for_range_write(&path).await?;
         write_at_offset(&mut file, range.start, &data).await?;
 
@@ -227,11 +227,11 @@ impl RealStore {
         range: &ByteRange,
         options: &Options,
     ) -> Result<Vec<u8>, RealStoreError> {
-        let resolver = self.path_resolver_from_opts(&arena, &options)?;
-        let actual = resolver.resolve(&relative_path).await?;
+        let resolver = self.path_resolver_from_opts(arena, options)?;
+        let actual = resolver.resolve(relative_path).await?;
         let mut file = open_for_range_read(&actual).await?;
         let mut buffer = vec![0; range.bytecount() as usize];
-        read_padded(&mut file, &range, &mut buffer).await?;
+        read_padded(&mut file, range, &mut buffer).await?;
 
         Ok(buffer)
     }
@@ -248,13 +248,13 @@ impl RealStore {
                 "Invalid option for finish: ignore_partial=true".to_string(),
             ));
         }
-        let resolver = self.path_resolver_from_opts(&arena, &options)?;
-        let partial_path = resolver.partial_path(&relative_path).ok_or(bad_path())?;
-        let actual = resolver.resolve(&relative_path).await?;
+        let resolver = self.path_resolver_from_opts(arena, options)?;
+        let partial_path = resolver.partial_path(relative_path).ok_or(bad_path())?;
+        let actual = resolver.resolve(relative_path).await?;
         if actual == partial_path {
             fs::rename(
                 actual,
-                resolver.final_path(&relative_path).ok_or(bad_path())?,
+                resolver.final_path(relative_path).ok_or(bad_path())?,
             )
             .await?;
         }
@@ -269,10 +269,10 @@ impl RealStore {
         range: &ByteRange,
         options: &Options,
     ) -> Result<Hash, RealStoreError> {
-        let resolver = self.path_resolver_from_opts(&arena, &options)?;
-        let path = resolver.resolve(&relative_path).await?;
+        let resolver = self.path_resolver_from_opts(arena, options)?;
+        let path = resolver.resolve(relative_path).await?;
 
-        hash_large_range_exact(&path, &range).await
+        hash_large_range_exact(&path, range).await
     }
 
     /// Delete the file at the given path (both partial and final forms).
@@ -282,17 +282,17 @@ impl RealStore {
         relative_path: &model::Path,
         options: &Options,
     ) -> Result<(), RealStoreError> {
-        let resolver = self.path_resolver_from_opts(&arena, &options)?;
-        let final_path = resolver.final_path(&relative_path).ok_or(bad_path())?;
+        let resolver = self.path_resolver_from_opts(arena, options)?;
+        let final_path = resolver.final_path(relative_path).ok_or(bad_path())?;
         if fs::metadata(&final_path).await.is_ok() {
             fs::remove_file(final_path).await?;
         }
 
-        let partial_path = resolver.partial_path(&relative_path).ok_or(bad_path())?;
+        let partial_path = resolver.partial_path(relative_path).ok_or(bad_path())?;
         if fs::metadata(&partial_path).await.is_ok() {
             fs::remove_file(partial_path).await?;
         }
-        delete_containing_dir(resolver.root(), &relative_path).await;
+        delete_containing_dir(resolver.root(), relative_path).await;
         Ok(())
     }
 
@@ -304,11 +304,11 @@ impl RealStore {
         range: &ByteRange,
         options: &Options,
     ) -> Result<Signature, RealStoreError> {
-        let resolver = self.path_resolver_from_opts(&arena, &options)?;
-        let actual = resolver.resolve(&relative_path).await?;
+        let resolver = self.path_resolver_from_opts(arena, options)?;
+        let actual = resolver.resolve(relative_path).await?;
         let mut file = File::open(&actual).await?;
         let mut buffer = vec![0u8; range.bytecount() as usize];
-        read_padded(&mut file, &range, &mut buffer).await?;
+        read_padded(&mut file, range, &mut buffer).await?;
         let opts = SignatureOptions {
             block_size: RSYNC_BLOCK_SIZE as u32,
             crypto_hash_size: 8,
@@ -328,11 +328,11 @@ impl RealStore {
         signature: Signature,
         options: &Options,
     ) -> Result<(Delta, Hash), RealStoreError> {
-        let resolver = self.path_resolver_from_opts(&arena, &options)?;
-        let actual = resolver.resolve(&relative_path).await?;
+        let resolver = self.path_resolver_from_opts(arena, options)?;
+        let actual = resolver.resolve(relative_path).await?;
         let mut file = open_for_range_read(&actual).await?;
         let mut buffer = vec![0; range.bytecount() as usize];
-        read_padded(&mut file, &range, &mut buffer).await?;
+        read_padded(&mut file, range, &mut buffer).await?;
 
         let hash = hash::digest(&buffer);
 
@@ -356,11 +356,11 @@ impl RealStore {
         hash: &Hash,
         options: &Options,
     ) -> Result<(), RealStoreError> {
-        let resolver = self.path_resolver_from_opts(&arena, &options)?;
-        let path = resolver.partial_path(&relative_path).ok_or(bad_path())?;
+        let resolver = self.path_resolver_from_opts(arena, options)?;
+        let path = resolver.partial_path(relative_path).ok_or(bad_path())?;
         let mut file = open_for_range_write(&path).await?;
         let mut base = vec![0u8; range.bytecount() as usize];
-        read_padded(&mut file, &range, &mut base).await?;
+        read_padded(&mut file, range, &mut base).await?;
         let mut out = Vec::new();
         rsync_apply_limited(&base, &delta.0, &mut out, range.bytecount() as usize)?;
         if out.len() as u64 != range.bytecount() {
@@ -373,7 +373,7 @@ impl RealStore {
         }
         write_at_offset(&mut file, range.start, &out).await?;
 
-        return Ok(());
+        Ok(())
     }
 
     /// Truncate file to the given size.
@@ -384,12 +384,12 @@ impl RealStore {
         file_size: u64,
         options: &Options,
     ) -> Result<(), RealStoreError> {
-        let resolver = self.path_resolver_from_opts(&arena, &options)?;
-        let path = resolver.partial_path(&relative_path).ok_or(bad_path())?;
+        let resolver = self.path_resolver_from_opts(arena, options)?;
+        let path = resolver.partial_path(relative_path).ok_or(bad_path())?;
         let mut file = open_for_range_write(&path).await?;
         shorten_file(&mut file, file_size).await?;
 
-        return Ok(());
+        Ok(())
     }
 
     /// Builds a path resolver for the given arena.
@@ -490,7 +490,7 @@ impl PathResolver {
             let mut path_type = PathType::Final;
             if self.access == StorageAccess::ReadWrite {
                 if let Some(non_partial) = non_partial_name(&relative) {
-                    relative.set_file_name(&OsString::from(non_partial.to_string()));
+                    relative.set_file_name(OsString::from(non_partial.to_string()));
                     path_type = PathType::Partial;
                 }
             }
@@ -627,7 +627,7 @@ async fn hash_large_range_exact(
     path: &std::path::Path,
     range: &ByteRange,
 ) -> Result<Hash, RealStoreError> {
-    let mut file = open_for_range_read(&path).await?;
+    let mut file = open_for_range_read(path).await?;
     let file_size = file.metadata().await?.len();
     if range.end > file_size {
         // We return an empty hash instead of failing, because we
@@ -690,7 +690,7 @@ async fn write_at_offset(
     data: &Vec<u8>,
 ) -> Result<(), RealStoreError> {
     file.seek(SeekFrom::Start(offset)).await?;
-    file.write_all(&data).await?;
+    file.write_all(data).await?;
     file.flush().await?;
     file.sync_all().await?;
 
@@ -759,7 +759,7 @@ async fn is_empty_dir(path: &std::path::Path) -> bool {
     if let Ok(is_empty) = ret {
         return is_empty;
     }
-    return false;
+    false
 }
 
 fn unknown_arena() -> RealStoreError {
@@ -787,7 +787,7 @@ mod tests {
     #[tokio::test]
     async fn partial_and_final_paths() -> anyhow::Result<()> {
         let arena = &Arena::from("test");
-        let resolver = RealStore::single(arena, &path::Path::new("/doesnotexist/test"))
+        let resolver = RealStore::single(arena, path::Path::new("/doesnotexist/test"))
             .path_resolver(arena, StorageAccess::Read)
             .ok_or(not_found())?;
 
@@ -877,7 +877,7 @@ mod tests {
         let temp = TempDir::new()?;
         let arena = &Arena::from("test");
         let resolver = RealStore::single(arena, temp.path())
-            .path_resolver(&arena, StorageAccess::Read)
+            .path_resolver(arena, StorageAccess::Read)
             .ok_or(not_found())?;
 
         let simple_file = &model::Path::parse(".foo.txt.part")?;

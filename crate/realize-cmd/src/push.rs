@@ -8,10 +8,7 @@ pub(crate) async fn push_metrics(
         label_map.insert("instance".to_owned(), instance.to_owned());
     }
     log::debug!(
-        "[metrics] push to {}, job={}, instance={:?}",
-        pushgateway,
-        job,
-        instance
+        "[metrics] push to {pushgateway}, job={job}, instance={instance:?}"
     );
     let metric_families = prometheus::gather();
     let pushgateway = pushgateway.to_string();

@@ -66,9 +66,10 @@ async fn send_notification(
     tx: &mpsc::Sender<Notification>,
     catchup: bool,
 ) -> Result<(), anyhow::Error> {
-    Ok(if *(n.arena()) == *arena && (catchup || !n.is_catchup()) {
+    if *(n.arena()) == *arena && (catchup || !n.is_catchup()) {
         tx.send(n.clone()).await?;
-    })
+    };
+    Ok(())
 }
 
 impl StoreSubscribe for FakeStoreSubscribe {

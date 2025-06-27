@@ -57,6 +57,12 @@ pub struct PeerVerifier {
     algos: WebPkiSupportedAlgorithms,
 }
 
+impl Default for PeerVerifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PeerVerifier {
     /// Create a new, empty verifier
     pub fn new() -> Self {

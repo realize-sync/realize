@@ -429,7 +429,7 @@ async fn systemd_log_output_format() -> anyhow::Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     for line in stderr.lines() {
-        eprintln!("{}", line);
+        eprintln!("{line}");
 
         if line.starts_with("<5>realize_cmd::progress: Moved foo.txt") {
             return Ok(());
@@ -471,7 +471,7 @@ async fn realize_metrics_export() -> anyhow::Result<()> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let metrics_addr = listener.local_addr()?;
     drop(listener); // release port for realize
-    let metrics_addr = format!("{}", metrics_addr);
+    let metrics_addr = format!("{metrics_addr}");
 
     // We want to have time to check the metrics. Make sure it'll
     // hang by giving it an address that won't ever answer.
@@ -496,7 +496,7 @@ async fn realize_metrics_export() -> anyhow::Result<()> {
     let mut captured = vec![];
     for _ in 0..100 {
         if let Some(line) = err_reader.next_line().await? {
-            eprintln!("{}", line);
+            eprintln!("{line}");
             if line.contains("[metrics] server listening on") {
                 found = true;
                 break;
@@ -512,15 +512,14 @@ async fn realize_metrics_export() -> anyhow::Result<()> {
 
     // Now test the endpoint
     let client = Client::new();
-    let metrics_url = format!("http://{}/metrics", metrics_addr);
+    let metrics_url = format!("http://{metrics_addr}/metrics");
     let resp = client.get(&metrics_url).send().await?;
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers()["Content-Type"], "text/plain; version=0.0.4");
     let body = resp.text().await?;
     assert!(
         body.contains("realize_cmd_up "),
-        "metrics output missing expected Prometheus format: {}",
-        body
+        "metrics output missing expected Prometheus format: {body}"
     );
 
     Ok(())
@@ -565,7 +564,7 @@ async fn realize_metrics_pushgateway() -> anyhow::Result<()> {
     let output = fixture
         .command()?
         .arg("--metrics-pushgateway")
-        .arg(format!("http://{}/", pushgw_addr))
+        .arg(format!("http://{pushgw_addr}/"))
         .arg("--metrics-job")
         .arg("dir")
         .output()
@@ -727,9 +726,9 @@ pubkey = """
 {}
 """
 "#,
-        src_addr.to_string(),
+        src_addr,
         fs::read_to_string(&keys.pubkey_a_path)?,
-        dst_addr.to_string(),
+        dst_addr,
         fs::read_to_string(&keys.pubkey_b_path)?,
     ))?;
 

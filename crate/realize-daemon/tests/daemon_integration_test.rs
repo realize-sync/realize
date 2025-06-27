@@ -176,7 +176,7 @@ async fn metrics_endpoint_works() -> anyhow::Result<()> {
     let fixture = Fixture::setup().await?;
 
     let metrics_port = portpicker::pick_unused_port().expect("No ports free");
-    let metrics_addr = format!("127.0.0.1:{}", metrics_port);
+    let metrics_addr = format!("127.0.0.1:{metrics_port}");
 
     // Run process in the background and in a way that allows reading
     // its output, so we know what port to connect to.
@@ -192,21 +192,20 @@ async fn metrics_endpoint_works() -> anyhow::Result<()> {
 
     // Now test the endpoint
     let client = Client::new();
-    let metrics_url = format!("http://{}/metrics", metrics_addr);
+    let metrics_url = format!("http://{metrics_addr}/metrics");
     let resp = client.get(&metrics_url).send().await?;
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers()["Content-Type"], "text/plain; version=0.0.4");
     let body = resp.text().await?;
     assert!(
         body.contains("realize_daemon_up 1"),
-        "metrics output missing expected Prometheus format: {}",
-        body
+        "metrics output missing expected Prometheus format: {body}"
     );
 
     // Random paths should not return anything
     // TODO: move to a unit test in src/metrics.rs
     let notfound = client
-        .get(format!("http://{}/notfound", metrics_addr))
+        .get(format!("http://{metrics_addr}/notfound"))
         .send()
         .await?;
     assert_eq!(notfound.status(), 404);
@@ -334,7 +333,7 @@ async fn daemon_exports_nfs() -> anyhow::Result<()> {
     let mut fixture = Fixture::setup().await?;
 
     let nfs_port = portpicker::pick_unused_port().expect("No ports free");
-    let nfs_addr = format!("127.0.0.1:{}", nfs_port);
+    let nfs_addr = format!("127.0.0.1:{nfs_port}");
 
     fixture.config.storage.cache = Some(CacheConfig {
         db: fixture.tempdir.child("cache.db").to_path_buf(),
@@ -368,7 +367,7 @@ async fn daemon_exports_nfs() -> anyhow::Result<()> {
         })
         .await?;
     match readdir {
-        Nfs3Result::Err(err) => panic!("readdir failed:{:?}", err),
+        Nfs3Result::Err(err) => panic!("readdir failed:{err:?}"),
         Nfs3Result::Ok(res) => {
             assert_unordered::assert_eq_unordered!(
                 vec!["testdir"],
@@ -411,7 +410,7 @@ async fn daemon_updates_cache() -> anyhow::Result<()> {
         .address = Some(format!("127.0.0.1:{a_port}"));
 
     let nfs_port = portpicker::pick_unused_port().expect("No ports free");
-    let nfs_addr = format!("127.0.0.1:{}", nfs_port);
+    let nfs_addr = format!("127.0.0.1:{nfs_port}");
     fixture_b.config.storage.cache = Some(CacheConfig {
         db: fixture_b.tempdir.child("cache.db").to_path_buf(),
     });
@@ -466,7 +465,7 @@ async fn daemon_updates_cache() -> anyhow::Result<()> {
                     tokio::time::sleep(delay).await;
                     continue;
                 } else {
-                    panic!("hello.txt lookup: {:?}", e);
+                    panic!("hello.txt lookup: {e:?}");
                 }
             }
             Nfs3Result::Ok(res) => {
@@ -503,7 +502,7 @@ async fn collect_stderr(stderr: &mut tokio::process::ChildStderr) -> anyhow::Res
     let mut lines = reader.lines();
     let mut all_lines = vec![];
     while let Ok(Some(line)) = lines.next_line().await {
-        eprintln!("{}", line);
+        eprintln!("{line}");
         all_lines.push(line);
     }
 
@@ -515,7 +514,7 @@ async fn collect_stdout(stdout: &mut tokio::process::ChildStdout) -> anyhow::Res
     let mut lines = reader.lines();
     let mut all_lines = vec![];
     while let Ok(Some(line)) = lines.next_line().await {
-        eprintln!("{}", line);
+        eprintln!("{line}");
         all_lines.push(line);
     }
 

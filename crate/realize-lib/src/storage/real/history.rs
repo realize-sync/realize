@@ -39,7 +39,7 @@ pub(crate) fn subscribe(
 
     tokio::spawn(async move {
         if let Err(err) = run_loop(inotify, arena, path_resolver, tx, catchup).await {
-            log::warn!("history loop was shut down: {}", err)
+            log::warn!("history loop was shut down: {err}")
         }
     });
 
@@ -117,7 +117,7 @@ impl Collector {
         // accessible becomes accessible; the whole directory needs to
         // be processed.
         let descr = self.watches.add(
-            &path,
+            path,
             WatchMask::CREATE
                 | WatchMask::CLOSE_WRITE
                 | WatchMask::DELETE
@@ -125,7 +125,7 @@ impl Collector {
                 | WatchMask::DONT_FOLLOW
                 | WatchMask::EXCL_UNLINK,
         )?;
-        log::debug!("watching {:?}", path);
+        log::debug!("watching {path:?}");
         self.wd.insert(descr, path.to_path_buf());
 
         Ok(())
@@ -154,7 +154,7 @@ impl Collector {
                                             queue.push_back(dir);
                                         }
                                         Err(err) => {
-                                            log::debug!("failed to add watch to {:?}: {}", dir, err)
+                                            log::debug!("failed to add watch to {dir:?}: {err}")
                                         }
                                     }
                                 } else if m.file_type().is_file() {
@@ -342,9 +342,9 @@ async fn find_mtime_for_unlink(
 
 /// Extract modification time as [UnixTime] from metadata.
 fn unix_mtime(metadata: &std::fs::Metadata) -> anyhow::Result<UnixTime, SystemTimeError> {
-    Ok(UnixTime::from_system_time(
+    UnixTime::from_system_time(
         metadata.modified().expect("OS must support mtime"),
-    )?)
+    )
 }
 
 #[cfg(test)]
@@ -543,10 +543,8 @@ mod tests {
         );
 
         std::fs::remove_dir_all(subdir.path())?;
-        let all_n = vec![
-            fixture.next("unlink 1").await?,
-            fixture.next("unlink 2").await?,
-        ];
+        let all_n = [fixture.next("unlink 1").await?,
+            fixture.next("unlink 2").await?];
         assert!(all_n
             .iter()
             .all(|n| matches!(n, Notification::Unlink { .. })));
@@ -557,7 +555,7 @@ mod tests {
             ],
             all_n
                 .iter()
-                .map(|n| n.path().map(|p| p.clone()))
+                .map(|n| n.path().cloned())
                 .collect::<Vec<_>>(),
         );
 

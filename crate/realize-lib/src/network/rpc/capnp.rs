@@ -221,7 +221,7 @@ impl AppContext {
             let mut borrow = self.connections.borrow_mut();
             let conn = borrow
                 .entry(peer.clone())
-                .or_insert_with(TrackedPeerConnections::default);
+                .or_default();
             let has_usable_tracker = conn
                 .tracker
                 .as_ref()
@@ -300,7 +300,7 @@ impl AppContext {
             });
 
             //this.register_self(&client);
-            if let Err(err) = self.subscribe_self(&peer, &mut store).await {
+            if let Err(err) = self.subscribe_self(peer, &mut store).await {
                 log::debug!("Failed to subscribe to {peer}: {err}");
             }
 
@@ -367,7 +367,7 @@ impl AppContext {
         self.connections
             .borrow_mut()
             .entry(peer.clone())
-            .or_insert_with(TrackedPeerConnections::default)
+            .or_default()
             .tracked_client = client;
     }
 }
@@ -678,7 +678,7 @@ mod tests {
             let arena = Arena::from("test");
 
             let mut stores = HashMap::new();
-            for peer in vec![TestingPeers::a(), TestingPeers::b(), TestingPeers::c()] {
+            for peer in [TestingPeers::a(), TestingPeers::b(), TestingPeers::c()] {
                 stores.insert(peer, FakeStoreSubscribe::new(vec![arena.clone()]));
             }
             Ok(Self {
@@ -701,11 +701,11 @@ mod tests {
                 .get(peer)
                 .ok_or(anyhow::anyhow!("No store defined for {peer}"))?
                 .clone();
-            Ok(Household::spawn(
+            Household::spawn(
                 self.peers.networking(peer)?,
                 store,
                 notification_tx,
-            )?)
+            )
         }
 
         async fn run_server(
@@ -813,10 +813,10 @@ mod tests {
         let mut fixture = Fixture::setup().await?;
 
         let a = &fixture.peer_a.clone();
-        fixture.peers.pick_port(&a)?;
+        fixture.peers.pick_port(a)?;
 
         let b = &fixture.peer_b.clone();
-        fixture.peers.pick_port(&b)?;
+        fixture.peers.pick_port(b)?;
 
         let (household_a, _) = fixture.household(a, None)?;
         let _server_a = fixture.run_server(a, &household_a).await?;
@@ -841,10 +841,10 @@ mod tests {
         let mut fixture = Fixture::setup().await?;
 
         let a = &fixture.peer_a.clone();
-        fixture.peers.pick_port(&a)?;
+        fixture.peers.pick_port(a)?;
 
         let b = &fixture.peer_b.clone();
-        fixture.peers.pick_port(&b)?;
+        fixture.peers.pick_port(b)?;
 
         let (household_a, _) = fixture.household(a, None)?;
         let _server_a = fixture.run_server(a, &household_a).await?;
@@ -870,10 +870,10 @@ mod tests {
         let mut fixture = Fixture::setup().await?;
 
         let a = &fixture.peer_a.clone();
-        fixture.peers.pick_port(&a)?;
+        fixture.peers.pick_port(a)?;
 
         let b = &fixture.peer_b.clone();
-        fixture.peers.pick_port(&b)?;
+        fixture.peers.pick_port(b)?;
 
         let (tx, mut rx) = mpsc::channel(10);
         let (household_a, _) = fixture.household(a, Some(tx))?;

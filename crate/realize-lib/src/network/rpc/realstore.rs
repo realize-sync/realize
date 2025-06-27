@@ -160,6 +160,12 @@ impl std::fmt::Display for RangedHash {
     }
 }
 
+impl Default for RangedHash {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RangedHash {
     /// Create an empty [RangedHash].
     pub fn new() -> Self {
@@ -279,7 +285,7 @@ mod tests {
         hash.add(ByteRange { start: 0, end: 10 }, Hash([1; 32]));
         hash.add(ByteRange { start: 10, end: 20 }, Hash([2; 32]));
         assert_eq!(
-            format!("{}", hash),
+            format!("{hash}"),
             format!("0-20: [0: {} 10: {}]", Hash([1; 32]), Hash([2; 32]))
         );
     }

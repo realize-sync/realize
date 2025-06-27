@@ -250,7 +250,7 @@ impl TestingPeers {
         let verifier = PeerVerifier::from_config(&others)?;
         let resolver = RawPublicKeyResolver::from_private_key(
             self.private_keys
-                .get(&peer)
+                .get(peer)
                 .ok_or(anyhow::anyhow!("No private key for {peer}"))?
                 .clone_key(),
         )?;

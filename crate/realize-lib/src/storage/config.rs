@@ -9,6 +9,12 @@ pub struct StorageConfig {
     pub cache: Option<CacheConfig>,
 }
 
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StorageConfig {
     pub fn new() -> Self {
         StorageConfig {

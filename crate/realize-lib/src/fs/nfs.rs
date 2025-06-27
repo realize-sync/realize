@@ -35,12 +35,12 @@ pub async fn export(
     downloader: Downloader,
     addr: SocketAddr,
 ) -> std::io::Result<JoinHandle<std::io::Result<()>>> {
-    log::debug!("Listening to {}", addr);
+    log::debug!("Listening to {addr}");
     let listener =
         NFSTcpListener::bind(&addr.to_string(), UnrealFs::new(cache, downloader)).await?;
 
     Ok(tokio::spawn(async move {
-        log::debug!("Running listener to {}", addr);
+        log::debug!("Running listener to {addr}");
         listener.handle_forever().await
     }))
 }
@@ -137,7 +137,7 @@ impl UnrealFs {
         if let Ok(mtime) = dir_mtime {
             return Ok(self.build_dir_attr(id, &mtime));
         }
-        return Ok(self.build_file_attr(id, &file_metadata?));
+        Ok(self.build_file_attr(id, &file_metadata?))
     }
 
     fn build_file_attr(&self, inode: u64, metadata: &FileMetadata) -> fattr3 {

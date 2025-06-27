@@ -8,7 +8,7 @@ pub struct Hash(pub [u8; 32]);
 
 impl Hash {
     fn base64(&self) -> String {
-        base64::prelude::BASE64_STANDARD_NO_PAD.encode(&self.0)
+        base64::prelude::BASE64_STANDARD_NO_PAD.encode(self.0)
     }
 
     /// Hash that indicates the absence of any data.

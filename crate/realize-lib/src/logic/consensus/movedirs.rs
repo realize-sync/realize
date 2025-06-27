@@ -222,7 +222,7 @@ where
                         (1, 0, 0)
                     }
                     Err(MoveFileError::Rpc(tarpc::client::RpcError::DeadlineExceeded)) => {
-                        log::debug!("{}/{}: Deadline exceeded", arena, file_path);
+                        log::debug!("{arena}/{file_path}: Deadline exceeded");
                         if let Some(tx) = &tx {
                             let _ = tx
                                 .send(ProgressEvent::FileError {
@@ -236,13 +236,13 @@ where
                         (0, 0, 1)
                     }
                     Err(ref err) => {
-                        log::debug!("{}/{}: {}", arena, file_path, err);
+                        log::debug!("{arena}/{file_path}: {err}");
                         if let Some(tx) = &tx {
                             let _ = tx
                                 .send(ProgressEvent::FileError {
                                     arena: arena.clone(),
                                     path: file_path.clone(),
-                                    error: format!("{}", err),
+                                    error: format!("{err}"),
                                 })
                                 .await;
                         }
@@ -343,7 +343,7 @@ where
         async {
             // 1. Copy missing data
             let copy_ranges = ranges.subtraction(&existing);
-            log::debug!("{}/{:?} {} copy {}", arena, path, ranges, copy_ranges);
+            log::debug!("{arena}/{path:?} {ranges} copy {copy_ranges}");
             copy_file_range(
                 ctx,
                 &arena,
@@ -462,7 +462,7 @@ where
         return Ok(());
     }
 
-    report_rsyncing(&progress_tx, &arena, path).await;
+    report_rsyncing(progress_tx, arena, path).await;
 
     for range in rsync_ranges.chunked(CHUNK_SIZE) {
         let sig = dst
@@ -511,15 +511,12 @@ where
                     .with_label_values(&["apply_delta"])
                     .inc_by(range.bytecount());
                 log::debug!("{}/{:?} INC {}", &arena, path, range.bytecount());
-                report_increment_bytecount(&progress_tx, &arena, path, range.bytecount()).await;
+                report_increment_bytecount(progress_tx, arena, path, range.bytecount()).await;
             }
             Err(RealStoreError::HashMismatch) => {
                 copy_ranges.add(&range);
                 log::error!(
-                    "{}/{}:{} hash mismatch after apply_delta, will copy",
-                    arena,
-                    path,
-                    range,
+                    "{arena}/{path}:{range} hash mismatch after apply_delta, will copy",
                 );
                 METRIC_APPLY_DELTA_FALLBACK_COUNT.inc();
                 METRIC_APPLY_DELTA_FALLBACK_BYTES.inc_by(range.bytecount());
@@ -552,10 +549,10 @@ where
     }
     // It can take some time for a permit to become available, so
     // go back to showing the file as Pending until then.
-    report_pending(&progress_tx, &arena, path).await;
+    report_pending(progress_tx, arena, path).await;
     let _lock = copy_sem.acquire().await;
 
-    report_copying(&progress_tx, &arena, path).await;
+    report_copying(progress_tx, arena, path).await;
 
     for range in copy_ranges.chunked(CHUNK_SIZE) {
         let data = src
@@ -589,7 +586,7 @@ where
         METRIC_RANGE_WRITE_BYTES
             .with_label_values(&["send"])
             .inc_by(range.bytecount());
-        report_increment_bytecount(&progress_tx, &arena, path, range.bytecount()).await;
+        report_increment_bytecount(progress_tx, arena, path, range.bytecount()).await;
     }
 
     Ok(())
@@ -709,7 +706,7 @@ where
     T: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse>,
 {
     let results =
-        futures::stream::iter(ByteRange::new(0, file_size).chunked(chunk_size).into_iter())
+        futures::stream::iter(ByteRange::new(0, file_size).chunked(chunk_size))
             .map(|range| {
                 client
                     .hash(
@@ -775,13 +772,7 @@ where
     let (matches, mismatches) = src_hash.diff(&dst_hash);
     if !mismatches.is_empty() || !is_complete_src || !is_complete_dst {
         log::debug!(
-            "{}:{:?} inconsistent hashes\nsrc: {}\ndst: {}\nmatches: {}\nmismatches: {}",
-            arena,
-            path,
-            src_hash,
-            dst_hash,
-            matches,
-            mismatches
+            "{arena}:{path:?} inconsistent hashes\nsrc: {src_hash}\ndst: {dst_hash}\nmatches: {matches}\nmismatches: {mismatches}"
         );
         METRIC_FILE_END_COUNT
             .with_label_values(&["Inconsistent"])
@@ -790,7 +781,7 @@ where
             partial_match: matches,
         });
     }
-    log::debug!("{}/{} MOVED", arena, path);
+    log::debug!("{arena}/{path} MOVED");
     // Hashes match, finish and delete
     dst.finish(ctx, arena.clone(), path.clone(), dst_options())
         .await??;

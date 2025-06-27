@@ -120,6 +120,6 @@ mod tests {
     #[tokio::test]
     async fn test_display() {
         let hp = HostPort::parse("127.0.0.1:8000").await.unwrap();
-        assert_eq!(format!("{}", hp), "127.0.0.1:8000");
+        assert_eq!(format!("{hp}"), "127.0.0.1:8000");
     }
 }

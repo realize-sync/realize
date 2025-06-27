@@ -39,7 +39,7 @@ impl<'a, T> Holder<'a, T> {
     pub fn as_bytes(&self) -> &'_ [u8] {
         match self {
             Holder::Owned(vec, _) => vec.as_slice(),
-            Holder::Borrowed(arr, _) => *arr,
+            Holder::Borrowed(arr, _) => arr,
         }
     }
 }

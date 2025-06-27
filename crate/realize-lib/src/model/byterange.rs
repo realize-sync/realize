@@ -59,11 +59,7 @@ impl ByteRange {
     /// Returns the number of bytes in this range.
     pub fn bytecount(&self) -> u64 {
         // TODO: guarantee that in a range
-        if self.end > self.start {
-            self.end - self.start
-        } else {
-            0
-        }
+        self.end.saturating_sub(self.start)
     }
     /// Returns true if this range overlaps with `other` (i.e., they share any bytes).
     ///
@@ -105,7 +101,7 @@ impl ByteRange {
 
     /// Check whether a value is within the range.
     pub fn contains(&self, val: u64) -> bool {
-        return val >= self.start && val < self.end;
+        val >= self.start && val < self.end
     }
 }
 
@@ -283,8 +279,7 @@ impl ByteRanges {
     pub fn chunked(&self, chunk_size: u64) -> impl Iterator<Item = ByteRange> {
         self.ranges
             .iter()
-            .map(move |r| ChunkIterator::new(r, chunk_size))
-            .flatten()
+            .flat_map(move |r| ChunkIterator::new(r, chunk_size))
     }
 
     /// Returns true if there are no ranges.
@@ -437,7 +432,7 @@ impl fmt::Display for ByteRanges {
             if !first {
                 write!(f, ", ")?;
             }
-            write!(f, "{}", r)?;
+            write!(f, "{r}")?;
             first = false;
         }
         f.write_str("}")?;

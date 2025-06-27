@@ -62,11 +62,11 @@ impl Notification {
     pub fn arena(&self) -> &Arena {
         use Notification::*;
         match self {
-            CatchingUp { arena, .. } => &arena,
-            Ready { arena, .. } => &arena,
-            Link { arena, .. } => &arena,
-            Unlink { arena, .. } => &arena,
-            Catchup { arena, .. } => &arena,
+            CatchingUp { arena, .. } => arena,
+            Ready { arena, .. } => arena,
+            Link { arena, .. } => arena,
+            Unlink { arena, .. } => arena,
+            Catchup { arena, .. } => arena,
         }
     }
     pub fn path(&self) -> Option<&Path> {
@@ -74,9 +74,9 @@ impl Notification {
         match self {
             CatchingUp { .. } => None,
             Ready { .. } => None,
-            Link { path, .. } => Some(&path),
-            Unlink { path, .. } => Some(&path),
-            Catchup { path, .. } => Some(&path),
+            Link { path, .. } => Some(path),
+            Unlink { path, .. } => Some(path),
+            Catchup { path, .. } => Some(path),
         }
     }
 

@@ -83,8 +83,7 @@ fn check_directory_access(arenas: &HashMap<Arena, ArenaConfig>) -> anyhow::Resul
                 arena
             );
         }
-        if !std::fs::metadata(path)
-            .and_then(|m| Ok(m.is_dir()))
+        if !std::fs::metadata(path).map(|m| m.is_dir())
             .unwrap_or(false)
         {
             anyhow::bail!(

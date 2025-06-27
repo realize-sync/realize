@@ -54,6 +54,6 @@ impl From<Duration> for UnixTime {
 }
 impl From<&Duration> for UnixTime {
     fn from(value: &Duration) -> Self {
-        UnixTime(value.clone())
+        UnixTime(*value)
     }
 }

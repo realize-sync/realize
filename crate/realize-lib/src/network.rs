@@ -51,15 +51,11 @@ impl Networking {
         peers: &HashMap<Peer, PeerConfig>,
         privkey: &path::Path,
     ) -> anyhow::Result<Self> {
-        let verifier = PeerVerifier::from_config(&peers)?;
+        let verifier = PeerVerifier::from_config(peers)?;
         let resolver = RawPublicKeyResolver::from_private_key_file(privkey)?;
         Ok(Self::new(
             peers.iter().flat_map(|(p, c)| {
-                if let Some(addr) = &c.address {
-                    Some((p, addr.as_ref()))
-                } else {
-                    None
-                }
+                c.address.as_ref().map(|addr| (p, addr.as_ref()))
             }),
             resolver,
             verifier,
@@ -131,7 +127,7 @@ impl Networking {
     ) -> anyhow::Result<tokio_rustls::client::TlsStream<RateLimitedStream<TcpStream>>> {
         let addr = self
             .addresses
-            .get(&peer)
+            .get(peer)
             .ok_or(anyhow::anyhow!("no address known for {peer}"))?;
         let addr = HostPort::parse(addr)
             .await
@@ -171,7 +167,7 @@ impl Networking {
             .connection_peer_id(&tls_stream)
             .expect("Peer must be known at this point")
             .clone();
-        log::info!("Accepted peer {} from {}", peer, peer_addr);
+        log::info!("Accepted peer {peer} from {peer_addr}");
         let mut tag = [0u8; 4];
         tls_stream.read_exact(&mut tag).await?;
 
@@ -242,7 +238,7 @@ impl Server {
                     loop {
                         tokio::select!(
                             _ = shutdown_rx.recv() => {
-                                log::debug!("Shutting connection to {}", peer);
+                                log::debug!("Shutting connection to {peer}");
                                 break;
                             }
                             next = stream.next() => {
@@ -307,7 +303,7 @@ impl Server {
 
         let addr = listener.local_addr()?;
         let mut shutdown_listener_rx = self.shutdown_tx.subscribe();
-        let weak_self = Arc::downgrade(&self);
+        let weak_self = Arc::downgrade(self);
         tokio::spawn(async move {
             loop {
                 tokio::select!(
@@ -320,7 +316,7 @@ impl Server {
                             Some(strong_self) => {
                                 match strong_self.accept(stream).await {
                                     Ok(_) => {}
-                                    Err(err) => log::debug!("{}: connection rejected: {}", peer, err),
+                                    Err(err) => log::debug!("{peer}: connection rejected: {err}"),
                                 };
                             }
                             None => {

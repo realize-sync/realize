@@ -83,7 +83,7 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
             downloader,
             HostPort::parse(addr)
                 .await
-                .with_context(|| format!("Failed to parse --nfs {}", addr))?
+                .with_context(|| format!("Failed to parse --nfs {addr}"))?
                 .addr(),
         )
         .await?;
@@ -98,9 +98,9 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
     let addr = server
         .listen(&hostport)
         .await
-        .with_context(|| format!("Failed to start server on {}", hostport))?;
+        .with_context(|| format!("Failed to start server on {hostport}"))?;
 
-    let mut signals = Signals::new(&[
+    let mut signals = Signals::new([
         signal_hook::consts::SIGHUP,
         signal_hook::consts::SIGTERM,
         signal_hook::consts::SIGINT,
