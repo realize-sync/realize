@@ -1,10 +1,7 @@
 use crate::model::{self, Arena, ByteRange, Delta, Hash, Signature};
 use crate::storage::config::ArenaConfig;
 use crate::utils::hash;
-use fast_rsync::{
-    Signature as RsyncSignature, SignatureOptions, apply_limited as rsync_apply_limited,
-    diff as rsync_diff,
-};
+use fast_rsync::SignatureOptions;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -305,7 +302,7 @@ impl RealStore {
             block_size: RSYNC_BLOCK_SIZE as u32,
             crypto_hash_size: 8,
         };
-        let sig = RsyncSignature::calculate(&buffer, opts);
+        let sig = fast_rsync::Signature::calculate(&buffer, opts);
         Ok(crate::model::Signature(sig.into_serialized()))
     }
 
@@ -328,9 +325,9 @@ impl RealStore {
 
         let hash = hash::digest(&buffer);
 
-        let sig = RsyncSignature::deserialize(signature.0)?;
+        let sig = fast_rsync::Signature::deserialize(signature.0)?;
         let mut delta = Vec::new();
-        rsync_diff(&sig.index(), &buffer, &mut delta)?;
+        fast_rsync::diff(&sig.index(), &buffer, &mut delta)?;
 
         Ok((crate::model::Delta(delta), hash))
     }
@@ -354,7 +351,7 @@ impl RealStore {
         let mut base = vec![0u8; range.bytecount() as usize];
         read_padded(&mut file, range, &mut base).await?;
         let mut out = Vec::new();
-        rsync_apply_limited(&base, &delta.0, &mut out, range.bytecount() as usize)?;
+        fast_rsync::apply_limited(&base, &delta.0, &mut out, range.bytecount() as usize)?;
         if out.len() as u64 != range.bytecount() {
             return Err(RealStoreError::BadRequest(
                 "Delta output size mismatch".to_string(),
