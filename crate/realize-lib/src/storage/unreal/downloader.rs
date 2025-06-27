@@ -98,17 +98,11 @@ pub struct Download {
     offset: u64,
     pending_seek: Option<u64>,
     avail: VecDeque<(ByteRange, Vec<u8>)>,
-    pending: Option<(
-        ByteRange,
-        Pin<
-            Box<
-                dyn Future<Output = Result<Result<Vec<u8>, RealStoreError>, RpcError>>
-                    + Send
-                    + Sync,
-            >,
-        >,
-    )>,
+    pending: Option<(ByteRange, PendingDownload)>,
 }
+
+type PendingDownload =
+    Pin<Box<dyn Future<Output = Result<Result<Vec<u8>, RealStoreError>, RpcError>> + Send + Sync>>;
 
 impl Download {
     fn new(client: Arc<RealStoreClient>, peer: Peer, entry: FileTableEntry) -> Self {
@@ -161,19 +155,7 @@ impl Download {
         filled
     }
 
-    fn next_request(
-        &mut self,
-        bufsize: usize,
-    ) -> (
-        ByteRange,
-        Pin<
-            Box<
-                dyn Future<Output = Result<Result<Vec<u8>, RealStoreError>, RpcError>>
-                    + Send
-                    + Sync,
-            >,
-        >,
-    ) {
+    fn next_request(&mut self, bufsize: usize) -> (ByteRange, PendingDownload) {
         let offset = self.offset;
         let end = self.entry.metadata.size;
         let next = self
