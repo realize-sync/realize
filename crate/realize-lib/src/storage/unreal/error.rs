@@ -9,7 +9,7 @@ use tokio::task::JoinError;
 #[derive(Debug, thiserror::Error)]
 pub enum UnrealError {
     #[error("redb error {0}")]
-    Database(redb::Error),
+    Database(Box<redb::Error>), // a box to keep size in check
 
     #[error("I/O error {0}")]
     Io(#[from] std::io::Error),
@@ -44,7 +44,7 @@ impl UnrealError {
                 _ => unreachable!(),
             }
         } else {
-            UnrealError::Database(err)
+            UnrealError::Database(Box::new(err))
         }
     }
 }
