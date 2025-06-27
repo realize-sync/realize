@@ -4,7 +4,7 @@
 
 Use [OverlayFS](https://docs.kernel.org/filesystems/overlayfs.html) to
 expose a merged view of the local files and [The Unreal](unreal.md)
-filesystem exporting remote files. 
+filesystem exporting remote files.
 
 When a remotely available file is modified, the changes are applied
 locally and later on sent to other peers.
@@ -36,12 +36,12 @@ Design and implementation happens in stages, incrementally:
    disconnections, described in [The Unreal](./unreal.md) and
    implemented based on
    [inotify](https://man7.org/linux/man-pages/man7/inotify.7.html).
-   
+
 3. Track changes and file content hash, used as both integrity check
    and version, in an index table. Upon restart, catchup with the
    latest changes by comparing index with directory content. This is a
    requirement for the next two phases. [Index]
-   
+
 4. Report local change to remote data to peers and update local data
    on interested peers (consensus) using such reports. Remove local
    data after synced for files we don't want to keep locally.
@@ -76,20 +76,61 @@ or not.
 ### Index
 
 To be able to build [History], we need to track changes to the
-directory content. 
+directory content.
 
 While the process is up and running, changes are tracked using
 inotify. While the process is down, change aren't tracked and need to
 be caught up at startup. This is where the index comes in.
 
-The index tracks: 
+The index tracks:
 - the files it knows about and their content (mtime + hash)
 - the local modifications from OveralyFS (in xattrs and special files)
 
 This information is used to build a history of changes at startup, by
 comparing the content of the index with the content of the directory.
 
-Exact format and table layout TBD
+#### Index Database Tables
+
+The tables elow keep an index of the files, their content (hash) and
+history. Local modifications on top of remote files still TDB.
+
+** File Table **
+
+Stores file and hash, together with metadata.
+
+A hash is only valid as long as the mtime and size match the current
+file.
+
+When adding a new entry, the current value is used to populate the
+old_hash field of the corresponding notification. `notification_index`
+is the key of the corresponding notification in the history table. It
+might not exist anymore.
+
+The key doesn't include the arena; each arena has its own separate
+index database.
+
+* Key: `&str`  `model::Path`
+* Value: `FileTableEntry: {Hash, mtime: UnixTime, size: u64, notification_index: u32}`
+
+** History Table **
+
+Keeps changes, in order, so they can be served to peers.
+
+* Key: `u64` index (monotonically increasing)
+* Value: `HistoryTableEntry: {Notification}`
+
+** Peer History Table **
+
+Keeps track of the index of most recent notification successfully set
+to each peer and the (local) time at which this was sent.
+
+This is used to delete old entries from the history table: entries in
+the history table can be removed once read by all peers or a peer has
+been disconnected for so long that it'll have to start from scratch,
+without history.
+
+* Key: `&str` `Peer`
+* Value: `PeerTableEntry: (index: u64, SystemTime)`
 
 ### History
 
@@ -113,7 +154,7 @@ design](./design.md)), the following modifications:
 
 > [!NOTE] Phase 1 also includes CatchupStart(arena), Catchup(arena,
 > path, mtime), Ready(arena) This is gone in phase 2, described here.
-> For a description of catchup, see the description of 
+> For a description of catchup, see the description of
 > mark_peer_files/delete_marked_files in [The Unreal](./unreal.md)
 
 The difference between `Unlink` and `Drop` is that the former should
@@ -140,9 +181,9 @@ Peer B calls the following RPC on peer A:
 
 ```
 interface Store {
-    /// Arenas the connecting peer is interested in. 
+    /// Arenas the connecting peer is interested in.
     arenas @0 () -> (arenas: List(Text));
-    
+
     /// Local modifications reported by the connected peer.
     subscribe @1 (arenas: List(Text), sub: Subscriber);
 }
@@ -163,11 +204,11 @@ Peers listen to notifications from remote peer's [History] and apply
 
 - if local file with matching hash has been reported as `Unlink`,
   delete it
-  
+
 - if local file with matching hash has been reported as being
-  modified by `Link`, download the new version 
-  
-- if no local file exists reported by `Link` and it is in an 
+  modified by `Link`, download the new version
+
+- if no local file exists reported by `Link` and it is in an
   *own* directory, download it
 
 - if local file marked *watch* has been reported as `Available` with
@@ -213,7 +254,7 @@ the desired action is kept into a queue to be executed later:
 - When triggered from a command (as in phase 0, but limited to owned files)
 - On a timer; it should be possible to configure times within which
   such download can happen, globally or per arena.
-  
+
 Downloading a file from a remote peer can be subject to rate-limits,
 configurable globally or per arena.
 
