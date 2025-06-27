@@ -61,19 +61,21 @@ Realize will advance through several key stages:
 
 ### Getting Started
 
-1. Clone the repository:
+1. [Install Cap'n Proto tools](https://capnproto.org/install.html)
+
+2. Clone the repository:
 
    ```bash
    git clone https://github.com/realize-sync/realize.git
    ```
 
-2. Navigate to the project directory:
+3. Navigate to the project directory:
 
    ```bash
    cd realize
    ```
 
-3. Build and test the project using Cargo:
+4. Build and test the project using Cargo:
 
    ```bash
    cargo test
