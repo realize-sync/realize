@@ -2,14 +2,10 @@ use assert_fs::TempDir;
 use assert_fs::prelude::*;
 use prometheus::proto::MetricType;
 use realize_lib::logic::consensus::movedirs;
-use realize_lib::logic::consensus::movedirs::METRIC_END_COUNT;
-use realize_lib::logic::consensus::movedirs::METRIC_FILE_END_COUNT;
-use realize_lib::logic::consensus::movedirs::METRIC_FILE_START_COUNT;
-use realize_lib::logic::consensus::movedirs::METRIC_RANGE_READ_BYTES;
-use realize_lib::logic::consensus::movedirs::METRIC_RANGE_WRITE_BYTES;
-use realize_lib::logic::consensus::movedirs::METRIC_READ_BYTES;
-use realize_lib::logic::consensus::movedirs::METRIC_START_COUNT;
-use realize_lib::logic::consensus::movedirs::METRIC_WRITE_BYTES;
+use realize_lib::logic::consensus::movedirs::{
+    METRIC_END_COUNT, METRIC_FILE_END_COUNT, METRIC_FILE_START_COUNT, METRIC_RANGE_READ_BYTES,
+    METRIC_RANGE_WRITE_BYTES, METRIC_READ_BYTES, METRIC_START_COUNT, METRIC_WRITE_BYTES,
+};
 use realize_lib::model::Arena;
 use realize_lib::network::rpc::realstore::server::{self, InProcessRealStoreServiceClient};
 use realize_lib::storage::real;

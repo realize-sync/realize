@@ -46,21 +46,15 @@ pub async fn keep_cache_updated(
 #[cfg(target_os = "linux")]
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::time::Duration;
-
     use super::*;
-    use crate::model::Arena;
-    use crate::model::Path;
-    use crate::model::UnixTime;
-    use crate::storage::real::Notification;
-    use crate::storage::real::RealStore;
+    use crate::model::{Arena, Path, UnixTime};
+    use crate::storage::real::{Notification, RealStore};
     use crate::storage::unreal::UnrealCacheBlocking;
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
-    use assert_fs::prelude::FileWriteStr as _;
-    use assert_fs::prelude::PathChild as _;
-    use assert_fs::prelude::PathCreateDir as _;
+    use assert_fs::prelude::{FileWriteStr as _, PathChild as _, PathCreateDir as _};
+    use std::fs;
+    use std::time::Duration;
     use tokio_retry::strategy::FixedInterval;
 
     struct Fixture {

@@ -1,33 +1,21 @@
-use std::{
-    cmp::{max, min},
-    collections::VecDeque,
-    io::{ErrorKind, SeekFrom},
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-    time::Duration,
-};
-
-use moka::future::{Cache, CacheBuilder};
-use tarpc::{client::RpcError, context};
-use tokio::{
-    io::{AsyncRead, AsyncSeek, ReadBuf},
-    task::JoinSet,
-};
-
-use crate::{
-    model::{ByteRange, Peer},
-    network::{
-        Networking,
-        rpc::realstore::{
-            self,
-            client::{ClientOptions, RealStoreClient},
-        },
-    },
-    storage::real::{self, RealStoreError},
-};
-
 use super::{FileTableEntry, UnrealCacheAsync, UnrealError};
+use crate::model::{ByteRange, Peer};
+use crate::network::Networking;
+use crate::network::rpc::realstore::client::{ClientOptions, RealStoreClient};
+use crate::network::rpc::realstore::{self};
+use crate::storage::real::{self, RealStoreError};
+use moka::future::{Cache, CacheBuilder};
+use std::cmp::{max, min};
+use std::collections::VecDeque;
+use std::io::{ErrorKind, SeekFrom};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tarpc::client::RpcError;
+use tarpc::context;
+use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
+use tokio::task::JoinSet;
 
 const MIN_CHUNK_SIZE: usize = 8 * 1024;
 const MAX_CHUNK_SIZE: usize = 32 * 1024;
@@ -349,21 +337,16 @@ fn real_store_to_io_error(err: RealStoreError) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
-
-    use assert_fs::{
-        TempDir,
-        prelude::{FileWriteBin as _, FileWriteStr as _, PathChild as _},
-    };
-    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
-
-    use crate::{
-        model::{Arena, Path, UnixTime},
-        network::{self, Server, hostport::HostPort},
-        storage::{self, real::RealStore},
-    };
-
     use super::*;
+    use crate::model::{Arena, Path, UnixTime};
+    use crate::network::hostport::HostPort;
+    use crate::network::{self, Server};
+    use crate::storage::real::RealStore;
+    use crate::storage::{self};
+    use assert_fs::TempDir;
+    use assert_fs::prelude::{FileWriteBin as _, FileWriteStr as _, PathChild as _};
+    use std::io::Write as _;
+    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
     struct Fixture {
         tempdir: TempDir,

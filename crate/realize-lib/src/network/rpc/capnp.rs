@@ -647,17 +647,14 @@ fn fill_time(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use tokio::{task::LocalSet, time::timeout};
-
-    use crate::{
-        model::Arena,
-        network::{hostport::HostPort, testing::TestingPeers},
-        storage::testing::FakeStoreSubscribe,
-    };
-
     use super::*;
+    use crate::model::Arena;
+    use crate::network::hostport::HostPort;
+    use crate::network::testing::TestingPeers;
+    use crate::storage::testing::FakeStoreSubscribe;
+    use std::sync::Arc;
+    use tokio::task::LocalSet;
+    use tokio::time::timeout;
 
     struct Fixture {
         arena: Arena,

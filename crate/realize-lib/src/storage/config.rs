@@ -1,6 +1,6 @@
-use std::{collections::HashMap, path::PathBuf};
-
 use crate::model::Arena;
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// Storage configuration.
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]

@@ -1,26 +1,22 @@
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
-
 use assert_fs::TempDir;
 use assert_fs::prelude::*;
 use nfs3_client::Nfs3ConnectionBuilder;
 use nfs3_client::tokio::TokioConnector;
-use nfs3_types::nfs3::Nfs3Result;
-use nfs3_types::nfs3::READDIR3args;
+use nfs3_types::nfs3::{Nfs3Result, READDIR3args};
 use predicates::prelude::*;
 use realize_lib::logic::config::Config;
 use realize_lib::model;
-use realize_lib::model::Arena;
-use realize_lib::model::Peer;
+use realize_lib::model::{Arena, Peer};
 use realize_lib::network::Networking;
 use realize_lib::network::config::PeerConfig;
 use realize_lib::network::rpc::realstore;
 use realize_lib::network::rpc::realstore::client::ClientOptions;
-use realize_lib::storage::config::ArenaConfig;
-use realize_lib::storage::config::CacheConfig;
+use realize_lib::storage::config::{ArenaConfig, CacheConfig};
 use realize_lib::storage::real;
 use reqwest::Client;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use tarpc::context;
 use tokio::io::AsyncBufReadExt as _;
 use tokio::process::Command;
@@ -390,9 +386,8 @@ async fn daemon_exports_nfs() -> anyhow::Result<()> {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn daemon_updates_cache() -> anyhow::Result<()> {
-    use std::time::Duration;
-
     use nfs3_types::nfs3::{LOOKUP3args, READ3args, diropargs3, nfs_fh3};
+    use std::time::Duration;
     use tokio_retry::strategy::FixedInterval;
 
     let fixture_a = Fixture::setup().await?;

@@ -5,20 +5,15 @@
 //! and supports secure, restartable sync.
 
 use crate::model;
-use crate::model::Arena;
-use crate::model::ByteRange;
-use crate::model::Hash;
+use crate::model::{Arena, ByteRange, Hash};
 use crate::network::Server;
-use crate::network::rpc::realstore::Config;
-use crate::network::rpc::realstore::RealStoreService;
 use crate::network::rpc::realstore::metrics::{MetricsRealizeClient, MetricsRealizeServer};
 use crate::network::rpc::realstore::{
-    RealStoreServiceClient, RealStoreServiceRequest, RealStoreServiceResponse,
+    Config, RealStoreService, RealStoreServiceClient, RealStoreServiceRequest,
+    RealStoreServiceResponse,
 };
 use crate::storage::real;
-use crate::storage::real::RealStore;
-use crate::storage::real::RealStoreError;
-use crate::storage::real::SyncedFile;
+use crate::storage::real::{RealStore, RealStoreError, SyncedFile};
 use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
 use futures::StreamExt;

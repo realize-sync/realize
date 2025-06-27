@@ -1,6 +1,5 @@
-use std::collections::HashMap;
-
 use crate::model::Peer;
+use std::collections::HashMap;
 
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
 pub struct NetworkConfig {

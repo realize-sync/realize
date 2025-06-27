@@ -1,8 +1,7 @@
-use std::{marker::PhantomData, str::Utf8Error};
-
-use redb::Value;
-
 use crate::model::PathError;
+use redb::Value;
+use std::marker::PhantomData;
+use std::str::Utf8Error;
 
 /// A type that can be converted to and from bytes.
 ///

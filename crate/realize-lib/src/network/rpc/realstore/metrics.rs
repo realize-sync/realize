@@ -11,23 +11,21 @@
 //! realize_lib::network::rpc::realstore::metrics::export_metrics("127.0.0.1:9000");
 //! ```
 
-use std::time::Instant;
-
+use crate::model::ByteRange;
+use crate::network::rpc::realstore::{RealStoreServiceRequest, RealStoreServiceResponse};
+use crate::storage::real::RealStoreError;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use prometheus::{
     Encoder, HistogramVec, IntCounterVec, register_histogram_vec, register_int_counter_vec,
 };
-use tarpc::{
-    ServerError,
-    client::{RpcError, stub::Stub},
-    context::Context,
-    server::Serve,
-};
+use std::time::Instant;
+use tarpc::ServerError;
+use tarpc::client::RpcError;
+use tarpc::client::stub::Stub;
+use tarpc::context::Context;
+use tarpc::server::Serve;
 use tokio::net::TcpListener;
-
-use crate::network::rpc::realstore::{RealStoreServiceRequest, RealStoreServiceResponse};
-use crate::{model::ByteRange, storage::real::RealStoreError};
 
 lazy_static::lazy_static! {
     pub(crate) static ref METRIC_SERVER_DATA_IN_BYTES: HistogramVec =

@@ -1,22 +1,15 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    ffi::OsString,
-    fs::Metadata,
-    path::PathBuf,
-    time::SystemTimeError,
-};
-
+use super::{Notification, PathResolver};
+use crate::model::{Arena, Path, UnixTime};
+use crate::storage::real::PathType;
 use futures::StreamExt as _;
 use inotify::{Event, EventMask, Inotify, WatchDescriptor, WatchMask, Watches};
+use std::collections::{HashMap, VecDeque};
+use std::ffi::OsString;
+use std::fs::Metadata;
+use std::path::PathBuf;
+use std::time::SystemTimeError;
 use tokio::fs;
 use tokio::sync::mpsc;
-
-use crate::{
-    model::{Arena, Path, UnixTime},
-    storage::real::PathType,
-};
-
-use super::{Notification, PathResolver};
 
 /// Spawn a file watcher task that can be used to get notifications.
 ///
@@ -350,11 +343,9 @@ mod tests {
     use super::*;
     use crate::storage::real::RealStore;
     use anyhow::Context as _;
-    use assert_fs::{
-        TempDir,
-        fixture::ChildPath,
-        prelude::{FileWriteStr as _, PathChild as _, PathCreateDir as _},
-    };
+    use assert_fs::TempDir;
+    use assert_fs::fixture::ChildPath;
+    use assert_fs::prelude::{FileWriteStr as _, PathChild as _, PathCreateDir as _};
     use std::time::Duration;
     use tokio::time::timeout;
 

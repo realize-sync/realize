@@ -1,6 +1,5 @@
 use async_speed_limit::Limiter;
-use async_speed_limit::clock::Clock;
-use async_speed_limit::clock::StandardClock;
+use async_speed_limit::clock::{Clock, StandardClock};
 use async_speed_limit::limiter::Consume;
 use futures::prelude::*;
 use std::pin::Pin;

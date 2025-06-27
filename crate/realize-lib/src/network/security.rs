@@ -1,24 +1,21 @@
+use super::config::PeerConfig;
+use crate::model::Peer;
 use anyhow::Context as _;
 use rustls::client::Resumption;
 use rustls::client::danger::ServerCertVerifier;
 use rustls::crypto::WebPkiSupportedAlgorithms;
+pub use rustls::crypto::aws_lc_rs::default_provider;
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use rustls::sign::CertifiedKey;
 use rustls::version::TLS13;
 use rustls::{ClientConfig, Error, ServerConfig};
 use std::collections::{BTreeMap, HashMap};
-
 use std::path::Path;
 use std::sync::Arc;
-use tokio_rustls::rustls::{self, server::danger::ClientCertVerifier};
+use tokio_rustls::rustls::server::danger::ClientCertVerifier;
+use tokio_rustls::rustls::{self};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
-
-pub use rustls::crypto::aws_lc_rs::default_provider;
-
-use crate::model::Peer;
-
-use super::config::PeerConfig;
 
 /// Create a TlsAcceptor (server-side) for the given peers and private key.
 pub(crate) fn make_tls_acceptor(

@@ -1,3 +1,4 @@
+use crate::model::Peer;
 use anyhow::Context as _;
 use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
@@ -6,26 +7,18 @@ use futures::prelude::*;
 use hostport::HostPort;
 use rate_limit::RateLimitedStream;
 use rustls::pki_types::ServerName;
-use security::PeerVerifier;
-use security::RawPublicKeyResolver;
-use tokio::io::AsyncReadExt as _;
-use tokio::io::AsyncWriteExt as _;
-use tokio::sync::broadcast;
-use tokio_rustls::TlsAcceptor;
-use tokio_rustls::TlsConnector;
-
+use security::{PeerVerifier, RawPublicKeyResolver};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path;
 use std::sync::Arc;
-use tokio::net::TcpListener;
-use tokio::net::TcpStream;
-
 use tarpc::serde_transport as transport;
 use tarpc::tokio_serde::formats::Bincode;
 use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
-
-use crate::model::Peer;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::broadcast;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 pub mod config;
 pub mod hostport;

@@ -4,16 +4,12 @@
 //! It is used by the TCP transport to transparently reconnect on
 //! network errors.
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
-
-use tarpc::{
-    RequestName,
-    client::{RpcError, stub::Stub},
-    context::Context,
-};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tarpc::RequestName;
+use tarpc::client::RpcError;
+use tarpc::client::stub::Stub;
+use tarpc::context::Context;
 use tokio::sync::RwLock;
 
 /// Maximum number of retries for DeadlineExceeded
@@ -238,22 +234,16 @@ fn should_reconnect<T>(result: &Result<T, RpcError>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashSet,
-        result::Result,
-        sync::atomic::{AtomicU32, Ordering},
-        time::Duration,
-    };
-
+    use super::*;
     use anyhow::Context as _;
     use futures::future::join_all;
-    use tarpc::{
-        ChannelError,
-        context::{self, Context},
-    };
+    use std::collections::HashSet;
+    use std::result::Result;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+    use tarpc::ChannelError;
+    use tarpc::context::{self, Context};
     use tokio_retry::strategy::ExponentialBackoff;
-
-    use super::*;
 
     #[derive(Clone, Debug)]
     struct FakeError {}

@@ -9,10 +9,8 @@ pub mod client;
 pub mod metrics;
 pub mod server;
 
-use crate::{
-    model::{self, Arena, ByteRange, ByteRanges, Delta, Hash, Signature},
-    storage::real::{self, RealStoreError, SyncedFile},
-};
+use crate::model::{self, Arena, ByteRange, ByteRanges, Delta, Hash, Signature};
+use crate::storage::real::{self, RealStoreError, SyncedFile};
 
 /// Configure a specific connection to a [RealStoreService] instance.
 ///

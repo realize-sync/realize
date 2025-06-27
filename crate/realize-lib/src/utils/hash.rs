@@ -23,7 +23,8 @@
 //! ```
 
 use crate::model::Hash;
-use blake2::{Blake2b, Digest, digest::consts::U32};
+use blake2::digest::consts::U32;
+use blake2::{Blake2b, Digest};
 
 type Blake2b256 = Blake2b<U32>;
 

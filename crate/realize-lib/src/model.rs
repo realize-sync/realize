@@ -6,12 +6,8 @@ mod peer;
 mod time;
 
 pub use arena::Arena;
-pub use byterange::ByteRange;
-pub use byterange::ByteRanges;
-pub use data::Delta;
-pub use data::Hash;
-pub use data::Signature;
-pub use path::Path;
-pub use path::PathError;
+pub use byterange::{ByteRange, ByteRanges};
+pub use data::{Delta, Hash, Signature};
+pub use path::{Path, PathError};
 pub use peer::Peer;
 pub use time::UnixTime;

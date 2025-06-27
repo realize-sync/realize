@@ -5,15 +5,13 @@
 //! over the RealStoreService trait and is designed to be robust and restartable.
 
 use crate::model;
-use crate::model::Arena;
-use crate::model::{ByteRange, ByteRanges};
+use crate::model::{Arena, ByteRange, ByteRanges};
 use crate::network::rpc::realstore::{
     RangedHash, RealStoreServiceClient, RealStoreServiceRequest, RealStoreServiceResponse,
 };
 use crate::storage::real::{self, RealStoreError, SyncedFile};
-use futures::FutureExt;
-use futures::future;
 use futures::stream::StreamExt as _;
+use futures::{FutureExt, future};
 use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -792,8 +790,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Arena;
-    use crate::model::Hash;
+    use crate::model::{Arena, Hash};
     use crate::network::rpc::realstore::server::{self};
     use crate::storage::real::RealStore;
     use crate::utils::hash;

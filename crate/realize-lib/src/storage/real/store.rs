@@ -1,32 +1,24 @@
+use crate::model::{self, Arena, ByteRange, Delta, Hash, Signature};
+use crate::storage::config::ArenaConfig;
+use crate::utils::hash;
 use fast_rsync::{
     Signature as RsyncSignature, SignatureOptions, apply_limited as rsync_apply_limited,
     diff as rsync_diff,
 };
-use std::{
-    cmp::min,
-    collections::HashMap,
-    ffi::OsString,
-    io::{self, SeekFrom},
-    iter,
-    os::unix::fs::MetadataExt as _,
-    path::{self, PathBuf},
-    sync::Arc,
-    time::SystemTime,
-};
-use tokio::{
-    fs::{self, File, OpenOptions},
-    io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _},
-    task::JoinError,
-};
-
+use std::cmp::min;
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::io::{self, SeekFrom};
+use std::iter;
+use std::os::unix::fs::MetadataExt as _;
+use std::path::{self, PathBuf};
+use std::sync::Arc;
+use std::time::SystemTime;
+use tokio::fs::{self, File, OpenOptions};
+use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::sync::mpsc;
+use tokio::task::JoinError;
 use walkdir::WalkDir;
-
-use crate::{
-    model::{self, Arena, ByteRange, Delta, Hash, Signature},
-    storage::config::ArenaConfig,
-    utils::hash,
-};
 
 const RSYNC_BLOCK_SIZE: usize = 4096;
 
@@ -779,10 +771,9 @@ mod tests {
     use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
     use std::ffi::OsString;
-    use std::fs;
     use std::io::Read as _;
-    use std::path;
     use std::path::PathBuf;
+    use std::{fs, path};
 
     #[tokio::test]
     async fn partial_and_final_paths() -> anyhow::Result<()> {

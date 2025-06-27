@@ -1,15 +1,11 @@
-use std::{path, sync::Arc};
-
-use tokio::task;
-
-use crate::{
-    model::{Arena, Path, Peer, UnixTime},
-    storage::config::StorageConfig,
-};
-
 use super::{
     FileMetadata, FileTableEntry, InodeAssignment, ReadDirEntry, UnrealCacheBlocking, UnrealError,
 };
+use crate::model::{Arena, Path, Peer, UnixTime};
+use crate::storage::config::StorageConfig;
+use std::path;
+use std::sync::Arc;
+use tokio::task;
 
 #[derive(Clone)]
 pub struct UnrealCacheAsync {

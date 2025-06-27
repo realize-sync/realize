@@ -1,10 +1,8 @@
 #![cfg(target_os = "linux")]
 
-use assert_fs::prelude::FileWriteStr as _;
-use assert_fs::prelude::PathChild as _;
+use assert_fs::prelude::{FileWriteStr as _, PathChild as _};
 use common::mountpoint;
-use realize_lib::model::Path;
-use realize_lib::model::UnixTime;
+use realize_lib::model::{Path, UnixTime};
 use std::os::unix::fs::PermissionsExt as _;
 
 mod common;

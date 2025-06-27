@@ -1,4 +1,5 @@
-use crate::{network::config::NetworkConfig, storage::config::StorageConfig};
+use crate::network::config::NetworkConfig;
+use crate::storage::config::StorageConfig;
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct Config {

@@ -125,9 +125,9 @@ pub enum PathError {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
-
     use super::*;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
 
     #[test]
     fn parse_valid_paths() -> anyhow::Result<()> {

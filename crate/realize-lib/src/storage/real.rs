@@ -1,19 +1,13 @@
-use crate::model::Arena;
-use crate::model::Path;
-use crate::model::UnixTime;
+use crate::model::{Arena, Path, UnixTime};
 
 #[cfg(target_os = "linux")]
 mod history;
 mod store;
 
-pub use store::Options;
-pub use store::PathResolver;
-pub use store::PathType;
-pub use store::RealStore;
-pub use store::RealStoreError;
-pub use store::RsyncOperation;
-pub use store::StoreSubscribe;
-pub use store::SyncedFile;
+pub use store::{
+    Options, PathResolver, PathType, RealStore, RealStoreError, RsyncOperation, StoreSubscribe,
+    SyncedFile,
+};
 
 /// Report something happening in arenas of the local file system.
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]

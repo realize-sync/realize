@@ -1,6 +1,6 @@
+use crate::model::Arena;
+use crate::utils::holder::ByteConversionError;
 use tokio::task::JoinError;
-
-use crate::{model::Arena, utils::holder::ByteConversionError};
 
 /// Error returned by the [UnrealCache].
 ///

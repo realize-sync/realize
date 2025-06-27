@@ -1,16 +1,13 @@
-use std::{collections::HashMap, sync::Arc};
-
-use tokio::sync::mpsc;
-
+use super::config::Config;
 use crate::model::{Arena, Peer};
 use crate::network::rpc::{Household, realstore};
 use crate::network::{Networking, Server};
 use crate::storage::config::ArenaConfig;
 use crate::storage::real::{Notification, RealStore};
-use crate::storage::unreal::UnrealCacheAsync;
-use crate::storage::unreal::{Downloader, keep_cache_updated};
-
-use super::config::Config;
+use crate::storage::unreal::{Downloader, UnrealCacheAsync, keep_cache_updated};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 pub struct Setup {
     networking: Networking,

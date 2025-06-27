@@ -1,16 +1,9 @@
-use std::{
-    collections::HashSet,
-    sync::{Arc, Mutex},
-};
-
-use tokio::sync::mpsc;
-
+use super::real::{Notification, StoreSubscribe};
+use super::unreal::UnrealCacheBlocking;
 use crate::model::Arena;
-
-use super::{
-    real::{Notification, StoreSubscribe},
-    unreal::UnrealCacheBlocking,
-};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 
 pub fn in_memory_cache() -> anyhow::Result<UnrealCacheBlocking> {
     let cache = UnrealCacheBlocking::new(
