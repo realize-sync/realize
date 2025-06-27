@@ -3,8 +3,8 @@
 //! See `spec/unreal.md` for details.
 
 use super::{
-    DirTableEntry, FileMetadata, FileTableEntry, InodeAssignment, ReadDirEntry, UnrealCacheAsync,
-    UnrealError, ROOT_DIR,
+    DirTableEntry, FileMetadata, FileTableEntry, InodeAssignment, ROOT_DIR, ReadDirEntry,
+    UnrealCacheAsync, UnrealError,
 };
 use crate::model::{Arena, Path, Peer, UnixTime};
 use crate::storage::unreal::FileContent;
@@ -120,7 +120,8 @@ impl UnrealCacheBlocking {
     /// is available in the cache.
     pub fn arena_root(&self, arena: &Arena) -> Result<u64, UnrealError> {
         self.arena_map
-            .get(arena).copied()
+            .get(arena)
+            .copied()
             .ok_or_else(|| UnrealError::UnknownArena(arena.clone()))
     }
 

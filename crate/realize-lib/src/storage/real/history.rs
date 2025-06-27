@@ -342,9 +342,7 @@ async fn find_mtime_for_unlink(
 
 /// Extract modification time as [UnixTime] from metadata.
 fn unix_mtime(metadata: &std::fs::Metadata) -> anyhow::Result<UnixTime, SystemTimeError> {
-    UnixTime::from_system_time(
-        metadata.modified().expect("OS must support mtime"),
-    )
+    UnixTime::from_system_time(metadata.modified().expect("OS must support mtime"))
 }
 
 #[cfg(test)]
@@ -353,9 +351,9 @@ mod tests {
     use crate::storage::real::RealStore;
     use anyhow::Context as _;
     use assert_fs::{
+        TempDir,
         fixture::ChildPath,
         prelude::{FileWriteStr as _, PathChild as _, PathCreateDir as _},
-        TempDir,
     };
     use std::time::Duration;
     use tokio::time::timeout;
@@ -543,20 +541,21 @@ mod tests {
         );
 
         std::fs::remove_dir_all(subdir.path())?;
-        let all_n = [fixture.next("unlink 1").await?,
-            fixture.next("unlink 2").await?];
-        assert!(all_n
-            .iter()
-            .all(|n| matches!(n, Notification::Unlink { .. })));
+        let all_n = [
+            fixture.next("unlink 1").await?,
+            fixture.next("unlink 2").await?,
+        ];
+        assert!(
+            all_n
+                .iter()
+                .all(|n| matches!(n, Notification::Unlink { .. }))
+        );
         assert_unordered::assert_eq_unordered!(
             vec![
                 Some(Path::parse("subdir/child1.txt")?),
                 Some(Path::parse("subdir/child2.txt")?)
             ],
-            all_n
-                .iter()
-                .map(|n| n.path().cloned())
-                .collect::<Vec<_>>(),
+            all_n.iter().map(|n| n.path().cloned()).collect::<Vec<_>>(),
         );
 
         Ok(())

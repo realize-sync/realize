@@ -3,12 +3,12 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc;
 
 use crate::model::{Arena, Peer};
-use crate::network::rpc::{realstore, Household};
+use crate::network::rpc::{Household, realstore};
 use crate::network::{Networking, Server};
 use crate::storage::config::ArenaConfig;
 use crate::storage::real::{Notification, RealStore};
 use crate::storage::unreal::UnrealCacheAsync;
-use crate::storage::unreal::{keep_cache_updated, Downloader};
+use crate::storage::unreal::{Downloader, keep_cache_updated};
 
 use super::config::Config;
 
@@ -83,9 +83,7 @@ fn check_directory_access(arenas: &HashMap<Arena, ArenaConfig>) -> anyhow::Resul
                 arena
             );
         }
-        if !std::fs::metadata(path).map(|m| m.is_dir())
-            .unwrap_or(false)
-        {
+        if !std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
             anyhow::bail!(
                 "Path '{}' (id: {}) is not a directory",
                 path.display(),

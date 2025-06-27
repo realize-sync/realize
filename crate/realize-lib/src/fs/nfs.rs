@@ -316,8 +316,8 @@ impl From<UnrealFsError> for nfsstat3 {
 }
 
 fn unreal_to_nfsstat3(err: &UnrealError) -> nfsstat3 {
-    use nfsstat3::*;
     use UnrealError::*;
+    use nfsstat3::*;
     match err {
         NotFound => NFS3ERR_NOENT,
         NotADirectory => NFS3ERR_NOTDIR,
@@ -359,12 +359,12 @@ mod tests {
 
     use crate::{
         model::{Arena, Path},
-        network::{self, hostport::HostPort, rpc::realstore, Server},
+        network::{self, Server, hostport::HostPort, rpc::realstore},
         storage::{self, real::RealStore},
     };
     use assert_fs::{
-        prelude::{FileWriteStr as _, PathChild as _},
         TempDir,
+        prelude::{FileWriteStr as _, PathChild as _},
     };
     use nfsserve::nfs::nfsstring;
 

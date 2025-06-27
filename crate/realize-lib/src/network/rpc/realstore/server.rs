@@ -8,22 +8,22 @@ use crate::model;
 use crate::model::Arena;
 use crate::model::ByteRange;
 use crate::model::Hash;
-use crate::network::rpc::realstore::metrics::{MetricsRealizeClient, MetricsRealizeServer};
+use crate::network::Server;
 use crate::network::rpc::realstore::Config;
 use crate::network::rpc::realstore::RealStoreService;
+use crate::network::rpc::realstore::metrics::{MetricsRealizeClient, MetricsRealizeServer};
 use crate::network::rpc::realstore::{
     RealStoreServiceClient, RealStoreServiceRequest, RealStoreServiceResponse,
 };
-use crate::network::Server;
 use crate::storage::real;
 use crate::storage::real::RealStore;
 use crate::storage::real::RealStoreError;
 use crate::storage::real::SyncedFile;
-use async_speed_limit::clock::StandardClock;
 use async_speed_limit::Limiter;
+use async_speed_limit::clock::StandardClock;
 use futures::StreamExt;
-use tarpc::client::stub::Stub;
 use tarpc::client::RpcError;
+use tarpc::client::stub::Stub;
 use tarpc::context;
 use tarpc::server::Channel;
 use tarpc::tokio_serde::formats::Bincode;

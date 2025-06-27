@@ -1,7 +1,7 @@
-use async_speed_limit::clock::StandardClock;
 use async_speed_limit::Limiter;
-use tarpc::client::stub::Stub;
+use async_speed_limit::clock::StandardClock;
 use tarpc::client::RpcError;
+use tarpc::client::stub::Stub;
 use tarpc::context;
 use tokio::sync::Mutex;
 use tokio_retry::strategy::ExponentialBackoff;
@@ -10,15 +10,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::model::Peer;
+use crate::network::Networking;
 use crate::network::reconnect::Connect;
 use crate::network::reconnect::Reconnect;
 use crate::network::rpc::realstore;
-use crate::network::rpc::realstore::metrics::MetricsRealizeClient;
 use crate::network::rpc::realstore::Config;
 use crate::network::rpc::realstore::RealStoreServiceClient;
 use crate::network::rpc::realstore::RealStoreServiceRequest;
 use crate::network::rpc::realstore::RealStoreServiceResponse;
-use crate::network::Networking;
+use crate::network::rpc::realstore::metrics::MetricsRealizeClient;
 
 pub type RealStoreClient = RealStoreServiceClient<RealizeStub>;
 
@@ -168,11 +168,11 @@ mod tests {
 
     use super::*;
     use crate::model::{Arena, Peer};
+    use crate::network::Server;
     use crate::network::hostport::HostPort;
     use crate::network::rpc::realstore::Config;
     use crate::network::security::{PeerVerifier, RawPublicKeyResolver};
     use crate::network::testing;
-    use crate::network::Server;
     use crate::storage::real::{self, RealStore};
     use crate::utils::async_utils::AbortOnDrop;
     use assert_fs::TempDir;

@@ -1,6 +1,6 @@
 use anyhow::Context as _;
-use async_speed_limit::clock::StandardClock;
 use async_speed_limit::Limiter;
+use async_speed_limit::clock::StandardClock;
 use config::PeerConfig;
 use futures::prelude::*;
 use hostport::HostPort;
@@ -54,9 +54,9 @@ impl Networking {
         let verifier = PeerVerifier::from_config(peers)?;
         let resolver = RawPublicKeyResolver::from_private_key_file(privkey)?;
         Ok(Self::new(
-            peers.iter().flat_map(|(p, c)| {
-                c.address.as_ref().map(|addr| (p, addr.as_ref()))
-            }),
+            peers
+                .iter()
+                .flat_map(|(p, c)| c.address.as_ref().map(|addr| (p, addr.as_ref()))),
             resolver,
             verifier,
         ))
@@ -263,13 +263,13 @@ impl Server {
         &mut self,
         tag: &'static [u8; 4],
         handler: impl Fn(
-                Peer,
-                tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
-                Limiter,
-                broadcast::Receiver<()>,
-            ) + Send
-            + Sync
-            + 'static,
+            Peer,
+            tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
+            Limiter,
+            broadcast::Receiver<()>,
+        ) + Send
+        + Sync
+        + 'static,
     ) {
         self.handlers.insert(tag, Box::new(handler));
     }

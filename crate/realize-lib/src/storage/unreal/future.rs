@@ -108,8 +108,7 @@ impl UnrealCacheAsync {
         let mtime = mtime.clone();
         let inner = Arc::clone(&self.inner);
 
-        task::spawn_blocking(move || inner.catchup(&peer, &arena, &path, size, &mtime))
-                .await?
+        task::spawn_blocking(move || inner.catchup(&peer, &arena, &path, size, &mtime)).await?
     }
 
     pub async fn lookup(&self, parent_inode: u64, name: &str) -> Result<ReadDirEntry, UnrealError> {

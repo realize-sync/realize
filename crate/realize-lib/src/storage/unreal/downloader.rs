@@ -18,11 +18,11 @@ use tokio::{
 use crate::{
     model::{ByteRange, Peer},
     network::{
+        Networking,
         rpc::realstore::{
             self,
             client::{ClientOptions, RealStoreClient},
         },
-        Networking,
     },
     storage::real::{self, RealStoreError},
 };
@@ -352,14 +352,14 @@ mod tests {
     use std::io::Write as _;
 
     use assert_fs::{
-        prelude::{FileWriteBin as _, FileWriteStr as _, PathChild as _},
         TempDir,
+        prelude::{FileWriteBin as _, FileWriteStr as _, PathChild as _},
     };
     use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
     use crate::{
         model::{Arena, Path, UnixTime},
-        network::{self, hostport::HostPort, Server},
+        network::{self, Server, hostport::HostPort},
         storage::{self, real::RealStore},
     };
 

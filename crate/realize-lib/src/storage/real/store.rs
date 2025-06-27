@@ -1,6 +1,6 @@
 use fast_rsync::{
-    apply_limited as rsync_apply_limited, diff as rsync_diff, Signature as RsyncSignature,
-    SignatureOptions,
+    Signature as RsyncSignature, SignatureOptions, apply_limited as rsync_apply_limited,
+    diff as rsync_diff,
 };
 use std::{
     cmp::min,
@@ -775,8 +775,8 @@ mod tests {
     use super::*;
     use crate::model::Hash;
     use crate::utils::hash;
-    use assert_fs::prelude::*;
     use assert_fs::TempDir;
+    use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
     use std::ffi::OsString;
     use std::fs;
@@ -1413,7 +1413,7 @@ mod tests {
                 &Options::default(),
             )
             .await?;
-        assert!(!delta.0 .0.is_empty());
+        assert!(!delta.0.0.is_empty());
 
         // Revert file to old content, then apply delta
         temp.child(".foo.txt.part").write_binary(file_content)?;

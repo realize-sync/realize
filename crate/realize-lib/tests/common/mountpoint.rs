@@ -5,10 +5,10 @@ use nix::fcntl::{Flock, FlockArg};
 use realize_lib::{
     model::{Arena, Peer},
     network::{
+        Networking, Server,
         hostport::HostPort,
         rpc::realstore,
         security::{PeerVerifier, RawPublicKeyResolver},
-        Networking, Server,
     },
     storage::{
         real::RealStore,

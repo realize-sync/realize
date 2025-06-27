@@ -1,6 +1,6 @@
 use anyhow::Context as _;
-use rustls::client::danger::ServerCertVerifier;
 use rustls::client::Resumption;
+use rustls::client::danger::ServerCertVerifier;
 use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
@@ -327,8 +327,8 @@ mod tests {
     use super::*;
     use crate::network::testing;
     use crate::utils::async_utils::AbortOnDrop;
-    use rustls::pki_types::pem::PemObject as _;
     use rustls::pki_types::PrivateKeyDer;
+    use rustls::pki_types::pem::PemObject as _;
     use rustls::sign::SigningKey;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

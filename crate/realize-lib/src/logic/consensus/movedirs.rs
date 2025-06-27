@@ -11,16 +11,16 @@ use crate::network::rpc::realstore::{
     RangedHash, RealStoreServiceClient, RealStoreServiceRequest, RealStoreServiceResponse,
 };
 use crate::storage::real::{self, RealStoreError, SyncedFile};
+use futures::FutureExt;
 use futures::future;
 use futures::stream::StreamExt as _;
-use futures::FutureExt;
-use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
+use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tarpc::client::stub::Stub;
 use thiserror::Error;
-use tokio::sync::mpsc::Sender;
 use tokio::sync::Semaphore;
+use tokio::sync::mpsc::Sender;
 
 const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 const PARALLEL_FILE_COUNT: usize = 4;
@@ -515,9 +515,7 @@ where
             }
             Err(RealStoreError::HashMismatch) => {
                 copy_ranges.add(&range);
-                log::error!(
-                    "{arena}/{path}:{range} hash mismatch after apply_delta, will copy",
-                );
+                log::error!("{arena}/{path}:{range} hash mismatch after apply_delta, will copy",);
                 METRIC_APPLY_DELTA_FALLBACK_COUNT.inc();
                 METRIC_APPLY_DELTA_FALLBACK_BYTES.inc_by(range.bytecount());
             }
@@ -705,22 +703,21 @@ pub(crate) async fn hash_file<T>(
 where
     T: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse>,
 {
-    let results =
-        futures::stream::iter(ByteRange::new(0, file_size).chunked(chunk_size))
-            .map(|range| {
-                client
-                    .hash(
-                        ctx,
-                        arena.clone(),
-                        relative_path.clone(),
-                        range.clone(),
-                        options,
-                    )
-                    .map(move |res| res.map(|h| (range.clone(), h)))
-            })
-            .buffer_unordered(PARALLEL_FILE_HASH)
-            .collect::<Vec<_>>()
-            .await;
+    let results = futures::stream::iter(ByteRange::new(0, file_size).chunked(chunk_size))
+        .map(|range| {
+            client
+                .hash(
+                    ctx,
+                    arena.clone(),
+                    relative_path.clone(),
+                    range.clone(),
+                    options,
+                )
+                .map(move |res| res.map(|h| (range.clone(), h)))
+        })
+        .buffer_unordered(PARALLEL_FILE_HASH)
+        .collect::<Vec<_>>()
+        .await;
 
     let mut ranged = RangedHash::new();
     for res in results.into_iter() {
@@ -800,8 +797,8 @@ mod tests {
     use crate::network::rpc::realstore::server::{self};
     use crate::storage::real::RealStore;
     use crate::utils::hash;
-    use assert_fs::prelude::*;
     use assert_fs::TempDir;
+    use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
     use std::path::PathBuf;
     use walkdir::WalkDir;

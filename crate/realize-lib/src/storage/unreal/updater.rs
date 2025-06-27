@@ -56,11 +56,11 @@ mod tests {
     use crate::storage::real::Notification;
     use crate::storage::real::RealStore;
     use crate::storage::unreal::UnrealCacheBlocking;
+    use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::FileWriteStr as _;
     use assert_fs::prelude::PathChild as _;
     use assert_fs::prelude::PathCreateDir as _;
-    use assert_fs::TempDir;
     use tokio_retry::strategy::FixedInterval;
 
     struct Fixture {

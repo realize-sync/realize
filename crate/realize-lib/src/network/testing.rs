@@ -1,12 +1,12 @@
-use rustls::pki_types::{pem::PemObject as _, PrivateKeyDer, SubjectPublicKeyInfoDer};
+use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer, pem::PemObject as _};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use super::Networking;
 use super::config::PeerConfig;
 use super::hostport::HostPort;
 use super::security::{PeerVerifier, RawPublicKeyResolver};
-use super::Networking;
 use crate::model::Peer;
 
 pub fn client_peer() -> Peer {

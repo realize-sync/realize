@@ -13,8 +13,8 @@ use capnp::capability::Promise;
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
 use capnp_rpc::{RpcSystem, VatNetwork as _};
-use futures::io::{BufReader, BufWriter};
 use futures::AsyncReadExt;
+use futures::io::{BufReader, BufWriter};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -219,9 +219,7 @@ impl AppContext {
     fn keep_connected(self: &Rc<Self>) {
         for peer in self.networking.connectable_peers() {
             let mut borrow = self.connections.borrow_mut();
-            let conn = borrow
-                .entry(peer.clone())
-                .or_default();
+            let conn = borrow.entry(peer.clone()).or_default();
             let has_usable_tracker = conn
                 .tracker
                 .as_ref()
@@ -701,11 +699,7 @@ mod tests {
                 .get(peer)
                 .ok_or(anyhow::anyhow!("No store defined for {peer}"))?
                 .clone();
-            Household::spawn(
-                self.peers.networking(peer)?,
-                store,
-                notification_tx,
-            )
+            Household::spawn(self.peers.networking(peer)?, store, notification_tx)
         }
 
         async fn run_server(

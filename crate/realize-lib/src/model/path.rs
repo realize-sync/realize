@@ -66,7 +66,9 @@ impl Path {
     ///
     /// Return a non-empty parent path or None.
     pub fn parent(&self) -> Option<Path> {
-        self.0.rfind('/').map(|slash| Path(self.0[0..slash].to_string()))
+        self.0
+            .rfind('/')
+            .map(|slash| Path(self.0[0..slash].to_string()))
     }
 
     /// Split a possibly empty path into zero or more components.
