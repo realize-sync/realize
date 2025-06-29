@@ -35,6 +35,7 @@ thiserror = "2.0"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "fs", "io-util"] }
 tokio-retry = "0.3.0"
 tokio-rustls = "0.26"
+tokio-stream = "0.1.17"
 tokio-util = { version = "0.7.15", features = ["compat"] }
 walkdir = "2.5"
 

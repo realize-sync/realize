@@ -2,6 +2,7 @@ use crate::model::{Arena, Path, UnixTime};
 
 #[cfg(target_os = "linux")]
 mod history;
+mod index;
 #[allow(dead_code)]
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]
