@@ -249,24 +249,23 @@ impl Collector {
         if let Some((PathType::Final, path)) = self.path_resolver.reverse(&path) {
             let arena = self.arena.clone();
             let size = metadata.len();
-            if let Ok(mtime) = unix_mtime(&metadata) {
-                self.send_notification(if catchup {
-                    Notification::Catchup {
-                        arena,
-                        path,
-                        size,
-                        mtime,
-                    }
-                } else {
-                    Notification::Link {
-                        arena,
-                        path,
-                        size,
-                        mtime,
-                    }
-                })
-                .await;
-            }
+            let mtime = UnixTime::mtime(&metadata);
+            self.send_notification(if catchup {
+                Notification::Catchup {
+                    arena,
+                    path,
+                    size,
+                    mtime,
+                }
+            } else {
+                Notification::Link {
+                    arena,
+                    path,
+                    size,
+                    mtime,
+                }
+            })
+            .await;
         }
     }
 
@@ -312,18 +311,18 @@ async fn find_mtime_for_unlink(
     while let Some(parent_path) = current {
         let parent_full_path = parent_path.within(resolver.root());
         if let Ok(metadata) = fs::metadata(&parent_full_path).await {
-            if let Ok(mtime) = unix_mtime(&metadata) {
-                return Ok(Some(mtime));
-            }
+            let mtime = Unix::mtime(&metadata);
+
+            return Ok(Some(mtime));
         }
         current = parent_path.parent();
     }
 
     // Fallback to arena root
     if let Ok(metadata) = fs::metadata(resolver.root()).await {
-        if let Ok(mtime) = unix_mtime(&metadata) {
-            return Ok(Some(mtime));
-        }
+        let mtime = Unix::mtime(&metadata);
+
+        return Ok(Some(mtime));
     }
 
     Err(anyhow::anyhow!(
@@ -331,11 +330,6 @@ async fn find_mtime_for_unlink(
         resolver.root(),
         path
     ))
-}
-
-/// Extract modification time as [UnixTime] from metadata.
-fn unix_mtime(metadata: &std::fs::Metadata) -> anyhow::Result<UnixTime, SystemTimeError> {
-    UnixTime::from_system_time(metadata.modified().expect("OS must support mtime"))
 }
 
 #[cfg(test)]
@@ -422,7 +416,7 @@ mod tests {
                 arena: fixture.arena(),
                 path: Path::parse("child.txt")?,
                 size: 7,
-                mtime: UnixTime::from_system_time(child.metadata()?.modified()?)?,
+                mtime: UnixTime::mtime(&child.metadata()?)
             },
             fixture.next("child.txt").await?,
         );
@@ -450,7 +444,7 @@ mod tests {
                 arena: fixture.arena(),
                 path: Path::parse("subdir1/subdir2/child.txt")?,
                 size: 7,
-                mtime: UnixTime::from_system_time(child.metadata()?.modified()?)?,
+                mtime: UnixTime::mtime(&child.metadata())
             },
             fixture.next("child.txt").await?,
         );
@@ -471,7 +465,7 @@ mod tests {
             fixture.next("ready").await?,
         );
 
-        let start = UnixTime::from_system_time(fixture.arena_dir.metadata()?.modified()?)?;
+        let start = UnixTime::mtime(&fixture.arena_dir.metadata()?);
         std::fs::remove_file(child.path())?;
         let notification = fixture.next("unlink").await?;
         match &notification {
@@ -507,7 +501,7 @@ mod tests {
                 arena: fixture.arena(),
                 path: Path::parse("child.txt")?,
                 size: 11,
-                mtime: UnixTime::from_system_time(child.metadata()?.modified()?)?,
+                mtime: UnixTime::mtime(&child.metadata()?),
             },
             fixture.next("rewrite").await?,
         );
@@ -567,7 +561,7 @@ mod tests {
 
         let dest = fixture._tempdir.child("dest.txt");
         std::fs::rename(child.path(), dest.path())?;
-        let mtime = UnixTime::from_system_time(fixture.arena_dir.metadata()?.modified()?)?;
+        let mtime = UnixTime::mtime(&fixture.arena_dir.metadata());
         assert_eq!(
             Notification::Unlink {
                 arena: fixture.arena(),
@@ -599,7 +593,7 @@ mod tests {
                 arena: fixture.arena(),
                 path: Path::parse("dest.txt")?,
                 size: 7,
-                mtime: UnixTime::from_system_time(dest.metadata()?.modified()?)?,
+                mtime: UnixTime::mtime(&dest.metadata()?),
             },
             fixture.next("move in").await?,
         );
@@ -623,7 +617,7 @@ mod tests {
         std::fs::rename(source.path(), dest.path())?;
         let n1 = fixture.next("move within 1").await?;
         let n2 = fixture.next("move within 2").await?;
-        let mtime = UnixTime::from_system_time(fixture.arena_dir.metadata()?.modified()?)?;
+        let mtime = UnixTime::mtime(&fixture.arena_dir.metadata());
         let unlink = Notification::Unlink {
             arena: fixture.arena(),
             path: Path::parse("source.txt")?,
@@ -633,7 +627,7 @@ mod tests {
             arena: fixture.arena(),
             path: Path::parse("dest.txt")?,
             size: 7,
-            mtime: UnixTime::from_system_time(dest.metadata()?.modified()?)?,
+            mtime: UnixTime::mtime(&dest.metadata()?),
         };
         if n1 == unlink {
             assert_eq!(n2, link);
@@ -661,12 +655,12 @@ mod tests {
                 arena: fixture.arena(),
                 path: Path::parse("child.txt")?,
                 size: 7,
-                mtime: UnixTime::from_system_time(child.metadata()?.modified()?)?,
+                mtime: UnixTime::mtime(&child.metadata()?),
             },
             fixture.next("create").await?,
         );
 
-        let mtime = UnixTime::from_system_time(fixture.arena_dir.metadata()?.modified()?)?;
+        let mtime = UnixTime::mtime(&fixture.arena_dir.metadata()?);
         std::fs::remove_file(child.path())?;
         assert_eq!(
             Notification::Unlink {
@@ -704,7 +698,7 @@ mod tests {
                     arena: fixture.arena(),
                     path: Path::parse("child.txt")?,
                     size: 7,
-                    mtime: UnixTime::from_system_time(child.metadata()?.modified()?)?,
+                    mtime: UnixTime::mtime(&child.metadata()?),
                 },
                 Notification::Ready {
                     arena: fixture.arena()
@@ -743,13 +737,13 @@ mod tests {
                     arena: fixture.arena(),
                     path: Path::parse("a/child1.txt")?,
                     size: 1,
-                    mtime: UnixTime::from_system_time(child1.metadata()?.modified()?)?,
+                    mtime: UnixTime::mtime(&child1.metadata()?),
                 },
                 Notification::Catchup {
                     arena: fixture.arena(),
                     path: Path::parse("a/b/child2.txt")?,
                     size: 1,
-                    mtime: UnixTime::from_system_time(child2.metadata()?.modified()?)?,
+                    mtime: UnixTime::mtime(child2.metadata()?),
                 },
             ],
             notifications,

@@ -377,7 +377,7 @@ mod tests {
                     &self.arena,
                     &path,
                     metadata.len(),
-                    &UnixTime::from_system_time(metadata.modified()?)?,
+                    &UnixTime::mtime(&metadata),
                 )
                 .await?;
             let (inode, _) = self

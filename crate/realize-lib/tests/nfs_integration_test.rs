@@ -58,19 +58,13 @@ async fn export_linked_files() -> anyhow::Result<()> {
     let metadata = c.metadata().await?;
     assert!(metadata.file_type().is_file());
     assert_eq!(0o0440, metadata.permissions().mode() & 0o7777);
-    assert_eq!(
-        test_mtime,
-        UnixTime::from_system_time(metadata.modified().unwrap())?
-    );
+    assert_eq!(test_mtime, UnixTime::mtime(&metadata));
 
     assert_eq!("d.txt", d.file_name().to_string_lossy());
     let metadata = d.metadata().await?;
     assert!(metadata.file_type().is_file());
     assert_eq!(0o0440, metadata.permissions().mode() & 0o7777);
-    assert_eq!(
-        test_mtime,
-        UnixTime::from_system_time(metadata.modified().unwrap())?
-    );
+    assert_eq!(test_mtime, UnixTime::mtime(&metadata));
 
     Ok(())
 }
@@ -87,13 +81,7 @@ async fn read_file() -> anyhow::Result<()> {
     testfile.write_str("hello, world")?;
     let m = tokio::fs::metadata(&testfile.path()).await?;
     cache
-        .link(
-            &peer,
-            arena,
-            &path,
-            m.len(),
-            &UnixTime::from_system_time(m.modified()?)?,
-        )
+        .link(&peer, arena, &path, m.len(), &UnixTime::mtime(&m))
         .await?;
 
     assert_eq!(

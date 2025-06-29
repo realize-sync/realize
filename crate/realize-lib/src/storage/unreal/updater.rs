@@ -170,7 +170,7 @@ mod tests {
         let file2 = fixture.arena_root.child("file2");
         file2.write_str("test")?;
 
-        let mtime = UnixTime::from_system_time(file2.metadata()?.modified()?)?;
+        let mtime = UnixTime::mtime(&file2.metadata()?);
 
         // There existed, in the past, a file called "file1", which
         // isn't there anymore. It should be removed when the peer

@@ -485,7 +485,7 @@ mod tests {
                 &fixture.arena,
                 &Path::parse("hello.txt")?,
                 m.len(),
-                &UnixTime::from_system_time(m.modified()?)?,
+                &UnixTime::mtime(&m),
             )
             .await?;
 

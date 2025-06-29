@@ -1,4 +1,7 @@
-use std::time::{Duration, SystemTime, SystemTimeError};
+use std::{
+    fs::Metadata,
+    time::{Duration, SystemTime, SystemTimeError},
+};
 
 /// Time as duration since the start of the UNIX epoch.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, Debug)]
@@ -28,8 +31,14 @@ impl UnixTime {
         UnixTime::new(secs, 0)
     }
 
-    pub fn from_system_time(time: SystemTime) -> Result<Self, SystemTimeError> {
+    fn from_system_time(time: SystemTime) -> Result<Self, SystemTimeError> {
         Ok(UnixTime(time.duration_since(SystemTime::UNIX_EPOCH)?))
+    }
+
+    /// Extract modification time from the given file metadata.
+    pub fn mtime(m: &Metadata) -> UnixTime {
+        UnixTime::from_system_time(m.modified().expect("OS must support mtime"))
+            .unwrap_or(UnixTime::ZERO)
     }
 
     /// Seconds since start of the UNIX epoch.
@@ -47,11 +56,13 @@ impl UnixTime {
         &self.0
     }
 }
+
 impl From<Duration> for UnixTime {
     fn from(value: Duration) -> Self {
         UnixTime(value)
     }
 }
+
 impl From<&Duration> for UnixTime {
     fn from(value: &Duration) -> Self {
         UnixTime(*value)
