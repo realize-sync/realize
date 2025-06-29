@@ -24,6 +24,11 @@ fn storage_capnpc() -> anyhow::Result<()> {
         .file("capnp/storage/unreal.capnp")
         .run()?;
 
+    capnpc::CompilerCommand::new()
+        .src_prefix("capnp/storage")
+        .default_parent_module(module_name_as_vec("storage::real"))
+        .file("capnp/storage/real.capnp")
+        .run()?;
     Ok(())
 }
 

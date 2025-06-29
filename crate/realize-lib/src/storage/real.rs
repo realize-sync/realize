@@ -2,6 +2,13 @@ use crate::model::{Arena, Path, UnixTime};
 
 #[cfg(target_os = "linux")]
 mod history;
+#[allow(dead_code)]
+#[allow(unknown_lints)]
+#[allow(clippy::uninlined_format_args)]
+#[allow(clippy::extra_unused_type_parameters)]
+mod real_capnp {
+    include!(concat!(env!("OUT_DIR"), "/real_capnp.rs"));
+}
 mod store;
 
 pub use store::{
