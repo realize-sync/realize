@@ -201,6 +201,7 @@ fn next_history_index(
 }
 
 /// File hash index, async version.
+#[derive(Clone)]
 pub struct RealIndexAsync {
     inner: Arc<RealIndexBlocking>,
 }

@@ -11,6 +11,7 @@ mod real_capnp {
     include!(concat!(env!("OUT_DIR"), "/real_capnp.rs"));
 }
 mod store;
+mod watcher;
 
 pub use store::{
     Options, PathResolver, PathType, RealStore, RealStoreError, RsyncOperation, StoreSubscribe,
