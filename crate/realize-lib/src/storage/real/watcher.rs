@@ -193,7 +193,6 @@ mod tests {
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
-    use tokio_retry::strategy::FixedInterval;
 
     struct Fixture {
         watcher: RealWatcher,
@@ -220,6 +219,21 @@ mod tests {
                 _tempdir: tempdir,
             })
         }
+
+        /// Wait for the given history entry to have been written.
+        ///
+        /// This is useful to wait for something to change in the index.
+        async fn wait_for_history_event(&self, goal_index: u64) -> anyhow::Result<()> {
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                self.index
+                    .watch_history()
+                    .wait_for(|index| *index >= goal_index),
+            )
+            .await??;
+
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -237,13 +251,8 @@ mod tests {
 
         let path = model::Path::parse("foobar")?;
 
-        let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
-        while !fixture.index.has_file(&path).await? {
-            match retry.next() {
-                Some(delay) => tokio::time::sleep(delay).await,
-                None => panic!("'foobar' not added"),
-            }
-        }
+        fixture.wait_for_history_event(1).await?;
+        assert!(fixture.index.has_file(&path).await?);
 
         Ok(())
     }
@@ -255,23 +264,13 @@ mod tests {
         foobar.write_str("test")?;
 
         let path = model::Path::parse("foobar")?;
-
-        let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
-        while !fixture.index.has_file(&path).await? {
-            match retry.next() {
-                Some(delay) => tokio::time::sleep(delay).await,
-                None => panic!("'foobar' not added"),
-            }
-        }
+        fixture.wait_for_history_event(1).await?;
+        assert!(fixture.index.has_file(&path).await?);
 
         foobar.write_str("boo")?;
         let mtime = UnixTime::mtime(&fs::metadata(foobar.path()).await?);
-        while !fixture.index.has_matching_file(&path, 3, &mtime).await? {
-            match retry.next() {
-                Some(delay) => tokio::time::sleep(delay).await,
-                None => panic!("'foobar' not modified"),
-            }
-        }
+        fixture.wait_for_history_event(2).await?;
+        assert!(fixture.index.has_matching_file(&path, 3, &mtime).await?);
 
         Ok(())
     }
@@ -280,26 +279,15 @@ mod tests {
     async fn remove_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let foobar = fixture.root.child("foobar");
+
         foobar.write_str("test")?;
-
+        fixture.wait_for_history_event(1).await?;
         let path = model::Path::parse("foobar")?;
+        assert!(fixture.index.has_file(&path).await?);
 
-        let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
-        while !fixture.index.has_file(&path).await? {
-            match retry.next() {
-                Some(delay) => tokio::time::sleep(delay).await,
-                None => panic!("'foobar' not added"),
-            }
-        }
         fs::remove_file(foobar.path()).await?;
-
-        let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
-        while fixture.index.has_file(&path).await? {
-            match retry.next() {
-                Some(delay) => tokio::time::sleep(delay).await,
-                None => panic!("'foobar' not removed"),
-            }
-        }
+        fixture.wait_for_history_event(2).await?;
+        assert!(!fixture.index.has_file(&path).await?);
 
         Ok(())
     }
