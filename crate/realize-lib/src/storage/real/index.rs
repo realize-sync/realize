@@ -241,7 +241,13 @@ fn do_add_file(
     let mut file_table = txn.open_table(FILE_TABLE)?;
     let mut history_table = txn.open_table(HISTORY_TABLE)?;
 
-    let existing = file_table.insert(
+    let old_hash = file_table
+        .get(path.as_str())?
+        .map(|e| e.value().parse().ok())
+        .flatten()
+        .map(|e| e.hash);
+    let same_hash = old_hash.as_ref().map(|h| *h == hash).unwrap_or(false);
+    file_table.insert(
         path.as_str(),
         Holder::new(FileTableEntry {
             size,
@@ -249,10 +255,10 @@ fn do_add_file(
             hash,
         })?,
     )?;
-    let old_hash = existing
-        .map(|e| e.value().parse().ok())
-        .flatten()
-        .map(|e| e.hash);
+    if same_hash {
+        return Ok(());
+    }
+
     let index = next_history_index(&history_table)?;
     history_table.insert(
         index,
@@ -949,6 +955,26 @@ mod tests {
 
         let mut history_rx = index.watch_history();
         assert_eq!(3, *history_rx.borrow_and_update());
+
+        Ok(())
+    }
+    #[test]
+    fn touch_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        let index = &fixture.index;
+        let mtime1 = UnixTime::from_secs(1234567890);
+        let mtime2 = UnixTime::from_secs(1234567891);
+        let path = model::Path::parse("foo/bar.txt")?;
+        index.add_file(&path, 100, &mtime1, Hash([0xfa; 32]))?;
+        let hist_entry_count = index.last_history_index()?;
+        index.add_file(&path, 100, &mtime2, Hash([0xfa; 32]))?;
+
+        // No new history entry should have been added, since the file didn't really change.
+        assert_eq!(hist_entry_count, index.last_history_index()?);
+
+        // The new mtime should have been stored.
+        assert!(index.has_matching_file(&path, 100, &mtime2)?);
 
         Ok(())
     }
