@@ -3,9 +3,10 @@
 use super::index::RealIndexAsync;
 use crate::model::{self, UnixTime};
 use crate::utils::hash;
-use futures::TryStreamExt as _;
-use notify::event::{DataChange, ModifyKind};
+use futures::{StreamExt as _, TryStreamExt as _};
+use notify::event::{CreateKind, DataChange, ModifyKind};
 use notify::{Event, EventKind, RecommendedWatcher, Watcher as _};
+use std::fs::Metadata;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::{self, File};
@@ -116,59 +117,147 @@ impl RealWatcherWorker {
             EventKind::Remove(_) => {
                 // Remove can't always tell whether a file or
                 // directory was removed, so we don't bother checking.
-                if let Some(path) = ev.paths.last().map(|p| self.to_model_path(p)).flatten() {
-                    self.index.remove_file_or_dir(&path).await?;
+                let realpath = ev.paths.last().ok_or(anyhow::anyhow!("No path in event"))?;
+                self.file_or_dir_removed(realpath).await?;
+            }
+            EventKind::Create(CreateKind::Folder) => {
+                let realpath = ev.paths.last().ok_or(anyhow::anyhow!("No path in event"))?;
+                self.dir_created_or_modified(realpath).await?;
+            }
+
+            EventKind::Modify(ModifyKind::Name(_)) => {
+                // We can't trust that the notification tells us
+                // whether a file or dir was moved to or from the
+                // directory; check both.
+                //
+                // Anything outside the root directory is ignored when
+                // converting to model::Path, so we don't bother
+                // checking here.
+
+                for realpath in &ev.paths {
+                    match fs::symlink_metadata(realpath).await {
+                        Ok(m) => {
+                            // Possibly moved to; add or update
+                            if m.is_file() {
+                                self.file_created_or_modified(realpath, &m).await?;
+                            } else if m.is_dir() {
+                                self.dir_created_or_modified(realpath).await?;
+                            }
+                        }
+                        Err(_) => {
+                            // Possibly moved from; remove
+                            self.file_or_dir_removed(realpath).await?;
+                        }
+                    }
                 }
             }
+
             EventKind::Modify(ModifyKind::Data(DataChange::Content)) => {
-                let realpath = match ev.paths.last() {
-                    Some(p) => p.as_ref(),
-                    None => {
-                        return Ok(());
-                    }
-                };
+                let realpath = ev.paths.last().ok_or(anyhow::anyhow!("No path in event"))?;
                 let m = fs::symlink_metadata(realpath).await?;
-                // TODO: if ev is create and it is a directory, add all files recursively.
-                if !m.is_file() {
-                    return Ok(());
+                if m.is_file() {
+                    // This event only matters if it's a file.
+                    self.file_created_or_modified(realpath, &m).await?;
                 }
-                let path = match self.to_model_path(&realpath) {
-                    Some(p) => p,
-                    None => {
-                        return Ok(());
-                    }
-                };
-
-                let mtime = UnixTime::mtime(&m);
-                if self
-                    .index
-                    .has_matching_file(&path, m.len(), &mtime)
-                    .await
-                    .unwrap_or(false)
-                {
-                    return Ok(());
-                }
-
-                // TODO: Use a Merkle tree for files above a certain size.
-                // TODO: spawn here, as it can take a long time to compute the hash of a large file
-                // TODO: check len and mtime after creating the hash, to be sure they did not change
-                let mut hasher = hash::running();
-                ReaderStream::with_capacity(File::open(realpath).await?, 64 * 1024)
-                    .try_for_each(|chunk| {
-                        hasher.update(chunk);
-
-                        std::future::ready(Ok(()))
-                    })
-                    .await?;
-                let hash = hasher.finalize();
-                log::debug!("[{}] Add file {path} with hash {hash}", self.index.arena());
-                self.index.add_file(&path, m.len(), &mtime, hash).await?;
             }
             _ => {}
         }
 
-        // TODO: move file to, create dir, move dir to, change attributes (make file readable/unreadable)
+        // TODO: change attributes (make file or dir readable/unreadable)
 
+        Ok(())
+    }
+
+    async fn file_or_dir_removed(&self, realpath: &std::path::Path) -> anyhow::Result<()> {
+        let path = match self.to_model_path(&realpath) {
+            Some(p) => p,
+            None => {
+                return Ok(());
+            }
+        };
+
+        self.index.remove_file_or_dir(&path).await?;
+
+        Ok(())
+    }
+
+    async fn dir_created_or_modified(
+        &self,
+        dirpath: &std::path::Path,
+    ) -> Result<(), anyhow::Error> {
+        let mut direntries = async_walkdir::WalkDir::new(&dirpath).filter(only_regular);
+        while let Some(direntry) = direntries.next().await {
+            let direntry = match direntry {
+                Err(_) => {
+                    continue;
+                }
+                Ok(e) => e,
+            };
+
+            // Only take files into account.
+            if !direntry
+                .file_type()
+                .await
+                .map(|t| t.is_file())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            let realpath = direntry.path();
+            let path = match self.to_model_path(&realpath) {
+                Some(p) => p,
+                None => {
+                    continue;
+                }
+            };
+
+            let m = match direntry.metadata().await {
+                Ok(m) => m,
+                Err(_) => {
+                    continue;
+                }
+            };
+
+            if let Err(err) = self.file_created_or_modified(&realpath, &m).await {
+                log::debug!("[{}] Failed to add {path}: {err}", self.index.arena());
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn file_created_or_modified(
+        &self,
+        realpath: &std::path::Path,
+        m: &Metadata,
+    ) -> Result<(), anyhow::Error> {
+        let path = match self.to_model_path(&realpath) {
+            Some(p) => p,
+            None => {
+                return Ok(());
+            }
+        };
+        let mtime = UnixTime::mtime(m);
+        if self
+            .index
+            .has_matching_file(&path, m.len(), &mtime)
+            .await
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        let mut hasher = hash::running();
+        ReaderStream::with_capacity(File::open(realpath).await?, 64 * 1024)
+            .try_for_each(|chunk| {
+                hasher.update(chunk);
+
+                std::future::ready(Ok(()))
+            })
+            .await?;
+        let hash = hasher.finalize();
+        log::debug!("[{}] Add file {path} with hash {hash}", self.index.arena());
+        self.index.add_file(&path, m.len(), &mtime, hash).await?;
         Ok(())
     }
 
@@ -180,6 +269,23 @@ impl RealWatcherWorker {
         let relative = pathdiff::diff_paths(&path, &self.root)?;
 
         model::Path::from_real_path(&relative).ok()
+    }
+}
+
+/// Filter for [async_walkdir::WalkDir] to ignore everything except
+/// regular files and directories.
+///
+/// This excludes symlinks. With this filter, WalkDir won't enter into
+/// symlinks to directories.
+async fn only_regular(e: async_walkdir::DirEntry) -> async_walkdir::Filtering {
+    if e.file_type() // does not follow symlinks
+        .await
+        .map(|t| t.is_dir() || t.is_file())
+        .unwrap_or(false)
+    {
+        async_walkdir::Filtering::Continue
+    } else {
+        async_walkdir::Filtering::IgnoreDir
     }
 }
 
@@ -198,7 +304,7 @@ mod tests {
         watcher: RealWatcher,
         index: RealIndexAsync,
         root: ChildPath,
-        _tempdir: TempDir,
+        tempdir: TempDir,
     }
 
     impl Fixture {
@@ -216,7 +322,7 @@ mod tests {
                 watcher,
                 root,
                 index,
-                _tempdir: tempdir,
+                tempdir,
             })
         }
 
@@ -288,6 +394,185 @@ mod tests {
         fs::remove_file(foobar.path()).await?;
         fixture.wait_for_history_event(2).await?;
         assert!(!fixture.index.has_file(&path).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_dir_with_files() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+        let dir = fixture.root.child("a/b");
+        dir.create_dir_all()?;
+
+        fixture.root.child("a/b/foo").write_str("test")?;
+        fixture.root.child("a/b/bar").write_str("test")?;
+
+        fixture.wait_for_history_event(2).await?;
+        assert!(index.has_file(&model::Path::parse("a/b/foo")?).await?);
+        assert!(index.has_file(&model::Path::parse("a/b/bar")?).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remove_dir_with_files() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+        let dir = fixture.root.child("a/b");
+        dir.create_dir_all()?;
+
+        fixture.root.child("a/b/foo").write_str("test")?;
+        fixture.root.child("a/b/bar").write_str("test")?;
+
+        let foo = model::Path::parse("a/b/foo")?;
+        let bar = model::Path::parse("a/b/bar")?;
+
+        fixture.wait_for_history_event(2).await?;
+        assert!(index.has_file(&foo).await?);
+        assert!(index.has_file(&bar).await?);
+
+        fs::remove_dir_all(dir.path()).await?;
+
+        fixture.wait_for_history_event(4).await?;
+        assert!(!index.has_file(&foo).await?);
+        assert!(!index.has_file(&bar).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn move_dir_with_files_into() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+        let dir = fixture.tempdir.child("newdir");
+        dir.create_dir_all()?;
+
+        dir.child("a/b/foo").write_str("test")?;
+        dir.child("a/b/bar").write_str("test")?;
+
+        let foo = model::Path::parse("newdir/a/b/foo")?;
+        let bar = model::Path::parse("newdir/a/b/bar")?;
+
+        fs::rename(dir, fixture.root.join("newdir")).await?;
+
+        fixture.wait_for_history_event(2).await?;
+        assert!(index.has_file(&foo).await?);
+        assert!(index.has_file(&bar).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn move_dir_with_files_out() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+        let dir = fixture.root.child("a/b");
+        dir.create_dir_all()?;
+
+        fixture.root.child("a/b/foo").write_str("test")?;
+        fixture.root.child("a/b/bar").write_str("test")?;
+
+        let foo = model::Path::parse("a/b/foo")?;
+        let bar = model::Path::parse("a/b/bar")?;
+
+        fixture.wait_for_history_event(2).await?;
+        assert!(index.has_file(&foo).await?);
+        assert!(index.has_file(&bar).await?);
+
+        fs::rename(dir.path(), fixture.tempdir.child("out").path()).await?;
+
+        fixture.wait_for_history_event(4).await?;
+        assert!(!index.has_file(&foo).await?);
+        assert!(!index.has_file(&bar).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rename_dir_with_files() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+        let dir = fixture.root.child("a/b");
+        dir.create_dir_all()?;
+
+        fixture.root.child("a/b/foo").write_str("test")?;
+        fixture.root.child("a/b/bar").write_str("test")?;
+
+        let foo = model::Path::parse("a/b/foo")?;
+        let bar = model::Path::parse("a/b/bar")?;
+
+        fixture.wait_for_history_event(2).await?;
+        assert!(index.has_file(&foo).await?);
+        assert!(index.has_file(&bar).await?);
+
+        fs::rename(
+            fixture.root.child("a").path(),
+            fixture.root.child("newa").path(),
+        )
+        .await?;
+
+        fixture.wait_for_history_event(6).await?;
+        assert!(!index.has_file(&foo).await?);
+        assert!(!index.has_file(&bar).await?);
+
+        let newfoo = model::Path::parse("newa/b/foo")?;
+        let newbar = model::Path::parse("newa/b/bar")?;
+        assert!(index.has_file(&newfoo).await?);
+        assert!(index.has_file(&newbar).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn move_file_into() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+        let newfile = fixture.tempdir.child("newfile");
+        newfile.write_str("test")?;
+
+        fs::rename(newfile.path(), fixture.root.join("newfile")).await?;
+
+        fixture.wait_for_history_event(1).await?;
+        assert!(index.has_file(&model::Path::parse("newfile")?).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn move_file_out() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let foobar = fixture.root.child("foobar");
+
+        foobar.write_str("test")?;
+        fixture.wait_for_history_event(1).await?;
+        let path = model::Path::parse("foobar")?;
+        assert!(fixture.index.has_file(&path).await?);
+
+        fs::rename(foobar.path(), fixture.tempdir.child("out").path()).await?;
+
+        fixture.wait_for_history_event(2).await?;
+        assert!(!fixture.index.has_file(&path).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rename_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let foo = fixture.root.child("foo");
+
+        foo.write_str("test")?;
+        fixture.wait_for_history_event(1).await?;
+        let path = model::Path::parse("foo")?;
+        assert!(fixture.index.has_file(&path).await?);
+
+        fs::rename(foo.path(), fixture.root.child("bar")).await?;
+
+        fixture.wait_for_history_event(3).await?;
+        assert!(!fixture.index.has_file(&path).await?);
+        let path = model::Path::parse("bar")?;
+        assert!(fixture.index.has_file(&path).await?);
 
         Ok(())
     }
