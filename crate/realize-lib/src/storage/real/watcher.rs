@@ -4,7 +4,7 @@ use super::index::RealIndexAsync;
 use crate::model::{self, UnixTime};
 use crate::utils::hash;
 use futures::{StreamExt as _, TryStreamExt as _};
-use notify::event::{CreateKind, DataChange, MetadataKind, ModifyKind};
+use notify::event::{CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind};
 use notify::{Event, EventKind, RecommendedWatcher, Watcher as _};
 use std::fs::Metadata;
 use std::path::PathBuf;
@@ -28,11 +28,12 @@ impl RealWatcher {
     /// Background work is also stopped at some point after the instance is dropped.
     pub async fn spawn(root: &std::path::Path, index: RealIndexAsync) -> anyhow::Result<Self> {
         let root = fs::canonicalize(&root).await?;
+        let arena = index.arena().clone();
 
         let (watch_tx, watch_rx) = mpsc::channel(100);
 
         let watcher = {
-            let arena = index.arena().clone();
+            let arena = arena.clone();
             let root = root.clone();
             let watch_tx = watch_tx.clone();
             tokio::task::spawn_blocking(move || {
@@ -52,7 +53,33 @@ impl RealWatcher {
 
         let worker = Arc::new(RealWatcherWorker::new(root, index));
 
-        // TODO: add catchup
+        task::spawn({
+            let worker = Arc::clone(&worker);
+            let watch_tx = watch_tx.clone();
+            let shutdown_rx = shutdown_tx.subscribe();
+            let arena = arena.clone();
+            async move {
+                if let Err(err) = worker
+                    .catchup_removed_or_modified(watch_tx, shutdown_rx)
+                    .await
+                {
+                    log::debug!(
+                        "[{}] Catchup for modified or removed files failed: {err}",
+                        arena
+                    );
+                }
+            }
+        });
+        task::spawn({
+            let worker = Arc::clone(&worker);
+            let watch_tx = watch_tx.clone();
+            let shutdown_rx = shutdown_tx.subscribe();
+            async move {
+                if let Err(err) = worker.catchup_added(watch_tx, shutdown_rx).await {
+                    log::debug!("[{}] Catchup for added files failed: {err}", arena);
+                }
+            }
+        });
         task::spawn(async move {
             let _watcher = watcher;
             worker.event_loop(watch_rx, shutdown_rx).await;
@@ -78,6 +105,104 @@ struct RealWatcherWorker {
 impl RealWatcherWorker {
     fn new(root: PathBuf, index: RealIndexAsync) -> Self {
         RealWatcherWorker { root, index }
+    }
+
+    /// Look for files in the index that have been deleted or modified
+    /// and generate remove or modify events.
+    async fn catchup_removed_or_modified(
+        &self,
+        watch_tx: mpsc::Sender<Result<Event, notify::Error>>,
+        mut shutdown_rx: broadcast::Receiver<()>,
+    ) -> anyhow::Result<()> {
+        let mut files = std::pin::pin!(self.index.all_files());
+        loop {
+            tokio::select!(
+            _ = shutdown_rx.recv() => {
+                break;
+            },
+            next = files.next() => {
+                let (path, entry) = match next {
+                    None => {
+                        break;
+                    },
+                    Some(e) => e,
+                };
+
+                let full_path = path.within(&self.root);
+                match fs::metadata(&full_path).await {
+                    Err(_) => {
+                        let ev = Event::new(EventKind::Remove(RemoveKind::File))
+                            .add_path(full_path)
+                            .set_info("catchup");
+                        watch_tx.send(Ok(ev)).await?;
+                    }
+                    Ok(m) => {
+                        if m.len() != entry.size || UnixTime::mtime(&m) != entry.mtime {
+                            let ev = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+                                .add_path(full_path)
+                                .set_info("catchup");
+                            watch_tx.send(Ok(ev)).await?;
+                        }
+                    }
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// Look for files not yet in the index yet and generate create events.
+    async fn catchup_added(
+        &self,
+        watch_tx: mpsc::Sender<Result<Event, notify::Error>>,
+        mut shutdown_rx: broadcast::Receiver<()>,
+    ) -> anyhow::Result<()> {
+        let mut direntries = async_walkdir::WalkDir::new(&self.root).filter(only_regular);
+
+        loop {
+            tokio::select!(
+            _ = shutdown_rx.recv() => {
+                break;
+            }
+            direntry = direntries.next() => {
+                let direntry = match direntry {
+                    None => {
+                        break;
+                    }
+                    Some(Err(_)) => {
+                        continue;
+                    }
+                    Some(Ok(e)) => e,
+                };
+
+                // Only take files into account.
+                if !direntry.file_type().await.map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
+
+                let full_path = direntry.path();
+                let path = match self.to_model_path(&full_path) {
+                    Some(p) => p,
+                    None => {
+                        continue;
+                    }
+                };
+
+                // Skip if the file is already in the index.
+                if self.index.has_file(&path).await.unwrap_or(false) {
+                    continue;
+                }
+
+                // Send an event to add the file to the index. Note
+                // that this is not a create event as we already have
+                // file content.
+                let ev = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+                    .add_path(full_path)
+                    .set_info("catchup");
+                watch_tx.send(Ok(ev)).await?;
+            });
+        }
+
+        Ok(())
     }
 
     /// Listen to notifications from the filesystem or from catchup.
@@ -328,6 +453,7 @@ async fn only_regular(e: async_walkdir::DirEntry) -> async_walkdir::Filtering {
 mod tests {
     use std::time::Duration;
 
+    use crate::model::Hash;
     use crate::storage::real::index::FileTableEntry;
     use crate::{model::Arena, storage::real::index::RealIndexBlocking};
 
@@ -338,7 +464,6 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     struct Fixture {
-        watcher: RealWatcher,
         index: RealIndexAsync,
         root: ChildPath,
         tempdir: TempDir,
@@ -353,14 +478,16 @@ mod tests {
             root.create_dir_all()?;
 
             let index = RealIndexBlocking::open(Arena::from("test"), &path)?.into_async();
-            let watcher = RealWatcher::spawn(root.path(), index.clone()).await?;
 
             Ok(Self {
-                watcher,
                 root,
                 index,
                 tempdir,
             })
+        }
+
+        async fn watch(&self) -> anyhow::Result<RealWatcher> {
+            RealWatcher::spawn(self.root.path(), self.index.clone()).await
         }
 
         /// Wait for the given history entry to have been written.
@@ -382,14 +509,17 @@ mod tests {
     #[tokio::test]
     async fn shutdown() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
+        let watcher = fixture.watch().await?;
 
-        fixture.watcher.shutdown().await?;
+        watcher.shutdown().await?;
+
         Ok(())
     }
 
     #[tokio::test]
     async fn create_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
+        let _watcher = fixture.watch().await?;
         let foobar = fixture.root.child("foobar");
         foobar.write_str("test")?;
 
@@ -411,6 +541,7 @@ mod tests {
 
     async fn create_empty_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
+        let _watcher = fixture.watch().await?;
         let foobar = fixture.root.child("foobar");
         foobar.touch()?;
 
@@ -433,6 +564,7 @@ mod tests {
     #[tokio::test]
     async fn modify_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
+        let _watcher = fixture.watch().await?;
         let foobar = fixture.root.child("foobar");
         foobar.write_str("test")?;
 
@@ -451,6 +583,7 @@ mod tests {
     #[tokio::test]
     async fn remove_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
+        let _watcher = fixture.watch().await?;
         let foobar = fixture.root.child("foobar");
 
         foobar.write_str("test")?;
@@ -468,6 +601,7 @@ mod tests {
     #[tokio::test]
     async fn create_dir_with_files() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
+        let _watcher = fixture.watch().await?;
         let index = &fixture.index;
         let dir = fixture.root.child("a/b");
         dir.create_dir_all()?;
@@ -485,6 +619,7 @@ mod tests {
     #[tokio::test]
     async fn remove_dir_with_files() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
+        let _watcher = fixture.watch().await?;
         let index = &fixture.index;
         let dir = fixture.root.child("a/b");
         dir.create_dir_all()?;
@@ -511,6 +646,7 @@ mod tests {
     #[tokio::test]
     async fn move_dir_with_files_into() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
+        let _watcher = fixture.watch().await?;
         let index = &fixture.index;
         let dir = fixture.tempdir.child("newdir");
         dir.create_dir_all()?;
@@ -533,6 +669,7 @@ mod tests {
     #[tokio::test]
     async fn move_dir_with_files_out() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
+        let _watcher = fixture.watch().await?;
         let index = &fixture.index;
         let dir = fixture.root.child("a/b");
         dir.create_dir_all()?;
@@ -559,6 +696,7 @@ mod tests {
     #[tokio::test]
     async fn rename_dir_with_files() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
+        let _watcher = fixture.watch().await?;
         let index = &fixture.index;
         let dir = fixture.root.child("a/b");
         dir.create_dir_all()?;
@@ -594,6 +732,7 @@ mod tests {
     #[tokio::test]
     async fn move_file_into() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
+        let _watcher = fixture.watch().await?;
         let index = &fixture.index;
         let newfile = fixture.tempdir.child("newfile");
         newfile.write_str("test")?;
@@ -609,6 +748,7 @@ mod tests {
     #[tokio::test]
     async fn move_file_out() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
+        let _watcher = fixture.watch().await?;
         let foobar = fixture.root.child("foobar");
 
         foobar.write_str("test")?;
@@ -627,6 +767,7 @@ mod tests {
     #[tokio::test]
     async fn rename_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
+        let _watcher = fixture.watch().await?;
         let foo = fixture.root.child("foo");
 
         foo.write_str("test")?;
@@ -647,6 +788,7 @@ mod tests {
     #[tokio::test]
     async fn change_file_accessibility() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
+        let _watcher = fixture.watch().await?;
         let index = &fixture.index;
         let dir = fixture.root.child("a/b");
         dir.create_dir_all()?;
@@ -671,6 +813,7 @@ mod tests {
     #[tokio::test]
     async fn change_dir_accessibility() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
+        let _watcher = fixture.watch().await?;
         let index = &fixture.index;
         let dir = fixture.root.child("a/b");
         dir.create_dir_all()?;
@@ -713,6 +856,104 @@ mod tests {
         let mut permissions = m.permissions();
         permissions.set_mode(if m.is_dir() { 0o770 } else { 0o660 });
         fs::set_permissions(path, permissions).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catchup_adds_existing_files() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+
+        fixture.root.child("foo").write_str("foo")?;
+        fixture.root.child("a/b/c").create_dir_all()?;
+        fixture.root.child("a/b/c/bar").write_str("bar")?;
+
+        let _watcher = fixture.watch().await?;
+
+        fixture.wait_for_history_event(2).await?;
+        let foo = model::Path::parse("foo")?;
+        let bar = model::Path::parse("a/b/c/bar")?;
+        assert!(index.has_file(&foo).await?);
+        assert!(index.has_file(&bar).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catchup_removes_old_files() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+
+        let foo = model::Path::parse("foo")?;
+        let bar = model::Path::parse("a/b/c/bar")?;
+        let mtime = UnixTime::from_secs(1234567890);
+        index.add_file(&foo, 4, &mtime, Hash([1; 32])).await?;
+        index.add_file(&bar, 4, &mtime, Hash([2; 32])).await?;
+
+        let _watcher = fixture.watch().await?;
+
+        fixture.wait_for_history_event(4).await?;
+        assert!(!index.has_file(&foo).await?);
+        assert!(!index.has_file(&bar).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catchup_updates_modified_files() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+
+        let foo = model::Path::parse("foo")?;
+        let bar = model::Path::parse("a/b/c/bar")?;
+        let foo_child = fixture.root.child("foo");
+        foo_child.write_str("foo")?;
+        let bar_child = fixture.root.child("a/b/c/bar");
+        bar_child.write_str("bar")?;
+
+        index
+            .add_file(
+                &foo,
+                3,
+                &UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
+                hash::digest("foo".as_bytes()),
+            )
+            .await?;
+        index
+            .add_file(
+                &bar,
+                3,
+                &UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
+                hash::digest("bar".as_bytes()),
+            )
+            .await?;
+
+        bar_child.write_str("barbar")?;
+
+        let _watcher = fixture.watch().await?;
+
+        fixture.wait_for_history_event(3).await?;
+
+        // Foo is as added initially
+        assert_eq!(
+            Some(FileTableEntry {
+                size: 3,
+                mtime: UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
+                hash: hash::digest("foo".as_bytes())
+            }),
+            fixture.index.get_file(&foo).await?
+        );
+
+        // Bar was updated
+        assert_eq!(
+            Some(FileTableEntry {
+                size: 6,
+                mtime: UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
+                hash: hash::digest("barbar".as_bytes())
+            }),
+            fixture.index.get_file(&bar).await?
+        );
 
         Ok(())
     }
