@@ -4,7 +4,7 @@ use super::index::RealIndexAsync;
 use crate::model::{self, UnixTime};
 use crate::utils::hash;
 use futures::{StreamExt as _, TryStreamExt as _};
-use notify::event::{CreateKind, DataChange, ModifyKind};
+use notify::event::{CreateKind, DataChange, MetadataKind, ModifyKind};
 use notify::{Event, EventKind, RecommendedWatcher, Watcher as _};
 use std::fs::Metadata;
 use std::path::PathBuf;
@@ -120,6 +120,7 @@ impl RealWatcherWorker {
                 let realpath = ev.paths.last().ok_or(anyhow::anyhow!("No path in event"))?;
                 self.file_or_dir_removed(realpath).await?;
             }
+
             EventKind::Create(CreateKind::Folder) => {
                 let realpath = ev.paths.last().ok_or(anyhow::anyhow!("No path in event"))?;
                 self.dir_created_or_modified(realpath).await?;
@@ -151,6 +152,40 @@ impl RealWatcherWorker {
                     }
                 }
             }
+            EventKind::Modify(ModifyKind::Metadata(
+                MetadataKind::Permissions | MetadataKind::Ownership,
+            )) => {
+                // Files that were accessible might have become
+                // inacessible or the other way round. This is stored
+                // as add/remove, with inaccessible files treated as
+                // if they're gone.
+                let realpath = ev.paths.last().ok_or(anyhow::anyhow!("No path in event"))?;
+                match fs::symlink_metadata(realpath).await {
+                    Err(_) => {
+                        // Not accessible anymore.
+                        self.file_or_dir_removed(realpath).await?;
+                    }
+                    Ok(m) => {
+                        if m.is_dir() {
+                            if fs::read_dir(realpath).await.is_ok() {
+                                // Might have just become accessible.
+                                self.dir_created_or_modified(realpath).await?;
+                            } else {
+                                // Might have just become inaccessible
+                                self.file_or_dir_removed(realpath).await?;
+                            }
+                        } else {
+                            if File::open(realpath).await.is_ok() {
+                                // Might have just become accessible.
+                                self.file_created_or_modified(realpath, &m).await?;
+                            } else {
+                                // Might have just become inaccessible
+                                self.file_or_dir_removed(realpath).await?;
+                            }
+                        }
+                    }
+                }
+            }
 
             EventKind::Modify(ModifyKind::Data(DataChange::Content)) => {
                 let realpath = ev.paths.last().ok_or(anyhow::anyhow!("No path in event"))?;
@@ -163,7 +198,7 @@ impl RealWatcherWorker {
             _ => {}
         }
 
-        // TODO: change attributes (make file or dir readable/unreadable)
+        // TODO: add support for empty files (file created but never written to)
 
         Ok(())
     }
@@ -299,6 +334,7 @@ mod tests {
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
+    use std::os::unix::fs::PermissionsExt as _;
 
     struct Fixture {
         watcher: RealWatcher,
@@ -573,6 +609,79 @@ mod tests {
         assert!(!fixture.index.has_file(&path).await?);
         let path = model::Path::parse("bar")?;
         assert!(fixture.index.has_file(&path).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn change_file_accessibility() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+        let dir = fixture.root.child("a/b");
+        dir.create_dir_all()?;
+
+        fixture.root.child("a/b/foo").write_str("test")?;
+        fixture.wait_for_history_event(1).await?;
+
+        let foo = model::Path::parse("a/b/foo")?;
+        let foo_pathbuf = fixture.root.join("a/b/foo");
+        make_inaccessible(&foo_pathbuf).await?;
+
+        fixture.wait_for_history_event(2).await?;
+        assert!(!index.has_file(&foo).await?);
+
+        make_accessible(&foo_pathbuf).await?;
+        fixture.wait_for_history_event(3).await?;
+        assert!(index.has_file(&foo).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn change_dir_accessibility() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+        let dir = fixture.root.child("a/b");
+        dir.create_dir_all()?;
+
+        fixture.root.child("a/b/foo").write_str("test")?;
+        fixture.root.child("a/b/bar").write_str("test")?;
+
+        fixture.wait_for_history_event(2).await?;
+        let foo = model::Path::parse("a/b/foo")?;
+        let bar = model::Path::parse("a/b/foo")?;
+        assert!(index.has_file(&foo).await?);
+        assert!(index.has_file(&bar).await?);
+
+        let dir = fixture.root.join("a");
+        make_inaccessible(&dir).await?;
+
+        fixture.wait_for_history_event(4).await?;
+        assert!(!index.has_file(&foo).await?);
+        assert!(!index.has_file(&bar).await?);
+
+        make_accessible(&dir).await?;
+
+        fixture.wait_for_history_event(6).await?;
+        assert!(index.has_file(&foo).await?);
+        assert!(index.has_file(&bar).await?);
+
+        Ok(())
+    }
+
+    async fn make_inaccessible(path: &std::path::Path) -> anyhow::Result<()> {
+        let mut permissions = fs::metadata(path).await?.permissions();
+        permissions.set_mode(0);
+        fs::set_permissions(path, permissions).await?;
+
+        Ok(())
+    }
+
+    async fn make_accessible(path: &std::path::Path) -> anyhow::Result<()> {
+        let m = fs::metadata(path).await?;
+        let mut permissions = m.permissions();
+        permissions.set_mode(if m.is_dir() { 0o770 } else { 0o660 });
+        fs::set_permissions(path, permissions).await?;
 
         Ok(())
     }
