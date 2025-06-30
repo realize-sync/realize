@@ -328,6 +328,7 @@ async fn only_regular(e: async_walkdir::DirEntry) -> async_walkdir::Filtering {
 mod tests {
     use std::time::Duration;
 
+    use crate::storage::real::index::FileTableEntry;
     use crate::{model::Arena, storage::real::index::RealIndexBlocking};
 
     use super::*;
@@ -389,24 +390,42 @@ mod tests {
     #[tokio::test]
     async fn create_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        fixture.root.child("foobar").write_str("test")?;
+        let foobar = fixture.root.child("foobar");
+        foobar.write_str("test")?;
+
+        let mtime = UnixTime::mtime(&fs::metadata(foobar.path()).await?);
 
         let path = model::Path::parse("foobar")?;
-
         fixture.wait_for_history_event(1).await?;
-        assert!(fixture.index.has_file(&path).await?);
+        assert_eq!(
+            Some(FileTableEntry {
+                size: 4,
+                mtime,
+                hash: hash::digest("test".as_bytes())
+            }),
+            fixture.index.get_file(&path).await?
+        );
 
         Ok(())
     }
 
     async fn create_empty_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        fixture.root.child("foobar").touch()?;
+        let foobar = fixture.root.child("foobar");
+        foobar.touch()?;
+
+        let mtime = UnixTime::mtime(&fs::metadata(foobar.path()).await?);
 
         let path = model::Path::parse("foobar")?;
-
         fixture.wait_for_history_event(1).await?;
-        assert!(fixture.index.has_file(&path).await?);
+        assert_eq!(
+            Some(FileTableEntry {
+                size: 0,
+                mtime,
+                hash: hash::digest([])
+            }),
+            fixture.index.get_file(&path).await?
+        );
 
         Ok(())
     }

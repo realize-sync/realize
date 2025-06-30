@@ -93,6 +93,18 @@ impl RealIndexBlocking {
         Self::new(arena, Database::create(path)?)
     }
 
+    /// Get a file entry.
+    pub fn get_file(&self, path: &model::Path) -> anyhow::Result<Option<FileTableEntry>> {
+        let txn = self.db.begin_read()?;
+        let file_table = txn.open_table(FILE_TABLE)?;
+
+        if let Some(entry) = file_table.get(path.as_str())? {
+            return Ok(Some(entry.value().parse()?));
+        }
+
+        Ok(None)
+    }
+
     /// Check whether a given file is in the index already.
     pub fn has_file(&self, path: &model::Path) -> anyhow::Result<bool> {
         let txn = self.db.begin_read()?;
@@ -108,15 +120,10 @@ impl RealIndexBlocking {
         size: u64,
         mtime: &UnixTime,
     ) -> anyhow::Result<bool> {
-        let txn = self.db.begin_read()?;
-        let file_table = txn.open_table(FILE_TABLE)?;
-
-        if let Some(entry) = file_table.get(path.as_str())? {
-            let entry = entry.value().parse()?;
-            return Ok(entry.size == size && entry.mtime == *mtime);
-        }
-
-        Ok(false)
+        Ok(self
+            .get_file(path)?
+            .map(|e| e.size == size && e.mtime == *mtime)
+            .unwrap_or(false))
     }
 
     /// Add a file entry with the given values. Replace one if it exists.
@@ -364,6 +371,14 @@ impl RealIndexAsync {
         });
 
         ReceiverStream::new(rx)
+    }
+
+    /// Get a file entry
+    pub async fn get_file(&self, path: &model::Path) -> anyhow::Result<Option<FileTableEntry>> {
+        let inner = Arc::clone(&self.inner);
+        let path = path.clone();
+
+        task::spawn_blocking(move || inner.get_file(&path)).await?
     }
 
     /// Check whether a given file is in the index already.
@@ -695,6 +710,28 @@ mod tests {
         assert_eq!(true, fixture.index.has_file(&path)?);
         assert_eq!(false, index.has_file(&model::Path::parse("foo/bar/toto")?)?);
         assert_eq!(false, index.has_file(&model::Path::parse("other.txt")?)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        let index = &fixture.index;
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = model::Path::parse("foo/bar")?;
+        let hash = Hash([0xfa; 32]);
+        index.add_file(&path, 100, &mtime, hash.clone())?;
+
+        assert_eq!(
+            Some(FileTableEntry {
+                size: 100,
+                mtime: mtime.clone(),
+                hash: hash.clone()
+            }),
+            fixture.index.get_file(&path)?
+        );
 
         Ok(())
     }
