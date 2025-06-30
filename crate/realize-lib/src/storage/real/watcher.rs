@@ -399,6 +399,18 @@ mod tests {
         Ok(())
     }
 
+    async fn create_empty_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        fixture.root.child("foobar").touch()?;
+
+        let path = model::Path::parse("foobar")?;
+
+        fixture.wait_for_history_event(1).await?;
+        assert!(fixture.index.has_file(&path).await?);
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn modify_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
