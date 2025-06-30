@@ -6,9 +6,10 @@ use crate::utils::holder::{ByteConversionError, ByteConvertible, Holder, NamedTy
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
 use redb::{Database, ReadableTable as _, TableDefinition, WriteTransaction};
+use std::ops::RangeBounds;
 use std::path;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -29,23 +30,57 @@ const HISTORY_TABLE: TableDefinition<u64, Holder<HistoryTableEntry>> =
 pub struct RealIndexBlocking {
     db: Database,
     arena: Arena,
+    history_tx: watch::Sender<u64>,
+
+    /// This is just to keep history_tx alive and up-to-date.
+    _history_rx: watch::Receiver<u64>,
 }
 
 impl RealIndexBlocking {
     pub fn new(arena: Arena, db: Database) -> anyhow::Result<Self> {
+        let index: u64;
         {
             let txn = db.begin_write()?;
-            txn.open_table(FILE_TABLE)?;
-            txn.open_table(HISTORY_TABLE)?;
+            {
+                txn.open_table(FILE_TABLE)?;
+                let history_table = txn.open_table(HISTORY_TABLE)?;
+                index = last_history_index(&history_table)?;
+            }
             txn.commit()?;
         }
 
-        Ok(Self { arena, db })
+        let (history_tx, history_rx) = watch::channel(index);
+
+        Ok(Self {
+            arena,
+            db,
+            history_tx,
+            _history_rx: history_rx,
+        })
     }
 
     /// The arena tied to this index.
     pub fn arena(&self) -> &Arena {
         &self.arena
+    }
+
+    /// Subscribe to a watch channel reporting the highest history entry index.
+    ///
+    /// Entries can be later queried using [RealIndexBlocking::history].
+    ///
+    /// The value itself is also available as [RealIndexBlocking::last_history_index].
+    pub fn watch_history(&self) -> watch::Receiver<u64> {
+        self.history_tx.subscribe()
+    }
+
+    /// Index of the last history entry that was written.
+    ///
+    /// This is the value tracked by [RealIndexBlocking::watch_history].
+    pub fn last_history_index(&self) -> anyhow::Result<u64> {
+        let txn = self.db.begin_read()?;
+        let history_table = txn.open_table(HISTORY_TABLE)?;
+
+        last_history_index(&history_table)
     }
 
     /// Turn this instance into an async one.
@@ -93,9 +128,13 @@ impl RealIndexBlocking {
         hash: Hash,
     ) -> anyhow::Result<()> {
         let txn = self.db.begin_write()?;
-        do_add_file(&txn, path, size, mtime, hash)?;
+        let mut history_index = None;
+        do_add_file(&txn, path, size, mtime, hash, &mut history_index)?;
         txn.commit()?;
 
+        if let Some(index) = history_index {
+            let _ = self.history_tx.send(index);
+        }
         Ok(())
     }
 
@@ -121,20 +160,50 @@ impl RealIndexBlocking {
         Ok(())
     }
 
+    /// Grab a range of history entries.
+    pub fn history(
+        &self,
+        range: impl RangeBounds<u64>,
+        tx: mpsc::Sender<anyhow::Result<(u64, HistoryTableEntry)>>,
+    ) -> anyhow::Result<()> {
+        let txn = self.db.begin_read()?;
+        let history_table = txn.open_table(HISTORY_TABLE)?;
+        for res in history_table.range(range)?.map(|res| match res {
+            Err(err) => Err(anyhow::Error::from(err)),
+            Ok((k, v)) => match v.value().parse() {
+                Ok(v) => Ok((k.value(), v)),
+                Err(err) => Err(anyhow::Error::from(err)),
+            },
+        }) {
+            tx.blocking_send(res)?;
+        }
+
+        Ok(())
+    }
+
     /// Remove a path that can be a file or a directory.
     ///
     /// If the path is a directory, all files within that directory
     /// are removed, recursively.
     pub fn remove_file_or_dir(&self, path: &model::Path) -> anyhow::Result<()> {
         let txn = self.db.begin_write()?;
-        do_remove_file_or_dir(&txn, path)?;
+        let mut history_index = None;
+        do_remove_file_or_dir(&txn, path, &mut history_index)?;
         txn.commit()?;
+
+        if let Some(index) = history_index {
+            let _ = self.history_tx.send(index);
+        }
 
         Ok(())
     }
 }
 
-fn do_remove_file_or_dir(txn: &WriteTransaction, path: &model::Path) -> anyhow::Result<()> {
+fn do_remove_file_or_dir(
+    txn: &WriteTransaction,
+    path: &model::Path,
+    history_index: &mut Option<u64>,
+) -> anyhow::Result<()> {
     let mut file_table = txn.open_table(FILE_TABLE)?;
     let mut history_table = txn.open_table(HISTORY_TABLE)?;
     let path_str = path.as_str();
@@ -147,13 +216,15 @@ fn do_remove_file_or_dir(txn: &WriteTransaction, path: &model::Path) -> anyhow::
             .unwrap_or(false)
     })? {
         let (k, v) = entry?;
+        let index = next_history_index(&history_table)?;
         history_table.insert(
-            next_history_index(&history_table)?,
+            index,
             Holder::new(HistoryTableEntry::Remove(
                 model::Path::parse(k.value())?,
                 v.value().parse()?.hash,
             ))?,
         )?;
+        *history_index = Some(index);
     }
 
     Ok(())
@@ -165,6 +236,7 @@ fn do_add_file(
     size: u64,
     mtime: &UnixTime,
     hash: Hash,
+    history_index: &mut Option<u64>,
 ) -> anyhow::Result<()> {
     let mut file_table = txn.open_table(FILE_TABLE)?;
     let mut history_table = txn.open_table(HISTORY_TABLE)?;
@@ -181,23 +253,31 @@ fn do_add_file(
         .map(|e| e.value().parse().ok())
         .flatten()
         .map(|e| e.hash);
+    let index = next_history_index(&history_table)?;
     history_table.insert(
-        next_history_index(&history_table)?,
+        index,
         Holder::new(if let Some(old_hash) = old_hash {
             HistoryTableEntry::Replace(path.clone(), old_hash)
         } else {
             HistoryTableEntry::Add(path.clone())
         })?,
     )?;
+    *history_index = Some(index);
 
     Ok(())
 }
 
 fn next_history_index(
     history_table: &impl redb::ReadableTable<u64, Holder<'static, HistoryTableEntry>>,
-) -> Result<u64, anyhow::Error> {
-    let entry_index = 1 + history_table.last()?.map(|(k, _)| k.value()).unwrap_or(0);
+) -> anyhow::Result<u64> {
+    let entry_index = 1 + last_history_index(history_table)?;
     Ok(entry_index)
+}
+
+fn last_history_index(
+    history_table: &impl redb::ReadableTable<u64, Holder<'static, HistoryTableEntry>>,
+) -> anyhow::Result<u64> {
+    Ok(history_table.last()?.map(|(k, _)| k.value()).unwrap_or(0))
 }
 
 /// File hash index, async version.
@@ -216,6 +296,24 @@ impl RealIndexAsync {
     /// The arena tied to this index.
     pub fn arena(&self) -> &Arena {
         &self.inner.arena
+    }
+
+    /// Subscribe to a watch channel reporting the highest history entry index.
+    ///
+    /// Entries can be later queried using [RealIndexAsync::history].
+    ///
+    /// The value itself is also available as [RealIndexAsync::last_history_index].
+    pub fn watch_history(&self) -> watch::Receiver<u64> {
+        self.inner.watch_history()
+    }
+
+    /// Index of the last history entry that was written.
+    ///
+    /// This is the value tracked by [RealIndexAsync::watch_history].
+    pub async fn last_history_index(&self) -> anyhow::Result<u64> {
+        let inner = Arc::clone(&self.inner);
+
+        task::spawn_blocking(move || inner.last_history_index()).await?
     }
 
     /// Open or create an index at the given path.
@@ -237,6 +335,27 @@ impl RealIndexAsync {
 
         let inner = Arc::clone(&self.inner);
         task::spawn_blocking(move || inner.all_files(tx));
+
+        ReceiverStream::new(rx)
+    }
+
+    /// Grab a range of history entries.
+    pub fn history(
+        &self,
+        range: impl RangeBounds<u64> + Send + 'static,
+    ) -> ReceiverStream<anyhow::Result<(u64, HistoryTableEntry)>> {
+        let (tx, rx) = mpsc::channel(100);
+
+        let inner = Arc::clone(&self.inner);
+        let range = Box::new(range);
+        task::spawn_blocking(move || {
+            let tx_clone = tx.clone();
+            if let Err(err) = inner.history(*range, tx) {
+                // Send any global error to the channel, so it ends up
+                // in the stream instead of getting lost.
+                let _ = tx_clone.blocking_send(Err(anyhow::Error::from(err)));
+            }
+        });
 
         ReceiverStream::new(rx)
     }
@@ -417,7 +536,7 @@ fn parse_path(path: capnp::text::Reader<'_>) -> Result<model::Path, ByteConversi
 mod tests {
     use super::*;
     use assert_fs::TempDir;
-    use futures::StreamExt as _;
+    use futures::{StreamExt as _, TryStreamExt as _};
 
     fn test_arena() -> Arena {
         Arena::from("arena")
@@ -627,9 +746,9 @@ mod tests {
         let index = &fixture.index;
         let mtime = UnixTime::from_secs(1234567890);
 
-        index.add_file(&model::Path::parse("foo/a")?, 100, &mtime, Hash([0x01; 32]))?;
-        index.add_file(&model::Path::parse("foo/b")?, 100, &mtime, Hash([0x02; 32]))?;
-        index.add_file(&model::Path::parse("foo/c")?, 100, &mtime, Hash([0x03; 32]))?;
+        index.add_file(&model::Path::parse("foo/a")?, 100, &mtime, Hash([1; 32]))?;
+        index.add_file(&model::Path::parse("foo/b")?, 100, &mtime, Hash([2; 32]))?;
+        index.add_file(&model::Path::parse("foo/c")?, 100, &mtime, Hash([3; 32]))?;
         index.add_file(
             &model::Path::parse("foobar")?,
             100,
@@ -648,15 +767,15 @@ mod tests {
             let txn = index.db.begin_read()?;
             let history_table = txn.open_table(HISTORY_TABLE)?;
             assert_eq!(
-                HistoryTableEntry::Remove(model::Path::parse("foo/a")?, Hash([0x01; 32])),
+                HistoryTableEntry::Remove(model::Path::parse("foo/a")?, Hash([1; 32])),
                 history_table.get(5)?.unwrap().value().parse()?
             );
             assert_eq!(
-                HistoryTableEntry::Remove(model::Path::parse("foo/b")?, Hash([0x02; 32])),
+                HistoryTableEntry::Remove(model::Path::parse("foo/b")?, Hash([2; 32])),
                 history_table.get(6)?.unwrap().value().parse()?
             );
             assert_eq!(
-                HistoryTableEntry::Remove(model::Path::parse("foo/c")?, Hash([0x03; 32])),
+                HistoryTableEntry::Remove(model::Path::parse("foo/c")?, Hash([3; 32])),
                 history_table.get(7)?.unwrap().value().parse()?
             );
         }
@@ -686,7 +805,7 @@ mod tests {
 
         let index = &fixture.aindex;
         let mtime = UnixTime::from_secs(1234567890);
-        let hash = Hash([0x01; 32]);
+        let hash = Hash([1; 32]);
         index
             .add_file(&model::Path::parse("baa.txt")?, 100, &mtime, hash.clone())
             .await?;
@@ -721,6 +840,115 @@ mod tests {
             ],
             files
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn last_history_index() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        let index = &fixture.index;
+        assert_eq!(0, index.last_history_index()?);
+
+        let mtime = UnixTime::from_secs(1234567890);
+        index.add_file(&model::Path::parse("foo/a")?, 100, &mtime, Hash([1; 32]))?;
+        index.add_file(&model::Path::parse("foo/b")?, 100, &mtime, Hash([2; 32]))?;
+        index.add_file(&model::Path::parse("foo/c")?, 100, &mtime, Hash([3; 32]))?;
+        assert_eq!(3, index.last_history_index()?);
+
+        index.remove_file_or_dir(&model::Path::parse("foo")?)?;
+        assert_eq!(6, index.last_history_index()?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn history_stream() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        let index = &fixture.index;
+
+        let mtime = UnixTime::from_secs(1234567890);
+        let foo_a = model::Path::parse("foo/a")?;
+        let foo_b = model::Path::parse("foo/b")?;
+        let foo_c = model::Path::parse("foo/c")?;
+        index.add_file(&foo_a, 100, &mtime, Hash([1; 32]))?;
+        index.add_file(&foo_b, 100, &mtime, Hash([2; 32]))?;
+        index.add_file(&foo_c, 100, &mtime, Hash([3; 32]))?;
+        index.remove_file_or_dir(&model::Path::parse("foo")?)?;
+
+        let all = fixture.aindex.history(0..).try_collect::<Vec<_>>().await?;
+        assert_eq!(
+            vec![
+                (1, HistoryTableEntry::Add(foo_a.clone())),
+                (2, HistoryTableEntry::Add(foo_b.clone())),
+                (3, HistoryTableEntry::Add(foo_c.clone())),
+                (4, HistoryTableEntry::Remove(foo_a.clone(), Hash([1; 32]))),
+                (5, HistoryTableEntry::Remove(foo_b.clone(), Hash([2; 32]))),
+                (6, HistoryTableEntry::Remove(foo_c.clone(), Hash([3; 32]))),
+            ],
+            all
+        );
+
+        let add = fixture.aindex.history(1..4).try_collect::<Vec<_>>().await?;
+        assert_eq!(
+            vec![
+                (1, HistoryTableEntry::Add(foo_a.clone())),
+                (2, HistoryTableEntry::Add(foo_b.clone())),
+                (3, HistoryTableEntry::Add(foo_c.clone())),
+            ],
+            add
+        );
+
+        let remove = fixture.aindex.history(4..).try_collect::<Vec<_>>().await?;
+        assert_eq!(
+            vec![
+                (4, HistoryTableEntry::Remove(foo_a.clone(), Hash([1; 32]))),
+                (5, HistoryTableEntry::Remove(foo_b.clone(), Hash([2; 32]))),
+                (6, HistoryTableEntry::Remove(foo_c.clone(), Hash([3; 32]))),
+            ],
+            remove
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn watch_history() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        let index = &fixture.index;
+        let mut history_rx = index.watch_history();
+        assert_eq!(0, *history_rx.borrow_and_update());
+
+        let mtime = UnixTime::from_secs(1234567890);
+        index.add_file(&model::Path::parse("foo/a")?, 100, &mtime, Hash([1; 32]))?;
+        assert_eq!(true, history_rx.has_changed()?);
+
+        index.add_file(&model::Path::parse("foo/b")?, 100, &mtime, Hash([2; 32]))?;
+        index.add_file(&model::Path::parse("foo/c")?, 100, &mtime, Hash([3; 32]))?;
+        assert_eq!(3, *history_rx.wait_for(|v| *v >= 3).await?);
+
+        index.remove_file_or_dir(&model::Path::parse("foo")?)?;
+        history_rx.changed().await?;
+        assert_eq!(6, *history_rx.borrow_and_update());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn watch_history_later_on() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let index = &fixture.index;
+
+        let mtime = UnixTime::from_secs(1234567890);
+        index.add_file(&model::Path::parse("foo/a")?, 100, &mtime, Hash([1; 32]))?;
+        index.add_file(&model::Path::parse("foo/b")?, 100, &mtime, Hash([2; 32]))?;
+        index.add_file(&model::Path::parse("foo/c")?, 100, &mtime, Hash([3; 32]))?;
+
+        let mut history_rx = index.watch_history();
+        assert_eq!(3, *history_rx.borrow_and_update());
 
         Ok(())
     }
