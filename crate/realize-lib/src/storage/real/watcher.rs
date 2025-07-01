@@ -366,8 +366,6 @@ impl RealWatcherWorker {
             _ => {}
         }
 
-        // TODO: add support for empty files (file created but never written to)
-
         Ok(())
     }
 
