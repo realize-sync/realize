@@ -1,5 +1,6 @@
 use crate::model::{Arena, Path, UnixTime};
 
+mod hasher;
 #[cfg(target_os = "linux")]
 mod history;
 mod index;

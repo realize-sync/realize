@@ -1,9 +1,9 @@
 #![allow(dead_code)] // work in progress
 
+use super::hasher::{self, HashResult, Hasher};
 use super::index::RealIndexAsync;
 use crate::model::{self, UnixTime};
-use crate::utils::hash;
-use futures::{StreamExt as _, TryStreamExt as _};
+use futures::StreamExt as _;
 use notify::event::{CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind};
 use notify::{Event, EventKind, RecommendedWatcher, Watcher as _};
 use std::fs::Metadata;
@@ -13,7 +13,6 @@ use tokio::fs::{self, File};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::task;
-use tokio_util::io::ReaderStream;
 
 /// Watch an arena directory and update its index.
 pub struct RealWatcher {
@@ -50,8 +49,13 @@ impl RealWatcher {
         };
 
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let (hashed_tx, hashed_rx) = mpsc::channel(128);
 
-        let worker = Arc::new(RealWatcherWorker::new(root, index));
+        let worker = Arc::new(RealWatcherWorker {
+            root,
+            index,
+            hasher: hasher::Hasher::new(hashed_tx),
+        });
 
         task::spawn({
             let worker = Arc::clone(&worker);
@@ -80,6 +84,11 @@ impl RealWatcher {
                 }
             }
         });
+        task::spawn({
+            let worker = Arc::clone(&worker);
+            let shutdown_rx = shutdown_tx.subscribe();
+            async move { worker.hashed_loop(hashed_rx, shutdown_rx).await }
+        });
         task::spawn(async move {
             let _watcher = watcher;
             worker.event_loop(watch_rx, shutdown_rx).await;
@@ -100,13 +109,10 @@ impl RealWatcher {
 struct RealWatcherWorker {
     root: PathBuf,
     index: RealIndexAsync,
+    hasher: Hasher,
 }
 
 impl RealWatcherWorker {
-    fn new(root: PathBuf, index: RealIndexAsync) -> Self {
-        RealWatcherWorker { root, index }
-    }
-
     /// Look for files in the index that have been deleted or modified
     /// and generate remove or modify events.
     async fn catchup_removed_or_modified(
@@ -232,6 +238,43 @@ impl RealWatcherWorker {
                     if let Err(err) = self.handle_event(&ev).await {
                         log::warn!("[{}] Handling of {ev:?} failed: {err}", self.index.arena());
                     }
+                }
+            );
+        }
+    }
+
+    async fn hashed_loop(
+        &self,
+        mut hashed_rx: mpsc::Receiver<(model::Path, std::io::Result<HashResult>)>,
+        mut shutdown_rx: broadcast::Receiver<()>,
+    ) {
+        loop {
+            tokio::select!(
+                _ = shutdown_rx.recv() => {
+                    break;
+                }
+                res = hashed_rx.recv() => {
+                    match res {
+                        None => {
+                            break;
+                        }
+                        Some((path, Ok(HashResult { size, mtime, hash }))) => {
+                            let realpath = path.within(&self.root);
+                            if let Ok(m) = fs::symlink_metadata(realpath).await && m.len() == size && UnixTime::mtime(&m) == mtime {
+                                log::debug!("[{}] Add file {path} with hash {hash}", self.index.arena());
+                                if let Err(err) = self.index.add_file(&path, size, &mtime, hash).await {
+                                    log::debug!("[{}] Failed to add {path}: {err}", self.index.arena());
+                                }
+                            }
+                        }
+                        Some((path, Err(err))) => {
+                            // TODO: should hash failures be retried?
+                            // should some error types, such as access
+                            // denied, cause removal?
+                            log::debug!("[{}] Hashing failed for {path}: {err}", self.index.arena());
+                        }
+                    }
+
                 }
             );
         }
@@ -407,17 +450,8 @@ impl RealWatcherWorker {
         {
             return Ok(());
         }
-        let mut hasher = hash::running();
-        ReaderStream::with_capacity(File::open(realpath).await?, 64 * 1024)
-            .try_for_each(|chunk| {
-                hasher.update(chunk);
-
-                std::future::ready(Ok(()))
-            })
-            .await?;
-        let hash = hasher.finalize();
-        log::debug!("[{}] Add file {path} with hash {hash}", self.index.arena());
-        self.index.add_file(&path, m.len(), &mtime, hash).await?;
+        log::debug!("[{}] Requesting hash of {path}", self.index.arena());
+        self.hasher.request_hash(realpath.to_path_buf(), path);
         Ok(())
     }
 
@@ -455,6 +489,7 @@ mod tests {
 
     use crate::model::Hash;
     use crate::storage::real::index::FileTableEntry;
+    use crate::utils::hash;
     use crate::{model::Arena, storage::real::index::RealIndexBlocking};
 
     use super::*;
