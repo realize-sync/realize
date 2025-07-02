@@ -1232,6 +1232,33 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn create_hard_link() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let _watcher = fixture.watch().await?;
+        let index = &fixture.index;
+        let foo_child = fixture.root.child("foo");
+        foo_child.write_str("test")?;
+        let mtime = UnixTime::mtime(&fs::metadata(foo_child.path()).await?);
+
+        fixture.wait_for_history_event(1).await?;
+
+        let bar_child = fixture.root.child("bar");
+        fs::hard_link(foo_child.path(), bar_child.path()).await?;
+        fixture.wait_for_history_event(2).await?;
+
+        assert_eq!(
+            Some(FileTableEntry {
+                size: 4,
+                mtime,
+                hash: hash::digest("test".as_bytes())
+            }),
+            index.get_file(&model::Path::parse("bar")?).await?
+        );
+
+        Ok(())
+    }
+
     async fn make_inaccessible(path: &std::path::Path) -> anyhow::Result<()> {
         let mut permissions = fs::metadata(path).await?.permissions();
         permissions.set_mode(0);
