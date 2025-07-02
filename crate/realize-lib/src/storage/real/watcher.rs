@@ -137,11 +137,13 @@ impl RealWatcherWorker {
                 let full_path = path.within(&self.root);
                 let mut is_deleted = false;
                 let mut is_modified = false;
-                match fs::metadata(&full_path).await {
+                match fs::symlink_metadata(&full_path).await {
                     Err(_) => { is_deleted = true;
                     }
                     Ok(m) => {
-                        if !file_is_readable(&full_path).await {
+                        if let Ok(canonical) = fs::canonicalize(&full_path).await && canonical != full_path {
+                            is_deleted = true;
+                        } else if !file_is_readable(&full_path).await {
                             is_deleted = true;
                         } else if m.len() != entry.size || UnixTime::mtime(&m) != entry.mtime {
                             is_modified = true;
@@ -479,11 +481,7 @@ impl RealWatcherWorker {
 /// be limited to the traditional unix rules, this function simply
 /// tries to open the file for reading.
 async fn file_is_readable(realpath: &std::path::Path) -> bool {
-    let readable = File::open(realpath).await.is_ok();
-
-    log::debug!("=== FILE IS READABLE ? {realpath:?} -> {readable}"); // NOCOMMIT
-
-    readable
+    File::open(realpath).await.is_ok()
 }
 
 /// Filter for [async_walkdir::WalkDir] to ignore everything except
@@ -1075,6 +1073,161 @@ mod tests {
 
         assert!(!index.has_file(&foo).await?);
         assert!(!index.has_file(&bar).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ignore_new_symlinks() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let _watcher = fixture.watch().await?;
+        let index = &fixture.index;
+
+        let file_symlink = fixture.root.child("file_symlink");
+        let dir_symlink = fixture.root.child("dir_symlink");
+        let foo = fixture.root.child("foo");
+        let bar = fixture.root.child("b/bar");
+        foo.write_str("test")?;
+        fs::symlink(foo.path(), file_symlink.path()).await?;
+        fs::symlink(fixture.root.child("b").path(), dir_symlink.path()).await?;
+        bar.write_str("test")?;
+
+        fixture.wait_for_history_event(2).await?;
+        assert!(!index.has_file(&model::Path::parse("file_symlink")?).await?);
+        assert!(
+            !index
+                .has_file(&model::Path::parse("dir_symlink/bar")?)
+                .await?
+        );
+        assert!(index.has_file(&model::Path::parse("foo")?).await?);
+        assert!(index.has_file(&model::Path::parse("b/bar")?).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catchup_ignores_symlinks() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+
+        let foo = fixture.root.child("foo");
+        foo.write_str("foo")?;
+        fixture.root.child("a/b/c/bar").write_str("bar")?;
+        fs::symlink(foo, fixture.root.child("file_symlink")).await?;
+        fs::symlink(
+            fixture.root.child("a").path(),
+            fixture.root.child("dir_symlink").path(),
+        )
+        .await?;
+
+        let _watcher = fixture.watch().await?;
+
+        fixture.wait_for_history_event(2).await?;
+        let foo = model::Path::parse("foo")?;
+        let bar = model::Path::parse("a/b/c/bar")?;
+        let file_symlink = model::Path::parse("file_symlink")?;
+        let bar_through_symlink = model::Path::parse("dir_symlink/b/c/bar")?;
+        assert!(index.has_file(&foo).await?);
+        assert!(index.has_file(&bar).await?);
+        assert!(!index.has_file(&file_symlink).await?);
+        assert!(!index.has_file(&bar_through_symlink).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_file_into_symlink() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let _watcher = fixture.watch().await?;
+        let foo_child = fixture.root.child("foo");
+        foo_child.write_str("foo")?;
+        let bar_child = fixture.root.child("bar");
+        bar_child.write_str("bar")?;
+
+        let foo = model::Path::parse("foo")?;
+        let bar = model::Path::parse("bar")?;
+        fixture.wait_for_history_event(2).await?;
+        assert!(fixture.index.has_file(&foo).await?);
+        assert!(fixture.index.has_file(&bar).await?);
+
+        fs::remove_file(bar_child.path()).await?;
+        fs::symlink(foo_child.path(), bar_child.path()).await?;
+
+        fixture.wait_for_history_event(3).await?;
+        assert!(!fixture.index.has_file(&bar).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catchup_removes_files_turned_into_symlinks() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+
+        let foo_child = fixture.root.child("foo");
+        let foo = model::Path::parse("foo")?;
+        let bar_child = fixture.root.child("bar");
+        let bar = model::Path::parse("bar")?;
+
+        foo_child.write_str("foo")?;
+        bar_child.write_str("bar")?;
+        index
+            .add_file(
+                &foo,
+                3,
+                &UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
+                hash::digest("foo".as_bytes()),
+            )
+            .await?;
+        index
+            .add_file(
+                &bar,
+                3,
+                &UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
+                hash::digest("bar".as_bytes()),
+            )
+            .await?;
+
+        fs::remove_file(bar_child.path()).await?;
+        fs::symlink(foo_child.path(), bar_child.path()).await?;
+
+        let _watcher = fixture.watch().await?;
+
+        fixture.wait_for_history_event(3).await?;
+        assert!(index.has_file(&foo).await?);
+        assert!(!index.has_file(&bar).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catchup_removes_files_in_dirs_turned_into_symlinks() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+
+        let foo_child = fixture.root.child("a/foo");
+        let foo = model::Path::parse("a/foo")?;
+
+        foo_child.write_str("foo")?;
+        index
+            .add_file(
+                &foo,
+                3,
+                &UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
+                hash::digest("foo".as_bytes()),
+            )
+            .await?;
+
+        let dir = fixture.root.child("a");
+        let newdir = fixture.root.child("b");
+        fs::rename(dir.path(), newdir.path()).await?;
+        fs::symlink(newdir.path(), dir.path()).await?;
+
+        let _watcher = fixture.watch().await?;
+
+        fixture.wait_for_history_event(3).await?;
+        assert!(index.has_file(&model::Path::parse("b/foo")?).await?);
+        assert!(!index.has_file(&model::Path::parse("a/foo")?).await?);
 
         Ok(())
     }
