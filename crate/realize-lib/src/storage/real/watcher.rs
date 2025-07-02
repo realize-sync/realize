@@ -135,21 +135,30 @@ impl RealWatcherWorker {
                 };
 
                 let full_path = path.within(&self.root);
+                let mut is_deleted = false;
+                let mut is_modified = false;
                 match fs::metadata(&full_path).await {
-                    Err(_) => {
-                        let ev = Event::new(EventKind::Remove(RemoveKind::File))
-                            .add_path(full_path)
-                            .set_info("catchup");
-                        watch_tx.send(Ok(ev)).await?;
+                    Err(_) => { is_deleted = true;
                     }
                     Ok(m) => {
-                        if m.len() != entry.size || UnixTime::mtime(&m) != entry.mtime {
-                            let ev = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
-                                .add_path(full_path)
-                                .set_info("catchup");
-                            watch_tx.send(Ok(ev)).await?;
+                        if !file_is_readable(&full_path).await {
+                            is_deleted = true;
+                        } else if m.len() != entry.size || UnixTime::mtime(&m) != entry.mtime {
+                            is_modified = true;
                         }
                     }
+                }
+
+                if is_deleted {
+                    let ev = Event::new(EventKind::Remove(RemoveKind::File))
+                    .add_path(full_path)
+                    .set_info("catchup");
+                    watch_tx.send(Ok(ev)).await?;
+                } else if is_modified {
+                    let ev = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+                    .add_path(full_path)
+                    .set_info("catchup");
+                    watch_tx.send(Ok(ev)).await?;
                 }
             });
         }
@@ -343,7 +352,7 @@ impl RealWatcherWorker {
                                 self.file_or_dir_removed(realpath).await?;
                             }
                         } else {
-                            if File::open(realpath).await.is_ok() {
+                            if file_is_readable(realpath).await {
                                 // Might have just become accessible.
                                 self.file_created_or_modified(realpath, &m).await?;
                             } else {
@@ -462,6 +471,19 @@ impl RealWatcherWorker {
 
         model::Path::from_real_path(&relative).ok()
     }
+}
+
+/// Check whether the given file can be read.
+///
+/// Instead of duplicating the access rules of the OS, which might not
+/// be limited to the traditional unix rules, this function simply
+/// tries to open the file for reading.
+async fn file_is_readable(realpath: &std::path::Path) -> bool {
+    let readable = File::open(realpath).await.is_ok();
+
+    log::debug!("=== FILE IS READABLE ? {realpath:?} -> {readable}"); // NOCOMMIT
+
+    readable
 }
 
 /// Filter for [async_walkdir::WalkDir] to ignore everything except
@@ -876,23 +898,6 @@ mod tests {
         Ok(())
     }
 
-    async fn make_inaccessible(path: &std::path::Path) -> anyhow::Result<()> {
-        let mut permissions = fs::metadata(path).await?.permissions();
-        permissions.set_mode(0);
-        fs::set_permissions(path, permissions).await?;
-
-        Ok(())
-    }
-
-    async fn make_accessible(path: &std::path::Path) -> anyhow::Result<()> {
-        let m = fs::metadata(path).await?;
-        let mut permissions = m.permissions();
-        permissions.set_mode(if m.is_dir() { 0o770 } else { 0o660 });
-        fs::set_permissions(path, permissions).await?;
-
-        Ok(())
-    }
-
     #[tokio::test]
     async fn catchup_adds_existing_files() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
@@ -987,6 +992,106 @@ mod tests {
             }),
             fixture.index.get_file(&bar).await?
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catchup_removes_inaccessible_files() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+
+        let foo = model::Path::parse("foo")?;
+        let bar = model::Path::parse("a/b/c/bar")?;
+        let foo_child = fixture.root.child("foo");
+        foo_child.write_str("foo")?;
+        let bar_child = fixture.root.child("a/b/c/bar");
+        bar_child.write_str("bar")?;
+
+        index
+            .add_file(
+                &foo,
+                3,
+                &UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
+                hash::digest("foo".as_bytes()),
+            )
+            .await?;
+        index
+            .add_file(
+                &bar,
+                3,
+                &UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
+                hash::digest("bar".as_bytes()),
+            )
+            .await?;
+
+        make_inaccessible(foo_child.path()).await?;
+        make_inaccessible(bar_child.path()).await?;
+
+        let _watcher = fixture.watch().await?;
+
+        fixture.wait_for_history_event(4).await?;
+
+        assert!(!index.has_file(&foo).await?);
+        assert!(!index.has_file(&bar).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catchup_removes_files_in_inaccessible_dirs() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+
+        let foo = model::Path::parse("a/b/c/foo")?;
+        let bar = model::Path::parse("a/b/d/bar")?;
+        let foo_child = fixture.root.child("foo");
+        foo_child.write_str("foo")?;
+        let bar_child = fixture.root.child("a/b/c/bar");
+        bar_child.write_str("bar")?;
+
+        index
+            .add_file(
+                &foo,
+                3,
+                &UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
+                hash::digest("foo".as_bytes()),
+            )
+            .await?;
+        index
+            .add_file(
+                &bar,
+                3,
+                &UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
+                hash::digest("bar".as_bytes()),
+            )
+            .await?;
+
+        make_inaccessible(fixture.root.child("a").path()).await?;
+
+        let _watcher = fixture.watch().await?;
+
+        fixture.wait_for_history_event(4).await?;
+
+        assert!(!index.has_file(&foo).await?);
+        assert!(!index.has_file(&bar).await?);
+
+        Ok(())
+    }
+
+    async fn make_inaccessible(path: &std::path::Path) -> anyhow::Result<()> {
+        let mut permissions = fs::metadata(path).await?.permissions();
+        permissions.set_mode(0);
+        fs::set_permissions(path, permissions).await?;
+
+        Ok(())
+    }
+
+    async fn make_accessible(path: &std::path::Path) -> anyhow::Result<()> {
+        let m = fs::metadata(path).await?;
+        let mut permissions = m.permissions();
+        permissions.set_mode(if m.is_dir() { 0o770 } else { 0o660 });
+        fs::set_permissions(path, permissions).await?;
 
         Ok(())
     }
