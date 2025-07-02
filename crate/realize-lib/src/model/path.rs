@@ -102,6 +102,21 @@ impl Path {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Return true if the other path is the current path or a parent
+    /// of the current path.
+    ///
+    /// Note that it works at the level of paths, not names, so
+    /// `Path::parse("foobar")?` does not start with
+    /// `Path::parts("foo")?` even though "foobar" start with
+    /// "foo".
+    pub fn starts_with(&self, other: &Path) -> bool {
+        if let Some(rest) = self.0.strip_prefix(other.as_str()) {
+            return rest == "" || rest.starts_with('/');
+        }
+
+        false
+    }
 }
 
 impl From<Path> for path::PathBuf {
@@ -116,7 +131,7 @@ impl std::fmt::Display for Path {
     }
 }
 
-/// Errors returned by model::Path functions
+/// Errors returned by Path functions
 #[derive(Debug, thiserror::Error)]
 pub enum PathError {
     #[error("Invalid path. Paths must be valid unicode and not contain ., .. or :")]
@@ -293,6 +308,19 @@ mod tests {
     fn into_path_buf() -> anyhow::Result<()> {
         let buf: path::PathBuf = Path::parse("foo/bar")?.into();
         assert_eq!(path::PathBuf::from("foo/bar"), buf);
+
+        Ok(())
+    }
+
+    #[test]
+    fn starts_with_file_or_dir() -> anyhow::Result<()> {
+        assert!(Path::parse("test/foo")?.starts_with(&Path::parse("test")?));
+        assert!(Path::parse("test/foo")?.starts_with(&Path::parse("test/foo")?));
+        assert!(!Path::parse("test/foo")?.starts_with(&Path::parse("test/foo/bar")?));
+        assert!(!Path::parse("test/foo")?.starts_with(&Path::parse("test/foobar")?));
+
+        assert!(!Path::parse("test/foo")?.starts_with(&Path::parse("t")?));
+        assert!(!Path::parse("test/foobar")?.starts_with(&Path::parse("test/foo")?));
 
         Ok(())
     }

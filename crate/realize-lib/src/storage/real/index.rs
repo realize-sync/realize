@@ -219,7 +219,7 @@ fn do_remove_file_or_dir(
 
     for entry in file_table.extract_from_if(path_str..range_end.as_ref(), |k, _| {
         k.strip_prefix(path_str)
-            .map(|rest| rest == "" || rest.starts_with("/"))
+            .map(|rest| rest == "" || rest.starts_with('/'))
             .unwrap_or(false)
     })? {
         let (k, v) = entry?;

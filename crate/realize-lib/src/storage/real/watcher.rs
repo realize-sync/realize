@@ -25,7 +25,11 @@ impl RealWatcher {
     /// To stop the background work cleanly, call [RealWatcher::shutdown].
     ///
     /// Background work is also stopped at some point after the instance is dropped.
-    pub async fn spawn(root: &std::path::Path, index: RealIndexAsync) -> anyhow::Result<Self> {
+    pub async fn spawn(
+        root: &std::path::Path,
+        exclude: Vec<model::Path>,
+        index: RealIndexAsync,
+    ) -> anyhow::Result<Self> {
         let root = fs::canonicalize(&root).await?;
         let arena = index.arena().clone();
 
@@ -51,10 +55,12 @@ impl RealWatcher {
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
         let (hashed_tx, hashed_rx) = mpsc::channel(128);
 
+        // Transform excluded path::Path into model::Path, when possible.
         let worker = Arc::new(RealWatcherWorker {
             root,
             index,
             hasher: hasher::Hasher::new(hashed_tx),
+            exclude,
         });
 
         task::spawn({
@@ -110,6 +116,11 @@ struct RealWatcherWorker {
     root: PathBuf,
     index: RealIndexAsync,
     hasher: Hasher,
+
+    /// Paths that should be excluded from the index. These may be
+    /// files or directories. For directories, the whole directory
+    /// content is excluded.
+    exclude: Vec<model::Path>,
 }
 
 impl RealWatcherWorker {
@@ -135,18 +146,25 @@ impl RealWatcherWorker {
                 };
 
                 let full_path = path.within(&self.root);
+
                 let mut is_deleted = false;
                 let mut is_modified = false;
-                match fs::symlink_metadata(&full_path).await {
-                    Err(_) => { is_deleted = true;
-                    }
-                    Ok(m) => {
-                        if let Ok(canonical) = fs::canonicalize(&full_path).await && canonical != full_path {
-                            is_deleted = true;
-                        } else if !file_is_readable(&full_path).await {
-                            is_deleted = true;
-                        } else if m.len() != entry.size || UnixTime::mtime(&m) != entry.mtime {
-                            is_modified = true;
+                if self.is_excluded(&path) {
+                    // If the file is now to be excluded, delete it
+                    // from the index.
+                    is_deleted = true;
+                } else {
+                    match fs::symlink_metadata(&full_path).await {
+                        Err(_) => { is_deleted = true;
+                        }
+                        Ok(m) => {
+                            if let Ok(canonical) = fs::canonicalize(&full_path).await && canonical != full_path {
+                                is_deleted = true;
+                            } else if !file_is_readable(&full_path).await {
+                                is_deleted = true;
+                            } else if m.len() != entry.size || UnixTime::mtime(&m) != entry.mtime {
+                                is_modified = true;
+                            }
                         }
                     }
                 }
@@ -206,6 +224,11 @@ impl RealWatcherWorker {
 
                 // Skip if the file is already in the index.
                 if self.index.has_file(&path).await.unwrap_or(false) {
+                    continue;
+                }
+
+                // Skip if the file is to be excluded
+                if self.is_excluded(&path) {
                     continue;
                 }
 
@@ -450,6 +473,12 @@ impl RealWatcherWorker {
                 return Ok(());
             }
         };
+
+        // Skip if the file is to be excluded from the index.
+        if self.is_excluded(&path) {
+            return Ok(());
+        }
+
         let mtime = UnixTime::mtime(m);
         if self
             .index
@@ -472,6 +501,11 @@ impl RealWatcherWorker {
         let relative = pathdiff::diff_paths(&path, &self.root)?;
 
         model::Path::from_real_path(&relative).ok()
+    }
+
+    /// Check whether the given path should be excluded from the index.
+    fn is_excluded(&self, path: &model::Path) -> bool {
+        self.exclude.iter().any(|e| path.starts_with(e))
     }
 }
 
@@ -520,6 +554,7 @@ mod tests {
         index: RealIndexAsync,
         root: ChildPath,
         tempdir: TempDir,
+        exclude: Vec<model::Path>,
     }
 
     impl Fixture {
@@ -536,11 +571,17 @@ mod tests {
                 root,
                 index,
                 tempdir,
+                exclude: vec![],
             })
         }
 
+        /// Add to the exclusion list of any future watcher.
+        fn exclude(&mut self, path: model::Path) {
+            self.exclude.push(path);
+        }
+
         async fn watch(&self) -> anyhow::Result<RealWatcher> {
-            RealWatcher::spawn(self.root.path(), self.index.clone()).await
+            RealWatcher::spawn(self.root.path(), self.exclude.clone(), self.index.clone()).await
         }
 
         /// Wait for the given history entry to have been written.
@@ -1254,6 +1295,126 @@ mod tests {
                 hash: hash::digest("test".as_bytes())
             }),
             index.get_file(&model::Path::parse("bar")?).await?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ignore_excluded() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        fixture.exclude(model::Path::parse("a/b")?);
+        fixture.exclude(model::Path::parse("excluded")?);
+
+        let _watcher = fixture.watch().await?;
+
+        fixture.root.child("excluded").write_str("test")?;
+        fixture.root.child("a/b/also_excluded").write_str("test")?;
+        fixture.root.child("a/not_excluded").write_str("test")?;
+
+        fixture.wait_for_history_event(1).await?;
+
+        let index = &fixture.index;
+        assert!(!index.has_file(&model::Path::parse("excluded")?).await?);
+        assert!(
+            !index
+                .has_file(&model::Path::parse("a/b/also_excluded")?)
+                .await?
+        );
+        assert!(
+            index
+                .has_file(&model::Path::parse("a/not_excluded")?)
+                .await?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catchup_ignores_excluded() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        fixture.exclude(model::Path::parse("a/b")?);
+        fixture.exclude(model::Path::parse("excluded")?);
+        let index = &fixture.index;
+
+        fixture.root.child("excluded").write_str("test")?;
+        fixture.root.child("a/b/excluded_too").write_str("test")?;
+        fixture.root.child("not_excluded").write_str("test")?;
+
+        let _watcher = fixture.watch().await?;
+
+        fixture.wait_for_history_event(1).await?;
+        let not_excluded = model::Path::parse("not_excluded")?;
+        assert!(index.has_file(&not_excluded).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catchup_removes_excluded() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        fixture.exclude(model::Path::parse("a/b")?);
+        fixture.exclude(model::Path::parse("excluded")?);
+        let index = &fixture.index;
+
+        let excluded_child = fixture.root.child("excluded");
+        excluded_child.write_str("test")?;
+        let excluded_too_child = fixture.root.child("a/b/excluded_too");
+        excluded_too_child.write_str("test")?;
+
+        let excluded = model::Path::parse("excluded")?;
+        let excluded_too = model::Path::parse("a/b/excluded_too")?;
+        index
+            .add_file(
+                &excluded,
+                4,
+                &UnixTime::mtime(&fs::metadata(excluded_child.path()).await?),
+                hash::digest("test".as_bytes()),
+            )
+            .await?;
+        index
+            .add_file(
+                &excluded_too,
+                4,
+                &UnixTime::mtime(&fs::metadata(excluded_too_child.path()).await?),
+                hash::digest("test".as_bytes()),
+            )
+            .await?;
+
+        let _watcher = fixture.watch().await?;
+
+        fixture.wait_for_history_event(4).await?;
+        assert!(!index.has_file(&excluded).await?);
+        assert!(!index.has_file(&excluded_too).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn capture_ignore_and_removes_excluded() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        fixture.exclude(model::Path::parse("a/b")?);
+        fixture.exclude(model::Path::parse("excluded")?);
+
+        let _watcher = fixture.watch().await?;
+
+        fixture.root.child("excluded").write_str("test")?;
+        fixture.root.child("a/b/also_excluded").write_str("test")?;
+        fixture.root.child("a/not_excluded").write_str("test")?;
+
+        fixture.wait_for_history_event(1).await?;
+
+        let index = &fixture.index;
+        assert!(!index.has_file(&model::Path::parse("excluded")?).await?);
+        assert!(
+            !index
+                .has_file(&model::Path::parse("a/b/also_excluded")?)
+                .await?
+        );
+        assert!(
+            index
+                .has_file(&model::Path::parse("a/not_excluded")?)
+                .await?
         );
 
         Ok(())
