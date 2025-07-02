@@ -7,7 +7,6 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs::Metadata;
 use std::path::PathBuf;
-use std::time::SystemTimeError;
 use tokio::fs;
 use tokio::sync::mpsc;
 
@@ -311,7 +310,7 @@ async fn find_mtime_for_unlink(
     while let Some(parent_path) = current {
         let parent_full_path = parent_path.within(resolver.root());
         if let Ok(metadata) = fs::metadata(&parent_full_path).await {
-            let mtime = Unix::mtime(&metadata);
+            let mtime = UnixTime::mtime(&metadata);
 
             return Ok(Some(mtime));
         }
@@ -320,7 +319,7 @@ async fn find_mtime_for_unlink(
 
     // Fallback to arena root
     if let Ok(metadata) = fs::metadata(resolver.root()).await {
-        let mtime = Unix::mtime(&metadata);
+        let mtime = UnixTime::mtime(&metadata);
 
         return Ok(Some(mtime));
     }
@@ -444,7 +443,7 @@ mod tests {
                 arena: fixture.arena(),
                 path: Path::parse("subdir1/subdir2/child.txt")?,
                 size: 7,
-                mtime: UnixTime::mtime(&child.metadata())
+                mtime: UnixTime::mtime(&child.metadata()?)
             },
             fixture.next("child.txt").await?,
         );
@@ -561,7 +560,7 @@ mod tests {
 
         let dest = fixture._tempdir.child("dest.txt");
         std::fs::rename(child.path(), dest.path())?;
-        let mtime = UnixTime::mtime(&fixture.arena_dir.metadata());
+        let mtime = UnixTime::mtime(&fixture.arena_dir.metadata()?);
         assert_eq!(
             Notification::Unlink {
                 arena: fixture.arena(),
@@ -617,7 +616,7 @@ mod tests {
         std::fs::rename(source.path(), dest.path())?;
         let n1 = fixture.next("move within 1").await?;
         let n2 = fixture.next("move within 2").await?;
-        let mtime = UnixTime::mtime(&fixture.arena_dir.metadata());
+        let mtime = UnixTime::mtime(&fixture.arena_dir.metadata()?);
         let unlink = Notification::Unlink {
             arena: fixture.arena(),
             path: Path::parse("source.txt")?,
@@ -743,7 +742,7 @@ mod tests {
                     arena: fixture.arena(),
                     path: Path::parse("a/b/child2.txt")?,
                     size: 1,
-                    mtime: UnixTime::mtime(child2.metadata()?),
+                    mtime: UnixTime::mtime(&child2.metadata()?),
                 },
             ],
             notifications,
