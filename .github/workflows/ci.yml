@@ -32,6 +32,7 @@ jobs:
       uses: actions-rs/toolchain@v1
       with:
         toolchain: "1.88.0"
+        profile: "minimal" # rustc, rust-std and cargo only
         override: true
     - name: Build
       run: cargo build
@@ -48,6 +49,7 @@ jobs:
       uses: actions-rs/toolchain@v1
       with:
         toolchain: "1.88.0"
+        profile: "minimal"
         override: true
     - name: Build
       run: "cargo build"
