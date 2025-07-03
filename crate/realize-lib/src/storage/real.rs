@@ -4,6 +4,7 @@ mod hasher;
 #[cfg(target_os = "linux")]
 mod history;
 mod index;
+mod notifier;
 #[allow(dead_code)]
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]
@@ -14,6 +15,7 @@ mod real_capnp {
 mod store;
 mod watcher;
 
+pub use index::{RealIndexAsync, RealIndexBlocking};
 pub use store::{
     Options, PathResolver, PathType, RealStore, RealStoreError, RsyncOperation, StoreSubscribe,
     SyncedFile,
@@ -58,7 +60,7 @@ pub enum Notification {
 
     /// Report that the arena is done catching up. After that
     /// [Notification::Link] and [Notification::Unlink] are sent and
-    /// no [Notification::Catcheup].
+    /// no [Notification::Catchup].
     Ready { arena: Arena },
 }
 

@@ -139,15 +139,18 @@ design](./design.md)), the following modifications:
 
 `Notification`:
 
-- `Link(arena, path, mtime, size, hash, old_hash)`: set file content,
-  versioned by its hash. old_hash optionally identifies previous
-  content for the path.
+- `Add(arena, path, mtime, size, hash)`: set file content,
+  versioned by its hash.
+
+- `Replace(arena, path, mtime, size, hash, old_hash)`: replace
+  file content hash old_hash with new file content with the given
+  hash and metadata.
 
 - `Available(arena, path, mtime, size, hash)`: remote file was
   downloaded and made available locally
 
-- `Unlink(arena, path, old_hash)`: file has no content anymore.
-  old_hash identifies the version that was removed
+- `Remove(arena, path, old_hash)`: Remove file content identified
+  by old_hash.
 
 - `Drop(arena, path, hash)`: file was removed locally, but is still
   available remotely
@@ -157,18 +160,16 @@ design](./design.md)), the following modifications:
 > For a description of catchup, see the description of
 > mark_peer_files/delete_marked_files in [The Unreal](./unreal.md)
 
-The difference between `Unlink` and `Drop` is that the former should
+The difference between `Remove` and `Drop` is that the former should
 be replicated to other peers while the latter is just informational.
-The `Link` and `Available` pair have a similar relationship.
+`Add`/`Replace` and `Available` pair have a similar relationship.
 
-The [Unreal cache](./unreal.md) doesn't distinguish `Link` from
-`Available` nor `Unlink` from `Drop`.
+The [Unreal cache](./unreal.md) doesn't distinguish `Add`/`Replace`
+from `Available` nor `Remove` from `Drop`.
 
 This is mapped from lower-level inotify notifications. For example,
 Inotify reports just a directory move, which results in many files
 being reported as deleted and moved in the history.
-
-Exact mapping TBD.
 
 These notifications are sent to peers through the `Store` interface.
 
@@ -198,18 +199,22 @@ interface Subscriber {
 ### Consensus
 
 Peers listen to notifications from remote peer's [History] and apply
-`Link` and `Unlink` modifications locally.
+`Add`, `Replace` and `Remove` modifications locally.
 
-`Unlink` and `Link` are ignored if old_hash doesn't match the current version, unless history is known to have been lost (catching up)
+- `Remove` is ignored if a file exists whose content doesn't match
+  old_hash.
 
-- if local file with matching hash has been reported as `Unlink`,
+- `Replace` is ignored if a file exists whose content doesn't match
+  old_hash. If no file exists, `Replace` is treated as `Add`.
+
+- if local file with matching hash has been reported as `Remove`,
   delete it
 
 - if local file with matching hash has been reported as being
-  modified by `Link`, download the new version
+  modified by `Replace`, download the new version
 
-- if no local file exists reported by `Link` and it is in an
-  *own* directory, download it
+- if no local file exists reported by `Replace` or `Add` and it is in
+  an *own* directory, download it
 
 - if local file marked *watch* has been reported as `Available` with
   the same hash, delete it
