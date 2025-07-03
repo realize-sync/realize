@@ -39,6 +39,7 @@ tokio-retry = "0.3.0"
 tokio-rustls = "0.26"
 tokio-stream = "0.1.17"
 tokio-util = { version = "0.7.15", features = ["compat"] }
+uuid = { version = "1.17.0", features = ["std", "v7"] }
 walkdir = "2.5"
 
 

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 use tokio::task;
 use tokio_stream::wrappers::ReceiverStream;
+use uuid::Uuid;
 
 /// Track hash and metadata of local files.
 ///
@@ -26,11 +27,18 @@ const FILE_TABLE: TableDefinition<&str, Holder<FileTableEntry>> = TableDefinitio
 const HISTORY_TABLE: TableDefinition<u64, Holder<HistoryTableEntry>> =
     TableDefinition::new("history");
 
+/// Database settings.
+///
+/// Key: string
+/// Value: depends on the setting
+const SETTINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("settings");
+
 /// File hash index, blocking version.
 pub struct RealIndexBlocking {
     db: Database,
     arena: Arena,
     history_tx: watch::Sender<u64>,
+    uuid: Uuid,
 
     /// This is just to keep history_tx alive and up-to-date.
     _history_rx: watch::Receiver<u64>,
@@ -39,12 +47,24 @@ pub struct RealIndexBlocking {
 impl RealIndexBlocking {
     pub fn new(arena: Arena, db: Database) -> anyhow::Result<Self> {
         let index: u64;
+        let uuid: Uuid;
         {
             let txn = db.begin_write()?;
             {
                 txn.open_table(FILE_TABLE)?;
                 let history_table = txn.open_table(HISTORY_TABLE)?;
                 index = last_history_index(&history_table)?;
+            }
+            {
+                let mut settings_table = txn.open_table(SETTINGS_TABLE)?;
+                if let Some(value) = settings_table.get("uuid")? {
+                    let bytes: uuid::Bytes = value.value().try_into()?;
+                    uuid = Uuid::from_bytes(bytes);
+                } else {
+                    uuid = Uuid::now_v7();
+                    let bytes: &[u8] = uuid.as_bytes();
+                    settings_table.insert("uuid", &bytes)?;
+                }
             }
             txn.commit()?;
         }
@@ -54,9 +74,17 @@ impl RealIndexBlocking {
         Ok(Self {
             arena,
             db,
+            uuid,
             history_tx,
             _history_rx: history_rx,
         })
+    }
+
+    /// Returns the database UUID.
+    ///
+    /// A UUID is set when a new database is created.
+    pub fn uuid(&self) -> &Uuid {
+        &self.uuid
     }
 
     /// The arena tied to this index.
@@ -304,6 +332,13 @@ impl RealIndexAsync {
         Self {
             inner: Arc::new(inner),
         }
+    }
+
+    /// Returns the database UUID.
+    ///
+    /// A UUID is set when a new database is created.
+    pub fn uuid(&self) -> &Uuid {
+        &self.inner.uuid
     }
 
     /// The arena tied to this index.
@@ -590,6 +625,24 @@ mod tests {
         let txn = db.begin_read()?;
         assert!(txn.open_table(FILE_TABLE).is_ok());
         assert!(txn.open_table(HISTORY_TABLE).is_ok());
+        assert!(txn.open_table(SETTINGS_TABLE).is_ok());
+
+        assert!(!fixture.index.uuid().is_nil());
+        Ok(())
+    }
+
+    #[test]
+    fn reopen_keeps_uuid() -> anyhow::Result<()> {
+        let tempdir = TempDir::new()?;
+        let path = tempdir.path().join("index.db");
+        let uuid = RealIndexBlocking::open(test_arena(), &path)?.uuid().clone();
+
+        assert!(!uuid.is_nil());
+        assert_eq!(
+            uuid,
+            RealIndexBlocking::open(test_arena(), &path)?.uuid().clone()
+        );
+
         Ok(())
     }
 
