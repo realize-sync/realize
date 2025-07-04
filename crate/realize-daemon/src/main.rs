@@ -93,7 +93,7 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("Failed to parse --address {}", cli.address))?;
     log::debug!("Starting server on {}/{:?}...", hostport, hostport.addr());
-    let server = setup.setup_server()?;
+    let server = setup.setup_server().await?;
 
     let addr = server
         .listen(&hostport)

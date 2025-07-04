@@ -1,7 +1,6 @@
 use crate::model::UnixTime;
-use crate::storage::unreal::{
-    self, Download, Downloader, FileMetadata, InodeAssignment, UnrealCacheAsync, UnrealError,
-};
+use crate::storage::unreal::{self, Download, Downloader};
+use crate::storage::{FileMetadata, InodeAssignment, UnrealCacheAsync, UnrealError};
 use async_trait::async_trait;
 use moka::future::Cache;
 use nfsserve::nfs::{
@@ -349,8 +348,8 @@ mod tests {
     use crate::network::hostport::HostPort;
     use crate::network::rpc::realstore;
     use crate::network::{self, Server};
-    use crate::storage::real::RealStore;
-    use crate::storage::{self};
+    use crate::storage;
+    use crate::storage::RealStore;
     use assert_fs::TempDir;
     use assert_fs::prelude::{FileWriteStr as _, PathChild as _};
     use nfsserve::nfs::nfsstring;

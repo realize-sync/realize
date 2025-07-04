@@ -3,8 +3,8 @@ use crate::model::{Arena, Peer};
 use crate::network::rpc::{Household, realstore};
 use crate::network::{Networking, Server};
 use crate::storage::config::ArenaConfig;
-use crate::storage::real::{Notification, RealStore};
-use crate::storage::unreal::{Downloader, UnrealCacheAsync, keep_cache_updated};
+use crate::storage::unreal::Downloader;
+use crate::storage::{Notification, Storage, UnrealCacheAsync};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -31,9 +31,10 @@ impl Setup {
     /// The content of the returned cache is kept up-to-date as much as
     /// possible by connecting to other peers to track changes.
     pub fn setup_cache(&mut self) -> anyhow::Result<(UnrealCacheAsync, Downloader)> {
-        let cache = UnrealCacheAsync::from_config(&self.config.storage)?;
-        let (tx, rx) = mpsc::channel(100);
-        tokio::spawn(keep_cache_updated(cache.clone(), rx));
+        let cache = UnrealCacheAsync::from_config(&self.config.storage)?
+            .ok_or_else(|| anyhow::anyhow!("cache.db missing from configuration"))?;
+        let (tx, _rx) = mpsc::channel(100);
+        //tokio::spawn(keep_cache_updated(cache.clone(), rx)); TODO
         self.notification_tx = Some(tx);
 
         let downloader = Downloader::new(self.networking.clone(), cache.clone());
@@ -44,7 +45,7 @@ impl Setup {
     /// Setup server as specified in the configuration.
     ///
     /// The returned server is configured, but not started.
-    pub fn setup_server(self) -> anyhow::Result<Arc<Server>> {
+    pub async fn setup_server(self) -> anyhow::Result<Arc<Server>> {
         check_directory_access(&self.config.storage.arenas)?;
         let Setup {
             networking,
@@ -52,13 +53,13 @@ impl Setup {
             notification_tx,
         } = self;
 
-        let store = RealStore::from_config(&config.storage.arenas);
+        let storage = Storage::from_config(&config.storage).await?;
 
         let mut server = Server::new(networking.clone());
-        realstore::server::register(&mut server, store.clone());
+        realstore::server::register(&mut server, storage.store());
 
         let has_notifications = notification_tx.is_some();
-        let (household, _) = Household::spawn(networking, Arc::new(store), notification_tx)?;
+        let (household, _) = Household::spawn(networking, storage, notification_tx)?;
         if has_notifications {
             household.keep_connected()?;
         }

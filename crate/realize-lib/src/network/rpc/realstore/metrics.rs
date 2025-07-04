@@ -13,7 +13,7 @@
 
 use crate::model::ByteRange;
 use crate::network::rpc::realstore::{RealStoreServiceRequest, RealStoreServiceResponse};
-use crate::storage::real::RealStoreError;
+use crate::storage::RealStoreError;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use prometheus::{

@@ -9,7 +9,7 @@ use crate::model::{Arena, ByteRange, ByteRanges};
 use crate::network::rpc::realstore::{
     RangedHash, RealStoreServiceClient, RealStoreServiceRequest, RealStoreServiceResponse,
 };
-use crate::storage::real::{self, RealStoreError, SyncedFile};
+use crate::storage::{RealStoreError, RealStoreOptions, SyncedFile};
 use futures::stream::StreamExt as _;
 use futures::{FutureExt, future};
 use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
@@ -75,15 +75,15 @@ lazy_static::lazy_static! {
 }
 
 /// Options used for RPC calls on the source.
-fn src_options() -> real::Options {
-    real::Options {
+fn src_options() -> RealStoreOptions {
+    RealStoreOptions {
         ignore_partial: true,
     }
 }
 
 /// Options used for RPC calls on the destination.
-fn dst_options() -> real::Options {
-    real::Options {
+fn dst_options() -> RealStoreOptions {
+    RealStoreOptions {
         ignore_partial: false,
     }
 }
@@ -694,7 +694,7 @@ pub(crate) async fn hash_file<T>(
     relative_path: &model::Path,
     file_size: u64,
     chunk_size: u64,
-    options: real::Options,
+    options: RealStoreOptions,
 ) -> Result<RangedHash, MoveFileError>
 where
     T: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse>,
@@ -790,7 +790,7 @@ mod tests {
     use super::*;
     use crate::model::{Arena, Hash};
     use crate::network::rpc::realstore::server::{self};
-    use crate::storage::real::RealStore;
+    use crate::storage::RealStore;
     use crate::utils::hash;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
@@ -1256,7 +1256,7 @@ mod tests {
             &model::Path::parse("somefile")?,
             content.len() as u64,
             HASH_FILE_CHUNK,
-            real::Options::default(),
+            RealStoreOptions::default(),
         )
         .await?;
         assert_eq!(
@@ -1290,7 +1290,7 @@ mod tests {
             &model::Path::parse("somefile")?,
             content.len() as u64,
             4,
-            real::Options::default(),
+            RealStoreOptions::default(),
         )
         .await?;
         let mut expected = RangedHash::new();
@@ -1324,7 +1324,7 @@ mod tests {
             &model::Path::parse("somefile")?,
             8,
             4,
-            real::Options::default(),
+            RealStoreOptions::default(),
         )
         .await?;
         let mut expected = RangedHash::new();

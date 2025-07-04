@@ -3,7 +3,7 @@ use crate::model::{ByteRange, Peer};
 use crate::network::Networking;
 use crate::network::rpc::realstore::client::{ClientOptions, RealStoreClient};
 use crate::network::rpc::realstore::{self};
-use crate::storage::real::{self, RealStoreError};
+use crate::storage::{RealStoreError, RealStoreOptions};
 use moka::future::{Cache, CacheBuilder};
 use std::cmp::min;
 use std::collections::VecDeque;
@@ -192,7 +192,7 @@ impl Download {
                         arena,
                         path,
                         range,
-                        real::Options::default(),
+                        RealStoreOptions::default(),
                     )
                     .await
             })
@@ -321,8 +321,7 @@ mod tests {
     use crate::model::{Arena, Path, UnixTime};
     use crate::network::hostport::HostPort;
     use crate::network::{self, Server};
-    use crate::storage::real::RealStore;
-    use crate::storage::{self};
+    use crate::storage::{self, RealStore};
     use assert_fs::TempDir;
     use assert_fs::prelude::{FileWriteBin as _, FileWriteStr as _, PathChild as _};
     use std::io::Write as _;

@@ -510,10 +510,7 @@ impl RealWatcherWorker {
     fn to_model_path(&self, path: &std::path::Path) -> Option<model::Path> {
         // TODO: Should this use a PathResolver? We may or may not want
         // to care about partial/full files here.
-
-        let relative = pathdiff::diff_paths(&path, &self.root)?;
-
-        model::Path::from_real_path(&relative).ok()
+        model::Path::from_real_path_in(&path, &self.root).ok()
     }
 
     /// Check whether the given path should be excluded from the index.

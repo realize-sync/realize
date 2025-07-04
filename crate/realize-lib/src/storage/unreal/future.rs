@@ -14,16 +14,17 @@ pub struct UnrealCacheAsync {
 
 impl UnrealCacheAsync {
     /// Create and configure a cache from configuration.
-    pub fn from_config(config: &StorageConfig) -> anyhow::Result<Self> {
-        let cache_config = config
-            .cache
-            .as_ref()
-            .ok_or(anyhow::anyhow!("cache section missing from config file"))?;
-        let mut cache = UnrealCacheBlocking::open(&cache_config.db)?;
-        for arena in config.arenas.keys() {
-            cache.add_arena(arena)?;
+    pub fn from_config(config: &StorageConfig) -> anyhow::Result<Option<Self>> {
+        match &config.cache {
+            None => Ok(None),
+            Some(cache_config) => {
+                let mut cache = UnrealCacheBlocking::open(&cache_config.db)?;
+                for arena in config.arenas.keys() {
+                    cache.add_arena(arena)?;
+                }
+                Ok(Some(cache.into_async()))
+            }
         }
-        Ok(cache.into_async())
     }
 
     /// Create a new cache from a blocking one.

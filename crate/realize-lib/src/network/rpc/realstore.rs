@@ -10,7 +10,7 @@ pub mod metrics;
 pub mod server;
 
 use crate::model::{self, Arena, ByteRange, ByteRanges, Delta, Hash, Signature};
-use crate::storage::real::{self, RealStoreError, SyncedFile};
+use crate::storage::{RealStoreError, RealStoreOptions, SyncedFile};
 
 /// Configure a specific connection to a [RealStoreService] instance.
 ///
@@ -28,7 +28,10 @@ pub const TAG: &[u8; 4] = b"REAL";
 #[tarpc::service]
 pub trait RealStoreService {
     /// List files in a directory
-    async fn list(arena: Arena, options: real::Options) -> Result<Vec<SyncedFile>, RealStoreError>;
+    async fn list(
+        arena: Arena,
+        options: RealStoreOptions,
+    ) -> Result<Vec<SyncedFile>, RealStoreError>;
 
     /// Send a byte range of a file.
     async fn send(
@@ -36,7 +39,7 @@ pub trait RealStoreService {
         relative_path: model::Path,
         range: ByteRange,
         data: Vec<u8>,
-        options: real::Options,
+        options: RealStoreOptions,
     ) -> Result<(), RealStoreError>;
 
     /// Read a byte range from a file, returning the data.
@@ -46,14 +49,14 @@ pub trait RealStoreService {
         arena: Arena,
         relative_path: model::Path,
         range: ByteRange,
-        options: real::Options,
+        options: RealStoreOptions,
     ) -> Result<Vec<u8>, RealStoreError>;
 
     /// Mark a partial file as complete
     async fn finish(
         arena: Arena,
         relative_path: model::Path,
-        options: real::Options,
+        options: RealStoreOptions,
     ) -> Result<(), RealStoreError>;
 
     /// Compute a SHA-256 hash of the file at the given path (final or partial).
@@ -61,14 +64,14 @@ pub trait RealStoreService {
         arena: Arena,
         relative_path: model::Path,
         range: ByteRange,
-        options: real::Options,
+        options: RealStoreOptions,
     ) -> Result<Hash, RealStoreError>;
 
     /// Delete the file at the given path (both partial and final forms).
     async fn delete(
         arena: Arena,
         relative_path: model::Path,
-        options: real::Options,
+        options: RealStoreOptions,
     ) -> Result<(), RealStoreError>;
 
     /// Calculate a signature for the file at the given path and byte range.
@@ -76,7 +79,7 @@ pub trait RealStoreService {
         arena: Arena,
         relative_path: model::Path,
         range: ByteRange,
-        options: real::Options,
+        options: RealStoreOptions,
     ) -> Result<Signature, RealStoreError>;
 
     /// Compute a delta from the file at the given path and a given signature.
@@ -87,7 +90,7 @@ pub trait RealStoreService {
         relative_path: model::Path,
         range: ByteRange,
         signature: Signature,
-        options: real::Options,
+        options: RealStoreOptions,
     ) -> Result<(Delta, Hash), RealStoreError>;
 
     /// Apply a delta to the file at the given path and byte range, verifying the hash
@@ -100,7 +103,7 @@ pub trait RealStoreService {
         range: ByteRange,
         delta: Delta,
         hash: Hash,
-        options: real::Options,
+        options: RealStoreOptions,
     ) -> Result<(), RealStoreError>;
 
     /// Truncate file to the given size.
@@ -108,7 +111,7 @@ pub trait RealStoreService {
         arena: Arena,
         relative_path: model::Path,
         file_size: u64,
-        options: real::Options,
+        options: RealStoreOptions,
     ) -> Result<(), RealStoreError>;
 
     /// Configure the service with the given config (e.g., set write rate limit).

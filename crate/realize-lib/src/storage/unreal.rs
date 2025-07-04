@@ -6,13 +6,11 @@ pub use downloader::{Download, Downloader};
 pub use error::UnrealError;
 pub use future::UnrealCacheAsync;
 pub use sync::UnrealCacheBlocking;
-pub use updater::keep_cache_updated;
 
 mod downloader;
 mod error;
 mod future;
 mod sync;
-mod updater;
 #[allow(dead_code)]
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]
