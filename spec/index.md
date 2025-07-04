@@ -11,6 +11,10 @@
 
 4. [The Real](real.md) - Remote and local filesystems overlayed (Linux)
 
+5. [Project Rules and Conventions](conventions.md)
+
+6. [Project Framework and Dependencies](tech.md)
+
 ## Planning
 
 * [Future](future.md) - Future code and spec changes
