@@ -326,7 +326,11 @@ impl RealWatcherWorker {
 
             EventKind::Create(CreateKind::Folder) => {
                 let realpath = ev.paths.last().ok_or(anyhow::anyhow!("No path in event"))?;
-                self.dir_created_or_modified(realpath).await?;
+                let m = fs::symlink_metadata(realpath).await?;
+                // Checking is_dir() because the  folder might actually be a symlink.
+                if m.is_dir() {
+                    self.dir_created_or_modified(realpath).await?;
+                }
             }
 
             EventKind::Create(CreateKind::File) => {
