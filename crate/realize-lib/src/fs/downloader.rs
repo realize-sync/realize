@@ -2,8 +2,9 @@ use crate::model::{Arena, ByteRange, Path, Peer};
 use crate::network::Networking;
 use crate::network::rpc::realstore::client::{ClientOptions, RealStoreClient};
 use crate::network::rpc::realstore::{self};
-use crate::storage::real::{self, RealStoreError};
-use crate::storage::unreal::{FileAvailability, FileVersion, UnrealCacheAsync, UnrealError};
+use crate::storage::{
+    FileAvailability, FileVersion, RealStoreError, RealStoreOptions, UnrealCacheAsync, UnrealError,
+};
 use moka::future::{Cache, CacheBuilder};
 use std::cmp::min;
 use std::collections::VecDeque;
@@ -216,7 +217,7 @@ impl Download {
                         arena,
                         path,
                         range,
-                        real::Options::default(),
+                        RealStoreOptions::default(),
                     )
                     .await
             })
@@ -345,9 +346,7 @@ mod tests {
     use crate::model::{Arena, Path, UnixTime};
     use crate::network::hostport::HostPort;
     use crate::network::{self, Server};
-    use crate::storage::real::RealStore;
-    use crate::storage::real::notifier::Notification;
-    use crate::storage::{self};
+    use crate::storage::{self, Notification, RealStore};
     use crate::utils::hash;
     use assert_fs::TempDir;
     use assert_fs::prelude::{FileWriteBin as _, FileWriteStr as _, PathChild as _};
@@ -373,9 +372,7 @@ mod tests {
             let server = Arc::new(server);
             let addr = server.listen(&HostPort::localhost(0)).await?;
             let networking = network::testing::client_networking(addr)?;
-
-            let mut cache = storage::testing::in_memory_cache()?;
-            cache.add_arena(&arena)?;
+            let cache = storage::testing::in_memory_cache([arena.clone()]).await?;
 
             Ok(Self {
                 tempdir,
@@ -383,7 +380,7 @@ mod tests {
                 _local: local,
                 _server: server,
                 networking,
-                cache: cache.into_async(),
+                cache,
             })
         }
 

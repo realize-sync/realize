@@ -2,14 +2,13 @@ use crate::model::{self, Arena, Hash, Path, UnixTime};
 use crate::utils::holder::{ByteConversionError, ByteConvertible, NamedType};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
-pub use error::UnrealError;
-pub use future::UnrealCacheAsync;
-pub use sync::{FileAvailability, FileVersion, UnrealCacheBlocking};
+use error::UnrealError;
+use future::UnrealCacheAsync;
 use uuid::Uuid;
 
-mod error;
-mod future;
-mod sync;
+pub mod error;
+pub mod future;
+pub mod sync;
 #[allow(dead_code)]
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]
@@ -17,9 +16,6 @@ mod sync;
 mod unreal_capnp {
     include!(concat!(env!("OUT_DIR"), "/unreal_capnp.rs"));
 }
-
-/// Inode of the root dir.
-pub const ROOT_DIR: u64 = 1;
 
 /// An entry in a directory listing.
 #[derive(Debug, Clone, PartialEq)]

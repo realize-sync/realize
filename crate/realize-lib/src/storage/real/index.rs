@@ -334,6 +334,22 @@ impl RealIndexAsync {
         }
     }
 
+    /// Create an inedx using the database at the given path. Create it if necessary.
+    pub async fn open(arena: Arena, path: &path::Path) -> anyhow::Result<Self> {
+        let path = path.to_path_buf();
+
+        task::spawn_blocking(move || {
+            Ok(RealIndexAsync::new(RealIndexBlocking::open(arena, &path)?))
+        })
+        .await?
+    }
+
+    /// Create an index using the given database. Initialize the database if necessary.
+    pub async fn with_db(arena: Arena, db: redb::Database) -> anyhow::Result<Self> {
+        task::spawn_blocking(move || Ok(RealIndexAsync::new(RealIndexBlocking::new(arena, db)?)))
+            .await?
+    }
+
     /// Returns the database UUID.
     ///
     /// A UUID is set when a new database is created.
@@ -362,14 +378,6 @@ impl RealIndexAsync {
         let inner = Arc::clone(&self.inner);
 
         task::spawn_blocking(move || inner.last_history_index()).await?
-    }
-
-    /// Open or create an index at the given path.
-    pub async fn open(arena: Arena, path: &path::Path) -> anyhow::Result<RealIndexAsync> {
-        let path = path.to_path_buf();
-        Ok(Self::new(
-            task::spawn_blocking(move || RealIndexBlocking::open(arena, &path)).await??,
-        ))
     }
 
     /// Return a reference to the underlying blocking instance.

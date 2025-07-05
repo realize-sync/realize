@@ -8,9 +8,7 @@ use super::store_capnp::subscriber::{self, NotifyParams, NotifyResults};
 use crate::model::{Arena, Hash, Path, Peer, UnixTime};
 use crate::network::rate_limit::RateLimitedStream;
 use crate::network::{Networking, Server};
-use crate::storage::real::RealIndexAsync;
-use crate::storage::real::notifier::{self, Notification, Progress};
-use crate::storage::unreal::{UnrealCacheAsync, UnrealError};
+use crate::storage::{Notification, Progress, Storage, UnrealCacheAsync, UnrealError};
 use capnp::capability::Promise;
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
@@ -20,6 +18,7 @@ use futures::io::{BufReader, BufWriter};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -58,12 +57,11 @@ impl Household {
     /// manages it.
     pub fn spawn(
         networking: Networking,
-        cache: Option<UnrealCacheAsync>,
-        indexes: HashMap<Arena, RealIndexAsync>,
+        storage: Arc<Storage>,
     ) -> anyhow::Result<(Self, thread::JoinHandle<()>)> {
         let (tx, rx) = mpsc::unbounded_channel();
         let (broadcast_tx, _) = broadcast::channel(128);
-        let handle = spawn_rpc_thread(networking, cache, indexes, rx, broadcast_tx.clone())?;
+        let handle = spawn_rpc_thread(networking, storage, rx, broadcast_tx.clone())?;
 
         Ok((Self { tx, broadcast_tx }, handle))
     }
@@ -114,8 +112,7 @@ enum HouseholdConnection {
 /// To communicate with the thread, send [HousehholdConnection]s to the channel.
 fn spawn_rpc_thread(
     networking: Networking,
-    cache: Option<UnrealCacheAsync>,
-    indexes: HashMap<Arena, RealIndexAsync>,
+    storage: Arc<Storage>,
     mut rx: mpsc::UnboundedReceiver<HouseholdConnection>,
     broadcast_tx: broadcast::Sender<PeerStatus>,
 ) -> anyhow::Result<thread::JoinHandle<()>> {
@@ -128,7 +125,7 @@ fn spawn_rpc_thread(
     Ok(thread::Builder::new()
         .name("capnprpc".into())
         .spawn(move || {
-            let ctx = AppContext::new(networking, cache, indexes, broadcast_tx, main_rt);
+            let ctx = AppContext::new(networking, storage, broadcast_tx, main_rt);
             let local = LocalSet::new();
 
             local.spawn_local(async move {
@@ -156,8 +153,7 @@ struct TrackedPeerConnections {
 
 struct AppContext {
     networking: Networking,
-    cache: Option<UnrealCacheAsync>,
-    indexes: HashMap<Arena, RealIndexAsync>,
+    storage: Arc<Storage>,
     broadcast_tx: broadcast::Sender<PeerStatus>,
     main_rt: runtime::Handle,
     connections: RefCell<HashMap<Peer, TrackedPeerConnections>>,
@@ -166,15 +162,13 @@ struct AppContext {
 impl AppContext {
     fn new(
         networking: Networking,
-        cache: Option<UnrealCacheAsync>,
-        indexes: HashMap<Arena, RealIndexAsync>,
+        storage: Arc<Storage>,
         broadcast_tx: broadcast::Sender<PeerStatus>,
         main_rt: runtime::Handle,
     ) -> Rc<Self> {
         Rc::new(Self {
             networking,
-            cache,
-            indexes,
+            storage,
             broadcast_tx,
             main_rt,
             connections: RefCell::new(HashMap::new()),
@@ -314,7 +308,7 @@ impl AppContext {
         peer: &Peer,
         client: &mut store::Client,
     ) -> anyhow::Result<()> {
-        let cache = match &self.cache {
+        let cache = match self.storage.cache() {
             None => {
                 return Ok(());
             }
@@ -326,8 +320,9 @@ impl AppContext {
         let arenas = reply.get()?.get_arenas()?;
         let peer_arenas = parse_arena_set(arenas)?;
 
-        let goal_arenas = cache
-            .arenas()
+        let goal_arenas = self
+            .storage
+            .indexed_arenas()
             .filter(|a| peer_arenas.contains(*a))
             .map(|a| a.clone())
             .collect::<Vec<_>>();
@@ -479,8 +474,8 @@ impl store::Server for ConnectedPeerServer {
     fn arenas(&mut self, _: ArenasParams, mut results: ArenasResults) -> Promise<(), capnp::Error> {
         let arenas = self
             .ctx
-            .indexes
-            .keys()
+            .storage
+            .indexed_arenas()
             .map(|a| a.clone())
             .collect::<Vec<_>>();
         let mut list = results.get().init_arenas(arenas.len() as u32);
@@ -506,7 +501,7 @@ impl subscriber::Server for ConnectedPeerServer {
         params: NotifyParams,
         _: NotifyResults,
     ) -> capnp::capability::Promise<(), capnp::Error> {
-        if let Some(cache) = &self.ctx.cache {
+        if let Some(cache) = self.ctx.storage.cache() {
             Promise::from_future(do_notify(
                 cache.clone(),
                 self.ctx.main_rt.clone(),
@@ -620,15 +615,6 @@ async fn do_subscribe(
     let arena = parse_arena(req.get_arena()?)?;
 
     let result = results.get().init_result();
-    let index = match ctx.indexes.get(&arena) {
-        None => {
-            result.init_err().set_message("Not available");
-
-            return Ok(());
-        }
-        Some(index) => index.clone(),
-    };
-
     let progress = if req.has_progress() {
         let progress = req.get_progress()?;
         Some(Progress::new(
@@ -643,10 +629,11 @@ async fn do_subscribe(
 
     let (tx, mut rx) = mpsc::channel(100);
 
+    let storage = ctx.storage.clone();
     if let Err(err) = ctx
         .main_rt
         .spawn(async move {
-            notifier::subscribe(index, tx, progress).await?;
+            storage.subscribe(&arena, tx, progress).await?;
 
             Ok::<(), anyhow::Error>(())
         })
@@ -848,11 +835,15 @@ fn fill_time(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Arena;
     use crate::network::hostport::HostPort;
     use crate::network::testing::TestingPeers;
-    use crate::utils::hash;
-    use crate::{model::Arena, storage};
+    use crate::storage;
+    use assert_fs::TempDir;
+    use assert_fs::prelude::*;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use tokio::fs;
     use tokio::task::LocalSet;
     use tokio_retry::strategy::FixedInterval;
 
@@ -872,29 +863,30 @@ mod tests {
 
     struct Fixture {
         peers: TestingPeers,
-        peer_storage: HashMap<Peer, PeerStorage>,
-    }
-    struct PeerStorage {
-        cache: UnrealCacheAsync,
-        index: RealIndexAsync,
+        peer_storage: HashMap<Peer, Arc<Storage>>,
+        tempdir: TempDir,
     }
     impl Fixture {
         async fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
 
+            let tempdir = TempDir::new()?;
             let mut peer_storage = HashMap::new();
             for peer in [a(), b(), c()] {
-                let mut cache = storage::testing::in_memory_cache()?;
-                cache.add_arena(&test_arena())?;
-                let cache = cache.into_async();
-                let index = storage::testing::in_memory_index(test_arena())?.into_async();
-
-                peer_storage.insert(peer, PeerStorage { cache, index });
+                let s =
+                    storage::testing::storage(tempdir.child(peer.as_str()).path(), [test_arena()])
+                        .await?;
+                peer_storage.insert(peer, s);
             }
             Ok(Self {
                 peers: TestingPeers::new()?,
                 peer_storage,
+                tempdir,
             })
+        }
+
+        fn arena_root(&self, peer: &Peer) -> PathBuf {
+            storage::testing::arena_root(self.tempdir.child(peer.as_str()).path(), &test_arena())
         }
 
         fn household(&self, peer: &Peer) -> anyhow::Result<(Household, thread::JoinHandle<()>)> {
@@ -903,11 +895,7 @@ mod tests {
                 .get(peer)
                 .ok_or_else(|| anyhow::anyhow!("unknown peer: {peer}"))?;
 
-            Household::spawn(
-                self.peers.networking(peer)?,
-                Some(storage.cache.clone()),
-                HashMap::from([(test_arena(), storage.index.clone())]),
-            )
+            Household::spawn(self.peers.networking(peer)?, storage.clone())
         }
 
         async fn run_server(
@@ -1084,26 +1072,19 @@ mod tests {
         let _server_b = fixture.run_server(b, &household_b).await?;
         household_a.keep_connected()?;
 
-        // A file added to index B should eventually become accessible
-        // from cache A.
-        let a_cache = &fixture.peer_storage.get(a).unwrap().cache;
-        let b_index = &fixture.peer_storage.get(b).unwrap().index;
-
-        let bar = Path::parse("bar.txt")?;
-        let mtime = UnixTime::from_secs(1234567890);
-        b_index
-            .add_file(&bar, 4, &mtime, hash::digest("test"))
-            .await?;
-
-        let root = a_cache.arena_root(&test_arena())?;
+        // A file created in B's arena should eventually become
+        // available in cache A.
+        let b_dir = fixture.arena_root(&b);
+        fs::write(&b_dir.join("bar.txt"), b"test").await?;
 
         let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
-        while a_cache.lookup(root, "bar.txt").await.is_err() {
+        let a_cache = &fixture.peer_storage.get(a).unwrap().cache().unwrap();
+        let arena_inode = a_cache.arena_root(&test_arena())?;
+        while a_cache.lookup(arena_inode, "bar.txt").await.is_err() {
             if let Some(delay) = retry.next() {
                 tokio::time::sleep(delay).await;
-                continue;
             } else {
-                panic!("bar.txt was never added to b");
+                panic!("bar.txt was never added to the cache");
             }
         }
 

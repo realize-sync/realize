@@ -165,7 +165,7 @@ mod tests {
     use crate::network::rpc::realstore::Config;
     use crate::network::security::{PeerVerifier, RawPublicKeyResolver};
     use crate::network::{Server, testing};
-    use crate::storage::real::{self, RealStore};
+    use crate::storage::{RealStore, RealStoreOptions};
     use crate::utils::async_utils::AbortOnDrop;
     use assert_fs::TempDir;
     use std::net::SocketAddr;
@@ -250,7 +250,7 @@ mod tests {
             .list(
                 context::current(),
                 Arena::from("testdir"),
-                real::Options::default(),
+                RealStoreOptions::default(),
             )
             .await??;
         assert!(list.is_empty());
@@ -327,7 +327,7 @@ mod tests {
             .list(
                 context::current(),
                 Arena::from("testdir"),
-                real::Options::default(),
+                RealStoreOptions::default(),
             )
             .await??;
         shutdown.send(())?;
@@ -335,7 +335,7 @@ mod tests {
             .list(
                 context::current(),
                 Arena::from("testdir"),
-                real::Options::default(),
+                RealStoreOptions::default(),
             )
             .await??;
         assert_eq!(connection_count.load(Ordering::Relaxed), 2);
@@ -418,7 +418,7 @@ mod tests {
             .list(
                 context::current(),
                 Arena::from("testdir"),
-                real::Options::default(),
+                RealStoreOptions::default(),
             )
             .await??;
         shutdown.send(())?;
@@ -426,7 +426,7 @@ mod tests {
             .list(
                 context::current(),
                 Arena::from("testdir"),
-                real::Options::default(),
+                RealStoreOptions::default(),
             )
             .await??;
         drop(client); // also closes conn_tx

@@ -1,62 +1,62 @@
 use super::config::Config;
 use crate::fs::downloader::Downloader;
+use crate::fs::nfs;
 use crate::model::Arena;
 use crate::network::rpc::{Household, realstore};
 use crate::network::{Networking, Server};
+use crate::storage::Storage;
 use crate::storage::config::ArenaConfig;
-use crate::storage::real::RealStore;
-use crate::storage::unreal::UnrealCacheAsync;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-pub struct Setup {
+pub struct SetupHelper {
     networking: Networking,
-    config: Config,
-    cache: Option<UnrealCacheAsync>,
+    storage: Arc<Storage>,
 }
 
-impl Setup {
-    pub fn new(config: Config, privkey: &std::path::Path) -> anyhow::Result<Self> {
+impl SetupHelper {
+    pub async fn setup(config: Config, privkey: &std::path::Path) -> anyhow::Result<Self> {
+        check_directory_access(&config.storage.arenas)?;
+
         let networking = Networking::from_config(&config.network.peers, privkey)?;
+        let storage = Storage::from_config(&config.storage).await?;
 
         Ok(Self {
             networking,
-            config,
-            cache: None,
+            storage,
         })
     }
 
-    /// Setup cache as specified in the configuration.
+    /// Export NFS at the given address.
     ///
-    /// The content of the returned cache is kept up-to-date as much as
-    /// possible by connecting to other peers to track changes.
-    pub fn setup_cache(&mut self) -> anyhow::Result<(UnrealCacheAsync, Downloader)> {
-        let cache = UnrealCacheAsync::from_config(&self.config.storage)?;
+    /// A local cache must be configured.
+    pub async fn export_nfs(&self, addr: SocketAddr) -> anyhow::Result<()> {
+        let cache = self
+            .storage
+            .cache()
+            .ok_or_else(|| anyhow::anyhow!("cache.db must be set in the configuration"))?;
         let downloader = Downloader::new(self.networking.clone(), cache.clone());
 
-        self.cache = Some(cache.clone());
+        nfs::export(cache.clone(), downloader, addr).await?;
 
-        Ok((cache, downloader))
+        Ok(())
     }
 
     /// Setup server as specified in the configuration.
     ///
     /// The returned server is configured, but not started.
-    pub fn setup_server(self) -> anyhow::Result<Arc<Server>> {
-        check_directory_access(&self.config.storage.arenas)?;
-        let Setup {
+    pub async fn setup_server(self) -> anyhow::Result<Arc<Server>> {
+        let SetupHelper {
             networking,
-            config,
-            cache,
+            storage,
         } = self;
 
-        let store = RealStore::from_config(&config.storage.arenas);
-
         let mut server = Server::new(networking.clone());
-        realstore::server::register(&mut server, store.clone());
+        realstore::server::register(&mut server, storage.store().clone());
 
-        let has_cache = cache.is_some();
-        let (household, _) = Household::spawn(networking, cache, HashMap::new())?;
+        let has_cache = storage.cache().is_some();
+        let (household, _) = Household::spawn(networking, storage)?;
         if has_cache {
             household.keep_connected()?;
         }

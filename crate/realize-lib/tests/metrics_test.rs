@@ -8,8 +8,8 @@ use realize_lib::logic::consensus::movedirs::{
 };
 use realize_lib::model::Arena;
 use realize_lib::network::rpc::realstore::server::{self, InProcessRealStoreServiceClient};
-use realize_lib::storage::real;
-use realize_lib::storage::real::RealStore;
+use realize_lib::storage::RealStore;
+use realize_lib::storage::RealStoreOptions;
 
 // Metric tests are kept in their own binary to avoid other test
 // running in parallel interfering with the counts.
@@ -29,7 +29,7 @@ async fn client_success_call_count() -> anyhow::Result<()> {
         .list(
             tarpc::context::current(),
             arena.clone(),
-            real::Options::default(),
+            RealStoreOptions::default(),
         )
         .await??;
     let after = get_metric_value(
@@ -57,7 +57,7 @@ async fn client_error_call_count() -> anyhow::Result<()> {
             .list(
                 tarpc::context::current(),
                 Arena::from("doesnotexist"),
-                real::Options::default(),
+                RealStoreOptions::default(),
             )
             .await?
             .is_err()
@@ -86,7 +86,7 @@ async fn server_success_call_count() -> anyhow::Result<()> {
         .list(
             tarpc::context::current(),
             arena.clone(),
-            real::Options::default(),
+            RealStoreOptions::default(),
         )
         .await??;
     let after_srv = get_metric_value(
@@ -114,7 +114,7 @@ async fn server_error_call_count() -> anyhow::Result<()> {
             .list(
                 tarpc::context::current(),
                 Arena::from("doesnotexist"),
-                real::Options::default(),
+                RealStoreOptions::default(),
             )
             .await?
             .is_err()

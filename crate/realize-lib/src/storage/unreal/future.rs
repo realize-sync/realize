@@ -1,6 +1,6 @@
-use super::{
-    FileAvailability, FileMetadata, InodeAssignment, ReadDirEntry, UnrealCacheBlocking, UnrealError,
-};
+use super::error::UnrealError;
+use super::sync::{FileAvailability, UnrealCacheBlocking};
+use super::{FileMetadata, InodeAssignment, ReadDirEntry};
 use crate::model::{Arena, Path, Peer, UnixTime};
 use crate::storage::config::StorageConfig;
 use crate::storage::real::notifier::{Notification, Progress};
@@ -14,17 +14,21 @@ pub struct UnrealCacheAsync {
 }
 
 impl UnrealCacheAsync {
+    /// Inode of the root dir.
+    pub const ROOT_DIR: u64 = UnrealCacheBlocking::ROOT_DIR;
+
     /// Create and configure a cache from configuration.
-    pub fn from_config(config: &StorageConfig) -> anyhow::Result<Self> {
-        let cache_config = config
-            .cache
-            .as_ref()
-            .ok_or(anyhow::anyhow!("cache section missing from config file"))?;
-        let mut cache = UnrealCacheBlocking::open(&cache_config.db)?;
-        for arena in config.arenas.keys() {
-            cache.add_arena(arena)?;
+    pub fn from_config(config: &StorageConfig) -> anyhow::Result<Option<Self>> {
+        match &config.cache {
+            None => Ok(None),
+            Some(cache_config) => {
+                let mut cache = UnrealCacheBlocking::open(&cache_config.db)?;
+                for arena in config.arenas.keys() {
+                    cache.add_arena(arena)?;
+                }
+                Ok(Some(cache.into_async()))
+            }
         }
-        Ok(cache.into_async())
     }
 
     /// Create a new cache from a blocking one.
@@ -35,11 +39,37 @@ impl UnrealCacheAsync {
     }
 
     /// Create a new cache with the database at the given path.
-    pub async fn open(path: &path::Path) -> Result<Self, UnrealError> {
+    pub async fn open<T>(arenas: T, path: &path::Path) -> Result<Self, anyhow::Error>
+    where
+        T: IntoIterator<Item = Arena> + Send + 'static,
+    {
         let path = path.to_path_buf();
-        Ok(Self::new(
-            task::spawn_blocking(move || UnrealCacheBlocking::open(&path)).await??,
-        ))
+
+        task::spawn_blocking(move || {
+            let mut cache = UnrealCacheBlocking::open(&path)?;
+            for arena in arenas.into_iter() {
+                cache.add_arena(&arena)?;
+            }
+
+            Ok::<_, anyhow::Error>(Self::new(cache))
+        })
+        .await?
+    }
+
+    /// Create a new cache with the database at the given path.
+    pub async fn with_db<T>(arenas: T, db: redb::Database) -> Result<Self, anyhow::Error>
+    where
+        T: IntoIterator<Item = Arena> + Send + 'static,
+    {
+        task::spawn_blocking(move || {
+            let mut cache = UnrealCacheBlocking::new(db)?;
+            for arena in arenas.into_iter() {
+                cache.add_arena(&arena)?;
+            }
+
+            Ok::<_, anyhow::Error>(Self::new(cache))
+        })
+        .await?
     }
 
     /// Return a reference on the blocking cache.

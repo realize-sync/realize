@@ -3,8 +3,8 @@
 //! See `spec/unreal.md` for details.
 
 use super::{
-    DirTableEntry, FileMetadata, FileTableEntry, InodeAssignment, PeerTableEntry, ROOT_DIR,
-    ReadDirEntry, UnrealCacheAsync, UnrealError,
+    DirTableEntry, FileMetadata, FileTableEntry, InodeAssignment, PeerTableEntry, ReadDirEntry,
+    UnrealCacheAsync, UnrealError,
 };
 use crate::model::{Arena, Hash, Path, Peer, UnixTime};
 use crate::storage::real::notifier::{Notification, Progress};
@@ -117,6 +117,9 @@ pub struct FileVersion {
 }
 
 impl UnrealCacheBlocking {
+    /// Inode of the root dir.
+    pub const ROOT_DIR: u64 = 1;
+
     /// Create a new UnrealCache from a redb database.
     pub fn new(db: Database) -> Result<Self, UnrealError> {
         {
@@ -406,7 +409,7 @@ fn do_dir_mtime(txn: &ReadTransaction, inode: u64) -> Result<UnixTime, UnrealErr
             }
         }
         None => {
-            if inode == ROOT_DIR {
+            if inode == UnrealCacheBlocking::ROOT_DIR {
                 // When the filesystem is empty, the root dir might not
                 // have a mtime. This is not an error.
                 return Ok(UnixTime::ZERO);
@@ -459,7 +462,7 @@ fn do_add_arena(txn: &WriteTransaction, arena: &Arena) -> anyhow::Result<u64> {
     let inode = do_mkdirs(
         txn,
         &mut dir_table,
-        ROOT_DIR,
+        UnrealCacheBlocking::ROOT_DIR,
         // TODO: constrain arena names to valid paths at creation, to get earlier error
         &Some(Path::parse(arena.as_str())?),
     )?;
@@ -721,7 +724,7 @@ fn alloc_inode(txn: &WriteTransaction) -> Result<u64, UnrealError> {
     let max_inode = if let Some(v) = table.get(())? {
         v.value()
     } else {
-        ROOT_DIR
+        UnrealCacheBlocking::ROOT_DIR
     };
     let inode = max_inode + 1;
     table.insert((), inode)?;
@@ -954,7 +957,9 @@ mod tests {
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-        let entry = dir_table.get((ROOT_DIR, "test_arena"))?.unwrap();
+        let entry = dir_table
+            .get((UnrealCacheBlocking::ROOT_DIR, "test_arena"))?
+            .unwrap();
         let entry = match entry.value().parse()? {
             DirTableEntry::Dot(_) => panic!("Unexpected dot entry"),
             DirTableEntry::Regular(e) => e,
@@ -1026,7 +1031,9 @@ mod tests {
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-        let dir_entry = dir_table.get((ROOT_DIR, "test_arena"))?.unwrap();
+        let dir_entry = dir_table
+            .get((UnrealCacheBlocking::ROOT_DIR, "test_arena"))?
+            .unwrap();
         let dir_entry = match dir_entry.value().parse()? {
             DirTableEntry::Dot(_) => panic!("Unexpected dot entry"),
             DirTableEntry::Regular(e) => e,
@@ -1115,7 +1122,11 @@ mod tests {
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-        assert!(dir_table.get((ROOT_DIR, "file.txt"))?.is_none());
+        assert!(
+            dir_table
+                .get((UnrealCacheBlocking::ROOT_DIR, "file.txt"))?
+                .is_none()
+        );
 
         Ok(())
     }
@@ -1156,7 +1167,9 @@ mod tests {
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-        let dir_entry = dir_table.get((ROOT_DIR, "test_arena"))?.unwrap();
+        let dir_entry = dir_table
+            .get((UnrealCacheBlocking::ROOT_DIR, "test_arena"))?
+            .unwrap();
         let dir_entry = match dir_entry.value().parse()? {
             DirTableEntry::Dot(_) => panic!("Unexpected dot entry"),
             DirTableEntry::Regular(e) => e,
@@ -1197,7 +1210,7 @@ mod tests {
         let cache = &fixture.cache;
 
         assert!(matches!(
-            cache.lookup(ROOT_DIR, "nonexistent"),
+            cache.lookup(UnrealCacheBlocking::ROOT_DIR, "nonexistent"),
             Err(UnrealError::NotFound),
         ));
 
@@ -1238,13 +1251,13 @@ mod tests {
         assert_unordered::assert_eq_unordered!(
             vec![(arena.to_string(), InodeAssignment::Directory),],
             cache
-                .readdir(ROOT_DIR)?
+                .readdir(UnrealCacheBlocking::ROOT_DIR)?
                 .into_iter()
                 .map(|(name, entry)| (name, entry.assignment))
                 .collect::<Vec<_>>(),
         );
 
-        let dir_entry = cache.lookup(ROOT_DIR, arena.as_str())?;
+        let dir_entry = cache.lookup(UnrealCacheBlocking::ROOT_DIR, arena.as_str())?;
         assert_unordered::assert_eq_unordered!(
             vec![("dir".to_string(), InodeAssignment::Directory),],
             cache
@@ -1518,7 +1531,7 @@ mod tests {
 
         // File1 should have been deleted, since it was only on peer1,
         assert!(matches!(
-            cache.lookup(ROOT_DIR, file1.name()),
+            cache.lookup(UnrealCacheBlocking::ROOT_DIR, file1.name()),
             Err(UnrealError::NotFound)
         ));
         // File2 and 3 should still be available, from other peers

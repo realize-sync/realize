@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
-use tokio::sync::mpsc;
 use tokio::task::JoinError;
 use walkdir::WalkDir;
 
@@ -88,47 +87,6 @@ impl RealStore {
     /// Returns the arenas configured in this store.
     pub fn arenas(&self) -> Vec<Arena> {
         self.map.keys().cloned().collect()
-    }
-
-    /// Subscribe to notification for the given arena.
-    ///
-    /// If the arena is unknown, do nothing and return false. This is
-    /// not considered an error.
-    ///
-    /// Dropping the receiver drops the subscription.
-    ///
-    /// Does nothing if the arena is unknown.
-    ///
-    /// All required inotify watches are guaranteed to have been
-    /// created when this function returns true, so any changes after
-    /// that will be caught. Note that this might take some time as
-    /// creating watches requires going through the whole arena, so
-    /// use a join if you need to subscribe to multiple arenas at the
-    /// same time.
-    #[cfg(target_os = "linux")]
-    pub fn subscribe(
-        &self,
-        arena: Arena,
-        tx: mpsc::Sender<super::Notification>,
-        catchup: bool,
-    ) -> anyhow::Result<bool> {
-        if let Some(resolver) = self.path_resolver(&arena, StorageAccess::Read) {
-            super::history::subscribe(&arena, resolver, tx, catchup)?;
-
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub fn subscribe(
-        &self,
-        _arena: Arena,
-        _tx: mpsc::Sender<super::Notification>,
-        _catchup: bool,
-    ) -> anyhow::Result<bool> {
-        Err(anyhow::anyhow!("Not available on this OS"))
     }
 
     /// List files in a directory

@@ -11,8 +11,8 @@ use realize_lib::network::Networking;
 use realize_lib::network::config::PeerConfig;
 use realize_lib::network::rpc::realstore;
 use realize_lib::network::rpc::realstore::client::ClientOptions;
+use realize_lib::storage::RealStoreOptions;
 use realize_lib::storage::config::{ArenaConfig, CacheConfig};
-use realize_lib::storage::real;
 use reqwest::Client;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -60,6 +60,7 @@ impl Fixture {
             arena.clone(),
             ArenaConfig {
                 path: testdir.to_path_buf(),
+                index: None,
             },
         );
 
@@ -145,7 +146,7 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
         .list(
             context::current(),
             Arena::from("testdir"),
-            real::Options::default(),
+            RealStoreOptions::default(),
         )
         .await??;
     assert_unordered::assert_eq_unordered!(

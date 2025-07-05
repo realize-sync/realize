@@ -12,8 +12,8 @@ use crate::network::rpc::realstore::{
     Config, RealStoreService, RealStoreServiceClient, RealStoreServiceRequest,
     RealStoreServiceResponse,
 };
-use crate::storage::real;
-use crate::storage::real::{RealStore, RealStoreError, SyncedFile};
+use crate::storage::RealStoreOptions;
+use crate::storage::{RealStore, RealStoreError, SyncedFile};
 use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
 use futures::StreamExt;
@@ -111,7 +111,7 @@ impl RealStoreService for RealStoreServer {
         self,
         _: tarpc::context::Context,
         arena: Arena,
-        options: real::Options,
+        options: RealStoreOptions,
     ) -> Result<Vec<SyncedFile>, RealStoreError> {
         self.store.list(&arena, &options).await
     }
@@ -122,7 +122,7 @@ impl RealStoreService for RealStoreServer {
         arena: Arena,
         relative_path: model::Path,
         range: ByteRange,
-        options: real::Options,
+        options: RealStoreOptions,
     ) -> Result<Vec<u8>, RealStoreError> {
         self.store
             .read(&arena, &relative_path, &range, &options)
@@ -136,7 +136,7 @@ impl RealStoreService for RealStoreServer {
         relative_path: model::Path,
         range: ByteRange,
         data: Vec<u8>,
-        options: real::Options,
+        options: RealStoreOptions,
     ) -> Result<(), RealStoreError> {
         self.store
             .send(&arena, &relative_path, &range, data, &options)
@@ -148,7 +148,7 @@ impl RealStoreService for RealStoreServer {
         _: tarpc::context::Context,
         arena: Arena,
         relative_path: model::Path,
-        options: real::Options,
+        options: RealStoreOptions,
     ) -> Result<(), RealStoreError> {
         self.store.finish(&arena, &relative_path, &options).await
     }
@@ -159,7 +159,7 @@ impl RealStoreService for RealStoreServer {
         arena: Arena,
         relative_path: model::Path,
         range: ByteRange,
-        options: real::Options,
+        options: RealStoreOptions,
     ) -> Result<Hash, RealStoreError> {
         self.store
             .hash(&arena, &relative_path, &range, &options)
@@ -171,7 +171,7 @@ impl RealStoreService for RealStoreServer {
         _ctx: tarpc::context::Context,
         arena: Arena,
         relative_path: model::Path,
-        options: real::Options,
+        options: RealStoreOptions,
     ) -> Result<(), RealStoreError> {
         self.store.delete(&arena, &relative_path, &options).await
     }
@@ -182,7 +182,7 @@ impl RealStoreService for RealStoreServer {
         arena: Arena,
         relative_path: model::Path,
         range: ByteRange,
-        options: real::Options,
+        options: RealStoreOptions,
     ) -> Result<crate::model::Signature, RealStoreError> {
         self.store
             .calculate_signature(&arena, &relative_path, &range, &options)
@@ -196,7 +196,7 @@ impl RealStoreService for RealStoreServer {
         relative_path: model::Path,
         range: ByteRange,
         signature: crate::model::Signature,
-        options: real::Options,
+        options: RealStoreOptions,
     ) -> Result<(crate::model::Delta, Hash), RealStoreError> {
         self.store
             .diff(&arena, &relative_path, &range, signature, &options)
@@ -211,7 +211,7 @@ impl RealStoreService for RealStoreServer {
         range: ByteRange,
         delta: crate::model::Delta,
         hash: Hash,
-        options: real::Options,
+        options: RealStoreOptions,
     ) -> Result<(), RealStoreError> {
         self.store
             .apply_delta(&arena, &relative_path, &range, delta, &hash, &options)
@@ -224,7 +224,7 @@ impl RealStoreService for RealStoreServer {
         arena: Arena,
         relative_path: model::Path,
         file_size: u64,
-        options: real::Options,
+        options: RealStoreOptions,
     ) -> Result<(), RealStoreError> {
         self.store
             .truncate(&arena, &relative_path, file_size, &options)
@@ -267,7 +267,7 @@ mod tests {
             .list(
                 tarpc::context::current(),
                 Arena::from("testdir"),
-                real::Options::default(),
+                RealStoreOptions::default(),
             )
             .await??;
         assert_eq!(list.len(), 0);

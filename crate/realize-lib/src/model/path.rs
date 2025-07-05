@@ -45,6 +45,15 @@ impl Path {
         Path::parse(path.to_str().ok_or(PathError::InvalidPath)?)
     }
 
+    /// Build a path from the given path, relative to the given root.
+    ///
+    /// For this to work, te given path must be inside the given root.
+    pub fn from_real_path_in(path: &path::Path, root: &path::Path) -> Result<Path, PathError> {
+        let relative = pathdiff::diff_paths(&path, root).ok_or(PathError::InvalidPath)?;
+
+        Path::from_real_path(&relative)
+    }
+
     /// The name part of the path, without any parent element.
     ///
     /// This is the last and possibly only element of a

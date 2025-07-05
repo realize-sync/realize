@@ -4,9 +4,8 @@ use anyhow::Context as _;
 use clap::Parser;
 use futures_util::stream::StreamExt as _;
 use prometheus::{IntCounter, register_int_counter};
-use realize_lib::fs::nfs;
 use realize_lib::logic::config::Config;
-use realize_lib::logic::setup::Setup;
+use realize_lib::logic::setup::SetupHelper;
 use realize_lib::network::hostport::HostPort;
 use realize_lib::network::rpc::realstore::metrics;
 use realize_lib::utils::logging;
@@ -67,7 +66,7 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
     let config = parse_config(&cli.config)
         .with_context(|| format!("{}: failed to read TOML config file", cli.config.display()))?;
 
-    let mut setup = Setup::new(config, &cli.privkey)?;
+    let setup = SetupHelper::setup(config, &cli.privkey).await?;
 
     if let Some(addr) = &cli.metrics_addr {
         metrics::export_metrics(addr)
@@ -77,23 +76,21 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
     }
 
     if let Some(addr) = &cli.nfs {
-        let (cache, downloader) = setup.setup_cache()?;
-        nfs::export(
-            cache,
-            downloader,
-            HostPort::parse(addr)
-                .await
-                .with_context(|| format!("Failed to parse --nfs {addr}"))?
-                .addr(),
-        )
-        .await?;
+        setup
+            .export_nfs(
+                HostPort::parse(addr)
+                    .await
+                    .with_context(|| format!("Failed to parse --nfs {addr}"))?
+                    .addr(),
+            )
+            .await?;
     }
 
     let hostport = HostPort::parse(&cli.address)
         .await
         .with_context(|| format!("Failed to parse --address {}", cli.address))?;
     log::debug!("Starting server on {}/{:?}...", hostport, hostport.addr());
-    let server = setup.setup_server()?;
+    let server = setup.setup_server().await?;
 
     let addr = server
         .listen(&hostport)

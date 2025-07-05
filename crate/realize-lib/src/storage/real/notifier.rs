@@ -354,12 +354,9 @@ async fn send_notifications(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use crate::storage::testing;
-    use crate::utils::hash;
-
     use super::*;
+    use crate::utils::hash;
+    use std::time::Duration;
 
     fn test_arena() -> Arena {
         Arena::from("myarena")
@@ -371,9 +368,14 @@ mod tests {
     }
 
     impl Fixture {
-        fn setup() -> anyhow::Result<Self> {
+        async fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
-            let index = testing::in_memory_index(test_arena())?.into_async();
+            let index = RealIndexAsync::with_db(
+                test_arena(),
+                redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?,
+            )
+            .await?;
+
             Ok(Self {
                 index,
                 current_time: UnixTime::from_secs(1234567890),
@@ -484,7 +486,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_notification() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+        let fixture = Fixture::setup().await?;
 
         let rx = fixture.subscribe().await?;
         let foo = fixture.add("foo", "foofoo").await?;
@@ -517,7 +519,7 @@ mod tests {
 
     #[tokio::test]
     async fn replace_notification() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup()?;
+        let mut fixture = Fixture::setup().await?;
 
         let mut rx = fixture.subscribe().await?;
         let foo = fixture.add("foo", "foo").await?;
@@ -556,7 +558,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_notification() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+        let fixture = Fixture::setup().await?;
 
         let mut rx = fixture.subscribe().await?;
 
@@ -589,7 +591,7 @@ mod tests {
 
     #[tokio::test]
     async fn catchup_then_continue() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+        let fixture = Fixture::setup().await?;
 
         let foo = fixture.add("foo", "foo").await?;
 
@@ -639,7 +641,7 @@ mod tests {
 
     #[tokio::test]
     async fn continue_after_resubscribing() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+        let fixture = Fixture::setup().await?;
 
         fixture.add("foo", "foo").await?;
         let bar = fixture.add("bar", "bar").await?;
@@ -663,7 +665,7 @@ mod tests {
 
     #[tokio::test]
     async fn continue_after_file_modified_multiple_times() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+        let fixture = Fixture::setup().await?;
 
         let foo = fixture.add("foo", "1").await?;
         fixture.add("foo", "2").await?;

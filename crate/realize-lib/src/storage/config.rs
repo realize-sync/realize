@@ -34,10 +34,19 @@ pub struct ArenaConfig {
     ///
     /// That directory must be writable by the current user.
     pub path: PathBuf,
+
+    /// Configures the local index.
+    pub index: Option<IndexConfig>,
 }
 
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
 pub struct CacheConfig {
     /// Path to the cache database.
+    pub db: PathBuf,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
+pub struct IndexConfig {
+    /// Path to the index database.
     pub db: PathBuf,
 }

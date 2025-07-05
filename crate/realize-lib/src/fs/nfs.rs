@@ -1,6 +1,6 @@
 use super::downloader::{Download, Downloader};
 use crate::model::UnixTime;
-use crate::storage::unreal::{self, FileMetadata, InodeAssignment, UnrealCacheAsync, UnrealError};
+use crate::storage::{FileMetadata, InodeAssignment, UnrealCacheAsync, UnrealError};
 use async_trait::async_trait;
 use moka::future::Cache;
 use nfsserve::nfs::{
@@ -171,7 +171,7 @@ impl UnrealFs {
 #[async_trait]
 impl NFSFileSystem for UnrealFs {
     fn root_dir(&self) -> fileid3 {
-        unreal::ROOT_DIR
+        UnrealCacheAsync::ROOT_DIR
     }
 
     fn capabilities(&self) -> VFSCapabilities {
@@ -348,9 +348,7 @@ mod tests {
     use crate::network::hostport::HostPort;
     use crate::network::rpc::realstore;
     use crate::network::{self, Server};
-    use crate::storage::real::RealStore;
-    use crate::storage::real::notifier::Notification;
-    use crate::storage::{self};
+    use crate::storage::{self, Notification, RealStore};
     use assert_fs::TempDir;
     use assert_fs::prelude::{FileWriteStr as _, PathChild as _};
     use nfsserve::nfs::nfsstring;
@@ -376,11 +374,7 @@ mod tests {
             let server = Arc::new(server);
             let addr = server.listen(&HostPort::localhost(0)).await?;
             let networking = network::testing::client_networking(addr)?;
-
-            let mut cache = storage::testing::in_memory_cache()?;
-            cache.add_arena(&arena)?;
-            let cache = cache.into_async();
-
+            let cache = storage::testing::in_memory_cache([arena.clone()]).await?;
             let fs = UnrealFs::new(cache.clone(), Downloader::new(networking, cache.clone()));
 
             Ok(Self {
@@ -399,9 +393,12 @@ mod tests {
         let fixture = Fixture::setup().await?;
         let fs = &fixture.fs;
 
-        assert_eq!(unreal::ROOT_DIR, fs.root_dir());
+        assert_eq!(UnrealCacheAsync::ROOT_DIR, fs.root_dir());
 
-        let attrs = fs.getattr(unreal::ROOT_DIR).await.map_err(to_anyhow)?;
+        let attrs = fs
+            .getattr(UnrealCacheAsync::ROOT_DIR)
+            .await
+            .map_err(to_anyhow)?;
         assert_eq!(0o0550, attrs.mode);
         assert_eq!(nix::unistd::getuid().as_raw(), attrs.uid);
         assert_eq!(nix::unistd::getgid().as_raw(), attrs.gid);
@@ -417,7 +414,10 @@ mod tests {
         let fs = &fixture.fs;
 
         let arena_root = fs
-            .lookup(unreal::ROOT_DIR, &nfsstring::from("test".as_bytes()))
+            .lookup(
+                UnrealCacheAsync::ROOT_DIR,
+                &nfsstring::from("test".as_bytes()),
+            )
             .await
             .map_err(to_anyhow)?;
         assert_eq!(fixture.cache.arena_root(&fixture.arena)?, arena_root);
