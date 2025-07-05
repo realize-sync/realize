@@ -107,6 +107,15 @@ pub enum Notification {
         /// Content is complete up to this notification index.
         index: u64,
     },
+
+    Connected {
+        /// Containing arena.
+        arena: Arena,
+
+        /// UUID of the peer's store. This should be stored to
+        /// generate [Progress].
+        uuid: Uuid,
+    },
 }
 
 impl Notification {
@@ -118,6 +127,7 @@ impl Notification {
             Notification::CatchupStart(arena) => arena,
             Notification::Catchup { arena, .. } => arena,
             Notification::CatchupComplete { arena, .. } => arena,
+            Notification::Connected { arena, .. } => arena,
         }
     }
     fn path(&self) -> Option<&Path> {
@@ -128,6 +138,7 @@ impl Notification {
             Notification::CatchupStart(_) => None,
             Notification::Catchup { path, .. } => Some(path),
             Notification::CatchupComplete { .. } => None,
+            Notification::Connected { .. } => None,
         }
     }
     fn index(&self) -> Option<u64> {
@@ -138,6 +149,7 @@ impl Notification {
             Notification::CatchupStart(_) => None,
             Notification::Catchup { .. } => None,
             Notification::CatchupComplete { index, .. } => Some(*index),
+            Notification::Connected { .. } => None,
         }
     }
 }
@@ -161,7 +173,7 @@ pub struct Progress {
 
 impl Progress {
     /// A new progress instance.
-    fn new(uuid: Uuid, last_seen: u64) -> Self {
+    pub fn new(uuid: Uuid, last_seen: u64) -> Self {
         Self { uuid, last_seen }
     }
 }
@@ -184,6 +196,12 @@ pub async fn subscribe(
     } else {
         0
     };
+
+    tx.send(Notification::Connected {
+        arena: index.arena().clone(),
+        uuid: index.uuid().clone(),
+    })
+    .await?;
 
     let mut watch_rx = index.watch_history();
     let current = *watch_rx.borrow_and_update();
@@ -371,8 +389,9 @@ mod tests {
         }
 
         async fn subscribe(&self) -> anyhow::Result<mpsc::Receiver<Notification>> {
-            let (tx, rx) = mpsc::channel(128);
+            let (tx, mut rx) = mpsc::channel(128);
             subscribe(self.index.clone(), tx, None).await?;
+            self.expect_connected(&mut rx).await?;
 
             Ok(rx)
         }
@@ -381,15 +400,31 @@ mod tests {
             &self,
             index: u64,
         ) -> anyhow::Result<mpsc::Receiver<Notification>> {
-            let (tx, rx) = mpsc::channel(128);
+            let (tx, mut rx) = mpsc::channel(128);
             subscribe(
                 self.index.clone(),
                 tx,
                 Some(Progress::new(self.index.uuid().clone(), index)),
             )
             .await?;
+            self.expect_connected(&mut rx).await?;
 
             Ok(rx)
+        }
+
+        async fn expect_connected(
+            &self,
+            rx: &mut mpsc::Receiver<Notification>,
+        ) -> anyhow::Result<()> {
+            assert_eq!(
+                Notification::Connected {
+                    arena: test_arena(),
+                    uuid: self.index.uuid().clone()
+                },
+                next(rx, "connected").await?
+            );
+
+            Ok(())
         }
 
         async fn add(&self, path: &str, content: &str) -> anyhow::Result<Path> {
@@ -484,34 +519,36 @@ mod tests {
     async fn replace_notification() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup()?;
 
-        let rx = fixture.subscribe().await?;
+        let mut rx = fixture.subscribe().await?;
         let foo = fixture.add("foo", "foo").await?;
         let foo_mtime = fixture.now();
+
+        assert_eq!(
+            Notification::Add {
+                arena: test_arena(),
+                index: 1,
+                path: foo.clone(),
+                size: 3,
+                mtime: foo_mtime,
+                hash: hash::digest("foo")
+            },
+            next(&mut rx, "add").await?
+        );
 
         fixture.increment_time(10);
         fixture.add("foo", "foobar").await?;
 
         assert_eq!(
-            vec![
-                Notification::Add {
-                    arena: test_arena(),
-                    index: 1,
-                    path: foo.clone(),
-                    size: 3,
-                    mtime: foo_mtime,
-                    hash: hash::digest("foo")
-                },
-                Notification::Replace {
-                    arena: test_arena(),
-                    index: 2,
-                    path: foo.clone(),
-                    size: 6,
-                    mtime: fixture.now(),
-                    hash: hash::digest("foobar"),
-                    old_hash: hash::digest("foo"),
-                },
-            ],
-            fixture.consume(rx).await?
+            Notification::Replace {
+                arena: test_arena(),
+                index: 2,
+                path: foo.clone(),
+                size: 6,
+                mtime: fixture.now(),
+                hash: hash::digest("foobar"),
+                old_hash: hash::digest("foo"),
+            },
+            next(&mut rx, "replace").await?
         );
 
         Ok(())

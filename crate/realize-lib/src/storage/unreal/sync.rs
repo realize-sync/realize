@@ -3,10 +3,11 @@
 //! See `spec/unreal.md` for details.
 
 use super::{
-    DirTableEntry, FileMetadata, FileTableEntry, InodeAssignment, ROOT_DIR, ReadDirEntry,
-    UnrealCacheAsync, UnrealError,
+    DirTableEntry, FileMetadata, FileTableEntry, InodeAssignment, PeerTableEntry, ROOT_DIR,
+    ReadDirEntry, UnrealCacheAsync, UnrealError,
 };
-use crate::model::{Arena, Path, Peer, UnixTime};
+use crate::model::{Arena, Hash, Path, Peer, UnixTime};
+use crate::storage::real::notifier::{Notification, Progress};
 use crate::storage::unreal::FileContent;
 use crate::utils::holder::Holder;
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
@@ -78,6 +79,21 @@ const MAX_INODE_TABLE: TableDefinition<(), u64> = TableDefinition::new("max_inod
 const PENDING_CATCHUP_TABLE: TableDefinition<(&str, &str, u64), u64> =
     TableDefinition::new("pending_catchup");
 
+/// Track Peer UUIDs.
+///
+/// This table tracks the store UUID for each peer and arena.
+///
+/// Key: (&str, &str) (Peer, Arena)
+/// Value: PeerTableEntry
+const PEER_TABLE: TableDefinition<(&str, &str), Holder<PeerTableEntry>> =
+    TableDefinition::new("peer");
+
+/// Track last seen notification index.
+///
+/// Key: (&str, &str) (Peer, Arena)
+/// Value: last seen index
+const NOTIFICATION_TABLE: TableDefinition<(&str, &str), u64> = TableDefinition::new("notification");
+
 /// A cache of remote files.
 pub struct UnrealCacheBlocking {
     db: Database,
@@ -93,6 +109,8 @@ impl UnrealCacheBlocking {
             txn.open_table(DIRECTORY_TABLE)?;
             txn.open_table(FILE_TABLE)?;
             txn.open_table(PENDING_CATCHUP_TABLE)?;
+            txn.open_table(PEER_TABLE)?;
+            txn.open_table(NOTIFICATION_TABLE)?;
             txn.commit()?;
         }
 
@@ -150,66 +168,6 @@ impl UnrealCacheBlocking {
     /// Transform this cache into an async cache.
     pub fn into_async(self) -> UnrealCacheAsync {
         UnrealCacheAsync::new(self)
-    }
-
-    pub fn catchup(
-        &self,
-        peer: &Peer,
-        arena: &Arena,
-        path: &Path,
-        size: u64,
-        mtime: &UnixTime,
-    ) -> Result<(), UnrealError> {
-        let txn = self.db.begin_write()?;
-        let inode = do_link(
-            &txn,
-            peer,
-            arena,
-            self.arena_root(arena)?,
-            path,
-            size,
-            mtime,
-        )?;
-        do_unmark_peer_file(&txn, peer, arena, inode)?;
-        txn.commit()?;
-
-        Ok(())
-    }
-
-    pub fn link(
-        &self,
-        peer: &Peer,
-        arena: &Arena,
-        path: &Path,
-        size: u64,
-        mtime: &UnixTime,
-    ) -> Result<(), UnrealError> {
-        let txn = self.db.begin_write()?;
-        do_link(
-            &txn,
-            peer,
-            arena,
-            self.arena_root(arena)?,
-            path,
-            size,
-            mtime,
-        )?;
-        txn.commit()?;
-
-        Ok(())
-    }
-
-    pub fn unlink(
-        &self,
-        peer: &Peer,
-        arena: &Arena,
-        path: &Path,
-        mtime: &UnixTime,
-    ) -> Result<(), UnrealError> {
-        let txn = self.db.begin_write()?;
-        do_unlink(&txn, peer, self.arena_root(arena)?, path, mtime)?;
-        txn.commit()?;
-        Ok(())
     }
 
     /// Lookup a directory entry.
@@ -289,19 +247,139 @@ impl UnrealCacheBlocking {
         Ok(entries)
     }
 
-    pub fn mark_peer_files(&self, peer: &Peer, arena: &Arena) -> Result<(), UnrealError> {
-        let txn = self.db.begin_write()?;
-        do_mark_peer_files(&txn, peer, arena)?;
-        txn.commit()?;
-        Ok(())
+    /// Return a [Progress] instance that represents how up-to-date
+    /// the information in the cache is for that peer and arena.
+    ///
+    /// This should be passed to the peer when subscribing.
+    pub fn peer_progress(
+        &self,
+        peer: &Peer,
+        arena: &Arena,
+    ) -> Result<Option<Progress>, UnrealError> {
+        let txn = self.db.begin_read()?;
+
+        do_peer_progress(&txn, peer, arena)
     }
 
-    pub fn delete_marked_files(&self, peer: &Peer, arena: &Arena) -> Result<(), UnrealError> {
+    pub fn update(&self, peer: &Peer, notification: Notification) -> Result<(), UnrealError> {
         let txn = self.db.begin_write()?;
-        do_delete_marked_files(&txn, peer, arena)?;
+        match notification {
+            Notification::Add {
+                arena,
+                index,
+                path,
+                mtime,
+                size,
+                hash,
+            } => {
+                let root = self.arena_root(&arena)?;
+                do_link(&txn, peer, &arena, root, &path, size, &mtime, hash, |_| {
+                    false
+                })?;
+                do_update_last_seen_notification(&txn, peer, &arena, index)?;
+            }
+            Notification::Replace {
+                arena,
+                index,
+                path,
+                mtime,
+                size,
+                hash,
+                old_hash,
+            } => {
+                let root = self.arena_root(&arena)?;
+                do_link(
+                    &txn,
+                    peer,
+                    &arena,
+                    root,
+                    &path,
+                    size,
+                    &mtime,
+                    hash,
+                    |existing| old_hash == existing.content.hash,
+                )?;
+                do_update_last_seen_notification(&txn, peer, &arena, index)?;
+            }
+            Notification::Remove {
+                arena,
+                index,
+                path,
+                old_hash,
+            } => {
+                let root = self.arena_root(&arena)?;
+                do_unlink(&txn, peer, root, &path, old_hash)?;
+                do_update_last_seen_notification(&txn, peer, &arena, index)?;
+            }
+            Notification::CatchupStart(arena) => {
+                do_mark_peer_files(&txn, peer, &arena)?;
+            }
+            Notification::Catchup {
+                arena,
+                path,
+                mtime,
+                size,
+                hash,
+            } => {
+                let root = self.arena_root(&arena)?;
+                let inode = do_link(&txn, peer, &arena, root, &path, size, &mtime, hash, |_| {
+                    true
+                })?;
+                do_unmark_peer_file(&txn, peer, &arena, inode)?;
+            }
+            Notification::CatchupComplete { arena, index } => {
+                do_delete_marked_files(&txn, peer, &arena)?;
+                do_update_last_seen_notification(&txn, peer, &arena, index)?;
+            }
+            Notification::Connected { arena, uuid } => {
+                let mut peer_table = txn.open_table(PEER_TABLE)?;
+                let key = (peer.as_str(), arena.as_str());
+                if let Some(entry) = peer_table.get(key)? {
+                    if entry.value().parse()?.uuid == uuid {
+                        // We're connected to the same store as before; there's nothing to do.
+                        return Ok(());
+                    }
+                }
+                peer_table.insert(key, Holder::new(PeerTableEntry { uuid })?)?;
+                let mut notification_table = txn.open_table(NOTIFICATION_TABLE)?;
+                notification_table.remove(key)?;
+            }
+        }
         txn.commit()?;
         Ok(())
     }
+}
+
+fn do_update_last_seen_notification(
+    txn: &WriteTransaction,
+    peer: &Peer,
+    arena: &Arena,
+    index: u64,
+) -> Result<(), UnrealError> {
+    let mut notification_table = txn.open_table(NOTIFICATION_TABLE)?;
+    notification_table.insert((peer.as_str(), arena.as_str()), index)?;
+
+    Ok(())
+}
+
+fn do_peer_progress(
+    txn: &ReadTransaction,
+    peer: &Peer,
+    arena: &Arena,
+) -> Result<Option<Progress>, UnrealError> {
+    let key = (peer.as_str(), arena.as_str());
+
+    let peer_table = txn.open_table(PEER_TABLE)?;
+    if let Some(entry) = peer_table.get(key)? {
+        let PeerTableEntry { uuid, .. } = entry.value().parse()?;
+
+        let notification_table = txn.open_table(NOTIFICATION_TABLE)?;
+        if let Some(last_seen) = notification_table.get(key)? {
+            return Ok(Some(Progress::new(uuid, last_seen.value())));
+        }
+    }
+
+    Ok(None)
 }
 
 fn do_dir_mtime(txn: &ReadTransaction, inode: u64) -> Result<UnixTime, UnrealError> {
@@ -381,7 +459,7 @@ fn do_unlink(
     peer: &Peer,
     arena_root: u64,
     path: &Path,
-    mtime: &UnixTime,
+    old_hash: Hash,
 ) -> Result<(), UnrealError> {
     let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
     let (parent_inode, parent_assignment) = do_lookup_path(&dir_table, arena_root, &path.parent())?;
@@ -403,7 +481,7 @@ fn do_unlink(
         parent_inode,
         inode,
         peer,
-        Some(mtime),
+        Some(old_hash),
     )?;
 
     Ok(())
@@ -427,6 +505,10 @@ fn do_file_availability(
 ) -> Result<Vec<(Peer, FileTableEntry)>, UnrealError> {
     let file_table = txn.open_table(FILE_TABLE)?;
 
+    // TODO: do something with hashes. When two peers have different
+    // hashes, it should be possible, from the chain of hashes
+    // reported by add and replace notifications, to figure out which
+    // one has replaced the other (directly or indirectly).
     let mut all = vec![];
     for entry in file_table.range((inode, "")..(inode + 1, ""))? {
         let entry = entry?;
@@ -453,6 +535,8 @@ fn do_link(
     path: &Path,
     size: u64,
     mtime: &UnixTime,
+    hash: Hash,
+    overwrite: impl FnOnce(&FileTableEntry) -> bool,
 ) -> Result<u64, UnrealError> {
     let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
     let mut file_table = txn.open_table(FILE_TABLE)?;
@@ -470,7 +554,7 @@ fn do_link(
         )?,
         Some(dir_entry) => {
             if let Some(existing) = get_file_entry(&file_table, dir_entry.inode, peer)? {
-                if existing.metadata.mtime > *mtime {
+                if !overwrite(&existing) {
                     return Ok(dir_entry.inode);
                 }
             }
@@ -478,7 +562,7 @@ fn do_link(
             dir_entry.inode
         }
     };
-    log::debug!("new file entry ({inode} {peer})");
+    log::debug!("new file entry ({inode} {peer}) {hash}");
     file_table.insert(
         (inode, peer.as_str()),
         Holder::new(FileTableEntry {
@@ -489,6 +573,7 @@ fn do_link(
             content: FileContent {
                 arena: arena.clone(),
                 path: path.clone(),
+                hash,
             },
             parent_inode,
         })?,
@@ -676,7 +761,7 @@ fn do_rm_file_entry(
     parent_inode: u64,
     inode: u64,
     peer: &Peer,
-    mtime: Option<&UnixTime>,
+    old_hash: Option<Hash>,
 ) -> Result<(), UnrealError> {
     let mut range_size = 0;
     let mut delete = false;
@@ -687,11 +772,11 @@ fn do_rm_file_entry(
         if peer_str != elt.0.value().1 {
             continue;
         }
-        match mtime {
+        match &old_hash {
             None => delete = true,
-            Some(mtime) => {
-                let m = elt.1.value().parse()?.metadata.mtime;
-                if m <= *mtime {
+            Some(old_hash) => {
+                let hash = elt.1.value().parse()?.content.hash;
+                if hash == *old_hash {
                     delete = true;
                 }
             }
@@ -734,16 +819,16 @@ mod tests {
         Arena::from("test_arena")
     }
 
+    fn test_hash() -> Hash {
+        Hash([1u8; 32])
+    }
+
     fn test_time() -> UnixTime {
         UnixTime::from_secs(TEST_TIME)
     }
 
     fn later_time() -> UnixTime {
         UnixTime::from_secs(TEST_TIME + 1)
-    }
-
-    fn earlier_time() -> UnixTime {
-        UnixTime::from_secs(TEST_TIME - 1)
     }
 
     struct Fixture {
@@ -775,6 +860,36 @@ mod tests {
                 }
             }
         }
+
+        fn add_file(&self, path: &Path, size: u64, mtime: &UnixTime) -> anyhow::Result<()> {
+            self.cache.update(
+                &test_peer(),
+                Notification::Add {
+                    arena: test_arena(),
+                    index: 1,
+                    path: path.clone(),
+                    mtime: mtime.clone(),
+                    size,
+                    hash: test_hash(),
+                },
+            )?;
+
+            Ok(())
+        }
+
+        fn remove_file(&self, path: &Path) -> anyhow::Result<()> {
+            self.cache.update(
+                &test_peer(),
+                Notification::Remove {
+                    arena: test_arena(),
+                    index: 1,
+                    path: path.clone(),
+                    old_hash: test_hash(),
+                },
+            )?;
+
+            Ok(())
+        }
     }
 
     #[test]
@@ -789,15 +904,13 @@ mod tests {
     }
 
     #[test]
-    fn link_creates_directories() -> anyhow::Result<()> {
+    fn add_creates_directories() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let cache = &fixture.cache;
-        let peer = test_peer();
-        let arena = test_arena();
         let file_path = Path::parse("a/b/c.txt")?;
         let mtime = test_time();
 
-        cache.link(&peer, &arena, &file_path, 100, &mtime)?;
+        fixture.add_file(&file_path, 100, &mtime)?;
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
@@ -825,35 +938,51 @@ mod tests {
     }
 
     #[test]
-    fn link_update_dir_mtime() -> anyhow::Result<()> {
+    fn add_update_dir_mtime() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let cache = &fixture.cache;
-        let peer = test_peer();
         let arena = test_arena();
         let mtime = test_time();
         let path1 = Path::parse("a/b/1.txt")?;
-        cache.link(&peer, &arena, &path1, 100, &mtime)?;
+        fixture.add_file(&path1, 100, &mtime)?;
         let dir_mtime = fixture.parent_dir_mtime(&arena, &path1)?;
 
         let path2 = Path::parse("a/b/2.txt")?;
-        cache.link(&peer, &arena, &path2, 100, &mtime)?;
+        fixture.add_file(&path2, 100, &mtime)?;
 
         assert!(fixture.parent_dir_mtime(&arena, &path2)? > dir_mtime);
         Ok(())
     }
 
     #[test]
-    fn link_updates_existing_file() -> anyhow::Result<()> {
+    fn replace_existing_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let cache = &fixture.cache;
         let peer = test_peer();
-        let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
-        let old_mtime = test_time();
-        let new_mtime = later_time();
 
-        cache.link(&peer, &arena, &file_path, 100, &old_mtime)?;
-        cache.link(&peer, &arena, &file_path, 200, &new_mtime)?;
+        cache.update(
+            &peer,
+            Notification::Add {
+                arena: test_arena(),
+                index: 0,
+                path: file_path.clone(),
+                mtime: test_time(),
+                size: 100,
+                hash: test_hash(),
+            },
+        )?;
+        cache.update(
+            &peer,
+            Notification::Replace {
+                arena: test_arena(),
+                index: 0,
+                path: file_path.clone(),
+                mtime: later_time(),
+                size: 200,
+                hash: Hash([2u8; 32]),
+                old_hash: test_hash(),
+            },
+        )?;
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
@@ -875,45 +1004,61 @@ mod tests {
             .value()
             .parse()?;
         assert_eq!(entry.metadata.size, 200);
-        assert_eq!(entry.metadata.mtime, new_mtime);
+        assert_eq!(entry.metadata.mtime, later_time());
 
         Ok(())
     }
 
     #[test]
-    fn link_ignores_older_mtime() -> anyhow::Result<()> {
+    fn ignore_duplicate_add() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let cache = &fixture.cache;
-        let peer = test_peer();
-        let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
-        let new_mtime = test_time();
-        let old_mtime = earlier_time();
 
-        cache.link(&peer, &arena, &file_path, 100, &new_mtime)?;
-        cache.link(&peer, &arena, &file_path, 200, &old_mtime)?;
+        fixture.add_file(&file_path, 100, &test_time())?;
+        fixture.add_file(&file_path, 200, &test_time())?;
 
-        let txn = cache.db.begin_read()?;
-        let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-        let dir_entry = dir_table.get((ROOT_DIR, "test_arena"))?.unwrap();
-        let dir_entry = match dir_entry.value().parse()? {
-            DirTableEntry::Dot(_) => panic!("Unexpected dot entry"),
-            DirTableEntry::Regular(e) => e,
-        };
-        let dir_entry = dir_table.get((dir_entry.inode, "file.txt"))?.unwrap();
-        let dir_entry = match dir_entry.value().parse()? {
-            DirTableEntry::Dot(_) => panic!("Unexpected dot entry"),
-            DirTableEntry::Regular(e) => e,
-        };
+        let (inode, _) = cache.lookup_path(cache.arena_root(&test_arena())?, &file_path)?;
+        let metadata = cache.file_metadata(inode)?;
+        assert_eq!(metadata.size, 100);
 
-        let file_table = txn.open_table(FILE_TABLE)?;
-        let entry = file_table
-            .get((dir_entry.inode, peer.as_str()))?
-            .unwrap()
-            .value()
-            .parse()?;
-        assert_eq!(entry.metadata.size, 100);
-        assert_eq!(entry.metadata.mtime, new_mtime);
+        Ok(())
+    }
+
+    #[test]
+    fn ignore_replace_with_wrong_hash() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let cache = &fixture.cache;
+        let file_path = Path::parse("file.txt")?;
+        let peer = test_peer();
+
+        cache.update(
+            &peer,
+            Notification::Add {
+                arena: test_arena(),
+                index: 0,
+                path: file_path.clone(),
+                mtime: test_time(),
+                size: 100,
+                hash: Hash([1u8; 32]),
+            },
+        )?;
+        cache.update(
+            &peer,
+            Notification::Replace {
+                arena: test_arena(),
+                index: 0,
+                path: file_path.clone(),
+                mtime: later_time(),
+                size: 200,
+                hash: Hash([2u8; 32]),
+                old_hash: Hash([0xffu8; 32]), // wrong
+            },
+        )?;
+
+        let (inode, _) = cache.lookup_path(cache.arena_root(&test_arena())?, &file_path)?;
+        let metadata = cache.file_metadata(inode)?;
+        assert_eq!(metadata.size, 100);
 
         Ok(())
     }
@@ -922,13 +1067,11 @@ mod tests {
     fn unlink_removes_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let cache = &fixture.cache;
-        let peer = test_peer();
-        let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
 
-        cache.link(&peer, &arena, &file_path, 100, &mtime)?;
-        cache.unlink(&peer, &arena, &file_path, &later_time())?;
+        fixture.add_file(&file_path, 100, &mtime)?;
+        fixture.remove_file(&file_path)?;
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
@@ -940,15 +1083,13 @@ mod tests {
     #[test]
     fn unlink_update_dir_mtime() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let cache = &fixture.cache;
-        let peer = test_peer();
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
 
-        cache.link(&peer, &arena, &file_path, 100, &mtime)?;
+        fixture.add_file(&file_path, 100, &mtime)?;
         let dir_mtime = fixture.parent_dir_mtime(&arena, &file_path)?;
-        cache.unlink(&peer, &arena, &file_path, &later_time())?;
+        fixture.remove_file(&file_path)?;
 
         assert!(fixture.parent_dir_mtime(&arena, &file_path)? > dir_mtime);
 
@@ -956,16 +1097,22 @@ mod tests {
     }
 
     #[test]
-    fn unlink_ignores_older_mtime() -> anyhow::Result<()> {
+    fn unlink_ignores_wrong_old_hash() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let cache = &fixture.cache;
-        let peer = test_peer();
-        let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
 
-        cache.link(&peer, &arena, &file_path, 100, &mtime)?;
-        cache.unlink(&peer, &arena, &file_path, &earlier_time())?;
+        fixture.add_file(&file_path, 100, &mtime)?;
+        cache.update(
+            &test_peer(),
+            Notification::Remove {
+                arena: test_arena(),
+                index: 1,
+                path: file_path.clone(),
+                old_hash: Hash([2u8; 32]), // != test_hash()
+            },
+        )?;
 
         let txn = cache.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
@@ -983,12 +1130,11 @@ mod tests {
     fn lookup_finds_entry() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let cache = &fixture.cache;
-        let peer = test_peer();
         let arena = test_arena();
         let file_path = Path::parse("a/file.txt")?;
         let mtime = test_time();
 
-        cache.link(&peer, &arena, &file_path, 100, &mtime)?;
+        fixture.add_file(&file_path, 100, &mtime)?;
 
         // Lookup directory
         let dir_entry = cache.lookup(cache.arena_root(&arena)?, "a")?;
@@ -1022,12 +1168,11 @@ mod tests {
     fn lookup_path_finds_entry() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let cache = &fixture.cache;
-        let peer = test_peer();
         let arena = test_arena();
         let path = Path::parse("a/b/c/file.txt")?;
         let mtime = test_time();
 
-        cache.link(&peer, &arena, &path, 100, &mtime)?;
+        fixture.add_file(&path, 100, &mtime)?;
 
         let (inode, assignment) = cache.lookup_path(cache.arena_root(&arena)?, &path)?;
         assert_eq!(assignment, InodeAssignment::File);
@@ -1043,19 +1188,12 @@ mod tests {
     fn readdir_returns_all_entries() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let cache = &fixture.cache;
-        let peer = test_peer();
         let arena = test_arena();
         let mtime = test_time();
 
-        cache.link(&peer, &arena, &Path::parse("dir/file1.txt")?, 100, &mtime)?;
-        cache.link(&peer, &arena, &Path::parse("dir/file2.txt")?, 200, &mtime)?;
-        cache.link(
-            &peer,
-            &arena,
-            &Path::parse("dir/subdir/file3.txt")?,
-            300,
-            &mtime,
-        )?;
+        fixture.add_file(&Path::parse("dir/file1.txt")?, 100, &mtime)?;
+        fixture.add_file(&Path::parse("dir/file2.txt")?, 200, &mtime)?;
+        fixture.add_file(&Path::parse("dir/subdir/file3.txt")?, 300, &mtime)?;
 
         assert_unordered::assert_eq_unordered!(
             vec![(arena.to_string(), InodeAssignment::Directory),],
@@ -1103,16 +1241,33 @@ mod tests {
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
 
-        let mtime1 = test_time();
-        let mtime2 = later_time();
-
-        cache.link(&peer1, &arena, &file_path, 100, &mtime1)?;
-        cache.link(&peer2, &arena, &file_path, 200, &mtime2)?;
+        cache.update(
+            &peer1,
+            Notification::Add {
+                arena: arena.clone(),
+                index: 0,
+                path: file_path.clone(),
+                mtime: test_time(),
+                size: 100,
+                hash: Hash([1u8; 32]),
+            },
+        )?;
+        cache.update(
+            &peer2,
+            Notification::Add {
+                arena: arena.clone(),
+                index: 0,
+                path: file_path.clone(),
+                mtime: later_time(),
+                size: 200,
+                hash: Hash([2u8; 32]),
+            },
+        )?;
 
         let file_entry = cache.lookup(cache.arena_root(&arena)?, "file.txt")?;
         let metadata = cache.file_metadata(file_entry.inode)?;
         assert_eq!(metadata.size, 200);
-        assert_eq!(metadata.mtime, mtime2);
+        assert_eq!(metadata.mtime, later_time());
 
         Ok(())
     }
@@ -1128,12 +1283,39 @@ mod tests {
         let arena = test_arena();
         let path = Path::parse("file.txt")?;
 
-        let mtime1 = test_time();
-        let mtime2 = later_time();
-
-        cache.link(&a, &arena, &path, 100, &mtime1)?;
-        cache.link(&b, &arena, &path, 200, &mtime2)?;
-        cache.link(&c, &arena, &path, 200, &mtime2)?;
+        cache.update(
+            &a,
+            Notification::Add {
+                arena: arena.clone(),
+                index: 0,
+                path: path.clone(),
+                mtime: test_time(),
+                size: 100,
+                hash: Hash([1u8; 32]),
+            },
+        )?;
+        cache.update(
+            &b,
+            Notification::Add {
+                arena: arena.clone(),
+                index: 0,
+                path: path.clone(),
+                mtime: later_time(),
+                size: 200,
+                hash: Hash([2u8; 32]),
+            },
+        )?;
+        cache.update(
+            &c,
+            Notification::Add {
+                arena: arena.clone(),
+                index: 0,
+                path: path.clone(),
+                mtime: later_time(),
+                size: 200,
+                hash: Hash([2u8; 32]),
+            },
+        )?;
 
         let parent_inode = cache.arena_root(&arena)?;
         let inode = cache.lookup(parent_inode, "file.txt")?.inode;
@@ -1146,10 +1328,11 @@ mod tests {
                         content: FileContent {
                             arena: arena.clone(),
                             path: path.clone(),
+                            hash: Hash([2u8; 32]),
                         },
                         metadata: FileMetadata {
                             size: 200,
-                            mtime: mtime2.clone(),
+                            mtime: later_time(),
                         },
                         parent_inode
                     }
@@ -1160,10 +1343,11 @@ mod tests {
                         content: FileContent {
                             arena: arena.clone(),
                             path: path.clone(),
+                            hash: Hash([2u8; 32])
                         },
                         metadata: FileMetadata {
                             size: 200,
-                            mtime: mtime2.clone(),
+                            mtime: later_time(),
                         },
                         parent_inode
                     }
@@ -1190,25 +1374,119 @@ mod tests {
 
         let mtime = test_time();
 
-        cache.link(&peer1, &arena, &file1, 10, &mtime)?;
+        cache.update(
+            &peer1,
+            Notification::Add {
+                arena: arena.clone(),
+                index: 0,
+                path: file1.clone(),
+                mtime: mtime.clone(),
+                size: 10,
+                hash: test_hash(),
+            },
+        )?;
 
-        cache.link(&peer1, &arena, &file2, 10, &mtime)?;
-        cache.link(&peer2, &arena, &file2, 10, &mtime)?;
+        cache.update(
+            &peer1,
+            Notification::Add {
+                arena: arena.clone(),
+                index: 0,
+                path: file2.clone(),
+                mtime: mtime.clone(),
+                size: 10,
+                hash: test_hash(),
+            },
+        )?;
+        cache.update(
+            &peer2,
+            Notification::Add {
+                arena: arena.clone(),
+                index: 0,
+                path: file2.clone(),
+                mtime: mtime.clone(),
+                size: 10,
+                hash: test_hash(),
+            },
+        )?;
 
-        cache.link(&peer1, &arena, &file1, 10, &mtime)?;
-        cache.link(&peer2, &arena, &file2, 10, &mtime)?;
-        cache.link(&peer3, &arena, &file3, 10, &mtime)?;
+        cache.update(
+            &peer1,
+            Notification::Add {
+                arena: arena.clone(),
+                index: 0,
+                path: file1.clone(),
+                mtime: mtime.clone(),
+                size: 10,
+                hash: test_hash(),
+            },
+        )?;
+        cache.update(
+            &peer2,
+            Notification::Add {
+                arena: arena.clone(),
+                index: 0,
+                path: file2.clone(),
+                mtime: mtime.clone(),
+                size: 10,
+                hash: test_hash(),
+            },
+        )?;
+        cache.update(
+            &peer3,
+            Notification::Add {
+                arena: arena.clone(),
+                index: 0,
+                path: file3.clone(),
+                mtime: mtime.clone(),
+                size: 10,
+                hash: test_hash(),
+            },
+        )?;
 
-        cache.link(&peer1, &arena, &file4, 10, &mtime)?;
+        cache.update(
+            &peer1,
+            Notification::Add {
+                arena: arena.clone(),
+                index: 0,
+                path: file4.clone(),
+                mtime: mtime.clone(),
+                size: 10,
+                hash: test_hash(),
+            },
+        )?;
 
         let arena_root = cache.arena_root(&arena)?;
         let file1_inode = cache.lookup(arena_root, file1.name())?.inode;
 
         // Simulate a catchup that only reports file2 and file4.
-        cache.mark_peer_files(&peer1, &arena)?;
-        cache.catchup(&peer1, &arena, &file2, 10, &mtime)?;
-        cache.catchup(&peer1, &arena, &file4, 10, &mtime)?;
-        cache.delete_marked_files(&peer1, &arena)?;
+        cache.update(&peer1, Notification::CatchupStart(arena.clone()))?;
+        cache.update(
+            &peer1,
+            Notification::Catchup {
+                arena: arena.clone(),
+                path: file2.clone(),
+                size: 10,
+                mtime: mtime.clone(),
+                hash: test_hash(),
+            },
+        )?;
+        cache.update(
+            &peer1,
+            Notification::Catchup {
+                arena: arena.clone(),
+                path: file4.clone(),
+                size: 10,
+                mtime: mtime.clone(),
+                hash: test_hash(),
+            },
+        )?;
+        cache.update(
+            &peer1,
+            Notification::CatchupComplete {
+                arena: arena.clone(),
+                index: 0,
+            },
+        )?;
 
         // File1 should have been deleted, since it was only on peer1,
         assert!(matches!(

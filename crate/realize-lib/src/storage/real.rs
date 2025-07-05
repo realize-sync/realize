@@ -4,7 +4,7 @@ mod hasher;
 #[cfg(target_os = "linux")]
 mod history;
 mod index;
-mod notifier;
+pub mod notifier;
 #[allow(dead_code)]
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]
@@ -17,8 +17,7 @@ mod watcher;
 
 pub use index::{RealIndexAsync, RealIndexBlocking};
 pub use store::{
-    Options, PathResolver, PathType, RealStore, RealStoreError, RsyncOperation, StoreSubscribe,
-    SyncedFile,
+    Options, PathResolver, PathType, RealStore, RealStoreError, RsyncOperation, SyncedFile,
 };
 
 /// Report something happening in arenas of the local file system.

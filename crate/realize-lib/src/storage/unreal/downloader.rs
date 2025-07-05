@@ -322,7 +322,9 @@ mod tests {
     use crate::network::hostport::HostPort;
     use crate::network::{self, Server};
     use crate::storage::real::RealStore;
+    use crate::storage::real::notifier::Notification;
     use crate::storage::{self};
+    use crate::utils::hash;
     use assert_fs::TempDir;
     use assert_fs::prelude::{FileWriteBin as _, FileWriteStr as _, PathChild as _};
     use std::io::Write as _;
@@ -370,14 +372,19 @@ mod tests {
         }
 
         async fn add_file(&self, path: Path) -> Result<u64, anyhow::Error> {
-            let metadata = tokio::fs::metadata(path.within(self.tempdir.path())).await?;
+            let realpath = path.within(self.tempdir.path());
+            let metadata = tokio::fs::metadata(&realpath).await?;
             self.cache
-                .link(
+                .update(
                     &network::testing::server_peer(),
-                    &self.arena,
-                    &path,
-                    metadata.len(),
-                    &UnixTime::mtime(&metadata),
+                    Notification::Add {
+                        index: 1,
+                        arena: self.arena.clone(),
+                        path: path.clone(),
+                        size: metadata.len(),
+                        mtime: UnixTime::mtime(&metadata),
+                        hash: hash::digest(tokio::fs::read(&realpath).await?),
+                    },
                 )
                 .await?;
             let (inode, _) = self

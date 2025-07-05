@@ -345,11 +345,12 @@ fn to_nfs_time(time: &UnixTime) -> nfstime3 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Arena, Path};
+    use crate::model::{Arena, Hash, Path};
     use crate::network::hostport::HostPort;
     use crate::network::rpc::realstore;
     use crate::network::{self, Server};
     use crate::storage::real::RealStore;
+    use crate::storage::real::notifier::Notification;
     use crate::storage::{self};
     use assert_fs::TempDir;
     use assert_fs::prelude::{FileWriteStr as _, PathChild as _};
@@ -439,12 +440,16 @@ mod tests {
         let mtime = UnixTime::now();
         fixture
             .cache
-            .link(
+            .update(
                 &network::testing::server_peer(),
-                &fixture.arena,
-                &Path::parse("somefile.txt")?,
-                5,
-                &mtime,
+                Notification::Add {
+                    index: 1,
+                    arena: fixture.arena.clone(),
+                    path: Path::parse("somefile.txt")?,
+                    size: 5,
+                    mtime: mtime.clone(),
+                    hash: Hash([1u8; 32]),
+                },
             )
             .await?;
 
@@ -480,12 +485,16 @@ mod tests {
         let m = tokio::fs::metadata(&file).await?;
         fixture
             .cache
-            .link(
+            .update(
                 &network::testing::server_peer(),
-                &fixture.arena,
-                &Path::parse("hello.txt")?,
-                m.len(),
-                &UnixTime::mtime(&m),
+                Notification::Add {
+                    index: 1,
+                    arena: fixture.arena.clone(),
+                    path: Path::parse("hello.txt")?,
+                    size: m.len(),
+                    mtime: UnixTime::mtime(&m),
+                    hash: Hash([1u8; 32]),
+                },
             )
             .await?;
 

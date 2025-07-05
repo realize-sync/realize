@@ -3,6 +3,7 @@ use super::{
 };
 use crate::model::{Arena, Path, Peer, UnixTime};
 use crate::storage::config::StorageConfig;
+use crate::storage::real::notifier::{Notification, Progress};
 use std::path;
 use std::sync::Arc;
 use tokio::task;
@@ -54,59 +55,6 @@ impl UnrealCacheAsync {
         self.inner.arena_root(arena)
     }
 
-    /// Async version of [BlockingUnrealCache::link]
-    pub async fn link(
-        &self,
-        peer: &Peer,
-        arena: &Arena,
-        path: &Path,
-        size: u64,
-        mtime: &UnixTime,
-    ) -> Result<(), UnrealError> {
-        let peer = peer.clone();
-        let arena = arena.clone();
-        let path = path.clone();
-        let mtime = mtime.clone();
-        let inner = Arc::clone(&self.inner);
-
-        task::spawn_blocking(move || inner.link(&peer, &arena, &path, size, &mtime)).await?
-    }
-
-    /// Async version of [BlockingUnrealCache::unlink]
-    pub async fn unlink(
-        &self,
-        peer: &Peer,
-        arena: &Arena,
-        path: &Path,
-        mtime: &UnixTime,
-    ) -> Result<(), UnrealError> {
-        let peer = peer.clone();
-        let arena = arena.clone();
-        let path = path.clone();
-        let mtime = mtime.clone();
-        let inner = Arc::clone(&self.inner);
-
-        task::spawn_blocking(move || inner.unlink(&peer, &arena, &path, &mtime)).await?
-    }
-
-    /// Async version of [BlockingUnrealCache::catchup]
-    pub async fn catchup(
-        &self,
-        peer: &Peer,
-        arena: &Arena,
-        path: &Path,
-        size: u64,
-        mtime: &UnixTime,
-    ) -> Result<(), UnrealError> {
-        let peer = peer.clone();
-        let arena = arena.clone();
-        let path = path.clone();
-        let mtime = mtime.clone();
-        let inner = Arc::clone(&self.inner);
-
-        task::spawn_blocking(move || inner.catchup(&peer, &arena, &path, size, &mtime)).await?
-    }
-
     pub async fn lookup(&self, parent_inode: u64, name: &str) -> Result<ReadDirEntry, UnrealError> {
         let name = name.to_string();
         let inner = Arc::clone(&self.inner);
@@ -152,19 +100,27 @@ impl UnrealCacheAsync {
         task::spawn_blocking(move || inner.readdir(inode)).await?
     }
 
-    pub async fn mark_peer_files(&self, peer: &Peer, arena: &Arena) -> Result<(), UnrealError> {
+    /// Return a [Progress] instance that represents how up-to-date
+    /// the information in the cache is for that peer and arena.
+    ///
+    /// This should be passed to the peer when subscribing.
+    pub async fn peer_progress(
+        &self,
+        peer: &Peer,
+        arena: &Arena,
+    ) -> Result<Option<Progress>, UnrealError> {
         let peer = peer.clone();
         let arena = arena.clone();
         let inner = Arc::clone(&self.inner);
 
-        task::spawn_blocking(move || inner.mark_peer_files(&peer, &arena)).await?
+        task::spawn_blocking(move || inner.peer_progress(&peer, &arena)).await?
     }
 
-    pub async fn delete_marked_files(&self, peer: &Peer, arena: &Arena) -> Result<(), UnrealError> {
+    /// Update the cache by applying a notification coming from the given peer.
+    pub async fn update(&self, peer: &Peer, notification: Notification) -> Result<(), UnrealError> {
         let peer = peer.clone();
-        let arena = arena.clone();
         let inner = Arc::clone(&self.inner);
 
-        task::spawn_blocking(move || inner.delete_marked_files(&peer, &arena)).await?
+        task::spawn_blocking(move || inner.update(&peer, notification)).await?
     }
 }

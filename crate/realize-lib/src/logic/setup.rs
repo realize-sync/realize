@@ -1,18 +1,17 @@
 use super::config::Config;
-use crate::model::{Arena, Peer};
+use crate::model::Arena;
 use crate::network::rpc::{Household, realstore};
 use crate::network::{Networking, Server};
 use crate::storage::config::ArenaConfig;
-use crate::storage::real::{Notification, RealStore};
-use crate::storage::unreal::{Downloader, UnrealCacheAsync, keep_cache_updated};
+use crate::storage::real::RealStore;
+use crate::storage::unreal::{Downloader, UnrealCacheAsync};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 pub struct Setup {
     networking: Networking,
     config: Config,
-    notification_tx: Option<mpsc::Sender<(Peer, Notification)>>,
+    cache: Option<UnrealCacheAsync>,
 }
 
 impl Setup {
@@ -22,7 +21,7 @@ impl Setup {
         Ok(Self {
             networking,
             config,
-            notification_tx: None,
+            cache: None,
         })
     }
 
@@ -32,11 +31,9 @@ impl Setup {
     /// possible by connecting to other peers to track changes.
     pub fn setup_cache(&mut self) -> anyhow::Result<(UnrealCacheAsync, Downloader)> {
         let cache = UnrealCacheAsync::from_config(&self.config.storage)?;
-        let (tx, rx) = mpsc::channel(100);
-        tokio::spawn(keep_cache_updated(cache.clone(), rx));
-        self.notification_tx = Some(tx);
-
         let downloader = Downloader::new(self.networking.clone(), cache.clone());
+
+        self.cache = Some(cache.clone());
 
         Ok((cache, downloader))
     }
@@ -49,7 +46,7 @@ impl Setup {
         let Setup {
             networking,
             config,
-            notification_tx,
+            cache,
         } = self;
 
         let store = RealStore::from_config(&config.storage.arenas);
@@ -57,9 +54,9 @@ impl Setup {
         let mut server = Server::new(networking.clone());
         realstore::server::register(&mut server, store.clone());
 
-        let has_notifications = notification_tx.is_some();
-        let (household, _) = Household::spawn(networking, Arc::new(store), notification_tx)?;
-        if has_notifications {
+        let has_cache = cache.is_some();
+        let (household, _) = Household::spawn(networking, cache, HashMap::new())?;
+        if has_cache {
             household.keep_connected()?;
         }
         household.register(&mut server);

@@ -1,4 +1,4 @@
-use crate::model::{self, Arena, Path, UnixTime};
+use crate::model::{self, Arena, Hash, Path, UnixTime};
 use crate::utils::holder::{ByteConversionError, ByteConvertible, NamedType};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
@@ -6,13 +6,12 @@ pub use downloader::{Download, Downloader};
 pub use error::UnrealError;
 pub use future::UnrealCacheAsync;
 pub use sync::UnrealCacheBlocking;
-pub use updater::keep_cache_updated;
+use uuid::Uuid;
 
 mod downloader;
 mod error;
 mod future;
 mod sync;
-mod updater;
 #[allow(dead_code)]
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]
@@ -75,11 +74,14 @@ pub struct FileContent {
     /// This is stored here as a key to fetch file content,
     /// to be replaced by a blob id.
     path: model::Path,
+
+    /// Hash of the specific version of the content the peer has.
+    hash: model::Hash,
 }
 
 impl std::fmt::Debug for FileContent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{}]/{}", self.arena, self.path)
+        write!(f, "[{}]/{} {}", self.arena, self.path, self.hash)
     }
 }
 
@@ -106,6 +108,7 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
             content: FileContent {
                 arena: Arena::from(content.get_arena()?.to_str()?),
                 path: Path::parse(content.get_path()?.to_str()?)?,
+                hash: parse_hash(content.get_hash()?)?,
             },
             parent_inode: msg.get_parent(),
         })
@@ -121,6 +124,7 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
         let mut content = builder.reborrow().init_content();
         content.set_arena(self.content.arena.as_str());
         content.set_path(self.content.path.as_str());
+        content.set_hash(&self.content.hash.0);
 
         let mut metadata = builder.init_metadata();
         metadata.set_size(self.metadata.size);
@@ -225,6 +229,53 @@ impl ByteConvertible<DirTableEntry> for DirTableEntry {
     }
 }
 
+/// An entry in the peer table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeerTableEntry {
+    pub uuid: Uuid,
+}
+
+impl NamedType for PeerTableEntry {
+    fn typename() -> &'static str {
+        "PeerEntry"
+    }
+}
+
+impl ByteConvertible<PeerTableEntry> for PeerTableEntry {
+    fn from_bytes(data: &[u8]) -> Result<PeerTableEntry, ByteConversionError> {
+        let message_reader = serialize_packed::read_message(&mut &data[..], ReaderOptions::new())?;
+        let msg: unreal_capnp::peer_table_entry::Reader =
+            message_reader.get_root::<unreal_capnp::peer_table_entry::Reader>()?;
+
+        Ok(PeerTableEntry {
+            uuid: Uuid::from_u64_pair(msg.get_uuid_hi(), msg.get_uuid_lo()),
+        })
+    }
+
+    fn to_bytes(self) -> Result<Vec<u8>, ByteConversionError> {
+        let mut message = ::capnp::message::Builder::new_default();
+        let mut builder: unreal_capnp::peer_table_entry::Builder =
+            message.init_root::<unreal_capnp::peer_table_entry::Builder>();
+
+        let (hi, lo) = self.uuid.as_u64_pair();
+        builder.set_uuid_hi(hi);
+        builder.set_uuid_lo(lo);
+
+        let mut buffer: Vec<u8> = Vec::new();
+        serialize_packed::write_message(&mut buffer, &message)?;
+
+        Ok(buffer)
+    }
+}
+
+fn parse_hash(hash: &[u8]) -> Result<Hash, ByteConversionError> {
+    let hash: [u8; 32] = hash
+        .try_into()
+        .map_err(|_| ByteConversionError::Invalid("hash"))?;
+
+    Ok(Hash(hash))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +286,7 @@ mod tests {
             content: FileContent {
                 arena: Arena::from("test"),
                 path: Path::parse("foo/bar.txt")?,
+                hash: Hash([0xa1u8; 32]),
             },
             metadata: FileMetadata {
                 size: 200,

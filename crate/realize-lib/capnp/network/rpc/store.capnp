@@ -30,10 +30,16 @@ struct ReadError {
 
 struct SubscribeRequest {
   subscriber @0: Subscriber;
-  arenas @1: List(Text);
+  arena @1: Text;
+  progress @2: SubscriberProgress;
 }
 
 struct SubscribeResponse {
+}
+
+struct SubscriberProgress {
+  uuid @0: Uuid;
+  lastSeen @1: UInt64;
 }
 
 struct SubscribeError {
@@ -46,35 +52,64 @@ interface Subscriber {
 
 struct Notification {
   union {
-    link @0: Link;
-    unlink @1: Unlink;
-    catchingUp @2: CatchingUp;
-    catchup @3: Link;
-    ready @4: Ready;
+    add @0: Add;
+    replace @1: Replace;
+    remove @2: Remove;
+    catchupStart @3: CatchupStart;
+    catchup @4: Catchup;
+    catchupComplete @5: CatchupComplete;
+    connected @6: Connected;
   }
 }
 
-struct CatchingUp {
+struct Add {
+  index @0: UInt64;
+  arena @1: Text;
+  path @2: Text;
+  size @3: UInt64;
+  mtime @4: Time;
+  hash @5: Data;
+}
+struct Replace {
+  index @0: UInt64;
+  arena @1: Text;
+  path @2: Text;
+  size @3: UInt64;
+  mtime @4: Time;
+  hash @5: Data;
+  oldHash @6: Data;
+}
+struct Remove {
+  index @0: UInt64;
+  arena @1: Text;
+  path @2: Text;
+  oldHash @3: Data;
+}
+struct CatchupStart {
   arena @0: Text;
 }
-struct Ready {
-  arena @0: Text;
-}
-struct Link {
+struct Catchup {
   arena @0: Text;
   path @1: Text;
   size @2: UInt64;
   mtime @3: Time;
+  hash @4: Data;
 }
-
-struct Unlink {
+struct CatchupComplete {
   arena @0: Text;
-  path @1: Text;
-  size @2: UInt64;
-  mtime @3: Time;
+  index @1: UInt64;
+}
+struct Connected {
+  arena @0: Text;
+  uuid @1: Uuid;
 }
 
 struct Time {
   secs @0: UInt64;
   nsecs @1: UInt32;
+}
+
+struct Uuid {
+  lo @0: UInt64;
+  hi @1: UInt64;
 }

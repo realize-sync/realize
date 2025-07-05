@@ -54,34 +54,6 @@ pub struct SyncedFile {
     pub mtime: SystemTime,
 }
 
-#[allow(async_fn_in_trait)]
-pub trait StoreSubscribe {
-    /// List arenas that are locally available.
-    fn arenas(&self) -> Vec<Arena>;
-
-    /// Subscribe to notification for the given arena.
-    ///
-    /// If the arena is unknown, do nothing and return false. This is
-    /// not considered an error.
-    ///
-    /// Dropping the receiver drops the subscription.
-    ///
-    /// Does nothing if the arena is unknown.
-    ///
-    /// All required inotify watches are guaranteed to have been
-    /// created when this function returns true, so any changes after
-    /// that will be caught. Note that this might take some time as
-    /// creating watches requires going through the whole arena, so
-    /// use a join if you need to subscribe to multiple arenas at the
-    /// same time.
-    fn subscribe(
-        &self,
-        arena: Arena,
-        tx: mpsc::Sender<super::Notification>,
-        catchup: bool,
-    ) -> anyhow::Result<bool>;
-}
-
 /// Local storage, for all [Arena]s.
 #[derive(Clone)]
 pub struct RealStore {
@@ -402,21 +374,6 @@ impl RealStore {
             },
         )
         .ok_or(unknown_arena())
-    }
-}
-
-impl StoreSubscribe for RealStore {
-    fn arenas(&self) -> Vec<Arena> {
-        RealStore::arenas(self)
-    }
-
-    fn subscribe(
-        &self,
-        arena: Arena,
-        tx: mpsc::Sender<super::Notification>,
-        catchup: bool,
-    ) -> anyhow::Result<bool> {
-        RealStore::subscribe(self, arena, tx, catchup)
     }
 }
 

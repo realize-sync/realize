@@ -29,11 +29,17 @@ struct FileTableEntry {
 struct FileContent {
   arena @0: Text;
   path @1: Text;
+  hash @2: Data;
 }
 
 struct FileMetadata {
   size @0: UInt64;
   mtime @1: Time;
+}
+
+struct PeerTableEntry {
+  uuidHi @0: UInt64;
+  uuidLo @1: UInt64;
 }
 
 # Time as duration since UNIX_EPOCH.
