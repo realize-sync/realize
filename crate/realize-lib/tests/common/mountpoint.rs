@@ -1,13 +1,13 @@
 use crate::common::config::Config;
 use assert_fs::TempDir;
 use nix::fcntl::{Flock, FlockArg};
+use realize_lib::fs::downloader::Downloader;
 use realize_lib::model::{Arena, Peer};
 use realize_lib::network::hostport::HostPort;
 use realize_lib::network::rpc::realstore;
 use realize_lib::network::security::{PeerVerifier, RawPublicKeyResolver};
 use realize_lib::network::{Networking, Server};
-use realize_lib::storage::real::RealStore;
-use realize_lib::storage::unreal::{Downloader, UnrealCacheAsync, UnrealCacheBlocking};
+use realize_lib::storage::{RealStore, UnrealCacheAsync};
 use realize_lib::utils::async_utils::AbortOnDrop;
 use rustls::pki_types::pem::PemObject as _;
 use std::fs::File;
@@ -45,9 +45,7 @@ impl Fixture {
         let server = Arc::new(server);
         let addr = server.listen(&HostPort::localhost(0)).await?;
 
-        let mut cache = in_memory_cache()?;
-        cache.add_arena(&arena)?;
-        let cache = cache.into_async();
+        let cache = in_memory_cache(arena.clone()).await?;
 
         let downloader = Downloader::new(
             Networking::new(
@@ -161,10 +159,12 @@ async fn export_retry(
     ))
 }
 
-fn in_memory_cache() -> anyhow::Result<UnrealCacheBlocking> {
-    let cache = realize_lib::storage::unreal::UnrealCacheBlocking::new(
+async fn in_memory_cache(arena: Arena) -> anyhow::Result<UnrealCacheAsync> {
+    let cache = UnrealCacheAsync::with_db(
+        [arena],
         redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?,
-    )?;
+    )
+    .await?;
 
     Ok(cache)
 }

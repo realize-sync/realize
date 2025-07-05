@@ -1,14 +1,15 @@
-#![cfg(target_os = "linux")]
-
-use assert_fs::prelude::{FileWriteStr as _, PathChild as _};
+use assert_fs::prelude::*;
 use common::mountpoint;
-use realize_lib::model::{Path, UnixTime};
+use realize_lib::model::{Hash, Path, UnixTime};
+use realize_lib::storage::Notification;
+use realize_lib::utils::hash;
 use std::os::unix::fs::PermissionsExt as _;
 
 mod common;
 
 #[tokio::test]
 #[test_tag::tag(nfsmount)]
+#[cfg_attr(target_os = "linux", ignore)]
 async fn export_arena() -> anyhow::Result<()> {
     let fixture = mountpoint::Fixture::setup().await?;
 
@@ -30,17 +31,38 @@ async fn export_arena() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[test_tag::tag(nfsmount)]
-async fn export_linked_files() -> anyhow::Result<()> {
+#[cfg_attr(target_os = "linux", ignore)]
+async fn export_files() -> anyhow::Result<()> {
     let fixture = mountpoint::Fixture::setup().await?;
     let cache = &fixture.cache;
     let peer = realize_lib::model::Peer::from("peer");
     let arena = &fixture.arena;
     let test_mtime = UnixTime::from_secs(1234567890);
     cache
-        .link(&peer, arena, &Path::parse("a/b/c.txt")?, 1024, &test_mtime)
+        .update(
+            &peer,
+            Notification::Add {
+                arena: arena.clone(),
+                index: 0,
+                path: Path::parse("a/b/c.txt")?,
+                mtime: test_mtime.clone(),
+                size: 1024,
+                hash: Hash([1u8; 32]),
+            },
+        )
         .await?;
     cache
-        .link(&peer, arena, &Path::parse("a/b/d.txt")?, 2048, &test_mtime)
+        .update(
+            &peer,
+            Notification::Add {
+                arena: arena.clone(),
+                index: 0,
+                path: Path::parse("a/b/d.txt")?,
+                mtime: test_mtime.clone(),
+                size: 2048,
+                hash: Hash([2u8; 32]),
+            },
+        )
         .await?;
 
     let mut entries = vec![];
@@ -71,6 +93,7 @@ async fn export_linked_files() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[test_tag::tag(nfsmount)]
+#[cfg_attr(target_os = "linux", ignore)]
 async fn read_file() -> anyhow::Result<()> {
     let fixture = mountpoint::Fixture::setup().await?;
     let cache = &fixture.cache;
@@ -81,7 +104,17 @@ async fn read_file() -> anyhow::Result<()> {
     testfile.write_str("hello, world")?;
     let m = tokio::fs::metadata(&testfile.path()).await?;
     cache
-        .link(&peer, arena, &path, m.len(), &UnixTime::mtime(&m))
+        .update(
+            &peer,
+            Notification::Add {
+                arena: arena.clone(),
+                index: 0,
+                path: path.clone(),
+                mtime: UnixTime::mtime(&m),
+                size: m.len(),
+                hash: hash::digest("hello, world"),
+            },
+        )
         .await?;
 
     assert_eq!(
