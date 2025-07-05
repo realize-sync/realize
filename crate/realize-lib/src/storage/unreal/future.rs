@@ -1,5 +1,5 @@
 use super::{
-    FileMetadata, FileTableEntry, InodeAssignment, ReadDirEntry, UnrealCacheBlocking, UnrealError,
+    FileAvailability, FileMetadata, InodeAssignment, ReadDirEntry, UnrealCacheBlocking, UnrealError,
 };
 use crate::model::{Arena, Path, Peer, UnixTime};
 use crate::storage::config::StorageConfig;
@@ -79,10 +79,7 @@ impl UnrealCacheAsync {
         task::spawn_blocking(move || inner.file_metadata(inode)).await?
     }
 
-    pub async fn file_availability(
-        &self,
-        inode: u64,
-    ) -> Result<Vec<(Peer, FileTableEntry)>, UnrealError> {
+    pub async fn file_availability(&self, inode: u64) -> Result<FileAvailability, UnrealError> {
         let inner = Arc::clone(&self.inner);
 
         task::spawn_blocking(move || inner.file_availability(inode)).await?

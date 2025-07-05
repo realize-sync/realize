@@ -1,7 +1,6 @@
+use super::downloader::{Download, Downloader};
 use crate::model::UnixTime;
-use crate::storage::unreal::{
-    self, Download, Downloader, FileMetadata, InodeAssignment, UnrealCacheAsync, UnrealError,
-};
+use crate::storage::unreal::{self, FileMetadata, InodeAssignment, UnrealCacheAsync, UnrealError};
 use async_trait::async_trait;
 use moka::future::Cache;
 use nfsserve::nfs::{

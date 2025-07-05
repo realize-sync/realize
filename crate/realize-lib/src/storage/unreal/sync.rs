@@ -100,6 +100,22 @@ pub struct UnrealCacheBlocking {
     arena_map: HashMap<Arena, u64>,
 }
 
+/// A file and all versions known to the cache.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileAvailability {
+    pub arena: Arena,
+    pub path: Path,
+    pub versions: Vec<FileVersion>,
+}
+
+/// Specific version of a file.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileVersion {
+    pub peer: Peer,
+    pub metadata: FileMetadata,
+    pub hash: Hash,
+}
+
 impl UnrealCacheBlocking {
     /// Create a new UnrealCache from a redb database.
     pub fn new(db: Database) -> Result<Self, UnrealError> {
@@ -198,11 +214,13 @@ impl UnrealCacheBlocking {
     /// Return the best metadata for the file.
     pub fn file_metadata(&self, inode: u64) -> Result<FileMetadata, UnrealError> {
         let txn = self.db.begin_read()?;
-        if let Some((_, entry)) = do_file_availability(&txn, inode)?.into_iter().next() {
-            return Ok(entry.metadata);
-        }
 
-        Err(UnrealError::NotFound)
+        do_file_availability(&txn, inode)?
+            .versions
+            .into_iter()
+            .next()
+            .map(|v| v.metadata)
+            .ok_or(UnrealError::NotFound)
     }
 
     /// Return the mtime of the directory.
@@ -215,10 +233,7 @@ impl UnrealCacheBlocking {
     /// Return valid peer file entries for the file.
     ///
     /// The returned vector might be empty if the file isn't available in any peer.
-    pub fn file_availability(
-        &self,
-        inode: u64,
-    ) -> Result<Vec<(Peer, FileTableEntry)>, UnrealError> {
+    pub fn file_availability(&self, inode: u64) -> Result<FileAvailability, UnrealError> {
         let txn = self.db.begin_read()?;
 
         do_file_availability(&txn, inode)
@@ -502,26 +517,51 @@ fn get_file_entry(
 fn do_file_availability(
     txn: &ReadTransaction,
     inode: u64,
-) -> Result<Vec<(Peer, FileTableEntry)>, UnrealError> {
+) -> Result<FileAvailability, UnrealError> {
     let file_table = txn.open_table(FILE_TABLE)?;
 
     // TODO: do something with hashes. When two peers have different
     // hashes, it should be possible, from the chain of hashes
     // reported by add and replace notifications, to figure out which
     // one has replaced the other (directly or indirectly).
-    let mut all = vec![];
+    let mut entries = vec![];
     for entry in file_table.range((inode, "")..(inode + 1, ""))? {
         let entry = entry?;
         let peer = Peer::from(entry.0.value().1);
         let file_entry: FileTableEntry = entry.1.value().parse()?;
-        all.push((peer, file_entry));
+        entries.push((peer, file_entry));
+    }
+    if entries.is_empty() {
+        return Err(UnrealError::NotFound);
+    }
+    let arena = entries[0].1.content.arena.clone();
+    let path = entries[0].1.content.path.clone();
+    let mut versions = entries
+        .into_iter()
+        .map(|(peer, entry)| {
+            let FileTableEntry {
+                metadata,
+                content: FileContent { hash, .. },
+                ..
+            } = entry;
+
+            FileVersion {
+                peer,
+                metadata,
+                hash,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(best_mtime) = versions.iter().map(|v| v.metadata.mtime.clone()).max() {
+        versions.retain(|v| v.metadata.mtime == best_mtime);
     }
 
-    if let Some(best_mtime) = all.iter().map(|(_, e)| e.metadata.mtime.clone()).max() {
-        all.retain(|(_, e)| e.metadata.mtime == best_mtime);
-    }
-
-    Ok(all)
+    Ok(FileAvailability {
+        arena,
+        path,
+        versions,
+    })
 }
 
 /// Implement [UnrealCache::link] in a transaction.
@@ -1320,40 +1360,28 @@ mod tests {
         let parent_inode = cache.arena_root(&arena)?;
         let inode = cache.lookup(parent_inode, "file.txt")?.inode;
         let avail = cache.file_availability(inode)?;
+        assert_eq!(arena, avail.arena);
+        assert_eq!(path, avail.path);
         assert_unordered::assert_eq_unordered!(
             vec![
-                (
-                    b.clone(),
-                    FileTableEntry {
-                        content: FileContent {
-                            arena: arena.clone(),
-                            path: path.clone(),
-                            hash: Hash([2u8; 32]),
-                        },
-                        metadata: FileMetadata {
-                            size: 200,
-                            mtime: later_time(),
-                        },
-                        parent_inode
-                    }
-                ),
-                (
-                    c.clone(),
-                    FileTableEntry {
-                        content: FileContent {
-                            arena: arena.clone(),
-                            path: path.clone(),
-                            hash: Hash([2u8; 32])
-                        },
-                        metadata: FileMetadata {
-                            size: 200,
-                            mtime: later_time(),
-                        },
-                        parent_inode
-                    }
-                )
+                FileVersion {
+                    peer: b.clone(),
+                    metadata: FileMetadata {
+                        size: 200,
+                        mtime: later_time(),
+                    },
+                    hash: Hash([2u8; 32]),
+                },
+                FileVersion {
+                    peer: c.clone(),
+                    metadata: FileMetadata {
+                        size: 200,
+                        mtime: later_time(),
+                    },
+                    hash: Hash([2u8; 32]),
+                },
             ],
-            avail
+            avail.versions
         );
 
         Ok(())

@@ -1,10 +1,11 @@
 use super::config::Config;
+use crate::fs::downloader::Downloader;
 use crate::model::Arena;
 use crate::network::rpc::{Household, realstore};
 use crate::network::{Networking, Server};
 use crate::storage::config::ArenaConfig;
 use crate::storage::real::RealStore;
-use crate::storage::unreal::{Downloader, UnrealCacheAsync};
+use crate::storage::unreal::UnrealCacheAsync;
 use std::collections::HashMap;
 use std::sync::Arc;
 

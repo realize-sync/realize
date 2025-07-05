@@ -1,9 +1,9 @@
-use super::{FileTableEntry, UnrealCacheAsync, UnrealError};
-use crate::model::{ByteRange, Peer};
+use crate::model::{Arena, ByteRange, Path, Peer};
 use crate::network::Networking;
 use crate::network::rpc::realstore::client::{ClientOptions, RealStoreClient};
 use crate::network::rpc::realstore::{self};
 use crate::storage::real::{self, RealStoreError};
+use crate::storage::unreal::{FileAvailability, FileVersion, UnrealCacheAsync, UnrealError};
 use moka::future::{Cache, CacheBuilder};
 use std::cmp::min;
 use std::collections::VecDeque;
@@ -40,51 +40,69 @@ impl Downloader {
 
     pub async fn reader(&self, inode: u64) -> Result<Download, UnrealError> {
         let avail = self.cache.file_availability(inode).await?;
-        if avail.is_empty() {
-            return Err(UnrealError::NotFound);
-        }
 
-        let (client, peer, entry) = self.choose(avail).await?;
+        let (client, arena, path, version) = self.choose(avail).await?;
 
-        Ok(Download::new(client, peer, entry))
+        // TODO: check hash
+        Ok(Download::new(
+            client,
+            version.peer,
+            arena,
+            path,
+            version.metadata.size,
+        ))
     }
 
     async fn choose(
         &self,
-        avail: Vec<(Peer, FileTableEntry)>,
-    ) -> Result<(Arc<RealStoreClient>, Peer, FileTableEntry), UnrealError> {
-        for (peer, entry) in &avail {
-            if let Some(client) = self.clients.get(peer).await {
+        avail: FileAvailability,
+    ) -> Result<(Arc<RealStoreClient>, Arena, Path, FileVersion), UnrealError> {
+        for version in &avail.versions {
+            if let Some(client) = self.clients.get(&version.peer).await {
                 // TODO: check if client is still connected, if no,
                 // connecting to another client would be better.
                 log::debug!(
-                    "Reusing connection to {peer} to download {:?}",
-                    entry.content,
+                    "Reusing connection to {} to download [{}]/{} {}",
+                    version.peer,
+                    avail.arena,
+                    avail.path,
+                    version.hash
                 );
-                return Ok((client, peer.clone(), entry.clone()));
+                return Ok((client, avail.arena, avail.path, version.clone()));
             }
         }
 
         let mut set = JoinSet::new();
-        for (peer, entry) in avail {
+        for version in avail.versions {
             let networking = self.networking.clone();
             set.spawn(async move {
-                let client =
-                    realstore::client::connect(&networking, &peer, ClientOptions::default())
-                        .await?;
+                let client = realstore::client::connect(
+                    &networking,
+                    &version.peer,
+                    ClientOptions::default(),
+                )
+                .await?;
 
-                log::debug!("Connected to {peer} to download {:?}", entry.content);
-
-                Ok::<_, anyhow::Error>((client, peer, entry))
+                Ok::<_, anyhow::Error>((client, version))
             });
         }
         while let Some(res) = set.join_next().await {
-            if let Ok(Ok((client, peer, entry))) = res {
+            if let Ok(Ok((client, version))) = res {
                 let client = Arc::new(client);
-                self.clients.insert(peer.clone(), Arc::clone(&client)).await;
+                self.clients
+                    .insert(version.peer.clone(), Arc::clone(&client))
+                    .await;
+                log::debug!(
+                    "Connected to {} to download [{}]/{} {}",
+                    version.peer,
+                    avail.arena,
+                    avail.path,
+                    version.hash
+                );
+
                 // TODO: consider keeping any other successful
                 // connections here instead of discarding them.
-                return Ok((client, peer, entry));
+                return Ok((client, avail.arena, avail.path, version));
             }
         }
         Err(UnrealError::Unavailable)
@@ -94,7 +112,9 @@ impl Downloader {
 pub struct Download {
     client: Arc<RealStoreClient>,
     peer: Peer,
-    entry: FileTableEntry,
+    arena: Arena,
+    path: Path,
+    size: u64,
     offset: u64,
     pending_seek: Option<u64>,
     avail: VecDeque<(ByteRange, Vec<u8>)>,
@@ -105,11 +125,13 @@ type PendingDownload =
     Pin<Box<dyn Future<Output = Result<Result<Vec<u8>, RealStoreError>, RpcError>> + Send + Sync>>;
 
 impl Download {
-    fn new(client: Arc<RealStoreClient>, peer: Peer, entry: FileTableEntry) -> Self {
+    fn new(client: Arc<RealStoreClient>, peer: Peer, arena: Arena, path: Path, size: u64) -> Self {
         Self {
             client,
             peer,
-            entry,
+            arena,
+            path,
+            size,
             offset: 0,
             pending_seek: None,
             avail: VecDeque::new(),
@@ -119,7 +141,7 @@ impl Download {
 
     /// Check whether the current offset is at or past the file end.
     pub fn at_end(&self) -> bool {
-        self.offset >= self.entry.metadata.size
+        self.offset >= self.size
     }
 
     fn fill(&mut self, buf: &mut ReadBuf<'_>) -> bool {
@@ -129,9 +151,10 @@ impl Download {
             let intersection = requested.intersection(range);
             if !intersection.is_empty() && intersection.start == self.offset {
                 log::debug!(
-                    "From {}, return {:?} {}",
+                    "From {}, return [{}]/{} {}",
                     self.peer,
-                    self.entry.content,
+                    self.arena,
+                    self.path,
                     intersection
                 );
 
@@ -157,7 +180,7 @@ impl Download {
 
     fn next_request(&mut self, bufsize: usize) -> (ByteRange, PendingDownload) {
         let offset = self.offset;
-        let end = self.entry.metadata.size;
+        let end = self.size;
         let next = self
             .avail
             .back()
@@ -173,16 +196,17 @@ impl Download {
         );
 
         log::debug!(
-            "From {}, download {:?} {}",
+            "From {}, download [{}]/{} {}",
             self.peer,
-            self.entry.content,
+            self.arena,
+            self.path,
             range
         );
 
         let fut = {
             let client = Arc::clone(&self.client);
-            let arena = self.entry.content.arena.clone();
-            let path = self.entry.content.path.clone();
+            let arena = self.arena.clone();
+            let path = self.path.clone();
             let range = range.clone();
 
             Box::pin(async move {
@@ -206,7 +230,7 @@ impl Download {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        if self.offset >= self.entry.metadata.size || self.fill(buf) {
+        if self.offset >= self.size || self.fill(buf) {
             return Poll::Ready(Ok(()));
         }
         let (range, mut fut) = match self.pending.take() {
@@ -251,7 +275,7 @@ fn relative_offset(offset: i64, base: u64) -> Result<u64, std::io::Error> {
 
 impl AsyncSeek for Download {
     fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> std::io::Result<()> {
-        let end = self.entry.metadata.size;
+        let end = self.size;
         let goal = std::cmp::min(
             end,
             match position {
