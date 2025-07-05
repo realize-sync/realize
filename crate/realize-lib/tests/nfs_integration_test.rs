@@ -9,7 +9,7 @@ mod common;
 
 #[tokio::test]
 #[test_tag::tag(nfsmount)]
-#[cfg_attr(target_os = "linux", ignore)]
+#[cfg_attr(not(target_os = "linux"), ignore)]
 async fn export_arena() -> anyhow::Result<()> {
     let fixture = mountpoint::Fixture::setup().await?;
 
@@ -31,7 +31,7 @@ async fn export_arena() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[test_tag::tag(nfsmount)]
-#[cfg_attr(target_os = "linux", ignore)]
+#[cfg_attr(not(target_os = "linux"), ignore)]
 async fn export_files() -> anyhow::Result<()> {
     let fixture = mountpoint::Fixture::setup().await?;
     let cache = &fixture.cache;
@@ -93,7 +93,7 @@ async fn export_files() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[test_tag::tag(nfsmount)]
-#[cfg_attr(target_os = "linux", ignore)]
+#[cfg_attr(not(target_os = "linux"), ignore)]
 async fn read_file() -> anyhow::Result<()> {
     let fixture = mountpoint::Fixture::setup().await?;
     let cache = &fixture.cache;
