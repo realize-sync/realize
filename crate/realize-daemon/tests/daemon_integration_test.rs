@@ -12,6 +12,7 @@ use realize_lib::network::config::PeerConfig;
 use realize_lib::network::rpc::realstore;
 use realize_lib::network::rpc::realstore::client::ClientOptions;
 use realize_lib::storage::RealStoreOptions;
+use realize_lib::storage::config::IndexConfig;
 use realize_lib::storage::config::{ArenaConfig, CacheConfig};
 use reqwest::Client;
 use std::fs;
@@ -384,14 +385,22 @@ async fn daemon_exports_nfs() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn daemon_updates_cache() -> anyhow::Result<()> {
     use nfs3_types::nfs3::{LOOKUP3args, READ3args, diropargs3, nfs_fh3};
     use std::time::Duration;
     use tokio_retry::strategy::FixedInterval;
 
-    let fixture_a = Fixture::setup().await?;
+    let mut fixture_a = Fixture::setup().await?;
+    fixture_a
+        .config
+        .storage
+        .arenas
+        .get_mut(&Arena::from("testdir"))
+        .unwrap()
+        .index = Some(IndexConfig {
+        db: fixture_a.tempdir.join("index.db"),
+    });
     let mut daemon_a = fixture_a.command()?.spawn()?;
     let a_port = wait_for_listening_port(daemon_a.stdout.as_mut().unwrap()).await?;
 

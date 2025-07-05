@@ -280,6 +280,7 @@ impl UnrealCacheBlocking {
     }
 
     pub fn update(&self, peer: &Peer, notification: Notification) -> Result<(), UnrealError> {
+        log::debug!("notification from {peer}: {notification:?}");
         let txn = self.db.begin_write()?;
         match notification {
             Notification::Add {

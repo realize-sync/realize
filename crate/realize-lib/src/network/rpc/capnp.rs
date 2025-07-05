@@ -320,13 +320,18 @@ impl AppContext {
         let arenas = reply.get()?.get_arenas()?;
         let peer_arenas = parse_arena_set(arenas)?;
 
-        let goal_arenas = self
-            .storage
-            .indexed_arenas()
+        let goal_arenas = cache
+            .arenas()
             .filter(|a| peer_arenas.contains(*a))
             .map(|a| a.clone())
             .collect::<Vec<_>>();
         if goal_arenas.is_empty() {
+            log::debug!(
+                "Not subscribing to {peer}: no common arena. {:?} vs {:?}",
+                peer_arenas,
+                cache.arenas().collect::<Vec<_>>(),
+            );
+
             return Ok(());
         }
         log::debug!(
@@ -491,7 +496,12 @@ impl store::Server for ConnectedPeerServer {
         params: SubscribeParams,
         results: SubscribeResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::from_future(do_subscribe(Rc::clone(&self.ctx), params, results))
+        Promise::from_future(do_subscribe(
+            self.peer.clone(),
+            Rc::clone(&self.ctx),
+            params,
+            results,
+        ))
     }
 }
 
@@ -607,6 +617,7 @@ async fn do_notify(
 }
 
 async fn do_subscribe(
+    peer: Peer,
     ctx: Rc<AppContext>,
     params: SubscribeParams,
     mut results: SubscribeResults,
@@ -632,10 +643,13 @@ async fn do_subscribe(
     let storage = ctx.storage.clone();
     if let Err(err) = ctx
         .main_rt
-        .spawn(async move {
-            storage.subscribe(&arena, tx, progress).await?;
+        .spawn({
+            let arena = arena.clone();
+            async move {
+                storage.subscribe(&arena, tx, progress).await?;
 
-            Ok::<(), anyhow::Error>(())
+                Ok::<(), anyhow::Error>(())
+            }
         })
         .await
     {
@@ -643,6 +657,7 @@ async fn do_subscribe(
         return Ok(());
     }
 
+    log::debug!("{peer} subscribed to notifications from {arena}");
     tokio::task::spawn_local(async move {
         let mut notifications = Vec::new();
         loop {
@@ -651,6 +666,7 @@ async fn do_subscribe(
                 // Channel has been closed
                 return;
             }
+            log::debug!("notify {peer}: {notifications:?}");
             if let Err(err) = send_notifications(notifications.as_slice(), &subscriber).await {
                 if err.kind == capnp::ErrorKind::Disconnected {
                     return;
