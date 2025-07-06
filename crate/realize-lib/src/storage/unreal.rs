@@ -2,13 +2,10 @@ use crate::model::{self, Arena, Hash, Path, UnixTime};
 use crate::utils::holder::{ByteConversionError, ByteConvertible, NamedType};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
-use error::UnrealError;
-use future::UnrealCacheAsync;
 use uuid::Uuid;
 
 pub mod cache;
 pub mod error;
-pub mod future;
 #[allow(dead_code)]
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]

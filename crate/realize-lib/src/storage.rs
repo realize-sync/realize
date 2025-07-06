@@ -18,9 +18,8 @@ mod unreal;
 pub use real::notifier::Notification;
 pub use real::notifier::Progress;
 pub use real::store::{Options as RealStoreOptions, RealStore, RealStoreError, SyncedFile};
-pub use unreal::cache::{FileAvailability, FileVersion};
+pub use unreal::cache::{FileAvailability, FileVersion, UnrealCacheAsync};
 pub use unreal::error::UnrealError;
-pub use unreal::future::UnrealCacheAsync;
 pub use unreal::{FileMetadata, InodeAssignment};
 
 /// Local storage, including the real store and an unreal cache.
