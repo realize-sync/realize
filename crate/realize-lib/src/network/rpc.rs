@@ -1,4 +1,4 @@
-mod capnp;
+mod household;
 pub mod realstore;
 
 #[allow(dead_code)]
@@ -33,4 +33,4 @@ mod store_capnp {
     include!(concat!(env!("OUT_DIR"), "/store_capnp.rs"));
 }
 
-pub use capnp::Household;
+pub use household::Household;
