@@ -278,11 +278,19 @@ impl UnrealCacheBlocking {
                 size,
                 hash,
             } => {
-                let root = self.arena_root(&arena)?;
-                do_link(&txn, peer, &arena, root, &path, size, &mtime, hash, |_| {
-                    false
-                })?;
                 do_update_last_seen_notification(&txn, peer, &arena, index)?;
+
+                let mut file_table = txn.open_table(FILE_TABLE)?;
+                let (parent_inode, file_inode) =
+                    do_create_file(&txn, self.arena_root(&arena)?, &path)?;
+                if !get_file_entry(&file_table, file_inode, peer)?.is_some() {
+                    do_write_file_entry(
+                        &mut file_table,
+                        file_inode,
+                        peer,
+                        FileTableEntry::new(arena, path, size, mtime, hash, parent_inode),
+                    )?;
+                }
             }
             Notification::Replace {
                 arena,
@@ -293,19 +301,22 @@ impl UnrealCacheBlocking {
                 hash,
                 old_hash,
             } => {
-                let root = self.arena_root(&arena)?;
-                do_link(
-                    &txn,
-                    peer,
-                    &arena,
-                    root,
-                    &path,
-                    size,
-                    &mtime,
-                    hash,
-                    |existing| old_hash == existing.content.hash,
-                )?;
                 do_update_last_seen_notification(&txn, peer, &arena, index)?;
+
+                let (parent_inode, file_inode) =
+                    do_create_file(&txn, self.arena_root(&arena)?, &path)?;
+
+                let mut file_table = txn.open_table(FILE_TABLE)?;
+                if let Some(existing) = get_file_entry(&file_table, file_inode, peer)?
+                    && existing.content.hash == old_hash
+                {
+                    do_write_file_entry(
+                        &mut file_table,
+                        file_inode,
+                        peer,
+                        FileTableEntry::new(arena, path, size, mtime, hash, parent_inode),
+                    )?;
+                }
             }
             Notification::Remove {
                 arena,
@@ -313,9 +324,10 @@ impl UnrealCacheBlocking {
                 path,
                 old_hash,
             } => {
+                do_update_last_seen_notification(&txn, peer, &arena, index)?;
+
                 let root = self.arena_root(&arena)?;
                 do_unlink(&txn, peer, root, &path, old_hash)?;
-                do_update_last_seen_notification(&txn, peer, &arena, index)?;
             }
             Notification::CatchupStart(arena) => {
                 do_mark_peer_files(&txn, peer, &arena)?;
@@ -327,11 +339,18 @@ impl UnrealCacheBlocking {
                 size,
                 hash,
             } => {
-                let root = self.arena_root(&arena)?;
-                let inode = do_link(&txn, peer, &arena, root, &path, size, &mtime, hash, |_| {
-                    true
-                })?;
-                do_unmark_peer_file(&txn, peer, &arena, inode)?;
+                let (parent_inode, file_inode) =
+                    do_create_file(&txn, self.arena_root(&arena)?, &path)?;
+
+                do_unmark_peer_file(&txn, peer, &arena, file_inode)?;
+
+                let mut file_table = txn.open_table(FILE_TABLE)?;
+                do_write_file_entry(
+                    &mut file_table,
+                    file_inode,
+                    peer,
+                    FileTableEntry::new(arena, path, size, mtime, hash, parent_inode),
+                )?;
             }
             Notification::CatchupComplete { arena, index } => {
                 do_delete_marked_files(&txn, peer, &arena)?;
@@ -699,27 +718,33 @@ fn do_file_availability(
     })
 }
 
-/// Implement [UnrealCache::link] in a transaction.
-///
-/// Return the inode of the file.
-fn do_link(
-    txn: &WriteTransaction,
+/// Write an entry in the file table, overwriting any existing one.
+fn do_write_file_entry(
+    file_table: &mut redb::Table<'_, (u64, &str), Holder<FileTableEntry>>,
+    file_inode: u64,
     peer: &Peer,
-    arena: &Arena,
+    entry: FileTableEntry,
+) -> Result<(), UnrealError> {
+    log::debug!("new file entry {file_inode} {peer} {}", entry.content.hash);
+
+    file_table.insert((file_inode, peer.as_str()), Holder::new(entry)?)?;
+
+    Ok(())
+}
+
+/// Retrieve or create a file entry at the given path.
+///
+/// Return the parent inode and the file inode.
+fn do_create_file(
+    txn: &WriteTransaction,
     arena_root: u64,
     path: &Path,
-    size: u64,
-    mtime: &UnixTime,
-    hash: Hash,
-    overwrite: impl FnOnce(&FileTableEntry) -> bool,
-) -> Result<u64, UnrealError> {
+) -> Result<(u64, u64), UnrealError> {
     let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
-    let mut file_table = txn.open_table(FILE_TABLE)?;
-
     let filename = path.name();
     let parent_inode = do_mkdirs(txn, &mut dir_table, arena_root, &path.parent())?;
     let dir_entry = get_dir_entry(&dir_table, parent_inode, filename)?;
-    let inode = match dir_entry {
+    let file_inode = match dir_entry {
         None => add_dir_entry(
             txn,
             &mut dir_table,
@@ -728,33 +753,16 @@ fn do_link(
             InodeAssignment::File,
         )?,
         Some(dir_entry) => {
-            if let Some(existing) = get_file_entry(&file_table, dir_entry.inode, peer)? {
-                if !overwrite(&existing) {
-                    return Ok(dir_entry.inode);
-                }
+            if dir_entry.assignment != InodeAssignment::File {
+                return Err(UnrealError::IsADirectory);
             }
 
             dir_entry.inode
         }
     };
-    log::debug!("new file entry ({inode} {peer}) {hash}");
-    file_table.insert(
-        (inode, peer.as_str()),
-        Holder::new(FileTableEntry {
-            metadata: FileMetadata {
-                size,
-                mtime: mtime.clone(),
-            },
-            content: FileContent {
-                arena: arena.clone(),
-                path: path.clone(),
-                hash,
-            },
-            parent_inode,
-        })?,
-    )?;
 
-    Ok(inode)
+    log::debug!("new dir entry {parent_inode} {filename} {file_inode}");
+    Ok((parent_inode, file_inode))
 }
 
 /// Make sure that the given path is a directory; create it if necessary.

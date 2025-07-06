@@ -54,6 +54,27 @@ pub struct FileTableEntry {
     pub parent_inode: u64,
 }
 
+impl FileTableEntry {
+    pub fn new(
+        arena: Arena,
+        path: Path,
+        size: u64,
+        mtime: UnixTime,
+        hash: Hash,
+        parent_inode: u64,
+    ) -> Self {
+        Self {
+            metadata: FileMetadata { size, mtime: mtime },
+            content: FileContent {
+                arena: arena,
+                path: path,
+                hash,
+            },
+            parent_inode,
+        }
+    }
+}
+
 /// Information needed to fetch a file from a remote peer.
 #[derive(Clone, PartialEq)]
 pub struct FileContent {
