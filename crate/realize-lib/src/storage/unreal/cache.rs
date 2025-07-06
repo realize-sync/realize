@@ -2,14 +2,14 @@
 //!
 //! See `spec/unreal.md` for details.
 
-use super::{
-    DirTableEntry, FileMetadata, FileTableEntry, InodeAssignment, PeerTableEntry, ReadDirEntry,
+use super::error::UnrealError;
+use super::types::{
+    DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry, FileVersion,
+    InodeAssignment, PeerTableEntry, ReadDirEntry,
 };
 use crate::model::{Arena, Hash, Path, Peer, UnixTime};
 use crate::storage::config::StorageConfig;
 use crate::storage::real::notifier::{Notification, Progress};
-use crate::storage::unreal::FileContent;
-use crate::storage::unreal::error::UnrealError;
 use crate::utils::holder::Holder;
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
 use std::collections::HashMap;
@@ -101,22 +101,6 @@ const NOTIFICATION_TABLE: TableDefinition<(&str, &str), u64> = TableDefinition::
 pub struct UnrealCacheBlocking {
     db: Database,
     arena_map: HashMap<Arena, u64>,
-}
-
-/// A file and all versions known to the cache.
-#[derive(Clone, Debug, PartialEq)]
-pub struct FileAvailability {
-    pub arena: Arena,
-    pub path: Path,
-    pub versions: Vec<FileVersion>,
-}
-
-/// Specific version of a file.
-#[derive(Clone, Debug, PartialEq)]
-pub struct FileVersion {
-    pub peer: Peer,
-    pub metadata: FileMetadata,
-    pub hash: Hash,
 }
 
 impl UnrealCacheBlocking {
