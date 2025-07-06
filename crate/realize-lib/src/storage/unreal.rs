@@ -6,9 +6,9 @@ use error::UnrealError;
 use future::UnrealCacheAsync;
 use uuid::Uuid;
 
+pub mod cache;
 pub mod error;
 pub mod future;
-pub mod sync;
 #[allow(dead_code)]
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]

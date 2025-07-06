@@ -1,5 +1,5 @@
+use super::cache::{FileAvailability, UnrealCacheBlocking};
 use super::error::UnrealError;
-use super::sync::{FileAvailability, UnrealCacheBlocking};
 use super::{FileMetadata, InodeAssignment, ReadDirEntry};
 use crate::model::{Arena, Path, Peer, UnixTime};
 use crate::storage::config::StorageConfig;
