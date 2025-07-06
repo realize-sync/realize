@@ -254,7 +254,7 @@ fn do_remove_file_or_dir(
         let index = next_history_index(&history_table)?;
         history_table.insert(
             index,
-            Holder::new(HistoryTableEntry::Remove(
+            Holder::with_content(HistoryTableEntry::Remove(
                 model::Path::parse(k.value())?,
                 v.value().parse()?.hash,
             ))?,
@@ -284,7 +284,7 @@ fn do_add_file(
     let same_hash = old_hash.as_ref().map(|h| *h == hash).unwrap_or(false);
     file_table.insert(
         path.as_str(),
-        Holder::new(FileTableEntry {
+        Holder::with_content(FileTableEntry {
             size,
             mtime: mtime.clone(),
             hash,
@@ -297,7 +297,7 @@ fn do_add_file(
     let index = next_history_index(&history_table)?;
     history_table.insert(
         index,
-        Holder::new(if let Some(old_hash) = old_hash {
+        Holder::with_content(if let Some(old_hash) = old_hash {
             HistoryTableEntry::Replace(path.clone(), old_hash)
         } else {
             HistoryTableEntry::Add(path.clone())
@@ -502,7 +502,7 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
         })
     }
 
-    fn to_bytes(self) -> Result<Vec<u8>, ByteConversionError> {
+    fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError> {
         let mut message = ::capnp::message::Builder::new_default();
         let mut builder: real_capnp::file_table_entry::Builder =
             message.init_root::<real_capnp::file_table_entry::Builder>();
@@ -555,7 +555,7 @@ impl ByteConvertible<HistoryTableEntry> for HistoryTableEntry {
         }
     }
 
-    fn to_bytes(self) -> Result<Vec<u8>, ByteConversionError> {
+    fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError> {
         let mut message = ::capnp::message::Builder::new_default();
         let mut builder: real_capnp::history_table_entry::Builder =
             message.init_root::<real_capnp::history_table_entry::Builder>();

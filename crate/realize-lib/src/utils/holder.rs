@@ -8,7 +8,7 @@ use std::str::Utf8Error;
 /// Either conversion are allowed to fail without causing a panic..
 pub trait ByteConvertible<T> {
     fn from_bytes(data: &[u8]) -> Result<T, ByteConversionError>;
-    fn to_bytes(self) -> Result<Vec<u8>, ByteConversionError>;
+    fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError>;
 }
 
 /// Give a name to the type; used by redb.
@@ -49,7 +49,13 @@ where
 {
     /// Create a Holder containing the byte representation of the
     /// given instance.
-    pub fn new(obj: T) -> Result<Self, ByteConversionError> {
+    pub fn with_content(obj: T) -> Result<Self, ByteConversionError> {
+        Self::new(&obj)
+    }
+
+    /// Create a Holder containing the byte representation of the
+    /// given instance.
+    pub fn new(obj: &T) -> Result<Self, ByteConversionError> {
         Ok(Holder::Owned(obj.to_bytes()?, PhantomData))
     }
 

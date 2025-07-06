@@ -3,7 +3,7 @@ use crate::network::Networking;
 use crate::network::rpc::realstore::client::{ClientOptions, RealStoreClient};
 use crate::network::rpc::realstore::{self};
 use crate::storage::{
-    FileAvailability, FileVersion, RealStoreError, RealStoreOptions, UnrealCacheAsync, UnrealError,
+    FileAvailability, RealStoreError, RealStoreOptions, UnrealCacheAsync, UnrealError,
 };
 use moka::future::{Cache, CacheBuilder};
 use std::cmp::min;
@@ -42,68 +42,64 @@ impl Downloader {
     pub async fn reader(&self, inode: u64) -> Result<Download, UnrealError> {
         let avail = self.cache.file_availability(inode).await?;
 
-        let (client, arena, path, version) = self.choose(avail).await?;
+        let (client, peer) = self.choose(&avail).await?;
 
         // TODO: check hash
         Ok(Download::new(
             client,
-            version.peer,
-            arena,
-            path,
-            version.metadata.size,
+            peer,
+            avail.arena,
+            avail.path,
+            avail.metadata.size,
         ))
     }
 
     async fn choose(
         &self,
-        avail: FileAvailability,
-    ) -> Result<(Arc<RealStoreClient>, Arena, Path, FileVersion), UnrealError> {
-        for version in &avail.versions {
-            if let Some(client) = self.clients.get(&version.peer).await {
+        avail: &FileAvailability,
+    ) -> Result<(Arc<RealStoreClient>, Peer), UnrealError> {
+        for peer in &avail.peers {
+            if let Some(client) = self.clients.get(&peer).await {
                 // TODO: check if client is still connected, if no,
                 // connecting to another client would be better.
                 log::debug!(
                     "Reusing connection to {} to download [{}]/{} {}",
-                    version.peer,
+                    peer,
                     avail.arena,
                     avail.path,
-                    version.hash
+                    avail.hash
                 );
-                return Ok((client, avail.arena, avail.path, version.clone()));
+                return Ok((client, peer.clone()));
             }
         }
 
         let mut set = JoinSet::new();
-        for version in avail.versions {
+        for peer in &avail.peers {
             let networking = self.networking.clone();
+            let peer = peer.clone();
             set.spawn(async move {
-                let client = realstore::client::connect(
-                    &networking,
-                    &version.peer,
-                    ClientOptions::default(),
-                )
-                .await?;
+                let client =
+                    realstore::client::connect(&networking, &peer, ClientOptions::default())
+                        .await?;
 
-                Ok::<_, anyhow::Error>((client, version))
+                Ok::<_, anyhow::Error>((client, peer))
             });
         }
         while let Some(res) = set.join_next().await {
-            if let Ok(Ok((client, version))) = res {
+            if let Ok(Ok((client, peer))) = res {
                 let client = Arc::new(client);
-                self.clients
-                    .insert(version.peer.clone(), Arc::clone(&client))
-                    .await;
+                self.clients.insert(peer.clone(), Arc::clone(&client)).await;
                 log::debug!(
                     "Connected to {} to download [{}]/{} {}",
-                    version.peer,
+                    peer,
                     avail.arena,
                     avail.path,
-                    version.hash
+                    avail.hash
                 );
 
                 // TODO: consider keeping any other successful
                 // connections here instead of discarding them.
-                return Ok((client, avail.arena, avail.path, version));
+                return Ok((client, peer.clone()));
             }
         }
         Err(UnrealError::Unavailable)

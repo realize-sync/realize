@@ -10,15 +10,9 @@ use uuid::Uuid;
 pub struct FileAvailability {
     pub arena: Arena,
     pub path: Path,
-    pub versions: Vec<FileVersion>,
-}
-
-/// Specific version of a file.
-#[derive(Clone, Debug, PartialEq)]
-pub struct FileVersion {
-    pub peer: Peer,
     pub metadata: FileMetadata,
     pub hash: Hash,
+    pub peers: Vec<Peer>,
 }
 
 /// An entry in a directory listing.
@@ -133,7 +127,7 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
         })
     }
 
-    fn to_bytes(self) -> Result<Vec<u8>, ByteConversionError> {
+    fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError> {
         let mut message = ::capnp::message::Builder::new_default();
         let mut builder: unreal_capnp::file_table_entry::Builder =
             message.init_root::<unreal_capnp::file_table_entry::Builder>();
@@ -220,7 +214,7 @@ impl ByteConvertible<DirTableEntry> for DirTableEntry {
         }
     }
 
-    fn to_bytes(self) -> Result<Vec<u8>, ByteConversionError> {
+    fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError> {
         let mut message = ::capnp::message::Builder::new_default();
         let builder: unreal_capnp::dir_table_entry::Builder =
             message.init_root::<unreal_capnp::dir_table_entry::Builder>();
@@ -271,7 +265,7 @@ impl ByteConvertible<PeerTableEntry> for PeerTableEntry {
         })
     }
 
-    fn to_bytes(self) -> Result<Vec<u8>, ByteConversionError> {
+    fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError> {
         let mut message = ::capnp::message::Builder::new_default();
         let mut builder: unreal_capnp::peer_table_entry::Builder =
             message.init_root::<unreal_capnp::peer_table_entry::Builder>();

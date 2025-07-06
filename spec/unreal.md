@@ -343,7 +343,7 @@ operation would need to do a range lookup to collect all names.
 
 **File Table**
 
-Key: `(u64, String)` (file inode, peer)
+Key: `(u64, &str)` (file inode, Option<peer>)
 Value:
 
 ```rust
@@ -375,25 +375,52 @@ struct FileMetadata {
 }
 ```
 
-Looking up file content requires range lookup, as the same inode can
-have data in more than one peers.
+An entry with no peer is maintained in parallel with the peer entries
+as the chosen version, the one shown in the directory and returned
+when read.
 
-If data is available from more than one peer, choose the one with the
-highest mtime. If more than one peer have the same maximum mtime, data
-can be fetched from any of these.
+This version is chosen in a way that tracks hash replacements:
 
-If data is available from more than one arenas, choose the one from
-the first arena, as declared in the config file.
+1. When the 1st peer entry is added, add a no-peer entry with the same
+   information.
 
-NOTE: This "on the fly" conflict resolution is good enough for the
-cache, which just reports what is available. A more configurable
-conflict resolution happens when peers sync; this outside the scope of
-the unreal cache.
+2. Whenever Notification::Replace comes with old_hash == no-peer entry
+   hash, update the no-peer entry with the new entry.
 
-**File Table**
+3. If there are no peer that has the version chosen in no-peer entry,
+   choose another version among the available one, the one with the
+   max mtime, and track than from now on.
 
-Key: `(u64, String)` (file inode, peer)
-Value:
+With this algorithm, the version that's returned is the most recent one
+according to one hash version chain, no matter what peer has it.
+
+There might be more than one chain available in the peers. The cache
+just chooses one (the first one added) and tracks that one, ignoring
+any parallel chain.
+
+Here's an example of a situation with two chains:
+
+```
+   / ----- B ---- D ---- E -----\
+A -|                            |- G
+   \--------- C -------------F--/
+
+```
+
+In this situation, the algorithm first chooses A, then moves on to B
+(the first reported), D, E and G, completely ignoring C and F.
+
+Choosing a different chain requires a UI that's not yet available.
+Eventually, it should be possible for a cache to query the history
+chain of all peers and to display that to the user for selection when
+there is more than one chain.
+
+Step 3 meant that the cache does jump history chains whenever a chain
+ends (with a Remove(old_hash=current)) so that a file remains
+available as long as it's available in at least one peer. This might
+be questionable (the history chain we selected and tracked has indeed
+ended), but practical (the user can get hold of a version of the
+file.) Once there is a UI, this might be an option.
 
 ## Future
 

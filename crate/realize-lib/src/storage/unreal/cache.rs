@@ -4,8 +4,8 @@
 
 use super::error::UnrealError;
 use super::types::{
-    DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry, FileVersion,
-    InodeAssignment, PeerTableEntry, ReadDirEntry,
+    DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry, InodeAssignment,
+    PeerTableEntry, ReadDirEntry,
 };
 use crate::model::{Arena, Hash, Path, Peer, UnixTime};
 use crate::storage::config::StorageConfig;
@@ -205,12 +205,7 @@ impl UnrealCacheBlocking {
     pub fn file_metadata(&self, inode: u64) -> Result<FileMetadata, UnrealError> {
         let txn = self.db.begin_read()?;
 
-        do_file_availability(&txn, inode)?
-            .versions
-            .into_iter()
-            .next()
-            .map(|v| v.metadata)
-            .ok_or(UnrealError::NotFound)
+        do_file_availability(&txn, inode).map(|a| a.metadata)
     }
 
     /// Return the mtime of the directory.
@@ -283,13 +278,13 @@ impl UnrealCacheBlocking {
                 let mut file_table = txn.open_table(FILE_TABLE)?;
                 let (parent_inode, file_inode) =
                     do_create_file(&txn, self.arena_root(&arena)?, &path)?;
-                if !get_file_entry(&file_table, file_inode, peer)?.is_some() {
-                    do_write_file_entry(
-                        &mut file_table,
-                        file_inode,
-                        peer,
-                        FileTableEntry::new(arena, path, size, mtime, hash, parent_inode),
-                    )?;
+                if !get_file_entry(&file_table, file_inode, Some(peer))?.is_some() {
+                    let entry = FileTableEntry::new(arena, path, size, mtime, hash, parent_inode);
+
+                    if !get_file_entry(&file_table, file_inode, None)?.is_some() {
+                        do_write_file_entry(&mut file_table, file_inode, None, &entry)?;
+                    }
+                    do_write_file_entry(&mut file_table, file_inode, Some(peer), &entry)?;
                 }
             }
             Notification::Replace {
@@ -307,15 +302,20 @@ impl UnrealCacheBlocking {
                     do_create_file(&txn, self.arena_root(&arena)?, &path)?;
 
                 let mut file_table = txn.open_table(FILE_TABLE)?;
-                if let Some(existing) = get_file_entry(&file_table, file_inode, peer)?
-                    && existing.content.hash == old_hash
+                let entry = FileTableEntry::new(arena, path, size, mtime, hash, parent_inode);
+                if let Some(e) = get_file_entry(&file_table, file_inode, None)?
+                    && e.content.hash == old_hash
                 {
-                    do_write_file_entry(
-                        &mut file_table,
-                        file_inode,
-                        peer,
-                        FileTableEntry::new(arena, path, size, mtime, hash, parent_inode),
-                    )?;
+                    // If it overwrites the entry that's current, it's
+                    // necessarily an entry we want.
+                    do_write_file_entry(&mut file_table, file_inode, None, &entry)?;
+                    do_write_file_entry(&mut file_table, file_inode, Some(peer), &entry)?;
+                } else if let Some(e) = get_file_entry(&file_table, file_inode, Some(peer))?
+                    && e.content.hash == old_hash
+                {
+                    // If it overwrites the peer's entry, we want to
+                    // keep that.
+                    do_write_file_entry(&mut file_table, file_inode, Some(peer), &entry)?;
                 }
             }
             Notification::Remove {
@@ -345,12 +345,11 @@ impl UnrealCacheBlocking {
                 do_unmark_peer_file(&txn, peer, &arena, file_inode)?;
 
                 let mut file_table = txn.open_table(FILE_TABLE)?;
-                do_write_file_entry(
-                    &mut file_table,
-                    file_inode,
-                    peer,
-                    FileTableEntry::new(arena, path, size, mtime, hash, parent_inode),
-                )?;
+                let entry = FileTableEntry::new(arena, path, size, mtime, hash, parent_inode);
+                if !get_file_entry(&file_table, file_inode, None)?.is_some() {
+                    do_write_file_entry(&mut file_table, file_inode, None, &entry)?;
+                }
+                do_write_file_entry(&mut file_table, file_inode, Some(peer), &entry)?;
             }
             Notification::CatchupComplete { arena, index } => {
                 do_delete_marked_files(&txn, peer, &arena)?;
@@ -365,7 +364,7 @@ impl UnrealCacheBlocking {
                         return Ok(());
                     }
                 }
-                peer_table.insert(key, Holder::new(PeerTableEntry { uuid })?)?;
+                peer_table.insert(key, Holder::with_content(PeerTableEntry { uuid })?)?;
                 let mut notification_table = txn.open_table(NOTIFICATION_TABLE)?;
                 notification_table.remove(key)?;
             }
@@ -660,9 +659,9 @@ fn do_unlink(
 fn get_file_entry(
     file_table: &redb::Table<'_, (u64, &str), Holder<FileTableEntry>>,
     inode: u64,
-    peer: &Peer,
+    peer: Option<&Peer>,
 ) -> Result<Option<FileTableEntry>, UnrealError> {
-    match file_table.get((inode, peer.as_str()))? {
+    match file_table.get((inode, peer.map(|p| p.as_str()).unwrap_or("")))? {
         None => Ok(None),
         Some(e) => Ok(Some(e.value().parse()?)),
     }
@@ -674,47 +673,40 @@ fn do_file_availability(
 ) -> Result<FileAvailability, UnrealError> {
     let file_table = txn.open_table(FILE_TABLE)?;
 
-    // TODO: do something with hashes. When two peers have different
-    // hashes, it should be possible, from the chain of hashes
-    // reported by add and replace notifications, to figure out which
-    // one has replaced the other (directly or indirectly).
-    let mut entries = vec![];
-    for entry in file_table.range((inode, "")..(inode + 1, ""))? {
-        let entry = entry?;
-        let peer = Peer::from(entry.0.value().1);
-        let file_entry: FileTableEntry = entry.1.value().parse()?;
-        entries.push((peer, file_entry));
-    }
-    if entries.is_empty() {
+    let mut range = file_table.range((inode, "")..(inode + 1, ""))?;
+    let (default_key, default_entry) = range.next().ok_or(UnrealError::NotFound)??;
+    if default_key.value().1 != "" {
+        log::warn!("File table entry without a default peer: {inode}");
         return Err(UnrealError::NotFound);
     }
-    let arena = entries[0].1.content.arena.clone();
-    let path = entries[0].1.content.path.clone();
-    let mut versions = entries
-        .into_iter()
-        .map(|(peer, entry)| {
-            let FileTableEntry {
-                metadata,
-                content: FileContent { hash, .. },
-                ..
-            } = entry;
+    let FileTableEntry {
+        metadata,
+        content: FileContent {
+            arena, path, hash, ..
+        },
+        ..
+    } = default_entry.value().parse()?;
 
-            FileVersion {
-                peer,
-                metadata,
-                hash,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    if let Some(best_mtime) = versions.iter().map(|v| v.metadata.mtime.clone()).max() {
-        versions.retain(|v| v.metadata.mtime == best_mtime);
+    let mut peers = vec![];
+    for entry in range {
+        let entry = entry?;
+        let file_entry: FileTableEntry = entry.1.value().parse()?;
+        if file_entry.content.hash == hash {
+            let peer = Peer::from(entry.0.value().1);
+            peers.push(peer);
+        }
+    }
+    if peers.is_empty() {
+        log::warn!("No peer has hash {hash} for {inode}");
+        return Err(UnrealError::NotFound);
     }
 
     Ok(FileAvailability {
         arena,
         path,
-        versions,
+        metadata,
+        hash,
+        peers,
     })
 }
 
@@ -722,12 +714,13 @@ fn do_file_availability(
 fn do_write_file_entry(
     file_table: &mut redb::Table<'_, (u64, &str), Holder<FileTableEntry>>,
     file_inode: u64,
-    peer: &Peer,
-    entry: FileTableEntry,
+    peer: Option<&Peer>,
+    entry: &FileTableEntry,
 ) -> Result<(), UnrealError> {
-    log::debug!("new file entry {file_inode} {peer} {}", entry.content.hash);
+    let key = peer.map(|p| p.as_str()).unwrap_or("");
+    log::debug!("new file entry {file_inode} {key} {}", entry.content.hash);
 
-    file_table.insert((file_inode, peer.as_str()), Holder::new(entry)?)?;
+    file_table.insert((file_inode, key), Holder::new(entry)?)?;
 
     Ok(())
 }
@@ -844,13 +837,13 @@ fn add_dir_entry(
     log::debug!("new dir entry {parent_inode} {name} -> {new_inode} {assignment:?}");
     dir_table.insert(
         (parent_inode, name),
-        Holder::new(DirTableEntry::Regular(ReadDirEntry {
+        Holder::with_content(DirTableEntry::Regular(ReadDirEntry {
             inode: new_inode,
             assignment,
         }))?,
     )?;
     let mtime = UnixTime::now();
-    let dot = Holder::new(DirTableEntry::Dot(mtime))?;
+    let dot = Holder::with_content(DirTableEntry::Dot(mtime))?;
     dir_table.insert((parent_inode, "."), dot.clone())?;
     if assignment == InodeAssignment::Directory {
         dir_table.insert((new_inode, "."), dot.clone())?;
@@ -946,31 +939,46 @@ fn do_rm_file_entry(
     peer: &Peer,
     old_hash: Option<Hash>,
 ) -> Result<(), UnrealError> {
-    let mut range_size = 0;
-    let mut delete = false;
     let peer_str = peer.as_str();
+
+    let mut entries = HashMap::new();
     for elt in file_table.range((inode, "")..(inode + 1, ""))? {
-        range_size += 1;
-        let elt = elt?;
-        if peer_str != elt.0.value().1 {
-            continue;
-        }
-        match &old_hash {
-            None => delete = true,
-            Some(old_hash) => {
-                let hash = elt.1.value().parse()?.content.hash;
-                if hash == *old_hash {
-                    delete = true;
-                }
-            }
-        }
+        let (key, value) = elt?;
+        let key = key.value().1;
+        let entry = value.value().parse()?;
+        entries.insert(key.to_string(), entry);
     }
 
-    if delete {
-        file_table.remove((inode, peer_str))?;
-        range_size -= 1;
+    let peer_hash = match entries.remove(peer_str).map(|e| e.content.hash) {
+        Some(h) => h,
+        None => {
+            // No entry to delete
+            return Ok(());
+        }
+    };
+
+    if let Some(old_hash) = old_hash
+        && peer_hash != old_hash
+    {
+        // Skip deletion
+        return Ok(());
     }
-    if range_size == 0 {
+
+    file_table.remove((inode, peer_str))?;
+
+    let default_hash = entries.remove("").map(|e| e.content.hash);
+    // In case old_hash == default_hash, should we remove the default
+    // version and pretend the file doesn't exist anymore, even if
+    // it's available on other peers? It would be consistent,
+    // history-wise. With the current logic, a file is only gone once
+    // it's gone from all peers.
+
+    if entries.is_empty() {
+        // This was the last peer. Remove the default entry as well as
+        // the directory entry.
+        // TODO: delete empty directories, up to the arena root
+
+        file_table.remove((inode, ""))?;
         dir_table.retain_in((parent_inode, "")..(parent_inode + 1, ""), |_, v| {
             match v.parse() {
                 Ok(DirTableEntry::Regular(v)) => v.inode != inode,
@@ -979,8 +987,30 @@ fn do_rm_file_entry(
         })?;
         dir_table.insert(
             (parent_inode, "."),
-            Holder::new(DirTableEntry::Dot(UnixTime::now()))?,
+            Holder::with_content(DirTableEntry::Dot(UnixTime::now()))?,
         )?;
+
+        return Ok(());
+    }
+
+    // If this was the peer that had the default entry, we need to
+    // choose another one as default.
+    let another_peer_has_default_hash = default_hash
+        .map(|h| entries.values().any(|e| e.content.hash == h))
+        .unwrap_or(false);
+    if another_peer_has_default_hash {
+        return Ok(());
+    }
+
+    let most_recent = entries.into_iter().reduce(|a, b| {
+        if b.1.metadata.mtime > a.1.metadata.mtime {
+            b
+        } else {
+            a
+        }
+    });
+    if let Some((_, entry)) = most_recent {
+        do_write_file_entry(file_table, inode, None, &entry)?;
     }
 
     Ok(())
@@ -1425,7 +1455,7 @@ mod tests {
     }
 
     #[test]
-    fn get_file_metadata_resolves_conflict() -> anyhow::Result<()> {
+    fn get_file_metadata_tracks_hash_chain() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let cache = &fixture.cache;
 
@@ -1451,9 +1481,21 @@ mod tests {
                 arena: arena.clone(),
                 index: 0,
                 path: file_path.clone(),
+                mtime: test_time(),
+                size: 100,
+                hash: Hash([1u8; 32]),
+            },
+        )?;
+        cache.update(
+            &peer2,
+            Notification::Replace {
+                arena: arena.clone(),
+                index: 0,
+                path: file_path.clone(),
                 mtime: later_time(),
                 size: 200,
                 hash: Hash([2u8; 32]),
+                old_hash: Hash([1u8; 32]),
             },
         )?;
 
@@ -1466,7 +1508,7 @@ mod tests {
     }
 
     #[test]
-    fn file_available_from_multiple_peers() -> anyhow::Result<()> {
+    fn file_available_with_conflicting_adds() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let cache = &fixture.cache;
 
@@ -1493,9 +1535,9 @@ mod tests {
                 arena: arena.clone(),
                 index: 0,
                 path: path.clone(),
-                mtime: later_time(),
-                size: 200,
-                hash: Hash([2u8; 32]),
+                mtime: test_time(),
+                size: 100,
+                hash: Hash([1u8; 32]),
             },
         )?;
         cache.update(
@@ -1509,33 +1551,228 @@ mod tests {
                 hash: Hash([2u8; 32]),
             },
         )?;
-
         let parent_inode = cache.arena_root(&arena)?;
         let inode = cache.lookup(parent_inode, "file.txt")?.inode;
         let avail = cache.file_availability(inode)?;
         assert_eq!(arena, avail.arena);
         assert_eq!(path, avail.path);
-        assert_unordered::assert_eq_unordered!(
-            vec![
-                FileVersion {
-                    peer: b.clone(),
-                    metadata: FileMetadata {
-                        size: 200,
-                        mtime: later_time(),
-                    },
-                    hash: Hash([2u8; 32]),
-                },
-                FileVersion {
-                    peer: c.clone(),
-                    metadata: FileMetadata {
-                        size: 200,
-                        mtime: later_time(),
-                    },
-                    hash: Hash([2u8; 32]),
-                },
-            ],
-            avail.versions
+        // Since they're just independent additions, the cache chooses
+        // the first one.
+        assert_eq!(Hash([1u8; 32]), avail.hash);
+        assert_eq!(
+            FileMetadata {
+                size: 100,
+                mtime: test_time(),
+            },
+            avail.metadata
         );
+        assert_unordered::assert_eq_unordered!(vec![a.clone(), b.clone()], avail.peers);
+
+        Ok(())
+    }
+
+    #[test]
+    fn file_available_with_different_versions() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let cache = &fixture.cache;
+
+        let a = Peer::from("a");
+        let b = Peer::from("b");
+        let c = Peer::from("c");
+        let arena = test_arena();
+        let path = Path::parse("file.txt")?;
+
+        cache.update(
+            &a,
+            Notification::Add {
+                arena: arena.clone(),
+                index: 0,
+                path: path.clone(),
+                mtime: test_time(),
+                size: 100,
+                hash: Hash([1u8; 32]),
+            },
+        )?;
+        cache.update(
+            &b,
+            Notification::Add {
+                arena: arena.clone(),
+                index: 0,
+                path: path.clone(),
+                mtime: test_time(),
+                size: 100,
+                hash: Hash([1u8; 32]),
+            },
+        )?;
+        cache.update(
+            &c,
+            Notification::Add {
+                arena: arena.clone(),
+                index: 0,
+                path: path.clone(),
+                mtime: test_time(),
+                size: 100,
+                hash: Hash([1u8; 32]),
+            },
+        )?;
+        cache.update(
+            &b,
+            Notification::Replace {
+                arena: arena.clone(),
+                index: 0,
+                path: path.clone(),
+                mtime: later_time(),
+                size: 200,
+                hash: Hash([2u8; 32]),
+                old_hash: Hash([1u8; 32]),
+            },
+        )?;
+        let inode = cache.lookup(cache.arena_root(&arena)?, "file.txt")?.inode;
+        let avail = cache.file_availability(inode)?;
+
+        //  Replace with old_hash=1 means that hash=2 is the most
+        //  recent one. This is the one chosen.
+        assert_eq!(Hash([2u8; 32]), avail.hash);
+        assert_eq!(
+            FileMetadata {
+                size: 200,
+                mtime: later_time(),
+            },
+            avail.metadata
+        );
+        assert_eq!(vec![b.clone()], avail.peers);
+
+        // We reconnect to c, which has yet another version. Following
+        // the hash chain, Hash 3 is now the newest version.
+        cache.update(
+            &c,
+            Notification::Replace {
+                arena: arena.clone(),
+                index: 0,
+                path: path.clone(),
+                mtime: later_time(),
+                size: 300,
+                hash: Hash([3u8; 32]),
+                old_hash: Hash([1u8; 32]),
+            },
+        )?;
+        cache.update(
+            &c,
+            Notification::Replace {
+                arena: arena.clone(),
+                index: 0,
+                path: path.clone(),
+                mtime: later_time(),
+                size: 300,
+                hash: Hash([3u8; 32]),
+                old_hash: Hash([2u8; 32]),
+            },
+        )?;
+        let avail = cache.file_availability(inode)?;
+        assert_eq!(Hash([3u8; 32]), avail.hash);
+        assert_eq!(vec![c.clone()], avail.peers);
+
+        // Later on, b joins the party
+        cache.update(
+            &b,
+            Notification::Replace {
+                arena: arena.clone(),
+                index: 0,
+                path: path.clone(),
+                mtime: later_time(),
+                size: 300,
+                hash: Hash([3u8; 32]),
+                old_hash: Hash([3u8; 32]),
+            },
+        )?;
+
+        let avail = cache.file_availability(inode)?;
+        assert_eq!(Hash([3u8; 32]), avail.hash);
+        assert_unordered::assert_eq_unordered!(vec![b.clone(), c.clone()], avail.peers);
+
+        Ok(())
+    }
+
+    #[test]
+    fn file_available_goes_away() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let cache = &fixture.cache;
+
+        let a = Peer::from("a");
+        let b = Peer::from("b");
+        let c = Peer::from("c");
+        let arena = test_arena();
+        let path = Path::parse("file.txt")?;
+
+        cache.update(
+            &a,
+            Notification::Add {
+                arena: arena.clone(),
+                index: 0,
+                path: path.clone(),
+                mtime: test_time(),
+                size: 100,
+                hash: Hash([1u8; 32]),
+            },
+        )?;
+        cache.update(
+            &b,
+            Notification::Add {
+                arena: arena.clone(),
+                index: 0,
+                path: path.clone(),
+                mtime: test_time(),
+                size: 100,
+                hash: Hash([1u8; 32]),
+            },
+        )?;
+        cache.update(
+            &c,
+            Notification::Add {
+                arena: arena.clone(),
+                index: 0,
+                path: path.clone(),
+                mtime: later_time(),
+                size: 100,
+                hash: Hash([2u8; 32]),
+            },
+        )?;
+        cache.update(
+            &a,
+            Notification::Replace {
+                arena: arena.clone(),
+                index: 0,
+                path: path.clone(),
+                mtime: later_time(),
+                size: 200,
+                hash: Hash([3u8; 32]),
+                old_hash: Hash([1u8; 32]),
+            },
+        )?;
+        let inode = cache.lookup(cache.arena_root(&arena)?, "file.txt")?.inode;
+        let avail = cache.file_availability(inode)?;
+        assert_eq!(Hash([3u8; 32]), avail.hash);
+        assert_eq!(vec![a.clone()], avail.peers);
+
+        cache.update(&a, Notification::CatchupStart(arena.clone()))?;
+        cache.update(
+            &a,
+            Notification::CatchupComplete {
+                arena: arena.clone(),
+                index: 0,
+            },
+        )?;
+        // All entries from A are now lost! We've lost the single peer
+        // that has the selected version.
+
+        // From the two conflicting versions that remain, Hash=2 from
+        // C should be chosen, because it has the most recent mtime.
+        //
+        // (If we kept a history, we would probably go
+        // back to Hash=1, but we don't have that kind of information)
+        let avail = cache.file_availability(inode)?;
+        assert_eq!(Hash([2u8; 32]), avail.hash);
+        assert_eq!(vec![c.clone()], avail.peers);
 
         Ok(())
     }
