@@ -13,8 +13,8 @@ mod peer_capnp {
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]
 #[allow(clippy::extra_unused_type_parameters)]
-mod store_capnp {
-    include!(concat!(env!("OUT_DIR"), "/store_capnp.rs"));
+mod read_capnp {
+    include!(concat!(env!("OUT_DIR"), "/read_capnp.rs"));
 }
 
 #[allow(dead_code)]
@@ -23,6 +23,14 @@ mod store_capnp {
 #[allow(clippy::extra_unused_type_parameters)]
 mod result_capnp {
     include!(concat!(env!("OUT_DIR"), "/result_capnp.rs"));
+}
+
+#[allow(dead_code)]
+#[allow(unknown_lints)]
+#[allow(clippy::uninlined_format_args)]
+#[allow(clippy::extra_unused_type_parameters)]
+mod store_capnp {
+    include!(concat!(env!("OUT_DIR"), "/store_capnp.rs"));
 }
 
 pub use capnp::Household;

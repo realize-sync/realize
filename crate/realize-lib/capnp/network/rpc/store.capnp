@@ -1,6 +1,7 @@
 @0xee767b7022b5de29;
 
 using import "result.capnp".Result;
+using Read = import "read.capnp";
 
 interface Store {
   # Set of Arenas kept in the store.
@@ -11,21 +12,20 @@ interface Store {
   # Subscribe to notifications to receive and be kept 
   # up-to-date on the store file list
   subscribe @1 (req: SubscribeRequest) -> (result: Result(SubscribeResponse, SubscribeError));
+
+  # Read data from a file
+  reader @2 (req: ReaderRequest) -> (result: Result(ReaderResponse, Read.ReadError));
 }
 
-struct ReadRequest {
+struct ReaderRequest {
   arena @0: Text;
   path @1: Text;
-  offset @2: UInt64;
-  size @3: UInt32;
 }
 
-struct ReadResponse {
-  data @0: Data;
-}
-
-struct ReadError {
-  message @0:Text;
+struct ReaderResponse {
+  reader @0: Read.Reader;
+  size @1: UInt64;
+  hash @2: Data;
 }
 
 struct SubscribeRequest {
@@ -113,3 +113,4 @@ struct Uuid {
   lo @0: UInt64;
   hi @1: UInt64;
 }
+

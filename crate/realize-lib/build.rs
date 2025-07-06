@@ -38,6 +38,7 @@ fn rpc_capnpc() -> anyhow::Result<()> {
         .default_parent_module(module_name_as_vec("network::rpc"))
         .file("capnp/network/rpc/peer.capnp")
         .file("capnp/network/rpc/store.capnp")
+        .file("capnp/network/rpc/read.capnp")
         .file("capnp/network/rpc/result.capnp")
         .run()?;
 
