@@ -6,38 +6,19 @@ use super::store_capnp::store::{
 };
 use super::store_capnp::subscriber::{self, NotifyParams, NotifyResults};
 use crate::model::{Arena, Hash, Path, Peer, UnixTime};
-use crate::network::rate_limit::RateLimitedStream;
+use crate::network::capnp::{ConnectionHandler, ConnectionManager, PeerStatus};
 use crate::network::{Networking, Server};
 use crate::storage::{Notification, Progress, Storage, UnrealCacheAsync, UnrealError};
 use capnp::capability::Promise;
-use capnp_rpc::rpc_twoparty_capnp::Side;
-use capnp_rpc::twoparty::VatNetwork;
-use capnp_rpc::{RpcSystem, VatNetwork as _};
-use futures::AsyncReadExt;
-use futures::io::{BufReader, BufWriter};
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
-use tokio::net::TcpStream;
 use tokio::runtime;
-use tokio::sync::{broadcast, mpsc};
-use tokio::task::{JoinHandle, LocalSet};
-use tokio_retry::strategy::ExponentialBackoff;
-use tokio_util::compat::TokioAsyncReadCompatExt;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 /// Identifies Cap'n Proto ConnectedPeer connections.
 const TAG: &[u8; 4] = b"PEER";
-
-/// Connection status of a peer, broadcast by [Household].
-#[derive(Clone, PartialEq, Debug)]
-pub enum PeerStatus {
-    Connected(Peer),
-    Disconnected(Peer),
-}
 
 /// A set of peers and their connections.
 ///
@@ -48,8 +29,7 @@ pub enum PeerStatus {
 /// To listen to incoming connections, call [Household::register].
 #[derive(Clone)]
 pub struct Household {
-    tx: mpsc::UnboundedSender<HouseholdConnection>,
-    broadcast_tx: broadcast::Sender<PeerStatus>,
+    manager: Arc<ConnectionManager>,
 }
 
 impl Household {
@@ -59,23 +39,20 @@ impl Household {
         networking: Networking,
         storage: Arc<Storage>,
     ) -> anyhow::Result<(Self, thread::JoinHandle<()>)> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let (broadcast_tx, _) = broadcast::channel(128);
-        let handle = spawn_rpc_thread(networking, storage, rx, broadcast_tx.clone())?;
+        let (manager, join_handle) =
+            ConnectionManager::spawn(networking, PeerConnectionHandler::new(storage))?;
 
-        Ok((Self { tx, broadcast_tx }, handle))
-    }
-
-    /// Report peer status changes through the given receiver.
-    pub fn peer_status(&self) -> broadcast::Receiver<PeerStatus> {
-        self.broadcast_tx.subscribe()
+        Ok((
+            Self {
+                manager: Arc::new(manager),
+            },
+            join_handle,
+        ))
     }
 
     /// Keep a client connection up to all peers for which an address is known.
     pub fn keep_connected(&self) -> anyhow::Result<()> {
-        self.tx.send(HouseholdConnection::KeepConnected)?;
-
-        Ok(())
+        self.manager.keep_connected()
     }
 
     /// Register peer connections to the given server.
@@ -83,231 +60,29 @@ impl Household {
     /// With this call, the server answers to PEER calls as Cap'n Proto
     /// PeerConnection, defined in `capnp/peer.capnp`.
     pub fn register(&self, server: &mut Server) {
-        let tx = self.tx.clone();
-        server.register_raw(TAG, move |peer, stream, _, shutdown_rx| {
-            // TODO: support shutdown_rx
-            let _ = tx.send(HouseholdConnection::Incoming {
-                peer,
-                stream: Box::new(stream),
-                shutdown_rx,
-            });
-        })
+        self.manager.register(server)
     }
 }
 
-/// Messages used to communicate with [CapnpRpcThread].
-enum HouseholdConnection {
-    /// Send incoming (server) TCP connections to the capnp threads to
-    /// be handled there.
-    Incoming {
-        peer: Peer,
-        stream: Box<tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>>,
-        shutdown_rx: broadcast::Receiver<()>,
-    },
-    KeepConnected,
-}
-
-/// Spawns a single thread that handles all Cap'n Proto RPC connections.
-///
-/// To communicate with the thread, send [HousehholdConnection]s to the channel.
-fn spawn_rpc_thread(
-    networking: Networking,
+struct PeerConnectionHandler {
     storage: Arc<Storage>,
-    mut rx: mpsc::UnboundedReceiver<HouseholdConnection>,
-    broadcast_tx: broadcast::Sender<PeerStatus>,
-) -> anyhow::Result<thread::JoinHandle<()>> {
-    let main_rt = runtime::Handle::current();
-    let rt = runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
-    Ok(thread::Builder::new()
-        .name("capnprpc".into())
-        .spawn(move || {
-            let ctx = AppContext::new(networking, storage, broadcast_tx, main_rt);
-            let local = LocalSet::new();
-
-            local.spawn_local(async move {
-                while let Some(conn) = rx.recv().await {
-                    match conn {
-                        HouseholdConnection::Incoming {
-                            peer,
-                            stream,
-                            shutdown_rx,
-                        } => ctx.accept(peer, stream, shutdown_rx),
-                        HouseholdConnection::KeepConnected => ctx.keep_connected(),
-                    }
-                }
-            });
-
-            rt.block_on(local);
-        })?)
-}
-
-#[derive(Default)]
-struct TrackedPeerConnections {
-    tracked_client: Option<store::Client>,
-    tracker: Option<JoinHandle<()>>,
-}
-
-struct AppContext {
-    networking: Networking,
-    storage: Arc<Storage>,
-    broadcast_tx: broadcast::Sender<PeerStatus>,
     main_rt: runtime::Handle,
-    connections: RefCell<HashMap<Peer, TrackedPeerConnections>>,
 }
 
-impl AppContext {
-    fn new(
-        networking: Networking,
-        storage: Arc<Storage>,
-        broadcast_tx: broadcast::Sender<PeerStatus>,
-        main_rt: runtime::Handle,
-    ) -> Rc<Self> {
-        Rc::new(Self {
-            networking,
+impl PeerConnectionHandler {
+    fn new(storage: Arc<Storage>) -> Self {
+        Self {
             storage,
-            broadcast_tx,
-            main_rt,
-            connections: RefCell::new(HashMap::new()),
-        })
-    }
-
-    fn accept(
-        self: &Rc<Self>,
-        peer: Peer,
-        stream: Box<tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>>,
-        mut shutdown_rx: broadcast::Receiver<()>,
-    ) {
-        let client = ConnectedPeerServer::new(peer.clone(), Rc::clone(self)).into_connected_peer();
-        tokio::task::spawn_local(async move {
-            let (r, w) = TokioAsyncReadCompatExt::compat(stream).split();
-            let mut net = Box::new(VatNetwork::new(
-                BufReader::new(r),
-                BufWriter::new(w),
-                Side::Server,
-                Default::default(),
-            ));
-            let until_shutdown = net.drive_until_shutdown();
-            let system = RpcSystem::new(net, Some(client.clone().client));
-            let disconnector = system.get_disconnector();
-            tokio::task::spawn_local(system);
-
-            tokio::select!(
-                _ = shutdown_rx.recv() => {
-                    let _ = disconnector.await;
-                },
-                res = until_shutdown => {
-                    if let Err(err) = res {
-                        log::debug!("RPC connection from {peer} failed: {err}")
-                    }
-                }
-            );
-        });
-    }
-
-    fn keep_connected(self: &Rc<Self>) {
-        for peer in self.networking.connectable_peers() {
-            let mut borrow = self.connections.borrow_mut();
-            let conn = borrow.entry(peer.clone()).or_default();
-            let has_usable_tracker = conn
-                .tracker
-                .as_ref()
-                .map(|t| !t.is_finished())
-                .unwrap_or(false);
-            if has_usable_tracker {
-                continue;
-            }
-
-            let this = Rc::clone(self);
-            let peer = peer.clone();
-            conn.tracker = Some(tokio::task::spawn_local(async move {
-                this.track_peer(&peer).await
-            }));
-        }
-    }
-
-    async fn track_peer(self: &Rc<Self>, peer: &Peer) {
-        let retry_strategy =
-            ExponentialBackoff::from_millis(500).max_delay(Duration::from_secs(5 * 60));
-        let mut current_backoff: Option<ExponentialBackoff> = None;
-        loop {
-            match &mut current_backoff {
-                Some(backoff) => match backoff.next() {
-                    None => {
-                        log::warn!("Giving up connecting to {peer}");
-                        return;
-                    }
-                    Some(delay) => {
-                        tokio::time::sleep(delay).await;
-                    }
-                },
-                None => {
-                    // Execute immediately, and install backoff for next time.
-                    current_backoff = Some(retry_strategy.clone());
-                }
-            }
-            let stream = match self.networking.connect_raw(peer, TAG, None).await {
-                Ok(stream) => stream,
-                Err(err) => {
-                    log::debug!("Failed to connect to {peer}: {err}; Will retry.");
-                    continue;
-                }
-            };
-
-            let (r, w) = TokioAsyncReadCompatExt::compat(stream).split();
-            let mut net = Box::new(VatNetwork::new(
-                BufReader::new(r),
-                BufWriter::new(w),
-                Side::Client,
-                Default::default(),
-            ));
-            let until_shutdown = net.drive_until_shutdown();
-            let mut system = RpcSystem::new(net, None);
-            let mut client: connected_peer::Client = system.bootstrap(Side::Server);
-            let disconnector = system.get_disconnector();
-            scopeguard::defer!({
-                tokio::task::spawn_local(disconnector);
-            });
-            tokio::task::spawn_local(system);
-
-            let mut store = match get_connected_peer_store(&mut client).await {
-                Ok(store) => store,
-                Err(err) => {
-                    log::debug!("Failed to get store from {peer}: {err}; Will retry.");
-                    continue;
-                }
-            };
-            self.set_tracked_client(peer, Some(store.clone()));
-            let _ = self.broadcast_tx.send(PeerStatus::Connected(peer.clone()));
-            scopeguard::defer!({
-                self.set_tracked_client(peer, None);
-                let _ = self
-                    .broadcast_tx
-                    .send(PeerStatus::Disconnected(peer.clone()));
-            });
-
-            //this.register_self(&client);
-            if let Err(err) = self.subscribe_self(peer, &mut store).await {
-                log::debug!("Failed to subscribe to {peer}: {err}");
-            }
-
-            // We're fully connected. Reset the backoff delay for next time.
-            current_backoff = None;
-
-            if let Err(err) = until_shutdown.await {
-                log::debug!("Connection to {peer} was shutdown: {err}; Will reconnect.")
-            }
+            main_rt: runtime::Handle::current(),
         }
     }
 
     async fn subscribe_self(
-        self: &Rc<Self>,
+        &self,
         peer: &Peer,
-        client: &mut store::Client,
+        mut client: connected_peer::Client,
     ) -> anyhow::Result<()> {
+        let store = get_connected_peer_store(&mut client).await?;
         let cache = match self.storage.cache() {
             None => {
                 return Ok(());
@@ -315,7 +90,7 @@ impl AppContext {
             Some(c) => c,
         };
 
-        let request = client.arenas_request();
+        let request = store.arenas_request();
         let reply = request.send().promise.await?;
         let arenas = reply.get()?.get_arenas()?;
         let peer_arenas = parse_arena_set(arenas)?;
@@ -362,11 +137,12 @@ impl AppContext {
             .await??;
 
         for arena in goal_arenas {
-            let mut request = client.subscribe_request();
+            let mut request = store.subscribe_request();
             let mut request_builder = request.get().init_req();
             request_builder.set_arena(arena.as_str());
             request_builder.set_subscriber(
-                ConnectedPeerServer::new(peer.clone(), self.clone()).into_subscriber(),
+                ConnectedPeerServer::new(peer.clone(), self.storage.clone(), self.main_rt.clone())
+                    .into_subscriber(),
             );
             if let Some(progress) = progress.remove(&arena) {
                 let mut builder = request_builder.init_progress();
@@ -384,14 +160,33 @@ impl AppContext {
 
         Ok(())
     }
+}
 
-    /// Associate the given client with the peer.
-    fn set_tracked_client(self: &Rc<Self>, peer: &Peer, client: Option<store::Client>) {
-        self.connections
-            .borrow_mut()
-            .entry(peer.clone())
-            .or_default()
-            .tracked_client = client;
+impl ConnectionHandler<connected_peer::Client> for PeerConnectionHandler {
+    fn tag(&self) -> &'static [u8; 4] {
+        TAG
+    }
+
+    fn server(&self, peer: &Peer) -> capnp::capability::Client {
+        ConnectedPeerServer::new(peer.clone(), self.storage.clone(), self.main_rt.clone())
+            .into_connected_peer()
+            .client
+    }
+
+    async fn check_connection(&self, peer: &Peer, client: &mut connected_peer::Client) -> bool {
+        match get_connected_peer_store(client).await {
+            Ok(_) => true,
+            Err(err) => {
+                log::debug!("Failed to get store from {peer}: {err}; Will retry.");
+                false
+            }
+        }
+    }
+
+    async fn register(&self, peer: &Peer, client: connected_peer::Client) {
+        if let Err(err) = self.subscribe_self(peer, client).await {
+            log::debug!("Failed to subscribe to {peer}: {err}");
+        }
     }
 }
 
@@ -442,12 +237,17 @@ fn parse_hash(hash: &[u8]) -> Result<Hash, capnp::Error> {
 #[derive(Clone)]
 struct ConnectedPeerServer {
     peer: Peer,
-    ctx: Rc<AppContext>,
+    storage: Arc<Storage>,
+    main_rt: runtime::Handle,
 }
 
 impl ConnectedPeerServer {
-    fn new(peer: Peer, ctx: Rc<AppContext>) -> Self {
-        Self { peer, ctx }
+    fn new(peer: Peer, storage: Arc<Storage>, main_rt: runtime::Handle) -> Self {
+        Self {
+            peer,
+            storage,
+            main_rt,
+        }
     }
 
     fn into_connected_peer(self) -> connected_peer::Client {
@@ -478,7 +278,6 @@ impl connected_peer::Server for ConnectedPeerServer {
 impl store::Server for ConnectedPeerServer {
     fn arenas(&mut self, _: ArenasParams, mut results: ArenasResults) -> Promise<(), capnp::Error> {
         let arenas = self
-            .ctx
             .storage
             .indexed_arenas()
             .map(|a| a.clone())
@@ -498,7 +297,8 @@ impl store::Server for ConnectedPeerServer {
     ) -> Promise<(), capnp::Error> {
         Promise::from_future(do_subscribe(
             self.peer.clone(),
-            Rc::clone(&self.ctx),
+            self.storage.clone(),
+            self.main_rt.clone(),
             params,
             results,
         ))
@@ -511,10 +311,10 @@ impl subscriber::Server for ConnectedPeerServer {
         params: NotifyParams,
         _: NotifyResults,
     ) -> capnp::capability::Promise<(), capnp::Error> {
-        if let Some(cache) = self.ctx.storage.cache() {
+        if let Some(cache) = self.storage.cache() {
             Promise::from_future(do_notify(
                 cache.clone(),
-                self.ctx.main_rt.clone(),
+                self.main_rt.clone(),
                 self.peer.clone(),
                 params,
             ))
@@ -618,7 +418,8 @@ async fn do_notify(
 
 async fn do_subscribe(
     peer: Peer,
-    ctx: Rc<AppContext>,
+    storage: Arc<Storage>,
+    main_rt: runtime::Handle,
     params: SubscribeParams,
     mut results: SubscribeResults,
 ) -> Result<(), capnp::Error> {
@@ -640,9 +441,8 @@ async fn do_subscribe(
 
     let (tx, mut rx) = mpsc::channel(100);
 
-    let storage = ctx.storage.clone();
-    if let Err(err) = ctx
-        .main_rt
+    let storage = storage.clone();
+    if let Err(err) = main_rt
         .spawn({
             let arena = arena.clone();
             async move {
@@ -857,11 +657,19 @@ mod tests {
     use crate::storage;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use capnp_rpc::RpcSystem;
+    use capnp_rpc::rpc_twoparty_capnp::Side;
+    use capnp_rpc::twoparty::VatNetwork;
+    use futures::AsyncReadExt;
+    use futures::io::BufReader;
+    use futures::io::BufWriter;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::fs;
     use tokio::task::LocalSet;
     use tokio_retry::strategy::FixedInterval;
+    use tokio_util::compat::TokioAsyncReadCompatExt;
 
     fn a() -> Peer {
         TestingPeers::a()
@@ -1030,8 +838,8 @@ mod tests {
         let (household_b, _) = fixture.household(b)?;
         let _server_b = fixture.run_server(b, &household_b).await?;
 
-        let mut status_a = household_a.peer_status();
-        let mut status_b = household_b.peer_status();
+        let mut status_a = household_a.manager.peer_status();
+        let mut status_b = household_b.manager.peer_status();
 
         household_a.keep_connected()?;
         assert_eq!(PeerStatus::Connected(b.clone()), status_a.recv().await?);
@@ -1058,7 +866,7 @@ mod tests {
         let (household_b, _) = fixture.household(b)?;
         let server_b = fixture.run_server(b, &household_b).await?;
 
-        let mut status_a = household_a.peer_status();
+        let mut status_a = household_a.manager.peer_status();
         household_a.keep_connected()?;
 
         assert_eq!(PeerStatus::Connected(b.clone()), status_a.recv().await?);

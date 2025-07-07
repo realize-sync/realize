@@ -27,6 +27,7 @@ pub(crate) mod reconnect;
 pub mod rpc;
 pub mod security;
 
+pub mod capnp;
 #[cfg(test)]
 pub(crate) mod testing;
 
