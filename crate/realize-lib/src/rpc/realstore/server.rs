@@ -7,8 +7,8 @@
 use crate::model;
 use crate::model::{Arena, ByteRange, Hash};
 use crate::network::Server;
-use crate::network::rpc::realstore::metrics::{MetricsRealizeClient, MetricsRealizeServer};
-use crate::network::rpc::realstore::{
+use crate::rpc::realstore::metrics::{MetricsRealizeClient, MetricsRealizeServer};
+use crate::rpc::realstore::{
     Config, RealStoreService, RealStoreServiceClient, RealStoreServiceRequest,
     RealStoreServiceResponse,
 };
@@ -234,8 +234,8 @@ impl RealStoreService for RealStoreServer {
     async fn configure(
         self,
         _ctx: tarpc::context::Context,
-        config: crate::network::rpc::realstore::Config,
-    ) -> Result<crate::network::rpc::realstore::Config, RealStoreError> {
+        config: crate::rpc::realstore::Config,
+    ) -> Result<crate::rpc::realstore::Config, RealStoreError> {
         if let (Some(limiter), Some(limit)) = (self.limiter.as_ref(), config.write_limit) {
             limiter.set_speed_limit(limit as f64);
         }

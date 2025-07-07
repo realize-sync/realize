@@ -8,11 +8,11 @@
 //!
 //! To export metrics on an HTTP endpoint:
 //! ```rust
-//! realize_lib::network::rpc::realstore::metrics::export_metrics("127.0.0.1:9000");
+//! realize_lib::rpc::realstore::metrics::export_metrics("127.0.0.1:9000");
 //! ```
 
 use crate::model::ByteRange;
-use crate::network::rpc::realstore::{RealStoreServiceRequest, RealStoreServiceResponse};
+use crate::rpc::realstore::{RealStoreServiceRequest, RealStoreServiceResponse};
 use crate::storage::RealStoreError;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;

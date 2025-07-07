@@ -2,7 +2,7 @@ use super::config::Config;
 use crate::fs::downloader::Downloader;
 use crate::fs::nfs;
 use crate::model::Arena;
-use crate::network::rpc::{Household, realstore};
+use crate::rpc::{Household, realstore};
 use crate::network::{Networking, Server};
 use crate::storage::Storage;
 use crate::storage::config::ArenaConfig;

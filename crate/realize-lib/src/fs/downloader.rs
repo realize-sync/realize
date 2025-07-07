@@ -1,7 +1,7 @@
 use crate::model::{Arena, ByteRange, Path, Peer};
 use crate::network::Networking;
-use crate::network::rpc::realstore::client::{ClientOptions, RealStoreClient};
-use crate::network::rpc::realstore::{self};
+use crate::rpc::realstore::client::{ClientOptions, RealStoreClient};
+use crate::rpc::realstore::{self};
 use crate::storage::{
     FileAvailability, RealStoreError, RealStoreOptions, UnrealCacheAsync, UnrealError,
 };

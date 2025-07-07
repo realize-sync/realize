@@ -24,7 +24,6 @@ pub mod hostport;
 mod metrics;
 pub(crate) mod rate_limit;
 pub(crate) mod reconnect;
-pub mod rpc;
 pub mod security;
 
 pub mod capnp;

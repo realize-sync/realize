@@ -1,9 +1,9 @@
 use crate::model::Peer;
 use crate::network::Networking;
 use crate::network::reconnect::{Connect, Reconnect};
-use crate::network::rpc::realstore;
-use crate::network::rpc::realstore::metrics::MetricsRealizeClient;
-use crate::network::rpc::realstore::{
+use crate::rpc::realstore;
+use crate::rpc::realstore::metrics::MetricsRealizeClient;
+use crate::rpc::realstore::{
     Config, RealStoreServiceClient, RealStoreServiceRequest, RealStoreServiceResponse,
 };
 use async_speed_limit::Limiter;
@@ -162,7 +162,7 @@ mod tests {
     use super::*;
     use crate::model::{Arena, Peer};
     use crate::network::hostport::HostPort;
-    use crate::network::rpc::realstore::Config;
+    use crate::rpc::realstore::Config;
     use crate::network::security::{PeerVerifier, RawPublicKeyResolver};
     use crate::network::{Server, testing};
     use crate::storage::{RealStore, RealStoreOptions};

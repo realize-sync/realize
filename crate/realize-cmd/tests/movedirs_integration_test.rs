@@ -5,7 +5,7 @@ use assert_unordered::assert_eq_unordered;
 use hyper_util::rt::TokioIo;
 use realize_lib::model::{Arena, Peer};
 use realize_lib::network::hostport::HostPort;
-use realize_lib::network::rpc::realstore;
+use realize_lib::rpc::realstore;
 use realize_lib::network::security::{PeerVerifier, RawPublicKeyResolver};
 use realize_lib::network::{Networking, Server};
 use realize_lib::storage::RealStore;
@@ -476,7 +476,7 @@ async fn realize_metrics_export() -> anyhow::Result<()> {
         .arg(&realize_metrics_addr)
         .env(
             "RUST_LOG",
-            "realize_lib::network::rpc::realstore::metrics=debug",
+            "realize_lib::rpc::realstore::metrics=debug",
         )
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())

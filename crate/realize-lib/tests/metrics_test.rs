@@ -7,7 +7,7 @@ use realize_lib::logic::consensus::movedirs::{
     METRIC_RANGE_WRITE_BYTES, METRIC_READ_BYTES, METRIC_START_COUNT, METRIC_WRITE_BYTES,
 };
 use realize_lib::model::Arena;
-use realize_lib::network::rpc::realstore::server::{self, InProcessRealStoreServiceClient};
+use realize_lib::rpc::realstore::server::{self, InProcessRealStoreServiceClient};
 use realize_lib::storage::RealStore;
 use realize_lib::storage::RealStoreOptions;
 

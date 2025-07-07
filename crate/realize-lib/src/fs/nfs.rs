@@ -346,7 +346,7 @@ mod tests {
     use super::*;
     use crate::model::{Arena, Hash, Path};
     use crate::network::hostport::HostPort;
-    use crate::network::rpc::realstore;
+    use crate::rpc::realstore;
     use crate::network::{self, Server};
     use crate::storage::{self, Notification, RealStore};
     use assert_fs::TempDir;

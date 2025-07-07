@@ -1,7 +1,7 @@
 @0xcc824aef448f2848;
 
 using Rust = import "/capnpc/rust.capnp";
-$Rust.parentModule("network::rpc");
+$Rust.parentModule("rpc");
 
 struct Result(ValueType,ErrorType) {
   union {

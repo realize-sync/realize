@@ -3,7 +3,7 @@ use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, Prog
 use realize_lib::logic::consensus::movedirs::ProgressEvent;
 use realize_lib::model;
 use realize_lib::model::Arena;
-use realize_lib::network::rpc::realstore::client::ClientConnectionState;
+use realize_lib::rpc::realstore::client::ClientConnectionState;
 use std::collections::HashMap;
 use tokio::sync::mpsc::Receiver;
 

@@ -11,9 +11,9 @@ use realize_lib::logic::consensus::movedirs::MoveFileError;
 use realize_lib::model::{Arena, Peer};
 use realize_lib::network::Networking;
 use realize_lib::network::config::PeerConfig;
-use realize_lib::network::rpc::realstore;
-use realize_lib::network::rpc::realstore::client::{ClientConnectionState, ClientOptions};
-use realize_lib::network::rpc::realstore::metrics;
+use realize_lib::rpc::realstore;
+use realize_lib::rpc::realstore::client::{ClientConnectionState, ClientOptions};
+use realize_lib::rpc::realstore::metrics;
 use realize_lib::utils::logging;
 use signal_hook_tokio::Signals;
 use std::collections::HashMap;
@@ -366,7 +366,7 @@ async fn configure_limit(
     let config = client
         .configure(
             context::current(),
-            realize_lib::network::rpc::realstore::Config {
+            realize_lib::rpc::realstore::Config {
                 write_limit: Some(limit),
             },
         )

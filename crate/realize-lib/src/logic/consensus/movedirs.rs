@@ -6,7 +6,7 @@
 
 use crate::model;
 use crate::model::{Arena, ByteRange, ByteRanges};
-use crate::network::rpc::realstore::{
+use crate::rpc::realstore::{
     RangedHash, RealStoreServiceClient, RealStoreServiceRequest, RealStoreServiceResponse,
 };
 use crate::storage::{RealStoreError, RealStoreOptions, SyncedFile};
@@ -789,7 +789,7 @@ where
 mod tests {
     use super::*;
     use crate::model::{Arena, Hash};
-    use crate::network::rpc::realstore::server::{self};
+    use crate::rpc::realstore::server::{self};
     use crate::storage::RealStore;
     use crate::utils::hash;
     use assert_fs::TempDir;

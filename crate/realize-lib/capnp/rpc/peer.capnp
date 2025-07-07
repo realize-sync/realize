@@ -1,7 +1,7 @@
 @0x8b094bf663d40cea;
 
 using Rust = import "/capnpc/rust.capnp";
-$Rust.parentModule("network::rpc");
+$Rust.parentModule("rpc");
 
 using import "store.capnp".Store;
 

@@ -4,7 +4,7 @@ use nix::fcntl::{Flock, FlockArg};
 use realize_lib::fs::downloader::Downloader;
 use realize_lib::model::{Arena, Peer};
 use realize_lib::network::hostport::HostPort;
-use realize_lib::network::rpc::realstore;
+use realize_lib::rpc::realstore;
 use realize_lib::network::security::{PeerVerifier, RawPublicKeyResolver};
 use realize_lib::network::{Networking, Server};
 use realize_lib::storage::{RealStore, UnrealCacheAsync};
