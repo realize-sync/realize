@@ -40,7 +40,7 @@ impl Household {
         storage: Arc<Storage>,
     ) -> anyhow::Result<(Self, thread::JoinHandle<()>)> {
         let (manager, join_handle) =
-            ConnectionManager::spawn(networking, PeerConnectionHandler::new(storage))?;
+            ConnectionManager::spawn(networking, PeerConnectionHandler::new(Ctx::new(storage)))?;
 
         Ok((
             Self {
@@ -64,101 +64,29 @@ impl Household {
     }
 }
 
-struct PeerConnectionHandler {
+/// Common contextual information that's passed around the types in
+/// this module.
+struct Ctx {
     storage: Arc<Storage>,
     main_rt: runtime::Handle,
 }
 
-impl PeerConnectionHandler {
-    fn new(storage: Arc<Storage>) -> Self {
-        Self {
+impl Ctx {
+    fn new(storage: Arc<Storage>) -> Arc<Ctx> {
+        Arc::new(Self {
             storage,
             main_rt: runtime::Handle::current(),
-        }
+        })
     }
+}
 
-    async fn subscribe_self(
-        &self,
-        peer: &Peer,
-        mut client: connected_peer::Client,
-    ) -> anyhow::Result<()> {
-        let store = get_connected_peer_store(&mut client).await?;
-        let cache = match self.storage.cache() {
-            None => {
-                return Ok(());
-            }
-            Some(c) => c,
-        };
+struct PeerConnectionHandler {
+    ctx: Arc<Ctx>,
+}
 
-        let request = store.arenas_request();
-        let reply = request.send().promise.await?;
-        let arenas = reply.get()?.get_arenas()?;
-        let peer_arenas = parse_arena_set(arenas)?;
-
-        let goal_arenas = cache
-            .arenas()
-            .filter(|a| peer_arenas.contains(*a))
-            .map(|a| a.clone())
-            .collect::<Vec<_>>();
-        if goal_arenas.is_empty() {
-            log::debug!(
-                "Not subscribing to {peer}: no common arena. {:?} vs {:?}",
-                peer_arenas,
-                cache.arenas().collect::<Vec<_>>(),
-            );
-
-            return Ok(());
-        }
-        log::debug!(
-            "Subscribe to {} on {peer}",
-            goal_arenas
-                .iter()
-                .map(|a| a.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        let mut progress = self
-            .main_rt
-            .spawn({
-                let peer = peer.clone();
-                let goal_arenas = goal_arenas.clone();
-                let cache = cache.clone();
-                async move {
-                    let mut map = HashMap::new();
-                    for arena in goal_arenas {
-                        if let Some(progress) = cache.peer_progress(&peer, &arena).await? {
-                            map.insert(arena, progress);
-                        }
-                    }
-
-                    Ok::<_, anyhow::Error>(map)
-                }
-            })
-            .await??;
-
-        for arena in goal_arenas {
-            let mut request = store.subscribe_request();
-            let mut request_builder = request.get().init_req();
-            request_builder.set_arena(arena.as_str());
-            request_builder.set_subscriber(
-                ConnectedPeerServer::new(peer.clone(), self.storage.clone(), self.main_rt.clone())
-                    .into_subscriber(),
-            );
-            if let Some(progress) = progress.remove(&arena) {
-                let mut builder = request_builder.init_progress();
-                builder.set_last_seen(progress.last_seen);
-                fill_uuid(builder.init_uuid(), &progress.uuid);
-            }
-
-            let reply = request.send().promise.await?;
-            let result = reply.get()?.get_result()?;
-
-            if let result_capnp::result::Err(err) = result.which()? {
-                return Err(anyhow::anyhow!(err?.get_message()?.to_string()?));
-            }
-        }
-
-        Ok(())
+impl PeerConnectionHandler {
+    fn new(ctx: Arc<Ctx>) -> Self {
+        Self { ctx }
     }
 }
 
@@ -168,7 +96,7 @@ impl ConnectionHandler<connected_peer::Client> for PeerConnectionHandler {
     }
 
     fn server(&self, peer: &Peer) -> capnp::capability::Client {
-        ConnectedPeerServer::new(peer.clone(), self.storage.clone(), self.main_rt.clone())
+        ConnectedPeerServer::new(peer.clone(), self.ctx.clone())
             .into_connected_peer()
             .client
     }
@@ -184,52 +112,94 @@ impl ConnectionHandler<connected_peer::Client> for PeerConnectionHandler {
     }
 
     async fn register(&self, peer: &Peer, client: connected_peer::Client) {
-        if let Err(err) = self.subscribe_self(peer, client).await {
+        if let Err(err) = subscribe_self(&self.ctx, peer, client).await {
             log::debug!("Failed to subscribe to {peer}: {err}");
         }
     }
 }
 
-async fn get_connected_peer_store(
-    client: &mut connected_peer::Client,
-) -> anyhow::Result<store::Client> {
-    let request = client.store_request();
+/// Subscribe to notifications from the given client and use it to
+/// update the cache.
+async fn subscribe_self(
+    ctx: &Arc<Ctx>,
+    peer: &Peer,
+    mut client: connected_peer::Client,
+) -> anyhow::Result<()> {
+    let store = get_connected_peer_store(&mut client).await?;
+    let cache = match ctx.storage.cache() {
+        None => {
+            return Ok(());
+        }
+        Some(c) => c,
+    };
+
+    let request = store.arenas_request();
     let reply = request.send().promise.await?;
-    let store = reply.get()?.get_store()?;
+    let arenas = reply.get()?.get_arenas()?;
+    let peer_arenas = parse_arena_set(arenas)?;
 
-    Ok(store)
-}
+    let goal_arenas = cache
+        .arenas()
+        .filter(|a| peer_arenas.contains(*a))
+        .map(|a| a.clone())
+        .collect::<Vec<_>>();
+    if goal_arenas.is_empty() {
+        log::debug!(
+            "Not subscribing to {peer}: no common arena. {:?} vs {:?}",
+            peer_arenas,
+            cache.arenas().collect::<Vec<_>>(),
+        );
 
-fn parse_arena(reader: capnp::text::Reader<'_>) -> Result<Arena, capnp::Error> {
-    Ok(Arena::from(reader.to_str()?))
-}
-
-fn parse_arena_set(arenas: capnp::text_list::Reader<'_>) -> Result<HashSet<Arena>, capnp::Error> {
-    let mut set = HashSet::new();
-    for arena in arenas.iter() {
-        set.insert(parse_arena(arena?)?);
+        return Ok(());
     }
-    Ok(set)
-}
+    log::debug!(
+        "Subscribe to {} on {peer}",
+        goal_arenas
+            .iter()
+            .map(|a| a.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let mut progress = ctx
+        .main_rt
+        .spawn({
+            let peer = peer.clone();
+            let goal_arenas = goal_arenas.clone();
+            let cache = cache.clone();
+            async move {
+                let mut map = HashMap::new();
+                for arena in goal_arenas {
+                    if let Some(progress) = cache.peer_progress(&peer, &arena).await? {
+                        map.insert(arena, progress);
+                    }
+                }
 
-fn parse_uuid(reader: super::store_capnp::uuid::Reader<'_>) -> Uuid {
-    Uuid::from_u64_pair(reader.get_hi(), reader.get_lo())
-}
+                Ok::<_, anyhow::Error>(map)
+            }
+        })
+        .await??;
 
-fn parse_mtime(reader: super::store_capnp::time::Reader<'_>) -> UnixTime {
-    UnixTime::new(reader.get_secs(), reader.get_nsecs())
-}
+    let subscriber = ConnectedPeerServer::new(peer.clone(), ctx.clone()).into_subscriber();
+    for arena in goal_arenas {
+        let mut request = store.subscribe_request();
+        let mut request_builder = request.get().init_req();
+        request_builder.set_arena(arena.as_str());
+        request_builder.set_subscriber(subscriber.clone());
+        if let Some(progress) = progress.remove(&arena) {
+            let mut builder = request_builder.init_progress();
+            builder.set_last_seen(progress.last_seen);
+            fill_uuid(builder.init_uuid(), &progress.uuid);
+        }
 
-fn parse_path(reader: capnp::text::Reader<'_>) -> Result<Path, capnp::Error> {
-    Path::parse(reader.to_str()?).map_err(|e| capnp::Error::failed(e.to_string()))
-}
+        let reply = request.send().promise.await?;
+        let result = reply.get()?.get_result()?;
 
-fn parse_hash(hash: &[u8]) -> Result<Hash, capnp::Error> {
-    let hash: [u8; 32] = hash
-        .try_into()
-        .map_err(|_| capnp::Error::failed("invalid hash".to_string()))?;
+        if let result_capnp::result::Err(err) = result.which()? {
+            return Err(anyhow::anyhow!(err?.get_message()?.to_string()?));
+        }
+    }
 
-    Ok(Hash(hash))
+    Ok(())
 }
 
 /// Implement capnp interface ConnectedPeer, defined in
@@ -237,17 +207,12 @@ fn parse_hash(hash: &[u8]) -> Result<Hash, capnp::Error> {
 #[derive(Clone)]
 struct ConnectedPeerServer {
     peer: Peer,
-    storage: Arc<Storage>,
-    main_rt: runtime::Handle,
+    ctx: Arc<Ctx>,
 }
 
 impl ConnectedPeerServer {
-    fn new(peer: Peer, storage: Arc<Storage>, main_rt: runtime::Handle) -> Self {
-        Self {
-            peer,
-            storage,
-            main_rt,
-        }
+    fn new(peer: Peer, ctx: Arc<Ctx>) -> Self {
+        Self { peer, ctx }
     }
 
     fn into_connected_peer(self) -> connected_peer::Client {
@@ -260,6 +225,72 @@ impl ConnectedPeerServer {
 
     fn into_subscriber(self) -> subscriber::Client {
         capnp_rpc::new_client(self)
+    }
+
+    async fn do_subscribe(
+        &self,
+        params: SubscribeParams,
+        mut results: SubscribeResults,
+    ) -> Result<(), capnp::Error> {
+        let req = params.get()?.get_req()?;
+        let arena = parse_arena(req.get_arena()?)?;
+
+        let result = results.get().init_result();
+        let progress = if req.has_progress() {
+            let progress = req.get_progress()?;
+            Some(Progress::new(
+                parse_uuid(progress.get_uuid()?),
+                progress.get_last_seen(),
+            ))
+        } else {
+            None
+        };
+
+        let subscriber = req.get_subscriber()?;
+
+        let (tx, mut rx) = mpsc::channel(100);
+
+        let storage = self.ctx.storage.clone();
+        if let Err(err) = self
+            .ctx
+            .main_rt
+            .spawn({
+                let arena = arena.clone();
+                async move {
+                    storage.subscribe(&arena, tx, progress).await?;
+
+                    Ok::<(), anyhow::Error>(())
+                }
+            })
+            .await
+        {
+            result.init_err().set_message(err.to_string());
+            return Ok(());
+        }
+
+        let peer = self.peer.clone();
+        log::debug!("{peer} subscribed to notifications from {arena}");
+        tokio::task::spawn_local(async move {
+            let mut notifications = Vec::new();
+            loop {
+                let count = rx.recv_many(&mut notifications, 25).await;
+                if count == 0 {
+                    // Channel has been closed
+                    return;
+                }
+                log::debug!("notify {peer}: {notifications:?}");
+                if let Err(err) = send_notifications(notifications.as_slice(), &subscriber).await {
+                    if err.kind == capnp::ErrorKind::Disconnected {
+                        return;
+                    }
+                }
+                notifications.clear();
+            }
+        });
+
+        result.init_ok();
+
+        Ok(())
     }
 }
 
@@ -278,6 +309,7 @@ impl connected_peer::Server for ConnectedPeerServer {
 impl store::Server for ConnectedPeerServer {
     fn arenas(&mut self, _: ArenasParams, mut results: ArenasResults) -> Promise<(), capnp::Error> {
         let arenas = self
+            .ctx
             .storage
             .indexed_arenas()
             .map(|a| a.clone())
@@ -295,13 +327,8 @@ impl store::Server for ConnectedPeerServer {
         params: SubscribeParams,
         results: SubscribeResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::from_future(do_subscribe(
-            self.peer.clone(),
-            self.storage.clone(),
-            self.main_rt.clone(),
-            params,
-            results,
-        ))
+        let this = self.clone();
+        Promise::from_future(async move { this.do_subscribe(params, results).await })
     }
 }
 
@@ -311,10 +338,10 @@ impl subscriber::Server for ConnectedPeerServer {
         params: NotifyParams,
         _: NotifyResults,
     ) -> capnp::capability::Promise<(), capnp::Error> {
-        if let Some(cache) = self.storage.cache() {
+        if let Some(cache) = self.ctx.storage.cache() {
             Promise::from_future(do_notify(
                 cache.clone(),
-                self.main_rt.clone(),
+                self.ctx.main_rt.clone(),
                 self.peer.clone(),
                 params,
             ))
@@ -412,71 +439,6 @@ async fn do_notify(
         .await
         .map_err(|e| capnp::Error::failed(e.to_string()))?
         .map_err(|e| capnp::Error::failed(e.to_string()))?;
-
-    Ok(())
-}
-
-async fn do_subscribe(
-    peer: Peer,
-    storage: Arc<Storage>,
-    main_rt: runtime::Handle,
-    params: SubscribeParams,
-    mut results: SubscribeResults,
-) -> Result<(), capnp::Error> {
-    let req = params.get()?.get_req()?;
-    let arena = parse_arena(req.get_arena()?)?;
-
-    let result = results.get().init_result();
-    let progress = if req.has_progress() {
-        let progress = req.get_progress()?;
-        Some(Progress::new(
-            parse_uuid(progress.get_uuid()?),
-            progress.get_last_seen(),
-        ))
-    } else {
-        None
-    };
-
-    let subscriber = req.get_subscriber()?;
-
-    let (tx, mut rx) = mpsc::channel(100);
-
-    let storage = storage.clone();
-    if let Err(err) = main_rt
-        .spawn({
-            let arena = arena.clone();
-            async move {
-                storage.subscribe(&arena, tx, progress).await?;
-
-                Ok::<(), anyhow::Error>(())
-            }
-        })
-        .await
-    {
-        result.init_err().set_message(err.to_string());
-        return Ok(());
-    }
-
-    log::debug!("{peer} subscribed to notifications from {arena}");
-    tokio::task::spawn_local(async move {
-        let mut notifications = Vec::new();
-        loop {
-            let count = rx.recv_many(&mut notifications, 25).await;
-            if count == 0 {
-                // Channel has been closed
-                return;
-            }
-            log::debug!("notify {peer}: {notifications:?}");
-            if let Err(err) = send_notifications(notifications.as_slice(), &subscriber).await {
-                if err.kind == capnp::ErrorKind::Disconnected {
-                    return;
-                }
-            }
-            notifications.clear();
-        }
-    });
-
-    result.init_ok();
 
     Ok(())
 }
@@ -646,6 +608,48 @@ fn fill_time(
 ) {
     mtime_builder.set_secs(mtime.as_secs());
     mtime_builder.set_nsecs(mtime.subsec_nanos());
+}
+
+async fn get_connected_peer_store(
+    client: &mut connected_peer::Client,
+) -> anyhow::Result<store::Client> {
+    let request = client.store_request();
+    let reply = request.send().promise.await?;
+    let store = reply.get()?.get_store()?;
+
+    Ok(store)
+}
+
+fn parse_arena(reader: capnp::text::Reader<'_>) -> Result<Arena, capnp::Error> {
+    Ok(Arena::from(reader.to_str()?))
+}
+
+fn parse_arena_set(arenas: capnp::text_list::Reader<'_>) -> Result<HashSet<Arena>, capnp::Error> {
+    let mut set = HashSet::new();
+    for arena in arenas.iter() {
+        set.insert(parse_arena(arena?)?);
+    }
+    Ok(set)
+}
+
+fn parse_uuid(reader: super::store_capnp::uuid::Reader<'_>) -> Uuid {
+    Uuid::from_u64_pair(reader.get_hi(), reader.get_lo())
+}
+
+fn parse_mtime(reader: super::store_capnp::time::Reader<'_>) -> UnixTime {
+    UnixTime::new(reader.get_secs(), reader.get_nsecs())
+}
+
+fn parse_path(reader: capnp::text::Reader<'_>) -> Result<Path, capnp::Error> {
+    Path::parse(reader.to_str()?).map_err(|e| capnp::Error::failed(e.to_string()))
+}
+
+fn parse_hash(hash: &[u8]) -> Result<Hash, capnp::Error> {
+    let hash: [u8; 32] = hash
+        .try_into()
+        .map_err(|_| capnp::Error::failed("invalid hash".to_string()))?;
+
+    Ok(Hash(hash))
 }
 
 #[cfg(test)]
