@@ -6,5 +6,5 @@ pub mod types;
 #[allow(clippy::uninlined_format_args)]
 #[allow(clippy::extra_unused_type_parameters)]
 mod unreal_capnp {
-    include!(concat!(env!("OUT_DIR"), "/unreal_capnp.rs"));
+    include!(concat!(env!("OUT_DIR"), "/storage/unreal_capnp.rs"));
 }
