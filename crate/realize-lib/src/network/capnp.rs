@@ -22,10 +22,11 @@ use crate::model::Peer;
 use super::rate_limit::RateLimitedStream;
 use super::{Networking, Server};
 
-/// Connection status of a peer, broadcast by [Household].
+/// Connection status of a peer, broadcast by [ConnectionManager].
 #[derive(Clone, PartialEq, Debug)]
 pub enum PeerStatus {
     Connected(Peer),
+    Registered(Peer),
     Disconnected(Peer),
 }
 
@@ -45,8 +46,8 @@ enum ConnectionMessage {
 pub trait ConnectionHandler<C>: Send {
     fn tag(&self) -> &'static [u8; 4];
     fn server(&self, peer: &Peer) -> capnp::capability::Client;
-    async fn check_connection(&self, peer: &Peer, client: &mut C) -> bool;
-    async fn register(&self, peer: &Peer, client: C);
+    async fn check_connection(&self, peer: &Peer, client: &mut C) -> anyhow::Result<()>;
+    async fn register(&self, peer: &Peer, client: C) -> anyhow::Result<()>;
 }
 
 pub struct ConnectionManager {
@@ -56,7 +57,7 @@ pub struct ConnectionManager {
 }
 
 impl ConnectionManager {
-    /// Spawn a new RPC thread and return the Household instance that
+    /// Spawn a new RPC thread and return the ConnectionManager instance that
     /// manages it.
     pub fn spawn<H, C>(
         networking: Networking,
@@ -293,7 +294,8 @@ where
             });
             tokio::task::spawn_local(system);
 
-            if !self.handler.check_connection(peer, &mut client).await {
+            if let Err(err) = self.handler.check_connection(peer, &mut client).await {
+                log::debug!("Bad connection to {peer}; will retry: {err}");
                 continue;
             }
 
@@ -306,7 +308,11 @@ where
                     .send(PeerStatus::Disconnected(peer.clone()));
             });
 
-            self.handler.register(peer, client).await;
+            if let Err(err) = self.handler.register(peer, client).await {
+                log::debug!("Registration on {peer} failed; Keeping connection: {err}");
+            } else {
+                let _ = self.broadcast_tx.send(PeerStatus::Registered(peer.clone()));
+            }
 
             // We're fully connected. Reset the backoff delay for next time.
             current_backoff = None;
@@ -327,5 +333,279 @@ where
                 tracker: None,
             })
             .tracked_client = client;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network::hostport::HostPort;
+    use crate::network::testing::TestingPeers;
+    use crate::network::testing::hello_capnp::hello;
+    use crate::network::testing::hello_capnp::hello::HelloParams;
+    use crate::network::testing::hello_capnp::hello::HelloResults;
+    use capnp::capability::Promise;
+    use capnp_rpc::RpcSystem;
+    use capnp_rpc::pry;
+    use capnp_rpc::rpc_twoparty_capnp::Side;
+    use capnp_rpc::twoparty::VatNetwork;
+    use futures::AsyncReadExt;
+    use futures::io::BufReader;
+    use futures::io::BufWriter;
+    use std::sync::Arc;
+    use tokio::task::LocalSet;
+    use tokio_util::compat::TokioAsyncReadCompatExt;
+
+    fn a() -> Peer {
+        TestingPeers::a()
+    }
+    fn b() -> Peer {
+        TestingPeers::b()
+    }
+
+    #[derive(Clone)]
+    struct HelloConnectionHandler {
+        peer: Peer,
+    }
+    impl HelloConnectionHandler {
+        fn new(peer: &Peer) -> Self {
+            Self { peer: peer.clone() }
+        }
+    }
+    impl ConnectionHandler<hello::Client> for HelloConnectionHandler {
+        fn tag(&self) -> &'static [u8; 4] {
+            b"HELO"
+        }
+
+        fn server(&self, peer: &Peer) -> capnp::capability::Client {
+            let c: hello::Client = capnp_rpc::new_client(HelloServer {
+                this_peer: self.peer.clone(),
+                other_peer: peer.clone(),
+            });
+
+            c.client
+        }
+
+        async fn check_connection(
+            &self,
+            peer: &Peer,
+            client: &mut hello::Client,
+        ) -> anyhow::Result<()> {
+            let mut request = client.hello_request();
+            request.get().set_name(peer.as_str());
+
+            request.send().promise.await?;
+
+            Ok(())
+        }
+
+        async fn register(&self, peer: &Peer, client: hello::Client) -> anyhow::Result<()> {
+            let mut request = client.hello_request();
+            request.get().set_name(self.peer.as_str());
+
+            let reply = request.send().promise.await?;
+            let greetings = reply.get()?.get_result()?.to_string()?;
+            assert_eq!(
+                format!("Hello {0} -- From {peer} to {0}", self.peer),
+                greetings
+            );
+
+            Ok(())
+        }
+    }
+
+    struct HelloServer {
+        this_peer: Peer,
+        other_peer: Peer,
+    }
+
+    impl hello::Server for HelloServer {
+        fn hello(
+            &mut self,
+            params: HelloParams,
+            mut results: HelloResults,
+        ) -> Promise<(), capnp::Error> {
+            let name = pry!(pry!(pry!(params.get()).get_name()).to_str());
+            results.get().set_result(format!(
+                "Hello {name} -- From {} to {}",
+                self.this_peer, self.other_peer,
+            ));
+
+            Promise::ok(())
+        }
+    }
+
+    struct Fixture {
+        peers: TestingPeers,
+    }
+    impl Fixture {
+        async fn setup() -> anyhow::Result<Self> {
+            let _ = env_logger::try_init();
+
+            let peers = TestingPeers::new()?;
+            Ok(Self { peers })
+        }
+
+        fn manager(
+            &self,
+            peer: &Peer,
+        ) -> anyhow::Result<(ConnectionManager, thread::JoinHandle<()>)> {
+            ConnectionManager::spawn(
+                self.peers.networking(peer)?,
+                HelloConnectionHandler::new(peer),
+            )
+        }
+
+        async fn run_server(
+            &mut self,
+            peer: &Peer,
+            manager: &ConnectionManager,
+        ) -> anyhow::Result<Arc<Server>> {
+            let mut server = Server::new(self.peers.networking(peer)?);
+            manager.register(&mut server);
+
+            let server = Arc::new(server);
+
+            let configured = self.peers.hostport(peer).await;
+            let addr = server
+                .listen(configured.unwrap_or(&HostPort::localhost(0)))
+                .await?;
+            if configured.is_none() {
+                self.peers.set_addr(peer, addr);
+            }
+
+            Ok(server)
+        }
+    }
+
+    async fn connect(networking: Networking, peer: &Peer) -> anyhow::Result<hello::Client> {
+        let stream = networking.connect_raw(peer, b"HELO", None).await?;
+        let (r, w) = TokioAsyncReadCompatExt::compat(stream).split();
+        let net = Box::new(VatNetwork::new(
+            BufReader::new(r),
+            BufWriter::new(w),
+            Side::Client,
+            Default::default(),
+        ));
+        let mut system = RpcSystem::new(net, None);
+        let client: hello::Client = system.bootstrap(Side::Server);
+        tokio::task::spawn_local(system);
+
+        Ok(client)
+    }
+
+    #[tokio::test]
+    async fn manager_listens() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+
+        let a = &a();
+        let (manager, _) = fixture.manager(a)?;
+        let _server = fixture.run_server(a, &manager).await?;
+
+        let b_networking = fixture.peers.networking(&b())?;
+        LocalSet::new()
+            .run_until(async move {
+                let client = connect(b_networking, a).await?;
+
+                let mut request = client.hello_request();
+                request.get().set_name("Bee");
+                let reply = request.send().promise.await?;
+                let greetings = reply.get()?.get_result()?.to_str()?;
+                assert_eq!("Hello Bee -- From a to b", greetings);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn capnprpc_thread_shutdown() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+
+        let a = &a();
+        let (manager, thread_join) = fixture.manager(a)?;
+        let server = fixture.run_server(a, &manager).await?;
+
+        let b_networking = fixture.peers.networking(&b())?;
+        LocalSet::new()
+            .run_until(async move {
+                let client = connect(b_networking, a).await?;
+                let mut request = client.hello_request();
+                request.get().set_name("test");
+                request.send().promise.await?;
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        // The thread shuts down once the channel is unused.
+        server.shutdown().await?;
+        drop(server);
+        drop(manager);
+        assert!(thread_join.join().is_ok());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manager_connects() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+
+        let a = &a();
+        fixture.peers.pick_port(a)?;
+
+        let b = &b();
+        fixture.peers.pick_port(b)?;
+
+        let (manager_a, _) = fixture.manager(a)?;
+        let _server_a = fixture.run_server(a, &manager_a).await?;
+
+        let (manager_b, _) = fixture.manager(b)?;
+        let _server_b = fixture.run_server(b, &manager_b).await?;
+
+        let mut status_a = manager_a.peer_status();
+        let mut status_b = manager_b.peer_status();
+
+        manager_a.keep_connected()?;
+        assert_eq!(PeerStatus::Connected(b.clone()), status_a.recv().await?);
+        assert_eq!(PeerStatus::Registered(b.clone()), status_a.recv().await?);
+
+        manager_b.keep_connected()?;
+        assert_eq!(PeerStatus::Connected(a.clone()), status_b.recv().await?);
+        assert_eq!(PeerStatus::Registered(a.clone()), status_b.recv().await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manager_reconnects() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+
+        let a = &a();
+        fixture.peers.pick_port(a)?;
+
+        let b = &b();
+        fixture.peers.pick_port(b)?;
+
+        let (manager_a, _) = fixture.manager(a)?;
+        let _server_a = fixture.run_server(a, &manager_a).await?;
+
+        let (manager_b, _) = fixture.manager(b)?;
+        let server_b = fixture.run_server(b, &manager_b).await?;
+
+        let mut status_a = manager_a.peer_status();
+        manager_a.keep_connected()?;
+
+        assert_eq!(PeerStatus::Connected(b.clone()), status_a.recv().await?);
+        assert_eq!(PeerStatus::Registered(b.clone()), status_a.recv().await?);
+        server_b.shutdown().await?;
+        assert_eq!(PeerStatus::Disconnected(b.clone()), status_a.recv().await?);
+
+        let _server_b = fixture.run_server(b, &manager_b).await?;
+        assert_eq!(PeerStatus::Connected(b.clone()), status_a.recv().await?);
+
+        Ok(())
     }
 }

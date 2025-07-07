@@ -24,8 +24,10 @@ fn capnpc() -> anyhow::Result<()> {
         .file("capnp/network/rpc/read.capnp")
         .file("capnp/network/rpc/result.capnp")
         .file("capnp/network/rpc/store.capnp")
+        .file("capnp/network/testing/hello.capnp")
         .file("capnp/storage/real.capnp")
         .file("capnp/storage/unreal.capnp")
+        // keep files sorted
         .run()?;
     Ok(())
 }

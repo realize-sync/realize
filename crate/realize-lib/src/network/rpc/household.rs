@@ -6,7 +6,7 @@ use super::store_capnp::store::{
 };
 use super::store_capnp::subscriber::{self, NotifyParams, NotifyResults};
 use crate::model::{Arena, Hash, Path, Peer, UnixTime};
-use crate::network::capnp::{ConnectionHandler, ConnectionManager, PeerStatus};
+use crate::network::capnp::{ConnectionHandler, ConnectionManager};
 use crate::network::{Networking, Server};
 use crate::storage::{Notification, Progress, Storage, UnrealCacheAsync, UnrealError};
 use capnp::capability::Promise;
@@ -101,20 +101,20 @@ impl ConnectionHandler<connected_peer::Client> for PeerConnectionHandler {
             .client
     }
 
-    async fn check_connection(&self, peer: &Peer, client: &mut connected_peer::Client) -> bool {
-        match get_connected_peer_store(client).await {
-            Ok(_) => true,
-            Err(err) => {
-                log::debug!("Failed to get store from {peer}: {err}; Will retry.");
-                false
-            }
-        }
+    async fn check_connection(
+        &self,
+        _peer: &Peer,
+        client: &mut connected_peer::Client,
+    ) -> anyhow::Result<()> {
+        get_connected_peer_store(client).await?;
+
+        Ok(())
     }
 
-    async fn register(&self, peer: &Peer, client: connected_peer::Client) {
-        if let Err(err) = subscribe_self(&self.ctx, peer, client).await {
-            log::debug!("Failed to subscribe to {peer}: {err}");
-        }
+    async fn register(&self, peer: &Peer, client: connected_peer::Client) -> anyhow::Result<()> {
+        subscribe_self(&self.ctx, peer, client).await?;
+
+        Ok(())
     }
 }
 
@@ -661,19 +661,11 @@ mod tests {
     use crate::storage;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
-    use capnp_rpc::RpcSystem;
-    use capnp_rpc::rpc_twoparty_capnp::Side;
-    use capnp_rpc::twoparty::VatNetwork;
-    use futures::AsyncReadExt;
-    use futures::io::BufReader;
-    use futures::io::BufWriter;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::fs;
-    use tokio::task::LocalSet;
     use tokio_retry::strategy::FixedInterval;
-    use tokio_util::compat::TokioAsyncReadCompatExt;
 
     fn a() -> Peer {
         TestingPeers::a()
@@ -746,141 +738,6 @@ mod tests {
 
             Ok(server)
         }
-    }
-
-    async fn connect(
-        networking: Networking,
-        peer: &Peer,
-    ) -> anyhow::Result<connected_peer::Client> {
-        let stream = networking.connect_raw(peer, TAG, None).await?;
-        let (r, w) = TokioAsyncReadCompatExt::compat(stream).split();
-        let net = Box::new(VatNetwork::new(
-            BufReader::new(r),
-            BufWriter::new(w),
-            Side::Client,
-            Default::default(),
-        ));
-        let mut system = RpcSystem::new(net, None);
-        let client: connected_peer::Client = system.bootstrap(Side::Server);
-        tokio::task::spawn_local(system);
-
-        Ok(client)
-    }
-
-    #[tokio::test]
-    async fn household_listens() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup().await?;
-
-        let a = &a();
-        let (household, _) = fixture.household(a)?;
-        let _server = fixture.run_server(a, &household).await?;
-
-        let b_networking = fixture.peers.networking(&b())?;
-        LocalSet::new()
-            .run_until(async move {
-                let client = connect(b_networking, a).await?;
-
-                let request = client.store_request();
-                let reply = request.send().promise.await?;
-                let store = reply.get()?.get_store()?;
-
-                let request = store.arenas_request();
-                let reply = request.send().promise.await?;
-                let arenas = reply.get()?.get_arenas()?;
-                assert_eq!(1, arenas.len());
-                assert_eq!(test_arena().as_str(), arenas.get(0)?.to_str()?);
-
-                Ok::<(), anyhow::Error>(())
-            })
-            .await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn capnprpc_thread_shutdown() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup().await?;
-
-        let a = &a();
-        let (household, thread_join) = fixture.household(a)?;
-        let server = fixture.run_server(a, &household).await?;
-
-        let b_networking = fixture.peers.networking(&b())?;
-        LocalSet::new()
-            .run_until(async move {
-                let client = connect(b_networking, a).await?;
-                let request = client.store_request();
-                let reply = request.send().promise.await?;
-                assert!(reply.get()?.has_store());
-
-                Ok::<(), anyhow::Error>(())
-            })
-            .await?;
-
-        // The thread shuts down once the channel is unused.
-        server.shutdown().await?;
-        drop(server);
-        drop(household);
-        assert!(thread_join.join().is_ok());
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn household_connects() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup().await?;
-
-        let a = &a();
-        fixture.peers.pick_port(a)?;
-
-        let b = &b();
-        fixture.peers.pick_port(b)?;
-
-        let (household_a, _) = fixture.household(a)?;
-        let _server_a = fixture.run_server(a, &household_a).await?;
-
-        let (household_b, _) = fixture.household(b)?;
-        let _server_b = fixture.run_server(b, &household_b).await?;
-
-        let mut status_a = household_a.manager.peer_status();
-        let mut status_b = household_b.manager.peer_status();
-
-        household_a.keep_connected()?;
-        assert_eq!(PeerStatus::Connected(b.clone()), status_a.recv().await?);
-
-        household_b.keep_connected()?;
-        assert_eq!(PeerStatus::Connected(a.clone()), status_b.recv().await?);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn household_reconnects() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup().await?;
-
-        let a = &a();
-        fixture.peers.pick_port(a)?;
-
-        let b = &b();
-        fixture.peers.pick_port(b)?;
-
-        let (household_a, _) = fixture.household(a)?;
-        let _server_a = fixture.run_server(a, &household_a).await?;
-
-        let (household_b, _) = fixture.household(b)?;
-        let server_b = fixture.run_server(b, &household_b).await?;
-
-        let mut status_a = household_a.manager.peer_status();
-        household_a.keep_connected()?;
-
-        assert_eq!(PeerStatus::Connected(b.clone()), status_a.recv().await?);
-        server_b.shutdown().await?;
-        assert_eq!(PeerStatus::Disconnected(b.clone()), status_a.recv().await?);
-
-        let _server_b = fixture.run_server(b, &household_b).await?;
-        assert_eq!(PeerStatus::Connected(b.clone()), status_a.recv().await?);
-
-        Ok(())
     }
 
     #[tokio::test]

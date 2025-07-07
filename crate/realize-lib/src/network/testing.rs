@@ -268,3 +268,11 @@ impl TestingPeers {
         ))
     }
 }
+
+#[allow(dead_code)]
+#[allow(unknown_lints)]
+#[allow(clippy::uninlined_format_args)]
+#[allow(clippy::extra_unused_type_parameters)]
+pub mod hello_capnp {
+    include!(concat!(env!("OUT_DIR"), "/network/testing/hello_capnp.rs"));
+}
