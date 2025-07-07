@@ -2,6 +2,7 @@
 
 use super::real_capnp;
 use crate::model::{self, Arena, Hash, UnixTime};
+use crate::storage::StorageError;
 use crate::utils::holder::{ByteConversionError, ByteConvertible, Holder, NamedType};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
@@ -45,7 +46,7 @@ pub struct RealIndexBlocking {
 }
 
 impl RealIndexBlocking {
-    pub fn new(arena: Arena, db: Database) -> anyhow::Result<Self> {
+    pub fn new(arena: Arena, db: Database) -> Result<Self, StorageError> {
         let index: u64;
         let uuid: Uuid;
         {
@@ -58,7 +59,10 @@ impl RealIndexBlocking {
             {
                 let mut settings_table = txn.open_table(SETTINGS_TABLE)?;
                 if let Some(value) = settings_table.get("uuid")? {
-                    let bytes: uuid::Bytes = value.value().try_into()?;
+                    let bytes: uuid::Bytes = value
+                        .value()
+                        .try_into()
+                        .map_err(|_| ByteConversionError::Invalid("uuid"))?;
                     uuid = Uuid::from_bytes(bytes);
                 } else {
                     uuid = Uuid::now_v7();
@@ -104,7 +108,7 @@ impl RealIndexBlocking {
     /// Index of the last history entry that was written.
     ///
     /// This is the value tracked by [RealIndexBlocking::watch_history].
-    pub fn last_history_index(&self) -> anyhow::Result<u64> {
+    pub fn last_history_index(&self) -> Result<u64, StorageError> {
         let txn = self.db.begin_read()?;
         let history_table = txn.open_table(HISTORY_TABLE)?;
 
@@ -117,12 +121,12 @@ impl RealIndexBlocking {
     }
 
     /// Open or create an index at the given path.
-    pub fn open(arena: Arena, path: &path::Path) -> anyhow::Result<Self> {
+    pub fn open(arena: Arena, path: &path::Path) -> Result<Self, StorageError> {
         Self::new(arena, Database::create(path)?)
     }
 
     /// Get a file entry.
-    pub fn get_file(&self, path: &model::Path) -> anyhow::Result<Option<FileTableEntry>> {
+    pub fn get_file(&self, path: &model::Path) -> Result<Option<FileTableEntry>, StorageError> {
         let txn = self.db.begin_read()?;
         let file_table = txn.open_table(FILE_TABLE)?;
 
@@ -134,7 +138,7 @@ impl RealIndexBlocking {
     }
 
     /// Check whether a given file is in the index already.
-    pub fn has_file(&self, path: &model::Path) -> anyhow::Result<bool> {
+    pub fn has_file(&self, path: &model::Path) -> Result<bool, StorageError> {
         let txn = self.db.begin_read()?;
         let file_table = txn.open_table(FILE_TABLE)?;
 
@@ -147,7 +151,7 @@ impl RealIndexBlocking {
         path: &model::Path,
         size: u64,
         mtime: &UnixTime,
-    ) -> anyhow::Result<bool> {
+    ) -> Result<bool, StorageError> {
         Ok(self
             .get_file(path)?
             .map(|e| e.size == size && e.mtime == *mtime)
@@ -161,7 +165,7 @@ impl RealIndexBlocking {
         size: u64,
         mtime: &UnixTime,
         hash: Hash,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
         let mut history_index = None;
         do_add_file(&txn, path, size, mtime, hash, &mut history_index)?;
@@ -174,7 +178,10 @@ impl RealIndexBlocking {
     }
 
     /// Send all valid entries of the file table to the given channel.
-    pub fn all_files(&self, tx: mpsc::Sender<(model::Path, FileTableEntry)>) -> anyhow::Result<()> {
+    pub fn all_files(
+        &self,
+        tx: mpsc::Sender<(model::Path, FileTableEntry)>,
+    ) -> Result<(), StorageError> {
         let txn = self.db.begin_read()?;
         let file_table = txn.open_table(FILE_TABLE)?;
         for (path, entry) in file_table
@@ -189,7 +196,9 @@ impl RealIndexBlocking {
                 }
             })
         {
-            tx.blocking_send((path, entry))?;
+            if let Err(_) = tx.blocking_send((path, entry)) {
+                break;
+            }
         }
 
         Ok(())
@@ -199,18 +208,20 @@ impl RealIndexBlocking {
     pub fn history(
         &self,
         range: impl RangeBounds<u64>,
-        tx: mpsc::Sender<anyhow::Result<(u64, HistoryTableEntry)>>,
-    ) -> anyhow::Result<()> {
+        tx: mpsc::Sender<Result<(u64, HistoryTableEntry), StorageError>>,
+    ) -> Result<(), StorageError> {
         let txn = self.db.begin_read()?;
         let history_table = txn.open_table(HISTORY_TABLE)?;
         for res in history_table.range(range)?.map(|res| match res {
-            Err(err) => Err(anyhow::Error::from(err)),
+            Err(err) => Err(StorageError::from(err)),
             Ok((k, v)) => match v.value().parse() {
                 Ok(v) => Ok((k.value(), v)),
-                Err(err) => Err(anyhow::Error::from(err)),
+                Err(err) => Err(StorageError::from(err)),
             },
         }) {
-            tx.blocking_send(res)?;
+            if let Err(_) = tx.blocking_send(res) {
+                break;
+            }
         }
 
         Ok(())
@@ -220,7 +231,7 @@ impl RealIndexBlocking {
     ///
     /// If the path is a directory, all files within that directory
     /// are removed, recursively.
-    pub fn remove_file_or_dir(&self, path: &model::Path) -> anyhow::Result<()> {
+    pub fn remove_file_or_dir(&self, path: &model::Path) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
         let mut history_index = None;
         do_remove_file_or_dir(&txn, path, &mut history_index)?;
@@ -238,7 +249,7 @@ fn do_remove_file_or_dir(
     txn: &WriteTransaction,
     path: &model::Path,
     history_index: &mut Option<u64>,
-) -> anyhow::Result<()> {
+) -> Result<(), StorageError> {
     let mut file_table = txn.open_table(FILE_TABLE)?;
     let mut history_table = txn.open_table(HISTORY_TABLE)?;
     let path_str = path.as_str();
@@ -272,7 +283,7 @@ fn do_add_file(
     mtime: &UnixTime,
     hash: Hash,
     history_index: &mut Option<u64>,
-) -> anyhow::Result<()> {
+) -> Result<(), StorageError> {
     let mut file_table = txn.open_table(FILE_TABLE)?;
     let mut history_table = txn.open_table(HISTORY_TABLE)?;
 
@@ -310,14 +321,14 @@ fn do_add_file(
 
 fn next_history_index(
     history_table: &impl redb::ReadableTable<u64, Holder<'static, HistoryTableEntry>>,
-) -> anyhow::Result<u64> {
+) -> Result<u64, StorageError> {
     let entry_index = 1 + last_history_index(history_table)?;
     Ok(entry_index)
 }
 
 fn last_history_index(
     history_table: &impl redb::ReadableTable<u64, Holder<'static, HistoryTableEntry>>,
-) -> anyhow::Result<u64> {
+) -> Result<u64, StorageError> {
     Ok(history_table.last()?.map(|(k, _)| k.value()).unwrap_or(0))
 }
 
@@ -335,7 +346,7 @@ impl RealIndexAsync {
     }
 
     /// Create an inedx using the database at the given path. Create it if necessary.
-    pub async fn open(arena: Arena, path: &path::Path) -> anyhow::Result<Self> {
+    pub async fn open(arena: Arena, path: &path::Path) -> Result<Self, StorageError> {
         let path = path.to_path_buf();
 
         task::spawn_blocking(move || {
@@ -345,7 +356,7 @@ impl RealIndexAsync {
     }
 
     /// Create an index using the given database. Initialize the database if necessary.
-    pub async fn with_db(arena: Arena, db: redb::Database) -> anyhow::Result<Self> {
+    pub async fn with_db(arena: Arena, db: redb::Database) -> Result<Self, StorageError> {
         task::spawn_blocking(move || Ok(RealIndexAsync::new(RealIndexBlocking::new(arena, db)?)))
             .await?
     }
@@ -374,7 +385,7 @@ impl RealIndexAsync {
     /// Index of the last history entry that was written.
     ///
     /// This is the value tracked by [RealIndexAsync::watch_history].
-    pub async fn last_history_index(&self) -> anyhow::Result<u64> {
+    pub async fn last_history_index(&self) -> Result<u64, StorageError> {
         let inner = Arc::clone(&self.inner);
 
         task::spawn_blocking(move || inner.last_history_index()).await?
@@ -399,7 +410,7 @@ impl RealIndexAsync {
     pub fn history(
         &self,
         range: impl RangeBounds<u64> + Send + 'static,
-    ) -> ReceiverStream<anyhow::Result<(u64, HistoryTableEntry)>> {
+    ) -> ReceiverStream<Result<(u64, HistoryTableEntry), StorageError>> {
         let (tx, rx) = mpsc::channel(100);
 
         let inner = Arc::clone(&self.inner);
@@ -409,7 +420,7 @@ impl RealIndexAsync {
             if let Err(err) = inner.history(*range, tx) {
                 // Send any global error to the channel, so it ends up
                 // in the stream instead of getting lost.
-                let _ = tx_clone.blocking_send(Err(anyhow::Error::from(err)));
+                let _ = tx_clone.blocking_send(Err(err));
             }
         });
 
@@ -417,7 +428,10 @@ impl RealIndexAsync {
     }
 
     /// Get a file entry
-    pub async fn get_file(&self, path: &model::Path) -> anyhow::Result<Option<FileTableEntry>> {
+    pub async fn get_file(
+        &self,
+        path: &model::Path,
+    ) -> Result<Option<FileTableEntry>, StorageError> {
         let inner = Arc::clone(&self.inner);
         let path = path.clone();
 
@@ -425,7 +439,7 @@ impl RealIndexAsync {
     }
 
     /// Check whether a given file is in the index already.
-    pub async fn has_file(&self, path: &model::Path) -> anyhow::Result<bool> {
+    pub async fn has_file(&self, path: &model::Path) -> Result<bool, StorageError> {
         let inner = Arc::clone(&self.inner);
         let path = path.clone();
 
@@ -438,7 +452,7 @@ impl RealIndexAsync {
         path: &model::Path,
         size: u64,
         mtime: &UnixTime,
-    ) -> anyhow::Result<bool> {
+    ) -> Result<bool, StorageError> {
         let inner = Arc::clone(&self.inner);
         let path = path.clone();
         let mtime = mtime.clone();
@@ -450,7 +464,7 @@ impl RealIndexAsync {
     ///
     /// If the path is a directory, all files within that directory
     /// are removed, recursively.
-    pub async fn remove_file_or_dir(&self, path: &model::Path) -> anyhow::Result<()> {
+    pub async fn remove_file_or_dir(&self, path: &model::Path) -> Result<(), StorageError> {
         let inner = Arc::clone(&self.inner);
         let path = path.clone();
 
@@ -463,7 +477,7 @@ impl RealIndexAsync {
         size: u64,
         mtime: &UnixTime,
         hash: Hash,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), StorageError> {
         let inner = Arc::clone(&self.inner);
         let path = path.clone();
         let mtime = mtime.clone();
