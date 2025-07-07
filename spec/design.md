@@ -255,18 +255,18 @@ a file, but only for a time (how long?)
 └──────────────────────┴─────────────────────────────────────────┘
   │
   │  ┌───────────────────────────────────────────────────────────┐
-p │  │ The Fastness                                              │  Logic layer
+p │  │ RPC and Consensus                                         │  Logic layer
 a │  └───────────────────────────────────────────────────────────┘
 s │
 s │  ┌─────────────────────────────┐  ┌──────────────────────────┐
 t │  │ Storage Layer               │  │ Network Layer            │  Data Layers
 h │  └─────────────────────────────┘  └──────────────────────────┘
 r │
-u │         ┌────────────┬─────────┐  ┌────────────────┐
-  │         │ The Unreal │ History │  │ RPC Services   │
-  ▼         │   Cache    │         │  │                │
-┌───────────┼────────────┴─────────┤  ├────────────────┴─────────┐
-│ The Real  │   redb               │  │ Transport (TPC+TLS)      │
+u │         ┌────────────┬─────────┐  ┌──────────────────────────┐
+  │         │ Real       │ Unreal  │  │ Networking               │
+  ▼         │ Index      │ Cache   │  │                          │
+┌───────────┼────────────┴─────────┤  ├──────────────────────────┤
+│ OverlayFS │ redb + Disk          │  │ Transport (TPC+TLS)      │
 └───────────┴──────────────────────┘  └──────────────────────────┘
 
 ^^^^^^^^^^^^^^ (disk) ^^^^^^^^^^^^^^  ^^^^^^^^ (network) ^^^^^^^^^
@@ -284,22 +284,16 @@ crate/
 │                                  │
 ├── realize─daemon/                │     Background process (RPC + Fuse)
 │                                  └─
-│                                  ┌─
-│                                  │ Filesystem Layer
-├── realize─fs/                    │     A library crate
-│                                  └─
 └── realize─lib/
     │
     └─ src/
        │                           ┌─
-       ├─ logic/                   │ Logic Layer
-       │  │                        │
-       │  ├─ emissaries/           │     External-facing service impl
-       │  │                        │
-       │  ├─ forest/               │     Consolidated real/unreal tree view
-       │  │                        │       and blob assignment
-       │  │                        │
-       │  ├─ consensus/            │     Bridging local and remote data
+       ├─ fs/                      │ Filesystem Layer
+       │                           └─
+       │                           ┌─
+       ├─ consensus/               │ Logic Layer
+       │                           │
+       ├─ rpc/                     │     Bridging local and remote data
        │  │                        │
        │  └─ houshold/             │     Remote peer definition and state
        │                           └─
@@ -307,14 +301,11 @@ crate/
        │                           ┌─
        ├─ network/                 │ Network Layer
        │  │                        │
-       │  ├─ rpc/                  │     TARPC service definitions
-       │  │  │                     │
-       │  │  ├─ <servicename>.rs   │
-       │  │  …  │                  │
-       │  │     └─ server.rs       │
        │  ├─ tcp.rs                │     TCP transport for TARPC
        │  │                        │
        │  ├─ reconnect.rs          │     TCP service clients
+       │  │                        │
+       │  ├─ capnp.rs              │     Cap' Proto RPC connections
        │  │                        │
        │  └─ security.rs           │     TLS and authorization (peer list)
        │                           └─
@@ -322,11 +313,9 @@ crate/
        │                           ┌─
        ├─ storage/                 │ Storage Layer
        │  │                        │
-       │  ├─ real/                 │     Data stored locally as files
+       │  ├─ real/                 │     Data stored locally as files, redb index
        │  │                        │
-       │  ├─ unreal/               │     Cached remote data
-       │  │                        │
-       │  └─ history/              │     Local change history
+       │  └─ unreal/               │     Cached remote data on disk and redbp
        │                           └─
        │
        ├─ model/                   Types shared across layers
