@@ -1,5 +1,9 @@
-@0x950bed21f9dbff63;
 # Types stored in the index databases
+
+@0xa865be6edb44e079;
+
+using Rust = import "/capnpc/rust.capnp";
+$Rust.parentModule("storage::real");
 
 # An entry in the file table.
 struct FileTableEntry {

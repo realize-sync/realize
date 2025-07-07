@@ -1,5 +1,8 @@
 @0xe4632a6ed7c19e67;
 
+using Rust = import "/capnpc/rust.capnp";
+$Rust.parentModule("network::rpc");
+
 using import "result.capnp".Result;
 
 interface Reader {

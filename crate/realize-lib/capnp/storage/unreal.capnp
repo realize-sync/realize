@@ -1,6 +1,10 @@
+# An entry in the directory table.
+
 @0x950bed21f9dbff63;
 
-# An entry in the directory table.
+using Rust = import "/capnpc/rust.capnp";
+$Rust.parentModule("storage::unreal");
+
 struct DirTableEntry {
   union {
     regular @0: ReadDirEntry;

@@ -11,40 +11,21 @@ fn main() {
 }
 
 fn build_all() -> anyhow::Result<()> {
-    storage_capnpc()?;
-    rpc_capnpc()?;
+    capnpc()?;
 
     Ok(())
 }
 
-fn storage_capnpc() -> anyhow::Result<()> {
+fn capnpc() -> anyhow::Result<()> {
     capnpc::CompilerCommand::new()
-        .src_prefix("capnp/storage")
-        .default_parent_module(module_name_as_vec("storage::unreal"))
-        .file("capnp/storage/unreal.capnp")
-        .run()?;
-
-    capnpc::CompilerCommand::new()
-        .src_prefix("capnp/storage")
-        .default_parent_module(module_name_as_vec("storage::real"))
-        .file("capnp/storage/real.capnp")
-        .run()?;
-    Ok(())
-}
-
-fn rpc_capnpc() -> anyhow::Result<()> {
-    capnpc::CompilerCommand::new()
-        .src_prefix("capnp/network/rpc")
-        .default_parent_module(module_name_as_vec("network::rpc"))
+        .src_prefix("capnp")
+        .import_path("capnp")
         .file("capnp/network/rpc/peer.capnp")
-        .file("capnp/network/rpc/store.capnp")
         .file("capnp/network/rpc/read.capnp")
         .file("capnp/network/rpc/result.capnp")
+        .file("capnp/network/rpc/store.capnp")
+        .file("capnp/storage/real.capnp")
+        .file("capnp/storage/unreal.capnp")
         .run()?;
-
     Ok(())
-}
-
-fn module_name_as_vec(module_name: &str) -> Vec<String> {
-    module_name.split("::").map(|s| s.to_string()).collect()
 }
