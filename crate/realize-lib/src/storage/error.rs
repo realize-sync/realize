@@ -1,4 +1,4 @@
-use crate::model::Arena;
+use crate::model::{self, Arena};
 use crate::utils::holder::ByteConversionError;
 use tokio::task::JoinError;
 
@@ -7,7 +7,7 @@ use tokio::task::JoinError;
 /// This type exists mainly so that errors can be converted when
 /// needed to OS I/O errors.
 #[derive(Debug, thiserror::Error)]
-pub enum UnrealError {
+pub enum StorageError {
     #[error("redb error {0}")]
     Database(Box<redb::Error>), // a box to keep size in check
 
@@ -36,50 +36,56 @@ pub enum UnrealError {
     UnknownArena(Arena),
 }
 
-impl UnrealError {
-    fn from_redb(err: redb::Error) -> UnrealError {
+impl StorageError {
+    fn from_redb(err: redb::Error) -> StorageError {
         if let redb::Error::Io(_) = &err {
             match err {
-                redb::Error::Io(err) => UnrealError::Io(err),
+                redb::Error::Io(err) => StorageError::Io(err),
                 _ => unreachable!(),
             }
         } else {
-            UnrealError::Database(Box::new(err))
+            StorageError::Database(Box::new(err))
         }
     }
 }
 
-impl From<redb::Error> for UnrealError {
+impl From<redb::Error> for StorageError {
     fn from(value: redb::Error) -> Self {
-        UnrealError::from_redb(value)
+        StorageError::from_redb(value)
     }
 }
 
-impl From<redb::TableError> for UnrealError {
+impl From<redb::TableError> for StorageError {
     fn from(value: redb::TableError) -> Self {
-        UnrealError::from_redb(value.into())
+        StorageError::from_redb(value.into())
     }
 }
 
-impl From<redb::StorageError> for UnrealError {
+impl From<redb::StorageError> for StorageError {
     fn from(value: redb::StorageError) -> Self {
-        UnrealError::from_redb(value.into())
+        StorageError::from_redb(value.into())
     }
 }
 
-impl From<redb::TransactionError> for UnrealError {
+impl From<redb::TransactionError> for StorageError {
     fn from(value: redb::TransactionError) -> Self {
-        UnrealError::from_redb(value.into())
+        StorageError::from_redb(value.into())
     }
 }
 
-impl From<redb::DatabaseError> for UnrealError {
+impl From<redb::DatabaseError> for StorageError {
     fn from(value: redb::DatabaseError) -> Self {
-        UnrealError::from_redb(value.into())
+        StorageError::from_redb(value.into())
     }
 }
-impl From<redb::CommitError> for UnrealError {
+impl From<redb::CommitError> for StorageError {
     fn from(value: redb::CommitError) -> Self {
-        UnrealError::from_redb(value.into())
+        StorageError::from_redb(value.into())
+    }
+}
+
+impl From<model::PathError> for StorageError {
+    fn from(_: model::PathError) -> Self {
+        StorageError::from(ByteConversionError::Invalid("path"))
     }
 }

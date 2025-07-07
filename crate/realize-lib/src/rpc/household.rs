@@ -8,7 +8,7 @@ use super::store_capnp::subscriber::{self, NotifyParams, NotifyResults};
 use crate::model::{Arena, Hash, Path, Peer, UnixTime};
 use crate::network::capnp::{ConnectionHandler, ConnectionManager};
 use crate::network::{Networking, Server};
-use crate::storage::{Notification, Progress, Storage, UnrealCacheAsync, UnrealError};
+use crate::storage::{Notification, Progress, Storage, StorageError, UnrealCacheAsync};
 use capnp::capability::Promise;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -434,7 +434,7 @@ async fn do_notify(
                 cache.update(&peer, notification).await?;
             }
 
-            Ok::<(), UnrealError>(())
+            Ok::<(), StorageError>(())
         })
         .await
         .map_err(|e| capnp::Error::failed(e.to_string()))?

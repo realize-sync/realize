@@ -1,6 +1,6 @@
 use super::downloader::{Download, Downloader};
 use crate::model::UnixTime;
-use crate::storage::{FileMetadata, InodeAssignment, UnrealCacheAsync, UnrealError};
+use crate::storage::{FileMetadata, InodeAssignment, StorageError, UnrealCacheAsync};
 use async_trait::async_trait;
 use moka::future::Cache;
 use nfsserve::nfs::{
@@ -222,7 +222,7 @@ impl NFSFileSystem for UnrealFs {
             .or_try_insert_with(async {
                 let reader = self.downloader.reader(id).await?;
 
-                Ok::<_, UnrealError>(Arc::new(Mutex::new(reader)))
+                Ok::<_, StorageError>(Arc::new(Mutex::new(reader)))
             })
             .await
             .map_err(|e| unreal_to_nfsstat3(e.as_ref()))?
@@ -283,7 +283,7 @@ impl NFSFileSystem for UnrealFs {
 #[derive(Debug, thiserror::Error)]
 enum UnrealFsError {
     #[error(transparent)]
-    Cache(#[from] UnrealError),
+    Cache(#[from] StorageError),
 
     #[error("invalid UTF-8 string")]
     Utf8(#[from] Utf8Error),
@@ -303,8 +303,8 @@ impl From<UnrealFsError> for nfsstat3 {
     }
 }
 
-fn unreal_to_nfsstat3(err: &UnrealError) -> nfsstat3 {
-    use UnrealError::*;
+fn unreal_to_nfsstat3(err: &StorageError) -> nfsstat3 {
+    use StorageError::*;
     use nfsstat3::*;
     match err {
         NotFound => NFS3ERR_NOENT,
@@ -346,8 +346,8 @@ mod tests {
     use super::*;
     use crate::model::{Arena, Hash, Path};
     use crate::network::hostport::HostPort;
-    use crate::rpc::realstore;
     use crate::network::{self, Server};
+    use crate::rpc::realstore;
     use crate::storage::{self, Notification, RealStore};
     use assert_fs::TempDir;
     use assert_fs::prelude::{FileWriteStr as _, PathChild as _};

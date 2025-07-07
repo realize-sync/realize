@@ -10,16 +10,17 @@ use crate::model;
 use crate::model::Arena;
 
 pub mod config;
+mod error;
 mod real;
 #[cfg(test)]
 pub mod testing;
 mod unreal;
 
+pub use error::StorageError;
 pub use real::notifier::Notification;
 pub use real::notifier::Progress;
 pub use real::store::{Options as RealStoreOptions, RealStore, RealStoreError, SyncedFile};
 pub use unreal::cache::UnrealCacheAsync;
-pub use unreal::error::UnrealError;
 pub use unreal::types::{FileAvailability, FileMetadata, InodeAssignment};
 
 /// Local storage, including the real store and an unreal cache.

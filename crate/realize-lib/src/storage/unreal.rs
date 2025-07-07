@@ -1,5 +1,4 @@
 pub mod cache;
-pub mod error;
 pub mod types;
 #[allow(dead_code)]
 #[allow(unknown_lints)]

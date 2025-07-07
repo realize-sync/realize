@@ -3,7 +3,7 @@ use crate::network::Networking;
 use crate::rpc::realstore::client::{ClientOptions, RealStoreClient};
 use crate::rpc::realstore::{self};
 use crate::storage::{
-    FileAvailability, RealStoreError, RealStoreOptions, UnrealCacheAsync, UnrealError,
+    FileAvailability, RealStoreError, RealStoreOptions, StorageError, UnrealCacheAsync,
 };
 use moka::future::{Cache, CacheBuilder};
 use std::cmp::min;
@@ -39,7 +39,7 @@ impl Downloader {
         }
     }
 
-    pub async fn reader(&self, inode: u64) -> Result<Download, UnrealError> {
+    pub async fn reader(&self, inode: u64) -> Result<Download, StorageError> {
         let avail = self.cache.file_availability(inode).await?;
 
         let (client, peer) = self.choose(&avail).await?;
@@ -57,7 +57,7 @@ impl Downloader {
     async fn choose(
         &self,
         avail: &FileAvailability,
-    ) -> Result<(Arc<RealStoreClient>, Peer), UnrealError> {
+    ) -> Result<(Arc<RealStoreClient>, Peer), StorageError> {
         for peer in &avail.peers {
             if let Some(client) = self.clients.get(&peer).await {
                 // TODO: check if client is still connected, if no,
@@ -102,7 +102,7 @@ impl Downloader {
                 return Ok((client, peer.clone()));
             }
         }
-        Err(UnrealError::Unavailable)
+        Err(StorageError::Unavailable)
     }
 }
 

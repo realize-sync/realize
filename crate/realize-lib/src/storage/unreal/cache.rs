@@ -2,12 +2,12 @@
 //!
 //! See `spec/unreal.md` for details.
 
-use super::error::UnrealError;
 use super::types::{
     DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry, InodeAssignment,
     PeerTableEntry, ReadDirEntry,
 };
 use crate::model::{Arena, Hash, Path, Peer, UnixTime};
+use crate::storage::StorageError;
 use crate::storage::config::StorageConfig;
 use crate::storage::real::notifier::{Notification, Progress};
 use crate::utils::holder::Holder;
@@ -108,7 +108,7 @@ impl UnrealCacheBlocking {
     pub const ROOT_DIR: u64 = 1;
 
     /// Create a new UnrealCache from a redb database.
-    pub fn new(db: Database) -> Result<Self, UnrealError> {
+    pub fn new(db: Database) -> Result<Self, StorageError> {
         {
             let txn = db.begin_write()?;
             txn.open_table(ARENA_TABLE)?;
@@ -129,7 +129,7 @@ impl UnrealCacheBlocking {
     }
 
     /// Open or create an UnrealCache at the given path.
-    pub fn open(path: &path::Path) -> Result<Self, UnrealError> {
+    pub fn open(path: &path::Path) -> Result<Self, StorageError> {
         Self::new(Database::create(path)?)
     }
 
@@ -142,11 +142,11 @@ impl UnrealCacheBlocking {
     ///
     /// Will return [UnrealCacheError::UnknownArena] unless the arena
     /// is available in the cache.
-    pub fn arena_root(&self, arena: &Arena) -> Result<u64, UnrealError> {
+    pub fn arena_root(&self, arena: &Arena) -> Result<u64, StorageError> {
         self.arena_map
             .get(arena)
             .copied()
-            .ok_or_else(|| UnrealError::UnknownArena(arena.clone()))
+            .ok_or_else(|| StorageError::UnknownArena(arena.clone()))
     }
 
     /// Add an arena to the database.
@@ -177,13 +177,13 @@ impl UnrealCacheBlocking {
     }
 
     /// Lookup a directory entry.
-    pub fn lookup(&self, parent_inode: u64, name: &str) -> Result<ReadDirEntry, UnrealError> {
+    pub fn lookup(&self, parent_inode: u64, name: &str) -> Result<ReadDirEntry, StorageError> {
         let txn = self.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
 
         Ok(dir_table
             .get((parent_inode, name))?
-            .ok_or(UnrealError::NotFound)?
+            .ok_or(StorageError::NotFound)?
             .value()
             .parse()?
             .into_readdir_entry(parent_inode))
@@ -194,7 +194,7 @@ impl UnrealCacheBlocking {
         &self,
         parent_inode: u64,
         path: &Path,
-    ) -> Result<(u64, InodeAssignment), UnrealError> {
+    ) -> Result<(u64, InodeAssignment), StorageError> {
         let txn = self.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
 
@@ -202,14 +202,14 @@ impl UnrealCacheBlocking {
     }
 
     /// Return the best metadata for the file.
-    pub fn file_metadata(&self, inode: u64) -> Result<FileMetadata, UnrealError> {
+    pub fn file_metadata(&self, inode: u64) -> Result<FileMetadata, StorageError> {
         let txn = self.db.begin_read()?;
 
         do_file_availability(&txn, inode).map(|a| a.metadata)
     }
 
     /// Return the mtime of the directory.
-    pub fn dir_mtime(&self, inode: u64) -> Result<UnixTime, UnrealError> {
+    pub fn dir_mtime(&self, inode: u64) -> Result<UnixTime, StorageError> {
         let txn = self.db.begin_read()?;
 
         do_dir_mtime(&txn, inode)
@@ -218,13 +218,13 @@ impl UnrealCacheBlocking {
     /// Return valid peer file entries for the file.
     ///
     /// The returned vector might be empty if the file isn't available in any peer.
-    pub fn file_availability(&self, inode: u64) -> Result<FileAvailability, UnrealError> {
+    pub fn file_availability(&self, inode: u64) -> Result<FileAvailability, StorageError> {
         let txn = self.db.begin_read()?;
 
         do_file_availability(&txn, inode)
     }
 
-    pub fn readdir(&self, inode: u64) -> Result<Vec<(String, ReadDirEntry)>, UnrealError> {
+    pub fn readdir(&self, inode: u64) -> Result<Vec<(String, ReadDirEntry)>, StorageError> {
         let txn = self.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
 
@@ -255,13 +255,13 @@ impl UnrealCacheBlocking {
         &self,
         peer: &Peer,
         arena: &Arena,
-    ) -> Result<Option<Progress>, UnrealError> {
+    ) -> Result<Option<Progress>, StorageError> {
         let txn = self.db.begin_read()?;
 
         do_peer_progress(&txn, peer, arena)
     }
 
-    pub fn update(&self, peer: &Peer, notification: Notification) -> Result<(), UnrealError> {
+    pub fn update(&self, peer: &Peer, notification: Notification) -> Result<(), StorageError> {
         log::debug!("notification from {peer}: {notification:?}");
         let txn = self.db.begin_write()?;
         match notification {
@@ -447,11 +447,15 @@ impl UnrealCacheAsync {
         self.inner.arenas()
     }
 
-    pub fn arena_root(&self, arena: &Arena) -> Result<u64, UnrealError> {
+    pub fn arena_root(&self, arena: &Arena) -> Result<u64, StorageError> {
         self.inner.arena_root(arena)
     }
 
-    pub async fn lookup(&self, parent_inode: u64, name: &str) -> Result<ReadDirEntry, UnrealError> {
+    pub async fn lookup(
+        &self,
+        parent_inode: u64,
+        name: &str,
+    ) -> Result<ReadDirEntry, StorageError> {
         let name = name.to_string();
         let inner = Arc::clone(&self.inner);
 
@@ -462,32 +466,32 @@ impl UnrealCacheAsync {
         &self,
         parent_inode: u64,
         path: &Path,
-    ) -> Result<(u64, InodeAssignment), UnrealError> {
+    ) -> Result<(u64, InodeAssignment), StorageError> {
         let path = path.clone();
         let inner = Arc::clone(&self.inner);
 
         task::spawn_blocking(move || inner.lookup_path(parent_inode, &path)).await?
     }
 
-    pub async fn file_metadata(&self, inode: u64) -> Result<FileMetadata, UnrealError> {
+    pub async fn file_metadata(&self, inode: u64) -> Result<FileMetadata, StorageError> {
         let inner = Arc::clone(&self.inner);
 
         task::spawn_blocking(move || inner.file_metadata(inode)).await?
     }
 
-    pub async fn file_availability(&self, inode: u64) -> Result<FileAvailability, UnrealError> {
+    pub async fn file_availability(&self, inode: u64) -> Result<FileAvailability, StorageError> {
         let inner = Arc::clone(&self.inner);
 
         task::spawn_blocking(move || inner.file_availability(inode)).await?
     }
 
-    pub async fn dir_mtime(&self, inode: u64) -> Result<UnixTime, UnrealError> {
+    pub async fn dir_mtime(&self, inode: u64) -> Result<UnixTime, StorageError> {
         let inner = Arc::clone(&self.inner);
 
         task::spawn_blocking(move || inner.dir_mtime(inode)).await?
     }
 
-    pub async fn readdir(&self, inode: u64) -> Result<Vec<(String, ReadDirEntry)>, UnrealError> {
+    pub async fn readdir(&self, inode: u64) -> Result<Vec<(String, ReadDirEntry)>, StorageError> {
         let inner = Arc::clone(&self.inner);
 
         task::spawn_blocking(move || inner.readdir(inode)).await?
@@ -501,7 +505,7 @@ impl UnrealCacheAsync {
         &self,
         peer: &Peer,
         arena: &Arena,
-    ) -> Result<Option<Progress>, UnrealError> {
+    ) -> Result<Option<Progress>, StorageError> {
         let peer = peer.clone();
         let arena = arena.clone();
         let inner = Arc::clone(&self.inner);
@@ -510,7 +514,11 @@ impl UnrealCacheAsync {
     }
 
     /// Update the cache by applying a notification coming from the given peer.
-    pub async fn update(&self, peer: &Peer, notification: Notification) -> Result<(), UnrealError> {
+    pub async fn update(
+        &self,
+        peer: &Peer,
+        notification: Notification,
+    ) -> Result<(), StorageError> {
         let peer = peer.clone();
         let inner = Arc::clone(&self.inner);
 
@@ -523,7 +531,7 @@ fn do_update_last_seen_notification(
     peer: &Peer,
     arena: &Arena,
     index: u64,
-) -> Result<(), UnrealError> {
+) -> Result<(), StorageError> {
     let mut notification_table = txn.open_table(NOTIFICATION_TABLE)?;
     notification_table.insert((peer.as_str(), arena.as_str()), index)?;
 
@@ -534,7 +542,7 @@ fn do_peer_progress(
     txn: &ReadTransaction,
     peer: &Peer,
     arena: &Arena,
-) -> Result<Option<Progress>, UnrealError> {
+) -> Result<Option<Progress>, StorageError> {
     let key = (peer.as_str(), arena.as_str());
 
     let peer_table = txn.open_table(PEER_TABLE)?;
@@ -550,7 +558,7 @@ fn do_peer_progress(
     Ok(None)
 }
 
-fn do_dir_mtime(txn: &ReadTransaction, inode: u64) -> Result<UnixTime, UnrealError> {
+fn do_dir_mtime(txn: &ReadTransaction, inode: u64) -> Result<UnixTime, StorageError> {
     let dir_table = txn.open_table(DIRECTORY_TABLE)?;
     match dir_table.get((inode, "."))? {
         Some(e) => {
@@ -567,10 +575,10 @@ fn do_dir_mtime(txn: &ReadTransaction, inode: u64) -> Result<UnixTime, UnrealErr
         }
     }
 
-    Err(UnrealError::NotFound)
+    Err(StorageError::NotFound)
 }
 
-fn do_read_arena_map(txn: &ReadTransaction) -> Result<HashMap<Arena, u64>, UnrealError> {
+fn do_read_arena_map(txn: &ReadTransaction) -> Result<HashMap<Arena, u64>, StorageError> {
     let mut map = HashMap::new();
     let arena_table = txn.open_table(ARENA_TABLE)?;
     for elt in arena_table.iter()? {
@@ -628,17 +636,17 @@ fn do_unlink(
     arena_root: u64,
     path: &Path,
     old_hash: Hash,
-) -> Result<(), UnrealError> {
+) -> Result<(), StorageError> {
     let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
     let (parent_inode, parent_assignment) = do_lookup_path(&dir_table, arena_root, &path.parent())?;
     if parent_assignment != InodeAssignment::Directory {
-        return Err(UnrealError::NotADirectory);
+        return Err(StorageError::NotADirectory);
     }
 
     let dir_entry =
-        get_dir_entry(&dir_table, parent_inode, path.name())?.ok_or(UnrealError::NotFound)?;
+        get_dir_entry(&dir_table, parent_inode, path.name())?.ok_or(StorageError::NotFound)?;
     if dir_entry.assignment != InodeAssignment::File {
-        return Err(UnrealError::IsADirectory);
+        return Err(StorageError::IsADirectory);
     }
 
     let inode = dir_entry.inode;
@@ -660,7 +668,7 @@ fn get_file_entry(
     file_table: &redb::Table<'_, (u64, &str), Holder<FileTableEntry>>,
     inode: u64,
     peer: Option<&Peer>,
-) -> Result<Option<FileTableEntry>, UnrealError> {
+) -> Result<Option<FileTableEntry>, StorageError> {
     match file_table.get((inode, peer.map(|p| p.as_str()).unwrap_or("")))? {
         None => Ok(None),
         Some(e) => Ok(Some(e.value().parse()?)),
@@ -670,14 +678,14 @@ fn get_file_entry(
 fn do_file_availability(
     txn: &ReadTransaction,
     inode: u64,
-) -> Result<FileAvailability, UnrealError> {
+) -> Result<FileAvailability, StorageError> {
     let file_table = txn.open_table(FILE_TABLE)?;
 
     let mut range = file_table.range((inode, "")..(inode + 1, ""))?;
-    let (default_key, default_entry) = range.next().ok_or(UnrealError::NotFound)??;
+    let (default_key, default_entry) = range.next().ok_or(StorageError::NotFound)??;
     if default_key.value().1 != "" {
         log::warn!("File table entry without a default peer: {inode}");
-        return Err(UnrealError::NotFound);
+        return Err(StorageError::NotFound);
     }
     let FileTableEntry {
         metadata,
@@ -698,7 +706,7 @@ fn do_file_availability(
     }
     if peers.is_empty() {
         log::warn!("No peer has hash {hash} for {inode}");
-        return Err(UnrealError::NotFound);
+        return Err(StorageError::NotFound);
     }
 
     Ok(FileAvailability {
@@ -716,7 +724,7 @@ fn do_write_file_entry(
     file_inode: u64,
     peer: Option<&Peer>,
     entry: &FileTableEntry,
-) -> Result<(), UnrealError> {
+) -> Result<(), StorageError> {
     let key = peer.map(|p| p.as_str()).unwrap_or("");
     log::debug!("new file entry {file_inode} {key} {}", entry.content.hash);
 
@@ -732,7 +740,7 @@ fn do_create_file(
     txn: &WriteTransaction,
     arena_root: u64,
     path: &Path,
-) -> Result<(u64, u64), UnrealError> {
+) -> Result<(u64, u64), StorageError> {
     let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
     let filename = path.name();
     let parent_inode = do_mkdirs(txn, &mut dir_table, arena_root, &path.parent())?;
@@ -747,7 +755,7 @@ fn do_create_file(
         )?,
         Some(dir_entry) => {
             if dir_entry.assignment != InodeAssignment::File {
-                return Err(UnrealError::IsADirectory);
+                return Err(StorageError::IsADirectory);
             }
 
             dir_entry.inode
@@ -766,13 +774,13 @@ fn do_mkdirs(
     dir_table: &mut redb::Table<'_, (u64, &str), Holder<DirTableEntry>>,
     root_inode: u64,
     path: &Option<Path>,
-) -> Result<u64, UnrealError> {
+) -> Result<u64, StorageError> {
     log::debug!("mkdirs {root_inode} {path:?}");
     let mut current = root_inode;
     for component in Path::components(path) {
         current = if let Some(entry) = get_dir_entry(dir_table, current, component)? {
             if entry.assignment != InodeAssignment::Directory {
-                return Err(UnrealError::NotADirectory);
+                return Err(StorageError::NotADirectory);
             }
             log::debug!("found {component} in {current} -> {entry:?}");
             entry.inode
@@ -797,16 +805,16 @@ fn do_lookup_path(
     dir_table: &impl redb::ReadableTable<(u64, &'static str), Holder<'static, DirTableEntry>>,
     root_inode: u64,
     path: &Option<Path>,
-) -> Result<(u64, InodeAssignment), UnrealError> {
+) -> Result<(u64, InodeAssignment), StorageError> {
     let mut current = (root_inode, InodeAssignment::Directory);
     for component in Path::components(path) {
         if current.1 != InodeAssignment::Directory {
-            return Err(UnrealError::NotADirectory);
+            return Err(StorageError::NotADirectory);
         }
         if let Some(entry) = get_dir_entry(dir_table, current.0, component)? {
             current = (entry.inode, entry.assignment);
         } else {
-            return Err(UnrealError::NotFound);
+            return Err(StorageError::NotFound);
         };
     }
 
@@ -818,7 +826,7 @@ fn get_dir_entry(
     dir_table: &impl redb::ReadableTable<(u64, &'static str), Holder<'static, DirTableEntry>>,
     parent_inode: u64,
     name: &str,
-) -> Result<Option<ReadDirEntry>, UnrealError> {
+) -> Result<Option<ReadDirEntry>, StorageError> {
     match dir_table.get((parent_inode, name))? {
         None => Ok(None),
         Some(e) => Ok(Some(e.value().parse()?.into_readdir_entry(parent_inode))),
@@ -832,7 +840,7 @@ fn add_dir_entry(
     parent_inode: u64,
     name: &str,
     assignment: InodeAssignment,
-) -> Result<u64, UnrealError> {
+) -> Result<u64, StorageError> {
     let new_inode = alloc_inode(txn)?;
     log::debug!("new dir entry {parent_inode} {name} -> {new_inode} {assignment:?}");
     dir_table.insert(
@@ -852,7 +860,7 @@ fn add_dir_entry(
     Ok(new_inode)
 }
 
-fn alloc_inode(txn: &WriteTransaction) -> Result<u64, UnrealError> {
+fn alloc_inode(txn: &WriteTransaction) -> Result<u64, StorageError> {
     let mut table = txn.open_table(MAX_INODE_TABLE)?;
     let max_inode = if let Some(v) = table.get(())? {
         v.value()
@@ -869,7 +877,7 @@ fn do_mark_peer_files(
     txn: &WriteTransaction,
     peer: &Peer,
     arena: &Arena,
-) -> Result<(), UnrealError> {
+) -> Result<(), StorageError> {
     let file_table = txn.open_table(FILE_TABLE)?;
     let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
     let peer_str = peer.as_str();
@@ -895,7 +903,7 @@ fn do_unmark_peer_file(
     peer: &Peer,
     arena: &Arena,
     inode: u64,
-) -> Result<(), UnrealError> {
+) -> Result<(), StorageError> {
     let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
     pending_catchup_table.remove((peer.as_str(), arena.as_str(), inode))?;
 
@@ -906,7 +914,7 @@ fn do_delete_marked_files(
     txn: &WriteTransaction,
     peer: &Peer,
     arena: &Arena,
-) -> Result<(), UnrealError> {
+) -> Result<(), StorageError> {
     let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
     let mut file_table = txn.open_table(FILE_TABLE)?;
     let mut directory_table = txn.open_table(DIRECTORY_TABLE)?;
@@ -938,7 +946,7 @@ fn do_rm_file_entry(
     inode: u64,
     peer: &Peer,
     old_hash: Option<Hash>,
-) -> Result<(), UnrealError> {
+) -> Result<(), StorageError> {
     let peer_str = peer.as_str();
 
     let mut entries = HashMap::new();
@@ -1381,7 +1389,7 @@ mod tests {
 
         assert!(matches!(
             cache.lookup(UnrealCacheBlocking::ROOT_DIR, "nonexistent"),
-            Err(UnrealError::NotFound),
+            Err(StorageError::NotFound),
         ));
 
         Ok(())
@@ -1909,7 +1917,7 @@ mod tests {
         // File1 should have been deleted, since it was only on peer1,
         assert!(matches!(
             cache.lookup(UnrealCacheBlocking::ROOT_DIR, file1.name()),
-            Err(UnrealError::NotFound)
+            Err(StorageError::NotFound)
         ));
         // File2 and 3 should still be available, from other peers
         let file2_inode = cache.lookup(arena_root, file2.name())?.inode;

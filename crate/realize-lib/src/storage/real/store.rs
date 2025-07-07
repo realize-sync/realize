@@ -461,8 +461,8 @@ fn not_found() -> std::io::Error {
 
 /// Error type used by [RealStoreService].
 ///
-/// The data stored in this error is limited, to remain usable through
-/// a RPC.
+/// The data stored in this error is limited, to be serializable and
+/// remain usable through tarpc.
 #[derive(thiserror::Error, Debug, serde::Serialize, serde::Deserialize)]
 pub enum RealStoreError {
     /// Returned by the RealStoreService when given an invalid request.
