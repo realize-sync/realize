@@ -7,10 +7,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::thread;
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::runtime;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, LocalSet};
@@ -57,29 +55,46 @@ pub struct ConnectionManager {
 }
 
 impl ConnectionManager {
-    /// Spawn a new RPC thread and return the ConnectionManager instance that
-    /// manages it.
-    pub fn spawn<H, C>(
-        networking: Networking,
-        handler: H,
-    ) -> anyhow::Result<(Self, thread::JoinHandle<()>)>
+    /// Build a new ConnectionManager instance that runs on the
+    /// given [LocalSet].
+    ///
+    /// The [LocalSet] must later be run to run the tasks spawned on
+    /// it by the connection manager. This is done by calling
+    /// [LocalSet::run_until] or awaiting the local set itself.
+    pub fn spawn<H, C>(local: &LocalSet, networking: Networking, handler: H) -> anyhow::Result<Self>
     where
         H: ConnectionHandler<C> + 'static,
         C: capnp::capability::FromClientHook + Clone + 'static,
     {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let (broadcast_tx, _) = broadcast::channel(128);
         let tag = handler.tag();
-        let handle = spawn_rpc_thread(networking, handler, rx, broadcast_tx.clone())?;
 
-        Ok((
-            Self {
-                tx,
-                broadcast_tx,
-                tag,
-            },
-            handle,
-        ))
+        local.spawn_local({
+            let broadcast_tx = broadcast_tx.clone();
+
+            async move {
+                log::debug!("=== manager start ");
+                let ctx = AppContext::new(networking, handler, broadcast_tx);
+                while let Some(conn) = rx.recv().await {
+                    match conn {
+                        ConnectionMessage::Incoming {
+                            peer,
+                            stream,
+                            shutdown_rx,
+                        } => ctx.accept(peer, stream, shutdown_rx),
+                        ConnectionMessage::KeepConnected => ctx.keep_connected(),
+                    }
+                }
+                log::debug!("=== manager end");
+            }
+        });
+
+        Ok(Self {
+            tx,
+            broadcast_tx,
+            tag,
+        })
     }
 
     /// Report peer status changes through the given receiver.
@@ -109,47 +124,6 @@ impl ConnectionManager {
             });
         })
     }
-}
-
-/// Spawns a single thread that handles all Cap'n Proto RPC connections.
-///
-/// To communicate with the thread, send [HousehholdConnection]s to the channel.
-fn spawn_rpc_thread<H, C>(
-    networking: Networking,
-    handler: H,
-    mut rx: mpsc::UnboundedReceiver<ConnectionMessage>,
-    broadcast_tx: broadcast::Sender<PeerStatus>,
-) -> anyhow::Result<thread::JoinHandle<()>>
-where
-    H: ConnectionHandler<C> + 'static,
-    C: capnp::capability::FromClientHook + Clone + 'static,
-{
-    let rt = runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
-    Ok(thread::Builder::new()
-        .name("capnprpc".into())
-        .spawn(move || {
-            let ctx = AppContext::new(networking, handler, broadcast_tx);
-            let local = LocalSet::new();
-
-            local.spawn_local(async move {
-                while let Some(conn) = rx.recv().await {
-                    match conn {
-                        ConnectionMessage::Incoming {
-                            peer,
-                            stream,
-                            shutdown_rx,
-                        } => ctx.accept(peer, stream, shutdown_rx),
-                        ConnectionMessage::KeepConnected => ctx.keep_connected(),
-                    }
-                }
-            });
-
-            rt.block_on(local);
-        })?)
 }
 
 struct AppContext<H, C>
@@ -446,17 +420,15 @@ mod tests {
             Ok(Self { peers })
         }
 
-        fn manager(
-            &self,
-            peer: &Peer,
-        ) -> anyhow::Result<(ConnectionManager, thread::JoinHandle<()>)> {
+        fn manager(&self, local: &LocalSet, peer: &Peer) -> anyhow::Result<ConnectionManager> {
             ConnectionManager::spawn(
+                local,
                 self.peers.networking(peer)?,
                 HelloConnectionHandler::new(peer),
             )
         }
 
-        async fn run_server(
+        async fn launch_server(
             &mut self,
             peer: &Peer,
             manager: &ConnectionManager,
@@ -497,13 +469,13 @@ mod tests {
     #[tokio::test]
     async fn manager_listens() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
+        let local = LocalSet::new();
 
         let a = &a();
-        let (manager, _) = fixture.manager(a)?;
-        let _server = fixture.run_server(a, &manager).await?;
-
+        let manager = fixture.manager(&local, a)?;
+        let _server = fixture.launch_server(a, &manager).await?;
         let b_networking = fixture.peers.networking(&b())?;
-        LocalSet::new()
+        local
             .run_until(async move {
                 let client = connect(b_networking, a).await?;
 
@@ -521,37 +493,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capnprpc_thread_shutdown() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup().await?;
-
-        let a = &a();
-        let (manager, thread_join) = fixture.manager(a)?;
-        let server = fixture.run_server(a, &manager).await?;
-
-        let b_networking = fixture.peers.networking(&b())?;
-        LocalSet::new()
-            .run_until(async move {
-                let client = connect(b_networking, a).await?;
-                let mut request = client.hello_request();
-                request.get().set_name("test");
-                request.send().promise.await?;
-
-                Ok::<(), anyhow::Error>(())
-            })
-            .await?;
-
-        // The thread shuts down once the channel is unused.
-        server.shutdown().await?;
-        drop(server);
-        drop(manager);
-        assert!(thread_join.join().is_ok());
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn manager_connects() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
+        let local = LocalSet::new();
 
         let a = &a();
         fixture.peers.pick_port(a)?;
@@ -559,22 +503,28 @@ mod tests {
         let b = &b();
         fixture.peers.pick_port(b)?;
 
-        let (manager_a, _) = fixture.manager(a)?;
-        let _server_a = fixture.run_server(a, &manager_a).await?;
+        let manager_a = fixture.manager(&local, a)?;
+        let _server_a = fixture.launch_server(a, &manager_a).await?;
 
-        let (manager_b, _) = fixture.manager(b)?;
-        let _server_b = fixture.run_server(b, &manager_b).await?;
+        let manager_b = fixture.manager(&local, b)?;
+        let _server_b = fixture.launch_server(b, &manager_b).await?;
 
-        let mut status_a = manager_a.peer_status();
-        let mut status_b = manager_b.peer_status();
+        local
+            .run_until(async move {
+                let mut status_a = manager_a.peer_status();
+                let mut status_b = manager_b.peer_status();
 
-        manager_a.keep_connected()?;
-        assert_eq!(PeerStatus::Connected(b.clone()), status_a.recv().await?);
-        assert_eq!(PeerStatus::Registered(b.clone()), status_a.recv().await?);
+                manager_a.keep_connected()?;
+                assert_eq!(PeerStatus::Connected(b.clone()), status_a.recv().await?);
+                assert_eq!(PeerStatus::Registered(b.clone()), status_a.recv().await?);
 
-        manager_b.keep_connected()?;
-        assert_eq!(PeerStatus::Connected(a.clone()), status_b.recv().await?);
-        assert_eq!(PeerStatus::Registered(a.clone()), status_b.recv().await?);
+                manager_b.keep_connected()?;
+                assert_eq!(PeerStatus::Connected(a.clone()), status_b.recv().await?);
+                assert_eq!(PeerStatus::Registered(a.clone()), status_b.recv().await?);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
 
         Ok(())
     }
@@ -582,6 +532,7 @@ mod tests {
     #[tokio::test]
     async fn manager_reconnects() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
+        let local = LocalSet::new();
 
         let a = &a();
         fixture.peers.pick_port(a)?;
@@ -589,22 +540,28 @@ mod tests {
         let b = &b();
         fixture.peers.pick_port(b)?;
 
-        let (manager_a, _) = fixture.manager(a)?;
-        let _server_a = fixture.run_server(a, &manager_a).await?;
+        let manager_a = fixture.manager(&local, a)?;
+        let _server_a = fixture.launch_server(a, &manager_a).await?;
 
-        let (manager_b, _) = fixture.manager(b)?;
-        let server_b = fixture.run_server(b, &manager_b).await?;
+        let manager_b = fixture.manager(&local, b)?;
+        let server_b = fixture.launch_server(b, &manager_b).await?;
 
         let mut status_a = manager_a.peer_status();
         manager_a.keep_connected()?;
 
-        assert_eq!(PeerStatus::Connected(b.clone()), status_a.recv().await?);
-        assert_eq!(PeerStatus::Registered(b.clone()), status_a.recv().await?);
-        server_b.shutdown().await?;
-        assert_eq!(PeerStatus::Disconnected(b.clone()), status_a.recv().await?);
+        local
+            .run_until(async move {
+                assert_eq!(PeerStatus::Connected(b.clone()), status_a.recv().await?);
+                assert_eq!(PeerStatus::Registered(b.clone()), status_a.recv().await?);
+                server_b.shutdown().await?;
+                assert_eq!(PeerStatus::Disconnected(b.clone()), status_a.recv().await?);
 
-        let _server_b = fixture.run_server(b, &manager_b).await?;
-        assert_eq!(PeerStatus::Connected(b.clone()), status_a.recv().await?);
+                let _server_b = fixture.launch_server(b, &manager_b).await?;
+                assert_eq!(PeerStatus::Connected(b.clone()), status_a.recv().await?);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
 
         Ok(())
     }

@@ -1,9 +1,11 @@
+use tokio::task::LocalSet;
+
 use super::config::Config;
 use crate::fs::downloader::Downloader;
 use crate::fs::nfs;
 use crate::model::Arena;
-use crate::rpc::{Household, realstore};
 use crate::network::{Networking, Server};
+use crate::rpc::{Household, realstore};
 use crate::storage::Storage;
 use crate::storage::config::ArenaConfig;
 use std::collections::HashMap;
@@ -46,7 +48,7 @@ impl SetupHelper {
     /// Setup server as specified in the configuration.
     ///
     /// The returned server is configured, but not started.
-    pub async fn setup_server(self) -> anyhow::Result<Arc<Server>> {
+    pub async fn setup_server(self, local: &LocalSet) -> anyhow::Result<Arc<Server>> {
         let SetupHelper {
             networking,
             storage,
@@ -56,7 +58,7 @@ impl SetupHelper {
         realstore::server::register(&mut server, storage.store().clone());
 
         let has_cache = storage.cache().is_some();
-        let (household, _) = Household::spawn(networking, storage)?;
+        let household = Household::spawn(local, networking, storage)?;
         if has_cache {
             household.keep_connected()?;
         }

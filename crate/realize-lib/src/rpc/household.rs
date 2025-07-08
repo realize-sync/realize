@@ -12,9 +12,8 @@ use crate::storage::{Notification, Progress, Storage, StorageError, UnrealCacheA
 use capnp::capability::Promise;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::thread;
-use tokio::runtime;
 use tokio::sync::mpsc;
+use tokio::task::LocalSet;
 use uuid::Uuid;
 
 /// Identifies Cap'n Proto ConnectedPeer connections.
@@ -33,21 +32,23 @@ pub struct Household {
 }
 
 impl Household {
-    /// Spawn a new RPC thread and return the Household instance that
-    /// manages it.
+    /// Build a new Household instance that runs on the given
+    /// [LocalSet].
+    ///
+    /// The [LocalSet] must later be run to run the tasks spawned on
+    /// it by the connection manager. This is done by calling
+    /// [LocalSet::run_until] or awaiting the local set itself.
     pub fn spawn(
+        local: &LocalSet,
         networking: Networking,
         storage: Arc<Storage>,
-    ) -> anyhow::Result<(Self, thread::JoinHandle<()>)> {
-        let (manager, join_handle) =
-            ConnectionManager::spawn(networking, PeerConnectionHandler::new(Ctx::new(storage)))?;
+    ) -> anyhow::Result<Self> {
+        let manager =
+            ConnectionManager::spawn(local, networking, PeerConnectionHandler::new(storage))?;
 
-        Ok((
-            Self {
-                manager: Arc::new(manager),
-            },
-            join_handle,
-        ))
+        Ok(Self {
+            manager: Arc::new(manager),
+        })
     }
 
     /// Keep a client connection up to all peers for which an address is known.
@@ -64,29 +65,13 @@ impl Household {
     }
 }
 
-/// Common contextual information that's passed around the types in
-/// this module.
-struct Ctx {
-    storage: Arc<Storage>,
-    main_rt: runtime::Handle,
-}
-
-impl Ctx {
-    fn new(storage: Arc<Storage>) -> Arc<Ctx> {
-        Arc::new(Self {
-            storage,
-            main_rt: runtime::Handle::current(),
-        })
-    }
-}
-
 struct PeerConnectionHandler {
-    ctx: Arc<Ctx>,
+    storage: Arc<Storage>,
 }
 
 impl PeerConnectionHandler {
-    fn new(ctx: Arc<Ctx>) -> Self {
-        Self { ctx }
+    fn new(storage: Arc<Storage>) -> Self {
+        Self { storage }
     }
 }
 
@@ -96,7 +81,7 @@ impl ConnectionHandler<connected_peer::Client> for PeerConnectionHandler {
     }
 
     fn server(&self, peer: &Peer) -> capnp::capability::Client {
-        ConnectedPeerServer::new(peer.clone(), self.ctx.clone())
+        ConnectedPeerServer::new(peer.clone(), self.storage.clone())
             .into_connected_peer()
             .client
     }
@@ -112,7 +97,7 @@ impl ConnectionHandler<connected_peer::Client> for PeerConnectionHandler {
     }
 
     async fn register(&self, peer: &Peer, client: connected_peer::Client) -> anyhow::Result<()> {
-        subscribe_self(&self.ctx, peer, client).await?;
+        subscribe_self(&self.storage, peer, client).await?;
 
         Ok(())
     }
@@ -121,12 +106,12 @@ impl ConnectionHandler<connected_peer::Client> for PeerConnectionHandler {
 /// Subscribe to notifications from the given client and use it to
 /// update the cache.
 async fn subscribe_self(
-    ctx: &Arc<Ctx>,
+    storage: &Arc<Storage>,
     peer: &Peer,
     mut client: connected_peer::Client,
 ) -> anyhow::Result<()> {
     let store = get_connected_peer_store(&mut client).await?;
-    let cache = match ctx.storage.cache() {
+    let cache = match storage.cache() {
         None => {
             return Ok(());
         }
@@ -160,26 +145,24 @@ async fn subscribe_self(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    let mut progress = ctx
-        .main_rt
-        .spawn({
-            let peer = peer.clone();
-            let goal_arenas = goal_arenas.clone();
-            let cache = cache.clone();
-            async move {
-                let mut map = HashMap::new();
-                for arena in goal_arenas {
-                    if let Some(progress) = cache.peer_progress(&peer, &arena).await? {
-                        map.insert(arena, progress);
-                    }
+    let mut progress = tokio::spawn({
+        let peer = peer.clone();
+        let goal_arenas = goal_arenas.clone();
+        let cache = cache.clone();
+        async move {
+            let mut map = HashMap::new();
+            for arena in goal_arenas {
+                if let Some(progress) = cache.peer_progress(&peer, &arena).await? {
+                    map.insert(arena, progress);
                 }
-
-                Ok::<_, anyhow::Error>(map)
             }
-        })
-        .await??;
 
-    let subscriber = ConnectedPeerServer::new(peer.clone(), ctx.clone()).into_subscriber();
+            Ok::<_, anyhow::Error>(map)
+        }
+    })
+    .await??;
+
+    let subscriber = ConnectedPeerServer::new(peer.clone(), storage.clone()).into_subscriber();
     for arena in goal_arenas {
         let mut request = store.subscribe_request();
         let mut request_builder = request.get().init_req();
@@ -207,12 +190,12 @@ async fn subscribe_self(
 #[derive(Clone)]
 struct ConnectedPeerServer {
     peer: Peer,
-    ctx: Arc<Ctx>,
+    storage: Arc<Storage>,
 }
 
 impl ConnectedPeerServer {
-    fn new(peer: Peer, ctx: Arc<Ctx>) -> Self {
-        Self { peer, ctx }
+    fn new(peer: Peer, storage: Arc<Storage>) -> Self {
+        Self { peer, storage }
     }
 
     fn into_connected_peer(self) -> connected_peer::Client {
@@ -250,19 +233,16 @@ impl ConnectedPeerServer {
 
         let (tx, mut rx) = mpsc::channel(100);
 
-        let storage = self.ctx.storage.clone();
-        if let Err(err) = self
-            .ctx
-            .main_rt
-            .spawn({
-                let arena = arena.clone();
-                async move {
-                    storage.subscribe(&arena, tx, progress).await?;
+        if let Err(err) = tokio::spawn({
+            let storage = self.storage.clone();
+            let arena = arena.clone();
+            async move {
+                storage.subscribe(&arena, tx, progress).await?;
 
-                    Ok::<(), anyhow::Error>(())
-                }
-            })
-            .await
+                Ok::<(), anyhow::Error>(())
+            }
+        })
+        .await
         {
             result.init_err().set_message(err.to_string());
             return Ok(());
@@ -309,7 +289,6 @@ impl connected_peer::Server for ConnectedPeerServer {
 impl store::Server for ConnectedPeerServer {
     fn arenas(&mut self, _: ArenasParams, mut results: ArenasResults) -> Promise<(), capnp::Error> {
         let arenas = self
-            .ctx
             .storage
             .indexed_arenas()
             .map(|a| a.clone())
@@ -338,13 +317,8 @@ impl subscriber::Server for ConnectedPeerServer {
         params: NotifyParams,
         _: NotifyResults,
     ) -> capnp::capability::Promise<(), capnp::Error> {
-        if let Some(cache) = self.ctx.storage.cache() {
-            Promise::from_future(do_notify(
-                cache.clone(),
-                self.ctx.main_rt.clone(),
-                self.peer.clone(),
-                params,
-            ))
+        if let Some(cache) = self.storage.cache() {
+            Promise::from_future(do_notify(cache.clone(), self.peer.clone(), params))
         } else {
             Promise::ok(())
         }
@@ -353,7 +327,6 @@ impl subscriber::Server for ConnectedPeerServer {
 
 async fn do_notify(
     cache: UnrealCacheAsync,
-    main_rt: runtime::Handle,
     peer: Peer,
     params: NotifyParams,
 ) -> Result<(), capnp::Error> {
@@ -428,17 +401,16 @@ async fn do_notify(
         });
     }
 
-    main_rt
-        .spawn(async move {
-            for notification in notifications {
-                cache.update(&peer, notification).await?;
-            }
+    tokio::spawn(async move {
+        for notification in notifications {
+            cache.update(&peer, notification).await?;
+        }
 
-            Ok::<(), StorageError>(())
-        })
-        .await
-        .map_err(|e| capnp::Error::failed(e.to_string()))?
-        .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        Ok::<(), StorageError>(())
+    })
+    .await
+    .map_err(|e| capnp::Error::failed(e.to_string()))?
+    .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
     Ok(())
 }
@@ -709,13 +681,13 @@ mod tests {
             storage::testing::arena_root(self.tempdir.child(peer.as_str()).path(), &test_arena())
         }
 
-        fn household(&self, peer: &Peer) -> anyhow::Result<(Household, thread::JoinHandle<()>)> {
+        fn household(&self, local: &LocalSet, peer: &Peer) -> anyhow::Result<Household> {
             let storage = self
                 .peer_storage
                 .get(peer)
                 .ok_or_else(|| anyhow::anyhow!("unknown peer: {peer}"))?;
 
-            Household::spawn(self.peers.networking(peer)?, storage.clone())
+            Household::spawn(local, self.peers.networking(peer)?, storage.clone())
         }
 
         async fn run_server(
@@ -743,6 +715,7 @@ mod tests {
     #[tokio::test]
     async fn household_subscribes() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
+        let local = LocalSet::new();
 
         let a = &a();
         fixture.peers.pick_port(a)?;
@@ -750,28 +723,34 @@ mod tests {
         let b = &b();
         fixture.peers.pick_port(b)?;
 
-        let (household_a, _) = fixture.household(a)?;
+        let household_a = fixture.household(&local, a)?;
         let _server_a = fixture.run_server(a, &household_a).await?;
 
-        let (household_b, _) = fixture.household(b)?;
+        let household_b = fixture.household(&local, b)?;
         let _server_b = fixture.run_server(b, &household_b).await?;
         household_a.keep_connected()?;
 
-        // A file created in B's arena should eventually become
-        // available in cache A.
-        let b_dir = fixture.arena_root(&b);
-        fs::write(&b_dir.join("bar.txt"), b"test").await?;
+        local
+            .run_until(async move {
+                // A file created in B's arena should eventually become
+                // available in cache A.
+                let b_dir = fixture.arena_root(&b);
+                fs::write(&b_dir.join("bar.txt"), b"test").await?;
 
-        let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
-        let a_cache = &fixture.peer_storage.get(a).unwrap().cache().unwrap();
-        let arena_inode = a_cache.arena_root(&test_arena())?;
-        while a_cache.lookup(arena_inode, "bar.txt").await.is_err() {
-            if let Some(delay) = retry.next() {
-                tokio::time::sleep(delay).await;
-            } else {
-                panic!("bar.txt was never added to the cache");
-            }
-        }
+                let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
+                let a_cache = &fixture.peer_storage.get(a).unwrap().cache().unwrap();
+                let arena_inode = a_cache.arena_root(&test_arena())?;
+                while a_cache.lookup(arena_inode, "bar.txt").await.is_err() {
+                    if let Some(delay) = retry.next() {
+                        tokio::time::sleep(delay).await;
+                    } else {
+                        panic!("bar.txt was never added to the cache");
+                    }
+                }
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
 
         Ok(())
     }

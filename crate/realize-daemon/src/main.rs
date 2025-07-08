@@ -12,6 +12,7 @@ use realize_lib::utils::logging;
 use signal_hook_tokio::Signals;
 use std::path::{Path, PathBuf};
 use std::{fs, process};
+use tokio::task::LocalSet;
 
 /// Run the realize daemon in the foreground.
 ///
@@ -90,29 +91,36 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("Failed to parse --address {}", cli.address))?;
     log::debug!("Starting server on {}/{:?}...", hostport, hostport.addr());
-    let server = setup.setup_server().await?;
+    let local = LocalSet::new();
+    let server = setup.setup_server(&local).await?;
 
     let addr = server
         .listen(&hostport)
         .await
         .with_context(|| format!("Failed to start server on {hostport}"))?;
 
-    let mut signals = Signals::new([
-        signal_hook::consts::SIGHUP,
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGINT,
-        signal_hook::consts::SIGQUIT,
-    ])?;
+    local
+        .run_until(async move {
+            let mut signals = Signals::new([
+                signal_hook::consts::SIGHUP,
+                signal_hook::consts::SIGTERM,
+                signal_hook::consts::SIGINT,
+                signal_hook::consts::SIGQUIT,
+            ])?;
 
-    METRIC_UP.inc();
-    log::info!("Listening on {addr}");
-    println!("Listening on {addr}");
+            METRIC_UP.inc();
+            log::info!("Listening on {addr}");
+            println!("Listening on {addr}");
 
-    let _ = signals.next().await;
+            let _ = signals.next().await;
 
-    log::info!("Interrupted. Shutting down..");
-    signals.handle().close(); // A 2nd signal kills the process
-    server.shutdown().await?;
+            log::info!("Interrupted. Shutting down..");
+            signals.handle().close(); // A 2nd signal kills the process
+            server.shutdown().await?;
+
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?;
 
     Ok(())
 }
