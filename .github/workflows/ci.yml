@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
     - name: Install build dependencies
-      run: "sudo apt-get install capnproto"
+      run: "sudo apt-get install capnproto libcapnp-dev"
     - uses: actions/checkout@v4
     - name: "Install toolchain"
       uses: actions-rs/toolchain@v1
