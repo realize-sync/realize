@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::{collections::HashMap, sync::Arc};
 
 use config::StorageConfig;
@@ -19,6 +20,7 @@ mod unreal;
 pub use error::StorageError;
 pub use real::notifier::Notification;
 pub use real::notifier::Progress;
+pub use real::reader::Reader;
 pub use real::store::{Options as RealStoreOptions, RealStore, RealStoreError, SyncedFile};
 pub use unreal::cache::UnrealCacheAsync;
 pub use unreal::types::{FileAvailability, FileMetadata, InodeAssignment};
@@ -33,6 +35,9 @@ pub struct Storage {
 struct ArenaStorage {
     /// The arena's index, kept up-to-date by the watcher.
     index: RealIndexAsync,
+
+    /// Arena root on the filesystem.
+    root: PathBuf,
 
     /// Keep a handle on the spawned watcher, which runs only
     /// as long as this instance exists.
@@ -64,6 +69,7 @@ impl Storage {
                     arena.clone(),
                     ArenaStorage {
                         index,
+                        root: root.to_path_buf(),
                         _watcher: watcher,
                     },
                 );
@@ -92,12 +98,9 @@ impl Storage {
         tx: mpsc::Sender<Notification>,
         progress: Option<Progress>,
     ) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
-        let storage = self
-            .arenas
-            .get(arena)
-            .ok_or_else(|| anyhow::anyhow!("No index available for arena {arena}"))?;
+        let arena_storage = self.arena_storage(arena)?;
 
-        real::notifier::subscribe(storage.index.clone(), tx, progress).await
+        real::notifier::subscribe(arena_storage.index.clone(), tx, progress).await
     }
 
     /// Return a handle on the unreal cache.
@@ -105,8 +108,22 @@ impl Storage {
         self.cache.as_ref()
     }
 
+    /// Get a reader on the given file, if possible.
+    pub async fn reader(&self, arena: &Arena, path: &model::Path) -> Result<Reader, StorageError> {
+        let s = self.arena_storage(arena)?;
+
+        Reader::open(&s.index, s.root.as_ref(), path).await
+    }
+
     /// Return a handle on the real store.
     pub fn store(&self) -> RealStore {
         self.store.clone()
+    }
+
+    /// Return the index for the given arena, if one exists.
+    fn arena_storage(&self, arena: &Arena) -> Result<&ArenaStorage, StorageError> {
+        self.arenas
+            .get(arena)
+            .ok_or_else(|| StorageError::UnknownArena(arena.clone()))
     }
 }

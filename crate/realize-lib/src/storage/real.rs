@@ -1,6 +1,7 @@
 pub mod hasher;
 pub mod index;
 pub mod notifier;
+pub mod reader;
 #[allow(dead_code)]
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]
