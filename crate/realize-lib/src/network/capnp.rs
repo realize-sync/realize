@@ -29,7 +29,7 @@ pub enum PeerStatus {
 }
 
 /// Messages used to communicate with [CapnpRpcThread].
-enum ConnectionMessage {
+enum ConnectionMessage<O> {
     /// Send incoming (server) TCP connections to the capnp threads to
     /// be handled there.
     Incoming {
@@ -38,23 +38,39 @@ enum ConnectionMessage {
         shutdown_rx: broadcast::Receiver<()>,
     },
     KeepConnected,
+
+    /// Execute the given operation on the first peer from the list
+    /// that is already connected.
+    ///
+    /// The operation is executed by the handler on the [LocalSet].
+    ///
+    /// Operations usually include a channel to use to send a reply
+    /// back.
+    PeerOperation {
+        peers: Vec<Peer>,
+        operation: O,
+    },
 }
 
 #[allow(async_fn_in_trait)]
-pub trait ConnectionHandler<C>: Send {
+pub trait ConnectionHandler<C, O>: Send {
     fn tag(&self) -> &'static [u8; 4];
     fn server(&self, peer: &Peer) -> capnp::capability::Client;
     async fn check_connection(&self, peer: &Peer, client: &mut C) -> anyhow::Result<()>;
     async fn register(&self, peer: &Peer, client: C) -> anyhow::Result<()>;
+    async fn execute(&self, client: Option<(Peer, C)>, operation: O);
 }
 
-pub struct ConnectionManager {
+pub struct ConnectionManager<O> {
     tag: &'static [u8; 4],
-    tx: mpsc::UnboundedSender<ConnectionMessage>,
+    tx: mpsc::UnboundedSender<ConnectionMessage<O>>,
     broadcast_tx: broadcast::Sender<PeerStatus>,
 }
 
-impl ConnectionManager {
+impl<O> ConnectionManager<O>
+where
+    O: Send + Sync + 'static,
+{
     /// Build a new ConnectionManager instance that runs on the
     /// given [LocalSet].
     ///
@@ -63,7 +79,7 @@ impl ConnectionManager {
     /// [LocalSet::run_until] or awaiting the local set itself.
     pub fn spawn<H, C>(local: &LocalSet, networking: Networking, handler: H) -> anyhow::Result<Self>
     where
-        H: ConnectionHandler<C> + 'static,
+        H: ConnectionHandler<C, O> + 'static,
         C: capnp::capability::FromClientHook + Clone + 'static,
     {
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -84,6 +100,9 @@ impl ConnectionManager {
                             shutdown_rx,
                         } => ctx.accept(peer, stream, shutdown_rx),
                         ConnectionMessage::KeepConnected => ctx.keep_connected(),
+                        ConnectionMessage::PeerOperation { peers, operation } => {
+                            ctx.with_any_peer_client(peers, operation);
+                        }
                     }
                 }
                 log::debug!("=== manager end");
@@ -102,13 +121,31 @@ impl ConnectionManager {
         self.broadcast_tx.subscribe()
     }
 
+    /// Execute an operation on a peer client.
+    pub fn with_peer_client(&self, peer: Peer, operation: O) -> anyhow::Result<()> {
+        self.with_any_peer_client(vec![peer], operation)
+    }
+
+    /// Execute an operation on a connected peer client among the
+    /// given set.
+    pub fn with_any_peer_client<T>(&self, peers: T, operation: O) -> anyhow::Result<()>
+    where
+        T: IntoIterator<Item = Peer>,
+    {
+        self.tx.send(ConnectionMessage::PeerOperation {
+            peers: peers.into_iter().collect::<Vec<_>>(),
+            operation,
+        })?;
+
+        Ok(())
+    }
+
     /// Keep a client connection up to all peers for which an address is known.
     pub fn keep_connected(&self) -> anyhow::Result<()> {
         self.tx.send(ConnectionMessage::KeepConnected)?;
 
         Ok(())
     }
-
     /// Register peer connections to the given server.
     ///
     /// With this call, the server answers to PEER calls as Cap'n Proto
@@ -126,15 +163,16 @@ impl ConnectionManager {
     }
 }
 
-struct AppContext<H, C>
+struct AppContext<H, C, O>
 where
-    H: ConnectionHandler<C>,
+    H: ConnectionHandler<C, O>,
 {
     networking: Networking,
     handler: H,
     broadcast_tx: broadcast::Sender<PeerStatus>,
     connections: RefCell<HashMap<Peer, TrackedPeerConnections<C>>>,
     _phantom1: PhantomData<C>,
+    _phantom2: PhantomData<O>,
 }
 
 struct TrackedPeerConnections<C> {
@@ -142,10 +180,11 @@ struct TrackedPeerConnections<C> {
     tracker: Option<JoinHandle<()>>,
 }
 
-impl<H, C> AppContext<H, C>
+impl<H, C, O> AppContext<H, C, O>
 where
-    H: ConnectionHandler<C> + 'static,
+    H: ConnectionHandler<C, O> + 'static,
     C: capnp::capability::FromClientHook + Clone + 'static,
+    O: 'static,
 {
     fn new(
         networking: Networking,
@@ -158,6 +197,7 @@ where
             broadcast_tx,
             connections: RefCell::new(HashMap::new()),
             _phantom1: PhantomData,
+            _phantom2: PhantomData,
         })
     }
 
@@ -308,6 +348,30 @@ where
             })
             .tracked_client = client;
     }
+
+    /// Find a connected client from the given peer list and send it to the handler
+    /// together with the operation for execution.
+    fn with_any_peer_client(self: &Rc<Self>, peers: Vec<Peer>, operation: O) {
+        let client = self.first_connected_peer(peers);
+        let this = Rc::clone(self);
+        tokio::task::spawn_local(async move {
+            this.handler.execute(client, operation).await;
+        });
+    }
+
+    fn first_connected_peer(&self, peers: Vec<Peer>) -> Option<(Peer, C)> {
+        let tracked = self.connections.borrow();
+
+        for peer in peers {
+            if let Some(conn) = tracked.get(&peer) {
+                if let Some(client) = &conn.tracked_client {
+                    return Some((peer, client.clone()));
+                }
+            }
+        }
+
+        None
+    }
 }
 
 #[cfg(test)]
@@ -327,6 +391,7 @@ mod tests {
     use futures::io::BufReader;
     use futures::io::BufWriter;
     use std::sync::Arc;
+    use tokio::sync::oneshot;
     use tokio::task::LocalSet;
     use tokio_util::compat::TokioAsyncReadCompatExt;
 
@@ -335,6 +400,13 @@ mod tests {
     }
     fn b() -> Peer {
         TestingPeers::b()
+    }
+    fn c() -> Peer {
+        TestingPeers::c()
+    }
+
+    enum HelloOperation {
+        Hello(String, oneshot::Sender<anyhow::Result<String>>),
     }
 
     #[derive(Clone)]
@@ -346,7 +418,7 @@ mod tests {
             Self { peer: peer.clone() }
         }
     }
-    impl ConnectionHandler<hello::Client> for HelloConnectionHandler {
+    impl ConnectionHandler<hello::Client, HelloOperation> for HelloConnectionHandler {
         fn tag(&self) -> &'static [u8; 4] {
             b"HELO"
         }
@@ -386,6 +458,33 @@ mod tests {
 
             Ok(())
         }
+
+        async fn execute(&self, client: Option<(Peer, hello::Client)>, op: HelloOperation) {
+            match op {
+                HelloOperation::Hello(name, tx) => {
+                    let _ = tx.send(execute_hello(&name, client).await);
+                }
+            }
+        }
+    }
+
+    async fn execute_hello(
+        name: &str,
+        client: Option<(Peer, hello::Client)>,
+    ) -> anyhow::Result<String> {
+        let (peer, client) = match client {
+            Some(c) => c,
+            None => {
+                anyhow::bail!("No available client");
+            }
+        };
+        log::debug!("Executing hello({name}) on {peer}...");
+        let mut request = client.hello_request();
+        request.get().set_name(name);
+
+        let reply = request.send().promise.await?;
+
+        Ok(reply.get()?.get_result()?.to_string()?)
     }
 
     struct HelloServer {
@@ -409,6 +508,17 @@ mod tests {
         }
     }
 
+    async fn say_hello_to_peers(
+        manager: &ConnectionManager<HelloOperation>,
+        peers: Vec<Peer>,
+        name: &str,
+    ) -> anyhow::Result<String> {
+        let (tx, rx) = oneshot::channel();
+        manager.with_any_peer_client(peers, HelloOperation::Hello(name.to_string(), tx))?;
+
+        rx.await?
+    }
+
     struct Fixture {
         peers: TestingPeers,
     }
@@ -420,7 +530,11 @@ mod tests {
             Ok(Self { peers })
         }
 
-        fn manager(&self, local: &LocalSet, peer: &Peer) -> anyhow::Result<ConnectionManager> {
+        fn manager(
+            &self,
+            local: &LocalSet,
+            peer: &Peer,
+        ) -> anyhow::Result<ConnectionManager<HelloOperation>> {
             ConnectionManager::spawn(
                 local,
                 self.peers.networking(peer)?,
@@ -431,7 +545,7 @@ mod tests {
         async fn launch_server(
             &mut self,
             peer: &Peer,
-            manager: &ConnectionManager,
+            manager: &ConnectionManager<HelloOperation>,
         ) -> anyhow::Result<Arc<Server>> {
             let mut server = Server::new(self.peers.networking(peer)?);
             manager.register(&mut server);
@@ -558,6 +672,61 @@ mod tests {
 
                 let _server_b = fixture.launch_server(b, &manager_b).await?;
                 assert_eq!(PeerStatus::Connected(b.clone()), status_a.recv().await?);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hello_operation() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        let local = LocalSet::new();
+
+        let a = &a();
+        fixture.peers.pick_port(a)?;
+
+        let b = &b();
+        fixture.peers.pick_port(b)?;
+
+        let c = &c();
+        fixture.peers.pick_port(c)?;
+
+        let manager_a = fixture.manager(&local, a)?;
+        let _server_a = fixture.launch_server(a, &manager_a).await?;
+
+        let manager_b = fixture.manager(&local, b)?;
+        let _server_b = fixture.launch_server(b, &manager_b).await?;
+
+        local
+            .run_until(async move {
+                let mut status_a = manager_a.peer_status();
+                manager_a.keep_connected()?;
+                assert_eq!(PeerStatus::Connected(b.clone()), status_a.recv().await?);
+
+                let mut status_b = manager_b.peer_status();
+                manager_b.keep_connected()?;
+                assert_eq!(PeerStatus::Connected(a.clone()), status_b.recv().await?);
+
+                assert_eq!(
+                    "Hello 1 -- From b to a",
+                    say_hello_to_peers(&manager_a, vec![b.clone()], "1").await?
+                );
+
+                // C is not connected, so B is used.
+                assert_eq!(
+                    "Hello 2 -- From b to a",
+                    say_hello_to_peers(&manager_a, vec![Peer::from("c"), b.clone()], "2").await?
+                );
+
+                // C is not connected, so this fails
+                assert!(
+                    say_hello_to_peers(&manager_a, vec![Peer::from("c")], "3")
+                        .await
+                        .is_err()
+                );
 
                 Ok::<(), anyhow::Error>(())
             })

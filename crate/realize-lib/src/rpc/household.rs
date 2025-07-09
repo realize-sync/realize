@@ -28,7 +28,7 @@ const TAG: &[u8; 4] = b"PEER";
 /// To listen to incoming connections, call [Household::register].
 #[derive(Clone)]
 pub struct Household {
-    manager: Arc<ConnectionManager>,
+    manager: Arc<ConnectionManager<()>>,
 }
 
 impl Household {
@@ -75,7 +75,7 @@ impl PeerConnectionHandler {
     }
 }
 
-impl ConnectionHandler<connected_peer::Client> for PeerConnectionHandler {
+impl ConnectionHandler<connected_peer::Client, ()> for PeerConnectionHandler {
     fn tag(&self) -> &'static [u8; 4] {
         TAG
     }
@@ -101,6 +101,8 @@ impl ConnectionHandler<connected_peer::Client> for PeerConnectionHandler {
 
         Ok(())
     }
+
+    async fn execute(&self, _: Option<(Peer, connected_peer::Client)>, _: ()) {}
 }
 
 /// Subscribe to notifications from the given client and use it to
