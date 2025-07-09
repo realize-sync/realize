@@ -1,19 +1,27 @@
 use super::peer_capnp::connected_peer;
 use super::result_capnp;
-use super::store_capnp::notification;
+use super::store_capnp::read_callback::{ChunkParams, FinishParams, FinishResults};
 use super::store_capnp::store::{
-    self, ArenasParams, ArenasResults, SubscribeParams, SubscribeResults,
+    self, ArenasParams, ArenasResults, ReadParams, ReadResults, SubscribeParams, SubscribeResults,
 };
 use super::store_capnp::subscriber::{self, NotifyParams, NotifyResults};
-use crate::model::{Arena, Hash, Path, Peer, UnixTime};
+use super::store_capnp::{notification, read_callback, read_error};
+use crate::model::{self, Arena, Hash, Path, Peer, UnixTime};
 use crate::network::capnp::{ConnectionHandler, ConnectionManager};
 use crate::network::{Networking, Server};
 use crate::storage::{Notification, Progress, Storage, StorageError, UnrealCacheAsync};
+use crate::utils::holder::ByteConversionError;
 use capnp::capability::Promise;
+use capnp_rpc::pry;
 use std::collections::{HashMap, HashSet};
+use std::io::{self, SeekFrom};
+use std::pin;
 use std::sync::Arc;
+use tokio::io::AsyncSeekExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
+use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 /// Identifies Cap'n Proto ConnectedPeer connections.
@@ -28,7 +36,7 @@ const TAG: &[u8; 4] = b"PEER";
 /// To listen to incoming connections, call [Household::register].
 #[derive(Clone)]
 pub struct Household {
-    manager: Arc<ConnectionManager<()>>,
+    manager: Arc<ConnectionManager<HouseholdOperation>>,
 }
 
 impl Household {
@@ -63,8 +71,46 @@ impl Household {
     pub fn register(&self, server: &mut Server) {
         self.manager.register(server)
     }
+
+    /// Read a file from a connected peer.
+    pub fn read<T>(
+        &self,
+        peers: T,
+        arena: Arena,
+        path: Path,
+        offset: u64,
+        limit: Option<u64>,
+    ) -> io::Result<ReceiverStream<Result<Vec<u8>, io::Error>>>
+    where
+        T: IntoIterator<Item = Peer>,
+    {
+        let (tx, rx) = mpsc::channel(10);
+        self.manager
+            .with_any_peer_client(
+                peers,
+                HouseholdOperation::Read {
+                    arena,
+                    path,
+                    offset,
+                    limit,
+                    tx,
+                },
+            )
+            .map_err(|err| io::Error::other(err))?;
+
+        Ok(ReceiverStream::new(rx))
+    }
 }
 
+enum HouseholdOperation {
+    Read {
+        arena: Arena,
+        path: model::Path,
+        offset: u64,
+        limit: Option<u64>,
+        tx: mpsc::Sender<Result<Vec<u8>, io::Error>>,
+    },
+}
 struct PeerConnectionHandler {
     storage: Arc<Storage>,
 }
@@ -75,7 +121,7 @@ impl PeerConnectionHandler {
     }
 }
 
-impl ConnectionHandler<connected_peer::Client, ()> for PeerConnectionHandler {
+impl ConnectionHandler<connected_peer::Client, HouseholdOperation> for PeerConnectionHandler {
     fn tag(&self) -> &'static [u8; 4] {
         TAG
     }
@@ -102,7 +148,125 @@ impl ConnectionHandler<connected_peer::Client, ()> for PeerConnectionHandler {
         Ok(())
     }
 
-    async fn execute(&self, _: Option<(Peer, connected_peer::Client)>, _: ()) {}
+    async fn execute(
+        &self,
+        client: Option<(Peer, connected_peer::Client)>,
+        operation: HouseholdOperation,
+    ) {
+        match operation {
+            HouseholdOperation::Read {
+                tx,
+                arena,
+                path,
+                offset,
+                limit,
+            } => {
+                let tx_clone = tx.clone();
+                if let Err(err) = execute_read(client, arena, path, offset, limit, tx).await {
+                    let _ = tx_clone.send(Err(err)).await;
+                }
+            }
+        }
+    }
+}
+
+async fn execute_read(
+    client: Option<(Peer, connected_peer::Client)>,
+    arena: Arena,
+    path: model::Path,
+    offset: u64,
+    limit: Option<u64>,
+    tx: mpsc::Sender<io::Result<Vec<u8>>>,
+) -> io::Result<()> {
+    let (peer, client) = match client {
+        Some(c) => c,
+        None => {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "No available peer"));
+        }
+    };
+    log::debug!("Reading [{arena}]/{path} from {peer}");
+
+    let store = client.store_request().send().pipeline.get_store();
+    let mut request = store.read_request();
+    let mut builder = request.get();
+    builder.set_cb(capnp_rpc::new_client(ReadCallbackServer { tx: Some(tx) }));
+    let mut req = builder.init_req();
+    req.set_arena(arena.as_str());
+    req.set_path(path.as_str());
+    req.set_start_offset(offset);
+    if let Some(limit) = limit {
+        req.set_limit(limit);
+    }
+
+    request
+        .send()
+        .promise
+        .await
+        .map_err(|err| io::Error::other(err))?;
+
+    Ok(())
+}
+
+struct ReadCallbackServer {
+    tx: Option<mpsc::Sender<io::Result<Vec<u8>>>>,
+}
+
+impl read_callback::Server for ReadCallbackServer {
+    fn chunk(&mut self, chunk: ChunkParams) -> Promise<(), capnp::Error> {
+        let tx = pry!(self.tx.as_ref().ok_or_else(already_finished)).clone();
+        Promise::from_future(async move {
+            let data = chunk.get()?.get_data()?.to_vec();
+            tx.send(Ok(data)).await.map_err(channel_closed)?;
+
+            Ok(())
+        })
+    }
+
+    fn finish(&mut self, params: FinishParams, _: FinishResults) -> Promise<(), capnp::Error> {
+        let tx = pry!(self.tx.take().ok_or_else(already_finished));
+        Promise::from_future(async move {
+            let result = params.get()?.get_result()?;
+            match result.which()? {
+                result_capnp::result::Which::Ok(_) => {}
+                result_capnp::result::Which::Err(err) => {
+                    tx.send(Err(errno_to_io_error(err?.get_errno()?)))
+                        .await
+                        .map_err(channel_closed)?;
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+fn errno_to_io_error(errno: read_error::Errno) -> io::Error {
+    use io::ErrorKind::*;
+
+    io::Error::new(
+        match errno {
+            read_error::Errno::Other => Other,
+            read_error::Errno::GenericIo => Other,
+            read_error::Errno::Unavailable => Other,
+            read_error::Errno::PermissionDenied => PermissionDenied,
+            read_error::Errno::NotADirectory => NotADirectory,
+            read_error::Errno::IsADirectory => IsADirectory,
+            read_error::Errno::InvalidInput => InvalidInput,
+            read_error::Errno::Closed => Other,
+            read_error::Errno::Aborted => ConnectionAborted,
+            read_error::Errno::NotFound => NotFound,
+            read_error::Errno::ResourceBusy => ResourceBusy,
+            read_error::Errno::InvalidPath => InvalidFilename,
+        },
+        format!("{errno:?}"),
+    )
+}
+
+fn already_finished() -> capnp::Error {
+    capnp::Error::failed("already finished".to_string())
+}
+
+fn channel_closed<T>(_: mpsc::error::SendError<T>) -> capnp::Error {
+    capnp::Error::failed("channel closed".to_string())
 }
 
 /// Subscribe to notifications from the given client and use it to
@@ -274,6 +438,105 @@ impl ConnectedPeerServer {
 
         Ok(())
     }
+
+    async fn do_read(&self, params: ReadParams) -> Result<(), capnp::Error> {
+        let params = params.get()?;
+        let req = params.get_req()?;
+
+        let arena = parse_arena(req.get_arena()?)?;
+        let path = parse_path(req.get_path()?)?;
+        let offset = req.get_start_offset();
+        let limit = req.get_limit();
+        let cb = params.get_cb()?;
+
+        let read_result = self.read_all(&arena, &path, offset, limit, &cb).await;
+        let mut request = cb.finish_request();
+        let result = request.get().init_result();
+        match read_result {
+            Err(err) => {
+                result.init_err().set_errno(read_errno(err));
+            }
+            Ok(complete) => {
+                if complete {
+                    result.init_ok();
+                } else {
+                    result.init_err().set_errno(read_error::Errno::Aborted);
+                }
+            }
+        }
+        request.send().promise.await?;
+
+        Ok(())
+    }
+
+    /// Read data from the given arena and path and send it to the
+    /// given callback.
+    ///
+    /// Returns true if everything was read, false if reading was
+    /// interrupted by a callback failing, an error if there was
+    /// some error while reading.
+    async fn read_all(
+        &self,
+        arena: &Arena,
+        path: &Path,
+        offset: u64,
+        limit: u64,
+        cb: &read_callback::Client,
+    ) -> Result<bool, StorageError> {
+        let mut reader = self.storage.reader(arena, path).await?;
+        if offset > 0 {
+            reader.seek(SeekFrom::Start(offset)).await?;
+        }
+        if limit > 0 {
+            send_chunks(reader.take(limit), cb).await
+        } else {
+            send_chunks(reader, cb).await
+        }
+    }
+}
+
+async fn send_chunks(
+    reader: impl AsyncRead,
+    cb: &read_callback::Client,
+) -> Result<bool, StorageError> {
+    let mut reader = pin::pin!(reader);
+    let mut buf = vec![0; 8 * 1024];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(true);
+        }
+        let mut request = cb.chunk_request();
+        request.get().set_data(&buf.as_slice()[0..n]);
+        if request.send().await.is_err() {
+            return Ok(false);
+        }
+    }
+}
+
+fn read_errno(err: StorageError) -> read_error::Errno {
+    use read_error::Errno::*;
+    match err {
+        StorageError::Database(_) => Unavailable,
+        StorageError::Io(ioerr) => match ioerr.kind() {
+            io::ErrorKind::NotFound => NotFound,
+            io::ErrorKind::PermissionDenied => PermissionDenied,
+            io::ErrorKind::ConnectionAborted => Aborted,
+            io::ErrorKind::NotADirectory => NotADirectory,
+            io::ErrorKind::IsADirectory => IsADirectory,
+            io::ErrorKind::InvalidInput => InvalidInput,
+            io::ErrorKind::ResourceBusy => ResourceBusy,
+            _ => GenericIo,
+        },
+        StorageError::ByteConversion(ByteConversionError::Path(_)) => InvalidPath,
+        StorageError::ByteConversion(_) => Unavailable,
+        StorageError::Unavailable => Unavailable,
+        StorageError::NotFound => NotFound,
+        StorageError::NotADirectory => NotADirectory,
+        StorageError::IsADirectory => IsADirectory,
+        StorageError::JoinError(_) => Other,
+        StorageError::UnknownArena(_) => NotFound,
+    }
 }
 
 impl connected_peer::Server for ConnectedPeerServer {
@@ -310,6 +573,11 @@ impl store::Server for ConnectedPeerServer {
     ) -> Promise<(), capnp::Error> {
         let this = self.clone();
         Promise::from_future(async move { this.do_subscribe(params, results).await })
+    }
+
+    fn read(&mut self, params: ReadParams, _t: ReadResults) -> Promise<(), capnp::Error> {
+        let this = self.clone();
+        Promise::from_future(async move { this.do_read(params).await })
     }
 }
 
@@ -635,6 +903,7 @@ mod tests {
     use crate::storage;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use futures::TryStreamExt as _;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
@@ -712,6 +981,29 @@ mod tests {
 
             Ok(server)
         }
+
+        /// Wait for the given file to appear in the given peer's cache, in the test arena.
+        async fn wait_for_file(&self, peer: &Peer, filename: &str) -> anyhow::Result<()> {
+            let cache = &self
+                .peer_storage
+                .get(peer)
+                .ok_or(anyhow::anyhow!("Unknown peer {peer}"))?
+                .cache()
+                .ok_or(anyhow::anyhow!("No cache for {peer}"))?;
+
+            let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
+            let arena = test_arena();
+            let arena_inode = cache.arena_root(&arena)?;
+            while cache.lookup(arena_inode, filename).await.is_err() {
+                if let Some(delay) = retry.next() {
+                    tokio::time::sleep(delay).await;
+                } else {
+                    panic!("[arena]/{filename} was never added to the cache");
+                }
+            }
+
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -739,16 +1031,69 @@ mod tests {
                 let b_dir = fixture.arena_root(&b);
                 fs::write(&b_dir.join("bar.txt"), b"test").await?;
 
-                let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
-                let a_cache = &fixture.peer_storage.get(a).unwrap().cache().unwrap();
-                let arena_inode = a_cache.arena_root(&test_arena())?;
-                while a_cache.lookup(arena_inode, "bar.txt").await.is_err() {
-                    if let Some(delay) = retry.next() {
-                        tokio::time::sleep(delay).await;
-                    } else {
-                        panic!("bar.txt was never added to the cache");
-                    }
-                }
+                fixture.wait_for_file(a, "bar.txt").await?;
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_from_peer() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        let local = LocalSet::new();
+
+        let a = &a();
+        fixture.peers.pick_port(a)?;
+
+        let b = &b();
+        fixture.peers.pick_port(b)?;
+
+        let household_a = fixture.household(&local, a)?;
+        let _server_a = fixture.run_server(a, &household_a).await?;
+
+        let household_b = fixture.household(&local, b)?;
+        let _server_b = fixture.run_server(b, &household_b).await?;
+        household_a.keep_connected()?;
+
+        local
+            .run_until(async move {
+                let b_dir = fixture.arena_root(&b);
+                fs::write(&b_dir.join("bar.txt"), b"test").await?;
+
+                fixture.wait_for_file(a, "bar.txt").await?;
+
+                let stream = household_a.read(
+                    vec![b.clone()],
+                    test_arena(),
+                    model::Path::parse("bar.txt")?,
+                    0,
+                    None,
+                )?;
+                let collected = stream.try_collect::<Vec<_>>().await?;
+                assert_eq!(vec![b"test".to_vec()], collected);
+
+                let stream = household_a.read(
+                    vec![b.clone()],
+                    test_arena(),
+                    model::Path::parse("bar.txt")?,
+                    2,
+                    None,
+                )?;
+                let collected = stream.try_collect::<Vec<_>>().await?;
+                assert_eq!(vec![b"st".to_vec()], collected);
+
+                let stream = household_a.read(
+                    vec![b.clone()],
+                    test_arena(),
+                    model::Path::parse("bar.txt")?,
+                    0,
+                    Some(2),
+                )?;
+                let collected = stream.try_collect::<Vec<_>>().await?;
+                assert_eq!(vec![b"te".to_vec()], collected);
 
                 Ok::<(), anyhow::Error>(())
             })
