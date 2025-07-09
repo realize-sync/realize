@@ -4,7 +4,6 @@ using Rust = import "/capnpc/rust.capnp";
 $Rust.parentModule("rpc");
 
 using import "result.capnp".Result;
-using Read = import "read.capnp";
 
 interface Store {
   # Set of Arenas kept in the store.
@@ -17,18 +16,61 @@ interface Store {
   subscribe @1 (req: SubscribeRequest) -> (result: Result(SubscribeResponse, SubscribeError));
 
   # Read data from a file
-  reader @2 (req: ReaderRequest) -> (result: Result(ReaderResponse, Read.ReadError));
+  #
+  # In case of errors, ReadCallback.finished()
+  # might be called immediately.
+  #
+  # Currently read is mapped as-is from the filesystem, even
+  # if the data changes while it's being read.
+  # TODO: add option to check hash and file stability.
+  read @2 (req: ReadRequest, cb: ReadCallback) -> ();
 }
 
-struct ReaderRequest {
+struct ReadRequest {
   arena @0: Text;
   path @1: Text;
+
+  # Offset from start to start reading from.
+  startOffset @2: UInt64 = 0;
+
+  # Read at most that many bytes, less if we reach EOF.
+  #
+  # 0 means read to EOF.
+  limit @3: UInt64 = 0;
+
 }
 
-struct ReaderResponse {
-  reader @0: Read.Reader;
-  size @1: UInt64;
-  hash @2: Data;
+interface ReadCallback {
+  # Send one chunk of data. The server chooses the size of the chunks.
+  chunk @0 (data :Data) -> stream;
+
+  # Report that the stream is finished,.
+  #
+  # If an error is detected, the stream ends with err set without having
+  # read everything.
+  finish @1 (result: Result(ReadFinished, ReadError)) -> ();
+}
+
+struct ReadFinished {}
+
+# Read errors, loosely based on I/O errors for ease of conversion.
+struct ReadError {
+  errno @0: Errno;
+
+  enum Errno {
+    other @0;
+    genericIo @1;
+    unavailable @2;
+    permissionDenied @3;
+    notADirectory @4;
+    isADirectory @5;
+    invalidInput @6;
+    closed @7;
+    aborted @8;
+    notFound @9;
+    resourceBusy @10;
+    invalidPath @11;
+  }
 }
 
 struct SubscribeRequest {

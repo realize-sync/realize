@@ -13,14 +13,6 @@ mod peer_capnp {
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]
 #[allow(clippy::extra_unused_type_parameters)]
-mod read_capnp {
-    include!(concat!(env!("OUT_DIR"), "/rpc/read_capnp.rs"));
-}
-
-#[allow(dead_code)]
-#[allow(unknown_lints)]
-#[allow(clippy::uninlined_format_args)]
-#[allow(clippy::extra_unused_type_parameters)]
 mod result_capnp {
     include!(concat!(env!("OUT_DIR"), "/rpc/result_capnp.rs"));
 }

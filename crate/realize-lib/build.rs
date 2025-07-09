@@ -21,7 +21,6 @@ fn capnpc() -> anyhow::Result<()> {
         .src_prefix("capnp")
         .import_path("capnp")
         .file("capnp/rpc/peer.capnp")
-        .file("capnp/rpc/read.capnp")
         .file("capnp/rpc/result.capnp")
         .file("capnp/rpc/store.capnp")
         .file("capnp/network/testing/hello.capnp")
