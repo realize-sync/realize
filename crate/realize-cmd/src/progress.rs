@@ -1,6 +1,6 @@
 use console::style;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use realize_core::logic::consensus::movedirs::ProgressEvent;
+use realize_core::consensus::movedirs::ProgressEvent;
 use realize_types;
 use realize_types::Arena;
 use realize_core::rpc::realstore::client::ClientConnectionState;

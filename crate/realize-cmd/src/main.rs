@@ -7,7 +7,7 @@ use futures_util::stream::StreamExt as _;
 use indicatif::HumanBytes;
 use progress::CliProgress;
 use prometheus::{IntCounter, register_int_counter};
-use realize_core::logic::consensus::movedirs::MoveFileError;
+use realize_core::consensus::movedirs::MoveFileError;
 use realize_types::{Arena, Peer};
 use realize_network::Networking;
 use realize_network::config::PeerConfig;
@@ -248,7 +248,7 @@ async fn run_with_progress(
             let mut total_error = 0;
             let mut total_interrupted = 0;
             let mut interrupted = false;
-            let result = realize_core::logic::consensus::movedirs::move_dirs(
+            let result = realize_core::consensus::movedirs::move_dirs(
                 ctx,
                 &src_client,
                 &dst_client,

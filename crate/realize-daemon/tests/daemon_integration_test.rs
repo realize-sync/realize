@@ -4,7 +4,7 @@ use nfs3_client::Nfs3ConnectionBuilder;
 use nfs3_client::tokio::TokioConnector;
 use nfs3_types::nfs3::{Nfs3Result, READDIR3args};
 use predicates::prelude::*;
-use realize_core::logic::config::Config;
+use realize_core::config::Config;
 use realize_types;
 use realize_types::{Arena, Peer};
 use realize_network::Networking;
