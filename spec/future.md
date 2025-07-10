@@ -3,6 +3,11 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
+## Design and implement a blob store {#blobstore}
+
+BlobStore is the part of the Unreal Cache that stores the actual file
+data. It works as a cache, with a cache eviction algorithm TBD.
+
 ## Remove path from FileContent {#cachepath}
 
 `FileContent`, defined in
