@@ -6,7 +6,7 @@ use futures_util::stream::StreamExt as _;
 use prometheus::{IntCounter, register_int_counter};
 use realize_lib::logic::config::Config;
 use realize_lib::logic::setup::SetupHelper;
-use realize_lib::network::hostport::HostPort;
+use realize_network::hostport::HostPort;
 use realize_lib::rpc::realstore::metrics;
 use realize_lib::utils::logging;
 use signal_hook_tokio::Signals;

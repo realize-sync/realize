@@ -350,8 +350,8 @@ impl Server {
 mod tests {
     use super::*;
     use realize_types::Peer;
-    use crate::network;
-    use crate::network::testing;
+    use realize_network;
+    use realize_network::testing;
     use tarpc::context;
     use tarpc::server::Channel as _;
 

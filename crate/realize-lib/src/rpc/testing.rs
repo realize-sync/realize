@@ -1,9 +1,9 @@
 use super::Household;
 use realize_types::{Arena, Peer};
-use crate::network::Server;
-use crate::network::capnp::PeerStatus;
-use crate::network::hostport::HostPort;
-use crate::network::testing::TestingPeers;
+use realize_network::Server;
+use realize_network::capnp::PeerStatus;
+use realize_network::hostport::HostPort;
+use realize_network::testing::TestingPeers;
 use crate::storage::Storage;
 use crate::storage::{self, UnrealCacheAsync};
 use assert_fs::TempDir;

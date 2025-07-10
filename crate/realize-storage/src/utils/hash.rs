@@ -9,13 +9,13 @@
 //!
 //! Hash a buffer in one shot:
 //! ```rust
-//! use realize_lib::utils::hash::digest;
+//! use realize_storage::utils::hash::digest;
 //! let hash = digest(b"hello world");
 //! ```
 //!
 //! Incrementally hash data:
 //! ```rust
-//! use realize_lib::utils::hash::running;
+//! use realize_storage::utils::hash::running;
 //! let mut hasher = running();
 //! hasher.update(b"foo");
 //! hasher.update(b"bar");
@@ -39,11 +39,11 @@ pub fn digest(data: impl AsRef<[u8]>) -> Hash {
 /// # Examples
 ///
 /// ```
-/// let mut hasher = realize_lib::utils::hash::running();
+/// let mut hasher = realize_storage::utils::hash::running();
 /// hasher.update(b"hello");
 /// hasher.update(b", world");
 /// assert_eq!(hasher.finalize(),
-///     realize_lib::utils::hash::digest("hello, world"));
+///     realize_storage::utils::hash::digest("hello, world"));
 /// ```
 pub fn running() -> RunningHash {
     RunningHash {

@@ -1,6 +1,6 @@
 use realize_types::Peer;
-use crate::network::Networking;
-use crate::network::reconnect::{Connect, Reconnect};
+use realize_network::Networking;
+use realize_network::reconnect::{Connect, Reconnect};
 use crate::rpc::realstore;
 use crate::rpc::realstore::metrics::MetricsRealizeClient;
 use crate::rpc::realstore::{
@@ -161,10 +161,10 @@ impl Stub for RealizeStub {
 mod tests {
     use super::*;
     use realize_types::{Arena, Peer};
-    use crate::network::hostport::HostPort;
+    use realize_network::hostport::HostPort;
     use crate::rpc::realstore::Config;
-    use crate::network::security::{PeerVerifier, RawPublicKeyResolver};
-    use crate::network::{Server, testing};
+    use realize_network::security::{PeerVerifier, RawPublicKeyResolver};
+    use realize_network::{Server, testing};
     use crate::storage::{RealStore, RealStoreOptions};
     use crate::utils::async_utils::AbortOnDrop;
     use assert_fs::TempDir;

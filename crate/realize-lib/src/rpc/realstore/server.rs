@@ -6,7 +6,7 @@
 
 use realize_types;
 use realize_types::{Arena, ByteRange, Hash};
-use crate::network::Server;
+use realize_network::Server;
 use crate::rpc::realstore::metrics::{MetricsRealizeClient, MetricsRealizeServer};
 use crate::rpc::realstore::{
     Config, RealStoreService, RealStoreServiceClient, RealStoreServiceRequest,

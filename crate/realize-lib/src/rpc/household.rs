@@ -7,8 +7,8 @@ use super::store_capnp::store::{
 use super::store_capnp::subscriber::{self, NotifyParams, NotifyResults};
 use super::store_capnp::{notification, read_callback, read_error};
 use realize_types::{self, Arena, Hash, Path, Peer, UnixTime};
-use crate::network::capnp::{ConnectionHandler, ConnectionManager, PeerStatus};
-use crate::network::{Networking, Server};
+use realize_network::capnp::{ConnectionHandler, ConnectionManager, PeerStatus};
+use realize_network::{Networking, Server};
 use crate::storage::{Notification, Progress, Storage, StorageError, UnrealCacheAsync};
 use capnp::capability::Promise;
 use capnp_rpc::pry;

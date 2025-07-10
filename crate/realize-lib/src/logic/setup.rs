@@ -4,7 +4,7 @@ use super::config::Config;
 use crate::fs::downloader::Downloader;
 use crate::fs::nfs;
 use realize_types::Arena;
-use crate::network::{Networking, Server};
+use realize_network::{Networking, Server};
 use crate::rpc::{Household, realstore};
 use crate::storage::Storage;
 use crate::storage::config::ArenaConfig;

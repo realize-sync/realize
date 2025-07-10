@@ -1,4 +1,4 @@
-use crate::network::config::NetworkConfig;
+use realize_network::config::NetworkConfig;
 use crate::storage::config::StorageConfig;
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
