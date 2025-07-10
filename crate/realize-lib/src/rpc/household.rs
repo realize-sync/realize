@@ -7,7 +7,7 @@ use super::store_capnp::store::{
 use super::store_capnp::subscriber::{self, NotifyParams, NotifyResults};
 use super::store_capnp::{notification, read_callback, read_error};
 use crate::model::{self, Arena, Hash, Path, Peer, UnixTime};
-use crate::network::capnp::{ConnectionHandler, ConnectionManager};
+use crate::network::capnp::{ConnectionHandler, ConnectionManager, PeerStatus};
 use crate::network::{Networking, Server};
 use crate::storage::{Notification, Progress, Storage, StorageError, UnrealCacheAsync};
 use crate::utils::holder::ByteConversionError;
@@ -19,7 +19,7 @@ use std::pin;
 use std::sync::Arc;
 use tokio::io::AsyncSeekExt;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::LocalSet;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
@@ -62,6 +62,11 @@ impl Household {
     /// Keep a client connection up to all peers for which an address is known.
     pub fn keep_connected(&self) -> anyhow::Result<()> {
         self.manager.keep_connected()
+    }
+
+    /// Report peer status changes through the given receiver.
+    pub fn peer_status(&self) -> broadcast::Receiver<PeerStatus> {
+        self.manager.peer_status()
     }
 
     /// Register peer connections to the given server.
@@ -897,12 +902,7 @@ fn parse_hash(hash: &[u8]) -> Result<Hash, capnp::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Arena;
-    use crate::network::hostport::HostPort;
-    use crate::network::testing::TestingPeers;
-    use crate::storage;
-    use assert_fs::TempDir;
-    use assert_fs::prelude::*;
+    use crate::rpc::testing::HouseholdFixture;
     use futures::TryStreamExt as _;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -910,89 +910,54 @@ mod tests {
     use tokio::fs;
     use tokio_retry::strategy::FixedInterval;
 
-    fn a() -> Peer {
-        TestingPeers::a()
-    }
-    fn b() -> Peer {
-        TestingPeers::b()
-    }
-    fn c() -> Peer {
-        TestingPeers::c()
-    }
-
-    fn test_arena() -> Arena {
-        Arena::from("myarena")
-    }
-
     struct Fixture {
-        peers: TestingPeers,
-        peer_storage: HashMap<Peer, Arc<Storage>>,
-        tempdir: TempDir,
+        households: HouseholdFixture,
     }
     impl Fixture {
         async fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
 
-            let tempdir = TempDir::new()?;
-            let mut peer_storage = HashMap::new();
-            for peer in [a(), b(), c()] {
-                let s =
-                    storage::testing::storage(tempdir.child(peer.as_str()).path(), [test_arena()])
-                        .await?;
-                peer_storage.insert(peer, s);
-            }
-            Ok(Self {
-                peers: TestingPeers::new()?,
-                peer_storage,
-                tempdir,
-            })
+            let households = HouseholdFixture::setup().await?;
+            Ok(Self { households })
         }
 
         fn arena_root(&self, peer: &Peer) -> PathBuf {
-            storage::testing::arena_root(self.tempdir.child(peer.as_str()).path(), &test_arena())
+            self.households.arena_root(peer)
         }
 
         fn household(&self, local: &LocalSet, peer: &Peer) -> anyhow::Result<Household> {
-            let storage = self
-                .peer_storage
-                .get(peer)
-                .ok_or_else(|| anyhow::anyhow!("unknown peer: {peer}"))?;
-
-            Household::spawn(local, self.peers.networking(peer)?, storage.clone())
+            self.households.create_household(local, peer)
         }
 
-        async fn run_server(
-            &mut self,
+        /// Run a server exporting the given household.
+        ///
+        /// A port must have been configured for the peer beforehand.
+        ///
+        /// This is a lower-level call that's usually not called directly. Prefer calling with_two_peers or with_three_peers
+        pub async fn run_server(
+            &self,
             peer: &Peer,
             household: &Household,
         ) -> anyhow::Result<Arc<Server>> {
-            let mut server = Server::new(self.peers.networking(peer)?);
+            let mut server = Server::new(self.households.peers.networking(peer)?);
             household.register(&mut server);
 
             let server = Arc::new(server);
 
-            let configured = self.peers.hostport(peer).await;
-            let addr = server
-                .listen(configured.unwrap_or(&HostPort::localhost(0)))
+            let configured = self.households.peers.hostport(peer).await;
+            server
+                .listen(configured.ok_or(anyhow::anyhow!("No port configured for {peer}"))?)
                 .await?;
-            if configured.is_none() {
-                self.peers.set_addr(peer, addr);
-            }
 
             Ok(server)
         }
 
         /// Wait for the given file to appear in the given peer's cache, in the test arena.
         async fn wait_for_file(&self, peer: &Peer, filename: &str) -> anyhow::Result<()> {
-            let cache = &self
-                .peer_storage
-                .get(peer)
-                .ok_or(anyhow::anyhow!("Unknown peer {peer}"))?
-                .cache()
-                .ok_or(anyhow::anyhow!("No cache for {peer}"))?;
+            let cache = &self.households.cache(peer)?;
 
             let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
-            let arena = test_arena();
+            let arena = HouseholdFixture::test_arena();
             let arena_inode = cache.arena_root(&arena)?;
             while cache.lookup(arena_inode, filename).await.is_err() {
                 if let Some(delay) = retry.next() {
@@ -1011,11 +976,11 @@ mod tests {
         let mut fixture = Fixture::setup().await?;
         let local = LocalSet::new();
 
-        let a = &a();
-        fixture.peers.pick_port(a)?;
+        let a = &HouseholdFixture::a();
+        fixture.households.pick_port(a)?;
 
-        let b = &b();
-        fixture.peers.pick_port(b)?;
+        let b = &HouseholdFixture::b();
+        fixture.households.pick_port(b)?;
 
         let household_a = fixture.household(&local, a)?;
         let _server_a = fixture.run_server(a, &household_a).await?;
@@ -1043,31 +1008,22 @@ mod tests {
     #[tokio::test]
     async fn read_from_peer() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
-        let local = LocalSet::new();
+        fixture
+            .households
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
 
-        let a = &a();
-        fixture.peers.pick_port(a)?;
-
-        let b = &b();
-        fixture.peers.pick_port(b)?;
-
-        let household_a = fixture.household(&local, a)?;
-        let _server_a = fixture.run_server(a, &household_a).await?;
-
-        let household_b = fixture.household(&local, b)?;
-        let _server_b = fixture.run_server(b, &household_b).await?;
-        household_a.keep_connected()?;
-
-        local
-            .run_until(async move {
                 let b_dir = fixture.arena_root(&b);
                 fs::write(&b_dir.join("bar.txt"), b"test").await?;
 
-                fixture.wait_for_file(a, "bar.txt").await?;
+                fixture.wait_for_file(&a, "bar.txt").await?;
 
                 let stream = household_a.read(
                     vec![b.clone()],
-                    test_arena(),
+                    HouseholdFixture::test_arena(),
                     model::Path::parse("bar.txt")?,
                     0,
                     None,
@@ -1077,7 +1033,7 @@ mod tests {
 
                 let stream = household_a.read(
                     vec![b.clone()],
-                    test_arena(),
+                    HouseholdFixture::test_arena(),
                     model::Path::parse("bar.txt")?,
                     2,
                     None,
@@ -1087,7 +1043,7 @@ mod tests {
 
                 let stream = household_a.read(
                     vec![b.clone()],
-                    test_arena(),
+                    HouseholdFixture::test_arena(),
                     model::Path::parse("bar.txt")?,
                     0,
                     Some(2),
