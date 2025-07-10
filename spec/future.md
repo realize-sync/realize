@@ -6,9 +6,9 @@ for easy reference, and end with a detailled and numbered task list.
 ## Remove path from FileContent {#cachepath}
 
 `FileContent`, defined in
-[unreal.rs](crate/realize-lib/src/storage/unreal.rs) stores arena and
-path as strings. This is unnecessary, since the position of the file
-in the hierarchy specifies that.
+[unreal.rs](crate/realize-storage/src/unreal.rs) stores arena and path
+as strings. This is unnecessary, since the position of the file in the
+hierarchy specifies that.
 
 What is needed is a way of going from a file inode back up to the
 root. It's already possible to go back up to a parent directory, since
@@ -16,10 +16,10 @@ root. It's already possible to go back up to a parent directory, since
 extended with a `parent_inode` as well.
 
 The field `arena` in `FileContent` is also used by `mark_peer_files`
-in [sync.rs](crate/realize-lib/src/storage/unreal/sync.rs) to find out
+in [sync.rs](crate/realize-storage/src/unreal/sync.rs) to find out
 which files belong to a specific arena. Let's replace `arena` by
-`arena_root`, an u64 from `arena_map` from `UnrealCacheBlocking`, which
-should be transformed into a bijective map.
+`arena_root`, an u64 from `arena_map` from `UnrealCacheBlocking`,
+which should be transformed into a bijective map.
 
 Such a `FileTableEntry` would unfortunately not be usable by the
 downloader anymore, so `file_availability` in `UnrealCacheBlocking`
@@ -28,7 +28,7 @@ downloader needs: peer, arena, path, hash.
 
 TBD: Detailed task list
 
-## Allow : in model:Path {#colon}
+## Allow : in realize_types:Path {#colon}
 
 Forbidding just brings trouble on Linux.
 
