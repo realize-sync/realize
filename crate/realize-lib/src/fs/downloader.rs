@@ -1,114 +1,46 @@
 use crate::model::{Arena, ByteRange, Path, Peer};
-use crate::network::Networking;
-use crate::rpc::realstore::client::{ClientOptions, RealStoreClient};
-use crate::rpc::realstore::{self};
-use crate::storage::{
-    FileAvailability, RealStoreError, RealStoreOptions, StorageError, UnrealCacheAsync,
-};
-use moka::future::{Cache, CacheBuilder};
+use crate::rpc::Household;
+use crate::storage::{StorageError, UnrealCacheAsync};
+use futures::Future;
 use std::cmp::min;
 use std::collections::VecDeque;
 use std::io::{ErrorKind, SeekFrom};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
-use tarpc::client::RpcError;
-use tarpc::context;
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
-use tokio::task::JoinSet;
+use tokio_stream::StreamExt;
 
 const MIN_CHUNK_SIZE: usize = 8 * 1024;
 const MAX_CHUNK_SIZE: usize = 32 * 1024;
 
 #[derive(Clone)]
 pub struct Downloader {
-    networking: Networking,
+    household: Household,
     cache: UnrealCacheAsync,
-    clients: Cache<Peer, Arc<RealStoreClient>>,
 }
 
 impl Downloader {
-    pub fn new(networking: Networking, cache: UnrealCacheAsync) -> Self {
-        Self {
-            networking,
-            cache,
-            clients: CacheBuilder::new(8)
-                .time_to_idle(Duration::from_secs(5 * 60))
-                .build(),
-        }
+    pub fn new(household: Household, cache: UnrealCacheAsync) -> Self {
+        Self { household, cache }
     }
 
     pub async fn reader(&self, inode: u64) -> Result<Download, StorageError> {
         let avail = self.cache.file_availability(inode).await?;
 
-        let (client, peer) = self.choose(&avail).await?;
-
         // TODO: check hash
         Ok(Download::new(
-            client,
-            peer,
+            self.household.clone(),
+            avail.peers,
             avail.arena,
             avail.path,
             avail.metadata.size,
         ))
     }
-
-    async fn choose(
-        &self,
-        avail: &FileAvailability,
-    ) -> Result<(Arc<RealStoreClient>, Peer), StorageError> {
-        for peer in &avail.peers {
-            if let Some(client) = self.clients.get(&peer).await {
-                // TODO: check if client is still connected, if no,
-                // connecting to another client would be better.
-                log::debug!(
-                    "Reusing connection to {} to download [{}]/{} {}",
-                    peer,
-                    avail.arena,
-                    avail.path,
-                    avail.hash
-                );
-                return Ok((client, peer.clone()));
-            }
-        }
-
-        let mut set = JoinSet::new();
-        for peer in &avail.peers {
-            let networking = self.networking.clone();
-            let peer = peer.clone();
-            set.spawn(async move {
-                let client =
-                    realstore::client::connect(&networking, &peer, ClientOptions::default())
-                        .await?;
-
-                Ok::<_, anyhow::Error>((client, peer))
-            });
-        }
-        while let Some(res) = set.join_next().await {
-            if let Ok(Ok((client, peer))) = res {
-                let client = Arc::new(client);
-                self.clients.insert(peer.clone(), Arc::clone(&client)).await;
-                log::debug!(
-                    "Connected to {} to download [{}]/{} {}",
-                    peer,
-                    avail.arena,
-                    avail.path,
-                    avail.hash
-                );
-
-                // TODO: consider keeping any other successful
-                // connections here instead of discarding them.
-                return Ok((client, peer.clone()));
-            }
-        }
-        Err(StorageError::Unavailable)
-    }
 }
 
 pub struct Download {
-    client: Arc<RealStoreClient>,
-    peer: Peer,
+    household: Household,
+    peers: Vec<Peer>,
     arena: Arena,
     path: Path,
     size: u64,
@@ -118,14 +50,13 @@ pub struct Download {
     pending: Option<(ByteRange, PendingDownload)>,
 }
 
-type PendingDownload =
-    Pin<Box<dyn Future<Output = Result<Result<Vec<u8>, RealStoreError>, RpcError>> + Send + Sync>>;
+type PendingDownload = Pin<Box<dyn Future<Output = Result<Vec<u8>, std::io::Error>> + Send + Sync>>;
 
 impl Download {
-    fn new(client: Arc<RealStoreClient>, peer: Peer, arena: Arena, path: Path, size: u64) -> Self {
+    fn new(household: Household, peers: Vec<Peer>, arena: Arena, path: Path, size: u64) -> Self {
         Self {
-            client,
-            peer,
+            household,
+            peers,
             arena,
             path,
             size,
@@ -147,13 +78,7 @@ impl Download {
         while let Some((range, data)) = self.avail.front() {
             let intersection = requested.intersection(range);
             if !intersection.is_empty() && intersection.start == self.offset {
-                log::debug!(
-                    "From {}, return [{}]/{} {}",
-                    self.peer,
-                    self.arena,
-                    self.path,
-                    intersection
-                );
+                log::debug!("Return [{}]/{} {intersection}", self.arena, self.path);
 
                 buf.put_slice(
                     &data[(intersection.start - range.start) as usize
@@ -192,30 +117,26 @@ impl Download {
             ),
         );
 
-        log::debug!(
-            "From {}, download [{}]/{} {}",
-            self.peer,
-            self.arena,
-            self.path,
-            range
-        );
+        log::debug!("Download [{}]/{} {range}", self.arena, self.path);
 
         let fut = {
-            let client = Arc::clone(&self.client);
+            let household = self.household.clone();
+            let peers = self.peers.clone();
             let arena = self.arena.clone();
             let path = self.path.clone();
             let range = range.clone();
 
             Box::pin(async move {
-                client
-                    .read(
-                        context::current(),
-                        arena,
-                        path,
-                        range,
-                        RealStoreOptions::default(),
-                    )
-                    .await
+                let mut stream =
+                    household.read(peers, arena, path, range.start, Some(range.bytecount()))?;
+                let mut data = Vec::new();
+                while let Some(chunk_result) = stream.next().await {
+                    match chunk_result {
+                        Ok(mut chunk) => data.append(&mut chunk),
+                        Err(err) => return Err(err),
+                    }
+                }
+                Ok(data)
             })
         };
 
@@ -235,13 +156,12 @@ impl Download {
             None => self.next_request(buf.capacity()),
         };
         match fut.as_mut().poll(cx) {
-            Poll::Ready(Err(err)) => Poll::Ready(Err(rpc_to_io_error(err))),
-            Poll::Ready(Ok(Err(err))) => Poll::Ready(Err(real_store_to_io_error(err))),
-            Poll::Ready(Ok(Ok(data))) => {
+            Poll::Ready(Ok(data)) => {
                 self.avail.push_back((range, data));
 
                 self.inner_poll_read(cx, buf)
             }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
             Poll::Pending => {
                 self.pending = Some((range, fut));
 
@@ -323,251 +243,321 @@ impl AsyncRead for Download {
     }
 }
 
-fn rpc_to_io_error(err: RpcError) -> std::io::Error {
-    match &err {
-        RpcError::Shutdown => std::io::Error::new(ErrorKind::ConnectionReset, err),
-        RpcError::Server(_) => std::io::Error::new(ErrorKind::ConnectionReset, err),
-        RpcError::DeadlineExceeded => std::io::Error::new(ErrorKind::TimedOut, err),
-        _ => std::io::Error::other(err),
-    }
-}
-
-fn real_store_to_io_error(err: RealStoreError) -> std::io::Error {
-    std::io::Error::other(err)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Arena, Path, UnixTime};
-    use crate::network::hostport::HostPort;
-    use crate::network::{self, Server};
-    use crate::storage::{self, Notification, RealStore};
-    use crate::utils::hash;
-    use assert_fs::TempDir;
-    use assert_fs::prelude::{FileWriteBin as _, FileWriteStr as _, PathChild as _};
+    use crate::model::Path;
+    use crate::rpc::testing::HouseholdFixture;
     use std::io::Write as _;
+    use tokio::fs;
     use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
-
-    struct Fixture {
-        tempdir: TempDir,
-        arena: Arena,
-        _local: RealStore,
-        _server: Arc<Server>,
-        networking: Networking,
-        cache: UnrealCacheAsync,
-    }
-    impl Fixture {
-        async fn setup() -> anyhow::Result<Fixture> {
-            let _ = env_logger::try_init();
-            let tempdir = TempDir::new()?;
-            let arena = Arena::from("test");
-            let local = RealStore::new(vec![(arena.clone(), tempdir.path().to_path_buf())]);
-            let mut server = Server::new(network::testing::server_networking()?);
-            realstore::server::register(&mut server, local.clone());
-            let server = Arc::new(server);
-            let addr = server.listen(&HostPort::localhost(0)).await?;
-            let networking = network::testing::client_networking(addr)?;
-            let cache = storage::testing::in_memory_cache([arena.clone()]).await?;
-
-            Ok(Self {
-                tempdir,
-                arena,
-                _local: local,
-                _server: server,
-                networking,
-                cache,
-            })
-        }
-
-        async fn add_file_with_content(&self, name: &str, content: &str) -> anyhow::Result<u64> {
-            let path = Path::parse(name)?;
-            let file = self.tempdir.child(path.name());
-            file.write_str(content)?;
-
-            self.add_file(path).await
-        }
-
-        async fn add_file(&self, path: Path) -> Result<u64, anyhow::Error> {
-            let realpath = path.within(self.tempdir.path());
-            let metadata = tokio::fs::metadata(&realpath).await?;
-            self.cache
-                .update(
-                    &network::testing::server_peer(),
-                    Notification::Add {
-                        index: 1,
-                        arena: self.arena.clone(),
-                        path: path.clone(),
-                        size: metadata.len(),
-                        mtime: UnixTime::mtime(&metadata),
-                        hash: hash::digest(tokio::fs::read(&realpath).await?),
-                    },
-                )
-                .await?;
-            let (inode, _) = self
-                .cache
-                .lookup_path(self.cache.arena_root(&self.arena)?, &path)
-                .await?;
-
-            Ok(inode)
-        }
-    }
 
     #[tokio::test]
     async fn read_small_file() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
-        let inode = fixture
-            .add_file_with_content("test.txt", "File content")
-            .await?;
-        let downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
-        let mut reader = downloader.reader(inode).await?;
+        let mut fixture = HouseholdFixture::setup().await?;
+        fixture
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
 
-        assert_eq!("File content", read_string(&mut reader).await?);
+                // Create a file in peer B's arena
+                let b_dir = fixture.arena_root(&b);
+                fs::write(&b_dir.join("test.txt"), "File content").await?;
+
+                // Wait for the file to appear in peer A's cache
+                fixture.wait_for_file_in_cache(&a, "test.txt").await?;
+
+                // Get the cache and create a downloader
+                let cache = fixture.cache(&a)?;
+                let downloader = Downloader::new(household_a, cache.clone());
+
+                // Get the inode for the file
+                let arena = HouseholdFixture::test_arena();
+                let arena_root = cache.arena_root(&arena)?;
+                let (inode, _) = cache
+                    .lookup_path(arena_root, &Path::parse("test.txt")?)
+                    .await?;
+
+                let mut reader = downloader.reader(inode).await?;
+                assert_eq!("File content", read_string(&mut reader).await?);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
         Ok(())
     }
 
     #[tokio::test]
     async fn seek() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
-        let inode = fixture
-            .add_file_with_content("test.txt", "baa, baa, black sheep")
+        let mut fixture = HouseholdFixture::setup().await?;
+        fixture
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+
+                let b_dir = fixture.arena_root(&b);
+                fs::write(&b_dir.join("test.txt"), "baa, baa, black sheep").await?;
+
+                fixture.wait_for_file_in_cache(&a, "test.txt").await?;
+
+                let cache = fixture.cache(&a)?;
+                let downloader = Downloader::new(household_a, cache.clone());
+
+                let arena = HouseholdFixture::test_arena();
+                let arena_root = cache.arena_root(&arena)?;
+                let (inode, _) = cache
+                    .lookup_path(arena_root, &Path::parse("test.txt")?)
+                    .await?;
+
+                let mut reader = downloader.reader(inode).await?;
+
+                reader.seek(SeekFrom::Start(10)).await?;
+                assert_eq!("black sheep", read_string(&mut reader).await?);
+
+                reader.seek(SeekFrom::Start(5)).await?;
+                assert_eq!("baa, black sheep", read_string(&mut reader).await?);
+
+                reader.seek(SeekFrom::Start(5)).await?;
+                reader.seek(SeekFrom::Current(5)).await?;
+                assert_eq!("black sheep", read_string(&mut reader).await?);
+
+                reader.seek(SeekFrom::Current(-5)).await?;
+                assert_eq!("sheep", read_string(&mut reader).await?);
+
+                reader.seek(SeekFrom::End(-11)).await?;
+                assert_eq!("black sheep", read_string(&mut reader).await?);
+
+                Ok::<(), anyhow::Error>(())
+            })
             .await?;
-        let downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
-        let mut reader = downloader.reader(inode).await?;
-
-        reader.seek(SeekFrom::Start(10)).await?;
-        assert_eq!("black sheep", read_string(&mut reader).await?);
-
-        reader.seek(SeekFrom::Start(5)).await?;
-        assert_eq!("baa, black sheep", read_string(&mut reader).await?);
-
-        reader.seek(SeekFrom::Start(5)).await?;
-        reader.seek(SeekFrom::Current(5)).await?;
-        assert_eq!("black sheep", read_string(&mut reader).await?);
-
-        reader.seek(SeekFrom::Current(-5)).await?;
-        assert_eq!("sheep", read_string(&mut reader).await?);
-
-        reader.seek(SeekFrom::End(-11)).await?;
-        assert_eq!("black sheep", read_string(&mut reader).await?);
 
         Ok(())
     }
 
     #[tokio::test]
     async fn seek_past_end() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
-        let inode = fixture
-            .add_file_with_content("test.txt", "baa, baa, black sheep")
+        let mut fixture = HouseholdFixture::setup().await?;
+        fixture
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+
+                let b_dir = fixture.arena_root(&b);
+                fs::write(&b_dir.join("test.txt"), "baa, baa, black sheep").await?;
+
+                fixture.wait_for_file_in_cache(&a, "test.txt").await?;
+
+                let cache = fixture.cache(&a)?;
+                let downloader = Downloader::new(household_a, cache.clone());
+
+                let arena = HouseholdFixture::test_arena();
+                let arena_root = cache.arena_root(&arena)?;
+                let (inode, _) = cache
+                    .lookup_path(arena_root, &Path::parse("test.txt")?)
+                    .await?;
+
+                let mut reader = downloader.reader(inode).await?;
+
+                reader.seek(SeekFrom::Start(100)).await?;
+                assert_eq!("", read_string(&mut reader).await?);
+
+                reader.seek(SeekFrom::End(5)).await?;
+                assert_eq!("", read_string(&mut reader).await?);
+
+                reader.seek(SeekFrom::Start(5)).await?;
+                reader.seek(SeekFrom::Current(100)).await?;
+                assert_eq!("", read_string(&mut reader).await?);
+
+                Ok::<(), anyhow::Error>(())
+            })
             .await?;
-        let downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
-        let mut reader = downloader.reader(inode).await?;
-
-        reader.seek(SeekFrom::Start(100)).await?;
-        assert_eq!("", read_string(&mut reader).await?);
-
-        reader.seek(SeekFrom::End(5)).await?;
-        assert_eq!("", read_string(&mut reader).await?);
-
-        reader.seek(SeekFrom::Start(5)).await?;
-        reader.seek(SeekFrom::Current(100)).await?;
-        assert_eq!("", read_string(&mut reader).await?);
 
         Ok(())
     }
 
     #[tokio::test]
     async fn seek_before_start() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
-        let inode = fixture
-            .add_file_with_content("test.txt", "baa, baa, black sheep")
-            .await?;
-        let downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
-        let mut reader = downloader.reader(inode).await?;
+        let mut fixture = HouseholdFixture::setup().await?;
+        fixture
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
 
-        assert!(reader.seek(SeekFrom::End(-100)).await.is_err());
-        assert!(reader.seek(SeekFrom::Current(-100)).await.is_err());
+                let b_dir = fixture.arena_root(&b);
+                fs::write(&b_dir.join("test.txt"), "baa, baa, black sheep").await?;
+
+                fixture.wait_for_file_in_cache(&a, "test.txt").await?;
+
+                let cache = fixture.cache(&a)?;
+                let downloader = Downloader::new(household_a, cache.clone());
+
+                let arena = HouseholdFixture::test_arena();
+                let arena_root = cache.arena_root(&arena)?;
+                let (inode, _) = cache
+                    .lookup_path(arena_root, &Path::parse("test.txt")?)
+                    .await?;
+
+                let mut reader = downloader.reader(inode).await?;
+
+                assert!(reader.seek(SeekFrom::End(-100)).await.is_err());
+                assert!(reader.seek(SeekFrom::Current(-100)).await.is_err());
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
 
         Ok(())
     }
 
     #[tokio::test]
     async fn seek_mixed_with_read() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let mut fixture = HouseholdFixture::setup().await?;
+        fixture
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
 
-        let path = Path::parse("large_file")?;
-        {
-            let mut f = std::fs::File::create(path.within(fixture.tempdir.path()))?;
-            f.write(&[1u8; 8 * 1024])?;
-            f.write(&[0u8; 8 * 1024])?;
-            f.write(&[2u8; 8 * 1024])?;
-        }
+                let b_dir = fixture.arena_root(&b);
+                let path = b_dir.join("large_file");
+                {
+                    let mut f = std::fs::File::create(&path)?;
+                    f.write(&[1u8; 8 * 1024])?;
+                    f.write(&[0u8; 8 * 1024])?;
+                    f.write(&[2u8; 8 * 1024])?;
+                }
 
-        let inode = fixture.add_file(path).await?;
-        let downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
-        let mut reader = downloader.reader(inode).await?;
+                fixture.wait_for_file_in_cache(&a, "large_file").await?;
 
-        let mut buf = [0u8; 16];
-        reader.read_exact(&mut buf).await?;
-        assert_eq!([1u8; 16], buf);
+                let cache = fixture.cache(&a)?;
+                let downloader = Downloader::new(household_a, cache.clone());
 
-        reader.seek(SeekFrom::End(-100)).await?;
-        reader.read_exact(&mut buf).await?;
-        assert_eq!([2u8; 16], buf);
+                let arena = HouseholdFixture::test_arena();
+                let arena_root = cache.arena_root(&arena)?;
+                let (inode, _) = cache
+                    .lookup_path(arena_root, &Path::parse("large_file")?)
+                    .await?;
 
-        reader.seek(SeekFrom::Start(100)).await?;
-        reader.read_exact(&mut buf).await?;
-        assert_eq!([1u8; 16], buf);
+                let mut reader = downloader.reader(inode).await?;
 
-        reader.seek(SeekFrom::Start(8 * 1024)).await?;
-        reader.read_exact(&mut buf).await?;
-        assert_eq!([0u8; 16], buf);
+                let mut buf = [0u8; 16];
+                reader.read_exact(&mut buf).await?;
+                assert_eq!([1u8; 16], buf);
+
+                reader.seek(SeekFrom::End(-100)).await?;
+                reader.read_exact(&mut buf).await?;
+                assert_eq!([2u8; 16], buf);
+
+                reader.seek(SeekFrom::Start(100)).await?;
+                reader.read_exact(&mut buf).await?;
+                assert_eq!([1u8; 16], buf);
+
+                reader.seek(SeekFrom::Start(8 * 1024)).await?;
+                reader.read_exact(&mut buf).await?;
+                assert_eq!([0u8; 16], buf);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
 
         Ok(())
     }
 
     #[tokio::test]
     async fn read_large_file_small_buffer() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
-        test_read_file(&fixture, 12 * 1024, 1024, false).await?;
+        let mut fixture = HouseholdFixture::setup().await?;
+        fixture
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                test_read_file(&fixture, household_a, 12 * 1024, 1024, false).await?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
         Ok(())
     }
 
     #[tokio::test]
     async fn read_large_file_unusual_buffer_size() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
-        test_read_file(&fixture, 12 * 1024, 2000, true).await?;
+        let mut fixture = HouseholdFixture::setup().await?;
+        fixture
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                test_read_file(&fixture, household_a, 12 * 1024, 2000, true).await?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
         Ok(())
     }
 
     #[tokio::test]
     async fn read_large_file_large_buffer() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
-        test_read_file(&fixture, 48 * 1024, 32 * 1024, false).await?;
+        let mut fixture = HouseholdFixture::setup().await?;
+        fixture
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                test_read_file(&fixture, household_a, 48 * 1024, 32 * 1024, false).await?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
         Ok(())
     }
 
     #[tokio::test]
     async fn read_large_file_overly_large_buffer() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
-        test_read_file(&fixture, 64 * 1024, 48 * 1024, true).await?;
+        let mut fixture = HouseholdFixture::setup().await?;
+        fixture
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                test_read_file(&fixture, household_a, 64 * 1024, 48 * 1024, true).await?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
         Ok(())
     }
 
     async fn test_read_file(
-        fixture: &Fixture,
+        fixture: &HouseholdFixture,
+        household: Household,
         file_size: usize,
         buf_size: usize,
         allow_short_reads: bool,
     ) -> anyhow::Result<()> {
-        let path = Path::parse("large_file")?;
-        fixture
-            .tempdir
-            .child(path.to_string())
-            .write_binary(&vec![0xAB; file_size])?;
+        let a = HouseholdFixture::a();
+        let b = HouseholdFixture::b();
 
-        let inode = fixture.add_file(path).await?;
-        let downloader = Downloader::new(fixture.networking.clone(), fixture.cache.clone());
+        let b_dir = fixture.arena_root(&b);
+        let path = b_dir.join("large_file");
+        std::fs::write(&path, vec![0xAB; file_size])?;
+
+        fixture.wait_for_file_in_cache(&a, "large_file").await?;
+
+        let cache = fixture.cache(&a)?;
+        let downloader = Downloader::new(household, cache.clone());
+
+        let arena = HouseholdFixture::test_arena();
+        let arena_root = cache.arena_root(&arena)?;
+        let (inode, _) = cache
+            .lookup_path(arena_root, &Path::parse("large_file")?)
+            .await?;
+
         let mut reader = downloader.reader(inode).await?;
 
         if allow_short_reads {

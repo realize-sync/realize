@@ -344,179 +344,179 @@ fn to_nfs_time(time: &UnixTime) -> nfstime3 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Arena, Hash, Path};
-    use crate::network::hostport::HostPort;
-    use crate::network::{self, Server};
-    use crate::rpc::realstore;
-    use crate::storage::{self, Notification, RealStore};
-    use assert_fs::TempDir;
-    use assert_fs::prelude::{FileWriteStr as _, PathChild as _};
+    use crate::model::{Hash, Path};
+    use crate::rpc::testing::HouseholdFixture;
+    use crate::storage::Notification;
     use nfsserve::nfs::nfsstring;
     use std::time::SystemTime;
-
-    struct Fixture {
-        start_time: Duration,
-        arena: Arena,
-        cache: UnrealCacheAsync,
-        fs: UnrealFs,
-        tempdir: TempDir,
-        _server: Arc<Server>,
-    }
-    impl Fixture {
-        async fn setup() -> anyhow::Result<Fixture> {
-            let start_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?;
-            let _ = env_logger::try_init();
-            let tempdir = TempDir::new()?;
-            let arena = Arena::from("test");
-            let local = RealStore::new(vec![(arena.clone(), tempdir.path().to_path_buf())]);
-            let mut server = Server::new(network::testing::server_networking()?);
-            realstore::server::register(&mut server, local.clone());
-            let server = Arc::new(server);
-            let addr = server.listen(&HostPort::localhost(0)).await?;
-            let networking = network::testing::client_networking(addr)?;
-            let cache = storage::testing::in_memory_cache([arena.clone()]).await?;
-            let fs = UnrealFs::new(cache.clone(), Downloader::new(networking, cache.clone()));
-
-            Ok(Self {
-                start_time,
-                tempdir,
-                arena,
-                cache,
-                fs,
-                _server: server,
-            })
-        }
-    }
+    use tokio::fs;
 
     #[tokio::test]
     async fn root_dir() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
-        let fs = &fixture.fs;
+        let start_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?;
+        let mut fixture = HouseholdFixture::setup().await?;
+        fixture
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let cache = fixture.cache(&a)?;
+                let fs = UnrealFs::new(cache.clone(), Downloader::new(household_a, cache.clone()));
 
-        assert_eq!(UnrealCacheAsync::ROOT_DIR, fs.root_dir());
+                assert_eq!(UnrealCacheAsync::ROOT_DIR, fs.root_dir());
 
-        let attrs = fs
-            .getattr(UnrealCacheAsync::ROOT_DIR)
-            .await
-            .map_err(to_anyhow)?;
-        assert_eq!(0o0550, attrs.mode);
-        assert_eq!(nix::unistd::getuid().as_raw(), attrs.uid);
-        assert_eq!(nix::unistd::getgid().as_raw(), attrs.gid);
+                let attrs = fs
+                    .getattr(UnrealCacheAsync::ROOT_DIR)
+                    .await
+                    .map_err(to_anyhow)?;
+                assert_eq!(0o0550, attrs.mode);
+                assert_eq!(nix::unistd::getuid().as_raw(), attrs.uid);
+                assert_eq!(nix::unistd::getgid().as_raw(), attrs.gid);
 
-        // mtime should have been set when the arena was added
-        assert!(attrs.mtime.seconds >= fixture.start_time.as_secs() as u32);
+                // mtime should have been set when the arena was added
+                assert!(attrs.mtime.seconds >= start_time.as_secs() as u32);
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
         Ok(())
     }
 
     #[tokio::test]
     async fn arena_dir() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
-        let fs = &fixture.fs;
+        let start_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?;
+        let mut fixture = HouseholdFixture::setup().await?;
+        fixture
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let cache = fixture.cache(&a)?;
+                let fs = UnrealFs::new(cache.clone(), Downloader::new(household_a, cache.clone()));
 
-        let arena_root = fs
-            .lookup(
-                UnrealCacheAsync::ROOT_DIR,
-                &nfsstring::from("test".as_bytes()),
-            )
-            .await
-            .map_err(to_anyhow)?;
-        assert_eq!(fixture.cache.arena_root(&fixture.arena)?, arena_root);
+                let arena = HouseholdFixture::test_arena();
+                let arena_root = fs
+                    .lookup(
+                        UnrealCacheAsync::ROOT_DIR,
+                        &nfsstring::from(arena.as_str().as_bytes()),
+                    )
+                    .await
+                    .map_err(to_anyhow)?;
+                assert_eq!(cache.arena_root(&arena)?, arena_root);
 
-        let attrs = fs.getattr(arena_root).await.map_err(to_anyhow)?;
-        assert_eq!(0o0550, attrs.mode);
-        assert_eq!(nix::unistd::getuid().as_raw(), attrs.uid);
-        assert_eq!(nix::unistd::getgid().as_raw(), attrs.gid);
-        // mtime should have been set when the arena was added
-        assert!(attrs.mtime.seconds >= fixture.start_time.as_secs() as u32);
+                let attrs = fs.getattr(arena_root).await.map_err(to_anyhow)?;
+                assert_eq!(0o0550, attrs.mode);
+                assert_eq!(nix::unistd::getuid().as_raw(), attrs.uid);
+                assert_eq!(nix::unistd::getgid().as_raw(), attrs.gid);
+                // mtime should have been set when the arena was added
+                assert!(attrs.mtime.seconds >= start_time.as_secs() as u32);
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
         Ok(())
     }
 
     #[tokio::test]
     async fn file_attrs() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
-        let fs = &fixture.fs;
-
-        let mtime = UnixTime::now();
+        let mut fixture = HouseholdFixture::setup().await?;
         fixture
-            .cache
-            .update(
-                &network::testing::server_peer(),
-                Notification::Add {
-                    index: 1,
-                    arena: fixture.arena.clone(),
-                    path: Path::parse("somefile.txt")?,
-                    size: 5,
-                    mtime: mtime.clone(),
-                    hash: Hash([1u8; 32]),
-                },
-            )
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                let cache = fixture.cache(&a)?;
+                let fs = UnrealFs::new(cache.clone(), Downloader::new(household_a, cache.clone()));
+
+                let mtime = UnixTime::now();
+                cache
+                    .update(
+                        &b,
+                        Notification::Add {
+                            index: 1,
+                            arena: HouseholdFixture::test_arena(),
+                            path: Path::parse("somefile.txt")?,
+                            size: 5,
+                            mtime: mtime.clone(),
+                            hash: Hash([1u8; 32]),
+                        },
+                    )
+                    .await?;
+
+                let arena_root = cache
+                    .arena_root(&HouseholdFixture::test_arena())
+                    .expect("arena");
+                let somefile_inode = fs
+                    .lookup(arena_root, &nfsstring::from("somefile.txt".as_bytes()))
+                    .await
+                    .map_err(to_anyhow)?;
+
+                let attrs = fs.getattr(somefile_inode).await.map_err(to_anyhow)?;
+                assert_eq!(0o0440, attrs.mode);
+                assert_eq!(nix::unistd::getuid().as_raw(), attrs.uid);
+                assert_eq!(nix::unistd::getgid().as_raw(), attrs.gid);
+                assert_eq!(5, attrs.size);
+                assert_eq!(5, attrs.used);
+
+                assert_eq!(
+                    (mtime.as_secs(), mtime.subsec_nanos()),
+                    (attrs.mtime.seconds as u64, attrs.mtime.nseconds)
+                );
+
+                Ok::<(), anyhow::Error>(())
+            })
             .await?;
-
-        let arena_root = fixture.cache.arena_root(&fixture.arena).expect("arena");
-        let somefile_inode = fs
-            .lookup(arena_root, &nfsstring::from("somefile.txt".as_bytes()))
-            .await
-            .map_err(to_anyhow)?;
-
-        let attrs = fs.getattr(somefile_inode).await.map_err(to_anyhow)?;
-        assert_eq!(0o0440, attrs.mode);
-        assert_eq!(nix::unistd::getuid().as_raw(), attrs.uid);
-        assert_eq!(nix::unistd::getgid().as_raw(), attrs.gid);
-        assert_eq!(5, attrs.size);
-        assert_eq!(5, attrs.used);
-
-        assert_eq!(
-            (mtime.as_secs(), mtime.subsec_nanos()),
-            (attrs.mtime.seconds as u64, attrs.mtime.nseconds)
-        );
 
         Ok(())
     }
 
     #[tokio::test]
     async fn file_content() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
-        let fs = &fixture.fs;
-
-        let file = fixture.tempdir.child("hello.txt");
-        file.write_str("world")?;
-
-        let m = tokio::fs::metadata(&file).await?;
+        let mut fixture = HouseholdFixture::setup().await?;
         fixture
-            .cache
-            .update(
-                &network::testing::server_peer(),
-                Notification::Add {
-                    index: 1,
-                    arena: fixture.arena.clone(),
-                    path: Path::parse("hello.txt")?,
-                    size: m.len(),
-                    mtime: UnixTime::mtime(&m),
-                    hash: Hash([1u8; 32]),
-                },
-            )
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                let cache = fixture.cache(&a)?;
+                let fs = UnrealFs::new(cache.clone(), Downloader::new(household_a, cache.clone()));
+
+                // Create a file in peer B's arena
+                let b_dir = fixture.arena_root(&b);
+                let file = b_dir.join("hello.txt");
+                fs::write(&file, "world").await?;
+
+                // Wait for the file to appear in peer A's cache
+                fixture.wait_for_file_in_cache(&a, "hello.txt").await?;
+
+                let arena_root = cache
+                    .arena_root(&HouseholdFixture::test_arena())
+                    .expect("arena");
+                let somefile_inode = fs
+                    .lookup(arena_root, &nfsstring::from("hello.txt".as_bytes()))
+                    .await
+                    .map_err(to_anyhow)?;
+
+                let (vec, at_end) = fs.read(somefile_inode, 0, 2).await.map_err(to_anyhow)?;
+                let content = String::from_utf8(vec)?;
+                assert_eq!("wo", content);
+                assert!(!at_end);
+
+                let (vec, at_end) = fs.read(somefile_inode, 2, 2).await.map_err(to_anyhow)?;
+                let content = String::from_utf8(vec)?;
+                assert_eq!("rl", content);
+                assert!(!at_end);
+
+                let (vec, at_end) = fs.read(somefile_inode, 0, 100).await.map_err(to_anyhow)?;
+                let content = String::from_utf8(vec)?;
+                assert_eq!("world", content);
+                assert!(at_end);
+
+                Ok::<(), anyhow::Error>(())
+            })
             .await?;
-
-        let arena_root = fixture.cache.arena_root(&fixture.arena).expect("arena");
-        let somefile_inode = fs
-            .lookup(arena_root, &nfsstring::from("hello.txt".as_bytes()))
-            .await
-            .map_err(to_anyhow)?;
-
-        let (vec, at_end) = fs.read(somefile_inode, 0, 2).await.map_err(to_anyhow)?;
-        let content = String::from_utf8(vec)?;
-        assert_eq!("wo", content);
-        assert!(!at_end);
-
-        let (vec, at_end) = fs.read(somefile_inode, 2, 2).await.map_err(to_anyhow)?;
-        let content = String::from_utf8(vec)?;
-        assert_eq!("rl", content);
-        assert!(!at_end);
-
-        let (vec, at_end) = fs.read(somefile_inode, 0, 100).await.map_err(to_anyhow)?;
-        let content = String::from_utf8(vec)?;
-        assert_eq!("world", content);
-        assert!(at_end);
 
         Ok(())
     }

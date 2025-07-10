@@ -7,39 +7,6 @@ use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
-
-pub fn client_peer() -> Peer {
-    Peer::from("client")
-}
-
-/// Standard server peer for testing.
-pub fn server_peer() -> Peer {
-    Peer::from("server")
-}
-
-/// Verifier that knows public and client peers.
-pub fn client_server_verifier() -> Arc<PeerVerifier> {
-    let mut verifier = PeerVerifier::new();
-    verifier.add_peer(&client_peer(), client_public_key());
-    verifier.add_peer(&server_peer(), server_public_key());
-
-    Arc::new(verifier)
-}
-
-/// Resolver for server peer.
-pub fn server_resolver() -> anyhow::Result<Arc<RawPublicKeyResolver>> {
-    let resolver = RawPublicKeyResolver::from_private_key(server_private_key())?;
-
-    Ok(resolver)
-}
-
-/// Resolver for client peer.
-pub fn client_resolver() -> anyhow::Result<Arc<RawPublicKeyResolver>> {
-    let resolver = RawPublicKeyResolver::from_private_key(client_private_key())?;
-
-    Ok(resolver)
-}
 
 /// Public key for test client, in PEM format.
 pub const CLIENT_PUBLIC_KEY_PEM: &[u8] = br#"
@@ -128,22 +95,6 @@ MC4CAQAwBQYDK2VwBCIEIKQaAyXiyQU0mslObJQDBav1po/d5m4OmBvJR1l5iLC5
 /// Extract I/O error kind from an anyhow error, if possible.
 pub fn io_error_kind(err: Option<anyhow::Error>) -> Option<std::io::ErrorKind> {
     Some(err?.downcast_ref::<std::io::Error>()?.kind())
-}
-
-pub fn server_networking() -> anyhow::Result<Networking> {
-    Ok(Networking::new(
-        vec![],
-        server_resolver()?,
-        client_server_verifier(),
-    ))
-}
-
-pub fn client_networking(addr: SocketAddr) -> anyhow::Result<Networking> {
-    Ok(Networking::new(
-        vec![(&server_peer(), addr.to_string().as_ref())],
-        client_resolver()?,
-        client_server_verifier(),
-    ))
 }
 
 /// Helper for building [Networking] for multiple peers that can

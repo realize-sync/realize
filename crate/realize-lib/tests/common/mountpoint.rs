@@ -4,10 +4,10 @@ use nix::fcntl::{Flock, FlockArg};
 use realize_lib::fs::downloader::Downloader;
 use realize_lib::model::{Arena, Peer};
 use realize_lib::network::hostport::HostPort;
-use realize_lib::rpc::realstore;
 use realize_lib::network::security::{PeerVerifier, RawPublicKeyResolver};
 use realize_lib::network::{Networking, Server};
-use realize_lib::storage::{RealStore, UnrealCacheAsync};
+use realize_lib::rpc::{Household, realstore};
+use realize_lib::storage::{RealStore, Storage, UnrealCacheAsync};
 use realize_lib::utils::async_utils::AbortOnDrop;
 use rustls::pki_types::pem::PemObject as _;
 use std::fs::File;
@@ -16,6 +16,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
+use tokio::task::LocalSet;
 
 pub struct Fixture {
     pub arena: Arena,
@@ -27,7 +28,7 @@ pub struct Fixture {
     _server: Arc<Server>,
 }
 impl Fixture {
-    pub async fn setup() -> anyhow::Result<Self> {
+    pub async fn setup(local: &LocalSet) -> anyhow::Result<Self> {
         let _ = env_logger::try_init();
 
         let tempdir = TempDir::new()?;
@@ -47,14 +48,20 @@ impl Fixture {
 
         let cache = in_memory_cache(arena.clone()).await?;
 
-        let downloader = Downloader::new(
-            Networking::new(
-                vec![(&client, addr.to_string().as_ref())],
-                RawPublicKeyResolver::from_private_key_file(&keys.privkey_b_path)?,
-                Arc::clone(&verifier),
-            ),
-            cache.clone(),
+        let client_networking = Networking::new(
+            vec![(&client, addr.to_string().as_ref())],
+            RawPublicKeyResolver::from_private_key_file(&keys.privkey_b_path)?,
+            Arc::clone(&verifier),
         );
+
+        let storage = Storage::from_config(&realize_lib::storage::config::StorageConfig {
+            arenas: std::collections::HashMap::new(),
+            cache: None,
+        })
+        .await?;
+        let household = Household::spawn(local, client_networking, storage)?;
+
+        let downloader = Downloader::new(household, cache.clone());
 
         let config = Config::read()?;
         let nfs_config = config.nfs.ok_or_else(|| {

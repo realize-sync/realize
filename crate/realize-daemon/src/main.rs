@@ -67,7 +67,8 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
     let config = parse_config(&cli.config)
         .with_context(|| format!("{}: failed to read TOML config file", cli.config.display()))?;
 
-    let setup = SetupHelper::setup(config, &cli.privkey).await?;
+    let local = LocalSet::new();
+    let mut setup = SetupHelper::setup(config, &cli.privkey, &local).await?;
 
     if let Some(addr) = &cli.metrics_addr {
         metrics::export_metrics(addr)
@@ -75,6 +76,11 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
             .with_context(|| format!("Failed to export metrics on {addr}"))?;
         log::info!("Metrics available on http://{addr}/metrics");
     }
+
+    let hostport = HostPort::parse(&cli.address)
+        .await
+        .with_context(|| format!("Failed to parse --address {}", cli.address))?;
+    log::debug!("Starting server on {}/{:?}...", hostport, hostport.addr());
 
     if let Some(addr) = &cli.nfs {
         setup
@@ -87,12 +93,7 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
             .await?;
     }
 
-    let hostport = HostPort::parse(&cli.address)
-        .await
-        .with_context(|| format!("Failed to parse --address {}", cli.address))?;
-    log::debug!("Starting server on {}/{:?}...", hostport, hostport.addr());
-    let local = LocalSet::new();
-    let server = setup.setup_server(&local).await?;
+    let server = setup.setup_server().await?;
 
     let addr = server
         .listen(&hostport)

@@ -45,6 +45,8 @@ impl HouseholdFixture {
 
     /// Setup the fixture.
     pub async fn setup() -> anyhow::Result<Self> {
+        let _ = env_logger::try_init();
+
         let tempdir = TempDir::new()?;
         let mut peer_storage = HashMap::new();
         for peer in [
@@ -123,6 +125,24 @@ impl HouseholdFixture {
             .ok_or(anyhow::anyhow!("{peer} has no cache"))
     }
 
+    /// Wait for the given file to appear in the given peer's cache, in the test arena.
+    pub async fn wait_for_file_in_cache(&self, peer: &Peer, filename: &str) -> anyhow::Result<()> {
+        let cache = &self.cache(peer)?;
+
+        let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
+        let arena = HouseholdFixture::test_arena();
+        let arena_inode = cache.arena_root(&arena)?;
+        while cache.lookup(arena_inode, filename).await.is_err() {
+            if let Some(delay) = retry.next() {
+                tokio::time::sleep(delay).await;
+            } else {
+                panic!("[arena]/{filename} was never added to the cache");
+            }
+        }
+
+        Ok(())
+    }
+
     // Pick a port for the given peer and store it in the network
     // configuration. Call this before calling houshold() to allow
     // households to communicate.
@@ -145,24 +165,6 @@ impl HouseholdFixture {
             .ok_or_else(|| anyhow::anyhow!("unknown peer: {peer}"))?;
 
         Household::spawn(local, self.peers.networking(peer)?, storage.clone())
-    }
-
-    /// Wait for the given file to appear in the given peer's cache, in the test arena.
-    pub async fn wait_for_file_in_cache(&self, peer: &Peer, filename: &str) -> anyhow::Result<()> {
-        let cache = self.cache(peer)?;
-
-        let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
-        let arena = HouseholdFixture::test_arena();
-        let arena_inode = cache.arena_root(&arena)?;
-        while cache.lookup(arena_inode, filename).await.is_err() {
-            if let Some(delay) = retry.next() {
-                tokio::time::sleep(delay).await;
-            } else {
-                panic!("[arena]/{filename} was never added to the cache");
-            }
-        }
-
-        Ok(())
     }
 }
 

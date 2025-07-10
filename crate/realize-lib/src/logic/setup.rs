@@ -15,30 +15,38 @@ use std::sync::Arc;
 pub struct SetupHelper {
     networking: Networking,
     storage: Arc<Storage>,
+    household: Household,
 }
 
 impl SetupHelper {
-    pub async fn setup(config: Config, privkey: &std::path::Path) -> anyhow::Result<Self> {
+    pub async fn setup(
+        config: Config,
+        privkey: &std::path::Path,
+        local: &LocalSet,
+    ) -> anyhow::Result<Self> {
         check_directory_access(&config.storage.arenas)?;
 
         let networking = Networking::from_config(&config.network.peers, privkey)?;
         let storage = Storage::from_config(&config.storage).await?;
+        let household = Household::spawn(local, networking.clone(), storage.clone())?;
 
         Ok(Self {
             networking,
             storage,
+            household,
         })
     }
 
     /// Export NFS at the given address.
     ///
     /// A local cache must be configured.
-    pub async fn export_nfs(&self, addr: SocketAddr) -> anyhow::Result<()> {
+    pub async fn export_nfs(&mut self, addr: SocketAddr) -> anyhow::Result<()> {
         let cache = self
             .storage
             .cache()
             .ok_or_else(|| anyhow::anyhow!("cache.db must be set in the configuration"))?;
-        let downloader = Downloader::new(self.networking.clone(), cache.clone());
+
+        let downloader = Downloader::new(self.household.clone(), cache.clone());
 
         nfs::export(cache.clone(), downloader, addr).await?;
 
@@ -48,17 +56,17 @@ impl SetupHelper {
     /// Setup server as specified in the configuration.
     ///
     /// The returned server is configured, but not started.
-    pub async fn setup_server(self, local: &LocalSet) -> anyhow::Result<Arc<Server>> {
+    pub async fn setup_server(self) -> anyhow::Result<Arc<Server>> {
         let SetupHelper {
             networking,
             storage,
+            household,
         } = self;
 
         let mut server = Server::new(networking.clone());
         realstore::server::register(&mut server, storage.store().clone());
 
         let has_cache = storage.cache().is_some();
-        let household = Household::spawn(local, networking, storage)?;
         if has_cache {
             household.keep_connected()?;
         }
