@@ -10,10 +10,10 @@ speed up build times.
 
 Let's create the following crates:
 
-crate/realize-lib/src/model -> crate/realize-types
-crate/realize-lib/src/network -> crate/realize-network
-crate/realize-lib/src/storage -> crate/realize-storage
-crate/realize-lib/src/rpc, crate/realize-lib/src/fs, crate/realize-lib/src/logic  -> crate/realize-core
+crate/realize-lib/src/model -> crate/realize-types/src (the package realize-lib::model becomes realize-types)
+crate/realize-lib/src/network -> crate/realize-network/src (the package realize-lib::network becomes realize-network)
+crate/realize-lib/src/storage -> crate/realize-storage (the package realize-lib::storage becomes realize-storage)
+crate/realize-lib/src/rpc, crate/realize-lib/src/fs, crate/realize-lib/src/logic  -> crate/realize-core (the package realize-lib becomes realize-core)
 
 Dependencies:
 
@@ -25,10 +25,33 @@ Dependencies:
 
 Task list:
 
-1. split realize-types out of realize-lib and add dependencies. Build with "cargo check --tests" and fix any issues. Some types marked "pub(crate)" might need to be turned into "pub"
-2. split realize-network out of realize-lib and add dependencies. Remember to enable the feature testing in dev dependencies, as realize-network exposes a testing module. Build with "cargo check --tests" and fix any issues.
-3. split realize-storage out of realize-lib, like in the previous step. Build with "cargo check --tests" and fix any issues.
-4. rename realize-lib to realize-core. Build with "cargo check --tests" and fix any issues.
+1. split realize-types out of realize-lib and add dependencies. Build
+   with "cargo check --tests" and fix any issues. Some types marked
+   "pub(crate)" might need to be turned into "pub"
+
+2. split realize-network out of realize-lib and add dependencies.
+   Remember to enable the feature testing in dev dependencies, as
+   realize-network exposes a testing module. Build with "cargo check
+   --tests" and fix any issues.
+
+   The file crate/realize-lib/capnp/network/testing/hello.capnp must
+   be moved to the network crate, into
+   crate/realize-network/capnp/testing/hello.capnp. A subset of
+   create/realize-lib/build.rs that builds hello.capnp must be moved
+   to crate/realize-network/build.rs and the package referenced in
+   hello.capnp must be changed from network::testing to just testing.
+
+3. split realize-storage out of realize-lib, like in the previous
+   step. Build with "cargo check --tests" and fix any issues.
+
+   The capnp schemas in crate/realize-lib/capnp/storage/ must be moved
+   to the storage crate, into crate/realize-network/capnp/. A subset
+   of create/realize-lib/build.rs that builds hello.capnp must be
+   moved to crate/realize-storage/build.rs and the package referenced
+   in hello.capnp must be changed to remove the storage:: prefix.
+
+4. rename realize-lib to realize-core. Build with "cargo check
+   --tests" and fix any issues.
 
 ## Use hash replacement chain in cache {#cachehash}
 
