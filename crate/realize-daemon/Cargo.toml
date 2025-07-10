@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 realize-lib = { path = "../realize-lib" }
+realize-types = { path = "../realize-types" }
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 env_logger = "0.11"

@@ -1,5 +1,5 @@
 use super::downloader::{Download, Downloader};
-use crate::model::UnixTime;
+use realize_types::UnixTime;
 use crate::storage::{FileMetadata, InodeAssignment, StorageError, UnrealCacheAsync};
 use async_trait::async_trait;
 use moka::future::Cache;
@@ -344,7 +344,7 @@ fn to_nfs_time(time: &UnixTime) -> nfstime3 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Hash, Path};
+    use realize_types::{Hash, Path};
     use crate::rpc::testing::HouseholdFixture;
     use crate::storage::Notification;
     use nfsserve::nfs::nfsstring;

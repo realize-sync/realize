@@ -4,8 +4,8 @@
 //! file operations, and in-process server/client utilities. It is robust to interruptions
 //! and supports secure, restartable sync.
 
-use crate::model;
-use crate::model::{Arena, ByteRange, Hash};
+use realize_types;
+use realize_types::{Arena, ByteRange, Hash};
 use crate::network::Server;
 use crate::rpc::realstore::metrics::{MetricsRealizeClient, MetricsRealizeServer};
 use crate::rpc::realstore::{
@@ -120,7 +120,7 @@ impl RealStoreService for RealStoreServer {
         self,
         _: tarpc::context::Context,
         arena: Arena,
-        relative_path: model::Path,
+        relative_path: realize_types::Path,
         range: ByteRange,
         options: RealStoreOptions,
     ) -> Result<Vec<u8>, RealStoreError> {
@@ -133,7 +133,7 @@ impl RealStoreService for RealStoreServer {
         self,
         _: tarpc::context::Context,
         arena: Arena,
-        relative_path: model::Path,
+        relative_path: realize_types::Path,
         range: ByteRange,
         data: Vec<u8>,
         options: RealStoreOptions,
@@ -147,7 +147,7 @@ impl RealStoreService for RealStoreServer {
         self,
         _: tarpc::context::Context,
         arena: Arena,
-        relative_path: model::Path,
+        relative_path: realize_types::Path,
         options: RealStoreOptions,
     ) -> Result<(), RealStoreError> {
         self.store.finish(&arena, &relative_path, &options).await
@@ -157,7 +157,7 @@ impl RealStoreService for RealStoreServer {
         self,
         _ctx: tarpc::context::Context,
         arena: Arena,
-        relative_path: model::Path,
+        relative_path: realize_types::Path,
         range: ByteRange,
         options: RealStoreOptions,
     ) -> Result<Hash, RealStoreError> {
@@ -170,7 +170,7 @@ impl RealStoreService for RealStoreServer {
         self,
         _ctx: tarpc::context::Context,
         arena: Arena,
-        relative_path: model::Path,
+        relative_path: realize_types::Path,
         options: RealStoreOptions,
     ) -> Result<(), RealStoreError> {
         self.store.delete(&arena, &relative_path, &options).await
@@ -180,10 +180,10 @@ impl RealStoreService for RealStoreServer {
         self,
         _ctx: tarpc::context::Context,
         arena: Arena,
-        relative_path: model::Path,
+        relative_path: realize_types::Path,
         range: ByteRange,
         options: RealStoreOptions,
-    ) -> Result<crate::model::Signature, RealStoreError> {
+    ) -> Result<realize_types::Signature, RealStoreError> {
         self.store
             .calculate_signature(&arena, &relative_path, &range, &options)
             .await
@@ -193,11 +193,11 @@ impl RealStoreService for RealStoreServer {
         self,
         _ctx: tarpc::context::Context,
         arena: Arena,
-        relative_path: model::Path,
+        relative_path: realize_types::Path,
         range: ByteRange,
-        signature: crate::model::Signature,
+        signature: realize_types::Signature,
         options: RealStoreOptions,
-    ) -> Result<(crate::model::Delta, Hash), RealStoreError> {
+    ) -> Result<(realize_types::Delta, Hash), RealStoreError> {
         self.store
             .diff(&arena, &relative_path, &range, signature, &options)
             .await
@@ -207,9 +207,9 @@ impl RealStoreService for RealStoreServer {
         self,
         _ctx: tarpc::context::Context,
         arena: Arena,
-        relative_path: model::Path,
+        relative_path: realize_types::Path,
         range: ByteRange,
-        delta: crate::model::Delta,
+        delta: realize_types::Delta,
         hash: Hash,
         options: RealStoreOptions,
     ) -> Result<(), RealStoreError> {
@@ -222,7 +222,7 @@ impl RealStoreService for RealStoreServer {
         self,
         _ctx: tarpc::context::Context,
         arena: Arena,
-        relative_path: model::Path,
+        relative_path: realize_types::Path,
         file_size: u64,
         options: RealStoreOptions,
     ) -> Result<(), RealStoreError> {

@@ -3,7 +3,7 @@ use tokio::task::LocalSet;
 use super::config::Config;
 use crate::fs::downloader::Downloader;
 use crate::fs::nfs;
-use crate::model::Arena;
+use realize_types::Arena;
 use crate::network::{Networking, Server};
 use crate::rpc::{Household, realstore};
 use crate::storage::Storage;

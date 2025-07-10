@@ -1,4 +1,4 @@
-use crate::model::Peer;
+use realize_types::Peer;
 use anyhow::Context as _;
 use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
@@ -349,7 +349,7 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Peer;
+    use realize_types::Peer;
     use crate::network;
     use crate::network::testing;
     use tarpc::context;

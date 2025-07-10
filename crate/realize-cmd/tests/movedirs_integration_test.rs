@@ -3,7 +3,7 @@ use assert_fs::fixture::ChildPath;
 use assert_fs::prelude::*;
 use assert_unordered::assert_eq_unordered;
 use hyper_util::rt::TokioIo;
-use realize_lib::model::{Arena, Peer};
+use realize_types::{Arena, Peer};
 use realize_lib::network::hostport::HostPort;
 use realize_lib::rpc::realstore;
 use realize_lib::network::security::{PeerVerifier, RawPublicKeyResolver};

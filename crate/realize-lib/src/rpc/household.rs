@@ -6,7 +6,7 @@ use super::store_capnp::store::{
 };
 use super::store_capnp::subscriber::{self, NotifyParams, NotifyResults};
 use super::store_capnp::{notification, read_callback, read_error};
-use crate::model::{self, Arena, Hash, Path, Peer, UnixTime};
+use realize_types::{self, Arena, Hash, Path, Peer, UnixTime};
 use crate::network::capnp::{ConnectionHandler, ConnectionManager, PeerStatus};
 use crate::network::{Networking, Server};
 use crate::storage::{Notification, Progress, Storage, StorageError, UnrealCacheAsync};
@@ -110,7 +110,7 @@ impl Household {
 enum HouseholdOperation {
     Read {
         arena: Arena,
-        path: model::Path,
+        path: realize_types::Path,
         offset: u64,
         limit: Option<u64>,
         tx: mpsc::Sender<Result<Vec<u8>, io::Error>>,
@@ -178,7 +178,7 @@ impl ConnectionHandler<connected_peer::Client, HouseholdOperation> for PeerConne
 async fn execute_read(
     client: Option<(Peer, connected_peer::Client)>,
     arena: Arena,
-    path: model::Path,
+    path: realize_types::Path,
     offset: u64,
     limit: Option<u64>,
     tx: mpsc::Sender<io::Result<Vec<u8>>>,
@@ -789,10 +789,10 @@ fn fill_add(
     mut builder: super::store_capnp::add::Builder<'_>,
     arena: &Arena,
     index: u64,
-    path: &crate::model::Path,
+    path: &realize_types::Path,
     size: u64,
-    mtime: &crate::model::UnixTime,
-    hash: &crate::model::Hash,
+    mtime: &realize_types::UnixTime,
+    hash: &realize_types::Hash,
 ) {
     builder.set_arena(arena.as_str());
     builder.set_index(index);
@@ -806,11 +806,11 @@ fn fill_replace(
     mut builder: super::store_capnp::replace::Builder<'_>,
     arena: &Arena,
     index: u64,
-    path: &crate::model::Path,
+    path: &realize_types::Path,
     size: u64,
-    mtime: &crate::model::UnixTime,
-    hash: &crate::model::Hash,
-    old_hash: &crate::model::Hash,
+    mtime: &realize_types::UnixTime,
+    hash: &realize_types::Hash,
+    old_hash: &realize_types::Hash,
 ) {
     builder.set_arena(arena.as_str());
     builder.set_index(index);
@@ -825,8 +825,8 @@ fn fill_remove(
     mut builder: super::store_capnp::remove::Builder<'_>,
     arena: &Arena,
     index: u64,
-    path: &crate::model::Path,
-    old_hash: &crate::model::Hash,
+    path: &realize_types::Path,
+    old_hash: &realize_types::Hash,
 ) {
     builder.set_arena(arena.as_str());
     builder.set_index(index);
@@ -837,10 +837,10 @@ fn fill_remove(
 fn fill_catchup(
     mut builder: super::store_capnp::catchup::Builder<'_>,
     arena: &Arena,
-    path: &crate::model::Path,
+    path: &realize_types::Path,
     size: u64,
-    mtime: &crate::model::UnixTime,
-    hash: &crate::model::Hash,
+    mtime: &realize_types::UnixTime,
+    hash: &realize_types::Hash,
 ) {
     builder.set_arena(arena.as_str());
     builder.set_path(path.as_str());
@@ -851,7 +851,7 @@ fn fill_catchup(
 
 fn fill_time(
     mut mtime_builder: super::store_capnp::time::Builder<'_>,
-    mtime: &crate::model::UnixTime,
+    mtime: &realize_types::UnixTime,
 ) {
     mtime_builder.set_secs(mtime.as_secs());
     mtime_builder.set_nsecs(mtime.subsec_nanos());
@@ -948,7 +948,7 @@ mod tests {
                 let stream = household_a.read(
                     vec![b.clone()],
                     HouseholdFixture::test_arena(),
-                    model::Path::parse("bar.txt")?,
+                    realize_types::Path::parse("bar.txt")?,
                     0,
                     None,
                 )?;
@@ -958,7 +958,7 @@ mod tests {
                 let stream = household_a.read(
                     vec![b.clone()],
                     HouseholdFixture::test_arena(),
-                    model::Path::parse("bar.txt")?,
+                    realize_types::Path::parse("bar.txt")?,
                     2,
                     None,
                 )?;
@@ -968,7 +968,7 @@ mod tests {
                 let stream = household_a.read(
                     vec![b.clone()],
                     HouseholdFixture::test_arena(),
-                    model::Path::parse("bar.txt")?,
+                    realize_types::Path::parse("bar.txt")?,
                     0,
                     Some(2),
                 )?;

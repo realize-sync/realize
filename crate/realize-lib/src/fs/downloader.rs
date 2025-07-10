@@ -1,4 +1,4 @@
-use crate::model::{Arena, ByteRange, Path, Peer};
+use realize_types::{Arena, ByteRange, Path, Peer};
 use crate::rpc::Household;
 use crate::storage::{StorageError, UnrealCacheAsync};
 use futures::Future;
@@ -246,7 +246,7 @@ impl AsyncRead for Download {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Path;
+    use realize_types::Path;
     use crate::rpc::testing::HouseholdFixture;
     use std::io::Write as _;
     use tokio::fs;

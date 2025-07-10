@@ -8,7 +8,7 @@ use indicatif::HumanBytes;
 use progress::CliProgress;
 use prometheus::{IntCounter, register_int_counter};
 use realize_lib::logic::consensus::movedirs::MoveFileError;
-use realize_lib::model::{Arena, Peer};
+use realize_types::{Arena, Peer};
 use realize_lib::network::Networking;
 use realize_lib::network::config::PeerConfig;
 use realize_lib::rpc::realstore;

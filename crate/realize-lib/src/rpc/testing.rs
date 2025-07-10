@@ -1,5 +1,5 @@
 use super::Household;
-use crate::model::{Arena, Peer};
+use realize_types::{Arena, Peer};
 use crate::network::Server;
 use crate::network::capnp::PeerStatus;
 use crate::network::hostport::HostPort;

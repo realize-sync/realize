@@ -1,4 +1,4 @@
-use crate::model::Peer;
+use realize_types::Peer;
 use crate::network::Networking;
 use crate::network::reconnect::{Connect, Reconnect};
 use crate::rpc::realstore;
@@ -160,7 +160,7 @@ impl Stub for RealizeStub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Arena, Peer};
+    use realize_types::{Arena, Peer};
     use crate::network::hostport::HostPort;
     use crate::rpc::realstore::Config;
     use crate::network::security::{PeerVerifier, RawPublicKeyResolver};

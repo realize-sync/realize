@@ -4,8 +4,8 @@
 //! rsync-based partial transfer, progress reporting, and error handling. It operates
 //! over the RealStoreService trait and is designed to be robust and restartable.
 
-use crate::model;
-use crate::model::{Arena, ByteRange, ByteRanges};
+use realize_types;
+use realize_types::{Arena, ByteRange, ByteRanges};
 use crate::rpc::realstore::{
     RangedHash, RealStoreServiceClient, RealStoreServiceRequest, RealStoreServiceResponse,
 };
@@ -101,39 +101,39 @@ pub enum ProgressEvent {
     /// Indicates a file is being processed (start), with its path and size.
     MovingFile {
         arena: Arena,
-        path: model::Path,
+        path: realize_types::Path,
         bytes: u64,
 
         /// Bytes already available, to be r-synced.
         available: u64,
     },
     /// File is being verified (hash check).
-    VerifyingFile { arena: Arena, path: model::Path },
+    VerifyingFile { arena: Arena, path: realize_types::Path },
     /// File is being rsynced (diff/patch).
-    RsyncingFile { arena: Arena, path: model::Path },
+    RsyncingFile { arena: Arena, path: realize_types::Path },
     /// File is being copied (data transfer).
-    CopyingFile { arena: Arena, path: model::Path },
+    CopyingFile { arena: Arena, path: realize_types::Path },
     /// File is waiting its turn to be copied.
-    PendingFile { arena: Arena, path: model::Path },
+    PendingFile { arena: Arena, path: realize_types::Path },
     /// Increment byte count for a file and overall progress.
     IncrementByteCount {
         arena: Arena,
-        path: model::Path,
+        path: realize_types::Path,
         bytecount: u64,
     },
     /// Decrement byte count for a file and overall progress, when
     /// retrying a range previously assumed to be correct.
     DecrementByteCount {
         arena: Arena,
-        path: model::Path,
+        path: realize_types::Path,
         bytecount: u64,
     },
     /// File was moved successfully.
-    FileSuccess { arena: Arena, path: model::Path },
+    FileSuccess { arena: Arena, path: realize_types::Path },
     /// Moving the file failed.
     FileError {
         arena: Arena,
-        path: model::Path,
+        path: realize_types::Path,
         error: String,
     },
 }
@@ -443,7 +443,7 @@ where
 async fn rsync_file_range<T, U>(
     ctx: tarpc::context::Context,
     arena: &Arena,
-    path: &model::Path,
+    path: &realize_types::Path,
     src: &RealStoreServiceClient<T>,
     dst: &RealStoreServiceClient<U>,
     progress_tx: &Option<Sender<ProgressEvent>>,
@@ -527,7 +527,7 @@ where
 async fn copy_file_range<T, U>(
     ctx: tarpc::context::Context,
     arena: &Arena,
-    path: &model::Path,
+    path: &realize_types::Path,
     src: &RealStoreServiceClient<T>,
     dst: &RealStoreServiceClient<U>,
     progress_tx: &Option<Sender<ProgressEvent>>,
@@ -589,7 +589,7 @@ where
 async fn report_pending(
     progress_tx: &Option<Sender<ProgressEvent>>,
     arena: &Arena,
-    path: &model::Path,
+    path: &realize_types::Path,
 ) {
     if let Some(tx) = progress_tx {
         let _ = tx
@@ -604,7 +604,7 @@ async fn report_pending(
 async fn report_copying(
     progress_tx: &Option<Sender<ProgressEvent>>,
     arena: &Arena,
-    path: &model::Path,
+    path: &realize_types::Path,
 ) {
     if let Some(tx) = progress_tx {
         let _ = tx
@@ -619,7 +619,7 @@ async fn report_copying(
 async fn report_rsyncing(
     progress_tx: &Option<Sender<ProgressEvent>>,
     arena: &Arena,
-    path: &model::Path,
+    path: &realize_types::Path,
 ) {
     if let Some(tx) = progress_tx {
         let _ = tx
@@ -634,7 +634,7 @@ async fn report_rsyncing(
 async fn report_verifying(
     progress_tx: &Option<Sender<ProgressEvent>>,
     arena: &Arena,
-    path: &model::Path,
+    path: &realize_types::Path,
 ) {
     if let Some(tx) = progress_tx {
         let _ = tx
@@ -649,7 +649,7 @@ async fn report_verifying(
 async fn report_increment_bytecount(
     progress_tx: &Option<Sender<ProgressEvent>>,
     arena: &Arena,
-    path: &model::Path,
+    path: &realize_types::Path,
     bytecount: u64,
 ) {
     if bytecount == 0 {
@@ -669,7 +669,7 @@ async fn report_increment_bytecount(
 async fn report_decrement_bytecount(
     progress_tx: &Option<Sender<ProgressEvent>>,
     arena: &Arena,
-    path: &model::Path,
+    path: &realize_types::Path,
     bytecount: u64,
 ) {
     if bytecount == 0 {
@@ -691,7 +691,7 @@ pub(crate) async fn hash_file<T>(
     ctx: tarpc::context::Context,
     client: &RealStoreServiceClient<T>,
     arena: &Arena,
-    relative_path: &model::Path,
+    relative_path: &realize_types::Path,
     file_size: u64,
     chunk_size: u64,
     options: RealStoreOptions,
@@ -744,7 +744,7 @@ async fn check_hashes_and_delete<T, U>(
     src: &RealStoreServiceClient<T>,
     dst: &RealStoreServiceClient<U>,
     arena: &Arena,
-    path: &model::Path,
+    path: &realize_types::Path,
 ) -> Result<HashCheck, MoveFileError>
 where
     T: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse>,
@@ -788,7 +788,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Arena, Hash};
+    use realize_types::{Arena, Hash};
     use crate::rpc::realstore::server::{self};
     use crate::storage::RealStore;
     use assert_fs::TempDir;
@@ -839,30 +839,30 @@ mod tests {
                 },
                 MovingFile {
                     arena: Arena::from("testdir"),
-                    path: model::Path::parse("foo")?,
+                    path: realize_types::Path::parse("foo")?,
                     bytes: 3,
                     available: 0
                 },
                 PendingFile {
                     arena: Arena::from("testdir"),
-                    path: model::Path::parse("foo")?
+                    path: realize_types::Path::parse("foo")?
                 },
                 CopyingFile {
                     arena: Arena::from("testdir"),
-                    path: model::Path::parse("foo")?
+                    path: realize_types::Path::parse("foo")?
                 },
                 IncrementByteCount {
                     arena: Arena::from("testdir"),
-                    path: model::Path::parse("foo")?,
+                    path: realize_types::Path::parse("foo")?,
                     bytecount: 3
                 },
                 VerifyingFile {
                     arena: Arena::from("testdir"),
-                    path: model::Path::parse("foo")?
+                    path: realize_types::Path::parse("foo")?
                 },
                 FileSuccess {
                     arena: Arena::from("testdir"),
-                    path: model::Path::parse("foo")?
+                    path: realize_types::Path::parse("foo")?
                 },
             ],
             events
@@ -914,30 +914,30 @@ mod tests {
                 },
                 MovingFile {
                     arena: Arena::from("testdir"),
-                    path: model::Path::parse("foo")?,
+                    path: realize_types::Path::parse("foo")?,
                     bytes: 9,
                     available: 3
                 },
                 PendingFile {
                     arena: Arena::from("testdir"),
-                    path: model::Path::parse("foo")?
+                    path: realize_types::Path::parse("foo")?
                 },
                 CopyingFile {
                     arena: Arena::from("testdir"),
-                    path: model::Path::parse("foo")?
+                    path: realize_types::Path::parse("foo")?
                 },
                 IncrementByteCount {
                     arena: Arena::from("testdir"),
-                    path: model::Path::parse("foo")?,
+                    path: realize_types::Path::parse("foo")?,
                     bytecount: 6
                 },
                 VerifyingFile {
                     arena: Arena::from("testdir"),
-                    path: model::Path::parse("foo")?
+                    path: realize_types::Path::parse("foo")?
                 },
                 FileSuccess {
                     arena: Arena::from("testdir"),
-                    path: model::Path::parse("foo")?
+                    path: realize_types::Path::parse("foo")?
                 },
             ],
             events
@@ -989,48 +989,48 @@ mod tests {
                 },
                 MovingFile {
                     arena: Arena::from("testdir"),
-                    path: model::Path::parse("foo")?,
+                    path: realize_types::Path::parse("foo")?,
                     bytes: 9,
                     available: 3
                 },
                 PendingFile {
                     arena: Arena::from("testdir"),
-                    path: model::Path::parse("foo")?
+                    path: realize_types::Path::parse("foo")?
                 },
                 CopyingFile {
                     arena: Arena::from("testdir"),
-                    path: model::Path::parse("foo")?
+                    path: realize_types::Path::parse("foo")?
                 },
                 IncrementByteCount {
                     arena: Arena::from("testdir"),
-                    path: model::Path::parse("foo")?,
+                    path: realize_types::Path::parse("foo")?,
                     bytecount: 6
                 },
                 VerifyingFile {
                     arena: Arena::from("testdir"),
-                    path: model::Path::parse("foo")?
+                    path: realize_types::Path::parse("foo")?
                 },
                 DecrementByteCount {
                     arena: Arena::from("testdir"),
-                    path: model::Path::parse("foo")?,
+                    path: realize_types::Path::parse("foo")?,
                     bytecount: 9
                 },
                 RsyncingFile {
                     arena: Arena::from("testdir"),
-                    path: model::Path::parse("foo")?
+                    path: realize_types::Path::parse("foo")?
                 },
                 IncrementByteCount {
                     arena: Arena::from("testdir"),
-                    path: model::Path::parse("foo")?,
+                    path: realize_types::Path::parse("foo")?,
                     bytecount: 9
                 },
                 VerifyingFile {
                     arena: Arena::from("testdir"),
-                    path: model::Path::parse("foo")?
+                    path: realize_types::Path::parse("foo")?
                 },
                 FileSuccess {
                     arena: Arena::from("testdir"),
-                    path: model::Path::parse("foo")?
+                    path: realize_types::Path::parse("foo")?
                 },
             ],
             events
@@ -1253,7 +1253,7 @@ mod tests {
             tarpc::context::current(),
             &server,
             &arena,
-            &model::Path::parse("somefile")?,
+            &realize_types::Path::parse("somefile")?,
             content.len() as u64,
             HASH_FILE_CHUNK,
             RealStoreOptions::default(),
@@ -1287,7 +1287,7 @@ mod tests {
             tarpc::context::current(),
             &server,
             &arena,
-            &model::Path::parse("somefile")?,
+            &realize_types::Path::parse("somefile")?,
             content.len() as u64,
             4,
             RealStoreOptions::default(),
@@ -1321,7 +1321,7 @@ mod tests {
             tarpc::context::current(),
             &server,
             &arena,
-            &model::Path::parse("somefile")?,
+            &realize_types::Path::parse("somefile")?,
             8,
             4,
             RealStoreOptions::default(),

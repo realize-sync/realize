@@ -11,7 +11,7 @@
 //! realize_lib::rpc::realstore::metrics::export_metrics("127.0.0.1:9000");
 //! ```
 
-use crate::model::ByteRange;
+use realize_types::ByteRange;
 use crate::rpc::realstore::{RealStoreServiceRequest, RealStoreServiceResponse};
 use crate::storage::RealStoreError;
 use hyper::server::conn::http1;

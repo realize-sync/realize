@@ -5,8 +5,8 @@ use nfs3_client::tokio::TokioConnector;
 use nfs3_types::nfs3::{Nfs3Result, READDIR3args};
 use predicates::prelude::*;
 use realize_lib::logic::config::Config;
-use realize_lib::model;
-use realize_lib::model::{Arena, Peer};
+use realize_types;
+use realize_types::{Arena, Peer};
 use realize_lib::network::Networking;
 use realize_lib::network::config::PeerConfig;
 use realize_lib::rpc::realstore;
@@ -152,7 +152,7 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
         .await??;
     assert_unordered::assert_eq_unordered!(
         files.into_iter().map(|f| f.path).collect(),
-        vec![model::Path::parse("foo.txt")?]
+        vec![realize_types::Path::parse("foo.txt")?]
     );
 
     // Kill to make sure stderr ends
