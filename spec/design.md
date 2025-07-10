@@ -255,7 +255,7 @@ a file, but only for a time (how long?)
 └──────────────────────┴─────────────────────────────────────────┘
   │
   │  ┌───────────────────────────────────────────────────────────┐
-p │  │ RPC and Consensus                                         │  Logic layer
+p │  │ RPC and Consensus                                         │  Core layer
 a │  └───────────────────────────────────────────────────────────┘
 s │
 s │  ┌─────────────────────────────┐  ┌──────────────────────────┐
@@ -284,43 +284,30 @@ crate/
 │                                  │
 ├── realize─daemon/                │     Background process (RPC + Fuse)
 │                                  └─
-└── realize─lib/
-    │
-    └─ src/
-       │                           ┌─
-       ├─ fs/                      │ Filesystem Layer
-       │                           └─
-       │                           ┌─
-       ├─ consensus/               │ Logic Layer
-       │                           │
-       ├─ rpc/                     │     Bridging local and remote data
-       │  │                        │
-       │  └─ houshold/             │     Remote peer definition and state
-       │                           └─
-       │
-       │                           ┌─
-       ├─ network/                 │ Network Layer
-       │  │                        │
-       │  ├─ tcp.rs                │     TCP transport for TARPC
-       │  │                        │
-       │  ├─ reconnect.rs          │     TCP service clients
-       │  │                        │
-       │  ├─ capnp.rs              │     Cap' Proto RPC connections
-       │  │                        │
-       │  └─ security.rs           │     TLS and authorization (peer list)
-       │                           └─
-       │
-       │                           ┌─
-       ├─ storage/                 │ Storage Layer
-       │  │                        │
-       │  ├─ real/                 │     Data stored locally as files, redb index
-       │  │                        │
-       │  └─ unreal/               │     Cached remote data on disk and redbp
-       │                           └─
-       │
-       ├─ model/                   Types shared across layers
-       │
-       └─ util/                    Random layer-agnostic utilities
+├── realize─types/                   Shared types across all layers
+│                                  ┌─
+├── realize─network/               │ Network Layer
+│  └─ src/                         │
+│     ├─ tcp.rs                    │       TCP transport for TARPC
+│     ├─ reconnect.rs              │       TCP service clients
+│     ├─ capnp.rs                  │       Cap' Proto RPC connections
+│     └─ security.rs               │       TLS and authorization (peer list)
+│                                  └─
+│                                  ┌─
+├── realize─storage/               │ Storage Layer
+│  └─ src/                         │
+│     ├─ real/                     │       Data stored locally as files, redb index
+│     └─ unreal/                   │       Cached remote data on disk and redb
+│                                  └─
+│                                  ┌─
+└── realize─core/                  │ Core Layer
+   └─ src/                         │
+      ├─ fs/                       │         Filesystem Layer
+      ├─ consensus/                │         Consensus and sync logic
+      ├─ rpc/                      │         Bridging local and remote data
+      │  └─ household/             │             Remote peer definition and state
+      └─ utils/                    │         Random utilities
+                                   └─
 
 ```
 
