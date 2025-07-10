@@ -90,7 +90,6 @@ where
             let broadcast_tx = broadcast_tx.clone();
 
             async move {
-                log::debug!("=== manager start ");
                 let ctx = AppContext::new(networking, handler, broadcast_tx);
                 while let Some(conn) = rx.recv().await {
                     match conn {
@@ -105,7 +104,6 @@ where
                         }
                     }
                 }
-                log::debug!("=== manager end");
             }
         });
 
