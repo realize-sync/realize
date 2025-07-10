@@ -1,5 +1,5 @@
 use realize_network::config::NetworkConfig;
-use crate::storage::config::StorageConfig;
+use realize_storage::config::StorageConfig;
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct Config {

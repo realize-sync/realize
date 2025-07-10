@@ -1,6 +1,6 @@
 use super::downloader::{Download, Downloader};
 use realize_types::UnixTime;
-use crate::storage::{FileMetadata, InodeAssignment, StorageError, UnrealCacheAsync};
+use realize_storage::{FileMetadata, InodeAssignment, StorageError, UnrealCacheAsync};
 use async_trait::async_trait;
 use moka::future::Cache;
 use nfsserve::nfs::{
@@ -346,7 +346,7 @@ mod tests {
     use super::*;
     use realize_types::{Hash, Path};
     use crate::rpc::testing::HouseholdFixture;
-    use crate::storage::Notification;
+    use realize_storage::Notification;
     use nfsserve::nfs::nfsstring;
     use std::time::SystemTime;
     use tokio::fs;

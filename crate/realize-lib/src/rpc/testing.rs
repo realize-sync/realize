@@ -4,8 +4,8 @@ use realize_network::Server;
 use realize_network::capnp::PeerStatus;
 use realize_network::hostport::HostPort;
 use realize_network::testing::TestingPeers;
-use crate::storage::Storage;
-use crate::storage::{self, UnrealCacheAsync};
+use realize_storage::Storage;
+use realize_storage::{self, UnrealCacheAsync};
 use assert_fs::TempDir;
 use assert_fs::prelude::*;
 use std::collections::HashMap;
@@ -54,7 +54,7 @@ impl HouseholdFixture {
             HouseholdFixture::b(),
             HouseholdFixture::c(),
         ] {
-            let s = storage::testing::storage(
+            let s = realize_storage::testing::storage(
                 tempdir.child(peer.as_str()).path(),
                 [HouseholdFixture::test_arena()],
             )
@@ -105,7 +105,7 @@ impl HouseholdFixture {
 
     /// Path where files for the test arena of the given peer are stored.
     pub fn arena_root(&self, peer: &Peer) -> PathBuf {
-        storage::testing::arena_root(
+        realize_storage::testing::arena_root(
             self.tempdir.child(peer.as_str()).path(),
             &HouseholdFixture::test_arena(),
         )

@@ -9,7 +9,7 @@ use super::store_capnp::{notification, read_callback, read_error};
 use realize_types::{self, Arena, Hash, Path, Peer, UnixTime};
 use realize_network::capnp::{ConnectionHandler, ConnectionManager, PeerStatus};
 use realize_network::{Networking, Server};
-use crate::storage::{Notification, Progress, Storage, StorageError, UnrealCacheAsync};
+use realize_storage::{Notification, Progress, Storage, StorageError, UnrealCacheAsync};
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 use realize_storage::utils::holder::ByteConversionError;

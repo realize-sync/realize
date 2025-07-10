@@ -10,7 +10,7 @@ pub mod metrics;
 pub mod server;
 
 use realize_types::{self, Arena, ByteRange, ByteRanges, Delta, Hash, Signature};
-use crate::storage::{RealStoreError, RealStoreOptions, SyncedFile};
+use realize_storage::{RealStoreError, RealStoreOptions, SyncedFile};
 
 /// Configure a specific connection to a [RealStoreService] instance.
 ///

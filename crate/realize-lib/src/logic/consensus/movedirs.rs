@@ -9,7 +9,7 @@ use realize_types::{Arena, ByteRange, ByteRanges};
 use crate::rpc::realstore::{
     RangedHash, RealStoreServiceClient, RealStoreServiceRequest, RealStoreServiceResponse,
 };
-use crate::storage::{RealStoreError, RealStoreOptions, SyncedFile};
+use realize_storage::{RealStoreError, RealStoreOptions, SyncedFile};
 use futures::stream::StreamExt as _;
 use futures::{FutureExt, future};
 use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
@@ -790,7 +790,7 @@ mod tests {
     use super::*;
     use realize_types::{Arena, Hash};
     use crate::rpc::realstore::server::{self};
-    use crate::storage::RealStore;
+    use realize_storage::RealStore;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;

@@ -165,7 +165,7 @@ mod tests {
     use crate::rpc::realstore::Config;
     use realize_network::security::{PeerVerifier, RawPublicKeyResolver};
     use realize_network::{Server, testing};
-    use crate::storage::{RealStore, RealStoreOptions};
+    use realize_storage::{RealStore, RealStoreOptions};
     use crate::utils::async_utils::AbortOnDrop;
     use assert_fs::TempDir;
     use std::net::SocketAddr;

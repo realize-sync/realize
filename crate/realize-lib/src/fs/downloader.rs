@@ -1,6 +1,6 @@
 use realize_types::{Arena, ByteRange, Path, Peer};
 use crate::rpc::Household;
-use crate::storage::{StorageError, UnrealCacheAsync};
+use realize_storage::{StorageError, UnrealCacheAsync};
 use futures::Future;
 use std::cmp::min;
 use std::collections::VecDeque;

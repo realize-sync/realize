@@ -8,7 +8,7 @@ use realize_network::hostport::HostPort;
 use realize_lib::rpc::realstore;
 use realize_network::security::{PeerVerifier, RawPublicKeyResolver};
 use realize_network::{Networking, Server};
-use realize_lib::storage::RealStore;
+use realize_storage::RealStore;
 use rustls::pki_types::SubjectPublicKeyInfoDer;
 use rustls::pki_types::pem::PemObject;
 use std::fs;

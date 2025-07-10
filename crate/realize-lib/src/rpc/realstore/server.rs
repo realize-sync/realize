@@ -12,8 +12,8 @@ use crate::rpc::realstore::{
     Config, RealStoreService, RealStoreServiceClient, RealStoreServiceRequest,
     RealStoreServiceResponse,
 };
-use crate::storage::RealStoreOptions;
-use crate::storage::{RealStore, RealStoreError, SyncedFile};
+use realize_storage::RealStoreOptions;
+use realize_storage::{RealStore, RealStoreError, SyncedFile};
 use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
 use futures::StreamExt;

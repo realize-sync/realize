@@ -8,8 +8,8 @@ use realize_lib::logic::consensus::movedirs::{
 };
 use realize_types::Arena;
 use realize_lib::rpc::realstore::server::{self, InProcessRealStoreServiceClient};
-use realize_lib::storage::RealStore;
-use realize_lib::storage::RealStoreOptions;
+use realize_storage::RealStore;
+use realize_storage::RealStoreOptions;
 
 // Metric tests are kept in their own binary to avoid other test
 // running in parallel interfering with the counts.

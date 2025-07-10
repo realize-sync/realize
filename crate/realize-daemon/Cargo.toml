@@ -7,6 +7,7 @@ edition = "2024"
 realize-lib = { path = "../realize-lib" }
 realize-types = { path = "../realize-types" }
 realize-network = { path = "../realize-network" }
+realize-storage = { path = "../realize-storage" }
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 env_logger = "0.11"
@@ -22,7 +23,6 @@ futures-util = "0.3.31"
 toml = {version="0.8.23", features = ["parse"]}
 
 [dev-dependencies]
-realize-lib = { path = "../realize-lib", features = ["testing"]}
 assert_cmd = "2.0"
 assert_fs = "1.1"
 predicates = "3.1"
