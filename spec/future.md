@@ -23,18 +23,12 @@ Dependencies:
  - realize-daemon depends on realize-core
  - realize-command depends on realize-core
 
-One possible issue with splitting into multiple crates is with the testing odules, which are annotated with #[cfg(test)]. That won't work for sharing types. To solve this, do the following:
-- add a "testing" feature
-- make each testing module available if #[cfg(any(test, feature = "testing"))] so it is available locally when testing and available in other crates when the testing feature is enabled
-- crates that depend on other realize create should enable the testing feature of the dependent crate in development
-
 Task list:
 
-1. define a feature called "testing" and make all testing module available if test configuration is enabled or if the feature is enabled
-2. split realize-types out of realize-lib and add dependencies. Build with "cargo check --tests" and fix any issues. Some types marked "pub(crate)" might need to be turned into "pub"
-3. split realize-network out of realize-lib and add dependencies. Remember to enable the feature testing in dev dependencies, as realize-network exposes a testing module. Build with "cargo check --tests" and fix any issues.
-4. split realize-storage out of realize-lib, like in the previous step. Build with "cargo check --tests" and fix any issues.
-5. rename realize-lib to realize-core. Build with "cargo check --tests" and fix any issues.
+1. split realize-types out of realize-lib and add dependencies. Build with "cargo check --tests" and fix any issues. Some types marked "pub(crate)" might need to be turned into "pub"
+2. split realize-network out of realize-lib and add dependencies. Remember to enable the feature testing in dev dependencies, as realize-network exposes a testing module. Build with "cargo check --tests" and fix any issues.
+3. split realize-storage out of realize-lib, like in the previous step. Build with "cargo check --tests" and fix any issues.
+4. rename realize-lib to realize-core. Build with "cargo check --tests" and fix any issues.
 
 ## Use hash replacement chain in cache {#cachehash}
 

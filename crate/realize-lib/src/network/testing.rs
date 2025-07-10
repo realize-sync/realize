@@ -33,7 +33,7 @@ MCowBQYDK2VwAyEAJ7KIbhdPS2ESzYMeQXoqHJv8Vdmi+pJlkFChY8K+IVg=
 ///
 /// Generated from [client_private_key] with:
 ///   openssl pkey -in peer.key -pubout -out -
-pub(crate) fn client_public_key() -> SubjectPublicKeyInfoDer<'static> {
+pub fn client_public_key() -> SubjectPublicKeyInfoDer<'static> {
     SubjectPublicKeyInfoDer::from_pem_slice(CLIENT_PUBLIC_KEY_PEM)
         .expect("Invalid test client public key")
 }
@@ -42,7 +42,7 @@ pub(crate) fn client_public_key() -> SubjectPublicKeyInfoDer<'static> {
 ///
 /// Generated from [server_private_key] with:
 ///   openssl pkey -in peer.key -pubout -out -
-pub(crate) fn server_public_key() -> SubjectPublicKeyInfoDer<'static> {
+pub fn server_public_key() -> SubjectPublicKeyInfoDer<'static> {
     SubjectPublicKeyInfoDer::from_pem_slice(SERVER_PUBLIC_KEY_PEM)
         .expect("Invalid test server public key")
 }
@@ -51,7 +51,7 @@ pub(crate) fn server_public_key() -> SubjectPublicKeyInfoDer<'static> {
 ///
 /// Generated with:
 ///  openssl genpkey -algorithm ed25519 -out -
-pub(crate) fn server_private_key() -> PrivateKeyDer<'static> {
+pub fn server_private_key() -> PrivateKeyDer<'static> {
     PrivateKeyDer::from_pem_slice(
         br#"
 -----BEGIN PRIVATE KEY-----
@@ -66,7 +66,7 @@ MC4CAQAwBQYDK2VwBCIEIBde8kxon54UvlyvkcwIUf7mFR4SkBJGsstNAn2HzK1Y
 ///
 /// Generated with:
 ///  openssl genpkey -algorithm ed25519 -out -
-pub(crate) fn client_private_key() -> PrivateKeyDer<'static> {
+pub fn client_private_key() -> PrivateKeyDer<'static> {
     PrivateKeyDer::from_pem_slice(
         br#"
 -----BEGIN PRIVATE KEY-----
@@ -81,7 +81,7 @@ MC4CAQAwBQYDK2VwBCIEIPaGEL0B7EAMQb5anN+DTH0vZ/qI90AQpbwYuklDABpV
 ///
 /// Generated with:
 ///  openssl genpkey -algorithm ed25519 -out -
-pub(crate) fn other_private_key() -> PrivateKeyDer<'static> {
+pub fn other_private_key() -> PrivateKeyDer<'static> {
     PrivateKeyDer::from_pem_slice(
         br#"
 -----BEGIN PRIVATE KEY-----

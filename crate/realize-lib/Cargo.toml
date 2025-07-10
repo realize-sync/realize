@@ -3,9 +3,12 @@ name = "realize-lib"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+testing = ["dep:assert_fs", "dep:portpicker"]
+
 [dependencies]
 anyhow = "1.0"
-assert_unordered = "0.3"
+assert_fs = { version = "1.1", optional = true } # for feature = "testing"
 async-speed-limit = { version = "0.4.2", features = ["futures-timer","futures-core"] }
 async-trait = "0.1.88"
 async-walkdir = "2.1.0"
@@ -26,6 +29,7 @@ nfsserve = "0.10.2"
 nix = { version = "0.30.1", features = ["user"] }
 notify = "8.0.0"
 pathdiff = "0.2"
+portpicker = {version = "0.1", optional = true } # for feature = "testing"
 prometheus = { version = "0.14", features = [] }
 redb = "2.6.0"
 rustls = "0.23"
@@ -46,6 +50,7 @@ walkdir = "2.5"
 [dev-dependencies]
 assert_cmd = "2.0"
 assert_fs = "1.1"
+assert_unordered = "0.3"
 futures = "0.3"
 portpicker = "0.1"
 predicates = "3.1"

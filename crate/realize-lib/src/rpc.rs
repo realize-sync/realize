@@ -24,7 +24,7 @@ mod result_capnp {
 mod store_capnp {
     include!(concat!(env!("OUT_DIR"), "/rpc/store_capnp.rs"));
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
 pub use household::Household;

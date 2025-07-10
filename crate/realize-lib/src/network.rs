@@ -27,8 +27,8 @@ pub(crate) mod reconnect;
 pub mod security;
 
 pub mod capnp;
-#[cfg(test)]
-pub(crate) mod testing;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 #[derive(Clone)]
 pub struct Networking {

@@ -13,7 +13,7 @@ use crate::model::Arena;
 pub mod config;
 mod error;
 mod real;
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub mod testing;
 mod unreal;
 
