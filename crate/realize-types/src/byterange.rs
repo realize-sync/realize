@@ -13,7 +13,7 @@
 //! # Examples
 //!
 //! ```rust
-//! use realize_lib::model::ByteRange;
+//! use realize_types::ByteRange;
 //!
 //! let r1 = ByteRange::new(0, 10);
 //! let r2 = ByteRange::new(5, 15);

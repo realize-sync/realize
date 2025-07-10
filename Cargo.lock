@@ -2288,6 +2288,7 @@ dependencies = [
  "portpicker",
  "predicates",
  "prometheus",
+ "realize-types",
  "redb",
  "reqwest",
  "rustls",
@@ -2307,6 +2308,17 @@ dependencies = [
  "toml",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "realize-types"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "pathdiff",
+ "serde",
+ "thiserror 2.0.12",
 ]
 
 [[package]]

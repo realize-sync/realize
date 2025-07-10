@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crate/realize-types",
     "crate/realize-lib",
     "crate/realize-daemon",
     "crate/realize-cmd"

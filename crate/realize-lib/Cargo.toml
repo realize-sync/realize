@@ -7,6 +7,7 @@ edition = "2024"
 testing = ["dep:assert_fs", "dep:portpicker"]
 
 [dependencies]
+realize-types = { path = "../realize-types" }
 anyhow = "1.0"
 assert_fs = { version = "1.1", optional = true } # for feature = "testing"
 async-speed-limit = { version = "0.4.2", features = ["futures-timer","futures-core"] }
