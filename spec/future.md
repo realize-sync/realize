@@ -36,37 +36,6 @@ Task list:
 4. split realize-storage out of realize-lib, like in the previous step. Build with "cargo check --tests" and fix any issues.
 5. rename realize-lib to realize-core. Build with "cargo check --tests" and fix any issues.
 
-## Have Downloader use Houshold::read {#newdl}
-
-The `Downloader`, defined in
-[downloader.rs](../crate/realize-lib/src/fs/downloader.rs) currently
-uses the legacy tarpc RPC system to download files. The goal of this
-task is to switch it to using the new Cap'n Proto based RPC system
-through Houshold, defined in
-[household.rs](../crate/realize-lib/src/rpc/household.rs)
-
-The `Downloader` should take a `Household` instance and call
-`Household::read` with the right offset and limit to read a chunk of
-data. `Household` takes care of tracking the connections, so no need
-of a `Networking` instance to connect or cache connections anymore;
-just pass the right set of peers to `Household::read`.
-
-Task list:
-
-1. Refactor Download to work on `Household` and *update all uses of
-   Download* in `crate/realize-lib/src/logic/setup.rs` and
-   `crate/realize-lib/src/fs/nfs.rs`. Make sure it all compiles by running
-   `cargo check --lib`
-
-2. Update test utilities that use downloader,
-   `crate/realize-lib/src/fs/nfs.rs` and
-   `crate/realize-lib/tests/common/mountpoint.rs` and make sure
-   everything compiles with `cargo check --lib`
-
-3. Run all unit tests with `cargo test --lib` make sure everything passes.
-
-4. Run all tests with `cargo test` make sure everything passes.
-
 ## Use hash replacement chain in cache {#cachehash}
 
 Currently, if a file is available in multiple peers, the cache returns
