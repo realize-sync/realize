@@ -8,7 +8,7 @@
 //!
 //! To export metrics on an HTTP endpoint:
 //! ```rust
-//! realize_lib::rpc::realstore::metrics::export_metrics("127.0.0.1:9000");
+//! realize_core::rpc::realstore::metrics::export_metrics("127.0.0.1:9000");
 //! ```
 
 use realize_types::ByteRange;

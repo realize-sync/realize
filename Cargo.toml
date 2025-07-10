@@ -3,7 +3,7 @@ resolver = "3"
 members = [
     "crate/realize-cmd",
     "crate/realize-daemon",
-    "crate/realize-lib",
+    "crate/realize-core",
     "crate/realize-network",
     "crate/realize-storage",
     "crate/realize-types",

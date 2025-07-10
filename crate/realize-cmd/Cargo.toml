@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-realize-lib = { path = "../realize-lib" }
+realize-core = { path = "../realize-core" }
 realize-types = { path = "../realize-types" }
 realize-network = { path = "../realize-network" }
 realize-storage = { path = "../realize-storage" }

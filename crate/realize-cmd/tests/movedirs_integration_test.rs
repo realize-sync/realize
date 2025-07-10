@@ -5,7 +5,7 @@ use assert_unordered::assert_eq_unordered;
 use hyper_util::rt::TokioIo;
 use realize_types::{Arena, Peer};
 use realize_network::hostport::HostPort;
-use realize_lib::rpc::realstore;
+use realize_core::rpc::realstore;
 use realize_network::security::{PeerVerifier, RawPublicKeyResolver};
 use realize_network::{Networking, Server};
 use realize_storage::RealStore;
@@ -476,7 +476,7 @@ async fn realize_metrics_export() -> anyhow::Result<()> {
         .arg(&realize_metrics_addr)
         .env(
             "RUST_LOG",
-            "realize_lib::rpc::realstore::metrics=debug",
+            "realize_core::rpc::realstore::metrics=debug",
         )
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
@@ -521,7 +521,7 @@ async fn realize_metrics_export() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn realize_metrics_pushgateway() -> anyhow::Result<()> {
-    use realize_lib::utils::async_utils::AbortOnDrop;
+    use realize_core::utils::async_utils::AbortOnDrop;
 
     // A fake pushgateway that expect one specific request and then
     // dies.

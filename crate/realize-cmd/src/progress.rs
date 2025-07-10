@@ -1,9 +1,9 @@
 use console::style;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use realize_lib::logic::consensus::movedirs::ProgressEvent;
+use realize_core::logic::consensus::movedirs::ProgressEvent;
 use realize_types;
 use realize_types::Arena;
-use realize_lib::rpc::realstore::client::ClientConnectionState;
+use realize_core::rpc::realstore::client::ClientConnectionState;
 use std::collections::HashMap;
 use tokio::sync::mpsc::Receiver;
 

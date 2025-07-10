@@ -7,14 +7,14 @@ use futures_util::stream::StreamExt as _;
 use indicatif::HumanBytes;
 use progress::CliProgress;
 use prometheus::{IntCounter, register_int_counter};
-use realize_lib::logic::consensus::movedirs::MoveFileError;
+use realize_core::logic::consensus::movedirs::MoveFileError;
 use realize_types::{Arena, Peer};
 use realize_network::Networking;
 use realize_network::config::PeerConfig;
-use realize_lib::rpc::realstore;
-use realize_lib::rpc::realstore::client::{ClientConnectionState, ClientOptions};
-use realize_lib::rpc::realstore::metrics;
-use realize_lib::utils::logging;
+use realize_core::rpc::realstore;
+use realize_core::rpc::realstore::client::{ClientConnectionState, ClientOptions};
+use realize_core::rpc::realstore::metrics;
+use realize_core::utils::logging;
 use signal_hook_tokio::Signals;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -248,7 +248,7 @@ async fn run_with_progress(
             let mut total_error = 0;
             let mut total_interrupted = 0;
             let mut interrupted = false;
-            let result = realize_lib::logic::consensus::movedirs::move_dirs(
+            let result = realize_core::logic::consensus::movedirs::move_dirs(
                 ctx,
                 &src_client,
                 &dst_client,
@@ -366,7 +366,7 @@ async fn configure_limit(
     let config = client
         .configure(
             context::current(),
-            realize_lib::rpc::realstore::Config {
+            realize_core::rpc::realstore::Config {
                 write_limit: Some(limit),
             },
         )

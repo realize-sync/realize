@@ -2201,7 +2201,7 @@ dependencies = [
  "pathdiff",
  "predicates",
  "prometheus",
- "realize-lib",
+ "realize-core",
  "realize-network",
  "realize-storage",
  "realize-types",
@@ -2218,43 +2218,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "realize-daemon"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "assert_fs",
- "assert_unordered",
- "clap",
- "env_logger",
- "futures-util",
- "lazy_static",
- "log",
- "nfs3_client",
- "nfs3_types",
- "nix",
- "portpicker",
- "predicates",
- "prometheus",
- "realize-lib",
- "realize-network",
- "realize-storage",
- "realize-types",
- "reqwest",
- "rustls",
- "serde",
- "signal-hook",
- "signal-hook-tokio",
- "tarpc",
- "tempfile",
- "test-tag",
- "tokio",
- "tokio-retry",
- "toml",
-]
-
-[[package]]
-name = "realize-lib"
+name = "realize-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2299,6 +2263,42 @@ dependencies = [
  "toml",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "realize-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "assert_fs",
+ "assert_unordered",
+ "clap",
+ "env_logger",
+ "futures-util",
+ "lazy_static",
+ "log",
+ "nfs3_client",
+ "nfs3_types",
+ "nix",
+ "portpicker",
+ "predicates",
+ "prometheus",
+ "realize-core",
+ "realize-network",
+ "realize-storage",
+ "realize-types",
+ "reqwest",
+ "rustls",
+ "serde",
+ "signal-hook",
+ "signal-hook-tokio",
+ "tarpc",
+ "tempfile",
+ "test-tag",
+ "tokio",
+ "tokio-retry",
+ "toml",
 ]
 
 [[package]]

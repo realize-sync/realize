@@ -5,7 +5,7 @@
 //! # Example
 //!
 //! ```rust
-//! use realize_lib::utils::async_utils::AbortOnDrop;
+//! use realize_core::utils::async_utils::AbortOnDrop;
 //! use tokio::task;
 //!
 //! # fn do_something() {}
