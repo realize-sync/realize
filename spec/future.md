@@ -3,31 +3,6 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
-## Use hash replacement chain in cache {#cachehash}
-
-Currently, if a file is available in multiple peers, the cache returns
-one of the most recent ones. This logic predates hashes.
-
-With hashes, it should be possible for a pair of hashes A and B,
-looking at the peers chain of hashs reported by hash and replace,
-whether hash A replaces hash B.
-
-If we have, for example:
-
- - peer1: add(hash A), replace(hash B, hash A)
- - peer2: add(hash A)
-
-then we know that we should return hash B.
-
-This information might be taken into account at write time.
-
-It's only in the case of catchups that this information might not be
-available. Possibly it should be made available in a best-effort basis
-(in case the history table was trimmed), by going through the list of
-replace and reporting them during catchup.
-
-TBD detailed task list
-
 ## Remove path from FileContent {#cachepath}
 
 `FileContent`, defined in
