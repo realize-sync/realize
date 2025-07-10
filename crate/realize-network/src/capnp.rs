@@ -15,10 +15,12 @@ use tokio::task::{JoinHandle, LocalSet};
 use tokio_retry::strategy::ExponentialBackoff;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
-use crate::model::Peer;
+use realize_types::Peer;
 
 use super::rate_limit::RateLimitedStream;
-use super::{Networking, Server};
+use crate::{Networking, Server};
+
+
 
 /// Connection status of a peer, broadcast by [ConnectionManager].
 #[derive(Clone, PartialEq, Debug)]
@@ -375,11 +377,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::hostport::HostPort;
-    use crate::network::testing::TestingPeers;
-    use crate::network::testing::hello_capnp::hello;
-    use crate::network::testing::hello_capnp::hello::HelloParams;
-    use crate::network::testing::hello_capnp::hello::HelloResults;
+    use crate::hostport::HostPort;
+    use crate::testing::TestingPeers;
+    use crate::testing::hello_capnp::hello;
+    use crate::testing::hello_capnp::hello::HelloParams;
+    use crate::testing::hello_capnp::hello::HelloResults;
     use capnp::capability::Promise;
     use capnp_rpc::RpcSystem;
     use capnp_rpc::pry;

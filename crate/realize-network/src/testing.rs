@@ -1,8 +1,7 @@
-use super::Networking;
 use super::config::PeerConfig;
 use super::hostport::HostPort;
 use super::security::{PeerVerifier, RawPublicKeyResolver};
-use crate::model::Peer;
+use realize_types::Peer;
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use std::collections::HashMap;
@@ -194,7 +193,7 @@ impl TestingPeers {
     /// Build a [Networking] instance for the given peer.
     ///
     /// Other peer public keys and addreses will be available.
-    pub fn networking(&self, peer: &Peer) -> anyhow::Result<Networking> {
+    pub fn networking(&self, peer: &Peer) -> anyhow::Result<crate::Networking> {
         let mut others = self.peers.clone();
         others.remove(peer);
 
@@ -212,7 +211,7 @@ impl TestingPeers {
             .filter(|(p, _)| **p != *peer)
             .map(|(p, hostport)| (p.clone(), hostport.to_string()))
             .collect::<Vec<_>>();
-        Ok(Networking::new(
+        Ok(crate::Networking::new(
             addresses.iter().map(|(p, addr)| (p, addr.as_ref())),
             resolver,
             verifier,
@@ -225,5 +224,5 @@ impl TestingPeers {
 #[allow(clippy::uninlined_format_args)]
 #[allow(clippy::extra_unused_type_parameters)]
 pub mod hello_capnp {
-    include!(concat!(env!("OUT_DIR"), "/network/testing/hello_capnp.rs"));
+    include!(concat!(env!("OUT_DIR"), "/testing/hello_capnp.rs"));
 }

@@ -129,7 +129,7 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
         .command()?
         .env(
             "RUST_LOG",
-            "realize_lib::network=debug,realize_daemon=debug",
+            "realize_network::network=debug,realize_daemon=debug",
         )
         .spawn()?;
 
@@ -301,7 +301,7 @@ async fn daemon_interrupted() -> anyhow::Result<()> {
         .command()?
         .env(
             "RUST_LOG",
-            "realize_lib::network::tcp=debug,realize_daemon=debug",
+            "realize_network::network::tcp=debug,realize_daemon=debug",
         )
         .spawn()?;
 

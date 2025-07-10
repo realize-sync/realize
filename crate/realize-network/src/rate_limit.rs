@@ -7,8 +7,9 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Apply the given bps limit on writes to this stream.
-pub(crate) struct RateLimitedStream<S, C = StandardClock>
+pub struct RateLimitedStream<S, C = StandardClock>
 where
+    S: AsyncRead + AsyncWrite + Unpin,
     C: Clock,
 {
     inner: S,
@@ -18,6 +19,7 @@ where
 
 impl<S, C> RateLimitedStream<S, C>
 where
+    S: AsyncRead + AsyncWrite + Unpin,
     C: Clock,
 {
     pub(crate) fn new(inner: S, limiter: Limiter<C>) -> Self {
@@ -31,7 +33,7 @@ where
 
 impl<S, C> AsyncRead for RateLimitedStream<S, C>
 where
-    S: AsyncRead + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
     C: Clock,
 {
     fn poll_read(
@@ -45,7 +47,7 @@ where
 
 impl<S, C> AsyncWrite for RateLimitedStream<S, C>
 where
-    S: AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
     C: Clock,
 {
     fn poll_write(
@@ -83,7 +85,12 @@ where
     // stream supports it; writes go through poll_write
 }
 
-impl<S: Unpin, C: Clock> Unpin for RateLimitedStream<S, C> {}
+impl<S, C> Unpin for RateLimitedStream<S, C>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    C: Clock,
+{
+}
 
 #[cfg(test)]
 mod tests {

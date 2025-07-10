@@ -1,5 +1,5 @@
 use super::config::PeerConfig;
-use crate::model::Peer;
+use realize_types::Peer;
 use anyhow::Context as _;
 use rustls::client::Resumption;
 use rustls::client::danger::ServerCertVerifier;
@@ -322,8 +322,7 @@ impl rustls::server::ResolvesServerCert for RawPublicKeyResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::testing;
-    use crate::utils::async_utils::AbortOnDrop;
+    use crate::testing;
     use rustls::pki_types::PrivateKeyDer;
     use rustls::pki_types::pem::PemObject as _;
     use rustls::sign::SigningKey;
@@ -498,7 +497,7 @@ mod tests {
     async fn test_connect_1(acceptor: TlsAcceptor, connector: TlsConnector) -> anyhow::Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
-        let handle: AbortOnDrop<anyhow::Result<()>> = AbortOnDrop::new(tokio::spawn(async move {
+        let handle: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await?;
 
             let mut tls = acceptor.accept(tcp).await?;
@@ -506,7 +505,7 @@ mod tests {
             tls.shutdown().await?;
 
             Ok(())
-        }));
+        });
 
         let tcp = TcpStream::connect(addr).await?;
         let domain = rustls::pki_types::ServerName::try_from("localhost")?;
@@ -515,7 +514,7 @@ mod tests {
         tls.read_exact(&mut buf).await?;
         assert_eq!(&buf, b"foobar");
 
-        handle.join().await??;
+        handle.await??;
         Ok(())
     }
 

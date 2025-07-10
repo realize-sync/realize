@@ -1,4 +1,4 @@
-use crate::model::Peer;
+use realize_types::Peer;
 use std::collections::HashMap;
 
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
@@ -22,7 +22,7 @@ impl NetworkConfig {
 
 /// Define a peer.
 ///
-/// A peer is identified by [crate::model::Peer].
+/// A peer is identified by [realize_types::Peer].
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
 pub struct PeerConfig {
     /// Address of the peer, if available.

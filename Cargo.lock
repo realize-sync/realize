@@ -2288,6 +2288,7 @@ dependencies = [
  "portpicker",
  "predicates",
  "prometheus",
+ "realize-network",
  "realize-types",
  "redb",
  "reqwest",
@@ -2308,6 +2309,32 @@ dependencies = [
  "toml",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "realize-network"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-speed-limit",
+ "capnp",
+ "capnp-rpc",
+ "capnpc",
+ "env_logger",
+ "futures",
+ "lazy_static",
+ "log",
+ "portpicker",
+ "prometheus",
+ "realize-types",
+ "rustls",
+ "scopeguard",
+ "serde",
+ "tarpc",
+ "tokio",
+ "tokio-retry",
+ "tokio-rustls",
+ "tokio-util",
 ]
 
 [[package]]
