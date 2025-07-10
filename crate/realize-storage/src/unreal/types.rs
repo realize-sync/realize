@@ -1,5 +1,5 @@
 use super::unreal_capnp;
-use crate::model::{self, Arena, Hash, Path, Peer, UnixTime};
+use realize_types::{self, Arena, Hash, Path, Peer, UnixTime};
 use crate::utils::holder::{ByteConversionError, ByteConvertible, NamedType};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
@@ -76,7 +76,7 @@ pub struct FileContent {
     ///
     /// This is stored here as a key to fetch file content,
     /// to be replaced by a blob id.
-    pub arena: model::Arena,
+    pub arena: realize_types::Arena,
 
     /// The path to use to fetch file content in the peer.
     ///
@@ -86,10 +86,10 @@ pub struct FileContent {
     ///
     /// This is stored here as a key to fetch file content,
     /// to be replaced by a blob id.
-    pub path: model::Path,
+    pub path: realize_types::Path,
 
     /// Hash of the specific version of the content the peer has.
-    pub hash: model::Hash,
+    pub hash: realize_types::Hash,
 }
 
 impl std::fmt::Debug for FileContent {

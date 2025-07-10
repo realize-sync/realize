@@ -6,10 +6,10 @@ use super::types::{
     DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry, InodeAssignment,
     PeerTableEntry, ReadDirEntry,
 };
-use crate::model::{Arena, Hash, Path, Peer, UnixTime};
-use crate::storage::StorageError;
-use crate::storage::config::StorageConfig;
-use crate::storage::real::notifier::{Notification, Progress};
+use realize_types::{Arena, Hash, Path, Peer, UnixTime};
+use crate::StorageError;
+use crate::config::StorageConfig;
+use crate::real::notifier::{Notification, Progress};
 use crate::utils::holder::Holder;
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
 use std::collections::HashMap;
@@ -1027,7 +1027,7 @@ fn do_rm_file_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Arena, Path, Peer};
+    use realize_types::{Arena, Path, Peer};
     use assert_fs::TempDir;
 
     const TEST_TIME: u64 = 1234567890;

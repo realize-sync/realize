@@ -4,23 +4,20 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-testing = ["dep:assert_fs", "dep:portpicker"]
+testing = ["dep:assert_fs"]
 
 [dependencies]
 realize-types = { path = "../realize-types" }
 realize-network = { path = "../realize-network" }
+realize-storage = { path = "../realize-storage" }
 anyhow = "1.0"
 assert_fs = { version = "1.1", optional = true } # for feature = "testing"
 async-speed-limit = { version = "0.4.2", features = ["futures-timer","futures-core"] }
 async-trait = "0.1.88"
-async-walkdir = "2.1.0"
-base64 = "0.22"
 bincode = "1.3.3"
-blake2 = "0.10.6"
 capnp = "0.21.1"
 capnp-rpc = "0.21.0"
 env_logger = "0.11"
-fast_rsync = "0.2"
 futures = "0.3"
 hyper = { version = "1.6", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -29,42 +26,36 @@ log = "0.4"
 moka = { version = "0.12.10", features = ["future"] }
 nfsserve = "0.10.2"
 nix = { version = "0.30.1", features = ["user"] }
-notify = "8.0.0"
 pathdiff = "0.2"
-portpicker = {version = "0.1", optional = true } # for feature = "testing"
 prometheus = { version = "0.14", features = [] }
-redb = "2.6.0"
 rustls = "0.23"
-scopeguard = "1.2.0"
 serde = {version = "1.0", features = ["derive"] }
-sha2 = "0.10"
 tarpc = { version = "0.36", features = ["serde1", "tokio1", "serde-transport", "serde-transport-bincode", "tcp"] }
 thiserror = "2.0"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "fs", "io-util"] }
 tokio-retry = "0.3.0"
 tokio-rustls = "0.26"
 tokio-stream = "0.1.17"
-tokio-util = { version = "0.7.15", features = ["compat"] }
 uuid = { version = "1.17.0", features = ["std", "v7"] }
 walkdir = "2.5"
 
-
 [dev-dependencies]
+realize-network = { path = "../realize-network", features = ["testing"] }
+realize-storage = { path = "../realize-storage", features = ["testing"] }
 assert_cmd = "2.0"
 assert_fs = "1.1"
 assert_unordered = "0.3"
 futures = "0.3"
+nix = { version = "0.30.1", features = ["fs"] }
 portpicker = "0.1"
 predicates = "3.1"
+redb = { version = "2.6.0", features = ["logging"] }
 reqwest = "0.12"
 serial_test = "3.2.0"
 tempfile = "3.20"
 test-tag = "0.1"
 tokio = { version = "1", features = ["process"] }
-redb = { version = "2.6.0", features = ["logging"] }
-nix = { version = "0.30.1", features = ["fs"] }
 toml = { version = "0.8.23", features = ["display", "parse"] }
-realize-network = { path = "../realize-network", features = ["testing"] }
 
 [build-dependencies]
 anyhow = "1.0"

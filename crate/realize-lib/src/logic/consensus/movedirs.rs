@@ -791,10 +791,10 @@ mod tests {
     use crate::model::{Arena, Hash};
     use crate::rpc::realstore::server::{self};
     use crate::storage::RealStore;
-    use crate::utils::hash;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
+    use realize_storage::utils::hash;
     use std::path::PathBuf;
     use walkdir::WalkDir;
 

@@ -2,10 +2,10 @@
 
 use super::hasher::{self, HashResult, Hasher};
 use super::index::RealIndexAsync;
-use crate::model::{self, UnixTime};
 use futures::StreamExt as _;
 use notify::event::{CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind};
 use notify::{Event, EventKind, RecommendedWatcher, Watcher as _};
+use realize_types::{self, UnixTime};
 use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
@@ -28,7 +28,7 @@ impl RealWatcher {
     /// Background work is also stopped at some point after the instance is dropped.
     pub async fn spawn(
         root: &std::path::Path,
-        exclude: Vec<model::Path>,
+        exclude: Vec<realize_types::Path>,
         index: RealIndexAsync,
     ) -> anyhow::Result<Self> {
         let root = fs::canonicalize(&root).await?;
@@ -56,7 +56,7 @@ impl RealWatcher {
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
         let (hashed_tx, hashed_rx) = mpsc::channel(128);
 
-        // Transform excluded path::Path into model::Path, when possible.
+        // Transform excluded path::Path into realize_types::Path, when possible.
         let worker = Arc::new(RealWatcherWorker {
             root,
             index,
@@ -121,7 +121,7 @@ struct RealWatcherWorker {
     /// Paths that should be excluded from the index. These may be
     /// files or directories. For directories, the whole directory
     /// content is excluded.
-    exclude: Vec<model::Path>,
+    exclude: Vec<realize_types::Path>,
 }
 
 impl RealWatcherWorker {
@@ -280,7 +280,7 @@ impl RealWatcherWorker {
 
     async fn hashed_loop(
         &self,
-        mut hashed_rx: mpsc::Receiver<(model::Path, std::io::Result<HashResult>)>,
+        mut hashed_rx: mpsc::Receiver<(realize_types::Path, std::io::Result<HashResult>)>,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) {
         loop {
@@ -351,7 +351,7 @@ impl RealWatcherWorker {
                 // directory; check both.
                 //
                 // Anything outside the root directory is ignored when
-                // converting to model::Path, so we don't bother
+                // converting to realize_types::Path, so we don't bother
                 // checking here.
 
                 for realpath in &ev.paths {
@@ -510,15 +510,15 @@ impl RealWatcherWorker {
         Ok(())
     }
 
-    /// Convert a full path to a [model::Path] within the arena, if possible.
-    fn to_model_path(&self, path: &std::path::Path) -> Option<model::Path> {
+    /// Convert a full path to a [realize_types::Path] within the arena, if possible.
+    fn to_model_path(&self, path: &std::path::Path) -> Option<realize_types::Path> {
         // TODO: Should this use a PathResolver? We may or may not want
         // to care about partial/full files here.
-        model::Path::from_real_path_in(&path, &self.root).ok()
+        realize_types::Path::from_real_path_in(&path, &self.root).ok()
     }
 
     /// Check whether the given path should be excluded from the index.
-    fn is_excluded(&self, path: &model::Path) -> bool {
+    fn is_excluded(&self, path: &realize_types::Path) -> bool {
         self.exclude.iter().any(|e| path.starts_with(e))
     }
 }
@@ -553,10 +553,10 @@ async fn only_regular(e: async_walkdir::DirEntry) -> async_walkdir::Filtering {
 mod tests {
     use std::time::Duration;
 
-    use crate::model::Hash;
-    use crate::storage::real::index::FileTableEntry;
+    use crate::real::index::{FileTableEntry, RealIndexBlocking};
+    use crate::realize_types::Arena;
     use crate::utils::hash;
-    use crate::{model::Arena, storage::real::index::RealIndexBlocking};
+    use realize_types::Hash;
 
     use super::*;
     use assert_fs::TempDir;
@@ -568,7 +568,7 @@ mod tests {
         index: RealIndexAsync,
         root: ChildPath,
         tempdir: TempDir,
-        exclude: Vec<model::Path>,
+        exclude: Vec<realize_types::Path>,
     }
 
     impl Fixture {
@@ -590,7 +590,7 @@ mod tests {
         }
 
         /// Add to the exclusion list of any future watcher.
-        fn exclude(&mut self, path: model::Path) {
+        fn exclude(&mut self, path: realize_types::Path) {
             self.exclude.push(path);
         }
 
@@ -636,7 +636,7 @@ mod tests {
 
         let mtime = UnixTime::mtime(&fs::metadata(foobar.path()).await?);
 
-        let path = model::Path::parse("foobar")?;
+        let path = realize_types::Path::parse("foobar")?;
         fixture.wait_for_history_event(1).await?;
         assert_eq!(
             Some(FileTableEntry {
@@ -659,7 +659,7 @@ mod tests {
 
         let mtime = UnixTime::mtime(&fs::metadata(foobar.path()).await?);
 
-        let path = model::Path::parse("foobar")?;
+        let path = realize_types::Path::parse("foobar")?;
         fixture.wait_for_history_event(1).await?;
         assert_eq!(
             Some(FileTableEntry {
@@ -680,7 +680,7 @@ mod tests {
         let foobar = fixture.root.child("foobar");
         foobar.write_str("test")?;
 
-        let path = model::Path::parse("foobar")?;
+        let path = realize_types::Path::parse("foobar")?;
         fixture.wait_for_history_event(1).await?;
         assert!(fixture.index.has_file(&path).await?);
 
@@ -700,7 +700,7 @@ mod tests {
 
         foobar.write_str("test")?;
         fixture.wait_for_history_event(1).await?;
-        let path = model::Path::parse("foobar")?;
+        let path = realize_types::Path::parse("foobar")?;
         assert!(fixture.index.has_file(&path).await?);
 
         fs::remove_file(foobar.path()).await?;
@@ -722,8 +722,16 @@ mod tests {
         fixture.root.child("a/b/bar").write_str("test")?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(index.has_file(&model::Path::parse("a/b/foo")?).await?);
-        assert!(index.has_file(&model::Path::parse("a/b/bar")?).await?);
+        assert!(
+            index
+                .has_file(&realize_types::Path::parse("a/b/foo")?)
+                .await?
+        );
+        assert!(
+            index
+                .has_file(&realize_types::Path::parse("a/b/bar")?)
+                .await?
+        );
 
         Ok(())
     }
@@ -739,8 +747,8 @@ mod tests {
         fixture.root.child("a/b/foo").write_str("test")?;
         fixture.root.child("a/b/bar").write_str("test")?;
 
-        let foo = model::Path::parse("a/b/foo")?;
-        let bar = model::Path::parse("a/b/bar")?;
+        let foo = realize_types::Path::parse("a/b/foo")?;
+        let bar = realize_types::Path::parse("a/b/bar")?;
 
         fixture.wait_for_history_event(2).await?;
         assert!(index.has_file(&foo).await?);
@@ -766,8 +774,8 @@ mod tests {
         dir.child("a/b/foo").write_str("test")?;
         dir.child("a/b/bar").write_str("test")?;
 
-        let foo = model::Path::parse("newdir/a/b/foo")?;
-        let bar = model::Path::parse("newdir/a/b/bar")?;
+        let foo = realize_types::Path::parse("newdir/a/b/foo")?;
+        let bar = realize_types::Path::parse("newdir/a/b/bar")?;
 
         fs::rename(dir, fixture.root.join("newdir")).await?;
 
@@ -789,8 +797,8 @@ mod tests {
         fixture.root.child("a/b/foo").write_str("test")?;
         fixture.root.child("a/b/bar").write_str("test")?;
 
-        let foo = model::Path::parse("a/b/foo")?;
-        let bar = model::Path::parse("a/b/bar")?;
+        let foo = realize_types::Path::parse("a/b/foo")?;
+        let bar = realize_types::Path::parse("a/b/bar")?;
 
         fixture.wait_for_history_event(2).await?;
         assert!(index.has_file(&foo).await?);
@@ -816,8 +824,8 @@ mod tests {
         fixture.root.child("a/b/foo").write_str("test")?;
         fixture.root.child("a/b/bar").write_str("test")?;
 
-        let foo = model::Path::parse("a/b/foo")?;
-        let bar = model::Path::parse("a/b/bar")?;
+        let foo = realize_types::Path::parse("a/b/foo")?;
+        let bar = realize_types::Path::parse("a/b/bar")?;
 
         fixture.wait_for_history_event(2).await?;
         assert!(index.has_file(&foo).await?);
@@ -833,8 +841,8 @@ mod tests {
         assert!(!index.has_file(&foo).await?);
         assert!(!index.has_file(&bar).await?);
 
-        let newfoo = model::Path::parse("newa/b/foo")?;
-        let newbar = model::Path::parse("newa/b/bar")?;
+        let newfoo = realize_types::Path::parse("newa/b/foo")?;
+        let newbar = realize_types::Path::parse("newa/b/bar")?;
         assert!(index.has_file(&newfoo).await?);
         assert!(index.has_file(&newbar).await?);
 
@@ -852,7 +860,11 @@ mod tests {
         fs::rename(newfile.path(), fixture.root.join("newfile")).await?;
 
         fixture.wait_for_history_event(1).await?;
-        assert!(index.has_file(&model::Path::parse("newfile")?).await?);
+        assert!(
+            index
+                .has_file(&realize_types::Path::parse("newfile")?)
+                .await?
+        );
 
         Ok(())
     }
@@ -865,7 +877,7 @@ mod tests {
 
         foobar.write_str("test")?;
         fixture.wait_for_history_event(1).await?;
-        let path = model::Path::parse("foobar")?;
+        let path = realize_types::Path::parse("foobar")?;
         assert!(fixture.index.has_file(&path).await?);
 
         fs::rename(foobar.path(), fixture.tempdir.child("out").path()).await?;
@@ -884,14 +896,14 @@ mod tests {
 
         foo.write_str("test")?;
         fixture.wait_for_history_event(1).await?;
-        let path = model::Path::parse("foo")?;
+        let path = realize_types::Path::parse("foo")?;
         assert!(fixture.index.has_file(&path).await?);
 
         fs::rename(foo.path(), fixture.root.child("bar")).await?;
 
         fixture.wait_for_history_event(3).await?;
         assert!(!fixture.index.has_file(&path).await?);
-        let path = model::Path::parse("bar")?;
+        let path = realize_types::Path::parse("bar")?;
         assert!(fixture.index.has_file(&path).await?);
 
         Ok(())
@@ -908,7 +920,7 @@ mod tests {
         fixture.root.child("a/b/foo").write_str("test")?;
         fixture.wait_for_history_event(1).await?;
 
-        let foo = model::Path::parse("a/b/foo")?;
+        let foo = realize_types::Path::parse("a/b/foo")?;
         let foo_pathbuf = fixture.root.join("a/b/foo");
         make_inaccessible(&foo_pathbuf).await?;
 
@@ -934,8 +946,8 @@ mod tests {
         fixture.root.child("a/b/bar").write_str("test")?;
 
         fixture.wait_for_history_event(2).await?;
-        let foo = model::Path::parse("a/b/foo")?;
-        let bar = model::Path::parse("a/b/foo")?;
+        let foo = realize_types::Path::parse("a/b/foo")?;
+        let bar = realize_types::Path::parse("a/b/foo")?;
         assert!(index.has_file(&foo).await?);
         assert!(index.has_file(&bar).await?);
 
@@ -967,8 +979,8 @@ mod tests {
         let _watcher = fixture.watch().await?;
 
         fixture.wait_for_history_event(2).await?;
-        let foo = model::Path::parse("foo")?;
-        let bar = model::Path::parse("a/b/c/bar")?;
+        let foo = realize_types::Path::parse("foo")?;
+        let bar = realize_types::Path::parse("a/b/c/bar")?;
         assert!(index.has_file(&foo).await?);
         assert!(index.has_file(&bar).await?);
 
@@ -980,8 +992,8 @@ mod tests {
         let fixture = Fixture::setup().await?;
         let index = &fixture.index;
 
-        let foo = model::Path::parse("foo")?;
-        let bar = model::Path::parse("a/b/c/bar")?;
+        let foo = realize_types::Path::parse("foo")?;
+        let bar = realize_types::Path::parse("a/b/c/bar")?;
         let mtime = UnixTime::from_secs(1234567890);
         index.add_file(&foo, 4, &mtime, Hash([1; 32])).await?;
         index.add_file(&bar, 4, &mtime, Hash([2; 32])).await?;
@@ -1000,8 +1012,8 @@ mod tests {
         let fixture = Fixture::setup().await?;
         let index = &fixture.index;
 
-        let foo = model::Path::parse("foo")?;
-        let bar = model::Path::parse("a/b/c/bar")?;
+        let foo = realize_types::Path::parse("foo")?;
+        let bar = realize_types::Path::parse("a/b/c/bar")?;
         let foo_child = fixture.root.child("foo");
         foo_child.write_str("foo")?;
         let bar_child = fixture.root.child("a/b/c/bar");
@@ -1058,8 +1070,8 @@ mod tests {
         let fixture = Fixture::setup().await?;
         let index = &fixture.index;
 
-        let foo = model::Path::parse("foo")?;
-        let bar = model::Path::parse("a/b/c/bar")?;
+        let foo = realize_types::Path::parse("foo")?;
+        let bar = realize_types::Path::parse("a/b/c/bar")?;
         let foo_child = fixture.root.child("foo");
         foo_child.write_str("foo")?;
         let bar_child = fixture.root.child("a/b/c/bar");
@@ -1100,8 +1112,8 @@ mod tests {
         let fixture = Fixture::setup().await?;
         let index = &fixture.index;
 
-        let foo = model::Path::parse("a/b/c/foo")?;
-        let bar = model::Path::parse("a/b/d/bar")?;
+        let foo = realize_types::Path::parse("a/b/c/foo")?;
+        let bar = realize_types::Path::parse("a/b/d/bar")?;
         let foo_child = fixture.root.child("foo");
         foo_child.write_str("foo")?;
         let bar_child = fixture.root.child("a/b/c/bar");
@@ -1161,14 +1173,22 @@ mod tests {
         bar.write_str("test")?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(!index.has_file(&model::Path::parse("file_symlink")?).await?);
         assert!(
             !index
-                .has_file(&model::Path::parse("dir_symlink/bar")?)
+                .has_file(&realize_types::Path::parse("file_symlink")?)
                 .await?
         );
-        assert!(index.has_file(&model::Path::parse("foo")?).await?);
-        assert!(index.has_file(&model::Path::parse("b/bar")?).await?);
+        assert!(
+            !index
+                .has_file(&realize_types::Path::parse("dir_symlink/bar")?)
+                .await?
+        );
+        assert!(index.has_file(&realize_types::Path::parse("foo")?).await?);
+        assert!(
+            index
+                .has_file(&realize_types::Path::parse("b/bar")?)
+                .await?
+        );
 
         Ok(())
     }
@@ -1191,10 +1211,10 @@ mod tests {
         let _watcher = fixture.watch().await?;
 
         fixture.wait_for_history_event(2).await?;
-        let foo = model::Path::parse("foo")?;
-        let bar = model::Path::parse("a/b/c/bar")?;
-        let file_symlink = model::Path::parse("file_symlink")?;
-        let bar_through_symlink = model::Path::parse("dir_symlink/b/c/bar")?;
+        let foo = realize_types::Path::parse("foo")?;
+        let bar = realize_types::Path::parse("a/b/c/bar")?;
+        let file_symlink = realize_types::Path::parse("file_symlink")?;
+        let bar_through_symlink = realize_types::Path::parse("dir_symlink/b/c/bar")?;
         assert!(index.has_file(&foo).await?);
         assert!(index.has_file(&bar).await?);
         assert!(!index.has_file(&file_symlink).await?);
@@ -1212,8 +1232,8 @@ mod tests {
         let bar_child = fixture.root.child("bar");
         bar_child.write_str("bar")?;
 
-        let foo = model::Path::parse("foo")?;
-        let bar = model::Path::parse("bar")?;
+        let foo = realize_types::Path::parse("foo")?;
+        let bar = realize_types::Path::parse("bar")?;
         fixture.wait_for_history_event(2).await?;
         assert!(fixture.index.has_file(&foo).await?);
         assert!(fixture.index.has_file(&bar).await?);
@@ -1233,9 +1253,9 @@ mod tests {
         let index = &fixture.index;
 
         let foo_child = fixture.root.child("foo");
-        let foo = model::Path::parse("foo")?;
+        let foo = realize_types::Path::parse("foo")?;
         let bar_child = fixture.root.child("bar");
-        let bar = model::Path::parse("bar")?;
+        let bar = realize_types::Path::parse("bar")?;
 
         foo_child.write_str("foo")?;
         bar_child.write_str("bar")?;
@@ -1274,7 +1294,7 @@ mod tests {
         let index = &fixture.index;
 
         let foo_child = fixture.root.child("a/foo");
-        let foo = model::Path::parse("a/foo")?;
+        let foo = realize_types::Path::parse("a/foo")?;
 
         foo_child.write_str("foo")?;
         index
@@ -1294,8 +1314,16 @@ mod tests {
         let _watcher = fixture.watch().await?;
 
         fixture.wait_for_history_event(3).await?;
-        assert!(index.has_file(&model::Path::parse("b/foo")?).await?);
-        assert!(!index.has_file(&model::Path::parse("a/foo")?).await?);
+        assert!(
+            index
+                .has_file(&realize_types::Path::parse("b/foo")?)
+                .await?
+        );
+        assert!(
+            !index
+                .has_file(&realize_types::Path::parse("a/foo")?)
+                .await?
+        );
 
         Ok(())
     }
@@ -1321,7 +1349,7 @@ mod tests {
                 mtime,
                 hash: hash::digest("test".as_bytes())
             }),
-            index.get_file(&model::Path::parse("bar")?).await?
+            index.get_file(&realize_types::Path::parse("bar")?).await?
         );
 
         Ok(())
@@ -1330,8 +1358,8 @@ mod tests {
     #[tokio::test]
     async fn ignore_excluded() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
-        fixture.exclude(model::Path::parse("a/b")?);
-        fixture.exclude(model::Path::parse("excluded")?);
+        fixture.exclude(realize_types::Path::parse("a/b")?);
+        fixture.exclude(realize_types::Path::parse("excluded")?);
 
         let _watcher = fixture.watch().await?;
 
@@ -1342,15 +1370,19 @@ mod tests {
         fixture.wait_for_history_event(1).await?;
 
         let index = &fixture.index;
-        assert!(!index.has_file(&model::Path::parse("excluded")?).await?);
         assert!(
             !index
-                .has_file(&model::Path::parse("a/b/also_excluded")?)
+                .has_file(&realize_types::Path::parse("excluded")?)
+                .await?
+        );
+        assert!(
+            !index
+                .has_file(&realize_types::Path::parse("a/b/also_excluded")?)
                 .await?
         );
         assert!(
             index
-                .has_file(&model::Path::parse("a/not_excluded")?)
+                .has_file(&realize_types::Path::parse("a/not_excluded")?)
                 .await?
         );
 
@@ -1360,8 +1392,8 @@ mod tests {
     #[tokio::test]
     async fn catchup_ignores_excluded() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
-        fixture.exclude(model::Path::parse("a/b")?);
-        fixture.exclude(model::Path::parse("excluded")?);
+        fixture.exclude(realize_types::Path::parse("a/b")?);
+        fixture.exclude(realize_types::Path::parse("excluded")?);
         let index = &fixture.index;
 
         fixture.root.child("excluded").write_str("test")?;
@@ -1371,7 +1403,7 @@ mod tests {
         let _watcher = fixture.watch().await?;
 
         fixture.wait_for_history_event(1).await?;
-        let not_excluded = model::Path::parse("not_excluded")?;
+        let not_excluded = realize_types::Path::parse("not_excluded")?;
         assert!(index.has_file(&not_excluded).await?);
 
         Ok(())
@@ -1380,8 +1412,8 @@ mod tests {
     #[tokio::test]
     async fn catchup_removes_excluded() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
-        fixture.exclude(model::Path::parse("a/b")?);
-        fixture.exclude(model::Path::parse("excluded")?);
+        fixture.exclude(realize_types::Path::parse("a/b")?);
+        fixture.exclude(realize_types::Path::parse("excluded")?);
         let index = &fixture.index;
 
         let excluded_child = fixture.root.child("excluded");
@@ -1389,8 +1421,8 @@ mod tests {
         let excluded_too_child = fixture.root.child("a/b/excluded_too");
         excluded_too_child.write_str("test")?;
 
-        let excluded = model::Path::parse("excluded")?;
-        let excluded_too = model::Path::parse("a/b/excluded_too")?;
+        let excluded = realize_types::Path::parse("excluded")?;
+        let excluded_too = realize_types::Path::parse("a/b/excluded_too")?;
         index
             .add_file(
                 &excluded,
@@ -1420,8 +1452,8 @@ mod tests {
     #[tokio::test]
     async fn capture_ignore_and_removes_excluded() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
-        fixture.exclude(model::Path::parse("a/b")?);
-        fixture.exclude(model::Path::parse("excluded")?);
+        fixture.exclude(realize_types::Path::parse("a/b")?);
+        fixture.exclude(realize_types::Path::parse("excluded")?);
 
         let _watcher = fixture.watch().await?;
 
@@ -1432,15 +1464,19 @@ mod tests {
         fixture.wait_for_history_event(1).await?;
 
         let index = &fixture.index;
-        assert!(!index.has_file(&model::Path::parse("excluded")?).await?);
         assert!(
             !index
-                .has_file(&model::Path::parse("a/b/also_excluded")?)
+                .has_file(&realize_types::Path::parse("excluded")?)
+                .await?
+        );
+        assert!(
+            !index
+                .has_file(&realize_types::Path::parse("a/b/also_excluded")?)
                 .await?
         );
         assert!(
             index
-                .has_file(&model::Path::parse("a/not_excluded")?)
+                .has_file(&realize_types::Path::parse("a/not_excluded")?)
                 .await?
         );
 

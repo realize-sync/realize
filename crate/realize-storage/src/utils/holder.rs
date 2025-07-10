@@ -1,4 +1,4 @@
-use crate::model::PathError;
+use realize_types::PathError;
 use redb::Value;
 use std::marker::PhantomData;
 use std::str::Utf8Error;

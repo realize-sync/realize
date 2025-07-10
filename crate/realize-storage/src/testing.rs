@@ -1,6 +1,6 @@
 use super::config::{ArenaConfig, CacheConfig, IndexConfig, StorageConfig};
 use super::{Storage, UnrealCacheAsync};
-use crate::model::Arena;
+use realize_types::Arena;
 use std::sync::Arc;
 use tokio::fs;
 

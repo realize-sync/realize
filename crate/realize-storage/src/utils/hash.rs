@@ -22,7 +22,7 @@
 //! let hash = hasher.finalize();
 //! ```
 
-use crate::model::Hash;
+use realize_types::Hash;
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest};
 

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::model::{self, Hash, UnixTime};
+use realize_types::{self, Hash, UnixTime};
 use crate::utils::hash;
 use futures::TryStreamExt as _;
 use tokio::fs::File;
@@ -18,15 +18,15 @@ pub struct HashResult {
 }
 
 pub struct Hasher {
-    tx: mpsc::Sender<(model::Path, std::io::Result<HashResult>)>,
+    tx: mpsc::Sender<(realize_types::Path, std::io::Result<HashResult>)>,
 }
 
 impl Hasher {
-    pub fn new(tx: mpsc::Sender<(model::Path, std::io::Result<HashResult>)>) -> Self {
+    pub fn new(tx: mpsc::Sender<(realize_types::Path, std::io::Result<HashResult>)>) -> Self {
         Self { tx }
     }
 
-    pub fn request_hash(&self, realpath: PathBuf, path: model::Path) {
+    pub fn request_hash(&self, realpath: PathBuf, path: realize_types::Path) {
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let _ = tx.send((path.clone(), do_hash(realpath).await)).await;

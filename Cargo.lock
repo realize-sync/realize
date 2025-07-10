@@ -557,15 +557,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
-name = "cpufeatures"
-version = "0.2.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "crossbeam-channel"
 version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2266,15 +2257,11 @@ dependencies = [
  "assert_unordered",
  "async-speed-limit",
  "async-trait",
- "async-walkdir",
- "base64",
  "bincode",
- "blake2",
  "capnp",
  "capnp-rpc",
  "capnpc",
  "env_logger",
- "fast_rsync",
  "futures",
  "hyper",
  "hyper-util",
@@ -2283,20 +2270,18 @@ dependencies = [
  "moka",
  "nfsserve",
  "nix",
- "notify",
  "pathdiff",
  "portpicker",
  "predicates",
  "prometheus",
  "realize-network",
+ "realize-storage",
  "realize-types",
  "redb",
  "reqwest",
  "rustls",
- "scopeguard",
  "serde",
  "serial_test",
- "sha2",
  "tarpc",
  "tempfile",
  "test-tag",
@@ -2305,7 +2290,6 @@ dependencies = [
  "tokio-retry",
  "tokio-rustls",
  "tokio-stream",
- "tokio-util",
  "toml",
  "uuid",
  "walkdir",
@@ -2335,6 +2319,34 @@ dependencies = [
  "tokio-retry",
  "tokio-rustls",
  "tokio-util",
+]
+
+[[package]]
+name = "realize-storage"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert_fs",
+ "assert_unordered",
+ "async-walkdir",
+ "blake2",
+ "capnp",
+ "capnpc",
+ "env_logger",
+ "fast_rsync",
+ "futures",
+ "log",
+ "notify",
+ "pathdiff",
+ "realize-types",
+ "redb",
+ "serde",
+ "thiserror 2.0.12",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "uuid",
+ "walkdir",
 ]
 
 [[package]]
@@ -2724,17 +2736,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.101",
-]
-
-[[package]]
-name = "sha2"
-version = "0.10.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
-dependencies = [
- "cfg-if",
- "cpufeatures",
- "digest",
 ]
 
 [[package]]

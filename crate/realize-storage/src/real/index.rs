@@ -1,8 +1,8 @@
 #![allow(dead_code)] // work in progress
 
 use super::real_capnp;
-use crate::model::{self, Arena, Hash, UnixTime};
-use crate::storage::StorageError;
+use realize_types::{self, Arena, Hash, UnixTime};
+use crate::StorageError;
 use crate::utils::holder::{ByteConversionError, ByteConvertible, Holder, NamedType};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 /// Track hash and metadata of local files.
 ///
-/// Key: model::Path
+/// Key: realize_types::Path
 /// Value: FileTableEntry
 const FILE_TABLE: TableDefinition<&str, Holder<FileTableEntry>> = TableDefinition::new("file");
 
@@ -126,7 +126,7 @@ impl RealIndexBlocking {
     }
 
     /// Get a file entry.
-    pub fn get_file(&self, path: &model::Path) -> Result<Option<FileTableEntry>, StorageError> {
+    pub fn get_file(&self, path: &realize_types::Path) -> Result<Option<FileTableEntry>, StorageError> {
         let txn = self.db.begin_read()?;
         let file_table = txn.open_table(FILE_TABLE)?;
 
@@ -138,7 +138,7 @@ impl RealIndexBlocking {
     }
 
     /// Check whether a given file is in the index already.
-    pub fn has_file(&self, path: &model::Path) -> Result<bool, StorageError> {
+    pub fn has_file(&self, path: &realize_types::Path) -> Result<bool, StorageError> {
         let txn = self.db.begin_read()?;
         let file_table = txn.open_table(FILE_TABLE)?;
 
@@ -148,7 +148,7 @@ impl RealIndexBlocking {
     /// Check whether a given file is in the index with the given size and mtime.
     pub fn has_matching_file(
         &self,
-        path: &model::Path,
+        path: &realize_types::Path,
         size: u64,
         mtime: &UnixTime,
     ) -> Result<bool, StorageError> {
@@ -161,7 +161,7 @@ impl RealIndexBlocking {
     /// Add a file entry with the given values. Replace one if it exists.
     pub fn add_file(
         &self,
-        path: &model::Path,
+        path: &realize_types::Path,
         size: u64,
         mtime: &UnixTime,
         hash: Hash,
@@ -180,7 +180,7 @@ impl RealIndexBlocking {
     /// Send all valid entries of the file table to the given channel.
     pub fn all_files(
         &self,
-        tx: mpsc::Sender<(model::Path, FileTableEntry)>,
+        tx: mpsc::Sender<(realize_types::Path, FileTableEntry)>,
     ) -> Result<(), StorageError> {
         let txn = self.db.begin_read()?;
         let file_table = txn.open_table(FILE_TABLE)?;
@@ -189,7 +189,7 @@ impl RealIndexBlocking {
             .flatten()
             // Skip any entry with errors
             .flat_map(|(k, v)| {
-                if let (Ok(path), Ok(entry)) = (model::Path::parse(k.value()), v.value().parse()) {
+                if let (Ok(path), Ok(entry)) = (realize_types::Path::parse(k.value()), v.value().parse()) {
                     Some((path, entry))
                 } else {
                     None
@@ -231,7 +231,7 @@ impl RealIndexBlocking {
     ///
     /// If the path is a directory, all files within that directory
     /// are removed, recursively.
-    pub fn remove_file_or_dir(&self, path: &model::Path) -> Result<(), StorageError> {
+    pub fn remove_file_or_dir(&self, path: &realize_types::Path) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
         let mut history_index = None;
         do_remove_file_or_dir(&txn, path, &mut history_index)?;
@@ -247,7 +247,7 @@ impl RealIndexBlocking {
 
 fn do_remove_file_or_dir(
     txn: &WriteTransaction,
-    path: &model::Path,
+    path: &realize_types::Path,
     history_index: &mut Option<u64>,
 ) -> Result<(), StorageError> {
     let mut file_table = txn.open_table(FILE_TABLE)?;
@@ -266,7 +266,7 @@ fn do_remove_file_or_dir(
         history_table.insert(
             index,
             Holder::with_content(HistoryTableEntry::Remove(
-                model::Path::parse(k.value())?,
+                realize_types::Path::parse(k.value())?,
                 v.value().parse()?.hash,
             ))?,
         )?;
@@ -278,7 +278,7 @@ fn do_remove_file_or_dir(
 
 fn do_add_file(
     txn: &WriteTransaction,
-    path: &model::Path,
+    path: &realize_types::Path,
     size: u64,
     mtime: &UnixTime,
     hash: Hash,
@@ -397,7 +397,7 @@ impl RealIndexAsync {
     }
 
     /// Return all valid file entries as a stream.
-    pub fn all_files(&self) -> ReceiverStream<(model::Path, FileTableEntry)> {
+    pub fn all_files(&self) -> ReceiverStream<(realize_types::Path, FileTableEntry)> {
         let (tx, rx) = mpsc::channel(100);
 
         let inner = Arc::clone(&self.inner);
@@ -430,7 +430,7 @@ impl RealIndexAsync {
     /// Get a file entry
     pub async fn get_file(
         &self,
-        path: &model::Path,
+        path: &realize_types::Path,
     ) -> Result<Option<FileTableEntry>, StorageError> {
         let inner = Arc::clone(&self.inner);
         let path = path.clone();
@@ -439,7 +439,7 @@ impl RealIndexAsync {
     }
 
     /// Check whether a given file is in the index already.
-    pub async fn has_file(&self, path: &model::Path) -> Result<bool, StorageError> {
+    pub async fn has_file(&self, path: &realize_types::Path) -> Result<bool, StorageError> {
         let inner = Arc::clone(&self.inner);
         let path = path.clone();
 
@@ -449,7 +449,7 @@ impl RealIndexAsync {
     /// Check whether a given file is in the index already with the given size and mtime.
     pub async fn has_matching_file(
         &self,
-        path: &model::Path,
+        path: &realize_types::Path,
         size: u64,
         mtime: &UnixTime,
     ) -> Result<bool, StorageError> {
@@ -464,7 +464,7 @@ impl RealIndexAsync {
     ///
     /// If the path is a directory, all files within that directory
     /// are removed, recursively.
-    pub async fn remove_file_or_dir(&self, path: &model::Path) -> Result<(), StorageError> {
+    pub async fn remove_file_or_dir(&self, path: &realize_types::Path) -> Result<(), StorageError> {
         let inner = Arc::clone(&self.inner);
         let path = path.clone();
 
@@ -473,7 +473,7 @@ impl RealIndexAsync {
 
     pub async fn add_file(
         &self,
-        path: &model::Path,
+        path: &realize_types::Path,
         size: u64,
         mtime: &UnixTime,
         hash: Hash,
@@ -538,9 +538,9 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
 /// An entry in the file table.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HistoryTableEntry {
-    Add(model::Path),
-    Replace(model::Path, Hash),
-    Remove(model::Path, Hash),
+    Add(realize_types::Path),
+    Replace(realize_types::Path, Hash),
+    Remove(realize_types::Path, Hash),
 }
 
 impl NamedType for HistoryTableEntry {
@@ -606,8 +606,8 @@ fn parse_hash(hash: &[u8]) -> Result<Hash, ByteConversionError> {
     Ok(hash)
 }
 
-fn parse_path(path: capnp::text::Reader<'_>) -> Result<model::Path, ByteConversionError> {
-    model::Path::parse(path.to_str()?).map_err(|_| ByteConversionError::Invalid("path"))
+fn parse_path(path: capnp::text::Reader<'_>) -> Result<realize_types::Path, ByteConversionError> {
+    realize_types::Path::parse(path.to_str()?).map_err(|_| ByteConversionError::Invalid("path"))
 }
 
 #[cfg(test)]
@@ -686,21 +686,21 @@ mod tests {
 
     #[test]
     fn convert_history_table_entry() -> anyhow::Result<()> {
-        let add = HistoryTableEntry::Add(model::Path::parse("foo/bar.txt")?);
+        let add = HistoryTableEntry::Add(realize_types::Path::parse("foo/bar.txt")?);
         assert_eq!(
             add,
             HistoryTableEntry::from_bytes(add.clone().to_bytes()?.as_slice())?
         );
 
         let remove =
-            HistoryTableEntry::Remove(model::Path::parse("foo/bar.txt")?, Hash([0xfa; 32]));
+            HistoryTableEntry::Remove(realize_types::Path::parse("foo/bar.txt")?, Hash([0xfa; 32]));
         assert_eq!(
             remove,
             HistoryTableEntry::from_bytes(remove.clone().to_bytes()?.as_slice())?
         );
 
         let replace =
-            HistoryTableEntry::Replace(model::Path::parse("foo/bar.txt")?, Hash([0x1a; 32]));
+            HistoryTableEntry::Replace(realize_types::Path::parse("foo/bar.txt")?, Hash([0x1a; 32]));
         assert_eq!(
             replace,
             HistoryTableEntry::from_bytes(replace.clone().to_bytes()?.as_slice())?
@@ -715,7 +715,7 @@ mod tests {
 
         let index = &fixture.index;
         let mtime = UnixTime::from_secs(1234567890);
-        let path = model::Path::parse("foo/bar.txt")?;
+        let path = realize_types::Path::parse("foo/bar.txt")?;
         index.add_file(&path, 100, &mtime, Hash([0xfa; 32]))?;
 
         {
@@ -747,7 +747,7 @@ mod tests {
         let index = &fixture.index;
         let mtime1 = UnixTime::from_secs(1234567890);
         let mtime2 = UnixTime::from_secs(1234567891);
-        let path = model::Path::parse("foo/bar.txt")?;
+        let path = realize_types::Path::parse("foo/bar.txt")?;
         index.add_file(&path, 100, &mtime1, Hash([0xfa; 32]))?;
         index.add_file(&path, 200, &mtime2, Hash([0x07; 32]))?;
 
@@ -779,12 +779,12 @@ mod tests {
 
         let index = &fixture.index;
         let mtime = UnixTime::from_secs(1234567890);
-        let path = model::Path::parse("foo/bar")?;
+        let path = realize_types::Path::parse("foo/bar")?;
         index.add_file(&path, 100, &mtime, Hash([0xfa; 32]))?;
 
         assert_eq!(true, fixture.index.has_file(&path)?);
-        assert_eq!(false, index.has_file(&model::Path::parse("foo/bar/toto")?)?);
-        assert_eq!(false, index.has_file(&model::Path::parse("other.txt")?)?);
+        assert_eq!(false, index.has_file(&realize_types::Path::parse("foo/bar/toto")?)?);
+        assert_eq!(false, index.has_file(&realize_types::Path::parse("other.txt")?)?);
 
         Ok(())
     }
@@ -795,7 +795,7 @@ mod tests {
 
         let index = &fixture.index;
         let mtime = UnixTime::from_secs(1234567890);
-        let path = model::Path::parse("foo/bar")?;
+        let path = realize_types::Path::parse("foo/bar")?;
         let hash = Hash([0xfa; 32]);
         index.add_file(&path, 100, &mtime, hash.clone())?;
 
@@ -817,13 +817,13 @@ mod tests {
 
         let index = &fixture.index;
         let mtime = UnixTime::from_secs(1234567890);
-        let path = model::Path::parse("foo/bar")?;
+        let path = realize_types::Path::parse("foo/bar")?;
         index.add_file(&path, 100, &mtime, Hash([0xfa; 32]))?;
 
         assert_eq!(true, fixture.index.has_matching_file(&path, 100, &mtime)?);
         assert_eq!(
             false,
-            index.has_matching_file(&model::Path::parse("other")?, 100, &mtime)?
+            index.has_matching_file(&realize_types::Path::parse("other")?, 100, &mtime)?
         );
         assert_eq!(false, fixture.index.has_matching_file(&path, 200, &mtime)?);
         assert_eq!(
@@ -840,7 +840,7 @@ mod tests {
 
         let index = &fixture.index;
         let mtime = UnixTime::from_secs(1234567890);
-        let path = model::Path::parse("foo/bar.txt")?;
+        let path = realize_types::Path::parse("foo/bar.txt")?;
         index.add_file(&path, 100, &mtime, Hash([0xfa; 32]))?;
         index.remove_file_or_dir(&path)?;
 
@@ -864,36 +864,36 @@ mod tests {
         let index = &fixture.index;
         let mtime = UnixTime::from_secs(1234567890);
 
-        index.add_file(&model::Path::parse("foo/a")?, 100, &mtime, Hash([1; 32]))?;
-        index.add_file(&model::Path::parse("foo/b")?, 100, &mtime, Hash([2; 32]))?;
-        index.add_file(&model::Path::parse("foo/c")?, 100, &mtime, Hash([3; 32]))?;
+        index.add_file(&realize_types::Path::parse("foo/a")?, 100, &mtime, Hash([1; 32]))?;
+        index.add_file(&realize_types::Path::parse("foo/b")?, 100, &mtime, Hash([2; 32]))?;
+        index.add_file(&realize_types::Path::parse("foo/c")?, 100, &mtime, Hash([3; 32]))?;
         index.add_file(
-            &model::Path::parse("foobar")?,
+            &realize_types::Path::parse("foobar")?,
             100,
             &mtime,
             Hash([0x04; 32]),
         )?;
 
-        index.remove_file_or_dir(&model::Path::parse("foo")?)?;
+        index.remove_file_or_dir(&realize_types::Path::parse("foo")?)?;
 
-        assert_eq!(true, index.has_file(&model::Path::parse("foobar")?)?);
-        assert_eq!(false, index.has_file(&model::Path::parse("foo/a")?)?);
-        assert_eq!(false, index.has_file(&model::Path::parse("foo/b")?)?);
-        assert_eq!(false, index.has_file(&model::Path::parse("foo/c")?)?);
+        assert_eq!(true, index.has_file(&realize_types::Path::parse("foobar")?)?);
+        assert_eq!(false, index.has_file(&realize_types::Path::parse("foo/a")?)?);
+        assert_eq!(false, index.has_file(&realize_types::Path::parse("foo/b")?)?);
+        assert_eq!(false, index.has_file(&realize_types::Path::parse("foo/c")?)?);
 
         {
             let txn = index.db.begin_read()?;
             let history_table = txn.open_table(HISTORY_TABLE)?;
             assert_eq!(
-                HistoryTableEntry::Remove(model::Path::parse("foo/a")?, Hash([1; 32])),
+                HistoryTableEntry::Remove(realize_types::Path::parse("foo/a")?, Hash([1; 32])),
                 history_table.get(5)?.unwrap().value().parse()?
             );
             assert_eq!(
-                HistoryTableEntry::Remove(model::Path::parse("foo/b")?, Hash([2; 32])),
+                HistoryTableEntry::Remove(realize_types::Path::parse("foo/b")?, Hash([2; 32])),
                 history_table.get(6)?.unwrap().value().parse()?
             );
             assert_eq!(
-                HistoryTableEntry::Remove(model::Path::parse("foo/c")?, Hash([3; 32])),
+                HistoryTableEntry::Remove(realize_types::Path::parse("foo/c")?, Hash([3; 32])),
                 history_table.get(7)?.unwrap().value().parse()?
             );
         }
@@ -906,7 +906,7 @@ mod tests {
         let fixture = Fixture::setup()?;
 
         let index = &fixture.index;
-        index.remove_file_or_dir(&model::Path::parse("foo")?)?;
+        index.remove_file_or_dir(&realize_types::Path::parse("foo")?)?;
 
         {
             let txn = index.db.begin_read()?;
@@ -925,11 +925,11 @@ mod tests {
         let mtime = UnixTime::from_secs(1234567890);
         let hash = Hash([1; 32]);
         index
-            .add_file(&model::Path::parse("baa.txt")?, 100, &mtime, hash.clone())
+            .add_file(&realize_types::Path::parse("baa.txt")?, 100, &mtime, hash.clone())
             .await?;
         index
             .add_file(
-                &model::Path::parse("baa/baa.txt")?,
+                &realize_types::Path::parse("baa/baa.txt")?,
                 200,
                 &mtime,
                 hash.clone(),
@@ -937,7 +937,7 @@ mod tests {
             .await?;
         index
             .add_file(
-                &model::Path::parse("baa/baa/black/sheep.txt")?,
+                &realize_types::Path::parse("baa/baa/black/sheep.txt")?,
                 300,
                 &mtime,
                 hash.clone(),
@@ -970,12 +970,12 @@ mod tests {
         assert_eq!(0, index.last_history_index()?);
 
         let mtime = UnixTime::from_secs(1234567890);
-        index.add_file(&model::Path::parse("foo/a")?, 100, &mtime, Hash([1; 32]))?;
-        index.add_file(&model::Path::parse("foo/b")?, 100, &mtime, Hash([2; 32]))?;
-        index.add_file(&model::Path::parse("foo/c")?, 100, &mtime, Hash([3; 32]))?;
+        index.add_file(&realize_types::Path::parse("foo/a")?, 100, &mtime, Hash([1; 32]))?;
+        index.add_file(&realize_types::Path::parse("foo/b")?, 100, &mtime, Hash([2; 32]))?;
+        index.add_file(&realize_types::Path::parse("foo/c")?, 100, &mtime, Hash([3; 32]))?;
         assert_eq!(3, index.last_history_index()?);
 
-        index.remove_file_or_dir(&model::Path::parse("foo")?)?;
+        index.remove_file_or_dir(&realize_types::Path::parse("foo")?)?;
         assert_eq!(6, index.last_history_index()?);
 
         Ok(())
@@ -988,13 +988,13 @@ mod tests {
         let index = &fixture.index;
 
         let mtime = UnixTime::from_secs(1234567890);
-        let foo_a = model::Path::parse("foo/a")?;
-        let foo_b = model::Path::parse("foo/b")?;
-        let foo_c = model::Path::parse("foo/c")?;
+        let foo_a = realize_types::Path::parse("foo/a")?;
+        let foo_b = realize_types::Path::parse("foo/b")?;
+        let foo_c = realize_types::Path::parse("foo/c")?;
         index.add_file(&foo_a, 100, &mtime, Hash([1; 32]))?;
         index.add_file(&foo_b, 100, &mtime, Hash([2; 32]))?;
         index.add_file(&foo_c, 100, &mtime, Hash([3; 32]))?;
-        index.remove_file_or_dir(&model::Path::parse("foo")?)?;
+        index.remove_file_or_dir(&realize_types::Path::parse("foo")?)?;
 
         let all = fixture.aindex.history(0..).try_collect::<Vec<_>>().await?;
         assert_eq!(
@@ -1041,14 +1041,14 @@ mod tests {
         assert_eq!(0, *history_rx.borrow_and_update());
 
         let mtime = UnixTime::from_secs(1234567890);
-        index.add_file(&model::Path::parse("foo/a")?, 100, &mtime, Hash([1; 32]))?;
+        index.add_file(&realize_types::Path::parse("foo/a")?, 100, &mtime, Hash([1; 32]))?;
         assert_eq!(true, history_rx.has_changed()?);
 
-        index.add_file(&model::Path::parse("foo/b")?, 100, &mtime, Hash([2; 32]))?;
-        index.add_file(&model::Path::parse("foo/c")?, 100, &mtime, Hash([3; 32]))?;
+        index.add_file(&realize_types::Path::parse("foo/b")?, 100, &mtime, Hash([2; 32]))?;
+        index.add_file(&realize_types::Path::parse("foo/c")?, 100, &mtime, Hash([3; 32]))?;
         assert_eq!(3, *history_rx.wait_for(|v| *v >= 3).await?);
 
-        index.remove_file_or_dir(&model::Path::parse("foo")?)?;
+        index.remove_file_or_dir(&realize_types::Path::parse("foo")?)?;
         history_rx.changed().await?;
         assert_eq!(6, *history_rx.borrow_and_update());
 
@@ -1061,9 +1061,9 @@ mod tests {
         let index = &fixture.index;
 
         let mtime = UnixTime::from_secs(1234567890);
-        index.add_file(&model::Path::parse("foo/a")?, 100, &mtime, Hash([1; 32]))?;
-        index.add_file(&model::Path::parse("foo/b")?, 100, &mtime, Hash([2; 32]))?;
-        index.add_file(&model::Path::parse("foo/c")?, 100, &mtime, Hash([3; 32]))?;
+        index.add_file(&realize_types::Path::parse("foo/a")?, 100, &mtime, Hash([1; 32]))?;
+        index.add_file(&realize_types::Path::parse("foo/b")?, 100, &mtime, Hash([2; 32]))?;
+        index.add_file(&realize_types::Path::parse("foo/c")?, 100, &mtime, Hash([3; 32]))?;
 
         let mut history_rx = index.watch_history();
         assert_eq!(3, *history_rx.borrow_and_update());
@@ -1077,7 +1077,7 @@ mod tests {
         let index = &fixture.index;
         let mtime1 = UnixTime::from_secs(1234567890);
         let mtime2 = UnixTime::from_secs(1234567891);
-        let path = model::Path::parse("foo/bar.txt")?;
+        let path = realize_types::Path::parse("foo/bar.txt")?;
         index.add_file(&path, 100, &mtime1, Hash([0xfa; 32]))?;
         let hist_entry_count = index.last_history_index()?;
         index.add_file(&path, 100, &mtime2, Hash([0xfa; 32]))?;

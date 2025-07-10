@@ -3,15 +3,15 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use super::index::RealIndexAsync;
-use crate::model::{self, Hash, UnixTime};
-use crate::storage::StorageError;
+use realize_types::{self, Hash, UnixTime};
+use crate::StorageError;
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 
 /// A handle on a filesystem file, with a known hash.
 pub struct Reader {
     index: RealIndexAsync,
-    path: model::Path,
+    path: realize_types::Path,
     file: File,
 }
 
@@ -19,7 +19,7 @@ impl Reader {
     pub(crate) async fn open(
         index: &RealIndexAsync,
         root: &std::path::Path,
-        path: &model::Path,
+        path: &realize_types::Path,
     ) -> Result<Self, StorageError> {
         let entry = index.get_file(path).await?.ok_or(StorageError::NotFound)?;
 
@@ -81,7 +81,7 @@ impl AsyncSeek for Reader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Arena;
+    use realize_types::Arena;
     use crate::utils::hash;
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
@@ -121,8 +121,8 @@ mod tests {
             &self,
             path_str: &str,
             content: &str,
-        ) -> anyhow::Result<(model::Path, Hash)> {
-            let path = model::Path::parse(path_str)?;
+        ) -> anyhow::Result<(realize_types::Path, Hash)> {
+            let path = realize_types::Path::parse(path_str)?;
             let hash = hash::digest(content);
             let child = self.root.child(path_str);
             child.write_str(content)?;
@@ -205,7 +205,7 @@ mod tests {
             Reader::open(
                 &fixture.index,
                 root.path(),
-                &model::Path::parse("doesnotexist")?
+                &realize_types::Path::parse("doesnotexist")?
             )
             .await,
             Err(StorageError::NotFound)
@@ -221,7 +221,7 @@ mod tests {
         root.child("fs_only").write_str("that's not enough")?;
 
         assert!(matches!(
-            Reader::open(&fixture.index, root.path(), &model::Path::parse("fs_only")?).await,
+            Reader::open(&fixture.index, root.path(), &realize_types::Path::parse("fs_only")?).await,
             Err(StorageError::NotFound)
         ));
 

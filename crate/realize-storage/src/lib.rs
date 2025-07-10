@@ -7,8 +7,8 @@ use real::watcher::RealWatcher;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::model;
-use crate::model::Arena;
+use realize_types;
+use realize_types::Arena;
 
 pub mod config;
 mod error;
@@ -16,6 +16,7 @@ mod real;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 mod unreal;
+pub mod utils;
 
 pub use error::StorageError;
 pub use real::notifier::Notification;
@@ -56,11 +57,12 @@ impl Storage {
                 let index_path = &index_config.db;
                 let index = RealIndexAsync::open(arena.clone(), &index_path).await?;
                 let mut exclude = vec![];
-                if let Ok(path) = model::Path::from_real_path_in(&index_path, root) {
+                if let Ok(path) = realize_types::Path::from_real_path_in(&index_path, root) {
                     exclude.push(path);
                 }
                 if let Some(cache_config) = &config.cache {
-                    if let Ok(path) = model::Path::from_real_path_in(&cache_config.db, root) {
+                    if let Ok(path) = realize_types::Path::from_real_path_in(&cache_config.db, root)
+                    {
                         exclude.push(path);
                     }
                 }
@@ -109,7 +111,11 @@ impl Storage {
     }
 
     /// Get a reader on the given file, if possible.
-    pub async fn reader(&self, arena: &Arena, path: &model::Path) -> Result<Reader, StorageError> {
+    pub async fn reader(
+        &self,
+        arena: &Arena,
+        path: &realize_types::Path,
+    ) -> Result<Reader, StorageError> {
         let s = self.arena_storage(arena)?;
 
         Reader::open(&s.index, s.root.as_ref(), path).await

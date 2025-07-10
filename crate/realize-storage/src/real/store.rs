@@ -1,5 +1,5 @@
-use crate::model::{self, Arena, ByteRange, Delta, Hash, Signature};
-use crate::storage::config::ArenaConfig;
+use realize_types::{self, Arena, ByteRange, Delta, Hash, Signature};
+use crate::config::ArenaConfig;
 use crate::utils::hash;
 use fast_rsync::SignatureOptions;
 use std::cmp::min;
@@ -44,7 +44,7 @@ pub struct SyncedFile {
     /// Relative path to a file within the directory.
     ///
     /// Absolute paths and .. are not supported.
-    pub path: model::Path,
+    pub path: realize_types::Path,
 
     /// Size of the file on the current instance, in bytes.
     pub size: u64,
@@ -123,7 +123,7 @@ impl RealStore {
     pub async fn send(
         &self,
         arena: &Arena,
-        relative_path: &model::Path,
+        relative_path: &realize_types::Path,
         range: &ByteRange,
         data: Vec<u8>,
         options: &Options,
@@ -142,7 +142,7 @@ impl RealStore {
     pub async fn read(
         &self,
         arena: &Arena,
-        relative_path: &model::Path,
+        relative_path: &realize_types::Path,
         range: &ByteRange,
         options: &Options,
     ) -> Result<Vec<u8>, RealStoreError> {
@@ -159,7 +159,7 @@ impl RealStore {
     pub async fn finish(
         &self,
         arena: &Arena,
-        relative_path: &model::Path,
+        relative_path: &realize_types::Path,
         options: &Options,
     ) -> Result<(), RealStoreError> {
         if options.ignore_partial {
@@ -184,7 +184,7 @@ impl RealStore {
     pub async fn hash(
         &self,
         arena: &Arena,
-        relative_path: &model::Path,
+        relative_path: &realize_types::Path,
         range: &ByteRange,
         options: &Options,
     ) -> Result<Hash, RealStoreError> {
@@ -198,7 +198,7 @@ impl RealStore {
     pub async fn delete(
         &self,
         arena: &Arena,
-        relative_path: &model::Path,
+        relative_path: &realize_types::Path,
         options: &Options,
     ) -> Result<(), RealStoreError> {
         let resolver = self.path_resolver_from_opts(arena, options)?;
@@ -219,7 +219,7 @@ impl RealStore {
     pub async fn calculate_signature(
         &self,
         arena: &Arena,
-        relative_path: &model::Path,
+        relative_path: &realize_types::Path,
         range: &ByteRange,
         options: &Options,
     ) -> Result<Signature, RealStoreError> {
@@ -233,7 +233,7 @@ impl RealStore {
             crypto_hash_size: 8,
         };
         let sig = fast_rsync::Signature::calculate(&buffer, opts);
-        Ok(crate::model::Signature(sig.into_serialized()))
+        Ok(realize_types::Signature(sig.into_serialized()))
     }
 
     /// Compute a delta from the file at the given path and a given signature.
@@ -242,7 +242,7 @@ impl RealStore {
     pub async fn diff(
         &self,
         arena: &Arena,
-        relative_path: &model::Path,
+        relative_path: &realize_types::Path,
         range: &ByteRange,
         signature: Signature,
         options: &Options,
@@ -259,7 +259,7 @@ impl RealStore {
         let mut delta = Vec::new();
         fast_rsync::diff(&sig.index(), &buffer, &mut delta)?;
 
-        Ok((crate::model::Delta(delta), hash))
+        Ok((realize_types::Delta(delta), hash))
     }
 
     /// Apply a delta to the file at the given path and byte range, verifying the hash
@@ -269,7 +269,7 @@ impl RealStore {
     pub async fn apply_delta(
         &self,
         arena: &Arena,
-        relative_path: &model::Path,
+        relative_path: &realize_types::Path,
         range: &ByteRange,
         delta: Delta,
         hash: &Hash,
@@ -299,7 +299,7 @@ impl RealStore {
     pub async fn truncate(
         &self,
         arena: &Arena,
-        relative_path: &model::Path,
+        relative_path: &realize_types::Path,
         file_size: u64,
         options: &Options,
     ) -> Result<(), RealStoreError> {
@@ -352,13 +352,13 @@ impl PathResolver {
         self.path.as_ref()
     }
 
-    pub fn partial_path(&self, path: &model::Path) -> Option<path::PathBuf> {
+    pub fn partial_path(&self, path: &realize_types::Path) -> Option<path::PathBuf> {
         let full_path = to_full_path(&self.path, path)?;
 
         Some(to_partial(&full_path))
     }
 
-    pub fn final_path(&self, path: &model::Path) -> Option<path::PathBuf> {
+    pub fn final_path(&self, path: &realize_types::Path) -> Option<path::PathBuf> {
         to_full_path(&self.path, path)
     }
 
@@ -366,7 +366,7 @@ impl PathResolver {
     ///
     /// The OS path might not exist or some error might prevent it
     /// from being accessible.
-    pub async fn resolve(&self, path: &model::Path) -> Result<path::PathBuf, io::Error> {
+    pub async fn resolve(&self, path: &realize_types::Path) -> Result<path::PathBuf, io::Error> {
         let full_path = to_full_path(&self.path, path).ok_or(not_found())?;
 
         if self.access == StorageAccess::ReadWrite {
@@ -385,7 +385,7 @@ impl PathResolver {
     ///
     /// The OS path might not be part of the model, so reverse
     /// sometimes return None.
-    pub fn reverse(&self, actual: &path::Path) -> Option<(PathType, model::Path)> {
+    pub fn reverse(&self, actual: &path::Path) -> Option<(PathType, realize_types::Path)> {
         if self.access == StorageAccess::Read && is_partial(actual) {
             return None;
         }
@@ -398,7 +398,7 @@ impl PathResolver {
                     path_type = PathType::Partial;
                 }
             }
-            if let Ok(p) = model::Path::from_real_path(&relative) {
+            if let Ok(p) = realize_types::Path::from_real_path(&relative) {
                 return Some((path_type, p));
             }
         }
@@ -446,7 +446,7 @@ fn non_partial_name(path: &path::Path) -> Option<&str> {
 /// This function refuses to return partial paths, even if the model
 /// path is trying to point to a partial path, as partial paths never
 /// exist in this view of the Arena.
-fn to_full_path(root: &path::Path, relative: &model::Path) -> Option<path::PathBuf> {
+fn to_full_path(root: &path::Path, relative: &realize_types::Path) -> Option<path::PathBuf> {
     let full_path = relative.within(root);
     if is_partial(&full_path) {
         return None;
@@ -635,7 +635,7 @@ impl From<fast_rsync::SignatureParseError> for RealStoreError {
 /// Remove empty parent directories of [relative_path].
 ///
 /// Errors are ignored. Deleting just stops.
-async fn delete_containing_dir(root: &std::path::Path, relative_path: &model::Path) {
+async fn delete_containing_dir(root: &std::path::Path, relative_path: &realize_types::Path) {
     let mut current = relative_path.clone();
     while let Some(parent) = current.parent() {
         let full_path = parent.within(root);
@@ -673,7 +673,7 @@ fn bad_path() -> RealStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Hash;
+    use realize_types::Hash;
     use crate::utils::hash;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
@@ -692,21 +692,21 @@ mod tests {
 
         assert_eq!(
             Some(path::PathBuf::from("/doesnotexist/test/foo.txt")),
-            resolver.final_path(&model::Path::parse("foo.txt")?)
+            resolver.final_path(&realize_types::Path::parse("foo.txt")?)
         );
         assert_eq!(
             Some(path::PathBuf::from("/doesnotexist/test/.foo.txt.part")),
-            resolver.partial_path(&model::Path::parse("foo.txt")?)
+            resolver.partial_path(&realize_types::Path::parse("foo.txt")?)
         );
         assert_eq!(
             Some(path::PathBuf::from("/doesnotexist/test/subdir/.foo.txt")),
-            resolver.final_path(&model::Path::parse("subdir/.foo.txt")?)
+            resolver.final_path(&realize_types::Path::parse("subdir/.foo.txt")?)
         );
         assert_eq!(
             Some(path::PathBuf::from(
                 "/doesnotexist/test/subdir/..foo.txt.part"
             )),
-            resolver.partial_path(&model::Path::parse("subdir/.foo.txt")?)
+            resolver.partial_path(&realize_types::Path::parse("subdir/.foo.txt")?)
         );
 
         Ok(())
@@ -720,7 +720,7 @@ mod tests {
             .path_resolver(arena, StorageAccess::Read)
             .ok_or(not_found())?;
 
-        let simple_file = &model::Path::parse("foo.txt")?;
+        let simple_file = &realize_types::Path::parse("foo.txt")?;
         assert!(matches!(
             resolver.resolve(simple_file).await,
             Err(std::io::Error { .. })
@@ -738,7 +738,7 @@ mod tests {
             resolver.resolve(simple_file).await?,
         );
 
-        let file_in_subdir = &model::Path::parse("foo/bar.txt")?;
+        let file_in_subdir = &realize_types::Path::parse("foo/bar.txt")?;
         assert!(matches!(
             resolver.resolve(file_in_subdir).await,
             Err(std::io::Error { .. })
@@ -756,7 +756,7 @@ mod tests {
             resolver.resolve(file_in_subdir).await?,
         );
 
-        let hidden_file = &model::Path::parse(".foo/.bar.txt")?;
+        let hidden_file = &realize_types::Path::parse(".foo/.bar.txt")?;
         assert!(matches!(
             resolver.resolve(hidden_file).await,
             Err(std::io::Error { .. })
@@ -779,7 +779,7 @@ mod tests {
             .path_resolver(arena, StorageAccess::Read)
             .ok_or(not_found())?;
 
-        let simple_file = &model::Path::parse(".foo.txt.part")?;
+        let simple_file = &realize_types::Path::parse(".foo.txt.part")?;
         assert!(matches!(
             resolver.resolve(simple_file).await,
             Err(std::io::Error { .. })
@@ -791,7 +791,7 @@ mod tests {
             Err(std::io::Error { .. })
         ));
 
-        let file_in_subdir = &model::Path::parse("foo/.bar.txt.part")?;
+        let file_in_subdir = &realize_types::Path::parse("foo/.bar.txt.part")?;
         assert!(matches!(
             resolver.resolve(file_in_subdir).await,
             Err(std::io::Error { .. })
@@ -814,7 +814,7 @@ mod tests {
             .path_resolver(arena, StorageAccess::ReadWrite)
             .ok_or(not_found())?;
 
-        let simple_file = &model::Path::parse("foo.txt")?;
+        let simple_file = &realize_types::Path::parse("foo.txt")?;
         assert!(matches!(
             resolver.resolve(simple_file).await,
             Err(std::io::Error { .. })
@@ -832,7 +832,7 @@ mod tests {
             resolver.resolve(simple_file).await?,
         );
 
-        let file_in_subdir = &model::Path::parse("foo/bar.txt")?;
+        let file_in_subdir = &realize_types::Path::parse("foo/bar.txt")?;
         assert!(matches!(
             resolver.resolve(file_in_subdir).await,
             Err(std::io::Error { .. })
@@ -850,7 +850,7 @@ mod tests {
             resolver.resolve(file_in_subdir).await?,
         );
 
-        let hidden_file = &model::Path::parse(".foo/.bar.txt")?;
+        let hidden_file = &realize_types::Path::parse(".foo/.bar.txt")?;
         assert!(matches!(
             resolver.resolve(hidden_file).await,
             Err(std::io::Error { .. })
@@ -879,7 +879,7 @@ mod tests {
             .path_resolver(arena, StorageAccess::ReadWrite)
             .ok_or(not_found())?;
 
-        let simple_file = &model::Path::parse(".foo.txt.part")?;
+        let simple_file = &realize_types::Path::parse(".foo.txt.part")?;
         assert!(matches!(
             resolver.resolve(simple_file).await,
             Err(std::io::Error { .. })
@@ -891,7 +891,7 @@ mod tests {
             Err(std::io::Error { .. })
         ));
 
-        let file_in_subdir = &model::Path::parse("foo/.bar.txt.part")?;
+        let file_in_subdir = &realize_types::Path::parse("foo/.bar.txt.part")?;
         assert!(matches!(
             resolver.resolve(file_in_subdir).await,
             Err(std::io::Error { .. })
@@ -915,7 +915,7 @@ mod tests {
             .ok_or(not_found())?;
 
         assert_eq!(
-            Some((PathType::Final, model::Path::parse("foo/bar")?)),
+            Some((PathType::Final, realize_types::Path::parse("foo/bar")?)),
             storage.reverse(temp.child("foo/bar").path())
         );
 
@@ -938,12 +938,12 @@ mod tests {
             .ok_or(not_found())?;
 
         assert_eq!(
-            Some((PathType::Final, model::Path::parse("foo/bar")?)),
+            Some((PathType::Final, realize_types::Path::parse("foo/bar")?)),
             storage.reverse(temp.child("foo/bar").path())
         );
 
         assert_eq!(
-            Some((PathType::Partial, model::Path::parse("foo/bar")?)),
+            Some((PathType::Partial, realize_types::Path::parse("foo/bar")?)),
             storage.reverse(temp.child("foo/.bar.part").path())
         );
 
@@ -959,11 +959,11 @@ mod tests {
 
     struct LogicalPath {
         arena_path: PathBuf,
-        path: model::Path,
+        path: realize_types::Path,
     }
 
     impl LogicalPath {
-        fn new(arena_path: &path::Path, path: &model::Path) -> Self {
+        fn new(arena_path: &path::Path, path: &realize_types::Path) -> Self {
             Self {
                 arena_path: arena_path.to_path_buf(),
                 path: path.clone(),
@@ -1023,22 +1023,22 @@ mod tests {
             files,
             vec![
                 SyncedFile {
-                    path: model::Path::parse("foo.txt")?,
+                    path: realize_types::Path::parse("foo.txt")?,
                     size: 5,
                     mtime: foo.metadata()?.modified()?,
                 },
                 SyncedFile {
-                    path: model::Path::parse("subdir/foo2.txt")?,
+                    path: realize_types::Path::parse("subdir/foo2.txt")?,
                     size: 5,
                     mtime: foo2.metadata()?.modified()?,
                 },
                 SyncedFile {
-                    path: model::Path::parse("bar.txt")?,
+                    path: realize_types::Path::parse("bar.txt")?,
                     size: 7,
                     mtime: bar.metadata()?.modified()?,
                 },
                 SyncedFile {
-                    path: model::Path::parse("subdir/bar2.txt")?,
+                    path: realize_types::Path::parse("subdir/bar2.txt")?,
                     size: 7,
                     mtime: bar2.metadata()?.modified()?,
                 },
@@ -1051,7 +1051,7 @@ mod tests {
     #[tokio::test]
     async fn send_wrong_order() -> anyhow::Result<()> {
         let (store, temp, arena) = setup_store()?;
-        let fpath = LogicalPath::new(temp.path(), &model::Path::parse("wrong_order.txt")?);
+        let fpath = LogicalPath::new(temp.path(), &realize_types::Path::parse("wrong_order.txt")?);
         let data1 = b"fghij".to_vec();
         store
             .send(
@@ -1088,7 +1088,7 @@ mod tests {
     async fn read() -> anyhow::Result<()> {
         let (store, temp, arena) = setup_store()?;
 
-        let fpath = LogicalPath::new(temp.path(), &model::Path::parse("wrong_order.txt")?);
+        let fpath = LogicalPath::new(temp.path(), &realize_types::Path::parse("wrong_order.txt")?);
         fs::write(fpath.final_path(), "abcdefghij")?;
 
         let data = store
@@ -1129,7 +1129,7 @@ mod tests {
     async fn finish_partial() -> anyhow::Result<()> {
         let (store, temp, arena) = setup_store()?;
 
-        let fpath = LogicalPath::new(temp.path(), &model::Path::parse("finish_partial.txt")?);
+        let fpath = LogicalPath::new(temp.path(), &realize_types::Path::parse("finish_partial.txt")?);
         fs::write(fpath.partial_path(), "abcde")?;
 
         store
@@ -1147,7 +1147,7 @@ mod tests {
     async fn finish_final() -> anyhow::Result<()> {
         let (store, temp, arena) = setup_store()?;
 
-        let fpath = LogicalPath::new(temp.path(), &model::Path::parse("finish_partial.txt")?);
+        let fpath = LogicalPath::new(temp.path(), &realize_types::Path::parse("finish_partial.txt")?);
         fs::write(fpath.final_path(), "abcde")?;
 
         store
@@ -1164,7 +1164,7 @@ mod tests {
     #[tokio::test]
     async fn truncate() -> anyhow::Result<()> {
         let (store, temp, arena) = setup_store()?;
-        let fpath = LogicalPath::new(temp.path(), &model::Path::parse("truncate.txt")?);
+        let fpath = LogicalPath::new(temp.path(), &realize_types::Path::parse("truncate.txt")?);
         std::fs::write(fpath.partial_path(), b"abcdefghij")?;
         store
             .truncate(&arena, &fpath.path, 7, &Options::default())
@@ -1178,12 +1178,12 @@ mod tests {
     async fn hash_final_and_partial() -> anyhow::Result<()> {
         let (store, temp, arena) = setup_store()?;
         let content = b"hello world";
-        let fpath = LogicalPath::new(temp.path(), &model::Path::parse("foo.txt")?);
+        let fpath = LogicalPath::new(temp.path(), &realize_types::Path::parse("foo.txt")?);
         std::fs::write(fpath.final_path(), content)?;
         let hash = store
             .hash(
                 &arena,
-                &model::Path::parse("foo.txt")?,
+                &realize_types::Path::parse("foo.txt")?,
                 &ByteRange {
                     start: 0,
                     end: content.len() as u64,
@@ -1196,12 +1196,12 @@ mod tests {
 
         // Now test partial
         let content2 = b"partial content";
-        let fpath2 = LogicalPath::new(temp.path(), &model::Path::parse("bar.txt")?);
+        let fpath2 = LogicalPath::new(temp.path(), &realize_types::Path::parse("bar.txt")?);
         std::fs::write(fpath2.partial_path(), content2)?;
         let hash2 = store
             .hash(
                 &arena,
-                &model::Path::parse("bar.txt")?,
+                &realize_types::Path::parse("bar.txt")?,
                 &ByteRange {
                     start: 0,
                     end: content2.len() as u64,
@@ -1218,12 +1218,12 @@ mod tests {
     async fn hash_past_file_end() -> anyhow::Result<()> {
         let (store, temp, arena) = setup_store()?;
         let content = b"hello world";
-        let fpath = LogicalPath::new(temp.path(), &model::Path::parse("foo.txt")?);
+        let fpath = LogicalPath::new(temp.path(), &realize_types::Path::parse("foo.txt")?);
         std::fs::write(fpath.final_path(), content)?;
         let hash = store
             .hash(
                 &arena,
-                &model::Path::parse("foo.txt")?,
+                &realize_types::Path::parse("foo.txt")?,
                 &ByteRange {
                     start: 100,
                     end: 200,
@@ -1240,12 +1240,12 @@ mod tests {
     async fn hash_short_read() -> anyhow::Result<()> {
         let (store, temp, arena) = setup_store()?;
         let content = b"hello world";
-        let fpath = LogicalPath::new(temp.path(), &model::Path::parse("foo.txt")?);
+        let fpath = LogicalPath::new(temp.path(), &realize_types::Path::parse("foo.txt")?);
         std::fs::write(fpath.final_path(), content)?;
         let hash = store
             .hash(
                 &arena,
-                &model::Path::parse("foo.txt")?,
+                &realize_types::Path::parse("foo.txt")?,
                 &ByteRange { start: 0, end: 200 },
                 &Options::default(),
             )
@@ -1258,19 +1258,19 @@ mod tests {
     #[tokio::test]
     async fn delete_final_and_partial() -> anyhow::Result<()> {
         let (store, temp, arena) = setup_store()?;
-        let fpath = LogicalPath::new(temp.path(), &model::Path::parse("foo.txt")?);
+        let fpath = LogicalPath::new(temp.path(), &realize_types::Path::parse("foo.txt")?);
         std::fs::write(fpath.final_path(), b"data")?;
         std::fs::write(fpath.partial_path(), b"data2")?;
         assert!(fpath.final_path().exists());
         assert!(fpath.partial_path().exists());
         store
-            .delete(&arena, &model::Path::parse("foo.txt")?, &Options::default())
+            .delete(&arena, &realize_types::Path::parse("foo.txt")?, &Options::default())
             .await?;
         assert!(!fpath.final_path().exists());
         assert!(!fpath.partial_path().exists());
         // Should succeed if called again (idempotent)
         store
-            .delete(&arena, &model::Path::parse("foo.txt")?, &Options::default())
+            .delete(&arena, &realize_types::Path::parse("foo.txt")?, &Options::default())
             .await?;
         Ok(())
     }
@@ -1278,7 +1278,7 @@ mod tests {
     #[tokio::test]
     async fn calculate_signature_and_diff_and_apply_delta() -> anyhow::Result<()> {
         let (store, temp, arena) = setup_store()?;
-        let file_path = model::Path::parse("foo.txt")?;
+        let file_path = realize_types::Path::parse("foo.txt")?;
         let file_content = b"hello world, this is a test of rsync signature!";
         temp.child("foo.txt").write_binary(file_content)?;
 
@@ -1344,7 +1344,7 @@ mod tests {
         let result = server
             .calculate_signature(
                 &arena,
-                &model::Path::parse("notfound.txt")?,
+                &realize_types::Path::parse("notfound.txt")?,
                 &ByteRange { start: 0, end: 10 },
                 &Options::default(),
             )
@@ -1357,7 +1357,7 @@ mod tests {
     #[tokio::test]
     async fn apply_delta_error_case() -> anyhow::Result<()> {
         let (store, temp, arena) = setup_store()?;
-        let file_path = model::Path::parse("foo.txt")?;
+        let file_path = realize_types::Path::parse("foo.txt")?;
         temp.child("foo.txt").write_str("abc")?;
         // Try to apply a bogus delta
         let result = store
@@ -1365,7 +1365,7 @@ mod tests {
                 &arena,
                 &file_path,
                 &ByteRange { start: 0, end: 3 },
-                crate::model::Delta(vec![1, 2, 3]),
+                realize_types::Delta(vec![1, 2, 3]),
                 &Hash::zero(),
                 &Options::default(),
             )
@@ -1441,7 +1441,7 @@ mod tests {
         let data = store
             .read(
                 &arena,
-                &model::Path::parse("foo.txt")?,
+                &realize_types::Path::parse("foo.txt")?,
                 &ByteRange { start: 0, end: 7 },
                 &Options {
                     ignore_partial: false,
@@ -1453,7 +1453,7 @@ mod tests {
         let data = store
             .read(
                 &arena,
-                &model::Path::parse("foo.txt")?,
+                &realize_types::Path::parse("foo.txt")?,
                 &ByteRange { start: 0, end: 5 },
                 &Options {
                     ignore_partial: true,
@@ -1470,7 +1470,7 @@ mod tests {
         // Create nested directories: a/b/c/file.txt
         let nested_dir = temp.child("a/b/c");
         std::fs::create_dir_all(nested_dir.path())?;
-        let file_path = model::Path::parse("a/b/c/file.txt")?;
+        let file_path = realize_types::Path::parse("a/b/c/file.txt")?;
         let logical = LogicalPath::new(temp.path(), &file_path);
         std::fs::write(logical.final_path(), b"data")?;
         // Delete the file
@@ -1493,7 +1493,7 @@ mod tests {
         // Create nested directories: a/b/c/file.txt and a/b/c/keep.txt
         let nested_dir = temp.child("a/b/c");
         std::fs::create_dir_all(nested_dir.path())?;
-        let file_path = model::Path::parse("a/b/c/file.txt")?;
+        let file_path = realize_types::Path::parse("a/b/c/file.txt")?;
         let keep_path = temp.child("a/b/c/keep.txt");
         let logical = LogicalPath::new(temp.path(), &file_path);
         std::fs::write(logical.final_path(), b"data")?;

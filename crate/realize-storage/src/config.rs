@@ -1,4 +1,4 @@
-use crate::model::Arena;
+use realize_types::Arena;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -26,7 +26,7 @@ impl StorageConfig {
 
 /// Define an Arena available locally.
 ///
-/// An arena is identified by [crate::model::Arena].
+/// An arena is identified by [realize_types::Arena].
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
 pub struct ArenaConfig {
     /// Local path to the directory where files for that arena are

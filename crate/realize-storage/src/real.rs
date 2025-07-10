@@ -7,7 +7,7 @@ pub mod reader;
 #[allow(clippy::uninlined_format_args)]
 #[allow(clippy::extra_unused_type_parameters)]
 mod real_capnp {
-    include!(concat!(env!("OUT_DIR"), "/storage/real_capnp.rs"));
+    include!(concat!(env!("OUT_DIR"), "/real_capnp.rs"));
 }
 pub mod store;
 pub mod watcher;

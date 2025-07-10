@@ -1,4 +1,4 @@
-use crate::model::{self, Arena};
+use realize_types::{self, Arena};
 use crate::utils::holder::ByteConversionError;
 use tokio::task::JoinError;
 
@@ -84,8 +84,8 @@ impl From<redb::CommitError> for StorageError {
     }
 }
 
-impl From<model::PathError> for StorageError {
-    fn from(_: model::PathError) -> Self {
+impl From<realize_types::PathError> for StorageError {
+    fn from(_: realize_types::PathError) -> Self {
         StorageError::from(ByteConversionError::Invalid("path"))
     }
 }

@@ -1,7 +1,7 @@
 #![allow(dead_code)] // work in progress
 
 use super::index::{FileTableEntry, HistoryTableEntry, RealIndexAsync};
-use crate::model::{Arena, Hash, Path, UnixTime};
+use realize_types::{Arena, Hash, Path, UnixTime};
 use futures::StreamExt as _;
 use tokio::{sync::mpsc, task::JoinHandle};
 use uuid::Uuid;

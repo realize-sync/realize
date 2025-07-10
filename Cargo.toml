@@ -1,8 +1,10 @@
 [workspace]
 resolver = "3"
 members = [
-    "crate/realize-types",
-    "crate/realize-lib",
+    "crate/realize-cmd",
     "crate/realize-daemon",
-    "crate/realize-cmd"
-, "crate/realize-network"]
+    "crate/realize-lib",
+    "crate/realize-network",
+    "crate/realize-storage",
+    "crate/realize-types",
+]
