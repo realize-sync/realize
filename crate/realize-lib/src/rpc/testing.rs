@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::LocalSet;
 use tokio::time::timeout;
+use tokio_retry::strategy::FixedInterval;
 
 /// Create up to 3 inter-connected [Household]s for testing, with one
 /// arena.
@@ -144,6 +145,24 @@ impl HouseholdFixture {
             .ok_or_else(|| anyhow::anyhow!("unknown peer: {peer}"))?;
 
         Household::spawn(local, self.peers.networking(peer)?, storage.clone())
+    }
+
+    /// Wait for the given file to appear in the given peer's cache, in the test arena.
+    pub async fn wait_for_file_in_cache(&self, peer: &Peer, filename: &str) -> anyhow::Result<()> {
+        let cache = self.cache(peer)?;
+
+        let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
+        let arena = HouseholdFixture::test_arena();
+        let arena_inode = cache.arena_root(&arena)?;
+        while cache.lookup(arena_inode, filename).await.is_err() {
+            if let Some(delay) = retry.next() {
+                tokio::time::sleep(delay).await;
+            } else {
+                panic!("[arena]/{filename} was never added to the cache");
+            }
+        }
+
+        Ok(())
     }
 }
 

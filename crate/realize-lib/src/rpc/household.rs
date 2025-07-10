@@ -904,99 +904,24 @@ mod tests {
     use super::*;
     use crate::rpc::testing::HouseholdFixture;
     use futures::TryStreamExt as _;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::time::Duration;
     use tokio::fs;
-    use tokio_retry::strategy::FixedInterval;
-
-    struct Fixture {
-        households: HouseholdFixture,
-    }
-    impl Fixture {
-        async fn setup() -> anyhow::Result<Self> {
-            let _ = env_logger::try_init();
-
-            let households = HouseholdFixture::setup().await?;
-            Ok(Self { households })
-        }
-
-        fn arena_root(&self, peer: &Peer) -> PathBuf {
-            self.households.arena_root(peer)
-        }
-
-        fn household(&self, local: &LocalSet, peer: &Peer) -> anyhow::Result<Household> {
-            self.households.create_household(local, peer)
-        }
-
-        /// Run a server exporting the given household.
-        ///
-        /// A port must have been configured for the peer beforehand.
-        ///
-        /// This is a lower-level call that's usually not called directly. Prefer calling with_two_peers or with_three_peers
-        pub async fn run_server(
-            &self,
-            peer: &Peer,
-            household: &Household,
-        ) -> anyhow::Result<Arc<Server>> {
-            let mut server = Server::new(self.households.peers.networking(peer)?);
-            household.register(&mut server);
-
-            let server = Arc::new(server);
-
-            let configured = self.households.peers.hostport(peer).await;
-            server
-                .listen(configured.ok_or(anyhow::anyhow!("No port configured for {peer}"))?)
-                .await?;
-
-            Ok(server)
-        }
-
-        /// Wait for the given file to appear in the given peer's cache, in the test arena.
-        async fn wait_for_file(&self, peer: &Peer, filename: &str) -> anyhow::Result<()> {
-            let cache = &self.households.cache(peer)?;
-
-            let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
-            let arena = HouseholdFixture::test_arena();
-            let arena_inode = cache.arena_root(&arena)?;
-            while cache.lookup(arena_inode, filename).await.is_err() {
-                if let Some(delay) = retry.next() {
-                    tokio::time::sleep(delay).await;
-                } else {
-                    panic!("[arena]/{filename} was never added to the cache");
-                }
-            }
-
-            Ok(())
-        }
-    }
 
     #[tokio::test]
     async fn household_subscribes() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup().await?;
-        let local = LocalSet::new();
+        let mut fixture = HouseholdFixture::setup().await?;
+        fixture
+            .with_two_peers()
+            .await?
+            .run(async |_, _| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
 
-        let a = &HouseholdFixture::a();
-        fixture.households.pick_port(a)?;
-
-        let b = &HouseholdFixture::b();
-        fixture.households.pick_port(b)?;
-
-        let household_a = fixture.household(&local, a)?;
-        let _server_a = fixture.run_server(a, &household_a).await?;
-
-        let household_b = fixture.household(&local, b)?;
-        let _server_b = fixture.run_server(b, &household_b).await?;
-        household_a.keep_connected()?;
-
-        local
-            .run_until(async move {
                 // A file created in B's arena should eventually become
                 // available in cache A.
                 let b_dir = fixture.arena_root(&b);
                 fs::write(&b_dir.join("bar.txt"), b"test").await?;
 
-                fixture.wait_for_file(a, "bar.txt").await?;
+                fixture.wait_for_file_in_cache(&a, "bar.txt").await?;
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -1007,9 +932,8 @@ mod tests {
 
     #[tokio::test]
     async fn read_from_peer() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup().await?;
+        let mut fixture = HouseholdFixture::setup().await?;
         fixture
-            .households
             .with_two_peers()
             .await?
             .run(async |household_a, _household_b| {
@@ -1019,7 +943,7 @@ mod tests {
                 let b_dir = fixture.arena_root(&b);
                 fs::write(&b_dir.join("bar.txt"), b"test").await?;
 
-                fixture.wait_for_file(&a, "bar.txt").await?;
+                fixture.wait_for_file_in_cache(&a, "bar.txt").await?;
 
                 let stream = household_a.read(
                     vec![b.clone()],
