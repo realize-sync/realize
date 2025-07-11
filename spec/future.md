@@ -20,29 +20,6 @@ Task List:
  - write integration tests
  - add support for tracking cache size and doing eviction
 
-## Peers and arenas as numbers {#shortpeer}
-
-Peers and arenas are used everywhere within the app, and they keep
-getting copied. It's fiddly and annoying.
-
-Let's turn them into a number using
-[Fingerprint64](https://docs.rs/farmhash/latest/farmhash/fn.fingerprint64.html)
-or equivalent algorithm. At startup, the config file is read with all
-peers and arenas and they're all fingerprinted. From then on, only the
-number is used. A static hash map exists to display them as strings
-when needed.
-
-That number is stable, so can be stored in the local databases.
-
-While collisions are extremely unlikely, but still, they're not
-impossible. Just to be sure, check for collisions and refuse to start
-if there is a collision. Solving this requires a rename. Peer names
-are local anyways, so renames are easy. Renaming existing arenas is a
-planned feature.
-
-To be safe, arenas and peers numbers should only be used locally. RPCs
-should keep using strings.
-
 ## Remove path from FileContent {#cachepath}
 
 `FileContent`, defined in
