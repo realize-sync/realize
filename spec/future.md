@@ -3,10 +3,45 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
-## Design and implement a blob store {#blobstore}
+## Blobstore {#blobstore}
 
-BlobStore is the part of the Unreal Cache that stores the actual file
-data. It works as a cache, with a cache eviction algorithm TBD.
+Implement an Arena-specific blob store as described in the section
+Blobstore of [unreal.md](spec/unreal.md). Start with a blob store with
+only one area/LRU queue; the Working area.
+
+Task List:
+ - define how the unreal cache and downloader interface with the
+   blobstore and write skeleton with just that interface in
+   crate/realize-storage/src/unreal/blobstore.rs with everything
+   implemented as no-op, make sure it compiles
+ - write capnp in crate/realize-storage/capnp/unreal/blobstore.capnp,
+   add it to crate/realize-storage/capnp/unreal.rs, ake sure it compiles
+ - implement a no-eviction version, add unit tests
+ - write integration tests
+ - add support for tracking cache size and doing eviction
+
+## Peers and arenas as numbers {#shortpeer}
+
+Peers and arenas are used everywhere within the app, and they keep
+getting copied. It's fiddly and annoying.
+
+Let's turn them into a number using
+[Fingerprint64](https://docs.rs/farmhash/latest/farmhash/fn.fingerprint64.html)
+or equivalent algorithm. At startup, the config file is read with all
+peers and arenas and they're all fingerprinted. From then on, only the
+number is used. A static hash map exists to display them as strings
+when needed.
+
+That number is stable, so can be stored in the local databases.
+
+While collisions are extremely unlikely, but still, they're not
+impossible. Just to be sure, check for collisions and refuse to start
+if there is a collision. Solving this requires a rename. Peer names
+are local anyways, so renames are easy. Renaming existing arenas is a
+planned feature.
+
+To be safe, arenas and peers numbers should only be used locally. RPCs
+should keep using strings.
 
 ## Remove path from FileContent {#cachepath}
 

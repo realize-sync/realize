@@ -430,14 +430,170 @@ implementation.
 
 ### Store File Content
 
-In the future, the cache will store file content, so `read` can serve
-directly from the cache, without connecting to a peer. For that to
-work, everything read from a peer should be added to the cache.
+The cache stores file content, fully or partially.
 
-File content is subject to cache eviction strategy (LRU), to make
-room, if necessary.
+Stored file content is useful:
 
-Details TBD
+- for working on a file locally, as the same data is often read more
+  than once. Even partial data is useful as often utilities will read
+  only a subset of a large video file to extract information about it;
+  typically just the beginning and sometimes end, depending on the
+  format.
+
+- for reading files without being connected to the peer that owns them
+
+In general, when downloading a file, the data should be stored
+optimistically, then kept in a cache portion of the store for later
+use. In addition to that, files can be tagged for download.
+
+#### Blobstore
+
+The blob store functions as a cache of file data. A cache size should
+be set, either absolutely or as a percentage of the filesystem size.
+Cache size may be reduced if filesystem usage is above a certain
+percentage.
+
+The cache stores blobs of different size, computed in term of blocks
+(using the filesystem block size, gathered at first startup.)
+
+When reading a file from the cache (*active file*), a sparse file of
+the right size is created, then filled as the file is accessed. As
+blocks are added to the file, files might need to be evicted from the
+cache to make room.
+
+When marking a file as available offline (*marked files*), the file is
+downloaded in the background and added to the cache unconditionally.
+As blocks are added to the file, files might need to be evicted from
+the cache to make room.
+
+The Blobstore is split into two areas: a working area and a protected
+area, each working as a cache with LRU eviction policy taking a
+percentage of the total cache size (such as 20/80). Files always start
+in the working area, which works as a LRU cache. When evicted from the
+Working area, marked files and files that are deemed useful enough are
+moved to the protected area, which might need to evict some data to
+make room, chosen using LRU.
+
+Files that are deleted move into "Pending removal", which also works
+as a LRU cache. When more space is needed, it is first taken by
+evicting data from "Pending removal" then from "Protected". A
+background process might also empty "Pending removal".
+
+
+```
+     ╷
+     │ New
+     ▼
+╭──────────╮  (LRU)
+│ Working  │╶───────▶ marked?
+╰──────────╯ evict    frequently used?
+     ╷                protected area not full? (maybe)
+     │                    ╷
+     │                    │ Add
+     │                    │
+     │                    ▼
+     │             ╭────────────╮  (LRU)
+     │             │ Protected  │╶────────▶ delete
+     │             ╰─┬──────────╯  evict
+     │               │
+     │               │
+     │               │  ╭─────────────────╮
+     ╰───────────────┴─▶│ Pending Removal │╶───────▶ delete
+                        ╰─────────────────╯ evict
+```
+
+This setup is freely inspired by "TinyLFU: A Highly Efficient Cache
+Admission Policy" (Einziger, Friedman)
+
+Figuring out usage frequency happens outside of the Blobstore, working
+on inodes and their access patterns. See next section.
+
+A Blobstore for an arena is a directory within that arena with:
+ - a redb database "store.db"
+ - set of files with a u64 as name, encoded as Base64 without final ==
+
+The redb database stores the following tables:
+
+**blob**
+Key: u64 (incrementing)
+value: BlobTableEntry, defined in crate/realize-storage/capnp/unreal/blobstore.capnp
+ - owning inode (for getting frequency)
+ - areas that have been written (ByteRanges)
+ - used blocks, total blocks  (for comparison with FS, if needed)
+ - ID of containing LRU queue (see queue table)
+ - next and prev (key of blob table) for inclusion into a doubly-linked list for LRU
+
+The file name is the key encoded as base64 no ==. Some periodic job
+should compare files with database and fix any discrepancies. When
+writing to both database and filesystem, operation order is chosen
+carefully in case one step fails so work can continue where it left
+off. For example:
+ - Creation: 1. write to db, 2. create file 3. set used blocks/total blocks in db
+ - Write data: 1. write data to file, 2. update range and block/total blocks in db
+ - Delete: 1. delete file, 2. delete entry, decrease block/total block in db
+
+When a new blob is added, a sparse file of the right size is created.
+It is filled as data is downloaded. More on sparse files on Linux [Handling sparse files on Linux](https://www.systutorials.com/handling-sparse-files-on-linux/#lseek), MacOS [APFS How sparse files work](https://eclecticlight.co/2024/06/08/apfs-how-sparse-files-work/), Windows [DeviceIoControl
+FSCTL_SET_SPARSE
+IOCTL](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_set_sparse)
+
+Used blocks/total blocks come from the filesystem (unix MetadataExt)
+and are updated after each write. This is mainly used to know what to
+decrease the cache size by if a file disappears.
+
+When these values are increased or decreased, so is the block count of
+the containing queue.
+
+**queues**
+Key: u16 (LRU Queue ID, an enum defined in blobstore.capnp: working area, protected area, pending removal)
+Value: QueueTableEntry, defined in blobstore.capnp
+ - first node (a key of the blob table)
+ - last node
+ - block count
+
+The blob id is kept in the cache, associated with a specific version
+of a file (hash). When that version is deleted or overwritten, the
+blob is moved to the pending removal queue. It is not immediately
+deleted, as existing data might be useful when downloading a new
+version or to serve while offline, still pending removal have the
+lowest priority priority and will be evicted whenever more space is
+needed, before evicting from the protected area.
+
+**settings**
+Key: u16 (setting ID, an enum with u16 as repr, to be consistent with capnp enums)
+Value: [u8] (bytes, depending on setting)
+
+- block size, read when the database is created
+- uuid, generated when the database is created
+
+#### Computing Usage Frequency in the Cache
+
+Each inode has the fields: usage count, generation. Each use (reading
+1 block through download of store access) increases usage count until
+a certain total usage value is reached (called W, TBD), after which
+the existing counts are halved and generation is increased.
+
+This is an implementation of usage count described in "TinyLFU: A
+Highly Efficient Cache Admission Policy" (Einziger, Friedman) adapted
+for a situation where we can keep data for all possible entries
+(they're the inodes).
+
+Keeping usage count and generation avoids having to update all entries
+when generation increases. An entry that's not accessed for a long
+time will have a usage count that's part of a very old generation,
+that can be used to compute the latest usage count.
+
+To avoid writing for every read access, uses are kept in memory as a
+journal and dumped to database after a certain time, such as 5 or 10
+minutes or when the process is shut down. This means that access
+history might be lost.
+
+A file is worth keeping if its value is >= (blocks*W/C), with C the
+cache size is blocks and W the max usage value of a generation.
+
+Note that since this relies on FS block size, frequency computation
+might need to be updated or discarded if the FS block size of the
+arena blobstore changes.
 
 ### Versioned Storage
 
