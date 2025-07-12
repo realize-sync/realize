@@ -1,8 +1,8 @@
 #![allow(dead_code)] // work in progress
 
 use super::index::{FileTableEntry, HistoryTableEntry, RealIndexAsync};
-use realize_types::{Arena, Hash, Path, UnixTime};
 use futures::StreamExt as _;
+use realize_types::{Arena, Hash, Path, UnixTime};
 use tokio::{sync::mpsc, task::JoinHandle};
 use uuid::Uuid;
 
@@ -119,7 +119,7 @@ pub enum Notification {
 }
 
 impl Notification {
-    fn arena(&self) -> &Arena {
+    pub fn arena(&self) -> &Arena {
         match self {
             Notification::Add { arena, .. } => arena,
             Notification::Replace { arena, .. } => arena,
@@ -130,7 +130,7 @@ impl Notification {
             Notification::Connected { arena, .. } => arena,
         }
     }
-    fn path(&self) -> Option<&Path> {
+    pub fn path(&self) -> Option<&Path> {
         match self {
             Notification::Add { path, .. } => Some(path),
             Notification::Replace { path, .. } => Some(path),
@@ -141,7 +141,7 @@ impl Notification {
             Notification::Connected { .. } => None,
         }
     }
-    fn index(&self) -> Option<u64> {
+    pub fn index(&self) -> Option<u64> {
         match self {
             Notification::Add { index, .. } => Some(*index),
             Notification::Replace { index, .. } => Some(*index),

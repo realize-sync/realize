@@ -27,6 +27,7 @@ tokio-stream = "0.1.17"
 tokio-util = { version = "0.7.15", features = ["compat", "io"] }
 uuid = { version = "1.17.0", features = ["std", "v7"] }
 walkdir = "2.5"
+bimap = "0.6.3"
 
 [dev-dependencies]
 assert_fs = "1.1"

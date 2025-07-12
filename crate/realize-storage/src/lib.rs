@@ -51,22 +51,22 @@ impl Storage {
         let store = RealStore::from_config(&config.arenas);
         let cache = UnrealCacheAsync::from_config(&config)?;
         let mut arenas = HashMap::new();
+        let exclude = build_exclude(&config);
         for (arena, arena_config) in &config.arenas {
             let root = &arena_config.path;
             if let Some(index_config) = &arena_config.index {
                 let index_path = &index_config.db;
                 let index = RealIndexAsync::open(arena.clone(), &index_path).await?;
-                let mut exclude = vec![];
-                if let Ok(path) = realize_types::Path::from_real_path_in(&index_path, root) {
-                    exclude.push(path);
-                }
-                if let Some(cache_config) = &config.cache {
-                    if let Ok(path) = realize_types::Path::from_real_path_in(&cache_config.db, root)
-                    {
-                        exclude.push(path);
-                    }
-                }
-                let watcher = RealWatcher::spawn(root, exclude, index.clone()).await?;
+                let watcher = RealWatcher::spawn(
+                    root,
+                    exclude
+                        .iter()
+                        .map(|p| realize_types::Path::from_real_path_in(p, root))
+                        .flatten()
+                        .collect::<Vec<_>>(),
+                    index.clone(),
+                )
+                .await?;
                 arenas.insert(
                     arena.clone(),
                     ArenaStorage {
@@ -132,4 +132,23 @@ impl Storage {
             .get(arena)
             .ok_or_else(|| StorageError::UnknownArena(arena.clone()))
     }
+}
+
+/// Build a vector of all databases listed in `config`, to be excluded
+/// from syncing.
+fn build_exclude(config: &StorageConfig) -> Vec<&std::path::Path> {
+    let mut exclude = vec![];
+    if let Some(path) = &config.cache {
+        exclude.push(path.db.as_ref());
+    }
+    for (_, arena_config) in &config.arenas {
+        if let Some(index_config) = &arena_config.index {
+            exclude.push(index_config.db.as_ref());
+        }
+        if let Some(cache_config) = &arena_config.cache {
+            exclude.push(cache_config.db.as_ref());
+        }
+    }
+
+    exclude
 }

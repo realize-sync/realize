@@ -8,8 +8,15 @@ pub async fn in_memory_cache<T>(arenas: T) -> anyhow::Result<UnrealCacheAsync>
 where
     T: IntoIterator<Item = Arena> + Send + 'static,
 {
+    let mut arena_dbs = vec![];
+    for arena in arenas.into_iter() {
+        arena_dbs.push((
+            arena,
+            redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?,
+        ));
+    }
     let cache = UnrealCacheAsync::with_db(
-        arenas,
+        arena_dbs,
         redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?,
     )
     .await?;
@@ -31,12 +38,15 @@ where
             .map(|arena| {
                 let arena_dir = arena_root(dir, &arena);
                 let index_path = arena_dir.join(".index.db");
-
+                let arena_cache_path = arena_dir.join(".cache.db");
                 (
                     arena,
                     ArenaConfig {
                         path: arena_dir,
                         index: Some(IndexConfig { db: index_path }),
+                        cache: Some(CacheConfig {
+                            db: arena_cache_path,
+                        }),
                     },
                 )
             })

@@ -1,7 +1,7 @@
-use realize_types::{Arena, ByteRange, Path, Peer};
 use crate::rpc::Household;
-use realize_storage::{StorageError, UnrealCacheAsync};
 use futures::Future;
+use realize_storage::{StorageError, UnrealCacheAsync};
+use realize_types::{Arena, ByteRange, Path, Peer};
 use std::cmp::min;
 use std::collections::VecDeque;
 use std::io::{ErrorKind, SeekFrom};
@@ -246,8 +246,8 @@ impl AsyncRead for Download {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use realize_types::Path;
     use crate::rpc::testing::HouseholdFixture;
+    use realize_types::Path;
     use std::io::Write as _;
     use tokio::fs;
     use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
@@ -275,10 +275,7 @@ mod tests {
 
                 // Get the inode for the file
                 let arena = HouseholdFixture::test_arena();
-                let arena_root = cache.arena_root(&arena)?;
-                let (inode, _) = cache
-                    .lookup_path(arena_root, &Path::parse("test.txt")?)
-                    .await?;
+                let (inode, _) = cache.lookup_path(&arena, &Path::parse("test.txt")?).await?;
 
                 let mut reader = downloader.reader(inode).await?;
                 assert_eq!("File content", read_string(&mut reader).await?);
@@ -309,10 +306,7 @@ mod tests {
                 let downloader = Downloader::new(household_a, cache.clone());
 
                 let arena = HouseholdFixture::test_arena();
-                let arena_root = cache.arena_root(&arena)?;
-                let (inode, _) = cache
-                    .lookup_path(arena_root, &Path::parse("test.txt")?)
-                    .await?;
+                let (inode, _) = cache.lookup_path(&arena, &Path::parse("test.txt")?).await?;
 
                 let mut reader = downloader.reader(inode).await?;
 
@@ -358,10 +352,7 @@ mod tests {
                 let downloader = Downloader::new(household_a, cache.clone());
 
                 let arena = HouseholdFixture::test_arena();
-                let arena_root = cache.arena_root(&arena)?;
-                let (inode, _) = cache
-                    .lookup_path(arena_root, &Path::parse("test.txt")?)
-                    .await?;
+                let (inode, _) = cache.lookup_path(&arena, &Path::parse("test.txt")?).await?;
 
                 let mut reader = downloader.reader(inode).await?;
 
@@ -401,10 +392,7 @@ mod tests {
                 let downloader = Downloader::new(household_a, cache.clone());
 
                 let arena = HouseholdFixture::test_arena();
-                let arena_root = cache.arena_root(&arena)?;
-                let (inode, _) = cache
-                    .lookup_path(arena_root, &Path::parse("test.txt")?)
-                    .await?;
+                let (inode, _) = cache.lookup_path(&arena, &Path::parse("test.txt")?).await?;
 
                 let mut reader = downloader.reader(inode).await?;
 
@@ -443,9 +431,8 @@ mod tests {
                 let downloader = Downloader::new(household_a, cache.clone());
 
                 let arena = HouseholdFixture::test_arena();
-                let arena_root = cache.arena_root(&arena)?;
                 let (inode, _) = cache
-                    .lookup_path(arena_root, &Path::parse("large_file")?)
+                    .lookup_path(&arena, &Path::parse("large_file")?)
                     .await?;
 
                 let mut reader = downloader.reader(inode).await?;
@@ -553,9 +540,8 @@ mod tests {
         let downloader = Downloader::new(household, cache.clone());
 
         let arena = HouseholdFixture::test_arena();
-        let arena_root = cache.arena_root(&arena)?;
         let (inode, _) = cache
-            .lookup_path(arena_root, &Path::parse("large_file")?)
+            .lookup_path(&arena, &Path::parse("large_file")?)
             .await?;
 
         let mut reader = downloader.reader(inode).await?;

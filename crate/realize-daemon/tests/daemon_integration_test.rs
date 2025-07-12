@@ -5,15 +5,15 @@ use nfs3_client::tokio::TokioConnector;
 use nfs3_types::nfs3::{Nfs3Result, READDIR3args};
 use predicates::prelude::*;
 use realize_core::config::Config;
-use realize_types;
-use realize_types::{Arena, Peer};
-use realize_network::Networking;
-use realize_network::config::PeerConfig;
 use realize_core::rpc::realstore;
 use realize_core::rpc::realstore::client::ClientOptions;
+use realize_network::Networking;
+use realize_network::config::PeerConfig;
 use realize_storage::RealStoreOptions;
 use realize_storage::config::IndexConfig;
 use realize_storage::config::{ArenaConfig, CacheConfig};
+use realize_types;
+use realize_types::{Arena, Peer};
 use reqwest::Client;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -62,6 +62,7 @@ impl Fixture {
             ArenaConfig {
                 path: testdir.to_path_buf(),
                 index: None,
+                cache: None,
             },
         );
 
@@ -95,6 +96,18 @@ impl Fixture {
             server_address,
             server_privkey,
         })
+    }
+
+    fn configure_cache(&mut self) {
+        self.config.storage.cache = Some(CacheConfig {
+            db: self.tempdir.child("cache.db").to_path_buf(),
+        });
+        for (arena, arena_config) in &mut self.config.storage.arenas {
+            let child = self.tempdir.child(format!("{arena}-cache.db"));
+            arena_config.cache = Some(CacheConfig {
+                db: child.to_path_buf(),
+            });
+        }
     }
 
     pub fn command(&self) -> anyhow::Result<Command> {
@@ -333,9 +346,7 @@ async fn daemon_exports_nfs() -> anyhow::Result<()> {
     let nfs_port = portpicker::pick_unused_port().expect("No ports free");
     let nfs_addr = format!("127.0.0.1:{nfs_port}");
 
-    fixture.config.storage.cache = Some(CacheConfig {
-        db: fixture.tempdir.child("cache.db").to_path_buf(),
-    });
+    fixture.configure_cache();
 
     // Run process in the background and in a way that allows reading
     // its output, so we know what port to connect to.
@@ -416,9 +427,7 @@ async fn daemon_updates_cache() -> anyhow::Result<()> {
 
     let nfs_port = portpicker::pick_unused_port().expect("No ports free");
     let nfs_addr = format!("127.0.0.1:{nfs_port}");
-    fixture_b.config.storage.cache = Some(CacheConfig {
-        db: fixture_b.tempdir.child("cache.db").to_path_buf(),
-    });
+    fixture_b.configure_cache();
 
     let mut daemon_b = fixture_b.command()?.arg("--nfs").arg(nfs_addr).spawn()?;
 

@@ -37,6 +37,9 @@ pub struct ArenaConfig {
 
     /// Configures the local index.
     pub index: Option<IndexConfig>,
+
+    /// Optional path to the cache database for this arena.
+    pub cache: Option<CacheConfig>,
 }
 
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]

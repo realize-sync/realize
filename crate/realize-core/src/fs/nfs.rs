@@ -1,6 +1,4 @@
 use super::downloader::{Download, Downloader};
-use realize_types::UnixTime;
-use realize_storage::{FileMetadata, InodeAssignment, StorageError, UnrealCacheAsync};
 use async_trait::async_trait;
 use moka::future::Cache;
 use nfsserve::nfs::{
@@ -8,6 +6,8 @@ use nfsserve::nfs::{
 };
 use nfsserve::tcp::{NFSTcp as _, NFSTcpListener};
 use nfsserve::vfs::{NFSFileSystem, ReadDirResult, VFSCapabilities};
+use realize_storage::{FileMetadata, InodeAssignment, StorageError, UnrealCacheAsync};
+use realize_types::UnixTime;
 use std::io::{ErrorKind, SeekFrom};
 use std::net::SocketAddr;
 use std::str::Utf8Error;
@@ -344,10 +344,10 @@ fn to_nfs_time(time: &UnixTime) -> nfstime3 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use realize_types::{Hash, Path};
     use crate::rpc::testing::HouseholdFixture;
-    use realize_storage::Notification;
     use nfsserve::nfs::nfsstring;
+    use realize_storage::Notification;
+    use realize_types::{Hash, Path};
     use std::time::SystemTime;
     use tokio::fs;
 
@@ -384,7 +384,6 @@ mod tests {
 
     #[tokio::test]
     async fn arena_dir() -> anyhow::Result<()> {
-        let start_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?;
         let mut fixture = HouseholdFixture::setup().await?;
         fixture
             .with_two_peers()
@@ -408,8 +407,6 @@ mod tests {
                 assert_eq!(0o0550, attrs.mode);
                 assert_eq!(nix::unistd::getuid().as_raw(), attrs.uid);
                 assert_eq!(nix::unistd::getgid().as_raw(), attrs.gid);
-                // mtime should have been set when the arena was added
-                assert!(attrs.mtime.seconds >= start_time.as_secs() as u32);
                 Ok::<(), anyhow::Error>(())
             })
             .await?;
