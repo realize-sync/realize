@@ -111,9 +111,42 @@ UnrealCacheBlocking keeps a hash map of ArenaUnrealCacheBlocking
 instances.
 
 Public methods of UnrealCacheBlocking either take an Arena (such as
-update) or just an inode (such as lookup). The functions that take an
-Arena are easy to just dispatch to ArenaUnrealCacheBlocking. The
-functions that take an inode require calling lookup_arena(u64).
+update) or just an inode (such as lookup) and, in most case, just delegate to the relevant ArenaUnrealCachBlocking.
+
+
+For example:
+```
+fn do_something(arena: &Arena, ...) -> ... {
+...
+}
+```
+
+Becomes:
+
+```
+fn do_something(arena: &Arena, ...) -> ... {
+  cache_for_arena(arena)?.do_something(...)
+}
+```
+
+The functions like the one above that take an Arena are easy to just
+dispatch to ArenaUnrealCacheBlocking. The functions that take an inode
+require calling lookup_arena(u64).
+
+
+```
+fn do_something(inode: u64, ...) -> ... {
+...
+}
+```
+
+Becomes:
+
+```
+fn do_something(inode: u64, ...) -> ... {
+  cache_for_arena(lookup_arena(u64)?)?.do_something(...)
+}
+```
 
 Now, to create an UnrealCacheBlocking::new, we need to pass it a
 global database and a database for each arena. The same goes with
