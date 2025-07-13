@@ -417,7 +417,7 @@ impl ArenaUnrealCacheBlocking {
 
     fn file_metadata(&self, inode: u64) -> Result<FileMetadata, StorageError> {
         let txn = self.db.begin_read()?;
-        do_file_availability(&txn, inode, &self.arena).map(|a| a.metadata)
+        do_file_metadata(&txn, inode)
     }
 
     fn dir_mtime(&self, inode: u64) -> Result<UnixTime, StorageError> {
@@ -874,6 +874,14 @@ fn get_file_entry(
         None => Ok(None),
         Some(e) => Ok(Some(e.value().parse()?)),
     }
+}
+
+fn do_file_metadata(txn: &ReadTransaction, inode: u64) -> Result<FileMetadata, StorageError> {
+    let file_table = txn.open_table(FILE_TABLE)?;
+    let entry = file_table.get((inode, ""))?.ok_or(StorageError::NotFound)?;
+    let file_entry = entry.value().parse()?;
+
+    Ok(file_entry.metadata)
 }
 
 fn do_file_availability(
