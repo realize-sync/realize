@@ -25,6 +25,10 @@ actions:
       4. Test the behavior that matters to users
       5. Test helpers in unit tests go in the test module.
       6. Test helpers in integration tests don't need to be tagged with cfg(test)
+      7. Add Fixture types in the current tests module to capture
+      setup that is common to all or most tests in the module. When
+      adding a new test, prefer extending the Fixture to cover the new
+      case over re-writing parts of it.
 
   - type: validate
     patterns:
@@ -48,14 +52,21 @@ examples:
       mod tests {
           use super::*;
 
-          fn create_test_instance() -> MyStruct {
-              // ...
+          struct Fixture {
+            instance: MyInstance; 
+          }
+          impl Fixture {
+            fn setup() -> anyhow::Result<()> {
+              Ok(Self(MyInstance::create()?)) 
+            } 
           }
 
           #[test]
-          fn verify_actual_behavior() {
-              let instance = create_test_instance();
-              assert!(instance.public_method());
+          fn verify_actual_behavior() -> anyhow::Result<()> {
+              let fixture = Fixture::setup()?;
+              assert!(fixture.instance.is_something());
+
+              Ok(())
           }
       }
     output: "Keep test code in test modules"
