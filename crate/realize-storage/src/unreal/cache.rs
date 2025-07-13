@@ -79,22 +79,20 @@ const PENDING_CATCHUP_TABLE: TableDefinition<(&str, &str, u64), u64> =
 
 /// Track Peer UUIDs.
 ///
-/// This table tracks the store UUID for each peer and arena.
+/// This table tracks the store UUID for each peer.
 ///
-/// TODO: Remove arena; this is only in the arena database.
-///
-/// Key: (&str, &str) (Peer, Arena)
+/// Key: &str (Peer)
 /// Value: PeerTableEntry
-const PEER_TABLE: TableDefinition<(&str, &str), Holder<PeerTableEntry>> =
+const PEER_TABLE: TableDefinition<&str, Holder<PeerTableEntry>> =
     TableDefinition::new("peer");
 
 /// Track last seen notification index.
 ///
-/// TODO: Remove arena; this is only in the arena database.
+/// This table tracks the last seen notification index for each peer.
 ///
-/// Key: (&str, &str) (Peer, Arena)
+/// Key: &str (Peer)
 /// Value: last seen index
-const NOTIFICATION_TABLE: TableDefinition<(&str, &str), u64> = TableDefinition::new("notification");
+const NOTIFICATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("notification");
 
 /// Track inode range allocation for arenas.
 ///
@@ -448,7 +446,7 @@ impl ArenaUnrealCacheBlocking {
     fn peer_progress(&self, peer: &Peer) -> Result<Option<Progress>, StorageError> {
         let txn = self.db.begin_read()?;
 
-        do_peer_progress(&txn, peer, &self.arena)
+        do_peer_progress(&txn, peer)
     }
 
     fn update(
@@ -471,7 +469,7 @@ impl ArenaUnrealCacheBlocking {
                 hash,
                 ..
             } => {
-                do_update_last_seen_notification(&txn, peer, &self.arena, index)?;
+                do_update_last_seen_notification(&txn, peer, index)?;
 
                 let mut file_table = txn.open_table(FILE_TABLE)?;
                 let (parent_inode, file_inode) =
@@ -501,7 +499,7 @@ impl ArenaUnrealCacheBlocking {
                 old_hash,
                 ..
             } => {
-                do_update_last_seen_notification(&txn, peer, &self.arena, index)?;
+                do_update_last_seen_notification(&txn, peer, index)?;
 
                 let (parent_inode, file_inode) =
                     do_create_file(&txn, self.arena_root, &path, &alloc_inode_range)?;
@@ -530,7 +528,7 @@ impl ArenaUnrealCacheBlocking {
                 old_hash,
                 ..
             } => {
-                do_update_last_seen_notification(&txn, peer, &self.arena, index)?;
+                do_update_last_seen_notification(&txn, peer, index)?;
 
                 let root = self.arena_root;
                 do_unlink(&txn, peer, root, &path, old_hash)?;
@@ -560,11 +558,11 @@ impl ArenaUnrealCacheBlocking {
             }
             Notification::CatchupComplete { index, .. } => {
                 do_delete_marked_files(&txn, peer, &self.arena)?;
-                do_update_last_seen_notification(&txn, peer, &self.arena, index)?;
+                do_update_last_seen_notification(&txn, peer, index)?;
             }
             Notification::Connected { uuid, .. } => {
                 let mut peer_table = txn.open_table(PEER_TABLE)?;
-                let key = (peer.as_str(), self.arena.as_str());
+                let key = peer.as_str();
                 if let Some(entry) = peer_table.get(key)? {
                     if entry.value().parse()?.uuid == uuid {
                         // We're connected to the same store as before; there's nothing to do.
@@ -739,11 +737,10 @@ impl UnrealCacheAsync {
 fn do_update_last_seen_notification(
     txn: &WriteTransaction,
     peer: &Peer,
-    arena: &Arena,
     index: u64,
 ) -> Result<(), StorageError> {
     let mut notification_table = txn.open_table(NOTIFICATION_TABLE)?;
-    notification_table.insert((peer.as_str(), arena.as_str()), index)?;
+    notification_table.insert(peer.as_str(), index)?;
 
     Ok(())
 }
@@ -751,9 +748,8 @@ fn do_update_last_seen_notification(
 fn do_peer_progress(
     txn: &ReadTransaction,
     peer: &Peer,
-    arena: &Arena,
 ) -> Result<Option<Progress>, StorageError> {
-    let key = (peer.as_str(), arena.as_str());
+    let key = peer.as_str();
 
     let peer_table = txn.open_table(PEER_TABLE)?;
     if let Some(entry) = peer_table.get(key)? {
