@@ -94,6 +94,10 @@ Task list:
 
 Next step is to actually split the cache. That's part of the next section.
 
+Status: DONE
+
+Follow-up: update the design doc after this change.
+
 ## An unreal cache per arena 2: split the cache {#arenacache2}
 
 The goal of this change is to split UnrealCacheBlocking, defined in
@@ -102,6 +106,9 @@ UnrealCacheBlocking (global) and ArenaUnrealCacheBlocking (per-arena).
 The interface of UnrealCacheBlocking doesn't change, but it delegates.
 most of the work to an arena-specific ArenaUnrealCacheBlocking
 instance.
+
+This continues the work done in the previous section #arenacache1, which
+introduced a way of allocating and dispatching inodes per arena (lookup_arena(inode))
 
 ArenaUnrealCacheBlocking interface mostly mirrors UnrealCacheBlocking,
 without add_arena and with a new root() function to return the arena
@@ -156,12 +163,52 @@ UnrealCacheBlocking::add_arena should be integrated into
 UnrealCachBlocking::new, since we know which arenas we'll support at
 the beginning.
 
+Status: DONE
+
+Some follow-up cleanups might be useful:
+ - remove unnecessary arenas from the table and table entries (see TODOs in cache.rs)
+ - update the design doc after this change.
+
+## Recover inode range in Arena cache {#inoderange}
+
+When allocating a inode range in
+[cache.rs](../crate/realize-storage/src/unreal/cache.rs), there are
+two databases working together, the database of the global cache and
+the database of the arena cache. Since 2-phase commit is not supported
+between redb database, we can end up in a situation where the inode
+range allocated for the arena by do_alloc_inode_range is forgotten by the
+arena cache, as the transaction of the arena cache is aborted after
+the transaction of the global cache has been submitted.
+
+One solution to avoid that is to update the logic of
+do_alloc_inode_cache so that if it's called by an arena cache that's
+forgotten about an previously-allocated range, that
+previously-allocated range is returned instead. It is possible, since
+range only increase.
+
 Task list:
 
-1. Split the work into multiple sub-tasks and update this section. For
-   each sub-task, always include a way to verify it (Example: set of
-   tests to run) and a condition to move on to the next task (Example:
-   when all tests pass)
+- Have the arena cache pass the end of the exhausted range (or 0 the
+  first time) eventually to do_alloc_inode_range
+
+- before allocating a new range do_alloc_inode_range does a range
+  search with the exhausted range `exhausted_range_end+1..` and if
+  there is one range returned that's allocated to the current arena,
+  return that.
+
+This also allows reusing ranges if the entire arena database is deleted.
+
+Task list:
+
+ 1. pass the end of the exhausted range from the arena cache to
+    do_alloc_inode_range. Make sure the range compile.
+
+ 2. update do_alloc_inode_range to do a range check. Add a unit test.
+    Make sure the test passes.
+
+ 3. add a test where all caches instances are dropped and re-created
+    after deleting one of the arena cache, make sure the inode range
+    of the deleted arena cache correspond to the previous range.
 
 
 ## Blobstore {#blobstore}
