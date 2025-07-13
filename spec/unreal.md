@@ -50,6 +50,11 @@ directory. So the file "foo/bar" in the arena "test" is represented as
 represented by more than one directory; The file "blurg" in the arena
 "documents/office" is represented as "/documents/office/blurg"
 
+## Implementation Status
+
+- IMPLEMENTED: Cache and Arena Cache
+- NOT IMPLEMENTED: Blobstore
+
 ### Arenas
 
 Arenas are separate collections of files, kept in the same cache.
@@ -129,9 +134,14 @@ This must be possible but doesn't need to be efficient.
 
 ### Interface
 
+The cache architecture consists of two main types:
+
+- `UnrealCacheBlocking`: The global cache that manages inode allocation and delegates operations to arena-specific caches
+- `ArenaUnrealCacheBlocking`: Per-arena caches that handle file hierarchy and metadata for their specific arena
+
 The `UnrealCacheBlocking` type exposes the following methods, corresponding to
 the access patterns above. Each method is described in its own section
-below.
+below. Most methods delegate to the appropriate `ArenaUnrealCacheBlocking` instance.
 
 ```
 // Access pattern 1:
@@ -140,7 +150,6 @@ fn readdir(inode) -> anyhow::Result<Iterator<ReadDirEntry>, UnrealCacheError>;
 fn lookup(inode, name) -> anyhow::Result<Option<ReadDirEntry>, UnrealCacheError>;
 fn file_metadata(inode) -> anyhow::Result<FileMetadata, UnrealCacheError>;
 fn dir_mtime(inode) -> anyhow::result<SystemTime, UnrealCacheError>;
-fn read(inode) -> anyhow::Result<impl AsyncRead+AsyncSeek, UnrealCacheError>;
 
 // Access pattern 2:
 
@@ -178,17 +187,30 @@ tokio::spawn_blocking will be necessary to make calling these function
 conveniently from the async parts of the code.
 
 Code location:
- - crate/realize-lib/src/storage/unreal/cache.rs
- - crate/realize-lib/src/storage/unreal/error.rs
- - crate/realize-lib/src/storage/unreal/sync.rs
- - crate/realize-lib/src/storage/unreal/future.rs
+ - crate/realize-storage/src/unreal/cache.rs (contains both UnrealCacheBlocking and ArenaUnrealCacheBlocking)
+ - crate/realize-storage/src/unreal/error.rs
+ - crate/realize-storage/src/unreal/sync.rs
+ - crate/realize-storage/src/unreal/future.rs
 
-Public types are exposed as being in realize-lib::storage::unreal.
+Public types are exposed as being in realize-storage::unreal.
+
+#### Cache Initialization
+
+The `UnrealCacheBlocking::new` constructor takes a global database
+path and a map of arena names to their database paths.
+
+Each arena cache is initialized with its own database and inode range
+allocation. The global cache maintains a hash map of
+`ArenaUnrealCacheBlocking` instances, one per arena.
 
 #### readdir
 
 This corresponds to the operations readdir and readdirplus of NFS and
 FUSE: return the entries of a directory, with file attributes.
+
+The method first determines which arena the inode belongs to using
+`lookup_arena(inode)`, then delegates to the appropriate
+`ArenaUnrealCacheBlocking::readdir` method.
 
 - ownership and protection (hardcoded)
 
@@ -204,13 +226,26 @@ FUSE: return the entries of a directory, with file attributes.
 
 Look up one entry in a directory and return its inode.
 
+The method first determines which arena the directory inode belongs to
+using `lookup_arena(inode)`, then delegates to the appropriate
+`ArenaUnrealCacheBlocking::lookup` method.
+
 #### file_metadata dir_mtime
 
 Return the file metadata or the last modification time of a directory.
 
+These methods first determine which arena the inode belongs to using
+`lookup_arena(inode)`, then delegate to the appropriate
+`ArenaUnrealCacheBlocking` methods.
+
 #### link/catchup
 
 Report availability of a remote file from a peer.
+
+The method delegates to the appropriate
+`ArenaUnrealCacheBlocking::link` or
+`ArenaUnrealCacheBlocking::catchup` method based on the arena
+parameter.
 
 If the same file already exists for that peer, overwrite the entry if
 the new mtime >= the old mtime.
@@ -231,6 +266,10 @@ optimization, to be added later after profiling, if necessary.
 #### unlink
 
 Report a remote file becoming unavailable from a peer.
+
+The method delegates to the appropriate
+`ArenaUnrealCacheBlocking::unlink` method based on the arena
+parameter.
 
 If a file exists for the same peer with a higher mtime, ignore the call.
 
@@ -256,6 +295,9 @@ reconnects, to delete any file not mentioned again:
 2. call `catchup` for all files provided by the peer
 3. catchup ends, call `delete_marked_files`
 
+These methods delegate to all `ArenaUnrealCacheBlocking` instances, as
+files from a peer may be distributed across multiple arenas.
+
 This requires catchup removing the mark.
 
 OPEN ISSUE: With the proposed database schema, this require going
@@ -266,6 +308,10 @@ if necessary.
 
 #### delete_arena(arena)
 
+This removes the arena from the global cache's arena map and deletes
+the arena's cache instance. The arena's database files are also
+removed.
+
 This works exactly like recursive directory deletion, since arenas are
 just directories in the proposed design.
 
@@ -275,42 +321,70 @@ This updates the arena root and otherwise works like renaming
 directories, since arenas are mapped as directories. The same restrictions
 apply on the new name as for the initial set of arenas. See [Arenas]
 
-#### read(inode)
-
-The `read` method returns type that implements `AsyncRead` and
-`AsyncSeek` from `tokio::io`, so it can be accessed with all the bells
-and whistles through `AsyncReadExt` and `AsyncSeekExt`.
-
-`read` chooses one of the peers that reported having the most recent
-version of the file available and connects to it to retrieve it
-through `RealStoreService`. It caches just one "chunk" of data,
-between 8k and 32k.
-
-Eventually, `read` will be able to serve partially or fully from the
-database. See the [Future] section.
-
 ### Database Schema
+
+The Unreal cache is split into a global cache and per-arena caches.
+The global cache handles inode allocation and lookup across all
+arenas, while each arena has its own cache for file hierarchy and
+metadata.
+
+#### Global Cache Database
+
+The global cache manages inode allocation and provides arena lookup functionality.
+
+**INODE_RANGE_ALLOCATION_TABLE**
+
+Key: u64 (inode)
+Value: &str (arena name, empty string "" for global inodes)
+
+This table allocates increasing ranges of inodes to arenas. To find
+which arena an inode belongs to, lookup the range [inode..]; the first
+element returned is the end of the current range containing that
+inode.
+
+To allocate a new range for an arena:
+1. Lookup the last element of the table (0 if absent), call it A
+2. Add the number of inodes to allocate (e.g., 10000), call it B
+3. Insert (B, arena) into the table
+4. Return the range [A+1, B) to the arena
+
+**CURRENT_INODE_RANGE_TABLE**
+
+Key: &str (arena name)
+Value: (u64, u64) (current inode, end of range)
+
+Each arena tracks its current inode allocation within its assigned
+range. When an arena needs a new inode:
+1. Query its current range
+2. If missing, request a new allocation from the global cache
+3. If current < end, increment current and return the new inode
+4. Otherwise, request a new allocation and update the range
+
+#### Arena Cache Database
+
+Each arena has its own database containing the file hierarchy and
+metadata for that arena. The structure mirrors the original design but
+is scoped to a single arena.
 
 File hierarchy should be stored as a filesystem would, so it can be
 served quickly for the access pattern that matters the most
 (filesystem access).
 
 Inodes should be looked up either as a file or as a directory; there's
-no global inode table.
+no global inode table within an arena.
 
 Everything starts with inode 1, which is always a directory, though
 possibly empty.
 
-New inode values are allocated sequentially, using the single-entry
-table `max_inode` which just stores the highest inode allocated so
-far.
+New inode values are allocated from the arena's assigned range, using
+the arena's CURRENT_INODE_RANGE_TABLE.
 
 Inodes aren't reused. If we reach the max value for u64, new files or
 dirs cannot be created anymore. It's hard to justify anything more
 complicated. It's possible to switch to another scheme later in a
 backward-compatible way.
 
-**Directory Table**
+**Directory Table** (per arena)
 
 Key: `(u64, String)` (directory inode, name)
 Value:
@@ -341,7 +415,7 @@ enum InodeAssigment {
 A FS lookup operation would have the full key, but a FS readdir
 operation would need to do a range lookup to collect all names.
 
-**File Table**
+**File Table** (per arena)
 
 Key: `(u64, &str)` (file inode, Option<peer>)
 Value:
@@ -594,11 +668,3 @@ cache size is blocks and W the max usage value of a generation.
 Note that since this relies on FS block size, frequency computation
 might need to be updated or discarded if the FS block size of the
 arena blobstore changes.
-
-### Versioned Storage
-
-The database will be extended to support versioning of file content,
-using their hashes. Hashes can be used to identify file content in the
-database (blob storage).
-
-Details TBD
