@@ -19,15 +19,15 @@ Initial implementation is read-only. This will be extended later into
 a read-write implementation that stores local modifications for MacOS
 and Windows support.
 
-## Stages
+## Implementation Status
 
 Design and implementation happens in stages, incrementally:
 
 1. Store file hierarchy, described and implemented.
 2. Serve data from network, described and implemented.
-3. Store file content, in an expiring cache, see [Future].
+3. Blobtore, an expiring cache, design in progress
 
-## Details
+## Unreal Cache
 
 The Unreal cache is built upon a `redb` database that tracks the state
 of files across a set of peers, called the Household. This allows the
@@ -49,11 +49,6 @@ directory. So the file "foo/bar" in the arena "test" is represented as
 "/test/foo/bar". Arenas names can have slashes in them, so might be
 represented by more than one directory; The file "blurg" in the arena
 "documents/office" is represented as "/documents/office/blurg"
-
-## Implementation Status
-
-- IMPLEMENTED: Cache and Arena Cache
-- NOT IMPLEMENTED: Blobstore
 
 ### Arenas
 
@@ -146,28 +141,29 @@ below. Most methods delegate to the appropriate `ArenaUnrealCacheBlocking` insta
 ```
 // Access pattern 1:
 
-fn readdir(inode) -> anyhow::Result<Iterator<ReadDirEntry>, UnrealCacheError>;
-fn lookup(inode, name) -> anyhow::Result<Option<ReadDirEntry>, UnrealCacheError>;
-fn file_metadata(inode) -> anyhow::Result<FileMetadata, UnrealCacheError>;
-fn dir_mtime(inode) -> anyhow::result<SystemTime, UnrealCacheError>;
+fn readdir(inode) -> anyhow::Result<Iterator<ReadDirEntry>, StorageError>;
+fn lookup(inode, name) -> anyhow::Result<Option<ReadDirEntry>, StorageError>;
+fn file_metadata(inode) -> anyhow::Result<FileMetadata, StorageError>;
+fn dir_mtime(inode) -> anyhow::result<SystemTime, StorageError>;
+fn open(inode, mode) -> anyhow::Result<Blob, StorageError>
 
 // Access pattern 2:
 
-fn link(peer, arena, path, size, mtime) -> anyhow::Result<(), UnrealCacheError>;
-fn unlink(peer, arena, path, mtime) -> anyhow::Result<(), UnrealCacheError>;
+fn link(peer, arena, path, size, mtime) -> anyhow::Result<(), StorageError>;
+fn unlink(peer, arena, path, mtime) -> anyhow::Result<(), StorageError>;
 
 // Access pattern 3:
 
 /// Mark all files belonging to a specific peer.
-fn mark_peer_files(peer) -> anyhow::Result<(), UnrealCacheError>;
+fn mark_peer_files(peer) -> anyhow::Result<(), StorageError>;
 
 /// Delete marked files belonging to a specific peer that
 /// have not been refreshed by a link() call since mark_peer_files.
-fn delete_marked_files(peer) -> anyhow::Result<(), UnrealCacheError>;
+fn delete_marked_files(peer) -> anyhow::Result<(), StorageError>;
 
 // Access pattern 4:
 
-fn delete_arena(arena) ->anyhow::Result<(), UnrealCacheError>;
+fn delete_arena(arena) ->anyhow::Result<(), StorageError>;
 
 ```
 
@@ -175,7 +171,7 @@ See definition of `ReadDirEntry`, and `FileEntry` in the next section.
 Initially, the type that is stored is the type that is returned, even
 though they'll likely diverge later.
 
-`UnrealCacheError` is an error implemented with `thiserror` that
+`StorageError` is an error implemented with `thiserror` that
 collects the different error variants, so they can be transformed into
 `std::io::Error` when implementing the filesystem. Define custom
 errors when not forwarding another error. Write a From when forwarding
@@ -306,7 +302,7 @@ a background call. Worse case scenario, a file deleted on the remote
 peer says for longer than strictly necessary. Profile and add an index
 if necessary.
 
-#### delete_arena(arena)
+#### delete_arena(arena) (NOT IMPLEMENTED)
 
 This removes the arena from the global cache's arena map and deletes
 the arena's cache instance. The arena's database files are also
@@ -315,18 +311,65 @@ removed.
 This works exactly like recursive directory deletion, since arenas are
 just directories in the proposed design.
 
-#### rename_arena(arena, new_name)
+#### rename_arena(arena, new_name) (NOT IMPLEMENTED)
 
 This updates the arena root and otherwise works like renaming
 directories, since arenas are mapped as directories. The same restrictions
 apply on the new name as for the initial set of arenas. See [Arenas]
 
+#### open(inode, mode) (NOT IMPLEMENTED)
+
+This call gives read/write access to a file on the [Blobstore] in the
+form of a file handle called `Blob` that supports seek, read and
+write `AsyncRead + AsyncSeek + AsyncWrite`
+
+`mode` is Read|ReadWrite
+
+The file size is fixed, but not all parts might be locally available.
+Writing within the bounds always succeeds, but reading only succeeds
+if at least the beginning of the section that is read is available.
+Attempting to read at an unavailable position fails with the error
+`StorageError::DataUnavailable`.
+
+```rust
+
+struct Blob { ... }
+impl {
+  /// Hash of the corresponding file
+  fn hash() -> Hash; // fixed
+
+  /// Size of the corresponding file
+  fn size() -> u64; // fixed
+
+  /// The parts of the file that are available locally.
+  ///
+  /// Might just be `((0..size()))`
+  fn local_availability() -> ByteRanges; // may change if written to
+}
+impl AsyncRead for Blob {}
+impl AsyncWrite for Blob {}
+impl AsyncSeek for Blob {}
+
+```
+
+The `Downloader`, defined in
+[downloader.rs](crate/realize-core/src/fs/downloader.rs) extends this
+type by reading sections that are not locally available from peers and
+writing the result for later use. This isn't part of the cache.
+
 ### Database Schema
 
 The Unreal cache is split into a global cache and per-arena caches.
+
 The global cache handles inode allocation and lookup across all
 arenas, while each arena has its own cache for file hierarchy and
-metadata.
+metadata and manages local copies (blobs).
+
+Additionally, the Unreal cache contains copies of remote data, kept on
+the filesystem. The part of the cache that stores these copies and
+their metadata is called the Blobstore and is described in its own
+section [Blobstore] even though it can technically be seen as part of
+the Arena database.
 
 #### Global Cache Database
 
@@ -360,7 +403,7 @@ range. When an arena needs a new inode:
 3. If current < end, increment current and return the new inode
 4. Otherwise, request a new allocation and update the range
 
-#### Arena Cache Database
+#### Arena Database
 
 Each arena has its own database containing the file hierarchy and
 metadata for that arena. The structure mirrors the original design but
@@ -422,11 +465,15 @@ Value:
 
 ```rust
 struct FileEntry {
-  /// The arena to use to fetch file content in the peer.
-  ///
-  /// This is stored here as a key to fetch file content.
-  arena: model::Arena,
+  content: FileContent,
 
+  metadata:FileMetadata,
+}
+struct FileMetadata {
+  size:u64,
+  mtime:SystemTime,
+}
+struct FileContent {
   /// The path to use to fetch file content in the peer.
   ///
   /// Note that it shouldn't matter whether the path
@@ -436,16 +483,11 @@ struct FileEntry {
   /// This is stored here as a key to fetch file content.
   path: model::Path,
 
-  metadata:FileMetadata,
+  hash: Hash,
 
-  /// File is marked for deletion.
-  ///
-  /// See mark_peer_files and delete_marked_files above.
-  marked: bool,
-}
-struct FileMetadata {
-  size:u64,
-  mtime:SystemTime,
+  /// Locally-available portions of this specific version
+  /// of the file. See Blobstore.
+  blob: Option<u64>,
 }
 ```
 
@@ -496,15 +538,11 @@ be questionable (the history chain we selected and tracked has indeed
 ended), but practical (the user can get hold of a version of the
 file.) Once there is a UI, this might be an option.
 
-## Future
+## Blobstore
 
-These changes are planned and described in [the overall
-design](./design.md) but not yet integrated into this design and its
-implementation.
-
-### Store File Content
-
-The cache stores file content, fully or partially.
+The cache stores file content in an Arena-specific Blobstore. File
+content is stored for a specific version of a file, identified by a
+hash - this is what is called *blob* in this design.
 
 Stored file content is useful:
 
@@ -520,9 +558,7 @@ In general, when downloading a file, the data should be stored
 optimistically, then kept in a cache portion of the store for later
 use. In addition to that, files can be tagged for download.
 
-#### Blobstore
-
-The blob store functions as a cache of file data. A cache size should
+The Blobstore functions as a cache of file data. A cache size should
 be set, either absolutely or as a percentage of the filesystem size.
 Cache size may be reduced if filesystem usage is above a certain
 percentage.
@@ -668,3 +704,11 @@ cache size is blocks and W the max usage value of a generation.
 Note that since this relies on FS block size, frequency computation
 might need to be updated or discarded if the FS block size of the
 arena blobstore changes.
+
+## Future
+
+These changes are planned and described in [the overall
+design](./design.md) but not yet integrated into this design and its
+implementation.
+
+TBD

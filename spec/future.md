@@ -3,6 +3,83 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
+## Blobstore {#blobstore}
+
+Implement an Arena-specific blob store as described in the section
+Blobstore of [unreal.md](spec/unreal.md).
+
+Task List:
+ 1. Start with a blobstore with no expiration #blobstore1. Blobs are
+    only ever deleted if it becomes outdated (the file is deleted or
+    updated remotely.)
+    See the section #blobstore1
+
+ 2. Hook it up with Downloader so it can serve locally available data
+    and keeps any data that is downloaded for later.
+    Details TBD
+
+ 3. Implement the Working Area as a LRU cache.
+
+ 4. Add a consistency/cleanup job that runs from time to time to
+    compare file data with metadata in the database.
+
+ 5. Add TinyLFU accounting that gates the entry to a secondary LRU
+    cache.
+
+ 6. Add a LRU cache for "to be deleted" data and batch job for
+    deleting it.
+
+## Blobstore 1st step: store files with no expiration {#blobstore}
+
+Implement a first version of `open(inode, mode)` of [unreal.md](unreal.md).
+
+Read the corresponding section of `unreal.md` as well as the
+`Blobstore` section in the same file.
+
+The relevant code and the file to modify is
+[cache.rs](../crate/realize-storage/src/unreal/cache.rs)
+
+
+Task list
+
+ 1. Have ArenaUnrealCacheBlocking take a directory in addition to a
+    database. This is the directory where files will be stored. Update
+    ArenaUnrealCacheBlocking::open, UnrealCacheAsync::open,
+    UnrealCacheAsync::from_config and the configuration to pass these
+    directories. In-memory caches used for testing, get /dev/null as
+    directory, so any attempt to use them will fail.
+
+    This is all in [cache.rs](../crate/realize-storage/src/unreal/cache.rs)
+
+    Update all tests, including integration tests, run them with
+    "cargo test"" and make sure they all pass.
+
+ 2. Add a `blobs` table (skip any fields that's for LRU accounting) and an
+    entry `blob: Option<u64>` to FileContent. This table is described in
+    the section Blobstore of [unreal.md](unreal.md)
+
+    Run "cargo check -p realize-storage", then "cargo test -p
+    realize-storage" and fix any issues.
+
+ 3. Add an `open` function to ArenaUnrealCacheConfig that just returns
+    a `tokio::io::File`. This requires creating a new entry in the
+    `blobs` table, creating a file corresponding to that blob id and
+    opening it. Expose the same function in UnrealCacheConfig and
+    UnrealCacheAsync as usual, by delegating.
+
+    Add unit tests for that function and the type it returns.
+
+    Run "cargo check -p realize-storage", then "cargo test -p
+    realize-storage" and fix any issues.
+
+ 4. Add code for deleting the blob and its file when the corresponding
+    version is removed from the database.
+
+    Add unit test to check that.
+
+    Run "cargo check -p realize-storage", then "cargo test -p
+    realize-storage" and fix any issues.
+
 ## Recover inode range in Arena cache {#inoderange}
 
 When allocating a inode range in
@@ -44,23 +121,6 @@ Task list:
     after deleting one of the arena cache, make sure the inode range
     of the deleted arena cache correspond to the previous range.
 
-
-## Blobstore {#blobstore}
-
-Implement an Arena-specific blob store as described in the section
-Blobstore of [unreal.md](spec/unreal.md). Start with a blob store with
-only one area/LRU queue; the Working area.
-
-Task List:
- - define how the unreal cache and downloader interface with the
-   blobstore and write skeleton with just that interface in
-   crate/realize-storage/src/unreal/blobstore.rs with everything
-   implemented as no-op, make sure it compiles
- - write capnp in crate/realize-storage/capnp/unreal/blobstore.capnp,
-   add it to crate/realize-storage/capnp/unreal.rs, ake sure it compiles
- - implement a no-eviction version, add unit tests
- - write integration tests
- - add support for tracking cache size and doing eviction
 
 ## Allow : in realize_types:Path {#colon}
 
