@@ -50,7 +50,6 @@ pub struct FileTableEntry {
 
 impl FileTableEntry {
     pub fn new(
-        arena: Arena,
         path: Path,
         size: u64,
         mtime: UnixTime,
@@ -60,7 +59,6 @@ impl FileTableEntry {
         Self {
             metadata: FileMetadata { size, mtime: mtime },
             content: FileContent {
-                arena: arena,
                 path: path,
                 hash,
             },
@@ -72,12 +70,6 @@ impl FileTableEntry {
 /// Information needed to fetch a file from a remote peer.
 #[derive(Clone, PartialEq)]
 pub struct FileContent {
-    /// The arena to use to fetch file content in the peer.
-    ///
-    /// This is stored here as a key to fetch file content,
-    /// to be replaced by a blob id.
-    pub arena: realize_types::Arena,
-
     /// The path to use to fetch file content in the peer.
     ///
     /// Note that it shouldn't matter whether the path
@@ -94,7 +86,7 @@ pub struct FileContent {
 
 impl std::fmt::Debug for FileContent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{}]/{} {}", self.arena, self.path, self.hash)
+        write!(f, "{} {}", self.path, self.hash)
     }
 }
 
@@ -119,7 +111,6 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
                 mtime: UnixTime::new(mtime.get_secs(), mtime.get_nsecs()),
             },
             content: FileContent {
-                arena: Arena::from(content.get_arena()?.to_str()?),
                 path: Path::parse(content.get_path()?.to_str()?)?,
                 hash: parse_hash(content.get_hash()?)?,
             },
@@ -135,7 +126,6 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
         builder.set_parent(self.parent_inode);
 
         let mut content = builder.reborrow().init_content();
-        content.set_arena(self.content.arena.as_str());
         content.set_path(self.content.path.as_str());
         content.set_hash(&self.content.hash.0);
 
@@ -297,7 +287,6 @@ mod tests {
     fn convert_file_table_entry() -> anyhow::Result<()> {
         let entry = FileTableEntry {
             content: FileContent {
-                arena: Arena::from("test"),
                 path: Path::parse("foo/bar.txt")?,
                 hash: Hash([0xa1u8; 32]),
             },

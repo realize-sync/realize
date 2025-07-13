@@ -80,8 +80,7 @@ const PENDING_CATCHUP_TABLE: TableDefinition<(&str, u64), u64> =
 ///
 /// Key: &str (Peer)
 /// Value: PeerTableEntry
-const PEER_TABLE: TableDefinition<&str, Holder<PeerTableEntry>> =
-    TableDefinition::new("peer");
+const PEER_TABLE: TableDefinition<&str, Holder<PeerTableEntry>> = TableDefinition::new("peer");
 
 /// Track last seen notification index.
 ///
@@ -223,11 +222,11 @@ impl UnrealCacheBlocking {
 
     /// Return the best metadata for the file.
     pub fn file_metadata(&self, inode: u64) -> Result<FileMetadata, StorageError> {
-        let txn = self.db.begin_read()?;
-        match self.arena_for_inode(&txn, inode)? {
-            None => do_file_availability(&txn, inode).map(|a| a.metadata),
-            Some(arena) => self.arena_cache(&arena)?.file_metadata(inode),
-        }
+        let arena = self
+            .arena_for_inode(&self.db.begin_read()?, inode)?
+            .ok_or(StorageError::NotFound)?;
+
+        self.arena_cache(&arena)?.file_metadata(inode)
     }
 
     /// Return the mtime of the directory.
@@ -243,9 +242,8 @@ impl UnrealCacheBlocking {
     ///
     /// The returned vector might be empty if the file isn't available in any peer.
     pub fn file_availability(&self, inode: u64) -> Result<FileAvailability, StorageError> {
-        let txn = self.db.begin_read()?;
         let arena = self
-            .arena_for_inode(&txn, inode)?
+            .arena_for_inode(&self.db.begin_read()?, inode)?
             .ok_or(StorageError::NotFound)?;
 
         self.arena_cache(&arena)?.file_availability(inode)
@@ -419,7 +417,7 @@ impl ArenaUnrealCacheBlocking {
 
     fn file_metadata(&self, inode: u64) -> Result<FileMetadata, StorageError> {
         let txn = self.db.begin_read()?;
-        do_file_availability(&txn, inode).map(|a| a.metadata)
+        do_file_availability(&txn, inode, &self.arena).map(|a| a.metadata)
     }
 
     fn dir_mtime(&self, inode: u64) -> Result<UnixTime, StorageError> {
@@ -431,7 +429,7 @@ impl ArenaUnrealCacheBlocking {
     fn file_availability(&self, inode: u64) -> Result<FileAvailability, StorageError> {
         let txn = self.db.begin_read()?;
 
-        do_file_availability(&txn, inode)
+        do_file_availability(&txn, inode, &self.arena)
     }
 
     fn readdir(&self, inode: u64) -> Result<Vec<(String, ReadDirEntry)>, StorageError> {
@@ -472,14 +470,7 @@ impl ArenaUnrealCacheBlocking {
                 let (parent_inode, file_inode) =
                     do_create_file(&txn, self.arena_root, &path, &alloc_inode_range)?;
                 if !get_file_entry(&file_table, file_inode, Some(peer))?.is_some() {
-                    let entry = FileTableEntry::new(
-                        self.arena.clone(),
-                        path,
-                        size,
-                        mtime,
-                        hash,
-                        parent_inode,
-                    );
+                    let entry = FileTableEntry::new(path, size, mtime, hash, parent_inode);
 
                     if !get_file_entry(&file_table, file_inode, None)?.is_some() {
                         do_write_file_entry(&mut file_table, file_inode, None, &entry)?;
@@ -502,8 +493,7 @@ impl ArenaUnrealCacheBlocking {
                     do_create_file(&txn, self.arena_root, &path, &alloc_inode_range)?;
 
                 let mut file_table = txn.open_table(FILE_TABLE)?;
-                let entry =
-                    FileTableEntry::new(self.arena.clone(), path, size, mtime, hash, parent_inode);
+                let entry = FileTableEntry::new(path, size, mtime, hash, parent_inode);
                 if let Some(e) = get_file_entry(&file_table, file_inode, None)?
                     && e.content.hash == old_hash
                 {
@@ -546,8 +536,7 @@ impl ArenaUnrealCacheBlocking {
                 do_unmark_peer_file(&txn, peer, file_inode)?;
 
                 let mut file_table = txn.open_table(FILE_TABLE)?;
-                let entry =
-                    FileTableEntry::new(self.arena.clone(), path, size, mtime, hash, parent_inode);
+                let entry = FileTableEntry::new(path, size, mtime, hash, parent_inode);
                 if !get_file_entry(&file_table, file_inode, None)?.is_some() {
                     do_write_file_entry(&mut file_table, file_inode, None, &entry)?;
                 }
@@ -742,10 +731,7 @@ fn do_update_last_seen_notification(
     Ok(())
 }
 
-fn do_peer_progress(
-    txn: &ReadTransaction,
-    peer: &Peer,
-) -> Result<Option<Progress>, StorageError> {
+fn do_peer_progress(txn: &ReadTransaction, peer: &Peer) -> Result<Option<Progress>, StorageError> {
     let key = peer.as_str();
 
     let peer_table = txn.open_table(PEER_TABLE)?;
@@ -893,6 +879,7 @@ fn get_file_entry(
 fn do_file_availability(
     txn: &ReadTransaction,
     inode: u64,
+    arena: &Arena,
 ) -> Result<FileAvailability, StorageError> {
     let file_table = txn.open_table(FILE_TABLE)?;
 
@@ -904,9 +891,7 @@ fn do_file_availability(
     }
     let FileTableEntry {
         metadata,
-        content: FileContent {
-            arena, path, hash, ..
-        },
+        content: FileContent { path, hash, .. },
         ..
     } = default_entry.value().parse()?;
 
@@ -925,7 +910,7 @@ fn do_file_availability(
     }
 
     Ok(FileAvailability {
-        arena,
+        arena: arena.clone(),
         path,
         metadata,
         hash,
@@ -1128,10 +1113,7 @@ fn alloc_inode(
     }
 }
 
-fn do_mark_peer_files(
-    txn: &WriteTransaction,
-    peer: &Peer,
-) -> Result<(), StorageError> {
+fn do_mark_peer_files(txn: &WriteTransaction, peer: &Peer) -> Result<(), StorageError> {
     let file_table = txn.open_table(FILE_TABLE)?;
     let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
     let peer_str = peer.as_str();
@@ -1160,18 +1142,14 @@ fn do_unmark_peer_file(
     Ok(())
 }
 
-fn do_delete_marked_files(
-    txn: &WriteTransaction,
-    peer: &Peer,
-) -> Result<(), StorageError> {
+fn do_delete_marked_files(txn: &WriteTransaction, peer: &Peer) -> Result<(), StorageError> {
     let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
     let mut file_table = txn.open_table(FILE_TABLE)?;
     let mut directory_table = txn.open_table(DIRECTORY_TABLE)?;
     let peer_str = peer.as_str();
-    for elt in pending_catchup_table.extract_from_if(
-        (peer_str, 0)..(peer_str, u64::MAX),
-        |_, _| true,
-    )? {
+    for elt in
+        pending_catchup_table.extract_from_if((peer_str, 0)..(peer_str, u64::MAX), |_, _| true)?
+    {
         let elt = elt?;
         let (_, inode) = elt.0.value();
         let parent_inode = elt.1.value();
@@ -1290,7 +1268,7 @@ fn do_alloc_inode_range(
 
 #[cfg(test)]
 mod tests {
-    
+
     use super::*;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;

@@ -31,10 +31,8 @@ struct FileTableEntry {
 }
 
 struct FileContent {
-  # TODO: Remove arena; the whole database is arena-specific.
-  arena @0: Text;
-  path @1: Text;
-  hash @2: Data;
+  path @0: Text;
+  hash @1: Data;
 }
 
 struct FileMetadata {
