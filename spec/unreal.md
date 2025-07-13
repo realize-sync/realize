@@ -625,7 +625,7 @@ A Blobstore for an arena is a directory within that arena with:
 The redb database stores the following tables:
 
 **blob**
-Key: u64 (incrementing)
+Key: u64 (incrementing, starts at 1; 0 is used in capnp to mean "no blob")
 value: BlobTableEntry, defined in crate/realize-storage/capnp/unreal/blobstore.capnp
  - owning inode (for getting frequency)
  - areas that have been written (ByteRanges)
