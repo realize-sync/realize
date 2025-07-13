@@ -69,12 +69,9 @@ const FILE_TABLE: TableDefinition<(u64, &str), Holder<FileTableEntry>> =
 /// This is handled by [do_mark_peer_files], [do_delete_marked_files]
 /// and [do_unmark_peer_file].
 ///
-/// TODO: Remove arena; this is only in the arena database.
-///
-///
-/// Key: (peer, arena, file inode)
+/// Key: (peer, file inode)
 /// Value: parent dir inode
-const PENDING_CATCHUP_TABLE: TableDefinition<(&str, &str, u64), u64> =
+const PENDING_CATCHUP_TABLE: TableDefinition<(&str, u64), u64> =
     TableDefinition::new("pending_catchup");
 
 /// Track Peer UUIDs.
@@ -534,7 +531,7 @@ impl ArenaUnrealCacheBlocking {
                 do_unlink(&txn, peer, root, &path, old_hash)?;
             }
             Notification::CatchupStart(_) => {
-                do_mark_peer_files(&txn, peer, &self.arena)?;
+                do_mark_peer_files(&txn, peer)?;
             }
             Notification::Catchup {
                 path,
@@ -546,7 +543,7 @@ impl ArenaUnrealCacheBlocking {
                 let (parent_inode, file_inode) =
                     do_create_file(&txn, self.arena_root, &path, &alloc_inode_range)?;
 
-                do_unmark_peer_file(&txn, peer, &self.arena, file_inode)?;
+                do_unmark_peer_file(&txn, peer, file_inode)?;
 
                 let mut file_table = txn.open_table(FILE_TABLE)?;
                 let entry =
@@ -557,7 +554,7 @@ impl ArenaUnrealCacheBlocking {
                 do_write_file_entry(&mut file_table, file_inode, Some(peer), &entry)?;
             }
             Notification::CatchupComplete { index, .. } => {
-                do_delete_marked_files(&txn, peer, &self.arena)?;
+                do_delete_marked_files(&txn, peer)?;
                 do_update_last_seen_notification(&txn, peer, index)?;
             }
             Notification::Connected { uuid, .. } => {
@@ -1134,7 +1131,6 @@ fn alloc_inode(
 fn do_mark_peer_files(
     txn: &WriteTransaction,
     peer: &Peer,
-    arena: &Arena,
 ) -> Result<(), StorageError> {
     let file_table = txn.open_table(FILE_TABLE)?;
     let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
@@ -1146,11 +1142,8 @@ fn do_mark_peer_files(
             continue;
         }
         let v = v.value().parse()?;
-        if v.content.arena != *arena {
-            continue;
-        }
         let inode = k.0;
-        pending_catchup_table.insert((peer_str, arena.as_str(), inode), v.parent_inode)?;
+        pending_catchup_table.insert((peer_str, inode), v.parent_inode)?;
     }
 
     Ok(())
@@ -1159,11 +1152,10 @@ fn do_mark_peer_files(
 fn do_unmark_peer_file(
     txn: &WriteTransaction,
     peer: &Peer,
-    arena: &Arena,
     inode: u64,
 ) -> Result<(), StorageError> {
     let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
-    pending_catchup_table.remove((peer.as_str(), arena.as_str(), inode))?;
+    pending_catchup_table.remove((peer.as_str(), inode))?;
 
     Ok(())
 }
@@ -1171,19 +1163,17 @@ fn do_unmark_peer_file(
 fn do_delete_marked_files(
     txn: &WriteTransaction,
     peer: &Peer,
-    arena: &Arena,
 ) -> Result<(), StorageError> {
     let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
     let mut file_table = txn.open_table(FILE_TABLE)?;
     let mut directory_table = txn.open_table(DIRECTORY_TABLE)?;
     let peer_str = peer.as_str();
-    let arena_str = arena.as_str();
     for elt in pending_catchup_table.extract_from_if(
-        (peer_str, arena_str, 0)..(peer_str, arena_str, u64::MAX),
+        (peer_str, 0)..(peer_str, u64::MAX),
         |_, _| true,
     )? {
         let elt = elt?;
-        let (_, _, inode) = elt.0.value();
+        let (_, inode) = elt.0.value();
         let parent_inode = elt.1.value();
         do_rm_file_entry(
             &mut file_table,
@@ -1300,6 +1290,7 @@ fn do_alloc_inode_range(
 
 #[cfg(test)]
 mod tests {
+    
     use super::*;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
