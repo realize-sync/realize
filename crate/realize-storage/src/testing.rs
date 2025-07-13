@@ -1,4 +1,4 @@
-use super::config::{ArenaConfig, CacheConfig, IndexConfig, StorageConfig};
+use super::config::{ArenaCacheConfig, ArenaConfig, CacheConfig, IndexConfig, StorageConfig};
 use super::{Storage, UnrealCacheAsync};
 use realize_types::Arena;
 use std::sync::Arc;
@@ -13,6 +13,7 @@ where
         arena_dbs.push((
             arena,
             redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?,
+            std::path::PathBuf::from("/dev/null"),
         ));
     }
     let cache = UnrealCacheAsync::with_db(
@@ -42,10 +43,11 @@ where
                 (
                     arena,
                     ArenaConfig {
-                        path: arena_dir,
+                        path: arena_dir.clone(),
                         index: Some(IndexConfig { db: index_path }),
-                        cache: Some(CacheConfig {
+                        cache: Some(ArenaCacheConfig {
                             db: arena_cache_path,
+                            blob_dir: arena_dir.join(".blobs"),
                         }),
                     },
                 )
@@ -58,6 +60,9 @@ where
 
     for arena_config in config.arenas.values() {
         fs::create_dir_all(&arena_config.path).await?;
+        if let Some(cache_config) = &arena_config.cache {
+            fs::create_dir_all(&cache_config.blob_dir).await?;
+        }
     }
 
     Storage::from_config(&config).await

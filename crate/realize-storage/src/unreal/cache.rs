@@ -172,7 +172,7 @@ impl UnrealCacheBlocking {
     }
 
     /// Add an arena to the database.
-    pub fn add_arena(&mut self, arena: Arena, db: Database) -> anyhow::Result<()> {
+    pub fn add_arena(&mut self, arena: Arena, db: Database, blob_dir: PathBuf) -> anyhow::Result<()> {
         let arena_root = match self.arena_roots.get_by_left(&arena) {
             Some(inode) => *inode,
             None => {
@@ -191,7 +191,7 @@ impl UnrealCacheBlocking {
         };
         self.arena_caches.insert(
             arena.clone(),
-            ArenaUnrealCacheBlocking::new(arena, arena_root, db)?,
+            ArenaUnrealCacheBlocking::new(arena, arena_root, db, blob_dir)?,
         );
 
         Ok(())
@@ -377,11 +377,12 @@ struct ArenaUnrealCacheBlocking {
     arena: Arena,
     arena_root: u64,
     db: Database,
+    blob_dir: PathBuf,
 }
 
 impl ArenaUnrealCacheBlocking {
-    /// Create a new ArenaUnrealCacheBlocking from an arena, root inode, and database.
-    pub fn new(arena: Arena, arena_root: u64, db: Database) -> Result<Self, StorageError> {
+    /// Create a new ArenaUnrealCacheBlocking from an arena, root inode, database, and blob directory.
+    pub fn new(arena: Arena, arena_root: u64, db: Database, blob_dir: PathBuf) -> Result<Self, StorageError> {
         // Ensure the database has the required tables
         {
             let txn = db.begin_write()?;
@@ -400,6 +401,7 @@ impl ArenaUnrealCacheBlocking {
             arena,
             arena_root,
             db,
+            blob_dir,
         })
     }
 
@@ -582,8 +584,12 @@ impl UnrealCacheAsync {
         };
         let mut cache = UnrealCacheBlocking::open(global_db_path)?;
         for (arena, arena_cfg) in &config.arenas {
-            if let Some(cache_config) = &arena_cfg.cache {
-                cache.add_arena(arena.clone(), Database::create(&cache_config.db)?)?;
+            if let Some(arena_cache_config) = &arena_cfg.cache {
+                cache.add_arena(
+                    arena.clone(),
+                    Database::create(&arena_cache_config.db)?,
+                    arena_cache_config.blob_dir.clone(),
+                )?;
             }
         }
 
@@ -600,14 +606,14 @@ impl UnrealCacheAsync {
     /// Create a new cache with the database at the given path.
     pub async fn open<T>(path: &path::Path, arenas: T) -> Result<Self, anyhow::Error>
     where
-        T: IntoIterator<Item = (Arena, PathBuf)> + Send + 'static,
+        T: IntoIterator<Item = (Arena, PathBuf, PathBuf)> + Send + 'static,
     {
         let path = path.to_path_buf();
 
         task::spawn_blocking(move || {
             let mut cache = UnrealCacheBlocking::open(&path)?;
-            for (arena, arena_path) in arenas.into_iter() {
-                cache.add_arena(arena, Database::create(arena_path)?)?;
+            for (arena, arena_path, blob_dir) in arenas.into_iter() {
+                cache.add_arena(arena, Database::create(arena_path)?, blob_dir)?;
             }
 
             Ok::<_, anyhow::Error>(Self::new(cache))
@@ -618,12 +624,12 @@ impl UnrealCacheAsync {
     /// Create a new cache with the database at the given path.
     pub async fn with_db<T>(arenas: T, db: redb::Database) -> Result<Self, anyhow::Error>
     where
-        T: IntoIterator<Item = (Arena, redb::Database)> + Send + 'static,
+        T: IntoIterator<Item = (Arena, redb::Database, PathBuf)> + Send + 'static,
     {
         task::spawn_blocking(move || {
             let mut cache = UnrealCacheBlocking::new(db)?;
-            for (arena, db) in arenas.into_iter() {
-                cache.add_arena(arena, db)?;
+            for (arena, db, blob_dir) in arenas.into_iter() {
+                cache.add_arena(arena, db, blob_dir)?;
             }
 
             Ok::<_, anyhow::Error>(Self::new(cache))
@@ -1327,12 +1333,10 @@ mod tests {
         fn add_arena(&mut self, arena: &Arena) -> anyhow::Result<()> {
             let child = self.tempdir.child(format!("{arena}-cache.db"));
             if let Some(p) = child.parent() {
-                // In case the arena name contains a slash
                 std::fs::create_dir_all(p)?;
             }
             self.cache
-                .add_arena(arena.clone(), Database::create(child.path())?)?;
-
+                .add_arena(arena.clone(), Database::create(child.path())?, PathBuf::from("/dev/null"))?;
             Ok(())
         }
 

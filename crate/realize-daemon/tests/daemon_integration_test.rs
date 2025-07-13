@@ -10,6 +10,7 @@ use realize_core::rpc::realstore::client::ClientOptions;
 use realize_network::Networking;
 use realize_network::config::PeerConfig;
 use realize_storage::RealStoreOptions;
+use realize_storage::config::ArenaCacheConfig;
 use realize_storage::config::IndexConfig;
 use realize_storage::config::{ArenaConfig, CacheConfig};
 use realize_types;
@@ -104,8 +105,10 @@ impl Fixture {
         });
         for (arena, arena_config) in &mut self.config.storage.arenas {
             let child = self.tempdir.child(format!("{arena}-cache.db"));
-            arena_config.cache = Some(CacheConfig {
+            let blob_dir = self.tempdir.child(format!("{arena}-blobs"));
+            arena_config.cache = Some(ArenaCacheConfig {
                 db: child.to_path_buf(),
+                blob_dir: blob_dir.to_path_buf(),
             });
         }
     }
