@@ -33,6 +33,7 @@ struct FileTableEntry {
 struct FileContent {
   path @0: Text;
   hash @1: Data;
+  blob @2: UInt64;
 }
 
 struct FileMetadata {
@@ -49,4 +50,22 @@ struct PeerTableEntry {
 struct Time {
   secs @0: UInt64;
   nsecs @1: UInt32;
+}
+
+# An entry in the blob table.
+struct BlobTableEntry {
+  owningInode @0: UInt64;
+  writtenAreas @1: ByteRanges;
+  usedDiskSpace @2: UInt64;
+}
+
+# A sequence of byte ranges.
+struct ByteRanges {
+  ranges @0: List(ByteRange);
+}
+
+# A single byte range.
+struct ByteRange {
+  start @0: UInt64;
+  end @1: UInt64;
 }

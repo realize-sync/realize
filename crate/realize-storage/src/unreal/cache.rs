@@ -3,17 +3,19 @@
 //! See `spec/unreal.md` for details.
 
 use super::types::{
-    DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry, InodeAssignment,
-    PeerTableEntry, ReadDirEntry,
+    BlobTableEntry, DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry,
+    InodeAssignment, PeerTableEntry, ReadDirEntry,
 };
 use crate::StorageError;
 use crate::config::StorageConfig;
 use crate::real::notifier::{Notification, Progress};
 use crate::utils::holder::Holder;
 use bimap::BiMap;
-use realize_types::{Arena, Hash, Path, Peer, UnixTime};
+use realize_types::{Arena, ByteRanges, Hash, Path, Peer, UnixTime};
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
 use std::collections::HashMap;
+use std::io::Write;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{self, PathBuf};
 use std::sync::Arc;
 use tokio::task;
@@ -111,6 +113,12 @@ const INODE_RANGE_ALLOCATION_TABLE: TableDefinition<u64, u64> =
 const CURRENT_INODE_RANGE_TABLE: TableDefinition<(), (u64, u64)> =
     TableDefinition::new("current_inode_range");
 
+/// Track blobs.
+///
+/// Key: inode
+/// Value: BlobTableEntry
+const BLOB_TABLE: TableDefinition<u64, Holder<BlobTableEntry>> = TableDefinition::new("blob");
+
 /// A cache of remote files.
 pub struct UnrealCacheBlocking {
     db: Database,
@@ -130,6 +138,8 @@ impl UnrealCacheBlocking {
             txn.open_table(DIRECTORY_TABLE)?;
             txn.open_table(INODE_RANGE_ALLOCATION_TABLE)?;
             txn.open_table(CURRENT_INODE_RANGE_TABLE)?;
+
+            // Most tables are only used in ArenaUnrealCacheBlocking
             txn.commit()?;
         }
 
@@ -172,7 +182,12 @@ impl UnrealCacheBlocking {
     }
 
     /// Add an arena to the database.
-    pub fn add_arena(&mut self, arena: Arena, db: Database, blob_dir: PathBuf) -> anyhow::Result<()> {
+    pub fn add_arena(
+        &mut self,
+        arena: Arena,
+        db: Database,
+        blob_dir: PathBuf,
+    ) -> anyhow::Result<()> {
         let arena_root = match self.arena_roots.get_by_left(&arena) {
             Some(inode) => *inode,
             None => {
@@ -269,10 +284,17 @@ impl UnrealCacheBlocking {
         self.arena_cache(&arena)?.peer_progress(peer)
     }
 
-    pub fn update(&self, peer: &Peer, notification: Notification) -> Result<(), StorageError> {
+    fn update(&self, peer: &Peer, notification: Notification) -> Result<(), StorageError> {
         let arena = notification.arena().clone();
         let cache = self.arena_cache(&arena)?;
         cache.update(peer, notification, || self.alloc_inode_range(&arena))
+    }
+
+    fn open_file(&self, inode: u64) -> Result<std::fs::File, StorageError> {
+        let arena = self
+            .arena_for_inode(&self.db.begin_read()?, inode)?
+            .ok_or(StorageError::NotFound)?;
+        self.arena_cache(arena)?.open_file(inode)
     }
 
     /// Allocate a new range of inodes to an arena.
@@ -382,19 +404,29 @@ struct ArenaUnrealCacheBlocking {
 
 impl ArenaUnrealCacheBlocking {
     /// Create a new ArenaUnrealCacheBlocking from an arena, root inode, database, and blob directory.
-    pub fn new(arena: Arena, arena_root: u64, db: Database, blob_dir: PathBuf) -> Result<Self, StorageError> {
+    pub fn new(
+        arena: Arena,
+        arena_root: u64,
+        db: Database,
+        blob_dir: PathBuf,
+    ) -> Result<Self, StorageError> {
         // Ensure the database has the required tables
         {
             let txn = db.begin_write()?;
-            txn.open_table(ARENA_TABLE)?;
             txn.open_table(DIRECTORY_TABLE)?;
             txn.open_table(FILE_TABLE)?;
             txn.open_table(PENDING_CATCHUP_TABLE)?;
             txn.open_table(PEER_TABLE)?;
             txn.open_table(NOTIFICATION_TABLE)?;
             txn.open_table(CURRENT_INODE_RANGE_TABLE)?;
+            txn.open_table(BLOB_TABLE)?;
 
+            // ARENA_TABLE and INODE_RANGE_ALLOCATION_TABLE are only used in UnrealCacheBlocking
             txn.commit()?;
+        }
+
+        if !blob_dir.exists() {
+            std::fs::create_dir_all(&blob_dir)?;
         }
 
         Ok(Self {
@@ -565,6 +597,79 @@ impl ArenaUnrealCacheBlocking {
         txn.commit()?;
         Ok(())
     }
+
+    /// Open a file for reading/writing.
+    pub fn open_file(&self, inode: u64) -> Result<std::fs::File, StorageError> {
+        // Optimistically, try a read transaction to check whether the
+        // blob is there.
+        {
+            let txn = self.db.begin_read()?;
+            let file_entry = get_default_entry(&txn.open_table(FILE_TABLE)?, inode)?;
+            if let Some(blob_id) = file_entry.content.blob {
+                let (file, _) = self.create_blob_file(blob_id, file_entry.metadata.size)?;
+                return Ok(file);
+            }
+        }
+
+        // Switch to a write transaction to create the blob. We need to read
+        // the file entry again because it might have changed.
+        let txn = self.db.begin_write()?;
+        let file = {
+            let mut file_table = txn.open_table(FILE_TABLE)?;
+            let mut file_entry = get_default_entry(&file_table, inode)?;
+            if let Some(blob_id) = file_entry.content.blob {
+                let (file, _) = self.create_blob_file(blob_id, file_entry.metadata.size)?;
+                return Ok(file);
+            }
+
+            let mut blob_table = txn.open_table(BLOB_TABLE)?;
+            let blob_id = blob_table.last()?.map(|(k, _)| k.value()).unwrap_or(1);
+            log::debug!(
+                "assigned blob {blob_id:016x} to file {inode} {}",
+                file_entry.content.hash
+            );
+            let (file, m) = self.create_blob_file(blob_id, file_entry.metadata.size)?;
+            blob_table.insert(
+                blob_id,
+                Holder::with_content(BlobTableEntry {
+                    owning_inode: inode,
+                    written_areas: ByteRanges::new(),
+                    used_disk_space: m.blocks() * 512,
+                })?,
+            )?;
+            file_entry.content.blob = Some(blob_id);
+            file_table.insert((inode, ""), Holder::new(&file_entry)?)?;
+
+            file
+        };
+        txn.commit()?;
+
+        Ok(file)
+    }
+
+    /// Open or create a file for the blob and make sure it has the
+    /// right size.
+    fn create_blob_file(
+        &self,
+        blob_id: u64,
+        file_size: u64,
+    ) -> Result<(std::fs::File, std::fs::Metadata), StorageError> {
+        let path = self.blob_path(blob_id);
+        let mut file = std::fs::File::create(path)?;
+        let mut file_meta = file.metadata()?;
+        if file_size != file_meta.len() {
+            file.set_len(file_size)?;
+            file.flush()?;
+            file_meta = file.metadata()?;
+        }
+
+        Ok((file, file_meta))
+    }
+
+    /// Return the path of the file for the given blob.
+    fn blob_path(&self, blob_id: u64) -> PathBuf {
+        self.blob_dir.join(format!("{blob_id:016x}"))
+    }
 }
 
 #[derive(Clone)]
@@ -724,6 +829,18 @@ impl UnrealCacheAsync {
 
         task::spawn_blocking(move || inner.update(&peer, notification)).await?
     }
+
+    /// Open a file for reading/writing, creating a new blob entry.
+    ///
+    /// This creates a new blob entry in the database and a sparse file
+    /// in the blob directory with the specified size.
+    pub async fn open_file(&self, inode: u64) -> Result<tokio::fs::File, StorageError> {
+        let inner = Arc::clone(&self.inner);
+
+        Ok(tokio::fs::File::from_std(
+            task::spawn_blocking(move || inner.open_file(inode)).await??,
+        ))
+    }
 }
 
 fn do_update_last_seen_notification(
@@ -882,12 +999,17 @@ fn get_file_entry(
     }
 }
 
-fn do_file_metadata(txn: &ReadTransaction, inode: u64) -> Result<FileMetadata, StorageError> {
-    let file_table = txn.open_table(FILE_TABLE)?;
+fn get_default_entry(
+    file_table: &impl redb::ReadableTable<(u64, &'static str), Holder<'static, FileTableEntry>>,
+    inode: u64,
+) -> Result<FileTableEntry, StorageError> {
     let entry = file_table.get((inode, ""))?.ok_or(StorageError::NotFound)?;
-    let file_entry = entry.value().parse()?;
 
-    Ok(file_entry.metadata)
+    Ok(entry.value().parse()?)
+}
+
+fn do_file_metadata(txn: &ReadTransaction, inode: u64) -> Result<FileMetadata, StorageError> {
+    Ok(get_default_entry(&txn.open_table(FILE_TABLE)?, inode)?.metadata)
 }
 
 fn do_file_availability(
@@ -1332,11 +1454,15 @@ mod tests {
 
         fn add_arena(&mut self, arena: &Arena) -> anyhow::Result<()> {
             let child = self.tempdir.child(format!("{arena}-cache.db"));
+            let blob_dir = self.tempdir.child(format!("{arena}/blobs"));
             if let Some(p) = child.parent() {
                 std::fs::create_dir_all(p)?;
             }
-            self.cache
-                .add_arena(arena.clone(), Database::create(child.path())?, PathBuf::from("/dev/null"))?;
+            self.cache.add_arena(
+                arena.clone(),
+                Database::create(child.path())?,
+                blob_dir.to_path_buf(),
+            )?;
             Ok(())
         }
 
@@ -2287,6 +2413,34 @@ mod tests {
             assert_eq!(new_range_inode, current);
             assert!(range_end > current);
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_open_file_create_sparse_file() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(&arena)?;
+        let cache = &fixture.cache;
+        let file_path = Path::parse("foobar")?;
+
+        fixture.add_file(&file_path, 10000, &test_time())?;
+        let inode = cache.lookup(cache.arena_root(&arena)?, "foobar")?.inode;
+
+        let file = cache.open_file(inode)?;
+
+        let m = file.metadata()?;
+
+        // File should have the right size
+        assert_eq!(10000, m.len());
+
+        // File should be sparse
+        assert_eq!(0, m.blocks());
+
+        // If called a second time, it should return a handle on the same file.
+        let file2 = cache.open_file(inode)?;
+        let m2 = file2.metadata()?;
+        assert_eq!((m.dev(), m.ino()), (m2.dev(), m2.ino()));
 
         Ok(())
     }
