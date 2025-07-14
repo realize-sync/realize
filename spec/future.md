@@ -3,6 +3,107 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
+## Inode type {#inode}
+
+A new Inode type is defined in
+crate/realize-storage/src/unreal/types.rs that implements redb::Value
+and redb::Key.
+
+Let's use it everywhere it makes sense.
+
+## Types and Structures to Update
+
+### 1. **Data Structures in `unreal/types.rs`**
+- `ReadDirEntry.inode: u64` → `ReadDirEntry.inode: Inode`
+- `FileTableEntry.parent_inode: u64` → `FileTableEntry.parent_inode: Inode`
+- `DirTableEntry::into_readdir_entry(self, inode: u64)` → `DirTableEntry::into_readdir_entry(self, inode: Inode)`
+
+### 2. **Database Table Definitions**
+- `ARENA_TABLE: TableDefinition<&str, u64>` → `ARENA_TABLE: TableDefinition<&str, Inode>`
+- `INODE_RANGE_ALLOCATION_TABLE: TableDefinition<u64, u64>` → `INODE_RANGE_ALLOCATION_TABLE: TableDefinition<Inode, Inode>`
+- `DIRECTORY_TABLE: TableDefinition<(u64, &str), Holder<DirTableEntry>>` → `DIRECTORY_TABLE: TableDefinition<(Inode, &str), Holder<DirTableEntry>>`
+- `FILE_TABLE: TableDefinition<(u64, &str), Holder<FileTableEntry>>` → `FILE_TABLE: TableDefinition<(Inode, &str), Holder<FileTableEntry>>`
+- `PENDING_CATCHUP_TABLE: TableDefinition<(&str, u64), u64>` → `PENDING_CATCHUP_TABLE: TableDefinition<(&str, Inode), Inode>`
+- `CURRENT_INODE_RANGE_TABLE: TableDefinition<(), (u64, u64)>` → `CURRENT_INODE_RANGE_TABLE: TableDefinition<(), (Inode, Inode)>`
+- `BLOB_TABLE: TableDefinition<u64, Holder<BlobTableEntry>>` → `BLOB_TABLE: TableDefinition<Inode, Holder<BlobTableEntry>>`
+- `HISTORY_TABLE: TableDefinition<u64, Holder<HistoryTableEntry>>` → `HISTORY_TABLE: TableDefinition<Inode, Holder<HistoryTableEntry>>`
+
+### 3. **Function Signatures in `unreal/cache.rs`**
+- `lookup(parent_inode: u64, name: &str)` → `lookup(parent_inode: Inode, name: &str)`
+- `lookup_path(arena: &Arena, path: &Path) -> Result<(u64, InodeAssignment)>` → `lookup_path(arena: &Arena, path: &Path) -> Result<(Inode, InodeAssignment)>`
+- `file_metadata(inode: u64)` → `file_metadata(inode: Inode)`
+- `dir_mtime(inode: u64)` → `dir_mtime(inode: Inode)`
+- `file_availability(inode: u64)` → `file_availability(inode: Inode)`
+- `readdir(inode: u64)` → `readdir(inode: Inode)`
+- `open_file(inode: u64)` → `open_file(inode: Inode)`
+- `arena_for_inode(txn: &ReadTransaction, inode: u64)` → `arena_for_inode(txn: &ReadTransaction, inode: Inode)`
+- `alloc_inode_range(arena: &Arena) -> Result<(u64, u64)>` → `alloc_inode_range(arena: &Arena) -> Result<(Inode, Inode)>`
+
+### 4. **Function Signatures in `unreal/arena_cache.rs`**
+- `lookup_path(path: &Path) -> Result<(u64, InodeAssignment)>` → `lookup_path(path: &Path) -> Result<(Inode, InodeAssignment)>`
+- `file_metadata(inode: u64)` → `file_metadata(inode: Inode)`
+- `dir_mtime(inode: u64)` → `dir_mtime(inode: Inode)`
+- `file_availability(inode: u64)` → `file_availability(inode: Inode)`
+- `readdir(inode: u64)` → `readdir(inode: Inode)`
+- `open_file(inode: u64)` → `open_file(inode: Inode)`
+
+### 5. **Function Signatures in `realize-core`**
+- `downloader.rs: reader(inode: u64)` → `reader(inode: Inode)`
+- `nfs.rs: build_file_attr(inode: u64, metadata: &FileMetadata)` → `build_file_attr(inode: Inode, metadata: &FileMetadata)`
+- `nfs.rs: build_dir_attr(inode: u64, mtime: &UnixTime)` → `build_dir_attr(inode: Inode, mtime: &UnixTime)`
+
+## Transition Plan
+
+### Phase 1: Update Data Structures (Low Risk)
+1. **Update `unreal/types.rs`**:
+   - Change `ReadDirEntry.inode` from `u64` to `Inode`
+   - Change `FileTableEntry.parent_inode` from `u64` to `Inode`
+   - Update `DirTableEntry::into_readdir_entry` parameter
+   - Update all constructors and methods that use these fields
+
+2. **Update Cap'n Proto serialization**:
+   - Modify `ByteConvertible` implementations to handle `Inode` instead of `u64`
+   - Update `from_bytes` and `to_bytes` methods
+
+### Phase 2: Update Database Schema (Medium Risk)
+1. **Update Table Definitions**:
+   - Change all `TableDefinition` types that use `u64` for inodes to use `Inode`
+   - This will require database migration or recreation
+
+2. **Update Database Operations**:
+   - Modify all database read/write operations to use `Inode`
+   - Update range queries and comparisons
+
+### Phase 3: Update Function Signatures (High Risk)
+1. **Update Storage Layer**:
+   - Change all function signatures in `unreal/cache.rs` and `unreal/arena_cache.rs`
+   - Update all callers to pass `Inode` instead of `u64`
+
+2. **Update Core Layer**:
+   - Change function signatures in `realize-core`
+   - Update all callers in the filesystem and RPC layers
+
+### Phase 4: Update Tests and Documentation
+1. **Update all tests** to use `Inode` instead of `u64`
+2. **Update documentation** and examples
+3. **Add migration tests** to ensure data integrity
+
+## Benefits of This Transition
+
+1. **Type Safety**: Prevents mixing inode numbers with other u64 values
+2. **Database Safety**: Ensures inodes are properly serialized/deserialized
+3. **API Clarity**: Makes it clear when a value represents an inode
+4. **Future Extensibility**: Allows adding inode-specific methods and validation
+
+## Risks and Considerations
+
+1. **Breaking Changes**: This is a major breaking change that affects the entire codebase
+2. **Database Migration**: Existing databases will need to be migrated or recreated
+3. **Performance**: Minimal impact, but `Inode` is slightly larger than `u64` due to newtype overhead
+4. **Compatibility**: External APIs that expect u64 inodes will need to be updated
+
+Would you like me to start with Phase 1 (updating the data structures) or would you prefer a different approach?
+
 ## Blobstore {#blobstore}
 
 Implement an Arena-specific blob store as described in the section
@@ -76,21 +177,53 @@ Task list
  4. Add code for deleting the blob whose id is stored in the
     FileTableEntry and delete its file when the default version (the
     entry without peer) changes or is removed (see calls to
-    do_write_file_entry and do_rm_file_entry.).
+    do_write_file_entry and do_rm_file_entry with Option<Peer> set to
+    None or the key set to (inode, "")).
 
-    Add a test to check that.
+    Add a test to check that creates a new file with Fixture::add_file
+    call file_open, close the returned file and then:
+    - overwrite the file with a new version, like in
+      replace_existing_file. Make sure the blob and file created by
+      open_file() have been deleted
+    - delete the file, like in unlink_removes_file. Make sure the
+      blob and file created by open_file() have been deleted.
 
     Run "cargo check -p realize-storage", then "cargo test -p
     realize-storage" and fix any issues.
 
  5. Add function to ArneaUnrealCacheConfig for getting and updating
-    the ByteRange of a blob, the later only to be called after
-    updating the file content flushing and syncing. Add the same
+    the ByteRange of a blob given the blob_id returned by file_open.
+    The function for updating the ByteRange is meant to only be called
+    after updating the file content flushing and syncing. Add the same
     functions to UnrealCacheConfig that just delegate to
     ArenaUnrealCacheConfig.
 
+    Do not add these functions to UnrealCacheAsync, as the type
+    returned by UnrealCacheAsync is supposed to be what is going to
+    update the ByteRange in the next step.
+
     Add a unit test that call the functions in UnrealCacheConfig and
-    verify the ByteRange.
+    verify the ByteRange. Run the test and make sure it passes.
+
+ 6. Change the type returned by UnrealCacheAsync::file_open to Blob,
+    which implements tokio::io::AsyncRead and tokio::io::AsyncSeek
+    (look for "impl AsyncRead" in the codebase for examples of such
+    implementation) by delegating to the equivalent function on the
+    tokio::std::File, except in the case where a read starts outside
+    the bounds of the blob's available ByteRanges (returned by
+    open_file, kept as a field in the Blob). In such case, return a
+    new error type BlobIncomplete wrapped in std::io::Error::other().
+
+    Write tests for reading
+    - within the ByteRanges:
+    - starting just before the end of the ByteRanges (the beginning of
+    the data to be read is in range, but the end isn't, so just
+    the beginning is returned (short read))
+    - starting after the end of the ByteRange (which throws BlobIncomplete)
+
+    Run the tests and make sure they pass.
+
+ 7. TBD Add AsyncWrite to Blob.
 
 ## Recover inode range in Arena cache {#inoderange}
 
