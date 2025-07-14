@@ -290,7 +290,7 @@ impl UnrealCacheBlocking {
         cache.update(peer, notification, || self.alloc_inode_range(&arena))
     }
 
-    fn open_file(&self, inode: u64) -> Result<(u64, std::fs::File), StorageError> {
+    fn open_file(&self, inode: u64) -> Result<(u64, ByteRanges, std::fs::File), StorageError> {
         let arena = self
             .arena_for_inode(&self.db.begin_read()?, inode)?
             .ok_or(StorageError::NotFound)?;
@@ -348,6 +348,26 @@ impl UnrealCacheBlocking {
         }
 
         Err(StorageError::NotFound)
+    }
+
+    /// Get a range showing data availability of a blob given its id.
+    fn local_availability(&self, arena: &Arena, blob_id: u64) -> Result<ByteRanges, StorageError> {
+        self.arena_cache(arena)?.local_availability(blob_id)
+    }
+
+    /// Extend the data availability range of a blob given the
+    /// blob_id.
+    ///
+    /// This function is meant to only be called after updating the
+    /// file content, flushing and syncing.
+    fn extend_local_availability(
+        &self,
+        arena: &Arena,
+        blob_id: u64,
+        written_areas: ByteRanges,
+    ) -> Result<(), StorageError> {
+        self.arena_cache(arena)?
+            .extend_local_availability(blob_id, written_areas)
     }
 }
 
@@ -585,14 +605,7 @@ impl ArenaUnrealCacheBlocking {
 
                 let root = self.arena_root;
                 let mut blob_table = txn.open_table(BLOB_TABLE)?;
-                self.do_unlink(
-                    &txn,
-                    peer,
-                    root,
-                    &path,
-                    old_hash,
-                    Some(&mut blob_table),
-                )?;
+                self.do_unlink(&txn, peer, root, &path, old_hash, Some(&mut blob_table))?;
             }
             Notification::CatchupStart(_) => {
                 do_mark_peer_files(&txn, peer)?;
@@ -646,15 +659,16 @@ impl ArenaUnrealCacheBlocking {
     }
 
     /// Open a file for reading/writing.
-    pub fn open_file(&self, inode: u64) -> Result<(u64, std::fs::File), StorageError> {
+    pub fn open_file(&self, inode: u64) -> Result<(u64, ByteRanges, std::fs::File), StorageError> {
         // Optimistically, try a read transaction to check whether the
         // blob is there.
         {
             let txn = self.db.begin_read()?;
             let file_entry = get_default_entry(&txn.open_table(FILE_TABLE)?, inode)?;
             if let Some(blob_id) = file_entry.content.blob {
+                let ranges = get_blob_entry(&txn.open_table(BLOB_TABLE)?, blob_id)?.written_areas;
                 let (file, _) = self.create_blob_file(blob_id, file_entry.metadata.size)?;
-                return Ok((blob_id, file));
+                return Ok((blob_id, ranges, file));
             }
         }
 
@@ -665,8 +679,9 @@ impl ArenaUnrealCacheBlocking {
             let mut file_table = txn.open_table(FILE_TABLE)?;
             let mut file_entry = get_default_entry(&file_table, inode)?;
             if let Some(blob_id) = file_entry.content.blob {
+                let ranges = get_blob_entry(&txn.open_table(BLOB_TABLE)?, blob_id)?.written_areas;
                 let (file, _) = self.create_blob_file(blob_id, file_entry.metadata.size)?;
-                return Ok((blob_id, file));
+                return Ok((blob_id, ranges, file));
             }
 
             let mut blob_table = txn.open_table(BLOB_TABLE)?;
@@ -687,7 +702,7 @@ impl ArenaUnrealCacheBlocking {
             file_entry.content.blob = Some(blob_id);
             file_table.insert((inode, ""), Holder::new(&file_entry)?)?;
 
-            (blob_id, file)
+            (blob_id, ByteRanges::new(), file)
         };
         txn.commit()?;
 
@@ -726,8 +741,6 @@ impl ArenaUnrealCacheBlocking {
         }
         Ok(())
     }
-
-
 
     /// Write an entry in the file table, overwriting any existing one.
     fn do_write_file_entry(
@@ -852,13 +865,7 @@ impl ArenaUnrealCacheBlocking {
             }
         });
         if let Some((_, entry)) = most_recent {
-            self.do_write_file_entry(
-                file_table,
-                inode,
-                None,
-                &entry,
-                blob_table,
-            )?;
+            self.do_write_file_entry(file_table, inode, None, &entry, blob_table)?;
         }
 
         Ok(())
@@ -875,7 +882,8 @@ impl ArenaUnrealCacheBlocking {
         blob_table: Option<&mut redb::Table<'_, u64, Holder<BlobTableEntry>>>,
     ) -> Result<(), StorageError> {
         let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
-        let (parent_inode, parent_assignment) = do_lookup_path(&dir_table, arena_root, &path.parent())?;
+        let (parent_inode, parent_assignment) =
+            do_lookup_path(&dir_table, arena_root, &path.parent())?;
         if parent_assignment != InodeAssignment::Directory {
             return Err(StorageError::NotADirectory);
         }
@@ -912,8 +920,8 @@ impl ArenaUnrealCacheBlocking {
         let mut directory_table = txn.open_table(DIRECTORY_TABLE)?;
         let mut blob_table = txn.open_table(BLOB_TABLE)?;
         let peer_str = peer.as_str();
-        for elt in
-            pending_catchup_table.extract_from_if((peer_str, 0)..(peer_str, u64::MAX), |_, _| true)?
+        for elt in pending_catchup_table
+            .extract_from_if((peer_str, 0)..(peer_str, u64::MAX), |_, _| true)?
         {
             let elt = elt?;
             let (_, inode) = elt.0.value();
@@ -928,6 +936,31 @@ impl ArenaUnrealCacheBlocking {
                 Some(&mut blob_table),
             )?;
         }
+        Ok(())
+    }
+
+    fn local_availability(&self, blob_id: u64) -> Result<ByteRanges, StorageError> {
+        let txn = self.db.begin_read()?;
+        let blob_table = txn.open_table(BLOB_TABLE)?;
+
+        Ok(get_blob_entry(&blob_table, blob_id)?.written_areas)
+    }
+
+    fn extend_local_availability(
+        &self,
+        blob_id: u64,
+        new_range: ByteRanges,
+    ) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut blob_table = txn.open_table(BLOB_TABLE)?;
+            let mut blob_entry = get_blob_entry(&blob_table, blob_id)?;
+            blob_entry.written_areas = blob_entry.written_areas.union(&new_range);
+
+            blob_table.insert(blob_id, Holder::with_content(blob_entry)?)?;
+        }
+        txn.commit()?;
+
         Ok(())
     }
 }
@@ -1097,7 +1130,9 @@ impl UnrealCacheAsync {
     pub async fn open_file(&self, inode: u64) -> Result<tokio::fs::File, StorageError> {
         let inner = Arc::clone(&self.inner);
 
-        let (_, stdfile) = task::spawn_blocking(move || inner.open_file(inode)).await??;
+        // TODO: Build a Blob structs that keeps the blob_id and
+        // blob_range returned by open_file.
+        let (_, _, stdfile) = task::spawn_blocking(move || inner.open_file(inode)).await??;
         Ok(tokio::fs::File::from_std(stdfile))
     }
 }
@@ -1212,8 +1247,6 @@ fn do_add_arena_root(txn: &WriteTransaction, arena: &Arena) -> anyhow::Result<u6
     Ok(arena_root)
 }
 
-
-
 /// Get a [FileEntry] for a specific peer.
 fn get_file_entry(
     file_table: &redb::Table<'_, (u64, &str), Holder<FileTableEntry>>,
@@ -1224,6 +1257,19 @@ fn get_file_entry(
         None => Ok(None),
         Some(e) => Ok(Some(e.value().parse()?)),
     }
+}
+
+fn get_blob_entry(
+    blob_table: &impl redb::ReadableTable<u64, Holder<'static, BlobTableEntry>>,
+    blob_id: u64,
+) -> Result<BlobTableEntry, StorageError> {
+    let entry = blob_table
+        .get(blob_id)?
+        .ok_or(StorageError::NotFound)?
+        .value()
+        .parse()?;
+
+    Ok(entry)
 }
 
 fn get_default_entry(
@@ -1282,7 +1328,6 @@ fn do_file_availability(
 }
 
 /// Write an entry in the file table, overwriting any existing one.
-
 
 /// Retrieve or create a file entry at the given path.
 ///
@@ -1493,10 +1538,6 @@ fn do_unmark_peer_file(
     Ok(())
 }
 
-
-
-
-
 fn do_alloc_inode_range(
     txn: &WriteTransaction,
     assigned_root: u64,
@@ -1518,6 +1559,7 @@ mod tests {
     use super::*;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use realize_types::ByteRange;
     use realize_types::{Arena, Path, Peer};
 
     const TEST_TIME: u64 = 1234567890;
@@ -2544,7 +2586,7 @@ mod tests {
         let inode = cache.lookup(cache.arena_root(&arena)?, "foobar")?.inode;
 
         let (blob_id, file_id1) = {
-            let (blob_id, file) = cache.open_file(inode)?;
+            let (blob_id, ranges, file) = cache.open_file(inode)?;
             assert_eq!(1, blob_id);
 
             let m = file.metadata()?;
@@ -2555,13 +2597,17 @@ mod tests {
             // File should be sparse
             assert_eq!(0, m.blocks());
 
+            // Range empty for now
+            assert_eq!(ByteRanges::new(), ranges);
+
             (blob_id, file_id(file)?)
         };
 
         // If called a second time, it should return a handle on the same file.
-        let (blob_id2, file2) = cache.open_file(inode)?;
+        let (blob_id2, ranges, file2) = cache.open_file(inode)?;
         assert_eq!(blob_id, blob_id2);
         assert_eq!(file_id1, file_id(file2)?);
+        assert_eq!(ByteRanges::new(), ranges);
 
         Ok(())
     }
@@ -2584,8 +2630,8 @@ mod tests {
 
         // Open the file to create a blob
         let (inode, _) = cache.lookup_path(&arena, &file_path)?;
-        let (blob_id, _file) = cache.open_file(inode)?;
-        
+        let (blob_id, _, _) = cache.open_file(inode)?;
+
         // Verify the blob file was created
         assert!(fixture.blob_file_exists(&arena, blob_id));
 
@@ -2621,8 +2667,8 @@ mod tests {
 
         // Open the file to create a blob
         let (inode, _) = cache.lookup_path(&arena, &file_path)?;
-        let (blob_id, _file) = cache.open_file(inode)?;
-        
+        let (blob_id, _, _) = cache.open_file(inode)?;
+
         // Verify the blob file was created
         assert!(fixture.blob_file_exists(&arena, blob_id));
 
@@ -2647,8 +2693,8 @@ mod tests {
 
         // Open the file to create a blob
         let (inode, _) = cache.lookup_path(&arena, &file_path)?;
-        let (blob_id, _file) = cache.open_file(inode)?;
-        
+        let (blob_id, _, _) = cache.open_file(inode)?;
+
         // Verify the blob file was created
         assert!(fixture.blob_file_exists(&arena, blob_id));
 
@@ -2665,6 +2711,65 @@ mod tests {
 
         // Verify the blob file has been deleted
         assert!(!fixture.blob_file_exists(&arena, blob_id));
+
+        Ok(())
+    }
+
+    #[test]
+    fn update_local_availability() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(&test_arena())?;
+        let cache = &fixture.cache;
+        let arena = test_arena();
+        let file_path = Path::parse("file.txt")?;
+
+        // Create a file
+        fixture.add_file(&file_path, 1000, &test_time())?;
+
+        // Open the file to create a blob
+        let (inode, _) = cache.lookup_path(&arena, &file_path)?;
+        let (blob_id, _, _) = cache.open_file(inode)?;
+
+        // Initially, the blob should have empty written areas
+        let initial_ranges = cache.local_availability(&arena, blob_id)?;
+        assert!(initial_ranges.is_empty());
+
+        // Update the blob with some written areas
+        let written_areas = ByteRanges::from_ranges(vec![
+            ByteRange::new(0, 100),
+            ByteRange::new(200, 300),
+            ByteRange::new(500, 600),
+        ]);
+
+        cache.extend_local_availability(&arena, blob_id, written_areas.clone())?;
+
+        // Verify the written areas were updated
+        let retrieved_ranges = cache.local_availability(&arena, blob_id)?;
+        assert_eq!(retrieved_ranges, written_areas);
+
+        cache.extend_local_availability(
+            &arena,
+            blob_id,
+            ByteRanges::from_ranges(vec![ByteRange::new(50, 210), ByteRange::new(200, 400)]),
+        )?;
+
+        // Verify the ranges were updated again
+        let final_ranges = cache.local_availability(&arena, blob_id)?;
+        assert_eq!(
+            final_ranges,
+            ByteRanges::from_ranges(vec![ByteRange::new(0, 400), ByteRange::new(500, 600)])
+        );
+
+        // Test that getting ranges for a non-existent blob returns NotFound
+        assert!(matches!(
+            cache.local_availability(&arena, 99999),
+            Err(StorageError::NotFound)
+        ));
+
+        // Test that updating ranges for a non-existent blob returns NotFound
+        assert!(matches!(
+            cache.extend_local_availability(&arena, 99999, ByteRanges::new()),
+            Err(StorageError::NotFound)
+        ));
 
         Ok(())
     }
