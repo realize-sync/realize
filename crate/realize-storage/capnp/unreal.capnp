@@ -54,9 +54,7 @@ struct Time {
 
 # An entry in the blob table.
 struct BlobTableEntry {
-  owningInode @0: UInt64;
-  writtenAreas @1: ByteRanges;
-  usedDiskSpace @2: UInt64;
+  writtenAreas @0: ByteRanges;
 }
 
 # A sequence of byte ranges.

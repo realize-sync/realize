@@ -276,13 +276,7 @@ impl ByteConvertible<PeerTableEntry> for PeerTableEntry {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlobTableEntry {
-    pub owning_inode: u64,
     pub written_areas: realize_types::ByteRanges,
-
-    /// Disk space taken on the filesystem by this entry, in bytes.
-    ///
-    /// This is <= blob size.
-    pub used_disk_space: u64,
 }
 
 impl NamedType for BlobTableEntry {
@@ -298,19 +292,15 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
             message_reader.get_root::<unreal_capnp::blob_table_entry::Reader>()?;
 
         Ok(BlobTableEntry {
-            owning_inode: reader.get_owning_inode(),
             written_areas: parse_byte_ranges(reader.get_written_areas()?)?,
-            used_disk_space: reader.get_used_disk_space(),
         })
     }
 
     fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError> {
         let mut message = ::capnp::message::Builder::new_default();
-        let mut builder: unreal_capnp::blob_table_entry::Builder =
+        let builder: unreal_capnp::blob_table_entry::Builder =
             message.init_root::<unreal_capnp::blob_table_entry::Builder>();
 
-        builder.set_owning_inode(self.owning_inode);
-        builder.set_used_disk_space(self.used_disk_space);
         fill_byte_ranges(&self.written_areas, builder.init_written_areas());
 
         let mut buffer: Vec<u8> = Vec::new();
@@ -436,12 +426,10 @@ mod tests {
     #[test]
     fn convert_blob_table_entry() -> anyhow::Result<()> {
         let entry = BlobTableEntry {
-            owning_inode: 12345,
             written_areas: realize_types::ByteRanges::from_ranges(vec![
                 realize_types::ByteRange::new(0, 1024),
                 realize_types::ByteRange::new(2048, 4096),
             ]),
-            used_disk_space: 10,
         };
 
         assert_eq!(

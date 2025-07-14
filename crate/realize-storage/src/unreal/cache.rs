@@ -15,7 +15,6 @@ use realize_types::{Arena, ByteRanges, Hash, Path, Peer, UnixTime};
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
 use std::collections::HashMap;
 use std::io::{SeekFrom, Write};
-use std::os::unix::fs::MetadataExt as _;
 use std::path::{self, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -672,7 +671,7 @@ impl ArenaUnrealCacheBlocking {
             let file_entry = get_default_entry(&txn.open_table(FILE_TABLE)?, inode)?;
             if let Some(blob_id) = file_entry.content.blob {
                 let blob_entry = get_blob_entry(&txn.open_table(BLOB_TABLE)?, blob_id)?;
-                let (file, _) = self.open_blob_file(blob_id, file_entry.metadata.size, false)?;
+                let file = self.open_blob_file(blob_id, file_entry.metadata.size, false)?;
                 return Ok(Blob::new(blob_id, file_entry, blob_entry, file));
             }
         }
@@ -685,7 +684,7 @@ impl ArenaUnrealCacheBlocking {
             let mut file_entry = get_default_entry(&file_table, inode)?;
             if let Some(blob_id) = file_entry.content.blob {
                 let blob_entry = get_blob_entry(&txn.open_table(BLOB_TABLE)?, blob_id)?;
-                let (file, _) = self.open_blob_file(blob_id, file_entry.metadata.size, false)?;
+                let file = self.open_blob_file(blob_id, file_entry.metadata.size, false)?;
                 return Ok(Blob::new(blob_id, file_entry, blob_entry, file));
             }
 
@@ -695,11 +694,9 @@ impl ArenaUnrealCacheBlocking {
                 "assigned blob {blob_id:016x} to file {inode} {}",
                 file_entry.content.hash
             );
-            let (file, m) = self.open_blob_file(blob_id, file_entry.metadata.size, true)?;
+            let file = self.open_blob_file(blob_id, file_entry.metadata.size, true)?;
             let blob_entry = BlobTableEntry {
-                owning_inode: inode,
                 written_areas: ByteRanges::new(),
-                used_disk_space: m.blocks() * 512,
             };
             blob_table.insert(blob_id, Holder::new(&blob_entry)?)?;
             file_entry.content.blob = Some(blob_id);
@@ -719,7 +716,7 @@ impl ArenaUnrealCacheBlocking {
         blob_id: u64,
         file_size: u64,
         new_file: bool,
-    ) -> Result<(std::fs::File, std::fs::Metadata), StorageError> {
+    ) -> Result<std::fs::File, StorageError> {
         let path = self.blob_path(blob_id);
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -727,14 +724,13 @@ impl ArenaUnrealCacheBlocking {
             .truncate(new_file)
             .create(true)
             .open(path)?;
-        let mut file_meta = file.metadata()?;
+        let file_meta = file.metadata()?;
         if file_size != file_meta.len() {
             file.set_len(file_size)?;
             file.flush()?;
-            file_meta = file.metadata()?;
         }
 
-        Ok((file, file_meta))
+        Ok(file)
     }
 
     /// Return the path of the file for the given blob.
@@ -1717,6 +1713,8 @@ impl AsyncSeek for Blob {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::MetadataExt as _;
+
     use super::*;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
