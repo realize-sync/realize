@@ -2,9 +2,7 @@
 //!
 //! See `spec/unreal.md` for details.
 
-use super::arena_cache::{
-    self, ArenaUnrealCacheBlocking, Blob, CURRENT_INODE_RANGE_TABLE, DIRECTORY_TABLE,
-};
+use super::arena_cache::{self, ArenaCache, Blob, CURRENT_INODE_RANGE_TABLE, DIRECTORY_TABLE};
 use super::types::{FileAvailability, FileMetadata, InodeAssignment, ReadDirEntry};
 use crate::StorageError;
 use crate::config::StorageConfig;
@@ -44,7 +42,7 @@ const INODE_RANGE_ALLOCATION_TABLE: TableDefinition<u64, u64> =
 pub struct UnrealCacheBlocking {
     db: Database,
     arena_roots: BiMap<Arena, u64>,
-    arena_caches: HashMap<Arena, ArenaUnrealCacheBlocking>,
+    arena_caches: HashMap<Arena, ArenaCache>,
 }
 
 impl UnrealCacheBlocking {
@@ -98,7 +96,7 @@ impl UnrealCacheBlocking {
     }
 
     /// Returns the cache for the given arena or fail.
-    fn arena_cache(&self, arena: &Arena) -> Result<&ArenaUnrealCacheBlocking, StorageError> {
+    fn arena_cache(&self, arena: &Arena) -> Result<&ArenaCache, StorageError> {
         Ok(self.arena_caches.get(arena).ok_or(StorageError::NotFound)?)
     }
 
@@ -127,7 +125,7 @@ impl UnrealCacheBlocking {
         };
         self.arena_caches.insert(
             arena.clone(),
-            ArenaUnrealCacheBlocking::new(arena, arena_root, db, blob_dir)?,
+            ArenaCache::new(arena, arena_root, db, blob_dir)?,
         );
 
         Ok(())

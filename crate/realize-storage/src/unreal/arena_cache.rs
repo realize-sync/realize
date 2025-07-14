@@ -94,14 +94,14 @@ const BLOB_TABLE: TableDefinition<u64, Holder<BlobTableEntry>> = TableDefinition
 ///
 /// This struct handles all cache operations for a specific arena.
 /// It contains the arena's database and root inode.
-pub(crate) struct ArenaUnrealCacheBlocking {
+pub(crate) struct ArenaCache {
     arena: Arena,
     arena_root: u64,
     db: Database,
     blob_dir: PathBuf,
 }
 
-impl ArenaUnrealCacheBlocking {
+impl ArenaCache {
     /// Create a new ArenaUnrealCacheBlocking from an arena, root inode, database, and blob directory.
     pub(crate) fn new(
         arena: Arena,
