@@ -15,6 +15,7 @@ mod error;
 mod real;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+mod types;
 mod unreal;
 pub mod utils;
 
@@ -23,6 +24,7 @@ pub use real::notifier::Notification;
 pub use real::notifier::Progress;
 pub use real::reader::Reader;
 pub use real::store::{Options as RealStoreOptions, RealStore, RealStoreError, SyncedFile};
+pub use types::Inode;
 pub use unreal::arena_cache::Blob;
 pub use unreal::cache::UnrealCacheAsync;
 pub use unreal::types::{FileAvailability, FileMetadata, InodeAssignment};
