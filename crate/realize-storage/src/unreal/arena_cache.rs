@@ -2,9 +2,9 @@ use super::types::{
     BlobTableEntry, DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry,
     InodeAssignment, PeerTableEntry, ReadDirEntry,
 };
-use crate::StorageError;
 use crate::real::notifier::{Notification, Progress};
 use crate::utils::holder::Holder;
+use crate::{Inode, StorageError};
 use realize_types::{Arena, ByteRanges, Hash, Path, Peer, UnixTime};
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
 use std::collections::HashMap;
@@ -26,7 +26,7 @@ use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 ///
 /// Key: (inode, name)
 /// Value: DirTableEntry
-pub(crate) const DIRECTORY_TABLE: TableDefinition<(u64, &str), Holder<DirTableEntry>> =
+pub(crate) const DIRECTORY_TABLE: TableDefinition<(Inode, &str), Holder<DirTableEntry>> =
     TableDefinition::new("directory");
 
 /// Track peer files.
@@ -40,7 +40,7 @@ pub(crate) const DIRECTORY_TABLE: TableDefinition<(u64, &str), Holder<DirTableEn
 ///
 /// Key: (inode, peer)
 /// Value: FileTableEntry
-const FILE_TABLE: TableDefinition<(u64, &str), Holder<FileTableEntry>> =
+const FILE_TABLE: TableDefinition<(Inode, &str), Holder<FileTableEntry>> =
     TableDefinition::new("file");
 
 /// Track peer files that might have been deleted remotely.
@@ -55,7 +55,7 @@ const FILE_TABLE: TableDefinition<(u64, &str), Holder<FileTableEntry>> =
 ///
 /// Key: (peer, file inode)
 /// Value: parent dir inode
-const PENDING_CATCHUP_TABLE: TableDefinition<(&str, u64), u64> =
+const PENDING_CATCHUP_TABLE: TableDefinition<(&str, Inode), Inode> =
     TableDefinition::new("pending_catchup");
 
 /// Track Peer UUIDs.
@@ -80,8 +80,8 @@ const NOTIFICATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("not
 /// arena.
 ///
 /// Key: ()
-/// Value: (u64, u64) (last inode allocated, end of range)
-pub(crate) const CURRENT_INODE_RANGE_TABLE: TableDefinition<(), (u64, u64)> =
+/// Value: (Inode, Inode) (last inode allocated, end of range)
+pub(crate) const CURRENT_INODE_RANGE_TABLE: TableDefinition<(), (Inode, Inode)> =
     TableDefinition::new("current_inode_range");
 
 /// Track blobs.
@@ -96,7 +96,7 @@ const BLOB_TABLE: TableDefinition<u64, Holder<BlobTableEntry>> = TableDefinition
 /// It contains the arena's database and root inode.
 pub(crate) struct ArenaCache {
     arena: Arena,
-    arena_root: u64,
+    arena_root: Inode,
     db: Database,
     blob_dir: PathBuf,
 }
@@ -105,7 +105,7 @@ impl ArenaCache {
     /// Create a new ArenaUnrealCacheBlocking from an arena, root inode, database, and blob directory.
     pub(crate) fn new(
         arena: Arena,
-        arena_root: u64,
+        arena_root: Inode,
         db: Database,
         blob_dir: PathBuf,
     ) -> Result<Self, StorageError> {
@@ -138,38 +138,44 @@ impl ArenaCache {
 
     pub(crate) fn lookup(
         &self,
-        parent_inode: u64,
+        parent_inode: Inode,
         name: &str,
     ) -> Result<ReadDirEntry, StorageError> {
         let txn = self.db.begin_read()?;
         do_lookup(txn, parent_inode, name)
     }
 
-    pub(crate) fn lookup_path(&self, path: &Path) -> Result<(u64, InodeAssignment), StorageError> {
+    pub(crate) fn lookup_path(
+        &self,
+        path: &Path,
+    ) -> Result<(Inode, InodeAssignment), StorageError> {
         let txn = self.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
 
         do_lookup_path(&dir_table, self.arena_root, &Some(path.clone()))
     }
 
-    pub(crate) fn file_metadata(&self, inode: u64) -> Result<FileMetadata, StorageError> {
+    pub(crate) fn file_metadata(&self, inode: Inode) -> Result<FileMetadata, StorageError> {
         let txn = self.db.begin_read()?;
         do_file_metadata(&txn, inode)
     }
 
-    pub(crate) fn dir_mtime(&self, inode: u64) -> Result<UnixTime, StorageError> {
+    pub(crate) fn dir_mtime(&self, inode: Inode) -> Result<UnixTime, StorageError> {
         let txn = self.db.begin_read()?;
 
         do_dir_mtime(&txn, inode, self.arena_root)
     }
 
-    pub(crate) fn file_availability(&self, inode: u64) -> Result<FileAvailability, StorageError> {
+    pub(crate) fn file_availability(&self, inode: Inode) -> Result<FileAvailability, StorageError> {
         let txn = self.db.begin_read()?;
 
         do_file_availability(&txn, inode, &self.arena)
     }
 
-    pub(crate) fn readdir(&self, inode: u64) -> Result<Vec<(String, ReadDirEntry)>, StorageError> {
+    pub(crate) fn readdir(
+        &self,
+        inode: Inode,
+    ) -> Result<Vec<(String, ReadDirEntry)>, StorageError> {
         let txn = self.db.begin_read()?;
 
         do_readdir(&txn, inode)
@@ -185,7 +191,7 @@ impl ArenaCache {
         &self,
         peer: &Peer,
         notification: Notification,
-        alloc_inode_range: impl Fn() -> Result<(u64, u64), StorageError>,
+        alloc_inode_range: impl Fn() -> Result<(Inode, Inode), StorageError>,
     ) -> Result<(), StorageError> {
         log::debug!("notification from {peer}: {notification:?}");
         // UnrealCacheBlocking::update, is responsible for dispatching properly
@@ -342,7 +348,7 @@ impl ArenaCache {
     }
 
     /// Open a file for reading/writing.
-    pub(crate) fn open_file(&self, inode: u64) -> Result<Blob, StorageError> {
+    pub(crate) fn open_file(&self, inode: Inode) -> Result<Blob, StorageError> {
         // Optimistically, try a read transaction to check whether the
         // blob is there.
         {
@@ -429,8 +435,8 @@ impl ArenaCache {
     /// Write an entry in the file table, overwriting any existing one.
     fn do_write_file_entry(
         &self,
-        file_table: &mut redb::Table<'_, (u64, &str), Holder<FileTableEntry>>,
-        file_inode: u64,
+        file_table: &mut redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
+        file_inode: Inode,
         peer: Option<&Peer>,
         entry: &FileTableEntry,
         blob_table: Option<&mut redb::Table<'_, u64, Holder<BlobTableEntry>>>,
@@ -459,10 +465,10 @@ impl ArenaCache {
     /// Remove a file entry for a specific peer.
     fn do_rm_file_entry(
         &self,
-        file_table: &mut redb::Table<'_, (u64, &str), Holder<FileTableEntry>>,
-        dir_table: &mut redb::Table<'_, (u64, &str), Holder<DirTableEntry>>,
-        parent_inode: u64,
-        inode: u64,
+        file_table: &mut redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
+        dir_table: &mut redb::Table<'_, (Inode, &str), Holder<DirTableEntry>>,
+        parent_inode: Inode,
+        inode: Inode,
         peer: &Peer,
         old_hash: Option<Hash>,
         blob_table: Option<&mut redb::Table<'_, u64, Holder<BlobTableEntry>>>,
@@ -470,7 +476,7 @@ impl ArenaCache {
         let peer_str = peer.as_str();
 
         let mut entries = HashMap::new();
-        for elt in file_table.range((inode, "")..(inode + 1, ""))? {
+        for elt in file_table.range((inode, "")..(inode.plus(1), ""))? {
             let (key, value) = elt?;
             let key = key.value().1;
             let entry = value.value().parse()?;
@@ -518,12 +524,13 @@ impl ArenaCache {
             }
 
             file_table.remove((inode, ""))?;
-            dir_table.retain_in((parent_inode, "")..(parent_inode + 1, ""), |_, v| {
-                match v.parse() {
+            dir_table.retain_in(
+                (parent_inode, "")..(parent_inode.plus(1), ""),
+                |_, v| match v.parse() {
                     Ok(DirTableEntry::Regular(v)) => v.inode != inode,
                     _ => true,
-                }
-            })?;
+                },
+            )?;
             dir_table.insert(
                 (parent_inode, "."),
                 Holder::with_content(DirTableEntry::Dot(UnixTime::now()))?,
@@ -560,7 +567,7 @@ impl ArenaCache {
         &self,
         txn: &WriteTransaction,
         peer: &Peer,
-        arena_root: u64,
+        arena_root: Inode,
         path: &Path,
         old_hash: Hash,
         blob_table: Option<&mut redb::Table<'_, u64, Holder<BlobTableEntry>>>,
@@ -605,7 +612,9 @@ impl ArenaCache {
         let mut blob_table = txn.open_table(BLOB_TABLE)?;
         let peer_str = peer.as_str();
         for elt in pending_catchup_table
-            .extract_from_if((peer_str, 0)..(peer_str, u64::MAX), |_, _| true)?
+            .extract_from_if((peer_str, Inode::ZERO)..=(peer_str, Inode::MAX), |_, _| {
+                true
+            })?
         {
             let elt = elt?;
             let (_, inode) = elt.0.value();
@@ -651,7 +660,7 @@ impl ArenaCache {
 
 pub(crate) fn do_readdir(
     txn: &ReadTransaction,
-    inode: u64,
+    inode: Inode,
 ) -> Result<Vec<(String, ReadDirEntry)>, StorageError> {
     let dir_table = txn.open_table(DIRECTORY_TABLE)?;
 
@@ -676,7 +685,7 @@ pub(crate) fn do_readdir(
 
 pub(crate) fn do_lookup(
     txn: ReadTransaction,
-    parent_inode: u64,
+    parent_inode: Inode,
     name: &str,
 ) -> Result<ReadDirEntry, StorageError> {
     let dir_table = txn.open_table(DIRECTORY_TABLE)?;
@@ -718,8 +727,8 @@ fn do_peer_progress(txn: &ReadTransaction, peer: &Peer) -> Result<Option<Progres
 
 pub(crate) fn do_dir_mtime(
     txn: &ReadTransaction,
-    inode: u64,
-    root: u64,
+    inode: Inode,
+    root: Inode,
 ) -> Result<UnixTime, StorageError> {
     let dir_table = txn.open_table(DIRECTORY_TABLE)?;
     match dir_table.get((inode, "."))? {
@@ -742,8 +751,8 @@ pub(crate) fn do_dir_mtime(
 
 /// Get a [FileEntry] for a specific peer.
 fn get_file_entry(
-    file_table: &redb::Table<'_, (u64, &str), Holder<FileTableEntry>>,
-    inode: u64,
+    file_table: &redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
+    inode: Inode,
     peer: Option<&Peer>,
 ) -> Result<Option<FileTableEntry>, StorageError> {
     match file_table.get((inode, peer.map(|p| p.as_str()).unwrap_or("")))? {
@@ -766,26 +775,26 @@ fn get_blob_entry(
 }
 
 fn get_default_entry(
-    file_table: &impl redb::ReadableTable<(u64, &'static str), Holder<'static, FileTableEntry>>,
-    inode: u64,
+    file_table: &impl redb::ReadableTable<(Inode, &'static str), Holder<'static, FileTableEntry>>,
+    inode: Inode,
 ) -> Result<FileTableEntry, StorageError> {
     let entry = file_table.get((inode, ""))?.ok_or(StorageError::NotFound)?;
 
     Ok(entry.value().parse()?)
 }
 
-fn do_file_metadata(txn: &ReadTransaction, inode: u64) -> Result<FileMetadata, StorageError> {
+fn do_file_metadata(txn: &ReadTransaction, inode: Inode) -> Result<FileMetadata, StorageError> {
     Ok(get_default_entry(&txn.open_table(FILE_TABLE)?, inode)?.metadata)
 }
 
 fn do_file_availability(
     txn: &ReadTransaction,
-    inode: u64,
+    inode: Inode,
     arena: &Arena,
 ) -> Result<FileAvailability, StorageError> {
     let file_table = txn.open_table(FILE_TABLE)?;
 
-    let mut range = file_table.range((inode, "")..(inode + 1, ""))?;
+    let mut range = file_table.range((inode, "")..(inode.plus(1), ""))?;
     let (default_key, default_entry) = range.next().ok_or(StorageError::NotFound)??;
     if default_key.value().1 != "" {
         log::warn!("File table entry without a default peer: {inode}");
@@ -827,10 +836,10 @@ fn do_file_availability(
 /// Return the parent inode and the file inode.
 fn do_create_file(
     txn: &WriteTransaction,
-    arena_root: u64,
+    arena_root: Inode,
     path: &Path,
-    alloc_inode_range: &impl Fn() -> Result<(u64, u64), StorageError>,
-) -> Result<(u64, u64), StorageError> {
+    alloc_inode_range: &impl Fn() -> Result<(Inode, Inode), StorageError>,
+) -> Result<(Inode, Inode), StorageError> {
     let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
     let filename = path.name();
     let parent_inode = do_mkdirs(
@@ -872,11 +881,11 @@ fn do_create_file(
 /// Returns the inode of the directory pointed to by the path.
 pub(crate) fn do_mkdirs(
     txn: &WriteTransaction,
-    dir_table: &mut redb::Table<'_, (u64, &str), Holder<DirTableEntry>>,
-    root_inode: u64,
+    dir_table: &mut redb::Table<'_, (Inode, &str), Holder<DirTableEntry>>,
+    root_inode: Inode,
     path: &Option<Path>,
-    alloc_inode_range: &impl Fn() -> Result<(u64, u64), StorageError>,
-) -> Result<u64, StorageError> {
+    alloc_inode_range: &impl Fn() -> Result<(Inode, Inode), StorageError>,
+) -> Result<Inode, StorageError> {
     log::debug!("mkdirs {root_inode} {path:?}");
     let mut current = root_inode;
     for component in Path::components(path) {
@@ -907,10 +916,10 @@ pub(crate) fn do_mkdirs(
 
 /// Find the file or directory pointed to by the given path.
 fn do_lookup_path(
-    dir_table: &impl redb::ReadableTable<(u64, &'static str), Holder<'static, DirTableEntry>>,
-    root_inode: u64,
+    dir_table: &impl redb::ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
+    root_inode: Inode,
     path: &Option<Path>,
-) -> Result<(u64, InodeAssignment), StorageError> {
+) -> Result<(Inode, InodeAssignment), StorageError> {
     let mut current = (root_inode, InodeAssignment::Directory);
     for component in Path::components(path) {
         if current.1 != InodeAssignment::Directory {
@@ -928,8 +937,8 @@ fn do_lookup_path(
 
 /// Get a [ReadDirEntry] from a directory, if it exists.
 fn get_dir_entry(
-    dir_table: &impl redb::ReadableTable<(u64, &'static str), Holder<'static, DirTableEntry>>,
-    parent_inode: u64,
+    dir_table: &impl redb::ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
+    parent_inode: Inode,
     name: &str,
 ) -> Result<Option<ReadDirEntry>, StorageError> {
     match dir_table.get((parent_inode, name))? {
@@ -940,9 +949,9 @@ fn get_dir_entry(
 
 /// Add an entry to the given directory.
 pub(crate) fn add_dir_entry(
-    dir_table: &mut redb::Table<'_, (u64, &str), Holder<DirTableEntry>>,
-    parent_inode: u64,
-    new_inode: u64,
+    dir_table: &mut redb::Table<'_, (Inode, &str), Holder<DirTableEntry>>,
+    parent_inode: Inode,
+    new_inode: Inode,
     name: &str,
     assignment: InodeAssignment,
 ) -> Result<(), StorageError> {
@@ -973,8 +982,8 @@ pub(crate) fn add_dir_entry(
 /// Returns the allocated inode.
 pub(crate) fn alloc_inode(
     txn: &WriteTransaction,
-    alloc_inode_range: impl Fn() -> Result<(u64, u64), StorageError>,
-) -> Result<u64, StorageError> {
+    alloc_inode_range: impl Fn() -> Result<(Inode, Inode), StorageError>,
+) -> Result<Inode, StorageError> {
     let mut current_range_table = txn.open_table(CURRENT_INODE_RANGE_TABLE)?;
     // Read the current range directly from the write transaction
     let current_range = match current_range_table.get(())? {
@@ -985,9 +994,9 @@ pub(crate) fn alloc_inode(
         None => None,
     };
     match current_range {
-        Some((current, end)) if (current + 1) < end => {
+        Some((current, end)) if (current.plus(1)) < end => {
             // We have inodes available in the current range
-            let inode = current + 1;
+            let inode = current.plus(1);
             current_range_table.insert((), (inode, end))?;
             Ok(inode)
         }
@@ -1022,7 +1031,7 @@ fn do_mark_peer_files(txn: &WriteTransaction, peer: &Peer) -> Result<(), Storage
 fn do_unmark_peer_file(
     txn: &WriteTransaction,
     peer: &Peer,
-    inode: u64,
+    inode: Inode,
 ) -> Result<(), StorageError> {
     let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
     pending_catchup_table.remove((peer.as_str(), inode))?;

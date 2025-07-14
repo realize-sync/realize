@@ -4,9 +4,9 @@
 
 use super::arena_cache::{self, ArenaCache, Blob, CURRENT_INODE_RANGE_TABLE, DIRECTORY_TABLE};
 use super::types::{FileAvailability, FileMetadata, InodeAssignment, ReadDirEntry};
-use crate::StorageError;
 use crate::config::StorageConfig;
 use crate::real::notifier::{Notification, Progress};
+use crate::{Inode, StorageError};
 use bimap::BiMap;
 use realize_types::{Arena, ByteRanges, Path, Peer, UnixTime};
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
@@ -25,29 +25,29 @@ const RANGE_SIZE: u64 = 10000;
 ///
 /// Key: arena name
 /// Value: root inode of arena
-const ARENA_TABLE: TableDefinition<&str, u64> = TableDefinition::new("arena");
+const ARENA_TABLE: TableDefinition<&str, Inode> = TableDefinition::new("arena");
 
 /// Track inode range allocation for arenas.
 ///
 /// This table allocates increasing ranges of inodes to arenas.
-/// Key: u64 (inode - end of range)
-/// Value: u64 (arena root, 1 for the no-arena range)
+/// Key: Inode (inode - end of range)
+/// Value: Inode (arena root, 1 for the no-arena range)
 ///
 /// To find which arena a given inode N belongs to, lookup the range [N..];
 /// the first element returned is the end of the current range to which N belongs.
-const INODE_RANGE_ALLOCATION_TABLE: TableDefinition<u64, u64> =
+const INODE_RANGE_ALLOCATION_TABLE: TableDefinition<Inode, Inode> =
     TableDefinition::new("inode_range_allocation");
 
 /// A cache of remote files.
 pub struct UnrealCacheBlocking {
     db: Database,
-    arena_roots: BiMap<Arena, u64>,
+    arena_roots: BiMap<Arena, Inode>,
     arena_caches: HashMap<Arena, ArenaCache>,
 }
 
 impl UnrealCacheBlocking {
     /// Inode of the root dir.
-    pub const ROOT_DIR: u64 = 1;
+    pub const ROOT_DIR: Inode = Inode(1);
 
     /// Create a new UnrealCache from a redb database.
     pub fn new(db: Database) -> Result<Self, StorageError> {
@@ -88,7 +88,7 @@ impl UnrealCacheBlocking {
     ///
     /// Will return [UnrealCacheError::UnknownArena] unless the arena
     /// is available in the cache.
-    pub fn arena_root(&self, arena: &Arena) -> Result<u64, StorageError> {
+    pub fn arena_root(&self, arena: &Arena) -> Result<Inode, StorageError> {
         self.arena_roots
             .get_by_left(arena)
             .copied()
@@ -137,7 +137,7 @@ impl UnrealCacheBlocking {
     }
 
     /// Lookup a directory entry.
-    pub fn lookup(&self, parent_inode: u64, name: &str) -> Result<ReadDirEntry, StorageError> {
+    pub fn lookup(&self, parent_inode: Inode, name: &str) -> Result<ReadDirEntry, StorageError> {
         let txn = self.db.begin_read()?;
         match self.arena_for_inode(&txn, parent_inode)? {
             Some(arena) => self.arena_cache(&arena)?.lookup(parent_inode, name),
@@ -150,12 +150,12 @@ impl UnrealCacheBlocking {
         &self,
         arena: &Arena,
         path: &Path,
-    ) -> Result<(u64, InodeAssignment), StorageError> {
+    ) -> Result<(Inode, InodeAssignment), StorageError> {
         self.arena_cache(arena)?.lookup_path(path)
     }
 
     /// Return the best metadata for the file.
-    pub fn file_metadata(&self, inode: u64) -> Result<FileMetadata, StorageError> {
+    pub fn file_metadata(&self, inode: Inode) -> Result<FileMetadata, StorageError> {
         let arena = self
             .arena_for_inode(&self.db.begin_read()?, inode)?
             .ok_or(StorageError::NotFound)?;
@@ -164,7 +164,7 @@ impl UnrealCacheBlocking {
     }
 
     /// Return the mtime of the directory.
-    pub fn dir_mtime(&self, inode: u64) -> Result<UnixTime, StorageError> {
+    pub fn dir_mtime(&self, inode: Inode) -> Result<UnixTime, StorageError> {
         let txn = self.db.begin_read()?;
         match self.arena_for_inode(&txn, inode)? {
             None => arena_cache::do_dir_mtime(&txn, inode, UnrealCacheBlocking::ROOT_DIR),
@@ -175,7 +175,7 @@ impl UnrealCacheBlocking {
     /// Return valid peer file entries for the file.
     ///
     /// The returned vector might be empty if the file isn't available in any peer.
-    pub fn file_availability(&self, inode: u64) -> Result<FileAvailability, StorageError> {
+    pub fn file_availability(&self, inode: Inode) -> Result<FileAvailability, StorageError> {
         let arena = self
             .arena_for_inode(&self.db.begin_read()?, inode)?
             .ok_or(StorageError::NotFound)?;
@@ -183,7 +183,7 @@ impl UnrealCacheBlocking {
         self.arena_cache(&arena)?.file_availability(inode)
     }
 
-    pub fn readdir(&self, inode: u64) -> Result<Vec<(String, ReadDirEntry)>, StorageError> {
+    pub fn readdir(&self, inode: Inode) -> Result<Vec<(String, ReadDirEntry)>, StorageError> {
         let txn = self.db.begin_read()?;
         match self.arena_for_inode(&txn, inode)? {
             None => arena_cache::do_readdir(&txn, inode),
@@ -213,7 +213,7 @@ impl UnrealCacheBlocking {
         cache.update(peer, notification, || self.alloc_inode_range(&arena))
     }
 
-    pub(crate) fn open_file(&self, inode: u64) -> Result<Blob, StorageError> {
+    pub(crate) fn open_file(&self, inode: Inode) -> Result<Blob, StorageError> {
         let arena = self
             .arena_for_inode(&self.db.begin_read()?, inode)?
             .ok_or(StorageError::NotFound)?;
@@ -226,7 +226,7 @@ impl UnrealCacheBlocking {
     /// It finds the last allocated range and allocates the next available range.
     ///
     /// Returns the allocated range as (start, end) where end is exclusive.
-    fn alloc_inode_range(&self, arena: &Arena) -> Result<(u64, u64), StorageError> {
+    fn alloc_inode_range(&self, arena: &Arena) -> Result<(Inode, Inode), StorageError> {
         let arena_root = self.arena_root(arena)?;
 
         let txn = self.db.begin_write()?;
@@ -250,7 +250,7 @@ impl UnrealCacheBlocking {
     fn arena_for_inode(
         &self,
         txn: &ReadTransaction,
-        inode: u64,
+        inode: Inode,
     ) -> Result<Option<&Arena>, StorageError> {
         if inode == UnrealCacheBlocking::ROOT_DIR {
             return Ok(None);
@@ -307,7 +307,7 @@ pub struct UnrealCacheAsync {
 
 impl UnrealCacheAsync {
     /// Inode of the root dir.
-    pub const ROOT_DIR: u64 = UnrealCacheBlocking::ROOT_DIR;
+    pub const ROOT_DIR: Inode = UnrealCacheBlocking::ROOT_DIR;
 
     /// Create and configure a cache from configuration.
     pub fn from_config(config: &StorageConfig) -> anyhow::Result<Option<Self>> {
@@ -379,13 +379,13 @@ impl UnrealCacheAsync {
         self.inner.arenas()
     }
 
-    pub fn arena_root(&self, arena: &Arena) -> Result<u64, StorageError> {
+    pub fn arena_root(&self, arena: &Arena) -> Result<Inode, StorageError> {
         self.inner.arena_root(arena)
     }
 
     pub async fn lookup(
         &self,
-        parent_inode: u64,
+        parent_inode: Inode,
         name: &str,
     ) -> Result<ReadDirEntry, StorageError> {
         let name = name.to_string();
@@ -398,7 +398,7 @@ impl UnrealCacheAsync {
         &self,
         arena: &Arena,
         path: &Path,
-    ) -> Result<(u64, InodeAssignment), StorageError> {
+    ) -> Result<(Inode, InodeAssignment), StorageError> {
         let arena = arena.clone();
         let path = path.clone();
         let inner = Arc::clone(&self.inner);
@@ -406,25 +406,25 @@ impl UnrealCacheAsync {
         task::spawn_blocking(move || inner.lookup_path(&arena, &path)).await?
     }
 
-    pub async fn file_metadata(&self, inode: u64) -> Result<FileMetadata, StorageError> {
+    pub async fn file_metadata(&self, inode: Inode) -> Result<FileMetadata, StorageError> {
         let inner = Arc::clone(&self.inner);
 
         task::spawn_blocking(move || inner.file_metadata(inode)).await?
     }
 
-    pub async fn file_availability(&self, inode: u64) -> Result<FileAvailability, StorageError> {
+    pub async fn file_availability(&self, inode: Inode) -> Result<FileAvailability, StorageError> {
         let inner = Arc::clone(&self.inner);
 
         task::spawn_blocking(move || inner.file_availability(inode)).await?
     }
 
-    pub async fn dir_mtime(&self, inode: u64) -> Result<UnixTime, StorageError> {
+    pub async fn dir_mtime(&self, inode: Inode) -> Result<UnixTime, StorageError> {
         let inner = Arc::clone(&self.inner);
 
         task::spawn_blocking(move || inner.dir_mtime(inode)).await?
     }
 
-    pub async fn readdir(&self, inode: u64) -> Result<Vec<(String, ReadDirEntry)>, StorageError> {
+    pub async fn readdir(&self, inode: Inode) -> Result<Vec<(String, ReadDirEntry)>, StorageError> {
         let inner = Arc::clone(&self.inner);
 
         task::spawn_blocking(move || inner.readdir(inode)).await?
@@ -465,14 +465,14 @@ impl UnrealCacheAsync {
     ///
     /// This is usually used through the `Downloader`, which can
     /// download incomplete portions of the file.
-    pub async fn open_file(&self, inode: u64) -> Result<Blob, StorageError> {
+    pub async fn open_file(&self, inode: Inode) -> Result<Blob, StorageError> {
         let inner = Arc::clone(&self.inner);
 
         task::spawn_blocking(move || inner.open_file(inode)).await?
     }
 }
 
-fn do_read_arena_map(txn: &ReadTransaction) -> Result<BiMap<Arena, u64>, StorageError> {
+fn do_read_arena_map(txn: &ReadTransaction) -> Result<BiMap<Arena, Inode>, StorageError> {
     let mut map = BiMap::new();
     let arena_table = txn.open_table(ARENA_TABLE)?;
     for elt in arena_table.iter()? {
@@ -504,7 +504,7 @@ fn check_arena_compatibility(arena: &Arena, existing: &Arena) -> anyhow::Result<
     Ok(())
 }
 
-fn do_add_arena_root(txn: &WriteTransaction, arena: &Arena) -> anyhow::Result<u64> {
+fn do_add_arena_root(txn: &WriteTransaction, arena: &Arena) -> anyhow::Result<Inode> {
     let mut arena_table = txn.open_table(ARENA_TABLE)?;
     let arena_str = arena.as_str();
     if let Some(v) = arena_table.get(arena_str)? {
@@ -537,16 +537,19 @@ fn do_add_arena_root(txn: &WriteTransaction, arena: &Arena) -> anyhow::Result<u6
 
 fn do_alloc_inode_range(
     txn: &WriteTransaction,
-    assigned_root: u64,
+    assigned_root: Inode,
     range_size: u64,
-) -> Result<(u64, u64), StorageError> {
+) -> Result<(Inode, Inode), StorageError> {
     let mut range_table = txn.open_table(INODE_RANGE_ALLOCATION_TABLE)?;
 
-    let last_end = range_table.last()?.map(|(key, _)| key.value()).unwrap_or(1);
+    let last_end = range_table
+        .last()?
+        .map(|(key, _)| key.value())
+        .unwrap_or(Inode(1));
 
-    let new_range_start = last_end + 1;
-    let new_range_end = new_range_start + range_size;
-    range_table.insert(new_range_end - 1, assigned_root)?;
+    let new_range_start = last_end.plus(1);
+    let new_range_end = new_range_start.plus(range_size);
+    range_table.insert(new_range_end.minus(1), assigned_root)?;
 
     Ok((new_range_start, new_range_end))
 }
@@ -598,7 +601,7 @@ mod tests {
 
         /// Get the current inode range in the current database.
         /// If no range exists, returns None.
-        fn get_current_inode_range(&self) -> Result<Option<(u64, u64)>, StorageError> {
+        fn get_current_inode_range(&self) -> Result<Option<(Inode, Inode)>, StorageError> {
             let txn = self.cache.db.begin_read()?;
             let range_table = txn.open_table(CURRENT_INODE_RANGE_TABLE)?;
 
@@ -631,10 +634,10 @@ mod tests {
         let fixture = Fixture::setup_with_arena(&arena)?;
 
         // There might not be any mtime at this point, but dir_mtime should not fail.
-        fixture.cache.dir_mtime(1)?;
+        fixture.cache.dir_mtime(Inode(1))?;
         fixture.cache.dir_mtime(fixture.cache.arena_root(&arena)?)?;
 
-        let documents = fixture.cache.lookup(1, "documents")?.inode;
+        let documents = fixture.cache.lookup(Inode(1), "documents")?.inode;
         fixture.cache.dir_mtime(documents)?;
 
         Ok(())
@@ -649,10 +652,10 @@ mod tests {
 
         let cache = &fixture.cache;
 
-        let arenas = cache.lookup(1, "arenas")?;
+        let arenas = cache.lookup(Inode(1), "arenas")?;
         assert_eq!(arenas.assignment, InodeAssignment::Directory);
 
-        let other = cache.lookup(1, "other")?;
+        let other = cache.lookup(Inode(1), "other")?;
         assert_eq!(other.assignment, InodeAssignment::Directory);
 
         let test1 = cache.lookup(arenas.inode, "test1")?;
@@ -691,13 +694,13 @@ mod tests {
                 ("other".to_string(), InodeAssignment::Directory)
             ],
             cache
-                .readdir(1)?
+                .readdir(Inode(1))?
                 .into_iter()
                 .map(|(name, entry)| (name, entry.assignment))
                 .collect::<Vec<_>>(),
         );
 
-        let arenas = cache.lookup(1, "arenas")?;
+        let arenas = cache.lookup(Inode(1), "arenas")?;
         assert_unordered::assert_eq_unordered!(
             vec![
                 ("test1".to_string(), InodeAssignment::Directory),
@@ -720,36 +723,63 @@ mod tests {
         assert!(fixture.get_current_inode_range()?.is_none());
 
         fixture.add_arena(&Arena::from("others"))?;
-        assert_eq!(Some((2, 102)), fixture.get_current_inode_range()?);
-        assert_eq!(2, fixture.cache.arena_root(&Arena::from("others"))?);
+        assert_eq!(
+            Some((Inode(2), Inode(102))),
+            fixture.get_current_inode_range()?
+        );
+        assert_eq!(Inode(2), fixture.cache.arena_root(&Arena::from("others"))?);
 
         fixture.add_arena(&Arena::from("arenas/test1"))?;
-        assert_eq!(Some((4, 102)), fixture.get_current_inode_range()?);
-        assert_eq!(4, fixture.cache.arena_root(&Arena::from("arenas/test1"))?);
+        assert_eq!(
+            Some((Inode(4), Inode(102))),
+            fixture.get_current_inode_range()?
+        );
+        assert_eq!(
+            Inode(4),
+            fixture.cache.arena_root(&Arena::from("arenas/test1"))?
+        );
 
         fixture.add_arena(&Arena::from("arenas/test2"))?;
-        assert_eq!(Some((5, 102)), fixture.get_current_inode_range()?);
-        assert_eq!(5, fixture.cache.arena_root(&Arena::from("arenas/test2"))?);
+        assert_eq!(
+            Some((Inode(5), Inode(102))),
+            fixture.get_current_inode_range()?
+        );
+        assert_eq!(
+            Inode(5),
+            fixture.cache.arena_root(&Arena::from("arenas/test2"))?
+        );
 
         // Nearly exhaust the range
         {
             let txn = fixture.cache.db.begin_write()?;
             {
                 let mut range_table = txn.open_table(CURRENT_INODE_RANGE_TABLE)?;
-                range_table.insert((), (100, 102))?;
+                range_table.insert((), (Inode(100), Inode(102)))?;
             }
             txn.commit()?;
         }
 
         // Next allocation exhausts the range
         fixture.add_arena(&Arena::from("another"))?;
-        assert_eq!(Some((101, 102)), fixture.get_current_inode_range()?);
-        assert_eq!(101, fixture.cache.arena_root(&Arena::from("another"))?);
+        assert_eq!(
+            Some((Inode(101), Inode(102))),
+            fixture.get_current_inode_range()?
+        );
+        assert_eq!(
+            Inode(101),
+            fixture.cache.arena_root(&Arena::from("another"))?
+        );
 
         // Next inode allocation require a new range allocation.
         fixture.add_arena(&Arena::from("theone"))?;
-        assert_eq!(Some((102, 202)), fixture.get_current_inode_range()?);
-        assert_eq!(102, fixture.cache.arena_root(&Arena::from("theone"))?);
+        assert_eq!(
+            Some((Inode(102), Inode(202))),
+            fixture.get_current_inode_range()?
+        );
+        assert_eq!(
+            Inode(102),
+            fixture.cache.arena_root(&Arena::from("theone"))?
+        );
 
         Ok(())
     }

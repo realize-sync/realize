@@ -1,6 +1,6 @@
 use crate::rpc::Household;
 use futures::Future;
-use realize_storage::{StorageError, UnrealCacheAsync};
+use realize_storage::{Inode, StorageError, UnrealCacheAsync};
 use realize_types::{Arena, ByteRange, Path, Peer};
 use std::cmp::min;
 use std::collections::VecDeque;
@@ -24,7 +24,7 @@ impl Downloader {
         Self { household, cache }
     }
 
-    pub async fn reader(&self, inode: u64) -> Result<Download, StorageError> {
+    pub async fn reader(&self, inode: Inode) -> Result<Download, StorageError> {
         let avail = self.cache.file_availability(inode).await?;
 
         // TODO: check hash

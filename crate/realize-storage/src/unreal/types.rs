@@ -1,5 +1,8 @@
 use super::unreal_capnp;
-use crate::utils::holder::{ByteConversionError, ByteConvertible, NamedType};
+use crate::{
+    Inode,
+    utils::holder::{ByteConversionError, ByteConvertible, NamedType},
+};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
 use realize_types::{self, Arena, ByteRanges, Hash, Path, Peer, UnixTime};
@@ -19,7 +22,7 @@ pub struct FileAvailability {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReadDirEntry {
     /// The inode of the entry.
-    pub inode: u64,
+    pub inode: Inode,
     /// The type of the entry.
     pub assignment: InodeAssignment,
 }
@@ -45,11 +48,11 @@ pub struct FileTableEntry {
     pub content: FileContent,
 
     /// Inode of the containing directory
-    pub parent_inode: u64,
+    pub parent_inode: Inode,
 }
 
 impl FileTableEntry {
-    pub fn new(path: Path, size: u64, mtime: UnixTime, hash: Hash, parent_inode: u64) -> Self {
+    pub fn new(path: Path, size: u64, mtime: UnixTime, hash: Hash, parent_inode: Inode) -> Self {
         Self {
             metadata: FileMetadata { size, mtime: mtime },
             content: FileContent {
@@ -114,7 +117,7 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
                 hash: parse_hash(content.get_hash()?)?,
                 blob: if blob != 0 { Some(blob) } else { None },
             },
-            parent_inode: msg.get_parent(),
+            parent_inode: Inode(msg.get_parent()),
         })
     }
 
@@ -123,7 +126,7 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
         let mut builder: unreal_capnp::file_table_entry::Builder =
             message.init_root::<unreal_capnp::file_table_entry::Builder>();
 
-        builder.set_parent(self.parent_inode);
+        builder.set_parent(self.parent_inode.into());
 
         let mut content = builder.reborrow().init_content();
         content.set_path(self.content.path.as_str());
@@ -162,7 +165,7 @@ pub enum DirTableEntry {
     Dot(UnixTime),
 }
 impl DirTableEntry {
-    pub fn into_readdir_entry(self, inode: u64) -> ReadDirEntry {
+    pub fn into_readdir_entry(self, inode: Inode) -> ReadDirEntry {
         match self {
             DirTableEntry::Regular(e) => e,
             DirTableEntry::Dot(_) => ReadDirEntry {
@@ -189,7 +192,7 @@ impl ByteConvertible<DirTableEntry> for DirTableEntry {
             unreal_capnp::dir_table_entry::Regular(entry) => {
                 let entry = entry?;
                 Ok(DirTableEntry::Regular(ReadDirEntry {
-                    inode: entry.get_inode(),
+                    inode: Inode(entry.get_inode()),
                     assignment: match entry.get_assignment()? {
                         unreal_capnp::InodeAssignment::File => InodeAssignment::File,
                         unreal_capnp::InodeAssignment::Directory => InodeAssignment::Directory,
@@ -215,7 +218,7 @@ impl ByteConvertible<DirTableEntry> for DirTableEntry {
         match self {
             DirTableEntry::Regular(entry) => {
                 let mut builder = builder.init_regular();
-                builder.set_inode(entry.inode);
+                builder.set_inode(entry.inode.into());
                 builder.set_assignment(match entry.assignment {
                     InodeAssignment::Directory => unreal_capnp::InodeAssignment::Directory,
                     InodeAssignment::File => unreal_capnp::InodeAssignment::File,
@@ -360,7 +363,7 @@ mod tests {
                 size: 200,
                 mtime: UnixTime::from_secs(1234567890),
             },
-            parent_inode: 1234,
+            parent_inode: Inode(1234),
         };
 
         assert_eq!(
@@ -383,7 +386,7 @@ mod tests {
                 size: 200,
                 mtime: UnixTime::from_secs(1234567890),
             },
-            parent_inode: 1234,
+            parent_inode: Inode(1234),
         };
 
         assert_eq!(
@@ -403,7 +406,7 @@ mod tests {
         );
 
         let regular_dir = DirTableEntry::Regular(ReadDirEntry {
-            inode: 1234,
+            inode: Inode(1234),
             assignment: InodeAssignment::Directory,
         });
         assert_eq!(
@@ -412,7 +415,7 @@ mod tests {
         );
 
         let regular_file = DirTableEntry::Regular(ReadDirEntry {
-            inode: 1234,
+            inode: Inode(1234),
             assignment: InodeAssignment::Directory,
         });
         assert_eq!(

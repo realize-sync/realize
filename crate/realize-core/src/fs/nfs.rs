@@ -6,7 +6,7 @@ use nfsserve::nfs::{
 };
 use nfsserve::tcp::{NFSTcp as _, NFSTcpListener};
 use nfsserve::vfs::{NFSFileSystem, ReadDirResult, VFSCapabilities};
-use realize_storage::{FileMetadata, InodeAssignment, StorageError, UnrealCacheAsync};
+use realize_storage::{FileMetadata, Inode, InodeAssignment, StorageError, UnrealCacheAsync};
 use realize_types::UnixTime;
 use std::io::{ErrorKind, SeekFrom};
 use std::net::SocketAddr;
@@ -36,7 +36,7 @@ pub async fn export(
 struct UnrealFs {
     cache: UnrealCacheAsync,
     downloader: Downloader,
-    readers: Cache<u64, Arc<Mutex<Download>>>,
+    readers: Cache<Inode, Arc<Mutex<Download>>>,
     uid: uid3,
     gid: gid3,
 }
@@ -78,15 +78,16 @@ impl UnrealFs {
     ) -> Result<fileid3, UnrealFsError> {
         Ok(self
             .cache
-            .lookup(dirid, std::str::from_utf8(filename)?)
+            .lookup(Inode(dirid), std::str::from_utf8(filename)?)
             .await?
-            .inode)
+            .inode
+            .into())
     }
 
     async fn do_readdir(
         &self,
-        dirid: fileid3,
-        start_after: fileid3,
+        dirid: Inode,
+        start_after: Inode,
         max_entries: usize,
     ) -> Result<ReadDirResult, UnrealFsError> {
         let mut entries = self.cache.readdir(dirid).await?;
@@ -98,7 +99,7 @@ impl UnrealFs {
         };
         for (name, entry) in entries.into_iter().skip_while(|e| e.1.inode <= start_after) {
             res.entries.push(nfsserve::vfs::DirEntry {
-                fileid: entry.inode,
+                fileid: entry.inode.into(),
                 name: name.as_bytes().into(),
                 attr: match entry.assignment {
                     InodeAssignment::Directory => {
@@ -119,7 +120,7 @@ impl UnrealFs {
         Ok(res)
     }
 
-    async fn do_getattr(&self, id: fileid3) -> Result<fattr3, UnrealFsError> {
+    async fn do_getattr(&self, id: Inode) -> Result<fattr3, UnrealFsError> {
         let (file_metadata, dir_mtime) =
             tokio::join!(self.cache.file_metadata(id), self.cache.dir_mtime(id));
         if let Ok(mtime) = dir_mtime {
@@ -128,7 +129,7 @@ impl UnrealFs {
         Ok(self.build_file_attr(id, &file_metadata?))
     }
 
-    fn build_file_attr(&self, inode: u64, metadata: &FileMetadata) -> fattr3 {
+    fn build_file_attr(&self, inode: Inode, metadata: &FileMetadata) -> fattr3 {
         let mtime = to_nfs_time(&metadata.mtime);
 
         fattr3 {
@@ -141,14 +142,14 @@ impl UnrealFs {
             used: metadata.size,
             rdev: specdata3::default(),
             fsid: 0,
-            fileid: inode,
+            fileid: inode.into(),
             atime: nfstime3::default(),
             mtime,
             ctime: mtime,
         }
     }
 
-    fn build_dir_attr(&self, inode: u64, mtime: &UnixTime) -> fattr3 {
+    fn build_dir_attr(&self, inode: Inode, mtime: &UnixTime) -> fattr3 {
         let mtime = to_nfs_time(mtime);
         fattr3 {
             ftype: ftype3::NF3DIR,
@@ -160,7 +161,7 @@ impl UnrealFs {
             used: 512,
             rdev: specdata3::default(),
             fsid: 0,
-            fileid: inode,
+            fileid: inode.into(),
             atime: nfstime3::default(),
             mtime,
             ctime: mtime,
@@ -171,7 +172,7 @@ impl UnrealFs {
 #[async_trait]
 impl NFSFileSystem for UnrealFs {
     fn root_dir(&self) -> fileid3 {
-        UnrealCacheAsync::ROOT_DIR
+        UnrealCacheAsync::ROOT_DIR.into()
     }
 
     fn capabilities(&self) -> VFSCapabilities {
@@ -204,7 +205,7 @@ impl NFSFileSystem for UnrealFs {
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
-        Ok(self.do_getattr(id).await?)
+        Ok(self.do_getattr(Inode(id)).await?)
     }
     async fn setattr(&self, _id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
         Err(nfsstat3::NFS3ERR_ROFS)
@@ -218,9 +219,9 @@ impl NFSFileSystem for UnrealFs {
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
         let reader = self
             .readers
-            .entry(id)
+            .entry(Inode(id))
             .or_try_insert_with(async {
-                let reader = self.downloader.reader(id).await?;
+                let reader = self.downloader.reader(Inode(id)).await?;
 
                 Ok::<_, StorageError>(Arc::new(Mutex::new(reader)))
             })
@@ -237,7 +238,9 @@ impl NFSFileSystem for UnrealFs {
         start_after: fileid3,
         max_entries: usize,
     ) -> Result<ReadDirResult, nfsstat3> {
-        Ok(self.do_readdir(dirid, start_after, max_entries).await?)
+        Ok(self
+            .do_readdir(Inode(dirid), Inode(start_after), max_entries)
+            .await?)
     }
 
     #[allow(unused)]
@@ -363,10 +366,10 @@ mod tests {
                 let cache = fixture.cache(&a)?;
                 let fs = UnrealFs::new(cache.clone(), Downloader::new(household_a, cache.clone()));
 
-                assert_eq!(UnrealCacheAsync::ROOT_DIR, fs.root_dir());
+                assert_eq!(UnrealCacheAsync::ROOT_DIR.as_u64(), fs.root_dir());
 
                 let attrs = fs
-                    .getattr(UnrealCacheAsync::ROOT_DIR)
+                    .getattr(UnrealCacheAsync::ROOT_DIR.into())
                     .await
                     .map_err(to_anyhow)?;
                 assert_eq!(0o0550, attrs.mode);
@@ -396,12 +399,12 @@ mod tests {
                 let arena = HouseholdFixture::test_arena();
                 let arena_root = fs
                     .lookup(
-                        UnrealCacheAsync::ROOT_DIR,
+                        UnrealCacheAsync::ROOT_DIR.into(),
                         &nfsstring::from(arena.as_str().as_bytes()),
                     )
                     .await
                     .map_err(to_anyhow)?;
-                assert_eq!(cache.arena_root(&arena)?, arena_root);
+                assert_eq!(cache.arena_root(&arena)?.as_u64(), arena_root);
 
                 let attrs = fs.getattr(arena_root).await.map_err(to_anyhow)?;
                 assert_eq!(0o0550, attrs.mode);
@@ -445,7 +448,10 @@ mod tests {
                     .arena_root(&HouseholdFixture::test_arena())
                     .expect("arena");
                 let somefile_inode = fs
-                    .lookup(arena_root, &nfsstring::from("somefile.txt".as_bytes()))
+                    .lookup(
+                        arena_root.into(),
+                        &nfsstring::from("somefile.txt".as_bytes()),
+                    )
                     .await
                     .map_err(to_anyhow)?;
 
@@ -492,7 +498,7 @@ mod tests {
                     .arena_root(&HouseholdFixture::test_arena())
                     .expect("arena");
                 let somefile_inode = fs
-                    .lookup(arena_root, &nfsstring::from("hello.txt".as_bytes()))
+                    .lookup(arena_root.into(), &nfsstring::from("hello.txt".as_bytes()))
                     .await
                     .map_err(to_anyhow)?;
 

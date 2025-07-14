@@ -7,6 +7,9 @@ use redb::{Key, TypeName, Value};
 pub struct Inode(pub u64);
 
 impl Inode {
+    pub const ZERO: Inode = Inode(0);
+    pub const MAX: Inode = Inode(u64::MAX);
+
     /// Create a new Inode from a u64 value.
     pub fn new(value: u64) -> Self {
         Self(value)
@@ -14,6 +17,18 @@ impl Inode {
 
     /// Get the underlying u64 value.
     pub fn value(&self) -> u64 {
+        self.0
+    }
+
+    pub fn plus(&self, val: u64) -> Inode {
+        Inode(self.0 + val)
+    }
+
+    pub fn minus(&self, val: u64) -> Inode {
+        Inode(self.0 - val)
+    }
+
+    pub fn as_u64(&self) -> u64 {
         self.0
     }
 }
