@@ -985,7 +985,7 @@ pub(crate) fn alloc_inode(
         None => None,
     };
     match current_range {
-        Some((current, end)) if current < end => {
+        Some((current, end)) if (current + 1) < end => {
             // We have inodes available in the current range
             let inode = current + 1;
             current_range_table.insert((), (inode, end))?;
