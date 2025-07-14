@@ -505,11 +505,24 @@ impl ArenaUnrealCacheBlocking {
                     do_create_file(&txn, self.arena_root, &path, &alloc_inode_range)?;
                 if !get_file_entry(&file_table, file_inode, Some(peer))?.is_some() {
                     let entry = FileTableEntry::new(path, size, mtime, hash, parent_inode);
+                    let mut blob_table = txn.open_table(BLOB_TABLE)?;
 
                     if !get_file_entry(&file_table, file_inode, None)?.is_some() {
-                        do_write_file_entry(&mut file_table, file_inode, None, &entry)?;
+                        self.do_write_file_entry(
+                            &mut file_table,
+                            file_inode,
+                            None,
+                            &entry,
+                            Some(&mut blob_table),
+                        )?;
                     }
-                    do_write_file_entry(&mut file_table, file_inode, Some(peer), &entry)?;
+                    self.do_write_file_entry(
+                        &mut file_table,
+                        file_inode,
+                        Some(peer),
+                        &entry,
+                        None,
+                    )?;
                 }
             }
             Notification::Replace {
@@ -528,19 +541,38 @@ impl ArenaUnrealCacheBlocking {
 
                 let mut file_table = txn.open_table(FILE_TABLE)?;
                 let entry = FileTableEntry::new(path, size, mtime, hash, parent_inode);
+                let mut blob_table = txn.open_table(BLOB_TABLE)?;
                 if let Some(e) = get_file_entry(&file_table, file_inode, None)?
                     && e.content.hash == old_hash
                 {
                     // If it overwrites the entry that's current, it's
                     // necessarily an entry we want.
-                    do_write_file_entry(&mut file_table, file_inode, None, &entry)?;
-                    do_write_file_entry(&mut file_table, file_inode, Some(peer), &entry)?;
+                    self.do_write_file_entry(
+                        &mut file_table,
+                        file_inode,
+                        None,
+                        &entry,
+                        Some(&mut blob_table),
+                    )?;
+                    self.do_write_file_entry(
+                        &mut file_table,
+                        file_inode,
+                        Some(peer),
+                        &entry,
+                        None,
+                    )?;
                 } else if let Some(e) = get_file_entry(&file_table, file_inode, Some(peer))?
                     && e.content.hash == old_hash
                 {
                     // If it overwrites the peer's entry, we want to
                     // keep that.
-                    do_write_file_entry(&mut file_table, file_inode, Some(peer), &entry)?;
+                    self.do_write_file_entry(
+                        &mut file_table,
+                        file_inode,
+                        Some(peer),
+                        &entry,
+                        None,
+                    )?;
                 }
             }
             Notification::Remove {
@@ -552,7 +584,15 @@ impl ArenaUnrealCacheBlocking {
                 do_update_last_seen_notification(&txn, peer, index)?;
 
                 let root = self.arena_root;
-                do_unlink(&txn, peer, root, &path, old_hash)?;
+                let mut blob_table = txn.open_table(BLOB_TABLE)?;
+                self.do_unlink(
+                    &txn,
+                    peer,
+                    root,
+                    &path,
+                    old_hash,
+                    Some(&mut blob_table),
+                )?;
             }
             Notification::CatchupStart(_) => {
                 do_mark_peer_files(&txn, peer)?;
@@ -571,13 +611,20 @@ impl ArenaUnrealCacheBlocking {
 
                 let mut file_table = txn.open_table(FILE_TABLE)?;
                 let entry = FileTableEntry::new(path, size, mtime, hash, parent_inode);
+                let mut blob_table = txn.open_table(BLOB_TABLE)?;
                 if !get_file_entry(&file_table, file_inode, None)?.is_some() {
-                    do_write_file_entry(&mut file_table, file_inode, None, &entry)?;
+                    self.do_write_file_entry(
+                        &mut file_table,
+                        file_inode,
+                        None,
+                        &entry,
+                        Some(&mut blob_table),
+                    )?;
                 }
-                do_write_file_entry(&mut file_table, file_inode, Some(peer), &entry)?;
+                self.do_write_file_entry(&mut file_table, file_inode, Some(peer), &entry, None)?;
             }
             Notification::CatchupComplete { index, .. } => {
-                do_delete_marked_files(&txn, peer)?;
+                self.do_delete_marked_files(&txn, peer)?;
                 do_update_last_seen_notification(&txn, peer, index)?;
             }
             Notification::Connected { uuid, .. } => {
@@ -669,6 +716,219 @@ impl ArenaUnrealCacheBlocking {
     /// Return the path of the file for the given blob.
     fn blob_path(&self, blob_id: u64) -> PathBuf {
         self.blob_dir.join(format!("{blob_id:016x}"))
+    }
+
+    /// Delete a blob and its associated file.
+    fn delete_blob(&self, blob_id: u64) -> Result<(), StorageError> {
+        let blob_path = self.blob_path(blob_id);
+        if blob_path.exists() {
+            std::fs::remove_file(&blob_path)?;
+        }
+        Ok(())
+    }
+
+
+
+    /// Write an entry in the file table, overwriting any existing one.
+    fn do_write_file_entry(
+        &self,
+        file_table: &mut redb::Table<'_, (u64, &str), Holder<FileTableEntry>>,
+        file_inode: u64,
+        peer: Option<&Peer>,
+        entry: &FileTableEntry,
+        blob_table: Option<&mut redb::Table<'_, u64, Holder<BlobTableEntry>>>,
+    ) -> Result<(), StorageError> {
+        let key = peer.map(|p| p.as_str()).unwrap_or("");
+        log::debug!("new file entry {file_inode} {key} {}", entry.content.hash);
+
+        // If this is overwriting the default entry (no peer), check if the old entry had a blob
+        if peer.is_none() {
+            if let Some(old_entry) = file_table.get((file_inode, ""))? {
+                let old_entry = old_entry.value().parse()?;
+                if let Some(blob_id) = old_entry.content.blob {
+                    self.delete_blob(blob_id)?;
+                    if let Some(blob_table) = blob_table {
+                        blob_table.remove(blob_id)?;
+                    }
+                }
+            }
+        }
+
+        file_table.insert((file_inode, key), Holder::new(entry)?)?;
+
+        Ok(())
+    }
+
+    /// Remove a file entry for a specific peer.
+    fn do_rm_file_entry(
+        &self,
+        file_table: &mut redb::Table<'_, (u64, &str), Holder<FileTableEntry>>,
+        dir_table: &mut redb::Table<'_, (u64, &str), Holder<DirTableEntry>>,
+        parent_inode: u64,
+        inode: u64,
+        peer: &Peer,
+        old_hash: Option<Hash>,
+        blob_table: Option<&mut redb::Table<'_, u64, Holder<BlobTableEntry>>>,
+    ) -> Result<(), StorageError> {
+        let peer_str = peer.as_str();
+
+        let mut entries = HashMap::new();
+        for elt in file_table.range((inode, "")..(inode + 1, ""))? {
+            let (key, value) = elt?;
+            let key = key.value().1;
+            let entry = value.value().parse()?;
+            entries.insert(key.to_string(), entry);
+        }
+
+        let peer_hash = match entries.remove(peer_str).map(|e| e.content.hash) {
+            Some(h) => h,
+            None => {
+                // No entry to delete
+                return Ok(());
+            }
+        };
+
+        if let Some(old_hash) = old_hash
+            && peer_hash != old_hash
+        {
+            // Skip deletion
+            return Ok(());
+        }
+
+        file_table.remove((inode, peer_str))?;
+
+        let default_hash = entries.remove("").map(|e| e.content.hash);
+        // In case old_hash == default_hash, should we remove the default
+        // version and pretend the file doesn't exist anymore, even if
+        // it's available on other peers? It would be consistent,
+        // history-wise. With the current logic, a file is only gone once
+        // it's gone from all peers.
+
+        if entries.is_empty() {
+            // This was the last peer. Remove the default entry as well as
+            // the directory entry.
+            // TODO: delete empty directories, up to the arena root
+
+            // Check if the default entry has a blob and delete it
+            if let Some(default_entry) = file_table.get((inode, ""))? {
+                let default_entry = default_entry.value().parse()?;
+                if let Some(blob_id) = default_entry.content.blob {
+                    self.delete_blob(blob_id)?;
+                    if let Some(blob_table) = blob_table {
+                        blob_table.remove(blob_id)?;
+                    }
+                }
+            }
+
+            file_table.remove((inode, ""))?;
+            dir_table.retain_in((parent_inode, "")..(parent_inode + 1, ""), |_, v| {
+                match v.parse() {
+                    Ok(DirTableEntry::Regular(v)) => v.inode != inode,
+                    _ => true,
+                }
+            })?;
+            dir_table.insert(
+                (parent_inode, "."),
+                Holder::with_content(DirTableEntry::Dot(UnixTime::now()))?,
+            )?;
+
+            return Ok(());
+        }
+
+        // If this was the peer that had the default entry, we need to
+        // choose another one as default.
+        let another_peer_has_default_hash = default_hash
+            .map(|h| entries.values().any(|e| e.content.hash == h))
+            .unwrap_or(false);
+        if another_peer_has_default_hash {
+            return Ok(());
+        }
+
+        let most_recent = entries.into_iter().reduce(|a, b| {
+            if b.1.metadata.mtime > a.1.metadata.mtime {
+                b
+            } else {
+                a
+            }
+        });
+        if let Some((_, entry)) = most_recent {
+            self.do_write_file_entry(
+                file_table,
+                inode,
+                None,
+                &entry,
+                blob_table,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Implement [UnrealCache::unlink] within a transaction.
+    fn do_unlink(
+        &self,
+        txn: &WriteTransaction,
+        peer: &Peer,
+        arena_root: u64,
+        path: &Path,
+        old_hash: Hash,
+        blob_table: Option<&mut redb::Table<'_, u64, Holder<BlobTableEntry>>>,
+    ) -> Result<(), StorageError> {
+        let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
+        let (parent_inode, parent_assignment) = do_lookup_path(&dir_table, arena_root, &path.parent())?;
+        if parent_assignment != InodeAssignment::Directory {
+            return Err(StorageError::NotADirectory);
+        }
+
+        let dir_entry =
+            get_dir_entry(&dir_table, parent_inode, path.name())?.ok_or(StorageError::NotFound)?;
+        if dir_entry.assignment != InodeAssignment::File {
+            return Err(StorageError::IsADirectory);
+        }
+
+        let inode = dir_entry.inode;
+        let mut file_table = txn.open_table(FILE_TABLE)?;
+        self.do_rm_file_entry(
+            &mut file_table,
+            &mut dir_table,
+            parent_inode,
+            inode,
+            peer,
+            Some(old_hash),
+            blob_table,
+        )?;
+
+        Ok(())
+    }
+
+    /// Delete all marked files for a peer.
+    fn do_delete_marked_files(
+        &self,
+        txn: &WriteTransaction,
+        peer: &Peer,
+    ) -> Result<(), StorageError> {
+        let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
+        let mut file_table = txn.open_table(FILE_TABLE)?;
+        let mut directory_table = txn.open_table(DIRECTORY_TABLE)?;
+        let mut blob_table = txn.open_table(BLOB_TABLE)?;
+        let peer_str = peer.as_str();
+        for elt in
+            pending_catchup_table.extract_from_if((peer_str, 0)..(peer_str, u64::MAX), |_, _| true)?
+        {
+            let elt = elt?;
+            let (_, inode) = elt.0.value();
+            let parent_inode = elt.1.value();
+            self.do_rm_file_entry(
+                &mut file_table,
+                &mut directory_table,
+                parent_inode,
+                inode,
+                peer,
+                None,
+                Some(&mut blob_table),
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -952,39 +1212,7 @@ fn do_add_arena_root(txn: &WriteTransaction, arena: &Arena) -> anyhow::Result<u6
     Ok(arena_root)
 }
 
-/// Implement [UnrealCache::unlink] within a transaction.
-fn do_unlink(
-    txn: &WriteTransaction,
-    peer: &Peer,
-    arena_root: u64,
-    path: &Path,
-    old_hash: Hash,
-) -> Result<(), StorageError> {
-    let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
-    let (parent_inode, parent_assignment) = do_lookup_path(&dir_table, arena_root, &path.parent())?;
-    if parent_assignment != InodeAssignment::Directory {
-        return Err(StorageError::NotADirectory);
-    }
 
-    let dir_entry =
-        get_dir_entry(&dir_table, parent_inode, path.name())?.ok_or(StorageError::NotFound)?;
-    if dir_entry.assignment != InodeAssignment::File {
-        return Err(StorageError::IsADirectory);
-    }
-
-    let inode = dir_entry.inode;
-    let mut file_table = txn.open_table(FILE_TABLE)?;
-    do_rm_file_entry(
-        &mut file_table,
-        &mut dir_table,
-        parent_inode,
-        inode,
-        peer,
-        Some(old_hash),
-    )?;
-
-    Ok(())
-}
 
 /// Get a [FileEntry] for a specific peer.
 fn get_file_entry(
@@ -1054,19 +1282,7 @@ fn do_file_availability(
 }
 
 /// Write an entry in the file table, overwriting any existing one.
-fn do_write_file_entry(
-    file_table: &mut redb::Table<'_, (u64, &str), Holder<FileTableEntry>>,
-    file_inode: u64,
-    peer: Option<&Peer>,
-    entry: &FileTableEntry,
-) -> Result<(), StorageError> {
-    let key = peer.map(|p| p.as_str()).unwrap_or("");
-    log::debug!("new file entry {file_inode} {key} {}", entry.content.hash);
 
-    file_table.insert((file_inode, key), Holder::new(entry)?)?;
-
-    Ok(())
-}
 
 /// Retrieve or create a file entry at the given path.
 ///
@@ -1277,113 +1493,9 @@ fn do_unmark_peer_file(
     Ok(())
 }
 
-fn do_delete_marked_files(txn: &WriteTransaction, peer: &Peer) -> Result<(), StorageError> {
-    let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
-    let mut file_table = txn.open_table(FILE_TABLE)?;
-    let mut directory_table = txn.open_table(DIRECTORY_TABLE)?;
-    let peer_str = peer.as_str();
-    for elt in
-        pending_catchup_table.extract_from_if((peer_str, 0)..(peer_str, u64::MAX), |_, _| true)?
-    {
-        let elt = elt?;
-        let (_, inode) = elt.0.value();
-        let parent_inode = elt.1.value();
-        do_rm_file_entry(
-            &mut file_table,
-            &mut directory_table,
-            parent_inode,
-            inode,
-            peer,
-            None,
-        )?;
-    }
-    Ok(())
-}
 
-fn do_rm_file_entry(
-    file_table: &mut redb::Table<'_, (u64, &str), Holder<FileTableEntry>>,
-    dir_table: &mut redb::Table<'_, (u64, &str), Holder<DirTableEntry>>,
-    parent_inode: u64,
-    inode: u64,
-    peer: &Peer,
-    old_hash: Option<Hash>,
-) -> Result<(), StorageError> {
-    let peer_str = peer.as_str();
 
-    let mut entries = HashMap::new();
-    for elt in file_table.range((inode, "")..(inode + 1, ""))? {
-        let (key, value) = elt?;
-        let key = key.value().1;
-        let entry = value.value().parse()?;
-        entries.insert(key.to_string(), entry);
-    }
 
-    let peer_hash = match entries.remove(peer_str).map(|e| e.content.hash) {
-        Some(h) => h,
-        None => {
-            // No entry to delete
-            return Ok(());
-        }
-    };
-
-    if let Some(old_hash) = old_hash
-        && peer_hash != old_hash
-    {
-        // Skip deletion
-        return Ok(());
-    }
-
-    file_table.remove((inode, peer_str))?;
-
-    let default_hash = entries.remove("").map(|e| e.content.hash);
-    // In case old_hash == default_hash, should we remove the default
-    // version and pretend the file doesn't exist anymore, even if
-    // it's available on other peers? It would be consistent,
-    // history-wise. With the current logic, a file is only gone once
-    // it's gone from all peers.
-
-    if entries.is_empty() {
-        // This was the last peer. Remove the default entry as well as
-        // the directory entry.
-        // TODO: delete empty directories, up to the arena root
-
-        file_table.remove((inode, ""))?;
-        dir_table.retain_in((parent_inode, "")..(parent_inode + 1, ""), |_, v| {
-            match v.parse() {
-                Ok(DirTableEntry::Regular(v)) => v.inode != inode,
-                _ => true,
-            }
-        })?;
-        dir_table.insert(
-            (parent_inode, "."),
-            Holder::with_content(DirTableEntry::Dot(UnixTime::now()))?,
-        )?;
-
-        return Ok(());
-    }
-
-    // If this was the peer that had the default entry, we need to
-    // choose another one as default.
-    let another_peer_has_default_hash = default_hash
-        .map(|h| entries.values().any(|e| e.content.hash == h))
-        .unwrap_or(false);
-    if another_peer_has_default_hash {
-        return Ok(());
-    }
-
-    let most_recent = entries.into_iter().reduce(|a, b| {
-        if b.1.metadata.mtime > a.1.metadata.mtime {
-            b
-        } else {
-            a
-        }
-    });
-    if let Some((_, entry)) = most_recent {
-        do_write_file_entry(file_table, inode, None, &entry)?;
-    }
-
-    Ok(())
-}
 
 fn do_alloc_inode_range(
     txn: &WriteTransaction,
@@ -1504,6 +1616,12 @@ mod tests {
             )?;
 
             Ok(())
+        }
+
+        /// Check if a blob file exists for the given blob ID in the test arena.
+        fn blob_file_exists(&self, arena: &Arena, blob_id: u64) -> bool {
+            let blob_path = self.tempdir.child(format!("{arena}/blobs/{blob_id:016x}"));
+            blob_path.exists()
         }
     }
 
@@ -2452,5 +2570,102 @@ mod tests {
         let m = f.metadata()?;
 
         Ok((m.dev(), m.ino()))
+    }
+
+    #[test]
+    fn blob_deleted_on_file_overwrite() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(&test_arena())?;
+        let cache = &fixture.cache;
+        let arena = test_arena();
+        let file_path = Path::parse("file.txt")?;
+
+        // Create a file
+        fixture.add_file(&file_path, 100, &test_time())?;
+
+        // Open the file to create a blob
+        let (inode, _) = cache.lookup_path(&arena, &file_path)?;
+        let (blob_id, _file) = cache.open_file(inode)?;
+        
+        // Verify the blob file was created
+        assert!(fixture.blob_file_exists(&arena, blob_id));
+
+        // Overwrite the file with a new version
+        cache.update(
+            &test_peer(),
+            Notification::Replace {
+                arena: arena.clone(),
+                index: 0,
+                path: file_path.clone(),
+                mtime: later_time(),
+                size: 200,
+                hash: Hash([2u8; 32]),
+                old_hash: test_hash(),
+            },
+        )?;
+
+        // Verify the blob file has been deleted
+        assert!(!fixture.blob_file_exists(&arena, blob_id));
+
+        Ok(())
+    }
+
+    #[test]
+    fn blob_deleted_on_file_removal() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(&test_arena())?;
+        let cache = &fixture.cache;
+        let arena = test_arena();
+        let file_path = Path::parse("file.txt")?;
+
+        // Create a file
+        fixture.add_file(&file_path, 100, &test_time())?;
+
+        // Open the file to create a blob
+        let (inode, _) = cache.lookup_path(&arena, &file_path)?;
+        let (blob_id, _file) = cache.open_file(inode)?;
+        
+        // Verify the blob file was created
+        assert!(fixture.blob_file_exists(&arena, blob_id));
+
+        // Remove the file
+        fixture.remove_file(&file_path)?;
+
+        // Verify the blob file has been deleted
+        assert!(!fixture.blob_file_exists(&arena, blob_id));
+
+        Ok(())
+    }
+
+    #[test]
+    fn blob_deleted_on_catchup_removal() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(&test_arena())?;
+        let cache = &fixture.cache;
+        let arena = test_arena();
+        let file_path = Path::parse("file.txt")?;
+
+        // Create a file
+        fixture.add_file(&file_path, 100, &test_time())?;
+
+        // Open the file to create a blob
+        let (inode, _) = cache.lookup_path(&arena, &file_path)?;
+        let (blob_id, _file) = cache.open_file(inode)?;
+        
+        // Verify the blob file was created
+        assert!(fixture.blob_file_exists(&arena, blob_id));
+
+        // Do a catchup that doesn't include this file (simulating file removal)
+        cache.update(&test_peer(), Notification::CatchupStart(arena.clone()))?;
+        // Note: No Catchup notification for the file, so it will be deleted
+        cache.update(
+            &test_peer(),
+            Notification::CatchupComplete {
+                arena: arena.clone(),
+                index: 0,
+            },
+        )?;
+
+        // Verify the blob file has been deleted
+        assert!(!fixture.blob_file_exists(&arena, blob_id));
+
+        Ok(())
     }
 }
