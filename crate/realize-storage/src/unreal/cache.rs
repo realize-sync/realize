@@ -290,7 +290,7 @@ impl UnrealCacheBlocking {
         cache.update(peer, notification, || self.alloc_inode_range(&arena))
     }
 
-    fn open_file(&self, inode: u64) -> Result<std::fs::File, StorageError> {
+    fn open_file(&self, inode: u64) -> Result<(u64, std::fs::File), StorageError> {
         let arena = self
             .arena_for_inode(&self.db.begin_read()?, inode)?
             .ok_or(StorageError::NotFound)?;
@@ -599,7 +599,7 @@ impl ArenaUnrealCacheBlocking {
     }
 
     /// Open a file for reading/writing.
-    pub fn open_file(&self, inode: u64) -> Result<std::fs::File, StorageError> {
+    pub fn open_file(&self, inode: u64) -> Result<(u64, std::fs::File), StorageError> {
         // Optimistically, try a read transaction to check whether the
         // blob is there.
         {
@@ -607,19 +607,19 @@ impl ArenaUnrealCacheBlocking {
             let file_entry = get_default_entry(&txn.open_table(FILE_TABLE)?, inode)?;
             if let Some(blob_id) = file_entry.content.blob {
                 let (file, _) = self.create_blob_file(blob_id, file_entry.metadata.size)?;
-                return Ok(file);
+                return Ok((blob_id, file));
             }
         }
 
         // Switch to a write transaction to create the blob. We need to read
         // the file entry again because it might have changed.
         let txn = self.db.begin_write()?;
-        let file = {
+        let ret = {
             let mut file_table = txn.open_table(FILE_TABLE)?;
             let mut file_entry = get_default_entry(&file_table, inode)?;
             if let Some(blob_id) = file_entry.content.blob {
                 let (file, _) = self.create_blob_file(blob_id, file_entry.metadata.size)?;
-                return Ok(file);
+                return Ok((blob_id, file));
             }
 
             let mut blob_table = txn.open_table(BLOB_TABLE)?;
@@ -640,11 +640,11 @@ impl ArenaUnrealCacheBlocking {
             file_entry.content.blob = Some(blob_id);
             file_table.insert((inode, ""), Holder::new(&file_entry)?)?;
 
-            file
+            (blob_id, file)
         };
         txn.commit()?;
 
-        Ok(file)
+        Ok(ret)
     }
 
     /// Open or create a file for the blob and make sure it has the
@@ -837,9 +837,8 @@ impl UnrealCacheAsync {
     pub async fn open_file(&self, inode: u64) -> Result<tokio::fs::File, StorageError> {
         let inner = Arc::clone(&self.inner);
 
-        Ok(tokio::fs::File::from_std(
-            task::spawn_blocking(move || inner.open_file(inode)).await??,
-        ))
+        let (_, stdfile) = task::spawn_blocking(move || inner.open_file(inode)).await??;
+        Ok(tokio::fs::File::from_std(stdfile))
     }
 }
 
@@ -1404,7 +1403,6 @@ fn do_alloc_inode_range(
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
@@ -2427,21 +2425,32 @@ mod tests {
         fixture.add_file(&file_path, 10000, &test_time())?;
         let inode = cache.lookup(cache.arena_root(&arena)?, "foobar")?.inode;
 
-        let file = cache.open_file(inode)?;
+        let (blob_id, file_id1) = {
+            let (blob_id, file) = cache.open_file(inode)?;
+            assert_eq!(1, blob_id);
 
-        let m = file.metadata()?;
+            let m = file.metadata()?;
 
-        // File should have the right size
-        assert_eq!(10000, m.len());
+            // File should have the right size
+            assert_eq!(10000, m.len());
 
-        // File should be sparse
-        assert_eq!(0, m.blocks());
+            // File should be sparse
+            assert_eq!(0, m.blocks());
+
+            (blob_id, file_id(file)?)
+        };
 
         // If called a second time, it should return a handle on the same file.
-        let file2 = cache.open_file(inode)?;
-        let m2 = file2.metadata()?;
-        assert_eq!((m.dev(), m.ino()), (m2.dev(), m2.ino()));
+        let (blob_id2, file2) = cache.open_file(inode)?;
+        assert_eq!(blob_id, blob_id2);
+        assert_eq!(file_id1, file_id(file2)?);
 
         Ok(())
+    }
+
+    fn file_id(f: std::fs::File) -> anyhow::Result<(u64, u64)> {
+        let m = f.metadata()?;
+
+        Ok((m.dev(), m.ino()))
     }
 }

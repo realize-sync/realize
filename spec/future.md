@@ -62,23 +62,35 @@ Task list
     realize-storage" and fix any issues.
 
  3. Add an `open` function to ArenaUnrealCacheConfig that just returns
-    a `tokio::io::File`. This requires creating a new entry in the
-    `blobs` table, creating a file corresponding to that blob id and
-    opening it. Expose the same function in UnrealCacheConfig and
-    UnrealCacheAsync as usual, by delegating.
+    a `std::fs::File`. This requires creating a new entry in the `blobs` table,
+    creating a file corresponding to that blob id and opening it.
+    Expose the same function in UnrealCacheConfig that just delegates
+    to it. UnrealCacheAsync gets a slightly different function that
+    returns a `tokio::fs::File` created from the std file.
 
     Add unit tests for that function and the type it returns.
 
     Run "cargo check -p realize-storage", then "cargo test -p
     realize-storage" and fix any issues.
 
- 4. Add code for deleting the blob and its file when the corresponding
-    version is removed from the database.
+ 4. Add code for deleting the blob whose id is stored in the
+    FileTableEntry and delete its file when the default version (the
+    entry without peer) changes or is removed (see calls to
+    do_write_file_entry and do_rm_file_entry.).
 
-    Add unit test to check that.
+    Add a test to check that.
 
     Run "cargo check -p realize-storage", then "cargo test -p
     realize-storage" and fix any issues.
+
+ 5. Add function to ArneaUnrealCacheConfig for getting and updating
+    the ByteRange of a blob, the later only to be called after
+    updating the file content flushing and syncing. Add the same
+    functions to UnrealCacheConfig that just delegate to
+    ArenaUnrealCacheConfig.
+
+    Add a unit test that call the functions in UnrealCacheConfig and
+    verify the ByteRange.
 
 ## Recover inode range in Arena cache {#inoderange}
 
