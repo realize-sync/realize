@@ -3,7 +3,7 @@
 //! See `spec/unreal.md` for details.
 
 use super::arena_cache::{self, ArenaCache, Blob, CURRENT_INODE_RANGE_TABLE, DIRECTORY_TABLE};
-use super::types::{FileAvailability, FileMetadata, InodeAssignment, ReadDirEntry};
+use super::types::{BlobId, FileAvailability, FileMetadata, InodeAssignment, ReadDirEntry};
 use crate::config::StorageConfig;
 use crate::real::notifier::{Notification, Progress};
 use crate::{Inode, StorageError};
@@ -278,7 +278,7 @@ impl UnrealCacheBlocking {
     pub(crate) fn local_availability(
         &self,
         arena: &Arena,
-        blob_id: u64,
+        blob_id: BlobId,
     ) -> Result<ByteRanges, StorageError> {
         self.arena_cache(arena)?.local_availability(blob_id)
     }
@@ -292,7 +292,7 @@ impl UnrealCacheBlocking {
     pub(crate) fn extend_local_availability(
         &self,
         arena: &Arena,
-        blob_id: u64,
+        blob_id: BlobId,
         written_areas: ByteRanges,
     ) -> Result<(), StorageError> {
         self.arena_cache(arena)?

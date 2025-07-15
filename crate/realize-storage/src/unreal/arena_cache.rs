@@ -1,6 +1,6 @@
 use super::types::{
-    BlobTableEntry, DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry,
-    InodeAssignment, PeerTableEntry, ReadDirEntry,
+    BlobId, BlobTableEntry, DirTableEntry, FileAvailability, FileContent, FileMetadata,
+    FileTableEntry, InodeAssignment, PeerTableEntry, ReadDirEntry,
 };
 use crate::real::notifier::{Notification, Progress};
 use crate::utils::holder::Holder;
@@ -88,7 +88,7 @@ pub(crate) const CURRENT_INODE_RANGE_TABLE: TableDefinition<(), (Inode, Inode)> 
 ///
 /// Key: inode
 /// Value: BlobTableEntry
-const BLOB_TABLE: TableDefinition<u64, Holder<BlobTableEntry>> = TableDefinition::new("blob");
+const BLOB_TABLE: TableDefinition<BlobId, Holder<BlobTableEntry>> = TableDefinition::new("blob");
 
 /// A per-arena cache of remote files.
 ///
@@ -374,9 +374,12 @@ impl ArenaCache {
             }
 
             let mut blob_table = txn.open_table(BLOB_TABLE)?;
-            let blob_id = blob_table.last()?.map(|(k, _)| k.value()).unwrap_or(1);
+            let blob_id = blob_table
+                .last()?
+                .map(|(k, _)| k.value())
+                .unwrap_or(BlobId(1));
             log::debug!(
-                "assigned blob {blob_id:016x} to file {inode} {}",
+                "assigned blob {blob_id} to file {inode} {}",
                 file_entry.content.hash
             );
             let file = self.open_blob_file(blob_id, file_entry.metadata.size, true)?;
@@ -398,7 +401,7 @@ impl ArenaCache {
     /// right size.
     fn open_blob_file(
         &self,
-        blob_id: u64,
+        blob_id: BlobId,
         file_size: u64,
         new_file: bool,
     ) -> Result<std::fs::File, StorageError> {
@@ -419,12 +422,12 @@ impl ArenaCache {
     }
 
     /// Return the path of the file for the given blob.
-    fn blob_path(&self, blob_id: u64) -> PathBuf {
-        self.blob_dir.join(format!("{blob_id:016x}"))
+    fn blob_path(&self, blob_id: BlobId) -> PathBuf {
+        self.blob_dir.join(blob_id.to_string())
     }
 
     /// Delete a blob and its associated file.
-    fn delete_blob(&self, blob_id: u64) -> Result<(), StorageError> {
+    fn delete_blob(&self, blob_id: BlobId) -> Result<(), StorageError> {
         let blob_path = self.blob_path(blob_id);
         if blob_path.exists() {
             std::fs::remove_file(&blob_path)?;
@@ -439,7 +442,7 @@ impl ArenaCache {
         file_inode: Inode,
         peer: Option<&Peer>,
         entry: &FileTableEntry,
-        blob_table: Option<&mut redb::Table<'_, u64, Holder<BlobTableEntry>>>,
+        blob_table: Option<&mut redb::Table<'_, BlobId, Holder<BlobTableEntry>>>,
     ) -> Result<(), StorageError> {
         let key = peer.map(|p| p.as_str()).unwrap_or("");
         log::debug!("new file entry {file_inode} {key} {}", entry.content.hash);
@@ -471,7 +474,7 @@ impl ArenaCache {
         inode: Inode,
         peer: &Peer,
         old_hash: Option<Hash>,
-        blob_table: Option<&mut redb::Table<'_, u64, Holder<BlobTableEntry>>>,
+        blob_table: Option<&mut redb::Table<'_, BlobId, Holder<BlobTableEntry>>>,
     ) -> Result<(), StorageError> {
         let peer_str = peer.as_str();
 
@@ -570,7 +573,7 @@ impl ArenaCache {
         arena_root: Inode,
         path: &Path,
         old_hash: Hash,
-        blob_table: Option<&mut redb::Table<'_, u64, Holder<BlobTableEntry>>>,
+        blob_table: Option<&mut redb::Table<'_, BlobId, Holder<BlobTableEntry>>>,
     ) -> Result<(), StorageError> {
         let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
         let (parent_inode, parent_assignment) =
@@ -632,7 +635,7 @@ impl ArenaCache {
         Ok(())
     }
 
-    pub(crate) fn local_availability(&self, blob_id: u64) -> Result<ByteRanges, StorageError> {
+    pub(crate) fn local_availability(&self, blob_id: BlobId) -> Result<ByteRanges, StorageError> {
         let txn = self.db.begin_read()?;
         let blob_table = txn.open_table(BLOB_TABLE)?;
 
@@ -641,7 +644,7 @@ impl ArenaCache {
 
     pub(crate) fn extend_local_availability(
         &self,
-        blob_id: u64,
+        blob_id: BlobId,
         new_range: ByteRanges,
     ) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
@@ -762,8 +765,8 @@ fn get_file_entry(
 }
 
 fn get_blob_entry(
-    blob_table: &impl redb::ReadableTable<u64, Holder<'static, BlobTableEntry>>,
-    blob_id: u64,
+    blob_table: &impl redb::ReadableTable<BlobId, Holder<'static, BlobTableEntry>>,
+    blob_id: BlobId,
 ) -> Result<BlobTableEntry, StorageError> {
     let entry = blob_table
         .get(blob_id)?
@@ -1066,7 +1069,7 @@ impl BlobIncomplete {
 /// error of kind [std::io::ErrorKind::InvalidData] with a
 /// [BlobIncomplete] error.
 pub struct Blob {
-    blob_id: u64,
+    blob_id: BlobId,
     file: tokio::fs::File,
     available_ranges: ByteRanges,
     size: u64,
@@ -1080,7 +1083,7 @@ pub struct Blob {
 impl Blob {
     /// Create a new blob from a file and its available byte ranges.
     fn new(
-        blob_id: u64,
+        blob_id: BlobId,
         file_entry: FileTableEntry,
         blob_entry: BlobTableEntry,
         file: std::fs::File,
@@ -1113,7 +1116,7 @@ impl Blob {
     /// Get the blob ID on the database.
     ///
     /// The blob ID is also used to construct the file path.
-    fn id(&self) -> u64 {
+    fn id(&self) -> BlobId {
         self.blob_id
     }
 
@@ -1302,14 +1305,14 @@ mod tests {
         }
 
         /// Check if a blob file exists for the given blob ID in the test arena.
-        fn blob_file_exists(&self, arena: &Arena, blob_id: u64) -> bool {
+        fn blob_file_exists(&self, arena: &Arena, blob_id: BlobId) -> bool {
             self.blob_path(arena, blob_id).exists()
         }
 
         /// Return the path to a blob file for test use.
-        fn blob_path(&self, arena: &Arena, blob_id: u64) -> std::path::PathBuf {
+        fn blob_path(&self, arena: &Arena, blob_id: BlobId) -> std::path::PathBuf {
             self.tempdir
-                .child(format!("{arena}/blobs/{blob_id:016x}"))
+                .child(format!("{arena}/blobs/{blob_id}"))
                 .to_path_buf()
         }
     }
@@ -2097,7 +2100,7 @@ mod tests {
 
         let blob_id = {
             let blob = cache.open_file(inode)?;
-            assert_eq!(1, blob.id());
+            assert_eq!(BlobId(1), blob.id());
 
             let m = fixture.blob_path(&arena, blob.id()).metadata()?;
 
@@ -2264,13 +2267,13 @@ mod tests {
 
         // Test that getting ranges for a non-existent blob returns NotFound
         assert!(matches!(
-            cache.local_availability(&arena, 99999),
+            cache.local_availability(&arena, BlobId(99999)),
             Err(StorageError::NotFound)
         ));
 
         // Test that updating ranges for a non-existent blob returns NotFound
         assert!(matches!(
-            cache.extend_local_availability(&arena, 99999, ByteRanges::new()),
+            cache.extend_local_availability(&arena, BlobId(99999), ByteRanges::new()),
             Err(StorageError::NotFound)
         ));
 

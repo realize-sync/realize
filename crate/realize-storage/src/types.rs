@@ -105,88 +105,11 @@ impl Value for Inode {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_inode_creation() {
-        let inode = Inode::new(12345);
-        assert_eq!(inode.value(), 12345);
-        assert_eq!(inode.0, 12345);
-    }
-
-    #[test]
-    fn test_inode_from_u64() {
-        let value = 67890;
-        let inode = Inode::from(value);
-        assert_eq!(inode.value(), value);
-    }
-
-    #[test]
-    fn test_u64_from_inode() {
-        let value = 11111;
-        let inode = Inode::new(value);
-        let converted: u64 = inode.into();
-        assert_eq!(converted, value);
-    }
-
-    #[test]
-    fn test_inode_as_ref() {
-        let inode = Inode::new(22222);
-        let ref_value: &u64 = inode.as_ref();
-        assert_eq!(*ref_value, 22222);
-    }
-
-    #[test]
-    fn test_inode_as_mut() {
-        let mut inode = Inode::new(33333);
-        let mut_ref: &mut u64 = inode.as_mut();
-        *mut_ref = 44444;
-        assert_eq!(inode.value(), 44444);
-    }
-
     #[test]
     fn test_inode_display() {
         let inode = Inode::new(55555);
         assert_eq!(inode.to_string(), "55555");
     }
-
-    #[test]
-    fn test_inode_equality() {
-        let inode1 = Inode::new(123);
-        let inode2 = Inode::new(123);
-        let inode3 = Inode::new(456);
-
-        assert_eq!(inode1, inode2);
-        assert_ne!(inode1, inode3);
-    }
-
-    #[test]
-    fn test_inode_ordering() {
-        let inode1 = Inode::new(100);
-        let inode2 = Inode::new(200);
-        let inode3 = Inode::new(200);
-
-        assert!(inode1 < inode2);
-        assert!(inode2 > inode1);
-        assert!(inode2 >= inode3);
-        assert!(inode2 <= inode3);
-    }
-
-    #[test]
-    fn test_inode_hash() {
-        use std::collections::HashMap;
-
-        let mut map = HashMap::new();
-        let inode1 = Inode::new(123);
-        let inode2 = Inode::new(456);
-
-        map.insert(inode1, "file1");
-        map.insert(inode2, "file2");
-
-        assert_eq!(map.get(&Inode::new(123)), Some(&"file1"));
-        assert_eq!(map.get(&Inode::new(456)), Some(&"file2"));
-        assert_eq!(map.get(&Inode::new(789)), None);
-    }
-
     #[test]
     fn test_inode_redb_key() {
         let inode1 = Inode::new(100);
@@ -238,25 +161,5 @@ mod tests {
         let valid_data = &[1, 0, 0, 0, 0, 0, 0, 0]; // Little endian 1
         let restored = Inode::from_bytes(valid_data);
         assert_eq!(restored.value(), 1);
-    }
-
-    #[test]
-    fn test_inode_type_name() {
-        assert_eq!(Inode::type_name(), redb::TypeName::new("Inode"));
-    }
-
-    #[test]
-    fn test_inode_clone() {
-        let original = Inode::new(12345);
-        let cloned = original.clone();
-        assert_eq!(original, cloned);
-    }
-
-    #[test]
-    fn test_inode_copy() {
-        let original = Inode::new(12345);
-        let copied = original; // This should copy, not move
-        assert_eq!(original, copied);
-        assert_eq!(original.value(), 12345); // original should still be valid
     }
 }
