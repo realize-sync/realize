@@ -635,6 +635,7 @@ impl ArenaCache {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn local_availability(&self, blob_id: BlobId) -> Result<ByteRanges, StorageError> {
         let txn = self.db.begin_read()?;
         let blob_table = txn.open_table(BLOB_TABLE)?;
@@ -642,6 +643,7 @@ impl ArenaCache {
         Ok(get_blob_entry(&blob_table, blob_id)?.written_areas)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn extend_local_availability(
         &self,
         blob_id: BlobId,
@@ -1229,37 +1231,37 @@ mod tests {
     }
 
     struct Fixture {
+        arena: Arena,
         cache: UnrealCacheBlocking,
         tempdir: TempDir,
     }
     impl Fixture {
-        fn setup() -> anyhow::Result<Fixture> {
+        fn setup_with_arena(arena: &Arena) -> anyhow::Result<Fixture> {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
             let path = tempdir.path().join("unreal.db");
-            let cache = UnrealCacheBlocking::open(&path)?;
-            Ok(Self { cache, tempdir })
-        }
+            let mut cache = UnrealCacheBlocking::open(&path)?;
 
-        fn setup_with_arena(arena: &Arena) -> anyhow::Result<Fixture> {
-            let mut fixture = Self::setup()?;
-            fixture.add_arena(arena)?;
-
-            Ok(fixture)
-        }
-
-        fn add_arena(&mut self, arena: &Arena) -> anyhow::Result<()> {
-            let child = self.tempdir.child(format!("{arena}-cache.db"));
-            let blob_dir = self.tempdir.child(format!("{arena}/blobs"));
+            let child = tempdir.child(format!("{arena}-cache.db"));
+            let blob_dir = tempdir.child(format!("{arena}/blobs"));
             if let Some(p) = child.parent() {
                 std::fs::create_dir_all(p)?;
             }
-            self.cache.add_arena(
+            cache.add_arena(
                 arena.clone(),
                 Database::create(child.path())?,
                 blob_dir.to_path_buf(),
             )?;
-            Ok(())
+
+            Ok(Self {
+                arena: arena.clone(),
+                cache,
+                tempdir,
+            })
+        }
+
+        fn arena_cache(&self) -> anyhow::Result<&ArenaCache> {
+            Ok(self.cache.arena_cache(&self.arena)?)
         }
 
         fn parent_dir_mtime(&self, arena: &Arena, path: &Path) -> anyhow::Result<UnixTime> {
@@ -1386,8 +1388,9 @@ mod tests {
             },
         )?;
 
-        let (inode, _) = cache.lookup_path(&arena, &file_path)?;
-        let metadata = cache.file_metadata(inode)?;
+        let acache = fixture.arena_cache()?;
+        let (inode, _) = acache.lookup_path(&file_path)?;
+        let metadata = acache.file_metadata(inode)?;
         assert_eq!(metadata.size, 200);
         assert_eq!(metadata.mtime, later_time());
 
@@ -1397,14 +1400,14 @@ mod tests {
     #[test]
     fn ignore_duplicate_add() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(&test_arena())?;
-        let cache = &fixture.cache;
         let file_path = Path::parse("file.txt")?;
 
         fixture.add_file(&file_path, 100, &test_time())?;
         fixture.add_file(&file_path, 200, &test_time())?;
 
-        let (inode, _) = cache.lookup_path(&test_arena(), &file_path)?;
-        let metadata = cache.file_metadata(inode)?;
+        let acache = fixture.arena_cache()?;
+        let (inode, _) = acache.lookup_path(&file_path)?;
+        let metadata = acache.file_metadata(inode)?;
         assert_eq!(metadata.size, 100);
 
         Ok(())
@@ -1441,8 +1444,9 @@ mod tests {
             },
         )?;
 
-        let (inode, _) = cache.lookup_path(&test_arena(), &file_path)?;
-        let metadata = cache.file_metadata(inode)?;
+        let acache = fixture.arena_cache()?;
+        let (inode, _) = acache.lookup_path(&file_path)?;
+        let metadata = acache.file_metadata(inode)?;
         assert_eq!(metadata.size, 100);
 
         Ok(())
@@ -1503,8 +1507,9 @@ mod tests {
         )?;
 
         // File should still exist because wrong hash was provided
-        let (inode, _) = cache.lookup_path(&arena, &file_path)?;
-        let metadata = cache.file_metadata(inode)?;
+        let acache = fixture.arena_cache()?;
+        let (inode, _) = acache.lookup_path(&file_path)?;
+        let metadata = acache.file_metadata(inode)?;
         assert_eq!(metadata.size, 100);
 
         Ok(())
@@ -1528,7 +1533,8 @@ mod tests {
         let file_entry = cache.lookup(dir_entry.inode, "file.txt")?;
         assert_eq!(file_entry.assignment, InodeAssignment::File);
 
-        let metadata = cache.file_metadata(file_entry.inode)?;
+        let acache = fixture.arena_cache()?;
+        let metadata = acache.file_metadata(file_entry.inode)?;
         assert_eq!(metadata.mtime, mtime);
         assert_eq!(metadata.size, 100);
 
@@ -1561,7 +1567,8 @@ mod tests {
         let (inode, assignment) = cache.lookup_path(&arena, &path)?;
         assert_eq!(assignment, InodeAssignment::File);
 
-        let metadata = cache.file_metadata(inode)?;
+        let acache = fixture.arena_cache()?;
+        let metadata = acache.file_metadata(inode)?;
         assert_eq!(metadata.mtime, mtime);
         assert_eq!(metadata.size, 100);
 
@@ -1660,8 +1667,9 @@ mod tests {
             },
         )?;
 
-        let file_entry = cache.lookup(cache.arena_root(&arena)?, "file.txt")?;
-        let metadata = cache.file_metadata(file_entry.inode)?;
+        let acache = fixture.arena_cache()?;
+        let file_entry = acache.lookup(acache.arena_root, "file.txt")?;
+        let metadata = acache.file_metadata(file_entry.inode)?;
         assert_eq!(metadata.size, 200);
         assert_eq!(metadata.mtime, later_time());
 
@@ -1712,9 +1720,9 @@ mod tests {
                 hash: Hash([2u8; 32]),
             },
         )?;
-        let parent_inode = cache.arena_root(&arena)?;
-        let inode = cache.lookup(parent_inode, "file.txt")?.inode;
-        let avail = cache.file_availability(inode)?;
+        let acache = fixture.arena_cache()?;
+        let inode = acache.lookup(acache.arena_root, "file.txt")?.inode;
+        let avail = acache.file_availability(inode)?;
         assert_eq!(arena, avail.arena);
         assert_eq!(path, avail.path);
         // Since they're just independent additions, the cache chooses
@@ -1788,8 +1796,9 @@ mod tests {
                 old_hash: Hash([1u8; 32]),
             },
         )?;
-        let inode = cache.lookup(cache.arena_root(&arena)?, "file.txt")?.inode;
-        let avail = cache.file_availability(inode)?;
+        let acache = fixture.arena_cache()?;
+        let inode = acache.lookup(acache.arena_root, "file.txt")?.inode;
+        let avail = acache.file_availability(inode)?;
 
         //  Replace with old_hash=1 means that hash=2 is the most
         //  recent one. This is the one chosen.
@@ -1829,7 +1838,8 @@ mod tests {
                 old_hash: Hash([2u8; 32]),
             },
         )?;
-        let avail = cache.file_availability(inode)?;
+        let acache = fixture.arena_cache()?;
+        let avail = acache.file_availability(inode)?;
         assert_eq!(Hash([3u8; 32]), avail.hash);
         assert_eq!(vec![c.clone()], avail.peers);
 
@@ -1847,7 +1857,8 @@ mod tests {
             },
         )?;
 
-        let avail = cache.file_availability(inode)?;
+        let acache = fixture.arena_cache()?;
+        let avail = acache.file_availability(inode)?;
         assert_eq!(Hash([3u8; 32]), avail.hash);
         assert_unordered::assert_eq_unordered!(vec![b.clone(), c.clone()], avail.peers);
 
@@ -1910,8 +1921,9 @@ mod tests {
                 old_hash: Hash([1u8; 32]),
             },
         )?;
-        let inode = cache.lookup(cache.arena_root(&arena)?, "file.txt")?.inode;
-        let avail = cache.file_availability(inode)?;
+        let acache = fixture.arena_cache()?;
+        let inode = acache.lookup(acache.arena_root, "file.txt")?.inode;
+        let avail = acache.file_availability(inode)?;
         assert_eq!(Hash([3u8; 32]), avail.hash);
         assert_eq!(vec![a.clone()], avail.peers);
 
@@ -1931,7 +1943,8 @@ mod tests {
         //
         // (If we kept a history, we would probably go
         // back to Hash=1, but we don't have that kind of information)
-        let avail = cache.file_availability(inode)?;
+        let acache = fixture.arena_cache()?;
+        let avail = acache.file_availability(inode)?;
         assert_eq!(Hash([2u8; 32]), avail.hash);
         assert_eq!(vec![c.clone()], avail.peers);
 
@@ -2071,18 +2084,19 @@ mod tests {
         ));
 
         // File2 should still be available, from peer2
-        let (file2_inode, _) = cache.lookup_path(&arena, &file2)?;
-        let file2_availability = cache.file_availability(file2_inode)?;
+        let acache = fixture.arena_cache()?;
+        let (file2_inode, _) = acache.lookup_path(&file2)?;
+        let file2_availability = acache.file_availability(file2_inode)?;
         assert!(file2_availability.peers.contains(&peer2));
 
         // File3 should still be available, from peer3
-        let (file3_inode, _) = cache.lookup_path(&arena, &file3)?;
-        let file3_availability = cache.file_availability(file3_inode)?;
+        let (file3_inode, _) = acache.lookup_path(&file3)?;
+        let file3_availability = acache.file_availability(file3_inode)?;
         assert!(file3_availability.peers.contains(&peer3));
 
         // File4 should still be available, from peer1
-        let (file4_inode, _) = cache.lookup_path(&arena, &file4)?;
-        let file4_availability = cache.file_availability(file4_inode)?;
+        let (file4_inode, _) = acache.lookup_path(&file4)?;
+        let file4_availability = acache.file_availability(file4_inode)?;
         assert!(file4_availability.peers.contains(&peer1));
 
         Ok(())
@@ -2092,14 +2106,14 @@ mod tests {
     fn open_file_creates_sparse_file() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(&arena)?;
-        let cache = &fixture.cache;
+        let acache = fixture.arena_cache()?;
         let file_path = Path::parse("foobar")?;
 
         fixture.add_file(&file_path, 10000, &test_time())?;
-        let inode = cache.lookup(cache.arena_root(&arena)?, "foobar")?.inode;
+        let inode = acache.lookup(acache.arena_root, "foobar")?.inode;
 
         let blob_id = {
-            let blob = cache.open_file(inode)?;
+            let blob = acache.open_file(inode)?;
             assert_eq!(BlobId(1), blob.id());
 
             let m = fixture.blob_path(&arena, blob.id()).metadata()?;
@@ -2117,7 +2131,7 @@ mod tests {
         };
 
         // If called a second time, it should return a handle on the same file.
-        let blob = cache.open_file(inode)?;
+        let blob = acache.open_file(inode)?;
         assert_eq!(blob_id, blob.id());
         assert_eq!(ByteRanges::new(), *blob.local_availability());
 
@@ -2128,6 +2142,7 @@ mod tests {
     fn blob_deleted_on_file_overwrite() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(&test_arena())?;
         let cache = &fixture.cache;
+        let acache = fixture.arena_cache()?;
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
 
@@ -2135,8 +2150,8 @@ mod tests {
         fixture.add_file(&file_path, 100, &test_time())?;
 
         // Open the file to create a blob
-        let (inode, _) = cache.lookup_path(&arena, &file_path)?;
-        let blob_id = cache.open_file(inode)?.id();
+        let (inode, _) = acache.lookup_path(&file_path)?;
+        let blob_id = acache.open_file(inode)?.id();
 
         // Verify the blob file was created
         assert!(fixture.blob_file_exists(&arena, blob_id));
@@ -2164,7 +2179,7 @@ mod tests {
     #[test]
     fn blob_deleted_on_file_removal() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(&test_arena())?;
-        let cache = &fixture.cache;
+        let acache = fixture.arena_cache()?;
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
 
@@ -2172,8 +2187,8 @@ mod tests {
         fixture.add_file(&file_path, 100, &test_time())?;
 
         // Open the file to create a blob
-        let (inode, _) = cache.lookup_path(&arena, &file_path)?;
-        let blob_id = cache.open_file(inode)?.id();
+        let (inode, _) = acache.lookup_path(&file_path)?;
+        let blob_id = acache.open_file(inode)?.id();
 
         // Verify the blob file was created
         assert!(fixture.blob_file_exists(&arena, blob_id));
@@ -2191,6 +2206,7 @@ mod tests {
     fn blob_deleted_on_catchup_removal() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(&test_arena())?;
         let cache = &fixture.cache;
+        let acache = fixture.arena_cache()?;
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
 
@@ -2198,8 +2214,8 @@ mod tests {
         fixture.add_file(&file_path, 100, &test_time())?;
 
         // Open the file to create a blob
-        let (inode, _) = cache.lookup_path(&arena, &file_path)?;
-        let blob_id = cache.open_file(inode)?.id();
+        let (inode, _) = acache.lookup_path(&file_path)?;
+        let blob_id = acache.open_file(inode)?.id();
 
         // Verify the blob file was created
         assert!(fixture.blob_file_exists(&arena, blob_id));
@@ -2223,20 +2239,20 @@ mod tests {
 
     #[test]
     fn update_local_availability() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(&test_arena())?;
-        let cache = &fixture.cache;
         let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(&arena)?;
+        let acache = fixture.arena_cache()?;
         let file_path = Path::parse("file.txt")?;
 
         // Create a file
         fixture.add_file(&file_path, 1000, &test_time())?;
 
         // Open the file to create a blob
-        let (inode, _) = cache.lookup_path(&arena, &file_path)?;
-        let blob_id = cache.open_file(inode)?.id();
+        let (inode, _) = acache.lookup_path(&file_path)?;
+        let blob_id = acache.open_file(inode)?.id();
 
         // Initially, the blob should have empty written areas
-        let initial_ranges = cache.local_availability(&arena, blob_id)?;
+        let initial_ranges = acache.local_availability(blob_id)?;
         assert!(initial_ranges.is_empty());
 
         // Update the blob with some written areas
@@ -2246,20 +2262,19 @@ mod tests {
             ByteRange::new(500, 600),
         ]);
 
-        cache.extend_local_availability(&arena, blob_id, written_areas.clone())?;
+        acache.extend_local_availability(blob_id, written_areas.clone())?;
 
         // Verify the written areas were updated
-        let retrieved_ranges = cache.local_availability(&arena, blob_id)?;
+        let retrieved_ranges = acache.local_availability(blob_id)?;
         assert_eq!(retrieved_ranges, written_areas);
 
-        cache.extend_local_availability(
-            &arena,
+        acache.extend_local_availability(
             blob_id,
             ByteRanges::from_ranges(vec![ByteRange::new(50, 210), ByteRange::new(200, 400)]),
         )?;
 
         // Verify the ranges were updated again
-        let final_ranges = cache.local_availability(&arena, blob_id)?;
+        let final_ranges = acache.local_availability(blob_id)?;
         assert_eq!(
             final_ranges,
             ByteRanges::from_ranges(vec![ByteRange::new(0, 400), ByteRange::new(500, 600)])
@@ -2267,13 +2282,13 @@ mod tests {
 
         // Test that getting ranges for a non-existent blob returns NotFound
         assert!(matches!(
-            cache.local_availability(&arena, BlobId(99999)),
+            acache.local_availability(BlobId(99999)),
             Err(StorageError::NotFound)
         ));
 
         // Test that updating ranges for a non-existent blob returns NotFound
         assert!(matches!(
-            cache.extend_local_availability(&arena, BlobId(99999), ByteRanges::new()),
+            acache.extend_local_availability(BlobId(99999), ByteRanges::new()),
             Err(StorageError::NotFound)
         ));
 
@@ -2284,28 +2299,27 @@ mod tests {
     async fn read_blob_within_available_ranges() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(&arena)?;
-        let cache = &fixture.cache;
+        let acache = fixture.arena_cache()?;
         let file_path = Path::parse("test.txt")?;
 
         fixture.add_file(&file_path, 1000, &test_time())?;
-        let inode = cache.lookup(cache.arena_root(&arena)?, "test.txt")?.inode;
+        let inode = acache.lookup(acache.arena_root, "test.txt")?.inode;
 
         // Allocate blob id and create file
-        let blob_id = cache.open_file(inode)?.id();
+        let blob_id = acache.open_file(inode)?.id();
 
         // Write some test data to the blob file
         let blob_path = fixture.blob_path(&arena, blob_id);
         let test_data = b"Baa, baa, black sheep, have you any wool?";
         std::fs::write(&blob_path, test_data)?;
 
-        cache.extend_local_availability(
-            &arena,
+        acache.extend_local_availability(
             blob_id,
             ByteRanges::from_ranges(vec![ByteRange::new(0, test_data.len() as u64)]),
         )?;
 
         // Read from blob
-        let mut blob = cache.open_file(inode)?;
+        let mut blob = acache.open_file(inode)?;
 
         let mut buf = [0; 5];
         let n = blob.read(&mut buf).await?;
@@ -2322,27 +2336,26 @@ mod tests {
     async fn read_blob_after_seek_within_available_range() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(&arena)?;
-        let cache = &fixture.cache;
+        let acache = fixture.arena_cache()?;
         let file_path = Path::parse("test.txt")?;
         fixture.add_file(&file_path, 1000, &test_time())?;
-        let inode = cache.lookup(cache.arena_root(&arena)?, "test.txt")?.inode;
+        let inode = acache.lookup(acache.arena_root, "test.txt")?.inode;
 
         // Allocate blob id and create file
-        let blob_id = cache.open_file(inode)?.id();
+        let blob_id = acache.open_file(inode)?.id();
 
         // Write test data to the blob file
         let blob_path = fixture.blob_path(&arena, blob_id);
         let test_data = b"Baa, baa, black sheep, have you any wool?";
         std::fs::write(&blob_path, test_data)?;
 
-        cache.extend_local_availability(
-            &arena,
+        acache.extend_local_availability(
             blob_id,
             ByteRanges::from_ranges(vec![ByteRange::new(0, test_data.len() as u64)]),
         )?;
 
         // Read from blob
-        let mut blob = cache.open_file(inode)?;
+        let mut blob = acache.open_file(inode)?;
         blob.seek(SeekFrom::Start(b"Baa, baa, black sheep, ".len() as u64))
             .await?;
         let mut buf = [0; 100];
@@ -2356,26 +2369,25 @@ mod tests {
     async fn read_blob_outside_available_ranges() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(&arena)?;
-        let cache = &fixture.cache;
+        let acache = fixture.arena_cache()?;
         let file_path = Path::parse("test.txt")?;
         fixture.add_file(&file_path, 1000, &test_time())?;
-        let inode = cache.lookup(cache.arena_root(&arena)?, "test.txt")?.inode;
+        let inode = acache.lookup(acache.arena_root, "test.txt")?.inode;
 
         // Allocate blob id and create file
-        let blob_id = cache.open_file(inode)?.id();
+        let blob_id = acache.open_file(inode)?.id();
 
         // Write test data to the blob file
         let blob_path = fixture.blob_path(&arena, blob_id);
         let test_data = b"baa, baa";
         std::fs::write(&blob_path, test_data)?;
-        cache.extend_local_availability(
-            &arena,
+        acache.extend_local_availability(
             blob_id,
             ByteRanges::from_ranges(vec![ByteRange::new(0, test_data.len() as u64)]),
         )?;
 
         // Read from blob
-        let mut blob = cache.open_file(inode)?;
+        let mut blob = acache.open_file(inode)?;
         blob.seek(SeekFrom::Start(20)).await?;
         let mut buf = [0; 100];
         let res = blob.read(&mut buf).await;

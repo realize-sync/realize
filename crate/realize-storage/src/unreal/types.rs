@@ -572,8 +572,8 @@ mod tests {
 
     #[test]
     fn test_blobid_display() {
-        let blobid = BlobId::new(55555);
-        assert_eq!(blobid.to_string(), "55555");
+        let blobid = BlobId::new(0xd903);
+        assert_eq!(blobid.to_string(), "000000000000d903");
     }
     #[test]
     fn test_blobid_redb_key() {

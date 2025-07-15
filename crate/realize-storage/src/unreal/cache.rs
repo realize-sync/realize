@@ -3,12 +3,12 @@
 //! See `spec/unreal.md` for details.
 
 use super::arena_cache::{self, ArenaCache, Blob, CURRENT_INODE_RANGE_TABLE, DIRECTORY_TABLE};
-use super::types::{BlobId, FileAvailability, FileMetadata, InodeAssignment, ReadDirEntry};
+use super::types::{FileAvailability, FileMetadata, InodeAssignment, ReadDirEntry};
 use crate::config::StorageConfig;
 use crate::real::notifier::{Notification, Progress};
 use crate::{Inode, StorageError};
 use bimap::BiMap;
-use realize_types::{Arena, ByteRanges, Path, Peer, UnixTime};
+use realize_types::{Arena, Path, Peer, UnixTime};
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
 use std::collections::HashMap;
 use std::path::{self, PathBuf};
@@ -96,8 +96,16 @@ impl UnrealCacheBlocking {
     }
 
     /// Returns the cache for the given arena or fail.
-    fn arena_cache(&self, arena: &Arena) -> Result<&ArenaCache, StorageError> {
+    pub(crate) fn arena_cache(&self, arena: &Arena) -> Result<&ArenaCache, StorageError> {
         Ok(self.arena_caches.get(arena).ok_or(StorageError::NotFound)?)
+    }
+
+    /// Returns the cache for the given inode or fail.
+    fn arena_cache_for_inode(&self, inode: Inode) -> Result<&ArenaCache, StorageError> {
+        let arena = self
+            .arena_for_inode(&self.db.begin_read()?, inode)?
+            .ok_or(StorageError::NotFound)?;
+        self.arena_cache(arena)
     }
 
     /// Add an arena to the database.
@@ -154,15 +162,6 @@ impl UnrealCacheBlocking {
         self.arena_cache(arena)?.lookup_path(path)
     }
 
-    /// Return the best metadata for the file.
-    pub fn file_metadata(&self, inode: Inode) -> Result<FileMetadata, StorageError> {
-        let arena = self
-            .arena_for_inode(&self.db.begin_read()?, inode)?
-            .ok_or(StorageError::NotFound)?;
-
-        self.arena_cache(&arena)?.file_metadata(inode)
-    }
-
     /// Return the mtime of the directory.
     pub fn dir_mtime(&self, inode: Inode) -> Result<UnixTime, StorageError> {
         let txn = self.db.begin_read()?;
@@ -170,17 +169,6 @@ impl UnrealCacheBlocking {
             None => arena_cache::do_dir_mtime(&txn, inode, UnrealCacheBlocking::ROOT_DIR),
             Some(arena) => self.arena_cache(&arena)?.dir_mtime(inode),
         }
-    }
-
-    /// Return valid peer file entries for the file.
-    ///
-    /// The returned vector might be empty if the file isn't available in any peer.
-    pub fn file_availability(&self, inode: Inode) -> Result<FileAvailability, StorageError> {
-        let arena = self
-            .arena_for_inode(&self.db.begin_read()?, inode)?
-            .ok_or(StorageError::NotFound)?;
-
-        self.arena_cache(&arena)?.file_availability(inode)
     }
 
     pub fn readdir(&self, inode: Inode) -> Result<Vec<(String, ReadDirEntry)>, StorageError> {
@@ -191,18 +179,6 @@ impl UnrealCacheBlocking {
         }
     }
 
-    /// Return a [Progress] instance that represents how up-to-date
-    /// the information in the cache is for that peer and arena.
-    ///
-    /// This should be passed to the peer when subscribing.
-    pub fn peer_progress(
-        &self,
-        peer: &Peer,
-        arena: &Arena,
-    ) -> Result<Option<Progress>, StorageError> {
-        self.arena_cache(&arena)?.peer_progress(peer)
-    }
-
     pub(crate) fn update(
         &self,
         peer: &Peer,
@@ -211,13 +187,6 @@ impl UnrealCacheBlocking {
         let arena = notification.arena().clone();
         let cache = self.arena_cache(&arena)?;
         cache.update(peer, notification, || self.alloc_inode_range(&arena))
-    }
-
-    pub(crate) fn open_file(&self, inode: Inode) -> Result<Blob, StorageError> {
-        let arena = self
-            .arena_for_inode(&self.db.begin_read()?, inode)?
-            .ok_or(StorageError::NotFound)?;
-        self.arena_cache(arena)?.open_file(inode)
     }
 
     /// Allocate a new range of inodes to an arena.
@@ -271,32 +240,6 @@ impl UnrealCacheBlocking {
         }
 
         Err(StorageError::NotFound)
-    }
-
-    /// Get a range showing data availability of a blob given its id.
-    #[allow(dead_code)]
-    pub(crate) fn local_availability(
-        &self,
-        arena: &Arena,
-        blob_id: BlobId,
-    ) -> Result<ByteRanges, StorageError> {
-        self.arena_cache(arena)?.local_availability(blob_id)
-    }
-
-    /// Extend the data availability range of a blob given the
-    /// blob_id.
-    ///
-    /// This function is meant to only be called after updating the
-    /// file content, flushing and syncing.
-    #[allow(dead_code)]
-    pub(crate) fn extend_local_availability(
-        &self,
-        arena: &Arena,
-        blob_id: BlobId,
-        written_areas: ByteRanges,
-    ) -> Result<(), StorageError> {
-        self.arena_cache(arena)?
-            .extend_local_availability(blob_id, written_areas)
     }
 }
 
@@ -409,13 +352,21 @@ impl UnrealCacheAsync {
     pub async fn file_metadata(&self, inode: Inode) -> Result<FileMetadata, StorageError> {
         let inner = Arc::clone(&self.inner);
 
-        task::spawn_blocking(move || inner.file_metadata(inode)).await?
+        task::spawn_blocking(move || {
+            let arena_cache = inner.arena_cache_for_inode(inode)?;
+            arena_cache.file_metadata(inode)
+        })
+        .await?
     }
 
     pub async fn file_availability(&self, inode: Inode) -> Result<FileAvailability, StorageError> {
         let inner = Arc::clone(&self.inner);
 
-        task::spawn_blocking(move || inner.file_availability(inode)).await?
+        task::spawn_blocking(move || {
+            let arena_cache = inner.arena_cache_for_inode(inode)?;
+            arena_cache.file_availability(inode)
+        })
+        .await?
     }
 
     pub async fn dir_mtime(&self, inode: Inode) -> Result<UnixTime, StorageError> {
@@ -443,7 +394,11 @@ impl UnrealCacheAsync {
         let arena = arena.clone();
         let inner = Arc::clone(&self.inner);
 
-        task::spawn_blocking(move || inner.peer_progress(&peer, &arena)).await?
+        task::spawn_blocking(move || {
+            let arena_cache = inner.arena_cache(&arena)?;
+            arena_cache.peer_progress(&peer)
+        })
+        .await?
     }
 
     /// Update the cache by applying a notification coming from the given peer.
@@ -468,7 +423,11 @@ impl UnrealCacheAsync {
     pub async fn open_file(&self, inode: Inode) -> Result<Blob, StorageError> {
         let inner = Arc::clone(&self.inner);
 
-        task::spawn_blocking(move || inner.open_file(inode)).await?
+        task::spawn_blocking(move || {
+            let arena_cache = inner.arena_cache_for_inode(inode)?;
+            arena_cache.open_file(inode)
+        })
+        .await?
     }
 }
 
