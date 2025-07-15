@@ -1,9 +1,9 @@
 use console::style;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use realize_core::consensus::movedirs::ProgressEvent;
+use realize_core::rpc::realstore::client::ClientConnectionState;
 use realize_types;
 use realize_types::Arena;
-use realize_core::rpc::realstore::client::ClientConnectionState;
 use std::collections::HashMap;
 use tokio::sync::mpsc::Receiver;
 
@@ -59,7 +59,7 @@ impl CliProgress {
 
     fn set_length(
         &mut self,
-        arena: &Arena,
+        arena: Arena,
         total_files: usize,
         total_bytes: u64,
         available_bytes: u64,
@@ -80,7 +80,7 @@ impl CliProgress {
 
     fn for_file(
         &mut self,
-        arena: &Arena,
+        arena: Arena,
         path: &realize_types::Path,
         bytes: u64,
         available: u64,
@@ -164,7 +164,8 @@ impl CliProgress {
         mut dst_watch_rx: tokio::sync::watch::Receiver<ClientConnectionState>,
     ) {
         use ProgressEvent::*;
-        let mut file_progress_map: HashMap<(Arena, realize_types::Path), CliFileProgress> = HashMap::new();
+        let mut file_progress_map: HashMap<(Arena, realize_types::Path), CliFileProgress> =
+            HashMap::new();
 
         self.set_connection_state(
             *src_watch_rx.borrow_and_update(),
@@ -193,7 +194,7 @@ impl CliProgress {
                         available_bytes,
                         ..
                     }) => {
-                        self.set_length(&arena, total_files, total_bytes, available_bytes);
+                        self.set_length(arena, total_files, total_bytes, available_bytes);
                     }
                     Some(MovingFile {
                         arena,
@@ -202,7 +203,7 @@ impl CliProgress {
                         available,
                         ..
                     }) => {
-                        let fp = self.for_file(&arena, &path, bytes, available);
+                        let fp = self.for_file(arena, &path, bytes, available);
                         file_progress_map.insert((arena, path), fp);
                     }
                     Some(VerifyingFile { arena, path, .. }) => {

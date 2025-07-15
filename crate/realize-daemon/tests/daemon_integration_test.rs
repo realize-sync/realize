@@ -59,7 +59,7 @@ impl Fixture {
         let testdir = tempdir.child("testdir");
         testdir.create_dir_all()?;
         config.storage.arenas.insert(
-            arena.clone(),
+            arena,
             ArenaConfig {
                 path: testdir.to_path_buf(),
                 index: None,

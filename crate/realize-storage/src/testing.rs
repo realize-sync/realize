@@ -37,7 +37,7 @@ where
         arenas: arenas
             .into_iter()
             .map(|arena| {
-                let arena_dir = arena_root(dir, &arena);
+                let arena_dir = arena_root(dir, arena);
                 let index_path = arena_dir.join(".index.db");
                 let arena_cache_path = arena_dir.join(".cache.db");
                 (
@@ -72,6 +72,6 @@ where
 /// given arena.
 ///
 /// This is used by [storage].
-pub fn arena_root(root: &std::path::Path, arena: &Arena) -> std::path::PathBuf {
+pub fn arena_root(root: &std::path::Path, arena: Arena) -> std::path::PathBuf {
     root.join(arena.as_str())
 }

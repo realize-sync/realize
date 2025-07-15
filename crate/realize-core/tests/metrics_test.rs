@@ -6,10 +6,10 @@ use realize_core::consensus::movedirs::{
     METRIC_END_COUNT, METRIC_FILE_END_COUNT, METRIC_FILE_START_COUNT, METRIC_RANGE_READ_BYTES,
     METRIC_RANGE_WRITE_BYTES, METRIC_READ_BYTES, METRIC_START_COUNT, METRIC_WRITE_BYTES,
 };
-use realize_types::Arena;
 use realize_core::rpc::realstore::server::{self, InProcessRealStoreServiceClient};
 use realize_storage::RealStore;
 use realize_storage::RealStoreOptions;
+use realize_types::Arena;
 
 // Metric tests are kept in their own binary to avoid other test
 // running in parallel interfering with the counts.
@@ -28,7 +28,7 @@ async fn client_success_call_count() -> anyhow::Result<()> {
     client
         .list(
             tarpc::context::current(),
-            arena.clone(),
+            arena,
             RealStoreOptions::default(),
         )
         .await??;
@@ -85,7 +85,7 @@ async fn server_success_call_count() -> anyhow::Result<()> {
     client
         .list(
             tarpc::context::current(),
-            arena.clone(),
+            arena,
             RealStoreOptions::default(),
         )
         .await??;
@@ -152,8 +152,8 @@ async fn move_files_metrics() -> anyhow::Result<()> {
     let arena = Arena::from("testdir");
     let (success, error, _interrupted) = movedirs::move_dir(
         tarpc::context::current(),
-        &server::create_inprocess_client(RealStore::single(&arena, src_temp.path())),
-        &server::create_inprocess_client(RealStore::single(&arena, dst_temp.path())),
+        &server::create_inprocess_client(RealStore::single(arena, src_temp.path())),
+        &server::create_inprocess_client(RealStore::single(arena, dst_temp.path())),
         Arena::from("testdir"),
         None,
     )
@@ -182,7 +182,7 @@ async fn move_files_metrics() -> anyhow::Result<()> {
 fn setup_inprocess_client() -> (TempDir, Arena, InProcessRealStoreServiceClient) {
     let temp = TempDir::new().unwrap();
     let arena = Arena::from("testdir");
-    let client = server::create_inprocess_client(RealStore::single(&arena, temp.path()));
+    let client = server::create_inprocess_client(RealStore::single(arena, temp.path()));
 
     (temp, arena, client)
 }

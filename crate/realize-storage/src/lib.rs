@@ -56,10 +56,10 @@ impl Storage {
         let mut arenas = HashMap::new();
         let exclude = build_exclude(&config);
         for (arena, arena_config) in &config.arenas {
-            let root = &arena_config.path;
+            let root = arena_config.path.as_ref();
             if let Some(index_config) = &arena_config.index {
                 let index_path = &index_config.db;
-                let index = RealIndexAsync::open(arena.clone(), &index_path).await?;
+                let index = RealIndexAsync::open(*arena, &index_path).await?;
                 let watcher = RealWatcher::spawn(
                     root,
                     exclude
@@ -71,7 +71,7 @@ impl Storage {
                 )
                 .await?;
                 arenas.insert(
-                    arena.clone(),
+                    *arena,
                     ArenaStorage {
                         index,
                         root: root.to_path_buf(),
@@ -90,8 +90,8 @@ impl Storage {
 
     /// Return an iterator over arenas that have an index, and so can
     /// be subscribed to.
-    pub fn indexed_arenas(&self) -> impl Iterator<Item = &Arena> {
-        self.arenas.keys()
+    pub fn indexed_arenas(&self) -> impl Iterator<Item = Arena> {
+        self.arenas.keys().map(|a| *a)
     }
 
     /// Subscribe to files in the given arena.
@@ -99,7 +99,7 @@ impl Storage {
     /// The arena must have an index; check with [Storage::indexed_arenas] first.
     pub async fn subscribe(
         &self,
-        arena: &Arena,
+        arena: Arena,
         tx: mpsc::Sender<Notification>,
         progress: Option<Progress>,
     ) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
@@ -116,7 +116,7 @@ impl Storage {
     /// Get a reader on the given file, if possible.
     pub async fn reader(
         &self,
-        arena: &Arena,
+        arena: Arena,
         path: &realize_types::Path,
     ) -> Result<Reader, StorageError> {
         let s = self.arena_storage(arena)?;
@@ -130,10 +130,10 @@ impl Storage {
     }
 
     /// Return the index for the given arena, if one exists.
-    fn arena_storage(&self, arena: &Arena) -> Result<&ArenaStorage, StorageError> {
+    fn arena_storage(&self, arena: Arena) -> Result<&ArenaStorage, StorageError> {
         self.arenas
-            .get(arena)
-            .ok_or_else(|| StorageError::UnknownArena(arena.clone()))
+            .get(&arena)
+            .ok_or_else(|| StorageError::UnknownArena(arena))
     }
 }
 

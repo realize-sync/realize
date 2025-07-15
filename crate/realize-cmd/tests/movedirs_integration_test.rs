@@ -3,12 +3,12 @@ use assert_fs::fixture::ChildPath;
 use assert_fs::prelude::*;
 use assert_unordered::assert_eq_unordered;
 use hyper_util::rt::TokioIo;
-use realize_types::{Arena, Peer};
-use realize_network::hostport::HostPort;
 use realize_core::rpc::realstore;
+use realize_network::hostport::HostPort;
 use realize_network::security::{PeerVerifier, RawPublicKeyResolver};
 use realize_network::{Networking, Server};
 use realize_storage::RealStore;
+use realize_types::{Arena, Peer};
 use rustls::pki_types::SubjectPublicKeyInfoDer;
 use rustls::pki_types::pem::PemObject;
 use std::fs;
@@ -69,7 +69,7 @@ impl Fixture {
 
         Ok(Self {
             tempdir,
-            arenas: vec![(arena.clone(), src_dir.to_path_buf(), dst_dir.to_path_buf())],
+            arenas: vec![(arena, src_dir.to_path_buf(), dst_dir.to_path_buf())],
             src_dir,
             dst_dir,
             arena,
@@ -474,10 +474,7 @@ async fn realize_metrics_export() -> anyhow::Result<()> {
         .command()?
         .arg("--metrics-addr")
         .arg(&realize_metrics_addr)
-        .env(
-            "RUST_LOG",
-            "realize_core::rpc::realstore::metrics=debug",
-        )
+        .env("RUST_LOG", "realize_core::rpc::realstore::metrics=debug")
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
         .kill_on_drop(true)

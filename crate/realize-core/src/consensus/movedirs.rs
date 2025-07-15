@@ -4,15 +4,15 @@
 //! rsync-based partial transfer, progress reporting, and error handling. It operates
 //! over the RealStoreService trait and is designed to be robust and restartable.
 
-use realize_types;
-use realize_types::{Arena, ByteRange, ByteRanges};
 use crate::rpc::realstore::{
     RangedHash, RealStoreServiceClient, RealStoreServiceRequest, RealStoreServiceResponse,
 };
-use realize_storage::{RealStoreError, RealStoreOptions, SyncedFile};
 use futures::stream::StreamExt as _;
 use futures::{FutureExt, future};
 use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
+use realize_storage::{RealStoreError, RealStoreOptions, SyncedFile};
+use realize_types;
+use realize_types::{Arena, ByteRange, ByteRanges};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tarpc::client::stub::Stub;
@@ -108,13 +108,25 @@ pub enum ProgressEvent {
         available: u64,
     },
     /// File is being verified (hash check).
-    VerifyingFile { arena: Arena, path: realize_types::Path },
+    VerifyingFile {
+        arena: Arena,
+        path: realize_types::Path,
+    },
     /// File is being rsynced (diff/patch).
-    RsyncingFile { arena: Arena, path: realize_types::Path },
+    RsyncingFile {
+        arena: Arena,
+        path: realize_types::Path,
+    },
     /// File is being copied (data transfer).
-    CopyingFile { arena: Arena, path: realize_types::Path },
+    CopyingFile {
+        arena: Arena,
+        path: realize_types::Path,
+    },
     /// File is waiting its turn to be copied.
-    PendingFile { arena: Arena, path: realize_types::Path },
+    PendingFile {
+        arena: Arena,
+        path: realize_types::Path,
+    },
     /// Increment byte count for a file and overall progress.
     IncrementByteCount {
         arena: Arena,
@@ -129,7 +141,10 @@ pub enum ProgressEvent {
         bytecount: u64,
     },
     /// File was moved successfully.
-    FileSuccess { arena: Arena, path: realize_types::Path },
+    FileSuccess {
+        arena: Arena,
+        path: realize_types::Path,
+    },
     /// Moving the file failed.
     FileError {
         arena: Arena,
@@ -187,7 +202,7 @@ where
                 if let Some(tx) = &tx {
                     let _ = tx
                         .send(ProgressEvent::MovingFile {
-                            arena: arena.clone(),
+                            arena: arena,
                             path: file_path.clone(),
                             bytes: src_file.size,
                             available: dst_file.as_ref().map_or(0, |f| f.size),
@@ -201,7 +216,7 @@ where
                     src_file,
                     dst,
                     dst_file,
-                    &arena,
+                    arena,
                     copy_sem.clone(),
                     tx.clone(),
                 )
@@ -211,7 +226,7 @@ where
                         if let Some(tx) = &tx {
                             let _ = tx
                                 .send(ProgressEvent::FileSuccess {
-                                    arena: arena.clone(),
+                                    arena: arena,
                                     path: file_path.clone(),
                                 })
                                 .await;
@@ -224,7 +239,7 @@ where
                         if let Some(tx) = &tx {
                             let _ = tx
                                 .send(ProgressEvent::FileError {
-                                    arena: arena.clone(),
+                                    arena: arena,
                                     path: file_path.clone(),
                                     error: "Deadline exceeded".to_string(),
                                 })
@@ -238,7 +253,7 @@ where
                         if let Some(tx) = &tx {
                             let _ = tx
                                 .send(ProgressEvent::FileError {
-                                    arena: arena.clone(),
+                                    arena: arena,
                                     path: file_path.clone(),
                                     error: format!("{err}"),
                                 })
@@ -277,8 +292,8 @@ where
 {
     // 1. List files on src and dst in parallel
     let (src_files, dst_files) = future::join(
-        src.list(ctx, arena.clone(), src_options()),
-        dst.list(ctx, arena.clone(), dst_options()),
+        src.list(ctx, arena, src_options()),
+        dst.list(ctx, arena, dst_options()),
     )
     .await;
     let src_files = src_files??;
@@ -291,14 +306,14 @@ where
         .map(|src_file| {
             let dst_file = dst_map.remove(&src_file.path);
 
-            (arena.clone(), src_file, dst_file)
+            (arena, src_file, dst_file)
         })
         .collect::<Vec<_>>();
 
     if let Some(tx) = &progress_tx {
         let _ = tx
             .send(ProgressEvent::MovingDir {
-                arena: arena.clone(),
+                arena: arena,
                 total_files: files_to_sync.len(),
                 total_bytes: files_to_sync.iter().fold(0, |acc, (_, f, _)| acc + f.size),
                 available_bytes: files_to_sync
@@ -317,7 +332,7 @@ async fn move_file<T, U>(
     src_file: SyncedFile,
     dst: &RealStoreServiceClient<U>,
     dst_file: Option<SyncedFile>,
-    arena: &Arena,
+    arena: Arena,
     copy_sem: Arc<Semaphore>,
     progress_tx: Option<Sender<ProgressEvent>>,
 ) -> Result<(), MoveFileError>
@@ -329,7 +344,6 @@ where
     let path = src_file.path;
     let src_size = src_file.size;
     let dst_size = dst_file.as_ref().map(|f| f.size).unwrap_or(0);
-    let arena = arena.clone();
 
     let ranges = ByteRanges::single(0, src_size);
 
@@ -344,7 +358,7 @@ where
             log::debug!("{arena}/{path:?} {ranges} copy {copy_ranges}");
             copy_file_range(
                 ctx,
-                &arena,
+                arena,
                 &path,
                 src,
                 dst,
@@ -356,14 +370,8 @@ where
 
             // 2. Truncate if necessary
             if dst_file.as_ref().map_or(0, |f| f.size) > src_file.size {
-                dst.truncate(
-                    ctx,
-                    arena.clone(),
-                    path.clone(),
-                    src_file.size,
-                    dst_options(),
-                )
-                .await??;
+                dst.truncate(ctx, arena, path.clone(), src_file.size, dst_options())
+                    .await??;
             }
 
             Ok::<(), MoveFileError>(())
@@ -372,7 +380,7 @@ where
         hash_file(
             ctx,
             src,
-            &arena,
+            arena,
             &path,
             src_size,
             HASH_FILE_CHUNK,
@@ -383,9 +391,9 @@ where
     let src_hash = src_hash?;
 
     // 3. Check hash, return if succeeds
-    report_verifying(&progress_tx, &arena, &path).await;
+    report_verifying(&progress_tx, arena, &path).await;
     let correct =
-        match check_hashes_and_delete(ctx, &src_hash, src_size, src, dst, &arena, &path).await? {
+        match check_hashes_and_delete(ctx, &src_hash, src_size, src, dst, arena, &path).await? {
             HashCheck::Match => {
                 return Ok(());
             }
@@ -406,10 +414,10 @@ where
         rsync_ranges,
         rsync_ranges.bytecount()
     );
-    report_decrement_bytecount(&progress_tx, &arena, &path, rsync_ranges.bytecount()).await;
+    report_decrement_bytecount(&progress_tx, arena, &path, rsync_ranges.bytecount()).await;
     rsync_file_range(
         ctx,
-        &arena,
+        arena,
         &path,
         src,
         dst,
@@ -422,7 +430,7 @@ where
     // 5. Fallback to copy if necessary
     copy_file_range(
         ctx,
-        &arena,
+        arena,
         &path,
         src,
         dst,
@@ -433,8 +441,8 @@ where
     .await?;
 
     // 6. Check again against hash
-    report_verifying(&progress_tx, &arena, &path).await;
-    match check_hashes_and_delete(ctx, &src_hash, src_size, src, dst, &arena, &path).await? {
+    report_verifying(&progress_tx, arena, &path).await;
+    match check_hashes_and_delete(ctx, &src_hash, src_size, src, dst, arena, &path).await? {
         HashCheck::Mismatch { .. } => Err(MoveFileError::FailedToSync),
         HashCheck::Match => Ok(()),
     }
@@ -442,7 +450,7 @@ where
 
 async fn rsync_file_range<T, U>(
     ctx: tarpc::context::Context,
-    arena: &Arena,
+    arena: Arena,
     path: &realize_types::Path,
     src: &RealStoreServiceClient<T>,
     dst: &RealStoreServiceClient<U>,
@@ -462,23 +470,10 @@ where
 
     for range in rsync_ranges.chunked(CHUNK_SIZE) {
         let sig = dst
-            .calculate_signature(
-                ctx,
-                arena.clone(),
-                path.clone(),
-                range.clone(),
-                dst_options(),
-            )
+            .calculate_signature(ctx, arena, path.clone(), range.clone(), dst_options())
             .await??;
         let (delta, hash) = src
-            .diff(
-                ctx,
-                arena.clone(),
-                path.clone(),
-                range.clone(),
-                sig,
-                src_options(),
-            )
+            .diff(ctx, arena, path.clone(), range.clone(), sig, src_options())
             .await??;
         METRIC_READ_BYTES
             .with_label_values(&["diff"])
@@ -490,7 +485,7 @@ where
         match dst
             .apply_delta(
                 ctx,
-                arena.clone(),
+                arena,
                 path.clone(),
                 range.clone(),
                 delta,
@@ -506,7 +501,7 @@ where
                 METRIC_RANGE_WRITE_BYTES
                     .with_label_values(&["apply_delta"])
                     .inc_by(range.bytecount());
-                log::debug!("{}/{:?} INC {}", &arena, path, range.bytecount());
+                log::debug!("{}/{:?} INC {}", arena, path, range.bytecount());
                 report_increment_bytecount(progress_tx, arena, path, range.bytecount()).await;
             }
             Err(RealStoreError::HashMismatch) => {
@@ -526,7 +521,7 @@ where
 
 async fn copy_file_range<T, U>(
     ctx: tarpc::context::Context,
-    arena: &Arena,
+    arena: Arena,
     path: &realize_types::Path,
     src: &RealStoreServiceClient<T>,
     dst: &RealStoreServiceClient<U>,
@@ -550,13 +545,7 @@ where
 
     for range in copy_ranges.chunked(CHUNK_SIZE) {
         let data = src
-            .read(
-                ctx,
-                arena.clone(),
-                path.clone(),
-                range.clone(),
-                src_options(),
-            )
+            .read(ctx, arena, path.clone(), range.clone(), src_options())
             .await??;
         METRIC_READ_BYTES
             .with_label_values(&["read"])
@@ -565,15 +554,8 @@ where
             .with_label_values(&["read"])
             .inc_by(range.bytecount());
         let data_len = data.len();
-        dst.send(
-            ctx,
-            arena.clone(),
-            path.clone(),
-            range.clone(),
-            data,
-            dst_options(),
-        )
-        .await??;
+        dst.send(ctx, arena, path.clone(), range.clone(), data, dst_options())
+            .await??;
         METRIC_WRITE_BYTES
             .with_label_values(&["send"])
             .inc_by(data_len as u64);
@@ -588,13 +570,13 @@ where
 
 async fn report_pending(
     progress_tx: &Option<Sender<ProgressEvent>>,
-    arena: &Arena,
+    arena: Arena,
     path: &realize_types::Path,
 ) {
     if let Some(tx) = progress_tx {
         let _ = tx
             .send(ProgressEvent::PendingFile {
-                arena: arena.clone(),
+                arena: arena,
                 path: path.clone(),
             })
             .await;
@@ -603,13 +585,13 @@ async fn report_pending(
 
 async fn report_copying(
     progress_tx: &Option<Sender<ProgressEvent>>,
-    arena: &Arena,
+    arena: Arena,
     path: &realize_types::Path,
 ) {
     if let Some(tx) = progress_tx {
         let _ = tx
             .send(ProgressEvent::CopyingFile {
-                arena: arena.clone(),
+                arena: arena,
                 path: path.clone(),
             })
             .await;
@@ -618,13 +600,13 @@ async fn report_copying(
 
 async fn report_rsyncing(
     progress_tx: &Option<Sender<ProgressEvent>>,
-    arena: &Arena,
+    arena: Arena,
     path: &realize_types::Path,
 ) {
     if let Some(tx) = progress_tx {
         let _ = tx
             .send(ProgressEvent::RsyncingFile {
-                arena: arena.clone(),
+                arena: arena,
                 path: path.clone(),
             })
             .await;
@@ -633,13 +615,13 @@ async fn report_rsyncing(
 
 async fn report_verifying(
     progress_tx: &Option<Sender<ProgressEvent>>,
-    arena: &Arena,
+    arena: Arena,
     path: &realize_types::Path,
 ) {
     if let Some(tx) = progress_tx {
         let _ = tx
             .send(ProgressEvent::VerifyingFile {
-                arena: arena.clone(),
+                arena: arena,
                 path: path.clone(),
             })
             .await;
@@ -648,7 +630,7 @@ async fn report_verifying(
 
 async fn report_increment_bytecount(
     progress_tx: &Option<Sender<ProgressEvent>>,
-    arena: &Arena,
+    arena: Arena,
     path: &realize_types::Path,
     bytecount: u64,
 ) {
@@ -658,7 +640,7 @@ async fn report_increment_bytecount(
     if let Some(tx) = progress_tx {
         let _ = tx
             .send(ProgressEvent::IncrementByteCount {
-                arena: arena.clone(),
+                arena: arena,
                 path: path.clone(),
                 bytecount,
             })
@@ -668,7 +650,7 @@ async fn report_increment_bytecount(
 
 async fn report_decrement_bytecount(
     progress_tx: &Option<Sender<ProgressEvent>>,
-    arena: &Arena,
+    arena: Arena,
     path: &realize_types::Path,
     bytecount: u64,
 ) {
@@ -678,7 +660,7 @@ async fn report_decrement_bytecount(
     if let Some(tx) = progress_tx {
         let _ = tx
             .send(ProgressEvent::DecrementByteCount {
-                arena: arena.clone(),
+                arena: arena,
                 path: path.clone(),
                 bytecount,
             })
@@ -690,7 +672,7 @@ async fn report_decrement_bytecount(
 pub(crate) async fn hash_file<T>(
     ctx: tarpc::context::Context,
     client: &RealStoreServiceClient<T>,
-    arena: &Arena,
+    arena: Arena,
     relative_path: &realize_types::Path,
     file_size: u64,
     chunk_size: u64,
@@ -702,13 +684,7 @@ where
     let results = futures::stream::iter(ByteRange::new(0, file_size).chunked(chunk_size))
         .map(|range| {
             client
-                .hash(
-                    ctx,
-                    arena.clone(),
-                    relative_path.clone(),
-                    range.clone(),
-                    options,
-                )
+                .hash(ctx, arena, relative_path.clone(), range.clone(), options)
                 .map(move |res| res.map(|h| (range.clone(), h)))
         })
         .buffer_unordered(PARALLEL_FILE_HASH)
@@ -743,7 +719,7 @@ async fn check_hashes_and_delete<T, U>(
     file_size: u64,
     src: &RealStoreServiceClient<T>,
     dst: &RealStoreServiceClient<U>,
-    arena: &Arena,
+    arena: Arena,
     path: &realize_types::Path,
 ) -> Result<HashCheck, MoveFileError>
 where
@@ -776,9 +752,9 @@ where
     }
     log::debug!("{arena}/{path} MOVED");
     // Hashes match, finish and delete
-    dst.finish(ctx, arena.clone(), path.clone(), dst_options())
+    dst.finish(ctx, arena, path.clone(), dst_options())
         .await??;
-    src.delete(ctx, arena.clone(), path.clone(), src_options())
+    src.delete(ctx, arena, path.clone(), src_options())
         .await??;
 
     METRIC_FILE_END_COUNT.with_label_values(&["Ok"]).inc();
@@ -788,13 +764,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use realize_types::{Arena, Hash};
     use crate::rpc::realstore::server::{self};
-    use realize_storage::RealStore;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
+    use realize_storage::RealStore;
     use realize_storage::utils::hash;
+    use realize_types::{Arena, Hash};
     use std::path::PathBuf;
     use walkdir::WalkDir;
 
@@ -807,8 +783,8 @@ mod tests {
         let arena = Arena::from("testdir");
         let src_dir = src_temp.path();
         let dst_dir = dst_temp.path();
-        let src_server = server::create_inprocess_client(RealStore::single(&arena, src_dir));
-        let dst_server = server::create_inprocess_client(RealStore::single(&arena, dst_dir));
+        let src_server = server::create_inprocess_client(RealStore::single(arena, src_dir));
+        let dst_server = server::create_inprocess_client(RealStore::single(arena, dst_dir));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let (success, error, _) = move_dir(
@@ -880,10 +856,8 @@ mod tests {
         src_temp.child("foo").write_str("abcdefghi")?;
         dst_temp.child(".foo.part").write_str("abc")?;
 
-        let src_server =
-            server::create_inprocess_client(RealStore::single(&arena, src_temp.path()));
-        let dst_server =
-            server::create_inprocess_client(RealStore::single(&arena, dst_temp.path()));
+        let src_server = server::create_inprocess_client(RealStore::single(arena, src_temp.path()));
+        let dst_server = server::create_inprocess_client(RealStore::single(arena, dst_temp.path()));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let (success, error, _) = move_dir(
@@ -955,10 +929,8 @@ mod tests {
         src_temp.child("foo").write_str("abcdefghi")?;
         dst_temp.child(".foo.part").write_str("xxx")?;
 
-        let src_server =
-            server::create_inprocess_client(RealStore::single(&arena, src_temp.path()));
-        let dst_server =
-            server::create_inprocess_client(RealStore::single(&arena, dst_temp.path()));
+        let src_server = server::create_inprocess_client(RealStore::single(arena, src_temp.path()));
+        let dst_server = server::create_inprocess_client(RealStore::single(arena, dst_temp.path()));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let (success, error, _) = move_dir(
@@ -1047,13 +1019,11 @@ mod tests {
 
         // Setup source directory with files
         let src_temp = TempDir::new()?;
-        let src_server =
-            server::create_inprocess_client(RealStore::single(&arena, src_temp.path()));
+        let src_server = server::create_inprocess_client(RealStore::single(arena, src_temp.path()));
 
         // Setup destination directory (empty)
         let dst_temp = TempDir::new()?;
-        let dst_server =
-            server::create_inprocess_client(RealStore::single(&arena, dst_temp.path()));
+        let dst_server = server::create_inprocess_client(RealStore::single(arena, dst_temp.path()));
 
         // Pre-populate destination with a file of the same length as source (should trigger rsync optimization)
         src_temp.child("same_length").write_str("hello")?;
@@ -1109,12 +1079,10 @@ mod tests {
 
         let arena = Arena::from("testdir");
         let src_temp = TempDir::new()?;
-        let src_server =
-            server::create_inprocess_client(RealStore::single(&arena, src_temp.path()));
+        let src_server = server::create_inprocess_client(RealStore::single(arena, src_temp.path()));
 
         let dst_temp = TempDir::new()?;
-        let dst_server =
-            server::create_inprocess_client(RealStore::single(&arena, dst_temp.path()));
+        let dst_server = server::create_inprocess_client(RealStore::single(arena, dst_temp.path()));
 
         // Case 1: source > CHUNK_SIZE, destination empty
         src_temp.child("large_empty").write_binary(&chunk)?;
@@ -1172,11 +1140,9 @@ mod tests {
         let _ = env_logger::try_init();
         let arena = Arena::from("testdir");
         let src_temp = TempDir::new()?;
-        let src_server =
-            server::create_inprocess_client(RealStore::single(&arena, src_temp.path()));
+        let src_server = server::create_inprocess_client(RealStore::single(arena, src_temp.path()));
         let dst_temp = TempDir::new()?;
-        let dst_server =
-            server::create_inprocess_client(RealStore::single(&arena, dst_temp.path()));
+        let dst_server = server::create_inprocess_client(RealStore::single(arena, dst_temp.path()));
         // Good file
         src_temp.child("good").write_str("ok")?;
         // Unreadable file
@@ -1208,8 +1174,8 @@ mod tests {
         let arena = Arena::from("testdir");
         let src_dir = src_temp.path();
         let dst_dir = dst_temp.path();
-        let src_server = server::create_inprocess_client(RealStore::single(&arena, src_dir));
-        let dst_server = server::create_inprocess_client(RealStore::single(&arena, dst_dir));
+        let src_server = server::create_inprocess_client(RealStore::single(arena, src_dir));
+        let dst_server = server::create_inprocess_client(RealStore::single(arena, dst_dir));
         // Create a final file and a partial file in src
         src_temp.child("final.txt").write_str("finaldata")?;
         src_temp
@@ -1248,11 +1214,11 @@ mod tests {
         file.write_binary(content)?;
 
         let arena = Arena::from("dir");
-        let server = server::create_inprocess_client(RealStore::single(&arena, temp.path()));
+        let server = server::create_inprocess_client(RealStore::single(arena, temp.path()));
         let ranged = hash_file(
             tarpc::context::current(),
             &server,
-            &arena,
+            arena,
             &realize_types::Path::parse("somefile")?,
             content.len() as u64,
             HASH_FILE_CHUNK,
@@ -1282,11 +1248,11 @@ mod tests {
         file.write_binary(content)?;
 
         let arena = Arena::from("dir");
-        let server = server::create_inprocess_client(RealStore::single(&arena, temp.path()));
+        let server = server::create_inprocess_client(RealStore::single(arena, temp.path()));
         let ranged = hash_file(
             tarpc::context::current(),
             &server,
-            &arena,
+            arena,
             &realize_types::Path::parse("somefile")?,
             content.len() as u64,
             4,
@@ -1316,11 +1282,11 @@ mod tests {
         file.write_binary(content)?;
 
         let arena = Arena::from("dir");
-        let server = server::create_inprocess_client(RealStore::single(&arena, temp.path()));
+        let server = server::create_inprocess_client(RealStore::single(arena, temp.path()));
         let ranged = hash_file(
             tarpc::context::current(),
             &server,
-            &arena,
+            arena,
             &realize_types::Path::parse("somefile")?,
             8,
             4,

@@ -122,7 +122,7 @@ impl Download {
         let fut = {
             let household = self.household.clone();
             let peers = self.peers.clone();
-            let arena = self.arena.clone();
+            let arena = self.arena;
             let path = self.path.clone();
             let range = range.clone();
 
@@ -275,7 +275,7 @@ mod tests {
 
                 // Get the inode for the file
                 let arena = HouseholdFixture::test_arena();
-                let (inode, _) = cache.lookup_path(&arena, &Path::parse("test.txt")?).await?;
+                let (inode, _) = cache.lookup_path(arena, &Path::parse("test.txt")?).await?;
 
                 let mut reader = downloader.reader(inode).await?;
                 assert_eq!("File content", read_string(&mut reader).await?);
@@ -306,7 +306,7 @@ mod tests {
                 let downloader = Downloader::new(household_a, cache.clone());
 
                 let arena = HouseholdFixture::test_arena();
-                let (inode, _) = cache.lookup_path(&arena, &Path::parse("test.txt")?).await?;
+                let (inode, _) = cache.lookup_path(arena, &Path::parse("test.txt")?).await?;
 
                 let mut reader = downloader.reader(inode).await?;
 
@@ -352,7 +352,7 @@ mod tests {
                 let downloader = Downloader::new(household_a, cache.clone());
 
                 let arena = HouseholdFixture::test_arena();
-                let (inode, _) = cache.lookup_path(&arena, &Path::parse("test.txt")?).await?;
+                let (inode, _) = cache.lookup_path(arena, &Path::parse("test.txt")?).await?;
 
                 let mut reader = downloader.reader(inode).await?;
 
@@ -392,7 +392,7 @@ mod tests {
                 let downloader = Downloader::new(household_a, cache.clone());
 
                 let arena = HouseholdFixture::test_arena();
-                let (inode, _) = cache.lookup_path(&arena, &Path::parse("test.txt")?).await?;
+                let (inode, _) = cache.lookup_path(arena, &Path::parse("test.txt")?).await?;
 
                 let mut reader = downloader.reader(inode).await?;
 
@@ -432,7 +432,7 @@ mod tests {
 
                 let arena = HouseholdFixture::test_arena();
                 let (inode, _) = cache
-                    .lookup_path(&arena, &Path::parse("large_file")?)
+                    .lookup_path(arena, &Path::parse("large_file")?)
                     .await?;
 
                 let mut reader = downloader.reader(inode).await?;
@@ -541,7 +541,7 @@ mod tests {
 
         let arena = HouseholdFixture::test_arena();
         let (inode, _) = cache
-            .lookup_path(&arena, &Path::parse("large_file")?)
+            .lookup_path(arena, &Path::parse("large_file")?)
             .await?;
 
         let mut reader = downloader.reader(inode).await?;

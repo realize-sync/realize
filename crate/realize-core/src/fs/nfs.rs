@@ -404,7 +404,7 @@ mod tests {
                     )
                     .await
                     .map_err(to_anyhow)?;
-                assert_eq!(cache.arena_root(&arena)?.as_u64(), arena_root);
+                assert_eq!(cache.arena_root(arena)?.as_u64(), arena_root);
 
                 let attrs = fs.getattr(arena_root).await.map_err(to_anyhow)?;
                 assert_eq!(0o0550, attrs.mode);
@@ -445,7 +445,7 @@ mod tests {
                     .await?;
 
                 let arena_root = cache
-                    .arena_root(&HouseholdFixture::test_arena())
+                    .arena_root(HouseholdFixture::test_arena())
                     .expect("arena");
                 let somefile_inode = fs
                     .lookup(
@@ -495,7 +495,7 @@ mod tests {
                 fixture.wait_for_file_in_cache(a, "hello.txt").await?;
 
                 let arena_root = cache
-                    .arena_root(&HouseholdFixture::test_arena())
+                    .arena_root(HouseholdFixture::test_arena())
                     .expect("arena");
                 let somefile_inode = fs
                     .lookup(arena_root.into(), &nfsstring::from("hello.txt".as_bytes()))

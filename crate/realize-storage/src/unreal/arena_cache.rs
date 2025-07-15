@@ -169,7 +169,7 @@ impl ArenaCache {
     pub(crate) fn file_availability(&self, inode: Inode) -> Result<FileAvailability, StorageError> {
         let txn = self.db.begin_read()?;
 
-        do_file_availability(&txn, inode, &self.arena)
+        do_file_availability(&txn, inode, self.arena)
     }
 
     pub(crate) fn readdir(
@@ -195,7 +195,7 @@ impl ArenaCache {
     ) -> Result<(), StorageError> {
         log::debug!("notification from {peer}: {notification:?}");
         // UnrealCacheBlocking::update, is responsible for dispatching properly
-        assert_eq!(self.arena, *notification.arena());
+        assert_eq!(self.arena, notification.arena());
 
         let txn = self.db.begin_write()?;
         match notification {
@@ -795,7 +795,7 @@ fn do_file_metadata(txn: &ReadTransaction, inode: Inode) -> Result<FileMetadata,
 fn do_file_availability(
     txn: &ReadTransaction,
     inode: Inode,
-    arena: &Arena,
+    arena: Arena,
 ) -> Result<FileAvailability, StorageError> {
     let file_table = txn.open_table(FILE_TABLE)?;
 
@@ -826,7 +826,7 @@ fn do_file_availability(
     }
 
     Ok(FileAvailability {
-        arena: arena.clone(),
+        arena: arena,
         path,
         metadata,
         hash,
@@ -1236,7 +1236,7 @@ mod tests {
         tempdir: TempDir,
     }
     impl Fixture {
-        fn setup_with_arena(arena: &Arena) -> anyhow::Result<Fixture> {
+        fn setup_with_arena(arena: Arena) -> anyhow::Result<Fixture> {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
             let path = tempdir.path().join("unreal.db");
@@ -1248,28 +1248,28 @@ mod tests {
                 std::fs::create_dir_all(p)?;
             }
             cache.add_arena(
-                arena.clone(),
+                arena,
                 Database::create(child.path())?,
                 blob_dir.to_path_buf(),
             )?;
 
             Ok(Self {
-                arena: arena.clone(),
+                arena: arena,
                 cache,
                 tempdir,
             })
         }
 
         fn arena_cache(&self) -> anyhow::Result<&ArenaCache> {
-            Ok(self.cache.arena_cache(&self.arena)?)
+            Ok(self.cache.arena_cache(self.arena)?)
         }
 
-        fn parent_dir_mtime(&self, arena: &Arena, path: &Path) -> anyhow::Result<UnixTime> {
+        fn parent_dir_mtime(&self, arena: Arena, path: &Path) -> anyhow::Result<UnixTime> {
             let arena_root = self.cache.arena_root(arena).expect("arena was added");
             match path.parent() {
                 None => Ok(self.cache.dir_mtime(arena_root)?),
                 Some(path) => {
-                    let (inode, _) = self.cache.lookup_path(&arena, &path)?;
+                    let (inode, _) = self.cache.lookup_path(arena, &path)?;
 
                     Ok(self.cache.dir_mtime(inode)?)
                 }
@@ -1307,12 +1307,12 @@ mod tests {
         }
 
         /// Check if a blob file exists for the given blob ID in the test arena.
-        fn blob_file_exists(&self, arena: &Arena, blob_id: BlobId) -> bool {
+        fn blob_file_exists(&self, arena: Arena, blob_id: BlobId) -> bool {
             self.blob_path(arena, blob_id).exists()
         }
 
         /// Return the path to a blob file for test use.
-        fn blob_path(&self, arena: &Arena, blob_id: BlobId) -> std::path::PathBuf {
+        fn blob_path(&self, arena: Arena, blob_id: BlobId) -> std::path::PathBuf {
             self.tempdir
                 .child(format!("{arena}/blobs/{blob_id}"))
                 .to_path_buf()
@@ -1321,7 +1321,7 @@ mod tests {
 
     #[test]
     fn add_creates_directories() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(&test_arena())?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let cache = &fixture.cache;
         let file_path = Path::parse("a/b/c.txt")?;
         let mtime = test_time();
@@ -1343,22 +1343,22 @@ mod tests {
     #[test]
     fn add_updates_dir_mtime() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(&arena)?;
+        let fixture = Fixture::setup_with_arena(arena)?;
         let mtime = test_time();
         let path1 = Path::parse("a/b/1.txt")?;
         fixture.add_file(&path1, 100, &mtime)?;
-        let dir_mtime = fixture.parent_dir_mtime(&arena, &path1)?;
+        let dir_mtime = fixture.parent_dir_mtime(arena, &path1)?;
 
         let path2 = Path::parse("a/b/2.txt")?;
         fixture.add_file(&path2, 100, &mtime)?;
 
-        assert!(fixture.parent_dir_mtime(&arena, &path2)? > dir_mtime);
+        assert!(fixture.parent_dir_mtime(arena, &path2)? > dir_mtime);
         Ok(())
     }
 
     #[test]
     fn replace_existing_file() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(&test_arena())?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let cache = &fixture.cache;
         let peer = test_peer();
         let arena = test_arena();
@@ -1367,7 +1367,7 @@ mod tests {
         cache.update(
             peer,
             Notification::Add {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: file_path.clone(),
                 mtime: test_time(),
@@ -1378,7 +1378,7 @@ mod tests {
         cache.update(
             peer,
             Notification::Replace {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: file_path.clone(),
                 mtime: later_time(),
@@ -1399,7 +1399,7 @@ mod tests {
 
     #[test]
     fn ignore_duplicate_add() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(&test_arena())?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let file_path = Path::parse("file.txt")?;
 
         fixture.add_file(&file_path, 100, &test_time())?;
@@ -1415,7 +1415,7 @@ mod tests {
 
     #[test]
     fn ignore_replace_with_wrong_hash() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(&test_arena())?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let cache = &fixture.cache;
         let file_path = Path::parse("file.txt")?;
         let peer = test_peer();
@@ -1454,13 +1454,13 @@ mod tests {
 
     #[test]
     fn unlink_removes_file() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(&test_arena())?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let cache = &fixture.cache;
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
 
         fixture.add_file(&file_path, 100, &mtime)?;
-        let arena_root = cache.arena_root(&test_arena())?;
+        let arena_root = cache.arena_root(test_arena())?;
         cache.lookup(arena_root, "file.txt")?;
         fixture.remove_file(&file_path)?;
         assert!(matches!(
@@ -1474,22 +1474,22 @@ mod tests {
     #[test]
     fn unlink_updates_dir_mtime() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(&arena)?;
+        let fixture = Fixture::setup_with_arena(arena)?;
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
 
         fixture.add_file(&file_path, 100, &mtime)?;
-        let dir_mtime = fixture.parent_dir_mtime(&arena, &file_path)?;
+        let dir_mtime = fixture.parent_dir_mtime(arena, &file_path)?;
         fixture.remove_file(&file_path)?;
 
-        assert!(fixture.parent_dir_mtime(&arena, &file_path)? > dir_mtime);
+        assert!(fixture.parent_dir_mtime(arena, &file_path)? > dir_mtime);
 
         Ok(())
     }
 
     #[test]
     fn unlink_ignores_wrong_old_hash() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(&test_arena())?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let cache = &fixture.cache;
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
@@ -1499,7 +1499,7 @@ mod tests {
         cache.update(
             test_peer(),
             Notification::Remove {
-                arena: arena.clone(),
+                arena: arena,
                 index: 1,
                 path: file_path.clone(),
                 old_hash: Hash([2u8; 32]), // != test_hash()
@@ -1517,7 +1517,7 @@ mod tests {
 
     #[test]
     fn lookup_finds_entry() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(&test_arena())?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let cache = &fixture.cache;
         let arena = test_arena();
         let file_path = Path::parse("a/file.txt")?;
@@ -1526,7 +1526,7 @@ mod tests {
         fixture.add_file(&file_path, 100, &mtime)?;
 
         // Lookup directory
-        let dir_entry = cache.lookup(cache.arena_root(&arena)?, "a")?;
+        let dir_entry = cache.lookup(cache.arena_root(arena)?, "a")?;
         assert_eq!(dir_entry.assignment, InodeAssignment::Directory);
 
         // Lookup file
@@ -1543,11 +1543,11 @@ mod tests {
 
     #[test]
     fn lookup_returns_notfound_for_missing_entry() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(&test_arena())?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let cache = &fixture.cache;
 
         assert!(matches!(
-            cache.lookup(cache.arena_root(&test_arena())?, "nonexistent"),
+            cache.lookup(cache.arena_root(test_arena())?, "nonexistent"),
             Err(StorageError::NotFound),
         ));
 
@@ -1556,7 +1556,7 @@ mod tests {
 
     #[test]
     fn lookup_path_finds_entry() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(&test_arena())?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let cache = &fixture.cache;
         let arena = test_arena();
         let path = Path::parse("a/b/c/file.txt")?;
@@ -1564,7 +1564,7 @@ mod tests {
 
         fixture.add_file(&path, 100, &mtime)?;
 
-        let (inode, assignment) = cache.lookup_path(&arena, &path)?;
+        let (inode, assignment) = cache.lookup_path(arena, &path)?;
         assert_eq!(assignment, InodeAssignment::File);
 
         let acache = fixture.arena_cache()?;
@@ -1577,7 +1577,7 @@ mod tests {
 
     #[test]
     fn readdir_returns_all_entries() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(&test_arena())?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let cache = &fixture.cache;
         let arena = test_arena();
         let mtime = test_time();
@@ -1595,7 +1595,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
 
-        let arena_root = cache.arena_root(&arena)?;
+        let arena_root = cache.arena_root(arena)?;
         assert_unordered::assert_eq_unordered!(
             vec![("dir".to_string(), InodeAssignment::Directory),],
             cache
@@ -1624,7 +1624,7 @@ mod tests {
 
     #[test]
     fn get_file_metadata_tracks_hash_chain() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(&test_arena())?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let cache = &fixture.cache;
 
         let peer1 = Peer::from("peer1");
@@ -1635,7 +1635,7 @@ mod tests {
         cache.update(
             peer1,
             Notification::Add {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: file_path.clone(),
                 mtime: test_time(),
@@ -1646,7 +1646,7 @@ mod tests {
         cache.update(
             peer2,
             Notification::Add {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: file_path.clone(),
                 mtime: test_time(),
@@ -1657,7 +1657,7 @@ mod tests {
         cache.update(
             peer2,
             Notification::Replace {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: file_path.clone(),
                 mtime: later_time(),
@@ -1678,7 +1678,7 @@ mod tests {
 
     #[test]
     fn file_availability_deals_with_conflicting_adds() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(&test_arena())?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let cache = &fixture.cache;
 
         let a = Peer::from("a");
@@ -1690,7 +1690,7 @@ mod tests {
         cache.update(
             a,
             Notification::Add {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: path.clone(),
                 mtime: test_time(),
@@ -1701,7 +1701,7 @@ mod tests {
         cache.update(
             b,
             Notification::Add {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: path.clone(),
                 mtime: test_time(),
@@ -1712,7 +1712,7 @@ mod tests {
         cache.update(
             c,
             Notification::Add {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: path.clone(),
                 mtime: later_time(),
@@ -1742,7 +1742,7 @@ mod tests {
 
     #[test]
     fn file_availablility_deals_with_different_versions() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(&test_arena())?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let cache = &fixture.cache;
 
         let a = Peer::from("a");
@@ -1754,7 +1754,7 @@ mod tests {
         cache.update(
             a,
             Notification::Add {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: path.clone(),
                 mtime: test_time(),
@@ -1765,7 +1765,7 @@ mod tests {
         cache.update(
             b,
             Notification::Add {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: path.clone(),
                 mtime: test_time(),
@@ -1776,7 +1776,7 @@ mod tests {
         cache.update(
             c,
             Notification::Add {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: path.clone(),
                 mtime: test_time(),
@@ -1787,7 +1787,7 @@ mod tests {
         cache.update(
             b,
             Notification::Replace {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: path.clone(),
                 mtime: later_time(),
@@ -1817,7 +1817,7 @@ mod tests {
         cache.update(
             c,
             Notification::Replace {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: path.clone(),
                 mtime: later_time(),
@@ -1829,7 +1829,7 @@ mod tests {
         cache.update(
             c,
             Notification::Replace {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: path.clone(),
                 mtime: later_time(),
@@ -1847,7 +1847,7 @@ mod tests {
         cache.update(
             b,
             Notification::Replace {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: path.clone(),
                 mtime: later_time(),
@@ -1867,7 +1867,7 @@ mod tests {
 
     #[test]
     fn file_availability_when_a_peer_goes_away() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(&test_arena())?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let cache = &fixture.cache;
 
         let a = Peer::from("a");
@@ -1879,7 +1879,7 @@ mod tests {
         cache.update(
             a,
             Notification::Add {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: path.clone(),
                 mtime: test_time(),
@@ -1890,7 +1890,7 @@ mod tests {
         cache.update(
             b,
             Notification::Add {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: path.clone(),
                 mtime: test_time(),
@@ -1901,7 +1901,7 @@ mod tests {
         cache.update(
             c,
             Notification::Add {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: path.clone(),
                 mtime: later_time(),
@@ -1912,7 +1912,7 @@ mod tests {
         cache.update(
             a,
             Notification::Replace {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: path.clone(),
                 mtime: later_time(),
@@ -1927,11 +1927,11 @@ mod tests {
         assert_eq!(vec![a], avail.peers);
         assert_eq!(Hash([3u8; 32]), avail.hash);
 
-        cache.update(a, Notification::CatchupStart(arena.clone()))?;
+        cache.update(a, Notification::CatchupStart(arena))?;
         cache.update(
             a,
             Notification::CatchupComplete {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
             },
         )?;
@@ -1953,7 +1953,7 @@ mod tests {
 
     #[test]
     fn mark_and_delete_peer_files() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(&test_arena())?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let cache = &fixture.cache;
         let arena = test_arena();
         let peer1 = Peer::from("1");
@@ -1969,7 +1969,7 @@ mod tests {
         cache.update(
             peer1,
             Notification::Add {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: file1.clone(),
                 mtime: mtime.clone(),
@@ -1981,7 +1981,7 @@ mod tests {
         cache.update(
             peer1,
             Notification::Add {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: file2.clone(),
                 mtime: mtime.clone(),
@@ -1992,7 +1992,7 @@ mod tests {
         cache.update(
             peer2,
             Notification::Add {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: file2.clone(),
                 mtime: mtime.clone(),
@@ -2004,7 +2004,7 @@ mod tests {
         cache.update(
             peer1,
             Notification::Add {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: file1.clone(),
                 mtime: mtime.clone(),
@@ -2015,7 +2015,7 @@ mod tests {
         cache.update(
             peer2,
             Notification::Add {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: file2.clone(),
                 mtime: mtime.clone(),
@@ -2026,7 +2026,7 @@ mod tests {
         cache.update(
             peer3,
             Notification::Add {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: file3.clone(),
                 mtime: mtime.clone(),
@@ -2038,7 +2038,7 @@ mod tests {
         cache.update(
             peer1,
             Notification::Add {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: file4.clone(),
                 mtime: mtime.clone(),
@@ -2048,11 +2048,11 @@ mod tests {
         )?;
 
         // Simulate a catchup that only reports file2 and file4.
-        cache.update(peer1, Notification::CatchupStart(arena.clone()))?;
+        cache.update(peer1, Notification::CatchupStart(arena))?;
         cache.update(
             peer1,
             Notification::Catchup {
-                arena: arena.clone(),
+                arena: arena,
                 path: file2.clone(),
                 size: 10,
                 mtime: mtime.clone(),
@@ -2062,7 +2062,7 @@ mod tests {
         cache.update(
             peer1,
             Notification::Catchup {
-                arena: arena.clone(),
+                arena: arena,
                 path: file4.clone(),
                 size: 10,
                 mtime: mtime.clone(),
@@ -2072,14 +2072,14 @@ mod tests {
         cache.update(
             peer1,
             Notification::CatchupComplete {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
             },
         )?;
 
         // File1 should have been deleted, since it was only on peer1,
         assert!(matches!(
-            cache.lookup_path(&arena, &file1),
+            cache.lookup_path(arena, &file1),
             Err(StorageError::NotFound)
         ));
 
@@ -2105,7 +2105,7 @@ mod tests {
     #[test]
     fn open_file_creates_sparse_file() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(&arena)?;
+        let fixture = Fixture::setup_with_arena(arena)?;
         let acache = fixture.arena_cache()?;
         let file_path = Path::parse("foobar")?;
 
@@ -2116,7 +2116,7 @@ mod tests {
             let blob = acache.open_file(inode)?;
             assert_eq!(BlobId(1), blob.id());
 
-            let m = fixture.blob_path(&arena, blob.id()).metadata()?;
+            let m = fixture.blob_path(arena, blob.id()).metadata()?;
 
             // File should have the right size
             assert_eq!(10000, m.len());
@@ -2140,7 +2140,7 @@ mod tests {
 
     #[test]
     fn blob_deleted_on_file_overwrite() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(&test_arena())?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let cache = &fixture.cache;
         let acache = fixture.arena_cache()?;
         let arena = test_arena();
@@ -2154,13 +2154,13 @@ mod tests {
         let blob_id = acache.open_file(inode)?.id();
 
         // Verify the blob file was created
-        assert!(fixture.blob_file_exists(&arena, blob_id));
+        assert!(fixture.blob_file_exists(arena, blob_id));
 
         // Overwrite the file with a new version
         cache.update(
             test_peer(),
             Notification::Replace {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
                 path: file_path.clone(),
                 mtime: later_time(),
@@ -2171,14 +2171,14 @@ mod tests {
         )?;
 
         // Verify the blob file has been deleted
-        assert!(!fixture.blob_file_exists(&arena, blob_id));
+        assert!(!fixture.blob_file_exists(arena, blob_id));
 
         Ok(())
     }
 
     #[test]
     fn blob_deleted_on_file_removal() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(&test_arena())?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let acache = fixture.arena_cache()?;
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
@@ -2191,20 +2191,20 @@ mod tests {
         let blob_id = acache.open_file(inode)?.id();
 
         // Verify the blob file was created
-        assert!(fixture.blob_file_exists(&arena, blob_id));
+        assert!(fixture.blob_file_exists(arena, blob_id));
 
         // Remove the file
         fixture.remove_file(&file_path)?;
 
         // Verify the blob file has been deleted
-        assert!(!fixture.blob_file_exists(&arena, blob_id));
+        assert!(!fixture.blob_file_exists(arena, blob_id));
 
         Ok(())
     }
 
     #[test]
     fn blob_deleted_on_catchup_removal() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(&test_arena())?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let cache = &fixture.cache;
         let acache = fixture.arena_cache()?;
         let arena = test_arena();
@@ -2218,21 +2218,21 @@ mod tests {
         let blob_id = acache.open_file(inode)?.id();
 
         // Verify the blob file was created
-        assert!(fixture.blob_file_exists(&arena, blob_id));
+        assert!(fixture.blob_file_exists(arena, blob_id));
 
         // Do a catchup that doesn't include this file (simulating file removal)
-        cache.update(test_peer(), Notification::CatchupStart(arena.clone()))?;
+        cache.update(test_peer(), Notification::CatchupStart(arena))?;
         // Note: No Catchup notification for the file, so it will be deleted
         cache.update(
             test_peer(),
             Notification::CatchupComplete {
-                arena: arena.clone(),
+                arena: arena,
                 index: 0,
             },
         )?;
 
         // Verify the blob file has been deleted
-        assert!(!fixture.blob_file_exists(&arena, blob_id));
+        assert!(!fixture.blob_file_exists(arena, blob_id));
 
         Ok(())
     }
@@ -2240,7 +2240,7 @@ mod tests {
     #[test]
     fn update_local_availability() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(&arena)?;
+        let fixture = Fixture::setup_with_arena(arena)?;
         let acache = fixture.arena_cache()?;
         let file_path = Path::parse("file.txt")?;
 
@@ -2298,7 +2298,7 @@ mod tests {
     #[tokio::test]
     async fn read_blob_within_available_ranges() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(&arena)?;
+        let fixture = Fixture::setup_with_arena(arena)?;
         let acache = fixture.arena_cache()?;
         let file_path = Path::parse("test.txt")?;
 
@@ -2309,7 +2309,7 @@ mod tests {
         let blob_id = acache.open_file(inode)?.id();
 
         // Write some test data to the blob file
-        let blob_path = fixture.blob_path(&arena, blob_id);
+        let blob_path = fixture.blob_path(arena, blob_id);
         let test_data = b"Baa, baa, black sheep, have you any wool?";
         std::fs::write(&blob_path, test_data)?;
 
@@ -2335,7 +2335,7 @@ mod tests {
     #[tokio::test]
     async fn read_blob_after_seek_within_available_range() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(&arena)?;
+        let fixture = Fixture::setup_with_arena(arena)?;
         let acache = fixture.arena_cache()?;
         let file_path = Path::parse("test.txt")?;
         fixture.add_file(&file_path, 1000, &test_time())?;
@@ -2345,7 +2345,7 @@ mod tests {
         let blob_id = acache.open_file(inode)?.id();
 
         // Write test data to the blob file
-        let blob_path = fixture.blob_path(&arena, blob_id);
+        let blob_path = fixture.blob_path(arena, blob_id);
         let test_data = b"Baa, baa, black sheep, have you any wool?";
         std::fs::write(&blob_path, test_data)?;
 
@@ -2368,7 +2368,7 @@ mod tests {
     #[tokio::test]
     async fn read_blob_outside_available_ranges() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(&arena)?;
+        let fixture = Fixture::setup_with_arena(arena)?;
         let acache = fixture.arena_cache()?;
         let file_path = Path::parse("test.txt")?;
         fixture.add_file(&file_path, 1000, &test_time())?;
@@ -2378,7 +2378,7 @@ mod tests {
         let blob_id = acache.open_file(inode)?.id();
 
         // Write test data to the blob file
-        let blob_path = fixture.blob_path(&arena, blob_id);
+        let blob_path = fixture.blob_path(arena, blob_id);
         let test_data = b"baa, baa";
         std::fs::write(&blob_path, test_data)?;
         acache.extend_local_availability(

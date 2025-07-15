@@ -119,15 +119,15 @@ pub enum Notification {
 }
 
 impl Notification {
-    pub fn arena(&self) -> &Arena {
+    pub fn arena(&self) -> Arena {
         match self {
-            Notification::Add { arena, .. } => arena,
-            Notification::Replace { arena, .. } => arena,
-            Notification::Remove { arena, .. } => arena,
-            Notification::CatchupStart(arena) => arena,
-            Notification::Catchup { arena, .. } => arena,
-            Notification::CatchupComplete { arena, .. } => arena,
-            Notification::Connected { arena, .. } => arena,
+            Notification::Add { arena, .. } => *arena,
+            Notification::Replace { arena, .. } => *arena,
+            Notification::Remove { arena, .. } => *arena,
+            Notification::CatchupStart(arena) => *arena,
+            Notification::Catchup { arena, .. } => *arena,
+            Notification::CatchupComplete { arena, .. } => *arena,
+            Notification::Connected { arena, .. } => *arena,
         }
     }
     pub fn path(&self) -> Option<&Path> {

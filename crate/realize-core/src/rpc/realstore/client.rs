@@ -187,7 +187,7 @@ mod tests {
             let _ = env_logger::try_init();
 
             let tempdir = TempDir::new()?;
-            let storage = RealStore::single(&Arena::from("testdir"), tempdir.path());
+            let storage = RealStore::single(Arena::from("testdir"), tempdir.path());
             let resolver = RawPublicKeyResolver::from_private_key(testing::server_private_key())?;
             let mut verifier = PeerVerifier::new();
             verifier.add_peer(Peer::from("client"), testing::client_public_key());

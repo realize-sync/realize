@@ -37,7 +37,6 @@ impl RealWatcher {
         let (watch_tx, watch_rx) = mpsc::channel(100);
 
         let watcher = {
-            let arena = arena.clone();
             let root = root.clone();
             let watch_tx = watch_tx.clone();
             tokio::task::spawn_blocking(move || {
@@ -68,7 +67,6 @@ impl RealWatcher {
             let worker = Arc::clone(&worker);
             let watch_tx = watch_tx.clone();
             let shutdown_rx = shutdown_tx.subscribe();
-            let arena = arena.clone();
             async move {
                 if let Err(err) = worker
                     .catchup_removed_or_modified(watch_tx, shutdown_rx)

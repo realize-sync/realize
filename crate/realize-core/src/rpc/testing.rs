@@ -107,7 +107,7 @@ impl HouseholdFixture {
     pub fn arena_root(&self, peer: Peer) -> PathBuf {
         realize_storage::testing::arena_root(
             self.tempdir.child(peer.as_str()).path(),
-            &HouseholdFixture::test_arena(),
+            HouseholdFixture::test_arena(),
         )
     }
 
@@ -131,7 +131,7 @@ impl HouseholdFixture {
 
         let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
         let arena = HouseholdFixture::test_arena();
-        let arena_inode = cache.arena_root(&arena)?;
+        let arena_inode = cache.arena_root(arena)?;
         while cache.lookup(arena_inode, filename).await.is_err() {
             if let Some(delay) = retry.next() {
                 tokio::time::sleep(delay).await;

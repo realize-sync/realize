@@ -296,7 +296,7 @@ async fn subscribe_self(
 
     let goal_arenas = cache
         .arenas()
-        .filter(|a| peer_arenas.contains(*a))
+        .filter(|a| peer_arenas.contains(a))
         .map(|a| a.clone())
         .collect::<Vec<_>>();
     if goal_arenas.is_empty() {
@@ -322,7 +322,7 @@ async fn subscribe_self(
         async move {
             let mut map = HashMap::new();
             for arena in goal_arenas {
-                if let Some(progress) = cache.peer_progress(peer, &arena).await? {
+                if let Some(progress) = cache.peer_progress(peer, arena).await? {
                     map.insert(arena, progress);
                 }
             }
@@ -405,9 +405,8 @@ impl ConnectedPeerServer {
 
         if let Err(err) = tokio::spawn({
             let storage = self.storage.clone();
-            let arena = arena.clone();
             async move {
-                storage.subscribe(&arena, tx, progress).await?;
+                storage.subscribe(arena, tx, progress).await?;
 
                 Ok::<(), anyhow::Error>(())
             }
@@ -453,7 +452,7 @@ impl ConnectedPeerServer {
         let limit = req.get_limit();
         let cb = params.get_cb()?;
 
-        let read_result = self.read_all(&arena, &path, offset, limit, &cb).await;
+        let read_result = self.read_all(arena, &path, offset, limit, &cb).await;
         let mut request = cb.finish_request();
         let result = request.get().init_result();
         match read_result {
@@ -481,7 +480,7 @@ impl ConnectedPeerServer {
     /// some error while reading.
     async fn read_all(
         &self,
-        arena: &Arena,
+        arena: Arena,
         path: &Path,
         offset: u64,
         limit: u64,
@@ -707,7 +706,7 @@ async fn send_notifications(
                 hash,
             } => fill_add(
                 notif_builder.init_add(),
-                arena,
+                *arena,
                 *index,
                 path,
                 *size,
@@ -725,7 +724,7 @@ async fn send_notifications(
                 old_hash,
             } => fill_replace(
                 notif_builder.init_replace(),
-                arena,
+                *arena,
                 *index,
                 path,
                 *size,
@@ -739,7 +738,7 @@ async fn send_notifications(
                 index,
                 path,
                 old_hash,
-            } => fill_remove(notif_builder.init_remove(), arena, *index, path, old_hash),
+            } => fill_remove(notif_builder.init_remove(), *arena, *index, path, old_hash),
 
             Notification::Catchup {
                 arena,
@@ -749,7 +748,7 @@ async fn send_notifications(
                 hash,
             } => fill_catchup(
                 notif_builder.init_catchup(),
-                arena,
+                *arena,
                 path,
                 *size,
                 mtime,
@@ -786,7 +785,7 @@ fn fill_uuid(mut builder: super::store_capnp::uuid::Builder<'_>, uuid: &Uuid) {
 
 fn fill_add(
     mut builder: super::store_capnp::add::Builder<'_>,
-    arena: &Arena,
+    arena: Arena,
     index: u64,
     path: &realize_types::Path,
     size: u64,
@@ -803,7 +802,7 @@ fn fill_add(
 
 fn fill_replace(
     mut builder: super::store_capnp::replace::Builder<'_>,
-    arena: &Arena,
+    arena: Arena,
     index: u64,
     path: &realize_types::Path,
     size: u64,
@@ -822,7 +821,7 @@ fn fill_replace(
 
 fn fill_remove(
     mut builder: super::store_capnp::remove::Builder<'_>,
-    arena: &Arena,
+    arena: Arena,
     index: u64,
     path: &realize_types::Path,
     old_hash: &realize_types::Hash,
@@ -835,7 +834,7 @@ fn fill_remove(
 
 fn fill_catchup(
     mut builder: super::store_capnp::catchup::Builder<'_>,
-    arena: &Arena,
+    arena: Arena,
     path: &realize_types::Path,
     size: u64,
     mtime: &realize_types::UnixTime,

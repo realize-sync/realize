@@ -1,7 +1,7 @@
-use realize_types::{self, Arena, ByteRange, Delta, Hash, Signature};
 use crate::config::ArenaConfig;
 use crate::utils::hash;
 use fast_rsync::SignatureOptions;
+use realize_types::{self, Arena, ByteRange, Delta, Hash, Signature};
 use std::cmp::min;
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -65,7 +65,7 @@ impl RealStore {
         Self::new(
             arenas
                 .iter()
-                .map(|(arena, config)| (arena.clone(), config.path.to_path_buf())),
+                .map(|(arena, config)| (*arena, config.path.to_path_buf())),
         )
     }
 
@@ -80,8 +80,8 @@ impl RealStore {
     }
 
     /// Define a single local arena.
-    pub fn single(arena: &Arena, path: &path::Path) -> Self {
-        Self::new(iter::once((arena.clone(), path.to_path_buf())))
+    pub fn single(arena: Arena, path: &path::Path) -> Self {
+        Self::new(iter::once((arena, path.to_path_buf())))
     }
 
     /// Returns the arenas configured in this store.
@@ -92,7 +92,7 @@ impl RealStore {
     /// List files in a directory
     pub async fn list(
         &self,
-        arena: &Arena,
+        arena: Arena,
         options: &Options,
     ) -> Result<Vec<SyncedFile>, RealStoreError> {
         let resolver = self.path_resolver_from_opts(arena, options)?.clone();
@@ -122,7 +122,7 @@ impl RealStore {
     /// Send a byte range of a file.
     pub async fn send(
         &self,
-        arena: &Arena,
+        arena: Arena,
         relative_path: &realize_types::Path,
         range: &ByteRange,
         data: Vec<u8>,
@@ -141,7 +141,7 @@ impl RealStore {
     /// Data outside of the range [0, file_size) is returned filled with 0.
     pub async fn read(
         &self,
-        arena: &Arena,
+        arena: Arena,
         relative_path: &realize_types::Path,
         range: &ByteRange,
         options: &Options,
@@ -158,7 +158,7 @@ impl RealStore {
     /// Mark a partial file as complete
     pub async fn finish(
         &self,
-        arena: &Arena,
+        arena: Arena,
         relative_path: &realize_types::Path,
         options: &Options,
     ) -> Result<(), RealStoreError> {
@@ -183,7 +183,7 @@ impl RealStore {
     /// Compute a SHA-256 hash of the file at the given path (final or partial).
     pub async fn hash(
         &self,
-        arena: &Arena,
+        arena: Arena,
         relative_path: &realize_types::Path,
         range: &ByteRange,
         options: &Options,
@@ -197,7 +197,7 @@ impl RealStore {
     /// Delete the file at the given path (both partial and final forms).
     pub async fn delete(
         &self,
-        arena: &Arena,
+        arena: Arena,
         relative_path: &realize_types::Path,
         options: &Options,
     ) -> Result<(), RealStoreError> {
@@ -218,7 +218,7 @@ impl RealStore {
     /// Calculate a signature for the file at the given path and byte range.
     pub async fn calculate_signature(
         &self,
-        arena: &Arena,
+        arena: Arena,
         relative_path: &realize_types::Path,
         range: &ByteRange,
         options: &Options,
@@ -241,7 +241,7 @@ impl RealStore {
     /// Returns the delta and the hash of the data used to compute it.
     pub async fn diff(
         &self,
-        arena: &Arena,
+        arena: Arena,
         relative_path: &realize_types::Path,
         range: &ByteRange,
         signature: Signature,
@@ -268,7 +268,7 @@ impl RealStore {
     /// applying the patch, the data doesn't match the given hash.
     pub async fn apply_delta(
         &self,
-        arena: &Arena,
+        arena: Arena,
         relative_path: &realize_types::Path,
         range: &ByteRange,
         delta: Delta,
@@ -298,7 +298,7 @@ impl RealStore {
     /// Truncate file to the given size.
     pub async fn truncate(
         &self,
-        arena: &Arena,
+        arena: Arena,
         relative_path: &realize_types::Path,
         file_size: u64,
         options: &Options,
@@ -312,15 +312,15 @@ impl RealStore {
     }
 
     /// Builds a path resolver for the given arena.
-    fn path_resolver(&self, arena: &Arena, access: StorageAccess) -> Option<PathResolver> {
+    fn path_resolver(&self, arena: Arena, access: StorageAccess) -> Option<PathResolver> {
         self.map
-            .get(arena)
+            .get(&arena)
             .map(|p| PathResolver::new(p.clone(), access))
     }
 
     fn path_resolver_from_opts(
         &self,
-        arena: &Arena,
+        arena: Arena,
         opts: &Options,
     ) -> Result<PathResolver, RealStoreError> {
         self.path_resolver(
@@ -673,11 +673,11 @@ fn bad_path() -> RealStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use realize_types::Hash;
     use crate::utils::hash;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use assert_unordered::assert_eq_unordered;
+    use realize_types::Hash;
     use std::ffi::OsString;
     use std::io::Read as _;
     use std::path::PathBuf;
@@ -685,7 +685,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_and_final_paths() -> anyhow::Result<()> {
-        let arena = &Arena::from("test");
+        let arena = Arena::from("test");
         let resolver = RealStore::single(arena, path::Path::new("/doesnotexist/test"))
             .path_resolver(arena, StorageAccess::Read)
             .ok_or(not_found())?;
@@ -715,7 +715,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_in_readonly_arena() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        let arena = &Arena::from("test");
+        let arena = Arena::from("test");
         let resolver = RealStore::single(arena, temp.path())
             .path_resolver(arena, StorageAccess::Read)
             .ok_or(not_found())?;
@@ -774,7 +774,7 @@ mod tests {
     #[tokio::test]
     async fn ignore_model_path_with_partial_name_in_readonly_area() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        let arena = &Arena::from("test");
+        let arena = Arena::from("test");
         let resolver = RealStore::single(arena, temp.path())
             .path_resolver(arena, StorageAccess::Read)
             .ok_or(not_found())?;
@@ -809,7 +809,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_in_writable_arena() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        let arena = &Arena::from("test");
+        let arena = Arena::from("test");
         let resolver = RealStore::single(arena, temp.path())
             .path_resolver(arena, StorageAccess::ReadWrite)
             .ok_or(not_found())?;
@@ -874,7 +874,7 @@ mod tests {
     #[tokio::test]
     async fn ignore_model_path_with_partial_name_in_writable_arena() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        let arena = &Arena::from("test");
+        let arena = Arena::from("test");
         let resolver = RealStore::single(arena, temp.path())
             .path_resolver(arena, StorageAccess::ReadWrite)
             .ok_or(not_found())?;
@@ -909,7 +909,7 @@ mod tests {
     #[tokio::test]
     async fn reverse_in_readonly_arena() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        let arena = &Arena::from("test");
+        let arena = Arena::from("test");
         let storage = RealStore::single(arena, temp.path())
             .path_resolver(arena, StorageAccess::Read)
             .ok_or(not_found())?;
@@ -932,7 +932,7 @@ mod tests {
     #[tokio::test]
     async fn reverse_in_writable_arena() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        let arena = &Arena::from("test");
+        let arena = Arena::from("test");
         let storage = RealStore::single(arena, temp.path())
             .path_resolver(arena, StorageAccess::ReadWrite)
             .ok_or(not_found())?;
@@ -991,13 +991,13 @@ mod tests {
         let tempdir = TempDir::new()?;
         let arena = Arena::from("testdir");
 
-        Ok((RealStore::single(&arena, tempdir.path()), tempdir, arena))
+        Ok((RealStore::single(arena, tempdir.path()), tempdir, arena))
     }
 
     #[tokio::test]
     async fn list_empty() -> anyhow::Result<()> {
         let (store, _temp, arena) = setup_store()?;
-        let files = store.list(&arena, &Options::default()).await?;
+        let files = store.list(arena, &Options::default()).await?;
         assert!(files.is_empty());
 
         Ok(())
@@ -1018,7 +1018,7 @@ mod tests {
         let bar2 = temp.child("subdir/.bar2.txt.part");
         bar2.write_str("partial")?;
 
-        let files = store.list(&arena, &Options::default()).await?;
+        let files = store.list(arena, &Options::default()).await?;
         assert_eq_unordered!(
             files,
             vec![
@@ -1055,7 +1055,7 @@ mod tests {
         let data1 = b"fghij".to_vec();
         store
             .send(
-                &arena,
+                arena,
                 &fpath.path,
                 &ByteRange { start: 5, end: 10 },
                 data1.clone(),
@@ -1071,7 +1071,7 @@ mod tests {
         let data2 = b"abcde".to_vec();
         store
             .send(
-                &arena,
+                arena,
                 &fpath.path,
                 &ByteRange { start: 0, end: 5 },
                 data2.clone(),
@@ -1093,7 +1093,7 @@ mod tests {
 
         let data = store
             .read(
-                &arena,
+                arena,
                 &fpath.path,
                 &ByteRange { start: 5, end: 10 },
                 &Options::default(),
@@ -1103,7 +1103,7 @@ mod tests {
 
         let data = store
             .read(
-                &arena,
+                arena,
                 &fpath.path,
                 &ByteRange { start: 0, end: 5 },
                 &Options::default(),
@@ -1113,7 +1113,7 @@ mod tests {
 
         let result = store
             .read(
-                &arena,
+                arena,
                 &fpath.path,
                 &ByteRange { start: 0, end: 15 },
                 &Options::default(),
@@ -1129,11 +1129,14 @@ mod tests {
     async fn finish_partial() -> anyhow::Result<()> {
         let (store, temp, arena) = setup_store()?;
 
-        let fpath = LogicalPath::new(temp.path(), &realize_types::Path::parse("finish_partial.txt")?);
+        let fpath = LogicalPath::new(
+            temp.path(),
+            &realize_types::Path::parse("finish_partial.txt")?,
+        );
         fs::write(fpath.partial_path(), "abcde")?;
 
         store
-            .finish(&arena, &fpath.path, &Options::default())
+            .finish(arena, &fpath.path, &Options::default())
             .await?;
 
         assert!(fpath.final_path().exists());
@@ -1147,11 +1150,14 @@ mod tests {
     async fn finish_final() -> anyhow::Result<()> {
         let (store, temp, arena) = setup_store()?;
 
-        let fpath = LogicalPath::new(temp.path(), &realize_types::Path::parse("finish_partial.txt")?);
+        let fpath = LogicalPath::new(
+            temp.path(),
+            &realize_types::Path::parse("finish_partial.txt")?,
+        );
         fs::write(fpath.final_path(), "abcde")?;
 
         store
-            .finish(&arena, &fpath.path, &Options::default())
+            .finish(arena, &fpath.path, &Options::default())
             .await?;
 
         assert!(fpath.final_path().exists());
@@ -1167,7 +1173,7 @@ mod tests {
         let fpath = LogicalPath::new(temp.path(), &realize_types::Path::parse("truncate.txt")?);
         std::fs::write(fpath.partial_path(), b"abcdefghij")?;
         store
-            .truncate(&arena, &fpath.path, 7, &Options::default())
+            .truncate(arena, &fpath.path, 7, &Options::default())
             .await?;
         let content = std::fs::read_to_string(fpath.partial_path())?;
         assert_eq!(content, "abcdefg");
@@ -1182,7 +1188,7 @@ mod tests {
         std::fs::write(fpath.final_path(), content)?;
         let hash = store
             .hash(
-                &arena,
+                arena,
                 &realize_types::Path::parse("foo.txt")?,
                 &ByteRange {
                     start: 0,
@@ -1200,7 +1206,7 @@ mod tests {
         std::fs::write(fpath2.partial_path(), content2)?;
         let hash2 = store
             .hash(
-                &arena,
+                arena,
                 &realize_types::Path::parse("bar.txt")?,
                 &ByteRange {
                     start: 0,
@@ -1222,7 +1228,7 @@ mod tests {
         std::fs::write(fpath.final_path(), content)?;
         let hash = store
             .hash(
-                &arena,
+                arena,
                 &realize_types::Path::parse("foo.txt")?,
                 &ByteRange {
                     start: 100,
@@ -1244,7 +1250,7 @@ mod tests {
         std::fs::write(fpath.final_path(), content)?;
         let hash = store
             .hash(
-                &arena,
+                arena,
                 &realize_types::Path::parse("foo.txt")?,
                 &ByteRange { start: 0, end: 200 },
                 &Options::default(),
@@ -1264,13 +1270,21 @@ mod tests {
         assert!(fpath.final_path().exists());
         assert!(fpath.partial_path().exists());
         store
-            .delete(&arena, &realize_types::Path::parse("foo.txt")?, &Options::default())
+            .delete(
+                arena,
+                &realize_types::Path::parse("foo.txt")?,
+                &Options::default(),
+            )
             .await?;
         assert!(!fpath.final_path().exists());
         assert!(!fpath.partial_path().exists());
         // Should succeed if called again (idempotent)
         store
-            .delete(&arena, &realize_types::Path::parse("foo.txt")?, &Options::default())
+            .delete(
+                arena,
+                &realize_types::Path::parse("foo.txt")?,
+                &Options::default(),
+            )
             .await?;
         Ok(())
     }
@@ -1285,7 +1299,7 @@ mod tests {
         // Calculate signature for the whole file
         let sig = store
             .calculate_signature(
-                &arena,
+                arena,
                 &file_path.clone(),
                 &ByteRange {
                     start: 0,
@@ -1302,7 +1316,7 @@ mod tests {
         // Diff: get delta from old signature to new content
         let delta = store
             .diff(
-                &arena,
+                arena,
                 &file_path,
                 &ByteRange {
                     start: 0,
@@ -1318,7 +1332,7 @@ mod tests {
         temp.child(".foo.txt.part").write_binary(file_content)?;
         let res = store
             .apply_delta(
-                &arena,
+                arena,
                 &file_path,
                 &ByteRange {
                     start: 0,
@@ -1343,7 +1357,7 @@ mod tests {
         // Nonexistent file
         let result = server
             .calculate_signature(
-                &arena,
+                arena,
                 &realize_types::Path::parse("notfound.txt")?,
                 &ByteRange { start: 0, end: 10 },
                 &Options::default(),
@@ -1362,7 +1376,7 @@ mod tests {
         // Try to apply a bogus delta
         let result = store
             .apply_delta(
-                &arena,
+                arena,
                 &file_path,
                 &ByteRange { start: 0, end: 3 },
                 realize_types::Delta(vec![1, 2, 3]),
@@ -1385,7 +1399,7 @@ mod tests {
         // Default: partial preferred
         let files = store
             .list(
-                &arena,
+                arena,
                 &Options {
                     ignore_partial: false,
                 },
@@ -1395,7 +1409,7 @@ mod tests {
         // With ignore_partial: final preferred
         let files = store
             .list(
-                &arena,
+                arena,
                 &Options {
                     ignore_partial: true,
                 },
@@ -1412,7 +1426,7 @@ mod tests {
         // Default: return partial
         let files = store
             .list(
-                &arena,
+                arena,
                 &Options {
                     ignore_partial: false,
                 },
@@ -1422,7 +1436,7 @@ mod tests {
         // With ignore_partial: don't return partial
         let files = store
             .list(
-                &arena,
+                arena,
                 &Options {
                     ignore_partial: true,
                 },
@@ -1440,7 +1454,7 @@ mod tests {
         // Default: partial preferred
         let data = store
             .read(
-                &arena,
+                arena,
                 &realize_types::Path::parse("foo.txt")?,
                 &ByteRange { start: 0, end: 7 },
                 &Options {
@@ -1452,7 +1466,7 @@ mod tests {
         // With ignore_partial: final preferred
         let data = store
             .read(
-                &arena,
+                arena,
                 &realize_types::Path::parse("foo.txt")?,
                 &ByteRange { start: 0, end: 5 },
                 &Options {
@@ -1474,9 +1488,7 @@ mod tests {
         let logical = LogicalPath::new(temp.path(), &file_path);
         std::fs::write(logical.final_path(), b"data")?;
         // Delete the file
-        store
-            .delete(&arena, &file_path, &Options::default())
-            .await?;
+        store.delete(arena, &file_path, &Options::default()).await?;
         // All parent dirs except the root should be deleted
         assert!(!logical.final_path().exists());
         assert!(!temp.child("a/b/c").exists());
@@ -1499,9 +1511,7 @@ mod tests {
         std::fs::write(logical.final_path(), b"data")?;
         std::fs::write(keep_path.path(), b"keep")?;
         // Delete the file
-        store
-            .delete(&arena, &file_path, &Options::default())
-            .await?;
+        store.delete(arena, &file_path, &Options::default()).await?;
         // Only the file should be deleted, parent dirs should remain
         assert!(!logical.final_path().exists());
         assert!(temp.child("a/b/c").exists());

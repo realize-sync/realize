@@ -4,19 +4,19 @@
 //! file operations, and in-process server/client utilities. It is robust to interruptions
 //! and supports secure, restartable sync.
 
-use realize_types;
-use realize_types::{Arena, ByteRange, Hash};
-use realize_network::Server;
 use crate::rpc::realstore::metrics::{MetricsRealizeClient, MetricsRealizeServer};
 use crate::rpc::realstore::{
     Config, RealStoreService, RealStoreServiceClient, RealStoreServiceRequest,
     RealStoreServiceResponse,
 };
-use realize_storage::RealStoreOptions;
-use realize_storage::{RealStore, RealStoreError, SyncedFile};
 use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
 use futures::StreamExt;
+use realize_network::Server;
+use realize_storage::RealStoreOptions;
+use realize_storage::{RealStore, RealStoreError, SyncedFile};
+use realize_types;
+use realize_types::{Arena, ByteRange, Hash};
 use tarpc::client::RpcError;
 use tarpc::client::stub::Stub;
 use tarpc::context;
@@ -113,7 +113,7 @@ impl RealStoreService for RealStoreServer {
         arena: Arena,
         options: RealStoreOptions,
     ) -> Result<Vec<SyncedFile>, RealStoreError> {
-        self.store.list(&arena, &options).await
+        self.store.list(arena, &options).await
     }
 
     async fn read(
@@ -125,7 +125,7 @@ impl RealStoreService for RealStoreServer {
         options: RealStoreOptions,
     ) -> Result<Vec<u8>, RealStoreError> {
         self.store
-            .read(&arena, &relative_path, &range, &options)
+            .read(arena, &relative_path, &range, &options)
             .await
     }
 
@@ -139,7 +139,7 @@ impl RealStoreService for RealStoreServer {
         options: RealStoreOptions,
     ) -> Result<(), RealStoreError> {
         self.store
-            .send(&arena, &relative_path, &range, data, &options)
+            .send(arena, &relative_path, &range, data, &options)
             .await
     }
 
@@ -150,7 +150,7 @@ impl RealStoreService for RealStoreServer {
         relative_path: realize_types::Path,
         options: RealStoreOptions,
     ) -> Result<(), RealStoreError> {
-        self.store.finish(&arena, &relative_path, &options).await
+        self.store.finish(arena, &relative_path, &options).await
     }
 
     async fn hash(
@@ -162,7 +162,7 @@ impl RealStoreService for RealStoreServer {
         options: RealStoreOptions,
     ) -> Result<Hash, RealStoreError> {
         self.store
-            .hash(&arena, &relative_path, &range, &options)
+            .hash(arena, &relative_path, &range, &options)
             .await
     }
 
@@ -173,7 +173,7 @@ impl RealStoreService for RealStoreServer {
         relative_path: realize_types::Path,
         options: RealStoreOptions,
     ) -> Result<(), RealStoreError> {
-        self.store.delete(&arena, &relative_path, &options).await
+        self.store.delete(arena, &relative_path, &options).await
     }
 
     async fn calculate_signature(
@@ -185,7 +185,7 @@ impl RealStoreService for RealStoreServer {
         options: RealStoreOptions,
     ) -> Result<realize_types::Signature, RealStoreError> {
         self.store
-            .calculate_signature(&arena, &relative_path, &range, &options)
+            .calculate_signature(arena, &relative_path, &range, &options)
             .await
     }
 
@@ -199,7 +199,7 @@ impl RealStoreService for RealStoreServer {
         options: RealStoreOptions,
     ) -> Result<(realize_types::Delta, Hash), RealStoreError> {
         self.store
-            .diff(&arena, &relative_path, &range, signature, &options)
+            .diff(arena, &relative_path, &range, signature, &options)
             .await
     }
 
@@ -214,7 +214,7 @@ impl RealStoreService for RealStoreServer {
         options: RealStoreOptions,
     ) -> Result<(), RealStoreError> {
         self.store
-            .apply_delta(&arena, &relative_path, &range, delta, &hash, &options)
+            .apply_delta(arena, &relative_path, &range, delta, &hash, &options)
             .await
     }
 
@@ -227,7 +227,7 @@ impl RealStoreService for RealStoreServer {
         options: RealStoreOptions,
     ) -> Result<(), RealStoreError> {
         self.store
-            .truncate(&arena, &relative_path, file_size, &options)
+            .truncate(arena, &relative_path, file_size, &options)
             .await
     }
 
@@ -262,7 +262,7 @@ mod tests {
     async fn tarpc_rpc_inprocess() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let client =
-            create_inprocess_client(RealStore::single(&Arena::from("testdir"), temp.path()));
+            create_inprocess_client(RealStore::single(Arena::from("testdir"), temp.path()));
         let list = client
             .list(
                 tarpc::context::current(),
@@ -278,7 +278,7 @@ mod tests {
     #[tokio::test]
     async fn configure_noop_returns_none() {
         let server = RealStoreServer::new(RealStore::single(
-            &Arena::from("testdir"),
+            Arena::from("testdir"),
             &PathBuf::from("/tmp/testdir"),
         ));
         let returned = server
@@ -296,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn configure_limited_sets_and_returns_limit() {
-        let dirs = RealStore::single(&Arena::from("testdir"), &PathBuf::from("/tmp/testdir"));
+        let dirs = RealStore::single(Arena::from("testdir"), &PathBuf::from("/tmp/testdir"));
         let limiter = Limiter::<StandardClock>::new(f64::INFINITY);
         let server = RealStoreServer::new_limited(dirs, limiter.clone());
         let limit = 55555u64;
