@@ -2,11 +2,11 @@
 //!
 //! See `spec/unreal.md` for details.
 
-use super::arena_cache::{self, ArenaCache, Blob, CURRENT_INODE_RANGE_TABLE, DIRECTORY_TABLE};
+use super::arena_cache::{self, ArenaCache, CURRENT_INODE_RANGE_TABLE, DIRECTORY_TABLE};
 use super::types::{FileAvailability, FileMetadata, InodeAssignment, ReadDirEntry};
 use crate::config::StorageConfig;
 use crate::real::notifier::{Notification, Progress};
-use crate::{Inode, StorageError};
+use crate::{Blob, Inode, StorageError};
 use bimap::BiMap;
 use realize_types::{Arena, Path, Peer, UnixTime};
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};

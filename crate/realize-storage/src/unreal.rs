@@ -1,4 +1,5 @@
 pub mod arena_cache;
+pub mod blob;
 pub mod cache;
 pub mod types;
 #[allow(dead_code)]
