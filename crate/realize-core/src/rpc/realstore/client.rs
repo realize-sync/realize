@@ -1,6 +1,3 @@
-use realize_types::Peer;
-use realize_network::Networking;
-use realize_network::reconnect::{Connect, Reconnect};
 use crate::rpc::realstore;
 use crate::rpc::realstore::metrics::MetricsRealizeClient;
 use crate::rpc::realstore::{
@@ -8,6 +5,9 @@ use crate::rpc::realstore::{
 };
 use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
+use realize_network::Networking;
+use realize_network::reconnect::{Connect, Reconnect};
+use realize_types::Peer;
 use std::sync::Arc;
 use std::time::Duration;
 use tarpc::client::RpcError;
@@ -38,7 +38,7 @@ pub enum ClientConnectionState {
 /// Create a [RealStoreServiceClient] connected to the given TCP address.
 pub async fn connect(
     networking: &Networking,
-    peer: &Peer,
+    peer: Peer,
     options: ClientOptions,
 ) -> anyhow::Result<RealStoreClient> {
     let stub = RealizeStub::new(networking, peer, options).await?;
@@ -66,7 +66,7 @@ impl Connect<tarpc::client::Channel<Arc<RealStoreServiceRequest>, RealStoreServi
         }
         let transport = self
             .networking
-            .connect(&self.peer, realstore::TAG, self.options.limiter.clone())
+            .connect(self.peer, realstore::TAG, self.options.limiter.clone())
             .await?;
         let channel = tarpc::client::new(Default::default(), transport).spawn();
 
@@ -102,7 +102,7 @@ pub struct RealizeStub {
 impl RealizeStub {
     async fn new(
         networking: &Networking,
-        peer: &Peer,
+        peer: Peer,
         options: ClientOptions,
     ) -> anyhow::Result<Self> {
         let retry_strategy =
@@ -115,7 +115,7 @@ impl RealizeStub {
         }
         let connect = TcpConnect {
             networking: networking.clone(),
-            peer: peer.clone(),
+            peer,
             options,
             config: Arc::clone(&config),
         };
@@ -160,14 +160,14 @@ impl Stub for RealizeStub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use realize_types::{Arena, Peer};
-    use realize_network::hostport::HostPort;
     use crate::rpc::realstore::Config;
+    use crate::utils::async_utils::AbortOnDrop;
+    use assert_fs::TempDir;
+    use realize_network::hostport::HostPort;
     use realize_network::security::{PeerVerifier, RawPublicKeyResolver};
     use realize_network::{Server, testing};
     use realize_storage::{RealStore, RealStoreOptions};
-    use crate::utils::async_utils::AbortOnDrop;
-    use assert_fs::TempDir;
+    use realize_types::{Arena, Peer};
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicU32, Ordering};
     use tarpc::context;
@@ -190,8 +190,8 @@ mod tests {
             let storage = RealStore::single(&Arena::from("testdir"), tempdir.path());
             let resolver = RawPublicKeyResolver::from_private_key(testing::server_private_key())?;
             let mut verifier = PeerVerifier::new();
-            verifier.add_peer(&Peer::from("client"), testing::client_public_key());
-            verifier.add_peer(&Peer::from("server"), testing::server_public_key());
+            verifier.add_peer(Peer::from("client"), testing::client_public_key());
+            verifier.add_peer(Peer::from("server"), testing::server_public_key());
             let verifier = Arc::new(verifier);
 
             Ok(Self {
@@ -219,20 +219,12 @@ mod tests {
             Ok(addr)
         }
 
-        fn client_networking(&self, peer: &Peer, addr: SocketAddr) -> anyhow::Result<Networking> {
-            self.client_networking_with_verifier(peer, addr, Arc::clone(&self.verifier))
-        }
-
-        fn client_networking_with_verifier(
-            &self,
-            peer: &Peer,
-            addr: SocketAddr,
-            verifier: Arc<PeerVerifier>,
-        ) -> anyhow::Result<Networking> {
+        fn client_networking(&self, peer: Peer, addr: SocketAddr) -> anyhow::Result<Networking> {
+            let addr_str = addr.to_string();
             Ok(Networking::new(
-                vec![(peer, addr.to_string().as_ref())],
+                vec![(peer, addr_str.leak() as &'static str)],
                 RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
-                verifier,
+                Arc::clone(&self.verifier),
             ))
         }
     }
@@ -244,8 +236,8 @@ mod tests {
 
         let options = ClientOptions::default();
         let peer = Peer::from("server");
-        let networking = fixture.client_networking(&peer, addr)?;
-        let client = connect(&networking, &peer, options).await?;
+        let networking = fixture.client_networking(peer, addr)?;
+        let client = connect(&networking, peer, options).await?;
         let list = client
             .list(
                 context::current(),
@@ -264,8 +256,8 @@ mod tests {
 
         let options = ClientOptions::default();
         let peer = Peer::from("server");
-        let networking = fixture.client_networking(&peer, addr)?;
-        let client = connect(&networking, &peer, options).await?;
+        let networking = fixture.client_networking(peer, addr)?;
+        let client = connect(&networking, peer, options).await?;
         let limit = 12345u64;
         let config = client
             .configure(
@@ -289,9 +281,9 @@ mod tests {
         let addr = fixture.start_server().await?;
 
         let peer = Peer::from("server");
-        let networking = fixture.client_networking(&peer, addr)?;
-        let client1 = connect(&networking, &peer, ClientOptions::default()).await?;
-        let client2 = connect(&networking, &peer, ClientOptions::default()).await?;
+        let networking = fixture.client_networking(peer, addr)?;
+        let client1 = connect(&networking, peer, ClientOptions::default()).await?;
+        let client2 = connect(&networking, peer, ClientOptions::default()).await?;
         let limit = 54321u64;
         let config1 = client1
             .configure(
@@ -320,8 +312,8 @@ mod tests {
             proxy_tcp(&addr, shutdown.clone(), connection_count.clone()).await?;
 
         let peer = Peer::from("server");
-        let networking = fixture.client_networking(&peer, proxy_addr)?;
-        let client = connect(&networking, &peer, ClientOptions::default()).await?;
+        let networking = fixture.client_networking(peer, proxy_addr)?;
+        let client = connect(&networking, peer, ClientOptions::default()).await?;
 
         client
             .list(
@@ -354,8 +346,8 @@ mod tests {
             proxy_tcp(&addr, shutdown.clone(), connection_count.clone()).await?;
 
         let peer = Peer::from("server");
-        let networking = fixture.client_networking(&peer, proxy_addr)?;
-        let client = connect(&networking, &peer, ClientOptions::default()).await?;
+        let networking = fixture.client_networking(peer, proxy_addr)?;
+        let client = connect(&networking, peer, ClientOptions::default()).await?;
 
         let config = Config {
             write_limit: Some(1024),
@@ -407,12 +399,12 @@ mod tests {
         });
 
         let peer = Peer::from("server");
-        let networking = fixture.client_networking(&peer, proxy_addr)?;
+        let networking = fixture.client_networking(peer, proxy_addr)?;
         let options = ClientOptions {
             connection_events: Some(conn_tx),
             ..ClientOptions::default()
         };
-        let client = connect(&networking, &peer, options).await?;
+        let client = connect(&networking, peer, options).await?;
 
         client
             .list(

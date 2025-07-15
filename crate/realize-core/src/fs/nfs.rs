@@ -363,7 +363,7 @@ mod tests {
             .await?
             .run(async |household_a, _household_b| {
                 let a = HouseholdFixture::a();
-                let cache = fixture.cache(&a)?;
+                let cache = fixture.cache(a)?;
                 let fs = UnrealFs::new(cache.clone(), Downloader::new(household_a, cache.clone()));
 
                 assert_eq!(UnrealCacheAsync::ROOT_DIR.as_u64(), fs.root_dir());
@@ -393,7 +393,7 @@ mod tests {
             .await?
             .run(async |household_a, _household_b| {
                 let a = HouseholdFixture::a();
-                let cache = fixture.cache(&a)?;
+                let cache = fixture.cache(a)?;
                 let fs = UnrealFs::new(cache.clone(), Downloader::new(household_a, cache.clone()));
 
                 let arena = HouseholdFixture::test_arena();
@@ -426,13 +426,13 @@ mod tests {
             .run(async |household_a, _household_b| {
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
-                let cache = fixture.cache(&a)?;
+                let cache = fixture.cache(a)?;
                 let fs = UnrealFs::new(cache.clone(), Downloader::new(household_a, cache.clone()));
 
                 let mtime = UnixTime::now();
                 cache
                     .update(
-                        &b,
+                        b,
                         Notification::Add {
                             index: 1,
                             arena: HouseholdFixture::test_arena(),
@@ -483,16 +483,16 @@ mod tests {
             .run(async |household_a, _household_b| {
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
-                let cache = fixture.cache(&a)?;
+                let cache = fixture.cache(a)?;
                 let fs = UnrealFs::new(cache.clone(), Downloader::new(household_a, cache.clone()));
 
                 // Create a file in peer B's arena
-                let b_dir = fixture.arena_root(&b);
+                let b_dir = fixture.arena_root(b);
                 let file = b_dir.join("hello.txt");
                 fs::write(&file, "world").await?;
 
                 // Wait for the file to appear in peer A's cache
-                fixture.wait_for_file_in_cache(&a, "hello.txt").await?;
+                fixture.wait_for_file_in_cache(a, "hello.txt").await?;
 
                 let arena_root = cache
                     .arena_root(&HouseholdFixture::test_arena())

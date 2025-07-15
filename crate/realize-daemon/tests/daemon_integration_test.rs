@@ -158,7 +158,7 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
     peers.get_mut(&a).expect("PeerConfig of a").address = Some(format!("127.0.0.1:{portstr}"));
 
     let networking = Networking::from_config(&peers, &fixture.resources.join("b.key"))?;
-    let client = realstore::client::connect(&networking, &a, ClientOptions::default()).await?;
+    let client = realstore::client::connect(&networking, a, ClientOptions::default()).await?;
     let files = client
         .list(
             context::current(),

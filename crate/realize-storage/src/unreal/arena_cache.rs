@@ -181,7 +181,7 @@ impl ArenaCache {
         do_readdir(&txn, inode)
     }
 
-    pub(crate) fn peer_progress(&self, peer: &Peer) -> Result<Option<Progress>, StorageError> {
+    pub(crate) fn peer_progress(&self, peer: Peer) -> Result<Option<Progress>, StorageError> {
         let txn = self.db.begin_read()?;
 
         do_peer_progress(&txn, peer)
@@ -189,7 +189,7 @@ impl ArenaCache {
 
     pub(crate) fn update(
         &self,
-        peer: &Peer,
+        peer: Peer,
         notification: Notification,
         alloc_inode_range: impl Fn() -> Result<(Inode, Inode), StorageError>,
     ) -> Result<(), StorageError> {
@@ -440,7 +440,7 @@ impl ArenaCache {
         &self,
         file_table: &mut redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
         file_inode: Inode,
-        peer: Option<&Peer>,
+        peer: Option<Peer>,
         entry: &FileTableEntry,
         blob_table: Option<&mut redb::Table<'_, BlobId, Holder<BlobTableEntry>>>,
     ) -> Result<(), StorageError> {
@@ -472,7 +472,7 @@ impl ArenaCache {
         dir_table: &mut redb::Table<'_, (Inode, &str), Holder<DirTableEntry>>,
         parent_inode: Inode,
         inode: Inode,
-        peer: &Peer,
+        peer: Peer,
         old_hash: Option<Hash>,
         blob_table: Option<&mut redb::Table<'_, BlobId, Holder<BlobTableEntry>>>,
     ) -> Result<(), StorageError> {
@@ -569,7 +569,7 @@ impl ArenaCache {
     fn do_unlink(
         &self,
         txn: &WriteTransaction,
-        peer: &Peer,
+        peer: Peer,
         arena_root: Inode,
         path: &Path,
         old_hash: Hash,
@@ -607,7 +607,7 @@ impl ArenaCache {
     fn do_delete_marked_files(
         &self,
         txn: &WriteTransaction,
-        peer: &Peer,
+        peer: Peer,
     ) -> Result<(), StorageError> {
         let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
         let mut file_table = txn.open_table(FILE_TABLE)?;
@@ -705,7 +705,7 @@ pub(crate) fn do_lookup(
 
 fn do_update_last_seen_notification(
     txn: &WriteTransaction,
-    peer: &Peer,
+    peer: Peer,
     index: u64,
 ) -> Result<(), StorageError> {
     let mut notification_table = txn.open_table(NOTIFICATION_TABLE)?;
@@ -714,7 +714,7 @@ fn do_update_last_seen_notification(
     Ok(())
 }
 
-fn do_peer_progress(txn: &ReadTransaction, peer: &Peer) -> Result<Option<Progress>, StorageError> {
+fn do_peer_progress(txn: &ReadTransaction, peer: Peer) -> Result<Option<Progress>, StorageError> {
     let key = peer.as_str();
 
     let peer_table = txn.open_table(PEER_TABLE)?;
@@ -758,7 +758,7 @@ pub(crate) fn do_dir_mtime(
 fn get_file_entry(
     file_table: &redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
     inode: Inode,
-    peer: Option<&Peer>,
+    peer: Option<Peer>,
 ) -> Result<Option<FileTableEntry>, StorageError> {
     match file_table.get((inode, peer.map(|p| p.as_str()).unwrap_or("")))? {
         None => Ok(None),
@@ -1015,7 +1015,7 @@ pub(crate) fn alloc_inode(
     }
 }
 
-fn do_mark_peer_files(txn: &WriteTransaction, peer: &Peer) -> Result<(), StorageError> {
+fn do_mark_peer_files(txn: &WriteTransaction, peer: Peer) -> Result<(), StorageError> {
     let file_table = txn.open_table(FILE_TABLE)?;
     let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
     let peer_str = peer.as_str();
@@ -1035,7 +1035,7 @@ fn do_mark_peer_files(txn: &WriteTransaction, peer: &Peer) -> Result<(), Storage
 
 fn do_unmark_peer_file(
     txn: &WriteTransaction,
-    peer: &Peer,
+    peer: Peer,
     inode: Inode,
 ) -> Result<(), StorageError> {
     let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
@@ -1278,7 +1278,7 @@ mod tests {
 
         fn add_file(&self, path: &Path, size: u64, mtime: &UnixTime) -> anyhow::Result<()> {
             self.cache.update(
-                &test_peer(),
+                test_peer(),
                 Notification::Add {
                     arena: test_arena(),
                     index: 1,
@@ -1294,7 +1294,7 @@ mod tests {
 
         fn remove_file(&self, path: &Path) -> anyhow::Result<()> {
             self.cache.update(
-                &test_peer(),
+                test_peer(),
                 Notification::Remove {
                     arena: test_arena(),
                     index: 1,
@@ -1365,7 +1365,7 @@ mod tests {
         let file_path = Path::parse("file.txt")?;
 
         cache.update(
-            &peer,
+            peer,
             Notification::Add {
                 arena: arena.clone(),
                 index: 0,
@@ -1376,7 +1376,7 @@ mod tests {
             },
         )?;
         cache.update(
-            &peer,
+            peer,
             Notification::Replace {
                 arena: arena.clone(),
                 index: 0,
@@ -1421,7 +1421,7 @@ mod tests {
         let peer = test_peer();
 
         cache.update(
-            &peer,
+            peer,
             Notification::Add {
                 arena: test_arena(),
                 index: 0,
@@ -1432,7 +1432,7 @@ mod tests {
             },
         )?;
         cache.update(
-            &peer,
+            peer,
             Notification::Replace {
                 arena: test_arena(),
                 index: 0,
@@ -1497,7 +1497,7 @@ mod tests {
 
         fixture.add_file(&file_path, 100, &mtime)?;
         cache.update(
-            &test_peer(),
+            test_peer(),
             Notification::Remove {
                 arena: arena.clone(),
                 index: 1,
@@ -1633,7 +1633,7 @@ mod tests {
         let file_path = Path::parse("file.txt")?;
 
         cache.update(
-            &peer1,
+            peer1,
             Notification::Add {
                 arena: arena.clone(),
                 index: 0,
@@ -1644,7 +1644,7 @@ mod tests {
             },
         )?;
         cache.update(
-            &peer2,
+            peer2,
             Notification::Add {
                 arena: arena.clone(),
                 index: 0,
@@ -1655,7 +1655,7 @@ mod tests {
             },
         )?;
         cache.update(
-            &peer2,
+            peer2,
             Notification::Replace {
                 arena: arena.clone(),
                 index: 0,
@@ -1688,7 +1688,7 @@ mod tests {
         let path = Path::parse("file.txt")?;
 
         cache.update(
-            &a,
+            a,
             Notification::Add {
                 arena: arena.clone(),
                 index: 0,
@@ -1699,7 +1699,7 @@ mod tests {
             },
         )?;
         cache.update(
-            &b,
+            b,
             Notification::Add {
                 arena: arena.clone(),
                 index: 0,
@@ -1710,7 +1710,7 @@ mod tests {
             },
         )?;
         cache.update(
-            &c,
+            c,
             Notification::Add {
                 arena: arena.clone(),
                 index: 0,
@@ -1735,7 +1735,7 @@ mod tests {
             },
             avail.metadata
         );
-        assert_unordered::assert_eq_unordered!(vec![a.clone(), b.clone()], avail.peers);
+        assert_unordered::assert_eq_unordered!(vec![a, b], avail.peers);
 
         Ok(())
     }
@@ -1752,7 +1752,7 @@ mod tests {
         let path = Path::parse("file.txt")?;
 
         cache.update(
-            &a,
+            a,
             Notification::Add {
                 arena: arena.clone(),
                 index: 0,
@@ -1763,7 +1763,7 @@ mod tests {
             },
         )?;
         cache.update(
-            &b,
+            b,
             Notification::Add {
                 arena: arena.clone(),
                 index: 0,
@@ -1774,7 +1774,7 @@ mod tests {
             },
         )?;
         cache.update(
-            &c,
+            c,
             Notification::Add {
                 arena: arena.clone(),
                 index: 0,
@@ -1785,7 +1785,7 @@ mod tests {
             },
         )?;
         cache.update(
-            &b,
+            b,
             Notification::Replace {
                 arena: arena.clone(),
                 index: 0,
@@ -1810,12 +1810,12 @@ mod tests {
             },
             avail.metadata
         );
-        assert_eq!(vec![b.clone()], avail.peers);
+        assert_eq!(vec![b], avail.peers);
 
         // We reconnect to c, which has yet another version. Following
         // the hash chain, Hash 3 is now the newest version.
         cache.update(
-            &c,
+            c,
             Notification::Replace {
                 arena: arena.clone(),
                 index: 0,
@@ -1827,7 +1827,7 @@ mod tests {
             },
         )?;
         cache.update(
-            &c,
+            c,
             Notification::Replace {
                 arena: arena.clone(),
                 index: 0,
@@ -1841,11 +1841,11 @@ mod tests {
         let acache = fixture.arena_cache()?;
         let avail = acache.file_availability(inode)?;
         assert_eq!(Hash([3u8; 32]), avail.hash);
-        assert_eq!(vec![c.clone()], avail.peers);
+        assert_eq!(vec![c], avail.peers);
 
         // Later on, b joins the party
         cache.update(
-            &b,
+            b,
             Notification::Replace {
                 arena: arena.clone(),
                 index: 0,
@@ -1860,7 +1860,7 @@ mod tests {
         let acache = fixture.arena_cache()?;
         let avail = acache.file_availability(inode)?;
         assert_eq!(Hash([3u8; 32]), avail.hash);
-        assert_unordered::assert_eq_unordered!(vec![b.clone(), c.clone()], avail.peers);
+        assert_unordered::assert_eq_unordered!(vec![b, c], avail.peers);
 
         Ok(())
     }
@@ -1877,7 +1877,7 @@ mod tests {
         let path = Path::parse("file.txt")?;
 
         cache.update(
-            &a,
+            a,
             Notification::Add {
                 arena: arena.clone(),
                 index: 0,
@@ -1888,7 +1888,7 @@ mod tests {
             },
         )?;
         cache.update(
-            &b,
+            b,
             Notification::Add {
                 arena: arena.clone(),
                 index: 0,
@@ -1899,7 +1899,7 @@ mod tests {
             },
         )?;
         cache.update(
-            &c,
+            c,
             Notification::Add {
                 arena: arena.clone(),
                 index: 0,
@@ -1910,7 +1910,7 @@ mod tests {
             },
         )?;
         cache.update(
-            &a,
+            a,
             Notification::Replace {
                 arena: arena.clone(),
                 index: 0,
@@ -1924,12 +1924,12 @@ mod tests {
         let acache = fixture.arena_cache()?;
         let inode = acache.lookup(acache.arena_root, "file.txt")?.inode;
         let avail = acache.file_availability(inode)?;
+        assert_eq!(vec![a], avail.peers);
         assert_eq!(Hash([3u8; 32]), avail.hash);
-        assert_eq!(vec![a.clone()], avail.peers);
 
-        cache.update(&a, Notification::CatchupStart(arena.clone()))?;
+        cache.update(a, Notification::CatchupStart(arena.clone()))?;
         cache.update(
-            &a,
+            a,
             Notification::CatchupComplete {
                 arena: arena.clone(),
                 index: 0,
@@ -1945,8 +1945,8 @@ mod tests {
         // back to Hash=1, but we don't have that kind of information)
         let acache = fixture.arena_cache()?;
         let avail = acache.file_availability(inode)?;
+        assert_eq!(vec![c], avail.peers);
         assert_eq!(Hash([2u8; 32]), avail.hash);
-        assert_eq!(vec![c.clone()], avail.peers);
 
         Ok(())
     }
@@ -1967,7 +1967,7 @@ mod tests {
         let mtime = test_time();
 
         cache.update(
-            &peer1,
+            peer1,
             Notification::Add {
                 arena: arena.clone(),
                 index: 0,
@@ -1979,7 +1979,7 @@ mod tests {
         )?;
 
         cache.update(
-            &peer1,
+            peer1,
             Notification::Add {
                 arena: arena.clone(),
                 index: 0,
@@ -1990,7 +1990,7 @@ mod tests {
             },
         )?;
         cache.update(
-            &peer2,
+            peer2,
             Notification::Add {
                 arena: arena.clone(),
                 index: 0,
@@ -2002,7 +2002,7 @@ mod tests {
         )?;
 
         cache.update(
-            &peer1,
+            peer1,
             Notification::Add {
                 arena: arena.clone(),
                 index: 0,
@@ -2013,7 +2013,7 @@ mod tests {
             },
         )?;
         cache.update(
-            &peer2,
+            peer2,
             Notification::Add {
                 arena: arena.clone(),
                 index: 0,
@@ -2024,7 +2024,7 @@ mod tests {
             },
         )?;
         cache.update(
-            &peer3,
+            peer3,
             Notification::Add {
                 arena: arena.clone(),
                 index: 0,
@@ -2036,7 +2036,7 @@ mod tests {
         )?;
 
         cache.update(
-            &peer1,
+            peer1,
             Notification::Add {
                 arena: arena.clone(),
                 index: 0,
@@ -2048,9 +2048,9 @@ mod tests {
         )?;
 
         // Simulate a catchup that only reports file2 and file4.
-        cache.update(&peer1, Notification::CatchupStart(arena.clone()))?;
+        cache.update(peer1, Notification::CatchupStart(arena.clone()))?;
         cache.update(
-            &peer1,
+            peer1,
             Notification::Catchup {
                 arena: arena.clone(),
                 path: file2.clone(),
@@ -2060,7 +2060,7 @@ mod tests {
             },
         )?;
         cache.update(
-            &peer1,
+            peer1,
             Notification::Catchup {
                 arena: arena.clone(),
                 path: file4.clone(),
@@ -2070,7 +2070,7 @@ mod tests {
             },
         )?;
         cache.update(
-            &peer1,
+            peer1,
             Notification::CatchupComplete {
                 arena: arena.clone(),
                 index: 0,
@@ -2158,7 +2158,7 @@ mod tests {
 
         // Overwrite the file with a new version
         cache.update(
-            &test_peer(),
+            test_peer(),
             Notification::Replace {
                 arena: arena.clone(),
                 index: 0,
@@ -2221,10 +2221,10 @@ mod tests {
         assert!(fixture.blob_file_exists(&arena, blob_id));
 
         // Do a catchup that doesn't include this file (simulating file removal)
-        cache.update(&test_peer(), Notification::CatchupStart(arena.clone()))?;
+        cache.update(test_peer(), Notification::CatchupStart(arena.clone()))?;
         // Note: No Catchup notification for the file, so it will be deleted
         cache.update(
-            &test_peer(),
+            test_peer(),
             Notification::CatchupComplete {
                 arena: arena.clone(),
                 index: 0,

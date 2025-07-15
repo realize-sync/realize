@@ -263,14 +263,14 @@ mod tests {
                 let b = HouseholdFixture::b();
 
                 // Create a file in peer B's arena
-                let b_dir = fixture.arena_root(&b);
+                let b_dir = fixture.arena_root(b);
                 fs::write(&b_dir.join("test.txt"), "File content").await?;
 
                 // Wait for the file to appear in peer A's cache
-                fixture.wait_for_file_in_cache(&a, "test.txt").await?;
+                fixture.wait_for_file_in_cache(a, "test.txt").await?;
 
                 // Get the cache and create a downloader
-                let cache = fixture.cache(&a)?;
+                let cache = fixture.cache(a)?;
                 let downloader = Downloader::new(household_a, cache.clone());
 
                 // Get the inode for the file
@@ -297,12 +297,12 @@ mod tests {
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
 
-                let b_dir = fixture.arena_root(&b);
+                let b_dir = fixture.arena_root(b);
                 fs::write(&b_dir.join("test.txt"), "baa, baa, black sheep").await?;
 
-                fixture.wait_for_file_in_cache(&a, "test.txt").await?;
+                fixture.wait_for_file_in_cache(a, "test.txt").await?;
 
-                let cache = fixture.cache(&a)?;
+                let cache = fixture.cache(a)?;
                 let downloader = Downloader::new(household_a, cache.clone());
 
                 let arena = HouseholdFixture::test_arena();
@@ -343,12 +343,12 @@ mod tests {
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
 
-                let b_dir = fixture.arena_root(&b);
+                let b_dir = fixture.arena_root(b);
                 fs::write(&b_dir.join("test.txt"), "baa, baa, black sheep").await?;
 
-                fixture.wait_for_file_in_cache(&a, "test.txt").await?;
+                fixture.wait_for_file_in_cache(a, "test.txt").await?;
 
-                let cache = fixture.cache(&a)?;
+                let cache = fixture.cache(a)?;
                 let downloader = Downloader::new(household_a, cache.clone());
 
                 let arena = HouseholdFixture::test_arena();
@@ -383,12 +383,12 @@ mod tests {
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
 
-                let b_dir = fixture.arena_root(&b);
+                let b_dir = fixture.arena_root(b);
                 fs::write(&b_dir.join("test.txt"), "baa, baa, black sheep").await?;
 
-                fixture.wait_for_file_in_cache(&a, "test.txt").await?;
+                fixture.wait_for_file_in_cache(a, "test.txt").await?;
 
-                let cache = fixture.cache(&a)?;
+                let cache = fixture.cache(a)?;
                 let downloader = Downloader::new(household_a, cache.clone());
 
                 let arena = HouseholdFixture::test_arena();
@@ -416,7 +416,7 @@ mod tests {
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
 
-                let b_dir = fixture.arena_root(&b);
+                let b_dir = fixture.arena_root(b);
                 let path = b_dir.join("large_file");
                 {
                     let mut f = std::fs::File::create(&path)?;
@@ -425,9 +425,9 @@ mod tests {
                     f.write(&[2u8; 8 * 1024])?;
                 }
 
-                fixture.wait_for_file_in_cache(&a, "large_file").await?;
+                fixture.wait_for_file_in_cache(a, "large_file").await?;
 
-                let cache = fixture.cache(&a)?;
+                let cache = fixture.cache(a)?;
                 let downloader = Downloader::new(household_a, cache.clone());
 
                 let arena = HouseholdFixture::test_arena();
@@ -530,13 +530,13 @@ mod tests {
         let a = HouseholdFixture::a();
         let b = HouseholdFixture::b();
 
-        let b_dir = fixture.arena_root(&b);
+        let b_dir = fixture.arena_root(b);
         let path = b_dir.join("large_file");
         std::fs::write(&path, vec![0xAB; file_size])?;
 
-        fixture.wait_for_file_in_cache(&a, "large_file").await?;
+        fixture.wait_for_file_in_cache(a, "large_file").await?;
 
-        let cache = fixture.cache(&a)?;
+        let cache = fixture.cache(a)?;
         let downloader = Downloader::new(household, cache.clone());
 
         let arena = HouseholdFixture::test_arena();

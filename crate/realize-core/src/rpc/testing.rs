@@ -1,13 +1,13 @@
 use super::Household;
-use realize_types::{Arena, Peer};
+use assert_fs::TempDir;
+use assert_fs::prelude::*;
 use realize_network::Server;
 use realize_network::capnp::PeerStatus;
 use realize_network::hostport::HostPort;
 use realize_network::testing::TestingPeers;
 use realize_storage::Storage;
 use realize_storage::{self, UnrealCacheAsync};
-use assert_fs::TempDir;
-use assert_fs::prelude::*;
+use realize_types::{Arena, Peer};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -74,20 +74,20 @@ impl HouseholdFixture {
     pub async fn with_two_peers(&mut self) -> anyhow::Result<WithTwoPeers> {
         let a = HouseholdFixture::a();
         let b = HouseholdFixture::b();
-        let addr_a = self.pick_port(&a)?;
-        let addr_b = self.pick_port(&b)?;
+        let addr_a = self.pick_port(a)?;
+        let addr_b = self.pick_port(b)?;
         assert!(addr_a != addr_b);
 
         let local = LocalSet::new();
 
-        let household_a = self.create_household(&local, &a)?;
-        let mut server_a = Server::new(self.peers.networking(&a)?);
+        let household_a = self.create_household(&local, a)?;
+        let mut server_a = Server::new(self.peers.networking(a)?);
         household_a.register(&mut server_a);
         let server_a = Arc::new(server_a);
         self.servers.push(Arc::clone(&server_a));
 
-        let household_b = self.create_household(&local, &b)?;
-        let mut server_b = Server::new(self.peers.networking(&b)?);
+        let household_b = self.create_household(&local, b)?;
+        let mut server_b = Server::new(self.peers.networking(b)?);
         household_b.register(&mut server_b);
         let server_b = Arc::new(server_b);
         self.servers.push(Arc::clone(&server_b));
@@ -104,7 +104,7 @@ impl HouseholdFixture {
     }
 
     /// Path where files for the test arena of the given peer are stored.
-    pub fn arena_root(&self, peer: &Peer) -> PathBuf {
+    pub fn arena_root(&self, peer: Peer) -> PathBuf {
         realize_storage::testing::arena_root(
             self.tempdir.child(peer.as_str()).path(),
             &HouseholdFixture::test_arena(),
@@ -112,21 +112,21 @@ impl HouseholdFixture {
     }
 
     /// Get a peer storage.
-    pub fn storage(&self, peer: &Peer) -> anyhow::Result<&Arc<Storage>> {
+    pub fn storage(&self, peer: Peer) -> anyhow::Result<&Arc<Storage>> {
         self.peer_storage
-            .get(peer)
+            .get(&peer)
             .ok_or(anyhow::anyhow!("Unknown peer {peer}"))
     }
 
     /// Get a peer cache.
-    pub fn cache(&self, peer: &Peer) -> anyhow::Result<&UnrealCacheAsync> {
+    pub fn cache(&self, peer: Peer) -> anyhow::Result<&UnrealCacheAsync> {
         self.storage(peer)?
             .cache()
             .ok_or(anyhow::anyhow!("{peer} has no cache"))
     }
 
     /// Wait for the given file to appear in the given peer's cache, in the test arena.
-    pub async fn wait_for_file_in_cache(&self, peer: &Peer, filename: &str) -> anyhow::Result<()> {
+    pub async fn wait_for_file_in_cache(&self, peer: Peer, filename: &str) -> anyhow::Result<()> {
         let cache = &self.cache(peer)?;
 
         let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
@@ -148,7 +148,7 @@ impl HouseholdFixture {
     // households to communicate.
     ///
     /// This is a lower-level call that's usually not called directly. Prefer calling with_two_peers or with_three_peers
-    pub fn pick_port(&mut self, peer: &Peer) -> anyhow::Result<HostPort> {
+    pub fn pick_port(&mut self, peer: Peer) -> anyhow::Result<HostPort> {
         self.peers.pick_port(peer)
     }
 
@@ -158,10 +158,10 @@ impl HouseholdFixture {
     /// must be run for the household to do something.
     ///
     /// This is a lower-level call that's usually not called directly. Prefer calling with_two_peers or with_three_peers
-    pub fn create_household(&self, local: &LocalSet, peer: &Peer) -> anyhow::Result<Household> {
+    pub fn create_household(&self, local: &LocalSet, peer: Peer) -> anyhow::Result<Household> {
         let storage = self
             .peer_storage
-            .get(peer)
+            .get(&peer)
             .ok_or_else(|| anyhow::anyhow!("unknown peer: {peer}"))?;
 
         Household::spawn(local, self.peers.networking(peer)?, storage.clone())
@@ -208,7 +208,7 @@ impl WithTwoPeers {
 
                 let delay = Duration::from_secs(3);
                 assert_eq!(
-                    PeerStatus::Connected(b.clone()),
+                    PeerStatus::Connected(b),
                     timeout(delay, status_a.recv())
                         .await
                         .map_err(|_| anyhow::anyhow!(
@@ -216,7 +216,7 @@ impl WithTwoPeers {
                         ))??
                 );
                 assert_eq!(
-                    PeerStatus::Registered(b.clone()),
+                    PeerStatus::Registered(b),
                     timeout(delay, status_a.recv())
                         .await
                         .map_err(|_| anyhow::anyhow!(
@@ -224,7 +224,7 @@ impl WithTwoPeers {
                         ))??
                 );
                 assert_eq!(
-                    PeerStatus::Connected(a.clone()),
+                    PeerStatus::Connected(a),
                     timeout(delay, status_b.recv())
                         .await
                         .map_err(|_| anyhow::anyhow!(
@@ -232,7 +232,7 @@ impl WithTwoPeers {
                         ))??
                 );
                 assert_eq!(
-                    PeerStatus::Registered(a.clone()),
+                    PeerStatus::Registered(a),
                     timeout(delay, status_b.recv())
                         .await
                         .map_err(|_| anyhow::anyhow!(

@@ -6,13 +6,13 @@ use super::store_capnp::store::{
 };
 use super::store_capnp::subscriber::{self, NotifyParams, NotifyResults};
 use super::store_capnp::{notification, read_callback, read_error};
-use realize_types::{self, Arena, Hash, Path, Peer, UnixTime};
-use realize_network::capnp::{ConnectionHandler, ConnectionManager, PeerStatus};
-use realize_network::{Networking, Server};
-use realize_storage::{Notification, Progress, Storage, StorageError, UnrealCacheAsync};
 use capnp::capability::Promise;
 use capnp_rpc::pry;
+use realize_network::capnp::{ConnectionHandler, ConnectionManager, PeerStatus};
+use realize_network::{Networking, Server};
 use realize_storage::utils::holder::ByteConversionError;
+use realize_storage::{Notification, Progress, Storage, StorageError, UnrealCacheAsync};
+use realize_types::{self, Arena, Hash, Path, Peer, UnixTime};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, SeekFrom};
 use std::pin;
@@ -131,15 +131,15 @@ impl ConnectionHandler<connected_peer::Client, HouseholdOperation> for PeerConne
         TAG
     }
 
-    fn server(&self, peer: &Peer) -> capnp::capability::Client {
-        ConnectedPeerServer::new(peer.clone(), self.storage.clone())
+    fn server(&self, peer: Peer) -> capnp::capability::Client {
+        ConnectedPeerServer::new(peer, self.storage.clone())
             .into_connected_peer()
             .client
     }
 
     async fn check_connection(
         &self,
-        _peer: &Peer,
+        _peer: Peer,
         client: &mut connected_peer::Client,
     ) -> anyhow::Result<()> {
         get_connected_peer_store(client).await?;
@@ -147,7 +147,7 @@ impl ConnectionHandler<connected_peer::Client, HouseholdOperation> for PeerConne
         Ok(())
     }
 
-    async fn register(&self, peer: &Peer, client: connected_peer::Client) -> anyhow::Result<()> {
+    async fn register(&self, peer: Peer, client: connected_peer::Client) -> anyhow::Result<()> {
         subscribe_self(&self.storage, peer, client).await?;
 
         Ok(())
@@ -278,7 +278,7 @@ fn channel_closed<T>(_: mpsc::error::SendError<T>) -> capnp::Error {
 /// update the cache.
 async fn subscribe_self(
     storage: &Arc<Storage>,
-    peer: &Peer,
+    peer: Peer,
     mut client: connected_peer::Client,
 ) -> anyhow::Result<()> {
     let store = get_connected_peer_store(&mut client).await?;
@@ -317,13 +317,12 @@ async fn subscribe_self(
             .join(", ")
     );
     let mut progress = tokio::spawn({
-        let peer = peer.clone();
         let goal_arenas = goal_arenas.clone();
         let cache = cache.clone();
         async move {
             let mut map = HashMap::new();
             for arena in goal_arenas {
-                if let Some(progress) = cache.peer_progress(&peer, &arena).await? {
+                if let Some(progress) = cache.peer_progress(peer, &arena).await? {
                     map.insert(arena, progress);
                 }
             }
@@ -333,7 +332,7 @@ async fn subscribe_self(
     })
     .await??;
 
-    let subscriber = ConnectedPeerServer::new(peer.clone(), storage.clone()).into_subscriber();
+    let subscriber = ConnectedPeerServer::new(peer, storage.clone()).into_subscriber();
     for arena in goal_arenas {
         let mut request = store.subscribe_request();
         let mut request_builder = request.get().init_req();
@@ -419,7 +418,7 @@ impl ConnectedPeerServer {
             return Ok(());
         }
 
-        let peer = self.peer.clone();
+        let peer = self.peer;
         log::debug!("{peer} subscribed to notifications from {arena}");
         tokio::task::spawn_local(async move {
             let mut notifications = Vec::new();
@@ -593,7 +592,7 @@ impl subscriber::Server for ConnectedPeerServer {
         _: NotifyResults,
     ) -> capnp::capability::Promise<(), capnp::Error> {
         if let Some(cache) = self.storage.cache() {
-            Promise::from_future(do_notify(cache.clone(), self.peer.clone(), params))
+            Promise::from_future(do_notify(cache.clone(), self.peer, params))
         } else {
             Promise::ok(())
         }
@@ -678,7 +677,7 @@ async fn do_notify(
 
     tokio::spawn(async move {
         for notification in notifications {
-            cache.update(&peer, notification).await?;
+            cache.update(peer, notification).await?;
         }
 
         Ok::<(), StorageError>(())
@@ -918,10 +917,10 @@ mod tests {
 
                 // A file created in B's arena should eventually become
                 // available in cache A.
-                let b_dir = fixture.arena_root(&b);
+                let b_dir = fixture.arena_root(b);
                 fs::write(&b_dir.join("bar.txt"), b"test").await?;
 
-                fixture.wait_for_file_in_cache(&a, "bar.txt").await?;
+                fixture.wait_for_file_in_cache(a, "bar.txt").await?;
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -940,10 +939,10 @@ mod tests {
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
 
-                let b_dir = fixture.arena_root(&b);
+                let b_dir = fixture.arena_root(b);
                 fs::write(&b_dir.join("bar.txt"), b"test").await?;
 
-                fixture.wait_for_file_in_cache(&a, "bar.txt").await?;
+                fixture.wait_for_file_in_cache(a, "bar.txt").await?;
 
                 let stream = household_a.read(
                     vec![b.clone()],

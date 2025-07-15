@@ -688,11 +688,11 @@ pub fn dir_content(dir: &assert_fs::fixture::ChildPath) -> anyhow::Result<Vec<Pa
 pub fn setup_verifier(keys: &TestKeys) -> Arc<PeerVerifier> {
     let mut verifier = PeerVerifier::new();
     verifier.add_peer(
-        &Peer::from("a"),
+        Peer::from("a"),
         SubjectPublicKeyInfoDer::from_pem_file(&keys.pubkey_a_path).unwrap(),
     );
     verifier.add_peer(
-        &Peer::from("b"),
+        Peer::from("b"),
         SubjectPublicKeyInfoDer::from_pem_file(&keys.pubkey_b_path).unwrap(),
     );
 

@@ -181,7 +181,7 @@ impl UnrealCacheBlocking {
 
     pub(crate) fn update(
         &self,
-        peer: &Peer,
+        peer: Peer,
         notification: Notification,
     ) -> Result<(), StorageError> {
         let arena = notification.arena().clone();
@@ -387,30 +387,24 @@ impl UnrealCacheAsync {
     /// This should be passed to the peer when subscribing.
     pub async fn peer_progress(
         &self,
-        peer: &Peer,
+        peer: Peer,
         arena: &Arena,
     ) -> Result<Option<Progress>, StorageError> {
-        let peer = peer.clone();
         let arena = arena.clone();
         let inner = Arc::clone(&self.inner);
 
         task::spawn_blocking(move || {
             let arena_cache = inner.arena_cache(&arena)?;
-            arena_cache.peer_progress(&peer)
+            arena_cache.peer_progress(peer)
         })
         .await?
     }
 
     /// Update the cache by applying a notification coming from the given peer.
-    pub async fn update(
-        &self,
-        peer: &Peer,
-        notification: Notification,
-    ) -> Result<(), StorageError> {
-        let peer = peer.clone();
+    pub async fn update(&self, peer: Peer, notification: Notification) -> Result<(), StorageError> {
         let inner = Arc::clone(&self.inner);
 
-        task::spawn_blocking(move || inner.update(&peer, notification)).await?
+        task::spawn_blocking(move || inner.update(peer, notification)).await?
     }
 
     /// Open a file for reading/writing, creating a new blob entry.

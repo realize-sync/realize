@@ -352,7 +352,7 @@ async fn connect(
     }
     options.connection_events = Some(conn_status);
 
-    realstore::client::connect(networking, &Peer::from(peer), options).await
+    realstore::client::connect(networking, Peer::from(peer), options).await
 }
 
 /// Set server-site write rate limit on client, return it.

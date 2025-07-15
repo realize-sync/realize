@@ -20,8 +20,6 @@ use realize_types::Peer;
 use super::rate_limit::RateLimitedStream;
 use crate::{Networking, Server};
 
-
-
 /// Connection status of a peer, broadcast by [ConnectionManager].
 #[derive(Clone, PartialEq, Debug)]
 pub enum PeerStatus {
@@ -57,9 +55,9 @@ enum ConnectionMessage<O> {
 #[allow(async_fn_in_trait)]
 pub trait ConnectionHandler<C, O>: Send {
     fn tag(&self) -> &'static [u8; 4];
-    fn server(&self, peer: &Peer) -> capnp::capability::Client;
-    async fn check_connection(&self, peer: &Peer, client: &mut C) -> anyhow::Result<()>;
-    async fn register(&self, peer: &Peer, client: C) -> anyhow::Result<()>;
+    fn server(&self, peer: Peer) -> capnp::capability::Client;
+    async fn check_connection(&self, peer: Peer, client: &mut C) -> anyhow::Result<()>;
+    async fn register(&self, peer: Peer, client: C) -> anyhow::Result<()>;
     async fn execute(&self, client: Option<(Peer, C)>, operation: O);
 }
 
@@ -217,7 +215,7 @@ where
                 Default::default(),
             ));
             let until_shutdown = net.drive_until_shutdown();
-            let system = RpcSystem::new(net, Some(this.handler.server(&peer)));
+            let system = RpcSystem::new(net, Some(this.handler.server(peer)));
             let disconnector = system.get_disconnector();
             tokio::task::spawn_local(system);
 
@@ -238,7 +236,7 @@ where
         for peer in self.networking.connectable_peers() {
             let mut borrow = self.connections.borrow_mut();
             let conn = borrow
-                .entry(peer.clone())
+                .entry(peer)
                 .or_insert_with(|| TrackedPeerConnections {
                     tracked_client: None,
                     tracker: None,
@@ -253,14 +251,13 @@ where
             }
 
             let this = Rc::clone(self);
-            let peer = peer.clone();
             conn.tracker = Some(tokio::task::spawn_local(async move {
-                this.track_peer(&peer).await
+                this.track_peer(peer).await
             }));
         }
     }
 
-    async fn track_peer(self: &Rc<Self>, peer: &Peer) {
+    async fn track_peer(self: &Rc<Self>, peer: Peer) {
         let retry_strategy =
             ExponentialBackoff::from_millis(500).max_delay(Duration::from_secs(5 * 60));
         let mut current_backoff: Option<ExponentialBackoff> = None;
@@ -314,18 +311,16 @@ where
             }
 
             self.set_tracked_client(peer, Some(client.clone()));
-            let _ = self.broadcast_tx.send(PeerStatus::Connected(peer.clone()));
+            let _ = self.broadcast_tx.send(PeerStatus::Connected(peer));
             scopeguard::defer!({
                 self.set_tracked_client(peer, None);
-                let _ = self
-                    .broadcast_tx
-                    .send(PeerStatus::Disconnected(peer.clone()));
+                let _ = self.broadcast_tx.send(PeerStatus::Disconnected(peer));
             });
 
             if let Err(err) = self.handler.register(peer, client).await {
                 log::debug!("Registration on {peer} failed; Keeping connection: {err}");
             } else {
-                let _ = self.broadcast_tx.send(PeerStatus::Registered(peer.clone()));
+                let _ = self.broadcast_tx.send(PeerStatus::Registered(peer));
             }
 
             // We're fully connected. Reset the backoff delay for next time.
@@ -338,10 +333,10 @@ where
     }
 
     /// Associate the given client with the peer.
-    fn set_tracked_client(self: &Rc<Self>, peer: &Peer, client: Option<C>) {
+    fn set_tracked_client(self: &Rc<Self>, peer: Peer, client: Option<C>) {
         self.connections
             .borrow_mut()
-            .entry(peer.clone())
+            .entry(peer)
             .or_insert_with(|| TrackedPeerConnections {
                 tracked_client: None,
                 tracker: None,
@@ -414,8 +409,8 @@ mod tests {
         peer: Peer,
     }
     impl HelloConnectionHandler {
-        fn new(peer: &Peer) -> Self {
-            Self { peer: peer.clone() }
+        fn new(peer: Peer) -> Self {
+            Self { peer }
         }
     }
     impl ConnectionHandler<hello::Client, HelloOperation> for HelloConnectionHandler {
@@ -423,10 +418,10 @@ mod tests {
             b"HELO"
         }
 
-        fn server(&self, peer: &Peer) -> capnp::capability::Client {
+        fn server(&self, peer: Peer) -> capnp::capability::Client {
             let c: hello::Client = capnp_rpc::new_client(HelloServer {
-                this_peer: self.peer.clone(),
-                other_peer: peer.clone(),
+                this_peer: self.peer,
+                other_peer: peer,
             });
 
             c.client
@@ -434,7 +429,7 @@ mod tests {
 
         async fn check_connection(
             &self,
-            peer: &Peer,
+            peer: Peer,
             client: &mut hello::Client,
         ) -> anyhow::Result<()> {
             let mut request = client.hello_request();
@@ -445,7 +440,7 @@ mod tests {
             Ok(())
         }
 
-        async fn register(&self, peer: &Peer, client: hello::Client) -> anyhow::Result<()> {
+        async fn register(&self, peer: Peer, client: hello::Client) -> anyhow::Result<()> {
             let mut request = client.hello_request();
             request.get().set_name(self.peer.as_str());
 
@@ -533,7 +528,7 @@ mod tests {
         fn manager(
             &self,
             local: &LocalSet,
-            peer: &Peer,
+            peer: Peer,
         ) -> anyhow::Result<ConnectionManager<HelloOperation>> {
             ConnectionManager::spawn(
                 local,
@@ -544,7 +539,7 @@ mod tests {
 
         async fn launch_server(
             &mut self,
-            peer: &Peer,
+            peer: Peer,
             manager: &ConnectionManager<HelloOperation>,
         ) -> anyhow::Result<Arc<Server>> {
             let mut server = Server::new(self.peers.networking(peer)?);
@@ -564,7 +559,7 @@ mod tests {
         }
     }
 
-    async fn connect(networking: Networking, peer: &Peer) -> anyhow::Result<hello::Client> {
+    async fn connect(networking: Networking, peer: Peer) -> anyhow::Result<hello::Client> {
         let stream = networking.connect_raw(peer, b"HELO", None).await?;
         let (r, w) = TokioAsyncReadCompatExt::compat(stream).split();
         let net = Box::new(VatNetwork::new(
@@ -585,10 +580,10 @@ mod tests {
         let mut fixture = Fixture::setup().await?;
         let local = LocalSet::new();
 
-        let a = &a();
+        let a = a();
         let manager = fixture.manager(&local, a)?;
         let _server = fixture.launch_server(a, &manager).await?;
-        let b_networking = fixture.peers.networking(&b())?;
+        let b_networking = fixture.peers.networking(b())?;
         local
             .run_until(async move {
                 let client = connect(b_networking, a).await?;
@@ -611,10 +606,10 @@ mod tests {
         let mut fixture = Fixture::setup().await?;
         let local = LocalSet::new();
 
-        let a = &a();
+        let a = a();
         fixture.peers.pick_port(a)?;
 
-        let b = &b();
+        let b = b();
         fixture.peers.pick_port(b)?;
 
         let manager_a = fixture.manager(&local, a)?;
@@ -629,12 +624,12 @@ mod tests {
                 let mut status_b = manager_b.peer_status();
 
                 manager_a.keep_connected()?;
-                assert_eq!(PeerStatus::Connected(b.clone()), status_a.recv().await?);
-                assert_eq!(PeerStatus::Registered(b.clone()), status_a.recv().await?);
+                assert_eq!(PeerStatus::Connected(b), status_a.recv().await?);
+                assert_eq!(PeerStatus::Registered(b), status_a.recv().await?);
 
                 manager_b.keep_connected()?;
-                assert_eq!(PeerStatus::Connected(a.clone()), status_b.recv().await?);
-                assert_eq!(PeerStatus::Registered(a.clone()), status_b.recv().await?);
+                assert_eq!(PeerStatus::Connected(a), status_b.recv().await?);
+                assert_eq!(PeerStatus::Registered(a), status_b.recv().await?);
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -648,10 +643,10 @@ mod tests {
         let mut fixture = Fixture::setup().await?;
         let local = LocalSet::new();
 
-        let a = &a();
+        let a = a();
         fixture.peers.pick_port(a)?;
 
-        let b = &b();
+        let b = b();
         fixture.peers.pick_port(b)?;
 
         let manager_a = fixture.manager(&local, a)?;
@@ -665,13 +660,13 @@ mod tests {
 
         local
             .run_until(async move {
-                assert_eq!(PeerStatus::Connected(b.clone()), status_a.recv().await?);
-                assert_eq!(PeerStatus::Registered(b.clone()), status_a.recv().await?);
+                assert_eq!(PeerStatus::Connected(b), status_a.recv().await?);
+                assert_eq!(PeerStatus::Registered(b), status_a.recv().await?);
                 server_b.shutdown().await?;
-                assert_eq!(PeerStatus::Disconnected(b.clone()), status_a.recv().await?);
+                assert_eq!(PeerStatus::Disconnected(b), status_a.recv().await?);
 
                 let _server_b = fixture.launch_server(b, &manager_b).await?;
-                assert_eq!(PeerStatus::Connected(b.clone()), status_a.recv().await?);
+                assert_eq!(PeerStatus::Connected(b), status_a.recv().await?);
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -685,13 +680,13 @@ mod tests {
         let mut fixture = Fixture::setup().await?;
         let local = LocalSet::new();
 
-        let a = &a();
+        let a = a();
         fixture.peers.pick_port(a)?;
 
-        let b = &b();
+        let b = b();
         fixture.peers.pick_port(b)?;
 
-        let c = &c();
+        let c = c();
         fixture.peers.pick_port(c)?;
 
         let manager_a = fixture.manager(&local, a)?;
@@ -704,21 +699,21 @@ mod tests {
             .run_until(async move {
                 let mut status_a = manager_a.peer_status();
                 manager_a.keep_connected()?;
-                assert_eq!(PeerStatus::Connected(b.clone()), status_a.recv().await?);
+                assert_eq!(PeerStatus::Connected(b), status_a.recv().await?);
 
                 let mut status_b = manager_b.peer_status();
                 manager_b.keep_connected()?;
-                assert_eq!(PeerStatus::Connected(a.clone()), status_b.recv().await?);
+                assert_eq!(PeerStatus::Connected(a), status_b.recv().await?);
 
                 assert_eq!(
                     "Hello 1 -- From b to a",
-                    say_hello_to_peers(&manager_a, vec![b.clone()], "1").await?
+                    say_hello_to_peers(&manager_a, vec![b], "1").await?
                 );
 
                 // C is not connected, so B is used.
                 assert_eq!(
                     "Hello 2 -- From b to a",
-                    say_hello_to_peers(&manager_a, vec![Peer::from("c"), b.clone()], "2").await?
+                    say_hello_to_peers(&manager_a, vec![Peer::from("c"), b], "2").await?
                 );
 
                 // C is not connected, so this fails

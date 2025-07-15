@@ -1,13 +1,13 @@
-use realize_types::Peer;
+use crate::config::PeerConfig;
+use crate::hostport::HostPort;
+use crate::rate_limit::RateLimitedStream;
+use crate::security::{PeerVerifier, RawPublicKeyResolver};
 use anyhow::Context as _;
 use async_speed_limit::Limiter;
 use async_speed_limit::clock::StandardClock;
-use crate::config::PeerConfig;
 use futures::prelude::*;
-use crate::hostport::HostPort;
-use crate::rate_limit::RateLimitedStream;
+use realize_types::Peer;
 use rustls::pki_types::ServerName;
-use crate::security::{PeerVerifier, RawPublicKeyResolver};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path;
@@ -35,9 +35,12 @@ impl Networking {
         let verifier = PeerVerifier::from_config(peers)?;
         let resolver = RawPublicKeyResolver::from_private_key_file(privkey)?;
         Ok(Self::new(
-            peers
-                .iter()
-                .flat_map(|(p, c)| c.address.as_ref().map(|addr| (p, addr.as_ref()))),
+            peers.iter().flat_map(|(p, c)| {
+                c.address.as_ref().map(|addr| {
+                    let leaked: &'static str = addr.to_string().leak() as &'static str;
+                    (p.clone(), leaked)
+                })
+            }),
             resolver,
             verifier,
         ))
@@ -49,13 +52,13 @@ impl Networking {
         verifier: Arc<PeerVerifier>,
     ) -> Self
     where
-        T: IntoIterator<Item = (&'a Peer, &'a str)>,
+        T: IntoIterator<Item = (Peer, &'a str)>,
     {
         Self {
             addresses: Arc::new(
                 addresses
                     .into_iter()
-                    .map(|(p, addr)| (p.clone(), addr.to_string()))
+                    .map(|(p, addr)| (p, addr.to_string()))
                     .collect(),
             ),
             verifier: Arc::clone(&verifier),
@@ -68,13 +71,13 @@ impl Networking {
     }
 
     /// Set of peers that have a known address.
-    pub fn connectable_peers(&self) -> impl Iterator<Item = &Peer> {
-        self.addresses.keys()
+    pub fn connectable_peers(&self) -> impl Iterator<Item = Peer> {
+        self.addresses.keys().cloned()
     }
 
     pub async fn connect<Req, Resp>(
         &self,
-        peer: &Peer,
+        peer: Peer,
         tag: &[u8; 4],
         limiter: Option<Limiter>,
     ) -> Result<
@@ -102,13 +105,13 @@ impl Networking {
 
     pub(crate) async fn connect_raw(
         &self,
-        peer: &Peer,
+        peer: Peer,
         tag: &[u8; 4],
         limiter: Option<Limiter>,
     ) -> anyhow::Result<tokio_rustls::client::TlsStream<RateLimitedStream<TcpStream>>> {
         let addr = self
             .addresses
-            .get(peer)
+            .get(&peer)
             .ok_or(anyhow::anyhow!("no address known for {peer}"))?;
         let addr = HostPort::parse(addr)
             .await
@@ -192,7 +195,7 @@ impl Server {
     pub fn register_server<T, S, F>(&mut self, tag: &'static [u8; 4], handler: T)
     where
         T: Fn(
-                &Peer,
+                Peer,
                 Limiter,
                 tarpc::tokio_util::codec::Framed<
                     tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
@@ -212,7 +215,7 @@ impl Server {
                   limiter: Limiter,
                   mut shutdown_rx: broadcast::Receiver<()>| {
                 let framed = LengthDelimitedCodec::builder().new_framed(stream);
-                let stream = handler(&peer, limiter, framed);
+                let stream = handler(peer, limiter, framed);
 
                 tokio::spawn(async move {
                     let mut stream = Box::pin(stream);
@@ -338,8 +341,8 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use realize_types::Peer;
     use crate::testing;
+    use realize_types::Peer;
     use tarpc::context;
     use tarpc::server::Channel as _;
 
@@ -383,18 +386,19 @@ mod tests {
             Ok(addr)
         }
 
-        fn client_networking(&self, peer: &Peer, addr: SocketAddr) -> anyhow::Result<Networking> {
+        fn client_networking(&self, peer: Peer, addr: SocketAddr) -> anyhow::Result<Networking> {
             self.client_networking_with_verifier(peer, addr, Arc::clone(&self.verifier))
         }
 
         fn client_networking_with_verifier(
             &self,
-            peer: &Peer,
+            peer: Peer,
             addr: SocketAddr,
             verifier: Arc<PeerVerifier>,
         ) -> anyhow::Result<Networking> {
+            let addr_str = addr.to_string();
             Ok(Networking::new(
-                vec![(peer, addr.to_string().as_ref())],
+                vec![(peer, addr_str.leak() as &'static str)],
                 RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
                 verifier,
             ))
@@ -404,22 +408,22 @@ mod tests {
     // Helper to create a PeerVerifier with only the server key
     fn verifier_server_only() -> Arc<PeerVerifier> {
         let mut verifier = PeerVerifier::new();
-        verifier.add_peer(&Peer::from("server"), testing::server_public_key());
+        verifier.add_peer(Peer::from("server"), testing::server_public_key());
         Arc::new(verifier)
     }
 
     // Helper to create a PeerVerifier with only the client key
     fn verifier_client_only() -> Arc<PeerVerifier> {
         let mut verifier = PeerVerifier::new();
-        verifier.add_peer(&Peer::from("client"), testing::client_public_key());
+        verifier.add_peer(Peer::from("client"), testing::client_public_key());
         Arc::new(verifier)
     }
 
     // Helper to create a PeerVerifier with both keys
     fn verifier_both() -> Arc<PeerVerifier> {
         let mut verifier = PeerVerifier::new();
-        verifier.add_peer(&Peer::from("client"), testing::client_public_key());
-        verifier.add_peer(&Peer::from("server"), testing::server_public_key());
+        verifier.add_peer(Peer::from("client"), testing::client_public_key());
+        verifier.add_peer(Peer::from("server"), testing::server_public_key());
         Arc::new(verifier)
     }
 
@@ -429,8 +433,8 @@ mod tests {
         let addr = fixture.start_server().await?;
 
         let peer = Peer::from("server");
-        let networking = fixture.client_networking(&peer, addr)?;
-        let client = connect_ping(&networking, &peer).await?;
+        let networking = fixture.client_networking(peer, addr)?;
+        let client = connect_ping(&networking, peer).await?;
         assert_eq!("pong", client.ping(context::current()).await?);
 
         Ok(())
@@ -464,8 +468,8 @@ mod tests {
         let addr = fixture.start_server().await?;
 
         let peer = Peer::from("server");
-        let networking = fixture.client_networking_with_verifier(&peer, addr, verifier_both())?;
-        let client_result = connect_ping(&networking, &peer).await;
+        let networking = fixture.client_networking_with_verifier(peer, addr, verifier_both())?;
+        let client_result = connect_ping(&networking, peer).await;
         let failed = match client_result {
             Ok(client) => client.ping(context::current()).await.is_err(),
             // If handshake fails, that's also acceptable
@@ -483,8 +487,8 @@ mod tests {
 
         let peer = Peer::from("server");
         let networking =
-            fixture.client_networking_with_verifier(&peer, addr, verifier_client_only())?;
-        let client_result = connect_ping(&networking, &peer).await;
+            fixture.client_networking_with_verifier(peer, addr, verifier_client_only())?;
+        let client_result = connect_ping(&networking, peer).await;
         let failed = match client_result {
             Ok(client) => client.ping(context::current()).await.is_err(),
             // If handshake fails, that's also acceptable
@@ -501,14 +505,14 @@ mod tests {
         let addr = fixture.start_server().await?;
 
         let peer = Peer::from("server");
-        let networking = fixture.client_networking(&peer, addr)?;
+        let networking = fixture.client_networking(peer, addr)?;
 
-        connect_ping(&networking, &peer).await?;
+        connect_ping(&networking, peer).await?;
 
         fixture.server.expect("server").shutdown().await?;
 
         // After shutdown, connection fails
-        let ret = connect_ping(&networking, &peer).await;
+        let ret = connect_ping(&networking, peer).await;
 
         assert_eq!(
             Some(std::io::ErrorKind::ConnectionRefused),
@@ -524,9 +528,9 @@ mod tests {
         let addr = fixture.start_server().await?;
 
         let peer = Peer::from("server");
-        let networking = fixture.client_networking(&peer, addr)?;
+        let networking = fixture.client_networking(peer, addr)?;
 
-        connect_ping(&networking, &peer).await?;
+        connect_ping(&networking, peer).await?;
 
         fixture.server.take();
 
@@ -536,7 +540,7 @@ mod tests {
         // Connection fails from now on. The exact error isn't known,
         // as the server could be in different steps of the shutdown
         // when the client attempts to connect.
-        let ret = connect_ping(&networking, &peer).await;
+        let ret = connect_ping(&networking, peer).await;
         assert!(ret.is_err());
 
         Ok(())
@@ -572,7 +576,7 @@ mod tests {
     /// Connect to the given peer as [PingService].
     async fn connect_ping(
         networking: &Networking,
-        peer: &Peer,
+        peer: Peer,
     ) -> anyhow::Result<PingServiceClient> {
         let transport = networking.connect(peer, PING_TAG, None).await?;
 

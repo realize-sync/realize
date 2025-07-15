@@ -130,20 +130,16 @@ impl TestingPeers {
     pub fn new() -> anyhow::Result<Self> {
         let mut peers = Self::empty();
         peers.add(
-            &TestingPeers::a(),
+            TestingPeers::a(),
             CLIENT_PUBLIC_KEY_PEM,
             client_private_key(),
         )?;
         peers.add(
-            &TestingPeers::b(),
+            TestingPeers::b(),
             SERVER_PUBLIC_KEY_PEM,
             server_private_key(),
         )?;
-        peers.add(
-            &TestingPeers::c(),
-            OTHER_PUBLIC_KEY_PEM,
-            other_private_key(),
-        )?;
+        peers.add(TestingPeers::c(), OTHER_PUBLIC_KEY_PEM, other_private_key())?;
 
         Ok(peers)
     }
@@ -151,56 +147,55 @@ impl TestingPeers {
     /// Add a peer.
     pub fn add(
         &mut self,
-        peer: &Peer,
+        peer: Peer,
         pubkey: &[u8],
         private_key: PrivateKeyDer<'static>,
     ) -> anyhow::Result<()> {
         self.peers.insert(
-            peer.clone(),
+            peer,
             PeerConfig {
                 pubkey: String::from_utf8(pubkey.to_vec())?,
                 address: None,
             },
         );
-        self.private_keys.insert(peer.clone(), private_key);
+        self.private_keys.insert(peer, private_key);
 
         Ok(())
     }
 
     /// Choose an address for the given peer, store it and return it.
-    pub fn pick_port(&mut self, peer: &Peer) -> anyhow::Result<HostPort> {
+    pub fn pick_port(&mut self, peer: Peer) -> anyhow::Result<HostPort> {
         let port = portpicker::pick_unused_port().ok_or(anyhow::anyhow!("No free port"))?;
         let hostport = HostPort::localhost(port);
         self.set_addr(peer, hostport.addr());
-
         Ok(hostport)
     }
 
     /// Set address of the given peer.
-    pub fn set_addr(&mut self, peer: &Peer, addr: SocketAddr) {
+    pub fn set_addr(&mut self, peer: Peer, addr: SocketAddr) {
         self.set_hostport(peer, HostPort::from(addr))
     }
 
-    pub fn set_hostport(&mut self, peer: &Peer, hostport: HostPort) {
-        self.addresses.insert(peer.clone(), hostport);
+    pub fn set_hostport(&mut self, peer: Peer, hostport: HostPort) {
+        self.addresses.insert(peer, hostport);
     }
 
     /// Get the address configured for peer.
-    pub async fn hostport(&self, peer: &Peer) -> Option<&HostPort> {
-        self.addresses.get(peer)
+    pub async fn hostport(&self, peer: Peer) -> Option<&HostPort> {
+        self.addresses.get(&peer)
     }
 
     /// Build a [Networking] instance for the given peer.
     ///
     /// Other peer public keys and addreses will be available.
-    pub fn networking(&self, peer: &Peer) -> anyhow::Result<crate::Networking> {
+    pub fn networking(&self, peer: Peer) -> anyhow::Result<crate::Networking> {
         let mut others = self.peers.clone();
-        others.remove(peer);
+        others.remove(&peer);
 
         let verifier = PeerVerifier::from_config(&others)?;
         let resolver = RawPublicKeyResolver::from_private_key(
             self.private_keys
-                .get(peer)
+                .get(&peer)
                 .ok_or(anyhow::anyhow!("No private key for {peer}"))?
                 .clone_key(),
         )?;
@@ -208,14 +203,18 @@ impl TestingPeers {
         let addresses = self
             .addresses
             .iter()
-            .filter(|(p, _)| **p != *peer)
+            .filter(|(p, _)| **p != peer)
             .map(|(p, hostport)| (p.clone(), hostport.to_string()))
             .collect::<Vec<_>>();
-        Ok(crate::Networking::new(
-            addresses.iter().map(|(p, addr)| (p, addr.as_ref())),
-            resolver,
-            verifier,
-        ))
+        let address_vec: Vec<(Peer, String)> = addresses
+            .iter()
+            .map(|(p, addr)| (*p, addr.clone()))
+            .collect();
+        let leaked_vec: Vec<(Peer, &'static str)> = address_vec
+            .iter()
+            .map(|(p, s)| (*p, s.clone().leak() as &'static str))
+            .collect();
+        Ok(crate::Networking::new(leaked_vec, resolver, verifier))
     }
 }
 
