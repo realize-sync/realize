@@ -416,11 +416,13 @@ impl UnrealCacheAsync {
     pub async fn open_file(&self, inode: Inode) -> Result<Blob, StorageError> {
         let inner = Arc::clone(&self.inner);
 
-        task::spawn_blocking(move || {
-            let arena_cache = inner.arena_cache_for_inode(inode)?;
-            arena_cache.open_file(inode)
-        })
-        .await?
+        Ok(Blob::new(
+            task::spawn_blocking(move || {
+                let arena_cache = inner.arena_cache_for_inode(inode)?;
+                arena_cache.open_file(inode)
+            })
+            .await??,
+        ))
     }
 }
 

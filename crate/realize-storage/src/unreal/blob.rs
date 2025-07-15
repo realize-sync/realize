@@ -1,4 +1,4 @@
-use super::types::{BlobId, BlobTableEntry, FileTableEntry};
+use super::types::{BlobId, OpenBlob};
 use realize_types::{ByteRanges, Hash};
 use std::io::SeekFrom;
 use std::pin::Pin;
@@ -45,18 +45,13 @@ pub struct Blob {
 #[allow(dead_code)]
 impl Blob {
     /// Create a new blob from a file and its available byte ranges.
-    pub(crate) fn new(
-        blob_id: BlobId,
-        file_entry: FileTableEntry,
-        blob_entry: BlobTableEntry,
-        file: std::fs::File,
-    ) -> Self {
+    pub(crate) fn new(def: OpenBlob) -> Self {
         Self {
-            blob_id,
-            file: tokio::fs::File::from_std(file),
-            available_ranges: blob_entry.written_areas,
-            size: file_entry.metadata.size,
-            hash: file_entry.content.hash,
+            blob_id: def.blob_id,
+            file: tokio::fs::File::from_std(def.file),
+            available_ranges: def.blob_entry.written_areas,
+            size: def.file_entry.metadata.size,
+            hash: def.file_entry.content.hash,
             position: 0,
         }
     }
@@ -155,5 +150,199 @@ impl AsyncSeek for Blob {
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::cache::UnrealCacheBlocking;
+    use super::*;
+    use crate::unreal::arena_cache::ArenaCache;
+    use crate::{Inode, Notification, UnrealCacheAsync};
+    use assert_fs::TempDir;
+    use assert_fs::prelude::*;
+    use realize_types::ByteRange;
+    use realize_types::UnixTime;
+    use realize_types::{Arena, Path, Peer};
+    use redb::Database;
+    use std::io::SeekFrom;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    fn test_peer() -> Peer {
+        Peer::from("test_peer")
+    }
+
+    fn test_arena() -> Arena {
+        Arena::from("test_arena")
+    }
+
+    fn test_hash() -> Hash {
+        Hash([1u8; 32])
+    }
+
+    struct Fixture {
+        arena: Arena,
+        async_cache: UnrealCacheAsync,
+        cache: Arc<UnrealCacheBlocking>,
+        tempdir: TempDir,
+    }
+    impl Fixture {
+        fn setup_with_arena(arena: Arena) -> anyhow::Result<Fixture> {
+            let _ = env_logger::try_init();
+            let tempdir = TempDir::new()?;
+            let path = tempdir.path().join("unreal.db");
+            let mut cache = UnrealCacheBlocking::open(&path)?;
+
+            let child = tempdir.child(format!("{arena}-cache.db"));
+            let blob_dir = tempdir.child(format!("{arena}/blobs"));
+            if let Some(p) = child.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            cache.add_arena(
+                arena,
+                Database::create(child.path())?,
+                blob_dir.to_path_buf(),
+            )?;
+
+            let async_cache = cache.into_async();
+            let cache = async_cache.blocking();
+
+            Ok(Self {
+                arena,
+                async_cache,
+                cache,
+                tempdir,
+            })
+        }
+
+        fn arena_cache(&self) -> anyhow::Result<&ArenaCache> {
+            Ok(self.cache.arena_cache(self.arena)?)
+        }
+
+        fn add_file(&self, path: &str, size: u64) -> anyhow::Result<Inode> {
+            let path = Path::parse(path)?;
+
+            self.cache.update(
+                test_peer(),
+                Notification::Add {
+                    arena: self.arena,
+                    index: 1,
+                    path: path.clone(),
+                    mtime: UnixTime::from_secs(1234567890),
+                    size,
+                    hash: test_hash(),
+                },
+            )?;
+
+            let (inode, _) = self.cache.lookup_path(self.arena, &path)?;
+
+            Ok(inode)
+        }
+
+        /// Return the path to a blob file for test use.
+        fn blob_path(&self, arena: Arena, blob_id: BlobId) -> std::path::PathBuf {
+            self.tempdir
+                .child(format!("{arena}/blobs/{blob_id}"))
+                .to_path_buf()
+        }
+    }
+
+    #[tokio::test]
+    async fn read_blob_within_available_ranges() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena)?;
+        let acache = fixture.arena_cache()?;
+
+        let inode = fixture.add_file("test.txt", 1000)?;
+
+        // Allocate blob id and create file
+        let blob_id = acache.open_file(inode)?.blob_id;
+
+        // Write some test data to the blob file
+        let blob_path = fixture.blob_path(arena, blob_id);
+        let test_data = b"Baa, baa, black sheep, have you any wool?";
+        std::fs::write(&blob_path, test_data)?;
+
+        acache.extend_local_availability(
+            blob_id,
+            ByteRanges::from_ranges(vec![ByteRange::new(0, test_data.len() as u64)]),
+        )?;
+
+        // Read from blob
+        let mut blob = fixture.async_cache.open_file(inode).await?;
+
+        let mut buf = [0; 5];
+        let n = blob.read(&mut buf).await?;
+        assert_eq!(b"Baa, ", &buf[0..n]);
+
+        let mut buf = [0; 100];
+        let n = blob.read(&mut buf).await?;
+        assert_eq!(b"baa, black sheep, have you any wool?", &buf[0..n]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_blob_after_seek_within_available_range() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena)?;
+        let acache = fixture.arena_cache()?;
+
+        let inode = fixture.add_file("test.txt", 1000)?;
+
+        // Allocate blob id and create file
+        let blob_id = acache.open_file(inode)?.blob_id;
+
+        // Write test data to the blob file
+        let blob_path = fixture.blob_path(arena, blob_id);
+        let test_data = b"Baa, baa, black sheep, have you any wool?";
+        std::fs::write(&blob_path, test_data)?;
+
+        acache.extend_local_availability(
+            blob_id,
+            ByteRanges::from_ranges(vec![ByteRange::new(0, test_data.len() as u64)]),
+        )?;
+
+        // Read from blob
+        let mut blob = fixture.async_cache.open_file(inode).await?;
+        blob.seek(SeekFrom::Start(b"Baa, baa, black sheep, ".len() as u64))
+            .await?;
+        let mut buf = [0; 100];
+        let n = blob.read(&mut buf).await?;
+        assert_eq!(b"have you any wool?", &buf[0..n]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_blob_outside_available_ranges() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena)?;
+        let acache = fixture.arena_cache()?;
+        let inode = fixture.add_file("test.txt", 1000)?;
+
+        // Allocate blob id and create file
+        let blob_id = acache.open_file(inode)?.blob_id;
+
+        // Write test data to the blob file
+        let blob_path = fixture.blob_path(arena, blob_id);
+        let test_data = b"baa, baa";
+        std::fs::write(&blob_path, test_data)?;
+        acache.extend_local_availability(
+            blob_id,
+            ByteRanges::from_ranges(vec![ByteRange::new(0, test_data.len() as u64)]),
+        )?;
+
+        // Read from blob
+        let mut blob = fixture.async_cache.open_file(inode).await?;
+        blob.seek(SeekFrom::Start(20)).await?;
+        let mut buf = [0; 100];
+        let res = blob.read(&mut buf).await;
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(BlobIncomplete::matches(&err));
+
+        Ok(())
     }
 }

@@ -1,10 +1,10 @@
 use super::types::{
     BlobId, BlobTableEntry, DirTableEntry, FileAvailability, FileContent, FileMetadata,
-    FileTableEntry, InodeAssignment, PeerTableEntry, ReadDirEntry,
+    FileTableEntry, InodeAssignment, OpenBlob, PeerTableEntry, ReadDirEntry,
 };
 use crate::real::notifier::{Notification, Progress};
 use crate::utils::holder::Holder;
-use crate::{Blob, Inode, StorageError};
+use crate::{Inode, StorageError};
 use realize_types::{Arena, ByteRanges, Hash, Path, Peer, UnixTime};
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
 use std::collections::HashMap;
@@ -345,7 +345,7 @@ impl ArenaCache {
     }
 
     /// Open a file for reading/writing.
-    pub(crate) fn open_file(&self, inode: Inode) -> Result<Blob, StorageError> {
+    pub(crate) fn open_file(&self, inode: Inode) -> Result<OpenBlob, StorageError> {
         // Optimistically, try a read transaction to check whether the
         // blob is there.
         {
@@ -354,7 +354,12 @@ impl ArenaCache {
             if let Some(blob_id) = file_entry.content.blob {
                 let blob_entry = get_blob_entry(&txn.open_table(BLOB_TABLE)?, blob_id)?;
                 let file = self.open_blob_file(blob_id, file_entry.metadata.size, false)?;
-                return Ok(Blob::new(blob_id, file_entry, blob_entry, file));
+                return Ok(OpenBlob {
+                    blob_id,
+                    file_entry,
+                    blob_entry,
+                    file,
+                });
             }
         }
 
@@ -367,7 +372,12 @@ impl ArenaCache {
             if let Some(blob_id) = file_entry.content.blob {
                 let blob_entry = get_blob_entry(&txn.open_table(BLOB_TABLE)?, blob_id)?;
                 let file = self.open_blob_file(blob_id, file_entry.metadata.size, false)?;
-                return Ok(Blob::new(blob_id, file_entry, blob_entry, file));
+                return Ok(OpenBlob {
+                    blob_id,
+                    file_entry,
+                    blob_entry,
+                    file,
+                });
             }
 
             let mut blob_table = txn.open_table(BLOB_TABLE)?;
@@ -387,7 +397,12 @@ impl ArenaCache {
             file_entry.content.blob = Some(blob_id);
             file_table.insert((inode, ""), Holder::new(&file_entry)?)?;
 
-            Blob::new(blob_id, file_entry, blob_entry, file)
+            OpenBlob {
+                blob_id,
+                file_entry,
+                blob_entry,
+                file,
+            }
         };
         txn.commit()?;
 
@@ -1043,7 +1058,7 @@ fn do_unmark_peer_file(
 
 #[cfg(test)]
 mod tests {
-    use crate::BlobIncomplete;
+    use std::os::unix::fs::MetadataExt as _;
 
     use super::super::cache::UnrealCacheBlocking;
     use super::*;
@@ -1051,9 +1066,6 @@ mod tests {
     use assert_fs::prelude::*;
     use realize_types::ByteRange;
     use realize_types::{Arena, Path, Peer};
-    use std::io::SeekFrom;
-    use std::os::unix::fs::MetadataExt as _;
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
     const TEST_TIME: u64 = 1234567890;
 
@@ -1961,9 +1973,9 @@ mod tests {
 
         let blob_id = {
             let blob = acache.open_file(inode)?;
-            assert_eq!(BlobId(1), blob.id());
+            assert_eq!(BlobId(1), blob.blob_id);
 
-            let m = fixture.blob_path(arena, blob.id()).metadata()?;
+            let m = fixture.blob_path(arena, blob.blob_id).metadata()?;
 
             // File should have the right size
             assert_eq!(10000, m.len());
@@ -1972,15 +1984,15 @@ mod tests {
             assert_eq!(0, m.blocks());
 
             // Range empty for now
-            assert_eq!(ByteRanges::new(), *blob.local_availability());
+            assert_eq!(ByteRanges::new(), blob.blob_entry.written_areas);
 
-            blob.id()
+            blob.blob_id
         };
 
         // If called a second time, it should return a handle on the same file.
         let blob = acache.open_file(inode)?;
-        assert_eq!(blob_id, blob.id());
-        assert_eq!(ByteRanges::new(), *blob.local_availability());
+        assert_eq!(blob_id, blob.blob_id);
+        assert_eq!(ByteRanges::new(), blob.blob_entry.written_areas);
 
         Ok(())
     }
@@ -1998,7 +2010,7 @@ mod tests {
 
         // Open the file to create a blob
         let (inode, _) = acache.lookup_path(&file_path)?;
-        let blob_id = acache.open_file(inode)?.id();
+        let blob_id = acache.open_file(inode)?.blob_id;
 
         // Verify the blob file was created
         assert!(fixture.blob_file_exists(arena, blob_id));
@@ -2035,7 +2047,7 @@ mod tests {
 
         // Open the file to create a blob
         let (inode, _) = acache.lookup_path(&file_path)?;
-        let blob_id = acache.open_file(inode)?.id();
+        let blob_id = acache.open_file(inode)?.blob_id;
 
         // Verify the blob file was created
         assert!(fixture.blob_file_exists(arena, blob_id));
@@ -2062,7 +2074,7 @@ mod tests {
 
         // Open the file to create a blob
         let (inode, _) = acache.lookup_path(&file_path)?;
-        let blob_id = acache.open_file(inode)?.id();
+        let blob_id = acache.open_file(inode)?.blob_id;
 
         // Verify the blob file was created
         assert!(fixture.blob_file_exists(arena, blob_id));
@@ -2096,7 +2108,7 @@ mod tests {
 
         // Open the file to create a blob
         let (inode, _) = acache.lookup_path(&file_path)?;
-        let blob_id = acache.open_file(inode)?.id();
+        let blob_id = acache.open_file(inode)?.blob_id;
 
         // Initially, the blob should have empty written areas
         let initial_ranges = acache.local_availability(blob_id)?;
@@ -2138,109 +2150,6 @@ mod tests {
             acache.extend_local_availability(BlobId(99999), ByteRanges::new()),
             Err(StorageError::NotFound)
         ));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn read_blob_within_available_ranges() -> anyhow::Result<()> {
-        let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena)?;
-        let acache = fixture.arena_cache()?;
-        let file_path = Path::parse("test.txt")?;
-
-        fixture.add_file(&file_path, 1000, &test_time())?;
-        let inode = acache.lookup(acache.arena_root, "test.txt")?.inode;
-
-        // Allocate blob id and create file
-        let blob_id = acache.open_file(inode)?.id();
-
-        // Write some test data to the blob file
-        let blob_path = fixture.blob_path(arena, blob_id);
-        let test_data = b"Baa, baa, black sheep, have you any wool?";
-        std::fs::write(&blob_path, test_data)?;
-
-        acache.extend_local_availability(
-            blob_id,
-            ByteRanges::from_ranges(vec![ByteRange::new(0, test_data.len() as u64)]),
-        )?;
-
-        // Read from blob
-        let mut blob = acache.open_file(inode)?;
-
-        let mut buf = [0; 5];
-        let n = blob.read(&mut buf).await?;
-        assert_eq!(b"Baa, ", &buf[0..n]);
-
-        let mut buf = [0; 100];
-        let n = blob.read(&mut buf).await?;
-        assert_eq!(b"baa, black sheep, have you any wool?", &buf[0..n]);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn read_blob_after_seek_within_available_range() -> anyhow::Result<()> {
-        let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena)?;
-        let acache = fixture.arena_cache()?;
-        let file_path = Path::parse("test.txt")?;
-        fixture.add_file(&file_path, 1000, &test_time())?;
-        let inode = acache.lookup(acache.arena_root, "test.txt")?.inode;
-
-        // Allocate blob id and create file
-        let blob_id = acache.open_file(inode)?.id();
-
-        // Write test data to the blob file
-        let blob_path = fixture.blob_path(arena, blob_id);
-        let test_data = b"Baa, baa, black sheep, have you any wool?";
-        std::fs::write(&blob_path, test_data)?;
-
-        acache.extend_local_availability(
-            blob_id,
-            ByteRanges::from_ranges(vec![ByteRange::new(0, test_data.len() as u64)]),
-        )?;
-
-        // Read from blob
-        let mut blob = acache.open_file(inode)?;
-        blob.seek(SeekFrom::Start(b"Baa, baa, black sheep, ".len() as u64))
-            .await?;
-        let mut buf = [0; 100];
-        let n = blob.read(&mut buf).await?;
-        assert_eq!(b"have you any wool?", &buf[0..n]);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn read_blob_outside_available_ranges() -> anyhow::Result<()> {
-        let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena)?;
-        let acache = fixture.arena_cache()?;
-        let file_path = Path::parse("test.txt")?;
-        fixture.add_file(&file_path, 1000, &test_time())?;
-        let inode = acache.lookup(acache.arena_root, "test.txt")?.inode;
-
-        // Allocate blob id and create file
-        let blob_id = acache.open_file(inode)?.id();
-
-        // Write test data to the blob file
-        let blob_path = fixture.blob_path(arena, blob_id);
-        let test_data = b"baa, baa";
-        std::fs::write(&blob_path, test_data)?;
-        acache.extend_local_availability(
-            blob_id,
-            ByteRanges::from_ranges(vec![ByteRange::new(0, test_data.len() as u64)]),
-        )?;
-
-        // Read from blob
-        let mut blob = acache.open_file(inode)?;
-        blob.seek(SeekFrom::Start(20)).await?;
-        let mut buf = [0; 100];
-        let res = blob.read(&mut buf).await;
-        assert!(res.is_err());
-        let err = res.unwrap_err();
-        assert!(BlobIncomplete::matches(&err));
 
         Ok(())
     }
