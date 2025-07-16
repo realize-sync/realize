@@ -1,6 +1,7 @@
+use super::blob::OpenBlob;
 use super::types::{
     BlobId, BlobTableEntry, DirTableEntry, FileAvailability, FileContent, FileMetadata,
-    FileTableEntry, InodeAssignment, OpenBlob, PeerTableEntry, ReadDirEntry,
+    FileTableEntry, InodeAssignment, PeerTableEntry, ReadDirEntry,
 };
 use crate::real::notifier::{Notification, Progress};
 use crate::utils::holder::Holder;
@@ -131,6 +132,10 @@ impl ArenaCache {
             db,
             blob_dir,
         })
+    }
+
+    pub(crate) fn arena(&self) -> Arena {
+        self.arena
     }
 
     pub(crate) fn lookup(
@@ -655,17 +660,20 @@ impl ArenaCache {
         Ok(get_blob_entry(&blob_table, blob_id)?.written_areas)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn extend_local_availability(
         &self,
         blob_id: BlobId,
-        new_range: ByteRanges,
+        new_range: &ByteRanges,
     ) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
         {
             let mut blob_table = txn.open_table(BLOB_TABLE)?;
             let mut blob_entry = get_blob_entry(&blob_table, blob_id)?;
             blob_entry.written_areas = blob_entry.written_areas.union(&new_range);
+            log::debug!(
+                "{blob_id} extended by {new_range}; available: {}",
+                blob_entry.written_areas
+            );
 
             blob_table.insert(blob_id, Holder::with_content(blob_entry)?)?;
         }
@@ -2097,7 +2105,7 @@ mod tests {
     }
 
     #[test]
-    fn update_local_availability() -> anyhow::Result<()> {
+    fn blob_update_extends_range() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(arena)?;
         let acache = fixture.arena_cache()?;
@@ -2121,7 +2129,7 @@ mod tests {
             ByteRange::new(500, 600),
         ]);
 
-        acache.extend_local_availability(blob_id, written_areas.clone())?;
+        acache.extend_local_availability(blob_id, &written_areas)?;
 
         // Verify the written areas were updated
         let retrieved_ranges = acache.local_availability(blob_id)?;
@@ -2129,7 +2137,7 @@ mod tests {
 
         acache.extend_local_availability(
             blob_id,
-            ByteRanges::from_ranges(vec![ByteRange::new(50, 210), ByteRange::new(200, 400)]),
+            &ByteRanges::from_ranges(vec![ByteRange::new(50, 210), ByteRange::new(200, 400)]),
         )?;
 
         // Verify the ranges were updated again
@@ -2147,7 +2155,7 @@ mod tests {
 
         // Test that updating ranges for a non-existent blob returns NotFound
         assert!(matches!(
-            acache.extend_local_availability(BlobId(99999), ByteRanges::new()),
+            acache.extend_local_availability(BlobId(99999), &ByteRanges::new()),
             Err(StorageError::NotFound)
         ));
 

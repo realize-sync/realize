@@ -296,6 +296,18 @@ impl ByteRanges {
             .iter()
             .fold(0, |sum, range| sum + range.bytecount())
     }
+
+    /// Add all ranges from `other` to `self`.
+    pub fn extend(&mut self, mut other: ByteRanges) {
+        if self.ranges.is_empty() {
+            self.ranges = std::mem::take(&mut other.ranges)
+        } else {
+            for range in other.ranges.into_iter() {
+                self.add(&range)
+            }
+        }
+    }
+
     /// Adds a new ByteRange, merging as needed to maintain minimal, sorted, non-overlapping invariants.
     pub fn add(&mut self, range: &ByteRange) {
         if range.is_empty() {
@@ -525,6 +537,45 @@ mod byteranges_tests {
         b.add(&ByteRange::new(0, 5));
         b.add(&ByteRange::new(10, 15));
         assert_eq!(b.to_string(), "{[0, 5), [10, 15)}");
+    }
+    #[test]
+    fn extend() {
+        let mut a = ByteRanges::new();
+        a.add(&ByteRange::new(0, 5));
+        a.add(&ByteRange::new(10, 15));
+
+        let mut b = ByteRanges::new();
+        b.add(&ByteRange::new(3, 8));
+        b.add(&ByteRange::new(12, 20));
+
+        a.extend(b);
+
+        // Should merge overlapping ranges: [0,5) + [3,8) = [0,8), [10,15) + [12,20) = [10,20)
+        assert_eq!(a.ranges, vec![ByteRange::new(0, 8), ByteRange::new(10, 20)]);
+    }
+    #[test]
+    fn extend_empty() {
+        let mut a = ByteRanges::new();
+        a.add(&ByteRange::new(0, 5));
+
+        let empty = ByteRanges::new();
+        a.extend(empty);
+
+        // Should remain unchanged
+        assert_eq!(a.ranges, vec![ByteRange::new(0, 5)]);
+    }
+    #[test]
+    fn extend_into_empty() {
+        let mut a = ByteRanges::new();
+
+        let mut b = ByteRanges::new();
+        b.add(&ByteRange::new(0, 5));
+        b.add(&ByteRange::new(10, 15));
+
+        a.extend(b);
+
+        // Should take all ranges from b
+        assert_eq!(a.ranges, vec![ByteRange::new(0, 5), ByteRange::new(10, 15)]);
     }
     #[test]
     fn test_chunked() {

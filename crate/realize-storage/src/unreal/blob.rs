@@ -1,9 +1,12 @@
-use super::types::{BlobId, OpenBlob};
-use realize_types::{ByteRanges, Hash};
+use super::cache::UnrealCacheBlocking;
+use super::types::{BlobId, BlobTableEntry, FileTableEntry};
+use crate::StorageError;
+use realize_types::{Arena, ByteRange, ByteRanges, Hash};
 use std::io::SeekFrom;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
+use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 
 /// Error returned by Blob when reading outside the available range.
 ///
@@ -26,6 +29,13 @@ impl BlobIncomplete {
     }
 }
 
+pub(crate) struct OpenBlob {
+    pub blob_id: BlobId,
+    pub file_entry: FileTableEntry,
+    pub blob_entry: BlobTableEntry,
+    pub file: std::fs::File,
+}
+
 /// A blob that provides async read and seek access to file data.
 ///
 /// Attempts to read outside of available range will result in an I/O
@@ -34,9 +44,16 @@ impl BlobIncomplete {
 pub struct Blob {
     blob_id: BlobId,
     file: tokio::fs::File,
-    available_ranges: ByteRanges,
     size: u64,
     hash: Hash,
+    cache: Arc<UnrealCacheBlocking>,
+    arena: Arena,
+
+    /// Complete available range
+    available_ranges: ByteRanges,
+    /// Updates to the available range already integrated into
+    /// available_range but not yet reported to update_tx.
+    pending_ranges: ByteRanges,
 
     /// The read/write/seek position.
     position: u64,
@@ -45,11 +62,14 @@ pub struct Blob {
 #[allow(dead_code)]
 impl Blob {
     /// Create a new blob from a file and its available byte ranges.
-    pub(crate) fn new(def: OpenBlob) -> Self {
+    pub(crate) fn new(def: OpenBlob, cache: Arc<UnrealCacheBlocking>, arena: Arena) -> Self {
         Self {
             blob_id: def.blob_id,
             file: tokio::fs::File::from_std(def.file),
             available_ranges: def.blob_entry.written_areas,
+            cache,
+            arena,
+            pending_ranges: ByteRanges::new(),
             size: def.file_entry.metadata.size,
             hash: def.file_entry.content.hash,
             position: 0,
@@ -76,6 +96,34 @@ impl Blob {
     /// The blob ID is also used to construct the file path.
     pub(crate) fn id(&self) -> BlobId {
         self.blob_id
+    }
+
+    pub(crate) async fn update_db(&mut self) -> Result<(), StorageError> {
+        if self.pending_ranges.is_empty() {
+            return Ok(());
+        }
+        self.file.flush().await?;
+        self.file.sync_all().await?;
+
+        let cache = Arc::clone(&self.cache);
+        let blob_id = self.blob_id;
+        let arena = self.arena;
+        let ranges = std::mem::take(&mut self.pending_ranges);
+        let (res, ranges) = tokio::task::spawn_blocking(move || {
+            (
+                match cache.arena_cache(arena) {
+                    Err(err) => Err(err),
+                    Ok(cache) => cache.extend_local_availability(blob_id, &ranges),
+                },
+                ranges,
+            )
+        })
+        .await?;
+        if !res.is_ok() {
+            self.pending_ranges.extend(ranges);
+        }
+
+        res
     }
 
     /// Adjust the len to cover only the available portion of the requested range.
@@ -153,6 +201,37 @@ impl AsyncSeek for Blob {
     }
 }
 
+impl AsyncWrite for Blob {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let res = Pin::new(&mut self.file).poll_write(cx, buf);
+
+        if let Poll::Ready(Ok(len)) = &res {
+            if *len > 0 {
+                let start = self.position;
+                let end = start + (*len as u64);
+                self.position = end;
+                let range = ByteRange::new(start, end);
+                self.available_ranges.add(&range);
+                self.pending_ranges.add(&range);
+            }
+        }
+
+        res
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.file).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.file).poll_shutdown(cx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::cache::UnrealCacheBlocking;
@@ -161,13 +240,12 @@ mod tests {
     use crate::{Inode, Notification, UnrealCacheAsync};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
-    use realize_types::ByteRange;
-    use realize_types::UnixTime;
-    use realize_types::{Arena, Path, Peer};
+    use realize_types::{Arena, Path, Peer, UnixTime};
     use redb::Database;
     use std::io::SeekFrom;
     use std::sync::Arc;
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    use tokio::fs;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
     fn test_peer() -> Peer {
         Peer::from("test_peer")
@@ -264,10 +342,8 @@ mod tests {
         let test_data = b"Baa, baa, black sheep, have you any wool?";
         std::fs::write(&blob_path, test_data)?;
 
-        acache.extend_local_availability(
-            blob_id,
-            ByteRanges::from_ranges(vec![ByteRange::new(0, test_data.len() as u64)]),
-        )?;
+        acache
+            .extend_local_availability(blob_id, &ByteRanges::single(0, test_data.len() as u64))?;
 
         // Read from blob
         let mut blob = fixture.async_cache.open_file(inode).await?;
@@ -299,10 +375,8 @@ mod tests {
         let test_data = b"Baa, baa, black sheep, have you any wool?";
         std::fs::write(&blob_path, test_data)?;
 
-        acache.extend_local_availability(
-            blob_id,
-            ByteRanges::from_ranges(vec![ByteRange::new(0, test_data.len() as u64)]),
-        )?;
+        acache
+            .extend_local_availability(blob_id, &ByteRanges::single(0, test_data.len() as u64))?;
 
         // Read from blob
         let mut blob = fixture.async_cache.open_file(inode).await?;
@@ -329,10 +403,8 @@ mod tests {
         let blob_path = fixture.blob_path(arena, blob_id);
         let test_data = b"baa, baa";
         std::fs::write(&blob_path, test_data)?;
-        acache.extend_local_availability(
-            blob_id,
-            ByteRanges::from_ranges(vec![ByteRange::new(0, test_data.len() as u64)]),
-        )?;
+        acache
+            .extend_local_availability(blob_id, &ByteRanges::single(0, test_data.len() as u64))?;
 
         // Read from blob
         let mut blob = fixture.async_cache.open_file(inode).await?;
@@ -342,6 +414,72 @@ mod tests {
         assert!(res.is_err());
         let err = res.unwrap_err();
         assert!(BlobIncomplete::matches(&err));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writing_to_blob_updates_local_availability() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena)?;
+        let acache = fixture.arena_cache()?;
+        let inode = fixture.add_file("test.txt", 21)?;
+
+        // Write to blob
+        let mut blob = fixture.async_cache.open_file(inode).await?;
+        let blob_id = blob.id();
+
+        blob.write(b"baa, baa").await?;
+        assert_eq!(ByteRanges::single(0, 8), *blob.local_availability());
+        assert_eq!(ByteRanges::new(), acache.local_availability(blob_id)?);
+
+        blob.write(b", black sheep").await?;
+        assert_eq!(ByteRanges::single(0, 21), *blob.local_availability());
+        assert_eq!(ByteRanges::new(), acache.local_availability(blob_id)?);
+
+        blob.update_db().await?;
+        assert_eq!(
+            ByteRanges::single(0, 21),
+            acache.local_availability(blob_id)?
+        );
+        drop(blob);
+
+        assert_eq!(
+            "baa, baa, black sheep",
+            fs::read_to_string(fixture.blob_path(arena, blob_id)).await?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writing_to_blob_out_of_order() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena)?;
+        let acache = fixture.arena_cache()?;
+        let inode = fixture.add_file("test.txt", 21)?;
+
+        // Write to blob
+        let mut blob = fixture.async_cache.open_file(inode).await?;
+        let blob_id = blob.id();
+
+        blob.seek(SeekFrom::Start(8)).await?;
+        blob.write(b", black sheep").await?;
+
+        blob.seek(SeekFrom::Start(0)).await?;
+        blob.write(b"baa, baa").await?;
+
+        blob.update_db().await?;
+        assert_eq!(
+            ByteRanges::single(0, 21),
+            acache.local_availability(blob_id)?
+        );
+        drop(blob);
+
+        assert_eq!(
+            "baa, baa, black sheep",
+            fs::read_to_string(fixture.blob_path(arena, blob_id)).await?
+        );
 
         Ok(())
     }

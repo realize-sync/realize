@@ -9,13 +9,6 @@ use realize_types::{self, Arena, ByteRanges, Hash, Path, Peer, UnixTime};
 use redb::{Key, TypeName, Value};
 use uuid::Uuid;
 
-pub(crate) struct OpenBlob {
-    pub blob_id: BlobId,
-    pub file_entry: FileTableEntry,
-    pub blob_entry: BlobTableEntry,
-    pub file: std::fs::File,
-}
-
 /// A file and all versions known to the cache.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FileAvailability {
