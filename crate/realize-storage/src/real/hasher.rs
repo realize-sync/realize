@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
-use realize_types::{self, Hash, UnixTime};
 use crate::utils::hash;
 use futures::TryStreamExt as _;
+use realize_types::{self, Hash, UnixTime};
 use tokio::fs::File;
 use tokio::sync::mpsc;
 use tokio_util::io::ReaderStream;

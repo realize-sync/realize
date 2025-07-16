@@ -1,5 +1,5 @@
-use realize_types::{self, Arena};
 use crate::utils::holder::ByteConversionError;
+use realize_types::{self, Arena};
 use tokio::task::JoinError;
 
 /// Error returned by the [UnrealCache].

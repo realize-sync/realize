@@ -10,4 +10,4 @@ pub use byterange::{ByteRange, ByteRanges};
 pub use data::{Delta, Hash, Signature};
 pub use path::{Path, PathError};
 pub use peer::Peer;
-pub use time::UnixTime; 
+pub use time::UnixTime;

@@ -3,8 +3,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use super::index::RealIndexAsync;
-use realize_types::{self, Hash, UnixTime};
 use crate::StorageError;
+use realize_types::{self, Hash, UnixTime};
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 
@@ -81,11 +81,11 @@ impl AsyncSeek for Reader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use realize_types::Arena;
     use crate::utils::hash;
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
+    use realize_types::Arena;
     use tokio::fs;
     use tokio::io::AsyncReadExt as _;
 
@@ -221,7 +221,12 @@ mod tests {
         root.child("fs_only").write_str("that's not enough")?;
 
         assert!(matches!(
-            Reader::open(&fixture.index, root.path(), &realize_types::Path::parse("fs_only")?).await,
+            Reader::open(
+                &fixture.index,
+                root.path(),
+                &realize_types::Path::parse("fs_only")?
+            )
+            .await,
             Err(StorageError::NotFound)
         ));
 

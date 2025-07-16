@@ -5,4 +5,4 @@ fn main() {
         .file("capnp/testing/hello.capnp")
         .run()
         .expect("capnpc failed");
-} 
+}
