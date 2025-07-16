@@ -56,7 +56,7 @@ pub struct Blob {
     pending_ranges: ByteRanges,
 
     /// The read/write/seek position.
-    position: u64,
+    offset: u64,
 }
 
 #[allow(dead_code)]
@@ -72,13 +72,20 @@ impl Blob {
             pending_ranges: ByteRanges::new(),
             size: def.file_entry.metadata.size,
             hash: def.file_entry.content.hash,
-            position: 0,
+            offset: 0,
         }
     }
 
     /// Get the size of the corresponding file.
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    /// Current read/write position within the file.
+    ///
+    /// This is the position relative to the start of the file.
+    pub fn offset(&self) -> u64 {
+        self.offset
     }
 
     /// Get the parts of the file that are available locally.
@@ -128,10 +135,10 @@ impl Blob {
 
     /// Adjust the len to cover only the available portion of the requested range.
     fn adjusted_len(&self, requested_len: usize) -> Option<usize> {
-        let available = ByteRanges::single(self.position, requested_len as u64)
+        let available = ByteRanges::single(self.offset, requested_len as u64)
             .intersection(&self.available_ranges);
         if let Some(range) = available.iter().next()
-            && range.start == self.position
+            && range.start == self.offset
         {
             return Some(range.bytecount() as usize);
         }
@@ -163,7 +170,7 @@ impl AsyncRead for Blob {
                     Poll::Ready(Ok(())) => {
                         let filled = shortbuf.filled().len();
                         let initialized = shortbuf.initialized().len();
-                        self.position += filled as u64;
+                        self.offset += filled as u64;
                         drop(shortbuf);
 
                         // We know at least initialized bytes of the
@@ -192,7 +199,7 @@ impl AsyncSeek for Blob {
     fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
         match Pin::new(&mut self.file).poll_complete(cx) {
             Poll::Ready(Ok(pos)) => {
-                self.position = pos;
+                self.offset = pos;
                 Poll::Ready(Ok(pos))
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -211,9 +218,9 @@ impl AsyncWrite for Blob {
 
         if let Poll::Ready(Ok(len)) = &res {
             if *len > 0 {
-                let start = self.position;
+                let start = self.offset;
                 let end = start + (*len as u64);
-                self.position = end;
+                self.offset = end;
                 let range = ByteRange::new(start, end);
                 self.available_ranges.add(&range);
                 self.pending_ranges.add(&range);

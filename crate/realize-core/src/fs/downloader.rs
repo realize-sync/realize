@@ -47,7 +47,7 @@ pub struct Download {
     offset: u64,
     pending_seek: Option<u64>,
     avail: VecDeque<(ByteRange, Vec<u8>)>,
-    pending: Option<(ByteRange, PendingDownload)>,
+    state: DlState,
 }
 
 type PendingDownload = Pin<Box<dyn Future<Output = Result<Vec<u8>, std::io::Error>> + Send + Sync>>;
@@ -63,7 +63,7 @@ impl Download {
             offset: 0,
             pending_seek: None,
             avail: VecDeque::new(),
-            pending: None,
+            state: DlState::Initial,
         }
     }
 
@@ -143,30 +143,34 @@ impl Download {
         (range, fut)
     }
 
-    fn inner_poll_read(
-        &mut self,
+    /// State-based handler for poll_read.
+    ///
+    /// Returns the next state and optionally a poll value to return.
+    fn handle_poll_read(
+        self: &mut Pin<&mut Self>,
+        state: DlState,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        if self.offset >= self.size || self.fill(buf) {
-            return Poll::Ready(Ok(()));
-        }
-        let (range, mut fut) = match self.pending.take() {
-            Some(existing) => existing,
-            None => self.next_request(buf.capacity()),
-        };
-        match fut.as_mut().poll(cx) {
-            Poll::Ready(Ok(data)) => {
-                self.avail.push_back((range, data));
+    ) -> (DlState, Option<Poll<std::io::Result<()>>>) {
+        match state {
+            DlState::Initial => {
+                if self.offset >= self.size || self.fill(buf) {
+                    return (DlState::Initial, Some(Poll::Ready(Ok(()))));
+                }
 
-                self.inner_poll_read(cx, buf)
-            }
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-            Poll::Pending => {
-                self.pending = Some((range, fut));
+                let (r, fut) = self.next_request(buf.capacity());
 
-                Poll::Pending
+                (DlState::Downloading(r, fut), None)
             }
+            DlState::Downloading(r, mut fut) => match fut.as_mut().poll(cx) {
+                Poll::Ready(Ok(data)) => {
+                    self.avail.push_back((r.clone(), data));
+
+                    (DlState::Initial, None)
+                }
+                Poll::Ready(Err(err)) => (DlState::Initial, Some(Poll::Ready(Err(err)))),
+                Poll::Pending => (DlState::Downloading(r, fut), Some(Poll::Pending)),
+            },
         }
     }
 }
@@ -212,10 +216,10 @@ impl AsyncSeek for Download {
         match this.pending_seek.take() {
             None => Poll::Ready(Ok(this.offset)),
             Some(goal) => {
-                if let Some((range, _)) = &this.pending {
-                    if !range.contains(goal) {
-                        this.pending = None;
-                    }
+                if let DlState::Downloading(range, _) = &this.state
+                    && !range.contains(goal)
+                {
+                    this.state = DlState::Initial;
                 }
                 while this
                     .avail
@@ -233,13 +237,27 @@ impl AsyncSeek for Download {
     }
 }
 
+#[derive(Default)]
+enum DlState {
+    #[default]
+    Initial,
+    Downloading(ByteRange, PendingDownload),
+}
+
 impl AsyncRead for Download {
     fn poll_read(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        self.get_mut().inner_poll_read(cx, buf)
+        loop {
+            let prev = std::mem::take(&mut self.state);
+            let (next, ret) = self.handle_poll_read(prev, cx, buf);
+            self.state = next;
+            if let Some(ret) = ret {
+                return ret;
+            }
+        }
     }
 }
 
