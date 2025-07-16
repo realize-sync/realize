@@ -483,4 +483,23 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn writing_to_blob_then_reading_it() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena)?;
+        let inode = fixture.add_file("test.txt", 100)?;
+
+        let mut blob = fixture.async_cache.open_file(inode).await?;
+
+        blob.write(b"baa, baa, black sheep").await?;
+
+        blob.seek(SeekFrom::Start(10)).await?;
+
+        let mut buf = [0; 100];
+        let n = blob.read(&mut buf).await?;
+        assert_eq!(b"black sheep", &buf[0..n]);
+
+        Ok(())
+    }
 }
