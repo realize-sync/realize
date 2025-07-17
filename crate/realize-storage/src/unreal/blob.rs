@@ -90,6 +90,12 @@ impl Blob {
     }
 
     /// Get the parts of the file that are available locally.
+    ///
+    /// This might differ from local availability as reported by the
+    /// cache, since this:
+    /// - includes ranges that have been written to the file, but
+    ///   haven't been flushed yet.
+    /// - does not include ranges written through other file handles
     pub fn local_availability(&self) -> &ByteRanges {
         &self.available_ranges
     }

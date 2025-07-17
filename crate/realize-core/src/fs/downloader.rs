@@ -1,7 +1,7 @@
 use crate::rpc::Household;
 use futures::Future;
 use realize_storage::{Blob, Inode, StorageError, UnrealCacheAsync};
-use realize_types::{Arena, ByteRange, Path, Peer};
+use realize_types::{Arena, ByteRange, ByteRanges, Path, Peer};
 use std::cmp::min;
 use std::collections::VecDeque;
 use std::io::{ErrorKind, SeekFrom};
@@ -10,8 +10,16 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite as _, ReadBuf};
 use tokio_stream::StreamExt;
 
-const MIN_CHUNK_SIZE: usize = 8 * 1024;
-const MAX_CHUNK_SIZE: usize = 32 * 1024;
+/// Minimum size of a chunk read from a remote peer.
+///
+/// This should be a multiple of 4k, to match the most common
+/// filesystem block sizes.
+const MIN_CHUNK_SIZE: u64 = 8 * 1024;
+
+/// Maximum size of a chunk read from a remote peer.
+///
+/// This should be a multiple of MIN_CHUNK_SIZE.
+const MAX_CHUNK_SIZE: u64 = 4 * MIN_CHUNK_SIZE;
 
 #[derive(Clone)]
 pub struct Downloader {
@@ -121,6 +129,17 @@ impl Download {
         self.blob.update_db().await
     }
 
+    /// Get the parts of the file that are available locally.
+    ///
+    /// This might differ from local availability as reported by the
+    /// cache, since this:
+    /// - includes ranges that have been written to the file, but
+    ///   haven't been flushed yet.
+    /// - does not include ranges written through other file handles
+    pub fn local_availability(&self) -> &ByteRanges {
+        self.blob.local_availability()
+    }
+
     fn fill(&mut self, buf: &mut ReadBuf<'_>) -> bool {
         let requested = ByteRange::new(self.offset, self.offset + buf.remaining() as u64);
         let mut filled = false;
@@ -150,19 +169,25 @@ impl Download {
     fn next_request(&mut self, bufsize: usize) -> (ByteRange, PendingDownload) {
         let offset = self.offset;
         let end = self.size;
-        let next = self
+        let mut next = self
             .avail
             .back()
             .map(|(range, _)| range.end)
             .unwrap_or(offset);
 
-        let range = ByteRange::new(
-            next,
-            min(
-                end,
-                next + bufsize.clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE) as u64,
-            ),
-        );
+        // Align to MIN_CHUNK_SIZE, so the blocks start and end at
+        // consistent positions. This will also match filesystem
+        // blocks, to avoid wasting disk space when the blocks are
+        // stored in sparse files.
+        let align = next % MIN_CHUNK_SIZE;
+        next -= align;
+        let mut bufsize = bufsize as u64 + align;
+        bufsize += MIN_CHUNK_SIZE - (bufsize % MIN_CHUNK_SIZE);
+        if bufsize > MAX_CHUNK_SIZE {
+            bufsize = MAX_CHUNK_SIZE;
+        }
+
+        let range = ByteRange::new(next, min(end, next + bufsize));
 
         log::debug!("Download [{}]/{} {range}", self.arena, self.path);
 
@@ -625,8 +650,9 @@ mod tests {
 
     #[tokio::test]
     async fn seek_mixed_with_read() -> anyhow::Result<()> {
-        let mut fixture = HouseholdFixture::setup().await?;
+        let mut fixture = Fixture::setup().await?;
         fixture
+            .inner
             .with_two_peers()
             .await?
             .interconnected()
@@ -634,7 +660,7 @@ mod tests {
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
 
-                let b_dir = fixture.arena_root(b);
+                let b_dir = fixture.inner.arena_root(b);
                 let path = b_dir.join("large_file");
                 {
                     let mut f = std::fs::File::create(&path)?;
@@ -643,17 +669,14 @@ mod tests {
                     f.write(&[2u8; 8 * 1024])?;
                 }
 
-                fixture.wait_for_file_in_cache(a, "large_file").await?;
-
-                let cache = fixture.cache(a)?;
-                let downloader = Downloader::new(household_a, cache.clone());
-
-                let arena = HouseholdFixture::test_arena();
-                let (inode, _) = cache
-                    .lookup_path(arena, &Path::parse("large_file")?)
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "large_file")
                     .await?;
 
-                let mut reader = downloader.reader(inode).await?;
+                let downloader = Downloader::new(household_a, fixture.inner.cache(a)?.clone());
+
+                let mut reader = fixture.reader(&downloader, "large_file").await?;
 
                 let mut buf = [0u8; 16];
                 reader.read_exact(&mut buf).await?;
@@ -670,6 +693,79 @@ mod tests {
                 reader.seek(SeekFrom::Start(8 * 1024)).await?;
                 reader.read_exact(&mut buf).await?;
                 assert_eq!([0u8; 16], buf);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_partially_available_file_offline() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                testing::connect(&household_a, b).await?;
+
+                let b_dir = fixture.inner.arena_root(b);
+                let path = b_dir.join("large_file");
+                {
+                    let mut f = std::fs::File::create(&path)?;
+                    f.write(&[1u8; MIN_CHUNK_SIZE as usize])?;
+                    f.write(&[0u8; MIN_CHUNK_SIZE as usize])?;
+                    f.write(&[2u8; MIN_CHUNK_SIZE as usize])?;
+                }
+
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "large_file")
+                    .await?;
+
+                let downloader =
+                    Downloader::new(household_a.clone(), fixture.inner.cache(a)?.clone());
+
+                let mut reader = fixture.reader(&downloader, "large_file").await?;
+
+                // Read near start; stores the 1st block
+                reader.seek(SeekFrom::Start(100)).await?;
+                let mut buf = [0u8; 16];
+                reader.read_exact(&mut buf).await?;
+
+                // Read near end; stores the last block
+                reader.seek(SeekFrom::End(-100)).await?;
+                reader.read_exact(&mut buf).await?;
+
+                testing::disconnect(&household_a, b).await?;
+
+                let block = MIN_CHUNK_SIZE;
+                assert_eq!(
+                    ByteRanges::from_ranges(vec![
+                        ByteRange::new(0, block),
+                        ByteRange::new(2 * block, 3 * block)
+                    ]),
+                    *reader.local_availability()
+                );
+
+                // Read from first block succeeds.
+                reader.seek(SeekFrom::Start(16)).await?;
+                let mut buf = [0u8; 16];
+                reader.read_exact(&mut buf).await?;
+                assert_eq!([1u8; 16], buf);
+
+                // Read from last block succeeds.
+                reader.seek(SeekFrom::End(-32)).await?;
+                reader.read_exact(&mut buf).await?;
+                assert_eq!([2u8; 16], buf);
+
+                // Read from middle block fails.
+                reader.seek(SeekFrom::Start(block)).await?;
+                assert!(reader.read_exact(&mut buf).await.is_err());
 
                 Ok::<(), anyhow::Error>(())
             })
