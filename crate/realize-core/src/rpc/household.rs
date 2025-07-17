@@ -60,8 +60,25 @@ impl Household {
     }
 
     /// Keep a client connection up to all peers for which an address is known.
-    pub fn keep_connected(&self) -> anyhow::Result<()> {
-        self.manager.keep_connected()
+    pub fn keep_all_connected(&self) -> anyhow::Result<()> {
+        self.manager.keep_all_connected()
+    }
+
+    /// Disconnects from all peers and stop trying to connect to peers.
+    pub fn disconnect_all(&self) -> anyhow::Result<()> {
+        self.manager.disconnect_all()
+    }
+
+    /// Keep a client connection up to the given peer.
+    ///
+    /// Does nothing if no address is known for the peer.
+    pub fn keep_peer_connected(&self, peer: Peer) -> anyhow::Result<()> {
+        self.manager.keep_peer_connected(peer)
+    }
+
+    /// Disconnects the peer and stop trying to connect to peers.
+    pub fn disconnect_peer(&self, peer: Peer) -> anyhow::Result<()> {
+        self.manager.disconnect_peer(peer)
     }
 
     /// Report peer status changes through the given receiver.

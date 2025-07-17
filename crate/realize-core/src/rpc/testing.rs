@@ -203,8 +203,8 @@ impl WithTwoPeers {
                 let mut status_a = household_a.peer_status();
                 let mut status_b = household_b.peer_status();
 
-                household_a.keep_connected()?;
-                household_b.keep_connected()?;
+                household_a.keep_all_connected()?;
+                household_b.keep_all_connected()?;
 
                 let delay = Duration::from_secs(3);
                 assert_eq!(

@@ -68,7 +68,7 @@ impl SetupHelper {
 
         let has_cache = storage.cache().is_some();
         if has_cache {
-            household.keep_connected()?;
+            household.keep_all_connected()?;
         }
         household.register(&mut server);
 

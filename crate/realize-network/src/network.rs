@@ -75,6 +75,11 @@ impl Networking {
         self.addresses.keys().cloned()
     }
 
+    /// Check whether the peer is connectable.
+    pub fn is_connectable(&self, peer: Peer) -> bool {
+        self.addresses.contains_key(&peer)
+    }
+
     pub async fn connect<Req, Resp>(
         &self,
         peer: Peer,

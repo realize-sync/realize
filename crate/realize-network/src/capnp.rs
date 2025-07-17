@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, LocalSet};
 use tokio_retry::strategy::ExponentialBackoff;
 use tokio_util::compat::TokioAsyncReadCompatExt;
+use tokio_util::sync::CancellationToken;
 
 use realize_types::Peer;
 
@@ -37,7 +38,20 @@ enum ConnectionMessage<O> {
         stream: Box<tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>>,
         shutdown_rx: broadcast::Receiver<()>,
     },
-    KeepConnected,
+    /// Connect to all peers that have an address and attempt to keep
+    /// the connection up.
+    KeepAllConnected,
+
+    /// Disconnect for all peers. This disables KeepConnected.
+    DisconnectAll,
+
+    /// Attempt to keep the connection up for a single peer.
+    ///
+    /// Does nothing unless an address is known for the peer.
+    KeepPeerConnected(Peer),
+
+    /// Disconnects the peer and/or stop trying to connect to it.
+    DisconnectPeer(Peer),
 
     /// Execute the given operation on the first peer from the list
     /// that is already connected.
@@ -46,10 +60,7 @@ enum ConnectionMessage<O> {
     ///
     /// Operations usually include a channel to use to send a reply
     /// back.
-    PeerOperation {
-        peers: Vec<Peer>,
-        operation: O,
-    },
+    PeerOperation { peers: Vec<Peer>, operation: O },
 }
 
 #[allow(async_fn_in_trait)]
@@ -98,7 +109,14 @@ where
                             stream,
                             shutdown_rx,
                         } => ctx.accept(peer, stream, shutdown_rx),
-                        ConnectionMessage::KeepConnected => ctx.keep_connected(),
+                        ConnectionMessage::KeepAllConnected => ctx.keep_all_connected(),
+                        ConnectionMessage::DisconnectAll => ctx.disconnect_all(),
+                        ConnectionMessage::KeepPeerConnected(peer) => {
+                            if ctx.networking.is_connectable(peer) {
+                                ctx.keep_peer_connected(peer);
+                            }
+                        }
+                        ConnectionMessage::DisconnectPeer(peer) => ctx.disconnect_peer(peer),
                         ConnectionMessage::PeerOperation { peers, operation } => {
                             ctx.with_any_peer_client(peers, operation);
                         }
@@ -139,11 +157,35 @@ where
     }
 
     /// Keep a client connection up to all peers for which an address is known.
-    pub fn keep_connected(&self) -> anyhow::Result<()> {
-        self.tx.send(ConnectionMessage::KeepConnected)?;
+    pub fn keep_all_connected(&self) -> anyhow::Result<()> {
+        self.tx.send(ConnectionMessage::KeepAllConnected)?;
 
         Ok(())
     }
+
+    /// Disconnect from all servers. Stop trying to connect to other peers.
+    pub fn disconnect_all(&self) -> anyhow::Result<()> {
+        self.tx.send(ConnectionMessage::DisconnectAll)?;
+
+        Ok(())
+    }
+
+    /// Keep a client connection up to the given peer.
+    ///
+    /// Has no effect if no address is known for the peer
+    pub fn keep_peer_connected(&self, peer: Peer) -> anyhow::Result<()> {
+        self.tx.send(ConnectionMessage::KeepPeerConnected(peer))?;
+
+        Ok(())
+    }
+
+    /// Disconnect from all servers. Stop trying to connect to other peers.
+    pub fn disconnect_peer(&self, peer: Peer) -> anyhow::Result<()> {
+        self.tx.send(ConnectionMessage::DisconnectPeer(peer))?;
+
+        Ok(())
+    }
+
     /// Register peer connections to the given server.
     ///
     /// With this call, the server answers to PEER calls as Cap'n Proto
@@ -176,8 +218,18 @@ where
 struct TrackedPeerConnections<C> {
     tracked_client: Option<C>,
     tracker: Option<JoinHandle<()>>,
+    cancel: CancellationToken,
 }
 
+impl<C> TrackedPeerConnections<C> {
+    pub fn new() -> Self {
+        TrackedPeerConnections {
+            tracked_client: None,
+            tracker: None,
+            cancel: CancellationToken::new(),
+        }
+    }
+}
 impl<H, C, O> AppContext<H, C, O>
 where
     H: ConnectionHandler<C, O> + 'static,
@@ -232,32 +284,54 @@ where
         });
     }
 
-    fn keep_connected(self: &Rc<Self>) {
+    fn keep_all_connected(self: &Rc<Self>) {
         for peer in self.networking.connectable_peers() {
-            let mut borrow = self.connections.borrow_mut();
-            let conn = borrow
-                .entry(peer)
-                .or_insert_with(|| TrackedPeerConnections {
-                    tracked_client: None,
-                    tracker: None,
-                });
+            self.keep_peer_connected(peer);
+        }
+    }
+
+    fn keep_peer_connected(self: &Rc<Self>, peer: Peer) {
+        let mut borrow = self.connections.borrow_mut();
+        let conn = borrow
+            .entry(peer)
+            .or_insert_with(TrackedPeerConnections::new);
+        if conn.cancel.is_cancelled() {
+            conn.tracker = None;
+            conn.cancel = CancellationToken::new();
+        } else {
             let has_usable_tracker = conn
                 .tracker
                 .as_ref()
                 .map(|t| !t.is_finished())
                 .unwrap_or(false);
             if has_usable_tracker {
-                continue;
+                // Already running
+                return;
             }
+        }
 
-            let this = Rc::clone(self);
-            conn.tracker = Some(tokio::task::spawn_local(async move {
-                this.track_peer(peer).await
-            }));
+        let this = Rc::clone(self);
+        let cancel = conn.cancel.clone();
+        conn.tracker = Some(tokio::task::spawn_local(async move {
+            this.track_peer(peer, cancel).await
+        }));
+    }
+
+    fn disconnect_peer(self: &Rc<Self>, peer: Peer) {
+        let borrow = self.connections.borrow();
+        if let Some(conn) = borrow.get(&peer) {
+            conn.cancel.cancel();
         }
     }
 
-    async fn track_peer(self: &Rc<Self>, peer: Peer) {
+    fn disconnect_all(self: &Rc<Self>) {
+        let borrow = self.connections.borrow();
+        for conn in borrow.values() {
+            conn.cancel.cancel();
+        }
+    }
+
+    async fn track_peer(self: &Rc<Self>, peer: Peer, cancel: CancellationToken) {
         let retry_strategy =
             ExponentialBackoff::from_millis(500).max_delay(Duration::from_secs(5 * 60));
         let mut current_backoff: Option<ExponentialBackoff> = None;
@@ -269,7 +343,9 @@ where
                         return;
                     }
                     Some(delay) => {
-                        tokio::time::sleep(delay).await;
+                        tokio::select!(
+                        _ = cancel.cancelled() => { return },
+                        _ = tokio::time::sleep(delay) => {});
                     }
                 },
                 None => {
@@ -277,17 +353,18 @@ where
                     current_backoff = Some(retry_strategy.clone());
                 }
             }
-            let stream = match self
-                .networking
-                .connect_raw(peer, self.handler.tag(), None)
-                .await
-            {
-                Ok(stream) => stream,
-                Err(err) => {
-                    log::debug!("Failed to connect to {peer}: {err}; Will retry.");
-                    continue;
+            let stream = tokio::select!(
+                _ = cancel.cancelled() => {
+                    return;
                 }
-            };
+                connected = self.networking.connect_raw(peer, self.handler.tag(), None) =>  match connected {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        log::debug!("Failed to connect to {peer}: {err}; Will retry.");
+                        continue;
+                    }
+                }
+            );
 
             let (r, w) = TokioAsyncReadCompatExt::compat(stream).split();
             let mut net = Box::new(VatNetwork::new(
@@ -326,9 +403,14 @@ where
             // We're fully connected. Reset the backoff delay for next time.
             current_backoff = None;
 
-            if let Err(err) = until_shutdown.await {
-                log::debug!("Connection to {peer} was shutdown: {err}; Will reconnect.")
-            }
+            tokio::select!(
+                _ = cancel.cancelled() => {
+                    return;
+                }
+                res = until_shutdown => if let Err(err) = res {
+                    log::debug!("Connection to {peer} was shutdown: {err}; Will reconnect.")
+                },
+            );
         }
     }
 
@@ -337,10 +419,7 @@ where
         self.connections
             .borrow_mut()
             .entry(peer)
-            .or_insert_with(|| TrackedPeerConnections {
-                tracked_client: None,
-                tracker: None,
-            })
+            .or_insert_with(TrackedPeerConnections::new)
             .tracked_client = client;
     }
 
@@ -623,11 +702,11 @@ mod tests {
                 let mut status_a = manager_a.peer_status();
                 let mut status_b = manager_b.peer_status();
 
-                manager_a.keep_connected()?;
+                manager_a.keep_all_connected()?;
                 assert_eq!(PeerStatus::Connected(b), status_a.recv().await?);
                 assert_eq!(PeerStatus::Registered(b), status_a.recv().await?);
 
-                manager_b.keep_connected()?;
+                manager_b.keep_all_connected()?;
                 assert_eq!(PeerStatus::Connected(a), status_b.recv().await?);
                 assert_eq!(PeerStatus::Registered(a), status_b.recv().await?);
 
@@ -656,7 +735,7 @@ mod tests {
         let server_b = fixture.launch_server(b, &manager_b).await?;
 
         let mut status_a = manager_a.peer_status();
-        manager_a.keep_connected()?;
+        manager_a.keep_all_connected()?;
 
         local
             .run_until(async move {
@@ -667,6 +746,94 @@ mod tests {
 
                 let _server_b = fixture.launch_server(b, &manager_b).await?;
                 assert_eq!(PeerStatus::Connected(b), status_a.recv().await?);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manager_connects_and_disconnects() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        let local = LocalSet::new();
+
+        let a = a();
+        let b = b();
+        fixture.peers.pick_port(b)?;
+
+        let manager_a = fixture.manager(&local, a)?;
+
+        let manager_b = fixture.manager(&local, b)?;
+        let _server_b = fixture.launch_server(b, &manager_b).await?;
+
+        local
+            .run_until(async move {
+                let mut status_a = manager_a.peer_status();
+
+                manager_a.keep_all_connected()?;
+                assert_eq!(PeerStatus::Connected(b), status_a.recv().await?);
+                assert_eq!(PeerStatus::Registered(b), status_a.recv().await?);
+
+                manager_a.disconnect_all()?;
+                assert_eq!(PeerStatus::Disconnected(b), status_a.recv().await?);
+
+                manager_a.keep_all_connected()?;
+                assert_eq!(PeerStatus::Connected(b), status_a.recv().await?);
+                assert_eq!(PeerStatus::Registered(b), status_a.recv().await?);
+
+                manager_a.disconnect_all()?;
+                assert_eq!(PeerStatus::Disconnected(b), status_a.recv().await?);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manager_connects_and_disconnects_peer() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        let local = LocalSet::new();
+
+        let a = a();
+        let b = b();
+        fixture.peers.pick_port(b)?;
+
+        let c = c();
+        fixture.peers.pick_port(c)?;
+
+        let manager_a = fixture.manager(&local, a)?;
+
+        let manager_b = fixture.manager(&local, b)?;
+        let _server_b = fixture.launch_server(b, &manager_b).await?;
+
+        let manager_c = fixture.manager(&local, c)?;
+        let _server_c = fixture.launch_server(c, &manager_c).await?;
+
+        local
+            .run_until(async move {
+                let mut status_a = manager_a.peer_status();
+
+                manager_a.keep_peer_connected(b)?;
+                assert_eq!(PeerStatus::Connected(b), status_a.recv().await?);
+                assert_eq!(PeerStatus::Registered(b), status_a.recv().await?);
+
+                manager_a.keep_peer_connected(c)?;
+                assert_eq!(PeerStatus::Connected(c), status_a.recv().await?);
+                assert_eq!(PeerStatus::Registered(c), status_a.recv().await?);
+
+                manager_a.disconnect_peer(c)?;
+                assert_eq!(PeerStatus::Disconnected(c), status_a.recv().await?);
+
+                manager_a.keep_peer_connected(c)?;
+                assert_eq!(PeerStatus::Connected(c), status_a.recv().await?);
+                assert_eq!(PeerStatus::Registered(c), status_a.recv().await?);
+
+                manager_a.disconnect_peer(b)?;
+                assert_eq!(PeerStatus::Disconnected(b), status_a.recv().await?);
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -698,11 +865,11 @@ mod tests {
         local
             .run_until(async move {
                 let mut status_a = manager_a.peer_status();
-                manager_a.keep_connected()?;
+                manager_a.keep_all_connected()?;
                 assert_eq!(PeerStatus::Connected(b), status_a.recv().await?);
 
                 let mut status_b = manager_b.peer_status();
-                manager_b.keep_connected()?;
+                manager_b.keep_all_connected()?;
                 assert_eq!(PeerStatus::Connected(a), status_b.recv().await?);
 
                 assert_eq!(
