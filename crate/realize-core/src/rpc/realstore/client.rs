@@ -86,8 +86,6 @@ impl Connect<tarpc::client::Channel<Arc<RealStoreServiceRequest>, RealStoreServi
 }
 
 /// A type that encapsulates and hides the actual stub type.
-///
-/// Most usage should be through the alias [TcpRealStoreServiceClient].
 pub struct RealizeStub {
     inner: MetricsRealizeClient<
         Reconnect<

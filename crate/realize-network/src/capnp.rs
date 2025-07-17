@@ -29,7 +29,7 @@ pub enum PeerStatus {
     Disconnected(Peer),
 }
 
-/// Messages used to communicate with [CapnpRpcThread].
+/// Messages used to communicate with capnp on the main thread.
 enum ConnectionMessage<O> {
     /// Send incoming (server) TCP connections to the capnp threads to
     /// be handled there.

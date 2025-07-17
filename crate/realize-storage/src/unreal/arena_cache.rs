@@ -34,7 +34,7 @@ pub(crate) const DIRECTORY_TABLE: TableDefinition<(Inode, &str), Holder<DirTable
 /// same entry.
 ///
 /// An inode available in no peers should be remove from all
-/// directories. This is handled by [do_rm_file_entry].
+/// directories.
 ///
 /// Key: (inode, peer)
 /// Value: FileTableEntry
@@ -47,9 +47,6 @@ const FILE_TABLE: TableDefinition<(Inode, &str), Holder<FileTableEntry>> =
 /// this table. Calls to catchup for that peer and arena removes the
 /// corresponding entry in the table. At the end of catchup, files
 /// still in this table are deleted.
-///
-/// This is handled by [do_mark_peer_files], [do_delete_marked_files]
-/// and [do_unmark_peer_file].
 ///
 /// Key: (peer, file inode)
 /// Value: parent dir inode
@@ -590,7 +587,6 @@ impl ArenaCache {
         Ok(())
     }
 
-    /// Implement [UnrealCache::unlink] within a transaction.
     fn do_unlink(
         &self,
         txn: &WriteTransaction,
@@ -782,7 +778,7 @@ pub(crate) fn do_dir_mtime(
     Err(StorageError::NotFound)
 }
 
-/// Get a [FileEntry] for a specific peer.
+/// Get a [FileTableEntry] for a specific peer.
 fn get_file_entry(
     file_table: &redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
     inode: Inode,

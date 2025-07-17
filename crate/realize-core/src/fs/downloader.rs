@@ -71,23 +71,23 @@ pub struct Download {
 /// States for AsyncRead::poll_read.
 #[derive(Default)]
 enum ReadState {
-    /// Answer [AsyncRead::poll_read] immediately or dispatch to
+    /// Answer [tokio::io::AsyncRead::poll_read] immediately or dispatch to
     /// another state to get the data.
     #[default]
     Default,
 
-    /// Run [AsyncSeek::poll_complete] on the blob, then
-    /// [AsyncSeek::start_seek].
+    /// Run [tokio::io::AsyncSeek::poll_complete] on the blob, then
+    /// [tokio::io::AsyncSeek::start_seek].
     StartSeek(SeekFrom, Box<ReadState>),
 
-    /// [AsyncSeek::poll_complete] on the blob after calling
-    /// [AsyncSeek::start_seek].
+    /// [tokio::io::AsyncSeek::poll_complete] on the blob after
+    /// calling [tokio::io::AsyncSeek::start_seek].
     Seek(Box<ReadState>),
 
-    /// Call [AsyncRead::poll_read] on the blob
+    /// Call [tokio::io::AsyncRead::poll_read] on the blob
     Read,
 
-    /// Call [AsyncRead::poll_write] on the blob
+    /// Call [tokio::io::AsyncWrite::poll_write] on the blob
     Write(ByteRange, Vec<u8>),
 
     /// A future that downloads the given range from a remote peer.
@@ -221,15 +221,9 @@ impl Download {
     ///
     /// ## [ReadState] transitions
     ///
-    /// ```
-    /// Default╶┬─> StartSeek → Seek ╶┬─> Read → Default
-    ///         │                     │
-    ///         ╰─────────────────────╯
+    /// - `Default` → ( `StartSeek` → `Seek` ) → `Read` → `Default`
     ///
-    /// Default -> Download ╶┬─> StartSeek → Seek ╶┬─> Write → Default
-    ///                      │                     │
-    ///                      ╰─────────────────────╯
-    /// ```
+    /// - `Default` → `Download` → ( `StartSeek` → `Seek` ) → `Write` → `Default`
     ///
     /// On error, go back to `Default`.
     ///

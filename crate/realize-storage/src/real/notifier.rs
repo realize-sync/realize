@@ -163,8 +163,6 @@ impl Notification {
 pub struct Progress {
     /// UUID of the database being subscribed to. Subscription indexes
     /// are only meaningful within that specific database.
-    ///
-    /// Usually from [RealIndexAsync::uuid]
     pub uuid: Uuid,
 
     /// Index of the last notification seen by the subscriber.

@@ -1,8 +1,9 @@
 use base64::Engine as _;
 
-/// Hash for a range within a [SyncedFile].
+/// Hash of a file content or byte range.
 ///
-/// It is normally created by functions from [crate::utils::hash]
+/// It is normally created by functions from
+/// `realize_storage::utils::hash`
 #[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Hash(pub [u8; 32]);
 

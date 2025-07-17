@@ -95,7 +95,7 @@ pub trait RealStoreService {
 
     /// Apply a delta to the file at the given path and byte range, verifying the hash
     ///
-    /// Returns the error [RealizeError::HashMismatch] if, after
+    /// Returns the error [RealStoreError::HashMismatch] if, after
     /// applying the patch, the data doesn't match the given hash.
     async fn apply_delta(
         arena: Arena,

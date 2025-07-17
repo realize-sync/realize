@@ -30,7 +30,7 @@ pub enum PathType {
     Final,
 }
 
-/// Configures the behavior of a method on [RealStoreService].
+/// Configures the behavior of a [RealStore] method.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub struct Options {
     /// If true, only take final files into account. This is usually
@@ -264,7 +264,7 @@ impl RealStore {
 
     /// Apply a delta to the file at the given path and byte range, verifying the hash
     ///
-    /// Returns the error [RealizeError::HashMismatch] if, after
+    /// Returns the error [RealStoreError::HashMismatch] if, after
     /// applying the patch, the data doesn't match the given hash.
     pub async fn apply_delta(
         &self,
@@ -459,7 +459,7 @@ fn not_found() -> std::io::Error {
     std::io::Error::from(std::io::ErrorKind::NotFound)
 }
 
-/// Error type used by [RealStoreService].
+/// Error type used by [RealStore].
 ///
 /// The data stored in this error is limited, to be serializable and
 /// remain usable through tarpc.
@@ -478,8 +478,8 @@ pub enum RealStoreError {
     #[error("Unexpected: {0}")]
     Other(String),
 
-    /// Returned by [RealStoreService::apply_delta] when the resulting
-    /// patch didn't match the hash created by [RealStoreService::diff].
+    /// Returned by [RealStore::apply_delta] when the resulting
+    /// patch didn't match the hash created by [RealStore::diff].
     #[error("Hash mismatch after rsync")]
     HashMismatch,
 }
@@ -632,7 +632,7 @@ impl From<fast_rsync::SignatureParseError> for RealStoreError {
     }
 }
 
-/// Remove empty parent directories of [relative_path].
+/// Remove empty parent directories of `relative_path`.
 ///
 /// Errors are ignored. Deleting just stops.
 async fn delete_containing_dir(root: &std::path::Path, relative_path: &realize_types::Path) {

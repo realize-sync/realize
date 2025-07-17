@@ -2,7 +2,7 @@ use crate::utils::holder::ByteConversionError;
 use realize_types::{self, Arena};
 use tokio::task::JoinError;
 
-/// Error returned by the [UnrealCache].
+/// Error returned types in this crate.
 ///
 /// This type exists mainly so that errors can be converted when
 /// needed to OS I/O errors.

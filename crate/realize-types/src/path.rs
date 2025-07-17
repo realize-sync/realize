@@ -98,7 +98,7 @@ impl Path {
         path::Path::new(&self.0)
     }
 
-    /// Create a [PathBuf] from this path.
+    /// Create a [std::path::PathBuf] from this path.
     pub fn to_path_buf(&self) -> path::PathBuf {
         self.as_real_path().to_path_buf()
     }

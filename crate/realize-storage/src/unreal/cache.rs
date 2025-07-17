@@ -86,7 +86,7 @@ impl UnrealCacheBlocking {
 
     /// Returns the inode of an arena.
     ///
-    /// Will return [UnrealCacheError::UnknownArena] unless the arena
+    /// Will return [StorageError::UnknownArena] unless the arena
     /// is available in the cache.
     pub fn arena_root(&self, arena: Arena) -> Result<Inode, StorageError> {
         self.arena_roots
@@ -409,7 +409,7 @@ impl UnrealCacheAsync {
     /// Open a file for reading/writing, creating a new blob entry.
     ///
     /// The returned [Blob] is available for reading. However, reading outside
-    /// the range of data that is locally available causes [BlobIncomplete] error.
+    /// the range of data that is locally available causes [crate::BlobIncomplete] error.
     ///
     /// This is usually used through the `Downloader`, which can
     /// download incomplete portions of the file.

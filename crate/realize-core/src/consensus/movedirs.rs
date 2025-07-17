@@ -1335,7 +1335,7 @@ mod tests {
     }
 }
 
-/// Errors returned by [move_files]
+/// Errors returned by [move_dir]
 ///
 /// Error messages are kept short, to avoid repetition when printed
 /// with anyhow {:#}.

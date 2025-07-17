@@ -173,7 +173,7 @@ fn realize_error(res: &RealStoreServiceResponse) -> Option<&RealStoreError> {
     }
 }
 
-/// Label that describes a [RealizeError] in metrics.
+/// Label that describes a [RealStoreError] in metrics.
 fn realize_error_label(err: &RealStoreError) -> &'static str {
     match err {
         RealStoreError::BadRequest(_) => "BadRequest",
@@ -281,7 +281,7 @@ async fn serve_metrics(
         .body(encoder.encode_to_string(&metrics)?)?)
 }
 
-/// [RealStoreService] Stub that fills in client-side metrics.
+/// Service Stub that fills in client-side metrics.
 #[derive(Clone)]
 pub(crate) struct MetricsRealizeClient<T>
 where
@@ -347,7 +347,7 @@ impl<T: Stub<Req = RealStoreServiceRequest, Resp = RealStoreServiceResponse> + C
     }
 }
 
-/// [RealStoreService] serve function that fills in server-side metrics.
+/// Serve function that fills in server-side metrics.
 #[derive(Clone)]
 pub(crate) struct MetricsRealizeServer<T> {
     inner: T,
