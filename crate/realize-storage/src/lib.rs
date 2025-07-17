@@ -60,16 +60,14 @@ impl Storage {
             if let Some(index_config) = &arena_config.index {
                 let index_path = &index_config.db;
                 let index = RealIndexAsync::open(*arena, &index_path).await?;
-                let watcher = RealWatcher::spawn(
-                    root,
-                    exclude
-                        .iter()
-                        .map(|p| realize_types::Path::from_real_path_in(p, root))
-                        .flatten()
-                        .collect::<Vec<_>>(),
-                    index.clone(),
-                )
-                .await?;
+                let exclude = exclude
+                    .iter()
+                    .map(|p| realize_types::Path::from_real_path_in(p, root))
+                    .flatten()
+                    .collect::<Vec<_>>();
+
+                log::debug!("Watch {root:?}, excluding {exclude:?} for {index_path:?}");
+                let watcher = RealWatcher::spawn(root, exclude, index.clone()).await?;
                 arenas.insert(
                     *arena,
                     ArenaStorage {
@@ -150,6 +148,7 @@ fn build_exclude(config: &StorageConfig) -> Vec<&std::path::Path> {
         }
         if let Some(cache_config) = &arena_config.cache {
             exclude.push(cache_config.db.as_ref());
+            exclude.push(cache_config.blob_dir.as_ref());
         }
     }
 
