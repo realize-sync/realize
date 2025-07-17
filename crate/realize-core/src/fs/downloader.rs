@@ -405,32 +405,63 @@ mod tests {
     use tokio::fs;
     use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
+    struct Fixture {
+        inner: HouseholdFixture,
+    }
+
+    impl Fixture {
+        async fn setup() -> anyhow::Result<Self> {
+            let _ = env_logger::try_init();
+            let household_fixture = HouseholdFixture::setup().await?;
+
+            Ok(Self {
+                inner: household_fixture,
+            })
+        }
+
+        async fn download_file_from_b(
+            &self,
+            downloader: &Downloader,
+            path_str: &str,
+            content: &str,
+        ) -> anyhow::Result<Download> {
+            let path = Path::parse(path_str)?;
+
+            let b = HouseholdFixture::b();
+            let b_dir = self.inner.arena_root(b);
+            fs::write(path.within(&b_dir), content).await?;
+
+            // Wait for the file to appear in peer A's cache
+            let a = HouseholdFixture::a();
+            self.inner.wait_for_file_in_cache(a, path_str).await?;
+
+            // Get the cache and create a downloader
+            let cache = self.inner.cache(a)?;
+
+            // Get the inode for the file
+            let arena = HouseholdFixture::test_arena();
+            let (inode, _) = cache.lookup_path(arena, &path).await?;
+
+            Ok(downloader.reader(inode).await?)
+        }
+    }
+
     #[tokio::test]
     async fn read_small_file() -> anyhow::Result<()> {
-        let mut fixture = HouseholdFixture::setup().await?;
+        let mut fixture = Fixture::setup().await?;
         fixture
+            .inner
             .with_two_peers()
             .await?
+            .interconnected()
             .run(async |household_a, _household_b| {
-                let a = HouseholdFixture::a();
-                let b = HouseholdFixture::b();
-
-                // Create a file in peer B's arena
-                let b_dir = fixture.arena_root(b);
-                fs::write(&b_dir.join("test.txt"), "File content").await?;
-
-                // Wait for the file to appear in peer A's cache
-                fixture.wait_for_file_in_cache(a, "test.txt").await?;
-
-                // Get the cache and create a downloader
-                let cache = fixture.cache(a)?;
-                let downloader = Downloader::new(household_a, cache.clone());
-
-                // Get the inode for the file
-                let arena = HouseholdFixture::test_arena();
-                let (inode, _) = cache.lookup_path(arena, &Path::parse("test.txt")?).await?;
-
-                let mut reader = downloader.reader(inode).await?;
+                let downloader = Downloader::new(
+                    household_a,
+                    fixture.inner.cache(HouseholdFixture::a())?.clone(),
+                );
+                let mut reader = fixture
+                    .download_file_from_b(&downloader, "test.txt", "File content")
+                    .await?;
                 assert_eq!("File content", read_string(&mut reader).await?);
 
                 Ok::<(), anyhow::Error>(())
@@ -442,26 +473,20 @@ mod tests {
 
     #[tokio::test]
     async fn seek() -> anyhow::Result<()> {
-        let mut fixture = HouseholdFixture::setup().await?;
+        let mut fixture = Fixture::setup().await?;
         fixture
+            .inner
             .with_two_peers()
             .await?
+            .interconnected()
             .run(async |household_a, _household_b| {
-                let a = HouseholdFixture::a();
-                let b = HouseholdFixture::b();
-
-                let b_dir = fixture.arena_root(b);
-                fs::write(&b_dir.join("test.txt"), "baa, baa, black sheep").await?;
-
-                fixture.wait_for_file_in_cache(a, "test.txt").await?;
-
-                let cache = fixture.cache(a)?;
-                let downloader = Downloader::new(household_a, cache.clone());
-
-                let arena = HouseholdFixture::test_arena();
-                let (inode, _) = cache.lookup_path(arena, &Path::parse("test.txt")?).await?;
-
-                let mut reader = downloader.reader(inode).await?;
+                let downloader = Downloader::new(
+                    household_a,
+                    fixture.inner.cache(HouseholdFixture::a())?.clone(),
+                );
+                let mut reader = fixture
+                    .download_file_from_b(&downloader, "test.txt", "baa, baa, black sheep")
+                    .await?;
 
                 reader.seek(SeekFrom::Start(10)).await?;
                 assert_eq!("black sheep", read_string(&mut reader).await?);
@@ -488,26 +513,20 @@ mod tests {
 
     #[tokio::test]
     async fn seek_past_end() -> anyhow::Result<()> {
-        let mut fixture = HouseholdFixture::setup().await?;
+        let mut fixture = Fixture::setup().await?;
         fixture
+            .inner
             .with_two_peers()
             .await?
+            .interconnected()
             .run(async |household_a, _household_b| {
-                let a = HouseholdFixture::a();
-                let b = HouseholdFixture::b();
-
-                let b_dir = fixture.arena_root(b);
-                fs::write(&b_dir.join("test.txt"), "baa, baa, black sheep").await?;
-
-                fixture.wait_for_file_in_cache(a, "test.txt").await?;
-
-                let cache = fixture.cache(a)?;
-                let downloader = Downloader::new(household_a, cache.clone());
-
-                let arena = HouseholdFixture::test_arena();
-                let (inode, _) = cache.lookup_path(arena, &Path::parse("test.txt")?).await?;
-
-                let mut reader = downloader.reader(inode).await?;
+                let downloader = Downloader::new(
+                    household_a,
+                    fixture.inner.cache(HouseholdFixture::a())?.clone(),
+                );
+                let mut reader = fixture
+                    .download_file_from_b(&downloader, "test.txt", "baa, baa, black sheep")
+                    .await?;
 
                 reader.seek(SeekFrom::Start(100)).await?;
                 assert_eq!("", read_string(&mut reader).await?);
@@ -528,26 +547,20 @@ mod tests {
 
     #[tokio::test]
     async fn seek_before_start() -> anyhow::Result<()> {
-        let mut fixture = HouseholdFixture::setup().await?;
+        let mut fixture = Fixture::setup().await?;
         fixture
+            .inner
             .with_two_peers()
             .await?
+            .interconnected()
             .run(async |household_a, _household_b| {
-                let a = HouseholdFixture::a();
-                let b = HouseholdFixture::b();
-
-                let b_dir = fixture.arena_root(b);
-                fs::write(&b_dir.join("test.txt"), "baa, baa, black sheep").await?;
-
-                fixture.wait_for_file_in_cache(a, "test.txt").await?;
-
-                let cache = fixture.cache(a)?;
-                let downloader = Downloader::new(household_a, cache.clone());
-
-                let arena = HouseholdFixture::test_arena();
-                let (inode, _) = cache.lookup_path(arena, &Path::parse("test.txt")?).await?;
-
-                let mut reader = downloader.reader(inode).await?;
+                let downloader = Downloader::new(
+                    household_a,
+                    fixture.inner.cache(HouseholdFixture::a())?.clone(),
+                );
+                let mut reader = fixture
+                    .download_file_from_b(&downloader, "test.txt", "baa, baa, black sheep")
+                    .await?;
 
                 assert!(reader.seek(SeekFrom::End(-100)).await.is_err());
                 assert!(reader.seek(SeekFrom::Current(-100)).await.is_err());
@@ -565,6 +578,7 @@ mod tests {
         fixture
             .with_two_peers()
             .await?
+            .interconnected()
             .run(async |household_a, _household_b| {
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
@@ -619,6 +633,7 @@ mod tests {
         fixture
             .with_two_peers()
             .await?
+            .interconnected()
             .run(async |household_a, _household_b| {
                 test_read_file(&fixture, household_a, 12 * 1024, 1024, false).await?;
                 Ok::<(), anyhow::Error>(())
@@ -634,6 +649,7 @@ mod tests {
         fixture
             .with_two_peers()
             .await?
+            .interconnected()
             .run(async |household_a, _household_b| {
                 test_read_file(&fixture, household_a, 12 * 1024, 2000, true).await?;
                 Ok::<(), anyhow::Error>(())
@@ -649,6 +665,7 @@ mod tests {
         fixture
             .with_two_peers()
             .await?
+            .interconnected()
             .run(async |household_a, _household_b| {
                 test_read_file(&fixture, household_a, 48 * 1024, 32 * 1024, false).await?;
                 Ok::<(), anyhow::Error>(())
@@ -664,6 +681,7 @@ mod tests {
         fixture
             .with_two_peers()
             .await?
+            .interconnected()
             .run(async |household_a, _household_b| {
                 test_read_file(&fixture, household_a, 64 * 1024, 48 * 1024, true).await?;
                 Ok::<(), anyhow::Error>(())

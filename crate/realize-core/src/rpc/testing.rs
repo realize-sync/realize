@@ -7,6 +7,7 @@ use realize_network::hostport::HostPort;
 use realize_network::testing::TestingPeers;
 use realize_storage::Storage;
 use realize_storage::{self, UnrealCacheAsync};
+use realize_types::Path;
 use realize_types::{Arena, Peer};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -100,6 +101,7 @@ impl HouseholdFixture {
             addr_b,
             household_b,
             server_b,
+            connected: false,
         })
     }
 
@@ -131,8 +133,11 @@ impl HouseholdFixture {
 
         let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
         let arena = HouseholdFixture::test_arena();
-        let arena_inode = cache.arena_root(arena)?;
-        while cache.lookup(arena_inode, filename).await.is_err() {
+        while cache
+            .lookup_path(arena, &Path::parse(filename)?)
+            .await
+            .is_err()
+        {
             if let Some(delay) = retry.next() {
                 tokio::time::sleep(delay).await;
             } else {
@@ -168,6 +173,48 @@ impl HouseholdFixture {
     }
 }
 
+/// Connect from `household` to `peer`.
+///
+/// Assumes that the household is not already connected to the peer.
+pub async fn connect(household: &Household, peer: Peer) -> anyhow::Result<()> {
+    let mut status = household.peer_status();
+    household.keep_peer_connected(peer)?;
+
+    let delay = Duration::from_secs(3);
+    assert_eq!(
+        PeerStatus::Connected(peer),
+        timeout(delay, status.recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting to connect to {peer}"))??
+    );
+    assert_eq!(
+        PeerStatus::Registered(peer),
+        timeout(delay, status.recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting to register on {peer}"))??
+    );
+
+    Ok(())
+}
+
+/// Disconnects from `household` to `peer`.
+///
+/// Assumes that the household is connected to the peer.
+pub async fn disconnect(household: &Household, peer: Peer) -> anyhow::Result<()> {
+    let mut status = household.peer_status();
+    household.disconnect_peer(peer)?;
+
+    let delay = Duration::from_secs(3);
+    assert_eq!(
+        PeerStatus::Disconnected(peer),
+        timeout(delay, status.recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting to disconnect from {peer}"))??
+    );
+
+    Ok(())
+}
+
 pub struct WithTwoPeers {
     local: LocalSet,
     household_a: Household,
@@ -176,9 +223,16 @@ pub struct WithTwoPeers {
     addr_b: HostPort,
     household_b: Household,
     server_b: Arc<Server>,
+    connected: bool,
 }
 
 impl WithTwoPeers {
+    pub fn interconnected(mut self) -> Self {
+        self.connected = true;
+
+        self
+    }
+
     pub async fn run(
         self,
         test: impl AsyncFnOnce(Household, Household) -> anyhow::Result<()>,
@@ -191,6 +245,7 @@ impl WithTwoPeers {
             household_b,
             addr_b,
             server_b,
+            connected,
         } = self;
         local
             .run_until(async move {
@@ -200,45 +255,10 @@ impl WithTwoPeers {
                 server_a.listen(&addr_a).await?;
                 server_b.listen(&addr_b).await?;
 
-                let mut status_a = household_a.peer_status();
-                let mut status_b = household_b.peer_status();
-
-                household_a.keep_all_connected()?;
-                household_b.keep_all_connected()?;
-
-                let delay = Duration::from_secs(3);
-                assert_eq!(
-                    PeerStatus::Connected(b),
-                    timeout(delay, status_a.recv())
-                        .await
-                        .map_err(|_| anyhow::anyhow!(
-                            "timed out waiting for B to connect to A"
-                        ))??
-                );
-                assert_eq!(
-                    PeerStatus::Registered(b),
-                    timeout(delay, status_a.recv())
-                        .await
-                        .map_err(|_| anyhow::anyhow!(
-                            "timed out waiting for B to register itself on A"
-                        ))??
-                );
-                assert_eq!(
-                    PeerStatus::Connected(a),
-                    timeout(delay, status_b.recv())
-                        .await
-                        .map_err(|_| anyhow::anyhow!(
-                            "timed out waiting for A to connect to B"
-                        ))??
-                );
-                assert_eq!(
-                    PeerStatus::Registered(a),
-                    timeout(delay, status_b.recv())
-                        .await
-                        .map_err(|_| anyhow::anyhow!(
-                            "timed out waiting for A register itself on B"
-                        ))??
-                );
+                if connected {
+                    connect(&household_a, b).await?;
+                    connect(&household_b, a).await?;
+                }
 
                 test(household_a, household_b).await
             })

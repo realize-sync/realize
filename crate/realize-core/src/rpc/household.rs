@@ -927,6 +927,7 @@ mod tests {
         fixture
             .with_two_peers()
             .await?
+            .interconnected()
             .run(async |_, _| {
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
@@ -951,6 +952,7 @@ mod tests {
         fixture
             .with_two_peers()
             .await?
+            .interconnected()
             .run(async |household_a, _household_b| {
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
