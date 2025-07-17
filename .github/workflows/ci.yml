@@ -32,7 +32,7 @@ jobs:
     - name: Build
       run: "cargo build"
     - name: Run tests
-      run: "cargo nextest --retries 1 --no-fail-fast"
+      run: "cargo nextest run --retries 1 --no-fail-fast"
     - name: Run doctests
       run: "cargo test --doc"
 
@@ -46,6 +46,6 @@ jobs:
     - name: Build
       run: "cargo build"
     - name: Run tests
-      run: "cargo nextest --retries 1 --no-fail-fast"
+      run: "cargo nextest run --retries 1 --no-fail-fast"
     - name: Run doctests
       run: "cargo test --doc"
