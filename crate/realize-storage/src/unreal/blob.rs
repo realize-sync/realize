@@ -105,7 +105,7 @@ impl Blob {
         self.blob_id
     }
 
-    pub(crate) async fn update_db(&mut self) -> Result<(), StorageError> {
+    pub async fn update_db(&mut self) -> Result<(), StorageError> {
         if self.pending_ranges.is_empty() {
             return Ok(());
         }
@@ -133,17 +133,26 @@ impl Blob {
         res
     }
 
-    /// Adjust the len to cover only the available portion of the requested range.
-    fn adjusted_len(&self, requested_len: usize) -> Option<usize> {
-        let available = ByteRanges::single(self.offset, requested_len as u64)
-            .intersection(&self.available_ranges);
+    /// Returns how much data, out of `requested_len` can be read at `offset`.
+    ///
+    /// - `Some(0)` means that reading would succeed, but would return nothing.
+    /// - `None` means that reading would fail with the error [BlobIncomplete].
+    pub fn readable_length(&self, offset: u64, requested_len: usize) -> Option<usize> {
+        if requested_len == 0 {
+            return Some(requested_len);
+        }
+        if offset >= self.size() {
+            return Some(0);
+        }
+        let available =
+            ByteRanges::single(offset, requested_len as u64).intersection(&self.available_ranges);
         if let Some(range) = available.iter().next()
-            && range.start == self.offset
+            && range.start == offset
         {
             return Some(range.bytecount() as usize);
         }
 
-        // Len cannot be ajusted; the request should not go through.
+        // The request should not go through.
         None
     }
 }
@@ -155,11 +164,11 @@ impl AsyncRead for Blob {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let requested_len = buf.remaining();
-        if requested_len == 0 {
+        if requested_len == 0 || self.offset > self.size {
             return Poll::Ready(Ok(()));
         }
 
-        match self.adjusted_len(requested_len) {
+        match self.readable_length(self.offset, requested_len) {
             None => Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 BlobIncomplete,
@@ -183,7 +192,7 @@ impl AsyncRead for Blob {
 
                         Poll::Ready(Ok(()))
                     }
-                    Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                    Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
                     Poll::Pending => Poll::Pending,
                 }
             }
