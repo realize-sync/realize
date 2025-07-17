@@ -23,16 +23,16 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::collections::btree_map;
 use std::fmt;
+use std::iter::Peekable;
 
 /// A closed-open range of bytes: `[start, end)`.
 ///
 /// - An empty range always has `start=0` and `end=0`.
 /// - Ranges are used for efficient file and buffer operations.
 /// - All methods treat the range as closed-open.
-#[derive(
-    Clone, Eq, PartialEq, Debug, Default, serde::Serialize, serde::Deserialize, PartialOrd, Ord,
-)]
+#[derive(Clone, Eq, PartialEq, Default, serde::Serialize, serde::Deserialize, PartialOrd, Ord)]
 pub struct ByteRange {
     /// The start offset (inclusive).
     pub start: u64,
@@ -48,6 +48,10 @@ impl ByteRange {
     /// Does not panic, but callers should ensure `start <= end` for valid ranges.
     pub fn new(start: u64, end: u64) -> Self {
         ByteRange { start, end }
+    }
+    /// Build a zero-length range with the given position.
+    pub fn zero_len(start: u64) -> Self {
+        ByteRange { start, end: start }
     }
     /// Return the empty range `[0, 0)`.
     pub fn empty() -> Self {
@@ -66,12 +70,6 @@ impl ByteRange {
     ///
     /// Overlap is defined as: `self.start < other.end && other.start < self.end`.
     pub fn overlaps(&self, other: &ByteRange) -> bool {
-        self.start < other.end && other.start < self.end
-    }
-    /// Returns true if this range intersects with `other` (i.e., they share any bytes).
-    ///
-    /// For closed-open ranges, this is the same as `overlaps`.
-    pub fn intersects(&self, other: &ByteRange) -> bool {
         self.start < other.end && other.start < self.end
     }
     /// Returns the intersection of this range and `other`.
@@ -110,6 +108,12 @@ impl fmt::Display for ByteRange {
     /// Formats the range as `[start, end)`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "[{}, {})", self.start, self.end)
+    }
+}
+
+impl fmt::Debug for ByteRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
     }
 }
 
@@ -176,16 +180,6 @@ mod tests {
         assert!(a.overlaps(&b));
         assert!(!a.overlaps(&c));
     }
-    /// Test intersection logic.
-    #[test]
-    fn test_intersects() {
-        let a = ByteRange::new(0, 10);
-        let b = ByteRange::new(10, 20);
-        let c = ByteRange::new(5, 15);
-        assert!(!a.intersects(&b));
-        assert!(a.intersects(&c));
-    }
-    /// Test intersection range.
     #[test]
     fn test_intersection() {
         let a = ByteRange::new(0, 10);
@@ -232,34 +226,47 @@ mod tests {
 /// Provides efficient set operations and iteration.
 ///
 /// Implementation uses a segment tree based on BTreeMap for efficient range operations.
-#[derive(Clone, Eq, PartialEq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Eq, PartialEq, Default, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ByteRanges {
-    // BTreeMap where key is the start of a range and value is the end
-    // This maintains sorted, non-overlapping ranges automatically
-    ranges: BTreeMap<u64, u64>,
+    btree: BTreeMap<u64, Point>,
+}
+
+#[derive(PartialEq, Eq, Copy, Clone, Debug, serde::Serialize, serde::Deserialize)]
+enum Point {
+    Start,
+    End,
+}
+
+impl Point {
+    fn reverse(&self) -> Self {
+        match self {
+            Point::Start => Point::End,
+            Point::End => Point::Start,
+        }
+    }
 }
 
 impl ByteRanges {
     /// Creates an empty ByteRanges set.
     pub fn new() -> Self {
         ByteRanges {
-            ranges: BTreeMap::new(),
+            btree: BTreeMap::new(),
         }
     }
 
     pub fn single(start: u64, end: u64) -> Self {
-        ByteRanges::for_range(ByteRange::new(start, end))
+        let mut r = ByteRanges::new();
+        if end > start {
+            r.btree.insert(start, Point::Start);
+            r.btree.insert(end, Point::End);
+        }
+
+        r
     }
 
     /// Creates a ByteRanges containing a single range.
     pub fn for_range(range: ByteRange) -> Self {
-        if range.is_empty() {
-            ByteRanges::new()
-        } else {
-            let mut ranges = BTreeMap::new();
-            ranges.insert(range.start, range.end);
-            ByteRanges { ranges }
-        }
+        Self::single(range.start, range.end)
     }
 
     /// Creates and fills a ByteRanges set.
@@ -282,33 +289,33 @@ impl ByteRanges {
 
     /// Split all ranges into chunks of at most `chunk_size` bytes.
     pub fn chunked(&self, chunk_size: u64) -> impl Iterator<Item = ByteRange> {
-        self.ranges.iter().flat_map(move |(&start, &end)| {
-            let range = ByteRange::new(start, end);
-            ChunkIterator::new(&range, chunk_size)
-        })
+        self.iter()
+            .flat_map(move |r| ChunkIterator::new(&r, chunk_size))
     }
 
     /// Returns true if there are no ranges.
     pub fn is_empty(&self) -> bool {
-        self.ranges.is_empty()
+        self.btree.is_empty()
     }
 
     /// Returns the number of ranges.
     pub fn len(&self) -> usize {
-        self.ranges.len()
+        self.btree.len() / 2
     }
 
     /// Returns the total number of bytes within the ranges.
     pub fn bytecount(&self) -> u64 {
-        self.ranges
-            .iter()
-            .fold(0, |sum, (&start, &end)| sum + (end - start))
+        self.iter().fold(0, |sum, r| sum + r.bytecount())
     }
 
     /// Add all ranges from `other` to `self`.
-    pub fn extend(&mut self, other: ByteRanges) {
-        for (&start, &end) in other.ranges.iter() {
-            self.add(&ByteRange::new(start, end));
+    pub fn extend(&mut self, mut other: ByteRanges) {
+        if self.is_empty() {
+            std::mem::swap(&mut self.btree, &mut other.btree);
+            return;
+        }
+        for r in other.iter() {
+            self.add(&r);
         }
     }
 
@@ -317,169 +324,217 @@ impl ByteRanges {
         if range.is_empty() {
             return;
         }
-
-        let mut new_start = range.start;
-        let mut new_end = range.end;
-
-        // Find ranges that overlap or are adjacent to the new range
-        let mut to_remove = Vec::new();
-
-        // Find ranges that start before or at the new range's end
-        let overlapping_start = self.ranges.range(..=range.end);
-        for (&start, &end) in overlapping_start {
-            // Check if ranges overlap or are adjacent
-            if end >= range.start || start == range.end || end == range.start {
-                to_remove.push(start);
-                new_start = new_start.min(start);
-                new_end = new_end.max(end);
-            }
+        for val in self
+            .btree
+            .range(range.start..=range.end)
+            .map(|(val, _)| *val)
+            .collect::<Vec<_>>()
+        {
+            self.btree.remove(&val);
         }
 
-        // Remove overlapping ranges
-        for start in to_remove {
-            self.ranges.remove(&start);
+        let before_start = self.btree.range(..range.start).next_back();
+        if !matches!(before_start, Some((_, Point::Start))) {
+            self.btree.insert(range.start, Point::Start);
         }
 
-        // Insert the merged range
-        self.ranges.insert(new_start, new_end);
+        let after_end = self.btree.range(range.end..).next();
+        if !matches!(after_end, Some((_, Point::End))) {
+            self.btree.insert(range.end, Point::End);
+        }
     }
 
     /// Returns the union of two ByteRanges sets.
     pub fn union(&self, other: &ByteRanges) -> ByteRanges {
-        let mut result = self.clone();
-        for (&start, &end) in other.ranges.iter() {
-            result.add(&ByteRange::new(start, end));
+        if self.is_empty() {
+            return other.clone();
         }
+        let mut result = ByteRanges::new();
+        let mut depth = 0;
+        for pt in Merged::new(self.points(), other.points()) {
+            match pt {
+                (val, Point::Start) => {
+                    if depth == 0 {
+                        result.btree.insert(val, Point::Start);
+                    }
+                    depth += 1;
+                }
+                (val, Point::End) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        result.btree.insert(val, Point::End);
+                    }
+                }
+            }
+            debug_assert!(depth >= 0);
+            debug_assert!(depth <= 2);
+        }
+        debug_assert_eq!(depth, 0);
+
         result
     }
 
     /// Returns the intersection of two ByteRanges sets.
     pub fn intersection(&self, other: &ByteRanges) -> ByteRanges {
-        let mut result = ByteRanges::new();
+        if self.is_empty() || other.is_empty() {
+            return ByteRanges::new();
+        }
 
-        for (&a_start, &a_end) in self.ranges.iter() {
-            for (&b_start, &b_end) in other.ranges.iter() {
-                let intersection =
-                    ByteRange::new(a_start, a_end).intersection(&ByteRange::new(b_start, b_end));
-                if !intersection.is_empty() {
-                    result.add(&intersection);
+        let mut result = ByteRanges::new();
+        let mut depth = 0;
+        for pt in Merged::new(self.points(), other.points()) {
+            match pt {
+                (val, Point::Start) => {
+                    depth += 1;
+                    if depth == 2 {
+                        result.btree.insert(val, Point::Start);
+                    }
+                }
+                (val, Point::End) => {
+                    if depth == 2 {
+                        result.btree.insert(val, Point::End);
+                    }
+                    depth -= 1;
                 }
             }
+            debug_assert!(depth >= 0);
+            debug_assert!(depth <= 2);
         }
+        debug_assert_eq!(depth, 0);
+
         result
     }
 
     /// Returns the subtraction of other from self (i.e., the parts of self not covered by other).
     pub fn subtraction(&self, other: &ByteRanges) -> ByteRanges {
+        // Subtraction is implemented here as an intersection with the
+        // reverse of other.
         let mut result = ByteRanges::new();
 
-        for (&a_start, &a_end) in self.ranges.iter() {
-            let mut current_ranges = vec![ByteRange::new(a_start, a_end)];
+        // The reverse of other starts and ends opened.
+        let mut depth = 1;
+        let mut started = false;
 
-            for (&b_start, &b_end) in other.ranges.iter() {
-                let mut new_ranges = Vec::new();
-
-                for range in current_ranges {
-                    let b_range = ByteRange::new(b_start, b_end);
-
-                    if b_range.end <= range.start || b_range.start >= range.end {
-                        // No overlap
-                        new_ranges.push(range);
-                    } else {
-                        // Overlap - split the range
-                        if b_range.start > range.start {
-                            new_ranges.push(ByteRange::new(range.start, b_range.start));
-                        }
-                        if b_range.end < range.end {
-                            new_ranges.push(ByteRange::new(b_range.end, range.end));
-                        }
+        for pt in Merged::new(
+            self.points(),
+            other.btree.iter().map(|(v, p)| (*v, p.reverse())),
+        ) {
+            match pt {
+                (val, Point::Start) => {
+                    depth += 1;
+                    if depth == 2 {
+                        started = true;
+                        result.btree.insert(val, Point::Start);
                     }
                 }
-
-                current_ranges = new_ranges;
+                (val, Point::End) => {
+                    if depth == 2 && started {
+                        result.btree.insert(val, Point::End);
+                    }
+                    depth -= 1;
+                }
             }
-
-            for range in current_ranges {
-                result.add(&range);
-            }
+            debug_assert!(depth >= 0);
+            debug_assert!(depth <= 2);
         }
+        debug_assert_eq!(depth, 1);
+
         result
-    }
-
-    /// Returns true if any range in self intersects with the given ByteRange.
-    pub fn intersects(&self, range: &ByteRange) -> bool {
-        // Find ranges that start before the query range ends
-        let overlapping_start = self.ranges.range(..range.end);
-        for (&_start, &end) in overlapping_start {
-            if end > range.start {
-                return true;
-            }
-        }
-        false
     }
 
     /// Returns true if any range in self overlaps with the given ByteRange.
     pub fn overlaps(&self, range: &ByteRange) -> bool {
-        self.intersects(range)
+        self.btree
+            .range(range.start..range.end)
+            .any(|(_, pt)| *pt == Point::Start)
+            || matches!(
+                self.btree.range(..range.start).next_back(),
+                Some((_, Point::Start)),
+            )
     }
 
-    /// Returns an iterator over the contained ByteRanges.
-    pub fn iter(&self) -> ByteRangesIter<'_> {
-        ByteRangesIter {
-            inner: self.ranges.iter(),
-        }
+    /// Returns an iterator over the contained [ByteRange]s.
+    pub fn iter(&self) -> impl Iterator<Item = ByteRange> {
+        ByteRangesIter::new(self.points())
     }
 
-    /// Returns a range containing the given offset, if any.
-    pub fn range_containing(&self, offset: u64) -> Option<ByteRange> {
-        // Find the range that starts at or before the offset
-        let range_before = self.ranges.range(..=offset).next_back();
+    /// Returns a representation of this ByteRanges as a vector of
+    /// [ByteRange].
+    pub fn as_vec(&self) -> Vec<ByteRange> {
+        self.iter().collect()
+    }
 
-        if let Some((&start, &end)) = range_before {
-            if offset < end {
-                Some(ByteRange::new(start, end))
-            } else {
-                None
+    /// Returns the range containing the given offset, if any.
+    pub fn containing_range(&self, offset: u64) -> Option<ByteRange> {
+        if let Some((start, Point::Start)) = self.btree.range(..=offset).next_back() {
+            if let Some((end, Point::End)) = self.btree.range(offset + 1..).next() {
+                return Some(ByteRange::new(*start, *end));
             }
-        } else {
-            None
         }
+
+        None
+    }
+
+    fn points(&self) -> impl Iterator<Item = (u64, Point)> {
+        self.btree.iter().map(|(k, v)| (*k, *v))
     }
 }
 
 impl IntoIterator for ByteRanges {
     type Item = ByteRange;
-    type IntoIter = std::vec::IntoIter<ByteRange>;
+    type IntoIter = ByteRangesIntoIter;
 
-    fn into_iter(self) -> Self::IntoIter {
-        self.ranges
-            .into_iter()
-            .map(|(start, end)| ByteRange::new(start, end))
-            .collect::<Vec<_>>()
-            .into_iter()
+    fn into_iter(self) -> ByteRangesIntoIter {
+        ByteRangesIntoIter {
+            inner: ByteRangesIter::new(self.btree.into_iter()),
+        }
     }
 }
 
-/// Iterator over ByteRanges
-pub struct ByteRangesIter<'a> {
-    inner: std::collections::btree_map::Iter<'a, u64, u64>,
+pub struct ByteRangesIntoIter {
+    inner: ByteRangesIter<btree_map::IntoIter<u64, Point>>,
 }
 
-impl<'a> Iterator for ByteRangesIter<'a> {
+impl Iterator for ByteRangesIntoIter {
     type Item = ByteRange;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner
-            .next()
-            .map(|(&start, &end)| ByteRange::new(start, end))
+        self.inner.next()
     }
 }
 
-impl<'a> Clone for ByteRangesIter<'a> {
-    fn clone(&self) -> Self {
-        ByteRangesIter {
-            inner: self.inner.clone(),
+/// Transforms points into [ByteRange]s.
+#[derive(Clone)]
+struct ByteRangesIter<T>
+where
+    T: Iterator<Item = (u64, Point)>,
+{
+    inner: T,
+}
+
+impl<T> ByteRangesIter<T>
+where
+    T: Iterator<Item = (u64, Point)>,
+{
+    fn new(inner: T) -> Self {
+        Self { inner }
+    }
+}
+
+impl<T> Iterator for ByteRangesIter<T>
+where
+    T: Iterator<Item = (u64, Point)>,
+{
+    type Item = ByteRange;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let (Some((start, Point::Start)), Some((end, Point::End))) =
+            (self.inner.next(), self.inner.next())
+        {
+            return Some(ByteRange::new(start, end));
         }
+
+        None
     }
 }
 
@@ -488,15 +543,73 @@ impl fmt::Display for ByteRanges {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut first = true;
         f.write_str("{")?;
-        for (&start, &end) in &self.ranges {
-            if !first {
+        for range in self.iter() {
+            if first {
+                first = false;
+            } else {
                 write!(f, ", ")?;
             }
-            write!(f, "[{}, {})", start, end)?;
-            first = false;
+            write!(f, "{range}")?;
         }
         f.write_str("}")?;
         Ok(())
+    }
+}
+// impl fmt::Debug for ByteRanges {
+//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+//         fmt::Display::fmt(self, f)
+//     }
+// }
+
+struct Merged<A, B>
+where
+    A: Iterator<Item = (u64, Point)>,
+    B: Iterator<Item = (u64, Point)>,
+{
+    a: Peekable<A>,
+    b: Peekable<B>,
+}
+
+impl<A, B> Merged<A, B>
+where
+    A: Iterator<Item = (u64, Point)>,
+    B: Iterator<Item = (u64, Point)>,
+{
+    fn new(a: A, b: B) -> Self {
+        Self {
+            a: a.peekable(),
+            b: b.peekable(),
+        }
+    }
+}
+
+impl<A, B> Iterator for Merged<A, B>
+where
+    A: Iterator<Item = (u64, Point)>,
+    B: Iterator<Item = (u64, Point)>,
+{
+    type Item = (u64, Point);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match (self.a.peek(), self.b.peek()) {
+            (None, None) => None,
+            (None, Some(_)) => self.b.next(),
+            (Some(_), None) => self.a.next(),
+            (Some((val_a, pt_a)), Some((val_b, pt_b))) => {
+                if *val_a == *val_b && pt_a != pt_b {
+                    // Skip any Star/End pair at the same value;
+                    // that's a no-op.
+                    self.a.next();
+                    self.b.next();
+                    return self.next();
+                }
+                if *val_a < *val_b {
+                    self.a.next()
+                } else {
+                    self.b.next()
+                }
+            }
+        }
     }
 }
 
@@ -511,58 +624,123 @@ mod byteranges_tests {
     }
     #[test]
     fn test_add_and_merge() {
-        let mut b = ByteRanges::new();
-        b.add(&ByteRange::new(0, 5));
-        b.add(&ByteRange::new(5, 10));
-        b.add(&ByteRange::new(12, 15));
-        b.add(&ByteRange::new(8, 13));
-        let expected = vec![ByteRange::new(0, 15)];
-        assert_eq!(b.iter().collect::<Vec<_>>(), expected);
+        assert_eq!(
+            ByteRanges::single(0, 15),
+            ByteRanges::from_ranges(vec![
+                ByteRange::new(0, 5),
+                ByteRange::new(5, 10),
+                ByteRange::new(12, 15),
+                ByteRange::new(8, 13)
+            ])
+        );
     }
     #[test]
     fn test_union() {
-        let mut a = ByteRanges::new();
-        a.add(&ByteRange::new(0, 5));
-        let mut b = ByteRanges::new();
-        b.add(&ByteRange::new(3, 10));
-        let u = a.union(&b);
-        assert_eq!(u.iter().collect::<Vec<_>>(), vec![ByteRange::new(0, 10)]);
+        assert_eq!(
+            ByteRanges::single(0, 10),
+            ByteRanges::new().union(&ByteRanges::single(0, 10))
+        );
+        assert_eq!(
+            ByteRanges::single(0, 10),
+            ByteRanges::single(0, 10).union(&ByteRanges::new())
+        );
+        assert_eq!(
+            ByteRanges::single(0, 10),
+            ByteRanges::single(0, 5).union(&ByteRanges::single(5, 10))
+        );
+        assert_eq!(
+            ByteRanges::single(0, 10),
+            ByteRanges::single(0, 5).union(&ByteRanges::single(3, 10))
+        );
+        assert_eq!(
+            ByteRanges::from_ranges(vec![ByteRange::new(0, 5), ByteRange::new(10, 15)]),
+            ByteRanges::single(0, 5).union(&ByteRanges::single(10, 15))
+        );
+        assert_eq!(
+            ByteRanges::single(0, 25),
+            ByteRanges::from_ranges(vec![ByteRange::new(0, 5), ByteRange::new(10, 15)])
+                .union(&ByteRanges::from_ranges(vec![ByteRange::new(2, 25)]))
+        );
     }
     #[test]
     fn test_intersection() {
-        let mut a = ByteRanges::new();
-        a.add(&ByteRange::new(0, 5));
-        a.add(&ByteRange::new(10, 15));
-        let mut b = ByteRanges::new();
-        b.add(&ByteRange::new(3, 12));
-        let i = a.intersection(&b);
         assert_eq!(
-            i.iter().collect::<Vec<_>>(),
-            vec![ByteRange::new(3, 5), ByteRange::new(10, 12)]
+            ByteRanges::new(),
+            ByteRanges::new().intersection(&ByteRanges::single(0, 10))
+        );
+        assert_eq!(
+            ByteRanges::new(),
+            ByteRanges::single(0, 10).intersection(&ByteRanges::new())
+        );
+        assert_eq!(
+            ByteRanges::new(),
+            ByteRanges::single(0, 5).intersection(&ByteRanges::single(5, 10))
+        );
+        assert_eq!(
+            ByteRanges::new(),
+            ByteRanges::single(0, 5).intersection(&ByteRanges::single(10, 15))
+        );
+        assert_eq!(
+            ByteRanges::single(3, 5),
+            ByteRanges::single(0, 5).intersection(&ByteRanges::single(3, 10))
+        );
+        assert_eq!(
+            ByteRanges::from_ranges(vec![ByteRange::new(5, 10), ByteRange::new(15, 20)]),
+            ByteRanges::single(0, 100).intersection(&ByteRanges::from_ranges(vec![
+                ByteRange::new(5, 10),
+                ByteRange::new(15, 20)
+            ]))
         );
     }
     #[test]
     fn test_subtraction() {
-        let mut a = ByteRanges::new();
-        a.add(&ByteRange::new(0, 10));
-        let mut b = ByteRanges::new();
-        b.add(&ByteRange::new(3, 5));
-        b.add(&ByteRange::new(7, 12));
-        let s = a.subtraction(&b);
         assert_eq!(
-            s.iter().collect::<Vec<_>>(),
-            vec![ByteRange::new(0, 3), ByteRange::new(5, 7)]
+            ByteRanges::new(),
+            ByteRanges::new().subtraction(&ByteRanges::single(0, 10))
+        );
+
+        assert_eq!(
+            ByteRanges::single(0, 10),
+            ByteRanges::single(0, 10).subtraction(&ByteRanges::new())
+        );
+
+        assert_eq!(
+            ByteRanges::new(),
+            ByteRanges::single(0, 10).subtraction(&ByteRanges::single(0, 10))
+        );
+
+        assert_eq!(
+            ByteRanges::new(),
+            ByteRanges::single(10, 20).subtraction(&ByteRanges::single(0, 30))
+        );
+
+        assert_eq!(
+            ByteRanges::single(15, 20),
+            ByteRanges::single(10, 20).subtraction(&ByteRanges::single(0, 15))
+        );
+
+        assert_eq!(
+            ByteRanges::single(10, 15),
+            ByteRanges::single(10, 20).subtraction(&ByteRanges::single(15, 20))
+        );
+
+        assert_eq!(
+            ByteRanges::from_ranges(vec![
+                ByteRange::new(1, 2),
+                ByteRange::new(5, 6),
+                ByteRange::new(9, 10),
+                ByteRange::new(13, 14),
+            ]),
+            ByteRanges::single(0, 20).subtraction(&ByteRanges::from_ranges(vec![
+                ByteRange::new(0, 1),
+                ByteRange::new(2, 5),
+                ByteRange::new(6, 9),
+                ByteRange::new(10, 13),
+                ByteRange::new(14, 20),
+            ])),
         );
     }
-    #[test]
-    fn test_intersects_and_overlaps() {
-        let mut b = ByteRanges::new();
-        b.add(&ByteRange::new(0, 5));
-        b.add(&ByteRange::new(10, 15));
-        assert!(b.intersects(&ByteRange::new(3, 12)));
-        assert!(b.overlaps(&ByteRange::new(3, 12)));
-        assert!(!b.intersects(&ByteRange::new(20, 25)));
-    }
+
     #[test]
     fn test_bytecount() {
         assert_eq!(0, ByteRanges::new().bytecount());
@@ -594,48 +772,36 @@ mod byteranges_tests {
     }
     #[test]
     fn extend() {
-        let mut a = ByteRanges::new();
-        a.add(&ByteRange::new(0, 5));
-        a.add(&ByteRange::new(10, 15));
-
-        let mut b = ByteRanges::new();
-        b.add(&ByteRange::new(3, 8));
-        b.add(&ByteRange::new(12, 20));
-
-        a.extend(b);
-
+        let mut r = ByteRanges::from_ranges(vec![ByteRange::new(0, 5), ByteRange::new(10, 15)]);
+        r.extend(ByteRanges::from_ranges(vec![
+            ByteRange::new(3, 8),
+            ByteRange::new(12, 20),
+        ]));
         // Should merge overlapping ranges: [0,5) + [3,8) = [0,8), [10,15) + [12,20) = [10,20)
         assert_eq!(
-            a.iter().collect::<Vec<_>>(),
-            vec![ByteRange::new(0, 8), ByteRange::new(10, 20)]
+            ByteRanges::from_ranges(vec![ByteRange::new(0, 8), ByteRange::new(10, 20)]),
+            r
         );
     }
     #[test]
     fn extend_empty() {
-        let mut a = ByteRanges::new();
-        a.add(&ByteRange::new(0, 5));
-
-        let empty = ByteRanges::new();
-        a.extend(empty);
+        let mut r = ByteRanges::single(0, 5);
+        r.extend(ByteRanges::new());
 
         // Should remain unchanged
-        assert_eq!(a.iter().collect::<Vec<_>>(), vec![ByteRange::new(0, 5)]);
+        assert_eq!(ByteRanges::single(0, 5), r);
     }
     #[test]
     fn extend_into_empty() {
-        let mut a = ByteRanges::new();
-
-        let mut b = ByteRanges::new();
-        b.add(&ByteRange::new(0, 5));
-        b.add(&ByteRange::new(10, 15));
-
-        a.extend(b);
-
-        // Should take all ranges from b
+        let mut r = ByteRanges::new();
+        r.extend(ByteRanges::from_ranges(vec![
+            ByteRange::new(0, 5),
+            ByteRange::new(10, 15),
+        ]));
         assert_eq!(
-            a.iter().collect::<Vec<_>>(),
-            vec![ByteRange::new(0, 5), ByteRange::new(10, 15)]
-        );
+            ByteRanges::from_ranges(vec![ByteRange::new(0, 5), ByteRange::new(10, 15)]),
+            r
+        )
     }
     #[test]
     fn test_chunked() {
@@ -665,17 +831,17 @@ mod byteranges_tests {
     fn test_range_containing() {
         // Test with empty ByteRanges
         let empty = ByteRanges::new();
-        assert_eq!(empty.range_containing(0), None);
-        assert_eq!(empty.range_containing(100), None);
+        assert_eq!(empty.containing_range(0), None);
+        assert_eq!(empty.containing_range(100), None);
 
         // Test with single range
         let single = ByteRanges::single(10, 20);
-        assert_eq!(single.range_containing(5), None); // Before range
-        assert_eq!(single.range_containing(10), Some(ByteRange::new(10, 20))); // At start
-        assert_eq!(single.range_containing(15), Some(ByteRange::new(10, 20))); // Inside range
-        assert_eq!(single.range_containing(19), Some(ByteRange::new(10, 20))); // Just before end
-        assert_eq!(single.range_containing(20), None); // At end (exclusive)
-        assert_eq!(single.range_containing(25), None); // After range
+        assert_eq!(single.containing_range(5), None); // Before range
+        assert_eq!(single.containing_range(10), Some(ByteRange::new(10, 20))); // At start
+        assert_eq!(single.containing_range(15), Some(ByteRange::new(10, 20))); // Inside range
+        assert_eq!(single.containing_range(19), Some(ByteRange::new(10, 20))); // Just before end
+        assert_eq!(single.containing_range(20), None); // At end (exclusive)
+        assert_eq!(single.containing_range(25), None); // After range
 
         // Test with multiple ranges
         let mut multiple = ByteRanges::new();
@@ -684,30 +850,30 @@ mod byteranges_tests {
         multiple.add(&ByteRange::new(40, 50));
 
         // Test offsets before first range
-        assert_eq!(multiple.range_containing(0), Some(ByteRange::new(0, 10)));
-        assert_eq!(multiple.range_containing(5), Some(ByteRange::new(0, 10)));
-        assert_eq!(multiple.range_containing(9), Some(ByteRange::new(0, 10)));
+        assert_eq!(multiple.containing_range(0), Some(ByteRange::new(0, 10)));
+        assert_eq!(multiple.containing_range(5), Some(ByteRange::new(0, 10)));
+        assert_eq!(multiple.containing_range(9), Some(ByteRange::new(0, 10)));
 
         // Test offsets in gaps between ranges
-        assert_eq!(multiple.range_containing(10), None); // At end of first range
-        assert_eq!(multiple.range_containing(15), None); // In gap
-        assert_eq!(multiple.range_containing(19), None); // Just before second range
+        assert_eq!(multiple.containing_range(10), None); // At end of first range
+        assert_eq!(multiple.containing_range(15), None); // In gap
+        assert_eq!(multiple.containing_range(19), None); // Just before second range
 
         // Test offsets in second range
-        assert_eq!(multiple.range_containing(20), Some(ByteRange::new(20, 30)));
-        assert_eq!(multiple.range_containing(25), Some(ByteRange::new(20, 30)));
-        assert_eq!(multiple.range_containing(29), Some(ByteRange::new(20, 30)));
+        assert_eq!(multiple.containing_range(20), Some(ByteRange::new(20, 30)));
+        assert_eq!(multiple.containing_range(25), Some(ByteRange::new(20, 30)));
+        assert_eq!(multiple.containing_range(29), Some(ByteRange::new(20, 30)));
 
         // Test offsets in gaps and third range
-        assert_eq!(multiple.range_containing(30), None); // At end of second range
-        assert_eq!(multiple.range_containing(35), None); // In gap
-        assert_eq!(multiple.range_containing(40), Some(ByteRange::new(40, 50)));
-        assert_eq!(multiple.range_containing(45), Some(ByteRange::new(40, 50)));
-        assert_eq!(multiple.range_containing(49), Some(ByteRange::new(40, 50)));
+        assert_eq!(multiple.containing_range(30), None); // At end of second range
+        assert_eq!(multiple.containing_range(35), None); // In gap
+        assert_eq!(multiple.containing_range(40), Some(ByteRange::new(40, 50)));
+        assert_eq!(multiple.containing_range(45), Some(ByteRange::new(40, 50)));
+        assert_eq!(multiple.containing_range(49), Some(ByteRange::new(40, 50)));
 
         // Test offsets after last range
-        assert_eq!(multiple.range_containing(50), None); // At end of last range
-        assert_eq!(multiple.range_containing(100), None); // Far after
+        assert_eq!(multiple.containing_range(50), None); // At end of last range
+        assert_eq!(multiple.containing_range(100), None); // Far after
     }
 
     #[test]
@@ -720,14 +886,14 @@ mod byteranges_tests {
         merged.add(&ByteRange::new(18, 25)); // Should merge with [15,20)
 
         // Should have two merged ranges: [0,10) and [15,25)
-        assert_eq!(merged.range_containing(0), Some(ByteRange::new(0, 10)));
-        assert_eq!(merged.range_containing(5), Some(ByteRange::new(0, 10)));
-        assert_eq!(merged.range_containing(9), Some(ByteRange::new(0, 10)));
-        assert_eq!(merged.range_containing(10), None); // At end of first merged range
-        assert_eq!(merged.range_containing(15), Some(ByteRange::new(15, 25)));
-        assert_eq!(merged.range_containing(20), Some(ByteRange::new(15, 25)));
-        assert_eq!(merged.range_containing(24), Some(ByteRange::new(15, 25)));
-        assert_eq!(merged.range_containing(25), None); // At end of second merged range
+        assert_eq!(merged.containing_range(0), Some(ByteRange::new(0, 10)));
+        assert_eq!(merged.containing_range(5), Some(ByteRange::new(0, 10)));
+        assert_eq!(merged.containing_range(9), Some(ByteRange::new(0, 10)));
+        assert_eq!(merged.containing_range(10), None); // At end of first merged range
+        assert_eq!(merged.containing_range(15), Some(ByteRange::new(15, 25)));
+        assert_eq!(merged.containing_range(20), Some(ByteRange::new(15, 25)));
+        assert_eq!(merged.containing_range(24), Some(ByteRange::new(15, 25)));
+        assert_eq!(merged.containing_range(25), None); // At end of second merged range
     }
 
     #[test]
@@ -738,25 +904,25 @@ mod byteranges_tests {
         with_empty.add(&ByteRange::new(10, 20));
         with_empty.add(&ByteRange::new(30, 30)); // Empty range
 
-        assert_eq!(with_empty.range_containing(0), None); // Empty range doesn't contain anything
+        assert_eq!(with_empty.containing_range(0), None); // Empty range doesn't contain anything
         assert_eq!(
-            with_empty.range_containing(15),
+            with_empty.containing_range(15),
             Some(ByteRange::new(10, 20))
         );
-        assert_eq!(with_empty.range_containing(30), None); // Empty range doesn't contain anything
+        assert_eq!(with_empty.containing_range(30), None); // Empty range doesn't contain anything
 
         // Test with very large offsets
         let large = ByteRanges::single(u64::MAX - 10, u64::MAX - 5);
         assert_eq!(
-            large.range_containing(u64::MAX - 10),
+            large.containing_range(u64::MAX - 10),
             Some(ByteRange::new(u64::MAX - 10, u64::MAX - 5))
         );
         assert_eq!(
-            large.range_containing(u64::MAX - 7),
+            large.containing_range(u64::MAX - 7),
             Some(ByteRange::new(u64::MAX - 10, u64::MAX - 5))
         );
-        assert_eq!(large.range_containing(u64::MAX - 5), None);
-        assert_eq!(large.range_containing(u64::MAX), None);
+        assert_eq!(large.containing_range(u64::MAX - 5), None);
+        assert_eq!(large.containing_range(u64::MAX), None);
     }
 }
 

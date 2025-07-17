@@ -146,7 +146,7 @@ impl Blob {
         }
         // Read what's left in a range containing offset
         self.available_ranges
-            .range_containing(offset)
+            .containing_range(offset)
             .map(|r| min(requested_len, (r.end - offset) as usize))
     }
 }
