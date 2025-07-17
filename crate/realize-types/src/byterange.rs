@@ -425,6 +425,19 @@ impl ByteRanges {
     pub fn iter(&self) -> std::slice::Iter<'_, ByteRange> {
         self.ranges.iter()
     }
+    /// Returns a range containing the given offset, if any.
+    pub fn range_containing(&self, offset: u64) -> Option<&ByteRange> {
+        for range in self.iter() {
+            if range.contains(offset) {
+                return Some(range);
+            }
+            if range.start > offset {
+                break;
+            }
+        }
+
+        None
+    }
 }
 
 impl IntoIterator for ByteRanges {
@@ -469,7 +482,7 @@ mod byteranges_tests {
         b.add(&ByteRange::new(12, 15));
         b.add(&ByteRange::new(8, 13));
         let expected = vec![ByteRange::new(0, 15)];
-        assert_eq!(b.ranges, expected);
+        assert_eq!(b.iter().cloned().collect::<Vec<_>>(), expected);
     }
     #[test]
     fn test_union() {
@@ -478,7 +491,7 @@ mod byteranges_tests {
         let mut b = ByteRanges::new();
         b.add(&ByteRange::new(3, 10));
         let u = a.union(&b);
-        assert_eq!(u.ranges, vec![ByteRange::new(0, 10)]);
+        assert_eq!(u.iter().cloned().collect::<Vec<_>>(), vec![ByteRange::new(0, 10)]);
     }
     #[test]
     fn test_intersection() {
@@ -488,7 +501,7 @@ mod byteranges_tests {
         let mut b = ByteRanges::new();
         b.add(&ByteRange::new(3, 12));
         let i = a.intersection(&b);
-        assert_eq!(i.ranges, vec![ByteRange::new(3, 5), ByteRange::new(10, 12)]);
+        assert_eq!(i.iter().cloned().collect::<Vec<_>>(), vec![ByteRange::new(3, 5), ByteRange::new(10, 12)]);
     }
     #[test]
     fn test_subtraction() {
@@ -498,7 +511,7 @@ mod byteranges_tests {
         b.add(&ByteRange::new(3, 5));
         b.add(&ByteRange::new(7, 12));
         let s = a.subtraction(&b);
-        assert_eq!(s.ranges, vec![ByteRange::new(0, 3), ByteRange::new(5, 7)]);
+        assert_eq!(s.iter().cloned().collect::<Vec<_>>(), vec![ByteRange::new(0, 3), ByteRange::new(5, 7)]);
     }
     #[test]
     fn test_intersects_and_overlaps() {
@@ -551,7 +564,7 @@ mod byteranges_tests {
         a.extend(b);
 
         // Should merge overlapping ranges: [0,5) + [3,8) = [0,8), [10,15) + [12,20) = [10,20)
-        assert_eq!(a.ranges, vec![ByteRange::new(0, 8), ByteRange::new(10, 20)]);
+        assert_eq!(a.iter().cloned().collect::<Vec<_>>(), vec![ByteRange::new(0, 8), ByteRange::new(10, 20)]);
     }
     #[test]
     fn extend_empty() {
@@ -562,7 +575,7 @@ mod byteranges_tests {
         a.extend(empty);
 
         // Should remain unchanged
-        assert_eq!(a.ranges, vec![ByteRange::new(0, 5)]);
+        assert_eq!(a.iter().cloned().collect::<Vec<_>>(), vec![ByteRange::new(0, 5)]);
     }
     #[test]
     fn extend_into_empty() {
@@ -575,7 +588,7 @@ mod byteranges_tests {
         a.extend(b);
 
         // Should take all ranges from b
-        assert_eq!(a.ranges, vec![ByteRange::new(0, 5), ByteRange::new(10, 15)]);
+        assert_eq!(a.iter().cloned().collect::<Vec<_>>(), vec![ByteRange::new(0, 5), ByteRange::new(10, 15)]);
     }
     #[test]
     fn test_chunked() {
@@ -599,6 +612,95 @@ mod byteranges_tests {
                 ByteRange::new(28, 30),
             ]
         );
+    }
+
+    #[test]
+    fn test_range_containing() {
+        // Test with empty ByteRanges
+        let empty = ByteRanges::new();
+        assert_eq!(empty.range_containing(0), None);
+        assert_eq!(empty.range_containing(100), None);
+
+        // Test with single range
+        let single = ByteRanges::single(10, 20);
+        assert_eq!(single.range_containing(5), None);  // Before range
+        assert_eq!(single.range_containing(10), Some(&ByteRange::new(10, 20)));  // At start
+        assert_eq!(single.range_containing(15), Some(&ByteRange::new(10, 20)));  // Inside range
+        assert_eq!(single.range_containing(19), Some(&ByteRange::new(10, 20)));  // Just before end
+        assert_eq!(single.range_containing(20), None);  // At end (exclusive)
+        assert_eq!(single.range_containing(25), None);  // After range
+
+        // Test with multiple ranges
+        let mut multiple = ByteRanges::new();
+        multiple.add(&ByteRange::new(0, 10));
+        multiple.add(&ByteRange::new(20, 30));
+        multiple.add(&ByteRange::new(40, 50));
+
+        // Test offsets before first range
+        assert_eq!(multiple.range_containing(0), Some(&ByteRange::new(0, 10)));
+        assert_eq!(multiple.range_containing(5), Some(&ByteRange::new(0, 10)));
+        assert_eq!(multiple.range_containing(9), Some(&ByteRange::new(0, 10)));
+
+        // Test offsets in gaps between ranges
+        assert_eq!(multiple.range_containing(10), None);  // At end of first range
+        assert_eq!(multiple.range_containing(15), None);  // In gap
+        assert_eq!(multiple.range_containing(19), None);  // Just before second range
+
+        // Test offsets in second range
+        assert_eq!(multiple.range_containing(20), Some(&ByteRange::new(20, 30)));
+        assert_eq!(multiple.range_containing(25), Some(&ByteRange::new(20, 30)));
+        assert_eq!(multiple.range_containing(29), Some(&ByteRange::new(20, 30)));
+
+        // Test offsets in gaps and third range
+        assert_eq!(multiple.range_containing(30), None);  // At end of second range
+        assert_eq!(multiple.range_containing(35), None);  // In gap
+        assert_eq!(multiple.range_containing(40), Some(&ByteRange::new(40, 50)));
+        assert_eq!(multiple.range_containing(45), Some(&ByteRange::new(40, 50)));
+        assert_eq!(multiple.range_containing(49), Some(&ByteRange::new(40, 50)));
+
+        // Test offsets after last range
+        assert_eq!(multiple.range_containing(50), None);  // At end of last range
+        assert_eq!(multiple.range_containing(100), None);  // Far after
+    }
+
+    #[test]
+    fn test_range_containing_with_merged_ranges() {
+        // Test with ranges that get merged during add operations
+        let mut merged = ByteRanges::new();
+        merged.add(&ByteRange::new(0, 5));
+        merged.add(&ByteRange::new(5, 10));  // Should merge with [0,5)
+        merged.add(&ByteRange::new(15, 20));
+        merged.add(&ByteRange::new(18, 25));  // Should merge with [15,20)
+
+        // Should have two merged ranges: [0,10) and [15,25)
+        assert_eq!(merged.range_containing(0), Some(&ByteRange::new(0, 10)));
+        assert_eq!(merged.range_containing(5), Some(&ByteRange::new(0, 10)));
+        assert_eq!(merged.range_containing(9), Some(&ByteRange::new(0, 10)));
+        assert_eq!(merged.range_containing(10), None);  // At end of first merged range
+        assert_eq!(merged.range_containing(15), Some(&ByteRange::new(15, 25)));
+        assert_eq!(merged.range_containing(20), Some(&ByteRange::new(15, 25)));
+        assert_eq!(merged.range_containing(24), Some(&ByteRange::new(15, 25)));
+        assert_eq!(merged.range_containing(25), None);  // At end of second merged range
+    }
+
+    #[test]
+    fn test_range_containing_edge_cases() {
+        // Test with empty ranges (should be filtered out)
+        let mut with_empty = ByteRanges::new();
+        with_empty.add(&ByteRange::new(0, 0));  // Empty range
+        with_empty.add(&ByteRange::new(10, 20));
+        with_empty.add(&ByteRange::new(30, 30));  // Empty range
+
+        assert_eq!(with_empty.range_containing(0), None);  // Empty range doesn't contain anything
+        assert_eq!(with_empty.range_containing(15), Some(&ByteRange::new(10, 20)));
+        assert_eq!(with_empty.range_containing(30), None);  // Empty range doesn't contain anything
+
+        // Test with very large offsets
+        let large = ByteRanges::single(u64::MAX - 10, u64::MAX - 5);
+        assert_eq!(large.range_containing(u64::MAX - 10), Some(&ByteRange::new(u64::MAX - 10, u64::MAX - 5)));
+        assert_eq!(large.range_containing(u64::MAX - 7), Some(&ByteRange::new(u64::MAX - 10, u64::MAX - 5)));
+        assert_eq!(large.range_containing(u64::MAX - 5), None);
+        assert_eq!(large.range_containing(u64::MAX), None);
     }
 }
 

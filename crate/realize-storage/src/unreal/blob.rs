@@ -2,6 +2,7 @@ use super::cache::UnrealCacheBlocking;
 use super::types::{BlobId, BlobTableEntry, FileTableEntry};
 use crate::StorageError;
 use realize_types::{Arena, ByteRange, ByteRanges, Hash};
+use std::cmp::min;
 use std::io::SeekFrom;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -138,22 +139,15 @@ impl Blob {
     /// - `Some(0)` means that reading would succeed, but would return nothing.
     /// - `None` means that reading would fail with the error [BlobIncomplete].
     pub fn readable_length(&self, offset: u64, requested_len: usize) -> Option<usize> {
-        if requested_len == 0 {
-            return Some(requested_len);
-        }
-        if offset >= self.size() {
+        // It's always possible to read nothing, and nothing is what you'll get.
+        // A file can always be read past its end, but yields no data.
+        if requested_len == 0 || offset >= self.size() {
             return Some(0);
         }
-        let available =
-            ByteRanges::single(offset, requested_len as u64).intersection(&self.available_ranges);
-        if let Some(range) = available.iter().next()
-            && range.start == offset
-        {
-            return Some(range.bytecount() as usize);
-        }
-
-        // The request should not go through.
-        None
+        // Read what's left in a range containing offset
+        self.available_ranges
+            .range_containing(offset)
+            .map(|r| min(requested_len, (r.end - offset) as usize))
     }
 }
 
@@ -163,16 +157,12 @@ impl AsyncRead for Blob {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let requested_len = buf.remaining();
-        if requested_len == 0 || self.offset > self.size {
-            return Poll::Ready(Ok(()));
-        }
-
-        match self.readable_length(self.offset, requested_len) {
+        match self.readable_length(self.offset, buf.remaining()) {
             None => Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 BlobIncomplete,
             ))),
+            Some(0) => Poll::Ready(Ok(())),
             Some(adjusted_len) => {
                 let mut shortbuf = buf.take(adjusted_len);
                 match Pin::new(&mut self.file).poll_read(cx, &mut shortbuf) {
