@@ -399,7 +399,7 @@ impl AsyncRead for Download {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc::testing::HouseholdFixture;
+    use crate::rpc::testing::{self, HouseholdFixture};
     use realize_types::Path;
     use std::io::Write as _;
     use tokio::fs;
@@ -435,11 +435,19 @@ mod tests {
             let a = HouseholdFixture::a();
             self.inner.wait_for_file_in_cache(a, path_str).await?;
 
-            // Get the cache and create a downloader
-            let cache = self.inner.cache(a)?;
-
             // Get the inode for the file
+            self.reader(downloader, path_str).await
+        }
+
+        async fn reader(
+            &self,
+            downloader: &Downloader,
+            path_str: &str,
+        ) -> Result<Download, anyhow::Error> {
             let arena = HouseholdFixture::test_arena();
+            let a = HouseholdFixture::a();
+            let cache = self.inner.cache(a)?;
+            let path = Path::parse(path_str)?;
             let (inode, _) = cache.lookup_path(arena, &path).await?;
 
             Ok(downloader.reader(inode).await?)
@@ -462,6 +470,49 @@ mod tests {
                 let mut reader = fixture
                     .download_file_from_b(&downloader, "test.txt", "File content")
                     .await?;
+                assert_eq!("File content", read_string(&mut reader).await?);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_after_disconnection() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let b = HouseholdFixture::b();
+                testing::connect(&household_a, b).await?;
+
+                let downloader = Downloader::new(
+                    household_a.clone(),
+                    fixture.inner.cache(HouseholdFixture::a())?.clone(),
+                );
+                let mut reader = fixture
+                    .download_file_from_b(&downloader, "test.txt", "File content")
+                    .await?;
+                assert_eq!("File content", read_string(&mut reader).await?);
+
+                // The entire content of test.txt is available
+                // locally. We don't need a connection anymore.
+                testing::disconnect(&household_a, b).await?;
+
+                // Reading back from the reader works.
+                reader.seek(SeekFrom::Start(0)).await?;
+                assert_eq!("File content", read_string(&mut reader).await?);
+
+                // Reading back from another reader works, once the
+                // database has been updated..
+                reader.update_db().await?;
+                drop(reader);
+
+                let mut reader = fixture.reader(&downloader, "test.txt").await?;
                 assert_eq!("File content", read_string(&mut reader).await?);
 
                 Ok::<(), anyhow::Error>(())
