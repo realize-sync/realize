@@ -461,8 +461,16 @@ impl ArenaCache {
         entry: &FileTableEntry,
         blob_table: Option<&mut redb::Table<'_, BlobId, Holder<BlobTableEntry>>>,
     ) -> Result<(), StorageError> {
-        let key = peer.map(|p| p.as_str()).unwrap_or("");
-        log::debug!("new file entry {file_inode} {key} {}", entry.content.hash);
+        let key = match peer {
+            None => "",
+            Some(peer) => {
+                log::debug!(
+                    "new file entry {file_inode} on {peer} {}",
+                    entry.content.hash
+                );
+                peer.as_str()
+            }
+        };
 
         // If this is overwriting the default entry (no peer), check if the old entry had a blob
         if peer.is_none() {

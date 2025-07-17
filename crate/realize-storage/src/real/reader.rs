@@ -21,12 +21,10 @@ impl Reader {
         root: &std::path::Path,
         path: &realize_types::Path,
     ) -> Result<Self, StorageError> {
-        let entry = index.get_file(path).await?.ok_or(StorageError::NotFound)?;
+        // The file must exist in the index
+        index.get_file(path).await?.ok_or(StorageError::NotFound)?;
 
         let realpath = path.within(root);
-
-        log::debug!("ON SERVER STORAGE OPEN {realpath:?} -> {entry:?}");
-
         let file = File::open(realpath).await?;
         Ok(Self {
             index: index.clone(),
