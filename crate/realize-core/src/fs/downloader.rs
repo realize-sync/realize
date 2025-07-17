@@ -1,13 +1,13 @@
 use crate::rpc::Household;
 use futures::Future;
-use realize_storage::{Inode, StorageError, UnrealCacheAsync};
+use realize_storage::{Blob, Inode, StorageError, UnrealCacheAsync};
 use realize_types::{Arena, ByteRange, Path, Peer};
 use std::cmp::min;
 use std::collections::VecDeque;
 use std::io::{ErrorKind, SeekFrom};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
+use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite as _, ReadBuf};
 use tokio_stream::StreamExt;
 
 const MIN_CHUNK_SIZE: usize = 8 * 1024;
@@ -26,6 +26,7 @@ impl Downloader {
 
     pub async fn reader(&self, inode: Inode) -> Result<Download, StorageError> {
         let avail = self.cache.file_availability(inode).await?;
+        let blob = self.cache.open_file(inode).await?;
 
         // TODO: check hash
         Ok(Download::new(
@@ -34,10 +35,18 @@ impl Downloader {
             avail.arena,
             avail.path,
             avail.metadata.size,
+            blob,
         ))
     }
 }
 
+/// Make file data available for read.
+///
+/// If data is available locally, return it, otherwise fetch it from a
+/// remote peer and store it for later.
+///
+/// Call [Download::update_db] when you're done to update the database
+/// with any data that had to be downloaded, to keep it for later.
 pub struct Download {
     household: Household,
     peers: Vec<Peer>,
@@ -47,13 +56,47 @@ pub struct Download {
     offset: u64,
     pending_seek: Option<u64>,
     avail: VecDeque<(ByteRange, Vec<u8>)>,
-    state: DlState,
+    read: ReadState,
+    blob: Blob,
+}
+
+/// States for AsyncRead::poll_read.
+#[derive(Default)]
+enum ReadState {
+    /// Answer [AsyncRead::poll_read] immediately or dispatch to
+    /// another state to get the data.
+    #[default]
+    Default,
+
+    /// Run [AsyncSeek::poll_complete] on the blob, then
+    /// [AsyncSeek::start_seek].
+    StartSeek(SeekFrom, Box<ReadState>),
+
+    /// [AsyncSeek::poll_complete] on the blob after calling
+    /// [AsyncSeek::start_seek].
+    Seek(Box<ReadState>),
+
+    /// Call [AsyncRead::poll_read] on the blob
+    Read,
+
+    /// Call [AsyncRead::poll_write] on the blob
+    Write(ByteRange, Vec<u8>),
+
+    /// A future that downloads the given range from a remote peer.
+    Download(ByteRange, PendingDownload),
 }
 
 type PendingDownload = Pin<Box<dyn Future<Output = Result<Vec<u8>, std::io::Error>> + Send + Sync>>;
 
 impl Download {
-    fn new(household: Household, peers: Vec<Peer>, arena: Arena, path: Path, size: u64) -> Self {
+    fn new(
+        household: Household,
+        peers: Vec<Peer>,
+        arena: Arena,
+        path: Path,
+        size: u64,
+        blob: Blob,
+    ) -> Self {
         Self {
             household,
             peers,
@@ -63,7 +106,8 @@ impl Download {
             offset: 0,
             pending_seek: None,
             avail: VecDeque::new(),
-            state: DlState::Initial,
+            read: ReadState::Default,
+            blob,
         }
     }
 
@@ -72,14 +116,17 @@ impl Download {
         self.offset >= self.size
     }
 
+    /// Update local availability in the database.
+    pub async fn update_db(&mut self) -> Result<(), StorageError> {
+        self.blob.update_db().await
+    }
+
     fn fill(&mut self, buf: &mut ReadBuf<'_>) -> bool {
         let requested = ByteRange::new(self.offset, self.offset + buf.remaining() as u64);
         let mut filled = false;
         while let Some((range, data)) = self.avail.front() {
             let intersection = requested.intersection(range);
             if !intersection.is_empty() && intersection.start == self.offset {
-                log::debug!("Return [{}]/{} {intersection}", self.arena, self.path);
-
                 buf.put_slice(
                     &data[(intersection.start - range.start) as usize
                         ..(intersection.end - range.start) as usize],
@@ -146,31 +193,126 @@ impl Download {
     /// State-based handler for poll_read.
     ///
     /// Returns the next state and optionally a poll value to return.
+    ///
+    /// ## [ReadState] transitions
+    ///
+    /// ```
+    /// Default╶┬─> StartSeek → Seek ╶┬─> Read → Default
+    ///         │                     │
+    ///         ╰─────────────────────╯
+    ///
+    /// Default -> Download ╶┬─> StartSeek → Seek ╶┬─> Write → Default
+    ///                      │                     │
+    ///                      ╰─────────────────────╯
+    /// ```
+    ///
+    /// On error, go back to `Default`.
+    ///
     fn handle_poll_read(
         self: &mut Pin<&mut Self>,
-        state: DlState,
+        state: ReadState,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> (DlState, Option<Poll<std::io::Result<()>>>) {
+    ) -> (ReadState, Option<Poll<std::io::Result<()>>>) {
         match state {
-            DlState::Initial => {
+            // Return the data or dispatch to Read or Download.
+            ReadState::Default => {
                 if self.offset >= self.size || self.fill(buf) {
-                    return (DlState::Initial, Some(Poll::Ready(Ok(()))));
+                    return (ReadState::Default, Some(Poll::Ready(Ok(()))));
                 }
 
-                let (r, fut) = self.next_request(buf.capacity());
+                let readable = self.blob.readable_length(self.offset, buf.remaining());
+                if readable.is_none() {
+                    let (r, fut) = self.next_request(buf.capacity());
 
-                (DlState::Downloading(r, fut), None)
+                    return (ReadState::Download(r, fut), None);
+                }
+
+                (
+                    if self.blob.offset() == self.offset {
+                        ReadState::Read
+                    } else {
+                        ReadState::StartSeek(
+                            SeekFrom::Start(self.offset),
+                            Box::new(ReadState::Read),
+                        )
+                    },
+                    None,
+                )
             }
-            DlState::Downloading(r, mut fut) => match fut.as_mut().poll(cx) {
-                Poll::Ready(Ok(data)) => {
-                    self.avail.push_back((r.clone(), data));
 
-                    (DlState::Initial, None)
+            // Call poll_complete on the blob, then start_seek.
+            //
+            // As the documentation of start_seek recommends, this
+            // implementation always call poll_complete before
+            // start_seek to make sure any pending operations are
+            // done.
+            ReadState::StartSeek(position, next) => {
+                match Pin::new(&mut self.blob).poll_complete(cx) {
+                    Poll::Pending => (ReadState::StartSeek(position, next), Some(Poll::Pending)),
+                    Poll::Ready(Err(err)) => (ReadState::Default, Some(Poll::Ready(Err(err)))),
+                    Poll::Ready(Ok(_)) => {
+                        if let Err(err) = Pin::new(&mut self.blob).start_seek(position) {
+                            return (ReadState::Default, Some(Poll::Ready(Err(err))));
+                        }
+                        (ReadState::Seek(next), None)
+                    }
                 }
-                Poll::Ready(Err(err)) => (DlState::Initial, Some(Poll::Ready(Err(err)))),
-                Poll::Pending => (DlState::Downloading(r, fut), Some(Poll::Pending)),
+            }
+
+            // Call poll_complete on the blob after start_seek
+            ReadState::Seek(next) => match Pin::new(&mut self.blob).poll_complete(cx) {
+                Poll::Pending => (ReadState::Seek(next), Some(Poll::Pending)),
+                Poll::Ready(Err(err)) => (ReadState::Default, Some(Poll::Ready(Err(err)))),
+                Poll::Ready(Ok(_)) => (*next, None),
             },
+
+            // Read data from the blob
+            ReadState::Read => {
+                let start = buf.filled().len();
+                match Pin::new(&mut self.blob).poll_read(cx, buf) {
+                    Poll::Pending => (ReadState::Read, Some(Poll::Pending)),
+                    Poll::Ready(Err(err)) => (ReadState::Default, Some(Poll::Ready(Err(err)))),
+                    Poll::Ready(Ok(())) => {
+                        let n = buf.filled().len() - start;
+                        self.offset += n as u64;
+
+                        (ReadState::Default, Some(Poll::Ready(Ok(()))))
+                    }
+                }
+            }
+
+            // Download data from another peer
+            ReadState::Download(r, mut fut) => match fut.as_mut().poll(cx) {
+                Poll::Pending => (ReadState::Download(r, fut), Some(Poll::Pending)),
+                Poll::Ready(Err(err)) => (ReadState::Default, Some(Poll::Ready(Err(err)))),
+                Poll::Ready(Ok(data)) => (
+                    if r.start == self.blob.offset() {
+                        ReadState::Write(r, data)
+                    } else {
+                        ReadState::StartSeek(
+                            SeekFrom::Start(r.start),
+                            Box::new(ReadState::Write(r, data)),
+                        )
+                    },
+                    None,
+                ),
+            },
+
+            // Write data to the blob.
+            ReadState::Write(r, data) => {
+                match Pin::new(&mut self.blob).poll_write(cx, data.as_slice()) {
+                    Poll::Pending => (ReadState::Write(r, data), Some(Poll::Pending)),
+                    Poll::Ready(Err(err)) => (ReadState::Default, Some(Poll::Ready(Err(err)))),
+                    Poll::Ready(Ok(_)) => {
+                        // Keep the data in memory so the Default
+                        // state can answer the next request(s)
+                        // immediately.                        self.avail.push_back((r, data));
+
+                        (ReadState::Default, None)
+                    }
+                }
+            }
         }
     }
 }
@@ -216,10 +358,10 @@ impl AsyncSeek for Download {
         match this.pending_seek.take() {
             None => Poll::Ready(Ok(this.offset)),
             Some(goal) => {
-                if let DlState::Downloading(range, _) = &this.state
+                if let ReadState::Download(range, _) = &this.read
                     && !range.contains(goal)
                 {
-                    this.state = DlState::Initial;
+                    this.read = ReadState::Default;
                 }
                 while this
                     .avail
@@ -237,13 +379,6 @@ impl AsyncSeek for Download {
     }
 }
 
-#[derive(Default)]
-enum DlState {
-    #[default]
-    Initial,
-    Downloading(ByteRange, PendingDownload),
-}
-
 impl AsyncRead for Download {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -251,9 +386,9 @@ impl AsyncRead for Download {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         loop {
-            let prev = std::mem::take(&mut self.state);
+            let prev = std::mem::take(&mut self.read);
             let (next, ret) = self.handle_poll_read(prev, cx, buf);
-            self.state = next;
+            self.read = next;
             if let Some(ret) = ret {
                 return ret;
             }
