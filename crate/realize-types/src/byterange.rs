@@ -226,7 +226,7 @@ mod tests {
 /// Provides efficient set operations and iteration.
 ///
 /// Implementation uses a segment tree based on BTreeMap for efficient range operations.
-#[derive(Clone, Eq, PartialEq, Default, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Eq, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ByteRanges {
     btree: BTreeMap<u64, Point>,
 }
@@ -551,15 +551,30 @@ impl fmt::Display for ByteRanges {
             }
             write!(f, "{range}")?;
         }
-        f.write_str("}")?;
-        Ok(())
+
+        f.write_str("}")
     }
 }
-// impl fmt::Debug for ByteRanges {
-//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-//         fmt::Display::fmt(self, f)
-//     }
-// }
+
+impl fmt::Debug for ByteRanges {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
+        f.write_str("{")?;
+        for (val, pt) in &self.btree {
+            if first {
+                first = false;
+            } else {
+                write!(f, ", ")?;
+            }
+            match pt {
+                Point::Start => write!(f, "[{val}"),
+                Point::End => write!(f, "{val})"),
+            }?;
+        }
+
+        f.write_str("}")
+    }
+}
 
 struct Merged<A, B>
 where
