@@ -3,6 +3,34 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
+## Design and implement decision maker {#decisionmaker}
+
+Design a type that makes decisions and store them in Engine based on:
+- `PathMarks`
+- notifications from other peers
+- notification from the index
+
+Rules:
+1. If a file with Mark::Keep is in the cache but its active version is not complete, store Decision::UpdateCache
+2. If a file with Mark::Own is in the cache, store Decision::Realize
+3. If a file with with Mark::Keep or Mark::Watch is in the index *and* the cache, store Decision::Unrealize
+4. If the mark changes on a file or one of its parent directories:
+   - remove any decision stored in the Engine for the path
+   - go through the rules above to possibly make another decision
+
+Rule 1, 2 and 3 should be updated whenever the cache is updated, by
+listening to notifications from remote peers, after they've been
+processed by the cache.
+
+Rule 3 should be updated whenever the index is updated by listening to
+notifications (history update) from the index.
+
+Rule 4 should be updated at startup and whenever the mark changes by
+listening to notification from the watcher (see section
+[#marksxattrs))
+
+Task list: TBD
+
 ## Update marks from xattrs {#marksxattr}
 
 Arenas, files and directories can be marked *own*, *watch* or *keep*
@@ -36,16 +64,6 @@ unset marks as xattrs change.
 - Add unit tests, then run `cargo test -p realize-storage marks`,
   fix any issues.
 - Finally run `cargo test -p realize-storage`, fix any issues.
-
-## Design and implement decision maker {#decisionmaker}
-
-Design a type that makes decisions and store them in Engine based on:
-- `PathMarks`
-- notifications from other peers
-- notification from the index
-
-TODO: fill that in
-
 
 ## Turn Blobstore into a LRU cache {#bloblru}
 
