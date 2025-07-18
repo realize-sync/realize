@@ -3,85 +3,39 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
-## Track path marks {#marks}
+## Update marks from xattrs {#marksxattr}
 
 Arenas, files and directories can be marked *own*, *watch* or *keep*
 as described in the section Consensus of [real.md](real.md) and the
 section Blobstore in [unreal.md](unreal.md)
 
-- Files marked *own* belong in the real. They should be moved into the
-  arena root as regular file.
+The type `PathMarks` and `Mark`, defined in
+[mark.rs](../crate/realize-storage/src/mark.rs) track that.
 
-- Files marked *watch* or *keep* belong in the unreal. They should be
-  left in the cache. They might be moved to the cache if they're
-  stored as regular file, once another peer has taken ownership of
-  them.
+The goal of this task is to be able to add and remove paths from
+`PathMarks` using file xattrs.
 
-- Files marked *watch* are subject to the normal LRU rules in the
-  cache. They may be refreshed when they change.
+Extend `Watcher`, defined in
+[watcher.rs](../crate/realize-storage/src/real/watcher.rs) to track
+xattr `user.realize.mark` on files and directories and update
+`PathMarks`, based on that.
 
-- Files marked *keep* are unconditionally kept in the cache and
-  refreshed when they change.
+The `Watcher` should be given a `PathMarks` type to modify. Typically
+that type is empty with just the default (arena) mark set. It returns
+a reference to that `PathMarks` instances from `Watcher::path_marks()
+-> &PathMarks`
 
-- Unmarked files inherit their mark from the containing directory or Arena.
+During catchup, the Watcher should just set marks as it finds them in
+the `PathMarks` it's given without worrying about existing marks.
 
-1. Define an enum type `Mark` and an arena-specific type `PathMarks`
-   that tracks marks hierarchically by paths in the file
-   `../crate/realize-storage/src/mark.rs`. For now, `PathMarks` has
-   just a global (per-Arena mark) and returns that for every path it's
-   given to `PathMarks::for_path(&realize_types::Path) -> Mark`
+When receiving a notification, the watcher should set, update and
+unset marks as xattrs change.
 
-   Add the new types then run `cargo check -p realize-storage --lib`,
-   fix any issues.
-
-2. Add a `Mark` to `ArenaConfig` and add a function
-   `PathMarks::from_config(&ArenaConfig)->Self` to create a
-   `PathMarks` from config. The mark defaults to *watch* in
-   ArenaConfig.
-
-   Refactor, then run `cargo check -p realize-storage --lib` and
-   `cargo test -p realize-storage`, fix any issues.
-
-3. Extend `PathMarks` to keep paths, which can be file or directory,
-   and the corresponding mark. Extend `for_path` to take these paths
-   into account (return the file mark if it is set, return the
-   containing directory mark if it is set, return the default mark
-   otherwise).
-
-   Marks can be set and unset (for the next step)
-
-   Add unit tests for `for_path` that tests file, directory and arena
-   marks.
-
-   - Implement, then run `cargo check -p realize-storage --lib`, fix
-   any issues.
-   - Add unit tests, then run `cargo test -p realize-storage marks`,
-   fix any issues.
-   - Finally run `cargo test -p realize-storage`, fix any issues.
-
-4. Extend `Watcher`, defined in
-   [watcher.rs](../crate/realize-storage/src/real/watcher.rs) to track
-   xattr `user.realize.mark` on files and directories and update
-   `PathMarks` based on that.
-
-   The `Watcher` should be given a `PathMarks` type to modify.
-   Typically that type is empty with just the default (arena) mark
-   set. It returns a reference to that `PathMarks` instances from
-   `Watcher::path_marks() -> &PathMarks`
-
-   During catchup, the Watcher should just set marks as it finds them
-   in the `PathMarks` it's given without worrying about existing
-   marks.
-
-   When receiving a notification, the watcher should set, update and
-   unset marks as xattrs change.
-
-   - Implement, then run `cargo check -p realize-storage --lib`, fix
-   any issues.
-   - Add unit tests, then run `cargo test -p realize-storage marks`,
-   fix any issues.
-   - Finally run `cargo test -p realize-storage`, fix any issues.
-
+- Implement, then run `cargo check -p realize-storage --lib`, fix
+  any issues.
+- Add unit tests, then run `cargo test -p realize-storage marks`,
+  fix any issues.
+- Finally run `cargo test -p realize-storage`, fix any issues.
 
 ## Design and implement decision maker {#decisionmaker}
 
