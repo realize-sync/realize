@@ -13,6 +13,7 @@ use realize_types::Arena;
 pub mod config;
 mod engine;
 mod error;
+mod mark;
 mod real;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -21,6 +22,7 @@ mod unreal;
 pub mod utils;
 
 pub use error::StorageError;
+pub use mark::Mark;
 pub use real::notifier::Notification;
 pub use real::notifier::Progress;
 pub use real::reader::Reader;
@@ -56,10 +58,10 @@ impl Storage {
         let store = RealStore::from_config(&config.arenas);
         let mut arenas = HashMap::new();
         let exclude = build_exclude(&config);
-        
+
         // Collect arena databases for cache creation
         let mut arena_databases = Vec::new();
-        
+
         for (arena, arena_config) in &config.arenas {
             let root = arena_config.path.as_ref();
             if let Some(db_path) = &arena_config.db {
@@ -81,18 +83,14 @@ impl Storage {
                         _watcher: watcher,
                     },
                 );
-                
+
                 // Add to arena databases for cache creation if blob_dir is configured
                 if let Some(blob_dir) = &arena_config.blob_dir {
-                    arena_databases.push((
-                        *arena,
-                        db,
-                        blob_dir.clone(),
-                    ));
+                    arena_databases.push((*arena, db, blob_dir.clone()));
                 }
             }
         }
-        
+
         // Create cache with shared databases
         let cache = if let Some(cache_config) = &config.cache {
             let global_db = redb_utils::open(&cache_config.db).await?;

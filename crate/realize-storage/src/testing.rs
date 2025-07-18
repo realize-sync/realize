@@ -1,6 +1,7 @@
 use crate::utils::redb_utils;
 
 use super::config::{ArenaConfig, CacheConfig, StorageConfig};
+use super::mark::Mark;
 use super::{Storage, UnrealCacheAsync};
 use realize_types::Arena;
 use std::sync::Arc;
@@ -43,6 +44,7 @@ where
                         path: arena_dir.clone(),
                         db: Some(storage_db),
                         blob_dir: Some(arena_dir.join(".blobs")),
+                        mark: Mark::Watch,
                     },
                 )
             })

@@ -2,6 +2,8 @@ use realize_types::Arena;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::mark::Mark;
+
 /// Storage configuration.
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
 pub struct StorageConfig {
@@ -39,4 +41,7 @@ pub struct ArenaConfig {
     pub db: Option<PathBuf>,
     /// Optional path to the directory where blob files are stored (required for cache functionality).
     pub blob_dir: Option<PathBuf>,
+    /// The default mark for files and directories in this arena.
+    #[serde(default)]
+    pub mark: Mark,
 }

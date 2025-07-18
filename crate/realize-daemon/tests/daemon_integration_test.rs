@@ -9,8 +9,8 @@ use realize_core::rpc::realstore;
 use realize_core::rpc::realstore::client::ClientOptions;
 use realize_network::Networking;
 use realize_network::config::PeerConfig;
-use realize_storage::RealStoreOptions;
 use realize_storage::config::{ArenaConfig, CacheConfig};
+use realize_storage::{Mark, RealStoreOptions};
 use realize_types;
 use realize_types::{Arena, Peer};
 use reqwest::Client;
@@ -62,6 +62,7 @@ impl Fixture {
                 path: testdir.to_path_buf(),
                 db: None,
                 blob_dir: None,
+                mark: Mark::Watch,
             },
         );
 
