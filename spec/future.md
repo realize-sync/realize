@@ -83,37 +83,6 @@ section Blobstore in [unreal.md](unreal.md)
    - Finally run `cargo test -p realize-storage`, fix any issues.
 
 
-## Extract a Blobstore type {#blobstoretype}
-
-Extract the blob-specific code, types and database (BlobTableEntry)
-definition from
-[arena_cache.rs](../crate/realize-storage/src/unreal/arena_cache.rs)
-into a Blobstore type and put it all into
-[blob.rs](../crate/realize-storage/src/unreal/blob.rs)
-
-The goal of this change is to consolidate blob-specific logic used in
-different places (`cache.rs`, `arena_cache.rs`, `blob.rs`) in one
-place, `blob.rs`
-
-1. Split a `Blobstore` type from `ArenaCache`, leaving it all in
-   `arena_cache.rs`.
-
-   Refactor, then run `cargo check -p realize-storage --tests` to make
-   sure everything still builds.
-
-2. Move `Blobstore` `BlobstoreTableEntry` and the blob table
-   definition to `blob.rs`.
-
-   Refactor, then run `cargo check -p realize-storage --tests` to make
-   sure everything still builds.
-
-3. Move the blob-related tests in `arena.rs` into `blob.rs`. Reuse
-   and, if necessary, extend the Fixture defined in `blob.rs` for the
-   blob-related tests that are moved.
-
-   Move the tests, run `cargo test -p realize-storage blob`, fix any
-   issues.
-
 ## Add an Engine {#engine}
 
 An engine is a new type, defined in
