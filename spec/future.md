@@ -83,97 +83,15 @@ section Blobstore in [unreal.md](unreal.md)
    - Finally run `cargo test -p realize-storage`, fix any issues.
 
 
-## Add an Engine {#engine}
+## Design and implement decision maker {#decisionmaker}
 
-An engine is a new type, defined in
-`crate/realize-storage/src/engine.rs` that store `Decision`s in a
-redb::Database it's given.
+Design a type that makes decisions and store them in Engine based on:
+- `PathMarks`
+- notifications from other peers
+- notification from the index
 
-Implement `engine.rs` database-handling just the way it's defined in
-[index.rs](../crate/realize-storage/src/real/index.rs), that is:
+TODO: fill that in
 
-- Define two types, `EngineAsync` and `EngineBlocking`.
-
-    `EngineAsync` just keeps an `EngineBlocking` that it calls using spawn_blocking.
-    `EngineBlocking` does the real work. It is given an `Arc<Database>` and stores its data here.
-
-- Define a redb::Table with a path as key (stored as a &str) and a
-  `Holder<DecisionTableEntry>` as value. `DecisionTableEntry` is a
-  rust type defined in `engine.rs` that can be serialized to and
-  deserialized from a capnp message, defined in
-  `crate/realize-storage/capnp/engine.capnp`
-
-  `DecisionTableEntry` just contains a single enum for now, a
-  `Decision` which has the values:
-     - `Realize` -- move from cache to arena root (as a regular file)
-     - `Unrealize` -- move from arena root to cache
-     - `UpdateCache` -- update the file from another peer and store it in the cache
-
-- Define the following methods on `EngineBlocking` and `EngineAsync`:
-  `set(path, decision)`, `clear(path)`, `get(path)`. Adds adds or
-  updates an entry in the database. Clear removes any entry for the
-  path from the database (if one existed), get returns the `Decision`
-  for the path, if any exist.
-
-Task List:
-
-1. Create the file `engine.rs`, with skeletons for the two types
-   `EngineAsync` and `EngineBlocking` and the methods that link them
-   together (`EngineBlocking::into_async()`
-   `EngineAsync::new(EngineBlocking)` `EngineAsync::blocking()` like
-   in `index.rs`)
-
-   Write the code, then run `cargo check -p realize-storage --lib` to
-   make sure it compiles.
-
-2. Define the types `Decision` and `DecisionTableEntry` and have it
-   implement `ByteConvertible` so it can be put into a `Holder`
-
-   This requires defining the corresponding capnp enum and type in
-   `crate/realize-storage/capnp/engine.capnp`. Set the parent module
-   to "engine". Make sure to update
-   [build.rs](../crate/realize-storage/build.rs) and define the module
-   engine_capnp in `engine.rs` just like it's done in
-   [real.rs](../crate/realize-storage/src/real.rs) for `real_capnp`.
-
-   Write the code, add unit tests for serialization/deserialization,
-   then run `cargo test -p realize-storage engine`
-
-3. Define the new DECISION_TABLE (name: "engine.decision", key: &str,
-   value: Holder<DecisionTableEntry>) and implement the methods `set`,
-   `clear` and `get` in `EngineBlocking` as well as the corresponding
-   methods in `EngineAsync` that delegate to them.
-
-   Write the code, add unit tests then run `cargo test -p
-   realize-storage engine`. You can create an in-memory database for
-   the tests using
-   `redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?`
-
-   When writing the tests, make sure to add a fixture and use it
-   throughout to avoid duplicating work in all test:
-
-```
-   struct Fixture { engine: EngineBlocking }
-   impl Fixture {
-     fn setup() -> Self {
-        let engine = ... // create db and type
-
-        Fixture { engine }
-     }
-   }
-
-   #[test]
-   fn engine_does_something() -> anyhow::Result<()> {
-      let fixture = Fixture::setup()?;
-
-      fixture.engine.do_something()?;
-
-      Ok(())
-   }
-```
-
-(Next steps: Design and implement the code that creates and updates
-the decisions. That's outside the scope of this section.)
 
 ## Turn Blobstore into a LRU cache {#bloblru}
 
