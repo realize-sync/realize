@@ -11,6 +11,7 @@ use realize_types;
 use realize_types::Arena;
 
 pub mod config;
+mod engine;
 mod error;
 mod real;
 #[cfg(any(test, feature = "testing"))]
