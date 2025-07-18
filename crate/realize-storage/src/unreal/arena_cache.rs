@@ -357,14 +357,7 @@ impl ArenaCache {
             let txn = (&*self.db).begin_read()?;
             let file_entry = get_default_entry(&txn.open_table(FILE_TABLE)?, inode)?;
             if let Some(blob_id) = file_entry.content.blob {
-                let blob_entry = get_blob_entry(&txn.open_table(BLOB_TABLE)?, blob_id)?;
-                let file = self.open_blob_file(blob_id, file_entry.metadata.size, false)?;
-                return Ok(OpenBlob {
-                    blob_id,
-                    file_entry,
-                    blob_entry,
-                    file,
-                });
+                return self.open_blob(&txn.open_table(BLOB_TABLE)?, file_entry, blob_id);
             }
         }
 
@@ -373,45 +366,67 @@ impl ArenaCache {
         let txn = (&*self.db).begin_write()?;
         let ret = {
             let mut file_table = txn.open_table(FILE_TABLE)?;
-            let mut file_entry = get_default_entry(&file_table, inode)?;
+            let file_entry = get_default_entry(&file_table, inode)?;
             if let Some(blob_id) = file_entry.content.blob {
-                let blob_entry = get_blob_entry(&txn.open_table(BLOB_TABLE)?, blob_id)?;
-                let file = self.open_blob_file(blob_id, file_entry.metadata.size, false)?;
-                return Ok(OpenBlob {
-                    blob_id,
-                    file_entry,
-                    blob_entry,
-                    file,
-                });
+                return self.open_blob(&txn.open_table(BLOB_TABLE)?, file_entry, blob_id);
             }
+            let mut openblob = self.create_blob(inode, &txn, file_entry)?;
 
-            let mut blob_table = txn.open_table(BLOB_TABLE)?;
-            let blob_id = blob_table
-                .last()?
-                .map(|(k, _)| k.value())
-                .unwrap_or(BlobId(1));
-            log::debug!(
-                "assigned blob {blob_id} to file {inode} {}",
-                file_entry.content.hash
-            );
-            let file = self.open_blob_file(blob_id, file_entry.metadata.size, true)?;
-            let blob_entry = BlobTableEntry {
-                written_areas: ByteRanges::new(),
-            };
-            blob_table.insert(blob_id, Holder::new(&blob_entry)?)?;
-            file_entry.content.blob = Some(blob_id);
-            file_table.insert((inode, ""), Holder::new(&file_entry)?)?;
+            openblob.file_entry.content.blob = Some(openblob.blob_id);
+            file_table.insert((inode, ""), Holder::new(&openblob.file_entry)?)?;
 
-            OpenBlob {
-                blob_id,
-                file_entry,
-                blob_entry,
-                file,
-            }
+            openblob
         };
         txn.commit()?;
 
         Ok(ret)
+    }
+
+    /// Return an [OpenBlob] entry given a blob id.
+    fn open_blob(
+        &self,
+        blob_table: &impl redb::ReadableTable<BlobId, Holder<'static, BlobTableEntry>>,
+        file_entry: FileTableEntry,
+        blob_id: BlobId,
+    ) -> Result<OpenBlob, StorageError> {
+        let blob_entry = get_blob_entry(blob_table, blob_id)?;
+        let file = self.open_blob_file(blob_id, file_entry.metadata.size, false)?;
+
+        return Ok(OpenBlob {
+            blob_id,
+            file_entry,
+            blob_entry,
+            file,
+        });
+    }
+
+    /// Create a new blob and returns its [OpenBlob]
+    fn create_blob(
+        &self,
+        inode: Inode,
+        txn: &WriteTransaction,
+        file_entry: FileTableEntry,
+    ) -> Result<OpenBlob, StorageError> {
+        let mut blob_table = txn.open_table(BLOB_TABLE)?;
+        let blob_id = blob_table
+            .last()?
+            .map(|(k, _)| k.value())
+            .unwrap_or(BlobId(1));
+        log::debug!(
+            "assigned blob {blob_id} to file {inode} {}",
+            file_entry.content.hash
+        );
+        let file = self.open_blob_file(blob_id, file_entry.metadata.size, true)?;
+        let blob_entry = BlobTableEntry {
+            written_areas: ByteRanges::new(),
+        };
+        blob_table.insert(blob_id, Holder::new(&blob_entry)?)?;
+        Ok(OpenBlob {
+            blob_id,
+            file_entry,
+            blob_entry,
+            file,
+        })
     }
 
     /// Open or create a file for the blob and make sure it has the
