@@ -44,7 +44,7 @@ impl Blobstore {
         Ok(Arc::new(Self { db, blob_dir }))
     }
 
-    /// Return an [OpenBlob] entry given a blob id.
+    /// Return an [Blob] entry given a blob id.
     pub(crate) fn open_blob(
         self: &Arc<Self>,
         txn: &ReadTransaction,
@@ -56,17 +56,15 @@ impl Blobstore {
         let file = self.open_blob_file(blob_id, file_entry.metadata.size, false)?;
 
         return Ok(Blob::new(
-            OpenBlob {
-                blob_id,
-                file_entry,
-                blob_entry,
-                file,
-            },
+            blob_id,
+            file_entry,
+            blob_entry,
+            file,
             Arc::clone(self),
         ));
     }
 
-    /// Create a new blob and returns its [OpenBlob]
+    /// Create a new blob and returns its [Blob]
     pub(crate) fn create_blob(
         self: &Arc<Self>,
         inode: Inode,
@@ -96,12 +94,10 @@ impl Blobstore {
         let file = self.open_blob_file(blob_id, file_entry.metadata.size, true)?;
         blob_table.insert(blob_id, Holder::new(&blob_entry)?)?;
         Ok(Blob::new(
-            OpenBlob {
-                blob_id,
-                file_entry,
-                blob_entry,
-                file,
-            },
+            blob_id,
+            file_entry,
+            blob_entry,
+            file,
             Arc::clone(self),
         ))
     }
@@ -210,13 +206,6 @@ impl BlobIncomplete {
     }
 }
 
-pub(crate) struct OpenBlob {
-    pub blob_id: BlobId,
-    pub file_entry: FileTableEntry,
-    pub blob_entry: BlobTableEntry,
-    pub file: std::fs::File,
-}
-
 /// A blob that provides async read and seek access to file data.
 ///
 /// Attempts to read outside of available range will result in an I/O
@@ -242,15 +231,21 @@ pub struct Blob {
 #[allow(dead_code)]
 impl Blob {
     /// Create a new blob from a file and its available byte ranges.
-    pub(crate) fn new(def: OpenBlob, blobstore: Arc<Blobstore>) -> Self {
+    pub(crate) fn new(
+        blob_id: BlobId,
+        file_entry: FileTableEntry,
+        blob_entry: BlobTableEntry,
+        file: std::fs::File,
+        blobstore: Arc<Blobstore>,
+    ) -> Self {
         Self {
-            blob_id: def.blob_id,
-            file: tokio::fs::File::from_std(def.file),
-            available_ranges: def.blob_entry.written_areas,
+            blob_id,
+            file: tokio::fs::File::from_std(file),
+            available_ranges: blob_entry.written_areas,
             blobstore,
             pending_ranges: ByteRanges::new(),
-            size: def.file_entry.metadata.size,
-            hash: def.file_entry.content.hash,
+            size: file_entry.metadata.size,
+            hash: file_entry.content.hash,
             offset: 0,
         }
     }
