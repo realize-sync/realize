@@ -1,13 +1,188 @@
 use super::cache::UnrealCacheBlocking;
 use super::types::{BlobId, BlobTableEntry, FileTableEntry};
 use crate::StorageError;
+use crate::utils::holder::Holder;
+use crate::Inode;
 use realize_types::{Arena, ByteRange, ByteRanges, Hash};
 use std::cmp::min;
-use std::io::SeekFrom;
+use std::io::{SeekFrom, Write};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt as _, ReadBuf};
+use redb::{Database, ReadTransaction, WriteTransaction, TableDefinition, ReadableTable};
+
+/// Track blobs.
+///
+/// Key: inode
+/// Value: BlobTableEntry
+const BLOB_TABLE: TableDefinition<BlobId, Holder<BlobTableEntry>> =
+    TableDefinition::new("acache.blob");
+
+/// A blob store that handles blob-specific operations.
+///
+/// This struct contains blob-specific logic and database operations.
+pub(crate) struct Blobstore {
+    db: Arc<Database>,
+    blob_dir: PathBuf,
+}
+
+impl Blobstore {
+    /// Create a new Blobstore from a database and blob directory.
+    pub(crate) fn new(db: Arc<Database>, blob_dir: PathBuf) -> Result<Self, StorageError> {
+        // Ensure the database has the required blob table
+        {
+            let txn = db.begin_write()?;
+            txn.open_table(BLOB_TABLE)?;
+            txn.commit()?;
+        }
+
+        if !blob_dir.exists() {
+            std::fs::create_dir_all(&blob_dir)?;
+        }
+
+        Ok(Self { db, blob_dir })
+    }
+
+    /// Return an [OpenBlob] entry given a blob id.
+    pub(crate) fn open_blob(
+        &self,
+        txn: &ReadTransaction,
+        file_entry: FileTableEntry,
+        blob_id: BlobId,
+    ) -> Result<OpenBlob, StorageError> {
+        let blob_table = txn.open_table(BLOB_TABLE)?;
+        let blob_entry = get_blob_entry(&blob_table, blob_id)?;
+        let file = self.open_blob_file(blob_id, file_entry.metadata.size, false)?;
+
+        return Ok(OpenBlob {
+            blob_id,
+            file_entry,
+            blob_entry,
+            file,
+        });
+    }
+
+    /// Create a new blob and returns its [OpenBlob]
+    pub(crate) fn create_blob(
+        &self,
+        inode: Inode,
+        txn: &WriteTransaction,
+        file_entry: FileTableEntry,
+    ) -> Result<OpenBlob, StorageError> {
+        let mut blob_table = txn.open_table(BLOB_TABLE)?;
+        let (blob_id, blob_entry) = if let Some(blob_id) = file_entry.content.blob {
+            let blob_entry = get_blob_entry(&blob_table, blob_id)?;
+
+            (blob_id, blob_entry)
+        } else {
+            let blob_id = blob_table
+                .last()?
+                .map(|(k, _)| k.value())
+                .unwrap_or(BlobId(1));
+            log::debug!(
+                "assigned blob {blob_id} to file {inode} {}",
+                file_entry.content.hash
+            );
+            let blob_entry = BlobTableEntry {
+                written_areas: ByteRanges::new(),
+            };
+
+            (blob_id, blob_entry)
+        };
+        let file = self.open_blob_file(blob_id, file_entry.metadata.size, true)?;
+        blob_table.insert(blob_id, Holder::new(&blob_entry)?)?;
+        Ok(OpenBlob {
+            blob_id,
+            file_entry,
+            blob_entry,
+            file,
+        })
+    }
+
+    /// Open or create a file for the blob and make sure it has the
+    /// right size.
+    fn open_blob_file(
+        &self,
+        blob_id: BlobId,
+        file_size: u64,
+        new_file: bool,
+    ) -> Result<std::fs::File, StorageError> {
+        let path = self.blob_path(blob_id);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .truncate(new_file)
+            .create(true)
+            .open(path)?;
+        let file_meta = file.metadata()?;
+        if file_size != file_meta.len() {
+            file.set_len(file_size)?;
+            file.flush()?;
+        }
+
+        Ok(file)
+    }
+
+    /// Return the path of the file for the given blob.
+    fn blob_path(&self, blob_id: BlobId) -> PathBuf {
+        self.blob_dir.join(blob_id.to_string())
+    }
+
+    /// Delete a blob and its associated file.
+    pub(crate) fn delete_blob(&self, blob_id: BlobId) -> Result<(), StorageError> {
+        let blob_path = self.blob_path(blob_id);
+        if blob_path.exists() {
+            std::fs::remove_file(&blob_path)?;
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn local_availability(&self, blob_id: BlobId) -> Result<ByteRanges, StorageError> {
+        let txn = self.db.begin_read()?;
+        let blob_table = txn.open_table(BLOB_TABLE)?;
+
+        Ok(get_blob_entry(&blob_table, blob_id)?.written_areas)
+    }
+
+    /// Extend the local availability of a blob.
+    pub(crate) fn extend_local_availability(
+        &self,
+        blob_id: BlobId,
+        new_range: &ByteRanges,
+    ) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut blob_table = txn.open_table(BLOB_TABLE)?;
+            let mut blob_entry = get_blob_entry(&blob_table, blob_id)?;
+            blob_entry.written_areas = blob_entry.written_areas.union(&new_range);
+            log::debug!(
+                "{blob_id} extended by {new_range}; available: {}",
+                blob_entry.written_areas
+            );
+
+            blob_table.insert(blob_id, Holder::with_content(blob_entry)?)?;
+        }
+        txn.commit()?;
+
+        Ok(())
+    }
+}
+
+fn get_blob_entry(
+    blob_table: &impl redb::ReadableTable<BlobId, Holder<'static, BlobTableEntry>>,
+    blob_id: BlobId,
+) -> Result<BlobTableEntry, StorageError> {
+    let entry = blob_table
+        .get(blob_id)?
+        .ok_or(StorageError::NotFound)?
+        .value()
+        .parse()?;
+
+    Ok(entry)
+}
 
 /// Error returned by Blob when reading outside the available range.
 ///

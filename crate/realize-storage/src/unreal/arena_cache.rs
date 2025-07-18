@@ -1,6 +1,7 @@
 use super::blob::OpenBlob;
+use super::blob::Blobstore;
 use super::types::{
-    BlobId, BlobTableEntry, DirTableEntry, FileAvailability, FileContent, FileMetadata,
+    BlobId, DirTableEntry, FileAvailability, FileContent, FileMetadata,
     FileTableEntry, InodeAssignment, PeerTableEntry, ReadDirEntry,
 };
 use crate::real::notifier::{Notification, Progress};
@@ -9,7 +10,6 @@ use crate::{Inode, StorageError};
 use realize_types::{Arena, ByteRanges, Hash, Path, Peer, UnixTime};
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -81,13 +81,6 @@ const NOTIFICATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("aca
 pub(crate) const CURRENT_INODE_RANGE_TABLE: TableDefinition<(), (Inode, Inode)> =
     TableDefinition::new("acache.current_inode_range");
 
-/// Track blobs.
-///
-/// Key: inode
-/// Value: BlobTableEntry
-const BLOB_TABLE: TableDefinition<BlobId, Holder<BlobTableEntry>> =
-    TableDefinition::new("acache.blob");
-
 /// A per-arena cache of remote files.
 ///
 /// This struct handles all cache operations for a specific arena.
@@ -96,7 +89,7 @@ pub(crate) struct ArenaCache {
     arena: Arena,
     arena_root: Inode,
     db: Arc<Database>,
-    blob_dir: PathBuf,
+    blobstore: Blobstore,
 }
 
 impl ArenaCache {
@@ -116,21 +109,18 @@ impl ArenaCache {
             txn.open_table(PEER_TABLE)?;
             txn.open_table(NOTIFICATION_TABLE)?;
             txn.open_table(CURRENT_INODE_RANGE_TABLE)?;
-            txn.open_table(BLOB_TABLE)?;
 
             // ARENA_TABLE and INODE_RANGE_ALLOCATION_TABLE are only used in UnrealCacheBlocking
             txn.commit()?;
         }
 
-        if !blob_dir.exists() {
-            std::fs::create_dir_all(&blob_dir)?;
-        }
+        let blobstore = Blobstore::new(Arc::clone(&db), blob_dir)?;
 
         Ok(Self {
             arena,
             arena_root,
             db,
-            blob_dir,
+            blobstore,
         })
     }
 
@@ -143,7 +133,7 @@ impl ArenaCache {
         parent_inode: Inode,
         name: &str,
     ) -> Result<ReadDirEntry, StorageError> {
-        let txn = (&*self.db).begin_read()?;
+        let txn = self.db.begin_read()?;
         do_lookup(txn, parent_inode, name)
     }
 
@@ -151,25 +141,25 @@ impl ArenaCache {
         &self,
         path: &Path,
     ) -> Result<(Inode, InodeAssignment), StorageError> {
-        let txn = (&*self.db).begin_read()?;
+        let txn = self.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
 
         do_lookup_path(&dir_table, self.arena_root, &Some(path.clone()))
     }
 
     pub(crate) fn file_metadata(&self, inode: Inode) -> Result<FileMetadata, StorageError> {
-        let txn = (&*self.db).begin_read()?;
+        let txn = self.db.begin_read()?;
         do_file_metadata(&txn, inode)
     }
 
     pub(crate) fn dir_mtime(&self, inode: Inode) -> Result<UnixTime, StorageError> {
-        let txn = (&*self.db).begin_read()?;
+        let txn = self.db.begin_read()?;
 
         do_dir_mtime(&txn, inode, self.arena_root)
     }
 
     pub(crate) fn file_availability(&self, inode: Inode) -> Result<FileAvailability, StorageError> {
-        let txn = (&*self.db).begin_read()?;
+        let txn = self.db.begin_read()?;
 
         do_file_availability(&txn, inode, self.arena)
     }
@@ -178,13 +168,13 @@ impl ArenaCache {
         &self,
         inode: Inode,
     ) -> Result<Vec<(String, ReadDirEntry)>, StorageError> {
-        let txn = (&*self.db).begin_read()?;
+        let txn = self.db.begin_read()?;
 
         do_readdir(&txn, inode)
     }
 
     pub(crate) fn peer_progress(&self, peer: Peer) -> Result<Option<Progress>, StorageError> {
-        let txn = (&*self.db).begin_read()?;
+        let txn = self.db.begin_read()?;
 
         do_peer_progress(&txn, peer)
     }
@@ -199,7 +189,7 @@ impl ArenaCache {
         // UnrealCacheBlocking::update, is responsible for dispatching properly
         assert_eq!(self.arena, notification.arena());
 
-        let txn = (&*self.db).begin_write()?;
+        let txn = self.db.begin_write()?;
         match notification {
             Notification::Add {
                 index,
@@ -216,7 +206,6 @@ impl ArenaCache {
                     do_create_file(&txn, self.arena_root, &path, &alloc_inode_range)?;
                 if !get_file_entry(&file_table, file_inode, Some(peer))?.is_some() {
                     let entry = FileTableEntry::new(path, size, mtime, hash, parent_inode);
-                    let mut blob_table = txn.open_table(BLOB_TABLE)?;
 
                     if !get_file_entry(&file_table, file_inode, None)?.is_some() {
                         self.do_write_file_entry(
@@ -224,7 +213,6 @@ impl ArenaCache {
                             file_inode,
                             None,
                             &entry,
-                            Some(&mut blob_table),
                         )?;
                     }
                     self.do_write_file_entry(
@@ -232,7 +220,6 @@ impl ArenaCache {
                         file_inode,
                         Some(peer),
                         &entry,
-                        None,
                     )?;
                 }
             }
@@ -252,7 +239,6 @@ impl ArenaCache {
 
                 let mut file_table = txn.open_table(FILE_TABLE)?;
                 let entry = FileTableEntry::new(path, size, mtime, hash, parent_inode);
-                let mut blob_table = txn.open_table(BLOB_TABLE)?;
                 if let Some(e) = get_file_entry(&file_table, file_inode, None)?
                     && e.content.hash == old_hash
                 {
@@ -263,14 +249,12 @@ impl ArenaCache {
                         file_inode,
                         None,
                         &entry,
-                        Some(&mut blob_table),
                     )?;
                     self.do_write_file_entry(
                         &mut file_table,
                         file_inode,
                         Some(peer),
                         &entry,
-                        None,
                     )?;
                 } else if let Some(e) = get_file_entry(&file_table, file_inode, Some(peer))?
                     && e.content.hash == old_hash
@@ -282,7 +266,6 @@ impl ArenaCache {
                         file_inode,
                         Some(peer),
                         &entry,
-                        None,
                     )?;
                 }
             }
@@ -295,8 +278,7 @@ impl ArenaCache {
                 do_update_last_seen_notification(&txn, peer, index)?;
 
                 let root = self.arena_root;
-                let mut blob_table = txn.open_table(BLOB_TABLE)?;
-                self.do_unlink(&txn, peer, root, &path, old_hash, Some(&mut blob_table))?;
+                self.do_unlink(&txn, peer, root, &path, old_hash)?;
             }
             Notification::CatchupStart(_) => {
                 do_mark_peer_files(&txn, peer)?;
@@ -315,17 +297,15 @@ impl ArenaCache {
 
                 let mut file_table = txn.open_table(FILE_TABLE)?;
                 let entry = FileTableEntry::new(path, size, mtime, hash, parent_inode);
-                let mut blob_table = txn.open_table(BLOB_TABLE)?;
                 if !get_file_entry(&file_table, file_inode, None)?.is_some() {
                     self.do_write_file_entry(
                         &mut file_table,
                         file_inode,
                         None,
                         &entry,
-                        Some(&mut blob_table),
                     )?;
                 }
-                self.do_write_file_entry(&mut file_table, file_inode, Some(peer), &entry, None)?;
+                self.do_write_file_entry(&mut file_table, file_inode, Some(peer), &entry)?;
             }
             Notification::CatchupComplete { index, .. } => {
                 self.do_delete_marked_files(&txn, peer)?;
@@ -354,23 +334,21 @@ impl ArenaCache {
         // Optimistically, try a read transaction to check whether the
         // blob is there.
         {
-            let txn = (&*self.db).begin_read()?;
+            let txn = self.db.begin_read()?;
             let file_entry = get_default_entry(&txn.open_table(FILE_TABLE)?, inode)?;
             if let Some(blob_id) = file_entry.content.blob {
-                return self.open_blob(&txn.open_table(BLOB_TABLE)?, file_entry, blob_id);
+                // Delegate to Blobstore
+                return self.blobstore.open_blob(&txn, file_entry, blob_id);
             }
         }
 
         // Switch to a write transaction to create the blob. We need to read
         // the file entry again because it might have changed.
-        let txn = (&*self.db).begin_write()?;
+        let txn = self.db.begin_write()?;
         let ret = {
             let mut file_table = txn.open_table(FILE_TABLE)?;
             let file_entry = get_default_entry(&file_table, inode)?;
-            if let Some(blob_id) = file_entry.content.blob {
-                return self.open_blob(&txn.open_table(BLOB_TABLE)?, file_entry, blob_id);
-            }
-            let mut openblob = self.create_blob(inode, &txn, file_entry)?;
+            let mut openblob = self.blobstore.create_blob(inode, &txn, file_entry)?;
 
             openblob.file_entry.content.blob = Some(openblob.blob_id);
             file_table.insert((inode, ""), Holder::new(&openblob.file_entry)?)?;
@@ -382,91 +360,6 @@ impl ArenaCache {
         Ok(ret)
     }
 
-    /// Return an [OpenBlob] entry given a blob id.
-    fn open_blob(
-        &self,
-        blob_table: &impl redb::ReadableTable<BlobId, Holder<'static, BlobTableEntry>>,
-        file_entry: FileTableEntry,
-        blob_id: BlobId,
-    ) -> Result<OpenBlob, StorageError> {
-        let blob_entry = get_blob_entry(blob_table, blob_id)?;
-        let file = self.open_blob_file(blob_id, file_entry.metadata.size, false)?;
-
-        return Ok(OpenBlob {
-            blob_id,
-            file_entry,
-            blob_entry,
-            file,
-        });
-    }
-
-    /// Create a new blob and returns its [OpenBlob]
-    fn create_blob(
-        &self,
-        inode: Inode,
-        txn: &WriteTransaction,
-        file_entry: FileTableEntry,
-    ) -> Result<OpenBlob, StorageError> {
-        let mut blob_table = txn.open_table(BLOB_TABLE)?;
-        let blob_id = blob_table
-            .last()?
-            .map(|(k, _)| k.value())
-            .unwrap_or(BlobId(1));
-        log::debug!(
-            "assigned blob {blob_id} to file {inode} {}",
-            file_entry.content.hash
-        );
-        let file = self.open_blob_file(blob_id, file_entry.metadata.size, true)?;
-        let blob_entry = BlobTableEntry {
-            written_areas: ByteRanges::new(),
-        };
-        blob_table.insert(blob_id, Holder::new(&blob_entry)?)?;
-        Ok(OpenBlob {
-            blob_id,
-            file_entry,
-            blob_entry,
-            file,
-        })
-    }
-
-    /// Open or create a file for the blob and make sure it has the
-    /// right size.
-    fn open_blob_file(
-        &self,
-        blob_id: BlobId,
-        file_size: u64,
-        new_file: bool,
-    ) -> Result<std::fs::File, StorageError> {
-        let path = self.blob_path(blob_id);
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .truncate(new_file)
-            .create(true)
-            .open(path)?;
-        let file_meta = file.metadata()?;
-        if file_size != file_meta.len() {
-            file.set_len(file_size)?;
-            file.flush()?;
-        }
-
-        Ok(file)
-    }
-
-    /// Return the path of the file for the given blob.
-    fn blob_path(&self, blob_id: BlobId) -> PathBuf {
-        self.blob_dir.join(blob_id.to_string())
-    }
-
-    /// Delete a blob and its associated file.
-    fn delete_blob(&self, blob_id: BlobId) -> Result<(), StorageError> {
-        let blob_path = self.blob_path(blob_id);
-        if blob_path.exists() {
-            std::fs::remove_file(&blob_path)?;
-        }
-        Ok(())
-    }
-
     /// Write an entry in the file table, overwriting any existing one.
     fn do_write_file_entry(
         &self,
@@ -474,7 +367,6 @@ impl ArenaCache {
         file_inode: Inode,
         peer: Option<Peer>,
         entry: &FileTableEntry,
-        blob_table: Option<&mut redb::Table<'_, BlobId, Holder<BlobTableEntry>>>,
     ) -> Result<(), StorageError> {
         let key = match peer {
             None => "",
@@ -492,10 +384,7 @@ impl ArenaCache {
             if let Some(old_entry) = file_table.get((file_inode, ""))? {
                 let old_entry = old_entry.value().parse()?;
                 if let Some(blob_id) = old_entry.content.blob {
-                    self.delete_blob(blob_id)?;
-                    if let Some(blob_table) = blob_table {
-                        blob_table.remove(blob_id)?;
-                    }
+                    self.blobstore.delete_blob(blob_id)?;
                 }
             }
         }
@@ -514,7 +403,6 @@ impl ArenaCache {
         inode: Inode,
         peer: Peer,
         old_hash: Option<Hash>,
-        blob_table: Option<&mut redb::Table<'_, BlobId, Holder<BlobTableEntry>>>,
     ) -> Result<(), StorageError> {
         let peer_str = peer.as_str();
 
@@ -559,10 +447,7 @@ impl ArenaCache {
             if let Some(default_entry) = file_table.get((inode, ""))? {
                 let default_entry = default_entry.value().parse()?;
                 if let Some(blob_id) = default_entry.content.blob {
-                    self.delete_blob(blob_id)?;
-                    if let Some(blob_table) = blob_table {
-                        blob_table.remove(blob_id)?;
-                    }
+                    self.blobstore.delete_blob(blob_id)?;
                 }
             }
 
@@ -599,7 +484,7 @@ impl ArenaCache {
             }
         });
         if let Some((_, entry)) = most_recent {
-            self.do_write_file_entry(file_table, inode, None, &entry, blob_table)?;
+            self.do_write_file_entry(file_table, inode, None, &entry)?;
         }
 
         Ok(())
@@ -612,7 +497,6 @@ impl ArenaCache {
         arena_root: Inode,
         path: &Path,
         old_hash: Hash,
-        blob_table: Option<&mut redb::Table<'_, BlobId, Holder<BlobTableEntry>>>,
     ) -> Result<(), StorageError> {
         let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
         let (parent_inode, parent_assignment) =
@@ -636,7 +520,6 @@ impl ArenaCache {
             inode,
             peer,
             Some(old_hash),
-            blob_table,
         )?;
 
         Ok(())
@@ -651,7 +534,6 @@ impl ArenaCache {
         let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
         let mut file_table = txn.open_table(FILE_TABLE)?;
         let mut directory_table = txn.open_table(DIRECTORY_TABLE)?;
-        let mut blob_table = txn.open_table(BLOB_TABLE)?;
         let peer_str = peer.as_str();
         for elt in pending_catchup_table
             .extract_from_if((peer_str, Inode::ZERO)..=(peer_str, Inode::MAX), |_, _| {
@@ -668,7 +550,6 @@ impl ArenaCache {
                 inode,
                 peer,
                 None,
-                Some(&mut blob_table),
             )?;
         }
         Ok(())
@@ -676,10 +557,7 @@ impl ArenaCache {
 
     #[allow(dead_code)]
     pub(crate) fn local_availability(&self, blob_id: BlobId) -> Result<ByteRanges, StorageError> {
-        let txn = (&*self.db).begin_read()?;
-        let blob_table = txn.open_table(BLOB_TABLE)?;
-
-        Ok(get_blob_entry(&blob_table, blob_id)?.written_areas)
+        self.blobstore.local_availability(blob_id)
     }
 
     pub(crate) fn extend_local_availability(
@@ -687,21 +565,7 @@ impl ArenaCache {
         blob_id: BlobId,
         new_range: &ByteRanges,
     ) -> Result<(), StorageError> {
-        let txn = (&*self.db).begin_write()?;
-        {
-            let mut blob_table = txn.open_table(BLOB_TABLE)?;
-            let mut blob_entry = get_blob_entry(&blob_table, blob_id)?;
-            blob_entry.written_areas = blob_entry.written_areas.union(&new_range);
-            log::debug!(
-                "{blob_id} extended by {new_range}; available: {}",
-                blob_entry.written_areas
-            );
-
-            blob_table.insert(blob_id, Holder::with_content(blob_entry)?)?;
-        }
-        txn.commit()?;
-
-        Ok(())
+        self.blobstore.extend_local_availability(blob_id, new_range)
     }
 }
 
@@ -806,19 +670,6 @@ fn get_file_entry(
         None => Ok(None),
         Some(e) => Ok(Some(e.value().parse()?)),
     }
-}
-
-fn get_blob_entry(
-    blob_table: &impl redb::ReadableTable<BlobId, Holder<'static, BlobTableEntry>>,
-    blob_id: BlobId,
-) -> Result<BlobTableEntry, StorageError> {
-    let entry = blob_table
-        .get(blob_id)?
-        .ok_or(StorageError::NotFound)?
-        .value()
-        .parse()?;
-
-    Ok(entry)
 }
 
 fn get_default_entry(
