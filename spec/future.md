@@ -3,6 +3,61 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
+## Update cache/indexer/arena cache requirements in config  {#required}
+
+Currently the cache and indexers are optional in
+[config.rs](../crate/realize-storage/src/config.rs). Yet, both an
+index and an arena cache is required for the consensus algorithms
+described in [unreal.md](unreal.md) and [real.md](real.md).
+
+Let's change the rules to:
+
+- a global cache is required (so a cache must be specified in
+  StorageConfig)
+
+- each arena must have an arena cache with a blob_dir (so a db path
+  and blob_dir path must be specified in ArenaConfig)
+
+- arenas *may* have a local path assigned to it and if a local path is
+  assigned, an indexer will necessarily be created as well
+
+With these new rules we have a set of cached arenas (all arenas) and a
+set of stored arenas (a subset of all arenas).
+
+The fields of Storage, defined in
+[lib.rs](../crate/realize-storage/src/lib.rs) change a bit:
+
+- the cache field is not optional anymore
+
+- the arenas field should be renamed indexed_arenas, as it only
+  contains arenas for which a local path (ArenaStorage.root) is known.
+
+The setup code in [setup.rs](../crate/realize-core/src/setup.rs) also
+changes, following the changes in Storage.
+
+Task list:
+
+1. Update the configuration in
+   [config.rs](../crate/realize-storage/src/config.rs) to reflect the
+   new rules.
+
+2. Update the fields in Storage, in
+   [lib.rs](../crate/realize-storage/src/lib.rs) as described above.
+
+3. Run `cargo check -p realize-storage --tests` and fix any issues.
+
+4. Run `cargo test -p realize-storage` to make sure everything still runs
+
+5. Update
+   [daemon_integration_test.rs](../crate/realize-daemon/tests/daemon_integration_test.rs)
+   to use the new configuration and always provide a path to a cache
+   database.
+
+   Run `cargo check -p realize-daemon --test daemon_integration_test`
+   then `cargo test -p realize-daemon --test daemon_integration_test`
+   to verify the changes are correct, fix any issues.
+
+
 ## Design and implement decision maker {#decisionmaker}
 
 Design a type that makes decisions and store them in Engine based on:
