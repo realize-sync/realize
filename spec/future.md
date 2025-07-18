@@ -3,126 +3,235 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
-## Blobstore {#blobstore}
+## Track path marks {#marks}
 
-Implement an Arena-specific blob store as described in the section
-Blobstore of [unreal.md](spec/unreal.md).
+Arenas, files and directories can be marked *own*, *watch* or *keep*
+as described in the section Consensus of [real.md](real.md) and the
+section Blobstore in [unreal.md](unreal.md)
+
+- Files marked *own* belong in the real. They should be moved into the
+  arena root as regular file.
+
+- Files marked *watch* or *keep* belong in the unreal. They should be
+  left in the cache. They might be moved to the cache if they're
+  stored as regular file, once another peer has taken ownership of
+  them.
+
+- Files marked *watch* are subject to the normal LRU rules in the
+  cache. They may be refreshed when they change.
+
+- Files marked *keep* are unconditionally kept in the cache and
+  refreshed when they change.
+
+- Unmarked files inherit their mark from the containing directory or Arena.
+
+1. Define an enum type `Mark` and an arena-specific type `PathMarks`
+   that tracks marks hierarchically by paths in the file
+   `../crate/realize-storage/src/mark.rs`. For now, `PathMarks` has
+   just a global (per-Arena mark) and returns that for every path it's
+   given to `PathMarks::for_path(&realize_types::Path) -> Mark`
+
+   Add the new types then run `cargo check -p realize-storage --lib`,
+   fix any issues.
+
+2. Add a `Mark` to `ArenaConfig` and add a function
+   `PathMarks::from_config(&ArenaConfig)->Self` to create a
+   `PathMarks` from config. The mark defaults to *watch* in
+   ArenaConfig.
+
+   Refactor, then run `cargo check -p realize-storage --lib` and
+   `cargo test -p realize-storage`, fix any issues.
+
+3. Extend `PathMarks` to keep paths, which can be file or directory,
+   and the corresponding mark. Extend `for_path` to take these paths
+   into account (return the file mark if it is set, return the
+   containing directory mark if it is set, return the default mark
+   otherwise).
+
+   Marks can be set and unset (for the next step)
+
+   Add unit tests for `for_path` that tests file, directory and arena
+   marks.
+
+   - Implement, then run `cargo check -p realize-storage --lib`, fix
+   any issues.
+   - Add unit tests, then run `cargo test -p realize-storage marks`,
+   fix any issues.
+   - Finally run `cargo test -p realize-storage`, fix any issues.
+
+4. Extend `Watcher`, defined in
+   [watcher.rs](../crate/realize-storage/src/real/watcher.rs) to track
+   xattr `user.realize.mark` on files and directories and update
+   `PathMarks` based on that.
+
+   The `Watcher` should be given a `PathMarks` type to modify.
+   Typically that type is empty with just the default (arena) mark
+   set. It returns a reference to that `PathMarks` instances from
+   `Watcher::path_marks() -> &PathMarks`
+
+   During catchup, the Watcher should just set marks as it finds them
+   in the `PathMarks` it's given without worrying about existing
+   marks.
+
+   When receiving a notification, the watcher should set, update and
+   unset marks as xattrs change.
+
+   - Implement, then run `cargo check -p realize-storage --lib`, fix
+   any issues.
+   - Add unit tests, then run `cargo test -p realize-storage marks`,
+   fix any issues.
+   - Finally run `cargo test -p realize-storage`, fix any issues.
+
+## Change Database ownership {#owndb}
+
+The goal of this change is to allow different classes to share the
+same database. This allows putting the arena cache and real index in
+the same database.
+
+Task list:
+
+1. Go through all redb table definition to add the current subsystem
+   to their name. Databases defined in
+   [index.rs](../crate/realize-storage/src/real/index.rs) should have
+   an "index." prefix added to their names. Databases defined in
+   [arena_cache.rs](../crate/realize-storage/src/unreal/arena_cache.rs)
+   should have a "acache." prefix. Databases defined in
+   [cache.rs](../crate/realize-storage/src/unreal/cache.rs) should
+   have a "cache." prefix.
+
+   Change the database names then run `cargo check -p realize-storage
+   --tests`, fix any issues.
+
+2. Make `redb::Database` an Arc<Database> everywhere and move database
+   creation out from `ArenaCache` defined in
+   [arena_cache.rs](../crate/realize-storage/src/unreal/arena_cache.rs)
+   or `RealIndexBlocking` defined in
+   [index.rs](../crate/realize-storage/src/real/index.rs). Their
+   primary constructor receive an Arc<Database> instead of a file. Let
+   their caller create a database from file or memory.
+
+   Keep the file/database relationship the same otherwise.
+
+   Refactor existing code then run `cargo check -p realize-storage
+   --lib`, then `cargo check -p realize-storage --tests` then `cargo
+   test -p realize-storage` to make sure everything still works. Fix
+   any issues.
+
+3. Update the storage
+   [config.rs](../crate/realize-storage/src/config.rs) to take only
+   one database per arena. Then, when building `Storage` from config,
+   in the [storage module](../crate/realize-storage/src/lib.rs), put
+   both the index and the area cache into that database.
+
+   Do the same when creating a `Storage` for testing in
+   [testing.rs](../crate/realize-storage/src/testing.rs)
+
+   Refactor existing code then run `cargo check -p realize-storage
+   --lib`, then `cargo check -p realize-storage --tests` then `cargo
+   test -p realize-storage` to make sure everything still works. Fix
+   any issues.
+
+3. Extract a `Blobstore` type from `ArenaCache` that share the same
+   DB and might also share the same transaction. Details TBD
+
+## Add an Engine {#engine}
+
+An engine is a new type, defined in
+`crate/realize-storage/src/engine.rs` that store `Decision`s in a
+redb::Database it's given.
+
+Implement `engine.rs` database-handling just the way it's defined in
+[index.rs](../crate/realize-storage/src/real/index.rs), that is:
+
+- Define two types, `EngineAsync` and `EngineBlocking`.
+
+    `EngineAsync` just keeps an `EngineBlocking` that it calls using spawn_blocking.
+    `EngineBlocking` does the real work. It is given an `Arc<Database>` and stores its data here.
+
+- Define a redb::Table with a path as key (stored as a &str) and a
+  `Holder<DecisionTableEntry>` as value. `DecisionTableEntry` is a
+  rust type defined in `engine.rs` that can be serialized to and
+  deserialized from a capnp message, defined in
+  `crate/realize-storage/capnp/engine.capnp`
+
+  `DecisionTableEntry` just contains a single enum for now, a
+  `Decision` which has the values:
+     - `Realize` -- move from cache to arena root (as a regular file)
+     - `Unrealize` -- move from arena root to cache
+     - `UpdateCache` -- update the file from another peer and store it in the cache
+
+- Define the following methods on `EngineBlocking` and `EngineAsync`:
+  `set(path, decision)`, `clear(path)`, `get(path)`. Adds adds or
+  updates an entry in the database. Clear removes any entry for the
+  path from the database (if one existed), get returns the `Decision`
+  for the path, if any exist.
 
 Task List:
- 1. Start with a blobstore with no expiration #blobstore1. Blobs are
-    only ever deleted if it becomes outdated (the file is deleted or
-    updated remotely.)
-    See the section #blobstore1
 
- 2. Hook it up with Downloader so it can serve locally available data
-    and keeps any data that is downloaded for later.
-    Details TBD
+1. Create the file `engine.rs`, with skeletons for the two types
+   `EngineAsync` and `EngineBlocking` and the methods that link them
+   together (`EngineBlocking::into_async()`
+   `EngineAsync::new(EngineBlocking)` `EngineAsync::blocking()` like
+   in `index.rs`)
 
- 3. Implement the Working Area as a LRU cache.
+   Write the code, then run `cargo check -p realize-storage --lib` to
+   make sure it compiles.
 
- 4. Add a consistency/cleanup job that runs from time to time to
-    compare file data with metadata in the database.
+2. Define the types `Decision` and `DecisionTableEntry` and have it
+   implement `ByteConvertible` so it can be put into a `Holder`
 
- 5. Add TinyLFU accounting that gates the entry to a secondary LRU
-    cache.
+   This requires defining the corresponding capnp enum and type in
+   `crate/realize-storage/capnp/engine.capnp`. Set the parent module
+   to "engine". Make sure to update
+   [build.rs](../crate/realize-storage/build.rs) and define the module
+   engine_capnp in `engine.rs` just like it's done in
+   [real.rs](../crate/realize-storage/src/real.rs) for `real_capnp`.
 
- 6. Add a LRU cache for "to be deleted" data and batch job for
-    deleting it.
+   Write the code, add unit tests for serialization/deserialization,
+   then run `cargo test -p realize-storage engine`
 
-## Blobstore 1st step: store files with no expiration {#blobstore}
+3. Define the new DECISION_TABLE (name: "engine.decision", key: &str,
+   value: Holder<DecisionTableEntry>) and implement the methods `set`,
+   `clear` and `get` in `EngineBlocking` as well as the corresponding
+   methods in `EngineAsync` that delegate to them.
 
-Implement a first version of `open(inode, mode)` of [unreal.md](unreal.md).
+   Write the code, add unit tests then run `cargo test -p
+   realize-storage engine`. You can create an in-memory database for
+   the tests using
+   `redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?`
 
-Read the corresponding section of `unreal.md` as well as the
-`Blobstore` section in the same file.
+   When writing the tests, make sure to add a fixture and use it
+   throughout to avoid duplicating work in all test:
 
-The relevant code and the file to modify is
-[cache.rs](../crate/realize-storage/src/unreal/cache.rs)
+```
+   struct Fixture { engine: EngineBlocking }
+   impl Fixture {
+     fn setup() -> Self {
+        let engine = ... // create db and type
 
+        Fixture { engine }
+     }
+   }
 
-Task list
+   #[test]
+   fn engine_does_something() -> anyhow::Result<()> {
+      let fixture = Fixture::setup()?;
 
- 1. Have ArenaUnrealCacheBlocking take a directory in addition to a
-    database. This is the directory where files will be stored. Update
-    ArenaUnrealCacheBlocking::open, UnrealCacheAsync::open,
-    UnrealCacheAsync::from_config and the configuration to pass these
-    directories. In-memory caches used for testing, get /dev/null as
-    directory, so any attempt to use them will fail.
+      fixture.engine.do_something()?;
 
-    This is all in [cache.rs](../crate/realize-storage/src/unreal/cache.rs)
+      Ok(())
+   }
+```
 
-    Update all tests, including integration tests, run them with
-    "cargo test"" and make sure they all pass.
+(Next steps: Design and implement the code that creates and updates
+the decisions. That's outside the scope of this section.)
 
- 2. Add a `blobs` table (skip any fields that's for LRU accounting) and an
-    entry `blob: Option<u64>` to FileContent. This table is described in
-    the section Blobstore of [unreal.md](unreal.md)
+## Turn Blobstore into a LRU cache {#bloblru}
 
-    Run "cargo check -p realize-storage", then "cargo test -p
-    realize-storage" and fix any issues.
+Add a single-level LRU cache for the Working cache of the blobstore,
+described in the section BlobStore of [unreal.md](unreal.md)
 
- 3. Add an `open` function to ArenaUnrealCacheConfig that just returns
-    a `std::fs::File`. This requires creating a new entry in the `blobs` table,
-    creating a file corresponding to that blob id and opening it.
-    Expose the same function in UnrealCacheConfig that just delegates
-    to it. UnrealCacheAsync gets a slightly different function that
-    returns a `tokio::fs::File` created from the std file.
-
-    Add unit tests for that function and the type it returns.
-
-    Run "cargo check -p realize-storage", then "cargo test -p
-    realize-storage" and fix any issues.
-
- 4. Add code for deleting the blob whose id is stored in the
-    FileTableEntry and delete its file when the default version (the
-    entry without peer) changes or is removed (see calls to
-    do_write_file_entry and do_rm_file_entry with Option<Peer> set to
-    None or the key set to (inode, "")).
-
-    Add a test to check that creates a new file with Fixture::add_file
-    call file_open, close the returned file and then:
-    - overwrite the file with a new version, like in
-      replace_existing_file. Make sure the blob and file created by
-      open_file() have been deleted
-    - delete the file, like in unlink_removes_file. Make sure the
-      blob and file created by open_file() have been deleted.
-
-    Run "cargo check -p realize-storage", then "cargo test -p
-    realize-storage" and fix any issues.
-
- 5. Add function to ArneaUnrealCacheConfig for getting and updating
-    the ByteRange of a blob given the blob_id returned by file_open.
-    The function for updating the ByteRange is meant to only be called
-    after updating the file content flushing and syncing. Add the same
-    functions to UnrealCacheConfig that just delegate to
-    ArenaUnrealCacheConfig.
-
-    Do not add these functions to UnrealCacheAsync, as the type
-    returned by UnrealCacheAsync is supposed to be what is going to
-    update the ByteRange in the next step.
-
-    Add a unit test that call the functions in UnrealCacheConfig and
-    verify the ByteRange. Run the test and make sure it passes.
-
- 6. Change the type returned by UnrealCacheAsync::file_open to Blob,
-    which implements tokio::io::AsyncRead and tokio::io::AsyncSeek
-    (look for "impl AsyncRead" in the codebase for examples of such
-    implementation) by delegating to the equivalent function on the
-    tokio::std::File, except in the case where a read starts outside
-    the bounds of the blob's available ByteRanges (returned by
-    open_file, kept as a field in the Blob). In such case, return a
-    new error type BlobIncomplete wrapped in std::io::Error::other().
-
-    Write tests for reading
-    - within the ByteRanges:
-    - starting just before the end of the ByteRanges (the beginning of
-    the data to be read is in range, but the end isn't, so just
-    the beginning is returned (short read))
-    - starting after the end of the ByteRange (which throws BlobIncomplete)
-
-    Run the tests and make sure they pass.
-
- 7. TBD Add AsyncWrite to Blob.
+Task list: TBD
 
 ## Recover inode range in Arena cache {#inoderange}
 
