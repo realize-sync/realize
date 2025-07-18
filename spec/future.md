@@ -82,57 +82,37 @@ section Blobstore in [unreal.md](unreal.md)
    fix any issues.
    - Finally run `cargo test -p realize-storage`, fix any issues.
 
-## Change Database ownership {#owndb}
 
-The goal of this change is to allow different classes to share the
-same database. This allows putting the arena cache and real index in
-the same database.
+## Extract a Blobstore type {#blobstoretype}
 
-Task list:
+Extract the blob-specific code, types and database (BlobTableEntry)
+definition from
+[arena_cache.rs](../crate/realize-storage/src/unreal/arena_cache.rs)
+into a Blobstore type and put it all into
+[blob.rs](../crate/realize-storage/src/unreal/blob.rs)
 
-1. Go through all redb table definition to add the current subsystem
-   to their name. Databases defined in
-   [index.rs](../crate/realize-storage/src/real/index.rs) should have
-   an "index." prefix added to their names. Databases defined in
-   [arena_cache.rs](../crate/realize-storage/src/unreal/arena_cache.rs)
-   should have a "acache." prefix. Databases defined in
-   [cache.rs](../crate/realize-storage/src/unreal/cache.rs) should
-   have a "cache." prefix.
+The goal of this change is to consolidate blob-specific logic used in
+different places (`cache.rs`, `arena_cache.rs`, `blob.rs`) in one
+place, `blob.rs`
 
-   Change the database names then run `cargo check -p realize-storage
-   --tests`, fix any issues.
+1. Split a `Blobstore` type from `ArenaCache`, leaving it all in
+   `arena_cache.rs`.
 
-2. Make `redb::Database` an Arc<Database> everywhere and move database
-   creation out from `ArenaCache` defined in
-   [arena_cache.rs](../crate/realize-storage/src/unreal/arena_cache.rs)
-   or `RealIndexBlocking` defined in
-   [index.rs](../crate/realize-storage/src/real/index.rs). Their
-   primary constructor receive an Arc<Database> instead of a file. Let
-   their caller create a database from file or memory.
+   Refactor, then run `cargo check -p realize-storage --tests` to make
+   sure everything still builds.
 
-   Keep the file/database relationship the same otherwise.
+2. Move `Blobstore` `BlobstoreTableEntry` and the blob table
+   definition to `blob.rs`.
 
-   Refactor existing code then run `cargo check -p realize-storage
-   --lib`, then `cargo check -p realize-storage --tests` then `cargo
-   test -p realize-storage` to make sure everything still works. Fix
-   any issues.
+   Refactor, then run `cargo check -p realize-storage --tests` to make
+   sure everything still builds.
 
-3. Update the storage
-   [config.rs](../crate/realize-storage/src/config.rs) to take only
-   one database per arena. Then, when building `Storage` from config,
-   in the [storage module](../crate/realize-storage/src/lib.rs), put
-   both the index and the area cache into that database.
+3. Move the blob-related tests in `arena.rs` into `blob.rs`. Reuse
+   and, if necessary, extend the Fixture defined in `blob.rs` for the
+   blob-related tests that are moved.
 
-   Do the same when creating a `Storage` for testing in
-   [testing.rs](../crate/realize-storage/src/testing.rs)
-
-   Refactor existing code then run `cargo check -p realize-storage
-   --lib`, then `cargo check -p realize-storage --tests` then `cargo
-   test -p realize-storage` to make sure everything still works. Fix
-   any issues.
-
-3. Extract a `Blobstore` type from `ArenaCache` that share the same
-   DB and might also share the same transaction. Details TBD
+   Move the tests, run `cargo test -p realize-storage blob`, fix any
+   issues.
 
 ## Add an Engine {#engine}
 
