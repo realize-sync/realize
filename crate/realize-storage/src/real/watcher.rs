@@ -553,7 +553,7 @@ mod tests {
 
     use crate::real::index::{FileTableEntry, RealIndexBlocking};
     use crate::realize_types::Arena;
-    use crate::utils::hash;
+    use crate::utils::{hash, redb_utils};
     use realize_types::Hash;
 
     use super::*;
@@ -573,13 +573,11 @@ mod tests {
         async fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
-            let path = tempdir.path().join("index.db");
             let root = tempdir.child("root");
             root.create_dir_all()?;
 
             let arena = Arena::from("test");
-            let index = RealIndexBlocking::new(arena, Arc::new(redb::Database::create(&path)?))?
-                .into_async();
+            let index = RealIndexBlocking::new(arena, redb_utils::in_memory()?)?.into_async();
 
             Ok(Self {
                 root,

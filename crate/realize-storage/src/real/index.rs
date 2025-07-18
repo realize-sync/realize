@@ -602,6 +602,8 @@ fn parse_path(path: capnp::text::Reader<'_>) -> Result<realize_types::Path, Byte
 
 #[cfg(test)]
 mod tests {
+    use crate::utils::redb_utils;
+
     use super::*;
     use assert_fs::TempDir;
     use futures::{StreamExt as _, TryStreamExt as _};
@@ -613,20 +615,15 @@ mod tests {
     struct Fixture {
         aindex: RealIndexAsync,
         index: Arc<RealIndexBlocking>,
-        _tempdir: TempDir,
     }
     impl Fixture {
         fn setup() -> anyhow::Result<Fixture> {
             let _ = env_logger::try_init();
-            let tempdir = TempDir::new()?;
-            let path = tempdir.path().join("index.db");
             let arena = test_arena();
-            let aindex =
-                RealIndexBlocking::new(arena, Arc::new(Database::create(&path)?))?.into_async();
+            let aindex = RealIndexBlocking::new(arena, redb_utils::in_memory()?)?.into_async();
             Ok(Self {
                 index: aindex.blocking(),
                 aindex,
-                _tempdir: tempdir,
             })
         }
     }

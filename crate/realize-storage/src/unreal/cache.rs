@@ -249,21 +249,28 @@ impl UnrealCacheAsync {
     pub const ROOT_DIR: Inode = UnrealCacheBlocking::ROOT_DIR;
 
     /// Create and configure a cache from configuration.
-    pub fn from_config(config: &StorageConfig) -> anyhow::Result<Option<Self>> {
+    pub async fn from_config(config: &StorageConfig) -> anyhow::Result<Option<Self>> {
         let global_db_path = match &config.cache {
             Some(cache_config) => &cache_config.db,
             None => return Ok(None),
-        };
-        let mut cache = UnrealCacheBlocking::new(Arc::new(Database::create(global_db_path)?))?;
-        for (arena, arena_cfg) in &config.arenas {
-            if let Some(arena_cache_config) = &arena_cfg.cache {
-                cache.add_arena(
-                    *arena,
-                    Arc::new(Database::create(&arena_cache_config.db)?),
-                    arena_cache_config.blob_dir.clone(),
-                )?;
-            }
         }
+        .to_path_buf();
+        let arenas = config.arenas.clone();
+        let cache = task::spawn_blocking(move || {
+            let mut cache = UnrealCacheBlocking::new(Arc::new(Database::create(global_db_path)?))?;
+            for (arena, arena_cfg) in arenas {
+                if let Some(arena_cache_config) = &arena_cfg.cache {
+                    cache.add_arena(
+                        arena,
+                        Arc::new(Database::create(&arena_cache_config.db)?),
+                        arena_cache_config.blob_dir.clone(),
+                    )?;
+                }
+            }
+
+            Ok::<_, anyhow::Error>(cache)
+        })
+        .await??;
 
         Ok(Some(cache.into_async()))
     }
@@ -489,6 +496,8 @@ fn do_alloc_inode_range(
 
 #[cfg(test)]
 mod tests {
+    use crate::utils::redb_utils;
+
     use super::*;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
@@ -506,8 +515,7 @@ mod tests {
         fn setup() -> anyhow::Result<Fixture> {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
-            let path = tempdir.path().join("unreal.db");
-            let cache = UnrealCacheBlocking::new(Arc::new(redb::Database::create(&path)?))?;
+            let cache = UnrealCacheBlocking::new(redb_utils::in_memory()?)?;
             Ok(Self { cache, tempdir })
         }
 
@@ -519,16 +527,10 @@ mod tests {
         }
 
         fn add_arena(&mut self, arena: Arena) -> anyhow::Result<()> {
-            let child = self.tempdir.child(format!("{arena}-cache.db"));
             let blob_dir = self.tempdir.child(format!("{arena}/blobs"));
-            if let Some(p) = child.parent() {
-                std::fs::create_dir_all(p)?;
-            }
-            self.cache.add_arena(
-                arena,
-                Arc::new(Database::create(child.path())?),
-                blob_dir.to_path_buf(),
-            )?;
+            blob_dir.create_dir_all()?;
+            self.cache
+                .add_arena(arena, redb_utils::in_memory()?, blob_dir.to_path_buf())?;
             Ok(())
         }
 

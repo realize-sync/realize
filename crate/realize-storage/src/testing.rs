@@ -1,3 +1,5 @@
+use crate::utils::redb_utils;
+
 use super::config::{ArenaCacheConfig, ArenaConfig, CacheConfig, IndexConfig, StorageConfig};
 use super::{Storage, UnrealCacheAsync};
 use realize_types::Arena;
@@ -12,17 +14,11 @@ where
     for arena in arenas.into_iter() {
         arena_dbs.push((
             arena,
-            Arc::new(
-                redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?,
-            ),
+            redb_utils::in_memory()?,
             std::path::PathBuf::from("/dev/null"),
         ));
     }
-    let cache = UnrealCacheAsync::with_db(
-        Arc::new(redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?),
-        arena_dbs,
-    )
-    .await?;
+    let cache = UnrealCacheAsync::with_db(redb_utils::in_memory()?, arena_dbs).await?;
 
     Ok(cache)
 }

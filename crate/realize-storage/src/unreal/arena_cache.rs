@@ -1075,6 +1075,8 @@ fn do_unmark_peer_file(
 mod tests {
     use std::os::unix::fs::MetadataExt as _;
 
+    use crate::utils::redb_utils;
+
     use super::super::cache::UnrealCacheBlocking;
     use super::*;
     use assert_fs::TempDir;
@@ -1113,19 +1115,14 @@ mod tests {
         fn setup_with_arena(arena: Arena) -> anyhow::Result<Fixture> {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
-            let path = tempdir.path().join("unreal.db");
-            let mut cache = UnrealCacheBlocking::new(Arc::new(redb::Database::create(&path)?))?;
+            let mut cache = UnrealCacheBlocking::new(redb_utils::in_memory()?)?;
 
             let child = tempdir.child(format!("{arena}-cache.db"));
             let blob_dir = tempdir.child(format!("{arena}/blobs"));
             if let Some(p) = child.parent() {
                 std::fs::create_dir_all(p)?;
             }
-            cache.add_arena(
-                arena,
-                Arc::new(Database::create(child.path())?),
-                blob_dir.to_path_buf(),
-            )?;
+            cache.add_arena(arena, redb_utils::in_memory()?, blob_dir.to_path_buf())?;
 
             Ok(Self {
                 arena: arena,

@@ -5,7 +5,7 @@ use config::StorageConfig;
 use real::index::RealIndexAsync;
 use real::watcher::RealWatcher;
 use tokio::sync::mpsc;
-use tokio::task::{self, JoinHandle};
+use tokio::task::JoinHandle;
 
 use realize_types;
 use realize_types::Arena;
@@ -28,6 +28,7 @@ pub use types::Inode;
 pub use unreal::blob::{Blob, BlobIncomplete};
 pub use unreal::cache::UnrealCacheAsync;
 pub use unreal::types::{FileAvailability, FileMetadata, InodeAssignment};
+use utils::redb_utils;
 
 /// Local storage, including the real store and an unreal cache.
 pub struct Storage {
@@ -52,14 +53,15 @@ impl Storage {
     /// Create and initialize storage from its configuration.
     pub async fn from_config(config: &StorageConfig) -> anyhow::Result<Arc<Self>> {
         let store = RealStore::from_config(&config.arenas);
-        let cache = UnrealCacheAsync::from_config(&config)?;
+        let cache = UnrealCacheAsync::from_config(&config).await?;
         let mut arenas = HashMap::new();
         let exclude = build_exclude(&config);
         for (arena, arena_config) in &config.arenas {
             let root = arena_config.path.as_ref();
             if let Some(index_config) = &arena_config.index {
                 let index_path = &index_config.db;
-                let index = RealIndexAsync::with_db(*arena, open_db(index_path).await?).await?;
+                let index =
+                    RealIndexAsync::with_db(*arena, redb_utils::open(index_path).await?).await?;
                 let exclude = exclude
                     .iter()
                     .map(|p| realize_types::Path::from_real_path_in(p, root))
@@ -153,12 +155,4 @@ fn build_exclude(config: &StorageConfig) -> Vec<&std::path::Path> {
     }
 
     exclude
-}
-
-async fn open_db(path: &std::path::Path) -> anyhow::Result<Arc<redb::Database>> {
-    let path = path.to_path_buf();
-
-    Ok(Arc::new(
-        task::spawn_blocking(move || redb::Database::create(path)).await??,
-    ))
 }

@@ -249,11 +249,11 @@ mod tests {
     use super::super::cache::UnrealCacheBlocking;
     use super::*;
     use crate::unreal::arena_cache::ArenaCache;
+    use crate::utils::redb_utils;
     use crate::{Inode, Notification, UnrealCacheAsync};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Path, Peer, UnixTime};
-    use redb::Database;
     use std::io::SeekFrom;
     use std::sync::Arc;
     use tokio::fs;
@@ -281,19 +281,14 @@ mod tests {
         fn setup_with_arena(arena: Arena) -> anyhow::Result<Fixture> {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
-            let path = tempdir.path().join("unreal.db");
-            let mut cache = UnrealCacheBlocking::new(Arc::new(redb::Database::create(&path)?))?;
+            let mut cache = UnrealCacheBlocking::new(redb_utils::in_memory()?)?;
 
             let child = tempdir.child(format!("{arena}-cache.db"));
             let blob_dir = tempdir.child(format!("{arena}/blobs"));
             if let Some(p) = child.parent() {
                 std::fs::create_dir_all(p)?;
             }
-            cache.add_arena(
-                arena,
-                Arc::new(Database::create(child.path())?),
-                blob_dir.to_path_buf(),
-            )?;
+            cache.add_arena(arena, redb_utils::in_memory()?, blob_dir.to_path_buf())?;
 
             let async_cache = cache.into_async();
             let cache = async_cache.blocking();
