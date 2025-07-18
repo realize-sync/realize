@@ -18,20 +18,46 @@ Rules:
    - remove any decision stored in the Engine for the path
    - go through the rules above to possibly make another decision
 
-Rule 1, 2 and 3 should be updated whenever the cache is updated, by
-listening to notifications from remote peers, after they've been
-processed by the cache.
+A. Rule 1, 2 and 3 should be updated whenever the cache is updated, by
+   listening to notifications from remote peers, after they've been
+   processed by the cache.
 
-Rule 3 should be updated whenever the index is updated by listening to
-notifications (history update) from the index.
+B. Rule 3 should be updated whenever the index is updated by listening to
+  notifications (history update) from the index.
 
-Rule 4 should be updated at startup and whenever the mark changes by
-listening to notification from the watcher (see section
-[#marksxattrs))
+C. Rule 4 should be updated at startup and whenever the mark changes by
+   listening to notification from the watcher (see section #marksxattrs))
+
+Create a DecisionMarker type, defined in
+[engine.rs](../crate/realize-storage/src/engine.rs) that is given:
+ - an engine to update (EngineAsync)
+ - a cache to query (UnrealCacheAsync)
+ - an index to query and to watch (RealIndexAsync)
+
+For A, DecisionMarker::update(notification) should be called from
+`do_notify` in
+[household.rs](../crate/realize-core/src/rpc/household.rs) just after
+calling cache.update. This requires creating and then keeping an
+Engine and DecisionMarker per-arena in `Storage`, defined in the
+[storage](../crate/realize-storage/src/lib.rs) module. Use the Arena
+database when creating the engine, just like for the Index and
+ArenaCaches. It would be a good idea to just have a method
+`Storage::update(notification)` to dispatch to the cache and
+DecisionMaker, so Household doesn't need to know about both of them.
+
+For B, the DecisionMarker should spawn a task that listens to the
+index history using AsyncRealIndex::watch_history and fetching history
+entries as needed for as long as the DecisionMaker instance lives.
+
+C is described in the section #marksxattrs. It's not useful unless
+#markxattrs is implemented.
+
+
+
 
 Task list: TBD
 
-## Update marks from xattrs {#marksxattr}
+## Update marks from xattrs {#marksxattrs}
 
 Arenas, files and directories can be marked *own*, *watch* or *keep*
 as described in the section Consensus of [real.md](real.md) and the
