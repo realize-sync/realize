@@ -19,20 +19,21 @@ use uuid::Uuid;
 ///
 /// Key: realize_types::Path
 /// Value: FileTableEntry
-const FILE_TABLE: TableDefinition<&str, Holder<FileTableEntry>> = TableDefinition::new("file");
+const FILE_TABLE: TableDefinition<&str, Holder<FileTableEntry>> =
+    TableDefinition::new("index.file");
 
 /// Local file history.
 ///
 /// Key: u64 (monotonically increasing index value)
 /// Value: HistoryTableEntry
 const HISTORY_TABLE: TableDefinition<u64, Holder<HistoryTableEntry>> =
-    TableDefinition::new("history");
+    TableDefinition::new("index.history");
 
 /// Database settings.
 ///
 /// Key: string
 /// Value: depends on the setting
-const SETTINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("settings");
+const SETTINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("index.settings");
 
 /// File hash index, blocking version.
 pub struct RealIndexBlocking {

@@ -25,7 +25,7 @@ use std::path::PathBuf;
 /// Key: (inode, name)
 /// Value: DirTableEntry
 pub(crate) const DIRECTORY_TABLE: TableDefinition<(Inode, &str), Holder<DirTableEntry>> =
-    TableDefinition::new("directory");
+    TableDefinition::new("acache.directory");
 
 /// Track peer files.
 ///
@@ -39,7 +39,7 @@ pub(crate) const DIRECTORY_TABLE: TableDefinition<(Inode, &str), Holder<DirTable
 /// Key: (inode, peer)
 /// Value: FileTableEntry
 const FILE_TABLE: TableDefinition<(Inode, &str), Holder<FileTableEntry>> =
-    TableDefinition::new("file");
+    TableDefinition::new("acache.file");
 
 /// Track peer files that might have been deleted remotely.
 ///
@@ -51,7 +51,7 @@ const FILE_TABLE: TableDefinition<(Inode, &str), Holder<FileTableEntry>> =
 /// Key: (peer, file inode)
 /// Value: parent dir inode
 const PENDING_CATCHUP_TABLE: TableDefinition<(&str, Inode), Inode> =
-    TableDefinition::new("pending_catchup");
+    TableDefinition::new("acache.pending_catchup");
 
 /// Track Peer UUIDs.
 ///
@@ -59,7 +59,8 @@ const PENDING_CATCHUP_TABLE: TableDefinition<(&str, Inode), Inode> =
 ///
 /// Key: &str (Peer)
 /// Value: PeerTableEntry
-const PEER_TABLE: TableDefinition<&str, Holder<PeerTableEntry>> = TableDefinition::new("peer");
+const PEER_TABLE: TableDefinition<&str, Holder<PeerTableEntry>> =
+    TableDefinition::new("acache.peer");
 
 /// Track last seen notification index.
 ///
@@ -67,7 +68,7 @@ const PEER_TABLE: TableDefinition<&str, Holder<PeerTableEntry>> = TableDefinitio
 ///
 /// Key: &str (Peer)
 /// Value: last seen index
-const NOTIFICATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("notification");
+const NOTIFICATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("acache.notification");
 
 /// Track current inode range for each arena.
 ///
@@ -77,13 +78,14 @@ const NOTIFICATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("not
 /// Key: ()
 /// Value: (Inode, Inode) (last inode allocated, end of range)
 pub(crate) const CURRENT_INODE_RANGE_TABLE: TableDefinition<(), (Inode, Inode)> =
-    TableDefinition::new("current_inode_range");
+    TableDefinition::new("acache.current_inode_range");
 
 /// Track blobs.
 ///
 /// Key: inode
 /// Value: BlobTableEntry
-const BLOB_TABLE: TableDefinition<BlobId, Holder<BlobTableEntry>> = TableDefinition::new("blob");
+const BLOB_TABLE: TableDefinition<BlobId, Holder<BlobTableEntry>> =
+    TableDefinition::new("acache.blob");
 
 /// A per-arena cache of remote files.
 ///

@@ -25,7 +25,7 @@ const RANGE_SIZE: u64 = 10000;
 ///
 /// Key: arena name
 /// Value: root inode of arena
-const ARENA_TABLE: TableDefinition<&str, Inode> = TableDefinition::new("arena");
+const ARENA_TABLE: TableDefinition<&str, Inode> = TableDefinition::new("cache.arena");
 
 /// Track inode range allocation for arenas.
 ///
@@ -36,7 +36,7 @@ const ARENA_TABLE: TableDefinition<&str, Inode> = TableDefinition::new("arena");
 /// To find which arena a given inode N belongs to, lookup the range [N..];
 /// the first element returned is the end of the current range to which N belongs.
 const INODE_RANGE_ALLOCATION_TABLE: TableDefinition<Inode, Inode> =
-    TableDefinition::new("inode_range_allocation");
+    TableDefinition::new("cache.inode_range_allocation");
 
 /// A cache of remote files.
 pub struct UnrealCacheBlocking {
