@@ -429,6 +429,7 @@ mod tests {
     use assert_fs::prelude::*;
     use realize_types::{Arena, Path, Peer, UnixTime};
     use std::io::SeekFrom;
+    use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
     use tokio::fs;
     use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -443,6 +444,14 @@ mod tests {
 
     fn test_hash() -> Hash {
         Hash([1u8; 32])
+    }
+
+    fn test_time() -> UnixTime {
+        UnixTime::from_secs(1234567890)
+    }
+
+    fn later_time() -> UnixTime {
+        UnixTime::from_secs(1234567891)
     }
 
     struct Fixture {
@@ -488,7 +497,7 @@ mod tests {
                     arena: self.arena,
                     index: 1,
                     path: path.clone(),
-                    mtime: UnixTime::from_secs(1234567890),
+                    mtime: test_time(),
                     size,
                     hash: test_hash(),
                 },
@@ -497,6 +506,46 @@ mod tests {
             let (inode, _) = self.cache.lookup_path(self.arena, &path)?;
 
             Ok(inode)
+        }
+
+        fn add_file_with_mtime(
+            &self,
+            path: &Path,
+            size: u64,
+            mtime: &UnixTime,
+        ) -> anyhow::Result<()> {
+            self.cache.update(
+                test_peer(),
+                Notification::Add {
+                    arena: self.arena,
+                    index: 1,
+                    path: path.clone(),
+                    mtime: mtime.clone(),
+                    size,
+                    hash: test_hash(),
+                },
+            )?;
+
+            Ok(())
+        }
+
+        fn remove_file(&self, path: &Path) -> anyhow::Result<()> {
+            self.cache.update(
+                test_peer(),
+                Notification::Remove {
+                    arena: self.arena,
+                    index: 1,
+                    path: path.clone(),
+                    old_hash: test_hash(),
+                },
+            )?;
+
+            Ok(())
+        }
+
+        /// Check if a blob file exists for the given blob ID in the test arena.
+        fn blob_file_exists(&self, arena: Arena, blob_id: BlobId) -> bool {
+            self.blob_path(arena, blob_id).exists()
         }
 
         /// Return the path to a blob file for test use.
@@ -680,6 +729,199 @@ mod tests {
         let mut buf = [0; 100];
         let n = blob.read(&mut buf).await?;
         assert_eq!(b"black sheep", &buf[0..n]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn open_file_creates_sparse_file() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena)?;
+        let acache = fixture.arena_cache()?;
+        let file_path = Path::parse("foobar")?;
+
+        fixture.add_file_with_mtime(&file_path, 10000, &test_time())?;
+        let (inode, _) = acache.lookup_path(&file_path)?;
+
+        let blob_id = {
+            let blob = acache.open_file(inode)?;
+            assert_eq!(BlobId(1), blob.id());
+
+            let m = fixture.blob_path(arena, blob.id()).metadata()?;
+
+            // File should have the right size
+            assert_eq!(10000, m.len());
+
+            // File should be sparse
+            assert_eq!(0, m.blocks());
+
+            // Range empty for now
+            assert_eq!(ByteRanges::new(), *blob.local_availability());
+
+            blob.id()
+        };
+
+        // If called a second time, it should return a handle on the same file.
+        let blob = acache.open_file(inode)?;
+        assert_eq!(blob_id, blob.id());
+        assert_eq!(ByteRanges::new(), *blob.local_availability());
+
+        Ok(())
+    }
+
+    #[test]
+    fn blob_deleted_on_file_overwrite() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let cache = &fixture.cache;
+        let acache = fixture.arena_cache()?;
+        let arena = test_arena();
+        let file_path = Path::parse("file.txt")?;
+
+        // Create a file
+        fixture.add_file_with_mtime(&file_path, 100, &test_time())?;
+
+        // Open the file to create a blob
+        let (inode, _) = acache.lookup_path(&file_path)?;
+        let blob_id = acache.open_file(inode)?.id();
+
+        // Verify the blob file was created
+        assert!(fixture.blob_file_exists(arena, blob_id));
+
+        // Overwrite the file with a new version
+        cache.update(
+            test_peer(),
+            Notification::Replace {
+                arena: arena,
+                index: 0,
+                path: file_path.clone(),
+                mtime: later_time(),
+                size: 200,
+                hash: Hash([2u8; 32]),
+                old_hash: test_hash(),
+            },
+        )?;
+
+        // Verify the blob file has been deleted
+        assert!(!fixture.blob_file_exists(arena, blob_id));
+
+        Ok(())
+    }
+
+    #[test]
+    fn blob_deleted_on_file_removal() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let acache = fixture.arena_cache()?;
+        let arena = test_arena();
+        let file_path = Path::parse("file.txt")?;
+
+        // Create a file
+        fixture.add_file_with_mtime(&file_path, 100, &test_time())?;
+
+        // Open the file to create a blob
+        let (inode, _) = acache.lookup_path(&file_path)?;
+        let blob_id = acache.open_file(inode)?.id();
+
+        // Verify the blob file was created
+        assert!(fixture.blob_file_exists(arena, blob_id));
+
+        // Remove the file
+        fixture.remove_file(&file_path)?;
+
+        // Verify the blob file has been deleted
+        assert!(!fixture.blob_file_exists(arena, blob_id));
+
+        Ok(())
+    }
+
+    #[test]
+    fn blob_deleted_on_catchup_removal() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let cache = &fixture.cache;
+        let acache = fixture.arena_cache()?;
+        let arena = test_arena();
+        let file_path = Path::parse("file.txt")?;
+
+        // Create a file
+        fixture.add_file_with_mtime(&file_path, 100, &test_time())?;
+
+        // Open the file to create a blob
+        let (inode, _) = acache.lookup_path(&file_path)?;
+        let blob_id = acache.open_file(inode)?.id();
+
+        // Verify the blob file was created
+        assert!(fixture.blob_file_exists(arena, blob_id));
+
+        // Do a catchup that doesn't include this file (simulating file removal)
+        cache.update(test_peer(), Notification::CatchupStart(arena))?;
+        // Note: No Catchup notification for the file, so it will be deleted
+        cache.update(
+            test_peer(),
+            Notification::CatchupComplete {
+                arena: arena,
+                index: 0,
+            },
+        )?;
+
+        // Verify the blob file has been deleted
+        assert!(!fixture.blob_file_exists(arena, blob_id));
+
+        Ok(())
+    }
+
+    #[test]
+    fn blob_update_extends_range() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena)?;
+        let acache = fixture.arena_cache()?;
+        let file_path = Path::parse("file.txt")?;
+
+        // Create a file
+        fixture.add_file_with_mtime(&file_path, 1000, &test_time())?;
+
+        // Open the file to create a blob
+        let (inode, _) = acache.lookup_path(&file_path)?;
+        let blob_id = acache.open_file(inode)?.id();
+
+        // Initially, the blob should have empty written areas
+        let initial_ranges = acache.local_availability(blob_id)?;
+        assert!(initial_ranges.is_empty());
+
+        // Update the blob with some written areas
+        let written_areas = ByteRanges::from_ranges(vec![
+            ByteRange::new(0, 100),
+            ByteRange::new(200, 300),
+            ByteRange::new(500, 600),
+        ]);
+
+        acache.extend_local_availability(blob_id, &written_areas)?;
+
+        // Verify the written areas were updated
+        let retrieved_ranges = acache.local_availability(blob_id)?;
+        assert_eq!(retrieved_ranges, written_areas);
+
+        acache.extend_local_availability(
+            blob_id,
+            &ByteRanges::from_ranges(vec![ByteRange::new(50, 210), ByteRange::new(200, 400)]),
+        )?;
+
+        // Verify the ranges were updated again
+        let final_ranges = acache.local_availability(blob_id)?;
+        assert_eq!(
+            final_ranges,
+            ByteRanges::from_ranges(vec![ByteRange::new(0, 400), ByteRange::new(500, 600)])
+        );
+
+        // Test that getting ranges for a non-existent blob returns NotFound
+        assert!(matches!(
+            acache.local_availability(BlobId(99999)),
+            Err(StorageError::NotFound)
+        ));
+
+        // Test that updating ranges for a non-existent blob returns NotFound
+        assert!(matches!(
+            acache.extend_local_availability(BlobId(99999), &ByteRanges::new()),
+            Err(StorageError::NotFound)
+        ));
 
         Ok(())
     }
