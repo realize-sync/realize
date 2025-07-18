@@ -1,6 +1,6 @@
 use crate::utils::redb_utils;
 
-use super::config::{ArenaCacheConfig, ArenaConfig, CacheConfig, IndexConfig, StorageConfig};
+use super::config::{ArenaConfig, CacheConfig, StorageConfig};
 use super::{Storage, UnrealCacheAsync};
 use realize_types::Arena;
 use std::sync::Arc;
@@ -36,17 +36,13 @@ where
             .into_iter()
             .map(|arena| {
                 let arena_dir = arena_root(dir, arena);
-                let index_path = arena_dir.join(".index.db");
-                let arena_cache_path = arena_dir.join(".cache.db");
+                let storage_db = arena_dir.join(".storage.db");
                 (
                     arena,
                     ArenaConfig {
                         path: arena_dir.clone(),
-                        index: Some(IndexConfig { db: index_path }),
-                        cache: Some(ArenaCacheConfig {
-                            db: arena_cache_path,
-                            blob_dir: arena_dir.join(".blobs"),
-                        }),
+                        db: Some(storage_db),
+                        blob_dir: Some(arena_dir.join(".blobs")),
                     },
                 )
             })
@@ -58,8 +54,8 @@ where
 
     for arena_config in config.arenas.values() {
         fs::create_dir_all(&arena_config.path).await?;
-        if let Some(cache_config) = &arena_config.cache {
-            fs::create_dir_all(&cache_config.blob_dir).await?;
+        if let Some(blob_dir) = &arena_config.blob_dir {
+            fs::create_dir_all(blob_dir).await?;
         }
     }
 

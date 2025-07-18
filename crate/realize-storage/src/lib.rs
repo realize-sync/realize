@@ -53,22 +53,24 @@ impl Storage {
     /// Create and initialize storage from its configuration.
     pub async fn from_config(config: &StorageConfig) -> anyhow::Result<Arc<Self>> {
         let store = RealStore::from_config(&config.arenas);
-        let cache = UnrealCacheAsync::from_config(&config).await?;
         let mut arenas = HashMap::new();
         let exclude = build_exclude(&config);
+        
+        // Collect arena databases for cache creation
+        let mut arena_databases = Vec::new();
+        
         for (arena, arena_config) in &config.arenas {
             let root = arena_config.path.as_ref();
-            if let Some(index_config) = &arena_config.index {
-                let index_path = &index_config.db;
-                let index =
-                    RealIndexAsync::with_db(*arena, redb_utils::open(index_path).await?).await?;
+            if let Some(db_path) = &arena_config.db {
+                let db = redb_utils::open(db_path).await?;
+                let index = RealIndexAsync::with_db(*arena, db.clone()).await?;
                 let exclude = exclude
                     .iter()
                     .map(|p| realize_types::Path::from_real_path_in(p, root))
                     .flatten()
                     .collect::<Vec<_>>();
 
-                log::debug!("Watch {root:?}, excluding {exclude:?} for {index_path:?}");
+                log::debug!("Watch {root:?}, excluding {exclude:?} for {db_path:?}");
                 let watcher = RealWatcher::spawn(root, exclude, index.clone()).await?;
                 arenas.insert(
                     *arena,
@@ -78,8 +80,25 @@ impl Storage {
                         _watcher: watcher,
                     },
                 );
+                
+                // Add to arena databases for cache creation if blob_dir is configured
+                if let Some(blob_dir) = &arena_config.blob_dir {
+                    arena_databases.push((
+                        *arena,
+                        db,
+                        blob_dir.clone(),
+                    ));
+                }
             }
         }
+        
+        // Create cache with shared databases
+        let cache = if let Some(cache_config) = &config.cache {
+            let global_db = redb_utils::open(&cache_config.db).await?;
+            Some(UnrealCacheAsync::with_db(global_db, arena_databases).await?)
+        } else {
+            None
+        };
 
         Ok(Arc::new(Self {
             cache,
@@ -145,12 +164,11 @@ fn build_exclude(config: &StorageConfig) -> Vec<&std::path::Path> {
         exclude.push(path.db.as_ref());
     }
     for (_, arena_config) in &config.arenas {
-        if let Some(index_config) = &arena_config.index {
-            exclude.push(index_config.db.as_ref());
+        if let Some(db_path) = &arena_config.db {
+            exclude.push(db_path.as_ref());
         }
-        if let Some(cache_config) = &arena_config.cache {
-            exclude.push(cache_config.db.as_ref());
-            exclude.push(cache_config.blob_dir.as_ref());
+        if let Some(blob_dir) = &arena_config.blob_dir {
+            exclude.push(blob_dir.as_ref());
         }
     }
 

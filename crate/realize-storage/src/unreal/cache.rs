@@ -4,7 +4,7 @@
 
 use super::arena_cache::{self, ArenaCache, CURRENT_INODE_RANGE_TABLE, DIRECTORY_TABLE};
 use super::types::{FileAvailability, FileMetadata, InodeAssignment, ReadDirEntry};
-use crate::config::StorageConfig;
+
 use crate::real::notifier::{Notification, Progress};
 use crate::{Blob, Inode, StorageError};
 use bimap::BiMap;
@@ -248,32 +248,7 @@ impl UnrealCacheAsync {
     /// Inode of the root dir.
     pub const ROOT_DIR: Inode = UnrealCacheBlocking::ROOT_DIR;
 
-    /// Create and configure a cache from configuration.
-    pub async fn from_config(config: &StorageConfig) -> anyhow::Result<Option<Self>> {
-        let global_db_path = match &config.cache {
-            Some(cache_config) => &cache_config.db,
-            None => return Ok(None),
-        }
-        .to_path_buf();
-        let arenas = config.arenas.clone();
-        let cache = task::spawn_blocking(move || {
-            let mut cache = UnrealCacheBlocking::new(Arc::new(Database::create(global_db_path)?))?;
-            for (arena, arena_cfg) in arenas {
-                if let Some(arena_cache_config) = &arena_cfg.cache {
-                    cache.add_arena(
-                        arena,
-                        Arc::new(Database::create(&arena_cache_config.db)?),
-                        arena_cache_config.blob_dir.clone(),
-                    )?;
-                }
-            }
 
-            Ok::<_, anyhow::Error>(cache)
-        })
-        .await??;
-
-        Ok(Some(cache.into_async()))
-    }
 
     /// Create a new cache from a blocking one.
     pub fn new(inner: UnrealCacheBlocking) -> Self {

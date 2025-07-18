@@ -31,25 +31,12 @@ pub struct CacheConfig {
     pub db: PathBuf,
 }
 
-/// For per-arena cache (blob_dir required)
-#[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
-pub struct ArenaCacheConfig {
-    /// Path to the cache database.
-    pub db: PathBuf,
-    /// Path to the directory where blob files are stored (required)
-    pub blob_dir: PathBuf,
-}
-
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
 pub struct ArenaConfig {
     /// Local path to the directory where files for that arena are stored.
     pub path: PathBuf,
-    pub index: Option<IndexConfig>,
-    /// Optional path to the cache database for this arena.
-    pub cache: Option<ArenaCacheConfig>,
-}
-
-#[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
-pub struct IndexConfig {
-    pub db: PathBuf,
+    /// Optional path to the database that contains both index and cache data.
+    pub db: Option<PathBuf>,
+    /// Optional path to the directory where blob files are stored (required for cache functionality).
+    pub blob_dir: Option<PathBuf>,
 }

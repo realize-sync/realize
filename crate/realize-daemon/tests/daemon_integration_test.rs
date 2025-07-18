@@ -10,8 +10,6 @@ use realize_core::rpc::realstore::client::ClientOptions;
 use realize_network::Networking;
 use realize_network::config::PeerConfig;
 use realize_storage::RealStoreOptions;
-use realize_storage::config::ArenaCacheConfig;
-use realize_storage::config::IndexConfig;
 use realize_storage::config::{ArenaConfig, CacheConfig};
 use realize_types;
 use realize_types::{Arena, Peer};
@@ -62,8 +60,8 @@ impl Fixture {
             arena,
             ArenaConfig {
                 path: testdir.to_path_buf(),
-                index: None,
-                cache: None,
+                db: None,
+                blob_dir: None,
             },
         );
 
@@ -106,10 +104,8 @@ impl Fixture {
         for (arena, arena_config) in &mut self.config.storage.arenas {
             let child = self.tempdir.child(format!("{arena}-cache.db"));
             let blob_dir = self.tempdir.child(format!("{arena}-blobs"));
-            arena_config.cache = Some(ArenaCacheConfig {
-                db: child.to_path_buf(),
-                blob_dir: blob_dir.to_path_buf(),
-            });
+            arena_config.db = Some(child.to_path_buf());
+            arena_config.blob_dir = Some(blob_dir.to_path_buf());
         }
     }
 
@@ -412,9 +408,7 @@ async fn daemon_updates_cache() -> anyhow::Result<()> {
         .arenas
         .get_mut(&Arena::from("testdir"))
         .unwrap()
-        .index = Some(IndexConfig {
-        db: fixture_a.tempdir.join("index.db"),
-    });
+        .db = Some(fixture_a.tempdir.join("index.db"));
     let mut daemon_a = fixture_a.command()?.spawn()?;
     let a_port = wait_for_listening_port(daemon_a.stdout.as_mut().unwrap()).await?;
 
