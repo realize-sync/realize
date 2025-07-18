@@ -1,9 +1,9 @@
-use super::blob::OpenBlob;
 use super::blob::Blobstore;
 use super::types::{
-    BlobId, DirTableEntry, FileAvailability, FileContent, FileMetadata,
-    FileTableEntry, InodeAssignment, PeerTableEntry, ReadDirEntry,
+    BlobId, DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry,
+    InodeAssignment, PeerTableEntry, ReadDirEntry,
 };
+use crate::Blob;
 use crate::real::notifier::{Notification, Progress};
 use crate::utils::holder::Holder;
 use crate::{Inode, StorageError};
@@ -89,7 +89,7 @@ pub(crate) struct ArenaCache {
     arena: Arena,
     arena_root: Inode,
     db: Arc<Database>,
-    blobstore: Blobstore,
+    blobstore: Arc<Blobstore>,
 }
 
 impl ArenaCache {
@@ -122,10 +122,6 @@ impl ArenaCache {
             db,
             blobstore,
         })
-    }
-
-    pub(crate) fn arena(&self) -> Arena {
-        self.arena
     }
 
     pub(crate) fn lookup(
@@ -208,19 +204,9 @@ impl ArenaCache {
                     let entry = FileTableEntry::new(path, size, mtime, hash, parent_inode);
 
                     if !get_file_entry(&file_table, file_inode, None)?.is_some() {
-                        self.do_write_file_entry(
-                            &mut file_table,
-                            file_inode,
-                            None,
-                            &entry,
-                        )?;
+                        self.do_write_file_entry(&mut file_table, file_inode, None, &entry)?;
                     }
-                    self.do_write_file_entry(
-                        &mut file_table,
-                        file_inode,
-                        Some(peer),
-                        &entry,
-                    )?;
+                    self.do_write_file_entry(&mut file_table, file_inode, Some(peer), &entry)?;
                 }
             }
             Notification::Replace {
@@ -244,29 +230,14 @@ impl ArenaCache {
                 {
                     // If it overwrites the entry that's current, it's
                     // necessarily an entry we want.
-                    self.do_write_file_entry(
-                        &mut file_table,
-                        file_inode,
-                        None,
-                        &entry,
-                    )?;
-                    self.do_write_file_entry(
-                        &mut file_table,
-                        file_inode,
-                        Some(peer),
-                        &entry,
-                    )?;
+                    self.do_write_file_entry(&mut file_table, file_inode, None, &entry)?;
+                    self.do_write_file_entry(&mut file_table, file_inode, Some(peer), &entry)?;
                 } else if let Some(e) = get_file_entry(&file_table, file_inode, Some(peer))?
                     && e.content.hash == old_hash
                 {
                     // If it overwrites the peer's entry, we want to
                     // keep that.
-                    self.do_write_file_entry(
-                        &mut file_table,
-                        file_inode,
-                        Some(peer),
-                        &entry,
-                    )?;
+                    self.do_write_file_entry(&mut file_table, file_inode, Some(peer), &entry)?;
                 }
             }
             Notification::Remove {
@@ -298,12 +269,7 @@ impl ArenaCache {
                 let mut file_table = txn.open_table(FILE_TABLE)?;
                 let entry = FileTableEntry::new(path, size, mtime, hash, parent_inode);
                 if !get_file_entry(&file_table, file_inode, None)?.is_some() {
-                    self.do_write_file_entry(
-                        &mut file_table,
-                        file_inode,
-                        None,
-                        &entry,
-                    )?;
+                    self.do_write_file_entry(&mut file_table, file_inode, None, &entry)?;
                 }
                 self.do_write_file_entry(&mut file_table, file_inode, Some(peer), &entry)?;
             }
@@ -330,7 +296,7 @@ impl ArenaCache {
     }
 
     /// Open a file for reading/writing.
-    pub(crate) fn open_file(&self, inode: Inode) -> Result<OpenBlob, StorageError> {
+    pub(crate) fn open_file(&self, inode: Inode) -> Result<Blob, StorageError> {
         // Optimistically, try a read transaction to check whether the
         // blob is there.
         {
@@ -347,13 +313,15 @@ impl ArenaCache {
         let txn = self.db.begin_write()?;
         let ret = {
             let mut file_table = txn.open_table(FILE_TABLE)?;
-            let file_entry = get_default_entry(&file_table, inode)?;
-            let mut openblob = self.blobstore.create_blob(inode, &txn, file_entry)?;
+            let mut file_entry = get_default_entry(&file_table, inode)?;
+            let blob = self
+                .blobstore
+                .create_blob(inode, &txn, file_entry.clone())?;
 
-            openblob.file_entry.content.blob = Some(openblob.blob_id);
-            file_table.insert((inode, ""), Holder::new(&openblob.file_entry)?)?;
+            file_entry.content.blob = Some(blob.id());
+            file_table.insert((inode, ""), Holder::new(&file_entry)?)?;
 
-            openblob
+            blob
         };
         txn.commit()?;
 
@@ -555,11 +523,14 @@ impl ArenaCache {
         Ok(())
     }
 
+    // TODO: update tests to work on blobstore and remove
     #[allow(dead_code)]
     pub(crate) fn local_availability(&self, blob_id: BlobId) -> Result<ByteRanges, StorageError> {
         self.blobstore.local_availability(blob_id)
     }
 
+    // TODO: update tests to work on blobstore and remove
+    #[allow(dead_code)]
     pub(crate) fn extend_local_availability(
         &self,
         blob_id: BlobId,
@@ -1851,9 +1822,9 @@ mod tests {
 
         let blob_id = {
             let blob = acache.open_file(inode)?;
-            assert_eq!(BlobId(1), blob.blob_id);
+            assert_eq!(BlobId(1), blob.id());
 
-            let m = fixture.blob_path(arena, blob.blob_id).metadata()?;
+            let m = fixture.blob_path(arena, blob.id()).metadata()?;
 
             // File should have the right size
             assert_eq!(10000, m.len());
@@ -1862,15 +1833,15 @@ mod tests {
             assert_eq!(0, m.blocks());
 
             // Range empty for now
-            assert_eq!(ByteRanges::new(), blob.blob_entry.written_areas);
+            assert_eq!(ByteRanges::new(), *blob.local_availability());
 
-            blob.blob_id
+            blob.id()
         };
 
         // If called a second time, it should return a handle on the same file.
         let blob = acache.open_file(inode)?;
-        assert_eq!(blob_id, blob.blob_id);
-        assert_eq!(ByteRanges::new(), blob.blob_entry.written_areas);
+        assert_eq!(blob_id, blob.id());
+        assert_eq!(ByteRanges::new(), *blob.local_availability());
 
         Ok(())
     }
@@ -1888,7 +1859,7 @@ mod tests {
 
         // Open the file to create a blob
         let (inode, _) = acache.lookup_path(&file_path)?;
-        let blob_id = acache.open_file(inode)?.blob_id;
+        let blob_id = acache.open_file(inode)?.id();
 
         // Verify the blob file was created
         assert!(fixture.blob_file_exists(arena, blob_id));
@@ -1925,7 +1896,7 @@ mod tests {
 
         // Open the file to create a blob
         let (inode, _) = acache.lookup_path(&file_path)?;
-        let blob_id = acache.open_file(inode)?.blob_id;
+        let blob_id = acache.open_file(inode)?.id();
 
         // Verify the blob file was created
         assert!(fixture.blob_file_exists(arena, blob_id));
@@ -1952,7 +1923,7 @@ mod tests {
 
         // Open the file to create a blob
         let (inode, _) = acache.lookup_path(&file_path)?;
-        let blob_id = acache.open_file(inode)?.blob_id;
+        let blob_id = acache.open_file(inode)?.id();
 
         // Verify the blob file was created
         assert!(fixture.blob_file_exists(arena, blob_id));
@@ -1986,7 +1957,7 @@ mod tests {
 
         // Open the file to create a blob
         let (inode, _) = acache.lookup_path(&file_path)?;
-        let blob_id = acache.open_file(inode)?.blob_id;
+        let blob_id = acache.open_file(inode)?.id();
 
         // Initially, the blob should have empty written areas
         let initial_ranges = acache.local_availability(blob_id)?;

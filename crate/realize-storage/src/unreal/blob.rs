@@ -1,9 +1,9 @@
-use super::cache::UnrealCacheBlocking;
 use super::types::{BlobId, BlobTableEntry, FileTableEntry};
+use crate::Inode;
 use crate::StorageError;
 use crate::utils::holder::Holder;
-use crate::Inode;
-use realize_types::{Arena, ByteRange, ByteRanges, Hash};
+use realize_types::{ByteRange, ByteRanges, Hash};
+use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
 use std::cmp::min;
 use std::io::{SeekFrom, Write};
 use std::path::PathBuf;
@@ -11,7 +11,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt as _, ReadBuf};
-use redb::{Database, ReadTransaction, WriteTransaction, TableDefinition, ReadableTable};
 
 /// Track blobs.
 ///
@@ -30,7 +29,7 @@ pub(crate) struct Blobstore {
 
 impl Blobstore {
     /// Create a new Blobstore from a database and blob directory.
-    pub(crate) fn new(db: Arc<Database>, blob_dir: PathBuf) -> Result<Self, StorageError> {
+    pub(crate) fn new(db: Arc<Database>, blob_dir: PathBuf) -> Result<Arc<Self>, StorageError> {
         // Ensure the database has the required blob table
         {
             let txn = db.begin_write()?;
@@ -42,35 +41,38 @@ impl Blobstore {
             std::fs::create_dir_all(&blob_dir)?;
         }
 
-        Ok(Self { db, blob_dir })
+        Ok(Arc::new(Self { db, blob_dir }))
     }
 
     /// Return an [OpenBlob] entry given a blob id.
     pub(crate) fn open_blob(
-        &self,
+        self: &Arc<Self>,
         txn: &ReadTransaction,
         file_entry: FileTableEntry,
         blob_id: BlobId,
-    ) -> Result<OpenBlob, StorageError> {
+    ) -> Result<Blob, StorageError> {
         let blob_table = txn.open_table(BLOB_TABLE)?;
         let blob_entry = get_blob_entry(&blob_table, blob_id)?;
         let file = self.open_blob_file(blob_id, file_entry.metadata.size, false)?;
 
-        return Ok(OpenBlob {
-            blob_id,
-            file_entry,
-            blob_entry,
-            file,
-        });
+        return Ok(Blob::new(
+            OpenBlob {
+                blob_id,
+                file_entry,
+                blob_entry,
+                file,
+            },
+            Arc::clone(self),
+        ));
     }
 
     /// Create a new blob and returns its [OpenBlob]
     pub(crate) fn create_blob(
-        &self,
+        self: &Arc<Self>,
         inode: Inode,
         txn: &WriteTransaction,
         file_entry: FileTableEntry,
-    ) -> Result<OpenBlob, StorageError> {
+    ) -> Result<Blob, StorageError> {
         let mut blob_table = txn.open_table(BLOB_TABLE)?;
         let (blob_id, blob_entry) = if let Some(blob_id) = file_entry.content.blob {
             let blob_entry = get_blob_entry(&blob_table, blob_id)?;
@@ -93,12 +95,15 @@ impl Blobstore {
         };
         let file = self.open_blob_file(blob_id, file_entry.metadata.size, true)?;
         blob_table.insert(blob_id, Holder::new(&blob_entry)?)?;
-        Ok(OpenBlob {
-            blob_id,
-            file_entry,
-            blob_entry,
-            file,
-        })
+        Ok(Blob::new(
+            OpenBlob {
+                blob_id,
+                file_entry,
+                blob_entry,
+                file,
+            },
+            Arc::clone(self),
+        ))
     }
 
     /// Open or create a file for the blob and make sure it has the
@@ -222,8 +227,7 @@ pub struct Blob {
     file: tokio::fs::File,
     size: u64,
     hash: Hash,
-    cache: Arc<UnrealCacheBlocking>,
-    arena: Arena,
+    blobstore: Arc<Blobstore>,
 
     /// Complete available range
     available_ranges: ByteRanges,
@@ -238,13 +242,12 @@ pub struct Blob {
 #[allow(dead_code)]
 impl Blob {
     /// Create a new blob from a file and its available byte ranges.
-    pub(crate) fn new(def: OpenBlob, cache: Arc<UnrealCacheBlocking>, arena: Arena) -> Self {
+    pub(crate) fn new(def: OpenBlob, blobstore: Arc<Blobstore>) -> Self {
         Self {
             blob_id: def.blob_id,
             file: tokio::fs::File::from_std(def.file),
             available_ranges: def.blob_entry.written_areas,
-            cache,
-            arena,
+            blobstore,
             pending_ranges: ByteRanges::new(),
             size: def.file_entry.metadata.size,
             hash: def.file_entry.content.hash,
@@ -294,16 +297,12 @@ impl Blob {
         self.file.flush().await?;
         self.file.sync_all().await?;
 
-        let cache = Arc::clone(&self.cache);
         let blob_id = self.blob_id;
-        let arena = self.arena;
         let ranges = std::mem::take(&mut self.pending_ranges);
+        let blobstore = Arc::clone(&self.blobstore);
         let (res, ranges) = tokio::task::spawn_blocking(move || {
             (
-                match cache.arena_cache(arena) {
-                    Err(err) => Err(err),
-                    Ok(cache) => cache.extend_local_availability(blob_id, &ranges),
-                },
+                blobstore.extend_local_availability(blob_id, &ranges),
                 ranges,
             )
         })

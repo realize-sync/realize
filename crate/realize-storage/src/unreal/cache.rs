@@ -248,8 +248,6 @@ impl UnrealCacheAsync {
     /// Inode of the root dir.
     pub const ROOT_DIR: Inode = UnrealCacheBlocking::ROOT_DIR;
 
-
-
     /// Create a new cache from a blocking one.
     pub fn new(inner: UnrealCacheBlocking) -> Self {
         Self {
@@ -373,17 +371,13 @@ impl UnrealCacheAsync {
     /// This is usually used through the `Downloader`, which can
     /// download incomplete portions of the file.
     pub async fn open_file(&self, inode: Inode) -> Result<Blob, StorageError> {
-        let (def, arena) = task::spawn_blocking({
-            let inner = Arc::clone(&self.inner);
-            move || {
-                let cache = inner.arena_cache_for_inode(inode)?;
+        let inner = Arc::clone(&self.inner);
 
-                Ok::<_, StorageError>((cache.open_file(inode)?, cache.arena()))
-            }
+        task::spawn_blocking(move || {
+            let arena_cache = inner.arena_cache_for_inode(inode)?;
+            arena_cache.open_file(inode)
         })
-        .await??;
-
-        Ok(Blob::new(def, Arc::clone(&self.inner), arena))
+        .await?
     }
 }
 
