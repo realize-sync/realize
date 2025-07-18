@@ -5,7 +5,7 @@ use config::StorageConfig;
 use real::index::RealIndexAsync;
 use real::watcher::RealWatcher;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::task::{self, JoinHandle};
 
 use realize_types;
 use realize_types::Arena;
@@ -59,7 +59,7 @@ impl Storage {
             let root = arena_config.path.as_ref();
             if let Some(index_config) = &arena_config.index {
                 let index_path = &index_config.db;
-                let index = RealIndexAsync::open(*arena, &index_path).await?;
+                let index = RealIndexAsync::with_db(*arena, open_db(index_path).await?).await?;
                 let exclude = exclude
                     .iter()
                     .map(|p| realize_types::Path::from_real_path_in(p, root))
@@ -153,4 +153,12 @@ fn build_exclude(config: &StorageConfig) -> Vec<&std::path::Path> {
     }
 
     exclude
+}
+
+async fn open_db(path: &std::path::Path) -> anyhow::Result<Arc<redb::Database>> {
+    let path = path.to_path_buf();
+
+    Ok(Arc::new(
+        task::spawn_blocking(move || redb::Database::create(path)).await??,
+    ))
 }

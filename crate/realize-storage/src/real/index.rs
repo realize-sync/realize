@@ -8,7 +8,6 @@ use capnp::serialize_packed;
 use realize_types::{self, Arena, Hash, UnixTime};
 use redb::{Database, ReadableTable as _, TableDefinition, WriteTransaction};
 use std::ops::RangeBounds;
-use std::path;
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 use tokio::task;
@@ -37,7 +36,7 @@ const SETTINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("index
 
 /// File hash index, blocking version.
 pub struct RealIndexBlocking {
-    db: Database,
+    db: Arc<Database>,
     arena: Arena,
     history_tx: watch::Sender<u64>,
     uuid: Uuid,
@@ -47,7 +46,7 @@ pub struct RealIndexBlocking {
 }
 
 impl RealIndexBlocking {
-    pub fn new(arena: Arena, db: Database) -> Result<Self, StorageError> {
+    pub fn new(arena: Arena, db: Arc<Database>) -> Result<Self, StorageError> {
         let index: u64;
         let uuid: Uuid;
         {
@@ -110,7 +109,7 @@ impl RealIndexBlocking {
     ///
     /// This is the value tracked by [RealIndexBlocking::watch_history].
     pub fn last_history_index(&self) -> Result<u64, StorageError> {
-        let txn = self.db.begin_read()?;
+        let txn = (&*self.db).begin_read()?;
         let history_table = txn.open_table(HISTORY_TABLE)?;
 
         last_history_index(&history_table)
@@ -121,17 +120,12 @@ impl RealIndexBlocking {
         RealIndexAsync::new(self)
     }
 
-    /// Open or create an index at the given path.
-    pub fn open(arena: Arena, path: &path::Path) -> Result<Self, StorageError> {
-        Self::new(arena, Database::create(path)?)
-    }
-
     /// Get a file entry.
     pub fn get_file(
         &self,
         path: &realize_types::Path,
     ) -> Result<Option<FileTableEntry>, StorageError> {
-        let txn = self.db.begin_read()?;
+        let txn = (&*self.db).begin_read()?;
         let file_table = txn.open_table(FILE_TABLE)?;
 
         if let Some(entry) = file_table.get(path.as_str())? {
@@ -143,7 +137,7 @@ impl RealIndexBlocking {
 
     /// Check whether a given file is in the index already.
     pub fn has_file(&self, path: &realize_types::Path) -> Result<bool, StorageError> {
-        let txn = self.db.begin_read()?;
+        let txn = (&*self.db).begin_read()?;
         let file_table = txn.open_table(FILE_TABLE)?;
 
         Ok(file_table.get(path.as_str())?.is_some())
@@ -170,7 +164,7 @@ impl RealIndexBlocking {
         mtime: &UnixTime,
         hash: Hash,
     ) -> Result<(), StorageError> {
-        let txn = self.db.begin_write()?;
+        let txn = (&*self.db).begin_write()?;
         let mut history_index = None;
         do_add_file(&txn, path, size, mtime, hash, &mut history_index)?;
         txn.commit()?;
@@ -186,7 +180,7 @@ impl RealIndexBlocking {
         &self,
         tx: mpsc::Sender<(realize_types::Path, FileTableEntry)>,
     ) -> Result<(), StorageError> {
-        let txn = self.db.begin_read()?;
+        let txn = (&*self.db).begin_read()?;
         let file_table = txn.open_table(FILE_TABLE)?;
         for (path, entry) in file_table
             .iter()?
@@ -216,7 +210,7 @@ impl RealIndexBlocking {
         range: impl RangeBounds<u64>,
         tx: mpsc::Sender<Result<(u64, HistoryTableEntry), StorageError>>,
     ) -> Result<(), StorageError> {
-        let txn = self.db.begin_read()?;
+        let txn = (&*self.db).begin_read()?;
         let history_table = txn.open_table(HISTORY_TABLE)?;
         for res in history_table.range(range)?.map(|res| match res {
             Err(err) => Err(StorageError::from(err)),
@@ -238,7 +232,7 @@ impl RealIndexBlocking {
     /// If the path is a directory, all files within that directory
     /// are removed, recursively.
     pub fn remove_file_or_dir(&self, path: &realize_types::Path) -> Result<(), StorageError> {
-        let txn = self.db.begin_write()?;
+        let txn = (&*self.db).begin_write()?;
         let mut history_index = None;
         do_remove_file_or_dir(&txn, path, &mut history_index)?;
         txn.commit()?;
@@ -351,18 +345,8 @@ impl RealIndexAsync {
         }
     }
 
-    /// Create an inedx using the database at the given path. Create it if necessary.
-    pub async fn open(arena: Arena, path: &path::Path) -> Result<Self, StorageError> {
-        let path = path.to_path_buf();
-
-        task::spawn_blocking(move || {
-            Ok(RealIndexAsync::new(RealIndexBlocking::open(arena, &path)?))
-        })
-        .await?
-    }
-
     /// Create an index using the given database. Initialize the database if necessary.
-    pub async fn with_db(arena: Arena, db: redb::Database) -> Result<Self, StorageError> {
+    pub async fn with_db(arena: Arena, db: Arc<redb::Database>) -> Result<Self, StorageError> {
         task::spawn_blocking(move || Ok(RealIndexAsync::new(RealIndexBlocking::new(arena, db)?)))
             .await?
     }
@@ -636,7 +620,9 @@ mod tests {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
             let path = tempdir.path().join("index.db");
-            let aindex = RealIndexBlocking::open(test_arena(), &path)?.into_async();
+            let arena = test_arena();
+            let aindex =
+                RealIndexBlocking::new(arena, Arc::new(Database::create(&path)?))?.into_async();
             Ok(Self {
                 index: aindex.blocking(),
                 aindex,
@@ -663,12 +649,17 @@ mod tests {
     fn reopen_keeps_uuid() -> anyhow::Result<()> {
         let tempdir = TempDir::new()?;
         let path = tempdir.path().join("index.db");
-        let uuid = RealIndexBlocking::open(test_arena(), &path)?.uuid().clone();
+        let arena = test_arena();
+        let uuid = RealIndexBlocking::new(arena, Arc::new(redb::Database::create(&path)?))?
+            .uuid()
+            .clone();
 
         assert!(!uuid.is_nil());
         assert_eq!(
             uuid,
-            RealIndexBlocking::open(test_arena(), &path)?.uuid().clone()
+            RealIndexBlocking::new(arena, Arc::new(redb::Database::create(&path)?))?
+                .uuid()
+                .clone()
         );
 
         Ok(())

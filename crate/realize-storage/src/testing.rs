@@ -12,13 +12,15 @@ where
     for arena in arenas.into_iter() {
         arena_dbs.push((
             arena,
-            redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?,
+            Arc::new(
+                redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?,
+            ),
             std::path::PathBuf::from("/dev/null"),
         ));
     }
     let cache = UnrealCacheAsync::with_db(
+        Arc::new(redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?),
         arena_dbs,
-        redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?,
     )
     .await?;
 

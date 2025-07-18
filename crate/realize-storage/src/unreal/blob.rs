@@ -282,7 +282,7 @@ mod tests {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
             let path = tempdir.path().join("unreal.db");
-            let mut cache = UnrealCacheBlocking::open(&path)?;
+            let mut cache = UnrealCacheBlocking::new(Arc::new(redb::Database::create(&path)?))?;
 
             let child = tempdir.child(format!("{arena}-cache.db"));
             let blob_dir = tempdir.child(format!("{arena}/blobs"));
@@ -291,7 +291,7 @@ mod tests {
             }
             cache.add_arena(
                 arena,
-                Database::create(child.path())?,
+                Arc::new(Database::create(child.path())?),
                 blob_dir.to_path_buf(),
             )?;
 

@@ -11,6 +11,7 @@ use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTrans
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Tracks directory content.
 ///
@@ -94,7 +95,7 @@ const BLOB_TABLE: TableDefinition<BlobId, Holder<BlobTableEntry>> =
 pub(crate) struct ArenaCache {
     arena: Arena,
     arena_root: Inode,
-    db: Database,
+    db: Arc<Database>,
     blob_dir: PathBuf,
 }
 
@@ -103,7 +104,7 @@ impl ArenaCache {
     pub(crate) fn new(
         arena: Arena,
         arena_root: Inode,
-        db: Database,
+        db: Arc<Database>,
         blob_dir: PathBuf,
     ) -> Result<Self, StorageError> {
         // Ensure the database has the required tables
@@ -142,7 +143,7 @@ impl ArenaCache {
         parent_inode: Inode,
         name: &str,
     ) -> Result<ReadDirEntry, StorageError> {
-        let txn = self.db.begin_read()?;
+        let txn = (&*self.db).begin_read()?;
         do_lookup(txn, parent_inode, name)
     }
 
@@ -150,25 +151,25 @@ impl ArenaCache {
         &self,
         path: &Path,
     ) -> Result<(Inode, InodeAssignment), StorageError> {
-        let txn = self.db.begin_read()?;
+        let txn = (&*self.db).begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
 
         do_lookup_path(&dir_table, self.arena_root, &Some(path.clone()))
     }
 
     pub(crate) fn file_metadata(&self, inode: Inode) -> Result<FileMetadata, StorageError> {
-        let txn = self.db.begin_read()?;
+        let txn = (&*self.db).begin_read()?;
         do_file_metadata(&txn, inode)
     }
 
     pub(crate) fn dir_mtime(&self, inode: Inode) -> Result<UnixTime, StorageError> {
-        let txn = self.db.begin_read()?;
+        let txn = (&*self.db).begin_read()?;
 
         do_dir_mtime(&txn, inode, self.arena_root)
     }
 
     pub(crate) fn file_availability(&self, inode: Inode) -> Result<FileAvailability, StorageError> {
-        let txn = self.db.begin_read()?;
+        let txn = (&*self.db).begin_read()?;
 
         do_file_availability(&txn, inode, self.arena)
     }
@@ -177,13 +178,13 @@ impl ArenaCache {
         &self,
         inode: Inode,
     ) -> Result<Vec<(String, ReadDirEntry)>, StorageError> {
-        let txn = self.db.begin_read()?;
+        let txn = (&*self.db).begin_read()?;
 
         do_readdir(&txn, inode)
     }
 
     pub(crate) fn peer_progress(&self, peer: Peer) -> Result<Option<Progress>, StorageError> {
-        let txn = self.db.begin_read()?;
+        let txn = (&*self.db).begin_read()?;
 
         do_peer_progress(&txn, peer)
     }
@@ -198,7 +199,7 @@ impl ArenaCache {
         // UnrealCacheBlocking::update, is responsible for dispatching properly
         assert_eq!(self.arena, notification.arena());
 
-        let txn = self.db.begin_write()?;
+        let txn = (&*self.db).begin_write()?;
         match notification {
             Notification::Add {
                 index,
@@ -353,7 +354,7 @@ impl ArenaCache {
         // Optimistically, try a read transaction to check whether the
         // blob is there.
         {
-            let txn = self.db.begin_read()?;
+            let txn = (&*self.db).begin_read()?;
             let file_entry = get_default_entry(&txn.open_table(FILE_TABLE)?, inode)?;
             if let Some(blob_id) = file_entry.content.blob {
                 let blob_entry = get_blob_entry(&txn.open_table(BLOB_TABLE)?, blob_id)?;
@@ -369,7 +370,7 @@ impl ArenaCache {
 
         // Switch to a write transaction to create the blob. We need to read
         // the file entry again because it might have changed.
-        let txn = self.db.begin_write()?;
+        let txn = (&*self.db).begin_write()?;
         let ret = {
             let mut file_table = txn.open_table(FILE_TABLE)?;
             let mut file_entry = get_default_entry(&file_table, inode)?;
@@ -660,7 +661,7 @@ impl ArenaCache {
 
     #[allow(dead_code)]
     pub(crate) fn local_availability(&self, blob_id: BlobId) -> Result<ByteRanges, StorageError> {
-        let txn = self.db.begin_read()?;
+        let txn = (&*self.db).begin_read()?;
         let blob_table = txn.open_table(BLOB_TABLE)?;
 
         Ok(get_blob_entry(&blob_table, blob_id)?.written_areas)
@@ -671,7 +672,7 @@ impl ArenaCache {
         blob_id: BlobId,
         new_range: &ByteRanges,
     ) -> Result<(), StorageError> {
-        let txn = self.db.begin_write()?;
+        let txn = (&*self.db).begin_write()?;
         {
             let mut blob_table = txn.open_table(BLOB_TABLE)?;
             let mut blob_entry = get_blob_entry(&blob_table, blob_id)?;
@@ -1113,7 +1114,7 @@ mod tests {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
             let path = tempdir.path().join("unreal.db");
-            let mut cache = UnrealCacheBlocking::open(&path)?;
+            let mut cache = UnrealCacheBlocking::new(Arc::new(redb::Database::create(&path)?))?;
 
             let child = tempdir.child(format!("{arena}-cache.db"));
             let blob_dir = tempdir.child(format!("{arena}/blobs"));
@@ -1122,7 +1123,7 @@ mod tests {
             }
             cache.add_arena(
                 arena,
-                Database::create(child.path())?,
+                Arc::new(Database::create(child.path())?),
                 blob_dir.to_path_buf(),
             )?;
 

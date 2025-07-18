@@ -11,7 +11,7 @@ use bimap::BiMap;
 use realize_types::{Arena, Path, Peer, UnixTime};
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
 use std::collections::HashMap;
-use std::path::{self, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::task;
 
@@ -40,7 +40,7 @@ const INODE_RANGE_ALLOCATION_TABLE: TableDefinition<Inode, Inode> =
 
 /// A cache of remote files.
 pub struct UnrealCacheBlocking {
-    db: Database,
+    db: Arc<Database>,
     arena_roots: BiMap<Arena, Inode>,
     arena_caches: HashMap<Arena, ArenaCache>,
 }
@@ -50,9 +50,9 @@ impl UnrealCacheBlocking {
     pub const ROOT_DIR: Inode = Inode(1);
 
     /// Create a new UnrealCache from a redb database.
-    pub fn new(db: Database) -> Result<Self, StorageError> {
+    pub fn new(db: Arc<Database>) -> Result<Self, StorageError> {
         {
-            let txn = db.begin_write()?;
+            let txn = (&*db).begin_write()?;
             txn.open_table(ARENA_TABLE)?;
             txn.open_table(DIRECTORY_TABLE)?;
             txn.open_table(INODE_RANGE_ALLOCATION_TABLE)?;
@@ -63,7 +63,7 @@ impl UnrealCacheBlocking {
         }
 
         let arena_map = {
-            let txn = db.begin_read()?;
+            let txn = (&*db).begin_read()?;
             do_read_arena_map(&txn)?
         };
 
@@ -72,11 +72,6 @@ impl UnrealCacheBlocking {
             arena_roots: arena_map,
             arena_caches: HashMap::new(),
         })
-    }
-
-    /// Open or create an UnrealCache at the given path.
-    pub fn open(path: &path::Path) -> Result<Self, StorageError> {
-        Self::new(Database::create(path)?)
     }
 
     /// Lists arenas available in this database
@@ -106,7 +101,7 @@ impl UnrealCacheBlocking {
     /// Returns the cache for the given inode or fail.
     fn arena_cache_for_inode(&self, inode: Inode) -> Result<&ArenaCache, StorageError> {
         let arena = self
-            .arena_for_inode(&self.db.begin_read()?, inode)?
+            .arena_for_inode(&(&*self.db).begin_read()?, inode)?
             .ok_or(StorageError::NotFound)?;
         self.arena_cache(arena)
     }
@@ -115,7 +110,7 @@ impl UnrealCacheBlocking {
     pub fn add_arena(
         &mut self,
         arena: Arena,
-        db: Database,
+        db: Arc<Database>,
         blob_dir: PathBuf,
     ) -> anyhow::Result<()> {
         let arena_root = match self.arena_roots.get_by_left(&arena) {
@@ -125,7 +120,7 @@ impl UnrealCacheBlocking {
                     check_arena_compatibility(arena, *existing)?;
                 }
 
-                let txn = self.db.begin_write()?;
+                let txn = (&*self.db).begin_write()?;
                 let arena_root = do_add_arena_root(&txn, arena)?;
                 txn.commit()?;
 
@@ -147,7 +142,7 @@ impl UnrealCacheBlocking {
 
     /// Lookup a directory entry.
     pub fn lookup(&self, parent_inode: Inode, name: &str) -> Result<ReadDirEntry, StorageError> {
-        let txn = self.db.begin_read()?;
+        let txn = (&*self.db).begin_read()?;
         match self.arena_for_inode(&txn, parent_inode)? {
             Some(arena) => self.arena_cache(arena)?.lookup(parent_inode, name),
             None => arena_cache::do_lookup(txn, parent_inode, name),
@@ -165,7 +160,7 @@ impl UnrealCacheBlocking {
 
     /// Return the mtime of the directory.
     pub fn dir_mtime(&self, inode: Inode) -> Result<UnixTime, StorageError> {
-        let txn = self.db.begin_read()?;
+        let txn = (&*self.db).begin_read()?;
         match self.arena_for_inode(&txn, inode)? {
             None => arena_cache::do_dir_mtime(&txn, inode, UnrealCacheBlocking::ROOT_DIR),
             Some(arena) => self.arena_cache(arena)?.dir_mtime(inode),
@@ -173,7 +168,7 @@ impl UnrealCacheBlocking {
     }
 
     pub fn readdir(&self, inode: Inode) -> Result<Vec<(String, ReadDirEntry)>, StorageError> {
-        let txn = self.db.begin_read()?;
+        let txn = (&*self.db).begin_read()?;
         match self.arena_for_inode(&txn, inode)? {
             None => arena_cache::do_readdir(&txn, inode),
             Some(arena) => self.arena_cache(arena)?.readdir(inode),
@@ -199,7 +194,7 @@ impl UnrealCacheBlocking {
     fn alloc_inode_range(&self, arena: Arena) -> Result<(Inode, Inode), StorageError> {
         let arena_root = self.arena_root(arena)?;
 
-        let txn = self.db.begin_write()?;
+        let txn = (&*self.db).begin_write()?;
         let ret = do_alloc_inode_range(&txn, arena_root, RANGE_SIZE)?;
 
         // If the transaction inside the arena cache fails to commit,
@@ -259,12 +254,12 @@ impl UnrealCacheAsync {
             Some(cache_config) => &cache_config.db,
             None => return Ok(None),
         };
-        let mut cache = UnrealCacheBlocking::open(global_db_path)?;
+        let mut cache = UnrealCacheBlocking::new(Arc::new(Database::create(global_db_path)?))?;
         for (arena, arena_cfg) in &config.arenas {
             if let Some(arena_cache_config) = &arena_cfg.cache {
                 cache.add_arena(
                     *arena,
-                    Database::create(&arena_cache_config.db)?,
+                    Arc::new(Database::create(&arena_cache_config.db)?),
                     arena_cache_config.blob_dir.clone(),
                 )?;
             }
@@ -281,27 +276,9 @@ impl UnrealCacheAsync {
     }
 
     /// Create a new cache with the database at the given path.
-    pub async fn open<T>(path: &path::Path, arenas: T) -> Result<Self, anyhow::Error>
+    pub async fn with_db<T>(db: Arc<redb::Database>, arenas: T) -> Result<Self, anyhow::Error>
     where
-        T: IntoIterator<Item = (Arena, PathBuf, PathBuf)> + Send + 'static,
-    {
-        let path = path.to_path_buf();
-
-        task::spawn_blocking(move || {
-            let mut cache = UnrealCacheBlocking::open(&path)?;
-            for (arena, arena_path, blob_dir) in arenas.into_iter() {
-                cache.add_arena(arena, Database::create(arena_path)?, blob_dir)?;
-            }
-
-            Ok::<_, anyhow::Error>(Self::new(cache))
-        })
-        .await?
-    }
-
-    /// Create a new cache with the database at the given path.
-    pub async fn with_db<T>(arenas: T, db: redb::Database) -> Result<Self, anyhow::Error>
-    where
-        T: IntoIterator<Item = (Arena, redb::Database, PathBuf)> + Send + 'static,
+        T: IntoIterator<Item = (Arena, Arc<redb::Database>, PathBuf)> + Send + 'static,
     {
         task::spawn_blocking(move || {
             let mut cache = UnrealCacheBlocking::new(db)?;
@@ -530,7 +507,7 @@ mod tests {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
             let path = tempdir.path().join("unreal.db");
-            let cache = UnrealCacheBlocking::open(&path)?;
+            let cache = UnrealCacheBlocking::new(Arc::new(redb::Database::create(&path)?))?;
             Ok(Self { cache, tempdir })
         }
 
@@ -549,7 +526,7 @@ mod tests {
             }
             self.cache.add_arena(
                 arena,
-                Database::create(child.path())?,
+                Arc::new(Database::create(child.path())?),
                 blob_dir.to_path_buf(),
             )?;
             Ok(())

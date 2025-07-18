@@ -577,7 +577,9 @@ mod tests {
             let root = tempdir.child("root");
             root.create_dir_all()?;
 
-            let index = RealIndexBlocking::open(Arena::from("test"), &path)?.into_async();
+            let arena = Arena::from("test");
+            let index = RealIndexBlocking::new(arena, Arc::new(redb::Database::create(&path)?))?
+                .into_async();
 
             Ok(Self {
                 root,

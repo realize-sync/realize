@@ -78,6 +78,8 @@ impl AsyncSeek for Reader {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::utils::hash;
     use assert_fs::TempDir;
@@ -105,8 +107,11 @@ mod tests {
             let root = tempdir.child("root");
             root.create_dir_all()?;
 
-            let index =
-                RealIndexAsync::open(test_arena(), tempdir.child("index.db").path()).await?;
+            let index = RealIndexAsync::with_db(
+                test_arena(),
+                Arc::new(redb::Database::create(tempdir.child("index.db").path())?),
+            )
+            .await?;
 
             Ok(Self {
                 index,
@@ -143,7 +148,6 @@ mod tests {
         let fixture = Fixture::setup().await?;
         let root = &fixture.root;
         let (path, _) = fixture.add_file("foo/bar.txt", "foobar").await?;
-
         let mut reader = Reader::open(&fixture.index, root.path(), &path).await?;
         let mut str = String::new();
         reader.read_to_string(&mut str).await?;
