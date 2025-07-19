@@ -59,41 +59,50 @@ impl Storage {
         let mut indexed_arenas = HashMap::new();
         let exclude = build_exclude(&config);
 
-        // Collect arena databases for cache creation
-        let mut arena_databases = Vec::new();
-
+        // Create databases in advance, as the same database may be
+        // passed to multiple different subsystems.
+        let mut arena_dbs = HashMap::new();
         for (arena, arena_config) in &config.arenas {
-            // Open the database once for this arena
             let db = redb_utils::open(&arena_config.db).await?;
-
-            // Only create arena storage if a local path is specified
-            if let Some(root) = &arena_config.root {
-                let index = RealIndexAsync::with_db(*arena, db.clone()).await?;
-                let exclude = exclude
-                    .iter()
-                    .map(|p| realize_types::Path::from_real_path_in(p, root))
-                    .flatten()
-                    .collect::<Vec<_>>();
-
-                log::debug!("Watch {root:?}, excluding {exclude:?} for {db:?}");
-                let watcher = RealWatcher::spawn(root, exclude, index.clone()).await?;
-                indexed_arenas.insert(
-                    *arena,
-                    ArenaStorage {
-                        index,
-                        root: root.to_path_buf(),
-                        _watcher: watcher,
-                    },
-                );
-            }
-
-            // Add to arena databases for cache creation (all arenas have cache)
-            arena_databases.push((*arena, db, arena_config.blob_dir.clone()));
+            arena_dbs.insert(*arena, (arena_config, db));
         }
 
-        // Create cache with shared databases (cache is now required)
-        let global_db = redb_utils::open(&config.cache.db).await?;
-        let cache = UnrealCacheAsync::with_db(global_db, arena_databases).await?;
+        let cache = UnrealCacheAsync::with_db(
+            redb_utils::open(&config.cache.db).await?,
+            arena_dbs
+                .iter()
+                .map(|(arena, (config, db))| {
+                    (*arena, Arc::clone(db), config.blob_dir.to_path_buf())
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+
+        for (arena, (arena_config, db)) in arena_dbs {
+            let root = match arena_config.root.as_ref() {
+                Some(p) => p,
+                None => {
+                    continue;
+                }
+            };
+            let index = RealIndexAsync::with_db(arena, db.clone()).await?;
+            let exclude = exclude
+                .iter()
+                .map(|p| realize_types::Path::from_real_path_in(p, root))
+                .flatten()
+                .collect::<Vec<_>>();
+
+            log::debug!("Watch {root:?}, excluding {exclude:?} for {db:?}");
+            let watcher = RealWatcher::spawn(root, exclude, index.clone()).await?;
+            indexed_arenas.insert(
+                arena,
+                ArenaStorage {
+                    index,
+                    root: root.to_path_buf(),
+                    _watcher: watcher,
+                },
+            );
+        }
 
         Ok(Arc::new(Self {
             cache,
