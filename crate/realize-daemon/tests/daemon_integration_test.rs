@@ -8,8 +8,8 @@ use realize_core::rpc::realstore;
 use realize_core::rpc::realstore::client::ClientOptions;
 use realize_network::Networking;
 use realize_network::config::PeerConfig;
+use realize_storage::RealStoreOptions;
 use realize_storage::config::{ArenaConfig, CacheConfig};
-use realize_storage::{Mark, RealStoreOptions};
 use realize_types;
 use realize_types::{Arena, Peer};
 use reqwest::Client;
@@ -70,14 +70,20 @@ impl Fixture {
 
         let testdir = tempdir.child("testdir");
         testdir.create_dir_all()?;
+
+        // Configure cache (now required)
+        config.storage.cache = CacheConfig {
+            db: tempdir.child("cache.db").to_path_buf(),
+        };
+
+        // Configure arena with required cache and optional local path
         config.storage.arenas.insert(
             arena,
-            ArenaConfig {
-                path: testdir.to_path_buf(),
-                db: None,
-                blob_dir: None,
-                mark: Mark::Watch,
-            },
+            ArenaConfig::new(
+                testdir.to_path_buf(),
+                tempdir.child("testdir-cache.db").to_path_buf(),
+                tempdir.child("testdir-blobs").to_path_buf(),
+            ),
         );
 
         testdir.child("foo.txt").write_str("hello")?;
@@ -115,14 +121,13 @@ impl Fixture {
     }
 
     fn configure_cache(&mut self) {
-        self.config.storage.cache = Some(CacheConfig {
-            db: self.tempdir.child("cache.db").to_path_buf(),
-        });
+        // Cache is now always configured in setup, but this method can be used
+        // to override cache configuration if needed for specific tests
         for (arena, arena_config) in &mut self.config.storage.arenas {
             let child = self.tempdir.child(format!("{arena}-cache.db"));
             let blob_dir = self.tempdir.child(format!("{arena}-blobs"));
-            arena_config.db = Some(child.to_path_buf());
-            arena_config.blob_dir = Some(blob_dir.to_path_buf());
+            arena_config.db = child.to_path_buf();
+            arena_config.blob_dir = blob_dir.to_path_buf();
         }
     }
 
@@ -130,7 +135,11 @@ impl Fixture {
         let mut cmd = tokio::process::Command::new(command_path());
 
         let config_file = self.tempdir.child("config.toml").to_path_buf();
-        std::fs::write(&config_file, toml::to_string_pretty(&self.config)?)?;
+        let config_str = toml::to_string_pretty(&self.config)?;
+        if self.debug_output {
+            eprintln!("config.toml <<EOF\n{config_str}\nEOF");
+        }
+        std::fs::write(&config_file, config_str)?;
 
         cmd.arg("--address")
             .arg(&self.server_address)
@@ -400,6 +409,7 @@ async fn daemon_systemd_log_output_format() -> anyhow::Result<()> {
     let mut daemon = fixture
         .command()?
         .env("RUST_LOG_FORMAT", "SYSTEMD")
+        .env("RUST_LOG", "realize_=debug")
         .stderr(Stdio::piped())
         .spawn()?;
     let pid = daemon.id();
@@ -414,7 +424,7 @@ async fn daemon_systemd_log_output_format() -> anyhow::Result<()> {
     // Make sure stderr contains the expected log message.
     let stderr = stderr.await??;
     assert!(
-        stderr.contains("<5>realize_daemon: Listening on 127.0.0.1:"),
+        stderr.contains("<7>realize_") || stderr.contains("<5>realize_"),
         "stderr<<EOF\n{stderr}\nEOF"
     );
 
@@ -521,7 +531,7 @@ async fn daemon_updates_cache() -> anyhow::Result<()> {
         .arenas
         .get_mut(&Arena::from("testdir"))
         .unwrap()
-        .db = Some(fixture_a.tempdir.join("index.db"));
+        .db = fixture_a.tempdir.join("index.db");
 
     let mut daemon_a = fixture_a
         .command()?

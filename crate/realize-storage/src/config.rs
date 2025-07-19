@@ -8,20 +8,14 @@ use crate::mark::Mark;
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
 pub struct StorageConfig {
     pub arenas: HashMap<Arena, ArenaConfig>,
-    pub cache: Option<CacheConfig>,
-}
-
-impl Default for StorageConfig {
-    fn default() -> Self {
-        Self::new()
-    }
+    pub cache: CacheConfig,
 }
 
 impl StorageConfig {
-    pub fn new() -> Self {
+    pub fn new(cache_db: PathBuf) -> Self {
         StorageConfig {
             arenas: HashMap::new(),
-            cache: None,
+            cache: CacheConfig { db: cache_db },
         }
     }
 }
@@ -33,15 +27,42 @@ pub struct CacheConfig {
     pub db: PathBuf,
 }
 
+impl CacheConfig {
+    pub fn new(db: PathBuf) -> Self {
+        Self { db }
+    }
+}
+
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
 pub struct ArenaConfig {
-    /// Local path to the directory where files for that arena are stored.
-    pub path: PathBuf,
-    /// Optional path to the database that contains both index and cache data.
-    pub db: Option<PathBuf>,
-    /// Optional path to the directory where blob files are stored (required for cache functionality).
-    pub blob_dir: Option<PathBuf>,
+    /// Optional local path to the directory where files for that arena are stored.
+    /// If specified, an indexer will be created for this arena.
+    pub root: Option<PathBuf>,
+    /// Path to the database that contains both index and cache data (required for arena cache).
+    pub db: PathBuf,
+    /// Path to the directory where blob files are stored (required for arena cache).
+    pub blob_dir: PathBuf,
     /// The default mark for files and directories in this arena.
-    #[serde(default)]
     pub mark: Mark,
+}
+
+impl ArenaConfig {
+    pub fn new(root: PathBuf, db: PathBuf, blob_dir: PathBuf) -> Self {
+        Self {
+            root: Some(root),
+            db,
+            blob_dir,
+            mark: Mark::default(),
+        }
+    }
+
+    /// Configure an arena without local root folder.
+    pub fn rootless(db: PathBuf, blob_dir: PathBuf) -> Self {
+        Self {
+            root: None,
+            db,
+            blob_dir,
+            mark: Mark::default(),
+        }
+    }
 }

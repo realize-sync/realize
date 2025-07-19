@@ -1,7 +1,6 @@
 use crate::utils::redb_utils;
 
 use super::config::{ArenaConfig, CacheConfig, StorageConfig};
-use super::mark::Mark;
 use super::{Storage, UnrealCacheAsync};
 use realize_types::Arena;
 use std::sync::Arc;
@@ -37,28 +36,26 @@ where
             .into_iter()
             .map(|arena| {
                 let arena_dir = arena_root(dir, arena);
-                let storage_db = arena_dir.join(".storage.db");
                 (
                     arena,
-                    ArenaConfig {
-                        path: arena_dir.clone(),
-                        db: Some(storage_db),
-                        blob_dir: Some(arena_dir.join(".blobs")),
-                        mark: Mark::Watch,
-                    },
+                    ArenaConfig::new(
+                        arena_dir.clone(),
+                        arena_dir.join(".arena.db"),
+                        arena_dir.join(".arena.blobs"),
+                    ),
                 )
             })
             .collect(),
-        cache: Some(CacheConfig {
+        cache: CacheConfig {
             db: dir.join("cache.db"),
-        }),
+        },
     };
 
     for arena_config in config.arenas.values() {
-        fs::create_dir_all(&arena_config.path).await?;
-        if let Some(blob_dir) = &arena_config.blob_dir {
-            fs::create_dir_all(blob_dir).await?;
+        if let Some(root) = &arena_config.root {
+            fs::create_dir_all(root).await?;
         }
+        fs::create_dir_all(&arena_config.blob_dir).await?;
     }
 
     Storage::from_config(&config).await

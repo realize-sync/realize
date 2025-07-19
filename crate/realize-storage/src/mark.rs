@@ -178,12 +178,12 @@ mod tests {
 
     #[test]
     fn test_from_config() {
-        let mut config = ArenaConfig {
-            path: std::path::PathBuf::from("/tmp"),
-            db: None,
-            blob_dir: None,
-            mark: Mark::Keep,
-        };
+        let mut config = ArenaConfig::new(
+            std::path::PathBuf::from("/doesnotexist/arena/root"),
+            std::path::PathBuf::from("/doesnotexist/arena/db"),
+            std::path::PathBuf::from("/doesnotexist/arena/blobs"),
+        );
+        config.mark = Mark::Keep;
 
         let path_marks = PathMarks::from_config(&config);
         assert_eq!(path_marks.default_mark, Mark::Keep);

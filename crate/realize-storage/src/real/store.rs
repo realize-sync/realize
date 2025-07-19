@@ -62,11 +62,10 @@ pub struct RealStore {
 impl RealStore {
     /// Create a [RealStore] from a set of [ArenaConfig].
     pub fn from_config(arenas: &HashMap<Arena, ArenaConfig>) -> Self {
-        Self::new(
-            arenas
-                .iter()
-                .map(|(arena, config)| (*arena, config.path.to_path_buf())),
-        )
+        Self::new(arenas.iter().filter_map(|(arena, config)| {
+            // Only include arenas that have a local path specified
+            config.root.as_ref().map(|path| (*arena, path.clone()))
+        }))
     }
 
     /// Create and fill a [RealStore].

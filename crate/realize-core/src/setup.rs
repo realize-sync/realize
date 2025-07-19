@@ -41,10 +41,7 @@ impl SetupHelper {
     ///
     /// A local cache must be configured.
     pub async fn export_nfs(&mut self, addr: SocketAddr) -> anyhow::Result<()> {
-        let cache = self
-            .storage
-            .cache()
-            .ok_or_else(|| anyhow::anyhow!("cache.db must be set in the configuration"))?;
+        let cache = self.storage.cache().expect("cache is always configured");
 
         let downloader = Downloader::new(self.household.clone(), cache.clone());
 
@@ -66,10 +63,8 @@ impl SetupHelper {
         let mut server = Server::new(networking.clone());
         realstore::server::register(&mut server, storage.store().clone());
 
-        let has_cache = storage.cache().is_some();
-        if has_cache {
-            household.keep_all_connected()?;
-        }
+        // Cache is always configured now
+        household.keep_all_connected()?;
         household.register(&mut server);
 
         Ok(Arc::new(server))
@@ -79,48 +74,50 @@ impl SetupHelper {
 /// Checks that all directories in the config file are accessible.
 fn check_directory_access(arenas: &HashMap<Arena, ArenaConfig>) -> anyhow::Result<()> {
     for (arena, config) in arenas {
-        let path = &config.path;
-        log::debug!("Checking directory {}: {}", arena, config.path.display());
-        if !path.exists() {
-            anyhow::bail!(
-                "LocalArena '{}' (id: {}) does not exist",
-                path.display(),
-                arena
-            );
-        }
-        if !std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
-            anyhow::bail!(
-                "Path '{}' (id: {}) is not a directory",
-                path.display(),
-                arena
-            );
-        }
-
-        // Check read access
-        if std::fs::read_dir(path).is_err() {
-            anyhow::bail!(
-                "No read access to directory '{}' (id: {})",
-                path.display(),
-                arena
-            );
-        }
-
-        // Check write access (warn only)
-        let testfile = path.join(".realize_write_test");
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&testfile)
-        {
-            Ok(_) => {
-                let _ = std::fs::remove_file(&testfile);
-            }
-            Err(_) => {
-                log::warn!(
-                    "No write access to directory '{}' (id: {})",
-                    path.display(),
+        // Only check arenas that have a local path specified
+        if let Some(root) = &config.root {
+            log::debug!("Checking directory {}: {}", arena, root.display());
+            if !root.exists() {
+                anyhow::bail!(
+                    "LocalArena '{}' (id: {}) does not exist",
+                    root.display(),
                     arena
                 );
+            }
+            if !std::fs::metadata(root).map(|m| m.is_dir()).unwrap_or(false) {
+                anyhow::bail!(
+                    "Path '{}' (id: {}) is not a directory",
+                    root.display(),
+                    arena
+                );
+            }
+
+            // Check read access
+            if std::fs::read_dir(root).is_err() {
+                anyhow::bail!(
+                    "No read access to directory '{}' (id: {})",
+                    root.display(),
+                    arena
+                );
+            }
+
+            // Check write access (warn only)
+            let testfile = root.join(".realize_write_test");
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&testfile)
+            {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&testfile);
+                }
+                Err(_) => {
+                    log::warn!(
+                        "No write access to directory '{}' (id: {})",
+                        root.display(),
+                        arena
+                    );
+                }
             }
         }
     }
