@@ -2323,6 +2323,7 @@ dependencies = [
  "realize-types",
  "reqwest",
  "rustls",
+ "scopeguard",
  "serde",
  "signal-hook",
  "signal-hook-tokio",

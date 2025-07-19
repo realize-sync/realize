@@ -3,7 +3,6 @@ use assert_fs::prelude::*;
 use nfs3_client::Nfs3ConnectionBuilder;
 use nfs3_client::tokio::TokioConnector;
 use nfs3_types::nfs3::{Nfs3Result, READDIR3args};
-use predicates::prelude::*;
 use realize_core::config::Config;
 use realize_core::rpc::realstore;
 use realize_core::rpc::realstore::client::ClientOptions;
@@ -14,12 +13,18 @@ use realize_storage::{Mark, RealStoreOptions};
 use realize_types;
 use realize_types::{Arena, Peer};
 use reqwest::Client;
+use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Duration;
 use tarpc::context;
 use tokio::io::AsyncBufReadExt as _;
+use tokio::io::AsyncWriteExt as _;
+use tokio::process::Child;
 use tokio::process::Command;
+use tokio::task::JoinHandle;
 
 fn command_path() -> PathBuf {
     // Expecting a path for the current exe to look like
@@ -42,12 +47,21 @@ struct Fixture {
     pub tempdir: TempDir,
     pub server_address: String,
     pub server_privkey: PathBuf,
+    pub debug_output: bool,
 }
 
 impl Fixture {
     pub async fn setup() -> anyhow::Result<Self> {
         let _ = env_logger::try_init();
 
+        // To debug, set env variable TEST_DEBUG to get output from
+        // the commands and pass --nocapture.
+        //
+        // Example: TEST_DEBUG=1 cargo nextest run -p realize-daemon --test daemon_integration_test --nocapture
+        let debug = env::var("TEST_DEBUG").is_ok_and(|v| !v.is_empty());
+        if debug {
+            eprintln!("TEST_DEBUG detected");
+        }
         let mut config = Config::new();
         let arena = Arena::from("testdir");
 
@@ -87,7 +101,8 @@ impl Fixture {
         );
 
         let server_privkey = resources.join("a.key");
-        let server_address = "127.0.0.1:0".to_string(); // dynamic
+        let server_port = portpicker::pick_unused_port().expect("No ports free");
+        let server_address = format!("127.0.0.1:{server_port}");
         Ok(Self {
             config,
             resources,
@@ -95,6 +110,7 @@ impl Fixture {
             tempdir,
             server_address,
             server_privkey,
+            debug_output: debug,
         })
     }
 
@@ -122,14 +138,108 @@ impl Fixture {
             .arg(&self.server_privkey)
             .arg("--config")
             .arg(config_file)
-            .env_remove("RUST_LOG")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .kill_on_drop(true);
+
+        if self.debug_output {
+            cmd.env("RUST_LOG", "debug");
+        } else {
+            cmd.env_remove("RUST_LOG");
+        }
 
         Ok(cmd)
     }
+
+    /// Collect stderr from a child process, optionally print it out.
+    ///
+    /// Set env variable TEST_DEBUG=1 to get child process output as
+    /// it comes.
+    ///
+    /// Call it as early as possible, just after creating the process,
+    /// so process output is immediately available.
+    fn collect_stderr(
+        &self,
+        name: &'static str,
+        daemon: &mut Child,
+    ) -> JoinHandle<anyhow::Result<String>> {
+        let debug_output = self.debug_output;
+        let mut stderr = daemon
+            .stderr
+            .take()
+            .expect("call Command::stderr(Stdio::piped())");
+        tokio::spawn(async move {
+            let reader = tokio::io::BufReader::new(&mut stderr);
+            let mut lines = reader.lines();
+            let mut all_lines = vec![];
+
+            while let Ok(Some(line)) = lines.next_line().await {
+                if debug_output {
+                    eprintln!("[{name}] STDERR: {line}");
+                }
+                all_lines.push(line);
+            }
+
+            Ok(all_lines.join("\n"))
+        })
+    }
+
+    fn collect_stdout(
+        &self,
+        name: &'static str,
+        daemon: &mut Child,
+    ) -> JoinHandle<anyhow::Result<String>> {
+        let debug_output = self.debug_output;
+        let mut stdout = daemon
+            .stdout
+            .take()
+            .expect("call Command::stdout(Stdio::piped())");
+        tokio::spawn(async move {
+            let reader = tokio::io::BufReader::new(&mut stdout);
+            let mut lines = reader.lines();
+            let mut all_lines = vec![];
+
+            while let Ok(Some(line)) = lines.next_line().await {
+                if debug_output {
+                    eprintln!("[{name}] STDOUT: {line}");
+                }
+                all_lines.push(line);
+            }
+
+            Ok(all_lines.join("\n"))
+        })
+    }
+
+    async fn assert_listening(&self) {
+        assert_listening_to(&self.server_address).await;
+    }
+}
+
+async fn assert_listening_to(address: &str) {
+    for _ in 0..150 {
+        // 150 * 100ms = 15 seconds
+        match tokio::net::TcpStream::connect(address).await {
+            Ok(mut stream) => {
+                let _ = stream.shutdown().await;
+                return;
+            }
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+
+    panic!("Server never listened on {address}");
+}
+
+fn kill(pid: Option<u32>) -> anyhow::Result<()> {
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid.expect("no pid") as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )?;
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -140,19 +250,19 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
     // its output, so we know what port to connect to.
     let mut daemon = fixture
         .command()?
-        .env(
-            "RUST_LOG",
-            "realize_network::network=debug,realize_daemon=debug",
-        )
+        // We're looking for specific log output on stderr
+        .env("RUST_LOG", "realize_=debug")
+        .stderr(Stdio::piped())
         .spawn()?;
+    let pid = daemon.id();
+    scopeguard::defer! { let _ = kill(pid); }
+    let stderr = fixture.collect_stderr("daemon", &mut daemon);
 
-    // The first line that's output to stdout must be Listening on
-    // <address>:<port>. Anything else is an error.
-    let portstr = wait_for_listening_port(daemon.stdout.as_mut().unwrap()).await?;
+    fixture.assert_listening().await;
 
     let a = Peer::from("a");
     let mut peers = fixture.config.network.peers.clone();
-    peers.get_mut(&a).expect("PeerConfig of a").address = Some(format!("127.0.0.1:{portstr}"));
+    peers.get_mut(&a).expect("PeerConfig of a").address = Some(fixture.server_address.clone());
 
     let networking = Networking::from_config(&peers, &fixture.resources.join("b.key"))?;
     let client = realstore::client::connect(&networking, a, ClientOptions::default()).await?;
@@ -172,11 +282,10 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
     daemon.start_kill()?;
 
     // Make sure stderr contains the expected log message.
-    let stdout = collect_stdout(daemon.stdout.as_mut().unwrap()).await?;
-    let stderr = collect_stderr(daemon.stderr.as_mut().unwrap()).await?;
+    let stderr = stderr.await??;
     assert!(
         stderr.contains("Accepted peer b from "),
-        "stderr: {stderr} stdout: {stdout}"
+        "stderr<<EOF\n{stderr}\nEOF"
     );
 
     Ok(())
@@ -191,15 +300,16 @@ async fn metrics_endpoint_works() -> anyhow::Result<()> {
 
     // Run process in the background and in a way that allows reading
     // its output, so we know what port to connect to.
-    let mut daemon = fixture
+    let daemon = fixture
         .command()?
         .arg("--metrics-addr")
         .arg(&metrics_addr)
         .spawn()?;
+    let pid = daemon.id();
+    scopeguard::defer! { let _ = kill(pid); }
 
-    // Waiting for the daemon to be ready, to be sure the metrics
-    // endpoint is up.
-    wait_for_listening_port(daemon.stdout.as_mut().unwrap()).await?;
+    fixture.assert_listening().await;
+    assert_listening_to(&metrics_addr).await;
 
     // Now test the endpoint
     let client = Client::new();
@@ -230,13 +340,12 @@ async fn daemon_fails_on_missing_directory() -> anyhow::Result<()> {
     fs::remove_dir_all(&fixture.testdir)?;
 
     let output = fixture.command()?.output().await?;
-    assert!(!output.status.success());
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr<<EOF\n{stderr}\nEOF");
     assert!(
         stderr.contains("does not exist"),
-        "stderr: {stderr}, stdout: {stdout}"
+        "stderr<<EOF\n{stderr}\nEOF"
     );
 
     Ok(())
@@ -248,13 +357,12 @@ async fn daemon_fails_on_unreadable_directory() -> anyhow::Result<()> {
     std::fs::set_permissions(&fixture.testdir, std::fs::Permissions::from_mode(0o000))?;
 
     let output = fixture.command()?.output().await?;
-    assert!(!output.status.success());
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr<<EOF\n{stderr}\nEOF");
     assert!(
         stderr.contains("No read access"),
-        "stderr: {stderr}, stdout: {stdout}"
+        "stderr<<EOF\n{stderr}\nEOF"
     );
 
     Ok(())
@@ -265,17 +373,20 @@ async fn daemon_warns_on_unwritable_directory() -> anyhow::Result<()> {
     let fixture = Fixture::setup().await?;
     std::fs::set_permissions(&fixture.testdir, std::fs::Permissions::from_mode(0o500))?; // read+exec only
 
-    let mut daemon = fixture.command()?.spawn()?;
-    let _ = wait_for_listening_port(daemon.stdout.as_mut().unwrap()).await?;
+    let mut daemon = fixture.command()?.stderr(Stdio::piped()).spawn()?;
+    let pid = daemon.id();
+    scopeguard::defer! { let _ = kill(pid); }
+
+    let stderr = fixture.collect_stderr("daemon", &mut daemon);
+    fixture.assert_listening().await;
 
     // Kill to make sure stderr ends
     daemon.start_kill()?;
 
-    let stdout = collect_stdout(daemon.stdout.as_mut().unwrap()).await?;
-    let stderr = collect_stderr(daemon.stderr.as_mut().unwrap()).await?;
+    let stderr = stderr.await??;
     assert!(
         stderr.contains("No write access"),
-        "stderr: {stderr}, stdout: {stdout}"
+        "stderr<<EOF\n{stderr}\nEOF"
     );
     Ok(())
 }
@@ -289,18 +400,22 @@ async fn daemon_systemd_log_output_format() -> anyhow::Result<()> {
     let mut daemon = fixture
         .command()?
         .env("RUST_LOG_FORMAT", "SYSTEMD")
+        .stderr(Stdio::piped())
         .spawn()?;
+    let pid = daemon.id();
+    scopeguard::defer! { let _ = kill(pid); }
 
-    wait_for_listening_port(daemon.stdout.as_mut().unwrap()).await?;
+    let stderr = fixture.collect_stderr("daemon", &mut daemon);
+    fixture.assert_listening().await;
+
     // Kill to make sure stderr ends
     daemon.start_kill()?;
 
     // Make sure stderr contains the expected log message.
-    let stdout = collect_stdout(daemon.stdout.as_mut().unwrap()).await?;
-    let stderr = collect_stderr(daemon.stderr.as_mut().unwrap()).await?;
+    let stderr = stderr.await??;
     assert!(
         stderr.contains("<5>realize_daemon: Listening on 127.0.0.1:"),
-        "stderr: {stderr} stdout: {stdout}"
+        "stderr<<EOF\n{stderr}\nEOF"
     );
 
     Ok(())
@@ -316,25 +431,22 @@ async fn daemon_interrupted() -> anyhow::Result<()> {
             "RUST_LOG",
             "realize_network::network::tcp=debug,realize_daemon=debug",
         )
+        .stderr(Stdio::piped())
         .spawn()?;
+    let pid = daemon.id();
+    scopeguard::defer! { let _ = kill(pid); }
 
-    let _ = wait_for_listening_port(daemon.stdout.as_mut().unwrap()).await?;
-    let pid = daemon.id().expect("no pid");
-    nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(pid as i32),
-        nix::sys::signal::Signal::SIGTERM,
-    )?;
+    let stderr = fixture.collect_stderr("daemon", &mut daemon);
+    fixture.assert_listening().await;
+
+    kill(daemon.id())?;
 
     let status = daemon.wait().await?;
     assert_eq!(status.code(), Some(0));
 
     // Make sure stderr contains the expected log message.
-    let stdout = collect_stdout(daemon.stdout.as_mut().unwrap()).await?;
-    let stderr = collect_stderr(daemon.stderr.as_mut().unwrap()).await?;
-    assert!(
-        stderr.contains("Interrupted"),
-        "stderr: {stderr} stdout: {stdout}"
-    );
+    let stderr = stderr.await??;
+    assert!(stderr.contains("Interrupted"), "stderr<<EOF\n{stderr}\nEOF");
 
     Ok(())
 }
@@ -350,11 +462,11 @@ async fn daemon_exports_nfs() -> anyhow::Result<()> {
 
     // Run process in the background and in a way that allows reading
     // its output, so we know what port to connect to.
-    let mut daemon = fixture.command()?.arg("--nfs").arg(nfs_addr).spawn()?;
+    let mut daemon = fixture.command()?.arg("--nfs").arg(&nfs_addr).spawn()?;
+    let pid = daemon.id();
+    scopeguard::defer! { let _ = kill(pid); }
 
-    // The first line that's output to stdout must be Listening on
-    // <address>:<port>. Anything else is an error.
-    wait_for_listening_port(daemon.stdout.as_mut().unwrap()).await?;
+    assert_listening_to(&nfs_addr).await;
 
     log::debug!("Connecting to NFS port {nfs_port}");
     let mut connection =
@@ -410,8 +522,20 @@ async fn daemon_updates_cache() -> anyhow::Result<()> {
         .get_mut(&Arena::from("testdir"))
         .unwrap()
         .db = Some(fixture_a.tempdir.join("index.db"));
-    let mut daemon_a = fixture_a.command()?.spawn()?;
-    let a_port = wait_for_listening_port(daemon_a.stdout.as_mut().unwrap()).await?;
+
+    let mut daemon_a = fixture_a
+        .command()?
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let pid = daemon_a.id();
+    scopeguard::defer! { let _ = kill(pid); }
+
+    // collect_stderr and collect_stdout are used here to add a prefix
+    // to the daemon output and tell one from the other.
+    fixture_a.collect_stderr("A", &mut daemon_a);
+    fixture_a.collect_stdout("A", &mut daemon_a);
+    fixture_a.assert_listening().await;
 
     let mut fixture_b = Fixture::setup().await?;
     fixture_b.server_privkey = fixture_b.resources.join("b.key");
@@ -421,17 +545,25 @@ async fn daemon_updates_cache() -> anyhow::Result<()> {
         .peers
         .get_mut(&Peer::from("a"))
         .expect("peer a")
-        .address = Some(format!("127.0.0.1:{a_port}"));
+        .address = Some(fixture_a.server_address);
 
     let nfs_port = portpicker::pick_unused_port().expect("No ports free");
     let nfs_addr = format!("127.0.0.1:{nfs_port}");
     fixture_b.configure_cache();
 
-    let mut daemon_b = fixture_b.command()?.arg("--nfs").arg(nfs_addr).spawn()?;
+    let mut daemon_b = fixture_b
+        .command()?
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .arg("--nfs")
+        .arg(&nfs_addr)
+        .spawn()?;
+    let pid = daemon_b.id();
+    scopeguard::defer! { let _ = kill(pid); }
 
-    // The first line that's output to stdout must be Listening on
-    // <address>:<port>. Anything else is an error.
-    wait_for_listening_port(daemon_b.stdout.as_mut().unwrap()).await?;
+    fixture_b.collect_stderr("B", &mut daemon_b);
+    fixture_b.collect_stdout("B", &mut daemon_b);
+    assert_listening_to(&nfs_addr).await;
 
     tokio::fs::write(fixture_a.testdir.join("hello.txt"), "Hello, world!").await?;
 
@@ -507,46 +639,4 @@ async fn daemon_updates_cache() -> anyhow::Result<()> {
     daemon_a.start_kill()?;
 
     Ok(())
-}
-
-async fn collect_stderr(stderr: &mut tokio::process::ChildStderr) -> anyhow::Result<String> {
-    let reader = tokio::io::BufReader::new(stderr);
-    let mut lines = reader.lines();
-    let mut all_lines = vec![];
-    while let Ok(Some(line)) = lines.next_line().await {
-        eprintln!("{line}");
-        all_lines.push(line);
-    }
-
-    Ok(all_lines.join("\n"))
-}
-
-async fn collect_stdout(stdout: &mut tokio::process::ChildStdout) -> anyhow::Result<String> {
-    let reader = tokio::io::BufReader::new(stdout);
-    let mut lines = reader.lines();
-    let mut all_lines = vec![];
-    while let Ok(Some(line)) = lines.next_line().await {
-        eprintln!("{line}");
-        all_lines.push(line);
-    }
-
-    Ok(all_lines.join("\n"))
-}
-
-async fn wait_for_listening_port(
-    stdout: &mut tokio::process::ChildStdout,
-) -> anyhow::Result<String> {
-    let reader = tokio::io::BufReader::new(stdout);
-    let mut lines = reader.lines();
-    let line = lines.next_line().await?.unwrap();
-    assert!(
-        predicate::str::starts_with("Listening on").eval(&line),
-        "Unexpected output: {line}"
-    );
-
-    Ok(line
-        .split(":")
-        .last()
-        .expect("Unexpected output: {line}")
-        .to_string())
 }
