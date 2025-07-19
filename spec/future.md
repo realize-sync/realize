@@ -33,6 +33,7 @@ Create a DecisionMarker type, defined in
  - an engine to update (EngineAsync)
  - a cache to query (UnrealCacheAsync)
  - an index to query and to watch (RealIndexAsync)
+ - a PathMarks type, defined in [marks.rs](../crate/realize-storage/src/mark.rs)
 
 For A, DecisionMarker::update(notification) should be called from
 `do_notify` in
@@ -41,7 +42,9 @@ calling cache.update. This requires creating and then keeping an
 Engine and DecisionMarker per-arena in `Storage`, defined in the
 [storage](../crate/realize-storage/src/lib.rs) module. Use the Arena
 database when creating the engine, just like for the Index and
-ArenaCaches. It would be a good idea to just have a method
+ArenaCaches.
+
+It would be a good idea to just have a method
 `Storage::update(notification)` to dispatch to the cache and
 DecisionMaker, so Household doesn't need to know about both of them.
 
@@ -50,12 +53,53 @@ index history using AsyncRealIndex::watch_history and fetching history
 entries as needed for as long as the DecisionMaker instance lives.
 
 C is described in the section #marksxattrs. It's not useful unless
-#markxattrs is implemented.
+#markxattrs is implemented, so it outside the scope of this section.
 
+Task list:
 
+1. Add a type DecisionMaker into
+   [engine.rs](../crate/realize-storage/src/engine.rs) that takes an
+   engine, cache, index, PathMarks and has an empty method
+   update(notification)
 
+   Run `cargo check -p realize-storage --tests`, fix any issues
 
-Task list: TBD
+2. Create a DecisionMaker as well as an Engine for each arena and
+   store it into ArenaStorage in
+   [storage](../crate/realize-storage/src/lib.rs)
+
+   Run `cargo check -p realize-storage --tests`, then `cargo test -p
+   realize-storage`, fix any issues.
+
+3. Add a method Storage::update(notification) that calls the update
+   method on the cache, then on the decisionmaker. Call this new
+   method from `do_notify` in
+   [household.rs](../crate/realize-core/src/rpc/household.rs) instead
+   of calling the cache method directly.
+
+   Run `cargo check -p realize-storage --tests`, then `cargo test -p
+   realize-storage`, fix any issues.
+
+4. Implement the rules above inside DecisionMaker as a private
+   function check(path) -> anyhow::Result<Option<Decision>>. The rule
+   checks the engine, cache, index, marks to come to a decision about
+   what to do with the path. Add unit tests for it.
+
+   Run the new tests, make sure they pass.
+
+5. Fill in DecisionMaker::update(notification): decide what to do when
+   a path changes in the cache and update any existing entry in the
+   Engine. Add unit tests for it.
+
+   Run the new tests, make sure they pass.
+
+6. Spawn a task that watches RealIndexAsync, getting a watcher, then
+   querying the history when changes are reported, and updates
+   decisions for paths that are reported there. Spawn that from
+   Storage, just after creating the DecisionMaker. Add unit tests in
+   the DecisionMaker..
+
+   Run the new tests, make sure they pass.
 
 ## Update marks from xattrs {#marksxattrs}
 
