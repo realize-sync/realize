@@ -3,9 +3,9 @@ use super::types::{
     BlobId, DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry,
     InodeAssignment, PeerTableEntry, ReadDirEntry,
 };
-use crate::Blob;
 use crate::real::notifier::{Notification, Progress};
 use crate::utils::holder::Holder;
+use crate::{Blob, engine};
 use crate::{Inode, StorageError};
 use realize_types::{Arena, ByteRanges, Hash, Path, Peer, UnixTime};
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
@@ -204,9 +204,15 @@ impl ArenaCache {
                     let entry = FileTableEntry::new(path, size, mtime, hash, parent_inode);
 
                     if !get_file_entry(&file_table, file_inode, None)?.is_some() {
-                        self.do_write_file_entry(&mut file_table, file_inode, None, &entry)?;
+                        self.do_write_file_entry(&txn, &mut file_table, file_inode, None, &entry)?;
                     }
-                    self.do_write_file_entry(&mut file_table, file_inode, Some(peer), &entry)?;
+                    self.do_write_file_entry(
+                        &txn,
+                        &mut file_table,
+                        file_inode,
+                        Some(peer),
+                        &entry,
+                    )?;
                 }
             }
             Notification::Replace {
@@ -230,14 +236,26 @@ impl ArenaCache {
                 {
                     // If it overwrites the entry that's current, it's
                     // necessarily an entry we want.
-                    self.do_write_file_entry(&mut file_table, file_inode, None, &entry)?;
-                    self.do_write_file_entry(&mut file_table, file_inode, Some(peer), &entry)?;
+                    self.do_write_file_entry(&txn, &mut file_table, file_inode, None, &entry)?;
+                    self.do_write_file_entry(
+                        &txn,
+                        &mut file_table,
+                        file_inode,
+                        Some(peer),
+                        &entry,
+                    )?;
                 } else if let Some(e) = get_file_entry(&file_table, file_inode, Some(peer))?
                     && e.content.hash == old_hash
                 {
                     // If it overwrites the peer's entry, we want to
                     // keep that.
-                    self.do_write_file_entry(&mut file_table, file_inode, Some(peer), &entry)?;
+                    self.do_write_file_entry(
+                        &txn,
+                        &mut file_table,
+                        file_inode,
+                        Some(peer),
+                        &entry,
+                    )?;
                 }
             }
             Notification::Remove {
@@ -269,9 +287,9 @@ impl ArenaCache {
                 let mut file_table = txn.open_table(FILE_TABLE)?;
                 let entry = FileTableEntry::new(path, size, mtime, hash, parent_inode);
                 if !get_file_entry(&file_table, file_inode, None)?.is_some() {
-                    self.do_write_file_entry(&mut file_table, file_inode, None, &entry)?;
+                    self.do_write_file_entry(&txn, &mut file_table, file_inode, None, &entry)?;
                 }
-                self.do_write_file_entry(&mut file_table, file_inode, Some(peer), &entry)?;
+                self.do_write_file_entry(&txn, &mut file_table, file_inode, Some(peer), &entry)?;
             }
             Notification::CatchupComplete { index, .. } => {
                 self.do_delete_marked_files(&txn, peer)?;
@@ -331,6 +349,7 @@ impl ArenaCache {
     /// Write an entry in the file table, overwriting any existing one.
     fn do_write_file_entry(
         &self,
+        txn: &WriteTransaction,
         file_table: &mut redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
         file_inode: Inode,
         peer: Option<Peer>,
@@ -347,14 +366,15 @@ impl ArenaCache {
             }
         };
 
-        // If this is overwriting the default entry (no peer), check if the old entry had a blob
         if peer.is_none() {
+            // If this is overwriting the default entry (no peer), check if the old entry had a blob
             if let Some(old_entry) = file_table.get((file_inode, ""))? {
                 let old_entry = old_entry.value().parse()?;
                 if let Some(blob_id) = old_entry.content.blob {
                     self.blobstore.delete_blob(blob_id)?;
                 }
             }
+            engine::mark_dirty(txn, &entry.content.path)?;
         }
 
         file_table.insert((file_inode, key), Holder::new(entry)?)?;
@@ -365,6 +385,7 @@ impl ArenaCache {
     /// Remove a file entry for a specific peer.
     fn do_rm_file_entry(
         &self,
+        txn: &WriteTransaction,
         file_table: &mut redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
         dir_table: &mut redb::Table<'_, (Inode, &str), Holder<DirTableEntry>>,
         parent_inode: Inode,
@@ -374,11 +395,15 @@ impl ArenaCache {
     ) -> Result<(), StorageError> {
         let peer_str = peer.as_str();
 
+        let mut path = None;
         let mut entries = HashMap::new();
         for elt in file_table.range((inode, "")..(inode.plus(1), ""))? {
             let (key, value) = elt?;
             let key = key.value().1;
             let entry = value.value().parse()?;
+            if path.is_none() {
+                path = Some(entry.content.path.clone());
+            }
             entries.insert(key.to_string(), entry);
         }
 
@@ -410,6 +435,10 @@ impl ArenaCache {
             // This was the last peer. Remove the default entry as well as
             // the directory entry.
             // TODO: delete empty directories, up to the arena root
+
+            if let Some(path) = path {
+                engine::mark_dirty(&txn, &path)?;
+            }
 
             // Check if the default entry has a blob and delete it
             if let Some(default_entry) = file_table.get((inode, ""))? {
@@ -452,7 +481,7 @@ impl ArenaCache {
             }
         });
         if let Some((_, entry)) = most_recent {
-            self.do_write_file_entry(file_table, inode, None, &entry)?;
+            self.do_write_file_entry(txn, file_table, inode, None, &entry)?;
         }
 
         Ok(())
@@ -482,6 +511,7 @@ impl ArenaCache {
         let inode = dir_entry.inode;
         let mut file_table = txn.open_table(FILE_TABLE)?;
         self.do_rm_file_entry(
+            txn,
             &mut file_table,
             &mut dir_table,
             parent_inode,
@@ -512,6 +542,7 @@ impl ArenaCache {
             let (_, inode) = elt.0.value();
             let parent_inode = elt.1.value();
             self.do_rm_file_entry(
+                txn,
                 &mut file_table,
                 &mut directory_table,
                 parent_inode,
@@ -538,6 +569,66 @@ impl ArenaCache {
     ) -> Result<(), StorageError> {
         self.blobstore.extend_local_availability(blob_id, new_range)
     }
+}
+
+/// Mark files within the cache dirty.
+///
+/// If the inode is a file in the cache, it is marked dirty.
+//
+/// If the inode is a directory in the cache, all the files within it
+/// and its subdirectories are marked dirty.
+///
+/// If the inode is not in the cache, the function does nothing.
+#[allow(dead_code)]
+pub(crate) fn mark_dirty_recursive(
+    txn: &WriteTransaction,
+    inode: Inode,
+) -> Result<(), StorageError> {
+    let file_table = txn.open_table(FILE_TABLE)?;
+    mark_file_dirty(txn, &file_table, inode)?;
+
+    let dir_table = txn.open_table(DIRECTORY_TABLE)?;
+    mark_dir_dirty(txn, &dir_table, &file_table, inode)
+}
+
+#[allow(dead_code)]
+fn mark_file_dirty(
+    txn: &WriteTransaction,
+    file_table: &redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
+    inode: Inode,
+) -> Result<(), StorageError> {
+    if let Some(entry) = file_table.get((inode, ""))? {
+        engine::mark_dirty(txn, &entry.value().parse()?.content.path)?;
+    }
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn mark_dir_dirty(
+    txn: &WriteTransaction,
+    dir_table: &redb::Table<'_, (Inode, &str), Holder<DirTableEntry>>,
+    file_table: &redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
+    inode: Inode,
+) -> Result<(), StorageError> {
+    for item in dir_table.range((inode, "")..(inode.plus(1), ""))? {
+        let (key, value) = item?;
+        if key.value().0 != inode {
+            break;
+        }
+        if let DirTableEntry::Regular(entry) = value.value().parse()? {
+            match entry.assignment {
+                InodeAssignment::File => {
+                    mark_file_dirty(txn, file_table, entry.inode)?;
+                }
+                InodeAssignment::Directory => {
+                    mark_dir_dirty(txn, dir_table, file_table, entry.inode)?;
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub(crate) fn do_readdir(
@@ -910,14 +1001,17 @@ fn do_unmark_peer_file(
 
 #[cfg(test)]
 mod tests {
-    use crate::StorageError;
     use crate::real::notifier::Notification;
     use crate::unreal::cache::UnrealCacheBlocking;
     use crate::unreal::types::{FileMetadata, InodeAssignment};
     use crate::utils::redb_utils;
+    use crate::{Inode, StorageError, engine};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Hash, Path, Peer, UnixTime};
+    use redb::{ReadTransaction, WriteTransaction};
+
+    use super::mark_dirty_recursive;
 
     use super::ArenaCache;
 
@@ -970,6 +1064,28 @@ mod tests {
 
         fn arena_cache(&self) -> anyhow::Result<&ArenaCache> {
             Ok(self.cache.arena_cache(self.arena)?)
+        }
+
+        fn begin_read(&self) -> anyhow::Result<ReadTransaction> {
+            let acache = self.arena_cache()?;
+
+            Ok(acache.db.begin_read()?)
+        }
+
+        fn begin_write(&self) -> anyhow::Result<WriteTransaction> {
+            let acache = self.arena_cache()?;
+
+            Ok(acache.db.begin_write()?)
+        }
+
+        fn clear_dirty(&self) -> anyhow::Result<()> {
+            let acache = self.arena_cache()?;
+
+            let txn = acache.db.begin_write()?;
+            while engine::take_dirty(&txn)?.is_some() {}
+            txn.commit()?;
+
+            Ok(())
         }
 
         fn parent_dir_mtime(&self, arena: Arena, path: &Path) -> anyhow::Result<UnixTime> {
@@ -1053,6 +1169,18 @@ mod tests {
     }
 
     #[test]
+    fn add_marks_dirty() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let file_path = Path::parse("a/b/c.txt")?;
+
+        fixture.add_file(&file_path, 100, &test_time())?;
+
+        assert!(engine::is_dirty(&fixture.begin_read()?, &file_path)?);
+
+        Ok(())
+    }
+
+    #[test]
     fn replace_existing_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena())?;
         let cache = &fixture.cache;
@@ -1089,6 +1217,83 @@ mod tests {
         let metadata = acache.file_metadata(inode)?;
         assert_eq!(metadata.size, 200);
         assert_eq!(metadata.mtime, later_time());
+
+        Ok(())
+    }
+
+    #[test]
+    fn replace_marks_dirty() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let cache = &fixture.cache;
+        let peer = test_peer();
+        let arena = test_arena();
+        let file_path = Path::parse("file.txt")?;
+
+        cache.update(
+            peer,
+            Notification::Add {
+                arena: arena,
+                index: 0,
+                path: file_path.clone(),
+                mtime: test_time(),
+                size: 100,
+                hash: test_hash(),
+            },
+        )?;
+        fixture.clear_dirty()?;
+
+        cache.update(
+            peer,
+            Notification::Replace {
+                arena: arena,
+                index: 0,
+                path: file_path.clone(),
+                mtime: later_time(),
+                size: 200,
+                hash: Hash([2u8; 32]),
+                old_hash: test_hash(),
+            },
+        )?;
+        assert!(engine::is_dirty(&fixture.begin_read()?, &file_path)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn ignored_replace_does_not_mark_dirty() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let cache = &fixture.cache;
+        let peer = test_peer();
+        let arena = test_arena();
+        let file_path = Path::parse("file.txt")?;
+
+        cache.update(
+            peer,
+            Notification::Add {
+                arena: arena,
+                index: 0,
+                path: file_path.clone(),
+                mtime: test_time(),
+                size: 100,
+                hash: Hash([1u8; 32]),
+            },
+        )?;
+        fixture.clear_dirty()?;
+
+        // Replace is ignored because old_hash != current hash.
+        cache.update(
+            peer,
+            Notification::Replace {
+                arena: arena,
+                index: 0,
+                path: file_path.clone(),
+                mtime: later_time(),
+                size: 200,
+                hash: Hash([3u8; 32]),
+                old_hash: Hash([2u8; 32]),
+            },
+        )?;
+        assert!(!engine::is_dirty(&fixture.begin_read()?, &file_path)?);
 
         Ok(())
     }
@@ -1163,6 +1368,24 @@ mod tests {
             cache.lookup(arena_root, "file.txt"),
             Err(StorageError::NotFound)
         ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn unlink_marks_dirty() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let cache = &fixture.cache;
+        let file_path = Path::parse("file.txt")?;
+        let mtime = test_time();
+
+        fixture.add_file(&file_path, 100, &mtime)?;
+        let arena_root = cache.arena_root(test_arena())?;
+        cache.lookup(arena_root, "file.txt")?;
+
+        fixture.clear_dirty()?;
+        fixture.remove_file(&file_path)?;
+        assert!(engine::is_dirty(&fixture.begin_read()?, &file_path)?);
 
         Ok(())
     }
@@ -1794,6 +2017,198 @@ mod tests {
         let (file4_inode, _) = acache.lookup_path(&file4)?;
         let file4_availability = acache.file_availability(file4_inode)?;
         assert!(file4_availability.peers.contains(&peer1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn mark_dirty_recursive_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let cache = &fixture.cache;
+        let arena = test_arena();
+        let mtime = test_time();
+
+        // Add a single file
+        let file_path = Path::parse("foo/bar.txt")?;
+        fixture.add_file(&file_path, 100, &mtime)?;
+
+        // Get the file's inode
+        let (file_inode, _) = cache.lookup_path(arena, &file_path)?;
+
+        // Clear any existing dirty marks
+        fixture.clear_dirty()?;
+
+        // Mark the file dirty recursively
+        {
+            let txn = fixture.begin_write()?;
+            mark_dirty_recursive(&txn, file_inode)?;
+            txn.commit()?;
+        }
+
+        // Check that the file is marked dirty
+        {
+            let txn = fixture.begin_read()?;
+            assert!(engine::is_dirty(&txn, &file_path)?);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn mark_dirty_recursive_directory() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let cache = &fixture.cache;
+        let arena = test_arena();
+        let mtime = test_time();
+
+        // Add files in a directory structure
+        let a = Path::parse("foo/a.txt")?;
+        let b = Path::parse("foo/b.txt")?;
+        let c = Path::parse("foo/subdir/c.txt")?;
+        let d = Path::parse("foo/subdir/d.txt")?;
+        let e = Path::parse("bar/e.txt")?;
+
+        for file in vec![&a, &b, &c, &d, &e] {
+            fixture.add_file(file, 100, &mtime)?;
+        }
+        fixture.clear_dirty()?;
+
+        let (foo_dir_inode, _) = cache.lookup_path(arena, &Path::parse("foo")?)?;
+
+        // Mark the foo directory dirty recursively
+        {
+            let txn = fixture.begin_write()?;
+            mark_dirty_recursive(&txn, foo_dir_inode)?;
+            txn.commit()?;
+        }
+
+        // Check that all files under foo are marked dirty
+        {
+            let txn = fixture.begin_read()?;
+            assert!(engine::is_dirty(&txn, &a)?);
+            assert!(engine::is_dirty(&txn, &b)?);
+            assert!(engine::is_dirty(&txn, &c)?);
+            assert!(engine::is_dirty(&txn, &d)?);
+
+            // Files outside foo should not be dirty
+            assert!(!engine::is_dirty(&txn, &e)?);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn mark_dirty_recursive_nested_directory() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let cache = &fixture.cache;
+        let arena = test_arena();
+        let mtime = test_time();
+
+        // Add files in a deeply nested structure
+        let a = Path::parse("foo/a.txt")?;
+        let b = Path::parse("foo/subdir/b.txt")?;
+        let c = Path::parse("foo/subdir/deep/c.txt")?;
+        let d = Path::parse("foo/subdir/deep/very/d.txt")?;
+        let e = Path::parse("foo/other/e.txt")?;
+
+        for file in vec![&a, &b, &c, &d, &e] {
+            fixture.add_file(file, 100, &mtime)?;
+        }
+        fixture.clear_dirty()?;
+
+        let (subdir_inode, _) = cache.lookup_path(arena, &Path::parse("foo/subdir")?)?;
+
+        // Mark the subdir directory dirty recursively
+        {
+            let txn = fixture.begin_write()?;
+            mark_dirty_recursive(&txn, subdir_inode)?;
+            txn.commit()?;
+        }
+
+        // Check that only files under subdir are marked dirty
+        {
+            let txn = fixture.begin_read()?;
+            // Files under subdir should be dirty
+            assert!(engine::is_dirty(&txn, &b)?);
+            assert!(engine::is_dirty(&txn, &c)?);
+            assert!(engine::is_dirty(&txn, &d)?);
+
+            // Files outside subdir should not be dirty
+            assert!(!engine::is_dirty(&txn, &a)?);
+            assert!(!engine::is_dirty(&txn, &e)?);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn mark_dirty_recursive_nonexistent_inode() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let mtime = test_time();
+
+        // Add some files
+        for file in vec!["foo/a.txt", "bar/b.txt"] {
+            let path = Path::parse(file)?;
+            fixture.add_file(&path, 100, &mtime)?;
+        }
+        fixture.clear_dirty()?;
+
+        // Mark a non-existent inode dirty recursively
+        {
+            let acache = fixture.arena_cache()?;
+            let txn = acache.db.begin_write()?;
+            // Use a very high inode number that shouldn't exist
+            let nonexistent_inode = Inode(999999);
+            mark_dirty_recursive(&txn, nonexistent_inode)?;
+            txn.commit()?;
+        }
+
+        // Check that no files are marked dirty (function should do nothing)
+        {
+            let txn = fixture.begin_write()?;
+            assert_eq!(None, engine::take_dirty(&txn)?);
+            let _ = txn.abort();
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn mark_dirty_recursive_arena_root() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let cache = &fixture.cache;
+        let arena = test_arena();
+        let mtime = test_time();
+
+        // Add files in different directories
+        let files = vec![
+            Path::parse("foo/a.txt")?,
+            Path::parse("foo/b.txt")?,
+            Path::parse("bar/c.txt")?,
+            Path::parse("baz/d.txt")?,
+        ];
+
+        for file in &files {
+            fixture.add_file(file, 100, &mtime)?;
+        }
+        fixture.clear_dirty()?;
+
+        let arena_root = cache.arena_root(arena)?;
+
+        // Mark the whole dirty
+        {
+            let txn = fixture.begin_write()?;
+            mark_dirty_recursive(&txn, arena_root)?;
+            txn.commit()?;
+        }
+
+        // Check that all files in the arena are marked dirty
+        {
+            let txn = fixture.begin_read()?;
+            for file in files {
+                assert!(engine::is_dirty(&txn, &file)?, "{file} should be dirty",);
+            }
+        }
 
         Ok(())
     }

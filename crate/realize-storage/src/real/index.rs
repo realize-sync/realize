@@ -1,8 +1,8 @@
 #![allow(dead_code)] // work in progress
 
 use super::real_capnp;
-use crate::StorageError;
 use crate::utils::holder::{ByteConversionError, ByteConvertible, Holder, NamedType};
+use crate::{StorageError, engine};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
 use realize_types::{self, Arena, Hash, UnixTime};
@@ -252,28 +252,54 @@ fn do_remove_file_or_dir(
 ) -> Result<(), StorageError> {
     let mut file_table = txn.open_table(FILE_TABLE)?;
     let mut history_table = txn.open_table(HISTORY_TABLE)?;
-    let path_str = path.as_str();
-    let mut range_end = path.to_string();
-    range_end.push('0' /* '/' + 1 */);
+    let path_prefix = PathPrefix::new(&path);
 
-    for entry in file_table.extract_from_if(path_str..range_end.as_ref(), |k, _| {
-        k.strip_prefix(path_str)
-            .map(|rest| rest == "" || rest.starts_with('/'))
-            .unwrap_or(false)
-    })? {
+    for entry in file_table.extract_from_if(path_prefix.range(), |k, _| path_prefix.accept(k))? {
         let (k, v) = entry?;
         let index = next_history_index(&history_table)?;
+        let path = realize_types::Path::parse(k.value())?;
+        engine::mark_dirty(txn, &path)?;
         history_table.insert(
             index,
-            Holder::with_content(HistoryTableEntry::Remove(
-                realize_types::Path::parse(k.value())?,
-                v.value().parse()?.hash,
-            ))?,
+            Holder::with_content(HistoryTableEntry::Remove(path, v.value().parse()?.hash))?,
         )?;
         *history_index = Some(index);
     }
 
     Ok(())
+}
+
+/// Helper for iterating over a range of paths.
+///
+/// First query the returned range, then check any result against
+/// accept.
+struct PathPrefix {
+    range_end: String,
+}
+impl PathPrefix {
+    fn new(prefix: &realize_types::Path) -> Self {
+        let mut range_end = prefix.to_string();
+        range_end.push('0' /* '/' + 1 */);
+
+        Self { range_end }
+    }
+
+    fn prefix(&self) -> &str {
+        &self.range_end[0..(self.range_end.len() - 1)]
+    }
+
+    fn range(&self) -> std::ops::Range<&str> {
+        let start = self.prefix();
+        let end = self.range_end.as_str();
+
+        start..end
+    }
+
+    fn accept(&self, path: &str) -> bool {
+        path.strip_prefix(self.prefix())
+            .map(|rest| rest == "" || rest.starts_with('/'))
+            .unwrap_or(false)
+    }
 }
 
 fn do_add_file(
@@ -305,6 +331,7 @@ fn do_add_file(
         return Ok(());
     }
 
+    engine::mark_dirty(txn, path)?;
     let index = next_history_index(&history_table)?;
     history_table.insert(
         index,
@@ -588,6 +615,47 @@ impl ByteConvertible<HistoryTableEntry> for HistoryTableEntry {
     }
 }
 
+/// Mark paths within the index dirty.
+///
+/// If the path is a file in the index, it is marked dirty.
+//
+/// If there exists files within the index that are inside that
+/// directory, directly or indirectly, they're marked dirty.
+///
+/// If the path is not in the index, the function does nothing.
+pub(crate) fn mark_dirty_recursive(
+    txn: &WriteTransaction,
+    path: &realize_types::Path,
+) -> Result<(), StorageError> {
+    let file_table = txn.open_table(FILE_TABLE)?;
+    let path_prefix = PathPrefix::new(&path);
+    for entry in file_table.range(path_prefix.range())? {
+        let (k, _) = entry?;
+        let key = k.value();
+        if !path_prefix.accept(key) {
+            continue;
+        }
+        if let Ok(path) = realize_types::Path::parse(key) {
+            engine::mark_dirty(txn, &path)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Mark all files within the index dirty
+pub(crate) fn make_all_dirty(txn: &WriteTransaction) -> Result<(), StorageError> {
+    let file_table = txn.open_table(FILE_TABLE)?;
+    for entry in file_table.iter()? {
+        let (k, _) = entry?;
+        if let Ok(path) = realize_types::Path::parse(k.value()) {
+            engine::mark_dirty(txn, &path)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn parse_hash(hash: &[u8]) -> Result<Hash, ByteConversionError> {
     let hash: [u8; 32] = hash
         .try_into()
@@ -625,6 +693,14 @@ mod tests {
                 index: aindex.blocking(),
                 aindex,
             })
+        }
+
+        fn clear_all_dirty(&self) -> anyhow::Result<()> {
+            let txn = self.index.db.begin_write()?;
+            while engine::take_dirty(&txn)?.is_some() {}
+            txn.commit()?;
+
+            Ok(())
         }
     }
 
@@ -731,6 +807,8 @@ mod tests {
                 HistoryTableEntry::Add(path.clone()),
                 history_table.get(1)?.unwrap().value().parse()?
             );
+
+            assert!(engine::is_dirty(&txn, &path)?);
         }
 
         Ok(())
@@ -764,6 +842,8 @@ mod tests {
                 HistoryTableEntry::Replace(path.clone(), Hash([0xfa; 32])),
                 history_table.get(2)?.unwrap().value().parse()?
             );
+
+            assert!(engine::is_dirty(&txn, &path)?);
         }
 
         Ok(())
@@ -854,6 +934,8 @@ mod tests {
                 HistoryTableEntry::Remove(path.clone(), Hash([0xfa; 32])),
                 history_table.get(2)?.unwrap().value().parse()?
             );
+
+            assert!(engine::is_dirty(&txn, &path)?);
         }
 
         Ok(())
@@ -891,6 +973,8 @@ mod tests {
             Hash([0x04; 32]),
         )?;
 
+        fixture.clear_all_dirty()?;
+
         index.remove_file_or_dir(&realize_types::Path::parse("foo")?)?;
 
         assert_eq!(
@@ -925,6 +1009,19 @@ mod tests {
                 HistoryTableEntry::Remove(realize_types::Path::parse("foo/c")?, Hash([3; 32])),
                 history_table.get(7)?.unwrap().value().parse()?
             );
+
+            assert!(engine::is_dirty(
+                &txn,
+                &realize_types::Path::parse("foo/a")?
+            )?);
+            assert!(engine::is_dirty(
+                &txn,
+                &realize_types::Path::parse("foo/b")?
+            )?);
+            assert!(engine::is_dirty(
+                &txn,
+                &realize_types::Path::parse("foo/c")?
+            )?);
         }
 
         Ok(())
@@ -1166,6 +1263,211 @@ mod tests {
 
         // The new mtime should have been stored.
         assert!(index.has_matching_file(&path, 100, &mtime2)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn mark_dirty_recursive_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let index = &fixture.index;
+        let mtime = UnixTime::from_secs(1234567890);
+
+        // Add a single file
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        index.add_file(&path, 100, &mtime, Hash([0xfa; 32]))?;
+
+        fixture.clear_all_dirty()?;
+
+        // Mark the file dirty recursively
+        {
+            let txn = index.db.begin_write()?;
+            mark_dirty_recursive(&txn, &path)?;
+            txn.commit()?;
+        }
+
+        // Check that the file is marked dirty
+        {
+            let txn = index.db.begin_read()?;
+            assert!(engine::is_dirty(&txn, &path)?);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn mark_dirty_recursive_directory() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let index = &fixture.index;
+        let mtime = UnixTime::from_secs(1234567890);
+
+        let foo_a = realize_types::Path::parse("foo/a.txt")?;
+        let foo_b = realize_types::Path::parse("foo/b.txt")?;
+        let foo_c = realize_types::Path::parse("foo/subdir/c.txt")?;
+        let foo_d = realize_types::Path::parse("foo/subdir/d.txt")?;
+        let foo_file = realize_types::Path::parse("foo.txt")?;
+        let foodie = realize_types::Path::parse("foodie/e.txt")?;
+        let bar = realize_types::Path::parse("bar/f.txt")?;
+
+        // Add files in a directory structure
+        let files = vec![&foo_a, &foo_b, &foo_c, &foo_d, &foo_file, &foodie, &bar];
+        for file in files {
+            index.add_file(file, 100, &mtime, Hash([0xfa; 32]))?;
+        }
+
+        fixture.clear_all_dirty()?;
+
+        // Mark the foo directory dirty recursively
+        {
+            let txn = index.db.begin_write()?;
+            let foo_dir = realize_types::Path::parse("foo")?;
+            mark_dirty_recursive(&txn, &foo_dir)?;
+            txn.commit()?;
+        }
+
+        // Check that all files under foo are marked dirty
+        {
+            let txn = index.db.begin_read()?;
+            assert!(engine::is_dirty(&txn, &foo_a)?);
+            assert!(engine::is_dirty(&txn, &foo_b)?);
+            assert!(engine::is_dirty(&txn, &foo_c)?);
+            assert!(engine::is_dirty(&txn, &foo_d)?);
+
+            // Files outside foo should not be dirty (even if their
+            // name start with foo)
+            assert!(!engine::is_dirty(&txn, &foo_file)?);
+            assert!(!engine::is_dirty(&txn, &foodie)?);
+            assert!(!engine::is_dirty(&txn, &bar)?);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn mark_dirty_recursive_nonexistent_path() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let index = &fixture.index;
+
+        // Mark a non-existent path dirty recursively; it shouldn't fail.
+        {
+            let txn = index.db.begin_write()?;
+            let nonexistent = realize_types::Path::parse("nonexistent")?;
+            mark_dirty_recursive(&txn, &nonexistent)?;
+            txn.commit()?;
+        }
+
+        // Check that no files are marked dirty (function should do nothing)
+        {
+            let txn = index.db.begin_write()?;
+            assert!(engine::take_dirty(&txn)?.is_none());
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_make_all_dirty() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let index = &fixture.index;
+        let mtime = UnixTime::from_secs(1234567890);
+
+        // Add multiple files in different directories
+        let files = vec![
+            realize_types::Path::parse("foo/a.txt")?,
+            realize_types::Path::parse("foo/b.txt")?,
+            realize_types::Path::parse("bar/c.txt")?,
+            realize_types::Path::parse("baz/d.txt")?,
+            realize_types::Path::parse("deep/nested/file.txt")?,
+        ];
+
+        for file in &files {
+            index.add_file(file, 100, &mtime, Hash([0xfa; 32]))?;
+        }
+
+        fixture.clear_all_dirty()?;
+
+        // Mark all files dirty
+        {
+            let txn = index.db.begin_write()?;
+            make_all_dirty(&txn)?;
+            txn.commit()?;
+        }
+
+        // Check that all files are marked dirty
+        {
+            let txn = index.db.begin_read()?;
+            for file in &files {
+                assert!(engine::is_dirty(&txn, &file)?, "{file} should be dirty",);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_make_all_dirty_empty_index() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let index = &fixture.index;
+
+        // Mark all files dirty on empty index; it shouldn't fail
+        {
+            let txn = index.db.begin_write()?;
+            make_all_dirty(&txn)?;
+            txn.commit()?;
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_make_all_dirty_with_invalid_paths() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let index = &fixture.index;
+        let mtime = UnixTime::from_secs(1234567890);
+
+        // Add some valid files
+        let valid_files = vec![
+            realize_types::Path::parse("foo/a.txt")?,
+            realize_types::Path::parse("bar/b.txt")?,
+        ];
+
+        for file in &valid_files {
+            index.add_file(file, 100, &mtime, Hash([0xfa; 32]))?;
+        }
+
+        // Manually insert an invalid path into the file table; it should be skipped
+        {
+            let txn = index.db.begin_write()?;
+            {
+                let mut file_table = txn.open_table(FILE_TABLE)?;
+                file_table.insert(
+                    "///invalid///path",
+                    Holder::with_content(FileTableEntry {
+                        size: 100,
+                        mtime: mtime.clone(),
+                        hash: Hash([0xfa; 32]),
+                    })?,
+                )?;
+            }
+            txn.commit()?;
+        }
+
+        fixture.clear_all_dirty()?;
+
+        // Mark all files dirty
+        {
+            let txn = index.db.begin_write()?;
+            make_all_dirty(&txn)?;
+            txn.commit()?;
+        }
+
+        // Check that valid files are marked dirty
+        {
+            let txn = index.db.begin_read()?;
+            for file in &valid_files {
+                assert!(engine::is_dirty(&txn, file)?, "{file} should be dirty",);
+            }
+        }
 
         Ok(())
     }
