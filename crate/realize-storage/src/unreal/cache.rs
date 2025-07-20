@@ -426,7 +426,7 @@ fn do_add_arena_root(txn: &WriteTransaction, arena: Arena) -> anyhow::Result<Ino
         txn,
         &mut dir_table,
         UnrealCacheBlocking::ROOT_DIR,
-        &arena_path.parent(),
+        arena_path.parent().as_ref(),
         &alloc_inode_range,
     )?;
     let arena_root = arena_cache::alloc_inode(txn, &alloc_inode_range)?;

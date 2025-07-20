@@ -140,7 +140,7 @@ impl ArenaCache {
         let txn = self.db.begin_read()?;
         let dir_table = txn.open_table(DIRECTORY_TABLE)?;
 
-        do_lookup_path(&dir_table, self.arena_root, &Some(path.clone()))
+        do_lookup_path(&dir_table, self.arena_root, Some(path))
     }
 
     pub(crate) fn file_metadata(&self, inode: Inode) -> Result<FileMetadata, StorageError> {
@@ -497,7 +497,7 @@ impl ArenaCache {
     ) -> Result<(), StorageError> {
         let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
         let (parent_inode, parent_assignment) =
-            do_lookup_path(&dir_table, arena_root, &path.parent())?;
+            do_lookup_path(&dir_table, arena_root, path.parent().as_ref())?;
         if parent_assignment != InodeAssignment::Directory {
             return Err(StorageError::NotADirectory);
         }
@@ -579,19 +579,25 @@ impl ArenaCache {
 /// and its subdirectories are marked dirty.
 ///
 /// If the inode is not in the cache, the function does nothing.
-#[allow(dead_code)]
 pub(crate) fn mark_dirty_recursive(
     txn: &WriteTransaction,
-    inode: Inode,
+    arena_root: Inode,
+    path: Option<&Path>,
 ) -> Result<(), StorageError> {
-    let file_table = txn.open_table(FILE_TABLE)?;
-    mark_file_dirty(txn, &file_table, inode)?;
-
     let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-    mark_dir_dirty(txn, &dir_table, &file_table, inode)
+    match do_lookup_path(&dir_table, arena_root, path) {
+        Ok((inode, _)) => {
+            let file_table = txn.open_table(FILE_TABLE)?;
+            mark_file_dirty(txn, &file_table, inode)?;
+            mark_dir_dirty(txn, &dir_table, &file_table, inode)?;
+
+            Ok(())
+        }
+        Err(StorageError::NotFound) => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
-#[allow(dead_code)]
 fn mark_file_dirty(
     txn: &WriteTransaction,
     file_table: &redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
@@ -604,7 +610,6 @@ fn mark_file_dirty(
     Ok(())
 }
 
-#[allow(dead_code)]
 fn mark_dir_dirty(
     txn: &WriteTransaction,
     dir_table: &redb::Table<'_, (Inode, &str), Holder<DirTableEntry>>,
@@ -806,7 +811,7 @@ fn do_create_file(
         txn,
         &mut dir_table,
         arena_root,
-        &path.parent(),
+        path.parent().as_ref(),
         alloc_inode_range,
     )?;
     let dir_entry = get_dir_entry(&dir_table, parent_inode, filename)?;
@@ -843,7 +848,7 @@ pub(crate) fn do_mkdirs(
     txn: &WriteTransaction,
     dir_table: &mut redb::Table<'_, (Inode, &str), Holder<DirTableEntry>>,
     root_inode: Inode,
-    path: &Option<Path>,
+    path: Option<&Path>,
     alloc_inode_range: &impl Fn() -> Result<(Inode, Inode), StorageError>,
 ) -> Result<Inode, StorageError> {
     log::debug!("mkdirs {root_inode} {path:?}");
@@ -878,7 +883,7 @@ pub(crate) fn do_mkdirs(
 fn do_lookup_path(
     dir_table: &impl redb::ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
     root_inode: Inode,
-    path: &Option<Path>,
+    path: Option<&Path>,
 ) -> Result<(Inode, InodeAssignment), StorageError> {
     let mut current = (root_inode, InodeAssignment::Directory);
     for component in Path::components(path) {
@@ -1060,6 +1065,10 @@ mod tests {
                 cache,
                 _tempdir: tempdir,
             })
+        }
+
+        fn arena_root(&self) -> anyhow::Result<Inode> {
+            Ok(self.cache.arena_root(self.arena)?)
         }
 
         fn arena_cache(&self) -> anyhow::Result<&ArenaCache> {
@@ -2024,24 +2033,17 @@ mod tests {
     #[test]
     fn mark_dirty_recursive_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena())?;
-        let cache = &fixture.cache;
-        let arena = test_arena();
         let mtime = test_time();
 
         // Add a single file
         let file_path = Path::parse("foo/bar.txt")?;
         fixture.add_file(&file_path, 100, &mtime)?;
-
-        // Get the file's inode
-        let (file_inode, _) = cache.lookup_path(arena, &file_path)?;
-
-        // Clear any existing dirty marks
         fixture.clear_dirty()?;
 
         // Mark the file dirty recursively
         {
             let txn = fixture.begin_write()?;
-            mark_dirty_recursive(&txn, file_inode)?;
+            mark_dirty_recursive(&txn, fixture.arena_root()?, Some(&file_path))?;
             txn.commit()?;
         }
 
@@ -2057,8 +2059,6 @@ mod tests {
     #[test]
     fn mark_dirty_recursive_directory() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena())?;
-        let cache = &fixture.cache;
-        let arena = test_arena();
         let mtime = test_time();
 
         // Add files in a directory structure
@@ -2073,12 +2073,10 @@ mod tests {
         }
         fixture.clear_dirty()?;
 
-        let (foo_dir_inode, _) = cache.lookup_path(arena, &Path::parse("foo")?)?;
-
         // Mark the foo directory dirty recursively
         {
             let txn = fixture.begin_write()?;
-            mark_dirty_recursive(&txn, foo_dir_inode)?;
+            mark_dirty_recursive(&txn, fixture.arena_root()?, Some(&Path::parse("foo")?))?;
             txn.commit()?;
         }
 
@@ -2100,8 +2098,6 @@ mod tests {
     #[test]
     fn mark_dirty_recursive_nested_directory() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena())?;
-        let cache = &fixture.cache;
-        let arena = test_arena();
         let mtime = test_time();
 
         // Add files in a deeply nested structure
@@ -2116,12 +2112,14 @@ mod tests {
         }
         fixture.clear_dirty()?;
 
-        let (subdir_inode, _) = cache.lookup_path(arena, &Path::parse("foo/subdir")?)?;
-
         // Mark the subdir directory dirty recursively
         {
             let txn = fixture.begin_write()?;
-            mark_dirty_recursive(&txn, subdir_inode)?;
+            mark_dirty_recursive(
+                &txn,
+                fixture.arena_root()?,
+                Some(&Path::parse("foo/subdir")?),
+            )?;
             txn.commit()?;
         }
 
@@ -2159,7 +2157,40 @@ mod tests {
             let txn = acache.db.begin_write()?;
             // Use a very high inode number that shouldn't exist
             let nonexistent_inode = Inode(999999);
-            mark_dirty_recursive(&txn, nonexistent_inode)?;
+            mark_dirty_recursive(&txn, nonexistent_inode, Some(&Path::parse("foo")?))?;
+            txn.commit()?;
+        }
+
+        // Check that no files are marked dirty (function should do nothing)
+        {
+            let txn = fixture.begin_write()?;
+            assert_eq!(None, engine::take_dirty(&txn)?);
+            let _ = txn.abort();
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn mark_dirty_recursive_nonexistent_path() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let mtime = test_time();
+
+        // Add some files
+        for file in vec!["foo/a.txt", "bar/b.txt"] {
+            let path = Path::parse(file)?;
+            fixture.add_file(&path, 100, &mtime)?;
+        }
+        fixture.clear_dirty()?;
+
+        {
+            let acache = fixture.arena_cache()?;
+            let txn = acache.db.begin_write()?;
+            mark_dirty_recursive(
+                &txn,
+                fixture.arena_root()?,
+                Some(&Path::parse("doesnotexist")?),
+            )?;
             txn.commit()?;
         }
 
@@ -2176,9 +2207,6 @@ mod tests {
     #[test]
     fn mark_dirty_recursive_arena_root() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena())?;
-        let cache = &fixture.cache;
-        let arena = test_arena();
-        let mtime = test_time();
 
         // Add files in different directories
         let files = vec![
@@ -2188,17 +2216,16 @@ mod tests {
             Path::parse("baz/d.txt")?,
         ];
 
+        let mtime = test_time();
         for file in &files {
             fixture.add_file(file, 100, &mtime)?;
         }
         fixture.clear_dirty()?;
 
-        let arena_root = cache.arena_root(arena)?;
-
         // Mark the whole dirty
         {
             let txn = fixture.begin_write()?;
-            mark_dirty_recursive(&txn, arena_root)?;
+            mark_dirty_recursive(&txn, fixture.arena_root()?, None)?;
             txn.commit()?;
         }
 
