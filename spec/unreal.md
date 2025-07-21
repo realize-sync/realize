@@ -23,9 +23,10 @@ and Windows support.
 
 Design and implementation happens in stages, incrementally:
 
-1. Store file hierarchy, described and implemented.
-2. Serve data from network, described and implemented.
-3. Blobtore, an expiring cache, design in progress
+1. Store file hierarchy *described and implemented*
+2. Serve data from network *described and implemented*
+3. Blobtore, an expiring cache *described, partially implemented*;
+   storage works, but expiration is still missing
 
 ## Unreal Cache
 

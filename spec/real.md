@@ -43,9 +43,9 @@ Design and implementation happens in stages, incrementally:
    requirement for the next two phases. [Index]
 
 4. Report local change to remote data to peers and update local data
-   on interested peers (consensus) using such reports. Remove local
-   data after synced for files we don't want to keep locally.
-   [History] and [Consensus]
+   on interested peers using such reports [Update From Peers].
+   Download, move files from cache to real, from real to cache
+   [Consensus](consensus.md)
 
 5. Use hashes to download the right version of a file or make sure
    file content is consistent. This allows [The Unreal](./unreal.md)
@@ -196,7 +196,7 @@ interface Subscriber {
 
 `Notification` is described in the previous section.
 
-### Consensus
+### Update from Peers
 
 Peers listen to notifications from remote peer's [History] and apply
 `Add`, `Replace` and `Remove` modifications locally.
@@ -260,8 +260,7 @@ the desired action is kept into a queue to be executed later:
 - On a timer; it should be possible to configure times within which
   such download can happen, globally or per arena.
 
-Downloading a file from a remote peer can be subject to rate-limits,
-configurable globally or per arena.
+How that happens is detailed in [Consensus](consensus.md)
 
 ## Future
 
