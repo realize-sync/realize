@@ -11,6 +11,7 @@ pub struct UnixTime(Duration);
 impl UnixTime {
     /// Start of the UNIX epoch.
     pub const ZERO: UnixTime = UnixTime(Duration::ZERO);
+    pub const MAX: UnixTime = UnixTime(Duration::MAX);
 
     /// The current time
     pub fn now() -> Self {
@@ -35,6 +36,17 @@ impl UnixTime {
         Ok(UnixTime(time.duration_since(SystemTime::UNIX_EPOCH)?))
     }
 
+    /// Return duration since some other time.
+    ///
+    /// Return 0 if `self < other`
+    pub fn duration_since(&self, other: &UnixTime) -> Duration {
+        if self.0 > other.0 {
+            self.0 - other.0
+        } else {
+            Duration::ZERO
+        }
+    }
+
     /// Extract modification time from the given file metadata.
     pub fn mtime(m: &Metadata) -> UnixTime {
         UnixTime::from_system_time(m.modified().expect("OS must support mtime"))
@@ -54,6 +66,10 @@ impl UnixTime {
     /// Return a reference to the underlying duration.
     pub fn as_duration(&self) -> &Duration {
         &self.0
+    }
+
+    pub fn plus(self, duration: Duration) -> UnixTime {
+        UnixTime(self.0 + duration)
     }
 }
 

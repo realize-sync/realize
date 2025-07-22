@@ -207,7 +207,7 @@ pub struct MarkTableEntry {
 
 impl NamedType for MarkTableEntry {
     fn typename() -> &'static str {
-        "engine.mark"
+        "mark"
     }
 }
 

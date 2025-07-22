@@ -20,6 +20,7 @@ fn capnpc() -> anyhow::Result<()> {
     capnpc::CompilerCommand::new()
         .src_prefix("capnp")
         .import_path("capnp")
+        .file("capnp/engine.capnp")
         .file("capnp/mark.capnp")
         .file("capnp/real.capnp")
         .file("capnp/unreal.capnp")
