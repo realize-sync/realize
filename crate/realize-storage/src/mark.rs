@@ -7,7 +7,7 @@ use crate::{DirtyPaths, Inode, StorageError};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
 use realize_types::Path;
-use redb::{Database, TableDefinition, WriteTransaction};
+use redb::{Database, ReadTransaction, TableDefinition, WriteTransaction};
 use std::sync::Arc;
 
 #[allow(dead_code)]
@@ -80,7 +80,7 @@ impl PathMarks {
         let txn = self.db.begin_read()?;
         let mark_table = txn.open_table(MARK_TABLE)?;
 
-        get_mark(&mark_table, Some(path))
+        do_get_mark(&mark_table, Some(path))
     }
 
     /// Set the default mark for the arena.
@@ -106,7 +106,7 @@ impl PathMarks {
                 }
                 Some(e) => e.value().parse()?.mark,
             };
-            let after = get_mark(&mark_table, Some(path))?;
+            let after = do_get_mark(&mark_table, Some(path))?;
 
             if before != after {
                 // Clearing the mark had an impact, mark affected files.
@@ -126,7 +126,7 @@ impl PathMarks {
         let txn = self.db.begin_write()?;
         {
             let mut mark_table = txn.open_table(MARK_TABLE)?;
-            let before = get_mark(&mark_table, path_or_root)?;
+            let before = do_get_mark(&mark_table, path_or_root)?;
             mark_table.insert(
                 path_or_root.map(|p| p.as_str()).unwrap_or(""),
                 Holder::with_content(MarkTableEntry { mark })?,
@@ -172,7 +172,12 @@ impl PathMarks {
     }
 }
 
-fn get_mark(
+pub(crate) fn get_mark(txn: &ReadTransaction, path: &Path) -> Result<Mark, StorageError> {
+    let mark_table = txn.open_table(MARK_TABLE)?;
+    do_get_mark(&mark_table, Some(path))
+}
+
+fn do_get_mark(
     mark_table: &impl redb::ReadableTable<&'static str, Holder<'static, MarkTableEntry>>,
     path: Option<&Path>,
 ) -> Result<Mark, StorageError> {

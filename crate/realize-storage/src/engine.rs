@@ -1,7 +1,8 @@
 #![allow(dead_code)] // work in progress
 
+use crate::mark;
 use crate::unreal::{arena_cache, blob};
-use crate::{Inode, StorageError};
+use crate::{Inode, Mark, StorageError};
 use realize_types::{ByteRanges, Hash, Path};
 use redb::{Database, ReadTransaction, TableDefinition, WriteTransaction};
 use std::sync::Arc;
@@ -20,6 +21,7 @@ const DIRTY_TABLE: TableDefinition<&str, u64> = TableDefinition::new("engine.dir
 const DIRTY_LOG_TABLE: TableDefinition<u64, &str> = TableDefinition::new("engine.dirty_log");
 const DIRTY_COUNTER_TABLE: TableDefinition<(), u64> = TableDefinition::new("engine.dirty_counter");
 
+#[derive(Eq, PartialEq, Debug, Clone)]
 pub(crate) enum Job {
     Download(Path, u64, Hash),
 }
@@ -102,10 +104,15 @@ impl Engine {
         })
     }
 
-    pub(crate) async fn job_stream(self: &Arc<Engine>) -> ReceiverStream<anyhow::Result<Job>> {
-        let (tx, rx) = mpsc::channel(0);
+    pub(crate) fn job_stream(self: &Arc<Engine>) -> ReceiverStream<anyhow::Result<Job>> {
+        let (tx, rx) = mpsc::channel(1);
+        // Using a small buffer to avoid buffering stale jobs.
 
         let this = Arc::clone(self);
+        // The above means that the Engine will stay in memory as long
+        // as there is at least one stream. Should dropping the engine
+        // instead invalidate the streams?
+
         tokio::spawn(async move {
             if let Err(err) = this.build_jobs(tx.clone()).await {
                 let _ = tx.send(Err(err)).await;
@@ -183,20 +190,28 @@ impl Engine {
         path: Path,
         counter: u64,
     ) -> Result<Option<Job>, StorageError> {
-        let file_entry = match arena_cache::get_file_entry_for_path(txn, self.arena_root, &path) {
-            Ok(e) => e,
-            Err(_) => {
-                return Ok(None);
-            }
-        };
-        if let Some(blob_id) = file_entry.content.blob {
-            let file_range = ByteRanges::single(0, file_entry.metadata.size);
-            if blob::local_availability(&txn, blob_id)?.intersection(&file_range) == file_range {
-                // Already fully available
-                return Ok(None);
+        match mark::get_mark(txn, &path)? {
+            Mark::Watch => Ok(None),
+            Mark::Keep | Mark::Own => {
+                let file_entry =
+                    match arena_cache::get_file_entry_for_path(txn, self.arena_root, &path) {
+                        Ok(e) => e,
+                        Err(_) => {
+                            return Ok(None);
+                        }
+                    };
+                if let Some(blob_id) = file_entry.content.blob {
+                    let file_range = ByteRanges::single(0, file_entry.metadata.size);
+                    if blob::local_availability(&txn, blob_id)?.intersection(&file_range)
+                        == file_range
+                    {
+                        // Already fully available
+                        return Ok(None);
+                    }
+                }
+                Ok(Some(Job::Download(path, counter, file_entry.content.hash)))
             }
         }
-        Ok(Some(Job::Download(path, counter, file_entry.content.hash)))
     }
 
     fn delete_range(&self, beg: u64, end: u64) -> Result<(), StorageError> {
@@ -284,17 +299,30 @@ pub(crate) fn take_dirty(txn: &WriteTransaction) -> Result<Option<(Path, u64)>, 
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
+    use crate::Notification;
+    use crate::mark::PathMarks;
+    use crate::unreal::arena_cache::ArenaCache;
     use crate::utils::redb_utils;
+    use assert_fs::TempDir;
+    use futures::StreamExt as _;
+    use realize_types::{Arena, Peer, UnixTime};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt as _;
+    use tokio::time;
 
-    struct Fixture {
+    fn test_hash() -> Hash {
+        Hash([1; 32])
+    }
+
+    /// Fixture for testing DirtyPaths.
+    struct DirtyPathsFixture {
         db: Arc<redb::Database>,
         dirty_paths: Arc<DirtyPaths>,
     }
-    impl Fixture {
-        async fn setup() -> anyhow::Result<Fixture> {
+    impl DirtyPathsFixture {
+        async fn setup() -> anyhow::Result<DirtyPathsFixture> {
             let _ = env_logger::try_init();
             let db = redb_utils::in_memory()?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
@@ -302,9 +330,87 @@ mod tests {
         }
     }
 
+    /// Fixture for testing Engine.
+    struct EngineFixture {
+        arena: Arena,
+        db: Arc<redb::Database>,
+        dirty_paths: Arc<DirtyPaths>,
+        acache: ArenaCache,
+        pathmarks: PathMarks,
+        engine: Arc<Engine>,
+        _tempdir: TempDir,
+    }
+    impl EngineFixture {
+        async fn setup() -> anyhow::Result<EngineFixture> {
+            let _ = env_logger::try_init();
+
+            let tempdir = TempDir::new()?;
+            let db = redb_utils::in_memory()?;
+            let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
+
+            let arena = Arena::from("myarena");
+            let arena_root = Inode(300);
+            let acache = ArenaCache::new(
+                arena,
+                arena_root,
+                Arc::clone(&db),
+                tempdir.path().join("blobs"),
+                Arc::clone(&dirty_paths),
+            )?;
+            let pathmarks = PathMarks::new(Arc::clone(&db), arena_root, Arc::clone(&dirty_paths))?;
+            let engine = Engine::new(Arc::clone(&db), Arc::clone(&dirty_paths), arena_root);
+
+            Ok(Self {
+                arena,
+                db,
+                dirty_paths,
+                acache,
+                engine,
+                pathmarks,
+                _tempdir: tempdir,
+            })
+        }
+
+        /// Add a file to the cache for testing
+        fn add_file_to_cache(&self, path: &Path) -> anyhow::Result<()> {
+            self.update_cache(Notification::Add {
+                arena: self.arena,
+                index: 1,
+                path: path.clone(),
+                mtime: UnixTime::from_secs(1234567890),
+                size: 4,
+                hash: test_hash(),
+            })
+        }
+
+        fn remove_file_from_cache(&self, path: &Path) -> anyhow::Result<()> {
+            self.update_cache(Notification::Remove {
+                arena: self.arena,
+                index: 1,
+                path: path.clone(),
+                old_hash: test_hash(),
+            })
+        }
+
+        fn update_cache(&self, notification: Notification) -> anyhow::Result<()> {
+            let test_peer = Peer::from("other");
+            self.acache
+                .update(test_peer, notification, || Ok((Inode(1000), Inode(2000))))?;
+            Ok(())
+        }
+    }
+
+    async fn next_with_timeout(
+        stream: &mut ReceiverStream<anyhow::Result<Job>>,
+    ) -> anyhow::Result<Option<Job>> {
+        let job = time::timeout(Duration::from_secs(3), stream.next()).await?;
+
+        job.transpose()
+    }
+
     #[tokio::test]
     async fn mark_and_take() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = DirtyPathsFixture::setup().await?;
         let txn = fixture.db.begin_write()?;
         let path1 = Path::parse("path1")?;
         let path2 = Path::parse("path2")?;
@@ -324,7 +430,7 @@ mod tests {
 
     #[tokio::test]
     async fn increase_counter() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = DirtyPathsFixture::setup().await?;
         let txn = fixture.db.begin_write()?;
         let path1 = Path::parse("path1")?;
         let path2 = Path::parse("path2")?;
@@ -347,7 +453,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_dirty() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = DirtyPathsFixture::setup().await?;
 
         let path1 = Path::parse("path1")?;
         let path2 = Path::parse("path2")?;
@@ -364,7 +470,7 @@ mod tests {
 
     #[tokio::test]
     async fn clear_mark() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = DirtyPathsFixture::setup().await?;
         let txn = fixture.db.begin_write()?;
         let path1 = Path::parse("path1")?;
         let path2 = Path::parse("path2")?;
@@ -382,7 +488,7 @@ mod tests {
 
     #[tokio::test]
     async fn skip_invalid_path() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = DirtyPathsFixture::setup().await?;
         let txn = fixture.db.begin_write()?;
         txn.open_table(DIRTY_TABLE)?.insert("///", 1)?;
         txn.open_table(DIRTY_COUNTER_TABLE)?.insert((), 1)?;
@@ -395,6 +501,140 @@ mod tests {
         assert_eq!(None, take_dirty(&txn)?);
 
         txn.commit()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_stream_new_file_to_keep() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let foodir = Path::parse("foo")?;
+        let barfile = Path::parse("foo/bar.txt")?;
+        let mut job_stream = fixture.engine.job_stream();
+        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.add_file_to_cache(&barfile)?;
+
+        let job = next_with_timeout(&mut job_stream).await?.unwrap();
+        assert_eq!(Job::Download(barfile, 1, test_hash()), job);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multiple_job_streams() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let foodir = Path::parse("foo")?;
+        let barfile = Path::parse("foo/bar.txt")?;
+        let mut job_stream = fixture.engine.job_stream();
+        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        let mut job_stream2 = fixture.engine.job_stream();
+        fixture.add_file_to_cache(&barfile)?;
+
+        let goal_job = Some(Job::Download(barfile, 1, test_hash()));
+        assert_eq!(goal_job, next_with_timeout(&mut job_stream).await?);
+        assert_eq!(goal_job, next_with_timeout(&mut job_stream2).await?);
+
+        let mut job_stream3 = fixture.engine.job_stream();
+        assert_eq!(goal_job, next_with_timeout(&mut job_stream3).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_stream_new_file_set_to_keep_afterwards() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let foodir = Path::parse("foo")?;
+        let barfile = Path::parse("foo/bar.txt")?;
+        let mut job_stream = fixture.engine.job_stream();
+        fixture.add_file_to_cache(&barfile)?;
+        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+
+        let job = next_with_timeout(&mut job_stream).await?.unwrap();
+        // Counter is 2, because the job was created after the 2nd
+        // change only.
+        assert_eq!(Job::Download(barfile, 2, test_hash()), job);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_stream_file_to_keep_partially_downloaded() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let foodir = Path::parse("foo")?;
+        let barfile = Path::parse("foo/bar.txt")?;
+
+        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.add_file_to_cache(&barfile)?;
+        let (inode, _) = fixture.acache.lookup_path(&barfile)?;
+        {
+            let mut blob = fixture.acache.open_file(inode)?;
+            blob.write_all(b"te").await?;
+            blob.update_db().await?;
+        }
+
+        // The stream is created after downloading to be sure it sees
+        // the download.
+        let mut job_stream = fixture.engine.job_stream();
+
+        let job = next_with_timeout(&mut job_stream).await?.unwrap();
+        assert_eq!(Job::Download(barfile, 1, test_hash()), job);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_stream_file_to_keep_fully_downloaded() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let foodir = Path::parse("foo")?;
+        let barfile = Path::parse("foo/bar.txt")?;
+        let otherfile = Path::parse("foo/other.txt")?;
+
+        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.add_file_to_cache(&barfile)?;
+        let (inode, _) = fixture.acache.lookup_path(&barfile)?;
+        {
+            let mut blob = fixture.acache.open_file(inode)?;
+            blob.write_all(b"test").await?;
+            blob.update_db().await?;
+        }
+
+        // The stream is created after downloading to be sure it sees
+        // the download.
+        let mut job_stream = fixture.engine.job_stream();
+
+        // Add something else for the stream to return, or it'll just
+        // hang forever.
+        fixture.add_file_to_cache(&otherfile)?;
+
+        let job = next_with_timeout(&mut job_stream).await?.unwrap();
+        // 1 has been skipped, because it is fully downloaded
+        assert_eq!(Job::Download(otherfile, 2, test_hash()), job);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_stream_file_to_keep_already_removed() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let foodir = Path::parse("foo")?;
+        let barfile = Path::parse("foo/bar.txt")?;
+        let otherfile = Path::parse("foo/other.txt")?;
+
+        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.add_file_to_cache(&barfile)?;
+        fixture.remove_file_from_cache(&barfile)?;
+
+        // Add something else for the stream to return, or it'll just
+        // hang forever.
+        fixture.add_file_to_cache(&otherfile)?;
+
+        // The stream is created after the deletion to avoid race conditions.
+        let mut job_stream = fixture.engine.job_stream();
+
+        let job = next_with_timeout(&mut job_stream).await?.unwrap();
+        // 1 and 2 have been skipped; as they correspond to barfile
+        // creation and deletion.
+        assert_eq!(Job::Download(otherfile, 3, test_hash()), job);
+
         Ok(())
     }
 }
