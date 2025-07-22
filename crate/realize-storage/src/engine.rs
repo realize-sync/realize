@@ -103,7 +103,7 @@ impl Engine {
     }
 
     pub(crate) async fn job_stream(self: &Arc<Engine>) -> ReceiverStream<anyhow::Result<Job>> {
-        let (tx, rx) = mpsc::channel(1);
+        let (tx, rx) = mpsc::channel(0);
 
         let this = Arc::clone(self);
         tokio::spawn(async move {
@@ -292,55 +292,32 @@ mod tests {
     struct Fixture {
         db: Arc<redb::Database>,
         dirty_paths: Arc<DirtyPaths>,
-        txn: Option<WriteTransaction>,
     }
     impl Fixture {
         async fn setup() -> anyhow::Result<Fixture> {
             let _ = env_logger::try_init();
             let db = redb_utils::in_memory()?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-            let txn = db.begin_write()?;
-            Ok(Self {
-                db,
-                dirty_paths,
-                txn: Some(txn),
-            })
-        }
-
-        fn txn(&self) -> anyhow::Result<&WriteTransaction> {
-            self.txn.as_ref().ok_or(anyhow::anyhow!("no transaction"))
-        }
-
-        fn commit(&mut self) -> anyhow::Result<()> {
-            self.txn
-                .take()
-                .ok_or(anyhow::anyhow!("no transaction"))?
-                .commit()?;
-
-            Ok(())
-        }
-    }
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = self.txn.take().map(|v| {
-                let _ = v.abort();
-            });
+            Ok(Self { db, dirty_paths })
         }
     }
 
     #[tokio::test]
     async fn mark_and_take() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
+        let txn = fixture.db.begin_write()?;
         let path1 = Path::parse("path1")?;
         let path2 = Path::parse("path2")?;
 
-        fixture.dirty_paths.mark_dirty(fixture.txn()?, &path1)?;
-        fixture.dirty_paths.mark_dirty(fixture.txn()?, &path2)?;
+        fixture.dirty_paths.mark_dirty(&txn, &path1)?;
+        fixture.dirty_paths.mark_dirty(&txn, &path2)?;
 
-        assert_eq!(Some((path1, 1)), take_dirty(fixture.txn()?)?);
-        assert_eq!(Some((path2, 2)), take_dirty(fixture.txn()?)?);
-        assert_eq!(None, take_dirty(fixture.txn()?)?);
-        assert_eq!(None, take_dirty(fixture.txn()?)?);
+        assert_eq!(Some((path1, 1)), take_dirty(&txn)?);
+        assert_eq!(Some((path2, 2)), take_dirty(&txn)?);
+        assert_eq!(None, take_dirty(&txn)?);
+        assert_eq!(None, take_dirty(&txn)?);
+
+        txn.commit()?;
 
         Ok(())
     }
@@ -348,75 +325,76 @@ mod tests {
     #[tokio::test]
     async fn increase_counter() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
+        let txn = fixture.db.begin_write()?;
         let path1 = Path::parse("path1")?;
         let path2 = Path::parse("path2")?;
 
-        fixture.dirty_paths.mark_dirty(fixture.txn()?, &path1)?;
-        fixture.dirty_paths.mark_dirty(fixture.txn()?, &path2)?;
-        fixture.dirty_paths.mark_dirty(fixture.txn()?, &path1)?;
-        fixture.dirty_paths.mark_dirty(fixture.txn()?, &path1)?;
+        fixture.dirty_paths.mark_dirty(&txn, &path1)?;
+        fixture.dirty_paths.mark_dirty(&txn, &path2)?;
+        fixture.dirty_paths.mark_dirty(&txn, &path1)?;
+        fixture.dirty_paths.mark_dirty(&txn, &path1)?;
 
         // return path2 first, because its counter is lower
-        assert_eq!(Some((path2, 2)), take_dirty(fixture.txn()?)?);
-        assert_eq!(Some((path1, 4)), take_dirty(fixture.txn()?)?);
-        assert_eq!(None, take_dirty(fixture.txn()?)?);
-        assert_eq!(None, take_dirty(fixture.txn()?)?);
+        assert_eq!(Some((path2, 2)), take_dirty(&txn)?);
+        assert_eq!(Some((path1, 4)), take_dirty(&txn)?);
+        assert_eq!(None, take_dirty(&txn)?);
+        assert_eq!(None, take_dirty(&txn)?);
+
+        txn.commit()?;
 
         Ok(())
     }
 
     #[tokio::test]
     async fn check_dirty() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup().await?;
+
         let path1 = Path::parse("path1")?;
         let path2 = Path::parse("path2")?;
 
-        fixture.dirty_paths.mark_dirty(fixture.txn()?, &path2)?;
-
-        fixture.commit()?;
+        let txn = fixture.db.begin_write()?;
+        fixture.dirty_paths.mark_dirty(&txn, &path2)?;
+        txn.commit()?;
 
         let txn = fixture.db.begin_read()?;
         assert_eq!(false, is_dirty(&txn, &path1)?);
         assert_eq!(true, is_dirty(&txn, &path2)?);
-
         Ok(())
     }
 
     #[tokio::test]
     async fn clear_mark() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
+        let txn = fixture.db.begin_write()?;
         let path1 = Path::parse("path1")?;
         let path2 = Path::parse("path2")?;
 
-        fixture.dirty_paths.mark_dirty(fixture.txn()?, &path1)?;
-        fixture.dirty_paths.mark_dirty(fixture.txn()?, &path2)?;
-        clear_dirty(fixture.txn()?, &path1)?;
+        fixture.dirty_paths.mark_dirty(&txn, &path1)?;
+        fixture.dirty_paths.mark_dirty(&txn, &path2)?;
+        clear_dirty(&txn, &path1)?;
 
-        assert_eq!(Some((path2, 2)), take_dirty(fixture.txn()?)?);
-        assert_eq!(None, take_dirty(fixture.txn()?)?);
+        assert_eq!(Some((path2, 2)), take_dirty(&txn)?);
+        assert_eq!(None, take_dirty(&txn)?);
 
+        txn.commit()?;
         Ok(())
     }
 
     #[tokio::test]
     async fn skip_invalid_path() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        fixture.txn()?.open_table(DIRTY_TABLE)?.insert("///", 1)?;
-        fixture
-            .txn()?
-            .open_table(DIRTY_COUNTER_TABLE)?
-            .insert((), 1)?;
-        fixture
-            .txn()?
-            .open_table(DIRTY_LOG_TABLE)?
-            .insert(1, "///")?;
+        let txn = fixture.db.begin_write()?;
+        txn.open_table(DIRTY_TABLE)?.insert("///", 1)?;
+        txn.open_table(DIRTY_COUNTER_TABLE)?.insert((), 1)?;
+        txn.open_table(DIRTY_LOG_TABLE)?.insert(1, "///")?;
         let path = Path::parse("path")?;
 
-        fixture.dirty_paths.mark_dirty(fixture.txn()?, &path)?;
+        fixture.dirty_paths.mark_dirty(&txn, &path)?;
 
-        assert_eq!(Some((path, 2)), take_dirty(fixture.txn()?)?);
-        assert_eq!(None, take_dirty(fixture.txn()?)?);
+        assert_eq!(Some((path, 2)), take_dirty(&txn)?);
+        assert_eq!(None, take_dirty(&txn)?);
 
+        txn.commit()?;
         Ok(())
     }
 }
