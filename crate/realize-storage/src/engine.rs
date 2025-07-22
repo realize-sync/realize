@@ -4,7 +4,7 @@ use crate::mark;
 use crate::unreal::{arena_cache, blob};
 use crate::{Inode, Mark, StorageError};
 use realize_types::{ByteRanges, Hash, Path};
-use redb::{Database, ReadTransaction, TableDefinition, WriteTransaction};
+use redb::{Database, ReadTransaction, ReadableTable as _, TableDefinition, WriteTransaction};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
@@ -24,6 +24,19 @@ const DIRTY_COUNTER_TABLE: TableDefinition<(), u64> = TableDefinition::new("engi
 #[derive(Eq, PartialEq, Debug, Clone)]
 pub(crate) enum Job {
     Download(Path, u64, Hash),
+}
+
+impl Job {
+    pub(crate) fn path(&self) -> &Path {
+        match self {
+            Job::Download(path, _, _) => path,
+        }
+    }
+    pub(crate) fn counter(&self) -> u64 {
+        match self {
+            Job::Download(_, counter, _) => *counter,
+        }
+    }
 }
 
 pub(crate) struct DirtyPaths {
@@ -104,6 +117,20 @@ impl Engine {
         })
     }
 
+    /// Return an infinite stream of jobs.
+    ///
+    /// Return a stream that looks at the dirty paths on the database
+    /// and report jobs that need to be run.
+    ///
+    /// Uninteresting entries in the dirty path tables are deleted, but entries that
+    /// correspond to jobs are left, so that if the process dies, the jobs will be
+    /// returned again.
+    ///
+    /// This stream will wait for as long as necessary for changes on
+    /// the database.
+    ///
+    /// Multiple streams will return the same results, even in the
+    /// same process, as long as no job is marked done or failed.
     pub(crate) fn job_stream(self: &Arc<Engine>) -> ReceiverStream<anyhow::Result<Job>> {
         let (tx, rx) = mpsc::channel(1);
         // Using a small buffer to avoid buffering stale jobs.
@@ -120,6 +147,26 @@ impl Engine {
         });
 
         ReceiverStream::new(rx)
+    }
+
+    /// A job returned by a stream has been successfully executed.
+    ///
+    /// The dirty mark is cleared unless the path has been modified
+    /// after the job was created.
+    pub(crate) fn job_done(&self, job: &Job) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        let path = job.path();
+
+        let current = txn
+            .open_table(DIRTY_TABLE)?
+            .get(path.as_str())?
+            .map(|e| e.value());
+        if current == Some(job.counter()) {
+            clear_dirty(&txn, path)?;
+        }
+        txn.commit()?;
+
+        Ok(())
     }
 
     async fn build_jobs(
@@ -398,6 +445,13 @@ mod tests {
                 .update(test_peer, notification, || Ok((Inode(1000), Inode(2000))))?;
             Ok(())
         }
+
+        fn lowest_counter(&self) -> anyhow::Result<Option<u64>> {
+            let txn = self.db.begin_read()?;
+            let dirty_log_table = txn.open_table(DIRTY_LOG_TABLE)?;
+
+            Ok(dirty_log_table.first()?.map(|(k, _)| k.value()))
+        }
     }
 
     async fn next_with_timeout(
@@ -513,8 +567,8 @@ mod tests {
         fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
 
-        let job = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert_eq!(Job::Download(barfile, 1, test_hash()), job);
+        let job = next_with_timeout(&mut job_stream).await?;
+        assert_eq!(Some(Job::Download(barfile, 1, test_hash())), job);
 
         Ok(())
     }
@@ -548,10 +602,13 @@ mod tests {
         fixture.add_file_to_cache(&barfile)?;
         fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
 
-        let job = next_with_timeout(&mut job_stream).await?.unwrap();
+        let job = next_with_timeout(&mut job_stream).await?;
         // Counter is 2, because the job was created after the 2nd
         // change only.
-        assert_eq!(Job::Download(barfile, 2, test_hash()), job);
+        assert_eq!(Some(Job::Download(barfile, 2, test_hash())), job);
+
+        // The entries before the job that have been deleted.
+        assert_eq!(Some(2), fixture.lowest_counter()?);
 
         Ok(())
     }
@@ -575,8 +632,8 @@ mod tests {
         // the download.
         let mut job_stream = fixture.engine.job_stream();
 
-        let job = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert_eq!(Job::Download(barfile, 1, test_hash()), job);
+        let job = next_with_timeout(&mut job_stream).await?;
+        assert_eq!(Some(Job::Download(barfile, 1, test_hash())), job);
 
         Ok(())
     }
@@ -605,9 +662,12 @@ mod tests {
         // hang forever.
         fixture.add_file_to_cache(&otherfile)?;
 
-        let job = next_with_timeout(&mut job_stream).await?.unwrap();
+        let job = next_with_timeout(&mut job_stream).await?;
         // 1 has been skipped, because it is fully downloaded
-        assert_eq!(Job::Download(otherfile, 2, test_hash()), job);
+        assert_eq!(Some(Job::Download(otherfile, 2, test_hash())), job);
+
+        // The entries before the job that have been deleted.
+        assert_eq!(Some(2), fixture.lowest_counter()?);
 
         Ok(())
     }
@@ -634,6 +694,78 @@ mod tests {
         // 1 and 2 have been skipped; as they correspond to barfile
         // creation and deletion.
         assert_eq!(Job::Download(otherfile, 3, test_hash()), job);
+
+        // The entries before the job that have been deleted.
+        assert_eq!(Some(3), fixture.lowest_counter()?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_done() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let foodir = Path::parse("foo")?;
+        let barfile = Path::parse("foo/bar.txt")?;
+        let otherfile = Path::parse("foo/other.txt")?;
+        let mut job_stream = fixture.engine.job_stream();
+        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.add_file_to_cache(&barfile)?;
+        fixture.add_file_to_cache(&otherfile)?;
+
+        let job = next_with_timeout(&mut job_stream).await?.unwrap();
+        fixture.engine.job_done(&job)?;
+
+        // Any future stream won't return this job (even though the
+        // job isn't really done, since the file wasn't downloaded; this isn't checked).
+        let mut job_stream = fixture.engine.job_stream();
+        assert_eq!(
+            Some(Job::Download(otherfile, 2, test_hash())),
+            next_with_timeout(&mut job_stream).await?
+        );
+
+        // The dirty log entry that correspond to the job has been deleted.
+        assert_eq!(Some(2), fixture.lowest_counter()?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_done_but_file_modified_again() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let foodir = Path::parse("foo")?;
+        let barfile = Path::parse("foo/bar.txt")?;
+        let mut job_stream = fixture.engine.job_stream();
+        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.add_file_to_cache(&barfile)?;
+
+        let job1 = next_with_timeout(&mut job_stream).await?.unwrap();
+        assert_eq!(barfile, *job1.path());
+        assert_eq!(2, job1.counter());
+        {
+            let txn = fixture.db.begin_write()?;
+            fixture.dirty_paths.mark_dirty(&txn, &barfile)?;
+            txn.commit()?;
+        }
+
+        let job2 = next_with_timeout(&mut job_stream).await?.unwrap();
+        assert_eq!(barfile, *job2.path());
+        assert_eq!(2, job2.counter());
+
+        // Job1 is done, but that changes nothing, because the path has been modified afterwards
+        fixture.engine.job_done(&job1)?;
+        assert_eq!(Some(2), fixture.lowest_counter()?);
+
+        // Since the job wasn't really done, job2 is still returned by the next stream.
+        assert_eq!(
+            Some(2),
+            next_with_timeout(&mut fixture.engine.job_stream())
+                .await?
+                .map(|j| j.counter()),
+        );
+
+        // Marking job2 done erases the dirty mark.
+        fixture.engine.job_done(&job2)?;
+        assert_eq!(None, fixture.lowest_counter()?);
 
         Ok(())
     }
