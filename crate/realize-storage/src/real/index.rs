@@ -1,8 +1,9 @@
 #![allow(dead_code)] // work in progress
 
 use super::real_capnp;
+use crate::StorageError;
+use crate::engine::DirtyPaths;
 use crate::utils::holder::{ByteConversionError, ByteConvertible, Holder, NamedType};
-use crate::{StorageError, engine};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
 use realize_types::{self, Arena, Hash, UnixTime};
@@ -40,13 +41,18 @@ pub struct RealIndexBlocking {
     arena: Arena,
     history_tx: watch::Sender<u64>,
     uuid: Uuid,
+    dirty_paths: Arc<DirtyPaths>,
 
     /// This is just to keep history_tx alive and up-to-date.
     _history_rx: watch::Receiver<u64>,
 }
 
 impl RealIndexBlocking {
-    pub fn new(arena: Arena, db: Arc<Database>) -> Result<Self, StorageError> {
+    pub fn new(
+        arena: Arena,
+        db: Arc<Database>,
+        dirty_paths: Arc<DirtyPaths>,
+    ) -> Result<Self, StorageError> {
         let index: u64;
         let uuid: Uuid;
         {
@@ -80,6 +86,7 @@ impl RealIndexBlocking {
             db,
             uuid,
             history_tx,
+            dirty_paths,
             _history_rx: history_rx,
         })
     }
@@ -166,7 +173,15 @@ impl RealIndexBlocking {
     ) -> Result<(), StorageError> {
         let txn = (&*self.db).begin_write()?;
         let mut history_index = None;
-        do_add_file(&txn, path, size, mtime, hash, &mut history_index)?;
+        do_add_file(
+            &txn,
+            path,
+            size,
+            mtime,
+            hash,
+            &mut history_index,
+            &self.dirty_paths,
+        )?;
         txn.commit()?;
 
         if let Some(index) = history_index {
@@ -234,7 +249,7 @@ impl RealIndexBlocking {
     pub fn remove_file_or_dir(&self, path: &realize_types::Path) -> Result<(), StorageError> {
         let txn = (&*self.db).begin_write()?;
         let mut history_index = None;
-        do_remove_file_or_dir(&txn, path, &mut history_index)?;
+        do_remove_file_or_dir(&txn, path, &mut history_index, &self.dirty_paths)?;
         txn.commit()?;
 
         if let Some(index) = history_index {
@@ -249,6 +264,7 @@ fn do_remove_file_or_dir(
     txn: &WriteTransaction,
     path: &realize_types::Path,
     history_index: &mut Option<u64>,
+    dirty_paths: &Arc<DirtyPaths>,
 ) -> Result<(), StorageError> {
     let mut file_table = txn.open_table(FILE_TABLE)?;
     let mut history_table = txn.open_table(HISTORY_TABLE)?;
@@ -258,7 +274,7 @@ fn do_remove_file_or_dir(
         let (k, v) = entry?;
         let index = next_history_index(&history_table)?;
         let path = realize_types::Path::parse(k.value())?;
-        engine::mark_dirty(txn, &path)?;
+        dirty_paths.mark_dirty(txn, &path)?;
         history_table.insert(
             index,
             Holder::with_content(HistoryTableEntry::Remove(path, v.value().parse()?.hash))?,
@@ -309,6 +325,7 @@ fn do_add_file(
     mtime: &UnixTime,
     hash: Hash,
     history_index: &mut Option<u64>,
+    dirty_paths: &Arc<DirtyPaths>,
 ) -> Result<(), StorageError> {
     let mut file_table = txn.open_table(FILE_TABLE)?;
     let mut history_table = txn.open_table(HISTORY_TABLE)?;
@@ -331,7 +348,7 @@ fn do_add_file(
         return Ok(());
     }
 
-    engine::mark_dirty(txn, path)?;
+    dirty_paths.mark_dirty(txn, path)?;
     let index = next_history_index(&history_table)?;
     history_table.insert(
         index,
@@ -373,9 +390,19 @@ impl RealIndexAsync {
     }
 
     /// Create an index using the given database. Initialize the database if necessary.
-    pub async fn with_db(arena: Arena, db: Arc<redb::Database>) -> Result<Self, StorageError> {
-        task::spawn_blocking(move || Ok(RealIndexAsync::new(RealIndexBlocking::new(arena, db)?)))
-            .await?
+    pub async fn with_db(
+        arena: Arena,
+        db: Arc<redb::Database>,
+        dirty_paths: Arc<DirtyPaths>,
+    ) -> Result<Self, StorageError> {
+        task::spawn_blocking(move || {
+            Ok(RealIndexAsync::new(RealIndexBlocking::new(
+                arena,
+                db,
+                dirty_paths,
+            )?))
+        })
+        .await?
     }
 
     /// Returns the database UUID.
@@ -626,6 +653,7 @@ impl ByteConvertible<HistoryTableEntry> for HistoryTableEntry {
 pub(crate) fn mark_dirty_recursive(
     txn: &WriteTransaction,
     path: &realize_types::Path,
+    dirty_paths: &Arc<DirtyPaths>,
 ) -> Result<(), StorageError> {
     let file_table = txn.open_table(FILE_TABLE)?;
     let path_prefix = PathPrefix::new(&path);
@@ -636,7 +664,7 @@ pub(crate) fn mark_dirty_recursive(
             continue;
         }
         if let Ok(path) = realize_types::Path::parse(key) {
-            engine::mark_dirty(txn, &path)?;
+            dirty_paths.mark_dirty(txn, &path)?;
         }
     }
 
@@ -644,12 +672,15 @@ pub(crate) fn mark_dirty_recursive(
 }
 
 /// Mark all files within the index dirty
-pub(crate) fn make_all_dirty(txn: &WriteTransaction) -> Result<(), StorageError> {
+pub(crate) fn make_all_dirty(
+    txn: &WriteTransaction,
+    dirty_paths: &Arc<DirtyPaths>,
+) -> Result<(), StorageError> {
     let file_table = txn.open_table(FILE_TABLE)?;
     for entry in file_table.iter()? {
         let (k, _) = entry?;
         if let Ok(path) = realize_types::Path::parse(k.value()) {
-            engine::mark_dirty(txn, &path)?;
+            dirty_paths.mark_dirty(txn, &path)?;
         }
     }
 
@@ -670,7 +701,7 @@ fn parse_path(path: capnp::text::Reader<'_>) -> Result<realize_types::Path, Byte
 
 #[cfg(test)]
 mod tests {
-    use crate::utils::redb_utils;
+    use crate::{engine, utils::redb_utils};
 
     use super::*;
     use assert_fs::TempDir;
@@ -683,15 +714,19 @@ mod tests {
     struct Fixture {
         aindex: RealIndexAsync,
         index: Arc<RealIndexBlocking>,
+        dirty_paths: Arc<DirtyPaths>,
     }
     impl Fixture {
-        fn setup() -> anyhow::Result<Fixture> {
+        async fn setup() -> anyhow::Result<Fixture> {
             let _ = env_logger::try_init();
             let arena = test_arena();
-            let aindex = RealIndexBlocking::new(arena, redb_utils::in_memory()?)?.into_async();
+            let db = redb_utils::in_memory()?;
+            let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
+            let aindex = RealIndexBlocking::new(arena, db, Arc::clone(&dirty_paths))?.into_async();
             Ok(Self {
                 index: aindex.blocking(),
                 aindex,
+                dirty_paths,
             })
         }
 
@@ -704,9 +739,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn open_creates_tables() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn open_creates_tables() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
         let db = &fixture.index.db;
 
         let txn = db.begin_read()?;
@@ -718,19 +753,23 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn reopen_keeps_uuid() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn reopen_keeps_uuid() -> anyhow::Result<()> {
         let tempdir = TempDir::new()?;
         let path = tempdir.path().join("index.db");
+        let db = Arc::new(redb::Database::create(&path)?);
+        let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
         let arena = test_arena();
-        let uuid = RealIndexBlocking::new(arena, Arc::new(redb::Database::create(&path)?))?
+        let uuid = RealIndexBlocking::new(arena, db, dirty_paths)?
             .uuid()
             .clone();
 
+        let db = Arc::new(redb::Database::create(&path)?);
+        let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
         assert!(!uuid.is_nil());
         assert_eq!(
             uuid,
-            RealIndexBlocking::new(arena, Arc::new(redb::Database::create(&path)?))?
+            RealIndexBlocking::new(arena, db, dirty_paths)?
                 .uuid()
                 .clone()
         );
@@ -738,8 +777,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn convert_file_table_entry() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn convert_file_table_entry() -> anyhow::Result<()> {
         let entry = FileTableEntry {
             size: 200,
             mtime: UnixTime::new(1234567890, 111),
@@ -754,8 +793,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn convert_history_table_entry() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn convert_history_table_entry() -> anyhow::Result<()> {
         let add = HistoryTableEntry::Add(realize_types::Path::parse("foo/bar.txt")?);
         assert_eq!(
             add,
@@ -781,9 +820,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn add_file() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn add_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
         let mtime = UnixTime::from_secs(1234567890);
@@ -814,9 +853,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn replace_file() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn replace_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
         let mtime1 = UnixTime::from_secs(1234567890);
@@ -849,9 +888,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn has_file() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn has_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
         let mtime = UnixTime::from_secs(1234567890);
@@ -871,9 +910,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn get_file() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn get_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
         let mtime = UnixTime::from_secs(1234567890);
@@ -893,9 +932,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn has_matching_file() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn has_matching_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
         let mtime = UnixTime::from_secs(1234567890);
@@ -916,9 +955,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn remove_file() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn remove_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
         let mtime = UnixTime::from_secs(1234567890);
@@ -941,9 +980,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn remove_dir() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn remove_dir() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
         let mtime = UnixTime::from_secs(1234567890);
@@ -1027,9 +1066,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn remove_nothing() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn remove_nothing() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
         index.remove_file_or_dir(&realize_types::Path::parse("foo")?)?;
@@ -1045,7 +1084,7 @@ mod tests {
 
     #[tokio::test]
     async fn all_files_stream() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+        let fixture = Fixture::setup().await?;
 
         let index = &fixture.aindex;
         let mtime = UnixTime::from_secs(1234567890);
@@ -1093,9 +1132,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn last_history_index() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn last_history_index() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
         assert_eq!(0, index.last_history_index()?);
@@ -1129,7 +1168,7 @@ mod tests {
 
     #[tokio::test]
     async fn history_stream() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+        let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
 
@@ -1180,7 +1219,7 @@ mod tests {
 
     #[tokio::test]
     async fn watch_history() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+        let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
         let mut history_rx = index.watch_history();
@@ -1218,7 +1257,7 @@ mod tests {
 
     #[tokio::test]
     async fn watch_history_later_on() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+        let fixture = Fixture::setup().await?;
         let index = &fixture.index;
 
         let mtime = UnixTime::from_secs(1234567890);
@@ -1246,9 +1285,9 @@ mod tests {
 
         Ok(())
     }
-    #[test]
-    fn touch_file() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn touch_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
         let mtime1 = UnixTime::from_secs(1234567890);
@@ -1267,9 +1306,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn mark_dirty_recursive_file() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn mark_dirty_recursive_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
         let index = &fixture.index;
         let mtime = UnixTime::from_secs(1234567890);
 
@@ -1282,7 +1321,7 @@ mod tests {
         // Mark the file dirty recursively
         {
             let txn = index.db.begin_write()?;
-            mark_dirty_recursive(&txn, &path)?;
+            mark_dirty_recursive(&txn, &path, &fixture.dirty_paths)?;
             txn.commit()?;
         }
 
@@ -1295,9 +1334,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn mark_dirty_recursive_directory() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn mark_dirty_recursive_directory() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
         let index = &fixture.index;
         let mtime = UnixTime::from_secs(1234567890);
 
@@ -1321,7 +1360,7 @@ mod tests {
         {
             let txn = index.db.begin_write()?;
             let foo_dir = realize_types::Path::parse("foo")?;
-            mark_dirty_recursive(&txn, &foo_dir)?;
+            mark_dirty_recursive(&txn, &foo_dir, &fixture.dirty_paths)?;
             txn.commit()?;
         }
 
@@ -1343,16 +1382,16 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn mark_dirty_recursive_nonexistent_path() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn mark_dirty_recursive_nonexistent_path() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
         let index = &fixture.index;
 
         // Mark a non-existent path dirty recursively; it shouldn't fail.
         {
             let txn = index.db.begin_write()?;
             let nonexistent = realize_types::Path::parse("nonexistent")?;
-            mark_dirty_recursive(&txn, &nonexistent)?;
+            mark_dirty_recursive(&txn, &nonexistent, &fixture.dirty_paths)?;
             txn.commit()?;
         }
 
@@ -1365,9 +1404,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_make_all_dirty() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn test_make_all_dirty() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
         let index = &fixture.index;
         let mtime = UnixTime::from_secs(1234567890);
 
@@ -1389,7 +1428,7 @@ mod tests {
         // Mark all files dirty
         {
             let txn = index.db.begin_write()?;
-            make_all_dirty(&txn)?;
+            make_all_dirty(&txn, &fixture.dirty_paths)?;
             txn.commit()?;
         }
 
@@ -1404,24 +1443,24 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_make_all_dirty_empty_index() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn test_make_all_dirty_empty_index() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
         let index = &fixture.index;
 
         // Mark all files dirty on empty index; it shouldn't fail
         {
             let txn = index.db.begin_write()?;
-            make_all_dirty(&txn)?;
+            make_all_dirty(&txn, &fixture.dirty_paths)?;
             txn.commit()?;
         }
 
         Ok(())
     }
 
-    #[test]
-    fn test_make_all_dirty_with_invalid_paths() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn test_make_all_dirty_with_invalid_paths() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
         let index = &fixture.index;
         let mtime = UnixTime::from_secs(1234567890);
 
@@ -1457,7 +1496,7 @@ mod tests {
         // Mark all files dirty
         {
             let txn = index.db.begin_write()?;
-            make_all_dirty(&txn)?;
+            make_all_dirty(&txn, &fixture.dirty_paths)?;
             txn.commit()?;
         }
 

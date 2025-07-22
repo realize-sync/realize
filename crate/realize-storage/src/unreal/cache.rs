@@ -6,7 +6,7 @@ use super::arena_cache::{self, ArenaCache, CURRENT_INODE_RANGE_TABLE, DIRECTORY_
 use super::types::{FileAvailability, FileMetadata, InodeAssignment, ReadDirEntry};
 
 use crate::real::notifier::{Notification, Progress};
-use crate::{Blob, Inode, StorageError};
+use crate::{Blob, DirtyPaths, Inode, StorageError};
 use bimap::BiMap;
 use realize_types::{Arena, Path, Peer, UnixTime};
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
@@ -107,11 +107,12 @@ impl UnrealCacheBlocking {
     }
 
     /// Add an arena to the database.
-    pub fn add_arena(
+    pub(crate) fn add_arena(
         &mut self,
         arena: Arena,
         db: Arc<Database>,
         blob_dir: PathBuf,
+        dirty_paths: Arc<DirtyPaths>,
     ) -> anyhow::Result<()> {
         let arena_root = match self.arena_roots.get_by_left(&arena) {
             Some(inode) => *inode,
@@ -129,8 +130,10 @@ impl UnrealCacheBlocking {
                 arena_root
             }
         };
-        self.arena_caches
-            .insert(arena, ArenaCache::new(arena, arena_root, db, blob_dir)?);
+        self.arena_caches.insert(
+            arena,
+            ArenaCache::new(arena, arena_root, db, blob_dir, dirty_paths)?,
+        );
 
         Ok(())
     }
@@ -256,14 +259,19 @@ impl UnrealCacheAsync {
     }
 
     /// Create a new cache with the database at the given path.
-    pub async fn with_db<T>(db: Arc<redb::Database>, arenas: T) -> Result<Self, anyhow::Error>
+    pub(crate) async fn with_db<T>(
+        db: Arc<redb::Database>,
+        arenas: T,
+    ) -> Result<Self, anyhow::Error>
     where
-        T: IntoIterator<Item = (Arena, Arc<redb::Database>, PathBuf)> + Send + 'static,
+        T: IntoIterator<Item = (Arena, Arc<redb::Database>, PathBuf, Arc<DirtyPaths>)>
+            + Send
+            + 'static,
     {
         task::spawn_blocking(move || {
             let mut cache = UnrealCacheBlocking::new(db)?;
-            for (arena, db, blob_dir) in arenas.into_iter() {
-                cache.add_arena(arena, db, blob_dir)?;
+            for (arena, db, blob_dir, dirty_paths) in arenas.into_iter() {
+                cache.add_arena(arena, db, blob_dir, dirty_paths)?;
             }
 
             Ok::<_, anyhow::Error>(Self::new(cache))
@@ -488,18 +496,20 @@ mod tests {
             Ok(Self { cache, tempdir })
         }
 
-        fn setup_with_arena(arena: Arena) -> anyhow::Result<Fixture> {
+        async fn setup_with_arena(arena: Arena) -> anyhow::Result<Fixture> {
             let mut fixture = Self::setup()?;
-            fixture.add_arena(arena)?;
+            fixture.add_arena(arena).await?;
 
             Ok(fixture)
         }
 
-        fn add_arena(&mut self, arena: Arena) -> anyhow::Result<()> {
+        async fn add_arena(&mut self, arena: Arena) -> anyhow::Result<()> {
             let blob_dir = self.tempdir.child(format!("{arena}/blobs"));
             blob_dir.create_dir_all()?;
+            let db = redb_utils::in_memory()?;
+            let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
             self.cache
-                .add_arena(arena, redb_utils::in_memory()?, blob_dir.to_path_buf())?;
+                .add_arena(arena, db, blob_dir.to_path_buf(), dirty_paths)?;
             Ok(())
         }
 
@@ -519,9 +529,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn open_creates_tables() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn open_creates_tables() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let cache = &fixture.cache;
 
         let txn = cache.db.begin_read()?;
@@ -532,10 +542,10 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn initial_dir_mtime() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn initial_dir_mtime() -> anyhow::Result<()> {
         let arena = Arena::from("documents/letters");
-        let fixture = Fixture::setup_with_arena(arena)?;
+        let fixture = Fixture::setup_with_arena(arena).await?;
 
         // There might not be any mtime at this point, but dir_mtime should not fail.
         fixture.cache.dir_mtime(Inode(1))?;
@@ -547,12 +557,12 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn lookup_finds_entry() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn lookup_finds_entry() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup()?;
-        fixture.add_arena(Arena::from("arenas/test1"))?;
-        fixture.add_arena(Arena::from("arenas/test2"))?;
-        fixture.add_arena(Arena::from("other"))?;
+        fixture.add_arena(Arena::from("arenas/test1")).await?;
+        fixture.add_arena(Arena::from("arenas/test2")).await?;
+        fixture.add_arena(Arena::from("other")).await?;
 
         let cache = &fixture.cache;
 
@@ -571,9 +581,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn lookup_returns_notfound_for_missing_entry() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn lookup_returns_notfound_for_missing_entry() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let cache = &fixture.cache;
 
         assert!(matches!(
@@ -584,12 +594,12 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn readdir_returns_arena_dirs() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn readdir_returns_arena_dirs() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup()?;
-        fixture.add_arena(Arena::from("arenas/test1"))?;
-        fixture.add_arena(Arena::from("arenas/test2"))?;
-        fixture.add_arena(Arena::from("other"))?;
+        fixture.add_arena(Arena::from("arenas/test1")).await?;
+        fixture.add_arena(Arena::from("arenas/test2")).await?;
+        fixture.add_arena(Arena::from("other")).await?;
 
         let cache = &fixture.cache;
         assert_unordered::assert_eq_unordered!(
@@ -620,20 +630,20 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn alloc_inode() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn alloc_inode() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup()?;
 
         assert!(fixture.get_current_inode_range()?.is_none());
 
-        fixture.add_arena(Arena::from("others"))?;
+        fixture.add_arena(Arena::from("others")).await?;
         assert_eq!(
             Some((Inode(2), Inode(102))),
             fixture.get_current_inode_range()?
         );
         assert_eq!(Inode(2), fixture.cache.arena_root(Arena::from("others"))?);
 
-        fixture.add_arena(Arena::from("arenas/test1"))?;
+        fixture.add_arena(Arena::from("arenas/test1")).await?;
         assert_eq!(
             Some((Inode(4), Inode(102))),
             fixture.get_current_inode_range()?
@@ -643,7 +653,7 @@ mod tests {
             fixture.cache.arena_root(Arena::from("arenas/test1"))?
         );
 
-        fixture.add_arena(Arena::from("arenas/test2"))?;
+        fixture.add_arena(Arena::from("arenas/test2")).await?;
         assert_eq!(
             Some((Inode(5), Inode(102))),
             fixture.get_current_inode_range()?
@@ -664,7 +674,7 @@ mod tests {
         }
 
         // Next allocation exhausts the range
-        fixture.add_arena(Arena::from("another"))?;
+        fixture.add_arena(Arena::from("another")).await?;
         assert_eq!(
             Some((Inode(101), Inode(102))),
             fixture.get_current_inode_range()?
@@ -675,7 +685,7 @@ mod tests {
         );
 
         // Next inode allocation require a new range allocation.
-        fixture.add_arena(Arena::from("theone"))?;
+        fixture.add_arena(Arena::from("theone")).await?;
         assert_eq!(
             Some((Inode(102), Inode(202))),
             fixture.get_current_inode_range()?

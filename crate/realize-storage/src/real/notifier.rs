@@ -353,8 +353,11 @@ async fn send_notifications(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::{hash, redb_utils};
-    use std::time::Duration;
+    use crate::{
+        DirtyPaths,
+        utils::{hash, redb_utils},
+    };
+    use std::{sync::Arc, time::Duration};
 
     fn test_arena() -> Arena {
         Arena::from("myarena")
@@ -368,7 +371,9 @@ mod tests {
     impl Fixture {
         async fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
-            let index = RealIndexAsync::with_db(test_arena(), redb_utils::in_memory()?).await?;
+            let db = redb_utils::in_memory()?;
+            let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
+            let index = RealIndexAsync::with_db(test_arena(), db, dirty_paths).await?;
 
             Ok(Self {
                 index,

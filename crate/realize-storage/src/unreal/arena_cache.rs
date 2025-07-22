@@ -3,9 +3,10 @@ use super::types::{
     BlobId, DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry,
     InodeAssignment, PeerTableEntry, ReadDirEntry,
 };
+use crate::Blob;
+use crate::engine::DirtyPaths;
 use crate::real::notifier::{Notification, Progress};
 use crate::utils::holder::Holder;
-use crate::{Blob, engine};
 use crate::{Inode, StorageError};
 use realize_types::{Arena, ByteRanges, Hash, Path, Peer, UnixTime};
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
@@ -90,6 +91,7 @@ pub(crate) struct ArenaCache {
     arena_root: Inode,
     db: Arc<Database>,
     blobstore: Arc<Blobstore>,
+    dirty_paths: Arc<DirtyPaths>,
 }
 
 impl ArenaCache {
@@ -99,6 +101,7 @@ impl ArenaCache {
         arena_root: Inode,
         db: Arc<Database>,
         blob_dir: PathBuf,
+        dirty_paths: Arc<DirtyPaths>,
     ) -> Result<Self, StorageError> {
         // Ensure the database has the required tables
         {
@@ -121,6 +124,7 @@ impl ArenaCache {
             arena_root,
             db,
             blobstore,
+            dirty_paths,
         })
     }
 
@@ -374,7 +378,7 @@ impl ArenaCache {
                     self.blobstore.delete_blob(blob_id)?;
                 }
             }
-            engine::mark_dirty(txn, &entry.content.path)?;
+            self.dirty_paths.mark_dirty(txn, &entry.content.path)?;
         }
 
         file_table.insert((file_inode, key), Holder::new(entry)?)?;
@@ -437,7 +441,7 @@ impl ArenaCache {
             // TODO: delete empty directories, up to the arena root
 
             if let Some(path) = path {
-                engine::mark_dirty(&txn, &path)?;
+                self.dirty_paths.mark_dirty(&txn, &path)?;
             }
 
             // Check if the default entry has a blob and delete it
@@ -583,13 +587,14 @@ pub(crate) fn mark_dirty_recursive(
     txn: &WriteTransaction,
     arena_root: Inode,
     path: Option<&Path>,
+    dirty_paths: &Arc<DirtyPaths>,
 ) -> Result<(), StorageError> {
     let dir_table = txn.open_table(DIRECTORY_TABLE)?;
     match do_lookup_path(&dir_table, arena_root, path) {
         Ok((inode, _)) => {
             let file_table = txn.open_table(FILE_TABLE)?;
-            mark_file_dirty(txn, &file_table, inode)?;
-            mark_dir_dirty(txn, &dir_table, &file_table, inode)?;
+            mark_file_dirty(txn, &file_table, inode, dirty_paths)?;
+            mark_dir_dirty(txn, &dir_table, &file_table, inode, dirty_paths)?;
 
             Ok(())
         }
@@ -602,9 +607,10 @@ fn mark_file_dirty(
     txn: &WriteTransaction,
     file_table: &redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
     inode: Inode,
+    dirty_paths: &Arc<DirtyPaths>,
 ) -> Result<(), StorageError> {
     if let Some(entry) = file_table.get((inode, ""))? {
-        engine::mark_dirty(txn, &entry.value().parse()?.content.path)?;
+        dirty_paths.mark_dirty(txn, &entry.value().parse()?.content.path)?;
     }
 
     Ok(())
@@ -615,6 +621,7 @@ fn mark_dir_dirty(
     dir_table: &redb::Table<'_, (Inode, &str), Holder<DirTableEntry>>,
     file_table: &redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
     inode: Inode,
+    dirty_paths: &Arc<DirtyPaths>,
 ) -> Result<(), StorageError> {
     for item in dir_table.range((inode, "")..(inode.plus(1), ""))? {
         let (key, value) = item?;
@@ -624,10 +631,10 @@ fn mark_dir_dirty(
         if let DirTableEntry::Regular(entry) = value.value().parse()? {
             match entry.assignment {
                 InodeAssignment::File => {
-                    mark_file_dirty(txn, file_table, entry.inode)?;
+                    mark_file_dirty(txn, file_table, entry.inode, dirty_paths)?;
                 }
                 InodeAssignment::Directory => {
-                    mark_dir_dirty(txn, dir_table, file_table, entry.inode)?;
+                    mark_dir_dirty(txn, dir_table, file_table, entry.inode, dirty_paths)?;
                 }
             }
         }
@@ -727,9 +734,25 @@ pub(crate) fn do_dir_mtime(
     Err(StorageError::NotFound)
 }
 
+// Return the default file entry for a path.
+pub(crate) fn get_file_entry_for_path(
+    txn: &ReadTransaction,
+    root: Inode,
+    path: &Path,
+) -> Result<FileTableEntry, StorageError> {
+    let dir_table = txn.open_table(DIRECTORY_TABLE)?;
+    let (inode, assignment) = do_lookup_path(&dir_table, root, Some(path))?;
+    if assignment != InodeAssignment::File {
+        return Err(StorageError::IsADirectory);
+    }
+    let file_table = txn.open_table(FILE_TABLE)?;
+
+    get_file_entry(&file_table, inode, None)?.ok_or(StorageError::NotFound)
+}
+
 /// Get a [FileTableEntry] for a specific peer.
 fn get_file_entry(
-    file_table: &redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
+    file_table: &impl redb::ReadableTable<(Inode, &'static str), Holder<'static, FileTableEntry>>,
     inode: Inode,
     peer: Option<Peer>,
 ) -> Result<Option<FileTableEntry>, StorageError> {
@@ -1006,11 +1029,13 @@ fn do_unmark_peer_file(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::real::notifier::Notification;
     use crate::unreal::cache::UnrealCacheBlocking;
     use crate::unreal::types::{FileMetadata, InodeAssignment};
     use crate::utils::redb_utils;
-    use crate::{Inode, StorageError, engine};
+    use crate::{DirtyPaths, Inode, StorageError, engine};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Hash, Path, Peer, UnixTime};
@@ -1045,10 +1070,11 @@ mod tests {
     struct Fixture {
         arena: Arena,
         cache: UnrealCacheBlocking,
+        dirty_paths: Arc<DirtyPaths>,
         _tempdir: TempDir,
     }
     impl Fixture {
-        fn setup_with_arena(arena: Arena) -> anyhow::Result<Fixture> {
+        async fn setup_with_arena(arena: Arena) -> anyhow::Result<Fixture> {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
             let mut cache = UnrealCacheBlocking::new(redb_utils::in_memory()?)?;
@@ -1058,11 +1084,14 @@ mod tests {
             if let Some(p) = child.parent() {
                 std::fs::create_dir_all(p)?;
             }
-            cache.add_arena(arena, redb_utils::in_memory()?, blob_dir.to_path_buf())?;
+            let db = redb_utils::in_memory()?;
+            let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
+            cache.add_arena(arena, db, blob_dir.to_path_buf(), Arc::clone(&dirty_paths))?;
 
             Ok(Self {
-                arena: arena,
+                arena,
                 cache,
+                dirty_paths,
                 _tempdir: tempdir,
             })
         }
@@ -1140,9 +1169,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn add_creates_directories() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn add_creates_directories() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let cache = &fixture.cache;
         let file_path = Path::parse("a/b/c.txt")?;
         let mtime = test_time();
@@ -1161,10 +1190,10 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn add_updates_dir_mtime() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn add_updates_dir_mtime() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena)?;
+        let fixture = Fixture::setup_with_arena(arena).await?;
         let mtime = test_time();
         let path1 = Path::parse("a/b/1.txt")?;
         fixture.add_file(&path1, 100, &mtime)?;
@@ -1177,9 +1206,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn add_marks_dirty() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn add_marks_dirty() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let file_path = Path::parse("a/b/c.txt")?;
 
         fixture.add_file(&file_path, 100, &test_time())?;
@@ -1189,9 +1218,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn replace_existing_file() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn replace_existing_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let cache = &fixture.cache;
         let peer = test_peer();
         let arena = test_arena();
@@ -1230,9 +1259,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn replace_marks_dirty() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn replace_marks_dirty() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let cache = &fixture.cache;
         let peer = test_peer();
         let arena = test_arena();
@@ -1268,9 +1297,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn ignored_replace_does_not_mark_dirty() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn ignored_replace_does_not_mark_dirty() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let cache = &fixture.cache;
         let peer = test_peer();
         let arena = test_arena();
@@ -1307,9 +1336,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn ignore_duplicate_add() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn ignore_duplicate_add() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let file_path = Path::parse("file.txt")?;
 
         fixture.add_file(&file_path, 100, &test_time())?;
@@ -1323,9 +1352,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn ignore_replace_with_wrong_hash() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn ignore_replace_with_wrong_hash() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let cache = &fixture.cache;
         let file_path = Path::parse("file.txt")?;
         let peer = test_peer();
@@ -1362,9 +1391,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn unlink_removes_file() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn unlink_removes_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let cache = &fixture.cache;
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
@@ -1381,9 +1410,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn unlink_marks_dirty() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn unlink_marks_dirty() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let cache = &fixture.cache;
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
@@ -1399,10 +1428,10 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn unlink_updates_dir_mtime() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn unlink_updates_dir_mtime() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena)?;
+        let fixture = Fixture::setup_with_arena(arena).await?;
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
 
@@ -1415,9 +1444,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn unlink_ignores_wrong_old_hash() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn unlink_ignores_wrong_old_hash() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let cache = &fixture.cache;
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
@@ -1443,9 +1472,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn lookup_finds_entry() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn lookup_finds_entry() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let cache = &fixture.cache;
         let arena = test_arena();
         let file_path = Path::parse("a/file.txt")?;
@@ -1469,9 +1498,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn lookup_returns_notfound_for_missing_entry() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn lookup_returns_notfound_for_missing_entry() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let cache = &fixture.cache;
 
         assert!(matches!(
@@ -1482,9 +1511,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn lookup_path_finds_entry() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn lookup_path_finds_entry() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let cache = &fixture.cache;
         let arena = test_arena();
         let path = Path::parse("a/b/c/file.txt")?;
@@ -1503,9 +1532,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn readdir_returns_all_entries() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn readdir_returns_all_entries() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let cache = &fixture.cache;
         let arena = test_arena();
         let mtime = test_time();
@@ -1550,9 +1579,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn get_file_metadata_tracks_hash_chain() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn get_file_metadata_tracks_hash_chain() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let cache = &fixture.cache;
 
         let peer1 = Peer::from("peer1");
@@ -1604,9 +1633,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn file_availability_deals_with_conflicting_adds() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn file_availability_deals_with_conflicting_adds() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let cache = &fixture.cache;
 
         let a = Peer::from("a");
@@ -1668,9 +1697,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn file_availablility_deals_with_different_versions() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn file_availablility_deals_with_different_versions() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let cache = &fixture.cache;
 
         let a = Peer::from("a");
@@ -1793,9 +1822,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn file_availability_when_a_peer_goes_away() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn file_availability_when_a_peer_goes_away() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let cache = &fixture.cache;
 
         let a = Peer::from("a");
@@ -1879,9 +1908,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn mark_and_delete_peer_files() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn mark_and_delete_peer_files() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let cache = &fixture.cache;
         let arena = test_arena();
         let peer1 = Peer::from("1");
@@ -2030,9 +2059,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn mark_dirty_recursive_file() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn mark_dirty_recursive_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let mtime = test_time();
 
         // Add a single file
@@ -2043,7 +2072,12 @@ mod tests {
         // Mark the file dirty recursively
         {
             let txn = fixture.begin_write()?;
-            mark_dirty_recursive(&txn, fixture.arena_root()?, Some(&file_path))?;
+            mark_dirty_recursive(
+                &txn,
+                fixture.arena_root()?,
+                Some(&file_path),
+                &fixture.dirty_paths,
+            )?;
             txn.commit()?;
         }
 
@@ -2056,9 +2090,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn mark_dirty_recursive_directory() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn mark_dirty_recursive_directory() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let mtime = test_time();
 
         // Add files in a directory structure
@@ -2076,7 +2110,12 @@ mod tests {
         // Mark the foo directory dirty recursively
         {
             let txn = fixture.begin_write()?;
-            mark_dirty_recursive(&txn, fixture.arena_root()?, Some(&Path::parse("foo")?))?;
+            mark_dirty_recursive(
+                &txn,
+                fixture.arena_root()?,
+                Some(&Path::parse("foo")?),
+                &fixture.dirty_paths,
+            )?;
             txn.commit()?;
         }
 
@@ -2095,9 +2134,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn mark_dirty_recursive_nested_directory() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn mark_dirty_recursive_nested_directory() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let mtime = test_time();
 
         // Add files in a deeply nested structure
@@ -2119,6 +2158,7 @@ mod tests {
                 &txn,
                 fixture.arena_root()?,
                 Some(&Path::parse("foo/subdir")?),
+                &fixture.dirty_paths,
             )?;
             txn.commit()?;
         }
@@ -2139,9 +2179,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn mark_dirty_recursive_nonexistent_inode() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn mark_dirty_recursive_nonexistent_inode() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let mtime = test_time();
 
         // Add some files
@@ -2157,7 +2197,12 @@ mod tests {
             let txn = acache.db.begin_write()?;
             // Use a very high inode number that shouldn't exist
             let nonexistent_inode = Inode(999999);
-            mark_dirty_recursive(&txn, nonexistent_inode, Some(&Path::parse("foo")?))?;
+            mark_dirty_recursive(
+                &txn,
+                nonexistent_inode,
+                Some(&Path::parse("foo")?),
+                &fixture.dirty_paths,
+            )?;
             txn.commit()?;
         }
 
@@ -2171,9 +2216,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn mark_dirty_recursive_nonexistent_path() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn mark_dirty_recursive_nonexistent_path() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let mtime = test_time();
 
         // Add some files
@@ -2190,6 +2235,7 @@ mod tests {
                 &txn,
                 fixture.arena_root()?,
                 Some(&Path::parse("doesnotexist")?),
+                &fixture.dirty_paths,
             )?;
             txn.commit()?;
         }
@@ -2204,9 +2250,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn mark_dirty_recursive_arena_root() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn mark_dirty_recursive_arena_root() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
 
         // Add files in different directories
         let files = vec![
@@ -2225,7 +2271,7 @@ mod tests {
         // Mark the whole dirty
         {
             let txn = fixture.begin_write()?;
-            mark_dirty_recursive(&txn, fixture.arena_root()?, None)?;
+            mark_dirty_recursive(&txn, fixture.arena_root()?, None, &fixture.dirty_paths)?;
             txn.commit()?;
         }
 

@@ -143,9 +143,7 @@ impl Blobstore {
     #[allow(dead_code)]
     pub(crate) fn local_availability(&self, blob_id: BlobId) -> Result<ByteRanges, StorageError> {
         let txn = self.db.begin_read()?;
-        let blob_table = txn.open_table(BLOB_TABLE)?;
-
-        Ok(get_blob_entry(&blob_table, blob_id)?.written_areas)
+        local_availability(&txn, blob_id)
     }
 
     /// Extend the local availability of a blob.
@@ -170,6 +168,15 @@ impl Blobstore {
 
         Ok(())
     }
+}
+
+pub(crate) fn local_availability(
+    txn: &ReadTransaction,
+    blob_id: BlobId,
+) -> Result<ByteRanges, StorageError> {
+    let blob_table = txn.open_table(BLOB_TABLE)?;
+
+    Ok(get_blob_entry(&blob_table, blob_id)?.written_areas)
 }
 
 fn get_blob_entry(
@@ -419,7 +426,7 @@ mod tests {
     use super::*;
     use crate::unreal::arena_cache::ArenaCache;
     use crate::utils::redb_utils;
-    use crate::{Inode, Notification, UnrealCacheAsync};
+    use crate::{DirtyPaths, Inode, Notification, UnrealCacheAsync};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Path, Peer, UnixTime};
@@ -456,7 +463,7 @@ mod tests {
         tempdir: TempDir,
     }
     impl Fixture {
-        fn setup_with_arena(arena: Arena) -> anyhow::Result<Fixture> {
+        async fn setup_with_arena(arena: Arena) -> anyhow::Result<Fixture> {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
             let mut cache = UnrealCacheBlocking::new(redb_utils::in_memory()?)?;
@@ -466,7 +473,9 @@ mod tests {
             if let Some(p) = child.parent() {
                 std::fs::create_dir_all(p)?;
             }
-            cache.add_arena(arena, redb_utils::in_memory()?, blob_dir.to_path_buf())?;
+            let db = redb_utils::in_memory()?;
+            let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
+            cache.add_arena(arena, db, blob_dir.to_path_buf(), dirty_paths)?;
 
             let async_cache = cache.into_async();
             let cache = async_cache.blocking();
@@ -554,7 +563,7 @@ mod tests {
     #[tokio::test]
     async fn read_blob_within_available_ranges() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena)?;
+        let fixture = Fixture::setup_with_arena(arena).await?;
         let acache = fixture.arena_cache()?;
 
         let inode = fixture.add_file("test.txt", 1000)?;
@@ -587,7 +596,7 @@ mod tests {
     #[tokio::test]
     async fn read_blob_after_seek_within_available_range() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena)?;
+        let fixture = Fixture::setup_with_arena(arena).await?;
         let acache = fixture.arena_cache()?;
 
         let inode = fixture.add_file("test.txt", 1000)?;
@@ -617,7 +626,7 @@ mod tests {
     #[tokio::test]
     async fn read_blob_outside_available_ranges() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena)?;
+        let fixture = Fixture::setup_with_arena(arena).await?;
         let acache = fixture.arena_cache()?;
         let inode = fixture.add_file("test.txt", 1000)?;
 
@@ -646,7 +655,7 @@ mod tests {
     #[tokio::test]
     async fn writing_to_blob_updates_local_availability() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena)?;
+        let fixture = Fixture::setup_with_arena(arena).await?;
         let acache = fixture.arena_cache()?;
         let inode = fixture.add_file("test.txt", 21)?;
 
@@ -680,7 +689,7 @@ mod tests {
     #[tokio::test]
     async fn writing_to_blob_out_of_order() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena)?;
+        let fixture = Fixture::setup_with_arena(arena).await?;
         let acache = fixture.arena_cache()?;
         let inode = fixture.add_file("test.txt", 21)?;
 
@@ -712,7 +721,7 @@ mod tests {
     #[tokio::test]
     async fn writing_to_blob_then_reading_it() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena)?;
+        let fixture = Fixture::setup_with_arena(arena).await?;
         let inode = fixture.add_file("test.txt", 100)?;
 
         let mut blob = fixture.async_cache.open_file(inode).await?;
@@ -728,10 +737,10 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn open_file_creates_sparse_file() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn open_file_creates_sparse_file() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena)?;
+        let fixture = Fixture::setup_with_arena(arena).await?;
         let acache = fixture.arena_cache()?;
         let file_path = Path::parse("foobar")?;
 
@@ -764,9 +773,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn blob_deleted_on_file_overwrite() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn blob_deleted_on_file_overwrite() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let cache = &fixture.cache;
         let acache = fixture.arena_cache()?;
         let arena = test_arena();
@@ -802,9 +811,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn blob_deleted_on_file_removal() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn blob_deleted_on_file_removal() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let acache = fixture.arena_cache()?;
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
@@ -828,9 +837,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn blob_deleted_on_catchup_removal() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
+    #[tokio::test]
+    async fn blob_deleted_on_catchup_removal() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let cache = &fixture.cache;
         let acache = fixture.arena_cache()?;
         let arena = test_arena();
@@ -863,10 +872,10 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn blob_update_extends_range() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn blob_update_extends_range() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena)?;
+        let fixture = Fixture::setup_with_arena(arena).await?;
         let acache = fixture.arena_cache()?;
         let file_path = Path::parse("file.txt")?;
 

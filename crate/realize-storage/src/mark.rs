@@ -3,7 +3,7 @@
 use crate::real::index;
 use crate::unreal::arena_cache;
 use crate::utils::holder::{ByteConversionError, ByteConvertible, Holder, NamedType};
-use crate::{Inode, StorageError};
+use crate::{DirtyPaths, Inode, StorageError};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
 use realize_types::Path;
@@ -48,11 +48,16 @@ pub enum Mark {
 pub struct PathMarks {
     db: Arc<Database>,
     arena_root: Inode,
+    dirty_paths: Arc<DirtyPaths>,
 }
 
 impl PathMarks {
     /// Create a new PathMarks with the given default mark.
-    pub fn new(db: Arc<Database>, arena_root: Inode) -> Result<Self, StorageError> {
+    pub fn new(
+        db: Arc<Database>,
+        arena_root: Inode,
+        dirty_paths: Arc<DirtyPaths>,
+    ) -> Result<Self, StorageError> {
         // Ensure the database has the required mark table
         {
             let txn = db.begin_write()?;
@@ -60,7 +65,11 @@ impl PathMarks {
             txn.commit()?;
         }
 
-        Ok(Self { db, arena_root })
+        Ok(Self {
+            db,
+            arena_root,
+            dirty_paths,
+        })
     }
 
     /// Get the mark for a specific path.
@@ -152,12 +161,12 @@ impl PathMarks {
         path_or_root: Option<&Path>,
     ) -> Result<(), StorageError> {
         if let Some(path) = path_or_root {
-            index::mark_dirty_recursive(txn, &path)?;
+            index::mark_dirty_recursive(txn, &path, &self.dirty_paths)?;
         } else {
-            index::make_all_dirty(txn)?;
+            index::make_all_dirty(txn, &self.dirty_paths)?;
         }
 
-        arena_cache::mark_dirty_recursive(txn, self.arena_root, path_or_root)?;
+        arena_cache::mark_dirty_recursive(txn, self.arena_root, path_or_root, &self.dirty_paths)?;
 
         Ok(())
     }
@@ -248,23 +257,26 @@ mod tests {
         acache: ArenaCache,
         index: RealIndexBlocking,
         marks: PathMarks,
+        dirty_paths: Arc<DirtyPaths>,
     }
 
     impl Fixture {
-        fn setup() -> anyhow::Result<Self> {
+        async fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
 
             let arena = Arena::from("test");
             let db = redb_utils::in_memory()?;
+            let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
             let arena_root = Inode(300);
             let acache = ArenaCache::new(
                 arena,
                 arena_root,
                 Arc::clone(&db),
                 PathBuf::from("/dev/null"),
+                Arc::clone(&dirty_paths),
             )?;
-            let index = RealIndexBlocking::new(arena, Arc::clone(&db))?;
-            let marks = PathMarks::new(Arc::clone(&db), arena_root)?;
+            let index = RealIndexBlocking::new(arena, Arc::clone(&db), Arc::clone(&dirty_paths))?;
+            let marks = PathMarks::new(Arc::clone(&db), arena_root, Arc::clone(&dirty_paths))?;
 
             Ok(Self {
                 arena,
@@ -272,6 +284,7 @@ mod tests {
                 acache,
                 index,
                 marks,
+                dirty_paths,
             })
         }
 
@@ -318,8 +331,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn convert_mark_table_entry() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn convert_mark_table_entry() -> anyhow::Result<()> {
         let entry = MarkTableEntry { mark: Mark::Own };
 
         assert_eq!(
@@ -337,9 +350,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn default_mark() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn default_mark() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         // New PathMarks should return default mark (Watch) for any path
         let path = Path::parse("some/file.txt")?;
@@ -350,9 +363,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn set_and_get_root_mark() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn set_and_get_root_mark() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         // Set root mark to Keep
         fixture.marks.set_root_mark(Mark::Keep)?;
@@ -372,9 +385,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn set_and_get_path_mark() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn set_and_get_path_mark() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         let file_path = Path::parse("dir/file.txt")?;
         let dir_path = Path::parse("dir")?;
@@ -410,9 +423,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn hierarchical_mark_inheritance() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn hierarchical_mark_inheritance() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         // Set root mark
         fixture.marks.set_root_mark(Mark::Watch)?;
@@ -441,9 +454,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn clear_mark() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn clear_mark() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         let file_path = Path::parse("dir/file.txt")?;
         let dir_path = Path::parse("dir")?;
@@ -477,9 +490,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn clear_mark_with_root_mark() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn clear_mark_with_root_mark() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         // Set root mark
         fixture.marks.set_root_mark(Mark::Keep)?;
@@ -499,9 +512,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn mark_persistence() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn mark_persistence() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         let file_path = Path::parse("test/file.txt")?;
         let dir_path = Path::parse("test")?;
@@ -512,7 +525,11 @@ mod tests {
         fixture.marks.set_mark(&file_path, Mark::Own)?;
 
         // Create new PathMarks instance with same database
-        let new_marks = PathMarks::new(Arc::clone(&fixture.db), fixture.marks.arena_root)?;
+        let new_marks = PathMarks::new(
+            Arc::clone(&fixture.db),
+            fixture.marks.arena_root,
+            Arc::clone(&fixture.dirty_paths),
+        )?;
 
         // Verify marks persist
         assert_eq!(new_marks.get_mark(&file_path)?, Mark::Own);
@@ -525,9 +542,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn all_mark_types() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn all_mark_types() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         let watch_path = Path::parse("watch/file.txt")?;
         let keep_path = Path::parse("keep/file.txt")?;
@@ -545,9 +562,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn mark_changes() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn mark_changes() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         let file_path = Path::parse("test/file.txt")?;
 
@@ -571,9 +588,9 @@ mod tests {
     }
 
     // New dirty flag tests
-    #[test]
-    fn set_mark_marks_dirty_when_effective() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn set_mark_marks_dirty_when_effective() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         // Add files to both index and cache
         let in_index = Path::parse("test/in_index.txt")?;
@@ -595,9 +612,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn set_mark_does_not_mark_dirty_when_not_effective() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn set_mark_does_not_mark_dirty_when_not_effective() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         // Add files to both index and cache
         let file_path = Path::parse("test/file.txt")?;
@@ -614,9 +631,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn set_root_mark_marks_all_dirty() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn set_root_mark_marks_all_dirty() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         // Add multiple files to both index and cache
         let index_files = vec![
@@ -655,9 +672,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn clear_mark_marks_dirty_when_effective() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn clear_mark_marks_dirty_when_effective() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         // Add files to both index and cache
         let file_path = Path::parse("test/file.txt")?;
@@ -676,9 +693,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn clear_mark_does_not_mark_dirty_when_it_did_not_exist() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn clear_mark_does_not_mark_dirty_when_it_did_not_exist() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         // Add files to both index and cache
         let file_path = Path::parse("test/file.txt")?;
@@ -695,9 +712,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn clear_mark_does_not_mark_dirty_when_not_effective() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn clear_mark_does_not_mark_dirty_when_not_effective() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         // Add files to both index and cache
         let file_path = Path::parse("test/file.txt")?;
@@ -714,9 +731,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn hierarchical_mark_changes_mark_dirty_recursively() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn hierarchical_mark_changes_mark_dirty_recursively() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         // Add files in a directory structure
         let dir_file1 = Path::parse("dir/file1.txt")?;
@@ -750,9 +767,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn specific_file_mark_overrides_directory_mark() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn specific_file_mark_overrides_directory_mark() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         // Add files to both index and cache
         let dir_path = Path::parse("dir")?;
@@ -772,9 +789,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn clear_directory_mark_affects_all_files_in_directory() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn clear_directory_mark_affects_all_files_in_directory() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         // Add files in a directory structure
         let files = vec![
@@ -803,9 +820,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn nonexistent_files_not_marked_dirty() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn nonexistent_files_not_marked_dirty() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         // Set marks on paths that don't exist in index or cache
         let nonexistent_path = Path::parse("nonexistent/file.txt")?;
@@ -819,9 +836,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn root_mark_clearing_marks_all_dirty() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn root_mark_clearing_marks_all_dirty() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
 
         // Add multiple files to both index and cache
         let files_in_index = vec![

@@ -1,3 +1,4 @@
+use crate::DirtyPaths;
 use crate::utils::redb_utils;
 
 use super::config::{ArenaConfig, CacheConfig, StorageConfig};
@@ -12,10 +13,13 @@ where
 {
     let mut arena_dbs = vec![];
     for arena in arenas.into_iter() {
+        let db = redb_utils::in_memory()?;
+        let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
         arena_dbs.push((
             arena,
-            redb_utils::in_memory()?,
+            db,
             std::path::PathBuf::from("/dev/null"),
+            dirty_paths,
         ));
     }
     let cache = UnrealCacheAsync::with_db(redb_utils::in_memory()?, arena_dbs).await?;

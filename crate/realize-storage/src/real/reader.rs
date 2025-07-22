@@ -78,7 +78,10 @@ impl AsyncSeek for Reader {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::DirtyPaths;
     use crate::utils::{hash, redb_utils};
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
@@ -105,7 +108,9 @@ mod tests {
             let root = tempdir.child("root");
             root.create_dir_all()?;
 
-            let index = RealIndexAsync::with_db(test_arena(), redb_utils::in_memory()?).await?;
+            let db = redb_utils::in_memory()?;
+            let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
+            let index = RealIndexAsync::with_db(test_arena(), db, dirty_paths).await?;
 
             Ok(Self {
                 index,

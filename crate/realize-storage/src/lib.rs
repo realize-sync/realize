@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::{collections::HashMap, sync::Arc};
 
 use config::StorageConfig;
+use engine::DirtyPaths;
 use real::index::RealIndexAsync;
 use real::watcher::RealWatcher;
 use tokio::sync::mpsc;
@@ -64,28 +65,34 @@ impl Storage {
         let mut arena_dbs = HashMap::new();
         for (arena, arena_config) in &config.arenas {
             let db = redb_utils::open(&arena_config.db).await?;
-            arena_dbs.insert(*arena, (arena_config, db));
+            let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
+            arena_dbs.insert(*arena, (arena_config, db, dirty_paths));
         }
 
         let cache = UnrealCacheAsync::with_db(
             redb_utils::open(&config.cache.db).await?,
             arena_dbs
                 .iter()
-                .map(|(arena, (config, db))| {
-                    (*arena, Arc::clone(db), config.blob_dir.to_path_buf())
+                .map(|(arena, (config, db, dirty_paths))| {
+                    (
+                        *arena,
+                        Arc::clone(db),
+                        config.blob_dir.to_path_buf(),
+                        Arc::clone(dirty_paths),
+                    )
                 })
                 .collect::<Vec<_>>(),
         )
         .await?;
 
-        for (arena, (arena_config, db)) in arena_dbs {
+        for (arena, (arena_config, db, dirty_paths)) in arena_dbs {
             let root = match arena_config.root.as_ref() {
                 Some(p) => p,
                 None => {
                     continue;
                 }
             };
-            let index = RealIndexAsync::with_db(arena, db.clone()).await?;
+            let index = RealIndexAsync::with_db(arena, db.clone(), dirty_paths).await?;
             let exclude = exclude
                 .iter()
                 .map(|p| realize_types::Path::from_real_path_in(p, root))
