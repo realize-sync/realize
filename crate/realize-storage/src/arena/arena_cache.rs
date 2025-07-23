@@ -1,5 +1,4 @@
 use super::blob::Blobstore;
-use super::types::BlobId;
 use crate::Blob;
 use crate::arena::engine::DirtyPaths;
 use crate::arena::notifier::{Notification, Progress};
@@ -7,6 +6,7 @@ use crate::global::types::{
     DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry, InodeAssignment,
     PeerTableEntry, ReadDirEntry,
 };
+use crate::types::BlobId;
 use crate::utils::holder::Holder;
 use crate::{Inode, StorageError};
 use realize_types::{Arena, ByteRanges, Hash, Path, Peer, UnixTime};

@@ -1,7 +1,7 @@
-use super::types::{BlobId, BlobTableEntry};
-use crate::Inode;
+use super::types::BlobTableEntry;
 use crate::StorageError;
 use crate::global::types::FileTableEntry;
+use crate::types::{BlobId, Inode};
 use crate::utils::holder::Holder;
 use realize_types::{ByteRange, ByteRanges, Hash};
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};

@@ -1,8 +1,5 @@
-use crate::{
-    Inode,
-    arena::types::BlobId,
-    utils::holder::{ByteConversionError, ByteConvertible, NamedType},
-};
+use crate::types::{BlobId, Inode};
+use crate::utils::holder::{ByteConversionError, ByteConvertible, NamedType};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
 use realize_types::{self, Arena, Hash, Path, Peer, UnixTime};
