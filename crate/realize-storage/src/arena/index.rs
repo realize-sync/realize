@@ -1,11 +1,9 @@
 #![allow(dead_code)] // work in progress
 
-use super::index_capnp;
+use super::types::{FileTableEntry, HistoryTableEntry};
 use crate::StorageError;
 use crate::arena::engine::DirtyPaths;
-use crate::utils::holder::{ByteConversionError, ByteConvertible, Holder, NamedType};
-use capnp::message::ReaderOptions;
-use capnp::serialize_packed;
+use crate::utils::holder::{ByteConversionError, Holder};
 use realize_types::{self, Arena, Hash, UnixTime};
 use redb::{Database, ReadableTable as _, TableDefinition, WriteTransaction};
 use std::ops::RangeBounds;
@@ -530,118 +528,6 @@ impl RealIndexAsync {
     }
 }
 
-/// An entry in the file table.
-#[derive(Debug, Clone, PartialEq)]
-pub struct FileTableEntry {
-    pub hash: Hash,
-    pub mtime: UnixTime,
-    pub size: u64,
-}
-
-impl NamedType for FileTableEntry {
-    fn typename() -> &'static str {
-        "index.file"
-    }
-}
-
-impl ByteConvertible<FileTableEntry> for FileTableEntry {
-    fn from_bytes(data: &[u8]) -> Result<FileTableEntry, ByteConversionError> {
-        let message_reader = serialize_packed::read_message(&mut &data[..], ReaderOptions::new())?;
-        let msg: index_capnp::file_table_entry::Reader =
-            message_reader.get_root::<index_capnp::file_table_entry::Reader>()?;
-
-        let mtime = msg.get_mtime()?;
-        let hash: &[u8] = msg.get_hash()?;
-        let hash = parse_hash(hash)?;
-        Ok(FileTableEntry {
-            hash,
-            mtime: UnixTime::new(mtime.get_secs(), mtime.get_nsecs()),
-            size: msg.get_size(),
-        })
-    }
-
-    fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError> {
-        let mut message = ::capnp::message::Builder::new_default();
-        let mut builder: index_capnp::file_table_entry::Builder =
-            message.init_root::<index_capnp::file_table_entry::Builder>();
-
-        builder.set_size(self.size);
-        builder.set_hash(&self.hash.0);
-
-        let mut mtime = builder.init_mtime();
-        mtime.set_secs(self.mtime.as_secs());
-        mtime.set_nsecs(self.mtime.subsec_nanos());
-
-        let mut buffer: Vec<u8> = Vec::new();
-        serialize_packed::write_message(&mut buffer, &message)?;
-
-        Ok(buffer)
-    }
-}
-
-/// An entry in the file table.
-#[derive(Debug, Clone, PartialEq)]
-pub enum HistoryTableEntry {
-    Add(realize_types::Path),
-    Replace(realize_types::Path, Hash),
-    Remove(realize_types::Path, Hash),
-}
-
-impl NamedType for HistoryTableEntry {
-    fn typename() -> &'static str {
-        "index.file"
-    }
-}
-
-impl ByteConvertible<HistoryTableEntry> for HistoryTableEntry {
-    fn from_bytes(data: &[u8]) -> Result<HistoryTableEntry, ByteConversionError> {
-        let message_reader = serialize_packed::read_message(&mut &data[..], ReaderOptions::new())?;
-        let msg: index_capnp::history_table_entry::Reader =
-            message_reader.get_root::<index_capnp::history_table_entry::Reader>()?;
-        match msg.get_kind()? {
-            index_capnp::history_table_entry::Kind::Add => {
-                Ok(HistoryTableEntry::Add(parse_path(msg.get_path()?)?))
-            }
-            index_capnp::history_table_entry::Kind::Replace => Ok(HistoryTableEntry::Replace(
-                parse_path(msg.get_path()?)?,
-                parse_hash(msg.get_old_hash()?)?,
-            )),
-            index_capnp::history_table_entry::Kind::Remove => Ok(HistoryTableEntry::Remove(
-                parse_path(msg.get_path()?)?,
-                parse_hash(msg.get_old_hash()?)?,
-            )),
-        }
-    }
-
-    fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError> {
-        let mut message = ::capnp::message::Builder::new_default();
-        let mut builder: index_capnp::history_table_entry::Builder =
-            message.init_root::<index_capnp::history_table_entry::Builder>();
-
-        match self {
-            HistoryTableEntry::Add(path) => {
-                builder.set_kind(index_capnp::history_table_entry::Kind::Add);
-                builder.set_path(path.as_str());
-            }
-            HistoryTableEntry::Replace(path, old_hash) => {
-                builder.set_kind(index_capnp::history_table_entry::Kind::Replace);
-                builder.set_path(path.as_str());
-                builder.set_old_hash(&old_hash.0);
-            }
-            HistoryTableEntry::Remove(path, old_hash) => {
-                builder.set_kind(index_capnp::history_table_entry::Kind::Remove);
-                builder.set_path(path.as_str());
-                builder.set_old_hash(&old_hash.0);
-            }
-        }
-
-        let mut buffer: Vec<u8> = Vec::new();
-        serialize_packed::write_message(&mut buffer, &message)?;
-
-        Ok(buffer)
-    }
-}
-
 /// Mark paths within the index dirty.
 ///
 /// If the path is a file in the index, it is marked dirty.
@@ -685,18 +571,6 @@ pub(crate) fn make_all_dirty(
     }
 
     Ok(())
-}
-
-fn parse_hash(hash: &[u8]) -> Result<Hash, ByteConversionError> {
-    let hash: [u8; 32] = hash
-        .try_into()
-        .map_err(|_| ByteConversionError::Invalid("hash"))?;
-    let hash = Hash(hash);
-    Ok(hash)
-}
-
-fn parse_path(path: capnp::text::Reader<'_>) -> Result<realize_types::Path, ByteConversionError> {
-    realize_types::Path::parse(path.to_str()?).map_err(|_| ByteConversionError::Invalid("path"))
 }
 
 #[cfg(test)]
@@ -776,50 +650,6 @@ mod tests {
 
         Ok(())
     }
-
-    #[tokio::test]
-    async fn convert_file_table_entry() -> anyhow::Result<()> {
-        let entry = FileTableEntry {
-            size: 200,
-            mtime: UnixTime::new(1234567890, 111),
-            hash: Hash([0xf0; 32]),
-        };
-
-        assert_eq!(
-            entry,
-            FileTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn convert_history_table_entry() -> anyhow::Result<()> {
-        let add = HistoryTableEntry::Add(realize_types::Path::parse("foo/bar.txt")?);
-        assert_eq!(
-            add,
-            HistoryTableEntry::from_bytes(add.clone().to_bytes()?.as_slice())?
-        );
-
-        let remove =
-            HistoryTableEntry::Remove(realize_types::Path::parse("foo/bar.txt")?, Hash([0xfa; 32]));
-        assert_eq!(
-            remove,
-            HistoryTableEntry::from_bytes(remove.clone().to_bytes()?.as_slice())?
-        );
-
-        let replace = HistoryTableEntry::Replace(
-            realize_types::Path::parse("foo/bar.txt")?,
-            Hash([0x1a; 32]),
-        );
-        assert_eq!(
-            replace,
-            HistoryTableEntry::from_bytes(replace.clone().to_bytes()?.as_slice())?
-        );
-
-        Ok(())
-    }
-
     #[tokio::test]
     async fn add_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;

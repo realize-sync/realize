@@ -3,7 +3,7 @@
 @0x950bed21f9dbff63;
 
 using Rust = import "/capnpc/rust.capnp";
-$Rust.parentModule("global");
+$Rust.parentModule("global::types");
 
 struct DirTableEntry {
   union {
@@ -52,18 +52,3 @@ struct Time {
   nsecs @1: UInt32;
 }
 
-# An entry in the blob table.
-struct BlobTableEntry {
-  writtenAreas @0: ByteRanges;
-}
-
-# A sequence of byte ranges.
-struct ByteRanges {
-  ranges @0: List(ByteRange);
-}
-
-# A single byte range.
-struct ByteRange {
-  start @0: UInt64;
-  end @1: UInt64;
-}

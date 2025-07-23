@@ -1,7 +1,7 @@
 @0xca95085c49f2ff10;
 
 using Rust = import "/capnpc/rust.capnp";
-$Rust.parentModule("arena");
+$Rust.parentModule("arena::types");
 
 # Store retry information about a job.
 struct FailedJobTableEntry {

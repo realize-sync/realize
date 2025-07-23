@@ -4,7 +4,7 @@
 
 
 using Rust = import "/capnpc/rust.capnp";
-$Rust.parentModule("arena");
+$Rust.parentModule("arena::types");
 
 # An entry in the blob table.
 struct BlobTableEntry {

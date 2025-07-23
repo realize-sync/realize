@@ -1,6 +1,7 @@
 #![allow(dead_code)] // work in progress
 
-use super::index::{FileTableEntry, HistoryTableEntry, RealIndexAsync};
+use super::index::RealIndexAsync;
+use super::types::{FileTableEntry, HistoryTableEntry};
 use futures::StreamExt as _;
 use realize_types::{Arena, Hash, Path, UnixTime};
 use tokio::{sync::mpsc, task::JoinHandle};

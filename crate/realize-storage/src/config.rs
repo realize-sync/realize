@@ -1,8 +1,7 @@
+use crate::arena::types::Mark;
 use realize_types::Arena;
 use std::collections::HashMap;
 use std::path::PathBuf;
-
-use crate::arena::mark::Mark;
 
 /// Storage configuration.
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]

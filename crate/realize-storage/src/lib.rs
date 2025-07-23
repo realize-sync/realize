@@ -21,11 +21,11 @@ mod types;
 pub mod utils;
 
 pub use arena::blob::{Blob, BlobIncomplete};
-pub use arena::mark::Mark;
 pub use arena::notifier::Notification;
 pub use arena::notifier::Progress;
 pub use arena::reader::Reader;
 pub use arena::store::{Options as RealStoreOptions, RealStore, RealStoreError, SyncedFile};
+pub use arena::types::Mark;
 pub use error::StorageError;
 pub use global::cache::UnrealCacheAsync;
 pub use global::types::{FileAvailability, FileMetadata, InodeAssignment};

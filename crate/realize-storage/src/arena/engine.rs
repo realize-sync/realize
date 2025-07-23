@@ -1,12 +1,11 @@
 #![allow(dead_code)] // work in progress
 
+use super::types::FailedJobTableEntry;
 use crate::arena::arena_cache;
 use crate::arena::blob;
 use crate::arena::mark;
-use crate::utils::holder::{ByteConversionError, ByteConvertible, Holder, NamedType};
+use crate::utils::holder::Holder;
 use crate::{Inode, Mark, StorageError};
-use capnp::message::ReaderOptions;
-use capnp::serialize_packed;
 use realize_types::{ByteRanges, Hash, Path, UnixTime};
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
 use std::sync::Arc;
@@ -15,8 +14,6 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::{task, time};
 use tokio_stream::wrappers::ReceiverStream;
-
-use super::engine_capnp;
 
 /// Path marked dirty, indexed by path.
 ///
@@ -594,46 +591,6 @@ pub(crate) fn take_dirty(txn: &WriteTransaction) -> Result<Option<(Path, u64)>, 
         }
     }
 }
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct FailedJobTableEntry {
-    backoff_until: UnixTime,
-    failure_count: u32,
-}
-
-impl NamedType for FailedJobTableEntry {
-    fn typename() -> &'static str {
-        "engine.job"
-    }
-}
-
-impl ByteConvertible<FailedJobTableEntry> for FailedJobTableEntry {
-    fn from_bytes(data: &[u8]) -> Result<FailedJobTableEntry, ByteConversionError> {
-        let message_reader = serialize_packed::read_message(&mut &data[..], ReaderOptions::new())?;
-        let msg: engine_capnp::failed_job_table_entry::Reader =
-            message_reader.get_root::<engine_capnp::failed_job_table_entry::Reader>()?;
-
-        Ok(FailedJobTableEntry {
-            failure_count: msg.get_failure_count(),
-            backoff_until: UnixTime::from_secs(msg.get_backoff_until_secs()),
-        })
-    }
-
-    fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError> {
-        let mut message = ::capnp::message::Builder::new_default();
-        let mut builder: engine_capnp::failed_job_table_entry::Builder =
-            message.init_root::<engine_capnp::failed_job_table_entry::Builder>();
-
-        builder.set_failure_count(self.failure_count);
-        builder.set_backoff_until_secs(self.backoff_until.as_secs());
-
-        let mut buffer: Vec<u8> = Vec::new();
-        serialize_packed::write_message(&mut buffer, &message)?;
-
-        Ok(buffer)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -878,21 +835,6 @@ mod tests {
 
         let job = next_with_timeout(&mut job_stream).await?;
         assert_eq!(Some(Job::Download(barfile, 1, test_hash())), job);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn convert_failed_job_table_entry() -> anyhow::Result<()> {
-        let entry = FailedJobTableEntry {
-            failure_count: 3,
-            backoff_until: UnixTime::from_secs(1234567890),
-        };
-
-        assert_eq!(
-            entry,
-            FailedJobTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
-        );
 
         Ok(())
     }

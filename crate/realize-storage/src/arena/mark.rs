@@ -1,12 +1,10 @@
 #![allow(dead_code)] // work in progress
 
-use super::mark_capnp;
+use super::types::{Mark, MarkTableEntry};
 use crate::arena::arena_cache;
 use crate::arena::index;
-use crate::utils::holder::{ByteConversionError, ByteConvertible, Holder, NamedType};
+use crate::utils::holder::Holder;
 use crate::{DirtyPaths, Inode, StorageError};
-use capnp::message::ReaderOptions;
-use capnp::serialize_packed;
 use realize_types::Path;
 use redb::{Database, ReadTransaction, TableDefinition, WriteTransaction};
 use std::sync::Arc;
@@ -17,18 +15,6 @@ use std::sync::Arc;
 /// Value: Holder<MarkTableEntry>
 const MARK_TABLE: TableDefinition<&str, Holder<MarkTableEntry>> =
     TableDefinition::new("engine.mark");
-
-/// A mark that can be applied to files and directories in an arena.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
-pub enum Mark {
-    /// Files marked as "watch" belong in the unreal. They should be left in the cache and are subject to normal LRU rules.
-    #[default]
-    Watch,
-    /// Files marked as "keep" belong in the unreal. They should be left in the cache and are unconditionally kept.
-    Keep,
-    /// Files marked as "own" belong in the real. They should be moved into the arena root as regular files.
-    Own,
-}
 
 /// Tracks marks hierarchically by paths in an arena.
 ///
@@ -192,53 +178,7 @@ fn do_get_mark(
     }
 }
 
-/// Entry in the mark table.
-#[derive(Debug, Clone, PartialEq)]
-pub struct MarkTableEntry {
-    pub mark: Mark,
-}
-
-impl NamedType for MarkTableEntry {
-    fn typename() -> &'static str {
-        "mark"
-    }
-}
-
-impl ByteConvertible<MarkTableEntry> for MarkTableEntry {
-    fn from_bytes(data: &[u8]) -> Result<MarkTableEntry, ByteConversionError> {
-        let message_reader = serialize_packed::read_message(&mut &data[..], ReaderOptions::new())?;
-        let msg: mark_capnp::mark_table_entry::Reader =
-            message_reader.get_root::<mark_capnp::mark_table_entry::Reader>()?;
-
-        let mark = match msg.get_mark()? {
-            mark_capnp::Mark::Own => Mark::Own,
-            mark_capnp::Mark::Watch => Mark::Watch,
-            mark_capnp::Mark::Keep => Mark::Keep,
-        };
-
-        Ok(MarkTableEntry { mark })
-    }
-
-    fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError> {
-        let mut message = ::capnp::message::Builder::new_default();
-        let mut builder: mark_capnp::mark_table_entry::Builder =
-            message.init_root::<mark_capnp::mark_table_entry::Builder>();
-
-        let mark = match self.mark {
-            Mark::Own => mark_capnp::Mark::Own,
-            Mark::Watch => mark_capnp::Mark::Watch,
-            Mark::Keep => mark_capnp::Mark::Keep,
-        };
-        builder.set_mark(mark);
-
-        let mut buffer: Vec<u8> = Vec::new();
-        serialize_packed::write_message(&mut buffer, &message)?;
-
-        Ok(buffer)
-    }
-}
-
-#[cfg(test)]
+/// Entry in the mark #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
@@ -327,25 +267,6 @@ mod tests {
                 .update(test_peer, notification, || Ok((Inode(1000), Inode(2000))))?;
             Ok(())
         }
-    }
-
-    #[tokio::test]
-    async fn convert_mark_table_entry() -> anyhow::Result<()> {
-        let entry = MarkTableEntry { mark: Mark::Own };
-
-        assert_eq!(
-            entry,
-            MarkTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
-        );
-
-        let entry = MarkTableEntry { mark: Mark::Keep };
-
-        assert_eq!(
-            entry,
-            MarkTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
-        );
-
-        Ok(())
     }
 
     #[tokio::test]

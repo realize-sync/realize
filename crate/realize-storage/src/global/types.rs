@@ -1,4 +1,3 @@
-use super::cache_capnp;
 use crate::{
     Inode,
     arena::types::BlobId,
@@ -8,6 +7,14 @@ use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
 use realize_types::{self, Arena, Hash, Path, Peer, UnixTime};
 use uuid::Uuid;
+
+#[allow(dead_code)]
+#[allow(unknown_lints)]
+#[allow(clippy::uninlined_format_args)]
+#[allow(clippy::extra_unused_type_parameters)]
+mod cache_capnp {
+    include!(concat!(env!("OUT_DIR"), "/global/cache_capnp.rs"));
+}
 
 /// A file and all versions known to the cache.
 #[derive(Clone, Debug, PartialEq)]
