@@ -65,7 +65,7 @@ const CURRENT_INODE_RANGE_TABLE: TableDefinition<(), (Inode, Inode)> =
 
 /// A cache of remote files.
 pub struct UnrealCacheBlocking {
-    db: Arc<Database>,
+    db: Database,
     arena_roots: BiMap<Arena, Inode>,
     arena_caches: HashMap<Arena, ArenaCache>,
 }
@@ -75,9 +75,9 @@ impl UnrealCacheBlocking {
     pub const ROOT_DIR: Inode = Inode(1);
 
     /// Create a new UnrealCache from a redb database.
-    pub fn new(db: Arc<Database>) -> Result<Self, StorageError> {
+    pub fn new(db: Database) -> Result<Self, StorageError> {
         {
-            let txn = (&*db).begin_write()?;
+            let txn = db.begin_write()?;
             txn.open_table(ARENA_TABLE)?;
             txn.open_table(DIRECTORY_TABLE)?;
             txn.open_table(INODE_RANGE_ALLOCATION_TABLE)?;
@@ -88,7 +88,7 @@ impl UnrealCacheBlocking {
         }
 
         let arena_map = {
-            let txn = (&*db).begin_read()?;
+            let txn = db.begin_read()?;
             do_read_arena_map(&txn)?
         };
 
@@ -288,10 +288,7 @@ impl UnrealCacheAsync {
     }
 
     /// Create a new cache with the database at the given path.
-    pub(crate) async fn with_db<T>(
-        db: Arc<redb::Database>,
-        arenas: T,
-    ) -> Result<Self, anyhow::Error>
+    pub(crate) async fn with_db<T>(db: redb::Database, arenas: T) -> Result<Self, anyhow::Error>
     where
         T: IntoIterator<Item = (Arena, Arc<ArenaDatabase>, PathBuf, Arc<DirtyPaths>)>
             + Send

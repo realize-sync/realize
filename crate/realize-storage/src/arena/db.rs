@@ -140,11 +140,11 @@ const FAILED_JOB_TABLE: TableDefinition<u64, Holder<FailedJobTableEntry>> =
     TableDefinition::new("engine.failed_job");
 
 pub(crate) struct ArenaDatabase {
-    db: Arc<redb::Database>,
+    db: redb::Database,
 }
 
 impl ArenaDatabase {
-    pub fn new(db: Arc<redb::Database>) -> Result<Arc<Self>, StorageError> {
+    pub fn new(db: redb::Database) -> Result<Arc<Self>, StorageError> {
         let txn = db.begin_write()?;
         {
             // create tables

@@ -598,14 +598,14 @@ mod tests {
     async fn reopen_keeps_uuid() -> anyhow::Result<()> {
         let tempdir = TempDir::new()?;
         let path = tempdir.path().join("index.db");
-        let db = ArenaDatabase::new(Arc::new(redb::Database::create(&path)?))?;
+        let db = ArenaDatabase::new(redb::Database::create(&path)?)?;
         let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
         let arena = test_arena();
         let uuid = RealIndexBlocking::new(arena, db, dirty_paths)?
             .uuid()
             .clone();
 
-        let db = ArenaDatabase::new(Arc::new(redb::Database::create(&path)?))?;
+        let db = ArenaDatabase::new(redb::Database::create(&path)?)?;
         let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
         assert!(!uuid.is_nil());
         assert_eq!(
