@@ -1,10 +1,11 @@
+use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
 use super::types::BlobTableEntry;
 use crate::StorageError;
 use crate::global::types::FileTableEntry;
 use crate::types::{BlobId, Inode};
 use crate::utils::holder::Holder;
 use realize_types::{ByteRange, ByteRanges, Hash};
-use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
+use redb::ReadableTable;
 use std::cmp::min;
 use std::io::{SeekFrom, Write};
 use std::path::PathBuf;
@@ -13,28 +14,24 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 
-/// Track blobs.
-///
-/// Key: inode
-/// Value: BlobTableEntry
-const BLOB_TABLE: TableDefinition<BlobId, Holder<BlobTableEntry>> =
-    TableDefinition::new("acache.blob");
-
 /// A blob store that handles blob-specific operations.
 ///
 /// This struct contains blob-specific logic and database operations.
 pub(crate) struct Blobstore {
-    db: Arc<Database>,
+    db: Arc<ArenaDatabase>,
     blob_dir: PathBuf,
 }
 
 impl Blobstore {
     /// Create a new Blobstore from a database and blob directory.
-    pub(crate) fn new(db: Arc<Database>, blob_dir: PathBuf) -> Result<Arc<Self>, StorageError> {
+    pub(crate) fn new(
+        db: Arc<ArenaDatabase>,
+        blob_dir: PathBuf,
+    ) -> Result<Arc<Self>, StorageError> {
         // Ensure the database has the required blob table
         {
             let txn = db.begin_write()?;
-            txn.open_table(BLOB_TABLE)?;
+            txn.blob_table()?;
             txn.commit()?;
         }
 
@@ -48,11 +45,11 @@ impl Blobstore {
     /// Return an [Blob] entry given a blob id.
     pub(crate) fn open_blob(
         self: &Arc<Self>,
-        txn: &ReadTransaction,
+        txn: &ArenaReadTransaction,
         file_entry: FileTableEntry,
         blob_id: BlobId,
     ) -> Result<Blob, StorageError> {
-        let blob_table = txn.open_table(BLOB_TABLE)?;
+        let blob_table = txn.blob_table()?;
         let blob_entry = get_blob_entry(&blob_table, blob_id)?;
         let file = self.open_blob_file(blob_id, file_entry.metadata.size, false)?;
 
@@ -69,10 +66,10 @@ impl Blobstore {
     pub(crate) fn create_blob(
         self: &Arc<Self>,
         inode: Inode,
-        txn: &WriteTransaction,
+        txn: &ArenaWriteTransaction,
         file_entry: FileTableEntry,
     ) -> Result<Blob, StorageError> {
-        let mut blob_table = txn.open_table(BLOB_TABLE)?;
+        let mut blob_table = txn.blob_table()?;
         let (blob_id, blob_entry) = if let Some(blob_id) = file_entry.content.blob {
             let blob_entry = get_blob_entry(&blob_table, blob_id)?;
 
@@ -155,7 +152,7 @@ impl Blobstore {
     ) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
         {
-            let mut blob_table = txn.open_table(BLOB_TABLE)?;
+            let mut blob_table = txn.blob_table()?;
             let mut blob_entry = get_blob_entry(&blob_table, blob_id)?;
             blob_entry.written_areas = blob_entry.written_areas.union(&new_range);
             log::debug!(
@@ -172,10 +169,10 @@ impl Blobstore {
 }
 
 pub(crate) fn local_availability(
-    txn: &ReadTransaction,
+    txn: &ArenaReadTransaction,
     blob_id: BlobId,
 ) -> Result<ByteRanges, StorageError> {
-    let blob_table = txn.open_table(BLOB_TABLE)?;
+    let blob_table = txn.blob_table()?;
 
     Ok(get_blob_entry(&blob_table, blob_id)?.written_areas)
 }
@@ -474,7 +471,7 @@ mod tests {
             if let Some(p) = child.parent() {
                 std::fs::create_dir_all(p)?;
             }
-            let db = redb_utils::in_memory()?;
+            let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
             cache.add_arena(arena, db, blob_dir.to_path_buf(), dirty_paths)?;
 

@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::{collections::HashMap, sync::Arc};
 
+use arena::db::ArenaDatabase;
 use arena::engine::DirtyPaths;
 use arena::index::RealIndexAsync;
 use arena::watcher::RealWatcher;
@@ -62,7 +63,7 @@ impl Storage {
         // passed to multiple different subsystems.
         let mut arena_dbs = HashMap::new();
         for (arena, arena_config) in &config.arenas {
-            let db = redb_utils::open(&arena_config.db).await?;
+            let db = ArenaDatabase::new(redb_utils::open(&arena_config.db).await?)?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
             arena_dbs.insert(*arena, (arena_config, db, dirty_paths));
         }
@@ -97,7 +98,7 @@ impl Storage {
                 .flatten()
                 .collect::<Vec<_>>();
 
-            log::debug!("Watch {root:?}, excluding {exclude:?} for {db:?}");
+            log::debug!("Watch {root:?}, excluding {exclude:?}");
             let watcher = RealWatcher::spawn(root, exclude, index.clone()).await?;
             indexed_arenas.insert(
                 arena,

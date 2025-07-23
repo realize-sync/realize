@@ -1,11 +1,12 @@
 #![allow(dead_code)] // work in progress
 
+use super::db::{ArenaDatabase, ArenaWriteTransaction};
 use super::types::{HistoryTableEntry, IndexedFileTableEntry};
 use crate::StorageError;
 use crate::arena::engine::DirtyPaths;
 use crate::utils::holder::{ByteConversionError, Holder};
 use realize_types::{self, Arena, Hash, UnixTime};
-use redb::{Database, ReadableTable as _, TableDefinition, WriteTransaction};
+use redb::ReadableTable as _;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
@@ -13,29 +14,9 @@ use tokio::task;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-/// Track hash and metadata of local files.
-///
-/// Key: realize_types::Path
-/// Value: FileTableEntry
-const FILE_TABLE: TableDefinition<&str, Holder<IndexedFileTableEntry>> =
-    TableDefinition::new("index.file");
-
-/// Local file history.
-///
-/// Key: u64 (monotonically increasing index value)
-/// Value: HistoryTableEntry
-const HISTORY_TABLE: TableDefinition<u64, Holder<HistoryTableEntry>> =
-    TableDefinition::new("index.history");
-
-/// Database settings.
-///
-/// Key: string
-/// Value: depends on the setting
-const SETTINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("index.settings");
-
 /// File hash index, blocking version.
 pub struct RealIndexBlocking {
-    db: Arc<Database>,
+    db: Arc<ArenaDatabase>,
     arena: Arena,
     history_tx: watch::Sender<u64>,
     uuid: Uuid,
@@ -48,7 +29,7 @@ pub struct RealIndexBlocking {
 impl RealIndexBlocking {
     pub fn new(
         arena: Arena,
-        db: Arc<Database>,
+        db: Arc<ArenaDatabase>,
         dirty_paths: Arc<DirtyPaths>,
     ) -> Result<Self, StorageError> {
         let index: u64;
@@ -56,12 +37,12 @@ impl RealIndexBlocking {
         {
             let txn = db.begin_write()?;
             {
-                txn.open_table(FILE_TABLE)?;
-                let history_table = txn.open_table(HISTORY_TABLE)?;
+                txn.index_file_table()?;
+                let history_table = txn.index_history_table()?;
                 index = last_history_index(&history_table)?;
             }
             {
-                let mut settings_table = txn.open_table(SETTINGS_TABLE)?;
+                let mut settings_table = txn.index_settings_table()?;
                 if let Some(value) = settings_table.get("uuid")? {
                     let bytes: uuid::Bytes = value
                         .value()
@@ -115,7 +96,7 @@ impl RealIndexBlocking {
     /// This is the value tracked by [RealIndexBlocking::watch_history].
     pub fn last_history_index(&self) -> Result<u64, StorageError> {
         let txn = (&*self.db).begin_read()?;
-        let history_table = txn.open_table(HISTORY_TABLE)?;
+        let history_table = txn.index_history_table()?;
 
         last_history_index(&history_table)
     }
@@ -131,7 +112,7 @@ impl RealIndexBlocking {
         path: &realize_types::Path,
     ) -> Result<Option<IndexedFileTableEntry>, StorageError> {
         let txn = (&*self.db).begin_read()?;
-        let file_table = txn.open_table(FILE_TABLE)?;
+        let file_table = txn.index_file_table()?;
 
         if let Some(entry) = file_table.get(path.as_str())? {
             return Ok(Some(entry.value().parse()?));
@@ -143,7 +124,7 @@ impl RealIndexBlocking {
     /// Check whether a given file is in the index already.
     pub fn has_file(&self, path: &realize_types::Path) -> Result<bool, StorageError> {
         let txn = (&*self.db).begin_read()?;
-        let file_table = txn.open_table(FILE_TABLE)?;
+        let file_table = txn.index_file_table()?;
 
         Ok(file_table.get(path.as_str())?.is_some())
     }
@@ -194,7 +175,7 @@ impl RealIndexBlocking {
         tx: mpsc::Sender<(realize_types::Path, IndexedFileTableEntry)>,
     ) -> Result<(), StorageError> {
         let txn = (&*self.db).begin_read()?;
-        let file_table = txn.open_table(FILE_TABLE)?;
+        let file_table = txn.index_file_table()?;
         for (path, entry) in file_table
             .iter()?
             .flatten()
@@ -224,7 +205,7 @@ impl RealIndexBlocking {
         tx: mpsc::Sender<Result<(u64, HistoryTableEntry), StorageError>>,
     ) -> Result<(), StorageError> {
         let txn = (&*self.db).begin_read()?;
-        let history_table = txn.open_table(HISTORY_TABLE)?;
+        let history_table = txn.index_history_table()?;
         for res in history_table.range(range)?.map(|res| match res {
             Err(err) => Err(StorageError::from(err)),
             Ok((k, v)) => match v.value().parse() {
@@ -259,13 +240,13 @@ impl RealIndexBlocking {
 }
 
 fn do_remove_file_or_dir(
-    txn: &WriteTransaction,
+    txn: &ArenaWriteTransaction,
     path: &realize_types::Path,
     history_index: &mut Option<u64>,
     dirty_paths: &Arc<DirtyPaths>,
 ) -> Result<(), StorageError> {
-    let mut file_table = txn.open_table(FILE_TABLE)?;
-    let mut history_table = txn.open_table(HISTORY_TABLE)?;
+    let mut file_table = txn.index_file_table()?;
+    let mut history_table = txn.index_history_table()?;
     let path_prefix = PathPrefix::new(&path);
 
     for entry in file_table.extract_from_if(path_prefix.range(), |k, _| path_prefix.accept(k))? {
@@ -317,7 +298,7 @@ impl PathPrefix {
 }
 
 fn do_add_file(
-    txn: &WriteTransaction,
+    txn: &ArenaWriteTransaction,
     path: &realize_types::Path,
     size: u64,
     mtime: &UnixTime,
@@ -325,8 +306,8 @@ fn do_add_file(
     history_index: &mut Option<u64>,
     dirty_paths: &Arc<DirtyPaths>,
 ) -> Result<(), StorageError> {
-    let mut file_table = txn.open_table(FILE_TABLE)?;
-    let mut history_table = txn.open_table(HISTORY_TABLE)?;
+    let mut file_table = txn.index_file_table()?;
+    let mut history_table = txn.index_history_table()?;
 
     let old_hash = file_table
         .get(path.as_str())?
@@ -390,7 +371,7 @@ impl RealIndexAsync {
     /// Create an index using the given database. Initialize the database if necessary.
     pub async fn with_db(
         arena: Arena,
-        db: Arc<redb::Database>,
+        db: Arc<ArenaDatabase>,
         dirty_paths: Arc<DirtyPaths>,
     ) -> Result<Self, StorageError> {
         task::spawn_blocking(move || {
@@ -537,11 +518,11 @@ impl RealIndexAsync {
 ///
 /// If the path is not in the index, the function does nothing.
 pub(crate) fn mark_dirty_recursive(
-    txn: &WriteTransaction,
+    txn: &ArenaWriteTransaction,
     path: &realize_types::Path,
     dirty_paths: &Arc<DirtyPaths>,
 ) -> Result<(), StorageError> {
-    let file_table = txn.open_table(FILE_TABLE)?;
+    let file_table = txn.index_file_table()?;
     let path_prefix = PathPrefix::new(&path);
     for entry in file_table.range(path_prefix.range())? {
         let (k, _) = entry?;
@@ -559,10 +540,10 @@ pub(crate) fn mark_dirty_recursive(
 
 /// Mark all files within the index dirty
 pub(crate) fn make_all_dirty(
-    txn: &WriteTransaction,
+    txn: &ArenaWriteTransaction,
     dirty_paths: &Arc<DirtyPaths>,
 ) -> Result<(), StorageError> {
-    let file_table = txn.open_table(FILE_TABLE)?;
+    let file_table = txn.index_file_table()?;
     for entry in file_table.iter()? {
         let (k, _) = entry?;
         if let Ok(path) = realize_types::Path::parse(k.value()) {
@@ -594,7 +575,7 @@ mod tests {
         async fn setup() -> anyhow::Result<Fixture> {
             let _ = env_logger::try_init();
             let arena = test_arena();
-            let db = redb_utils::in_memory()?;
+            let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
             let aindex = RealIndexBlocking::new(arena, db, Arc::clone(&dirty_paths))?.into_async();
             Ok(Self {
@@ -614,31 +595,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_creates_tables() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
-        let db = &fixture.index.db;
-
-        let txn = db.begin_read()?;
-        assert!(txn.open_table(FILE_TABLE).is_ok());
-        assert!(txn.open_table(HISTORY_TABLE).is_ok());
-        assert!(txn.open_table(SETTINGS_TABLE).is_ok());
-
-        assert!(!fixture.index.uuid().is_nil());
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn reopen_keeps_uuid() -> anyhow::Result<()> {
         let tempdir = TempDir::new()?;
         let path = tempdir.path().join("index.db");
-        let db = Arc::new(redb::Database::create(&path)?);
+        let db = ArenaDatabase::new(Arc::new(redb::Database::create(&path)?))?;
         let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
         let arena = test_arena();
         let uuid = RealIndexBlocking::new(arena, db, dirty_paths)?
             .uuid()
             .clone();
 
-        let db = Arc::new(redb::Database::create(&path)?);
+        let db = ArenaDatabase::new(Arc::new(redb::Database::create(&path)?))?;
         let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
         assert!(!uuid.is_nil());
         assert_eq!(
@@ -661,7 +628,7 @@ mod tests {
 
         {
             let txn = index.db.begin_read()?;
-            let file_table = txn.open_table(FILE_TABLE)?;
+            let file_table = txn.index_file_table()?;
             assert_eq!(
                 IndexedFileTableEntry {
                     size: 100,
@@ -671,7 +638,7 @@ mod tests {
                 file_table.get("foo/bar.txt")?.unwrap().value().parse()?
             );
 
-            let history_table = txn.open_table(HISTORY_TABLE)?;
+            let history_table = txn.index_history_table()?;
             assert_eq!(
                 HistoryTableEntry::Add(path.clone()),
                 history_table.get(1)?.unwrap().value().parse()?
@@ -696,7 +663,7 @@ mod tests {
 
         {
             let txn = index.db.begin_read()?;
-            let file_table = txn.open_table(FILE_TABLE)?;
+            let file_table = txn.index_file_table()?;
             assert_eq!(
                 IndexedFileTableEntry {
                     size: 200,
@@ -706,7 +673,7 @@ mod tests {
                 file_table.get("foo/bar.txt")?.unwrap().value().parse()?
             );
 
-            let history_table = txn.open_table(HISTORY_TABLE)?;
+            let history_table = txn.index_history_table()?;
             assert_eq!(
                 HistoryTableEntry::Replace(path.clone(), Hash([0xfa; 32])),
                 history_table.get(2)?.unwrap().value().parse()?
@@ -798,7 +765,7 @@ mod tests {
         assert_eq!(false, index.has_file(&path)?);
         {
             let txn = index.db.begin_read()?;
-            let history_table = txn.open_table(HISTORY_TABLE)?;
+            let history_table = txn.index_history_table()?;
             assert_eq!(
                 HistoryTableEntry::Remove(path.clone(), Hash([0xfa; 32])),
                 history_table.get(2)?.unwrap().value().parse()?
@@ -865,7 +832,7 @@ mod tests {
 
         {
             let txn = index.db.begin_read()?;
-            let history_table = txn.open_table(HISTORY_TABLE)?;
+            let history_table = txn.index_history_table()?;
             assert_eq!(
                 HistoryTableEntry::Remove(realize_types::Path::parse("foo/a")?, Hash([1; 32])),
                 history_table.get(5)?.unwrap().value().parse()?
@@ -905,7 +872,7 @@ mod tests {
 
         {
             let txn = index.db.begin_read()?;
-            let history_table = txn.open_table(HISTORY_TABLE)?;
+            let history_table = txn.index_history_table()?;
             assert!(history_table.last()?.is_none());
         }
 
@@ -1308,7 +1275,7 @@ mod tests {
         {
             let txn = index.db.begin_write()?;
             {
-                let mut file_table = txn.open_table(FILE_TABLE)?;
+                let mut file_table = txn.index_file_table()?;
                 file_table.insert(
                     "///invalid///path",
                     Holder::with_content(IndexedFileTableEntry {

@@ -1,10 +1,9 @@
-use std::io::{self, SeekFrom};
-use std::pin::Pin;
-use std::task::{Context, Poll};
-
 use super::index::RealIndexAsync;
 use crate::StorageError;
 use realize_types::{self, Hash, UnixTime};
+use std::io::{self, SeekFrom};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 
@@ -81,8 +80,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::DirtyPaths;
     use crate::utils::{hash, redb_utils};
+    use crate::{ArenaDatabase, DirtyPaths};
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
@@ -108,7 +107,7 @@ mod tests {
             let root = tempdir.child("root");
             root.create_dir_all()?;
 
-            let db = redb_utils::in_memory()?;
+            let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
             let index = RealIndexAsync::with_db(test_arena(), db, dirty_paths).await?;
 

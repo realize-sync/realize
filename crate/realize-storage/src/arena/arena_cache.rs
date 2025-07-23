@@ -1,4 +1,5 @@
 use super::blob::Blobstore;
+use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
 use crate::Blob;
 use crate::arena::engine::DirtyPaths;
 use crate::arena::notifier::{Notification, Progress};
@@ -10,78 +11,10 @@ use crate::types::BlobId;
 use crate::utils::holder::Holder;
 use crate::{Inode, StorageError};
 use realize_types::{Arena, ByteRanges, Hash, Path, Peer, UnixTime};
-use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
+use redb::ReadableTable;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-
-/// Tracks directory content.
-///
-/// Each entry in a directory has an entry in this table, keyed with
-/// the directory inode and the entry name.
-///
-/// To list directory content, do a range scan.
-///
-/// The special name "." store information about the current
-/// directory, in a DirTableEntry::Self.
-///
-/// Key: (inode, name)
-/// Value: DirTableEntry
-pub(crate) const DIRECTORY_TABLE: TableDefinition<(Inode, &str), Holder<DirTableEntry>> =
-    TableDefinition::new("acache.directory");
-
-/// Track peer files.
-///
-/// Each known peer file has an entry in this table, keyed with the
-/// file inode and the peer name. More than one peer might have the
-/// same entry.
-///
-/// An inode available in no peers should be remove from all
-/// directories.
-///
-/// Key: (inode, peer)
-/// Value: FileTableEntry
-const FILE_TABLE: TableDefinition<(Inode, &str), Holder<FileTableEntry>> =
-    TableDefinition::new("acache.file");
-
-/// Track peer files that might have been deleted remotely.
-///
-/// When a peer starts catchup of an arena, all its files are added to
-/// this table. Calls to catchup for that peer and arena removes the
-/// corresponding entry in the table. At the end of catchup, files
-/// still in this table are deleted.
-///
-/// Key: (peer, file inode)
-/// Value: parent dir inode
-const PENDING_CATCHUP_TABLE: TableDefinition<(&str, Inode), Inode> =
-    TableDefinition::new("acache.pending_catchup");
-
-/// Track Peer UUIDs.
-///
-/// This table tracks the store UUID for each peer.
-///
-/// Key: &str (Peer)
-/// Value: PeerTableEntry
-const PEER_TABLE: TableDefinition<&str, Holder<PeerTableEntry>> =
-    TableDefinition::new("acache.peer");
-
-/// Track last seen notification index.
-///
-/// This table tracks the last seen notification index for each peer.
-///
-/// Key: &str (Peer)
-/// Value: last seen index
-const NOTIFICATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("acache.notification");
-
-/// Track current inode range for each arena.
-///
-/// The current inode is the last inode that was allocated for the
-/// arena.
-///
-/// Key: ()
-/// Value: (Inode, Inode) (last inode allocated, end of range)
-pub(crate) const CURRENT_INODE_RANGE_TABLE: TableDefinition<(), (Inode, Inode)> =
-    TableDefinition::new("acache.current_inode_range");
 
 /// A per-arena cache of remote files.
 ///
@@ -90,7 +23,7 @@ pub(crate) const CURRENT_INODE_RANGE_TABLE: TableDefinition<(), (Inode, Inode)> 
 pub(crate) struct ArenaCache {
     arena: Arena,
     arena_root: Inode,
-    db: Arc<Database>,
+    db: Arc<ArenaDatabase>,
     blobstore: Arc<Blobstore>,
     dirty_paths: Arc<DirtyPaths>,
 }
@@ -100,24 +33,10 @@ impl ArenaCache {
     pub(crate) fn new(
         arena: Arena,
         arena_root: Inode,
-        db: Arc<Database>,
+        db: Arc<ArenaDatabase>,
         blob_dir: PathBuf,
         dirty_paths: Arc<DirtyPaths>,
     ) -> Result<Self, StorageError> {
-        // Ensure the database has the required tables
-        {
-            let txn = db.begin_write()?;
-            txn.open_table(DIRECTORY_TABLE)?;
-            txn.open_table(FILE_TABLE)?;
-            txn.open_table(PENDING_CATCHUP_TABLE)?;
-            txn.open_table(PEER_TABLE)?;
-            txn.open_table(NOTIFICATION_TABLE)?;
-            txn.open_table(CURRENT_INODE_RANGE_TABLE)?;
-
-            // ARENA_TABLE and INODE_RANGE_ALLOCATION_TABLE are only used in UnrealCacheBlocking
-            txn.commit()?;
-        }
-
         let blobstore = Blobstore::new(Arc::clone(&db), blob_dir)?;
 
         Ok(Self {
@@ -135,7 +54,7 @@ impl ArenaCache {
         name: &str,
     ) -> Result<ReadDirEntry, StorageError> {
         let txn = self.db.begin_read()?;
-        do_lookup(txn, parent_inode, name)
+        do_lookup(&txn.cache_directory_table()?, parent_inode, name)
     }
 
     pub(crate) fn lookup_path(
@@ -143,7 +62,7 @@ impl ArenaCache {
         path: &Path,
     ) -> Result<(Inode, InodeAssignment), StorageError> {
         let txn = self.db.begin_read()?;
-        let dir_table = txn.open_table(DIRECTORY_TABLE)?;
+        let dir_table = txn.cache_directory_table()?;
 
         do_lookup_path(&dir_table, self.arena_root, Some(path))
     }
@@ -156,7 +75,7 @@ impl ArenaCache {
     pub(crate) fn dir_mtime(&self, inode: Inode) -> Result<UnixTime, StorageError> {
         let txn = self.db.begin_read()?;
 
-        do_dir_mtime(&txn, inode, self.arena_root)
+        do_dir_mtime(&txn.cache_directory_table()?, inode, self.arena_root)
     }
 
     pub(crate) fn file_availability(&self, inode: Inode) -> Result<FileAvailability, StorageError> {
@@ -171,7 +90,7 @@ impl ArenaCache {
     ) -> Result<Vec<(String, ReadDirEntry)>, StorageError> {
         let txn = self.db.begin_read()?;
 
-        do_readdir(&txn, inode)
+        do_readdir(&txn.cache_directory_table()?, inode)
     }
 
     pub(crate) fn peer_progress(&self, peer: Peer) -> Result<Option<Progress>, StorageError> {
@@ -202,7 +121,7 @@ impl ArenaCache {
             } => {
                 do_update_last_seen_notification(&txn, peer, index)?;
 
-                let mut file_table = txn.open_table(FILE_TABLE)?;
+                let mut file_table = txn.cache_file_table()?;
                 let (parent_inode, file_inode) =
                     do_create_file(&txn, self.arena_root, &path, &alloc_inode_range)?;
                 if !get_file_entry(&file_table, file_inode, Some(peer))?.is_some() {
@@ -234,7 +153,7 @@ impl ArenaCache {
                 let (parent_inode, file_inode) =
                     do_create_file(&txn, self.arena_root, &path, &alloc_inode_range)?;
 
-                let mut file_table = txn.open_table(FILE_TABLE)?;
+                let mut file_table = txn.cache_file_table()?;
                 let entry = FileTableEntry::new(path, size, mtime, hash, parent_inode);
                 if let Some(e) = get_file_entry(&file_table, file_inode, None)?
                     && e.content.hash == old_hash
@@ -289,7 +208,7 @@ impl ArenaCache {
 
                 do_unmark_peer_file(&txn, peer, file_inode)?;
 
-                let mut file_table = txn.open_table(FILE_TABLE)?;
+                let mut file_table = txn.cache_file_table()?;
                 let entry = FileTableEntry::new(path, size, mtime, hash, parent_inode);
                 if !get_file_entry(&file_table, file_inode, None)?.is_some() {
                     self.do_write_file_entry(&txn, &mut file_table, file_inode, None, &entry)?;
@@ -301,7 +220,7 @@ impl ArenaCache {
                 do_update_last_seen_notification(&txn, peer, index)?;
             }
             Notification::Connected { uuid, .. } => {
-                let mut peer_table = txn.open_table(PEER_TABLE)?;
+                let mut peer_table = txn.cache_peer_table()?;
                 let key = peer.as_str();
                 if let Some(entry) = peer_table.get(key)? {
                     if entry.value().parse()?.uuid == uuid {
@@ -310,7 +229,7 @@ impl ArenaCache {
                     }
                 }
                 peer_table.insert(key, Holder::with_content(PeerTableEntry { uuid })?)?;
-                let mut notification_table = txn.open_table(NOTIFICATION_TABLE)?;
+                let mut notification_table = txn.cache_notification_table()?;
                 notification_table.remove(key)?;
             }
         }
@@ -324,7 +243,7 @@ impl ArenaCache {
         // blob is there.
         {
             let txn = self.db.begin_read()?;
-            let file_entry = get_default_entry(&txn.open_table(FILE_TABLE)?, inode)?;
+            let file_entry = get_default_entry(&txn.cache_file_table()?, inode)?;
             if let Some(blob_id) = file_entry.content.blob {
                 // Delegate to Blobstore
                 return self.blobstore.open_blob(&txn, file_entry, blob_id);
@@ -335,7 +254,7 @@ impl ArenaCache {
         // the file entry again because it might have changed.
         let txn = self.db.begin_write()?;
         let ret = {
-            let mut file_table = txn.open_table(FILE_TABLE)?;
+            let mut file_table = txn.cache_file_table()?;
             let mut file_entry = get_default_entry(&file_table, inode)?;
             let blob = self
                 .blobstore
@@ -354,7 +273,7 @@ impl ArenaCache {
     /// Write an entry in the file table, overwriting any existing one.
     fn do_write_file_entry(
         &self,
-        txn: &WriteTransaction,
+        txn: &ArenaWriteTransaction,
         file_table: &mut redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
         file_inode: Inode,
         peer: Option<Peer>,
@@ -390,7 +309,7 @@ impl ArenaCache {
     /// Remove a file entry for a specific peer.
     fn do_rm_file_entry(
         &self,
-        txn: &WriteTransaction,
+        txn: &ArenaWriteTransaction,
         file_table: &mut redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
         dir_table: &mut redb::Table<'_, (Inode, &str), Holder<DirTableEntry>>,
         parent_inode: Inode,
@@ -494,13 +413,13 @@ impl ArenaCache {
 
     fn do_unlink(
         &self,
-        txn: &WriteTransaction,
+        txn: &ArenaWriteTransaction,
         peer: Peer,
         arena_root: Inode,
         path: &Path,
         old_hash: Hash,
     ) -> Result<(), StorageError> {
-        let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
+        let mut dir_table = txn.cache_directory_table()?;
         let (parent_inode, parent_assignment) =
             do_lookup_path(&dir_table, arena_root, path.parent().as_ref())?;
         if parent_assignment != InodeAssignment::Directory {
@@ -514,7 +433,7 @@ impl ArenaCache {
         }
 
         let inode = dir_entry.inode;
-        let mut file_table = txn.open_table(FILE_TABLE)?;
+        let mut file_table = txn.cache_file_table()?;
         self.do_rm_file_entry(
             txn,
             &mut file_table,
@@ -531,12 +450,12 @@ impl ArenaCache {
     /// Delete all marked files for a peer.
     fn do_delete_marked_files(
         &self,
-        txn: &WriteTransaction,
+        txn: &ArenaWriteTransaction,
         peer: Peer,
     ) -> Result<(), StorageError> {
-        let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
-        let mut file_table = txn.open_table(FILE_TABLE)?;
-        let mut directory_table = txn.open_table(DIRECTORY_TABLE)?;
+        let mut pending_catchup_table = txn.cache_pending_catchup_table()?;
+        let mut file_table = txn.cache_file_table()?;
+        let mut directory_table = txn.cache_directory_table()?;
         let peer_str = peer.as_str();
         for elt in pending_catchup_table
             .extract_from_if((peer_str, Inode::ZERO)..=(peer_str, Inode::MAX), |_, _| {
@@ -585,15 +504,15 @@ impl ArenaCache {
 ///
 /// If the inode is not in the cache, the function does nothing.
 pub(crate) fn mark_dirty_recursive(
-    txn: &WriteTransaction,
+    txn: &ArenaWriteTransaction,
     arena_root: Inode,
     path: Option<&Path>,
     dirty_paths: &Arc<DirtyPaths>,
 ) -> Result<(), StorageError> {
-    let dir_table = txn.open_table(DIRECTORY_TABLE)?;
+    let dir_table = txn.cache_directory_table()?;
     match do_lookup_path(&dir_table, arena_root, path) {
         Ok((inode, _)) => {
-            let file_table = txn.open_table(FILE_TABLE)?;
+            let file_table = txn.cache_file_table()?;
             mark_file_dirty(txn, &file_table, inode, dirty_paths)?;
             mark_dir_dirty(txn, &dir_table, &file_table, inode, dirty_paths)?;
 
@@ -605,7 +524,7 @@ pub(crate) fn mark_dirty_recursive(
 }
 
 fn mark_file_dirty(
-    txn: &WriteTransaction,
+    txn: &ArenaWriteTransaction,
     file_table: &redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
     inode: Inode,
     dirty_paths: &Arc<DirtyPaths>,
@@ -618,7 +537,7 @@ fn mark_file_dirty(
 }
 
 fn mark_dir_dirty(
-    txn: &WriteTransaction,
+    txn: &ArenaWriteTransaction,
     dir_table: &redb::Table<'_, (Inode, &str), Holder<DirTableEntry>>,
     file_table: &redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
     inode: Inode,
@@ -645,11 +564,9 @@ fn mark_dir_dirty(
 }
 
 pub(crate) fn do_readdir(
-    txn: &ReadTransaction,
+    dir_table: &impl ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
     inode: Inode,
 ) -> Result<Vec<(String, ReadDirEntry)>, StorageError> {
-    let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-
     // This is not ideal, but redb iterators are bound to the transaction.
     // We must collect the results.
     let mut entries = Vec::new();
@@ -670,12 +587,10 @@ pub(crate) fn do_readdir(
 }
 
 pub(crate) fn do_lookup(
-    txn: ReadTransaction,
+    dir_table: &impl ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
     parent_inode: Inode,
     name: &str,
 ) -> Result<ReadDirEntry, StorageError> {
-    let dir_table = txn.open_table(DIRECTORY_TABLE)?;
-
     Ok(dir_table
         .get((parent_inode, name))?
         .ok_or(StorageError::NotFound)?
@@ -685,24 +600,27 @@ pub(crate) fn do_lookup(
 }
 
 fn do_update_last_seen_notification(
-    txn: &WriteTransaction,
+    txn: &ArenaWriteTransaction,
     peer: Peer,
     index: u64,
 ) -> Result<(), StorageError> {
-    let mut notification_table = txn.open_table(NOTIFICATION_TABLE)?;
+    let mut notification_table = txn.cache_notification_table()?;
     notification_table.insert(peer.as_str(), index)?;
 
     Ok(())
 }
 
-fn do_peer_progress(txn: &ReadTransaction, peer: Peer) -> Result<Option<Progress>, StorageError> {
+fn do_peer_progress(
+    txn: &ArenaReadTransaction,
+    peer: Peer,
+) -> Result<Option<Progress>, StorageError> {
     let key = peer.as_str();
 
-    let peer_table = txn.open_table(PEER_TABLE)?;
+    let peer_table = txn.cache_peer_table()?;
     if let Some(entry) = peer_table.get(key)? {
         let PeerTableEntry { uuid, .. } = entry.value().parse()?;
 
-        let notification_table = txn.open_table(NOTIFICATION_TABLE)?;
+        let notification_table = txn.cache_notification_table()?;
         if let Some(last_seen) = notification_table.get(key)? {
             return Ok(Some(Progress::new(uuid, last_seen.value())));
         }
@@ -712,11 +630,10 @@ fn do_peer_progress(txn: &ReadTransaction, peer: Peer) -> Result<Option<Progress
 }
 
 pub(crate) fn do_dir_mtime(
-    txn: &ReadTransaction,
+    dir_table: &impl redb::ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
     inode: Inode,
     root: Inode,
 ) -> Result<UnixTime, StorageError> {
-    let dir_table = txn.open_table(DIRECTORY_TABLE)?;
     match dir_table.get((inode, "."))? {
         Some(e) => {
             if let DirTableEntry::Dot(mtime) = e.value().parse()? {
@@ -737,16 +654,16 @@ pub(crate) fn do_dir_mtime(
 
 // Return the default file entry for a path.
 pub(crate) fn get_file_entry_for_path(
-    txn: &ReadTransaction,
+    txn: &ArenaReadTransaction,
     root: Inode,
     path: &Path,
 ) -> Result<FileTableEntry, StorageError> {
-    let dir_table = txn.open_table(DIRECTORY_TABLE)?;
+    let dir_table = txn.cache_directory_table()?;
     let (inode, assignment) = do_lookup_path(&dir_table, root, Some(path))?;
     if assignment != InodeAssignment::File {
         return Err(StorageError::IsADirectory);
     }
-    let file_table = txn.open_table(FILE_TABLE)?;
+    let file_table = txn.cache_file_table()?;
 
     get_file_entry(&file_table, inode, None)?.ok_or(StorageError::NotFound)
 }
@@ -772,16 +689,19 @@ fn get_default_entry(
     Ok(entry.value().parse()?)
 }
 
-fn do_file_metadata(txn: &ReadTransaction, inode: Inode) -> Result<FileMetadata, StorageError> {
-    Ok(get_default_entry(&txn.open_table(FILE_TABLE)?, inode)?.metadata)
+fn do_file_metadata(
+    txn: &ArenaReadTransaction,
+    inode: Inode,
+) -> Result<FileMetadata, StorageError> {
+    Ok(get_default_entry(&txn.cache_file_table()?, inode)?.metadata)
 }
 
 fn do_file_availability(
-    txn: &ReadTransaction,
+    txn: &ArenaReadTransaction,
     inode: Inode,
     arena: Arena,
 ) -> Result<FileAvailability, StorageError> {
-    let file_table = txn.open_table(FILE_TABLE)?;
+    let file_table = txn.cache_file_table()?;
 
     let mut range = file_table.range((inode, "")..(inode.plus(1), ""))?;
     let (default_key, default_entry) = range.next().ok_or(StorageError::NotFound)??;
@@ -824,15 +744,16 @@ fn do_file_availability(
 ///
 /// Return the parent inode and the file inode.
 fn do_create_file(
-    txn: &WriteTransaction,
+    txn: &ArenaWriteTransaction,
     arena_root: Inode,
     path: &Path,
     alloc_inode_range: &impl Fn() -> Result<(Inode, Inode), StorageError>,
 ) -> Result<(Inode, Inode), StorageError> {
-    let mut dir_table = txn.open_table(DIRECTORY_TABLE)?;
+    let mut dir_table = txn.cache_directory_table()?;
+    let mut current_range_table = txn.cache_current_inode_range_table()?;
     let filename = path.name();
     let parent_inode = do_mkdirs(
-        txn,
+        &mut current_range_table,
         &mut dir_table,
         arena_root,
         path.parent().as_ref(),
@@ -841,7 +762,7 @@ fn do_create_file(
     let dir_entry = get_dir_entry(&dir_table, parent_inode, filename)?;
     let file_inode = match dir_entry {
         None => {
-            let new_inode = alloc_inode(txn, alloc_inode_range)?;
+            let new_inode = alloc_inode(&mut current_range_table, alloc_inode_range)?;
             add_dir_entry(
                 &mut dir_table,
                 parent_inode,
@@ -869,7 +790,7 @@ fn do_create_file(
 ///
 /// Returns the inode of the directory pointed to by the path.
 pub(crate) fn do_mkdirs(
-    txn: &WriteTransaction,
+    current_range_table: &mut redb::Table<(), (Inode, Inode)>,
     dir_table: &mut redb::Table<'_, (Inode, &str), Holder<DirTableEntry>>,
     root_inode: Inode,
     path: Option<&Path>,
@@ -887,7 +808,7 @@ pub(crate) fn do_mkdirs(
             entry.inode
         } else {
             log::debug!("add {component} in {current}");
-            let new_inode = alloc_inode(txn, alloc_inode_range)?;
+            let new_inode = alloc_inode(current_range_table, alloc_inode_range)?;
             add_dir_entry(
                 dir_table,
                 current,
@@ -970,11 +891,9 @@ pub(crate) fn add_dir_entry(
 ///
 /// Returns the allocated inode.
 pub(crate) fn alloc_inode(
-    txn: &WriteTransaction,
+    current_range_table: &mut redb::Table<'_, (), (Inode, Inode)>,
     alloc_inode_range: impl Fn() -> Result<(Inode, Inode), StorageError>,
 ) -> Result<Inode, StorageError> {
-    let mut current_range_table = txn.open_table(CURRENT_INODE_RANGE_TABLE)?;
-    // Read the current range directly from the write transaction
     let current_range = match current_range_table.get(())? {
         Some(value) => {
             let (current, end) = value.value();
@@ -999,9 +918,9 @@ pub(crate) fn alloc_inode(
     }
 }
 
-fn do_mark_peer_files(txn: &WriteTransaction, peer: Peer) -> Result<(), StorageError> {
-    let file_table = txn.open_table(FILE_TABLE)?;
-    let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
+fn do_mark_peer_files(txn: &ArenaWriteTransaction, peer: Peer) -> Result<(), StorageError> {
+    let file_table = txn.cache_file_table()?;
+    let mut pending_catchup_table = txn.cache_pending_catchup_table()?;
     let peer_str = peer.as_str();
     for elt in file_table.iter()? {
         let (k, v) = elt?;
@@ -1018,11 +937,11 @@ fn do_mark_peer_files(txn: &WriteTransaction, peer: Peer) -> Result<(), StorageE
 }
 
 fn do_unmark_peer_file(
-    txn: &WriteTransaction,
+    txn: &ArenaWriteTransaction,
     peer: Peer,
     inode: Inode,
 ) -> Result<(), StorageError> {
-    let mut pending_catchup_table = txn.open_table(PENDING_CATCHUP_TABLE)?;
+    let mut pending_catchup_table = txn.cache_pending_catchup_table()?;
     pending_catchup_table.remove((peer.as_str(), inode))?;
 
     Ok(())
@@ -1032,16 +951,16 @@ fn do_unmark_peer_file(
 mod tests {
     use std::sync::Arc;
 
+    use crate::arena::db::{ArenaReadTransaction, ArenaWriteTransaction};
     use crate::arena::engine;
     use crate::arena::notifier::Notification;
     use crate::global::cache::UnrealCacheBlocking;
     use crate::global::types::{FileMetadata, InodeAssignment};
     use crate::utils::redb_utils;
-    use crate::{DirtyPaths, Inode, StorageError};
+    use crate::{ArenaDatabase, DirtyPaths, Inode, StorageError};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Hash, Path, Peer, UnixTime};
-    use redb::{ReadTransaction, WriteTransaction};
 
     use super::mark_dirty_recursive;
 
@@ -1086,7 +1005,7 @@ mod tests {
             if let Some(p) = child.parent() {
                 std::fs::create_dir_all(p)?;
             }
-            let db = redb_utils::in_memory()?;
+            let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
             cache.add_arena(arena, db, blob_dir.to_path_buf(), Arc::clone(&dirty_paths))?;
 
@@ -1106,13 +1025,13 @@ mod tests {
             Ok(self.cache.arena_cache(self.arena)?)
         }
 
-        fn begin_read(&self) -> anyhow::Result<ReadTransaction> {
+        fn begin_read(&self) -> anyhow::Result<ArenaReadTransaction> {
             let acache = self.arena_cache()?;
 
             Ok(acache.db.begin_read()?)
         }
 
-        fn begin_write(&self) -> anyhow::Result<WriteTransaction> {
+        fn begin_write(&self) -> anyhow::Result<ArenaWriteTransaction> {
             let acache = self.arena_cache()?;
 
             Ok(acache.db.begin_write()?)
@@ -2212,7 +2131,6 @@ mod tests {
         {
             let txn = fixture.begin_write()?;
             assert_eq!(None, engine::take_dirty(&txn)?);
-            let _ = txn.abort();
         }
 
         Ok(())
@@ -2246,7 +2164,6 @@ mod tests {
         {
             let txn = fixture.begin_write()?;
             assert_eq!(None, engine::take_dirty(&txn)?);
-            let _ = txn.abort();
         }
 
         Ok(())

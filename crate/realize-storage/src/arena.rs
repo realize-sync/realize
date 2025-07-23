@@ -1,5 +1,6 @@
 pub mod arena_cache;
 pub mod blob;
+pub mod db;
 pub mod engine;
 pub mod hasher;
 pub mod index;

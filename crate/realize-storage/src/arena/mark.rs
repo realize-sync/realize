@@ -1,20 +1,13 @@
 #![allow(dead_code)] // work in progress
 
+use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
 use super::types::{Mark, MarkTableEntry};
 use crate::arena::arena_cache;
 use crate::arena::index;
 use crate::utils::holder::Holder;
 use crate::{DirtyPaths, Inode, StorageError};
 use realize_types::Path;
-use redb::{Database, ReadTransaction, TableDefinition, WriteTransaction};
 use std::sync::Arc;
-
-/// Mark table for storing file marks within an Arena.
-///
-/// Key: &str (path)
-/// Value: Holder<MarkTableEntry>
-const MARK_TABLE: TableDefinition<&str, Holder<MarkTableEntry>> =
-    TableDefinition::new("engine.mark");
 
 /// Tracks marks hierarchically by paths in an arena.
 ///
@@ -25,7 +18,7 @@ const MARK_TABLE: TableDefinition<&str, Holder<MarkTableEntry>> =
 /// are marked dirty. Changing the root mark will mark all files in
 /// the cache and index dirty.
 pub struct PathMarks {
-    db: Arc<Database>,
+    db: Arc<ArenaDatabase>,
     arena_root: Inode,
     dirty_paths: Arc<DirtyPaths>,
 }
@@ -33,14 +26,14 @@ pub struct PathMarks {
 impl PathMarks {
     /// Create a new PathMarks with the given default mark.
     pub fn new(
-        db: Arc<Database>,
+        db: Arc<ArenaDatabase>,
         arena_root: Inode,
         dirty_paths: Arc<DirtyPaths>,
     ) -> Result<Self, StorageError> {
         // Ensure the database has the required mark table
         {
             let txn = db.begin_write()?;
-            txn.open_table(MARK_TABLE)?;
+            txn.mark_table()?;
             txn.commit()?;
         }
 
@@ -57,7 +50,7 @@ impl PathMarks {
     /// parents or it can be the root mark.
     pub fn get_mark(&self, path: &Path) -> Result<Mark, StorageError> {
         let txn = self.db.begin_read()?;
-        let mark_table = txn.open_table(MARK_TABLE)?;
+        let mark_table = txn.mark_table()?;
 
         do_get_mark(&mark_table, Some(path))
     }
@@ -76,7 +69,7 @@ impl PathMarks {
     pub fn clear_mark(&self, path: &Path) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
         {
-            let mut mark_table = txn.open_table(MARK_TABLE)?;
+            let mut mark_table = txn.mark_table()?;
 
             let before = match mark_table.remove(path.as_str())? {
                 None => {
@@ -104,7 +97,7 @@ impl PathMarks {
     ) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
         {
-            let mut mark_table = txn.open_table(MARK_TABLE)?;
+            let mut mark_table = txn.mark_table()?;
             let before = do_get_mark(&mark_table, path_or_root)?;
             mark_table.insert(
                 path_or_root.map(|p| p.as_str()).unwrap_or(""),
@@ -136,7 +129,7 @@ impl PathMarks {
     /// the index, this function does nothing.
     fn mark_dirty(
         &self,
-        txn: &WriteTransaction,
+        txn: &ArenaWriteTransaction,
         path_or_root: Option<&Path>,
     ) -> Result<(), StorageError> {
         if let Some(path) = path_or_root {
@@ -151,8 +144,8 @@ impl PathMarks {
     }
 }
 
-pub(crate) fn get_mark(txn: &ReadTransaction, path: &Path) -> Result<Mark, StorageError> {
-    let mark_table = txn.open_table(MARK_TABLE)?;
+pub(crate) fn get_mark(txn: &ArenaReadTransaction, path: &Path) -> Result<Mark, StorageError> {
+    let mark_table = txn.mark_table()?;
     do_get_mark(&mark_table, Some(path))
 }
 
@@ -178,7 +171,8 @@ fn do_get_mark(
     }
 }
 
-/// Entry in the mark #[cfg(test)]
+/// Entry in the mark
+#[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
@@ -191,7 +185,7 @@ mod tests {
 
     struct Fixture {
         arena: Arena,
-        db: Arc<Database>,
+        db: Arc<ArenaDatabase>,
         acache: ArenaCache,
         index: RealIndexBlocking,
         marks: PathMarks,
@@ -203,7 +197,7 @@ mod tests {
             let _ = env_logger::try_init();
 
             let arena = Arena::from("test");
-            let db = redb_utils::in_memory()?;
+            let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
             let arena_root = Inode(300);
             let acache = ArenaCache::new(

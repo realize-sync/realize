@@ -1,5 +1,6 @@
 #![allow(dead_code)] // work in progress
 
+use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
 use super::types::FailedJobTableEntry;
 use crate::arena::arena_cache;
 use crate::arena::blob;
@@ -7,42 +8,13 @@ use crate::arena::mark;
 use crate::utils::holder::Holder;
 use crate::{Inode, Mark, StorageError};
 use realize_types::{ByteRanges, Hash, Path, UnixTime};
-use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
+use redb::ReadableTable;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::{task, time};
 use tokio_stream::wrappers::ReceiverStream;
-
-/// Path marked dirty, indexed by path.
-///
-/// The path can be in the index, in the cache or both.
-///
-/// Each entry in this table has a corresponding entry in DIRTY_LOG_TABLE.
-///
-/// Key: &str (path)
-/// Value: dirty counter (key of DIRTY_LOG_TABLE)
-const DIRTY_TABLE: TableDefinition<&str, u64> = TableDefinition::new("engine.dirty");
-
-/// Path marked dirty, indexed by an increasing counter.
-///
-/// Key: u64 (increasing counter)
-/// Value: &str (path)
-const DIRTY_LOG_TABLE: TableDefinition<u64, &str> = TableDefinition::new("engine.dirty_log");
-
-/// Highest counter value for DIRTY_LOG_TABLE.
-///
-/// Can only be cleared if DIRTY_TABLE, DIRTY_LOG_TABLE and JOB_TABLE
-/// are empty and there is no active stream of Jobs.
-const DIRTY_COUNTER_TABLE: TableDefinition<(), u64> = TableDefinition::new("engine.dirty_counter");
-
-/// Stores job failures.
-///
-/// Key: u64 (key of the corresponding DIRTY_LOG_TABLE entry)
-/// Value: FailedJobTableEntry
-const FAILED_JOB_TABLE: TableDefinition<u64, Holder<FailedJobTableEntry>> =
-    TableDefinition::new("engine.failed_job");
 
 #[derive(Eq, PartialEq, Debug, Clone)]
 pub(crate) enum Job {
@@ -68,16 +40,13 @@ pub(crate) struct DirtyPaths {
 }
 
 impl DirtyPaths {
-    pub(crate) async fn new(db: Arc<Database>) -> Result<Arc<DirtyPaths>, StorageError> {
+    pub(crate) async fn new(db: Arc<ArenaDatabase>) -> Result<Arc<DirtyPaths>, StorageError> {
         let last_counter = task::spawn_blocking(move || {
             let counter: u64;
 
             let txn = db.begin_write()?;
             {
-                txn.open_table(DIRTY_TABLE)?;
-                txn.open_table(DIRTY_LOG_TABLE)?;
-                txn.open_table(FAILED_JOB_TABLE)?;
-                let dirty_counter_table = txn.open_table(DIRTY_COUNTER_TABLE)?;
+                let dirty_counter_table = txn.dirty_counter_table()?;
                 counter = last_counter(&dirty_counter_table)?;
             }
             txn.commit()?;
@@ -102,13 +71,13 @@ impl DirtyPaths {
     /// This does nothing if the path is already dirty.
     pub(crate) fn mark_dirty(
         &self,
-        txn: &WriteTransaction,
+        txn: &ArenaWriteTransaction,
         path: &Path,
     ) -> Result<(), StorageError> {
-        let mut dirty_table = txn.open_table(DIRTY_TABLE)?;
-        let mut dirty_log_table = txn.open_table(DIRTY_LOG_TABLE)?;
-        let mut dirty_counter_table = txn.open_table(DIRTY_COUNTER_TABLE)?;
-        let mut failed_job_table = txn.open_table(FAILED_JOB_TABLE)?;
+        let mut dirty_table = txn.dirty_table()?;
+        let mut dirty_log_table = txn.dirty_log_table()?;
+        let mut dirty_counter_table = txn.dirty_counter_table()?;
+        let mut failed_job_table = txn.failed_job_table()?;
 
         let counter = last_counter(&dirty_counter_table)? + 1;
         dirty_counter_table.insert((), counter)?;
@@ -126,7 +95,7 @@ impl DirtyPaths {
     }
 }
 pub(crate) struct Engine {
-    db: Arc<Database>,
+    db: Arc<ArenaDatabase>,
     dirty_paths: Arc<DirtyPaths>,
     arena_root: Inode,
     job_retry_strategy: Box<dyn (Fn(u32) -> Option<Duration>) + Sync + Send + 'static>,
@@ -140,7 +109,7 @@ pub(crate) struct Engine {
 
 impl Engine {
     pub(crate) fn new(
-        db: Arc<Database>,
+        db: Arc<ArenaDatabase>,
         dirty_paths: Arc<DirtyPaths>,
         arena_root: Inode,
         job_retry_strategy: impl (Fn(u32) -> Option<Duration>) + Sync + Send + 'static,
@@ -198,9 +167,9 @@ impl Engine {
         let current = current_path_counter(&txn, path)?;
         let counter = job.counter();
         if current == Some(counter) {
-            txn.open_table(FAILED_JOB_TABLE)?.remove(counter)?;
-            txn.open_table(DIRTY_LOG_TABLE)?.remove(counter)?;
-            txn.open_table(DIRTY_TABLE)?.remove(path.as_str())?;
+            txn.failed_job_table()?.remove(counter)?;
+            txn.dirty_log_table()?.remove(counter)?;
+            txn.dirty_table()?.remove(path.as_str())?;
         }
         txn.commit()?;
 
@@ -224,7 +193,7 @@ impl Engine {
                 return Ok(());
             }
 
-            let mut failed_job_table = txn.open_table(FAILED_JOB_TABLE)?;
+            let mut failed_job_table = txn.failed_job_table()?;
             let failure_count = if let Some(existing) = failed_job_table.get(counter)? {
                 let existing = existing.value().parse()?;
                 existing.failure_count + 1
@@ -235,8 +204,8 @@ impl Engine {
                 None => {
                     log::warn!("Giving up on {job:?} after {failure_count} attempts");
                     failed_job_table.remove(counter)?;
-                    txn.open_table(DIRTY_LOG_TABLE)?.remove(counter)?;
-                    txn.open_table(DIRTY_TABLE)?.remove(path.as_str())?;
+                    txn.dirty_log_table()?.remove(counter)?;
+                    txn.dirty_table()?.remove(path.as_str())?;
                 }
                 Some(delay) => {
                     log::debug!(
@@ -335,7 +304,7 @@ impl Engine {
 
     fn next_job(&self, start_counter: u64) -> Result<(Option<Job>, Option<u64>), StorageError> {
         let txn = self.db.begin_read()?;
-        let dirty_log_table = txn.open_table(DIRTY_LOG_TABLE)?;
+        let dirty_log_table = txn.dirty_log_table()?;
         let mut last_counter = None;
         for entry in dirty_log_table.range(start_counter..)? {
             let (key, value) = entry?;
@@ -362,7 +331,7 @@ impl Engine {
         let this = Arc::clone(self);
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
-            let dirty_log_table = txn.open_table(DIRTY_LOG_TABLE)?;
+            let dirty_log_table = txn.dirty_log_table()?;
             if let Some(v) = dirty_log_table.get(counter)? {
                 drop(dirty_log_table);
 
@@ -377,7 +346,7 @@ impl Engine {
     /// Build a job from a path, if possible.
     fn build_job(
         &self,
-        txn: &ReadTransaction,
+        txn: &ArenaReadTransaction,
         path: Path,
         counter: u64,
     ) -> Result<Option<Job>, StorageError> {
@@ -411,9 +380,9 @@ impl Engine {
         }
         let txn = self.db.begin_write()?;
         {
-            let mut dirty_log_table = txn.open_table(DIRTY_LOG_TABLE)?;
-            let mut dirty_table = txn.open_table(DIRTY_TABLE)?;
-            let mut failed_job_table = txn.open_table(FAILED_JOB_TABLE)?;
+            let mut dirty_log_table = txn.dirty_log_table()?;
+            let mut dirty_table = txn.dirty_table()?;
+            let mut failed_job_table = txn.failed_job_table()?;
 
             for counter in beg..end {
                 let prev = dirty_log_table.remove(counter)?;
@@ -433,7 +402,7 @@ impl Engine {
         let counter = job.counter();
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
-            let failed_job_table = txn.open_table(FAILED_JOB_TABLE)?;
+            let failed_job_table = txn.failed_job_table()?;
 
             Ok::<_, StorageError>(failed_job_table.get(counter)?.is_some())
         })
@@ -454,7 +423,7 @@ impl Engine {
             let lower_bound = lower_bound.cloned();
             let current = task::spawn_blocking(move || {
                 let txn = this.db.begin_read()?;
-                let failed_job_table = txn.open_table(FAILED_JOB_TABLE)?;
+                let failed_job_table = txn.failed_job_table()?;
                 let mut earliest_backoff = UnixTime::MAX;
                 let mut counters = vec![];
                 for e in failed_job_table.iter()? {
@@ -499,11 +468,11 @@ impl Engine {
     }
 }
 
-fn current_path_counter(txn: &WriteTransaction, path: &Path) -> Result<Option<u64>, StorageError> {
-    let current = txn
-        .open_table(DIRTY_TABLE)?
-        .get(path.as_str())?
-        .map(|e| e.value());
+fn current_path_counter(
+    txn: &ArenaWriteTransaction,
+    path: &Path,
+) -> Result<Option<u64>, StorageError> {
+    let current = txn.dirty_table()?.get(path.as_str())?.map(|e| e.value());
     Ok(current)
 }
 
@@ -533,15 +502,18 @@ fn next_retry(
 }
 
 /// Check the dirty mark on a path.
-pub(crate) fn is_dirty(txn: &ReadTransaction, path: &Path) -> Result<bool, StorageError> {
-    let dirty_table = txn.open_table(DIRTY_TABLE)?;
+pub(crate) fn is_dirty(txn: &ArenaReadTransaction, path: &Path) -> Result<bool, StorageError> {
+    let dirty_table = txn.dirty_table()?;
 
     Ok(dirty_table.get(path.as_str())?.is_some())
 }
 
 /// Check whether a path is dirty and if it is return its dirty mark counter.
-pub(crate) fn get_dirty(txn: &ReadTransaction, path: &Path) -> Result<Option<u64>, StorageError> {
-    let dirty_table = txn.open_table(DIRTY_TABLE)?;
+pub(crate) fn get_dirty(
+    txn: &ArenaReadTransaction,
+    path: &Path,
+) -> Result<Option<u64>, StorageError> {
+    let dirty_table = txn.dirty_table()?;
 
     let entry = dirty_table.get(path.as_str())?;
 
@@ -551,10 +523,10 @@ pub(crate) fn get_dirty(txn: &ReadTransaction, path: &Path) -> Result<Option<u64
 /// Clear the dirty mark on a path.
 ///
 /// This does nothing if the path has no dirty mark.
-pub(crate) fn clear_dirty(txn: &WriteTransaction, path: &Path) -> Result<(), StorageError> {
-    let mut dirty_table = txn.open_table(DIRTY_TABLE)?;
-    let mut dirty_log_table = txn.open_table(DIRTY_LOG_TABLE)?;
-    let mut failed_job_table = txn.open_table(FAILED_JOB_TABLE)?;
+pub(crate) fn clear_dirty(txn: &ArenaWriteTransaction, path: &Path) -> Result<(), StorageError> {
+    let mut dirty_table = txn.dirty_table()?;
+    let mut dirty_log_table = txn.dirty_log_table()?;
+    let mut failed_job_table = txn.failed_job_table()?;
 
     let prev = dirty_table.remove(path.as_str())?;
     if let Some(prev) = prev {
@@ -570,9 +542,9 @@ pub(crate) fn clear_dirty(txn: &WriteTransaction, path: &Path) -> Result<(), Sto
 ///
 /// The returned path is removed from the dirty table when the
 /// transaction is committed.
-pub(crate) fn take_dirty(txn: &WriteTransaction) -> Result<Option<(Path, u64)>, StorageError> {
-    let mut dirty_table = txn.open_table(DIRTY_TABLE)?;
-    let mut dirty_log_table = txn.open_table(DIRTY_LOG_TABLE)?;
+pub(crate) fn take_dirty(txn: &ArenaWriteTransaction) -> Result<Option<(Path, u64)>, StorageError> {
+    let mut dirty_table = txn.dirty_table()?;
+    let mut dirty_log_table = txn.dirty_log_table()?;
     loop {
         // This loop skips invalid paths.
         match dirty_log_table.pop_first()? {
@@ -612,13 +584,13 @@ mod tests {
 
     /// Fixture for testing DirtyPaths.
     struct DirtyPathsFixture {
-        db: Arc<redb::Database>,
+        db: Arc<ArenaDatabase>,
         dirty_paths: Arc<DirtyPaths>,
     }
     impl DirtyPathsFixture {
         async fn setup() -> anyhow::Result<DirtyPathsFixture> {
             let _ = env_logger::try_init();
-            let db = redb_utils::in_memory()?;
+            let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
             Ok(Self { db, dirty_paths })
         }
@@ -627,7 +599,7 @@ mod tests {
     /// Fixture for testing Engine.
     struct EngineFixture {
         arena: Arena,
-        db: Arc<redb::Database>,
+        db: Arc<ArenaDatabase>,
         dirty_paths: Arc<DirtyPaths>,
         acache: ArenaCache,
         pathmarks: PathMarks,
@@ -639,7 +611,7 @@ mod tests {
             let _ = env_logger::try_init();
 
             let tempdir = TempDir::new()?;
-            let db = redb_utils::in_memory()?;
+            let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
 
             let arena = Arena::from("myarena");
@@ -706,7 +678,7 @@ mod tests {
 
         fn lowest_counter(&self) -> anyhow::Result<Option<u64>> {
             let txn = self.db.begin_read()?;
-            let dirty_log_table = txn.open_table(DIRTY_LOG_TABLE)?;
+            let dirty_log_table = txn.dirty_log_table()?;
 
             Ok(dirty_log_table.first()?.map(|(k, _)| k.value()))
         }
@@ -810,9 +782,9 @@ mod tests {
     async fn skip_invalid_path() -> anyhow::Result<()> {
         let fixture = DirtyPathsFixture::setup().await?;
         let txn = fixture.db.begin_write()?;
-        txn.open_table(DIRTY_TABLE)?.insert("///", 1)?;
-        txn.open_table(DIRTY_COUNTER_TABLE)?.insert((), 1)?;
-        txn.open_table(DIRTY_LOG_TABLE)?.insert(1, "///")?;
+        txn.dirty_table()?.insert("///", 1)?;
+        txn.dirty_counter_table()?.insert((), 1)?;
+        txn.dirty_log_table()?.insert(1, "///")?;
         let path = Path::parse("path")?;
 
         fixture.dirty_paths.mark_dirty(&txn, &path)?;
