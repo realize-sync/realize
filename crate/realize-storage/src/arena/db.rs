@@ -147,7 +147,8 @@ impl ArenaDatabase {
     pub fn new(db: redb::Database) -> Result<Arc<Self>, StorageError> {
         let txn = db.begin_write()?;
         {
-            // create tables
+            // Create tables so they can safely be queried in read
+            // transactions in an empty database.
             txn.open_table(INDEX_FILE_TABLE)?;
             txn.open_table(INDEX_HISTORY_TABLE)?;
             txn.open_table(INDEX_SETTINGS_TABLE)?;
