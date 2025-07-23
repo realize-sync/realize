@@ -3,7 +3,7 @@
 @0xa865be6edb44e079;
 
 using Rust = import "/capnpc/rust.capnp";
-$Rust.parentModule("real");
+$Rust.parentModule("arena");
 
 # An entry in the file table.
 struct FileTableEntry {

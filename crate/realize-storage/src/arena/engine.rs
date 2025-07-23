@@ -1,7 +1,8 @@
 #![allow(dead_code)] // work in progress
 
-use crate::mark;
-use crate::unreal::{arena_cache, blob};
+use crate::arena::arena_cache;
+use crate::arena::blob;
+use crate::arena::mark;
 use crate::utils::holder::{ByteConversionError, ByteConvertible, Holder, NamedType};
 use crate::{Inode, Mark, StorageError};
 use capnp::message::ReaderOptions;
@@ -15,13 +16,7 @@ use tokio::sync::watch;
 use tokio::{task, time};
 use tokio_stream::wrappers::ReceiverStream;
 
-#[allow(dead_code)]
-#[allow(unknown_lints)]
-#[allow(clippy::uninlined_format_args)]
-#[allow(clippy::extra_unused_type_parameters)]
-mod engine_capnp {
-    include!(concat!(env!("OUT_DIR"), "/engine_capnp.rs"));
-}
+use super::engine_capnp;
 
 /// Path marked dirty, indexed by path.
 ///
@@ -643,8 +638,8 @@ impl ByteConvertible<FailedJobTableEntry> for FailedJobTableEntry {
 mod tests {
     use super::*;
     use crate::Notification;
-    use crate::mark::PathMarks;
-    use crate::unreal::arena_cache::ArenaCache;
+    use crate::arena::arena_cache::ArenaCache;
+    use crate::arena::mark::PathMarks;
     use crate::utils::redb_utils;
     use assert_fs::TempDir;
     use futures::StreamExt as _;

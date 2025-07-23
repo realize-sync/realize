@@ -1,37 +1,35 @@
 use std::path::PathBuf;
 use std::{collections::HashMap, sync::Arc};
 
+use arena::engine::DirtyPaths;
+use arena::index::RealIndexAsync;
+use arena::watcher::RealWatcher;
 use config::StorageConfig;
-use engine::DirtyPaths;
-use real::index::RealIndexAsync;
-use real::watcher::RealWatcher;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use realize_types;
 use realize_types::Arena;
 
+mod arena;
 pub mod config;
-mod engine;
 mod error;
-mod mark;
-mod real;
+mod global;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 mod types;
-mod unreal;
 pub mod utils;
 
+pub use arena::blob::{Blob, BlobIncomplete};
+pub use arena::mark::Mark;
+pub use arena::notifier::Notification;
+pub use arena::notifier::Progress;
+pub use arena::reader::Reader;
+pub use arena::store::{Options as RealStoreOptions, RealStore, RealStoreError, SyncedFile};
 pub use error::StorageError;
-pub use mark::Mark;
-pub use real::notifier::Notification;
-pub use real::notifier::Progress;
-pub use real::reader::Reader;
-pub use real::store::{Options as RealStoreOptions, RealStore, RealStoreError, SyncedFile};
+pub use global::cache::UnrealCacheAsync;
+pub use global::types::{FileAvailability, FileMetadata, InodeAssignment};
 pub use types::Inode;
-pub use unreal::blob::{Blob, BlobIncomplete};
-pub use unreal::cache::UnrealCacheAsync;
-pub use unreal::types::{FileAvailability, FileMetadata, InodeAssignment};
 use utils::redb_utils;
 
 /// Local storage, including the real store and an unreal cache.
@@ -135,7 +133,7 @@ impl Storage {
     ) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
         let arena_storage = self.arena_storage(arena)?;
 
-        real::notifier::subscribe(arena_storage.index.clone(), tx, progress).await
+        arena::notifier::subscribe(arena_storage.index.clone(), tx, progress).await
     }
 
     /// Return a handle on the unreal cache.

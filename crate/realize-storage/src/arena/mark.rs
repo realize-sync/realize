@@ -1,7 +1,8 @@
 #![allow(dead_code)] // work in progress
 
-use crate::real::index;
-use crate::unreal::arena_cache;
+use super::mark_capnp;
+use crate::arena::arena_cache;
+use crate::arena::index;
 use crate::utils::holder::{ByteConversionError, ByteConvertible, Holder, NamedType};
 use crate::{DirtyPaths, Inode, StorageError};
 use capnp::message::ReaderOptions;
@@ -9,14 +10,6 @@ use capnp::serialize_packed;
 use realize_types::Path;
 use redb::{Database, ReadTransaction, TableDefinition, WriteTransaction};
 use std::sync::Arc;
-
-#[allow(dead_code)]
-#[allow(unknown_lints)]
-#[allow(clippy::uninlined_format_args)]
-#[allow(clippy::extra_unused_type_parameters)]
-mod mark_capnp {
-    include!(concat!(env!("OUT_DIR"), "/mark_capnp.rs"));
-}
 
 /// Mark table for storing file marks within an Arena.
 ///
@@ -250,9 +243,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::engine;
-    use crate::real::index::RealIndexBlocking;
-    use crate::unreal::arena_cache::ArenaCache;
+    use crate::arena::arena_cache::ArenaCache;
+    use crate::arena::engine;
+    use crate::arena::index::RealIndexBlocking;
     use crate::utils::redb_utils;
     use realize_types::{Arena, Hash, UnixTime};
 
@@ -317,7 +310,7 @@ mod tests {
 
         /// Add a file to the cache for testing
         fn add_file_to_cache(&self, path: &Path) -> anyhow::Result<()> {
-            use crate::real::notifier::Notification;
+            use crate::arena::notifier::Notification;
             use realize_types::Peer;
 
             let test_peer = Peer::from("test-peer");

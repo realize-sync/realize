@@ -552,7 +552,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::DirtyPaths;
-    use crate::real::index::{FileTableEntry, RealIndexBlocking};
+    use crate::arena::index::{FileTableEntry, RealIndexBlocking};
     use crate::realize_types::Arena;
     use crate::utils::{hash, redb_utils};
     use realize_types::Hash;

@@ -1,11 +1,12 @@
 use super::blob::Blobstore;
-use super::types::{
-    BlobId, DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry,
-    InodeAssignment, PeerTableEntry, ReadDirEntry,
-};
+use super::types::BlobId;
 use crate::Blob;
-use crate::engine::DirtyPaths;
-use crate::real::notifier::{Notification, Progress};
+use crate::arena::engine::DirtyPaths;
+use crate::arena::notifier::{Notification, Progress};
+use crate::global::types::{
+    DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry, InodeAssignment,
+    PeerTableEntry, ReadDirEntry,
+};
 use crate::utils::holder::Holder;
 use crate::{Inode, StorageError};
 use realize_types::{Arena, ByteRanges, Hash, Path, Peer, UnixTime};
@@ -1031,11 +1032,12 @@ fn do_unmark_peer_file(
 mod tests {
     use std::sync::Arc;
 
-    use crate::real::notifier::Notification;
-    use crate::unreal::cache::UnrealCacheBlocking;
-    use crate::unreal::types::{FileMetadata, InodeAssignment};
+    use crate::arena::engine;
+    use crate::arena::notifier::Notification;
+    use crate::global::cache::UnrealCacheBlocking;
+    use crate::global::types::{FileMetadata, InodeAssignment};
     use crate::utils::redb_utils;
-    use crate::{DirtyPaths, Inode, StorageError, engine};
+    use crate::{DirtyPaths, Inode, StorageError};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Hash, Path, Peer, UnixTime};

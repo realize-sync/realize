@@ -1,8 +1,8 @@
 #![allow(dead_code)] // work in progress
 
-use super::real_capnp;
+use super::index_capnp;
 use crate::StorageError;
-use crate::engine::DirtyPaths;
+use crate::arena::engine::DirtyPaths;
 use crate::utils::holder::{ByteConversionError, ByteConvertible, Holder, NamedType};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
@@ -547,8 +547,8 @@ impl NamedType for FileTableEntry {
 impl ByteConvertible<FileTableEntry> for FileTableEntry {
     fn from_bytes(data: &[u8]) -> Result<FileTableEntry, ByteConversionError> {
         let message_reader = serialize_packed::read_message(&mut &data[..], ReaderOptions::new())?;
-        let msg: real_capnp::file_table_entry::Reader =
-            message_reader.get_root::<real_capnp::file_table_entry::Reader>()?;
+        let msg: index_capnp::file_table_entry::Reader =
+            message_reader.get_root::<index_capnp::file_table_entry::Reader>()?;
 
         let mtime = msg.get_mtime()?;
         let hash: &[u8] = msg.get_hash()?;
@@ -562,8 +562,8 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
 
     fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError> {
         let mut message = ::capnp::message::Builder::new_default();
-        let mut builder: real_capnp::file_table_entry::Builder =
-            message.init_root::<real_capnp::file_table_entry::Builder>();
+        let mut builder: index_capnp::file_table_entry::Builder =
+            message.init_root::<index_capnp::file_table_entry::Builder>();
 
         builder.set_size(self.size);
         builder.set_hash(&self.hash.0);
@@ -596,17 +596,17 @@ impl NamedType for HistoryTableEntry {
 impl ByteConvertible<HistoryTableEntry> for HistoryTableEntry {
     fn from_bytes(data: &[u8]) -> Result<HistoryTableEntry, ByteConversionError> {
         let message_reader = serialize_packed::read_message(&mut &data[..], ReaderOptions::new())?;
-        let msg: real_capnp::history_table_entry::Reader =
-            message_reader.get_root::<real_capnp::history_table_entry::Reader>()?;
+        let msg: index_capnp::history_table_entry::Reader =
+            message_reader.get_root::<index_capnp::history_table_entry::Reader>()?;
         match msg.get_kind()? {
-            real_capnp::history_table_entry::Kind::Add => {
+            index_capnp::history_table_entry::Kind::Add => {
                 Ok(HistoryTableEntry::Add(parse_path(msg.get_path()?)?))
             }
-            real_capnp::history_table_entry::Kind::Replace => Ok(HistoryTableEntry::Replace(
+            index_capnp::history_table_entry::Kind::Replace => Ok(HistoryTableEntry::Replace(
                 parse_path(msg.get_path()?)?,
                 parse_hash(msg.get_old_hash()?)?,
             )),
-            real_capnp::history_table_entry::Kind::Remove => Ok(HistoryTableEntry::Remove(
+            index_capnp::history_table_entry::Kind::Remove => Ok(HistoryTableEntry::Remove(
                 parse_path(msg.get_path()?)?,
                 parse_hash(msg.get_old_hash()?)?,
             )),
@@ -615,21 +615,21 @@ impl ByteConvertible<HistoryTableEntry> for HistoryTableEntry {
 
     fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError> {
         let mut message = ::capnp::message::Builder::new_default();
-        let mut builder: real_capnp::history_table_entry::Builder =
-            message.init_root::<real_capnp::history_table_entry::Builder>();
+        let mut builder: index_capnp::history_table_entry::Builder =
+            message.init_root::<index_capnp::history_table_entry::Builder>();
 
         match self {
             HistoryTableEntry::Add(path) => {
-                builder.set_kind(real_capnp::history_table_entry::Kind::Add);
+                builder.set_kind(index_capnp::history_table_entry::Kind::Add);
                 builder.set_path(path.as_str());
             }
             HistoryTableEntry::Replace(path, old_hash) => {
-                builder.set_kind(real_capnp::history_table_entry::Kind::Replace);
+                builder.set_kind(index_capnp::history_table_entry::Kind::Replace);
                 builder.set_path(path.as_str());
                 builder.set_old_hash(&old_hash.0);
             }
             HistoryTableEntry::Remove(path, old_hash) => {
-                builder.set_kind(real_capnp::history_table_entry::Kind::Remove);
+                builder.set_kind(index_capnp::history_table_entry::Kind::Remove);
                 builder.set_path(path.as_str());
                 builder.set_old_hash(&old_hash.0);
             }
@@ -701,9 +701,9 @@ fn parse_path(path: capnp::text::Reader<'_>) -> Result<realize_types::Path, Byte
 
 #[cfg(test)]
 mod tests {
-    use crate::{engine, utils::redb_utils};
-
     use super::*;
+    use crate::arena::engine;
+    use crate::utils::redb_utils;
     use assert_fs::TempDir;
     use futures::{StreamExt as _, TryStreamExt as _};
 

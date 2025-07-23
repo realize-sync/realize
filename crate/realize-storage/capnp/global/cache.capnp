@@ -3,7 +3,7 @@
 @0x950bed21f9dbff63;
 
 using Rust = import "/capnpc/rust.capnp";
-$Rust.parentModule("unreal");
+$Rust.parentModule("global");
 
 struct DirTableEntry {
   union {

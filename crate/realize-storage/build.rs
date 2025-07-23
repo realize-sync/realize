@@ -20,10 +20,11 @@ fn capnpc() -> anyhow::Result<()> {
     capnpc::CompilerCommand::new()
         .src_prefix("capnp")
         .import_path("capnp")
-        .file("capnp/engine.capnp")
-        .file("capnp/mark.capnp")
-        .file("capnp/real.capnp")
-        .file("capnp/unreal.capnp")
+        .file("capnp/arena/engine.capnp")
+        .file("capnp/arena/mark.capnp")
+        .file("capnp/arena/index.capnp")
+        .file("capnp/arena/blob.capnp")
+        .file("capnp/global/cache.capnp")
         // keep files sorted
         .run()?;
     Ok(())

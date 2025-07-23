@@ -1,6 +1,7 @@
-use super::types::{BlobId, BlobTableEntry, FileTableEntry};
+use super::types::{BlobId, BlobTableEntry};
 use crate::Inode;
 use crate::StorageError;
+use crate::global::types::FileTableEntry;
 use crate::utils::holder::Holder;
 use realize_types::{ByteRange, ByteRanges, Hash};
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
@@ -422,9 +423,9 @@ impl AsyncWrite for Blob {
 
 #[cfg(test)]
 mod tests {
-    use super::super::cache::UnrealCacheBlocking;
     use super::*;
-    use crate::unreal::arena_cache::ArenaCache;
+    use crate::arena::arena_cache::ArenaCache;
+    use crate::global::cache::UnrealCacheBlocking;
     use crate::utils::redb_utils;
     use crate::{DirtyPaths, Inode, Notification, UnrealCacheAsync};
     use assert_fs::TempDir;
