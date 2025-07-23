@@ -94,28 +94,28 @@ fn fill_byte_ranges(ranges: &ByteRanges, builder: blob_capnp::byte_ranges::Build
 
 /// An entry in the file table.
 #[derive(Debug, Clone, PartialEq)]
-pub struct FileTableEntry {
+pub struct IndexedFileTableEntry {
     pub hash: Hash,
     pub mtime: UnixTime,
     pub size: u64,
 }
 
-impl NamedType for FileTableEntry {
+impl NamedType for IndexedFileTableEntry {
     fn typename() -> &'static str {
         "index.file"
     }
 }
 
-impl ByteConvertible<FileTableEntry> for FileTableEntry {
-    fn from_bytes(data: &[u8]) -> Result<FileTableEntry, ByteConversionError> {
+impl ByteConvertible<IndexedFileTableEntry> for IndexedFileTableEntry {
+    fn from_bytes(data: &[u8]) -> Result<IndexedFileTableEntry, ByteConversionError> {
         let message_reader = serialize_packed::read_message(&mut &data[..], ReaderOptions::new())?;
-        let msg: index_capnp::file_table_entry::Reader =
-            message_reader.get_root::<index_capnp::file_table_entry::Reader>()?;
+        let msg: index_capnp::indexed_file_table_entry::Reader =
+            message_reader.get_root::<index_capnp::indexed_file_table_entry::Reader>()?;
 
         let mtime = msg.get_mtime()?;
         let hash: &[u8] = msg.get_hash()?;
         let hash = parse_hash(hash)?;
-        Ok(FileTableEntry {
+        Ok(IndexedFileTableEntry {
             hash,
             mtime: UnixTime::new(mtime.get_secs(), mtime.get_nsecs()),
             size: msg.get_size(),
@@ -124,8 +124,8 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
 
     fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError> {
         let mut message = ::capnp::message::Builder::new_default();
-        let mut builder: index_capnp::file_table_entry::Builder =
-            message.init_root::<index_capnp::file_table_entry::Builder>();
+        let mut builder: index_capnp::indexed_file_table_entry::Builder =
+            message.init_root::<index_capnp::indexed_file_table_entry::Builder>();
 
         builder.set_size(self.size);
         builder.set_hash(&self.hash.0);
@@ -334,8 +334,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn convert_file_table_entry() -> anyhow::Result<()> {
-        let entry = FileTableEntry {
+    async fn convert_indexed_file_table_entry() -> anyhow::Result<()> {
+        let entry = IndexedFileTableEntry {
             size: 200,
             mtime: UnixTime::new(1234567890, 111),
             hash: Hash([0xf0; 32]),
@@ -343,7 +343,7 @@ mod tests {
 
         assert_eq!(
             entry,
-            FileTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
+            IndexedFileTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
         );
 
         Ok(())

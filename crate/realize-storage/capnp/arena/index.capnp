@@ -6,7 +6,7 @@ using Rust = import "/capnpc/rust.capnp";
 $Rust.parentModule("arena::types");
 
 # An entry in the file table.
-struct FileTableEntry {
+struct IndexedFileTableEntry {
   hash @0: Data;
   mtime @1: Time;
   size @2: UInt64;

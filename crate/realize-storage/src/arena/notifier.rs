@@ -1,7 +1,7 @@
 #![allow(dead_code)] // work in progress
 
 use super::index::RealIndexAsync;
-use super::types::{FileTableEntry, HistoryTableEntry};
+use super::types::{HistoryTableEntry, IndexedFileTableEntry};
 use futures::StreamExt as _;
 use realize_types::{Arena, Hash, Path, UnixTime};
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -252,7 +252,7 @@ async fn catchup(
     let mut all_files = index.all_files();
     while let Some((
         path,
-        FileTableEntry {
+        IndexedFileTableEntry {
             size, mtime, hash, ..
         },
     )) = all_files.next().await
@@ -294,7 +294,7 @@ async fn send_notifications(
         let (hist_index, hist_entry) = entry?;
         let notification = match hist_entry {
             HistoryTableEntry::Add(path) => {
-                if let Some(FileTableEntry {
+                if let Some(IndexedFileTableEntry {
                     size, mtime, hash, ..
                 }) = index.get_file(&path).await?
                 {
@@ -319,7 +319,7 @@ async fn send_notifications(
                 // in the index, which might have changed since the
                 // entry was added.
 
-                if let Some(FileTableEntry {
+                if let Some(IndexedFileTableEntry {
                     size, mtime, hash, ..
                 }) = index.get_file(&path).await?
                 {

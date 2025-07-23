@@ -553,7 +553,7 @@ mod tests {
 
     use crate::DirtyPaths;
     use crate::arena::index::RealIndexBlocking;
-    use crate::arena::types::FileTableEntry;
+    use crate::arena::types::IndexedFileTableEntry;
     use crate::realize_types::Arena;
     use crate::utils::{hash, redb_utils};
     use realize_types::Hash;
@@ -641,7 +641,7 @@ mod tests {
         let path = realize_types::Path::parse("foobar")?;
         fixture.wait_for_history_event(1).await?;
         assert_eq!(
-            Some(FileTableEntry {
+            Some(IndexedFileTableEntry {
                 size: 4,
                 mtime,
                 hash: hash::digest("test".as_bytes())
@@ -664,7 +664,7 @@ mod tests {
         let path = realize_types::Path::parse("foobar")?;
         fixture.wait_for_history_event(1).await?;
         assert_eq!(
-            Some(FileTableEntry {
+            Some(IndexedFileTableEntry {
                 size: 0,
                 mtime,
                 hash: hash::digest([])
@@ -1046,7 +1046,7 @@ mod tests {
 
         // Foo is as added initially
         assert_eq!(
-            Some(FileTableEntry {
+            Some(IndexedFileTableEntry {
                 size: 3,
                 mtime: UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
                 hash: hash::digest("foo".as_bytes())
@@ -1056,7 +1056,7 @@ mod tests {
 
         // Bar was updated
         assert_eq!(
-            Some(FileTableEntry {
+            Some(IndexedFileTableEntry {
                 size: 6,
                 mtime: UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
                 hash: hash::digest("barbar".as_bytes())
@@ -1346,7 +1346,7 @@ mod tests {
         fixture.wait_for_history_event(2).await?;
 
         assert_eq!(
-            Some(FileTableEntry {
+            Some(IndexedFileTableEntry {
                 size: 4,
                 mtime,
                 hash: hash::digest("test".as_bytes())

@@ -1,6 +1,6 @@
 #![allow(dead_code)] // work in progress
 
-use super::types::{FileTableEntry, HistoryTableEntry};
+use super::types::{HistoryTableEntry, IndexedFileTableEntry};
 use crate::StorageError;
 use crate::arena::engine::DirtyPaths;
 use crate::utils::holder::{ByteConversionError, Holder};
@@ -17,7 +17,7 @@ use uuid::Uuid;
 ///
 /// Key: realize_types::Path
 /// Value: FileTableEntry
-const FILE_TABLE: TableDefinition<&str, Holder<FileTableEntry>> =
+const FILE_TABLE: TableDefinition<&str, Holder<IndexedFileTableEntry>> =
     TableDefinition::new("index.file");
 
 /// Local file history.
@@ -129,7 +129,7 @@ impl RealIndexBlocking {
     pub fn get_file(
         &self,
         path: &realize_types::Path,
-    ) -> Result<Option<FileTableEntry>, StorageError> {
+    ) -> Result<Option<IndexedFileTableEntry>, StorageError> {
         let txn = (&*self.db).begin_read()?;
         let file_table = txn.open_table(FILE_TABLE)?;
 
@@ -191,7 +191,7 @@ impl RealIndexBlocking {
     /// Send all valid entries of the file table to the given channel.
     pub fn all_files(
         &self,
-        tx: mpsc::Sender<(realize_types::Path, FileTableEntry)>,
+        tx: mpsc::Sender<(realize_types::Path, IndexedFileTableEntry)>,
     ) -> Result<(), StorageError> {
         let txn = (&*self.db).begin_read()?;
         let file_table = txn.open_table(FILE_TABLE)?;
@@ -336,7 +336,7 @@ fn do_add_file(
     let same_hash = old_hash.as_ref().map(|h| *h == hash).unwrap_or(false);
     file_table.insert(
         path.as_str(),
-        Holder::with_content(FileTableEntry {
+        Holder::with_content(IndexedFileTableEntry {
             size,
             mtime: mtime.clone(),
             hash,
@@ -439,7 +439,7 @@ impl RealIndexAsync {
     }
 
     /// Return all valid file entries as a stream.
-    pub fn all_files(&self) -> ReceiverStream<(realize_types::Path, FileTableEntry)> {
+    pub fn all_files(&self) -> ReceiverStream<(realize_types::Path, IndexedFileTableEntry)> {
         let (tx, rx) = mpsc::channel(100);
 
         let inner = Arc::clone(&self.inner);
@@ -473,7 +473,7 @@ impl RealIndexAsync {
     pub async fn get_file(
         &self,
         path: &realize_types::Path,
-    ) -> Result<Option<FileTableEntry>, StorageError> {
+    ) -> Result<Option<IndexedFileTableEntry>, StorageError> {
         let inner = Arc::clone(&self.inner);
         let path = path.clone();
 
@@ -663,7 +663,7 @@ mod tests {
             let txn = index.db.begin_read()?;
             let file_table = txn.open_table(FILE_TABLE)?;
             assert_eq!(
-                FileTableEntry {
+                IndexedFileTableEntry {
                     size: 100,
                     mtime,
                     hash: Hash([0xfa; 32])
@@ -698,7 +698,7 @@ mod tests {
             let txn = index.db.begin_read()?;
             let file_table = txn.open_table(FILE_TABLE)?;
             assert_eq!(
-                FileTableEntry {
+                IndexedFileTableEntry {
                     size: 200,
                     mtime: mtime2,
                     hash: Hash([0x07; 32])
@@ -751,7 +751,7 @@ mod tests {
         index.add_file(&path, 100, &mtime, hash.clone())?;
 
         assert_eq!(
-            Some(FileTableEntry {
+            Some(IndexedFileTableEntry {
                 size: 100,
                 mtime: mtime.clone(),
                 hash: hash.clone()
@@ -1311,7 +1311,7 @@ mod tests {
                 let mut file_table = txn.open_table(FILE_TABLE)?;
                 file_table.insert(
                     "///invalid///path",
-                    Holder::with_content(FileTableEntry {
+                    Holder::with_content(IndexedFileTableEntry {
                         size: 100,
                         mtime: mtime.clone(),
                         hash: Hash([0xfa; 32]),
