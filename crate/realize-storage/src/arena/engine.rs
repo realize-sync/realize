@@ -88,8 +88,10 @@ impl DirtyPaths {
             dirty_log_table.remove(counter)?;
             failed_job_table.remove(counter)?;
         }
-        // TODO: do that only after transaction is committed
-        let _ = self.watch_tx.send(counter);
+        let watch_tx = self.watch_tx.clone();
+        txn.after_commit(move || {
+            let _ = watch_tx.send(counter);
+        });
 
         Ok(())
     }

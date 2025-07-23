@@ -95,7 +95,7 @@ impl RealIndexBlocking {
     ///
     /// This is the value tracked by [RealIndexBlocking::watch_history].
     pub fn last_history_index(&self) -> Result<u64, StorageError> {
-        let txn = (&*self.db).begin_read()?;
+        let txn = self.db.begin_read()?;
         let history_table = txn.index_history_table()?;
 
         last_history_index(&history_table)
@@ -111,7 +111,7 @@ impl RealIndexBlocking {
         &self,
         path: &realize_types::Path,
     ) -> Result<Option<IndexedFileTableEntry>, StorageError> {
-        let txn = (&*self.db).begin_read()?;
+        let txn = self.db.begin_read()?;
         let file_table = txn.index_file_table()?;
 
         if let Some(entry) = file_table.get(path.as_str())? {
@@ -123,7 +123,7 @@ impl RealIndexBlocking {
 
     /// Check whether a given file is in the index already.
     pub fn has_file(&self, path: &realize_types::Path) -> Result<bool, StorageError> {
-        let txn = (&*self.db).begin_read()?;
+        let txn = self.db.begin_read()?;
         let file_table = txn.index_file_table()?;
 
         Ok(file_table.get(path.as_str())?.is_some())
@@ -150,22 +150,17 @@ impl RealIndexBlocking {
         mtime: &UnixTime,
         hash: Hash,
     ) -> Result<(), StorageError> {
-        let txn = (&*self.db).begin_write()?;
-        let mut history_index = None;
+        let txn = self.db.begin_write()?;
         do_add_file(
             &txn,
             path,
             size,
             mtime,
             hash,
-            &mut history_index,
+            &self.history_tx,
             &self.dirty_paths,
         )?;
         txn.commit()?;
-
-        if let Some(index) = history_index {
-            let _ = self.history_tx.send(index);
-        }
         Ok(())
     }
 
@@ -174,7 +169,7 @@ impl RealIndexBlocking {
         &self,
         tx: mpsc::Sender<(realize_types::Path, IndexedFileTableEntry)>,
     ) -> Result<(), StorageError> {
-        let txn = (&*self.db).begin_read()?;
+        let txn = self.db.begin_read()?;
         let file_table = txn.index_file_table()?;
         for (path, entry) in file_table
             .iter()?
@@ -204,7 +199,7 @@ impl RealIndexBlocking {
         range: impl RangeBounds<u64>,
         tx: mpsc::Sender<Result<(u64, HistoryTableEntry), StorageError>>,
     ) -> Result<(), StorageError> {
-        let txn = (&*self.db).begin_read()?;
+        let txn = self.db.begin_read()?;
         let history_table = txn.index_history_table()?;
         for res in history_table.range(range)?.map(|res| match res {
             Err(err) => Err(StorageError::from(err)),
@@ -226,14 +221,9 @@ impl RealIndexBlocking {
     /// If the path is a directory, all files within that directory
     /// are removed, recursively.
     pub fn remove_file_or_dir(&self, path: &realize_types::Path) -> Result<(), StorageError> {
-        let txn = (&*self.db).begin_write()?;
-        let mut history_index = None;
-        do_remove_file_or_dir(&txn, path, &mut history_index, &self.dirty_paths)?;
+        let txn = self.db.begin_write()?;
+        do_remove_file_or_dir(&txn, path, &self.history_tx, &self.dirty_paths)?;
         txn.commit()?;
-
-        if let Some(index) = history_index {
-            let _ = self.history_tx.send(index);
-        }
 
         Ok(())
     }
@@ -242,7 +232,7 @@ impl RealIndexBlocking {
 fn do_remove_file_or_dir(
     txn: &ArenaWriteTransaction,
     path: &realize_types::Path,
-    history_index: &mut Option<u64>,
+    history_tx: &watch::Sender<u64>,
     dirty_paths: &Arc<DirtyPaths>,
 ) -> Result<(), StorageError> {
     let mut file_table = txn.index_file_table()?;
@@ -251,14 +241,13 @@ fn do_remove_file_or_dir(
 
     for entry in file_table.extract_from_if(path_prefix.range(), |k, _| path_prefix.accept(k))? {
         let (k, v) = entry?;
-        let index = next_history_index(&history_table)?;
+        let index = allocate_history_index(txn, history_tx, &history_table)?;
         let path = realize_types::Path::parse(k.value())?;
         dirty_paths.mark_dirty(txn, &path)?;
         history_table.insert(
             index,
             Holder::with_content(HistoryTableEntry::Remove(path, v.value().parse()?.hash))?,
         )?;
-        *history_index = Some(index);
     }
 
     Ok(())
@@ -303,7 +292,7 @@ fn do_add_file(
     size: u64,
     mtime: &UnixTime,
     hash: Hash,
-    history_index: &mut Option<u64>,
+    history_tx: &watch::Sender<u64>,
     dirty_paths: &Arc<DirtyPaths>,
 ) -> Result<(), StorageError> {
     let mut file_table = txn.index_file_table()?;
@@ -328,7 +317,7 @@ fn do_add_file(
     }
 
     dirty_paths.mark_dirty(txn, path)?;
-    let index = next_history_index(&history_table)?;
+    let index = allocate_history_index(txn, history_tx, &history_table)?;
     history_table.insert(
         index,
         Holder::with_content(if let Some(old_hash) = old_hash {
@@ -337,15 +326,21 @@ fn do_add_file(
             HistoryTableEntry::Add(path.clone())
         })?,
     )?;
-    *history_index = Some(index);
 
     Ok(())
 }
 
-fn next_history_index(
+fn allocate_history_index(
+    txn: &ArenaWriteTransaction,
+    history_tx: &watch::Sender<u64>,
     history_table: &impl redb::ReadableTable<u64, Holder<'static, HistoryTableEntry>>,
 ) -> Result<u64, StorageError> {
     let entry_index = 1 + last_history_index(history_table)?;
+
+    let history_tx = history_tx.clone();
+    txn.after_commit(move || {
+        let _ = history_tx.send(entry_index);
+    });
     Ok(entry_index)
 }
 

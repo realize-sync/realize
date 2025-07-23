@@ -7,6 +7,7 @@ use crate::types::BlobId;
 use crate::utils::holder::Holder;
 use crate::{StorageError, global::types::DirTableEntry};
 use redb::{ReadOnlyTable, Table, TableDefinition};
+use std::cell::RefCell;
 use std::sync::Arc;
 
 /// Track hash and metadata of local files.
@@ -173,6 +174,7 @@ impl ArenaDatabase {
     pub fn begin_write(&self) -> Result<ArenaWriteTransaction, StorageError> {
         Ok(ArenaWriteTransaction {
             inner: self.db.begin_write()?,
+            after_commit: RefCell::new(vec![]),
         })
     }
 
@@ -185,13 +187,35 @@ impl ArenaDatabase {
 
 pub struct ArenaWriteTransaction {
     inner: redb::WriteTransaction,
+
+    /// Callbacks to be run after the transaction is committed.
+    ///
+    /// Using a RefCell to avoid issues, as transactions are pretty
+    /// much always borrowed immutably, with the tables it would be
+    /// impractical to have pass around mutable references to
+    /// transactions.
+    after_commit: RefCell<Vec<Box<dyn FnOnce() -> () + Send + 'static>>>,
 }
 
 impl ArenaWriteTransaction {
+    /// Commit the changes.
+    ///
+    /// If the transaction is successfully committed, functions
+    /// registered by after_commit are run, and these may fail.
     pub fn commit(self) -> Result<(), StorageError> {
         self.inner.commit()?;
-
+        for cb in self.after_commit.into_inner() {
+            cb();
+        }
         Ok(())
+    }
+
+    /// Register a function to be run after the current transaction
+    /// has been successfully committed.
+    ///
+    /// After commit functions are run in order after a successful commit.
+    pub fn after_commit(&self, cb: impl FnOnce() -> () + Send + 'static) {
+        self.after_commit.borrow_mut().push(Box::new(cb));
     }
 
     pub fn index_file_table<'txn>(
