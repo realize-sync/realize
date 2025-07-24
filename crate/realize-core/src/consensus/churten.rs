@@ -80,21 +80,33 @@ pub enum JobProgress {
     Failed(String),
 }
 
+/// A type that processes jobs and returns the result for [Churten].
+///
+/// Outside of tests, this is normally [JobHandlerImpl].
+pub trait JobHandler: Sync + Send + Clone {
+    fn run(
+        &self,
+        arena: Arena,
+        job: &Arc<Job>,
+        tx: broadcast::Sender<ChurtenNotification>,
+        shutdown: CancellationToken,
+    ) -> impl Future<Output = anyhow::Result<JobStatus>> + Sync + Send;
+}
+
 /// Bring the local store and peers closer together.
 ///
 /// Maintains a background job that checks whatever needs to be done
 /// and does it. Call [Churten::subscribe] to be notified of what
 /// happens on that job.
-struct Churten {
+struct Churten<H: JobHandler> {
     storage: Arc<Storage>,
-    handler: JobHandler,
+    handler: H,
     task: Option<(JoinHandle<()>, CancellationToken)>,
     tx: broadcast::Sender<ChurtenNotification>,
 }
 
-impl Churten {
-    pub(crate) fn new(storage: Arc<Storage>, household: Household) -> Self {
-        let handler = JobHandler::new(Arc::clone(&storage), household);
+impl<H: JobHandler + 'static> Churten<H> {
+    pub(crate) fn new(storage: Arc<Storage>, handler: H) -> Self {
         let (tx, _) = broadcast::channel(16);
 
         Self {
@@ -151,9 +163,9 @@ const PARALLEL_JOB_COUNT: usize = 4;
 /// Process jobs from the job stream and report their result to [Storage].
 ///
 /// Processing ends if the stream ends or if cancelled using the token.
-async fn background_job(
+async fn background_job<H: JobHandler>(
     storage: &Arc<Storage>,
-    handler: &JobHandler,
+    handler: &H,
     tx: broadcast::Sender<ChurtenNotification>,
     shutdown: CancellationToken,
 ) {
@@ -199,8 +211,8 @@ async fn background_job(
     }
 }
 
-async fn run_job(
-    handler: &JobHandler,
+async fn run_job<H: JobHandler>(
+    handler: &H,
     arena: Arena,
     job: Arc<Job>,
     tx: &broadcast::Sender<ChurtenNotification>,
@@ -217,17 +229,20 @@ async fn run_job(
     (arena, job, result)
 }
 
+/// Dispatch jobs to the relevant function for processing.
 #[derive(Clone)]
-struct JobHandler {
+struct JobHandlerImpl {
     storage: Arc<Storage>,
     household: Household,
 }
 
-impl JobHandler {
+impl JobHandlerImpl {
     fn new(storage: Arc<Storage>, household: Household) -> Self {
         Self { storage, household }
     }
+}
 
+impl JobHandler for JobHandlerImpl {
     async fn run(
         &self,
         arena: Arena,
@@ -311,7 +326,10 @@ mod tests {
                 let storage = fixture.inner.storage(a)?;
                 testing::connect(&household_a, b).await?;
 
-                let mut churten = Churten::new(Arc::clone(&storage), household_a.clone());
+                let mut churten = Churten::new(
+                    Arc::clone(&storage),
+                    JobHandlerImpl::new(Arc::clone(&storage), household_a.clone()),
+                );
                 let mut rx = churten.subscribe();
                 churten.start();
 
