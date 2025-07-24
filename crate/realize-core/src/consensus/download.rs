@@ -6,6 +6,8 @@ use std::{io::SeekFrom, sync::Arc};
 use tarpc::tokio_util::sync::CancellationToken;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
+use super::progress::ByteCountProgress;
+
 /// Make a local copy of a specific version of a remote file.
 ///
 /// Executes a [realize_storage::Job::Download]
@@ -15,6 +17,7 @@ pub(crate) async fn download(
     arena: Arena,
     path: &Path,
     hash: &Hash,
+    progress: &mut impl ByteCountProgress,
     shutdown: CancellationToken,
 ) -> anyhow::Result<JobStatus> {
     let inode = match storage.cache().lookup_path(arena, path).await {
@@ -35,7 +38,7 @@ pub(crate) async fn download(
     if *blob.hash() != *hash {
         return Ok(JobStatus::Abandoned);
     }
-    let res = write_to_blob(household, arena, path, peers, &mut blob, shutdown).await;
+    let res = write_to_blob(household, arena, path, peers, &mut blob, progress, shutdown).await;
     // Update the database even in the case of errors, to keep
     // whatever we could write before the error happened.
     blob.update_db().await?;
@@ -52,12 +55,16 @@ async fn write_to_blob(
     path: &Path,
     peers: Vec<Peer>,
     blob: &mut realize_storage::Blob,
+    progress: &mut impl ByteCountProgress,
     shutdown: CancellationToken,
 ) -> Result<(), anyhow::Error> {
     let missing = ByteRanges::single(0, blob.size()).subtraction(blob.local_availability());
     if missing.is_empty() {
         return Ok(());
     }
+    let total_bytes = missing.bytecount();
+    let mut current_bytes: u64 = 0;
+    progress.update(0, total_bytes);
 
     for range in missing {
         let mut stream = household.read(
@@ -76,23 +83,24 @@ async fn write_to_blob(
         ) {
             let chunk = chunk?;
             blob.write_all(&chunk).await?;
+
+            current_bytes += chunk.len() as u64;
+            progress.update(current_bytes, total_bytes);
         }
     }
-    // TODO: track bytes written and call update_db at regular
-    // intervals, so we don't lose too much data in case the process
-    // is interrupted.
+    // TODO: Call update_db at regular intervals, so we don't lose too
+    // much data in case the process is interrupted.
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::consensus::progress::testing::{NoOpByteCountProgress, SimpleByteCountProgress};
+    use crate::rpc::testing::{self, HouseholdFixture};
     use realize_storage::{Blob, utils::hash::digest};
     use tokio::{fs, io::AsyncReadExt};
-
-    use crate::rpc::testing::{self, HouseholdFixture};
-
-    use super::*;
 
     struct Fixture {
         inner: HouseholdFixture,
@@ -155,6 +163,7 @@ mod tests {
                         HouseholdFixture::test_arena(),
                         &path,
                         &digest("foo then bar"),
+                        &mut NoOpByteCountProgress,
                         CancellationToken::new(),
                     )
                     .await?,
@@ -206,6 +215,7 @@ mod tests {
                         HouseholdFixture::test_arena(),
                         &path,
                         &digest("baa, baa, black sheep"),
+                        &mut NoOpByteCountProgress,
                         CancellationToken::new(),
                     )
                     .await?,
@@ -262,6 +272,7 @@ mod tests {
                         HouseholdFixture::test_arena(),
                         &path,
                         &digest("baa, baa, black sheep"),
+                        &mut NoOpByteCountProgress,
                         CancellationToken::new(),
                     )
                     .await?,
@@ -308,6 +319,7 @@ mod tests {
                         HouseholdFixture::test_arena(),
                         &path,
                         &digest("barfoo"), // mismatch
+                        &mut NoOpByteCountProgress,
                         CancellationToken::new(),
                     )
                     .await?,
@@ -340,6 +352,7 @@ mod tests {
                         HouseholdFixture::test_arena(),
                         &Path::parse("doesnotexist")?,
                         &digest(""),
+                        &mut NoOpByteCountProgress,
                         CancellationToken::new(),
                     )
                     .await?,
@@ -376,6 +389,7 @@ mod tests {
                     HouseholdFixture::test_arena(),
                     &path,
                     &digest("foobar"),
+                    &mut NoOpByteCountProgress,
                     cancelled_token,
                 )
                 .await;
@@ -386,6 +400,53 @@ mod tests {
 
                 let blob = fixture.open_file(a, "foobar").await?;
                 assert!(blob.local_availability().is_empty());
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_progress() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                testing::connect(&household_a, b).await?;
+
+                let path = fixture
+                    .write_file(b, "foobar", "baa, baa, black sheep")
+                    .await?;
+                fixture.inner.wait_for_file_in_cache(a, "foobar").await?;
+
+                {
+                    let mut blob = fixture.open_file(a, "foobar").await?;
+                    blob.write(b"baa").await?;
+                    blob.update_db().await?;
+                }
+                let mut progress = SimpleByteCountProgress::new();
+                assert_eq!(
+                    JobStatus::Done,
+                    download(
+                        fixture.inner.storage(a)?,
+                        &household_a,
+                        HouseholdFixture::test_arena(),
+                        &path,
+                        &digest("baa, baa, black sheep"),
+                        &mut progress,
+                        CancellationToken::new(),
+                    )
+                    .await?,
+                );
+                // 18 = "baa, baa, black sheep".len() - 3 already written
+                assert_eq!(18, progress.current_bytes);
+                assert_eq!(18, progress.total_bytes);
 
                 Ok::<(), anyhow::Error>(())
             })
