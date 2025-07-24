@@ -7,7 +7,7 @@ use crate::arena::blob;
 use crate::arena::mark;
 use crate::utils::holder::Holder;
 use crate::{Inode, Mark, StorageError};
-use realize_types::{ByteRanges, Hash, Path, UnixTime};
+use realize_types::{Arena, ByteRanges, Hash, Path, UnixTime};
 use redb::ReadableTable;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,20 +17,20 @@ use tokio::{task, time};
 use tokio_stream::wrappers::ReceiverStream;
 
 #[derive(Eq, PartialEq, Debug, Clone)]
-pub(crate) enum Job {
+pub enum Job {
     Download(Path, u64, Hash),
 }
 
 impl Job {
     /// Return the path the job is for.
-    pub(crate) fn path(&self) -> &Path {
+    pub fn path(&self) -> &Path {
         match self {
             Job::Download(path, _, _) => path,
         }
     }
 
     /// Return the job counter. This identifies a particular job.
-    pub(crate) fn counter(&self) -> u64 {
+    pub fn counter(&self) -> u64 {
         match self {
             Job::Download(_, counter, _) => *counter,
         }
@@ -40,16 +40,29 @@ impl Job {
     ///
     /// Useful to update a job after getting [JobUpdate::Updated] from
     /// [Engine::check_job].
-    pub(crate) fn with_counter(self, counter: u64) -> Job {
+    pub fn with_counter(self, counter: u64) -> Job {
         match self {
             Job::Download(path, _, hash) => Job::Download(path, counter, hash),
         }
     }
 }
 
+/// The result of processing a job.
+///
+/// The full status has type `Result<JobStatus>`, to make it
+/// convenient as a return value.
+#[derive(Clone, Debug)]
+pub enum JobStatus {
+    /// The job was processed successfully.
+    Done,
+
+    /// The job was abandoned
+    Abandoned,
+}
+
 /// Result of [Engine::check_job]
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) enum JobUpdate {
+pub enum JobUpdate {
     /// Job is still relevant
     Same,
 
@@ -126,7 +139,8 @@ impl DirtyPaths {
         Ok(())
     }
 }
-pub(crate) struct Engine {
+pub struct Engine {
+    arena: Arena,
     db: Arc<ArenaDatabase>,
     dirty_paths: Arc<DirtyPaths>,
     arena_root: Inode,
@@ -141,6 +155,7 @@ pub(crate) struct Engine {
 
 impl Engine {
     pub(crate) fn new(
+        arena: Arena,
         db: Arc<ArenaDatabase>,
         dirty_paths: Arc<DirtyPaths>,
         arena_root: Inode,
@@ -149,6 +164,7 @@ impl Engine {
         let (failed_job_tx, _) = watch::channel(());
 
         Arc::new(Self {
+            arena,
             db,
             dirty_paths,
             arena_root,
@@ -171,7 +187,7 @@ impl Engine {
     ///
     /// Multiple streams will return the same results, even in the
     /// same process, as long as no job is marked done or failed.
-    pub(crate) fn job_stream(self: &Arc<Engine>) -> ReceiverStream<anyhow::Result<Job>> {
+    pub fn job_stream(self: &Arc<Engine>) -> ReceiverStream<Job> {
         let (tx, rx) = mpsc::channel(1);
         // Using a small buffer to avoid buffering stale jobs.
 
@@ -181,19 +197,60 @@ impl Engine {
         // instead invalidate the streams?
 
         tokio::spawn(async move {
-            if let Err(err) = this.build_jobs(tx.clone()).await {
-                let _ = tx.send(Err(err)).await;
+            if let Err(err) = this.build_jobs(tx).await {
+                log::warn!("[{}] failed to collect jobs: {err}", this.arena)
             }
         });
 
         ReceiverStream::new(rx)
     }
 
+    /// Report the result of processing the given job.
+    pub fn job_finished(
+        &self,
+        job: &Job,
+        status: anyhow::Result<JobStatus>,
+    ) -> Result<(), StorageError> {
+        match status {
+            Ok(JobStatus::Done) => {
+                log::debug!("[{}] DONE: {job:?}", self.arena);
+                self.job_done(job)
+            }
+            Ok(JobStatus::Abandoned) => {
+                log::debug!("[{}] ABANDONED: {job:?}", self.arena);
+                self.job_done(job)
+            }
+            Err(err) => match self.job_failed(job) {
+                Ok(None) => {
+                    log::warn!("[{}] FAILED; giving up: {job:?}: {err}", self.arena);
+
+                    Ok(())
+                }
+                Ok(Some(backoff_time)) => {
+                    log::debug!(
+                        "[{}] FAILED; retry after {backoff_time:?}: {job:?}: {err}",
+                        self.arena
+                    );
+
+                    Ok(())
+                }
+                Err(err) => {
+                    log::warn!(
+                        "[{}] FAILED; failed to reschedule: {job:?}: {err}",
+                        self.arena
+                    );
+
+                    Err(err)
+                }
+            },
+        }
+    }
+
     /// Report that a job returned by a stream has been successfully executed.
     ///
     /// The dirty mark is cleared unless the path has been modified
     /// after the job was created.
-    pub(crate) fn job_done(&self, job: &Job) -> Result<(), StorageError> {
+    fn job_done(&self, job: &Job) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
         let path = job.path();
         let current = current_path_counter(&txn, path)?;
@@ -216,13 +273,16 @@ impl Engine {
     ///
     /// The job is abandoned if the corresponding path is modified
     /// again or according to the retry strategy says so.
-    pub(crate) fn job_failed(&self, job: &Job) -> Result<(), StorageError> {
+    ///
+    /// Return the time after which the job will be retried or None if
+    /// the job won't be retried.
+    fn job_failed(&self, job: &Job) -> Result<Option<UnixTime>, StorageError> {
         let txn = self.db.begin_write()?;
-        {
+        let backoff_until = {
             let path = job.path();
             let counter = job.counter();
             if current_path_counter(&txn, path)? != Some(counter) {
-                return Ok(());
+                return Ok(None);
             }
 
             let mut failed_job_table = txn.failed_job_table()?;
@@ -232,32 +292,33 @@ impl Engine {
             } else {
                 1
             };
+
             match (self.job_retry_strategy)(failure_count) {
                 None => {
-                    log::warn!("Giving up on {job:?} after {failure_count} attempts");
                     failed_job_table.remove(counter)?;
                     txn.dirty_log_table()?.remove(counter)?;
                     txn.dirty_table()?.remove(path.as_str())?;
+
+                    None
                 }
                 Some(delay) => {
-                    log::debug!(
-                        "{job:?} failed ({failure_count} attempts). Will retry after {}s",
-                        delay.as_secs()
-                    );
+                    let backoff_until = UnixTime::now().plus(delay);
                     failed_job_table.insert(
                         counter,
                         Holder::with_content(FailedJobTableEntry {
                             failure_count,
-                            backoff_until: UnixTime::now().plus(delay),
+                            backoff_until: backoff_until.clone(),
                         })?,
                     )?;
+
+                    Some(backoff_until)
                 }
-            };
-        }
+            }
+        };
         txn.commit()?;
         let _ = self.failed_job_tx.send(());
 
-        Ok(())
+        Ok(backoff_until)
     }
 
     /// Check whether the given job is still relevant.
@@ -289,10 +350,7 @@ impl Engine {
         }
     }
 
-    async fn build_jobs(
-        self: &Arc<Engine>,
-        tx: mpsc::Sender<anyhow::Result<Job>>,
-    ) -> anyhow::Result<()> {
+    async fn build_jobs(self: &Arc<Engine>, tx: mpsc::Sender<Job>) -> anyhow::Result<()> {
         let mut start_counter = 0;
         let mut retry_lower_bound = None;
 
@@ -322,7 +380,7 @@ impl Engine {
                     // Skip it for now; it'll be handled after a delay.
                     continue;
                 }
-                if tx.send(Ok(job)).await.is_err() {
+                if tx.send(job).await.is_err() {
                     // Broken channel; normal end of this loop
                     return Ok(());
                 }
@@ -354,7 +412,7 @@ impl Engine {
                 for counter in jobs_to_retry {
                     let job = self.build_job_with_counter(counter).await.ok().flatten();
                     if let Some(job) = job {
-                        if tx.send(Ok(job)).await.is_err() {
+                        if tx.send(job).await.is_err() {
                             return Ok(());
                         }
                     }
@@ -707,6 +765,7 @@ mod tests {
             )?;
             let pathmarks = PathMarks::new(Arc::clone(&db), arena_root, Arc::clone(&dirty_paths))?;
             let engine = Engine::new(
+                arena,
                 Arc::clone(&db),
                 Arc::clone(&dirty_paths),
                 arena_root,
@@ -774,12 +833,10 @@ mod tests {
         }
     }
 
-    async fn next_with_timeout(
-        stream: &mut ReceiverStream<anyhow::Result<Job>>,
-    ) -> anyhow::Result<Option<Job>> {
+    async fn next_with_timeout(stream: &mut ReceiverStream<Job>) -> anyhow::Result<Option<Job>> {
         let job = time::timeout(Duration::from_secs(3), stream.next()).await?;
 
-        job.transpose()
+        Ok(job)
     }
 
     #[tokio::test]
@@ -1033,7 +1090,7 @@ mod tests {
         fixture.add_file_to_cache(&otherfile)?;
 
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
-        fixture.engine.job_done(&job)?;
+        fixture.engine.job_finished(&job, Ok(JobStatus::Done))?;
 
         // Any future stream won't return this job (even though the
         // job isn't really done, since the file wasn't downloaded; this isn't checked).
@@ -1044,6 +1101,35 @@ mod tests {
         );
 
         // The dirty log entry that correspond to the job has been deleted.
+        assert_eq!(Some(2), fixture.lowest_counter()?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_abandoned() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let foodir = Path::parse("foo")?;
+        let barfile = Path::parse("foo/bar.txt")?;
+        let otherfile = Path::parse("foo/other.txt")?;
+        let mut job_stream = fixture.engine.job_stream();
+        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.add_file_to_cache(&barfile)?;
+        fixture.add_file_to_cache(&otherfile)?;
+
+        let job = next_with_timeout(&mut job_stream).await?.unwrap();
+        fixture
+            .engine
+            .job_finished(&job, Ok(JobStatus::Abandoned))?;
+
+        // This is handled the same as job_done. The only difference,
+        // for now, is the logging.
+        let mut job_stream = fixture.engine.job_stream();
+        assert_eq!(
+            Some(Job::Download(otherfile, 2, test_hash())),
+            next_with_timeout(&mut job_stream).await?
+        );
+
         assert_eq!(Some(2), fixture.lowest_counter()?);
 
         Ok(())
@@ -1068,7 +1154,7 @@ mod tests {
         assert_eq!(2, job2.counter());
 
         // Job1 is done, but that changes nothing, because the path has been modified afterwards
-        fixture.engine.job_done(&job1)?;
+        fixture.engine.job_finished(&job1, Ok(JobStatus::Done))?;
         assert_eq!(Some(2), fixture.lowest_counter()?);
 
         // Since the job wasn't really done, job2 is still returned by the next stream.
@@ -1080,7 +1166,7 @@ mod tests {
         );
 
         // Marking job2 done erases the dirty mark.
-        fixture.engine.job_done(&job2)?;
+        fixture.engine.job_finished(&job2, Ok(JobStatus::Done))?;
         assert_eq!(None, fixture.lowest_counter()?);
 
         Ok(())
@@ -1099,7 +1185,9 @@ mod tests {
 
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
         assert_eq!(barfile, *job.path());
-        fixture.engine.job_failed(&job)?;
+        fixture
+            .engine
+            .job_finished(&job, Err(anyhow::anyhow!("fake")))?;
 
         // barfile is still there
         assert_eq!(Some(1), fixture.lowest_counter()?);
@@ -1113,18 +1201,22 @@ mod tests {
         //
         // Not using next_with_timeout because that wouldn't help with
         // time paused.
-        let job = job_stream.next().await.unwrap()?;
+        let job = job_stream.next().await.unwrap();
         assert_eq!(otherfile, *job.path());
 
         // 2nd attempt
-        let job = job_stream.next().await.unwrap()?;
+        let job = job_stream.next().await.unwrap();
         assert_eq!(barfile, *job.path());
-        fixture.engine.job_failed(&job)?;
+        fixture
+            .engine
+            .job_finished(&job, Err(anyhow::anyhow!("fake")))?;
 
         // 3rd and last attempt
-        let job = job_stream.next().await.unwrap()?;
+        let job = job_stream.next().await.unwrap();
         assert_eq!(barfile, *job.path());
-        fixture.engine.job_failed(&job)?;
+        fixture
+            .engine
+            .job_finished(&job, Err(anyhow::anyhow!("fake")))?;
 
         // barfile is gone, otherfile is left
         assert_eq!(Some(2), fixture.lowest_counter()?);
@@ -1145,7 +1237,9 @@ mod tests {
 
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
         assert_eq!(barfile, *job.path());
-        fixture.engine.job_failed(&job)?;
+        fixture
+            .engine
+            .job_finished(&job, Err(anyhow::anyhow!("fake")))?;
 
         // New stream starts with otherfile, because barfile is delayed.
         // This is what happens after a restart as well.
@@ -1153,14 +1247,18 @@ mod tests {
 
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
         assert_eq!(otherfile, *job.path());
-        fixture.engine.job_failed(&job)?;
+        fixture
+            .engine
+            .job_finished(&job, Err(anyhow::anyhow!("fake")))?;
 
         tokio::time::pause();
 
         // 2nd attempt
-        let job = job_stream.next().await.unwrap()?;
+        let job = job_stream.next().await.unwrap();
         assert_eq!(barfile, *job.path());
-        fixture.engine.job_failed(&job)?;
+        fixture
+            .engine
+            .job_finished(&job, Err(anyhow::anyhow!("fake")))?;
 
         Ok(())
     }
@@ -1178,7 +1276,9 @@ mod tests {
 
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
         assert_eq!(barfile, *job.path());
-        fixture.engine.job_failed(&job)?;
+        fixture
+            .engine
+            .job_finished(&job, Err(anyhow::anyhow!("fake")))?;
         assert_eq!(Some(1), fixture.lowest_counter()?);
 
         // Modifying the path gets rid of the failed job.
@@ -1210,7 +1310,9 @@ mod tests {
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
         assert_eq!(barfile, *job.path());
         fixture.mark_dirty(&barfile)?;
-        fixture.engine.job_failed(&job)?; // This does nothing
+        fixture
+            .engine
+            .job_finished(&job, Err(anyhow::anyhow!("fake")))?; // This does nothing
 
         assert_eq!(Some(2), fixture.lowest_counter()?);
 

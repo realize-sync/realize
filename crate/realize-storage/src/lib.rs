@@ -1,16 +1,19 @@
-use std::path::PathBuf;
-use std::{collections::HashMap, sync::Arc};
-
 use arena::db::ArenaDatabase;
-use arena::engine::DirtyPaths;
+use arena::engine::{DirtyPaths, Engine};
 use arena::index::RealIndexAsync;
 use arena::watcher::RealWatcher;
 use config::StorageConfig;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-
+use futures::Stream;
 use realize_types;
 use realize_types::Arena;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio_stream::StreamMap;
+use utils::redb_utils;
 
 mod arena;
 pub mod config;
@@ -22,6 +25,7 @@ mod types;
 pub mod utils;
 
 pub use arena::blob::{Blob, BlobIncomplete};
+pub use arena::engine::{Job, JobStatus, JobUpdate};
 pub use arena::notifier::Notification;
 pub use arena::notifier::Progress;
 pub use arena::reader::Reader;
@@ -31,7 +35,6 @@ pub use error::StorageError;
 pub use global::cache::UnrealCacheAsync;
 pub use global::types::{FileAvailability, FileMetadata, InodeAssignment};
 pub use types::Inode;
-use utils::redb_utils;
 
 /// Local storage, including the real store and an unreal cache.
 pub struct Storage {
@@ -46,6 +49,9 @@ struct ArenaStorage {
 
     /// Arena root on the filesystem.
     root: PathBuf,
+
+    /// The arena's engine.
+    engine: Arc<Engine>,
 
     /// Keep a handle on the spawned watcher, which runs only
     /// as long as this instance exists.
@@ -91,7 +97,8 @@ impl Storage {
                     continue;
                 }
             };
-            let index = RealIndexAsync::with_db(arena, db.clone(), dirty_paths).await?;
+            let index =
+                RealIndexAsync::with_db(arena, Arc::clone(&db), Arc::clone(&dirty_paths)).await?;
             let exclude = exclude
                 .iter()
                 .map(|p| realize_types::Path::from_real_path_in(p, root))
@@ -100,11 +107,19 @@ impl Storage {
 
             log::debug!("Watch {root:?}, excluding {exclude:?}");
             let watcher = RealWatcher::spawn(root, exclude, index.clone()).await?;
+            let engine = Engine::new(
+                arena,
+                Arc::clone(&db),
+                Arc::clone(&dirty_paths),
+                cache.arena_root(arena)?,
+                job_retry_strategy,
+            );
             indexed_arenas.insert(
                 arena,
                 ArenaStorage {
                     index,
                     root: root.to_path_buf(),
+                    engine,
                     _watcher: watcher,
                 },
             );
@@ -158,6 +173,63 @@ impl Storage {
         self.store.clone()
     }
 
+    /// Return an infinite stream of jobs.
+    ///
+    /// Return a stream that looks at the dirty paths on the database
+    /// and report jobs that need to be run.
+    ///
+    /// Uninteresting entries in the dirty path tables are deleted, but entries that
+    /// correspond to jobs are left, so that if the process dies, the jobs will be
+    /// returned again.
+    ///
+    /// This stream will wait for as long as necessary for changes on
+    /// the database.
+    ///
+    /// Multiple streams will return the same results, even in the
+    /// same process, as long as no job is marked done or failed.
+    pub fn job_stream(&self) -> impl Stream<Item = (Arena, Job)> {
+        self.indexed_arenas
+            .iter()
+            .map(|(arena, storage)| (*arena, Box::pin(storage.engine.job_stream())))
+            .collect::<StreamMap<Arena, _>>()
+    }
+
+    /// Report the result of processing a job returned by the job stream.
+    ///
+    /// A job that is reported failed may be returned again for retry, after
+    /// some backoff period.
+    pub fn job_finished(
+        &self,
+        arena: Arena,
+        job: &Job,
+        status: anyhow::Result<JobStatus>,
+    ) -> Result<(), StorageError> {
+        self.engine(arena)?.job_finished(job, status)
+    }
+
+    /// Check whether the given job is still relevant.
+    ///
+    /// - If situation didn't change and the job is still relevant,
+    ///   returns [JobUpdate::Same]
+    ///
+    /// - If the job is still necessary, even though the path was
+    ///   updated, returns the new job counter within a
+    ///   [JobUpdate::Updated].
+    ///
+    /// - If the job is no longer necessary, either because it is done
+    ///   or because the cache or index state changed, returns
+    ///   [JobUpdate::Outdated].
+    pub async fn check_job(&self, arena: Arena, job: &Job) -> Result<JobUpdate, StorageError> {
+        self.engine(arena)?.check_job(job).await
+    }
+
+    /// Return the engine for an arena.
+    ///
+    /// Only indexed arenas have engines.
+    fn engine(&self, arena: Arena) -> Result<&Arc<Engine>, StorageError> {
+        Ok(&self.arena_storage(arena)?.engine)
+    }
+
     /// Return the index for the given arena, if one exists.
     fn arena_storage(&self, arena: Arena) -> Result<&ArenaStorage, StorageError> {
         self.indexed_arenas
@@ -179,4 +251,20 @@ fn build_exclude(config: &StorageConfig) -> Vec<&std::path::Path> {
     }
 
     exclude
+}
+
+/// Minimum wait time after a failed job.
+const JOB_RETRY_TIME_BASE: Duration = Duration::from_secs(60);
+
+/// Max is less than one day, so we retry at different time of day.
+const MAX_JOB_RETRY_DURATION: Duration = Duration::from_secs(18 * 23600);
+
+/// Exponential backoff, starting with [JOB_RETRY_TIME_BASE] with a
+/// max of [MAX_JOB_RETRY_DURATION].
+///
+/// TODO: make that configurable in ArenaConfig.
+fn job_retry_strategy(attempt: u32) -> Option<Duration> {
+    let duration = 2u32.pow(attempt) * JOB_RETRY_TIME_BASE;
+
+    Some(duration.max(MAX_JOB_RETRY_DURATION))
 }
