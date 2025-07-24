@@ -482,6 +482,10 @@ impl RealWatcherWorker {
         realpath: &std::path::Path,
         m: &Metadata,
     ) -> Result<(), anyhow::Error> {
+        if fs::canonicalize(&realpath).await? != *realpath {
+            // Skip paths with symlinks in them.
+            return Ok(());
+        }
         let path = match self.to_model_path(&realpath) {
             Some(p) => p,
             None => {
