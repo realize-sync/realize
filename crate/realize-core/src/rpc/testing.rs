@@ -122,9 +122,7 @@ impl HouseholdFixture {
 
     /// Get a peer cache.
     pub fn cache(&self, peer: Peer) -> anyhow::Result<&UnrealCacheAsync> {
-        self.storage(peer)?
-            .cache()
-            .ok_or(anyhow::anyhow!("{peer} has no cache"))
+        Ok(self.storage(peer)?.cache())
     }
 
     /// Wait for the given file to appear in the given peer's cache, in the test arena.

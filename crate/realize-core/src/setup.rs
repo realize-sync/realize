@@ -41,7 +41,7 @@ impl SetupHelper {
     ///
     /// A local cache must be configured.
     pub async fn export_nfs(&mut self, addr: SocketAddr) -> anyhow::Result<()> {
-        let cache = self.storage.cache().expect("cache is always configured");
+        let cache = self.storage.cache();
 
         let downloader = Downloader::new(self.household.clone(), cache.clone());
 

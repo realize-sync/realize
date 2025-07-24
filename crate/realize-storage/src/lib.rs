@@ -153,8 +153,8 @@ impl Storage {
     }
 
     /// Return a handle on the unreal cache.
-    pub fn cache(&self) -> Option<&UnrealCacheAsync> {
-        Some(&self.cache)
+    pub fn cache(&self) -> &UnrealCacheAsync {
+        &self.cache
     }
 
     /// Get a reader on the given file, if possible.

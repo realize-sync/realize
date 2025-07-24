@@ -299,12 +299,7 @@ async fn subscribe_self(
     mut client: connected_peer::Client,
 ) -> anyhow::Result<()> {
     let store = get_connected_peer_store(&mut client).await?;
-    let cache = match storage.cache() {
-        None => {
-            return Ok(());
-        }
-        Some(c) => c,
-    };
+    let cache = storage.cache();
 
     let request = store.arenas_request();
     let reply = request.send().promise.await?;
@@ -607,11 +602,9 @@ impl subscriber::Server for ConnectedPeerServer {
         params: NotifyParams,
         _: NotifyResults,
     ) -> capnp::capability::Promise<(), capnp::Error> {
-        if let Some(cache) = self.storage.cache() {
-            Promise::from_future(do_notify(cache.clone(), self.peer, params))
-        } else {
-            Promise::ok(())
-        }
+        let cache = self.storage.cache();
+
+        Promise::from_future(do_notify(cache.clone(), self.peer, params))
     }
 }
 
