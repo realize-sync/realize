@@ -1320,15 +1320,13 @@ mod tests {
         let _watcher = fixture.watch().await?;
 
         fixture.wait_for_history_event(3).await?;
-        assert!(
-            index
-                .has_file(&realize_types::Path::parse("b/foo")?)
-                .await?
-        );
-        assert!(
-            !index
-                .has_file(&realize_types::Path::parse("a/foo")?)
-                .await?
+        let foo_in_b = realize_types::Path::parse("b/foo")?;
+        assert_eq!(
+            (true, false),
+            (
+                index.has_file(&foo_in_b).await?,
+                index.has_file(&foo).await?,
+            )
         );
 
         Ok(())
