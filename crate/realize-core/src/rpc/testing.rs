@@ -5,6 +5,7 @@ use realize_network::Server;
 use realize_network::capnp::PeerStatus;
 use realize_network::hostport::HostPort;
 use realize_network::testing::TestingPeers;
+use realize_storage::Blob;
 use realize_storage::Storage;
 use realize_storage::{self, UnrealCacheAsync};
 use realize_types::Path;
@@ -144,6 +145,29 @@ impl HouseholdFixture {
         }
 
         Ok(())
+    }
+
+    pub async fn write_file(
+        &self,
+        peer: Peer,
+        path_str: &str,
+        content: &str,
+    ) -> anyhow::Result<Path> {
+        let root = self.arena_root(peer);
+        let path = Path::parse(path_str)?;
+        let realpath = path.within(&root);
+        tokio::fs::write(realpath, content).await?;
+
+        Ok(path)
+    }
+
+    pub async fn open_file(&self, peer: Peer, path_str: &str) -> anyhow::Result<Blob> {
+        let cache = self.cache(peer)?;
+        let (inode, _) = cache
+            .lookup_path(HouseholdFixture::test_arena(), &Path::parse(path_str)?)
+            .await?;
+
+        Ok(cache.open_file(inode).await?)
     }
 
     // Pick a port for the given peer and store it in the network
