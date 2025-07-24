@@ -1,17 +1,18 @@
 use arena::db::ArenaDatabase;
 use arena::engine::{DirtyPaths, Engine};
 use arena::index::RealIndexAsync;
+use arena::mark::PathMarks;
 use arena::watcher::RealWatcher;
 use config::StorageConfig;
 use futures::Stream;
-use realize_types;
 use realize_types::Arena;
+use realize_types::{self, Path};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::task::{self, JoinHandle};
 use tokio_stream::StreamMap;
 use utils::redb_utils;
 
@@ -52,6 +53,9 @@ struct ArenaStorage {
 
     /// The arena's engine.
     engine: Arc<Engine>,
+
+    /// Handles file and directory marks.
+    pathmarks: PathMarks,
 
     /// Keep a handle on the spawned watcher, which runs only
     /// as long as this instance exists.
@@ -107,19 +111,22 @@ impl Storage {
 
             log::debug!("Watch {root:?}, excluding {exclude:?}");
             let watcher = RealWatcher::spawn(root, exclude, index.clone()).await?;
+            let arena_root = cache.arena_root(arena)?;
             let engine = Engine::new(
                 arena,
                 Arc::clone(&db),
                 Arc::clone(&dirty_paths),
-                cache.arena_root(arena)?,
+                arena_root,
                 job_retry_strategy,
             );
+            let pathmarks = PathMarks::new(Arc::clone(&db), arena_root, Arc::clone(&dirty_paths))?;
             indexed_arenas.insert(
                 arena,
                 ArenaStorage {
                     index,
                     root: root.to_path_buf(),
                     engine,
+                    pathmarks,
                     _watcher: watcher,
                 },
             );
@@ -150,6 +157,30 @@ impl Storage {
         let arena_storage = self.arena_storage(arena)?;
 
         arena::notifier::subscribe(arena_storage.index.clone(), tx, progress).await
+    }
+
+    /// Set the default mark for the files in the given arena.
+    pub async fn set_arena_mark(
+        self: &Arc<Self>,
+        arena: Arena,
+        mark: Mark,
+    ) -> Result<(), StorageError> {
+        let this = Arc::clone(&self);
+        task::spawn_blocking(move || this.arena_storage(arena)?.pathmarks.set_root_mark(mark))
+            .await?
+    }
+
+    /// Set the default mark for the files in the given arena.
+    pub async fn set_mark(
+        self: &Arc<Self>,
+        arena: Arena,
+        path: &Path,
+        mark: Mark,
+    ) -> Result<(), StorageError> {
+        let this = Arc::clone(&self);
+        let path = path.clone();
+        task::spawn_blocking(move || this.arena_storage(arena)?.pathmarks.set_mark(&path, mark))
+            .await?
     }
 
     /// Return a handle on the unreal cache.

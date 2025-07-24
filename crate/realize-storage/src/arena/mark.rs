@@ -90,7 +90,7 @@ impl PathMarks {
         Ok(())
     }
 
-    pub fn set_mark_or_root(
+    fn set_mark_or_root(
         &self,
         path_or_root: Option<&Path>,
         mark: Mark,
