@@ -22,16 +22,46 @@ pub(crate) enum Job {
 }
 
 impl Job {
+    /// Return the path the job is for.
     pub(crate) fn path(&self) -> &Path {
         match self {
             Job::Download(path, _, _) => path,
         }
     }
+
+    /// Return the job counter. This identifies a particular job.
     pub(crate) fn counter(&self) -> u64 {
         match self {
             Job::Download(_, counter, _) => *counter,
         }
     }
+
+    /// Return the same job, with a different counter.
+    ///
+    /// Useful to update a job after getting [JobUpdate::Updated] from
+    /// [Engine::check_job].
+    pub(crate) fn with_counter(self, counter: u64) -> Job {
+        match self {
+            Job::Download(path, _, hash) => Job::Download(path, counter, hash),
+        }
+    }
+}
+
+/// Result of [Engine::check_job]
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum JobUpdate {
+    /// Job is still relevant
+    Same,
+
+    /// The path was updated, but the job is otherwise still relevant.
+    ///
+    /// You can call `Job.with_counter(counter)` with the given
+    /// counter to update the job enum.
+    Updated(u64),
+
+    /// The job is no longer relevant, either because it is done or
+    /// because the situation changed and made the job irrelevant.
+    Outdated,
 }
 
 pub(crate) struct DirtyPaths {
@@ -230,6 +260,35 @@ impl Engine {
         Ok(())
     }
 
+    /// Check whether the given job is still relevant.
+    ///
+    /// - If situation didn't change and the job is still relevant,
+    ///   returns [JobUpdate::Same]
+    ///
+    /// - If the job is still necessary, even though the path was
+    ///   updated, returns the new job counter within a
+    ///   [JobUpdate::Updated].
+    ///
+    /// - If the job is no longer necessary, either because it is done
+    ///   or because the cache or index state changed, returns
+    ///   [JobUpdate::Outdated].
+    pub(crate) async fn check_job(self: &Arc<Self>, job: &Job) -> Result<JobUpdate, StorageError> {
+        match self.build_job_with_path(job.path()).await? {
+            None => Ok(JobUpdate::Outdated),
+            Some(updated_job) => {
+                if updated_job == *job {
+                    return Ok(JobUpdate::Same);
+                }
+                let updated_counter = updated_job.counter();
+                if updated_job.with_counter(job.counter()) == *job {
+                    return Ok(JobUpdate::Updated(updated_counter));
+                }
+
+                Ok(JobUpdate::Outdated)
+            }
+        }
+    }
+
     async fn build_jobs(
         self: &Arc<Engine>,
         tx: mpsc::Sender<anyhow::Result<Job>>,
@@ -338,6 +397,27 @@ impl Engine {
                 drop(dirty_log_table);
 
                 let path = Path::parse(v.value())?;
+                return this.build_job(&txn, path, counter);
+            }
+            return Ok::<_, StorageError>(None);
+        })
+        .await?
+    }
+
+    /// Lookup the counter of given a path and build a job, if possible.
+    async fn build_job_with_path(
+        self: &Arc<Self>,
+        path: &Path,
+    ) -> Result<Option<Job>, StorageError> {
+        let this = Arc::clone(self);
+        let path = path.clone();
+        task::spawn_blocking(move || {
+            let txn = this.db.begin_read()?;
+            let dirty_table = txn.dirty_table()?;
+            if let Some(v) = dirty_table.get(path.as_str())? {
+                drop(dirty_table);
+
+                let counter = v.value();
                 return this.build_job(&txn, path, counter);
             }
             return Ok::<_, StorageError>(None);
@@ -1141,6 +1221,73 @@ mod tests {
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
         assert_eq!(barfile, *job.path());
         assert_eq!(3, job.counter());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_job_returns_same() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let foodir = Path::parse("foo")?;
+        let barfile = Path::parse("foo/bar.txt")?;
+        let mut job_stream = fixture.engine.job_stream();
+        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.add_file_to_cache(&barfile)?;
+
+        let job = next_with_timeout(&mut job_stream).await?.unwrap();
+        assert_eq!(JobUpdate::Same, fixture.engine.check_job(&job).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_job_returns_updated() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let foodir = Path::parse("foo")?;
+        let barfile = Path::parse("foo/bar.txt")?;
+        let mut job_stream = fixture.engine.job_stream();
+        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.add_file_to_cache(&barfile)?;
+
+        let job = next_with_timeout(&mut job_stream).await?.unwrap();
+        assert_eq!(1, job.counter());
+        fixture.mark_dirty(&barfile)?;
+        assert_eq!(JobUpdate::Updated(2), fixture.engine.check_job(&job).await?);
+
+        Ok(())
+    }
+
+    async fn check_job_returns_outdated_because_done() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let foodir = Path::parse("foo")?;
+        let barfile = Path::parse("foo/bar.txt")?;
+        let mut job_stream = fixture.engine.job_stream();
+        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.add_file_to_cache(&barfile)?;
+
+        let job = next_with_timeout(&mut job_stream).await?.unwrap();
+        let (inode, _) = fixture.acache.lookup_path(&barfile)?;
+        {
+            let mut blob = fixture.acache.open_file(inode)?;
+            blob.write_all(b"test").await?;
+            blob.update_db().await?;
+        }
+        assert_eq!(JobUpdate::Outdated, fixture.engine.check_job(&job).await?);
+
+        Ok(())
+    }
+
+    async fn check_job_returns_outdated_because_irrelevant() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let foodir = Path::parse("foo")?;
+        let barfile = Path::parse("foo/bar.txt")?;
+        let mut job_stream = fixture.engine.job_stream();
+        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.add_file_to_cache(&barfile)?;
+
+        let job = next_with_timeout(&mut job_stream).await?.unwrap();
+        fixture.remove_file_from_cache(&barfile)?;
+        assert_eq!(JobUpdate::Outdated, fixture.engine.check_job(&job).await?);
 
         Ok(())
     }
