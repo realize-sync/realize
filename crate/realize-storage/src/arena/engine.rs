@@ -51,7 +51,7 @@ impl Job {
 ///
 /// The full status has type `Result<JobStatus>`, to make it
 /// convenient as a return value.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JobStatus {
     /// The job was processed successfully.
     Done,
