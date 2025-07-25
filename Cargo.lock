@@ -2251,6 +2251,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "realize-control"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "realize-core",
+ "realize-network",
+ "tokio",
+]
+
+[[package]]
 name = "realize-core"
 version = "0.1.0"
 dependencies = [
