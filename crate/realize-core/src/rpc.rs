@@ -1,3 +1,4 @@
+mod control;
 mod household;
 pub mod realstore;
 

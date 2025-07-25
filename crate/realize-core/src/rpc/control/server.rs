@@ -1,0 +1,348 @@
+#![allow(dead_code)] // work in progress
+
+use super::control_capnp::churten::{
+    self, IsRunningParams, IsRunningResults, ShutdownParams, ShutdownResults, StartParams,
+    StartResults, SubscribeParams, SubscribeResults,
+};
+use super::control_capnp::control::{
+    self, ChurtenParams, ChurtenResults, GetMarkParams, GetMarkResults, SetArenaMarkParams,
+    SetArenaMarkResults, SetMarkParams, SetMarkResults,
+};
+use super::control_capnp::{self};
+use crate::consensus::churten::{Churten, JobHandlerImpl};
+use capnp::capability::Promise;
+use realize_storage::{Mark, Storage, StorageError};
+use realize_types::{Arena, Hash, Path};
+use std::sync::Arc;
+
+#[derive(Clone)]
+struct ControlServer {
+    storage: Arc<Storage>,
+    churten: Arc<Churten<JobHandlerImpl>>,
+}
+
+impl ControlServer {
+    fn new(storage: Arc<Storage>, churten: Arc<Churten<JobHandlerImpl>>) -> ControlServer {
+        Self { storage, churten }
+    }
+
+    fn into_client(self) -> control::Client {
+        capnp_rpc::new_client(self)
+    }
+}
+
+impl control::Server for ControlServer {
+    fn churten(
+        &mut self,
+        _: ChurtenParams,
+        mut results: ChurtenResults,
+    ) -> Promise<(), capnp::Error> {
+        results
+            .get()
+            .set_churten(capnp_rpc::new_client(ChurtenServer {
+                churten: Arc::clone(&self.churten),
+            }));
+
+        Promise::ok(())
+    }
+
+    fn set_mark(&mut self, params: SetMarkParams, _: SetMarkResults) -> Promise<(), capnp::Error> {
+        let storage = Arc::clone(&self.storage);
+        Promise::from_future(async move {
+            let req = params.get()?.get_req()?;
+            let arena = parse_arena(req.get_arena()?)?;
+            let path = parse_path(req.get_path()?)?;
+            let mark = parse_mark(req.get_mark()?);
+
+            storage
+                .set_mark(arena, &path, mark)
+                .await
+                .map_err(from_storage_err)?;
+
+            Ok(())
+        })
+    }
+
+    fn set_arena_mark(
+        &mut self,
+        params: SetArenaMarkParams,
+        _: SetArenaMarkResults,
+    ) -> Promise<(), capnp::Error> {
+        let storage = Arc::clone(&self.storage);
+        Promise::from_future(async move {
+            let req = params.get()?.get_req()?;
+            let arena = parse_arena(req.get_arena()?)?;
+            let mark = parse_mark(req.get_mark()?);
+
+            storage
+                .set_arena_mark(arena, mark)
+                .await
+                .map_err(from_storage_err)?;
+
+            Ok(())
+        })
+    }
+
+    fn get_mark(
+        &mut self,
+        params: GetMarkParams,
+        mut results: GetMarkResults,
+    ) -> Promise<(), capnp::Error> {
+        let storage = Arc::clone(&self.storage);
+        Promise::from_future(async move {
+            let req = params.get()?.get_req()?;
+            let arena = parse_arena(req.get_arena()?)?;
+            let path = parse_path(req.get_path()?)?;
+
+            let mark = storage
+                .get_mark(arena, &path)
+                .await
+                .map_err(from_storage_err)?;
+
+            let mut res = results.get().init_res();
+            res.set_mark(mark_to_capnp(mark));
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
+struct ChurtenServer {
+    churten: Arc<Churten<JobHandlerImpl>>,
+}
+
+impl churten::Server for ChurtenServer {
+    fn subscribe(&mut self, _: SubscribeParams, _: SubscribeResults) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented(
+            "method churten::Server::subscribe not implemented".to_string(),
+        ))
+    }
+    fn start(&mut self, _: StartParams, _: StartResults) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented(
+            "method churten::Server::start not implemented".to_string(),
+        ))
+    }
+    fn shutdown(&mut self, _: ShutdownParams, _: ShutdownResults) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented(
+            "method churten::Server::shutdown not implemented".to_string(),
+        ))
+    }
+    fn is_running(&mut self, _: IsRunningParams, _: IsRunningResults) -> Promise<(), capnp::Error> {
+        Promise::err(capnp::Error::unimplemented(
+            "method churten::Server::is_running not implemented".to_string(),
+        ))
+    }
+}
+
+/// Straightforward conversion from storage error to capnp error
+/// that's just good enough to get started.
+fn from_storage_err(err: StorageError) -> capnp::Error {
+    capnp::Error::failed(format!("{err:?}"))
+}
+
+// These capnp parse_ functions are duplicates of these found in household.rs.
+//
+// TODO: consolidate these somewhere
+
+fn parse_arena(reader: capnp::text::Reader<'_>) -> Result<Arena, capnp::Error> {
+    Ok(Arena::from(reader.to_str()?))
+}
+
+fn parse_path(reader: capnp::text::Reader<'_>) -> Result<Path, capnp::Error> {
+    Path::parse(reader.to_str()?).map_err(|e| capnp::Error::failed(e.to_string()))
+}
+
+fn parse_hash(hash: &[u8]) -> Result<Hash, capnp::Error> {
+    let hash: [u8; 32] = hash
+        .try_into()
+        .map_err(|_| capnp::Error::failed("invalid hash".to_string()))?;
+
+    Ok(Hash(hash))
+}
+
+fn parse_mark(mark: control_capnp::Mark) -> Mark {
+    match mark {
+        control_capnp::Mark::Own => Mark::Own,
+        control_capnp::Mark::Watch => Mark::Watch,
+        control_capnp::Mark::Keep => Mark::Keep,
+    }
+}
+
+fn mark_to_capnp(mark: Mark) -> control_capnp::Mark {
+    match mark {
+        Mark::Own => control_capnp::Mark::Own,
+        Mark::Watch => control_capnp::Mark::Watch,
+        Mark::Keep => control_capnp::Mark::Keep,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::rpc::{Household, testing::HouseholdFixture};
+    use assert_fs::TempDir;
+    use realize_network::unixsocket;
+    use realize_storage::Mark;
+    use realize_types::Peer;
+    use tarpc::tokio_util::sync::CancellationToken;
+    use tokio::task::LocalSet;
+
+    struct Fixture {
+        inner: HouseholdFixture,
+        tempdir: TempDir,
+        shutdown: CancellationToken,
+    }
+
+    impl Fixture {
+        async fn setup() -> anyhow::Result<Self> {
+            let _ = env_logger::try_init();
+            let household_fixture = HouseholdFixture::setup().await?;
+            let tempdir = TempDir::new()?;
+            let shutdown = CancellationToken::new();
+
+            Ok(Self {
+                inner: household_fixture,
+                tempdir,
+                shutdown,
+            })
+        }
+
+        async fn bind_server(
+            &self,
+            local: &LocalSet,
+            peer: Peer,
+            household: Household,
+        ) -> anyhow::Result<PathBuf> {
+            let storage = self.inner.storage(peer)?;
+            let churten = Arc::new(Churten::new(Arc::clone(storage), household.clone()));
+            let server = ControlServer::new(Arc::clone(storage), churten);
+
+            let sockpath = self
+                .tempdir
+                .path()
+                .join("realize/control.socket")
+                .to_path_buf();
+            unixsocket::bind(
+                &local,
+                &sockpath,
+                move || server.clone().into_client().client,
+                self.shutdown.clone(),
+            )
+            .await?;
+
+            Ok(sockpath)
+        }
+    }
+
+    #[tokio::test]
+    async fn set_mark() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let arena = HouseholdFixture::test_arena();
+        let peer = HouseholdFixture::a();
+        let local = LocalSet::new();
+        let household = fixture.inner.create_household(&local, peer)?;
+        let storage = fixture.inner.storage(peer)?;
+        let sockpath = fixture.bind_server(&local, peer, household).await?;
+
+        local
+            .run_until(async move {
+                let control = unixsocket::connect::<control::Client>(&sockpath).await?;
+
+                let mut request = control.set_mark_request();
+                let mut req = request.get().init_req();
+                req.set_arena(arena.as_str());
+                req.set_path("foo");
+                req.set_mark(control_capnp::Mark::Keep);
+                request.send().promise.await?;
+
+                assert_eq!(
+                    Mark::Keep,
+                    storage.get_mark(arena, &Path::parse("foo")?).await?
+                );
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_arena_mark() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let arena = HouseholdFixture::test_arena();
+        let peer = HouseholdFixture::a();
+        let local = LocalSet::new();
+        let household = fixture.inner.create_household(&local, peer)?;
+        let storage = fixture.inner.storage(peer)?;
+        let sockpath = fixture.bind_server(&local, peer, household).await?;
+
+        local
+            .run_until(async move {
+                let control = unixsocket::connect::<control::Client>(&sockpath).await?;
+
+                let mut request = control.set_arena_mark_request();
+                let mut req = request.get().init_req();
+                req.set_arena(arena.as_str());
+                req.set_mark(control_capnp::Mark::Keep);
+                request.send().promise.await?;
+
+                assert_eq!(
+                    Mark::Keep,
+                    storage.get_mark(arena, &Path::parse("foo")?).await?
+                );
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_mark() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let arena = HouseholdFixture::test_arena();
+        let peer = HouseholdFixture::a();
+        let local = LocalSet::new();
+        let household = fixture.inner.create_household(&local, peer)?;
+        let storage = fixture.inner.storage(peer)?;
+        let sockpath = fixture.bind_server(&local, peer, household).await?;
+
+        local
+            .run_until(async move {
+                let control = unixsocket::connect::<control::Client>(&sockpath).await?;
+
+                let mut request = control.get_mark_request();
+                let mut req = request.get().init_req();
+                req.set_arena(arena.as_str());
+                req.set_path("foo");
+                let result = request.send().promise.await?;
+                assert_eq!(
+                    control_capnp::Mark::Watch,
+                    result.get()?.get_res()?.get_mark()?
+                );
+
+                storage
+                    .set_mark(arena, &Path::parse("foo")?, Mark::Keep)
+                    .await?;
+
+                let mut request = control.get_mark_request();
+                let mut req = request.get().init_req();
+                req.set_arena(arena.as_str());
+                req.set_path("foo");
+                let result = request.send().promise.await?;
+                assert_eq!(
+                    control_capnp::Mark::Keep,
+                    result.get()?.get_res()?.get_mark()?
+                );
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+}

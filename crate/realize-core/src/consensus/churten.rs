@@ -83,7 +83,7 @@ pub enum JobProgress {
 /// A type that processes jobs and returns the result for [Churten].
 ///
 /// Outside of tests, this is normally [JobHandlerImpl].
-pub trait JobHandler: Sync + Send + Clone {
+pub(crate) trait JobHandler: Sync + Send + Clone {
     fn run(
         &self,
         arena: Arena,
@@ -98,15 +98,24 @@ pub trait JobHandler: Sync + Send + Clone {
 /// Maintains a background job that checks whatever needs to be done
 /// and does it. Call [Churten::subscribe] to be notified of what
 /// happens on that job.
-struct Churten<H: JobHandler> {
+pub(crate) struct Churten<H: JobHandler> {
     storage: Arc<Storage>,
     handler: H,
     task: Option<(JoinHandle<()>, CancellationToken)>,
     tx: broadcast::Sender<ChurtenNotification>,
 }
 
+impl Churten<JobHandlerImpl> {
+    pub(crate) fn new(storage: Arc<Storage>, household: Household) -> Self {
+        Self::with_handler(
+            Arc::clone(&storage),
+            JobHandlerImpl::new(storage, household),
+        )
+    }
+}
+
 impl<H: JobHandler + 'static> Churten<H> {
-    pub(crate) fn new(storage: Arc<Storage>, handler: H) -> Self {
+    pub(crate) fn with_handler(storage: Arc<Storage>, handler: H) -> Self {
         let (tx, _) = broadcast::channel(16);
 
         Self {
@@ -231,7 +240,7 @@ async fn run_job<H: JobHandler>(
 
 /// Dispatch jobs to the relevant function for processing.
 #[derive(Clone)]
-struct JobHandlerImpl {
+pub(crate) struct JobHandlerImpl {
     storage: Arc<Storage>,
     household: Household,
 }
@@ -326,7 +335,7 @@ mod tests {
                 let storage = fixture.inner.storage(a)?;
                 testing::connect(&household_a, b).await?;
 
-                let mut churten = Churten::new(
+                let mut churten = Churten::with_handler(
                     Arc::clone(&storage),
                     JobHandlerImpl::new(Arc::clone(&storage), household_a.clone()),
                 );
@@ -395,8 +404,6 @@ mod tests {
 
         Ok(())
     }
-
-    // TODO: Make Churten testable and add more tests
 
     /// A fake JobHandler for testing different job outcomes
     #[derive(Clone)]
@@ -485,7 +492,7 @@ mod tests {
                 testing::connect(&household_a, b).await?;
 
                 let handler = FakeJobHandler::new(|| Ok(JobStatus::Done)).with_progress(true);
-                let mut churten = Churten::new(Arc::clone(&storage), handler);
+                let mut churten = Churten::with_handler(Arc::clone(&storage), handler);
                 let mut rx = churten.subscribe();
                 churten.start();
 
@@ -568,7 +575,7 @@ mod tests {
                 testing::connect(&household_a, b).await?;
 
                 let handler = FakeJobHandler::new(|| Ok(JobStatus::Abandoned));
-                let mut churten = Churten::new(Arc::clone(&storage), handler);
+                let mut churten = Churten::with_handler(Arc::clone(&storage), handler);
                 let mut rx = churten.subscribe();
                 churten.start();
 
@@ -631,7 +638,7 @@ mod tests {
 
                 let error_msg = "Simulated job failure";
                 let handler = FakeJobHandler::new(move || Err(anyhow::anyhow!(error_msg)));
-                let mut churten = Churten::new(Arc::clone(&storage), handler);
+                let mut churten = Churten::with_handler(Arc::clone(&storage), handler);
                 let mut rx = churten.subscribe();
                 churten.start();
 
@@ -694,7 +701,7 @@ mod tests {
 
                 // Create a handler that will be cancelled
                 let handler = FakeJobHandler::new(|| Ok(JobStatus::Done)).with_cancel(true);
-                let mut churten = Churten::new(Arc::clone(&storage), handler);
+                let mut churten = Churten::with_handler(Arc::clone(&storage), handler);
                 let mut rx = churten.subscribe();
                 churten.start();
 
@@ -756,7 +763,7 @@ mod tests {
                 testing::connect(&household_a, b).await?;
 
                 let handler = FakeJobHandler::new(|| Ok(JobStatus::Done)).with_progress(false);
-                let mut churten = Churten::new(Arc::clone(&storage), handler);
+                let mut churten = Churten::with_handler(Arc::clone(&storage), handler);
                 let mut rx = churten.subscribe();
                 churten.start();
 
@@ -817,7 +824,7 @@ mod tests {
                 testing::connect(&household_a, b).await?;
 
                 let handler = FakeJobHandler::new(|| Ok(JobStatus::Done));
-                let mut churten = Churten::new(Arc::clone(&storage), handler);
+                let mut churten = Churten::with_handler(Arc::clone(&storage), handler);
                 let mut rx = churten.subscribe();
                 churten.start();
 

@@ -20,6 +20,7 @@ fn capnpc() -> anyhow::Result<()> {
     capnpc::CompilerCommand::new()
         .src_prefix("capnp")
         .import_path("capnp")
+        .file("capnp/rpc/control.capnp")
         .file("capnp/rpc/peer.capnp")
         .file("capnp/rpc/result.capnp")
         .file("capnp/rpc/store.capnp")

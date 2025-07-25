@@ -183,6 +183,18 @@ impl Storage {
             .await?
     }
 
+    /// Get the mark for a specific path in the given arena.
+    pub async fn get_mark(
+        self: &Arc<Self>,
+        arena: Arena,
+        path: &Path,
+    ) -> Result<Mark, StorageError> {
+        let this = Arc::clone(&self);
+        let path = path.clone();
+        task::spawn_blocking(move || this.arena_storage(arena)?.pathmarks.get_mark(&path))
+            .await?
+    }
+
     /// Return a handle on the unreal cache.
     pub fn cache(&self) -> &UnrealCacheAsync {
         &self.cache
