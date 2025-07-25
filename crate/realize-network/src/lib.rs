@@ -8,5 +8,6 @@ pub mod reconnect;
 pub mod security;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+pub mod unixsocket;
 
 pub use network::{Networking, Server};

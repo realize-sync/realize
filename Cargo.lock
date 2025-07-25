@@ -2340,6 +2340,7 @@ name = "realize-network"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "assert_fs",
  "async-speed-limit",
  "capnp",
  "capnp-rpc",
