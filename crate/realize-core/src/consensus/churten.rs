@@ -246,7 +246,7 @@ pub(crate) struct JobHandlerImpl {
 }
 
 impl JobHandlerImpl {
-    fn new(storage: Arc<Storage>, household: Household) -> Self {
+    pub(crate) fn new(storage: Arc<Storage>, household: Household) -> Self {
         Self { storage, household }
     }
 }
