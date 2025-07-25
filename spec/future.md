@@ -3,6 +3,18 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
+## job action: verify {#verify}
+## job action: realize + Available notification {#realize}
+## job action: unrealize + Removed notification {#unrealize}
+## add job action to ChurtenNotification #action
+## "realize-control churten run" {#churten-run}
+  - start churten
+  - listen to notifications, display
+  - stop churten on shutdown
+## expose connection info through RPC and display in realize-control {#conninfo}
+## realize-control set-mark arena [path] {#setmark}
+## download limit that applies only to churten {#churtenlimit}
+
 ## Update marks from xattrs {#marksxattrs}
 
 Arenas, files and directories can be marked *own*, *watch* or *keep*
