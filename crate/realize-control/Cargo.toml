@@ -14,9 +14,6 @@ log = "0.4.27"
 [dev-dependencies]
 assert_fs = "1.1"
 env_logger = "0.11"
-nix = { version = "0.30.1", features = ["user", "process", "signal"] }
-portpicker = "0.1"
 realize-storage = { path = "../realize-storage" }
 realize-types = { path = "../realize-types" }
 scopeguard = "1.2"
-toml = { version = "0.8.23", features = ["display", "parse"] } 

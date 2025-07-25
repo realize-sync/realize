@@ -2259,15 +2259,12 @@ dependencies = [
  "clap",
  "env_logger",
  "log",
- "nix",
- "portpicker",
  "realize-core",
  "realize-network",
  "realize-storage",
  "realize-types",
  "scopeguard",
  "tokio",
- "toml",
 ]
 
 [[package]]
