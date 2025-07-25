@@ -2255,10 +2255,19 @@ name = "realize-control"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "assert_fs",
  "clap",
+ "env_logger",
+ "log",
+ "nix",
+ "portpicker",
  "realize-core",
  "realize-network",
+ "realize-storage",
+ "realize-types",
+ "scopeguard",
  "tokio",
+ "toml",
 ]
 
 [[package]]
