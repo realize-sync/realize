@@ -11,7 +11,7 @@ use tokio::{sync::broadcast, task::JoinHandle};
 
 /// Notifications broadcast by [Churten].
 #[derive(Debug, Clone, PartialEq)]
-pub enum ChurtenNotification {
+pub(crate) enum ChurtenNotification {
     /// Report the general job state.
     Update {
         arena: Arena,
@@ -58,7 +58,7 @@ impl ChurtenNotification {
 
 /// Job progress reported by [ChurtenNotification]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JobProgress {
+pub(crate) enum JobProgress {
     /// A job exists, but isn't running yet.
     Pending,
 
@@ -127,12 +127,12 @@ impl<H: JobHandler + 'static> Churten<H> {
     }
 
     /// Subscribe to [ChurtenNotification]s.
-    pub fn subscribe(&self) -> broadcast::Receiver<ChurtenNotification> {
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<ChurtenNotification> {
         self.tx.subscribe()
     }
 
     /// Check whether the background is running.
-    pub fn is_running(&self) -> bool {
+    pub(crate) fn is_running(&self) -> bool {
         self.task
             .as_ref()
             .map(|(handle, _)| !handle.is_finished())
@@ -140,7 +140,7 @@ impl<H: JobHandler + 'static> Churten<H> {
     }
 
     /// Start the background jobs, unless they're already running.
-    pub fn start(&mut self) {
+    pub(crate) fn start(&mut self) {
         if self.task.is_some() {
             return;
         }
@@ -159,7 +159,7 @@ impl<H: JobHandler + 'static> Churten<H> {
     /// Shutdown the background jobs, but don't wait for them to finish.
     ///
     /// Does nothing if the jobs aren't running.
-    pub fn shutdown(&mut self) {
+    pub(crate) fn shutdown(&mut self) {
         if let Some((_, shutdown)) = self.task.take() {
             shutdown.cancel();
         }

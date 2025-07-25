@@ -8,6 +8,7 @@ use realize_core::rpc::realstore;
 use realize_core::rpc::realstore::client::ClientOptions;
 use realize_network::Networking;
 use realize_network::config::PeerConfig;
+use realize_network::unixsocket;
 use realize_storage::RealStoreOptions;
 use realize_storage::config::{ArenaConfig, CacheConfig};
 use realize_types;
@@ -25,6 +26,7 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::process::Child;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
+use tokio::task::LocalSet;
 
 fn command_path() -> PathBuf {
     // Expecting a path for the current exe to look like
@@ -48,6 +50,7 @@ struct Fixture {
     pub server_address: String,
     pub server_privkey: PathBuf,
     pub debug_output: bool,
+    pub socket: PathBuf,
 }
 
 impl Fixture {
@@ -109,6 +112,7 @@ impl Fixture {
         let server_privkey = resources.join("a.key");
         let server_port = portpicker::pick_unused_port().expect("No ports free");
         let server_address = format!("127.0.0.1:{server_port}");
+        let socket = tempdir.path().join("realize/control.socket");
         Ok(Self {
             config,
             resources,
@@ -117,6 +121,7 @@ impl Fixture {
             server_address,
             server_privkey,
             debug_output: debug,
+            socket,
         })
     }
 
@@ -147,6 +152,8 @@ impl Fixture {
             .arg(&self.server_privkey)
             .arg("--config")
             .arg(config_file)
+            .arg("--socket")
+            .arg(&self.socket)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -648,5 +655,40 @@ async fn daemon_updates_cache() -> anyhow::Result<()> {
     daemon_b.start_kill()?;
     daemon_a.start_kill()?;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_binds_socket() -> anyhow::Result<()> {
+    let fixture = Fixture::setup().await?;
+
+    let daemon = fixture.command()?.spawn()?;
+    let pid = daemon.id();
+    scopeguard::defer! { let _ = kill(pid); }
+
+    fixture.assert_listening().await;
+
+    let local = LocalSet::new();
+    local
+        .run_until(async move {
+            let control = unixsocket::connect::<
+                realize_core::rpc::control::control_capnp::control::Client,
+            >(&fixture.socket)
+            .await?;
+
+            let churten = control
+                .churten_request()
+                .send()
+                .promise
+                .await?
+                .get()?
+                .get_churten()?;
+
+            let is_running_result = churten.is_running_request().send().promise.await?;
+            assert!(!is_running_result.get()?.get_running());
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
     Ok(())
 }

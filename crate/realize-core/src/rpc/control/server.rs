@@ -19,17 +19,20 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 #[derive(Clone)]
-struct ControlServer<H: JobHandler + 'static> {
+pub(crate) struct ControlServer<H: JobHandler + 'static> {
     storage: Arc<Storage>,
     churten: Rc<RefCell<Churten<H>>>,
 }
 
 impl<H: JobHandler + 'static> ControlServer<H> {
-    fn new(storage: Arc<Storage>, churten: Rc<RefCell<Churten<H>>>) -> ControlServer<H> {
-        Self { storage, churten }
+    pub(crate) fn new(storage: Arc<Storage>, churten: Churten<H>) -> ControlServer<H> {
+        Self {
+            storage,
+            churten: Rc::new(RefCell::new(churten)),
+        }
     }
 
-    fn into_client(self) -> control::Client {
+    pub(crate) fn into_client(self) -> control::Client {
         capnp_rpc::new_client(self)
     }
 }
@@ -256,9 +259,7 @@ fn fill_notification(source: ChurtenNotification, mut dest: churten_notification
 }
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
     use std::path::PathBuf;
-    use std::rc::Rc;
     use std::time::Duration;
 
     use super::*;
@@ -371,10 +372,7 @@ mod tests {
             handler: H,
         ) -> anyhow::Result<PathBuf> {
             let storage = self.inner.storage(peer)?;
-            let churten = Rc::new(RefCell::new(Churten::with_handler(
-                Arc::clone(storage),
-                handler,
-            )));
+            let churten = Churten::with_handler(Arc::clone(storage), handler);
             let server = ControlServer::new(Arc::clone(storage), churten);
 
             let sockpath = self

@@ -45,6 +45,19 @@ struct Cli {
     /// Address to export prometheus metrics (host:port, optional)
     #[arg(long)]
     metrics_addr: Option<String>,
+
+    /// Path to the control socket file to use.
+    ///
+    /// If the containing directory doesn't exist in the path, it'll
+    /// be created with mod 700 (u=rwx), so it's a good idea to point
+    /// this path to a non-existing containing directory.
+    ///
+    /// If unset, the following paths are tried:
+    ///  - `/run/realize/control.socket`
+    ///  - `/var/run/realize/control.socket`
+    ///  - `/tmp/realize/control.socket`
+    #[arg(long)]
+    socket: Option<PathBuf>,
 }
 
 lazy_static::lazy_static! {
@@ -68,7 +81,7 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
         .with_context(|| format!("{}: failed to read TOML config file", cli.config.display()))?;
 
     let local = LocalSet::new();
-    let mut setup = SetupHelper::setup(config, &cli.privkey, &local).await?;
+    let setup = SetupHelper::setup(config, &cli.privkey, &local).await?;
 
     if let Some(addr) = &cli.metrics_addr {
         metrics::export_metrics(addr)
@@ -92,6 +105,10 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
             )
             .await?;
     }
+
+    setup
+        .bind_control_socket(&local, cli.socket.as_deref())
+        .await?;
 
     let server = setup.setup_server().await?;
 

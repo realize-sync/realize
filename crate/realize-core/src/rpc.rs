@@ -1,4 +1,4 @@
-mod control;
+pub mod control;
 mod household;
 pub mod realstore;
 
