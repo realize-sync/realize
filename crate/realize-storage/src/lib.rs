@@ -31,7 +31,7 @@ pub use arena::notifier::Notification;
 pub use arena::notifier::Progress;
 pub use arena::reader::Reader;
 pub use arena::store::{Options as RealStoreOptions, RealStore, RealStoreError, SyncedFile};
-pub use arena::types::Mark;
+pub use arena::types::{LocalAvailability, Mark};
 pub use error::StorageError;
 pub use global::cache::UnrealCacheAsync;
 pub use global::types::{FileAvailability, FileMetadata, InodeAssignment};
@@ -191,8 +191,7 @@ impl Storage {
     ) -> Result<Mark, StorageError> {
         let this = Arc::clone(&self);
         let path = path.clone();
-        task::spawn_blocking(move || this.arena_storage(arena)?.pathmarks.get_mark(&path))
-            .await?
+        task::spawn_blocking(move || this.arena_storage(arena)?.pathmarks.get_mark(&path)).await?
     }
 
     /// Return a handle on the unreal cache.

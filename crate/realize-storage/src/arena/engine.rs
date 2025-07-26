@@ -1,13 +1,13 @@
 #![allow(dead_code)] // work in progress
 
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
-use super::types::FailedJobTableEntry;
+use super::types::{FailedJobTableEntry, LocalAvailability};
 use crate::arena::arena_cache;
 use crate::arena::blob;
 use crate::arena::mark;
 use crate::utils::holder::Holder;
 use crate::{Inode, Mark, StorageError};
-use realize_types::{Arena, ByteRanges, Hash, Path, UnixTime};
+use realize_types::{Arena, Hash, Path, UnixTime};
 use redb::ReadableTable;
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,6 +58,7 @@ pub enum JobStatus {
 
     /// The job was abandoned
     Abandoned,
+    // TODO: add Cancelled
 }
 
 /// Result of [Engine::check_job]
@@ -500,16 +501,16 @@ impl Engine {
                             return Ok(None);
                         }
                     };
-                if let Some(blob_id) = file_entry.content.blob {
-                    let file_range = ByteRanges::single(0, file_entry.metadata.size);
-                    if blob::local_availability(&txn, blob_id)?.intersection(&file_range)
-                        == file_range
-                    {
-                        // Already fully available
-                        return Ok(None);
+                match blob::local_availability(txn, &file_entry)? {
+                    LocalAvailability::Missing | LocalAvailability::Partial(_, _) => {
+                        Ok(Some(Job::Download(path, counter, file_entry.content.hash)))
+                    }
+                    LocalAvailability::Complete | LocalAvailability::Verified => {
+                        // TODO: verify if complete but unverified
+
+                        Ok(None)
                     }
                 }
-                Ok(Some(Job::Download(path, counter, file_entry.content.hash)))
             }
         }
     }

@@ -9,6 +9,10 @@ $Rust.parentModule("arena::types");
 # An entry in the blob table.
 struct BlobTableEntry {
   writtenAreas @0: ByteRanges;
+
+  # Hash of the content, may be missing or inconsistent
+  # with the corresponding file entry.
+  contentHash @1: Data;
 }
 
 # A sequence of byte ranges.

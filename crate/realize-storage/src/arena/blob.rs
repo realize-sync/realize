@@ -1,5 +1,6 @@
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
-use super::types::BlobTableEntry;
+use super::hasher::hash_file;
+use super::types::{BlobTableEntry, LocalAvailability};
 use crate::StorageError;
 use crate::global::types::FileTableEntry;
 use crate::types::{BlobId, Inode};
@@ -12,7 +13,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt as _, ReadBuf};
+use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 
 /// A blob store that handles blob-specific operations.
 ///
@@ -85,6 +86,7 @@ impl Blobstore {
             );
             let blob_entry = BlobTableEntry {
                 written_areas: ByteRanges::new(),
+                content_hash: None,
             };
 
             (blob_id, blob_entry)
@@ -138,12 +140,6 @@ impl Blobstore {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn local_availability(&self, blob_id: BlobId) -> Result<ByteRanges, StorageError> {
-        let txn = self.db.begin_read()?;
-        local_availability(&txn, blob_id)
-    }
-
     /// Extend the local availability of a blob.
     pub(crate) fn extend_local_availability(
         &self,
@@ -166,15 +162,51 @@ impl Blobstore {
 
         Ok(())
     }
+
+    fn set_content_hash(&self, blob_id: BlobId, hash: Hash) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut blob_table = txn.blob_table()?;
+            let mut blob_entry = get_blob_entry(&blob_table, blob_id)?;
+            log::debug!("{blob_id} content verified to be {hash}");
+            blob_entry.content_hash = Some(hash);
+
+            blob_table.insert(blob_id, Holder::with_content(blob_entry)?)?;
+        }
+        txn.commit()?;
+
+        Ok(())
+    }
 }
 
 pub(crate) fn local_availability(
     txn: &ArenaReadTransaction,
-    blob_id: BlobId,
-) -> Result<ByteRanges, StorageError> {
-    let blob_table = txn.blob_table()?;
+    file_entry: &FileTableEntry,
+) -> Result<LocalAvailability, StorageError> {
+    match file_entry.content.blob {
+        None => Ok(LocalAvailability::Missing),
+        Some(blob_id) => {
+            let blob_table = txn.blob_table()?;
+            let blob_entry = get_blob_entry(&blob_table, blob_id)?;
+            let file_range = ByteRanges::single(0, file_entry.metadata.size);
+            if file_range == file_range.intersection(&blob_entry.written_areas) {
+                if let Some(content_hash) = &blob_entry.content_hash
+                    && file_entry.content.hash == *content_hash
+                {
+                    return Ok(LocalAvailability::Verified);
+                }
+                return Ok(LocalAvailability::Complete);
+            }
+            if blob_entry.written_areas.is_empty() {
+                return Ok(LocalAvailability::Missing);
+            }
 
-    Ok(get_blob_entry(&blob_table, blob_id)?.written_areas)
+            Ok(LocalAvailability::Partial(
+                file_entry.metadata.size,
+                blob_entry.written_areas,
+            ))
+        }
+    }
 }
 
 fn get_blob_entry(
@@ -290,12 +322,44 @@ impl Blob {
         self.blob_id
     }
 
+    /// Compute hash from the current local content.
+    ///
+    /// This hashes the entire content, no matter the current offset.
+    /// When this ends without errors, offset is at the end of the
+    /// file.
+    pub async fn compute_hash(&mut self) -> Result<Hash, std::io::Error> {
+        if self.offset != 0 {
+            self.seek(SeekFrom::Start(0)).await?;
+        }
+
+        hash_file(self).await
+    }
+
+    /// Flush and mark file content as verified on the database.
+    pub async fn mark_verified(&mut self) -> Result<(), StorageError> {
+        self.update_db().await?;
+
+        let blob_id = self.blob_id;
+        let blobstore = self.blobstore.clone();
+        let hash = self.hash.clone();
+        tokio::task::spawn_blocking(move || blobstore.set_content_hash(blob_id, hash)).await?
+    }
+
+    /// Make sure any updated content is stored on disk before
+    /// continuing.
+    pub async fn flush_and_sync(&mut self) -> std::io::Result<()> {
+        self.file.flush().await?;
+        self.file.sync_all().await?;
+
+        Ok(())
+    }
+
+    /// Flush data and report any ranges written to to the database.
     pub async fn update_db(&mut self) -> Result<(), StorageError> {
         if self.pending_ranges.is_empty() {
             return Ok(());
         }
-        self.file.flush().await?;
-        self.file.sync_all().await?;
+        self.flush_and_sync().await?;
 
         let blob_id = self.blob_id;
         let ranges = std::mem::take(&mut self.pending_ranges);
@@ -458,6 +522,7 @@ mod tests {
         arena: Arena,
         async_cache: UnrealCacheAsync,
         cache: Arc<UnrealCacheBlocking>,
+        db: Arc<ArenaDatabase>,
         tempdir: TempDir,
     }
     impl Fixture {
@@ -473,7 +538,7 @@ mod tests {
             }
             let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-            cache.add_arena(arena, db, blob_dir.to_path_buf(), dirty_paths)?;
+            cache.add_arena(arena, Arc::clone(&db), blob_dir.to_path_buf(), dirty_paths)?;
 
             let async_cache = cache.into_async();
             let cache = async_cache.blocking();
@@ -481,6 +546,7 @@ mod tests {
             Ok(Self {
                 arena,
                 async_cache,
+                db,
                 cache,
                 tempdir,
             })
@@ -555,6 +621,16 @@ mod tests {
             self.tempdir
                 .child(format!("{arena}/blobs/{blob_id}"))
                 .to_path_buf()
+        }
+
+        fn begin_read(&self) -> anyhow::Result<ArenaReadTransaction> {
+            Ok(self.db.begin_read()?)
+        }
+
+        fn get_blob_entry(&self, blob_id: BlobId) -> anyhow::Result<BlobTableEntry> {
+            let txn = self.begin_read()?;
+            let blob_table = txn.blob_table()?;
+            Ok(get_blob_entry(&blob_table, blob_id)?)
         }
     }
 
@@ -654,7 +730,6 @@ mod tests {
     async fn writing_to_blob_updates_local_availability() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(arena).await?;
-        let acache = fixture.arena_cache()?;
         let inode = fixture.add_file("test.txt", 21)?;
 
         // Write to blob
@@ -663,17 +738,22 @@ mod tests {
 
         blob.write(b"baa, baa").await?;
         assert_eq!(ByteRanges::single(0, 8), *blob.local_availability());
-        assert_eq!(ByteRanges::new(), acache.local_availability(blob_id)?);
+
+        let blob_entry = fixture.get_blob_entry(blob_id)?;
+        assert_eq!(ByteRanges::new(), blob_entry.written_areas);
 
         blob.write(b", black sheep").await?;
         assert_eq!(ByteRanges::single(0, 21), *blob.local_availability());
-        assert_eq!(ByteRanges::new(), acache.local_availability(blob_id)?);
+
+        let blob_entry = fixture.get_blob_entry(blob_id)?;
+        assert_eq!(ByteRanges::new(), blob_entry.written_areas);
 
         blob.update_db().await?;
-        assert_eq!(
-            ByteRanges::single(0, 21),
-            acache.local_availability(blob_id)?
-        );
+
+        // Get written areas from blob table after update
+        let txn = fixture.begin_read()?;
+        let blob_entry = get_blob_entry(&txn.blob_table()?, blob_id)?;
+        assert_eq!(ByteRanges::single(0, 21), blob_entry.written_areas);
         drop(blob);
 
         assert_eq!(
@@ -688,7 +768,6 @@ mod tests {
     async fn writing_to_blob_out_of_order() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(arena).await?;
-        let acache = fixture.arena_cache()?;
         let inode = fixture.add_file("test.txt", 21)?;
 
         // Write to blob
@@ -702,10 +781,9 @@ mod tests {
         blob.write(b"baa, baa").await?;
 
         blob.update_db().await?;
-        assert_eq!(
-            ByteRanges::single(0, 21),
-            acache.local_availability(blob_id)?
-        );
+
+        let blob_entry = fixture.get_blob_entry(blob_id)?;
+        assert_eq!(ByteRanges::single(0, 21), blob_entry.written_areas);
         drop(blob);
 
         assert_eq!(
@@ -885,8 +963,9 @@ mod tests {
         let blob_id = acache.open_file(inode)?.id();
 
         // Initially, the blob should have empty written areas
-        let initial_ranges = acache.local_availability(blob_id)?;
-        assert!(initial_ranges.is_empty());
+        let txn = fixture.begin_read()?;
+        let initial_blob_entry = get_blob_entry(&txn.blob_table()?, blob_id)?;
+        assert!(initial_blob_entry.written_areas.is_empty());
 
         // Update the blob with some written areas
         let written_areas = ByteRanges::from_ranges(vec![
@@ -898,8 +977,9 @@ mod tests {
         acache.extend_local_availability(blob_id, &written_areas)?;
 
         // Verify the written areas were updated
-        let retrieved_ranges = acache.local_availability(blob_id)?;
-        assert_eq!(retrieved_ranges, written_areas);
+        let txn = fixture.begin_read()?;
+        let retrieved_blob_entry = get_blob_entry(&txn.blob_table()?, blob_id)?;
+        assert_eq!(retrieved_blob_entry.written_areas, written_areas);
 
         acache.extend_local_availability(
             blob_id,
@@ -907,15 +987,16 @@ mod tests {
         )?;
 
         // Verify the ranges were updated again
-        let final_ranges = acache.local_availability(blob_id)?;
+        let txn = fixture.begin_read()?;
+        let final_blob_entry = get_blob_entry(&txn.blob_table()?, blob_id)?;
         assert_eq!(
-            final_ranges,
+            final_blob_entry.written_areas,
             ByteRanges::from_ranges(vec![ByteRange::new(0, 400), ByteRange::new(500, 600)])
         );
 
         // Test that getting ranges for a non-existent blob returns NotFound
         assert!(matches!(
-            acache.local_availability(BlobId(99999)),
+            get_blob_entry(&txn.blob_table()?, BlobId(99999)),
             Err(StorageError::NotFound)
         ));
 

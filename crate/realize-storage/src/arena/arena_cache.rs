@@ -1,5 +1,6 @@
-use super::blob::Blobstore;
+use super::blob::{self, Blobstore};
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
+use super::types::LocalAvailability;
 use crate::Blob;
 use crate::arena::engine::DirtyPaths;
 use crate::arena::notifier::{Notification, Progress};
@@ -478,10 +479,14 @@ impl ArenaCache {
         Ok(())
     }
 
-    // TODO: update tests to work on blobstore and remove
-    #[allow(dead_code)]
-    pub(crate) fn local_availability(&self, blob_id: BlobId) -> Result<ByteRanges, StorageError> {
-        self.blobstore.local_availability(blob_id)
+    pub(crate) fn local_availability(
+        &self,
+        inode: Inode,
+    ) -> Result<LocalAvailability, StorageError> {
+        let txn = self.db.begin_read()?;
+        let file_entry = get_default_entry(&txn.cache_file_table()?, inode)?;
+
+        blob::local_availability(&txn, &file_entry)
     }
 
     // TODO: update tests to work on blobstore and remove
@@ -954,13 +959,14 @@ mod tests {
     use crate::arena::db::{ArenaReadTransaction, ArenaWriteTransaction};
     use crate::arena::engine;
     use crate::arena::notifier::Notification;
-    use crate::global::cache::UnrealCacheBlocking;
+    use crate::global::cache::{UnrealCacheAsync, UnrealCacheBlocking};
     use crate::global::types::{FileMetadata, InodeAssignment};
     use crate::utils::redb_utils;
-    use crate::{ArenaDatabase, DirtyPaths, Inode, StorageError};
+    use crate::{ArenaDatabase, DirtyPaths, Inode, LocalAvailability, StorageError};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Hash, Path, Peer, UnixTime};
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
     use super::mark_dirty_recursive;
 
@@ -990,7 +996,8 @@ mod tests {
 
     struct Fixture {
         arena: Arena,
-        cache: UnrealCacheBlocking,
+        async_cache: UnrealCacheAsync,
+        cache: Arc<UnrealCacheBlocking>,
         dirty_paths: Arc<DirtyPaths>,
         _tempdir: TempDir,
     }
@@ -1009,8 +1016,12 @@ mod tests {
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
             cache.add_arena(arena, db, blob_dir.to_path_buf(), Arc::clone(&dirty_paths))?;
 
+            let async_cache = cache.into_async();
+            let cache = async_cache.blocking();
+
             Ok(Self {
                 arena,
+                async_cache,
                 cache,
                 dirty_paths,
                 _tempdir: tempdir,
@@ -2201,6 +2212,266 @@ mod tests {
                 assert!(engine::is_dirty(&txn, &file)?, "{file} should be dirty",);
             }
         }
+
+        Ok(())
+    }
+
+    // Tests for local_availability method
+    #[tokio::test]
+    async fn local_availability_missing_when_no_blob() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let file_path = Path::parse("test.txt")?;
+        let mtime = test_time();
+
+        // Add a file without opening it (so no blob is created)
+        fixture.add_file(&file_path, 100, &mtime)?;
+
+        let acache = fixture.arena_cache()?;
+        let (inode, _) = acache.lookup_path(&file_path)?;
+        let availability = acache.local_availability(inode)?;
+
+        assert!(matches!(availability, LocalAvailability::Missing));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_availability_missing_when_blob_empty() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let file_path = Path::parse("test.txt")?;
+        let mtime = test_time();
+
+        // Add a file and open it to create a blob
+        fixture.add_file(&file_path, 100, &mtime)?;
+        let acache = fixture.arena_cache()?;
+        let (inode, _) = acache.lookup_path(&file_path)?;
+
+        // Open the file to create a blob but don't write anything
+        let _blob = fixture.async_cache.open_file(inode).await?;
+
+        let availability = acache.local_availability(inode)?;
+
+        assert!(matches!(availability, LocalAvailability::Missing));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_availability_partial_when_blob_incomplete() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let file_path = Path::parse("test.txt")?;
+        let mtime = test_time();
+
+        // Add a file and open it to create a blob
+        fixture.add_file(&file_path, 100, &mtime)?;
+        let acache = fixture.arena_cache()?;
+        let (inode, _) = acache.lookup_path(&file_path)?;
+
+        // Open the file and write only part of it
+        let mut blob = fixture.async_cache.open_file(inode).await?;
+        blob.write_all(b"partial data").await?;
+        blob.flush_and_sync().await?;
+        blob.update_db().await?;
+
+        let availability = acache.local_availability(inode)?;
+
+        match availability {
+            LocalAvailability::Partial(size, ranges) => {
+                assert_eq!(size, 100);
+                assert!(!ranges.is_empty());
+                assert!(ranges.bytecount() < 100);
+            }
+            _ => panic!("Expected Partial availability, got {:?}", availability),
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_availability_complete_when_blob_full_but_unverified() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let file_path = Path::parse("test.txt")?;
+        let mtime = test_time();
+
+        // Add a file and open it to create a blob
+        fixture.add_file(&file_path, 100, &mtime)?;
+        let acache = fixture.arena_cache()?;
+        let (inode, _) = acache.lookup_path(&file_path)?;
+
+        // Open the file and write the full content
+        let mut blob = fixture.async_cache.open_file(inode).await?;
+        let data = vec![b'x'; 100];
+        blob.write_all(&data).await?;
+        blob.flush_and_sync().await?;
+        blob.update_db().await?;
+
+        let availability = acache.local_availability(inode)?;
+
+        assert!(matches!(availability, LocalAvailability::Complete));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_availability_verified_when_blob_full_and_verified() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let file_path = Path::parse("test.txt")?;
+        let mtime = test_time();
+
+        // Add a file and open it to create a blob
+        fixture.add_file(&file_path, 100, &mtime)?;
+        let acache = fixture.arena_cache()?;
+        let (inode, _) = acache.lookup_path(&file_path)?;
+
+        // Open the file and write the full content
+        let mut blob = fixture.async_cache.open_file(inode).await?;
+        let data = vec![b'x'; 100];
+        blob.write_all(&data).await?;
+        blob.flush_and_sync().await?;
+        blob.update_db().await?;
+
+        // Mark the blob as verified
+        blob.mark_verified().await?;
+
+        let availability = acache.local_availability(inode)?;
+
+        assert!(matches!(availability, LocalAvailability::Verified));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_availability_partial_with_multiple_ranges() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let file_path = Path::parse("test.txt")?;
+        let mtime = test_time();
+
+        // Add a file and open it to create a blob
+        fixture.add_file(&file_path, 1000, &mtime)?;
+        let acache = fixture.arena_cache()?;
+        let (inode, _) = acache.lookup_path(&file_path)?;
+
+        // Open the file and write data in non-contiguous ranges
+        let mut blob = fixture.async_cache.open_file(inode).await?;
+
+        // Write first range: 0-100
+        blob.seek(std::io::SeekFrom::Start(0)).await?;
+        blob.write_all(&vec![b'a'; 100]).await?;
+
+        // Write second range: 500-600
+        blob.seek(std::io::SeekFrom::Start(500)).await?;
+        blob.write_all(&vec![b'b'; 100]).await?;
+
+        // Write third range: 900-1000
+        blob.seek(std::io::SeekFrom::Start(900)).await?;
+        blob.write_all(&vec![b'c'; 100]).await?;
+
+        blob.flush_and_sync().await?;
+        blob.update_db().await?;
+
+        let availability = acache.local_availability(inode)?;
+
+        match availability {
+            LocalAvailability::Partial(size, ranges) => {
+                assert_eq!(size, 1000);
+                assert_eq!(ranges.len(), 3); // Three separate ranges
+                assert_eq!(ranges.bytecount(), 300); // Total 300 bytes written
+            }
+            _ => panic!("Expected Partial availability, got {:?}", availability),
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_availability_handles_zero_size_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let file_path = Path::parse("empty.txt")?;
+        let mtime = test_time();
+
+        // Add a zero-size file
+        fixture.add_file(&file_path, 0, &mtime)?;
+        let acache = fixture.arena_cache()?;
+        let (inode, _) = acache.lookup_path(&file_path)?;
+        assert!(matches!(
+            acache.local_availability(inode)?,
+            LocalAvailability::Missing
+        ));
+
+        // TODO: should a zero-length file be complete from the very
+        // beginning? Will everything work even before a blob is
+        // created?
+
+        // Open the file to create a blob; this is all that's needed
+        // for availability to switch to Complete.
+        fixture.async_cache.open_file(inode).await?;
+        assert!(matches!(
+            acache.local_availability(inode)?,
+            LocalAvailability::Complete
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_availability_handles_nonexistent_inode() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let acache = fixture.arena_cache()?;
+
+        // Try to get availability for a non-existent inode
+        let nonexistent_inode = Inode(999999);
+        let result = acache.local_availability(nonexistent_inode);
+
+        assert!(matches!(result, Err(StorageError::NotFound)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_availability_updates_after_writing() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let file_path = Path::parse("test.txt")?;
+        let mtime = test_time();
+
+        // Add a file and open it to create a blob
+        fixture.add_file(&file_path, 100, &mtime)?;
+        let acache = fixture.arena_cache()?;
+        let (inode, _) = acache.lookup_path(&file_path)?;
+
+        // Initially should be missing
+        let availability = acache.local_availability(inode)?;
+        assert!(matches!(availability, LocalAvailability::Missing));
+
+        // Open and write half the file
+        {
+            let mut blob = fixture.async_cache.open_file(inode).await?;
+            blob.write_all(&vec![b'x'; 50]).await?;
+            blob.flush_and_sync().await?;
+            blob.update_db().await?;
+        }
+
+        // Should now be partial
+        let availability = acache.local_availability(inode)?;
+        match availability {
+            LocalAvailability::Partial(size, ranges) => {
+                assert_eq!(size, 100);
+                assert_eq!(ranges.bytecount(), 50);
+            }
+            _ => panic!("Expected Partial availability, got {:?}", availability),
+        }
+
+        // Write the rest of the file
+        {
+            let mut blob = fixture.async_cache.open_file(inode).await?;
+            blob.seek(std::io::SeekFrom::Start(50)).await?;
+            blob.write_all(&vec![b'y'; 50]).await?;
+            blob.flush_and_sync().await?;
+            blob.update_db().await?;
+        }
+
+        // Should now be complete
+        let availability = acache.local_availability(inode)?;
+        assert!(matches!(availability, LocalAvailability::Complete));
 
         Ok(())
     }

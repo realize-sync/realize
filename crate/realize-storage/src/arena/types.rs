@@ -32,9 +32,28 @@ mod engine_capnp {
     include!(concat!(env!("OUT_DIR"), "/arena/engine_capnp.rs"));
 }
 
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub enum LocalAvailability {
+    /// File is not available locally
+    Missing,
+
+    /// File is only partially available locally, and here is its size
+    /// and available range.
+    Partial(u64, ByteRanges),
+
+    /// File is available locally, but its content hasn't been verified.
+    Complete,
+
+    /// File is available locally and its content has been verified
+    Verified,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlobTableEntry {
     pub written_areas: realize_types::ByteRanges,
+
+    /// Hash of the content; this may be missing or different from the file hash.
+    pub content_hash: Option<Hash>,
 }
 
 impl NamedType for BlobTableEntry {
@@ -49,16 +68,25 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
         let reader: blob_capnp::blob_table_entry::Reader =
             message_reader.get_root::<blob_capnp::blob_table_entry::Reader>()?;
 
+        let content_hash = if reader.has_content_hash() {
+            Some(parse_hash(reader.get_content_hash()?)?)
+        } else {
+            None
+        };
         Ok(BlobTableEntry {
             written_areas: parse_byte_ranges(reader.get_written_areas()?)?,
+            content_hash,
         })
     }
 
     fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError> {
         let mut message = ::capnp::message::Builder::new_default();
-        let builder: blob_capnp::blob_table_entry::Builder =
+        let mut builder: blob_capnp::blob_table_entry::Builder =
             message.init_root::<blob_capnp::blob_table_entry::Builder>();
 
+        if let Some(h) = &self.content_hash {
+            builder.set_content_hash(&h.0);
+        }
         fill_byte_ranges(&self.written_areas, builder.init_written_areas());
 
         let mut buffer: Vec<u8> = Vec::new();
@@ -323,6 +351,7 @@ mod tests {
                 realize_types::ByteRange::new(0, 1024),
                 realize_types::ByteRange::new(2048, 4096),
             ]),
+            content_hash: None,
         };
 
         assert_eq!(

@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 
-use crate::utils::hash;
+use crate::utils::hash::{self};
 use futures::TryStreamExt as _;
 use realize_types::{self, Hash, UnixTime};
 use tokio::fs::File;
+use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
 use tokio_util::io::ReaderStream;
 
@@ -42,16 +43,20 @@ async fn do_hash(realpath: PathBuf) -> std::io::Result<HashResult> {
     let mtime = UnixTime::mtime(&m);
     let size = m.len();
 
+    let hash = hash_file(f).await?;
+
+    Ok(HashResult { hash, mtime, size })
+}
+
+pub(crate) async fn hash_file<R: AsyncRead>(f: R) -> Result<Hash, std::io::Error> {
     let mut hasher = hash::running();
-    ReaderStream::with_capacity(f, 64 * 1024)
+    ReaderStream::with_capacity(f, 8 * 1024)
         .try_for_each(|chunk| {
             hasher.update(chunk);
 
             std::future::ready(Ok(()))
         })
         .await?;
-
     let hash = hasher.finalize();
-
-    Ok(HashResult { hash, mtime, size })
+    Ok(hash)
 }

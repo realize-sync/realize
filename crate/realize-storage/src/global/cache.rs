@@ -5,6 +5,7 @@
 use super::types::{DirTableEntry, FileAvailability, FileMetadata, InodeAssignment, ReadDirEntry};
 use crate::arena::arena_cache::{self, ArenaCache};
 use crate::arena::notifier::{Notification, Progress};
+use crate::arena::types::LocalAvailability;
 use crate::utils::holder::Holder;
 use crate::{ArenaDatabase, Blob, DirtyPaths, Inode, StorageError};
 use bimap::BiMap;
@@ -395,6 +396,20 @@ impl UnrealCacheAsync {
         let inner = Arc::clone(&self.inner);
 
         task::spawn_blocking(move || inner.update(peer, notification)).await?
+    }
+
+    /// Check local file content availability.
+    pub async fn local_availability(
+        &self,
+        inode: Inode,
+    ) -> Result<LocalAvailability, StorageError> {
+        let inner = Arc::clone(&self.inner);
+
+        task::spawn_blocking(move || {
+            let arena_cache = inner.arena_cache_for_inode(inode)?;
+            arena_cache.local_availability(inode)
+        })
+        .await?
     }
 
     /// Open a file for reading/writing, creating a new blob entry.
