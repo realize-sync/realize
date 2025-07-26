@@ -1,11 +1,11 @@
 use super::index::RealIndexAsync;
 use crate::StorageError;
-use realize_types::{self, Hash, UnixTime};
+use realize_types::{self, ByteRange, Delta, Hash, Signature, UnixTime};
 use std::io::{self, SeekFrom};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::fs::File;
-use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, ReadBuf};
 
 /// A handle on a filesystem file, with a known hash.
 pub struct Reader {
@@ -75,6 +75,39 @@ impl AsyncSeek for Reader {
     }
 }
 
+/// Use the rsync algorithm to sync some file with a file in the index.
+///
+/// To use this function to sync a local file with a file in the
+/// index, call fast_sync::signature on a range of the local file, to
+/// get a Signature, then pass that signature to this function to get
+/// a patch (Delta) and apply that delta to the range of the local file.
+///
+/// The file must exist in the index for this call to succeed.
+///
+/// TODO: require a hash and compare the hash with the hash in the
+/// index, then check that the size/mtime of the file on the
+/// filesystem correspond to the index.
+pub(crate) async fn rsync(
+    index: &RealIndexAsync,
+    root: &std::path::Path,
+    path: &realize_types::Path,
+    range: &ByteRange,
+    sig: Signature,
+) -> Result<Delta, StorageError> {
+    let sig = fast_rsync::Signature::deserialize(sig.0)?;
+    index.get_file(path).await?.ok_or(StorageError::NotFound)?;
+
+    let realpath = path.within(root);
+    let len = range.bytecount() as usize;
+    let mut data = vec![0; len];
+    File::open(realpath).await?.read_exact(&mut data).await?;
+
+    let mut delta = Vec::new();
+    fast_rsync::diff(&sig.index(), data.as_slice(), &mut delta)?;
+
+    Ok(Delta(delta))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -87,7 +120,6 @@ mod tests {
     use assert_fs::prelude::*;
     use realize_types::Arena;
     use tokio::fs;
-    use tokio::io::AsyncReadExt as _;
 
     fn test_arena() -> Arena {
         Arena::from("arena")

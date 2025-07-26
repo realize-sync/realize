@@ -2282,6 +2282,7 @@ dependencies = [
  "capnp-rpc",
  "capnpc",
  "env_logger",
+ "fast_rsync",
  "futures",
  "hyper",
  "hyper-util",

@@ -32,6 +32,9 @@ pub enum StorageError {
     #[error(transparent)]
     JoinError(#[from] JoinError),
 
+    #[error{"invalid rsync signature"}]
+    InvalidRsyncSignature,
+
     #[error("unknown arena: {0}")]
     UnknownArena(Arena),
 }
@@ -87,5 +90,20 @@ impl From<redb::CommitError> for StorageError {
 impl From<realize_types::PathError> for StorageError {
     fn from(_: realize_types::PathError) -> Self {
         StorageError::from(ByteConversionError::Invalid("path"))
+    }
+}
+
+impl From<fast_rsync::DiffError> for StorageError {
+    fn from(err: fast_rsync::DiffError) -> Self {
+        match err {
+            fast_rsync::DiffError::InvalidSignature => StorageError::InvalidRsyncSignature,
+            fast_rsync::DiffError::Io(err) => StorageError::from(err),
+        }
+    }
+}
+
+impl From<fast_rsync::SignatureParseError> for StorageError {
+    fn from(_: fast_rsync::SignatureParseError) -> Self {
+        StorageError::InvalidRsyncSignature
     }
 }

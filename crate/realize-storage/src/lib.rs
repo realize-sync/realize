@@ -1,12 +1,12 @@
 use arena::db::ArenaDatabase;
 use arena::engine::{DirtyPaths, Engine};
 use arena::index::RealIndexAsync;
+use arena::indexed_store;
 use arena::mark::PathMarks;
 use arena::watcher::RealWatcher;
 use config::StorageConfig;
 use futures::Stream;
-use realize_types::Arena;
-use realize_types::{self, Path};
+use realize_types::{self, Arena, ByteRange, Delta, Path, Signature};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,9 +27,9 @@ pub mod utils;
 
 pub use arena::blob::{Blob, BlobIncomplete};
 pub use arena::engine::{Job, JobStatus, JobUpdate};
+pub use arena::indexed_store::Reader;
 pub use arena::notifier::Notification;
 pub use arena::notifier::Progress;
-pub use arena::reader::Reader;
 pub use arena::store::{Options as RealStoreOptions, RealStore, RealStoreError, SyncedFile};
 pub use arena::types::{LocalAvailability, Mark};
 pub use error::StorageError;
@@ -208,6 +208,18 @@ impl Storage {
         let s = self.arena_storage(arena)?;
 
         Reader::open(&s.index, s.root.as_ref(), path).await
+    }
+
+    pub async fn rsync(
+        &self,
+        arena: Arena,
+        path: &realize_types::Path,
+        range: &ByteRange,
+        sig: Signature,
+    ) -> anyhow::Result<Delta, StorageError> {
+        let s = self.arena_storage(arena)?;
+
+        indexed_store::rsync(&s.index, &s.root, path, range, sig).await
     }
 
     /// Return a handle on the real store.
