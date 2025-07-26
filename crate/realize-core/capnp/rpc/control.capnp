@@ -56,6 +56,7 @@ struct ChurtenNotification {
   union {
     update @2: Update;
     updateByteCount @3: UpdateByteCount;
+    updateAction @4: UpdateAction;
   }
 
   struct Update {
@@ -68,6 +69,10 @@ struct ChurtenNotification {
   struct UpdateByteCount {
     currentBytes @0: UInt64;
     totalBytes @1: UInt64;
+  }
+
+  struct UpdateAction {
+    action @0: JobAction;
   }
 }
 
@@ -92,4 +97,10 @@ enum JobProgress {
   abandoned @3;
   cancelled @4;
   failed @5;
+}
+
+enum JobAction {
+  download @0;
+  verify @1;
+  repair @2;
 }

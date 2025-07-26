@@ -1,3 +1,4 @@
+use super::{churten::JobAction, progress::ByteCountProgress};
 use crate::rpc::Household;
 use futures::StreamExt;
 use realize_storage::{JobStatus, Storage, StorageError};
@@ -5,8 +6,6 @@ use realize_types::{Arena, ByteRanges, Hash, Path, Peer};
 use std::{io::SeekFrom, sync::Arc};
 use tarpc::tokio_util::sync::CancellationToken;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-
-use super::progress::ByteCountProgress;
 
 /// Make a local copy of a specific version of a remote file.
 ///
@@ -43,8 +42,6 @@ pub(crate) async fn download(
     // whatever we could write before the error happened.
     blob.update_db().await?;
 
-    // TODO: add data verification
-
     res.map(|_| JobStatus::Done)
 }
 
@@ -64,6 +61,7 @@ async fn write_to_blob(
     }
     let total_bytes = missing.bytecount();
     let mut current_bytes: u64 = 0;
+    progress.update_action(JobAction::Download);
     progress.update(0, total_bytes);
 
     for range in missing {
@@ -409,6 +407,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn download_progress_no_action_when_already_complete() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                testing::connect(&household_a, b).await?;
+
+                let path = fixture
+                    .write_file(b, "foobar", "baa, baa, black sheep")
+                    .await?;
+                fixture.inner.wait_for_file_in_cache(a, "foobar").await?;
+
+                // Write the complete file content
+                {
+                    let mut blob = fixture.open_file(a, "foobar").await?;
+                    blob.write(b"baa, baa, black sheep").await?;
+                    blob.update_db().await?;
+                }
+
+                let mut progress = SimpleByteCountProgress::new();
+                assert_eq!(
+                    JobStatus::Done,
+                    download(
+                        fixture.inner.storage(a)?,
+                        &household_a,
+                        HouseholdFixture::test_arena(),
+                        &path,
+                        &digest("baa, baa, black sheep"),
+                        &mut progress,
+                        CancellationToken::new(),
+                    )
+                    .await?,
+                );
+
+                // When the blob is already complete, no download action should be performed
+                assert_eq!(0, progress.actions.len());
+                assert_eq!(0, progress.current_bytes);
+                assert_eq!(0, progress.total_bytes);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn download_progress() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
         fixture
@@ -447,6 +496,10 @@ mod tests {
                 // 18 = "baa, baa, black sheep".len() - 3 already written
                 assert_eq!(18, progress.current_bytes);
                 assert_eq!(18, progress.total_bytes);
+
+                // Verify that update_action was called with Download
+                assert_eq!(1, progress.actions.len());
+                assert_eq!(JobAction::Download, progress.actions[0]);
 
                 Ok::<(), anyhow::Error>(())
             })

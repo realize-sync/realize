@@ -1,6 +1,7 @@
 #![allow(dead_code)] // work in progress
 
-use super::{download::download, progress::ByteCountProgress};
+use super::download::download;
+use super::progress::ByteCountProgress;
 use crate::rpc::Household;
 use futures::StreamExt;
 use realize_storage::{Job, JobStatus, Storage};
@@ -17,6 +18,17 @@ pub(crate) enum ChurtenNotification {
         arena: Arena,
         job: Arc<Job>,
         progress: JobProgress,
+    },
+
+    /// Report a specific action taken by the job.
+    ///
+    /// Any byte count progress previously reported should be
+    /// considered invalid after this notification and until the next
+    /// byte count update.
+    UpdateAction {
+        arena: Arena,
+        job: Arc<Job>,
+        action: JobAction,
     },
 
     /// Report bytecount update, such as for a copy or a download job.
@@ -46,12 +58,14 @@ impl ChurtenNotification {
         match self {
             ChurtenNotification::Update { arena, .. } => *arena,
             ChurtenNotification::UpdateByteCount { arena, .. } => *arena,
+            ChurtenNotification::UpdateAction { arena, .. } => *arena,
         }
     }
     pub(crate) fn job(&self) -> &Arc<Job> {
         match self {
             ChurtenNotification::Update { job, .. } => job,
             ChurtenNotification::UpdateByteCount { job, .. } => job,
+            ChurtenNotification::UpdateAction { job, .. } => job,
         }
     }
 }
@@ -78,6 +92,14 @@ pub(crate) enum JobProgress {
     ///
     /// The string is an error description.
     Failed(String),
+}
+
+/// An specific action taken by a job.
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub(crate) enum JobAction {
+    Download,
+    Verify,
+    Repair,
 }
 
 /// A type that processes jobs and returns the result for [Churten].
@@ -288,6 +310,13 @@ struct TxByteCountProgress {
 }
 
 impl ByteCountProgress for TxByteCountProgress {
+    fn update_action(&mut self, action: JobAction) {
+        let _ = self.tx.send(ChurtenNotification::UpdateAction {
+            arena: self.arena,
+            job: Arc::clone(&self.job),
+            action,
+        });
+    }
     fn update(&mut self, current_bytes: u64, total_bytes: u64) {
         let _ = self.tx.send(ChurtenNotification::UpdateByteCount {
             arena: self.arena,
@@ -360,6 +389,15 @@ mod tests {
                         arena,
                         job: job.clone(),
                         progress: JobProgress::Running,
+                    },
+                    rx.recv().await?
+                );
+
+                assert_eq!(
+                    ChurtenNotification::UpdateAction {
+                        arena,
+                        job: job.clone(),
+                        action: JobAction::Download,
                     },
                     rx.recv().await?
                 );

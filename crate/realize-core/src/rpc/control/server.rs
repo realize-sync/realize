@@ -9,7 +9,7 @@ use super::control_capnp::control::{
     SetArenaMarkResults, SetMarkParams, SetMarkResults,
 };
 use super::control_capnp::{self, churten_notification};
-use crate::consensus::churten::{Churten, ChurtenNotification, JobHandler, JobProgress};
+use crate::consensus::churten::{Churten, ChurtenNotification, JobAction, JobHandler, JobProgress};
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 use realize_storage::{Mark, Storage, StorageError};
@@ -246,14 +246,22 @@ fn fill_notification(source: ChurtenNotification, mut dest: churten_notification
                 }
             }
         }
+        ChurtenNotification::UpdateAction { action, .. } => {
+            let mut update = dest.reborrow().init_update_action();
+            match action {
+                JobAction::Download => update.set_action(control_capnp::JobAction::Download),
+                JobAction::Verify => update.set_action(control_capnp::JobAction::Verify),
+                JobAction::Repair => update.set_action(control_capnp::JobAction::Repair),
+            }
+        }
         ChurtenNotification::UpdateByteCount {
             current_bytes,
             total_bytes,
             ..
         } => {
-            let mut update_byte_count = dest.reborrow().init_update_byte_count();
-            update_byte_count.set_current_bytes(*current_bytes);
-            update_byte_count.set_total_bytes(*total_bytes);
+            let mut update = dest.reborrow().init_update_byte_count();
+            update.set_current_bytes(*current_bytes);
+            update.set_total_bytes(*total_bytes);
         }
     }
 }
