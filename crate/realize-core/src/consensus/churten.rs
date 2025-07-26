@@ -423,6 +423,15 @@ mod tests {
                 );
 
                 assert_eq!(
+                    ChurtenNotification::UpdateAction {
+                        arena,
+                        job: job.clone(),
+                        action: JobAction::Verify,
+                    },
+                    rx.recv().await?
+                );
+
+                assert_eq!(
                     ChurtenNotification::Update {
                         arena,
                         job: job.clone(),
