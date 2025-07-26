@@ -2,24 +2,25 @@ use super::peer_capnp::connected_peer;
 use super::result_capnp;
 use super::store_capnp::read_callback::{ChunkParams, FinishParams, FinishResults};
 use super::store_capnp::store::{
-    self, ArenasParams, ArenasResults, ReadParams, ReadResults, SubscribeParams, SubscribeResults,
+    self, ArenasParams, ArenasResults, ReadParams, ReadResults, RsyncParams, RsyncResults,
+    SubscribeParams, SubscribeResults,
 };
 use super::store_capnp::subscriber::{self, NotifyParams, NotifyResults};
-use super::store_capnp::{notification, read_callback, read_error};
+use super::store_capnp::{io_error, notification, read_callback};
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 use realize_network::capnp::{ConnectionHandler, ConnectionManager, PeerStatus};
 use realize_network::{Networking, Server};
 use realize_storage::utils::holder::ByteConversionError;
 use realize_storage::{Notification, Progress, Storage, StorageError, UnrealCacheAsync};
-use realize_types::{self, Arena, Hash, Path, Peer, UnixTime};
+use realize_types::{self, Arena, ByteRange, Delta, Hash, Path, Peer, Signature, UnixTime};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, SeekFrom};
 use std::pin;
 use std::sync::Arc;
 use tokio::io::AsyncSeekExt;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::LocalSet;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
@@ -122,15 +123,49 @@ impl Household {
 
         Ok(ReceiverStream::new(rx))
     }
+
+    /// Generate a rsync patch to apply to a given byte range of a remote file.
+    pub async fn rsync<T>(
+        &self,
+        peers: T,
+        arena: Arena,
+        path: &Path,
+        range: &ByteRange,
+        sig: Signature,
+    ) -> anyhow::Result<Delta>
+    where
+        T: IntoIterator<Item = Peer>,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.manager.with_any_peer_client(
+            peers,
+            HouseholdOperation::Rsync {
+                tx,
+                arena,
+                path: path.clone(),
+                range: range.clone(),
+                sig,
+            },
+        )?;
+
+        rx.await?
+    }
 }
 
 enum HouseholdOperation {
     Read {
+        tx: mpsc::Sender<Result<Vec<u8>, io::Error>>,
         arena: Arena,
         path: realize_types::Path,
         offset: u64,
         limit: Option<u64>,
-        tx: mpsc::Sender<Result<Vec<u8>, io::Error>>,
+    },
+    Rsync {
+        tx: oneshot::Sender<anyhow::Result<Delta>>,
+        arena: Arena,
+        path: realize_types::Path,
+        range: ByteRange,
+        sig: Signature,
     },
 }
 struct PeerConnectionHandler {
@@ -188,6 +223,16 @@ impl ConnectionHandler<connected_peer::Client, HouseholdOperation> for PeerConne
                     let _ = tx_clone.send(Err(err)).await;
                 }
             }
+            HouseholdOperation::Rsync {
+                tx,
+                arena,
+                path,
+                range,
+                sig,
+            } => {
+                let res = execute_rsync(client, arena, &path, &range, sig).await;
+                let _ = tx.send(res);
+            }
         }
     }
 }
@@ -229,6 +274,41 @@ async fn execute_read(
     Ok(())
 }
 
+async fn execute_rsync(
+    client: Option<(Peer, connected_peer::Client)>,
+    arena: Arena,
+    path: &realize_types::Path,
+    range: &ByteRange,
+    sig: Signature,
+) -> anyhow::Result<Delta> {
+    let (peer, client) = match client {
+        Some(c) => c,
+        None => {
+            anyhow::bail!("No available peer");
+        }
+    };
+    log::debug!(
+        "Rsyncing [{arena}]/{path} {range} with {peer} ({} bytes in)",
+        sig.0.len()
+    );
+
+    let store = client.store_request().send().pipeline.get_store();
+    let mut request = store.rsync_request();
+    let mut req = request.get().init_req();
+    req.set_arena(arena.as_str());
+    req.set_path(path.as_str());
+    req.set_sig(sig.0.as_slice());
+    fill_byterange(req.init_range(), range);
+    let reply = request.send().promise.await?;
+    let delta = Delta(reply.get()?.get_res()?.get_delta()?.into());
+    log::debug!(
+        "Rsynced [{arena}]/{path} {range} with {peer} ({} bytes out)",
+        delta.0.len()
+    );
+
+    Ok(delta)
+}
+
 struct ReadCallbackServer {
     tx: Option<mpsc::Sender<io::Result<Vec<u8>>>>,
 }
@@ -261,23 +341,23 @@ impl read_callback::Server for ReadCallbackServer {
     }
 }
 
-fn errno_to_io_error(errno: read_error::Errno) -> io::Error {
+fn errno_to_io_error(errno: io_error::Errno) -> io::Error {
     use io::ErrorKind::*;
 
     io::Error::new(
         match errno {
-            read_error::Errno::Other => Other,
-            read_error::Errno::GenericIo => Other,
-            read_error::Errno::Unavailable => Other,
-            read_error::Errno::PermissionDenied => PermissionDenied,
-            read_error::Errno::NotADirectory => NotADirectory,
-            read_error::Errno::IsADirectory => IsADirectory,
-            read_error::Errno::InvalidInput => InvalidInput,
-            read_error::Errno::Closed => Other,
-            read_error::Errno::Aborted => ConnectionAborted,
-            read_error::Errno::NotFound => NotFound,
-            read_error::Errno::ResourceBusy => ResourceBusy,
-            read_error::Errno::InvalidPath => InvalidFilename,
+            io_error::Errno::Other => Other,
+            io_error::Errno::GenericIo => Other,
+            io_error::Errno::Unavailable => Other,
+            io_error::Errno::PermissionDenied => PermissionDenied,
+            io_error::Errno::NotADirectory => NotADirectory,
+            io_error::Errno::IsADirectory => IsADirectory,
+            io_error::Errno::InvalidInput => InvalidInput,
+            io_error::Errno::Closed => Other,
+            io_error::Errno::Aborted => ConnectionAborted,
+            io_error::Errno::NotFound => NotFound,
+            io_error::Errno::ResourceBusy => ResourceBusy,
+            io_error::Errno::InvalidPath => InvalidFilename,
         },
         format!("{errno:?}"),
     )
@@ -475,7 +555,7 @@ impl ConnectedPeerServer {
                 if complete {
                     result.init_ok();
                 } else {
-                    result.init_err().set_errno(read_error::Errno::Aborted);
+                    result.init_err().set_errno(io_error::Errno::Aborted);
                 }
             }
         }
@@ -508,6 +588,32 @@ impl ConnectedPeerServer {
             send_chunks(reader, cb).await
         }
     }
+
+    async fn do_rsync(
+        &self,
+        params: RsyncParams,
+        mut results: RsyncResults,
+    ) -> Result<(), capnp::Error> {
+        let params = params.get()?;
+        let req = params.get_req()?;
+
+        let arena = parse_arena(req.get_arena()?)?;
+        let path = parse_path(req.get_path()?)?;
+        let range = parse_range(req.get_range()?);
+        if range.bytecount() > 1024 * 1024 {
+            return Err(capnp::Error::failed("range too large".to_string()));
+        }
+        let sig = Signature(req.get_sig()?.into());
+        let delta = self
+            .storage
+            .rsync(arena, &path, &range, sig)
+            .await
+            .map_err(storage_to_capnp_err)?;
+
+        results.get().init_res().set_delta(&delta.0);
+
+        Ok(())
+    }
 }
 
 async fn send_chunks(
@@ -529,8 +635,8 @@ async fn send_chunks(
     }
 }
 
-fn read_errno(err: StorageError) -> read_error::Errno {
-    use read_error::Errno::*;
+fn read_errno(err: StorageError) -> io_error::Errno {
+    use io_error::Errno::*;
     match err {
         StorageError::Database(_) => Unavailable,
         StorageError::Io(ioerr) => match ioerr.kind() {
@@ -550,6 +656,7 @@ fn read_errno(err: StorageError) -> read_error::Errno {
         StorageError::NotADirectory => NotADirectory,
         StorageError::IsADirectory => IsADirectory,
         StorageError::JoinError(_) => Other,
+        StorageError::InvalidRsyncSignature => InvalidInput,
         StorageError::UnknownArena(_) => NotFound,
     }
 }
@@ -590,9 +697,14 @@ impl store::Server for ConnectedPeerServer {
         Promise::from_future(async move { this.do_subscribe(params, results).await })
     }
 
-    fn read(&mut self, params: ReadParams, _t: ReadResults) -> Promise<(), capnp::Error> {
+    fn read(&mut self, params: ReadParams, _: ReadResults) -> Promise<(), capnp::Error> {
         let this = self.clone();
         Promise::from_future(async move { this.do_read(params).await })
+    }
+
+    fn rsync(&mut self, params: RsyncParams, results: RsyncResults) -> Promise<(), capnp::Error> {
+        let this = self.clone();
+        Promise::from_future(async move { this.do_rsync(params, results).await })
     }
 }
 
@@ -793,6 +905,11 @@ fn fill_uuid(mut builder: super::store_capnp::uuid::Builder<'_>, uuid: &Uuid) {
     builder.set_lo(lo);
 }
 
+fn fill_byterange(mut builder: super::store_capnp::byte_range::Builder<'_>, range: &ByteRange) {
+    builder.set_start(range.start);
+    builder.set_end(range.end);
+}
+
 fn fill_add(
     mut builder: super::store_capnp::add::Builder<'_>,
     arena: Arena,
@@ -891,6 +1008,10 @@ fn parse_uuid(reader: super::store_capnp::uuid::Reader<'_>) -> Uuid {
     Uuid::from_u64_pair(reader.get_hi(), reader.get_lo())
 }
 
+fn parse_range(reader: super::store_capnp::byte_range::Reader<'_>) -> ByteRange {
+    ByteRange::new(reader.get_start(), reader.get_end())
+}
+
 fn parse_mtime(reader: super::store_capnp::time::Reader<'_>) -> UnixTime {
     UnixTime::new(reader.get_secs(), reader.get_nsecs())
 }
@@ -907,10 +1028,15 @@ fn parse_hash(hash: &[u8]) -> Result<Hash, capnp::Error> {
     Ok(Hash(hash))
 }
 
+fn storage_to_capnp_err(err: StorageError) -> capnp::Error {
+    capnp::Error::failed(err.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::rpc::testing::HouseholdFixture;
+    use fast_rsync::SignatureOptions;
     use futures::TryStreamExt as _;
     use tokio::fs;
 
@@ -984,6 +1110,199 @@ mod tests {
                 )?;
                 let collected = stream.try_collect::<Vec<_>>().await?;
                 assert_eq!(vec![b"te".to_vec()], collected);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rsync_from_peer() -> anyhow::Result<()> {
+        let mut fixture = HouseholdFixture::setup().await?;
+        fixture
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+
+                // Create a file in peer B with some content
+                let b_dir = fixture.arena_root(b);
+                let content = "Hello, this is a test file for rsync functionality!";
+                fs::write(&b_dir.join("rsync_test.txt"), content.as_bytes()).await?;
+
+                // Wait for the file to be available in peer A's cache
+                fixture.wait_for_file_in_cache(a, "rsync_test.txt").await?;
+
+                // Create a different version of the file in peer A (similar but not identical)
+                let a_dir = fixture.arena_root(a);
+                let modified_content =
+                    "Hello, this is a modified test file for rsync functionality!";
+                fs::write(&a_dir.join("rsync_test.txt"), modified_content.as_bytes()).await?;
+
+                // Now test rsync: create a signature of the local file and get a delta from peer B
+                let arena = HouseholdFixture::test_arena();
+                let path = realize_types::Path::parse("rsync_test.txt")?;
+                let range = realize_types::ByteRange::new(0, content.len() as u64);
+
+                // Create signature options similar to those used in verify.rs
+                let opts = SignatureOptions {
+                    block_size: 4 * 1024,
+                    crypto_hash_size: 8,
+                };
+
+                // Read the local file content
+                let local_content = fs::read(&a_dir.join("rsync_test.txt")).await?;
+
+                // Calculate signature of the local content
+                let signature = fast_rsync::Signature::calculate(&local_content, opts);
+                let sig = realize_types::Signature(signature.into_serialized());
+
+                // Call rsync to get delta from peer B
+                let delta = household_a
+                    .rsync(vec![b.clone()], arena, &path, &range, sig)
+                    .await?;
+
+                // Apply the delta to reconstruct the original content
+                let mut reconstructed = Vec::new();
+                fast_rsync::apply_limited(
+                    &local_content,
+                    &delta.0,
+                    &mut reconstructed,
+                    local_content.len(),
+                )?;
+
+                // Verify that the reconstructed content matches the original content from peer B
+                assert_eq!(content.as_bytes(), reconstructed.as_slice());
+
+                // Also verify that the reconstructed content is different from the local modified content
+                assert_ne!(modified_content.as_bytes(), reconstructed.as_slice());
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rsync_with_identical_files() -> anyhow::Result<()> {
+        let mut fixture = HouseholdFixture::setup().await?;
+        fixture
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+
+                // Create identical files in both peers
+                let content = "Identical content for both peers";
+                let a_dir = fixture.arena_root(a);
+                let b_dir = fixture.arena_root(b);
+
+                fs::write(&a_dir.join("identical.txt"), content.as_bytes()).await?;
+                fs::write(&b_dir.join("identical.txt"), content.as_bytes()).await?;
+
+                // Wait for the file to be available in peer A's cache
+                fixture.wait_for_file_in_cache(a, "identical.txt").await?;
+
+                let arena = HouseholdFixture::test_arena();
+                let path = realize_types::Path::parse("identical.txt")?;
+                let range = realize_types::ByteRange::new(0, content.len() as u64);
+
+                let opts = SignatureOptions {
+                    block_size: 4 * 1024,
+                    crypto_hash_size: 8,
+                };
+
+                let local_content = fs::read(&a_dir.join("identical.txt")).await?;
+                let signature = fast_rsync::Signature::calculate(&local_content, opts);
+                let sig = realize_types::Signature(signature.into_serialized());
+
+                // Call rsync - should return an empty or minimal delta since files are identical
+                let delta = household_a
+                    .rsync(vec![b.clone()], arena, &path, &range, sig)
+                    .await?;
+
+                // Apply the delta
+                let mut reconstructed = Vec::new();
+                fast_rsync::apply_limited(
+                    &local_content,
+                    &delta.0,
+                    &mut reconstructed,
+                    local_content.len(),
+                )?;
+
+                // Should still match the original content
+                assert_eq!(content.as_bytes(), reconstructed.as_slice());
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rsync_with_completely_different_files() -> anyhow::Result<()> {
+        let mut fixture = HouseholdFixture::setup().await?;
+        fixture
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+
+                // Create completely different files
+                let a_content = "This is content from peer A";
+                let b_content = "This is completely different content from peer B";
+
+                let a_dir = fixture.arena_root(a);
+                let b_dir = fixture.arena_root(b);
+
+                fs::write(&a_dir.join("different.txt"), a_content.as_bytes()).await?;
+                fs::write(&b_dir.join("different.txt"), b_content.as_bytes()).await?;
+
+                // Wait for the file to be available in peer A's cache
+                fixture.wait_for_file_in_cache(a, "different.txt").await?;
+
+                let arena = HouseholdFixture::test_arena();
+                let path = realize_types::Path::parse("different.txt")?;
+                let range = realize_types::ByteRange::new(0, b_content.len() as u64);
+
+                let opts = SignatureOptions {
+                    block_size: 4 * 1024,
+                    crypto_hash_size: 8,
+                };
+
+                let local_content = fs::read(&a_dir.join("different.txt")).await?;
+                let signature = fast_rsync::Signature::calculate(&local_content, opts);
+                let sig = realize_types::Signature(signature.into_serialized());
+
+                // Call rsync - should return a delta that transforms A's content to B's content
+                let delta = household_a
+                    .rsync(vec![b.clone()], arena, &path, &range, sig)
+                    .await?;
+
+                // Apply the delta
+                let mut reconstructed = Vec::new();
+                fast_rsync::apply_limited(
+                    &local_content,
+                    &delta.0,
+                    &mut reconstructed,
+                    b_content.len(),
+                )?;
+
+                // Should match peer B's content
+                assert_eq!(b_content.as_bytes(), reconstructed.as_slice());
+
+                // Should be different from peer A's original content
+                assert_ne!(a_content.as_bytes(), reconstructed.as_slice());
 
                 Ok::<(), anyhow::Error>(())
             })

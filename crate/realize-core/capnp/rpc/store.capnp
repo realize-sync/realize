@@ -24,6 +24,21 @@ interface Store {
   # if the data changes while it's being read.
   # TODO: add option to check hash and file stability.
   read @2 (req: ReadRequest, cb: ReadCallback) -> ();
+
+  # Send a rsync signature for a range of a file and
+  # get back a delta.
+  rsync @3 (req: RsyncRequest) -> (res: RsyncResponse);
+}
+
+struct RsyncRequest {
+  arena @0: Text;
+  path @1: Text;
+  range @2: ByteRange;
+  sig @3: Data;
+}
+
+struct RsyncResponse {
+  delta @0: Data;
 }
 
 struct ReadRequest {
@@ -48,13 +63,13 @@ interface ReadCallback {
   #
   # If an error is detected, the stream ends with err set without having
   # read everything.
-  finish @1 (result: Result(ReadFinished, ReadError)) -> ();
+  finish @1 (result: Result(ReadFinished, IoError)) -> ();
 }
 
 struct ReadFinished {}
 
 # Read errors, loosely based on I/O errors for ease of conversion.
-struct ReadError {
+struct IoError {
   errno @0: Errno;
 
   enum Errno {
@@ -159,3 +174,7 @@ struct Uuid {
   hi @1: UInt64;
 }
 
+struct ByteRange {
+  start @0: UInt64;
+  end @1: UInt64;
+}
