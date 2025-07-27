@@ -494,22 +494,13 @@ impl Engine {
         match mark::get_mark(txn, &path)? {
             Mark::Watch => Ok(None),
             Mark::Keep | Mark::Own => {
-                let file_entry =
-                    match arena_cache::get_file_entry_for_path(txn, self.arena_root, &path) {
-                        Ok(e) => e,
-                        Err(_) => {
-                            return Ok(None);
-                        }
-                    };
-                match blob::local_availability(txn, &file_entry)? {
-                    LocalAvailability::Missing | LocalAvailability::Partial(_, _) => {
-                        Ok(Some(Job::Download(path, counter, file_entry.content.hash)))
-                    }
-                    LocalAvailability::Complete | LocalAvailability::Verified => {
-                        // TODO: verify if complete but unverified
-
-                        Ok(None)
-                    }
+                if let Ok(file_entry) =
+                    arena_cache::get_file_entry_for_path(txn, self.arena_root, &path)
+                    && blob::local_availability(txn, &file_entry)? != LocalAvailability::Verified
+                {
+                    Ok(Some(Job::Download(path, counter, file_entry.content.hash)))
+                } else {
+                    Ok(None)
                 }
             }
         }
@@ -1021,7 +1012,6 @@ mod tests {
         let fixture = EngineFixture::setup().await?;
         let foodir = Path::parse("foo")?;
         let barfile = Path::parse("foo/bar.txt")?;
-        let otherfile = Path::parse("foo/other.txt")?;
 
         fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
@@ -1030,6 +1020,32 @@ mod tests {
             let mut blob = fixture.acache.open_file(inode)?;
             blob.write_all(b"test").await?;
             blob.update_db().await?;
+        }
+
+        // The stream is created after downloading to be sure it sees
+        // the download.
+        let mut job_stream = fixture.engine.job_stream();
+
+        let job = next_with_timeout(&mut job_stream).await?;
+        assert_eq!(Some(Job::Download(barfile, 1, test_hash())), job);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_stream_file_to_keep_verified() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let foodir = Path::parse("foo")?;
+        let barfile = Path::parse("foo/bar.txt")?;
+        let otherfile = Path::parse("foo/other.txt")?;
+
+        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.add_file_to_cache(&barfile)?;
+        let (inode, _) = fixture.acache.lookup_path(&barfile)?;
+        {
+            let mut blob = fixture.acache.open_file(inode)?;
+            blob.write_all(b"test").await?;
+            blob.mark_verified().await?;
         }
 
         // The stream is created after downloading to be sure it sees
