@@ -46,8 +46,11 @@ impl RealWatcherBuilder {
     }
 
     /// Add multiple paths to exclude from watching.
-    pub fn exclude_all(mut self, paths: impl IntoIterator<Item = realize_types::Path>) -> Self {
-        self.exclude.extend(paths);
+    pub fn exclude_all<'a>(mut self, paths: impl Iterator<Item = &'a realize_types::Path>) -> Self {
+        for path in paths {
+            self.exclude.push(path.clone());
+        }
+
         self
     }
 
