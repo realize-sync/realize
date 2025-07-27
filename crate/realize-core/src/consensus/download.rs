@@ -352,6 +352,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn download_zero_length_file() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                testing::connect(&household_a, b).await?;
+
+                let path = fixture.write_file(b, "foobar", "").await?;
+                fixture.inner.wait_for_file_in_cache(a, "foobar").await?;
+
+                let mut progress = SimpleByteCountProgress::new();
+                assert_eq!(
+                    JobStatus::Done,
+                    download(
+                        fixture.inner.storage(a)?,
+                        &household_a,
+                        HouseholdFixture::test_arena(),
+                        &path,
+                        &hash::digest(""),
+                        &mut progress,
+                        CancellationToken::new(),
+                    )
+                    .await?,
+                );
+
+                let blob = fixture.open_file(a, "foobar").await?;
+                assert!(blob.local_availability().is_empty());
+
+                assert_eq!(
+                    LocalAvailability::Verified,
+                    fixture.local_availability(a, "foobar").await?
+                );
+
+                assert_eq!("", fixture.get_blob_content_as_string(a, "foobar").await?);
+
+                assert_eq!(vec![JobAction::Verify], progress.actions);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn download_from_b_partial() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
         fixture
