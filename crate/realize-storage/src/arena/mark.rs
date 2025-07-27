@@ -56,7 +56,7 @@ impl PathMarks {
     }
 
     /// Set the default mark for the arena.
-    pub fn set_root_mark(&self, mark: Mark) -> Result<(), StorageError> {
+    pub fn set_arena_mark(&self, mark: Mark) -> Result<(), StorageError> {
         self.set_mark_or_root(None, mark)
     }
 
@@ -281,7 +281,7 @@ mod tests {
         let fixture = Fixture::setup().await?;
 
         // Set root mark to Keep
-        fixture.marks.set_root_mark(Mark::Keep)?;
+        fixture.marks.set_arena_mark(Mark::Keep)?;
 
         // Verify root mark is returned for any path
         let path = Path::parse("some/file.txt")?;
@@ -290,7 +290,7 @@ mod tests {
         assert_eq!(mark, Mark::Keep);
 
         // Change root mark to Own
-        fixture.marks.set_root_mark(Mark::Own)?;
+        fixture.marks.set_arena_mark(Mark::Own)?;
         let mark = fixture.marks.get_mark(&path)?;
 
         assert_eq!(mark, Mark::Own);
@@ -341,7 +341,7 @@ mod tests {
         let fixture = Fixture::setup().await?;
 
         // Set root mark
-        fixture.marks.set_root_mark(Mark::Watch)?;
+        fixture.marks.set_arena_mark(Mark::Watch)?;
 
         // Set directory mark
         let dir_path = Path::parse("parent/child")?;
@@ -408,7 +408,7 @@ mod tests {
         let fixture = Fixture::setup().await?;
 
         // Set root mark
-        fixture.marks.set_root_mark(Mark::Keep)?;
+        fixture.marks.set_arena_mark(Mark::Keep)?;
 
         let file_path = Path::parse("dir/file.txt")?;
 
@@ -433,7 +433,7 @@ mod tests {
         let dir_path = Path::parse("test")?;
 
         // Set marks
-        fixture.marks.set_root_mark(Mark::Keep)?;
+        fixture.marks.set_arena_mark(Mark::Keep)?;
         fixture.marks.set_mark(&dir_path, Mark::Watch)?;
         fixture.marks.set_mark(&file_path, Mark::Own)?;
 
@@ -572,7 +572,7 @@ mod tests {
         fixture.clear_all_dirty()?;
 
         // Set root mark that changes the effective mark for all files
-        fixture.marks.set_root_mark(Mark::Keep)?;
+        fixture.marks.set_arena_mark(Mark::Keep)?;
 
         // Check that all files are marked dirty
         for file in &index_files {
@@ -772,11 +772,11 @@ mod tests {
         }
 
         // Set root mark
-        fixture.marks.set_root_mark(Mark::Keep)?;
+        fixture.marks.set_arena_mark(Mark::Keep)?;
         fixture.clear_all_dirty()?;
 
         // Clear root mark (set to default Watch)
-        fixture.marks.set_root_mark(Mark::Watch)?;
+        fixture.marks.set_arena_mark(Mark::Watch)?;
 
         // Check that all files are marked dirty (effective mark changed from Keep to Watch)
         for file in &files_in_index {

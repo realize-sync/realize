@@ -169,7 +169,7 @@ impl Storage {
         mark: Mark,
     ) -> Result<(), StorageError> {
         let this = Arc::clone(&self);
-        task::spawn_blocking(move || this.arena_storage(arena)?.pathmarks.set_root_mark(mark))
+        task::spawn_blocking(move || this.arena_storage(arena)?.pathmarks.set_arena_mark(mark))
             .await?
     }
 
