@@ -1120,9 +1120,9 @@ mod tests {
 
         let foo = realize_types::Path::parse("a/b/c/foo")?;
         let bar = realize_types::Path::parse("a/b/d/bar")?;
-        let foo_child = fixture.root.child("foo");
+        let foo_child = fixture.root.child("a/b/c/foo");
         foo_child.write_str("foo")?;
-        let bar_child = fixture.root.child("a/b/c/bar");
+        let bar_child = fixture.root.child("a/b/d/bar");
         bar_child.write_str("bar")?;
 
         index
