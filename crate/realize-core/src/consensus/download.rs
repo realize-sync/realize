@@ -228,8 +228,12 @@ mod tests {
     use super::*;
     use crate::consensus::progress::testing::{NoOpByteCountProgress, SimpleByteCountProgress};
     use crate::rpc::testing::{self, HouseholdFixture};
+    use rand::rngs::SmallRng;
+    use rand::{RngCore, SeedableRng};
     use realize_storage::Blob;
     use realize_storage::utils::hash;
+    use tokio::fs::File;
+    use tokio::io::{BufReader, BufWriter};
     use tokio::{fs, io::AsyncReadExt};
 
     struct Fixture {
@@ -258,6 +262,48 @@ mod tests {
             fs::write(realpath, content).await?;
 
             Ok(path)
+        }
+
+        async fn write_large_file(
+            &self,
+            peer: Peer,
+            path_str: &str,
+            seed: u64,
+            size_kb: u64,
+        ) -> anyhow::Result<(Path, Hash)> {
+            let root = self.inner.arena_root(peer);
+            let path = Path::parse(path_str)?;
+            let realpath = path.within(&root);
+
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let mut file = BufWriter::new(File::create(realpath).await?);
+            let mut hasher = hash::running();
+            let mut bytes = [0; 1024];
+            for _ in 0..size_kb {
+                rng.fill_bytes(&mut bytes);
+                file.write_all(&bytes).await?;
+                hasher.update(&bytes);
+            }
+            file.flush().await?;
+
+            let hash = hasher.finalize();
+
+            Ok((path, hash))
+        }
+
+        async fn hash_blob(&self, file: Blob) -> anyhow::Result<Hash> {
+            let mut reader = BufReader::new(file);
+            let mut hasher = hash::running();
+            let mut buf = vec![0; 8 * 1024];
+            loop {
+                let n = reader.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[0..n])
+            }
+
+            Ok(hasher.finalize())
         }
 
         async fn open_file(&self, peer: Peer, path_str: &str) -> anyhow::Result<Blob> {
@@ -827,6 +873,51 @@ mod tests {
                     ],
                     progress.actions
                 );
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_large_file() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                testing::connect(&household_a, b).await?;
+
+                let (path, hash) = fixture.write_large_file(b, "large", 433, 1024).await?;
+                fixture.inner.wait_for_file_in_cache(a, "large").await?;
+
+                assert_eq!(
+                    JobStatus::Done,
+                    download(
+                        fixture.inner.storage(a)?,
+                        &household_a,
+                        HouseholdFixture::test_arena(),
+                        &path,
+                        &hash,
+                        &mut NoOpByteCountProgress,
+                        CancellationToken::new(),
+                    )
+                    .await?,
+                );
+
+                assert_eq!(
+                    LocalAvailability::Verified,
+                    fixture.local_availability(a, "large").await?
+                );
+
+                let blob = fixture.open_file(a, "large").await?;
+                assert_eq!(hash, *blob.hash());
+                assert_eq!(hash, fixture.hash_blob(blob).await?);
 
                 Ok::<(), anyhow::Error>(())
             })
