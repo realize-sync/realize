@@ -28,6 +28,8 @@ struct FileTableEntry {
   metadata @0: FileMetadata;
   content @1: FileContent;
   parent @2: UInt64;
+  hasOutdatedVersions @3: Bool;
+  outdatedVersions @4: List(Data);
 }
 
 struct FileContent {
