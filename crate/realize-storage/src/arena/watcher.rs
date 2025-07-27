@@ -16,17 +16,58 @@ use tokio::sync::mpsc;
 use tokio::task;
 
 /// Watch an arena directory and update its index.
+///
+/// This is created with `RealWatcher::builder()`
 pub struct RealWatcher {
     shutdown_tx: broadcast::Sender<()>,
 }
 
-impl RealWatcher {
-    /// Spawn the worker.
+/// Builder for creating a RealWatcher with convenient configuration options.
+pub struct RealWatcherBuilder {
+    root: std::path::PathBuf,
+    index: RealIndexAsync,
+    exclude: Vec<realize_types::Path>,
+}
+
+impl RealWatcherBuilder {
+    /// Create a new builder for watching the given root directory with the specified index.
+    pub fn new(root: &std::path::Path, index: RealIndexAsync) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            index,
+            exclude: Vec::new(),
+        }
+    }
+
+    /// Add a single path to exclude from watching.
+    pub fn exclude(mut self, path: &realize_types::Path) -> Self {
+        self.exclude.push(path.clone());
+        self
+    }
+
+    /// Add multiple paths to exclude from watching.
+    pub fn exclude_all(mut self, paths: impl IntoIterator<Item = realize_types::Path>) -> Self {
+        self.exclude.extend(paths);
+        self
+    }
+
+    /// Spawn the watcher with the current configuration.
     ///
     /// To stop the background work cleanly, call [RealWatcher::shutdown].
     ///
     /// Background work is also stopped at some point after the instance is dropped.
-    pub async fn spawn(
+    pub async fn spawn(self) -> anyhow::Result<RealWatcher> {
+        RealWatcher::spawn(&self.root, self.exclude, self.index).await
+    }
+}
+
+impl RealWatcher {
+    /// Create a builder for configuring and spawning a RealWatcher.
+    pub fn builder(root: &std::path::Path, index: RealIndexAsync) -> RealWatcherBuilder {
+        RealWatcherBuilder::new(root, index)
+    }
+
+    async fn spawn(
         root: &std::path::Path,
         exclude: Vec<realize_types::Path>,
         index: RealIndexAsync,
@@ -601,7 +642,11 @@ mod tests {
         }
 
         async fn watch(&self) -> anyhow::Result<RealWatcher> {
-            RealWatcher::spawn(self.root.path(), self.exclude.clone(), self.index.clone()).await
+            let mut builder = RealWatcher::builder(self.root.path(), self.index.clone());
+            for path in &self.exclude {
+                builder = builder.exclude(path);
+            }
+            builder.spawn().await
         }
 
         /// Wait for the given history entry to have been written.

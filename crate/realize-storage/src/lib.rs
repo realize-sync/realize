@@ -110,7 +110,11 @@ impl Storage {
                 .collect::<Vec<_>>();
 
             log::debug!("Watch {root:?}, excluding {exclude:?}");
-            let watcher = RealWatcher::spawn(root, exclude, index.clone()).await?;
+            let mut builder = RealWatcher::builder(root, index.clone());
+            for path in &exclude {
+                builder = builder.exclude(path);
+            }
+            let watcher = builder.spawn().await?;
             let arena_root = cache.arena_root(arena)?;
             let engine = Engine::new(
                 arena,
