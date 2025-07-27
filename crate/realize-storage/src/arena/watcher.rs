@@ -1,5 +1,7 @@
 #![allow(dead_code)] // work in progress
 
+use crate::utils::hash;
+
 use super::hasher::{self, HashResult, Hasher};
 use super::index::RealIndexAsync;
 use futures::StreamExt as _;
@@ -27,6 +29,7 @@ pub struct RealWatcherBuilder {
     root: std::path::PathBuf,
     index: RealIndexAsync,
     exclude: Vec<realize_types::Path>,
+    catchup: bool,
 }
 
 impl RealWatcherBuilder {
@@ -36,7 +39,15 @@ impl RealWatcherBuilder {
             root: root.to_path_buf(),
             index,
             exclude: Vec::new(),
+            catchup: false,
         }
+    }
+
+    /// Look at existing files at startup, to catch up to any missed changes.
+    pub fn with_catchup(mut self) -> Self {
+        self.catchup = true;
+
+        self
     }
 
     /// Add a single path to exclude from watching.
@@ -60,7 +71,7 @@ impl RealWatcherBuilder {
     ///
     /// Background work is also stopped at some point after the instance is dropped.
     pub async fn spawn(self) -> anyhow::Result<RealWatcher> {
-        RealWatcher::spawn(&self.root, self.exclude, self.index).await
+        RealWatcher::spawn(&self.root, self.exclude, self.index, self.catchup).await
     }
 }
 
@@ -74,6 +85,7 @@ impl RealWatcher {
         root: &std::path::Path,
         exclude: Vec<realize_types::Path>,
         index: RealIndexAsync,
+        catchup: bool,
     ) -> anyhow::Result<Self> {
         let root = fs::canonicalize(&root).await?;
         let arena = index.arena().clone();
@@ -107,32 +119,34 @@ impl RealWatcher {
             exclude,
         });
 
-        task::spawn({
-            let worker = Arc::clone(&worker);
-            let watch_tx = watch_tx.clone();
-            let shutdown_rx = shutdown_tx.subscribe();
-            async move {
-                if let Err(err) = worker
-                    .catchup_removed_or_modified(watch_tx, shutdown_rx)
-                    .await
-                {
-                    log::debug!(
-                        "[{}] Catchup for modified or removed files failed: {err}",
-                        arena
-                    );
+        if catchup {
+            task::spawn({
+                let worker = Arc::clone(&worker);
+                let watch_tx = watch_tx.clone();
+                let shutdown_rx = shutdown_tx.subscribe();
+                async move {
+                    if let Err(err) = worker
+                        .catchup_removed_or_modified(watch_tx, shutdown_rx)
+                        .await
+                    {
+                        log::debug!(
+                            "[{}] Catchup for modified or removed files failed: {err}",
+                            arena
+                        );
+                    }
                 }
-            }
-        });
-        task::spawn({
-            let worker = Arc::clone(&worker);
-            let watch_tx = watch_tx.clone();
-            let shutdown_rx = shutdown_tx.subscribe();
-            async move {
-                if let Err(err) = worker.catchup_added(watch_tx, shutdown_rx).await {
-                    log::debug!("[{}] Catchup for added files failed: {err}", arena);
+            });
+            task::spawn({
+                let worker = Arc::clone(&worker);
+                let watch_tx = watch_tx.clone();
+                let shutdown_rx = shutdown_tx.subscribe();
+                async move {
+                    if let Err(err) = worker.catchup_added(watch_tx, shutdown_rx).await {
+                        log::debug!("[{}] Catchup for added files failed: {err}", arena);
+                    }
                 }
-            }
-        });
+            });
+        }
         task::spawn({
             let worker = Arc::clone(&worker);
             let shutdown_rx = shutdown_tx.subscribe();
@@ -379,11 +393,14 @@ impl RealWatcherWorker {
                 let realpath = ev.paths.last().ok_or(anyhow::anyhow!("No path in event"))?;
                 if let Ok(m) = fs::symlink_metadata(realpath).await
                     && m.is_file()
-                    && m.nlink() > 1
                 {
-                    // Create for hard links is normally not followed
-                    // by a Modify; index it immediately.
-                    self.file_created_or_modified(realpath, &m).await?;
+                    // If not a hard link, not a rename and len > 0,
+                    // this means that writing on the file has already
+                    // started, so there's no point in creating an
+                    // entry; we'll get a Modify event soon enough.
+                    if m.nlink() > 1 || m.len() == 0 {
+                        self.file_created_or_modified(realpath, &m).await?;
+                    }
                 }
             }
 
@@ -551,8 +568,15 @@ impl RealWatcherWorker {
         {
             return Ok(());
         }
-        log::debug!("[{}] Requesting hash of {path}", self.index.arena());
-        self.hasher.request_hash(realpath.to_path_buf(), path);
+        if m.len() == 0 {
+            log::debug!("[{}] Empty file at {path}", self.index.arena());
+            self.index
+                .add_file(&path, 0, &UnixTime::mtime(&m), hash::empty())
+                .await?;
+        } else {
+            log::debug!("[{}] Requesting hash of {path}", self.index.arena());
+            self.hasher.request_hash(realpath.to_path_buf(), path);
+        }
         Ok(())
     }
 
@@ -644,12 +668,24 @@ mod tests {
             self.exclude.push(path);
         }
 
+        /// Catchup to any previous changes and watch for anything new.
+        async fn catchup_and_watch(&self) -> anyhow::Result<RealWatcher> {
+            RealWatcher::builder(self.root.path(), self.index.clone())
+                .with_catchup()
+                .exclude_all(self.exclude.iter())
+                .spawn()
+                .await
+        }
+
+        /// Watch for changes; don't do any catchup.
+        ///
+        /// Note that filesystem modifications made just before this
+        /// is called might still get reported.
         async fn watch(&self) -> anyhow::Result<RealWatcher> {
-            let mut builder = RealWatcher::builder(self.root.path(), self.index.clone());
-            for path in &self.exclude {
-                builder = builder.exclude(path);
-            }
-            builder.spawn().await
+            RealWatcher::builder(self.root.path(), self.index.clone())
+                .exclude_all(self.exclude.iter())
+                .spawn()
+                .await
         }
 
         /// Wait for the given history entry to have been written.
@@ -674,7 +710,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let watcher = fixture.watch().await?;
+        let watcher = fixture.catchup_and_watch().await?;
 
         watcher.shutdown().await?;
 
@@ -1030,7 +1066,7 @@ mod tests {
         fixture.root.child("a/b/c").create_dir_all()?;
         fixture.root.child("a/b/c/bar").write_str("bar")?;
 
-        let _watcher = fixture.watch().await?;
+        let _watcher = fixture.catchup_and_watch().await?;
 
         fixture.wait_for_history_event(2).await?;
         let foo = realize_types::Path::parse("foo")?;
@@ -1052,7 +1088,7 @@ mod tests {
         index.add_file(&foo, 4, &mtime, Hash([1; 32])).await?;
         index.add_file(&bar, 4, &mtime, Hash([2; 32])).await?;
 
-        let _watcher = fixture.watch().await?;
+        let _watcher = fixture.catchup_and_watch().await?;
 
         fixture.wait_for_history_event(4).await?;
         assert!(!index.has_file(&foo).await?);
@@ -1092,7 +1128,7 @@ mod tests {
 
         bar_child.write_str("barbar")?;
 
-        let _watcher = fixture.watch().await?;
+        let _watcher = fixture.catchup_and_watch().await?;
 
         fixture.wait_for_history_event(3).await?;
 
@@ -1151,7 +1187,7 @@ mod tests {
         make_inaccessible(foo_child.path()).await?;
         make_inaccessible(bar_child.path()).await?;
 
-        let _watcher = fixture.watch().await?;
+        let _watcher = fixture.catchup_and_watch().await?;
 
         fixture.wait_for_history_event(4).await?;
 
@@ -1192,7 +1228,7 @@ mod tests {
 
         make_inaccessible(fixture.root.child("a").path()).await?;
 
-        let _watcher = match fixture.watch().await {
+        let _watcher = match fixture.catchup_and_watch().await {
             Ok(w) => w,
             Err(err) => {
                 // The inotify backend won't start if a subdirectory
@@ -1262,7 +1298,7 @@ mod tests {
         )
         .await?;
 
-        let _watcher = fixture.watch().await?;
+        let _watcher = fixture.catchup_and_watch().await?;
 
         fixture.wait_for_history_event(2).await?;
         let foo = realize_types::Path::parse("foo")?;
@@ -1333,7 +1369,7 @@ mod tests {
         fs::remove_file(bar_child.path()).await?;
         fs::symlink(foo_child.path(), bar_child.path()).await?;
 
-        let _watcher = fixture.watch().await?;
+        let _watcher = fixture.catchup_and_watch().await?;
 
         fixture.wait_for_history_event(3).await?;
         assert!(index.has_file(&foo).await?);
@@ -1365,7 +1401,7 @@ mod tests {
         fs::rename(dir.path(), newdir.path()).await?;
         fs::symlink(newdir.path(), dir.path()).await?;
 
-        let _watcher = fixture.watch().await?;
+        let _watcher = fixture.catchup_and_watch().await?;
 
         fixture.wait_for_history_event(3).await?;
         let foo_in_b = realize_types::Path::parse("b/foo")?;
@@ -1452,7 +1488,7 @@ mod tests {
         fixture.root.child("a/b/excluded_too").write_str("test")?;
         fixture.root.child("not_excluded").write_str("test")?;
 
-        let _watcher = fixture.watch().await?;
+        let _watcher = fixture.catchup_and_watch().await?;
 
         fixture.wait_for_history_event(1).await?;
         let not_excluded = realize_types::Path::parse("not_excluded")?;
@@ -1492,7 +1528,7 @@ mod tests {
             )
             .await?;
 
-        let _watcher = fixture.watch().await?;
+        let _watcher = fixture.catchup_and_watch().await?;
 
         fixture.wait_for_history_event(4).await?;
         assert!(!index.has_file(&excluded).await?);
@@ -1507,7 +1543,7 @@ mod tests {
         fixture.exclude(realize_types::Path::parse("a/b")?);
         fixture.exclude(realize_types::Path::parse("excluded")?);
 
-        let _watcher = fixture.watch().await?;
+        let _watcher = fixture.catchup_and_watch().await?;
 
         fixture.root.child("excluded").write_str("test")?;
         fixture.root.child("a/b/also_excluded").write_str("test")?;

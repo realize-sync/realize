@@ -33,6 +33,13 @@ pub fn digest(data: impl AsRef<[u8]>) -> Hash {
     Hash(Blake2b256::digest(data).into())
 }
 
+/// Produce a hash for an empty buffer.
+///
+/// TODO: optimize; this is constant
+pub fn empty() -> Hash {
+    digest(b"")
+}
+
 /// Produce a hash by appending multiple buffers.
 ///
 ///
