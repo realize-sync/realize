@@ -6,6 +6,7 @@ use arena::mark::PathMarks;
 use arena::watcher::RealWatcher;
 use config::StorageConfig;
 use futures::Stream;
+use global::db::GlobalDatabase;
 use realize_types::{self, Arena, ByteRange, Delta, Hash, Path, Peer, Signature};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -79,7 +80,7 @@ impl Storage {
         }
 
         let cache = UnrealCacheAsync::with_db(
-            redb_utils::open(&config.cache.db).await?,
+            GlobalDatabase::new(redb_utils::open(&config.cache.db).await?)?,
             arena_dbs
                 .iter()
                 .map(|(arena, (config, db, dirty_paths))| {

@@ -524,7 +524,7 @@ mod tests {
     use crate::arena::arena_cache::ArenaCache;
     use crate::global::cache::UnrealCacheBlocking;
     use crate::utils::redb_utils;
-    use crate::{DirtyPaths, Inode, Notification, UnrealCacheAsync};
+    use crate::{DirtyPaths, GlobalDatabase, Inode, Notification, UnrealCacheAsync};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Path, Peer, UnixTime};
@@ -565,7 +565,8 @@ mod tests {
         async fn setup_with_arena(arena: Arena) -> anyhow::Result<Fixture> {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
-            let mut cache = UnrealCacheBlocking::new(redb_utils::in_memory()?)?;
+            let mut cache =
+                UnrealCacheBlocking::new(GlobalDatabase::new(redb_utils::in_memory()?)?)?;
 
             let child = tempdir.child(format!("{arena}-cache.db"));
             let blob_dir = tempdir.child(format!("{arena}/blobs"));
@@ -1269,7 +1270,10 @@ mod tests {
 
         // Verify the content was moved correctly
         let moved_content = std::fs::read_to_string(&dest_path)?;
-        assert_eq!("test content for hash verification", moved_content.trim_end_matches('\0'));
+        assert_eq!(
+            "test content for hash verification",
+            moved_content.trim_end_matches('\0')
+        );
 
         Ok(())
     }

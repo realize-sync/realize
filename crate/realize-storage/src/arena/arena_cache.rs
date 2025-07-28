@@ -999,7 +999,9 @@ mod tests {
     use crate::global::cache::{UnrealCacheAsync, UnrealCacheBlocking};
     use crate::global::types::{FileMetadata, InodeAssignment};
     use crate::utils::redb_utils;
-    use crate::{ArenaDatabase, DirtyPaths, Inode, LocalAvailability, StorageError};
+    use crate::{
+        ArenaDatabase, DirtyPaths, GlobalDatabase, Inode, LocalAvailability, StorageError,
+    };
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Hash, Path, Peer, UnixTime};
@@ -1042,7 +1044,8 @@ mod tests {
         async fn setup_with_arena(arena: Arena) -> anyhow::Result<Fixture> {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
-            let mut cache = UnrealCacheBlocking::new(redb_utils::in_memory()?)?;
+            let mut cache =
+                UnrealCacheBlocking::new(GlobalDatabase::new(redb_utils::in_memory()?)?)?;
 
             let child = tempdir.child(format!("{arena}-cache.db"));
             let blob_dir = tempdir.child(format!("{arena}/blobs"));

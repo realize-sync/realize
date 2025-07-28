@@ -1,5 +1,5 @@
 use crate::utils::redb_utils;
-use crate::{ArenaDatabase, DirtyPaths};
+use crate::{ArenaDatabase, DirtyPaths, GlobalDatabase};
 
 use super::config::{ArenaConfig, CacheConfig, StorageConfig};
 use super::{Storage, UnrealCacheAsync};
@@ -22,7 +22,9 @@ where
             dirty_paths,
         ));
     }
-    let cache = UnrealCacheAsync::with_db(redb_utils::in_memory()?, arena_dbs).await?;
+    let cache =
+        UnrealCacheAsync::with_db(GlobalDatabase::new(redb_utils::in_memory()?)?, arena_dbs)
+            .await?;
 
     Ok(cache)
 }
