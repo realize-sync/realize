@@ -177,16 +177,17 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::arena::arena_cache::ArenaCache;
+    use crate::GlobalDatabase;
     use crate::arena::engine;
     use crate::arena::index::RealIndexBlocking;
     use crate::utils::redb_utils;
+    use crate::{InodeAllocator, arena::arena_cache::ArenaCache};
     use realize_types::{Arena, Hash, UnixTime};
 
     struct Fixture {
         arena: Arena,
         db: Arc<ArenaDatabase>,
-        acache: ArenaCache,
+        acache: Arc<ArenaCache>,
         index: RealIndexBlocking,
         marks: PathMarks,
         dirty_paths: Arc<DirtyPaths>,
@@ -199,14 +200,16 @@ mod tests {
             let arena = Arena::from("test");
             let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-            let arena_root = Inode(300);
+            let allocator =
+                InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
             let acache = ArenaCache::new(
                 arena,
-                arena_root,
+                allocator,
                 Arc::clone(&db),
-                PathBuf::from("/dev/null"),
+                &PathBuf::from("/dev/null"),
                 Arc::clone(&dirty_paths),
             )?;
+            let arena_root = acache.arena_root();
             let index = RealIndexBlocking::new(arena, Arc::clone(&db), Arc::clone(&dirty_paths))?;
             let marks = PathMarks::new(Arc::clone(&db), arena_root, Arc::clone(&dirty_paths))?;
 
@@ -257,8 +260,7 @@ mod tests {
                 hash: Hash([2; 32]),
             };
 
-            self.acache
-                .update(test_peer, notification, || Ok((Inode(1000), Inode(2000))))?;
+            self.acache.update(test_peer, notification)?;
             Ok(())
         }
     }

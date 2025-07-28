@@ -1,3 +1,4 @@
+use arena::arena_cache::ArenaCache;
 use arena::db::ArenaDatabase;
 use arena::engine::{DirtyPaths, Engine};
 use arena::index::RealIndexAsync;
@@ -7,6 +8,7 @@ use arena::watcher::RealWatcher;
 use config::StorageConfig;
 use futures::Stream;
 use global::db::GlobalDatabase;
+use global::inode_allocator::InodeAllocator;
 use realize_types::{self, Arena, ByteRange, Delta, Hash, Path, Peer, Signature};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -49,6 +51,10 @@ struct ArenaStorage {
     /// The arena's index, kept up-to-date by the watcher.
     index: RealIndexAsync,
 
+    /// The subset of the cache that manages file in this arena.
+    #[allow(dead_code)] // in progress
+    arena_cache: Arc<ArenaCache>,
+
     /// Arena root on the filesystem.
     root: PathBuf,
 
@@ -70,32 +76,26 @@ impl Storage {
         let mut indexed_arenas = HashMap::new();
         let exclude = build_exclude(&config);
 
-        // Create databases in advance, as the same database may be
-        // passed to multiple different subsystems.
-        let mut arena_dbs = HashMap::new();
+        let globaldb = GlobalDatabase::new(redb_utils::open(&config.cache.db).await?)?;
+        let allocator = InodeAllocator::new(
+            Arc::clone(&globaldb),
+            config.arenas.keys().map(|a| *a).collect::<Vec<_>>(),
+        )?;
+        let mut arena_caches = vec![];
+
         for (arena, arena_config) in &config.arenas {
+            let arena = *arena;
             let db = ArenaDatabase::new(redb_utils::open(&arena_config.db).await?)?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-            arena_dbs.insert(*arena, (arena_config, db, dirty_paths));
-        }
+            let arena_cache = ArenaCache::new(
+                arena,
+                Arc::clone(&allocator),
+                Arc::clone(&db),
+                &arena_config.blob_dir,
+                Arc::clone(&dirty_paths),
+            )?;
+            arena_caches.push(Arc::clone(&arena_cache));
 
-        let cache = UnrealCacheAsync::with_db(
-            GlobalDatabase::new(redb_utils::open(&config.cache.db).await?)?,
-            arena_dbs
-                .iter()
-                .map(|(arena, (config, db, dirty_paths))| {
-                    (
-                        *arena,
-                        Arc::clone(db),
-                        config.blob_dir.to_path_buf(),
-                        Arc::clone(dirty_paths),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )
-        .await?;
-
-        for (arena, (arena_config, db, dirty_paths)) in arena_dbs {
             let root = match arena_config.root.as_ref() {
                 Some(p) => p,
                 None => {
@@ -115,7 +115,7 @@ impl Storage {
                 .exclude_all(exclude.iter())
                 .spawn()
                 .await?;
-            let arena_root = cache.arena_root(arena)?;
+            let arena_root = arena_cache.arena_root();
             let engine = Engine::new(
                 arena,
                 Arc::clone(&db),
@@ -128,6 +128,7 @@ impl Storage {
                 arena,
                 ArenaStorage {
                     index,
+                    arena_cache,
                     root: root.to_path_buf(),
                     engine,
                     pathmarks,
@@ -135,6 +136,8 @@ impl Storage {
                 },
             );
         }
+
+        let cache = UnrealCacheAsync::with_db(globaldb, allocator, arena_caches).await?;
 
         Ok(Arc::new(Self {
             cache,

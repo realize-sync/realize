@@ -1,7 +1,6 @@
 use super::blob::{self, Blobstore};
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
 use super::types::LocalAvailability;
-use crate::Blob;
 use crate::arena::engine::DirtyPaths;
 use crate::arena::notifier::{Notification, Progress};
 use crate::global::types::{
@@ -10,11 +9,11 @@ use crate::global::types::{
 };
 use crate::types::BlobId;
 use crate::utils::holder::Holder;
+use crate::{Blob, InodeAllocator};
 use crate::{Inode, StorageError};
 use realize_types::{Arena, ByteRanges, Hash, Path, Peer, UnixTime};
 use redb::ReadableTable;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 /// A per-arena cache of remote files.
@@ -25,6 +24,7 @@ pub(crate) struct ArenaCache {
     arena: Arena,
     arena_root: Inode,
     db: Arc<ArenaDatabase>,
+    allocator: Arc<InodeAllocator>,
     blobstore: Arc<Blobstore>,
     dirty_paths: Arc<DirtyPaths>,
 }
@@ -33,20 +33,31 @@ impl ArenaCache {
     /// Create a new ArenaUnrealCacheBlocking from an arena, root inode, database, and blob directory.
     pub(crate) fn new(
         arena: Arena,
-        arena_root: Inode,
+        allocator: Arc<InodeAllocator>,
         db: Arc<ArenaDatabase>,
-        blob_dir: PathBuf,
+        blob_dir: &std::path::Path,
         dirty_paths: Arc<DirtyPaths>,
-    ) -> Result<Self, StorageError> {
+    ) -> Result<Arc<Self>, StorageError> {
         let blobstore = Blobstore::new(Arc::clone(&db), blob_dir)?;
-
-        Ok(Self {
+        let arena_root = allocator
+            .arena_root(arena)
+            .ok_or_else(|| StorageError::UnknownArena(arena))?;
+        Ok(Arc::new(Self {
             arena,
             arena_root,
+            allocator,
             db,
             blobstore,
             dirty_paths,
-        })
+        }))
+    }
+
+    pub(crate) fn arena(&self) -> Arena {
+        self.arena
+    }
+
+    pub(crate) fn arena_root(&self) -> Inode {
+        self.arena_root
     }
 
     pub(crate) fn lookup(
@@ -104,7 +115,6 @@ impl ArenaCache {
         &self,
         peer: Peer,
         notification: Notification,
-        alloc_inode_range: impl Fn() -> Result<(Inode, Inode), StorageError>,
     ) -> Result<(), StorageError> {
         log::debug!("notification from {peer}: {notification:?}");
         // UnrealCacheBlocking::update, is responsible for dispatching properly
@@ -124,7 +134,7 @@ impl ArenaCache {
 
                 let mut file_table = txn.cache_file_table()?;
                 let (parent_inode, file_inode) =
-                    do_create_file(&txn, self.arena_root, &path, &alloc_inode_range)?;
+                    do_create_file(&txn, self.arena_root, &path, &|| self.allocate_inode(&txn))?;
                 if !get_file_entry(&file_table, file_inode, Some(peer))?.is_some() {
                     let entry = FileTableEntry::new(path, size, mtime, hash, parent_inode);
                     self.do_write_file_entry(&mut file_table, file_inode, peer, &entry)?;
@@ -150,7 +160,7 @@ impl ArenaCache {
                 do_update_last_seen_notification(&txn, peer, index)?;
 
                 let (parent_inode, file_inode) =
-                    do_create_file(&txn, self.arena_root, &path, &alloc_inode_range)?;
+                    do_create_file(&txn, self.arena_root, &path, &|| self.allocate_inode(&txn))?;
 
                 let mut file_table = txn.cache_file_table()?;
                 let entry = FileTableEntry::new(path, size, mtime, hash, parent_inode);
@@ -191,7 +201,7 @@ impl ArenaCache {
                 ..
             } => {
                 let (parent_inode, file_inode) =
-                    do_create_file(&txn, self.arena_root, &path, &alloc_inode_range)?;
+                    do_create_file(&txn, self.arena_root, &path, &|| self.allocate_inode(&txn))?;
 
                 do_unmark_peer_file(&txn, peer, file_inode)?;
 
@@ -535,6 +545,12 @@ impl ArenaCache {
     ) -> Result<(), StorageError> {
         self.blobstore.extend_local_availability(blob_id, new_range)
     }
+
+    /// Allocate a new inode, extending the range if necessary.
+    fn allocate_inode(&self, txn: &ArenaWriteTransaction) -> Result<Inode, StorageError> {
+        self.allocator
+            .allocate_arena_inode(&mut txn.cache_current_inode_range_table()?, self.arena)
+    }
 }
 
 /// Mark files within the cache dirty.
@@ -789,22 +805,20 @@ fn do_create_file(
     txn: &ArenaWriteTransaction,
     arena_root: Inode,
     path: &Path,
-    alloc_inode_range: &impl Fn() -> Result<(Inode, Inode), StorageError>,
+    alloc_inode: &impl Fn() -> Result<Inode, StorageError>,
 ) -> Result<(Inode, Inode), StorageError> {
     let mut dir_table = txn.cache_directory_table()?;
-    let mut current_range_table = txn.cache_current_inode_range_table()?;
     let filename = path.name();
     let parent_inode = do_mkdirs(
-        &mut current_range_table,
         &mut dir_table,
         arena_root,
         path.parent().as_ref(),
-        alloc_inode_range,
+        alloc_inode,
     )?;
     let dir_entry = get_dir_entry(&dir_table, parent_inode, filename)?;
     let file_inode = match dir_entry {
         None => {
-            let new_inode = alloc_inode(&mut current_range_table, alloc_inode_range)?;
+            let new_inode = (alloc_inode)()?;
             add_dir_entry(
                 &mut dir_table,
                 parent_inode,
@@ -832,11 +846,10 @@ fn do_create_file(
 ///
 /// Returns the inode of the directory pointed to by the path.
 pub(crate) fn do_mkdirs(
-    current_range_table: &mut redb::Table<(), (Inode, Inode)>,
     dir_table: &mut redb::Table<'_, (Inode, &str), Holder<DirTableEntry>>,
     root_inode: Inode,
     path: Option<&Path>,
-    alloc_inode_range: &impl Fn() -> Result<(Inode, Inode), StorageError>,
+    alloc_inode: &impl Fn() -> Result<Inode, StorageError>,
 ) -> Result<Inode, StorageError> {
     log::debug!("mkdirs {root_inode} {path:?}");
     let mut current = root_inode;
@@ -850,7 +863,7 @@ pub(crate) fn do_mkdirs(
             entry.inode
         } else {
             log::debug!("add {component} in {current}");
-            let new_inode = alloc_inode(current_range_table, alloc_inode_range)?;
+            let new_inode = (alloc_inode)()?;
             add_dir_entry(
                 dir_table,
                 current,
@@ -867,7 +880,7 @@ pub(crate) fn do_mkdirs(
 }
 
 /// Find the file or directory pointed to by the given path.
-fn do_lookup_path(
+pub(crate) fn do_lookup_path(
     dir_table: &impl redb::ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
     root_inode: Inode,
     path: Option<&Path>,
@@ -925,41 +938,6 @@ pub(crate) fn add_dir_entry(
     Ok(())
 }
 
-/// Allocate a new inode for an arena.
-///
-/// This function allocates a new inode from the arena's current range.
-/// If the arena has no range or the current range is exhausted,
-/// it allocates a new range.
-///
-/// Returns the allocated inode.
-pub(crate) fn alloc_inode(
-    current_range_table: &mut redb::Table<'_, (), (Inode, Inode)>,
-    alloc_inode_range: impl Fn() -> Result<(Inode, Inode), StorageError>,
-) -> Result<Inode, StorageError> {
-    let current_range = match current_range_table.get(())? {
-        Some(value) => {
-            let (current, end) = value.value();
-            Some((current, end))
-        }
-        None => None,
-    };
-    match current_range {
-        Some((current, end)) if (current.plus(1)) < end => {
-            // We have inodes available in the current range
-            let inode = current.plus(1);
-            current_range_table.insert((), (inode, end))?;
-            Ok(inode)
-        }
-        _ => {
-            // Need to allocate a new range
-            let (start, end) = alloc_inode_range()?;
-            let inode = start;
-            current_range_table.insert((), (start, end))?;
-            Ok(inode)
-        }
-    }
-}
-
 fn do_mark_peer_files(txn: &ArenaWriteTransaction, peer: Peer) -> Result<(), StorageError> {
     let file_table = txn.cache_file_table()?;
     let mut pending_catchup_table = txn.cache_pending_catchup_table()?;
@@ -996,11 +974,11 @@ mod tests {
     use crate::arena::db::{ArenaReadTransaction, ArenaWriteTransaction};
     use crate::arena::engine;
     use crate::arena::notifier::Notification;
-    use crate::global::cache::{UnrealCacheAsync, UnrealCacheBlocking};
     use crate::global::types::{FileMetadata, InodeAssignment};
     use crate::utils::redb_utils;
     use crate::{
-        ArenaDatabase, DirtyPaths, GlobalDatabase, Inode, LocalAvailability, StorageError,
+        ArenaDatabase, DirtyPaths, GlobalDatabase, Inode, InodeAllocator, LocalAvailability,
+        StorageError,
     };
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
@@ -1035,8 +1013,8 @@ mod tests {
 
     struct Fixture {
         arena: Arena,
-        async_cache: UnrealCacheAsync,
-        cache: Arc<UnrealCacheBlocking>,
+        acache: Arc<ArenaCache>,
+        db: Arc<ArenaDatabase>,
         dirty_paths: Arc<DirtyPaths>,
         _tempdir: TempDir,
     }
@@ -1044,8 +1022,8 @@ mod tests {
         async fn setup_with_arena(arena: Arena) -> anyhow::Result<Fixture> {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
-            let mut cache =
-                UnrealCacheBlocking::new(GlobalDatabase::new(redb_utils::in_memory()?)?)?;
+            let allocator =
+                InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
 
             let child = tempdir.child(format!("{arena}-cache.db"));
             let blob_dir = tempdir.child(format!("{arena}/blobs"));
@@ -1054,67 +1032,53 @@ mod tests {
             }
             let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-            cache.add_arena(arena, db, blob_dir.to_path_buf(), Arc::clone(&dirty_paths))?;
-
-            let async_cache = cache.into_async();
-            let cache = async_cache.blocking();
+            let acache = ArenaCache::new(
+                arena,
+                allocator,
+                Arc::clone(&db),
+                blob_dir.path(),
+                Arc::clone(&dirty_paths),
+            )?;
 
             Ok(Self {
                 arena,
-                async_cache,
-                cache,
+                acache,
+                db,
                 dirty_paths,
                 _tempdir: tempdir,
             })
         }
 
-        fn arena_root(&self) -> anyhow::Result<Inode> {
-            Ok(self.cache.arena_root(self.arena)?)
-        }
-
-        fn arena_cache(&self) -> anyhow::Result<&ArenaCache> {
-            Ok(self.cache.arena_cache(self.arena)?)
+        fn arena_root(&self) -> Inode {
+            self.acache.arena_root()
         }
 
         fn begin_read(&self) -> anyhow::Result<ArenaReadTransaction> {
-            let acache = self.arena_cache()?;
-
-            Ok(acache.db.begin_read()?)
+            Ok(self.db.begin_read()?)
         }
 
         fn begin_write(&self) -> anyhow::Result<ArenaWriteTransaction> {
-            let acache = self.arena_cache()?;
-
-            Ok(acache.db.begin_write()?)
+            Ok(self.db.begin_write()?)
         }
 
         fn clear_dirty(&self) -> anyhow::Result<()> {
-            let acache = self.arena_cache()?;
-
-            let txn = acache.db.begin_write()?;
+            let txn = self.db.begin_write()?;
             while engine::take_dirty(&txn)?.is_some() {}
             txn.commit()?;
 
             Ok(())
         }
 
-        fn parent_dir_mtime(&self, arena: Arena, path: &Path) -> anyhow::Result<UnixTime> {
-            let arena_root = self.cache.arena_root(arena).expect("arena was added");
-            match path.parent() {
-                None => Ok(self.cache.dir_mtime(arena_root)?),
-                Some(path) => {
-                    let (inode, _) = self.cache.lookup_path(arena, &path)?;
-
-                    Ok(self.cache.dir_mtime(inode)?)
-                }
-            }
+        fn dir_mtime(&self, path: &Path) -> anyhow::Result<UnixTime> {
+            let (inode, _) = self.acache.lookup_path(&path)?;
+            Ok(self.acache.dir_mtime(inode)?)
         }
 
         fn add_file(&self, path: &Path, size: u64, mtime: &UnixTime) -> anyhow::Result<()> {
-            self.cache.update(
+            self.acache.update(
                 test_peer(),
                 Notification::Add {
-                    arena: test_arena(),
+                    arena: self.arena,
                     index: 1,
                     path: path.clone(),
                     mtime: mtime.clone(),
@@ -1127,7 +1091,7 @@ mod tests {
         }
 
         fn remove_file(&self, path: &Path) -> anyhow::Result<()> {
-            self.cache.update(
+            self.acache.update(
                 test_peer(),
                 Notification::Remove {
                     arena: self.arena,
@@ -1144,19 +1108,16 @@ mod tests {
     #[tokio::test]
     async fn add_creates_directories() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let cache = &fixture.cache;
+        let acache = &fixture.acache;
         let file_path = Path::parse("a/b/c.txt")?;
         let mtime = test_time();
 
         fixture.add_file(&file_path, 100, &mtime)?;
 
-        let entry = cache.lookup(UnrealCacheBlocking::ROOT_DIR, "test_arena")?;
-        assert_eq!(entry.assignment, InodeAssignment::Directory, "test_arena");
-
-        let entry = cache.lookup(entry.inode, "a")?;
+        let entry = acache.lookup(acache.arena_root(), "a")?;
         assert_eq!(entry.assignment, InodeAssignment::Directory, "a");
 
-        let entry = cache.lookup(entry.inode, "b")?;
+        let entry = acache.lookup(entry.inode, "b")?;
         assert_eq!(entry.assignment, InodeAssignment::Directory, "b");
 
         Ok(())
@@ -1169,12 +1130,13 @@ mod tests {
         let mtime = test_time();
         let path1 = Path::parse("a/b/1.txt")?;
         fixture.add_file(&path1, 100, &mtime)?;
-        let dir_mtime = fixture.parent_dir_mtime(arena, &path1)?;
+        let dir = Path::parse("a/b")?;
+        let dir_mtime = fixture.dir_mtime(&dir)?;
 
         let path2 = Path::parse("a/b/2.txt")?;
         fixture.add_file(&path2, 100, &mtime)?;
 
-        assert!(fixture.parent_dir_mtime(arena, &path2)? > dir_mtime);
+        assert!(fixture.dir_mtime(&dir)? > dir_mtime);
         Ok(())
     }
 
@@ -1192,13 +1154,13 @@ mod tests {
 
     #[tokio::test]
     async fn replace_existing_file() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let cache = &fixture.cache;
-        let peer = test_peer();
         let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena).await?;
+        let acache = &fixture.acache;
+        let peer = test_peer();
         let file_path = Path::parse("file.txt")?;
 
-        cache.update(
+        acache.update(
             peer,
             Notification::Add {
                 arena: arena,
@@ -1209,7 +1171,7 @@ mod tests {
                 hash: test_hash(),
             },
         )?;
-        cache.update(
+        acache.update(
             peer,
             Notification::Replace {
                 arena: arena,
@@ -1222,7 +1184,6 @@ mod tests {
             },
         )?;
 
-        let acache = fixture.arena_cache()?;
         let (inode, _) = acache.lookup_path(&file_path)?;
         let metadata = acache.file_metadata(inode)?;
         assert_eq!(metadata.size, 200);
@@ -1233,13 +1194,13 @@ mod tests {
 
     #[tokio::test]
     async fn replace_marks_dirty() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let cache = &fixture.cache;
-        let peer = test_peer();
         let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena).await?;
+        let acache = &fixture.acache;
+        let peer = test_peer();
         let file_path = Path::parse("file.txt")?;
 
-        cache.update(
+        acache.update(
             peer,
             Notification::Add {
                 arena: arena,
@@ -1252,7 +1213,7 @@ mod tests {
         )?;
         fixture.clear_dirty()?;
 
-        cache.update(
+        acache.update(
             peer,
             Notification::Replace {
                 arena: arena,
@@ -1271,13 +1232,13 @@ mod tests {
 
     #[tokio::test]
     async fn ignored_replace_does_not_mark_dirty() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let cache = &fixture.cache;
-        let peer = test_peer();
         let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena).await?;
+        let acache = &fixture.acache;
+        let peer = test_peer();
         let file_path = Path::parse("file.txt")?;
 
-        cache.update(
+        acache.update(
             peer,
             Notification::Add {
                 arena: arena,
@@ -1291,7 +1252,7 @@ mod tests {
         fixture.clear_dirty()?;
 
         // Replace is ignored because old_hash != current hash.
-        cache.update(
+        acache.update(
             peer,
             Notification::Replace {
                 arena: arena,
@@ -1316,7 +1277,7 @@ mod tests {
         fixture.add_file(&file_path, 100, &test_time())?;
         fixture.add_file(&file_path, 200, &test_time())?;
 
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
         let metadata = acache.file_metadata(inode)?;
         assert_eq!(metadata.size, 100);
@@ -1327,11 +1288,11 @@ mod tests {
     #[tokio::test]
     async fn ignore_replace_with_wrong_hash() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let cache = &fixture.cache;
+        let acache = &fixture.acache;
         let file_path = Path::parse("file.txt")?;
         let peer = test_peer();
 
-        cache.update(
+        acache.update(
             peer,
             Notification::Add {
                 arena: test_arena(),
@@ -1342,7 +1303,7 @@ mod tests {
                 hash: Hash([1u8; 32]),
             },
         )?;
-        cache.update(
+        acache.update(
             peer,
             Notification::Replace {
                 arena: test_arena(),
@@ -1355,7 +1316,6 @@ mod tests {
             },
         )?;
 
-        let acache = fixture.arena_cache()?;
         let (inode, _) = acache.lookup_path(&file_path)?;
         let metadata = acache.file_metadata(inode)?;
         assert_eq!(metadata.size, 100);
@@ -1366,16 +1326,16 @@ mod tests {
     #[tokio::test]
     async fn unlink_removes_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let cache = &fixture.cache;
+        let acache = &fixture.acache;
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
 
         fixture.add_file(&file_path, 100, &mtime)?;
-        let arena_root = cache.arena_root(test_arena())?;
-        cache.lookup(arena_root, "file.txt")?;
+        let arena_root = acache.arena_root();
+        acache.lookup(arena_root, "file.txt")?;
         fixture.remove_file(&file_path)?;
         assert!(matches!(
-            cache.lookup(arena_root, "file.txt"),
+            acache.lookup(arena_root, "file.txt"),
             Err(StorageError::NotFound)
         ));
 
@@ -1385,13 +1345,13 @@ mod tests {
     #[tokio::test]
     async fn unlink_marks_dirty() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let cache = &fixture.cache;
+        let acache = &fixture.acache;
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
 
         fixture.add_file(&file_path, 100, &mtime)?;
-        let arena_root = cache.arena_root(test_arena())?;
-        cache.lookup(arena_root, "file.txt")?;
+        let arena_root = acache.arena_root();
+        acache.lookup(arena_root, "file.txt")?;
 
         fixture.clear_dirty()?;
         fixture.remove_file(&file_path)?;
@@ -1408,27 +1368,28 @@ mod tests {
         let mtime = test_time();
 
         fixture.add_file(&file_path, 100, &mtime)?;
-        let dir_mtime = fixture.parent_dir_mtime(arena, &file_path)?;
+        let arena_root = fixture.acache.arena_root();
+        let dir_mtime = fixture.acache.dir_mtime(arena_root)?;
         fixture.remove_file(&file_path)?;
 
-        assert!(fixture.parent_dir_mtime(arena, &file_path)? > dir_mtime);
+        assert!(fixture.acache.dir_mtime(arena_root)? > dir_mtime);
 
         Ok(())
     }
 
     #[tokio::test]
     async fn unlink_ignores_wrong_old_hash() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let cache = &fixture.cache;
         let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena).await?;
+        let acache = &fixture.acache;
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
 
         fixture.add_file(&file_path, 100, &mtime)?;
-        cache.update(
+        acache.update(
             test_peer(),
             Notification::Remove {
-                arena: arena,
+                arena,
                 index: 1,
                 path: file_path.clone(),
                 old_hash: Hash([2u8; 32]), // != test_hash()
@@ -1436,7 +1397,6 @@ mod tests {
         )?;
 
         // File should still exist because wrong hash was provided
-        let acache = fixture.arena_cache()?;
         let (inode, _) = acache.lookup_path(&file_path)?;
         let metadata = acache.file_metadata(inode)?;
         assert_eq!(metadata.size, 100);
@@ -1446,23 +1406,22 @@ mod tests {
 
     #[tokio::test]
     async fn lookup_finds_entry() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let cache = &fixture.cache;
         let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena).await?;
+        let acache = &fixture.acache;
         let file_path = Path::parse("a/file.txt")?;
         let mtime = test_time();
 
         fixture.add_file(&file_path, 100, &mtime)?;
 
         // Lookup directory
-        let dir_entry = cache.lookup(cache.arena_root(arena)?, "a")?;
+        let dir_entry = acache.lookup(acache.arena_root(), "a")?;
         assert_eq!(dir_entry.assignment, InodeAssignment::Directory);
 
         // Lookup file
-        let file_entry = cache.lookup(dir_entry.inode, "file.txt")?;
+        let file_entry = acache.lookup(dir_entry.inode, "file.txt")?;
         assert_eq!(file_entry.assignment, InodeAssignment::File);
 
-        let acache = fixture.arena_cache()?;
         let metadata = acache.file_metadata(file_entry.inode)?;
         assert_eq!(metadata.mtime, mtime);
         assert_eq!(metadata.size, 100);
@@ -1473,10 +1432,10 @@ mod tests {
     #[tokio::test]
     async fn lookup_returns_notfound_for_missing_entry() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let cache = &fixture.cache;
+        let acache = &fixture.acache;
 
         assert!(matches!(
-            cache.lookup(cache.arena_root(test_arena())?, "nonexistent"),
+            acache.lookup(acache.arena_root(), "nonexistent"),
             Err(StorageError::NotFound),
         ));
 
@@ -1485,18 +1444,17 @@ mod tests {
 
     #[tokio::test]
     async fn lookup_path_finds_entry() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let cache = &fixture.cache;
         let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena).await?;
+        let acache = &fixture.acache;
         let path = Path::parse("a/b/c/file.txt")?;
         let mtime = test_time();
 
         fixture.add_file(&path, 100, &mtime)?;
 
-        let (inode, assignment) = cache.lookup_path(arena, &path)?;
+        let (inode, assignment) = acache.lookup_path(&path)?;
         assert_eq!(assignment, InodeAssignment::File);
 
-        let acache = fixture.arena_cache()?;
         let metadata = acache.file_metadata(inode)?;
         assert_eq!(metadata.mtime, mtime);
         assert_eq!(metadata.size, 100);
@@ -1506,42 +1464,33 @@ mod tests {
 
     #[tokio::test]
     async fn readdir_returns_all_entries() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let cache = &fixture.cache;
         let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena).await?;
+        let acache = &fixture.acache;
         let mtime = test_time();
 
         fixture.add_file(&Path::parse("dir/file1.txt")?, 100, &mtime)?;
         fixture.add_file(&Path::parse("dir/file2.txt")?, 200, &mtime)?;
         fixture.add_file(&Path::parse("dir/subdir/file3.txt")?, 300, &mtime)?;
 
-        assert_unordered::assert_eq_unordered!(
-            vec![(arena.to_string(), InodeAssignment::Directory),],
-            cache
-                .readdir(UnrealCacheBlocking::ROOT_DIR)?
-                .into_iter()
-                .map(|(name, entry)| (name, entry.assignment))
-                .collect::<Vec<_>>(),
-        );
-
-        let arena_root = cache.arena_root(arena)?;
+        let arena_root = acache.arena_root();
         assert_unordered::assert_eq_unordered!(
             vec![("dir".to_string(), InodeAssignment::Directory),],
-            cache
+            acache
                 .readdir(arena_root)?
                 .into_iter()
                 .map(|(name, entry)| (name, entry.assignment))
                 .collect::<Vec<_>>(),
         );
 
-        let dir_entry = cache.lookup(arena_root, "dir")?;
+        let dir_entry = acache.lookup(arena_root, "dir")?;
         assert_unordered::assert_eq_unordered!(
             vec![
                 ("file1.txt".to_string(), InodeAssignment::File),
                 ("file2.txt".to_string(), InodeAssignment::File),
                 ("subdir".to_string(), InodeAssignment::Directory),
             ],
-            cache
+            acache
                 .readdir(dir_entry.inode)?
                 .into_iter()
                 .map(|(name, entry)| (name, entry.assignment))
@@ -1553,15 +1502,15 @@ mod tests {
 
     #[tokio::test]
     async fn get_file_metadata_tracks_hash_chain() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let cache = &fixture.cache;
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena).await?;
+        let acache = &fixture.acache;
 
         let peer1 = Peer::from("peer1");
         let peer2 = Peer::from("peer2");
-        let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
 
-        cache.update(
+        acache.update(
             peer1,
             Notification::Add {
                 arena: arena,
@@ -1572,7 +1521,7 @@ mod tests {
                 hash: Hash([1u8; 32]),
             },
         )?;
-        cache.update(
+        acache.update(
             peer2,
             Notification::Add {
                 arena: arena,
@@ -1583,7 +1532,7 @@ mod tests {
                 hash: Hash([1u8; 32]),
             },
         )?;
-        cache.update(
+        acache.update(
             peer2,
             Notification::Replace {
                 arena: arena,
@@ -1596,7 +1545,6 @@ mod tests {
             },
         )?;
 
-        let acache = fixture.arena_cache()?;
         let file_entry = acache.lookup(acache.arena_root, "file.txt")?;
         let metadata = acache.file_metadata(file_entry.inode)?;
         assert_eq!(metadata.size, 200);
@@ -1608,7 +1556,7 @@ mod tests {
     #[tokio::test]
     async fn file_availability_deals_with_conflicting_adds() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let cache = &fixture.cache;
+        let acache = &fixture.acache;
 
         let a = Peer::from("a");
         let b = Peer::from("b");
@@ -1616,7 +1564,7 @@ mod tests {
         let arena = test_arena();
         let path = Path::parse("file.txt")?;
 
-        cache.update(
+        acache.update(
             a,
             Notification::Add {
                 arena: arena,
@@ -1627,7 +1575,7 @@ mod tests {
                 hash: Hash([1u8; 32]),
             },
         )?;
-        cache.update(
+        acache.update(
             b,
             Notification::Add {
                 arena: arena,
@@ -1638,7 +1586,7 @@ mod tests {
                 hash: Hash([1u8; 32]),
             },
         )?;
-        cache.update(
+        acache.update(
             c,
             Notification::Add {
                 arena: arena,
@@ -1649,8 +1597,7 @@ mod tests {
                 hash: Hash([2u8; 32]),
             },
         )?;
-        let acache = fixture.arena_cache()?;
-        let inode = acache.lookup(acache.arena_root, "file.txt")?.inode;
+        let inode = acache.lookup(acache.arena_root(), "file.txt")?.inode;
         let avail = acache.file_availability(inode)?;
         assert_eq!(arena, avail.arena);
         assert_eq!(path, avail.path);
@@ -1672,7 +1619,7 @@ mod tests {
     #[tokio::test]
     async fn file_availablility_deals_with_different_versions() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let cache = &fixture.cache;
+        let acache = &fixture.acache;
 
         let a = Peer::from("a");
         let b = Peer::from("b");
@@ -1680,7 +1627,7 @@ mod tests {
         let arena = test_arena();
         let path = Path::parse("file.txt")?;
 
-        cache.update(
+        acache.update(
             a,
             Notification::Add {
                 arena: arena,
@@ -1691,7 +1638,7 @@ mod tests {
                 hash: Hash([1u8; 32]),
             },
         )?;
-        cache.update(
+        acache.update(
             b,
             Notification::Add {
                 arena: arena,
@@ -1702,7 +1649,7 @@ mod tests {
                 hash: Hash([1u8; 32]),
             },
         )?;
-        cache.update(
+        acache.update(
             c,
             Notification::Add {
                 arena: arena,
@@ -1713,7 +1660,7 @@ mod tests {
                 hash: Hash([1u8; 32]),
             },
         )?;
-        cache.update(
+        acache.update(
             b,
             Notification::Replace {
                 arena: arena,
@@ -1725,7 +1672,6 @@ mod tests {
                 old_hash: Hash([1u8; 32]),
             },
         )?;
-        let acache = fixture.arena_cache()?;
         let inode = acache.lookup(acache.arena_root, "file.txt")?.inode;
         let avail = acache.file_availability(inode)?;
 
@@ -1743,7 +1689,7 @@ mod tests {
 
         // We reconnect to c, which has yet another version. Following
         // the hash chain, Hash 3 is now the newest version.
-        cache.update(
+        acache.update(
             c,
             Notification::Replace {
                 arena: arena,
@@ -1755,7 +1701,7 @@ mod tests {
                 old_hash: Hash([1u8; 32]),
             },
         )?;
-        cache.update(
+        acache.update(
             c,
             Notification::Replace {
                 arena: arena,
@@ -1767,13 +1713,13 @@ mod tests {
                 old_hash: Hash([2u8; 32]),
             },
         )?;
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
         let avail = acache.file_availability(inode)?;
         assert_eq!(Hash([3u8; 32]), avail.hash);
         assert_eq!(vec![c], avail.peers);
 
         // Later on, b joins the party
-        cache.update(
+        acache.update(
             b,
             Notification::Replace {
                 arena: arena,
@@ -1786,7 +1732,6 @@ mod tests {
             },
         )?;
 
-        let acache = fixture.arena_cache()?;
         let avail = acache.file_availability(inode)?;
         assert_eq!(Hash([3u8; 32]), avail.hash);
         assert_unordered::assert_eq_unordered!(vec![b, c], avail.peers);
@@ -1797,7 +1742,7 @@ mod tests {
     #[tokio::test]
     async fn file_availability_when_a_peer_goes_away() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let cache = &fixture.cache;
+        let acache = &fixture.acache;
 
         let a = Peer::from("a");
         let b = Peer::from("b");
@@ -1805,7 +1750,7 @@ mod tests {
         let arena = test_arena();
         let path = Path::parse("file.txt")?;
 
-        cache.update(
+        acache.update(
             a,
             Notification::Add {
                 arena: arena,
@@ -1816,7 +1761,7 @@ mod tests {
                 hash: Hash([1u8; 32]),
             },
         )?;
-        cache.update(
+        acache.update(
             b,
             Notification::Add {
                 arena: arena,
@@ -1827,7 +1772,7 @@ mod tests {
                 hash: Hash([1u8; 32]),
             },
         )?;
-        cache.update(
+        acache.update(
             c,
             Notification::Add {
                 arena: arena,
@@ -1838,7 +1783,7 @@ mod tests {
                 hash: Hash([2u8; 32]),
             },
         )?;
-        cache.update(
+        acache.update(
             a,
             Notification::Replace {
                 arena: arena,
@@ -1850,14 +1795,13 @@ mod tests {
                 old_hash: Hash([1u8; 32]),
             },
         )?;
-        let acache = fixture.arena_cache()?;
         let inode = acache.lookup(acache.arena_root, "file.txt")?.inode;
         let avail = acache.file_availability(inode)?;
         assert_eq!(vec![a], avail.peers);
         assert_eq!(Hash([3u8; 32]), avail.hash);
 
-        cache.update(a, Notification::CatchupStart(arena))?;
-        cache.update(
+        acache.update(a, Notification::CatchupStart(arena))?;
+        acache.update(
             a,
             Notification::CatchupComplete {
                 arena: arena,
@@ -1872,7 +1816,7 @@ mod tests {
         //
         // (If we kept a history, we would probably go
         // back to Hash=1, but we don't have that kind of information)
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
         let avail = acache.file_availability(inode)?;
         assert_eq!(vec![c], avail.peers);
         assert_eq!(Hash([2u8; 32]), avail.hash);
@@ -1883,7 +1827,7 @@ mod tests {
     #[tokio::test]
     async fn mark_and_delete_peer_files() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let cache = &fixture.cache;
+        let acache = &fixture.acache;
         let arena = test_arena();
         let peer1 = Peer::from("1");
         let peer2 = Peer::from("2");
@@ -1895,7 +1839,7 @@ mod tests {
 
         let mtime = test_time();
 
-        cache.update(
+        acache.update(
             peer1,
             Notification::Add {
                 arena: arena,
@@ -1907,7 +1851,7 @@ mod tests {
             },
         )?;
 
-        cache.update(
+        acache.update(
             peer1,
             Notification::Add {
                 arena: arena,
@@ -1918,7 +1862,7 @@ mod tests {
                 hash: test_hash(),
             },
         )?;
-        cache.update(
+        acache.update(
             peer2,
             Notification::Add {
                 arena: arena,
@@ -1930,7 +1874,7 @@ mod tests {
             },
         )?;
 
-        cache.update(
+        acache.update(
             peer1,
             Notification::Add {
                 arena: arena,
@@ -1941,7 +1885,7 @@ mod tests {
                 hash: test_hash(),
             },
         )?;
-        cache.update(
+        acache.update(
             peer2,
             Notification::Add {
                 arena: arena,
@@ -1952,7 +1896,7 @@ mod tests {
                 hash: test_hash(),
             },
         )?;
-        cache.update(
+        acache.update(
             peer3,
             Notification::Add {
                 arena: arena,
@@ -1964,7 +1908,7 @@ mod tests {
             },
         )?;
 
-        cache.update(
+        acache.update(
             peer1,
             Notification::Add {
                 arena: arena,
@@ -1977,8 +1921,8 @@ mod tests {
         )?;
 
         // Simulate a catchup that only reports file2 and file4.
-        cache.update(peer1, Notification::CatchupStart(arena))?;
-        cache.update(
+        acache.update(peer1, Notification::CatchupStart(arena))?;
+        acache.update(
             peer1,
             Notification::Catchup {
                 arena: arena,
@@ -1988,7 +1932,7 @@ mod tests {
                 hash: test_hash(),
             },
         )?;
-        cache.update(
+        acache.update(
             peer1,
             Notification::Catchup {
                 arena: arena,
@@ -1998,7 +1942,7 @@ mod tests {
                 hash: test_hash(),
             },
         )?;
-        cache.update(
+        acache.update(
             peer1,
             Notification::CatchupComplete {
                 arena: arena,
@@ -2008,12 +1952,11 @@ mod tests {
 
         // File1 should have been deleted, since it was only on peer1,
         assert!(matches!(
-            cache.lookup_path(arena, &file1),
+            acache.lookup_path(&file1),
             Err(StorageError::NotFound)
         ));
 
         // File2 should still be available, from peer2
-        let acache = fixture.arena_cache()?;
         let (file2_inode, _) = acache.lookup_path(&file2)?;
         let file2_availability = acache.file_availability(file2_inode)?;
         assert!(file2_availability.peers.contains(&peer2));
@@ -2046,7 +1989,7 @@ mod tests {
             let txn = fixture.begin_write()?;
             mark_dirty_recursive(
                 &txn,
-                fixture.arena_root()?,
+                fixture.arena_root(),
                 Some(&file_path),
                 &fixture.dirty_paths,
             )?;
@@ -2084,7 +2027,7 @@ mod tests {
             let txn = fixture.begin_write()?;
             mark_dirty_recursive(
                 &txn,
-                fixture.arena_root()?,
+                fixture.arena_root(),
                 Some(&Path::parse("foo")?),
                 &fixture.dirty_paths,
             )?;
@@ -2128,7 +2071,7 @@ mod tests {
             let txn = fixture.begin_write()?;
             mark_dirty_recursive(
                 &txn,
-                fixture.arena_root()?,
+                fixture.arena_root(),
                 Some(&Path::parse("foo/subdir")?),
                 &fixture.dirty_paths,
             )?;
@@ -2165,7 +2108,7 @@ mod tests {
 
         // Mark a non-existent inode dirty recursively
         {
-            let acache = fixture.arena_cache()?;
+            let acache = &fixture.acache;
             let txn = acache.db.begin_write()?;
             // Use a very high inode number that shouldn't exist
             let nonexistent_inode = Inode(999999);
@@ -2200,11 +2143,11 @@ mod tests {
         fixture.clear_dirty()?;
 
         {
-            let acache = fixture.arena_cache()?;
+            let acache = &fixture.acache;
             let txn = acache.db.begin_write()?;
             mark_dirty_recursive(
                 &txn,
-                fixture.arena_root()?,
+                fixture.arena_root(),
                 Some(&Path::parse("doesnotexist")?),
                 &fixture.dirty_paths,
             )?;
@@ -2241,7 +2184,7 @@ mod tests {
         // Mark the whole dirty
         {
             let txn = fixture.begin_write()?;
-            mark_dirty_recursive(&txn, fixture.arena_root()?, None, &fixture.dirty_paths)?;
+            mark_dirty_recursive(&txn, fixture.arena_root(), None, &fixture.dirty_paths)?;
             txn.commit()?;
         }
 
@@ -2266,7 +2209,7 @@ mod tests {
         // Add a file without opening it (so no blob is created)
         fixture.add_file(&file_path, 100, &mtime)?;
 
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
         let availability = acache.local_availability(inode)?;
 
@@ -2283,11 +2226,11 @@ mod tests {
 
         // Add a file and open it to create a blob
         fixture.add_file(&file_path, 100, &mtime)?;
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
 
         // Open the file to create a blob but don't write anything
-        let _blob = fixture.async_cache.open_file(inode).await?;
+        let _blob = fixture.acache.open_file(inode)?;
 
         let availability = acache.local_availability(inode)?;
 
@@ -2304,11 +2247,11 @@ mod tests {
 
         // Add a file and open it to create a blob
         fixture.add_file(&file_path, 100, &mtime)?;
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
 
         // Open the file and write only part of it
-        let mut blob = fixture.async_cache.open_file(inode).await?;
+        let mut blob = fixture.acache.open_file(inode)?;
         blob.write_all(b"partial data").await?;
         blob.flush_and_sync().await?;
         blob.update_db().await?;
@@ -2335,11 +2278,11 @@ mod tests {
 
         // Add a file and open it to create a blob
         fixture.add_file(&file_path, 100, &mtime)?;
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
 
         // Open the file and write the full content
-        let mut blob = fixture.async_cache.open_file(inode).await?;
+        let mut blob = fixture.acache.open_file(inode)?;
         let data = vec![b'x'; 100];
         blob.write_all(&data).await?;
         blob.flush_and_sync().await?;
@@ -2360,11 +2303,11 @@ mod tests {
 
         // Add a file and open it to create a blob
         fixture.add_file(&file_path, 100, &mtime)?;
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
 
         // Open the file and write the full content
-        let mut blob = fixture.async_cache.open_file(inode).await?;
+        let mut blob = fixture.acache.open_file(inode)?;
         let data = vec![b'x'; 100];
         blob.write_all(&data).await?;
         blob.flush_and_sync().await?;
@@ -2388,11 +2331,11 @@ mod tests {
 
         // Add a file and open it to create a blob
         fixture.add_file(&file_path, 1000, &mtime)?;
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
 
         // Open the file and write data in non-contiguous ranges
-        let mut blob = fixture.async_cache.open_file(inode).await?;
+        let mut blob = fixture.acache.open_file(inode)?;
 
         // Write first range: 0-100
         blob.seek(std::io::SeekFrom::Start(0)).await?;
@@ -2431,7 +2374,7 @@ mod tests {
 
         // Add a zero-size file
         fixture.add_file(&file_path, 0, &mtime)?;
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
         assert!(matches!(
             acache.local_availability(inode)?,
@@ -2444,7 +2387,7 @@ mod tests {
 
         // Open the file to create a blob; this is all that's needed
         // for availability to switch to Complete.
-        fixture.async_cache.open_file(inode).await?;
+        fixture.acache.open_file(inode)?;
         assert!(matches!(
             acache.local_availability(inode)?,
             LocalAvailability::Complete
@@ -2456,7 +2399,7 @@ mod tests {
     #[tokio::test]
     async fn local_availability_handles_nonexistent_inode() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
 
         // Try to get availability for a non-existent inode
         let nonexistent_inode = Inode(999999);
@@ -2475,7 +2418,7 @@ mod tests {
 
         // Add a file and open it to create a blob
         fixture.add_file(&file_path, 100, &mtime)?;
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
 
         // Initially should be missing
@@ -2484,7 +2427,7 @@ mod tests {
 
         // Open and write half the file
         {
-            let mut blob = fixture.async_cache.open_file(inode).await?;
+            let mut blob = fixture.acache.open_file(inode)?;
             blob.write_all(&vec![b'x'; 50]).await?;
             blob.flush_and_sync().await?;
             blob.update_db().await?;
@@ -2502,7 +2445,7 @@ mod tests {
 
         // Write the rest of the file
         {
-            let mut blob = fixture.async_cache.open_file(inode).await?;
+            let mut blob = fixture.acache.open_file(inode)?;
             blob.seek(std::io::SeekFrom::Start(50)).await?;
             blob.write_all(&vec![b'y'; 50]).await?;
             blob.flush_and_sync().await?;

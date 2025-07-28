@@ -735,6 +735,8 @@ pub(crate) fn take_dirty(txn: &ArenaWriteTransaction) -> Result<Option<(Path, u6
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GlobalDatabase;
+    use crate::InodeAllocator;
     use crate::Notification;
     use crate::arena::arena_cache::ArenaCache;
     use crate::arena::index::RealIndexBlocking;
@@ -773,7 +775,7 @@ mod tests {
         arena: Arena,
         db: Arc<ArenaDatabase>,
         dirty_paths: Arc<DirtyPaths>,
-        acache: ArenaCache,
+        acache: Arc<ArenaCache>,
         index: RealIndexBlocking,
         pathmarks: PathMarks,
         engine: Arc<Engine>,
@@ -792,14 +794,16 @@ mod tests {
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
 
             let arena = Arena::from("myarena");
-            let arena_root = Inode(300);
+            let allocator =
+                InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
             let acache = ArenaCache::new(
                 arena,
-                arena_root,
+                allocator,
                 Arc::clone(&db),
-                tempdir.path().join("blobs"),
+                &tempdir.path().join("blobs"),
                 Arc::clone(&dirty_paths),
             )?;
+            let arena_root = acache.arena_root();
             let index = RealIndexBlocking::new(arena, Arc::clone(&db), Arc::clone(&dirty_paths))?;
             let pathmarks = PathMarks::new(Arc::clone(&db), arena_root, Arc::clone(&dirty_paths))?;
             let engine = Engine::new(
@@ -885,8 +889,7 @@ mod tests {
 
         fn update_cache(&self, notification: Notification) -> anyhow::Result<()> {
             let test_peer = Peer::from("other");
-            self.acache
-                .update(test_peer, notification, || Ok((Inode(1000), Inode(2000))))?;
+            self.acache.update(test_peer, notification)?;
             Ok(())
         }
 

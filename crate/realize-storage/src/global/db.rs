@@ -126,10 +126,6 @@ pub struct GlobalReadTransaction {
 }
 
 impl GlobalReadTransaction {
-    pub fn arena_table(&self) -> Result<ReadOnlyTable<&'static str, Inode>, StorageError> {
-        Ok(self.inner.open_table(ARENA_TABLE)?)
-    }
-
     pub fn inode_range_allocation_table(
         &self,
     ) -> Result<ReadOnlyTable<Inode, Inode>, StorageError> {

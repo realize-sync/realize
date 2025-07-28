@@ -1,5 +1,5 @@
 use crate::utils::redb_utils;
-use crate::{ArenaDatabase, DirtyPaths, GlobalDatabase};
+use crate::{ArenaCache, ArenaDatabase, DirtyPaths, GlobalDatabase, InodeAllocator};
 
 use super::config::{ArenaConfig, CacheConfig, StorageConfig};
 use super::{Storage, UnrealCacheAsync};
@@ -11,20 +11,22 @@ pub async fn in_memory_cache<T>(arenas: T) -> anyhow::Result<UnrealCacheAsync>
 where
     T: IntoIterator<Item = Arena> + Send + 'static,
 {
+    let arenas = arenas.into_iter().collect::<Vec<_>>();
+    let globaldb = GlobalDatabase::new(redb_utils::in_memory()?)?;
+    let allocator = InodeAllocator::new(Arc::clone(&globaldb), arenas.clone())?;
     let mut arena_dbs = vec![];
     for arena in arenas.into_iter() {
         let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
         let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-        arena_dbs.push((
+        arena_dbs.push(ArenaCache::new(
             arena,
+            Arc::clone(&allocator),
             db,
-            std::path::PathBuf::from("/dev/null"),
+            &std::path::PathBuf::from("/dev/null"),
             dirty_paths,
-        ));
+        )?);
     }
-    let cache =
-        UnrealCacheAsync::with_db(GlobalDatabase::new(redb_utils::in_memory()?)?, arena_dbs)
-            .await?;
+    let cache = UnrealCacheAsync::with_db(globaldb, allocator, arena_dbs).await?;
 
     Ok(cache)
 }

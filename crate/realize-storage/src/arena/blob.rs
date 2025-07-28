@@ -27,7 +27,7 @@ impl Blobstore {
     /// Create a new Blobstore from a database and blob directory.
     pub(crate) fn new(
         db: Arc<ArenaDatabase>,
-        blob_dir: PathBuf,
+        blob_dir: &std::path::Path,
     ) -> Result<Arc<Self>, StorageError> {
         // Ensure the database has the required blob table
         {
@@ -40,7 +40,10 @@ impl Blobstore {
             std::fs::create_dir_all(&blob_dir)?;
         }
 
-        Ok(Arc::new(Self { db, blob_dir }))
+        Ok(Arc::new(Self {
+            db,
+            blob_dir: blob_dir.to_path_buf(),
+        }))
     }
 
     /// Return an [Blob] entry given a blob id.
@@ -522,9 +525,8 @@ impl AsyncWrite for Blob {
 mod tests {
     use super::*;
     use crate::arena::arena_cache::ArenaCache;
-    use crate::global::cache::UnrealCacheBlocking;
     use crate::utils::redb_utils;
-    use crate::{DirtyPaths, GlobalDatabase, Inode, Notification, UnrealCacheAsync};
+    use crate::{DirtyPaths, GlobalDatabase, Inode, InodeAllocator, Notification};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Path, Peer, UnixTime};
@@ -556,8 +558,7 @@ mod tests {
 
     struct Fixture {
         arena: Arena,
-        async_cache: UnrealCacheAsync,
-        cache: Arc<UnrealCacheBlocking>,
+        acache: Arc<ArenaCache>,
         db: Arc<ArenaDatabase>,
         tempdir: TempDir,
     }
@@ -565,8 +566,8 @@ mod tests {
         async fn setup_with_arena(arena: Arena) -> anyhow::Result<Fixture> {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
-            let mut cache =
-                UnrealCacheBlocking::new(GlobalDatabase::new(redb_utils::in_memory()?)?)?;
+            let allocator =
+                InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
 
             let child = tempdir.child(format!("{arena}-cache.db"));
             let blob_dir = tempdir.child(format!("{arena}/blobs"));
@@ -575,28 +576,26 @@ mod tests {
             }
             let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-            cache.add_arena(arena, Arc::clone(&db), blob_dir.to_path_buf(), dirty_paths)?;
-
-            let async_cache = cache.into_async();
-            let cache = async_cache.blocking();
+            let acache = ArenaCache::new(
+                arena,
+                allocator,
+                Arc::clone(&db),
+                blob_dir.path(),
+                Arc::clone(&dirty_paths),
+            )?;
 
             Ok(Self {
                 arena,
-                async_cache,
                 db,
-                cache,
+                acache,
                 tempdir,
             })
-        }
-
-        fn arena_cache(&self) -> anyhow::Result<&ArenaCache> {
-            Ok(self.cache.arena_cache(self.arena)?)
         }
 
         fn add_file(&self, path: &str, size: u64) -> anyhow::Result<Inode> {
             let path = Path::parse(path)?;
 
-            self.cache.update(
+            self.acache.update(
                 test_peer(),
                 Notification::Add {
                     arena: self.arena,
@@ -608,7 +607,7 @@ mod tests {
                 },
             )?;
 
-            let (inode, _) = self.cache.lookup_path(self.arena, &path)?;
+            let (inode, _) = self.acache.lookup_path(&path)?;
 
             Ok(inode)
         }
@@ -619,7 +618,7 @@ mod tests {
             size: u64,
             mtime: &UnixTime,
         ) -> anyhow::Result<()> {
-            self.cache.update(
+            self.acache.update(
                 test_peer(),
                 Notification::Add {
                     arena: self.arena,
@@ -635,7 +634,7 @@ mod tests {
         }
 
         fn remove_file(&self, path: &Path) -> anyhow::Result<()> {
-            self.cache.update(
+            self.acache.update(
                 test_peer(),
                 Notification::Remove {
                     arena: self.arena,
@@ -685,7 +684,7 @@ mod tests {
     async fn read_blob_within_available_ranges() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(arena).await?;
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
 
         let inode = fixture.add_file("test.txt", 1000)?;
 
@@ -701,7 +700,7 @@ mod tests {
             .extend_local_availability(blob_id, &ByteRanges::single(0, test_data.len() as u64))?;
 
         // Read from blob
-        let mut blob = fixture.async_cache.open_file(inode).await?;
+        let mut blob = fixture.acache.open_file(inode)?;
 
         let mut buf = [0; 5];
         let n = blob.read(&mut buf).await?;
@@ -718,7 +717,7 @@ mod tests {
     async fn read_blob_after_seek_within_available_range() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(arena).await?;
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
 
         let inode = fixture.add_file("test.txt", 1000)?;
 
@@ -734,7 +733,7 @@ mod tests {
             .extend_local_availability(blob_id, &ByteRanges::single(0, test_data.len() as u64))?;
 
         // Read from blob
-        let mut blob = fixture.async_cache.open_file(inode).await?;
+        let mut blob = fixture.acache.open_file(inode)?;
         blob.seek(SeekFrom::Start(b"Baa, baa, black sheep, ".len() as u64))
             .await?;
         let mut buf = [0; 100];
@@ -748,7 +747,7 @@ mod tests {
     async fn read_blob_outside_available_ranges() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(arena).await?;
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
         let inode = fixture.add_file("test.txt", 1000)?;
 
         // Allocate blob id and create file
@@ -762,7 +761,7 @@ mod tests {
             .extend_local_availability(blob_id, &ByteRanges::single(0, test_data.len() as u64))?;
 
         // Read from blob
-        let mut blob = fixture.async_cache.open_file(inode).await?;
+        let mut blob = fixture.acache.open_file(inode)?;
         blob.seek(SeekFrom::Start(20)).await?;
         let mut buf = [0; 100];
         let res = blob.read(&mut buf).await;
@@ -780,7 +779,7 @@ mod tests {
         let inode = fixture.add_file("test.txt", 21)?;
 
         // Write to blob
-        let mut blob = fixture.async_cache.open_file(inode).await?;
+        let mut blob = fixture.acache.open_file(inode)?;
         let blob_id = blob.id();
 
         blob.write(b"baa, baa").await?;
@@ -818,7 +817,7 @@ mod tests {
         let inode = fixture.add_file("test.txt", 21)?;
 
         // Write to blob
-        let mut blob = fixture.async_cache.open_file(inode).await?;
+        let mut blob = fixture.acache.open_file(inode)?;
         let blob_id = blob.id();
 
         blob.seek(SeekFrom::Start(8)).await?;
@@ -847,7 +846,7 @@ mod tests {
         let fixture = Fixture::setup_with_arena(arena).await?;
         let inode = fixture.add_file("test.txt", 100)?;
 
-        let mut blob = fixture.async_cache.open_file(inode).await?;
+        let mut blob = fixture.acache.open_file(inode)?;
 
         blob.write(b"baa, baa, black sheep").await?;
 
@@ -864,7 +863,7 @@ mod tests {
     async fn open_file_creates_sparse_file() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(arena).await?;
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
         let file_path = Path::parse("foobar")?;
 
         fixture.add_file_with_mtime(&file_path, 10000, &test_time())?;
@@ -899,8 +898,7 @@ mod tests {
     #[tokio::test]
     async fn blob_deleted_on_file_overwrite() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let cache = &fixture.cache;
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
 
@@ -917,7 +915,7 @@ mod tests {
         assert!(fixture.blob_entry_exists(blob_id)?);
 
         // Overwrite the file with a new version
-        cache.update(
+        acache.update(
             test_peer(),
             Notification::Replace {
                 arena: arena,
@@ -941,7 +939,7 @@ mod tests {
     #[tokio::test]
     async fn blob_deleted_on_file_removal() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
 
@@ -971,8 +969,7 @@ mod tests {
     #[tokio::test]
     async fn blob_deleted_on_catchup_removal() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let cache = &fixture.cache;
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
 
@@ -989,9 +986,9 @@ mod tests {
         assert!(fixture.blob_entry_exists(blob_id)?);
 
         // Do a catchup that doesn't include this file (simulating file removal)
-        cache.update(test_peer(), Notification::CatchupStart(arena))?;
+        acache.update(test_peer(), Notification::CatchupStart(arena))?;
         // Note: No Catchup notification for the file, so it will be deleted
-        cache.update(
+        acache.update(
             test_peer(),
             Notification::CatchupComplete {
                 arena: arena,
@@ -1011,7 +1008,7 @@ mod tests {
     async fn blob_update_extends_range() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(arena).await?;
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
         let file_path = Path::parse("file.txt")?;
 
         // Create a file
@@ -1072,7 +1069,7 @@ mod tests {
     async fn test_move_blob_success() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(arena).await?;
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
         let file_path = Path::parse("test.txt")?;
 
         // Create a file and add it to the cache
@@ -1083,7 +1080,7 @@ mod tests {
         let blob_id = acache.open_file(inode)?.id();
 
         // Write some data to the blob and mark it as verified
-        let mut blob = fixture.async_cache.open_file(inode).await?;
+        let mut blob = fixture.acache.open_file(inode)?;
         blob.write(b"test content").await?;
         blob.update_db().await?;
         blob.mark_verified().await?;
@@ -1119,7 +1116,7 @@ mod tests {
     async fn test_move_blob_wrong_hash() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(arena).await?;
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
         let file_path = Path::parse("test.txt")?;
 
         // Create a file and add it to the cache
@@ -1130,7 +1127,7 @@ mod tests {
         let blob_id = acache.open_file(inode)?.id();
 
         // Write some data to the blob and mark it as verified
-        let mut blob = fixture.async_cache.open_file(inode).await?;
+        let mut blob = fixture.acache.open_file(inode)?;
         blob.write(b"test content").await?;
         blob.update_db().await?;
         blob.mark_verified().await?;
@@ -1163,7 +1160,7 @@ mod tests {
     async fn test_move_blob_not_verified() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(arena).await?;
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
         let file_path = Path::parse("test.txt")?;
 
         // Create a file and add it to the cache
@@ -1174,7 +1171,7 @@ mod tests {
         let blob_id = acache.open_file(inode)?.id();
 
         // Write some data to the blob but don't mark it as verified
-        let mut blob = fixture.async_cache.open_file(inode).await?;
+        let mut blob = fixture.acache.open_file(inode)?;
         blob.write(b"test content").await?;
         blob.update_db().await?;
         // Note: Not calling mark_verified()
@@ -1206,7 +1203,7 @@ mod tests {
     async fn test_move_blob_nonexistent_blob() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(arena).await?;
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
 
         // Create destination path
         let dest_path = fixture.tempdir.child("moved_blob").to_path_buf();
@@ -1228,7 +1225,7 @@ mod tests {
     async fn test_move_blob_verifies_hash_and_state() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(arena).await?;
-        let acache = fixture.arena_cache()?;
+        let acache = &fixture.acache;
         let file_path = Path::parse("test.txt")?;
 
         // Create a file and add it to the cache
@@ -1239,7 +1236,7 @@ mod tests {
         let blob_id = acache.open_file(inode)?.id();
 
         // Write some data to the blob and mark it as verified
-        let mut blob = fixture.async_cache.open_file(inode).await?;
+        let mut blob = fixture.acache.open_file(inode)?;
         let content = b"test content for hash verification";
         blob.write(content).await?;
         blob.update_db().await?;

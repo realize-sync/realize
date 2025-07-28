@@ -2,46 +2,36 @@
 //!
 //! See `spec/unreal.md` for details.
 
-use super::db::{GlobalDatabase, GlobalReadTransaction, GlobalWriteTransaction};
+use super::db::GlobalDatabase;
+use super::inode_allocator::InodeAllocator;
 use super::types::{FileAvailability, FileMetadata, InodeAssignment, ReadDirEntry};
 use crate::arena::arena_cache::{self, ArenaCache};
 use crate::arena::notifier::{Notification, Progress};
 use crate::arena::types::LocalAvailability;
-use crate::{ArenaDatabase, Blob, DirtyPaths, Inode, StorageError};
-use bimap::BiMap;
+use crate::{Blob, Inode, StorageError};
 use realize_types::{Arena, Hash, Path, Peer, UnixTime};
-use redb::ReadableTable;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::task;
-
-/// Size of allocated ranges.
-const RANGE_SIZE: u64 = 10000;
 
 /// A cache of remote files.
 pub struct UnrealCacheBlocking {
     db: Arc<GlobalDatabase>,
-    arena_roots: BiMap<Arena, Inode>,
-    arena_caches: HashMap<Arena, ArenaCache>,
+    allocator: Arc<InodeAllocator>,
+    arena_caches: HashMap<Arena, Arc<ArenaCache>>,
 }
 
 impl UnrealCacheBlocking {
     /// Inode of the root dir.
-    pub const ROOT_DIR: Inode = Inode(1);
+    pub const ROOT_DIR: Inode = InodeAllocator::ROOT_INODE;
 
     /// Create a new UnrealCache from a redb database.
-    pub(crate) fn new(db: Arc<GlobalDatabase>) -> Result<Self, StorageError> {
-        let arena_map = {
-            let txn = db.begin_read()?;
-            do_read_arena_map(&txn)?
-        };
-
-        Ok(Self {
+    pub(crate) fn new(db: Arc<GlobalDatabase>, allocator: Arc<InodeAllocator>) -> Self {
+        Self {
             db,
-            arena_roots: arena_map,
+            allocator,
             arena_caches: HashMap::new(),
-        })
+        }
     }
 
     /// Lists arenas available in this database
@@ -54,9 +44,8 @@ impl UnrealCacheBlocking {
     /// Will return [StorageError::UnknownArena] unless the arena
     /// is available in the cache.
     pub fn arena_root(&self, arena: Arena) -> Result<Inode, StorageError> {
-        self.arena_roots
-            .get_by_left(&arena)
-            .copied()
+        self.allocator
+            .arena_root(arena)
             .ok_or_else(|| StorageError::UnknownArena(arena))
     }
 
@@ -71,39 +60,27 @@ impl UnrealCacheBlocking {
     /// Returns the cache for the given inode or fail.
     fn arena_cache_for_inode(&self, inode: Inode) -> Result<&ArenaCache, StorageError> {
         let arena = self
+            .allocator
             .arena_for_inode(&self.db.begin_read()?, inode)?
             .ok_or(StorageError::NotFound)?;
         self.arena_cache(arena)
     }
 
-    /// Add an arena to the database.
-    pub(crate) fn add_arena(
-        &mut self,
-        arena: Arena,
-        db: Arc<ArenaDatabase>,
-        blob_dir: PathBuf,
-        dirty_paths: Arc<DirtyPaths>,
-    ) -> anyhow::Result<()> {
-        let arena_root = match self.arena_roots.get_by_left(&arena) {
-            Some(inode) => *inode,
-            None => {
-                for existing in self.arena_roots.left_values() {
-                    check_arena_compatibility(arena, *existing)?;
-                }
+    /// Register an [ArenaCache] that handles calls for a specific arena.
+    ///
+    /// Calls for inode assigned to the cache arena will be directed there.
+    pub(crate) fn register(&mut self, cache: Arc<ArenaCache>) -> anyhow::Result<()> {
+        let arena = cache.arena();
+        let arena_root = self
+            .allocator
+            .arena_root(arena)
+            .ok_or_else(|| StorageError::UnknownArena(arena))?;
 
-                let txn = self.db.begin_write()?;
-                let arena_root = do_add_arena_root(&txn, arena)?;
-                txn.commit()?;
-
-                self.arena_roots.insert(arena, arena_root);
-
-                arena_root
-            }
-        };
-        self.arena_caches.insert(
-            arena,
-            ArenaCache::new(arena, arena_root, db, blob_dir, dirty_paths)?,
-        );
+        for existing in self.arena_caches.keys().map(|a| *a) {
+            check_arena_compatibility(arena, existing)?;
+        }
+        self.add_arena_root(arena, arena_root)?;
+        self.arena_caches.insert(cache.arena(), cache);
 
         Ok(())
     }
@@ -116,7 +93,7 @@ impl UnrealCacheBlocking {
     /// Lookup a directory entry.
     pub fn lookup(&self, parent_inode: Inode, name: &str) -> Result<ReadDirEntry, StorageError> {
         let txn = self.db.begin_read()?;
-        match self.arena_for_inode(&txn, parent_inode)? {
+        match self.allocator.arena_for_inode(&txn, parent_inode)? {
             Some(arena) => self.arena_cache(arena)?.lookup(parent_inode, name),
             None => arena_cache::do_lookup(&txn.directory_table()?, parent_inode, name),
         }
@@ -134,7 +111,7 @@ impl UnrealCacheBlocking {
     /// Return the mtime of the directory.
     pub fn dir_mtime(&self, inode: Inode) -> Result<UnixTime, StorageError> {
         let txn = self.db.begin_read()?;
-        match self.arena_for_inode(&txn, inode)? {
+        match self.allocator.arena_for_inode(&txn, inode)? {
             None => arena_cache::do_dir_mtime(
                 &txn.directory_table()?,
                 inode,
@@ -146,7 +123,7 @@ impl UnrealCacheBlocking {
 
     pub fn readdir(&self, inode: Inode) -> Result<Vec<(String, ReadDirEntry)>, StorageError> {
         let txn = self.db.begin_read()?;
-        match self.arena_for_inode(&txn, inode)? {
+        match self.allocator.arena_for_inode(&txn, inode)? {
             None => arena_cache::do_readdir(&txn.directory_table()?, inode),
             Some(arena) => self.arena_cache(arena)?.readdir(inode),
         }
@@ -159,60 +136,44 @@ impl UnrealCacheBlocking {
     ) -> Result<(), StorageError> {
         let arena = notification.arena();
         let cache = self.arena_cache(arena)?;
-        cache.update(peer, notification, || self.alloc_inode_range(arena))
+        cache.update(peer, notification)
     }
 
-    /// Allocate a new range of inodes to an arena.
-    ///
-    /// This function allocates a range of `range_size` inodes to the given arena.
-    /// It finds the last allocated range and allocates the next available range.
-    ///
-    /// Returns the allocated range as (start, end) where end is exclusive.
-    fn alloc_inode_range(&self, arena: Arena) -> Result<(Inode, Inode), StorageError> {
-        let arena_root = self.arena_root(arena)?;
-
+    fn add_arena_root(&self, arena: Arena, arena_root: Inode) -> anyhow::Result<()> {
         let txn = self.db.begin_write()?;
-        let ret = do_alloc_inode_range(&txn, arena_root, RANGE_SIZE)?;
+        {
+            let mut dir_table = txn.directory_table()?;
 
-        // If the transaction inside the arena cache fails to commit,
-        // the range is lost. TODO: find a way of avoiding such
-        // issues.
+            let arena_path = Path::parse(arena.as_str())?;
+            if arena_cache::do_lookup_path(
+                &dir_table,
+                UnrealCacheBlocking::ROOT_DIR,
+                Some(&arena_path),
+            )
+            .is_ok()
+            {
+                return Ok(());
+            }
+
+            let parent_inode = arena_cache::do_mkdirs(
+                &mut dir_table,
+                UnrealCacheBlocking::ROOT_DIR,
+                arena_path.parent().as_ref(),
+                &|| self.allocator.allocate_global_inode(&txn),
+            )?;
+            arena_cache::add_dir_entry(
+                &mut dir_table,
+                parent_inode,
+                arena_root,
+                arena_path.name(),
+                InodeAssignment::Directory,
+            )?;
+
+            log::debug!("Mkdir {arena}; inode {arena_root}");
+        }
         txn.commit()?;
 
-        Ok(ret)
-    }
-
-    /// Lookup the arena assigned to `inode`, fail if it has no assigned
-    /// arenas yet.
-    ///
-    /// None is for global nodes, such as the root node and intermediate
-    /// directories created for arenas with compound names, such as
-    /// "documents/others". Note that inodes of arena roots are assigned
-    /// to their own arena.
-    fn arena_for_inode(
-        &self,
-        txn: &GlobalReadTransaction,
-        inode: Inode,
-    ) -> Result<Option<Arena>, StorageError> {
-        if inode == UnrealCacheBlocking::ROOT_DIR {
-            return Ok(None);
-        }
-        if let Some(arena) = self.arena_roots.get_by_right(&inode) {
-            return Ok(Some(*arena));
-        }
-
-        let range_table = txn.inode_range_allocation_table()?;
-        for entry in range_table.range(inode..)? {
-            let (_, root) = entry?;
-            let root = root.value();
-            if root == UnrealCacheAsync::ROOT_DIR {
-                return Ok(None);
-            } else if let Some(arena) = self.arena_roots.get_by_right(&root) {
-                return Ok(Some(*arena));
-            }
-        }
-
-        Err(StorageError::NotFound)
+        Ok(())
     }
 }
 
@@ -235,17 +196,16 @@ impl UnrealCacheAsync {
     /// Create a new cache with the database at the given path.
     pub(crate) async fn with_db<T>(
         db: Arc<GlobalDatabase>,
-        arenas: T,
+        allocator: Arc<InodeAllocator>,
+        caches: T,
     ) -> Result<Self, anyhow::Error>
     where
-        T: IntoIterator<Item = (Arena, Arc<ArenaDatabase>, PathBuf, Arc<DirtyPaths>)>
-            + Send
-            + 'static,
+        T: IntoIterator<Item = Arc<ArenaCache>> + Send + 'static,
     {
         task::spawn_blocking(move || {
-            let mut cache = UnrealCacheBlocking::new(db)?;
-            for (arena, db, blob_dir, dirty_paths) in arenas.into_iter() {
-                cache.add_arena(arena, db, blob_dir, dirty_paths)?;
+            let mut cache = UnrealCacheBlocking::new(db, allocator);
+            for arena_cache in caches.into_iter() {
+                cache.register(arena_cache)?;
             }
 
             Ok::<_, anyhow::Error>(Self::new(cache))
@@ -396,19 +356,6 @@ impl UnrealCacheAsync {
     }
 }
 
-fn do_read_arena_map(txn: &GlobalReadTransaction) -> Result<BiMap<Arena, Inode>, StorageError> {
-    let mut map = BiMap::new();
-    let arena_table = txn.arena_table()?;
-    for elt in arena_table.iter()? {
-        let (k, v) = elt?;
-        let arena = Arena::from(k.value());
-        let inode = v.value();
-        map.insert(arena, inode);
-    }
-
-    Ok(map)
-}
-
 fn check_arena_compatibility(arena: Arena, existing: Arena) -> anyhow::Result<()> {
     fn is_path_prefix(prefix: &str, arena: &str) -> bool {
         if let Some(rest) = arena.strip_prefix(prefix) {
@@ -428,59 +375,10 @@ fn check_arena_compatibility(arena: Arena, existing: Arena) -> anyhow::Result<()
     Ok(())
 }
 
-fn do_add_arena_root(txn: &GlobalWriteTransaction, arena: Arena) -> anyhow::Result<Inode> {
-    let mut arena_table = txn.arena_table()?;
-    let arena_str = arena.as_str();
-    if let Some(v) = arena_table.get(arena_str)? {
-        return Ok(v.value());
-    }
-    let mut dir_table = txn.directory_table()?;
-    let mut current_range_table = txn.current_inode_range_table()?;
-    let arena_path = Path::parse(arena.as_str())?;
-    let alloc_inode_range = || do_alloc_inode_range(txn, UnrealCacheBlocking::ROOT_DIR, 100);
-    let parent_inode = arena_cache::do_mkdirs(
-        &mut current_range_table,
-        &mut dir_table,
-        UnrealCacheBlocking::ROOT_DIR,
-        arena_path.parent().as_ref(),
-        &alloc_inode_range,
-    )?;
-    let arena_root = arena_cache::alloc_inode(&mut current_range_table, &alloc_inode_range)?;
-    arena_cache::add_dir_entry(
-        &mut dir_table,
-        parent_inode,
-        arena_root,
-        arena_path.name(),
-        InodeAssignment::Directory,
-    )?;
-    arena_table.insert(arena.as_str(), arena_root)?;
-
-    log::debug!("Arena root {arena}: {arena_root}");
-
-    Ok(arena_root)
-}
-
-fn do_alloc_inode_range(
-    txn: &GlobalWriteTransaction,
-    assigned_root: Inode,
-    range_size: u64,
-) -> Result<(Inode, Inode), StorageError> {
-    let mut range_table = txn.inode_range_allocation_table()?;
-
-    let last_end = range_table
-        .last()?
-        .map(|(key, _)| key.value())
-        .unwrap_or(Inode(1));
-
-    let new_range_start = last_end.plus(1);
-    let new_range_end = new_range_start.plus(range_size);
-    range_table.insert(new_range_end.minus(1), assigned_root)?;
-
-    Ok((new_range_start, new_range_end))
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::ArenaDatabase;
+    use crate::DirtyPaths;
     use crate::utils::redb_utils;
 
     use super::*;
@@ -494,46 +392,42 @@ mod tests {
 
     struct Fixture {
         cache: UnrealCacheBlocking,
-        tempdir: TempDir,
+        _tempdir: TempDir,
     }
     impl Fixture {
-        fn setup() -> anyhow::Result<Fixture> {
+        async fn setup_with_arena(arena: Arena) -> anyhow::Result<Self> {
+            Self::setup_with_arenas([arena]).await
+        }
+
+        async fn setup_with_arenas<T>(arenas: T) -> anyhow::Result<Self>
+        where
+            T: IntoIterator<Item = Arena>,
+        {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
-            let cache = UnrealCacheBlocking::new(GlobalDatabase::new(redb_utils::in_memory()?)?)?;
-            Ok(Self { cache, tempdir })
-        }
 
-        async fn setup_with_arena(arena: Arena) -> anyhow::Result<Fixture> {
-            let mut fixture = Self::setup()?;
-            fixture.add_arena(arena).await?;
+            let arenas = arenas.into_iter().collect::<Vec<_>>();
+            let db = GlobalDatabase::new(redb_utils::in_memory()?)?;
+            let allocator = InodeAllocator::new(Arc::clone(&db), arenas.clone())?;
+            let mut cache = UnrealCacheBlocking::new(Arc::clone(&db), Arc::clone(&allocator));
 
-            Ok(fixture)
-        }
-
-        async fn add_arena(&mut self, arena: Arena) -> anyhow::Result<()> {
-            let blob_dir = self.tempdir.child(format!("{arena}/blobs"));
-            blob_dir.create_dir_all()?;
-            let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
-            let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-            self.cache
-                .add_arena(arena, db, blob_dir.to_path_buf(), dirty_paths)?;
-            Ok(())
-        }
-
-        /// Get the current inode range in the current database.
-        /// If no range exists, returns None.
-        fn get_current_inode_range(&self) -> Result<Option<(Inode, Inode)>, StorageError> {
-            let txn = self.cache.db.begin_write()?;
-            let range_table = txn.current_inode_range_table()?;
-
-            match range_table.get(())? {
-                Some(value) => {
-                    let (current, end) = value.value();
-                    Ok(Some((current, end)))
-                }
-                None => Ok(None),
+            for arena in arenas {
+                let blob_dir = tempdir.child(format!("{arena}/blobs"));
+                blob_dir.create_dir_all()?;
+                let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
+                let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
+                cache.register(ArenaCache::new(
+                    arena,
+                    Arc::clone(&allocator),
+                    db,
+                    blob_dir.path(),
+                    dirty_paths,
+                )?)?;
             }
+            Ok(Self {
+                cache,
+                _tempdir: tempdir,
+            })
         }
     }
 
@@ -554,10 +448,12 @@ mod tests {
 
     #[tokio::test]
     async fn lookup_finds_entry() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup()?;
-        fixture.add_arena(Arena::from("arenas/test1")).await?;
-        fixture.add_arena(Arena::from("arenas/test2")).await?;
-        fixture.add_arena(Arena::from("other")).await?;
+        let fixture = Fixture::setup_with_arenas([
+            Arena::from("arenas/test1"),
+            Arena::from("arenas/test2"),
+            Arena::from("other"),
+        ])
+        .await?;
 
         let cache = &fixture.cache;
 
@@ -591,10 +487,12 @@ mod tests {
 
     #[tokio::test]
     async fn readdir_returns_arena_dirs() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup()?;
-        fixture.add_arena(Arena::from("arenas/test1")).await?;
-        fixture.add_arena(Arena::from("arenas/test2")).await?;
-        fixture.add_arena(Arena::from("other")).await?;
+        let fixture = Fixture::setup_with_arenas([
+            Arena::from("arenas/test1"),
+            Arena::from("arenas/test2"),
+            Arena::from("other"),
+        ])
+        .await?;
 
         let cache = &fixture.cache;
         assert_unordered::assert_eq_unordered!(
@@ -621,71 +519,6 @@ mod tests {
                 .map(|(name, entry)| (name, entry.assignment))
                 .collect::<Vec<_>>(),
         );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn alloc_inode() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup()?;
-
-        assert!(fixture.get_current_inode_range()?.is_none());
-
-        fixture.add_arena(Arena::from("others")).await?;
-        assert_eq!(
-            Some((Inode(2), Inode(102))),
-            fixture.get_current_inode_range()?
-        );
-        assert_eq!(Inode(2), fixture.cache.arena_root(Arena::from("others"))?);
-
-        fixture.add_arena(Arena::from("arenas/test1")).await?;
-        assert_eq!(
-            Some((Inode(4), Inode(102))),
-            fixture.get_current_inode_range()?
-        );
-        assert_eq!(
-            Inode(4),
-            fixture.cache.arena_root(Arena::from("arenas/test1"))?
-        );
-
-        fixture.add_arena(Arena::from("arenas/test2")).await?;
-        assert_eq!(
-            Some((Inode(5), Inode(102))),
-            fixture.get_current_inode_range()?
-        );
-        assert_eq!(
-            Inode(5),
-            fixture.cache.arena_root(Arena::from("arenas/test2"))?
-        );
-
-        // Nearly exhaust the range
-        {
-            let txn = fixture.cache.db.begin_write()?;
-            {
-                let mut range_table = txn.current_inode_range_table()?;
-                range_table.insert((), (Inode(100), Inode(102)))?;
-            }
-            txn.commit()?;
-        }
-
-        // Next allocation exhausts the range
-        fixture.add_arena(Arena::from("another")).await?;
-        assert_eq!(
-            Some((Inode(101), Inode(102))),
-            fixture.get_current_inode_range()?
-        );
-        assert_eq!(
-            Inode(101),
-            fixture.cache.arena_root(Arena::from("another"))?
-        );
-
-        // Next inode allocation require a new range allocation.
-        fixture.add_arena(Arena::from("theone")).await?;
-        assert_eq!(
-            Some((Inode(102), Inode(202))),
-            fixture.get_current_inode_range()?
-        );
-        assert_eq!(Inode(102), fixture.cache.arena_root(Arena::from("theone"))?);
 
         Ok(())
     }
