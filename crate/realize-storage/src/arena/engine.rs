@@ -1,6 +1,7 @@
 #![allow(dead_code)] // work in progress
 
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
+use super::index;
 use super::types::{FailedJobTableEntry, LocalAvailability};
 use crate::arena::arena_cache;
 use crate::arena::blob;
@@ -19,6 +20,11 @@ use tokio_stream::wrappers::ReceiverStream;
 #[derive(Eq, PartialEq, Debug, Clone)]
 pub enum Job {
     Download(Path, u64, Hash),
+
+    /// Realize `Path` with `counter`, moving `Hash` from cache to the
+    /// index, currently containing nothing or `Hash`.
+    /// TODO: use named fields
+    Realize(Path, u64, Hash, Option<Hash>),
 }
 
 impl Job {
@@ -26,6 +32,7 @@ impl Job {
     pub fn path(&self) -> &Path {
         match self {
             Job::Download(path, _, _) => path,
+            Job::Realize(path, _, _, _) => path,
         }
     }
 
@@ -33,6 +40,7 @@ impl Job {
     pub fn counter(&self) -> u64 {
         match self {
             Job::Download(_, counter, _) => *counter,
+            Job::Realize(_, counter, _, _) => *counter,
         }
     }
 
@@ -43,6 +51,9 @@ impl Job {
     pub fn with_counter(self, counter: u64) -> Job {
         match self {
             Job::Download(path, _, hash) => Job::Download(path, counter, hash),
+            Job::Realize(path, _, cached_hash, indexed_hash) => {
+                Job::Realize(path, counter, cached_hash, indexed_hash)
+            }
         }
     }
 }
@@ -493,7 +504,7 @@ impl Engine {
     ) -> Result<Option<Job>, StorageError> {
         match mark::get_mark(txn, &path)? {
             Mark::Watch => Ok(None),
-            Mark::Keep | Mark::Own => {
+            Mark::Keep => {
                 if let Ok(file_entry) =
                     arena_cache::get_file_entry_for_path(txn, self.arena_root, &path)
                     && blob::local_availability(txn, &file_entry)? != LocalAvailability::Verified
@@ -502,6 +513,32 @@ impl Engine {
                 } else {
                     Ok(None)
                 }
+            }
+            Mark::Own => {
+                if let Ok(cached) =
+                    arena_cache::get_file_entry_for_path(txn, self.arena_root, &path)
+                {
+                    let from_index = index::get_file_entry(txn, &path).ok().flatten();
+                    if from_index.is_none() {
+                        // File is missing from the index, move it there.
+                        return Ok(Some(Job::Realize(path, counter, cached.content.hash, None)));
+                    }
+                    if let Some(indexed) = from_index
+                        && cached
+                            .outdated_versions
+                            .map(|v| v.contains(&indexed.hash))
+                            .unwrap_or(false)
+                    {
+                        // File in the index is outdated, updated it.
+                        return Ok(Some(Job::Realize(
+                            path,
+                            counter,
+                            cached.content.hash,
+                            Some(indexed.hash),
+                        )));
+                    }
+                }
+                Ok(None)
             }
         }
     }
@@ -700,6 +737,7 @@ mod tests {
     use super::*;
     use crate::Notification;
     use crate::arena::arena_cache::ArenaCache;
+    use crate::arena::index::RealIndexBlocking;
     use crate::arena::mark::PathMarks;
     use crate::utils::redb_utils;
     use assert_fs::TempDir;
@@ -734,6 +772,7 @@ mod tests {
         db: Arc<ArenaDatabase>,
         dirty_paths: Arc<DirtyPaths>,
         acache: ArenaCache,
+        index: RealIndexBlocking,
         pathmarks: PathMarks,
         engine: Arc<Engine>,
         _tempdir: TempDir,
@@ -755,6 +794,7 @@ mod tests {
                 tempdir.path().join("blobs"),
                 Arc::clone(&dirty_paths),
             )?;
+            let index = RealIndexBlocking::new(arena, Arc::clone(&db), Arc::clone(&dirty_paths))?;
             let pathmarks = PathMarks::new(Arc::clone(&db), arena_root, Arc::clone(&dirty_paths))?;
             let engine = Engine::new(
                 arena,
@@ -775,6 +815,7 @@ mod tests {
                 db,
                 dirty_paths,
                 acache,
+                index,
                 engine,
                 pathmarks,
                 _tempdir: tempdir,
@@ -783,13 +824,17 @@ mod tests {
 
         /// Add a file to the cache for testing
         fn add_file_to_cache(&self, path: &Path) -> anyhow::Result<()> {
+            self.add_file_to_cache_with_version(path, test_hash())
+        }
+
+        fn add_file_to_cache_with_version(&self, path: &Path, hash: Hash) -> anyhow::Result<()> {
             self.update_cache(Notification::Add {
                 arena: self.arena,
                 index: 1,
                 path: path.clone(),
                 mtime: UnixTime::from_secs(1234567890),
                 size: 4,
-                hash: test_hash(),
+                hash,
             })
         }
 
@@ -800,6 +845,12 @@ mod tests {
                 path: path.clone(),
                 old_hash: test_hash(),
             })
+        }
+
+        fn add_file_to_index_with_version(&self, path: &Path, hash: Hash) -> anyhow::Result<()> {
+            Ok(self
+                .index
+                .add_file(path, 100, &UnixTime::from_secs(1234567889), hash)?)
         }
 
         fn update_cache(&self, notification: Notification) -> anyhow::Result<()> {
@@ -1091,6 +1142,109 @@ mod tests {
 
         // The entries before the job that have been deleted.
         assert_eq!(Some(3), fixture.lowest_counter()?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_stream_file_to_own_not_in_index() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let foobar = Path::parse("foo/bar")?;
+
+        fixture.pathmarks.set_arena_mark(Mark::Own)?;
+        fixture.add_file_to_cache(&foobar)?;
+
+        let mut job_stream = fixture.engine.job_stream();
+
+        let job = next_with_timeout(&mut job_stream).await?.unwrap();
+        assert_eq!(Job::Realize(foobar, 1, test_hash(), None), job);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_stream_file_to_own_in_index_with_same_version() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let foobar = Path::parse("foo/bar")?;
+        let otherfile = Path::parse("other")?;
+
+        fixture.pathmarks.set_arena_mark(Mark::Own)?;
+        fixture.add_file_to_cache_with_version(&foobar, Hash([1; 32]))?;
+        fixture.add_file_to_index_with_version(&foobar, Hash([1; 32]))?;
+
+        // Add something else for the stream to return, or it'll just
+        // hang forever.
+        fixture.pathmarks.set_mark(&otherfile, Mark::Keep)?;
+        fixture.add_file_to_cache(&otherfile)?;
+
+        let mut job_stream = fixture.engine.job_stream();
+
+        let job = next_with_timeout(&mut job_stream).await?.unwrap();
+        // 1 has been skipped, since the file is in the index
+        assert_eq!(Job::Download(otherfile, 3, test_hash()), job);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_stream_file_to_own_in_index_with_different_version() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let foobar = Path::parse("foo/bar")?;
+        let otherfile = Path::parse("other")?;
+
+        fixture.pathmarks.set_arena_mark(Mark::Own)?;
+        fixture.add_file_to_cache_with_version(&foobar, Hash([1; 32]))?;
+        fixture.add_file_to_index_with_version(&foobar, Hash([2; 32]))?;
+
+        // Add something else for the stream to return, or it'll just
+        // hang forever.
+        fixture.pathmarks.set_mark(&otherfile, Mark::Keep)?;
+        fixture.add_file_to_cache(&otherfile)?;
+
+        let mut job_stream = fixture.engine.job_stream();
+
+        let job = next_with_timeout(&mut job_stream).await?.unwrap();
+        // 1 has been skipped, since the file is in the index
+        assert_eq!(Job::Download(otherfile, 3, test_hash()), job);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_stream_file_to_own_in_index_with_outdated_version() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let foobar = Path::parse("foo/bar")?;
+
+        fixture.pathmarks.set_arena_mark(Mark::Own)?;
+
+        // Cache and index have the same version
+        fixture.add_file_to_cache_with_version(&foobar, Hash([1; 32]))?;
+        fixture.add_file_to_index_with_version(&foobar, Hash([1; 32]))?;
+
+        // Version tracking is enabled in the cache (normally by a
+        // previous run of Realize).
+        let (inode, _) = fixture.acache.lookup_path(&foobar)?;
+        fixture.acache.start_tracking_outdated_versions(inode)?;
+
+        // A new version comes in that replaces the version in the
+        // cache/index.
+        fixture.update_cache(Notification::Replace {
+            arena: fixture.arena,
+            index: 1,
+            path: foobar.clone(),
+            mtime: UnixTime::from_secs(1234567890),
+            size: 4,
+            hash: Hash([2; 32]),
+            old_hash: Hash([1; 32]),
+        })?;
+
+        let mut job_stream = fixture.engine.job_stream();
+
+        let job = next_with_timeout(&mut job_stream).await?.unwrap();
+        assert_eq!(
+            Job::Realize(foobar, 3, Hash([2; 32]), Some(Hash([1; 32]))),
+            job
+        );
 
         Ok(())
     }

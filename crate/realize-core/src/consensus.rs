@@ -1,4 +1,4 @@
 pub(crate) mod churten;
-mod download;
+mod jobs;
 pub mod movedirs;
 mod progress;

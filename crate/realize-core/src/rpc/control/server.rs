@@ -209,17 +209,16 @@ fn mark_to_capnp(mark: Mark) -> control_capnp::Mark {
 fn fill_notification(source: ChurtenNotification, mut dest: churten_notification::Builder<'_>) {
     let arena = source.arena();
     let job = source.job();
-    let path = job.path().as_str().to_owned();
-    let hash = match &**job {
-        realize_storage::Job::Download(_, _, hash) => hash.0.clone(),
-    };
 
     dest.set_arena(&arena.as_str());
     // Set job fields using reborrow
     let mut job_builder = dest.reborrow().init_job();
-    job_builder.set_path(&path);
+    job_builder.set_path(job.path().as_str());
     let mut download = job_builder.init_download();
-    download.set_hash(&hash);
+    download.set_hash(match &**job {
+        realize_storage::Job::Download(_, _, hash) => &hash.0,
+        realize_storage::Job::Realize(_, _, hash, _) => &hash.0,
+    });
     // Set notification type
     match &source {
         ChurtenNotification::Update { progress, .. } => {
@@ -252,6 +251,7 @@ fn fill_notification(source: ChurtenNotification, mut dest: churten_notification
                 JobAction::Download => update.set_action(control_capnp::JobAction::Download),
                 JobAction::Verify => update.set_action(control_capnp::JobAction::Verify),
                 JobAction::Repair => update.set_action(control_capnp::JobAction::Repair),
+                JobAction::Move => update.set_action(control_capnp::JobAction::Move),
             }
         }
         ChurtenNotification::UpdateByteCount {

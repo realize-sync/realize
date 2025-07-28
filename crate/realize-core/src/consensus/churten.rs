@@ -1,6 +1,6 @@
 #![allow(dead_code)] // work in progress
 
-use super::download::download;
+use super::jobs;
 use super::progress::ByteCountProgress;
 use crate::rpc::Household;
 use futures::StreamExt;
@@ -100,6 +100,7 @@ pub(crate) enum JobAction {
     Download,
     Verify,
     Repair,
+    Move,
 }
 
 /// A type that processes jobs and returns the result for [Churten].
@@ -288,12 +289,25 @@ impl JobHandler for JobHandlerImpl {
         };
         match &**job {
             Job::Download(path, _, hash) => {
-                download(
+                jobs::download(
                     &self.storage,
                     &self.household,
                     arena,
                     path,
                     hash,
+                    &mut progress,
+                    shutdown,
+                )
+                .await
+            }
+            Job::Realize(path, _, hash, index_hash) => {
+                jobs::realize(
+                    &self.storage,
+                    &self.household,
+                    arena,
+                    path,
+                    hash,
+                    index_hash.as_ref(),
                     &mut progress,
                     shutdown,
                 )

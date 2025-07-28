@@ -289,6 +289,52 @@ impl ArenaCache {
         Ok(ret)
     }
 
+    /// Move the blob entry for `path` to `dest` and delete the blob.
+    ///
+    /// Also enables version tracking on `path` to allow detecting
+    /// when `dest` becomes out-of-date.
+    ///
+    /// Gives up and returns false if `path` doesn't have a verified
+    /// blob with version `hash`.
+    pub(crate) fn move_blob(
+        &self,
+        path: &Path,
+        hash: &Hash,
+        dest: &std::path::Path,
+    ) -> Result<bool, StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let (inode, _) =
+                do_lookup_path(&txn.cache_directory_table()?, self.arena_root, Some(path))?;
+            let mut file_table = txn.cache_file_table()?;
+            let mut file_entry = get_default_entry(&file_table, inode)?;
+            if file_entry.content.hash != *hash {
+                return Ok(false);
+            }
+            let blob_id = match file_entry.content.blob {
+                None => {
+                    return Err(StorageError::NotFound);
+                }
+                Some(id) => id,
+            };
+
+            if !self.blobstore.move_blob(&txn, blob_id, hash, dest)? {
+                return Ok(false);
+            }
+
+            // Track outdated versions to be able to, later on, update
+            // the file in the index when necessary.
+            file_entry.outdated_versions = Some(vec![]);
+            file_entry.content.blob = None;
+            file_table.insert((inode, ""), Holder::with_content(file_entry)?)?;
+
+            log::debug!("Realized [{}]/{path} {hash} as {dest:?}", self.arena);
+        }
+        txn.commit()?;
+
+        Ok(true)
+    }
+
     /// Write an entry in the file table, overwriting any existing one.
     fn do_write_file_entry(
         &self,
@@ -320,7 +366,7 @@ impl ArenaCache {
         if let Some(old_entry) = file_table.get((file_inode, ""))? {
             let mut old_entry = old_entry.value().parse()?;
             if let Some(blob_id) = old_entry.content.blob {
-                self.blobstore.delete_blob(blob_id)?;
+                self.blobstore.delete_blob(&txn, blob_id)?;
             }
             if let Some(mut outdated_versions) = std::mem::take(&mut old_entry.outdated_versions) {
                 if entry.content.hash != old_entry.content.hash {
@@ -401,7 +447,7 @@ impl ArenaCache {
             if let Some(default_entry) = file_table.get((inode, ""))? {
                 let default_entry = default_entry.value().parse()?;
                 if let Some(blob_id) = default_entry.content.blob {
-                    self.blobstore.delete_blob(blob_id)?;
+                    self.blobstore.delete_blob(&txn, blob_id)?;
                 }
             }
 

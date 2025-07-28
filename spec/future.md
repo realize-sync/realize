@@ -3,7 +3,6 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
-## job action: realize + Available notification {#realize}
 ## job action: unrealize + Removed notification {#unrealize}
 ## add job action to ChurtenNotification #action
 ## "realize-control churten run" {#churten-run}

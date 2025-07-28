@@ -464,6 +464,25 @@ impl UnrealCacheAsync {
         })
         .await?
     }
+
+    pub async fn move_blob(
+        &self,
+        arena: Arena,
+        path: &Path,
+        hash: &Hash,
+        dest: &std::path::Path,
+    ) -> Result<bool, StorageError> {
+        let inner = Arc::clone(&self.inner);
+        let path = path.clone();
+        let hash = hash.clone();
+        let dest = dest.to_path_buf();
+
+        task::spawn_blocking(move || {
+            let arena_cache = inner.arena_cache(arena)?;
+            arena_cache.move_blob(&path, &hash, &dest)
+        })
+        .await?
+    }
 }
 
 fn do_read_arena_map(txn: &ReadTransaction) -> Result<BiMap<Arena, Inode>, StorageError> {

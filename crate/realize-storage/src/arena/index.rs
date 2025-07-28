@@ -112,13 +112,7 @@ impl RealIndexBlocking {
         path: &realize_types::Path,
     ) -> Result<Option<IndexedFileTableEntry>, StorageError> {
         let txn = self.db.begin_read()?;
-        let file_table = txn.index_file_table()?;
-
-        if let Some(entry) = file_table.get(path.as_str())? {
-            return Ok(Some(entry.value().parse()?));
-        }
-
-        Ok(None)
+        get_file_entry(&txn, path)
     }
 
     /// Check whether a given file is in the index already.
@@ -279,6 +273,19 @@ impl RealIndexBlocking {
         });
         Ok(entry_index)
     }
+}
+
+pub(crate) fn get_file_entry(
+    txn: &super::db::ArenaReadTransaction,
+    path: &realize_types::Path,
+) -> Result<Option<IndexedFileTableEntry>, StorageError> {
+    let file_table = txn.index_file_table()?;
+
+    if let Some(entry) = file_table.get(path.as_str())? {
+        return Ok(Some(entry.value().parse()?));
+    }
+
+    Ok(None)
 }
 
 /// Helper for iterating over a range of paths.

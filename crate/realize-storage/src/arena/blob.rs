@@ -132,11 +132,18 @@ impl Blobstore {
     }
 
     /// Delete a blob and its associated file.
-    pub(crate) fn delete_blob(&self, blob_id: BlobId) -> Result<(), StorageError> {
+    pub(crate) fn delete_blob(
+        &self,
+        txn: &ArenaWriteTransaction,
+        blob_id: BlobId,
+    ) -> Result<(), StorageError> {
+        let mut blob_table = txn.blob_table()?;
+        blob_table.remove(blob_id)?;
         let blob_path = self.blob_path(blob_id);
         if blob_path.exists() {
             std::fs::remove_file(&blob_path)?;
         }
+
         Ok(())
     }
 
@@ -176,6 +183,35 @@ impl Blobstore {
         txn.commit()?;
 
         Ok(())
+    }
+
+    /// Move the file of `blob_id` to `dest` and delete the entry.
+    ///
+    /// Does nothing and return false unless the blob content hash is
+    /// `content_hash`, which means that the corresponding file must
+    /// have been fully downloaded and verified before moving.
+    pub(crate) fn move_blob(
+        &self,
+        txn: &ArenaWriteTransaction,
+        blob_id: BlobId,
+        content_hash: &Hash,
+        dest: &std::path::Path,
+    ) -> Result<bool, StorageError> {
+        let mut blob_table = txn.blob_table()?;
+        let blob_entry = get_blob_entry(&blob_table, blob_id)?;
+        if !blob_entry
+            .content_hash
+            .as_ref()
+            .map(|h| *h == *content_hash)
+            .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+
+        blob_table.remove(blob_id)?;
+        std::fs::rename(self.blob_path(blob_id), dest)?;
+
+        Ok(true)
     }
 }
 
@@ -632,6 +668,16 @@ mod tests {
             let blob_table = txn.blob_table()?;
             Ok(get_blob_entry(&blob_table, blob_id)?)
         }
+
+        /// Check if a blob entry exists in the database.
+        fn blob_entry_exists(&self, blob_id: BlobId) -> anyhow::Result<bool> {
+            let txn = self.begin_read()?;
+            let blob_table = txn.blob_table()?;
+            match blob_table.get(blob_id)? {
+                Some(_) => Ok(true),
+                None => Ok(false),
+            }
+        }
     }
 
     #[tokio::test]
@@ -866,6 +912,8 @@ mod tests {
 
         // Verify the blob file was created
         assert!(fixture.blob_file_exists(arena, blob_id));
+        // Verify the blob entry exists in the database
+        assert!(fixture.blob_entry_exists(blob_id)?);
 
         // Overwrite the file with a new version
         cache.update(
@@ -883,6 +931,8 @@ mod tests {
 
         // Verify the blob file has been deleted
         assert!(!fixture.blob_file_exists(arena, blob_id));
+        // Verify the blob entry has been deleted from the database
+        assert!(!fixture.blob_entry_exists(blob_id)?);
 
         Ok(())
     }
@@ -903,12 +953,16 @@ mod tests {
 
         // Verify the blob file was created
         assert!(fixture.blob_file_exists(arena, blob_id));
+        // Verify the blob entry exists in the database
+        assert!(fixture.blob_entry_exists(blob_id)?);
 
         // Remove the file
         fixture.remove_file(&file_path)?;
 
         // Verify the blob file has been deleted
         assert!(!fixture.blob_file_exists(arena, blob_id));
+        // Verify the blob entry has been deleted from the database
+        assert!(!fixture.blob_entry_exists(blob_id)?);
 
         Ok(())
     }
@@ -930,6 +984,8 @@ mod tests {
 
         // Verify the blob file was created
         assert!(fixture.blob_file_exists(arena, blob_id));
+        // Verify the blob entry exists in the database
+        assert!(fixture.blob_entry_exists(blob_id)?);
 
         // Do a catchup that doesn't include this file (simulating file removal)
         cache.update(test_peer(), Notification::CatchupStart(arena))?;
@@ -944,6 +1000,8 @@ mod tests {
 
         // Verify the blob file has been deleted
         assert!(!fixture.blob_file_exists(arena, blob_id));
+        // Verify the blob entry has been deleted from the database
+        assert!(!fixture.blob_entry_exists(blob_id)?);
 
         Ok(())
     }
@@ -1005,6 +1063,213 @@ mod tests {
             acache.extend_local_availability(BlobId(99999), &ByteRanges::new()),
             Err(StorageError::NotFound)
         ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_move_blob_success() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena).await?;
+        let acache = fixture.arena_cache()?;
+        let file_path = Path::parse("test.txt")?;
+
+        // Create a file and add it to the cache
+        fixture.add_file_with_mtime(&file_path, 100, &test_time())?;
+
+        // Open the file to create a blob
+        let (inode, _) = acache.lookup_path(&file_path)?;
+        let blob_id = acache.open_file(inode)?.id();
+
+        // Write some data to the blob and mark it as verified
+        let mut blob = fixture.async_cache.open_file(inode).await?;
+        blob.write(b"test content").await?;
+        blob.update_db().await?;
+        blob.mark_verified().await?;
+
+        // Verify the blob file exists and has content
+        assert!(fixture.blob_file_exists(arena, blob_id));
+        assert!(fixture.blob_entry_exists(blob_id)?);
+
+        // Create destination path
+        let dest_path = fixture.tempdir.child("moved_blob").to_path_buf();
+
+        // Move the blob
+        let result = acache.move_blob(&file_path, &test_hash(), &dest_path)?;
+
+        // Verify the move was successful
+        assert!(result);
+
+        // Verify the blob file has been moved
+        assert!(!fixture.blob_file_exists(arena, blob_id));
+        assert!(dest_path.exists());
+
+        // Verify the blob entry has been deleted from the database
+        assert!(!fixture.blob_entry_exists(blob_id)?);
+
+        // Verify the content was moved correctly
+        let moved_content = std::fs::read_to_string(&dest_path)?;
+        assert_eq!("test content", moved_content.trim_end_matches('\0'));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_move_blob_wrong_hash() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena).await?;
+        let acache = fixture.arena_cache()?;
+        let file_path = Path::parse("test.txt")?;
+
+        // Create a file and add it to the cache
+        fixture.add_file_with_mtime(&file_path, 100, &test_time())?;
+
+        // Open the file to create a blob
+        let (inode, _) = acache.lookup_path(&file_path)?;
+        let blob_id = acache.open_file(inode)?.id();
+
+        // Write some data to the blob and mark it as verified
+        let mut blob = fixture.async_cache.open_file(inode).await?;
+        blob.write(b"test content").await?;
+        blob.update_db().await?;
+        blob.mark_verified().await?;
+
+        // Verify the blob file exists
+        assert!(fixture.blob_file_exists(arena, blob_id));
+        assert!(fixture.blob_entry_exists(blob_id)?);
+
+        // Create destination path
+        let dest_path = fixture.tempdir.child("moved_blob").to_path_buf();
+
+        // Try to move the blob with wrong hash
+        let wrong_hash = Hash([2u8; 32]);
+        let result = acache.move_blob(&file_path, &wrong_hash, &dest_path)?;
+
+        // Verify the move was not successful
+        assert!(!result);
+
+        // Verify the blob file still exists
+        assert!(fixture.blob_file_exists(arena, blob_id));
+        assert!(fixture.blob_entry_exists(blob_id)?);
+
+        // Verify the destination file was not created
+        assert!(!dest_path.exists());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_move_blob_not_verified() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena).await?;
+        let acache = fixture.arena_cache()?;
+        let file_path = Path::parse("test.txt")?;
+
+        // Create a file and add it to the cache
+        fixture.add_file_with_mtime(&file_path, 100, &test_time())?;
+
+        // Open the file to create a blob
+        let (inode, _) = acache.lookup_path(&file_path)?;
+        let blob_id = acache.open_file(inode)?.id();
+
+        // Write some data to the blob but don't mark it as verified
+        let mut blob = fixture.async_cache.open_file(inode).await?;
+        blob.write(b"test content").await?;
+        blob.update_db().await?;
+        // Note: Not calling mark_verified()
+
+        // Verify the blob file exists
+        assert!(fixture.blob_file_exists(arena, blob_id));
+        assert!(fixture.blob_entry_exists(blob_id)?);
+
+        // Create destination path
+        let dest_path = fixture.tempdir.child("moved_blob").to_path_buf();
+
+        // Try to move the blob
+        let result = acache.move_blob(&file_path, &test_hash(), &dest_path)?;
+
+        // Verify the move was not successful (not verified)
+        assert!(!result);
+
+        // Verify the blob file still exists
+        assert!(fixture.blob_file_exists(arena, blob_id));
+        assert!(fixture.blob_entry_exists(blob_id)?);
+
+        // Verify the destination file was not created
+        assert!(!dest_path.exists());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_move_blob_nonexistent_blob() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena).await?;
+        let acache = fixture.arena_cache()?;
+
+        // Create destination path
+        let dest_path = fixture.tempdir.child("moved_blob").to_path_buf();
+
+        // Try to move a non-existent blob
+        let non_existent_path = Path::parse("non_existent.txt")?;
+        let result = acache.move_blob(&non_existent_path, &test_hash(), &dest_path);
+
+        // Verify the move failed with NotFound error
+        assert!(matches!(result, Err(StorageError::NotFound)));
+
+        // Verify the destination file was not created
+        assert!(!dest_path.exists());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_move_blob_verifies_hash_and_state() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena).await?;
+        let acache = fixture.arena_cache()?;
+        let file_path = Path::parse("test.txt")?;
+
+        // Create a file and add it to the cache
+        fixture.add_file_with_mtime(&file_path, 100, &test_time())?;
+
+        // Open the file to create a blob
+        let (inode, _) = acache.lookup_path(&file_path)?;
+        let blob_id = acache.open_file(inode)?.id();
+
+        // Write some data to the blob and mark it as verified
+        let mut blob = fixture.async_cache.open_file(inode).await?;
+        let content = b"test content for hash verification";
+        blob.write(content).await?;
+        blob.update_db().await?;
+        blob.mark_verified().await?;
+
+        // Get the actual hash of the content
+        let actual_hash = blob.hash().clone();
+
+        // Verify the blob file exists
+        assert!(fixture.blob_file_exists(arena, blob_id));
+        assert!(fixture.blob_entry_exists(blob_id)?);
+
+        // Create destination path
+        let dest_path = fixture.tempdir.child("moved_blob").to_path_buf();
+
+        // Move the blob with the correct hash
+        let result = acache.move_blob(&file_path, &actual_hash, &dest_path)?;
+
+        // Verify the move was successful
+        assert!(result);
+
+        // Verify the blob file has been moved
+        assert!(!fixture.blob_file_exists(arena, blob_id));
+        assert!(dest_path.exists());
+
+        // Verify the blob entry has been deleted from the database
+        assert!(!fixture.blob_entry_exists(blob_id)?);
+
+        // Verify the content was moved correctly
+        let moved_content = std::fs::read_to_string(&dest_path)?;
+        assert_eq!("test content for hash verification", moved_content.trim_end_matches('\0'));
 
         Ok(())
     }

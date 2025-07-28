@@ -9,7 +9,7 @@ use realize_storage::Blob;
 use realize_storage::Storage;
 use realize_storage::{self, UnrealCacheAsync};
 use realize_types::Path;
-use realize_types::{Arena, Peer};
+use realize_types::{Arena, Hash, Peer};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -141,6 +141,32 @@ impl HouseholdFixture {
                 tokio::time::sleep(delay).await;
             } else {
                 panic!("[arena]/{filename} was never added to the cache");
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn wait_for_file_version_in_cache(
+        &self,
+        peer: Peer,
+        filename: &str,
+        hash: &Hash,
+    ) -> anyhow::Result<()> {
+        let cache = &self.cache(peer)?;
+
+        let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
+        let arena = HouseholdFixture::test_arena();
+        let (inode, _) = cache.lookup_path(arena, &Path::parse(filename)?).await?;
+        while cache.file_availability(inode).await?.hash != *hash {
+            if let Some(delay) = retry.next() {
+                tokio::time::sleep(delay).await;
+            } else {
+                panic!(
+                    "[arena]/{filename} never became {} (current: {})",
+                    *hash,
+                    cache.file_availability(inode).await?.hash
+                );
             }
         }
 

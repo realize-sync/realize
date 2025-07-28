@@ -103,4 +103,5 @@ enum JobAction {
   download @0;
   verify @1;
   repair @2;
+  move @3;
 }

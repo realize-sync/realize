@@ -6,7 +6,7 @@ use arena::mark::PathMarks;
 use arena::watcher::RealWatcher;
 use config::StorageConfig;
 use futures::Stream;
-use realize_types::{self, Arena, ByteRange, Delta, Path, Signature};
+use realize_types::{self, Arena, ByteRange, Delta, Hash, Path, Signature};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -223,6 +223,36 @@ impl Storage {
         let s = self.arena_storage(arena)?;
 
         indexed_store::rsync(&s.index, &s.root, path, range, sig).await
+    }
+
+    /// Move a file from the cache to the filesystem.
+    ///
+    /// The file must have been fully downloaded and verified or the
+    /// move will fail.
+    ///
+    /// Give up and return false if the current versions in the cache
+    /// don't match `cache_hash` and `index_hash`.
+    ///
+    /// A `index_hash` value of `None` means that the file must not
+    /// exit. If it exists, realize gives up and returns false.
+    pub async fn realize(
+        &self,
+        arena: Arena,
+        path: &realize_types::Path,
+        cache_hash: &Hash,
+        index_hash: Option<&Hash>,
+    ) -> Result<bool, StorageError> {
+        let s = self.arena_storage(arena)?;
+        let index_realpath =
+            match indexed_store::get_indexed_file(&s.index, &s.root, path, index_hash).await? {
+                None => {
+                    return Ok(false);
+                }
+                Some(p) => p,
+            };
+        self.cache
+            .move_blob(arena, path, cache_hash, &index_realpath)
+            .await
     }
 
     /// Return a handle on the real store.
