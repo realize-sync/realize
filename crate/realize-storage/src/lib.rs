@@ -6,7 +6,7 @@ use arena::mark::PathMarks;
 use arena::watcher::RealWatcher;
 use config::StorageConfig;
 use futures::Stream;
-use realize_types::{self, Arena, ByteRange, Delta, Hash, Path, Signature};
+use realize_types::{self, Arena, ByteRange, Delta, Hash, Path, Peer, Signature};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -160,6 +160,19 @@ impl Storage {
         let arena_storage = self.arena_storage(arena)?;
 
         arena::notifier::subscribe(arena_storage.index.clone(), tx, progress).await
+    }
+
+    /// Take into account notification from a remote peer.
+    pub async fn update(&self, peer: Peer, notification: Notification) -> Result<(), StorageError> {
+        // TODO: change both in the same transaction
+        if let Some(s) = self.indexed_arenas.get(&notification.arena()) {
+            if let Err(err) = s.index.update(notification.clone(), &s.root).await {
+                log::warn!("Failed to update local store for {notification:?}: {err:?}",);
+            }
+        }
+        self.cache.update(peer, notification).await?;
+
+        Ok(())
     }
 
     /// Set the default mark for the files in the given arena.

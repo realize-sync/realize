@@ -2,9 +2,9 @@
 
 use super::db::{ArenaDatabase, ArenaWriteTransaction};
 use super::types::{HistoryTableEntry, IndexedFileTableEntry};
-use crate::StorageError;
 use crate::arena::engine::DirtyPaths;
 use crate::utils::holder::{ByteConversionError, Holder};
+use crate::{Notification, StorageError};
 use realize_types::{self, Arena, Hash, UnixTime};
 use redb::ReadableTable as _;
 use std::ops::RangeBounds;
@@ -161,6 +161,7 @@ impl RealIndexBlocking {
                     size,
                     mtime: mtime.clone(),
                     hash,
+                    outdated_by: None,
                 })?,
             )?;
             if !same_hash {
@@ -273,6 +274,78 @@ impl RealIndexBlocking {
         });
         Ok(entry_index)
     }
+
+    /// Take a remote change into account, if it applies to a file in
+    /// the index.
+    pub(crate) fn update(
+        &self,
+        notification: &Notification,
+        root: &std::path::Path,
+    ) -> Result<(), StorageError> {
+        if notification.arena() != self.arena {
+            return Ok(());
+        }
+
+        match notification {
+            Notification::Replace {
+                path,
+                hash,
+                old_hash,
+                ..
+            } => {
+                let txn = self.db.begin_write()?;
+                {
+                    let mut file_table = txn.index_file_table()?;
+                    if let Some(mut entry) = do_get_file_entry(&file_table, path)?
+                        && replaces(&entry, old_hash)
+                    {
+                        // Just remember that a newer version exist in
+                        // a remote peer. This information is going to
+                        // be used to download that newer version later on.
+                        entry.outdated_by = Some(hash.clone());
+                        file_table.insert(path.as_str(), Holder::with_content(entry)?)?;
+                    }
+                }
+                txn.commit()?;
+            }
+            Notification::Remove { path, old_hash, .. } => {
+                let txn = self.db.begin_read()?;
+                if let Some(entry) = get_file_entry(&txn, path)?
+                    && replaces(&entry, old_hash)
+                {
+                    // This specific version has been removed
+                    // remotely. Make sure that the file hasn't
+                    // changed since it was indexed and if it hasn't,
+                    // remove it locally as well.
+                    let realpath = path.within(root);
+                    if file_matches_index(&entry, &realpath) {
+                        std::fs::remove_file(&realpath)?;
+                    }
+                }
+            }
+            _ => {}
+        };
+
+        Ok(())
+    }
+}
+
+fn file_matches_index(entry: &IndexedFileTableEntry, path: &std::path::Path) -> bool {
+    if let Ok(m) = std::fs::metadata(path) {
+        UnixTime::mtime(&m) == entry.mtime && m.len() == entry.size
+    } else {
+        false
+    }
+}
+
+/// Check whether replacing `old_hash` replaces `entry`
+fn replaces(entry: &IndexedFileTableEntry, old_hash: &Hash) -> bool {
+    entry.hash == *old_hash
+        || entry
+            .outdated_by
+            .as_ref()
+            .map(|h| *h == *old_hash)
+            .unwrap_or(false)
 }
 
 pub(crate) fn get_file_entry(
@@ -281,6 +354,13 @@ pub(crate) fn get_file_entry(
 ) -> Result<Option<IndexedFileTableEntry>, StorageError> {
     let file_table = txn.index_file_table()?;
 
+    do_get_file_entry(&file_table, path)
+}
+
+fn do_get_file_entry(
+    file_table: &impl redb::ReadableTable<&'static str, Holder<'static, IndexedFileTableEntry>>,
+    path: &realize_types::Path,
+) -> Result<Option<IndexedFileTableEntry>, StorageError> {
     if let Some(entry) = file_table.get(path.as_str())? {
         return Ok(Some(entry.value().parse()?));
     }
@@ -479,6 +559,19 @@ impl RealIndexAsync {
 
         task::spawn_blocking(move || inner.add_file(&path, size, &mtime, hash)).await?
     }
+
+    /// Take a remote change into account, if it applies to a file in
+    /// the index.
+    pub(crate) async fn update(
+        &self,
+        notification: Notification,
+        root: &std::path::Path,
+    ) -> Result<(), StorageError> {
+        let inner = Arc::clone(&self.inner);
+        let root = root.to_path_buf();
+
+        task::spawn_blocking(move || inner.update(&notification, &root)).await?
+    }
 }
 
 /// Mark paths within the index dirty.
@@ -605,7 +698,8 @@ mod tests {
                 IndexedFileTableEntry {
                     size: 100,
                     mtime,
-                    hash: Hash([0xfa; 32])
+                    hash: Hash([0xfa; 32]),
+                    outdated_by: None,
                 },
                 file_table.get("foo/bar.txt")?.unwrap().value().parse()?
             );
@@ -640,7 +734,8 @@ mod tests {
                 IndexedFileTableEntry {
                     size: 200,
                     mtime: mtime2,
-                    hash: Hash([0x07; 32])
+                    hash: Hash([0x07; 32]),
+                    outdated_by: None,
                 },
                 file_table.get("foo/bar.txt")?.unwrap().value().parse()?
             );
@@ -693,7 +788,8 @@ mod tests {
             Some(IndexedFileTableEntry {
                 size: 100,
                 mtime: mtime.clone(),
-                hash: hash.clone()
+                hash: hash.clone(),
+                outdated_by: None,
             }),
             fixture.index.get_file(&path)?
         );
@@ -1254,6 +1350,7 @@ mod tests {
                         size: 100,
                         mtime: mtime.clone(),
                         hash: Hash([0xfa; 32]),
+                        outdated_by: None,
                     })?,
                 )?;
             }
@@ -1276,6 +1373,534 @@ mod tests {
                 assert!(engine::is_dirty(&txn, file)?, "{file} should be dirty",);
             }
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_different_arena() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        let hash = Hash([0xfa; 32]);
+
+        // Add a file to the index
+        index.add_file(&path, 100, &mtime, hash.clone())?;
+
+        // Create a notification for a different arena
+        let notification = Notification::Replace {
+            arena: Arena::from("different_arena"),
+            index: 1,
+            path: path.clone(),
+            mtime: mtime.clone(),
+            size: 200,
+            hash: Hash([0x07; 32]),
+            old_hash: hash.clone(),
+        };
+
+        // Update should be ignored for different arena
+        index.update(&notification, &std::path::Path::new("/tmp"))?;
+
+        // Verify the file entry hasn't changed
+        let entry = index.get_file(&path)?;
+        assert_eq!(
+            Some(IndexedFileTableEntry {
+                size: 100,
+                mtime: mtime.clone(),
+                hash: hash.clone(),
+                outdated_by: None,
+            }),
+            entry
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_replace_matching_hash() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        let old_hash = Hash([0xfa; 32]);
+        let new_hash = Hash([0x07; 32]);
+
+        // Add a file to the index
+        index.add_file(&path, 100, &mtime, old_hash.clone())?;
+
+        // Create a replace notification that matches the current hash
+        let notification = Notification::Replace {
+            arena: test_arena(),
+            index: 1,
+            path: path.clone(),
+            mtime: UnixTime::from_secs(1234567891),
+            size: 200,
+            hash: new_hash.clone(),
+            old_hash: old_hash.clone(),
+        };
+
+        // Update should mark the current version as outdated
+        index.update(&notification, &std::path::Path::new("/tmp"))?;
+
+        // Verify the file entry has been updated with outdated_by
+        let entry = index.get_file(&path)?;
+        assert_eq!(
+            Some(IndexedFileTableEntry {
+                size: 100,
+                mtime: mtime.clone(),
+                hash: old_hash.clone(),
+                outdated_by: Some(new_hash.clone()),
+            }),
+            entry
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_replace_matching_outdated_by() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        let original_hash = Hash([0xfa; 32]);
+        let outdated_hash = Hash([0x07; 32]);
+        let newer_hash = Hash([0x42; 32]);
+
+        // Add a file to the index with an outdated_by entry
+        {
+            let txn = index.db.begin_write()?;
+            {
+                let mut file_table = txn.index_file_table()?;
+                file_table.insert(
+                    path.as_str(),
+                    Holder::with_content(IndexedFileTableEntry {
+                        size: 100,
+                        mtime: mtime.clone(),
+                        hash: original_hash.clone(),
+                        outdated_by: Some(outdated_hash.clone()),
+                    })?,
+                )?;
+            }
+            txn.commit()?;
+        }
+
+        // Create a replace notification that matches the outdated_by hash
+        let notification = Notification::Replace {
+            arena: test_arena(),
+            index: 1,
+            path: path.clone(),
+            mtime: UnixTime::from_secs(1234567891),
+            size: 200,
+            hash: newer_hash.clone(),
+            old_hash: outdated_hash.clone(),
+        };
+
+        // Update should mark the current version as outdated by the newer hash
+        index.update(&notification, &std::path::Path::new("/tmp"))?;
+
+        // Verify the file entry has been updated with the newer hash in outdated_by
+        let entry = index.get_file(&path)?;
+        assert_eq!(
+            Some(IndexedFileTableEntry {
+                size: 100,
+                mtime: mtime.clone(),
+                hash: original_hash.clone(),
+                outdated_by: Some(newer_hash.clone()),
+            }),
+            entry
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_replace_non_matching_hash() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        let current_hash = Hash([0xfa; 32]);
+        let different_hash = Hash([0x07; 32]);
+        let new_hash = Hash([0x42; 32]);
+
+        // Add a file to the index
+        index.add_file(&path, 100, &mtime, current_hash.clone())?;
+
+        // Create a replace notification that doesn't match the current hash
+        let notification = Notification::Replace {
+            arena: test_arena(),
+            index: 1,
+            path: path.clone(),
+            mtime: UnixTime::from_secs(1234567891),
+            size: 200,
+            hash: new_hash.clone(),
+            old_hash: different_hash.clone(),
+        };
+
+        // Update should be ignored since the hash doesn't match
+        index.update(&notification, &std::path::Path::new("/tmp"))?;
+
+        // Verify the file entry hasn't changed
+        let entry = index.get_file(&path)?;
+        assert_eq!(
+            Some(IndexedFileTableEntry {
+                size: 100,
+                mtime: mtime.clone(),
+                hash: current_hash.clone(),
+                outdated_by: None,
+            }),
+            entry
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_replace_file_not_in_index() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        let old_hash = Hash([0xfa; 32]);
+        let new_hash = Hash([0x07; 32]);
+
+        // Create a replace notification for a file not in the index
+        let notification = Notification::Replace {
+            arena: test_arena(),
+            index: 1,
+            path: path.clone(),
+            mtime: UnixTime::from_secs(1234567890),
+            size: 100,
+            hash: new_hash.clone(),
+            old_hash: old_hash.clone(),
+        };
+
+        // Update should be ignored since the file doesn't exist in the index
+        index.update(&notification, &std::path::Path::new("/tmp"))?;
+
+        // Verify the file still doesn't exist in the index
+        assert_eq!(None, index.get_file(&path)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_remove_matching_hash() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        let hash = Hash([0xfa; 32]);
+
+        // Create a file whose mtime and size match the entry.
+        let tempdir = assert_fs::TempDir::new()?;
+        let file_path = tempdir.path().join("foo").join("bar.txt");
+        std::fs::create_dir_all(file_path.parent().unwrap())?;
+        std::fs::write(&file_path, "test content")?;
+
+        let metadata = std::fs::metadata(&file_path)?;
+        let size = metadata.len();
+        let mtime = UnixTime::mtime(&metadata);
+        index.add_file(&path, size, &mtime, hash.clone())?;
+
+        // Create a remove notification that matches the current hash
+        let notification = Notification::Remove {
+            arena: test_arena(),
+            index: 1,
+            path: path.clone(),
+            old_hash: hash.clone(),
+        };
+
+        // Update should remove the file from the filesystem
+        index.update(&notification, tempdir.path())?;
+
+        // Verify the file has been removed from the filesystem
+        assert!(!file_path.exists());
+
+        // Verify the file entry still exists in the index (it's not removed from index)
+        let entry = index.get_file(&path)?;
+        assert_eq!(
+            Some(IndexedFileTableEntry {
+                size,
+                mtime,
+                hash: hash.clone(),
+                outdated_by: None,
+            }),
+            entry
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_remove_matching_outdated_by() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        let original_hash = Hash([0xfa; 32]);
+        let outdated_hash = Hash([0x07; 32]);
+
+        let tempdir = assert_fs::TempDir::new()?;
+        let file_path = tempdir.path().join("foo").join("bar.txt");
+        std::fs::create_dir_all(file_path.parent().unwrap())?;
+        std::fs::write(&file_path, "test content")?;
+
+        let metadata = std::fs::metadata(&file_path)?;
+        let size = metadata.len();
+        let mtime = UnixTime::mtime(&metadata);
+        index.add_file(&path, size, &mtime, original_hash.clone())?;
+
+        // Add a file to the index with an outdated_by entry
+        {
+            let txn = index.db.begin_write()?;
+            {
+                let mut file_table = txn.index_file_table()?;
+                file_table.insert(
+                    path.as_str(),
+                    Holder::with_content(IndexedFileTableEntry {
+                        size,
+                        mtime: mtime.clone(),
+                        hash: original_hash.clone(),
+                        outdated_by: Some(outdated_hash.clone()),
+                    })?,
+                )?;
+            }
+            txn.commit()?;
+        }
+
+        // Create a remove notification that matches the outdated_by hash
+        let notification = Notification::Remove {
+            arena: test_arena(),
+            index: 1,
+            path: path.clone(),
+            old_hash: outdated_hash.clone(),
+        };
+
+        // Update should remove the file from the filesystem
+        index.update(&notification, tempdir.path())?;
+
+        // Verify the file has been removed from the filesystem
+        assert!(!file_path.exists());
+
+        // Verify the file entry still exists in the index
+        let entry = index.get_file(&path)?;
+        assert_eq!(
+            Some(IndexedFileTableEntry {
+                size,
+                mtime: mtime.clone(),
+                hash: original_hash.clone(),
+                outdated_by: Some(outdated_hash.clone()),
+            }),
+            entry
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_remove_non_matching_hash() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        let current_hash = Hash([0xfa; 32]);
+        let different_hash = Hash([0x07; 32]);
+
+        let tempdir = assert_fs::TempDir::new()?;
+        let file_path = tempdir.path().join("foo").join("bar.txt");
+        std::fs::create_dir_all(file_path.parent().unwrap())?;
+        std::fs::write(&file_path, "test content")?;
+
+        let metadata = std::fs::metadata(&file_path)?;
+        let size = metadata.len();
+        let mtime = UnixTime::mtime(&metadata);
+        index.add_file(&path, size, &mtime, current_hash.clone())?;
+
+        // Create a remove notification that doesn't match the current hash
+        let notification = Notification::Remove {
+            arena: test_arena(),
+            index: 1,
+            path: path.clone(),
+            old_hash: different_hash.clone(),
+        };
+
+        // Update should be ignored since the hash doesn't match
+        index.update(&notification, tempdir.path())?;
+
+        // Verify the file still exists in the filesystem
+        assert!(file_path.exists());
+
+        // Verify the file entry hasn't changed
+        let entry = index.get_file(&path)?;
+        assert_eq!(
+            Some(IndexedFileTableEntry {
+                size: 12,
+                mtime: mtime.clone(),
+                hash: current_hash.clone(),
+                outdated_by: None,
+            }),
+            entry
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_remove_file_not_in_index() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        let hash = Hash([0xfa; 32]);
+
+        // Create a remove notification for a file not in the index
+        let notification = Notification::Remove {
+            arena: test_arena(),
+            index: 1,
+            path: path.clone(),
+            old_hash: hash.clone(),
+        };
+
+        // Update should be ignored since the file doesn't exist in the index
+        index.update(&notification, &std::path::Path::new("/tmp"))?;
+
+        // Verify the file still doesn't exist in the index
+        assert_eq!(None, index.get_file(&path)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_remove_file_mismatched_metadata() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        let hash = Hash([0xfa; 32]);
+
+        // Create a temporary file with different metadata than the index
+        let tempdir = assert_fs::TempDir::new()?;
+        let file_path = tempdir.path().join("foo").join("bar.txt");
+        std::fs::create_dir_all(file_path.parent().unwrap())?;
+        std::fs::write(&file_path, "different content")?;
+
+        // Add a file to the index
+        index.add_file(&path, 12, &mtime, hash.clone())?;
+
+        // Create a remove notification that matches the current hash
+        let notification = Notification::Remove {
+            arena: test_arena(),
+            index: 1,
+            path: path.clone(),
+            old_hash: hash.clone(),
+        };
+
+        // Update should be ignored since the file metadata doesn't match
+        index.update(&notification, tempdir.path())?;
+
+        // Verify the file still exists in the filesystem
+        assert!(file_path.exists());
+
+        // Verify the file entry hasn't changed
+        let entry = index.get_file(&path)?;
+        assert_eq!(
+            Some(IndexedFileTableEntry {
+                size: 12,
+                mtime: mtime.clone(),
+                hash: hash.clone(),
+                outdated_by: None,
+            }),
+            entry
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_remove_file_does_not_exist() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        let hash = Hash([0xfa; 32]);
+
+        // Add a file to the index
+        index.add_file(&path, 12, &mtime, hash.clone())?;
+
+        // Create a remove notification that matches the current hash
+        let notification = Notification::Remove {
+            arena: test_arena(),
+            index: 1,
+            path: path.clone(),
+            old_hash: hash.clone(),
+        };
+
+        // Update should be ignored since the file doesn't exist on filesystem
+        index.update(&notification, &std::path::Path::new("/tmp"))?;
+
+        // Verify the file entry still exists in the index
+        let entry = index.get_file(&path)?;
+        assert_eq!(
+            Some(IndexedFileTableEntry {
+                size: 12,
+                mtime: mtime.clone(),
+                hash: hash.clone(),
+                outdated_by: None,
+            }),
+            entry
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_other_notification_types() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = &fixture.index;
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        let hash = Hash([0xfa; 32]);
+
+        // Add a file to the index
+        index.add_file(&path, 12, &mtime, hash.clone())?;
+
+        // Test Add notification (should be ignored)
+        let add_notification = Notification::Add {
+            arena: test_arena(),
+            index: 1,
+            path: path.clone(),
+            mtime: mtime.clone(),
+            size: 12,
+            hash: hash.clone(),
+        };
+
+        index.update(&add_notification, &std::path::Path::new("/tmp"))?;
+
+        // Verify the file entry hasn't changed
+        let entry = index.get_file(&path)?;
+        assert_eq!(
+            Some(IndexedFileTableEntry {
+                size: 12,
+                mtime: mtime.clone(),
+                hash: hash.clone(),
+                outdated_by: None,
+            }),
+            entry
+        );
+
+        // Test CatchupStart notification (should be ignored)
+        let catchup_notification = Notification::CatchupStart(test_arena());
+        index.update(&catchup_notification, &std::path::Path::new("/tmp"))?;
+
+        // Verify the file entry still hasn't changed
+        let entry = index.get_file(&path)?;
+        assert_eq!(
+            Some(IndexedFileTableEntry {
+                size: 12,
+                mtime: mtime.clone(),
+                hash: hash.clone(),
+                outdated_by: None,
+            }),
+            entry
+        );
 
         Ok(())
     }

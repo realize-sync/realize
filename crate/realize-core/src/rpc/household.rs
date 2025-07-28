@@ -12,7 +12,7 @@ use capnp_rpc::pry;
 use realize_network::capnp::{ConnectionHandler, ConnectionManager, PeerStatus};
 use realize_network::{Networking, Server};
 use realize_storage::utils::holder::ByteConversionError;
-use realize_storage::{Notification, Progress, Storage, StorageError, UnrealCacheAsync};
+use realize_storage::{Notification, Progress, Storage, StorageError};
 use realize_types::{self, Arena, ByteRange, Delta, Hash, Path, Peer, Signature, UnixTime};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, SeekFrom};
@@ -714,14 +714,12 @@ impl subscriber::Server for ConnectedPeerServer {
         params: NotifyParams,
         _: NotifyResults,
     ) -> capnp::capability::Promise<(), capnp::Error> {
-        let cache = self.storage.cache();
-
-        Promise::from_future(do_notify(cache.clone(), self.peer, params))
+        Promise::from_future(do_notify(Arc::clone(&self.storage), self.peer, params))
     }
 }
 
 async fn do_notify(
-    cache: UnrealCacheAsync,
+    storage: Arc<Storage>,
     peer: Peer,
     params: NotifyParams,
 ) -> Result<(), capnp::Error> {
@@ -798,7 +796,7 @@ async fn do_notify(
 
     tokio::spawn(async move {
         for notification in notifications {
-            cache.update(peer, notification).await?;
+            storage.update(peer, notification).await?;
         }
 
         Ok::<(), StorageError>(())

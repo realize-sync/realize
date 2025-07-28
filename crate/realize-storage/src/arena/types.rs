@@ -126,6 +126,10 @@ pub struct IndexedFileTableEntry {
     pub hash: Hash,
     pub mtime: UnixTime,
     pub size: u64,
+
+    // If set, a version is known to exist that replaces the version
+    // in this entry.
+    pub outdated_by: Option<Hash>,
 }
 
 impl NamedType for IndexedFileTableEntry {
@@ -143,10 +147,17 @@ impl ByteConvertible<IndexedFileTableEntry> for IndexedFileTableEntry {
         let mtime = msg.get_mtime()?;
         let hash: &[u8] = msg.get_hash()?;
         let hash = parse_hash(hash)?;
+        let outdated_by: &[u8] = msg.get_outdated_by()?;
+        let outdated_by = if outdated_by.is_empty() {
+            None
+        } else {
+            Some(parse_hash(outdated_by)?)
+        };
         Ok(IndexedFileTableEntry {
             hash,
             mtime: UnixTime::new(mtime.get_secs(), mtime.get_nsecs()),
             size: msg.get_size(),
+            outdated_by,
         })
     }
 
@@ -157,6 +168,10 @@ impl ByteConvertible<IndexedFileTableEntry> for IndexedFileTableEntry {
 
         builder.set_size(self.size);
         builder.set_hash(&self.hash.0);
+
+        if let Some(hash) = &self.outdated_by {
+            builder.set_outdated_by(&hash.0)
+        }
 
         let mut mtime = builder.init_mtime();
         mtime.set_secs(self.mtime.as_secs());
@@ -368,6 +383,24 @@ mod tests {
             size: 200,
             mtime: UnixTime::new(1234567890, 111),
             hash: Hash([0xf0; 32]),
+            outdated_by: None,
+        };
+
+        assert_eq!(
+            entry,
+            IndexedFileTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn convert_indexed_file_table_entry_outdated() -> anyhow::Result<()> {
+        let entry = IndexedFileTableEntry {
+            size: 200,
+            mtime: UnixTime::new(1234567890, 111),
+            hash: Hash([0xf0; 32]),
+            outdated_by: Some(Hash([2; 32])),
         };
 
         assert_eq!(

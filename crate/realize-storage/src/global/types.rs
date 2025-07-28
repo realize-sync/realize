@@ -54,13 +54,6 @@ pub struct FileTableEntry {
 
     /// Inode of the containing directory
     pub parent_inode: Inode,
-
-    /// Track the history of old value of hash in this entry.
-    ///
-    /// This is only set in the default entry.
-    ///
-    /// If None, tracking is disabled.
-    pub outdated_versions: Option<Vec<Hash>>,
 }
 
 impl FileTableEntry {
@@ -73,7 +66,6 @@ impl FileTableEntry {
                 blob: None,
             },
             parent_inode,
-            outdated_versions: None,
         }
     }
 }
@@ -120,16 +112,6 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
         let metadata = msg.get_metadata()?;
         let mtime = metadata.get_mtime()?;
         let blob: Option<BlobId> = BlobId::as_optional(content.get_blob());
-
-        let outdated_versions = if msg.get_has_outdated_versions() {
-            let mut vec = vec![];
-            for v in msg.get_outdated_versions()?.iter() {
-                vec.push(parse_hash(v?)?)
-            }
-            Some(vec)
-        } else {
-            None
-        };
         Ok(FileTableEntry {
             metadata: FileMetadata {
                 size: metadata.get_size(),
@@ -141,7 +123,6 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
                 blob,
             },
             parent_inode: Inode(msg.get_parent()),
-            outdated_versions,
         })
     }
 
@@ -159,19 +140,11 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
             content.set_blob(blob.into());
         }
 
-        let mut metadata = builder.reborrow().init_metadata();
+        let mut metadata = builder.init_metadata();
         metadata.set_size(self.metadata.size);
         let mut mtime = metadata.init_mtime();
         mtime.set_secs(self.metadata.mtime.as_secs());
         mtime.set_nsecs(self.metadata.mtime.subsec_nanos());
-
-        if let Some(versions) = &self.outdated_versions {
-            builder.set_has_outdated_versions(true);
-            let mut list = builder.init_outdated_versions(versions.len() as u32);
-            for (i, hash) in versions.iter().enumerate() {
-                list.set(i as u32, &hash.0);
-            }
-        }
 
         let mut buffer: Vec<u8> = Vec::new();
         serialize_packed::write_message(&mut buffer, &message)?;
@@ -333,7 +306,6 @@ mod tests {
                 mtime: UnixTime::from_secs(1234567890),
             },
             parent_inode: Inode(1234),
-            outdated_versions: None,
         };
 
         assert_eq!(
@@ -357,55 +329,6 @@ mod tests {
                 mtime: UnixTime::from_secs(1234567890),
             },
             parent_inode: Inode(1234),
-            outdated_versions: None,
-        };
-
-        assert_eq!(
-            entry,
-            FileTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn convert_file_table_entry_with_empty_outdated_versions() -> anyhow::Result<()> {
-        let entry = FileTableEntry {
-            content: FileContent {
-                path: Path::parse("foo/bar.txt")?,
-                hash: Hash([0xa1u8; 32]),
-                blob: None,
-            },
-            metadata: FileMetadata {
-                size: 200,
-                mtime: UnixTime::from_secs(1234567890),
-            },
-            parent_inode: Inode(1234),
-            outdated_versions: Some(vec![]),
-        };
-
-        assert_eq!(
-            entry,
-            FileTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn convert_file_table_entry_with_outdated_versions() -> anyhow::Result<()> {
-        let entry = FileTableEntry {
-            content: FileContent {
-                path: Path::parse("foo/bar.txt")?,
-                hash: Hash([0xa1u8; 32]),
-                blob: None,
-            },
-            metadata: FileMetadata {
-                size: 200,
-                mtime: UnixTime::from_secs(1234567890),
-            },
-            parent_inode: Inode(1234),
-            outdated_versions: Some(vec![Hash([3u8; 32]), Hash([4u8; 32])]),
         };
 
         assert_eq!(

@@ -732,7 +732,8 @@ mod tests {
             Some(IndexedFileTableEntry {
                 size: 4,
                 mtime,
-                hash: hash::digest("test".as_bytes())
+                hash: hash::digest("test".as_bytes()),
+                outdated_by: None,
             }),
             fixture.index.get_file(&path).await?
         );
@@ -755,7 +756,8 @@ mod tests {
             Some(IndexedFileTableEntry {
                 size: 0,
                 mtime,
-                hash: hash::digest([])
+                hash: hash::digest([]),
+                outdated_by: None,
             }),
             fixture.index.get_file(&path).await?
         );
@@ -1137,7 +1139,8 @@ mod tests {
             Some(IndexedFileTableEntry {
                 size: 3,
                 mtime: UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
-                hash: hash::digest("foo".as_bytes())
+                hash: hash::digest("foo".as_bytes()),
+                outdated_by: None,
             }),
             fixture.index.get_file(&foo).await?
         );
@@ -1147,7 +1150,8 @@ mod tests {
             Some(IndexedFileTableEntry {
                 size: 6,
                 mtime: UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
-                hash: hash::digest("barbar".as_bytes())
+                hash: hash::digest("barbar".as_bytes()),
+                outdated_by: None,
             }),
             fixture.index.get_file(&bar).await?
         );
@@ -1435,7 +1439,8 @@ mod tests {
             Some(IndexedFileTableEntry {
                 size: 4,
                 mtime,
-                hash: hash::digest("test".as_bytes())
+                hash: hash::digest("test".as_bytes()),
+                outdated_by: None,
             }),
             index.get_file(&realize_types::Path::parse("bar")?).await?
         );

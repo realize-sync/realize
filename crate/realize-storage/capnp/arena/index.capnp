@@ -10,6 +10,9 @@ struct IndexedFileTableEntry {
   hash @0: Data;
   mtime @1: Time;
   size @2: UInt64;
+
+  # may be empty
+  outdatedBy @3: Data;
 }
 
 # An entry in the history table

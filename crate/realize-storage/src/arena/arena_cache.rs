@@ -85,43 +85,6 @@ impl ArenaCache {
         do_file_availability(&txn, inode, self.arena)
     }
 
-    /// Track any versions that overwrite the current one.
-    ///
-    /// Note that this call always starts fresh: current set of
-    /// outdated versions, if any, is cleared.
-    pub(crate) fn start_tracking_outdated_versions(
-        &self,
-        inode: Inode,
-    ) -> Result<(), StorageError> {
-        let txn = self.db.begin_write()?;
-        do_set_outdated_versions(&txn, inode, Some(vec![]))?;
-        txn.commit()?;
-
-        Ok(())
-    }
-
-    /// Stop tracking outdated versions.
-    /// outdated versions, if any, is cleared.
-    pub(crate) fn stop_tracking_outdated_versions(&self, inode: Inode) -> Result<(), StorageError> {
-        let txn = self.db.begin_write()?;
-        do_set_outdated_versions(&txn, inode, None)?;
-        txn.commit()?;
-
-        Ok(())
-    }
-
-    /// Return hashes of versions that have been replaced since
-    /// `track_outdated_versions`.
-    pub(crate) fn outdated_versions(
-        &self,
-        inode: Inode,
-    ) -> Result<Option<Vec<Hash>>, StorageError> {
-        let txn = self.db.begin_read()?;
-        let entry = get_default_entry(&txn.cache_file_table()?, inode)?;
-
-        Ok(entry.outdated_versions)
-    }
-
     pub(crate) fn readdir(
         &self,
         inode: Inode,
@@ -166,7 +129,12 @@ impl ArenaCache {
                     let entry = FileTableEntry::new(path, size, mtime, hash, parent_inode);
                     self.do_write_file_entry(&mut file_table, file_inode, peer, &entry)?;
                     if !get_file_entry(&file_table, file_inode, None)?.is_some() {
-                        self.do_write_default_file_entry(&txn, &mut file_table, file_inode, entry)?;
+                        self.do_write_default_file_entry(
+                            &txn,
+                            &mut file_table,
+                            file_inode,
+                            &entry,
+                        )?;
                     }
                 }
             }
@@ -192,7 +160,7 @@ impl ArenaCache {
                     // If it overwrites the entry that's current, it's
                     // necessarily an entry we want.
                     self.do_write_file_entry(&mut file_table, file_inode, peer, &entry)?;
-                    self.do_write_default_file_entry(&txn, &mut file_table, file_inode, entry)?;
+                    self.do_write_default_file_entry(&txn, &mut file_table, file_inode, &entry)?;
                 } else if let Some(e) = get_file_entry(&file_table, file_inode, Some(peer))?
                     && e.content.hash == old_hash
                 {
@@ -231,7 +199,7 @@ impl ArenaCache {
                 let entry = FileTableEntry::new(path, size, mtime, hash, parent_inode);
                 self.do_write_file_entry(&mut file_table, file_inode, peer, &entry)?;
                 if !get_file_entry(&file_table, file_inode, None)?.is_some() {
-                    self.do_write_default_file_entry(&txn, &mut file_table, file_inode, entry)?;
+                    self.do_write_default_file_entry(&txn, &mut file_table, file_inode, &entry)?;
                 }
             }
             Notification::CatchupComplete { index, .. } => {
@@ -322,9 +290,6 @@ impl ArenaCache {
                 return Ok(false);
             }
 
-            // Track outdated versions to be able to, later on, update
-            // the file in the index when necessary.
-            file_entry.outdated_versions = Some(vec![]);
             file_entry.content.blob = None;
             file_table.insert((inode, ""), Holder::with_content(file_entry)?)?;
 
@@ -360,19 +325,13 @@ impl ArenaCache {
         txn: &ArenaWriteTransaction,
         file_table: &mut redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
         file_inode: Inode,
-        mut entry: FileTableEntry,
+        entry: &FileTableEntry,
     ) -> Result<(), StorageError> {
         let key = "";
         if let Some(old_entry) = file_table.get((file_inode, ""))? {
-            let mut old_entry = old_entry.value().parse()?;
+            let old_entry = old_entry.value().parse()?;
             if let Some(blob_id) = old_entry.content.blob {
                 self.blobstore.delete_blob(&txn, blob_id)?;
-            }
-            if let Some(mut outdated_versions) = std::mem::take(&mut old_entry.outdated_versions) {
-                if entry.content.hash != old_entry.content.hash {
-                    outdated_versions.push(old_entry.content.hash);
-                }
-                entry.outdated_versions = Some(outdated_versions);
             }
         }
 
@@ -380,7 +339,7 @@ impl ArenaCache {
         // changes should be reported.
         self.dirty_paths.mark_dirty(txn, &entry.content.path)?;
 
-        file_table.insert((file_inode, key), Holder::with_content(entry)?)?;
+        file_table.insert((file_inode, key), Holder::new(entry)?)?;
 
         Ok(())
     }
@@ -484,7 +443,7 @@ impl ArenaCache {
             }
         });
         if let Some((_, entry)) = most_recent {
-            self.do_write_default_file_entry(txn, file_table, inode, entry)?;
+            self.do_write_default_file_entry(txn, file_table, inode, &entry)?;
         }
 
         Ok(())
@@ -1026,24 +985,6 @@ fn do_unmark_peer_file(
 ) -> Result<(), StorageError> {
     let mut pending_catchup_table = txn.cache_pending_catchup_table()?;
     pending_catchup_table.remove((peer.as_str(), inode))?;
-
-    Ok(())
-}
-
-fn do_set_outdated_versions(
-    txn: &ArenaWriteTransaction,
-    inode: Inode,
-    val: Option<Vec<Hash>>,
-) -> Result<(), StorageError> {
-    let key = (inode, "");
-    let mut file_table = txn.cache_file_table()?;
-    let mut entry = file_table
-        .get(key)?
-        .ok_or(StorageError::NotFound)?
-        .value()
-        .parse()?;
-    entry.outdated_versions = val;
-    file_table.insert(key, Holder::with_content(entry)?)?;
 
     Ok(())
 }
@@ -2568,104 +2509,6 @@ mod tests {
         // Should now be complete
         let availability = acache.local_availability(inode)?;
         assert!(matches!(availability, LocalAvailability::Complete));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn track_outdated_versions() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let cache = &fixture.cache;
-        let peer = test_peer();
-        let arena = test_arena();
-        let file_path = Path::parse("file.txt")?;
-
-        cache.update(
-            peer,
-            Notification::Add {
-                arena: arena,
-                index: 0,
-                path: file_path.clone(),
-                mtime: test_time(),
-                size: 100,
-                hash: test_hash(),
-            },
-        )?;
-        let acache = fixture.arena_cache()?;
-        let (inode, _) = acache.lookup_path(&file_path)?;
-        assert_eq!(None, acache.outdated_versions(inode)?);
-        acache.start_tracking_outdated_versions(inode)?;
-        assert_eq!(Some(vec![]), acache.outdated_versions(inode)?);
-
-        cache.update(
-            peer,
-            Notification::Replace {
-                arena: arena,
-                index: 0,
-                path: file_path.clone(),
-                mtime: later_time(),
-                size: 200,
-                hash: Hash([2u8; 32]),
-                old_hash: test_hash(),
-            },
-        )?;
-
-        assert_eq!(Some(vec![test_hash()]), acache.outdated_versions(inode)?);
-
-        cache.update(
-            peer,
-            Notification::Replace {
-                arena: arena,
-                index: 0,
-                path: file_path.clone(),
-                mtime: later_time(),
-                size: 200,
-                hash: Hash([3u8; 32]),
-                old_hash: Hash([2u8; 32]),
-            },
-        )?;
-
-        assert_eq!(
-            Some(vec![test_hash(), Hash([2u8; 32])]),
-            acache.outdated_versions(inode)?
-        );
-
-        acache.start_tracking_outdated_versions(inode)?;
-        assert_eq!(Some(vec![]), acache.outdated_versions(inode)?);
-
-        cache.update(
-            peer,
-            Notification::Replace {
-                arena: arena,
-                index: 0,
-                path: file_path.clone(),
-                mtime: later_time(),
-                size: 200,
-                hash: Hash([4u8; 32]),
-                old_hash: Hash([3u8; 32]),
-            },
-        )?;
-
-        assert_eq!(
-            Some(vec![Hash([3u8; 32])]),
-            acache.outdated_versions(inode)?
-        );
-        acache.stop_tracking_outdated_versions(inode)?;
-        assert_eq!(None, acache.outdated_versions(inode)?);
-
-        cache.update(
-            peer,
-            Notification::Replace {
-                arena: arena,
-                index: 0,
-                path: file_path.clone(),
-                mtime: later_time(),
-                size: 200,
-                hash: Hash([5u8; 32]),
-                old_hash: Hash([4u8; 32]),
-            },
-        )?;
-        assert_eq!(None, acache.outdated_versions(inode)?);
 
         Ok(())
     }

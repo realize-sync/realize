@@ -213,7 +213,7 @@ impl UnrealCacheBlocking {
         peer: Peer,
         notification: Notification,
     ) -> Result<(), StorageError> {
-        let arena = notification.arena().clone();
+        let arena = notification.arena();
         let cache = self.arena_cache(arena)?;
         cache.update(peer, notification, || self.alloc_inode_range(arena))
     }
@@ -408,42 +408,6 @@ impl UnrealCacheAsync {
         task::spawn_blocking(move || {
             let arena_cache = inner.arena_cache_for_inode(inode)?;
             arena_cache.local_availability(inode)
-        })
-        .await?
-    }
-
-    /// Start tracking versions that overwrite the current one.
-    ///
-    /// Erases the current set of versions if tracking is already enabled.
-    pub async fn start_tracking_outdated_versions(&self, inode: Inode) -> Result<(), StorageError> {
-        let inner = Arc::clone(&self.inner);
-
-        task::spawn_blocking(move || {
-            let arena_cache = inner.arena_cache_for_inode(inode)?;
-            arena_cache.start_tracking_outdated_versions(inode)
-        })
-        .await?
-    }
-
-    /// Stop tracking overwritten versions.
-    pub async fn stop_tracking_outdated_versions(&self, inode: Inode) -> Result<(), StorageError> {
-        let inner = Arc::clone(&self.inner);
-
-        task::spawn_blocking(move || {
-            let arena_cache = inner.arena_cache_for_inode(inode)?;
-            arena_cache.stop_tracking_outdated_versions(inode)
-        })
-        .await?
-    }
-
-    /// Return hashes of versions that have been replaced since
-    /// `track_outdated_versions`.
-    pub async fn outdated_versions(&self, inode: Inode) -> Result<Option<Vec<Hash>>, StorageError> {
-        let inner = Arc::clone(&self.inner);
-
-        task::spawn_blocking(move || {
-            let arena_cache = inner.arena_cache_for_inode(inode)?;
-            arena_cache.outdated_versions(inode)
         })
         .await?
     }

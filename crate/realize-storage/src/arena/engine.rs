@@ -524,12 +524,12 @@ impl Engine {
                         return Ok(Some(Job::Realize(path, counter, cached.content.hash, None)));
                     }
                     if let Some(indexed) = from_index
-                        && cached
-                            .outdated_versions
-                            .map(|v| v.contains(&indexed.hash))
+                        && indexed
+                            .outdated_by
+                            .as_ref()
+                            .map(|h| *h == cached.content.hash)
                             .unwrap_or(false)
                     {
-                        // File in the index is outdated, updated it.
                         return Ok(Some(Job::Realize(
                             path,
                             counter,
@@ -741,8 +741,10 @@ mod tests {
     use crate::arena::mark::PathMarks;
     use crate::utils::redb_utils;
     use assert_fs::TempDir;
+    use assert_fs::prelude::*;
     use futures::StreamExt as _;
     use realize_types::{Arena, Peer, UnixTime};
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::io::AsyncWriteExt as _;
@@ -775,6 +777,7 @@ mod tests {
         index: RealIndexBlocking,
         pathmarks: PathMarks,
         engine: Arc<Engine>,
+        arena_path: PathBuf,
         _tempdir: TempDir,
     }
     impl EngineFixture {
@@ -782,6 +785,9 @@ mod tests {
             let _ = env_logger::try_init();
 
             let tempdir = TempDir::new()?;
+            let arena_path = tempdir.child("arena");
+            arena_path.create_dir_all()?;
+
             let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
 
@@ -818,6 +824,7 @@ mod tests {
                 index,
                 engine,
                 pathmarks,
+                arena_path: arena_path.to_path_buf(),
                 _tempdir: tempdir,
             })
         }
@@ -847,6 +854,29 @@ mod tests {
             })
         }
 
+        // A new version comes in that replaces the version in the
+        // cache/index.
+        fn replace_in_cache_and_index(
+            &self,
+            path: &Path,
+            hash: Hash,
+            old_hash: Hash,
+        ) -> anyhow::Result<()> {
+            let notification = Notification::Replace {
+                arena: self.arena,
+                index: 1,
+                path: path.clone(),
+                mtime: UnixTime::from_secs(1234567890),
+                size: 4,
+                hash,
+                old_hash,
+            };
+            self.update_index(&notification)?;
+            self.update_cache(notification)?;
+
+            Ok(())
+        }
+
         fn add_file_to_index_with_version(&self, path: &Path, hash: Hash) -> anyhow::Result<()> {
             Ok(self
                 .index
@@ -857,6 +887,12 @@ mod tests {
             let test_peer = Peer::from("other");
             self.acache
                 .update(test_peer, notification, || Ok((Inode(1000), Inode(2000))))?;
+            Ok(())
+        }
+
+        fn update_index(&self, notification: &Notification) -> anyhow::Result<()> {
+            self.index.update(notification, &self.arena_path)?;
+
             Ok(())
         }
 
@@ -1220,23 +1256,7 @@ mod tests {
         // Cache and index have the same version
         fixture.add_file_to_cache_with_version(&foobar, Hash([1; 32]))?;
         fixture.add_file_to_index_with_version(&foobar, Hash([1; 32]))?;
-
-        // Version tracking is enabled in the cache (normally by a
-        // previous run of Realize).
-        let (inode, _) = fixture.acache.lookup_path(&foobar)?;
-        fixture.acache.start_tracking_outdated_versions(inode)?;
-
-        // A new version comes in that replaces the version in the
-        // cache/index.
-        fixture.update_cache(Notification::Replace {
-            arena: fixture.arena,
-            index: 1,
-            path: foobar.clone(),
-            mtime: UnixTime::from_secs(1234567890),
-            size: 4,
-            hash: Hash([2; 32]),
-            old_hash: Hash([1; 32]),
-        })?;
+        fixture.replace_in_cache_and_index(&foobar, Hash([2; 32]), Hash([1; 32]))?;
 
         let mut job_stream = fixture.engine.job_stream();
 
