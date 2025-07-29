@@ -34,6 +34,10 @@ struct HistoryTableEntry {
 
     # File has been removed.
     remove @2;
+
+    # File has been dropped from this peer,
+    # but should remain available elsewhere.
+    drop @3;
   }
 
   path @1: Text;

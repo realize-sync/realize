@@ -762,6 +762,16 @@ async fn do_notify(
                     old_hash: parse_hash(remove.get_old_hash()?)?,
                 }
             }
+            notification::Which::Drop(drop) => {
+                let drop = drop?;
+
+                Notification::Drop {
+                    arena: parse_arena(drop.get_arena()?)?,
+                    index: drop.get_index(),
+                    path: parse_path(drop.get_path()?)?,
+                    old_hash: parse_hash(drop.get_old_hash()?)?,
+                }
+            }
             notification::Which::CatchupStart(start) => {
                 Notification::CatchupStart(parse_arena(start?.get_arena()?)?)
             }
@@ -861,6 +871,13 @@ async fn send_notifications(
                 old_hash,
             } => fill_remove(notif_builder.init_remove(), *arena, *index, path, old_hash),
 
+            Notification::Drop {
+                arena,
+                index,
+                path,
+                old_hash,
+            } => fill_drop(notif_builder.init_drop(), *arena, *index, path, old_hash),
+
             Notification::Catchup {
                 arena,
                 path,
@@ -947,6 +964,19 @@ fn fill_replace(
 
 fn fill_remove(
     mut builder: super::store_capnp::remove::Builder<'_>,
+    arena: Arena,
+    index: u64,
+    path: &realize_types::Path,
+    old_hash: &realize_types::Hash,
+) {
+    builder.set_arena(arena.as_str());
+    builder.set_index(index);
+    builder.set_path(path.as_str());
+    builder.set_old_hash(&old_hash.0);
+}
+
+fn fill_drop(
+    mut builder: super::store_capnp::drop::Builder<'_>,
     arena: Arena,
     index: u64,
     path: &realize_types::Path,

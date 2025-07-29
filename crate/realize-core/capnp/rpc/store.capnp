@@ -115,6 +115,7 @@ struct Notification {
     add @0: Add;
     replace @1: Replace;
     remove @2: Remove;
+    drop @7: Drop;
     catchupStart @3: CatchupStart;
     catchup @4: Catchup;
     catchupComplete @5: CatchupComplete;
@@ -140,6 +141,12 @@ struct Replace {
   oldHash @6: Data;
 }
 struct Remove {
+  index @0: UInt64;
+  arena @1: Text;
+  path @2: Text;
+  oldHash @3: Data;
+}
+struct Drop {
   index @0: UInt64;
   arena @1: Text;
   path @2: Text;

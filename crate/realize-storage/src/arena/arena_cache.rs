@@ -184,6 +184,12 @@ impl ArenaCache {
                 path,
                 old_hash,
                 ..
+            }
+            | Notification::Drop {
+                index,
+                path,
+                old_hash,
+                ..
             } => {
                 do_update_last_seen_notification(&txn, peer, index)?;
 

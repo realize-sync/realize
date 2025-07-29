@@ -261,6 +261,35 @@ impl RealIndexBlocking {
         Ok(())
     }
 
+    /// Remove `path` from the index if the hash and file match,
+    /// report it as a drop in the history.
+    pub fn drop_file_if_matches(
+        &self,
+        txn: &ArenaWriteTransaction,
+        path: &realize_types::Path,
+        hash: &Hash,
+        realpath: &std::path::Path,
+    ) -> Result<bool, StorageError> {
+        let mut file_table = txn.index_file_table()?;
+        let mut history_table = txn.index_history_table()?;
+
+        if let Some(entry) = do_get_file_entry(&file_table, path)?
+            && entry.hash == *hash
+            && file_matches_index(&entry, realpath)
+        {
+            file_table.remove(path.as_str())?;
+
+            let index = self.allocate_history_index(&txn, &history_table)?;
+            (&self.dirty_paths).mark_dirty(&txn, &path)?;
+            let ev = HistoryTableEntry::Drop(path.clone(), hash.clone());
+            log::debug!("[{}] History #{index}: {ev:?}", self.arena);
+            history_table.insert(index, Holder::with_content(ev)?)?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
     fn allocate_history_index(
         &self,
         txn: &ArenaWriteTransaction,
@@ -2110,6 +2139,231 @@ mod tests {
         let txn = fixture.index.db.begin_write()?;
         let result = get_indexed_file(&txn, root.path(), &path, Some(&hash))?;
         assert_eq!(result, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_drop_file_if_matches_success() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let (path, hash) = fixture.add_file_with_content("test.txt", "test content")?;
+
+        // Verify file exists in index
+        assert!(fixture.index.has_file(&path)?);
+
+        // Drop the file
+        {
+            let txn = fixture.index.db.begin_write()?;
+            let child = fixture.root.child("test.txt");
+            let realpath = child.path();
+            let result = fixture
+                .index
+                .drop_file_if_matches(&txn, &path, &hash, &realpath)?;
+            assert!(result);
+            txn.commit()?;
+        }
+
+        // Verify file is removed from index
+        assert!(!fixture.index.has_file(&path)?);
+
+        // Verify history entry was created
+        {
+            let txn = fixture.index.db.begin_read()?;
+            let history_table = txn.index_history_table()?;
+            let last_index = fixture.index.last_history_index()?;
+            let entry = history_table.get(last_index)?.unwrap().value().parse()?;
+            assert_eq!(entry, HistoryTableEntry::Drop(path.clone(), hash.clone()));
+        }
+
+        // Verify file is marked dirty
+        {
+            let txn = fixture.index.db.begin_read()?;
+            assert!(engine::is_dirty(&txn, &path)?);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_drop_file_if_matches_wrong_hash() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let (path, _) = fixture.add_file_with_content("test.txt", "test content")?;
+        let wrong_hash = hash::digest("different content");
+
+        // Get the initial history count
+        let initial_history_count = fixture.index.last_history_index()?;
+
+        // Verify file exists in index
+        assert!(fixture.index.has_file(&path)?);
+
+        // Try to drop with wrong hash
+        {
+            let txn = fixture.index.db.begin_write()?;
+            let child = fixture.root.child("test.txt");
+            let realpath = child.path();
+            let result = fixture
+                .index
+                .drop_file_if_matches(&txn, &path, &wrong_hash, &realpath)?;
+            assert!(!result);
+            txn.commit()?;
+        }
+
+        // Verify file still exists in index
+        assert!(fixture.index.has_file(&path)?);
+
+        // Verify no new history entry was created
+        let final_history_count = fixture.index.last_history_index()?;
+        assert_eq!(initial_history_count, final_history_count);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_drop_file_if_matches_file_not_in_index() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let path = realize_types::Path::parse("not_in_index.txt")?;
+        let hash = hash::digest("some content");
+
+        // Get the initial history count
+        let initial_history_count = fixture.index.last_history_index()?;
+
+        // Verify file doesn't exist in index
+        assert!(!fixture.index.has_file(&path)?);
+
+        // Try to drop file not in index
+        {
+            let txn = fixture.index.db.begin_write()?;
+            let child = fixture.root.child("not_in_index.txt");
+            let realpath = child.path();
+            let result = fixture
+                .index
+                .drop_file_if_matches(&txn, &path, &hash, &realpath)?;
+            assert!(!result);
+            txn.commit()?;
+        }
+
+        // Verify no new history entry was created
+        let final_history_count = fixture.index.last_history_index()?;
+        assert_eq!(initial_history_count, final_history_count);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_drop_file_if_matches_file_modified_on_fs() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let (path, hash) = fixture.add_file_with_content("test.txt", "original content")?;
+
+        // Get the initial history count
+        let initial_history_count = fixture.index.last_history_index()?;
+
+        // Modify the file on filesystem without updating the index
+        fixture
+            .root
+            .child("test.txt")
+            .write_str("modified content")?;
+
+        // Verify file exists in index
+        assert!(fixture.index.has_file(&path)?);
+
+        // Try to drop the file
+        {
+            let txn = fixture.index.db.begin_write()?;
+            let child = fixture.root.child("test.txt");
+            let realpath = child.path();
+            let result = fixture
+                .index
+                .drop_file_if_matches(&txn, &path, &hash, &realpath)?;
+            assert!(!result);
+            txn.commit()?;
+        }
+
+        // Verify file still exists in index
+        assert!(fixture.index.has_file(&path)?);
+
+        // Verify no new history entry was created
+        let final_history_count = fixture.index.last_history_index()?;
+        assert_eq!(initial_history_count, final_history_count);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_drop_file_if_matches_file_missing_on_fs() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let (path, hash) = fixture.add_file_with_content("test.txt", "test content")?;
+
+        // Get the initial history count
+        let initial_history_count = fixture.index.last_history_index()?;
+
+        // Remove the file from filesystem
+        std::fs::remove_file(fixture.root.child("test.txt").path())?;
+
+        // Verify file exists in index
+        assert!(fixture.index.has_file(&path)?);
+
+        // Try to drop the file
+        {
+            let txn = fixture.index.db.begin_write()?;
+            let child = fixture.root.child("test.txt");
+            let realpath = child.path();
+            let result = fixture
+                .index
+                .drop_file_if_matches(&txn, &path, &hash, &realpath)?;
+            assert!(!result);
+            txn.commit()?;
+        }
+
+        // Verify file still exists in index
+        assert!(fixture.index.has_file(&path)?);
+
+        // Verify no new history entry was created
+        let final_history_count = fixture.index.last_history_index()?;
+        assert_eq!(initial_history_count, final_history_count);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_drop_file_if_matches_metadata_mismatch() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let path = realize_types::Path::parse("test.txt")?;
+        let content = "test content";
+        let hash = hash::digest(content);
+
+        // Create file with different metadata than what's in index
+        fixture.root.child("test.txt").write_str(content)?;
+        fixture.index.add_file(
+            &path,
+            content.len() as u64,
+            &UnixTime::from_secs(1234567890),
+            hash.clone(),
+        )?;
+
+        // Get the initial history count
+        let initial_history_count = fixture.index.last_history_index()?;
+
+        // Verify file exists in index
+        assert!(fixture.index.has_file(&path)?);
+
+        // Try to drop the file
+        {
+            let txn = fixture.index.db.begin_write()?;
+            let child = fixture.root.child("test.txt");
+            let realpath = child.path();
+            let result = fixture
+                .index
+                .drop_file_if_matches(&txn, &path, &hash, &realpath)?;
+            assert!(!result);
+            txn.commit()?;
+        }
+
+        // Verify file still exists in index
+        assert!(fixture.index.has_file(&path)?);
+
+        // Verify no new history entry was created
+        let final_history_count = fixture.index.last_history_index()?;
+        assert_eq!(initial_history_count, final_history_count);
 
         Ok(())
     }

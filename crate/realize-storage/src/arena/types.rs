@@ -187,9 +187,23 @@ impl ByteConvertible<IndexedFileTableEntry> for IndexedFileTableEntry {
 /// An entry in the file table.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HistoryTableEntry {
+    /// The file was modified by the user. Modification should be forwarded to other copies.
     Add(realize_types::Path),
+
+    /// The file was modified by the user. Modification should be forwarded to other copies.
+    ///
+    /// The hash is the removed hash version.
     Replace(realize_types::Path, Hash),
+
+    /// The file was removed by the user. Removal should be forwarded to other copies.
+    ///
+    /// The hash is the removed hash version.
     Remove(realize_types::Path, Hash),
+
+    /// This version of the file was removed from local store, but it should remain available in the cache.
+    ///
+    /// The hash is the dropped hash version.
+    Drop(realize_types::Path, Hash),
 }
 
 impl NamedType for HistoryTableEntry {
@@ -215,6 +229,10 @@ impl ByteConvertible<HistoryTableEntry> for HistoryTableEntry {
                 parse_path(msg.get_path()?)?,
                 parse_hash(msg.get_old_hash()?)?,
             )),
+            index_capnp::history_table_entry::Kind::Drop => Ok(HistoryTableEntry::Drop(
+                parse_path(msg.get_path()?)?,
+                parse_hash(msg.get_old_hash()?)?,
+            )),
         }
     }
 
@@ -235,6 +253,11 @@ impl ByteConvertible<HistoryTableEntry> for HistoryTableEntry {
             }
             HistoryTableEntry::Remove(path, old_hash) => {
                 builder.set_kind(index_capnp::history_table_entry::Kind::Remove);
+                builder.set_path(path.as_str());
+                builder.set_old_hash(&old_hash.0);
+            }
+            HistoryTableEntry::Drop(path, old_hash) => {
+                builder.set_kind(index_capnp::history_table_entry::Kind::Drop);
                 builder.set_path(path.as_str());
                 builder.set_old_hash(&old_hash.0);
             }

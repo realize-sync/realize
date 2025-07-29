@@ -71,6 +71,24 @@ pub enum Notification {
         old_hash: Hash,
     },
 
+    /// Peer dropped that file, but it should still remain available
+    /// elsewhere.
+    Drop {
+        /// Containing arena.
+        arena: Arena,
+
+        /// Notification index.
+        ///
+        /// Should be stored and reported back as [Progress::last_seen] when re-subscribing.
+        index: u64,
+
+        /// File path within the arena.
+        path: Path,
+
+        /// Hash of the removed content.
+        old_hash: Hash,
+    },
+
     /// Let the subscriber know that catchup has started.
     ///
     /// Catchup might need to be run even when the subscriber provided
@@ -125,6 +143,7 @@ impl Notification {
             Notification::Add { arena, .. } => *arena,
             Notification::Replace { arena, .. } => *arena,
             Notification::Remove { arena, .. } => *arena,
+            Notification::Drop { arena, .. } => *arena,
             Notification::CatchupStart(arena) => *arena,
             Notification::Catchup { arena, .. } => *arena,
             Notification::CatchupComplete { arena, .. } => *arena,
@@ -136,6 +155,7 @@ impl Notification {
             Notification::Add { path, .. } => Some(path),
             Notification::Replace { path, .. } => Some(path),
             Notification::Remove { path, .. } => Some(path),
+            Notification::Drop { path, .. } => Some(path),
             Notification::CatchupStart(_) => None,
             Notification::Catchup { path, .. } => Some(path),
             Notification::CatchupComplete { .. } => None,
@@ -147,6 +167,7 @@ impl Notification {
             Notification::Add { index, .. } => Some(*index),
             Notification::Replace { index, .. } => Some(*index),
             Notification::Remove { index, .. } => Some(*index),
+            Notification::Drop { index, .. } => Some(*index),
             Notification::CatchupStart(_) => None,
             Notification::Catchup { .. } => None,
             Notification::CatchupComplete { index, .. } => Some(*index),
@@ -197,7 +218,7 @@ pub async fn subscribe(
     };
 
     tx.send(Notification::Connected {
-        arena: index.arena().clone(),
+        arena: index.arena(),
         uuid: index.uuid().clone(),
     })
     .await?;
@@ -246,8 +267,7 @@ async fn catchup(
     catchup_index: u64,
     tx: &mpsc::Sender<Notification>,
 ) -> anyhow::Result<()> {
-    tx.send(Notification::CatchupStart(index.arena().clone()))
-        .await?;
+    tx.send(Notification::CatchupStart(index.arena())).await?;
 
     let mut all_files = index.all_files();
     while let Some((
@@ -258,7 +278,7 @@ async fn catchup(
     )) = all_files.next().await
     {
         tx.send(Notification::Catchup {
-            arena: index.arena().clone(),
+            arena: index.arena(),
             path,
             size,
             mtime,
@@ -268,7 +288,7 @@ async fn catchup(
     }
 
     tx.send(Notification::CatchupComplete {
-        arena: index.arena().clone(),
+        arena: index.arena(),
         index: catchup_index,
     })
     .await?;
@@ -300,7 +320,7 @@ async fn send_notifications(
                 {
                     Some(Notification::Add {
                         index: hist_index,
-                        arena: index.arena().clone(),
+                        arena: index.arena(),
                         path,
                         size,
                         mtime,
@@ -325,7 +345,7 @@ async fn send_notifications(
                 {
                     Some(Notification::Replace {
                         index: hist_index,
-                        arena: index.arena().clone(),
+                        arena: index.arena(),
                         path,
                         size,
                         mtime,
@@ -335,7 +355,19 @@ async fn send_notifications(
                 } else {
                     Some(Notification::Remove {
                         index: hist_index,
-                        arena: index.arena().clone(),
+                        arena: index.arena(),
+                        path,
+                        old_hash,
+                    })
+                }
+            }
+            HistoryTableEntry::Drop(path, old_hash) => {
+                if index.has_file(&path).await? {
+                    None
+                } else {
+                    Some(Notification::Drop {
+                        index: hist_index,
+                        arena: index.arena(),
                         path,
                         old_hash,
                     })
