@@ -1,19 +1,14 @@
 use arena::arena_cache::ArenaCache;
 use arena::db::ArenaDatabase;
 use arena::engine::{DirtyPaths, Engine};
-use arena::index::RealIndexAsync;
-use arena::indexed_store;
-use arena::mark::PathMarks;
-use arena::watcher::RealWatcher;
+use arena::{ArenaStorage, indexed_store};
 use config::StorageConfig;
 use futures::Stream;
 use global::db::GlobalDatabase;
 use global::inode_allocator::InodeAllocator;
 use realize_types::{self, Arena, ByteRange, Delta, Hash, Path, Peer, Signature};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::{self, JoinHandle};
 use tokio_stream::StreamMap;
@@ -47,28 +42,6 @@ pub struct Storage {
     store: RealStore,
 }
 
-struct ArenaStorage {
-    /// The arena's index, kept up-to-date by the watcher.
-    index: RealIndexAsync,
-
-    /// The subset of the cache that manages file in this arena.
-    #[allow(dead_code)] // in progress
-    arena_cache: Arc<ArenaCache>,
-
-    /// Arena root on the filesystem.
-    root: PathBuf,
-
-    /// The arena's engine.
-    engine: Arc<Engine>,
-
-    /// Handles file and directory marks.
-    pathmarks: PathMarks,
-
-    /// Keep a handle on the spawned watcher, which runs only
-    /// as long as this instance exists.
-    _watcher: RealWatcher,
-}
-
 impl Storage {
     /// Create and initialize storage from its configuration.
     pub async fn from_config(config: &StorageConfig) -> anyhow::Result<Arc<Self>> {
@@ -85,56 +58,13 @@ impl Storage {
 
         for (arena, arena_config) in &config.arenas {
             let arena = *arena;
-            let db = ArenaDatabase::new(redb_utils::open(&arena_config.db).await?)?;
-            let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-            let arena_cache = ArenaCache::new(
-                arena,
-                Arc::clone(&allocator),
-                Arc::clone(&db),
-                &arena_config.blob_dir,
-                Arc::clone(&dirty_paths),
-            )?;
-            arena_caches.push(Arc::clone(&arena_cache));
+            let (cache, storage) =
+                arena::from_config(arena, arena_config, &exclude, &allocator).await?;
 
-            let root = match arena_config.root.as_ref() {
-                Some(p) => p,
-                None => {
-                    continue;
-                }
-            };
-            let index =
-                RealIndexAsync::with_db(arena, Arc::clone(&db), Arc::clone(&dirty_paths)).await?;
-            let exclude = exclude
-                .iter()
-                .map(|p| realize_types::Path::from_real_path_in(p, root))
-                .flatten()
-                .collect::<Vec<_>>();
-
-            log::debug!("Watch {root:?}, excluding {exclude:?}");
-            let watcher = RealWatcher::builder(root, index.clone())
-                .exclude_all(exclude.iter())
-                .spawn()
-                .await?;
-            let arena_root = arena_cache.arena_root();
-            let engine = Engine::new(
-                arena,
-                Arc::clone(&db),
-                Arc::clone(&dirty_paths),
-                arena_root,
-                job_retry_strategy,
-            );
-            let pathmarks = PathMarks::new(Arc::clone(&db), arena_root, Arc::clone(&dirty_paths))?;
-            indexed_arenas.insert(
-                arena,
-                ArenaStorage {
-                    index,
-                    arena_cache,
-                    root: root.to_path_buf(),
-                    engine,
-                    pathmarks,
-                    _watcher: watcher,
-                },
-            );
+            arena_caches.push(cache);
+            if let Some(s) = storage {
+                indexed_arenas.insert(arena, s);
+            }
         }
 
         let cache = UnrealCacheAsync::with_db(globaldb, allocator, arena_caches).await?;
@@ -355,20 +285,4 @@ fn build_exclude(config: &StorageConfig) -> Vec<&std::path::Path> {
     }
 
     exclude
-}
-
-/// Minimum wait time after a failed job.
-const JOB_RETRY_TIME_BASE: Duration = Duration::from_secs(60);
-
-/// Max is less than one day, so we retry at different time of day.
-const MAX_JOB_RETRY_DURATION: Duration = Duration::from_secs(18 * 23600);
-
-/// Exponential backoff, starting with [JOB_RETRY_TIME_BASE] with a
-/// max of [MAX_JOB_RETRY_DURATION].
-///
-/// TODO: make that configurable in ArenaConfig.
-fn job_retry_strategy(attempt: u32) -> Option<Duration> {
-    let duration = 2u32.pow(attempt) * JOB_RETRY_TIME_BASE;
-
-    Some(duration.max(MAX_JOB_RETRY_DURATION))
 }
