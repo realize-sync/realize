@@ -140,7 +140,7 @@ impl HouseholdFixture {
             if let Some(delay) = retry.next() {
                 tokio::time::sleep(delay).await;
             } else {
-                panic!("[arena]/{filename} was never added to the cache");
+                panic!("[arena]/{filename} was never added to the cache of {peer}");
             }
         }
 

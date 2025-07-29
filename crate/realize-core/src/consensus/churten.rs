@@ -313,6 +313,9 @@ impl JobHandler for JobHandlerImpl {
                 )
                 .await
             }
+            Job::Unrealize(path, _, hash) => {
+                jobs::unrealize(&self.storage, arena, path, hash, &mut progress).await
+            }
         }
     }
 }

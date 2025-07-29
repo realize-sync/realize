@@ -17,14 +17,18 @@ use tokio::sync::watch;
 use tokio::{task, time};
 use tokio_stream::wrappers::ReceiverStream;
 
+/// Some change the [Engine] finds necessary.
 #[derive(Eq, PartialEq, Debug, Clone)]
 pub enum Job {
+    // TODO: use named fields
     Download(Path, u64, Hash),
 
     /// Realize `Path` with `counter`, moving `Hash` from cache to the
     /// index, currently containing nothing or `Hash`.
-    /// TODO: use named fields
     Realize(Path, u64, Hash, Option<Hash>),
+
+    /// Move file containing the given version into the cache.
+    Unrealize(Path, u64, Hash),
 }
 
 impl Job {
@@ -33,6 +37,7 @@ impl Job {
         match self {
             Job::Download(path, _, _) => path,
             Job::Realize(path, _, _, _) => path,
+            Job::Unrealize(path, _, _) => path,
         }
     }
 
@@ -41,6 +46,7 @@ impl Job {
         match self {
             Job::Download(_, counter, _) => *counter,
             Job::Realize(_, counter, _, _) => *counter,
+            Job::Unrealize(_, counter, _) => *counter,
         }
     }
 
@@ -54,6 +60,7 @@ impl Job {
             Job::Realize(path, _, cached_hash, indexed_hash) => {
                 Job::Realize(path, counter, cached_hash, indexed_hash)
             }
+            Job::Unrealize(path, _, hash) => Job::Unrealize(path, counter, hash),
         }
     }
 }
@@ -503,15 +510,28 @@ impl Engine {
         counter: u64,
     ) -> Result<Option<Job>, StorageError> {
         match mark::get_mark(txn, &path)? {
-            Mark::Watch => Ok(None),
-            Mark::Keep => {
-                if let Ok(file_entry) =
-                    arena_cache::get_file_entry_for_path(txn, self.arena_root, &path)
-                    && blob::local_availability(txn, &file_entry)? != LocalAvailability::Verified
+            Mark::Watch => {
+                if let (Ok(cached), Ok(Some(indexed))) = (
+                    arena_cache::get_file_entry_for_path(txn, self.arena_root, &path),
+                    index::get_file_entry(txn, &path),
+                ) && cached.content.hash == indexed.hash
                 {
-                    Ok(Some(Job::Download(path, counter, file_entry.content.hash)))
-                } else {
-                    Ok(None)
+                    return Ok(Some(Job::Unrealize(path, counter, cached.content.hash)));
+                }
+            }
+            Mark::Keep => {
+                if let Ok(cached) =
+                    arena_cache::get_file_entry_for_path(txn, self.arena_root, &path)
+                {
+                    if let Ok(Some(indexed)) = index::get_file_entry(txn, &path)
+                        && cached.content.hash == indexed.hash
+                    {
+                        return Ok(Some(Job::Unrealize(path, counter, cached.content.hash)));
+                    }
+
+                    if blob::local_availability(txn, &cached)? != LocalAvailability::Verified {
+                        return Ok(Some(Job::Download(path, counter, cached.content.hash)));
+                    }
                 }
             }
             Mark::Own => {
@@ -539,9 +559,10 @@ impl Engine {
                         )));
                     }
                 }
-                Ok(None)
             }
-        }
+        };
+
+        Ok(None)
     }
 
     fn delete_range(&self, beg: u64, end: u64) -> Result<(), StorageError> {

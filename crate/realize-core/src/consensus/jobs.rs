@@ -254,6 +254,24 @@ pub(crate) async fn realize(
     Ok(JobStatus::Done)
 }
 
+/// Move a real file into the cache.
+///
+/// Executes a [realize_storage::Job::Unrealize]
+pub(crate) async fn unrealize(
+    storage: &Arc<Storage>,
+    arena: Arena,
+    path: &Path,
+    hash: &Hash,
+    progress: &mut impl ByteCountProgress,
+) -> anyhow::Result<JobStatus> {
+    progress.update_action(JobAction::Move);
+    if !storage.unrealize(arena, path, hash).await? {
+        return Ok(JobStatus::Abandoned);
+    }
+
+    Ok(JobStatus::Done)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1056,6 +1074,53 @@ mod tests {
                     "bar before foo!",
                     fs::read_to_string(foobar.within(&root)).await?.as_str()
                 );
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unrealize_file() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |_household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+
+                let foobar = fixture.write_file(b, "foobar", "foo!").await?;
+                fixture.inner.wait_for_file_in_cache(a, "foobar").await?;
+                fixture.write_file(a, "foobar", "foo!").await?;
+                fixture.inner.wait_for_file_in_cache(b, "foobar").await?;
+                // foobar is in the cache and the index with the same content
+
+                let mut progress = SimpleByteCountProgress::new();
+                assert_eq!(
+                    JobStatus::Done,
+                    unrealize(
+                        fixture.inner.storage(a)?,
+                        HouseholdFixture::test_arena(),
+                        &foobar,
+                        &hash::digest("foo!"),
+                        &mut progress,
+                    )
+                    .await?,
+                );
+
+                log::debug!("=== ook1");
+                assert!(!fixture.inner.arena_root(a).join("foobar").exists());
+                log::debug!("=== ook2");
+                assert_eq!(
+                    "foo!",
+                    fixture.get_blob_content_as_string(a, "foobar").await?
+                );
+                log::debug!("=== ook3");
 
                 Ok::<(), anyhow::Error>(())
             })

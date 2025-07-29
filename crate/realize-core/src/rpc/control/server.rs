@@ -218,6 +218,7 @@ fn fill_notification(source: ChurtenNotification, mut dest: churten_notification
     download.set_hash(match &**job {
         realize_storage::Job::Download(_, _, hash) => &hash.0,
         realize_storage::Job::Realize(_, _, hash, _) => &hash.0,
+        realize_storage::Job::Unrealize(_, _, hash) => &hash.0,
     });
     // Set notification type
     match &source {
