@@ -71,6 +71,7 @@ impl ArenaStorage {
                     .collect::<Vec<_>>();
                 log::debug!("Watch {root:?}, excluding {exclude:?}");
                 let watcher = RealWatcher::builder(root, index.clone())
+                    .with_catchup()
                     .exclude_all(exclude.iter())
                     .spawn()
                     .await?;
