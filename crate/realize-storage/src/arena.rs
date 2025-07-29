@@ -24,57 +24,60 @@ pub mod store;
 pub mod types;
 pub mod watcher;
 
+/// Gives access to arena-specific stores and functions.
 pub(crate) struct ArenaStorage {
-    /// The arena's index, kept up-to-date by the watcher.
-    pub(crate) index: RealIndexAsync,
-
-    /// The subset of the cache that manages file in this arena.
-    #[allow(dead_code)] // in progress
-    arena_cache: Arc<ArenaCache>,
-
-    /// Arena root on the filesystem.
-    pub(crate) root: PathBuf,
-
-    /// The arena's engine.
-    pub(crate) engine: Arc<Engine>,
-
-    /// Handles file and directory marks.
+    pub(crate) cache: Arc<ArenaCache>,
     pub(crate) pathmarks: PathMarks,
+    pub(crate) engine: Arc<Engine>,
+    pub(crate) indexed: Option<IndexedArenaStorage>,
+}
 
-    /// Keep a handle on the spawned watcher, which runs only
-    /// as long as this instance exists.
+/// Indexed (FS-based) local storage.
+pub(crate) struct IndexedArenaStorage {
+    pub(crate) root: PathBuf,
+    pub(crate) index: RealIndexAsync,
     _watcher: RealWatcher,
 }
 
-pub(crate) async fn from_config(
-    arena: Arena,
-    arena_config: &config::ArenaConfig,
-    exclude: &Vec<&std::path::Path>,
-    allocator: &Arc<InodeAllocator>,
-) -> Result<(Arc<ArenaCache>, Option<ArenaStorage>), anyhow::Error> {
-    let db = ArenaDatabase::new(redb_utils::open(&arena_config.db).await?)?;
-    let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-    let arena_cache = ArenaCache::new(
-        arena,
-        Arc::clone(allocator),
-        Arc::clone(&db),
-        &arena_config.blob_dir,
-        Arc::clone(&dirty_paths),
-    )?;
-    let arena_storage = if let Some(root) = arena_config.root.as_ref() {
-        let index =
-            RealIndexAsync::with_db(arena, Arc::clone(&db), Arc::clone(&dirty_paths)).await?;
-        let exclude = exclude
-            .iter()
-            .map(|p| realize_types::Path::from_real_path_in(p, root))
-            .flatten()
-            .collect::<Vec<_>>();
+impl ArenaStorage {
+    pub(crate) async fn from_config(
+        arena: Arena,
+        arena_config: &config::ArenaConfig,
+        exclude: &Vec<&std::path::Path>,
+        allocator: &Arc<InodeAllocator>,
+    ) -> anyhow::Result<Self> {
+        let db = ArenaDatabase::new(redb_utils::open(&arena_config.db).await?)?;
+        let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
+        let arena_cache = ArenaCache::new(
+            arena,
+            Arc::clone(allocator),
+            Arc::clone(&db),
+            &arena_config.blob_dir,
+            Arc::clone(&dirty_paths),
+        )?;
+        let indexed = match arena_config.root.as_ref() {
+            None => None,
+            Some(root) => {
+                let index =
+                    RealIndexAsync::with_db(arena, Arc::clone(&db), Arc::clone(&dirty_paths))
+                        .await?;
+                let exclude = exclude
+                    .iter()
+                    .filter_map(|p| realize_types::Path::from_real_path_in(p, root).ok())
+                    .collect::<Vec<_>>();
+                log::debug!("Watch {root:?}, excluding {exclude:?}");
+                let watcher = RealWatcher::builder(root, index.clone())
+                    .exclude_all(exclude.iter())
+                    .spawn()
+                    .await?;
 
-        log::debug!("Watch {root:?}, excluding {exclude:?}");
-        let watcher = RealWatcher::builder(root, index.clone())
-            .exclude_all(exclude.iter())
-            .spawn()
-            .await?;
+                Some(IndexedArenaStorage {
+                    root: root.to_path_buf(),
+                    index,
+                    _watcher: watcher,
+                })
+            }
+        };
         let arena_root = arena_cache.arena_root();
         let engine = Engine::new(
             arena,
@@ -85,18 +88,13 @@ pub(crate) async fn from_config(
         );
         let pathmarks = PathMarks::new(Arc::clone(&db), arena_root, Arc::clone(&dirty_paths))?;
 
-        Some(ArenaStorage {
-            index,
-            arena_cache: Arc::clone(&arena_cache),
-            root: root.to_path_buf(),
+        Ok(ArenaStorage {
+            cache: Arc::clone(&arena_cache),
             engine,
             pathmarks,
-            _watcher: watcher,
+            indexed,
         })
-    } else {
-        None
-    };
-    Ok((arena_cache, arena_storage))
+    }
 }
 
 /// Minimum wait time after a failed job.

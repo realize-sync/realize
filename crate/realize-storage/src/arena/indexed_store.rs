@@ -152,8 +152,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::DirtyPaths;
+    use crate::arena::db::ArenaDatabase;
     use crate::utils::{hash, redb_utils};
-    use crate::{ArenaDatabase, DirtyPaths};
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;

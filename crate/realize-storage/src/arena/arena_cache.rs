@@ -971,14 +971,13 @@ fn do_unmark_peer_file(
 mod tests {
     use std::sync::Arc;
 
-    use crate::arena::db::{ArenaReadTransaction, ArenaWriteTransaction};
+    use crate::arena::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
     use crate::arena::engine;
     use crate::arena::notifier::Notification;
     use crate::global::types::{FileMetadata, InodeAssignment};
     use crate::utils::redb_utils;
     use crate::{
-        ArenaDatabase, DirtyPaths, GlobalDatabase, Inode, InodeAllocator, LocalAvailability,
-        StorageError,
+        DirtyPaths, GlobalDatabase, Inode, InodeAllocator, LocalAvailability, StorageError,
     };
     use assert_fs::TempDir;
     use assert_fs::prelude::*;

@@ -37,6 +37,9 @@ pub enum StorageError {
 
     #[error("unknown arena: {0}")]
     UnknownArena(Arena),
+
+    #[error("arena {0} has no local storage")]
+    NoLocalStorage(Arena),
 }
 
 impl StorageError {

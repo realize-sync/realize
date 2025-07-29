@@ -1,5 +1,3 @@
-use arena::arena_cache::ArenaCache;
-use arena::db::ArenaDatabase;
 use arena::engine::{DirtyPaths, Engine};
 use arena::{ArenaStorage, indexed_store};
 use config::StorageConfig;
@@ -38,7 +36,7 @@ pub use types::Inode;
 /// Local storage, including the real store and an unreal cache.
 pub struct Storage {
     cache: UnrealCacheAsync,
-    indexed_arenas: HashMap<Arena, ArenaStorage>,
+    arena_storage: HashMap<Arena, ArenaStorage>,
     store: RealStore,
 }
 
@@ -46,7 +44,7 @@ impl Storage {
     /// Create and initialize storage from its configuration.
     pub async fn from_config(config: &StorageConfig) -> anyhow::Result<Arc<Self>> {
         let store = RealStore::from_config(&config.arenas);
-        let mut indexed_arenas = HashMap::new();
+        let mut arena_storage = HashMap::new();
         let exclude = build_exclude(&config);
 
         let globaldb = GlobalDatabase::new(redb_utils::open(&config.cache.db).await?)?;
@@ -54,32 +52,47 @@ impl Storage {
             Arc::clone(&globaldb),
             config.arenas.keys().map(|a| *a).collect::<Vec<_>>(),
         )?;
-        let mut arena_caches = vec![];
-
         for (arena, arena_config) in &config.arenas {
-            let arena = *arena;
-            let (cache, storage) =
-                arena::from_config(arena, arena_config, &exclude, &allocator).await?;
-
-            arena_caches.push(cache);
-            if let Some(s) = storage {
-                indexed_arenas.insert(arena, s);
-            }
+            arena_storage.insert(
+                *arena,
+                ArenaStorage::from_config(*arena, arena_config, &exclude, &allocator).await?,
+            );
         }
 
-        let cache = UnrealCacheAsync::with_db(globaldb, allocator, arena_caches).await?;
+        let cache = UnrealCacheAsync::with_db(
+            globaldb,
+            allocator,
+            arena_storage
+                .values()
+                .map(|s| Arc::clone(&s.cache))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
 
         Ok(Arc::new(Self {
             cache,
-            indexed_arenas,
+            arena_storage,
             store,
         }))
+    }
+
+    /// Return a handle on the unreal cache.
+    pub fn cache(&self) -> &UnrealCacheAsync {
+        &self.cache
+    }
+
+    /// Return a handle on the legacy store.
+    pub fn store(&self) -> RealStore {
+        self.store.clone()
     }
 
     /// Return an iterator over arenas that have an index, and so can
     /// be subscribed to.
     pub fn indexed_arenas(&self) -> impl Iterator<Item = Arena> {
-        self.indexed_arenas.keys().map(|a| *a)
+        self.arena_storage
+            .iter()
+            .filter(|(_, s)| s.indexed.is_some())
+            .map(|(a, _)| *a)
     }
 
     /// Subscribe to files in the given arena.
@@ -91,20 +104,28 @@ impl Storage {
         tx: mpsc::Sender<Notification>,
         progress: Option<Progress>,
     ) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
-        let arena_storage = self.arena_storage(arena)?;
-
-        arena::notifier::subscribe(arena_storage.index.clone(), tx, progress).await
+        let index = match &self.arena_storage(arena)?.indexed {
+            None => return Err(StorageError::NoLocalStorage(arena).into()),
+            Some(indexed) => indexed.index.clone(),
+        };
+        arena::notifier::subscribe(index, tx, progress).await
     }
 
     /// Take into account notification from a remote peer.
     pub async fn update(&self, peer: Peer, notification: Notification) -> Result<(), StorageError> {
         // TODO: change both in the same transaction
-        if let Some(s) = self.indexed_arenas.get(&notification.arena()) {
-            if let Err(err) = s.index.update(notification.clone(), &s.root).await {
+        let arena_storage = self.arena_storage(notification.arena())?;
+        if let Some(indexed) = &arena_storage.indexed {
+            if let Err(err) = indexed
+                .index
+                .update(notification.clone(), &indexed.root)
+                .await
+            {
                 log::warn!("Failed to update local store for {notification:?}: {err:?}",);
             }
         }
-        self.cache.update(peer, notification).await?;
+        let cache = Arc::clone(&arena_storage.cache);
+        task::spawn_blocking(move || cache.update(peer, notification)).await??;
 
         Ok(())
     }
@@ -144,20 +165,18 @@ impl Storage {
         task::spawn_blocking(move || this.arena_storage(arena)?.pathmarks.get_mark(&path)).await?
     }
 
-    /// Return a handle on the unreal cache.
-    pub fn cache(&self) -> &UnrealCacheAsync {
-        &self.cache
-    }
-
     /// Get a reader on the given file, if possible.
     pub async fn reader(
         &self,
         arena: Arena,
         path: &realize_types::Path,
     ) -> Result<Reader, StorageError> {
-        let s = self.arena_storage(arena)?;
+        let indexed = match &self.arena_storage(arena)?.indexed {
+            None => return Err(StorageError::NoLocalStorage(arena)),
+            Some(indexed) => indexed,
+        };
 
-        Reader::open(&s.index, s.root.as_ref(), path).await
+        Reader::open(&indexed.index, indexed.root.as_ref(), path).await
     }
 
     pub async fn rsync(
@@ -167,9 +186,12 @@ impl Storage {
         range: &ByteRange,
         sig: Signature,
     ) -> anyhow::Result<Delta, StorageError> {
-        let s = self.arena_storage(arena)?;
+        let indexed = match &self.arena_storage(arena)?.indexed {
+            None => return Err(StorageError::NoLocalStorage(arena)),
+            Some(indexed) => indexed,
+        };
 
-        indexed_store::rsync(&s.index, &s.root, path, range, sig).await
+        indexed_store::rsync(&indexed.index, &indexed.root, path, range, sig).await
     }
 
     /// Move a file from the cache to the filesystem.
@@ -189,9 +211,15 @@ impl Storage {
         cache_hash: &Hash,
         index_hash: Option<&Hash>,
     ) -> Result<bool, StorageError> {
-        let s = self.arena_storage(arena)?;
+        let indexed = match &self.arena_storage(arena)?.indexed {
+            None => return Err(StorageError::NoLocalStorage(arena)),
+            Some(indexed) => indexed,
+        };
+
         let index_realpath =
-            match indexed_store::get_indexed_file(&s.index, &s.root, path, index_hash).await? {
+            match indexed_store::get_indexed_file(&indexed.index, &indexed.root, path, index_hash)
+                .await?
+            {
                 None => {
                     return Ok(false);
                 }
@@ -200,11 +228,6 @@ impl Storage {
         self.cache
             .move_blob(arena, path, cache_hash, &index_realpath)
             .await
-    }
-
-    /// Return a handle on the real store.
-    pub fn store(&self) -> RealStore {
-        self.store.clone()
     }
 
     /// Return an infinite stream of jobs.
@@ -222,7 +245,7 @@ impl Storage {
     /// Multiple streams will return the same results, even in the
     /// same process, as long as no job is marked done or failed.
     pub fn job_stream(&self) -> impl Stream<Item = (Arena, Job)> {
-        self.indexed_arenas
+        self.arena_storage
             .iter()
             .map(|(arena, storage)| (*arena, Box::pin(storage.engine.job_stream())))
             .collect::<StreamMap<Arena, _>>()
@@ -266,7 +289,7 @@ impl Storage {
 
     /// Return the index for the given arena, if one exists.
     fn arena_storage(&self, arena: Arena) -> Result<&ArenaStorage, StorageError> {
-        self.indexed_arenas
+        self.arena_storage
             .get(&arena)
             .ok_or_else(|| StorageError::UnknownArena(arena))
     }

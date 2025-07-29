@@ -355,7 +355,8 @@ async fn send_notifications(
 mod tests {
     use super::*;
     use crate::{
-        ArenaDatabase, DirtyPaths,
+        DirtyPaths,
+        arena::db::ArenaDatabase,
         utils::{hash, redb_utils},
     };
     use std::{sync::Arc, time::Duration};

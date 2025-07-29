@@ -299,6 +299,7 @@ impl UnrealCacheAsync {
     }
 
     /// Update the cache by applying a notification coming from the given peer.
+    /// TODO: remove. This is replaced by [crate::arena::ArenaStorage::update].
     pub async fn update(&self, peer: Peer, notification: Notification) -> Result<(), StorageError> {
         let inner = Arc::clone(&self.inner);
 
@@ -377,11 +378,10 @@ fn check_arena_compatibility(arena: Arena, existing: Arena) -> anyhow::Result<()
 
 #[cfg(test)]
 mod tests {
-    use crate::ArenaDatabase;
-    use crate::DirtyPaths;
-    use crate::utils::redb_utils;
-
     use super::*;
+    use crate::DirtyPaths;
+    use crate::arena::db::ArenaDatabase;
+    use crate::utils::redb_utils;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_types::Arena;

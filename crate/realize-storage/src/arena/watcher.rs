@@ -623,11 +623,12 @@ async fn only_regular(e: async_walkdir::DirEntry) -> async_walkdir::Filtering {
 mod tests {
     use std::time::Duration;
 
+    use crate::DirtyPaths;
+    use crate::arena::db::ArenaDatabase;
     use crate::arena::index::RealIndexBlocking;
     use crate::arena::types::IndexedFileTableEntry;
     use crate::realize_types::Arena;
     use crate::utils::{hash, redb_utils};
-    use crate::{ArenaDatabase, DirtyPaths};
     use realize_types::Hash;
 
     use super::*;

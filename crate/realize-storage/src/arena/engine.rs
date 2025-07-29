@@ -515,6 +515,7 @@ impl Engine {
                 }
             }
             Mark::Own => {
+                // TODO: treat is as Keep if there is no index.
                 if let Ok(cached) =
                     arena_cache::get_file_entry_for_path(txn, self.arena_root, &path)
                 {
