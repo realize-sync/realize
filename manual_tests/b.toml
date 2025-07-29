@@ -1,6 +1,12 @@
-[arenas]
-one.path = "one-b"
-two.path = "two-b"
+[arenas.one]
+root = "one-b"
+db = "one-b.db"
+blob_dir = "one-b.blobs"
+
+[arenas.two]
+root = "two-b"
+db = "two-b.db"
+blob_dir = "two-b.blobs"
 
 [peers.client]
 pubkey = """

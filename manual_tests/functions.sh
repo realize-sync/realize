@@ -1,26 +1,28 @@
-# Bash integration test management functions
-
 this="$(realpath "$(dirname "$0")")"
 root="$(realpath "${this}/..")"
-bindir="${root}/target/release"
-realize_bin="${bindir}/realize-cmd"
-realized_bin="${bindir}/realize-daemon"
-rust_log="debug"
+releasedir="${root}/target/release"
+realize_bin="${root}/target/debug/realize-control"
+realized_bin="${root}/target/release/realize-daemon"
+rust_log="realize_=debug"
 
 function rebuild {
-    cd "${root}" && cargo build --release -p $1
+    local args=""
+    if [[ "$2" == "release" ]]; then
+        args="--release"
+    fi
+    cd "${root}" && cargo build $args -p $1
 }
 
 function maybe_rebuild {
-    [[ -f "${bindir}/$1" ]] || rebuild $1
+    [[ -f "${root}/target/${2}/$1" ]] || rebuild $1 $2
 }
 
 function rebuild_all {
-    rebuild realize-cmd && rebuild realize-daemon
+    rebuild realize-control debug && rebuild realize-daemon release
 }
 
 function up_all {
-    maybe_rebuild realize-daemon && up a 7001 7002 7003 && up b 8001 8002 8003
+    maybe_rebuild realize-daemon release && up a 7001 7002 7003 && up b 8001 8002 8003
 }
 
 function down_all {
@@ -37,6 +39,8 @@ function up {
     keyfile="${root}/resources/test/${inst}.key"
     outfile="${this}/${inst}.out"
     pidfile="${this}/${inst}.pid"
+    sockfile="${this}/${inst}.socket"
+    rm -f "${sockfile}"
     down $inst
 
     echo "=== ${inst} Starting on ${port} [metrics ${metrics_port}]"
@@ -46,6 +50,7 @@ function up {
             --config "${configfile}" \
             --privkey "${keyfile}" \
             --address "127.0.0.1:${port}" \
+            --socket "${sockfile}" \
             --nfs "127.0.0.1:${nfs_port}" \
             --metrics-addr "127.0.0.1:${metrics_port}" \
             </dev/null >"${outfile}" 2>&1 &
@@ -111,16 +116,10 @@ function metrics {
     echo
 }
 
-function moveall {
-    keyfile="${root}/resources/test/client.key"
-    peersfile="${this}/client.toml"
-
-    maybe_rebuild realize-cmd && \
+function control {
+    maybe_rebuild realize-control debug && \
         exec "${realize_bin}" \
-             --privkey "${keyfile}"\
-             --config "${peersfile}" \
-             --src a \
-             --dst b \
+             --socket "${this}/a.socket"\
              "$@"
 }
 

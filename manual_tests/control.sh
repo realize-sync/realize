@@ -2,4 +2,4 @@
 
 . "$(dirname "$0")"/functions.sh
 
-moveall "$@"
+control "$@"

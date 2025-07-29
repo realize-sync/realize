@@ -4,6 +4,8 @@ manual_tests/two-*
 manual_tests/*.pid
 manual_tests/*.out
 manual_tests/*.db
+manual_tests/*.socket
+manual_tests/*.blobs
 .vscode
 .aider*
 packages.microsoft.*
