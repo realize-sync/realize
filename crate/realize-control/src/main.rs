@@ -1,5 +1,8 @@
 use anyhow::Result;
+use capnp::capability::Promise;
+use capnp_rpc;
 use clap::{Parser, Subcommand};
+use realize_core::rpc::control::control_capnp;
 use realize_core::utils::logging;
 use realize_network::unixsocket;
 use std::path::PathBuf;
@@ -38,6 +41,8 @@ enum ChurtenCommands {
         #[arg(short, long)]
         quiet: bool,
     },
+    /// Run churten and print notifications
+    Run,
 }
 
 /// Get the default socket path by checking for the first existing socket
@@ -163,6 +168,65 @@ async fn execute_churten_is_running(socket_path: &PathBuf, quiet: bool) -> Resul
     Ok(())
 }
 
+/// Execute the churten run command
+async fn execute_churten_run(socket_path: &PathBuf) -> Result<()> {
+    let local = LocalSet::new();
+    local
+        .run_until(async move {
+            let control =
+                unixsocket::connect::<control_capnp::control::Client>(socket_path).await?;
+
+            // Start churten
+            let churten = control
+                .churten_request()
+                .send()
+                .promise
+                .await?
+                .get()?
+                .get_churten()?;
+
+            churten.start_request().send().promise.await?;
+            println!("Churten started. Subscribing to notifications...");
+
+            let res = run_churten(&churten).await;
+
+            churten.shutdown_request().send().promise.await?;
+            println!("Churten stopped.");
+
+            res?;
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    Ok(())
+}
+
+async fn run_churten(
+    churten: &realize_core::rpc::control::control_capnp::churten::Client,
+) -> Result<(), anyhow::Error> {
+    let ctrl_c = tokio::spawn(tokio::signal::ctrl_c());
+    struct PrintSubscriber;
+    impl control_capnp::churten::subscriber::Server for PrintSubscriber {
+        fn notify(
+            &mut self,
+            params: control_capnp::churten::subscriber::NotifyParams,
+        ) -> Promise<(), capnp::Error> {
+            let notification = params.get().and_then(|p| p.get_notification());
+            match notification {
+                Ok(n) => println!("Notification: {:?}", n),
+                Err(e) => println!("Notification error: {e}"),
+            }
+            Promise::ok(())
+        }
+    }
+    let subscriber = capnp_rpc::new_client(PrintSubscriber);
+    let mut req = churten.subscribe_request();
+    req.get().set_subscriber(subscriber);
+    req.send().promise.await?;
+    let _ = ctrl_c.await;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -183,6 +247,9 @@ async fn main() -> Result<()> {
             }
             ChurtenCommands::IsRunning { quiet } => {
                 execute_churten_is_running(&socket_path, quiet).await?;
+            }
+            ChurtenCommands::Run => {
+                execute_churten_run(&socket_path).await?;
             }
         },
     }
