@@ -211,22 +211,8 @@ impl Storage {
         cache_hash: &Hash,
         index_hash: Option<&Hash>,
     ) -> Result<bool, StorageError> {
-        let indexed = match &self.arena_storage(arena)?.indexed {
-            None => return Err(StorageError::NoLocalStorage(arena)),
-            Some(indexed) => indexed,
-        };
-
-        let index_realpath =
-            match indexed_store::get_indexed_file(&indexed.index, &indexed.root, path, index_hash)
-                .await?
-            {
-                None => {
-                    return Ok(false);
-                }
-                Some(p) => p,
-            };
-        self.cache
-            .move_blob(arena, path, cache_hash, &index_realpath)
+        self.arena_storage(arena)?
+            .realize(path, cache_hash, index_hash)
             .await
     }
 

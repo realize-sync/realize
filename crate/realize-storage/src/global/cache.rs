@@ -9,7 +9,7 @@ use crate::arena::arena_cache::{self, ArenaCache};
 use crate::arena::notifier::{Notification, Progress};
 use crate::arena::types::LocalAvailability;
 use crate::{Blob, Inode, StorageError};
-use realize_types::{Arena, Hash, Path, Peer, UnixTime};
+use realize_types::{Arena, Path, Peer, UnixTime};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task;
@@ -333,25 +333,6 @@ impl UnrealCacheAsync {
         task::spawn_blocking(move || {
             let arena_cache = inner.arena_cache_for_inode(inode)?;
             arena_cache.open_file(inode)
-        })
-        .await?
-    }
-
-    pub async fn move_blob(
-        &self,
-        arena: Arena,
-        path: &Path,
-        hash: &Hash,
-        dest: &std::path::Path,
-    ) -> Result<bool, StorageError> {
-        let inner = Arc::clone(&self.inner);
-        let path = path.clone();
-        let hash = hash.clone();
-        let dest = dest.to_path_buf();
-
-        task::spawn_blocking(move || {
-            let arena_cache = inner.arena_cache(arena)?;
-            arena_cache.move_blob(&path, &hash, &dest)
         })
         .await?
     }

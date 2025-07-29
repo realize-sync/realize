@@ -330,6 +330,34 @@ impl RealIndexBlocking {
     }
 }
 
+pub(crate) fn get_indexed_file(
+    txn: &ArenaWriteTransaction,
+    root: &std::path::Path,
+    path: &realize_types::Path,
+    hash: Option<&Hash>,
+) -> Result<Option<std::path::PathBuf>, StorageError> {
+    let file_table = txn.index_file_table()?;
+    let realpath = path.within(root);
+
+    match hash {
+        Some(hash) => {
+            if let Some(entry) = do_get_file_entry(&file_table, path)?
+                && entry.hash == *hash
+                && file_matches_index(&entry, &realpath)
+            {
+                return Ok(Some(realpath));
+            }
+        }
+        None => {
+            if !file_table.get(path.as_str())?.is_some() && !realpath.exists() {
+                return Ok(Some(realpath));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 fn file_matches_index(entry: &IndexedFileTableEntry, path: &std::path::Path) -> bool {
     if let Ok(m) = std::fs::metadata(path) {
         UnixTime::mtime(&m) == entry.mtime && m.len() == entry.size
@@ -355,6 +383,15 @@ pub(crate) fn get_file_entry(
     let file_table = txn.index_file_table()?;
 
     do_get_file_entry(&file_table, path)
+}
+
+pub(crate) fn has_file_entry(
+    txn: &super::db::ArenaReadTransaction,
+    path: &realize_types::Path,
+) -> Result<bool, StorageError> {
+    let file_table = txn.index_file_table()?;
+
+    Ok(file_table.get(path.as_str())?.is_some())
 }
 
 fn do_get_file_entry(
@@ -622,9 +659,11 @@ pub(crate) fn make_all_dirty(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arena::engine;
     use crate::utils::redb_utils;
+    use crate::{arena::engine, utils::hash};
     use assert_fs::TempDir;
+    use assert_fs::fixture::ChildPath;
+    use assert_fs::prelude::*;
     use futures::{StreamExt as _, TryStreamExt as _};
 
     fn test_arena() -> Arena {
@@ -635,6 +674,8 @@ mod tests {
         aindex: RealIndexAsync,
         index: Arc<RealIndexBlocking>,
         dirty_paths: Arc<DirtyPaths>,
+        root: ChildPath,
+        _tempdir: TempDir,
     }
     impl Fixture {
         async fn setup() -> anyhow::Result<Fixture> {
@@ -643,10 +684,16 @@ mod tests {
             let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
             let aindex = RealIndexBlocking::new(arena, db, Arc::clone(&dirty_paths))?.into_async();
+            let tempdir = TempDir::new()?;
+            let root = tempdir.child("root");
+            root.create_dir_all()?;
+
             Ok(Self {
                 index: aindex.blocking(),
                 aindex,
                 dirty_paths,
+                root,
+                _tempdir: tempdir,
             })
         }
 
@@ -656,6 +703,26 @@ mod tests {
             txn.commit()?;
 
             Ok(())
+        }
+
+        fn add_file_with_content(
+            &self,
+            path_str: &str,
+            content: &str,
+        ) -> anyhow::Result<(realize_types::Path, Hash)> {
+            let path = realize_types::Path::parse(path_str)?;
+            let hash = hash::digest(content);
+            let child = self.root.child(path_str);
+            child.write_str(content)?;
+            let m = std::fs::metadata(child.path())?;
+            self.index.add_file(
+                &path,
+                content.len() as u64,
+                &UnixTime::mtime(&m),
+                hash.clone(),
+            )?;
+
+            Ok((path, hash))
         }
     }
 
@@ -1901,6 +1968,148 @@ mod tests {
             }),
             entry
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_indexed_file_with_hash_success() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let root = &fixture.root;
+        let (path, hash) = fixture.add_file_with_content("test.txt", "test content")?;
+
+        let txn = fixture.index.db.begin_write()?;
+        let result = get_indexed_file(&txn, root.path(), &path, Some(&hash))?;
+        assert_eq!(result, Some(root.child("test.txt").path().to_path_buf()));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_indexed_file_with_hash_wrong_hash() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let root = &fixture.root;
+        let (path, _) = fixture.add_file_with_content("test.txt", "test content")?;
+        let wrong_hash = hash::digest("different content");
+
+        let txn = fixture.index.db.begin_write()?;
+        let result = get_indexed_file(&txn, root.path(), &path, Some(&wrong_hash))?;
+        assert_eq!(result, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_indexed_file_with_hash_file_not_in_index() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let root = &fixture.root;
+        let path = realize_types::Path::parse("not_in_index.txt")?;
+        let hash = hash::digest("some content");
+
+        let txn = fixture.index.db.begin_write()?;
+        let result = get_indexed_file(&txn, root.path(), &path, Some(&hash))?;
+        assert_eq!(result, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_indexed_file_with_hash_file_modified_on_fs() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let root = &fixture.root;
+        let (path, hash) = fixture.add_file_with_content("test.txt", "original content")?;
+
+        // Modify the file on filesystem without updating the index
+        root.child("test.txt").write_str("modified content")?;
+
+        let txn = fixture.index.db.begin_write()?;
+        let result = get_indexed_file(&txn, root.path(), &path, Some(&hash))?;
+        assert_eq!(result, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_indexed_file_with_hash_file_missing_on_fs() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let root = &fixture.root;
+        let (path, hash) = fixture.add_file_with_content("test.txt", "test content")?;
+
+        // Remove the file from filesystem
+        std::fs::remove_file(root.child("test.txt").path())?;
+
+        let txn = fixture.index.db.begin_write()?;
+        let result = get_indexed_file(&txn, root.path(), &path, Some(&hash))?;
+        assert_eq!(result, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_indexed_file_without_hash_file_not_exist() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let root = &fixture.root;
+        let path = realize_types::Path::parse("does_not_exist.txt")?;
+
+        let txn = fixture.index.db.begin_write()?;
+        let result = get_indexed_file(&txn, root.path(), &path, None)?;
+        assert_eq!(
+            result,
+            Some(root.child("does_not_exist.txt").path().to_path_buf())
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_indexed_file_without_hash_file_exists_in_index() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let root = &fixture.root;
+        let (path, _) = fixture.add_file_with_content("test.txt", "test content")?;
+
+        let txn = fixture.index.db.begin_write()?;
+        let result = get_indexed_file(&txn, root.path(), &path, None)?;
+        assert_eq!(result, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_indexed_file_without_hash_file_exists_on_fs_but_not_in_index()
+    -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let root = &fixture.root;
+        let path = realize_types::Path::parse("fs_only.txt")?;
+
+        // Create file on filesystem without adding to index
+        root.child("fs_only.txt").write_str("fs only content")?;
+
+        let txn = fixture.index.db.begin_write()?;
+        let result = get_indexed_file(&txn, root.path(), &path, None)?;
+        assert_eq!(result, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_indexed_file_with_hash_metadata_mismatch() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let root = &fixture.root;
+        let path = realize_types::Path::parse("test.txt")?;
+
+        let content = "test content";
+        let hash = hash::digest(content);
+        fixture.root.child("test.txt").write_str(content)?;
+        fixture.index.add_file(
+            &path,
+            content.len() as u64,
+            &UnixTime::from_secs(1234567890),
+            hash.clone(),
+        )?;
+
+        let txn = fixture.index.db.begin_write()?;
+        let result = get_indexed_file(&txn, root.path(), &path, Some(&hash))?;
+        assert_eq!(result, None);
 
         Ok(())
     }

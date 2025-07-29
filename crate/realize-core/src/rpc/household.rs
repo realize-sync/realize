@@ -658,6 +658,7 @@ fn read_errno(err: StorageError) -> io_error::Errno {
         StorageError::JoinError(_) => Other,
         StorageError::InvalidRsyncSignature => InvalidInput,
         StorageError::UnknownArena(_) => NotFound,
+        StorageError::NoLocalStorage(_) => NotFound,
     }
 }
 

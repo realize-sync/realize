@@ -663,6 +663,10 @@ mod tests {
             Ok(self.db.begin_read()?)
         }
 
+        fn begin_write(&self) -> anyhow::Result<ArenaWriteTransaction> {
+            Ok(self.db.begin_write()?)
+        }
+
         fn get_blob_entry(&self, blob_id: BlobId) -> anyhow::Result<BlobTableEntry> {
             let txn = self.begin_read()?;
             let blob_table = txn.blob_table()?;
@@ -1093,7 +1097,9 @@ mod tests {
         let dest_path = fixture.tempdir.child("moved_blob").to_path_buf();
 
         // Move the blob
-        let result = acache.move_blob(&file_path, &test_hash(), &dest_path)?;
+        let txn = fixture.begin_write()?;
+        let result = acache.move_blob(&txn, &file_path, &test_hash(), &dest_path)?;
+        txn.commit()?;
 
         // Verify the move was successful
         assert!(result);
@@ -1141,7 +1147,9 @@ mod tests {
 
         // Try to move the blob with wrong hash
         let wrong_hash = Hash([2u8; 32]);
-        let result = acache.move_blob(&file_path, &wrong_hash, &dest_path)?;
+        let txn = fixture.begin_write()?;
+        let result = acache.move_blob(&txn, &file_path, &wrong_hash, &dest_path)?;
+        txn.commit()?;
 
         // Verify the move was not successful
         assert!(!result);
@@ -1184,7 +1192,9 @@ mod tests {
         let dest_path = fixture.tempdir.child("moved_blob").to_path_buf();
 
         // Try to move the blob
-        let result = acache.move_blob(&file_path, &test_hash(), &dest_path)?;
+        let txn = fixture.begin_write()?;
+        let result = acache.move_blob(&txn, &file_path, &test_hash(), &dest_path)?;
+        txn.commit()?;
 
         // Verify the move was not successful (not verified)
         assert!(!result);
@@ -1210,7 +1220,9 @@ mod tests {
 
         // Try to move a non-existent blob
         let non_existent_path = Path::parse("non_existent.txt")?;
-        let result = acache.move_blob(&non_existent_path, &test_hash(), &dest_path);
+        let txn = fixture.begin_write()?;
+        let result = acache.move_blob(&txn, &non_existent_path, &test_hash(), &dest_path);
+        txn.commit()?;
 
         // Verify the move failed with NotFound error
         assert!(matches!(result, Err(StorageError::NotFound)));
@@ -1253,7 +1265,9 @@ mod tests {
         let dest_path = fixture.tempdir.child("moved_blob").to_path_buf();
 
         // Move the blob with the correct hash
-        let result = acache.move_blob(&file_path, &actual_hash, &dest_path)?;
+        let txn = fixture.begin_write()?;
+        let result = acache.move_blob(&txn, &file_path, &actual_hash, &dest_path)?;
+        txn.commit()?;
 
         // Verify the move was successful
         assert!(result);

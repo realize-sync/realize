@@ -276,36 +276,33 @@ impl ArenaCache {
     /// blob with version `hash`.
     pub(crate) fn move_blob(
         &self,
+        txn: &ArenaWriteTransaction,
         path: &Path,
         hash: &Hash,
         dest: &std::path::Path,
     ) -> Result<bool, StorageError> {
-        let txn = self.db.begin_write()?;
-        {
-            let (inode, _) =
-                do_lookup_path(&txn.cache_directory_table()?, self.arena_root, Some(path))?;
-            let mut file_table = txn.cache_file_table()?;
-            let mut file_entry = get_default_entry(&file_table, inode)?;
-            if file_entry.content.hash != *hash {
-                return Ok(false);
-            }
-            let blob_id = match file_entry.content.blob {
-                None => {
-                    return Err(StorageError::NotFound);
-                }
-                Some(id) => id,
-            };
-
-            if !self.blobstore.move_blob(&txn, blob_id, hash, dest)? {
-                return Ok(false);
-            }
-
-            file_entry.content.blob = None;
-            file_table.insert((inode, ""), Holder::with_content(file_entry)?)?;
-
-            log::debug!("Realized [{}]/{path} {hash} as {dest:?}", self.arena);
+        let (inode, _) =
+            do_lookup_path(&txn.cache_directory_table()?, self.arena_root, Some(path))?;
+        let mut file_table = txn.cache_file_table()?;
+        let mut file_entry = get_default_entry(&file_table, inode)?;
+        if file_entry.content.hash != *hash {
+            return Ok(false);
         }
-        txn.commit()?;
+        let blob_id = match file_entry.content.blob {
+            None => {
+                return Err(StorageError::NotFound);
+            }
+            Some(id) => id,
+        };
+
+        if !self.blobstore.move_blob(&txn, blob_id, hash, dest)? {
+            return Ok(false);
+        }
+
+        file_entry.content.blob = None;
+        file_table.insert((inode, ""), Holder::with_content(file_entry)?)?;
+
+        log::debug!("Realized [{}]/{path} {hash} as {dest:?}", self.arena);
 
         Ok(true)
     }
