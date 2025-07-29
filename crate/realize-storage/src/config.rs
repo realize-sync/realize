@@ -1,4 +1,3 @@
-use crate::arena::types::Mark;
 use realize_types::Arena;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -41,8 +40,6 @@ pub struct ArenaConfig {
     pub db: PathBuf,
     /// Path to the directory where blob files are stored (required for arena cache).
     pub blob_dir: PathBuf,
-    /// The default mark for files and directories in this arena.
-    pub mark: Mark,
 }
 
 impl ArenaConfig {
@@ -51,7 +48,6 @@ impl ArenaConfig {
             root: Some(root),
             db,
             blob_dir,
-            mark: Mark::default(),
         }
     }
 
@@ -61,7 +57,6 @@ impl ArenaConfig {
             root: None,
             db,
             blob_dir,
-            mark: Mark::default(),
         }
     }
 }

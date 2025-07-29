@@ -274,7 +274,6 @@ mod tests {
                 } else {
                     None
                 },
-                mark: Mark::Watch,
             };
             let storage = ArenaStorage::from_config(arena, &config, &vec![], &allocator).await?;
 
