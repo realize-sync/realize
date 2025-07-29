@@ -360,7 +360,11 @@ where
                     return;
                 }
                 connected = self.networking.connect_raw(peer, self.handler.tag(), None) =>  match connected {
-                    Ok(stream) => stream,
+                    Ok(stream) => {
+                        log::debug!("Connected to {peer}.");
+
+                        stream
+                    },
                     Err(err) => {
                         log::debug!("Failed to connect to {peer}: {err}; Will retry.");
                         continue;

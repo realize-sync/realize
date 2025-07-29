@@ -35,6 +35,14 @@ impl SetupHelper {
 
         let networking = Networking::from_config(&config.network.peers, privkey)?;
         let storage = Storage::from_config(&config.storage).await?;
+        log::debug!(
+            "Storage: Cached {:?}",
+            storage.cache().arenas().collect::<Vec<_>>()
+        );
+        log::debug!(
+            "Storage: Indexed {:?}",
+            storage.indexed_arenas().collect::<Vec<_>>()
+        );
         let household = Household::spawn(local, networking.clone(), storage.clone())?;
 
         Ok(Self {

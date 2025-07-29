@@ -362,7 +362,9 @@ impl ArenaCache {
         entry: &FileTableEntry,
     ) -> Result<(), StorageError> {
         log::debug!(
-            "new file entry {file_inode} on {peer} {}",
+            "[{}] new file entry {:?} {file_inode} on {peer} {}",
+            self.arena,
+            entry.content.path,
             entry.content.hash
         );
         let key = peer.as_str();
@@ -881,7 +883,6 @@ fn do_create_file(
         }
     };
 
-    log::debug!("new dir entry {parent_inode} {filename} {file_inode}");
     Ok((parent_inode, file_inode))
 }
 
@@ -894,7 +895,6 @@ pub(crate) fn do_mkdirs(
     path: Option<&Path>,
     alloc_inode: &impl Fn() -> Result<Inode, StorageError>,
 ) -> Result<Inode, StorageError> {
-    log::debug!("mkdirs {root_inode} {path:?}");
     let mut current = root_inode;
     for component in Path::components(path) {
         current = if let Some(entry) = get_dir_entry(dir_table, current, component)? {

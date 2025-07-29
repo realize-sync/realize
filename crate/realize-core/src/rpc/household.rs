@@ -385,6 +385,7 @@ async fn subscribe_self(
     let reply = request.send().promise.await?;
     let arenas = reply.get()?.get_arenas()?;
     let peer_arenas = parse_arena_set(arenas)?;
+    log::debug!("{peer} arenas: {peer_arenas:?}");
 
     let goal_arenas = cache
         .arenas()

@@ -167,6 +167,7 @@ impl<H: JobHandler + 'static> Churten<H> {
         if self.task.is_some() {
             return;
         }
+        log::debug!("starting");
         let shutdown = CancellationToken::new();
         let handle = tokio::spawn({
             let shutdown = shutdown.clone();
@@ -183,6 +184,7 @@ impl<H: JobHandler + 'static> Churten<H> {
     ///
     /// Does nothing if the jobs aren't running.
     pub(crate) fn shutdown(&mut self) {
+        log::debug!("shutting down");
         if let Some((_, shutdown)) = self.task.take() {
             shutdown.cancel();
         }
@@ -201,10 +203,12 @@ async fn background_job<H: JobHandler>(
     tx: broadcast::Sender<ChurtenNotification>,
     shutdown: CancellationToken,
 ) {
+    log::debug!("Collecting jobs...");
     let mut result_stream = storage
         .job_stream()
         .map(|(arena, job)| {
             let job = Arc::new(job);
+            log::debug!("[{arena}] PENDING: {job:?}");
             let _ = tx.send(ChurtenNotification::Update {
                 arena,
                 job: Arc::clone(&job),
@@ -241,6 +245,7 @@ async fn background_job<H: JobHandler>(
             log::warn!("[{arena}] failed to report status of {job:?}: {err}");
         }
     }
+    log::debug!("Done collecting jobs...");
 }
 
 async fn run_job<H: JobHandler>(

@@ -141,6 +141,7 @@ impl DirtyPaths {
         let mut dirty_counter_table = txn.dirty_counter_table()?;
         let mut failed_job_table = txn.failed_job_table()?;
 
+        log::debug!("dirty: {path}");
         let counter = last_counter(&dirty_counter_table)? + 1;
         dirty_counter_table.insert((), counter)?;
         dirty_log_table.insert(counter, path.as_str())?;
@@ -392,7 +393,7 @@ impl Engine {
                 }
             })
             .await??;
-
+            let arena = self.arena;
             if let Some(c) = last_counter {
                 start_counter = c + 1;
             }
@@ -401,6 +402,7 @@ impl Engine {
                     // Skip it for now; it'll be handled after a delay.
                     continue;
                 }
+                log::debug!("[{arena}] job {job:?}");
                 if tx.send(job).await.is_err() {
                     // Broken channel; normal end of this loop
                     return Ok(());
@@ -408,7 +410,7 @@ impl Engine {
             } else {
                 // Wait for more dirty paths, then continue.
                 // Now is also a good time to retry failed jobs whose backoff period has passed.
-
+                log::debug!("[{arena}] waiting...");
                 let mut watch = self.dirty_paths.subscribe();
                 let mut jobs_to_retry = vec![];
                 tokio::select!(
@@ -416,10 +418,13 @@ impl Engine {
                         return Ok(());
                     }
                     ret = watch.wait_for(|v| *v >= start_counter) => {
+                        log::debug!("[{arena}] done waiting for v >= {start_counter} / {ret:?}");
+
                         ret?;
                     }
 
                     Ok(Some((backoff_until, mut jobs))) = self.wait_until_next_backoff(retry_lower_bound.as_ref()) => {
+                        log::debug!("[{arena}] jobs to retry: {jobs:?}");
                         jobs_to_retry.append(&mut jobs);
 
                         // From now on, only retry jobs whose backoff
@@ -432,6 +437,7 @@ impl Engine {
                 );
                 for counter in jobs_to_retry {
                     let job = self.build_job_with_counter(counter).await.ok().flatten();
+                    log::debug!("[{arena}] retry {job:?}");
                     if let Some(job) = job {
                         if tx.send(job).await.is_err() {
                             return Ok(());
