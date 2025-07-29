@@ -199,7 +199,7 @@ impl Storage {
     /// The file must have been fully downloaded and verified or the
     /// move will fail.
     ///
-    /// Give up and return false if the current versions in the cache
+    /// Gives up and returns false if the current versions in the cache
     /// don't match `cache_hash` and `index_hash`.
     ///
     /// A `index_hash` value of `None` means that the file must not
@@ -214,6 +214,15 @@ impl Storage {
         self.arena_storage(arena)?
             .realize(path, cache_hash, index_hash)
             .await
+    }
+
+    pub async fn unrealize(
+        &self,
+        arena: Arena,
+        path: &realize_types::Path,
+        hash: &Hash,
+    ) -> Result<bool, StorageError> {
+        self.arena_storage(arena)?.unrealize(path, hash).await
     }
 
     /// Return an infinite stream of jobs.

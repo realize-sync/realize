@@ -79,23 +79,15 @@ impl Blobstore {
 
             (blob_id, blob_entry)
         } else {
-            let blob_id = blob_table
-                .last()?
-                .map(|(k, _)| k.value())
-                .unwrap_or(BlobId(1));
+            let (blob_id, blob_entry) = do_create_blob_entry(&mut blob_table)?;
             log::debug!(
                 "assigned blob {blob_id} to file {inode} {}",
                 file_entry.content.hash
             );
-            let blob_entry = BlobTableEntry {
-                written_areas: ByteRanges::new(),
-                content_hash: None,
-            };
 
             (blob_id, blob_entry)
         };
         let file = self.open_blob_file(blob_id, file_entry.metadata.size, true)?;
-        blob_table.insert(blob_id, Holder::new(&blob_entry)?)?;
         Ok(Blob::new(
             blob_id,
             file_entry,
@@ -193,7 +185,7 @@ impl Blobstore {
     /// Does nothing and return false unless the blob content hash is
     /// `content_hash`, which means that the corresponding file must
     /// have been fully downloaded and verified before moving.
-    pub(crate) fn move_blob(
+    pub(crate) fn move_blob_if_matches(
         &self,
         txn: &ArenaWriteTransaction,
         blob_id: BlobId,
@@ -216,6 +208,47 @@ impl Blobstore {
 
         Ok(true)
     }
+
+    /// Setup the database to move some existing file into and return the
+    /// path to write to.
+    ///
+    /// If `blob_id` is None, an entry is created.
+    pub(crate) fn move_into_blob(
+        &self,
+        txn: &ArenaWriteTransaction,
+        blob_id: Option<BlobId>,
+        size: u64,
+    ) -> Result<(BlobId, PathBuf), StorageError> {
+        let mut blob_table = txn.blob_table()?;
+        let (blob_id, mut entry) = match blob_id {
+            Some(blob_id) => {
+                let entry = get_blob_entry(&blob_table, blob_id)?;
+
+                (blob_id, entry)
+            }
+            None => do_create_blob_entry(&mut blob_table)?,
+        };
+        let dest = self.blob_path(blob_id);
+        entry.written_areas = ByteRanges::single(0, size);
+        blob_table.insert(blob_id, Holder::new(&entry)?)?;
+
+        Ok((blob_id, dest))
+    }
+}
+
+fn do_create_blob_entry(
+    blob_table: &mut redb::Table<'_, BlobId, Holder<'static, BlobTableEntry>>,
+) -> Result<(BlobId, BlobTableEntry), StorageError> {
+    let blob_id = blob_table
+        .last()?
+        .map(|(k, _)| k.value())
+        .unwrap_or(BlobId(1));
+    let blob_entry = BlobTableEntry {
+        written_areas: ByteRanges::new(),
+        content_hash: None,
+    };
+    blob_table.insert(blob_id, Holder::new(&blob_entry)?)?;
+    Ok((blob_id, blob_entry))
 }
 
 pub(crate) fn local_availability(
@@ -1070,7 +1103,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_move_blob_success() -> anyhow::Result<()> {
+    async fn move_blob_success() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(arena).await?;
         let acache = &fixture.acache;
@@ -1098,7 +1131,7 @@ mod tests {
 
         // Move the blob
         let txn = fixture.begin_write()?;
-        let result = acache.move_blob(&txn, &file_path, &test_hash(), &dest_path)?;
+        let result = acache.move_blob_if_matches(&txn, &file_path, &test_hash(), &dest_path)?;
         txn.commit()?;
 
         // Verify the move was successful
@@ -1119,7 +1152,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_move_blob_wrong_hash() -> anyhow::Result<()> {
+    async fn move_blob_wrong_hash() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(arena).await?;
         let acache = &fixture.acache;
@@ -1148,7 +1181,7 @@ mod tests {
         // Try to move the blob with wrong hash
         let wrong_hash = Hash([2u8; 32]);
         let txn = fixture.begin_write()?;
-        let result = acache.move_blob(&txn, &file_path, &wrong_hash, &dest_path)?;
+        let result = acache.move_blob_if_matches(&txn, &file_path, &wrong_hash, &dest_path)?;
         txn.commit()?;
 
         // Verify the move was not successful
@@ -1165,7 +1198,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_move_blob_not_verified() -> anyhow::Result<()> {
+    async fn move_blob_not_verified() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(arena).await?;
         let acache = &fixture.acache;
@@ -1193,7 +1226,7 @@ mod tests {
 
         // Try to move the blob
         let txn = fixture.begin_write()?;
-        let result = acache.move_blob(&txn, &file_path, &test_hash(), &dest_path)?;
+        let result = acache.move_blob_if_matches(&txn, &file_path, &test_hash(), &dest_path)?;
         txn.commit()?;
 
         // Verify the move was not successful (not verified)
@@ -1210,7 +1243,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_move_blob_nonexistent_blob() -> anyhow::Result<()> {
+    async fn move_blob_nonexistent_blob() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(arena).await?;
         let acache = &fixture.acache;
@@ -1221,7 +1254,8 @@ mod tests {
         // Try to move a non-existent blob
         let non_existent_path = Path::parse("non_existent.txt")?;
         let txn = fixture.begin_write()?;
-        let result = acache.move_blob(&txn, &non_existent_path, &test_hash(), &dest_path);
+        let result =
+            acache.move_blob_if_matches(&txn, &non_existent_path, &test_hash(), &dest_path);
         txn.commit()?;
 
         // Verify the move failed with NotFound error
@@ -1234,14 +1268,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_move_blob_verifies_hash_and_state() -> anyhow::Result<()> {
+    async fn move_blob_verifies_hash_and_state() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(arena).await?;
         let acache = &fixture.acache;
         let file_path = Path::parse("test.txt")?;
 
         // Create a file and add it to the cache
-        fixture.add_file_with_mtime(&file_path, 100, &test_time())?;
+        fixture.add_file_with_mtime(&file_path, 34, &test_time())?;
 
         // Open the file to create a blob
         let (inode, _) = acache.lookup_path(&file_path)?;
@@ -1266,7 +1300,7 @@ mod tests {
 
         // Move the blob with the correct hash
         let txn = fixture.begin_write()?;
-        let result = acache.move_blob(&txn, &file_path, &actual_hash, &dest_path)?;
+        let result = acache.move_blob_if_matches(&txn, &file_path, &actual_hash, &dest_path)?;
         txn.commit()?;
 
         // Verify the move was successful
@@ -1280,10 +1314,106 @@ mod tests {
         assert!(!fixture.blob_entry_exists(blob_id)?);
 
         // Verify the content was moved correctly
-        let moved_content = std::fs::read_to_string(&dest_path)?;
         assert_eq!(
             "test content for hash verification",
-            moved_content.trim_end_matches('\0')
+            std::fs::read_to_string(&dest_path)?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn move_into_blob_if_matches_creates_new_blob() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena).await?;
+        let acache = &fixture.acache;
+        let file_path = Path::parse("test.txt")?;
+
+        // Create a file and add it to the cache
+        let inode = fixture.add_file(file_path.as_str(), 48)?;
+
+        // Use move_into_blob_if_matches to get a path to write to
+        let txn = fixture.begin_write()?;
+        let path_in_cache = acache
+            .move_into_blob_if_matches(&txn, &file_path, &test_hash())?
+            .unwrap();
+        txn.commit()?;
+
+        // Write some test data to the returned file path
+        std::fs::write(
+            &path_in_cache,
+            b"When you light a candle, you also cast a shadow.",
+        )?;
+
+        // Now open the file through the normal open_file mechanism
+        let mut blob = acache.open_file(inode)?;
+        let mut buf = String::new();
+        blob.read_to_string(&mut buf).await?;
+        assert_eq!(
+            "When you light a candle, you also cast a shadow.".to_string(),
+            buf
+        );
+        assert_eq!(ByteRanges::single(0, 48), *blob.local_availability());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn move_into_blob_if_matches_overwrites_existing_blob() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena).await?;
+        let acache = &fixture.acache;
+        let file_path = Path::parse("test.txt")?;
+
+        // Create a file and add it to the cache
+        let inode = fixture.add_file(file_path.as_str(), 59)?;
+
+        // First, create a blob through normal open_file
+        let existing_blob_id = acache.open_file(inode)?.id();
+
+        // Now use move_into_blob_if_matches with the existing blob
+        let txn = fixture.begin_write()?;
+        let dest_path = acache
+            .move_into_blob_if_matches(&txn, &file_path, &test_hash())?
+            .unwrap();
+        txn.commit()?;
+
+        // Write test data to the returned file path
+        std::fs::write(
+            &dest_path,
+            b"What sane person could live in this world and not be crazy?",
+        )?;
+
+        // Open the file again and verify we can read the content within the ranges
+        let mut blob = acache.open_file(inode)?;
+        assert_eq!(existing_blob_id, blob.id());
+
+        let mut buf = String::new();
+        blob.read_to_string(&mut buf).await?;
+        assert_eq!(
+            "What sane person could live in this world and not be crazy?".to_string(),
+            buf
+        );
+        assert_eq!(ByteRanges::single(0, 59), *blob.local_availability());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn move_into_blob_if_matches_rejects_wrong_hash() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena).await?;
+        let acache = &fixture.acache;
+        let file_path = Path::parse("test.txt")?;
+
+        // Create a file and add it to the cache
+        fixture.add_file(file_path.as_str(), 10)?;
+
+        let txn = fixture.begin_write()?;
+        // hash is test_hash(), which is not [99; 32]
+        assert_eq!(
+            None,
+            acache.move_into_blob_if_matches(&txn, &file_path, &Hash([99; 32]))?
         );
 
         Ok(())

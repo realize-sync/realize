@@ -14,6 +14,7 @@ use crate::{Inode, StorageError};
 use realize_types::{Arena, ByteRanges, Hash, Path, Peer, UnixTime};
 use redb::ReadableTable;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// A per-arena cache of remote files.
@@ -280,7 +281,7 @@ impl ArenaCache {
     ///
     /// Gives up and returns false if `path` doesn't have a verified
     /// blob with version `hash`.
-    pub(crate) fn move_blob(
+    pub(crate) fn move_blob_if_matches(
         &self,
         txn: &ArenaWriteTransaction,
         path: &Path,
@@ -301,7 +302,10 @@ impl ArenaCache {
             Some(id) => id,
         };
 
-        if !self.blobstore.move_blob(&txn, blob_id, hash, dest)? {
+        if !self
+            .blobstore
+            .move_blob_if_matches(&txn, blob_id, hash, dest)?
+        {
             return Ok(false);
         }
 
@@ -311,6 +315,42 @@ impl ArenaCache {
         log::debug!("Realized [{}]/{path} {hash} as {dest:?}", self.arena);
 
         Ok(true)
+    }
+
+    /// Prepare the database and return the path to write into to move some
+    /// file into the blob, replacing any existing ones.
+    ///
+    /// Gives up and returns None if `hash` doesn't match the entry version.
+    pub(crate) fn move_into_blob_if_matches(
+        &self,
+        txn: &ArenaWriteTransaction,
+        path: &Path,
+        hash: &Hash,
+    ) -> Result<Option<PathBuf>, StorageError> {
+        let inode = match do_lookup_path(&txn.cache_directory_table()?, self.arena_root, Some(path))
+        {
+            Ok((inode, _)) => inode,
+            Err(StorageError::NotFound) => {
+                return Ok(None);
+            }
+            Err(err) => {
+                return Err(err);
+            }
+        };
+        let mut file_table = txn.cache_file_table()?;
+        let mut file_entry = get_default_entry(&file_table, inode)?;
+        if file_entry.content.hash != *hash {
+            return Ok(None);
+        }
+        let (blob_id, cachepath) = self.blobstore.move_into_blob(
+            &txn,
+            file_entry.content.blob,
+            file_entry.metadata.size,
+        )?;
+        file_entry.content.blob = Some(blob_id);
+        file_table.insert((inode, ""), Holder::with_content(file_entry)?)?;
+
+        Ok(Some(cachepath))
     }
 
     /// Write an entry in the file table, overwriting any existing one.
