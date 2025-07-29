@@ -72,7 +72,9 @@ pub async fn bind(
                     },
                     res = until_shutdown => {
                         if let Err(err) = res {
-                            log::debug!("Local socket connection failed: {err}")
+                            if err.kind != capnp::ErrorKind::Disconnected {
+                                log::debug!("Local socket connection failed: {err}")
+                            }
                         }
                     }
                 );

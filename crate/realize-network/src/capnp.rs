@@ -277,7 +277,9 @@ where
                 },
                 res = until_shutdown => {
                     if let Err(err) = res {
-                        log::debug!("RPC connection from {peer} failed: {err}")
+                        if err.kind != capnp::ErrorKind::Disconnected {
+                            log::debug!("RPC connection from {peer} failed: {err}")
+                        }
                     }
                 }
             );
