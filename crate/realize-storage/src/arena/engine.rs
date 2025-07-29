@@ -370,19 +370,21 @@ impl Engine {
     }
 
     async fn build_jobs(self: &Arc<Engine>, tx: mpsc::Sender<Job>) -> anyhow::Result<()> {
-        let mut start_counter = 0;
+        let mut start_counter = 1;
         let mut retry_lower_bound = None;
 
         loop {
+            log::debug!("[{}] collecting jobs: {start_counter}..", self.arena);
             let (job, last_counter) = task::spawn_blocking({
                 let this = Arc::clone(self);
                 let start_counter = start_counter;
-
+                let arena = self.arena;
                 move || {
                     let (job, last_counter) = this.next_job(start_counter)?;
                     if let Some(last_counter) = last_counter
                         && last_counter > start_counter
                     {
+                        log::debug!("[{arena}] delete [{start_counter}, {last_counter})");
                         this.delete_range(start_counter, last_counter)?;
                     }
 
