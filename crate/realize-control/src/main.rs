@@ -2,7 +2,7 @@ use anyhow::Result;
 use capnp::capability::Promise;
 use capnp_rpc;
 use clap::{Parser, Subcommand};
-use realize_core::rpc::control::control_capnp;
+use realize_core::rpc::control::{client, control_capnp};
 use realize_core::utils::logging;
 use realize_network::unixsocket;
 use std::path::PathBuf;
@@ -109,19 +109,8 @@ async fn execute_churten_start(socket_path: &PathBuf) -> Result<()> {
     let local = LocalSet::new();
     local
         .run_until(async move {
-            let control = unixsocket::connect::<
-                realize_core::rpc::control::control_capnp::control::Client,
-            >(socket_path)
-            .await?;
-
-            let churten = control
-                .churten_request()
-                .send()
-                .promise
-                .await?
-                .get()?
-                .get_churten()?;
-
+            let control = client::connect(socket_path).await?;
+            let churten = client::get_churten(&control).await?;
             churten.start_request().send().promise.await?;
             println!("Churten started successfully");
 
@@ -136,19 +125,8 @@ async fn execute_churten_stop(socket_path: &PathBuf) -> Result<()> {
     let local = LocalSet::new();
     local
         .run_until(async move {
-            let control = unixsocket::connect::<
-                realize_core::rpc::control::control_capnp::control::Client,
-            >(socket_path)
-            .await?;
-
-            let churten = control
-                .churten_request()
-                .send()
-                .promise
-                .await?
-                .get()?
-                .get_churten()?;
-
+            let control = client::connect(socket_path).await?;
+            let churten = client::get_churten(&control).await?;
             churten.shutdown_request().send().promise.await?;
             println!("Churten stopped successfully");
 
@@ -163,28 +141,10 @@ async fn execute_churten_is_running(socket_path: &PathBuf, quiet: bool) -> Resul
     let local = LocalSet::new();
     local
         .run_until(async move {
-            log::debug!("RPC client start");
-            let control = unixsocket::connect::<
-                realize_core::rpc::control::control_capnp::control::Client,
-            >(socket_path)
-            .await?;
-            log::debug!("RPC client started");
-
-            let churten = control
-                .churten_request()
-                .send()
-                .promise
-                .await?
-                .get()?
-                .get_churten()?;
-
-            log::debug!("churten");
-
+            let control = client::connect(socket_path).await?;
+            let churten = client::get_churten(&control).await?;
             let is_running_result = churten.is_running_request().send().promise.await?;
             let is_running = is_running_result.get()?.get_running();
-
-            log::debug!("is_running");
-
             if quiet {
                 if is_running {
                     std::process::exit(0);
@@ -206,18 +166,8 @@ async fn execute_churten_run(socket_path: &PathBuf) -> Result<()> {
     let local = LocalSet::new();
     local
         .run_until(async move {
-            let control =
-                unixsocket::connect::<control_capnp::control::Client>(socket_path).await?;
-
-            // Start churten
-            let churten = control
-                .churten_request()
-                .send()
-                .promise
-                .await?
-                .get()?
-                .get_churten()?;
-
+            let control = client::connect(socket_path).await?;
+            let churten = client::get_churten(&control).await?;
             churten.start_request().send().promise.await?;
             println!("Churten started. Subscribing to notifications...");
 
