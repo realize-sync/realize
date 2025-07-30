@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use super::control_capnp;
 use super::control_capnp::churten_notification;
+use crate::consensus::tracker::JobInfo;
 use crate::consensus::types::{ChurtenNotification, JobAction, JobProgress};
 use realize_storage::{Job, JobId};
 use realize_types::{Arena, Hash, Path};
@@ -42,14 +45,15 @@ pub(crate) fn parse_notification(
         }
         churten_notification::Which::Update(update_reader_result) => {
             let update_reader = update_reader_result?;
-            let progress = match update_reader.get_progress()? {
-                super::control_capnp::JobProgress::Pending => JobProgress::Pending,
-                super::control_capnp::JobProgress::Running => JobProgress::Running,
-                super::control_capnp::JobProgress::Done => JobProgress::Done,
-                super::control_capnp::JobProgress::Abandoned => JobProgress::Abandoned,
-                super::control_capnp::JobProgress::Cancelled => JobProgress::Cancelled,
-                super::control_capnp::JobProgress::Failed => {
-                    let message = update_reader.get_message()?.to_str()?.to_string();
+            let progress_reader = update_reader.get_progress()?;
+            let progress = match progress_reader.get_type()? {
+                super::control_capnp::job_progress::Type::Pending => JobProgress::Pending,
+                super::control_capnp::job_progress::Type::Running => JobProgress::Running,
+                super::control_capnp::job_progress::Type::Done => JobProgress::Done,
+                super::control_capnp::job_progress::Type::Abandoned => JobProgress::Abandoned,
+                super::control_capnp::job_progress::Type::Cancelled => JobProgress::Cancelled,
+                super::control_capnp::job_progress::Type::Failed => {
+                    let message = progress_reader.get_message()?.to_str()?.to_string();
                     JobProgress::Failed(message)
                 }
             };
@@ -71,6 +75,11 @@ pub(crate) fn parse_notification(
         }
         churten_notification::Which::UpdateAction(action_reader) => {
             let action = match action_reader?.get_action()? {
+                super::control_capnp::JobAction::None => {
+                    return Err(capnp::Error::failed(
+                        "A JobAction must be set in UpdateAction".to_string(),
+                    ));
+                }
                 super::control_capnp::JobAction::Download => JobAction::Download,
                 super::control_capnp::JobAction::Verify => JobAction::Verify,
                 super::control_capnp::JobAction::Repair => JobAction::Repair,
@@ -98,56 +107,14 @@ pub(crate) fn fill_notification(
     dest.set_job_id(job_id.as_u64());
     match &source {
         ChurtenNotification::New { job, .. } => {
-            let mut builder = dest.reborrow().init_new().init_job();
-            builder.set_path(job.path().as_str());
-            builder.set_hash(&job.hash().0);
-            match &**job {
-                realize_storage::Job::Download(_, _) => {
-                    builder.init_download();
-                }
-                realize_storage::Job::Realize(_, _, index_hash) => {
-                    let mut realize = builder.init_realize();
-                    if let Some(h) = index_hash {
-                        realize.set_index_hash(&h.0);
-                    }
-                }
-                realize_storage::Job::Unrealize(_, _) => {
-                    builder.init_unrealize();
-                }
-            }
+            fill_job(job, dest.reborrow().init_new().init_job());
         }
         ChurtenNotification::Update { progress, .. } => {
-            let mut update = dest.reborrow().init_update();
-            match progress {
-                JobProgress::Pending => {
-                    update.set_progress(control_capnp::JobProgress::Pending);
-                }
-                JobProgress::Running => {
-                    update.set_progress(control_capnp::JobProgress::Running);
-                }
-                JobProgress::Done => {
-                    update.set_progress(control_capnp::JobProgress::Done);
-                }
-                JobProgress::Abandoned => {
-                    update.set_progress(control_capnp::JobProgress::Abandoned);
-                }
-                JobProgress::Cancelled => {
-                    update.set_progress(control_capnp::JobProgress::Cancelled);
-                }
-                JobProgress::Failed(msg) => {
-                    update.set_progress(control_capnp::JobProgress::Failed);
-                    update.set_message(&msg);
-                }
-            }
+            fill_progress(progress, dest.reborrow().init_update().init_progress());
         }
         ChurtenNotification::UpdateAction { action, .. } => {
             let mut update = dest.reborrow().init_update_action();
-            match action {
-                JobAction::Download => update.set_action(control_capnp::JobAction::Download),
-                JobAction::Verify => update.set_action(control_capnp::JobAction::Verify),
-                JobAction::Repair => update.set_action(control_capnp::JobAction::Repair),
-                JobAction::Move => update.set_action(control_capnp::JobAction::Move),
-            }
+            update.set_action(to_capnp_action(Some(action)))
         }
         ChurtenNotification::UpdateByteCount {
             current_bytes,
@@ -158,6 +125,77 @@ pub(crate) fn fill_notification(
             update.set_current_bytes(*current_bytes);
             update.set_total_bytes(*total_bytes);
         }
+    }
+}
+
+/// Convert rust JobInfo to capnp.
+pub(crate) fn fill_job_info(source: &JobInfo, mut dest: control_capnp::job_info::Builder<'_>) {
+    dest.set_arena(&source.arena.as_str());
+    dest.set_id(source.id.as_u64());
+    fill_job(&source.job, dest.reborrow().init_job());
+    fill_progress(&source.progress, dest.reborrow().init_progress());
+    dest.set_action(to_capnp_action(source.action.as_ref()));
+    if let Some((current, total)) = source.byte_progress {
+        let mut byte_progress = dest.init_byte_progress();
+        byte_progress.set_current(current);
+        byte_progress.set_total(total);
+    }
+}
+
+fn fill_job(job: &Arc<Job>, mut builder: control_capnp::job::Builder<'_>) {
+    builder.set_path(job.path().as_str());
+    builder.set_hash(&job.hash().0);
+
+    match &**job {
+        realize_storage::Job::Download(_, _) => {
+            builder.init_download();
+        }
+        realize_storage::Job::Realize(_, _, index_hash) => {
+            let mut realize = builder.init_realize();
+            if let Some(h) = index_hash {
+                realize.set_index_hash(&h.0);
+            }
+        }
+        realize_storage::Job::Unrealize(_, _) => {
+            builder.init_unrealize();
+        }
+    }
+}
+
+fn fill_progress(
+    source: &JobProgress,
+    mut progress_builder: control_capnp::job_progress::Builder<'_>,
+) {
+    match source {
+        JobProgress::Pending => {
+            progress_builder.set_type(control_capnp::job_progress::Type::Pending);
+        }
+        JobProgress::Running => {
+            progress_builder.set_type(control_capnp::job_progress::Type::Running);
+        }
+        JobProgress::Done => {
+            progress_builder.set_type(control_capnp::job_progress::Type::Done);
+        }
+        JobProgress::Abandoned => {
+            progress_builder.set_type(control_capnp::job_progress::Type::Abandoned);
+        }
+        JobProgress::Cancelled => {
+            progress_builder.set_type(control_capnp::job_progress::Type::Cancelled);
+        }
+        JobProgress::Failed(msg) => {
+            progress_builder.set_type(control_capnp::job_progress::Type::Failed);
+            progress_builder.set_message(msg);
+        }
+    }
+}
+
+fn to_capnp_action(action: Option<&JobAction>) -> control_capnp::JobAction {
+    match action {
+        Some(JobAction::Download) => control_capnp::JobAction::Download,
+        Some(JobAction::Verify) => control_capnp::JobAction::Verify,
+        Some(JobAction::Repair) => control_capnp::JobAction::Repair,
+        Some(JobAction::Move) => control_capnp::JobAction::Move,
+        None => control_capnp::JobAction::None,
     }
 }
 

@@ -43,6 +43,7 @@ interface Churten {
   start @1 () -> ();
   shutdown @2 () -> ();
   isRunning @3 () -> (running: Bool);
+  recentJobs @4 () -> (res: List(JobInfo));
 
   interface Subscriber {
     notify @0 (notification: ChurtenNotification) -> stream;
@@ -66,9 +67,6 @@ struct ChurtenNotification {
   
   struct Update {
     progress @0: JobProgress;
-
-    # Error Message for failed progress
-    message @1: Text;
   }
 
   struct UpdateByteCount {
@@ -98,24 +96,44 @@ struct Job {
   struct Unrealize {}
 }
 
+struct JobInfo {
+  arena @0: Text;
+  id @1: UInt64;
+  job @2: Job;
+  progress @3: JobProgress;
+  action @4: JobAction;
+  byteProgress @5: ByteProgress;
+}
+
+struct ByteProgress {
+  current @0: UInt64;
+  total @1: UInt64;
+}
+
 enum JobType {
   download @0;
   realize @1;
   unrealize @2;
 }
 
-enum JobProgress {
-  pending @0;
-  running @1;
-  done @2;
-  abandoned @3;
-  cancelled @4;
-  failed @5;
+struct JobProgress {
+  type @0: Type;
+  message @1: Text;
+
+  enum Type {
+    pending @0;
+    running @1;
+    done @2;
+    abandoned @3;
+    cancelled @4;
+    failed @5;
+  }
 }
 
 enum JobAction {
-  download @0;
-  verify @1;
-  repair @2;
-  move @3;
+  none @0;
+  download @1;
+  verify @2;
+  repair @3;
+  move @4;
 }

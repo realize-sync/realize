@@ -43,6 +43,7 @@ pub(crate) struct JobInfoTracker {
     finished: VecDeque<JobInfo>,
 }
 
+#[allow(dead_code)]
 impl JobInfoTracker {
     /// Create a new tracker with the given limit.
     ///

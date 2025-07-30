@@ -2,8 +2,8 @@
 
 use super::control_capnp;
 use super::control_capnp::churten::{
-    self, IsRunningParams, IsRunningResults, ShutdownParams, ShutdownResults, StartParams,
-    StartResults, SubscribeParams, SubscribeResults,
+    self, IsRunningParams, IsRunningResults, RecentJobsParams, RecentJobsResults, ShutdownParams,
+    ShutdownResults, StartParams, StartResults, SubscribeParams, SubscribeResults,
 };
 use super::control_capnp::control::{
     self, ChurtenParams, ChurtenResults, GetMarkParams, GetMarkResults, SetArenaMarkParams,
@@ -163,6 +163,25 @@ impl<H: JobHandler + 'static> churten::Server for ChurtenServer<H> {
 
         Promise::ok(())
     }
+
+    fn recent_jobs(
+        &mut self,
+        _: RecentJobsParams,
+        mut results: RecentJobsResults,
+    ) -> Promise<(), capnp::Error> {
+        let churten = self.churten.clone();
+        Promise::from_future(async move {
+            let recent_jobs = churten.borrow().recent_jobs().await;
+
+            let mut job_list = results.get().init_res(recent_jobs.len() as u32);
+
+            for (i, job_info) in recent_jobs.iter().enumerate() {
+                convert::fill_job_info(job_info, job_list.reborrow().get(i as u32));
+            }
+
+            Ok(())
+        })
+    }
 }
 
 /// Straightforward conversion from storage error to capnp error
@@ -215,13 +234,14 @@ mod tests {
     use super::*;
     use crate::consensus::churten::{JobHandler, JobHandlerImpl};
     use crate::consensus::types::ChurtenNotification;
+    use crate::rpc::control::client::TxChurtenSubscriber;
     use crate::rpc::testing::HouseholdFixture;
     use assert_fs::TempDir;
     use realize_network::unixsocket;
     use realize_storage::{JobId, JobStatus, Mark, Notification};
     use realize_types::{Peer, UnixTime};
     use tarpc::tokio_util::sync::CancellationToken;
-    use tokio::sync::broadcast;
+    use tokio::sync::{broadcast, mpsc};
     use tokio::task::LocalSet;
 
     struct Fixture {
@@ -270,9 +290,6 @@ mod tests {
             tx: broadcast::Sender<ChurtenNotification>,
             shutdown: CancellationToken,
         ) -> anyhow::Result<JobStatus> {
-            // Simulate some work time
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
             if self.should_cancel {
                 shutdown.cancel();
             }
@@ -289,7 +306,6 @@ mod tests {
                     current_bytes: 50,
                     total_bytes: 100,
                 });
-                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
                 let _ = tx.send(ChurtenNotification::UpdateByteCount {
                     arena,
                     job_id,
@@ -549,7 +565,10 @@ mod tests {
                 match notification.which()? {
                     control_capnp::churten_notification::Update(update) => {
                         let update = update?;
-                        assert_eq!(control_capnp::JobProgress::Running, update.get_progress()?)
+                        assert_eq!(
+                            control_capnp::job_progress::Type::Running,
+                            update.get_progress()?.get_type()?
+                        )
                     }
                     _ => panic!("Expected an Update, got {notification:?}"),
                 }
@@ -593,8 +612,8 @@ mod tests {
                 {
                     let update = update.expect("Update present");
                     assert_eq!(
-                        update.get_progress().expect("progress present"),
-                        control_capnp::JobProgress::Done
+                        update.get_progress()?.get_type()?,
+                        control_capnp::job_progress::Type::Done
                     );
                 } else {
                     panic!("Expected Update notification with Done progress");
@@ -606,6 +625,104 @@ mod tests {
                 // Check if it's no longer running
                 let is_running_result = churten.is_running_request().send().promise.await?;
                 assert!(!is_running_result.get()?.get_running());
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recent_jobs() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let arena = HouseholdFixture::test_arena();
+        let peer = HouseholdFixture::a();
+        let local = LocalSet::new();
+        let storage = Arc::clone(fixture.inner.storage(peer)?);
+
+        // Create a fake job handler that succeeds
+        let handler = FakeJobHandler::new(|| Ok(JobStatus::Done));
+        let sockpath = fixture.bind_server(&local, peer, handler).await?;
+
+        local
+            .run_until(async move {
+                let control = unixsocket::connect::<control::Client>(&sockpath).await?;
+                let churten = control
+                    .churten_request()
+                    .send()
+                    .promise
+                    .await?
+                    .get()?
+                    .get_churten()?;
+
+                // Start churten
+                churten.start_request().send().promise.await?;
+
+                // Create a job by setting up a file to download
+                storage.set_arena_mark(arena, Mark::Keep).await?;
+                fixture
+                    .inner
+                    .cache(peer)?
+                    .update(
+                        Peer::from("other"),
+                        Notification::Add {
+                            arena,
+                            index: 1,
+                            path: Path::parse("foo")?,
+                            mtime: UnixTime::from_secs(1234567890),
+                            size: 100,
+                            hash: Hash([1; 32]),
+                        },
+                    )
+                    .await?;
+
+                // Wait a bit for the job to complete
+                let (tx, mut rx) = mpsc::channel(10);
+                let mut subscribe_request = churten.subscribe_request();
+                subscribe_request
+                    .get()
+                    .set_subscriber(TxChurtenSubscriber::new(tx).as_client());
+                subscribe_request.send().promise.await?;
+
+                while let Some(n) = rx.recv().await {
+                    match n {
+                        ChurtenNotification::Update { progress, .. } => {
+                            if progress.is_finished() {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Get recent jobs
+                let recent_jobs_result = churten.recent_jobs_request().send().promise.await?;
+                let jobs = recent_jobs_result.get()?.get_res()?;
+
+                // Should have at least one job
+                assert!(jobs.len() > 0);
+
+                // Check the first job
+                let job = jobs.get(0);
+                assert_eq!(job.get_arena()?, arena.as_str());
+                assert_eq!(job.get_id(), 1);
+                assert_eq!(
+                    job.get_progress()?.get_type()?,
+                    control_capnp::job_progress::Type::Done
+                );
+                assert_eq!(job.get_action()?, control_capnp::JobAction::None);
+
+                // Check the job details
+                let job_info = job.get_job()?;
+                assert_eq!(job_info.get_path()?, "foo");
+                assert!(matches!(
+                    job_info.which(),
+                    Ok(control_capnp::job::Download(_))
+                ));
+
+                // Shutdown churten
+                churten.shutdown_request().send().promise.await?;
 
                 Ok::<(), anyhow::Error>(())
             })
