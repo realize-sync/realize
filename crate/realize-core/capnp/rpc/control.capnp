@@ -105,12 +105,11 @@ enum JobType {
 }
 
 enum JobProgress {
-  pending @0;
-  running @1;
-  done @2;
-  abandoned @3;
-  cancelled @4;
-  failed @5;
+  running @0;
+  done @1;
+  abandoned @2;
+  cancelled @3;
+  failed @4;
 }
 
 enum JobAction {

@@ -1,5 +1,6 @@
 #![allow(dead_code)] // work in progress
 
+use super::control_capnp;
 use super::control_capnp::churten::{
     self, IsRunningParams, IsRunningResults, ShutdownParams, ShutdownResults, StartParams,
     StartResults, SubscribeParams, SubscribeResults,
@@ -8,9 +9,8 @@ use super::control_capnp::control::{
     self, ChurtenParams, ChurtenResults, GetMarkParams, GetMarkResults, SetArenaMarkParams,
     SetArenaMarkResults, SetMarkParams, SetMarkResults,
 };
-use super::control_capnp::{self, churten_notification};
+use super::convert;
 use crate::consensus::churten::{Churten, JobHandler};
-use crate::consensus::types::{ChurtenNotification, JobAction, JobProgress};
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 use realize_storage::{Mark, Storage, StorageError};
@@ -131,7 +131,7 @@ impl<H: JobHandler + 'static> churten::Server for ChurtenServer<H> {
         tokio::task::spawn_local(async move {
             while let Ok(notification) = rx.recv().await {
                 let mut request = subscriber.notify_request();
-                fill_notification(notification, request.get().init_notification());
+                convert::fill_notification(notification, request.get().init_notification());
                 // Ignore errors as the client might have disconnected
                 let _ = request.send().await;
             }
@@ -207,73 +207,6 @@ fn mark_to_capnp(mark: Mark) -> control_capnp::Mark {
     }
 }
 
-fn fill_notification(source: ChurtenNotification, mut dest: churten_notification::Builder<'_>) {
-    let arena = source.arena();
-    let job_id = source.job_id();
-
-    dest.set_arena(&arena.as_str());
-    dest.set_job_id(job_id.as_u64());
-    match &source {
-        ChurtenNotification::New { job, .. } => {
-            let mut builder = dest.reborrow().init_new().init_job();
-            builder.set_path(job.path().as_str());
-            builder.set_hash(&job.hash().0);
-            match &**job {
-                realize_storage::Job::Download(_, _) => {
-                    builder.init_download();
-                }
-                realize_storage::Job::Realize(_, _, index_hash) => {
-                    let mut realize = builder.init_realize();
-                    if let Some(h) = index_hash {
-                        realize.set_index_hash(&h.0);
-                    }
-                }
-                realize_storage::Job::Unrealize(_, _) => {
-                    builder.init_unrealize();
-                }
-            }
-        }
-        ChurtenNotification::Update { progress, .. } => {
-            let mut update = dest.reborrow().init_update();
-            match progress {
-                JobProgress::Running => {
-                    update.set_progress(control_capnp::JobProgress::Running);
-                }
-                JobProgress::Done => {
-                    update.set_progress(control_capnp::JobProgress::Done);
-                }
-                JobProgress::Abandoned => {
-                    update.set_progress(control_capnp::JobProgress::Abandoned);
-                }
-                JobProgress::Cancelled => {
-                    update.set_progress(control_capnp::JobProgress::Cancelled);
-                }
-                JobProgress::Failed(msg) => {
-                    update.set_progress(control_capnp::JobProgress::Failed);
-                    update.set_message(&msg);
-                }
-            }
-        }
-        ChurtenNotification::UpdateAction { action, .. } => {
-            let mut update = dest.reborrow().init_update_action();
-            match action {
-                JobAction::Download => update.set_action(control_capnp::JobAction::Download),
-                JobAction::Verify => update.set_action(control_capnp::JobAction::Verify),
-                JobAction::Repair => update.set_action(control_capnp::JobAction::Repair),
-                JobAction::Move => update.set_action(control_capnp::JobAction::Move),
-            }
-        }
-        ChurtenNotification::UpdateByteCount {
-            current_bytes,
-            total_bytes,
-            ..
-        } => {
-            let mut update = dest.reborrow().init_update_byte_count();
-            update.set_current_bytes(*current_bytes);
-            update.set_total_bytes(*total_bytes);
-        }
-    }
-}
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;

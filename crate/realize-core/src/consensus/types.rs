@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 /// Notifications broadcast by [Churten].
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ChurtenNotification {
+pub enum ChurtenNotification {
     /// Report a new job, in state [JobProgress::Pending].
     New {
         arena: Arena,
@@ -52,7 +52,7 @@ pub(crate) enum ChurtenNotification {
 }
 
 impl ChurtenNotification {
-    pub(crate) fn arena(&self) -> Arena {
+    pub fn arena(&self) -> Arena {
         match self {
             ChurtenNotification::New { arena, .. } => *arena,
             ChurtenNotification::Update { arena, .. } => *arena,
@@ -60,7 +60,7 @@ impl ChurtenNotification {
             ChurtenNotification::UpdateAction { arena, .. } => *arena,
         }
     }
-    pub(crate) fn job_id(&self) -> JobId {
+    pub fn job_id(&self) -> JobId {
         match self {
             ChurtenNotification::New { job_id, .. } => *job_id,
             ChurtenNotification::Update { job_id, .. } => *job_id,
@@ -72,7 +72,7 @@ impl ChurtenNotification {
 
 /// Job progress reported by [ChurtenNotification]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum JobProgress {
+pub enum JobProgress {
     /// The job is running.
     Running,
 
@@ -93,7 +93,7 @@ pub(crate) enum JobProgress {
 
 /// An specific action taken by a job.
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
-pub(crate) enum JobAction {
+pub enum JobAction {
     Download,
     Verify,
     Repair,
