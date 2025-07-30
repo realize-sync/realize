@@ -1,0 +1,309 @@
+# Capnp Protocol Buffer Best Practices
+
+This rule documents best practices for working with capnp protocol buffers in Rust projects.
+
+## Rule Details
+
+- **Pattern**: `*.rs`
+- **Severity**: Warning
+- **Category**: Protocol Buffers
+
+## Key Concepts
+
+### 1. Generated Code Structure
+
+Capnp generates Rust code with the following structure:
+- **Reader types**: For reading data from capnp messages
+- **Builder types**: For constructing capnp messages
+- **Which enums**: For handling union types
+- **Owned types**: Type aliases for owned versions
+
+### 2. Message Lifecycle
+
+```rust
+// 1. Create a message builder
+let mut message = capnp::message::Builder::new_default();
+
+// 2. Initialize the root struct
+let mut builder = message.init_root::<my_struct::Builder>();
+
+// 3. Fill the builder with data
+fill_data(builder.reborrow());
+
+// 4. Convert to reader for reading
+let msg_reader = message.into_reader();
+let reader = msg_reader.get_root::<my_struct::Reader>().unwrap();
+
+// 5. Parse the data
+let parsed = parse_data(reader)?;
+```
+
+### 3. Union Type Handling
+
+Capnp unions are handled using the `which()` method:
+
+```rust
+match reader.which()? {
+    my_struct::Which::Variant1(variant_reader) => {
+        // Handle variant1
+        let data = variant_reader?.get_field()?;
+        Ok(MyEnum::Variant1(data))
+    }
+    my_struct::Which::Variant2(variant_reader) => {
+        // Handle variant2
+        let data = variant_reader?.get_field()?;
+        Ok(MyEnum::Variant2(data))
+    }
+}
+```
+
+### 4. Error Handling Patterns
+
+#### Result Unwrapping
+```rust
+// Good: Bind Result to variable before using
+let variant_reader = variant_reader_result?;
+let data = variant_reader.get_field()?;
+
+// Bad: Chaining ? operators on temporary values
+let data = variant_reader?.get_field()?; // May cause move issues
+```
+
+#### Boolean Methods
+```rust
+// Good: Boolean methods return bool, not Result
+if reader.has_field() {
+    let data = reader.get_field()?;
+    // Use data
+}
+
+// Bad: Using ? on boolean methods
+if reader.has_field()? { // Error: bool doesn't implement Try
+```
+
+### 5. Type Conversions
+
+#### String Handling
+```rust
+// Convert capnp text to Rust string
+let rust_string = reader.get_text()?.to_str()?.to_string();
+
+// Convert Rust string to capnp text
+builder.set_text(&rust_string);
+```
+
+#### Array/Data Handling
+```rust
+// Convert capnp data to Rust array
+let data = reader.get_data()?;
+let array: [u8; 32] = data.try_into()
+    .map_err(|_| capnp::Error::failed("invalid array length"))?;
+
+// Convert Rust array to capnp data
+builder.set_data(&array);
+```
+
+### 6. Builder vs Reader Pattern
+
+```rust
+// Writing (Builder pattern)
+pub fn fill_notification(
+    source: MyStruct,
+    mut dest: notification::Builder<'_>,
+) {
+    dest.set_field(&source.field);
+    match &source.variant {
+        Variant::A => dest.init_variant_a(),
+        Variant::B(data) => {
+            let mut builder = dest.init_variant_b();
+            builder.set_data(data);
+        }
+    }
+}
+
+// Reading (Reader pattern)
+pub fn parse_notification(
+    reader: notification::Reader<'_>,
+) -> Result<MyStruct, capnp::Error> {
+    let field = reader.get_field()?.to_str()?;
+    let variant = match reader.which()? {
+        notification::Which::VariantA(_) => Variant::A,
+        notification::Which::VariantB(variant_reader) => {
+            let data = variant_reader?.get_data()?;
+            Variant::B(data.to_vec())
+        }
+    };
+    Ok(MyStruct { field, variant })
+}
+```
+
+### 7. Round-trip Testing
+
+```rust
+#[test]
+fn test_round_trip() {
+    let original = create_test_data();
+    
+    // Convert to capnp
+    let mut message = capnp::message::Builder::new_default();
+    let mut builder = message.init_root::<my_struct::Builder>();
+    fill_data(original.clone(), builder.reborrow());
+    
+    // Convert back to rust
+    let msg_reader = message.into_reader();
+    let reader = msg_reader.get_root::<my_struct::Reader>().unwrap();
+    let parsed = parse_data(reader).unwrap();
+    
+    // Compare
+    assert_eq!(original, parsed);
+}
+```
+
+## Common Pitfalls
+
+### 1. Temporary Value Drops
+```rust
+// Bad: Temporary value dropped while borrowed
+let reader = message.into_reader().get_root::<MyStruct::Reader>().unwrap();
+
+// Good: Bind to variable first
+let msg_reader = message.into_reader();
+let reader = msg_reader.get_root::<MyStruct::Reader>().unwrap();
+```
+
+### 2. Union Result Handling
+```rust
+// Bad: Using ? on union variant readers directly
+match reader.which()? {
+    MyStruct::Which::Variant(variant_reader) => {
+        let data = variant_reader?.get_field()?; // variant_reader is Result
+    }
+}
+
+// Good: Unwrap the Result first
+match reader.which()? {
+    MyStruct::Which::Variant(variant_reader_result) => {
+        let variant_reader = variant_reader_result?;
+        let data = variant_reader.get_field()?;
+    }
+}
+```
+
+### 3. Boolean Method Usage
+```rust
+// Bad: Using ? on boolean methods
+if reader.has_field()? { // Error: bool doesn't implement Try
+
+// Good: Boolean methods return bool
+if reader.has_field() {
+    let field = reader.get_field()?;
+}
+```
+
+### 4. Builder vs Reader Confusion
+```rust
+// Bad: Trying to read from a Builder
+let reader = message.get_root::<MyStruct::Reader>().unwrap(); // Wrong trait
+
+// Good: Convert Builder to Reader first
+let msg_reader = message.into_reader();
+let reader = msg_reader.get_root::<MyStruct::Reader>().unwrap();
+```
+
+## Best Practices
+
+1. **Always bind Result values to variables** before using them multiple times
+2. **Use `into_reader()`** to convert Builder to Reader for reading
+3. **Handle union variants carefully** - they return `Result<Reader, Error>`
+4. **Boolean methods return bool**, not Result
+5. **Write comprehensive round-trip tests** for all data structures
+6. **Use meaningful error messages** when converting between types
+7. **Document the relationship** between capnp and Rust types
+
+## References
+
+- [Capnp Rust Documentation](https://docs.rs/capnp)
+- [Capnp Schema Language](https://capnproto.org/language.html)
+- [Capnp Rust Examples](https://github.com/capnproto/capnproto-rust)
+
+## Examples
+
+### Complete Example: Notification Protocol
+
+```rust
+// Capnp schema (control.capnp)
+struct ChurtenNotification {
+    arena @0: Text;
+    jobId @1: UInt64;
+    union {
+        new @2: New;
+        update @3: Update;
+        updateByteCount @4: UpdateByteCount;
+        updateAction @5: UpdateAction;
+    }
+}
+
+// Rust implementation
+pub fn fill_notification(
+    source: ChurtenNotification,
+    mut dest: churten_notification::Builder<'_>,
+) {
+    dest.set_arena(&source.arena.as_str());
+    dest.set_job_id(source.job_id.as_u64());
+    
+    match &source {
+        ChurtenNotification::New { job, .. } => {
+            let mut builder = dest.reborrow().init_new().init_job();
+            builder.set_path(job.path().as_str());
+            builder.set_hash(&job.hash().0);
+        }
+        ChurtenNotification::Update { progress, .. } => {
+            let mut update = dest.reborrow().init_update();
+            match progress {
+                JobProgress::Running => update.set_progress(JobProgress::Running),
+                JobProgress::Failed(msg) => {
+                    update.set_progress(JobProgress::Failed);
+                    update.set_message(msg);
+                }
+                // ... other variants
+            }
+        }
+        // ... other variants
+    }
+}
+
+pub fn parse_notification(
+    reader: churten_notification::Reader<'_>,
+) -> Result<ChurtenNotification, capnp::Error> {
+    let arena = Arena::from(reader.get_arena()?.to_str()?);
+    let job_id = JobId(reader.get_job_id());
+    
+    match reader.which()? {
+        churten_notification::Which::New(new_reader_result) => {
+            let new_reader = new_reader_result?;
+            let job_reader = new_reader.get_job()?;
+            // ... parse job
+            Ok(ChurtenNotification::New { arena, job_id, job })
+        }
+        churten_notification::Which::Update(update_reader_result) => {
+            let update_reader = update_reader_result?;
+            let progress = match update_reader.get_progress()? {
+                capnp::JobProgress::Running => JobProgress::Running,
+                capnp::JobProgress::Failed => {
+                    let message = update_reader.get_message()?.to_str()?.to_string();
+                    JobProgress::Failed(message)
+                }
+                // ... other variants
+            };
+            Ok(ChurtenNotification::Update { arena, job_id, progress })
+        }
+        // ... other variants
+    }
+}
+```
+
+This rule ensures proper handling of capnp protocol buffers in Rust projects, preventing common pitfalls and maintaining type safety.
+description: Working with capnp protos 
+globs: *.rs
+alwaysApply: false
+---
