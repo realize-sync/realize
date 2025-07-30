@@ -82,9 +82,20 @@ struct ChurtenNotification {
 }
 
 struct Job {
-  type @0: JobType;
-  path @1: Text;
-  hash @2: Data;
+  path @0: Text;
+  hash @1: Data;
+  union {
+    download@2 : Download;
+    realize@3: Realize;
+    unrealize@4: Unrealize;
+  }
+
+  struct Download {}
+  struct Realize {
+    # optional; None if empty
+    indexHash @0: Data;
+  }
+  struct Unrealize {}
 }
 
 enum JobType {

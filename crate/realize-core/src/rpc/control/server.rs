@@ -218,18 +218,24 @@ fn fill_notification(source: ChurtenNotification, mut dest: churten_notification
             let mut builder = dest.reborrow().init_new().init_job();
             builder.set_path(job.path().as_str());
             builder.set_hash(&job.hash().0);
-            builder.set_type(match &**job {
-                realize_storage::Job::Download(_, _) => control_capnp::JobType::Download,
-                realize_storage::Job::Realize(_, _, _) => control_capnp::JobType::Realize,
-                realize_storage::Job::Unrealize(_, _) => control_capnp::JobType::Unrealize,
-            });
+            match &**job {
+                realize_storage::Job::Download(_, _) => {
+                    builder.init_download();
+                }
+                realize_storage::Job::Realize(_, _, index_hash) => {
+                    let mut realize = builder.init_realize();
+                    if let Some(h) = index_hash {
+                        realize.set_index_hash(&h.0);
+                    }
+                }
+                realize_storage::Job::Unrealize(_, _) => {
+                    builder.init_unrealize();
+                }
+            }
         }
         ChurtenNotification::Update { progress, .. } => {
             let mut update = dest.reborrow().init_update();
             match progress {
-                JobProgress::Pending => {
-                    update.set_progress(control_capnp::JobProgress::Pending);
-                }
                 JobProgress::Running => {
                     update.set_progress(control_capnp::JobProgress::Running);
                 }
