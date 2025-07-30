@@ -2,6 +2,7 @@
 
 use super::jobs;
 use super::progress::ByteCountProgress;
+use super::tracker::{JobInfo, JobInfoTracker};
 use super::types::{ChurtenNotification, JobAction, JobProgress};
 use crate::rpc::Household;
 use futures::StreamExt;
@@ -9,6 +10,7 @@ use realize_storage::{Job, JobId, JobStatus, Storage};
 use realize_types::Arena;
 use std::sync::Arc;
 use tarpc::tokio_util::sync::CancellationToken;
+use tokio::sync::RwLock;
 use tokio::{sync::broadcast, task::JoinHandle};
 
 /// A type that processes jobs and returns the result for [Churten].
@@ -35,6 +37,7 @@ pub(crate) struct Churten<H: JobHandler> {
     handler: H,
     task: Option<(JoinHandle<()>, CancellationToken)>,
     tx: broadcast::Sender<ChurtenNotification>,
+    recent_jobs: Arc<RwLock<JobInfoTracker>>,
 }
 
 impl Churten<JobHandlerImpl> {
@@ -48,14 +51,41 @@ impl Churten<JobHandlerImpl> {
 
 impl<H: JobHandler + 'static> Churten<H> {
     pub(crate) fn with_handler(storage: Arc<Storage>, handler: H) -> Self {
-        let (tx, _) = broadcast::channel(16);
+        let (tx, mut rx) = broadcast::channel(16);
 
+        let tracker = Arc::new(RwLock::new(JobInfoTracker::new(16)));
+        tokio::spawn({
+            let tracker = Arc::clone(&tracker);
+
+            async move {
+                while let Ok(n) = rx.recv().await {
+                    tracker.write().await.update(&n);
+                }
+            }
+        });
         Self {
             storage,
             handler,
             task: None,
             tx,
+            recent_jobs: tracker,
         }
+    }
+
+    /// Return a list of recent jobs.
+    ///
+    /// The number of finished jobs reported by this method is limited.
+    ///
+    /// This is a snapshot; for up-to-date information, call [Churten::subscribe].
+    pub(crate) async fn recent_jobs(&self) -> Vec<JobInfo> {
+        self.recent_jobs.read().await.iter().cloned().collect()
+    }
+
+    /// Return a list of active jobs.
+    ///
+    /// This is a snapshot; for up-to-date information, call [Churten::subscribe].
+    pub(crate) async fn active_jobs(&self) -> Vec<JobInfo> {
+        self.recent_jobs.read().await.active().cloned().collect()
     }
 
     /// Subscribe to [ChurtenNotification]s.
@@ -258,9 +288,11 @@ impl ByteCountProgress for TxByteCountProgress {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::rpc::testing::{self, HouseholdFixture};
-    use realize_storage::utils::hash::digest;
+    use realize_storage::utils::hash::{self, digest};
     use realize_storage::{JobId, Mark};
     use tokio::io::AsyncReadExt;
 
@@ -861,6 +893,96 @@ mod tests {
                         }
                     ));
                 }
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recent_jobs() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                let arena = HouseholdFixture::test_arena();
+                let storage = fixture.inner.storage(a)?;
+                testing::connect(&household_a, b).await?;
+
+                let handler = FakeJobHandler::new(|| Ok(JobStatus::Done));
+                let mut churten = Churten::with_handler(Arc::clone(&storage), handler);
+                let mut rx = churten.subscribe();
+                churten.start();
+
+                storage.set_arena_mark(arena, Mark::Keep).await?;
+
+                // Create multiple files to trigger multiple jobs
+                let foo1 = fixture.inner.write_file(b, "foo1", "content1").await?;
+                let foo2 = fixture.inner.write_file(b, "foo2", "content2").await?;
+                let foo3 = fixture.inner.write_file(b, "foo3", "content3").await?;
+
+                // Collect all notifications
+                let mut finished_count = 0;
+                while let Ok(notification) = rx.recv().await {
+                    match notification {
+                        ChurtenNotification::Update { progress, .. } => {
+                            if progress.is_finished() {
+                                finished_count += 1;
+                                if finished_count == 3 {
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                let mut recent_jobs = churten
+                    .recent_jobs()
+                    .await
+                    .into_iter()
+                    .map(|job| (job.id, job))
+                    .collect::<HashMap<JobId, JobInfo>>();
+
+                assert_eq!(
+                    Some(JobInfo {
+                        arena,
+                        id: JobId(1),
+                        job: Arc::new(Job::Download(foo1, hash::digest("content1"))),
+                        progress: JobProgress::Done,
+                        action: None,
+                        byte_progress: None
+                    }),
+                    recent_jobs.remove(&JobId(1))
+                );
+                assert_eq!(
+                    Some(JobInfo {
+                        arena,
+                        id: JobId(2),
+                        job: Arc::new(Job::Download(foo2, hash::digest("content2"))),
+                        progress: JobProgress::Done,
+                        action: None,
+                        byte_progress: None
+                    }),
+                    recent_jobs.remove(&JobId(2))
+                );
+                assert_eq!(
+                    Some(JobInfo {
+                        arena,
+                        id: JobId(3),
+                        job: Arc::new(Job::Download(foo3, hash::digest("content3"))),
+                        progress: JobProgress::Done,
+                        action: None,
+                        byte_progress: None
+                    }),
+                    recent_jobs.remove(&JobId(3))
+                );
 
                 Ok::<(), anyhow::Error>(())
             })
