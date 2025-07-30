@@ -1,5 +1,4 @@
-use super::churten::JobAction;
-use super::progress::ByteCountProgress;
+use super::{progress::ByteCountProgress, types::JobAction};
 use crate::rpc::Household;
 use futures::StreamExt;
 use realize_storage::{Inode, JobStatus, LocalAvailability, Storage, StorageError};

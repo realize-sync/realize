@@ -9,7 +9,8 @@ use super::control_capnp::control::{
     SetArenaMarkResults, SetMarkParams, SetMarkResults,
 };
 use super::control_capnp::{self, churten_notification};
-use crate::consensus::churten::{Churten, ChurtenNotification, JobAction, JobHandler, JobProgress};
+use crate::consensus::churten::{Churten, JobHandler};
+use crate::consensus::types::{ChurtenNotification, JobAction, JobProgress};
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 use realize_storage::{Mark, Storage, StorageError};
@@ -273,7 +274,8 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::consensus::churten::{ChurtenNotification, JobHandler, JobHandlerImpl};
+    use crate::consensus::churten::{JobHandler, JobHandlerImpl};
+    use crate::consensus::types::ChurtenNotification;
     use crate::rpc::testing::HouseholdFixture;
     use assert_fs::TempDir;
     use realize_network::unixsocket;

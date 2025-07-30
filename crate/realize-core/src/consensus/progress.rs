@@ -1,4 +1,4 @@
-use super::churten::JobAction;
+use super::types::JobAction;
 
 /// A trait that let job implementation report internal progress.
 pub(crate) trait ByteCountProgress {
