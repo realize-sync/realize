@@ -354,7 +354,7 @@ mod tests {
     use super::*;
     use crate::rpc::testing::{self, HouseholdFixture};
     use realize_storage::utils::hash::digest;
-    use realize_storage::{JobUpdate, Mark};
+    use realize_storage::{JobId, JobUpdate, Mark};
     use tokio::io::AsyncReadExt;
 
     struct Fixture {
@@ -396,7 +396,7 @@ mod tests {
                 storage.set_arena_mark(arena, Mark::Keep).await?;
                 let foo = fixture.inner.write_file(b, "foo", "this is foo").await?;
                 let hash = digest("this is foo");
-                let job = Arc::new(Job::Download(foo, 1, hash));
+                let job = Arc::new(Job::Download(foo, JobId(1), hash));
                 assert_eq!(
                     ChurtenNotification::Update {
                         arena,
@@ -568,7 +568,7 @@ mod tests {
                 storage.set_arena_mark(arena, Mark::Keep).await?;
                 let foo = fixture.inner.write_file(b, "foo", "test content").await?;
                 let hash = digest("test content");
-                let job = Arc::new(Job::Download(foo, 1, hash));
+                let job = Arc::new(Job::Download(foo, JobId(1), hash));
 
                 // Check Pending notification
                 assert_eq!(
@@ -651,7 +651,7 @@ mod tests {
                 storage.set_arena_mark(arena, Mark::Keep).await?;
                 let foo = fixture.inner.write_file(b, "foo", "test content").await?;
                 let hash = digest("test content");
-                let job = Arc::new(Job::Download(foo, 1, hash));
+                let job = Arc::new(Job::Download(foo, JobId(1), hash));
 
                 // Check Pending notification
                 assert_eq!(
@@ -714,7 +714,7 @@ mod tests {
                 storage.set_arena_mark(arena, Mark::Keep).await?;
                 let foo = fixture.inner.write_file(b, "foo", "test content").await?;
                 let hash = digest("test content");
-                let job = Arc::new(Job::Download(foo, 1, hash));
+                let job = Arc::new(Job::Download(foo, JobId(1), hash));
 
                 // Check Pending notification
                 assert_eq!(
@@ -777,7 +777,7 @@ mod tests {
                 storage.set_arena_mark(arena, Mark::Keep).await?;
                 let foo = fixture.inner.write_file(b, "foo", "test content").await?;
                 let hash = digest("test content");
-                let job = Arc::new(Job::Download(foo, 1, hash));
+                let job = Arc::new(Job::Download(foo, JobId(1), hash));
 
                 // Check Pending notification
                 assert_eq!(
@@ -839,7 +839,7 @@ mod tests {
                 storage.set_arena_mark(arena, Mark::Keep).await?;
                 let foo = fixture.inner.write_file(b, "foo", "test content").await?;
                 let hash = digest("test content");
-                let job = Arc::new(Job::Download(foo, 1, hash));
+                let job = Arc::new(Job::Download(foo, JobId(1), hash));
 
                 // Check Pending notification
                 assert_eq!(
@@ -908,9 +908,9 @@ mod tests {
                 let hash2 = digest("content2");
                 let hash3 = digest("content3");
 
-                let job1 = Arc::new(Job::Download(foo1, 1, hash1));
-                let job2 = Arc::new(Job::Download(foo2, 2, hash2));
-                let job3 = Arc::new(Job::Download(foo3, 3, hash3));
+                let job1 = Arc::new(Job::Download(foo1, JobId(1), hash1));
+                let job2 = Arc::new(Job::Download(foo2, JobId(2), hash2));
+                let job3 = Arc::new(Job::Download(foo3, JobId(3), hash3));
 
                 // Collect all notifications
                 let mut notifications = Vec::new();
@@ -927,15 +927,15 @@ mod tests {
                 // Verify each job has the expected sequence
                 let job1_notifications: Vec<_> = notifications
                     .iter()
-                    .filter(|n| n.job().counter() == job1.counter())
+                    .filter(|n| n.job().id() == job1.id())
                     .collect();
                 let job2_notifications: Vec<_> = notifications
                     .iter()
-                    .filter(|n| n.job().counter() == job2.counter())
+                    .filter(|n| n.job().id() == job2.id())
                     .collect();
                 let job3_notifications: Vec<_> = notifications
                     .iter()
-                    .filter(|n| n.job().counter() == job3.counter())
+                    .filter(|n| n.job().id() == job3.id())
                     .collect();
 
                 assert_eq!(job1_notifications.len(), 3);

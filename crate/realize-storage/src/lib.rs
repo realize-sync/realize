@@ -31,7 +31,7 @@ pub use arena::types::{LocalAvailability, Mark};
 pub use error::StorageError;
 pub use global::cache::UnrealCacheAsync;
 pub use global::types::{FileAvailability, FileMetadata, InodeAssignment};
-pub use types::Inode;
+pub use types::{Inode, JobId};
 
 /// Local storage, including the real store and an unreal cache.
 pub struct Storage {

@@ -228,6 +228,85 @@ impl Value for BlobId {
     }
 }
 
+/// A unique ID for a job within an arena.
+///
+/// This type can be used as a key or value in redb database schemas.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct JobId(pub u64);
+
+impl JobId {
+    pub const ZERO: JobId = JobId(0);
+    pub const MAX: JobId = JobId(u64::MAX);
+
+    /// Create a new JobId from a u64 value.
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Get the underlying u64 value.
+    pub fn value(&self) -> u64 {
+        self.0
+    }
+
+    pub fn plus(&self, val: u64) -> JobId {
+        JobId(self.0 + val)
+    }
+
+    pub fn minus(&self, val: u64) -> JobId {
+        JobId(self.0 - val)
+    }
+
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
+
+    pub fn is_invalid(&self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn as_optional(job_id: u64) -> Option<JobId> {
+        if job_id == 0 {
+            None
+        } else {
+            Some(JobId(job_id))
+        }
+    }
+
+    pub fn from_optional(job_id: Option<JobId>) -> u64 {
+        job_id.map(|b| b.0).unwrap_or(0)
+    }
+}
+
+impl From<u64> for JobId {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl From<JobId> for u64 {
+    fn from(value: JobId) -> Self {
+        value.0
+    }
+}
+
+impl AsRef<u64> for JobId {
+    fn as_ref(&self) -> &u64 {
+        &self.0
+    }
+}
+
+impl AsMut<u64> for JobId {
+    fn as_mut(&mut self) -> &mut u64 {
+        &mut self.0
+    }
+}
+
+impl std::fmt::Display for JobId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

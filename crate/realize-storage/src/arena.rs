@@ -233,7 +233,7 @@ mod tests {
     use super::*;
     use crate::config::ArenaConfig;
     use crate::utils::hash;
-    use crate::{Blob, GlobalDatabase, Inode, Mark, Notification};
+    use crate::{Blob, GlobalDatabase, Inode, Notification};
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;

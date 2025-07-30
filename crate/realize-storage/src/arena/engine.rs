@@ -6,6 +6,7 @@ use super::types::{FailedJobTableEntry, LocalAvailability};
 use crate::arena::arena_cache;
 use crate::arena::blob;
 use crate::arena::mark;
+use crate::types::JobId;
 use crate::utils::holder::Holder;
 use crate::{Inode, Mark, StorageError};
 use realize_types::{Arena, Hash, Path, UnixTime};
@@ -21,14 +22,14 @@ use tokio_stream::wrappers::ReceiverStream;
 #[derive(Eq, PartialEq, Debug, Clone)]
 pub enum Job {
     // TODO: use named fields
-    Download(Path, u64, Hash),
+    Download(Path, JobId, Hash),
 
     /// Realize `Path` with `counter`, moving `Hash` from cache to the
     /// index, currently containing nothing or `Hash`.
-    Realize(Path, u64, Hash, Option<Hash>),
+    Realize(Path, JobId, Hash, Option<Hash>),
 
     /// Move file containing the given version into the cache.
-    Unrealize(Path, u64, Hash),
+    Unrealize(Path, JobId, Hash),
 }
 
 impl Job {
@@ -41,26 +42,20 @@ impl Job {
         }
     }
 
-    /// Return the job counter. This identifies a particular job.
-    pub fn counter(&self) -> u64 {
+    /// Return the ID of the job within its arena.
+    pub fn id(&self) -> JobId {
         match self {
-            Job::Download(_, counter, _) => *counter,
-            Job::Realize(_, counter, _, _) => *counter,
-            Job::Unrealize(_, counter, _) => *counter,
+            Job::Download(_, id, _) => *id,
+            Job::Realize(_, id, _, _) => *id,
+            Job::Unrealize(_, id, _) => *id,
         }
     }
 
-    /// Return the same job, with a different counter.
-    ///
-    /// Useful to update a job after getting [JobUpdate::Updated] from
-    /// [Engine::check_job].
-    pub fn with_counter(self, counter: u64) -> Job {
+    fn with_id(self, newid: JobId) -> Job {
         match self {
-            Job::Download(path, _, hash) => Job::Download(path, counter, hash),
-            Job::Realize(path, _, cached_hash, indexed_hash) => {
-                Job::Realize(path, counter, cached_hash, indexed_hash)
-            }
-            Job::Unrealize(path, _, hash) => Job::Unrealize(path, counter, hash),
+            Job::Download(path, _, h) => Job::Download(path, newid, h),
+            Job::Realize(path, _, h1, h2) => Job::Realize(path, newid, h1, h2),
+            Job::Unrealize(path, _, h) => Job::Unrealize(path, newid, h),
         }
     }
 }
@@ -86,10 +81,7 @@ pub enum JobUpdate {
     Same,
 
     /// The path was updated, but the job is otherwise still relevant.
-    ///
-    /// You can call `Job.with_counter(counter)` with the given
-    /// counter to update the job enum.
-    Updated(u64),
+    Updated,
 
     /// The job is no longer relevant, either because it is done or
     /// because the situation changed and made the job irrelevant.
@@ -274,7 +266,7 @@ impl Engine {
         let txn = self.db.begin_write()?;
         let path = job.path();
         let current = current_path_counter(&txn, path)?;
-        let counter = job.counter();
+        let counter = job.id().as_u64();
         if current == Some(counter) {
             txn.failed_job_table()?.remove(counter)?;
             txn.dirty_log_table()?.remove(counter)?;
@@ -300,7 +292,7 @@ impl Engine {
         let txn = self.db.begin_write()?;
         let backoff_until = {
             let path = job.path();
-            let counter = job.counter();
+            let counter = job.id().as_u64();
             if current_path_counter(&txn, path)? != Some(counter) {
                 return Ok(None);
             }
@@ -360,9 +352,8 @@ impl Engine {
                 if updated_job == *job {
                     return Ok(JobUpdate::Same);
                 }
-                let updated_counter = updated_job.counter();
-                if updated_job.with_counter(job.counter()) == *job {
-                    return Ok(JobUpdate::Updated(updated_counter));
+                if updated_job.with_id(job.id()) == *job {
+                    return Ok(JobUpdate::Updated);
                 }
 
                 Ok(JobUpdate::Outdated)
@@ -524,7 +515,11 @@ impl Engine {
                     index::get_file_entry(txn, &path),
                 ) && cached.content.hash == indexed.hash
                 {
-                    return Ok(Some(Job::Unrealize(path, counter, cached.content.hash)));
+                    return Ok(Some(Job::Unrealize(
+                        path,
+                        JobId(counter),
+                        cached.content.hash,
+                    )));
                 }
             }
             Mark::Keep => {
@@ -534,11 +529,19 @@ impl Engine {
                     if let Ok(Some(indexed)) = index::get_file_entry(txn, &path)
                         && cached.content.hash == indexed.hash
                     {
-                        return Ok(Some(Job::Unrealize(path, counter, cached.content.hash)));
+                        return Ok(Some(Job::Unrealize(
+                            path,
+                            JobId(counter),
+                            cached.content.hash,
+                        )));
                     }
 
                     if blob::local_availability(txn, &cached)? != LocalAvailability::Verified {
-                        return Ok(Some(Job::Download(path, counter, cached.content.hash)));
+                        return Ok(Some(Job::Download(
+                            path,
+                            JobId(counter),
+                            cached.content.hash,
+                        )));
                     }
                 }
             }
@@ -550,7 +553,12 @@ impl Engine {
                     let from_index = index::get_file_entry(txn, &path).ok().flatten();
                     if from_index.is_none() {
                         // File is missing from the index, move it there.
-                        return Ok(Some(Job::Realize(path, counter, cached.content.hash, None)));
+                        return Ok(Some(Job::Realize(
+                            path,
+                            JobId(counter),
+                            cached.content.hash,
+                            None,
+                        )));
                     }
                     if let Some(indexed) = from_index
                         && indexed
@@ -561,7 +569,7 @@ impl Engine {
                     {
                         return Ok(Some(Job::Realize(
                             path,
-                            counter,
+                            JobId(counter),
                             cached.content.hash,
                             Some(indexed.hash),
                         )));
@@ -598,7 +606,7 @@ impl Engine {
     /// Check whether this is a failed job.
     async fn is_failed(self: &Arc<Self>, job: &Job) -> Result<bool, StorageError> {
         let this = Arc::clone(self);
-        let counter = job.counter();
+        let counter = job.id().as_u64();
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
             let failed_job_table = txn.failed_job_table()?;
@@ -1057,7 +1065,7 @@ mod tests {
         fixture.add_file_to_cache(&barfile)?;
 
         let job = next_with_timeout(&mut job_stream).await?;
-        assert_eq!(Some(Job::Download(barfile, 1, test_hash())), job);
+        assert_eq!(Some(Job::Download(barfile, JobId(1), test_hash())), job);
 
         Ok(())
     }
@@ -1072,7 +1080,7 @@ mod tests {
         let mut job_stream2 = fixture.engine.job_stream();
         fixture.add_file_to_cache(&barfile)?;
 
-        let goal_job = Some(Job::Download(barfile, 1, test_hash()));
+        let goal_job = Some(Job::Download(barfile, JobId(1), test_hash()));
         assert_eq!(goal_job, next_with_timeout(&mut job_stream).await?);
         assert_eq!(goal_job, next_with_timeout(&mut job_stream2).await?);
 
@@ -1094,7 +1102,7 @@ mod tests {
         let job = next_with_timeout(&mut job_stream).await?;
         // Counter is 2, because the job was created after the 2nd
         // change only.
-        assert_eq!(Some(Job::Download(barfile, 2, test_hash())), job);
+        assert_eq!(Some(Job::Download(barfile, JobId(2), test_hash())), job);
 
         // The entries before the job that have been deleted.
         assert_eq!(Some(2), fixture.lowest_counter()?);
@@ -1122,7 +1130,7 @@ mod tests {
         let mut job_stream = fixture.engine.job_stream();
 
         let job = next_with_timeout(&mut job_stream).await?;
-        assert_eq!(Some(Job::Download(barfile, 1, test_hash())), job);
+        assert_eq!(Some(Job::Download(barfile, JobId(1), test_hash())), job);
 
         Ok(())
     }
@@ -1147,7 +1155,7 @@ mod tests {
         let mut job_stream = fixture.engine.job_stream();
 
         let job = next_with_timeout(&mut job_stream).await?;
-        assert_eq!(Some(Job::Download(barfile, 1, test_hash())), job);
+        assert_eq!(Some(Job::Download(barfile, JobId(1), test_hash())), job);
 
         Ok(())
     }
@@ -1178,7 +1186,7 @@ mod tests {
 
         let job = next_with_timeout(&mut job_stream).await?;
         // 1 has been skipped, because it is fully downloaded
-        assert_eq!(Some(Job::Download(otherfile, 2, test_hash())), job);
+        assert_eq!(Some(Job::Download(otherfile, JobId(2), test_hash())), job);
 
         // The entries before the job that have been deleted.
         assert_eq!(Some(2), fixture.lowest_counter()?);
@@ -1207,7 +1215,7 @@ mod tests {
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
         // 1 and 2 have been skipped; as they correspond to barfile
         // creation and deletion.
-        assert_eq!(Job::Download(otherfile, 3, test_hash()), job);
+        assert_eq!(Job::Download(otherfile, JobId(3), test_hash()), job);
 
         // The entries before the job that have been deleted.
         assert_eq!(Some(3), fixture.lowest_counter()?);
@@ -1226,7 +1234,7 @@ mod tests {
         let mut job_stream = fixture.engine.job_stream();
 
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert_eq!(Job::Realize(foobar, 1, test_hash(), None), job);
+        assert_eq!(Job::Realize(foobar, JobId(1), test_hash(), None), job);
 
         Ok(())
     }
@@ -1250,7 +1258,7 @@ mod tests {
 
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
         // 1 has been skipped, since the file is in the index
-        assert_eq!(Job::Download(otherfile, 3, test_hash()), job);
+        assert_eq!(Job::Download(otherfile, JobId(3), test_hash()), job);
 
         Ok(())
     }
@@ -1274,7 +1282,7 @@ mod tests {
 
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
         // 1 has been skipped, since the file is in the index
-        assert_eq!(Job::Download(otherfile, 3, test_hash()), job);
+        assert_eq!(Job::Download(otherfile, JobId(3), test_hash()), job);
 
         Ok(())
     }
@@ -1295,7 +1303,7 @@ mod tests {
 
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
         assert_eq!(
-            Job::Realize(foobar, 3, Hash([2; 32]), Some(Hash([1; 32]))),
+            Job::Realize(foobar, JobId(3), Hash([2; 32]), Some(Hash([1; 32]))),
             job
         );
 
@@ -1320,7 +1328,7 @@ mod tests {
         // job isn't really done, since the file wasn't downloaded; this isn't checked).
         let mut job_stream = fixture.engine.job_stream();
         assert_eq!(
-            Some(Job::Download(otherfile, 2, test_hash())),
+            Some(Job::Download(otherfile, JobId(2), test_hash())),
             next_with_timeout(&mut job_stream).await?
         );
 
@@ -1350,7 +1358,7 @@ mod tests {
         // for now, is the logging.
         let mut job_stream = fixture.engine.job_stream();
         assert_eq!(
-            Some(Job::Download(otherfile, 2, test_hash())),
+            Some(Job::Download(otherfile, JobId(2), test_hash())),
             next_with_timeout(&mut job_stream).await?
         );
 
@@ -1370,12 +1378,12 @@ mod tests {
 
         let job1 = next_with_timeout(&mut job_stream).await?.unwrap();
         assert_eq!(barfile, *job1.path());
-        assert_eq!(1, job1.counter());
+        assert_eq!(1, job1.id().as_u64());
         fixture.mark_dirty(&barfile)?;
 
         let job2 = next_with_timeout(&mut job_stream).await?.unwrap();
         assert_eq!(barfile, *job2.path());
-        assert_eq!(2, job2.counter());
+        assert_eq!(2, job2.id().as_u64());
 
         // Job1 is done, but that changes nothing, because the path has been modified afterwards
         fixture.engine.job_finished(&job1, Ok(JobStatus::Done))?;
@@ -1386,7 +1394,7 @@ mod tests {
             Some(2),
             next_with_timeout(&mut fixture.engine.job_stream())
                 .await?
-                .map(|j| j.counter()),
+                .map(|j| j.id().as_u64()),
         );
 
         // Marking job2 done erases the dirty mark.
@@ -1511,11 +1519,11 @@ mod tests {
 
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
         assert_eq!(otherfile, *job.path());
-        assert_eq!(2, job.counter());
+        assert_eq!(2, job.id().as_u64());
 
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
         assert_eq!(barfile, *job.path());
-        assert_eq!(3, job.counter());
+        assert_eq!(3, job.id().as_u64());
 
         Ok(())
     }
@@ -1542,11 +1550,11 @@ mod tests {
 
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
         assert_eq!(otherfile, *job.path());
-        assert_eq!(2, job.counter());
+        assert_eq!(2, job.id().as_u64());
 
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
         assert_eq!(barfile, *job.path());
-        assert_eq!(3, job.counter());
+        assert_eq!(3, job.id().as_u64());
 
         Ok(())
     }
@@ -1576,9 +1584,9 @@ mod tests {
         fixture.add_file_to_cache(&barfile)?;
 
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert_eq!(1, job.counter());
+        assert_eq!(1, job.id().as_u64());
         fixture.mark_dirty(&barfile)?;
-        assert_eq!(JobUpdate::Updated(2), fixture.engine.check_job(&job).await?);
+        assert_eq!(JobUpdate::Updated, fixture.engine.check_job(&job).await?);
 
         Ok(())
     }
