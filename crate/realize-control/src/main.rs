@@ -1,11 +1,12 @@
 use anyhow::Result;
-use capnp::capability::Promise;
-use capnp_rpc;
 use clap::{Parser, Subcommand};
+use realize_core::consensus::types::ChurtenNotification;
+use realize_core::rpc::control::client::TxChurtenSubscriber;
 use realize_core::rpc::control::{client, control_capnp};
 use realize_core::utils::logging;
 use realize_network::unixsocket;
 use std::path::PathBuf;
+use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 
 /// Command-line tool for controlling a running instance of realize-daemon
@@ -188,26 +189,23 @@ async fn run_churten(
     churten: &realize_core::rpc::control::control_capnp::churten::Client,
 ) -> Result<(), anyhow::Error> {
     let ctrl_c = tokio::spawn(tokio::signal::ctrl_c());
-    struct PrintSubscriber;
-    impl control_capnp::churten::subscriber::Server for PrintSubscriber {
-        fn notify(
-            &mut self,
-            params: control_capnp::churten::subscriber::NotifyParams,
-        ) -> Promise<(), capnp::Error> {
-            let notification = params.get().and_then(|p| p.get_notification());
-            match notification {
-                Ok(n) => println!("Notification: {:?}", n),
-                Err(e) => println!("Notification error: {e}"),
-            }
-            Promise::ok(())
-        }
-    }
-    let subscriber = capnp_rpc::new_client(PrintSubscriber);
+
+    let (tx, rx) = mpsc::channel(20);
     let mut req = churten.subscribe_request();
-    req.get().set_subscriber(subscriber);
+    req.get()
+        .set_subscriber(TxChurtenSubscriber::new(tx).as_client());
     req.send().promise.await?;
-    let _ = ctrl_c.await;
-    Ok(())
+    tokio::select!(
+        _ = ctrl_c => {},
+         _ = print_notifications(rx) => {}
+    );
+    return Ok(());
+}
+
+async fn print_notifications(mut rx: mpsc::Receiver<ChurtenNotification>) {
+    while let Some(notification) = rx.recv().await {
+        println!("RECV: {notification:?}");
+    }
 }
 
 /// Execute the mark set command
