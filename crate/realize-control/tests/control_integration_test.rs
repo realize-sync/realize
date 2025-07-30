@@ -163,7 +163,7 @@ async fn churten_mark_set_arena() -> anyhow::Result<()> {
         .run_until(async move {
             // Test setting arena mark
             let output = fixture
-                .control_command(&["churten", "mark", "set", "keep", "myarena"])?
+                .control_command(&["mark", "set", "keep", "myarena"])?
                 .output()
                 .await?;
 

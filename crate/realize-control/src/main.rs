@@ -1,10 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use realize_core::consensus::types::ChurtenNotification;
-use realize_core::rpc::control::client::TxChurtenSubscriber;
-use realize_core::rpc::control::{client, control_capnp};
+use realize_core::rpc::control::client::{self, TxChurtenSubscriber};
+use realize_core::rpc::control::control_capnp;
 use realize_core::utils::logging;
-use realize_network::unixsocket;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
@@ -23,10 +22,13 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Churten-related commands
     Churten {
         #[command(subcommand)]
         command: ChurtenCommands,
+    },
+    Mark {
+        #[command(subcommand)]
+        command: MarkCommands,
     },
 }
 
@@ -44,11 +46,6 @@ enum ChurtenCommands {
     },
     /// Run churten and print notifications
     Run,
-    /// Mark-related commands
-    Mark {
-        #[command(subcommand)]
-        command: MarkCommands,
-    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -106,82 +103,54 @@ fn resolve_socket_path(socket_arg: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 /// Execute the churten start command
-async fn execute_churten_start(socket_path: &PathBuf) -> Result<()> {
-    let local = LocalSet::new();
-    local
-        .run_until(async move {
-            let control = client::connect(socket_path).await?;
-            let churten = client::get_churten(&control).await?;
-            churten.start_request().send().promise.await?;
-            println!("Churten started successfully");
+async fn execute_churten_start(control: &control_capnp::control::Client) -> Result<()> {
+    let churten = client::get_churten(&control).await?;
+    churten.start_request().send().promise.await?;
+    println!("Churten started successfully");
 
-            Ok::<_, anyhow::Error>(())
-        })
-        .await?;
     Ok(())
 }
 
 /// Execute the churten stop command
-async fn execute_churten_stop(socket_path: &PathBuf) -> Result<()> {
-    let local = LocalSet::new();
-    local
-        .run_until(async move {
-            let control = client::connect(socket_path).await?;
-            let churten = client::get_churten(&control).await?;
-            churten.shutdown_request().send().promise.await?;
-            println!("Churten stopped successfully");
-
-            Ok::<_, anyhow::Error>(())
-        })
-        .await?;
+async fn execute_churten_stop(control: &control_capnp::control::Client) -> Result<()> {
+    let churten = client::get_churten(&control).await?;
+    churten.shutdown_request().send().promise.await?;
+    println!("Churten stopped successfully");
     Ok(())
 }
 
 /// Execute the churten is_running command
-async fn execute_churten_is_running(socket_path: &PathBuf, quiet: bool) -> Result<()> {
-    let local = LocalSet::new();
-    local
-        .run_until(async move {
-            let control = client::connect(socket_path).await?;
-            let churten = client::get_churten(&control).await?;
-            let is_running_result = churten.is_running_request().send().promise.await?;
-            let is_running = is_running_result.get()?.get_running();
-            if quiet {
-                if is_running {
-                    std::process::exit(0);
-                } else {
-                    std::process::exit(10);
-                }
-            } else {
-                println!("{}", is_running);
-            }
-
-            Ok::<_, anyhow::Error>(())
-        })
-        .await?;
+async fn execute_churten_is_running(
+    control: &control_capnp::control::Client,
+    quiet: bool,
+) -> Result<()> {
+    let churten = client::get_churten(&control).await?;
+    let is_running_result = churten.is_running_request().send().promise.await?;
+    let is_running = is_running_result.get()?.get_running();
+    if quiet {
+        if is_running {
+            std::process::exit(0);
+        } else {
+            std::process::exit(10);
+        }
+    } else {
+        println!("{}", is_running);
+    }
     Ok(())
 }
 
 /// Execute the churten run command
-async fn execute_churten_run(socket_path: &PathBuf) -> Result<()> {
-    let local = LocalSet::new();
-    local
-        .run_until(async move {
-            let control = client::connect(socket_path).await?;
-            let churten = client::get_churten(&control).await?;
-            churten.start_request().send().promise.await?;
-            println!("Churten started. Subscribing to notifications...");
+async fn execute_churten_run(control: &control_capnp::control::Client) -> Result<()> {
+    let churten = client::get_churten(&control).await?;
+    churten.start_request().send().promise.await?;
+    println!("Churten started. Subscribing to notifications...");
 
-            let res = run_churten(&churten).await;
+    let res = run_churten(&churten).await;
 
-            churten.shutdown_request().send().promise.await?;
-            println!("Churten stopped.");
+    churten.shutdown_request().send().promise.await?;
+    println!("Churten stopped.");
 
-            res?;
-
-            Ok::<_, anyhow::Error>(())
-        })
-        .await?;
+    res?;
     Ok(())
 }
 
@@ -210,83 +179,63 @@ async fn print_notifications(mut rx: mpsc::Receiver<ChurtenNotification>) {
 
 /// Execute the mark set command
 async fn execute_mark_set(
-    socket_path: &PathBuf,
+    control: &control_capnp::control::Client,
     mark: &MarkValue,
     arena: &str,
     paths: &[String],
 ) -> Result<()> {
-    let local = LocalSet::new();
-    local
-        .run_until(async move {
-            let control = unixsocket::connect::<
-                realize_core::rpc::control::control_capnp::control::Client,
-            >(socket_path)
-            .await?;
+    let mark_value = match mark {
+        MarkValue::Watch => control_capnp::Mark::Watch,
+        MarkValue::Keep => control_capnp::Mark::Keep,
+        MarkValue::Own => control_capnp::Mark::Own,
+    };
 
-            let mark_value = match mark {
-                MarkValue::Watch => control_capnp::Mark::Watch,
-                MarkValue::Keep => control_capnp::Mark::Keep,
-                MarkValue::Own => control_capnp::Mark::Own,
-            };
-
-            if paths.is_empty() {
-                // Set arena mark
-                let mut request = control.set_arena_mark_request();
-                let mut req = request.get().init_req();
-                req.set_arena(arena);
-                req.set_mark(mark_value);
-                request.send().promise.await?;
-                println!("Arena mark set successfully");
-            } else {
-                // Set marks on individual paths
-                for path in paths {
-                    let mut request = control.set_mark_request();
-                    let mut req = request.get().init_req();
-                    req.set_arena(arena);
-                    req.set_path(path);
-                    req.set_mark(mark_value);
-                    request.send().promise.await?;
-                }
-                println!("Marks set successfully on {} paths", paths.len());
-            }
-
-            Ok::<_, anyhow::Error>(())
-        })
-        .await?;
+    if paths.is_empty() {
+        // Set arena mark
+        let mut request = control.set_arena_mark_request();
+        let mut req = request.get().init_req();
+        req.set_arena(arena);
+        req.set_mark(mark_value);
+        request.send().promise.await?;
+        println!("Arena mark set successfully");
+    } else {
+        // Set marks on individual paths
+        for path in paths {
+            let mut request = control.set_mark_request();
+            let mut req = request.get().init_req();
+            req.set_arena(arena);
+            req.set_path(path);
+            req.set_mark(mark_value);
+            request.send().promise.await?;
+        }
+        println!("Marks set successfully on {} paths", paths.len());
+    }
     Ok(())
 }
 
 /// Execute the mark get command
-async fn execute_mark_get(socket_path: &PathBuf, arena: &str, paths: &[String]) -> Result<()> {
-    let local = LocalSet::new();
-    local
-        .run_until(async move {
-            let control = unixsocket::connect::<
-                realize_core::rpc::control::control_capnp::control::Client,
-            >(socket_path)
-            .await?;
+async fn execute_mark_get(
+    control: &control_capnp::control::Client,
+    arena: &str,
+    paths: &[String],
+) -> Result<()> {
+    for path in paths {
+        let mut request = control.get_mark_request();
+        let mut req = request.get().init_req();
+        req.set_arena(arena);
+        req.set_path(path);
+        let result = request.send().promise.await?;
+        let mark = result.get()?.get_res()?.get_mark();
 
-            for path in paths {
-                let mut request = control.get_mark_request();
-                let mut req = request.get().init_req();
-                req.set_arena(arena);
-                req.set_path(path);
-                let result = request.send().promise.await?;
-                let mark = result.get()?.get_res()?.get_mark();
+        let mark_str = match mark {
+            Ok(control_capnp::Mark::Watch) => "watch",
+            Ok(control_capnp::Mark::Keep) => "keep",
+            Ok(control_capnp::Mark::Own) => "own",
+            Err(_) => "unknown",
+        };
 
-                let mark_str = match mark {
-                    Ok(control_capnp::Mark::Watch) => "watch",
-                    Ok(control_capnp::Mark::Keep) => "keep",
-                    Ok(control_capnp::Mark::Own) => "own",
-                    Err(_) => "unknown",
-                };
-
-                println!("{}: {}", path, mark_str);
-            }
-
-            Ok::<_, anyhow::Error>(())
-        })
-        .await?;
+        println!("{}: {}", path, mark_str);
+    }
     Ok(())
 }
 
@@ -299,31 +248,42 @@ async fn main() -> Result<()> {
     let socket_path = resolve_socket_path(cli.socket)?;
     log::debug!("Connecting to {socket_path:?}");
 
-    // Execute the appropriate command
-    match cli.command {
-        Commands::Churten { command } => match command {
-            ChurtenCommands::Start => {
-                execute_churten_start(&socket_path).await?;
+    let local = LocalSet::new();
+    local
+        .run_until(async move {
+            let control = client::connect(&socket_path).await?;
+
+            // Execute the appropriate command
+            match cli.command {
+                Commands::Churten { command } => match command {
+                    ChurtenCommands::Start => {
+                        execute_churten_start(&control).await?;
+                    }
+                    ChurtenCommands::Stop => {
+                        execute_churten_stop(&control).await?;
+                    }
+                    ChurtenCommands::IsRunning { quiet } => {
+                        execute_churten_is_running(&control, quiet).await?;
+                    }
+                    ChurtenCommands::Run => {
+                        execute_churten_run(&control).await?;
+                    }
+                },
+
+                Commands::Mark { command } => match command {
+                    MarkCommands::Set { mark, arena, paths } => {
+                        execute_mark_set(&control, &mark, &arena, &paths).await?;
+                    }
+
+                    MarkCommands::Get { arena, paths } => {
+                        execute_mark_get(&control, &arena, &paths).await?;
+                    }
+                },
             }
-            ChurtenCommands::Stop => {
-                execute_churten_stop(&socket_path).await?;
-            }
-            ChurtenCommands::IsRunning { quiet } => {
-                execute_churten_is_running(&socket_path, quiet).await?;
-            }
-            ChurtenCommands::Run => {
-                execute_churten_run(&socket_path).await?;
-            }
-            ChurtenCommands::Mark { command } => match command {
-                MarkCommands::Set { mark, arena, paths } => {
-                    execute_mark_set(&socket_path, &mark, &arena, &paths).await?;
-                }
-                MarkCommands::Get { arena, paths } => {
-                    execute_mark_get(&socket_path, &arena, &paths).await?;
-                }
-            },
-        },
-    }
+
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?;
 
     Ok(())
 }
