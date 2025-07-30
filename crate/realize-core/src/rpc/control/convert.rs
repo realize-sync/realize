@@ -43,6 +43,7 @@ pub(crate) fn parse_notification(
         churten_notification::Which::Update(update_reader_result) => {
             let update_reader = update_reader_result?;
             let progress = match update_reader.get_progress()? {
+                super::control_capnp::JobProgress::Pending => JobProgress::Pending,
                 super::control_capnp::JobProgress::Running => JobProgress::Running,
                 super::control_capnp::JobProgress::Done => JobProgress::Done,
                 super::control_capnp::JobProgress::Abandoned => JobProgress::Abandoned,
@@ -118,6 +119,9 @@ pub(crate) fn fill_notification(
         ChurtenNotification::Update { progress, .. } => {
             let mut update = dest.reborrow().init_update();
             match progress {
+                JobProgress::Pending => {
+                    update.set_progress(control_capnp::JobProgress::Pending);
+                }
                 JobProgress::Running => {
                     update.set_progress(control_capnp::JobProgress::Running);
                 }

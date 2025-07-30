@@ -73,6 +73,9 @@ impl ChurtenNotification {
 /// Job progress reported by [ChurtenNotification]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobProgress {
+    /// The job has been created, but not yet started.
+    Pending,
+
     /// The job is running.
     Running,
 
@@ -89,6 +92,19 @@ pub enum JobProgress {
     ///
     /// The string is an error description.
     Failed(String),
+}
+
+impl JobProgress {
+    pub fn is_finished(&self) -> bool {
+        match self {
+            JobProgress::Pending => false,
+            JobProgress::Running => false,
+            JobProgress::Done => true,
+            JobProgress::Abandoned => true,
+            JobProgress::Cancelled => true,
+            JobProgress::Failed(_) => true,
+        }
+    }
 }
 
 /// An specific action taken by a job.
