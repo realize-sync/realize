@@ -29,6 +29,13 @@ This rule enforces best practices for testing in Rust code.
    - Avoid shared mutable state between tests
    - Clean up resources after tests
 
+4. **Test Stability**
+   - Never sleep in tests, it's not reliable as tests can run fast or slow depending
+     on the machine, rather wait for the appropriate event
+
+   To wait for the appropriate event, you might:
+     - wait for some notification to be sent to a channel
+     - poll at regular intervals (and give up after a reasonable delay, like 5 or 10s)
 
 ## Examples
 

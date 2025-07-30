@@ -57,7 +57,120 @@ match reader.which()? {
 }
 ```
 
-### 4. Error Handling Patterns
+### 4. List Handling
+
+#### Creating Lists
+```rust
+// Create a list with a specific size
+let mut list = results.get().init_res(items.len() as u32);
+
+// Fill the list with items
+for (i, item) in items.iter().enumerate() {
+    fill_item(item, list.reborrow().get(i as u32));
+}
+```
+
+#### Reading Lists
+```rust
+// Read a list from a reader
+let list_reader = reader.get_list()?;
+for item_reader in list_reader.iter() {
+    let item = parse_item(item_reader?)?;
+    items.push(item);
+}
+```
+
+### 5. RPC Server Implementation
+
+#### Async RPC Methods
+```rust
+fn my_method(
+    &mut self,
+    _: MyParams,
+    mut results: MyResults,
+) -> Promise<(), capnp::Error> {
+    let storage = Arc::clone(&self.storage);
+    Promise::from_future(async move {
+        // Async work here
+        let data = storage.get_data().await?;
+        
+        // Fill results
+        let mut res = results.get().init_res();
+        res.set_field(data);
+        
+        Ok(())
+    })
+}
+```
+
+#### List Return Types
+```rust
+// For return type: (res: List(ItemType))
+fn recent_items(
+    &mut self,
+    _: RecentItemsParams,
+    mut results: RecentItemsResults,
+) -> Promise<(), capnp::Error> {
+    let items = self.get_items().await;
+    
+    // Create list with correct size
+    let mut item_list = results.get().init_res(items.len() as u32);
+    
+    // Fill each item
+    for (i, item) in items.iter().enumerate() {
+        convert::fill_item(item, item_list.reborrow().get(i as u32));
+    }
+    
+    Promise::ok(())
+}
+```
+
+### 6. Builder Ownership and Reborrow
+
+#### Avoiding Ownership Issues
+```rust
+// Bad: Builder consumed by init_job()
+let mut job_builder = dest.init_job();
+job_builder.set_path(path);
+dest.set_progress(progress); // Error: dest moved
+
+// Good: Use reborrow() to avoid ownership issues
+let mut job_builder = dest.reborrow().init_job();
+job_builder.set_path(path);
+dest.set_progress(progress); // Works: dest still available
+```
+
+#### Complex Nested Structures
+```rust
+pub fn fill_complex_struct(
+    source: &ComplexStruct,
+    mut dest: complex_struct::Builder<'_>,
+) {
+    // Set simple fields
+    dest.set_id(source.id);
+    
+    // Handle nested structures with reborrow()
+    let mut nested = dest.reborrow().init_nested();
+    nested.set_field(source.nested_field);
+    
+    // Handle lists
+    let mut list = dest.reborrow().init_list(source.items.len() as u32);
+    for (i, item) in source.items.iter().enumerate() {
+        fill_item(item, list.reborrow().get(i as u32));
+    }
+    
+    // Handle unions
+    match &source.variant {
+        Variant::A => dest.reborrow().init_variant_a(),
+        Variant::B(data) => {
+            let mut builder = dest.reborrow().init_variant_b();
+            builder.set_data(data);
+        }
+    }
+}
+```
+
+### 7. Error Handling Patterns
 
 #### Result Unwrapping
 ```rust
@@ -81,7 +194,7 @@ if reader.has_field() {
 if reader.has_field()? { // Error: bool doesn't implement Try
 ```
 
-### 5. Type Conversions
+### 8. Type Conversions
 
 #### String Handling
 ```rust
@@ -103,7 +216,7 @@ let array: [u8; 32] = data.try_into()
 builder.set_data(&array);
 ```
 
-### 6. Builder vs Reader Pattern
+### 9. Builder vs Reader Pattern
 
 ```rust
 // Writing (Builder pattern)
@@ -113,9 +226,9 @@ pub fn fill_notification(
 ) {
     dest.set_field(&source.field);
     match &source.variant {
-        Variant::A => dest.init_variant_a(),
+        Variant::A => dest.reborrow().init_variant_a(),
         Variant::B(data) => {
-            let mut builder = dest.init_variant_b();
+            let mut builder = dest.reborrow().init_variant_b();
             builder.set_data(data);
         }
     }
@@ -137,7 +250,7 @@ pub fn parse_notification(
 }
 ```
 
-### 7. Round-trip Testing
+### 10. Round-trip Testing
 
 ```rust
 #[test]
@@ -156,6 +269,25 @@ fn test_round_trip() {
     
     // Compare
     assert_eq!(original, parsed);
+}
+```
+
+### 11. RPC Integration Testing
+
+```rust
+#[tokio::test]
+async fn test_rpc_method() -> anyhow::Result<()> {
+    let fixture = setup_fixture().await?;
+    let client = connect_client(&fixture).await?;
+    
+    // Call RPC method
+    let result = client.my_method_request().send().promise.await?;
+    let response = result.get()?.get_res()?;
+    
+    // Verify response
+    assert_eq!(response.get_field()?, expected_value);
+    
+    Ok(())
 }
 ```
 
@@ -210,6 +342,35 @@ let msg_reader = message.into_reader();
 let reader = msg_reader.get_root::<MyStruct::Reader>().unwrap();
 ```
 
+### 5. List Size Mismatch
+```rust
+// Bad: Creating list with wrong size
+let mut list = results.get().init_res(10); // Fixed size
+for (i, item) in items.iter().enumerate() {
+    if i >= 10 { break; } // Items lost
+    fill_item(item, list.reborrow().get(i as u32));
+}
+
+// Good: Use actual size
+let mut list = results.get().init_res(items.len() as u32);
+for (i, item) in items.iter().enumerate() {
+    fill_item(item, list.reborrow().get(i as u32));
+}
+```
+
+### 6. Forgetting Reborrow in Nested Structures
+```rust
+// Bad: Builder consumed by nested init
+let mut nested = dest.init_nested();
+nested.set_field(value);
+dest.set_other_field(other_value); // Error: dest moved
+
+// Good: Use reborrow for nested structures
+let mut nested = dest.reborrow().init_nested();
+nested.set_field(value);
+dest.set_other_field(other_value); // Works
+```
+
 ## Best Practices
 
 1. **Always bind Result values to variables** before using them multiple times
@@ -219,6 +380,10 @@ let reader = msg_reader.get_root::<MyStruct::Reader>().unwrap();
 5. **Write comprehensive round-trip tests** for all data structures
 6. **Use meaningful error messages** when converting between types
 7. **Document the relationship** between capnp and Rust types
+8. **Use `reborrow()`** when building nested structures to avoid ownership issues
+9. **Create lists with correct size** using `init_res(actual_size)`
+10. **Handle async RPC methods** with `Promise::from_future`
+11. **Test RPC methods** with integration tests that verify the full client-server flow
 
 ## References
 
@@ -228,77 +393,134 @@ let reader = msg_reader.get_root::<MyStruct::Reader>().unwrap();
 
 ## Examples
 
-### Complete Example: Notification Protocol
+### Complete Example: RPC Server with Lists
 
 ```rust
 // Capnp schema (control.capnp)
-struct ChurtenNotification {
+interface Churten {
+    recentJobs @4 () -> (res: List(JobInfo));
+}
+
+struct JobInfo {
     arena @0: Text;
-    jobId @1: UInt64;
-    union {
-        new @2: New;
-        update @3: Update;
-        updateByteCount @4: UpdateByteCount;
-        updateAction @5: UpdateAction;
+    id @1: UInt64;
+    job @2: Job;
+    progress @3: JobProgress;
+    action @4: JobAction;
+    byteProgress @5: ByteProgress;
+}
+
+// Rust RPC server implementation
+impl<H: JobHandler + 'static> churten::Server for ChurtenServer<H> {
+    fn recent_jobs(
+        &mut self,
+        _: RecentJobsParams,
+        mut results: RecentJobsResults,
+    ) -> Promise<(), capnp::Error> {
+        let churten = self.churten.clone();
+        Promise::from_future(async move {
+            let recent_jobs = churten.borrow().recent_jobs().await;
+            
+            // Create list with correct size
+            let mut job_list = results.get().init_res(recent_jobs.len() as u32);
+            
+            // Fill each job info
+            for (i, job_info) in recent_jobs.iter().enumerate() {
+                convert::fill_job_info(job_info, job_list.reborrow().get(i as u32));
+            }
+            
+            Ok(())
+        })
     }
 }
 
-// Rust implementation
-pub fn fill_notification(
-    source: ChurtenNotification,
-    mut dest: churten_notification::Builder<'_>,
+// Conversion function
+pub fn fill_job_info(
+    source: &JobInfo,
+    mut dest: control_capnp::job_info::Builder<'_>,
 ) {
     dest.set_arena(&source.arena.as_str());
-    dest.set_job_id(source.job_id.as_u64());
+    dest.set_id(source.id.as_u64());
     
-    match &source {
-        ChurtenNotification::New { job, .. } => {
-            let mut builder = dest.reborrow().init_new().init_job();
-            builder.set_path(job.path().as_str());
-            builder.set_hash(&job.hash().0);
+    // Handle nested job structure with reborrow()
+    let mut job_builder = dest.reborrow().init_job();
+    job_builder.set_path(source.job.path().as_str());
+    job_builder.set_hash(&source.job.hash().0);
+    
+    match &*source.job {
+        realize_storage::Job::Download(_, _) => {
+            job_builder.init_download();
         }
-        ChurtenNotification::Update { progress, .. } => {
-            let mut update = dest.reborrow().init_update();
-            match progress {
-                JobProgress::Running => update.set_progress(JobProgress::Running),
-                JobProgress::Failed(msg) => {
-                    update.set_progress(JobProgress::Failed);
-                    update.set_message(msg);
-                }
-                // ... other variants
+        realize_storage::Job::Realize(_, _, index_hash) => {
+            let mut realize = job_builder.init_realize();
+            if let Some(h) = index_hash {
+                realize.set_index_hash(&h.0);
             }
         }
-        // ... other variants
+        realize_storage::Job::Unrealize(_, _) => {
+            job_builder.init_unrealize();
+        }
+    }
+    
+    // Handle progress enum
+    match &source.progress {
+        JobProgress::Pending => {
+            dest.set_progress(control_capnp::JobProgress::Pending);
+        }
+        JobProgress::Running => {
+            dest.set_progress(control_capnp::JobProgress::Running);
+        }
+        JobProgress::Done => {
+            dest.set_progress(control_capnp::JobProgress::Done);
+        }
+        JobProgress::Abandoned => {
+            dest.set_progress(control_capnp::JobProgress::Abandoned);
+        }
+        JobProgress::Cancelled => {
+            dest.set_progress(control_capnp::JobProgress::Cancelled);
+        }
+        JobProgress::Failed(_msg) => {
+            dest.set_progress(control_capnp::JobProgress::Failed);
+        }
+    }
+    
+    // Handle optional action
+    match &source.action {
+        Some(JobAction::Download) => dest.set_action(control_capnp::JobAction::Download),
+        Some(JobAction::Verify) => dest.set_action(control_capnp::JobAction::Verify),
+        Some(JobAction::Repair) => dest.set_action(control_capnp::JobAction::Repair),
+        Some(JobAction::Move) => dest.set_action(control_capnp::JobAction::Move),
+        None => dest.set_action(control_capnp::JobAction::None),
+    }
+    
+    // Handle optional byte progress
+    if let Some((current, total)) = source.byte_progress {
+        let mut byte_progress = dest.init_byte_progress();
+        byte_progress.set_current(current);
+        byte_progress.set_total(total);
     }
 }
 
-pub fn parse_notification(
-    reader: churten_notification::Reader<'_>,
-) -> Result<ChurtenNotification, capnp::Error> {
-    let arena = Arena::from(reader.get_arena()?.to_str()?);
-    let job_id = JobId(reader.get_job_id());
+// Integration test
+#[tokio::test]
+async fn test_recent_jobs() -> anyhow::Result<()> {
+    let fixture = setup_fixture().await?;
+    let client = connect_client(&fixture).await?;
     
-    match reader.which()? {
-        churten_notification::Which::New(new_reader_result) => {
-            let new_reader = new_reader_result?;
-            let job_reader = new_reader.get_job()?;
-            // ... parse job
-            Ok(ChurtenNotification::New { arena, job_id, job })
-        }
-        churten_notification::Which::Update(update_reader_result) => {
-            let update_reader = update_reader_result?;
-            let progress = match update_reader.get_progress()? {
-                capnp::JobProgress::Running => JobProgress::Running,
-                capnp::JobProgress::Failed => {
-                    let message = update_reader.get_message()?.to_str()?.to_string();
-                    JobProgress::Failed(message)
-                }
-                // ... other variants
-            };
-            Ok(ChurtenNotification::Update { arena, job_id, progress })
-        }
-        // ... other variants
-    }
+    // Create some jobs
+    create_test_jobs(&fixture).await?;
+    
+    // Call RPC method
+    let result = client.recent_jobs_request().send().promise.await?;
+    let jobs = result.get()?.get_res()?;
+    
+    // Verify response
+    assert!(jobs.len() > 0);
+    let job = jobs.get(0);
+    assert_eq!(job.get_arena()?, "test-arena");
+    assert_eq!(job.get_id(), 1);
+    
+    Ok(())
 }
 ```
 
