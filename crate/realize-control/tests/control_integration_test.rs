@@ -2,6 +2,7 @@ use assert_fs::TempDir;
 use assert_fs::prelude::*;
 use realize_core::config::Config;
 use realize_core::setup::SetupHelper;
+use realize_storage::Mark;
 use realize_storage::config::{ArenaConfig, CacheConfig};
 use realize_types::{Arena, Peer};
 use std::path::PathBuf;
@@ -24,7 +25,7 @@ fn command_path(cmd: &str) -> PathBuf {
 struct Fixture {
     _tempdir: TempDir,
     socket: PathBuf,
-    _setup: SetupHelper,
+    setup: SetupHelper,
 }
 
 impl Fixture {
@@ -74,7 +75,7 @@ impl Fixture {
         Ok(Self {
             _tempdir: tempdir,
             socket,
-            _setup: setup,
+            setup,
         })
     }
 
@@ -144,6 +145,211 @@ async fn churten_is_running_quiet() -> anyhow::Result<()> {
             assert!(
                 output_str.is_empty(),
                 "Expected empty output in quiet mode, got '{}'",
+                output_str
+            );
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn churten_mark_set_arena() -> anyhow::Result<()> {
+    let local = LocalSet::new();
+    let fixture = Fixture::setup(&local).await?;
+
+    local
+        .run_until(async move {
+            // Test setting arena mark
+            let output = fixture
+                .control_command(&["churten", "mark", "set", "keep", "myarena"])?
+                .output()
+                .await?;
+
+            assert!(
+                output.status.success(),
+                "Control command failed: {output:?}"
+            );
+
+            let output_str = String::from_utf8(output.stdout)?;
+            assert!(
+                output_str.contains("Arena mark set successfully"),
+                "Expected success message, got '{}'",
+                output_str
+            );
+
+            assert_eq!(
+                Mark::Keep,
+                fixture
+                    .setup
+                    .storage
+                    .get_mark(Arena::from("myarena"), &realize_types::Path::parse("any")?)
+                    .await?
+            );
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn churten_mark_set_paths() -> anyhow::Result<()> {
+    let local = LocalSet::new();
+    let fixture = Fixture::setup(&local).await?;
+
+    local
+        .run_until(async move {
+            // Test setting marks on specific paths
+            let output = fixture
+                .control_command(&[
+                    "churten",
+                    "mark",
+                    "set",
+                    "own",
+                    "myarena",
+                    "file1.txt",
+                    "file2.txt",
+                ])?
+                .output()
+                .await?;
+
+            assert!(
+                output.status.success(),
+                "Control command failed: {output:?}"
+            );
+
+            let output_str = String::from_utf8(output.stdout)?;
+            assert!(
+                output_str.contains("Marks set successfully on 2 paths"),
+                "Expected success message, got '{}'",
+                output_str
+            );
+
+            let arena = Arena::from("myarena");
+            let storage = &fixture.setup.storage;
+            assert_eq!(
+                Mark::Own,
+                storage
+                    .get_mark(arena, &realize_types::Path::parse("file1.txt")?)
+                    .await?
+            );
+            assert_eq!(
+                Mark::Own,
+                storage
+                    .get_mark(arena, &realize_types::Path::parse("file2.txt")?)
+                    .await?
+            );
+            // file3.txt wasn't set. It still has the default (watch)
+            assert_eq!(
+                Mark::Watch,
+                storage
+                    .get_mark(arena, &realize_types::Path::parse("file3.txt")?)
+                    .await?
+            );
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn churten_mark_get() -> anyhow::Result<()> {
+    let local = LocalSet::new();
+    let fixture = Fixture::setup(&local).await?;
+
+    local
+        .run_until(async move {
+            let arena = Arena::from("myarena");
+            let storage = &fixture.setup.storage;
+            storage
+                .set_mark(arena, &realize_types::Path::parse("file1.txt")?, Mark::Keep)
+                .await?;
+            storage
+                .set_mark(arena, &realize_types::Path::parse("file2.txt")?, Mark::Own)
+                .await?;
+
+            let output = fixture
+                .control_command(&[
+                    "churten",
+                    "mark",
+                    "get",
+                    "myarena",
+                    "file1.txt",
+                    "file2.txt",
+                    "file3.txt",
+                ])?
+                .output()
+                .await?;
+
+            assert!(
+                output.status.success(),
+                "Control command failed: {output:?}"
+            );
+
+            let output_str = String::from_utf8(output.stdout)?;
+            assert_eq!(
+                "file1.txt: keep\nfile2.txt: own\nfile3.txt: watch\n",
+                output_str
+            );
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn churten_mark_get_multiple_paths() -> anyhow::Result<()> {
+    let local = LocalSet::new();
+    let fixture = Fixture::setup(&local).await?;
+
+    local
+        .run_until(async move {
+            // First set marks on multiple files
+            let set_output = fixture
+                .control_command(&[
+                    "churten",
+                    "mark",
+                    "set",
+                    "keep",
+                    "myarena",
+                    "file1.txt",
+                    "file2.txt",
+                ])?
+                .output()
+                .await?;
+            assert!(set_output.status.success());
+
+            // Then get marks for multiple files
+            let output = fixture
+                .control_command(&[
+                    "churten",
+                    "mark",
+                    "get",
+                    "myarena",
+                    "file1.txt",
+                    "file2.txt",
+                ])?
+                .output()
+                .await?;
+
+            assert!(
+                output.status.success(),
+                "Control command failed: {output:?}"
+            );
+
+            let output_str = String::from_utf8(output.stdout)?;
+            assert!(
+                output_str.contains("file1.txt: keep"),
+                "Expected file1 mark, got '{}'",
+                output_str
+            );
+            assert!(
+                output_str.contains("file2.txt: keep"),
+                "Expected file2 mark, got '{}'",
                 output_str
             );
 

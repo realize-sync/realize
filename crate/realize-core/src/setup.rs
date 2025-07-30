@@ -20,9 +20,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub struct SetupHelper {
-    networking: Networking,
-    storage: Arc<Storage>,
-    household: Household,
+    pub networking: Networking,
+    pub storage: Arc<Storage>,
+    pub household: Household,
 }
 
 impl SetupHelper {

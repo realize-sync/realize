@@ -43,6 +43,39 @@ enum ChurtenCommands {
     },
     /// Run churten and print notifications
     Run,
+    /// Mark-related commands
+    Mark {
+        #[command(subcommand)]
+        command: MarkCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MarkCommands {
+    /// Set marks on paths or arena
+    Set {
+        /// The mark to set (watch, keep, own)
+        #[arg(value_enum)]
+        mark: MarkValue,
+        /// The arena name
+        arena: String,
+        /// Paths to mark (optional - if not provided, sets arena mark)
+        paths: Vec<String>,
+    },
+    /// Get marks for paths
+    Get {
+        /// The arena name
+        arena: String,
+        /// Paths to get marks for
+        paths: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, clap::ValueEnum)]
+enum MarkValue {
+    Watch,
+    Keep,
+    Own,
 }
 
 /// Get the default socket path by checking for the first existing socket
@@ -227,6 +260,88 @@ async fn run_churten(
     Ok(())
 }
 
+/// Execute the mark set command
+async fn execute_mark_set(
+    socket_path: &PathBuf,
+    mark: &MarkValue,
+    arena: &str,
+    paths: &[String],
+) -> Result<()> {
+    let local = LocalSet::new();
+    local
+        .run_until(async move {
+            let control = unixsocket::connect::<
+                realize_core::rpc::control::control_capnp::control::Client,
+            >(socket_path)
+            .await?;
+
+            let mark_value = match mark {
+                MarkValue::Watch => control_capnp::Mark::Watch,
+                MarkValue::Keep => control_capnp::Mark::Keep,
+                MarkValue::Own => control_capnp::Mark::Own,
+            };
+
+            if paths.is_empty() {
+                // Set arena mark
+                let mut request = control.set_arena_mark_request();
+                let mut req = request.get().init_req();
+                req.set_arena(arena);
+                req.set_mark(mark_value);
+                request.send().promise.await?;
+                println!("Arena mark set successfully");
+            } else {
+                // Set marks on individual paths
+                for path in paths {
+                    let mut request = control.set_mark_request();
+                    let mut req = request.get().init_req();
+                    req.set_arena(arena);
+                    req.set_path(path);
+                    req.set_mark(mark_value);
+                    request.send().promise.await?;
+                }
+                println!("Marks set successfully on {} paths", paths.len());
+            }
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    Ok(())
+}
+
+/// Execute the mark get command
+async fn execute_mark_get(socket_path: &PathBuf, arena: &str, paths: &[String]) -> Result<()> {
+    let local = LocalSet::new();
+    local
+        .run_until(async move {
+            let control = unixsocket::connect::<
+                realize_core::rpc::control::control_capnp::control::Client,
+            >(socket_path)
+            .await?;
+
+            for path in paths {
+                let mut request = control.get_mark_request();
+                let mut req = request.get().init_req();
+                req.set_arena(arena);
+                req.set_path(path);
+                let result = request.send().promise.await?;
+                let mark = result.get()?.get_res()?.get_mark();
+
+                let mark_str = match mark {
+                    Ok(control_capnp::Mark::Watch) => "watch",
+                    Ok(control_capnp::Mark::Keep) => "keep",
+                    Ok(control_capnp::Mark::Own) => "own",
+                    Err(_) => "unknown",
+                };
+
+                println!("{}: {}", path, mark_str);
+            }
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -251,6 +366,14 @@ async fn main() -> Result<()> {
             ChurtenCommands::Run => {
                 execute_churten_run(&socket_path).await?;
             }
+            ChurtenCommands::Mark { command } => match command {
+                MarkCommands::Set { mark, arena, paths } => {
+                    execute_mark_set(&socket_path, &mark, &arena, &paths).await?;
+                }
+                MarkCommands::Get { arena, paths } => {
+                    execute_mark_get(&socket_path, &arena, &paths).await?;
+                }
+            },
         },
     }
 
