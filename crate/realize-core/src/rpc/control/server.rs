@@ -208,20 +208,21 @@ fn mark_to_capnp(mark: Mark) -> control_capnp::Mark {
 
 fn fill_notification(source: ChurtenNotification, mut dest: churten_notification::Builder<'_>) {
     let arena = source.arena();
-    let job = source.job();
+    let job_id = source.job_id();
 
     dest.set_arena(&arena.as_str());
-    // Set job fields using reborrow
-    let mut job_builder = dest.reborrow().init_job();
-    job_builder.set_path(job.path().as_str());
-    let mut download = job_builder.init_download();
-    download.set_hash(match &**job {
-        realize_storage::Job::Download(_, _, hash) => &hash.0,
-        realize_storage::Job::Realize(_, _, hash, _) => &hash.0,
-        realize_storage::Job::Unrealize(_, _, hash) => &hash.0,
-    });
-    // Set notification type
+    dest.set_job_id(job_id.as_u64());
     match &source {
+        ChurtenNotification::New { job, .. } => {
+            let mut builder = dest.reborrow().init_new().init_job();
+            builder.set_path(job.path().as_str());
+            builder.set_hash(&job.hash().0);
+            builder.set_type(match &**job {
+                realize_storage::Job::Download(_, _) => control_capnp::JobType::Download,
+                realize_storage::Job::Realize(_, _, _) => control_capnp::JobType::Realize,
+                realize_storage::Job::Unrealize(_, _) => control_capnp::JobType::Unrealize,
+            });
+        }
         ChurtenNotification::Update { progress, .. } => {
             let mut update = dest.reborrow().init_update();
             match progress {
@@ -276,7 +277,7 @@ mod tests {
     use crate::rpc::testing::HouseholdFixture;
     use assert_fs::TempDir;
     use realize_network::unixsocket;
-    use realize_storage::{JobStatus, Mark, Notification};
+    use realize_storage::{JobId, JobStatus, Mark, Notification};
     use realize_types::{Peer, UnixTime};
     use tarpc::tokio_util::sync::CancellationToken;
     use tokio::sync::broadcast;
@@ -323,7 +324,8 @@ mod tests {
         async fn run(
             &self,
             arena: Arena,
-            job: &Arc<realize_storage::Job>,
+            job_id: JobId,
+            _job: &Arc<realize_storage::Job>,
             tx: broadcast::Sender<ChurtenNotification>,
             shutdown: CancellationToken,
         ) -> anyhow::Result<JobStatus> {
@@ -342,14 +344,14 @@ mod tests {
             if self.should_send_progress {
                 let _ = tx.send(ChurtenNotification::UpdateByteCount {
                     arena,
-                    job: Arc::clone(job),
+                    job_id,
                     current_bytes: 50,
                     total_bytes: 100,
                 });
                 tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
                 let _ = tx.send(ChurtenNotification::UpdateByteCount {
                     arena,
-                    job: Arc::clone(job),
+                    job_id,
                     current_bytes: 100,
                     total_bytes: 100,
                 });
@@ -587,16 +589,15 @@ mod tests {
                     )
                     .await?;
 
-                // Verify the first notification is Pending
+                // Verify the first notification is New
                 let first = tokio::time::timeout(Duration::from_secs(3), rx.recv())
                     .await?
                     .unwrap();
                 let notification = first.get()?.get_notification()?;
                 assert_eq!(notification.get_arena()?, arena.as_str());
-                assert_eq!(notification.get_job()?.get_path()?, "foo");
                 assert!(matches!(
                     notification.which(),
-                    Ok(control_capnp::churten_notification::Update(_))
+                    Ok(control_capnp::churten_notification::New(_))
                 ));
 
                 // Verify the second notification is Running

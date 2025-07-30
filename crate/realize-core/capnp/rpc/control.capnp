@@ -51,14 +51,19 @@ interface Churten {
 
 struct ChurtenNotification {
   arena @0: Text;
-  job @1: Job;
+  jobId @1: UInt64;
 
   union {
-    update @2: Update;
-    updateByteCount @3: UpdateByteCount;
-    updateAction @4: UpdateAction;
+    new @2: New;
+    update @3: Update;
+    updateByteCount @4: UpdateByteCount;
+    updateAction @5: UpdateAction;
   }
 
+  struct New {
+    job @0: Job;
+  }
+  
   struct Update {
     progress @0: JobProgress;
 
@@ -77,17 +82,15 @@ struct ChurtenNotification {
 }
 
 struct Job {
-  path @0: Text;
-  # counter intentionally left out
+  type @0: JobType;
+  path @1: Text;
+  hash @2: Data;
+}
 
-  # Once there is more than one job type:
-  # union {
-    download @1: Download;
-  # }
-
-  struct Download {
-    hash @0: Data;
-  }
+enum JobType {
+  download @0;
+  realize @1;
+  unrealize @2;
 }
 
 enum JobProgress {

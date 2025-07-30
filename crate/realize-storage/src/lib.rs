@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::{self, JoinHandle};
-use tokio_stream::StreamMap;
+use tokio_stream::{StreamExt, StreamMap};
 use utils::redb_utils;
 
 mod arena;
@@ -22,7 +22,7 @@ mod types;
 pub mod utils;
 
 pub use arena::blob::{Blob, BlobIncomplete};
-pub use arena::engine::{Job, JobStatus, JobUpdate};
+pub use arena::engine::{Job, JobStatus};
 pub use arena::indexed_store::Reader;
 pub use arena::notifier::Notification;
 pub use arena::notifier::Progress;
@@ -239,11 +239,12 @@ impl Storage {
     ///
     /// Multiple streams will return the same results, even in the
     /// same process, as long as no job is marked done or failed.
-    pub fn job_stream(&self) -> impl Stream<Item = (Arena, Job)> {
+    pub fn job_stream(&self) -> impl Stream<Item = (Arena, JobId, Job)> {
         self.arena_storage
             .iter()
             .map(|(arena, storage)| (*arena, Box::pin(storage.engine.job_stream())))
             .collect::<StreamMap<Arena, _>>()
+            .map(|(arena, (job_id, job))| (arena, job_id, job))
     }
 
     /// Report the result of processing a job returned by the job stream.
@@ -253,10 +254,10 @@ impl Storage {
     pub fn job_finished(
         &self,
         arena: Arena,
-        job: &Job,
+        job_id: JobId,
         status: anyhow::Result<JobStatus>,
     ) -> Result<(), StorageError> {
-        self.engine(arena)?.job_finished(job, status)
+        self.engine(arena)?.job_finished(job_id, status)
     }
 
     /// Check whether the given job is still relevant.
@@ -271,8 +272,12 @@ impl Storage {
     /// - If the job is no longer necessary, either because it is done
     ///   or because the cache or index state changed, returns
     ///   [JobUpdate::Outdated].
-    pub async fn check_job(&self, arena: Arena, job: &Job) -> Result<JobUpdate, StorageError> {
-        self.engine(arena)?.check_job(job).await
+    pub async fn job_for_path(
+        &self,
+        arena: Arena,
+        path: &Path,
+    ) -> Result<Option<(JobId, Job)>, StorageError> {
+        self.engine(arena)?.job_for_path(path).await
     }
 
     /// Return the engine for an arena.
