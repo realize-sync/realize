@@ -96,50 +96,54 @@ fn resolve_socket_path(socket_arg: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     let cli = Cli::parse();
-    logging::init_with_info_modules(vec!["realize_control"]);
+    logging::init(log::LevelFilter::Off);
 
+    let status = match execute(cli).await {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("{err:#}");
+
+            1
+        }
+    };
+    std::process::exit(status);
+}
+
+async fn execute(cli: Cli) -> anyhow::Result<i32> {
     // Resolve socket path
     let socket_path = resolve_socket_path(cli.socket)?;
     log::debug!("Connecting to {socket_path:?}");
 
     let local = LocalSet::new();
-    local
+    let status = local
         .run_until(async move {
             let control = client::connect(&socket_path).await?;
 
             // Execute the appropriate command
             match cli.command {
                 Commands::Churten { command } => match command {
-                    ChurtenCommands::Start => {
-                        churten_cmd::execute_churten_start(&control).await?;
-                    }
-                    ChurtenCommands::Stop => {
-                        churten_cmd::execute_churten_stop(&control).await?;
-                    }
+                    ChurtenCommands::Start => churten_cmd::execute_churten_start(&control).await,
+                    ChurtenCommands::Stop => churten_cmd::execute_churten_stop(&control).await,
                     ChurtenCommands::IsRunning { quiet } => {
-                        churten_cmd::execute_churten_is_running(&control, quiet).await?;
+                        churten_cmd::execute_churten_is_running(&control, quiet).await
                     }
-                    ChurtenCommands::Run => {
-                        churten_cmd::execute_churten_run(&control).await?;
-                    }
+                    ChurtenCommands::Run => churten_cmd::execute_churten_run(&control).await,
                 },
 
                 Commands::Mark { command } => match command {
                     MarkCommands::Set { mark, arena, paths } => {
-                        mark_cmd::execute_mark_set(&control, &mark, &arena, &paths).await?;
+                        mark_cmd::execute_mark_set(&control, &mark, &arena, &paths).await
                     }
 
                     MarkCommands::Get { arena, paths } => {
-                        mark_cmd::execute_mark_get(&control, &arena, &paths).await?;
+                        mark_cmd::execute_mark_get(&control, &arena, &paths).await
                     }
                 },
             }
-
-            Ok::<(), anyhow::Error>(())
         })
         .await?;
 
-    Ok(())
+    Ok(status)
 }
