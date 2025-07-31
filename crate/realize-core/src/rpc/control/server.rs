@@ -244,20 +244,20 @@ fn mark_to_capnp(mark: Mark) -> control_capnp::Mark {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use std::time::Duration;
-
     use super::*;
-    use crate::consensus::churten::{JobHandler, JobHandlerImpl};
+    use crate::consensus::churten::{JobHandler, JobHandlerImpl, TxByteCountProgress};
+    use crate::consensus::progress::ByteCountProgress;
     use crate::consensus::types::ChurtenNotification;
     use crate::rpc::control::client::TxChurtenSubscriber;
     use crate::rpc::testing::HouseholdFixture;
     use assert_fs::TempDir;
     use realize_network::unixsocket;
-    use realize_storage::{JobId, JobStatus, Mark, Notification};
+    use realize_storage::{JobStatus, Mark, Notification};
     use realize_types::{Peer, UnixTime};
+    use std::path::PathBuf;
+    use std::time::Duration;
     use tarpc::tokio_util::sync::CancellationToken;
-    use tokio::sync::{broadcast, mpsc};
+    use tokio::sync::mpsc;
     use tokio::task::LocalSet;
 
     struct Fixture {
@@ -271,7 +271,6 @@ mod tests {
     struct FakeJobHandler {
         result_fn: Arc<dyn Fn() -> anyhow::Result<JobStatus> + Send + Sync>,
         should_send_progress: bool,
-        should_cancel: bool,
     }
 
     impl FakeJobHandler {
@@ -282,7 +281,6 @@ mod tests {
             Self {
                 result_fn: Arc::new(result_fn),
                 should_send_progress: false,
-                should_cancel: false,
             }
         }
 
@@ -290,44 +288,24 @@ mod tests {
             self.should_send_progress = should_send;
             self
         }
-
-        fn with_cancel(mut self, should_cancel: bool) -> Self {
-            self.should_cancel = should_cancel;
-            self
-        }
     }
 
     impl JobHandler for FakeJobHandler {
         async fn run(
             &self,
-            arena: Arena,
-            job_id: JobId,
+            _arena: Arena,
             _job: &Arc<realize_storage::Job>,
-            tx: broadcast::Sender<ChurtenNotification>,
+            progress: &mut TxByteCountProgress,
             shutdown: CancellationToken,
         ) -> anyhow::Result<JobStatus> {
-            if self.should_cancel {
-                shutdown.cancel();
-            }
             if shutdown.is_cancelled() {
-                shutdown.cancel();
                 anyhow::bail!("cancelled");
             }
 
             // Send progress updates if requested
             if self.should_send_progress {
-                let _ = tx.send(ChurtenNotification::UpdateByteCount {
-                    arena,
-                    job_id,
-                    current_bytes: 50,
-                    total_bytes: 100,
-                });
-                let _ = tx.send(ChurtenNotification::UpdateByteCount {
-                    arena,
-                    job_id,
-                    current_bytes: 100,
-                    total_bytes: 100,
-                });
+                progress.update(50, 100);
+                progress.update(100, 100);
             }
 
             // Return the configured result

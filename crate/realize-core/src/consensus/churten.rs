@@ -13,6 +13,12 @@ use tarpc::tokio_util::sync::CancellationToken;
 use tokio::sync::RwLock;
 use tokio::{sync::broadcast, task::JoinHandle};
 
+/// Capacity of the broadcast channel.
+///
+/// Used by [TxByteCountProgress] to scale down the number of bytes
+/// notifications.
+const BROADCAST_CHANNEL_CAPACITY: usize = 128;
+
 /// A type that processes jobs and returns the result for [Churten].
 ///
 /// Outside of tests, this is normally [JobHandlerImpl].
@@ -20,9 +26,8 @@ pub(crate) trait JobHandler: Sync + Send + Clone {
     fn run(
         &self,
         arena: Arena,
-        job_id: JobId,
         job: &Arc<Job>,
-        tx: broadcast::Sender<ChurtenNotification>,
+        progress: &mut TxByteCountProgress,
         shutdown: CancellationToken,
     ) -> impl Future<Output = anyhow::Result<JobStatus>> + Sync + Send;
 }
@@ -51,7 +56,7 @@ impl Churten<JobHandlerImpl> {
 
 impl<H: JobHandler + 'static> Churten<H> {
     pub(crate) fn with_handler(storage: Arc<Storage>, handler: H) -> Self {
-        let (tx, mut rx) = broadcast::channel(256);
+        let (tx, mut rx) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
 
         let tracker = Arc::new(RwLock::new(JobInfoTracker::new(16)));
         tokio::spawn({
@@ -201,7 +206,12 @@ async fn run_job<H: JobHandler>(
         job_id,
         progress: JobProgress::Running,
     });
-    let result = handler.run(arena, job_id, &job, tx.clone(), shutdown).await;
+    let mut progress = TxByteCountProgress {
+        tx: tx.clone(),
+        arena,
+        job_id,
+    };
+    let result = handler.run(arena, &job, &mut progress, shutdown).await;
 
     (arena, job_id, result)
 }
@@ -223,12 +233,10 @@ impl JobHandler for JobHandlerImpl {
     async fn run(
         &self,
         arena: Arena,
-        job_id: JobId,
         job: &Arc<Job>,
-        tx: broadcast::Sender<ChurtenNotification>,
+        progress: &mut TxByteCountProgress,
         shutdown: CancellationToken,
     ) -> anyhow::Result<JobStatus> {
-        let mut progress = TxByteCountProgress { tx, arena, job_id };
         match &**job {
             Job::Download(path, hash) => {
                 jobs::download(
@@ -237,7 +245,7 @@ impl JobHandler for JobHandlerImpl {
                     arena,
                     path,
                     hash,
-                    &mut progress,
+                    progress,
                     shutdown,
                 )
                 .await
@@ -250,19 +258,19 @@ impl JobHandler for JobHandlerImpl {
                     path,
                     hash,
                     index_hash.as_ref(),
-                    &mut progress,
+                    progress,
                     shutdown,
                 )
                 .await
             }
             Job::Unrealize(path, hash) => {
-                jobs::unrealize(&self.storage, arena, path, hash, &mut progress).await
+                jobs::unrealize(&self.storage, arena, path, hash, progress).await
             }
         }
     }
 }
 
-struct TxByteCountProgress {
+pub(crate) struct TxByteCountProgress {
     tx: broadcast::Sender<ChurtenNotification>,
     arena: Arena,
     job_id: JobId,
@@ -447,10 +455,9 @@ mod tests {
     impl JobHandler for FakeJobHandler {
         async fn run(
             &self,
-            arena: Arena,
-            job_id: JobId,
+            _arena: Arena,
             _job: &Arc<Job>,
-            tx: broadcast::Sender<ChurtenNotification>,
+            progress: &mut TxByteCountProgress,
             shutdown: CancellationToken,
         ) -> anyhow::Result<JobStatus> {
             // Simulate some work time
@@ -466,19 +473,8 @@ mod tests {
 
             // Send progress updates if requested
             if self.should_send_progress {
-                let _ = tx.send(ChurtenNotification::UpdateByteCount {
-                    arena,
-                    job_id,
-                    current_bytes: 50,
-                    total_bytes: 100,
-                });
-                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
-                let _ = tx.send(ChurtenNotification::UpdateByteCount {
-                    arena,
-                    job_id,
-                    current_bytes: 100,
-                    total_bytes: 100,
-                });
+                progress.update(50, 100);
+                progress.update(100, 100);
             }
 
             // Return the configured result
