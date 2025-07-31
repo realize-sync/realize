@@ -203,15 +203,7 @@ async fn churten_mark_set_paths() -> anyhow::Result<()> {
         .run_until(async move {
             // Test setting marks on specific paths
             let output = fixture
-                .control_command(&[
-                    "churten",
-                    "mark",
-                    "set",
-                    "own",
-                    "myarena",
-                    "file1.txt",
-                    "file2.txt",
-                ])?
+                .control_command(&["mark", "set", "own", "myarena", "file1.txt", "file2.txt"])?
                 .output()
                 .await?;
 
@@ -273,7 +265,6 @@ async fn churten_mark_get() -> anyhow::Result<()> {
 
             let output = fixture
                 .control_command(&[
-                    "churten",
                     "mark",
                     "get",
                     "myarena",
@@ -310,29 +301,14 @@ async fn churten_mark_get_multiple_paths() -> anyhow::Result<()> {
         .run_until(async move {
             // First set marks on multiple files
             let set_output = fixture
-                .control_command(&[
-                    "churten",
-                    "mark",
-                    "set",
-                    "keep",
-                    "myarena",
-                    "file1.txt",
-                    "file2.txt",
-                ])?
+                .control_command(&["mark", "set", "keep", "myarena", "file1.txt", "file2.txt"])?
                 .output()
                 .await?;
             assert!(set_output.status.success());
 
             // Then get marks for multiple files
             let output = fixture
-                .control_command(&[
-                    "churten",
-                    "mark",
-                    "get",
-                    "myarena",
-                    "file1.txt",
-                    "file2.txt",
-                ])?
+                .control_command(&["mark", "get", "myarena", "file1.txt", "file2.txt"])?
                 .output()
                 .await?;
 
