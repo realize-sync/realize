@@ -5,7 +5,6 @@ use realize_core::rpc::control::control_capnp;
 use realize_core::utils::logging;
 use std::path::PathBuf;
 use tokio::task::LocalSet;
-use tokio_util::sync::CancellationToken;
 
 /// Command-line tool for controlling a running instance of realize-daemon
 #[derive(Parser, Debug)]
@@ -156,13 +155,10 @@ async fn execute_churten_run(control: &control_capnp::control::Client) -> Result
 async fn run_churten(
     churten: &realize_core::rpc::control::control_capnp::churten::Client,
 ) -> Result<(), anyhow::Error> {
-    let (jobs, mut rx) = client::track_churten(churten).await?;
-    for job in jobs {
-        println!("{job:?}")
-    }
+    let mut rx = client::subscribe_to_churten(churten).await?;
 
-    while let Some(notification) = rx.recv().await {
-        println!("RECV: {notification:?}");
+    while let Some(update) = rx.recv().await {
+        println!("RECV: {update:?}");
     }
     println!("Done rx.closed: {}", rx.is_closed());
 

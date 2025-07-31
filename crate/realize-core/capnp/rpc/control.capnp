@@ -47,6 +47,14 @@ interface Churten {
 
   interface Subscriber {
     notify @0 (notification: ChurtenNotification) -> stream;
+
+    # Provide a list of active jobs as catchup and as a
+    # way to reset the stream when the channel is full.
+    #
+    # Whenever sent, this should overwrite the state
+    # built from previous notifications. Jobs not reported
+    # should be considered finished (with unknown result).
+    reset @1 (jobs: List(JobInfo)) -> stream;
   }
 }
 
@@ -64,7 +72,7 @@ struct ChurtenNotification {
   struct New {
     job @0: Job;
   }
-  
+
   struct Update {
     progress @0: JobProgress;
   }

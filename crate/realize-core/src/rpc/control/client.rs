@@ -4,7 +4,10 @@ use realize_network::unixsocket;
 use tokio::sync::mpsc;
 
 use super::{
-    control_capnp,
+    control_capnp::{
+        self,
+        churten::subscriber::{NotifyParams, ResetParams},
+    },
     convert::{self, parse_job_info},
 };
 
@@ -29,15 +32,10 @@ pub async fn get_churten(
         .get_churten()
 }
 
-/// Track what happens with churten, starting with a set of recent jobs, and
-/// gettings notifications.
-///
-/// A [crate::consensus::tracker::JobInfoTracker] can be useful to
-/// keep the list of jobs up-to-date using the notifications, if
-/// necessary.
-pub async fn track_churten(
+/// Subscribe to churten and get a stream of [ChurtenUpdates].
+pub async fn subscribe_to_churten(
     churten: &control_capnp::churten::Client,
-) -> Result<(Vec<JobInfo>, mpsc::Receiver<ChurtenNotification>), capnp::Error> {
+) -> Result<mpsc::Receiver<ChurtenUpdates>, capnp::Error> {
     let (tx, rx) = mpsc::channel(10);
     let mut request = churten.subscribe_request();
     request
@@ -45,24 +43,35 @@ pub async fn track_churten(
         .set_subscriber(TxChurtenSubscriber::new(tx).as_client());
     request.send().promise.await?;
 
-    let recent_jobs_result = churten.recent_jobs_request().send().promise.await?;
-    let job_list = recent_jobs_result.get()?.get_res()?;
-    let mut jobs = Vec::with_capacity(job_list.len() as usize);
-    for i in 0..job_list.len() {
-        jobs.push(parse_job_info(job_list.get(i))?);
-    }
-
-    Ok((jobs, rx))
+    Ok(rx)
 }
 
-/// A Churten subscriber server that forwards notifications to a
+/// Updates to churten, running in another process.
+#[derive(Clone, PartialEq, Debug)]
+pub enum ChurtenUpdates {
+    /// Report the of active jobs.
+    ///
+    /// This is the first update sent for every subscriber. Afterwards, [ChurtenNotification]s are
+    /// sent as long as the channel isn't backlogged.
+    ///
+    /// If the channel is full, the process drops notification and send a reset containing all
+    /// the currently active jobs. Jobs not on the new list should be considered finished with an unknown status.
+    Reset(Vec<JobInfo>),
+
+    /// Change to apply to the set of active jobs.
+    ///
+    /// [crate::consensus::tracker::JobInfoTracker] might help.
+    Notify(ChurtenNotification),
+}
+
+/// A Churten subscriber server that forwards Subscriber calls to a
 /// channel.
 pub struct TxChurtenSubscriber {
-    tx: mpsc::Sender<ChurtenNotification>,
+    tx: mpsc::Sender<ChurtenUpdates>,
 }
 
 impl TxChurtenSubscriber {
-    pub fn new(tx: mpsc::Sender<ChurtenNotification>) -> Self {
+    pub fn new(tx: mpsc::Sender<ChurtenUpdates>) -> Self {
         Self { tx }
     }
 
@@ -72,16 +81,30 @@ impl TxChurtenSubscriber {
 }
 
 impl control_capnp::churten::subscriber::Server for TxChurtenSubscriber {
-    fn notify(
-        &mut self,
-        params: control_capnp::churten::subscriber::NotifyParams,
-    ) -> Promise<(), capnp::Error> {
+    fn reset(&mut self, params: ResetParams) -> Promise<(), capnp::Error> {
+        let tx = self.tx.clone();
+        Promise::from_future(async move {
+            let job_list = params.get().and_then(|p| p.get_jobs())?;
+            let mut job_vec = Vec::with_capacity(job_list.len() as usize);
+            for i in 0..job_list.len() {
+                job_vec.push(parse_job_info(job_list.get(i as u32))?);
+            }
+            tx.send(ChurtenUpdates::Reset(job_vec))
+                .await
+                .map_err(channel_closed)?;
+
+            Ok(())
+        })
+    }
+
+    fn notify(&mut self, params: NotifyParams) -> Promise<(), capnp::Error> {
         let tx = self.tx.clone();
         Promise::from_future(async move {
             let reader = params.get().and_then(|p| p.get_notification())?;
             let n = convert::parse_notification(reader)?;
-            println!("// {n:?}");
-            tx.send(n).await.map_err(channel_closed)?;
+            tx.send(ChurtenUpdates::Notify(n))
+                .await
+                .map_err(channel_closed)?;
 
             Ok(())
         })

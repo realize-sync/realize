@@ -2267,7 +2267,6 @@ dependencies = [
  "realize-types",
  "scopeguard",
  "tokio",
- "tokio-util",
 ]
 
 [[package]]
