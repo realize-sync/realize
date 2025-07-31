@@ -12,21 +12,21 @@ use std::{
 /// This structure is a snapshot of [ChurtenNotification]s for a given
 /// job, built by the [JobInfoTracker]
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct JobInfo {
-    pub(crate) arena: Arena,
-    pub(crate) id: JobId,
-    pub(crate) job: Arc<Job>,
-    pub(crate) progress: JobProgress,
+pub struct JobInfo {
+    pub arena: Arena,
+    pub id: JobId,
+    pub job: Arc<Job>,
+    pub progress: JobProgress,
 
     /// current action, if any
-    pub(crate) action: Option<JobAction>,
+    pub action: Option<JobAction>,
 
     /// current / total
-    pub(crate) byte_progress: Option<(u64, u64)>,
+    pub byte_progress: Option<(u64, u64)>,
 }
 
 /// Keep limited historical information about jobs.
-pub(crate) struct JobInfoTracker {
+pub struct JobInfoTracker {
     /// Maximum desired number of jobs that should be kept by this
     /// tracker.
     ///
@@ -80,6 +80,24 @@ impl JobInfoTracker {
     /// Iterate over all finished [JobInfo]s.
     pub fn finished(&self) -> impl Iterator<Item = &JobInfo> {
         self.finished.iter()
+    }
+
+    /// Fill tracker with some existing JobInfo.
+    ///
+    /// This is useful to start tracking notifications after getting a
+    /// list of remote jobs.
+    pub fn backfill<T>(&mut self, jobs: T)
+    where
+        T: IntoIterator<Item = JobInfo>,
+    {
+        for job in jobs.into_iter() {
+            if job.progress.is_finished() {
+                self.finished.push_back(job)
+            } else {
+                let id = (job.arena, job.id);
+                self.active.insert(id, job);
+            }
+        }
     }
 
     /// Update jobs inside this tracker.

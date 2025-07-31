@@ -1,10 +1,12 @@
+use crate::consensus::{tracker::JobInfo, types::ChurtenNotification};
 use capnp::capability::Promise;
 use realize_network::unixsocket;
 use tokio::sync::mpsc;
 
-use crate::consensus::types::ChurtenNotification;
-
-use super::{control_capnp, convert};
+use super::{
+    control_capnp,
+    convert::{self, parse_job_info},
+};
 
 /// Connect to a running daemon through the given socket path.
 ///
@@ -25,6 +27,32 @@ pub async fn get_churten(
         .await?
         .get()?
         .get_churten()
+}
+
+/// Track what happens with churten, starting with a set of recent jobs, and
+/// gettings notifications.
+///
+/// A [crate::consensus::tracker::JobInfoTracker] can be useful to
+/// keep the list of jobs up-to-date using the notifications, if
+/// necessary.
+pub async fn track_churten(
+    churten: &control_capnp::churten::Client,
+) -> Result<(Vec<JobInfo>, mpsc::Receiver<ChurtenNotification>), capnp::Error> {
+    let (tx, rx) = mpsc::channel(10);
+    let mut request = churten.subscribe_request();
+    request
+        .get()
+        .set_subscriber(TxChurtenSubscriber::new(tx).as_client());
+    request.send().promise.await?;
+
+    let recent_jobs_result = churten.recent_jobs_request().send().promise.await?;
+    let job_list = recent_jobs_result.get()?.get_res()?;
+    let mut jobs = Vec::with_capacity(job_list.len() as usize);
+    for i in 0..job_list.len() {
+        jobs.push(parse_job_info(job_list.get(i))?);
+    }
+
+    Ok((jobs, rx))
 }
 
 /// A Churten subscriber server that forwards notifications to a
@@ -52,6 +80,7 @@ impl control_capnp::churten::subscriber::Server for TxChurtenSubscriber {
         Promise::from_future(async move {
             let reader = params.get().and_then(|p| p.get_notification())?;
             let n = convert::parse_notification(reader)?;
+            println!("// {n:?}");
             tx.send(n).await.map_err(channel_closed)?;
 
             Ok(())

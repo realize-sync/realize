@@ -51,7 +51,7 @@ impl Churten<JobHandlerImpl> {
 
 impl<H: JobHandler + 'static> Churten<H> {
     pub(crate) fn with_handler(storage: Arc<Storage>, handler: H) -> Self {
-        let (tx, mut rx) = broadcast::channel(16);
+        let (tx, mut rx) = broadcast::channel(256);
 
         let tracker = Arc::new(RwLock::new(JobInfoTracker::new(16)));
         tokio::spawn({

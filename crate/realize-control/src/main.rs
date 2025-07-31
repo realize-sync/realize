@@ -1,12 +1,11 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use realize_core::consensus::types::ChurtenNotification;
-use realize_core::rpc::control::client::{self, TxChurtenSubscriber};
+use realize_core::rpc::control::client;
 use realize_core::rpc::control::control_capnp;
 use realize_core::utils::logging;
 use std::path::PathBuf;
-use tokio::sync::mpsc;
 use tokio::task::LocalSet;
+use tokio_util::sync::CancellationToken;
 
 /// Command-line tool for controlling a running instance of realize-daemon
 #[derive(Parser, Debug)]
@@ -157,24 +156,17 @@ async fn execute_churten_run(control: &control_capnp::control::Client) -> Result
 async fn run_churten(
     churten: &realize_core::rpc::control::control_capnp::churten::Client,
 ) -> Result<(), anyhow::Error> {
-    let ctrl_c = tokio::spawn(tokio::signal::ctrl_c());
+    let (jobs, mut rx) = client::track_churten(churten).await?;
+    for job in jobs {
+        println!("{job:?}")
+    }
 
-    let (tx, rx) = mpsc::channel(20);
-    let mut req = churten.subscribe_request();
-    req.get()
-        .set_subscriber(TxChurtenSubscriber::new(tx).as_client());
-    req.send().promise.await?;
-    tokio::select!(
-        _ = ctrl_c => {},
-         _ = print_notifications(rx) => {}
-    );
-    return Ok(());
-}
-
-async fn print_notifications(mut rx: mpsc::Receiver<ChurtenNotification>) {
     while let Some(notification) = rx.recv().await {
         println!("RECV: {notification:?}");
     }
+    println!("Done rx.closed: {}", rx.is_closed());
+
+    return Ok(());
 }
 
 /// Execute the mark set command

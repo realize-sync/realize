@@ -17,25 +17,7 @@ pub(crate) fn parse_notification(
     match reader.which()? {
         churten_notification::Which::New(new_reader) => {
             let job_reader = new_reader?.get_job()?;
-            let path = parse_path(job_reader.get_path()?)?;
-            let hash = parse_hash(job_reader.get_hash()?)?;
-
-            let job = match job_reader.which()? {
-                super::control_capnp::job::Which::Download(_) => Job::Download(path, hash),
-                super::control_capnp::job::Which::Realize(realize_reader_result) => {
-                    let realize_reader = realize_reader_result?;
-                    let index_hash = if realize_reader.has_index_hash() {
-                        let index_hash_data = realize_reader.get_index_hash()?;
-                        Some(Hash(index_hash_data.try_into().map_err(|_| {
-                            capnp::Error::failed("Invalid index hash length".to_string())
-                        })?))
-                    } else {
-                        None
-                    };
-                    Job::Realize(path, hash, index_hash)
-                }
-                super::control_capnp::job::Which::Unrealize(_) => Job::Unrealize(path, hash),
-            };
+            let job = parse_job(job_reader)?;
 
             Ok(ChurtenNotification::New {
                 arena,
@@ -46,17 +28,7 @@ pub(crate) fn parse_notification(
         churten_notification::Which::Update(update_reader_result) => {
             let update_reader = update_reader_result?;
             let progress_reader = update_reader.get_progress()?;
-            let progress = match progress_reader.get_type()? {
-                super::control_capnp::job_progress::Type::Pending => JobProgress::Pending,
-                super::control_capnp::job_progress::Type::Running => JobProgress::Running,
-                super::control_capnp::job_progress::Type::Done => JobProgress::Done,
-                super::control_capnp::job_progress::Type::Abandoned => JobProgress::Abandoned,
-                super::control_capnp::job_progress::Type::Cancelled => JobProgress::Cancelled,
-                super::control_capnp::job_progress::Type::Failed => {
-                    let message = progress_reader.get_message()?.to_str()?.to_string();
-                    JobProgress::Failed(message)
-                }
-            };
+            let progress = parse_progress(progress_reader)?;
 
             Ok(ChurtenNotification::Update {
                 arena,
@@ -74,17 +46,9 @@ pub(crate) fn parse_notification(
             })
         }
         churten_notification::Which::UpdateAction(action_reader) => {
-            let action = match action_reader?.get_action()? {
-                super::control_capnp::JobAction::None => {
-                    return Err(capnp::Error::failed(
-                        "A JobAction must be set in UpdateAction".to_string(),
-                    ));
-                }
-                super::control_capnp::JobAction::Download => JobAction::Download,
-                super::control_capnp::JobAction::Verify => JobAction::Verify,
-                super::control_capnp::JobAction::Repair => JobAction::Repair,
-                super::control_capnp::JobAction::Move => JobAction::Move,
-            };
+            let action = parse_action(action_reader?.get_action()?)?.ok_or_else(|| {
+                capnp::Error::failed("A JobAction must be set in UpdateAction".to_string())
+            })?;
 
             Ok(ChurtenNotification::UpdateAction {
                 arena,
@@ -196,6 +160,85 @@ fn to_capnp_action(action: Option<&JobAction>) -> control_capnp::JobAction {
         Some(JobAction::Repair) => control_capnp::JobAction::Repair,
         Some(JobAction::Move) => control_capnp::JobAction::Move,
         None => control_capnp::JobAction::None,
+    }
+}
+
+/// Convert capnp JobInfo to rust.
+pub(crate) fn parse_job_info(
+    reader: control_capnp::job_info::Reader<'_>,
+) -> Result<JobInfo, capnp::Error> {
+    let arena = parse_arena(reader.get_arena()?)?;
+    let id = JobId(reader.get_id());
+    let job_reader = reader.get_job()?;
+    let job = parse_job(job_reader)?;
+    let progress_reader = reader.get_progress()?;
+    let progress = parse_progress(progress_reader)?;
+    let action = parse_action(reader.get_action()?)?;
+    let byte_progress = if reader.has_byte_progress() {
+        let byte_progress_reader = reader.get_byte_progress()?;
+        Some((
+            byte_progress_reader.get_current(),
+            byte_progress_reader.get_total(),
+        ))
+    } else {
+        None
+    };
+
+    Ok(JobInfo {
+        arena,
+        id,
+        job: std::sync::Arc::new(job),
+        progress,
+        action,
+        byte_progress,
+    })
+}
+
+fn parse_job(job_reader: control_capnp::job::Reader<'_>) -> Result<Job, capnp::Error> {
+    let path = parse_path(job_reader.get_path()?)?;
+    let hash = parse_hash(job_reader.get_hash()?)?;
+
+    match job_reader.which()? {
+        control_capnp::job::Which::Download(_) => Ok(Job::Download(path, hash)),
+        control_capnp::job::Which::Realize(realize_reader_result) => {
+            let realize_reader = realize_reader_result?;
+            let index_hash = if realize_reader.has_index_hash() {
+                let index_hash_data = realize_reader.get_index_hash()?;
+                Some(Hash(index_hash_data.try_into().map_err(|_| {
+                    capnp::Error::failed("Invalid index hash length".to_string())
+                })?))
+            } else {
+                None
+            };
+            Ok(Job::Realize(path, hash, index_hash))
+        }
+        control_capnp::job::Which::Unrealize(_) => Ok(Job::Unrealize(path, hash)),
+    }
+}
+
+fn parse_progress(
+    progress_reader: control_capnp::job_progress::Reader<'_>,
+) -> Result<JobProgress, capnp::Error> {
+    match progress_reader.get_type()? {
+        control_capnp::job_progress::Type::Pending => Ok(JobProgress::Pending),
+        control_capnp::job_progress::Type::Running => Ok(JobProgress::Running),
+        control_capnp::job_progress::Type::Done => Ok(JobProgress::Done),
+        control_capnp::job_progress::Type::Abandoned => Ok(JobProgress::Abandoned),
+        control_capnp::job_progress::Type::Cancelled => Ok(JobProgress::Cancelled),
+        control_capnp::job_progress::Type::Failed => {
+            let message = progress_reader.get_message()?.to_str()?.to_string();
+            Ok(JobProgress::Failed(message))
+        }
+    }
+}
+
+fn parse_action(action: control_capnp::JobAction) -> Result<Option<JobAction>, capnp::Error> {
+    match action {
+        control_capnp::JobAction::None => Ok(None),
+        control_capnp::JobAction::Download => Ok(Some(JobAction::Download)),
+        control_capnp::JobAction::Verify => Ok(Some(JobAction::Verify)),
+        control_capnp::JobAction::Repair => Ok(Some(JobAction::Repair)),
+        control_capnp::JobAction::Move => Ok(Some(JobAction::Move)),
     }
 }
 
@@ -424,5 +467,161 @@ mod tests {
 
         // Compare
         assert_eq!(original, parsed);
+    }
+
+    fn create_test_job_info() -> JobInfo {
+        let arena = Arena::from("test-arena");
+        let id = JobId(123);
+        let path = Path::parse("test/file.txt").unwrap();
+        let hash = Hash([0x42; 32]);
+        let job = Job::Download(path, hash);
+
+        JobInfo {
+            arena,
+            id,
+            job: std::sync::Arc::new(job),
+            progress: JobProgress::Running,
+            action: Some(JobAction::Download),
+            byte_progress: Some((42, 100)),
+        }
+    }
+
+    fn create_test_realize_job_info() -> JobInfo {
+        let arena = Arena::from("test-arena");
+        let id = JobId(456);
+        let path = Path::parse("test/file.txt").unwrap();
+        let hash = Hash([0x42; 32]);
+        let job = Job::Realize(path, hash, Some(Hash([0x24; 32])));
+
+        JobInfo {
+            arena,
+            id,
+            job: std::sync::Arc::new(job),
+            progress: JobProgress::Done,
+            action: Some(JobAction::Verify),
+            byte_progress: None,
+        }
+    }
+
+    fn create_test_unrealize_job_info() -> JobInfo {
+        let arena = Arena::from("test-arena");
+        let id = JobId(789);
+        let path = Path::parse("test/file.txt").unwrap();
+        let hash = Hash([0x42; 32]);
+        let job = Job::Unrealize(path, hash);
+
+        JobInfo {
+            arena,
+            id,
+            job: std::sync::Arc::new(job),
+            progress: JobProgress::Failed("Test error".to_string()),
+            action: None,
+            byte_progress: Some((0, 0)),
+        }
+    }
+
+    fn job_info_round_trip_test(original: JobInfo) {
+        // Convert to capnp
+        let mut message = Builder::new_default();
+        let mut builder = message.init_root::<control_capnp::job_info::Builder>();
+        fill_job_info(&original, builder.reborrow());
+
+        // Convert back to rust
+        let msg_reader = message.into_reader();
+        let reader = msg_reader
+            .get_root::<control_capnp::job_info::Reader>()
+            .unwrap();
+        let parsed = parse_job_info(reader).unwrap();
+
+        // Compare
+        assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn test_parse_job_info_download() {
+        job_info_round_trip_test(create_test_job_info());
+    }
+
+    #[test]
+    fn test_parse_job_info_realize() {
+        job_info_round_trip_test(create_test_realize_job_info());
+    }
+
+    #[test]
+    fn test_parse_job_info_unrealize() {
+        job_info_round_trip_test(create_test_unrealize_job_info());
+    }
+
+    #[test]
+    fn test_parse_job_info_all_progress_states() {
+        let arena = Arena::from("test-arena");
+        let id = JobId(123);
+        let path = Path::parse("test/file.txt").unwrap();
+        let hash = Hash([0x42; 32]);
+        let job = Job::Download(path, hash);
+
+        for progress in [
+            JobProgress::Pending,
+            JobProgress::Running,
+            JobProgress::Done,
+            JobProgress::Abandoned,
+            JobProgress::Cancelled,
+            JobProgress::Failed("Test error".to_string()),
+        ] {
+            let job_info = JobInfo {
+                arena,
+                id,
+                job: std::sync::Arc::new(job.clone()),
+                progress,
+                action: Some(JobAction::Download),
+                byte_progress: Some((42, 100)),
+            };
+            job_info_round_trip_test(job_info);
+        }
+    }
+
+    #[test]
+    fn test_parse_job_info_all_actions() {
+        let arena = Arena::from("test-arena");
+        let id = JobId(123);
+        let path = Path::parse("test/file.txt").unwrap();
+        let hash = Hash([0x42; 32]);
+        let job = Job::Download(path, hash);
+
+        for action in [
+            JobAction::Download,
+            JobAction::Verify,
+            JobAction::Repair,
+            JobAction::Move,
+        ] {
+            let job_info = JobInfo {
+                arena,
+                id,
+                job: std::sync::Arc::new(job.clone()),
+                progress: JobProgress::Running,
+                action: Some(action),
+                byte_progress: Some((42, 100)),
+            };
+            job_info_round_trip_test(job_info);
+        }
+    }
+
+    #[test]
+    fn test_parse_job_info_no_action() {
+        let arena = Arena::from("test-arena");
+        let id = JobId(123);
+        let path = Path::parse("test/file.txt").unwrap();
+        let hash = Hash([0x42; 32]);
+        let job = Job::Download(path, hash);
+
+        let job_info = JobInfo {
+            arena,
+            id,
+            job: std::sync::Arc::new(job),
+            progress: JobProgress::Pending,
+            action: None,
+            byte_progress: None,
+        };
+        job_info_round_trip_test(job_info);
     }
 }

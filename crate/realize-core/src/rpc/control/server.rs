@@ -129,11 +129,27 @@ impl<H: JobHandler + 'static> churten::Server for ChurtenServer<H> {
 
         // Forward notifications from tx to the subscriber
         tokio::task::spawn_local(async move {
-            while let Ok(notification) = rx.recv().await {
-                let mut request = subscriber.notify_request();
-                convert::fill_notification(notification, request.get().init_notification());
-                // Ignore errors as the client might have disconnected
-                let _ = request.send().await;
+            log::debug!("SUBSCRIBER START");
+            loop {
+                match rx.recv().await {
+                    Ok(notification) => {
+                        let mut request = subscriber.notify_request();
+                        convert::fill_notification(notification, request.get().init_notification());
+                        // Ignore errors as the client might have disconnected
+                        if let Err(err) = request.send().await {
+                            log::debug!("SUBSCRIBER END Failed to call notify: {err}");
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        // lag should not be fatal
+                        log::debug!(
+                            "SUBSCRIBER END Giving up on churten received closed={} {err}",
+                            rx.is_closed()
+                        );
+                        break;
+                    }
+                };
             }
         });
 
