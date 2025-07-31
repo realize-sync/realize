@@ -1,3 +1,4 @@
+use super::output::{self, OutputMode};
 use anyhow::Result;
 use realize_core::rpc::control::control_capnp;
 
@@ -14,6 +15,7 @@ pub(crate) async fn execute_mark_set(
     mark: &MarkValue,
     arena: &str,
     paths: &[String],
+    output_mode: OutputMode,
 ) -> Result<i32> {
     let mark_value = match mark {
         MarkValue::Watch => control_capnp::Mark::Watch,
@@ -39,7 +41,11 @@ pub(crate) async fn execute_mark_set(
             req.set_mark(mark_value);
             request.send().promise.await?;
         }
-        println!("Marks set successfully on {} paths", paths.len());
+        output::print_success(
+            output_mode,
+            "OK",
+            format!("Marks set on {} paths", paths.len()),
+        );
     }
 
     Ok(0)
@@ -50,6 +56,7 @@ pub(crate) async fn execute_mark_get(
     control: &control_capnp::control::Client,
     arena: &str,
     paths: &[String],
+    output_mode: OutputMode,
 ) -> Result<i32> {
     for path in paths {
         let mut request = control.get_mark_request();
@@ -66,7 +73,7 @@ pub(crate) async fn execute_mark_get(
             Err(_) => "unknown",
         };
 
-        println!("{}: {}", path, mark_str);
+        output::print_info(output_mode, format!("{path}: {mark_str}"));
     }
 
     Ok(0)

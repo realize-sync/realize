@@ -48,12 +48,11 @@ enum ChurtenCommands {
     Start,
     /// Stop churten
     Stop,
-    /// Check if churten is running
-    IsRunning {
-        /// Quiet mode - exit with 0 if running, 10 if not running
-        #[arg(short, long)]
-        quiet: bool,
-    },
+    /// Check if churten is running.
+    ///
+    /// In quiet mode, print nothing and exit with status 10 if
+    /// churten is not running.
+    IsRunning,
     /// Run churten and print notifications
     Run,
 }
@@ -139,21 +138,28 @@ async fn execute(cli: Cli) -> anyhow::Result<i32> {
             // Execute the appropriate command
             match cli.command {
                 Commands::Churten { command } => match command {
-                    ChurtenCommands::Start => churten_cmd::execute_churten_start(&control).await,
-                    ChurtenCommands::Stop => churten_cmd::execute_churten_stop(&control).await,
-                    ChurtenCommands::IsRunning { quiet } => {
-                        churten_cmd::execute_churten_is_running(&control, quiet).await
+                    ChurtenCommands::Start => {
+                        churten_cmd::execute_churten_start(&control, cli.output).await
                     }
-                    ChurtenCommands::Run => churten_cmd::execute_churten_run(&control).await,
+                    ChurtenCommands::Stop => {
+                        churten_cmd::execute_churten_stop(&control, cli.output).await
+                    }
+                    ChurtenCommands::IsRunning => {
+                        churten_cmd::execute_churten_is_running(&control, cli.output).await
+                    }
+                    ChurtenCommands::Run => {
+                        churten_cmd::execute_churten_run(&control, cli.output).await
+                    }
                 },
 
                 Commands::Mark { command } => match command {
                     MarkCommands::Set { mark, arena, paths } => {
-                        mark_cmd::execute_mark_set(&control, &mark, &arena, &paths).await
+                        mark_cmd::execute_mark_set(&control, &mark, &arena, &paths, cli.output)
+                            .await
                     }
 
                     MarkCommands::Get { arena, paths } => {
-                        mark_cmd::execute_mark_get(&control, &arena, &paths).await
+                        mark_cmd::execute_mark_get(&control, &arena, &paths, cli.output).await
                     }
                 },
             }
