@@ -245,8 +245,8 @@ fn mark_to_capnp(mark: Mark) -> control_capnp::Mark {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus::churten::{JobHandler, JobHandlerImpl, TxByteCountProgress};
-    use crate::consensus::progress::ByteCountProgress;
+    use crate::consensus::churten::{JobHandler, JobHandlerImpl};
+    use crate::consensus::progress::{ByteCountProgress, TxByteCountProgress};
     use crate::consensus::types::ChurtenNotification;
     use crate::rpc::control::client::TxChurtenSubscriber;
     use crate::rpc::testing::HouseholdFixture;

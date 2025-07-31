@@ -1,9 +1,9 @@
 #![allow(dead_code)] // work in progress
 
 use super::jobs;
-use super::progress::ByteCountProgress;
+use super::progress::TxByteCountProgress;
 use super::tracker::{JobInfo, JobInfoTracker};
-use super::types::{ChurtenNotification, JobAction, JobProgress};
+use super::types::{ChurtenNotification, JobProgress};
 use crate::rpc::Household;
 use futures::StreamExt;
 use realize_storage::{Job, JobId, JobStatus, Storage};
@@ -18,6 +18,10 @@ use tokio::{sync::broadcast, task::JoinHandle};
 /// Used by [TxByteCountProgress] to scale down the number of bytes
 /// notifications.
 const BROADCAST_CHANNEL_CAPACITY: usize = 128;
+
+/// Update byte count when the difference with the last update is at
+/// least that many.
+const BROADCAST_CHANNEL_RESOLUTION_BYTES: u64 = 64 * 1024;
 
 /// A type that processes jobs and returns the result for [Churten].
 ///
@@ -206,11 +210,9 @@ async fn run_job<H: JobHandler>(
         job_id,
         progress: JobProgress::Running,
     });
-    let mut progress = TxByteCountProgress {
-        tx: tx.clone(),
-        arena,
-        job_id,
-    };
+    let mut progress = TxByteCountProgress::new(arena, job_id, tx.clone())
+        .adaptive(BROADCAST_CHANNEL_CAPACITY)
+        .with_min_byte_delta(BROADCAST_CHANNEL_RESOLUTION_BYTES);
     let result = handler.run(arena, &job, &mut progress, shutdown).await;
 
     (arena, job_id, result)
@@ -270,35 +272,13 @@ impl JobHandler for JobHandlerImpl {
     }
 }
 
-pub(crate) struct TxByteCountProgress {
-    tx: broadcast::Sender<ChurtenNotification>,
-    arena: Arena,
-    job_id: JobId,
-}
-
-impl ByteCountProgress for TxByteCountProgress {
-    fn update_action(&mut self, action: JobAction) {
-        let _ = self.tx.send(ChurtenNotification::UpdateAction {
-            arena: self.arena,
-            job_id: self.job_id,
-            action,
-        });
-    }
-    fn update(&mut self, current_bytes: u64, total_bytes: u64) {
-        let _ = self.tx.send(ChurtenNotification::UpdateByteCount {
-            arena: self.arena,
-            job_id: self.job_id,
-            current_bytes,
-            total_bytes,
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::consensus::progress::ByteCountProgress;
+    use crate::consensus::types::JobAction;
     use crate::rpc::testing::{self, HouseholdFixture};
     use realize_storage::utils::hash::{self, digest};
     use realize_storage::{JobId, Mark};
@@ -473,8 +453,8 @@ mod tests {
 
             // Send progress updates if requested
             if self.should_send_progress {
-                progress.update(50, 100);
-                progress.update(100, 100);
+                progress.update(50 * 1024, 100 * 1024);
+                progress.update(100 * 1024, 100 * 1024);
             }
 
             // Return the configured result
@@ -527,8 +507,8 @@ mod tests {
                     ChurtenNotification::UpdateByteCount {
                         arena,
                         job_id,
-                        current_bytes: 50,
-                        total_bytes: 100,
+                        current_bytes: 50 * 1024,
+                        total_bytes: 100 * 1024,
                     },
                     rx.recv().await?
                 );
@@ -537,8 +517,8 @@ mod tests {
                     ChurtenNotification::UpdateByteCount {
                         arena,
                         job_id,
-                        current_bytes: 100,
-                        total_bytes: 100,
+                        current_bytes: 100 * 1024,
+                        total_bytes: 100 * 1024,
                     },
                     rx.recv().await?
                 );
