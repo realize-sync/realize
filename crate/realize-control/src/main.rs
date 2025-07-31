@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use output::OutputMode;
 use realize_core::rpc::control::client;
 use realize_core::utils::logging;
 use std::path::PathBuf;
@@ -7,6 +8,7 @@ use tokio::task::LocalSet;
 
 mod churten_cmd;
 mod mark_cmd;
+mod output;
 
 /// Command-line tool for controlling a running instance of realize-daemon
 #[derive(Parser, Debug)]
@@ -15,6 +17,14 @@ struct Cli {
     /// Socket path for connecting to the daemon
     #[arg(short, long, value_name = "SOCKET")]
     socket: Option<PathBuf>,
+
+    /// Output mode.
+    ///
+    /// Logging can be further configured by setting the env var
+    /// RUST_LOG. For a systemd-friendly output format, set the env
+    /// var RUST_LOG_FORMAT=SYSTEMD
+    #[arg(long, value_enum, default_value = "progress", verbatim_doc_comment)]
+    output: OutputMode,
 
     #[command(subcommand)]
     command: Commands,
@@ -98,12 +108,17 @@ fn resolve_socket_path(socket_arg: Option<PathBuf>) -> Result<PathBuf> {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    logging::init(log::LevelFilter::Off);
+    let output_mode = cli.output;
+    if output_mode == OutputMode::Log {
+        logging::init_with_info_modules(vec!["realize_control"]);
+    } else {
+        logging::init(log::LevelFilter::Off);
+    }
 
     let status = match execute(cli).await {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("{err:#}");
+            output::print_error(output_mode, &format!("{err:#}"));
 
             1
         }
