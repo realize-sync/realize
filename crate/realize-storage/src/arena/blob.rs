@@ -241,7 +241,7 @@ fn do_create_blob_entry(
 ) -> Result<(BlobId, BlobTableEntry), StorageError> {
     let blob_id = blob_table
         .last()?
-        .map(|(k, _)| k.value())
+        .map(|(k, _)| k.value().plus(1))
         .unwrap_or(BlobId(1));
     let blob_entry = BlobTableEntry {
         written_areas: ByteRanges::new(),
@@ -596,8 +596,9 @@ mod tests {
         tempdir: TempDir,
     }
     impl Fixture {
-        async fn setup_with_arena(arena: Arena) -> anyhow::Result<Fixture> {
+        async fn setup() -> anyhow::Result<Fixture> {
             let _ = env_logger::try_init();
+            let arena = test_arena();
             let tempdir = TempDir::new()?;
             let allocator =
                 InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
@@ -681,14 +682,14 @@ mod tests {
         }
 
         /// Check if a blob file exists for the given blob ID in the test arena.
-        fn blob_file_exists(&self, arena: Arena, blob_id: BlobId) -> bool {
-            self.blob_path(arena, blob_id).exists()
+        fn blob_file_exists(&self, blob_id: BlobId) -> bool {
+            self.blob_path(blob_id).exists()
         }
 
         /// Return the path to a blob file for test use.
-        fn blob_path(&self, arena: Arena, blob_id: BlobId) -> std::path::PathBuf {
+        fn blob_path(&self, blob_id: BlobId) -> std::path::PathBuf {
             self.tempdir
-                .child(format!("{arena}/blobs/{blob_id}"))
+                .child(format!("{}/blobs/{blob_id}", self.arena))
                 .to_path_buf()
         }
 
@@ -718,9 +719,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_file_creates_multiple_blobs_and_files() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let acache = &fixture.acache;
+
+        let inode1 = fixture.add_file("test1.txt", 100)?;
+        let inode2 = fixture.add_file("test2.txt", 200)?;
+        let inode3 = fixture.add_file("test3.txt", 300)?;
+
+        assert_eq!(BlobId(1), acache.open_file(inode1)?.blob_id);
+        assert_eq!(BlobId(2), acache.open_file(inode2)?.blob_id);
+        assert_eq!(BlobId(3), acache.open_file(inode3)?.blob_id);
+
+        assert!(fixture.blob_entry_exists(BlobId(1))?);
+        assert!(fixture.blob_entry_exists(BlobId(2))?);
+        assert!(fixture.blob_entry_exists(BlobId(3))?);
+
+        assert!(fixture.blob_path(BlobId(1)).exists());
+        assert!(fixture.blob_path(BlobId(2)).exists());
+        assert!(fixture.blob_path(BlobId(3)).exists());
+
+        assert_eq!(100, fixture.blob_path(BlobId(1)).metadata()?.len());
+        assert_eq!(200, fixture.blob_path(BlobId(2)).metadata()?.len());
+        assert_eq!(300, fixture.blob_path(BlobId(3)).metadata()?.len());
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn read_blob_within_available_ranges() -> anyhow::Result<()> {
-        let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup().await?;
         let acache = &fixture.acache;
 
         let inode = fixture.add_file("test.txt", 1000)?;
@@ -729,7 +757,7 @@ mod tests {
         let blob_id = acache.open_file(inode)?.blob_id;
 
         // Write some test data to the blob file
-        let blob_path = fixture.blob_path(arena, blob_id);
+        let blob_path = fixture.blob_path(blob_id);
         let test_data = b"Baa, baa, black sheep, have you any wool?";
         std::fs::write(&blob_path, test_data)?;
 
@@ -752,8 +780,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_blob_after_seek_within_available_range() -> anyhow::Result<()> {
-        let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup().await?;
         let acache = &fixture.acache;
 
         let inode = fixture.add_file("test.txt", 1000)?;
@@ -762,7 +789,7 @@ mod tests {
         let blob_id = acache.open_file(inode)?.blob_id;
 
         // Write test data to the blob file
-        let blob_path = fixture.blob_path(arena, blob_id);
+        let blob_path = fixture.blob_path(blob_id);
         let test_data = b"Baa, baa, black sheep, have you any wool?";
         std::fs::write(&blob_path, test_data)?;
 
@@ -782,8 +809,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_blob_outside_available_ranges() -> anyhow::Result<()> {
-        let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup().await?;
         let acache = &fixture.acache;
         let inode = fixture.add_file("test.txt", 1000)?;
 
@@ -791,7 +817,7 @@ mod tests {
         let blob_id = acache.open_file(inode)?.blob_id;
 
         // Write test data to the blob file
-        let blob_path = fixture.blob_path(arena, blob_id);
+        let blob_path = fixture.blob_path(blob_id);
         let test_data = b"baa, baa";
         std::fs::write(&blob_path, test_data)?;
         acache
@@ -811,8 +837,7 @@ mod tests {
 
     #[tokio::test]
     async fn writing_to_blob_updates_local_availability() -> anyhow::Result<()> {
-        let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup().await?;
         let inode = fixture.add_file("test.txt", 21)?;
 
         // Write to blob
@@ -841,7 +866,7 @@ mod tests {
 
         assert_eq!(
             "baa, baa, black sheep",
-            fs::read_to_string(fixture.blob_path(arena, blob_id)).await?
+            fs::read_to_string(fixture.blob_path(blob_id)).await?
         );
 
         Ok(())
@@ -849,8 +874,7 @@ mod tests {
 
     #[tokio::test]
     async fn writing_to_blob_out_of_order() -> anyhow::Result<()> {
-        let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup().await?;
         let inode = fixture.add_file("test.txt", 21)?;
 
         // Write to blob
@@ -871,7 +895,7 @@ mod tests {
 
         assert_eq!(
             "baa, baa, black sheep",
-            fs::read_to_string(fixture.blob_path(arena, blob_id)).await?
+            fs::read_to_string(fixture.blob_path(blob_id)).await?
         );
 
         Ok(())
@@ -879,8 +903,7 @@ mod tests {
 
     #[tokio::test]
     async fn writing_to_blob_then_reading_it() -> anyhow::Result<()> {
-        let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup().await?;
         let inode = fixture.add_file("test.txt", 100)?;
 
         let mut blob = fixture.acache.open_file(inode)?;
@@ -898,8 +921,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_file_creates_sparse_file() -> anyhow::Result<()> {
-        let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup().await?;
         let acache = &fixture.acache;
         let file_path = Path::parse("foobar")?;
 
@@ -910,7 +932,7 @@ mod tests {
             let blob = acache.open_file(inode)?;
             assert_eq!(BlobId(1), blob.id());
 
-            let m = fixture.blob_path(arena, blob.id()).metadata()?;
+            let m = fixture.blob_path(blob.id()).metadata()?;
 
             // File should have the right size
             assert_eq!(10000, m.len());
@@ -934,7 +956,7 @@ mod tests {
 
     #[tokio::test]
     async fn blob_deleted_on_file_overwrite() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup().await?;
         let acache = &fixture.acache;
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
@@ -947,7 +969,7 @@ mod tests {
         let blob_id = acache.open_file(inode)?.id();
 
         // Verify the blob file was created
-        assert!(fixture.blob_file_exists(arena, blob_id));
+        assert!(fixture.blob_file_exists(blob_id));
         // Verify the blob entry exists in the database
         assert!(fixture.blob_entry_exists(blob_id)?);
 
@@ -966,7 +988,7 @@ mod tests {
         )?;
 
         // Verify the blob file has been deleted
-        assert!(!fixture.blob_file_exists(arena, blob_id));
+        assert!(!fixture.blob_file_exists(blob_id));
         // Verify the blob entry has been deleted from the database
         assert!(!fixture.blob_entry_exists(blob_id)?);
 
@@ -975,9 +997,8 @@ mod tests {
 
     #[tokio::test]
     async fn blob_deleted_on_file_removal() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup().await?;
         let acache = &fixture.acache;
-        let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
 
         // Create a file
@@ -988,7 +1009,7 @@ mod tests {
         let blob_id = acache.open_file(inode)?.id();
 
         // Verify the blob file was created
-        assert!(fixture.blob_file_exists(arena, blob_id));
+        assert!(fixture.blob_file_exists(blob_id));
         // Verify the blob entry exists in the database
         assert!(fixture.blob_entry_exists(blob_id)?);
 
@@ -996,7 +1017,7 @@ mod tests {
         fixture.remove_file(&file_path)?;
 
         // Verify the blob file has been deleted
-        assert!(!fixture.blob_file_exists(arena, blob_id));
+        assert!(!fixture.blob_file_exists(blob_id));
         // Verify the blob entry has been deleted from the database
         assert!(!fixture.blob_entry_exists(blob_id)?);
 
@@ -1005,7 +1026,7 @@ mod tests {
 
     #[tokio::test]
     async fn blob_deleted_on_catchup_removal() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup().await?;
         let acache = &fixture.acache;
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
@@ -1018,7 +1039,7 @@ mod tests {
         let blob_id = acache.open_file(inode)?.id();
 
         // Verify the blob file was created
-        assert!(fixture.blob_file_exists(arena, blob_id));
+        assert!(fixture.blob_file_exists(blob_id));
         // Verify the blob entry exists in the database
         assert!(fixture.blob_entry_exists(blob_id)?);
 
@@ -1034,7 +1055,7 @@ mod tests {
         )?;
 
         // Verify the blob file has been deleted
-        assert!(!fixture.blob_file_exists(arena, blob_id));
+        assert!(!fixture.blob_file_exists(blob_id));
         // Verify the blob entry has been deleted from the database
         assert!(!fixture.blob_entry_exists(blob_id)?);
 
@@ -1043,8 +1064,7 @@ mod tests {
 
     #[tokio::test]
     async fn blob_update_extends_range() -> anyhow::Result<()> {
-        let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup().await?;
         let acache = &fixture.acache;
         let file_path = Path::parse("file.txt")?;
 
@@ -1104,8 +1124,7 @@ mod tests {
 
     #[tokio::test]
     async fn move_blob_success() -> anyhow::Result<()> {
-        let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup().await?;
         let acache = &fixture.acache;
         let file_path = Path::parse("test.txt")?;
 
@@ -1123,7 +1142,7 @@ mod tests {
         blob.mark_verified().await?;
 
         // Verify the blob file exists and has content
-        assert!(fixture.blob_file_exists(arena, blob_id));
+        assert!(fixture.blob_file_exists(blob_id));
         assert!(fixture.blob_entry_exists(blob_id)?);
 
         // Create destination path
@@ -1138,7 +1157,7 @@ mod tests {
         assert!(result);
 
         // Verify the blob file has been moved
-        assert!(!fixture.blob_file_exists(arena, blob_id));
+        assert!(!fixture.blob_file_exists(blob_id));
         assert!(dest_path.exists());
 
         // Verify the blob entry has been deleted from the database
@@ -1153,8 +1172,7 @@ mod tests {
 
     #[tokio::test]
     async fn move_blob_wrong_hash() -> anyhow::Result<()> {
-        let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup().await?;
         let acache = &fixture.acache;
         let file_path = Path::parse("test.txt")?;
 
@@ -1172,7 +1190,7 @@ mod tests {
         blob.mark_verified().await?;
 
         // Verify the blob file exists
-        assert!(fixture.blob_file_exists(arena, blob_id));
+        assert!(fixture.blob_file_exists(blob_id));
         assert!(fixture.blob_entry_exists(blob_id)?);
 
         // Create destination path
@@ -1188,7 +1206,7 @@ mod tests {
         assert!(!result);
 
         // Verify the blob file still exists
-        assert!(fixture.blob_file_exists(arena, blob_id));
+        assert!(fixture.blob_file_exists(blob_id));
         assert!(fixture.blob_entry_exists(blob_id)?);
 
         // Verify the destination file was not created
@@ -1199,8 +1217,7 @@ mod tests {
 
     #[tokio::test]
     async fn move_blob_not_verified() -> anyhow::Result<()> {
-        let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup().await?;
         let acache = &fixture.acache;
         let file_path = Path::parse("test.txt")?;
 
@@ -1218,7 +1235,7 @@ mod tests {
         // Note: Not calling mark_verified()
 
         // Verify the blob file exists
-        assert!(fixture.blob_file_exists(arena, blob_id));
+        assert!(fixture.blob_file_exists(blob_id));
         assert!(fixture.blob_entry_exists(blob_id)?);
 
         // Create destination path
@@ -1233,7 +1250,7 @@ mod tests {
         assert!(!result);
 
         // Verify the blob file still exists
-        assert!(fixture.blob_file_exists(arena, blob_id));
+        assert!(fixture.blob_file_exists(blob_id));
         assert!(fixture.blob_entry_exists(blob_id)?);
 
         // Verify the destination file was not created
@@ -1244,8 +1261,7 @@ mod tests {
 
     #[tokio::test]
     async fn move_blob_nonexistent_blob() -> anyhow::Result<()> {
-        let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup().await?;
         let acache = &fixture.acache;
 
         // Create destination path
@@ -1269,8 +1285,7 @@ mod tests {
 
     #[tokio::test]
     async fn move_blob_verifies_hash_and_state() -> anyhow::Result<()> {
-        let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup().await?;
         let acache = &fixture.acache;
         let file_path = Path::parse("test.txt")?;
 
@@ -1292,7 +1307,7 @@ mod tests {
         let actual_hash = blob.hash().clone();
 
         // Verify the blob file exists
-        assert!(fixture.blob_file_exists(arena, blob_id));
+        assert!(fixture.blob_file_exists(blob_id));
         assert!(fixture.blob_entry_exists(blob_id)?);
 
         // Create destination path
@@ -1307,7 +1322,7 @@ mod tests {
         assert!(result);
 
         // Verify the blob file has been moved
-        assert!(!fixture.blob_file_exists(arena, blob_id));
+        assert!(!fixture.blob_file_exists(blob_id));
         assert!(dest_path.exists());
 
         // Verify the blob entry has been deleted from the database
@@ -1324,8 +1339,7 @@ mod tests {
 
     #[tokio::test]
     async fn move_into_blob_if_matches_creates_new_blob() -> anyhow::Result<()> {
-        let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup().await?;
         let acache = &fixture.acache;
         let file_path = Path::parse("test.txt")?;
 
@@ -1360,8 +1374,7 @@ mod tests {
 
     #[tokio::test]
     async fn move_into_blob_if_matches_overwrites_existing_blob() -> anyhow::Result<()> {
-        let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup().await?;
         let acache = &fixture.acache;
         let file_path = Path::parse("test.txt")?;
 
@@ -1401,8 +1414,7 @@ mod tests {
 
     #[tokio::test]
     async fn move_into_blob_if_matches_rejects_wrong_hash() -> anyhow::Result<()> {
-        let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup().await?;
         let acache = &fixture.acache;
         let file_path = Path::parse("test.txt")?;
 
