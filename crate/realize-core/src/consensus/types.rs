@@ -11,8 +11,12 @@ pub enum ChurtenNotification {
         job_id: JobId,
         job: Arc<Job>,
     },
-    /// Update the general job state.
-    Update {
+
+    /// Start a pending job, which enters state [JobProgress::Running].
+    Start { arena: Arena, job_id: JobId },
+
+    /// Finish a job, successfully or not.
+    Finish {
         arena: Arena,
         job_id: JobId,
         progress: JobProgress,
@@ -26,6 +30,10 @@ pub enum ChurtenNotification {
     UpdateAction {
         arena: Arena,
         job_id: JobId,
+
+        /// Notification sequence index for this specific job, for
+        /// de-duplication.
+        index: u32,
         action: JobAction,
     },
 
@@ -35,6 +43,10 @@ pub enum ChurtenNotification {
     UpdateByteCount {
         arena: Arena,
         job_id: JobId,
+
+        /// Notification sequence index for this specific job, for
+        /// de-duplication.
+        index: u32,
 
         /// Current number of bytes.
         ///
@@ -55,7 +67,8 @@ impl ChurtenNotification {
     pub fn arena(&self) -> Arena {
         match self {
             ChurtenNotification::New { arena, .. } => *arena,
-            ChurtenNotification::Update { arena, .. } => *arena,
+            ChurtenNotification::Start { arena, .. } => *arena,
+            ChurtenNotification::Finish { arena, .. } => *arena,
             ChurtenNotification::UpdateByteCount { arena, .. } => *arena,
             ChurtenNotification::UpdateAction { arena, .. } => *arena,
         }
@@ -63,7 +76,8 @@ impl ChurtenNotification {
     pub fn job_id(&self) -> JobId {
         match self {
             ChurtenNotification::New { job_id, .. } => *job_id,
-            ChurtenNotification::Update { job_id, .. } => *job_id,
+            ChurtenNotification::Start { job_id, .. } => *job_id,
+            ChurtenNotification::Finish { job_id, .. } => *job_id,
             ChurtenNotification::UpdateByteCount { job_id, .. } => *job_id,
             ChurtenNotification::UpdateAction { job_id, .. } => *job_id,
         }

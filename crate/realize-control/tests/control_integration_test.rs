@@ -130,7 +130,7 @@ async fn churten_is_running_quiet() -> anyhow::Result<()> {
         .run_until(async move {
             // Test the quiet mode
             let output = fixture
-                .control_command(&["churten", "is-running", "-q"])?
+                .control_command(&["--output=quiet", "churten", "is-running"])?
                 .output()
                 .await?;
 
@@ -214,7 +214,7 @@ async fn churten_mark_set_paths() -> anyhow::Result<()> {
 
             let output_str = String::from_utf8(output.stdout)?;
             assert!(
-                output_str.contains("Marks set successfully on 2 paths"),
+                output_str.contains("set on 2 paths"),
                 "Expected success message, got '{}'",
                 output_str
             );

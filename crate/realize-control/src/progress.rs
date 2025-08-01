@@ -49,11 +49,14 @@ impl Progress for LogProgress {
                 self.tracker.init(jobs);
             }
             ChurtenUpdates::Notify(n) => {
-                self.tracker.update(&n);
+                if !self.tracker.update(&n) {
+                    return;
+                }
 
                 if let Some(job) = self.tracker.get(n.arena(), n.job_id()) {
                     match n {
-                        ChurtenNotification::Update { .. } | ChurtenNotification::New { .. } => {
+                        ChurtenNotification::New { .. } => {}
+                        ChurtenNotification::Start { .. } | ChurtenNotification::Finish { .. } => {
                             let progress = &job.progress;
                             match progress {
                                 JobProgress::Pending => {}

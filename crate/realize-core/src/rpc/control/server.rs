@@ -588,10 +588,9 @@ mod tests {
                 );
 
                 assert_eq!(
-                    ChurtenUpdates::Notify(ChurtenNotification::Update {
+                    ChurtenUpdates::Notify(ChurtenNotification::Start {
                         arena,
                         job_id: JobId(1),
-                        progress: JobProgress::Running,
                     }),
                     tokio::time::timeout(Duration::from_secs(3), rx.recv())
                         .await?
@@ -604,6 +603,7 @@ mod tests {
                         arena,
                         job_id: JobId(1),
                         action: JobAction::Download,
+                        index: 2,
                     }),
                     tokio::time::timeout(Duration::from_secs(3), rx.recv())
                         .await?
@@ -616,6 +616,7 @@ mod tests {
                         job_id: JobId(1),
                         current_bytes: 50,
                         total_bytes: 100,
+                        index: 3,
                     }),
                     tokio::time::timeout(Duration::from_secs(3), rx.recv())
                         .await?
@@ -628,6 +629,7 @@ mod tests {
                         job_id: JobId(1),
                         current_bytes: 100,
                         total_bytes: 100,
+                        index: 4,
                     }),
                     tokio::time::timeout(Duration::from_secs(3), rx.recv())
                         .await?
@@ -636,7 +638,7 @@ mod tests {
 
                 // Expect the job to succeed
                 assert_eq!(
-                    ChurtenUpdates::Notify(ChurtenNotification::Update {
+                    ChurtenUpdates::Notify(ChurtenNotification::Finish {
                         arena,
                         job_id: JobId(1),
                         progress: JobProgress::Done,
@@ -714,12 +716,8 @@ mod tests {
 
                 while let Some(n) = rx.recv().await {
                     match n {
-                        ChurtenUpdates::Notify(ChurtenNotification::Update {
-                            progress, ..
-                        }) => {
-                            if progress.is_finished() {
-                                break;
-                            }
+                        ChurtenUpdates::Notify(ChurtenNotification::Finish { .. }) => {
+                            break;
                         }
                         _ => {}
                     }

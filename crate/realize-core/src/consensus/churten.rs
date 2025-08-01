@@ -173,7 +173,7 @@ async fn background_job<H: JobHandler>(
         }
         _ = shutdown.cancelled() => { None })
     {
-        let _ = tx.send(ChurtenNotification::Update {
+        let _ = tx.send(ChurtenNotification::Finish {
             arena,
             job_id,
             progress: match &status {
@@ -205,11 +205,7 @@ async fn run_job<H: JobHandler>(
     shutdown: CancellationToken,
 ) -> (Arena, JobId, anyhow::Result<JobStatus>) {
     log::debug!("[{arena}] STARTING: {job_id} {job:?}");
-    let _ = tx.send(ChurtenNotification::Update {
-        arena,
-        job_id,
-        progress: JobProgress::Running,
-    });
+    let _ = tx.send(ChurtenNotification::Start { arena, job_id });
     let mut progress = TxByteCountProgress::new(arena, job_id, tx.clone())
         .adaptive(BROADCAST_CHANNEL_CAPACITY)
         .with_min_byte_delta(BROADCAST_CHANNEL_RESOLUTION_BYTES);
@@ -334,11 +330,7 @@ mod tests {
                 );
 
                 assert_eq!(
-                    ChurtenNotification::Update {
-                        arena,
-                        job_id,
-                        progress: JobProgress::Running,
-                    },
+                    ChurtenNotification::Start { arena, job_id },
                     rx.recv().await?
                 );
 
@@ -347,6 +339,7 @@ mod tests {
                         arena,
                         job_id,
                         action: JobAction::Download,
+                        index: 2,
                     },
                     rx.recv().await?
                 );
@@ -357,6 +350,7 @@ mod tests {
                         job_id,
                         current_bytes: 0,
                         total_bytes: 11,
+                        index: 3,
                     },
                     rx.recv().await?
                 );
@@ -367,6 +361,7 @@ mod tests {
                         job_id,
                         current_bytes: 11,
                         total_bytes: 11,
+                        index: 4,
                     },
                     rx.recv().await?
                 );
@@ -376,15 +371,16 @@ mod tests {
                         arena,
                         job_id,
                         action: JobAction::Verify,
+                        index: 5,
                     },
                     rx.recv().await?
                 );
 
                 assert_eq!(
-                    ChurtenNotification::Update {
+                    ChurtenNotification::Finish {
                         arena,
                         job_id,
-                        progress: JobProgress::Done,
+                        progress: JobProgress::Done
                     },
                     rx.recv().await?
                 );
@@ -494,11 +490,7 @@ mod tests {
 
                 // Check Running notification
                 assert_eq!(
-                    ChurtenNotification::Update {
-                        arena,
-                        job_id,
-                        progress: JobProgress::Running,
-                    },
+                    ChurtenNotification::Start { arena, job_id },
                     rx.recv().await?
                 );
 
@@ -509,6 +501,7 @@ mod tests {
                         job_id,
                         current_bytes: 50 * 1024,
                         total_bytes: 100 * 1024,
+                        index: 2,
                     },
                     rx.recv().await?
                 );
@@ -519,13 +512,14 @@ mod tests {
                         job_id,
                         current_bytes: 100 * 1024,
                         total_bytes: 100 * 1024,
+                        index: 3,
                     },
                     rx.recv().await?
                 );
 
                 // Check Done notification
                 assert_eq!(
-                    ChurtenNotification::Update {
+                    ChurtenNotification::Finish {
                         arena,
                         job_id,
                         progress: JobProgress::Done,
@@ -577,17 +571,13 @@ mod tests {
 
                 // Check Running notification
                 assert_eq!(
-                    ChurtenNotification::Update {
-                        arena,
-                        job_id,
-                        progress: JobProgress::Running,
-                    },
+                    ChurtenNotification::Start { arena, job_id },
                     rx.recv().await?
                 );
 
                 // Check Abandoned notification
                 assert_eq!(
-                    ChurtenNotification::Update {
+                    ChurtenNotification::Finish {
                         arena,
                         job_id,
                         progress: JobProgress::Abandoned,
@@ -637,17 +627,13 @@ mod tests {
 
                 // Check Running notification
                 assert_eq!(
-                    ChurtenNotification::Update {
-                        arena,
-                        job_id,
-                        progress: JobProgress::Running,
-                    },
+                    ChurtenNotification::Start { arena, job_id },
                     rx.recv().await?
                 );
 
                 // Check Failed notification
                 assert_eq!(
-                    ChurtenNotification::Update {
+                    ChurtenNotification::Finish {
                         arena,
                         job_id,
                         progress: JobProgress::Failed(error_msg.to_string()),
@@ -703,20 +689,16 @@ mod tests {
 
                 // Check Running notification
                 assert_eq!(
-                    ChurtenNotification::Update {
-                        arena,
-                        job_id,
-                        progress: JobProgress::Running,
-                    },
+                    ChurtenNotification::Start { arena, job_id },
                     rx.recv().await?
                 );
 
                 // Check Cancelled notification
                 assert_eq!(
-                    ChurtenNotification::Update {
+                    ChurtenNotification::Finish {
                         arena,
                         job_id,
-                        progress: JobProgress::Cancelled,
+                        progress: JobProgress::Cancelled
                     },
                     rx.recv().await?
                 );
@@ -765,17 +747,13 @@ mod tests {
 
                 // Check Running notification
                 assert_eq!(
-                    ChurtenNotification::Update {
-                        arena,
-                        job_id,
-                        progress: JobProgress::Running,
-                    },
+                    ChurtenNotification::Start { arena, job_id },
                     rx.recv().await?
                 );
 
                 // Check Done notification (no progress updates)
                 assert_eq!(
-                    ChurtenNotification::Update {
+                    ChurtenNotification::Finish {
                         arena,
                         job_id,
                         progress: JobProgress::Done,
@@ -856,14 +834,11 @@ mod tests {
                     ));
                     assert!(matches!(
                         job_notifications[1],
-                        ChurtenNotification::Update {
-                            progress: JobProgress::Running,
-                            ..
-                        }
+                        ChurtenNotification::Start { .. }
                     ));
                     assert!(matches!(
                         job_notifications[2],
-                        ChurtenNotification::Update {
+                        ChurtenNotification::Finish {
                             progress: JobProgress::Done,
                             ..
                         }
@@ -907,12 +882,10 @@ mod tests {
                 let mut finished_count = 0;
                 while let Ok(notification) = rx.recv().await {
                     match notification {
-                        ChurtenNotification::Update { progress, .. } => {
-                            if progress.is_finished() {
-                                finished_count += 1;
-                                if finished_count == 3 {
-                                    break;
-                                }
+                        ChurtenNotification::Finish { .. } => {
+                            finished_count += 1;
+                            if finished_count == 3 {
+                                break;
                             }
                         }
                         _ => {}
@@ -933,7 +906,8 @@ mod tests {
                         job: Arc::new(Job::Download(foo1, hash::digest("content1"))),
                         progress: JobProgress::Done,
                         action: None,
-                        byte_progress: None
+                        byte_progress: None,
+                        notification_index: 0,
                     }),
                     recent_jobs.remove(&JobId(1))
                 );
@@ -944,7 +918,8 @@ mod tests {
                         job: Arc::new(Job::Download(foo2, hash::digest("content2"))),
                         progress: JobProgress::Done,
                         action: None,
-                        byte_progress: None
+                        byte_progress: None,
+                        notification_index: 0,
                     }),
                     recent_jobs.remove(&JobId(2))
                 );
@@ -955,7 +930,8 @@ mod tests {
                         job: Arc::new(Job::Download(foo3, hash::digest("content3"))),
                         progress: JobProgress::Done,
                         action: None,
-                        byte_progress: None
+                        byte_progress: None,
+                        notification_index: 0,
                     }),
                     recent_jobs.remove(&JobId(3))
                 );

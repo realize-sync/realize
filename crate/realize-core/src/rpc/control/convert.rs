@@ -25,28 +25,32 @@ pub(crate) fn parse_notification(
                 job: std::sync::Arc::new(job),
             })
         }
-        churten_notification::Which::Update(update_reader_result) => {
+        churten_notification::Which::Start(_) => Ok(ChurtenNotification::Start { arena, job_id }),
+        churten_notification::Which::Finish(update_reader_result) => {
             let update_reader = update_reader_result?;
             let progress_reader = update_reader.get_progress()?;
             let progress = parse_progress(progress_reader)?;
 
-            Ok(ChurtenNotification::Update {
+            Ok(ChurtenNotification::Finish {
                 arena,
                 job_id,
                 progress,
             })
         }
-        churten_notification::Which::UpdateByteCount(byte_count_reader_result) => {
-            let byte_count_reader = byte_count_reader_result?;
+        churten_notification::Which::UpdateByteCount(reader) => {
+            let reader = reader?;
             Ok(ChurtenNotification::UpdateByteCount {
                 arena,
                 job_id,
-                current_bytes: byte_count_reader.get_current_bytes(),
-                total_bytes: byte_count_reader.get_total_bytes(),
+                current_bytes: reader.get_current_bytes(),
+                total_bytes: reader.get_total_bytes(),
+                index: reader.get_index(),
             })
         }
-        churten_notification::Which::UpdateAction(action_reader) => {
-            let action = parse_action(action_reader?.get_action()?)?.ok_or_else(|| {
+        churten_notification::Which::UpdateAction(reader) => {
+            let reader = reader?;
+            let index = reader.get_index();
+            let action = parse_action(reader.get_action()?)?.ok_or_else(|| {
                 capnp::Error::failed("A JobAction must be set in UpdateAction".to_string())
             })?;
 
@@ -54,6 +58,7 @@ pub(crate) fn parse_notification(
                 arena,
                 job_id,
                 action,
+                index,
             })
         }
     }
@@ -73,21 +78,27 @@ pub(crate) fn fill_notification(
         ChurtenNotification::New { job, .. } => {
             fill_job(job, dest.reborrow().init_new().init_job());
         }
-        ChurtenNotification::Update { progress, .. } => {
-            fill_progress(progress, dest.reborrow().init_update().init_progress());
+        ChurtenNotification::Start { .. } => {
+            dest.reborrow().init_start();
         }
-        ChurtenNotification::UpdateAction { action, .. } => {
+        ChurtenNotification::Finish { progress, .. } => {
+            fill_progress(progress, dest.reborrow().init_finish().init_progress());
+        }
+        ChurtenNotification::UpdateAction { action, index, .. } => {
             let mut update = dest.reborrow().init_update_action();
-            update.set_action(to_capnp_action(Some(action)))
+            update.set_action(to_capnp_action(Some(action)));
+            update.set_index(*index);
         }
         ChurtenNotification::UpdateByteCount {
             current_bytes,
             total_bytes,
+            index,
             ..
         } => {
             let mut update = dest.reborrow().init_update_byte_count();
             update.set_current_bytes(*current_bytes);
             update.set_total_bytes(*total_bytes);
+            update.set_index(*index);
         }
     }
 }
@@ -99,6 +110,7 @@ pub(crate) fn fill_job_info(source: &JobInfo, mut dest: control_capnp::job_info:
     fill_job(&source.job, dest.reborrow().init_job());
     fill_progress(&source.progress, dest.reborrow().init_progress());
     dest.set_action(to_capnp_action(source.action.as_ref()));
+    dest.set_notification_index(source.notification_index);
     if let Some((current, total)) = source.byte_progress {
         let mut byte_progress = dest.init_byte_progress();
         byte_progress.set_current(current);
@@ -169,6 +181,7 @@ pub(crate) fn parse_job_info(
 ) -> Result<JobInfo, capnp::Error> {
     let arena = parse_arena(reader.get_arena()?)?;
     let id = JobId(reader.get_id());
+    let notification_index = reader.get_notification_index();
     let job_reader = reader.get_job()?;
     let job = parse_job(job_reader)?;
     let progress_reader = reader.get_progress()?;
@@ -191,6 +204,7 @@ pub(crate) fn parse_job_info(
         progress,
         action,
         byte_progress,
+        notification_index,
     })
 }
 
@@ -282,7 +296,7 @@ mod tests {
         let arena = Arena::from("test-arena");
         let job_id = JobId(123);
 
-        ChurtenNotification::Update {
+        ChurtenNotification::Finish {
             arena,
             job_id,
             progress: JobProgress::Done,
@@ -293,7 +307,7 @@ mod tests {
         let arena = Arena::from("test-arena");
         let job_id = JobId(123);
 
-        ChurtenNotification::Update {
+        ChurtenNotification::Finish {
             arena,
             job_id,
             progress: JobProgress::Failed("error".to_string()),
@@ -309,6 +323,7 @@ mod tests {
             job_id,
             current_bytes: 42,
             total_bytes: 100,
+            index: 3,
         }
     }
 
@@ -320,6 +335,7 @@ mod tests {
             arena,
             job_id,
             action: JobAction::Download,
+            index: 2,
         }
     }
 
@@ -407,6 +423,7 @@ mod tests {
     fn test_all_job_actions() {
         let arena = Arena::from("test-arena");
         let job_id = JobId(123);
+        let index = 3;
 
         for action in [
             JobAction::Download,
@@ -418,6 +435,7 @@ mod tests {
                 arena,
                 job_id,
                 action,
+                index,
             };
             round_trip_test(notification);
         }
@@ -435,7 +453,7 @@ mod tests {
             JobProgress::Cancelled,
             JobProgress::Failed("Test error".to_string()),
         ] {
-            let notification = ChurtenNotification::Update {
+            let notification = ChurtenNotification::Finish {
                 arena,
                 job_id,
                 progress,
@@ -483,6 +501,7 @@ mod tests {
             progress: JobProgress::Running,
             action: Some(JobAction::Download),
             byte_progress: Some((42, 100)),
+            notification_index: 12,
         }
     }
 
@@ -500,6 +519,7 @@ mod tests {
             progress: JobProgress::Done,
             action: Some(JobAction::Verify),
             byte_progress: None,
+            notification_index: 4,
         }
     }
 
@@ -517,6 +537,7 @@ mod tests {
             progress: JobProgress::Failed("Test error".to_string()),
             action: None,
             byte_progress: Some((0, 0)),
+            notification_index: 9,
         }
     }
 
@@ -575,6 +596,7 @@ mod tests {
                 progress,
                 action: Some(JobAction::Download),
                 byte_progress: Some((42, 100)),
+                notification_index: 12,
             };
             job_info_round_trip_test(job_info);
         }
@@ -601,6 +623,7 @@ mod tests {
                 progress: JobProgress::Running,
                 action: Some(action),
                 byte_progress: Some((42, 100)),
+                notification_index: 10,
             };
             job_info_round_trip_test(job_info);
         }
@@ -621,6 +644,7 @@ mod tests {
             progress: JobProgress::Pending,
             action: None,
             byte_progress: None,
+            notification_index: 11,
         };
         job_info_round_trip_test(job_info);
     }

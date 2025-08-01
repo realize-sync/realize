@@ -25,6 +25,7 @@ pub(crate) struct TxByteCountProgress {
     resolution_bytes: u64,
     last_bytecount_update: Option<(u64, u64)>,
     channel_capacity: Option<usize>,
+    index: u32,
 }
 
 impl TxByteCountProgress {
@@ -41,6 +42,8 @@ impl TxByteCountProgress {
             resolution_bytes: 1,
             last_bytecount_update: None,
             channel_capacity: None,
+            // Start at 0, this way New is 0 and Start is 1.
+            index: 2,
         }
     }
 
@@ -110,22 +113,33 @@ impl TxByteCountProgress {
             }
         }
     }
+
+    fn next_index(&mut self) -> u32 {
+        let index = self.index;
+        self.index += 1;
+
+        index
+    }
 }
 
 impl ByteCountProgress for TxByteCountProgress {
     fn update_action(&mut self, action: JobAction) {
+        let index = self.next_index();
         let _ = self.tx.send(ChurtenNotification::UpdateAction {
             arena: self.arena,
             job_id: self.job_id,
+            index,
             action,
         });
     }
     fn update(&mut self, current_bytes: u64, total_bytes: u64) {
         if self.should_send(current_bytes, total_bytes) {
             self.last_bytecount_update = Some((current_bytes, total_bytes));
+            let index = self.next_index();
             let _ = self.tx.send(ChurtenNotification::UpdateByteCount {
                 arena: self.arena,
                 job_id: self.job_id,
+                index,
                 current_bytes,
                 total_bytes,
             });
@@ -265,13 +279,15 @@ mod tests {
                 ChurtenNotification::UpdateAction {
                     arena: Arena::from("myarena"),
                     job_id: JobId(1),
-                    action: JobAction::Download
+                    action: JobAction::Download,
+                    index: 2,
                 },
                 ChurtenNotification::UpdateByteCount {
                     arena: Arena::from("myarena"),
                     job_id: JobId(1),
                     current_bytes: 0,
-                    total_bytes: 1024
+                    total_bytes: 1024,
+                    index: 3,
                 }
             ],
             notifications

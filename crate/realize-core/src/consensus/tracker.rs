@@ -20,6 +20,10 @@ pub struct JobInfo {
 
     /// current / total
     pub byte_progress: Option<(u64, u64)>,
+
+    /// Index of the last UpdateAction/UpdateByteCount notification
+    /// processed for this job.
+    pub notification_index: u32,
 }
 
 /// Keep limited historical information about jobs.
@@ -34,7 +38,7 @@ pub struct JobInfoTracker {
     limit: usize,
 
     /// Jobs currently being updated
-    active: HashMap<(Arena, JobId), JobInfo>,
+    jobs: HashMap<(Arena, JobId), JobInfo>,
 
     /// Finished jobs, ordered from the oldest (front) to the newest (back).
     finished: VecDeque<(Arena, JobId)>,
@@ -50,7 +54,7 @@ impl JobInfoTracker {
         Self {
             limit,
             finished: VecDeque::new(),
-            active: HashMap::new(),
+            jobs: HashMap::new(),
         }
     }
 
@@ -60,56 +64,59 @@ impl JobInfoTracker {
         T: IntoIterator<Item = JobInfo>,
     {
         self.finished.clear();
-        self.active.clear();
+        self.jobs.clear();
         for job in jobs {
             let key = (job.arena, job.id);
             if job.progress.is_finished() {
                 self.finished.push_back(key.clone())
             }
-            self.active.insert(key, job);
+            self.jobs.insert(key, job);
         }
         self.trim();
     }
 
     /// Check whether there are any jobs in this tracker.
     pub fn is_empty(&self) -> bool {
-        self.active.is_empty()
+        self.jobs.is_empty()
     }
 
     /// Check how many jobs there are
     pub fn len(&self) -> usize {
-        self.active.len()
+        self.jobs.len()
     }
 
     /// Get a job from the tracker, if it is available.
     pub fn get(&self, arena: Arena, job_id: JobId) -> Option<&JobInfo> {
-        self.active.get(&(arena, job_id))
+        self.jobs.get(&(arena, job_id))
     }
 
     /// Iterate over all [JobInfo]s, in no particular order.
     pub fn iter(&self) -> impl Iterator<Item = &JobInfo> {
-        self.active.values()
+        self.jobs.values()
     }
 
     /// Iterate over all active [JobInfo]s.
     pub fn active(&self) -> impl Iterator<Item = &JobInfo> {
-        self.active.values().filter(|j| !j.progress.is_finished())
+        self.jobs.values().filter(|j| !j.progress.is_finished())
     }
 
     /// Iterate over all finished [JobInfo]s.
     pub fn finished(&self) -> impl Iterator<Item = &JobInfo> {
-        self.active.values().filter(|j| j.progress.is_finished())
+        self.jobs.values().filter(|j| j.progress.is_finished())
     }
 
     /// Update jobs inside this tracker.
-    pub fn update(&mut self, notification: &ChurtenNotification) {
+    ///
+    /// Return false if the notification was a duplicate or came
+    /// out-of-sequence.
+    pub fn update(&mut self, notification: &ChurtenNotification) -> bool {
         let arena = notification.arena();
         let job_id = notification.job_id();
         let id = (arena, job_id);
         match notification {
             ChurtenNotification::New { job, .. } => {
-                if !self.active.contains_key(&id) {
-                    self.active.insert(
+                if !self.jobs.contains_key(&id) {
+                    self.jobs.insert(
                         id,
                         JobInfo {
                             arena,
@@ -118,37 +125,61 @@ impl JobInfoTracker {
                             progress: JobProgress::Pending,
                             action: None,
                             byte_progress: None,
+                            notification_index: 0,
                         },
                     );
                     self.trim();
+                    return true;
                 }
             }
-            ChurtenNotification::Update { progress, .. } => {
-                if let Some(info) = self.active.get_mut(&id) {
+            ChurtenNotification::Start { .. } => {
+                if let Some(info) = self.jobs.get_mut(&id)
+                    && info.progress == JobProgress::Pending
+                {
+                    info.progress = JobProgress::Running;
+                    return true;
+                }
+            }
+            ChurtenNotification::Finish { progress, .. } => {
+                if let Some(info) = self.jobs.get_mut(&id)
+                    && !info.progress.is_finished()
+                {
                     info.progress = progress.clone();
                     info.action = None;
-                    if progress.is_finished() {
-                        self.finished.push_back(id.clone());
-                        self.trim();
-                    }
+                    self.finished.push_back(id.clone());
+                    self.trim();
+                    return true;
                 }
             }
-            ChurtenNotification::UpdateAction { action, .. } => {
-                if let Some(info) = self.active.get_mut(&id) {
+            ChurtenNotification::UpdateAction { action, index, .. } => {
+                if let Some(info) = self.jobs.get_mut(&id)
+                    && info.progress == JobProgress::Running
+                    && info.notification_index < *index
+                {
+                    info.notification_index = *index;
                     info.action = Some(*action);
                     info.byte_progress = None;
+                    return true;
                 }
             }
             ChurtenNotification::UpdateByteCount {
+                index,
                 current_bytes,
                 total_bytes,
                 ..
             } => {
-                if let Some(info) = self.active.get_mut(&id) {
-                    info.byte_progress = Some((*current_bytes, *total_bytes))
+                if let Some(info) = self.jobs.get_mut(&id)
+                    && info.progress == JobProgress::Running
+                    && info.notification_index < *index
+                {
+                    info.notification_index = *index;
+                    info.byte_progress = Some((*current_bytes, *total_bytes));
+                    return true;
                 }
             }
         };
+
+        false
     }
 
     /// Get rid of the oldest finished jobs as long as
@@ -156,7 +187,7 @@ impl JobInfoTracker {
     fn trim(&mut self) {
         while self.len() > self.limit && !self.finished.is_empty() {
             if let Some(key) = self.finished.pop_front() {
-                self.active.remove(&key);
+                self.jobs.remove(&key);
             }
         }
     }
@@ -168,7 +199,7 @@ impl IntoIterator for JobInfoTracker {
     type IntoIter = IntoValues<(Arena, JobId), JobInfo>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.active.into_values()
+        self.jobs.into_values()
     }
 }
 
@@ -205,26 +236,66 @@ mod tests {
                     job_id: self.job_id,
                     job: Arc::clone(&self.job),
                 },
-                "update_running" => ChurtenNotification::Update {
+                "start" => ChurtenNotification::Start {
                     arena: self.arena,
                     job_id: self.job_id,
-                    progress: JobProgress::Running,
                 },
-                "update_done" => ChurtenNotification::Update {
+                "finish" => ChurtenNotification::Finish {
                     arena: self.arena,
                     job_id: self.job_id,
                     progress: JobProgress::Done,
                 },
-                "update_action" => ChurtenNotification::UpdateAction {
+                "update_action(0)" => ChurtenNotification::UpdateAction {
                     arena: self.arena,
                     job_id: self.job_id,
                     action: JobAction::Download,
+                    index: 0,
                 },
-                "update_byte_count" => ChurtenNotification::UpdateByteCount {
+                "update_action(1)" => ChurtenNotification::UpdateAction {
+                    arena: self.arena,
+                    job_id: self.job_id,
+                    action: JobAction::Download,
+                    index: 1,
+                },
+                "update_action(2)" => ChurtenNotification::UpdateAction {
+                    arena: self.arena,
+                    job_id: self.job_id,
+                    action: JobAction::Download,
+                    index: 2,
+                },
+                "update_action(3)" => ChurtenNotification::UpdateAction {
+                    arena: self.arena,
+                    job_id: self.job_id,
+                    action: JobAction::Verify,
+                    index: 3,
+                },
+                "update_byte_count(0)" => ChurtenNotification::UpdateByteCount {
+                    arena: self.arena,
+                    job_id: self.job_id,
+                    current_bytes: 50,
+                    total_bytes: 1000,
+                    index: 0,
+                },
+                "update_byte_count(1)" => ChurtenNotification::UpdateByteCount {
                     arena: self.arena,
                     job_id: self.job_id,
                     current_bytes: 100,
                     total_bytes: 1000,
+                    index: 1,
+                },
+                "update_byte_count(2)" => ChurtenNotification::UpdateByteCount {
+                    arena: self.arena,
+                    job_id: self.job_id,
+                    current_bytes: 100,
+                    total_bytes: 1000,
+                    index: 2,
+                },
+                "update_byte_count(3)" => ChurtenNotification::UpdateByteCount {
+                    arena: self.arena,
+                    job_id: self.job_id,
+                    current_bytes: 200,
+                    total_bytes: 1000,
+                    index: 3,
                 },
                 _ => panic!("Unknown notification type: {}", notification_type),
             }
@@ -244,7 +315,7 @@ mod tests {
         let fixture = Fixture::new();
         let notification = fixture.create_notification("new");
 
-        tracker.update(&notification);
+        assert!(tracker.update(&notification));
 
         assert!(!tracker.is_empty());
         assert_eq!(tracker.len(), 1);
@@ -265,10 +336,10 @@ mod tests {
         let fixture = Fixture::new();
 
         // Add new job
-        tracker.update(&fixture.create_notification("new"));
+        assert!(tracker.update(&fixture.create_notification("new")));
 
         // Update to running
-        tracker.update(&fixture.create_notification("update_running"));
+        assert!(tracker.update(&fixture.create_notification("start")));
 
         let job_info = tracker.active().next().unwrap();
         assert_eq!(job_info.progress, JobProgress::Running);
@@ -280,11 +351,12 @@ mod tests {
         let mut tracker = JobInfoTracker::new(10);
         let fixture = Fixture::new();
 
-        // Add new job
-        tracker.update(&fixture.create_notification("new"));
+        // Add new job and start it
+        assert!(tracker.update(&fixture.create_notification("new")));
+        assert!(tracker.update(&fixture.create_notification("start")));
 
         // Update action
-        tracker.update(&fixture.create_notification("update_action"));
+        assert!(tracker.update(&fixture.create_notification("update_action(2)")));
 
         let job_info = tracker.active().next().unwrap();
         assert_eq!(job_info.action, Some(JobAction::Download));
@@ -295,14 +367,15 @@ mod tests {
         let mut tracker = JobInfoTracker::new(10);
         let fixture = Fixture::new();
 
-        // Add new job
-        tracker.update(&fixture.create_notification("new"));
+        // Add new job and start it
+        assert!(tracker.update(&fixture.create_notification("new")));
+        assert!(tracker.update(&fixture.create_notification("start")));
 
         // Update byte count
-        tracker.update(&fixture.create_notification("update_byte_count"));
+        assert!(tracker.update(&fixture.create_notification("update_byte_count(2)")));
 
         // Update action
-        tracker.update(&fixture.create_notification("update_action"));
+        assert!(tracker.update(&fixture.create_notification("update_action(3)")));
 
         let job_info = tracker.active().next().unwrap();
         assert_eq!(job_info.byte_progress, None);
@@ -313,11 +386,12 @@ mod tests {
         let mut tracker = JobInfoTracker::new(10);
         let fixture = Fixture::new();
 
-        // Add new job
-        tracker.update(&fixture.create_notification("new"));
+        // Add new job and start it
+        assert!(tracker.update(&fixture.create_notification("new")));
+        assert!(tracker.update(&fixture.create_notification("start")));
 
         // Update byte count
-        tracker.update(&fixture.create_notification("update_byte_count"));
+        assert!(tracker.update(&fixture.create_notification("update_byte_count(2)")));
 
         let job_info = tracker.active().next().unwrap();
         assert_eq!(job_info.byte_progress, Some((100, 1000)));
@@ -329,12 +403,12 @@ mod tests {
         let fixture = Fixture::new();
 
         // Add new job
-        tracker.update(&fixture.create_notification("new"));
+        assert!(tracker.update(&fixture.create_notification("new")));
         assert_eq!(tracker.active().count(), 1);
         assert_eq!(tracker.finished().count(), 0);
 
         // Finish the job
-        tracker.update(&fixture.create_notification("update_done"));
+        assert!(tracker.update(&fixture.create_notification("finish")));
 
         assert_eq!(tracker.active().count(), 0);
         assert_eq!(tracker.finished().count(), 1);
@@ -349,15 +423,20 @@ mod tests {
         let fixture = Fixture::new();
 
         // Add new job
-        tracker.update(&fixture.create_notification("new"));
+        assert!(tracker.update(&fixture.create_notification("new")));
+        assert_eq!(tracker.active().count(), 1);
+        assert_eq!(tracker.finished().count(), 0);
+
+        // Start it
+        assert!(tracker.update(&fixture.create_notification("start")));
         assert_eq!(tracker.active().count(), 1);
         assert_eq!(tracker.finished().count(), 0);
 
         // Update action
-        tracker.update(&fixture.create_notification("update_action"));
+        assert!(tracker.update(&fixture.create_notification("update_action(2)")));
 
         // Finish the job
-        tracker.update(&fixture.create_notification("update_done"));
+        assert!(tracker.update(&fixture.create_notification("finish")));
 
         assert_eq!(tracker.active().count(), 0);
         assert_eq!(tracker.finished().count(), 1);
@@ -376,14 +455,14 @@ mod tests {
         };
 
         // Add two jobs
-        tracker.update(&fixture1.create_notification("new"));
-        tracker.update(&fixture2.create_notification("new"));
+        assert!(tracker.update(&fixture1.create_notification("new")));
+        assert!(tracker.update(&fixture2.create_notification("new")));
 
         assert_eq!(tracker.len(), 2);
         assert_eq!(tracker.active().count(), 2);
 
         // Finish one job
-        tracker.update(&fixture1.create_notification("update_done"));
+        assert!(tracker.update(&fixture1.create_notification("finish")));
 
         assert_eq!(tracker.len(), 2);
         assert_eq!(tracker.active().count(), 1);
@@ -411,8 +490,8 @@ mod tests {
 
         // Add and finish 4 jobs
         for fixture in &fixtures {
-            tracker.update(&fixture.create_notification("new"));
-            tracker.update(&fixture.create_notification("update_done"));
+            assert!(tracker.update(&fixture.create_notification("new")));
+            assert!(tracker.update(&fixture.create_notification("finish")));
         }
 
         // Should have 3 jobs total (limit), with oldest finished job removed
@@ -445,13 +524,13 @@ mod tests {
         ];
 
         // Add 3 jobs, finish 2, keep 1 active
-        tracker.update(&fixtures[0].create_notification("new"));
-        tracker.update(&fixtures[0].create_notification("update_done"));
+        assert!(tracker.update(&fixtures[0].create_notification("new")));
+        assert!(tracker.update(&fixtures[0].create_notification("finish")));
 
-        tracker.update(&fixtures[1].create_notification("new"));
-        tracker.update(&fixtures[1].create_notification("update_done"));
+        assert!(tracker.update(&fixtures[1].create_notification("new")));
+        assert!(tracker.update(&fixtures[1].create_notification("finish")));
 
-        tracker.update(&fixtures[2].create_notification("new"));
+        assert!(tracker.update(&fixtures[2].create_notification("new")));
         // Don't finish the third job
 
         // After the second job finishes, we have 2 finished jobs
@@ -468,17 +547,17 @@ mod tests {
         let fixture = Fixture::new();
 
         // Add job
-        tracker.update(&fixture.create_notification("new"));
+        assert!(tracker.update(&fixture.create_notification("new")));
 
         // Finish job
-        tracker.update(&fixture.create_notification("update_done"));
+        assert!(tracker.update(&fixture.create_notification("finish")));
 
         // Add another active job
         let fixture2 = Fixture {
             job_id: JobId::new(2),
             ..fixture
         };
-        tracker.update(&fixture2.create_notification("new"));
+        assert!(tracker.update(&fixture2.create_notification("new")));
 
         let all_jobs: Vec<_> = tracker.iter().collect();
         assert_eq!(all_jobs.len(), 2);
@@ -489,8 +568,8 @@ mod tests {
         let mut tracker = JobInfoTracker::new(10);
         let fixture = Fixture::new();
 
-        tracker.update(&fixture.create_notification("new"));
-        tracker.update(&fixture.create_notification("update_done"));
+        assert!(tracker.update(&fixture.create_notification("new")));
+        assert!(tracker.update(&fixture.create_notification("finish")));
 
         let jobs: Vec<_> = tracker.into_iter().collect();
         assert_eq!(jobs.len(), 1);
@@ -502,7 +581,7 @@ mod tests {
         let fixture = Fixture::new();
 
         // Try to update a job that doesn't exist
-        tracker.update(&fixture.create_notification("update_running"));
+        assert!(!tracker.update(&fixture.create_notification("start")));
 
         assert!(tracker.is_empty());
         assert_eq!(tracker.len(), 0);
@@ -518,8 +597,8 @@ mod tests {
         };
 
         // Add jobs with different arenas but same job_id
-        tracker.update(&fixture1.create_notification("new"));
-        tracker.update(&fixture2.create_notification("new"));
+        assert!(tracker.update(&fixture1.create_notification("new")));
+        assert!(tracker.update(&fixture2.create_notification("new")));
 
         assert_eq!(tracker.len(), 2);
         assert_eq!(tracker.active().count(), 2);
@@ -531,17 +610,17 @@ mod tests {
         let fixture = Fixture::new();
 
         // Start with new job
-        tracker.update(&fixture.create_notification("new"));
+        assert!(tracker.update(&fixture.create_notification("new")));
         let job_info = tracker.active().next().unwrap();
         assert_eq!(job_info.progress, JobProgress::Pending);
 
         // Update to running
-        tracker.update(&fixture.create_notification("update_running"));
+        assert!(tracker.update(&fixture.create_notification("start")));
         let job_info = tracker.active().next().unwrap();
         assert_eq!(job_info.progress, JobProgress::Running);
 
         // Finish the job
-        tracker.update(&fixture.create_notification("update_done"));
+        assert!(tracker.update(&fixture.create_notification("finish")));
         let finished_job = tracker.finished().next().unwrap();
         assert_eq!(finished_job.progress, JobProgress::Done);
     }
@@ -551,17 +630,19 @@ mod tests {
         let mut tracker = JobInfoTracker::new(10);
         let fixture = Fixture::new();
 
-        // Add job
-        tracker.update(&fixture.create_notification("new"));
+        // Add job and start it
+        assert!(tracker.update(&fixture.create_notification("new")));
+        assert!(tracker.update(&fixture.create_notification("start")));
 
         // Update action multiple times
-        tracker.update(&fixture.create_notification("update_action"));
-        let job_info = tracker.active().next().unwrap();
+        assert!(tracker.update(&fixture.create_notification("update_action(2)")));
+        let job_info = tracker.active().next().unwrap().clone();
         assert_eq!(job_info.action, Some(JobAction::Download));
 
-        // Update with different action (would need a different notification type)
-        // For now, just verify the action is set correctly
-        assert_eq!(job_info.action, Some(JobAction::Download));
+        // Update with different action
+        assert!(tracker.update(&fixture.create_notification("update_action(3)")));
+        let job_info = tracker.active().next().unwrap().clone();
+        assert_eq!(job_info.action, Some(JobAction::Verify));
     }
 
     #[test]
@@ -569,16 +650,262 @@ mod tests {
         let mut tracker = JobInfoTracker::new(10);
         let fixture = Fixture::new();
 
-        // Add job
-        tracker.update(&fixture.create_notification("new"));
+        // Add job and start it
+        assert!(tracker.update(&fixture.create_notification("new")));
+        assert!(tracker.update(&fixture.create_notification("start")));
 
         // Update byte progress
-        tracker.update(&fixture.create_notification("update_byte_count"));
-        let job_info = tracker.active().next().unwrap();
+        assert!(tracker.update(&fixture.create_notification("update_byte_count(2)")));
+        let job_info = tracker.active().next().unwrap().clone();
         assert_eq!(job_info.byte_progress, Some((100, 1000)));
 
         // Update byte progress again (would need a different notification)
         // For now, just verify the byte progress is set correctly
+        assert!(tracker.update(&fixture.create_notification("update_byte_count(3)")));
+        let job_info = tracker.active().next().unwrap().clone();
+        assert_eq!(job_info.byte_progress, Some((200, 1000)));
+    }
+
+    #[test]
+    fn test_get_method() {
+        let mut tracker = JobInfoTracker::new(10);
+        let fixture = Fixture::new();
+
+        // Initially, get should return None
+        assert!(tracker.get(fixture.arena, fixture.job_id).is_none());
+
+        // Add a job
+        tracker.update(&fixture.create_notification("new"));
+
+        // Now get should return the job
+        let job_info = tracker.get(fixture.arena, fixture.job_id);
+        assert!(job_info.is_some());
+        let job_info = job_info.unwrap();
+        assert_eq!(job_info.arena, fixture.arena);
+        assert_eq!(job_info.id, fixture.job_id);
+        assert_eq!(job_info.progress, JobProgress::Pending);
+
+        // Get with different arena should return None
+        let different_arena = Arena::from("different-arena");
+        assert!(tracker.get(different_arena, fixture.job_id).is_none());
+
+        // Get with different job_id should return None
+        let different_job_id = JobId::new(999);
+        assert!(tracker.get(fixture.arena, different_job_id).is_none());
+    }
+
+    #[test]
+    fn test_duplicate_new_notification_rejected() {
+        let mut tracker = JobInfoTracker::new(10);
+        let fixture = Fixture::new();
+
+        // First new notification should succeed
+        assert!(tracker.update(&fixture.create_notification("new")));
+        assert_eq!(tracker.len(), 1);
+
+        // Second new notification for same job should be rejected
+        assert!(!tracker.update(&fixture.create_notification("new")));
+        assert_eq!(tracker.len(), 1); // Should still have only one job
+    }
+
+    #[test]
+    fn test_start_notification_out_of_order_rejected() {
+        let mut tracker = JobInfoTracker::new(10);
+        let fixture = Fixture::new();
+
+        // Try to start a job that doesn't exist
+        assert!(!tracker.update(&fixture.create_notification("start")));
+        assert_eq!(tracker.len(), 0);
+
+        // Add job and start it
+        tracker.update(&fixture.create_notification("new"));
+        assert!(tracker.update(&fixture.create_notification("start")));
+
+        // Try to start again - should be rejected
+        assert!(!tracker.update(&fixture.create_notification("start")));
+
+        // Job should still be in Running state
+        let job_info = tracker.get(fixture.arena, fixture.job_id).unwrap();
+        assert_eq!(job_info.progress, JobProgress::Running);
+    }
+
+    #[test]
+    fn test_finish_notification_out_of_order_rejected() {
+        let mut tracker = JobInfoTracker::new(10);
+        let fixture = Fixture::new();
+
+        // Try to finish a job that doesn't exist
+        assert!(!tracker.update(&fixture.create_notification("finish")));
+        assert_eq!(tracker.len(), 0);
+
+        // Add job but don't start it
+        assert!(tracker.update(&fixture.create_notification("new")));
+
+        // Try to finish a pending job - should work
+        assert!(tracker.update(&fixture.create_notification("finish")));
+
+        // Job should now be in Done state
+        let job_info = tracker.get(fixture.arena, fixture.job_id).unwrap();
+        assert_eq!(job_info.progress, JobProgress::Done);
+
+        // Try to finish again - should be rejected
+        assert!(!tracker.update(&fixture.create_notification("finish")));
+    }
+
+    #[test]
+    fn test_update_action_out_of_order_rejected() {
+        let mut tracker = JobInfoTracker::new(10);
+        let fixture = Fixture::new();
+
+        // Try to update action on non-existent job
+        assert!(!tracker.update(&fixture.create_notification("update_action(1)")));
+        assert_eq!(tracker.len(), 0);
+
+        // Add job but don't start it
+        tracker.update(&fixture.create_notification("new"));
+
+        // Try to update action on pending job - should be rejected
+        assert!(!tracker.update(&fixture.create_notification("update_action(1)")));
+
+        // Start the job
+        tracker.update(&fixture.create_notification("start"));
+
+        // Now update action should work
+        assert!(tracker.update(&fixture.create_notification("update_action(1)")));
+
+        // Try to update with same or lower index - should be rejected
+        assert!(!tracker.update(&fixture.create_notification("update_action(1)")));
+        assert!(!tracker.update(&fixture.create_notification("update_action(0)")));
+
+        // Update with higher index should work
+        assert!(tracker.update(&fixture.create_notification("update_action(2)")));
+    }
+
+    #[test]
+    fn test_update_byte_count_out_of_order_rejected() {
+        let mut tracker = JobInfoTracker::new(10);
+        let fixture = Fixture::new();
+
+        // Try to update byte count on non-existent job
+        assert!(!tracker.update(&fixture.create_notification("update_byte_count(1)")));
+        assert_eq!(tracker.len(), 0);
+
+        // Add job but don't start it
+        tracker.update(&fixture.create_notification("new"));
+
+        // Try to update byte count on pending job - should be rejected
+        assert!(!tracker.update(&fixture.create_notification("update_byte_count(1)")));
+
+        // Start the job
+        tracker.update(&fixture.create_notification("start"));
+
+        // Now update byte count should work
+        assert!(tracker.update(&fixture.create_notification("update_byte_count(1)")));
+
+        // Try to update with same or lower index - should be rejected
+        assert!(!tracker.update(&fixture.create_notification("update_byte_count(1)")));
+        assert!(!tracker.update(&fixture.create_notification("update_byte_count(0)")));
+
+        // Update with higher index should work
+        assert!(tracker.update(&fixture.create_notification("update_byte_count(2)")));
+    }
+
+    #[test]
+    fn test_notification_index_tracking() {
+        let mut tracker = JobInfoTracker::new(10);
+        let fixture = Fixture::new();
+
+        // Add and start job
+        tracker.update(&fixture.create_notification("new"));
+        tracker.update(&fixture.create_notification("start"));
+
+        // Update action with index 1
+        assert!(tracker.update(&fixture.create_notification("update_action(1)")));
+        let job_info = tracker.get(fixture.arena, fixture.job_id).unwrap();
+        assert_eq!(job_info.notification_index, 1);
+        assert_eq!(job_info.action, Some(JobAction::Download));
+
+        // Update byte count with index 2
+        assert!(tracker.update(&fixture.create_notification("update_byte_count(2)")));
+        let job_info = tracker.get(fixture.arena, fixture.job_id).unwrap();
+        assert_eq!(job_info.notification_index, 2);
         assert_eq!(job_info.byte_progress, Some((100, 1000)));
+
+        // Update action with index 3
+        assert!(tracker.update(&fixture.create_notification("update_action(3)")));
+        let job_info = tracker.get(fixture.arena, fixture.job_id).unwrap();
+        assert_eq!(job_info.notification_index, 3);
+        assert_eq!(job_info.action, Some(JobAction::Verify));
+        assert_eq!(job_info.byte_progress, None); // Should be reset
+    }
+
+    #[test]
+    fn test_finish_resets_notification_state() {
+        let mut tracker = JobInfoTracker::new(10);
+        let fixture = Fixture::new();
+
+        // Add, start, and update job
+        tracker.update(&fixture.create_notification("new"));
+        tracker.update(&fixture.create_notification("start"));
+        tracker.update(&fixture.create_notification("update_action(1)"));
+
+        // Finish the job
+        assert!(tracker.update(&fixture.create_notification("finish")));
+
+        let job_info = tracker.get(fixture.arena, fixture.job_id).unwrap();
+        assert_eq!(job_info.progress, JobProgress::Done);
+        assert_eq!(job_info.action, None); // Should be reset
+        assert_eq!(job_info.byte_progress, None); // Should be None
+    }
+
+    #[test]
+    fn test_update_action_resets_byte_progress() {
+        let mut tracker = JobInfoTracker::new(10);
+        let fixture = Fixture::new();
+
+        // Add, start, and set byte progress
+        tracker.update(&fixture.create_notification("new"));
+        tracker.update(&fixture.create_notification("start"));
+        tracker.update(&fixture.create_notification("update_byte_count(1)"));
+
+        let job_info = tracker.get(fixture.arena, fixture.job_id).unwrap();
+        assert_eq!(job_info.byte_progress, Some((100, 1000)));
+
+        // Update action should reset byte progress
+        assert!(tracker.update(&fixture.create_notification("update_action(2)")));
+        let job_info = tracker.get(fixture.arena, fixture.job_id).unwrap();
+        assert_eq!(job_info.byte_progress, None);
+        assert_eq!(job_info.action, Some(JobAction::Download));
+    }
+
+    #[test]
+    fn test_multiple_jobs_independent_notification_indices() {
+        let mut tracker = JobInfoTracker::new(10);
+        let fixture1 = Fixture::new();
+        let fixture2 = Fixture {
+            job_id: JobId::new(2),
+            ..fixture1.clone()
+        };
+
+        // Add and start both jobs
+        tracker.update(&fixture1.create_notification("new"));
+        tracker.update(&fixture1.create_notification("start"));
+        tracker.update(&fixture2.create_notification("new"));
+        tracker.update(&fixture2.create_notification("start"));
+
+        // Update job1 with index 1
+        assert!(tracker.update(&fixture1.create_notification("update_action(1)")));
+
+        // Update job2 with index 1 (should work independently)
+        assert!(tracker.update(&fixture2.create_notification("update_action(1)")));
+
+        // Update job1 with index 2
+        assert!(tracker.update(&fixture1.create_notification("update_action(2)")));
+
+        // Both jobs should have their own notification indices
+        let job1_info = tracker.get(fixture1.arena, fixture1.job_id).unwrap();
+        let job2_info = tracker.get(fixture2.arena, fixture2.job_id).unwrap();
+        assert_eq!(job1_info.notification_index, 2);
+        assert_eq!(job2_info.notification_index, 1);
     }
 }
