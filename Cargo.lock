@@ -1389,6 +1389,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "indicatif"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70a646d946d06bedbbc4cac4c218acf4bbf2d87757a784857025f4d447e4e1cd"
+dependencies = [
+ "console 0.16.0",
+ "portable-atomic",
+ "unicode-width",
+ "unit-prefix",
+ "web-time",
+]
+
+[[package]]
 name = "inotify"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2240,7 +2253,7 @@ dependencies = [
  "humantime",
  "hyper",
  "hyper-util",
- "indicatif",
+ "indicatif 0.17.11",
  "lazy_static",
  "log",
  "parse-size",
@@ -2274,6 +2287,7 @@ dependencies = [
  "clap",
  "console 0.16.0",
  "env_logger",
+ "indicatif 0.18.0",
  "log",
  "realize-core",
  "realize-network",
@@ -2281,6 +2295,7 @@ dependencies = [
  "realize-types",
  "scopeguard",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -3375,6 +3390,12 @@ name = "unicode-width"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fc81956842c57dac11422a97c3b8195a1ff727f06e85c84ed2e8aa277c9a0fd"
+
+[[package]]
+name = "unit-prefix"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "323402cff2dd658f39ca17c789b502021b3f18707c91cdf22e3838e1b4023817"
 
 [[package]]
 name = "untrusted"

@@ -1,11 +1,8 @@
 use super::types::{ChurtenNotification, JobAction, JobProgress};
 use realize_storage::{Job, JobId};
 use realize_types::Arena;
-use std::{
-    collections::{HashMap, VecDeque, hash_map::IntoValues},
-    iter::Chain,
-    sync::Arc,
-};
+use std::collections::{HashMap, VecDeque, hash_map::IntoValues};
+use std::sync::Arc;
 
 /// Information about a job and its progress.
 ///
@@ -40,7 +37,7 @@ pub struct JobInfoTracker {
     active: HashMap<(Arena, JobId), JobInfo>,
 
     /// Finished jobs, ordered from the oldest (front) to the newest (back).
-    finished: VecDeque<JobInfo>,
+    finished: VecDeque<(Arena, JobId)>,
 }
 
 #[allow(dead_code)]
@@ -57,47 +54,51 @@ impl JobInfoTracker {
         }
     }
 
+    /// Initialize or re-initialize the tracker from a set of jobs.
+    pub fn init<T>(&mut self, jobs: T)
+    where
+        T: IntoIterator<Item = JobInfo>,
+    {
+        self.finished.clear();
+        self.active.clear();
+        for job in jobs {
+            let key = (job.arena, job.id);
+            if job.progress.is_finished() {
+                self.finished.push_back(key.clone())
+            }
+            self.active.insert(key, job);
+        }
+        self.trim();
+    }
+
     /// Check whether there are any jobs in this tracker.
     pub fn is_empty(&self) -> bool {
-        self.active.is_empty() && self.finished.is_empty()
+        self.active.is_empty()
     }
 
     /// Check how many jobs there are
     pub fn len(&self) -> usize {
-        self.active.len() + self.finished.len()
+        self.active.len()
+    }
+
+    /// Get a job from the tracker, if it is available.
+    pub fn get(&self, arena: Arena, job_id: JobId) -> Option<&JobInfo> {
+        self.active.get(&(arena, job_id))
     }
 
     /// Iterate over all [JobInfo]s, in no particular order.
     pub fn iter(&self) -> impl Iterator<Item = &JobInfo> {
-        self.active.values().chain(self.finished.iter())
+        self.active.values()
     }
 
     /// Iterate over all active [JobInfo]s.
     pub fn active(&self) -> impl Iterator<Item = &JobInfo> {
-        self.active.values()
+        self.active.values().filter(|j| !j.progress.is_finished())
     }
 
     /// Iterate over all finished [JobInfo]s.
     pub fn finished(&self) -> impl Iterator<Item = &JobInfo> {
-        self.finished.iter()
-    }
-
-    /// Fill tracker with some existing JobInfo.
-    ///
-    /// This is useful to start tracking notifications after getting a
-    /// list of remote jobs.
-    pub fn backfill<T>(&mut self, jobs: T)
-    where
-        T: IntoIterator<Item = JobInfo>,
-    {
-        for job in jobs.into_iter() {
-            if job.progress.is_finished() {
-                self.finished.push_back(job)
-            } else {
-                let id = (job.arena, job.id);
-                self.active.insert(id, job);
-            }
-        }
+        self.active.values().filter(|j| j.progress.is_finished())
     }
 
     /// Update jobs inside this tracker.
@@ -107,31 +108,28 @@ impl JobInfoTracker {
         let id = (arena, job_id);
         match notification {
             ChurtenNotification::New { job, .. } => {
-                self.active.insert(
-                    id,
-                    JobInfo {
-                        arena,
-                        id: job_id,
-                        job: Arc::clone(job),
-                        progress: JobProgress::Pending,
-                        action: None,
-                        byte_progress: None,
-                    },
-                );
-                self.trim();
+                if !self.active.contains_key(&id) {
+                    self.active.insert(
+                        id,
+                        JobInfo {
+                            arena,
+                            id: job_id,
+                            job: Arc::clone(job),
+                            progress: JobProgress::Pending,
+                            action: None,
+                            byte_progress: None,
+                        },
+                    );
+                    self.trim();
+                }
             }
             ChurtenNotification::Update { progress, .. } => {
-                if progress.is_finished() {
-                    if let Some(mut info) = self.active.remove(&id) {
-                        info.progress = progress.clone();
-                        info.action = None;
-                        self.finished.push_back(info);
+                if let Some(info) = self.active.get_mut(&id) {
+                    info.progress = progress.clone();
+                    info.action = None;
+                    if progress.is_finished() {
+                        self.finished.push_back(id.clone());
                         self.trim();
-                    }
-                } else {
-                    if let Some(info) = self.active.get_mut(&id) {
-                        info.progress = progress.clone();
-                        info.action = None;
                     }
                 }
             }
@@ -157,7 +155,9 @@ impl JobInfoTracker {
     /// the total number of jobs is above limit.
     fn trim(&mut self) {
         while self.len() > self.limit && !self.finished.is_empty() {
-            self.finished.pop_front();
+            if let Some(key) = self.finished.pop_front() {
+                self.active.remove(&key);
+            }
         }
     }
 }
@@ -165,11 +165,10 @@ impl JobInfoTracker {
 impl IntoIterator for JobInfoTracker {
     type Item = JobInfo;
 
-    type IntoIter =
-        Chain<IntoValues<(Arena, JobId), JobInfo>, <VecDeque<JobInfo> as IntoIterator>::IntoIter>;
+    type IntoIter = IntoValues<(Arena, JobId), JobInfo>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.active.into_values().chain(self.finished.into_iter())
+        self.active.into_values()
     }
 }
 
@@ -507,38 +506,6 @@ mod tests {
 
         assert!(tracker.is_empty());
         assert_eq!(tracker.len(), 0);
-    }
-
-    #[test]
-    fn test_update_action_on_finished_job_does_nothing() {
-        let mut tracker = JobInfoTracker::new(10);
-        let fixture = Fixture::new();
-
-        // Add and finish job
-        tracker.update(&fixture.create_notification("new"));
-        tracker.update(&fixture.create_notification("update_done"));
-
-        // Try to update action on finished job
-        tracker.update(&fixture.create_notification("update_action"));
-
-        let finished_job = tracker.finished().next().unwrap();
-        assert_eq!(finished_job.action, None);
-    }
-
-    #[test]
-    fn test_update_byte_count_on_finished_job_does_nothing() {
-        let mut tracker = JobInfoTracker::new(10);
-        let fixture = Fixture::new();
-
-        // Add and finish job
-        tracker.update(&fixture.create_notification("new"));
-        tracker.update(&fixture.create_notification("update_done"));
-
-        // Try to update byte count on finished job
-        tracker.update(&fixture.create_notification("update_byte_count"));
-
-        let finished_job = tracker.finished().next().unwrap();
-        assert_eq!(finished_job.byte_progress, None);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 use clap::ValueEnum;
 use console::style;
+use indicatif::ProgressStyle;
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
 pub(crate) enum OutputMode {
@@ -64,4 +65,37 @@ pub(crate) fn print_info<T: AsRef<str>>(mode: OutputMode, msg: T) {
             println!("{msg}");
         }
     }
+}
+
+/// A progress bar with bytes per sec and total bytes.
+///
+/// Formatting is compatible with success/warning/error messages
+/// displayed when output mode is [OutputMode::Progress].
+fn bar_with_byte_progress() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{prefix:<10.cyan.bold} [{wide_bar:.cyan/blue}] {bytes_per_sec} ({bytes}/{total_bytes}) {percent}%",
+    )
+        .unwrap()
+        .progress_chars("=> ")
+}
+
+/// A tagged message with bytes per sec and total bytes.
+///
+/// Formatting is compatible with success/warning/error messages
+/// displayed when output mode is [OutputMode::Progress].
+fn tagged_message_with_byte_progress(tag: &str, warn: bool) -> ProgressStyle {
+    let tag = tag.to_string();
+    ProgressStyle::with_template(if warn {
+        "{prefix:<10.yellow.bold} [{tag}] {wide_msg} ({bytes}/{total_bytes}) {percent}%"
+    } else {
+        "{prefix:<10.cyan.bold} [{tag}] {wide_msg} ({bytes}/{total_bytes}) {percent}%"
+    })
+    .unwrap()
+    .progress_chars("=> ")
+    .with_key(
+        "tag",
+        move |_state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
+            let _ = w.write_str(&tag);
+        },
+    )
 }

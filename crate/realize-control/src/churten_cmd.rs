@@ -1,7 +1,13 @@
 use super::output::{self, OutputMode};
+use crate::progress::{self, Progress};
 use anyhow::Result;
 use realize_core::rpc::control::client;
+use realize_core::rpc::control::client::ChurtenUpdates;
 use realize_core::rpc::control::control_capnp;
+use tokio::signal::ctrl_c;
+use tokio::sync::mpsc;
+use tokio::task;
+use tokio_util::sync::CancellationToken;
 
 /// Execute the churten start command
 pub(crate) async fn execute_churten_start(
@@ -48,29 +54,54 @@ pub(crate) async fn execute_churten_run(
     control: &control_capnp::control::Client,
     output_mode: OutputMode,
 ) -> Result<i32> {
+    let shutdown = CancellationToken::new();
+    task::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            if ctrl_c().await.is_ok() {
+                if output_mode == OutputMode::Progress {
+                    println!("\nCTRL-C");
+                }
+                shutdown.cancel();
+            }
+        }
+    });
+
     let churten = client::get_churten(&control).await?;
     churten.start_request().send().promise.await?;
     output::print_success(output_mode, "Starting", "...");
 
-    let res = run_churten(&churten).await;
+    let rx = client::subscribe_to_churten(&churten).await?;
 
-    churten.shutdown_request().send().promise.await?;
+    // Have run_churten run in a normal Tokio environment (outside
+    // LocalSet).
+    let res = task::spawn(async move { run_churten(output_mode, rx, shutdown).await }).await;
+
+    // Shutdown even if run_churten failed and prioritize showing the
+    // error from churten over the error from shutdown.
+    let shutdown_res = churten.shutdown_request().send().promise.await;
+    res??;
+    shutdown_res?;
     output::print_info(output_mode, "Churten stopped");
-
-    res?;
 
     Ok(0)
 }
 
 async fn run_churten(
-    churten: &realize_core::rpc::control::control_capnp::churten::Client,
-) -> Result<i32, anyhow::Error> {
-    let mut rx = client::subscribe_to_churten(churten).await?;
-
-    while let Some(update) = rx.recv().await {
-        println!("RECV: {update:?}");
+    output_mode: OutputMode,
+    mut rx: mpsc::Receiver<ChurtenUpdates>,
+    shutdown: CancellationToken,
+) -> Result<(), anyhow::Error> {
+    let mut p = progress::create(output_mode).await?;
+    while let Some(update) = tokio::select!(
+        _ = shutdown.cancelled() => {
+            return Ok(());
+        }
+        res = rx.recv() =>  { res })
+    {
+        p.update(update).await;
     }
-    println!("Done rx.closed: {}", rx.is_closed());
+    p.finished().await;
 
-    return Ok(0);
+    return Ok(());
 }

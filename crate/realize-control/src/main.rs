@@ -9,6 +9,7 @@ use tokio::task::LocalSet;
 mod churten_cmd;
 mod mark_cmd;
 mod output;
+mod progress;
 
 /// Command-line tool for controlling a running instance of realize-daemon
 #[derive(Parser, Debug)]
