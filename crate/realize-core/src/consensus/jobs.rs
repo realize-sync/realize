@@ -212,9 +212,7 @@ pub(crate) async fn verify(
         anyhow::bail!("cancelled")
     });
     if content_hash != *hash {
-        anyhow::bail!(
-            "Wrong hash for [{arena}]/{path} after rsync with {peers:?}: got {content_hash}, but expected {hash}"
-        );
+        anyhow::bail!("Hashes inconsistent after repair");
     }
     blob.mark_verified().await?;
     log::debug!("[{arena}]/{path} fixed and verified against {hash}");

@@ -59,9 +59,6 @@ pub(crate) async fn execute_churten_run(
         let shutdown = shutdown.clone();
         async move {
             if ctrl_c().await.is_ok() {
-                if output_mode == OutputMode::Progress {
-                    println!("\nCTRL-C");
-                }
                 shutdown.cancel();
             }
         }
@@ -69,13 +66,19 @@ pub(crate) async fn execute_churten_run(
 
     let churten = client::get_churten(&control).await?;
     churten.start_request().send().promise.await?;
-    output::print_success(output_mode, "Starting", "...");
 
     let rx = client::subscribe_to_churten(&churten).await?;
 
     // Have run_churten run in a normal Tokio environment (outside
     // LocalSet).
-    let res = task::spawn(async move { run_churten(output_mode, rx, shutdown).await }).await;
+    let res = task::spawn(async move {
+        let mut display = ChurtenDisplay::new(output_mode);
+        let res = run_churten(&mut display, rx, shutdown).await;
+        display.finished().await;
+
+        res
+    })
+    .await;
 
     // Shutdown even if run_churten failed and prioritize showing the
     // error from churten over the error from shutdown.
@@ -88,11 +91,10 @@ pub(crate) async fn execute_churten_run(
 }
 
 async fn run_churten(
-    output_mode: OutputMode,
+    display: &mut ChurtenDisplay,
     mut rx: mpsc::Receiver<ChurtenUpdates>,
     shutdown: CancellationToken,
 ) -> Result<(), anyhow::Error> {
-    let mut display = ChurtenDisplay::new(output_mode);
     while let Some(update) = tokio::select!(
         _ = shutdown.cancelled() => {
             return Ok(());
@@ -101,7 +103,6 @@ async fn run_churten(
     {
         display.update(update).await;
     }
-    display.finished().await;
 
     return Ok(());
 }

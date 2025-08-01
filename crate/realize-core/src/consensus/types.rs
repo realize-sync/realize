@@ -64,6 +64,11 @@ pub enum ChurtenNotification {
 }
 
 impl ChurtenNotification {
+    /// A globally-unique identifier for the job.
+    pub fn global_job_id(&self) -> (Arena, JobId) {
+        (self.arena(), self.job_id())
+    }
+
     pub fn arena(&self) -> Arena {
         match self {
             ChurtenNotification::New { arena, .. } => *arena,

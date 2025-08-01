@@ -115,7 +115,6 @@ impl<H: JobHandler + 'static> Churten<H> {
         if self.task.is_some() {
             return;
         }
-        log::debug!("starting");
         let shutdown = CancellationToken::new();
         let handle = tokio::spawn({
             let shutdown = shutdown.clone();
