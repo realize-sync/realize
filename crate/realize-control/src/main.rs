@@ -7,9 +7,9 @@ use std::path::PathBuf;
 use tokio::task::LocalSet;
 
 mod churten_cmd;
+mod display;
 mod mark_cmd;
 mod output;
-mod progress;
 
 /// Command-line tool for controlling a running instance of realize-daemon
 #[derive(Parser, Debug)]

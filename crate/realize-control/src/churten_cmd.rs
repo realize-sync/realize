@@ -1,5 +1,5 @@
+use super::display::ChurtenDisplay;
 use super::output::{self, OutputMode};
-use crate::progress::{self, Progress};
 use anyhow::Result;
 use realize_core::rpc::control::client;
 use realize_core::rpc::control::client::ChurtenUpdates;
@@ -92,16 +92,16 @@ async fn run_churten(
     mut rx: mpsc::Receiver<ChurtenUpdates>,
     shutdown: CancellationToken,
 ) -> Result<(), anyhow::Error> {
-    let mut p = progress::create(output_mode).await?;
+    let mut display = ChurtenDisplay::new(output_mode);
     while let Some(update) = tokio::select!(
         _ = shutdown.cancelled() => {
             return Ok(());
         }
         res = rx.recv() =>  { res })
     {
-        p.update(update).await;
+        display.update(update).await;
     }
-    p.finished().await;
+    display.finished().await;
 
     return Ok(());
 }
