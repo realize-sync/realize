@@ -65,6 +65,8 @@ pub struct Download {
     pending_seek: Option<u64>,
 
     /// Chunks kept in memory, sorted by ByteRange.start.
+    ///
+    /// The first range should always contain offset.
     avail: VecDeque<(ByteRange, Vec<u8>)>,
     read: ReadState,
     blob: Blob,
