@@ -43,11 +43,17 @@ pub struct ByteRange {
 impl ByteRange {
     /// Create a new range from `start` to `end` (exclusive).
     ///
-    /// # Panics
-    ///
-    /// Does not panic, but callers should ensure `start <= end` for valid ranges.
+    /// Callers should ensure `start <= end` for valid ranges.
     pub fn new(start: u64, end: u64) -> Self {
         ByteRange { start, end }
+    }
+
+    /// Create a new range from `start` with the given size.
+    pub fn new_with_size(start: u64, size: u64) -> Self {
+        ByteRange {
+            start,
+            end: start + size,
+        }
     }
     /// Build a zero-length range with the given position.
     pub fn zero_len(start: u64) -> Self {
@@ -163,6 +169,17 @@ mod tests {
         assert!(ByteRange::empty().is_empty());
         assert!(ByteRange::new(2, 2).is_empty());
         assert!(!ByteRange::new(1, 2).is_empty());
+    }
+    #[test]
+    fn test_new_with_range() {
+        assert_eq!(
+            ByteRange::new_with_size(1, 3),
+            ByteRange { start: 1, end: 4 }
+        );
+        assert_eq!(
+            ByteRange::new_with_size(2, 0),
+            ByteRange { start: 2, end: 2 }
+        );
     }
     #[test]
     fn test_bytecount() {
