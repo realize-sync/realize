@@ -18,84 +18,51 @@ pub(crate) enum OutputMode {
     Log,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MessageType {
+    SUCCESS,
+    ERROR,
+    WARNING,
+    PROGRESS,
+}
+
 /// Print a warning message to stderr, with standard format.
 pub(crate) fn print_warning<T: AsRef<str>, U: AsRef<str>>(mode: OutputMode, tag: T, msg: U) {
-    print_warning_internal(mode, tag.as_ref(), msg.as_ref(), false);
-}
-
-/// Print a warning message to stderr, with standard format, aligned with bars.
-pub(crate) fn print_warning_aligned<T: AsRef<str>, U: AsRef<str>>(
-    mode: OutputMode,
-    tag: T,
-    msg: U,
-) {
-    print_warning_internal(mode, tag.as_ref(), msg.as_ref(), true);
-}
-
-fn print_warning_internal(mode: OutputMode, tag: &str, msg: &str, align: bool) {
+    let tag = tag.as_ref();
+    let msg = msg.as_ref();
     log::warn!("{tag} {msg}");
     match mode {
         OutputMode::Log => {}
         OutputMode::Quiet | OutputMode::Progress => {
             let tag = style(tag).for_stderr().red();
-            if align {
-                eprintln!("{tag:>10} {msg}");
-            } else {
-                eprintln!("{tag} {msg}");
-            }
+            eprintln!("{tag} {msg}");
         }
     }
 }
 
 /// Print an error message to stderr, with standard format.
 pub(crate) fn print_error<T: AsRef<str>>(mode: OutputMode, msg: T) {
-    print_error_internal(mode, msg.as_ref(), false);
-}
-
-pub(crate) fn print_error_aligned<T: AsRef<str>>(mode: OutputMode, msg: T) {
-    print_error_internal(mode, msg.as_ref(), true);
-}
-
-pub(crate) fn print_error_internal(mode: OutputMode, msg: &str, align: bool) {
+    let msg = msg.as_ref();
     log::error!("{msg}");
     match mode {
         OutputMode::Log => {}
         OutputMode::Quiet | OutputMode::Progress => {
             let tag = style("ERROR").for_stderr().red().bold();
-            if align {
-                eprintln!("{tag:>10} {msg}");
-            } else {
-                eprintln!("{tag} {msg}");
-            }
+            eprintln!("{tag} {msg}");
         }
     }
 }
 
 /// Print an success message to stdout, with standard format.
 pub(crate) fn print_success<T: AsRef<str>, U: AsRef<str>>(mode: OutputMode, tag: T, msg: U) {
-    print_success_internal(mode, tag.as_ref(), msg.as_ref(), false);
-}
-
-/// Print an success message to stdout, with standard format, aligned with bars.
-pub(crate) fn print_success_aligned<T: AsRef<str>, U: AsRef<str>>(
-    mode: OutputMode,
-    tag: T,
-    msg: U,
-) {
-    print_success_internal(mode, tag.as_ref(), msg.as_ref(), true);
-}
-
-fn print_success_internal(mode: OutputMode, tag: &str, msg: &str, align: bool) {
+    let tag = tag.as_ref();
+    let msg = msg.as_ref();
     log::info!("{tag} {msg}");
     match mode {
         OutputMode::Log | OutputMode::Quiet => {}
         OutputMode::Progress => {
             let tag = style(tag).for_stdout().green().bold();
-            if align {
-                println!("{tag:>10} {msg}");
-            } else {
-                println!("{tag} {msg}");
-            }
+            println!("{tag} {msg}");
         }
     }
 }
@@ -112,29 +79,28 @@ pub(crate) fn print_info<T: AsRef<str>>(mode: OutputMode, msg: T) {
     }
 }
 
-/// A message with bytes per sec and total bytes.
+/// Build a progress bar style.
 ///
 /// Formatting is compatible with success/warning/error messages
 /// displayed when output mode is [OutputMode::Progress].
-pub(crate) fn wide_message_with_byte_progress(warn: bool) -> ProgressStyle {
-    ProgressStyle::with_template(if warn {
-        "{prefix:>10.yellow.bold} {wide_msg} ({bytes}/{total_bytes}) {percent}%"
-    } else {
-        "{prefix:>10.cyan.bold} {wide_msg} ({bytes}/{total_bytes}) {percent}%"
-    })
-    .unwrap()
-    .progress_chars("=> ")
-}
-
-/// A message with bytes per sec and total bytes.
-///
-/// Formatting is compatible with success/warning/error messages
-/// displayed when output mode is [OutputMode::Progress].
-pub(crate) fn wide_message(warn: bool) -> ProgressStyle {
-    ProgressStyle::with_template(if warn {
-        "{prefix:>10.yellow.bold} {wide_msg}"
-    } else {
-        "{prefix:>10.cyan.bold} {wide_msg}"
+pub(crate) fn progress_style(msg: MessageType, with_bytes: bool) -> ProgressStyle {
+    ProgressStyle::with_template(match (msg, with_bytes) {
+        (MessageType::PROGRESS, false) => "{prefix:>12.cyan.bold} {wide_msg}",
+        (MessageType::SUCCESS, false) => "{prefix:>12.green.bold} {wide_msg}",
+        (MessageType::ERROR, false) => "{prefix:>12.red.bold} {wide_msg}",
+        (MessageType::WARNING, false) => "{prefix:>12.yellow.bold} {wide_msg}",
+        (MessageType::PROGRESS, true) => {
+            "{prefix:>12.cyan.bold} {wide_msg} ({bytes}/{total_bytes}) {percent}%"
+        }
+        (MessageType::SUCCESS, true) => {
+            "{prefix:>12.green.bold} {wide_msg} ({bytes}/{total_bytes}) {percent}%"
+        }
+        (MessageType::ERROR, true) => {
+            "{prefix:>12.red.bold} {wide_msg} ({bytes}/{total_bytes}) {percent}%"
+        }
+        (MessageType::WARNING, true) => {
+            "{prefix:>12.yellow.bold} {wide_msg} ({bytes}/{total_bytes}) {percent}%"
+        }
     })
     .unwrap()
     .progress_chars("=> ")

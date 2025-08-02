@@ -1,3 +1,4 @@
+use super::output::{self, MessageType, OutputMode};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
 use realize_core::consensus::tracker::{JobInfo, JobInfoTracker};
 use realize_core::consensus::types::{ChurtenNotification, JobAction, JobProgress};
@@ -5,9 +6,6 @@ use realize_core::rpc::control::client::ChurtenUpdates;
 use realize_storage::{Job, JobId};
 use realize_types::Arena;
 use std::collections::HashMap;
-
-use crate::output::wide_message_with_byte_progress;
-use crate::{OutputMode, output};
 
 pub(crate) struct ChurtenDisplay {
     output_mode: OutputMode,
@@ -47,7 +45,9 @@ impl ChurtenDisplay {
             ChurtenUpdates::Reset(jobs) => {
                 let total = jobs.len();
                 log_jobs(&jobs, total);
-                self.init_bars(&jobs);
+                if self.output_mode == OutputMode::Progress {
+                    self.init_bars(&jobs);
+                }
                 self.tracker.init(jobs);
             }
             ChurtenUpdates::Notify(n) => {
@@ -55,9 +55,40 @@ impl ChurtenDisplay {
                     return;
                 }
 
-                self.log_notification(&n);
-                self.update_bar_from_notification(&n);
+                self.log_notification(&n); // log in all modes
+                match self.output_mode {
+                    OutputMode::Log => {}
+                    OutputMode::Progress => self.update_bar_from_notification(&n),
+                    OutputMode::Quiet => self.print_errors(&n),
+                }
             }
+        }
+    }
+
+    /// In quiet mode, only print errors.
+    fn print_errors(&mut self, n: &ChurtenNotification) {
+        match n {
+            ChurtenNotification::Finish { progress, .. } => match progress {
+                JobProgress::Pending | JobProgress::Done => {}
+                JobProgress::Failed(msg) => {
+                    if let Some(job) = self.tracker.get(&n.global_job_id()) {
+                        output::print_error(
+                            self.output_mode,
+                            format!("{}: {}", display_path(job), msg),
+                        );
+                    }
+                }
+                _ => {
+                    if let Some(job) = self.tracker.get(&n.global_job_id()) {
+                        output::print_warning(
+                            self.output_mode,
+                            format!("{progress:?}"),
+                            display_path(job),
+                        );
+                    }
+                }
+            },
+            _ => {}
         }
     }
 
@@ -116,37 +147,41 @@ impl ChurtenDisplay {
     fn create_bar(&self, job: &JobInfo) -> ProgressBar {
         let mut bar = self.multi.insert_from_back(1, ProgressBar::no_length());
 
-        bar.set_style(output::wide_message(false));
+        bar.set_style(output::progress_style(MessageType::PROGRESS, false));
         bar.set_message(display_path(job));
         update_bar_for_job(&mut bar, job);
 
         bar
     }
 
-    fn finish_bar(&self, bar: ProgressBar, job: &JobInfo) {
-        bar.finish_and_clear();
-        self.multi.suspend(|| match &job.progress {
+    fn finish_bar(&self, mut bar: ProgressBar, job: &JobInfo) {
+        update_bar_for_job(&mut bar, job);
+        match &job.progress {
             JobProgress::Done => {
-                let prefix = match *job.job {
-                    Job::Download(_, _) => "Downloaded",
-                    Job::Realize(_, _, _) | Job::Unrealize(_, _) => "Moved",
-                };
-                output::print_success_aligned(self.output_mode, prefix, display_path(job));
+                // If notifications were lost, progress might not have
+                // reached 100% even though it's finished.
+                if let Some(length) = bar.length() {
+                    bar.set_position(length);
+                }
+                bar.set_prefix(finished_job_name(job));
+                bar.set_style(output::progress_style(
+                    MessageType::SUCCESS,
+                    bar.length().is_some(),
+                ));
             }
-            JobProgress::Failed(msg) => {
-                output::print_error_aligned(
-                    self.output_mode,
-                    format!("{} {}: {msg}", job_name(job), display_path(job)),
-                );
+            JobProgress::Failed(err) => {
+                bar.set_message(format!("{}: {err}", display_path(job)));
+                bar.set_style(output::progress_style(MessageType::ERROR, false));
             }
             _ => {
-                output::print_warning_aligned(
-                    self.output_mode,
-                    format!("{:?}", job.progress),
-                    format!("{} {}", job_name(job), display_path(job)),
-                );
+                bar.set_style(output::progress_style(
+                    MessageType::WARNING,
+                    bar.length().is_some(),
+                ));
             }
-        });
+        }
+
+        bar.finish();
     }
 
     fn log_notification(&self, n: &ChurtenNotification) {
@@ -201,7 +236,7 @@ fn format_log_string(job: &JobInfo) -> String {
         "[{}]/{} {} {}",
         job.arena,
         job.job.path(),
-        job_name(job),
+        in_progress_job_name(job),
         job.job.hash(),
     )
 }
@@ -209,10 +244,7 @@ fn format_log_string(job: &JobInfo) -> String {
 fn update_bar_for_job(bar: &mut ProgressBar, job: &JobInfo) {
     bar.set_prefix(prefix_for_job(job));
     if bar.length().is_none() && job.byte_progress.is_some() {
-        bar.set_style(wide_message_with_byte_progress(false))
-    }
-    if bar.length().is_some() && job.byte_progress.is_none() {
-        bar.set_style(output::wide_message(false))
+        bar.set_style(output::progress_style(MessageType::PROGRESS, true));
     }
     if let Some((current, total)) = &job.byte_progress {
         bar.set_length(*total);
@@ -222,13 +254,13 @@ fn update_bar_for_job(bar: &mut ProgressBar, job: &JobInfo) {
 
 fn update_overall_bar(overall_bar: &ProgressBar, job_count: usize) {
     if job_count == 0 {
-        overall_bar.set_style(output::wide_message(true));
+        overall_bar.set_style(output::progress_style(MessageType::WARNING, false));
         overall_bar.set_message("no active jobs. Press Ctrl-C to stop");
     } else if job_count == 1 {
-        overall_bar.set_style(output::wide_message(false));
+        overall_bar.set_style(output::progress_style(MessageType::PROGRESS, false));
         overall_bar.set_message("1 active job");
     } else {
-        overall_bar.set_style(output::wide_message(false));
+        overall_bar.set_style(output::progress_style(MessageType::PROGRESS, false));
         overall_bar.set_message(format!("{job_count} active jobs"));
     }
 }
@@ -239,15 +271,23 @@ fn prefix_for_job(job: &JobInfo) -> &'static str {
         Some(JobAction::Verify) => "Verify",
         Some(JobAction::Repair) => "Repair",
         Some(JobAction::Move) => "Move",
-        None => job_name(job),
+        None => in_progress_job_name(job),
     }
 }
 
-fn job_name(job: &JobInfo) -> &'static str {
+fn in_progress_job_name(job: &JobInfo) -> &'static str {
     match *job.job {
         Job::Download(_, _) => "Download",
         Job::Realize(_, _, _) => "Realize",
         Job::Unrealize(_, _) => "Unrealize",
+    }
+}
+
+fn finished_job_name(job: &JobInfo) -> &'static str {
+    match *job.job {
+        Job::Download(_, _) => "Downloaded",
+        Job::Realize(_, _, _) => "Realized",
+        Job::Unrealize(_, _) => "Unrealized",
     }
 }
 
