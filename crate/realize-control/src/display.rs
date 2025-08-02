@@ -13,6 +13,10 @@ pub(crate) struct ChurtenDisplay {
     multi: MultiProgress,
     overall_bar: ProgressBar,
     job_bars: HashMap<(Arena, JobId), ProgressBar>,
+
+    /// Tracks whether "processing"/"no more jobs" was printed in
+    /// `print_has_jobs` in plain output mode.
+    had_jobs: bool,
 }
 
 impl ChurtenDisplay {
@@ -24,7 +28,6 @@ impl ChurtenDisplay {
             ProgressDrawTarget::hidden()
         });
         let overall_bar = multi.add(ProgressBar::no_length());
-        overall_bar.set_prefix("Running");
         update_overall_bar(&overall_bar, tracker.active_len());
 
         Self {
@@ -33,6 +36,7 @@ impl ChurtenDisplay {
             multi,
             overall_bar,
             job_bars: HashMap::new(),
+            had_jobs: false,
         }
     }
 
@@ -59,13 +63,18 @@ impl ChurtenDisplay {
                 match self.output_mode {
                     OutputMode::Log => {}
                     OutputMode::Progress => self.update_bar_from_notification(&n),
+                    OutputMode::Plain => {
+                        self.print_success(&n);
+                        self.print_errors(&n);
+                        self.print_has_jobs(&n);
+                    }
                     OutputMode::Quiet => self.print_errors(&n),
                 }
             }
         }
     }
 
-    /// In quiet mode, only print errors.
+    /// Print failed jobs, for non-terminal and quiet mode.
     fn print_errors(&mut self, n: &ChurtenNotification) {
         match n {
             ChurtenNotification::Finish { progress, .. } => match progress {
@@ -90,6 +99,47 @@ impl ChurtenDisplay {
             },
             _ => {}
         }
+    }
+
+    /// Print successful job, for non-terminal mode.
+    fn print_success(&mut self, n: &ChurtenNotification) {
+        match n {
+            ChurtenNotification::Finish { progress, .. } => match progress {
+                JobProgress::Done => {
+                    if let Some(job) = self.tracker.get(&n.global_job_id()) {
+                        output::print_success(
+                            self.output_mode,
+                            finished_job_name(job),
+                            display_path(job),
+                        );
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    fn print_has_jobs(&mut self, n: &ChurtenNotification) {
+        match n {
+            ChurtenNotification::New { .. } => {
+                if !self.had_jobs && self.tracker.has_active_jobs() {
+                    self.had_jobs = true;
+                    output::print_progress(self.output_mode, "Processing", "...");
+                }
+            }
+            ChurtenNotification::Finish { .. } => {
+                if self.had_jobs && !self.tracker.has_active_jobs() {
+                    self.had_jobs = false;
+                    output::print_progress(
+                        self.output_mode,
+                        "Waiting",
+                        "for more jobs. Press Ctrl-C to stop",
+                    );
+                }
+            }
+            _ => {}
+        };
     }
 
     fn init_bars(&mut self, jobs: &Vec<JobInfo>) {
@@ -243,10 +293,10 @@ fn format_log_string(job: &JobInfo) -> String {
 
 fn update_bar_for_job(bar: &mut ProgressBar, job: &JobInfo) {
     bar.set_prefix(prefix_for_job(job));
-    if bar.length().is_none() && job.byte_progress.is_some() {
-        bar.set_style(output::progress_style(MessageType::PROGRESS, true));
-    }
     if let Some((current, total)) = &job.byte_progress {
+        if bar.length().is_none() {
+            bar.set_style(output::progress_style(MessageType::PROGRESS, true));
+        }
         bar.set_length(*total);
         bar.set_position(*current)
     }
@@ -255,11 +305,14 @@ fn update_bar_for_job(bar: &mut ProgressBar, job: &JobInfo) {
 fn update_overall_bar(overall_bar: &ProgressBar, job_count: usize) {
     if job_count == 0 {
         overall_bar.set_style(output::progress_style(MessageType::WARNING, false));
-        overall_bar.set_message("no active jobs. Press Ctrl-C to stop");
+        overall_bar.set_prefix("Waiting");
+        overall_bar.set_message("for more jobs. Press Ctrl-C to stop");
     } else if job_count == 1 {
+        overall_bar.set_prefix("Processing");
         overall_bar.set_style(output::progress_style(MessageType::PROGRESS, false));
         overall_bar.set_message("1 active job");
     } else {
+        overall_bar.set_prefix("Processing");
         overall_bar.set_style(output::progress_style(MessageType::PROGRESS, false));
         overall_bar.set_message(format!("{job_count} active jobs"));
     }

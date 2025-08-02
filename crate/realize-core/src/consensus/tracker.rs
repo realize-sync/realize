@@ -97,6 +97,11 @@ impl JobInfoTracker {
         self.jobs.len() - self.finished.len()
     }
 
+    /// Return true if there are active jobs.
+    pub fn has_active_jobs(&self) -> bool {
+        self.jobs.len() > self.finished.len()
+    }
+
     /// Get a job from the tracker, if it is available.
     pub fn get(&self, global_id: &(Arena, JobId)) -> Option<&JobInfo> {
         self.jobs.get(global_id)

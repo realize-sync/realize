@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use console::Term;
 use output::OutputMode;
 use realize_core::rpc::control::client;
 use realize_core::utils::logging;
@@ -107,14 +108,17 @@ fn resolve_socket_path(socket_arg: Option<PathBuf>) -> Result<PathBuf> {
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
-    let output_mode = cli.output;
-    if output_mode == OutputMode::Log {
+    let mut cli = Cli::parse();
+    if cli.output == OutputMode::Log {
         logging::init_with_info_modules(vec!["realize_control"]);
     } else {
         logging::init(log::LevelFilter::Off);
     }
+    if cli.output == OutputMode::Progress && !Term::stdout().is_term() {
+        cli.output = OutputMode::Plain;
+    }
 
+    let output_mode = cli.output;
     let status = match execute(cli).await {
         Ok(code) => code,
         Err(err) => {

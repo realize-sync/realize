@@ -9,7 +9,12 @@ pub(crate) enum OutputMode {
     /// Print only error messages and warnings to stderr.
     Quiet,
 
-    /// Print progress bar and summary  to stdout, and error messages and warnings to stderr.
+    /// Print success to stdout and errors and warnings to stderr.
+    Plain,
+
+    /// Display and update progress on stdout, and error messages and warnings to stderr.
+    ///
+    /// Falls back to `Plain` if stdout is not a terminal.
     Progress,
 
     /// Disable progress and printing of errors, just log.
@@ -33,9 +38,23 @@ pub(crate) fn print_warning<T: AsRef<str>, U: AsRef<str>>(mode: OutputMode, tag:
     log::warn!("{tag} {msg}");
     match mode {
         OutputMode::Log => {}
-        OutputMode::Quiet | OutputMode::Progress => {
-            let tag = style(tag).for_stderr().red();
+        OutputMode::Quiet | OutputMode::Plain | OutputMode::Progress => {
+            let tag = style(tag).for_stderr().yellow().bold();
             eprintln!("{tag} {msg}");
+        }
+    }
+}
+
+/// Print a progress message to stderr, with standard format.
+pub(crate) fn print_progress<T: AsRef<str>, U: AsRef<str>>(mode: OutputMode, tag: T, msg: U) {
+    let tag = tag.as_ref();
+    let msg = msg.as_ref();
+    log::warn!("{tag} {msg}");
+    match mode {
+        OutputMode::Log => {}
+        OutputMode::Quiet | OutputMode::Plain | OutputMode::Progress => {
+            let tag = style(tag).for_stdout().cyan().bold();
+            println!("{tag} {msg}");
         }
     }
 }
@@ -46,7 +65,7 @@ pub(crate) fn print_error<T: AsRef<str>>(mode: OutputMode, msg: T) {
     log::error!("{msg}");
     match mode {
         OutputMode::Log => {}
-        OutputMode::Quiet | OutputMode::Progress => {
+        OutputMode::Quiet | OutputMode::Plain | OutputMode::Progress => {
             let tag = style("ERROR").for_stderr().red().bold();
             eprintln!("{tag} {msg}");
         }
@@ -60,7 +79,7 @@ pub(crate) fn print_success<T: AsRef<str>, U: AsRef<str>>(mode: OutputMode, tag:
     log::info!("{tag} {msg}");
     match mode {
         OutputMode::Log | OutputMode::Quiet => {}
-        OutputMode::Progress => {
+        OutputMode::Plain | OutputMode::Progress => {
             let tag = style(tag).for_stdout().green().bold();
             println!("{tag} {msg}");
         }
@@ -73,7 +92,7 @@ pub(crate) fn print_info<T: AsRef<str>>(mode: OutputMode, msg: T) {
     log::info!("{msg}");
     match mode {
         OutputMode::Log | OutputMode::Quiet => {}
-        OutputMode::Progress => {
+        OutputMode::Plain | OutputMode::Progress => {
             println!("{msg}");
         }
     }
