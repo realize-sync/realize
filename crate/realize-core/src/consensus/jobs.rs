@@ -111,14 +111,17 @@ async fn write_to_blob(
             range.start,
             Some(range.bytecount()),
         )?;
-        blob.seek(SeekFrom::Start(range.start)).await?;
+
         while let Some(chunk) = tokio::select!(
             res = stream.next() => {res}
             _ = shutdown.cancelled() => {
                 anyhow::bail!("cancelled");
             }
         ) {
-            let chunk = chunk?;
+            let (chunk_offset, chunk) = chunk?;
+            if chunk_offset != blob.offset() {
+                blob.seek(SeekFrom::Start(chunk_offset)).await?;
+            }
             blob.write_all(&chunk).await?;
 
             current_bytes += chunk.len() as u64;

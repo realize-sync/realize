@@ -63,6 +63,8 @@ pub struct Download {
     size: u64,
     offset: u64,
     pending_seek: Option<u64>,
+
+    /// Chunks kept in memory, sorted by ByteRange.start.
     avail: VecDeque<(ByteRange, Vec<u8>)>,
     read: ReadState,
     blob: Blob,
@@ -87,14 +89,19 @@ enum ReadState {
     /// Call [tokio::io::AsyncRead::poll_read] on the blob
     Read,
 
-    /// Call [tokio::io::AsyncWrite::poll_write] on the blob
-    Write(ByteRange, Vec<u8>),
+    /// Call [tokio::io::AsyncWrite::poll_write] on the blob.
+    ///
+    /// Once this is done, schedule the ranges left in the deque for
+    /// writing, if any.
+    Write(ByteRange, Vec<u8>, VecDeque<(ByteRange, Vec<u8>)>),
 
     /// A future that downloads the given range from a remote peer.
     Download(ByteRange, PendingDownload),
 }
 
-type PendingDownload = Pin<Box<dyn Future<Output = Result<Vec<u8>, std::io::Error>> + Send + Sync>>;
+type PendingDownload = Pin<
+    Box<dyn Future<Output = Result<VecDeque<(ByteRange, Vec<u8>)>, std::io::Error>> + Send + Sync>,
+>;
 
 impl Download {
     fn new(
@@ -141,7 +148,7 @@ impl Download {
     }
 
     fn fill(&mut self, buf: &mut ReadBuf<'_>) -> bool {
-        let requested = ByteRange::new(self.offset, self.offset + buf.remaining() as u64);
+        let requested = ByteRange::new_with_size(self.offset, buf.remaining() as u64);
         let mut filled = false;
         while let Some((range, data)) = self.avail.front() {
             let intersection = requested.intersection(range);
@@ -199,16 +206,23 @@ impl Download {
             let range = range.clone();
 
             Box::pin(async move {
+                let mut result = VecDeque::new();
                 let mut stream =
                     household.read(peers, arena, path, range.start, Some(range.bytecount()))?;
-                let mut data = Vec::new();
                 while let Some(chunk_result) = stream.next().await {
                     match chunk_result {
-                        Ok(mut chunk) => data.append(&mut chunk),
+                        Ok((offset, chunk)) => {
+                            result.push_back((
+                                ByteRange::new_with_size(offset, chunk.len() as u64),
+                                chunk,
+                            ));
+                        }
                         Err(err) => return Err(err),
                     }
                 }
-                Ok(data)
+                result.make_contiguous().sort_by_key(|elt| elt.0.start);
+
+                Ok(result)
             })
         };
 
@@ -305,33 +319,40 @@ impl Download {
             ReadState::Download(r, mut fut) => match fut.as_mut().poll(cx) {
                 Poll::Pending => (ReadState::Download(r, fut), Some(Poll::Pending)),
                 Poll::Ready(Err(err)) => (ReadState::Default, Some(Poll::Ready(Err(err)))),
-                Poll::Ready(Ok(data)) => (
-                    if r.start == self.blob.offset() {
-                        ReadState::Write(r, data)
-                    } else {
-                        ReadState::StartSeek(
-                            SeekFrom::Start(r.start),
-                            Box::new(ReadState::Write(r, data)),
-                        )
-                    },
-                    None,
-                ),
+                Poll::Ready(Ok(chunks)) => (self.write_chunks_state(chunks), None),
             },
 
             // Write data to the blob.
-            ReadState::Write(r, data) => {
+            ReadState::Write(r, data, chunks) => {
                 match Pin::new(&mut self.blob).poll_write(cx, data.as_slice()) {
-                    Poll::Pending => (ReadState::Write(r, data), Some(Poll::Pending)),
+                    Poll::Pending => (ReadState::Write(r, data, chunks), Some(Poll::Pending)),
                     Poll::Ready(Err(err)) => (ReadState::Default, Some(Poll::Ready(Err(err)))),
                     Poll::Ready(Ok(_)) => {
-                        // Keep the data in memory so the Default
-                        // state can answer the next request(s)
-                        // immediately.                        self.avail.push_back((r, data));
+                        // Keep in memory so data is immediately available for reading
+                        self.avail.push_back((r, data));
+                        if chunks.is_empty() {
+                            self.avail.make_contiguous().sort_by_key(|elt| elt.0.start);
+                        }
 
-                        (ReadState::Default, None)
+                        (self.write_chunks_state(chunks), None)
                     }
                 }
             }
+        }
+    }
+
+    /// Build a state appropriate to write the given chunk list.
+    fn write_chunks_state(&self, mut chunks: VecDeque<(ByteRange, Vec<u8>)>) -> ReadState {
+        if let Some((chunk_range, chunk_data)) = chunks.pop_front() {
+            let start = chunk_range.start;
+            let write_state = ReadState::Write(chunk_range, chunk_data, chunks);
+            if start == self.blob.offset() {
+                write_state
+            } else {
+                ReadState::StartSeek(SeekFrom::Start(start), Box::new(write_state))
+            }
+        } else {
+            ReadState::Default
         }
     }
 }

@@ -57,7 +57,9 @@ struct ReadRequest {
 
 interface ReadCallback {
   # Send one chunk of data. The server chooses the size of the chunks.
-  chunk @0 (data :Data) -> stream;
+  #
+  # Chunks may come out of order. Always check the offset.
+  chunk @0 (offset: UInt64, data :Data) -> stream;
 
   # Report that the stream is finished,.
   #

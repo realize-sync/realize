@@ -103,7 +103,7 @@ impl Household {
         path: Path,
         offset: u64,
         limit: Option<u64>,
-    ) -> io::Result<ReceiverStream<Result<Vec<u8>, io::Error>>>
+    ) -> io::Result<ReceiverStream<Result<(u64, Vec<u8>), io::Error>>>
     where
         T: IntoIterator<Item = Peer>,
     {
@@ -154,7 +154,7 @@ impl Household {
 
 enum HouseholdOperation {
     Read {
-        tx: mpsc::Sender<Result<Vec<u8>, io::Error>>,
+        tx: mpsc::Sender<Result<(u64, Vec<u8>), io::Error>>,
         arena: Arena,
         path: realize_types::Path,
         offset: u64,
@@ -243,7 +243,7 @@ async fn execute_read(
     path: realize_types::Path,
     offset: u64,
     limit: Option<u64>,
-    tx: mpsc::Sender<io::Result<Vec<u8>>>,
+    tx: mpsc::Sender<io::Result<(u64, Vec<u8>)>>,
 ) -> io::Result<()> {
     let (peer, client) = match client {
         Some(c) => c,
@@ -310,15 +310,17 @@ async fn execute_rsync(
 }
 
 struct ReadCallbackServer {
-    tx: Option<mpsc::Sender<io::Result<Vec<u8>>>>,
+    tx: Option<mpsc::Sender<io::Result<(u64, Vec<u8>)>>>,
 }
 
 impl read_callback::Server for ReadCallbackServer {
-    fn chunk(&mut self, chunk: ChunkParams) -> Promise<(), capnp::Error> {
+    fn chunk(&mut self, params: ChunkParams) -> Promise<(), capnp::Error> {
         let tx = pry!(self.tx.as_ref().ok_or_else(already_finished)).clone();
         Promise::from_future(async move {
-            let data = chunk.get()?.get_data()?.to_vec();
-            tx.send(Ok(data)).await.map_err(channel_closed)?;
+            let params = params.get()?;
+            let offset = params.get_offset();
+            let data = params.get_data()?.to_vec();
+            tx.send(Ok((offset, data))).await.map_err(channel_closed)?;
 
             Ok(())
         })
@@ -584,9 +586,9 @@ impl ConnectedPeerServer {
             reader.seek(SeekFrom::Start(offset)).await?;
         }
         if limit > 0 {
-            send_chunks(reader.take(limit), cb).await
+            send_chunks(reader.take(limit), offset, cb).await
         } else {
-            send_chunks(reader, cb).await
+            send_chunks(reader, offset, cb).await
         }
     }
 
@@ -619,6 +621,7 @@ impl ConnectedPeerServer {
 
 async fn send_chunks(
     reader: impl AsyncRead,
+    mut offset: u64,
     cb: &read_callback::Client,
 ) -> Result<bool, StorageError> {
     let mut reader = pin::pin!(reader);
@@ -629,7 +632,10 @@ async fn send_chunks(
             return Ok(true);
         }
         let mut request = cb.chunk_request();
-        request.get().set_data(&buf.as_slice()[0..n]);
+        let mut req = request.get();
+        req.set_data(&buf.as_slice()[0..n]);
+        req.set_offset(offset);
+        offset += n as u64;
         if request.send().await.is_err() {
             return Ok(false);
         }
@@ -1119,7 +1125,7 @@ mod tests {
                     None,
                 )?;
                 let collected = stream.try_collect::<Vec<_>>().await?;
-                assert_eq!(vec![b"test".to_vec()], collected);
+                assert_eq!(vec![(0, b"test".to_vec())], collected);
 
                 let stream = household_a.read(
                     vec![b.clone()],
@@ -1129,7 +1135,7 @@ mod tests {
                     None,
                 )?;
                 let collected = stream.try_collect::<Vec<_>>().await?;
-                assert_eq!(vec![b"st".to_vec()], collected);
+                assert_eq!(vec![(2, b"st".to_vec())], collected);
 
                 let stream = household_a.read(
                     vec![b.clone()],
@@ -1139,7 +1145,7 @@ mod tests {
                     Some(2),
                 )?;
                 let collected = stream.try_collect::<Vec<_>>().await?;
-                assert_eq!(vec![b"te".to_vec()], collected);
+                assert_eq!(vec![(0, b"te".to_vec())], collected);
 
                 Ok::<(), anyhow::Error>(())
             })
