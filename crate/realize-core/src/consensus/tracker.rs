@@ -132,6 +132,14 @@ impl JobInfoTracker {
         let global_id = notification.global_job_id();
         match notification {
             ChurtenNotification::New { job, .. } => {
+                if let Some(info) = self.jobs.get_mut(&global_id)
+                    && info.progress.is_finished()
+                    && info.progress != JobProgress::Done
+                {
+                    // A retry; remove the old job
+                    self.finished.retain(|e| *e != global_id);
+                    self.jobs.remove(&global_id);
+                }
                 if !self.jobs.contains_key(&global_id) {
                     self.jobs.insert(
                         global_id,
@@ -265,6 +273,11 @@ mod tests {
                     arena: self.arena,
                     job_id: self.job_id,
                     progress: JobProgress::Done,
+                },
+                "failed" => ChurtenNotification::Finish {
+                    arena: self.arena,
+                    job_id: self.job_id,
+                    progress: JobProgress::Failed("test".to_string()),
                 },
                 "update_action(0)" => ChurtenNotification::UpdateAction {
                     arena: self.arena,
@@ -928,5 +941,28 @@ mod tests {
         let job2_info = tracker.get(&fixture2.global_job_id()).unwrap();
         assert_eq!(job1_info.notification_index, 2);
         assert_eq!(job2_info.notification_index, 1);
+    }
+
+    #[test]
+    fn track_retried_job() {
+        let mut tracker = JobInfoTracker::new(10);
+        let fixture = Fixture::new();
+
+        assert!(tracker.update(&fixture.create_notification("new")));
+        assert_eq!(tracker.len(), 1);
+        assert!(tracker.has_active_jobs());
+        assert!(tracker.update(&fixture.create_notification("start")));
+        assert!(tracker.update(&fixture.create_notification("failed")));
+        assert!(!tracker.has_active_jobs());
+
+        assert!(tracker.update(&fixture.create_notification("new")));
+        assert_eq!(tracker.len(), 1);
+        assert!(tracker.has_active_jobs());
+        assert_eq!(
+            Some(JobProgress::Pending),
+            tracker
+                .get(&fixture.global_job_id())
+                .map(|j| j.progress.clone())
+        );
     }
 }
