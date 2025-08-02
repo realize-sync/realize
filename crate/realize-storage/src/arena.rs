@@ -211,19 +211,31 @@ impl ArenaStorage {
 }
 
 /// Minimum wait time after a failed job.
-const JOB_RETRY_TIME_BASE: Duration = Duration::from_secs(60);
+const JOB_RETRY_BASE_SECS: u64 = 15;
 
 /// Max is less than one day, so we retry at different time of day.
-const MAX_JOB_RETRY_DURATION: Duration = Duration::from_secs(18 * 23600);
+const MAX_JOB_RETRY_SECS: u64 = 18 * 3600;
 
 /// Exponential backoff, starting with [JOB_RETRY_TIME_BASE] with a
 /// max of [MAX_JOB_RETRY_DURATION].
 ///
 /// TODO: make that configurable in ArenaConfig.
 fn job_retry_strategy(attempt: u32) -> Option<Duration> {
-    let duration = 2u32.pow(attempt) * JOB_RETRY_TIME_BASE;
+    if attempt == 0 {
+        return Some(Duration::ZERO);
+    }
 
-    Some(duration.max(MAX_JOB_RETRY_DURATION))
+    if let Some(secs) = 2u32
+        .checked_pow(attempt - 1)
+        .map(|pow| (pow as u64).checked_mul(JOB_RETRY_BASE_SECS))
+        .flatten()
+    {
+        if secs < MAX_JOB_RETRY_SECS {
+            return Some(Duration::from_secs(secs));
+        }
+    }
+
+    Some(Duration::from_secs(MAX_JOB_RETRY_SECS))
 }
 
 #[cfg(test)]
@@ -427,6 +439,25 @@ mod tests {
         assert!(fixture.find_in_index("test.txt")?.is_none());
         assert!(!fixture.file_exists("test.txt"));
         assert_eq!("", fixture.read_blob_content("test.txt").await?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn hardcoded_retry_strategy() -> anyhow::Result<()> {
+        assert_eq!(Some(Duration::ZERO), job_retry_strategy(0));
+        assert_eq!(Some(Duration::from_secs(15)), job_retry_strategy(1));
+        assert_eq!(Some(Duration::from_secs(30)), job_retry_strategy(2));
+        assert_eq!(Some(Duration::from_secs(60)), job_retry_strategy(3));
+        assert_eq!(Some(Duration::from_secs(120)), job_retry_strategy(4));
+        assert_eq!(
+            Some(Duration::from_secs(18 * 60 * 60)), // 18h
+            job_retry_strategy(20)
+        );
+        assert_eq!(
+            Some(Duration::from_secs(18 * 60 * 60)), // 18h
+            job_retry_strategy(9999)                 // overflow
+        );
 
         Ok(())
     }
