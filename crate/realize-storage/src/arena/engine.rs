@@ -218,8 +218,9 @@ impl Engine {
                 }
                 Ok(Some(backoff_time)) => {
                     log::debug!(
-                        "[{}] FAILED; retry after {backoff_time:?}: {job_id}: {err}",
-                        self.arena
+                        "[{}] FAILED; retry after {backoff_time:?}, in {}s: {job_id}: {err}",
+                        self.arena,
+                        backoff_time.duration_since(&UnixTime::now()).as_secs()
                     );
 
                     Ok(())
