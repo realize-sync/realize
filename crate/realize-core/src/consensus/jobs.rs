@@ -164,9 +164,7 @@ pub(crate) async fn verify(
         log::debug!("[{arena}]/{path} verified against {hash}");
         return Ok(JobStatus::Done);
     }
-    log::debug!(
-        "Wrong hash for [{arena}]/{path} : got {content_hash}, but expected {hash}; repairing"
-    );
+    log::debug!("[{arena}]/{path} {hash}: inconsistent content hash {content_hash}; repairing");
 
     // repair
     progress.update_action(JobAction::Repair);
@@ -186,6 +184,7 @@ pub(crate) async fn verify(
     for range in ByteRanges::single(0, size).chunked(RSYNC_BLOCK_SIZE as u64) {
         let range_len = range.bytecount() as usize;
         let limited_buf = &mut buf[0..range_len];
+        blob.seek(SeekFrom::Start(range.start)).await?;
         blob.read_exact(limited_buf).await?;
         assert_eq!(range_len, limited_buf.len());
 
@@ -213,6 +212,9 @@ pub(crate) async fn verify(
         anyhow::bail!("cancelled")
     });
     if content_hash != *hash {
+        log::debug!(
+            "[{arena}]/{path} {hash}: inconsistent content hash {content_hash} after repair"
+        );
         anyhow::bail!("Hashes inconsistent after repair");
     }
     blob.mark_verified().await?;
@@ -280,7 +282,7 @@ mod tests {
     use realize_storage::Blob;
     use realize_storage::utils::hash;
     use tokio::fs::File;
-    use tokio::io::{BufReader, BufWriter};
+    use tokio::io::{AsyncWrite, BufReader, BufWriter};
     use tokio::{fs, io::AsyncReadExt};
 
     struct Fixture {
@@ -322,18 +324,8 @@ mod tests {
             let path = Path::parse(path_str)?;
             let realpath = path.within(&root);
 
-            let mut rng = SmallRng::seed_from_u64(seed);
-            let mut file = BufWriter::new(File::create(realpath).await?);
-            let mut hasher = hash::running();
-            let mut bytes = [0; 1024];
-            for _ in 0..size_kb {
-                rng.fill_bytes(&mut bytes);
-                file.write_all(&bytes).await?;
-                hasher.update(&bytes);
-            }
-            file.flush().await?;
-
-            let hash = hasher.finalize();
+            let mut file = File::create(realpath).await?;
+            let hash = write_random_data(&mut file, seed, size_kb).await?;
 
             Ok((path, hash))
         }
@@ -399,6 +391,25 @@ mod tests {
 
             Ok(cache.local_availability(inode).await?)
         }
+    }
+
+    async fn write_random_data(
+        out: impl AsyncWrite,
+        seed: u64,
+        size_kb: u64,
+    ) -> Result<Hash, anyhow::Error> {
+        let mut rng = SmallRng::seed_from_u64(seed);
+        let mut out = std::pin::pin!(BufWriter::new(out));
+        let mut hasher = hash::running();
+        let mut bytes = [0; 1024];
+        for _ in 0..size_kb {
+            rng.fill_bytes(&mut bytes);
+            out.write_all(&bytes).await?;
+            hasher.update(&bytes);
+        }
+        out.flush().await?;
+        let hash = hasher.finalize();
+        Ok(hash)
     }
 
     #[tokio::test]
@@ -962,6 +973,71 @@ mod tests {
                     fixture.local_availability(a, "large").await?
                 );
 
+                let blob = fixture.open_file(a, "large").await?;
+                assert_eq!(hash, *blob.hash());
+                assert_eq!(hash, fixture.hash_blob(blob).await?);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repair_large_file() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                testing::connect(&household_a, b).await?;
+
+                let (path, hash) = fixture.write_large_file(b, "large", 415, 1024).await?;
+                fixture.inner.wait_for_file_in_cache(a, "large").await?;
+
+                // Fill the blob for 'large' with data. Download will
+                // have to repair it to get to the correct hash.
+                let mut blob = fixture.open_file(a, "large").await?;
+                // Same data as in the file (generated from the same seed)
+                let hash2 = write_random_data(&mut blob, 415, 1024).await?;
+                assert_eq!(hash, hash2); // same seed,same data
+                blob.seek(SeekFrom::Start(3 * 1024)).await?;
+                // 16k of bad data.
+                write_random_data(&mut blob, 512, 16).await?;
+                blob.update_db().await?;
+
+                let mut progress = SimpleByteCountProgress::new();
+                assert_eq!(
+                    JobStatus::Done,
+                    download(
+                        fixture.inner.storage(a)?,
+                        &household_a,
+                        HouseholdFixture::test_arena(),
+                        &path,
+                        &hash,
+                        &mut progress,
+                        CancellationToken::new(),
+                    )
+                    .await?,
+                );
+
+                // file was repaired
+                assert_eq!(
+                    vec![JobAction::Verify, JobAction::Repair, JobAction::Verify],
+                    progress.actions
+                );
+
+                // repair was successful
+                assert_eq!(
+                    LocalAvailability::Verified,
+                    fixture.local_availability(a, "large").await?
+                );
+
+                // check the content again
                 let blob = fixture.open_file(a, "large").await?;
                 assert_eq!(hash, *blob.hash());
                 assert_eq!(hash, fixture.hash_blob(blob).await?);

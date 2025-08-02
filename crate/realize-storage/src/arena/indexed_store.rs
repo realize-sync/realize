@@ -5,7 +5,7 @@ use std::io::{self, SeekFrom};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::fs::File;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, ReadBuf};
 
 /// A handle on a filesystem file, with a known hash.
 pub struct Reader {
@@ -100,8 +100,11 @@ pub(crate) async fn rsync(
     let realpath = path.within(root);
     let len = range.bytecount() as usize;
     let mut data = vec![0; len];
-    File::open(realpath).await?.read_exact(&mut data).await?;
-
+    {
+        let mut file = File::open(realpath).await?;
+        file.seek(SeekFrom::Start(range.start)).await?;
+        file.read_exact(&mut data).await?;
+    }
     let mut delta = Vec::new();
     fast_rsync::diff(&sig.index(), data.as_slice(), &mut delta)?;
 
@@ -278,6 +281,109 @@ mod tests {
             Reader::open(&fixture.index, root.path(), &path).await,
             Err(StorageError::Io(e)) if e.kind() == io::ErrorKind::NotFound
         ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rsync_bad_content() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let root = &fixture.root;
+
+        // Create a file with base content
+        let base_content = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let (path, _) = fixture.add_file("test.txt", base_content).await?;
+
+        // Calculate signature from bad content
+        let opts = fast_rsync::SignatureOptions {
+            block_size: 4096,
+            crypto_hash_size: 8,
+        };
+        let modified_content = "ZZXDEFGHIJXXXNOPQRSTUVWXYZ";
+        let sig = fast_rsync::Signature::calculate(modified_content.as_bytes(), opts);
+        let signature = Signature(sig.into_serialized());
+
+        let range = ByteRange::new(0, modified_content.len() as u64);
+        let delta = rsync(&fixture.index, root.path(), &path, &range, signature).await?;
+
+        // Apply delta to bad content to fix it
+        let mut reconstructed = Vec::new();
+        fast_rsync::apply_limited(
+            modified_content.as_bytes(),
+            &delta.0,
+            &mut reconstructed,
+            base_content.len(),
+        )?;
+
+        assert_eq!(base_content.as_bytes(), reconstructed.as_slice());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rsync_file_not_in_index() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let root = &fixture.root;
+
+        // Create a file that's not in the index
+        let path = realize_types::Path::parse("not_in_index.txt")?;
+
+        // Create a valid signature for some data
+        let opts = fast_rsync::SignatureOptions {
+            block_size: 4096,
+            crypto_hash_size: 8,
+        };
+        let sig = fast_rsync::Signature::calculate("test data".as_bytes(), opts);
+        let signature = Signature(sig.into_serialized());
+
+        let range = ByteRange::new(0, 10);
+        let result = rsync(&fixture.index, root.path(), &path, &range, signature).await;
+        println!("Result: {:?}", result);
+        assert!(matches!(result, Err(StorageError::NotFound)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rsync_file_in_chunks() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let root = &fixture.root;
+
+        // Create a file with content that has a clear change in the middle
+        let base_content = "AAAAABBBBBCCCCC";
+        let (path, _) = fixture.add_file("chunked.txt", base_content).await?;
+
+        // Calculate signature from base content
+        let opts = fast_rsync::SignatureOptions {
+            block_size: 4, // Small block size for better detection
+            crypto_hash_size: 8,
+        };
+
+        // Some modified content with rsync and verify that the
+        // function works with offsets
+        let modified_content = "AAAAAXBBBBBCCCCC";
+        for range in vec![
+            ByteRange::new(0, 5),
+            ByteRange::new(5, 10),
+            ByteRange::new(10, 15),
+        ] {
+            let correct = &base_content[range.start as usize..range.end as usize];
+            let incorrect = &modified_content[range.start as usize..range.end as usize];
+
+            let sig = fast_rsync::Signature::calculate(incorrect.as_bytes(), opts);
+            let delta = rsync(
+                &fixture.index,
+                root.path(),
+                &path,
+                &range,
+                Signature(sig.into_serialized()),
+            )
+            .await?;
+            let mut fixed = Vec::new();
+            fast_rsync::apply_limited(incorrect.as_bytes(), &delta.0, &mut fixed, correct.len())?;
+
+            assert_eq!(correct.as_bytes(), fixed.as_slice(), "chunk {range}");
+        }
 
         Ok(())
     }
