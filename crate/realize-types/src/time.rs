@@ -3,8 +3,10 @@ use std::{
     time::{Duration, SystemTime, SystemTimeError},
 };
 
+use time_format::TimeStampMs;
+
 /// Time as duration since the start of the UNIX epoch.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct UnixTime(Duration);
 
@@ -82,5 +84,39 @@ impl From<Duration> for UnixTime {
 impl From<&Duration> for UnixTime {
     fn from(value: &Duration) -> Self {
         UnixTime(*value)
+    }
+}
+
+impl std::fmt::Debug for UnixTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ts = if let (Some(s), Some(m)) = (
+            i64::try_from(self.as_secs()).ok(),
+            u16::try_from(self.0.subsec_millis()).ok(),
+        ) {
+            Some(TimeStampMs::new(s, m))
+        } else {
+            None
+        };
+        let time_string = ts
+            .map(|ts_ms| time_format::format_iso8601_ms_utc(ts_ms).ok())
+            .flatten()
+            .unwrap_or_else(|| format!("{:?}", self.0));
+
+        f.write_str(time_string.strip_suffix("Z").unwrap_or(&time_string))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_format() -> anyhow::Result<()> {
+        assert_eq!(
+            "2009-02-13T23:31:30.333",
+            format!("{:?}", UnixTime::new(1234567890, 333999111))
+        );
+
+        Ok(())
     }
 }

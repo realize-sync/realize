@@ -2451,6 +2451,7 @@ dependencies = [
  "pathdiff",
  "serde",
  "thiserror 2.0.12",
+ "time-format",
 ]
 
 [[package]]
@@ -3110,6 +3111,12 @@ dependencies = [
  "cfg-if",
  "once_cell",
 ]
+
+[[package]]
+name = "time-format"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a70bbfd9d497fe1c46d9a5051f03c73d253b14a9abf6645d32781592b719f9f"
 
 [[package]]
 name = "tinystr"

@@ -9,6 +9,7 @@ serde = {version = "1.0", features = ["derive"] }
 thiserror = "2.0"
 pathdiff = "0.2"
 internment = { version = "0.8.6", features = ["serde"] }
+time-format = "1.2.1"
 
 [dev-dependencies]
 anyhow = "1.0" 
