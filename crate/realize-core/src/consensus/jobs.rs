@@ -174,8 +174,6 @@ pub(crate) async fn verify(
     if peers.is_empty() {
         return Ok(JobStatus::Abandoned);
     }
-    blob.seek(SeekFrom::Start(0)).await?;
-
     let opts = fast_rsync::SignatureOptions {
         block_size: 4 * 1024 as u32,
         crypto_hash_size: 8,
