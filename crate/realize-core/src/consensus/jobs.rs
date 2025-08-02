@@ -1111,14 +1111,11 @@ mod tests {
                     .await?,
                 );
 
-                log::debug!("=== ook1");
                 assert!(!fixture.inner.arena_root(a).join("foobar").exists());
-                log::debug!("=== ook2");
                 assert_eq!(
                     "foo!",
                     fixture.get_blob_content_as_string(a, "foobar").await?
                 );
-                log::debug!("=== ook3");
 
                 Ok::<(), anyhow::Error>(())
             })
