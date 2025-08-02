@@ -440,6 +440,8 @@ impl AsyncRead for Download {
 mod tests {
     use super::*;
     use crate::rpc::testing::{self, HouseholdFixture};
+    use rand::rngs::SmallRng;
+    use rand::{RngCore, SeedableRng};
     use realize_types::Path;
     use std::io::Write as _;
     use tokio::fs;
@@ -865,7 +867,10 @@ mod tests {
 
         let b_dir = fixture.arena_root(b);
         let path = b_dir.join("large_file");
-        std::fs::write(&path, vec![0xAB; file_size])?;
+        let mut rng = SmallRng::seed_from_u64(1191);
+        let mut file_content = vec![0; file_size];
+        rng.fill_bytes(file_content.as_mut_slice());
+        std::fs::write(&path, &mut file_content)?;
 
         fixture.wait_for_file_in_cache(a, "large_file").await?;
 
@@ -881,31 +886,41 @@ mod tests {
 
         if allow_short_reads {
             let mut bytes_read = 0;
+            let mut offset = 0;
             while bytes_read < file_size {
                 let mut buf = vec![0u8; buf_size];
                 let n = reader.read(&mut buf).await?;
                 assert!(n > 0);
                 for i in 0..n {
-                    assert_eq!(0xAB, buf[i]);
+                    assert_eq!(file_content[offset + i], buf[i], "at offset {}", offset + i);
                 }
                 for i in n..buf_size {
-                    assert_eq!(0, buf[i]);
+                    assert_eq!(0, buf[i], "at offset {}", offset + i);
                 }
                 bytes_read += n;
+                offset += n;
             }
         } else {
             for i in 0..(file_size / buf_size) {
+                let offset = i * buf_size;
                 let mut buf = vec![0u8; buf_size];
                 assert_eq!(buf_size, reader.read(&mut buf).await?);
-                assert_eq!(vec![0xAB; buf_size], buf, "chunk {i}");
+                assert_eq!(
+                    file_content[offset..(offset + buf_size)],
+                    buf,
+                    "chunk {i}, offset {offset}"
+                );
             }
             let rest = file_size % buf_size;
             if rest > 0 {
+                let offset = file_size - rest;
                 let mut buf = vec![0u8; buf_size];
                 assert_eq!(rest, reader.read(&mut buf).await?);
-                for i in 0..rest {
-                    assert_eq!(0xAB, buf[i]);
-                }
+                assert_eq!(
+                    file_content[offset..],
+                    buf[0..rest],
+                    "last chunk, offset {offset}"
+                );
                 for i in rest..buf_size {
                     assert_eq!(0, buf[i]);
                 }
