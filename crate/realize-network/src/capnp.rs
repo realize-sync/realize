@@ -18,7 +18,6 @@ use tokio_util::sync::CancellationToken;
 
 use realize_types::Peer;
 
-use super::rate_limit::RateLimitedStream;
 use crate::{Networking, Server};
 
 /// Connection status of a peer, broadcast by [ConnectionManager].
@@ -34,7 +33,7 @@ enum ConnectionMessage {
     /// be handled there.
     Incoming {
         peer: Peer,
-        stream: Box<tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>>,
+        stream: Box<tokio_rustls::server::TlsStream<TcpStream>>,
         shutdown_rx: broadcast::Receiver<()>,
     },
     /// Connect to all peers that have an address and attempt to keep
@@ -169,7 +168,7 @@ impl ConnectionManager {
     /// PeerConnection, defined in `capnp/peer.capnp`.
     pub fn register(&self, server: &mut Server) {
         let tx = self.tx.clone();
-        server.register_raw(self.tag, move |peer, stream, _, shutdown_rx| {
+        server.register_raw(self.tag, move |peer, stream, shutdown_rx| {
             // TODO: support shutdown_rx
             let _ = tx.send(ConnectionMessage::Incoming {
                 peer,
@@ -229,7 +228,7 @@ where
     fn accept(
         self: &Rc<Self>,
         peer: Peer,
-        stream: Box<tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>>,
+        stream: Box<tokio_rustls::server::TlsStream<TcpStream>>,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) {
         let this = Rc::clone(self);
@@ -334,7 +333,7 @@ where
                 _ = cancel.cancelled() => {
                     return;
                 }
-                connected = self.networking.connect_raw(peer, self.tag, None) =>  match connected {
+                connected = self.networking.connect_raw(peer, self.tag) =>  match connected {
                     Ok(stream) => {
                         log::debug!("Connected to {peer}.");
 
@@ -570,7 +569,7 @@ mod tests {
     }
 
     async fn connect(networking: Networking, peer: Peer) -> anyhow::Result<hello::Client> {
-        let stream = networking.connect_raw(peer, b"HELO", None).await?;
+        let stream = networking.connect_raw(peer, b"HELO").await?;
         let (r, w) = TokioAsyncReadCompatExt::compat(stream).split();
         let net = Box::new(VatNetwork::new(
             BufReader::new(r),

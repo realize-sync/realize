@@ -1,19 +1,13 @@
 use crate::config::PeerConfig;
 use crate::hostport::HostPort;
-use crate::rate_limit::RateLimitedStream;
 use crate::security::{PeerVerifier, RawPublicKeyResolver};
 use anyhow::Context as _;
-use async_speed_limit::Limiter;
-use async_speed_limit::clock::StandardClock;
-use futures::prelude::*;
 use realize_types::Peer;
 use rustls::pki_types::ServerName;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path;
 use std::sync::Arc;
-use tarpc::tokio_serde::formats::Bincode;
-use tarpc::tokio_util::codec::length_delimited::LengthDelimitedCodec;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
@@ -103,40 +97,11 @@ impl Networking {
             .flatten()
     }
 
-    pub async fn connect<Req, Resp>(
-        &self,
-        peer: Peer,
-        tag: &[u8; 4],
-        limiter: Option<Limiter>,
-    ) -> Result<
-        tarpc::serde_transport::Transport<
-            tokio_rustls::client::TlsStream<RateLimitedStream<TcpStream>>,
-            Req,
-            Resp,
-            Bincode<Req, Resp>,
-        >,
-        anyhow::Error,
-    >
-    where
-        Req: for<'de> serde::Deserialize<'de>,
-        Resp: serde::Serialize,
-    {
-        let tls_stream = self.connect_raw(peer, tag, limiter).await?;
-
-        let transport = tarpc::serde_transport::new(
-            LengthDelimitedCodec::builder().new_framed(tls_stream),
-            Bincode::default(),
-        );
-
-        Ok(transport)
-    }
-
     pub(crate) async fn connect_raw(
         &self,
         peer: Peer,
         tag: &[u8; 4],
-        limiter: Option<Limiter>,
-    ) -> anyhow::Result<tokio_rustls::client::TlsStream<RateLimitedStream<TcpStream>>> {
+    ) -> anyhow::Result<tokio_rustls::client::TlsStream<TcpStream>> {
         let addr = self
             .peer_setup
             .get(&peer)
@@ -150,10 +115,6 @@ impl Networking {
         let stream = TcpStream::connect(addr.addr()).await?;
         stream.set_nodelay(true)?;
 
-        let stream = RateLimitedStream::new(
-            stream,
-            limiter.unwrap_or_else(|| Limiter::<StandardClock>::new(f64::INFINITY)),
-        );
         let mut tls_stream = self.connector.connect(domain, stream).await?;
         tls_stream.write_all(tag).await?;
 
@@ -163,17 +124,8 @@ impl Networking {
     async fn accept(
         &self,
         stream: TcpStream,
-        limiter: Limiter,
-    ) -> Result<
-        (
-            Peer,
-            [u8; 4],
-            tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
-        ),
-        anyhow::Error,
-    > {
+    ) -> Result<(Peer, [u8; 4], tokio_rustls::server::TlsStream<TcpStream>), anyhow::Error> {
         let peer_addr = stream.peer_addr()?;
-        let stream = RateLimitedStream::new(stream, limiter);
         let mut tls_stream = self.acceptor.accept(stream).await?;
         // Guards against bugs in the auth code; worth dying
         let peer = self
@@ -198,12 +150,8 @@ pub struct Server {
     handlers: HashMap<
         &'static [u8; 4],
         Box<
-            dyn Fn(
-                    Peer,
-                    tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
-                    Limiter,
-                    broadcast::Receiver<()>,
-                ) + Send
+            dyn Fn(Peer, tokio_rustls::server::TlsStream<TcpStream>, broadcast::Receiver<()>)
+                + Send
                 + Sync,
         >,
     >,
@@ -221,67 +169,12 @@ impl Server {
         }
     }
 
-    /// Register a handler for a TARPC service.
-    pub fn register_server<T, S, F>(&mut self, tag: &'static [u8; 4], handler: T)
-    where
-        T: Fn(
-                Peer,
-                Limiter,
-                tarpc::tokio_util::codec::Framed<
-                    tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
-                    LengthDelimitedCodec,
-                >,
-            ) -> S
-            + Send
-            + Sync
-            + 'static,
-        S: Stream<Item = F> + Send + 'static,
-        F: Future<Output = ()> + Send + 'static,
-    {
-        self.register_raw(
-            tag,
-            move |peer: Peer,
-                  stream,
-                  limiter: Limiter,
-                  mut shutdown_rx: broadcast::Receiver<()>| {
-                let framed = LengthDelimitedCodec::builder().new_framed(stream);
-                let stream = handler(peer, limiter, framed);
-
-                tokio::spawn(async move {
-                    let mut stream = Box::pin(stream);
-                    loop {
-                        tokio::select!(
-                            _ = shutdown_rx.recv() => {
-                                log::debug!("Shutting connection to {peer}");
-                                break;
-                            }
-                            next = stream.next() => {
-                                match next {
-                                    None => {
-                                        break;
-                                    },
-                                    Some(fut) => {
-                                        tokio::spawn(crate::metrics::track_in_flight_request(fut));
-                                    }
-                                }
-                            }
-                        )
-                    }
-                });
-            },
-        );
-    }
-
     /// Register a handler for the given tagged stream.
     pub(crate) fn register_raw(
         &mut self,
         tag: &'static [u8; 4],
-        handler: impl Fn(
-            Peer,
-            tokio_rustls::server::TlsStream<RateLimitedStream<TcpStream>>,
-            Limiter,
-            broadcast::Receiver<()>,
-        ) + Send
+        handler: impl Fn(Peer, tokio_rustls::server::TlsStream<TcpStream>, broadcast::Receiver<()>)
+        + Send
         + Sync
         + 'static,
     ) {
@@ -351,10 +244,9 @@ impl Server {
         stream.set_nodelay(true)?;
 
         let shutdown_rx = self.shutdown_tx.subscribe();
-        let limiter = Limiter::<StandardClock>::new(f64::INFINITY);
-        let (peer, tag, mut tls_stream) = self.networking.accept(stream, limiter.clone()).await?;
+        let (peer, tag, mut tls_stream) = self.networking.accept(stream).await?;
         if let Some(handler) = self.handlers.get(&tag) {
-            (*handler)(peer, tls_stream, limiter, shutdown_rx);
+            (*handler)(peer, tls_stream, shutdown_rx);
         } else {
             log::info!("Got unsupported RPC service tag '{tag:?}' from {peer}");
             // We log this separately from generic errors, because
@@ -373,8 +265,6 @@ mod tests {
     use super::*;
     use crate::testing;
     use realize_types::Peer;
-    use tarpc::context;
-    use tarpc::server::Channel as _;
 
     struct Fixture {
         resolver: Arc<RawPublicKeyResolver>,
@@ -463,20 +353,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tarpc_tcp_connect() -> anyhow::Result<()> {
+    async fn connect() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
         let addr = fixture.start_server().await?;
 
         let peer = Peer::from("server");
         let networking = fixture.client_networking(peer, addr)?;
-        let client = connect_ping(&networking, peer).await?;
-        assert_eq!("pong", client.ping(context::current()).await?);
+        assert_eq!("ping!", connect_ping(&networking, peer).await?);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn tarpc_tcp_reject_bad_tag() -> anyhow::Result<()> {
+    async fn reject_bad_tag() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
         let addr = fixture.start_server().await?;
 
@@ -504,13 +393,7 @@ mod tests {
 
         let peer = Peer::from("server");
         let networking = fixture.client_networking_with_verifier(peer, addr, verifier_both())?;
-        let client_result = connect_ping(&networking, peer).await;
-        let failed = match client_result {
-            Ok(client) => client.ping(context::current()).await.is_err(),
-            // If handshake fails, that's also acceptable
-            Err(_) => true,
-        };
-        assert!(failed);
+        assert!(connect_ping(&networking, peer).await.is_err());
 
         Ok(())
     }
@@ -523,13 +406,7 @@ mod tests {
         let peer = Peer::from("server");
         let networking =
             fixture.client_networking_with_verifier(peer, addr, verifier_client_only())?;
-        let client_result = connect_ping(&networking, peer).await;
-        let failed = match client_result {
-            Ok(client) => client.ping(context::current()).await.is_err(),
-            // If handshake fails, that's also acceptable
-            Err(_) => true,
-        };
-        assert!(failed);
+        assert!(connect_ping(&networking, peer).await.is_err());
 
         Ok(())
     }
@@ -581,40 +458,24 @@ mod tests {
         Ok(())
     }
 
-    /// A dummy test service, for testing client and server framework.
-    #[tarpc::service]
-    trait PingService {
-        async fn ping() -> String;
-    }
     const PING_TAG: &[u8; 4] = b"PING";
-
-    #[derive(Clone)]
-    struct PingServer {}
-
-    impl PingService for PingServer {
-        async fn ping(self, _ctx: context::Context) -> String {
-            "pong".to_string()
-        }
-    }
 
     /// Register a [PingService] to the given server.
     fn register_ping(server: &mut Server) {
-        server.register_server(PING_TAG, move |_, _, framed| {
-            let transport = tarpc::serde_transport::new(framed, Bincode::default());
-            let server = PingServer {};
-            let serve_fn = PingServer::serve(server.clone());
-
-            tarpc::server::BaseChannel::with_defaults(transport).execute(serve_fn)
-        })
+        server.register_raw(PING_TAG, |_, mut stream, _| {
+            tokio::spawn(async move {
+                stream.write("ping!".as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            });
+        });
     }
 
     /// Connect to the given peer as [PingService].
-    async fn connect_ping(
-        networking: &Networking,
-        peer: Peer,
-    ) -> anyhow::Result<PingServiceClient> {
-        let transport = networking.connect(peer, PING_TAG, None).await?;
+    async fn connect_ping(networking: &Networking, peer: Peer) -> anyhow::Result<String> {
+        let mut transport = networking.connect_raw(peer, PING_TAG).await?;
+        let mut str = String::new();
+        transport.read_to_string(&mut str).await?;
 
-        Ok(PingServiceClient::new(tarpc::client::Config::default(), transport).spawn())
+        Ok(str)
     }
 }

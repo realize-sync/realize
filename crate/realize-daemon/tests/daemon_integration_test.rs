@@ -4,23 +4,17 @@ use nfs3_client::Nfs3ConnectionBuilder;
 use nfs3_client::tokio::TokioConnector;
 use nfs3_types::nfs3::{Nfs3Result, READDIR3args};
 use realize_core::config::Config;
-use realize_core::rpc::realstore;
-use realize_core::rpc::realstore::client::ClientOptions;
-use realize_network::Networking;
 use realize_network::config::PeerConfig;
 use realize_network::unixsocket;
-use realize_storage::RealStoreOptions;
 use realize_storage::config::{ArenaConfig, CacheConfig};
 use realize_types;
 use realize_types::{Arena, Peer};
-use reqwest::Client;
 use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
-use tarpc::context;
 use tokio::io::AsyncBufReadExt as _;
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::Child;
@@ -254,55 +248,6 @@ fn kill(pid: Option<u32>) -> anyhow::Result<()> {
         nix::unistd::Pid::from_raw(pid.expect("no pid") as i32),
         nix::sys::signal::Signal::SIGTERM,
     )?;
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
-    let fixture = Fixture::setup().await?;
-
-    // Run process in the background and in a way that allows reading
-    // its output, so we know what port to connect to.
-    let mut daemon = fixture
-        .command()?
-        // We're looking for specific log output on stderr
-        .env("RUST_LOG", "realize_=debug")
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let pid = daemon.id();
-    scopeguard::defer! { let _ = kill(pid); }
-    let stderr = fixture.collect_stderr("daemon", &mut daemon);
-
-    fixture.assert_listening().await;
-
-    let a = Peer::from("a");
-    let mut peers = fixture.config.network.peers.clone();
-    peers.get_mut(&a).expect("PeerConfig of a").address = Some(fixture.server_address.clone());
-
-    let networking = Networking::from_config(&peers, &fixture.resources.join("b.key"))?;
-    let client = realstore::client::connect(&networking, a, ClientOptions::default()).await?;
-    let files = client
-        .list(
-            context::current(),
-            Arena::from("testdir"),
-            RealStoreOptions::default(),
-        )
-        .await??;
-    assert_unordered::assert_eq_unordered!(
-        files.into_iter().map(|f| f.path).collect(),
-        vec![realize_types::Path::parse("foo.txt")?]
-    );
-
-    // Kill to make sure stderr ends
-    daemon.start_kill()?;
-
-    // Make sure stderr contains the expected log message.
-    let stderr = stderr.await??;
-    assert!(
-        stderr.contains("Accepted peer b from "),
-        "stderr<<EOF\n{stderr}\nEOF"
-    );
 
     Ok(())
 }

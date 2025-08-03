@@ -11,8 +11,6 @@ realize-storage = { path = "../realize-storage" }
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 env_logger = "0.11"
-lazy_static = "1.5"
-prometheus = { version = "0.14", features = [] }
 rustls = "0.23"
 serde = {version = "1.0", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "fs", "io-util"] }
@@ -27,11 +25,9 @@ assert_cmd = "2.0"
 assert_fs = "1.1"
 predicates = "3.1"
 portpicker = "0.1"
-reqwest = "0.12"
 tempfile = "3.20"
 test-tag = "0.1"
 assert_unordered = "0.3"
-tarpc = { version = "0.36", features = ["serde1", "tokio1", "serde-transport", "serde-transport-bincode", "tcp"] }
 tokio = { version = "1", features = ["process"] }
 nix = { version = "0.30.1", features = ["signal"] }
 nfs3_client = { version = "0.4.2", features = ["tokio"] }

@@ -3,7 +3,6 @@
 use anyhow::Context as _;
 use clap::Parser;
 use futures_util::stream::StreamExt as _;
-use prometheus::{IntCounter, register_int_counter};
 use realize_core::config::Config;
 use realize_core::setup::SetupHelper;
 use realize_core::utils::logging;
@@ -53,11 +52,6 @@ struct Cli {
     ///  - `/tmp/realize/control.socket`
     #[arg(long)]
     socket: Option<PathBuf>,
-}
-
-lazy_static::lazy_static! {
-    static ref METRIC_UP: IntCounter =
-        register_int_counter!("realize_daemon_up", "Server is up").unwrap();
 }
 
 #[tokio::main]
@@ -114,7 +108,6 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
                 signal_hook::consts::SIGQUIT,
             ])?;
 
-            METRIC_UP.inc();
             log::info!("Listening on {addr}");
             println!("Listening on {addr}");
 
