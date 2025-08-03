@@ -541,19 +541,6 @@ dependencies = [
 
 [[package]]
 name = "console"
-version = "0.15.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "054ccb5b10f9f2cbf51eb355ca1d05c2d279ce1804688d0db74b4733a5aeafd8"
-dependencies = [
- "encode_unicode",
- "libc",
- "once_cell",
- "unicode-width",
- "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "console"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2e09ced7ebbccb63b4c65413d821f2e00ce54c5ca4514ddc6b3c892fdbcbc69d"
@@ -1377,24 +1364,11 @@ dependencies = [
 
 [[package]]
 name = "indicatif"
-version = "0.17.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "183b3088984b400f4cfac3620d5e076c84da5364016b4f49473de574b2586235"
-dependencies = [
- "console 0.15.11",
- "number_prefix",
- "portable-atomic",
- "unicode-width",
- "web-time",
-]
-
-[[package]]
-name = "indicatif"
 version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "70a646d946d06bedbbc4cac4c218acf4bbf2d87757a784857025f4d447e4e1cd"
 dependencies = [
- "console 0.16.0",
+ "console",
  "portable-atomic",
  "unicode-width",
  "unit-prefix",
@@ -1832,12 +1806,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "number_prefix"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
-
-[[package]]
 name = "object"
 version = "0.36.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1967,12 +1935,6 @@ dependencies = [
  "smallvec",
  "windows-targets 0.52.6",
 ]
-
-[[package]]
-name = "parse-size"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "487f2ccd1e17ce8c1bfab3a65c89525af41cfad4c8659021a1e9a2aacd73b89b"
 
 [[package]]
 name = "pathdiff"
@@ -2135,11 +2097,9 @@ dependencies = [
  "cfg-if",
  "fnv",
  "lazy_static",
- "libc",
  "memchr",
  "parking_lot",
  "protobuf",
- "reqwest",
  "thiserror 2.0.12",
 ]
 
@@ -2238,45 +2198,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "realize-cmd"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "assert_fs",
- "assert_unordered",
- "async-speed-limit",
- "clap",
- "console 0.15.11",
- "env_logger",
- "futures-util",
- "humantime",
- "hyper",
- "hyper-util",
- "indicatif 0.17.11",
- "lazy_static",
- "log",
- "parse-size",
- "pathdiff",
- "predicates",
- "prometheus",
- "realize-core",
- "realize-network",
- "realize-storage",
- "realize-types",
- "reqwest",
- "rustls",
- "serde",
- "signal-hook",
- "signal-hook-tokio",
- "tarpc",
- "tempfile",
- "test-tag",
- "tokio",
- "toml",
-]
-
-[[package]]
 name = "realize-control"
 version = "0.1.0"
 dependencies = [
@@ -2285,9 +2206,9 @@ dependencies = [
  "capnp",
  "capnp-rpc",
  "clap",
- "console 0.16.0",
+ "console",
  "env_logger",
- "indicatif 0.18.0",
+ "indicatif",
  "log",
  "realize-core",
  "realize-network",
@@ -2526,7 +2447,6 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
- "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
