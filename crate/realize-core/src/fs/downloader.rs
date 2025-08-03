@@ -225,7 +225,7 @@ impl Download {
                                 chunk,
                             ));
                         }
-                        Err(err) => return Err(err),
+                        Err(err) => return Err(err.into_io()),
                     }
                 }
                 result.make_contiguous().sort_by_key(|elt| elt.0.start);

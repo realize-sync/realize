@@ -116,7 +116,7 @@ impl Household {
         path: Path,
         offset: u64,
         limit: Option<u64>,
-    ) -> io::Result<ReceiverStream<Result<(u64, Vec<u8>), io::Error>>>
+    ) -> io::Result<ReceiverStream<Result<(u64, Vec<u8>), HouseholdOperationError>>>
     where
         T: IntoIterator<Item = Peer>,
     {
@@ -136,7 +136,7 @@ impl Household {
         tokio::spawn(async move {
             if let Err(err) = operation_tx.send(op).await {
                 if let HouseholdOperation::Read { tx, .. } = err.0 {
-                    let _ = tx.send(Err(io::Error::other("channel closed"))).await;
+                    let _ = tx.send(Err(HouseholdOperationError::Disconnected)).await;
                 }
             }
         });
@@ -153,11 +153,11 @@ impl Household {
         path: &Path,
         range: &ByteRange,
         sig: Signature,
-    ) -> anyhow::Result<Delta>
+    ) -> Result<Delta, HouseholdOperationError>
     where
         T: IntoIterator<Item = Peer>,
     {
-        let (tx, rx) = oneshot::channel();
+        let (tx, rx) = oneshot::channel::<Result<Delta, HouseholdOperationError>>();
         self.operation_tx
             .send(HouseholdOperation::Rsync {
                 peers: peers.into_iter().collect(),
@@ -170,7 +170,61 @@ impl Household {
             })
             .await?;
 
-        rx.await?
+        let res = rx.await?;
+        let delta = res?;
+
+        Ok(delta)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum HouseholdOperationError {
+    #[error("no suitable peer for operation")]
+    NoPeers,
+
+    #[error("connection was lost")]
+    Disconnected,
+
+    #[error("I/O error {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("RPC error {0}")]
+    Rpc(capnp::Error),
+}
+
+impl From<capnp::Error> for HouseholdOperationError {
+    fn from(err: capnp::Error) -> Self {
+        if err.kind == capnp::ErrorKind::Disconnected {
+            HouseholdOperationError::Disconnected
+        } else {
+            HouseholdOperationError::Rpc(err)
+        }
+    }
+}
+
+impl<T> From<mpsc::error::SendError<T>> for HouseholdOperationError {
+    fn from(_err: mpsc::error::SendError<T>) -> Self {
+        HouseholdOperationError::Disconnected
+    }
+}
+
+impl From<oneshot::error::RecvError> for HouseholdOperationError {
+    fn from(_err: oneshot::error::RecvError) -> Self {
+        HouseholdOperationError::Disconnected
+    }
+}
+
+impl HouseholdOperationError {
+    pub fn into_io(self) -> io::Error {
+        use HouseholdOperationError::*;
+        match self {
+            NoPeers => std::io::Error::new(std::io::ErrorKind::NotConnected, "no suitable peer"),
+            Disconnected => {
+                std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "disconnected")
+            }
+            Io(ioerr) => ioerr,
+            Rpc(err) => io::Error::other(err),
+        }
     }
 }
 
@@ -178,7 +232,7 @@ enum HouseholdOperation {
     Read {
         peers: Vec<Peer>,
         mode: ExecutionMode,
-        tx: mpsc::Sender<Result<(u64, Vec<u8>), io::Error>>,
+        tx: mpsc::Sender<Result<(u64, Vec<u8>), HouseholdOperationError>>,
         arena: Arena,
         path: realize_types::Path,
         offset: u64,
@@ -187,7 +241,7 @@ enum HouseholdOperation {
     Rsync {
         peers: Vec<Peer>,
         mode: ExecutionMode,
-        tx: oneshot::Sender<anyhow::Result<Delta>>,
+        tx: oneshot::Sender<Result<Delta, HouseholdOperationError>>,
         arena: Arena,
         path: realize_types::Path,
         range: ByteRange,
@@ -368,12 +422,12 @@ async fn execute_read(
     path: realize_types::Path,
     offset: u64,
     limit: Option<u64>,
-    tx: mpsc::Sender<io::Result<(u64, Vec<u8>)>>,
-) -> io::Result<()> {
+    tx: mpsc::Sender<Result<(u64, Vec<u8>), HouseholdOperationError>>,
+) -> Result<(), HouseholdOperationError> {
     let (peer, store) = match client {
         Some(c) => c,
         None => {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "No available peer"));
+            return Err(HouseholdOperationError::NoPeers);
         }
     };
     log::debug!("Reading [{arena}]/{path} from {peer}");
@@ -389,11 +443,7 @@ async fn execute_read(
         req.set_limit(limit);
     }
 
-    request
-        .send()
-        .promise
-        .await
-        .map_err(|err| io::Error::other(err))?;
+    request.send().promise.await?;
 
     Ok(())
 }
@@ -404,11 +454,11 @@ async fn execute_rsync(
     path: &realize_types::Path,
     range: &ByteRange,
     sig: Signature,
-) -> anyhow::Result<Delta> {
+) -> Result<Delta, HouseholdOperationError> {
     let (peer, store) = match client {
         Some(c) => c,
         None => {
-            anyhow::bail!("No available peer");
+            return Err(HouseholdOperationError::NoPeers);
         }
     };
     log::debug!(
@@ -433,7 +483,7 @@ async fn execute_rsync(
 }
 
 struct ReadCallbackServer {
-    tx: Option<mpsc::Sender<io::Result<(u64, Vec<u8>)>>>,
+    tx: Option<mpsc::Sender<Result<(u64, Vec<u8>), HouseholdOperationError>>>,
 }
 
 impl read_callback::Server for ReadCallbackServer {
@@ -456,7 +506,7 @@ impl read_callback::Server for ReadCallbackServer {
             match result.which()? {
                 result_capnp::result::Which::Ok(_) => {}
                 result_capnp::result::Which::Err(err) => {
-                    tx.send(Err(errno_to_io_error(err?.get_errno()?)))
+                    tx.send(Err(errno_to_io_error(err?.get_errno()?).into()))
                         .await
                         .map_err(channel_closed)?;
                 }
