@@ -178,6 +178,8 @@ async fn background_job<H: JobHandler>(
             progress: match &status {
                 Ok(JobStatus::Done) => JobProgress::Done,
                 Ok(JobStatus::Abandoned) => JobProgress::Abandoned,
+                Ok(JobStatus::Cancelled) => JobProgress::Cancelled,
+                Ok(JobStatus::NoPeers) => JobProgress::Failed("no peers".to_string()),
                 Err(err) => {
                     if shutdown.is_cancelled() {
                         JobProgress::Cancelled
@@ -187,7 +189,7 @@ async fn background_job<H: JobHandler>(
                 }
             },
         });
-        if let Err(err) = storage.job_finished(arena, job_id, status) {
+        if let Err(err) = storage.job_finished(arena, job_id, status).await {
             // We don't want to interrupt job processing, even in this case.
             log::warn!("[{arena}] failed to report status of job {job_id}: {err}");
         }

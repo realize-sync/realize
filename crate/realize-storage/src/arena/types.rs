@@ -272,8 +272,14 @@ impl ByteConvertible<HistoryTableEntry> for HistoryTableEntry {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct FailedJobTableEntry {
-    pub backoff_until: UnixTime,
     pub failure_count: u32,
+    pub retry: RetryJob,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum RetryJob {
+    WhenPeerConnects,
+    After(UnixTime),
 }
 
 impl NamedType for FailedJobTableEntry {
@@ -288,9 +294,18 @@ impl ByteConvertible<FailedJobTableEntry> for FailedJobTableEntry {
         let msg: engine_capnp::failed_job_table_entry::Reader =
             message_reader.get_root::<engine_capnp::failed_job_table_entry::Reader>()?;
 
+        let retry = match msg.get_retry().which()? {
+            engine_capnp::failed_job_table_entry::retry::After(after_time) => {
+                RetryJob::After(UnixTime::from_secs(after_time))
+            }
+            engine_capnp::failed_job_table_entry::retry::WhenPeerConnects(()) => {
+                RetryJob::WhenPeerConnects
+            }
+        };
+
         Ok(FailedJobTableEntry {
             failure_count: msg.get_failure_count(),
-            backoff_until: UnixTime::from_secs(msg.get_backoff_until_secs()),
+            retry,
         })
     }
 
@@ -300,7 +315,15 @@ impl ByteConvertible<FailedJobTableEntry> for FailedJobTableEntry {
             message.init_root::<engine_capnp::failed_job_table_entry::Builder>();
 
         builder.set_failure_count(self.failure_count);
-        builder.set_backoff_until_secs(self.backoff_until.as_secs());
+        
+        match &self.retry {
+            RetryJob::After(time) => {
+                builder.get_retry().set_after(time.as_secs());
+            }
+            RetryJob::WhenPeerConnects => {
+                builder.get_retry().set_when_peer_connects(());
+            }
+        }
 
         let mut buffer: Vec<u8> = Vec::new();
         serialize_packed::write_message(&mut buffer, &message)?;
@@ -461,10 +484,25 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
-    async fn convert_failed_job_table_entry() -> anyhow::Result<()> {
+    async fn convert_failed_job_table_entry_retry_after() -> anyhow::Result<()> {
         let entry = FailedJobTableEntry {
             failure_count: 3,
-            backoff_until: UnixTime::from_secs(1234567890),
+            retry: RetryJob::After(UnixTime::from_secs(1234567890)),
+        };
+
+        assert_eq!(
+            entry,
+            FailedJobTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn convert_failed_job_table_entry_retry_when_peer_connects() -> anyhow::Result<()> {
+        let entry = FailedJobTableEntry {
+            failure_count: 3,
+            retry: RetryJob::WhenPeerConnects,
         };
 
         assert_eq!(

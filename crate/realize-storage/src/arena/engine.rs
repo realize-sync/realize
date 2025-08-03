@@ -2,7 +2,7 @@
 
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
 use super::index;
-use super::types::{FailedJobTableEntry, LocalAvailability};
+use super::types::{FailedJobTableEntry, LocalAvailability, RetryJob};
 use crate::arena::arena_cache;
 use crate::arena::blob;
 use crate::arena::mark;
@@ -13,8 +13,8 @@ use realize_types::{Arena, Hash, Path, UnixTime};
 use redb::ReadableTable;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tokio::sync::watch;
+use tokio::sync::{broadcast, mpsc};
 use tokio::{task, time};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -63,7 +63,14 @@ pub enum JobStatus {
 
     /// The job was abandoned
     Abandoned,
-    // TODO: add Cancelled
+
+    /// The job was cancelled
+    Cancelled,
+
+    /// The job couldn't run because it required communicating with
+    /// unconnected peers. The job should be retried after peers have
+    /// connected.
+    NoPeers,
 }
 
 pub(crate) struct DirtyPaths {
@@ -141,6 +148,8 @@ pub struct Engine {
     /// This is used by wait_until_next_backoff to wait for a new
     /// failed job when there weren't any before.
     failed_job_tx: watch::Sender<()>,
+
+    retry_jobs_missing_peers: broadcast::Sender<()>,
 }
 
 impl Engine {
@@ -152,7 +161,7 @@ impl Engine {
         job_retry_strategy: impl (Fn(u32) -> Option<Duration>) + Sync + Send + 'static,
     ) -> Arc<Engine> {
         let (failed_job_tx, _) = watch::channel(());
-
+        let (retry_jobs_missing_peers, _) = broadcast::channel(8);
         Arc::new(Self {
             arena,
             db,
@@ -160,6 +169,7 @@ impl Engine {
             arena_root,
             job_retry_strategy: Box::new(job_retry_strategy),
             failed_job_tx,
+            retry_jobs_missing_peers,
         })
     }
 
@@ -209,6 +219,15 @@ impl Engine {
             Ok(JobStatus::Abandoned) => {
                 log::debug!("[{}] ABANDONED: {job_id}", self.arena);
                 self.job_done(job_id)
+            }
+            Ok(JobStatus::Cancelled) => {
+                log::debug!("[{}] CANCELLED: {job_id}", self.arena);
+                self.job_failed(job_id)?;
+                Ok(())
+            }
+            Ok(JobStatus::NoPeers) => {
+                log::debug!("[{}] MISSING PEERS: {job_id}; will retry", self.arena);
+                self.job_missing_peers(job_id)
             }
             Err(err) => match self.job_failed(job_id) {
                 Ok(None) => {
@@ -296,7 +315,7 @@ impl Engine {
                         counter,
                         Holder::with_content(FailedJobTableEntry {
                             failure_count,
-                            backoff_until: backoff_until.clone(),
+                            retry: RetryJob::After(backoff_until.clone()),
                         })?,
                     )?;
 
@@ -310,9 +329,58 @@ impl Engine {
         Ok(backoff_until)
     }
 
+    /// Tell the engine to retry job missing peers.
+    ///
+    /// This should be called after a new peer has become available.
+    pub(crate) fn retry_jobs_missing_peers(&self) {
+        let _ = self.retry_jobs_missing_peers.send(());
+    }
+
+    /// Report that a job returned had no peers to connect to.
+    ///
+    /// As long as the corresponding path isn't modified again, the job will be returned by
+    /// the job stream after another peer has connected.
+    ///
+    /// The job is abandoned if the corresponding path is modified
+    /// again or according to the retry strategy says so.
+    fn job_missing_peers(&self, job_id: JobId) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let dirty_log_table = txn.dirty_log_table()?;
+            let _path = match dirty_log_table.get(job_id.as_u64())? {
+                Some(v) => v.value().to_string(),
+                None => {
+                    return Ok(());
+                }
+            };
+            let counter = job_id.as_u64();
+            let mut failed_job_table = txn.failed_job_table()?;
+
+            // This isn't considered a failure, but keep the existing failure count.
+            let failure_count = if let Some(existing) = failed_job_table.get(counter)? {
+                let existing = existing.value().parse()?;
+                existing.failure_count
+            } else {
+                0
+            };
+
+            failed_job_table.insert(
+                counter,
+                Holder::with_content(FailedJobTableEntry {
+                    failure_count,
+                    retry: RetryJob::WhenPeerConnects,
+                })?,
+            )?;
+        }
+        txn.commit()?;
+
+        Ok(())
+    }
+
     async fn build_jobs(self: &Arc<Engine>, tx: mpsc::Sender<(JobId, Job)>) -> anyhow::Result<()> {
         let mut start_counter = 1;
         let mut retry_lower_bound = None;
+        let mut retry_jobs_missing_peers = self.retry_jobs_missing_peers.subscribe();
 
         loop {
             log::debug!("[{}] collecting jobs: {start_counter}..", self.arena);
@@ -357,6 +425,7 @@ impl Engine {
                     _ = tx.closed() => {
                         return Ok(());
                     }
+
                     ret = watch.wait_for(|v| *v >= start_counter) => {
                         log::debug!("[{arena}] done waiting for v >= {start_counter} / {ret:?}");
 
@@ -373,6 +442,12 @@ impl Engine {
                         // a single stream, relying on newly written
                         // backoffs always being in the future.
                         retry_lower_bound = Some(backoff_until);
+                    }
+
+                    Ok(mut jobs) = self.jobs_to_retry_missing_peers(&mut retry_jobs_missing_peers) => {
+                        log::debug!("[{arena}] {} jobs to retry after peer connected", jobs.len());
+
+                        jobs_to_retry.append(&mut jobs);
                     }
                 );
                 for counter in jobs_to_retry {
@@ -581,7 +656,14 @@ impl Engine {
                 for e in failed_job_table.iter()? {
                     let (key, val) = e?;
                     let counter = key.value();
-                    let backoff_until = val.value().parse()?.backoff_until;
+                    let entry = val.value().parse()?;
+                    let backoff_until = match entry.retry {
+                        RetryJob::After(time) => time,
+                        RetryJob::WhenPeerConnects => {
+                            // Skip jobs that are waiting for peer connection
+                            continue;
+                        }
+                    };
                     if let Some(lower_bound) = &lower_bound
                         && backoff_until <= *lower_bound
                     {
@@ -618,6 +700,44 @@ impl Engine {
             // A new job has failed. Re-evaluate wait time.
         }
     }
+
+    /// Look for jobs to retry whenever a new peer connects and return
+    /// them.
+    ///
+    /// Doesn't return an empty set of jobs if a peer connects and
+    /// there's nothing to retry; it instead goes back to sleep.
+    async fn jobs_to_retry_missing_peers(
+        self: &Arc<Self>,
+        rx: &mut broadcast::Receiver<()>,
+    ) -> Result<Vec<u64>, StorageError> {
+        loop {
+            let _ = rx.recv().await;
+            let this = Arc::clone(self);
+            let jobs = task::spawn_blocking(move || {
+                let txn = this.db.begin_read()?;
+                let failed_job_table = txn.failed_job_table()?;
+                let mut jobs = vec![];
+                for e in failed_job_table.iter()? {
+                    let (key, val) = e?;
+                    let counter = key.value();
+                    let entry = val.value().parse()?;
+                    match entry.retry {
+                        RetryJob::After(_) => {
+                            continue;
+                        }
+                        RetryJob::WhenPeerConnects => {
+                            jobs.push(counter);
+                        }
+                    }
+                }
+                Ok::<_, StorageError>(jobs)
+            })
+            .await??;
+            if !jobs.is_empty() {
+                return Ok(jobs);
+            }
+        }
+    }
 }
 
 fn current_path_counter(
@@ -632,25 +752,6 @@ fn last_counter(
     dirty_counter_table: &impl redb::ReadableTable<(), u64>,
 ) -> Result<u64, StorageError> {
     Ok(dirty_counter_table.get(())?.map(|v| v.value()).unwrap_or(0))
-}
-
-/// Return the time after which the next failed job can be retried and its key.
-fn next_retry(
-    failed_job_table: &impl ReadableTable<u64, Holder<'static, FailedJobTableEntry>>,
-) -> Result<Option<(UnixTime, u64)>, StorageError> {
-    let mut ret = None;
-    for e in failed_job_table.iter()? {
-        let (key, val) = e?;
-        let backoff_until = val.value().parse()?.backoff_until;
-        if let Some((t, _)) = &ret
-            && backoff_until >= *t
-        {
-            continue;
-        }
-        ret = Some((backoff_until, key.value()));
-    }
-
-    Ok(ret)
 }
 
 /// Check the dirty mark on a path.
@@ -1400,6 +1501,36 @@ mod tests {
 
         // barfile is gone, otherfile is left
         assert_eq!(Some(2), fixture.lowest_counter()?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_missing_peers_should_be_retried() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let foodir = Path::parse("foo")?;
+        let barfile = Path::parse("foo/bar.txt")?;
+        let otherfile = Path::parse("foo/other.txt")?;
+        let mut job_stream = fixture.engine.job_stream();
+        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.add_file_to_cache(&barfile)?;
+        fixture.add_file_to_cache(&otherfile)?;
+
+        let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
+        assert_eq!(barfile, *job.path());
+        fixture.engine.job_missing_peers(job_id)?;
+
+        // barfile is still there
+        assert_eq!(Some(1), fixture.lowest_counter()?);
+
+        let (_, job) = job_stream.next().await.unwrap();
+        assert_eq!(otherfile, *job.path());
+
+        fixture.engine.retry_jobs_missing_peers();
+
+        let (retry_job_id, retry_job) = next_with_timeout(&mut job_stream).await?.unwrap();
+        assert_eq!(barfile, *retry_job.path());
+        assert_eq!(job_id, retry_job_id);
 
         Ok(())
     }

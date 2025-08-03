@@ -247,17 +247,27 @@ impl Storage {
             .map(|(arena, (job_id, job))| (arena, job_id, job))
     }
 
+    /// Tell the engine to retry job missing peers.
+    ///
+    /// This should be called after a new peer has become available.
+    pub fn retry_jobs_missing_peers(&self) {
+        for storage in self.arena_storage.values() {
+            storage.engine.retry_jobs_missing_peers();
+        }
+    }
+
     /// Report the result of processing a job returned by the job stream.
     ///
     /// A job that is reported failed may be returned again for retry, after
     /// some backoff period.
-    pub fn job_finished(
+    pub async fn job_finished(
         &self,
         arena: Arena,
         job_id: JobId,
         status: anyhow::Result<JobStatus>,
     ) -> Result<(), StorageError> {
-        self.engine(arena)?.job_finished(job_id, status)
+        let engine = Arc::clone(self.engine(arena)?);
+        task::spawn(async move { engine.job_finished(job_id, status) }).await?
     }
 
     /// Check whether the given job is still relevant.
