@@ -97,15 +97,15 @@ impl Fixture {
         config.network.peers.insert(
             Peer::from("a"),
             PeerConfig {
-                address: None,
                 pubkey: std::fs::read_to_string(resources.join("a-spki.pem"))?,
+                ..Default::default()
             },
         );
         config.network.peers.insert(
             Peer::from("b"),
             PeerConfig {
-                address: None,
                 pubkey: std::fs::read_to_string(resources.join("b-spki.pem"))?,
+                ..Default::default()
             },
         );
 

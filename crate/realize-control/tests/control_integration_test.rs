@@ -62,8 +62,8 @@ impl Fixture {
         config.network.peers.insert(
             Peer::from("a"),
             realize_network::config::PeerConfig {
-                address: None,
                 pubkey: std::fs::read_to_string(resources.join("a-spki.pem"))?,
+                ..Default::default()
             },
         );
 
