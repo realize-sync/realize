@@ -1,5 +1,8 @@
-use super::{progress::ByteCountProgress, types::JobAction};
+use super::progress::ByteCountProgress;
+use super::types::JobAction;
+use crate::rpc::HouseholdOperationError;
 use crate::rpc::{ExecutionMode, Household};
+use fast_rsync::ApplyError;
 use futures::StreamExt;
 use realize_storage::{Inode, JobStatus, LocalAvailability, Storage, StorageError};
 use realize_types::{Arena, ByteRanges, Hash, Path, Peer, Signature};
@@ -13,6 +16,24 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 /// reasonably well into one message without slowing everything down.
 const RSYNC_BLOCK_SIZE: usize = 32 * 1024;
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum JobError {
+    #[error("{0}")]
+    Storage(#[from] StorageError),
+
+    #[error("{0}")]
+    Household(#[from] HouseholdOperationError),
+
+    #[error("I/O {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Rsync error")]
+    Rsync(#[from] ApplyError),
+
+    #[error("Hashes inconsistent after repair")]
+    InconsistentHash,
+}
+
 /// Make a local copy of a specific version of a remote file.
 ///
 /// Executes a [realize_storage::Job::Download]
@@ -24,7 +45,7 @@ pub(crate) async fn download(
     hash: &Hash,
     progress: &mut impl ByteCountProgress,
     shutdown: CancellationToken,
-) -> anyhow::Result<JobStatus> {
+) -> Result<JobStatus, JobError> {
     let cache = storage.cache();
     let inode = match cache.lookup_path(arena, path).await {
         Err(StorageError::NotFound) => {
@@ -72,7 +93,12 @@ pub(crate) async fn download(
             // whatever we could write before the error happened.
             blob.update_db().await?;
 
-            res?;
+            match res? {
+                JobStatus::Done => {}
+                other => {
+                    return Ok(other);
+                }
+            }
 
             drop(blob); // Make sure the file is closed before verifying
 
@@ -93,10 +119,10 @@ async fn write_to_blob(
     blob: &mut realize_storage::Blob,
     progress: &mut impl ByteCountProgress,
     shutdown: CancellationToken,
-) -> Result<(), anyhow::Error> {
+) -> Result<JobStatus, JobError> {
     let missing = ByteRanges::single(0, blob.size()).subtraction(blob.local_availability());
     if missing.is_empty() {
-        return Ok(());
+        return Ok(JobStatus::Done);
     }
     let total_bytes = missing.bytecount();
     let mut current_bytes: u64 = 0;
@@ -116,7 +142,7 @@ async fn write_to_blob(
         while let Some(chunk) = tokio::select!(
             res = stream.next() => {res}
             _ = shutdown.cancelled() => {
-                anyhow::bail!("cancelled");
+                return Ok(JobStatus::Cancelled);
             }
         ) {
             let (chunk_offset, chunk) = chunk?;
@@ -132,7 +158,7 @@ async fn write_to_blob(
     // TODO: Call update_db at regular intervals, so we don't lose too
     // much data in case the process is interrupted.
 
-    Ok(())
+    Ok(JobStatus::Done)
 }
 
 /// Check blob content against hash, repair it if necessary.
@@ -148,7 +174,7 @@ pub(crate) async fn verify(
     hash: &Hash,
     progress: &mut impl ByteCountProgress,
     shutdown: CancellationToken,
-) -> anyhow::Result<JobStatus> {
+) -> Result<JobStatus, JobError> {
     let mut blob = storage.cache().open_file(inode).await?;
     if *blob.hash() != *hash {
         return Ok(JobStatus::Abandoned);
@@ -158,7 +184,7 @@ pub(crate) async fn verify(
     let content_hash = tokio::select!(
     res = blob.compute_hash() => { res? },
     _ = shutdown.cancelled() => {
-        anyhow::bail!("cancelled")
+        return Ok(JobStatus::Cancelled);
     });
     if content_hash == *hash {
         blob.mark_verified().await?;
@@ -193,7 +219,7 @@ pub(crate) async fn verify(
         let delta = tokio::select!(
             res = household.rsync(peers.clone(), ExecutionMode::Batch, arena, path, &range, sig) => {res?},
             _ = shutdown.cancelled() => {
-                anyhow::bail!("cancelled")
+                return Ok(JobStatus::Cancelled);
             }
         );
         fixed_buf.clear();
@@ -210,13 +236,13 @@ pub(crate) async fn verify(
     let content_hash = tokio::select!(
     res = blob.compute_hash() => { res? },
     _ = shutdown.cancelled() => {
-        anyhow::bail!("cancelled")
+        return Ok(JobStatus::Cancelled);
     });
     if content_hash != *hash {
         log::debug!(
             "[{arena}]/{path} {hash}: inconsistent content hash {content_hash} after repair"
         );
-        anyhow::bail!("Hashes inconsistent after repair");
+        return Err(JobError::InconsistentHash);
     }
     blob.mark_verified().await?;
     log::debug!("[{arena}]/{path} fixed and verified against {hash}");
@@ -236,7 +262,7 @@ pub(crate) async fn realize(
     index_hash: Option<&Hash>,
     progress: &mut impl ByteCountProgress,
     shutdown: CancellationToken,
-) -> anyhow::Result<JobStatus> {
+) -> Result<JobStatus, JobError> {
     // First make sure that the correct version is locally available
     // and verified.
     let download_status =
@@ -264,7 +290,7 @@ pub(crate) async fn unrealize(
     path: &Path,
     hash: &Hash,
     progress: &mut impl ByteCountProgress,
-) -> anyhow::Result<JobStatus> {
+) -> Result<JobStatus, JobError> {
     progress.update_action(JobAction::Move);
     if !storage.unrealize(arena, path, hash).await? {
         return Ok(JobStatus::Abandoned);
@@ -699,19 +725,18 @@ mod tests {
                 let cancelled_token = CancellationToken::new();
                 cancelled_token.cancel();
 
-                let res = download(
-                    fixture.inner.storage(a)?,
-                    &household_a,
-                    HouseholdFixture::test_arena(),
-                    &path,
-                    &hash::digest("foobar"),
-                    &mut NoOpByteCountProgress,
-                    cancelled_token,
-                )
-                .await;
                 assert_eq!(
-                    Some("cancelled".to_string()),
-                    res.err().map(|err| err.to_string())
+                    JobStatus::Cancelled,
+                    download(
+                        fixture.inner.storage(a)?,
+                        &household_a,
+                        HouseholdFixture::test_arena(),
+                        &path,
+                        &hash::digest("foobar"),
+                        &mut NoOpByteCountProgress,
+                        cancelled_token,
+                    )
+                    .await?
                 );
 
                 let blob = fixture.open_file(a, "foobar").await?;

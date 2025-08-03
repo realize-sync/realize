@@ -152,6 +152,9 @@ fn fill_progress(
         JobProgress::Done => {
             progress_builder.set_type(control_capnp::job_progress::Type::Done);
         }
+        JobProgress::NoPeers => {
+            progress_builder.set_type(control_capnp::job_progress::Type::NoPeers);
+        }
         JobProgress::Abandoned => {
             progress_builder.set_type(control_capnp::job_progress::Type::Abandoned);
         }
@@ -237,6 +240,7 @@ fn parse_progress(
         control_capnp::job_progress::Type::Pending => Ok(JobProgress::Pending),
         control_capnp::job_progress::Type::Running => Ok(JobProgress::Running),
         control_capnp::job_progress::Type::Done => Ok(JobProgress::Done),
+        control_capnp::job_progress::Type::NoPeers => Ok(JobProgress::NoPeers),
         control_capnp::job_progress::Type::Abandoned => Ok(JobProgress::Abandoned),
         control_capnp::job_progress::Type::Cancelled => Ok(JobProgress::Cancelled),
         control_capnp::job_progress::Type::Failed => {

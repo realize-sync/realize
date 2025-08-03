@@ -107,6 +107,9 @@ pub enum JobProgress {
     /// The job was cancelled by a call to [Churten::shutdown].
     Cancelled,
 
+    /// Peers the job needed to connect to were offline.
+    NoPeers,
+
     /// The job failed. It may be retried.
     ///
     /// The string is an error description.
@@ -121,6 +124,7 @@ impl JobProgress {
             JobProgress::Done => true,
             JobProgress::Abandoned => true,
             JobProgress::Cancelled => true,
+            JobProgress::NoPeers => true,
             JobProgress::Failed(_) => true,
         }
     }

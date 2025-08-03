@@ -277,8 +277,10 @@ fn mark_to_capnp(mark: Mark) -> control_capnp::Mark {
 mod tests {
     use super::*;
     use crate::consensus::churten::{JobHandler, JobHandlerImpl};
+    use crate::consensus::jobs::JobError;
     use crate::consensus::progress::{ByteCountProgress, TxByteCountProgress};
     use crate::consensus::types::{ChurtenNotification, JobAction, JobProgress};
+    use crate::rpc::Household;
     use crate::rpc::control::client::{self, ChurtenUpdates, TxChurtenSubscriber};
     use crate::rpc::testing::HouseholdFixture;
     use assert_fs::TempDir;
@@ -300,14 +302,14 @@ mod tests {
     /// A fake JobHandler for testing different job outcomes through RPC
     #[derive(Clone)]
     struct FakeJobHandler {
-        result_fn: Arc<dyn Fn() -> anyhow::Result<JobStatus> + Send + Sync>,
+        result_fn: Arc<dyn Fn() -> Result<JobStatus, JobError> + Send + Sync>,
         should_send_progress: bool,
     }
 
     impl FakeJobHandler {
         fn new<F>(result_fn: F) -> Self
         where
-            F: Fn() -> anyhow::Result<JobStatus> + Send + Sync + 'static,
+            F: Fn() -> Result<JobStatus, JobError> + Send + Sync + 'static,
         {
             Self {
                 result_fn: Arc::new(result_fn),
@@ -328,9 +330,9 @@ mod tests {
             _job: &Arc<realize_storage::Job>,
             progress: &mut TxByteCountProgress,
             shutdown: CancellationToken,
-        ) -> anyhow::Result<JobStatus> {
+        ) -> Result<JobStatus, JobError> {
             if shutdown.is_cancelled() {
-                anyhow::bail!("cancelled");
+                return Ok(JobStatus::Cancelled);
             }
 
             // Send progress updates if requested
@@ -363,10 +365,11 @@ mod tests {
             &self,
             local: &LocalSet,
             peer: Peer,
+            household: Household,
             handler: H,
         ) -> anyhow::Result<PathBuf> {
             let storage = self.inner.storage(peer)?;
-            let churten = Churten::with_handler(Arc::clone(storage), handler);
+            let churten = Churten::with_handler(Arc::clone(storage), household, handler);
             let server = ControlServer::new(Arc::clone(storage), churten);
 
             let sockpath = self
@@ -398,6 +401,7 @@ mod tests {
             .bind_server(
                 &local,
                 peer,
+                household.clone(),
                 JobHandlerImpl::new(Arc::clone(storage), household.clone()),
             )
             .await?;
@@ -437,6 +441,7 @@ mod tests {
             .bind_server(
                 &local,
                 peer,
+                household.clone(),
                 JobHandlerImpl::new(Arc::clone(storage), household.clone()),
             )
             .await?;
@@ -475,6 +480,7 @@ mod tests {
             .bind_server(
                 &local,
                 peer,
+                household.clone(),
                 JobHandlerImpl::new(Arc::clone(storage), household.clone()),
             )
             .await?;
@@ -521,10 +527,13 @@ mod tests {
         let peer = HouseholdFixture::a();
         let local = LocalSet::new();
         let storage = Arc::clone(fixture.inner.storage(peer)?);
+        let household = fixture.inner.create_household(&local, peer)?;
 
         // Create a fake job handler that succeeds
         let handler = FakeJobHandler::new(|| Ok(JobStatus::Done)).with_progress(true);
-        let sockpath = fixture.bind_server(&local, peer, handler).await?;
+        let sockpath = fixture
+            .bind_server(&local, peer, household, handler)
+            .await?;
 
         local
             .run_until(async move {
@@ -669,10 +678,13 @@ mod tests {
         let peer = HouseholdFixture::a();
         let local = LocalSet::new();
         let storage = Arc::clone(fixture.inner.storage(peer)?);
+        let household = fixture.inner.create_household(&local, peer)?;
 
         // Create a fake job handler that succeeds
         let handler = FakeJobHandler::new(|| Ok(JobStatus::Done));
-        let sockpath = fixture.bind_server(&local, peer, handler).await?;
+        let sockpath = fixture
+            .bind_server(&local, peer, household, handler)
+            .await?;
 
         local
             .run_until(async move {

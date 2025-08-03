@@ -1,5 +1,5 @@
 pub(crate) mod churten;
-mod jobs;
+pub mod jobs;
 pub mod movedirs;
 pub(crate) mod progress;
 pub mod tracker;

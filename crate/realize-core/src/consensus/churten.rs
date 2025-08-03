@@ -1,11 +1,12 @@
 #![allow(dead_code)] // work in progress
 
-use super::jobs;
+use super::jobs::{self, JobError};
 use super::progress::TxByteCountProgress;
 use super::tracker::{JobInfo, JobInfoTracker};
 use super::types::{ChurtenNotification, JobProgress};
-use crate::rpc::Household;
+use crate::rpc::{Household, HouseholdOperationError};
 use futures::StreamExt;
+use realize_network::capnp::PeerStatus;
 use realize_storage::{Job, JobId, JobStatus, Storage};
 use realize_types::Arena;
 use std::sync::Arc;
@@ -33,7 +34,7 @@ pub(crate) trait JobHandler: Sync + Send + Clone {
         job: &Arc<Job>,
         progress: &mut TxByteCountProgress,
         shutdown: CancellationToken,
-    ) -> impl Future<Output = anyhow::Result<JobStatus>> + Sync + Send;
+    ) -> impl Future<Output = Result<JobStatus, JobError>> + Sync + Send;
 }
 
 /// Bring the local store and peers closer together.
@@ -43,6 +44,7 @@ pub(crate) trait JobHandler: Sync + Send + Clone {
 /// happens on that job.
 pub(crate) struct Churten<H: JobHandler> {
     storage: Arc<Storage>,
+    household: Household,
     handler: H,
     task: Option<(JoinHandle<()>, CancellationToken)>,
     tx: broadcast::Sender<ChurtenNotification>,
@@ -53,13 +55,14 @@ impl Churten<JobHandlerImpl> {
     pub(crate) fn new(storage: Arc<Storage>, household: Household) -> Self {
         Self::with_handler(
             Arc::clone(&storage),
+            household.clone(),
             JobHandlerImpl::new(storage, household),
         )
     }
 }
 
 impl<H: JobHandler + 'static> Churten<H> {
-    pub(crate) fn with_handler(storage: Arc<Storage>, handler: H) -> Self {
+    pub(crate) fn with_handler(storage: Arc<Storage>, household: Household, handler: H) -> Self {
         let (tx, mut rx) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
 
         let tracker = Arc::new(RwLock::new(JobInfoTracker::new(16)));
@@ -77,6 +80,7 @@ impl<H: JobHandler + 'static> Churten<H> {
             handler,
             task: None,
             tx,
+            household,
             recent_jobs: tracker,
         }
     }
@@ -121,8 +125,9 @@ impl<H: JobHandler + 'static> Churten<H> {
             let storage = Arc::clone(&self.storage);
             let handler = self.handler.clone();
             let tx = self.tx.clone();
+            let peer_status = self.household.peer_status();
 
-            async move { background_job(&storage, &handler, tx, shutdown).await }
+            async move { background_job(&storage, &handler, tx, peer_status, shutdown).await }
         });
         self.task = Some((handle, shutdown));
     }
@@ -148,6 +153,7 @@ async fn background_job<H: JobHandler>(
     storage: &Arc<Storage>,
     handler: &H,
     tx: broadcast::Sender<ChurtenNotification>,
+    mut peer_status: broadcast::Receiver<PeerStatus>,
     shutdown: CancellationToken,
 ) {
     log::debug!("Collecting jobs...");
@@ -166,33 +172,53 @@ async fn background_job<H: JobHandler>(
         })
         .map(|(arena, job_id, job)| run_job(handler, arena, job_id, job, &tx, shutdown.clone()))
         .buffer_unordered(PARALLEL_JOB_COUNT);
-    while let Some((arena, job_id, status)) = tokio::select!(
-        result = result_stream.next() => {
-            result
+
+    loop {
+        tokio::select!(
+        _ = shutdown.cancelled() => {
+            break;
         }
-        _ = shutdown.cancelled() => { None })
-    {
-        let _ = tx.send(ChurtenNotification::Finish {
-            arena,
-            job_id,
-            progress: match &status {
-                Ok(JobStatus::Done) => JobProgress::Done,
-                Ok(JobStatus::Abandoned) => JobProgress::Abandoned,
-                Ok(JobStatus::Cancelled) => JobProgress::Cancelled,
-                Ok(JobStatus::NoPeers) => JobProgress::Failed("no peers".to_string()),
-                Err(err) => {
-                    if shutdown.is_cancelled() {
-                        JobProgress::Cancelled
-                    } else {
-                        JobProgress::Failed(err.to_string())
+        _ = peer_status.recv() => {
+            storage.retry_jobs_missing_peers();
+        }
+        result = result_stream.next() => {
+            match result {
+                None => {
+                    break;
+                }
+                Some((arena, job_id, status)) => {
+                    let status = match status {
+                        Ok(status) => Ok(status),
+                        Err(JobError::Household(HouseholdOperationError::NoPeers))  => Ok(JobStatus::NoPeers),
+                        Err(JobError::Household(HouseholdOperationError::Disconnected))  => Ok(JobStatus::NoPeers),
+                        Err(err) => {
+                            if shutdown.is_cancelled() {
+                                Ok(JobStatus::Cancelled)
+                            } else {
+                                Err(err)
+                            }
+                        },
+                    };
+                    let _ = tx.send(ChurtenNotification::Finish {
+                        arena,
+                        job_id,
+                        progress: match &status {
+                            Ok(JobStatus::Done) => JobProgress::Done,
+                            Ok(JobStatus::Abandoned) => JobProgress::Abandoned,
+                            Ok(JobStatus::Cancelled) => JobProgress::Cancelled,
+                            Ok(JobStatus::NoPeers) => JobProgress::NoPeers,
+                            Err(err) => {
+                                JobProgress::Failed(err.to_string())
+                            }
+                        },
+                    });
+                    if let Err(err) = storage.job_finished(arena, job_id, status.map_err(|err| err.into())).await {
+                        // We don't want to interrupt job processing, even in this case.
+                        log::warn!("[{arena}] failed to report status of job {job_id}: {err}");
                     }
                 }
-            },
+            }
         });
-        if let Err(err) = storage.job_finished(arena, job_id, status).await {
-            // We don't want to interrupt job processing, even in this case.
-            log::warn!("[{arena}] failed to report status of job {job_id}: {err}");
-        }
     }
     log::debug!("Done collecting jobs...");
 }
@@ -204,7 +230,7 @@ async fn run_job<H: JobHandler>(
     job: Arc<Job>,
     tx: &broadcast::Sender<ChurtenNotification>,
     shutdown: CancellationToken,
-) -> (Arena, JobId, anyhow::Result<JobStatus>) {
+) -> (Arena, JobId, Result<JobStatus, JobError>) {
     log::debug!("[{arena}] STARTING: {job_id} {job:?}");
     let _ = tx.send(ChurtenNotification::Start { arena, job_id });
     let mut progress = TxByteCountProgress::new(arena, job_id, tx.clone())
@@ -235,7 +261,7 @@ impl JobHandler for JobHandlerImpl {
         job: &Arc<Job>,
         progress: &mut TxByteCountProgress,
         shutdown: CancellationToken,
-    ) -> anyhow::Result<JobStatus> {
+    ) -> Result<JobStatus, JobError> {
         match &**job {
             Job::Download(path, hash) => {
                 jobs::download(
@@ -271,14 +297,14 @@ impl JobHandler for JobHandlerImpl {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
     use crate::consensus::progress::ByteCountProgress;
     use crate::consensus::types::JobAction;
     use crate::rpc::testing::{self, HouseholdFixture};
     use realize_storage::utils::hash::{self, digest};
     use realize_storage::{JobId, Mark};
+    use std::collections::HashMap;
+    use std::time::Duration;
     use tokio::io::AsyncReadExt;
 
     struct Fixture {
@@ -312,6 +338,7 @@ mod tests {
 
                 let mut churten = Churten::with_handler(
                     Arc::clone(&storage),
+                    household_a.clone(),
                     JobHandlerImpl::new(Arc::clone(&storage), household_a.clone()),
                 );
                 let mut rx = churten.subscribe();
@@ -398,10 +425,70 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn churten_nopeers() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                let arena = HouseholdFixture::test_arena();
+                let storage = fixture.inner.storage(a)?;
+                testing::connect(&household_a, b).await?;
+
+                // b has foo in its index, which is available in the
+                // cache on a and set to keep; it'll be downloaded.
+                fixture.inner.write_file(b, "foo", "this is foo").await?;
+                fixture.inner.wait_for_file_in_cache(a, "foo").await?;
+                storage.set_arena_mark(arena, Mark::Keep).await?;
+
+                // b is disconnected; downloading won't succeed
+                testing::disconnect(&household_a, b).await?;
+
+                let mut churten = Churten::with_handler(
+                    Arc::clone(&storage),
+                    household_a.clone(),
+                    JobHandlerImpl::new(Arc::clone(&storage), household_a.clone()),
+                );
+                let mut rx = churten.subscribe();
+                churten.start();
+
+                // the job cannot connect to the peer, because it is disconnected
+                while let Ok(n) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await? {
+                    if let ChurtenNotification::Finish { progress, .. } = n {
+                        assert_eq!(JobProgress::NoPeers, progress);
+                        break;
+                    }
+                }
+
+                // upon reconnection, the job is retried and succeeds
+                testing::connect(&household_a, b).await?;
+                while let Ok(n) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await? {
+                    if let ChurtenNotification::Finish { progress, .. } = n {
+                        assert_eq!(JobProgress::Done, progress);
+                        break;
+                    }
+                }
+
+                let mut blob = fixture.inner.open_file(a, "foo").await?;
+                let mut buf = String::new();
+                blob.read_to_string(&mut buf).await?;
+                assert_eq!("this is foo", buf);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
     /// A fake JobHandler for testing different job outcomes
     #[derive(Clone)]
     struct FakeJobHandler {
-        result_fn: Arc<dyn Fn() -> anyhow::Result<JobStatus> + Send + Sync>,
+        result_fn: Arc<dyn Fn() -> Result<JobStatus, JobError> + Send + Sync>,
         should_send_progress: bool,
         should_cancel: bool,
     }
@@ -409,7 +496,7 @@ mod tests {
     impl FakeJobHandler {
         fn new<F>(result_fn: F) -> Self
         where
-            F: Fn() -> anyhow::Result<JobStatus> + Send + Sync + 'static,
+            F: Fn() -> Result<JobStatus, JobError> + Send + Sync + 'static,
         {
             Self {
                 result_fn: Arc::new(result_fn),
@@ -436,7 +523,7 @@ mod tests {
             _job: &Arc<Job>,
             progress: &mut TxByteCountProgress,
             shutdown: CancellationToken,
-        ) -> anyhow::Result<JobStatus> {
+        ) -> Result<JobStatus, JobError> {
             // Simulate some work time
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
@@ -445,7 +532,7 @@ mod tests {
             }
             if shutdown.is_cancelled() {
                 shutdown.cancel();
-                anyhow::bail!("cancelled");
+                return Ok(JobStatus::Cancelled);
             }
 
             // Send progress updates if requested
@@ -474,7 +561,8 @@ mod tests {
                 testing::connect(&household_a, b).await?;
 
                 let handler = FakeJobHandler::new(|| Ok(JobStatus::Done)).with_progress(true);
-                let mut churten = Churten::with_handler(Arc::clone(&storage), handler);
+                let mut churten =
+                    Churten::with_handler(Arc::clone(&storage), household_a.clone(), handler);
                 let mut rx = churten.subscribe();
                 churten.start();
 
@@ -551,7 +639,8 @@ mod tests {
                 testing::connect(&household_a, b).await?;
 
                 let handler = FakeJobHandler::new(|| Ok(JobStatus::Abandoned));
-                let mut churten = Churten::with_handler(Arc::clone(&storage), handler);
+                let mut churten =
+                    Churten::with_handler(Arc::clone(&storage), household_a.clone(), handler);
                 let mut rx = churten.subscribe();
                 churten.start();
 
@@ -608,9 +697,9 @@ mod tests {
                 let storage = fixture.inner.storage(a)?;
                 testing::connect(&household_a, b).await?;
 
-                let error_msg = "Simulated job failure";
-                let handler = FakeJobHandler::new(move || Err(anyhow::anyhow!(error_msg)));
-                let mut churten = Churten::with_handler(Arc::clone(&storage), handler);
+                let handler = FakeJobHandler::new(move || Err(JobError::InconsistentHash));
+                let mut churten =
+                    Churten::with_handler(Arc::clone(&storage), household_a.clone(), handler);
                 let mut rx = churten.subscribe();
                 churten.start();
 
@@ -637,7 +726,7 @@ mod tests {
                     ChurtenNotification::Finish {
                         arena,
                         job_id,
-                        progress: JobProgress::Failed(error_msg.to_string()),
+                        progress: JobProgress::Failed(JobError::InconsistentHash.to_string()),
                     },
                     rx.recv().await?
                 );
@@ -669,7 +758,8 @@ mod tests {
 
                 // Create a handler that will be cancelled
                 let handler = FakeJobHandler::new(|| Ok(JobStatus::Done)).with_cancel(true);
-                let mut churten = Churten::with_handler(Arc::clone(&storage), handler);
+                let mut churten =
+                    Churten::with_handler(Arc::clone(&storage), household_a.clone(), handler);
                 let mut rx = churten.subscribe();
                 churten.start();
 
@@ -730,7 +820,8 @@ mod tests {
                 testing::connect(&household_a, b).await?;
 
                 let handler = FakeJobHandler::new(|| Ok(JobStatus::Done)).with_progress(false);
-                let mut churten = Churten::with_handler(Arc::clone(&storage), handler);
+                let mut churten =
+                    Churten::with_handler(Arc::clone(&storage), household_a.clone(), handler);
                 let mut rx = churten.subscribe();
                 churten.start();
 
@@ -784,7 +875,8 @@ mod tests {
                 testing::connect(&household_a, b).await?;
 
                 let handler = FakeJobHandler::new(|| Ok(JobStatus::Done));
-                let mut churten = Churten::with_handler(Arc::clone(&storage), handler);
+                let mut churten =
+                    Churten::with_handler(Arc::clone(&storage), household_a.clone(), handler);
                 let mut rx = churten.subscribe();
                 churten.start();
 
@@ -868,7 +960,8 @@ mod tests {
                 testing::connect(&household_a, b).await?;
 
                 let handler = FakeJobHandler::new(|| Ok(JobStatus::Done));
-                let mut churten = Churten::with_handler(Arc::clone(&storage), handler);
+                let mut churten =
+                    Churten::with_handler(Arc::clone(&storage), household_a.clone(), handler);
                 let mut rx = churten.subscribe();
                 churten.start();
 

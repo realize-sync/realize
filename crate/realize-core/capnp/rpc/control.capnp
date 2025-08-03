@@ -141,6 +141,7 @@ struct JobProgress {
     abandoned @3;
     cancelled @4;
     failed @5;
+    noPeers @6;
   }
 }
 
