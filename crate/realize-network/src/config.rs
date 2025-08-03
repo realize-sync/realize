@@ -40,6 +40,5 @@ pub struct PeerConfig {
     /// Rate limit that applies to batch operations.
     ///
     /// Interactive operations are not limited.
-    #[serde(with = "byte_unit_serde")]
     pub batch_rate_limit: Option<u64>,
 }
