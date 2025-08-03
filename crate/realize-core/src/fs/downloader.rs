@@ -1,4 +1,4 @@
-use crate::rpc::Household;
+use crate::rpc::{ExecutionMode, Household};
 use futures::Future;
 use realize_storage::{Blob, Inode, StorageError, UnrealCacheAsync};
 use realize_types::{Arena, ByteRange, ByteRanges, Path, Peer};
@@ -209,8 +209,14 @@ impl Download {
 
             Box::pin(async move {
                 let mut result = VecDeque::new();
-                let mut stream =
-                    household.read(peers, arena, path, range.start, Some(range.bytecount()))?;
+                let mut stream = household.read(
+                    peers,
+                    ExecutionMode::Interactive,
+                    arena,
+                    path,
+                    range.start,
+                    Some(range.bytecount()),
+                )?;
                 while let Some(chunk_result) = stream.next().await {
                     match chunk_result {
                         Ok((offset, chunk)) => {

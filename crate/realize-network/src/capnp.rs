@@ -559,7 +559,7 @@ mod tests {
 
             let configured = self.peers.hostport(peer).await;
             let addr = server
-                .listen(configured.unwrap_or(&HostPort::localhost(0)))
+                .listen(configured.as_ref().unwrap_or(&HostPort::localhost(0)))
                 .await?;
             if configured.is_none() {
                 self.peers.set_addr(peer, addr);

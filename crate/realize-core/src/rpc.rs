@@ -28,4 +28,4 @@ mod store_capnp {
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
-pub use household::Household;
+pub use household::{ExecutionMode, Household};

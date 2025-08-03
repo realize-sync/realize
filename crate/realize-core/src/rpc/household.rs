@@ -31,6 +31,12 @@ use uuid::Uuid;
 /// Identifies Cap'n Proto ConnectedPeer connections.
 const TAG: &[u8; 4] = b"PEER";
 
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum ExecutionMode {
+    Interactive,
+    Batch,
+}
+
 /// A set of peers and their connections.
 ///
 /// Cap'n Proto connections are handled or their own thread. This
@@ -57,8 +63,8 @@ impl Household {
         storage: Arc<Storage>,
     ) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::channel(128);
-        let manager =
-            ConnectionManager::spawn(local, networking, PeerConnectionHandler { storage, rx })?;
+        let handler = PeerConnectionHandler::new(storage, &networking, rx);
+        let manager = ConnectionManager::spawn(local, networking, handler)?;
 
         Ok(Self {
             manager: Arc::new(manager),
@@ -105,6 +111,7 @@ impl Household {
     pub fn read<T>(
         &self,
         peers: T,
+        mode: ExecutionMode,
         arena: Arena,
         path: Path,
         offset: u64,
@@ -116,6 +123,7 @@ impl Household {
         let (tx, rx) = mpsc::channel(10);
         let op = HouseholdOperation::Read {
             peers: peers.into_iter().collect(),
+            mode,
             arena,
             path,
             offset,
@@ -140,6 +148,7 @@ impl Household {
     pub async fn rsync<T>(
         &self,
         peers: T,
+        mode: ExecutionMode,
         arena: Arena,
         path: &Path,
         range: &ByteRange,
@@ -152,6 +161,7 @@ impl Household {
         self.operation_tx
             .send(HouseholdOperation::Rsync {
                 peers: peers.into_iter().collect(),
+                mode,
                 tx,
                 arena,
                 path: path.clone(),
@@ -167,6 +177,7 @@ impl Household {
 enum HouseholdOperation {
     Read {
         peers: Vec<Peer>,
+        mode: ExecutionMode,
         tx: mpsc::Sender<Result<(u64, Vec<u8>), io::Error>>,
         arena: Arena,
         path: realize_types::Path,
@@ -175,6 +186,7 @@ enum HouseholdOperation {
     },
     Rsync {
         peers: Vec<Peer>,
+        mode: ExecutionMode,
         tx: oneshot::Sender<anyhow::Result<Delta>>,
         arena: Arena,
         path: realize_types::Path,
@@ -184,7 +196,28 @@ enum HouseholdOperation {
 }
 struct PeerConnectionHandler {
     storage: Arc<Storage>,
+    batch_rate_limits: HashMap<Peer, f64>,
     rx: mpsc::Receiver<HouseholdOperation>,
+}
+
+impl PeerConnectionHandler {
+    fn new(
+        storage: Arc<Storage>,
+        networking: &Networking,
+        rx: mpsc::Receiver<HouseholdOperation>,
+    ) -> Self {
+        let batch_rate_limits = networking
+            .peer_setup()
+            .flat_map(|(p, s)| s.batch_rate_limit.map(|l| (p, l as f64)))
+            .filter(|(_, l)| *l > 0.0)
+            .collect::<HashMap<Peer, f64>>();
+
+        Self {
+            storage,
+            batch_rate_limits,
+            rx,
+        }
+    }
 }
 
 impl ConnectionHandler<PeerConnectionTracker, connected_peer::Client> for PeerConnectionHandler {
@@ -193,8 +226,12 @@ impl ConnectionHandler<PeerConnectionTracker, connected_peer::Client> for PeerCo
     }
 
     async fn create_tracker(self) -> Rc<PeerConnectionTracker> {
-        let PeerConnectionHandler { storage, mut rx } = self;
-        let tracker = PeerConnectionTracker::new(storage);
+        let PeerConnectionHandler {
+            storage,
+            batch_rate_limits,
+            mut rx,
+        } = self;
+        let tracker = PeerConnectionTracker::new(storage, batch_rate_limits);
 
         tokio::task::spawn_local({
             let tracker = Rc::clone(&tracker);
@@ -212,13 +249,20 @@ impl ConnectionHandler<PeerConnectionTracker, connected_peer::Client> for PeerCo
 
 struct PeerConnectionTracker {
     storage: Arc<Storage>,
-    stores: RefCell<HashMap<Peer, store::Client>>,
+    batch_rate_limits: HashMap<Peer, f64>,
+    stores: RefCell<HashMap<Peer, TrackedClients>>,
+}
+
+struct TrackedClients {
+    store: store::Client,
+    batch_store: Option<store::Client>,
 }
 
 impl PeerConnectionTracker {
-    fn new(storage: Arc<Storage>) -> Rc<Self> {
+    fn new(storage: Arc<Storage>, batch_rate_limits: HashMap<Peer, f64>) -> Rc<Self> {
         Rc::new(Self {
             storage,
+            batch_rate_limits,
             stores: RefCell::new(HashMap::new()),
         })
     }
@@ -227,6 +271,7 @@ impl PeerConnectionTracker {
         match operation {
             HouseholdOperation::Read {
                 peers,
+                mode,
                 tx,
                 arena,
                 path,
@@ -234,36 +279,49 @@ impl PeerConnectionTracker {
                 limit,
             } => {
                 let tx_clone = tx.clone();
-                if let Err(err) =
-                    execute_read(self.find_store(&peers), arena, path, offset, limit, tx).await
+                if let Err(err) = execute_read(
+                    self.find_store(&peers, mode),
+                    arena,
+                    path,
+                    offset,
+                    limit,
+                    tx,
+                )
+                .await
                 {
                     let _ = tx_clone.send(Err(err)).await;
                 }
             }
             HouseholdOperation::Rsync {
                 peers,
+                mode,
                 tx,
                 arena,
                 path,
                 range,
                 sig,
             } => {
-                let res = execute_rsync(self.find_store(&peers), arena, &path, &range, sig).await;
+                let res =
+                    execute_rsync(self.find_store(&peers, mode), arena, &path, &range, sig).await;
                 let _ = tx.send(res);
             }
         }
     }
 
-    fn find_store(&self, peers: &Vec<Peer>) -> Option<(Peer, store::Client)> {
+    fn find_store(&self, peers: &Vec<Peer>, mode: ExecutionMode) -> Option<(Peer, store::Client)> {
         let stores = self.stores.borrow();
-        for peer in peers {
-            let found = stores.get(&peer).map(|c| (*peer, c.clone()));
-            if found.is_some() {
-                return found;
-            }
-        }
-
-        None
+        peers
+            .iter()
+            .find_map(|p| stores.get(p).map(|s| (*p, s)))
+            .map(|(p, c)| {
+                (
+                    p,
+                    match mode {
+                        ExecutionMode::Interactive => c.store.clone(),
+                        ExecutionMode::Batch => c.batch_store.as_ref().unwrap_or(&c.store).clone(),
+                    },
+                )
+            })
     }
 }
 
@@ -276,9 +334,25 @@ impl ConnectionTracker<connected_peer::Client> for PeerConnectionTracker {
 
     async fn register(&self, peer: Peer, mut client: connected_peer::Client) -> anyhow::Result<()> {
         let store = get_connected_peer_store(&mut client).await?;
-        self.stores.borrow_mut().insert(peer, store);
+        let batch_store = if let Some(bytes_per_second) = self.batch_rate_limits.get(&peer) {
+            log::debug!("Rate-limiting batch calls from {peer}, rate-limit={bytes_per_second}");
+            let mut request = store.with_rate_limit_request();
+            request.get().set_rate_limit(*bytes_per_second);
+            let reply = request.send().promise.await?;
 
-        subscribe_self(&self.storage, peer, client).await?;
+            Some(reply.get()?.get_store()?)
+        } else {
+            None
+        };
+
+        let store_for_subscribe = batch_store.as_ref().unwrap_or(&store).clone();
+        self.stores
+            .borrow_mut()
+            .insert(peer, TrackedClients { store, batch_store });
+
+        if let Err(err) = subscribe_self(&self.storage, peer, store_for_subscribe).await {
+            log::warn!("Failed to subscribe to {peer}: {err}");
+        }
 
         Ok(())
     }
@@ -427,11 +501,9 @@ fn channel_closed<T>(_: mpsc::error::SendError<T>) -> capnp::Error {
 async fn subscribe_self(
     storage: &Arc<Storage>,
     peer: Peer,
-    mut client: connected_peer::Client,
+    store: store::Client,
 ) -> anyhow::Result<()> {
-    let store = get_connected_peer_store(&mut client).await?;
     let cache = storage.cache();
-
     let request = store.arenas_request();
     let reply = request.send().promise.await?;
     let arenas = reply.get()?.get_arenas()?;
@@ -769,6 +841,10 @@ impl store::Server for StoreServer {
             return Promise::err(capnp::Error::failed("invalid rate limit".to_string()));
         }
 
+        log::debug!(
+            "Created rate-limited store for {}, rate-limit={rate_limit}",
+            self.peer
+        );
         results.get().set_store(
             StoreServer {
                 peer: self.peer,
@@ -1171,10 +1247,13 @@ fn size_to_bytes(size: capnp::MessageSize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::rpc::testing::HouseholdFixture;
     use fast_rsync::SignatureOptions;
     use futures::TryStreamExt as _;
+    use realize_network::testing::TestingPeers;
     use tokio::fs;
 
     #[tokio::test]
@@ -1220,6 +1299,7 @@ mod tests {
 
                 let stream = household_a.read(
                     vec![b.clone()],
+                    ExecutionMode::Interactive,
                     HouseholdFixture::test_arena(),
                     realize_types::Path::parse("bar.txt")?,
                     0,
@@ -1230,6 +1310,7 @@ mod tests {
 
                 let stream = household_a.read(
                     vec![b.clone()],
+                    ExecutionMode::Interactive,
                     HouseholdFixture::test_arena(),
                     realize_types::Path::parse("bar.txt")?,
                     2,
@@ -1240,6 +1321,7 @@ mod tests {
 
                 let stream = household_a.read(
                     vec![b.clone()],
+                    ExecutionMode::Interactive,
                     HouseholdFixture::test_arena(),
                     realize_types::Path::parse("bar.txt")?,
                     0,
@@ -1300,7 +1382,14 @@ mod tests {
 
                 // Call rsync to get delta from peer B
                 let delta = household_a
-                    .rsync(vec![b.clone()], arena, &path, &range, sig)
+                    .rsync(
+                        vec![b.clone()],
+                        ExecutionMode::Interactive,
+                        arena,
+                        &path,
+                        &range,
+                        sig,
+                    )
                     .await?;
 
                 // Apply the delta to reconstruct the original content
@@ -1362,7 +1451,14 @@ mod tests {
 
                 // Call rsync - should return an empty or minimal delta since files are identical
                 let delta = household_a
-                    .rsync(vec![b.clone()], arena, &path, &range, sig)
+                    .rsync(
+                        vec![b.clone()],
+                        ExecutionMode::Interactive,
+                        arena,
+                        &path,
+                        &range,
+                        sig,
+                    )
                     .await?;
 
                 // Apply the delta
@@ -1423,7 +1519,14 @@ mod tests {
 
                 // Call rsync - should return a delta that transforms A's content to B's content
                 let delta = household_a
-                    .rsync(vec![b.clone()], arena, &path, &range, sig)
+                    .rsync(
+                        vec![b.clone()],
+                        ExecutionMode::Interactive,
+                        arena,
+                        &path,
+                        &range,
+                        sig,
+                    )
                     .await?;
 
                 // Apply the delta
@@ -1446,5 +1549,214 @@ mod tests {
             .await?;
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_rate_limit() -> anyhow::Result<()> {
+        // This test uses a minimal fake server to test that the
+        // client-side of Household makes the correct calls to setup a
+        // rate-limited store and use it for the subscriber as well as
+        // when execution mode is batch.
+
+        let mut fixture = HouseholdFixture::setup().await?;
+        let a = TestingPeers::a();
+        let b = TestingPeers::b();
+        let arena = HouseholdFixture::test_arena();
+        let path = Path::parse("test.txt")?;
+        fixture.peers.set_batch_rate_limit(b, 1024);
+
+        let (tx, rx) = mpsc::channel(128);
+        let handler = PeerConnectionHandler::new(
+            Arc::clone(fixture.storage(a)?),
+            &fixture.peers.networking(a)?,
+            rx,
+        );
+
+        let local = LocalSet::new();
+        local
+            .run_until(async move {
+                let calls = Rc::new(RefCell::new(vec![]));
+                let tracker = handler.create_tracker().await;
+                tracker
+                    .register(b, capnp_rpc::new_client(FakeConnectedPeer(calls.clone())))
+                    .await?;
+
+                assert_eq!(
+                    vec![
+                        "ConnectedPeer.store()".to_string(),
+                        "Store.with_rate_limit(1024)".to_string(),
+                        "Store.subscribe() rate_limit=Some(1024.0)".to_string(),
+                    ],
+                    calls.borrow().clone()
+                );
+                calls.borrow_mut().clear();
+
+                let (read_tx, mut read_rx) = mpsc::channel(10);
+                tx.send(HouseholdOperation::Read {
+                    peers: vec![b],
+                    mode: ExecutionMode::Batch,
+                    arena,
+                    path: path.clone(),
+                    offset: 0,
+                    limit: None,
+                    tx: read_tx.clone(),
+                })
+                .await?;
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(3), read_rx.recv())
+                        .await?
+                        .is_some()
+                );
+                assert_eq!(
+                    vec!["Store.read() rate_limit=Some(1024.0)".to_string(),],
+                    calls.borrow().clone()
+                );
+                calls.borrow_mut().clear();
+
+                tx.send(HouseholdOperation::Read {
+                    peers: vec![b],
+                    mode: ExecutionMode::Interactive,
+                    arena,
+                    path: path.clone(),
+                    offset: 0,
+                    limit: None,
+                    tx: read_tx.clone(),
+                })
+                .await?;
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(3), read_rx.recv())
+                        .await?
+                        .is_some()
+                );
+                assert_eq!(
+                    vec!["Store.read() rate_limit=None".to_string(),],
+                    calls.borrow().clone()
+                );
+                calls.borrow_mut().clear();
+
+                let (rsync_tx, rsync_rx) = oneshot::channel();
+                tx.send(HouseholdOperation::Rsync {
+                    peers: vec![b],
+                    mode: ExecutionMode::Batch,
+                    tx: rsync_tx,
+                    arena,
+                    path: path.clone(),
+                    range: ByteRange::new(0, 100),
+                    sig: Signature(vec![]),
+                })
+                .await?;
+                rsync_rx.await??;
+                assert_eq!(
+                    vec!["Store.rsync() rate_limit=Some(1024.0)".to_string(),],
+                    calls.borrow().clone()
+                );
+                calls.borrow_mut().clear();
+
+                let (rsync_tx, rsync_rx) = oneshot::channel();
+                tx.send(HouseholdOperation::Rsync {
+                    peers: vec![b],
+                    mode: ExecutionMode::Interactive,
+                    tx: rsync_tx,
+                    arena,
+                    path: path.clone(),
+                    range: ByteRange::new(0, 100),
+                    sig: Signature(vec![]),
+                })
+                .await?;
+                rsync_rx.await??;
+                assert_eq!(
+                    vec!["Store.rsync() rate_limit=None".to_string(),],
+                    calls.borrow().clone()
+                );
+                calls.borrow_mut().clear();
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    struct FakeConnectedPeer(Rc<RefCell<Vec<String>>>);
+    impl connected_peer::Server for FakeConnectedPeer {
+        fn store(
+            &mut self,
+            _: connected_peer::StoreParams,
+            mut results: connected_peer::StoreResults,
+        ) -> Promise<(), capnp::Error> {
+            self.0
+                .borrow_mut()
+                .push("ConnectedPeer.store()".to_string());
+            results
+                .get()
+                .set_store(capnp_rpc::new_client(FakeStore(self.0.clone(), None)));
+
+            Promise::ok(())
+        }
+    }
+
+    struct FakeStore(Rc<RefCell<Vec<String>>>, Option<f64>);
+    impl store::Server for FakeStore {
+        fn with_rate_limit(
+            &mut self,
+            params: WithRateLimitParams,
+            mut results: WithRateLimitResults,
+        ) -> Promise<(), capnp::Error> {
+            let rate_limit = pry!(params.get()).get_rate_limit();
+            self.0
+                .borrow_mut()
+                .push(format!("Store.with_rate_limit({rate_limit})"));
+
+            results.get().set_store(capnp_rpc::new_client(FakeStore(
+                self.0.clone(),
+                Some(rate_limit),
+            )));
+
+            Promise::ok(())
+        }
+
+        fn arenas(
+            &mut self,
+            _: ArenasParams,
+            mut results: ArenasResults,
+        ) -> Promise<(), capnp::Error> {
+            let mut list = results.get().init_arenas(1);
+            list.set(0, HouseholdFixture::test_arena().as_str());
+
+            Promise::ok(())
+        }
+
+        fn subscribe(
+            &mut self,
+            _: SubscribeParams,
+            _: SubscribeResults,
+        ) -> Promise<(), capnp::Error> {
+            self.0
+                .borrow_mut()
+                .push(format!("Store.subscribe() rate_limit={:?}", self.1));
+
+            Promise::ok(())
+        }
+
+        fn read(&mut self, params: ReadParams, _: ReadResults) -> Promise<(), capnp::Error> {
+            self.0
+                .borrow_mut()
+                .push(format!("Store.read() rate_limit={:?}", self.1));
+
+            // send one chunk so the other side knows read has started.
+            let cb = pry!(pry!(params.get()).get_cb());
+            let request = cb.chunk_request();
+            tokio::task::spawn_local(request.send());
+
+            Promise::ok(())
+        }
+
+        fn rsync(&mut self, _: RsyncParams, _: RsyncResults) -> Promise<(), capnp::Error> {
+            self.0
+                .borrow_mut()
+                .push(format!("Store.rsync() rate_limit={:?}", self.1));
+
+            Promise::ok(())
+        }
     }
 }

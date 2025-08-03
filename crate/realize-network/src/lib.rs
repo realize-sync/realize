@@ -10,4 +10,4 @@ pub mod security;
 pub mod testing;
 pub mod unixsocket;
 
-pub use network::{Networking, Server};
+pub use network::{Networking, PeerSetup, Server};

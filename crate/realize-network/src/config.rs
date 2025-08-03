@@ -23,7 +23,7 @@ impl NetworkConfig {
 /// Define a peer.
 ///
 /// A peer is identified by [realize_types::Peer].
-#[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
+#[derive(Clone, serde::Deserialize, serde::Serialize, Debug, Default)]
 pub struct PeerConfig {
     /// Address of the peer, if available.
     ///
@@ -36,4 +36,10 @@ pub struct PeerConfig {
     ///
     /// Must be a PEM-encoded ED25519 public key.
     pub pubkey: String,
+
+    /// Rate limit that applies to batch operations.
+    ///
+    /// Interactive operations are not limited.
+    #[serde(with = "byte_unit_serde")]
+    pub batch_rate_limit: Option<u64>,
 }

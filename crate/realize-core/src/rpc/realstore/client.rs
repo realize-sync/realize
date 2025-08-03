@@ -163,7 +163,7 @@ mod tests {
     use assert_fs::TempDir;
     use realize_network::hostport::HostPort;
     use realize_network::security::{PeerVerifier, RawPublicKeyResolver};
-    use realize_network::{Server, testing};
+    use realize_network::{PeerSetup, Server, testing};
     use realize_storage::{RealStore, RealStoreOptions};
     use realize_types::{Arena, Peer};
     use std::net::SocketAddr;
@@ -218,9 +218,14 @@ mod tests {
         }
 
         fn client_networking(&self, peer: Peer, addr: SocketAddr) -> anyhow::Result<Networking> {
-            let addr_str = addr.to_string();
             Ok(Networking::new(
-                vec![(peer, addr_str.leak() as &'static str)],
+                [(
+                    peer,
+                    PeerSetup {
+                        address: Some(addr.to_string()),
+                        ..Default::default()
+                    },
+                )],
                 RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
                 Arc::clone(&self.verifier),
             ))

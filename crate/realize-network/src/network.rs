@@ -21,10 +21,25 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 #[derive(Clone)]
 pub struct Networking {
-    addresses: Arc<HashMap<Peer, String>>,
+    peer_setup: Arc<HashMap<Peer, PeerSetup>>,
     verifier: Arc<PeerVerifier>,
     acceptor: Arc<TlsAcceptor>,
     connector: Arc<TlsConnector>,
+}
+
+/// Information about peers
+#[derive(Default, Debug, PartialEq, Eq, Clone)]
+pub struct PeerSetup {
+    pub address: Option<String>,
+    pub batch_rate_limit: Option<u64>,
+}
+impl PeerSetup {
+    fn from_config(config: &PeerConfig) -> Self {
+        Self {
+            address: config.address.clone(),
+            batch_rate_limit: config.batch_rate_limit.clone(),
+        }
+    }
 }
 
 impl Networking {
@@ -35,32 +50,22 @@ impl Networking {
         let verifier = PeerVerifier::from_config(peers)?;
         let resolver = RawPublicKeyResolver::from_private_key_file(privkey)?;
         Ok(Self::new(
-            peers.iter().flat_map(|(p, c)| {
-                c.address.as_ref().map(|addr| {
-                    let leaked: &'static str = addr.to_string().leak() as &'static str;
-                    (p.clone(), leaked)
-                })
-            }),
+            peers.iter().map(|(p, c)| (*p, PeerSetup::from_config(c))),
             resolver,
             verifier,
         ))
     }
 
     pub fn new<'a, T>(
-        addresses: T,
+        peer_setup: T,
         resolver: Arc<RawPublicKeyResolver>,
         verifier: Arc<PeerVerifier>,
     ) -> Self
     where
-        T: IntoIterator<Item = (Peer, &'a str)>,
+        T: IntoIterator<Item = (Peer, PeerSetup)>,
     {
         Self {
-            addresses: Arc::new(
-                addresses
-                    .into_iter()
-                    .map(|(p, addr)| (p, addr.to_string()))
-                    .collect(),
-            ),
+            peer_setup: Arc::new(peer_setup.into_iter().collect()),
             verifier: Arc::clone(&verifier),
             acceptor: Arc::new(crate::security::make_tls_acceptor(
                 Arc::clone(&verifier),
@@ -70,14 +75,32 @@ impl Networking {
         }
     }
 
+    /// [PeerSetup] of all configured peers.
+    pub fn peer_setup(&self) -> impl Iterator<Item = (Peer, &PeerSetup)> {
+        self.peer_setup.iter().map(|(p, s)| (*p, s))
+    }
+
     /// Set of peers that have a known address.
     pub fn connectable_peers(&self) -> impl Iterator<Item = Peer> {
-        self.addresses.keys().cloned()
+        self.peer_setup
+            .iter()
+            .flat_map(|(p, s)| s.address.as_ref().map(|_| *p))
     }
 
     /// Check whether the peer is connectable.
     pub fn is_connectable(&self, peer: Peer) -> bool {
-        self.addresses.contains_key(&peer)
+        self.peer_setup
+            .get(&peer)
+            .map(|s| s.address.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Return the batch rate limit configured for the peer, if any.
+    pub fn batch_rate_limit(&self, peer: Peer) -> Option<u64> {
+        self.peer_setup
+            .get(&peer)
+            .map(|s| s.batch_rate_limit)
+            .flatten()
     }
 
     pub async fn connect<Req, Resp>(
@@ -115,8 +138,10 @@ impl Networking {
         limiter: Option<Limiter>,
     ) -> anyhow::Result<tokio_rustls::client::TlsStream<RateLimitedStream<TcpStream>>> {
         let addr = self
-            .addresses
+            .peer_setup
             .get(&peer)
+            .map(|s| s.address.as_ref())
+            .flatten()
             .ok_or(anyhow::anyhow!("no address known for {peer}"))?;
         let addr = HostPort::parse(addr)
             .await
@@ -401,9 +426,14 @@ mod tests {
             addr: SocketAddr,
             verifier: Arc<PeerVerifier>,
         ) -> anyhow::Result<Networking> {
-            let addr_str = addr.to_string();
             Ok(Networking::new(
-                vec![(peer, addr_str.leak() as &'static str)],
+                [(
+                    peer,
+                    PeerSetup {
+                        address: Some(addr.to_string()),
+                        ..Default::default()
+                    },
+                )],
                 RawPublicKeyResolver::from_private_key(testing::client_private_key())?,
                 verifier,
             ))

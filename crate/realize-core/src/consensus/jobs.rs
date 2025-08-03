@@ -1,5 +1,5 @@
 use super::{progress::ByteCountProgress, types::JobAction};
-use crate::rpc::Household;
+use crate::rpc::{ExecutionMode, Household};
 use futures::StreamExt;
 use realize_storage::{Inode, JobStatus, LocalAvailability, Storage, StorageError};
 use realize_types::{Arena, ByteRanges, Hash, Path, Peer, Signature};
@@ -106,6 +106,7 @@ async fn write_to_blob(
     for range in missing {
         let mut stream = household.read(
             peers.clone(),
+            ExecutionMode::Batch,
             arena,
             path.clone(),
             range.start,
@@ -190,7 +191,7 @@ pub(crate) async fn verify(
 
         let sig = Signature(fast_rsync::Signature::calculate(limited_buf, opts).into_serialized());
         let delta = tokio::select!(
-            res = household.rsync(peers.clone(), arena, path, &range, sig) => {res?},
+            res = household.rsync(peers.clone(), ExecutionMode::Batch, arena, path, &range, sig) => {res?},
             _ = shutdown.cancelled() => {
                 anyhow::bail!("cancelled")
             }

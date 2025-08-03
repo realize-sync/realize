@@ -1,3 +1,5 @@
+use crate::network::PeerSetup;
+
 use super::config::PeerConfig;
 use super::hostport::HostPort;
 use super::security::{PeerVerifier, RawPublicKeyResolver};
@@ -99,7 +101,7 @@ pub fn io_error_kind(err: Option<anyhow::Error>) -> Option<std::io::ErrorKind> {
 /// Helper for building [Networking] for multiple peers that can
 /// communicate with each other.
 pub struct TestingPeers {
-    addresses: HashMap<Peer, HostPort>,
+    peer_setup: HashMap<Peer, PeerSetup>,
     peers: HashMap<Peer, PeerConfig>,
     private_keys: HashMap<Peer, PrivateKeyDer<'static>>,
 }
@@ -119,7 +121,7 @@ impl TestingPeers {
     /// Build an empty instance.
     pub fn empty() -> Self {
         Self {
-            addresses: HashMap::new(),
+            peer_setup: HashMap::new(),
             peers: HashMap::new(),
             private_keys: HashMap::new(),
         }
@@ -156,6 +158,7 @@ impl TestingPeers {
             PeerConfig {
                 pubkey: String::from_utf8(pubkey.to_vec())?,
                 address: None,
+                ..Default::default()
             },
         );
         self.private_keys.insert(peer, private_key);
@@ -177,12 +180,25 @@ impl TestingPeers {
     }
 
     pub fn set_hostport(&mut self, peer: Peer, hostport: HostPort) {
-        self.addresses.insert(peer, hostport);
+        self.peer_setup.entry(peer).or_default().address = Some(hostport.to_string());
+    }
+
+    pub fn set_batch_rate_limit(&mut self, peer: Peer, bytes_per_second: u64) {
+        self.peer_setup.entry(peer).or_default().batch_rate_limit = Some(bytes_per_second);
     }
 
     /// Get the address configured for peer.
-    pub async fn hostport(&self, peer: Peer) -> Option<&HostPort> {
-        self.addresses.get(&peer)
+    pub async fn hostport(&self, peer: Peer) -> Option<HostPort> {
+        if let Some(address) = self
+            .peer_setup
+            .get(&peer)
+            .map(|s| s.address.as_deref())
+            .flatten()
+        {
+            return HostPort::parse(address).await.ok();
+        }
+
+        None
     }
 
     /// Build a [Networking] instance for the given peer.
@@ -200,21 +216,11 @@ impl TestingPeers {
                 .clone_key(),
         )?;
 
-        let addresses = self
-            .addresses
-            .iter()
-            .filter(|(p, _)| **p != peer)
-            .map(|(p, hostport)| (p.clone(), hostport.to_string()))
-            .collect::<Vec<_>>();
-        let address_vec: Vec<(Peer, String)> = addresses
-            .iter()
-            .map(|(p, addr)| (*p, addr.clone()))
-            .collect();
-        let leaked_vec: Vec<(Peer, &'static str)> = address_vec
-            .iter()
-            .map(|(p, s)| (*p, s.clone().leak() as &'static str))
-            .collect();
-        Ok(crate::Networking::new(leaked_vec, resolver, verifier))
+        Ok(crate::Networking::new(
+            self.peer_setup.clone(),
+            resolver,
+            verifier,
+        ))
     }
 }
 
