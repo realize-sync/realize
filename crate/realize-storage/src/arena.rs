@@ -22,7 +22,6 @@ pub mod index;
 pub mod indexed_store;
 pub mod mark;
 pub mod notifier;
-pub mod store;
 pub mod types;
 pub mod watcher;
 

@@ -26,7 +26,6 @@ pub use arena::engine::{Job, JobStatus};
 pub use arena::indexed_store::Reader;
 pub use arena::notifier::Notification;
 pub use arena::notifier::Progress;
-pub use arena::store::{Options as RealStoreOptions, RealStore, RealStoreError, SyncedFile};
 pub use arena::types::{LocalAvailability, Mark};
 pub use error::StorageError;
 pub use global::cache::UnrealCacheAsync;
@@ -37,13 +36,11 @@ pub use types::{Inode, JobId};
 pub struct Storage {
     cache: UnrealCacheAsync,
     arena_storage: HashMap<Arena, ArenaStorage>,
-    store: RealStore,
 }
 
 impl Storage {
     /// Create and initialize storage from its configuration.
     pub async fn from_config(config: &StorageConfig) -> anyhow::Result<Arc<Self>> {
-        let store = RealStore::from_config(&config.arenas);
         let mut arena_storage = HashMap::new();
         let exclude = build_exclude(&config);
 
@@ -72,18 +69,12 @@ impl Storage {
         Ok(Arc::new(Self {
             cache,
             arena_storage,
-            store,
         }))
     }
 
     /// Return a handle on the unreal cache.
     pub fn cache(&self) -> &UnrealCacheAsync {
         &self.cache
-    }
-
-    /// Return a handle on the legacy store.
-    pub fn store(&self) -> RealStore {
-        self.store.clone()
     }
 
     /// Return an iterator over arenas that have an index, and so can
