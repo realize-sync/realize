@@ -9,14 +9,16 @@ use super::store_capnp::subscriber::{self, NotifyParams, NotifyResults};
 use super::store_capnp::{io_error, notification, read_callback};
 use capnp::capability::Promise;
 use capnp_rpc::pry;
-use realize_network::capnp::{ConnectionHandler, ConnectionManager, PeerStatus};
+use realize_network::capnp::{ConnectionHandler, ConnectionManager, ConnectionTracker, PeerStatus};
 use realize_network::{Networking, Server};
 use realize_storage::utils::holder::ByteConversionError;
 use realize_storage::{Notification, Progress, Storage, StorageError};
 use realize_types::{self, Arena, ByteRange, Delta, Hash, Path, Peer, Signature, UnixTime};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, SeekFrom};
 use std::pin;
+use std::rc::Rc;
 use std::sync::Arc;
 use tokio::io::AsyncSeekExt;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -37,7 +39,8 @@ const TAG: &[u8; 4] = b"PEER";
 /// To listen to incoming connections, call [Household::register].
 #[derive(Clone)]
 pub struct Household {
-    manager: Arc<ConnectionManager<HouseholdOperation>>,
+    manager: Arc<ConnectionManager>,
+    operation_tx: mpsc::Sender<HouseholdOperation>,
 }
 
 impl Household {
@@ -52,11 +55,13 @@ impl Household {
         networking: Networking,
         storage: Arc<Storage>,
     ) -> anyhow::Result<Self> {
+        let (tx, rx) = mpsc::channel(128);
         let manager =
-            ConnectionManager::spawn(local, networking, PeerConnectionHandler::new(storage))?;
+            ConnectionManager::spawn(local, networking, PeerConnectionHandler { storage, rx })?;
 
         Ok(Self {
             manager: Arc::new(manager),
+            operation_tx: tx,
         })
     }
 
@@ -108,18 +113,24 @@ impl Household {
         T: IntoIterator<Item = Peer>,
     {
         let (tx, rx) = mpsc::channel(10);
-        self.manager
-            .with_any_peer_client(
-                peers,
-                HouseholdOperation::Read {
-                    arena,
-                    path,
-                    offset,
-                    limit,
-                    tx,
-                },
-            )
-            .map_err(|err| io::Error::other(err))?;
+        let op = HouseholdOperation::Read {
+            peers: peers.into_iter().collect(),
+            arena,
+            path,
+            offset,
+            limit,
+            tx,
+        };
+
+        // spawn to keep read non-async and report all errors in the stream.
+        let operation_tx = self.operation_tx.clone();
+        tokio::spawn(async move {
+            if let Err(err) = operation_tx.send(op).await {
+                if let HouseholdOperation::Read { tx, .. } = err.0 {
+                    let _ = tx.send(Err(io::Error::other("channel closed"))).await;
+                }
+            }
+        });
 
         Ok(ReceiverStream::new(rx))
     }
@@ -137,16 +148,16 @@ impl Household {
         T: IntoIterator<Item = Peer>,
     {
         let (tx, rx) = oneshot::channel();
-        self.manager.with_any_peer_client(
-            peers,
-            HouseholdOperation::Rsync {
+        self.operation_tx
+            .send(HouseholdOperation::Rsync {
+                peers: peers.into_iter().collect(),
                 tx,
                 arena,
                 path: path.clone(),
                 range: range.clone(),
                 sig,
-            },
-        )?;
+            })
+            .await?;
 
         rx.await?
     }
@@ -154,6 +165,7 @@ impl Household {
 
 enum HouseholdOperation {
     Read {
+        peers: Vec<Peer>,
         tx: mpsc::Sender<Result<(u64, Vec<u8>), io::Error>>,
         arena: Arena,
         path: realize_types::Path,
@@ -161,6 +173,7 @@ enum HouseholdOperation {
         limit: Option<u64>,
     },
     Rsync {
+        peers: Vec<Peer>,
         tx: oneshot::Sender<anyhow::Result<Delta>>,
         arena: Arena,
         path: realize_types::Path,
@@ -170,48 +183,49 @@ enum HouseholdOperation {
 }
 struct PeerConnectionHandler {
     storage: Arc<Storage>,
+    rx: mpsc::Receiver<HouseholdOperation>,
 }
 
-impl PeerConnectionHandler {
-    fn new(storage: Arc<Storage>) -> Self {
-        Self { storage }
-    }
-}
-
-impl ConnectionHandler<connected_peer::Client, HouseholdOperation> for PeerConnectionHandler {
+impl ConnectionHandler<PeerConnectionTracker, connected_peer::Client> for PeerConnectionHandler {
     fn tag(&self) -> &'static [u8; 4] {
         TAG
     }
 
-    fn server(&self, peer: Peer) -> capnp::capability::Client {
-        ConnectedPeerServer::new(peer, self.storage.clone())
-            .into_connected_peer()
-            .client
+    async fn create_tracker(self) -> Rc<PeerConnectionTracker> {
+        let PeerConnectionHandler { storage, mut rx } = self;
+        let tracker = PeerConnectionTracker::new(storage);
+
+        tokio::task::spawn_local({
+            let tracker = Rc::clone(&tracker);
+
+            async move {
+                while let Some(op) = rx.recv().await {
+                    tracker.execute(op).await;
+                }
+            }
+        });
+
+        tracker
+    }
+}
+
+struct PeerConnectionTracker {
+    storage: Arc<Storage>,
+    stores: RefCell<HashMap<Peer, store::Client>>,
+}
+
+impl PeerConnectionTracker {
+    fn new(storage: Arc<Storage>) -> Rc<Self> {
+        Rc::new(Self {
+            storage,
+            stores: RefCell::new(HashMap::new()),
+        })
     }
 
-    async fn check_connection(
-        &self,
-        _peer: Peer,
-        client: &mut connected_peer::Client,
-    ) -> anyhow::Result<()> {
-        get_connected_peer_store(client).await?;
-
-        Ok(())
-    }
-
-    async fn register(&self, peer: Peer, client: connected_peer::Client) -> anyhow::Result<()> {
-        subscribe_self(&self.storage, peer, client).await?;
-
-        Ok(())
-    }
-
-    async fn execute(
-        &self,
-        client: Option<(Peer, connected_peer::Client)>,
-        operation: HouseholdOperation,
-    ) {
+    async fn execute(&self, operation: HouseholdOperation) {
         match operation {
             HouseholdOperation::Read {
+                peers,
                 tx,
                 arena,
                 path,
@@ -219,33 +233,69 @@ impl ConnectionHandler<connected_peer::Client, HouseholdOperation> for PeerConne
                 limit,
             } => {
                 let tx_clone = tx.clone();
-                if let Err(err) = execute_read(client, arena, path, offset, limit, tx).await {
+                if let Err(err) =
+                    execute_read(self.find_store(&peers), arena, path, offset, limit, tx).await
+                {
                     let _ = tx_clone.send(Err(err)).await;
                 }
             }
             HouseholdOperation::Rsync {
+                peers,
                 tx,
                 arena,
                 path,
                 range,
                 sig,
             } => {
-                let res = execute_rsync(client, arena, &path, &range, sig).await;
+                let res = execute_rsync(self.find_store(&peers), arena, &path, &range, sig).await;
                 let _ = tx.send(res);
             }
         }
     }
+
+    fn find_store(&self, peers: &Vec<Peer>) -> Option<(Peer, store::Client)> {
+        let stores = self.stores.borrow();
+        for peer in peers {
+            let found = stores.get(&peer).map(|c| (*peer, c.clone()));
+            if found.is_some() {
+                return found;
+            }
+        }
+
+        None
+    }
+}
+
+impl ConnectionTracker<connected_peer::Client> for PeerConnectionTracker {
+    fn server(&self, peer: Peer) -> capnp::capability::Client {
+        ConnectedPeerServer::new(peer, self.storage.clone())
+            .into_connected_peer()
+            .client
+    }
+
+    async fn register(&self, peer: Peer, mut client: connected_peer::Client) -> anyhow::Result<()> {
+        let store = get_connected_peer_store(&mut client).await?;
+        self.stores.borrow_mut().insert(peer, store);
+
+        subscribe_self(&self.storage, peer, client).await?;
+
+        Ok(())
+    }
+
+    fn unregister(&self, peer: Peer) {
+        self.stores.borrow_mut().remove(&peer);
+    }
 }
 
 async fn execute_read(
-    client: Option<(Peer, connected_peer::Client)>,
+    client: Option<(Peer, store::Client)>,
     arena: Arena,
     path: realize_types::Path,
     offset: u64,
     limit: Option<u64>,
     tx: mpsc::Sender<io::Result<(u64, Vec<u8>)>>,
 ) -> io::Result<()> {
-    let (peer, client) = match client {
+    let (peer, store) = match client {
         Some(c) => c,
         None => {
             return Err(io::Error::new(io::ErrorKind::NotFound, "No available peer"));
@@ -253,7 +303,6 @@ async fn execute_read(
     };
     log::debug!("Reading [{arena}]/{path} from {peer}");
 
-    let store = client.store_request().send().pipeline.get_store();
     let mut request = store.read_request();
     let mut builder = request.get();
     builder.set_cb(capnp_rpc::new_client(ReadCallbackServer { tx: Some(tx) }));
@@ -275,13 +324,13 @@ async fn execute_read(
 }
 
 async fn execute_rsync(
-    client: Option<(Peer, connected_peer::Client)>,
+    client: Option<(Peer, store::Client)>,
     arena: Arena,
     path: &realize_types::Path,
     range: &ByteRange,
     sig: Signature,
 ) -> anyhow::Result<Delta> {
-    let (peer, client) = match client {
+    let (peer, store) = match client {
         Some(c) => c,
         None => {
             anyhow::bail!("No available peer");
@@ -292,7 +341,6 @@ async fn execute_rsync(
         sig.0.len()
     );
 
-    let store = client.store_request().send().pipeline.get_store();
     let mut request = store.rsync_request();
     let mut req = request.get().init_req();
     req.set_arena(arena.as_str());

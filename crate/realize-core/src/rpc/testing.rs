@@ -235,12 +235,6 @@ pub async fn connect(household: &Household, peer: Peer) -> anyhow::Result<()> {
             .await
             .map_err(|_| anyhow::anyhow!("timed out waiting to connect to {peer}"))??
     );
-    assert_eq!(
-        PeerStatus::Registered(peer),
-        timeout(delay, status.recv())
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out waiting to register on {peer}"))??
-    );
 
     Ok(())
 }
