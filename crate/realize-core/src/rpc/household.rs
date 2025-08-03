@@ -3,10 +3,11 @@ use super::result_capnp;
 use super::store_capnp::read_callback::{ChunkParams, FinishParams, FinishResults};
 use super::store_capnp::store::{
     self, ArenasParams, ArenasResults, ReadParams, ReadResults, RsyncParams, RsyncResults,
-    SubscribeParams, SubscribeResults,
+    SubscribeParams, SubscribeResults, WithRateLimitParams, WithRateLimitResults,
 };
 use super::store_capnp::subscriber::{self, NotifyParams, NotifyResults};
 use super::store_capnp::{io_error, notification, read_callback};
+use async_speed_limit::Limiter;
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 use realize_network::capnp::{ConnectionHandler, ConnectionManager, ConnectionTracker, PeerStatus};
@@ -515,11 +516,39 @@ impl ConnectedPeerServer {
         capnp_rpc::new_client(self)
     }
 
-    fn into_store(self) -> store::Client {
+    fn into_subscriber(self) -> subscriber::Client {
         capnp_rpc::new_client(self)
     }
+}
 
-    fn into_subscriber(self) -> subscriber::Client {
+impl connected_peer::Server for ConnectedPeerServer {
+    fn store(
+        &mut self,
+        _: connected_peer::StoreParams,
+        mut results: connected_peer::StoreResults,
+    ) -> Promise<(), capnp::Error> {
+        results.get().set_store(
+            StoreServer {
+                peer: self.peer,
+                storage: self.storage.clone(),
+                limiter: None,
+            }
+            .into_client(),
+        );
+
+        Promise::ok(())
+    }
+}
+
+#[derive(Clone)]
+struct StoreServer {
+    peer: Peer,
+    storage: Arc<Storage>,
+    limiter: Option<Limiter>,
+}
+
+impl StoreServer {
+    fn into_client(self) -> store::Client {
         capnp_rpc::new_client(self)
     }
 
@@ -561,6 +590,7 @@ impl ConnectedPeerServer {
         }
 
         let peer = self.peer;
+        let limiter = self.limiter.clone();
         log::debug!("{peer} subscribed to notifications from {arena}");
         tokio::task::spawn_local(async move {
             let mut notifications = Vec::new();
@@ -571,12 +601,19 @@ impl ConnectedPeerServer {
                     return;
                 }
                 log::debug!("notify {peer}: {notifications:?}");
-                if let Err(err) = send_notifications(notifications.as_slice(), &subscriber).await {
-                    if err.kind == capnp::ErrorKind::Disconnected {
-                        return;
-                    }
+
+                let mut request = subscriber.notify_request();
+                let mut builder = request.get().init_notifications(notifications.len() as u32);
+                for (i, n) in std::mem::take(&mut notifications).into_iter().enumerate() {
+                    fill_notification(&n, builder.reborrow().get(i as u32));
                 }
-                notifications.clear();
+
+                apply_rate_limit(&limiter, request.get().total_size()).await;
+                if let Err(err) = request.send().promise.await
+                    && err.kind == capnp::ErrorKind::Disconnected
+                {
+                    return;
+                }
             }
         });
 
@@ -610,6 +647,7 @@ impl ConnectedPeerServer {
                 }
             }
         }
+        apply_rate_limit(&self.limiter, req.total_size()).await;
         request.send().promise.await?;
 
         Ok(())
@@ -634,9 +672,9 @@ impl ConnectedPeerServer {
             reader.seek(SeekFrom::Start(offset)).await?;
         }
         if limit > 0 {
-            send_chunks(reader.take(limit), offset, cb).await
+            self.send_chunks(reader.take(limit), offset, cb).await
         } else {
-            send_chunks(reader, offset, cb).await
+            self.send_chunks(reader, offset, cb).await
         }
     }
 
@@ -663,29 +701,32 @@ impl ConnectedPeerServer {
 
         results.get().init_res().set_delta(&delta.0);
 
+        apply_rate_limit(&self.limiter, results.get().total_size()).await;
         Ok(())
     }
-}
+    async fn send_chunks(
+        &self,
+        reader: impl AsyncRead,
+        mut offset: u64,
+        cb: &read_callback::Client,
+    ) -> Result<bool, StorageError> {
+        let mut reader = pin::pin!(reader);
+        let mut buf = vec![0; 8 * 1024];
+        loop {
+            let n = reader.read(&mut buf).await?;
+            if n == 0 {
+                return Ok(true);
+            }
+            let mut request = cb.chunk_request();
+            let mut req = request.get();
+            req.set_data(&buf.as_slice()[0..n]);
+            req.set_offset(offset);
+            offset += n as u64;
 
-async fn send_chunks(
-    reader: impl AsyncRead,
-    mut offset: u64,
-    cb: &read_callback::Client,
-) -> Result<bool, StorageError> {
-    let mut reader = pin::pin!(reader);
-    let mut buf = vec![0; 8 * 1024];
-    loop {
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
-            return Ok(true);
-        }
-        let mut request = cb.chunk_request();
-        let mut req = request.get();
-        req.set_data(&buf.as_slice()[0..n]);
-        req.set_offset(offset);
-        offset += n as u64;
-        if request.send().await.is_err() {
-            return Ok(false);
+            apply_rate_limit(&self.limiter, req.total_size()).await;
+            if request.send().await.is_err() {
+                return Ok(false);
+            }
         }
     }
 }
@@ -717,19 +758,29 @@ fn read_errno(err: StorageError) -> io_error::Errno {
     }
 }
 
-impl connected_peer::Server for ConnectedPeerServer {
-    fn store(
+impl store::Server for StoreServer {
+    fn with_rate_limit(
         &mut self,
-        _params: connected_peer::StoreParams,
-        mut results: connected_peer::StoreResults,
+        params: WithRateLimitParams,
+        mut results: WithRateLimitResults,
     ) -> Promise<(), capnp::Error> {
-        results.get().set_store(self.clone().into_store());
+        let rate_limit = pry!(params.get()).get_rate_limit();
+        if rate_limit <= 0.0 {
+            return Promise::err(capnp::Error::failed("invalid rate limit".to_string()));
+        }
+
+        results.get().set_store(
+            StoreServer {
+                peer: self.peer,
+                storage: self.storage.clone(),
+                limiter: Some(<Limiter>::new(rate_limit)),
+            }
+            .into_client(),
+        );
 
         Promise::ok(())
     }
-}
 
-impl store::Server for ConnectedPeerServer {
     fn arenas(&mut self, _: ArenasParams, mut results: ArenasResults) -> Promise<(), capnp::Error> {
         let arenas = self
             .storage
@@ -874,102 +925,6 @@ async fn do_notify(
     Ok(())
 }
 
-async fn send_notifications(
-    notifications: &[Notification],
-    client: &subscriber::Client,
-) -> Result<(), capnp::Error> {
-    let mut request = client.notify_request();
-    let mut builder = request.get().init_notifications(notifications.len() as u32);
-    for (i, notif) in notifications.iter().enumerate() {
-        let notif_builder = builder.reborrow().get(i as u32);
-        match notif {
-            Notification::Add {
-                arena,
-                index,
-                path,
-                size,
-                mtime,
-                hash,
-            } => fill_add(
-                notif_builder.init_add(),
-                *arena,
-                *index,
-                path,
-                *size,
-                mtime,
-                hash,
-            ),
-
-            Notification::Replace {
-                arena,
-                index,
-                path,
-                size,
-                mtime,
-                hash,
-                old_hash,
-            } => fill_replace(
-                notif_builder.init_replace(),
-                *arena,
-                *index,
-                path,
-                *size,
-                mtime,
-                hash,
-                old_hash,
-            ),
-
-            Notification::Remove {
-                arena,
-                index,
-                path,
-                old_hash,
-            } => fill_remove(notif_builder.init_remove(), *arena, *index, path, old_hash),
-
-            Notification::Drop {
-                arena,
-                index,
-                path,
-                old_hash,
-            } => fill_drop(notif_builder.init_drop(), *arena, *index, path, old_hash),
-
-            Notification::Catchup {
-                arena,
-                path,
-                size,
-                mtime,
-                hash,
-            } => fill_catchup(
-                notif_builder.init_catchup(),
-                *arena,
-                path,
-                *size,
-                mtime,
-                hash,
-            ),
-
-            Notification::CatchupStart(arena) => {
-                notif_builder.init_catchup_start().set_arena(arena.as_str())
-            }
-
-            Notification::CatchupComplete { arena, index } => {
-                let mut builder = notif_builder.init_catchup_complete();
-                builder.set_arena(arena.as_str());
-                builder.set_index(*index);
-            }
-
-            Notification::Connected { arena, uuid } => {
-                let mut builder = notif_builder.init_connected();
-                builder.set_arena(arena.as_str());
-                fill_uuid(builder.init_uuid(), &uuid);
-            }
-        }
-    }
-    let _ = request.send().promise.await?;
-
-    Ok(())
-}
-
 fn fill_uuid(mut builder: super::store_capnp::uuid::Builder<'_>, uuid: &Uuid) {
     let (hi, lo) = uuid.as_u64_pair();
     builder.set_hi(hi);
@@ -1066,6 +1021,91 @@ fn fill_time(
     mtime_builder.set_nsecs(mtime.subsec_nanos());
 }
 
+fn fill_notification(notif: &Notification, notif_builder: notification::Builder<'_>) {
+    match notif {
+        Notification::Add {
+            arena,
+            index,
+            path,
+            size,
+            mtime,
+            hash,
+        } => fill_add(
+            notif_builder.init_add(),
+            *arena,
+            *index,
+            path,
+            *size,
+            mtime,
+            hash,
+        ),
+
+        Notification::Replace {
+            arena,
+            index,
+            path,
+            size,
+            mtime,
+            hash,
+            old_hash,
+        } => fill_replace(
+            notif_builder.init_replace(),
+            *arena,
+            *index,
+            path,
+            *size,
+            mtime,
+            hash,
+            old_hash,
+        ),
+
+        Notification::Remove {
+            arena,
+            index,
+            path,
+            old_hash,
+        } => fill_remove(notif_builder.init_remove(), *arena, *index, path, old_hash),
+
+        Notification::Drop {
+            arena,
+            index,
+            path,
+            old_hash,
+        } => fill_drop(notif_builder.init_drop(), *arena, *index, path, old_hash),
+
+        Notification::Catchup {
+            arena,
+            path,
+            size,
+            mtime,
+            hash,
+        } => fill_catchup(
+            notif_builder.init_catchup(),
+            *arena,
+            path,
+            *size,
+            mtime,
+            hash,
+        ),
+
+        Notification::CatchupStart(arena) => {
+            notif_builder.init_catchup_start().set_arena(arena.as_str())
+        }
+
+        Notification::CatchupComplete { arena, index } => {
+            let mut builder = notif_builder.init_catchup_complete();
+            builder.set_arena(arena.as_str());
+            builder.set_index(*index);
+        }
+
+        Notification::Connected { arena, uuid } => {
+            let mut builder = notif_builder.init_connected();
+            builder.set_arena(arena.as_str());
+            fill_uuid(builder.init_uuid(), &uuid);
+        }
+    }
+}
+
 async fn get_connected_peer_store(
     client: &mut connected_peer::Client,
 ) -> anyhow::Result<store::Client> {
@@ -1114,6 +1154,19 @@ fn parse_hash(hash: &[u8]) -> Result<Hash, capnp::Error> {
 
 fn storage_to_capnp_err(err: StorageError) -> capnp::Error {
     capnp::Error::failed(err.to_string())
+}
+
+/// Wait as long as needed until the rate limit allows sending a
+/// message of the given size.
+async fn apply_rate_limit(limiter: &Option<Limiter>, size: capnp::Result<::capnp::MessageSize>) {
+    if let (Ok(size), Some(limiter)) = (size, limiter) {
+        limiter.consume(size_to_bytes(size)).await;
+    }
+}
+
+/// Convert a [MessageSize] to a byte count
+fn size_to_bytes(size: capnp::MessageSize) -> usize {
+    (size.word_count as usize + size.cap_count as usize) * 8
 }
 
 #[cfg(test)]

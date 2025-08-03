@@ -28,6 +28,14 @@ interface Store {
   # Send a rsync signature for a range of a file and
   # get back a delta.
   rsync @3 (req: RsyncRequest) -> (res: RsyncResponse);
+
+  # Return a copy of the store that apply the
+  # given rate limit to all data that is sent.
+  #
+  # Note that if the current store already has a rate limit,
+  # this overwrites it and the two rate limits are counted
+  # separately.
+  withRateLimit @4 (rateLimit: Float64) -> (store: Store);
 }
 
 struct RsyncRequest {
