@@ -308,49 +308,6 @@ async fn daemon_starts_and_lists_files() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn metrics_endpoint_works() -> anyhow::Result<()> {
-    let fixture = Fixture::setup().await?;
-
-    let metrics_port = portpicker::pick_unused_port().expect("No ports free");
-    let metrics_addr = format!("127.0.0.1:{metrics_port}");
-
-    // Run process in the background and in a way that allows reading
-    // its output, so we know what port to connect to.
-    let daemon = fixture
-        .command()?
-        .arg("--metrics-addr")
-        .arg(&metrics_addr)
-        .spawn()?;
-    let pid = daemon.id();
-    scopeguard::defer! { let _ = kill(pid); }
-
-    fixture.assert_listening().await;
-    assert_listening_to(&metrics_addr).await;
-
-    // Now test the endpoint
-    let client = Client::new();
-    let metrics_url = format!("http://{metrics_addr}/metrics");
-    let resp = client.get(&metrics_url).send().await?;
-    assert_eq!(resp.status(), 200);
-    assert_eq!(resp.headers()["Content-Type"], "text/plain; version=0.0.4");
-    let body = resp.text().await?;
-    assert!(
-        body.contains("realize_daemon_up 1"),
-        "metrics output missing expected Prometheus format: {body}"
-    );
-
-    // Random paths should not return anything
-    // TODO: move to a unit test in src/metrics.rs
-    let notfound = client
-        .get(format!("http://{metrics_addr}/notfound"))
-        .send()
-        .await?;
-    assert_eq!(notfound.status(), 404);
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn daemon_fails_on_missing_directory() -> anyhow::Result<()> {
     let fixture = Fixture::setup().await?;
     fs::remove_dir_all(&fixture.testdir)?;

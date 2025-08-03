@@ -8,7 +8,7 @@ use realize_storage::{Inode, JobStatus, LocalAvailability, Storage, StorageError
 use realize_types::{Arena, ByteRanges, Hash, Path, Peer, Signature};
 use std::io::SeekFrom;
 use std::sync::Arc;
-use tarpc::tokio_util::sync::CancellationToken;
+use tokio_util::sync::CancellationToken;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 /// Maximum byterange to sync with rsync. This is also the worst-case

@@ -27,10 +27,8 @@ moka = { version = "0.12.10", features = ["future"] }
 nfsserve = "0.10.2"
 nix = { version = "0.30.1", features = ["user"] }
 pathdiff = "0.2"
-prometheus = { version = "0.14", features = [] }
 rustls = "0.23"
 serde = {version = "1.0", features = ["derive"] }
-tarpc = { version = "0.36", features = ["serde1", "tokio1", "serde-transport", "serde-transport-bincode", "tcp"] }
 thiserror = "2.0"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "fs", "io-util"] }
 tokio-retry = "0.3.0"
@@ -39,6 +37,7 @@ tokio-stream = "0.1.17"
 uuid = { version = "1.17.0", features = ["std", "v7"] }
 walkdir = "2.5"
 fast_rsync = "0.2.0"
+tokio-util = "0.7.16"
 
 [dev-dependencies]
 realize-network = { path = "../realize-network", features = ["testing"] }

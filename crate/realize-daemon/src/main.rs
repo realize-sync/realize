@@ -5,7 +5,6 @@ use clap::Parser;
 use futures_util::stream::StreamExt as _;
 use prometheus::{IntCounter, register_int_counter};
 use realize_core::config::Config;
-use realize_core::rpc::realstore::metrics;
 use realize_core::setup::SetupHelper;
 use realize_core::utils::logging;
 use realize_network::hostport::HostPort;
@@ -41,10 +40,6 @@ struct Cli {
     /// Path to the TOML configuration file
     #[arg(long)]
     config: PathBuf,
-
-    /// Address to export prometheus metrics (host:port, optional)
-    #[arg(long)]
-    metrics_addr: Option<String>,
 
     /// Path to the control socket file to use.
     ///
@@ -82,13 +77,6 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
 
     let local = LocalSet::new();
     let setup = SetupHelper::setup(config, &cli.privkey, &local).await?;
-
-    if let Some(addr) = &cli.metrics_addr {
-        metrics::export_metrics(addr)
-            .await
-            .with_context(|| format!("Failed to export metrics on {addr}"))?;
-        log::info!("Metrics available on http://{addr}/metrics");
-    }
 
     let hostport = HostPort::parse(&cli.address)
         .await

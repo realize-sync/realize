@@ -289,7 +289,7 @@ mod tests {
     use realize_types::{Peer, UnixTime};
     use std::path::PathBuf;
     use std::time::Duration;
-    use tarpc::tokio_util::sync::CancellationToken;
+    use tokio_util::sync::CancellationToken;
     use tokio::sync::mpsc;
     use tokio::task::LocalSet;
 

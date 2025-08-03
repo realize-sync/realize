@@ -10,9 +10,9 @@ use realize_network::capnp::PeerStatus;
 use realize_storage::{Job, JobId, JobStatus, Storage};
 use realize_types::Arena;
 use std::sync::Arc;
-use tarpc::tokio_util::sync::CancellationToken;
 use tokio::sync::RwLock;
 use tokio::{sync::broadcast, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 
 /// Capacity of the broadcast channel.
 ///

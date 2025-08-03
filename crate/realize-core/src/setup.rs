@@ -1,14 +1,10 @@
-use anyhow::Context;
-use tarpc::tokio_util::sync::CancellationToken;
-use tokio::fs;
-use tokio::task::LocalSet;
-
 use super::config::Config;
 use crate::consensus::churten::Churten;
 use crate::fs::downloader::Downloader;
 use crate::fs::nfs;
+use crate::rpc::Household;
 use crate::rpc::control::server::ControlServer;
-use crate::rpc::{Household, realstore};
+use anyhow::Context;
 use realize_network::{Networking, Server, unixsocket};
 use realize_storage::Storage;
 use realize_storage::config::ArenaConfig;
@@ -18,6 +14,9 @@ use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::fs;
+use tokio::task::LocalSet;
+use tokio_util::sync::CancellationToken;
 
 pub struct SetupHelper {
     pub networking: Networking,
@@ -107,14 +106,11 @@ impl SetupHelper {
     pub async fn setup_server(self) -> anyhow::Result<Arc<Server>> {
         let SetupHelper {
             networking,
-            storage,
             household,
+            ..
         } = self;
 
         let mut server = Server::new(networking.clone());
-        realstore::server::register(&mut server, storage.store().clone());
-
-        // Cache is always configured now
         household.keep_all_connected()?;
         household.register(&mut server);
 
