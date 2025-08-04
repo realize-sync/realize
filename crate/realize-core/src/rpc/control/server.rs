@@ -289,9 +289,9 @@ mod tests {
     use realize_types::{Peer, UnixTime};
     use std::path::PathBuf;
     use std::time::Duration;
-    use tokio_util::sync::CancellationToken;
     use tokio::sync::mpsc;
     use tokio::task::LocalSet;
+    use tokio_util::sync::CancellationToken;
 
     struct Fixture {
         inner: HouseholdFixture,
@@ -699,6 +699,12 @@ mod tests {
 
                 // Start churten
                 churten.start_request().send().promise.await?;
+                let (tx, mut rx) = mpsc::channel(10);
+                let mut subscribe_request = churten.subscribe_request();
+                subscribe_request
+                    .get()
+                    .set_subscriber(TxChurtenSubscriber::new(tx).as_client());
+                subscribe_request.send().promise.await?;
 
                 // Create a job by setting up a file to download
                 storage.set_arena_mark(arena, Mark::Keep).await?;
@@ -718,15 +724,8 @@ mod tests {
                     )
                     .await?;
 
-                // Wait a bit for the job to complete
-                let (tx, mut rx) = mpsc::channel(10);
-                let mut subscribe_request = churten.subscribe_request();
-                subscribe_request
-                    .get()
-                    .set_subscriber(TxChurtenSubscriber::new(tx).as_client());
-                subscribe_request.send().promise.await?;
-
-                while let Some(n) = rx.recv().await {
+                // Wait for it to be processed
+                while let Some(n) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await? {
                     match n {
                         ChurtenUpdates::Notify(ChurtenNotification::Finish { .. }) => {
                             break;

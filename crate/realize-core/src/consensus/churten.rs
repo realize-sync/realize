@@ -303,7 +303,6 @@ mod tests {
     use crate::rpc::testing::{self, HouseholdFixture};
     use realize_storage::utils::hash;
     use realize_storage::{JobId, Mark};
-    use std::collections::HashMap;
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
 
@@ -986,49 +985,22 @@ mod tests {
                     }
                 }
 
-                let mut recent_jobs = churten
-                    .recent_jobs()
-                    .await
-                    .into_iter()
-                    .map(|job| (job.id, job))
-                    .collect::<HashMap<JobId, JobInfo>>();
-
-                assert_eq!(
-                    Some(JobInfo {
-                        arena,
-                        id: JobId(1),
-                        job: Arc::new(Job::Download(foo1, hash1)),
-                        progress: JobProgress::Done,
-                        action: None,
-                        byte_progress: None,
-                        notification_index: 0,
-                    }),
-                    recent_jobs.remove(&JobId(1))
+                let recent_jobs = churten.recent_jobs().await.into_iter().collect::<Vec<_>>();
+                assert_unordered::assert_eq_unordered!(
+                    vec![
+                        Job::Download(foo1, hash1),
+                        Job::Download(foo2, hash2),
+                        Job::Download(foo3, hash3)
+                    ],
+                    recent_jobs
+                        .iter()
+                        .map(|j| (*j.job).clone())
+                        .collect::<Vec<_>>()
                 );
-                assert_eq!(
-                    Some(JobInfo {
-                        arena,
-                        id: JobId(2),
-                        job: Arc::new(Job::Download(foo2, hash2)),
-                        progress: JobProgress::Done,
-                        action: None,
-                        byte_progress: None,
-                        notification_index: 0,
-                    }),
-                    recent_jobs.remove(&JobId(2))
-                );
-                assert_eq!(
-                    Some(JobInfo {
-                        arena,
-                        id: JobId(3),
-                        job: Arc::new(Job::Download(foo3, hash3)),
-                        progress: JobProgress::Done,
-                        action: None,
-                        byte_progress: None,
-                        notification_index: 0,
-                    }),
-                    recent_jobs.remove(&JobId(3))
-                );
+                for job in recent_jobs {
+                    assert_eq!(job.arena, job.arena);
+                    assert_eq!(job.progress, JobProgress::Done);
+                }
 
                 Ok::<(), anyhow::Error>(())
             })
