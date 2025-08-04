@@ -2049,7 +2049,13 @@ mod tests {
         let (path, hash) = fixture.add_file_with_content("test.txt", "original content")?;
 
         // Modify the file on filesystem without updating the index
-        root.child("test.txt").write_str("modified content")?;
+        //
+        // Open issue:On some systems, the test may run too quickly
+        // for the test to catch a fs time change alone, so this changes the content size.
+        fixture
+            .root
+            .child("test.txt")
+            .write_str("modified content!")?;
 
         let txn = fixture.index.db.begin_write()?;
         let result = get_indexed_file(&txn, root.path(), &path, Some(&hash))?;
@@ -2258,10 +2264,13 @@ mod tests {
         let initial_history_count = fixture.index.last_history_index()?;
 
         // Modify the file on filesystem without updating the index
+        //
+        // Open issue:On some systems, the test may run too quickly
+        // for the test to catch a fs time change alone, so this changes the content size.
         fixture
             .root
             .child("test.txt")
-            .write_str("modified content")?;
+            .write_str("modified content!")?;
 
         // Verify file exists in index
         assert!(fixture.index.has_file(&path)?);
