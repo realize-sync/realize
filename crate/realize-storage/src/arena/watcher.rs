@@ -2,7 +2,7 @@
 
 use crate::utils::{fs_utils, hash};
 
-use super::hasher::{self, HashResult, Hasher};
+use super::hasher::{self, Hasher};
 use super::index::RealIndexAsync;
 use futures::StreamExt as _;
 use notify::event::{CreateKind, MetadataKind, ModifyKind};
@@ -120,14 +120,13 @@ impl RealWatcher {
         };
 
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-        let (hashed_tx, hashed_rx) = mpsc::channel(128);
         let (rescan_tx, rescan_rx) = mpsc::channel(16);
 
-        // Transform excluded path::Path into realize_types::Path, when possible.
+        let hasher = hasher::Hasher::spawn(index.clone(), shutdown_tx.subscribe());
         let worker = Arc::new(RealWatcherWorker {
             root,
             index,
-            hasher: hasher::Hasher::new(hashed_tx),
+            hasher,
             exclude,
         });
 
@@ -143,11 +142,6 @@ impl RealWatcher {
             async move {
                 worker.rescan_loop(rescan_rx, watch_tx, shutdown_rx).await;
             }
-        });
-        task::spawn({
-            let worker = Arc::clone(&worker);
-            let shutdown_rx = shutdown_tx.subscribe();
-            async move { worker.hashed_loop(hashed_rx, shutdown_rx).await }
         });
         task::spawn(async move {
             let _watcher = watcher;
@@ -423,44 +417,6 @@ impl RealWatcherWorker {
                             }
                         }
                     }
-                }
-            );
-        }
-    }
-
-    async fn hashed_loop(
-        &self,
-        mut hashed_rx: mpsc::Receiver<(realize_types::Path, std::io::Result<HashResult>)>,
-        mut shutdown_rx: broadcast::Receiver<()>,
-    ) {
-        let arena = self.index.arena();
-        loop {
-            tokio::select!(
-                _ = shutdown_rx.recv() => {
-                    break;
-                }
-                res = hashed_rx.recv() => {
-                    match res {
-                        None => {
-                            break;
-                        }
-                        Some((path, Ok(HashResult { size, mtime, hash }))) => {
-                            let realpath = path.within(&self.root);
-                            if let Ok(m) = fs::symlink_metadata(realpath).await && m.len() == size && UnixTime::mtime(&m) == mtime {
-                                log::debug!("[{arena}] Add file {path} with hash {hash}");
-                                if let Err(err) = self.index.add_file(&path, size, &mtime, hash).await {
-                                    log::debug!("[{arena}] Failed to add {path}: {err}");
-                                }
-                            }
-                        }
-                        Some((path, Err(err))) => {
-                            // TODO: should hash failures be retried?
-                            // should some error types, such as access
-                            // denied, cause removal?
-                            log::debug!("[{arena}] Hashing failed for {path}: {err}");
-                        }
-                    }
-
                 }
             );
         }

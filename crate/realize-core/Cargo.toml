@@ -29,7 +29,7 @@ tokio-retry = "0.3.0"
 tokio-stream = "0.1.17"
 uuid = { version = "1.17.0", features = ["std", "v7"] }
 fast_rsync = "0.2.0"
-tokio-util = "0.7.16"
+tokio-util = { version = "0.7.16", features = ["join-map"] }
 
 [dev-dependencies]
 realize-network = { path = "../realize-network", features = ["testing"] }
