@@ -62,7 +62,7 @@ pub enum JobStatus {
     Done,
 
     /// The job was abandoned
-    Abandoned,
+    Abandoned(&'static str),
 
     /// The job was cancelled
     Cancelled,
@@ -216,8 +216,8 @@ impl Engine {
                 log::debug!("[{}] DONE: {job_id}", self.arena);
                 self.job_done(job_id)
             }
-            Ok(JobStatus::Abandoned) => {
-                log::debug!("[{}] ABANDONED: {job_id}", self.arena);
+            Ok(JobStatus::Abandoned(reason)) => {
+                log::debug!("[{}] ABANDONED: {job_id} ({reason})", self.arena);
                 self.job_done(job_id)
             }
             Ok(JobStatus::Cancelled) => {
@@ -1401,7 +1401,7 @@ mod tests {
         let (job_id, _) = next_with_timeout(&mut job_stream).await?.unwrap();
         fixture
             .engine
-            .job_finished(job_id, Ok(JobStatus::Abandoned))?;
+            .job_finished(job_id, Ok(JobStatus::Abandoned("test")))?;
 
         // This is handled the same as job_done. The only difference,
         // for now, is the logging.

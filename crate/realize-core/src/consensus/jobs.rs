@@ -8,8 +8,8 @@ use realize_storage::{Inode, JobStatus, LocalAvailability, Storage, StorageError
 use realize_types::{Arena, ByteRanges, Hash, Path, Peer, Signature};
 use std::io::SeekFrom;
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 
 /// Maximum byterange to sync with rsync. This is also the worst-case
 /// size of the Delta to send back, so must be something that fits
@@ -49,7 +49,7 @@ pub(crate) async fn download(
     let cache = storage.cache();
     let inode = match cache.lookup_path(arena, path).await {
         Err(StorageError::NotFound) => {
-            return Ok(JobStatus::Abandoned);
+            return Ok(JobStatus::Abandoned("not in cache"));
         }
         Err(err) => {
             return Err(err.into());
@@ -71,12 +71,12 @@ pub(crate) async fn download(
         LocalAvailability::Missing | LocalAvailability::Partial(_, _) => {
             let peers = storage.cache().file_availability(inode).await?.peers;
             if peers.is_empty() {
-                return Ok(JobStatus::Abandoned);
+                return Ok(JobStatus::Abandoned("no peer has it"));
             }
 
             let mut blob = storage.cache().open_file(inode).await?;
             if *blob.hash() != *hash {
-                return Ok(JobStatus::Abandoned);
+                return Ok(JobStatus::Abandoned("Blob.hash is wrong"));
             }
 
             let res = write_to_blob(
@@ -177,7 +177,7 @@ pub(crate) async fn verify(
 ) -> Result<JobStatus, JobError> {
     let mut blob = storage.cache().open_file(inode).await?;
     if *blob.hash() != *hash {
-        return Ok(JobStatus::Abandoned);
+        return Ok(JobStatus::Abandoned("Blob.hash mismatch"));
     }
 
     progress.update_action(JobAction::Verify);
@@ -197,7 +197,7 @@ pub(crate) async fn verify(
     progress.update_action(JobAction::Repair);
     let peers = storage.cache().file_availability(inode).await?.peers;
     if peers.is_empty() {
-        return Ok(JobStatus::Abandoned);
+        return Ok(JobStatus::Abandoned("not available anywhere"));
     }
     let opts = fast_rsync::SignatureOptions {
         block_size: 4 * 1024 as u32,
@@ -275,7 +275,7 @@ pub(crate) async fn realize(
 
     // Then realize the file, if the state matches.
     if !storage.realize(arena, path, hash, index_hash).await? {
-        return Ok(JobStatus::Abandoned);
+        return Ok(JobStatus::Abandoned("state mismatch"));
     }
 
     Ok(JobStatus::Done)
@@ -293,7 +293,7 @@ pub(crate) async fn unrealize(
 ) -> Result<JobStatus, JobError> {
     progress.update_action(JobAction::Move);
     if !storage.unrealize(arena, path, hash).await? {
-        return Ok(JobStatus::Abandoned);
+        return Ok(JobStatus::Abandoned("state mismatch"));
     }
 
     Ok(JobStatus::Done)
@@ -653,8 +653,7 @@ mod tests {
                 let path = fixture.write_file(b, "foobar", "foobar").await?;
                 fixture.inner.wait_for_file_in_cache(a, "foobar").await?;
 
-                assert_eq!(
-                    JobStatus::Abandoned,
+                assert!(matches!(
                     download(
                         fixture.inner.storage(a)?,
                         &household_a,
@@ -665,7 +664,8 @@ mod tests {
                         CancellationToken::new(),
                     )
                     .await?,
-                );
+                    JobStatus::Abandoned(_),
+                ));
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -686,8 +686,7 @@ mod tests {
                 let b = HouseholdFixture::b();
                 testing::connect(&household_a, b).await?;
 
-                assert_eq!(
-                    JobStatus::Abandoned,
+                assert!(matches!(
                     download(
                         fixture.inner.storage(a)?,
                         &household_a,
@@ -698,7 +697,8 @@ mod tests {
                         CancellationToken::new(),
                     )
                     .await?,
-                );
+                    JobStatus::Abandoned(_)
+                ));
 
                 Ok::<(), anyhow::Error>(())
             })

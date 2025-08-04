@@ -204,7 +204,7 @@ async fn background_job<H: JobHandler>(
                         job_id,
                         progress: match &status {
                             Ok(JobStatus::Done) => JobProgress::Done,
-                            Ok(JobStatus::Abandoned) => JobProgress::Abandoned,
+                            Ok(JobStatus::Abandoned(_)) => JobProgress::Abandoned,
                             Ok(JobStatus::Cancelled) => JobProgress::Cancelled,
                             Ok(JobStatus::NoPeers) => JobProgress::NoPeers,
                             Err(err) => {
@@ -638,7 +638,7 @@ mod tests {
                 let storage = fixture.inner.storage(a)?;
                 testing::connect(&household_a, b).await?;
 
-                let handler = FakeJobHandler::new(|| Ok(JobStatus::Abandoned));
+                let handler = FakeJobHandler::new(|| Ok(JobStatus::Abandoned("fake")));
                 let mut churten =
                     Churten::with_handler(Arc::clone(&storage), household_a.clone(), handler);
                 let mut rx = churten.subscribe();
