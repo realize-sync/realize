@@ -224,7 +224,12 @@ impl FsEvent {
             EventKind::Modify(ModifyKind::Metadata(
                 MetadataKind::Permissions | MetadataKind::Ownership | MetadataKind::Any,
             )) => ev.paths.pop().map(|p| FsEvent::MetadataChanged(p)),
-            //EventKind::Access(AccessKind::Close(AccessMode::Write))
+
+            #[cfg(target_os = "linux")]
+            EventKind::Access(notify::event::AccessKind::Close(
+                notify::event::AccessMode::Write,
+            )) => ev.paths.pop().map(|p| FsEvent::ContentModified(p)),
+            #[cfg(target_os = "macos")]
             EventKind::Modify(ModifyKind::Data(_)) => {
                 ev.paths.pop().map(|p| FsEvent::ContentModified(p))
             }
