@@ -1304,6 +1304,7 @@ mod tests {
     use fast_rsync::SignatureOptions;
     use futures::TryStreamExt as _;
     use realize_network::testing::TestingPeers;
+    use realize_storage::utils::hash;
     use tokio::fs;
 
     #[tokio::test]
@@ -1322,7 +1323,9 @@ mod tests {
                 let b_dir = fixture.arena_root(b);
                 fs::write(&b_dir.join("bar.txt"), b"test").await?;
 
-                fixture.wait_for_file_in_cache(a, "bar.txt").await?;
+                fixture
+                    .wait_for_file_in_cache(a, "bar.txt", &hash::digest(b"test"))
+                    .await?;
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -1345,7 +1348,9 @@ mod tests {
                 let b_dir = fixture.arena_root(b);
                 fs::write(&b_dir.join("bar.txt"), b"test").await?;
 
-                fixture.wait_for_file_in_cache(a, "bar.txt").await?;
+                fixture
+                    .wait_for_file_in_cache(a, "bar.txt", &hash::digest(b"test"))
+                    .await?;
 
                 let stream = household_a.read(
                     vec![b.clone()],
@@ -1404,7 +1409,9 @@ mod tests {
                 fs::write(&b_dir.join("rsync_test.txt"), content.as_bytes()).await?;
 
                 // Wait for the file to be available in peer A's cache
-                fixture.wait_for_file_in_cache(a, "rsync_test.txt").await?;
+                fixture
+                    .wait_for_file_in_cache(a, "rsync_test.txt", &hash::digest(content.as_bytes()))
+                    .await?;
 
                 // Create a different version of the file in peer A (similar but not identical)
                 let a_dir = fixture.arena_root(a);
@@ -1484,7 +1491,9 @@ mod tests {
                 fs::write(&b_dir.join("identical.txt"), content.as_bytes()).await?;
 
                 // Wait for the file to be available in peer A's cache
-                fixture.wait_for_file_in_cache(a, "identical.txt").await?;
+                fixture
+                    .wait_for_file_in_cache(a, "identical.txt", &hash::digest(content.as_bytes()))
+                    .await?;
 
                 let arena = HouseholdFixture::test_arena();
                 let path = realize_types::Path::parse("identical.txt")?;
@@ -1552,7 +1561,9 @@ mod tests {
                 fs::write(&b_dir.join("different.txt"), b_content.as_bytes()).await?;
 
                 // Wait for the file to be available in peer A's cache
-                fixture.wait_for_file_in_cache(a, "different.txt").await?;
+                fixture
+                    .wait_for_file_in_cache(a, "different.txt", &hash::digest(b_content.as_bytes()))
+                    .await?;
 
                 let arena = HouseholdFixture::test_arena();
                 let path = realize_types::Path::parse("different.txt")?;

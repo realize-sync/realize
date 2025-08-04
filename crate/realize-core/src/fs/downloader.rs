@@ -450,6 +450,7 @@ mod tests {
     use crate::rpc::testing::{self, HouseholdFixture};
     use rand::rngs::SmallRng;
     use rand::{RngCore, SeedableRng};
+    use realize_storage::utils::hash;
     use realize_types::Path;
     use std::io::Write as _;
     use tokio::fs;
@@ -483,7 +484,9 @@ mod tests {
 
             // Wait for the file to appear in peer A's cache
             let a = HouseholdFixture::a();
-            self.inner.wait_for_file_in_cache(a, path_str).await?;
+            self.inner
+                .wait_for_file_in_cache(a, path_str, &hash::digest(content.as_bytes()))
+                .await?;
 
             // Get the inode for the file
             self.reader(downloader, path_str).await
@@ -694,9 +697,15 @@ mod tests {
                     f.write(&[2u8; 8 * 1024])?;
                 }
 
+                // Calculate hash for the large file content
+                let mut large_file_content = Vec::new();
+                large_file_content.extend_from_slice(&[1u8; 8 * 1024]);
+                large_file_content.extend_from_slice(&[0u8; 8 * 1024]);
+                large_file_content.extend_from_slice(&[2u8; 8 * 1024]);
+
                 fixture
                     .inner
-                    .wait_for_file_in_cache(a, "large_file")
+                    .wait_for_file_in_cache(a, "large_file", &hash::digest(&large_file_content))
                     .await?;
 
                 let downloader = Downloader::new(household_a, fixture.inner.cache(a)?.clone());
@@ -747,9 +756,15 @@ mod tests {
                     f.write(&[2u8; MIN_CHUNK_SIZE as usize])?;
                 }
 
+                // Calculate hash for the large file content
+                let mut large_file_content = Vec::new();
+                large_file_content.extend_from_slice(&[1u8; MIN_CHUNK_SIZE as usize]);
+                large_file_content.extend_from_slice(&[0u8; MIN_CHUNK_SIZE as usize]);
+                large_file_content.extend_from_slice(&[2u8; MIN_CHUNK_SIZE as usize]);
+
                 fixture
                     .inner
-                    .wait_for_file_in_cache(a, "large_file")
+                    .wait_for_file_in_cache(a, "large_file", &hash::digest(&large_file_content))
                     .await?;
 
                 let downloader =
@@ -880,7 +895,9 @@ mod tests {
         rng.fill_bytes(file_content.as_mut_slice());
         std::fs::write(&path, &mut file_content)?;
 
-        fixture.wait_for_file_in_cache(a, "large_file").await?;
+        fixture
+            .wait_for_file_in_cache(a, "large_file", &hash::digest(&file_content))
+            .await?;
 
         let cache = fixture.cache(a)?;
         let downloader = Downloader::new(household, cache.clone());

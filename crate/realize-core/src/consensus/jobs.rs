@@ -331,13 +331,13 @@ mod tests {
             peer: Peer,
             path_str: &str,
             content: &str,
-        ) -> anyhow::Result<Path> {
+        ) -> anyhow::Result<(Path, Hash)> {
             let root = self.inner.arena_root(peer);
             let path = Path::parse(path_str)?;
             let realpath = path.within(&root);
             fs::write(realpath, content).await?;
 
-            Ok(path)
+            Ok((path, hash::digest(content)))
         }
 
         async fn write_large_file(
@@ -451,8 +451,11 @@ mod tests {
                 let b = HouseholdFixture::b();
                 testing::connect(&household_a, b).await?;
 
-                let path = fixture.write_file(b, "foobar", "foo then bar").await?;
-                fixture.inner.wait_for_file_in_cache(a, "foobar").await?;
+                let (path, hash) = fixture.write_file(b, "foobar", "foo then bar").await?;
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "foobar", &hash)
+                    .await?;
 
                 assert_eq!(
                     JobStatus::Done,
@@ -461,7 +464,7 @@ mod tests {
                         &household_a,
                         HouseholdFixture::test_arena(),
                         &path,
-                        &hash::digest("foo then bar"),
+                        &hash,
                         &mut NoOpByteCountProgress,
                         CancellationToken::new(),
                     )
@@ -494,8 +497,11 @@ mod tests {
                 let b = HouseholdFixture::b();
                 testing::connect(&household_a, b).await?;
 
-                let path = fixture.write_file(b, "foobar", "").await?;
-                fixture.inner.wait_for_file_in_cache(a, "foobar").await?;
+                let (path, hash) = fixture.write_file(b, "foobar", "").await?;
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "foobar", &hash)
+                    .await?;
 
                 let mut progress = SimpleByteCountProgress::new();
                 assert_eq!(
@@ -543,10 +549,13 @@ mod tests {
                 let b = HouseholdFixture::b();
                 testing::connect(&household_a, b).await?;
 
-                let path = fixture
+                let (path, hash) = fixture
                     .write_file(b, "foobar", "baa, baa, black sheep")
                     .await?;
-                fixture.inner.wait_for_file_in_cache(a, "foobar").await?;
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "foobar", &hash)
+                    .await?;
 
                 {
                     let mut blob = fixture.open_file(a, "foobar").await?;
@@ -596,10 +605,13 @@ mod tests {
                 let b = HouseholdFixture::b();
                 testing::connect(&household_a, b).await?;
 
-                let path = fixture
+                let (path, hash) = fixture
                     .write_file(b, "foobar", "baa, baa, black sheep")
                     .await?;
-                fixture.inner.wait_for_file_in_cache(a, "foobar").await?;
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "foobar", &hash)
+                    .await?;
 
                 {
                     let mut blob = fixture.open_file(a, "foobar").await?;
@@ -650,8 +662,11 @@ mod tests {
                 let b = HouseholdFixture::b();
                 testing::connect(&household_a, b).await?;
 
-                let path = fixture.write_file(b, "foobar", "foobar").await?;
-                fixture.inner.wait_for_file_in_cache(a, "foobar").await?;
+                let (path, hash) = fixture.write_file(b, "foobar", "foobar").await?;
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "foobar", &hash)
+                    .await?;
 
                 assert!(matches!(
                     download(
@@ -719,8 +734,11 @@ mod tests {
                 let b = HouseholdFixture::b();
                 testing::connect(&household_a, b).await?;
 
-                let path = fixture.write_file(b, "foobar", "foobar").await?;
-                fixture.inner.wait_for_file_in_cache(a, "foobar").await?;
+                let (path, hash) = fixture.write_file(b, "foobar", "foobar").await?;
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "foobar", &hash)
+                    .await?;
 
                 let cancelled_token = CancellationToken::new();
                 cancelled_token.cancel();
@@ -732,7 +750,7 @@ mod tests {
                         &household_a,
                         HouseholdFixture::test_arena(),
                         &path,
-                        &hash::digest("foobar"),
+                        &hash,
                         &mut NoOpByteCountProgress,
                         cancelled_token,
                     )
@@ -761,10 +779,13 @@ mod tests {
                 let b = HouseholdFixture::b();
                 testing::connect(&household_a, b).await?;
 
-                let path = fixture
+                let (path, hash) = fixture
                     .write_file(b, "foobar", "baa, baa, black sheep")
                     .await?;
-                fixture.inner.wait_for_file_in_cache(a, "foobar").await?;
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "foobar", &hash)
+                    .await?;
 
                 // Write the complete file content
                 {
@@ -781,7 +802,7 @@ mod tests {
                         &household_a,
                         HouseholdFixture::test_arena(),
                         &path,
-                        &hash::digest("baa, baa, black sheep"),
+                        &hash,
                         &mut progress,
                         CancellationToken::new(),
                     )
@@ -811,10 +832,13 @@ mod tests {
                 let b = HouseholdFixture::b();
                 testing::connect(&household_a, b).await?;
 
-                let path = fixture
+                let (path, hash) = fixture
                     .write_file(b, "foobar", "baa, baa, black sheep")
                     .await?;
-                fixture.inner.wait_for_file_in_cache(a, "foobar").await?;
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "foobar", &hash)
+                    .await?;
 
                 {
                     let mut blob = fixture.open_file(a, "foobar").await?;
@@ -829,7 +853,7 @@ mod tests {
                         &household_a,
                         HouseholdFixture::test_arena(),
                         &path,
-                        &hash::digest("baa, baa, black sheep"),
+                        &hash,
                         &mut progress,
                         CancellationToken::new(),
                     )
@@ -865,8 +889,11 @@ mod tests {
                 let b = HouseholdFixture::b();
                 testing::connect(&household_a, b).await?;
 
-                let foobar = fixture.inner.write_file(b, "foobar", "foo & bar").await?;
-                fixture.inner.wait_for_file_in_cache(a, "foobar").await?;
+                let (foobar, hash) = fixture.inner.write_file(b, "foobar", "foo & bar").await?;
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "foobar", &hash)
+                    .await?;
                 fixture.set_blob_content(a, "foobar", "barbatruc").await?;
 
                 let mut progress = SimpleByteCountProgress::new();
@@ -877,7 +904,7 @@ mod tests {
                         &household_a,
                         arena,
                         &foobar,
-                        &hash::digest(b"foo & bar"),
+                        &hash,
                         &mut progress,
                         CancellationToken::new(),
                     )
@@ -919,8 +946,11 @@ mod tests {
                 let b = HouseholdFixture::b();
                 testing::connect(&household_a, b).await?;
 
-                let foobar = fixture.inner.write_file(b, "foobar", "foo & bar").await?;
-                fixture.inner.wait_for_file_in_cache(a, "foobar").await?;
+                let (foobar, hash) = fixture.inner.write_file(b, "foobar", "foo & bar").await?;
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "foobar", &hash)
+                    .await?;
                 fixture.set_blob_content(a, "foobar", "boo &").await?;
 
                 let mut progress = SimpleByteCountProgress::new();
@@ -931,7 +961,7 @@ mod tests {
                         &household_a,
                         arena,
                         &foobar,
-                        &hash::digest(b"foo & bar"),
+                        &hash,
                         &mut progress,
                         CancellationToken::new(),
                     )
@@ -978,7 +1008,10 @@ mod tests {
                 testing::connect(&household_a, b).await?;
 
                 let (path, hash) = fixture.write_large_file(b, "large", 433, 1024).await?;
-                fixture.inner.wait_for_file_in_cache(a, "large").await?;
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "large", &hash)
+                    .await?;
 
                 assert_eq!(
                     JobStatus::Done,
@@ -1023,7 +1056,10 @@ mod tests {
                 testing::connect(&household_a, b).await?;
 
                 let (path, hash) = fixture.write_large_file(b, "large", 415, 1024).await?;
-                fixture.inner.wait_for_file_in_cache(a, "large").await?;
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "large", &hash)
+                    .await?;
 
                 // Fill the blob for 'large' with data. Download will
                 // have to repair it to get to the correct hash.
@@ -1087,8 +1123,11 @@ mod tests {
                 let b = HouseholdFixture::b();
                 testing::connect(&household_a, b).await?;
 
-                let foobar = fixture.write_file(b, "foobar", "foo then bar").await?;
-                fixture.inner.wait_for_file_in_cache(a, "foobar").await?;
+                let (foobar, hash) = fixture.write_file(b, "foobar", "foo then bar").await?;
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "foobar", &hash)
+                    .await?;
 
                 assert_eq!(
                     JobStatus::Done,
@@ -1097,7 +1136,7 @@ mod tests {
                         &household_a,
                         HouseholdFixture::test_arena(),
                         &foobar,
-                        &hash::digest("foo then bar"),
+                        &hash,
                         None,
                         &mut NoOpByteCountProgress,
                         CancellationToken::new(),
@@ -1130,8 +1169,11 @@ mod tests {
                 let b = HouseholdFixture::b();
                 testing::connect(&household_a, b).await?;
 
-                let foobar = fixture.write_file(b, "foobar", "foo then bar").await?;
-                fixture.inner.wait_for_file_in_cache(a, "foobar").await?;
+                let (foobar, hash) = fixture.write_file(b, "foobar", "foo then bar").await?;
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "foobar", &hash)
+                    .await?;
 
                 assert_eq!(
                     JobStatus::Done,
@@ -1140,7 +1182,7 @@ mod tests {
                         &household_a,
                         HouseholdFixture::test_arena(),
                         &foobar,
-                        &hash::digest("foo then bar"),
+                        &hash,
                         None,
                         &mut NoOpByteCountProgress,
                         CancellationToken::new(),
@@ -1194,10 +1236,16 @@ mod tests {
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
 
-                let foobar = fixture.write_file(b, "foobar", "foo!").await?;
-                fixture.inner.wait_for_file_in_cache(a, "foobar").await?;
+                let (foobar, hash) = fixture.write_file(b, "foobar", "foo!").await?;
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "foobar", &hash)
+                    .await?;
                 fixture.write_file(a, "foobar", "foo!").await?;
-                fixture.inner.wait_for_file_in_cache(b, "foobar").await?;
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(b, "foobar", &hash)
+                    .await?;
                 // foobar is in the cache and the index with the same content
 
                 let mut progress = SimpleByteCountProgress::new();
@@ -1207,7 +1255,7 @@ mod tests {
                         fixture.inner.storage(a)?,
                         HouseholdFixture::test_arena(),
                         &foobar,
-                        &hash::digest("foo!"),
+                        &hash,
                         &mut progress,
                     )
                     .await?,

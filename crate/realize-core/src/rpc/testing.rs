@@ -7,6 +7,7 @@ use realize_network::hostport::HostPort;
 use realize_network::testing::TestingPeers;
 use realize_storage::Blob;
 use realize_storage::Storage;
+use realize_storage::utils::hash;
 use realize_storage::{self, UnrealCacheAsync};
 use realize_types::Path;
 use realize_types::{Arena, Hash, Peer};
@@ -127,20 +128,45 @@ impl HouseholdFixture {
     }
 
     /// Wait for the given file to appear in the given peer's cache, in the test arena.
-    pub async fn wait_for_file_in_cache(&self, peer: Peer, filename: &str) -> anyhow::Result<()> {
-        let cache = &self.cache(peer)?;
+    ///
+    /// This function waits for a specific version of the file (identified by hash) to avoid
+    /// flaky tests that see intermediate states on Linux.
+    pub async fn wait_for_file_in_cache(
+        &self,
+        peer: Peer,
+        filename: &str,
+        hash: &Hash,
+    ) -> anyhow::Result<()> {
+        let cache = self.cache(peer)?;
 
         let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
         let arena = HouseholdFixture::test_arena();
-        while cache
-            .lookup_path(arena, &Path::parse(filename)?)
-            .await
-            .is_err()
-        {
+        let path = Path::parse(filename)?;
+
+        // First, wait for the file to appear in the cache
+        let inode = loop {
+            match cache.lookup_path(arena, &path).await {
+                Ok((inode, _)) => break inode,
+                Err(_) => {
+                    if let Some(delay) = retry.next() {
+                        tokio::time::sleep(delay).await;
+                    } else {
+                        panic!("[arena]/{filename} was never added to the cache of {peer}");
+                    }
+                }
+            }
+        };
+
+        // Then, wait for the file to have the expected hash
+        while cache.file_availability(inode).await?.hash != *hash {
             if let Some(delay) = retry.next() {
                 tokio::time::sleep(delay).await;
             } else {
-                panic!("[arena]/{filename} was never added to the cache of {peer}");
+                panic!(
+                    "[arena]/{filename} in the cache of {peer} never became {} (current: {})",
+                    *hash,
+                    cache.file_availability(inode).await?.hash
+                );
             }
         }
 
@@ -178,13 +204,13 @@ impl HouseholdFixture {
         peer: Peer,
         path_str: &str,
         content: &str,
-    ) -> anyhow::Result<Path> {
+    ) -> anyhow::Result<(Path, Hash)> {
         let root = self.arena_root(peer);
         let path = Path::parse(path_str)?;
         let realpath = path.within(&root);
         tokio::fs::write(realpath, content).await?;
 
-        Ok(path)
+        Ok((path, hash::digest(content)))
     }
 
     pub async fn open_file(&self, peer: Peer, path_str: &str) -> anyhow::Result<Blob> {

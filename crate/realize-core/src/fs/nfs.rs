@@ -349,7 +349,7 @@ mod tests {
     use super::*;
     use crate::rpc::testing::HouseholdFixture;
     use nfsserve::nfs::nfsstring;
-    use realize_storage::Notification;
+    use realize_storage::{Notification, utils::hash};
     use realize_types::{Hash, Path};
     use std::time::SystemTime;
     use tokio::fs;
@@ -496,7 +496,9 @@ mod tests {
                 fs::write(&file, "world").await?;
 
                 // Wait for the file to appear in peer A's cache
-                fixture.wait_for_file_in_cache(a, "hello.txt").await?;
+                fixture
+                    .wait_for_file_in_cache(a, "hello.txt", &hash::digest("world"))
+                    .await?;
 
                 let arena_root = cache
                     .arena_root(HouseholdFixture::test_arena())

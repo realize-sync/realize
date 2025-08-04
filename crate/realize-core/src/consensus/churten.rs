@@ -301,7 +301,7 @@ mod tests {
     use crate::consensus::progress::ByteCountProgress;
     use crate::consensus::types::JobAction;
     use crate::rpc::testing::{self, HouseholdFixture};
-    use realize_storage::utils::hash::{self, digest};
+    use realize_storage::utils::hash;
     use realize_storage::{JobId, Mark};
     use std::collections::HashMap;
     use std::time::Duration;
@@ -345,8 +345,7 @@ mod tests {
                 churten.start();
 
                 storage.set_arena_mark(arena, Mark::Keep).await?;
-                let foo = fixture.inner.write_file(b, "foo", "this is foo").await?;
-                let hash = digest("this is foo");
+                let (foo, hash) = fixture.inner.write_file(b, "foo", "this is foo").await?;
                 let job_id = JobId(1);
                 assert_eq!(
                     ChurtenNotification::New {
@@ -442,7 +441,10 @@ mod tests {
                 // b has foo in its index, which is available in the
                 // cache on a and set to keep; it'll be downloaded.
                 fixture.inner.write_file(b, "foo", "this is foo").await?;
-                fixture.inner.wait_for_file_in_cache(a, "foo").await?;
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "foo", &hash::digest("this is foo"))
+                    .await?;
                 storage.set_arena_mark(arena, Mark::Keep).await?;
 
                 // b is disconnected; downloading won't succeed
@@ -567,8 +569,7 @@ mod tests {
                 churten.start();
 
                 storage.set_arena_mark(arena, Mark::Keep).await?;
-                let foo = fixture.inner.write_file(b, "foo", "test content").await?;
-                let hash = digest("test content");
+                let (foo, hash) = fixture.inner.write_file(b, "foo", "test content").await?;
                 let job_id = JobId(1);
                 let job = Arc::new(Job::Download(foo.clone(), hash));
                 // Check Pending notification
@@ -645,8 +646,7 @@ mod tests {
                 churten.start();
 
                 storage.set_arena_mark(arena, Mark::Keep).await?;
-                let foo = fixture.inner.write_file(b, "foo", "test content").await?;
-                let hash = digest("test content");
+                let (foo, hash) = fixture.inner.write_file(b, "foo", "test content").await?;
                 let job_id = JobId(1);
 
                 // Check Pending notification
@@ -704,8 +704,7 @@ mod tests {
                 churten.start();
 
                 storage.set_arena_mark(arena, Mark::Keep).await?;
-                let foo = fixture.inner.write_file(b, "foo", "test content").await?;
-                let hash = digest("test content");
+                let (foo, hash) = fixture.inner.write_file(b, "foo", "test content").await?;
                 let job_id = JobId(1);
                 let job = Arc::new(Job::Download(foo.clone(), hash.clone()));
 
@@ -764,8 +763,7 @@ mod tests {
                 churten.start();
 
                 storage.set_arena_mark(arena, Mark::Keep).await?;
-                let foo = fixture.inner.write_file(b, "foo", "test content").await?;
-                let hash = digest("test content");
+                let (foo, hash) = fixture.inner.write_file(b, "foo", "test content").await?;
                 let job_id = JobId(1);
 
                 // Check Pending notification
@@ -826,8 +824,7 @@ mod tests {
                 churten.start();
 
                 storage.set_arena_mark(arena, Mark::Keep).await?;
-                let foo = fixture.inner.write_file(b, "foo", "test content").await?;
-                let hash = digest("test content");
+                let (foo, hash) = fixture.inner.write_file(b, "foo", "test content").await?;
                 let job_id = JobId(1);
                 let job = Arc::new(Job::Download(foo, hash));
 
@@ -968,16 +965,19 @@ mod tests {
                 storage.set_arena_mark(arena, Mark::Keep).await?;
 
                 // Create multiple files to trigger multiple jobs
-                let foo1 = fixture.inner.write_file(b, "foo1", "content1").await?;
-                let foo2 = fixture.inner.write_file(b, "foo2", "content2").await?;
-                let foo3 = fixture.inner.write_file(b, "foo3", "content3").await?;
+                let (foo1, hash1) = fixture.inner.write_file(b, "foo1", "content1").await?;
+                let (foo2, hash2) = fixture.inner.write_file(b, "foo2", "content2").await?;
+                let (foo3, hash3) = fixture.inner.write_file(b, "foo3", "content3").await?;
 
                 // Collect all notifications
                 let mut finished_count = 0;
-                while let Ok(notification) = rx.recv().await {
+                while let Ok(notification) =
+                    tokio::time::timeout(Duration::from_secs(3), rx.recv()).await?
+                {
                     match notification {
                         ChurtenNotification::Finish { .. } => {
                             finished_count += 1;
+                            log::debug!("Finished {finished_count}/3");
                             if finished_count == 3 {
                                 break;
                             }
@@ -997,7 +997,7 @@ mod tests {
                     Some(JobInfo {
                         arena,
                         id: JobId(1),
-                        job: Arc::new(Job::Download(foo1, hash::digest("content1"))),
+                        job: Arc::new(Job::Download(foo1, hash1)),
                         progress: JobProgress::Done,
                         action: None,
                         byte_progress: None,
@@ -1009,7 +1009,7 @@ mod tests {
                     Some(JobInfo {
                         arena,
                         id: JobId(2),
-                        job: Arc::new(Job::Download(foo2, hash::digest("content2"))),
+                        job: Arc::new(Job::Download(foo2, hash2)),
                         progress: JobProgress::Done,
                         action: None,
                         byte_progress: None,
@@ -1021,7 +1021,7 @@ mod tests {
                     Some(JobInfo {
                         arena,
                         id: JobId(3),
-                        job: Arc::new(Job::Download(foo3, hash::digest("content3"))),
+                        job: Arc::new(Job::Download(foo3, hash3)),
                         progress: JobProgress::Done,
                         action: None,
                         byte_progress: None,
