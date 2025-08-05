@@ -10,10 +10,15 @@ pub struct StorageConfig {
 }
 
 impl StorageConfig {
-    pub fn new(cache_db: PathBuf) -> Self {
+    pub fn new<P>(cache_db: P) -> Self
+    where
+        P: AsRef<std::path::Path>,
+    {
         StorageConfig {
             arenas: HashMap::new(),
-            cache: CacheConfig { db: cache_db },
+            cache: CacheConfig {
+                db: cache_db.as_ref().to_path_buf(),
+            },
         }
     }
 }
@@ -26,8 +31,13 @@ pub struct CacheConfig {
 }
 
 impl CacheConfig {
-    pub fn new(db: PathBuf) -> Self {
-        Self { db }
+    pub fn new<P>(db: P) -> Self
+    where
+        P: AsRef<std::path::Path>,
+    {
+        Self {
+            db: db.as_ref().to_path_buf(),
+        }
     }
 }
 
@@ -54,20 +64,29 @@ pub struct ArenaConfig {
 }
 
 impl ArenaConfig {
-    pub fn new(root: PathBuf, db: PathBuf, blob_dir: PathBuf) -> Self {
+    pub fn new<P1, P2, P3>(root: P1, db: P2, blob_dir: P3) -> Self
+    where
+        P1: AsRef<std::path::Path>,
+        P2: AsRef<std::path::Path>,
+        P3: AsRef<std::path::Path>,
+    {
         Self {
-            root: Some(root),
-            db,
-            blob_dir,
+            root: Some(root.as_ref().to_path_buf()),
+            db: db.as_ref().to_path_buf(),
+            blob_dir: blob_dir.as_ref().to_path_buf(),
             ..Default::default()
         }
     }
 
     /// Configure an arena without local root folder.
-    pub fn rootless(db: PathBuf, blob_dir: PathBuf) -> Self {
+    pub fn rootless<P1, P2>(db: P1, blob_dir: P2) -> Self
+    where
+        P1: AsRef<std::path::Path>,
+        P2: AsRef<std::path::Path>,
+    {
         Self {
-            db,
-            blob_dir,
+            db: db.as_ref().to_path_buf(),
+            blob_dir: blob_dir.as_ref().to_path_buf(),
             ..Default::default()
         }
     }

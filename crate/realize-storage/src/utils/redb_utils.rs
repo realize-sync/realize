@@ -1,6 +1,9 @@
 /// Open a redb database (async call).
-pub async fn open(path: &std::path::Path) -> anyhow::Result<redb::Database> {
-    let path = path.to_path_buf();
+pub async fn open<P>(path: P) -> anyhow::Result<redb::Database>
+where
+    P: AsRef<std::path::Path>,
+{
+    let path = path.as_ref().to_path_buf();
 
     Ok(tokio::task::spawn_blocking(move || redb::Database::create(path)).await??)
 }

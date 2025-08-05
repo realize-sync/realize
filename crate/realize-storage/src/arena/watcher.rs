@@ -35,7 +35,11 @@ pub struct RealWatcherBuilder {
 
 impl RealWatcherBuilder {
     /// Create a new builder for watching the given root directory with the specified index.
-    pub fn new(root: &std::path::Path, index: RealIndexAsync) -> Self {
+    pub fn new<P>(root: P, index: RealIndexAsync) -> Self
+    where
+        P: AsRef<std::path::Path>,
+    {
+        let root = root.as_ref();
         Self {
             root: root.to_path_buf(),
             index,
@@ -107,7 +111,10 @@ impl RealWatcherBuilder {
 
 impl RealWatcher {
     /// Create a builder for configuring and spawning a RealWatcher.
-    pub fn builder(root: &std::path::Path, index: RealIndexAsync) -> RealWatcherBuilder {
+    pub fn builder<P>(root: P, index: RealIndexAsync) -> RealWatcherBuilder
+    where
+        P: AsRef<std::path::Path>,
+    {
         RealWatcherBuilder::new(root, index)
     }
 
@@ -234,7 +241,11 @@ enum FsEvent {
 
 impl FsEvent {
     /// Create a [FsEvent] from a [notify::Event]
-    fn from_notify(root: &std::path::Path, ev: Event) -> Option<Self> {
+    fn from_notify<P>(root: P, ev: Event) -> Option<Self>
+    where
+        P: AsRef<std::path::Path>,
+    {
+        let root = root.as_ref();
         match ev.kind {
             EventKind::Remove(_) => take_path(root, ev).map(|p| FsEvent::Removed(p)),
             EventKind::Create(CreateKind::Folder) => {
@@ -266,7 +277,11 @@ impl FsEvent {
     }
 }
 
-fn take_path(root: &std::path::Path, mut ev: Event) -> Option<Path> {
+fn take_path<P>(root: P, mut ev: Event) -> Option<Path>
+where
+    P: AsRef<std::path::Path>,
+{
+    let root = root.as_ref();
     Path::from_real_path_in(&ev.paths.pop()?, root)
 }
 
@@ -646,7 +661,11 @@ impl RealWatcherWorker {
     }
 
     /// Convert a full path to a [realize_types::Path] within the arena, if possible.
-    fn relative_path(&self, path: &std::path::Path) -> Option<realize_types::Path> {
+    fn relative_path<P>(&self, path: P) -> Option<realize_types::Path>
+    where
+        P: AsRef<std::path::Path>,
+    {
+        let path = path.as_ref();
         // TODO: Should this use a PathResolver? We may or may not want
         // to care about partial/full files here.
         realize_types::Path::from_real_path_in(&path, &self.root)
@@ -663,7 +682,11 @@ impl RealWatcherWorker {
 /// Instead of duplicating the access rules of the OS, which might not
 /// be limited to the traditional unix rules, this function simply
 /// tries to open the file for reading.
-async fn file_is_readable(realpath: &std::path::Path) -> bool {
+async fn file_is_readable<P>(realpath: P) -> bool
+where
+    P: AsRef<std::path::Path>,
+{
+    let realpath = realpath.as_ref();
     File::open(realpath).await.is_ok()
 }
 
@@ -1642,7 +1665,11 @@ mod tests {
         Ok(())
     }
 
-    async fn make_inaccessible(path: &std::path::Path) -> anyhow::Result<()> {
+    async fn make_inaccessible<P>(path: P) -> anyhow::Result<()>
+    where
+        P: AsRef<std::path::Path>,
+    {
+        let path = path.as_ref();
         let m = fs::metadata(path).await?;
         let mut permissions = m.permissions();
         permissions.set_mode(0);
@@ -1651,7 +1678,11 @@ mod tests {
         Ok(())
     }
 
-    async fn make_accessible(path: &std::path::Path) -> anyhow::Result<()> {
+    async fn make_accessible<P>(path: P) -> anyhow::Result<()>
+    where
+        P: AsRef<std::path::Path>,
+    {
+        let path = path.as_ref();
         let m = fs::metadata(path).await?;
         let mut permissions = m.permissions();
         permissions.set_mode(if m.is_dir() { 0o770 } else { 0o660 });

@@ -8,10 +8,12 @@ use tokio::fs;
 ///
 /// The database and arena roots are put into the provided directory.
 /// Use [arena_root] to get the root path of a specific arena.
-pub async fn storage<T>(dir: &std::path::Path, arenas: T) -> anyhow::Result<Arc<Storage>>
+pub async fn storage<T, P>(dir: P, arenas: T) -> anyhow::Result<Arc<Storage>>
 where
     T: IntoIterator<Item = Arena>,
+    P: AsRef<std::path::Path>,
 {
+    let dir = dir.as_ref();
     let config = StorageConfig {
         arenas: arenas
             .into_iter()
@@ -50,6 +52,10 @@ where
 /// given arena.
 ///
 /// This is used by [storage].
-pub fn arena_root(root: &std::path::Path, arena: Arena) -> std::path::PathBuf {
+pub fn arena_root<P>(root: P, arena: Arena) -> std::path::PathBuf
+where
+    P: AsRef<std::path::Path>,
+{
+    let root = root.as_ref();
     root.join(arena.as_str())
 }
