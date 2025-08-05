@@ -242,7 +242,7 @@ mod tests {
         fn add_file_to_index(&self, path: &Path) -> anyhow::Result<()> {
             Ok(self
                 .index
-                .add_file(path, 100, &UnixTime::from_secs(1234567889), Hash([1; 32]))?)
+                .add_file(path, 100, UnixTime::from_secs(1234567889), Hash([1; 32]))?)
         }
 
         /// Add a file to the cache for testing

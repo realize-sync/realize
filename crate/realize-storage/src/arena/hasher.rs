@@ -76,7 +76,7 @@ impl Hasher {
     pub(crate) async fn hash_content(
         &self,
         path: &realize_types::Path,
-        mtime: &UnixTime,
+        mtime: UnixTime,
         size: u64,
     ) -> anyhow::Result<()> {
         Ok(self
@@ -164,7 +164,7 @@ async fn apply_verdict(
         }
         Verdict::FileContent(hash, mtime, size) => {
             if !index
-                .add_file_if_matches(root, path, size, &mtime, hash)
+                .add_file_if_matches(root, path, size, mtime, hash)
                 .await?
             {
                 log::debug!("Mismatch; skipped adding {path}");
@@ -283,7 +283,7 @@ mod tests {
 
         let mut history_rx = fixture.index.watch_history();
         hasher
-            .hash_content(&Path::parse("foo")?, &mtime, 12)
+            .hash_content(&Path::parse("foo")?, mtime, 12)
             .await?;
         tokio::time::timeout(Duration::from_secs(3), history_rx.changed()).await??;
 
@@ -304,7 +304,7 @@ mod tests {
         foo.write_str("")?;
         let mtime = UnixTime::mtime(&foo.path().metadata()?);
         let mut history_rx = fixture.index.watch_history();
-        hasher.hash_content(&Path::parse("foo")?, &mtime, 0).await?;
+        hasher.hash_content(&Path::parse("foo")?, mtime, 0).await?;
         tokio::time::timeout(Duration::from_secs(3), history_rx.changed()).await??;
 
         let entry = fixture.index.get_file(&Path::parse("foo")?).await?.unwrap();
@@ -326,17 +326,17 @@ mod tests {
 
         foo.write_str("one")?;
         hasher
-            .hash_content(&path, &UnixTime::mtime(&foo.path().metadata()?), 3)
+            .hash_content(&path, UnixTime::mtime(&foo.path().metadata()?), 3)
             .await?;
         foo.write_str("two!")?;
         hasher
-            .hash_content(&path, &UnixTime::mtime(&foo.path().metadata()?), 4)
+            .hash_content(&path, UnixTime::mtime(&foo.path().metadata()?), 4)
             .await?;
 
         foo.write_str("three")?;
         tokio::time::pause(); // new sleep calls returns immediately
         hasher
-            .hash_content(&path, &UnixTime::mtime(&foo.path().metadata()?), 5)
+            .hash_content(&path, UnixTime::mtime(&foo.path().metadata()?), 5)
             .await?;
 
         let mut history_rx = fixture.index.watch_history();
@@ -363,7 +363,7 @@ mod tests {
             .add_file(
                 &Path::parse("foo")?,
                 3,
-                &UnixTime::from_secs(1234567890),
+                UnixTime::from_secs(1234567890),
                 hash::digest("foo"),
             )
             .await?;
@@ -390,7 +390,7 @@ mod tests {
             .add_file(
                 &path,
                 3,
-                &UnixTime::from_secs(1234567890),
+                UnixTime::from_secs(1234567890),
                 hash::digest("foo"),
             )
             .await?;
@@ -401,7 +401,7 @@ mod tests {
         foo.write_str("new!")?;
         tokio::time::pause(); // new sleep calls returns immediately
         hasher
-            .hash_content(&path, &UnixTime::mtime(&foo.path().metadata()?), 4)
+            .hash_content(&path, UnixTime::mtime(&foo.path().metadata()?), 4)
             .await?;
 
         history_rx.changed().await?; // cannot use timeout when time paused

@@ -103,7 +103,7 @@ impl UnrealFs {
                 name: name.as_bytes().into(),
                 attr: match entry.assignment {
                     InodeAssignment::Directory => {
-                        self.build_dir_attr(entry.inode, &self.cache.dir_mtime(entry.inode).await?)
+                        self.build_dir_attr(entry.inode, *&self.cache.dir_mtime(entry.inode).await?)
                     }
                     InodeAssignment::File => self.build_file_attr(
                         entry.inode,
@@ -124,13 +124,13 @@ impl UnrealFs {
         let (file_metadata, dir_mtime) =
             tokio::join!(self.cache.file_metadata(id), self.cache.dir_mtime(id));
         if let Ok(mtime) = dir_mtime {
-            return Ok(self.build_dir_attr(id, &mtime));
+            return Ok(self.build_dir_attr(id, mtime));
         }
         Ok(self.build_file_attr(id, &file_metadata?))
     }
 
     fn build_file_attr(&self, inode: Inode, metadata: &FileMetadata) -> fattr3 {
-        let mtime = to_nfs_time(&metadata.mtime);
+        let mtime = to_nfs_time(metadata.mtime);
 
         fattr3 {
             ftype: ftype3::NF3REG,
@@ -149,7 +149,7 @@ impl UnrealFs {
         }
     }
 
-    fn build_dir_attr(&self, inode: Inode, mtime: &UnixTime) -> fattr3 {
+    fn build_dir_attr(&self, inode: Inode, mtime: UnixTime) -> fattr3 {
         let mtime = to_nfs_time(mtime);
         fattr3 {
             ftype: ftype3::NF3DIR,
@@ -337,7 +337,7 @@ fn io_to_nfsstat3(err: &std::io::Error) -> nfsstat3 {
     }
 }
 
-fn to_nfs_time(time: &UnixTime) -> nfstime3 {
+fn to_nfs_time(time: UnixTime) -> nfstime3 {
     nfstime3 {
         seconds: time.as_secs() as u32,
         nseconds: time.subsec_nanos(),

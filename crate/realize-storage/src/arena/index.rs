@@ -129,11 +129,11 @@ impl RealIndexBlocking {
         &self,
         path: &realize_types::Path,
         size: u64,
-        mtime: &UnixTime,
+        mtime: UnixTime,
     ) -> Result<bool, StorageError> {
         Ok(self
             .get_file(path)?
-            .map(|e| e.size == size && e.mtime == *mtime)
+            .map(|e| e.size == size && e.mtime == mtime)
             .unwrap_or(false))
     }
 
@@ -142,7 +142,7 @@ impl RealIndexBlocking {
         &self,
         path: &realize_types::Path,
         size: u64,
-        mtime: &UnixTime,
+        mtime: UnixTime,
         hash: Hash,
     ) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
@@ -157,7 +157,7 @@ impl RealIndexBlocking {
         root: &std::path::Path,
         path: &realize_types::Path,
         size: u64,
-        mtime: &UnixTime,
+        mtime: UnixTime,
         hash: Hash,
     ) -> Result<bool, StorageError> {
         let txn = self.db.begin_write()?;
@@ -175,7 +175,7 @@ impl RealIndexBlocking {
         txn: &ArenaWriteTransaction,
         path: &realize_types::Path,
         size: u64,
-        mtime: &UnixTime,
+        mtime: UnixTime,
         hash: Hash,
     ) -> Result<IndexedFileTableEntry, StorageError> {
         let mut file_table = txn.index_file_table()?;
@@ -661,13 +661,13 @@ impl RealIndexAsync {
         &self,
         path: &realize_types::Path,
         size: u64,
-        mtime: &UnixTime,
+        mtime: UnixTime,
     ) -> Result<bool, StorageError> {
         let inner = Arc::clone(&self.inner);
         let path = path.clone();
         let mtime = mtime.clone();
 
-        task::spawn_blocking(move || inner.has_matching_file(&path, size, &mtime)).await?
+        task::spawn_blocking(move || inner.has_matching_file(&path, size, mtime)).await?
     }
 
     /// Remove a path that can be a file or a directory.
@@ -685,14 +685,14 @@ impl RealIndexAsync {
         &self,
         path: &realize_types::Path,
         size: u64,
-        mtime: &UnixTime,
+        mtime: UnixTime,
         hash: Hash,
     ) -> Result<(), StorageError> {
         let inner = Arc::clone(&self.inner);
         let path = path.clone();
         let mtime = mtime.clone();
 
-        task::spawn_blocking(move || inner.add_file(&path, size, &mtime, hash)).await?
+        task::spawn_blocking(move || inner.add_file(&path, size, mtime, hash)).await?
     }
 
     pub async fn add_file_if_matches(
@@ -700,7 +700,7 @@ impl RealIndexAsync {
         root: &std::path::Path,
         path: &realize_types::Path,
         size: u64,
-        mtime: &UnixTime,
+        mtime: UnixTime,
         hash: Hash,
     ) -> Result<bool, StorageError> {
         let inner = Arc::clone(&self.inner);
@@ -708,7 +708,7 @@ impl RealIndexAsync {
         let mtime = mtime.clone();
         let root = root.to_path_buf();
 
-        task::spawn_blocking(move || inner.add_file_if_matches(&root, &path, size, &mtime, hash))
+        task::spawn_blocking(move || inner.add_file_if_matches(&root, &path, size, mtime, hash))
             .await?
     }
 
@@ -847,7 +847,7 @@ mod tests {
             self.index.add_file(
                 &path,
                 content.len() as u64,
-                &UnixTime::mtime(&m),
+                UnixTime::mtime(&m),
                 hash.clone(),
             )?;
 
@@ -885,7 +885,7 @@ mod tests {
         let index = &fixture.index;
         let mtime = UnixTime::from_secs(1234567890);
         let path = realize_types::Path::parse("foo/bar.txt")?;
-        index.add_file(&path, 100, &mtime, Hash([0xfa; 32]))?;
+        index.add_file(&path, 100, mtime, Hash([0xfa; 32]))?;
 
         {
             let txn = index.db.begin_read()?;
@@ -924,7 +924,7 @@ mod tests {
             fixture.root.path(),
             &realize_types::Path::parse("foo")?,
             3,
-            &UnixTime::mtime(&foo.path().metadata()?),
+            UnixTime::mtime(&foo.path().metadata()?),
             hash::digest("foo"),
         )?);
         assert!(index.has_file(&realize_types::Path::parse("foo")?)?);
@@ -944,7 +944,7 @@ mod tests {
             fixture.root.path(),
             &realize_types::Path::parse("foo")?,
             3,
-            &UnixTime::from_secs(1234567890),
+            UnixTime::from_secs(1234567890),
             hash::digest("foo"),
         )?);
         assert!(!index.has_file(&realize_types::Path::parse("foo")?)?);
@@ -964,7 +964,7 @@ mod tests {
             fixture.root.path(),
             &realize_types::Path::parse("foo")?,
             2,
-            &UnixTime::mtime(&foo.path().metadata()?),
+            UnixTime::mtime(&foo.path().metadata()?),
             hash::digest("foo"),
         )?);
         assert!(!index.has_file(&realize_types::Path::parse("foo")?)?);
@@ -986,7 +986,7 @@ mod tests {
             fixture.root.path(),
             &realize_types::Path::parse("foo")?,
             3,
-            &mtime,
+            mtime,
             hash::digest("foo"),
         )?);
         assert!(!index.has_file(&realize_types::Path::parse("foo")?)?);
@@ -1002,8 +1002,8 @@ mod tests {
         let mtime1 = UnixTime::from_secs(1234567890);
         let mtime2 = UnixTime::from_secs(1234567891);
         let path = realize_types::Path::parse("foo/bar.txt")?;
-        index.add_file(&path, 100, &mtime1, Hash([0xfa; 32]))?;
-        index.add_file(&path, 200, &mtime2, Hash([0x07; 32]))?;
+        index.add_file(&path, 100, mtime1, Hash([0xfa; 32]))?;
+        index.add_file(&path, 200, mtime2, Hash([0x07; 32]))?;
 
         {
             let txn = index.db.begin_read()?;
@@ -1037,7 +1037,7 @@ mod tests {
         let index = &fixture.index;
         let mtime = UnixTime::from_secs(1234567890);
         let path = realize_types::Path::parse("foo/bar")?;
-        index.add_file(&path, 100, &mtime, Hash([0xfa; 32]))?;
+        index.add_file(&path, 100, mtime, Hash([0xfa; 32]))?;
 
         assert_eq!(true, fixture.index.has_file(&path)?);
         assert_eq!(
@@ -1060,7 +1060,7 @@ mod tests {
         let mtime = UnixTime::from_secs(1234567890);
         let path = realize_types::Path::parse("foo/bar")?;
         let hash = Hash([0xfa; 32]);
-        index.add_file(&path, 100, &mtime, hash.clone())?;
+        index.add_file(&path, 100, mtime, hash.clone())?;
 
         assert_eq!(
             Some(IndexedFileTableEntry {
@@ -1082,17 +1082,17 @@ mod tests {
         let index = &fixture.index;
         let mtime = UnixTime::from_secs(1234567890);
         let path = realize_types::Path::parse("foo/bar")?;
-        index.add_file(&path, 100, &mtime, Hash([0xfa; 32]))?;
+        index.add_file(&path, 100, mtime, Hash([0xfa; 32]))?;
 
-        assert_eq!(true, fixture.index.has_matching_file(&path, 100, &mtime)?);
+        assert_eq!(true, fixture.index.has_matching_file(&path, 100, mtime)?);
         assert_eq!(
             false,
-            index.has_matching_file(&realize_types::Path::parse("other")?, 100, &mtime)?
+            index.has_matching_file(&realize_types::Path::parse("other")?, 100, mtime)?
         );
-        assert_eq!(false, fixture.index.has_matching_file(&path, 200, &mtime)?);
+        assert_eq!(false, fixture.index.has_matching_file(&path, 200, mtime)?);
         assert_eq!(
             false,
-            index.has_matching_file(&path, 100, &UnixTime::from_secs(1234567891))?
+            index.has_matching_file(&path, 100, UnixTime::from_secs(1234567891))?
         );
 
         Ok(())
@@ -1105,7 +1105,7 @@ mod tests {
         let index = &fixture.index;
         let mtime = UnixTime::from_secs(1234567890);
         let path = realize_types::Path::parse("foo/bar.txt")?;
-        index.add_file(&path, 100, &mtime, Hash([0xfa; 32]))?;
+        index.add_file(&path, 100, mtime, Hash([0xfa; 32]))?;
         index.remove_file_or_dir(&path)?;
 
         assert_eq!(false, index.has_file(&path)?);
@@ -1130,7 +1130,7 @@ mod tests {
         let index = &fixture.index;
         let mtime = UnixTime::from_secs(1234567890);
         let path = realize_types::Path::parse("bar.txt")?;
-        index.add_file(&path, 100, &mtime, Hash([0xfa; 32]))?;
+        index.add_file(&path, 100, mtime, Hash([0xfa; 32]))?;
         assert!(index.remove_file_if_missing(&fixture.root, &path)?);
 
         assert_eq!(false, index.has_file(&path)?);
@@ -1146,7 +1146,7 @@ mod tests {
         let index = &fixture.index;
         let mtime = UnixTime::from_secs(1234567890);
         let path = realize_types::Path::parse("bar.txt")?;
-        index.add_file(&path, 100, &mtime, Hash([0xfa; 32]))?;
+        index.add_file(&path, 100, mtime, Hash([0xfa; 32]))?;
 
         let realpath = path.within(&fixture.root);
         fs::write(&realpath, "foo")?;
@@ -1169,25 +1169,25 @@ mod tests {
         index.add_file(
             &realize_types::Path::parse("foo/a")?,
             100,
-            &mtime,
+            mtime,
             Hash([1; 32]),
         )?;
         index.add_file(
             &realize_types::Path::parse("foo/b")?,
             100,
-            &mtime,
+            mtime,
             Hash([2; 32]),
         )?;
         index.add_file(
             &realize_types::Path::parse("foo/c")?,
             100,
-            &mtime,
+            mtime,
             Hash([3; 32]),
         )?;
         index.add_file(
             &realize_types::Path::parse("foobar")?,
             100,
-            &mtime,
+            mtime,
             Hash([0x04; 32]),
         )?;
 
@@ -1272,7 +1272,7 @@ mod tests {
             .add_file(
                 &realize_types::Path::parse("baa.txt")?,
                 100,
-                &mtime,
+                mtime,
                 hash.clone(),
             )
             .await?;
@@ -1280,7 +1280,7 @@ mod tests {
             .add_file(
                 &realize_types::Path::parse("baa/baa.txt")?,
                 200,
-                &mtime,
+                mtime,
                 hash.clone(),
             )
             .await?;
@@ -1288,7 +1288,7 @@ mod tests {
             .add_file(
                 &realize_types::Path::parse("baa/baa/black/sheep.txt")?,
                 300,
-                &mtime,
+                mtime,
                 hash.clone(),
             )
             .await?;
@@ -1322,19 +1322,19 @@ mod tests {
         index.add_file(
             &realize_types::Path::parse("foo/a")?,
             100,
-            &mtime,
+            mtime,
             Hash([1; 32]),
         )?;
         index.add_file(
             &realize_types::Path::parse("foo/b")?,
             100,
-            &mtime,
+            mtime,
             Hash([2; 32]),
         )?;
         index.add_file(
             &realize_types::Path::parse("foo/c")?,
             100,
-            &mtime,
+            mtime,
             Hash([3; 32]),
         )?;
         assert_eq!(3, index.last_history_index()?);
@@ -1355,9 +1355,9 @@ mod tests {
         let foo_a = realize_types::Path::parse("foo/a")?;
         let foo_b = realize_types::Path::parse("foo/b")?;
         let foo_c = realize_types::Path::parse("foo/c")?;
-        index.add_file(&foo_a, 100, &mtime, Hash([1; 32]))?;
-        index.add_file(&foo_b, 100, &mtime, Hash([2; 32]))?;
-        index.add_file(&foo_c, 100, &mtime, Hash([3; 32]))?;
+        index.add_file(&foo_a, 100, mtime, Hash([1; 32]))?;
+        index.add_file(&foo_b, 100, mtime, Hash([2; 32]))?;
+        index.add_file(&foo_c, 100, mtime, Hash([3; 32]))?;
         index.remove_file_or_dir(&realize_types::Path::parse("foo")?)?;
 
         let all = fixture.aindex.history(0..).try_collect::<Vec<_>>().await?;
@@ -1408,7 +1408,7 @@ mod tests {
         index.add_file(
             &realize_types::Path::parse("foo/a")?,
             100,
-            &mtime,
+            mtime,
             Hash([1; 32]),
         )?;
         assert_eq!(true, history_rx.has_changed()?);
@@ -1416,13 +1416,13 @@ mod tests {
         index.add_file(
             &realize_types::Path::parse("foo/b")?,
             100,
-            &mtime,
+            mtime,
             Hash([2; 32]),
         )?;
         index.add_file(
             &realize_types::Path::parse("foo/c")?,
             100,
-            &mtime,
+            mtime,
             Hash([3; 32]),
         )?;
         assert_eq!(3, *history_rx.wait_for(|v| *v >= 3).await?);
@@ -1443,19 +1443,19 @@ mod tests {
         index.add_file(
             &realize_types::Path::parse("foo/a")?,
             100,
-            &mtime,
+            mtime,
             Hash([1; 32]),
         )?;
         index.add_file(
             &realize_types::Path::parse("foo/b")?,
             100,
-            &mtime,
+            mtime,
             Hash([2; 32]),
         )?;
         index.add_file(
             &realize_types::Path::parse("foo/c")?,
             100,
-            &mtime,
+            mtime,
             Hash([3; 32]),
         )?;
 
@@ -1472,15 +1472,15 @@ mod tests {
         let mtime1 = UnixTime::from_secs(1234567890);
         let mtime2 = UnixTime::from_secs(1234567891);
         let path = realize_types::Path::parse("foo/bar.txt")?;
-        index.add_file(&path, 100, &mtime1, Hash([0xfa; 32]))?;
+        index.add_file(&path, 100, mtime1, Hash([0xfa; 32]))?;
         let hist_entry_count = index.last_history_index()?;
-        index.add_file(&path, 100, &mtime2, Hash([0xfa; 32]))?;
+        index.add_file(&path, 100, mtime2, Hash([0xfa; 32]))?;
 
         // No new history entry should have been added, since the file didn't really change.
         assert_eq!(hist_entry_count, index.last_history_index()?);
 
         // The new mtime should have been stored.
-        assert!(index.has_matching_file(&path, 100, &mtime2)?);
+        assert!(index.has_matching_file(&path, 100, mtime2)?);
 
         Ok(())
     }
@@ -1493,7 +1493,7 @@ mod tests {
 
         // Add a single file
         let path = realize_types::Path::parse("foo/bar.txt")?;
-        index.add_file(&path, 100, &mtime, Hash([0xfa; 32]))?;
+        index.add_file(&path, 100, mtime, Hash([0xfa; 32]))?;
 
         fixture.clear_all_dirty()?;
 
@@ -1530,7 +1530,7 @@ mod tests {
         // Add files in a directory structure
         let files = vec![&foo_a, &foo_b, &foo_c, &foo_d, &foo_file, &foodie, &bar];
         for file in files {
-            index.add_file(file, 100, &mtime, Hash([0xfa; 32]))?;
+            index.add_file(file, 100, mtime, Hash([0xfa; 32]))?;
         }
 
         fixture.clear_all_dirty()?;
@@ -1599,7 +1599,7 @@ mod tests {
         ];
 
         for file in &files {
-            index.add_file(file, 100, &mtime, Hash([0xfa; 32]))?;
+            index.add_file(file, 100, mtime, Hash([0xfa; 32]))?;
         }
 
         fixture.clear_all_dirty()?;
@@ -1650,7 +1650,7 @@ mod tests {
         ];
 
         for file in &valid_files {
-            index.add_file(file, 100, &mtime, Hash([0xfa; 32]))?;
+            index.add_file(file, 100, mtime, Hash([0xfa; 32]))?;
         }
 
         // Manually insert an invalid path into the file table; it should be skipped
@@ -1700,7 +1700,7 @@ mod tests {
         let hash = Hash([0xfa; 32]);
 
         // Add a file to the index
-        index.add_file(&path, 100, &mtime, hash.clone())?;
+        index.add_file(&path, 100, mtime, hash.clone())?;
 
         // Create a notification for a different arena
         let notification = Notification::Replace {
@@ -1741,7 +1741,7 @@ mod tests {
         let new_hash = Hash([0x07; 32]);
 
         // Add a file to the index
-        index.add_file(&path, 100, &mtime, old_hash.clone())?;
+        index.add_file(&path, 100, mtime, old_hash.clone())?;
 
         // Create a replace notification that matches the current hash
         let notification = Notification::Replace {
@@ -1840,7 +1840,7 @@ mod tests {
         let new_hash = Hash([0x42; 32]);
 
         // Add a file to the index
-        index.add_file(&path, 100, &mtime, current_hash.clone())?;
+        index.add_file(&path, 100, mtime, current_hash.clone())?;
 
         // Create a replace notification that doesn't match the current hash
         let notification = Notification::Replace {
@@ -1915,7 +1915,7 @@ mod tests {
         let metadata = std::fs::metadata(&file_path)?;
         let size = metadata.len();
         let mtime = UnixTime::mtime(&metadata);
-        index.add_file(&path, size, &mtime, hash.clone())?;
+        index.add_file(&path, size, mtime, hash.clone())?;
 
         // Create a remove notification that matches the current hash
         let notification = Notification::Remove {
@@ -1962,7 +1962,7 @@ mod tests {
         let metadata = std::fs::metadata(&file_path)?;
         let size = metadata.len();
         let mtime = UnixTime::mtime(&metadata);
-        index.add_file(&path, size, &mtime, original_hash.clone())?;
+        index.add_file(&path, size, mtime, original_hash.clone())?;
 
         // Add a file to the index with an outdated_by entry
         {
@@ -2027,7 +2027,7 @@ mod tests {
         let metadata = std::fs::metadata(&file_path)?;
         let size = metadata.len();
         let mtime = UnixTime::mtime(&metadata);
-        index.add_file(&path, size, &mtime, current_hash.clone())?;
+        index.add_file(&path, size, mtime, current_hash.clone())?;
 
         // Create a remove notification that doesn't match the current hash
         let notification = Notification::Remove {
@@ -2097,7 +2097,7 @@ mod tests {
         std::fs::write(&file_path, "different content")?;
 
         // Add a file to the index
-        index.add_file(&path, 12, &mtime, hash.clone())?;
+        index.add_file(&path, 12, mtime, hash.clone())?;
 
         // Create a remove notification that matches the current hash
         let notification = Notification::Remove {
@@ -2137,7 +2137,7 @@ mod tests {
         let hash = Hash([0xfa; 32]);
 
         // Add a file to the index
-        index.add_file(&path, 12, &mtime, hash.clone())?;
+        index.add_file(&path, 12, mtime, hash.clone())?;
 
         // Create a remove notification that matches the current hash
         let notification = Notification::Remove {
@@ -2174,7 +2174,7 @@ mod tests {
         let hash = Hash([0xfa; 32]);
 
         // Add a file to the index
-        index.add_file(&path, 12, &mtime, hash.clone())?;
+        index.add_file(&path, 12, mtime, hash.clone())?;
 
         // Test Add notification (should be ignored)
         let add_notification = Notification::Add {
@@ -2356,7 +2356,7 @@ mod tests {
         fixture.index.add_file(
             &path,
             content.len() as u64,
-            &UnixTime::from_secs(1234567890),
+            UnixTime::from_secs(1234567890),
             hash.clone(),
         )?;
 
@@ -2560,7 +2560,7 @@ mod tests {
         fixture.index.add_file(
             &path,
             content.len() as u64,
-            &UnixTime::from_secs(1234567890),
+            UnixTime::from_secs(1234567890),
             hash.clone(),
         )?;
 

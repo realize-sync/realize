@@ -168,7 +168,7 @@ mod tests {
                 .add_file(
                     &path,
                     content.len() as u64,
-                    &UnixTime::mtime(&m),
+                    UnixTime::mtime(&m),
                     hash.clone(),
                 )
                 .await?;

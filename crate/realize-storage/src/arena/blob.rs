@@ -650,7 +650,7 @@ mod tests {
             &self,
             path: &Path,
             size: u64,
-            mtime: &UnixTime,
+            mtime: UnixTime,
         ) -> anyhow::Result<()> {
             self.acache.update(
                 test_peer(),
@@ -925,7 +925,7 @@ mod tests {
         let acache = &fixture.acache;
         let file_path = Path::parse("foobar")?;
 
-        fixture.add_file_with_mtime(&file_path, 10000, &test_time())?;
+        fixture.add_file_with_mtime(&file_path, 10000, test_time())?;
         let (inode, _) = acache.lookup_path(&file_path)?;
 
         let blob_id = {
@@ -962,7 +962,7 @@ mod tests {
         let file_path = Path::parse("file.txt")?;
 
         // Create a file
-        fixture.add_file_with_mtime(&file_path, 100, &test_time())?;
+        fixture.add_file_with_mtime(&file_path, 100, test_time())?;
 
         // Open the file to create a blob
         let (inode, _) = acache.lookup_path(&file_path)?;
@@ -1002,7 +1002,7 @@ mod tests {
         let file_path = Path::parse("file.txt")?;
 
         // Create a file
-        fixture.add_file_with_mtime(&file_path, 100, &test_time())?;
+        fixture.add_file_with_mtime(&file_path, 100, test_time())?;
 
         // Open the file to create a blob
         let (inode, _) = acache.lookup_path(&file_path)?;
@@ -1032,7 +1032,7 @@ mod tests {
         let file_path = Path::parse("file.txt")?;
 
         // Create a file
-        fixture.add_file_with_mtime(&file_path, 100, &test_time())?;
+        fixture.add_file_with_mtime(&file_path, 100, test_time())?;
 
         // Open the file to create a blob
         let (inode, _) = acache.lookup_path(&file_path)?;
@@ -1069,7 +1069,7 @@ mod tests {
         let file_path = Path::parse("file.txt")?;
 
         // Create a file
-        fixture.add_file_with_mtime(&file_path, 1000, &test_time())?;
+        fixture.add_file_with_mtime(&file_path, 1000, test_time())?;
 
         // Open the file to create a blob
         let (inode, _) = acache.lookup_path(&file_path)?;
@@ -1129,7 +1129,7 @@ mod tests {
         let file_path = Path::parse("test.txt")?;
 
         // Create a file and add it to the cache
-        fixture.add_file_with_mtime(&file_path, 100, &test_time())?;
+        fixture.add_file_with_mtime(&file_path, 100, test_time())?;
 
         // Open the file to create a blob
         let (inode, _) = acache.lookup_path(&file_path)?;
@@ -1177,7 +1177,7 @@ mod tests {
         let file_path = Path::parse("test.txt")?;
 
         // Create a file and add it to the cache
-        fixture.add_file_with_mtime(&file_path, 100, &test_time())?;
+        fixture.add_file_with_mtime(&file_path, 100, test_time())?;
 
         // Open the file to create a blob
         let (inode, _) = acache.lookup_path(&file_path)?;
@@ -1222,7 +1222,7 @@ mod tests {
         let file_path = Path::parse("test.txt")?;
 
         // Create a file and add it to the cache
-        fixture.add_file_with_mtime(&file_path, 100, &test_time())?;
+        fixture.add_file_with_mtime(&file_path, 100, test_time())?;
 
         // Open the file to create a blob
         let (inode, _) = acache.lookup_path(&file_path)?;
@@ -1290,7 +1290,7 @@ mod tests {
         let file_path = Path::parse("test.txt")?;
 
         // Create a file and add it to the cache
-        fixture.add_file_with_mtime(&file_path, 34, &test_time())?;
+        fixture.add_file_with_mtime(&file_path, 34, test_time())?;
 
         // Open the file to create a blob
         let (inode, _) = acache.lookup_path(&file_path)?;

@@ -633,14 +633,14 @@ impl RealWatcherWorker {
         let size = m.len();
         if self
             .index
-            .has_matching_file(path, size, &mtime)
+            .has_matching_file(path, size, mtime)
             .await
             .unwrap_or(false)
         {
             return Ok(());
         }
         log::debug!("[{}] Requesting hash of {path}", self.index.arena());
-        self.hasher.hash_content(path, &mtime, size).await?;
+        self.hasher.hash_content(path, mtime, size).await?;
 
         Ok(())
     }
@@ -845,7 +845,7 @@ mod tests {
         foobar.write_str("boo")?;
         let mtime = UnixTime::mtime(&fs::metadata(foobar.path()).await?);
         fixture.wait_for_history_event(2).await?;
-        assert!(fixture.index.has_matching_file(&path, 3, &mtime).await?);
+        assert!(fixture.index.has_matching_file(&path, 3, mtime).await?);
 
         Ok(())
     }
@@ -1153,8 +1153,8 @@ mod tests {
         let foo = realize_types::Path::parse("foo")?;
         let bar = realize_types::Path::parse("a/b/c/bar")?;
         let mtime = UnixTime::from_secs(1234567890);
-        index.add_file(&foo, 4, &mtime, Hash([1; 32])).await?;
-        index.add_file(&bar, 4, &mtime, Hash([2; 32])).await?;
+        index.add_file(&foo, 4, mtime, Hash([1; 32])).await?;
+        index.add_file(&bar, 4, mtime, Hash([2; 32])).await?;
 
         let _watcher = fixture.scan_and_watch().await?;
 
@@ -1181,7 +1181,7 @@ mod tests {
             .add_file(
                 &foo,
                 3,
-                &UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
+                UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
                 hash::digest("foo".as_bytes()),
             )
             .await?;
@@ -1189,7 +1189,7 @@ mod tests {
             .add_file(
                 &bar,
                 3,
-                &UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
+                UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
                 hash::digest("bar".as_bytes()),
             )
             .await?;
@@ -1241,7 +1241,7 @@ mod tests {
             .add_file(
                 &foo,
                 3,
-                &UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
+                UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
                 hash::digest("foo".as_bytes()),
             )
             .await?;
@@ -1249,7 +1249,7 @@ mod tests {
             .add_file(
                 &bar,
                 3,
-                &UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
+                UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
                 hash::digest("bar".as_bytes()),
             )
             .await?;
@@ -1283,7 +1283,7 @@ mod tests {
             .add_file(
                 &foo,
                 3,
-                &UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
+                UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
                 hash::digest("foo".as_bytes()),
             )
             .await?;
@@ -1291,7 +1291,7 @@ mod tests {
             .add_file(
                 &bar,
                 3,
-                &UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
+                UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
                 hash::digest("bar".as_bytes()),
             )
             .await?;
@@ -1423,7 +1423,7 @@ mod tests {
             .add_file(
                 &foo,
                 3,
-                &UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
+                UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
                 hash::digest("foo".as_bytes()),
             )
             .await?;
@@ -1431,7 +1431,7 @@ mod tests {
             .add_file(
                 &bar,
                 3,
-                &UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
+                UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
                 hash::digest("bar".as_bytes()),
             )
             .await?;
@@ -1461,7 +1461,7 @@ mod tests {
             .add_file(
                 &foo,
                 3,
-                &UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
+                UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
                 hash::digest("foo".as_bytes()),
             )
             .await?;
@@ -1586,7 +1586,7 @@ mod tests {
             .add_file(
                 &excluded,
                 4,
-                &UnixTime::mtime(&fs::metadata(excluded_child.path()).await?),
+                UnixTime::mtime(&fs::metadata(excluded_child.path()).await?),
                 hash::digest("test".as_bytes()),
             )
             .await?;
@@ -1594,7 +1594,7 @@ mod tests {
             .add_file(
                 &excluded_too,
                 4,
-                &UnixTime::mtime(&fs::metadata(excluded_too_child.path()).await?),
+                UnixTime::mtime(&fs::metadata(excluded_too_child.path()).await?),
                 hash::digest("test".as_bytes()),
             )
             .await?;

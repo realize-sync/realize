@@ -1116,7 +1116,7 @@ mod tests {
             Ok(self.acache.dir_mtime(inode)?)
         }
 
-        fn add_file(&self, path: &Path, size: u64, mtime: &UnixTime) -> anyhow::Result<()> {
+        fn add_file(&self, path: &Path, size: u64, mtime: UnixTime) -> anyhow::Result<()> {
             self.acache.update(
                 test_peer(),
                 Notification::Add {
@@ -1154,7 +1154,7 @@ mod tests {
         let file_path = Path::parse("a/b/c.txt")?;
         let mtime = test_time();
 
-        fixture.add_file(&file_path, 100, &mtime)?;
+        fixture.add_file(&file_path, 100, mtime)?;
 
         let entry = acache.lookup(acache.arena_root(), "a")?;
         assert_eq!(entry.assignment, InodeAssignment::Directory, "a");
@@ -1171,12 +1171,12 @@ mod tests {
         let fixture = Fixture::setup_with_arena(arena).await?;
         let mtime = test_time();
         let path1 = Path::parse("a/b/1.txt")?;
-        fixture.add_file(&path1, 100, &mtime)?;
+        fixture.add_file(&path1, 100, mtime)?;
         let dir = Path::parse("a/b")?;
         let dir_mtime = fixture.dir_mtime(&dir)?;
 
         let path2 = Path::parse("a/b/2.txt")?;
-        fixture.add_file(&path2, 100, &mtime)?;
+        fixture.add_file(&path2, 100, mtime)?;
 
         assert!(fixture.dir_mtime(&dir)? > dir_mtime);
         Ok(())
@@ -1187,7 +1187,7 @@ mod tests {
         let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let file_path = Path::parse("a/b/c.txt")?;
 
-        fixture.add_file(&file_path, 100, &test_time())?;
+        fixture.add_file(&file_path, 100, test_time())?;
 
         assert!(engine::is_dirty(&fixture.begin_read()?, &file_path)?);
 
@@ -1316,8 +1316,8 @@ mod tests {
         let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let file_path = Path::parse("file.txt")?;
 
-        fixture.add_file(&file_path, 100, &test_time())?;
-        fixture.add_file(&file_path, 200, &test_time())?;
+        fixture.add_file(&file_path, 100, test_time())?;
+        fixture.add_file(&file_path, 200, test_time())?;
 
         let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
@@ -1372,7 +1372,7 @@ mod tests {
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
 
-        fixture.add_file(&file_path, 100, &mtime)?;
+        fixture.add_file(&file_path, 100, mtime)?;
         let arena_root = acache.arena_root();
         acache.lookup(arena_root, "file.txt")?;
         fixture.remove_file(&file_path)?;
@@ -1391,7 +1391,7 @@ mod tests {
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
 
-        fixture.add_file(&file_path, 100, &mtime)?;
+        fixture.add_file(&file_path, 100, mtime)?;
         let arena_root = acache.arena_root();
         acache.lookup(arena_root, "file.txt")?;
 
@@ -1409,7 +1409,7 @@ mod tests {
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
 
-        fixture.add_file(&file_path, 100, &mtime)?;
+        fixture.add_file(&file_path, 100, mtime)?;
         let arena_root = fixture.acache.arena_root();
         let dir_mtime = fixture.acache.dir_mtime(arena_root)?;
         fixture.remove_file(&file_path)?;
@@ -1427,7 +1427,7 @@ mod tests {
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
 
-        fixture.add_file(&file_path, 100, &mtime)?;
+        fixture.add_file(&file_path, 100, mtime)?;
         acache.update(
             test_peer(),
             Notification::Remove {
@@ -1454,7 +1454,7 @@ mod tests {
         let file_path = Path::parse("a/file.txt")?;
         let mtime = test_time();
 
-        fixture.add_file(&file_path, 100, &mtime)?;
+        fixture.add_file(&file_path, 100, mtime)?;
 
         // Lookup directory
         let dir_entry = acache.lookup(acache.arena_root(), "a")?;
@@ -1492,7 +1492,7 @@ mod tests {
         let path = Path::parse("a/b/c/file.txt")?;
         let mtime = test_time();
 
-        fixture.add_file(&path, 100, &mtime)?;
+        fixture.add_file(&path, 100, mtime)?;
 
         let (inode, assignment) = acache.lookup_path(&path)?;
         assert_eq!(assignment, InodeAssignment::File);
@@ -1511,9 +1511,9 @@ mod tests {
         let acache = &fixture.acache;
         let mtime = test_time();
 
-        fixture.add_file(&Path::parse("dir/file1.txt")?, 100, &mtime)?;
-        fixture.add_file(&Path::parse("dir/file2.txt")?, 200, &mtime)?;
-        fixture.add_file(&Path::parse("dir/subdir/file3.txt")?, 300, &mtime)?;
+        fixture.add_file(&Path::parse("dir/file1.txt")?, 100, mtime)?;
+        fixture.add_file(&Path::parse("dir/file2.txt")?, 200, mtime)?;
+        fixture.add_file(&Path::parse("dir/subdir/file3.txt")?, 300, mtime)?;
 
         let arena_root = acache.arena_root();
         assert_unordered::assert_eq_unordered!(
@@ -2023,7 +2023,7 @@ mod tests {
 
         // Add a single file
         let file_path = Path::parse("foo/bar.txt")?;
-        fixture.add_file(&file_path, 100, &mtime)?;
+        fixture.add_file(&file_path, 100, mtime)?;
         fixture.clear_dirty()?;
 
         // Mark the file dirty recursively
@@ -2060,7 +2060,7 @@ mod tests {
         let e = Path::parse("bar/e.txt")?;
 
         for file in vec![&a, &b, &c, &d, &e] {
-            fixture.add_file(file, 100, &mtime)?;
+            fixture.add_file(file, 100, mtime)?;
         }
         fixture.clear_dirty()?;
 
@@ -2104,7 +2104,7 @@ mod tests {
         let e = Path::parse("foo/other/e.txt")?;
 
         for file in vec![&a, &b, &c, &d, &e] {
-            fixture.add_file(file, 100, &mtime)?;
+            fixture.add_file(file, 100, mtime)?;
         }
         fixture.clear_dirty()?;
 
@@ -2144,7 +2144,7 @@ mod tests {
         // Add some files
         for file in vec!["foo/a.txt", "bar/b.txt"] {
             let path = Path::parse(file)?;
-            fixture.add_file(&path, 100, &mtime)?;
+            fixture.add_file(&path, 100, mtime)?;
         }
         fixture.clear_dirty()?;
 
@@ -2180,7 +2180,7 @@ mod tests {
         // Add some files
         for file in vec!["foo/a.txt", "bar/b.txt"] {
             let path = Path::parse(file)?;
-            fixture.add_file(&path, 100, &mtime)?;
+            fixture.add_file(&path, 100, mtime)?;
         }
         fixture.clear_dirty()?;
 
@@ -2219,7 +2219,7 @@ mod tests {
 
         let mtime = test_time();
         for file in &files {
-            fixture.add_file(file, 100, &mtime)?;
+            fixture.add_file(file, 100, mtime)?;
         }
         fixture.clear_dirty()?;
 
@@ -2249,7 +2249,7 @@ mod tests {
         let mtime = test_time();
 
         // Add a file without opening it (so no blob is created)
-        fixture.add_file(&file_path, 100, &mtime)?;
+        fixture.add_file(&file_path, 100, mtime)?;
 
         let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
@@ -2267,7 +2267,7 @@ mod tests {
         let mtime = test_time();
 
         // Add a file and open it to create a blob
-        fixture.add_file(&file_path, 100, &mtime)?;
+        fixture.add_file(&file_path, 100, mtime)?;
         let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
 
@@ -2288,7 +2288,7 @@ mod tests {
         let mtime = test_time();
 
         // Add a file and open it to create a blob
-        fixture.add_file(&file_path, 100, &mtime)?;
+        fixture.add_file(&file_path, 100, mtime)?;
         let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
 
@@ -2319,7 +2319,7 @@ mod tests {
         let mtime = test_time();
 
         // Add a file and open it to create a blob
-        fixture.add_file(&file_path, 100, &mtime)?;
+        fixture.add_file(&file_path, 100, mtime)?;
         let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
 
@@ -2344,7 +2344,7 @@ mod tests {
         let mtime = test_time();
 
         // Add a file and open it to create a blob
-        fixture.add_file(&file_path, 100, &mtime)?;
+        fixture.add_file(&file_path, 100, mtime)?;
         let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
 
@@ -2372,7 +2372,7 @@ mod tests {
         let mtime = test_time();
 
         // Add a file and open it to create a blob
-        fixture.add_file(&file_path, 1000, &mtime)?;
+        fixture.add_file(&file_path, 1000, mtime)?;
         let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
 
@@ -2415,7 +2415,7 @@ mod tests {
         let mtime = test_time();
 
         // Add a zero-size file
-        fixture.add_file(&file_path, 0, &mtime)?;
+        fixture.add_file(&file_path, 0, mtime)?;
         let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
         assert!(matches!(
@@ -2459,7 +2459,7 @@ mod tests {
         let mtime = test_time();
 
         // Add a file and open it to create a blob
-        fixture.add_file(&file_path, 100, &mtime)?;
+        fixture.add_file(&file_path, 100, mtime)?;
         let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
 

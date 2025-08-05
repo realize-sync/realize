@@ -77,7 +77,7 @@ impl UnixTime {
 }
 
 impl AsRef<UnixTime> for UnixTime {
-    fn as_ref(&self) -> &UnixTime {
+    fn as_ref(&self) -> &Self {
         self
     }
 }

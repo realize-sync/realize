@@ -469,7 +469,7 @@ mod tests {
                 .add_file(
                     &path,
                     content.len() as u64,
-                    &self.current_time,
+                    self.current_time,
                     hash::digest(content),
                 )
                 .await?;

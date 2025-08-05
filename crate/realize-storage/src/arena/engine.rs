@@ -239,7 +239,7 @@ impl Engine {
                     log::debug!(
                         "[{}] FAILED; retry after {backoff_time:?}, in {}s: {job_id}: {err}",
                         self.arena,
-                        backoff_time.duration_since(&UnixTime::now()).as_secs()
+                        backoff_time.duration_since(UnixTime::now()).as_secs()
                     );
 
                     Ok(())
@@ -432,7 +432,7 @@ impl Engine {
                         ret?;
                     }
 
-                    Ok(Some((backoff_until, mut jobs))) = self.wait_until_next_backoff(retry_lower_bound.as_ref()) => {
+                    Ok(Some((backoff_until, mut jobs))) = self.wait_until_next_backoff(retry_lower_bound) => {
                         log::debug!("[{arena}] jobs to retry: {jobs:?}");
                         jobs_to_retry.append(&mut jobs);
 
@@ -642,12 +642,11 @@ impl Engine {
     /// time they were assigned.
     async fn wait_until_next_backoff(
         self: &Arc<Self>,
-        lower_bound: Option<&UnixTime>,
+        lower_bound: Option<UnixTime>,
     ) -> Result<Option<(UnixTime, Vec<u64>)>, StorageError> {
         let mut rx = self.failed_job_tx.subscribe();
         loop {
             let this = Arc::clone(self);
-            let lower_bound = lower_bound.cloned();
             let current = task::spawn_blocking(move || {
                 let txn = this.db.begin_read()?;
                 let failed_job_table = txn.failed_job_table()?;
@@ -688,7 +687,7 @@ impl Engine {
 
             if let Some((backoff, jobs)) = current {
                 tokio::select!(
-                    _ = time::sleep(backoff.duration_since(&UnixTime::now())) => {
+                    _ = time::sleep(backoff.duration_since(UnixTime::now())) => {
                         return Ok(Some((backoff, jobs)));
                     }
                     _ = rx.changed() => {}
@@ -968,7 +967,7 @@ mod tests {
         fn add_file_to_index_with_version(&self, path: &Path, hash: Hash) -> anyhow::Result<()> {
             Ok(self
                 .index
-                .add_file(path, 100, &UnixTime::from_secs(1234567889), hash)?)
+                .add_file(path, 100, UnixTime::from_secs(1234567889), hash)?)
         }
 
         fn update_cache(&self, notification: Notification) -> anyhow::Result<()> {
