@@ -6,7 +6,7 @@ use std::{
 use time_format::TimeStampMs;
 
 /// Time as duration since the start of the UNIX epoch.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct UnixTime(Duration);
 
@@ -41,9 +41,10 @@ impl UnixTime {
     /// Return duration since some other time.
     ///
     /// Return 0 if `self < other`
-    pub fn duration_since(&self, other: &UnixTime) -> Duration {
-        if self.0 > other.0 {
-            self.0 - other.0
+    pub fn duration_since<T: AsRef<UnixTime>>(&self, other: T) -> Duration {
+        let other_duration = other.as_ref().0;
+        if self.0 > other_duration {
+            self.0 - other_duration
         } else {
             Duration::ZERO
         }
@@ -75,6 +76,11 @@ impl UnixTime {
     }
 }
 
+impl AsRef<UnixTime> for UnixTime {
+    fn as_ref(&self) -> &UnixTime {
+        self
+    }
+}
 impl From<Duration> for UnixTime {
     fn from(value: Duration) -> Self {
         UnixTime(value)
