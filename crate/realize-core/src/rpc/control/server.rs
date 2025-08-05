@@ -408,7 +408,7 @@ mod tests {
 
         local
             .run_until(async move {
-                let control = unixsocket::connect::<control::Client>(&sockpath).await?;
+                let control: control::Client = unixsocket::connect(&sockpath).await?;
 
                 let mut request = control.set_mark_request();
                 let mut req = request.get().init_req();
@@ -448,7 +448,7 @@ mod tests {
 
         local
             .run_until(async move {
-                let control = unixsocket::connect::<control::Client>(&sockpath).await?;
+                let control: control::Client = unixsocket::connect(&sockpath).await?;
 
                 let mut request = control.set_arena_mark_request();
                 let mut req = request.get().init_req();
@@ -487,7 +487,7 @@ mod tests {
 
         local
             .run_until(async move {
-                let control = unixsocket::connect::<control::Client>(&sockpath).await?;
+                let control: control::Client = unixsocket::connect(&sockpath).await?;
 
                 let mut request = control.get_mark_request();
                 let mut req = request.get().init_req();
@@ -688,7 +688,7 @@ mod tests {
 
         local
             .run_until(async move {
-                let control = unixsocket::connect::<control::Client>(&sockpath).await?;
+                let control: control::Client = unixsocket::connect(&sockpath).await?;
                 let churten = control
                     .churten_request()
                     .send()

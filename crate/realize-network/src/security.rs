@@ -255,7 +255,8 @@ pub struct RawPublicKeyResolver {
 
 impl RawPublicKeyResolver {
     /// Load the private key from the given pat and use it for the resolver.
-    pub fn from_private_key_file(path: &Path) -> anyhow::Result<Arc<Self>> {
+    pub fn from_private_key_file<T: AsRef<Path>>(path: T) -> anyhow::Result<Arc<Self>> {
+        let path = path.as_ref();
         let private_key = PrivateKeyDer::from_pem_file(path)
             .with_context(|| format!("invalid private key file {}", path.display()))?;
         let resolver = Self::from_private_key(private_key)

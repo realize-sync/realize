@@ -17,7 +17,7 @@ use super::{
 pub async fn connect(
     socket_path: &std::path::Path,
 ) -> anyhow::Result<control_capnp::control::Client> {
-    unixsocket::connect::<control_capnp::control::Client>(socket_path).await
+    unixsocket::connect(socket_path).await
 }
 
 /// Get a Churten client from a Control client

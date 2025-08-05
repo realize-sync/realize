@@ -91,10 +91,12 @@ pub async fn bind(
 /// This must be called from an environment where
 /// [tokio::task::spawn_local] is available, such as one setup by
 /// [tokio::task::LocalSet].
-pub async fn connect<C>(path: &Path) -> anyhow::Result<C>
+pub async fn connect<T, C>(path: T) -> anyhow::Result<C>
 where
+    T: AsRef<Path>,
     C: capnp::capability::FromClientHook + Clone + 'static,
 {
+    let path = path.as_ref();
     let stream = tokio::net::UnixStream::connect(path).await?;
     let (r, w) = stream.compat().split();
     let net = Box::new(twoparty::VatNetwork::new(
@@ -150,7 +152,7 @@ mod tests {
 
         local
             .run_until(async move {
-                let client = connect::<hello::Client>(&path).await?;
+                let client: hello::Client = connect(&path).await?;
 
                 let mut request = client.hello_request();
                 request.get().set_name("Foo");

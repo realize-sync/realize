@@ -573,10 +573,8 @@ async fn daemon_binds_socket() -> anyhow::Result<()> {
     let local = LocalSet::new();
     local
         .run_until(async move {
-            let control = unixsocket::connect::<
-                realize_core::rpc::control::control_capnp::control::Client,
-            >(&fixture.socket)
-            .await?;
+            let control: realize_core::rpc::control::control_capnp::control::Client =
+                unixsocket::connect(&fixture.socket).await?;
 
             let churten = control
                 .churten_request()
