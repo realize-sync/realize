@@ -19,11 +19,15 @@ where
                 let arena_dir = arena_root(dir, arena);
                 (
                     arena,
-                    ArenaConfig::new(
-                        arena_dir.clone(),
-                        arena_dir.join(".arena.db"),
-                        arena_dir.join(".arena.blobs"),
-                    ),
+                    ArenaConfig {
+                        root: Some(arena_dir.clone()),
+                        db: arena_dir.join(".arena.db"),
+                        blob_dir: arena_dir.join(".arena.blobs"),
+
+                        // Disabled in tests
+                        debounce_secs: Some(0),
+                        max_parallel_hashers: Some(0),
+                    },
                 )
             })
             .collect(),

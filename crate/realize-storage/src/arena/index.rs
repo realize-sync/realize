@@ -145,40 +145,66 @@ impl RealIndexBlocking {
         hash: Hash,
     ) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
-        {
-            let mut file_table = txn.index_file_table()?;
-            let mut history_table = txn.index_history_table()?;
-
-            let old_hash = file_table
-                .get(path.as_str())?
-                .map(|e| e.value().parse().ok())
-                .flatten()
-                .map(|e| e.hash);
-            let same_hash = old_hash.as_ref().map(|h| *h == hash).unwrap_or(false);
-            file_table.insert(
-                path.as_str(),
-                Holder::with_content(IndexedFileTableEntry {
-                    size,
-                    mtime: mtime.clone(),
-                    hash,
-                    outdated_by: None,
-                })?,
-            )?;
-            if !same_hash {
-                (&self.dirty_paths).mark_dirty(&txn, path)?;
-                let index = self.allocate_history_index(&txn, &history_table)?;
-                let ev = if let Some(old_hash) = old_hash {
-                    HistoryTableEntry::Replace(path.clone(), old_hash)
-                } else {
-                    HistoryTableEntry::Add(path.clone())
-                };
-                log::debug!("[{}] History #{index}: {ev:?}", self.arena);
-                history_table.insert(index, Holder::with_content(ev)?)?;
-            }
-        }
+        self.do_add_file(&txn, path, size, mtime, hash)?;
         txn.commit()?;
 
         Ok(())
+    }
+
+    pub fn add_file_if_matches(
+        &self,
+        path: &realize_types::Path,
+        size: u64,
+        mtime: &UnixTime,
+        hash: Hash,
+        realpath: &std::path::Path,
+    ) -> Result<bool, StorageError> {
+        let txn = self.db.begin_write()?;
+        let entry = self.do_add_file(&txn, path, size, mtime, hash)?;
+        if file_matches_index(&entry, realpath) {
+            txn.commit()?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    fn do_add_file(
+        &self,
+        txn: &ArenaWriteTransaction,
+        path: &realize_types::Path,
+        size: u64,
+        mtime: &UnixTime,
+        hash: Hash,
+    ) -> Result<IndexedFileTableEntry, StorageError> {
+        let mut file_table = txn.index_file_table()?;
+        let mut history_table = txn.index_history_table()?;
+        let old_hash = file_table
+            .get(path.as_str())?
+            .map(|e| e.value().parse().ok())
+            .flatten()
+            .map(|e| e.hash);
+        let same_hash = old_hash.as_ref().map(|h| *h == hash).unwrap_or(false);
+        let entry = IndexedFileTableEntry {
+            size,
+            mtime: mtime.clone(),
+            hash,
+            outdated_by: None,
+        };
+        file_table.insert(path.as_str(), Holder::new(&entry)?)?;
+        if !same_hash {
+            (&self.dirty_paths).mark_dirty(txn, path)?;
+            let index = self.allocate_history_index(txn, &history_table)?;
+            let ev = if let Some(old_hash) = old_hash {
+                HistoryTableEntry::Replace(path.clone(), old_hash)
+            } else {
+                HistoryTableEntry::Add(path.clone())
+            };
+            log::debug!("[{}] History #{index}: {ev:?}", self.arena);
+            history_table.insert(index, Holder::with_content(ev)?)?;
+        }
+
+        Ok(entry)
     }
 
     /// Send all valid entries of the file table to the given channel.
@@ -626,6 +652,25 @@ impl RealIndexAsync {
         task::spawn_blocking(move || inner.add_file(&path, size, &mtime, hash)).await?
     }
 
+    pub async fn add_file_if_matches(
+        &self,
+        path: &realize_types::Path,
+        size: u64,
+        mtime: &UnixTime,
+        hash: Hash,
+        realpath: &std::path::Path,
+    ) -> Result<bool, StorageError> {
+        let inner = Arc::clone(&self.inner);
+        let path = path.clone();
+        let mtime = mtime.clone();
+        let realpath = realpath.to_path_buf();
+
+        task::spawn_blocking(move || {
+            inner.add_file_if_matches(&path, size, &mtime, hash, &realpath)
+        })
+        .await?
+    }
+
     /// Take a remote change into account, if it applies to a file in
     /// the index.
     pub(crate) async fn update(
@@ -687,6 +732,8 @@ pub(crate) fn make_all_dirty(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::utils::redb_utils;
     use crate::{arena::engine, utils::hash};
@@ -808,6 +855,88 @@ mod tests {
 
             assert!(engine::is_dirty(&txn, &path)?);
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn add_file_if_matches_success() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+
+        let index = &fixture.index;
+
+        let foo = fixture.root.child("foo");
+        foo.write_str("foo")?;
+        assert!(index.add_file_if_matches(
+            &realize_types::Path::parse("foo")?,
+            3,
+            &UnixTime::mtime(&foo.path().metadata()?),
+            hash::digest("foo"),
+            foo.path(),
+        )?);
+        assert!(index.has_file(&realize_types::Path::parse("foo")?)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn add_file_if_matches_time_mismatch() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+
+        let index = &fixture.index;
+
+        let foo = fixture.root.child("foo");
+        foo.write_str("foo")?;
+        assert!(!index.add_file_if_matches(
+            &realize_types::Path::parse("foo")?,
+            3,
+            &UnixTime::from_secs(1234567890),
+            hash::digest("foo"),
+            foo.path(),
+        )?);
+        assert!(!index.has_file(&realize_types::Path::parse("foo")?)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn add_file_if_matches_size_mismatch() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+
+        let index = &fixture.index;
+
+        let foo = fixture.root.child("foo");
+        foo.write_str("foo")?;
+        assert!(!index.add_file_if_matches(
+            &realize_types::Path::parse("foo")?,
+            2,
+            &UnixTime::mtime(&foo.path().metadata()?),
+            hash::digest("foo"),
+            foo.path(),
+        )?);
+        assert!(!index.has_file(&realize_types::Path::parse("foo")?)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn add_file_if_matches_missing() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+
+        let index = &fixture.index;
+
+        let foo = fixture.root.child("foo");
+        foo.write_str("foo")?;
+        let mtime = UnixTime::mtime(&foo.path().metadata()?);
+        fs::remove_file(foo.path())?;
+        assert!(!index.add_file_if_matches(
+            &realize_types::Path::parse("foo")?,
+            3,
+            &mtime,
+            hash::digest("foo"),
+            foo.path(),
+        )?);
+        assert!(!index.has_file(&realize_types::Path::parse("foo")?)?);
 
         Ok(())
     }

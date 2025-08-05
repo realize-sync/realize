@@ -1,9 +1,9 @@
 #![allow(dead_code)] // work in progress
 
-use crate::utils::{fs_utils, hash};
-
-use super::hasher::{self, Hasher};
+use super::hasher::{self, Hasher, HasherOptions};
 use super::index::RealIndexAsync;
+use crate::utils::fs_utils;
+use crate::utils::hash;
 use futures::StreamExt as _;
 use notify::event::{CreateKind, MetadataKind, ModifyKind};
 use notify::{Event, EventKind, RecommendedWatcher, Watcher as _};
@@ -12,6 +12,7 @@ use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::fs::{self, File};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -30,6 +31,7 @@ pub struct RealWatcherBuilder {
     index: RealIndexAsync,
     exclude: Vec<realize_types::Path>,
     initial_scan: bool,
+    hasher_options: HasherOptions,
 }
 
 impl RealWatcherBuilder {
@@ -40,12 +42,34 @@ impl RealWatcherBuilder {
             index,
             exclude: Vec::new(),
             initial_scan: false,
+            hasher_options: Default::default(),
         }
     }
 
     /// Look at existing files at startup, to catch up to any missed changes.
     pub fn with_initial_scan(mut self) -> Self {
         self.initial_scan = true;
+
+        self
+    }
+
+    /// Set debounce delay for hashing files. This allows some time
+    /// for operations in progress to finish.
+    pub fn debounce(mut self, duration: Duration) -> Self {
+        self.hasher_options.debounce = duration;
+
+        self
+    }
+
+    /// Maximum number of hashers running in parallel.
+    ///
+    /// Hashing is CPU intensive, so hashing several large files in
+    /// parallel can become a problem. It's a good idea to limit
+    /// parallelism to a fraction of the available cores.
+    ///
+    /// Set it to 0 to not limit parallelism. This is the default.
+    pub fn max_parallel_hashers(mut self, n: usize) -> Self {
+        self.hasher_options.max_parallelism = n;
 
         self
     }
@@ -71,7 +95,14 @@ impl RealWatcherBuilder {
     ///
     /// Background work is also stopped at some point after the instance is dropped.
     pub async fn spawn(self) -> anyhow::Result<RealWatcher> {
-        RealWatcher::spawn(&self.root, self.exclude, self.index, self.initial_scan).await
+        RealWatcher::spawn(
+            &self.root,
+            self.exclude,
+            self.index,
+            self.initial_scan,
+            self.hasher_options,
+        )
+        .await
     }
 }
 
@@ -86,6 +117,7 @@ impl RealWatcher {
         exclude: Vec<realize_types::Path>,
         index: RealIndexAsync,
         initial_scan: bool,
+        hasher_options: HasherOptions,
     ) -> anyhow::Result<Self> {
         let root = fs::canonicalize(&root).await?;
         let arena = index.arena().clone();
@@ -122,7 +154,12 @@ impl RealWatcher {
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
         let (rescan_tx, rescan_rx) = mpsc::channel(16);
 
-        let hasher = hasher::Hasher::spawn(index.clone(), shutdown_tx.subscribe());
+        let hasher = hasher::Hasher::spawn(
+            root.clone(),
+            index.clone(),
+            shutdown_tx.subscribe(),
+            &hasher_options,
+        );
         let worker = Arc::new(RealWatcherWorker {
             root,
             index,
@@ -526,6 +563,9 @@ impl RealWatcherWorker {
     }
 
     async fn file_or_dir_removed(&self, path: &Path) -> anyhow::Result<()> {
+        // TODO: use hasher so that debounce applies, in case a file
+        // is deleted then re-created right after.
+        log::debug!("Direct removal of {path}");
         self.index.remove_file_or_dir(&path).await?;
 
         Ok(())

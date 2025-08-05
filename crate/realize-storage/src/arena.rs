@@ -72,6 +72,8 @@ impl ArenaStorage {
                 let watcher = RealWatcher::builder(root, index.clone())
                     .with_initial_scan()
                     .exclude_all(exclude.iter())
+                    .debounce(Duration::from_secs(arena_config.debounce_secs.unwrap_or(3)))
+                    .max_parallel_hashers(arena_config.max_parallel_hashers.unwrap_or(4))
                     .spawn()
                     .await?;
 
@@ -184,8 +186,10 @@ impl ArenaStorage {
                     if index.drop_file_if_matches(&txn, &path, &hash, &realpath)? {
                         // Database changes are ready. Make the fs change.
                         std::fs::rename(&realpath, &cachepath)?;
+                        log::debug!("renamed {realpath:?} to {cachepath:?}");
                         let committed = txn.commit();
                         if committed.is_err() {
+                            log::warn!("commit failed; revert {realpath:?}");
                             // best effort revert of the fs change
                             std::fs::rename(&cachepath, &realpath)?;
                         }
@@ -285,6 +289,8 @@ mod tests {
                 } else {
                     None
                 },
+                debounce_secs: Some(0),
+                max_parallel_hashers: Some(0),
             };
             let storage = ArenaStorage::from_config(arena, &config, &vec![], &allocator).await?;
 
