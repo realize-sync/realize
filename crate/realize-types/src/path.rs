@@ -47,11 +47,12 @@ impl Path {
 
     /// Build a path from the given path, relative to the given root.
     ///
-    /// For this to work, te given path must be inside the given root.
-    pub fn from_real_path_in(path: &path::Path, root: &path::Path) -> Result<Path, PathError> {
-        let relative = pathdiff::diff_paths(&path, root).ok_or(PathError::InvalidPath)?;
-
-        Path::from_real_path(&relative)
+    /// For this to work, the given path must be inside the given root.
+    pub fn from_real_path_in(path: &path::Path, root: &path::Path) -> Option<Path> {
+        path.strip_prefix(root)
+            .ok()
+            .map(|p| Path::from_real_path(p).ok())
+            .flatten()
     }
 
     /// The name part of the path, without any parent element.
