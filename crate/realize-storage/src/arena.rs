@@ -183,7 +183,7 @@ impl ArenaStorage {
                     // file after the move, a change that would
                     // eventually be lost when the file in the cache
                     // is verified.
-                    if index.drop_file_if_matches(&txn, &path, &hash, &realpath)? {
+                    if index.drop_file_if_matches(&txn, &root, &path, &hash)? {
                         // Database changes are ready. Make the fs change.
                         std::fs::rename(&realpath, &cachepath)?;
                         log::debug!("renamed {realpath:?} to {cachepath:?}");

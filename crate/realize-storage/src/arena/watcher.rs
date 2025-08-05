@@ -3,7 +3,6 @@
 use super::hasher::{self, Hasher, HasherOptions};
 use super::index::RealIndexAsync;
 use crate::utils::fs_utils;
-use crate::utils::hash;
 use futures::StreamExt as _;
 use notify::event::{CreateKind, MetadataKind, ModifyKind};
 use notify::{Event, EventKind, RecommendedWatcher, Watcher as _};
@@ -340,8 +339,6 @@ impl RealWatcherWorker {
                     Some(e) => e,
                 };
 
-                let full_path = path.within(&self.root);
-
                 let mut is_deleted = false;
                 let mut is_modified = false;
                 if self.is_excluded(&path) {
@@ -349,13 +346,12 @@ impl RealWatcherWorker {
                     // from the index.
                     is_deleted = true;
                 } else {
-                    match fs::symlink_metadata(&full_path).await {
-                        Err(_) => { is_deleted = true;
+                    match fs_utils::metadata_no_symlink(&self.root, &path).await {
+                        Err(_) => {
+                            is_deleted = true;
                         }
                         Ok(m) => {
-                            if let Ok(canonical) = fs::canonicalize(&full_path).await && canonical != full_path {
-                                is_deleted = true;
-                            } else if !file_is_readable(&full_path).await {
+                            if !file_is_readable(&path.within(&self.root)).await {
                                 is_deleted = true;
                             } else if m.len() != entry.size || UnixTime::mtime(&m) != entry.mtime {
                                 is_modified = true;
@@ -461,9 +457,19 @@ impl RealWatcherWorker {
 
     async fn handle_event(&self, ev: &FsEvent, rescan_tx: &mpsc::Sender<()>) -> anyhow::Result<()> {
         match ev {
-            FsEvent::Removed(path) | FsEvent::Gone(path) => {
-                // Remove can't always tell whether a file or
-                // directory was removed, so we don't bother checking.
+            FsEvent::Removed(path) => {
+                if self.index.has_file(&path).await? {
+                    // For a single-file deletion, use the hasher, so
+                    // the call is debounced. This avoids removing a
+                    // file that might be recreated by the application
+                    // right away.
+                    self.hasher.remove_content(path).await?;
+                    return Ok(());
+                }
+                self.file_or_dir_removed(path).await?;
+            }
+
+            FsEvent::Gone(path) => {
                 self.file_or_dir_removed(path).await?;
             }
 
@@ -563,8 +569,6 @@ impl RealWatcherWorker {
     }
 
     async fn file_or_dir_removed(&self, path: &Path) -> anyhow::Result<()> {
-        // TODO: use hasher so that debounce applies, in case a file
-        // is deleted then re-created right after.
         log::debug!("Direct removal of {path}");
         self.index.remove_file_or_dir(&path).await?;
 
@@ -626,24 +630,18 @@ impl RealWatcherWorker {
         }
 
         let mtime = UnixTime::mtime(m);
+        let size = m.len();
         if self
             .index
-            .has_matching_file(path, m.len(), &mtime)
+            .has_matching_file(path, size, &mtime)
             .await
             .unwrap_or(false)
         {
             return Ok(());
         }
-        if m.len() == 0 {
-            log::debug!("[{}] Empty file at {path}", self.index.arena());
-            self.index
-                .add_file(path, 0, &UnixTime::mtime(&m), hash::empty())
-                .await?;
-        } else {
-            log::debug!("[{}] Requesting hash of {path}", self.index.arena());
-            self.hasher
-                .request_hash(path.within(&self.root), path.clone());
-        }
+        log::debug!("[{}] Requesting hash of {path}", self.index.arena());
+        self.hasher.hash_content(path, &mtime, size).await?;
+
         Ok(())
     }
 

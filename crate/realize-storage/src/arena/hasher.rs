@@ -6,7 +6,7 @@ use crate::StorageError;
 use crate::utils::hash::{self};
 use futures::TryStreamExt as _;
 use realize_types::{self, Hash, Path, UnixTime};
-use tokio::fs::{self, File};
+use tokio::fs::File;
 use tokio::io::AsyncRead;
 use tokio::sync::{Semaphore, broadcast, mpsc};
 use tokio_util::io::ReaderStream;
@@ -16,11 +16,14 @@ use super::index::RealIndexAsync;
 
 #[derive(Debug)]
 enum Verdict {
-    /// File was deleted or is not accessible anymore.
-    Gone,
-
-    /// Hashed file content, modification time and size.
     FileContent(Hash, UnixTime, u64),
+    Remove,
+}
+
+#[derive(Debug)]
+enum Request {
+    HashFileVersion(Path, UnixTime, u64),
+    RemoveFileVersion(Path),
 }
 
 #[derive(Clone, Default, Debug)]
@@ -31,7 +34,7 @@ pub(crate) struct HasherOptions {
 
 /// A type that puts new file into the index or remove deleted files.
 pub(crate) struct Hasher {
-    tx: mpsc::Sender<Path>,
+    tx: mpsc::Sender<Request>,
 }
 
 impl Hasher {
@@ -65,23 +68,38 @@ impl Hasher {
         Self { tx }
     }
 
-    /// Check the given `realpath`.
-    ///
-    /// If it exists, hash it and add it to the index with that ash.
-    /// If it doesn't exist, remove it from the index.
+    /// Hash content of the given path.
     ///
     /// This handles conflicting updates; calling check_path on a path
     /// currently being processes cancels that processing so we only
     /// look at the latest state.
-    pub(crate) async fn check_path(&self, path: realize_types::Path) -> anyhow::Result<()> {
-        Ok(self.tx.send(path).await?)
+    pub(crate) async fn hash_content(
+        &self,
+        path: &realize_types::Path,
+        mtime: &UnixTime,
+        size: u64,
+    ) -> anyhow::Result<()> {
+        Ok(self
+            .tx
+            .send(Request::HashFileVersion(path.clone(), mtime.clone(), size))
+            .await?)
+    }
+
+    /// Remove the given path from the index.
+    ///
+    /// This debounces, in case the path is written again.
+    pub(crate) async fn remove_content(&self, path: &realize_types::Path) -> anyhow::Result<()> {
+        Ok(self
+            .tx
+            .send(Request::RemoveFileVersion(path.clone()))
+            .await?)
     }
 }
 
 async fn hasher_loop(
     root: PathBuf,
     index: RealIndexAsync,
-    mut rx: mpsc::Receiver<Path>,
+    mut rx: mpsc::Receiver<Request>,
     mut shutdown_rx: broadcast::Receiver<()>,
     sem: Option<Arc<Semaphore>>,
     debounce: Duration,
@@ -100,12 +118,15 @@ async fn hasher_loop(
                     None => {
                         return;
                     }
-                    Some(path) => {
+                    Some(Request::HashFileVersion(path, mtime, size)) => {
                         // Any previous run of do_hash currently
                         // running for this path is cancelled by this
                         // call; we only want to hash the very latest
                         // version.
-                        map.spawn(path.clone(), do_hash(path.within(&root), sem.clone(), debounce));
+                        map.spawn(path.clone(), add_version(path.within(&root), mtime, size, sem.clone(), debounce));
+                    }
+                    Some(Request::RemoveFileVersion(path)) => {
+                        map.spawn(path.clone(), remove_version(debounce));
                     }
                 }
             }
@@ -134,13 +155,19 @@ async fn apply_verdict(
     verdict: Verdict,
 ) -> Result<(), StorageError> {
     match verdict {
-        Verdict::Gone => index.remove_file_or_dir(path).await,
+        Verdict::Remove => {
+            if !index.remove_file_if_missing(root, path).await? {
+                log::debug!("Mismatch; skipped removing {path}");
+            }
+
+            Ok(())
+        }
         Verdict::FileContent(hash, mtime, size) => {
             if !index
-                .add_file_if_matches(path, size, &mtime, hash, &path.within(root))
+                .add_file_if_matches(root, path, size, &mtime, hash)
                 .await?
             {
-                log::debug!("Mimsatch; skipped adding {path}");
+                log::debug!("Mismatch; skipped adding {path}");
             }
 
             Ok(())
@@ -148,8 +175,10 @@ async fn apply_verdict(
     }
 }
 
-async fn do_hash(
+async fn add_version(
     realpath: PathBuf,
+    mtime: UnixTime,
+    size: u64,
     sem: Option<Arc<Semaphore>>,
     debounce: Duration,
 ) -> Result<Verdict, std::io::Error> {
@@ -157,32 +186,27 @@ async fn do_hash(
         tokio::time::sleep(debounce).await;
     }
 
-    let (start_mtime, start_size) = match fs::symlink_metadata(&realpath).await {
-        Err(_) => {
-            return Ok(Verdict::Gone);
-        }
-        Ok(m) => (UnixTime::mtime(&m), m.len()),
+    let hash = if size > 0 {
+        let _permit = if let Some(sem) = &sem {
+            Some(sem.acquire().await.unwrap())
+        } else {
+            None
+        };
+
+        hash_file(File::open(&realpath).await?).await?
+    } else {
+        hash::empty()
     };
 
-    if start_size == 0 {
-        // No need to bother reading the file
-        return Ok(Verdict::FileContent(hash::empty(), start_mtime, start_size));
+    Ok(Verdict::FileContent(hash, mtime, size))
+}
+
+async fn remove_version(debounce: Duration) -> Result<Verdict, std::io::Error> {
+    if !debounce.is_zero() {
+        tokio::time::sleep(debounce).await;
     }
 
-    let _permit = if let Some(sem) = &sem {
-        Some(sem.acquire().await.unwrap())
-    } else {
-        None
-    };
-
-    let hash = match File::open(&realpath).await {
-        Err(_) => {
-            return Ok(Verdict::Gone);
-        }
-        Ok(f) => hash_file(f).await?,
-    };
-
-    Ok(Verdict::FileContent(hash, start_mtime, start_size))
+    Ok(Verdict::Remove)
 }
 
 pub(crate) async fn hash_file<R: AsyncRead>(f: R) -> Result<Hash, std::io::Error> {
@@ -200,14 +224,13 @@ pub(crate) async fn hash_file<R: AsyncRead>(f: R) -> Result<Hash, std::io::Error
 
 #[cfg(test)]
 mod tests {
-    use assert_fs::TempDir;
-    use assert_fs::prelude::*;
-    use realize_types::Arena;
-
     use crate::DirtyPaths;
     use crate::arena::db::ArenaDatabase;
     use crate::arena::index::RealIndexBlocking;
     use crate::utils::redb_utils;
+    use assert_fs::TempDir;
+    use assert_fs::prelude::*;
+    use realize_types::Arena;
 
     use super::*;
 
@@ -256,15 +279,18 @@ mod tests {
 
         let foo = fixture.tempdir.child("foo");
         foo.write_str("some content")?;
+        let mtime = UnixTime::mtime(&foo.path().metadata()?);
 
         let mut history_rx = fixture.index.watch_history();
-        hasher.check_path(Path::parse("foo")?).await?;
-        history_rx.changed().await?;
+        hasher
+            .hash_content(&Path::parse("foo")?, &mtime, 12)
+            .await?;
+        tokio::time::timeout(Duration::from_secs(3), history_rx.changed()).await??;
 
         let entry = fixture.index.get_file(&Path::parse("foo")?).await?.unwrap();
         assert_eq!(hash::digest("some content"), entry.hash);
         assert_eq!(12, entry.size);
-        assert_eq!(UnixTime::mtime(&foo.path().metadata()?), entry.mtime);
+        assert_eq!(mtime, entry.mtime);
 
         Ok(())
     }
@@ -276,40 +302,15 @@ mod tests {
 
         let foo = fixture.tempdir.child("foo");
         foo.write_str("")?;
-
+        let mtime = UnixTime::mtime(&foo.path().metadata()?);
         let mut history_rx = fixture.index.watch_history();
-        hasher.check_path(Path::parse("foo")?).await?;
-        history_rx.changed().await?;
+        hasher.hash_content(&Path::parse("foo")?, &mtime, 0).await?;
+        tokio::time::timeout(Duration::from_secs(3), history_rx.changed()).await??;
 
         let entry = fixture.index.get_file(&Path::parse("foo")?).await?.unwrap();
         assert_eq!(hash::empty(), entry.hash);
         assert_eq!(0, entry.size);
-        assert_eq!(UnixTime::mtime(&foo.path().metadata()?), entry.mtime);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_file() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
-        let hasher = fixture.hasher();
-
-        let foo = Path::parse("foo")?;
-        fixture
-            .index
-            .add_file(
-                &foo,
-                3,
-                &UnixTime::from_secs(1234567890),
-                hash::digest("foo"),
-            )
-            .await?;
-
-        let mut history_rx = fixture.index.watch_history();
-        hasher.check_path(foo.clone()).await?;
-        history_rx.changed().await?;
-
-        assert!(!fixture.index.has_file(&foo).await?);
+        assert_eq!(mtime, entry.mtime);
 
         Ok(())
     }
@@ -323,22 +324,28 @@ mod tests {
         let foo = fixture.tempdir.child("foo");
         let path = Path::parse("foo")?;
 
-        foo.write_str("content1")?;
-        hasher.check_path(path.clone()).await?;
-        foo.write_str("content2")?;
-        hasher.check_path(path.clone()).await?;
-        foo.write_str("content3")?;
-        hasher.check_path(path.clone()).await?;
+        foo.write_str("one")?;
+        hasher
+            .hash_content(&path, &UnixTime::mtime(&foo.path().metadata()?), 3)
+            .await?;
+        foo.write_str("two!")?;
+        hasher
+            .hash_content(&path, &UnixTime::mtime(&foo.path().metadata()?), 4)
+            .await?;
+
+        foo.write_str("three")?;
+        tokio::time::pause(); // new sleep calls returns immediately
+        hasher
+            .hash_content(&path, &UnixTime::mtime(&foo.path().metadata()?), 5)
+            .await?;
 
         let mut history_rx = fixture.index.watch_history();
-        tokio::time::pause(); // hasher stops sleeping
-
-        history_rx.changed().await?;
+        history_rx.changed().await?; // timeout not available when paused
         let history_index = *history_rx.borrow_and_update();
 
         // The version that is finally hashed must be the last one.
         let entry = fixture.index.get_file(&Path::parse("foo")?).await?.unwrap();
-        assert_eq!(hash::digest("content3"), entry.hash);
+        assert_eq!(hash::digest("three"), entry.hash);
 
         // and this is the first entry that was written (intermediate values were not hashed).g
         assert_eq!(1, history_index);
@@ -347,15 +354,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finally_delete_file() -> anyhow::Result<()> {
+    async fn remove_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let hasher = fixture.hasher();
+
+        fixture
+            .index
+            .add_file(
+                &Path::parse("foo")?,
+                3,
+                &UnixTime::from_secs(1234567890),
+                hash::digest("foo"),
+            )
+            .await?;
+
+        let mut history_rx = fixture.index.watch_history();
+        hasher.remove_content(&Path::parse("foo")?).await?;
+        tokio::time::timeout(Duration::from_secs(3), history_rx.changed()).await??;
+
+        assert!(!fixture.index.has_file(&Path::parse("foo")?).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hash_file_that_reappeares() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
         fixture.options.debounce = Duration::from_secs(30);
 
         let hasher = fixture.hasher();
         let foo = fixture.tempdir.child("foo");
-        let realpath = foo.to_path_buf();
         let path = Path::parse("foo")?;
-
         fixture
             .index
             .add_file(
@@ -366,23 +395,22 @@ mod tests {
             )
             .await?;
 
-        foo.write_str("content1")?;
-        hasher.check_path(path.clone()).await?;
-        foo.write_str("content2")?;
-        hasher.check_path(path.clone()).await?;
-        fs::remove_file(&realpath).await?;
-        hasher.check_path(path.clone()).await?;
-
         let mut history_rx = fixture.index.watch_history();
-        tokio::time::pause(); // hasher stops sleeping
+        hasher.remove_content(&Path::parse("foo")?).await?;
 
-        history_rx.changed().await?;
+        foo.write_str("new!")?;
+        tokio::time::pause(); // new sleep calls returns immediately
+        hasher
+            .hash_content(&path, &UnixTime::mtime(&foo.path().metadata()?), 4)
+            .await?;
+
+        history_rx.changed().await?; // cannot use timeout when time paused
         let history_index = *history_rx.borrow_and_update();
 
-        assert!(!fixture.index.has_file(&path).await?);
+        let entry = fixture.index.get_file(&Path::parse("foo")?).await?.unwrap();
+        assert_eq!(hash::digest("new!"), entry.hash);
 
-        // 1 entry for add_file and one for delete; intermediate
-        // changes were just not recorded;
+        // one entry for add, one for replace; the removal was skipped
         assert_eq!(2, history_index);
 
         Ok(())

@@ -3,6 +3,7 @@
 use super::db::{ArenaDatabase, ArenaWriteTransaction};
 use super::types::{HistoryTableEntry, IndexedFileTableEntry};
 use crate::arena::engine::DirtyPaths;
+use crate::utils::fs_utils;
 use crate::utils::holder::{ByteConversionError, Holder};
 use crate::{Notification, StorageError};
 use realize_types::{self, Arena, Hash, UnixTime};
@@ -153,15 +154,15 @@ impl RealIndexBlocking {
 
     pub fn add_file_if_matches(
         &self,
+        root: &std::path::Path,
         path: &realize_types::Path,
         size: u64,
         mtime: &UnixTime,
         hash: Hash,
-        realpath: &std::path::Path,
     ) -> Result<bool, StorageError> {
         let txn = self.db.begin_write()?;
         let entry = self.do_add_file(&txn, path, size, mtime, hash)?;
-        if file_matches_index(&entry, realpath) {
+        if file_matches_index(&entry, root, path) {
             txn.commit()?;
             return Ok(true);
         }
@@ -205,6 +206,33 @@ impl RealIndexBlocking {
         }
 
         Ok(entry)
+    }
+
+    pub fn remove_file_if_missing(
+        &self,
+        root: &std::path::Path,
+        path: &realize_types::Path,
+    ) -> Result<bool, StorageError> {
+        let txn = self.db.begin_write()?;
+        if fs_utils::metadata_no_symlink_blocking(root, path).is_err() {
+            {
+                let mut file_table = txn.index_file_table()?;
+                let removed = file_table.remove(path.as_str())?;
+                if let Some(removed) = removed {
+                    let old_hash = removed.value().parse()?.hash;
+                    self.report_removed(
+                        &txn,
+                        &mut txn.index_history_table()?,
+                        path.clone(),
+                        old_hash,
+                    )?;
+                }
+            }
+            txn.commit()?;
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 
     /// Send all valid entries of the file table to the given channel.
@@ -274,16 +302,28 @@ impl RealIndexBlocking {
                 file_table.extract_from_if(path_prefix.range(), |k, _| path_prefix.accept(k))?
             {
                 let (k, v) = entry?;
-                let index = self.allocate_history_index(&txn, &history_table)?;
                 let path = realize_types::Path::parse(k.value())?;
-                (&self.dirty_paths).mark_dirty(&txn, &path)?;
-                let ev = HistoryTableEntry::Remove(path, v.value().parse()?.hash);
-                log::debug!("[{}] History #{index}: {ev:?}", self.arena);
-                history_table.insert(index, Holder::with_content(ev)?)?;
+                let hash = v.value().parse()?.hash;
+                self.report_removed(&txn, &mut history_table, path, hash)?;
             }
         }
         txn.commit()?;
 
+        Ok(())
+    }
+
+    fn report_removed(
+        &self,
+        txn: &ArenaWriteTransaction,
+        history_table: &mut redb::Table<'_, u64, Holder<'static, HistoryTableEntry>>,
+        path: realize_types::Path,
+        hash: Hash,
+    ) -> Result<(), StorageError> {
+        let index = self.allocate_history_index(txn, history_table)?;
+        (&self.dirty_paths).mark_dirty(txn, &path)?;
+        let ev = HistoryTableEntry::Remove(path, hash);
+        log::debug!("[{}] History #{index}: {ev:?}", self.arena);
+        history_table.insert(index, Holder::with_content(ev)?)?;
         Ok(())
     }
 
@@ -292,16 +332,16 @@ impl RealIndexBlocking {
     pub fn drop_file_if_matches(
         &self,
         txn: &ArenaWriteTransaction,
+        root: &std::path::Path,
         path: &realize_types::Path,
         hash: &Hash,
-        realpath: &std::path::Path,
     ) -> Result<bool, StorageError> {
         let mut file_table = txn.index_file_table()?;
         let mut history_table = txn.index_history_table()?;
 
         if let Some(entry) = do_get_file_entry(&file_table, path)?
             && entry.hash == *hash
-            && file_matches_index(&entry, realpath)
+            && file_matches_index(&entry, root, path)
         {
             file_table.remove(path.as_str())?;
 
@@ -372,9 +412,8 @@ impl RealIndexBlocking {
                     // remotely. Make sure that the file hasn't
                     // changed since it was indexed and if it hasn't,
                     // remove it locally as well.
-                    let realpath = path.within(root);
-                    if file_matches_index(&entry, &realpath) {
-                        std::fs::remove_file(&realpath)?;
+                    if file_matches_index(&entry, root, path) {
+                        std::fs::remove_file(&path.within(root))?;
                     }
                 }
             }
@@ -392,20 +431,20 @@ pub(crate) fn get_indexed_file(
     hash: Option<&Hash>,
 ) -> Result<Option<std::path::PathBuf>, StorageError> {
     let file_table = txn.index_file_table()?;
-    let realpath = path.within(root);
-
     match hash {
         Some(hash) => {
             if let Some(entry) = do_get_file_entry(&file_table, path)?
                 && entry.hash == *hash
-                && file_matches_index(&entry, &realpath)
+                && file_matches_index(&entry, root, path)
             {
-                return Ok(Some(realpath));
+                return Ok(Some(path.within(root)));
             }
         }
         None => {
-            if !file_table.get(path.as_str())?.is_some() && !realpath.exists() {
-                return Ok(Some(realpath));
+            if !file_table.get(path.as_str())?.is_some()
+                && fs_utils::metadata_no_symlink_blocking(root, path).is_err()
+            {
+                return Ok(Some(path.within(root)));
             }
         }
     }
@@ -413,8 +452,12 @@ pub(crate) fn get_indexed_file(
     Ok(None)
 }
 
-fn file_matches_index(entry: &IndexedFileTableEntry, path: &std::path::Path) -> bool {
-    if let Ok(m) = std::fs::metadata(path) {
+fn file_matches_index(
+    entry: &IndexedFileTableEntry,
+    root: &std::path::Path,
+    path: &realize_types::Path,
+) -> bool {
+    if let Ok(m) = fs_utils::metadata_no_symlink_blocking(root, path) {
         UnixTime::mtime(&m) == entry.mtime && m.len() == entry.size
     } else {
         false
@@ -654,21 +697,31 @@ impl RealIndexAsync {
 
     pub async fn add_file_if_matches(
         &self,
+        root: &std::path::Path,
         path: &realize_types::Path,
         size: u64,
         mtime: &UnixTime,
         hash: Hash,
-        realpath: &std::path::Path,
     ) -> Result<bool, StorageError> {
         let inner = Arc::clone(&self.inner);
         let path = path.clone();
         let mtime = mtime.clone();
-        let realpath = realpath.to_path_buf();
+        let root = root.to_path_buf();
 
-        task::spawn_blocking(move || {
-            inner.add_file_if_matches(&path, size, &mtime, hash, &realpath)
-        })
-        .await?
+        task::spawn_blocking(move || inner.add_file_if_matches(&root, &path, size, &mtime, hash))
+            .await?
+    }
+
+    pub async fn remove_file_if_missing(
+        &self,
+        root: &std::path::Path,
+        path: &realize_types::Path,
+    ) -> Result<bool, StorageError> {
+        let inner = Arc::clone(&self.inner);
+        let root = root.to_path_buf();
+        let path = path.clone();
+
+        task::spawn_blocking(move || inner.remove_file_if_missing(&root, &path)).await?
     }
 
     /// Take a remote change into account, if it applies to a file in
@@ -868,11 +921,11 @@ mod tests {
         let foo = fixture.root.child("foo");
         foo.write_str("foo")?;
         assert!(index.add_file_if_matches(
+            fixture.root.path(),
             &realize_types::Path::parse("foo")?,
             3,
             &UnixTime::mtime(&foo.path().metadata()?),
             hash::digest("foo"),
-            foo.path(),
         )?);
         assert!(index.has_file(&realize_types::Path::parse("foo")?)?);
 
@@ -888,11 +941,11 @@ mod tests {
         let foo = fixture.root.child("foo");
         foo.write_str("foo")?;
         assert!(!index.add_file_if_matches(
+            fixture.root.path(),
             &realize_types::Path::parse("foo")?,
             3,
             &UnixTime::from_secs(1234567890),
             hash::digest("foo"),
-            foo.path(),
         )?);
         assert!(!index.has_file(&realize_types::Path::parse("foo")?)?);
 
@@ -908,11 +961,11 @@ mod tests {
         let foo = fixture.root.child("foo");
         foo.write_str("foo")?;
         assert!(!index.add_file_if_matches(
+            fixture.root.path(),
             &realize_types::Path::parse("foo")?,
             2,
             &UnixTime::mtime(&foo.path().metadata()?),
             hash::digest("foo"),
-            foo.path(),
         )?);
         assert!(!index.has_file(&realize_types::Path::parse("foo")?)?);
 
@@ -930,11 +983,11 @@ mod tests {
         let mtime = UnixTime::mtime(&foo.path().metadata()?);
         fs::remove_file(foo.path())?;
         assert!(!index.add_file_if_matches(
+            fixture.root.path(),
             &realize_types::Path::parse("foo")?,
             3,
             &mtime,
             hash::digest("foo"),
-            foo.path(),
         )?);
         assert!(!index.has_file(&realize_types::Path::parse("foo")?)?);
 
@@ -1066,6 +1119,42 @@ mod tests {
 
             assert!(engine::is_dirty(&txn, &path)?);
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remove_file_if_missing_success() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+
+        let index = &fixture.index;
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("bar.txt")?;
+        index.add_file(&path, 100, &mtime, Hash([0xfa; 32]))?;
+        assert!(index.remove_file_if_missing(&fixture.root, &path)?);
+
+        assert_eq!(false, index.has_file(&path)?);
+        assert_eq!(2, index.last_history_index()?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remove_file_if_missing_failure() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+
+        let index = &fixture.index;
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("bar.txt")?;
+        index.add_file(&path, 100, &mtime, Hash([0xfa; 32]))?;
+
+        let realpath = path.within(&fixture.root);
+        fs::write(&realpath, "foo")?;
+
+        assert!(!index.remove_file_if_missing(&fixture.root, &path)?);
+
+        assert_eq!(true, index.has_file(&path)?);
+        assert_eq!(1, index.last_history_index()?);
 
         Ok(())
     }
@@ -2289,11 +2378,10 @@ mod tests {
         // Drop the file
         {
             let txn = fixture.index.db.begin_write()?;
-            let child = fixture.root.child("test.txt");
-            let realpath = child.path();
-            let result = fixture
-                .index
-                .drop_file_if_matches(&txn, &path, &hash, &realpath)?;
+            let result =
+                fixture
+                    .index
+                    .drop_file_if_matches(&txn, fixture.root.path(), &path, &hash)?;
             assert!(result);
             txn.commit()?;
         }
@@ -2334,11 +2422,12 @@ mod tests {
         // Try to drop with wrong hash
         {
             let txn = fixture.index.db.begin_write()?;
-            let child = fixture.root.child("test.txt");
-            let realpath = child.path();
-            let result = fixture
-                .index
-                .drop_file_if_matches(&txn, &path, &wrong_hash, &realpath)?;
+            let result = fixture.index.drop_file_if_matches(
+                &txn,
+                fixture.root.path(),
+                &path,
+                &wrong_hash,
+            )?;
             assert!(!result);
             txn.commit()?;
         }
@@ -2368,11 +2457,10 @@ mod tests {
         // Try to drop file not in index
         {
             let txn = fixture.index.db.begin_write()?;
-            let child = fixture.root.child("not_in_index.txt");
-            let realpath = child.path();
-            let result = fixture
-                .index
-                .drop_file_if_matches(&txn, &path, &hash, &realpath)?;
+            let result =
+                fixture
+                    .index
+                    .drop_file_if_matches(&txn, fixture.root.path(), &path, &hash)?;
             assert!(!result);
             txn.commit()?;
         }
@@ -2407,11 +2495,10 @@ mod tests {
         // Try to drop the file
         {
             let txn = fixture.index.db.begin_write()?;
-            let child = fixture.root.child("test.txt");
-            let realpath = child.path();
-            let result = fixture
-                .index
-                .drop_file_if_matches(&txn, &path, &hash, &realpath)?;
+            let result =
+                fixture
+                    .index
+                    .drop_file_if_matches(&txn, fixture.root.path(), &path, &hash)?;
             assert!(!result);
             txn.commit()?;
         }
@@ -2443,11 +2530,10 @@ mod tests {
         // Try to drop the file
         {
             let txn = fixture.index.db.begin_write()?;
-            let child = fixture.root.child("test.txt");
-            let realpath = child.path();
-            let result = fixture
-                .index
-                .drop_file_if_matches(&txn, &path, &hash, &realpath)?;
+            let result =
+                fixture
+                    .index
+                    .drop_file_if_matches(&txn, fixture.root.path(), &path, &hash)?;
             assert!(!result);
             txn.commit()?;
         }
@@ -2487,11 +2573,10 @@ mod tests {
         // Try to drop the file
         {
             let txn = fixture.index.db.begin_write()?;
-            let child = fixture.root.child("test.txt");
-            let realpath = child.path();
-            let result = fixture
-                .index
-                .drop_file_if_matches(&txn, &path, &hash, &realpath)?;
+            let result =
+                fixture
+                    .index
+                    .drop_file_if_matches(&txn, fixture.root.path(), &path, &hash)?;
             assert!(!result);
             txn.commit()?;
         }
