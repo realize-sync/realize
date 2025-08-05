@@ -117,7 +117,11 @@ impl RealIndexBlocking {
     }
 
     /// Check whether a given file is in the index already.
-    pub fn has_file(&self, path: &realize_types::Path) -> Result<bool, StorageError> {
+    pub fn has_file<T>(&self, path: T) -> Result<bool, StorageError>
+    where
+        T: AsRef<realize_types::Path>,
+    {
+        let path = path.as_ref();
         let txn = self.db.begin_read()?;
         let file_table = txn.index_file_table()?;
 
@@ -291,12 +295,16 @@ impl RealIndexBlocking {
     ///
     /// If the path is a directory, all files within that directory
     /// are removed, recursively.
-    pub fn remove_file_or_dir(&self, path: &realize_types::Path) -> Result<(), StorageError> {
+    pub fn remove_file_or_dir<T>(&self, path: T) -> Result<(), StorageError>
+    where
+        T: AsRef<realize_types::Path>,
+    {
+        let path = path.as_ref();
         let txn = self.db.begin_write()?;
         {
             let mut file_table = txn.index_file_table()?;
             let mut history_table = txn.index_history_table()?;
-            let path_prefix = PathPrefix::new(&path);
+            let path_prefix = PathPrefix::new(path);
 
             for entry in
                 file_table.extract_from_if(path_prefix.range(), |k, _| path_prefix.accept(k))?
@@ -649,7 +657,11 @@ impl RealIndexAsync {
     }
 
     /// Check whether a given file is in the index already.
-    pub async fn has_file(&self, path: &realize_types::Path) -> Result<bool, StorageError> {
+    pub async fn has_file<T>(&self, path: T) -> Result<bool, StorageError>
+    where
+        T: AsRef<realize_types::Path>,
+    {
+        let path = path.as_ref();
         let inner = Arc::clone(&self.inner);
         let path = path.clone();
 
@@ -674,11 +686,15 @@ impl RealIndexAsync {
     ///
     /// If the path is a directory, all files within that directory
     /// are removed, recursively.
-    pub async fn remove_file_or_dir(&self, path: &realize_types::Path) -> Result<(), StorageError> {
+    pub async fn remove_file_or_dir<T>(&self, path: T) -> Result<(), StorageError>
+    where
+        T: AsRef<realize_types::Path>,
+    {
+        let path = path.as_ref();
         let inner = Arc::clone(&self.inner);
         let path = path.clone();
 
-        task::spawn_blocking(move || inner.remove_file_or_dir(&path)).await?
+        task::spawn_blocking(move || inner.remove_file_or_dir(path)).await?
     }
 
     pub async fn add_file(

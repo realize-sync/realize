@@ -44,11 +44,14 @@ impl PathMarks {
         })
     }
 
-    /// Get the mark for a specific path.
-    ///
-    /// The mark might have been set on the given path, one of its
+    /// Get the mark for a specific path, which can be a file or a directory.
+    /// The mark can be inherited from one of its
     /// parents or it can be the root mark.
-    pub fn get_mark(&self, path: &Path) -> Result<Mark, StorageError> {
+    pub fn get_mark<T>(&self, path: T) -> Result<Mark, StorageError>
+    where
+        T: AsRef<Path>,
+    {
+        let path = path.as_ref();
         let txn = self.db.begin_read()?;
         let mark_table = txn.mark_table()?;
 
@@ -61,12 +64,20 @@ impl PathMarks {
     }
 
     /// Set a mark for a specific path, which can be a file or a directory.
-    pub fn set_mark(&self, path: &Path, mark: Mark) -> Result<(), StorageError> {
+    pub fn set_mark<T>(&self, path: T, mark: Mark) -> Result<(), StorageError>
+    where
+        T: AsRef<Path>,
+    {
+        let path = path.as_ref();
         self.set_mark_or_root(Some(path), mark)
     }
 
     /// Unset a mark for a specific path.
-    pub fn clear_mark(&self, path: &Path) -> Result<(), StorageError> {
+    pub fn clear_mark<T>(&self, path: T) -> Result<(), StorageError>
+    where
+        T: AsRef<Path>,
+    {
+        let path = path.as_ref();
         let txn = self.db.begin_write()?;
         {
             let mut mark_table = txn.mark_table()?;
@@ -144,7 +155,11 @@ impl PathMarks {
     }
 }
 
-pub(crate) fn get_mark(txn: &ArenaReadTransaction, path: &Path) -> Result<Mark, StorageError> {
+pub(crate) fn get_mark<T>(txn: &ArenaReadTransaction, path: T) -> Result<Mark, StorageError>
+where
+    T: AsRef<Path>,
+{
+    let path = path.as_ref();
     let mark_table = txn.mark_table()?;
     do_get_mark(&mark_table, Some(path))
 }
@@ -233,20 +248,32 @@ mod tests {
         }
 
         /// Check if a path is dirty in the index
-        fn is_dirty(&self, path: &Path) -> anyhow::Result<bool> {
+        fn is_dirty<T>(&self, path: T) -> anyhow::Result<bool>
+        where
+            T: AsRef<Path>,
+        {
+            let path = path.as_ref();
             let txn = self.db.begin_read()?;
             Ok(engine::is_dirty(&txn, path)?)
         }
 
         /// Add a file to the index for testing
-        fn add_file_to_index(&self, path: &Path) -> anyhow::Result<()> {
+        fn add_file_to_index<T>(&self, path: T) -> anyhow::Result<()>
+        where
+            T: AsRef<Path>,
+        {
+            let path = path.as_ref();
             Ok(self
                 .index
                 .add_file(path, 100, UnixTime::from_secs(1234567889), Hash([1; 32]))?)
         }
 
         /// Add a file to the cache for testing
-        fn add_file_to_cache(&self, path: &Path) -> anyhow::Result<()> {
+        fn add_file_to_cache<T>(&self, path: T) -> anyhow::Result<()>
+        where
+            T: AsRef<Path>,
+        {
+            let path = path.as_ref();
             use crate::arena::notifier::Notification;
             use realize_types::Peer;
 

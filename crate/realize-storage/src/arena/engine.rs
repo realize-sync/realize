@@ -108,11 +108,15 @@ impl DirtyPaths {
     /// Mark a path dirty.
     ///
     /// This does nothing if the path is already dirty.
-    pub(crate) fn mark_dirty(
+    pub(crate) fn mark_dirty<T>(
         &self,
         txn: &ArenaWriteTransaction,
-        path: &Path,
-    ) -> Result<(), StorageError> {
+        path: T,
+    ) -> Result<(), StorageError>
+    where
+        T: AsRef<Path>,
+    {
+        let path = path.as_ref();
         let mut dirty_table = txn.dirty_table()?;
         let mut dirty_log_table = txn.dirty_log_table()?;
         let mut dirty_counter_table = txn.dirty_counter_table()?;
@@ -508,12 +512,15 @@ impl Engine {
     }
 
     /// Build a Job for the given path, if any.
-    pub(crate) async fn job_for_path(
+    pub(crate) async fn job_for_path<T>(
         self: &Arc<Self>,
-        path: &Path,
-    ) -> Result<Option<(JobId, Job)>, StorageError> {
+        path: T,
+    ) -> Result<Option<(JobId, Job)>, StorageError>
+    where
+        T: AsRef<Path>,
+    {
         let this = Arc::clone(self);
-        let path = path.clone();
+        let path = path.as_ref().clone();
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
             let dirty_table = txn.dirty_table()?;
@@ -739,12 +746,21 @@ impl Engine {
     }
 }
 
-fn current_path_counter(
+fn current_path_counter<T>(
     txn: &ArenaWriteTransaction,
-    path: &Path,
-) -> Result<Option<u64>, StorageError> {
-    let current = txn.dirty_table()?.get(path.as_str())?.map(|e| e.value());
-    Ok(current)
+    path: T,
+) -> Result<Option<u64>, StorageError>
+where
+    T: AsRef<Path>,
+{
+    let path = path.as_ref();
+    let dirty_table = txn.dirty_table()?;
+
+    if let Some(entry) = dirty_table.get(path.as_str())? {
+        Ok(Some(entry.value()))
+    } else {
+        Ok(None)
+    }
 }
 
 fn last_counter(
@@ -754,17 +770,25 @@ fn last_counter(
 }
 
 /// Check the dirty mark on a path.
-pub(crate) fn is_dirty(txn: &ArenaReadTransaction, path: &Path) -> Result<bool, StorageError> {
+pub(crate) fn is_dirty<T>(txn: &ArenaReadTransaction, path: T) -> Result<bool, StorageError>
+where
+    T: AsRef<Path>,
+{
+    let path = path.as_ref();
     let dirty_table = txn.dirty_table()?;
 
     Ok(dirty_table.get(path.as_str())?.is_some())
 }
 
 /// Check whether a path is dirty and if it is return its dirty mark counter.
-pub(crate) fn get_dirty(
+pub(crate) fn get_dirty<T>(
     txn: &ArenaReadTransaction,
-    path: &Path,
-) -> Result<Option<u64>, StorageError> {
+    path: T,
+) -> Result<Option<u64>, StorageError>
+where
+    T: AsRef<Path>,
+{
+    let path = path.as_ref();
     let dirty_table = txn.dirty_table()?;
 
     let entry = dirty_table.get(path.as_str())?;
@@ -775,7 +799,11 @@ pub(crate) fn get_dirty(
 /// Clear the dirty mark on a path.
 ///
 /// This does nothing if the path has no dirty mark.
-pub(crate) fn clear_dirty(txn: &ArenaWriteTransaction, path: &Path) -> Result<(), StorageError> {
+pub(crate) fn clear_dirty<T>(txn: &ArenaWriteTransaction, path: T) -> Result<(), StorageError>
+where
+    T: AsRef<Path>,
+{
+    let path = path.as_ref();
     let mut dirty_table = txn.dirty_table()?;
     let mut dirty_log_table = txn.dirty_log_table()?;
     let mut failed_job_table = txn.failed_job_table()?;
@@ -917,11 +945,18 @@ mod tests {
         }
 
         /// Add a file to the cache for testing
-        fn add_file_to_cache(&self, path: &Path) -> anyhow::Result<()> {
+        fn add_file_to_cache<T>(&self, path: T) -> anyhow::Result<()>
+        where
+            T: AsRef<Path>,
+        {
             self.add_file_to_cache_with_version(path, test_hash())
         }
 
-        fn add_file_to_cache_with_version(&self, path: &Path, hash: Hash) -> anyhow::Result<()> {
+        fn add_file_to_cache_with_version<T>(&self, path: T, hash: Hash) -> anyhow::Result<()>
+        where
+            T: AsRef<Path>,
+        {
+            let path = path.as_ref();
             self.update_cache(Notification::Add {
                 arena: self.arena,
                 index: 1,
@@ -932,7 +967,11 @@ mod tests {
             })
         }
 
-        fn remove_file_from_cache(&self, path: &Path) -> anyhow::Result<()> {
+        fn remove_file_from_cache<T>(&self, path: T) -> anyhow::Result<()>
+        where
+            T: AsRef<Path>,
+        {
+            let path = path.as_ref();
             self.update_cache(Notification::Remove {
                 arena: self.arena,
                 index: 1,
@@ -943,12 +982,16 @@ mod tests {
 
         // A new version comes in that replaces the version in the
         // cache/index.
-        fn replace_in_cache_and_index(
+        fn replace_in_cache_and_index<T>(
             &self,
-            path: &Path,
+            path: T,
             hash: Hash,
             old_hash: Hash,
-        ) -> anyhow::Result<()> {
+        ) -> anyhow::Result<()>
+        where
+            T: AsRef<Path>,
+        {
+            let path = path.as_ref();
             let notification = Notification::Replace {
                 arena: self.arena,
                 index: 1,
@@ -964,7 +1007,11 @@ mod tests {
             Ok(())
         }
 
-        fn add_file_to_index_with_version(&self, path: &Path, hash: Hash) -> anyhow::Result<()> {
+        fn add_file_to_index_with_version<T>(&self, path: T, hash: Hash) -> anyhow::Result<()>
+        where
+            T: AsRef<Path>,
+        {
+            let path = path.as_ref();
             Ok(self
                 .index
                 .add_file(path, 100, UnixTime::from_secs(1234567889), hash)?)
@@ -989,11 +1036,13 @@ mod tests {
             Ok(dirty_log_table.first()?.map(|(k, _)| k.value()))
         }
 
-        fn mark_dirty(&self, path: &Path) -> anyhow::Result<()> {
+        fn mark_dirty<T>(&self, path: T) -> anyhow::Result<()>
+        where
+            T: AsRef<Path>,
+        {
             let txn = self.db.begin_write()?;
             self.dirty_paths.mark_dirty(&txn, path)?;
             txn.commit()?;
-
             Ok(())
         }
     }

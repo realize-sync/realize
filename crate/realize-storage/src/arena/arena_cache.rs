@@ -70,10 +70,11 @@ impl ArenaCache {
         do_lookup(&txn.cache_directory_table()?, parent_inode, name)
     }
 
-    pub(crate) fn lookup_path(
-        &self,
-        path: &Path,
-    ) -> Result<(Inode, InodeAssignment), StorageError> {
+    pub(crate) fn lookup_path<T>(&self, path: T) -> Result<(Inode, InodeAssignment), StorageError>
+    where
+        T: AsRef<Path>,
+    {
+        let path = path.as_ref();
         let txn = self.db.begin_read()?;
         let dir_table = txn.cache_directory_table()?;
 
@@ -281,13 +282,17 @@ impl ArenaCache {
     ///
     /// Gives up and returns false if `path` doesn't have a verified
     /// blob with version `hash`.
-    pub(crate) fn move_blob_if_matches(
+    pub(crate) fn move_blob_if_matches<T>(
         &self,
         txn: &ArenaWriteTransaction,
-        path: &Path,
+        path: T,
         hash: &Hash,
         dest: &std::path::Path,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<bool, StorageError>
+    where
+        T: AsRef<Path>,
+    {
+        let path = path.as_ref();
         let (inode, _) =
             do_lookup_path(&txn.cache_directory_table()?, self.arena_root, Some(path))?;
         let mut file_table = txn.cache_file_table()?;
@@ -321,12 +326,16 @@ impl ArenaCache {
     /// file into the blob, replacing any existing ones.
     ///
     /// Gives up and returns None if `hash` doesn't match the entry version.
-    pub(crate) fn move_into_blob_if_matches(
+    pub(crate) fn move_into_blob_if_matches<T>(
         &self,
         txn: &ArenaWriteTransaction,
-        path: &Path,
+        path: T,
         hash: &Hash,
-    ) -> Result<Option<PathBuf>, StorageError> {
+    ) -> Result<Option<PathBuf>, StorageError>
+    where
+        T: AsRef<Path>,
+    {
+        let path = path.as_ref();
         let inode = match do_lookup_path(&txn.cache_directory_table()?, self.arena_root, Some(path))
         {
             Ok((inode, _)) => inode,
@@ -504,14 +513,18 @@ impl ArenaCache {
         Ok(())
     }
 
-    fn do_unlink(
+    fn do_unlink<T>(
         &self,
         txn: &ArenaWriteTransaction,
         peer: Peer,
         arena_root: Inode,
-        path: &Path,
+        path: T,
         old_hash: Hash,
-    ) -> Result<(), StorageError> {
+    ) -> Result<(), StorageError>
+    where
+        T: AsRef<Path>,
+    {
+        let path = path.as_ref();
         let mut dir_table = txn.cache_directory_table()?;
         let (parent_inode, parent_assignment) =
             do_lookup_path(&dir_table, arena_root, path.parent().as_ref())?;
@@ -756,11 +769,15 @@ pub(crate) fn do_dir_mtime(
 }
 
 // Return the default file entry for a path.
-pub(crate) fn get_file_entry_for_path(
+pub(crate) fn get_file_entry_for_path<T>(
     txn: &ArenaReadTransaction,
     root: Inode,
-    path: &Path,
-) -> Result<FileTableEntry, StorageError> {
+    path: T,
+) -> Result<FileTableEntry, StorageError>
+where
+    T: AsRef<Path>,
+{
+    let path = path.as_ref();
     let dir_table = txn.cache_directory_table()?;
     let (inode, assignment) = do_lookup_path(&dir_table, root, Some(path))?;
     if assignment != InodeAssignment::File {
@@ -846,12 +863,16 @@ fn do_file_availability(
 /// Retrieve or create a file entry at the given path.
 ///
 /// Return the parent inode and the file inode.
-fn do_create_file(
+fn do_create_file<T>(
     txn: &ArenaWriteTransaction,
     arena_root: Inode,
-    path: &Path,
+    path: T,
     alloc_inode: &impl Fn() -> Result<Inode, StorageError>,
-) -> Result<(Inode, Inode), StorageError> {
+) -> Result<(Inode, Inode), StorageError>
+where
+    T: AsRef<Path>,
+{
+    let path = path.as_ref();
     let mut dir_table = txn.cache_directory_table()?;
     let filename = path.name();
     let parent_inode = do_mkdirs(
@@ -1111,12 +1132,20 @@ mod tests {
             Ok(())
         }
 
-        fn dir_mtime(&self, path: &Path) -> anyhow::Result<UnixTime> {
-            let (inode, _) = self.acache.lookup_path(&path)?;
+        fn dir_mtime<T>(&self, path: T) -> anyhow::Result<UnixTime>
+        where
+            T: AsRef<Path>,
+        {
+            let path = path.as_ref();
+            let (inode, _) = self.acache.lookup_path(path)?;
             Ok(self.acache.dir_mtime(inode)?)
         }
 
-        fn add_file(&self, path: &Path, size: u64, mtime: UnixTime) -> anyhow::Result<()> {
+        fn add_file<T>(&self, path: T, size: u64, mtime: UnixTime) -> anyhow::Result<()>
+        where
+            T: AsRef<Path>,
+        {
+            let path = path.as_ref();
             self.acache.update(
                 test_peer(),
                 Notification::Add {
@@ -1132,7 +1161,11 @@ mod tests {
             Ok(())
         }
 
-        fn remove_file(&self, path: &Path) -> anyhow::Result<()> {
+        fn remove_file<T>(&self, path: T) -> anyhow::Result<()>
+        where
+            T: AsRef<Path>,
+        {
+            let path = path.as_ref();
             self.acache.update(
                 test_peer(),
                 Notification::Remove {
