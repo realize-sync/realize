@@ -1,13 +1,13 @@
 #![allow(dead_code)] // work in progress
 
-use crate::utils::hash;
+use crate::utils::{fs_utils, hash};
 
 use super::hasher::{self, HashResult, Hasher};
 use super::index::RealIndexAsync;
 use futures::StreamExt as _;
 use notify::event::{CreateKind, MetadataKind, ModifyKind};
 use notify::{Event, EventKind, RecommendedWatcher, Watcher as _};
-use realize_types::{self, UnixTime};
+use realize_types::{self, Path, UnixTime};
 use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
@@ -96,17 +96,20 @@ impl RealWatcher {
             let root = root.clone();
             let watch_tx = watch_tx.clone();
             tokio::task::spawn_blocking(move || {
-                let mut watcher =
-                    notify::recommended_watcher(move |ev: Result<Event, notify::Error>| {
+                let mut watcher = notify::recommended_watcher({
+                    let root = root.clone();
+
+                    move |ev: Result<Event, notify::Error>| {
                         if let Ok(ev) = ev {
                             if ev.flag() == Some(notify::event::Flag::Rescan) {
                                 let _ = watch_tx.blocking_send(FsEvent::Rescan);
                             }
-                            if let Some(ev) = FsEvent::from(ev) {
+                            if let Some(ev) = FsEvent::from_notify(&root, ev) {
                                 let _ = watch_tx.blocking_send(ev);
                             }
                         }
-                    })?;
+                    }
+                })?;
                 watcher.configure(notify::Config::default().with_follow_symlinks(false))?;
                 watcher.watch(&root, notify::RecursiveMode::Recursive)?;
                 log::debug!("[{}] Watching {root:?} recursively.", arena);
@@ -170,58 +173,71 @@ impl RealWatcher {
 #[derive(Debug)]
 enum FsEvent {
     /// Notify reported that this file was removed
-    Removed(PathBuf),
+    Removed(Path),
     /// Notify reported that a new directory was created at this path.
-    DirCreated(PathBuf),
+    DirCreated(Path),
 
     /// Notify reported that a new file was created at this path.
-    FileCreated(PathBuf),
+    FileCreated(Path),
 
     /// Notify reported the following files moved.
     ///
     /// The path vector both sources and destinations.
-    Moved(Vec<PathBuf>),
+    Moved(Vec<Path>),
 
     /// Notify reported that metadata of this file have changed.
-    MetadataChanged(PathBuf),
+    MetadataChanged(Path),
 
     /// Notify reported that the content of this file has changed.
-    ContentModified(PathBuf),
+    ContentModified(Path),
 
     /// Notify reported that a rescan may be needed
     Rescan,
 
     /// Couldn't find the path anymore while scanning.
-    Gone(PathBuf),
+    Gone(Path),
 
     /// While scanning, it was noticed that the file at this path has
     /// changed since it was indexed.
-    NeedsUpdate(PathBuf),
+    NeedsUpdate(Path),
 }
 
 impl FsEvent {
     /// Create a [FsEvent] from a [notify::Event]
-    fn from(mut ev: Event) -> Option<Self> {
+    fn from_notify(root: &std::path::Path, ev: Event) -> Option<Self> {
         match ev.kind {
-            EventKind::Remove(_) => ev.paths.pop().map(|p| FsEvent::Removed(p)),
-            EventKind::Create(CreateKind::Folder) => ev.paths.pop().map(|p| FsEvent::DirCreated(p)),
-            EventKind::Create(CreateKind::File) => ev.paths.pop().map(|p| FsEvent::FileCreated(p)),
-            EventKind::Modify(ModifyKind::Name(_)) => Some(FsEvent::Moved(ev.paths)),
+            EventKind::Remove(_) => take_path(root, ev).map(|p| FsEvent::Removed(p)),
+            EventKind::Create(CreateKind::Folder) => {
+                take_path(root, ev).map(|p| FsEvent::DirCreated(p))
+            }
+            EventKind::Create(CreateKind::File) => {
+                take_path(root, ev).map(|p| FsEvent::FileCreated(p))
+            }
+            EventKind::Modify(ModifyKind::Name(_)) => Some(FsEvent::Moved(
+                ev.paths
+                    .into_iter()
+                    .flat_map(|p| Path::from_real_path_in(&p, root))
+                    .collect(),
+            )),
             EventKind::Modify(ModifyKind::Metadata(
                 MetadataKind::Permissions | MetadataKind::Ownership | MetadataKind::Any,
-            )) => ev.paths.pop().map(|p| FsEvent::MetadataChanged(p)),
+            )) => take_path(root, ev).map(|p| FsEvent::MetadataChanged(p)),
 
             #[cfg(target_os = "linux")]
             EventKind::Access(notify::event::AccessKind::Close(
                 notify::event::AccessMode::Write,
-            )) => ev.paths.pop().map(|p| FsEvent::ContentModified(p)),
+            )) => take_path(root, ev).map(|p| FsEvent::ContentModified(p)),
             #[cfg(target_os = "macos")]
             EventKind::Modify(ModifyKind::Data(_)) => {
-                ev.paths.pop().map(|p| FsEvent::ContentModified(p))
+                take_path(root, ev).map(|p| FsEvent::ContentModified(p))
             }
             _ => None,
         }
     }
+}
+
+fn take_path(root: &std::path::Path, mut ev: Event) -> Option<Path> {
+    Path::from_real_path_in(&ev.paths.pop()?, root)
 }
 
 struct RealWatcherWorker {
@@ -318,9 +334,9 @@ impl RealWatcherWorker {
                 }
 
                 if is_deleted {
-                    watch_tx.send(FsEvent::Gone(full_path)).await?;
+                    watch_tx.send(FsEvent::Gone(path)).await?;
                 } else if is_modified {
-                    watch_tx.send(FsEvent::NeedsUpdate(full_path)).await?;
+                    watch_tx.send(FsEvent::NeedsUpdate(path)).await?;
                 }
             });
         }
@@ -357,7 +373,7 @@ impl RealWatcherWorker {
                 }
 
                 let full_path = direntry.path();
-                let path = match self.to_model_path(&full_path) {
+                let path = match self.relative_path(&full_path) {
                     Some(p) => p,
                     None => {
                         continue;
@@ -377,7 +393,7 @@ impl RealWatcherWorker {
                 // Send an event to add the file to the index. Note
                 // that this is not a create event as we already have
                 // file content.
-                watch_tx.send(FsEvent::NeedsUpdate(full_path)).await?;
+                watch_tx.send(FsEvent::NeedsUpdate(path)).await?;
             });
         }
 
@@ -452,22 +468,22 @@ impl RealWatcherWorker {
 
     async fn handle_event(&self, ev: &FsEvent, rescan_tx: &mpsc::Sender<()>) -> anyhow::Result<()> {
         match ev {
-            FsEvent::Removed(realpath) | FsEvent::Gone(realpath) => {
+            FsEvent::Removed(path) | FsEvent::Gone(path) => {
                 // Remove can't always tell whether a file or
                 // directory was removed, so we don't bother checking.
-                self.file_or_dir_removed(realpath).await?;
+                self.file_or_dir_removed(path).await?;
             }
 
-            FsEvent::DirCreated(realpath) => {
-                let m = fs::symlink_metadata(realpath).await?;
+            FsEvent::DirCreated(path) => {
+                let m = fs_utils::metadata_no_symlink(&self.root, path).await?;
                 // Checking is_dir() because the  folder might actually be a symlink.
                 if m.is_dir() {
-                    self.dir_created_or_modified(realpath).await?;
+                    self.dir_created_or_modified(path).await?;
                 }
             }
 
-            FsEvent::FileCreated(realpath) => {
-                if let Ok(m) = fs::symlink_metadata(realpath).await
+            FsEvent::FileCreated(path) => {
+                if let Ok(m) = fs_utils::metadata_no_symlink(&self.root, path).await
                     && m.is_file()
                 {
                     // If not a hard link, not a rename and len > 0,
@@ -475,12 +491,12 @@ impl RealWatcherWorker {
                     // started, so there's no point in creating an
                     // entry; we'll get a Modify event soon enough.
                     if m.nlink() > 1 || m.len() == 0 {
-                        self.file_created_or_modified(realpath, &m).await?;
+                        self.file_created_or_modified(path, &m).await?;
                     }
                 }
             }
 
-            FsEvent::Moved(realpaths) => {
+            FsEvent::Moved(paths) => {
                 // We can't trust that the notification tells us
                 // whether a file or dir was moved to or from the
                 // directory; check both.
@@ -489,60 +505,60 @@ impl RealWatcherWorker {
                 // converting to realize_types::Path, so we don't bother
                 // checking here.
 
-                for realpath in realpaths {
-                    match fs::symlink_metadata(realpath).await {
+                for path in paths {
+                    match fs_utils::metadata_no_symlink(&self.root, path).await {
                         Ok(m) => {
                             // Possibly moved to; add or update
                             if m.is_file() {
-                                self.file_created_or_modified(realpath, &m).await?;
+                                self.file_created_or_modified(path, &m).await?;
                             } else if m.is_dir() {
-                                self.dir_created_or_modified(realpath).await?;
+                                self.dir_created_or_modified(path).await?;
                             }
                         }
                         Err(_) => {
                             // Possibly moved from; remove
-                            self.file_or_dir_removed(realpath).await?;
+                            self.file_or_dir_removed(path).await?;
                         }
                     }
                 }
             }
-            FsEvent::MetadataChanged(realpath) => {
+            FsEvent::MetadataChanged(path) => {
                 // Files that were accessible might have become
                 // inacessible or the other way round. This is stored
                 // as add/remove, with inaccessible files treated as
                 // if they're gone.
-                match fs::symlink_metadata(realpath).await {
+                match fs_utils::metadata_no_symlink(&self.root, path).await {
                     Err(_) => {
                         // Not accessible anymore.
-                        self.file_or_dir_removed(realpath).await?;
+                        self.file_or_dir_removed(path).await?;
                     }
                     Ok(m) => {
                         if m.is_dir() {
-                            if fs::read_dir(realpath).await.is_ok() {
+                            if fs::read_dir(path.within(&self.root)).await.is_ok() {
                                 // Might have just become accessible.
-                                self.dir_created_or_modified(realpath).await?;
+                                self.dir_created_or_modified(path).await?;
                             } else {
                                 // Might have just become inaccessible
-                                self.file_or_dir_removed(realpath).await?;
+                                self.file_or_dir_removed(path).await?;
                             }
                         } else {
-                            if file_is_readable(realpath).await {
+                            if file_is_readable(&path.within(&self.root)).await {
                                 // Might have just become accessible.
-                                self.file_created_or_modified(realpath, &m).await?;
+                                self.file_created_or_modified(path, &m).await?;
                             } else {
                                 // Might have just become inaccessible
-                                self.file_or_dir_removed(realpath).await?;
+                                self.file_or_dir_removed(path).await?;
                             }
                         }
                     }
                 }
             }
 
-            FsEvent::ContentModified(realpath) | FsEvent::NeedsUpdate(realpath) => {
-                let m = fs::symlink_metadata(realpath).await?;
+            FsEvent::ContentModified(path) | FsEvent::NeedsUpdate(path) => {
+                let m = fs_utils::metadata_no_symlink(&self.root, path).await?;
                 if m.is_file() {
                     // This event only matters if it's a file.
-                    self.file_created_or_modified(realpath, &m).await?;
+                    self.file_created_or_modified(path, &m).await?;
                 }
             }
             FsEvent::Rescan => {
@@ -553,24 +569,15 @@ impl RealWatcherWorker {
         Ok(())
     }
 
-    async fn file_or_dir_removed(&self, realpath: &std::path::Path) -> anyhow::Result<()> {
-        let path = match self.to_model_path(&realpath) {
-            Some(p) => p,
-            None => {
-                return Ok(());
-            }
-        };
-
+    async fn file_or_dir_removed(&self, path: &Path) -> anyhow::Result<()> {
         self.index.remove_file_or_dir(&path).await?;
 
         Ok(())
     }
 
-    async fn dir_created_or_modified(
-        &self,
-        dirpath: &std::path::Path,
-    ) -> Result<(), anyhow::Error> {
-        let mut direntries = async_walkdir::WalkDir::new(&dirpath).filter(only_regular);
+    async fn dir_created_or_modified(&self, dirpath: &Path) -> Result<(), anyhow::Error> {
+        let mut direntries =
+            async_walkdir::WalkDir::new(dirpath.within(&self.root)).filter(only_regular);
         while let Some(direntry) = direntries.next().await {
             let direntry = match direntry {
                 Err(_) => {
@@ -590,7 +597,7 @@ impl RealWatcherWorker {
             }
 
             let realpath = direntry.path();
-            let path = match self.to_model_path(&realpath) {
+            let path = match self.relative_path(&realpath) {
                 Some(p) => p,
                 None => {
                     continue;
@@ -604,7 +611,7 @@ impl RealWatcherWorker {
                 }
             };
 
-            if let Err(err) = self.file_created_or_modified(&realpath, &m).await {
+            if let Err(err) = self.file_created_or_modified(&path, &m).await {
                 log::debug!("[{}] Failed to add {path}: {err}", self.index.arena());
             }
         }
@@ -614,29 +621,18 @@ impl RealWatcherWorker {
 
     async fn file_created_or_modified(
         &self,
-        realpath: &std::path::Path,
+        path: &Path,
         m: &Metadata,
     ) -> Result<(), anyhow::Error> {
-        if fs::canonicalize(&realpath).await? != *realpath {
-            // Skip paths with symlinks in them.
-            return Ok(());
-        }
-        let path = match self.to_model_path(&realpath) {
-            Some(p) => p,
-            None => {
-                return Ok(());
-            }
-        };
-
         // Skip if the file is to be excluded from the index.
-        if self.is_excluded(&path) {
+        if self.is_excluded(path) {
             return Ok(());
         }
 
         let mtime = UnixTime::mtime(m);
         if self
             .index
-            .has_matching_file(&path, m.len(), &mtime)
+            .has_matching_file(path, m.len(), &mtime)
             .await
             .unwrap_or(false)
         {
@@ -645,20 +641,21 @@ impl RealWatcherWorker {
         if m.len() == 0 {
             log::debug!("[{}] Empty file at {path}", self.index.arena());
             self.index
-                .add_file(&path, 0, &UnixTime::mtime(&m), hash::empty())
+                .add_file(path, 0, &UnixTime::mtime(&m), hash::empty())
                 .await?;
         } else {
             log::debug!("[{}] Requesting hash of {path}", self.index.arena());
-            self.hasher.request_hash(realpath.to_path_buf(), path);
+            self.hasher
+                .request_hash(path.within(&self.root), path.clone());
         }
         Ok(())
     }
 
     /// Convert a full path to a [realize_types::Path] within the arena, if possible.
-    fn to_model_path(&self, path: &std::path::Path) -> Option<realize_types::Path> {
+    fn relative_path(&self, path: &std::path::Path) -> Option<realize_types::Path> {
         // TODO: Should this use a PathResolver? We may or may not want
         // to care about partial/full files here.
-        realize_types::Path::from_real_path_in(&path, &self.root).ok()
+        realize_types::Path::from_real_path_in(&path, &self.root)
     }
 
     /// Check whether the given path should be excluded from the index.

@@ -66,7 +66,7 @@ impl ArenaStorage {
                         .await?;
                 let exclude = exclude
                     .iter()
-                    .filter_map(|p| realize_types::Path::from_real_path_in(p, root).ok())
+                    .filter_map(|p| realize_types::Path::from_real_path_in(p, root))
                     .collect::<Vec<_>>();
                 log::debug!("Watch {root:?}, excluding {exclude:?}");
                 let watcher = RealWatcher::builder(root, index.clone())
