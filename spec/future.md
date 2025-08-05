@@ -3,13 +3,13 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
-## "realize-control churten run" {#churten-run}
-  - start churten
-  - listen to notifications, display
-  - stop churten on shutdown
-## expose connection info through RPC and display in realize-control {#conninfo}
-## realize-control set-mark arena [path] {#setmark}
-## download limit that applies only to churten {#churtenlimit}
+## Expose connection info through RPC and display in realize-control {#conninfo}
+
+## Add Mark::Ignore {#ignore}
+
+Mark::Ignore means that a file or directory must not be indexed. It
+might also mean that a file or directory must not be added into the
+cache, even if reported by another peer.
 
 ## Update marks from xattrs {#marksxattrs}
 
@@ -98,20 +98,6 @@ Task list:
 
 Forbidding just brings trouble on Linux.
 
-## Design: Multi-peer syncing {#multi-peer}
-
-This needs more thoughts: do peer get told about non-local (indirect)
-changes? do all peers need to be told about a non-local change?
-
-What does it look like to add a new peer?
-
-## Gate copy by file size {#sizegate}
-
-Instead of allowing one file to copy at a time, allow multiple for a
-total of up to CHUNK_SIZE bytes. A file > CHUNK_SIZE gets copied one
-at a time, but smaller files can be grouped together. Might be worth
-increasing the number of parallel files for that.
-
 ## IPV6 + IPV4 {#ipv64}
 
 Localhost is currently resolved to ipv6 address, which isn't what's
@@ -124,23 +110,10 @@ have it work normally (try ipv6, fallback to ipv4).
 This is normally automatic, I expect, but the custom transformation to
 SocketAddr screws that up.
 
-## Test retries {#testretries}
-
-Make it possible to intercept RealStoreService operations in tests to
-test:
-
-- write errors later fixed by rsync
-- rsync producing a bad chunk, handled as a copy later on
-
 ## Drop empty delta {#emptydelta}
 
 Detect empty deltas from the rsync algorithm and skip sending a RPC
 for them.
-
-## Drop hash past dest filesize {#sizebeforehash}
-
-Check dest filesize before sending a hash RPC and just store None in
-the RangedHash.
 
 ## Compression {#compress}
 
