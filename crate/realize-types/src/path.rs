@@ -32,7 +32,8 @@ impl Path {
     ///
     /// Not all real paths can be transformed. They must be relative,
     /// non-empty paths containing only valid unicode strings.
-    pub fn from_real_path(path: &path::Path) -> Result<Path, PathError> {
+    pub fn from_real_path<T: AsRef<path::Path>>(path: T) -> Result<Path, PathError> {
+        let path = path.as_ref();
         for component in path.components() {
             match component {
                 std::path::Component::Normal(_) => {}
@@ -48,8 +49,13 @@ impl Path {
     /// Build a path from the given path, relative to the given root.
     ///
     /// For this to work, the given path must be inside the given root.
-    pub fn from_real_path_in(path: &path::Path, root: &path::Path) -> Option<Path> {
-        path.strip_prefix(root)
+    pub fn from_real_path_in<T, U>(path: T, root: U) -> Option<Path>
+    where
+        T: AsRef<path::Path>,
+        U: AsRef<path::Path>,
+    {
+        path.as_ref()
+            .strip_prefix(root.as_ref())
             .ok()
             .map(|p| Path::from_real_path(p).ok())
             .flatten()
@@ -105,8 +111,8 @@ impl Path {
     }
 
     /// Build a real path within the given path.
-    pub fn within(&self, path: &path::Path) -> path::PathBuf {
-        path.join(self.as_real_path())
+    pub fn within<T: AsRef<path::Path>>(&self, path: T) -> path::PathBuf {
+        path.as_ref().join(self.as_real_path())
     }
 
     pub fn as_str(&self) -> &str {
@@ -120,8 +126,8 @@ impl Path {
     /// `Path::parse("foobar")?` does not start with
     /// `Path::parts("foo")?` even though "foobar" start with
     /// "foo".
-    pub fn starts_with(&self, other: &Path) -> bool {
-        if let Some(rest) = self.0.strip_prefix(other.as_str()) {
+    pub fn starts_with<T: AsRef<Path>>(&self, other: T) -> bool {
+        if let Some(rest) = self.0.strip_prefix(other.as_ref().as_str()) {
             return rest == "" || rest.starts_with('/');
         }
 
@@ -129,6 +135,11 @@ impl Path {
     }
 }
 
+impl AsRef<Path> for Path {
+    fn as_ref(&self) -> &Path {
+        self
+    }
+}
 impl From<Path> for path::PathBuf {
     fn from(val: Path) -> Self {
         val.as_real_path().to_path_buf()
