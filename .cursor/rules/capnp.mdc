@@ -1,3 +1,9 @@
+---
+description: Working with capnp protos
+globs: *.rs
+alwaysApply: false
+---
+
 # Capnp Protocol Buffer Best Practices
 
 This rule documents best practices for working with capnp protocol buffers in Rust projects.
@@ -93,11 +99,11 @@ fn my_method(
     Promise::from_future(async move {
         // Async work here
         let data = storage.get_data().await?;
-        
+
         // Fill results
         let mut res = results.get().init_res();
         res.set_field(data);
-        
+
         Ok(())
     })
 }
@@ -112,15 +118,15 @@ fn recent_items(
     mut results: RecentItemsResults,
 ) -> Promise<(), capnp::Error> {
     let items = self.get_items().await;
-    
+
     // Create list with correct size
     let mut item_list = results.get().init_res(items.len() as u32);
-    
+
     // Fill each item
     for (i, item) in items.iter().enumerate() {
         convert::fill_item(item, item_list.reborrow().get(i as u32));
     }
-    
+
     Promise::ok(())
 }
 ```
@@ -148,17 +154,17 @@ pub fn fill_complex_struct(
 ) {
     // Set simple fields
     dest.set_id(source.id);
-    
+
     // Handle nested structures with reborrow()
     let mut nested = dest.reborrow().init_nested();
     nested.set_field(source.nested_field);
-    
+
     // Handle lists
     let mut list = dest.reborrow().init_list(source.items.len() as u32);
     for (i, item) in source.items.iter().enumerate() {
         fill_item(item, list.reborrow().get(i as u32));
     }
-    
+
     // Handle unions
     match &source.variant {
         Variant::A => dest.reborrow().init_variant_a(),
@@ -256,17 +262,17 @@ pub fn parse_notification(
 #[test]
 fn test_round_trip() {
     let original = create_test_data();
-    
+
     // Convert to capnp
     let mut message = capnp::message::Builder::new_default();
     let mut builder = message.init_root::<my_struct::Builder>();
     fill_data(original.clone(), builder.reborrow());
-    
+
     // Convert back to rust
     let msg_reader = message.into_reader();
     let reader = msg_reader.get_root::<my_struct::Reader>().unwrap();
     let parsed = parse_data(reader).unwrap();
-    
+
     // Compare
     assert_eq!(original, parsed);
 }
@@ -279,14 +285,14 @@ fn test_round_trip() {
 async fn test_rpc_method() -> anyhow::Result<()> {
     let fixture = setup_fixture().await?;
     let client = connect_client(&fixture).await?;
-    
+
     // Call RPC method
     let result = client.my_method_request().send().promise.await?;
     let response = result.get()?.get_res()?;
-    
+
     // Verify response
     assert_eq!(response.get_field()?, expected_value);
-    
+
     Ok(())
 }
 ```
@@ -420,15 +426,15 @@ impl<H: JobHandler + 'static> churten::Server for ChurtenServer<H> {
         let churten = self.churten.clone();
         Promise::from_future(async move {
             let recent_jobs = churten.borrow().recent_jobs().await;
-            
+
             // Create list with correct size
             let mut job_list = results.get().init_res(recent_jobs.len() as u32);
-            
+
             // Fill each job info
             for (i, job_info) in recent_jobs.iter().enumerate() {
                 convert::fill_job_info(job_info, job_list.reborrow().get(i as u32));
             }
-            
+
             Ok(())
         })
     }
@@ -441,12 +447,12 @@ pub fn fill_job_info(
 ) {
     dest.set_arena(&source.arena.as_str());
     dest.set_id(source.id.as_u64());
-    
+
     // Handle nested job structure with reborrow()
     let mut job_builder = dest.reborrow().init_job();
     job_builder.set_path(source.job.path().as_str());
     job_builder.set_hash(&source.job.hash().0);
-    
+
     match &*source.job {
         realize_storage::Job::Download(_, _) => {
             job_builder.init_download();
@@ -461,7 +467,7 @@ pub fn fill_job_info(
             job_builder.init_unrealize();
         }
     }
-    
+
     // Handle progress enum
     match &source.progress {
         JobProgress::Pending => {
@@ -483,7 +489,7 @@ pub fn fill_job_info(
             dest.set_progress(control_capnp::JobProgress::Failed);
         }
     }
-    
+
     // Handle optional action
     match &source.action {
         Some(JobAction::Download) => dest.set_action(control_capnp::JobAction::Download),
@@ -492,7 +498,7 @@ pub fn fill_job_info(
         Some(JobAction::Move) => dest.set_action(control_capnp::JobAction::Move),
         None => dest.set_action(control_capnp::JobAction::None),
     }
-    
+
     // Handle optional byte progress
     if let Some((current, total)) = source.byte_progress {
         let mut byte_progress = dest.init_byte_progress();
@@ -506,26 +512,22 @@ pub fn fill_job_info(
 async fn test_recent_jobs() -> anyhow::Result<()> {
     let fixture = setup_fixture().await?;
     let client = connect_client(&fixture).await?;
-    
+
     // Create some jobs
     create_test_jobs(&fixture).await?;
-    
+
     // Call RPC method
     let result = client.recent_jobs_request().send().promise.await?;
     let jobs = result.get()?.get_res()?;
-    
+
     // Verify response
     assert!(jobs.len() > 0);
     let job = jobs.get(0);
     assert_eq!(job.get_arena()?, "test-arena");
     assert_eq!(job.get_id(), 1);
-    
+
     Ok(())
 }
 ```
 
 This rule ensures proper handling of capnp protocol buffers in Rust projects, preventing common pitfalls and maintaining type safety.
-description: Working with capnp protos 
-globs: *.rs
-alwaysApply: false
----

@@ -1,0 +1,228 @@
+---
+description: Working with redb tables and transactions
+globs:
+alwaysApply: false
+---
+
+# Redb Table Management Best Practices
+
+## Core Principle: Open Tables Once Per Transaction
+
+Redb tables can only be opened once per transaction. The recommended pattern is:
+
+1. Open the transaction
+2. Open a new scope
+3. Open all tables you need
+4. Pass tables around to helper functions
+5. Close the scope, noting the result
+6. Commit the transaction
+7. Return the result
+
+## Recommended Pattern
+
+```rust
+// Example A: Good pattern
+fn do_something() -> Result<(), StorageError> {
+    let txn = self.db.begin_write()?;
+    let result = {
+        let mut my_table = txn.my_table()?;
+        let mut my_other_table = txn.my_other_table()?;
+        let a = do_a(&mut my_table)?;
+        do_b(&mut my_other_table, &my_table, a)?;
+        Ok(())
+    };
+    txn.commit()?;
+    result
+}
+```
+
+## Avoid This Pattern
+
+```rust
+// Example B: Problematic pattern
+fn do_something() -> Result<(), StorageError> {
+    let txn = self.db.begin_write()?;
+    let result = {
+        let a = do_a(&txn)?;  // Opens table inside do_a
+        do_b(&txn, a)?;       // Opens table inside do_b
+        Ok(())
+    };
+    txn.commit()?;
+    result
+}
+```
+
+## Helper Function Signatures
+
+When writing helper functions that need table access, pass the table references directly:
+
+```rust
+// Good: Pass table references
+fn add_to_queue_front(
+    &self,
+    blob_lru_queue_table: &mut redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
+    blob_table: &mut redb::Table<'_, BlobId, Holder<'static, BlobTableEntry>>,
+    blob_id: BlobId,
+    blob_entry: &mut BlobTableEntry,
+) -> Result<(), StorageError> {
+    // Work with the tables directly
+    let queue_entry = blob_lru_queue_table.get(queue_id)?.unwrap().value().parse()?;
+    blob_table.insert(blob_id, Holder::with_content(blob_entry)?)?;
+    Ok(())
+}
+
+// Avoid: Pass transaction and open tables inside
+fn add_to_queue_front(
+    &self,
+    txn: &ArenaWriteTransaction,  // Don't do this
+    blob_id: BlobId,
+    blob_entry: &mut BlobTableEntry,
+) -> Result<(), StorageError> {
+    // This will cause "Table already opened" errors
+    let mut queue_table = txn.blob_lru_queue_table()?;
+    let mut blob_table = txn.blob_table()?;
+    // ...
+}
+```
+
+## Table Opening Pattern
+
+Always unwrap the `Result` from table opening methods:
+
+```rust
+// Good
+let mut blob_table = txn.blob_table()?;
+let mut queue_table = txn.blob_lru_queue_table()?;
+
+// Avoid
+let mut blob_table = txn.blob_table();
+let mut queue_table = txn.blob_lru_queue_table();
+```
+
+## Common Error: "Table already opened"
+
+This error occurs when you try to open the same table multiple times within a single transaction. Solutions:
+
+1. **Open tables once at the start** and pass references around
+2. **Use helper functions** that accept table references instead of transactions
+3. **Create separate scopes** for different table operations
+
+## Transaction Lifecycle
+
+```rust
+// 1. Begin transaction
+let txn = self.db.begin_write()?;
+
+// 2. Open scope for table operations
+let result = {
+    // 3. Open all needed tables
+    let mut table1 = txn.table1()?;
+    let mut table2 = txn.table2()?;
+
+    // 4. Pass tables to helper functions
+    helper_function(&mut table1, &mut table2)?;
+
+    // 5. Return result from scope
+    Ok(())
+};
+
+// 6. Commit transaction
+txn.commit()?;
+
+// 7. Return final result
+result
+```
+
+## Reading vs Writing
+
+- **Read transactions**: Use `begin_read()` and tables are read-only
+- **Write transactions**: Use `begin_write()` and tables are mutable
+
+```rust
+// Read transaction
+let txn = self.db.begin_read()?;
+let table = txn.my_table()?;  // Read-only
+let value = table.get(key)?;
+
+// Write transaction
+let txn = self.db.begin_write()?;
+let mut table = txn.my_table()?;  // Mutable
+table.insert(key, value)?;
+```
+
+## Error Handling
+
+Always handle the `Result` from table operations:
+
+```rust
+// Good
+let entry = table.get(key)?.ok_or(StorageError::NotFound)?;
+let value = entry.value().parse()?;
+
+// Avoid
+let entry = table.get(key).unwrap();
+```
+
+## Table Definition Pattern
+
+Define tables with proper types:
+
+```rust
+const MY_TABLE: TableDefinition<KeyType, ValueType> =
+    TableDefinition::new("table_name");
+
+// Example
+const BLOB_LRU_QUEUE_TABLE: TableDefinition<u16, Holder<'static, QueueTableEntry>> =
+    TableDefinition::new("blob.lru_queue");
+```
+
+## Integration with Database
+
+Add new tables to the database constructor:
+
+```rust
+impl ArenaDatabase {
+    pub fn new(db_path: &std::path::Path) -> Result<Self, StorageError> {
+        let db = redb::Database::create(db_path)?;
+
+        // Open all tables to ensure they exist
+        let txn = db.begin_write()?;
+        {
+            txn.open_table(MY_TABLE)?;
+            txn.open_table(ANOTHER_TABLE)?;
+            // ... all tables
+        }
+        txn.commit()?;
+
+        Ok(Self { inner: db })
+    }
+}
+```
+
+## Testing Pattern
+
+When testing table operations, use the same pattern:
+
+```rust
+#[test]
+fn test_table_operations() {
+    let fixture = Fixture::setup().await?;
+
+    // Use the fixture's transaction methods
+    let txn = fixture.begin_write()?;
+    let mut table = txn.my_table()?;
+
+    // Perform operations
+    table.insert(key, value)?;
+
+    txn.commit()?;
+}
+```
+
+## Key Takeaways
+
+1. **Open tables once per transaction** - never open the same table twice
+2. **Pass table references** to helper functions, not transactions
+3. **Use proper scoping** to manage table lifetimes
+4. **Always handle Results** from table operations
+5. **Follow the pattern**: open transaction → open scope → open tables → pass around → commit
