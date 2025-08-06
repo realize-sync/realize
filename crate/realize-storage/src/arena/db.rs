@@ -96,6 +96,12 @@ const CACHE_NOTIFICATION_TABLE: TableDefinition<&str, u64> =
 /// Value: BlobTableEntry
 const BLOB_TABLE: TableDefinition<BlobId, Holder<BlobTableEntry>> = TableDefinition::new("blob");
 
+/// Track the next blob ID to be allocated.
+///
+/// Key: () (unit key)
+/// Value: BlobId (next ID to allocate)
+const BLOB_NEXT_ID_TABLE: TableDefinition<(), BlobId> = TableDefinition::new("blob.next_id");
+
 /// Track LRU queue for blobs.
 ///
 /// Key: u16 (LRU Queue ID)
@@ -168,6 +174,7 @@ impl ArenaDatabase {
             txn.open_table(CACHE_NOTIFICATION_TABLE)?;
             txn.open_table(CACHE_CURRENT_INODE_RANGE_TABLE)?;
             txn.open_table(BLOB_TABLE)?;
+            txn.open_table(BLOB_NEXT_ID_TABLE)?;
             txn.open_table(BLOB_LRU_QUEUE_TABLE)?;
             txn.open_table(MARK_TABLE)?;
             txn.open_table(DIRTY_TABLE)?;
@@ -296,6 +303,12 @@ impl ArenaWriteTransaction {
         Ok(self.inner.open_table(BLOB_LRU_QUEUE_TABLE)?)
     }
 
+    pub fn blob_next_id_table<'txn>(
+        &'txn self,
+    ) -> Result<Table<'txn, (), BlobId>, StorageError> {
+        Ok(self.inner.open_table(BLOB_NEXT_ID_TABLE)?)
+    }
+
     pub fn mark_table<'txn>(
         &'txn self,
     ) -> Result<Table<'txn, &'static str, Holder<'static, MarkTableEntry>>, StorageError> {
@@ -378,6 +391,13 @@ impl ArenaReadTransaction {
         &self,
     ) -> Result<ReadOnlyTable<u16, Holder<'static, QueueTableEntry>>, StorageError> {
         Ok(self.inner.open_table(BLOB_LRU_QUEUE_TABLE)?)
+    }
+
+    #[allow(dead_code)]
+    pub fn blob_next_id_table(
+        &self,
+    ) -> Result<ReadOnlyTable<(), BlobId>, StorageError> {
+        Ok(self.inner.open_table(BLOB_NEXT_ID_TABLE)?)
     }
 
     pub fn mark_table(
