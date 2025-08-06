@@ -1,6 +1,6 @@
 use super::blob::{self, Blobstore};
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
-use super::types::LocalAvailability;
+use super::types::{LocalAvailability, LruQueueId};
 use crate::arena::engine::DirtyPaths;
 use crate::arena::notifier::{Notification, Progress};
 use crate::global::types::{
@@ -602,6 +602,15 @@ impl ArenaCache {
         new_range: &ByteRanges,
     ) -> Result<(), StorageError> {
         self.blobstore.extend_local_availability(blob_id, new_range)
+    }
+
+    /// Clean up the cache by removing blobs until the total disk usage is <= target_size.
+    ///
+    /// This method removes the least recently used blobs first, but skips blobs that are currently open.
+    #[allow(dead_code)]
+    pub(crate) fn cleanup_cache(&self, target_size: u64) -> Result<(), StorageError> {
+        self.blobstore
+            .cleanup_cache(LruQueueId::WorkingArea, target_size)
     }
 
     /// Allocate a new inode, extending the range if necessary.

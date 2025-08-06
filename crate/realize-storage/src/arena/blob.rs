@@ -8,11 +8,12 @@ use crate::utils::holder::Holder;
 use realize_types::{ByteRange, ByteRanges, Hash};
 use redb::ReadableTable;
 use std::cmp::min;
+use std::collections::HashMap;
 use std::io::{SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 
@@ -22,6 +23,8 @@ use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt as
 pub(crate) struct Blobstore {
     db: Arc<ArenaDatabase>,
     blob_dir: PathBuf,
+    /// Reference counter for open blobs. Maps BlobId to the number of open handles.
+    open_blobs: OpenBlobRefCounter,
 }
 
 impl Blobstore {
@@ -44,6 +47,7 @@ impl Blobstore {
         Ok(Arc::new(Self {
             db,
             blob_dir: blob_dir.to_path_buf(),
+            open_blobs: OpenBlobRefCounter::new(),
         }))
     }
 
@@ -301,6 +305,72 @@ impl Blobstore {
 
         Ok((blob_id, dest))
     }
+
+    /// Remove blobs from the back of the WorkingArea queue until the total
+    /// disk usage is <= target_size.
+    ///
+    /// This method removes the least recently used blobs first (from the tail
+    /// of the queue) and continues until the total disk usage is at or below
+    /// the target size. Blobs that are currently open will be skipped.
+    pub(crate) fn cleanup_cache(
+        &self,
+        queue_id: LruQueueId,
+        target: u64,
+    ) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
+            // Get the WorkingArea queue
+            let mut queue = match get_queue_if_available(&blob_lru_queue_table, queue_id)? {
+                Some(q) => q,
+                None => {
+                    // No queue exists, nothing to clean up
+                    return Ok(());
+                }
+            };
+
+            log::debug!(
+                "Starting cleanup of {queue_id:?} with disk usage: {}, target: {}",
+                queue.disk_usage,
+                target
+            );
+
+            let mut blob_table = txn.blob_table()?;
+            let mut prev = queue.tail;
+            let mut removed_count = 0;
+            while let Some(current_id) = prev
+                && queue.disk_usage > target
+            {
+                let current = get_blob_entry(&blob_table, current_id)?;
+                prev = current.prev;
+                if self.open_blobs.is_open(current_id) {
+                    continue;
+                }
+                log::debug!(
+                    "Evicted blob from {queue_id:?}: {current_id} ({} bytes)",
+                    current.disk_usage
+                );
+                remove_from_queue_update_entry(&mut blob_table, &current, &mut queue)?;
+                removed_count += 1;
+                blob_table.remove(current_id)?;
+                let blob_path = self.blob_path(current_id);
+                if blob_path.exists() {
+                    std::fs::remove_file(&blob_path)?;
+                }
+            }
+            log::debug!(
+                "Evicted {removed_count} entries from {queue_id:?} disk usage now {} (target: {target})",
+                queue.disk_usage
+            );
+            if removed_count == 0 {
+                return Ok(());
+            }
+            blob_lru_queue_table.insert(queue_id as u16, Holder::with_content(queue)?)?;
+        }
+        txn.commit()?;
+
+        Ok(())
+    }
 }
 
 fn update_total_disk_usage(
@@ -308,14 +378,14 @@ fn update_total_disk_usage(
     queue_id: LruQueueId,
     diff: i64,
 ) -> Result<(), StorageError> {
-    let mut entry = get_queue_must_exist(&blob_lru_queue_table, queue_id)?;
+    let mut entry = get_queue_must_exist(blob_lru_queue_table, queue_id)?;
     entry.disk_usage = entry.disk_usage.saturating_add_signed(diff);
     blob_lru_queue_table.insert(queue_id as u16, Holder::with_content(entry)?)?;
     Ok(())
 }
 
 fn get_queue_if_available(
-    blob_lru_queue_table: &redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
+    blob_lru_queue_table: &impl redb::ReadableTable<u16, Holder<'static, QueueTableEntry>>,
     queue_id: LruQueueId,
 ) -> Result<Option<QueueTableEntry>, StorageError> {
     let e = blob_lru_queue_table.get(queue_id as u16)?;
@@ -327,7 +397,7 @@ fn get_queue_if_available(
 }
 
 fn get_queue_must_exist(
-    blob_lru_queue_table: &redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
+    blob_lru_queue_table: &impl redb::ReadableTable<u16, Holder<'static, QueueTableEntry>>,
     queue_id: LruQueueId,
 ) -> Result<QueueTableEntry, StorageError> {
     Ok(blob_lru_queue_table
@@ -452,9 +522,17 @@ fn remove_from_queue(
 
     // Get the queue entry
     let mut queue = get_queue_must_exist(blob_lru_queue_table, queue_id)?;
-    let mut update_queue = false;
+    remove_from_queue_update_entry(blob_table, blob_entry, &mut queue)?;
+    blob_lru_queue_table.insert(queue_id as u16, Holder::with_content(queue)?)?;
 
-    // Update the queue links
+    Ok(())
+}
+
+fn remove_from_queue_update_entry(
+    blob_table: &mut redb::Table<'_, BlobId, Holder<'static, BlobTableEntry>>,
+    blob_entry: &BlobTableEntry,
+    queue: &mut QueueTableEntry,
+) -> Result<(), StorageError> {
     if let Some(prev_id) = blob_entry.prev {
         let mut prev = get_blob_entry(blob_table, prev_id)?;
         prev.next = blob_entry.next;
@@ -462,9 +540,7 @@ fn remove_from_queue(
     } else {
         // This was the first node
         queue.head = blob_entry.next;
-        update_queue = true;
     }
-
     if let Some(next_id) = blob_entry.next {
         let mut next = get_blob_entry(blob_table, next_id)?;
         next.prev = blob_entry.prev;
@@ -472,17 +548,8 @@ fn remove_from_queue(
     } else {
         // This was the last node
         queue.tail = blob_entry.prev;
-        update_queue = true;
     }
-
-    // Update queue's total disk usage
     queue.disk_usage = queue.disk_usage.saturating_sub(blob_entry.disk_usage);
-
-    // Save the updated queue entry
-    if update_queue {
-        blob_lru_queue_table.insert(queue_id as u16, Holder::with_content(queue)?)?;
-    }
-
     Ok(())
 }
 
@@ -539,6 +606,7 @@ impl Blob {
         file: std::fs::File,
         blobstore: Arc<Blobstore>,
     ) -> Self {
+        blobstore.open_blobs.increment(blob_id);
         Self {
             blob_id,
             file: tokio::fs::File::from_std(file),
@@ -659,6 +727,13 @@ impl Blob {
     }
 }
 
+impl Drop for Blob {
+    fn drop(&mut self) {
+        // Decrement the reference count when the blob is dropped
+        self.blobstore.open_blobs.decrement(self.blob_id);
+    }
+}
+
 impl AsyncRead for Blob {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -743,6 +818,38 @@ impl AsyncWrite for Blob {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.file).poll_shutdown(cx)
+    }
+}
+
+struct OpenBlobRefCounter {
+    counts: Mutex<HashMap<BlobId, u32>>,
+}
+impl OpenBlobRefCounter {
+    fn new() -> Self {
+        Self {
+            counts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn increment(&self, id: BlobId) {
+        let mut guard = self.counts.lock().unwrap();
+        *guard.entry(id).or_insert(0) += 1;
+        log::debug!("Blob {} opened, ref count: {}", id, guard[&id]);
+    }
+    fn decrement(&self, id: BlobId) {
+        let mut guard = self.counts.lock().unwrap();
+        if let Some(count) = guard.get_mut(&id) {
+            *count = count.saturating_sub(1);
+            log::debug!("Blob {} closed, ref count: {}", id, *count);
+            if *count == 0 {
+                guard.remove(&id);
+                log::debug!("Blob {} removed from open blobs", id);
+            }
+        }
+    }
+    fn is_open(&self, id: BlobId) -> bool {
+        let guard = self.counts.lock().unwrap();
+        guard.contains_key(&id)
     }
 }
 
@@ -947,6 +1054,14 @@ mod tests {
             }
 
             Ok(content)
+        }
+
+        fn queue_disk_usage(&self, queue_id: LruQueueId) -> anyhow::Result<u64> {
+            let txn = self.begin_read()?;
+            let queue_table = txn.blob_lru_queue_table()?;
+            Ok(get_queue_if_available(&queue_table, queue_id)?
+                .map(|q| q.disk_usage)
+                .unwrap_or(0))
         }
     }
 
@@ -1816,15 +1931,10 @@ mod tests {
         let blob_entry = fixture.get_blob_entry(blob_id)?;
         assert_eq!(blob_entry.disk_usage, blksize);
 
-        // Check queue disk usage
-        let txn = fixture.begin_read()?;
-        let queue_table = txn.blob_lru_queue_table()?;
-        let queue_entry = queue_table
-            .get(LruQueueId::WorkingArea as u16)?
-            .unwrap()
-            .value()
-            .parse()?;
-        assert_eq!(blob_entry.disk_usage, queue_entry.disk_usage);
+        assert_eq!(
+            blob_entry.disk_usage,
+            fixture.queue_disk_usage(LruQueueId::WorkingArea)?
+        );
 
         Ok(())
     }
@@ -1844,18 +1954,10 @@ mod tests {
 
         // Get initial disk usage
         let blob_entry = fixture.get_blob_entry(blob_id)?;
-        let initial_disk_usage = blob_entry.disk_usage;
-        assert!(initial_disk_usage > 0);
+        assert!(blob_entry.disk_usage > 0);
 
-        // Check queue disk usage before deletion
-        let txn = fixture.begin_read()?;
-        let queue_table = txn.blob_lru_queue_table()?;
-        let queue_entry = queue_table
-            .get(LruQueueId::WorkingArea as u16)?
-            .unwrap()
-            .value()
-            .parse()?;
-        assert_eq!(initial_disk_usage, queue_entry.disk_usage);
+        let initial_disk_usage = fixture.queue_disk_usage(LruQueueId::WorkingArea)?;
+        assert_eq!(initial_disk_usage, blob_entry.disk_usage);
 
         // Delete the blob
         fixture.remove_file(&Path::parse("test.txt")?)?;
@@ -1863,15 +1965,7 @@ mod tests {
         // Verify blob entry is gone
         assert!(!fixture.blob_entry_exists(blob_id)?);
 
-        // Check queue disk usage is now 0
-        let txn = fixture.begin_read()?;
-        let queue_table = txn.blob_lru_queue_table()?;
-        let queue_entry = queue_table
-            .get(LruQueueId::WorkingArea as u16)?
-            .unwrap()
-            .value()
-            .parse()?;
-        assert_eq!(0, queue_entry.disk_usage);
+        assert_eq!(0, fixture.queue_disk_usage(LruQueueId::WorkingArea)?);
 
         Ok(())
     }
@@ -1905,15 +1999,453 @@ mod tests {
         let blob_entry2 = fixture.get_blob_entry(blob_id2)?;
 
         // Check queue total disk usage
+        assert_eq!(
+            2 * blksize,
+            fixture.queue_disk_usage(LruQueueId::WorkingArea)?
+        );
+        assert_eq!(2 * blksize, blob_entry1.disk_usage + blob_entry2.disk_usage);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_cache_removes_blobs_until_target_size() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let acache = &fixture.acache;
+
+        // Create multiple blobs with data
+        let inode1 = fixture.add_file("test1.txt", 1000)?;
+        let inode2 = fixture.add_file("test2.txt", 2000)?;
+        let inode3 = fixture.add_file("test3.txt", 3000)?;
+        let inode4 = fixture.add_file("test4.txt", 4000)?;
+
+        let blob_id1 = acache.open_file(inode1)?.id();
+        let blob_id2 = acache.open_file(inode2)?.id();
+        let blob_id3 = acache.open_file(inode3)?.id();
+        let blob_id4 = acache.open_file(inode4)?.id();
+
+        // Write data to all blobs to create disk usage
+        let mut blob1 = acache.open_file(inode1)?;
+        blob1.write(b"data for blob 1").await?;
+        blob1.update_db().await?;
+
+        let mut blob2 = acache.open_file(inode2)?;
+        blob2.write(b"data for blob 2 which is longer").await?;
+        blob2.update_db().await?;
+
+        let mut blob3 = acache.open_file(inode3)?;
+        blob3.write(b"data for blob 3 which is even longer").await?;
+        blob3.update_db().await?;
+
+        let mut blob4 = acache.open_file(inode4)?;
+        blob4
+            .write(b"data for blob 4 which is the longest of all")
+            .await?;
+        blob4.update_db().await?;
+
+        let initial_disk_usage = fixture.queue_disk_usage(LruQueueId::WorkingArea)?;
+        assert!(initial_disk_usage > 0);
+
+        // Verify all blobs exist
+        assert!(fixture.blob_entry_exists(blob_id1)?);
+        assert!(fixture.blob_entry_exists(blob_id2)?);
+        assert!(fixture.blob_entry_exists(blob_id3)?);
+        assert!(fixture.blob_entry_exists(blob_id4)?);
+        assert!(fixture.blob_file_exists(blob_id1));
+        assert!(fixture.blob_file_exists(blob_id2));
+        assert!(fixture.blob_file_exists(blob_id3));
+        assert!(fixture.blob_file_exists(blob_id4));
+
+        // Clean up cache to target size (should remove some blobs)
+        let target_size = initial_disk_usage / 2; // Remove half the blobs
+        let blobstore = Blobstore::new(Arc::clone(&fixture.db), &fixture.blob_dir)?;
+        blobstore.cleanup_cache(LruQueueId::WorkingArea, target_size)?;
+
+        // Verify that some blobs were removed (the least recently used ones)
+        // The queue order should be [4, 3, 2, 1] so 1 and 2 should be removed first
+        assert!(!fixture.blob_entry_exists(blob_id1)?);
+        assert!(!fixture.blob_entry_exists(blob_id2)?);
+        assert!(fixture.blob_entry_exists(blob_id3)?);
+        assert!(fixture.blob_entry_exists(blob_id4)?);
+        assert!(!fixture.blob_file_exists(blob_id1));
+        assert!(!fixture.blob_file_exists(blob_id2));
+        assert!(fixture.blob_file_exists(blob_id3));
+        assert!(fixture.blob_file_exists(blob_id4));
+
+        // Verify the queue now only contains the remaining blobs
+        assert_eq!(
+            vec![blob_id4, blob_id3],
+            fixture.list_queue_content(LruQueueId::WorkingArea)?
+        );
+
+        // Verify the disk usage is now at or below target
+        assert!(fixture.queue_disk_usage(LruQueueId::WorkingArea)? <= target_size);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_cache_removes_all_blobs_when_target_is_zero() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let acache = &fixture.acache;
+
+        // Create a few blobs with data
+        let inode1 = fixture.add_file("test1.txt", 1000)?;
+        let inode2 = fixture.add_file("test2.txt", 2000)?;
+
+        let blob_id1 = acache.open_file(inode1)?.id();
+        let blob_id2 = acache.open_file(inode2)?.id();
+
+        // Write data to blobs
+        let mut blob1 = acache.open_file(inode1)?;
+        blob1.write(b"data for blob 1").await?;
+        blob1.update_db().await?;
+
+        let mut blob2 = acache.open_file(inode2)?;
+        blob2.write(b"data for blob 2").await?;
+        blob2.update_db().await?;
+
+        // Verify blobs exist
+        assert!(fixture.blob_entry_exists(blob_id1)?);
+        assert!(fixture.blob_entry_exists(blob_id2)?);
+        assert!(fixture.blob_file_exists(blob_id1));
+        assert!(fixture.blob_file_exists(blob_id2));
+
+        // Clean up cache with target size 0 (should remove all blobs)
+        let blobstore = Blobstore::new(Arc::clone(&fixture.db), &fixture.blob_dir)?;
+        blobstore.cleanup_cache(LruQueueId::WorkingArea, 0)?;
+
+        // Verify all blobs were removed
+        assert!(!fixture.blob_entry_exists(blob_id1)?);
+        assert!(!fixture.blob_entry_exists(blob_id2)?);
+        assert!(!fixture.blob_file_exists(blob_id1));
+        assert!(!fixture.blob_file_exists(blob_id2));
+
+        // Verify the queue is now empty
+        assert_eq!(
+            vec![] as Vec<BlobId>,
+            fixture.list_queue_content(LruQueueId::WorkingArea)?
+        );
+
+        assert_eq!(0, fixture.queue_disk_usage(LruQueueId::WorkingArea)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_cache_does_nothing_when_already_under_target() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let acache = &fixture.acache;
+
+        // Create a blob with data
+        let inode = fixture.add_file("test.txt", 1000)?;
+        let blob_id = acache.open_file(inode)?.id();
+
+        let mut blob = acache.open_file(inode)?;
+        blob.write(b"data for blob").await?;
+        blob.update_db().await?;
+
+        let current_disk_usage = fixture.queue_disk_usage(LruQueueId::WorkingArea)?;
+
+        // Verify blob exists
+        assert!(fixture.blob_entry_exists(blob_id)?);
+        assert!(fixture.blob_file_exists(blob_id));
+
+        // Clean up cache with target size higher than current usage
+        let target_size = current_disk_usage * 2;
+        let blobstore = Blobstore::new(Arc::clone(&fixture.db), &fixture.blob_dir)?;
+        blobstore.cleanup_cache(LruQueueId::WorkingArea, target_size)?;
+
+        // Verify blob still exists (nothing should have been removed)
+        assert!(fixture.blob_entry_exists(blob_id)?);
+        assert!(fixture.blob_file_exists(blob_id));
+
+        // Verify the queue still contains the blob
+        assert_eq!(
+            vec![blob_id],
+            fixture.list_queue_content(LruQueueId::WorkingArea)?
+        );
+
+        // Verify the disk usage hasn't changed
+        assert_eq!(
+            current_disk_usage,
+            fixture.queue_disk_usage(LruQueueId::WorkingArea)?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_cache_handles_empty_queue() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+
+        // Create blobstore without any blobs
+        let blobstore = Blobstore::new(Arc::clone(&fixture.db), &fixture.blob_dir)?;
+
+        // Clean up cache - should not error
+        blobstore.cleanup_cache(LruQueueId::WorkingArea, 1000)?;
+
+        // Verify the queue is still empty by checking that no queue entry exists
         let txn = fixture.begin_read()?;
         let queue_table = txn.blob_lru_queue_table()?;
-        let queue_entry = queue_table
-            .get(LruQueueId::WorkingArea as u16)?
-            .unwrap()
-            .value()
-            .parse()?;
-        assert_eq!(2 * blksize, queue_entry.disk_usage);
-        assert_eq!(2 * blksize, blob_entry1.disk_usage + blob_entry2.disk_usage);
+        let queue_entry = queue_table.get(LruQueueId::WorkingArea as u16)?;
+        assert!(queue_entry.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_cache_removes_blobs_in_lru_order() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let acache = &fixture.acache;
+
+        // Create blobs in order
+        let inode1 = fixture.add_file("test1.txt", 1000)?;
+        let inode2 = fixture.add_file("test2.txt", 1000)?;
+        let inode3 = fixture.add_file("test3.txt", 1000)?;
+
+        let blob_id1 = acache.open_file(inode1)?.id();
+        let blob_id2 = acache.open_file(inode2)?.id();
+        let blob_id3 = acache.open_file(inode3)?.id();
+
+        // Write data to all blobs
+        let mut blob1 = acache.open_file(inode1)?;
+        blob1.write(b"data1").await?;
+        blob1.update_db().await?;
+
+        let mut blob2 = acache.open_file(inode2)?;
+        blob2.write(b"data2").await?;
+        blob2.update_db().await?;
+
+        let mut blob3 = acache.open_file(inode3)?;
+        blob3.write(b"data3").await?;
+        blob3.update_db().await?;
+
+        // Access blob1 to move it to the front (make it most recently used)
+        let blobstore = Blobstore::new(Arc::clone(&fixture.db), &fixture.blob_dir)?;
+        blobstore.mark_accessed(blob_id1)?;
+
+        // Verify the order is now [1, 3, 2] (1 is most recent, 2 is least recent)
+        assert_eq!(
+            vec![blob_id1, blob_id3, blob_id2],
+            fixture.list_queue_content(LruQueueId::WorkingArea)?
+        );
+
+        // Get current disk usage
+        let current_disk_usage = fixture.queue_disk_usage(LruQueueId::WorkingArea)?;
+
+        // Clean up cache to remove one blob (should remove blob_id2 as it's least recently used)
+        let target_size = current_disk_usage - 1; // Just under current usage
+        blobstore.cleanup_cache(LruQueueId::WorkingArea, target_size)?;
+
+        // Verify blob_id2 was removed (least recently used)
+        assert!(!fixture.blob_entry_exists(blob_id2)?);
+        assert!(!fixture.blob_file_exists(blob_id2));
+
+        // Verify blob_id1 and blob_id3 still exist
+        assert!(fixture.blob_entry_exists(blob_id1)?);
+        assert!(fixture.blob_entry_exists(blob_id3)?);
+        assert!(fixture.blob_file_exists(blob_id1));
+        assert!(fixture.blob_file_exists(blob_id3));
+
+        // Verify the queue now contains only the remaining blobs in correct order
+        assert_eq!(
+            vec![blob_id1, blob_id3],
+            fixture.list_queue_content(LruQueueId::WorkingArea)?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_cache_skips_open_blobs() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let acache = &fixture.acache;
+
+        // Create a single blob with data
+        let inode = fixture.add_file("test.txt", 1000)?;
+        let blob_id = acache.open_file(inode)?.id();
+
+        // Write data to the blob
+        let mut blob = acache.open_file(inode)?;
+        blob.write(b"data for blob").await?;
+        blob.update_db().await?;
+
+        // Keep the blob open
+        let _open_blob = acache.open_file(inode)?;
+
+        // Try to clean up cache - should skip the open blob
+        let target_size = 0;
+        acache.cleanup_cache(target_size)?;
+
+        // Verify the blob still exists (it was open)
+        assert!(fixture.blob_entry_exists(blob_id)?);
+        assert!(fixture.blob_file_exists(blob_id));
+
+        // Drop all blob handles
+        drop(blob);
+        drop(_open_blob);
+
+        // Now clean up cache again - should delete the blob
+        acache.cleanup_cache(target_size)?;
+
+        // Verify the blob was deleted
+        assert!(!fixture.blob_entry_exists(blob_id)?);
+        assert!(!fixture.blob_file_exists(blob_id));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_cache_deletes_blob_after_it_is_closed() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let acache = &fixture.acache;
+
+        // Create a blob with data
+        let inode = fixture.add_file("test.txt", 1000)?;
+        let blob_id = acache.open_file(inode)?.id();
+
+        let mut blob = acache.open_file(inode)?;
+        blob.write(b"data for blob").await?;
+        blob.update_db().await?;
+
+        // Keep the blob open
+        let _open_blob = acache.open_file(inode)?;
+
+        // Try to clean up cache - should skip the open blob
+        let target_size = 0;
+        acache.cleanup_cache(target_size)?;
+
+        // Verify the blob still exists (it was open)
+        assert!(fixture.blob_entry_exists(blob_id)?);
+        assert!(fixture.blob_file_exists(blob_id));
+
+        // Drop all blob handles
+        drop(blob);
+        drop(_open_blob);
+
+        // Now clean up cache again - should delete the blob
+        acache.cleanup_cache(target_size)?;
+
+        // Verify the blob was deleted
+        assert!(!fixture.blob_entry_exists(blob_id)?);
+        assert!(!fixture.blob_file_exists(blob_id));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multiple_open_handles_work_correctly() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let acache = &fixture.acache;
+
+        // Create a blob with data
+        let inode = fixture.add_file("test.txt", 1000)?;
+        let blob_id = acache.open_file(inode)?.id();
+
+        let mut blob = acache.open_file(inode)?;
+        blob.write(b"data for blob").await?;
+        blob.update_db().await?;
+
+        // Open multiple handles to the same blob
+        let open_blob1 = acache.open_file(inode)?;
+        let open_blob2 = acache.open_file(inode)?;
+        let open_blob3 = acache.open_file(inode)?;
+
+        // Try to clean up cache - should skip the open blob
+        let target_size = 0;
+        acache.cleanup_cache(target_size)?;
+
+        // Verify the blob still exists (it has multiple open handles)
+        assert!(fixture.blob_entry_exists(blob_id)?);
+        assert!(fixture.blob_file_exists(blob_id));
+
+        // Drop one handle
+        drop(open_blob1);
+
+        // Try to clean up again - should still skip (2 handles remain)
+        acache.cleanup_cache(target_size)?;
+
+        // Verify the blob still exists
+        assert!(fixture.blob_entry_exists(blob_id)?);
+        assert!(fixture.blob_file_exists(blob_id));
+
+        // Drop another handle
+        drop(open_blob2);
+
+        // Try to clean up again - should still skip (1 handle remains)
+        acache.cleanup_cache(target_size)?;
+
+        // Verify the blob still exists
+        assert!(fixture.blob_entry_exists(blob_id)?);
+        assert!(fixture.blob_file_exists(blob_id));
+
+        // Drop the last handle
+        drop(open_blob3);
+
+        // Drop the initial blob handle as well
+        drop(blob);
+
+        // Now clean up cache - should delete the blob
+        acache.cleanup_cache(target_size)?;
+
+        // Verify the blob was deleted
+        assert!(!fixture.blob_entry_exists(blob_id)?);
+        assert!(!fixture.blob_file_exists(blob_id));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reference_counting_with_mixed_open_and_closed_blobs() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let acache = &fixture.acache;
+
+        // Create multiple blobs
+        let inode1 = fixture.add_file("test1.txt", 1000)?;
+        let inode2 = fixture.add_file("test2.txt", 2000)?;
+        let inode3 = fixture.add_file("test3.txt", 3000)?;
+
+        let blob_id1 = acache.open_file(inode1)?.id();
+        let blob_id2 = acache.open_file(inode2)?.id();
+        let blob_id3 = acache.open_file(inode3)?.id();
+
+        // Write data to all blobs
+        let mut blob1 = acache.open_file(inode1)?;
+        blob1.write(b"data for blob 1").await?;
+        blob1.update_db().await?;
+
+        let mut blob2 = acache.open_file(inode2)?;
+        blob2.write(b"data for blob 2").await?;
+        blob2.update_db().await?;
+
+        let mut blob3 = acache.open_file(inode3)?;
+        blob3.write(b"data for blob 3").await?;
+        blob3.update_db().await?;
+
+        // Keep blob_id1 and blob_id3 open, but close blob_id2
+        let _open_blob1 = acache.open_file(inode1)?;
+        let _open_blob3 = acache.open_file(inode3)?;
+        drop(blob2); // Close blob_id2
+
+        // Clean up cache with target size 0 - should remove blob_id2 but keep blob_id1 and blob_id3
+        acache.cleanup_cache(0)?;
+
+        // Verify that blob_id1 and blob_id3 still exist (they were open)
+        assert!(fixture.blob_entry_exists(blob_id1)?);
+        assert!(fixture.blob_entry_exists(blob_id3)?);
+        assert!(fixture.blob_file_exists(blob_id1));
+        assert!(fixture.blob_file_exists(blob_id3));
+
+        // Verify that blob_id2 was removed (it was closed)
+        assert!(!fixture.blob_entry_exists(blob_id2)?);
+        assert!(!fixture.blob_file_exists(blob_id2));
+
+        // Drop all remaining blob handles
+        drop(blob1);
+        drop(blob3);
+        drop(_open_blob1);
+        drop(_open_blob3);
 
         Ok(())
     }
