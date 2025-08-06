@@ -1,3 +1,4 @@
+use crate::types::BlobId;
 use crate::utils::holder::{ByteConversionError, ByteConvertible, NamedType};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
@@ -46,6 +47,77 @@ pub enum LocalAvailability {
 
     /// File is available locally and its content has been verified
     Verified,
+}
+
+/// LRU Queue ID enum
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LruQueueId {
+    /// Working area queue
+    WorkingArea,
+    /// Protected area queue
+    ProtectedArea,
+    /// Pending removal queue
+    PendingRemoval,
+}
+
+/// An entry in the queue table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueueTableEntry {
+    /// First node in the queue (BlobId)
+    pub first_node: Option<BlobId>,
+    /// Last node in the queue (BlobId)
+    pub last_node: Option<BlobId>,
+    /// Total disk usage in bytes
+    pub disk_usage: u64,
+}
+
+impl NamedType for QueueTableEntry {
+    fn typename() -> &'static str {
+        "QueueTableEntry"
+    }
+}
+
+impl ByteConvertible<QueueTableEntry> for QueueTableEntry {
+    fn from_bytes(data: &[u8]) -> Result<QueueTableEntry, ByteConversionError> {
+        let message_reader = serialize_packed::read_message(&mut &data[..], ReaderOptions::new())?;
+        let reader: blob_capnp::queue_table_entry::Reader =
+            message_reader.get_root::<blob_capnp::queue_table_entry::Reader>()?;
+
+        let first_node_value = reader.get_first_node();
+        let first_node = if first_node_value != 0 {
+            Some(BlobId(first_node_value))
+        } else {
+            None
+        };
+
+        let last_node_value = reader.get_last_node();
+        let last_node = if last_node_value != 0 {
+            Some(BlobId(last_node_value))
+        } else {
+            None
+        };
+
+        Ok(QueueTableEntry {
+            first_node,
+            last_node,
+            disk_usage: reader.get_disk_usage(),
+        })
+    }
+
+    fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError> {
+        let mut message = ::capnp::message::Builder::new_default();
+        let mut builder: blob_capnp::queue_table_entry::Builder =
+            message.init_root::<blob_capnp::queue_table_entry::Builder>();
+
+        builder.set_first_node(self.first_node.map(|b| b.0).unwrap_or(0));
+        builder.set_last_node(self.last_node.map(|b| b.0).unwrap_or(0));
+        builder.set_disk_usage(self.disk_usage);
+
+        let mut buffer: Vec<u8> = Vec::new();
+        serialize_packed::write_message(&mut buffer, &message)?;
+
+        Ok(buffer)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -315,7 +387,7 @@ impl ByteConvertible<FailedJobTableEntry> for FailedJobTableEntry {
             message.init_root::<engine_capnp::failed_job_table_entry::Builder>();
 
         builder.set_failure_count(self.failure_count);
-        
+
         match &self.retry {
             RetryJob::After(time) => {
                 builder.get_retry().set_after(time.as_secs());
@@ -418,6 +490,33 @@ mod tests {
         assert_eq!(
             entry,
             BlobTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn convert_queue_table_entry() -> anyhow::Result<()> {
+        let entry = QueueTableEntry {
+            first_node: Some(BlobId(0x0101010101010101)),
+            last_node: Some(BlobId(0x0202020202020202)),
+            disk_usage: 1024,
+        };
+
+        assert_eq!(
+            entry,
+            QueueTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
+        );
+
+        let empty_entry = QueueTableEntry {
+            first_node: None,
+            last_node: None,
+            disk_usage: 0,
+        };
+
+        assert_eq!(
+            empty_entry,
+            QueueTableEntry::from_bytes(empty_entry.clone().to_bytes()?.as_slice())?
         );
 
         Ok(())

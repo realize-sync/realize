@@ -1,5 +1,6 @@
 use super::types::{
     BlobTableEntry, FailedJobTableEntry, HistoryTableEntry, IndexedFileTableEntry, MarkTableEntry,
+    QueueTableEntry,
 };
 use crate::Inode;
 use crate::global::types::{FileTableEntry, PeerTableEntry};
@@ -95,6 +96,13 @@ const CACHE_NOTIFICATION_TABLE: TableDefinition<&str, u64> =
 /// Value: BlobTableEntry
 const BLOB_TABLE: TableDefinition<BlobId, Holder<BlobTableEntry>> = TableDefinition::new("blob");
 
+/// Track LRU queue for blobs.
+///
+/// Key: u16 (LRU Queue ID)
+/// Value: QueueTableEntry
+const BLOB_LRU_QUEUE_TABLE: TableDefinition<u16, Holder<QueueTableEntry>> =
+    TableDefinition::new("blob.lru_queue");
+
 /// Track current inode range for each arena.
 ///
 /// The current inode is the last inode that was allocated for the
@@ -160,6 +168,7 @@ impl ArenaDatabase {
             txn.open_table(CACHE_NOTIFICATION_TABLE)?;
             txn.open_table(CACHE_CURRENT_INODE_RANGE_TABLE)?;
             txn.open_table(BLOB_TABLE)?;
+            txn.open_table(BLOB_LRU_QUEUE_TABLE)?;
             txn.open_table(MARK_TABLE)?;
             txn.open_table(DIRTY_TABLE)?;
             txn.open_table(DIRTY_LOG_TABLE)?;
@@ -281,6 +290,12 @@ impl ArenaWriteTransaction {
         Ok(self.inner.open_table(BLOB_TABLE)?)
     }
 
+    pub fn blob_lru_queue_table<'txn>(
+        &'txn self,
+    ) -> Result<Table<'txn, u16, Holder<'static, QueueTableEntry>>, StorageError> {
+        Ok(self.inner.open_table(BLOB_LRU_QUEUE_TABLE)?)
+    }
+
     pub fn mark_table<'txn>(
         &'txn self,
     ) -> Result<Table<'txn, &'static str, Holder<'static, MarkTableEntry>>, StorageError> {
@@ -356,6 +371,12 @@ impl ArenaReadTransaction {
         &self,
     ) -> Result<ReadOnlyTable<BlobId, Holder<'static, BlobTableEntry>>, StorageError> {
         Ok(self.inner.open_table(BLOB_TABLE)?)
+    }
+
+    pub fn blob_lru_queue_table(
+        &self,
+    ) -> Result<ReadOnlyTable<u16, Holder<'static, QueueTableEntry>>, StorageError> {
+        Ok(self.inner.open_table(BLOB_LRU_QUEUE_TABLE)?)
     }
 
     pub fn mark_table(
