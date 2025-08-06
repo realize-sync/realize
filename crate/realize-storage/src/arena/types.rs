@@ -53,7 +53,7 @@ pub enum LocalAvailability {
 pub use blob_capnp::LruQueueId;
 
 /// An entry in the queue table.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct QueueTableEntry {
     /// First node in the queue (BlobId)
     pub head: Option<BlobId>,

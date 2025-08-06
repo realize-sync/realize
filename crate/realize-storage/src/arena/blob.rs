@@ -9,6 +9,7 @@ use realize_types::{ByteRange, ByteRanges, Hash};
 use redb::ReadableTable;
 use std::cmp::min;
 use std::io::{SeekFrom, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -182,6 +183,17 @@ impl Blobstore {
         Ok(())
     }
 
+    /// Calculate disk usage for a blob file using Unix metadata.
+    fn calculate_disk_usage(&self, blob_id: BlobId) -> u64 {
+        match std::fs::metadata(self.blob_path(blob_id)) {
+            // Only take into account actual usage, not the whole file
+            // size, which might be sparse.
+            Ok(m) => m.blocks() * 512,
+            // Most likely, file is gone. Let's not complain here
+            Err(_) => 0,
+        }
+    }
+
     /// Extend the local availability of a blob.
     pub(crate) fn extend_local_availability(
         &self,
@@ -191,14 +203,28 @@ impl Blobstore {
         let txn = self.db.begin_write()?;
         {
             let mut blob_table = txn.blob_table()?;
+            let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
             let mut blob_entry = get_blob_entry(&blob_table, blob_id)?;
+
+            let disk_usage = self.calculate_disk_usage(blob_id);
+            let disk_usage_diff = disk_usage as i64 - (blob_entry.disk_usage as i64);
+
             blob_entry.written_areas = blob_entry.written_areas.union(&new_range);
+            blob_entry.disk_usage = disk_usage;
+
             log::debug!(
-                "{blob_id} extended by {new_range}; available: {}",
+                "{blob_id} extended by {new_range}; available: {}; disk usage diff: {disk_usage_diff}",
                 blob_entry.written_areas
             );
 
-            blob_table.insert(blob_id, Holder::with_content(blob_entry)?)?;
+            // Update the blob entry
+            blob_table.insert(blob_id, Holder::new(&blob_entry)?)?;
+
+            let queue_id = blob_entry.queue;
+
+            if disk_usage_diff != 0 {
+                update_total_disk_usage(&mut blob_lru_queue_table, queue_id, disk_usage_diff)?;
+            }
         }
         txn.commit()?;
 
@@ -275,6 +301,40 @@ impl Blobstore {
 
         Ok((blob_id, dest))
     }
+}
+
+fn update_total_disk_usage(
+    blob_lru_queue_table: &mut redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
+    queue_id: LruQueueId,
+    diff: i64,
+) -> Result<(), StorageError> {
+    let mut entry = get_queue_must_exist(&blob_lru_queue_table, queue_id)?;
+    entry.disk_usage = entry.disk_usage.saturating_add_signed(diff);
+    blob_lru_queue_table.insert(queue_id as u16, Holder::with_content(entry)?)?;
+    Ok(())
+}
+
+fn get_queue_if_available(
+    blob_lru_queue_table: &redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
+    queue_id: LruQueueId,
+) -> Result<Option<QueueTableEntry>, StorageError> {
+    let e = blob_lru_queue_table.get(queue_id as u16)?;
+    if let Some(e) = e {
+        Ok(Some(e.value().parse()?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn get_queue_must_exist(
+    blob_lru_queue_table: &redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
+    queue_id: LruQueueId,
+) -> Result<QueueTableEntry, StorageError> {
+    Ok(blob_lru_queue_table
+        .get(queue_id as u16)?
+        .ok_or_else(|| StorageError::InconsistentDatabase(format!("{queue_id:?} missing")))?
+        .value()
+        .parse()?)
 }
 
 fn do_create_blob_entry(
@@ -359,17 +419,8 @@ fn add_to_queue_front(
 ) -> Result<(), StorageError> {
     blob_entry.queue = queue_id;
 
-    let mut queue_entry = if let Some(entry) = blob_lru_queue_table.get(queue_id as u16)? {
-        entry.value().parse()?
-    } else {
-        QueueTableEntry {
-            head: None,
-            tail: None,
-            disk_usage: 0,
-        }
-    };
-
-    if let Some(head_id) = queue_entry.head {
+    let mut queue = get_queue_if_available(blob_lru_queue_table, queue_id)?.unwrap_or_default();
+    if let Some(head_id) = queue.head {
         let mut head = get_blob_entry(blob_table, head_id)?;
         head.prev = Some(blob_id);
 
@@ -377,13 +428,16 @@ fn add_to_queue_front(
     } else {
         // This is the first node in the queue, so both the head
         // and the tail
-        queue_entry.tail = Some(blob_id);
+        queue.tail = Some(blob_id);
     }
-    blob_entry.next = queue_entry.head;
-    queue_entry.head = Some(blob_id);
+    blob_entry.next = queue.head;
+    queue.head = Some(blob_id);
     blob_entry.prev = None;
 
-    blob_lru_queue_table.insert(queue_id as u16, Holder::with_content(queue_entry)?)?;
+    // Update queue's total disk usage
+    queue.disk_usage += blob_entry.disk_usage;
+
+    blob_lru_queue_table.insert(queue_id as u16, Holder::with_content(queue)?)?;
 
     Ok(())
 }
@@ -394,15 +448,11 @@ fn remove_from_queue(
     blob_table: &mut redb::Table<'_, BlobId, Holder<'static, BlobTableEntry>>,
     blob_entry: &BlobTableEntry,
 ) -> Result<(), StorageError> {
-    let queue_id = blob_entry.queue as u16;
+    let queue_id = blob_entry.queue;
 
     // Get the queue entry
-    let mut queue_entry = if let Some(entry) = blob_lru_queue_table.get(queue_id)? {
-        entry.value().parse()?
-    } else {
-        return Ok(()); // Queue doesn't exist, nothing to remove
-    };
-    let mut update_queue_entry = false;
+    let mut queue = get_queue_must_exist(blob_lru_queue_table, queue_id)?;
+    let mut update_queue = false;
 
     // Update the queue links
     if let Some(prev_id) = blob_entry.prev {
@@ -411,8 +461,8 @@ fn remove_from_queue(
         blob_table.insert(prev_id, Holder::with_content(prev)?)?;
     } else {
         // This was the first node
-        queue_entry.head = blob_entry.next;
-        update_queue_entry = true;
+        queue.head = blob_entry.next;
+        update_queue = true;
     }
 
     if let Some(next_id) = blob_entry.next {
@@ -421,13 +471,16 @@ fn remove_from_queue(
         blob_table.insert(next_id, Holder::with_content(next)?)?;
     } else {
         // This was the last node
-        queue_entry.tail = blob_entry.prev;
-        update_queue_entry = true;
+        queue.tail = blob_entry.prev;
+        update_queue = true;
     }
 
+    // Update queue's total disk usage
+    queue.disk_usage = queue.disk_usage.saturating_sub(blob_entry.disk_usage);
+
     // Save the updated queue entry
-    if update_queue_entry {
-        blob_lru_queue_table.insert(queue_id, Holder::with_content(queue_entry)?)?;
+    if update_queue {
+        blob_lru_queue_table.insert(queue_id as u16, Holder::with_content(queue)?)?;
     }
 
     Ok(())
@@ -1737,6 +1790,130 @@ mod tests {
                 fixture.list_queue_content_backward(LruQueueId::WorkingArea)?
             )
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disk_usage_tracking() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let acache = &fixture.acache;
+
+        // Create a blob and verify initial disk usage is 0
+        let inode = fixture.add_file("test.txt", 1000)?;
+        let blob_id = acache.open_file(inode)?.id();
+
+        let blob_entry = fixture.get_blob_entry(blob_id)?;
+        assert_eq!(0, blob_entry.disk_usage);
+
+        // Write some data to the blob
+        let mut blob = acache.open_file(inode)?;
+        blob.write(b"test data").await?;
+        blob.update_db().await?;
+
+        // disk usage is now 1 block
+        let blksize = fs::metadata(fixture.blob_path(blob.id())).await?.blksize();
+        let blob_entry = fixture.get_blob_entry(blob_id)?;
+        assert_eq!(blob_entry.disk_usage, blksize);
+
+        // Check queue disk usage
+        let txn = fixture.begin_read()?;
+        let queue_table = txn.blob_lru_queue_table()?;
+        let queue_entry = queue_table
+            .get(LruQueueId::WorkingArea as u16)?
+            .unwrap()
+            .value()
+            .parse()?;
+        assert_eq!(blob_entry.disk_usage, queue_entry.disk_usage);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disk_usage_updates_on_blob_deletion() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let acache = &fixture.acache;
+
+        // Create a blob and write some data
+        let inode = fixture.add_file("test.txt", 1000)?;
+        let blob_id = acache.open_file(inode)?.id();
+
+        let mut blob = acache.open_file(inode)?;
+        blob.write(b"test data").await?;
+        blob.update_db().await?;
+
+        // Get initial disk usage
+        let blob_entry = fixture.get_blob_entry(blob_id)?;
+        let initial_disk_usage = blob_entry.disk_usage;
+        assert!(initial_disk_usage > 0);
+
+        // Check queue disk usage before deletion
+        let txn = fixture.begin_read()?;
+        let queue_table = txn.blob_lru_queue_table()?;
+        let queue_entry = queue_table
+            .get(LruQueueId::WorkingArea as u16)?
+            .unwrap()
+            .value()
+            .parse()?;
+        assert_eq!(initial_disk_usage, queue_entry.disk_usage);
+
+        // Delete the blob
+        fixture.remove_file(&Path::parse("test.txt")?)?;
+
+        // Verify blob entry is gone
+        assert!(!fixture.blob_entry_exists(blob_id)?);
+
+        // Check queue disk usage is now 0
+        let txn = fixture.begin_read()?;
+        let queue_table = txn.blob_lru_queue_table()?;
+        let queue_entry = queue_table
+            .get(LruQueueId::WorkingArea as u16)?
+            .unwrap()
+            .value()
+            .parse()?;
+        assert_eq!(0, queue_entry.disk_usage);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disk_usage_tracking_multiple_blobs() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let acache = &fixture.acache;
+
+        // Create multiple blobs and write data
+        let inode1 = fixture.add_file("test1.txt", 1000)?;
+        let inode2 = fixture.add_file("test2.txt", 2000)?;
+
+        let blob_id1 = acache.open_file(inode1)?.id();
+        let blob_id2 = acache.open_file(inode2)?.id();
+
+        let blksize = fs::metadata(fixture.blob_path(blob_id1)).await?.blksize();
+
+        // Write data to first blob
+        let mut blob1 = acache.open_file(inode1)?;
+        blob1.write(b"data for blob 1").await?;
+        blob1.update_db().await?;
+
+        // Write data to second blob
+        let mut blob2 = acache.open_file(inode2)?;
+        blob2.write(b"data for blob 2 which is longer").await?;
+        blob2.update_db().await?;
+
+        // Get individual disk usages
+        let blob_entry1 = fixture.get_blob_entry(blob_id1)?;
+        let blob_entry2 = fixture.get_blob_entry(blob_id2)?;
+
+        // Check queue total disk usage
+        let txn = fixture.begin_read()?;
+        let queue_table = txn.blob_lru_queue_table()?;
+        let queue_entry = queue_table
+            .get(LruQueueId::WorkingArea as u16)?
+            .unwrap()
+            .value()
+            .parse()?;
+        assert_eq!(2 * blksize, queue_entry.disk_usage);
+        assert_eq!(2 * blksize, blob_entry1.disk_usage + blob_entry2.disk_usage);
 
         Ok(())
     }
