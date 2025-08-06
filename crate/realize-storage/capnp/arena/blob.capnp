@@ -12,6 +12,18 @@ struct BlobTableEntry {
   # Hash of the content, may be missing or inconsistent
   # with the corresponding file entry.
   contentHash @1: Data;
+
+  # Queue ID enum
+  queue @2: LruQueueId;
+
+  # Next blob in the queue (BlobId)
+  next @3: UInt64;
+
+  # Previous blob in the queue (BlobId)
+  prev @4: UInt64;
+
+  # Disk usage in bytes
+  diskUsage @5: UInt64;
 }
 
 # A sequence of byte ranges.

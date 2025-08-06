@@ -126,6 +126,18 @@ pub struct BlobTableEntry {
 
     /// Hash of the content; this may be missing or different from the file hash.
     pub content_hash: Option<Hash>,
+
+    /// Queue ID enum
+    pub queue: LruQueueId,
+
+    /// Next blob in the queue (BlobId)
+    pub next: Option<BlobId>,
+
+    /// Previous blob in the queue (BlobId)
+    pub prev: Option<BlobId>,
+
+    /// Disk usage in bytes
+    pub disk_usage: u64,
 }
 
 impl NamedType for BlobTableEntry {
@@ -145,9 +157,34 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
         } else {
             None
         };
+
+        let next_value = reader.get_next();
+        let next = if next_value != 0 {
+            Some(BlobId(next_value))
+        } else {
+            None
+        };
+
+        let prev_value = reader.get_prev();
+        let prev = if prev_value != 0 {
+            Some(BlobId(prev_value))
+        } else {
+            None
+        };
+
+        let queue = match reader.get_queue()? {
+            blob_capnp::LruQueueId::WorkingArea => LruQueueId::WorkingArea,
+            blob_capnp::LruQueueId::ProtectedArea => LruQueueId::ProtectedArea,
+            blob_capnp::LruQueueId::PendingRemoval => LruQueueId::PendingRemoval,
+        };
+
         Ok(BlobTableEntry {
             written_areas: parse_byte_ranges(reader.get_written_areas()?)?,
             content_hash,
+            queue,
+            next,
+            prev,
+            disk_usage: reader.get_disk_usage(),
         })
     }
 
@@ -159,6 +196,14 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
         if let Some(h) = &self.content_hash {
             builder.set_content_hash(&h.0);
         }
+        builder.set_queue(match self.queue {
+            LruQueueId::WorkingArea => blob_capnp::LruQueueId::WorkingArea,
+            LruQueueId::ProtectedArea => blob_capnp::LruQueueId::ProtectedArea,
+            LruQueueId::PendingRemoval => blob_capnp::LruQueueId::PendingRemoval,
+        });
+        builder.set_next(self.next.map(|b| b.0).unwrap_or(0));
+        builder.set_prev(self.prev.map(|b| b.0).unwrap_or(0));
+        builder.set_disk_usage(self.disk_usage);
         fill_byte_ranges(&self.written_areas, builder.init_written_areas());
 
         let mut buffer: Vec<u8> = Vec::new();
@@ -485,11 +530,29 @@ mod tests {
                 realize_types::ByteRange::new(2048, 4096),
             ]),
             content_hash: None,
+            queue: LruQueueId::WorkingArea,
+            next: Some(BlobId(0x0101010101010101)),
+            prev: Some(BlobId(0x0202020202020202)),
+            disk_usage: 1024,
         };
 
         assert_eq!(
             entry,
             BlobTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
+        );
+
+        let empty_entry = BlobTableEntry {
+            written_areas: realize_types::ByteRanges::from_ranges(vec![]),
+            content_hash: Some(Hash([0x03; 32])),
+            queue: LruQueueId::ProtectedArea,
+            next: None,
+            prev: None,
+            disk_usage: 0,
+        };
+
+        assert_eq!(
+            empty_entry,
+            BlobTableEntry::from_bytes(empty_entry.clone().to_bytes()?.as_slice())?
         );
 
         Ok(())

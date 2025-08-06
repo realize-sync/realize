@@ -1,6 +1,6 @@
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
 use super::hasher::hash_file;
-use super::types::{BlobTableEntry, LocalAvailability};
+use super::types::{BlobTableEntry, LocalAvailability, LruQueueId};
 use crate::StorageError;
 use crate::global::types::FileTableEntry;
 use crate::types::{BlobId, Inode};
@@ -246,6 +246,10 @@ fn do_create_blob_entry(
     let blob_entry = BlobTableEntry {
         written_areas: ByteRanges::new(),
         content_hash: None,
+        queue: LruQueueId::WorkingArea,
+        next: None,
+        prev: None,
+        disk_usage: 0,
     };
     blob_table.insert(blob_id, Holder::new(&blob_entry)?)?;
     Ok((blob_id, blob_entry))
