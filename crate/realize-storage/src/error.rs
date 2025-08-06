@@ -40,6 +40,9 @@ pub enum StorageError {
 
     #[error("arena {0} has no local storage")]
     NoLocalStorage(Arena),
+
+    #[error("database is inconsistent. This is a bug. {0}")]
+    InconsistentDatabase(String),
 }
 
 impl StorageError {

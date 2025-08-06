@@ -47,10 +47,10 @@ enum LruQueueId {
 # An entry in the queue table.
 struct QueueTableEntry {
   # First node in the queue (BlobId)
-  firstNode @0: UInt64;
+  head @0: UInt64;
 
   # Last node in the queue (BlobId)
-  lastNode @1: UInt64;
+  tail @1: UInt64;
 
   # Total disk usage in bytes
   diskUsage @2: UInt64;

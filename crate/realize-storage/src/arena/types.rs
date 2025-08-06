@@ -50,23 +50,15 @@ pub enum LocalAvailability {
 }
 
 /// LRU Queue ID enum
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LruQueueId {
-    /// Working area queue
-    WorkingArea,
-    /// Protected area queue
-    ProtectedArea,
-    /// Pending removal queue
-    PendingRemoval,
-}
+pub use blob_capnp::LruQueueId;
 
 /// An entry in the queue table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueueTableEntry {
     /// First node in the queue (BlobId)
-    pub first_node: Option<BlobId>,
+    pub head: Option<BlobId>,
     /// Last node in the queue (BlobId)
-    pub last_node: Option<BlobId>,
+    pub tail: Option<BlobId>,
     /// Total disk usage in bytes
     pub disk_usage: u64,
 }
@@ -83,23 +75,23 @@ impl ByteConvertible<QueueTableEntry> for QueueTableEntry {
         let reader: blob_capnp::queue_table_entry::Reader =
             message_reader.get_root::<blob_capnp::queue_table_entry::Reader>()?;
 
-        let first_node_value = reader.get_first_node();
-        let first_node = if first_node_value != 0 {
-            Some(BlobId(first_node_value))
+        let head_value = reader.get_head();
+        let head = if head_value != 0 {
+            Some(BlobId(head_value))
         } else {
             None
         };
 
-        let last_node_value = reader.get_last_node();
-        let last_node = if last_node_value != 0 {
-            Some(BlobId(last_node_value))
+        let tail_value = reader.get_tail();
+        let tail = if tail_value != 0 {
+            Some(BlobId(tail_value))
         } else {
             None
         };
 
         Ok(QueueTableEntry {
-            first_node,
-            last_node,
+            head: head,
+            tail: tail,
             disk_usage: reader.get_disk_usage(),
         })
     }
@@ -109,8 +101,8 @@ impl ByteConvertible<QueueTableEntry> for QueueTableEntry {
         let mut builder: blob_capnp::queue_table_entry::Builder =
             message.init_root::<blob_capnp::queue_table_entry::Builder>();
 
-        builder.set_first_node(self.first_node.map(|b| b.0).unwrap_or(0));
-        builder.set_last_node(self.last_node.map(|b| b.0).unwrap_or(0));
+        builder.set_head(self.head.map(|b| b.0).unwrap_or(0));
+        builder.set_tail(self.tail.map(|b| b.0).unwrap_or(0));
         builder.set_disk_usage(self.disk_usage);
 
         let mut buffer: Vec<u8> = Vec::new();
@@ -172,11 +164,7 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
             None
         };
 
-        let queue = match reader.get_queue()? {
-            blob_capnp::LruQueueId::WorkingArea => LruQueueId::WorkingArea,
-            blob_capnp::LruQueueId::ProtectedArea => LruQueueId::ProtectedArea,
-            blob_capnp::LruQueueId::PendingRemoval => LruQueueId::PendingRemoval,
-        };
+        let queue = reader.get_queue()?;
 
         Ok(BlobTableEntry {
             written_areas: parse_byte_ranges(reader.get_written_areas()?)?,
@@ -196,11 +184,7 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
         if let Some(h) = &self.content_hash {
             builder.set_content_hash(&h.0);
         }
-        builder.set_queue(match self.queue {
-            LruQueueId::WorkingArea => blob_capnp::LruQueueId::WorkingArea,
-            LruQueueId::ProtectedArea => blob_capnp::LruQueueId::ProtectedArea,
-            LruQueueId::PendingRemoval => blob_capnp::LruQueueId::PendingRemoval,
-        });
+        builder.set_queue(self.queue);
         builder.set_next(self.next.map(|b| b.0).unwrap_or(0));
         builder.set_prev(self.prev.map(|b| b.0).unwrap_or(0));
         builder.set_disk_usage(self.disk_usage);
@@ -561,8 +545,8 @@ mod tests {
     #[test]
     fn convert_queue_table_entry() -> anyhow::Result<()> {
         let entry = QueueTableEntry {
-            first_node: Some(BlobId(0x0101010101010101)),
-            last_node: Some(BlobId(0x0202020202020202)),
+            head: Some(BlobId(0x0101010101010101)),
+            tail: Some(BlobId(0x0202020202020202)),
             disk_usage: 1024,
         };
 
@@ -572,8 +556,8 @@ mod tests {
         );
 
         let empty_entry = QueueTableEntry {
-            first_node: None,
-            last_node: None,
+            head: None,
+            tail: None,
             disk_usage: 0,
         };
 

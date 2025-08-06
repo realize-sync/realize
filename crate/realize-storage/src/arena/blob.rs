@@ -1,6 +1,6 @@
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
 use super::hasher::hash_file;
-use super::types::{BlobTableEntry, LocalAvailability, LruQueueId};
+use super::types::{BlobTableEntry, LocalAvailability, LruQueueId, QueueTableEntry};
 use crate::StorageError;
 use crate::global::types::FileTableEntry;
 use crate::types::{BlobId, Inode};
@@ -46,7 +46,7 @@ impl Blobstore {
         }))
     }
 
-    /// Return an [Blob] entry given a blob id.
+    /// Open an existing blob and returns its [Blob]
     pub(crate) fn open_blob(
         self: &Arc<Self>,
         txn: &ArenaReadTransaction,
@@ -74,12 +74,14 @@ impl Blobstore {
         file_entry: FileTableEntry,
     ) -> Result<Blob, StorageError> {
         let mut blob_table = txn.blob_table()?;
+        let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
         let (blob_id, blob_entry) = if let Some(blob_id) = file_entry.content.blob {
             let blob_entry = get_blob_entry(&blob_table, blob_id)?;
 
             (blob_id, blob_entry)
         } else {
-            let (blob_id, blob_entry) = do_create_blob_entry(&mut blob_table)?;
+            let (blob_id, blob_entry) =
+                do_create_blob_entry(&mut blob_lru_queue_table, &mut blob_table)?;
             log::debug!(
                 "assigned blob {blob_id} to file {inode} {}",
                 file_entry.content.hash
@@ -133,11 +135,49 @@ impl Blobstore {
         blob_id: BlobId,
     ) -> Result<(), StorageError> {
         let mut blob_table = txn.blob_table()?;
-        blob_table.remove(blob_id)?;
+        let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
+        let removed = blob_table.remove(blob_id)?;
+        let removed_entry = removed.map(|r| r.value().parse());
+        if let Some(entry) = removed_entry {
+            let entry = entry?;
+            remove_from_queue(&mut blob_lru_queue_table, &mut blob_table, &entry)?;
+        }
+
         let blob_path = self.blob_path(blob_id);
         if blob_path.exists() {
             std::fs::remove_file(&blob_path)?;
         }
+
+        Ok(())
+    }
+
+    /// Mark a blob as accessed by moving it to the front of its queue.
+    #[allow(dead_code)]
+    pub(crate) fn mark_accessed(&self, blob_id: BlobId) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut blob_table = txn.blob_table()?;
+            let mut blob_entry = get_blob_entry(&blob_table, blob_id)?;
+            if blob_entry.prev.is_none() {
+                // Already at the head of its queue
+                return Ok(());
+            }
+            log::debug!("{blob_id} moved to the front of {:?}", blob_entry.queue);
+            let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
+
+            let queue_id = blob_entry.queue;
+            remove_from_queue(&mut blob_lru_queue_table, &mut blob_table, &blob_entry)?;
+            add_to_queue_front(
+                &mut blob_lru_queue_table,
+                &mut blob_table,
+                queue_id,
+                blob_id,
+                &mut blob_entry,
+            )?;
+
+            blob_table.insert(blob_id, Holder::with_content(blob_entry)?)?;
+        }
+        txn.commit()?;
 
         Ok(())
     }
@@ -220,13 +260,14 @@ impl Blobstore {
         size: u64,
     ) -> Result<(BlobId, PathBuf), StorageError> {
         let mut blob_table = txn.blob_table()?;
+        let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
         let (blob_id, mut entry) = match blob_id {
             Some(blob_id) => {
                 let entry = get_blob_entry(&blob_table, blob_id)?;
 
                 (blob_id, entry)
             }
-            None => do_create_blob_entry(&mut blob_table)?,
+            None => do_create_blob_entry(&mut blob_lru_queue_table, &mut blob_table)?,
         };
         let dest = self.blob_path(blob_id);
         entry.written_areas = ByteRanges::single(0, size);
@@ -237,13 +278,14 @@ impl Blobstore {
 }
 
 fn do_create_blob_entry(
+    blob_lru_queue_table: &mut redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
     blob_table: &mut redb::Table<'_, BlobId, Holder<'static, BlobTableEntry>>,
 ) -> Result<(BlobId, BlobTableEntry), StorageError> {
     let blob_id = blob_table
         .last()?
         .map(|(k, _)| k.value().plus(1))
         .unwrap_or(BlobId(1));
-    let blob_entry = BlobTableEntry {
+    let mut blob_entry = BlobTableEntry {
         written_areas: ByteRanges::new(),
         content_hash: None,
         queue: LruQueueId::WorkingArea,
@@ -251,6 +293,15 @@ fn do_create_blob_entry(
         prev: None,
         disk_usage: 0,
     };
+
+    add_to_queue_front(
+        blob_lru_queue_table,
+        blob_table,
+        LruQueueId::WorkingArea,
+        blob_id,
+        &mut blob_entry,
+    )?;
+
     blob_table.insert(blob_id, Holder::new(&blob_entry)?)?;
     Ok((blob_id, blob_entry))
 }
@@ -296,6 +347,90 @@ fn get_blob_entry(
         .parse()?;
 
     Ok(entry)
+}
+
+/// Add a blob to the front of the WorkingArea queue.
+fn add_to_queue_front(
+    blob_lru_queue_table: &mut redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
+    blob_table: &mut redb::Table<'_, BlobId, Holder<'static, BlobTableEntry>>,
+    queue_id: LruQueueId,
+    blob_id: BlobId,
+    blob_entry: &mut BlobTableEntry,
+) -> Result<(), StorageError> {
+    blob_entry.queue = queue_id;
+
+    let mut queue_entry = if let Some(entry) = blob_lru_queue_table.get(queue_id as u16)? {
+        entry.value().parse()?
+    } else {
+        QueueTableEntry {
+            head: None,
+            tail: None,
+            disk_usage: 0,
+        }
+    };
+
+    if let Some(head_id) = queue_entry.head {
+        let mut head = get_blob_entry(blob_table, head_id)?;
+        head.prev = Some(blob_id);
+
+        blob_table.insert(head_id, Holder::with_content(head)?)?;
+    } else {
+        // This is the first node in the queue, so both the head
+        // and the tail
+        queue_entry.tail = Some(blob_id);
+    }
+    blob_entry.next = queue_entry.head;
+    queue_entry.head = Some(blob_id);
+    blob_entry.prev = None;
+
+    blob_lru_queue_table.insert(queue_id as u16, Holder::with_content(queue_entry)?)?;
+
+    Ok(())
+}
+
+/// Remove a blob from its queue.
+fn remove_from_queue(
+    blob_lru_queue_table: &mut redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
+    blob_table: &mut redb::Table<'_, BlobId, Holder<'static, BlobTableEntry>>,
+    blob_entry: &BlobTableEntry,
+) -> Result<(), StorageError> {
+    let queue_id = blob_entry.queue as u16;
+
+    // Get the queue entry
+    let mut queue_entry = if let Some(entry) = blob_lru_queue_table.get(queue_id)? {
+        entry.value().parse()?
+    } else {
+        return Ok(()); // Queue doesn't exist, nothing to remove
+    };
+    let mut update_queue_entry = false;
+
+    // Update the queue links
+    if let Some(prev_id) = blob_entry.prev {
+        let mut prev = get_blob_entry(blob_table, prev_id)?;
+        prev.next = blob_entry.next;
+        blob_table.insert(prev_id, Holder::with_content(prev)?)?;
+    } else {
+        // This was the first node
+        queue_entry.head = blob_entry.next;
+        update_queue_entry = true;
+    }
+
+    if let Some(next_id) = blob_entry.next {
+        let mut next = get_blob_entry(blob_table, next_id)?;
+        next.prev = blob_entry.prev;
+        blob_table.insert(next_id, Holder::with_content(next)?)?;
+    } else {
+        // This was the last node
+        queue_entry.tail = blob_entry.prev;
+        update_queue_entry = true;
+    }
+
+    // Save the updated queue entry
+    if update_queue_entry {
+        blob_lru_queue_table.insert(queue_id, Holder::with_content(queue_entry)?)?;
+    }
+
+    Ok(())
 }
 
 /// Error returned by Blob when reading outside the available range.
@@ -597,6 +732,7 @@ mod tests {
         arena: Arena,
         acache: Arc<ArenaCache>,
         db: Arc<ArenaDatabase>,
+        blob_dir: PathBuf,
         tempdir: TempDir,
     }
     impl Fixture {
@@ -626,6 +762,7 @@ mod tests {
                 arena,
                 db,
                 acache,
+                blob_dir: blob_dir.to_path_buf(),
                 tempdir,
             })
         }
@@ -719,6 +856,44 @@ mod tests {
                 Some(_) => Ok(true),
                 None => Ok(false),
             }
+        }
+
+        fn list_queue_content(&self, queue_id: LruQueueId) -> anyhow::Result<Vec<BlobId>> {
+            let mut content = vec![];
+            let txn = self.begin_read()?;
+            let blob_lru_queue_table = txn.blob_lru_queue_table()?;
+            let blob_table = txn.blob_table()?;
+            let queue = blob_lru_queue_table
+                .get(queue_id as u16)?
+                .unwrap()
+                .value()
+                .parse()?;
+            let mut current = queue.head;
+            while let Some(id) = current {
+                content.push(id);
+                current = get_blob_entry(&blob_table, id)?.next;
+            }
+
+            Ok(content)
+        }
+
+        fn list_queue_content_backward(&self, queue_id: LruQueueId) -> anyhow::Result<Vec<BlobId>> {
+            let mut content = vec![];
+            let txn = self.begin_read()?;
+            let blob_lru_queue_table = txn.blob_lru_queue_table()?;
+            let blob_table = txn.blob_table()?;
+            let queue = blob_lru_queue_table
+                .get(queue_id as u16)?
+                .unwrap()
+                .value()
+                .parse()?;
+            let mut current = queue.tail;
+            while let Some(id) = current {
+                content.push(id);
+                current = get_blob_entry(&blob_table, id)?.prev;
+            }
+
+            Ok(content)
         }
     }
 
@@ -1430,6 +1605,137 @@ mod tests {
         assert_eq!(
             None,
             acache.move_into_blob_if_matches(&txn, &file_path, &Hash([99; 32]))?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn add_to_working_area_on_blob_creation() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let acache = &fixture.acache;
+
+        let one = acache.open_file(fixture.add_file("one", 100)?)?.id();
+        assert_eq!(
+            (vec![one], vec![one]),
+            (
+                fixture.list_queue_content(LruQueueId::WorkingArea)?,
+                fixture.list_queue_content_backward(LruQueueId::WorkingArea)?
+            )
+        );
+
+        let two = acache.open_file(fixture.add_file("two", 100)?)?.id();
+        assert_eq!(
+            (vec![two, one], vec![one, two]),
+            (
+                fixture.list_queue_content(LruQueueId::WorkingArea)?,
+                fixture.list_queue_content_backward(LruQueueId::WorkingArea)?
+            )
+        );
+
+        let three = acache.open_file(fixture.add_file("three", 100)?)?.id();
+
+        assert_eq!(
+            (vec![three, two, one], vec![one, two, three]),
+            (
+                fixture.list_queue_content(LruQueueId::WorkingArea)?,
+                fixture.list_queue_content_backward(LruQueueId::WorkingArea)?
+            )
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remove_from_queue_on_blob_deletion() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let acache = &fixture.acache;
+
+        let one = acache.open_file(fixture.add_file("one", 100)?)?.id();
+        let _two = acache.open_file(fixture.add_file("two", 100)?)?.id();
+        let three = acache.open_file(fixture.add_file("three", 100)?)?.id();
+        let four = acache.open_file(fixture.add_file("four", 100)?)?.id();
+
+        // Delete the file to delete the blob.
+        fixture.remove_file(&Path::parse("two")?)?;
+
+        assert_eq!(
+            (vec![four, three, one], vec![one, three, four]),
+            (
+                fixture.list_queue_content(LruQueueId::WorkingArea)?,
+                fixture.list_queue_content_backward(LruQueueId::WorkingArea)?
+            )
+        );
+
+        fixture.remove_file(&Path::parse("one")?)?;
+
+        assert_eq!(
+            (vec![four, three], vec![three, four]),
+            (
+                fixture.list_queue_content(LruQueueId::WorkingArea)?,
+                fixture.list_queue_content_backward(LruQueueId::WorkingArea)?
+            )
+        );
+
+        fixture.remove_file(&Path::parse("four")?)?;
+        assert_eq!(
+            (vec![three], vec![three]),
+            (
+                fixture.list_queue_content(LruQueueId::WorkingArea)?,
+                fixture.list_queue_content_backward(LruQueueId::WorkingArea)?
+            )
+        );
+
+        fixture.remove_file(&Path::parse("three")?)?;
+        assert_eq!(
+            (vec![], vec![]),
+            (
+                fixture.list_queue_content(LruQueueId::WorkingArea)?,
+                fixture.list_queue_content_backward(LruQueueId::WorkingArea)?
+            )
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mark_accessed() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let acache = &fixture.acache;
+
+        let one = acache.open_file(fixture.add_file("one", 100)?)?.id();
+        let two = acache.open_file(fixture.add_file("two", 100)?)?.id();
+        let three = acache.open_file(fixture.add_file("three", 100)?)?.id();
+        let four = acache.open_file(fixture.add_file("four", 100)?)?.id();
+
+        // four is now at the head, being the most recent. Let's move
+        // two there, then one..
+        let blobstore = Blobstore::new(Arc::clone(&fixture.db), &fixture.blob_dir)?;
+        blobstore.mark_accessed(two)?;
+        assert_eq!(
+            (vec![two, four, three, one], vec![one, three, four, two]),
+            (
+                fixture.list_queue_content(LruQueueId::WorkingArea)?,
+                fixture.list_queue_content_backward(LruQueueId::WorkingArea)?
+            )
+        );
+
+        blobstore.mark_accessed(one)?;
+        assert_eq!(
+            (vec![one, two, four, three], vec![three, four, two, one]),
+            (
+                fixture.list_queue_content(LruQueueId::WorkingArea)?,
+                fixture.list_queue_content_backward(LruQueueId::WorkingArea)?
+            )
+        );
+
+        blobstore.mark_accessed(one)?;
+        assert_eq!(
+            (vec![one, two, four, three], vec![three, four, two, one]),
+            (
+                fixture.list_queue_content(LruQueueId::WorkingArea)?,
+                fixture.list_queue_content_backward(LruQueueId::WorkingArea)?
+            )
         );
 
         Ok(())

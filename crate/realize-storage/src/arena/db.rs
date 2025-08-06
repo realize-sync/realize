@@ -373,6 +373,7 @@ impl ArenaReadTransaction {
         Ok(self.inner.open_table(BLOB_TABLE)?)
     }
 
+    #[allow(dead_code)]
     pub fn blob_lru_queue_table(
         &self,
     ) -> Result<ReadOnlyTable<u16, Holder<'static, QueueTableEntry>>, StorageError> {
