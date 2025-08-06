@@ -249,7 +249,9 @@ impl ArenaCache {
         {
             let txn = self.db.begin_read()?;
             let file_entry = get_default_entry(&txn.cache_file_table()?, inode)?;
-            if let Some(blob_id) = file_entry.content.blob {
+            if let Some(blob_id) = file_entry.content.blob
+                && blob::blob_exists(&txn, blob_id)?
+            {
                 // Delegate to Blobstore
                 return self.blobstore.open_blob(&txn, file_entry, blob_id);
             }

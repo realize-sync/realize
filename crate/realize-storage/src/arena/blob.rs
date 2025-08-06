@@ -82,7 +82,11 @@ impl Blobstore {
         let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
         let mut blob_next_id_table = txn.blob_next_id_table()?;
         let (blob_id, blob_entry) = if let Some(blob_id) = file_entry.content.blob {
-            let blob_entry = get_blob_entry(&blob_table, blob_id)?;
+            let blob_entry = if let Some(e) = blob_table.get(blob_id)? {
+                e.value().parse()?
+            } else {
+                do_create_blob_entry_with_id(&mut blob_lru_queue_table, &mut blob_table, blob_id)?
+            };
 
             (blob_id, blob_entry)
         } else {
@@ -427,6 +431,17 @@ fn do_create_blob_entry(
     };
     blob_next_id_table.insert((), blob_id)?;
 
+    Ok((
+        blob_id,
+        do_create_blob_entry_with_id(blob_lru_queue_table, blob_table, blob_id)?,
+    ))
+}
+
+fn do_create_blob_entry_with_id(
+    blob_lru_queue_table: &mut redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
+    blob_table: &mut redb::Table<'_, BlobId, Holder<'static, BlobTableEntry>>,
+    blob_id: BlobId,
+) -> Result<BlobTableEntry, StorageError> {
     let mut blob_entry = BlobTableEntry {
         written_areas: ByteRanges::new(),
         content_hash: None,
@@ -445,7 +460,11 @@ fn do_create_blob_entry(
     )?;
 
     blob_table.insert(blob_id, Holder::new(&blob_entry)?)?;
-    Ok((blob_id, blob_entry))
+    Ok(blob_entry)
+}
+
+pub(crate) fn blob_exists(txn: &ArenaReadTransaction, id: BlobId) -> Result<bool, StorageError> {
+    Ok(txn.blob_table()?.get(id)?.is_some())
 }
 
 pub(crate) fn local_availability(
@@ -2528,6 +2547,60 @@ mod tests {
         let next_id_table = txn.blob_next_id_table()?;
         let next_id = next_id_table.get(())?.unwrap().value();
         assert_eq!(BlobId(2), next_id); // The table stores the last allocated ID
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn open_file_handles_blob_deleted_by_cleanup_cache() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let acache = &fixture.acache;
+
+        // 1. Add a file
+        let inode = fixture.add_file("test.txt", 100)?;
+
+        // 2. Call open_file() and drop the returned blob
+        {
+            let mut blob = acache.open_file(inode)?;
+            let blob_id = blob.id();
+            assert!(fixture.blob_entry_exists(blob_id)?);
+            assert!(fixture.blob_file_exists(blob_id));
+
+            // Write some data to create disk usage
+            let test_data = b"Hello, world!";
+            blob.write(test_data).await?;
+            blob.update_db().await?;
+
+            // Explicitly drop the blob to ensure it's closed
+            drop(blob);
+        }
+
+        // 3. Call cleanup_cache(0) to delete everything
+        acache.cleanup_cache(0)?;
+
+        // Verify the blob was deleted
+        let blob_id = BlobId(1); // First blob should have ID 1
+        assert!(!fixture.blob_entry_exists(blob_id)?);
+        assert!(!fixture.blob_file_exists(blob_id));
+
+        // 4. Call open_file() and make sure the returned blob can be written to normally
+        let mut new_blob = acache.open_file(inode)?;
+
+        // It's not actually a new blob; the id is reused
+        assert_eq!(blob_id, new_blob.id());
+
+        // Verify the new blob exists and it has been added to the LRU queue.
+        assert!(fixture.blob_entry_exists(blob_id)?);
+        assert!(fixture.blob_file_exists(blob_id));
+        assert_eq!(
+            vec![blob_id],
+            fixture.list_queue_content(LruQueueId::WorkingArea)?
+        );
+
+        // Test that we can write to the new blob normally
+        let test_data = b"Hello, world!";
+        let bytes_written = new_blob.write(test_data).await?;
+        assert_eq!(test_data.len(), bytes_written);
 
         Ok(())
     }
