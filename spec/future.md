@@ -3,6 +3,100 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
+## Turn Blobstore into a LRU cache {#bloblru}
+
+Add a single-level LRU cache for the Working cache of the blobstore,
+described in the section BlobStore of [unreal.md](unreal.md)
+
+Blobs are added to the front of the LRU cache when they're created or
+when they're opened. Blobs are removed from the LRU cache when they're
+deleted.
+
+All blob are added to the front of the LRU cache. open_file, in
+[blob.rs](../crate/realize-storage/src/arena/blob.rs) moves the blob
+to the front of the LRU cache.
+
+The LRU cache keeps track of disk usage of the blob files, in bytes.
+Since the blob files are sparse files, computing disk usage requires
+computing `Metadata.block()*Metadata.blksize()` using
+`std::os::unix::fs::MetadataEx`. Every time
+extend_local_availability, defined in
+[blob.rs](../crate/realize-storage/src/arena/blob.rs) updates a blob,
+it updates the disk usage stored in `BlobTableEntry` and the total
+disk usage of the containing LRU queue, stored in `QueueTableEntry`.
+
+A new method on BlobStore, `cleanup(target_size)` removes entries from
+the back of the LRU cache until the total `size <= target_size`.
+
+Task list:
+
+1. introduce a queue table, but don't use it yet
+
+**blob_lru_queue**
+Key: u16
+Value: QueueTableEntry, defined in blobstore.capnp
+ - first node :Option<BlobId>, BlobId is the key of the blob table
+ - last node: Option<BlobId>
+ - disk usage: u64 (in bytes)
+
+The key of this table is LRU Queue ID, an enum defined in capnp:
+ - working area (0)
+ - protected area (1)
+ - pending removal (2)
+
+- define a type QueueTableEntry in [types.rs](../crate/realize-storage/src/arena/types.rs)
+- define a corresponding capnp message in [blob.capnp](../crate/realize-storage/capnp/arena/blob.capnp)
+- make QueueTableEntry implement the trait ByteConvertible and NamedType, like other types in `types.rs
+- write a test case for the transformation of QueueTableEntry to and from bytes. See convert_indexed_file_table_entry in [types.rs](../crate/realize-storage/src/arena/types.rs) for an example
+- make sure the code builds and the test pass
+- define the LRU Queue ID enum in [blob.capnp](../crate/realize-storage/capnp/arena/blob.capnp)
+- define the table in [arena.rs](../crate/realize-storage/src/arena/db.rs), add a getter to `ArenaWriteTransaction` and `ArenaReadTransaction`
+- make sure the code builds
+
+2. Extend `BlobTableEntry` to allow adding a blob to the queue (but don't add it yet)
+
+- Add the following fields to `BlobTableEntry` in [types.rs](../crate/realize-storage/src/arena/types.rs):
+ queue: u16 (queue ID enum, defined in the previous step)
+ next: Option<BlobId>
+ prev: Option<BlobId>
+ disk_usage: u64 (disk usage in bytes)
+
+- Do the same in the capnp representation of `BlobTableEntry` in
+  [blob.capnp](../crate/realize-storage/capnp/arena/blob.capnp)
+
+- Update the transformation from/into bytes of `BlobTableEntry` in [types.rs](../crate/realize-storage/src/arena/types.rs)
+
+- Update and extend the unit test convert_table_entry to cover the new fields, make sure the new test passes
+
+3. Keep all blobs in the queue (in the working area)
+
+- Add a `BlobTableEntry` to the front of the queue when it is created
+- Remove a `BlobTableEntry` to the front of the queue when it is removed
+- Add a method `BlobStore::mark_accessed(BlobId)` that put a `BlobTableEntry` to the front of the queue if it's not already there.
+- Write test cases and make sure they pass
+
+4. Update disk usage count
+
+- Update disk_usage in `BlobTableEntry` in extend_local_availability.
+  Compute it in `Metadata.block()*Metadata.blksize()` using
+  `std::os::unix::fs::MetadataEx`
+- Apply any delta to the containing queue `QueueTableEntry` total disk
+  usage
+- Update total size in `QueueTableEntry` also when a blob is deleted
+- Write test cases and make sure they pass
+
+5. Add a method to `BlobStore::cleanup_cache(target)` that removes
+   blobs from the back of the queue until the total size <= target.
+
+- Write the method
+- Write test cases and make sure they pass
+
+TODO: define tasks for
+ - calling mark_accessed in the background, after open_file from downloader.rs
+ - configuring target size for the cache
+ - calling cleanup_cache in the background, after cache size has increased or
+   path marks have changed
+
 ## Expose connection info through RPC and display in realize-control {#conninfo}
 
 ## Add Mark::Ignore {#ignore}
@@ -44,13 +138,6 @@ unset marks as xattrs change.
 - Add unit tests, then run `cargo test -p realize-storage marks`,
   fix any issues.
 - Finally run `cargo test -p realize-storage`, fix any issues.
-
-## Turn Blobstore into a LRU cache {#bloblru}
-
-Add a single-level LRU cache for the Working cache of the blobstore,
-described in the section BlobStore of [unreal.md](unreal.md)
-
-Task list: TBD
 
 ## Recover inode range in Arena cache {#inoderange}
 
