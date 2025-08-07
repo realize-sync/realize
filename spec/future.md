@@ -88,14 +88,33 @@ The key of this table is LRU Queue ID, an enum defined in capnp:
 5. Add a method to `BlobStore::cleanup_cache(target)` that removes
    blobs from the back of the queue until the total size <= target.
 
-- Write the method
+   IMPORTANT: cleanup_cache method must not delete files for which there are
+   open blobs (created by open_blob, returned from the Arena cache by
+   file_open), so the blob store must track the open blobs. Dropping a
+   Blob instance returned by Blobstore::open_blob releases the blob in
+   that store and allows it to be deleted by cleanup_cache.
+
+- Implement code to track the ids opened blobs. Note that the same
+  blob can be opened more than once.
+
+- Implement cleanup_cache()
+
 - Write test cases and make sure they pass
 
-TODO: define tasks for
- - calling mark_accessed in the background, after open_file from downloader.rs
- - configuring target size for the cache
- - calling cleanup_cache in the background, after cache size has increased or
-   path marks have changed
+5. store mark in cache (explicit vs resolved)
+
+- turn PathMarks into a trait, implemented by PathMarks
+- have ArenaCache implement PathMarks, copy tests
+- turn off old PathMark implementation
+
+6. define protected (non-)queue and put watch in normal and non-watch
+   in protected, move to/fro protected when ark changes + call cleanup
+   queue (bg after commit)
+
+7. call cleanup queue after update_db +call update_db regularly (bg
+   after commit)
+
+8. call mark_accessed from downloader (bg, if necessary)
 
 ## Expose connection info through RPC and display in realize-control {#conninfo}
 
