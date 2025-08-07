@@ -1,15 +1,14 @@
 use super::blob::{self, Blobstore};
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
-use super::types::{LocalAvailability, LruQueueId};
+use super::types::{
+    DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry, LocalAvailability,
+    LruQueueId, PeerTableEntry, ReadDirEntry,
+};
 use crate::arena::engine::DirtyPaths;
 use crate::arena::notifier::{Notification, Progress};
-use crate::global::types::{
-    DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry, InodeAssignment,
-    PeerTableEntry, ReadDirEntry,
-};
 use crate::types::BlobId;
 use crate::utils::holder::Holder;
-use crate::{Blob, InodeAllocator};
+use crate::{Blob, InodeAllocator, InodeAssignment};
 use crate::{Inode, StorageError};
 use realize_types::{Arena, ByteRanges, Hash, Path, Peer, UnixTime};
 use redb::ReadableTable;
@@ -65,7 +64,7 @@ impl ArenaCache {
         &self,
         parent_inode: Inode,
         name: &str,
-    ) -> Result<ReadDirEntry, StorageError> {
+    ) -> Result<(Inode, InodeAssignment), StorageError> {
         let txn = self.db.begin_read()?;
         do_lookup(&txn.cache_directory_table()?, parent_inode, name)
     }
@@ -101,7 +100,7 @@ impl ArenaCache {
     pub(crate) fn readdir(
         &self,
         inode: Inode,
-    ) -> Result<Vec<(String, ReadDirEntry)>, StorageError> {
+    ) -> Result<Vec<(String, Inode, InodeAssignment)>, StorageError> {
         let txn = self.db.begin_read()?;
 
         do_readdir(&txn.cache_directory_table()?, inode)
@@ -534,13 +533,12 @@ impl ArenaCache {
             return Err(StorageError::NotADirectory);
         }
 
-        let dir_entry =
+        let (inode, assignment) =
             get_dir_entry(&dir_table, parent_inode, path.name())?.ok_or(StorageError::NotFound)?;
-        if dir_entry.assignment != InodeAssignment::File {
+        if assignment != InodeAssignment::File {
             return Err(StorageError::IsADirectory);
         }
 
-        let inode = dir_entry.inode;
         let mut file_table = txn.cache_file_table()?;
         self.do_rm_file_entry(
             txn,
@@ -690,10 +688,10 @@ fn mark_dir_dirty(
     Ok(())
 }
 
-pub(crate) fn do_readdir(
+fn do_readdir(
     dir_table: &impl ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
     inode: Inode,
-) -> Result<Vec<(String, ReadDirEntry)>, StorageError> {
+) -> Result<Vec<(String, Inode, InodeAssignment)>, StorageError> {
     // This is not ideal, but redb iterators are bound to the transaction.
     // We must collect the results.
     let mut entries = Vec::new();
@@ -706,18 +704,18 @@ pub(crate) fn do_readdir(
         }
         let name = key.value().1.to_string();
         if let DirTableEntry::Regular(entry) = value.value().parse()? {
-            entries.push((name, entry.clone()));
+            entries.push((name, entry.inode, entry.assignment));
         }
     }
 
     Ok(entries)
 }
 
-pub(crate) fn do_lookup(
+fn do_lookup(
     dir_table: &impl ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
     parent_inode: Inode,
     name: &str,
-) -> Result<ReadDirEntry, StorageError> {
+) -> Result<(Inode, InodeAssignment), StorageError> {
     Ok(dir_table
         .get((parent_inode, name))?
         .ok_or(StorageError::NotFound)?
@@ -756,7 +754,7 @@ fn do_peer_progress(
     Ok(None)
 }
 
-pub(crate) fn do_dir_mtime(
+fn do_dir_mtime(
     dir_table: &impl redb::ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
     inode: Inode,
     root: Inode,
@@ -906,12 +904,12 @@ where
 
             new_inode
         }
-        Some(dir_entry) => {
-            if dir_entry.assignment != InodeAssignment::File {
+        Some((inode, assignment)) => {
+            if assignment != InodeAssignment::File {
                 return Err(StorageError::IsADirectory);
             }
 
-            dir_entry.inode
+            inode
         }
     };
 
@@ -921,7 +919,7 @@ where
 /// Make sure that the given path is a directory; create it if necessary.
 ///
 /// Returns the inode of the directory pointed to by the path.
-pub(crate) fn do_mkdirs(
+fn do_mkdirs(
     dir_table: &mut redb::Table<'_, (Inode, &str), Holder<DirTableEntry>>,
     root_inode: Inode,
     path: Option<&Path>,
@@ -929,13 +927,13 @@ pub(crate) fn do_mkdirs(
 ) -> Result<Inode, StorageError> {
     let mut current = root_inode;
     for component in Path::components(path) {
-        current = if let Some(entry) = get_dir_entry(dir_table, current, component)? {
-            if entry.assignment != InodeAssignment::Directory {
+        current = if let Some((inode, assignment)) = get_dir_entry(dir_table, current, component)? {
+            if assignment != InodeAssignment::Directory {
                 return Err(StorageError::NotADirectory);
             }
-            log::debug!("found {component} in {current} -> {entry:?}");
+            log::debug!("found {component} in {current} -> {inode}");
 
-            entry.inode
+            inode
         } else {
             log::debug!("add {component} in {current}");
             let new_inode = (alloc_inode)()?;
@@ -955,7 +953,7 @@ pub(crate) fn do_mkdirs(
 }
 
 /// Find the file or directory pointed to by the given path.
-pub(crate) fn do_lookup_path(
+fn do_lookup_path(
     dir_table: &impl redb::ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
     root_inode: Inode,
     path: Option<&Path>,
@@ -965,8 +963,8 @@ pub(crate) fn do_lookup_path(
         if current.1 != InodeAssignment::Directory {
             return Err(StorageError::NotADirectory);
         }
-        if let Some(entry) = get_dir_entry(dir_table, current.0, component)? {
-            current = (entry.inode, entry.assignment);
+        if let Some(e) = get_dir_entry(dir_table, current.0, component)? {
+            current = e
         } else {
             return Err(StorageError::NotFound);
         };
@@ -980,7 +978,7 @@ fn get_dir_entry(
     dir_table: &impl redb::ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
     parent_inode: Inode,
     name: &str,
-) -> Result<Option<ReadDirEntry>, StorageError> {
+) -> Result<Option<(Inode, InodeAssignment)>, StorageError> {
     match dir_table.get((parent_inode, name))? {
         None => Ok(None),
         Some(e) => Ok(Some(e.value().parse()?.into_readdir_entry(parent_inode))),
@@ -988,7 +986,7 @@ fn get_dir_entry(
 }
 
 /// Add an entry to the given directory.
-pub(crate) fn add_dir_entry(
+fn add_dir_entry(
     dir_table: &mut redb::Table<'_, (Inode, &str), Holder<DirTableEntry>>,
     parent_inode: Inode,
     new_inode: Inode,
@@ -1049,10 +1047,10 @@ mod tests {
     use crate::arena::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
     use crate::arena::engine;
     use crate::arena::notifier::Notification;
-    use crate::global::types::{FileMetadata, InodeAssignment};
     use crate::utils::redb_utils;
     use crate::{
-        DirtyPaths, GlobalDatabase, Inode, InodeAllocator, LocalAvailability, StorageError,
+        DirtyPaths, FileMetadata, GlobalDatabase, Inode, InodeAllocator, InodeAssignment,
+        LocalAvailability, StorageError,
     };
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
@@ -1200,11 +1198,11 @@ mod tests {
 
         fixture.add_file(&file_path, 100, mtime)?;
 
-        let entry = acache.lookup(acache.arena_root(), "a")?;
-        assert_eq!(entry.assignment, InodeAssignment::Directory, "a");
+        let (inode, assignment) = acache.lookup(acache.arena_root(), "a")?;
+        assert_eq!(assignment, InodeAssignment::Directory, "a");
 
-        let entry = acache.lookup(entry.inode, "b")?;
-        assert_eq!(entry.assignment, InodeAssignment::Directory, "b");
+        let (_, assignment) = acache.lookup(inode, "b")?;
+        assert_eq!(assignment, InodeAssignment::Directory, "b");
 
         Ok(())
     }
@@ -1501,14 +1499,14 @@ mod tests {
         fixture.add_file(&file_path, 100, mtime)?;
 
         // Lookup directory
-        let dir_entry = acache.lookup(acache.arena_root(), "a")?;
-        assert_eq!(dir_entry.assignment, InodeAssignment::Directory);
+        let (inode, assignment) = acache.lookup(acache.arena_root(), "a")?;
+        assert_eq!(assignment, InodeAssignment::Directory);
 
         // Lookup file
-        let file_entry = acache.lookup(dir_entry.inode, "file.txt")?;
-        assert_eq!(file_entry.assignment, InodeAssignment::File);
+        let (inode, assignment) = acache.lookup(inode, "file.txt")?;
+        assert_eq!(assignment, InodeAssignment::File);
 
-        let metadata = acache.file_metadata(file_entry.inode)?;
+        let metadata = acache.file_metadata(inode)?;
         assert_eq!(metadata.mtime, mtime);
         assert_eq!(metadata.size, 100);
 
@@ -1565,11 +1563,11 @@ mod tests {
             acache
                 .readdir(arena_root)?
                 .into_iter()
-                .map(|(name, entry)| (name, entry.assignment))
+                .map(|(name, _, assignment)| (name, assignment))
                 .collect::<Vec<_>>(),
         );
 
-        let dir_entry = acache.lookup(arena_root, "dir")?;
+        let (inode, _) = acache.lookup(arena_root, "dir")?;
         assert_unordered::assert_eq_unordered!(
             vec![
                 ("file1.txt".to_string(), InodeAssignment::File),
@@ -1577,9 +1575,9 @@ mod tests {
                 ("subdir".to_string(), InodeAssignment::Directory),
             ],
             acache
-                .readdir(dir_entry.inode)?
+                .readdir(inode)?
                 .into_iter()
-                .map(|(name, entry)| (name, entry.assignment))
+                .map(|(name, _, assignment)| (name, assignment))
                 .collect::<Vec<_>>(),
         );
 
@@ -1631,8 +1629,8 @@ mod tests {
             },
         )?;
 
-        let file_entry = acache.lookup(acache.arena_root, "file.txt")?;
-        let metadata = acache.file_metadata(file_entry.inode)?;
+        let (inode, _) = acache.lookup(acache.arena_root, "file.txt")?;
+        let metadata = acache.file_metadata(inode)?;
         assert_eq!(metadata.size, 200);
         assert_eq!(metadata.mtime, later_time());
 
@@ -1683,7 +1681,7 @@ mod tests {
                 hash: Hash([2u8; 32]),
             },
         )?;
-        let inode = acache.lookup(acache.arena_root(), "file.txt")?.inode;
+        let (inode, _) = acache.lookup(acache.arena_root(), "file.txt")?;
         let avail = acache.file_availability(inode)?;
         assert_eq!(arena, avail.arena);
         assert_eq!(path, avail.path);
@@ -1758,7 +1756,7 @@ mod tests {
                 old_hash: Hash([1u8; 32]),
             },
         )?;
-        let inode = acache.lookup(acache.arena_root, "file.txt")?.inode;
+        let (inode, _) = acache.lookup(acache.arena_root, "file.txt")?;
         let avail = acache.file_availability(inode)?;
 
         //  Replace with old_hash=1 means that hash=2 is the most
@@ -1881,7 +1879,7 @@ mod tests {
                 old_hash: Hash([1u8; 32]),
             },
         )?;
-        let inode = acache.lookup(acache.arena_root, "file.txt")?.inode;
+        let (inode, _) = acache.lookup(acache.arena_root, "file.txt")?;
         let avail = acache.file_availability(inode)?;
         assert_eq!(vec![a], avail.peers);
         assert_eq!(Hash([3u8; 32]), avail.hash);

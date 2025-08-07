@@ -1,8 +1,9 @@
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
 use super::hasher::hash_file;
-use super::types::{BlobTableEntry, LocalAvailability, LruQueueId, QueueTableEntry};
+use super::types::{
+    BlobTableEntry, FileTableEntry, LocalAvailability, LruQueueId, QueueTableEntry,
+};
 use crate::StorageError;
-use crate::global::types::FileTableEntry;
 use crate::types::{BlobId, Inode};
 use crate::utils::holder::Holder;
 use realize_types::{ByteRange, ByteRanges, Hash};

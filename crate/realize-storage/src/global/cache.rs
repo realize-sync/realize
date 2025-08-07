@@ -4,13 +4,13 @@
 
 use super::db::GlobalDatabase;
 use super::inode_allocator::InodeAllocator;
-use super::types::{FileAvailability, FileMetadata, InodeAssignment, ReadDirEntry};
+use super::types::InodeAssignment;
 use crate::arena::arena_cache::ArenaCache;
 use crate::arena::notifier::{Notification, Progress};
 use crate::arena::types::LocalAvailability;
 use crate::global::types::PathTableEntry;
 use crate::utils::holder::Holder;
-use crate::{Blob, Inode, StorageError};
+use crate::{Blob, FileAvailability, FileMetadata, Inode, StorageError};
 use realize_types::{Arena, Path, Peer, UnixTime};
 use redb::ReadableTable;
 use std::collections::HashMap;
@@ -103,7 +103,11 @@ impl UnrealCacheBlocking {
     }
 
     /// Lookup a directory entry.
-    pub fn lookup(&self, parent_inode: Inode, name: &str) -> Result<ReadDirEntry, StorageError> {
+    pub fn lookup(
+        &self,
+        parent_inode: Inode,
+        name: &str,
+    ) -> Result<(Inode, InodeAssignment), StorageError> {
         let txn = self.db.begin_read()?;
         match self.allocator.arena_for_inode(&txn, parent_inode)? {
             Some(arena) => self.arena_cache(arena)?.lookup(parent_inode, name),
@@ -111,10 +115,7 @@ impl UnrealCacheBlocking {
                 None => Err(StorageError::NotFound),
                 Some(IntermediatePath { entries, .. }) => entries
                     .get(name)
-                    .map(|inode| ReadDirEntry {
-                        inode: *inode,
-                        assignment: InodeAssignment::Directory,
-                    })
+                    .map(|inode| (*inode, InodeAssignment::Directory))
                     .ok_or(StorageError::NotFound),
             },
         }
@@ -141,7 +142,10 @@ impl UnrealCacheBlocking {
         }
     }
 
-    pub fn readdir(&self, inode: Inode) -> Result<Vec<(String, ReadDirEntry)>, StorageError> {
+    pub fn readdir(
+        &self,
+        inode: Inode,
+    ) -> Result<Vec<(String, Inode, InodeAssignment)>, StorageError> {
         let txn = self.db.begin_read()?;
         match self.allocator.arena_for_inode(&txn, inode)? {
             Some(arena) => self.arena_cache(arena)?.readdir(inode),
@@ -149,15 +153,7 @@ impl UnrealCacheBlocking {
                 None => Err(StorageError::NotFound),
                 Some(IntermediatePath { entries, .. }) => Ok(entries
                     .iter()
-                    .map(|(name, inode)| {
-                        (
-                            name.to_string(),
-                            ReadDirEntry {
-                                inode: *inode,
-                                assignment: InodeAssignment::Directory,
-                            },
-                        )
-                    })
+                    .map(|(name, inode)| (name.to_string(), *inode, InodeAssignment::Directory))
                     .collect()),
             },
         }
@@ -288,7 +284,7 @@ impl UnrealCacheAsync {
         &self,
         parent_inode: Inode,
         name: &str,
-    ) -> Result<ReadDirEntry, StorageError> {
+    ) -> Result<(Inode, InodeAssignment), StorageError> {
         let name = name.to_string();
         let inner = Arc::clone(&self.inner);
 
@@ -332,7 +328,10 @@ impl UnrealCacheAsync {
         task::spawn_blocking(move || inner.dir_mtime(inode)).await?
     }
 
-    pub async fn readdir(&self, inode: Inode) -> Result<Vec<(String, ReadDirEntry)>, StorageError> {
+    pub async fn readdir(
+        &self,
+        inode: Inode,
+    ) -> Result<Vec<(String, Inode, InodeAssignment)>, StorageError> {
         let inner = Arc::clone(&self.inner);
 
         task::spawn_blocking(move || inner.readdir(inode)).await?
@@ -479,7 +478,7 @@ mod tests {
         fixture.cache.dir_mtime(Inode(1))?;
         fixture.cache.dir_mtime(fixture.cache.arena_root(arena)?)?;
 
-        let documents = fixture.cache.lookup(Inode(1), "documents")?.inode;
+        let (documents, _) = fixture.cache.lookup(Inode(1), "documents")?;
         fixture.cache.dir_mtime(documents)?;
 
         Ok(())
@@ -496,17 +495,17 @@ mod tests {
 
         let cache = &fixture.cache;
 
-        let arenas = cache.lookup(Inode(1), "arenas")?;
-        assert_eq!(arenas.assignment, InodeAssignment::Directory);
+        let (arenas, assignment) = cache.lookup(Inode(1), "arenas")?;
+        assert_eq!(assignment, InodeAssignment::Directory);
 
-        let other = cache.lookup(Inode(1), "other")?;
-        assert_eq!(other.assignment, InodeAssignment::Directory);
+        let (_, assignment) = cache.lookup(Inode(1), "other")?;
+        assert_eq!(assignment, InodeAssignment::Directory);
 
-        let test1 = cache.lookup(arenas.inode, "test1")?;
-        assert_eq!(test1.assignment, InodeAssignment::Directory);
+        let (_, assignment) = cache.lookup(arenas, "test1")?;
+        assert_eq!(assignment, InodeAssignment::Directory);
 
-        let test2 = cache.lookup(arenas.inode, "test2")?;
-        assert_eq!(test2.assignment, InodeAssignment::Directory);
+        let (_, assignment) = cache.lookup(arenas, "test2")?;
+        assert_eq!(assignment, InodeAssignment::Directory);
 
         Ok(())
     }
@@ -542,20 +541,20 @@ mod tests {
             cache
                 .readdir(Inode(1))?
                 .into_iter()
-                .map(|(name, entry)| (name, entry.assignment))
+                .map(|(name, _, assignment)| (name, assignment))
                 .collect::<Vec<_>>(),
         );
 
-        let arenas = cache.lookup(Inode(1), "arenas")?;
+        let (arenas, _) = cache.lookup(Inode(1), "arenas")?;
         assert_unordered::assert_eq_unordered!(
             vec![
                 ("test1".to_string(), InodeAssignment::Directory),
                 ("test2".to_string(), InodeAssignment::Directory)
             ],
             cache
-                .readdir(arenas.inode)?
+                .readdir(arenas)?
                 .into_iter()
-                .map(|(name, entry)| (name, entry.assignment))
+                .map(|(name, _, assignment)| (name, assignment))
                 .collect::<Vec<_>>(),
         );
 

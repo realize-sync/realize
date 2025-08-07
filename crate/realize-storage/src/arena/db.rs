@@ -1,12 +1,11 @@
 use super::types::{
-    BlobTableEntry, FailedJobTableEntry, HistoryTableEntry, IndexedFileTableEntry, MarkTableEntry,
-    QueueTableEntry,
+    BlobTableEntry, DirTableEntry, FailedJobTableEntry, FileTableEntry, HistoryTableEntry,
+    IndexedFileTableEntry, MarkTableEntry, PeerTableEntry, QueueTableEntry,
 };
 use crate::Inode;
-use crate::global::types::{FileTableEntry, PeerTableEntry};
+use crate::StorageError;
 use crate::types::BlobId;
 use crate::utils::holder::Holder;
-use crate::{StorageError, global::types::DirTableEntry};
 use redb::{ReadOnlyTable, Table, TableDefinition};
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -303,9 +302,7 @@ impl ArenaWriteTransaction {
         Ok(self.inner.open_table(BLOB_LRU_QUEUE_TABLE)?)
     }
 
-    pub fn blob_next_id_table<'txn>(
-        &'txn self,
-    ) -> Result<Table<'txn, (), BlobId>, StorageError> {
+    pub fn blob_next_id_table<'txn>(&'txn self) -> Result<Table<'txn, (), BlobId>, StorageError> {
         Ok(self.inner.open_table(BLOB_NEXT_ID_TABLE)?)
     }
 
@@ -394,9 +391,7 @@ impl ArenaReadTransaction {
     }
 
     #[allow(dead_code)]
-    pub fn blob_next_id_table(
-        &self,
-    ) -> Result<ReadOnlyTable<(), BlobId>, StorageError> {
+    pub fn blob_next_id_table(&self) -> Result<ReadOnlyTable<(), BlobId>, StorageError> {
         Ok(self.inner.open_table(BLOB_NEXT_ID_TABLE)?)
     }
 
