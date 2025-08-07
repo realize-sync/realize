@@ -1,17 +1,8 @@
-use crate::global::types::DirTableEntry;
+use crate::global::types::PathTableEntry;
 use crate::utils::holder::Holder;
 use crate::{Inode, StorageError};
 use redb::{ReadOnlyTable, Table, TableDefinition};
 use std::sync::Arc;
-
-/// Maps arena to their root directory inode.
-///
-/// Arenas in this table can also be accessed as subdirectories of the
-/// root directory (1).
-///
-/// Key: arena name
-/// Value: root inode of arena
-const ARENA_TABLE: TableDefinition<&str, Inode> = TableDefinition::new("cache.arena");
 
 /// Track inode range allocation for arenas.
 ///
@@ -24,21 +15,6 @@ const ARENA_TABLE: TableDefinition<&str, Inode> = TableDefinition::new("cache.ar
 const INODE_RANGE_ALLOCATION_TABLE: TableDefinition<Inode, Inode> =
     TableDefinition::new("cache.inode_range_allocation");
 
-/// Tracks directory content.
-///
-/// Each entry in a directory has an entry in this table, keyed with
-/// the directory inode and the entry name.
-///
-/// To list directory content, do a range scan.
-///
-/// The special name "." store information about the current
-/// directory, in a DirTableEntry::Self.
-///
-/// Key: (inode, name)
-/// Value: DirTableEntry
-const DIRECTORY_TABLE: TableDefinition<(Inode, &str), Holder<DirTableEntry>> =
-    TableDefinition::new("acache.directory");
-
 /// Track current inode range for each arena.
 ///
 /// The current inode is the last inode that was allocated for the
@@ -48,6 +24,30 @@ const DIRECTORY_TABLE: TableDefinition<(Inode, &str), Holder<DirTableEntry>> =
 /// Value: (Inode, Inode) (last inode allocated, end of range)
 const CURRENT_INODE_RANGE_TABLE: TableDefinition<(), (Inode, Inode)> =
     TableDefinition::new("acache.current_inode_range");
+
+/// Maps arena to their root directory inode.
+///
+/// Arenas in this table can also be accessed as subdirectories of the
+/// root directory (1).
+///
+/// Key: arena name
+/// Value: root inode of arena
+const ARENA_TABLE: TableDefinition<&str, Inode> = TableDefinition::new("cache.arena");
+
+/// Tracks mapping of inode to path and mtime for global directories
+/// (non-arena).
+///
+/// This table stores the path and modification time for the root
+/// inode (1) as well as any intermediate directories, if arenas
+/// contain slashes. (For example, if the arena is "documents/letters"
+/// the intermediate directory "documents" is in path_table, but
+/// "letters" isn't because it's an arena root and is in the arena
+/// table.)
+///
+/// Key: &str (path or "" for root)
+/// Value: PathTableEntry (inode  and mtime)
+const PATH_TABLE: TableDefinition<&str, Holder<PathTableEntry>> =
+    TableDefinition::new("cache.path");
 
 pub(crate) struct GlobalDatabase {
     db: redb::Database,
@@ -61,8 +61,8 @@ impl GlobalDatabase {
             // transactions in an empty database.
             txn.open_table(ARENA_TABLE)?;
             txn.open_table(INODE_RANGE_ALLOCATION_TABLE)?;
-            txn.open_table(DIRECTORY_TABLE)?;
             txn.open_table(CURRENT_INODE_RANGE_TABLE)?;
+            txn.open_table(PATH_TABLE)?;
         }
         txn.commit()?;
 
@@ -107,17 +107,16 @@ impl GlobalWriteTransaction {
         Ok(self.inner.open_table(INODE_RANGE_ALLOCATION_TABLE)?)
     }
 
-    pub fn directory_table<'txn>(
-        &'txn self,
-    ) -> Result<Table<'txn, (Inode, &'static str), Holder<'static, DirTableEntry>>, StorageError>
-    {
-        Ok(self.inner.open_table(DIRECTORY_TABLE)?)
-    }
-
     pub fn current_inode_range_table<'txn>(
         &'txn self,
     ) -> Result<Table<'txn, (), (Inode, Inode)>, StorageError> {
         Ok(self.inner.open_table(CURRENT_INODE_RANGE_TABLE)?)
+    }
+
+    pub fn path_table<'txn>(
+        &'txn self,
+    ) -> Result<Table<'txn, &'static str, Holder<'static, PathTableEntry>>, StorageError> {
+        Ok(self.inner.open_table(PATH_TABLE)?)
     }
 }
 
@@ -130,12 +129,5 @@ impl GlobalReadTransaction {
         &self,
     ) -> Result<ReadOnlyTable<Inode, Inode>, StorageError> {
         Ok(self.inner.open_table(INODE_RANGE_ALLOCATION_TABLE)?)
-    }
-
-    pub fn directory_table(
-        &self,
-    ) -> Result<ReadOnlyTable<(Inode, &'static str), Holder<'static, DirTableEntry>>, StorageError>
-    {
-        Ok(self.inner.open_table(DIRECTORY_TABLE)?)
     }
 }

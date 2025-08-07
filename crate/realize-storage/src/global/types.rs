@@ -282,6 +282,51 @@ impl ByteConvertible<PeerTableEntry> for PeerTableEntry {
     }
 }
 
+/// An entry in the path table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathTableEntry {
+    /// Directory or arena inode
+    pub inode: Inode,
+    /// The modification time when the directory was created.
+    pub mtime: UnixTime,
+}
+
+impl NamedType for PathTableEntry {
+    fn typename() -> &'static str {
+        "PathTableEntry"
+    }
+}
+
+impl ByteConvertible<PathTableEntry> for PathTableEntry {
+    fn from_bytes(data: &[u8]) -> Result<PathTableEntry, ByteConversionError> {
+        let message_reader = serialize_packed::read_message(&mut &data[..], ReaderOptions::new())?;
+        let msg: cache_capnp::path_table_entry::Reader =
+            message_reader.get_root::<cache_capnp::path_table_entry::Reader>()?;
+
+        let mtime = msg.get_mtime()?;
+        Ok(PathTableEntry {
+            inode: Inode(msg.get_inode()),
+            mtime: UnixTime::new(mtime.get_secs(), mtime.get_nsecs()),
+        })
+    }
+
+    fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError> {
+        let mut message = ::capnp::message::Builder::new_default();
+        let mut builder: cache_capnp::path_table_entry::Builder =
+            message.init_root::<cache_capnp::path_table_entry::Builder>();
+
+        builder.set_inode(self.inode.as_u64());
+        let mut mtime = builder.init_mtime();
+        mtime.set_secs(self.mtime.as_secs());
+        mtime.set_nsecs(self.mtime.subsec_nanos());
+
+        let mut buffer: Vec<u8> = Vec::new();
+        serialize_packed::write_message(&mut buffer, &message)?;
+
+        Ok(buffer)
+    }
+}
+
 fn parse_hash(hash: &[u8]) -> Result<Hash, ByteConversionError> {
     let hash: [u8; 32] = hash
         .try_into()
@@ -365,6 +410,20 @@ mod tests {
             DirTableEntry::from_bytes(regular_file.clone().to_bytes()?.as_slice())?
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn convert_path_table_entry() -> anyhow::Result<()> {
+        let entry = PathTableEntry {
+            inode: Inode(442),
+            mtime: UnixTime::from_secs(1234567890),
+        };
+
+        assert_eq!(
+            entry,
+            PathTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
+        );
         Ok(())
     }
 }

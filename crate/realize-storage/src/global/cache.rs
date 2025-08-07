@@ -5,11 +5,14 @@
 use super::db::GlobalDatabase;
 use super::inode_allocator::InodeAllocator;
 use super::types::{FileAvailability, FileMetadata, InodeAssignment, ReadDirEntry};
-use crate::arena::arena_cache::{self, ArenaCache};
+use crate::arena::arena_cache::ArenaCache;
 use crate::arena::notifier::{Notification, Progress};
 use crate::arena::types::LocalAvailability;
+use crate::global::types::PathTableEntry;
+use crate::utils::holder::Holder;
 use crate::{Blob, Inode, StorageError};
 use realize_types::{Arena, Path, Peer, UnixTime};
+use redb::ReadableTable;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task;
@@ -19,6 +22,14 @@ pub struct UnrealCacheBlocking {
     db: Arc<GlobalDatabase>,
     allocator: Arc<InodeAllocator>,
     arena_caches: HashMap<Arena, Arc<ArenaCache>>,
+
+    /// Inodes to intermediate paths, before arenas, includes root.
+    paths: HashMap<Inode, IntermediatePath>,
+}
+#[derive(Debug)]
+struct IntermediatePath {
+    entries: HashMap<String, Inode>,
+    mtime: UnixTime,
 }
 
 impl UnrealCacheBlocking {
@@ -31,6 +42,7 @@ impl UnrealCacheBlocking {
             db,
             allocator,
             arena_caches: HashMap::new(),
+            paths: HashMap::new(),
         }
     }
 
@@ -95,7 +107,16 @@ impl UnrealCacheBlocking {
         let txn = self.db.begin_read()?;
         match self.allocator.arena_for_inode(&txn, parent_inode)? {
             Some(arena) => self.arena_cache(arena)?.lookup(parent_inode, name),
-            None => arena_cache::do_lookup(&txn.directory_table()?, parent_inode, name),
+            None => match self.paths.get(&parent_inode) {
+                None => Err(StorageError::NotFound),
+                Some(IntermediatePath { entries, .. }) => entries
+                    .get(name)
+                    .map(|inode| ReadDirEntry {
+                        inode: *inode,
+                        assignment: InodeAssignment::Directory,
+                    })
+                    .ok_or(StorageError::NotFound),
+            },
         }
     }
 
@@ -112,20 +133,33 @@ impl UnrealCacheBlocking {
     pub fn dir_mtime(&self, inode: Inode) -> Result<UnixTime, StorageError> {
         let txn = self.db.begin_read()?;
         match self.allocator.arena_for_inode(&txn, inode)? {
-            None => arena_cache::do_dir_mtime(
-                &txn.directory_table()?,
-                inode,
-                UnrealCacheBlocking::ROOT_DIR,
-            ),
             Some(arena) => self.arena_cache(arena)?.dir_mtime(inode),
+            None => match self.paths.get(&inode) {
+                None => Err(StorageError::NotFound),
+                Some(IntermediatePath { mtime, .. }) => Ok(*mtime),
+            },
         }
     }
 
     pub fn readdir(&self, inode: Inode) -> Result<Vec<(String, ReadDirEntry)>, StorageError> {
         let txn = self.db.begin_read()?;
         match self.allocator.arena_for_inode(&txn, inode)? {
-            None => arena_cache::do_readdir(&txn.directory_table()?, inode),
             Some(arena) => self.arena_cache(arena)?.readdir(inode),
+            None => match self.paths.get(&inode) {
+                None => Err(StorageError::NotFound),
+                Some(IntermediatePath { entries, .. }) => Ok(entries
+                    .iter()
+                    .map(|(name, inode)| {
+                        (
+                            name.to_string(),
+                            ReadDirEntry {
+                                inode: *inode,
+                                assignment: InodeAssignment::Directory,
+                            },
+                        )
+                    })
+                    .collect()),
+            },
         }
     }
 
@@ -139,41 +173,65 @@ impl UnrealCacheBlocking {
         cache.update(peer, notification)
     }
 
-    fn add_arena_root(&self, arena: Arena, arena_root: Inode) -> anyhow::Result<()> {
+    fn add_arena_root(&mut self, arena: Arena, arena_root: Inode) -> anyhow::Result<()> {
+        let arena_path = Path::parse(arena.as_str())?;
         let txn = self.db.begin_write()?;
         {
-            let mut dir_table = txn.directory_table()?;
+            let mut path_table = txn.path_table()?;
+            let mut names = Path::components(Some(&arena_path))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .chain(/* root */ std::iter::once(""));
+            let mut current_inode = arena_root;
+            let mut current_name = names.next().unwrap();
+            for dirname in names {
+                let entry = if let Some(e) = path_table.get(dirname)? {
+                    e.value().parse()?
+                } else {
+                    let entry_inode = if dirname == "" {
+                        InodeAllocator::ROOT_INODE
+                    } else {
+                        self.allocator.allocate_global_inode(&txn)?
+                    };
+                    let entry = PathTableEntry {
+                        inode: entry_inode,
+                        mtime: UnixTime::now(),
+                    };
+                    path_table.insert(dirname, Holder::new(&entry)?)?;
 
-            let arena_path = Path::parse(arena.as_str())?;
-            if arena_cache::do_lookup_path(
-                &dir_table,
-                UnrealCacheBlocking::ROOT_DIR,
-                Some(&arena_path),
-            )
-            .is_ok()
-            {
-                return Ok(());
+                    entry
+                };
+                self.add_intermediate_path_entry(
+                    entry.inode,
+                    entry.mtime,
+                    current_name,
+                    current_inode,
+                );
+                current_name = dirname;
+                current_inode = entry.inode;
             }
-
-            let parent_inode = arena_cache::do_mkdirs(
-                &mut dir_table,
-                UnrealCacheBlocking::ROOT_DIR,
-                arena_path.parent().as_ref(),
-                &|| self.allocator.allocate_global_inode(&txn),
-            )?;
-            arena_cache::add_dir_entry(
-                &mut dir_table,
-                parent_inode,
-                arena_root,
-                arena_path.name(),
-                InodeAssignment::Directory,
-            )?;
-
-            log::debug!("Mkdir {arena}; inode {arena_root}");
         }
         txn.commit()?;
 
         Ok(())
+    }
+
+    /// Adds an entry in the intermediate path with the given inode.
+    ///
+    /// If no such intermediate path exists, it is added.
+    fn add_intermediate_path_entry(
+        &mut self,
+        inode: Inode,
+        mtime: UnixTime,
+        entry_name: &str,
+        entry_inode: Inode,
+    ) {
+        let mapping = self.paths.entry(inode).or_insert_with(|| IntermediatePath {
+            entries: HashMap::new(),
+            mtime,
+        });
+        mapping.entries.insert(entry_name.to_string(), entry_inode);
     }
 }
 

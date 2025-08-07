@@ -46,6 +46,12 @@ struct PeerTableEntry {
   uuidLo @1: UInt64;
 }
 
+# An entry in the path table.
+struct PathTableEntry {
+  inode @0: UInt64;
+  mtime @1: Time;
+}
+
 # Time as duration since UNIX_EPOCH.
 struct Time {
   secs @0: UInt64;
