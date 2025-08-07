@@ -1,8 +1,8 @@
 use super::blob::{self, Blobstore};
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
 use super::types::{
-    DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry, LocalAvailability,
-    LruQueueId, PeerTableEntry, ReadDirEntry,
+    DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry, FileTableKey,
+    LocalAvailability, LruQueueId, PeerTableEntry, ReadDirEntry,
 };
 use crate::arena::engine::DirtyPaths;
 use crate::arena::notifier::{Notification, Progress};
@@ -267,7 +267,7 @@ impl ArenaCache {
                 .create_blob(inode, &txn, file_entry.clone())?;
 
             file_entry.content.blob = Some(blob.id());
-            file_table.insert((inode, ""), Holder::new(&file_entry)?)?;
+            file_table.insert(FileTableKey::Default(inode), Holder::new(&file_entry)?)?;
 
             blob
         };
@@ -316,7 +316,10 @@ impl ArenaCache {
         }
 
         file_entry.content.blob = None;
-        file_table.insert((inode, ""), Holder::with_content(file_entry)?)?;
+        file_table.insert(
+            FileTableKey::Default(inode),
+            Holder::with_content(file_entry)?,
+        )?;
 
         log::debug!("Realized [{}]/{path} {hash} as {dest:?}", self.arena);
 
@@ -358,7 +361,10 @@ impl ArenaCache {
             file_entry.metadata.size,
         )?;
         file_entry.content.blob = Some(blob_id);
-        file_table.insert((inode, ""), Holder::with_content(file_entry)?)?;
+        file_table.insert(
+            FileTableKey::Default(inode),
+            Holder::with_content(file_entry)?,
+        )?;
 
         Ok(Some(cachepath))
     }
@@ -366,7 +372,7 @@ impl ArenaCache {
     /// Write an entry in the file table, overwriting any existing one.
     fn do_write_file_entry(
         &self,
-        file_table: &mut redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
+        file_table: &mut redb::Table<'_, FileTableKey, Holder<FileTableEntry>>,
         file_inode: Inode,
         peer: Peer,
         entry: &FileTableEntry,
@@ -377,9 +383,11 @@ impl ArenaCache {
             entry.content.path,
             entry.content.hash
         );
-        let key = peer.as_str();
 
-        file_table.insert((file_inode, key), Holder::new(entry)?)?;
+        file_table.insert(
+            FileTableKey::PeerCopy(file_inode, peer),
+            Holder::new(entry)?,
+        )?;
 
         Ok(())
     }
@@ -388,12 +396,11 @@ impl ArenaCache {
     fn do_write_default_file_entry(
         &self,
         txn: &ArenaWriteTransaction,
-        file_table: &mut redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
+        file_table: &mut redb::Table<'_, FileTableKey, Holder<FileTableEntry>>,
         file_inode: Inode,
         entry: &FileTableEntry,
     ) -> Result<(), StorageError> {
-        let key = "";
-        if let Some(old_entry) = file_table.get((file_inode, ""))? {
+        if let Some(old_entry) = file_table.get(FileTableKey::Default(file_inode))? {
             let old_entry = old_entry.value().parse()?;
             if let Some(blob_id) = old_entry.content.blob {
                 self.blobstore.delete_blob(&txn, blob_id)?;
@@ -404,7 +411,7 @@ impl ArenaCache {
         // changes should be reported.
         self.dirty_paths.mark_dirty(txn, &entry.content.path)?;
 
-        file_table.insert((file_inode, key), Holder::new(entry)?)?;
+        file_table.insert(FileTableKey::Default(file_inode), Holder::new(entry)?)?;
 
         Ok(())
     }
@@ -413,28 +420,32 @@ impl ArenaCache {
     fn do_rm_file_entry(
         &self,
         txn: &ArenaWriteTransaction,
-        file_table: &mut redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
+        file_table: &mut redb::Table<'_, FileTableKey, Holder<FileTableEntry>>,
         dir_table: &mut redb::Table<'_, (Inode, &str), Holder<DirTableEntry>>,
         parent_inode: Inode,
         inode: Inode,
         peer: Peer,
         old_hash: Option<Hash>,
     ) -> Result<(), StorageError> {
-        let peer_str = peer.as_str();
-
         let mut path = None;
         let mut entries = HashMap::new();
-        for elt in file_table.range((inode, "")..(inode.plus(1), ""))? {
+        for elt in file_table.range(FileTableKey::range(inode))? {
             let (key, value) = elt?;
-            let key = key.value().1;
+            let insert_key = match key.value() {
+                FileTableKey::PeerCopy(_, peer) => Some(peer),
+                FileTableKey::Default(_) => None,
+                _ => {
+                    continue;
+                }
+            };
             let entry = value.value().parse()?;
             if path.is_none() {
                 path = Some(entry.content.path.clone());
             }
-            entries.insert(key.to_string(), entry);
+            entries.insert(insert_key, entry);
         }
 
-        let peer_hash = match entries.remove(peer_str).map(|e| e.content.hash) {
+        let peer_hash = match entries.remove(&Some(peer)).map(|e| e.content.hash) {
             Some(h) => h,
             None => {
                 // No entry to delete
@@ -449,9 +460,9 @@ impl ArenaCache {
             return Ok(());
         }
 
-        file_table.remove((inode, peer_str))?;
+        file_table.remove(FileTableKey::PeerCopy(inode, peer))?;
 
-        let default_hash = entries.remove("").map(|e| e.content.hash);
+        let default_hash = entries.remove(&None).map(|e| e.content.hash);
         // In case old_hash == default_hash, should we remove the default
         // version and pretend the file doesn't exist anymore, even if
         // it's available on other peers? It would be consistent,
@@ -468,14 +479,14 @@ impl ArenaCache {
             }
 
             // Check if the default entry has a blob and delete it
-            if let Some(default_entry) = file_table.get((inode, ""))? {
+            if let Some(default_entry) = file_table.get(FileTableKey::Default(inode))? {
                 let default_entry = default_entry.value().parse()?;
                 if let Some(blob_id) = default_entry.content.blob {
                     self.blobstore.delete_blob(&txn, blob_id)?;
                 }
             }
 
-            file_table.remove((inode, ""))?;
+            file_table.remove(FileTableKey::Default(inode))?;
             dir_table.retain_in(
                 (parent_inode, "")..(parent_inode.plus(1), ""),
                 |_, v| match v.parse() {
@@ -650,11 +661,11 @@ pub(crate) fn mark_dirty_recursive(
 
 fn mark_file_dirty(
     txn: &ArenaWriteTransaction,
-    file_table: &redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
+    file_table: &redb::Table<'_, FileTableKey, Holder<FileTableEntry>>,
     inode: Inode,
     dirty_paths: &Arc<DirtyPaths>,
 ) -> Result<(), StorageError> {
-    if let Some(entry) = file_table.get((inode, ""))? {
+    if let Some(entry) = file_table.get(FileTableKey::Default(inode))? {
         dirty_paths.mark_dirty(txn, &entry.value().parse()?.content.path)?;
     }
 
@@ -664,7 +675,7 @@ fn mark_file_dirty(
 fn mark_dir_dirty(
     txn: &ArenaWriteTransaction,
     dir_table: &redb::Table<'_, (Inode, &str), Holder<DirTableEntry>>,
-    file_table: &redb::Table<'_, (Inode, &str), Holder<FileTableEntry>>,
+    file_table: &redb::Table<'_, FileTableKey, Holder<FileTableEntry>>,
     inode: Inode,
     dirty_paths: &Arc<DirtyPaths>,
 ) -> Result<(), StorageError> {
@@ -799,21 +810,26 @@ where
 
 /// Get a [FileTableEntry] for a specific peer.
 fn get_file_entry(
-    file_table: &impl redb::ReadableTable<(Inode, &'static str), Holder<'static, FileTableEntry>>,
+    file_table: &impl redb::ReadableTable<FileTableKey, Holder<'static, FileTableEntry>>,
     inode: Inode,
     peer: Option<Peer>,
 ) -> Result<Option<FileTableEntry>, StorageError> {
-    match file_table.get((inode, peer.map(|p| p.as_str()).unwrap_or("")))? {
+    match file_table.get(
+        peer.map(|p| FileTableKey::PeerCopy(inode, p))
+            .unwrap_or_else(|| FileTableKey::Default(inode)),
+    )? {
         None => Ok(None),
         Some(e) => Ok(Some(e.value().parse()?)),
     }
 }
 
 fn get_default_entry(
-    file_table: &impl redb::ReadableTable<(Inode, &'static str), Holder<'static, FileTableEntry>>,
+    file_table: &impl redb::ReadableTable<FileTableKey, Holder<'static, FileTableEntry>>,
     inode: Inode,
 ) -> Result<FileTableEntry, StorageError> {
-    let entry = file_table.get((inode, ""))?.ok_or(StorageError::NotFound)?;
+    let entry = file_table
+        .get(FileTableKey::Default(inode))?
+        .ok_or(StorageError::NotFound)?;
 
     Ok(entry.value().parse()?)
 }
@@ -832,9 +848,9 @@ fn do_file_availability(
 ) -> Result<FileAvailability, StorageError> {
     let file_table = txn.cache_file_table()?;
 
-    let mut range = file_table.range((inode, "")..(inode.plus(1), ""))?;
+    let mut range = file_table.range(FileTableKey::range(inode))?;
     let (default_key, default_entry) = range.next().ok_or(StorageError::NotFound)??;
-    if default_key.value().1 != "" {
+    if !matches!(default_key.value(), FileTableKey::Default(_)) {
         log::warn!("File table entry without a default peer: {inode}");
         return Err(StorageError::NotFound);
     }
@@ -847,10 +863,11 @@ fn do_file_availability(
     let mut peers = vec![];
     for entry in range {
         let entry = entry?;
-        let file_entry: FileTableEntry = entry.1.value().parse()?;
-        if file_entry.content.hash == hash {
-            let peer = Peer::from(entry.0.value().1);
-            peers.push(peer);
+        if let FileTableKey::PeerCopy(_, peer) = entry.0.value() {
+            let file_entry: FileTableEntry = entry.1.value().parse()?;
+            if file_entry.content.hash == hash {
+                peers.push(peer);
+            }
         }
     }
     if peers.is_empty() {
@@ -1014,16 +1031,14 @@ fn add_dir_entry(
 fn do_mark_peer_files(txn: &ArenaWriteTransaction, peer: Peer) -> Result<(), StorageError> {
     let file_table = txn.cache_file_table()?;
     let mut pending_catchup_table = txn.cache_pending_catchup_table()?;
-    let peer_str = peer.as_str();
     for elt in file_table.iter()? {
         let (k, v) = elt?;
-        let k = k.value();
-        if k.1 != peer_str {
-            continue;
+        if let FileTableKey::PeerCopy(inode, elt_peer) = k.value()
+            && elt_peer == peer
+        {
+            let v = v.value().parse()?;
+            pending_catchup_table.insert((peer.as_str(), inode), v.parent_inode)?;
         }
-        let v = v.value().parse()?;
-        let inode = k.0;
-        pending_catchup_table.insert((peer_str, inode), v.parent_inode)?;
     }
 
     Ok(())

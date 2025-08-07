@@ -1,3 +1,4 @@
+use super::types::FileTableKey;
 use super::types::{
     BlobTableEntry, DirTableEntry, FailedJobTableEntry, FileTableEntry, HistoryTableEntry,
     IndexedFileTableEntry, MarkTableEntry, PeerTableEntry, QueueTableEntry,
@@ -54,9 +55,9 @@ pub(crate) const CACHE_DIRECTORY_TABLE: TableDefinition<(Inode, &str), Holder<Di
 /// An inode available in no peers should be remove from all
 /// directories.
 ///
-/// Key: (inode, peer)
+/// Key: FileTableKey (inode, default|local|peer, peer)
 /// Value: FileTableEntry
-const CACHE_FILE_TABLE: TableDefinition<(Inode, &str), Holder<FileTableEntry>> =
+const CACHE_FILE_TABLE: TableDefinition<FileTableKey, Holder<FileTableEntry>> =
     TableDefinition::new("acache.file");
 
 /// Track peer files that might have been deleted remotely.
@@ -261,8 +262,7 @@ impl ArenaWriteTransaction {
 
     pub fn cache_file_table<'txn>(
         &'txn self,
-    ) -> Result<Table<'txn, (Inode, &'static str), Holder<'static, FileTableEntry>>, StorageError>
-    {
+    ) -> Result<Table<'txn, FileTableKey, Holder<'static, FileTableEntry>>, StorageError> {
         Ok(self.inner.open_table(CACHE_FILE_TABLE)?)
     }
 
@@ -360,8 +360,7 @@ impl ArenaReadTransaction {
 
     pub fn cache_file_table(
         &self,
-    ) -> Result<ReadOnlyTable<(Inode, &'static str), Holder<'static, FileTableEntry>>, StorageError>
-    {
+    ) -> Result<ReadOnlyTable<FileTableKey, Holder<'static, FileTableEntry>>, StorageError> {
         Ok(self.inner.open_table(CACHE_FILE_TABLE)?)
     }
 

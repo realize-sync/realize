@@ -59,6 +59,7 @@ pub enum LocalAvailability {
 
 /// LRU Queue ID enum
 pub use blob_capnp::LruQueueId;
+use redb::{Key, Value};
 use uuid::Uuid;
 
 /// An entry in the queue table.
@@ -528,6 +529,158 @@ pub struct ReadDirEntry {
     pub inode: Inode,
     /// The type of the entry.
     pub assignment: InodeAssignment,
+}
+
+/// Key for the file table of the [ArenaDatabase].
+#[derive(Debug, Clone)]
+pub enum FileTableKey {
+    /// The default entry, containing the selected version and its
+    /// metadata for the cache.
+    Default(Inode),
+    /// An entry that represents the local copy.
+    LocalCopy(Inode),
+    /// An entry that represents another peer's copy.
+    PeerCopy(Inode, Peer),
+
+    /// A key that could not be parsed
+    Invalid,
+}
+
+impl FileTableKey {
+    /// A range that covers all keys with the given inode.
+    pub fn range(inode: Inode) -> std::ops::Range<FileTableKey> {
+        FileTableKey::Default(inode)..FileTableKey::Default(inode.plus(1))
+    }
+
+    /// The key's inode
+    pub fn inode(&self) -> Inode {
+        match self {
+            FileTableKey::Invalid => Inode::ZERO,
+            FileTableKey::Default(inode) => *inode,
+            FileTableKey::LocalCopy(inode) => *inode,
+            FileTableKey::PeerCopy(inode, _) => *inode,
+        }
+    }
+
+    fn variant_order(&self) -> u8 {
+        match self {
+            FileTableKey::Invalid => 0,
+            FileTableKey::Default(_) => 1,
+            FileTableKey::LocalCopy(_) => 2,
+            FileTableKey::PeerCopy(_, _) => 3,
+        }
+    }
+
+    fn peer(&self) -> Option<&Peer> {
+        match self {
+            FileTableKey::PeerCopy(_, peer) => Some(peer),
+            _ => None,
+        }
+    }
+}
+
+impl PartialEq for FileTableKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.inode() == other.inode()
+            && self.variant_order() == other.variant_order()
+            && self.peer() == other.peer()
+    }
+}
+
+impl Eq for FileTableKey {}
+
+impl PartialOrd for FileTableKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for FileTableKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // First compare by inode
+        let inode_cmp = self.inode().cmp(&other.inode());
+        if inode_cmp != std::cmp::Ordering::Equal {
+            return inode_cmp;
+        }
+
+        // Then compare by variant type
+        let variant_cmp = self.variant_order().cmp(&other.variant_order());
+        if variant_cmp != std::cmp::Ordering::Equal {
+            return variant_cmp;
+        }
+
+        // Finally compare by peer (only relevant for PeerCopy variants)
+        match (self.peer(), other.peer()) {
+            (Some(peer1), Some(peer2)) => peer1.cmp(peer2),
+            (None, None) => std::cmp::Ordering::Equal,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+        }
+    }
+}
+
+impl Value for FileTableKey {
+    type SelfType<'a> = FileTableKey;
+
+    type AsBytes<'a> = Vec<u8>;
+
+    fn fixed_width() -> Option<usize> {
+        None
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
+    where
+        Self: 'a,
+    {
+        let inode = Inode(<u64>::from_be_bytes(
+            data[0..8].try_into().unwrap_or([0; 8]),
+        ));
+        if inode == Inode::ZERO {
+            return FileTableKey::Invalid;
+        }
+        match data.get(8) {
+            None => FileTableKey::Default(inode),
+            Some(0) => FileTableKey::LocalCopy(inode),
+            Some(1) => {
+                FileTableKey::PeerCopy(inode, Peer::from(str::from_utf8(&data[9..]).unwrap()))
+            }
+            Some(_) => FileTableKey::Invalid,
+        }
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &FileTableKey) -> Vec<u8>
+    where
+        Self: 'a,
+        Self: 'b,
+    {
+        let mut ret = vec![];
+        ret.extend_from_slice(&value.inode().as_u64().to_be_bytes());
+        match value {
+            FileTableKey::Default(_) | FileTableKey::Invalid => {}
+            FileTableKey::LocalCopy(_) => {
+                ret.push(0);
+            }
+            FileTableKey::PeerCopy(_, peer) => {
+                ret.push(1);
+                ret.extend_from_slice(peer.as_str().as_bytes());
+            }
+        };
+
+        ret
+    }
+
+    fn type_name() -> redb::TypeName {
+        redb::TypeName::new("FileTableKey")
+    }
+}
+
+impl Key for FileTableKey {
+    fn compare(data1: &[u8], data2: &[u8]) -> std::cmp::Ordering {
+        // The byte representation is designed so that byte comparison
+        // matches object comparison, except for Invalid. No need to
+        // parse.
+        data1.cmp(data2)
+    }
 }
 
 /// An entry in the file table.
@@ -1014,5 +1167,225 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn convert_file_table_key_default() -> anyhow::Result<()> {
+        let key = FileTableKey::Default(Inode(12345));
+
+        // Test round-trip conversion
+        let bytes = FileTableKey::as_bytes(&key);
+        let converted = FileTableKey::from_bytes(&bytes);
+        assert_eq!(key, converted);
+
+        Ok(())
+    }
+
+    #[test]
+    fn convert_file_table_key_local_copy() -> anyhow::Result<()> {
+        let key = FileTableKey::LocalCopy(Inode(67890));
+
+        // Test round-trip conversion
+        let bytes = FileTableKey::as_bytes(&key);
+        let converted = FileTableKey::from_bytes(&bytes);
+        assert_eq!(key, converted);
+
+        Ok(())
+    }
+
+    #[test]
+    fn convert_file_table_key_peer_copy() -> anyhow::Result<()> {
+        let key = FileTableKey::PeerCopy(Inode(11111), Peer::from("peer1"));
+
+        // Test round-trip conversion
+        let bytes = FileTableKey::as_bytes(&key);
+        let converted = FileTableKey::from_bytes(&bytes);
+        assert_eq!(key, converted);
+
+        Ok(())
+    }
+
+    #[test]
+    fn convert_file_table_key_invalid() -> anyhow::Result<()> {
+        let key = FileTableKey::Invalid;
+
+        // Test round-trip conversion
+        let bytes = FileTableKey::as_bytes(&key);
+        let converted = FileTableKey::from_bytes(&bytes);
+        assert_eq!(key, converted);
+
+        Ok(())
+    }
+
+    #[test]
+    fn convert_file_table_key_all_variants() -> anyhow::Result<()> {
+        let test_cases = vec![
+            FileTableKey::Default(Inode(1)),
+            FileTableKey::Default(Inode(0xFFFFFFFFFFFFFFFF)),
+            FileTableKey::LocalCopy(Inode(2)),
+            FileTableKey::LocalCopy(Inode(0xFFFFFFFFFFFFFFFF)),
+            FileTableKey::PeerCopy(Inode(3), Peer::from("short")),
+            FileTableKey::PeerCopy(
+                Inode(4),
+                Peer::from("very_long_peer_name_that_might_cause_issues"),
+            ),
+            FileTableKey::Invalid,
+        ];
+
+        for key in test_cases {
+            let bytes = FileTableKey::as_bytes(&key);
+            let converted = FileTableKey::from_bytes(&bytes);
+            assert_eq!(key, converted, "Failed for key: {:?}", key);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn file_table_key_byte_comparison_behavior() {
+        // Test that byte comparison behavior is consistent and documented
+
+        let test_cases = vec![
+            FileTableKey::Default(Inode(1)),
+            FileTableKey::Default(Inode(2)),
+            FileTableKey::LocalCopy(Inode(1)),
+            FileTableKey::LocalCopy(Inode(2)),
+            FileTableKey::PeerCopy(Inode(1), Peer::from("a")),
+            FileTableKey::PeerCopy(Inode(1), Peer::from("b")),
+            FileTableKey::PeerCopy(Inode(2), Peer::from("a")),
+        ];
+
+        // Test that byte comparison is consistent (same inputs always give same result)
+        for i in 0..test_cases.len() {
+            for j in 0..test_cases.len() {
+                let key1 = &test_cases[i];
+                let key2 = &test_cases[j];
+
+                let bytes1 = FileTableKey::as_bytes(key1);
+                let bytes2 = FileTableKey::as_bytes(key2);
+                let byte_cmp = FileTableKey::compare(&bytes1, &bytes2);
+
+                // Test consistency: reverse comparison should be opposite
+                let byte_cmp_reverse = FileTableKey::compare(&bytes2, &bytes1);
+                assert_eq!(
+                    byte_cmp,
+                    byte_cmp_reverse.reverse(),
+                    "Byte comparison not consistent for {:?} vs {:?}",
+                    key1,
+                    key2
+                );
+
+                // Test reflexivity: same key should compare equal
+                if i == j {
+                    assert_eq!(
+                        byte_cmp,
+                        std::cmp::Ordering::Equal,
+                        "Byte comparison not reflexive for {:?}",
+                        key1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn file_table_key_byte_comparison_matches_object_comparison() {
+        // Test that byte comparison matches object comparison for all valid keys
+        let test_cases = vec![
+            FileTableKey::Default(Inode(1)),
+            FileTableKey::Default(Inode(2)),
+            FileTableKey::Default(Inode(0x110000)),
+            FileTableKey::LocalCopy(Inode(1)),
+            FileTableKey::LocalCopy(Inode(2)),
+            FileTableKey::Default(Inode(0x110000)),
+            FileTableKey::PeerCopy(Inode(1), Peer::from("a")),
+            FileTableKey::PeerCopy(Inode(1), Peer::from("b")),
+            FileTableKey::PeerCopy(Inode(2), Peer::from("a")),
+            FileTableKey::PeerCopy(Inode(0x110000), Peer::from("a")),
+        ];
+
+        for i in 0..test_cases.len() {
+            for j in 0..test_cases.len() {
+                let key1 = &test_cases[i];
+                let key2 = &test_cases[j];
+
+                let object_cmp = key1.cmp(key2);
+                let bytes1 = FileTableKey::as_bytes(key1);
+                let bytes2 = FileTableKey::as_bytes(key2);
+                let byte_cmp = FileTableKey::compare(&bytes1, &bytes2);
+
+                assert_eq!(
+                    object_cmp, byte_cmp,
+                    "Comparison mismatch for {:?} vs {:?}",
+                    key1, key2
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn file_table_key_edge_cases() -> anyhow::Result<()> {
+        // Test edge cases
+        let edge_cases = vec![
+            FileTableKey::Default(Inode(1)),                   // Non-zero inode
+            FileTableKey::LocalCopy(Inode(1)),                 // Non-zero inode
+            FileTableKey::PeerCopy(Inode(1), Peer::from("")),  // Empty peer
+            FileTableKey::PeerCopy(Inode(1), Peer::from("a")), // Single char peer
+        ];
+
+        for key in edge_cases {
+            let bytes = FileTableKey::as_bytes(&key);
+            let converted = FileTableKey::from_bytes(&bytes);
+            assert_eq!(key, converted, "Failed for edge case: {:?}", key);
+        }
+
+        // Test that Inode(0) gets converted to Invalid (this is the intended behavior)
+        let zero_inode_cases = vec![
+            FileTableKey::Default(Inode(0)),
+            FileTableKey::LocalCopy(Inode(0)),
+            FileTableKey::PeerCopy(Inode(0), Peer::from("")),
+        ];
+
+        for key in zero_inode_cases {
+            let bytes = FileTableKey::as_bytes(&key);
+            let converted = FileTableKey::from_bytes(&bytes);
+            assert_eq!(
+                converted,
+                FileTableKey::Invalid,
+                "Expected Invalid for zero inode case: {:?}",
+                key
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn file_table_key_serialization_format() {
+        // Test that the serialization format is correct
+        let key = FileTableKey::Default(Inode(0x1021a3));
+        let bytes = FileTableKey::as_bytes(&key);
+
+        // Should be exactly 8 bytes for Default (just the inode),
+        // with big endian encoding.
+        assert_eq!(bytes.len(), 8);
+        assert_eq!(bytes, [0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x21, 0xa3]);
+
+        let key = FileTableKey::LocalCopy(Inode(67890));
+        let bytes = FileTableKey::as_bytes(&key);
+
+        // Should be 9 bytes for LocalCopy (inode + 0 byte)
+        assert_eq!(bytes.len(), 9);
+        assert_eq!(&bytes[0..8], Inode(67890).as_u64().to_be_bytes());
+        assert_eq!(bytes[8], 0);
+
+        let key = FileTableKey::PeerCopy(Inode(11111), Peer::from("test"));
+        let bytes = FileTableKey::as_bytes(&key);
+
+        // Should be 13 bytes for PeerCopy (inode + 1 byte + peer string)
+        assert_eq!(bytes.len(), 13);
+        assert_eq!(&bytes[0..8], Inode(11111).as_u64().to_be_bytes());
+        assert_eq!(bytes[8], 1);
+        assert_eq!(&bytes[9..], b"test");
     }
 }
