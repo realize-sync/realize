@@ -76,12 +76,12 @@ impl UnrealFs {
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<fileid3, UnrealFsError> {
-        Ok(self
+        let (inode, _) = self
             .cache
             .lookup(Inode(dirid), std::str::from_utf8(filename)?)
-            .await?
-            .inode
-            .into())
+            .await?;
+
+        Ok(inode.into())
     }
 
     async fn do_readdir(
@@ -91,24 +91,23 @@ impl UnrealFs {
         max_entries: usize,
     ) -> Result<ReadDirResult, UnrealFsError> {
         let mut entries = self.cache.readdir(dirid).await?;
-        entries.sort_by(|a, b| a.1.inode.cmp(&b.1.inode));
+        entries.sort_by(|a, b| a.1.cmp(&b.1));
 
         let mut res = ReadDirResult {
             entries: vec![],
             end: true,
         };
-        for (name, entry) in entries.into_iter().skip_while(|e| e.1.inode <= start_after) {
+        for (name, inode, assignment) in entries.into_iter().skip_while(|e| e.1 <= start_after) {
             res.entries.push(nfsserve::vfs::DirEntry {
-                fileid: entry.inode.into(),
+                fileid: inode.into(),
                 name: name.as_bytes().into(),
-                attr: match entry.assignment {
+                attr: match assignment {
                     InodeAssignment::Directory => {
-                        self.build_dir_attr(entry.inode, *&self.cache.dir_mtime(entry.inode).await?)
+                        self.build_dir_attr(inode, *&self.cache.dir_mtime(inode).await?)
                     }
-                    InodeAssignment::File => self.build_file_attr(
-                        entry.inode,
-                        &self.cache.file_metadata(entry.inode).await?,
-                    ),
+                    InodeAssignment::File => {
+                        self.build_file_attr(inode, &self.cache.file_metadata(inode).await?)
+                    }
                 },
             });
             if res.entries.len() >= max_entries {

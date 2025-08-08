@@ -1,7 +1,7 @@
 use super::types::FileTableKey;
 use super::types::{
     BlobTableEntry, DirTableEntry, FailedJobTableEntry, FileTableEntry, HistoryTableEntry,
-    IndexedFileTableEntry, MarkTableEntry, PeerTableEntry, QueueTableEntry,
+    MarkTableEntry, PeerTableEntry, QueueTableEntry,
 };
 use crate::Inode;
 use crate::StorageError;
@@ -10,13 +10,6 @@ use crate::utils::holder::Holder;
 use redb::{ReadOnlyTable, Table, TableDefinition};
 use std::cell::RefCell;
 use std::sync::Arc;
-
-/// Track hash and metadata of local files.
-///
-/// Key: realize_types::Path
-/// Value: FileTableEntry
-const INDEX_FILE_TABLE: TableDefinition<&str, Holder<IndexedFileTableEntry>> =
-    TableDefinition::new("index.file");
 
 /// Local file history.
 ///
@@ -164,7 +157,6 @@ impl ArenaDatabase {
         {
             // Create tables so they can safely be queried in read
             // transactions in an empty database.
-            txn.open_table(INDEX_FILE_TABLE)?;
             txn.open_table(INDEX_HISTORY_TABLE)?;
             txn.open_table(INDEX_SETTINGS_TABLE)?;
             txn.open_table(CACHE_DIRECTORY_TABLE)?;
@@ -232,13 +224,6 @@ impl ArenaWriteTransaction {
     /// After commit functions are run in order after a successful commit.
     pub fn after_commit(&self, cb: impl FnOnce() -> () + Send + 'static) {
         self.after_commit.borrow_mut().push(Box::new(cb));
-    }
-
-    pub fn index_file_table<'txn>(
-        &'txn self,
-    ) -> Result<Table<'txn, &'static str, Holder<'static, IndexedFileTableEntry>>, StorageError>
-    {
-        Ok(self.inner.open_table(INDEX_FILE_TABLE)?)
     }
 
     pub fn index_history_table<'txn>(
@@ -338,13 +323,6 @@ pub struct ArenaReadTransaction {
 }
 
 impl ArenaReadTransaction {
-    pub fn index_file_table(
-        &self,
-    ) -> Result<ReadOnlyTable<&'static str, Holder<'static, IndexedFileTableEntry>>, StorageError>
-    {
-        Ok(self.inner.open_table(INDEX_FILE_TABLE)?)
-    }
-
     pub fn index_history_table(
         &self,
     ) -> Result<ReadOnlyTable<u64, Holder<'static, HistoryTableEntry>>, StorageError> {

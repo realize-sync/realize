@@ -861,7 +861,7 @@ mod tests {
     use crate::InodeAllocator;
     use crate::Notification;
     use crate::arena::arena_cache::ArenaCache;
-    use crate::arena::index::{RealIndex, RealIndexBlocking};
+    use crate::arena::index::RealIndex;
     use crate::arena::mark::PathMarks;
     use crate::utils::redb_utils;
     use assert_fs::TempDir;
@@ -926,7 +926,7 @@ mod tests {
                 Arc::clone(&dirty_paths),
             )?;
             let arena_root = acache.arena_root();
-            let index = RealIndexBlocking::new(arena, Arc::clone(&db), Arc::clone(&dirty_paths))?;
+            let index = acache.as_index();
             let pathmarks = PathMarks::new(Arc::clone(&db), arena_root, Arc::clone(&dirty_paths))?;
             let engine = Engine::new(
                 arena,

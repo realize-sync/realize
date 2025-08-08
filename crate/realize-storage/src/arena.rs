@@ -61,9 +61,7 @@ impl ArenaStorage {
         let indexed = match arena_config.root.as_ref() {
             None => None,
             Some(root) => {
-                let index =
-                    RealIndexAsync::with_db(arena, Arc::clone(&db), Arc::clone(&dirty_paths))
-                        .await?;
+                let index = RealIndexAsync::new(arena_cache.as_index());
                 let exclude = exclude
                     .iter()
                     .filter_map(|p| realize_types::Path::from_real_path_in(p, root))

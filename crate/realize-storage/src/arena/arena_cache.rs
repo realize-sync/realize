@@ -83,6 +83,10 @@ impl ArenaCache {
         self.arena_root
     }
 
+    pub(crate) fn as_index(self: &Arc<Self>) -> Arc<dyn RealIndex> {
+        self.clone()
+    }
+
     pub(crate) fn lookup(
         &self,
         parent_inode: Inode,
@@ -422,7 +426,15 @@ impl ArenaCache {
             }
         };
         let mut file_table = txn.cache_file_table()?;
-        let mut file_entry = get_default_entry(&file_table, inode)?;
+        let mut file_entry = match get_default_entry(&file_table, inode) {
+            Ok(e) => e,
+            Err(StorageError::NotFound) => {
+                return Ok(None);
+            }
+            Err(err) => {
+                return Err(err);
+            }
+        };
         if file_entry.content.hash != *hash {
             return Ok(None);
         }
@@ -1153,8 +1165,15 @@ fn mark_file_dirty(
     inode: Inode,
     dirty_paths: &Arc<DirtyPaths>,
 ) -> Result<(), StorageError> {
-    if let Some(entry) = file_table.get(FileTableKey::Default(inode))? {
-        dirty_paths.mark_dirty(txn, &entry.value().parse()?.content.path)?;
+    for entry in file_table.range(FileTableKey::range(inode))? {
+        let entry = entry?;
+        match entry.0.value() {
+            FileTableKey::Default(_) | FileTableKey::LocalCopy(_) => {
+                dirty_paths.mark_dirty(txn, &entry.1.value().parse()?.content.path)?;
+                return Ok(());
+            }
+            _ => {}
+        }
     }
 
     Ok(())
@@ -1339,7 +1358,6 @@ fn do_file_availability(
     let mut range = file_table.range(FileTableKey::range(inode))?;
     let (default_key, default_entry) = range.next().ok_or(StorageError::NotFound)??;
     if !matches!(default_key.value(), FileTableKey::Default(_)) {
-        log::warn!("File table entry without a default peer: {inode}");
         return Err(StorageError::NotFound);
     }
     let FileTableEntry {

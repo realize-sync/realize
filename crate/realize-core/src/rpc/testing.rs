@@ -158,7 +158,8 @@ impl HouseholdFixture {
         };
 
         // Then, wait for the file to have the expected hash
-        while cache.file_availability(inode).await?.hash != *hash {
+        let goal = Some(hash.clone());
+        while cache.file_availability(inode).await.ok().map(|e| e.hash) != goal {
             if let Some(delay) = retry.next() {
                 tokio::time::sleep(delay).await;
             } else {

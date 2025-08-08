@@ -3,7 +3,6 @@
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
 use super::types::{Mark, MarkTableEntry};
 use crate::arena::arena_cache;
-use crate::arena::index;
 use crate::utils::holder::Holder;
 use crate::{DirtyPaths, Inode, StorageError};
 use realize_types::Path;
@@ -143,12 +142,6 @@ impl PathMarks {
         txn: &ArenaWriteTransaction,
         path_or_root: Option<&Path>,
     ) -> Result<(), StorageError> {
-        if let Some(path) = path_or_root {
-            index::mark_dirty_recursive(txn, &path, &self.dirty_paths)?;
-        } else {
-            index::make_all_dirty(txn, &self.dirty_paths)?;
-        }
-
         arena_cache::mark_dirty_recursive(txn, self.arena_root, path_or_root, &self.dirty_paths)?;
 
         Ok(())
@@ -194,7 +187,7 @@ mod tests {
     use super::*;
     use crate::GlobalDatabase;
     use crate::arena::engine;
-    use crate::arena::index::{RealIndex, RealIndexBlocking};
+    use crate::arena::index::RealIndex;
     use crate::utils::redb_utils;
     use crate::{InodeAllocator, arena::arena_cache::ArenaCache};
     use realize_types::{Arena, Hash, UnixTime};
@@ -225,7 +218,7 @@ mod tests {
                 Arc::clone(&dirty_paths),
             )?;
             let arena_root = acache.arena_root();
-            let index = RealIndexBlocking::new(arena, Arc::clone(&db), Arc::clone(&dirty_paths))?;
+            let index = acache.as_index();
             let marks = PathMarks::new(Arc::clone(&db), arena_root, Arc::clone(&dirty_paths))?;
 
             Ok(Self {

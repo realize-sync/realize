@@ -116,9 +116,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::DirtyPaths;
+    use crate::arena::arena_cache::ArenaCache;
     use crate::arena::db::ArenaDatabase;
     use crate::utils::{hash, redb_utils};
+    use crate::{DirtyPaths, GlobalDatabase, InodeAllocator};
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
@@ -145,7 +146,17 @@ mod tests {
 
             let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-            let index = RealIndexAsync::with_db(test_arena(), db, dirty_paths).await?;
+            let arena = test_arena();
+            let allocator =
+                InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
+            let arena_cache = ArenaCache::new(
+                arena,
+                allocator,
+                db,
+                &tempdir.path().join("blobs"),
+                dirty_paths,
+            )?;
+            let index = RealIndexAsync::new(arena_cache.as_index());
 
             Ok(Self {
                 index,

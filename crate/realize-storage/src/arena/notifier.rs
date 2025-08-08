@@ -387,8 +387,8 @@ async fn send_notifications(
 mod tests {
     use super::*;
     use crate::{
-        DirtyPaths,
-        arena::db::ArenaDatabase,
+        DirtyPaths, GlobalDatabase, InodeAllocator,
+        arena::{arena_cache::ArenaCache, db::ArenaDatabase},
         utils::{hash, redb_utils},
     };
     use std::{sync::Arc, time::Duration};
@@ -407,7 +407,18 @@ mod tests {
             let _ = env_logger::try_init();
             let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-            let index = RealIndexAsync::with_db(test_arena(), db, dirty_paths).await?;
+            let arena = test_arena();
+            let allocator =
+                InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
+            let index = ArenaCache::new(
+                arena,
+                allocator,
+                db,
+                &std::path::Path::new("/dev/null"),
+                dirty_paths,
+            )?
+            .as_index();
+            let index = RealIndexAsync::new(index);
 
             Ok(Self {
                 index,

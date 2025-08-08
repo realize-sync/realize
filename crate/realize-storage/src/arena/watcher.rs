@@ -711,12 +711,12 @@ async fn only_regular(e: async_walkdir::DirEntry) -> async_walkdir::Filtering {
 mod tests {
     use std::time::Duration;
 
-    use crate::DirtyPaths;
+    use crate::arena::arena_cache::ArenaCache;
     use crate::arena::db::ArenaDatabase;
-    use crate::arena::index::RealIndexBlocking;
     use crate::arena::types::IndexedFileTableEntry;
     use crate::realize_types::Arena;
     use crate::utils::{hash, redb_utils};
+    use crate::{DirtyPaths, GlobalDatabase, InodeAllocator};
     use realize_types::Hash;
 
     use super::*;
@@ -742,7 +742,17 @@ mod tests {
             let arena = Arena::from("test");
             let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-            let index = RealIndexBlocking::new(arena, db, dirty_paths)?.into_async();
+            let allocator =
+                InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
+            let index = ArenaCache::new(
+                arena,
+                allocator,
+                db,
+                &std::path::Path::new("/dev/null"),
+                dirty_paths,
+            )?
+            .as_index();
+            let index = RealIndexAsync::new(index);
 
             Ok(Self {
                 root,

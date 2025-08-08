@@ -877,6 +877,7 @@ fn read_errno(err: StorageError) -> io_error::Errno {
         StorageError::InvalidRsyncSignature => InvalidInput,
         StorageError::UnknownArena(_) => NotFound,
         StorageError::NoLocalStorage(_) => NotFound,
+        StorageError::InconsistentDatabase(_) => Other,
     }
 }
 

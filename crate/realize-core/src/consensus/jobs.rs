@@ -56,19 +56,25 @@ pub(crate) async fn download(
         }
         Ok((inode, _)) => inode,
     };
-    match cache.local_availability(inode).await? {
-        LocalAvailability::Verified => {
+    match cache.local_availability(inode).await {
+        Err(StorageError::NotFound) => {
+            return Ok(JobStatus::Abandoned("not in cache"));
+        }
+        Err(err) => {
+            return Err(err.into());
+        }
+        Ok(LocalAvailability::Verified) => {
             return Ok(JobStatus::Done);
         }
 
-        LocalAvailability::Complete => {
+        Ok(LocalAvailability::Complete) => {
             return verify(
                 storage, household, arena, path, inode, hash, progress, shutdown,
             )
             .await;
         }
 
-        LocalAvailability::Missing | LocalAvailability::Partial(_, _) => {
+        Ok(LocalAvailability::Missing) | Ok(LocalAvailability::Partial(_, _)) => {
             let peers = storage.cache().file_availability(inode).await?.peers;
             if peers.is_empty() {
                 return Ok(JobStatus::Abandoned("no peer has it"));

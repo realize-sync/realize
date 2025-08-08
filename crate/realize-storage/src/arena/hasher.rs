@@ -225,8 +225,10 @@ pub(crate) async fn hash_file<R: AsyncRead>(f: R) -> Result<Hash, std::io::Error
 #[cfg(test)]
 mod tests {
     use crate::DirtyPaths;
+    use crate::GlobalDatabase;
+    use crate::InodeAllocator;
+    use crate::arena::arena_cache::ArenaCache;
     use crate::arena::db::ArenaDatabase;
-    use crate::arena::index::RealIndexBlocking;
     use crate::utils::redb_utils;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
@@ -244,13 +246,22 @@ mod tests {
     impl Fixture {
         async fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
-
-            let _ = env_logger::try_init();
+            let tempdir = TempDir::new()?;
             let arena = Arena::from("myarena");
             let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-            let index = RealIndexBlocking::new(arena, db, dirty_paths)?.into_async();
-            let tempdir = TempDir::new()?;
+            let allocator =
+                InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
+            let index = ArenaCache::new(
+                arena,
+                allocator,
+                db,
+                &tempdir.path().join("blobs"),
+                dirty_paths,
+            )?
+            .as_index();
+            let index = RealIndexAsync::new(index);
+
             let (shutdown_tx, _) = broadcast::channel(1);
             let options = HasherOptions::default();
 
@@ -282,9 +293,7 @@ mod tests {
         let mtime = UnixTime::mtime(&foo.path().metadata()?);
 
         let mut history_rx = fixture.index.watch_history();
-        hasher
-            .hash_content(&Path::parse("foo")?, mtime, 12)
-            .await?;
+        hasher.hash_content(&Path::parse("foo")?, mtime, 12).await?;
         tokio::time::timeout(Duration::from_secs(3), history_rx.changed()).await??;
 
         let entry = fixture.index.get_file(&Path::parse("foo")?).await?.unwrap();
