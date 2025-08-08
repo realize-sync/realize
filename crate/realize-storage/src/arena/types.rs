@@ -693,6 +693,10 @@ pub struct FileTableEntry {
 
     /// Inode of the containing directory
     pub parent_inode: Inode,
+
+    // If set, a version is known to exist that replaces the version
+    // in this entry.
+    pub outdated_by: Option<Hash>,
 }
 
 impl FileTableEntry {
@@ -705,6 +709,7 @@ impl FileTableEntry {
                 blob: None,
             },
             parent_inode,
+            outdated_by: None,
         }
     }
 }
@@ -751,6 +756,12 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
         let metadata = msg.get_metadata()?;
         let mtime = metadata.get_mtime()?;
         let blob: Option<BlobId> = BlobId::as_optional(content.get_blob());
+        let outdated_by: &[u8] = msg.get_outdated_by()?;
+        let outdated_by = if outdated_by.is_empty() {
+            None
+        } else {
+            Some(parse_hash(outdated_by)?)
+        };
         Ok(FileTableEntry {
             metadata: FileMetadata {
                 size: metadata.get_size(),
@@ -762,6 +773,7 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
                 blob,
             },
             parent_inode: Inode(msg.get_parent()),
+            outdated_by,
         })
     }
 
@@ -777,6 +789,10 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
         content.set_hash(&self.content.hash.0);
         if let Some(blob) = self.content.blob {
             content.set_blob(blob.into());
+        }
+
+        if let Some(hash) = &self.outdated_by {
+            builder.set_outdated_by(&hash.0)
         }
 
         let mut metadata = builder.init_metadata();
@@ -1107,6 +1123,7 @@ mod tests {
                 mtime: UnixTime::from_secs(1234567890),
             },
             parent_inode: Inode(1234),
+            outdated_by: Some(Hash([3u8; 32])),
         };
 
         assert_eq!(
@@ -1130,6 +1147,7 @@ mod tests {
                 mtime: UnixTime::from_secs(1234567890),
             },
             parent_inode: Inode(1234),
+            outdated_by: None,
         };
 
         assert_eq!(

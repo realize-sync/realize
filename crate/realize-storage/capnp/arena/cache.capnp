@@ -26,6 +26,9 @@ struct FileTableEntry {
   metadata @0: FileMetadata;
   content @1: FileContent;
   parent @2: UInt64;
+
+  # may be empty
+  outdatedBy @3: Data;
 }
 
 struct FileContent {
