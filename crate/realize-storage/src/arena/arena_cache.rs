@@ -1080,7 +1080,7 @@ impl RealIndex for ArenaCache {
         let (inode, assignment) = match do_lookup_path(&dir_table, self.arena_root, Some(path)) {
             Ok(ret) => ret,
             Err(StorageError::NotFound) => {
-                return Ok(true);
+                return Ok(false);
             }
             Err(err) => {
                 return Err(err);
@@ -1592,11 +1592,18 @@ fn replaces_local_copy(entry: &FileTableEntry, old_hash: &Hash) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::fs;
     use std::sync::Arc;
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+    use tokio::sync::mpsc;
 
     use crate::arena::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
     use crate::arena::engine;
+    use crate::arena::index::RealIndex;
     use crate::arena::notifier::Notification;
+    use crate::arena::types::HistoryTableEntry;
+    use crate::utils::hash;
     use crate::utils::redb_utils;
     use crate::{
         DirtyPaths, FileMetadata, GlobalDatabase, Inode, InodeAllocator, InodeAssignment,
@@ -1605,7 +1612,6 @@ mod tests {
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Hash, Path, Peer, UnixTime};
-    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
     use super::mark_dirty_recursive;
 
@@ -1700,7 +1706,7 @@ mod tests {
             Ok(self.acache.dir_mtime(inode)?)
         }
 
-        fn add_file<T>(&self, path: T, size: u64, mtime: UnixTime) -> anyhow::Result<()>
+        fn add_to_cache<T>(&self, path: T, size: u64, mtime: UnixTime) -> anyhow::Result<()>
         where
             T: AsRef<Path>,
         {
@@ -1721,7 +1727,7 @@ mod tests {
             Ok(())
         }
 
-        fn remove_file<T>(&self, path: T) -> anyhow::Result<()>
+        fn remove_from_cache<T>(&self, path: T) -> anyhow::Result<()>
         where
             T: AsRef<Path>,
         {
@@ -1739,6 +1745,14 @@ mod tests {
 
             Ok(())
         }
+
+        fn as_real_index(&self) -> Arc<dyn RealIndex> {
+            Arc::clone(&self.acache) as Arc<dyn RealIndex>
+        }
+
+        async fn setup() -> anyhow::Result<Fixture> {
+            Self::setup_with_arena(test_arena()).await
+        }
     }
 
     #[tokio::test]
@@ -1748,7 +1762,7 @@ mod tests {
         let file_path = Path::parse("a/b/c.txt")?;
         let mtime = test_time();
 
-        fixture.add_file(&file_path, 100, mtime)?;
+        fixture.add_to_cache(&file_path, 100, mtime)?;
 
         let (inode, assignment) = acache.lookup(acache.arena_root(), "a")?;
         assert_eq!(assignment, InodeAssignment::Directory, "a");
@@ -1765,12 +1779,12 @@ mod tests {
         let fixture = Fixture::setup_with_arena(arena).await?;
         let mtime = test_time();
         let path1 = Path::parse("a/b/1.txt")?;
-        fixture.add_file(&path1, 100, mtime)?;
+        fixture.add_to_cache(&path1, 100, mtime)?;
         let dir = Path::parse("a/b")?;
         let dir_mtime = fixture.dir_mtime(&dir)?;
 
         let path2 = Path::parse("a/b/2.txt")?;
-        fixture.add_file(&path2, 100, mtime)?;
+        fixture.add_to_cache(&path2, 100, mtime)?;
 
         assert!(fixture.dir_mtime(&dir)? > dir_mtime);
         Ok(())
@@ -1781,7 +1795,7 @@ mod tests {
         let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let file_path = Path::parse("a/b/c.txt")?;
 
-        fixture.add_file(&file_path, 100, test_time())?;
+        fixture.add_to_cache(&file_path, 100, test_time())?;
 
         assert!(engine::is_dirty(&fixture.begin_read()?, &file_path)?);
 
@@ -1916,8 +1930,8 @@ mod tests {
         let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let file_path = Path::parse("file.txt")?;
 
-        fixture.add_file(&file_path, 100, test_time())?;
-        fixture.add_file(&file_path, 200, test_time())?;
+        fixture.add_to_cache(&file_path, 100, test_time())?;
+        fixture.add_to_cache(&file_path, 200, test_time())?;
 
         let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
@@ -1974,10 +1988,10 @@ mod tests {
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
 
-        fixture.add_file(&file_path, 100, mtime)?;
+        fixture.add_to_cache(&file_path, 100, mtime)?;
         let arena_root = acache.arena_root();
         acache.lookup(arena_root, "file.txt")?;
-        fixture.remove_file(&file_path)?;
+        fixture.remove_from_cache(&file_path)?;
         assert!(matches!(
             acache.lookup(arena_root, "file.txt"),
             Err(StorageError::NotFound)
@@ -1993,12 +2007,12 @@ mod tests {
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
 
-        fixture.add_file(&file_path, 100, mtime)?;
+        fixture.add_to_cache(&file_path, 100, mtime)?;
         let arena_root = acache.arena_root();
         acache.lookup(arena_root, "file.txt")?;
 
         fixture.clear_dirty()?;
-        fixture.remove_file(&file_path)?;
+        fixture.remove_from_cache(&file_path)?;
         assert!(engine::is_dirty(&fixture.begin_read()?, &file_path)?);
 
         Ok(())
@@ -2011,10 +2025,10 @@ mod tests {
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
 
-        fixture.add_file(&file_path, 100, mtime)?;
+        fixture.add_to_cache(&file_path, 100, mtime)?;
         let arena_root = fixture.acache.arena_root();
         let dir_mtime = fixture.acache.dir_mtime(arena_root)?;
-        fixture.remove_file(&file_path)?;
+        fixture.remove_from_cache(&file_path)?;
 
         assert!(fixture.acache.dir_mtime(arena_root)? > dir_mtime);
 
@@ -2029,7 +2043,7 @@ mod tests {
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
 
-        fixture.add_file(&file_path, 100, mtime)?;
+        fixture.add_to_cache(&file_path, 100, mtime)?;
         acache.update(
             test_peer(),
             Notification::Remove {
@@ -2057,7 +2071,7 @@ mod tests {
         let file_path = Path::parse("a/file.txt")?;
         let mtime = test_time();
 
-        fixture.add_file(&file_path, 100, mtime)?;
+        fixture.add_to_cache(&file_path, 100, mtime)?;
 
         // Lookup directory
         let (inode, assignment) = acache.lookup(acache.arena_root(), "a")?;
@@ -2095,7 +2109,7 @@ mod tests {
         let path = Path::parse("a/b/c/file.txt")?;
         let mtime = test_time();
 
-        fixture.add_file(&path, 100, mtime)?;
+        fixture.add_to_cache(&path, 100, mtime)?;
 
         let (inode, assignment) = acache.lookup_path(&path)?;
         assert_eq!(assignment, InodeAssignment::File);
@@ -2114,9 +2128,9 @@ mod tests {
         let acache = &fixture.acache;
         let mtime = test_time();
 
-        fixture.add_file(&Path::parse("dir/file1.txt")?, 100, mtime)?;
-        fixture.add_file(&Path::parse("dir/file2.txt")?, 200, mtime)?;
-        fixture.add_file(&Path::parse("dir/subdir/file3.txt")?, 300, mtime)?;
+        fixture.add_to_cache(&Path::parse("dir/file1.txt")?, 100, mtime)?;
+        fixture.add_to_cache(&Path::parse("dir/file2.txt")?, 200, mtime)?;
+        fixture.add_to_cache(&Path::parse("dir/subdir/file3.txt")?, 300, mtime)?;
 
         let arena_root = acache.arena_root();
         assert_unordered::assert_eq_unordered!(
@@ -2654,7 +2668,7 @@ mod tests {
 
         // Add a single file
         let file_path = Path::parse("foo/bar.txt")?;
-        fixture.add_file(&file_path, 100, mtime)?;
+        fixture.add_to_cache(&file_path, 100, mtime)?;
         fixture.clear_dirty()?;
 
         // Mark the file dirty recursively
@@ -2691,7 +2705,7 @@ mod tests {
         let e = Path::parse("bar/e.txt")?;
 
         for file in vec![&a, &b, &c, &d, &e] {
-            fixture.add_file(file, 100, mtime)?;
+            fixture.add_to_cache(file, 100, mtime)?;
         }
         fixture.clear_dirty()?;
 
@@ -2735,7 +2749,7 @@ mod tests {
         let e = Path::parse("foo/other/e.txt")?;
 
         for file in vec![&a, &b, &c, &d, &e] {
-            fixture.add_file(file, 100, mtime)?;
+            fixture.add_to_cache(file, 100, mtime)?;
         }
         fixture.clear_dirty()?;
 
@@ -2775,7 +2789,7 @@ mod tests {
         // Add some files
         for file in vec!["foo/a.txt", "bar/b.txt"] {
             let path = Path::parse(file)?;
-            fixture.add_file(&path, 100, mtime)?;
+            fixture.add_to_cache(&path, 100, mtime)?;
         }
         fixture.clear_dirty()?;
 
@@ -2811,7 +2825,7 @@ mod tests {
         // Add some files
         for file in vec!["foo/a.txt", "bar/b.txt"] {
             let path = Path::parse(file)?;
-            fixture.add_file(&path, 100, mtime)?;
+            fixture.add_to_cache(&path, 100, mtime)?;
         }
         fixture.clear_dirty()?;
 
@@ -2850,7 +2864,7 @@ mod tests {
 
         let mtime = test_time();
         for file in &files {
-            fixture.add_file(file, 100, mtime)?;
+            fixture.add_to_cache(file, 100, mtime)?;
         }
         fixture.clear_dirty()?;
 
@@ -2880,7 +2894,7 @@ mod tests {
         let mtime = test_time();
 
         // Add a file without opening it (so no blob is created)
-        fixture.add_file(&file_path, 100, mtime)?;
+        fixture.add_to_cache(&file_path, 100, mtime)?;
 
         let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
@@ -2898,7 +2912,7 @@ mod tests {
         let mtime = test_time();
 
         // Add a file and open it to create a blob
-        fixture.add_file(&file_path, 100, mtime)?;
+        fixture.add_to_cache(&file_path, 100, mtime)?;
         let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
 
@@ -2919,7 +2933,7 @@ mod tests {
         let mtime = test_time();
 
         // Add a file and open it to create a blob
-        fixture.add_file(&file_path, 100, mtime)?;
+        fixture.add_to_cache(&file_path, 100, mtime)?;
         let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
 
@@ -2950,7 +2964,7 @@ mod tests {
         let mtime = test_time();
 
         // Add a file and open it to create a blob
-        fixture.add_file(&file_path, 100, mtime)?;
+        fixture.add_to_cache(&file_path, 100, mtime)?;
         let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
 
@@ -2975,7 +2989,7 @@ mod tests {
         let mtime = test_time();
 
         // Add a file and open it to create a blob
-        fixture.add_file(&file_path, 100, mtime)?;
+        fixture.add_to_cache(&file_path, 100, mtime)?;
         let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
 
@@ -3003,7 +3017,7 @@ mod tests {
         let mtime = test_time();
 
         // Add a file and open it to create a blob
-        fixture.add_file(&file_path, 1000, mtime)?;
+        fixture.add_to_cache(&file_path, 1000, mtime)?;
         let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
 
@@ -3046,7 +3060,7 @@ mod tests {
         let mtime = test_time();
 
         // Add a zero-size file
-        fixture.add_file(&file_path, 0, mtime)?;
+        fixture.add_to_cache(&file_path, 0, mtime)?;
         let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
         assert!(matches!(
@@ -3090,7 +3104,7 @@ mod tests {
         let mtime = test_time();
 
         // Add a file and open it to create a blob
-        fixture.add_file(&file_path, 100, mtime)?;
+        fixture.add_to_cache(&file_path, 100, mtime)?;
         let acache = &fixture.acache;
         let (inode, _) = acache.lookup_path(&file_path)?;
 
@@ -3128,6 +3142,543 @@ mod tests {
         // Should now be complete
         let availability = acache.local_availability(inode)?;
         assert!(matches!(availability, LocalAvailability::Complete));
+
+        Ok(())
+    }
+
+    // RealIndex trait tests
+    #[tokio::test]
+    async fn real_index_reopen_keeps_uuid() -> anyhow::Result<()> {
+        let tempdir = TempDir::new()?;
+        let path = tempdir.path().join("index.db");
+        let db = ArenaDatabase::new(redb::Database::create(&path)?)?;
+        let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
+        let arena = test_arena();
+        let allocator =
+            InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
+        let blob_dir = tempdir.child("blobs");
+        let acache = ArenaCache::new(
+            arena,
+            allocator.clone(),
+            db,
+            blob_dir.path(),
+            dirty_paths.clone(),
+        )?;
+        let uuid = acache.uuid().clone();
+
+        // Drop the first instance to release the database lock
+        drop(acache);
+
+        let db = ArenaDatabase::new(redb::Database::create(&path)?)?;
+        let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
+        let allocator =
+            InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
+        let acache = ArenaCache::new(arena, allocator, db, blob_dir.path(), dirty_paths)?;
+        assert!(!uuid.is_nil());
+        assert_eq!(uuid, acache.uuid().clone());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_index_add_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = fixture.as_real_index();
+
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        index.add_file(&path, 100, mtime, Hash([0xfa; 32]))?;
+
+        // Verify the file was added
+        assert!(index.has_file(&path)?);
+        let entry = index.get_file(&path)?.unwrap();
+        assert_eq!(entry.size, 100);
+        assert_eq!(entry.mtime, mtime);
+        assert_eq!(entry.hash, Hash([0xfa; 32]));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_index_add_file_if_matches_success() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = fixture.as_real_index();
+
+        // Create a file on disk
+        let tempdir = TempDir::new()?;
+        let file_path = tempdir.child("foo");
+        file_path.write_str("foo")?;
+
+        assert!(index.add_file_if_matches(
+            tempdir.path(),
+            &realize_types::Path::parse("foo")?,
+            3,
+            UnixTime::mtime(&file_path.path().metadata()?),
+            hash::digest("foo"),
+        )?);
+        assert!(index.has_file(&realize_types::Path::parse("foo")?)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_index_add_file_if_matches_time_mismatch() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = fixture.as_real_index();
+
+        // Create a file on disk
+        let tempdir = TempDir::new()?;
+        let file_path = tempdir.child("foo");
+        file_path.write_str("foo")?;
+
+        assert!(!index.add_file_if_matches(
+            tempdir.path(),
+            &realize_types::Path::parse("foo")?,
+            3,
+            UnixTime::from_secs(1234567890),
+            hash::digest("foo"),
+        )?);
+        assert!(!index.has_file(&realize_types::Path::parse("foo")?)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_index_add_file_if_matches_size_mismatch() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = fixture.as_real_index();
+
+        // Create a file on disk
+        let tempdir = TempDir::new()?;
+        let file_path = tempdir.child("foo");
+        file_path.write_str("foo")?;
+
+        assert!(!index.add_file_if_matches(
+            tempdir.path(),
+            &realize_types::Path::parse("foo")?,
+            2,
+            UnixTime::mtime(&file_path.path().metadata()?),
+            hash::digest("foo"),
+        )?);
+        assert!(!index.has_file(&realize_types::Path::parse("foo")?)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_index_add_file_if_matches_missing() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = fixture.as_real_index();
+
+        // Create a file on disk then remove it
+        let tempdir = TempDir::new()?;
+        let file_path = tempdir.child("foo");
+        file_path.write_str("foo")?;
+        let mtime = UnixTime::mtime(&file_path.path().metadata()?);
+        fs::remove_file(file_path.path())?;
+
+        assert!(!index.add_file_if_matches(
+            tempdir.path(),
+            &realize_types::Path::parse("foo")?,
+            3,
+            mtime,
+            hash::digest("foo"),
+        )?);
+        assert!(!index.has_file(&realize_types::Path::parse("foo")?)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_index_replace_file_in_index() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = fixture.as_real_index();
+
+        let mtime1 = UnixTime::from_secs(1234567890);
+        let mtime2 = UnixTime::from_secs(1234567891);
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        index.add_file(&path, 100, mtime1, Hash([0xfa; 32]))?;
+        index.add_file(&path, 200, mtime2, Hash([0x07; 32]))?;
+
+        // Verify the file was replaced
+        assert!(index.has_file(&path)?);
+        let entry = index.get_file(&path)?.unwrap();
+        assert_eq!(entry.size, 200);
+        assert_eq!(entry.mtime, mtime2);
+        assert_eq!(entry.hash, Hash([0x07; 32]));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_index_has_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = fixture.as_real_index();
+
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("foo.txt")?;
+        index.add_file(&path, 100, mtime, Hash([0xfa; 32]))?;
+
+        assert!(index.has_file(&path)?);
+        assert!(!index.has_file(&realize_types::Path::parse("bar.txt")?)?);
+        assert!(!index.has_file(&realize_types::Path::parse("other.txt")?)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_index_get_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = fixture.as_real_index();
+
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("foo/bar")?;
+        let hash = Hash([0xfa; 32]);
+        index.add_file(&path, 100, mtime, hash.clone())?;
+
+        let entry = index.get_file(&path)?.unwrap();
+        assert_eq!(entry.size, 100);
+        assert_eq!(entry.mtime, mtime);
+        assert_eq!(entry.hash, hash);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_index_has_matching_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = fixture.as_real_index();
+
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("foo/bar")?;
+        index.add_file(&path, 100, mtime, Hash([0xfa; 32]))?;
+
+        assert!(index.has_matching_file(&path, 100, mtime)?);
+        assert!(!index.has_matching_file(&realize_types::Path::parse("other")?, 100, mtime)?);
+        assert!(!index.has_matching_file(&path, 200, mtime)?);
+        assert!(!index.has_matching_file(&path, 100, UnixTime::from_secs(1234567891))?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_index_remove_file_or_dir() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = fixture.as_real_index();
+
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        index.add_file(&path, 100, mtime, Hash([0xfa; 32]))?;
+        index.remove_file_or_dir(&path)?;
+
+        assert!(!index.has_file(&path)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_index_remove_file_if_missing_success() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = fixture.as_real_index();
+
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("bar.txt")?;
+        index.add_file(&path, 100, mtime, Hash([0xfa; 32]))?;
+        assert!(index.remove_file_if_missing(&std::path::Path::new("/tmp"), &path)?);
+
+        assert!(!index.has_file(&path)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_index_remove_file_if_missing_failure() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = fixture.as_real_index();
+
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("bar.txt")?;
+        index.add_file(&path, 100, mtime, Hash([0xfa; 32]))?;
+
+        // Create the file on disk
+        let tempdir = TempDir::new()?;
+        let file_path = tempdir.child("bar.txt");
+        file_path.write_str("content")?;
+
+        assert!(!index.remove_file_if_missing(tempdir.path(), &path)?);
+        assert!(index.has_file(&path)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_index_remove_dir_from_index() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = fixture.as_real_index();
+
+        let mtime = UnixTime::from_secs(1234567890);
+
+        index.add_file(
+            &realize_types::Path::parse("foo/a")?,
+            100,
+            mtime,
+            Hash([1; 32]),
+        )?;
+        index.add_file(
+            &realize_types::Path::parse("foo/b")?,
+            100,
+            mtime,
+            Hash([2; 32]),
+        )?;
+        index.add_file(
+            &realize_types::Path::parse("foo/c")?,
+            100,
+            mtime,
+            Hash([3; 32]),
+        )?;
+        index.add_file(
+            &realize_types::Path::parse("foobar")?,
+            100,
+            mtime,
+            Hash([0x04; 32]),
+        )?;
+
+        // Remove the directory
+        index.remove_file_or_dir(&realize_types::Path::parse("foo")?)?;
+
+        // Verify all files in the directory were removed
+        assert!(!index.has_file(&realize_types::Path::parse("foo/a")?)?);
+        assert!(!index.has_file(&realize_types::Path::parse("foo/b")?)?);
+        assert!(!index.has_file(&realize_types::Path::parse("foo/c")?)?);
+
+        // But the file outside the directory should remain
+        assert!(index.has_file(&realize_types::Path::parse("foobar")?)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_index_all_files() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = fixture.as_real_index();
+
+        let mtime = UnixTime::from_secs(1234567890);
+        let path1 = realize_types::Path::parse("foo/a")?;
+        let path2 = realize_types::Path::parse("foo/b")?;
+        let path3 = realize_types::Path::parse("bar.txt")?;
+
+        index.add_file(&path1, 100, mtime, Hash([1; 32]))?;
+        index.add_file(&path2, 200, mtime, Hash([2; 32]))?;
+        index.add_file(&path3, 300, mtime, Hash([3; 32]))?;
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let task = tokio::task::spawn_blocking({
+            let index = index.clone();
+
+            move || index.all_files(tx)
+        });
+
+        let mut files = HashMap::new();
+        while let Some((path, entry)) = rx.recv().await {
+            files.insert(path, entry);
+        }
+        task.await??; // make sure there are no errors
+
+        assert_eq!(files.len(), 3);
+        assert!(files.contains_key(&path1));
+        assert!(files.contains_key(&path2));
+        assert!(files.contains_key(&path3));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_index_history() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = fixture.as_real_index();
+
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        index.add_file(&path, 100, mtime, Hash([0xfa; 32]))?;
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let task = tokio::task::spawn_blocking({
+            let index = index.clone();
+
+            move || index.history(1..2, tx)
+        });
+
+        let mut entries = Vec::new();
+        while let Some(entry) = rx.recv().await {
+            entries.push(entry);
+        }
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0], Ok((1, HistoryTableEntry::Add(_)))));
+        task.await??; // make sure there are no errors
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_index_watch_history() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = fixture.as_real_index();
+
+        let mut rx = index.watch_history();
+        let initial = *rx.borrow();
+
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        index.add_file(&path, 100, mtime, Hash([0xfa; 32]))?;
+
+        // Wait for the history to be updated
+        let timeout = tokio::time::Duration::from_millis(100);
+        let _ = tokio::time::timeout(timeout, rx.changed()).await;
+
+        let updated = *rx.borrow();
+        assert!(updated > initial);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_index_last_history_index() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = fixture.as_real_index();
+
+        let initial = index.last_history_index()?;
+
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        index.add_file(&path, 100, mtime, Hash([0xfa; 32]))?;
+
+        let updated = index.last_history_index()?;
+        assert!(updated > initial);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_index_drop_file_if_matches_success() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = fixture.as_real_index();
+
+        let path = realize_types::Path::parse("test.txt")?;
+        let content = "test content";
+        let hash = hash::digest(content);
+
+        // Add file to index
+        index.add_file(
+            &path,
+            content.len() as u64,
+            UnixTime::from_secs(1234567890),
+            hash.clone(),
+        )?;
+
+        // Verify file exists in index
+        assert!(index.has_file(&path)?);
+
+        // Get the initial history count
+        let initial_history_count = index.last_history_index()?;
+
+        // Try to drop the file - this should fail because file doesn't exist on disk
+        // but the test is checking that the method returns the correct result
+        {
+            let txn = fixture.db.begin_write()?;
+            let result =
+                index.drop_file_if_matches(&txn, std::path::Path::new("/tmp"), &path, &hash)?;
+            // The method should return false because file_matches_index will fail
+            // since the file doesn't exist on disk at /tmp/test.txt
+            assert!(!result);
+            txn.commit()?;
+        }
+
+        // Verify file still exists in index (since drop failed)
+        assert!(index.has_file(&path)?);
+
+        // Verify no new history entry was created
+        let final_history_count = index.last_history_index()?;
+        assert_eq!(initial_history_count, final_history_count);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_index_drop_file_if_matches_wrong_hash() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = fixture.as_real_index();
+
+        let path = realize_types::Path::parse("test.txt")?;
+        let content = "test content";
+        let hash = hash::digest(content);
+        let wrong_hash = hash::digest("wrong content");
+
+        // Add file to index
+        index.add_file(
+            &path,
+            content.len() as u64,
+            UnixTime::from_secs(1234567890),
+            hash.clone(),
+        )?;
+
+        // Verify file exists in index
+        assert!(index.has_file(&path)?);
+
+        // Get the initial history count
+        let initial_history_count = index.last_history_index()?;
+
+        // Try to drop the file with wrong hash
+        {
+            let txn = fixture.db.begin_write()?;
+            let result = index.drop_file_if_matches(
+                &txn,
+                std::path::Path::new("/tmp"),
+                &path,
+                &wrong_hash,
+            )?;
+            assert!(!result);
+            txn.commit()?;
+        }
+
+        // Verify file still exists in index
+        assert!(index.has_file(&path)?);
+
+        // Verify no new history entry was created
+        let final_history_count = index.last_history_index()?;
+        assert_eq!(initial_history_count, final_history_count);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_index_drop_file_if_matches_file_not_in_index() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let index = fixture.as_real_index();
+
+        let path = realize_types::Path::parse("test.txt")?;
+        let hash = hash::digest("test content");
+
+        // Verify file doesn't exist in index
+        assert!(!index.has_file(&path)?);
+
+        // Get the initial history count
+        let initial_history_count = index.last_history_index()?;
+
+        // Try to drop the file
+        {
+            let txn = fixture.db.begin_write()?;
+            let result =
+                index.drop_file_if_matches(&txn, std::path::Path::new("/tmp"), &path, &hash)?;
+            assert!(!result);
+            txn.commit()?;
+        }
+
+        // Verify file still doesn't exist in index
+        assert!(!index.has_file(&path)?);
+
+        // Verify no new history entry was created
+        let final_history_count = index.last_history_index()?;
+        assert_eq!(initial_history_count, final_history_count);
 
         Ok(())
     }

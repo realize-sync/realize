@@ -1237,7 +1237,7 @@ mod tests {
             Ok(())
         }
 
-        fn add_file_with_content(
+        fn index_file_with_content(
             &self,
             path_str: &str,
             content: &str,
@@ -1282,7 +1282,7 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
-    async fn add_file() -> anyhow::Result<()> {
+    async fn index_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
@@ -1316,7 +1316,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_file_if_matches_success() -> anyhow::Result<()> {
+    async fn index_file_if_matches_success() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
@@ -1356,7 +1356,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_file_if_matches_size_mismatch() -> anyhow::Result<()> {
+    async fn index_file_if_matches_size_mismatch() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
@@ -1376,7 +1376,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_file_if_matches_missing() -> anyhow::Result<()> {
+    async fn index_file_if_matches_missing() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
@@ -1398,7 +1398,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replace_file() -> anyhow::Result<()> {
+    async fn replace_file_in_index() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
@@ -1434,7 +1434,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn has_file() -> anyhow::Result<()> {
+    async fn has_indexed_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
@@ -1456,7 +1456,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_file() -> anyhow::Result<()> {
+    async fn get_indexed_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
@@ -1479,7 +1479,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn has_matching_file() -> anyhow::Result<()> {
+    async fn has_matching_indexed_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
@@ -1502,7 +1502,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_file() -> anyhow::Result<()> {
+    async fn remove_file_from_index() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
@@ -1527,7 +1527,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_file_if_missing_success() -> anyhow::Result<()> {
+    async fn remove_file_from_index_if_missing_success() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
@@ -1543,7 +1543,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_file_if_missing_failure() -> anyhow::Result<()> {
+    async fn remove_file_from_index_if_missing_failure() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
@@ -1563,7 +1563,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_dir() -> anyhow::Result<()> {
+    async fn remove_dir_from_index() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
@@ -1649,7 +1649,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_nothing() -> anyhow::Result<()> {
+    async fn remove_nothing_from_index() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
 
         let index = &fixture.index;
@@ -1665,7 +1665,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_files_stream() -> anyhow::Result<()> {
+    async fn all_indexed_files_stream() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
 
         let index = &fixture.aindex;
@@ -2624,7 +2624,7 @@ mod tests {
     async fn test_get_indexed_file_with_hash_success() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let root = &fixture.root;
-        let (path, hash) = fixture.add_file_with_content("test.txt", "test content")?;
+        let (path, hash) = fixture.index_file_with_content("test.txt", "test content")?;
 
         let txn = fixture.db.begin_write()?;
         let result = fixture
@@ -2639,7 +2639,7 @@ mod tests {
     async fn test_get_indexed_file_with_hash_wrong_hash() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let root = &fixture.root;
-        let (path, _) = fixture.add_file_with_content("test.txt", "test content")?;
+        let (path, _) = fixture.index_file_with_content("test.txt", "test content")?;
         let wrong_hash = hash::digest("different content");
 
         let txn = fixture.db.begin_write()?;
@@ -2672,7 +2672,7 @@ mod tests {
     async fn test_get_indexed_file_with_hash_file_modified_on_fs() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let root = &fixture.root;
-        let (path, hash) = fixture.add_file_with_content("test.txt", "original content")?;
+        let (path, hash) = fixture.index_file_with_content("test.txt", "original content")?;
 
         // Modify the file on filesystem without updating the index
         //
@@ -2696,7 +2696,7 @@ mod tests {
     async fn test_get_indexed_file_with_hash_file_missing_on_fs() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let root = &fixture.root;
-        let (path, hash) = fixture.add_file_with_content("test.txt", "test content")?;
+        let (path, hash) = fixture.index_file_with_content("test.txt", "test content")?;
 
         // Remove the file from filesystem
         std::fs::remove_file(root.child("test.txt").path())?;
@@ -2732,7 +2732,7 @@ mod tests {
     async fn test_get_indexed_file_without_hash_file_exists_in_index() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let root = &fixture.root;
-        let (path, _) = fixture.add_file_with_content("test.txt", "test content")?;
+        let (path, _) = fixture.index_file_with_content("test.txt", "test content")?;
 
         let txn = fixture.db.begin_write()?;
         let result = fixture
@@ -2790,7 +2790,7 @@ mod tests {
     #[tokio::test]
     async fn test_drop_file_if_matches_success() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let (path, hash) = fixture.add_file_with_content("test.txt", "test content")?;
+        let (path, hash) = fixture.index_file_with_content("test.txt", "test content")?;
 
         // Verify file exists in index
         assert!(fixture.index.has_file(&path)?);
@@ -2830,7 +2830,7 @@ mod tests {
     #[tokio::test]
     async fn test_drop_file_if_matches_wrong_hash() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let (path, _) = fixture.add_file_with_content("test.txt", "test content")?;
+        let (path, _) = fixture.index_file_with_content("test.txt", "test content")?;
         let wrong_hash = hash::digest("different content");
 
         // Get the initial history count
@@ -2895,7 +2895,7 @@ mod tests {
     #[tokio::test]
     async fn test_drop_file_if_matches_file_modified_on_fs() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let (path, hash) = fixture.add_file_with_content("test.txt", "original content")?;
+        let (path, hash) = fixture.index_file_with_content("test.txt", "original content")?;
 
         // Get the initial history count
         let initial_history_count = fixture.index.last_history_index()?;
@@ -2936,7 +2936,7 @@ mod tests {
     #[tokio::test]
     async fn test_drop_file_if_matches_file_missing_on_fs() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let (path, hash) = fixture.add_file_with_content("test.txt", "test content")?;
+        let (path, hash) = fixture.index_file_with_content("test.txt", "test content")?;
 
         // Get the initial history count
         let initial_history_count = fixture.index.last_history_index()?;
