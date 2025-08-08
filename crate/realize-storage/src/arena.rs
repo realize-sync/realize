@@ -243,7 +243,7 @@ fn job_retry_strategy(attempt: u32) -> Option<Duration> {
 
 #[cfg(test)]
 mod tests {
-    use super::index::RealIndexBlocking;
+    use super::index::RealIndex;
     use super::types::IndexedFileTableEntry;
     use super::*;
     use crate::config::ArenaConfig;
@@ -302,7 +302,7 @@ mod tests {
             })
         }
 
-        fn index(&self) -> Arc<RealIndexBlocking> {
+        fn index(&self) -> Arc<dyn RealIndex> {
             self.storage
                 .indexed
                 .as_ref()

@@ -850,7 +850,7 @@ mod tests {
     use crate::InodeAllocator;
     use crate::Notification;
     use crate::arena::arena_cache::ArenaCache;
-    use crate::arena::index::RealIndexBlocking;
+    use crate::arena::index::{RealIndex, RealIndexBlocking};
     use crate::arena::mark::PathMarks;
     use crate::utils::redb_utils;
     use assert_fs::TempDir;
@@ -887,7 +887,7 @@ mod tests {
         db: Arc<ArenaDatabase>,
         dirty_paths: Arc<DirtyPaths>,
         acache: Arc<ArenaCache>,
-        index: RealIndexBlocking,
+        index: Arc<dyn RealIndex>,
         pathmarks: PathMarks,
         engine: Arc<Engine>,
         arena_path: PathBuf,

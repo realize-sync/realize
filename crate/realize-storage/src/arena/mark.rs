@@ -194,7 +194,7 @@ mod tests {
     use super::*;
     use crate::GlobalDatabase;
     use crate::arena::engine;
-    use crate::arena::index::RealIndexBlocking;
+    use crate::arena::index::{RealIndex, RealIndexBlocking};
     use crate::utils::redb_utils;
     use crate::{InodeAllocator, arena::arena_cache::ArenaCache};
     use realize_types::{Arena, Hash, UnixTime};
@@ -203,7 +203,7 @@ mod tests {
         arena: Arena,
         db: Arc<ArenaDatabase>,
         acache: Arc<ArenaCache>,
-        index: RealIndexBlocking,
+        index: Arc<dyn RealIndex>,
         marks: PathMarks,
         dirty_paths: Arc<DirtyPaths>,
     }

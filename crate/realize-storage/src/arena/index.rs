@@ -16,7 +16,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 /// Trait for index operations that abstracts over the implementation.
-pub trait RealIndex {
+pub trait RealIndex: Send + Sync {
     /// Returns the database UUID.
     ///
     /// A UUID is set when a new database is created.
@@ -87,7 +87,7 @@ pub trait RealIndex {
     /// Grab a range of history entries.
     fn history(
         &self,
-        range: impl RangeBounds<u64>,
+        range: std::ops::Range<u64>,
         tx: mpsc::Sender<Result<(u64, HistoryTableEntry), StorageError>>,
     ) -> Result<(), StorageError>;
 
@@ -106,6 +106,14 @@ pub trait RealIndex {
         path: &realize_types::Path,
         hash: &Hash,
     ) -> Result<bool, StorageError>;
+
+    /// Take a remote change into account, if it applies to a file in
+    /// the index.
+    fn update(
+        &self,
+        notification: &Notification,
+        root: &std::path::Path,
+    ) -> Result<(), StorageError>;
 }
 
 /// File hash index, blocking version.
@@ -256,7 +264,7 @@ impl RealIndex for RealIndexBlocking {
 
     fn history(
         &self,
-        range: impl RangeBounds<u64>,
+        range: std::ops::Range<u64>,
         tx: mpsc::Sender<Result<(u64, HistoryTableEntry), StorageError>>,
     ) -> Result<(), StorageError> {
         let txn = self.db.begin_read()?;
@@ -323,6 +331,57 @@ impl RealIndex for RealIndexBlocking {
 
         Ok(false)
     }
+
+    fn update(
+        &self,
+        notification: &Notification,
+        root: &std::path::Path,
+    ) -> Result<(), StorageError> {
+        if notification.arena() != self.arena {
+            return Ok(());
+        }
+
+        match notification {
+            Notification::Replace {
+                path,
+                hash,
+                old_hash,
+                ..
+            } => {
+                let txn = self.db.begin_write()?;
+                {
+                    let mut file_table = txn.index_file_table()?;
+                    if let Some(mut entry) = do_get_file_entry(&file_table, path)?
+                        && replaces(&entry, old_hash)
+                    {
+                        // Just remember that a newer version exist in
+                        // a remote peer. This information is going to
+                        // be used to download that newer version later on.
+                        entry.outdated_by = Some(hash.clone());
+                        file_table.insert(path.as_str(), Holder::with_content(entry)?)?;
+                    }
+                }
+                txn.commit()?;
+            }
+            Notification::Remove { path, old_hash, .. } => {
+                let txn = self.db.begin_read()?;
+                if let Some(entry) = get_file_entry(&txn, path)?
+                    && replaces(&entry, old_hash)
+                {
+                    // This specific version has been removed
+                    // remotely. Make sure that the file hasn't
+                    // changed since it was indexed and if it hasn't,
+                    // remove it locally as well.
+                    if file_matches_index(&entry, root, path) {
+                        std::fs::remove_file(&path.within(root))?;
+                    }
+                }
+            }
+            _ => {}
+        };
+
+        Ok(())
+    }
 }
 
 impl RealIndexBlocking {
@@ -330,7 +389,7 @@ impl RealIndexBlocking {
         arena: Arena,
         db: Arc<ArenaDatabase>,
         dirty_paths: Arc<DirtyPaths>,
-    ) -> Result<Self, StorageError> {
+    ) -> Result<Arc<Self>, StorageError> {
         let index: u64;
         let uuid: Uuid;
         {
@@ -359,14 +418,14 @@ impl RealIndexBlocking {
 
         let (history_tx, history_rx) = watch::channel(index);
 
-        Ok(Self {
+        Ok(Arc::new(Self {
             arena,
             db,
             uuid,
             history_tx,
             dirty_paths,
             _history_rx: history_rx,
-        })
+        }))
     }
 
     /// Returns the database UUID.
@@ -401,8 +460,8 @@ impl RealIndexBlocking {
     }
 
     /// Turn this instance into an async one.
-    pub fn into_async(self) -> RealIndexAsync {
-        RealIndexAsync::new(self)
+    pub fn into_async(self: Arc<Self>) -> RealIndexAsync {
+        RealIndexAsync::new(self as Arc<dyn RealIndex>)
     }
 
     /// Get a file entry.
@@ -851,14 +910,12 @@ fn last_history_index(
 /// File hash index, async version.
 #[derive(Clone)]
 pub struct RealIndexAsync {
-    inner: Arc<RealIndexBlocking>,
+    inner: Arc<dyn RealIndex>,
 }
 
 impl RealIndexAsync {
-    pub fn new(inner: RealIndexBlocking) -> Self {
-        Self {
-            inner: Arc::new(inner),
-        }
+    pub fn new(inner: Arc<dyn RealIndex>) -> Self {
+        Self { inner }
     }
 
     /// Create an index using the given database. Initialize the database if necessary.
@@ -881,12 +938,12 @@ impl RealIndexAsync {
     ///
     /// A UUID is set when a new database is created.
     pub fn uuid(&self) -> &Uuid {
-        &self.inner.uuid
+        self.inner.uuid()
     }
 
     /// The arena tied to this index.
     pub fn arena(&self) -> Arena {
-        self.inner.arena
+        self.inner.arena()
     }
 
     /// Subscribe to a watch channel reporting the highest history entry index.
@@ -908,7 +965,7 @@ impl RealIndexAsync {
     }
 
     /// Return a reference to the underlying blocking instance.
-    pub fn blocking(&self) -> Arc<RealIndexBlocking> {
+    pub fn blocking(&self) -> Arc<dyn RealIndex> {
         Arc::clone(&self.inner)
     }
 
@@ -933,7 +990,19 @@ impl RealIndexAsync {
         let range = Box::new(range);
         task::spawn_blocking(move || {
             let tx_clone = tx.clone();
-            if let Err(err) = inner.history(*range, tx) {
+            // Convert the generic range to a concrete Range<u64>
+            let start = match range.start_bound() {
+                std::ops::Bound::Included(&x) => x,
+                std::ops::Bound::Excluded(&x) => x + 1,
+                std::ops::Bound::Unbounded => 0,
+            };
+            let end = match range.end_bound() {
+                std::ops::Bound::Included(&x) => x + 1,
+                std::ops::Bound::Excluded(&x) => x,
+                std::ops::Bound::Unbounded => u64::MAX,
+            };
+            let concrete_range = start..end;
+            if let Err(err) = inner.history(concrete_range, tx) {
                 // Send any global error to the channel, so it ends up
                 // in the stream instead of getting lost.
                 let _ = tx_clone.blocking_send(Err(err));
@@ -992,7 +1061,7 @@ impl RealIndexAsync {
         let inner = Arc::clone(&self.inner);
         let path = path.clone();
 
-        task::spawn_blocking(move || inner.remove_file_or_dir(path)).await?
+        task::spawn_blocking(move || inner.remove_file_or_dir(&path)).await?
     }
 
     pub async fn add_file(
@@ -1115,8 +1184,9 @@ mod tests {
 
     struct Fixture {
         aindex: RealIndexAsync,
-        index: Arc<RealIndexBlocking>,
+        index: Arc<dyn RealIndex>,
         dirty_paths: Arc<DirtyPaths>,
+        db: Arc<ArenaDatabase>,
         root: ChildPath,
         _tempdir: TempDir,
     }
@@ -1126,7 +1196,8 @@ mod tests {
             let arena = test_arena();
             let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-            let aindex = RealIndexBlocking::new(arena, db, Arc::clone(&dirty_paths))?.into_async();
+            let aindex = RealIndexBlocking::new(arena, Arc::clone(&db), Arc::clone(&dirty_paths))?
+                .into_async();
             let tempdir = TempDir::new()?;
             let root = tempdir.child("root");
             root.create_dir_all()?;
@@ -1135,13 +1206,14 @@ mod tests {
                 index: aindex.blocking(),
                 aindex,
                 dirty_paths,
+                db,
                 root,
                 _tempdir: tempdir,
             })
         }
 
         fn clear_all_dirty(&self) -> anyhow::Result<()> {
-            let txn = self.index.db.begin_write()?;
+            let txn = self.db.begin_write()?;
             while engine::take_dirty(&txn)?.is_some() {}
             txn.commit()?;
 
@@ -1202,7 +1274,7 @@ mod tests {
         index.add_file(&path, 100, mtime, Hash([0xfa; 32]))?;
 
         {
-            let txn = index.db.begin_read()?;
+            let txn = fixture.db.begin_read()?;
             let file_table = txn.index_file_table()?;
             assert_eq!(
                 IndexedFileTableEntry {
@@ -1320,7 +1392,7 @@ mod tests {
         index.add_file(&path, 200, mtime2, Hash([0x07; 32]))?;
 
         {
-            let txn = index.db.begin_read()?;
+            let txn = fixture.db.begin_read()?;
             let file_table = txn.index_file_table()?;
             assert_eq!(
                 IndexedFileTableEntry {
@@ -1424,7 +1496,7 @@ mod tests {
 
         assert_eq!(false, index.has_file(&path)?);
         {
-            let txn = index.db.begin_read()?;
+            let txn = fixture.db.begin_read()?;
             let history_table = txn.index_history_table()?;
             assert_eq!(
                 HistoryTableEntry::Remove(path.clone(), Hash([0xfa; 32])),
@@ -1527,7 +1599,7 @@ mod tests {
         );
 
         {
-            let txn = index.db.begin_read()?;
+            let txn = fixture.db.begin_read()?;
             let history_table = txn.index_history_table()?;
             assert_eq!(
                 HistoryTableEntry::Remove(realize_types::Path::parse("foo/a")?, Hash([1; 32])),
@@ -1567,7 +1639,7 @@ mod tests {
         index.remove_file_or_dir(&realize_types::Path::parse("foo")?)?;
 
         {
-            let txn = index.db.begin_read()?;
+            let txn = fixture.db.begin_read()?;
             let history_table = txn.index_history_table()?;
             assert!(history_table.last()?.is_none());
         }
@@ -1813,14 +1885,14 @@ mod tests {
 
         // Mark the file dirty recursively
         {
-            let txn = index.db.begin_write()?;
+            let txn = fixture.db.begin_write()?;
             mark_dirty_recursive(&txn, &path, &fixture.dirty_paths)?;
             txn.commit()?;
         }
 
         // Check that the file is marked dirty
         {
-            let txn = index.db.begin_read()?;
+            let txn = fixture.db.begin_read()?;
             assert!(engine::is_dirty(&txn, &path)?);
         }
 
@@ -1851,7 +1923,7 @@ mod tests {
 
         // Mark the foo directory dirty recursively
         {
-            let txn = index.db.begin_write()?;
+            let txn = fixture.db.begin_write()?;
             let foo_dir = realize_types::Path::parse("foo")?;
             mark_dirty_recursive(&txn, &foo_dir, &fixture.dirty_paths)?;
             txn.commit()?;
@@ -1859,7 +1931,7 @@ mod tests {
 
         // Check that all files under foo are marked dirty
         {
-            let txn = index.db.begin_read()?;
+            let txn = fixture.db.begin_read()?;
             assert!(engine::is_dirty(&txn, &foo_a)?);
             assert!(engine::is_dirty(&txn, &foo_b)?);
             assert!(engine::is_dirty(&txn, &foo_c)?);
@@ -1878,11 +1950,10 @@ mod tests {
     #[tokio::test]
     async fn mark_dirty_recursive_nonexistent_path() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let index = &fixture.index;
 
         // Mark a non-existent path dirty recursively; it shouldn't fail.
         {
-            let txn = index.db.begin_write()?;
+            let txn = fixture.db.begin_write()?;
             let nonexistent = realize_types::Path::parse("nonexistent")?;
             mark_dirty_recursive(&txn, &nonexistent, &fixture.dirty_paths)?;
             txn.commit()?;
@@ -1890,7 +1961,7 @@ mod tests {
 
         // Check that no files are marked dirty (function should do nothing)
         {
-            let txn = index.db.begin_write()?;
+            let txn = fixture.db.begin_write()?;
             assert!(engine::take_dirty(&txn)?.is_none());
         }
 
@@ -1920,14 +1991,14 @@ mod tests {
 
         // Mark all files dirty
         {
-            let txn = index.db.begin_write()?;
+            let txn = fixture.db.begin_write()?;
             make_all_dirty(&txn, &fixture.dirty_paths)?;
             txn.commit()?;
         }
 
         // Check that all files are marked dirty
         {
-            let txn = index.db.begin_read()?;
+            let txn = fixture.db.begin_read()?;
             for file in &files {
                 assert!(engine::is_dirty(&txn, &file)?, "{file} should be dirty",);
             }
@@ -1939,11 +2010,10 @@ mod tests {
     #[tokio::test]
     async fn test_make_all_dirty_empty_index() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let index = &fixture.index;
 
         // Mark all files dirty on empty index; it shouldn't fail
         {
-            let txn = index.db.begin_write()?;
+            let txn = fixture.db.begin_write()?;
             make_all_dirty(&txn, &fixture.dirty_paths)?;
             txn.commit()?;
         }
@@ -1969,7 +2039,7 @@ mod tests {
 
         // Manually insert an invalid path into the file table; it should be skipped
         {
-            let txn = index.db.begin_write()?;
+            let txn = fixture.db.begin_write()?;
             {
                 let mut file_table = txn.index_file_table()?;
                 file_table.insert(
@@ -1989,14 +2059,14 @@ mod tests {
 
         // Mark all files dirty
         {
-            let txn = index.db.begin_write()?;
+            let txn = fixture.db.begin_write()?;
             make_all_dirty(&txn, &fixture.dirty_paths)?;
             txn.commit()?;
         }
 
         // Check that valid files are marked dirty
         {
-            let txn = index.db.begin_read()?;
+            let txn = fixture.db.begin_read()?;
             for file in &valid_files {
                 assert!(engine::is_dirty(&txn, file)?, "{file} should be dirty",);
             }
@@ -2098,7 +2168,7 @@ mod tests {
 
         // Add a file to the index with an outdated_by entry
         {
-            let txn = index.db.begin_write()?;
+            let txn = fixture.db.begin_write()?;
             {
                 let mut file_table = txn.index_file_table()?;
                 file_table.insert(
@@ -2280,7 +2350,7 @@ mod tests {
 
         // Add a file to the index with an outdated_by entry
         {
-            let txn = index.db.begin_write()?;
+            let txn = fixture.db.begin_write()?;
             {
                 let mut file_table = txn.index_file_table()?;
                 file_table.insert(
@@ -2539,7 +2609,7 @@ mod tests {
         let root = &fixture.root;
         let (path, hash) = fixture.add_file_with_content("test.txt", "test content")?;
 
-        let txn = fixture.index.db.begin_write()?;
+        let txn = fixture.db.begin_write()?;
         let result = get_indexed_file(&txn, root.path(), &path, Some(&hash))?;
         assert_eq!(result, Some(root.child("test.txt").path().to_path_buf()));
 
@@ -2553,7 +2623,7 @@ mod tests {
         let (path, _) = fixture.add_file_with_content("test.txt", "test content")?;
         let wrong_hash = hash::digest("different content");
 
-        let txn = fixture.index.db.begin_write()?;
+        let txn = fixture.db.begin_write()?;
         let result = get_indexed_file(&txn, root.path(), &path, Some(&wrong_hash))?;
         assert_eq!(result, None);
 
@@ -2567,7 +2637,7 @@ mod tests {
         let path = realize_types::Path::parse("not_in_index.txt")?;
         let hash = hash::digest("some content");
 
-        let txn = fixture.index.db.begin_write()?;
+        let txn = fixture.db.begin_write()?;
         let result = get_indexed_file(&txn, root.path(), &path, Some(&hash))?;
         assert_eq!(result, None);
 
@@ -2589,7 +2659,7 @@ mod tests {
             .child("test.txt")
             .write_str("modified content!")?;
 
-        let txn = fixture.index.db.begin_write()?;
+        let txn = fixture.db.begin_write()?;
         let result = get_indexed_file(&txn, root.path(), &path, Some(&hash))?;
         assert_eq!(result, None);
 
@@ -2605,7 +2675,7 @@ mod tests {
         // Remove the file from filesystem
         std::fs::remove_file(root.child("test.txt").path())?;
 
-        let txn = fixture.index.db.begin_write()?;
+        let txn = fixture.db.begin_write()?;
         let result = get_indexed_file(&txn, root.path(), &path, Some(&hash))?;
         assert_eq!(result, None);
 
@@ -2618,7 +2688,7 @@ mod tests {
         let root = &fixture.root;
         let path = realize_types::Path::parse("does_not_exist.txt")?;
 
-        let txn = fixture.index.db.begin_write()?;
+        let txn = fixture.db.begin_write()?;
         let result = get_indexed_file(&txn, root.path(), &path, None)?;
         assert_eq!(
             result,
@@ -2634,7 +2704,7 @@ mod tests {
         let root = &fixture.root;
         let (path, _) = fixture.add_file_with_content("test.txt", "test content")?;
 
-        let txn = fixture.index.db.begin_write()?;
+        let txn = fixture.db.begin_write()?;
         let result = get_indexed_file(&txn, root.path(), &path, None)?;
         assert_eq!(result, None);
 
@@ -2651,7 +2721,7 @@ mod tests {
         // Create file on filesystem without adding to index
         root.child("fs_only.txt").write_str("fs only content")?;
 
-        let txn = fixture.index.db.begin_write()?;
+        let txn = fixture.db.begin_write()?;
         let result = get_indexed_file(&txn, root.path(), &path, None)?;
         assert_eq!(result, None);
 
@@ -2674,7 +2744,7 @@ mod tests {
             hash.clone(),
         )?;
 
-        let txn = fixture.index.db.begin_write()?;
+        let txn = fixture.db.begin_write()?;
         let result = get_indexed_file(&txn, root.path(), &path, Some(&hash))?;
         assert_eq!(result, None);
 
@@ -2691,7 +2761,7 @@ mod tests {
 
         // Drop the file
         {
-            let txn = fixture.index.db.begin_write()?;
+            let txn = fixture.db.begin_write()?;
             let result =
                 fixture
                     .index
@@ -2705,7 +2775,7 @@ mod tests {
 
         // Verify history entry was created
         {
-            let txn = fixture.index.db.begin_read()?;
+            let txn = fixture.db.begin_read()?;
             let history_table = txn.index_history_table()?;
             let last_index = fixture.index.last_history_index()?;
             let entry = history_table.get(last_index)?.unwrap().value().parse()?;
@@ -2714,7 +2784,7 @@ mod tests {
 
         // Verify file is marked dirty
         {
-            let txn = fixture.index.db.begin_read()?;
+            let txn = fixture.db.begin_read()?;
             assert!(engine::is_dirty(&txn, &path)?);
         }
 
@@ -2735,7 +2805,7 @@ mod tests {
 
         // Try to drop with wrong hash
         {
-            let txn = fixture.index.db.begin_write()?;
+            let txn = fixture.db.begin_write()?;
             let result = fixture.index.drop_file_if_matches(
                 &txn,
                 fixture.root.path(),
@@ -2770,7 +2840,7 @@ mod tests {
 
         // Try to drop file not in index
         {
-            let txn = fixture.index.db.begin_write()?;
+            let txn = fixture.db.begin_write()?;
             let result =
                 fixture
                     .index
@@ -2808,7 +2878,7 @@ mod tests {
 
         // Try to drop the file
         {
-            let txn = fixture.index.db.begin_write()?;
+            let txn = fixture.db.begin_write()?;
             let result =
                 fixture
                     .index
@@ -2843,7 +2913,7 @@ mod tests {
 
         // Try to drop the file
         {
-            let txn = fixture.index.db.begin_write()?;
+            let txn = fixture.db.begin_write()?;
             let result =
                 fixture
                     .index
@@ -2886,7 +2956,7 @@ mod tests {
 
         // Try to drop the file
         {
-            let txn = fixture.index.db.begin_write()?;
+            let txn = fixture.db.begin_write()?;
             let result =
                 fixture
                     .index
