@@ -972,6 +972,7 @@ mod tests {
                     size,
                     hash: test_hash(),
                 },
+                None,
             )?;
 
             let (inode, _) = self.acache.lookup_path(&path)?;
@@ -995,6 +996,7 @@ mod tests {
                     size,
                     hash: test_hash(),
                 },
+                None,
             )?;
 
             Ok(())
@@ -1009,6 +1011,7 @@ mod tests {
                     path: path.clone(),
                     old_hash: test_hash(),
                 },
+                None,
             )?;
 
             Ok(())
@@ -1364,6 +1367,7 @@ mod tests {
                 hash: Hash([2u8; 32]),
                 old_hash: test_hash(),
             },
+            None,
         )?;
 
         // Verify the blob file has been deleted
@@ -1423,7 +1427,7 @@ mod tests {
         assert!(fixture.blob_entry_exists(blob_id)?);
 
         // Do a catchup that doesn't include this file (simulating file removal)
-        acache.update(test_peer(), Notification::CatchupStart(arena))?;
+        acache.update(test_peer(), Notification::CatchupStart(arena), None)?;
         // Note: No Catchup notification for the file, so it will be deleted
         acache.update(
             test_peer(),
@@ -1431,6 +1435,7 @@ mod tests {
                 arena: arena,
                 index: 0,
             },
+            None,
         )?;
 
         // Verify the blob file has been deleted

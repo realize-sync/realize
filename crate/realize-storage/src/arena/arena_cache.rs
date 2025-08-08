@@ -1,20 +1,26 @@
 use super::blob::{self, Blobstore};
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
+use super::index::RealIndex;
 use super::types::{
     DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry, FileTableKey,
-    LocalAvailability, LruQueueId, PeerTableEntry, ReadDirEntry,
+    HistoryTableEntry, IndexedFileTableEntry, LocalAvailability, LruQueueId, PeerTableEntry,
+    ReadDirEntry,
 };
 use crate::arena::engine::DirtyPaths;
 use crate::arena::notifier::{Notification, Progress};
 use crate::types::BlobId;
-use crate::utils::holder::Holder;
+use crate::utils::fs_utils;
+use crate::utils::holder::{ByteConversionError, Holder};
 use crate::{Blob, InodeAllocator, InodeAssignment};
 use crate::{Inode, StorageError};
 use realize_types::{Arena, ByteRanges, Hash, Path, Peer, UnixTime};
-use redb::ReadableTable;
+use redb::{ReadableTable, Table};
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::{mpsc, watch};
+use uuid::Uuid;
 
 /// A per-arena cache of remote files.
 ///
@@ -27,6 +33,11 @@ pub(crate) struct ArenaCache {
     allocator: Arc<InodeAllocator>,
     blobstore: Arc<Blobstore>,
     dirty_paths: Arc<DirtyPaths>,
+
+    history_tx: watch::Sender<u64>,
+    uuid: Uuid,
+    /// This is just to keep history_tx alive and up-to-date.
+    _history_rx: watch::Receiver<u64>,
 }
 
 impl ArenaCache {
@@ -42,6 +53,15 @@ impl ArenaCache {
         let arena_root = allocator
             .arena_root(arena)
             .ok_or_else(|| StorageError::UnknownArena(arena))?;
+
+        let uuid = load_or_assign_uuid(&db)?;
+        let last_history_index = {
+            let txn = db.begin_read()?;
+            let history_table = txn.index_history_table()?;
+            last_history_index(&history_table)?
+        };
+        let (history_tx, history_rx) = watch::channel(last_history_index);
+
         Ok(Arc::new(Self {
             arena,
             arena_root,
@@ -49,6 +69,9 @@ impl ArenaCache {
             db,
             blobstore,
             dirty_paths,
+            uuid,
+            history_tx,
+            _history_rx: history_rx,
         }))
     }
 
@@ -116,6 +139,7 @@ impl ArenaCache {
         &self,
         peer: Peer,
         notification: Notification,
+        index_root: Option<&std::path::Path>,
     ) -> Result<(), StorageError> {
         log::debug!("notification from {peer}: {notification:?}");
         // UnrealCacheBlocking::update, is responsible for dispatching properly
@@ -164,7 +188,7 @@ impl ArenaCache {
                     do_create_file(&txn, self.arena_root, &path, &|| self.allocate_inode(&txn))?;
 
                 let mut file_table = txn.cache_file_table()?;
-                let entry = FileTableEntry::new(path, size, mtime, hash, parent_inode);
+                let entry = FileTableEntry::new(path, size, mtime, hash.clone(), parent_inode);
                 if let Some(e) = get_file_entry(&file_table, file_inode, None)?
                     && e.content.hash == old_hash
                 {
@@ -179,14 +203,61 @@ impl ArenaCache {
                     // keep that.
                     self.do_write_file_entry(&mut file_table, file_inode, peer, &entry)?;
                 }
+
+                let entry = file_table
+                    .get(FileTableKey::LocalCopy(file_inode))?
+                    .map(|v| v.value().parse().ok())
+                    .flatten();
+                if let Some(mut entry) = entry {
+                    if replaces_local_copy(&entry, &old_hash) {
+                        // Just remember that a newer version exist in
+                        // a remote peer. This information is going to
+                        // be used to download that newer version later on.
+                        entry.outdated_by = Some(hash.clone());
+                        file_table.insert(
+                            FileTableKey::LocalCopy(file_inode),
+                            Holder::with_content(entry)?,
+                        )?;
+                    }
+                }
             }
             Notification::Remove {
                 index,
                 path,
                 old_hash,
                 ..
+            } => {
+                do_update_last_seen_notification(&txn, peer, index)?;
+
+                self.do_unlink(&txn, peer, self.arena_root, &path, old_hash.clone())?;
+
+                if let Some(index_root) = index_root {
+                    let dir_table = txn.cache_directory_table()?;
+                    let inode = match do_lookup_path(&dir_table, self.arena_root, Some(&path)) {
+                        Ok((inode, _)) => Some(inode),
+                        Err(StorageError::NotFound) => None,
+                        Err(err) => {
+                            return Err(err);
+                        }
+                    };
+                    if let Some(inode) = inode {
+                        let file_table = txn.cache_file_table()?;
+                        if let Some(entry) = file_table.get(FileTableKey::LocalCopy(inode))? {
+                            let entry = entry.value().parse()?;
+                            if replaces_local_copy(&entry, &old_hash) {
+                                // This specific version has been removed
+                                // remotely. Make sure that the file hasn't
+                                // changed since it was indexed and if it hasn't,
+                                // remove it locally as well.
+                                if file_matches_index(&entry.into(), index_root, &path) {
+                                    std::fs::remove_file(&path.within(index_root))?;
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            | Notification::Drop {
+            Notification::Drop {
                 index,
                 path,
                 old_hash,
@@ -629,8 +700,425 @@ impl ArenaCache {
         self.allocator
             .allocate_arena_inode(&mut txn.cache_current_inode_range_table()?, self.arena)
     }
+
+    fn get_indexed_file(
+        &self,
+        dir_table: &impl ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
+        file_table: &impl ReadableTable<FileTableKey, Holder<'static, FileTableEntry>>,
+        path: &Path,
+    ) -> Result<Option<IndexedFileTableEntry>, StorageError> {
+        let (inode, assignment) = match do_lookup_path(dir_table, self.arena_root, Some(path)) {
+            Ok(ret) => ret,
+            Err(StorageError::NotFound) => {
+                return Ok(None);
+            }
+            Err(err) => {
+                return Err(err);
+            }
+        };
+        if assignment != InodeAssignment::File {
+            return Err(StorageError::IsADirectory);
+        }
+
+        get_indexed_file_inode(file_table, inode)
+    }
+
+    fn index_file(
+        &self,
+        txn: &ArenaWriteTransaction,
+        path: &realize_types::Path,
+        size: u64,
+        mtime: UnixTime,
+        hash: Hash,
+    ) -> Result<IndexedFileTableEntry, StorageError> {
+        let (parent_inode, file_inode) =
+            do_create_file(&txn, self.arena_root, &path, &|| self.allocate_inode(&txn))?;
+
+        let mut file_table = txn.cache_file_table()?;
+        let mut history_table = txn.index_history_table()?;
+        let old_hash = file_table
+            .get(FileTableKey::LocalCopy(file_inode))?
+            .map(|e| e.value().parse().ok())
+            .flatten()
+            .map(|e| e.content.hash);
+        let same_hash = old_hash.as_ref().map(|h| *h == hash).unwrap_or(false);
+        let entry = FileTableEntry::new(path.clone(), size, mtime, hash, parent_inode);
+        file_table.insert(FileTableKey::LocalCopy(file_inode), Holder::new(&entry)?)?;
+        if !same_hash {
+            (&self.dirty_paths).mark_dirty(txn, path)?;
+            let index = self.allocate_history_index(txn, &history_table)?;
+            let ev = if let Some(old_hash) = old_hash {
+                HistoryTableEntry::Replace(path.clone(), old_hash)
+            } else {
+                HistoryTableEntry::Add(path.clone())
+            };
+            log::debug!("[{}] History #{index}: {ev:?}", self.arena);
+            history_table.insert(index, Holder::with_content(ev)?)?;
+        }
+
+        Ok(entry.into())
+    }
+
+    fn allocate_history_index(
+        &self,
+        txn: &ArenaWriteTransaction,
+        history_table: &impl ReadableTable<u64, Holder<'static, HistoryTableEntry>>,
+    ) -> Result<u64, StorageError> {
+        let entry_index = 1 + last_history_index(history_table)?;
+
+        let history_tx = self.history_tx.clone();
+        txn.after_commit(move || {
+            let _ = history_tx.send(entry_index);
+        });
+        Ok(entry_index)
+    }
+
+    fn report_removed(
+        &self,
+        txn: &ArenaWriteTransaction,
+        history_table: &mut redb::Table<'_, u64, Holder<'static, HistoryTableEntry>>,
+        path: realize_types::Path,
+        hash: Hash,
+    ) -> Result<(), StorageError> {
+        let index = self.allocate_history_index(txn, history_table)?;
+        (&self.dirty_paths).mark_dirty(txn, &path)?;
+        let ev = HistoryTableEntry::Remove(path, hash);
+        log::debug!("[{}] History #{index}: {ev:?}", self.arena);
+        history_table.insert(index, Holder::with_content(ev)?)?;
+        Ok(())
+    }
+
+    fn unindex_file(
+        &self,
+        txn: &ArenaWriteTransaction,
+        file_table: &mut Table<'_, FileTableKey, Holder<'static, FileTableEntry>>,
+        history_table: &mut Table<'_, u64, Holder<'static, HistoryTableEntry>>,
+        inode: Inode,
+    ) -> Result<(), StorageError> {
+        let removed = file_table.remove(FileTableKey::LocalCopy(inode))?;
+        Ok(if let Some(removed) = removed {
+            let entry = removed.value().parse()?;
+            self.report_removed(txn, history_table, entry.content.path, entry.content.hash)?;
+        })
+    }
+
+    fn unindex_dir(
+        &self,
+        txn: &ArenaWriteTransaction,
+        dir_table: &impl ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
+        file_table: &mut Table<'_, FileTableKey, Holder<'static, FileTableEntry>>,
+        history_table: &mut Table<'_, u64, Holder<'static, HistoryTableEntry>>,
+        inode: Inode,
+    ) -> Result<(), StorageError> {
+        for (_, inode, assignment) in do_readdir(dir_table, inode)? {
+            match assignment {
+                InodeAssignment::File => {
+                    self.unindex_file(txn, file_table, history_table, inode)?
+                }
+                InodeAssignment::Directory => {
+                    self.unindex_dir(txn, dir_table, file_table, history_table, inode)?
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
+fn get_indexed_file_inode(
+    file_table: &impl ReadableTable<FileTableKey, Holder<'static, FileTableEntry>>,
+    inode: Inode,
+) -> Result<Option<IndexedFileTableEntry>, StorageError> {
+    match file_table.get(FileTableKey::LocalCopy(inode))? {
+        None => Ok(None),
+        Some(v) => Ok(Some(v.value().parse()?.into())),
+    }
+}
+
+impl RealIndex for ArenaCache {
+    fn uuid(&self) -> &uuid::Uuid {
+        &self.uuid
+    }
+
+    fn arena(&self) -> Arena {
+        self.arena
+    }
+
+    fn watch_history(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.history_tx.subscribe()
+    }
+
+    fn last_history_index(&self) -> Result<u64, StorageError> {
+        let txn = self.db.begin_read()?;
+        let history_table = txn.index_history_table()?;
+
+        last_history_index(&history_table)
+    }
+
+    fn get_file(
+        &self,
+        path: &realize_types::Path,
+    ) -> Result<Option<IndexedFileTableEntry>, StorageError> {
+        let txn = self.db.begin_read()?;
+
+        self.get_file_txn(&txn, path)
+    }
+
+    fn get_file_txn(
+        &self,
+        txn: &super::db::ArenaReadTransaction,
+        path: &realize_types::Path,
+    ) -> Result<Option<IndexedFileTableEntry>, StorageError> {
+        self.get_indexed_file(
+            &txn.cache_directory_table()?,
+            &txn.cache_file_table()?,
+            path,
+        )
+    }
+
+    fn get_indexed_file_txn(
+        &self,
+        txn: &ArenaWriteTransaction,
+        root: &std::path::Path,
+        path: &realize_types::Path,
+        hash: Option<&Hash>,
+    ) -> Result<Option<std::path::PathBuf>, StorageError> {
+        let dir_table = txn.cache_directory_table()?;
+        let file_table = txn.cache_file_table()?;
+        let entry = self.get_indexed_file(&dir_table, &file_table, path)?;
+        match hash {
+            Some(hash) => {
+                if let Some(entry) = entry
+                    && entry.hash == *hash
+                    && file_matches_index(&entry, root, path)
+                {
+                    return Ok(Some(path.within(root)));
+                }
+            }
+            None => {
+                if entry.is_none() && fs_utils::metadata_no_symlink_blocking(root, path).is_err() {
+                    return Ok(Some(path.within(root)));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn has_file(&self, path: &realize_types::Path) -> Result<bool, StorageError> {
+        // TODO: consider optimizing; parsing the final value can be skipped
+
+        Ok(self.get_file(path)?.is_some())
+    }
+
+    fn has_matching_file(
+        &self,
+        path: &realize_types::Path,
+        size: u64,
+        mtime: UnixTime,
+    ) -> Result<bool, StorageError> {
+        Ok(self
+            .get_file(path)?
+            .map(|e| e.size == size && e.mtime == mtime)
+            .unwrap_or(false))
+    }
+
+    fn add_file(
+        &self,
+        path: &realize_types::Path,
+        size: u64,
+        mtime: UnixTime,
+        hash: Hash,
+    ) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        self.index_file(&txn, path, size, mtime, hash)?;
+        txn.commit()?;
+
+        Ok(())
+    }
+
+    fn add_file_if_matches(
+        &self,
+        root: &std::path::Path,
+        path: &realize_types::Path,
+        size: u64,
+        mtime: UnixTime,
+        hash: Hash,
+    ) -> Result<bool, StorageError> {
+        let txn = self.db.begin_write()?;
+        let entry = self.index_file(&txn, path, size, mtime, hash)?;
+        if file_matches_index(&entry, root, path) {
+            txn.commit()?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    fn remove_file_if_missing(
+        &self,
+        root: &std::path::Path,
+        path: &realize_types::Path,
+    ) -> Result<bool, StorageError> {
+        let txn = self.db.begin_write()?;
+        if fs_utils::metadata_no_symlink_blocking(root, path).is_err() {
+            {
+                let path = path.as_ref();
+                let dir_table = txn.cache_directory_table()?;
+                let (parent_inode, parent_assignment) =
+                    do_lookup_path(&dir_table, self.arena_root, path.parent().as_ref())?;
+                if parent_assignment != InodeAssignment::Directory {
+                    return Err(StorageError::NotADirectory);
+                }
+
+                let (inode, assignment) = get_dir_entry(&dir_table, parent_inode, path.name())?
+                    .ok_or(StorageError::NotFound)?;
+                if assignment != InodeAssignment::File {
+                    return Err(StorageError::IsADirectory);
+                }
+
+                let mut file_table = txn.cache_file_table()?;
+                let mut history_table = txn.index_history_table()?;
+                self.unindex_file(&txn, &mut file_table, &mut history_table, inode)?;
+            }
+            txn.commit()?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    fn all_files(
+        &self,
+        tx: mpsc::Sender<(realize_types::Path, IndexedFileTableEntry)>,
+    ) -> Result<(), StorageError> {
+        let txn = self.db.begin_read()?;
+        let file_table = txn.cache_file_table()?;
+        for (path, entry) in file_table
+            .iter()?
+            .flatten()
+            // Skip any entry with errors
+            .flat_map(|(k, v)| {
+                if let FileTableKey::LocalCopy(_) = k.value() {
+                    if let Ok(entry) = v.value().parse() {
+                        let path = entry.content.path.clone();
+                        return Some((path, IndexedFileTableEntry::from(entry)));
+                    }
+                }
+
+                None
+            })
+        {
+            if let Err(_) = tx.blocking_send((path, entry)) {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn history(
+        &self,
+        range: Range<u64>,
+        tx: mpsc::Sender<Result<(u64, HistoryTableEntry), StorageError>>,
+    ) -> Result<(), StorageError> {
+        let txn = self.db.begin_read()?;
+        let history_table = txn.index_history_table()?;
+        for res in history_table.range(range)?.map(|res| match res {
+            Err(err) => Err(StorageError::from(err)),
+            Ok((k, v)) => match v.value().parse() {
+                Ok(v) => Ok((k.value(), v)),
+                Err(err) => Err(StorageError::from(err)),
+            },
+        }) {
+            if let Err(_) = tx.blocking_send(res) {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn remove_file_or_dir(&self, path: &realize_types::Path) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let dir_table = txn.cache_directory_table()?;
+            let (inode, assignment) = match do_lookup_path(&dir_table, self.arena_root, Some(path))
+            {
+                Ok(ret) => ret,
+                Err(StorageError::NotFound) => {
+                    return Ok(());
+                }
+                Err(err) => {
+                    return Err(err);
+                }
+            };
+            let mut file_table = txn.cache_file_table()?;
+            let mut history_table = txn.index_history_table()?;
+            match assignment {
+                InodeAssignment::File => {
+                    self.unindex_file(&txn, &mut file_table, &mut history_table, inode)?
+                }
+                InodeAssignment::Directory => {
+                    self.unindex_dir(&txn, &dir_table, &mut file_table, &mut history_table, inode)?
+                }
+            }
+        }
+        txn.commit()?;
+
+        Ok(())
+    }
+
+    fn drop_file_if_matches(
+        &self,
+        txn: &ArenaWriteTransaction,
+        root: &std::path::Path,
+        path: &realize_types::Path,
+        hash: &Hash,
+    ) -> Result<bool, StorageError> {
+        let dir_table = txn.cache_directory_table()?;
+        let (inode, assignment) = match do_lookup_path(&dir_table, self.arena_root, Some(path)) {
+            Ok(ret) => ret,
+            Err(StorageError::NotFound) => {
+                return Ok(true);
+            }
+            Err(err) => {
+                return Err(err);
+            }
+        };
+        if assignment != InodeAssignment::File {
+            return Err(StorageError::IsADirectory);
+        }
+
+        let mut file_table = txn.cache_file_table()?;
+        let mut history_table = txn.index_history_table()?;
+        if let Some(entry) = get_indexed_file_inode(&file_table, inode)?
+            && entry.hash == *hash
+            && file_matches_index(&entry.into(), root, path)
+        {
+            file_table.remove(FileTableKey::LocalCopy(inode))?;
+
+            let index = self.allocate_history_index(&txn, &history_table)?;
+            (&self.dirty_paths).mark_dirty(&txn, &path)?;
+            let ev = HistoryTableEntry::Drop(path.clone(), hash.clone());
+            log::debug!("[{}] History #{index}: {ev:?}", self.arena);
+            history_table.insert(index, Holder::with_content(ev)?)?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    fn update(
+        &self,
+        _notification: &Notification,
+        _root: &std::path::Path,
+    ) -> Result<(), StorageError> {
+        // This now happens in on the ArenaCache side.
+        // TODO:remove this method once ArenaCache and index have been fully merged.
+        Ok(())
+    }
+}
 /// Mark files within the cache dirty.
 ///
 /// If the inode is a file in the cache, it is marked dirty.
@@ -884,8 +1372,6 @@ fn do_file_availability(
     })
 }
 
-/// Write an entry in the file table, overwriting any existing one.
-
 /// Retrieve or create a file entry at the given path.
 ///
 /// Return the parent inode and the file inode.
@@ -1055,6 +1541,55 @@ fn do_unmark_peer_file(
     Ok(())
 }
 
+fn load_or_assign_uuid(db: &Arc<ArenaDatabase>) -> Result<Uuid, StorageError> {
+    let txn = db.begin_write()?;
+    let mut settings_table = txn.index_settings_table()?;
+    if let Some(value) = settings_table.get("uuid")? {
+        let bytes: uuid::Bytes = value
+            .value()
+            .try_into()
+            .map_err(|_| ByteConversionError::Invalid("uuid"))?;
+
+        Ok(Uuid::from_bytes(bytes))
+    } else {
+        let uuid = Uuid::now_v7();
+        let bytes: &[u8] = uuid.as_bytes();
+        settings_table.insert("uuid", &bytes)?;
+        drop(settings_table);
+        txn.commit()?;
+
+        Ok(uuid)
+    }
+}
+
+fn last_history_index(
+    history_table: &impl redb::ReadableTable<u64, Holder<'static, HistoryTableEntry>>,
+) -> Result<u64, StorageError> {
+    Ok(history_table.last()?.map(|(k, _)| k.value()).unwrap_or(0))
+}
+
+fn file_matches_index(
+    entry: &IndexedFileTableEntry,
+    root: &std::path::Path,
+    path: &realize_types::Path,
+) -> bool {
+    if let Ok(m) = fs_utils::metadata_no_symlink_blocking(root, path) {
+        UnixTime::mtime(&m) == entry.mtime && m.len() == entry.size
+    } else {
+        false
+    }
+}
+
+/// Check whether replacing `old_hash` replaces `entry`
+fn replaces_local_copy(entry: &FileTableEntry, old_hash: &Hash) -> bool {
+    entry.content.hash == *old_hash
+        || entry
+            .outdated_by
+            .as_ref()
+            .map(|h| *h == *old_hash)
+            .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1180,6 +1715,7 @@ mod tests {
                     size,
                     hash: test_hash(),
                 },
+                None,
             )?;
 
             Ok(())
@@ -1198,6 +1734,7 @@ mod tests {
                     path: path.clone(),
                     old_hash: test_hash(),
                 },
+                None,
             )?;
 
             Ok(())
@@ -1269,6 +1806,7 @@ mod tests {
                 size: 100,
                 hash: test_hash(),
             },
+            None,
         )?;
         acache.update(
             peer,
@@ -1281,6 +1819,7 @@ mod tests {
                 hash: Hash([2u8; 32]),
                 old_hash: test_hash(),
             },
+            None,
         )?;
 
         let (inode, _) = acache.lookup_path(&file_path)?;
@@ -1309,6 +1848,7 @@ mod tests {
                 size: 100,
                 hash: test_hash(),
             },
+            None,
         )?;
         fixture.clear_dirty()?;
 
@@ -1323,6 +1863,7 @@ mod tests {
                 hash: Hash([2u8; 32]),
                 old_hash: test_hash(),
             },
+            None,
         )?;
         assert!(engine::is_dirty(&fixture.begin_read()?, &file_path)?);
 
@@ -1347,6 +1888,7 @@ mod tests {
                 size: 100,
                 hash: Hash([1u8; 32]),
             },
+            None,
         )?;
         fixture.clear_dirty()?;
 
@@ -1362,6 +1904,7 @@ mod tests {
                 hash: Hash([3u8; 32]),
                 old_hash: Hash([2u8; 32]),
             },
+            None,
         )?;
         assert!(!engine::is_dirty(&fixture.begin_read()?, &file_path)?);
 
@@ -1401,6 +1944,7 @@ mod tests {
                 size: 100,
                 hash: Hash([1u8; 32]),
             },
+            None,
         )?;
         acache.update(
             peer,
@@ -1413,6 +1957,7 @@ mod tests {
                 hash: Hash([2u8; 32]),
                 old_hash: Hash([0xffu8; 32]), // wrong
             },
+            None,
         )?;
 
         let (inode, _) = acache.lookup_path(&file_path)?;
@@ -1493,6 +2038,7 @@ mod tests {
                 path: file_path.clone(),
                 old_hash: Hash([2u8; 32]), // != test_hash()
             },
+            None,
         )?;
 
         // File should still exist because wrong hash was provided
@@ -1619,6 +2165,7 @@ mod tests {
                 size: 100,
                 hash: Hash([1u8; 32]),
             },
+            None,
         )?;
         acache.update(
             peer2,
@@ -1630,6 +2177,7 @@ mod tests {
                 size: 100,
                 hash: Hash([1u8; 32]),
             },
+            None,
         )?;
         acache.update(
             peer2,
@@ -1642,6 +2190,7 @@ mod tests {
                 hash: Hash([2u8; 32]),
                 old_hash: Hash([1u8; 32]),
             },
+            None,
         )?;
 
         let (inode, _) = acache.lookup(acache.arena_root, "file.txt")?;
@@ -1673,6 +2222,7 @@ mod tests {
                 size: 100,
                 hash: Hash([1u8; 32]),
             },
+            None,
         )?;
         acache.update(
             b,
@@ -1684,6 +2234,7 @@ mod tests {
                 size: 100,
                 hash: Hash([1u8; 32]),
             },
+            None,
         )?;
         acache.update(
             c,
@@ -1695,6 +2246,7 @@ mod tests {
                 size: 200,
                 hash: Hash([2u8; 32]),
             },
+            None,
         )?;
         let (inode, _) = acache.lookup(acache.arena_root(), "file.txt")?;
         let avail = acache.file_availability(inode)?;
@@ -1736,6 +2288,7 @@ mod tests {
                 size: 100,
                 hash: Hash([1u8; 32]),
             },
+            None,
         )?;
         acache.update(
             b,
@@ -1747,6 +2300,7 @@ mod tests {
                 size: 100,
                 hash: Hash([1u8; 32]),
             },
+            None,
         )?;
         acache.update(
             c,
@@ -1758,6 +2312,7 @@ mod tests {
                 size: 100,
                 hash: Hash([1u8; 32]),
             },
+            None,
         )?;
         acache.update(
             b,
@@ -1770,6 +2325,7 @@ mod tests {
                 hash: Hash([2u8; 32]),
                 old_hash: Hash([1u8; 32]),
             },
+            None,
         )?;
         let (inode, _) = acache.lookup(acache.arena_root, "file.txt")?;
         let avail = acache.file_availability(inode)?;
@@ -1799,6 +2355,7 @@ mod tests {
                 hash: Hash([3u8; 32]),
                 old_hash: Hash([1u8; 32]),
             },
+            None,
         )?;
         acache.update(
             c,
@@ -1811,6 +2368,7 @@ mod tests {
                 hash: Hash([3u8; 32]),
                 old_hash: Hash([2u8; 32]),
             },
+            None,
         )?;
         let acache = &fixture.acache;
         let avail = acache.file_availability(inode)?;
@@ -1829,6 +2387,7 @@ mod tests {
                 hash: Hash([3u8; 32]),
                 old_hash: Hash([3u8; 32]),
             },
+            None,
         )?;
 
         let avail = acache.file_availability(inode)?;
@@ -1859,6 +2418,7 @@ mod tests {
                 size: 100,
                 hash: Hash([1u8; 32]),
             },
+            None,
         )?;
         acache.update(
             b,
@@ -1870,6 +2430,7 @@ mod tests {
                 size: 100,
                 hash: Hash([1u8; 32]),
             },
+            None,
         )?;
         acache.update(
             c,
@@ -1881,6 +2442,7 @@ mod tests {
                 size: 100,
                 hash: Hash([2u8; 32]),
             },
+            None,
         )?;
         acache.update(
             a,
@@ -1893,19 +2455,21 @@ mod tests {
                 hash: Hash([3u8; 32]),
                 old_hash: Hash([1u8; 32]),
             },
+            None,
         )?;
         let (inode, _) = acache.lookup(acache.arena_root, "file.txt")?;
         let avail = acache.file_availability(inode)?;
         assert_eq!(vec![a], avail.peers);
         assert_eq!(Hash([3u8; 32]), avail.hash);
 
-        acache.update(a, Notification::CatchupStart(arena))?;
+        acache.update(a, Notification::CatchupStart(arena), None)?;
         acache.update(
             a,
             Notification::CatchupComplete {
                 arena: arena,
                 index: 0,
             },
+            None,
         )?;
         // All entries from A are now lost! We've lost the single peer
         // that has the selected version.
@@ -1948,6 +2512,7 @@ mod tests {
                 size: 10,
                 hash: test_hash(),
             },
+            None,
         )?;
 
         acache.update(
@@ -1960,6 +2525,7 @@ mod tests {
                 size: 10,
                 hash: test_hash(),
             },
+            None,
         )?;
         acache.update(
             peer2,
@@ -1971,6 +2537,7 @@ mod tests {
                 size: 10,
                 hash: test_hash(),
             },
+            None,
         )?;
 
         acache.update(
@@ -1983,6 +2550,7 @@ mod tests {
                 size: 10,
                 hash: test_hash(),
             },
+            None,
         )?;
         acache.update(
             peer2,
@@ -1994,6 +2562,7 @@ mod tests {
                 size: 10,
                 hash: test_hash(),
             },
+            None,
         )?;
         acache.update(
             peer3,
@@ -2005,6 +2574,7 @@ mod tests {
                 size: 10,
                 hash: test_hash(),
             },
+            None,
         )?;
 
         acache.update(
@@ -2017,10 +2587,11 @@ mod tests {
                 size: 10,
                 hash: test_hash(),
             },
+            None,
         )?;
 
         // Simulate a catchup that only reports file2 and file4.
-        acache.update(peer1, Notification::CatchupStart(arena))?;
+        acache.update(peer1, Notification::CatchupStart(arena), None)?;
         acache.update(
             peer1,
             Notification::Catchup {
@@ -2030,6 +2601,7 @@ mod tests {
                 mtime: mtime.clone(),
                 hash: test_hash(),
             },
+            None,
         )?;
         acache.update(
             peer1,
@@ -2040,6 +2612,7 @@ mod tests {
                 mtime: mtime.clone(),
                 hash: test_hash(),
             },
+            None,
         )?;
         acache.update(
             peer1,
@@ -2047,6 +2620,7 @@ mod tests {
                 arena: arena,
                 index: 0,
             },
+            None,
         )?;
 
         // File1 should have been deleted, since it was only on peer1,

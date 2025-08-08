@@ -336,6 +336,7 @@ mod tests {
                     size,
                     hash: hash.clone(),
                 },
+                None,
             )?;
 
             Ok(())

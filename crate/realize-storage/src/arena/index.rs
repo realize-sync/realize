@@ -435,37 +435,40 @@ impl RealIndex for RealIndexBlocking {
     }
 }
 
+fn load_or_assign_uuid(db: &Arc<ArenaDatabase>) -> Result<Uuid, StorageError> {
+    let txn = db.begin_write()?;
+    let mut settings_table = txn.index_settings_table()?;
+    if let Some(value) = settings_table.get("uuid")? {
+        let bytes: uuid::Bytes = value
+            .value()
+            .try_into()
+            .map_err(|_| ByteConversionError::Invalid("uuid"))?;
+
+        Ok(Uuid::from_bytes(bytes))
+    } else {
+        let uuid = Uuid::now_v7();
+        let bytes: &[u8] = uuid.as_bytes();
+        settings_table.insert("uuid", &bytes)?;
+        drop(settings_table);
+        txn.commit()?;
+
+        Ok(uuid)
+    }
+}
+
 impl RealIndexBlocking {
     pub fn new(
         arena: Arena,
         db: Arc<ArenaDatabase>,
         dirty_paths: Arc<DirtyPaths>,
     ) -> Result<Arc<Self>, StorageError> {
-        let index: u64;
-        let uuid: Uuid;
-        {
-            let txn = db.begin_write()?;
-            {
-                txn.index_file_table()?;
-                let history_table = txn.index_history_table()?;
-                index = last_history_index(&history_table)?;
-            }
-            {
-                let mut settings_table = txn.index_settings_table()?;
-                if let Some(value) = settings_table.get("uuid")? {
-                    let bytes: uuid::Bytes = value
-                        .value()
-                        .try_into()
-                        .map_err(|_| ByteConversionError::Invalid("uuid"))?;
-                    uuid = Uuid::from_bytes(bytes);
-                } else {
-                    uuid = Uuid::now_v7();
-                    let bytes: &[u8] = uuid.as_bytes();
-                    settings_table.insert("uuid", &bytes)?;
-                }
-            }
-            txn.commit()?;
-        }
+        let uuid = load_or_assign_uuid(&db)?;
+
+        let index = {
+            let txn = db.begin_read()?;
+            let history_table = txn.index_history_table()?;
+            last_history_index(&history_table)?
+        };
 
         let (history_tx, history_rx) = watch::channel(index);
 

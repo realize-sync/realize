@@ -287,7 +287,7 @@ mod tests {
                 hash: Hash([2; 32]),
             };
 
-            self.acache.update(test_peer, notification)?;
+            self.acache.update(test_peer, notification, None)?;
             Ok(())
         }
     }

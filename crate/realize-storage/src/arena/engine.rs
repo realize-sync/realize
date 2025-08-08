@@ -1031,7 +1031,7 @@ mod tests {
 
         fn update_cache(&self, notification: Notification) -> anyhow::Result<()> {
             let test_peer = Peer::from("other");
-            self.acache.update(test_peer, notification)?;
+            self.acache.update(test_peer, notification, None)?;
             Ok(())
         }
 

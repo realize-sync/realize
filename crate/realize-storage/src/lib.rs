@@ -116,7 +116,9 @@ impl Storage {
             }
         }
         let cache = Arc::clone(&arena_storage.cache);
-        task::spawn_blocking(move || cache.update(peer, notification)).await??;
+        let index_root = arena_storage.indexed.as_ref().map(|i| i.root.to_path_buf());
+        task::spawn_blocking(move || cache.update(peer, notification, index_root.as_deref()))
+            .await??;
 
         Ok(())
     }

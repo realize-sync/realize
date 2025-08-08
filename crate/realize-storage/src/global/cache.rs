@@ -166,7 +166,7 @@ impl UnrealCacheBlocking {
     ) -> Result<(), StorageError> {
         let arena = notification.arena();
         let cache = self.arena_cache(arena)?;
-        cache.update(peer, notification)
+        cache.update(peer, notification, None)
     }
 
     fn add_arena_root(&mut self, arena: Arena, arena_root: Inode) -> anyhow::Result<()> {

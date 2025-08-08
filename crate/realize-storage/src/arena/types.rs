@@ -243,6 +243,26 @@ pub struct IndexedFileTableEntry {
     pub outdated_by: Option<Hash>,
 }
 
+impl From<FileTableEntry> for IndexedFileTableEntry {
+    fn from(value: FileTableEntry) -> Self {
+        IndexedFileTableEntry {
+            hash: value.content.hash,
+            mtime: value.metadata.mtime,
+            size: value.metadata.size,
+            outdated_by: value.outdated_by,
+        }
+    }
+}
+impl From<&FileTableEntry> for IndexedFileTableEntry {
+    fn from(value: &FileTableEntry) -> Self {
+        IndexedFileTableEntry {
+            hash: value.content.hash.clone(),
+            mtime: value.metadata.mtime,
+            size: value.metadata.size,
+            outdated_by: value.outdated_by.clone(),
+        }
+    }
+}
 impl NamedType for IndexedFileTableEntry {
     fn typename() -> &'static str {
         "index.file"
