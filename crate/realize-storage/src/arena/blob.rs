@@ -150,12 +150,7 @@ impl Blobstore {
     ) -> Result<(), StorageError> {
         let mut blob_table = txn.blob_table()?;
         let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
-        let removed = blob_table.remove(blob_id)?;
-        let removed_entry = removed.map(|r| r.value().parse());
-        if let Some(entry) = removed_entry {
-            let entry = entry?;
-            remove_from_queue(&mut blob_lru_queue_table, &mut blob_table, &entry)?;
-        }
+        remove_blob_entry(&mut blob_table, &mut blob_lru_queue_table, blob_id)?;
 
         let blob_path = self.blob_path(blob_id);
         if blob_path.exists() {
@@ -282,7 +277,8 @@ impl Blobstore {
             return Ok(false);
         }
 
-        blob_table.remove(blob_id)?;
+        let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
+        remove_blob_entry(&mut blob_table, &mut blob_lru_queue_table, blob_id)?;
         std::fs::rename(self.blob_path(blob_id), dest)?;
 
         Ok(true)
@@ -385,6 +381,19 @@ impl Blobstore {
 
         Ok(())
     }
+}
+
+fn remove_blob_entry(
+    blob_table: &mut redb::Table<'_, BlobId, Holder<'static, BlobTableEntry>>,
+    blob_lru_queue_table: &mut redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
+    blob_id: BlobId,
+) -> Result<(), StorageError> {
+    let removed = blob_table.remove(blob_id)?;
+    let removed_entry = removed.map(|r| r.value().parse());
+    Ok(if let Some(entry) = removed_entry {
+        let entry = entry?;
+        remove_from_queue(blob_lru_queue_table, blob_table, &entry)?;
+    })
 }
 
 fn update_total_disk_usage(
@@ -1550,6 +1559,13 @@ mod tests {
         // Verify the content was moved correctly
         let moved_content = std::fs::read_to_string(&dest_path)?;
         assert_eq!("test content", moved_content.trim_end_matches('\0'));
+
+        // Verify the LRU queue has been updated properly.
+        assert!(
+            fixture
+                .list_queue_content(LruQueueId::WorkingArea)?
+                .is_empty()
+        );
 
         Ok(())
     }
