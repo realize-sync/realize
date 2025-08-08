@@ -1,7 +1,7 @@
 #![allow(dead_code)] // work in progress
 
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
-use super::index;
+use super::index::RealIndex;
 use super::types::{FailedJobTableEntry, LocalAvailability, RetryJob};
 use crate::arena::arena_cache;
 use crate::arena::blob;
@@ -144,6 +144,7 @@ pub struct Engine {
     arena: Arena,
     db: Arc<ArenaDatabase>,
     dirty_paths: Arc<DirtyPaths>,
+    index: Option<Arc<dyn RealIndex>>,
     arena_root: Inode,
     job_retry_strategy: Box<dyn (Fn(u32) -> Option<Duration>) + Sync + Send + 'static>,
 
@@ -160,6 +161,7 @@ impl Engine {
     pub(crate) fn new(
         arena: Arena,
         db: Arc<ArenaDatabase>,
+        index: Option<Arc<dyn RealIndex>>,
         dirty_paths: Arc<DirtyPaths>,
         arena_root: Inode,
         job_retry_strategy: impl (Fn(u32) -> Option<Duration>) + Sync + Send + 'static,
@@ -169,6 +171,7 @@ impl Engine {
         Arc::new(Self {
             arena,
             db,
+            index,
             dirty_paths,
             arena_root,
             job_retry_strategy: Box::new(job_retry_strategy),
@@ -546,7 +549,7 @@ impl Engine {
             Mark::Watch => {
                 if let (Ok(cached), Ok(Some(indexed))) = (
                     arena_cache::get_file_entry_for_path(txn, self.arena_root, &path),
-                    index::get_file_entry(txn, &path),
+                    self.get_indexed_file(txn, &path),
                 ) && cached.content.hash == indexed.hash
                 {
                     return Ok(Some((
@@ -559,7 +562,7 @@ impl Engine {
                 if let Ok(cached) =
                     arena_cache::get_file_entry_for_path(txn, self.arena_root, &path)
                 {
-                    if let Ok(Some(indexed)) = index::get_file_entry(txn, &path)
+                    if let Ok(Some(indexed)) = self.get_indexed_file(txn, &path)
                         && cached.content.hash == indexed.hash
                     {
                         return Ok(Some((
@@ -581,7 +584,7 @@ impl Engine {
                 if let Ok(cached) =
                     arena_cache::get_file_entry_for_path(txn, self.arena_root, &path)
                 {
-                    let from_index = index::get_file_entry(txn, &path).ok().flatten();
+                    let from_index = self.get_indexed_file(txn, &path)?;
                     if from_index.is_none() {
                         // File is missing from the index, move it there.
                         return Ok(Some((
@@ -606,6 +609,17 @@ impl Engine {
         };
 
         Ok(None)
+    }
+
+    fn get_indexed_file(
+        &self,
+        txn: &ArenaReadTransaction,
+        path: &Path,
+    ) -> Result<Option<super::types::IndexedFileTableEntry>, StorageError> {
+        self.index
+            .as_ref()
+            .map(|i| i.get_file_txn(txn, &path))
+            .unwrap_or(Ok(None))
     }
 
     fn delete_range(&self, beg: u64, end: u64) -> Result<(), StorageError> {
@@ -781,10 +795,7 @@ where
 }
 
 /// Check whether a path is dirty and if it is return its dirty mark counter.
-pub(crate) fn get_dirty<T>(
-    txn: &ArenaReadTransaction,
-    path: T,
-) -> Result<Option<u64>, StorageError>
+pub(crate) fn get_dirty<T>(txn: &ArenaReadTransaction, path: T) -> Result<Option<u64>, StorageError>
 where
     T: AsRef<Path>,
 {
@@ -920,6 +931,7 @@ mod tests {
             let engine = Engine::new(
                 arena,
                 Arc::clone(&db),
+                Some(index.clone()),
                 Arc::clone(&dirty_paths),
                 arena_root,
                 |attempt| {

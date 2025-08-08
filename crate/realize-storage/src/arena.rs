@@ -88,6 +88,7 @@ impl ArenaStorage {
         let engine = Engine::new(
             arena,
             Arc::clone(&db),
+            indexed.as_ref().map(|indexed| indexed.index.blocking()),
             Arc::clone(&dirty_paths),
             arena_root,
             job_retry_strategy,
@@ -131,10 +132,11 @@ impl ArenaStorage {
         let cache_hash = cache_hash.clone();
         let index_hash = index_hash.cloned();
         let db = Arc::clone(&self.db);
+        let index = indexed.index.blocking();
         let done = task::spawn_blocking(move || {
             let txn = db.begin_write()?;
             if let Some(realpath) =
-                index::get_indexed_file(&txn, &root, &path, index_hash.as_ref())?
+                index.get_indexed_file_txn(&txn, &root, &path, index_hash.as_ref())?
             {
                 if cache.move_blob_if_matches(&txn, &path, &cache_hash, &realpath)? {
                     txn.commit()?;
@@ -165,14 +167,14 @@ impl ArenaStorage {
 
         let arena = self.arena;
         let cache = self.cache.clone();
-        let index = indexed.index.blocking().clone();
+        let index = indexed.index.blocking();
         let root = indexed.root.clone();
         let path = path.clone();
         let hash = hash.clone();
         let db = Arc::clone(&self.db);
         let done = task::spawn_blocking(move || {
             let txn = db.begin_write()?;
-            if let Some(realpath) = index::get_indexed_file(&txn, &root, &path, Some(&hash))? {
+            if let Some(realpath) = index.get_indexed_file_txn(&txn, &root, &path, Some(&hash))? {
                 if let Some(cachepath) = cache.move_into_blob_if_matches(&txn, &path, &hash)? {
                     // drop_file_if_matches makes a second check of
                     // the file mtime and size just before renaming,

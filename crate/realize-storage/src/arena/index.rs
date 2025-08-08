@@ -1,6 +1,6 @@
 #![allow(dead_code)] // work in progress
 
-use super::db::{ArenaDatabase, ArenaWriteTransaction};
+use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
 use super::types::{HistoryTableEntry, IndexedFileTableEntry};
 use crate::arena::engine::DirtyPaths;
 use crate::utils::fs_utils;
@@ -42,6 +42,20 @@ pub trait RealIndex: Send + Sync {
         &self,
         path: &realize_types::Path,
     ) -> Result<Option<IndexedFileTableEntry>, StorageError>;
+
+    fn get_file_txn(
+        &self,
+        txn: &super::db::ArenaReadTransaction,
+        path: &realize_types::Path,
+    ) -> Result<Option<IndexedFileTableEntry>, StorageError>;
+
+    fn get_indexed_file_txn(
+        &self,
+        txn: &ArenaWriteTransaction,
+        root: &std::path::Path,
+        path: &realize_types::Path,
+        hash: Option<&Hash>,
+    ) -> Result<Option<std::path::PathBuf>, StorageError>;
 
     /// Check whether a given file is in the index already.
     fn has_file(&self, path: &realize_types::Path) -> Result<bool, StorageError>;
@@ -154,6 +168,14 @@ impl RealIndex for RealIndexBlocking {
     ) -> Result<Option<IndexedFileTableEntry>, StorageError> {
         let txn = self.db.begin_read()?;
         get_file_entry(&txn, path)
+    }
+
+    fn get_file_txn(
+        &self,
+        txn: &ArenaReadTransaction,
+        path: &realize_types::Path,
+    ) -> Result<Option<IndexedFileTableEntry>, StorageError> {
+        get_file_entry(txn, path)
     }
 
     fn has_file(&self, path: &realize_types::Path) -> Result<bool, StorageError> {
@@ -381,6 +403,35 @@ impl RealIndex for RealIndexBlocking {
         };
 
         Ok(())
+    }
+
+    fn get_indexed_file_txn(
+        &self,
+        txn: &ArenaWriteTransaction,
+        root: &std::path::Path,
+        path: &realize_types::Path,
+        hash: Option<&Hash>,
+    ) -> Result<Option<std::path::PathBuf>, StorageError> {
+        let file_table = txn.index_file_table()?;
+        match hash {
+            Some(hash) => {
+                if let Some(entry) = do_get_file_entry(&file_table, path)?
+                    && entry.hash == *hash
+                    && file_matches_index(&entry, root, path)
+                {
+                    return Ok(Some(path.within(root)));
+                }
+            }
+            None => {
+                if !file_table.get(path.as_str())?.is_some()
+                    && fs_utils::metadata_no_symlink_blocking(root, path).is_err()
+                {
+                    return Ok(Some(path.within(root)));
+                }
+            }
+        }
+
+        Ok(None)
     }
 }
 
@@ -789,34 +840,6 @@ impl RealIndexBlocking {
     }
 }
 
-pub(crate) fn get_indexed_file(
-    txn: &ArenaWriteTransaction,
-    root: &std::path::Path,
-    path: &realize_types::Path,
-    hash: Option<&Hash>,
-) -> Result<Option<std::path::PathBuf>, StorageError> {
-    let file_table = txn.index_file_table()?;
-    match hash {
-        Some(hash) => {
-            if let Some(entry) = do_get_file_entry(&file_table, path)?
-                && entry.hash == *hash
-                && file_matches_index(&entry, root, path)
-            {
-                return Ok(Some(path.within(root)));
-            }
-        }
-        None => {
-            if !file_table.get(path.as_str())?.is_some()
-                && fs_utils::metadata_no_symlink_blocking(root, path).is_err()
-            {
-                return Ok(Some(path.within(root)));
-            }
-        }
-    }
-
-    Ok(None)
-}
-
 fn file_matches_index(
     entry: &IndexedFileTableEntry,
     root: &std::path::Path,
@@ -839,22 +862,13 @@ fn replaces(entry: &IndexedFileTableEntry, old_hash: &Hash) -> bool {
             .unwrap_or(false)
 }
 
-pub(crate) fn get_file_entry(
+fn get_file_entry(
     txn: &super::db::ArenaReadTransaction,
     path: &realize_types::Path,
 ) -> Result<Option<IndexedFileTableEntry>, StorageError> {
     let file_table = txn.index_file_table()?;
 
     do_get_file_entry(&file_table, path)
-}
-
-pub(crate) fn has_file_entry(
-    txn: &super::db::ArenaReadTransaction,
-    path: &realize_types::Path,
-) -> Result<bool, StorageError> {
-    let file_table = txn.index_file_table()?;
-
-    Ok(file_table.get(path.as_str())?.is_some())
 }
 
 fn do_get_file_entry(
@@ -2610,7 +2624,9 @@ mod tests {
         let (path, hash) = fixture.add_file_with_content("test.txt", "test content")?;
 
         let txn = fixture.db.begin_write()?;
-        let result = get_indexed_file(&txn, root.path(), &path, Some(&hash))?;
+        let result = fixture
+            .index
+            .get_indexed_file_txn(&txn, root.path(), &path, Some(&hash))?;
         assert_eq!(result, Some(root.child("test.txt").path().to_path_buf()));
 
         Ok(())
@@ -2624,7 +2640,10 @@ mod tests {
         let wrong_hash = hash::digest("different content");
 
         let txn = fixture.db.begin_write()?;
-        let result = get_indexed_file(&txn, root.path(), &path, Some(&wrong_hash))?;
+        let result =
+            fixture
+                .index
+                .get_indexed_file_txn(&txn, root.path(), &path, Some(&wrong_hash))?;
         assert_eq!(result, None);
 
         Ok(())
@@ -2638,7 +2657,9 @@ mod tests {
         let hash = hash::digest("some content");
 
         let txn = fixture.db.begin_write()?;
-        let result = get_indexed_file(&txn, root.path(), &path, Some(&hash))?;
+        let result = fixture
+            .index
+            .get_indexed_file_txn(&txn, root.path(), &path, Some(&hash))?;
         assert_eq!(result, None);
 
         Ok(())
@@ -2660,7 +2681,9 @@ mod tests {
             .write_str("modified content!")?;
 
         let txn = fixture.db.begin_write()?;
-        let result = get_indexed_file(&txn, root.path(), &path, Some(&hash))?;
+        let result = fixture
+            .index
+            .get_indexed_file_txn(&txn, root.path(), &path, Some(&hash))?;
         assert_eq!(result, None);
 
         Ok(())
@@ -2676,7 +2699,9 @@ mod tests {
         std::fs::remove_file(root.child("test.txt").path())?;
 
         let txn = fixture.db.begin_write()?;
-        let result = get_indexed_file(&txn, root.path(), &path, Some(&hash))?;
+        let result = fixture
+            .index
+            .get_indexed_file_txn(&txn, root.path(), &path, Some(&hash))?;
         assert_eq!(result, None);
 
         Ok(())
@@ -2689,7 +2714,9 @@ mod tests {
         let path = realize_types::Path::parse("does_not_exist.txt")?;
 
         let txn = fixture.db.begin_write()?;
-        let result = get_indexed_file(&txn, root.path(), &path, None)?;
+        let result = fixture
+            .index
+            .get_indexed_file_txn(&txn, root.path(), &path, None)?;
         assert_eq!(
             result,
             Some(root.child("does_not_exist.txt").path().to_path_buf())
@@ -2705,7 +2732,9 @@ mod tests {
         let (path, _) = fixture.add_file_with_content("test.txt", "test content")?;
 
         let txn = fixture.db.begin_write()?;
-        let result = get_indexed_file(&txn, root.path(), &path, None)?;
+        let result = fixture
+            .index
+            .get_indexed_file_txn(&txn, root.path(), &path, None)?;
         assert_eq!(result, None);
 
         Ok(())
@@ -2722,7 +2751,9 @@ mod tests {
         root.child("fs_only.txt").write_str("fs only content")?;
 
         let txn = fixture.db.begin_write()?;
-        let result = get_indexed_file(&txn, root.path(), &path, None)?;
+        let result = fixture
+            .index
+            .get_indexed_file_txn(&txn, root.path(), &path, None)?;
         assert_eq!(result, None);
 
         Ok(())
@@ -2745,7 +2776,9 @@ mod tests {
         )?;
 
         let txn = fixture.db.begin_write()?;
-        let result = get_indexed_file(&txn, root.path(), &path, Some(&hash))?;
+        let result = fixture
+            .index
+            .get_indexed_file_txn(&txn, root.path(), &path, Some(&hash))?;
         assert_eq!(result, None);
 
         Ok(())
