@@ -862,7 +862,7 @@ mod tests {
     use crate::Notification;
     use crate::arena::arena_cache::ArenaCache;
     use crate::arena::index::RealIndex;
-    use crate::arena::mark::PathMarks;
+    use crate::arena::mark::{PathMarks, PathMarksImpl};
     use crate::utils::redb_utils;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
@@ -899,7 +899,7 @@ mod tests {
         dirty_paths: Arc<DirtyPaths>,
         acache: Arc<ArenaCache>,
         index: Arc<dyn RealIndex>,
-        pathmarks: PathMarks,
+        pathmarks: PathMarksImpl,
         engine: Arc<Engine>,
         arena_path: PathBuf,
         _tempdir: TempDir,
@@ -927,7 +927,8 @@ mod tests {
             )?;
             let arena_root = acache.arena_root();
             let index = acache.as_index();
-            let pathmarks = PathMarks::new(Arc::clone(&db), arena_root, Arc::clone(&dirty_paths))?;
+            let pathmarks =
+                PathMarksImpl::new(Arc::clone(&db), arena_root, Arc::clone(&dirty_paths))?;
             let engine = Engine::new(
                 arena,
                 Arc::clone(&db),

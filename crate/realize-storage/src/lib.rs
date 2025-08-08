@@ -1,4 +1,5 @@
 use arena::engine::{DirtyPaths, Engine};
+use arena::mark::PathMarks;
 use arena::{ArenaStorage, indexed_store};
 use config::StorageConfig;
 use futures::Stream;

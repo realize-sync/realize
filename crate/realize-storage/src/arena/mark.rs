@@ -8,6 +8,30 @@ use crate::{DirtyPaths, Inode, StorageError};
 use realize_types::Path;
 use std::sync::Arc;
 
+/// Trait for managing marks hierarchically by paths in an arena.
+///
+/// Paths can be files or directories, and marks are inherited from the most specific
+/// path that has a mark set (file > directory > arena default).
+///
+/// When a mark changes, affected paths in the index and arena cache
+/// are marked dirty. Changing the root mark will mark all files in
+/// the cache and index dirty.
+pub trait PathMarks {
+    /// Get the mark for a specific path, which can be a file or a directory.
+    /// The mark can be inherited from one of its
+    /// parents or it can be the root mark.
+    fn get_mark(&self, path: &Path) -> Result<Mark, StorageError>;
+
+    /// Set the default mark for the arena.
+    fn set_arena_mark(&self, mark: Mark) -> Result<(), StorageError>;
+
+    /// Set a mark for a specific path, which can be a file or a directory.
+    fn set_mark(&self, path: &Path, mark: Mark) -> Result<(), StorageError>;
+
+    /// Unset a mark for a specific path.
+    fn clear_mark(&self, path: &Path) -> Result<(), StorageError>;
+}
+
 /// Tracks marks hierarchically by paths in an arena.
 ///
 /// Paths can be files or directories, and marks are inherited from the most specific
@@ -16,13 +40,13 @@ use std::sync::Arc;
 /// When a mark changes, affected paths in the index and arena cache
 /// are marked dirty. Changing the root mark will mark all files in
 /// the cache and index dirty.
-pub struct PathMarks {
+pub struct PathMarksImpl {
     db: Arc<ArenaDatabase>,
     arena_root: Inode,
     dirty_paths: Arc<DirtyPaths>,
 }
 
-impl PathMarks {
+impl PathMarksImpl {
     /// Create a new PathMarks with the given default mark.
     pub fn new(
         db: Arc<ArenaDatabase>,
@@ -41,63 +65,6 @@ impl PathMarks {
             arena_root,
             dirty_paths,
         })
-    }
-
-    /// Get the mark for a specific path, which can be a file or a directory.
-    /// The mark can be inherited from one of its
-    /// parents or it can be the root mark.
-    pub fn get_mark<T>(&self, path: T) -> Result<Mark, StorageError>
-    where
-        T: AsRef<Path>,
-    {
-        let path = path.as_ref();
-        let txn = self.db.begin_read()?;
-        let mark_table = txn.mark_table()?;
-
-        do_get_mark(&mark_table, Some(path))
-    }
-
-    /// Set the default mark for the arena.
-    pub fn set_arena_mark(&self, mark: Mark) -> Result<(), StorageError> {
-        self.set_mark_or_root(None, mark)
-    }
-
-    /// Set a mark for a specific path, which can be a file or a directory.
-    pub fn set_mark<T>(&self, path: T, mark: Mark) -> Result<(), StorageError>
-    where
-        T: AsRef<Path>,
-    {
-        let path = path.as_ref();
-        self.set_mark_or_root(Some(path), mark)
-    }
-
-    /// Unset a mark for a specific path.
-    pub fn clear_mark<T>(&self, path: T) -> Result<(), StorageError>
-    where
-        T: AsRef<Path>,
-    {
-        let path = path.as_ref();
-        let txn = self.db.begin_write()?;
-        {
-            let mut mark_table = txn.mark_table()?;
-
-            let before = match mark_table.remove(path.as_str())? {
-                None => {
-                    // No changes
-                    return Ok(());
-                }
-                Some(e) => e.value().parse()?.mark,
-            };
-            let after = do_get_mark(&mark_table, Some(path))?;
-
-            if before != after {
-                // Clearing the mark had an impact, mark affected files.
-                self.mark_dirty(&txn, Some(path))?;
-            }
-        }
-
-        txn.commit()?;
-        Ok(())
     }
 
     fn set_mark_or_root(
@@ -144,6 +111,47 @@ impl PathMarks {
     ) -> Result<(), StorageError> {
         arena_cache::mark_dirty_recursive(txn, self.arena_root, path_or_root, &self.dirty_paths)?;
 
+        Ok(())
+    }
+}
+
+impl PathMarks for PathMarksImpl {
+    fn get_mark(&self, path: &Path) -> Result<Mark, StorageError> {
+        let txn = self.db.begin_read()?;
+        let mark_table = txn.mark_table()?;
+
+        do_get_mark(&mark_table, Some(path))
+    }
+
+    fn set_arena_mark(&self, mark: Mark) -> Result<(), StorageError> {
+        self.set_mark_or_root(None, mark)
+    }
+
+    fn set_mark(&self, path: &Path, mark: Mark) -> Result<(), StorageError> {
+        self.set_mark_or_root(Some(path), mark)
+    }
+
+    fn clear_mark(&self, path: &Path) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut mark_table = txn.mark_table()?;
+
+            let before = match mark_table.remove(path.as_str())? {
+                None => {
+                    // No changes
+                    return Ok(());
+                }
+                Some(e) => e.value().parse()?.mark,
+            };
+            let after = do_get_mark(&mark_table, Some(path))?;
+
+            if before != after {
+                // Clearing the mark had an impact, mark affected files.
+                self.mark_dirty(&txn, Some(path))?;
+            }
+        }
+
+        txn.commit()?;
         Ok(())
     }
 }
@@ -197,7 +205,7 @@ mod tests {
         db: Arc<ArenaDatabase>,
         acache: Arc<ArenaCache>,
         index: Arc<dyn RealIndex>,
-        marks: PathMarks,
+        marks: PathMarksImpl,
         dirty_paths: Arc<DirtyPaths>,
     }
 
@@ -219,7 +227,7 @@ mod tests {
             )?;
             let arena_root = acache.arena_root();
             let index = acache.as_index();
-            let marks = PathMarks::new(Arc::clone(&db), arena_root, Arc::clone(&dirty_paths))?;
+            let marks = PathMarksImpl::new(Arc::clone(&db), arena_root, Arc::clone(&dirty_paths))?;
 
             Ok(Self {
                 arena,
@@ -460,7 +468,7 @@ mod tests {
         fixture.marks.set_mark(&file_path, Mark::Own)?;
 
         // Create new PathMarks instance with same database
-        let new_marks = PathMarks::new(
+        let new_marks = PathMarksImpl::new(
             Arc::clone(&fixture.db),
             fixture.marks.arena_root,
             Arc::clone(&fixture.dirty_paths),
