@@ -15,6 +15,99 @@ use tokio::task;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
+/// Trait for index operations that abstracts over the implementation.
+pub trait RealIndex {
+    /// Returns the database UUID.
+    ///
+    /// A UUID is set when a new database is created.
+    fn uuid(&self) -> &Uuid;
+
+    /// The arena tied to this index.
+    fn arena(&self) -> Arena;
+
+    /// Subscribe to a watch channel reporting the highest history entry index.
+    ///
+    /// Entries can be later queried using [RealIndex::history].
+    ///
+    /// The value itself is also available as [RealIndex::last_history_index].
+    fn watch_history(&self) -> watch::Receiver<u64>;
+
+    /// Index of the last history entry that was written.
+    ///
+    /// This is the value tracked by [RealIndex::watch_history].
+    fn last_history_index(&self) -> Result<u64, StorageError>;
+
+    /// Get a file entry.
+    fn get_file(
+        &self,
+        path: &realize_types::Path,
+    ) -> Result<Option<IndexedFileTableEntry>, StorageError>;
+
+    /// Check whether a given file is in the index already.
+    fn has_file(&self, path: &realize_types::Path) -> Result<bool, StorageError>;
+
+    /// Check whether a given file is in the index with the given size and mtime.
+    fn has_matching_file(
+        &self,
+        path: &realize_types::Path,
+        size: u64,
+        mtime: UnixTime,
+    ) -> Result<bool, StorageError>;
+
+    /// Add a file entry with the given values. Replace one if it exists.
+    fn add_file(
+        &self,
+        path: &realize_types::Path,
+        size: u64,
+        mtime: UnixTime,
+        hash: Hash,
+    ) -> Result<(), StorageError>;
+
+    fn add_file_if_matches(
+        &self,
+        root: &std::path::Path,
+        path: &realize_types::Path,
+        size: u64,
+        mtime: UnixTime,
+        hash: Hash,
+    ) -> Result<bool, StorageError>;
+
+    fn remove_file_if_missing(
+        &self,
+        root: &std::path::Path,
+        path: &realize_types::Path,
+    ) -> Result<bool, StorageError>;
+
+    /// Send all valid entries of the file table to the given channel.
+    fn all_files(
+        &self,
+        tx: mpsc::Sender<(realize_types::Path, IndexedFileTableEntry)>,
+    ) -> Result<(), StorageError>;
+
+    /// Grab a range of history entries.
+    fn history(
+        &self,
+        range: impl RangeBounds<u64>,
+        tx: mpsc::Sender<Result<(u64, HistoryTableEntry), StorageError>>,
+    ) -> Result<(), StorageError>;
+
+    /// Remove a path that can be a file or a directory.
+    ///
+    /// If the path is a directory, all files within that directory
+    /// are removed, recursively.
+    fn remove_file_or_dir(&self, path: &realize_types::Path) -> Result<(), StorageError>;
+
+    /// Remove `path` from the index if the hash and file match,
+    /// report it as a drop in the history.
+    fn drop_file_if_matches(
+        &self,
+        txn: &ArenaWriteTransaction,
+        root: &std::path::Path,
+        path: &realize_types::Path,
+        hash: &Hash,
+    ) -> Result<bool, StorageError>;
+}
+
 /// File hash index, blocking version.
 pub struct RealIndexBlocking {
     db: Arc<ArenaDatabase>,
@@ -25,6 +118,211 @@ pub struct RealIndexBlocking {
 
     /// This is just to keep history_tx alive and up-to-date.
     _history_rx: watch::Receiver<u64>,
+}
+
+impl RealIndex for RealIndexBlocking {
+    fn uuid(&self) -> &Uuid {
+        &self.uuid
+    }
+
+    fn arena(&self) -> Arena {
+        self.arena
+    }
+
+    fn watch_history(&self) -> watch::Receiver<u64> {
+        self.history_tx.subscribe()
+    }
+
+    fn last_history_index(&self) -> Result<u64, StorageError> {
+        let txn = self.db.begin_read()?;
+        let history_table = txn.index_history_table()?;
+
+        last_history_index(&history_table)
+    }
+
+    fn get_file(
+        &self,
+        path: &realize_types::Path,
+    ) -> Result<Option<IndexedFileTableEntry>, StorageError> {
+        let txn = self.db.begin_read()?;
+        get_file_entry(&txn, path)
+    }
+
+    fn has_file(&self, path: &realize_types::Path) -> Result<bool, StorageError> {
+        let txn = self.db.begin_read()?;
+        let file_table = txn.index_file_table()?;
+
+        Ok(file_table.get(path.as_str())?.is_some())
+    }
+
+    fn has_matching_file(
+        &self,
+        path: &realize_types::Path,
+        size: u64,
+        mtime: UnixTime,
+    ) -> Result<bool, StorageError> {
+        Ok(self
+            .get_file(path)?
+            .map(|e| e.size == size && e.mtime == mtime)
+            .unwrap_or(false))
+    }
+
+    fn add_file(
+        &self,
+        path: &realize_types::Path,
+        size: u64,
+        mtime: UnixTime,
+        hash: Hash,
+    ) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        self.do_add_file(&txn, path, size, mtime, hash)?;
+        txn.commit()?;
+
+        Ok(())
+    }
+
+    fn add_file_if_matches(
+        &self,
+        root: &std::path::Path,
+        path: &realize_types::Path,
+        size: u64,
+        mtime: UnixTime,
+        hash: Hash,
+    ) -> Result<bool, StorageError> {
+        let txn = self.db.begin_write()?;
+        let entry = self.do_add_file(&txn, path, size, mtime, hash)?;
+        if file_matches_index(&entry, root, path) {
+            txn.commit()?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    fn remove_file_if_missing(
+        &self,
+        root: &std::path::Path,
+        path: &realize_types::Path,
+    ) -> Result<bool, StorageError> {
+        let txn = self.db.begin_write()?;
+        if fs_utils::metadata_no_symlink_blocking(root, path).is_err() {
+            {
+                let mut file_table = txn.index_file_table()?;
+                let removed = file_table.remove(path.as_str())?;
+                if let Some(removed) = removed {
+                    let old_hash = removed.value().parse()?.hash;
+                    self.report_removed(
+                        &txn,
+                        &mut txn.index_history_table()?,
+                        path.clone(),
+                        old_hash,
+                    )?;
+                }
+            }
+            txn.commit()?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    fn all_files(
+        &self,
+        tx: mpsc::Sender<(realize_types::Path, IndexedFileTableEntry)>,
+    ) -> Result<(), StorageError> {
+        let txn = self.db.begin_read()?;
+        let file_table = txn.index_file_table()?;
+        for (path, entry) in file_table
+            .iter()?
+            .flatten()
+            // Skip any entry with errors
+            .flat_map(|(k, v)| {
+                if let (Ok(path), Ok(entry)) =
+                    (realize_types::Path::parse(k.value()), v.value().parse())
+                {
+                    Some((path, entry))
+                } else {
+                    None
+                }
+            })
+        {
+            if let Err(_) = tx.blocking_send((path, entry)) {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn history(
+        &self,
+        range: impl RangeBounds<u64>,
+        tx: mpsc::Sender<Result<(u64, HistoryTableEntry), StorageError>>,
+    ) -> Result<(), StorageError> {
+        let txn = self.db.begin_read()?;
+        let history_table = txn.index_history_table()?;
+        for res in history_table.range(range)?.map(|res| match res {
+            Err(err) => Err(StorageError::from(err)),
+            Ok((k, v)) => match v.value().parse() {
+                Ok(v) => Ok((k.value(), v)),
+                Err(err) => Err(StorageError::from(err)),
+            },
+        }) {
+            if let Err(_) = tx.blocking_send(res) {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn remove_file_or_dir(&self, path: &realize_types::Path) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut file_table = txn.index_file_table()?;
+            let mut history_table = txn.index_history_table()?;
+            let path_prefix = PathPrefix::new(path);
+
+            for entry in
+                file_table.extract_from_if(path_prefix.range(), |k, _| path_prefix.accept(k))?
+            {
+                let (k, v) = entry?;
+                let path = realize_types::Path::parse(k.value())?;
+                let hash = v.value().parse()?.hash;
+                self.report_removed(&txn, &mut history_table, path, hash)?;
+            }
+        }
+        txn.commit()?;
+
+        Ok(())
+    }
+
+    fn drop_file_if_matches(
+        &self,
+        txn: &ArenaWriteTransaction,
+        root: &std::path::Path,
+        path: &realize_types::Path,
+        hash: &Hash,
+    ) -> Result<bool, StorageError> {
+        let mut file_table = txn.index_file_table()?;
+        let mut history_table = txn.index_history_table()?;
+
+        if let Some(entry) = do_get_file_entry(&file_table, path)?
+            && entry.hash == *hash
+            && file_matches_index(&entry, root, path)
+        {
+            file_table.remove(path.as_str())?;
+
+            let index = self.allocate_history_index(&txn, &history_table)?;
+            (&self.dirty_paths).mark_dirty(&txn, &path)?;
+            let ev = HistoryTableEntry::Drop(path.clone(), hash.clone());
+            log::debug!("[{}] History #{index}: {ev:?}", self.arena);
+            history_table.insert(index, Holder::with_content(ev)?)?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
 }
 
 impl RealIndexBlocking {
