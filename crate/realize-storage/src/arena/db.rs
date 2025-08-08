@@ -15,14 +15,14 @@ use std::sync::Arc;
 ///
 /// Key: u64 (monotonically increasing index value)
 /// Value: HistoryTableEntry
-const INDEX_HISTORY_TABLE: TableDefinition<u64, Holder<HistoryTableEntry>> =
+const HISTORY_TABLE: TableDefinition<u64, Holder<HistoryTableEntry>> =
     TableDefinition::new("index.history");
 
 /// Database settings.
 ///
 /// Key: string
 /// Value: depends on the setting
-const INDEX_SETTINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("index.settings");
+const SETTIGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("index.settings");
 
 /// Tracks directory content.
 ///
@@ -36,8 +36,8 @@ const INDEX_SETTINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new(
 ///
 /// Key: (inode, name)
 /// Value: DirTableEntry
-pub(crate) const CACHE_DIRECTORY_TABLE: TableDefinition<(Inode, &str), Holder<DirTableEntry>> =
-    TableDefinition::new("acache.directory");
+pub(crate) const DIR_TABLE: TableDefinition<(Inode, &str), Holder<DirTableEntry>> =
+    TableDefinition::new("acache.dir");
 
 /// Track peer files.
 ///
@@ -50,7 +50,7 @@ pub(crate) const CACHE_DIRECTORY_TABLE: TableDefinition<(Inode, &str), Holder<Di
 ///
 /// Key: FileTableKey (inode, default|local|peer, peer)
 /// Value: FileTableEntry
-const CACHE_FILE_TABLE: TableDefinition<FileTableKey, Holder<FileTableEntry>> =
+const FILE_TABLE: TableDefinition<FileTableKey, Holder<FileTableEntry>> =
     TableDefinition::new("acache.file");
 
 /// Track peer files that might have been deleted remotely.
@@ -62,7 +62,7 @@ const CACHE_FILE_TABLE: TableDefinition<FileTableKey, Holder<FileTableEntry>> =
 ///
 /// Key: (peer, file inode)
 /// Value: parent dir inode
-const CACHE_PENDING_CATCHUP_TABLE: TableDefinition<(&str, Inode), Inode> =
+const PENDING_CATCHUP_TABLE: TableDefinition<(&str, Inode), Inode> =
     TableDefinition::new("acache.pending_catchup");
 
 /// Track Peer UUIDs.
@@ -71,7 +71,7 @@ const CACHE_PENDING_CATCHUP_TABLE: TableDefinition<(&str, Inode), Inode> =
 ///
 /// Key: &str (Peer)
 /// Value: PeerTableEntry
-const CACHE_PEER_TABLE: TableDefinition<&str, Holder<PeerTableEntry>> =
+const PEER_TABLE: TableDefinition<&str, Holder<PeerTableEntry>> =
     TableDefinition::new("acache.peer");
 
 /// Track last seen notification index.
@@ -80,8 +80,7 @@ const CACHE_PEER_TABLE: TableDefinition<&str, Holder<PeerTableEntry>> =
 ///
 /// Key: &str (Peer)
 /// Value: last seen index
-const CACHE_NOTIFICATION_TABLE: TableDefinition<&str, u64> =
-    TableDefinition::new("acache.notification");
+const NOTIFICATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("acache.notification");
 
 /// Track blobs.
 ///
@@ -109,7 +108,7 @@ const BLOB_LRU_QUEUE_TABLE: TableDefinition<u16, Holder<QueueTableEntry>> =
 ///
 /// Key: ()
 /// Value: (Inode, Inode) (last inode allocated, end of range)
-pub(crate) const CACHE_CURRENT_INODE_RANGE_TABLE: TableDefinition<(), (Inode, Inode)> =
+pub(crate) const CURRENT_INODE_RANGE_TABLE: TableDefinition<(), (Inode, Inode)> =
     TableDefinition::new("acache.current_inode_range");
 
 /// Mark table for storing file marks within an Arena.
@@ -157,14 +156,14 @@ impl ArenaDatabase {
         {
             // Create tables so they can safely be queried in read
             // transactions in an empty database.
-            txn.open_table(INDEX_HISTORY_TABLE)?;
-            txn.open_table(INDEX_SETTINGS_TABLE)?;
-            txn.open_table(CACHE_DIRECTORY_TABLE)?;
-            txn.open_table(CACHE_FILE_TABLE)?;
-            txn.open_table(CACHE_PENDING_CATCHUP_TABLE)?;
-            txn.open_table(CACHE_PEER_TABLE)?;
-            txn.open_table(CACHE_NOTIFICATION_TABLE)?;
-            txn.open_table(CACHE_CURRENT_INODE_RANGE_TABLE)?;
+            txn.open_table(HISTORY_TABLE)?;
+            txn.open_table(SETTIGS_TABLE)?;
+            txn.open_table(DIR_TABLE)?;
+            txn.open_table(FILE_TABLE)?;
+            txn.open_table(PENDING_CATCHUP_TABLE)?;
+            txn.open_table(PEER_TABLE)?;
+            txn.open_table(NOTIFICATION_TABLE)?;
+            txn.open_table(CURRENT_INODE_RANGE_TABLE)?;
             txn.open_table(BLOB_TABLE)?;
             txn.open_table(BLOB_NEXT_ID_TABLE)?;
             txn.open_table(BLOB_LRU_QUEUE_TABLE)?;
@@ -226,53 +225,53 @@ impl ArenaWriteTransaction {
         self.after_commit.borrow_mut().push(Box::new(cb));
     }
 
-    pub fn index_history_table<'txn>(
+    pub fn history_table<'txn>(
         &'txn self,
     ) -> Result<Table<'txn, u64, Holder<'static, HistoryTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(INDEX_HISTORY_TABLE)?)
+        Ok(self.inner.open_table(HISTORY_TABLE)?)
     }
 
-    pub fn index_settings_table<'txn>(
+    pub fn settings_table<'txn>(
         &'txn self,
     ) -> Result<Table<'txn, &'static str, &'static [u8]>, StorageError> {
-        Ok(self.inner.open_table(INDEX_SETTINGS_TABLE)?)
+        Ok(self.inner.open_table(SETTIGS_TABLE)?)
     }
 
-    pub fn cache_directory_table<'txn>(
+    pub fn dir_table<'txn>(
         &'txn self,
     ) -> Result<Table<'txn, (Inode, &'static str), Holder<'static, DirTableEntry>>, StorageError>
     {
-        Ok(self.inner.open_table(CACHE_DIRECTORY_TABLE)?)
+        Ok(self.inner.open_table(DIR_TABLE)?)
     }
 
-    pub fn cache_file_table<'txn>(
+    pub fn file_table<'txn>(
         &'txn self,
     ) -> Result<Table<'txn, FileTableKey, Holder<'static, FileTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(CACHE_FILE_TABLE)?)
+        Ok(self.inner.open_table(FILE_TABLE)?)
     }
 
-    pub fn cache_pending_catchup_table<'txn>(
+    pub fn pending_catchup_table<'txn>(
         &'txn self,
     ) -> Result<Table<'txn, (&'static str, Inode), Inode>, StorageError> {
-        Ok(self.inner.open_table(CACHE_PENDING_CATCHUP_TABLE)?)
+        Ok(self.inner.open_table(PENDING_CATCHUP_TABLE)?)
     }
 
-    pub fn cache_peer_table<'txn>(
+    pub fn peer_table<'txn>(
         &'txn self,
     ) -> Result<Table<'txn, &'static str, Holder<'static, PeerTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(CACHE_PEER_TABLE)?)
+        Ok(self.inner.open_table(PEER_TABLE)?)
     }
 
-    pub fn cache_notification_table<'txn>(
+    pub fn notification_table<'txn>(
         &'txn self,
     ) -> Result<Table<'txn, &'static str, u64>, StorageError> {
-        Ok(self.inner.open_table(CACHE_NOTIFICATION_TABLE)?)
+        Ok(self.inner.open_table(NOTIFICATION_TABLE)?)
     }
 
-    pub fn cache_current_inode_range_table<'txn>(
+    pub fn current_inode_range_table<'txn>(
         &'txn self,
     ) -> Result<Table<'txn, (), (Inode, Inode)>, StorageError> {
-        Ok(self.inner.open_table(CACHE_CURRENT_INODE_RANGE_TABLE)?)
+        Ok(self.inner.open_table(CURRENT_INODE_RANGE_TABLE)?)
     }
 
     pub fn blob_table<'txn>(
@@ -323,35 +322,33 @@ pub struct ArenaReadTransaction {
 }
 
 impl ArenaReadTransaction {
-    pub fn index_history_table(
+    pub fn history_table(
         &self,
     ) -> Result<ReadOnlyTable<u64, Holder<'static, HistoryTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(INDEX_HISTORY_TABLE)?)
+        Ok(self.inner.open_table(HISTORY_TABLE)?)
     }
 
-    pub fn cache_directory_table(
+    pub fn dir_table(
         &self,
     ) -> Result<ReadOnlyTable<(Inode, &'static str), Holder<'static, DirTableEntry>>, StorageError>
     {
-        Ok(self.inner.open_table(CACHE_DIRECTORY_TABLE)?)
+        Ok(self.inner.open_table(DIR_TABLE)?)
     }
 
-    pub fn cache_file_table(
+    pub fn file_table(
         &self,
     ) -> Result<ReadOnlyTable<FileTableKey, Holder<'static, FileTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(CACHE_FILE_TABLE)?)
+        Ok(self.inner.open_table(FILE_TABLE)?)
     }
 
-    pub fn cache_peer_table(
+    pub fn peer_table(
         &self,
     ) -> Result<ReadOnlyTable<&'static str, Holder<'static, PeerTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(CACHE_PEER_TABLE)?)
+        Ok(self.inner.open_table(PEER_TABLE)?)
     }
 
-    pub fn cache_notification_table(
-        &self,
-    ) -> Result<ReadOnlyTable<&'static str, u64>, StorageError> {
-        Ok(self.inner.open_table(CACHE_NOTIFICATION_TABLE)?)
+    pub fn notification_table(&self) -> Result<ReadOnlyTable<&'static str, u64>, StorageError> {
+        Ok(self.inner.open_table(NOTIFICATION_TABLE)?)
     }
 
     pub fn blob_table(

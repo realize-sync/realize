@@ -57,7 +57,7 @@ impl ArenaCache {
         let uuid = load_or_assign_uuid(&db)?;
         let last_history_index = {
             let txn = db.begin_read()?;
-            let history_table = txn.index_history_table()?;
+            let history_table = txn.history_table()?;
             last_history_index(&history_table)?
         };
         let (history_tx, history_rx) = watch::channel(last_history_index);
@@ -93,7 +93,7 @@ impl ArenaCache {
         name: &str,
     ) -> Result<(Inode, InodeAssignment), StorageError> {
         let txn = self.db.begin_read()?;
-        do_lookup(&txn.cache_directory_table()?, parent_inode, name)
+        do_lookup(&txn.dir_table()?, parent_inode, name)
     }
 
     pub(crate) fn lookup_path<T>(&self, path: T) -> Result<(Inode, InodeAssignment), StorageError>
@@ -102,7 +102,7 @@ impl ArenaCache {
     {
         let path = path.as_ref();
         let txn = self.db.begin_read()?;
-        let dir_table = txn.cache_directory_table()?;
+        let dir_table = txn.dir_table()?;
 
         do_lookup_path(&dir_table, self.arena_root, Some(path))
     }
@@ -115,7 +115,7 @@ impl ArenaCache {
     pub(crate) fn dir_mtime(&self, inode: Inode) -> Result<UnixTime, StorageError> {
         let txn = self.db.begin_read()?;
 
-        do_dir_mtime(&txn.cache_directory_table()?, inode, self.arena_root)
+        do_dir_mtime(&txn.dir_table()?, inode, self.arena_root)
     }
 
     pub(crate) fn file_availability(&self, inode: Inode) -> Result<FileAvailability, StorageError> {
@@ -130,7 +130,7 @@ impl ArenaCache {
     ) -> Result<Vec<(String, Inode, InodeAssignment)>, StorageError> {
         let txn = self.db.begin_read()?;
 
-        do_readdir(&txn.cache_directory_table()?, inode)
+        do_readdir(&txn.dir_table()?, inode)
     }
 
     pub(crate) fn peer_progress(&self, peer: Peer) -> Result<Option<Progress>, StorageError> {
@@ -161,7 +161,7 @@ impl ArenaCache {
             } => {
                 do_update_last_seen_notification(&txn, peer, index)?;
 
-                let mut file_table = txn.cache_file_table()?;
+                let mut file_table = txn.file_table()?;
                 let (parent_inode, file_inode) =
                     do_create_file(&txn, self.arena_root, &path, &|| self.allocate_inode(&txn))?;
                 if !get_file_entry(&file_table, file_inode, Some(peer))?.is_some() {
@@ -191,7 +191,7 @@ impl ArenaCache {
                 let (parent_inode, file_inode) =
                     do_create_file(&txn, self.arena_root, &path, &|| self.allocate_inode(&txn))?;
 
-                let mut file_table = txn.cache_file_table()?;
+                let mut file_table = txn.file_table()?;
                 let entry = FileTableEntry::new(path, size, mtime, hash.clone(), parent_inode);
                 if let Some(e) = get_file_entry(&file_table, file_inode, None)?
                     && e.content.hash == old_hash
@@ -236,7 +236,7 @@ impl ArenaCache {
                 self.do_unlink(&txn, peer, self.arena_root, &path, old_hash.clone())?;
 
                 if let Some(index_root) = index_root {
-                    let dir_table = txn.cache_directory_table()?;
+                    let dir_table = txn.dir_table()?;
                     let inode = match do_lookup_path(&dir_table, self.arena_root, Some(&path)) {
                         Ok((inode, _)) => Some(inode),
                         Err(StorageError::NotFound) => None,
@@ -245,7 +245,7 @@ impl ArenaCache {
                         }
                     };
                     if let Some(inode) = inode {
-                        let file_table = txn.cache_file_table()?;
+                        let file_table = txn.file_table()?;
                         if let Some(entry) = file_table.get(FileTableKey::LocalCopy(inode))? {
                             let entry = entry.value().parse()?;
                             if replaces_local_copy(&entry, &old_hash) {
@@ -287,7 +287,7 @@ impl ArenaCache {
 
                 do_unmark_peer_file(&txn, peer, file_inode)?;
 
-                let mut file_table = txn.cache_file_table()?;
+                let mut file_table = txn.file_table()?;
                 let entry = FileTableEntry::new(path, size, mtime, hash, parent_inode);
                 self.do_write_file_entry(&mut file_table, file_inode, peer, &entry)?;
                 if !get_file_entry(&file_table, file_inode, None)?.is_some() {
@@ -299,7 +299,7 @@ impl ArenaCache {
                 do_update_last_seen_notification(&txn, peer, index)?;
             }
             Notification::Connected { uuid, .. } => {
-                let mut peer_table = txn.cache_peer_table()?;
+                let mut peer_table = txn.peer_table()?;
                 let key = peer.as_str();
                 if let Some(entry) = peer_table.get(key)? {
                     if entry.value().parse()?.uuid == uuid {
@@ -308,7 +308,7 @@ impl ArenaCache {
                     }
                 }
                 peer_table.insert(key, Holder::with_content(PeerTableEntry { uuid })?)?;
-                let mut notification_table = txn.cache_notification_table()?;
+                let mut notification_table = txn.notification_table()?;
                 notification_table.remove(key)?;
             }
         }
@@ -322,7 +322,7 @@ impl ArenaCache {
         // blob is there.
         {
             let txn = self.db.begin_read()?;
-            let file_entry = get_default_entry(&txn.cache_file_table()?, inode)?;
+            let file_entry = get_default_entry(&txn.file_table()?, inode)?;
             if let Some(blob_id) = file_entry.content.blob
                 && blob::blob_exists(&txn, blob_id)?
             {
@@ -335,7 +335,7 @@ impl ArenaCache {
         // the file entry again because it might have changed.
         let txn = self.db.begin_write()?;
         let ret = {
-            let mut file_table = txn.cache_file_table()?;
+            let mut file_table = txn.file_table()?;
             let mut file_entry = get_default_entry(&file_table, inode)?;
             let blob = self
                 .blobstore
@@ -369,9 +369,8 @@ impl ArenaCache {
         T: AsRef<Path>,
     {
         let path = path.as_ref();
-        let (inode, _) =
-            do_lookup_path(&txn.cache_directory_table()?, self.arena_root, Some(path))?;
-        let mut file_table = txn.cache_file_table()?;
+        let (inode, _) = do_lookup_path(&txn.dir_table()?, self.arena_root, Some(path))?;
+        let mut file_table = txn.file_table()?;
         let mut file_entry = get_default_entry(&file_table, inode)?;
         if file_entry.content.hash != *hash {
             return Ok(false);
@@ -415,8 +414,7 @@ impl ArenaCache {
         T: AsRef<Path>,
     {
         let path = path.as_ref();
-        let inode = match do_lookup_path(&txn.cache_directory_table()?, self.arena_root, Some(path))
-        {
+        let inode = match do_lookup_path(&txn.dir_table()?, self.arena_root, Some(path)) {
             Ok((inode, _)) => inode,
             Err(StorageError::NotFound) => {
                 return Ok(None);
@@ -425,7 +423,7 @@ impl ArenaCache {
                 return Err(err);
             }
         };
-        let mut file_table = txn.cache_file_table()?;
+        let mut file_table = txn.file_table()?;
         let mut file_entry = match get_default_entry(&file_table, inode) {
             Ok(e) => e,
             Err(StorageError::NotFound) => {
@@ -620,7 +618,7 @@ impl ArenaCache {
         T: AsRef<Path>,
     {
         let path = path.as_ref();
-        let mut dir_table = txn.cache_directory_table()?;
+        let mut dir_table = txn.dir_table()?;
         let (parent_inode, parent_assignment) =
             do_lookup_path(&dir_table, arena_root, path.parent().as_ref())?;
         if parent_assignment != InodeAssignment::Directory {
@@ -633,7 +631,7 @@ impl ArenaCache {
             return Err(StorageError::IsADirectory);
         }
 
-        let mut file_table = txn.cache_file_table()?;
+        let mut file_table = txn.file_table()?;
         self.do_rm_file_entry(
             txn,
             &mut file_table,
@@ -653,9 +651,9 @@ impl ArenaCache {
         txn: &ArenaWriteTransaction,
         peer: Peer,
     ) -> Result<(), StorageError> {
-        let mut pending_catchup_table = txn.cache_pending_catchup_table()?;
-        let mut file_table = txn.cache_file_table()?;
-        let mut directory_table = txn.cache_directory_table()?;
+        let mut pending_catchup_table = txn.pending_catchup_table()?;
+        let mut file_table = txn.file_table()?;
+        let mut directory_table = txn.dir_table()?;
         let peer_str = peer.as_str();
         for elt in pending_catchup_table
             .extract_from_if((peer_str, Inode::ZERO)..=(peer_str, Inode::MAX), |_, _| {
@@ -683,7 +681,7 @@ impl ArenaCache {
         inode: Inode,
     ) -> Result<LocalAvailability, StorageError> {
         let txn = self.db.begin_read()?;
-        let file_entry = get_default_entry(&txn.cache_file_table()?, inode)?;
+        let file_entry = get_default_entry(&txn.file_table()?, inode)?;
 
         blob::local_availability(&txn, &file_entry)
     }
@@ -710,7 +708,7 @@ impl ArenaCache {
     /// Allocate a new inode, extending the range if necessary.
     fn allocate_inode(&self, txn: &ArenaWriteTransaction) -> Result<Inode, StorageError> {
         self.allocator
-            .allocate_arena_inode(&mut txn.cache_current_inode_range_table()?, self.arena)
+            .allocate_arena_inode(&mut txn.current_inode_range_table()?, self.arena)
     }
 
     fn get_indexed_file(
@@ -746,8 +744,8 @@ impl ArenaCache {
         let (parent_inode, file_inode) =
             do_create_file(&txn, self.arena_root, &path, &|| self.allocate_inode(&txn))?;
 
-        let mut file_table = txn.cache_file_table()?;
-        let mut history_table = txn.index_history_table()?;
+        let mut file_table = txn.file_table()?;
+        let mut history_table = txn.history_table()?;
         let old_hash = file_table
             .get(FileTableKey::LocalCopy(file_inode))?
             .map(|e| e.value().parse().ok())
@@ -862,7 +860,7 @@ impl RealIndex for ArenaCache {
 
     fn last_history_index(&self) -> Result<u64, StorageError> {
         let txn = self.db.begin_read()?;
-        let history_table = txn.index_history_table()?;
+        let history_table = txn.history_table()?;
 
         last_history_index(&history_table)
     }
@@ -881,11 +879,7 @@ impl RealIndex for ArenaCache {
         txn: &super::db::ArenaReadTransaction,
         path: &realize_types::Path,
     ) -> Result<Option<IndexedFileTableEntry>, StorageError> {
-        self.get_indexed_file(
-            &txn.cache_directory_table()?,
-            &txn.cache_file_table()?,
-            path,
-        )
+        self.get_indexed_file(&txn.dir_table()?, &txn.file_table()?, path)
     }
 
     fn get_indexed_file_txn(
@@ -895,8 +889,8 @@ impl RealIndex for ArenaCache {
         path: &realize_types::Path,
         hash: Option<&Hash>,
     ) -> Result<Option<std::path::PathBuf>, StorageError> {
-        let dir_table = txn.cache_directory_table()?;
-        let file_table = txn.cache_file_table()?;
+        let dir_table = txn.dir_table()?;
+        let file_table = txn.file_table()?;
         let entry = self.get_indexed_file(&dir_table, &file_table, path)?;
         match hash {
             Some(hash) => {
@@ -976,7 +970,7 @@ impl RealIndex for ArenaCache {
         if fs_utils::metadata_no_symlink_blocking(root, path).is_err() {
             {
                 let path = path.as_ref();
-                let dir_table = txn.cache_directory_table()?;
+                let dir_table = txn.dir_table()?;
                 let (parent_inode, parent_assignment) =
                     do_lookup_path(&dir_table, self.arena_root, path.parent().as_ref())?;
                 if parent_assignment != InodeAssignment::Directory {
@@ -989,8 +983,8 @@ impl RealIndex for ArenaCache {
                     return Err(StorageError::IsADirectory);
                 }
 
-                let mut file_table = txn.cache_file_table()?;
-                let mut history_table = txn.index_history_table()?;
+                let mut file_table = txn.file_table()?;
+                let mut history_table = txn.history_table()?;
                 self.unindex_file(&txn, &mut file_table, &mut history_table, inode)?;
             }
             txn.commit()?;
@@ -1005,7 +999,7 @@ impl RealIndex for ArenaCache {
         tx: mpsc::Sender<(realize_types::Path, IndexedFileTableEntry)>,
     ) -> Result<(), StorageError> {
         let txn = self.db.begin_read()?;
-        let file_table = txn.cache_file_table()?;
+        let file_table = txn.file_table()?;
         for (path, entry) in file_table
             .iter()?
             .flatten()
@@ -1035,7 +1029,7 @@ impl RealIndex for ArenaCache {
         tx: mpsc::Sender<Result<(u64, HistoryTableEntry), StorageError>>,
     ) -> Result<(), StorageError> {
         let txn = self.db.begin_read()?;
-        let history_table = txn.index_history_table()?;
+        let history_table = txn.history_table()?;
         for res in history_table.range(range)?.map(|res| match res {
             Err(err) => Err(StorageError::from(err)),
             Ok((k, v)) => match v.value().parse() {
@@ -1054,7 +1048,7 @@ impl RealIndex for ArenaCache {
     fn remove_file_or_dir(&self, path: &realize_types::Path) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
         {
-            let dir_table = txn.cache_directory_table()?;
+            let dir_table = txn.dir_table()?;
             let (inode, assignment) = match do_lookup_path(&dir_table, self.arena_root, Some(path))
             {
                 Ok(ret) => ret,
@@ -1065,8 +1059,8 @@ impl RealIndex for ArenaCache {
                     return Err(err);
                 }
             };
-            let mut file_table = txn.cache_file_table()?;
-            let mut history_table = txn.index_history_table()?;
+            let mut file_table = txn.file_table()?;
+            let mut history_table = txn.history_table()?;
             match assignment {
                 InodeAssignment::File => {
                     self.unindex_file(&txn, &mut file_table, &mut history_table, inode)?
@@ -1088,7 +1082,7 @@ impl RealIndex for ArenaCache {
         path: &realize_types::Path,
         hash: &Hash,
     ) -> Result<bool, StorageError> {
-        let dir_table = txn.cache_directory_table()?;
+        let dir_table = txn.dir_table()?;
         let (inode, assignment) = match do_lookup_path(&dir_table, self.arena_root, Some(path)) {
             Ok(ret) => ret,
             Err(StorageError::NotFound) => {
@@ -1102,8 +1096,8 @@ impl RealIndex for ArenaCache {
             return Err(StorageError::IsADirectory);
         }
 
-        let mut file_table = txn.cache_file_table()?;
-        let mut history_table = txn.index_history_table()?;
+        let mut file_table = txn.file_table()?;
+        let mut history_table = txn.history_table()?;
         if let Some(entry) = get_indexed_file_inode(&file_table, inode)?
             && entry.hash == *hash
             && file_matches_index(&entry.into(), root, path)
@@ -1145,10 +1139,10 @@ pub(crate) fn mark_dirty_recursive(
     path: Option<&Path>,
     dirty_paths: &Arc<DirtyPaths>,
 ) -> Result<(), StorageError> {
-    let dir_table = txn.cache_directory_table()?;
+    let dir_table = txn.dir_table()?;
     match do_lookup_path(&dir_table, arena_root, path) {
         Ok((inode, _)) => {
-            let file_table = txn.cache_file_table()?;
+            let file_table = txn.file_table()?;
             mark_file_dirty(txn, &file_table, inode, dirty_paths)?;
             mark_dir_dirty(txn, &dir_table, &file_table, inode, dirty_paths)?;
 
@@ -1247,7 +1241,7 @@ fn do_update_last_seen_notification(
     peer: Peer,
     index: u64,
 ) -> Result<(), StorageError> {
-    let mut notification_table = txn.cache_notification_table()?;
+    let mut notification_table = txn.notification_table()?;
     notification_table.insert(peer.as_str(), index)?;
 
     Ok(())
@@ -1259,11 +1253,11 @@ fn do_peer_progress(
 ) -> Result<Option<Progress>, StorageError> {
     let key = peer.as_str();
 
-    let peer_table = txn.cache_peer_table()?;
+    let peer_table = txn.peer_table()?;
     if let Some(entry) = peer_table.get(key)? {
         let PeerTableEntry { uuid, .. } = entry.value().parse()?;
 
-        let notification_table = txn.cache_notification_table()?;
+        let notification_table = txn.notification_table()?;
         if let Some(last_seen) = notification_table.get(key)? {
             return Ok(Some(Progress::new(uuid, last_seen.value())));
         }
@@ -1305,12 +1299,12 @@ where
     T: AsRef<Path>,
 {
     let path = path.as_ref();
-    let dir_table = txn.cache_directory_table()?;
+    let dir_table = txn.dir_table()?;
     let (inode, assignment) = do_lookup_path(&dir_table, root, Some(path))?;
     if assignment != InodeAssignment::File {
         return Err(StorageError::IsADirectory);
     }
-    let file_table = txn.cache_file_table()?;
+    let file_table = txn.file_table()?;
 
     get_file_entry(&file_table, inode, None)?.ok_or(StorageError::NotFound)
 }
@@ -1345,7 +1339,7 @@ fn do_file_metadata(
     txn: &ArenaReadTransaction,
     inode: Inode,
 ) -> Result<FileMetadata, StorageError> {
-    Ok(get_default_entry(&txn.cache_file_table()?, inode)?.metadata)
+    Ok(get_default_entry(&txn.file_table()?, inode)?.metadata)
 }
 
 fn do_file_availability(
@@ -1353,7 +1347,7 @@ fn do_file_availability(
     inode: Inode,
     arena: Arena,
 ) -> Result<FileAvailability, StorageError> {
-    let file_table = txn.cache_file_table()?;
+    let file_table = txn.file_table()?;
 
     let mut range = file_table.range(FileTableKey::range(inode))?;
     let (default_key, default_entry) = range.next().ok_or(StorageError::NotFound)??;
@@ -1403,7 +1397,7 @@ where
     T: AsRef<Path>,
 {
     let path = path.as_ref();
-    let mut dir_table = txn.cache_directory_table()?;
+    let mut dir_table = txn.dir_table()?;
     let filename = path.name();
     let parent_inode = do_mkdirs(
         &mut dir_table,
@@ -1533,8 +1527,8 @@ fn add_dir_entry(
 }
 
 fn do_mark_peer_files(txn: &ArenaWriteTransaction, peer: Peer) -> Result<(), StorageError> {
-    let file_table = txn.cache_file_table()?;
-    let mut pending_catchup_table = txn.cache_pending_catchup_table()?;
+    let file_table = txn.file_table()?;
+    let mut pending_catchup_table = txn.pending_catchup_table()?;
     for elt in file_table.iter()? {
         let (k, v) = elt?;
         if let FileTableKey::PeerCopy(inode, elt_peer) = k.value()
@@ -1553,7 +1547,7 @@ fn do_unmark_peer_file(
     peer: Peer,
     inode: Inode,
 ) -> Result<(), StorageError> {
-    let mut pending_catchup_table = txn.cache_pending_catchup_table()?;
+    let mut pending_catchup_table = txn.pending_catchup_table()?;
     pending_catchup_table.remove((peer.as_str(), inode))?;
 
     Ok(())
@@ -1561,7 +1555,7 @@ fn do_unmark_peer_file(
 
 fn load_or_assign_uuid(db: &Arc<ArenaDatabase>) -> Result<Uuid, StorageError> {
     let txn = db.begin_write()?;
-    let mut settings_table = txn.index_settings_table()?;
+    let mut settings_table = txn.settings_table()?;
     if let Some(value) = settings_table.get("uuid")? {
         let bytes: uuid::Bytes = value
             .value()

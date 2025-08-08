@@ -971,40 +971,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn convert_indexed_file_table_entry() -> anyhow::Result<()> {
-        let entry = IndexedFileTableEntry {
-            size: 200,
-            mtime: UnixTime::new(1234567890, 111),
-            hash: Hash([0xf0; 32]),
-            outdated_by: None,
-        };
-
-        assert_eq!(
-            entry,
-            IndexedFileTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn convert_indexed_file_table_entry_outdated() -> anyhow::Result<()> {
-        let entry = IndexedFileTableEntry {
-            size: 200,
-            mtime: UnixTime::new(1234567890, 111),
-            hash: Hash([0xf0; 32]),
-            outdated_by: Some(Hash([2; 32])),
-        };
-
-        assert_eq!(
-            entry,
-            IndexedFileTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn convert_history_table_entry() -> anyhow::Result<()> {
         let add = HistoryTableEntry::Add(realize_types::Path::parse("foo/bar.txt")?);
         assert_eq!(
