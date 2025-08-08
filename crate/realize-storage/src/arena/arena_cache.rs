@@ -118,6 +118,12 @@ impl ArenaCache {
         do_dir_mtime(&txn.dir_table()?, inode, self.arena_root)
     }
 
+    pub(crate) fn parent_inode(&self, inode: Inode) -> Result<Inode, StorageError> {
+        let txn = self.db.begin_read()?;
+
+        do_parent_dir(&txn.dir_table()?, &txn.file_table()?, inode)
+    }
+
     pub(crate) fn file_availability(&self, inode: Inode) -> Result<FileAvailability, StorageError> {
         let txn = self.db.begin_read()?;
 
@@ -1289,6 +1295,24 @@ fn do_dir_mtime(
     Err(StorageError::NotFound)
 }
 
+fn do_parent_dir(
+    dir_table: &impl redb::ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
+    file_table: &impl ReadableTable<FileTableKey, Holder<'static, FileTableEntry>>,
+    inode: Inode,
+) -> Result<Inode, StorageError> {
+    if let Some(e) = dir_table.get((inode, ".."))? {
+        if let DirTableEntry::DotDot(inode) = e.value().parse()? {
+            return Ok(inode);
+        }
+    }
+    for entry in file_table.range(FileTableKey::range(inode))? {
+        let entry = entry?;
+        return Ok(entry.1.value().parse()?.parent_inode);
+    }
+
+    Err(StorageError::NotFound)
+}
+
 // Return the default file entry for a path.
 pub(crate) fn get_file_entry_for_path<T>(
     txn: &ArenaReadTransaction,
@@ -1521,6 +1545,10 @@ fn add_dir_entry(
     dir_table.insert((parent_inode, "."), dot.clone())?;
     if assignment == InodeAssignment::Directory {
         dir_table.insert((new_inode, "."), dot.clone())?;
+        dir_table.insert(
+            (new_inode, ".."),
+            Holder::with_content(DirTableEntry::DotDot(parent_inode))?,
+        )?;
     }
 
     Ok(())
@@ -1781,6 +1809,44 @@ mod tests {
 
         let (_, assignment) = acache.lookup(inode, "b")?;
         assert_eq!(assignment, InodeAssignment::Directory, "b");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_parent_of_file_in_cache() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let acache = &fixture.acache;
+        let file_path = Path::parse("a/b/c.txt")?;
+        let mtime = test_time();
+
+        fixture.add_to_cache(&file_path, 100, mtime)?;
+
+        let (a_inode, _) = acache.lookup_path(Path::parse("a")?)?;
+        let (b_inode, _) = acache.lookup_path(Path::parse("a/b")?)?;
+        let (c_inode, _) = acache.lookup_path(Path::parse("a/b/c.txt")?)?;
+        assert_eq!(b_inode, acache.parent_inode(c_inode)?);
+        assert_eq!(a_inode, acache.parent_inode(b_inode)?);
+        assert_eq!(acache.arena_root(), acache.parent_inode(a_inode)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_parent_of_file_in_index() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let acache = &fixture.acache;
+        let index = acache.as_index();
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("a/b/c.txt")?;
+        index.add_file(&path, 100, mtime, Hash([0xfa; 32]))?;
+
+        let (a_inode, _) = acache.lookup_path(Path::parse("a")?)?;
+        let (b_inode, _) = acache.lookup_path(Path::parse("a/b")?)?;
+        let (c_inode, _) = acache.lookup_path(Path::parse("a/b/c.txt")?)?;
+        assert_eq!(b_inode, acache.parent_inode(c_inode)?);
+        assert_eq!(a_inode, acache.parent_inode(b_inode)?);
+        assert_eq!(acache.arena_root(), acache.parent_inode(a_inode)?);
 
         Ok(())
     }

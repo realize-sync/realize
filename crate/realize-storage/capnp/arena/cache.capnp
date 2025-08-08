@@ -9,6 +9,9 @@ struct DirTableEntry {
     dot :group {
       mtime @1: Time;
     }
+    dotDot :group {
+      parent @2: UInt64;
+    }
   }
 }
 struct ReadDirEntry {

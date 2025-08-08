@@ -792,12 +792,14 @@ pub struct FileMetadata {
 pub enum DirTableEntry {
     Regular(ReadDirEntry),
     Dot(UnixTime),
+    DotDot(Inode),
 }
 impl DirTableEntry {
     pub fn into_readdir_entry(self, inode: Inode) -> (Inode, InodeAssignment) {
         match self {
             DirTableEntry::Regular(e) => (e.inode, e.assignment),
             DirTableEntry::Dot(_) => (inode, InodeAssignment::Directory),
+            DirTableEntry::DotDot(parent_inode) => (parent_inode, InodeAssignment::Directory),
         }
     }
 }
@@ -833,6 +835,11 @@ impl ByteConvertible<DirTableEntry> for DirTableEntry {
                     mtime.get_nsecs(),
                 )))
             }
+            cache_capnp::dir_table_entry::DotDot(group) => {
+                let parent = group.get_parent();
+
+                Ok(DirTableEntry::DotDot(Inode(parent)))
+            }
         }
     }
 
@@ -854,6 +861,9 @@ impl ByteConvertible<DirTableEntry> for DirTableEntry {
                 let mut builder = builder.init_dot().init_mtime();
                 builder.set_secs(mtime.as_secs());
                 builder.set_nsecs(mtime.subsec_nanos())
+            }
+            DirTableEntry::DotDot(parent) => {
+                builder.init_dot_dot().set_parent(parent.as_u64());
             }
         }
 
@@ -1099,6 +1109,12 @@ mod tests {
         assert_eq!(
             dot,
             DirTableEntry::from_bytes(dot.clone().to_bytes()?.as_slice())?
+        );
+
+        let dotdot = DirTableEntry::DotDot(Inode(1023));
+        assert_eq!(
+            dotdot,
+            DirTableEntry::from_bytes(dotdot.clone().to_bytes()?.as_slice())?
         );
 
         let regular_dir = DirTableEntry::Regular(ReadDirEntry {
