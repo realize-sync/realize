@@ -6,7 +6,6 @@ use arena_cache::ArenaCache;
 use db::ArenaDatabase;
 use engine::{DirtyPaths, Engine};
 use index::RealIndexAsync;
-use mark::PathMarks;
 use realize_types::{Arena, Hash};
 use std::time::Duration;
 use std::{path::PathBuf, sync::Arc};
@@ -86,7 +85,8 @@ impl ArenaStorage {
             arena,
             Arc::clone(&db),
             indexed.as_ref().map(|indexed| indexed.index.blocking()),
-            arena_cache.clone() as Arc<dyn PathMarks>,
+            arena_cache.clone(),
+            arena_cache.clone(),
             Arc::clone(&dirty_paths),
             arena_root,
             job_retry_strategy,

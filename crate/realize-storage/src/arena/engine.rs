@@ -1,10 +1,10 @@
 #![allow(dead_code)] // work in progress
 
+use super::arena_cache::ArenaCache;
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
 use super::index::RealIndex;
 use super::mark::PathMarks;
 use super::types::{FailedJobTableEntry, LocalAvailability, RetryJob};
-use crate::arena::arena_cache;
 use crate::arena::blob;
 use crate::types::JobId;
 use crate::utils::holder::Holder;
@@ -162,11 +162,13 @@ impl DirtyPaths {
         Ok(())
     }
 }
+
 pub struct Engine {
     arena: Arena,
     db: Arc<ArenaDatabase>,
     dirty_paths: Arc<DirtyPaths>,
     index: Option<Arc<dyn RealIndex>>,
+    cache: Arc<ArenaCache>,
     marks: Arc<dyn PathMarks>,
     arena_root: Inode,
     job_retry_strategy: Box<dyn (Fn(u32) -> Option<Duration>) + Sync + Send + 'static>,
@@ -185,6 +187,7 @@ impl Engine {
         arena: Arena,
         db: Arc<ArenaDatabase>,
         index: Option<Arc<dyn RealIndex>>,
+        cache: Arc<ArenaCache>,
         marks: Arc<dyn PathMarks>,
         dirty_paths: Arc<DirtyPaths>,
         arena_root: Inode,
@@ -196,6 +199,7 @@ impl Engine {
             arena,
             db,
             index,
+            cache,
             marks,
             dirty_paths,
             arena_root,
@@ -579,7 +583,8 @@ impl Engine {
             }
             Ok(Mark::Watch) => {
                 if let (Ok(cached), Ok(Some(indexed))) = (
-                    arena_cache::get_file_entry_for_path(txn, self.arena_root, &path),
+                    self.cache
+                        .get_file_entry_for_path(txn, self.arena_root, &path),
                     self.get_indexed_file(txn, &path),
                 ) && cached.content.hash == indexed.hash
                 {
@@ -590,8 +595,9 @@ impl Engine {
                 }
             }
             Ok(Mark::Keep) => {
-                if let Ok(cached) =
-                    arena_cache::get_file_entry_for_path(txn, self.arena_root, &path)
+                if let Ok(cached) = self
+                    .cache
+                    .get_file_entry_for_path(txn, self.arena_root, &path)
                 {
                     if let Ok(Some(indexed)) = self.get_indexed_file(txn, &path)
                         && cached.content.hash == indexed.hash
@@ -612,8 +618,9 @@ impl Engine {
             }
             Ok(Mark::Own) => {
                 // TODO: treat is as Keep if there is no index.
-                if let Ok(cached) =
-                    arena_cache::get_file_entry_for_path(txn, self.arena_root, &path)
+                if let Ok(cached) = self
+                    .cache
+                    .get_file_entry_for_path(txn, self.arena_root, &path)
                 {
                     let from_index = self.get_indexed_file(txn, &path)?;
                     if from_index.is_none() {
@@ -967,6 +974,7 @@ mod tests {
                 arena,
                 Arc::clone(&db),
                 Some(index.clone()),
+                Arc::clone(&acache),
                 Arc::clone(&marks),
                 Arc::clone(&dirty_paths),
                 arena_root,

@@ -469,6 +469,27 @@ impl ArenaCache {
         Ok(Some(cachepath))
     }
 
+    // Return the default file entry for a path.
+    pub(crate) fn get_file_entry_for_path<T>(
+        &self,
+        txn: &ArenaReadTransaction,
+        root: Inode,
+        path: T,
+    ) -> Result<FileTableEntry, StorageError>
+    where
+        T: AsRef<Path>,
+    {
+        let path = path.as_ref();
+        let dir_table = txn.dir_table()?;
+        let (inode, assignment) = do_lookup_path(&dir_table, root, Some(path))?;
+        if assignment != InodeAssignment::File {
+            return Err(StorageError::IsADirectory);
+        }
+        let file_table = txn.file_table()?;
+
+        get_file_entry(&file_table, inode, None)?.ok_or(StorageError::NotFound)
+    }
+
     /// Write an entry in the file table, overwriting any existing one.
     fn do_write_file_entry(
         &self,
@@ -1434,26 +1455,6 @@ fn do_parent_inode(
     }
 
     Err(StorageError::NotFound)
-}
-
-// Return the default file entry for a path.
-pub(crate) fn get_file_entry_for_path<T>(
-    txn: &ArenaReadTransaction,
-    root: Inode,
-    path: T,
-) -> Result<FileTableEntry, StorageError>
-where
-    T: AsRef<Path>,
-{
-    let path = path.as_ref();
-    let dir_table = txn.dir_table()?;
-    let (inode, assignment) = do_lookup_path(&dir_table, root, Some(path))?;
-    if assignment != InodeAssignment::File {
-        return Err(StorageError::IsADirectory);
-    }
-    let file_table = txn.file_table()?;
-
-    get_file_entry(&file_table, inode, None)?.ok_or(StorageError::NotFound)
 }
 
 /// Get a [FileTableEntry] for a specific peer.
