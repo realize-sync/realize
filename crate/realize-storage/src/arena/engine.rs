@@ -36,18 +36,40 @@ impl Job {
     /// Return the path the job is for.
     pub fn path(&self) -> &Path {
         match self {
-            Job::Download(path, _) => path,
-            Job::Realize(path, _, _) => path,
-            Job::Unrealize(path, _) => path,
+            Self::Download(path, _) => path,
+            Self::Realize(path, _, _) => path,
+            Self::Unrealize(path, _) => path,
         }
     }
 
     /// Return the hash the job is for.
     pub fn hash(&self) -> &Hash {
         match self {
-            Job::Download(_, h) => h,
-            Job::Realize(_, h, _) => h,
-            Job::Unrealize(_, h) => h,
+            Self::Download(_, h) => h,
+            Self::Realize(_, h, _) => h,
+            Self::Unrealize(_, h) => h,
+        }
+    }
+}
+
+/// An extended representation of [Job] that includes jobs not exposed
+/// outside of this crate.
+#[derive(Eq, PartialEq, Debug, Clone)]
+pub(crate) enum StorageJob {
+    External(Job),
+}
+
+impl StorageJob {
+    /// Return the path the job is for.
+    pub(crate) fn path(&self) -> &Path {
+        match self {
+            StorageJob::External(job) => job.path(),
+        }
+    }
+
+    pub(crate) fn into_external(self) -> Option<Job> {
+        match self {
+            Self::External(job) => Some(job),
         }
     }
 }
@@ -197,7 +219,7 @@ impl Engine {
     ///
     /// Multiple streams will return the same results, even in the
     /// same process, as long as no job is marked done or failed.
-    pub fn job_stream(self: &Arc<Engine>) -> ReceiverStream<(JobId, Job)> {
+    pub fn job_stream(self: &Arc<Engine>) -> ReceiverStream<(JobId, StorageJob)> {
         let (tx, rx) = mpsc::channel(1);
         // Using a small buffer to avoid buffering stale jobs.
 
@@ -387,7 +409,10 @@ impl Engine {
         Ok(())
     }
 
-    async fn build_jobs(self: &Arc<Engine>, tx: mpsc::Sender<(JobId, Job)>) -> anyhow::Result<()> {
+    async fn build_jobs(
+        self: &Arc<Engine>,
+        tx: mpsc::Sender<(JobId, StorageJob)>,
+    ) -> anyhow::Result<()> {
         let mut start_counter = 1;
         let mut retry_lower_bound = None;
         let mut retry_jobs_missing_peers = self.retry_jobs_missing_peers.subscribe();
@@ -476,7 +501,7 @@ impl Engine {
     fn next_job(
         &self,
         start_counter: u64,
-    ) -> Result<(Option<(JobId, Job)>, Option<u64>), StorageError> {
+    ) -> Result<(Option<(JobId, StorageJob)>, Option<u64>), StorageError> {
         let txn = self.db.begin_read()?;
         let dirty_log_table = txn.dirty_log_table()?;
         let mut last_counter = None;
@@ -501,7 +526,7 @@ impl Engine {
     async fn build_job_with_counter(
         self: &Arc<Self>,
         counter: u64,
-    ) -> Result<Option<(JobId, Job)>, StorageError> {
+    ) -> Result<Option<(JobId, StorageJob)>, StorageError> {
         let this = Arc::clone(self);
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
@@ -521,7 +546,7 @@ impl Engine {
     pub(crate) async fn job_for_path<T>(
         self: &Arc<Self>,
         path: T,
-    ) -> Result<Option<(JobId, Job)>, StorageError>
+    ) -> Result<Option<(JobId, StorageJob)>, StorageError>
     where
         T: AsRef<Path>,
     {
@@ -547,7 +572,7 @@ impl Engine {
         txn: &ArenaReadTransaction,
         path: Path,
         counter: u64,
-    ) -> Result<Option<(JobId, Job)>, StorageError> {
+    ) -> Result<Option<(JobId, StorageJob)>, StorageError> {
         match self.marks.get_mark_txn(txn, &path) {
             Err(_) => {
                 return Ok(None);
@@ -560,7 +585,7 @@ impl Engine {
                 {
                     return Ok(Some((
                         JobId(counter),
-                        Job::Unrealize(path, cached.content.hash),
+                        StorageJob::External(Job::Unrealize(path, cached.content.hash)),
                     )));
                 }
             }
@@ -573,14 +598,14 @@ impl Engine {
                     {
                         return Ok(Some((
                             JobId(counter),
-                            Job::Unrealize(path, cached.content.hash),
+                            StorageJob::External(Job::Unrealize(path, cached.content.hash)),
                         )));
                     }
 
                     if blob::local_availability(txn, &cached)? != LocalAvailability::Verified {
                         return Ok(Some((
                             JobId(counter),
-                            Job::Download(path, cached.content.hash),
+                            StorageJob::External(Job::Download(path, cached.content.hash)),
                         )));
                     }
                 }
@@ -595,7 +620,7 @@ impl Engine {
                         // File is missing from the index, move it there.
                         return Ok(Some((
                             JobId(counter),
-                            Job::Realize(path, cached.content.hash, None),
+                            StorageJob::External(Job::Realize(path, cached.content.hash, None)),
                         )));
                     }
                     if let Some(indexed) = from_index
@@ -607,7 +632,11 @@ impl Engine {
                     {
                         return Ok(Some((
                             JobId(counter),
-                            Job::Realize(path, cached.content.hash, Some(indexed.hash)),
+                            StorageJob::External(Job::Realize(
+                                path,
+                                cached.content.hash,
+                                Some(indexed.hash),
+                            )),
                         )));
                     }
                 }
@@ -1177,7 +1206,13 @@ mod tests {
         fixture.add_file_to_cache(&barfile)?;
 
         let job = next_with_timeout(&mut job_stream).await?;
-        assert_eq!(Some((JobId(1), Job::Download(barfile, test_hash()))), job);
+        assert_eq!(
+            Some((
+                JobId(1),
+                StorageJob::External(Job::Download(barfile, test_hash()))
+            )),
+            job
+        );
 
         Ok(())
     }
@@ -1192,7 +1227,10 @@ mod tests {
         fixture.add_file_to_cache(&barfile)?;
         let mut job_stream2 = fixture.engine.job_stream();
 
-        let goal_job = Some((JobId(1), Job::Download(barfile, test_hash())));
+        let goal_job = Some((
+            JobId(1),
+            StorageJob::External(Job::Download(barfile, test_hash())),
+        ));
         assert_eq!(goal_job, next_with_timeout(&mut job_stream).await?);
         assert_eq!(goal_job, next_with_timeout(&mut job_stream2).await?);
 
@@ -1214,7 +1252,13 @@ mod tests {
         let job = next_with_timeout(&mut job_stream).await?;
         // Counter is 2, because the job was created after the 2nd
         // change only.
-        assert_eq!(Some((JobId(2), Job::Download(barfile, test_hash()))), job);
+        assert_eq!(
+            Some((
+                JobId(2),
+                StorageJob::External(Job::Download(barfile, test_hash()))
+            )),
+            job
+        );
 
         // The entries before the job that have been deleted.
         assert_eq!(Some(2), fixture.lowest_counter()?);
@@ -1241,7 +1285,13 @@ mod tests {
         let mut job_stream = fixture.engine.job_stream();
 
         let job = next_with_timeout(&mut job_stream).await?;
-        assert_eq!(Some((JobId(1), Job::Download(barfile, test_hash()))), job);
+        assert_eq!(
+            Some((
+                JobId(1),
+                StorageJob::External(Job::Download(barfile, test_hash()))
+            )),
+            job
+        );
 
         Ok(())
     }
@@ -1265,7 +1315,13 @@ mod tests {
         let mut job_stream = fixture.engine.job_stream();
 
         let job = next_with_timeout(&mut job_stream).await?;
-        assert_eq!(Some((JobId(1), Job::Download(barfile, test_hash()))), job);
+        assert_eq!(
+            Some((
+                JobId(1),
+                StorageJob::External(Job::Download(barfile, test_hash()))
+            )),
+            job
+        );
 
         Ok(())
     }
@@ -1295,7 +1351,13 @@ mod tests {
 
         let job = next_with_timeout(&mut job_stream).await?;
         // 1 has been skipped, because it is fully downloaded
-        assert_eq!(Some((JobId(2), Job::Download(otherfile, test_hash()))), job);
+        assert_eq!(
+            Some((
+                JobId(2),
+                StorageJob::External(Job::Download(otherfile, test_hash()))
+            )),
+            job
+        );
 
         // The entries before the job that have been deleted.
         assert_eq!(Some(2), fixture.lowest_counter()?);
@@ -1323,7 +1385,13 @@ mod tests {
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
         // 1 and 2 have been skipped; as they correspond to barfile
         // creation and deletion.
-        assert_eq!((JobId(3), Job::Download(otherfile, test_hash())), job);
+        assert_eq!(
+            (
+                JobId(3),
+                StorageJob::External(Job::Download(otherfile, test_hash()))
+            ),
+            job
+        );
 
         // The entries before the job that have been deleted.
         assert_eq!(Some(3), fixture.lowest_counter()?);
@@ -1342,7 +1410,13 @@ mod tests {
         let mut job_stream = fixture.engine.job_stream();
 
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert_eq!((JobId(1), Job::Realize(foobar, test_hash(), None)), job);
+        assert_eq!(
+            (
+                JobId(1),
+                StorageJob::External(Job::Realize(foobar, test_hash(), None))
+            ),
+            job
+        );
 
         Ok(())
     }
@@ -1411,7 +1485,7 @@ mod tests {
         assert_eq!(
             (
                 JobId(3),
-                Job::Realize(foobar, Hash([2; 32]), Some(Hash([1; 32])))
+                StorageJob::External(Job::Realize(foobar, Hash([2; 32]), Some(Hash([1; 32]))))
             ),
             job
         );
@@ -1436,7 +1510,10 @@ mod tests {
         // job isn't really done, since the file wasn't downloaded; this isn't checked).
         let mut job_stream = fixture.engine.job_stream();
         assert_eq!(
-            Some((JobId(2), Job::Download(otherfile, test_hash()))),
+            Some((
+                JobId(2),
+                StorageJob::External(Job::Download(otherfile, test_hash()))
+            )),
             next_with_timeout(&mut job_stream).await?
         );
 
@@ -1465,7 +1542,10 @@ mod tests {
         // for now, is the logging.
         let mut job_stream = fixture.engine.job_stream();
         assert_eq!(
-            Some((JobId(2), Job::Download(otherfile, test_hash()))),
+            Some((
+                JobId(2),
+                StorageJob::External(Job::Download(otherfile, test_hash()))
+            )),
             next_with_timeout(&mut job_stream).await?
         );
 

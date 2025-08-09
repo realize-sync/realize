@@ -234,7 +234,17 @@ impl Storage {
     pub fn job_stream(&self) -> impl Stream<Item = (Arena, JobId, Job)> {
         self.arena_storage
             .iter()
-            .map(|(arena, storage)| (*arena, Box::pin(storage.engine.job_stream())))
+            .map(|(arena, storage)| {
+                (
+                    *arena,
+                    Box::pin(
+                        storage
+                            .engine
+                            .job_stream()
+                            .filter_map(|(job_id, job)| job.into_external().map(|j| (job_id, j))),
+                    ),
+                )
+            })
             .collect::<StreamMap<Arena, _>>()
             .map(|(arena, (job_id, job))| (arena, job_id, job))
     }
@@ -279,7 +289,10 @@ impl Storage {
         arena: Arena,
         path: &Path,
     ) -> Result<Option<(JobId, Job)>, StorageError> {
-        self.engine(arena)?.job_for_path(path).await
+        match self.engine(arena)?.job_for_path(path).await? {
+            None => Ok(None),
+            Some((id, job)) => Ok(job.into_external().map(|j| (id, j))),
+        }
     }
 
     /// Return the engine for an arena.
