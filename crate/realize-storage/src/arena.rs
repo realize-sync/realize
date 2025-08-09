@@ -171,7 +171,9 @@ impl ArenaStorage {
         let done = task::spawn_blocking(move || {
             let txn = db.begin_write()?;
             if let Some(realpath) = index.get_indexed_file_txn(&txn, &root, &path, Some(&hash))? {
-                if let Some(cachepath) = cache.move_into_blob_if_matches(&txn, &path, &hash)? {
+                if let Some(cachepath) =
+                    cache.move_into_blob_if_matches(&txn, &path, &hash, &realpath.metadata()?)?
+                {
                     // drop_file_if_matches makes a second check of
                     // the file mtime and size just before renaming,
                     // in case it has changed.

@@ -4,7 +4,7 @@ use super::types::{
     BlobTableEntry, FileTableEntry, LocalAvailability, LruQueueId, QueueTableEntry,
 };
 use crate::StorageError;
-use crate::types::{BlobId, Inode};
+use crate::types::BlobId;
 use crate::utils::holder::Holder;
 use realize_types::{ByteRange, ByteRanges, Hash};
 use redb::ReadableTable;
@@ -17,6 +17,14 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt as _, ReadBuf};
+
+// Arbitrary disk space considered to be occupied by an inode.
+//
+// This value is added to the disk usage estimates. It is meant to
+// account for the disk space used by the inode itself, so it doesn't
+// look like empty files are free. This is arbitrary and might not
+// correspond to the actual value, as it depends on the filesystem.
+const INODE_DISK_USAGE: u64 = 512;
 
 /// A blob store that handles blob-specific operations.
 ///
@@ -75,35 +83,25 @@ impl Blobstore {
     /// Create a new blob and returns its [Blob]
     pub(crate) fn create_blob(
         self: &Arc<Self>,
-        inode: Inode,
         txn: &ArenaWriteTransaction,
         file_entry: FileTableEntry,
     ) -> Result<Blob, StorageError> {
         let mut blob_table = txn.blob_table()?;
         let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
         let mut blob_next_id_table = txn.blob_next_id_table()?;
-        let (blob_id, blob_entry) = if let Some(blob_id) = file_entry.content.blob {
-            let blob_entry = if let Some(e) = blob_table.get(blob_id)? {
-                e.value().parse()?
-            } else {
-                do_create_blob_entry_with_id(&mut blob_lru_queue_table, &mut blob_table, blob_id)?
-            };
-
-            (blob_id, blob_entry)
-        } else {
-            let (blob_id, blob_entry) = do_create_blob_entry(
-                &mut blob_lru_queue_table,
-                &mut blob_table,
-                &mut blob_next_id_table,
-            )?;
-            log::debug!(
-                "assigned blob {blob_id} to file {inode} {}",
-                file_entry.content.hash
-            );
-
-            (blob_id, blob_entry)
+        let blob_id = match file_entry.content.blob {
+            Some(blob_id) => blob_id,
+            None => alloc_blob_id(&mut blob_next_id_table)?,
         };
         let file = self.open_blob_file(blob_id, file_entry.metadata.size, true)?;
+        let blob_entry = init_blob_entry(
+            &mut blob_lru_queue_table,
+            &mut blob_table,
+            blob_id,
+            &file.metadata()?,
+        )?;
+        blob_table.insert(blob_id, Holder::new(&blob_entry)?)?;
+
         Ok(Blob::new(
             blob_id,
             file_entry,
@@ -168,18 +166,14 @@ impl Blobstore {
             let mut blob_table = txn.blob_table()?;
             let mut blob_entry = get_blob_entry(&blob_table, blob_id)?;
             if blob_entry.prev.is_none() {
-                // Already at the head of its queue
+                // Already the head
                 return Ok(());
             }
-            log::debug!("{blob_id} moved to the front of {:?}", blob_entry.queue);
-            let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
 
-            let queue_id = blob_entry.queue;
-            remove_from_queue(&mut blob_lru_queue_table, &mut blob_table, &blob_entry)?;
-            add_to_queue_front(
+            let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
+            move_to_front(
                 &mut blob_lru_queue_table,
                 &mut blob_table,
-                queue_id,
                 blob_id,
                 &mut blob_entry,
             )?;
@@ -189,17 +183,6 @@ impl Blobstore {
         txn.commit()?;
 
         Ok(())
-    }
-
-    /// Calculate disk usage for a blob file using Unix metadata.
-    fn calculate_disk_usage(&self, blob_id: BlobId) -> u64 {
-        match std::fs::metadata(self.blob_path(blob_id)) {
-            // Only take into account actual usage, not the whole file
-            // size, which might be sparse.
-            Ok(m) => m.blocks() * 512,
-            // Most likely, file is gone. Let's not complain here
-            Err(_) => 0,
-        }
     }
 
     /// Extend the local availability of a blob.
@@ -214,25 +197,18 @@ impl Blobstore {
             let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
             let mut blob_entry = get_blob_entry(&blob_table, blob_id)?;
 
-            let disk_usage = self.calculate_disk_usage(blob_id);
-            let disk_usage_diff = disk_usage as i64 - (blob_entry.disk_usage as i64);
-
             blob_entry.written_areas = blob_entry.written_areas.union(&new_range);
-            blob_entry.disk_usage = disk_usage;
-
             log::debug!(
-                "{blob_id} extended by {new_range}; available: {}; disk usage diff: {disk_usage_diff}",
+                "{blob_id} extended by {new_range}; available: {}",
                 blob_entry.written_areas
             );
-
-            // Update the blob entry
-            blob_table.insert(blob_id, Holder::new(&blob_entry)?)?;
-
-            let queue_id = blob_entry.queue;
-
-            if disk_usage_diff != 0 {
-                update_total_disk_usage(&mut blob_lru_queue_table, queue_id, disk_usage_diff)?;
+            if let Ok(metadata) = self.blob_path(blob_id).metadata() {
+                update_disk_usage(&mut blob_lru_queue_table, &mut blob_entry, &metadata)?;
             }
+            // This function is not an appropriate place to complain
+            // about missing file; just ignore the issue for now.
+
+            blob_table.insert(blob_id, Holder::new(&blob_entry)?)?;
         }
         txn.commit()?;
 
@@ -291,29 +267,22 @@ impl Blobstore {
     pub(crate) fn move_into_blob(
         &self,
         txn: &ArenaWriteTransaction,
-        blob_id: Option<BlobId>,
-        size: u64,
+        id: Option<BlobId>,
+        metadata: &std::fs::Metadata,
     ) -> Result<(BlobId, PathBuf), StorageError> {
         let mut blob_table = txn.blob_table()?;
         let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
         let mut blob_next_id_table = txn.blob_next_id_table()?;
-        let (blob_id, mut entry) = match blob_id {
-            Some(blob_id) => {
-                let entry = get_blob_entry(&blob_table, blob_id)?;
-
-                (blob_id, entry)
-            }
-            None => do_create_blob_entry(
-                &mut blob_lru_queue_table,
-                &mut blob_table,
-                &mut blob_next_id_table,
-            )?,
+        let id = match id {
+            Some(blob_id) => blob_id,
+            None => alloc_blob_id(&mut blob_next_id_table)?,
         };
-        let dest = self.blob_path(blob_id);
-        entry.written_areas = ByteRanges::single(0, size);
-        blob_table.insert(blob_id, Holder::new(&entry)?)?;
+        let mut entry = init_blob_entry(&mut blob_lru_queue_table, &mut blob_table, id, metadata)?;
+        entry.written_areas = ByteRanges::single(0, metadata.len());
+        update_disk_usage(&mut blob_lru_queue_table, &mut entry, metadata)?;
+        blob_table.insert(id, Holder::with_content(entry)?)?;
 
-        Ok((blob_id, dest))
+        Ok((id, self.blob_path(id)))
     }
 
     /// Remove blobs from the back of the WorkingArea queue until the total
@@ -383,17 +352,55 @@ impl Blobstore {
     }
 }
 
-fn remove_blob_entry(
-    blob_table: &mut redb::Table<'_, BlobId, Holder<'static, BlobTableEntry>>,
+/// Move the blob to the front of its queue
+fn move_to_front(
     blob_lru_queue_table: &mut redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
+    blob_table: &mut redb::Table<'_, BlobId, Holder<'static, BlobTableEntry>>,
     blob_id: BlobId,
+    blob_entry: &mut BlobTableEntry,
 ) -> Result<(), StorageError> {
-    let removed = blob_table.remove(blob_id)?;
-    let removed_entry = removed.map(|r| r.value().parse());
-    Ok(if let Some(entry) = removed_entry {
-        let entry = entry?;
-        remove_from_queue(blob_lru_queue_table, blob_table, &entry)?;
-    })
+    if blob_entry.prev.is_none() {
+        // Already at the head of its queue
+        return Ok(());
+    }
+
+    log::debug!("{blob_id} moved to the front of {:?}", blob_entry.queue);
+    let queue_id = blob_entry.queue;
+    remove_from_queue(blob_lru_queue_table, blob_table, blob_entry)?;
+    add_to_queue_front(
+        blob_lru_queue_table,
+        blob_table,
+        queue_id,
+        blob_id,
+        blob_entry,
+    )?;
+    Ok(())
+}
+
+/// Calculate disk usage for a blob file using Unix metadata.
+fn calculate_disk_usage(metadata: &std::fs::Metadata) -> u64 {
+    // block() takes into account actual usage, not the whole file
+    // size, which might be sparse. Include the inode size into the
+    // computation.
+    metadata.blocks() * 512 + INODE_DISK_USAGE
+}
+
+/// Update disk usage in the given blob entry and the total in its
+/// containing table.
+fn update_disk_usage(
+    blob_lru_queue_table: &mut redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
+    entry: &mut BlobTableEntry,
+    metadata: &std::fs::Metadata,
+) -> Result<(), StorageError> {
+    let disk_usage = calculate_disk_usage(metadata);
+    let disk_usage_diff = disk_usage as i64 - (entry.disk_usage as i64);
+    if disk_usage_diff == 0 {
+        return Ok(());
+    }
+    entry.disk_usage = disk_usage;
+    update_total_disk_usage(blob_lru_queue_table, entry.queue, disk_usage_diff)?;
+
+    Ok(())
 }
 
 fn update_total_disk_usage(
@@ -405,6 +412,19 @@ fn update_total_disk_usage(
     entry.disk_usage = entry.disk_usage.saturating_add_signed(diff);
     blob_lru_queue_table.insert(queue_id as u16, Holder::with_content(entry)?)?;
     Ok(())
+}
+
+fn remove_blob_entry(
+    blob_table: &mut redb::Table<'_, BlobId, Holder<'static, BlobTableEntry>>,
+    blob_lru_queue_table: &mut redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
+    blob_id: BlobId,
+) -> Result<(), StorageError> {
+    let removed = blob_table.remove(blob_id)?;
+    let removed_entry = removed.map(|r| r.value().parse());
+    Ok(if let Some(entry) = removed_entry {
+        let entry = entry?;
+        remove_from_queue(blob_lru_queue_table, blob_table, &entry)?;
+    })
 }
 
 fn get_queue_if_available(
@@ -430,47 +450,48 @@ fn get_queue_must_exist(
         .parse()?)
 }
 
-fn do_create_blob_entry(
-    blob_lru_queue_table: &mut redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
-    blob_table: &mut redb::Table<'_, BlobId, Holder<'static, BlobTableEntry>>,
+fn alloc_blob_id(
     blob_next_id_table: &mut redb::Table<'_, (), BlobId>,
-) -> Result<(BlobId, BlobTableEntry), StorageError> {
+) -> Result<BlobId, StorageError> {
     let blob_id = match blob_next_id_table.get(())? {
         Some(entry) => entry.value().plus(1),
         None => BlobId(1), // First blob ever
     };
     blob_next_id_table.insert((), blob_id)?;
 
-    Ok((
-        blob_id,
-        do_create_blob_entry_with_id(blob_lru_queue_table, blob_table, blob_id)?,
-    ))
+    Ok(blob_id)
 }
 
-fn do_create_blob_entry_with_id(
+fn init_blob_entry(
     blob_lru_queue_table: &mut redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
     blob_table: &mut redb::Table<'_, BlobId, Holder<'static, BlobTableEntry>>,
-    blob_id: BlobId,
+    id: BlobId,
+    metadata: &std::fs::Metadata,
 ) -> Result<BlobTableEntry, StorageError> {
-    let mut blob_entry = BlobTableEntry {
-        written_areas: ByteRanges::new(),
-        content_hash: None,
-        queue: LruQueueId::WorkingArea,
-        next: None,
-        prev: None,
-        disk_usage: 0,
+    let mut entry = if let Some(e) = blob_table.get(id)? {
+        e.value().parse()?
+    } else {
+        let mut entry = BlobTableEntry {
+            written_areas: ByteRanges::new(),
+            content_hash: None,
+            queue: LruQueueId::WorkingArea,
+            next: None,
+            prev: None,
+            disk_usage: 0,
+        };
+        add_to_queue_front(
+            blob_lru_queue_table,
+            blob_table,
+            LruQueueId::WorkingArea,
+            id,
+            &mut entry,
+        )?;
+
+        entry
     };
+    update_disk_usage(blob_lru_queue_table, &mut entry, metadata)?;
 
-    add_to_queue_front(
-        blob_lru_queue_table,
-        blob_table,
-        LruQueueId::WorkingArea,
-        blob_id,
-        &mut blob_entry,
-    )?;
-
-    blob_table.insert(blob_id, Holder::new(&blob_entry)?)?;
-    Ok(blob_entry)
+    Ok(entry)
 }
 
 pub(crate) fn blob_exists(txn: &ArenaReadTransaction, id: BlobId) -> Result<bool, StorageError> {
@@ -1747,18 +1768,16 @@ mod tests {
         // Create a file and add it to the cache
         let inode = fixture.add_file(file_path.as_str(), 48)?;
 
-        // Use move_into_blob_if_matches to get a path to write to
+        let tmpfile = fixture.tempdir.child("tmp");
+        tmpfile.write_str("When you light a candle, you also cast a shadow.")?;
+
         let txn = fixture.begin_write()?;
         let path_in_cache = acache
-            .move_into_blob_if_matches(&txn, &file_path, &test_hash())?
+            .move_into_blob_if_matches(&txn, &file_path, &test_hash(), &tmpfile.path().metadata()?)?
             .unwrap();
         txn.commit()?;
 
-        // Write some test data to the returned file path
-        std::fs::write(
-            &path_in_cache,
-            b"When you light a candle, you also cast a shadow.",
-        )?;
+        std::fs::rename(tmpfile.path(), path_in_cache)?;
 
         // Now open the file through the normal open_file mechanism
         let mut blob = acache.open_file(inode)?;
@@ -1769,6 +1788,10 @@ mod tests {
             buf
         );
         assert_eq!(ByteRanges::single(0, 48), *blob.local_availability());
+
+        // Disk usage must be set.
+        let blob_entry = fixture.get_blob_entry(blob.id())?;
+        assert!(blob_entry.disk_usage > INODE_DISK_USAGE);
 
         Ok(())
     }
@@ -1786,17 +1809,15 @@ mod tests {
         let existing_blob_id = acache.open_file(inode)?.id();
 
         // Now use move_into_blob_if_matches with the existing blob
+        let tmpfile = fixture.tempdir.child("tmp");
+        tmpfile.write_str("What sane person could live in this world and not be crazy?")?;
+
         let txn = fixture.begin_write()?;
         let dest_path = acache
-            .move_into_blob_if_matches(&txn, &file_path, &test_hash())?
+            .move_into_blob_if_matches(&txn, &file_path, &test_hash(), &tmpfile.path().metadata()?)?
             .unwrap();
         txn.commit()?;
-
-        // Write test data to the returned file path
-        std::fs::write(
-            &dest_path,
-            b"What sane person could live in this world and not be crazy?",
-        )?;
+        std::fs::rename(tmpfile.path(), dest_path)?;
 
         // Open the file again and verify we can read the content within the ranges
         let mut blob = acache.open_file(inode)?;
@@ -1810,6 +1831,36 @@ mod tests {
         );
         assert_eq!(ByteRanges::single(0, 59), *blob.local_availability());
 
+        // Disk usage must be set.
+        let blob_entry = fixture.get_blob_entry(blob.id())?;
+        assert!(blob_entry.disk_usage > INODE_DISK_USAGE);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn move_into_blob_if_matches_reject_wrong_file_size() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let acache = &fixture.acache;
+        let file_path = Path::parse("test.txt")?;
+
+        // Create a file and add it to the cache
+        fixture.add_file(file_path.as_str(), 48)?;
+
+        let tmpfile = fixture.tempdir.child("tmp");
+        tmpfile.write_str("not 48 bytes")?;
+
+        let txn = fixture.begin_write()?;
+        assert_eq!(
+            None,
+            acache.move_into_blob_if_matches(
+                &txn,
+                &file_path,
+                &test_hash(),
+                &tmpfile.path().metadata()?
+            )?
+        );
+
         Ok(())
     }
 
@@ -1820,13 +1871,22 @@ mod tests {
         let file_path = Path::parse("test.txt")?;
 
         // Create a file and add it to the cache
-        fixture.add_file(file_path.as_str(), 10)?;
+        fixture.add_file(file_path.as_str(), 5)?;
 
         let txn = fixture.begin_write()?;
+
+        let tmpfile = fixture.tempdir.child("tmp");
+        tmpfile.write_str("hello")?;
+
         // hash is test_hash(), which is not [99; 32]
         assert_eq!(
             None,
-            acache.move_into_blob_if_matches(&txn, &file_path, &Hash([99; 32]))?
+            acache.move_into_blob_if_matches(
+                &txn,
+                &file_path,
+                &Hash([99; 32]),
+                &tmpfile.metadata()?
+            )?
         );
 
         Ok(())
@@ -1973,7 +2033,8 @@ mod tests {
         let blob_id = acache.open_file(inode)?.id();
 
         let blob_entry = fixture.get_blob_entry(blob_id)?;
-        assert_eq!(0, blob_entry.disk_usage);
+        // 512 bytes for an empty file, to account for inode usage.
+        assert_eq!(INODE_DISK_USAGE, blob_entry.disk_usage);
 
         // Write some data to the blob
         let mut blob = acache.open_file(inode)?;
@@ -1983,7 +2044,7 @@ mod tests {
         // disk usage is now 1 block
         let blksize = fs::metadata(fixture.blob_path(blob.id())).await?.blksize();
         let blob_entry = fixture.get_blob_entry(blob_id)?;
-        assert_eq!(blob_entry.disk_usage, blksize);
+        assert_eq!(blob_entry.disk_usage, blksize + INODE_DISK_USAGE);
 
         assert_eq!(
             blob_entry.disk_usage,
@@ -2054,10 +2115,13 @@ mod tests {
 
         // Check queue total disk usage
         assert_eq!(
-            2 * blksize,
+            2 * blksize + 2 * INODE_DISK_USAGE,
             fixture.queue_disk_usage(LruQueueId::WorkingArea)?
         );
-        assert_eq!(2 * blksize, blob_entry1.disk_usage + blob_entry2.disk_usage);
+        assert_eq!(
+            2 * blksize + 2 * INODE_DISK_USAGE,
+            blob_entry1.disk_usage + blob_entry2.disk_usage
+        );
 
         Ok(())
     }
@@ -2150,14 +2214,11 @@ mod tests {
         let blob_id1 = acache.open_file(inode1)?.id();
         let blob_id2 = acache.open_file(inode2)?.id();
 
-        // Write data to blobs
+        // Write data so there is something to cleanup
         let mut blob1 = acache.open_file(inode1)?;
         blob1.write(b"data for blob 1").await?;
         blob1.update_db().await?;
-
-        let mut blob2 = acache.open_file(inode2)?;
-        blob2.write(b"data for blob 2").await?;
-        blob2.update_db().await?;
+        drop(blob1);
 
         // Verify blobs exist
         assert!(fixture.blob_entry_exists(blob_id1)?);

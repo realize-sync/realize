@@ -345,10 +345,12 @@ impl ArenaCache {
         let ret = {
             let mut file_table = txn.file_table()?;
             let mut file_entry = get_default_entry(&file_table, inode)?;
-            let blob = self
-                .blobstore
-                .create_blob(inode, &txn, file_entry.clone())?;
-
+            let blob = self.blobstore.create_blob(&txn, file_entry.clone())?;
+            log::debug!(
+                "[{}] assigned blob {} to file {inode}",
+                self.arena,
+                blob.id()
+            );
             file_entry.content.blob = Some(blob.id());
             file_table.insert(FileTableKey::Default(inode), Holder::new(&file_entry)?)?;
 
@@ -417,6 +419,7 @@ impl ArenaCache {
         txn: &ArenaWriteTransaction,
         path: T,
         hash: &Hash,
+        metadata: &std::fs::Metadata,
     ) -> Result<Option<PathBuf>, StorageError>
     where
         T: AsRef<Path>,
@@ -441,14 +444,12 @@ impl ArenaCache {
                 return Err(err);
             }
         };
-        if file_entry.content.hash != *hash {
+        if file_entry.content.hash != *hash || file_entry.metadata.size != metadata.len() {
             return Ok(None);
         }
-        let (blob_id, cachepath) = self.blobstore.move_into_blob(
-            &txn,
-            file_entry.content.blob,
-            file_entry.metadata.size,
-        )?;
+        let (blob_id, cachepath) =
+            self.blobstore
+                .move_into_blob(&txn, file_entry.content.blob, metadata)?;
         file_entry.content.blob = Some(blob_id);
         file_table.insert(
             FileTableKey::Default(inode),
