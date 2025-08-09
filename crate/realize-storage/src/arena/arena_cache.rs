@@ -1145,7 +1145,7 @@ impl PathMarks for ArenaCache {
         let dir_table = txn.dir_table()?;
         let (inode, _) = do_lookup_path(&dir_table, self.arena_root, Some(path))?;
 
-        let mark_table = txn.inode_mark_table()?;
+        let mark_table = txn.mark_table()?;
         let file_table = txn.file_table()?;
 
         Ok(resolve_mark(&mark_table, &dir_table, &file_table, inode)?)
@@ -1156,7 +1156,7 @@ impl PathMarks for ArenaCache {
         {
             let inode = self.arena_root;
 
-            let mut mark_table = txn.inode_mark_table()?;
+            let mut mark_table = txn.mark_table()?;
             let dir_table = txn.dir_table()?;
             let file_table = txn.file_table()?;
             let old_mark = resolve_mark(&mark_table, &dir_table, &file_table, inode)?;
@@ -1177,7 +1177,7 @@ impl PathMarks for ArenaCache {
             let dir_table = txn.dir_table()?;
             let (inode, assignment) = do_lookup_path(&dir_table, self.arena_root, Some(path))?;
 
-            let mut mark_table = txn.inode_mark_table()?;
+            let mut mark_table = txn.mark_table()?;
             let file_table = txn.file_table()?;
             let old_mark = resolve_mark(&mark_table, &dir_table, &file_table, inode)?;
             mark_table.insert(inode, Holder::with_content(MarkTableEntry { mark })?)?;
@@ -1204,7 +1204,7 @@ impl PathMarks for ArenaCache {
             let dir_table = txn.dir_table()?;
             let (inode, assignment) = do_lookup_path(&dir_table, self.arena_root, Some(path))?;
 
-            let mut mark_table = txn.inode_mark_table()?;
+            let mut mark_table = txn.mark_table()?;
             let old_mark = match mark_table.remove(inode)? {
                 Some(entry) => Some(entry.value().parse()?.mark),
                 None => None,
