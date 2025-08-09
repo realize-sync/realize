@@ -344,10 +344,15 @@ impl ArenaCache {
         let txn = self.db.begin_write()?;
         let ret = {
             let mut file_table = txn.file_table()?;
+            let dir_table = txn.dir_table()?;
+            let mark_table = txn.mark_table()?;
             let mut file_entry = get_default_entry(&file_table, inode)?;
-            let blob = self.blobstore.create_blob(&txn, file_entry.clone())?;
+            let queue = queue_for_inode(&mark_table, &dir_table, &file_table, inode)?;
+            let blob = self
+                .blobstore
+                .create_blob(&txn, file_entry.clone(), queue)?;
             log::debug!(
-                "[{}] assigned blob {} to file {inode}",
+                "[{}] assigned blob {} in {queue:?} to file {inode}",
                 self.arena,
                 blob.id()
             );
@@ -447,9 +452,14 @@ impl ArenaCache {
         if file_entry.content.hash != *hash || file_entry.metadata.size != metadata.len() {
             return Ok(None);
         }
-        let (blob_id, cachepath) =
-            self.blobstore
-                .move_into_blob(&txn, file_entry.content.blob, metadata)?;
+        let mark_table = txn.mark_table()?;
+        let dir_table = txn.dir_table()?;
+        let (blob_id, cachepath) = self.blobstore.move_into_blob(
+            &txn,
+            file_entry.content.blob,
+            queue_for_inode(&mark_table, &dir_table, &file_table, inode)?,
+            metadata,
+        )?;
         file_entry.content.blob = Some(blob_id);
         file_table.insert(
             FileTableKey::Default(inode),
@@ -710,8 +720,7 @@ impl ArenaCache {
     /// This method removes the least recently used blobs first, but skips blobs that are currently open.
     #[allow(dead_code)]
     pub(crate) fn cleanup_cache(&self, target_size: u64) -> Result<(), StorageError> {
-        self.blobstore
-            .cleanup_cache(LruQueueId::WorkingArea, target_size)
+        self.blobstore.cleanup_cache(target_size)
     }
 
     /// Allocate a new inode, extending the range if necessary.
@@ -841,6 +850,25 @@ impl ArenaCache {
         }
 
         Ok(())
+    }
+}
+
+/// Choose the appropriate blob queue for the inode, given its mark.
+fn queue_for_inode(
+    mark_table: &impl ReadableTable<Inode, Holder<'static, MarkTableEntry>>,
+    dir_table: &impl ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
+    file_table: &impl ReadableTable<FileTableKey, Holder<'static, FileTableEntry>>,
+    inode: Inode,
+) -> Result<LruQueueId, StorageError> {
+    let mark = resolve_mark(mark_table, dir_table, file_table, inode)?;
+    Ok(queue_for_mark(mark))
+}
+
+/// Choose the appropriate queue given a file mark.
+fn queue_for_mark(mark: Mark) -> LruQueueId {
+    match mark {
+        Mark::Watch => LruQueueId::WorkingArea,
+        Mark::Keep | Mark::Own => LruQueueId::Protected,
     }
 }
 

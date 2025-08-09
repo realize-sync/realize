@@ -40,7 +40,7 @@ struct ByteRange {
 # LRU Queue ID enum
 enum LruQueueId {
   workingArea @0;
-  protectedArea @1;
+  protected @1;
   pendingRemoval @2;
 }
 

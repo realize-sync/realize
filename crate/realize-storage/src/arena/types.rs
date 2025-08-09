@@ -939,7 +939,7 @@ mod tests {
         let empty_entry = BlobTableEntry {
             written_areas: realize_types::ByteRanges::from_ranges(vec![]),
             content_hash: Some(Hash([0x03; 32])),
-            queue: LruQueueId::ProtectedArea,
+            queue: LruQueueId::WorkingArea,
             next: None,
             prev: None,
             disk_usage: 0,
