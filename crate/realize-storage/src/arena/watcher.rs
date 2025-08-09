@@ -713,10 +713,11 @@ mod tests {
 
     use crate::arena::arena_cache::ArenaCache;
     use crate::arena::db::ArenaDatabase;
+    use crate::arena::engine::DirtyPaths;
     use crate::arena::types::IndexedFileTableEntry;
     use crate::realize_types::Arena;
     use crate::utils::{hash, redb_utils};
-    use crate::{DirtyPaths, GlobalDatabase, InodeAllocator};
+    use crate::{GlobalDatabase, InodeAllocator};
     use realize_types::Hash;
 
     use super::*;

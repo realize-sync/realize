@@ -3,8 +3,9 @@ use assert_fs::prelude::*;
 use realize_core::config::Config;
 use realize_core::setup::SetupHelper;
 use realize_storage::Mark;
+use realize_storage::Notification;
 use realize_storage::config::{ArenaConfig, CacheConfig};
-use realize_types::{Arena, Peer};
+use realize_types::{Arena, Hash, Path, Peer, UnixTime};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::process::Command;
@@ -25,6 +26,7 @@ fn command_path(cmd: &str) -> PathBuf {
 struct Fixture {
     _tempdir: TempDir,
     socket: PathBuf,
+    arena: Arena,
     setup: SetupHelper,
 }
 
@@ -73,6 +75,7 @@ impl Fixture {
         setup.bind_control_socket(local, Some(&socket)).await?;
 
         Ok(Self {
+            arena,
             _tempdir: tempdir,
             socket,
             setup,
@@ -88,6 +91,26 @@ impl Fixture {
             .kill_on_drop(true);
 
         Ok(cmd)
+    }
+
+    async fn add_file_to_cache(&self, path_str: &str) -> anyhow::Result<()> {
+        self.setup
+            .storage
+            .cache()
+            .update(
+                Peer::from("other"),
+                Notification::Add {
+                    arena: self.arena,
+                    index: 1,
+                    path: Path::parse(path_str)?,
+                    mtime: UnixTime::from_secs(1234567890),
+                    size: 100,
+                    hash: Hash([1u8; 32]),
+                },
+            )
+            .await?;
+
+        Ok(())
     }
 }
 
@@ -158,6 +181,7 @@ async fn churten_is_running_quiet() -> anyhow::Result<()> {
 async fn churten_mark_set_arena() -> anyhow::Result<()> {
     let local = LocalSet::new();
     let fixture = Fixture::setup(&local).await?;
+    fixture.add_file_to_cache("file1.txt").await?;
 
     local
         .run_until(async move {
@@ -184,7 +208,10 @@ async fn churten_mark_set_arena() -> anyhow::Result<()> {
                 fixture
                     .setup
                     .storage
-                    .get_mark(Arena::from("myarena"), &realize_types::Path::parse("any")?)
+                    .get_mark(
+                        Arena::from("myarena"),
+                        &realize_types::Path::parse("file1.txt")?
+                    )
                     .await?
             );
 
@@ -198,6 +225,9 @@ async fn churten_mark_set_arena() -> anyhow::Result<()> {
 async fn churten_mark_set_paths() -> anyhow::Result<()> {
     let local = LocalSet::new();
     let fixture = Fixture::setup(&local).await?;
+    fixture.add_file_to_cache("file1.txt").await?;
+    fixture.add_file_to_cache("file2.txt").await?;
+    fixture.add_file_to_cache("file3.txt").await?;
 
     local
         .run_until(async move {
@@ -251,6 +281,9 @@ async fn churten_mark_set_paths() -> anyhow::Result<()> {
 async fn churten_mark_get() -> anyhow::Result<()> {
     let local = LocalSet::new();
     let fixture = Fixture::setup(&local).await?;
+    fixture.add_file_to_cache("file1.txt").await?;
+    fixture.add_file_to_cache("file2.txt").await?;
+    fixture.add_file_to_cache("file3.txt").await?;
 
     local
         .run_until(async move {
@@ -296,6 +329,8 @@ async fn churten_mark_get() -> anyhow::Result<()> {
 async fn churten_mark_get_multiple_paths() -> anyhow::Result<()> {
     let local = LocalSet::new();
     let fixture = Fixture::setup(&local).await?;
+    fixture.add_file_to_cache("file1.txt").await?;
+    fixture.add_file_to_cache("file2.txt").await?;
 
     local
         .run_until(async move {

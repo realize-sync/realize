@@ -898,8 +898,9 @@ impl OpenBlobRefCounter {
 mod tests {
     use super::*;
     use crate::arena::arena_cache::ArenaCache;
+    use crate::arena::engine::DirtyPaths;
     use crate::utils::redb_utils;
-    use crate::{DirtyPaths, GlobalDatabase, Inode, InodeAllocator, Notification};
+    use crate::{GlobalDatabase, Inode, InodeAllocator, Notification};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Path, Peer, UnixTime};

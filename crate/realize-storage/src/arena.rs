@@ -6,7 +6,7 @@ use arena_cache::ArenaCache;
 use db::ArenaDatabase;
 use engine::{DirtyPaths, Engine};
 use index::RealIndexAsync;
-use mark::PathMarksImpl;
+use mark::PathMarks;
 use realize_types::{Arena, Hash};
 use std::time::Duration;
 use std::{path::PathBuf, sync::Arc};
@@ -30,7 +30,6 @@ pub(crate) struct ArenaStorage {
     pub(crate) arena: Arena,
     pub(crate) db: Arc<ArenaDatabase>,
     pub(crate) cache: Arc<ArenaCache>,
-    pub(crate) pathmarks: PathMarksImpl,
     pub(crate) engine: Arc<Engine>,
     pub(crate) indexed: Option<IndexedArenaStorage>,
 }
@@ -87,18 +86,17 @@ impl ArenaStorage {
             arena,
             Arc::clone(&db),
             indexed.as_ref().map(|indexed| indexed.index.blocking()),
+            arena_cache.clone() as Arc<dyn PathMarks>,
             Arc::clone(&dirty_paths),
             arena_root,
             job_retry_strategy,
         );
-        let pathmarks = PathMarksImpl::new(Arc::clone(&db), arena_root, Arc::clone(&dirty_paths))?;
 
         Ok(ArenaStorage {
             arena,
             db,
             cache: Arc::clone(&arena_cache),
             engine,
-            pathmarks,
             indexed,
         })
     }

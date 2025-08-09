@@ -417,8 +417,8 @@ fn check_arena_compatibility(arena: Arena, existing: Arena) -> anyhow::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DirtyPaths;
     use crate::arena::db::ArenaDatabase;
+    use crate::arena::engine::DirtyPaths;
     use crate::utils::redb_utils;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;

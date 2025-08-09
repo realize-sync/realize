@@ -115,7 +115,8 @@ pub(crate) const CURRENT_INODE_RANGE_TABLE: TableDefinition<(), (Inode, Inode)> 
 ///
 /// Key: &str (path)
 /// Value: Holder<MarkTableEntry>
-const MARK_TABLE: TableDefinition<&str, Holder<MarkTableEntry>> = TableDefinition::new("mark");
+const INODE_MARK_TABLE: TableDefinition<Inode, Holder<MarkTableEntry>> =
+    TableDefinition::new("mark.inode");
 
 /// Path marked dirty, indexed by path.
 ///
@@ -167,7 +168,7 @@ impl ArenaDatabase {
             txn.open_table(BLOB_TABLE)?;
             txn.open_table(BLOB_NEXT_ID_TABLE)?;
             txn.open_table(BLOB_LRU_QUEUE_TABLE)?;
-            txn.open_table(MARK_TABLE)?;
+            txn.open_table(INODE_MARK_TABLE)?;
             txn.open_table(DIRTY_TABLE)?;
             txn.open_table(DIRTY_LOG_TABLE)?;
             txn.open_table(DIRTY_COUNTER_TABLE)?;
@@ -290,10 +291,10 @@ impl ArenaWriteTransaction {
         Ok(self.inner.open_table(BLOB_NEXT_ID_TABLE)?)
     }
 
-    pub fn mark_table<'txn>(
+    pub fn inode_mark_table<'txn>(
         &'txn self,
-    ) -> Result<Table<'txn, &'static str, Holder<'static, MarkTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(MARK_TABLE)?)
+    ) -> Result<Table<'txn, Inode, Holder<'static, MarkTableEntry>>, StorageError> {
+        Ok(self.inner.open_table(INODE_MARK_TABLE)?)
     }
 
     pub fn dirty_table<'txn>(&'txn self) -> Result<Table<'txn, &'static str, u64>, StorageError> {
@@ -369,10 +370,10 @@ impl ArenaReadTransaction {
         Ok(self.inner.open_table(BLOB_NEXT_ID_TABLE)?)
     }
 
-    pub fn mark_table(
+    pub fn inode_mark_table(
         &self,
-    ) -> Result<ReadOnlyTable<&'static str, Holder<'static, MarkTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(MARK_TABLE)?)
+    ) -> Result<ReadOnlyTable<Inode, Holder<'static, MarkTableEntry>>, StorageError> {
+        Ok(self.inner.open_table(INODE_MARK_TABLE)?)
     }
 
     pub fn dirty_table(&self) -> Result<ReadOnlyTable<&'static str, u64>, StorageError> {

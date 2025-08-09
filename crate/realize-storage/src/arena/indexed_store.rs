@@ -118,8 +118,9 @@ mod tests {
     use super::*;
     use crate::arena::arena_cache::ArenaCache;
     use crate::arena::db::ArenaDatabase;
+    use crate::arena::engine::DirtyPaths;
     use crate::utils::{hash, redb_utils};
-    use crate::{DirtyPaths, GlobalDatabase, InodeAllocator};
+    use crate::{GlobalDatabase, InodeAllocator};
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;

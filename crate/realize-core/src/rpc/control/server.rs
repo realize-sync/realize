@@ -361,6 +361,30 @@ mod tests {
             })
         }
 
+        async fn add_file_to_cache<T: AsRef<Path>>(
+            &self,
+            peer: Peer,
+            path: T,
+        ) -> anyhow::Result<()> {
+            let path = path.as_ref().clone();
+            self.inner
+                .cache(peer)?
+                .update(
+                    Peer::from("other"),
+                    Notification::Add {
+                        arena: HouseholdFixture::test_arena(),
+                        index: 1,
+                        path,
+                        mtime: UnixTime::from_secs(1234567890),
+                        size: 100,
+                        hash: Hash([1u8; 32]),
+                    },
+                )
+                .await?;
+
+            Ok(())
+        }
+
         async fn bind_server<H: JobHandler + 'static>(
             &self,
             local: &LocalSet,
@@ -405,6 +429,8 @@ mod tests {
                 JobHandlerImpl::new(Arc::clone(storage), household.clone()),
             )
             .await?;
+        let foo = Path::parse("foo")?;
+        fixture.add_file_to_cache(peer, &foo).await?;
 
         local
             .run_until(async move {
@@ -417,10 +443,7 @@ mod tests {
                 req.set_mark(control_capnp::Mark::Keep);
                 request.send().promise.await?;
 
-                assert_eq!(
-                    Mark::Keep,
-                    storage.get_mark(arena, &Path::parse("foo")?).await?
-                );
+                assert_eq!(Mark::Keep, storage.get_mark(arena, &foo).await?);
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -445,6 +468,8 @@ mod tests {
                 JobHandlerImpl::new(Arc::clone(storage), household.clone()),
             )
             .await?;
+        let foo = Path::parse("foo")?;
+        fixture.add_file_to_cache(peer, &foo).await?;
 
         local
             .run_until(async move {
@@ -456,10 +481,7 @@ mod tests {
                 req.set_mark(control_capnp::Mark::Keep);
                 request.send().promise.await?;
 
-                assert_eq!(
-                    Mark::Keep,
-                    storage.get_mark(arena, &Path::parse("foo")?).await?
-                );
+                assert_eq!(Mark::Keep, storage.get_mark(arena, &foo).await?);
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -484,6 +506,8 @@ mod tests {
                 JobHandlerImpl::new(Arc::clone(storage), household.clone()),
             )
             .await?;
+        let foo = Path::parse("foo")?;
+        fixture.add_file_to_cache(peer, &foo).await?;
 
         local
             .run_until(async move {
@@ -499,9 +523,7 @@ mod tests {
                     result.get()?.get_res()?.get_mark()?
                 );
 
-                storage
-                    .set_mark(arena, &Path::parse("foo")?, Mark::Keep)
-                    .await?;
+                storage.set_mark(arena, &foo, Mark::Keep).await?;
 
                 let mut request = control.get_mark_request();
                 let mut req = request.get().init_req();

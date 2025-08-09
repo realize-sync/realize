@@ -1,17 +1,18 @@
 use super::blob::{self, Blobstore};
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
 use super::index::RealIndex;
+use super::mark::PathMarks;
 use super::types::{
     DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry, FileTableKey,
-    HistoryTableEntry, IndexedFileTableEntry, LocalAvailability, LruQueueId, PeerTableEntry,
-    ReadDirEntry,
+    HistoryTableEntry, IndexedFileTableEntry, LocalAvailability, LruQueueId, MarkTableEntry,
+    PeerTableEntry, ReadDirEntry,
 };
 use crate::arena::engine::DirtyPaths;
 use crate::arena::notifier::{Notification, Progress};
 use crate::types::BlobId;
 use crate::utils::fs_utils;
 use crate::utils::holder::{ByteConversionError, Holder};
-use crate::{Blob, InodeAllocator, InodeAssignment};
+use crate::{Blob, InodeAllocator, InodeAssignment, Mark};
 use crate::{Inode, StorageError};
 use realize_types::{Arena, ByteRanges, Hash, Path, Peer, UnixTime};
 use redb::{ReadableTable, Table};
@@ -118,10 +119,11 @@ impl ArenaCache {
         do_dir_mtime(&txn.dir_table()?, inode, self.arena_root)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn parent_inode(&self, inode: Inode) -> Result<Inode, StorageError> {
         let txn = self.db.begin_read()?;
 
-        do_parent_dir(&txn.dir_table()?, &txn.file_table()?, inode)
+        do_parent_inode(&txn.dir_table()?, &txn.file_table()?, inode)
     }
 
     pub(crate) fn file_availability(&self, inode: Inode) -> Result<FileAvailability, StorageError> {
@@ -1131,31 +1133,123 @@ impl RealIndex for ArenaCache {
         Ok(())
     }
 }
-/// Mark files within the cache dirty.
-///
-/// If the inode is a file in the cache, it is marked dirty.
-//
-/// If the inode is a directory in the cache, all the files within it
-/// and its subdirectories are marked dirty.
-///
-/// If the inode is not in the cache, the function does nothing.
-pub(crate) fn mark_dirty_recursive(
-    txn: &ArenaWriteTransaction,
-    arena_root: Inode,
-    path: Option<&Path>,
-    dirty_paths: &Arc<DirtyPaths>,
-) -> Result<(), StorageError> {
-    let dir_table = txn.dir_table()?;
-    match do_lookup_path(&dir_table, arena_root, path) {
-        Ok((inode, _)) => {
-            let file_table = txn.file_table()?;
-            mark_file_dirty(txn, &file_table, inode, dirty_paths)?;
-            mark_dir_dirty(txn, &dir_table, &file_table, inode, dirty_paths)?;
 
-            Ok(())
+impl PathMarks for ArenaCache {
+    fn get_mark(&self, path: &Path) -> Result<Mark, StorageError> {
+        let txn = self.db.begin_read()?;
+
+        self.get_mark_txn(&txn, path)
+    }
+
+    fn get_mark_txn(&self, txn: &ArenaReadTransaction, path: &Path) -> Result<Mark, StorageError> {
+        let dir_table = txn.dir_table()?;
+        let (inode, _) = do_lookup_path(&dir_table, self.arena_root, Some(path))?;
+
+        let mark_table = txn.inode_mark_table()?;
+        let file_table = txn.file_table()?;
+
+        Ok(resolve_mark(&mark_table, &dir_table, &file_table, inode)?)
+    }
+
+    fn set_arena_mark(&self, mark: Mark) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let inode = self.arena_root;
+
+            let mut mark_table = txn.inode_mark_table()?;
+            let dir_table = txn.dir_table()?;
+            let file_table = txn.file_table()?;
+            let old_mark = resolve_mark(&mark_table, &dir_table, &file_table, inode)?;
+            mark_table.insert(inode, Holder::with_content(MarkTableEntry { mark })?)?;
+
+            if old_mark != mark {
+                mark_dir_dirty(&txn, &dir_table, &file_table, inode, &self.dirty_paths)?;
+            }
         }
-        Err(StorageError::NotFound) => Ok(()),
-        Err(err) => Err(err),
+        txn.commit()?;
+
+        Ok(())
+    }
+
+    fn set_mark(&self, path: &Path, mark: Mark) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let dir_table = txn.dir_table()?;
+            let (inode, assignment) = do_lookup_path(&dir_table, self.arena_root, Some(path))?;
+
+            let mut mark_table = txn.inode_mark_table()?;
+            let file_table = txn.file_table()?;
+            let old_mark = resolve_mark(&mark_table, &dir_table, &file_table, inode)?;
+            mark_table.insert(inode, Holder::with_content(MarkTableEntry { mark })?)?;
+
+            if old_mark != mark {
+                match assignment {
+                    InodeAssignment::Directory => {
+                        mark_dir_dirty(&txn, &dir_table, &file_table, inode, &self.dirty_paths)?
+                    }
+                    InodeAssignment::File => {
+                        mark_file_dirty(&txn, &file_table, inode, &self.dirty_paths)?
+                    }
+                }
+            }
+        }
+        txn.commit()?;
+
+        Ok(())
+    }
+
+    fn clear_mark(&self, path: &Path) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let dir_table = txn.dir_table()?;
+            let (inode, assignment) = do_lookup_path(&dir_table, self.arena_root, Some(path))?;
+
+            let mut mark_table = txn.inode_mark_table()?;
+            let old_mark = match mark_table.remove(inode)? {
+                Some(entry) => Some(entry.value().parse()?.mark),
+                None => None,
+            };
+            if let Some(old_mark) = old_mark {
+                let file_table = txn.file_table()?;
+                let new_mark = resolve_mark(&mark_table, &dir_table, &file_table, inode)?;
+                if old_mark != new_mark {
+                    match assignment {
+                        InodeAssignment::Directory => {
+                            mark_dir_dirty(&txn, &dir_table, &file_table, inode, &self.dirty_paths)?
+                        }
+                        InodeAssignment::File => {
+                            mark_file_dirty(&txn, &file_table, inode, &self.dirty_paths)?
+                        }
+                    }
+                }
+            }
+        }
+        txn.commit()?;
+
+        Ok(())
+    }
+}
+
+fn resolve_mark(
+    mark_table: &impl ReadableTable<Inode, Holder<'static, MarkTableEntry>>,
+    dir_table: &impl ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
+    file_table: &impl ReadableTable<FileTableKey, Holder<'static, FileTableEntry>>,
+    inode: Inode,
+) -> Result<Mark, StorageError> {
+    let mut inode = inode;
+    loop {
+        if let Some(e) = mark_table.get(inode)? {
+            return Ok(e.value().parse()?.mark);
+        }
+        inode = match do_parent_inode(dir_table, file_table, inode) {
+            Ok(inode) => inode,
+            Err(StorageError::NotFound) => {
+                return Ok(Mark::default());
+            }
+            Err(err) => {
+                return Err(err);
+            }
+        }
     }
 }
 
@@ -1295,7 +1389,7 @@ fn do_dir_mtime(
     Err(StorageError::NotFound)
 }
 
-fn do_parent_dir(
+fn do_parent_inode(
     dir_table: &impl redb::ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
     file_table: &impl ReadableTable<FileTableKey, Holder<'static, FileTableEntry>>,
     inode: Inode,
@@ -1638,24 +1732,22 @@ mod tests {
     use tokio::io::{AsyncSeekExt, AsyncWriteExt};
     use tokio::sync::mpsc;
 
-    use crate::arena::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
-    use crate::arena::engine;
+    use super::ArenaCache;
+    use crate::arena::db::{ArenaDatabase, ArenaReadTransaction};
+    use crate::arena::engine::{self, DirtyPaths};
     use crate::arena::index::RealIndex;
+    use crate::arena::mark::PathMarks;
     use crate::arena::notifier::Notification;
     use crate::arena::types::HistoryTableEntry;
     use crate::utils::hash;
     use crate::utils::redb_utils;
     use crate::{
-        DirtyPaths, FileMetadata, GlobalDatabase, Inode, InodeAllocator, InodeAssignment,
-        LocalAvailability, StorageError,
+        FileMetadata, GlobalDatabase, Inode, InodeAllocator, InodeAssignment, LocalAvailability,
+        Mark, StorageError,
     };
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Hash, Path, Peer, UnixTime};
-
-    use super::mark_dirty_recursive;
-
-    use super::ArenaCache;
 
     const TEST_TIME: u64 = 1234567890;
 
@@ -1683,7 +1775,6 @@ mod tests {
         arena: Arena,
         acache: Arc<ArenaCache>,
         db: Arc<ArenaDatabase>,
-        dirty_paths: Arc<DirtyPaths>,
         _tempdir: TempDir,
     }
     impl Fixture {
@@ -1712,21 +1803,12 @@ mod tests {
                 arena,
                 acache,
                 db,
-                dirty_paths,
                 _tempdir: tempdir,
             })
         }
 
-        fn arena_root(&self) -> Inode {
-            self.acache.arena_root()
-        }
-
         fn begin_read(&self) -> anyhow::Result<ArenaReadTransaction> {
             Ok(self.db.begin_read()?)
-        }
-
-        fn begin_write(&self) -> anyhow::Result<ArenaWriteTransaction> {
-            Ok(self.db.begin_write()?)
         }
 
         fn clear_dirty(&self) -> anyhow::Result<()> {
@@ -2739,231 +2821,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn mark_dirty_recursive_file() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let mtime = test_time();
-
-        // Add a single file
-        let file_path = Path::parse("foo/bar.txt")?;
-        fixture.add_to_cache(&file_path, 100, mtime)?;
-        fixture.clear_dirty()?;
-
-        // Mark the file dirty recursively
-        {
-            let txn = fixture.begin_write()?;
-            mark_dirty_recursive(
-                &txn,
-                fixture.arena_root(),
-                Some(&file_path),
-                &fixture.dirty_paths,
-            )?;
-            txn.commit()?;
-        }
-
-        // Check that the file is marked dirty
-        {
-            let txn = fixture.begin_read()?;
-            assert!(engine::is_dirty(&txn, &file_path)?);
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn mark_dirty_recursive_directory() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let mtime = test_time();
-
-        // Add files in a directory structure
-        let a = Path::parse("foo/a.txt")?;
-        let b = Path::parse("foo/b.txt")?;
-        let c = Path::parse("foo/subdir/c.txt")?;
-        let d = Path::parse("foo/subdir/d.txt")?;
-        let e = Path::parse("bar/e.txt")?;
-
-        for file in vec![&a, &b, &c, &d, &e] {
-            fixture.add_to_cache(file, 100, mtime)?;
-        }
-        fixture.clear_dirty()?;
-
-        // Mark the foo directory dirty recursively
-        {
-            let txn = fixture.begin_write()?;
-            mark_dirty_recursive(
-                &txn,
-                fixture.arena_root(),
-                Some(&Path::parse("foo")?),
-                &fixture.dirty_paths,
-            )?;
-            txn.commit()?;
-        }
-
-        // Check that all files under foo are marked dirty
-        {
-            let txn = fixture.begin_read()?;
-            assert!(engine::is_dirty(&txn, &a)?);
-            assert!(engine::is_dirty(&txn, &b)?);
-            assert!(engine::is_dirty(&txn, &c)?);
-            assert!(engine::is_dirty(&txn, &d)?);
-
-            // Files outside foo should not be dirty
-            assert!(!engine::is_dirty(&txn, &e)?);
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn mark_dirty_recursive_nested_directory() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let mtime = test_time();
-
-        // Add files in a deeply nested structure
-        let a = Path::parse("foo/a.txt")?;
-        let b = Path::parse("foo/subdir/b.txt")?;
-        let c = Path::parse("foo/subdir/deep/c.txt")?;
-        let d = Path::parse("foo/subdir/deep/very/d.txt")?;
-        let e = Path::parse("foo/other/e.txt")?;
-
-        for file in vec![&a, &b, &c, &d, &e] {
-            fixture.add_to_cache(file, 100, mtime)?;
-        }
-        fixture.clear_dirty()?;
-
-        // Mark the subdir directory dirty recursively
-        {
-            let txn = fixture.begin_write()?;
-            mark_dirty_recursive(
-                &txn,
-                fixture.arena_root(),
-                Some(&Path::parse("foo/subdir")?),
-                &fixture.dirty_paths,
-            )?;
-            txn.commit()?;
-        }
-
-        // Check that only files under subdir are marked dirty
-        {
-            let txn = fixture.begin_read()?;
-            // Files under subdir should be dirty
-            assert!(engine::is_dirty(&txn, &b)?);
-            assert!(engine::is_dirty(&txn, &c)?);
-            assert!(engine::is_dirty(&txn, &d)?);
-
-            // Files outside subdir should not be dirty
-            assert!(!engine::is_dirty(&txn, &a)?);
-            assert!(!engine::is_dirty(&txn, &e)?);
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn mark_dirty_recursive_nonexistent_inode() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let mtime = test_time();
-
-        // Add some files
-        for file in vec!["foo/a.txt", "bar/b.txt"] {
-            let path = Path::parse(file)?;
-            fixture.add_to_cache(&path, 100, mtime)?;
-        }
-        fixture.clear_dirty()?;
-
-        // Mark a non-existent inode dirty recursively
-        {
-            let acache = &fixture.acache;
-            let txn = acache.db.begin_write()?;
-            // Use a very high inode number that shouldn't exist
-            let nonexistent_inode = Inode(999999);
-            mark_dirty_recursive(
-                &txn,
-                nonexistent_inode,
-                Some(&Path::parse("foo")?),
-                &fixture.dirty_paths,
-            )?;
-            txn.commit()?;
-        }
-
-        // Check that no files are marked dirty (function should do nothing)
-        {
-            let txn = fixture.begin_write()?;
-            assert_eq!(None, engine::take_dirty(&txn)?);
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn mark_dirty_recursive_nonexistent_path() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let mtime = test_time();
-
-        // Add some files
-        for file in vec!["foo/a.txt", "bar/b.txt"] {
-            let path = Path::parse(file)?;
-            fixture.add_to_cache(&path, 100, mtime)?;
-        }
-        fixture.clear_dirty()?;
-
-        {
-            let acache = &fixture.acache;
-            let txn = acache.db.begin_write()?;
-            mark_dirty_recursive(
-                &txn,
-                fixture.arena_root(),
-                Some(&Path::parse("doesnotexist")?),
-                &fixture.dirty_paths,
-            )?;
-            txn.commit()?;
-        }
-
-        // Check that no files are marked dirty (function should do nothing)
-        {
-            let txn = fixture.begin_write()?;
-            assert_eq!(None, engine::take_dirty(&txn)?);
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn mark_dirty_recursive_arena_root() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
-
-        // Add files in different directories
-        let files = vec![
-            Path::parse("foo/a.txt")?,
-            Path::parse("foo/b.txt")?,
-            Path::parse("bar/c.txt")?,
-            Path::parse("baz/d.txt")?,
-        ];
-
-        let mtime = test_time();
-        for file in &files {
-            fixture.add_to_cache(file, 100, mtime)?;
-        }
-        fixture.clear_dirty()?;
-
-        // Mark the whole dirty
-        {
-            let txn = fixture.begin_write()?;
-            mark_dirty_recursive(&txn, fixture.arena_root(), None, &fixture.dirty_paths)?;
-            txn.commit()?;
-        }
-
-        // Check that all files in the arena are marked dirty
-        {
-            let txn = fixture.begin_read()?;
-            for file in files {
-                assert!(engine::is_dirty(&txn, &file)?, "{file} should be dirty",);
-            }
-        }
-
-        Ok(())
-    }
-
     // Tests for local_availability method
     #[tokio::test]
     async fn local_availability_missing_when_no_blob() -> anyhow::Result<()> {
@@ -3757,6 +3614,606 @@ mod tests {
         // Verify no new history entry was created
         let final_history_count = index.last_history_index()?;
         assert_eq!(initial_history_count, final_history_count);
+
+        Ok(())
+    }
+
+    struct MarksFixture {
+        arena: Arena,
+        db: Arc<ArenaDatabase>,
+        acache: Arc<ArenaCache>,
+        index: Arc<dyn RealIndex>,
+        marks: Arc<dyn PathMarks>,
+    }
+
+    impl MarksFixture {
+        async fn setup() -> anyhow::Result<Self> {
+            let _ = env_logger::try_init();
+
+            let arena = Arena::from("test");
+            let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
+            let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
+            let allocator =
+                InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
+            let acache = ArenaCache::new(
+                arena,
+                allocator,
+                Arc::clone(&db),
+                &std::path::PathBuf::from("/dev/null"),
+                Arc::clone(&dirty_paths),
+            )?;
+            let index = acache.as_index();
+            let marks = acache.clone() as Arc<dyn PathMarks>;
+
+            Ok(Self {
+                arena,
+                db,
+                acache,
+                index,
+                marks,
+            })
+        }
+
+        /// Clear all dirty flags in both index and cache
+        fn clear_all_dirty(&self) -> anyhow::Result<()> {
+            let txn = self.db.begin_write()?;
+            while engine::take_dirty(&txn)?.is_some() {}
+            txn.commit()?;
+
+            Ok(())
+        }
+
+        /// Check if a path is dirty in the index
+        fn is_dirty<T>(&self, path: T) -> anyhow::Result<bool>
+        where
+            T: AsRef<Path>,
+        {
+            let path = path.as_ref();
+            let txn = self.db.begin_read()?;
+            Ok(engine::is_dirty(&txn, path)?)
+        }
+
+        /// Add a file to the index for testing
+        fn add_file_to_index<T>(&self, path: T) -> anyhow::Result<()>
+        where
+            T: AsRef<Path>,
+        {
+            let path = path.as_ref();
+            Ok(self
+                .index
+                .add_file(path, 100, UnixTime::from_secs(1234567889), Hash([1; 32]))?)
+        }
+
+        /// Add a file to the cache for testing
+        fn add_file_to_cache<T>(&self, path: T) -> anyhow::Result<()>
+        where
+            T: AsRef<Path>,
+        {
+            let path = path.as_ref();
+            use crate::arena::notifier::Notification;
+            use realize_types::Peer;
+
+            let test_peer = Peer::from("test-peer");
+            let notification = Notification::Add {
+                arena: self.arena,
+                index: 1,
+                path: path.clone(),
+                mtime: UnixTime::from_secs(1234567890),
+                size: 100,
+                hash: Hash([2; 32]),
+            };
+
+            self.acache.update(test_peer, notification, None)?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn default_mark() -> anyhow::Result<()> {
+        let fixture = MarksFixture::setup().await?;
+
+        // New PathMarks should return default mark (Watch) for any path
+        let path = Path::parse("some/file.txt")?;
+        fixture.add_file_to_index(&path)?;
+
+        let mark = fixture.marks.get_mark(&path)?;
+
+        assert_eq!(mark, Mark::Watch);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_and_get_root_mark() -> anyhow::Result<()> {
+        let fixture = MarksFixture::setup().await?;
+
+        // Set root mark to Keep
+        fixture.marks.set_arena_mark(Mark::Keep)?;
+
+        // Verify root mark is returned for any path
+        let path = Path::parse("some/file.txt")?;
+        fixture.add_file_to_index(&path)?;
+
+        let mark = fixture.marks.get_mark(&path)?;
+
+        assert_eq!(mark, Mark::Keep);
+
+        // Change root mark to Own
+        fixture.marks.set_arena_mark(Mark::Own)?;
+        let mark = fixture.marks.get_mark(&path)?;
+
+        assert_eq!(mark, Mark::Own);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_and_get_path_mark() -> anyhow::Result<()> {
+        let fixture = MarksFixture::setup().await?;
+
+        let file_path = Path::parse("dir/file.txt")?;
+        fixture.add_file_to_index(&file_path)?;
+        let dir_path = Path::parse("dir")?;
+
+        // Set mark on specific file
+        fixture.marks.set_mark(&file_path, Mark::Own)?;
+
+        // Verify file has the mark
+        let mark = fixture.marks.get_mark(&file_path)?;
+        assert_eq!(mark, Mark::Own);
+
+        // Verify other files still get default mark
+        let other_file = Path::parse("other/file.txt")?;
+        fixture.add_file_to_index(&other_file)?;
+        let mark = fixture.marks.get_mark(&other_file)?;
+        assert_eq!(mark, Mark::Watch);
+
+        // Set mark on directory
+        fixture.marks.set_mark(&dir_path, Mark::Keep)?;
+
+        // Verify directory has the mark
+        let mark = fixture.marks.get_mark(&dir_path)?;
+        assert_eq!(mark, Mark::Keep);
+
+        // Verify files in directory inherit the mark
+        let file_in_dir = Path::parse("dir/another.txt")?;
+        fixture.add_file_to_index(&file_in_dir)?;
+        let mark = fixture.marks.get_mark(&file_in_dir)?;
+        assert_eq!(mark, Mark::Keep);
+
+        // But the specific file still has its own mark
+        let mark = fixture.marks.get_mark(&file_path)?;
+        assert_eq!(mark, Mark::Own);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hierarchical_mark_inheritance() -> anyhow::Result<()> {
+        let fixture = MarksFixture::setup().await?;
+
+        let dir_path = Path::parse("parent/child")?;
+        let file_path = Path::parse("parent/child/file.txt")?;
+        let root_file = Path::parse("other/file.txt")?;
+        let parent_file = Path::parse("parent/file.txt")?;
+        let child_file = Path::parse("parent/child/other.txt")?;
+        let specific_file = Path::parse("parent/child/file.txt")?;
+
+        for path in [
+            &file_path,
+            &root_file,
+            &parent_file,
+            &child_file,
+            &specific_file,
+        ] {
+            fixture.add_file_to_index(path)?;
+        }
+
+        fixture.marks.set_arena_mark(Mark::Watch)?;
+        fixture.marks.set_mark(&dir_path, Mark::Keep)?;
+        fixture.marks.set_mark(&file_path, Mark::Own)?;
+
+        // Test inheritance hierarchy
+        assert_eq!(fixture.marks.get_mark(&root_file)?, Mark::Watch);
+        assert_eq!(fixture.marks.get_mark(&parent_file)?, Mark::Watch);
+        assert_eq!(fixture.marks.get_mark(&child_file)?, Mark::Keep);
+        assert_eq!(fixture.marks.get_mark(&specific_file)?, Mark::Own);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clear_mark() -> anyhow::Result<()> {
+        let fixture = MarksFixture::setup().await?;
+
+        let file_path = Path::parse("dir/file.txt")?;
+        fixture.add_file_to_index(&file_path)?;
+        let dir_path = Path::parse("dir")?;
+
+        // Set marks
+        fixture.marks.set_mark(&file_path, Mark::Own)?;
+        fixture.marks.set_mark(&dir_path, Mark::Keep)?;
+
+        // Verify marks are set
+        assert_eq!(fixture.marks.get_mark(&file_path)?, Mark::Own);
+        assert_eq!(fixture.marks.get_mark(&dir_path)?, Mark::Keep);
+
+        // Clear file mark
+        fixture.marks.clear_mark(&file_path)?;
+
+        // File should now inherit from directory
+        assert_eq!(fixture.marks.get_mark(&file_path)?, Mark::Keep);
+
+        // Clear directory mark
+        fixture.marks.clear_mark(&dir_path)?;
+
+        // Both should now get default mark
+        assert_eq!(fixture.marks.get_mark(&file_path)?, Mark::Watch);
+        assert_eq!(fixture.marks.get_mark(&dir_path)?, Mark::Watch);
+
+        // Clearing non-existent mark should be no-op
+        let otherfile = Path::parse("dir/otherfile.txt")?;
+        fixture.add_file_to_index(&otherfile)?;
+        fixture.marks.clear_mark(&otherfile)?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clear_mark_with_root_mark() -> anyhow::Result<()> {
+        let fixture = MarksFixture::setup().await?;
+
+        // Set root mark
+        fixture.marks.set_arena_mark(Mark::Keep)?;
+
+        let file_path = Path::parse("dir/file.txt")?;
+        fixture.add_file_to_index(&file_path)?;
+
+        // Set specific file mark
+        fixture.marks.set_mark(&file_path, Mark::Own)?;
+        assert_eq!(fixture.marks.get_mark(&file_path)?, Mark::Own);
+
+        // Clear file mark
+        fixture.marks.clear_mark(&file_path)?;
+
+        // File should now inherit from root
+        assert_eq!(fixture.marks.get_mark(&file_path)?, Mark::Keep);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn all_mark_types() -> anyhow::Result<()> {
+        let fixture = MarksFixture::setup().await?;
+
+        let watch_path = Path::parse("watch/file.txt")?;
+        fixture.add_file_to_index(&watch_path)?;
+
+        let keep_path = Path::parse("keep/file.txt")?;
+        fixture.add_file_to_index(&keep_path)?;
+
+        let own_path = Path::parse("own/file.txt")?;
+        fixture.add_file_to_index(&own_path)?;
+
+        // Test all mark types
+        fixture.marks.set_mark(&watch_path, Mark::Watch)?;
+        fixture.marks.set_mark(&keep_path, Mark::Keep)?;
+        fixture.marks.set_mark(&own_path, Mark::Own)?;
+
+        assert_eq!(fixture.marks.get_mark(&watch_path)?, Mark::Watch);
+        assert_eq!(fixture.marks.get_mark(&keep_path)?, Mark::Keep);
+        assert_eq!(fixture.marks.get_mark(&own_path)?, Mark::Own);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mark_changes() -> anyhow::Result<()> {
+        let fixture = MarksFixture::setup().await?;
+
+        let file_path = Path::parse("test/file.txt")?;
+        fixture.add_file_to_index(&file_path)?;
+
+        // Set initial mark
+        fixture.marks.set_mark(&file_path, Mark::Watch)?;
+        assert_eq!(fixture.marks.get_mark(&file_path)?, Mark::Watch);
+
+        // Change mark
+        fixture.marks.set_mark(&file_path, Mark::Keep)?;
+        assert_eq!(fixture.marks.get_mark(&file_path)?, Mark::Keep);
+
+        // Change again
+        fixture.marks.set_mark(&file_path, Mark::Own)?;
+        assert_eq!(fixture.marks.get_mark(&file_path)?, Mark::Own);
+
+        // Change back
+        fixture.marks.set_mark(&file_path, Mark::Watch)?;
+        assert_eq!(fixture.marks.get_mark(&file_path)?, Mark::Watch);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_mark_marks_dirty_when_effective() -> anyhow::Result<()> {
+        let fixture = MarksFixture::setup().await?;
+
+        // Add files to both index and cache
+        let in_index = Path::parse("test/in_index.txt")?;
+        fixture.add_file_to_index(&in_index)?;
+
+        let in_cache = Path::parse("test/in_cache.txt")?;
+        fixture.add_file_to_cache(&in_cache)?;
+
+        fixture.clear_all_dirty()?;
+
+        // Set a mark that changes the effective mark (from Watch to Own)
+        fixture.marks.set_mark(&in_index, Mark::Own)?;
+        fixture.marks.set_mark(&in_cache, Mark::Own)?;
+
+        // Check that the file is marked dirty
+        assert!(fixture.is_dirty(&in_index)?);
+        assert!(fixture.is_dirty(&in_cache)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_mark_does_not_mark_dirty_when_not_effective() -> anyhow::Result<()> {
+        let fixture = MarksFixture::setup().await?;
+
+        // Add files to both index and cache
+        let file_path = Path::parse("test/file.txt")?;
+        fixture.add_file_to_index(&file_path)?;
+
+        fixture.clear_all_dirty()?;
+
+        // Set the same mark that's already effective (Watch is default)
+        fixture.marks.set_mark(&file_path, Mark::Watch)?;
+
+        // Check that the file is NOT marked dirty since the effective mark didn't change
+        assert!(!fixture.is_dirty(&file_path)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_root_mark_marks_all_dirty() -> anyhow::Result<()> {
+        let fixture = MarksFixture::setup().await?;
+
+        // Add multiple files to both index and cache
+        let index_files = vec![
+            Path::parse("dir1/file1.txt")?,
+            Path::parse("dir1/file2.txt")?,
+            Path::parse("dir2/file3.txt")?,
+            Path::parse("file4.txt")?,
+        ];
+        for file in &index_files {
+            fixture.add_file_to_index(file)?;
+        }
+
+        let cache_files = vec![
+            Path::parse("dir3/file5.txt")?,
+            Path::parse("dir3/file6.txt")?,
+            Path::parse("dir4/file7.txt")?,
+            Path::parse("file8.txt")?,
+        ];
+        for file in &cache_files {
+            fixture.add_file_to_index(file)?;
+        }
+
+        fixture.clear_all_dirty()?;
+
+        // Set root mark that changes the effective mark for all files
+        fixture.marks.set_arena_mark(Mark::Keep)?;
+
+        // Check that all files are marked dirty
+        for file in &index_files {
+            assert!(fixture.is_dirty(file)?, "{file} should be dirty");
+        }
+        for file in &cache_files {
+            assert!(fixture.is_dirty(file)?, "{file} should be dirty");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clear_mark_marks_dirty_when_effective() -> anyhow::Result<()> {
+        let fixture = MarksFixture::setup().await?;
+
+        // Add files to both index and cache
+        let file_path = Path::parse("test/file.txt")?;
+        fixture.add_file_to_index(&file_path)?;
+
+        // Set a specific mark first
+        fixture.marks.set_mark(&file_path, Mark::Own)?;
+        fixture.clear_all_dirty()?;
+
+        // Clear the mark, which should change the effective mark back to default
+        fixture.marks.clear_mark(&file_path)?;
+
+        // Check that the file is marked dirty
+        assert!(fixture.is_dirty(&file_path)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clear_mark_does_not_mark_dirty_when_it_did_not_exist() -> anyhow::Result<()> {
+        let fixture = MarksFixture::setup().await?;
+
+        // Add files to both index and cache
+        let file_path = Path::parse("test/file.txt")?;
+        fixture.add_file_to_index(&file_path)?;
+
+        fixture.clear_all_dirty()?;
+
+        // Clear a mark that doesn't exist (file already has default Watch mark)
+        fixture.marks.clear_mark(&file_path)?;
+
+        // Check that the file is NOT marked dirty since the effective mark didn't change
+        assert!(!fixture.is_dirty(&file_path)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clear_mark_does_not_mark_dirty_when_not_effective() -> anyhow::Result<()> {
+        let fixture = MarksFixture::setup().await?;
+
+        // Add files to both index and cache
+        let file_path = Path::parse("test/file.txt")?;
+        fixture.add_file_to_index(&file_path)?;
+        fixture.marks.set_mark(&file_path, Mark::Watch)?; // the default
+        fixture.clear_all_dirty()?;
+
+        // Clearing the mark changes nothing, since this mark just sets the default.
+        fixture.marks.clear_mark(&file_path)?;
+
+        // Check that the file is NOT marked dirty since the effective mark didn't change
+        assert!(!fixture.is_dirty(&file_path)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hierarchical_mark_changes_mark_dirty_recursively() -> anyhow::Result<()> {
+        let fixture = MarksFixture::setup().await?;
+
+        // Add files in a directory structure
+        let dir_file1 = Path::parse("dir/file1.txt")?;
+        let dir_file2 = Path::parse("dir/file2.txt")?;
+        let dir_subdir_file3 = Path::parse("dir/subdir/file3.txt")?;
+        let dir_subdir_file4 = Path::parse("dir/subdir/file4.txt")?;
+        let notdir_file5 = Path::parse("other/file5.txt")?;
+        let notdir_file6 = Path::parse("other/file6.txt")?;
+        for file in vec![&dir_file1, &dir_subdir_file3, &notdir_file5] {
+            fixture.add_file_to_index(file)?;
+        }
+        for file in vec![&dir_file2, &dir_subdir_file4, &notdir_file6] {
+            fixture.add_file_to_cache(file)?;
+        }
+        fixture.clear_all_dirty()?;
+
+        // Set a mark on the directory that changes the effective mark for files in that directory
+        let dir_path = Path::parse("dir")?;
+        fixture.marks.set_mark(&dir_path, Mark::Keep)?;
+
+        // Check that files in the directory are marked dirty
+        assert!(fixture.is_dirty(&dir_file1)?);
+        assert!(fixture.is_dirty(&dir_file2)?);
+        assert!(fixture.is_dirty(&dir_subdir_file3)?);
+        assert!(fixture.is_dirty(&dir_subdir_file4)?);
+
+        // Check that files outside the directory are NOT marked dirty
+        assert!(!fixture.is_dirty(&notdir_file5)?);
+        assert!(!fixture.is_dirty(&notdir_file6)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn specific_file_mark_overrides_directory_mark() -> anyhow::Result<()> {
+        let fixture = MarksFixture::setup().await?;
+
+        // Add files to both index and cache
+        let dir_path = Path::parse("dir")?;
+        let file_path = Path::parse("dir/file.txt")?;
+        fixture.add_file_to_index(&file_path)?;
+
+        // Set directory mark first
+        fixture.marks.set_mark(&dir_path, Mark::Keep)?;
+        fixture.clear_all_dirty()?;
+
+        // Set a different mark on the specific file
+        fixture.marks.set_mark(&file_path, Mark::Own)?;
+
+        // Check that the file is marked dirty (effective mark changed from Keep to Own)
+        assert!(fixture.is_dirty(&file_path)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clear_directory_mark_affects_all_files_in_directory() -> anyhow::Result<()> {
+        let fixture = MarksFixture::setup().await?;
+
+        // Add files in a directory structure
+        let files = vec![
+            Path::parse("dir/file1.txt")?,
+            Path::parse("dir/file2.txt")?,
+            Path::parse("dir/subdir/file3.txt")?,
+        ];
+
+        for file in &files {
+            fixture.add_file_to_index(file)?;
+        }
+
+        // Set directory mark
+        let dir_path = Path::parse("dir")?;
+        fixture.marks.set_mark(&dir_path, Mark::Keep)?;
+        fixture.clear_all_dirty()?;
+
+        // Clear the directory mark
+        fixture.marks.clear_mark(&dir_path)?;
+
+        // Check that all files in the directory are marked dirty (effective mark changed from Keep to Watch)
+        for file in &files {
+            assert!(fixture.is_dirty(file)?, "{file} should be dirty in index");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nonexistent_files_cannot_be_marked() -> anyhow::Result<()> {
+        let fixture = MarksFixture::setup().await?;
+
+        // Set marks on paths that don't exist in index or cache
+        let nonexistent_path = Path::parse("nonexistent/file.txt")?;
+        let res = fixture.marks.set_mark(&nonexistent_path, Mark::Own);
+        assert!(res.is_err());
+        assert!(matches!(res.err(), Some(StorageError::NotFound)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn root_mark_clearing_marks_all_dirty() -> anyhow::Result<()> {
+        let fixture = MarksFixture::setup().await?;
+
+        // Add multiple files to both index and cache
+        let files_in_index = vec![
+            Path::parse("dir1/file1.txt")?,
+            Path::parse("dir2/file2.txt")?,
+            Path::parse("file3.txt")?,
+        ];
+        for file in &files_in_index {
+            fixture.add_file_to_index(file)?;
+        }
+        let files_in_cache = vec![
+            Path::parse("dir3/file4.txt")?,
+            Path::parse("dir4/file5.txt")?,
+            Path::parse("file6.txt")?,
+        ];
+        for file in &files_in_cache {
+            fixture.add_file_to_cache(file)?;
+        }
+
+        // Set root mark
+        fixture.marks.set_arena_mark(Mark::Keep)?;
+        fixture.clear_all_dirty()?;
+
+        // Clear root mark (set to default Watch)
+        fixture.marks.set_arena_mark(Mark::Watch)?;
+
+        // Check that all files are marked dirty (effective mark changed from Keep to Watch)
+        for file in &files_in_index {
+            assert!(fixture.is_dirty(file)?, "{file} should be dirty");
+        }
+        for file in &files_in_cache {
+            assert!(fixture.is_dirty(file)?, "{file} should be dirty");
+        }
 
         Ok(())
     }

@@ -2,10 +2,10 @@
 
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
 use super::index::RealIndex;
+use super::mark::PathMarks;
 use super::types::{FailedJobTableEntry, LocalAvailability, RetryJob};
 use crate::arena::arena_cache;
 use crate::arena::blob;
-use crate::arena::mark;
 use crate::types::JobId;
 use crate::utils::holder::Holder;
 use crate::{Inode, Mark, StorageError};
@@ -145,6 +145,7 @@ pub struct Engine {
     db: Arc<ArenaDatabase>,
     dirty_paths: Arc<DirtyPaths>,
     index: Option<Arc<dyn RealIndex>>,
+    marks: Arc<dyn PathMarks>,
     arena_root: Inode,
     job_retry_strategy: Box<dyn (Fn(u32) -> Option<Duration>) + Sync + Send + 'static>,
 
@@ -162,6 +163,7 @@ impl Engine {
         arena: Arena,
         db: Arc<ArenaDatabase>,
         index: Option<Arc<dyn RealIndex>>,
+        marks: Arc<dyn PathMarks>,
         dirty_paths: Arc<DirtyPaths>,
         arena_root: Inode,
         job_retry_strategy: impl (Fn(u32) -> Option<Duration>) + Sync + Send + 'static,
@@ -172,6 +174,7 @@ impl Engine {
             arena,
             db,
             index,
+            marks,
             dirty_paths,
             arena_root,
             job_retry_strategy: Box::new(job_retry_strategy),
@@ -545,8 +548,11 @@ impl Engine {
         path: Path,
         counter: u64,
     ) -> Result<Option<(JobId, Job)>, StorageError> {
-        match mark::get_mark(txn, &path)? {
-            Mark::Watch => {
+        match self.marks.get_mark_txn(txn, &path) {
+            Err(_) => {
+                return Ok(None);
+            }
+            Ok(Mark::Watch) => {
                 if let (Ok(cached), Ok(Some(indexed))) = (
                     arena_cache::get_file_entry_for_path(txn, self.arena_root, &path),
                     self.get_indexed_file(txn, &path),
@@ -558,7 +564,7 @@ impl Engine {
                     )));
                 }
             }
-            Mark::Keep => {
+            Ok(Mark::Keep) => {
                 if let Ok(cached) =
                     arena_cache::get_file_entry_for_path(txn, self.arena_root, &path)
                 {
@@ -579,7 +585,7 @@ impl Engine {
                     }
                 }
             }
-            Mark::Own => {
+            Ok(Mark::Own) => {
                 // TODO: treat is as Keep if there is no index.
                 if let Ok(cached) =
                     arena_cache::get_file_entry_for_path(txn, self.arena_root, &path)
@@ -862,7 +868,7 @@ mod tests {
     use crate::Notification;
     use crate::arena::arena_cache::ArenaCache;
     use crate::arena::index::RealIndex;
-    use crate::arena::mark::{PathMarks, PathMarksImpl};
+    use crate::arena::mark::PathMarks;
     use crate::utils::redb_utils;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
@@ -899,7 +905,7 @@ mod tests {
         dirty_paths: Arc<DirtyPaths>,
         acache: Arc<ArenaCache>,
         index: Arc<dyn RealIndex>,
-        pathmarks: PathMarksImpl,
+        marks: Arc<dyn PathMarks>,
         engine: Arc<Engine>,
         arena_path: PathBuf,
         _tempdir: TempDir,
@@ -927,12 +933,12 @@ mod tests {
             )?;
             let arena_root = acache.arena_root();
             let index = acache.as_index();
-            let pathmarks =
-                PathMarksImpl::new(Arc::clone(&db), arena_root, Arc::clone(&dirty_paths))?;
+            let marks = acache.clone() as Arc<dyn PathMarks>;
             let engine = Engine::new(
                 arena,
                 Arc::clone(&db),
                 Some(index.clone()),
+                Arc::clone(&marks),
                 Arc::clone(&dirty_paths),
                 arena_root,
                 |attempt| {
@@ -950,8 +956,8 @@ mod tests {
                 dirty_paths,
                 acache,
                 index,
+                marks,
                 engine,
-                pathmarks,
                 arena_path: arena_path.to_path_buf(),
                 _tempdir: tempdir,
             })
@@ -1165,10 +1171,9 @@ mod tests {
     #[tokio::test]
     async fn job_stream_new_file_to_keep() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
-        let foodir = Path::parse("foo")?;
         let barfile = Path::parse("foo/bar.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.marks.set_arena_mark(Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
 
         let job = next_with_timeout(&mut job_stream).await?;
@@ -1180,12 +1185,12 @@ mod tests {
     #[tokio::test]
     async fn multiple_job_streams() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
-        let foodir = Path::parse("foo")?;
         let barfile = Path::parse("foo/bar.txt")?;
+
+        fixture.marks.set_arena_mark(Mark::Keep)?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
-        let mut job_stream2 = fixture.engine.job_stream();
         fixture.add_file_to_cache(&barfile)?;
+        let mut job_stream2 = fixture.engine.job_stream();
 
         let goal_job = Some((JobId(1), Job::Download(barfile, test_hash())));
         assert_eq!(goal_job, next_with_timeout(&mut job_stream).await?);
@@ -1204,7 +1209,7 @@ mod tests {
         let barfile = Path::parse("foo/bar.txt")?;
         let mut job_stream = fixture.engine.job_stream();
         fixture.add_file_to_cache(&barfile)?;
-        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.marks.set_mark(&foodir, Mark::Keep)?;
 
         let job = next_with_timeout(&mut job_stream).await?;
         // Counter is 2, because the job was created after the 2nd
@@ -1220,10 +1225,9 @@ mod tests {
     #[tokio::test]
     async fn job_stream_file_to_keep_partially_downloaded() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
-        let foodir = Path::parse("foo")?;
         let barfile = Path::parse("foo/bar.txt")?;
 
-        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.marks.set_arena_mark(Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         let (inode, _) = fixture.acache.lookup_path(&barfile)?;
         {
@@ -1245,10 +1249,9 @@ mod tests {
     #[tokio::test]
     async fn job_stream_file_to_keep_fully_downloaded() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
-        let foodir = Path::parse("foo")?;
         let barfile = Path::parse("foo/bar.txt")?;
 
-        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.marks.set_arena_mark(Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         let (inode, _) = fixture.acache.lookup_path(&barfile)?;
         {
@@ -1270,11 +1273,10 @@ mod tests {
     #[tokio::test]
     async fn job_stream_file_to_keep_verified() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
-        let foodir = Path::parse("foo")?;
         let barfile = Path::parse("foo/bar.txt")?;
         let otherfile = Path::parse("foo/other.txt")?;
 
-        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.marks.set_arena_mark(Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         let (inode, _) = fixture.acache.lookup_path(&barfile)?;
         {
@@ -1304,11 +1306,10 @@ mod tests {
     #[tokio::test]
     async fn job_stream_file_to_keep_already_removed() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
-        let foodir = Path::parse("foo")?;
         let barfile = Path::parse("foo/bar.txt")?;
         let otherfile = Path::parse("foo/other.txt")?;
 
-        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.marks.set_arena_mark(Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         fixture.remove_file_from_cache(&barfile)?;
 
@@ -1335,7 +1336,7 @@ mod tests {
         let fixture = EngineFixture::setup().await?;
         let foobar = Path::parse("foo/bar")?;
 
-        fixture.pathmarks.set_arena_mark(Mark::Own)?;
+        fixture.marks.set_arena_mark(Mark::Own)?;
         fixture.add_file_to_cache(&foobar)?;
 
         let mut job_stream = fixture.engine.job_stream();
@@ -1352,20 +1353,19 @@ mod tests {
         let foobar = Path::parse("foo/bar")?;
         let otherfile = Path::parse("other")?;
 
-        fixture.pathmarks.set_arena_mark(Mark::Own)?;
+        fixture.marks.set_arena_mark(Mark::Own)?;
         fixture.add_file_to_cache_with_version(&foobar, Hash([1; 32]))?;
         fixture.add_file_to_index_with_version(&foobar, Hash([1; 32]))?;
 
         // Add something else for the stream to return, or it'll just
         // hang forever.
-        fixture.pathmarks.set_mark(&otherfile, Mark::Keep)?;
         fixture.add_file_to_cache(&otherfile)?;
 
         let mut job_stream = fixture.engine.job_stream();
 
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
         // 1 has been skipped, since the file is in the index
-        assert_eq!((JobId(3), Job::Download(otherfile, test_hash())), job);
+        assert_eq!(JobId(3), job.0);
 
         Ok(())
     }
@@ -1376,20 +1376,19 @@ mod tests {
         let foobar = Path::parse("foo/bar")?;
         let otherfile = Path::parse("other")?;
 
-        fixture.pathmarks.set_arena_mark(Mark::Own)?;
+        fixture.marks.set_arena_mark(Mark::Own)?;
         fixture.add_file_to_cache_with_version(&foobar, Hash([1; 32]))?;
         fixture.add_file_to_index_with_version(&foobar, Hash([2; 32]))?;
 
         // Add something else for the stream to return, or it'll just
         // hang forever.
-        fixture.pathmarks.set_mark(&otherfile, Mark::Keep)?;
         fixture.add_file_to_cache(&otherfile)?;
 
         let mut job_stream = fixture.engine.job_stream();
 
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
         // 1 has been skipped, since the file is in the index
-        assert_eq!((JobId(3), Job::Download(otherfile, test_hash())), job);
+        assert_eq!(JobId(3), job.0);
 
         Ok(())
     }
@@ -1399,7 +1398,7 @@ mod tests {
         let fixture = EngineFixture::setup().await?;
         let foobar = Path::parse("foo/bar")?;
 
-        fixture.pathmarks.set_arena_mark(Mark::Own)?;
+        fixture.marks.set_arena_mark(Mark::Own)?;
 
         // Cache and index have the same version
         fixture.add_file_to_cache_with_version(&foobar, Hash([1; 32]))?;
@@ -1423,11 +1422,10 @@ mod tests {
     #[tokio::test]
     async fn job_done() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
-        let foodir = Path::parse("foo")?;
         let barfile = Path::parse("foo/bar.txt")?;
         let otherfile = Path::parse("foo/other.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.marks.set_arena_mark(Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         fixture.add_file_to_cache(&otherfile)?;
 
@@ -1451,11 +1449,10 @@ mod tests {
     #[tokio::test]
     async fn job_abandoned() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
-        let foodir = Path::parse("foo")?;
         let barfile = Path::parse("foo/bar.txt")?;
         let otherfile = Path::parse("foo/other.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.marks.set_arena_mark(Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         fixture.add_file_to_cache(&otherfile)?;
 
@@ -1480,10 +1477,9 @@ mod tests {
     #[tokio::test]
     async fn job_done_but_file_modified_again() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
-        let foodir = Path::parse("foo")?;
         let barfile = Path::parse("foo/bar.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.marks.set_arena_mark(Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
 
         let (job1_id, job1) = next_with_timeout(&mut job_stream).await?.unwrap();
@@ -1517,11 +1513,10 @@ mod tests {
     #[tokio::test]
     async fn job_failed() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
-        let foodir = Path::parse("foo")?;
         let barfile = Path::parse("foo/bar.txt")?;
         let otherfile = Path::parse("foo/other.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.marks.set_arena_mark(Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         fixture.add_file_to_cache(&otherfile)?;
 
@@ -1569,11 +1564,10 @@ mod tests {
     #[tokio::test]
     async fn job_missing_peers_should_be_retried() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
-        let foodir = Path::parse("foo")?;
         let barfile = Path::parse("foo/bar.txt")?;
         let otherfile = Path::parse("foo/other.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.marks.set_arena_mark(Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         fixture.add_file_to_cache(&otherfile)?;
 
@@ -1599,11 +1593,10 @@ mod tests {
     #[tokio::test]
     async fn new_stream_delays_failed_job() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
-        let foodir = Path::parse("foo")?;
         let barfile = Path::parse("foo/bar.txt")?;
         let otherfile = Path::parse("foo/other.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.marks.set_arena_mark(Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         fixture.add_file_to_cache(&otherfile)?;
 
@@ -1638,11 +1631,10 @@ mod tests {
     #[tokio::test]
     async fn job_failed_then_path_modified() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
-        let foodir = Path::parse("foo")?;
         let barfile = Path::parse("foo/bar.txt")?;
         let otherfile = Path::parse("foo/other.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.marks.set_arena_mark(Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         fixture.add_file_to_cache(&otherfile)?;
 
@@ -1671,11 +1663,10 @@ mod tests {
     #[tokio::test]
     async fn job_failed_after_path_modified() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
-        let foodir = Path::parse("foo")?;
         let barfile = Path::parse("foo/bar.txt")?;
         let otherfile = Path::parse("foo/other.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.marks.set_arena_mark(Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         fixture.add_file_to_cache(&otherfile)?;
 
@@ -1702,10 +1693,9 @@ mod tests {
     #[tokio::test]
     async fn check_job_returns_same() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
-        let foodir = Path::parse("foo")?;
         let barfile = Path::parse("foo/bar.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.marks.set_arena_mark(Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
 
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
@@ -1718,10 +1708,9 @@ mod tests {
     #[tokio::test]
     async fn check_job_returns_updated() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
-        let foodir = Path::parse("foo")?;
         let barfile = Path::parse("foo/bar.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.marks.set_arena_mark(Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
 
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
@@ -1736,10 +1725,9 @@ mod tests {
 
     async fn check_job_returns_outdated_because_done() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
-        let foodir = Path::parse("foo")?;
         let barfile = Path::parse("foo/bar.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.marks.set_arena_mark(Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
 
         let (_, job) = next_with_timeout(&mut job_stream).await?.unwrap();
@@ -1756,10 +1744,9 @@ mod tests {
 
     async fn check_job_returns_outdated_because_irrelevant() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
-        let foodir = Path::parse("foo")?;
         let barfile = Path::parse("foo/bar.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.pathmarks.set_mark(&foodir, Mark::Keep)?;
+        fixture.marks.set_arena_mark(Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
 
         let (_, job) = next_with_timeout(&mut job_stream).await?.unwrap();

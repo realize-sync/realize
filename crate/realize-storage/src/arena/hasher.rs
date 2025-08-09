@@ -224,11 +224,11 @@ pub(crate) async fn hash_file<R: AsyncRead>(f: R) -> Result<Hash, std::io::Error
 
 #[cfg(test)]
 mod tests {
-    use crate::DirtyPaths;
     use crate::GlobalDatabase;
     use crate::InodeAllocator;
     use crate::arena::arena_cache::ArenaCache;
     use crate::arena::db::ArenaDatabase;
+    use crate::arena::engine::DirtyPaths;
     use crate::utils::redb_utils;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
