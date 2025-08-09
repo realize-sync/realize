@@ -27,9 +27,6 @@ pub enum Job {
     /// Realize `Path` with `counter`, moving `Hash` from cache to the
     /// index, currently containing nothing or `Hash`.
     Realize(Path, Hash, Option<Hash>),
-
-    /// Move file containing the given version into the cache.
-    Unrealize(Path, Hash),
 }
 
 impl Job {
@@ -38,7 +35,6 @@ impl Job {
         match self {
             Self::Download(path, _) => path,
             Self::Realize(path, _, _) => path,
-            Self::Unrealize(path, _) => path,
         }
     }
 
@@ -47,7 +43,6 @@ impl Job {
         match self {
             Self::Download(_, h) => h,
             Self::Realize(_, h, _) => h,
-            Self::Unrealize(_, h) => h,
         }
     }
 }
@@ -57,6 +52,9 @@ impl Job {
 #[derive(Eq, PartialEq, Debug, Clone)]
 pub(crate) enum StorageJob {
     External(Job),
+
+    /// Move file containing the given version into the cache.
+    Unrealize(Path, Hash),
 }
 
 impl StorageJob {
@@ -64,12 +62,14 @@ impl StorageJob {
     pub(crate) fn path(&self) -> &Path {
         match self {
             StorageJob::External(job) => job.path(),
+            Self::Unrealize(path, _) => path,
         }
     }
 
     pub(crate) fn into_external(self) -> Option<Job> {
         match self {
             Self::External(job) => Some(job),
+            _ => None,
         }
     }
 }
@@ -102,7 +102,11 @@ pub(crate) struct DirtyPaths {
 
 impl DirtyPaths {
     pub(crate) async fn new(db: Arc<ArenaDatabase>) -> Result<Arc<DirtyPaths>, StorageError> {
-        let last_counter = task::spawn_blocking(move || {
+        Ok(task::spawn_blocking(move || DirtyPaths::new_blocking(db)).await??)
+    }
+
+    pub(crate) fn new_blocking(db: Arc<ArenaDatabase>) -> Result<Arc<DirtyPaths>, StorageError> {
+        let last_counter = {
             let counter: u64;
 
             let txn = db.begin_write()?;
@@ -113,8 +117,7 @@ impl DirtyPaths {
             txn.commit()?;
 
             Ok::<_, StorageError>(counter)
-        })
-        .await??;
+        }?;
         let (watch_tx, watch_rx) = watch::channel(last_counter);
 
         Ok(Arc::new(Self {
@@ -590,7 +593,7 @@ impl Engine {
                 {
                     return Ok(Some((
                         JobId(counter),
-                        StorageJob::External(Job::Unrealize(path, cached.content.hash)),
+                        StorageJob::Unrealize(path, cached.content.hash),
                     )));
                 }
             }
@@ -604,7 +607,7 @@ impl Engine {
                     {
                         return Ok(Some((
                             JobId(counter),
-                            StorageJob::External(Job::Unrealize(path, cached.content.hash)),
+                            StorageJob::Unrealize(path, cached.content.hash),
                         )));
                     }
 

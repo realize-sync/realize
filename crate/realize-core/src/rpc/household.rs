@@ -1305,7 +1305,7 @@ mod tests {
     use fast_rsync::SignatureOptions;
     use futures::TryStreamExt as _;
     use realize_network::testing::TestingPeers;
-    use realize_storage::utils::hash;
+    use realize_storage::{Mark, utils::hash};
     use tokio::fs;
 
     #[tokio::test]
@@ -1480,8 +1480,12 @@ mod tests {
             .await?
             .interconnected()
             .run(async |household_a, _household_b| {
+                let arena = HouseholdFixture::test_arena();
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
+
+                fixture.storage(a)?.set_arena_mark(arena, Mark::Own).await?;
+                fixture.storage(b)?.set_arena_mark(arena, Mark::Own).await?;
 
                 // Create identical files in both peers
                 let content = "Identical content for both peers";

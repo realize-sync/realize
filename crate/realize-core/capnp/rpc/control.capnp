@@ -98,7 +98,6 @@ struct Job {
   union {
     download@2 : Download;
     realize@3: Realize;
-    unrealize@4: Unrealize;
   }
 
   struct Download {}
@@ -106,7 +105,6 @@ struct Job {
     # optional; None if empty
     indexHash @0: Data;
   }
-  struct Unrealize {}
 }
 
 struct JobInfo {

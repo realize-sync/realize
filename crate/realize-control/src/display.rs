@@ -332,7 +332,6 @@ fn in_progress_job_name(job: &JobInfo) -> &'static str {
     match *job.job {
         Job::Download(_, _) => "Download",
         Job::Realize(_, _, _) => "Realize",
-        Job::Unrealize(_, _) => "Unrealize",
     }
 }
 
@@ -340,7 +339,6 @@ fn finished_job_name(job: &JobInfo) -> &'static str {
     match *job.job {
         Job::Download(_, _) => "Downloaded",
         Job::Realize(_, _, _) => "Realized",
-        Job::Unrealize(_, _) => "Unrealized",
     }
 }
 

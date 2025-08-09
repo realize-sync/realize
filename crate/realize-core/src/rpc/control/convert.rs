@@ -132,9 +132,6 @@ fn fill_job(job: &Arc<Job>, mut builder: control_capnp::job::Builder<'_>) {
                 realize.set_index_hash(&h.0);
             }
         }
-        realize_storage::Job::Unrealize(_, _) => {
-            builder.init_unrealize();
-        }
     }
 }
 
@@ -229,7 +226,6 @@ fn parse_job(job_reader: control_capnp::job::Reader<'_>) -> Result<Job, capnp::E
             };
             Ok(Job::Realize(path, hash, index_hash))
         }
-        control_capnp::job::Which::Unrealize(_) => Ok(Job::Unrealize(path, hash)),
     }
 }
 
@@ -357,20 +353,6 @@ mod tests {
         }
     }
 
-    fn create_test_unrealize_notification() -> ChurtenNotification {
-        let arena = Arena::from("test-arena");
-        let job_id = JobId(123);
-        let path = Path::parse("test/file.txt").unwrap();
-        let hash = Hash([0x42; 32]);
-        let job = Job::Unrealize(path, hash);
-
-        ChurtenNotification::New {
-            arena,
-            job_id,
-            job: std::sync::Arc::new(job),
-        }
-    }
-
     fn round_trip_test(original: ChurtenNotification) {
         // Convert to capnp
         let mut message = Builder::new_default();
@@ -396,11 +378,6 @@ mod tests {
     #[test]
     fn test_parse_new_realize_notification() {
         round_trip_test(create_test_realize_notification());
-    }
-
-    #[test]
-    fn test_parse_new_unrealize_notification() {
-        round_trip_test(create_test_unrealize_notification());
     }
 
     #[test]
@@ -527,24 +504,6 @@ mod tests {
         }
     }
 
-    fn create_test_unrealize_job_info() -> JobInfo {
-        let arena = Arena::from("test-arena");
-        let id = JobId(789);
-        let path = Path::parse("test/file.txt").unwrap();
-        let hash = Hash([0x42; 32]);
-        let job = Job::Unrealize(path, hash);
-
-        JobInfo {
-            arena,
-            id,
-            job: std::sync::Arc::new(job),
-            progress: JobProgress::Failed("Test error".to_string()),
-            action: None,
-            byte_progress: Some((0, 0)),
-            notification_index: 9,
-        }
-    }
-
     fn job_info_round_trip_test(original: JobInfo) {
         // Convert to capnp
         let mut message = Builder::new_default();
@@ -570,11 +529,6 @@ mod tests {
     #[test]
     fn test_parse_job_info_realize() {
         job_info_round_trip_test(create_test_realize_job_info());
-    }
-
-    #[test]
-    fn test_parse_job_info_unrealize() {
-        job_info_round_trip_test(create_test_unrealize_job_info());
     }
 
     #[test]

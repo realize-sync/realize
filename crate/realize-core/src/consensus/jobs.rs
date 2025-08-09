@@ -287,24 +287,6 @@ pub(crate) async fn realize(
     Ok(JobStatus::Done)
 }
 
-/// Move a real file into the cache.
-///
-/// Executes a [realize_storage::Job::Unrealize]
-pub(crate) async fn unrealize(
-    storage: &Arc<Storage>,
-    arena: Arena,
-    path: &Path,
-    hash: &Hash,
-    progress: &mut impl ByteCountProgress,
-) -> Result<JobStatus, JobError> {
-    progress.update_action(JobAction::Move);
-    if !storage.unrealize(arena, path, hash).await? {
-        return Ok(JobStatus::Abandoned("state mismatch"));
-    }
-
-    Ok(JobStatus::Done)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,8 +294,8 @@ mod tests {
     use crate::rpc::testing::{self, HouseholdFixture};
     use rand::rngs::SmallRng;
     use rand::{RngCore, SeedableRng};
-    use realize_storage::Blob;
     use realize_storage::utils::hash;
+    use realize_storage::{Blob, Mark};
     use tokio::fs::File;
     use tokio::io::{AsyncWrite, BufReader, BufWriter};
     use tokio::{fs, io::AsyncReadExt};
@@ -1171,6 +1153,7 @@ mod tests {
             .with_two_peers()
             .await?
             .run(async |household_a, _household_b| {
+                let arena = HouseholdFixture::test_arena();
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
                 testing::connect(&household_a, b).await?;
@@ -1179,6 +1162,11 @@ mod tests {
                 fixture
                     .inner
                     .wait_for_file_in_cache(a, "foobar", &hash)
+                    .await?;
+                fixture
+                    .inner
+                    .storage(a)?
+                    .set_mark(arena, &foobar, Mark::Own)
                     .await?;
 
                 assert_eq!(
@@ -1221,56 +1209,6 @@ mod tests {
                 assert_eq!(
                     "bar before foo!",
                     fs::read_to_string(foobar.within(&root)).await?.as_str()
-                );
-
-                Ok::<(), anyhow::Error>(())
-            })
-            .await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn unrealize_file() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup().await?;
-        fixture
-            .inner
-            .with_two_peers()
-            .await?
-            .interconnected()
-            .run(async |_household_a, _household_b| {
-                let a = HouseholdFixture::a();
-                let b = HouseholdFixture::b();
-
-                let (foobar, hash) = fixture.write_file(b, "foobar", "foo!").await?;
-                fixture
-                    .inner
-                    .wait_for_file_in_cache(a, "foobar", &hash)
-                    .await?;
-                fixture.write_file(a, "foobar", "foo!").await?;
-                fixture
-                    .inner
-                    .wait_for_file_in_cache(b, "foobar", &hash)
-                    .await?;
-                // foobar is in the cache and the index with the same content
-
-                let mut progress = SimpleByteCountProgress::new();
-                assert_eq!(
-                    JobStatus::Done,
-                    unrealize(
-                        fixture.inner.storage(a)?,
-                        HouseholdFixture::test_arena(),
-                        &foobar,
-                        &hash,
-                        &mut progress,
-                    )
-                    .await?,
-                );
-
-                assert!(!fixture.inner.arena_root(a).join("foobar").exists());
-                assert_eq!(
-                    "foo!",
-                    fixture.get_blob_content_as_string(a, "foobar").await?
                 );
 
                 Ok::<(), anyhow::Error>(())
