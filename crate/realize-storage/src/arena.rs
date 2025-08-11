@@ -24,6 +24,7 @@ pub mod indexed_store;
 mod jobs;
 pub mod mark;
 pub mod notifier;
+mod tree;
 pub mod types;
 pub mod watcher;
 

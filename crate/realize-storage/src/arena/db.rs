@@ -39,6 +39,19 @@ const SETTIGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("index.
 pub(crate) const DIR_TABLE: TableDefinition<(Inode, &str), Holder<DirTableEntry>> =
     TableDefinition::new("acache.dir");
 
+/// Tree branches and leaves, associated to inodes.
+///
+/// Key: (inode, name)
+/// Value: inode
+pub(crate) const TREE_TABLE: TableDefinition<(Inode, &str), Inode> = TableDefinition::new("tree");
+
+/// Refcount for tree nodes
+///
+/// Key: inode
+/// Value: u32 (refcount)
+pub(crate) const TREE_REFCOUNT_TABLE: TableDefinition<Inode, u32> =
+    TableDefinition::new("tree.refcount");
+
 /// Track peer files.
 ///
 /// Each known peer file has an entry in this table, keyed with the
@@ -159,6 +172,8 @@ impl ArenaDatabase {
             txn.open_table(HISTORY_TABLE)?;
             txn.open_table(SETTIGS_TABLE)?;
             txn.open_table(DIR_TABLE)?;
+            txn.open_table(TREE_TABLE)?;
+            txn.open_table(TREE_REFCOUNT_TABLE)?;
             txn.open_table(FILE_TABLE)?;
             txn.open_table(PENDING_CATCHUP_TABLE)?;
             txn.open_table(PEER_TABLE)?;
@@ -235,6 +250,16 @@ impl ArenaWriteTransaction {
         &'txn self,
     ) -> Result<Table<'txn, &'static str, &'static [u8]>, StorageError> {
         Ok(self.inner.open_table(SETTIGS_TABLE)?)
+    }
+
+    pub fn tree_table<'txn>(
+        &'txn self,
+    ) -> Result<Table<'txn, (Inode, &'static str), Inode>, StorageError> {
+        Ok(self.inner.open_table(TREE_TABLE)?)
+    }
+
+    pub fn tree_refcount_table<'txn>(&'txn self) -> Result<Table<'txn, Inode, u32>, StorageError> {
+        Ok(self.inner.open_table(TREE_REFCOUNT_TABLE)?)
     }
 
     pub fn dir_table<'txn>(
@@ -326,6 +351,10 @@ impl ArenaReadTransaction {
         &self,
     ) -> Result<ReadOnlyTable<u64, Holder<'static, HistoryTableEntry>>, StorageError> {
         Ok(self.inner.open_table(HISTORY_TABLE)?)
+    }
+
+    pub fn tree_table(&self) -> Result<ReadOnlyTable<(Inode, &'static str), Inode>, StorageError> {
+        Ok(self.inner.open_table(TREE_TABLE)?)
     }
 
     pub fn dir_table(
