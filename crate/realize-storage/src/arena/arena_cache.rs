@@ -1184,9 +1184,9 @@ impl PathMarks for ArenaCache {
     fn get_mark_txn(&self, txn: &ArenaReadTransaction, path: &Path) -> Result<Mark, StorageError> {
         let mark_table = txn.mark_table()?;
         let tree = txn.read_tree(&self.tree)?;
-        let inode = tree.lookup_path(path)?.unwrap_or(tree.root());
+        let (_, last_matching) = tree.lookup_partial_path(path)?;
 
-        Ok(resolve_mark(&mark_table, &tree, inode)?)
+        Ok(resolve_mark(&mark_table, &tree, last_matching)?)
     }
 
     fn set_arena_mark(&self, mark: Mark) -> Result<(), StorageError> {
@@ -3844,6 +3844,41 @@ mod tests {
         assert_eq!(fixture.marks.get_mark(&parent_file)?, Mark::Watch);
         assert_eq!(fixture.marks.get_mark(&child_file)?, Mark::Keep);
         assert_eq!(fixture.marks.get_mark(&specific_file)?, Mark::Own);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hierarchical_mark_inheritance_nonexistent() -> anyhow::Result<()> {
+        let fixture = MarksFixture::setup().await?;
+        fixture.add_file_to_index(&Path::parse("foo/bar/baz/waldo")?)?;
+
+        fixture.marks.set_arena_mark(Mark::Watch)?;
+        fixture.marks.set_mark(&Path::parse("foo")?, Mark::Own)?;
+        fixture
+            .marks
+            .set_mark(&Path::parse("foo/bar/baz")?, Mark::Keep)?;
+
+        // in foo, but not in baz
+        assert_eq!(fixture.marks.get_mark(&Path::parse("foo/qux")?)?, Mark::Own);
+        assert_eq!(
+            fixture.marks.get_mark(&Path::parse("foo/bar/qux")?)?,
+            Mark::Own
+        );
+        // in baz
+        assert_eq!(
+            fixture
+                .marks
+                .get_mark(&Path::parse("foo/bar/baz/qux/quuux")?)?,
+            Mark::Keep
+        );
+
+        // neither in foo, nor in baz
+        assert_eq!(fixture.marks.get_mark(&Path::parse("waldo")?)?, Mark::Watch);
+        assert_eq!(
+            fixture.marks.get_mark(&Path::parse("waldo/fred")?)?,
+            Mark::Watch
+        );
 
         Ok(())
     }

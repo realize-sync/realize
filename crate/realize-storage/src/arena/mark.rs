@@ -17,6 +17,10 @@ pub trait PathMarks: Send + Sync {
     /// Get the mark for a specific path, which can be a file or a directory.
     /// The mark can be inherited from one of its
     /// parents or it can be the root mark.
+    ///
+    /// If called on a non-existent file, get_mark returns the mark of
+    /// the latest node it finds. This way, it can predict the mark of
+    /// files not yet added.
     fn get_mark(&self, path: &Path) -> Result<Mark, StorageError>;
 
     fn get_mark_txn(&self, txn: &ArenaReadTransaction, path: &Path) -> Result<Mark, StorageError>;

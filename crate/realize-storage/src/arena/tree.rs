@@ -187,6 +187,13 @@ pub(crate) trait TreeExt {
     /// it doesn't exist.
     fn expect_path<P: AsRef<Path>>(&self, path: P) -> Result<Inode, StorageError>;
 
+    /// Lookup the given path and return the matching sub-path, possibly empty and
+    /// the last matching inode..
+    fn lookup_partial_path<P: AsRef<Path>>(
+        &self,
+        path: P,
+    ) -> Result<(Option<Path>, Inode), StorageError>;
+
     /// Read the content of the given directory.
     fn readdir_path<P: AsRef<Path>>(&self, path: P) -> ReadDirIterator<'_>;
 
@@ -244,6 +251,29 @@ impl<T: TreeReadOperations> TreeExt for T {
         }
 
         Ok(Some(current))
+    }
+
+    fn lookup_partial_path<P: AsRef<Path>>(
+        &self,
+        path: P,
+    ) -> Result<(Option<Path>, Inode), StorageError> {
+        let path = path.as_ref();
+        let mut current = self.root();
+        for (i, component) in Path::components(Some(path)).enumerate() {
+            if let Some(e) = self.lookup(current, component)? {
+                current = e
+            } else {
+                log::debug!("not found: {component} in {current}");
+                let matched = Path::components(Some(path)).take(i).collect::<Vec<_>>();
+                if matched.is_empty() {
+                    return Ok((None, current));
+                } else {
+                    return Ok((Some(Path::parse(matched.join("/"))?), current));
+                }
+            };
+        }
+
+        Ok((Some(path.clone()), current))
     }
 
     fn readdir_path<P: AsRef<Path>>(&self, path: P) -> ReadDirIterator<'_> {
@@ -957,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    fn lookup_path() -> anyhow::Result<()> {
+    fn lookup() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
@@ -968,6 +998,27 @@ mod tests {
         let bar = tree.lookup(foo, "bar")?.unwrap();
         assert_eq!(baz, tree.lookup(bar, "baz")?.unwrap());
         assert_eq!(qux, tree.lookup(baz, "qux")?.unwrap());
+
+        Ok(())
+    }
+
+    #[test]
+    fn lookup_path() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree(&fixture.tree)?;
+        let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
+        let qux = tree.add_path(&Path::parse("foo/bar/baz/qux")?)?;
+        let foo = tree.lookup(tree.root(), "foo")?.unwrap();
+        let bar = tree.lookup(foo, "bar")?.unwrap();
+
+        assert_eq!(foo, tree.lookup_path(Path::parse("foo")?)?.unwrap());
+        assert_eq!(bar, tree.lookup_path(Path::parse("foo/bar")?)?.unwrap());
+        assert_eq!(baz, tree.lookup_path(Path::parse("foo/bar/baz")?)?.unwrap());
+        assert_eq!(
+            qux,
+            tree.lookup_path(Path::parse("foo/bar/baz/qux")?)?.unwrap()
+        );
 
         Ok(())
     }
@@ -986,6 +1037,40 @@ mod tests {
         assert_eq!(None, tree.lookup_path(Path::parse("foo/bar/notfound")?)?);
         assert_eq!(None, tree.lookup_path(Path::parse("foo/notfound")?)?);
         assert_eq!(None, tree.lookup_path(Path::parse("notfound")?)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn lookup_partial_path() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree(&fixture.tree)?;
+        let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
+        tree.add_path(&Path::parse("foo/bar/baz/qux")?)?;
+        let foo = tree.lookup(tree.root(), "foo")?.unwrap();
+        let bar = tree.lookup(foo, "bar")?.unwrap();
+
+        assert_eq!(
+            (Some(Path::parse("foo/bar/baz")?), baz),
+            tree.lookup_partial_path(Path::parse("foo/bar/baz")?)?
+        );
+        assert_eq!(
+            (Some(Path::parse("foo/bar/baz")?), baz),
+            tree.lookup_partial_path(Path::parse("foo/bar/baz/quux")?)?
+        );
+        assert_eq!(
+            (Some(Path::parse("foo/bar")?), bar),
+            tree.lookup_partial_path(Path::parse("foo/bar/burgle")?)?
+        );
+        assert_eq!(
+            (Some(Path::parse("foo/bar")?), bar),
+            tree.lookup_partial_path(Path::parse("foo/bar/waldo/fred")?)?
+        );
+        assert_eq!(
+            (None, tree.root()),
+            tree.lookup_partial_path(Path::parse("waldo/fred")?)?
+        );
 
         Ok(())
     }
