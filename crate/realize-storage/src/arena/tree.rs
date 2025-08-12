@@ -121,6 +121,8 @@ pub(crate) trait TreeReadOperations {
     ///
     /// The parent of the root inode is None. All other existing inodes
     /// have a parent.
+    ///
+    /// See also [TreeExt::ancestors]
     fn parent(&self, inode: Inode) -> Result<Option<Inode>, StorageError>;
 
     /// Return the name {inode} can be found in in {parent_inode}.
@@ -218,6 +220,10 @@ pub(crate) trait TreeExt {
 
     /// Follow the inodes back up to the root and build a path.
     fn backtrack(&self, inode: Inode) -> Result<Path, StorageError>;
+
+    /// Return an iterator that returns the parent of inode and it
+    /// parent until the root.
+    fn ancestors(&self, inode: Inode) -> impl Iterator<Item = Result<Inode, StorageError>>;
 }
 
 impl<T: TreeReadOperations> TreeExt for T {
@@ -300,6 +306,43 @@ impl<T: TreeReadOperations> TreeExt for T {
         }
 
         Ok(Path::parse(components.make_contiguous().join("/"))?)
+    }
+
+    fn ancestors(&self, inode: Inode) -> impl Iterator<Item = Result<Inode, StorageError>> {
+        Ancestors {
+            tree: self,
+            current: Some(inode),
+        }
+    }
+}
+
+struct Ancestors<'a, T>
+where
+    T: TreeReadOperations,
+{
+    tree: &'a T,
+    current: Option<Inode>,
+}
+
+impl<'a, T> Iterator for Ancestors<'a, T>
+where
+    T: TreeReadOperations,
+{
+    type Item = Result<Inode, StorageError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.current.take() {
+            None => None,
+            Some(inode) => match self.tree.parent(inode) {
+                Err(err) => Some(Err(err)),
+                Ok(Some(inode)) => {
+                    self.current = Some(inode);
+
+                    Some(Ok(inode))
+                }
+                Ok(None) => None,
+            },
+        }
     }
 }
 
@@ -1036,6 +1079,34 @@ mod tests {
         assert_eq!(Some(bar), tree.parent(baz)?);
         assert_eq!(None, tree.parent(Inode(999))?);
         assert_eq!(None, tree.parent(tree.root())?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn ancestors() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree(&fixture.tree)?;
+        assert!(tree.exists(tree.root())?);
+        assert!(!tree.exists(Inode(999))?);
+
+        let foo = tree.add_path(&Path::parse("foo")?)?;
+        let bar = tree.add_path(&Path::parse("foo/bar")?)?;
+        let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
+        assert_eq!(
+            vec![bar, foo, tree.root()],
+            tree.ancestors(baz).collect::<Result<Vec<_>, _>>()?
+        );
+        assert_eq!(
+            vec![foo, tree.root()],
+            tree.ancestors(bar).collect::<Result<Vec<_>, _>>()?
+        );
+        assert_eq!(
+            vec![tree.root()],
+            tree.ancestors(foo).collect::<Result<Vec<_>, _>>()?
+        );
+        assert!(tree.ancestors(tree.root()).next().is_none());
 
         Ok(())
     }
