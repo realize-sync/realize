@@ -480,7 +480,7 @@ impl<'a> WritableOpenTree<'a> {
         F: FnOnce(Inode) -> KB,
         KB: std::borrow::Borrow<K::SelfType<'k>>,
     {
-        let (_, inode) = self.add_path(path)?;
+        let inode = self.add_path(path)?;
         let key = (keygen)(inode);
         let res = table.insert(key, value)?;
         if res.is_none() {
@@ -527,7 +527,7 @@ impl<'a> WritableOpenTree<'a> {
         KB: std::borrow::Borrow<K::SelfType<'k>>,
         VB: std::borrow::Borrow<V::SelfType<'v>>,
     {
-        let (_, inode) = self.add_path(path)?;
+        let inode = self.add_path(path)?;
         if table.get((keygen)(inode))?.is_some() {
             return Ok(inode);
         }
@@ -591,18 +591,14 @@ impl<'a> WritableOpenTree<'a> {
         Ok(false)
     }
 
-    fn add_path<P: AsRef<Path>>(&mut self, path: P) -> Result<(Vec<Inode>, Inode), StorageError> {
+    fn add_path<P: AsRef<Path>>(&mut self, path: P) -> Result<Inode, StorageError> {
         let path = path.as_ref();
-        let mut parent_inode = self.tree.root;
-        let mut branches = vec![];
-        for component in Path::components(path.parent().as_ref()) {
-            let inode = self.add(parent_inode, component)?;
-            branches.push(inode);
-            parent_inode = inode;
+        let mut current = self.tree.root;
+        for component in Path::components(Some(path)) {
+            current = self.add(current, component)?;
         }
-        let leaf = self.add(parent_inode, path.name())?;
 
-        Ok((branches, leaf))
+        Ok(current)
     }
 
     fn add(&mut self, parent_inode: Inode, name: &str) -> Result<Inode, StorageError> {
@@ -870,8 +866,7 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        let (parents, node) = tree.add_path(&Path::parse("test")?)?;
-        assert!(parents.is_empty());
+        let node = tree.add_path(&Path::parse("test")?)?;
 
         assert_eq!(Some(node), tree.lookup(Inode(1), "test")?);
 
@@ -883,8 +878,10 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        let (parents, _) = tree.add_path(&Path::parse("foo/bar")?)?;
-        assert_eq!(1, parents.len());
+        let bar = tree.add_path(&Path::parse("foo/bar")?)?;
+
+        let foo = tree.lookup(tree.root(), "foo")?.unwrap();
+        assert_eq!(bar, tree.lookup(foo, "bar")?.unwrap());
 
         Ok(())
     }
@@ -906,11 +903,13 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        let (bar_parents, bar_inode) = tree.add_path(&Path::parse("foo/bar")?)?;
-        let (baz_parents, _) = tree.add_path(&Path::parse("foo/bar/baz")?)?;
-        assert_eq!(1, bar_parents.len());
-        assert_eq!(2, baz_parents.len());
-        assert_eq!(vec![bar_parents[0], bar_inode], baz_parents);
+        let bar = tree.add_path(&Path::parse("foo/bar")?)?;
+        let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
+
+        let foo = tree.lookup(tree.root(), "foo")?.unwrap();
+        assert_eq!(bar, tree.lookup(foo, "bar")?.unwrap());
+        assert_eq!(baz, tree.lookup(bar, "baz")?.unwrap());
+
         Ok(())
     }
 
@@ -919,27 +918,13 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        let (baz_parents, baz_inode) = tree.add_path(&Path::parse("foo/bar/baz")?)?;
-        let (_, qux_inode) = tree.add_path(&Path::parse("foo/bar/baz/qux")?)?;
+        let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
+        let qux = tree.add_path(&Path::parse("foo/bar/baz/qux")?)?;
 
-        assert_eq!(2, baz_parents.len());
-        assert_eq!(
-            Some(baz_parents[0]),
-            tree.lookup_path(&Path::parse("foo")?)?
-        );
-        assert_eq!(
-            Some(baz_parents[1]),
-            tree.lookup_path(&Path::parse("foo/bar")?)?
-        );
-        assert_eq!(
-            Some(baz_inode),
-            tree.lookup_path(&Path::parse("foo/bar/baz")?)?
-        );
-
-        assert_eq!(
-            Some(qux_inode),
-            tree.lookup_path(&Path::parse("foo/bar/baz/qux")?)?
-        );
+        let foo = tree.lookup(tree.root(), "foo")?.unwrap();
+        let bar = tree.lookup(foo, "bar")?.unwrap();
+        assert_eq!(baz, tree.lookup(bar, "baz")?.unwrap());
+        assert_eq!(qux, tree.lookup(baz, "qux")?.unwrap());
 
         Ok(())
     }
@@ -967,30 +952,30 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        let (_, foo_inode) = tree.add_path(&Path::parse("foo")?)?;
-        let (_, bar_inode) = tree.add_path(&Path::parse("foo/bar")?)?;
-        let (_, baz_inode) = tree.add_path(&Path::parse("foo/bar/baz")?)?;
-        let (_, qux_inode) = tree.add_path(&Path::parse("foo/bar/qux")?)?;
-        let (_, quux_inode) = tree.add_path(&Path::parse("foo/bar/quux")?)?;
+        let foo = tree.add_path(&Path::parse("foo")?)?;
+        let bar = tree.add_path(&Path::parse("foo/bar")?)?;
+        let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
+        let qux = tree.add_path(&Path::parse("foo/bar/qux")?)?;
+        let quux = tree.add_path(&Path::parse("foo/bar/quux")?)?;
 
         assert_eq!(
-            Some(vec![("foo".to_string(), foo_inode)]),
+            Some(vec![("foo".to_string(), foo)]),
             tree.readdir(tree.root())
                 .collect::<Result<Vec<_>, _>>()
                 .ok()
         );
         assert_eq!(
-            Some(vec![("bar".to_string(), bar_inode)]),
-            tree.readdir(foo_inode).collect::<Result<Vec<_>, _>>().ok()
+            Some(vec![("bar".to_string(), bar)]),
+            tree.readdir(foo).collect::<Result<Vec<_>, _>>().ok()
         );
 
         assert_eq!(
             Some(vec![
-                ("baz".to_string(), baz_inode),
-                ("quux".to_string(), quux_inode),
-                ("qux".to_string(), qux_inode),
+                ("baz".to_string(), baz),
+                ("quux".to_string(), quux),
+                ("qux".to_string(), qux),
             ]),
-            tree.readdir(bar_inode).collect::<Result<Vec<_>, _>>().ok()
+            tree.readdir(bar).collect::<Result<Vec<_>, _>>().ok()
         );
 
         Ok(())
@@ -1001,13 +986,13 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        let (_, foo_inode) = tree.add_path(&Path::parse("foo")?)?;
-        let (_, bar_inode) = tree.add_path(&Path::parse("foo/bar")?)?;
-        let (_, baz_inode) = tree.add_path(&Path::parse("foo/bar/baz")?)?;
+        let foo = tree.add_path(&Path::parse("foo")?)?;
+        let bar = tree.add_path(&Path::parse("foo/bar")?)?;
+        let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
 
-        assert_eq!(Path::parse("foo/bar/baz")?, tree.backtrack(baz_inode)?);
-        assert_eq!(Path::parse("foo/bar")?, tree.backtrack(bar_inode)?);
-        assert_eq!(Path::parse("foo")?, tree.backtrack(foo_inode)?);
+        assert_eq!(Path::parse("foo/bar/baz")?, tree.backtrack(baz)?);
+        assert_eq!(Path::parse("foo/bar")?, tree.backtrack(bar)?);
+        assert_eq!(Path::parse("foo")?, tree.backtrack(foo)?);
         // Root cannot be turned into a path, as empty paths are invalid.
         assert!(tree.backtrack(tree.root()).is_err());
 
@@ -1027,10 +1012,10 @@ mod tests {
         assert!(tree.exists(tree.root())?);
         assert!(!tree.exists(Inode(999))?);
 
-        let (_, foo_inode) = tree.add_path(&Path::parse("foo")?)?;
-        let (_, bar_inode) = tree.add_path(&Path::parse("foo/bar")?)?;
-        assert!(tree.exists(foo_inode)?);
-        assert!(tree.exists(bar_inode)?);
+        let foo = tree.add_path(&Path::parse("foo")?)?;
+        let bar = tree.add_path(&Path::parse("foo/bar")?)?;
+        assert!(tree.exists(foo)?);
+        assert!(tree.exists(bar)?);
 
         Ok(())
     }
@@ -1043,9 +1028,9 @@ mod tests {
         assert!(tree.exists(tree.root())?);
         assert!(!tree.exists(Inode(999))?);
 
-        let (_, foo) = tree.add_path(&Path::parse("foo")?)?;
-        let (_, bar) = tree.add_path(&Path::parse("foo/bar")?)?;
-        let (_, baz) = tree.add_path(&Path::parse("foo/bar/baz")?)?;
+        let foo = tree.add_path(&Path::parse("foo")?)?;
+        let bar = tree.add_path(&Path::parse("foo/bar")?)?;
+        let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
         assert_eq!(Some(tree.root()), tree.parent(foo)?);
         assert_eq!(Some(foo), tree.parent(bar)?);
         assert_eq!(Some(bar), tree.parent(baz)?);
@@ -1063,9 +1048,9 @@ mod tests {
         assert!(tree.exists(tree.root())?);
         assert!(!tree.exists(Inode(999))?);
 
-        let (_, foo) = tree.add_path(&Path::parse("foo")?)?;
-        let (_, bar) = tree.add_path(&Path::parse("foo/bar")?)?;
-        let (_, baz) = tree.add_path(&Path::parse("foo/bar/baz")?)?;
+        let foo = tree.add_path(&Path::parse("foo")?)?;
+        let bar = tree.add_path(&Path::parse("foo/bar")?)?;
+        let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
         assert_eq!(Some("foo".to_string()), tree.name_in(tree.root(), foo)?);
         assert_eq!(Some("bar".to_string()), tree.name_in(foo, bar)?);
         assert_eq!(Some("baz".to_string()), tree.name_in(bar, baz)?);
@@ -1080,10 +1065,10 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        let (bar_parents, bar) = tree.add_path(&Path::parse("foo/bar")?)?;
-        let foo = bar_parents[0];
-        let (_, baz) = tree.add_path(&Path::parse("foo/bar/baz")?)?;
-        let (_, qux) = tree.add_path(&Path::parse("foo/qux")?)?;
+        let bar = tree.add_path(&Path::parse("foo/bar")?)?;
+        let foo = tree.lookup(tree.root(), "foo")?.unwrap();
+        let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
+        let qux = tree.add_path(&Path::parse("foo/qux")?)?;
 
         tree.incref(bar)?;
         tree.incref(baz)?;
@@ -1116,8 +1101,8 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        let (parents, baz) = tree.add_path(&Path::parse("foo/bar/baz")?)?;
-        let bar = parents[1];
+        let baz = tree.add_path(Path::parse("foo/bar/baz")?)?;
+        let bar = tree.expect_path(Path::parse("foo/bar")?)?;
 
         tree.incref(baz)?;
         tree.incref(bar)?;
@@ -1146,16 +1131,16 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
 
-        let (_, foo) = tree.add_path(Path::parse("foo")?)?;
-        let (_, bar) = tree.add_path(Path::parse("foo/bar")?)?;
-        let (_, baz) = tree.add_path(Path::parse("foo/bar/baz")?)?;
-        let (_, qux) = tree.add_path(Path::parse("foo/bar/baz/qux")?)?;
-        let (_, corge) = tree.add_path(Path::parse("foo/bar/corge")?)?;
-        let (_, graply) = tree.add_path(Path::parse("foo/bar/corge/graply")?)?;
-        let (_, grault) = tree.add_path(Path::parse("foo/bar/corge/grault")?)?;
-        let (_, quux) = tree.add_path(Path::parse("foo/bar/quux")?)?;
-        let (_, waldo) = tree.add_path(Path::parse("foo/bar/waldo")?)?;
-        let (_, fred) = tree.add_path(Path::parse("foo/fred")?)?;
+        let foo = tree.add_path(Path::parse("foo")?)?;
+        let bar = tree.add_path(Path::parse("foo/bar")?)?;
+        let baz = tree.add_path(Path::parse("foo/bar/baz")?)?;
+        let qux = tree.add_path(Path::parse("foo/bar/baz/qux")?)?;
+        let corge = tree.add_path(Path::parse("foo/bar/corge")?)?;
+        let graply = tree.add_path(Path::parse("foo/bar/corge/graply")?)?;
+        let grault = tree.add_path(Path::parse("foo/bar/corge/grault")?)?;
+        let quux = tree.add_path(Path::parse("foo/bar/quux")?)?;
+        let waldo = tree.add_path(Path::parse("foo/bar/waldo")?)?;
+        let fred = tree.add_path(Path::parse("foo/fred")?)?;
         tree.add_path(Path::parse("xyzzy")?)?; // not in foo, ignored
 
         assert_eq!(
@@ -1186,9 +1171,9 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
 
-        let (_, bar) = tree.add_path(Path::parse("foo/bar")?)?;
-        let (_, baz) = tree.add_path(Path::parse("foo/bar/baz")?)?;
-        let (_, qux) = tree.add_path(Path::parse("foo/bar/baz/qux")?)?;
+        let bar = tree.add_path(Path::parse("foo/bar")?)?;
+        let baz = tree.add_path(Path::parse("foo/bar/baz")?)?;
+        let qux = tree.add_path(Path::parse("foo/bar/baz/qux")?)?;
 
         assert_eq!(
             vec![bar, baz, qux],
