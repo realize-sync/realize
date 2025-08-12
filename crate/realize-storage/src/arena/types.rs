@@ -660,16 +660,13 @@ pub struct FileTableEntry {
     /// How the file can be fetched from the peer.
     pub content: FileContent,
 
-    /// Inode of the containing directory
-    pub parent_inode: Inode,
-
     // If set, a version is known to exist that replaces the version
     // in this entry.
     pub outdated_by: Option<Hash>,
 }
 
 impl FileTableEntry {
-    pub fn new(path: Path, size: u64, mtime: UnixTime, hash: Hash, parent_inode: Inode) -> Self {
+    pub fn new(path: Path, size: u64, mtime: UnixTime, hash: Hash) -> Self {
         Self {
             metadata: FileMetadata { size, mtime: mtime },
             content: FileContent {
@@ -677,7 +674,6 @@ impl FileTableEntry {
                 hash,
                 blob: None,
             },
-            parent_inode,
             outdated_by: None,
         }
     }
@@ -741,7 +737,6 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
                 hash: parse_hash(content.get_hash()?)?,
                 blob,
             },
-            parent_inode: Inode(msg.get_parent()),
             outdated_by,
         })
     }
@@ -750,8 +745,6 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
         let mut message = ::capnp::message::Builder::new_default();
         let mut builder: cache_capnp::file_table_entry::Builder =
             message.init_root::<cache_capnp::file_table_entry::Builder>();
-
-        builder.set_parent(self.parent_inode.into());
 
         let mut content = builder.reborrow().init_content();
         content.set_path(self.content.path.as_str());
@@ -1067,7 +1060,6 @@ mod tests {
                 size: 200,
                 mtime: UnixTime::from_secs(1234567890),
             },
-            parent_inode: Inode(1234),
             outdated_by: Some(Hash([3u8; 32])),
         };
 
@@ -1091,7 +1083,6 @@ mod tests {
                 size: 200,
                 mtime: UnixTime::from_secs(1234567890),
             },
-            parent_inode: Inode(1234),
             outdated_by: None,
         };
 

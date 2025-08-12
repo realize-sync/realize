@@ -74,8 +74,8 @@ const FILE_TABLE: TableDefinition<FileTableKey, Holder<FileTableEntry>> =
 /// still in this table are deleted.
 ///
 /// Key: (peer, file inode)
-/// Value: parent dir inode
-const PENDING_CATCHUP_TABLE: TableDefinition<(&str, Inode), Inode> =
+/// Value: ()
+const PENDING_CATCHUP_TABLE: TableDefinition<(&str, Inode), ()> =
     TableDefinition::new("acache.pending_catchup");
 
 /// Track Peer UUIDs.
@@ -277,7 +277,7 @@ impl ArenaWriteTransaction {
 
     pub fn pending_catchup_table<'txn>(
         &'txn self,
-    ) -> Result<Table<'txn, (&'static str, Inode), Inode>, StorageError> {
+    ) -> Result<Table<'txn, (&'static str, Inode), ()>, StorageError> {
         Ok(self.inner.open_table(PENDING_CATCHUP_TABLE)?)
     }
 
