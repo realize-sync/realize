@@ -743,24 +743,15 @@ impl ArenaCache {
 
     fn get_indexed_file(
         &self,
-        dir_table: &impl ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
+        tree: &impl TreeReadOperations,
         file_table: &impl ReadableTable<FileTableKey, Holder<'static, FileTableEntry>>,
         path: &Path,
     ) -> Result<Option<IndexedFileTableEntry>, StorageError> {
-        let (inode, assignment) = match do_lookup_path(dir_table, self.arena_root, Some(path)) {
-            Ok(ret) => ret,
-            Err(StorageError::NotFound) => {
-                return Ok(None);
-            }
-            Err(err) => {
-                return Err(err);
-            }
-        };
-        if assignment != InodeAssignment::File {
-            return Err(StorageError::IsADirectory);
+        if let Some(inode) = tree.lookup_path(path)? {
+            get_indexed_file_inode(file_table, inode)
+        } else {
+            Ok(None)
         }
-
-        get_indexed_file_inode(file_table, inode)
     }
 
     fn index_file(
@@ -927,7 +918,7 @@ impl RealIndex for ArenaCache {
         txn: &super::db::ArenaReadTransaction,
         path: &realize_types::Path,
     ) -> Result<Option<IndexedFileTableEntry>, StorageError> {
-        self.get_indexed_file(&txn.dir_table()?, &txn.file_table()?, path)
+        self.get_indexed_file(&txn.read_tree(&self.tree)?, &txn.file_table()?, path)
     }
 
     fn get_indexed_file_txn(
@@ -937,9 +928,8 @@ impl RealIndex for ArenaCache {
         path: &realize_types::Path,
         hash: Option<&Hash>,
     ) -> Result<Option<std::path::PathBuf>, StorageError> {
-        let dir_table = txn.dir_table()?;
         let file_table = txn.file_table()?;
-        let entry = self.get_indexed_file(&dir_table, &file_table, path)?;
+        let entry = self.get_indexed_file(&txn.read_tree(&self.tree)?, &file_table, path)?;
         match hash {
             Some(hash) => {
                 if let Some(entry) = entry
