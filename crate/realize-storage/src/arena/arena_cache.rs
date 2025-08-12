@@ -2,7 +2,7 @@ use super::blob::{self, Blobstore};
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
 use super::index::RealIndex;
 use super::mark::PathMarks;
-use super::tree::{OpenTreeWrite, Tree, TreeReadOperations, WritableOpenTree};
+use super::tree::{OpenTree, OpenTreeWrite, Tree, TreeExt, TreeReadOperations, WritableOpenTree};
 use super::types::{
     DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry, FileTableKey,
     HistoryTableEntry, IndexedFileTableEntry, LocalAvailability, LruQueueId, MarkTableEntry,
@@ -345,10 +345,9 @@ impl ArenaCache {
         let txn = self.db.begin_write()?;
         let ret = {
             let mut file_table = txn.file_table()?;
-            let dir_table = txn.dir_table()?;
             let mark_table = txn.mark_table()?;
             let mut file_entry = get_default_entry(&file_table, inode)?;
-            let queue = queue_for_inode(&mark_table, &dir_table, &file_table, inode)?;
+            let queue = queue_for_inode(&mark_table, &txn.read_tree(&self.tree)?, inode)?;
             let blob = self
                 .blobstore
                 .create_blob(&txn, file_entry.clone(), queue)?;
@@ -454,11 +453,10 @@ impl ArenaCache {
             return Ok(None);
         }
         let mark_table = txn.mark_table()?;
-        let dir_table = txn.dir_table()?;
         let (blob_id, cachepath) = self.blobstore.move_into_blob(
             &txn,
             file_entry.content.blob,
-            queue_for_inode(&mark_table, &dir_table, &file_table, inode)?,
+            queue_for_inode(&mark_table, &txn.read_tree(&self.tree)?, inode)?,
             metadata,
         )?;
         file_entry.content.blob = Some(blob_id);
@@ -870,11 +868,10 @@ impl ArenaCache {
 /// Choose the appropriate blob queue for the inode, given its mark.
 fn queue_for_inode(
     mark_table: &impl ReadableTable<Inode, Holder<'static, MarkTableEntry>>,
-    dir_table: &impl ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
-    file_table: &impl ReadableTable<FileTableKey, Holder<'static, FileTableEntry>>,
+    tree: &impl TreeReadOperations,
     inode: Inode,
 ) -> Result<LruQueueId, StorageError> {
-    let mark = resolve_mark(mark_table, dir_table, file_table, inode)?;
+    let mark = resolve_mark(mark_table, tree, inode)?;
     Ok(queue_for_mark(mark))
 }
 
@@ -1185,13 +1182,11 @@ impl PathMarks for ArenaCache {
     }
 
     fn get_mark_txn(&self, txn: &ArenaReadTransaction, path: &Path) -> Result<Mark, StorageError> {
-        let dir_table = txn.dir_table()?;
-        let (inode, _) = do_lookup_path(&dir_table, self.arena_root, Some(path))?;
-
         let mark_table = txn.mark_table()?;
-        let file_table = txn.file_table()?;
+        let tree = txn.read_tree(&self.tree)?;
+        let inode = tree.lookup_path(path)?.unwrap_or(tree.root());
 
-        Ok(resolve_mark(&mark_table, &dir_table, &file_table, inode)?)
+        Ok(resolve_mark(&mark_table, &tree, inode)?)
     }
 
     fn set_arena_mark(&self, mark: Mark) -> Result<(), StorageError> {
@@ -1202,7 +1197,7 @@ impl PathMarks for ArenaCache {
             let mut mark_table = txn.mark_table()?;
             let dir_table = txn.dir_table()?;
             let file_table = txn.file_table()?;
-            let old_mark = resolve_mark(&mark_table, &dir_table, &file_table, inode)?;
+            let old_mark = resolve_mark(&mark_table, &txn.read_tree(&self.tree)?, inode)?;
             mark_table.insert(inode, Holder::with_content(MarkTableEntry { mark })?)?;
 
             if old_mark != mark {
@@ -1222,7 +1217,7 @@ impl PathMarks for ArenaCache {
 
             let mut mark_table = txn.mark_table()?;
             let file_table = txn.file_table()?;
-            let old_mark = resolve_mark(&mark_table, &dir_table, &file_table, inode)?;
+            let old_mark = resolve_mark(&mark_table, &txn.read_tree(&self.tree)?, inode)?;
             mark_table.insert(inode, Holder::with_content(MarkTableEntry { mark })?)?;
 
             if old_mark != mark {
@@ -1254,7 +1249,7 @@ impl PathMarks for ArenaCache {
             };
             if let Some(old_mark) = old_mark {
                 let file_table = txn.file_table()?;
-                let new_mark = resolve_mark(&mark_table, &dir_table, &file_table, inode)?;
+                let new_mark = resolve_mark(&mark_table, &txn.read_tree(&self.tree)?, inode)?;
                 if old_mark != new_mark {
                     match assignment {
                         InodeAssignment::Directory => {
@@ -1275,25 +1270,17 @@ impl PathMarks for ArenaCache {
 
 fn resolve_mark(
     mark_table: &impl ReadableTable<Inode, Holder<'static, MarkTableEntry>>,
-    dir_table: &impl ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
-    file_table: &impl ReadableTable<FileTableKey, Holder<'static, FileTableEntry>>,
+    tree: &impl TreeReadOperations,
     inode: Inode,
 ) -> Result<Mark, StorageError> {
-    let mut inode = inode;
-    loop {
+    for inode in std::iter::once(Ok(inode)).chain(tree.ancestors(inode)) {
+        let inode = inode?;
         if let Some(e) = mark_table.get(inode)? {
             return Ok(e.value().parse()?.mark);
         }
-        inode = match do_parent_inode(dir_table, file_table, inode) {
-            Ok(inode) => inode,
-            Err(StorageError::NotFound) => {
-                return Ok(Mark::default());
-            }
-            Err(err) => {
-                return Err(err);
-            }
-        }
     }
+
+    Ok(Mark::default())
 }
 
 fn mark_file_dirty(
