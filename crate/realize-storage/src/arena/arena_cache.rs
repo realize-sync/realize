@@ -836,20 +836,13 @@ impl ArenaCache {
     fn unindex_dir(
         &self,
         txn: &ArenaWriteTransaction,
-        dir_table: &impl ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
+        tree: &impl TreeReadOperations,
         file_table: &mut Table<'_, FileTableKey, Holder<'static, FileTableEntry>>,
         history_table: &mut Table<'_, u64, Holder<'static, HistoryTableEntry>>,
         inode: Inode,
     ) -> Result<(), StorageError> {
-        for (_, inode, assignment) in do_readdir(dir_table, inode)? {
-            match assignment {
-                InodeAssignment::File => {
-                    self.unindex_file(txn, file_table, history_table, inode)?
-                }
-                InodeAssignment::Directory => {
-                    self.unindex_dir(txn, dir_table, file_table, history_table, inode)?
-                }
-            }
+        for inode in tree.recurse(inode, |_| true) {
+            self.unindex_file(txn, file_table, history_table, inode?)?
         }
 
         Ok(())
@@ -1081,9 +1074,7 @@ impl RealIndex for ArenaCache {
                 let mut file_table = txn.file_table()?;
                 let mut history_table = txn.history_table()?;
                 self.unindex_file(&txn, &mut file_table, &mut history_table, inode)?;
-
-                let dir_table = txn.dir_table()?;
-                self.unindex_dir(&txn, &dir_table, &mut file_table, &mut history_table, inode)?;
+                self.unindex_dir(&txn, &tree, &mut file_table, &mut history_table, inode)?;
             }
         }
         txn.commit()?;
