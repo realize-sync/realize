@@ -114,9 +114,6 @@ pub(crate) trait TreeReadOperations {
     /// List names under the given inode.
     fn readdir(&self, inode: Inode) -> ReadDirIterator;
 
-    /// Follow the inodes back up to the root and build a path.
-    fn backtrack(&self, inode: Inode) -> Result<Path, StorageError>;
-
     /// Check whether the given inode exists
     fn exists(&self, inode: Inode) -> Result<bool, StorageError>;
 
@@ -125,6 +122,9 @@ pub(crate) trait TreeReadOperations {
     /// The parent of the root inode is None. All other existing inodes
     /// have a parent.
     fn parent(&self, inode: Inode) -> Result<Option<Inode>, StorageError>;
+
+    /// Return the name {inode} can be found in in {parent_inode}.
+    fn name_in(&self, parent_inode: Inode, inode: Inode) -> Result<Option<String>, StorageError>;
 }
 
 impl<T> TreeReadOperations for ReadableOpenTree<T>
@@ -140,14 +140,14 @@ where
     fn readdir(&self, inode: Inode) -> ReadDirIterator<'_> {
         readdir(&self.table, inode)
     }
-    fn backtrack(&self, inode: Inode) -> Result<Path, StorageError> {
-        backtrack(&self.table, self.root, inode)
-    }
     fn exists(&self, inode: Inode) -> Result<bool, StorageError> {
         exists(&self.table, self.root, inode)
     }
     fn parent(&self, inode: Inode) -> Result<Option<Inode>, StorageError> {
         parent(&self.table, inode)
+    }
+    fn name_in(&self, parent_inode: Inode, inode: Inode) -> Result<Option<String>, StorageError> {
+        name_in(&self.table, parent_inode, inode)
     }
 }
 
@@ -161,14 +161,14 @@ impl<'a> TreeReadOperations for WritableOpenTree<'a> {
     fn readdir(&self, inode: Inode) -> ReadDirIterator<'_> {
         readdir(&self.table, inode)
     }
-    fn backtrack(&self, inode: Inode) -> Result<Path, StorageError> {
-        backtrack(&self.table, self.tree.root, inode)
-    }
     fn exists(&self, inode: Inode) -> Result<bool, StorageError> {
         exists(&self.table, self.tree.root, inode)
     }
     fn parent(&self, inode: Inode) -> Result<Option<Inode>, StorageError> {
         parent(&self.table, inode)
+    }
+    fn name_in(&self, parent_inode: Inode, inode: Inode) -> Result<Option<String>, StorageError> {
+        name_in(&self.table, parent_inode, inode)
     }
 }
 
@@ -215,6 +215,9 @@ pub(crate) trait TreeExt {
     ) -> impl Iterator<Item = Result<Inode, StorageError>>
     where
         F: FnMut(Inode) -> bool;
+
+    /// Follow the inodes back up to the root and build a path.
+    fn backtrack(&self, inode: Inode) -> Result<Path, StorageError>;
 }
 
 impl<T: TreeReadOperations> TreeExt for T {
@@ -277,6 +280,26 @@ impl<T: TreeReadOperations> TreeExt for T {
             enter,
             stack: VecDeque::from([self.readdir(inode)]),
         }
+    }
+
+    fn backtrack(&self, inode: Inode) -> Result<Path, StorageError> {
+        let mut components = VecDeque::new();
+        let mut current = inode;
+        while let Some(parent) = self.parent(current)? {
+            if let Some(name) = self.name_in(parent, current)? {
+                components.push_front(name);
+            } else {
+                return Err(StorageError::InconsistentDatabase(format!(
+                    "{current} not in its parent {parent}"
+                )));
+            }
+            current = parent;
+        }
+        if current != self.root() {
+            return Err(StorageError::NotFound);
+        }
+
+        Ok(Path::parse(components.make_contiguous().join("/"))?)
     }
 }
 
@@ -687,34 +710,24 @@ fn exists(
     Ok(tree_table.get((inode, ".."))?.is_some())
 }
 
-fn backtrack(
+fn name_in(
     tree_table: &impl ReadableTable<(Inode, &'static str), Inode>,
-    root_inode: Inode,
+    parent_inode: Inode,
     inode: Inode,
-) -> Result<Path, StorageError> {
-    let mut components = VecDeque::new();
-    let mut current = inode;
-    'outer: while let Some(parent) = parent(tree_table, current)? {
-        for v in tree_table.range(inode_range(parent))? {
-            let v = v?;
-            let (key, value) = v;
-            if value.value() == current {
-                let (_, name) = key.value();
-                components.push_front(name.to_string());
-
-                current = parent;
-                continue 'outer;
+) -> Result<Option<String>, StorageError> {
+    for v in tree_table.range(inode_range(parent_inode))? {
+        let v = v?;
+        let (key, value) = v;
+        if value.value() == inode {
+            let (_, name) = key.value();
+            if name == ".." || name == "." {
+                return Ok(None);
             }
+            return Ok(Some(name.to_string()));
         }
-        return Err(StorageError::InconsistentDatabase(format!(
-            "{current} not in its parent {parent}"
-        )));
-    }
-    if current != root_inode {
-        return Err(StorageError::NotFound);
     }
 
-    Ok(Path::parse(components.make_contiguous().join("/"))?)
+    Ok(None)
 }
 
 fn parent(
@@ -1038,6 +1051,26 @@ mod tests {
         assert_eq!(Some(bar), tree.parent(baz)?);
         assert_eq!(None, tree.parent(Inode(999))?);
         assert_eq!(None, tree.parent(tree.root())?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn name_in() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree(&fixture.tree)?;
+        assert!(tree.exists(tree.root())?);
+        assert!(!tree.exists(Inode(999))?);
+
+        let (_, foo) = tree.add_path(&Path::parse("foo")?)?;
+        let (_, bar) = tree.add_path(&Path::parse("foo/bar")?)?;
+        let (_, baz) = tree.add_path(&Path::parse("foo/bar/baz")?)?;
+        assert_eq!(Some("foo".to_string()), tree.name_in(tree.root(), foo)?);
+        assert_eq!(Some("bar".to_string()), tree.name_in(foo, bar)?);
+        assert_eq!(Some("baz".to_string()), tree.name_in(bar, baz)?);
+        assert_eq!(None, tree.name_in(foo, baz)?);
+        assert_eq!(None, tree.name_in(foo, tree.root())?);
 
         Ok(())
     }
