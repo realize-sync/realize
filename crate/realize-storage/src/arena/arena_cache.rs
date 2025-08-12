@@ -2,6 +2,7 @@ use super::blob::{self, Blobstore};
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
 use super::index::RealIndex;
 use super::mark::PathMarks;
+use super::tree::{OpenTreeWrite, Tree, TreeReadOperations, WritableOpenTree};
 use super::types::{
     DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry, FileTableKey,
     HistoryTableEntry, IndexedFileTableEntry, LocalAvailability, LruQueueId, MarkTableEntry,
@@ -31,7 +32,7 @@ pub(crate) struct ArenaCache {
     arena: Arena,
     arena_root: Inode,
     db: Arc<ArenaDatabase>,
-    allocator: Arc<InodeAllocator>,
+    tree: Tree,
     blobstore: Arc<Blobstore>,
     dirty_paths: Arc<DirtyPaths>,
 
@@ -54,7 +55,7 @@ impl ArenaCache {
         let arena_root = allocator
             .arena_root(arena)
             .ok_or_else(|| StorageError::UnknownArena(arena))?;
-
+        let tree = Tree::new(arena, arena_root, Arc::clone(&allocator));
         let uuid = load_or_assign_uuid(&db)?;
         let last_history_index = {
             let txn = db.begin_read()?;
@@ -66,7 +67,7 @@ impl ArenaCache {
         Ok(Arc::new(Self {
             arena,
             arena_root,
-            allocator,
+            tree,
             db,
             blobstore,
             dirty_paths,
@@ -171,7 +172,7 @@ impl ArenaCache {
 
                 let mut file_table = txn.file_table()?;
                 let (parent_inode, file_inode) =
-                    do_create_file(&txn, self.arena_root, &path, &|| self.allocate_inode(&txn))?;
+                    do_create_file(&txn, &mut txn.write_tree(&self.tree)?, &path)?;
                 if !get_file_entry(&file_table, file_inode, Some(peer))?.is_some() {
                     let entry = FileTableEntry::new(path, size, mtime, hash, parent_inode);
                     self.do_write_file_entry(&mut file_table, file_inode, peer, &entry)?;
@@ -197,7 +198,7 @@ impl ArenaCache {
                 do_update_last_seen_notification(&txn, peer, index)?;
 
                 let (parent_inode, file_inode) =
-                    do_create_file(&txn, self.arena_root, &path, &|| self.allocate_inode(&txn))?;
+                    do_create_file(&txn, &mut txn.write_tree(&self.tree)?, &path)?;
 
                 let mut file_table = txn.file_table()?;
                 let entry = FileTableEntry::new(path, size, mtime, hash.clone(), parent_inode);
@@ -291,7 +292,7 @@ impl ArenaCache {
                 ..
             } => {
                 let (parent_inode, file_inode) =
-                    do_create_file(&txn, self.arena_root, &path, &|| self.allocate_inode(&txn))?;
+                    do_create_file(&txn, &mut txn.write_tree(&self.tree)?, &path)?;
 
                 do_unmark_peer_file(&txn, peer, file_inode)?;
 
@@ -608,13 +609,11 @@ impl ArenaCache {
             }
 
             file_table.remove(FileTableKey::Default(inode))?;
-            dir_table.retain_in(
-                (parent_inode, "")..(parent_inode.plus(1), ""),
-                |_, v| match v.parse() {
-                    Ok(DirTableEntry::Regular(v)) => v.inode != inode,
-                    _ => true,
-                },
-            )?;
+            let mut tree = txn.write_tree(&self.tree)?;
+            if let Some(name) = tree.name_in(parent_inode, inode)? {
+                tree.remove(inode, dir_table, (parent_inode, name.as_str()))?;
+                log::debug!("Tree.remove {inode} ({parent_inode}, {name})");
+            }
             dir_table.insert(
                 (parent_inode, "."),
                 Holder::with_content(DirTableEntry::Dot(UnixTime::now()))?,
@@ -744,12 +743,6 @@ impl ArenaCache {
         self.blobstore.cleanup_cache(target_size)
     }
 
-    /// Allocate a new inode, extending the range if necessary.
-    fn allocate_inode(&self, txn: &ArenaWriteTransaction) -> Result<Inode, StorageError> {
-        self.allocator
-            .allocate_arena_inode(&mut txn.current_inode_range_table()?, self.arena)
-    }
-
     fn get_indexed_file(
         &self,
         dir_table: &impl ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
@@ -781,7 +774,7 @@ impl ArenaCache {
         hash: Hash,
     ) -> Result<IndexedFileTableEntry, StorageError> {
         let (parent_inode, file_inode) =
-            do_create_file(&txn, self.arena_root, &path, &|| self.allocate_inode(&txn))?;
+            do_create_file(&txn, &mut txn.write_tree(&self.tree)?, &path)?;
 
         let mut file_table = txn.file_table()?;
         let mut history_table = txn.history_table()?;
@@ -1537,82 +1530,82 @@ fn do_file_availability(
 /// Return the parent inode and the file inode.
 fn do_create_file<T>(
     txn: &ArenaWriteTransaction,
-    arena_root: Inode,
+    tree: &mut WritableOpenTree,
     path: T,
-    alloc_inode: &impl Fn() -> Result<Inode, StorageError>,
 ) -> Result<(Inode, Inode), StorageError>
 where
     T: AsRef<Path>,
 {
     let path = path.as_ref();
     let mut dir_table = txn.dir_table()?;
-    let filename = path.name();
-    let parent_inode = do_mkdirs(
+    let mut parent_inode = tree.root();
+    for component in Path::components(path.parent().as_ref()) {
+        parent_inode = add_dir_entry(
+            &mut dir_table,
+            tree,
+            parent_inode,
+            component,
+            InodeAssignment::Directory,
+        )?;
+    }
+
+    let file_inode = add_dir_entry(
         &mut dir_table,
-        arena_root,
-        path.parent().as_ref(),
-        alloc_inode,
+        tree,
+        parent_inode,
+        path.name(),
+        InodeAssignment::File,
     )?;
-    let dir_entry = get_dir_entry(&dir_table, parent_inode, filename)?;
-    let file_inode = match dir_entry {
-        None => {
-            let new_inode = (alloc_inode)()?;
-            add_dir_entry(
-                &mut dir_table,
-                parent_inode,
-                new_inode,
-                filename,
-                InodeAssignment::File,
-            )?;
-
-            new_inode
-        }
-        Some((inode, assignment)) => {
-            if assignment != InodeAssignment::File {
-                return Err(StorageError::IsADirectory);
-            }
-
-            inode
-        }
-    };
 
     Ok((parent_inode, file_inode))
 }
 
-/// Make sure that the given path is a directory; create it if necessary.
-///
-/// Returns the inode of the directory pointed to by the path.
-fn do_mkdirs(
+fn add_dir_entry(
     dir_table: &mut redb::Table<'_, (Inode, &str), Holder<DirTableEntry>>,
-    root_inode: Inode,
-    path: Option<&Path>,
-    alloc_inode: &impl Fn() -> Result<Inode, StorageError>,
+    tree: &mut WritableOpenTree,
+    parent_inode: Inode,
+    name: &str,
+    assignment: InodeAssignment,
 ) -> Result<Inode, StorageError> {
-    let mut current = root_inode;
-    for component in Path::components(path) {
-        current = if let Some((inode, assignment)) = get_dir_entry(dir_table, current, component)? {
-            if assignment != InodeAssignment::Directory {
-                return Err(StorageError::NotADirectory);
+    let (new_inode, created) = tree.insert_if_not_found(
+        parent_inode,
+        name,
+        dir_table,
+        |_| (parent_inode, name),
+        |inode| Holder::with_content(DirTableEntry::Regular(ReadDirEntry { inode, assignment })),
+        |_, v| {
+            if let DirTableEntry::Regular(e) = v.value().parse()? {
+                if e.assignment != assignment {
+                    return Err(match assignment {
+                        InodeAssignment::Directory => StorageError::NotADirectory,
+                        InodeAssignment::File => StorageError::IsADirectory,
+                    });
+                }
+            } else {
+                return Err(StorageError::InconsistentDatabase(format!(
+                    "expected regular entry for ({parent_inode}, {name:?}) in dir_table"
+                )));
             }
-            log::debug!("found {component} in {current} -> {inode}");
 
-            inode
-        } else {
-            log::debug!("add {component} in {current}");
-            let new_inode = (alloc_inode)()?;
-            add_dir_entry(
-                dir_table,
-                current,
-                new_inode,
-                component,
-                InodeAssignment::Directory,
+            Ok(())
+        },
+    )?;
+    if created {
+        log::debug!("new dir entry {parent_inode} {name} -> {new_inode} {assignment:?}");
+
+        let mtime = UnixTime::now();
+        let dot = Holder::with_content(DirTableEntry::Dot(mtime))?;
+        dir_table.insert((parent_inode, "."), dot.clone())?;
+        if assignment == InodeAssignment::Directory {
+            dir_table.insert((new_inode, "."), dot.clone())?;
+            dir_table.insert(
+                (new_inode, ".."),
+                Holder::with_content(DirTableEntry::DotDot(parent_inode))?,
             )?;
-
-            new_inode
-        };
+        }
     }
 
-    Ok(current)
+    Ok(new_inode)
 }
 
 /// Find the file or directory pointed to by the given path.
@@ -1646,36 +1639,6 @@ fn get_dir_entry(
         None => Ok(None),
         Some(e) => Ok(Some(e.value().parse()?.into_readdir_entry(parent_inode))),
     }
-}
-
-/// Add an entry to the given directory.
-fn add_dir_entry(
-    dir_table: &mut redb::Table<'_, (Inode, &str), Holder<DirTableEntry>>,
-    parent_inode: Inode,
-    new_inode: Inode,
-    name: &str,
-    assignment: InodeAssignment,
-) -> Result<(), StorageError> {
-    log::debug!("new dir entry {parent_inode} {name} -> {new_inode} {assignment:?}");
-    dir_table.insert(
-        (parent_inode, name),
-        Holder::with_content(DirTableEntry::Regular(ReadDirEntry {
-            inode: new_inode,
-            assignment,
-        }))?,
-    )?;
-    let mtime = UnixTime::now();
-    let dot = Holder::with_content(DirTableEntry::Dot(mtime))?;
-    dir_table.insert((parent_inode, "."), dot.clone())?;
-    if assignment == InodeAssignment::Directory {
-        dir_table.insert((new_inode, "."), dot.clone())?;
-        dir_table.insert(
-            (new_inode, ".."),
-            Holder::with_content(DirTableEntry::DotDot(parent_inode))?,
-        )?;
-    }
-
-    Ok(())
 }
 
 fn do_mark_peer_files(txn: &ArenaWriteTransaction, peer: Peer) -> Result<(), StorageError> {
@@ -1768,6 +1731,7 @@ mod tests {
     use crate::arena::index::RealIndex;
     use crate::arena::mark::PathMarks;
     use crate::arena::notifier::Notification;
+    use crate::arena::tree::{OpenTree, TreeReadOperations};
     use crate::arena::types::HistoryTableEntry;
     use crate::utils::hash;
     use crate::utils::redb_utils;
@@ -1922,6 +1886,51 @@ mod tests {
         let (_, assignment) = acache.lookup(inode, "b")?;
         assert_eq!(assignment, InodeAssignment::Directory, "b");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn add_and_remove_mirrored_in_tree() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let acache = &fixture.acache;
+        let file_path = Path::parse("a/b/c.txt")?;
+        let mtime = test_time();
+
+        fixture.add_to_cache(&file_path, 100, mtime)?;
+
+        let (a, _) = acache.lookup(acache.arena_root(), "a")?;
+        let (b, _) = acache.lookup(a, "b")?;
+        let (c, _) = acache.lookup(b, "c.txt")?;
+
+        {
+            let txn = fixture.db.begin_read()?;
+            let tree = txn.read_tree(&acache.tree)?;
+            assert_eq!(acache.arena_root(), tree.root());
+            assert!(tree.exists(a)?);
+            assert!(tree.exists(b)?);
+            assert!(tree.exists(c)?);
+            assert_eq!(Some(a), tree.lookup(tree.root(), "a")?);
+            assert_eq!(Some(b), tree.lookup(a, "b")?);
+            assert_eq!(Some(c), tree.lookup(b, "c.txt")?);
+        }
+
+        fixture.remove_from_cache(&file_path)?;
+
+        assert!(acache.lookup(b, "c.txt").is_err());
+        {
+            let txn = fixture.db.begin_read()?;
+            let tree = txn.read_tree(&acache.tree)?;
+
+            // The directories stay, because they still exist in the cache
+            // but the file is gone from tree as well, since this was the
+            // only reference to it.
+            assert!(tree.exists(a)?);
+            assert!(tree.exists(b)?);
+            assert!(!tree.exists(c)?);
+            assert_eq!(Some(a), tree.lookup(tree.root(), "a")?);
+            assert_eq!(Some(b), tree.lookup(a, "b")?);
+            assert_eq!(None, tree.lookup(b, "c.txt")?);
+        }
         Ok(())
     }
 
