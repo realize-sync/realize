@@ -1184,9 +1184,8 @@ impl PathMarks for ArenaCache {
     fn get_mark_txn(&self, txn: &ArenaReadTransaction, path: &Path) -> Result<Mark, StorageError> {
         let mark_table = txn.mark_table()?;
         let tree = txn.read_tree(&self.tree)?;
-        let (_, last_matching) = tree.lookup_partial_path(path)?;
 
-        Ok(resolve_mark(&mark_table, &tree, last_matching)?)
+        Ok(resolve_mark_at_path(&mark_table, &tree, path)?)
     }
 
     fn set_arena_mark(&self, mark: Mark) -> Result<(), StorageError> {
@@ -1214,8 +1213,7 @@ impl PathMarks for ArenaCache {
         {
             let mut mark_table = txn.mark_table()?;
             let mut tree = txn.write_tree(&self.tree)?;
-            let (_, last_matching) = tree.lookup_partial_path(path)?;
-            let old_mark = resolve_mark(&mark_table, &tree, last_matching)?;
+            let old_mark = resolve_mark_at_path(&mark_table, &tree, path)?;
             let inode = tree.insert_at_path(
                 path,
                 &mut mark_table,
@@ -1238,33 +1236,38 @@ impl PathMarks for ArenaCache {
     fn clear_mark(&self, path: &Path) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
         {
-            let dir_table = txn.dir_table()?;
-            let (inode, assignment) = do_lookup_path(&dir_table, self.arena_root, Some(path))?;
-
-            let mut mark_table = txn.mark_table()?;
-            let old_mark = match mark_table.remove(inode)? {
-                Some(entry) => Some(entry.value().parse()?.mark),
-                None => None,
-            };
-            if let Some(old_mark) = old_mark {
-                let file_table = txn.file_table()?;
-                let new_mark = resolve_mark(&mark_table, &txn.read_tree(&self.tree)?, inode)?;
-                if old_mark != new_mark {
-                    match assignment {
-                        InodeAssignment::Directory => {
-                            mark_dir_dirty(&txn, &dir_table, &file_table, inode, &self.dirty_paths)?
-                        }
-                        InodeAssignment::File => {
-                            mark_file_dirty(&txn, &file_table, inode, &self.dirty_paths)?
-                        }
-                    }
+            let mut tree = txn.write_tree(&self.tree)?;
+            let inode = match tree.lookup_path(path)? {
+                Some(inode) => inode,
+                None => {
+                    // No mark to remove
+                    return Ok(());
                 }
+            };
+            let mut mark_table = txn.mark_table()?;
+            let old_mark = resolve_mark(&mark_table, &tree, inode)?;
+            let removed = tree.remove(inode, &mut mark_table, inode)?;
+            if removed && old_mark != resolve_mark(&mark_table, &tree, inode)? {
+                let dir_table = txn.dir_table()?;
+                let file_table = txn.file_table()?;
+                mark_dir_dirty(&txn, &dir_table, &file_table, inode, &self.dirty_paths)?;
+                mark_file_dirty(&txn, &file_table, inode, &self.dirty_paths)?
             }
         }
         txn.commit()?;
 
         Ok(())
     }
+}
+
+fn resolve_mark_at_path<P: AsRef<Path>>(
+    mark_table: &impl ReadableTable<Inode, Holder<'static, MarkTableEntry>>,
+    tree: &impl TreeReadOperations,
+    path: P,
+) -> Result<Mark, StorageError> {
+    let (_, last_matching) = tree.lookup_partial_path(path)?;
+
+    resolve_mark(mark_table, tree, last_matching)
 }
 
 fn resolve_mark(
@@ -1717,7 +1720,7 @@ mod tests {
     use crate::arena::index::RealIndex;
     use crate::arena::mark::PathMarks;
     use crate::arena::notifier::Notification;
-    use crate::arena::tree::{OpenTree, TreeReadOperations};
+    use crate::arena::tree::{OpenTree, TreeExt, TreeReadOperations};
     use crate::arena::types::HistoryTableEntry;
     use crate::utils::hash;
     use crate::utils::redb_utils;
@@ -3915,6 +3918,38 @@ mod tests {
         let otherfile = Path::parse("dir/otherfile.txt")?;
         fixture.add_file_to_index(&otherfile)?;
         fixture.marks.clear_mark(&otherfile)?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clear_mark_otherwise_nonexistent_file() -> anyhow::Result<()> {
+        let fixture = MarksFixture::setup().await?;
+
+        fixture.marks.set_arena_mark(Mark::Keep)?;
+        let path = Path::parse("foo/bar")?;
+        fixture.marks.set_mark(&path, Mark::Own)?;
+
+        // after this call, the path has no inode anymore, make sure this
+        // also doesn't return an error.
+        fixture.marks.clear_mark(&path)?;
+
+        assert_eq!(fixture.marks.get_mark(&path)?, Mark::Keep);
+        let txn = fixture.db.begin_read()?;
+        let tree = txn.read_tree(&fixture.acache.tree)?;
+        assert!(tree.lookup_path(&path)?.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clear_mark_nonexistent_file() -> anyhow::Result<()> {
+        let fixture = MarksFixture::setup().await?;
+
+        // this mainly makes sure that nothing returns "not found"
+        // even though the path doesn't exist in the cache, index, or
+        // marks.
+        fixture.marks.clear_mark(&Path::parse("doesnotexist")?)?;
 
         Ok(())
     }
