@@ -1008,22 +1008,12 @@ impl RealIndex for ArenaCache {
         if fs_utils::metadata_no_symlink_blocking(root, path).is_err() {
             {
                 let path = path.as_ref();
-                let dir_table = txn.dir_table()?;
-                let (parent_inode, parent_assignment) =
-                    do_lookup_path(&dir_table, self.arena_root, path.parent().as_ref())?;
-                if parent_assignment != InodeAssignment::Directory {
-                    return Err(StorageError::NotADirectory);
+                let tree = txn.read_tree(&self.tree)?;
+                if let Some(inode) = tree.lookup_path(path)? {
+                    let mut file_table = txn.file_table()?;
+                    let mut history_table = txn.history_table()?;
+                    self.unindex_file(&txn, &mut file_table, &mut history_table, inode)?;
                 }
-
-                let (inode, assignment) = get_dir_entry(&dir_table, parent_inode, path.name())?
-                    .ok_or(StorageError::NotFound)?;
-                if assignment != InodeAssignment::File {
-                    return Err(StorageError::IsADirectory);
-                }
-
-                let mut file_table = txn.file_table()?;
-                let mut history_table = txn.history_table()?;
-                self.unindex_file(&txn, &mut file_table, &mut history_table, inode)?;
             }
             txn.commit()?;
             return Ok(true);
@@ -1086,26 +1076,14 @@ impl RealIndex for ArenaCache {
     fn remove_file_or_dir(&self, path: &realize_types::Path) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
         {
-            let dir_table = txn.dir_table()?;
-            let (inode, assignment) = match do_lookup_path(&dir_table, self.arena_root, Some(path))
-            {
-                Ok(ret) => ret,
-                Err(StorageError::NotFound) => {
-                    return Ok(());
-                }
-                Err(err) => {
-                    return Err(err);
-                }
-            };
-            let mut file_table = txn.file_table()?;
-            let mut history_table = txn.history_table()?;
-            match assignment {
-                InodeAssignment::File => {
-                    self.unindex_file(&txn, &mut file_table, &mut history_table, inode)?
-                }
-                InodeAssignment::Directory => {
-                    self.unindex_dir(&txn, &dir_table, &mut file_table, &mut history_table, inode)?
-                }
+            let tree = txn.read_tree(&self.tree)?;
+            if let Some(inode) = tree.lookup_path(path)? {
+                let mut file_table = txn.file_table()?;
+                let mut history_table = txn.history_table()?;
+                self.unindex_file(&txn, &mut file_table, &mut history_table, inode)?;
+
+                let dir_table = txn.dir_table()?;
+                self.unindex_dir(&txn, &dir_table, &mut file_table, &mut history_table, inode)?;
             }
         }
         txn.commit()?;
@@ -1120,19 +1098,13 @@ impl RealIndex for ArenaCache {
         path: &realize_types::Path,
         hash: &Hash,
     ) -> Result<bool, StorageError> {
-        let dir_table = txn.dir_table()?;
-        let (inode, assignment) = match do_lookup_path(&dir_table, self.arena_root, Some(path)) {
-            Ok(ret) => ret,
-            Err(StorageError::NotFound) => {
+        let tree = txn.read_tree(&self.tree)?;
+        let inode = match tree.lookup_path(path)? {
+            Some(inode) => inode,
+            None => {
                 return Ok(false);
             }
-            Err(err) => {
-                return Err(err);
-            }
         };
-        if assignment != InodeAssignment::File {
-            return Err(StorageError::IsADirectory);
-        }
 
         let mut file_table = txn.file_table()?;
         let mut history_table = txn.history_table()?;
