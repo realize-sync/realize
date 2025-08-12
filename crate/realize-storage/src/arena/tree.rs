@@ -444,14 +444,14 @@ impl<'a> WritableOpenTree<'a> {
     /// `keygen`, it is overwritten and its old content is returned.
     /// In this case, no strong reference to the name/inode pair is
     /// created, since there already is one.
-    pub(crate) fn insert<'k, 'v, 't, K, V, F, KB>(
+    pub(crate) fn insert<'k, 'v, K, V, F, KB>(
         &mut self,
         parent_inode: Inode,
         name: &str,
-        table: &'t mut Table<'t, K, V>,
+        table: &mut Table<'_, K, V>,
         keygen: F,
         value: impl std::borrow::Borrow<V::SelfType<'v>>,
-    ) -> Result<(Inode, Option<redb::AccessGuard<'t, V>>), StorageError>
+    ) -> Result<Inode, StorageError>
     where
         K: redb::Key + 'static,
         V: redb::Value + 'static,
@@ -460,13 +460,12 @@ impl<'a> WritableOpenTree<'a> {
     {
         let inode = self.add(parent_inode, name)?;
         let key = (keygen)(inode);
-        let res = table.insert(key, value)?;
-        if res.is_none() {
+        if table.insert(key, value)?.is_none() {
             self.incref(inode)?;
         }
         // TODO: assert that if the inode has just been assigned, res is none.
 
-        Ok((inode, res))
+        Ok(inode)
     }
 
     /// Create an entry `name` in `parent_inode`, checking any old one.
@@ -539,13 +538,13 @@ impl<'a> WritableOpenTree<'a> {
     /// `keygen`, it is overwritten and its old content is returned.
     /// In this case, no strong reference to the path/inode pair is
     /// created, since there already is one.
-    pub(crate) fn insert_at_path<'k, 'v, 't, K, V, F, KB, P>(
+    pub(crate) fn insert_at_path<'k, 'v, K, V, F, KB, P>(
         &mut self,
         path: P,
-        table: &'t mut Table<'t, K, V>,
+        table: &mut Table<'_, K, V>,
         keygen: F,
         value: impl std::borrow::Borrow<V::SelfType<'v>>,
-    ) -> Result<(Inode, Option<redb::AccessGuard<'t, V>>), StorageError>
+    ) -> Result<Inode, StorageError>
     where
         P: AsRef<Path>,
         K: redb::Key + 'static,
@@ -555,12 +554,11 @@ impl<'a> WritableOpenTree<'a> {
     {
         let inode = self.add_path(path)?;
         let key = (keygen)(inode);
-        let res = table.insert(key, value)?;
-        if res.is_none() {
+        if table.insert(key, value)?.is_none() {
             self.incref(inode)?;
         }
 
-        Ok((inode, res))
+        Ok(inode)
     }
 
     /// Create an entry for `path`, checking any old one.

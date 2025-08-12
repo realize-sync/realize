@@ -1212,23 +1212,22 @@ impl PathMarks for ArenaCache {
     fn set_mark(&self, path: &Path, mark: Mark) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
         {
-            let dir_table = txn.dir_table()?;
-            let (inode, assignment) = do_lookup_path(&dir_table, self.arena_root, Some(path))?;
-
             let mut mark_table = txn.mark_table()?;
-            let file_table = txn.file_table()?;
-            let old_mark = resolve_mark(&mark_table, &txn.read_tree(&self.tree)?, inode)?;
-            mark_table.insert(inode, Holder::with_content(MarkTableEntry { mark })?)?;
+            let mut tree = txn.write_tree(&self.tree)?;
+            let (_, last_matching) = tree.lookup_partial_path(path)?;
+            let old_mark = resolve_mark(&mark_table, &tree, last_matching)?;
+            let inode = tree.insert_at_path(
+                path,
+                &mut mark_table,
+                |inode| inode,
+                Holder::with_content(MarkTableEntry { mark })?,
+            )?;
 
             if old_mark != mark {
-                match assignment {
-                    InodeAssignment::Directory => {
-                        mark_dir_dirty(&txn, &dir_table, &file_table, inode, &self.dirty_paths)?
-                    }
-                    InodeAssignment::File => {
-                        mark_file_dirty(&txn, &file_table, inode, &self.dirty_paths)?
-                    }
-                }
+                let dir_table = txn.dir_table()?;
+                let file_table = txn.file_table()?;
+                mark_dir_dirty(&txn, &dir_table, &file_table, inode, &self.dirty_paths)?;
+                mark_file_dirty(&txn, &file_table, inode, &self.dirty_paths)?;
             }
         }
         txn.commit()?;
@@ -4227,14 +4226,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nonexistent_files_cannot_be_marked() -> anyhow::Result<()> {
+    async fn mark_nonexistent_file() -> anyhow::Result<()> {
         let fixture = MarksFixture::setup().await?;
 
         // Set marks on paths that don't exist in index or cache
-        let nonexistent_path = Path::parse("nonexistent/file.txt")?;
-        let res = fixture.marks.set_mark(&nonexistent_path, Mark::Own);
-        assert!(res.is_err());
-        assert!(matches!(res.err(), Some(StorageError::NotFound)));
+        fixture
+            .marks
+            .set_mark(&Path::parse("foo/bar")?, Mark::Own)?;
+        assert_eq!(Mark::Own, fixture.marks.get_mark(&Path::parse("foo/bar")?)?);
+        assert_eq!(
+            Mark::Own,
+            fixture.marks.get_mark(&Path::parse("foo/bar/baz")?)?,
+        );
+        assert_eq!(Mark::Watch, fixture.marks.get_mark(&Path::parse("waldo")?)?);
+
+        // The path still doesn't exist in the cache, even though it has a mark
+        assert!(matches!(
+            fixture.acache.lookup_path(Path::parse("foo/bar")?),
+            Err(StorageError::NotFound)
+        ));
 
         Ok(())
     }
