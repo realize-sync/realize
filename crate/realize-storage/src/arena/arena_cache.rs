@@ -755,23 +755,34 @@ impl ArenaCache {
     fn index_file(
         &self,
         txn: &ArenaWriteTransaction,
+        tree: &mut WritableOpenTree,
         path: &realize_types::Path,
         size: u64,
         mtime: UnixTime,
         hash: Hash,
     ) -> Result<IndexedFileTableEntry, StorageError> {
-        let (_, file_inode) = do_create_file(&txn, &mut txn.write_tree(&self.tree)?, &path)?;
-
         let mut file_table = txn.file_table()?;
         let mut history_table = txn.history_table()?;
-        let old_hash = file_table
-            .get(FileTableKey::LocalCopy(file_inode))?
-            .map(|e| e.value().parse().ok())
-            .flatten()
-            .map(|e| e.content.hash);
+        let old_hash = tree
+            .lookup_path(path)?
+            .map(|inode| {
+                file_table
+                    .get(FileTableKey::LocalCopy(inode))
+                    .ok()
+                    .flatten()
+                    .map(|e| e.value().parse().ok())
+                    .flatten()
+                    .map(|e| e.content.hash)
+            })
+            .flatten();
         let same_hash = old_hash.as_ref().map(|h| *h == hash).unwrap_or(false);
         let entry = FileTableEntry::new(path.clone(), size, mtime, hash);
-        file_table.insert(FileTableKey::LocalCopy(file_inode), Holder::new(&entry)?)?;
+        tree.insert_at_path(
+            path,
+            &mut file_table,
+            |inode| FileTableKey::LocalCopy(inode),
+            Holder::new(&entry)?,
+        )?;
         if !same_hash {
             (&self.dirty_paths).mark_dirty(txn, path)?;
             let index = self.allocate_history_index(txn, &history_table)?;
@@ -819,28 +830,51 @@ impl ArenaCache {
     fn unindex_file(
         &self,
         txn: &ArenaWriteTransaction,
+        tree: &mut WritableOpenTree,
         file_table: &mut Table<'_, FileTableKey, Holder<'static, FileTableEntry>>,
         history_table: &mut Table<'_, u64, Holder<'static, HistoryTableEntry>>,
         inode: Inode,
     ) -> Result<(), StorageError> {
-        let removed = file_table.remove(FileTableKey::LocalCopy(inode))?;
-        Ok(if let Some(removed) = removed {
-            let entry = removed.value().parse()?;
-            self.report_removed(txn, history_table, entry.content.path, entry.content.hash)?;
-        })
+        let key = FileTableKey::LocalCopy(inode);
+        let FileTableEntry {
+            content: FileContent { path, hash, .. },
+            ..
+        } = match file_table.get(key.clone())? {
+            None => {
+                // Nothing to do
+                return Ok(());
+            }
+            Some(existing) => existing.value().parse()?,
+        };
+        if tree.remove(inode, file_table, key)? {
+            self.report_removed(txn, history_table, path, hash)?;
+        }
+
+        Ok(())
     }
 
     fn unindex_dir(
         &self,
         txn: &ArenaWriteTransaction,
-        tree: &impl TreeReadOperations,
+        tree: &mut WritableOpenTree,
         file_table: &mut Table<'_, FileTableKey, Holder<'static, FileTableEntry>>,
         history_table: &mut Table<'_, u64, Holder<'static, HistoryTableEntry>>,
         inode: Inode,
     ) -> Result<(), StorageError> {
-        for inode in tree.recurse(inode, |_| true) {
-            self.unindex_file(txn, file_table, history_table, inode?)?
-        }
+        tree.remove_recursive(
+            inode,
+            file_table,
+            |inode| Ok(FileTableKey::LocalCopy(inode)),
+            |_, e| {
+                let FileTableEntry {
+                    content: FileContent { path, hash, .. },
+                    ..
+                } = e.parse()?;
+                self.report_removed(txn, history_table, path, hash)?;
+
+                Ok(true)
+            },
+        )?;
 
         Ok(())
     }
@@ -965,7 +999,14 @@ impl RealIndex for ArenaCache {
         hash: Hash,
     ) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
-        self.index_file(&txn, path, size, mtime, hash)?;
+        self.index_file(
+            &txn,
+            &mut txn.write_tree(&self.tree)?,
+            path,
+            size,
+            mtime,
+            hash,
+        )?;
         txn.commit()?;
 
         Ok(())
@@ -980,13 +1021,17 @@ impl RealIndex for ArenaCache {
         hash: Hash,
     ) -> Result<bool, StorageError> {
         let txn = self.db.begin_write()?;
-        let entry = self.index_file(&txn, path, size, mtime, hash)?;
-        if file_matches_index(&entry, root, path) {
+        let matches = {
+            let mut tree = txn.write_tree(&self.tree)?;
+            let entry = self.index_file(&txn, &mut tree, path, size, mtime, hash)?;
+
+            file_matches_index(&entry, root, path)
+        };
+        if matches {
             txn.commit()?;
-            return Ok(true);
         }
 
-        Ok(false)
+        Ok(matches)
     }
 
     fn remove_file_if_missing(
@@ -998,11 +1043,11 @@ impl RealIndex for ArenaCache {
         if fs_utils::metadata_no_symlink_blocking(root, path).is_err() {
             {
                 let path = path.as_ref();
-                let tree = txn.read_tree(&self.tree)?;
+                let mut tree = txn.write_tree(&self.tree)?;
                 if let Some(inode) = tree.lookup_path(path)? {
                     let mut file_table = txn.file_table()?;
                     let mut history_table = txn.history_table()?;
-                    self.unindex_file(&txn, &mut file_table, &mut history_table, inode)?;
+                    self.unindex_file(&txn, &mut tree, &mut file_table, &mut history_table, inode)?;
                 }
             }
             txn.commit()?;
@@ -1066,12 +1111,12 @@ impl RealIndex for ArenaCache {
     fn remove_file_or_dir(&self, path: &realize_types::Path) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
         {
-            let tree = txn.read_tree(&self.tree)?;
+            let mut tree = txn.write_tree(&self.tree)?;
             if let Some(inode) = tree.lookup_path(path)? {
                 let mut file_table = txn.file_table()?;
                 let mut history_table = txn.history_table()?;
-                self.unindex_file(&txn, &mut file_table, &mut history_table, inode)?;
-                self.unindex_dir(&txn, &tree, &mut file_table, &mut history_table, inode)?;
+                self.unindex_file(&txn, &mut tree, &mut file_table, &mut history_table, inode)?;
+                self.unindex_dir(&txn, &mut tree, &mut file_table, &mut history_table, inode)?;
             }
         }
         txn.commit()?;
@@ -1144,13 +1189,13 @@ impl PathMarks for ArenaCache {
             let inode = self.arena_root;
 
             let mut mark_table = txn.mark_table()?;
-            let dir_table = txn.dir_table()?;
             let file_table = txn.file_table()?;
-            let old_mark = resolve_mark(&mark_table, &txn.read_tree(&self.tree)?, inode)?;
+            let tree = txn.read_tree(&self.tree)?;
+            let old_mark = resolve_mark(&mark_table, &tree, inode)?;
             mark_table.insert(inode, Holder::with_content(MarkTableEntry { mark })?)?;
 
             if old_mark != mark {
-                mark_dir_dirty(&txn, &dir_table, &file_table, inode, &self.dirty_paths)?;
+                mark_dirty_recursive(&txn, &tree, &file_table, inode, &self.dirty_paths)?;
             }
         }
         txn.commit()?;
@@ -1172,10 +1217,8 @@ impl PathMarks for ArenaCache {
             )?;
 
             if old_mark != mark {
-                let dir_table = txn.dir_table()?;
                 let file_table = txn.file_table()?;
-                mark_dir_dirty(&txn, &dir_table, &file_table, inode, &self.dirty_paths)?;
-                mark_file_dirty(&txn, &file_table, inode, &self.dirty_paths)?;
+                mark_dirty_recursive(&txn, &tree, &file_table, inode, &self.dirty_paths)?;
             }
         }
         txn.commit()?;
@@ -1198,10 +1241,8 @@ impl PathMarks for ArenaCache {
             let old_mark = resolve_mark(&mark_table, &tree, inode)?;
             let removed = tree.remove(inode, &mut mark_table, inode)?;
             if removed && old_mark != resolve_mark(&mark_table, &tree, inode)? {
-                let dir_table = txn.dir_table()?;
                 let file_table = txn.file_table()?;
-                mark_dir_dirty(&txn, &dir_table, &file_table, inode, &self.dirty_paths)?;
-                mark_file_dirty(&txn, &file_table, inode, &self.dirty_paths)?
+                mark_dirty_recursive(&txn, &tree, &file_table, inode, &self.dirty_paths)?;
             }
         }
         txn.commit()?;
@@ -1235,46 +1276,24 @@ fn resolve_mark(
     Ok(Mark::default())
 }
 
-fn mark_file_dirty(
+fn mark_dirty_recursive(
     txn: &ArenaWriteTransaction,
+    tree: &impl TreeReadOperations,
     file_table: &redb::Table<'_, FileTableKey, Holder<FileTableEntry>>,
     inode: Inode,
     dirty_paths: &Arc<DirtyPaths>,
 ) -> Result<(), StorageError> {
-    for entry in file_table.range(FileTableKey::range(inode))? {
-        let entry = entry?;
-        match entry.0.value() {
-            FileTableKey::Default(_) | FileTableKey::LocalCopy(_) => {
-                dirty_paths.mark_dirty(txn, &entry.1.value().parse()?.content.path)?;
-                return Ok(());
-            }
-            _ => {}
-        }
-    }
-
-    Ok(())
-}
-
-fn mark_dir_dirty(
-    txn: &ArenaWriteTransaction,
-    dir_table: &redb::Table<'_, (Inode, &str), Holder<DirTableEntry>>,
-    file_table: &redb::Table<'_, FileTableKey, Holder<FileTableEntry>>,
-    inode: Inode,
-    dirty_paths: &Arc<DirtyPaths>,
-) -> Result<(), StorageError> {
-    for item in dir_table.range((inode, "")..(inode.plus(1), ""))? {
-        let (key, value) = item?;
-        if key.value().0 != inode {
-            break;
-        }
-        if let DirTableEntry::Regular(entry) = value.value().parse()? {
-            match entry.assignment {
-                InodeAssignment::File => {
-                    mark_file_dirty(txn, file_table, entry.inode, dirty_paths)?;
+    for inode in std::iter::once(Ok(inode)).chain(tree.recurse(inode, |_| true)) {
+        let inode = inode?;
+        for entry in file_table.range(FileTableKey::range(inode))? {
+            let entry = entry?;
+            match entry.0.value() {
+                FileTableKey::Default(_) | FileTableKey::LocalCopy(_) => {
+                    let path = &entry.1.value().parse()?.content.path;
+                    dirty_paths.mark_dirty(txn, path)?;
+                    break;
                 }
-                InodeAssignment::Directory => {
-                    mark_dir_dirty(txn, dir_table, file_table, entry.inode, dirty_paths)?;
-                }
+                _ => {}
             }
         }
     }

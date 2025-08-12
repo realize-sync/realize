@@ -662,6 +662,46 @@ impl<'a> WritableOpenTree<'a> {
         Ok(false)
     }
 
+    /// Remove children of the start inode recursively from the given table.
+    ///
+    /// The entries are removed from `table` if `pred` returns true
+    /// and their reference count is decreased in the tree.
+    ///
+    /// `keygen` generates keys for `table` from an inode.
+    pub fn remove_recursive<'k, K, V, FK, KB, F>(
+        &mut self,
+        start: Inode,
+        table: &mut Table<'_, K, V>,
+        keygen: FK,
+        mut pred: F,
+    ) -> Result<(), StorageError>
+    where
+        K: redb::Key + 'static,
+        V: redb::Value + 'static,
+        FK: Fn(Inode) -> Result<KB, ByteConversionError>,
+        KB: std::borrow::Borrow<K::SelfType<'k>>,
+        F: for<'f> FnMut(Inode, V::SelfType<'f>) -> Result<bool, StorageError>,
+    {
+        let mut decrement = vec![];
+        for inode in self.recurse(start, |_| true) {
+            let inode = inode?;
+            let remove = match table.get((keygen)(inode)?)? {
+                None => false,
+                Some(v) => (pred)(inode, v.value())?,
+            };
+            if remove {
+                if table.remove((keygen)(inode)?)?.is_some() {
+                    decrement.push(inode);
+                }
+            }
+        }
+        for inode in decrement {
+            self.decref(inode)?;
+        }
+
+        Ok(())
+    }
+
     fn add_path<P: AsRef<Path>>(&mut self, path: P) -> Result<Inode, StorageError> {
         let path = path.as_ref();
         let mut current = self.tree.root;
