@@ -586,8 +586,7 @@ impl Engine {
             }
             Ok(Mark::Watch) => {
                 if let (Ok(cached), Ok(Some(indexed))) = (
-                    self.cache
-                        .get_file_entry_for_path(txn, self.arena_root, &path),
+                    self.cache.get_file_entry_for_path(txn, &path),
                     self.get_indexed_file(txn, &path),
                 ) && cached.content.hash == indexed.hash
                 {
@@ -598,10 +597,7 @@ impl Engine {
                 }
             }
             Ok(Mark::Keep) => {
-                if let Ok(cached) = self
-                    .cache
-                    .get_file_entry_for_path(txn, self.arena_root, &path)
-                {
+                if let Ok(cached) = self.cache.get_file_entry_for_path(txn, &path) {
                     if let Ok(Some(indexed)) = self.get_indexed_file(txn, &path)
                         && cached.content.hash == indexed.hash
                     {
@@ -621,10 +617,7 @@ impl Engine {
             }
             Ok(Mark::Own) => {
                 // TODO: treat is as Keep if there is no index.
-                if let Ok(cached) = self
-                    .cache
-                    .get_file_entry_for_path(txn, self.arena_root, &path)
-                {
+                if let Ok(cached) = self.cache.get_file_entry_for_path(txn, &path) {
                     let from_index = self.get_indexed_file(txn, &path)?;
                     if from_index.is_none() {
                         // File is missing from the index, move it there.
