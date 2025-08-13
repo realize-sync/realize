@@ -85,6 +85,7 @@ impl OpenTree for ArenaWriteTransaction {
 impl OpenTreeWrite for ArenaWriteTransaction {
     fn write_tree<'a>(&'a self, tree: &'a Tree) -> Result<WritableOpenTree<'a>, StorageError> {
         Ok(WritableOpenTree {
+            txn: self,
             table: self.tree_table()?,
             refcount_table: self.tree_refcount_table()?,
             current_inode_range_table: self.current_inode_range_table()?,
@@ -411,6 +412,7 @@ where
 
 /// A tree open for write with [OpenTree::write_tree].
 pub(crate) struct WritableOpenTree<'a> {
+    txn: &'a ArenaWriteTransaction,
     table: Table<'a, (Inode, &'static str), Inode>,
     refcount_table: Table<'a, Inode, u32>,
     current_inode_range_table: redb::Table<'a, (), (Inode, Inode)>,
@@ -451,12 +453,11 @@ impl<'a> WritableOpenTree<'a> {
         F: FnOnce(Inode) -> KB,
         KB: std::borrow::Borrow<K::SelfType<'k>>,
     {
-        let inode = self.add_name(parent_inode, name)?;
+        let inode = self.setup_name(parent_inode, name)?;
         let key = (keygen)(inode);
         if table.insert(key, value)?.is_none() {
             self.incref(inode)?;
         }
-        // TODO: assert that if the inode has just been assigned, res is none.
 
         Ok(inode)
     }
@@ -500,7 +501,7 @@ impl<'a> WritableOpenTree<'a> {
         KB: std::borrow::Borrow<K::SelfType<'k>>,
         VB: std::borrow::Borrow<V::SelfType<'v>>,
     {
-        let inode = self.add_name(parent_inode, name)?;
+        let inode = self.setup_name(parent_inode, name)?;
         if let Some(v) = table.get((keygen)(inode))? {
             (valuecheck)(inode, v)?;
             return Ok((inode, false));
@@ -545,7 +546,7 @@ impl<'a> WritableOpenTree<'a> {
         F: FnOnce(Inode) -> KB,
         KB: std::borrow::Borrow<K::SelfType<'k>>,
     {
-        let inode = self.add_path(path)?;
+        let inode = self.setup(path)?;
         let key = (keygen)(inode);
         if table.insert(key, value)?.is_none() {
             self.incref(inode)?;
@@ -591,7 +592,7 @@ impl<'a> WritableOpenTree<'a> {
         KB: std::borrow::Borrow<K::SelfType<'k>>,
         VB: std::borrow::Borrow<V::SelfType<'v>>,
     {
-        let inode = self.add_path(path)?;
+        let inode = self.setup(path)?;
         if table.get((keygen)(inode))?.is_some() {
             return Ok(inode);
         }
@@ -702,33 +703,97 @@ impl<'a> WritableOpenTree<'a> {
         Ok(())
     }
 
-    fn add_path<P: AsRef<Path>>(&mut self, path: P) -> Result<Inode, StorageError> {
+    /// Get or create a mapping for all parts of the given path.
+    ///
+    /// A new inode allocated by this function has a reference count
+    /// of 0 and is only valid until the end of the transaction until
+    /// its reference count is incremented by one of the insert
+    /// methods on [WritableOpenTree].
+    pub(crate) fn setup<P: AsRef<Path>>(&mut self, path: P) -> Result<Inode, StorageError> {
+        let (inode, added) = self.add_path(path.as_ref())?;
+
+        if added {
+            self.txn.before_commit(move |txn| {
+                // Check refcount and delete the entry if it reaches
+                // 0. Note that the allocated inode is lost, so it's
+                // not a no-op.
+                decref(
+                    &mut txn.tree_refcount_table()?,
+                    &mut txn.tree_table()?,
+                    inode,
+                    0,
+                )
+            });
+        }
+        Ok(inode)
+    }
+
+    /// Get or create a mapping for `name` in `parent_inode`
+    ///
+    /// A new inode allocated by this function has a reference count
+    /// of 0 and is only valid until the end of the transaction until
+    /// its reference count is incremented by one of the insert
+    /// methods on [WritableOpenTree].
+    pub(crate) fn setup_name(
+        &mut self,
+        parent_inode: Inode,
+        name: &str,
+    ) -> Result<Inode, StorageError> {
+        let (inode, added) = self.add_name(parent_inode, name)?;
+
+        if added {
+            self.txn.before_commit(move |txn| {
+                // Check refcount and delete the entry if it reaches
+                // 0. Note that the allocated inode is lost, so it's
+                // not a no-op.
+                decref(
+                    &mut txn.tree_refcount_table()?,
+                    &mut txn.tree_table()?,
+                    inode,
+                    0,
+                )
+            });
+        }
+        Ok(inode)
+    }
+
+    /// Create a mapping for `path` but don't increment reference
+    /// count.
+    ///
+    /// Caller must make sure of incrementing reference count or call
+    /// setup instead.
+    ///
+    /// Return (inode, added), with added true if the leaf inode is new.
+    fn add_path(&mut self, path: &Path) -> Result<(Inode, bool), StorageError> {
         let path = path.as_ref();
-        let mut current = self.tree.root;
+        let mut current = (self.tree.root, false);
         for component in Path::components(Some(path)) {
-            current = self.add_name(current, component)?;
+            current = self.add_name(current.0, component)?;
         }
 
         Ok(current)
     }
 
-    fn add_name(&mut self, parent_inode: Inode, name: &str) -> Result<Inode, StorageError> {
-        let inode = match get_inode(&self.table, parent_inode, name)? {
+    /// Create a mapping for `name` in `parent_inode` but don't increment reference count.
+    ///
+    /// Caller must make sure of incrementing reference count.
+    ///
+    /// Return (inode, added), with added true if the inode is new.
+    fn add_name(&mut self, parent_inode: Inode, name: &str) -> Result<(Inode, bool), StorageError> {
+        match get_inode(&self.table, parent_inode, name)? {
             Some(inode) => {
                 log::debug!("found {name} in {parent_inode} -> {inode}");
 
-                inode
+                Ok((inode, false))
             }
             None => {
                 let new_inode = self.allocate_inode()?;
                 self.add_inode(parent_inode, new_inode, name)?;
                 log::debug!("add {name} in {parent_inode} -> {new_inode}");
 
-                new_inode
+                Ok((new_inode, true))
             }
-        };
-
-        Ok(inode)
+        }
     }
 
     /// Increment reference count on the given inode.
@@ -754,26 +819,7 @@ impl<'a> WritableOpenTree<'a> {
     /// class. Incrementing a reference should be tied to insertion in
     /// another table and removing to removal from another table.
     pub(crate) fn decref(&mut self, inode: Inode) -> Result<(), StorageError> {
-        let mut refcount = self
-            .refcount_table
-            .get(inode)?
-            .ok_or(StorageError::NotFound)?
-            .value();
-        refcount = refcount.saturating_sub(1);
-
-        if refcount > 0 {
-            self.refcount_table.insert(inode, refcount)?;
-        } else {
-            self.refcount_table.remove(inode)?;
-            let parent = self.table.remove((inode, ".."))?.map(|v| v.value());
-            if let Some(parent) = parent {
-                self.table
-                    .retain_in(inode_range(parent), |_, v| v != inode)?;
-                self.decref(parent)?;
-            }
-        }
-
-        Ok(())
+        decref(&mut self.refcount_table, &mut self.table, inode, 1)
     }
 
     fn allocate_inode(&mut self) -> Result<Inode, StorageError> {
@@ -795,6 +841,35 @@ impl<'a> WritableOpenTree<'a> {
 
         Ok(())
     }
+}
+
+/// Decrement reference count of `inode` by `decref`. If counter
+/// reaches 0, mapping for this inode is deleted.
+fn decref(
+    refcount_table: &mut Table<'_, Inode, u32>,
+    tree_table: &mut Table<'_, (Inode, &'static str), Inode>,
+    inode: Inode,
+    decval: u32,
+) -> Result<(), StorageError> {
+    let mut refcount = refcount_table.get(inode)?.map(|v| v.value()).unwrap_or(0);
+    if decval > 0 {
+        refcount = refcount.saturating_sub(decval);
+    }
+
+    if refcount > 0 && decval > 0 {
+        refcount_table.insert(inode, refcount)?;
+    }
+
+    if refcount == 0 {
+        refcount_table.remove(inode)?;
+        let parent = tree_table.remove((inode, ".."))?.map(|v| v.value());
+        if let Some(parent) = parent {
+            tree_table.retain_in(inode_range(parent), |_, v| v != inode)?;
+            decref(refcount_table, tree_table, parent, 1)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn lookup(
@@ -1002,7 +1077,7 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        let _ = tree.add_path(&Path::parse("test")?);
+        let _ = tree.setup(&Path::parse("test")?);
 
         Ok(())
     }
@@ -1012,7 +1087,7 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        let node = tree.add_path(&Path::parse("test")?)?;
+        let node = tree.setup(&Path::parse("test")?)?;
 
         assert_eq!(Some(node), tree.lookup_inode(Inode(1), "test")?);
 
@@ -1024,7 +1099,7 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        let bar = tree.add_path(&Path::parse("foo/bar")?)?;
+        let bar = tree.setup(&Path::parse("foo/bar")?)?;
 
         let foo = tree.lookup_inode(tree.root(), "foo")?.unwrap();
         assert_eq!(bar, tree.lookup_inode(foo, "bar")?.unwrap());
@@ -1037,8 +1112,8 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        let first = tree.add_path(&Path::parse("foo/bar")?)?;
-        let second = tree.add_path(&Path::parse("foo/bar")?)?;
+        let first = tree.setup(&Path::parse("foo/bar")?)?;
+        let second = tree.setup(&Path::parse("foo/bar")?)?;
         assert_eq!(first, second);
 
         Ok(())
@@ -1049,8 +1124,8 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        let bar = tree.add_path(&Path::parse("foo/bar")?)?;
-        let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
+        let bar = tree.setup(&Path::parse("foo/bar")?)?;
+        let baz = tree.setup(&Path::parse("foo/bar/baz")?)?;
 
         let foo = tree.lookup_inode(tree.root(), "foo")?.unwrap();
         assert_eq!(bar, tree.lookup_inode(foo, "bar")?.unwrap());
@@ -1064,8 +1139,8 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
-        let qux = tree.add_path(&Path::parse("foo/bar/baz/qux")?)?;
+        let baz = tree.setup(&Path::parse("foo/bar/baz")?)?;
+        let qux = tree.setup(&Path::parse("foo/bar/baz/qux")?)?;
 
         let foo = tree.lookup_inode(tree.root(), "foo")?.unwrap();
         let bar = tree.lookup_inode(foo, "bar")?.unwrap();
@@ -1080,8 +1155,8 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
-        let qux = tree.add_path(&Path::parse("foo/bar/baz/qux")?)?;
+        let baz = tree.setup(&Path::parse("foo/bar/baz")?)?;
+        let qux = tree.setup(&Path::parse("foo/bar/baz/qux")?)?;
         let foo = tree.lookup_inode(tree.root(), "foo")?.unwrap();
         let bar = tree.lookup_inode(foo, "bar")?.unwrap();
 
@@ -1098,7 +1173,7 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        tree.add_path(&Path::parse("foo/bar")?)?;
+        tree.setup(&Path::parse("foo/bar")?)?;
 
         assert_eq!(
             None,
@@ -1116,8 +1191,8 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
-        tree.add_path(&Path::parse("foo/bar/baz/qux")?)?;
+        let baz = tree.setup(&Path::parse("foo/bar/baz")?)?;
+        tree.setup(&Path::parse("foo/bar/baz/qux")?)?;
         let foo = tree.lookup_inode(tree.root(), "foo")?.unwrap();
         let bar = tree.lookup_inode(foo, "bar")?.unwrap();
 
@@ -1141,11 +1216,11 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        let foo = tree.add_path(&Path::parse("foo")?)?;
-        let bar = tree.add_path(&Path::parse("foo/bar")?)?;
-        let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
-        let qux = tree.add_path(&Path::parse("foo/bar/qux")?)?;
-        let quux = tree.add_path(&Path::parse("foo/bar/quux")?)?;
+        let foo = tree.setup(&Path::parse("foo")?)?;
+        let bar = tree.setup(&Path::parse("foo/bar")?)?;
+        let baz = tree.setup(&Path::parse("foo/bar/baz")?)?;
+        let qux = tree.setup(&Path::parse("foo/bar/qux")?)?;
+        let quux = tree.setup(&Path::parse("foo/bar/quux")?)?;
 
         assert_eq!(
             Some(vec![("foo".to_string(), foo)]),
@@ -1175,9 +1250,9 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        let foo = tree.add_path(&Path::parse("foo")?)?;
-        let bar = tree.add_path(&Path::parse("foo/bar")?)?;
-        let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
+        let foo = tree.setup(&Path::parse("foo")?)?;
+        let bar = tree.setup(&Path::parse("foo/bar")?)?;
+        let baz = tree.setup(&Path::parse("foo/bar/baz")?)?;
 
         assert_eq!(Path::parse("foo/bar/baz")?, tree.backtrack(baz)?);
         assert_eq!(Path::parse("foo/bar")?, tree.backtrack(bar)?);
@@ -1201,8 +1276,8 @@ mod tests {
         assert!(tree.inode_exists(tree.root())?);
         assert!(!tree.inode_exists(Inode(999))?);
 
-        let foo = tree.add_path(&Path::parse("foo")?)?;
-        let bar = tree.add_path(&Path::parse("foo/bar")?)?;
+        let foo = tree.setup(&Path::parse("foo")?)?;
+        let bar = tree.setup(&Path::parse("foo/bar")?)?;
         assert!(tree.inode_exists(foo)?);
         assert!(tree.inode_exists(bar)?);
 
@@ -1217,9 +1292,9 @@ mod tests {
         assert!(tree.inode_exists(tree.root())?);
         assert!(!tree.inode_exists(Inode(999))?);
 
-        let foo = tree.add_path(&Path::parse("foo")?)?;
-        let bar = tree.add_path(&Path::parse("foo/bar")?)?;
-        let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
+        let foo = tree.setup(&Path::parse("foo")?)?;
+        let bar = tree.setup(&Path::parse("foo/bar")?)?;
+        let baz = tree.setup(&Path::parse("foo/bar/baz")?)?;
         assert_eq!(Some(tree.root()), tree.parent(foo)?);
         assert_eq!(Some(foo), tree.parent(bar)?);
         assert_eq!(Some(bar), tree.parent(baz)?);
@@ -1237,9 +1312,9 @@ mod tests {
         assert!(tree.inode_exists(tree.root())?);
         assert!(!tree.inode_exists(Inode(999))?);
 
-        let foo = tree.add_path(&Path::parse("foo")?)?;
-        let bar = tree.add_path(&Path::parse("foo/bar")?)?;
-        let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
+        let foo = tree.setup(&Path::parse("foo")?)?;
+        let bar = tree.setup(&Path::parse("foo/bar")?)?;
+        let baz = tree.setup(&Path::parse("foo/bar/baz")?)?;
         assert_eq!(
             vec![bar, foo, tree.root()],
             tree.ancestors(baz).collect::<Result<Vec<_>, _>>()?
@@ -1265,9 +1340,9 @@ mod tests {
         assert!(tree.inode_exists(tree.root())?);
         assert!(!tree.inode_exists(Inode(999))?);
 
-        let foo = tree.add_path(&Path::parse("foo")?)?;
-        let bar = tree.add_path(&Path::parse("foo/bar")?)?;
-        let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
+        let foo = tree.setup(&Path::parse("foo")?)?;
+        let bar = tree.setup(&Path::parse("foo/bar")?)?;
+        let baz = tree.setup(&Path::parse("foo/bar/baz")?)?;
         assert_eq!(Some("foo".to_string()), tree.name_in(tree.root(), foo)?);
         assert_eq!(Some("bar".to_string()), tree.name_in(foo, bar)?);
         assert_eq!(Some("baz".to_string()), tree.name_in(bar, baz)?);
@@ -1282,10 +1357,10 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        let bar = tree.add_path(&Path::parse("foo/bar")?)?;
+        let bar = tree.setup(&Path::parse("foo/bar")?)?;
         let foo = tree.lookup_inode(tree.root(), "foo")?.unwrap();
-        let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
-        let qux = tree.add_path(&Path::parse("foo/qux")?)?;
+        let baz = tree.setup(&Path::parse("foo/bar/baz")?)?;
+        let qux = tree.setup(&Path::parse("foo/qux")?)?;
 
         tree.incref(bar)?;
         tree.incref(baz)?;
@@ -1314,11 +1389,77 @@ mod tests {
     }
 
     #[test]
+    fn setup() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.db.begin_write()?;
+        let bar: Inode;
+        let foo: Inode;
+        let qux: Inode;
+        let baz: Inode;
+        {
+            let mut tree = txn.write_tree(&fixture.tree)?;
+            bar = tree.setup(&Path::parse("foo/bar")?)?;
+            qux = tree.setup(&Path::parse("baz/qux")?)?;
+            foo = tree.lookup(tree.root(), "foo")?.unwrap();
+            baz = tree.lookup(tree.root(), "baz")?.unwrap();
+
+            // refcount is incremented for qux, but not bar, so foo
+            // and bar will be removed before committing the
+            // transaction.
+            tree.incref(qux)?;
+        }
+        txn.commit()?;
+
+        let txn = fixture.db.begin_read()?;
+        let tree = txn.read_tree(&fixture.tree)?;
+        assert!(tree.exists(qux)?);
+        assert!(tree.exists(baz)?);
+
+        assert!(!tree.exists(bar)?);
+        assert!(!tree.exists(foo)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn setup_name() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.db.begin_write()?;
+        let bar: Inode;
+        let foo: Inode;
+        let qux: Inode;
+        let baz: Inode;
+        {
+            let mut tree = txn.write_tree(&fixture.tree)?;
+            foo = tree.setup_name(tree.root(), "foo")?;
+            bar = tree.setup_name(foo, "bar")?;
+            baz = tree.setup_name(tree.root(), "baz")?;
+            qux = tree.setup_name(baz, "qux")?;
+
+            // refcount is incremented for qux, but not bar, so foo
+            // and bar will be removed before committing the
+            // transaction.
+            tree.incref(qux)?;
+        }
+        txn.commit()?;
+
+        let txn = fixture.db.begin_read()?;
+        let tree = txn.read_tree(&fixture.tree)?;
+        assert!(tree.exists(qux)?);
+        assert!(tree.exists(baz)?);
+
+        assert!(!tree.exists(bar)?);
+        assert!(!tree.exists(foo)?);
+
+        Ok(())
+    }
+
+    #[test]
     fn incref() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        let baz = tree.add_path(Path::parse("foo/bar/baz")?)?;
+        let baz = tree.setup(Path::parse("foo/bar/baz")?)?;
         let bar = tree.expect(Path::parse("foo/bar")?)?;
 
         tree.incref(baz)?;
@@ -1348,17 +1489,17 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
 
-        let foo = tree.add_path(Path::parse("foo")?)?;
-        let bar = tree.add_path(Path::parse("foo/bar")?)?;
-        let baz = tree.add_path(Path::parse("foo/bar/baz")?)?;
-        let qux = tree.add_path(Path::parse("foo/bar/baz/qux")?)?;
-        let corge = tree.add_path(Path::parse("foo/bar/corge")?)?;
-        let graply = tree.add_path(Path::parse("foo/bar/corge/graply")?)?;
-        let grault = tree.add_path(Path::parse("foo/bar/corge/grault")?)?;
-        let quux = tree.add_path(Path::parse("foo/bar/quux")?)?;
-        let waldo = tree.add_path(Path::parse("foo/bar/waldo")?)?;
-        let fred = tree.add_path(Path::parse("foo/fred")?)?;
-        tree.add_path(Path::parse("xyzzy")?)?; // not in foo, ignored
+        let foo = tree.setup(Path::parse("foo")?)?;
+        let bar = tree.setup(Path::parse("foo/bar")?)?;
+        let baz = tree.setup(Path::parse("foo/bar/baz")?)?;
+        let qux = tree.setup(Path::parse("foo/bar/baz/qux")?)?;
+        let corge = tree.setup(Path::parse("foo/bar/corge")?)?;
+        let graply = tree.setup(Path::parse("foo/bar/corge/graply")?)?;
+        let grault = tree.setup(Path::parse("foo/bar/corge/grault")?)?;
+        let quux = tree.setup(Path::parse("foo/bar/quux")?)?;
+        let waldo = tree.setup(Path::parse("foo/bar/waldo")?)?;
+        let fred = tree.setup(Path::parse("foo/fred")?)?;
+        tree.setup(Path::parse("xyzzy")?)?; // not in foo, ignored
 
         assert_eq!(
             vec![bar, baz, qux, corge, graply, grault, quux, waldo, fred],
@@ -1388,9 +1529,9 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
 
-        let bar = tree.add_path(Path::parse("foo/bar")?)?;
-        let baz = tree.add_path(Path::parse("foo/bar/baz")?)?;
-        let qux = tree.add_path(Path::parse("foo/bar/baz/qux")?)?;
+        let bar = tree.setup(Path::parse("foo/bar")?)?;
+        let baz = tree.setup(Path::parse("foo/bar/baz")?)?;
+        let qux = tree.setup(Path::parse("foo/bar/baz/qux")?)?;
 
         assert_eq!(
             vec![bar, baz, qux],

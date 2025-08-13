@@ -196,6 +196,7 @@ impl ArenaDatabase {
     pub fn begin_write(&self) -> Result<ArenaWriteTransaction, StorageError> {
         Ok(ArenaWriteTransaction {
             inner: self.db.begin_write()?,
+            before_commit: RefCell::new(vec![]),
             after_commit: RefCell::new(vec![]),
         })
     }
@@ -217,6 +218,14 @@ pub struct ArenaWriteTransaction {
     /// impractical to have pass around mutable references to
     /// transactions.
     after_commit: RefCell<Vec<Box<dyn FnOnce() -> () + Send + 'static>>>,
+
+    /// Callbacks to be run before the transaction is committed.
+    ///
+    /// These callbacks can interrupt the commit by returning an
+    /// error.
+    before_commit: RefCell<
+        Vec<Box<dyn FnOnce(&ArenaWriteTransaction) -> Result<(), StorageError> + Send + 'static>>,
+    >,
 }
 
 impl ArenaWriteTransaction {
@@ -225,11 +234,29 @@ impl ArenaWriteTransaction {
     /// If the transaction is successfully committed, functions
     /// registered by after_commit are run, and these may fail.
     pub fn commit(self) -> Result<(), StorageError> {
+        while let cbs = self.before_commit.take()
+            && !cbs.is_empty()
+        {
+            for cb in cbs {
+                (cb)(&self)?;
+            }
+        }
         self.inner.commit()?;
         for cb in self.after_commit.into_inner() {
             cb();
         }
         Ok(())
+    }
+
+    /// Register a function to be run just before committing the current transaction.
+    ///
+    /// Before commit functions are run in order from the time commit() is called until either
+    /// there isn't one left or one of them fails..
+    pub fn before_commit(
+        &self,
+        cb: impl FnOnce(&ArenaWriteTransaction) -> Result<(), StorageError> + Send + 'static,
+    ) {
+        self.before_commit.borrow_mut().push(Box::new(cb));
     }
 
     /// Register a function to be run after the current transaction
@@ -416,5 +443,128 @@ impl ArenaReadTransaction {
         &self,
     ) -> Result<ReadOnlyTable<u64, Holder<'static, FailedJobTableEntry>>, StorageError> {
         Ok(self.inner.open_table(FAILED_JOB_TABLE)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use redb::ReadableTable;
+
+    use super::*;
+    use crate::utils::redb_utils;
+
+    const TEST_TABLE: TableDefinition<&str, &str> = TableDefinition::new("test");
+
+    struct Fixture {
+        db: Arc<ArenaDatabase>,
+    }
+
+    impl Fixture {
+        fn setup() -> anyhow::Result<Self> {
+            let _ = env_logger::try_init();
+            let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
+
+            Ok(Self { db })
+        }
+    }
+
+    #[test]
+    fn create_databases() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        // Make sure the tables can be opened in a read transaction.
+        let txn = fixture.db.begin_read()?;
+        txn.history_table()?;
+        txn.tree_table()?;
+        txn.dir_table()?;
+        txn.peer_table()?;
+        txn.notification_table()?;
+        txn.blob_table()?;
+        txn.blob_lru_queue_table()?;
+        txn.blob_next_id_table()?;
+        txn.mark_table()?;
+        txn.dirty_table()?;
+        txn.dirty_log_table()?;
+        txn.failed_job_table()?;
+
+        Ok(())
+    }
+
+    fn test_table_content(
+        test_table: ReadOnlyTable<&str, &str>,
+    ) -> Result<Vec<(String, String)>, anyhow::Error> {
+        let result = test_table
+            .iter()?
+            .map(|r| r.and_then(|(k, v)| Ok((k.value().to_string(), v.value().to_string()))))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(result)
+    }
+
+    #[test]
+    fn before_commit() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        let txn = fixture.db.begin_write()?;
+        {
+            let mut test_table = txn.inner.open_table(TEST_TABLE)?;
+            txn.before_commit(|txn| {
+                let mut test_table = txn.inner.open_table(TEST_TABLE)?;
+                test_table.insert("2", "before_commit")?;
+                Ok(())
+            });
+            test_table.insert("1", "normal")?;
+        }
+        txn.commit()?;
+
+        let txn = fixture.db.begin_read()?;
+        let test_table = txn.inner.open_table(TEST_TABLE)?;
+        let result = test_table_content(test_table)?;
+        assert_eq!(
+            vec![
+                ("1".to_string(), "normal".to_string()),
+                ("2".to_string(), "before_commit".to_string())
+            ],
+            result
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn before_commit_registers_another() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        let txn = fixture.db.begin_write()?;
+        {
+            let mut test_table = txn.inner.open_table(TEST_TABLE)?;
+            txn.before_commit(|txn| {
+                let mut test_table = txn.inner.open_table(TEST_TABLE)?;
+                test_table.insert("2", "before_commit 1")?;
+
+                txn.before_commit(|txn| {
+                    let mut test_table = txn.inner.open_table(TEST_TABLE)?;
+                    test_table.insert("3", "before_commit 2")?;
+
+                    Ok(())
+                });
+                Ok(())
+            });
+            test_table.insert("1", "normal")?;
+        }
+        txn.commit()?;
+
+        let txn = fixture.db.begin_read()?;
+        let test_table = txn.inner.open_table(TEST_TABLE)?;
+        let result = test_table_content(test_table)?;
+        assert_eq!(
+            vec![
+                ("1".to_string(), "normal".to_string()),
+                ("2".to_string(), "before_commit 1".to_string()),
+                ("3".to_string(), "before_commit 2".to_string())
+            ],
+            result
+        );
+
+        Ok(())
     }
 }
