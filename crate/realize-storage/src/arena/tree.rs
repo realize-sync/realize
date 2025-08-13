@@ -456,7 +456,7 @@ impl<'a> WritableOpenTree<'a> {
         F: FnOnce(Inode) -> KB,
         KB: std::borrow::Borrow<K::SelfType<'k>>,
     {
-        let inode = self.add(parent_inode, name)?;
+        let inode = self.add_name(parent_inode, name)?;
         let key = (keygen)(inode);
         if table.insert(key, value)?.is_none() {
             self.incref(inode)?;
@@ -505,7 +505,7 @@ impl<'a> WritableOpenTree<'a> {
         KB: std::borrow::Borrow<K::SelfType<'k>>,
         VB: std::borrow::Borrow<V::SelfType<'v>>,
     {
-        let inode = self.add(parent_inode, name)?;
+        let inode = self.add_name(parent_inode, name)?;
         if let Some(v) = table.get((keygen)(inode))? {
             (valuecheck)(inode, v)?;
             return Ok((inode, false));
@@ -666,14 +666,15 @@ impl<'a> WritableOpenTree<'a> {
     /// and their reference count is decreased in the tree.
     ///
     /// `keygen` generates keys for `table` from an inode.
-    pub fn remove_recursive<'k, K, V, FK, KB, F>(
+    pub fn remove_recursive<'b, 'k, K, V, FK, KB, F, L>(
         &mut self,
-        start: Inode,
+        start: L,
         table: &mut Table<'_, K, V>,
         keygen: FK,
         mut pred: F,
     ) -> Result<(), StorageError>
     where
+        L: ToTreeLoc<'b>,
         K: redb::Key + 'static,
         V: redb::Value + 'static,
         FK: Fn(Inode) -> Result<KB, ByteConversionError>,
@@ -681,6 +682,12 @@ impl<'a> WritableOpenTree<'a> {
         F: for<'f> FnMut(Inode, V::SelfType<'f>) -> Result<bool, StorageError>,
     {
         let mut decrement = vec![];
+        let start = match self.resolve(start)? {
+            Some(inode) => inode,
+            None => {
+                return Ok(());
+            }
+        };
         for inode in self.recurse(start, |_| true) {
             let inode = inode?;
             let remove = match table.get((keygen)(inode)?)? {
@@ -704,13 +711,13 @@ impl<'a> WritableOpenTree<'a> {
         let path = path.as_ref();
         let mut current = self.tree.root;
         for component in Path::components(Some(path)) {
-            current = self.add(current, component)?;
+            current = self.add_name(current, component)?;
         }
 
         Ok(current)
     }
 
-    fn add(&mut self, parent_inode: Inode, name: &str) -> Result<Inode, StorageError> {
+    fn add_name(&mut self, parent_inode: Inode, name: &str) -> Result<Inode, StorageError> {
         let inode = match get_inode(&self.table, parent_inode, name)? {
             Some(inode) => {
                 log::debug!("found {name} in {parent_inode} -> {inode}");
