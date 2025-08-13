@@ -198,17 +198,16 @@ impl ArenaCache {
                 let mut file_table = txn.file_table()?;
                 let (_, file_inode) =
                     do_create_file(&txn, &mut txn.write_tree(&self.tree)?, &path)?;
-                if !get_file_entry(&file_table, file_inode, Some(peer))?.is_some() {
-                    let entry = FileTableEntry::new(path, size, mtime, hash);
+                let entry = FileTableEntry::new(path, size, mtime, hash);
+
+                // add peer
+                if get_file_entry(&file_table, file_inode, Some(peer))?.is_none() {
                     self.do_write_file_entry(&mut file_table, file_inode, peer, &entry)?;
-                    if !get_file_entry(&file_table, file_inode, None)?.is_some() {
-                        self.do_write_default_file_entry(
-                            &txn,
-                            &mut file_table,
-                            file_inode,
-                            &entry,
-                        )?;
-                    }
+                }
+
+                // add default
+                if get_file_entry(&file_table, file_inode, None)?.is_none() {
+                    self.do_write_default_file_entry(&txn, &mut file_table, file_inode, &entry)?;
                 }
             }
             Notification::Replace {
@@ -227,21 +226,22 @@ impl ArenaCache {
 
                 let mut file_table = txn.file_table()?;
                 let entry = FileTableEntry::new(path, size, mtime, hash.clone());
-                if let Some(e) = get_file_entry(&file_table, file_inode, None)?
+
+                // replace peer
+                if let Some(e) = get_file_entry(&file_table, file_inode, Some(peer))?
                     && e.content.hash == old_hash
                 {
-                    // If it overwrites the entry that's current, it's
-                    // necessarily an entry we want.
-                    self.do_write_file_entry(&mut file_table, file_inode, peer, &entry)?;
-                    self.do_write_default_file_entry(&txn, &mut file_table, file_inode, &entry)?;
-                } else if let Some(e) = get_file_entry(&file_table, file_inode, Some(peer))?
-                    && e.content.hash == old_hash
-                {
-                    // If it overwrites the peer's entry, we want to
-                    // keep that.
                     self.do_write_file_entry(&mut file_table, file_inode, peer, &entry)?;
                 }
 
+                // replace default
+                if let Some(e) = get_file_entry(&file_table, file_inode, None)?
+                    && e.content.hash == old_hash
+                {
+                    self.do_write_default_file_entry(&txn, &mut file_table, file_inode, &entry)?;
+                }
+
+                // replace local
                 let entry = file_table
                     .get(FileTableKey::LocalCopy(file_inode))?
                     .map(|v| v.value().parse().ok())
@@ -269,6 +269,7 @@ impl ArenaCache {
 
                 self.do_unlink(&txn, peer, &path, old_hash.clone())?;
 
+                // remove local
                 if let Some(index_root) = index_root {
                     let tree = txn.read_tree(&self.tree)?;
                     if let Some(inode) = tree.resolve(&path)? {
@@ -314,8 +315,18 @@ impl ArenaCache {
                 do_unmark_peer_file(&txn, peer, file_inode)?;
 
                 let mut file_table = txn.file_table()?;
-                let entry = FileTableEntry::new(path, size, mtime, hash);
+                let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
+
+                // catchup peer; remove the older version and write a
+                // new one
+                if let Some(e) = get_file_entry(&file_table, file_inode, None)?
+                    && e.content.hash != hash
+                {
+                    self.do_unlink(&txn, peer, &path, e.content.hash)?;
+                }
                 self.do_write_file_entry(&mut file_table, file_inode, peer, &entry)?;
+
+                // catchup default (same as add)
                 if !get_file_entry(&file_table, file_inode, None)?.is_some() {
                     self.do_write_default_file_entry(&txn, &mut file_table, file_inode, &entry)?;
                 }
@@ -2496,7 +2507,7 @@ mod tests {
                 mtime: later_time(),
                 size: 300,
                 hash: Hash([3u8; 32]),
-                old_hash: Hash([3u8; 32]),
+                old_hash: Hash([2u8; 32]),
             },
             None,
         )?;
