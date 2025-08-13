@@ -237,25 +237,13 @@ pub(crate) trait TreeExt {
     /// iterator (depth-first).
     ///
     /// Only enters the node for which `enter` returns true.
-    fn recurse_path<P, F>(
+    fn recurse<'a, L, F>(
         &self,
-        path: P,
+        loc: L,
         enter: F,
     ) -> impl Iterator<Item = Result<Inode, StorageError>>
     where
-        P: AsRef<Path>,
-        F: FnMut(Inode) -> bool;
-
-    /// Goes through whole tree, starting at inode and return it as an
-    /// iterator (depth-first).
-    ///
-    /// Only enters the node for which `enter` returns true.
-    fn recurse<F>(
-        &self,
-        inode: Inode,
-        enter: F,
-    ) -> impl Iterator<Item = Result<Inode, StorageError>>
-    where
+        L: ToTreeLoc<'a>,
         F: FnMut(Inode) -> bool;
 
     /// Follow the inodes back up to the root and build a path.
@@ -312,34 +300,19 @@ impl<T: TreeReadOperations> TreeExt for T {
         })
     }
 
-    fn recurse_path<P, F>(
+    fn recurse<'a, L, F>(
         &self,
-        path: P,
+        loc: L,
         enter: F,
     ) -> impl Iterator<Item = Result<Inode, StorageError>>
     where
-        P: AsRef<Path>,
+        L: ToTreeLoc<'a>,
         F: FnMut(Inode) -> bool,
     {
         RecurseIterator {
             tree: self,
             enter,
-            stack: VecDeque::from([self.readdir(path.as_ref())]),
-        }
-    }
-
-    fn recurse<F>(
-        &self,
-        inode: Inode,
-        enter: F,
-    ) -> impl Iterator<Item = Result<Inode, StorageError>>
-    where
-        F: FnMut(Inode) -> bool,
-    {
-        RecurseIterator {
-            tree: self,
-            enter,
-            stack: VecDeque::from([self.readdir_inode(inode)]),
+            stack: VecDeque::from([self.readdir(loc)]),
         }
     }
 
@@ -1419,18 +1392,18 @@ mod tests {
 
         assert_eq!(
             vec![bar, baz, qux],
-            tree.recurse_path(Path::parse("foo")?, |_| true)
+            tree.recurse(Path::parse("foo")?, |_| true)
                 .collect::<Result<Vec<_>, _>>()?
         );
 
         assert_eq!(
             vec![baz, qux],
-            tree.recurse_path(Path::parse("foo/bar")?, |_| true)
+            tree.recurse(Path::parse("foo/bar")?, |_| true)
                 .collect::<Result<Vec<_>, _>>()?
         );
 
         assert!(matches!(
-            tree.recurse_path(Path::parse("doesnotexist")?, |_| true)
+            tree.recurse(Path::parse("doesnotexist")?, |_| true)
                 .collect::<Result<Vec<_>, _>>(),
             Err(StorageError::NotFound)
         ));
