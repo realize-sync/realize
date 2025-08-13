@@ -189,6 +189,12 @@ pub(crate) trait ToTreeLoc<'a> {
     fn to_tree_loc(self) -> TreeLoc<'a>;
 }
 
+impl<'a> ToTreeLoc<'a> for TreeLoc<'a> {
+    fn to_tree_loc(self) -> TreeLoc<'a> {
+        self
+    }
+}
+
 impl ToTreeLoc<'static> for Inode {
     fn to_tree_loc(self) -> TreeLoc<'static> {
         TreeLoc::Inode(self)
