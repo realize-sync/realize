@@ -109,13 +109,13 @@ pub(crate) trait TreeReadOperations {
     fn root(&self) -> Inode;
 
     /// Lookup a specific name in the given node.
-    fn lookup(&self, inode: Inode, name: &str) -> Result<Option<Inode>, StorageError>;
+    fn lookup_inode(&self, inode: Inode, name: &str) -> Result<Option<Inode>, StorageError>;
 
     /// List names under the given inode.
-    fn readdir(&self, inode: Inode) -> ReadDirIterator;
+    fn readdir_inode(&self, inode: Inode) -> ReadDirIterator;
 
     /// Check whether the given inode exists
-    fn exists(&self, inode: Inode) -> Result<bool, StorageError>;
+    fn inode_exists(&self, inode: Inode) -> Result<bool, StorageError>;
 
     /// Return the parent of the given inode, or None if not found.
     ///
@@ -136,13 +136,13 @@ where
     fn root(&self) -> Inode {
         self.root
     }
-    fn lookup(&self, inode: Inode, name: &str) -> Result<Option<Inode>, StorageError> {
+    fn lookup_inode(&self, inode: Inode, name: &str) -> Result<Option<Inode>, StorageError> {
         lookup(&self.table, inode, name)
     }
-    fn readdir(&self, inode: Inode) -> ReadDirIterator<'_> {
+    fn readdir_inode(&self, inode: Inode) -> ReadDirIterator<'_> {
         readdir(&self.table, inode)
     }
-    fn exists(&self, inode: Inode) -> Result<bool, StorageError> {
+    fn inode_exists(&self, inode: Inode) -> Result<bool, StorageError> {
         exists(&self.table, self.root, inode)
     }
     fn parent(&self, inode: Inode) -> Result<Option<Inode>, StorageError> {
@@ -157,13 +157,13 @@ impl<'a> TreeReadOperations for WritableOpenTree<'a> {
     fn root(&self) -> Inode {
         self.tree.root
     }
-    fn lookup(&self, inode: Inode, name: &str) -> Result<Option<Inode>, StorageError> {
+    fn lookup_inode(&self, inode: Inode, name: &str) -> Result<Option<Inode>, StorageError> {
         lookup(&self.table, inode, name)
     }
-    fn readdir(&self, inode: Inode) -> ReadDirIterator<'_> {
+    fn readdir_inode(&self, inode: Inode) -> ReadDirIterator<'_> {
         readdir(&self.table, inode)
     }
-    fn exists(&self, inode: Inode) -> Result<bool, StorageError> {
+    fn inode_exists(&self, inode: Inode) -> Result<bool, StorageError> {
         exists(&self.table, self.tree.root, inode)
     }
     fn parent(&self, inode: Inode) -> Result<Option<Inode>, StorageError> {
@@ -210,34 +210,28 @@ impl ToTreeLoc<'static> for Path {
 /// Extend [TreeReadOperations] with convenience functions for working
 /// with [Path].
 pub(crate) trait TreeExt {
-    /// Lookup the given path.
-    ///
-    /// Returns the inode of the leaf or None if one of the components
-    /// of the path cannot be found.
-    fn lookup_path<P: AsRef<Path>>(&self, path: P) -> Result<Option<Inode>, StorageError>;
-
     /// Resolve the given tree location to an inode.
     fn resolve<'a, L: ToTreeLoc<'a>>(&self, loc: L) -> Result<Option<Inode>, StorageError>;
 
     /// Resolve the given tree location to an inode or return [Storage::NotFound].
     fn expect<'a, L: ToTreeLoc<'a>>(&self, loc: L) -> Result<Inode, StorageError>;
 
-    /// Lookup the given path, fail with [StorageError::NotFound] if
-    /// it doesn't exist.
-    fn expect_path<P: AsRef<Path>>(&self, path: P) -> Result<Inode, StorageError>;
+    /// Lookup the given path and return the most specific inode matching the
+    /// path - which might just be the root if nothing matches.
+    fn resolve_partial<'a, L: ToTreeLoc<'a>>(&self, path: L) -> Result<Inode, StorageError>;
 
-    /// Lookup the given path and return the matching sub-path, possibly empty and
-    /// the last matching inode..
-    fn lookup_partial_path<P: AsRef<Path>>(
+    /// Lookup a specific entry in the given directory.
+    fn lookup<'a, L: ToTreeLoc<'a>>(
         &self,
-        path: P,
-    ) -> Result<(Option<Path>, Inode), StorageError>;
+        loc: L,
+        name: &str,
+    ) -> Result<Option<Inode>, StorageError>;
 
     /// Read the content of the given directory.
-    fn readdir_path<P: AsRef<Path>>(&self, path: P) -> ReadDirIterator<'_>;
+    fn readdir<'a, L: ToTreeLoc<'a>>(&self, loc: L) -> ReadDirIterator<'_>;
 
-    /// Checks whether the given path exists.
-    fn path_exists<P: AsRef<Path>>(&self, path: P) -> Result<bool, StorageError>;
+    /// Checks whether a given location exists in the tree.
+    fn exists<'a, L: ToTreeLoc<'a>>(&self, loc: L) -> Result<bool, StorageError>;
 
     /// Goes through whole tree, starting at inode and return it as an
     /// iterator (depth-first).
@@ -281,62 +275,41 @@ impl<T: TreeReadOperations> TreeExt for T {
         let loc = loc.to_tree_loc();
         match loc {
             TreeLoc::Inode(inode) => Ok(Some(inode)),
-            TreeLoc::PathRef(path) => self.lookup_path(path),
-            TreeLoc::Path(path) => self.lookup_path(&path),
+            TreeLoc::PathRef(path) => resolve_path(self, path),
+            TreeLoc::Path(path) => resolve_path(self, &path),
         }
     }
 
-    fn expect_path<P: AsRef<Path>>(&self, path: P) -> Result<Inode, StorageError> {
-        self.lookup_path(path)?.ok_or(StorageError::NotFound)
-    }
-
-    fn lookup_path<P: AsRef<Path>>(&self, path: P) -> Result<Option<Inode>, StorageError> {
-        let path = path.as_ref();
-        let mut current = self.root();
-        for component in Path::components(Some(path)) {
-            if let Some(e) = self.lookup(current, component)? {
-                current = e
-            } else {
-                log::debug!("not found: {component} in {current}");
-                return Ok(None);
-            };
+    fn resolve_partial<'a, L: ToTreeLoc<'a>>(&self, loc: L) -> Result<Inode, StorageError> {
+        let loc = loc.to_tree_loc();
+        match loc {
+            TreeLoc::Inode(inode) => Ok(inode),
+            TreeLoc::PathRef(path) => resolve_path_partial(self, path),
+            TreeLoc::Path(path) => resolve_path_partial(self, &path),
         }
-
-        Ok(Some(current))
     }
 
-    fn lookup_partial_path<P: AsRef<Path>>(
+    fn lookup<'a, L: ToTreeLoc<'a>>(
         &self,
-        path: P,
-    ) -> Result<(Option<Path>, Inode), StorageError> {
-        let path = path.as_ref();
-        let mut current = self.root();
-        for (i, component) in Path::components(Some(path)).enumerate() {
-            if let Some(e) = self.lookup(current, component)? {
-                current = e
-            } else {
-                log::debug!("not found: {component} in {current}");
-                let matched = Path::components(Some(path)).take(i).collect::<Vec<_>>();
-                if matched.is_empty() {
-                    return Ok((None, current));
-                } else {
-                    return Ok((Some(Path::parse(matched.join("/"))?), current));
-                }
-            };
-        }
-
-        Ok((Some(path.clone()), current))
+        loc: L,
+        name: &str,
+    ) -> Result<Option<Inode>, StorageError> {
+        self.lookup_inode(self.expect(loc)?, name)
     }
 
-    fn readdir_path<P: AsRef<Path>>(&self, path: P) -> ReadDirIterator<'_> {
-        match self.expect_path(path) {
+    fn readdir<'a, L: ToTreeLoc<'a>>(&self, loc: L) -> ReadDirIterator<'_> {
+        match self.expect(loc) {
             Err(err) => ReadDirIterator::failed(err),
-            Ok(inode) => self.readdir(inode),
+            Ok(inode) => self.readdir_inode(inode),
         }
     }
 
-    fn path_exists<P: AsRef<Path>>(&self, path: P) -> Result<bool, StorageError> {
-        Ok(self.lookup_path(path)?.is_some())
+    fn exists<'a, L: ToTreeLoc<'a>>(&self, loc: L) -> Result<bool, StorageError> {
+        Ok(match loc.to_tree_loc() {
+            TreeLoc::Inode(inode) => self.inode_exists(inode)?,
+            TreeLoc::Path(path) => resolve_path(self, &path)?.is_some(),
+            TreeLoc::PathRef(path) => resolve_path(self, path)?.is_some(),
+        })
     }
 
     fn recurse_path<P, F>(
@@ -351,7 +324,7 @@ impl<T: TreeReadOperations> TreeExt for T {
         RecurseIterator {
             tree: self,
             enter,
-            stack: VecDeque::from([self.readdir_path(path)]),
+            stack: VecDeque::from([self.readdir(path.as_ref())]),
         }
     }
 
@@ -366,7 +339,7 @@ impl<T: TreeReadOperations> TreeExt for T {
         RecurseIterator {
             tree: self,
             enter,
-            stack: VecDeque::from([self.readdir(inode)]),
+            stack: VecDeque::from([self.readdir_inode(inode)]),
         }
     }
 
@@ -455,7 +428,7 @@ where
                     }
                     Ok((_, inode)) => {
                         if (self.enter)(inode) {
-                            self.stack.push_back(self.tree.readdir(inode));
+                            self.stack.push_back(self.tree.readdir_inode(inode));
                         }
                         return Some(Ok(inode));
                     }
@@ -707,7 +680,7 @@ impl<'a> WritableOpenTree<'a> {
         FK: Fn(Inode) -> Result<KB, ByteConversionError>,
         KB: std::borrow::Borrow<K::SelfType<'k>>,
     {
-        if let Some(inode) = self.lookup_path(path)? {
+        if let Some(inode) = self.resolve(path.as_ref())? {
             return self.remove(inode, table, (keygen)(inode)?);
         }
 
@@ -966,6 +939,41 @@ fn inode_range(inode: Inode) -> std::ops::Range<(Inode, &'static str)> {
     (inode, "")..(inode.plus(1), "")
 }
 
+fn resolve_path(
+    tree: &impl TreeReadOperations,
+    path: &Path,
+) -> Result<Option<Inode>, StorageError> {
+    let mut current = tree.root();
+    for component in Path::components(Some(path)) {
+        if let Some(e) = tree.lookup_inode(current, component)? {
+            current = e
+        } else {
+            log::debug!("not found: {component} in {current}");
+            return Ok(None);
+        };
+    }
+
+    Ok(Some(current))
+}
+
+fn resolve_path_partial(
+    tree: &impl TreeReadOperations,
+    path: &Path,
+) -> Result<Inode, StorageError> {
+    let path = path.as_ref();
+    let mut current = tree.root();
+    for component in Path::components(Some(path)) {
+        if let Some(e) = tree.lookup_inode(current, component)? {
+            current = e
+        } else {
+            log::debug!("not found: {component} in {current}");
+            break;
+        };
+    }
+
+    Ok(current)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -999,7 +1007,7 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_read()?;
         let tree = txn.read_tree(&fixture.tree)?;
-        assert_eq!(None, tree.lookup(Inode(1), "test")?,);
+        assert_eq!(None, tree.lookup_inode(Inode(1), "test")?,);
 
         Ok(())
     }
@@ -1009,7 +1017,7 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let tree = txn.read_tree(&fixture.tree)?;
-        assert_eq!(None, tree.lookup(Inode(1), "test")?);
+        assert_eq!(None, tree.lookup_inode(Inode(1), "test")?);
 
         Ok(())
     }
@@ -1031,7 +1039,7 @@ mod tests {
         let mut tree = txn.write_tree(&fixture.tree)?;
         let node = tree.add_path(&Path::parse("test")?)?;
 
-        assert_eq!(Some(node), tree.lookup(Inode(1), "test")?);
+        assert_eq!(Some(node), tree.lookup_inode(Inode(1), "test")?);
 
         Ok(())
     }
@@ -1043,8 +1051,8 @@ mod tests {
         let mut tree = txn.write_tree(&fixture.tree)?;
         let bar = tree.add_path(&Path::parse("foo/bar")?)?;
 
-        let foo = tree.lookup(tree.root(), "foo")?.unwrap();
-        assert_eq!(bar, tree.lookup(foo, "bar")?.unwrap());
+        let foo = tree.lookup_inode(tree.root(), "foo")?.unwrap();
+        assert_eq!(bar, tree.lookup_inode(foo, "bar")?.unwrap());
 
         Ok(())
     }
@@ -1069,9 +1077,9 @@ mod tests {
         let bar = tree.add_path(&Path::parse("foo/bar")?)?;
         let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
 
-        let foo = tree.lookup(tree.root(), "foo")?.unwrap();
-        assert_eq!(bar, tree.lookup(foo, "bar")?.unwrap());
-        assert_eq!(baz, tree.lookup(bar, "baz")?.unwrap());
+        let foo = tree.lookup_inode(tree.root(), "foo")?.unwrap();
+        assert_eq!(bar, tree.lookup_inode(foo, "bar")?.unwrap());
+        assert_eq!(baz, tree.lookup_inode(bar, "baz")?.unwrap());
 
         Ok(())
     }
@@ -1084,10 +1092,10 @@ mod tests {
         let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
         let qux = tree.add_path(&Path::parse("foo/bar/baz/qux")?)?;
 
-        let foo = tree.lookup(tree.root(), "foo")?.unwrap();
-        let bar = tree.lookup(foo, "bar")?.unwrap();
-        assert_eq!(baz, tree.lookup(bar, "baz")?.unwrap());
-        assert_eq!(qux, tree.lookup(baz, "qux")?.unwrap());
+        let foo = tree.lookup_inode(tree.root(), "foo")?.unwrap();
+        let bar = tree.lookup_inode(foo, "bar")?.unwrap();
+        assert_eq!(baz, tree.lookup_inode(bar, "baz")?.unwrap());
+        assert_eq!(qux, tree.lookup_inode(baz, "qux")?.unwrap());
 
         Ok(())
     }
@@ -1099,16 +1107,13 @@ mod tests {
         let mut tree = txn.write_tree(&fixture.tree)?;
         let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
         let qux = tree.add_path(&Path::parse("foo/bar/baz/qux")?)?;
-        let foo = tree.lookup(tree.root(), "foo")?.unwrap();
-        let bar = tree.lookup(foo, "bar")?.unwrap();
+        let foo = tree.lookup_inode(tree.root(), "foo")?.unwrap();
+        let bar = tree.lookup_inode(foo, "bar")?.unwrap();
 
-        assert_eq!(foo, tree.lookup_path(Path::parse("foo")?)?.unwrap());
-        assert_eq!(bar, tree.lookup_path(Path::parse("foo/bar")?)?.unwrap());
-        assert_eq!(baz, tree.lookup_path(Path::parse("foo/bar/baz")?)?.unwrap());
-        assert_eq!(
-            qux,
-            tree.lookup_path(Path::parse("foo/bar/baz/qux")?)?.unwrap()
-        );
+        assert_eq!(foo, tree.resolve(Path::parse("foo")?)?.unwrap());
+        assert_eq!(bar, tree.resolve(Path::parse("foo/bar")?)?.unwrap());
+        assert_eq!(baz, tree.resolve(Path::parse("foo/bar/baz")?)?.unwrap());
+        assert_eq!(qux, tree.resolve(Path::parse("foo/bar/baz/qux")?)?.unwrap());
 
         Ok(())
     }
@@ -1122,11 +1127,11 @@ mod tests {
 
         assert_eq!(
             None,
-            tree.lookup_path(Path::parse("foo/bar/notfound1/notfound2")?)?
+            tree.resolve(Path::parse("foo/bar/notfound1/notfound2")?)?
         );
-        assert_eq!(None, tree.lookup_path(Path::parse("foo/bar/notfound")?)?);
-        assert_eq!(None, tree.lookup_path(Path::parse("foo/notfound")?)?);
-        assert_eq!(None, tree.lookup_path(Path::parse("notfound")?)?);
+        assert_eq!(None, tree.resolve(Path::parse("foo/bar/notfound")?)?);
+        assert_eq!(None, tree.resolve(Path::parse("foo/notfound")?)?);
+        assert_eq!(None, tree.resolve(Path::parse("notfound")?)?);
 
         Ok(())
     }
@@ -1138,28 +1143,19 @@ mod tests {
         let mut tree = txn.write_tree(&fixture.tree)?;
         let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
         tree.add_path(&Path::parse("foo/bar/baz/qux")?)?;
-        let foo = tree.lookup(tree.root(), "foo")?.unwrap();
-        let bar = tree.lookup(foo, "bar")?.unwrap();
+        let foo = tree.lookup_inode(tree.root(), "foo")?.unwrap();
+        let bar = tree.lookup_inode(foo, "bar")?.unwrap();
 
+        assert_eq!(baz, tree.resolve_partial(Path::parse("foo/bar/baz")?)?);
+        assert_eq!(baz, tree.resolve_partial(Path::parse("foo/bar/baz/quux")?)?);
+        assert_eq!(bar, tree.resolve_partial(Path::parse("foo/bar/burgle")?)?);
         assert_eq!(
-            (Some(Path::parse("foo/bar/baz")?), baz),
-            tree.lookup_partial_path(Path::parse("foo/bar/baz")?)?
+            bar,
+            tree.resolve_partial(Path::parse("foo/bar/waldo/fred")?)?
         );
         assert_eq!(
-            (Some(Path::parse("foo/bar/baz")?), baz),
-            tree.lookup_partial_path(Path::parse("foo/bar/baz/quux")?)?
-        );
-        assert_eq!(
-            (Some(Path::parse("foo/bar")?), bar),
-            tree.lookup_partial_path(Path::parse("foo/bar/burgle")?)?
-        );
-        assert_eq!(
-            (Some(Path::parse("foo/bar")?), bar),
-            tree.lookup_partial_path(Path::parse("foo/bar/waldo/fred")?)?
-        );
-        assert_eq!(
-            (None, tree.root()),
-            tree.lookup_partial_path(Path::parse("waldo/fred")?)?
+            tree.root(),
+            tree.resolve_partial(Path::parse("waldo/fred")?)?
         );
 
         Ok(())
@@ -1178,13 +1174,13 @@ mod tests {
 
         assert_eq!(
             Some(vec![("foo".to_string(), foo)]),
-            tree.readdir(tree.root())
+            tree.readdir_inode(tree.root())
                 .collect::<Result<Vec<_>, _>>()
                 .ok()
         );
         assert_eq!(
             Some(vec![("bar".to_string(), bar)]),
-            tree.readdir(foo).collect::<Result<Vec<_>, _>>().ok()
+            tree.readdir_inode(foo).collect::<Result<Vec<_>, _>>().ok()
         );
 
         assert_eq!(
@@ -1193,7 +1189,7 @@ mod tests {
                 ("quux".to_string(), quux),
                 ("qux".to_string(), qux),
             ]),
-            tree.readdir(bar).collect::<Result<Vec<_>, _>>().ok()
+            tree.readdir_inode(bar).collect::<Result<Vec<_>, _>>().ok()
         );
 
         Ok(())
@@ -1227,13 +1223,13 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        assert!(tree.exists(tree.root())?);
-        assert!(!tree.exists(Inode(999))?);
+        assert!(tree.inode_exists(tree.root())?);
+        assert!(!tree.inode_exists(Inode(999))?);
 
         let foo = tree.add_path(&Path::parse("foo")?)?;
         let bar = tree.add_path(&Path::parse("foo/bar")?)?;
-        assert!(tree.exists(foo)?);
-        assert!(tree.exists(bar)?);
+        assert!(tree.inode_exists(foo)?);
+        assert!(tree.inode_exists(bar)?);
 
         Ok(())
     }
@@ -1243,8 +1239,8 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        assert!(tree.exists(tree.root())?);
-        assert!(!tree.exists(Inode(999))?);
+        assert!(tree.inode_exists(tree.root())?);
+        assert!(!tree.inode_exists(Inode(999))?);
 
         let foo = tree.add_path(&Path::parse("foo")?)?;
         let bar = tree.add_path(&Path::parse("foo/bar")?)?;
@@ -1263,8 +1259,8 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        assert!(tree.exists(tree.root())?);
-        assert!(!tree.exists(Inode(999))?);
+        assert!(tree.inode_exists(tree.root())?);
+        assert!(!tree.inode_exists(Inode(999))?);
 
         let foo = tree.add_path(&Path::parse("foo")?)?;
         let bar = tree.add_path(&Path::parse("foo/bar")?)?;
@@ -1291,8 +1287,8 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
-        assert!(tree.exists(tree.root())?);
-        assert!(!tree.exists(Inode(999))?);
+        assert!(tree.inode_exists(tree.root())?);
+        assert!(!tree.inode_exists(Inode(999))?);
 
         let foo = tree.add_path(&Path::parse("foo")?)?;
         let bar = tree.add_path(&Path::parse("foo/bar")?)?;
@@ -1312,7 +1308,7 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
         let bar = tree.add_path(&Path::parse("foo/bar")?)?;
-        let foo = tree.lookup(tree.root(), "foo")?.unwrap();
+        let foo = tree.lookup_inode(tree.root(), "foo")?.unwrap();
         let baz = tree.add_path(&Path::parse("foo/bar/baz")?)?;
         let qux = tree.add_path(&Path::parse("foo/qux")?)?;
 
@@ -1322,22 +1318,22 @@ mod tests {
 
         // decref qux deletes it, but not foo
         tree.decref(qux)?;
-        assert!(tree.exists(foo)?);
-        assert!(tree.exists(bar)?);
-        assert!(tree.exists(baz)?);
-        assert!(!tree.exists(qux)?);
+        assert!(tree.inode_exists(foo)?);
+        assert!(tree.inode_exists(bar)?);
+        assert!(tree.inode_exists(baz)?);
+        assert!(!tree.inode_exists(qux)?);
 
         // decref bar does not delete it, because it contains baz
         tree.decref(bar)?;
-        assert!(tree.exists(foo)?);
-        assert!(tree.exists(bar)?);
-        assert!(tree.exists(baz)?);
+        assert!(tree.inode_exists(foo)?);
+        assert!(tree.inode_exists(bar)?);
+        assert!(tree.inode_exists(baz)?);
 
         // decref baz deletes bar and baz, but not foo
         tree.decref(baz)?;
-        assert!(!tree.exists(foo)?);
-        assert!(!tree.exists(bar)?);
-        assert!(!tree.exists(baz)?);
+        assert!(!tree.inode_exists(foo)?);
+        assert!(!tree.inode_exists(bar)?);
+        assert!(!tree.inode_exists(baz)?);
 
         Ok(())
     }
@@ -1348,7 +1344,7 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree(&fixture.tree)?;
         let baz = tree.add_path(Path::parse("foo/bar/baz")?)?;
-        let bar = tree.expect_path(Path::parse("foo/bar")?)?;
+        let bar = tree.expect(Path::parse("foo/bar")?)?;
 
         tree.incref(baz)?;
         tree.incref(bar)?;
@@ -1357,16 +1353,16 @@ mod tests {
 
         // decref baz deletes baz, but not bar
         tree.decref(baz)?;
-        assert!(tree.exists(bar)?);
-        assert!(!tree.exists(baz)?);
+        assert!(tree.inode_exists(bar)?);
+        assert!(!tree.inode_exists(baz)?);
 
         // now that baz is gone, it still takes 3 decref to delete bar
         tree.decref(bar)?;
-        assert!(tree.exists(bar)?);
+        assert!(tree.inode_exists(bar)?);
         tree.decref(bar)?;
-        assert!(tree.exists(bar)?);
+        assert!(tree.inode_exists(bar)?);
         tree.decref(bar)?;
-        assert!(!tree.exists(bar)?);
+        assert!(!tree.inode_exists(bar)?);
 
         Ok(())
     }

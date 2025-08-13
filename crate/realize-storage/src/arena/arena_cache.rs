@@ -745,7 +745,7 @@ impl ArenaCache {
         file_table: &impl ReadableTable<FileTableKey, Holder<'static, FileTableEntry>>,
         path: &Path,
     ) -> Result<Option<IndexedFileTableEntry>, StorageError> {
-        if let Some(inode) = tree.lookup_path(path)? {
+        if let Some(inode) = tree.resolve(path)? {
             get_indexed_file_inode(file_table, inode)
         } else {
             Ok(None)
@@ -764,7 +764,7 @@ impl ArenaCache {
         let mut file_table = txn.file_table()?;
         let mut history_table = txn.history_table()?;
         let old_hash = tree
-            .lookup_path(path)?
+            .resolve(path)?
             .map(|inode| {
                 file_table
                     .get(FileTableKey::LocalCopy(inode))
@@ -1044,7 +1044,7 @@ impl RealIndex for ArenaCache {
             {
                 let path = path.as_ref();
                 let mut tree = txn.write_tree(&self.tree)?;
-                if let Some(inode) = tree.lookup_path(path)? {
+                if let Some(inode) = tree.resolve(path)? {
                     let mut file_table = txn.file_table()?;
                     let mut history_table = txn.history_table()?;
                     self.unindex_file(&txn, &mut tree, &mut file_table, &mut history_table, inode)?;
@@ -1112,7 +1112,7 @@ impl RealIndex for ArenaCache {
         let txn = self.db.begin_write()?;
         {
             let mut tree = txn.write_tree(&self.tree)?;
-            if let Some(inode) = tree.lookup_path(path)? {
+            if let Some(inode) = tree.resolve(path)? {
                 let mut file_table = txn.file_table()?;
                 let mut history_table = txn.history_table()?;
                 self.unindex_file(&txn, &mut tree, &mut file_table, &mut history_table, inode)?;
@@ -1132,7 +1132,7 @@ impl RealIndex for ArenaCache {
         hash: &Hash,
     ) -> Result<bool, StorageError> {
         let tree = txn.read_tree(&self.tree)?;
-        let inode = match tree.lookup_path(path)? {
+        let inode = match tree.resolve(path)? {
             Some(inode) => inode,
             None => {
                 return Ok(false);
@@ -1230,7 +1230,7 @@ impl PathMarks for ArenaCache {
         let txn = self.db.begin_write()?;
         {
             let mut tree = txn.write_tree(&self.tree)?;
-            let inode = match tree.lookup_path(path)? {
+            let inode = match tree.resolve(path)? {
                 Some(inode) => inode,
                 None => {
                     // No mark to remove
@@ -1256,7 +1256,7 @@ fn resolve_mark_at_path<P: AsRef<Path>>(
     tree: &impl TreeReadOperations,
     path: P,
 ) -> Result<Mark, StorageError> {
-    let (_, last_matching) = tree.lookup_partial_path(path)?;
+    let last_matching = tree.resolve_partial(path.as_ref())?;
 
     resolve_mark(mark_table, tree, last_matching)
 }
@@ -1845,12 +1845,12 @@ mod tests {
             let txn = fixture.db.begin_read()?;
             let tree = txn.read_tree(&acache.tree)?;
             assert_eq!(acache.arena_root(), tree.root());
-            assert!(tree.exists(a)?);
-            assert!(tree.exists(b)?);
-            assert!(tree.exists(c)?);
-            assert_eq!(Some(a), tree.lookup(tree.root(), "a")?);
-            assert_eq!(Some(b), tree.lookup(a, "b")?);
-            assert_eq!(Some(c), tree.lookup(b, "c.txt")?);
+            assert!(tree.inode_exists(a)?);
+            assert!(tree.inode_exists(b)?);
+            assert!(tree.inode_exists(c)?);
+            assert_eq!(Some(a), tree.lookup_inode(tree.root(), "a")?);
+            assert_eq!(Some(b), tree.lookup_inode(a, "b")?);
+            assert_eq!(Some(c), tree.lookup_inode(b, "c.txt")?);
         }
 
         fixture.remove_from_cache(&file_path)?;
@@ -1863,12 +1863,12 @@ mod tests {
             // The directories stay, because they still exist in the cache
             // but the file is gone from tree as well, since this was the
             // only reference to it.
-            assert!(tree.exists(a)?);
-            assert!(tree.exists(b)?);
-            assert!(!tree.exists(c)?);
-            assert_eq!(Some(a), tree.lookup(tree.root(), "a")?);
-            assert_eq!(Some(b), tree.lookup(a, "b")?);
-            assert_eq!(None, tree.lookup(b, "c.txt")?);
+            assert!(tree.inode_exists(a)?);
+            assert!(tree.inode_exists(b)?);
+            assert!(!tree.inode_exists(c)?);
+            assert_eq!(Some(a), tree.lookup_inode(tree.root(), "a")?);
+            assert_eq!(Some(b), tree.lookup_inode(a, "b")?);
+            assert_eq!(None, tree.lookup_inode(b, "c.txt")?);
         }
         Ok(())
     }
@@ -3849,7 +3849,7 @@ mod tests {
         assert_eq!(fixture.marks.get_mark(&path)?, Mark::Keep);
         let txn = fixture.db.begin_read()?;
         let tree = txn.read_tree(&fixture.acache.tree)?;
-        assert!(tree.lookup_path(&path)?.is_none());
+        assert!(tree.resolve(&path)?.is_none());
 
         Ok(())
     }
