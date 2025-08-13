@@ -1019,7 +1019,7 @@ mod tests {
                 None,
             )?;
 
-            let inode = self.acache.lookup_path(&path)?;
+            let inode = self.acache.expect(&path)?;
 
             Ok(inode)
         }
@@ -1352,7 +1352,7 @@ mod tests {
         let file_path = Path::parse("foobar")?;
 
         fixture.add_file_with_mtime(&file_path, 10000, test_time())?;
-        let inode = acache.lookup_path(&file_path)?;
+        let inode = acache.expect(&file_path)?;
 
         let blob_id = {
             let blob = acache.open_file(inode)?;
@@ -1391,7 +1391,7 @@ mod tests {
         fixture.add_file_with_mtime(&file_path, 100, test_time())?;
 
         // Open the file to create a blob
-        let inode = acache.lookup_path(&file_path)?;
+        let inode = acache.expect(&file_path)?;
         let blob_id = acache.open_file(inode)?.id();
 
         // Verify the blob file was created
@@ -1432,7 +1432,7 @@ mod tests {
         fixture.add_file_with_mtime(&file_path, 100, test_time())?;
 
         // Open the file to create a blob
-        let inode = acache.lookup_path(&file_path)?;
+        let inode = acache.expect(&file_path)?;
         let blob_id = acache.open_file(inode)?.id();
 
         // Verify the blob file was created
@@ -1462,7 +1462,7 @@ mod tests {
         fixture.add_file_with_mtime(&file_path, 100, test_time())?;
 
         // Open the file to create a blob
-        let inode = acache.lookup_path(&file_path)?;
+        let inode = acache.expect(&file_path)?;
         let blob_id = acache.open_file(inode)?.id();
 
         // Verify the blob file was created
@@ -1500,7 +1500,7 @@ mod tests {
         fixture.add_file_with_mtime(&file_path, 1000, test_time())?;
 
         // Open the file to create a blob
-        let inode = acache.lookup_path(&file_path)?;
+        let inode = acache.expect(&file_path)?;
         let blob_id = acache.open_file(inode)?.id();
 
         // Initially, the blob should have empty written areas
@@ -1560,7 +1560,7 @@ mod tests {
         fixture.add_file_with_mtime(&file_path, 100, test_time())?;
 
         // Open the file to create a blob
-        let inode = acache.lookup_path(&file_path)?;
+        let inode = acache.expect(&file_path)?;
         let blob_id = acache.open_file(inode)?.id();
 
         // Write some data to the blob and mark it as verified
@@ -1615,7 +1615,7 @@ mod tests {
         fixture.add_file_with_mtime(&file_path, 100, test_time())?;
 
         // Open the file to create a blob
-        let inode = acache.lookup_path(&file_path)?;
+        let inode = acache.expect(&file_path)?;
         let blob_id = acache.open_file(inode)?.id();
 
         // Write some data to the blob and mark it as verified
@@ -1660,7 +1660,7 @@ mod tests {
         fixture.add_file_with_mtime(&file_path, 100, test_time())?;
 
         // Open the file to create a blob
-        let inode = acache.lookup_path(&file_path)?;
+        let inode = acache.expect(&file_path)?;
         let blob_id = acache.open_file(inode)?.id();
 
         // Write some data to the blob but don't mark it as verified
@@ -1728,7 +1728,7 @@ mod tests {
         fixture.add_file_with_mtime(&file_path, 34, test_time())?;
 
         // Open the file to create a blob
-        let inode = acache.lookup_path(&file_path)?;
+        let inode = acache.expect(&file_path)?;
         let blob_id = acache.open_file(inode)?.id();
 
         // Write some data to the blob and mark it as verified

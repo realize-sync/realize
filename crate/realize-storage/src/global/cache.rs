@@ -121,9 +121,23 @@ impl UnrealCacheBlocking {
         }
     }
 
+    /// Lookup the inode and type of the file or directory pointed to
+    /// by a path.
+    ///
+    /// Fail with [StorageError::NotFound] if the path is not found in the tree. Note
+    /// that a successful return doesn't mean that a file or directory
+    /// with that inode actually exists in the cache.
+    pub fn expect(&self, arena: Arena, path: &Path) -> Result<Inode, StorageError> {
+        self.arena_cache(arena)?.expect(path)
+    }
+
     /// Lookup the inode and type of the file or directory pointed to by a path.
-    pub fn lookup_path(&self, arena: Arena, path: &Path) -> Result<Inode, StorageError> {
-        self.arena_cache(arena)?.lookup_path(path)
+    ///
+    /// Return Non if the path is not found in the tree. Note that a
+    /// successful return doesn't mean that a file or directory with
+    /// that inode actually exists in the cache.
+    pub fn resolve(&self, arena: Arena, path: &Path) -> Result<Option<Inode>, StorageError> {
+        self.arena_cache(arena)?.resolve(path)
     }
 
     /// Return the mtime of the directory.
@@ -287,11 +301,18 @@ impl UnrealCacheAsync {
         task::spawn_blocking(move || inner.lookup(parent_inode, &name)).await?
     }
 
-    pub async fn lookup_path(&self, arena: Arena, path: &Path) -> Result<Inode, StorageError> {
+    pub async fn expect(&self, arena: Arena, path: &Path) -> Result<Inode, StorageError> {
         let path = path.clone();
         let inner = Arc::clone(&self.inner);
 
-        task::spawn_blocking(move || inner.lookup_path(arena, &path)).await?
+        task::spawn_blocking(move || inner.expect(arena, &path)).await?
+    }
+
+    pub async fn resolve(&self, arena: Arena, path: &Path) -> Result<Option<Inode>, StorageError> {
+        let path = path.clone();
+        let inner = Arc::clone(&self.inner);
+
+        task::spawn_blocking(move || inner.resolve(arena, &path)).await?
     }
 
     pub async fn file_metadata(&self, inode: Inode) -> Result<FileMetadata, StorageError> {

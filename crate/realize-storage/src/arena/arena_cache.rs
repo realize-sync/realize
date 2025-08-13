@@ -2,7 +2,9 @@ use super::blob::{self, Blobstore};
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
 use super::index::RealIndex;
 use super::mark::PathMarks;
-use super::tree::{OpenTree, OpenTreeWrite, Tree, TreeExt, TreeReadOperations, WritableOpenTree};
+use super::tree::{
+    OpenTree, OpenTreeWrite, Tree, TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree,
+};
 use super::types::{
     DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry, FileTableKey,
     HistoryTableEntry, IndexedFileTableEntry, LocalAvailability, LruQueueId, MarkTableEntry,
@@ -98,17 +100,21 @@ impl ArenaCache {
         do_lookup(&txn.dir_table()?, parent_inode, name)
     }
 
-    pub(crate) fn lookup_path<T>(&self, path: T) -> Result<Inode, StorageError>
-    where
-        T: AsRef<Path>,
-    {
-        let path = path.as_ref();
+    pub(crate) fn expect<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<Inode, StorageError> {
         let txn = self.db.begin_read()?;
-        let dir_table = txn.dir_table()?;
+        let tree = txn.read_tree(&self.tree)?;
 
-        let (inode, _) = do_lookup_path(&dir_table, self.arena_root, Some(path))?;
+        tree.expect(loc)
+    }
 
-        Ok(inode)
+    pub(crate) fn resolve<'a, L: Into<TreeLoc<'a>>>(
+        &self,
+        loc: L,
+    ) -> Result<Option<Inode>, StorageError> {
+        let txn = self.db.begin_read()?;
+        let tree = txn.read_tree(&self.tree)?;
+
+        tree.resolve(loc)
     }
 
     pub(crate) fn file_metadata(&self, inode: Inode) -> Result<FileMetadata, StorageError> {
@@ -1759,7 +1765,7 @@ mod tests {
             T: AsRef<Path>,
         {
             let path = path.as_ref();
-            let inode = self.acache.lookup_path(path)?;
+            let inode = self.acache.expect(path)?;
             Ok(self.acache.dir_mtime(inode)?)
         }
 
@@ -1938,7 +1944,7 @@ mod tests {
             None,
         )?;
 
-        let inode = acache.lookup_path(&file_path)?;
+        let inode = acache.expect(&file_path)?;
         let metadata = acache.file_metadata(inode)?;
         assert_eq!(metadata.size, 200);
         assert_eq!(metadata.mtime, later_time());
@@ -2036,7 +2042,7 @@ mod tests {
         fixture.add_to_cache(&file_path, 200, test_time())?;
 
         let acache = &fixture.acache;
-        let inode = acache.lookup_path(&file_path)?;
+        let inode = acache.expect(&file_path)?;
         let metadata = acache.file_metadata(inode)?;
         assert_eq!(metadata.size, 100);
 
@@ -2076,7 +2082,7 @@ mod tests {
             None,
         )?;
 
-        let inode = acache.lookup_path(&file_path)?;
+        let inode = acache.expect(&file_path)?;
         let metadata = acache.file_metadata(inode)?;
         assert_eq!(metadata.size, 100);
 
@@ -2158,7 +2164,7 @@ mod tests {
         )?;
 
         // File should still exist because wrong hash was provided
-        let inode = acache.lookup_path(&file_path)?;
+        let inode = acache.expect(&file_path)?;
         let metadata = acache.file_metadata(inode)?;
         assert_eq!(metadata.size, 100);
 
@@ -2213,7 +2219,7 @@ mod tests {
 
         fixture.add_to_cache(&path, 100, mtime)?;
 
-        let inode = acache.lookup_path(&path)?;
+        let inode = acache.expect(&path)?;
         let metadata = acache.file_metadata(inode)?;
         assert_eq!(metadata.mtime, mtime);
         assert_eq!(metadata.size, 100);
@@ -2738,23 +2744,20 @@ mod tests {
         )?;
 
         // File1 should have been deleted, since it was only on peer1,
-        assert!(matches!(
-            acache.lookup_path(&file1),
-            Err(StorageError::NotFound)
-        ));
+        assert!(matches!(acache.expect(&file1), Err(StorageError::NotFound)));
 
         // File2 should still be available, from peer2
-        let file2_inode = acache.lookup_path(&file2)?;
+        let file2_inode = acache.expect(&file2)?;
         let file2_availability = acache.file_availability(file2_inode)?;
         assert!(file2_availability.peers.contains(&peer2));
 
         // File3 should still be available, from peer3
-        let file3_inode = acache.lookup_path(&file3)?;
+        let file3_inode = acache.expect(&file3)?;
         let file3_availability = acache.file_availability(file3_inode)?;
         assert!(file3_availability.peers.contains(&peer3));
 
         // File4 should still be available, from peer1
-        let file4_inode = acache.lookup_path(&file4)?;
+        let file4_inode = acache.expect(&file4)?;
         let file4_availability = acache.file_availability(file4_inode)?;
         assert!(file4_availability.peers.contains(&peer1));
 
@@ -2772,7 +2775,7 @@ mod tests {
         fixture.add_to_cache(&file_path, 100, mtime)?;
 
         let acache = &fixture.acache;
-        let inode = acache.lookup_path(&file_path)?;
+        let inode = acache.expect(&file_path)?;
         let availability = acache.local_availability(inode)?;
 
         assert!(matches!(availability, LocalAvailability::Missing));
@@ -2789,7 +2792,7 @@ mod tests {
         // Add a file and open it to create a blob
         fixture.add_to_cache(&file_path, 100, mtime)?;
         let acache = &fixture.acache;
-        let inode = acache.lookup_path(&file_path)?;
+        let inode = acache.expect(&file_path)?;
 
         // Open the file to create a blob but don't write anything
         let _blob = fixture.acache.open_file(inode)?;
@@ -2810,7 +2813,7 @@ mod tests {
         // Add a file and open it to create a blob
         fixture.add_to_cache(&file_path, 100, mtime)?;
         let acache = &fixture.acache;
-        let inode = acache.lookup_path(&file_path)?;
+        let inode = acache.expect(&file_path)?;
 
         // Open the file and write only part of it
         let mut blob = fixture.acache.open_file(inode)?;
@@ -2841,7 +2844,7 @@ mod tests {
         // Add a file and open it to create a blob
         fixture.add_to_cache(&file_path, 100, mtime)?;
         let acache = &fixture.acache;
-        let inode = acache.lookup_path(&file_path)?;
+        let inode = acache.expect(&file_path)?;
 
         // Open the file and write the full content
         let mut blob = fixture.acache.open_file(inode)?;
@@ -2866,7 +2869,7 @@ mod tests {
         // Add a file and open it to create a blob
         fixture.add_to_cache(&file_path, 100, mtime)?;
         let acache = &fixture.acache;
-        let inode = acache.lookup_path(&file_path)?;
+        let inode = acache.expect(&file_path)?;
 
         // Open the file and write the full content
         let mut blob = fixture.acache.open_file(inode)?;
@@ -2894,7 +2897,7 @@ mod tests {
         // Add a file and open it to create a blob
         fixture.add_to_cache(&file_path, 1000, mtime)?;
         let acache = &fixture.acache;
-        let inode = acache.lookup_path(&file_path)?;
+        let inode = acache.expect(&file_path)?;
 
         // Open the file and write data in non-contiguous ranges
         let mut blob = fixture.acache.open_file(inode)?;
@@ -2937,7 +2940,7 @@ mod tests {
         // Add a zero-size file
         fixture.add_to_cache(&file_path, 0, mtime)?;
         let acache = &fixture.acache;
-        let inode = acache.lookup_path(&file_path)?;
+        let inode = acache.expect(&file_path)?;
         assert!(matches!(
             acache.local_availability(inode)?,
             LocalAvailability::Missing
@@ -2981,7 +2984,7 @@ mod tests {
         // Add a file and open it to create a blob
         fixture.add_to_cache(&file_path, 100, mtime)?;
         let acache = &fixture.acache;
-        let inode = acache.lookup_path(&file_path)?;
+        let inode = acache.expect(&file_path)?;
 
         // Initially should be missing
         let availability = acache.local_availability(inode)?;
@@ -4189,7 +4192,7 @@ mod tests {
 
         // The path still doesn't exist in the cache, even though it has a mark
         assert!(matches!(
-            fixture.acache.lookup_path(Path::parse("foo/bar")?),
+            fixture.acache.expect(Path::parse("foo/bar")?),
             Err(StorageError::NotFound)
         ));
 

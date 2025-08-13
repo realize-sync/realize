@@ -47,7 +47,7 @@ pub(crate) async fn download(
     shutdown: CancellationToken,
 ) -> Result<JobStatus, JobError> {
     let cache = storage.cache();
-    let inode = match cache.lookup_path(arena, path).await {
+    let inode = match cache.expect(arena, path).await {
         Err(StorageError::NotFound) => {
             return Ok(JobStatus::Abandoned("not in cache"));
         }
@@ -363,7 +363,7 @@ mod tests {
         async fn open_file(&self, peer: Peer, path_str: &str) -> anyhow::Result<Blob> {
             let cache = self.inner.cache(peer)?;
             let inode = cache
-                .lookup_path(HouseholdFixture::test_arena(), &Path::parse(path_str)?)
+                .expect(HouseholdFixture::test_arena(), &Path::parse(path_str)?)
                 .await?;
 
             Ok(cache.open_file(inode).await?)
@@ -401,7 +401,7 @@ mod tests {
         ) -> anyhow::Result<LocalAvailability> {
             let cache = self.inner.cache(peer)?;
             let inode = cache
-                .lookup_path(HouseholdFixture::test_arena(), &Path::parse(path_str)?)
+                .expect(HouseholdFixture::test_arena(), &Path::parse(path_str)?)
                 .await?;
 
             Ok(cache.local_availability(inode).await?)
