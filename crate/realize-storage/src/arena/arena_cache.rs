@@ -19,7 +19,6 @@ use crate::{Blob, InodeAllocator, InodeAssignment, Mark};
 use crate::{Inode, StorageError};
 use realize_types::{Arena, ByteRanges, Hash, Path, Peer, UnixTime};
 use redb::{ReadableTable, Table};
-use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -207,7 +206,13 @@ impl ArenaCache {
 
                 // add default
                 if get_file_entry(&file_table, file_inode, None)?.is_none() {
-                    self.do_write_default_file_entry(&txn, &mut file_table, file_inode, &entry)?;
+                    self.do_write_default_file_entry(
+                        &txn,
+                        &mut file_table,
+                        file_inode,
+                        None,
+                        &entry,
+                    )?;
                 }
             }
             Notification::Replace {
@@ -235,10 +240,16 @@ impl ArenaCache {
                 }
 
                 // replace default
-                if let Some(e) = get_file_entry(&file_table, file_inode, None)?
-                    && e.content.hash == old_hash
+                if let Some(old_entry) = get_file_entry(&file_table, file_inode, None)?
+                    && old_entry.content.hash == old_hash
                 {
-                    self.do_write_default_file_entry(&txn, &mut file_table, file_inode, &entry)?;
+                    self.do_write_default_file_entry(
+                        &txn,
+                        &mut file_table,
+                        file_inode,
+                        Some(&old_entry),
+                        &entry,
+                    )?;
                 }
 
                 // replace local
@@ -328,7 +339,13 @@ impl ArenaCache {
 
                 // catchup default (same as add)
                 if !get_file_entry(&file_table, file_inode, None)?.is_some() {
-                    self.do_write_default_file_entry(&txn, &mut file_table, file_inode, &entry)?;
+                    self.do_write_default_file_entry(
+                        &txn,
+                        &mut file_table,
+                        file_inode,
+                        None,
+                        &entry,
+                    )?;
                 }
             }
             Notification::CatchupComplete { index, .. } => {
@@ -541,16 +558,15 @@ impl ArenaCache {
         Ok(())
     }
 
-    /// Write an entry in the file table, overwriting any existing one.
-    fn do_write_default_file_entry(
+    /// This must be executed before updating or removing the default
+    /// file entry.
+    fn before_default_file_entry_change(
         &self,
         txn: &ArenaWriteTransaction,
-        file_table: &mut redb::Table<'_, FileTableKey, Holder<FileTableEntry>>,
-        file_inode: Inode,
-        entry: &FileTableEntry,
+        old_entry: Option<&FileTableEntry>,
+        path: &Path,
     ) -> Result<(), StorageError> {
-        if let Some(old_entry) = file_table.get(FileTableKey::Default(file_inode))? {
-            let old_entry = old_entry.value().parse()?;
+        if let Some(old_entry) = old_entry {
             if let Some(blob_id) = old_entry.content.blob {
                 self.blobstore.delete_blob(&txn, blob_id)?;
             }
@@ -558,14 +574,28 @@ impl ArenaCache {
 
         // This entry is the outside world view of the file, so
         // changes should be reported.
-        self.dirty_paths.mark_dirty(txn, &entry.content.path)?;
-
-        file_table.insert(FileTableKey::Default(file_inode), Holder::new(entry)?)?;
+        self.dirty_paths.mark_dirty(txn, path)?;
 
         Ok(())
     }
 
-    /// Remove a file entry for a specific peer.
+    /// Write an entry in the file table, overwriting any existing one.
+    fn do_write_default_file_entry(
+        &self,
+        txn: &ArenaWriteTransaction,
+        file_table: &mut redb::Table<'_, FileTableKey, Holder<FileTableEntry>>,
+        file_inode: Inode,
+        old_entry: Option<&FileTableEntry>,
+        new_entry: &FileTableEntry,
+    ) -> Result<(), StorageError> {
+        self.before_default_file_entry_change(txn, old_entry, &new_entry.content.path)?;
+        file_table.insert(FileTableKey::Default(file_inode), Holder::new(new_entry)?)?;
+
+        Ok(())
+    }
+
+    /// Remove a file entry for a specific peer and update or remove
+    /// the corresponding default entry, as necessary.
     fn do_rm_file_entry(
         &self,
         txn: &ArenaWriteTransaction,
@@ -575,98 +605,84 @@ impl ArenaCache {
         parent_inode: Inode,
         inode: Inode,
         peer: Peer,
-        old_hash: Option<Hash>,
     ) -> Result<(), StorageError> {
-        let mut path = None;
-        let mut entries = HashMap::new();
-        for elt in file_table.range(FileTableKey::range(inode))? {
-            let (key, value) = elt?;
-            let insert_key = match key.value() {
-                FileTableKey::PeerCopy(_, peer) => Some(peer),
-                FileTableKey::Default(_) => None,
-                _ => {
-                    continue;
-                }
-            };
-            let entry = value.value().parse()?;
-            if path.is_none() {
-                path = Some(entry.content.path.clone());
-            }
-            entries.insert(insert_key, entry);
+        // Remove the entry
+        if file_table
+            .remove(FileTableKey::PeerCopy(inode, peer))?
+            .is_none()
+        {
+            // nothing was changed
+            return Ok(());
         }
 
-        let peer_hash = match entries.remove(&Some(peer)).map(|e| e.content.hash) {
-            Some(h) => h,
+        // Update or remove the default entry, if it relied on the now
+        // removed peer entry.
+
+        let mut peer_entries = vec![];
+        let mut default_entry = None;
+        for elt in file_table.range(FileTableKey::range(inode))? {
+            let (key, value) = elt?;
+            match key.value() {
+                FileTableKey::PeerCopy(_, _) => {
+                    peer_entries.push(value.value().parse()?);
+                }
+                FileTableKey::Default(_) => {
+                    default_entry = Some(value.value().parse()?);
+                }
+                _ => {}
+            }
+        }
+        let default_entry = match default_entry {
+            Some(e) => e,
             None => {
-                // No entry to delete
+                // if there's no default entry, there's nothing to do
                 return Ok(());
             }
         };
 
-        if let Some(old_hash) = old_hash
-            && peer_hash != old_hash
+        if peer_entries
+            .iter()
+            .find(|e| e.content.hash == default_entry.content.hash)
+            .is_some()
         {
-            // Skip deletion
+            // The default entry is still valid
             return Ok(());
         }
 
-        file_table.remove(FileTableKey::PeerCopy(inode, peer))?;
-
-        let default_hash = entries.remove(&None).map(|e| e.content.hash);
-        // In case old_hash == default_hash, should we remove the default
-        // version and pretend the file doesn't exist anymore, even if
-        // it's available on other peers? It would be consistent,
-        // history-wise. With the current logic, a file is only gone once
-        // it's gone from all peers.
-
-        if entries.is_empty() {
-            // This was the last peer. Remove the default entry as well as
-            // the directory entry.
-            // TODO: delete empty directories, up to the arena root
-
-            if let Some(path) = path {
-                self.dirty_paths.mark_dirty(&txn, &path)?;
+        // Select a new hash. This selects the most recent one; since
+        // version history is lost there's very little else we can do.
+        let new_entry = peer_entries.into_iter().max_by_key(|e| e.metadata.mtime);
+        match new_entry {
+            Some(new_entry) => {
+                self.do_write_default_file_entry(
+                    txn,
+                    file_table,
+                    inode,
+                    Some(&default_entry),
+                    &new_entry,
+                )?;
             }
-
-            // Check if the default entry has a blob and delete it
-            if let Some(default_entry) = file_table.get(FileTableKey::Default(inode))? {
-                let default_entry = default_entry.value().parse()?;
-                if let Some(blob_id) = default_entry.content.blob {
-                    self.blobstore.delete_blob(&txn, blob_id)?;
+            None => {
+                self.before_default_file_entry_change(
+                    txn,
+                    Some(&default_entry),
+                    &default_entry.content.path,
+                )?;
+                file_table.remove(FileTableKey::Default(inode))?;
+                if let Some(name) = tree.name_in(parent_inode, inode)? {
+                    tree.remove_and_decref(inode, dir_table, (parent_inode, name.as_str()))?;
+                    log::debug!("Tree.remove {inode} ({parent_inode}, {name})");
                 }
+
+                // We update the parent modification time, as removing
+                // an entry modified it.
+                dir_table.insert(
+                    (parent_inode, "."),
+                    Holder::with_content(DirTableEntry::Dot(UnixTime::now()))?,
+                )?;
+
+                return Ok(());
             }
-
-            file_table.remove(FileTableKey::Default(inode))?;
-            if let Some(name) = tree.name_in(parent_inode, inode)? {
-                tree.remove_and_decref(inode, dir_table, (parent_inode, name.as_str()))?;
-                log::debug!("Tree.remove {inode} ({parent_inode}, {name})");
-            }
-            dir_table.insert(
-                (parent_inode, "."),
-                Holder::with_content(DirTableEntry::Dot(UnixTime::now()))?,
-            )?;
-
-            return Ok(());
-        }
-
-        // If this was the peer that had the default entry, we need to
-        // choose another one as default.
-        let another_peer_has_default_hash = default_hash
-            .map(|h| entries.values().any(|e| e.content.hash == h))
-            .unwrap_or(false);
-        if another_peer_has_default_hash {
-            return Ok(());
-        }
-
-        let most_recent = entries.into_iter().reduce(|a, b| {
-            if b.1.metadata.mtime > a.1.metadata.mtime {
-                b
-            } else {
-                a
-            }
-        });
-        if let Some((_, entry)) = most_recent {
-            self.do_write_default_file_entry(txn, file_table, inode, &entry)?;
         }
 
         Ok(())
@@ -696,16 +712,19 @@ impl ArenaCache {
                 let mut file_table = txn.file_table()?;
                 let mut dir_table = txn.dir_table()?;
 
-                self.do_rm_file_entry(
-                    txn,
-                    &mut file_table,
-                    &mut dir_table,
-                    &mut tree,
-                    parent_inode,
-                    inode,
-                    peer,
-                    Some(old_hash),
-                )?;
+                if let Some(e) = get_file_entry(&file_table, inode, Some(peer))?
+                    && e.content.hash == old_hash
+                {
+                    self.do_rm_file_entry(
+                        txn,
+                        &mut file_table,
+                        &mut dir_table,
+                        &mut tree,
+                        parent_inode,
+                        inode,
+                        peer,
+                    )?;
+                }
             }
         }
 
@@ -739,7 +758,6 @@ impl ArenaCache {
                     parent_inode,
                     inode,
                     peer,
-                    None,
                 )?;
             }
         }
