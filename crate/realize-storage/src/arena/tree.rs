@@ -177,39 +177,28 @@ impl<'a> TreeReadOperations for WritableOpenTree<'a> {
 /// A location within the tree, which can be expressed as an inode or
 /// a path.
 ///
-/// Such locations are usually created automatically by [ToTreeLoc].
+/// Such locations are usually created automatically using into().
 pub(crate) enum TreeLoc<'a> {
     Inode(Inode),
     PathRef(&'a Path),
     Path(Path),
 }
 
-/// A type that can be used as tree location.
-pub(crate) trait ToTreeLoc<'a> {
-    fn to_tree_loc(self) -> TreeLoc<'a>;
-}
-
-impl<'a> ToTreeLoc<'a> for TreeLoc<'a> {
-    fn to_tree_loc(self) -> TreeLoc<'a> {
-        self
+impl From<Inode> for TreeLoc<'static> {
+    fn from(value: Inode) -> Self {
+        TreeLoc::Inode(value)
     }
 }
 
-impl ToTreeLoc<'static> for Inode {
-    fn to_tree_loc(self) -> TreeLoc<'static> {
-        TreeLoc::Inode(self)
+impl From<Path> for TreeLoc<'static> {
+    fn from(value: Path) -> Self {
+        TreeLoc::Path(value)
     }
 }
 
-impl<'a> ToTreeLoc<'a> for &'a Path {
-    fn to_tree_loc(self) -> TreeLoc<'a> {
-        TreeLoc::PathRef(self)
-    }
-}
-
-impl ToTreeLoc<'static> for Path {
-    fn to_tree_loc(self) -> TreeLoc<'static> {
-        TreeLoc::Path(self)
+impl<'a> From<&'a Path> for TreeLoc<'a> {
+    fn from(value: &'a Path) -> Self {
+        TreeLoc::PathRef(value)
     }
 }
 
@@ -217,27 +206,27 @@ impl ToTreeLoc<'static> for Path {
 /// with [Path].
 pub(crate) trait TreeExt {
     /// Resolve the given tree location to an inode.
-    fn resolve<'a, L: ToTreeLoc<'a>>(&self, loc: L) -> Result<Option<Inode>, StorageError>;
+    fn resolve<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<Option<Inode>, StorageError>;
 
     /// Resolve the given tree location to an inode or return [Storage::NotFound].
-    fn expect<'a, L: ToTreeLoc<'a>>(&self, loc: L) -> Result<Inode, StorageError>;
+    fn expect<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<Inode, StorageError>;
 
     /// Lookup the given path and return the most specific inode matching the
     /// path - which might just be the root if nothing matches.
-    fn resolve_partial<'a, L: ToTreeLoc<'a>>(&self, path: L) -> Result<Inode, StorageError>;
+    fn resolve_partial<'a, L: Into<TreeLoc<'a>>>(&self, path: L) -> Result<Inode, StorageError>;
 
     /// Lookup a specific entry in the given directory.
-    fn lookup<'a, L: ToTreeLoc<'a>>(
+    fn lookup<'a, L: Into<TreeLoc<'a>>>(
         &self,
         loc: L,
         name: &str,
     ) -> Result<Option<Inode>, StorageError>;
 
     /// Read the content of the given directory.
-    fn readdir<'a, L: ToTreeLoc<'a>>(&self, loc: L) -> ReadDirIterator<'_>;
+    fn readdir<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> ReadDirIterator<'_>;
 
     /// Checks whether a given location exists in the tree.
-    fn exists<'a, L: ToTreeLoc<'a>>(&self, loc: L) -> Result<bool, StorageError>;
+    fn exists<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<bool, StorageError>;
 
     /// Goes through whole tree, starting at inode and return it as an
     /// iterator (depth-first).
@@ -249,7 +238,7 @@ pub(crate) trait TreeExt {
         enter: F,
     ) -> impl Iterator<Item = Result<Inode, StorageError>>
     where
-        L: ToTreeLoc<'a>,
+        L: Into<TreeLoc<'a>>,
         F: FnMut(Inode) -> bool;
 
     /// Follow the inodes back up to the root and build a path.
@@ -261,12 +250,12 @@ pub(crate) trait TreeExt {
 }
 
 impl<T: TreeReadOperations> TreeExt for T {
-    fn expect<'a, L: ToTreeLoc<'a>>(&self, loc: L) -> Result<Inode, StorageError> {
+    fn expect<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<Inode, StorageError> {
         self.resolve(loc)?.ok_or(StorageError::NotFound)
     }
 
-    fn resolve<'a, L: ToTreeLoc<'a>>(&self, loc: L) -> Result<Option<Inode>, StorageError> {
-        let loc = loc.to_tree_loc();
+    fn resolve<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<Option<Inode>, StorageError> {
+        let loc = loc.into();
         match loc {
             TreeLoc::Inode(inode) => Ok(Some(inode)),
             TreeLoc::PathRef(path) => resolve_path(self, path),
@@ -274,8 +263,8 @@ impl<T: TreeReadOperations> TreeExt for T {
         }
     }
 
-    fn resolve_partial<'a, L: ToTreeLoc<'a>>(&self, loc: L) -> Result<Inode, StorageError> {
-        let loc = loc.to_tree_loc();
+    fn resolve_partial<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<Inode, StorageError> {
+        let loc = loc.into();
         match loc {
             TreeLoc::Inode(inode) => Ok(inode),
             TreeLoc::PathRef(path) => resolve_path_partial(self, path),
@@ -283,7 +272,7 @@ impl<T: TreeReadOperations> TreeExt for T {
         }
     }
 
-    fn lookup<'a, L: ToTreeLoc<'a>>(
+    fn lookup<'a, L: Into<TreeLoc<'a>>>(
         &self,
         loc: L,
         name: &str,
@@ -291,15 +280,15 @@ impl<T: TreeReadOperations> TreeExt for T {
         self.lookup_inode(self.expect(loc)?, name)
     }
 
-    fn readdir<'a, L: ToTreeLoc<'a>>(&self, loc: L) -> ReadDirIterator<'_> {
+    fn readdir<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> ReadDirIterator<'_> {
         match self.expect(loc) {
             Err(err) => ReadDirIterator::failed(err),
             Ok(inode) => self.readdir_inode(inode),
         }
     }
 
-    fn exists<'a, L: ToTreeLoc<'a>>(&self, loc: L) -> Result<bool, StorageError> {
-        Ok(match loc.to_tree_loc() {
+    fn exists<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<bool, StorageError> {
+        Ok(match loc.into() {
             TreeLoc::Inode(inode) => self.inode_exists(inode)?,
             TreeLoc::Path(path) => resolve_path(self, &path)?.is_some(),
             TreeLoc::PathRef(path) => resolve_path(self, path)?.is_some(),
@@ -312,7 +301,7 @@ impl<T: TreeReadOperations> TreeExt for T {
         enter: F,
     ) -> impl Iterator<Item = Result<Inode, StorageError>>
     where
-        L: ToTreeLoc<'a>,
+        L: Into<TreeLoc<'a>>,
         F: FnMut(Inode) -> bool,
     {
         RecurseIterator {
@@ -680,7 +669,7 @@ impl<'a> WritableOpenTree<'a> {
         mut pred: F,
     ) -> Result<(), StorageError>
     where
-        L: ToTreeLoc<'b>,
+        L: Into<TreeLoc<'b>>,
         K: redb::Key + 'static,
         V: redb::Value + 'static,
         FK: Fn(Inode) -> Result<KB, ByteConversionError>,
