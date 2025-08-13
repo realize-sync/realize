@@ -174,6 +174,39 @@ impl<'a> TreeReadOperations for WritableOpenTree<'a> {
     }
 }
 
+/// A location within the tree, which can be expressed as an inode or
+/// a path.
+///
+/// Such locations are usually created automatically by [ToTreeLoc].
+pub(crate) enum TreeLoc<'a> {
+    Inode(Inode),
+    PathRef(&'a Path),
+    Path(Path),
+}
+
+/// A type that can be used as tree location.
+pub(crate) trait ToTreeLoc<'a> {
+    fn to_tree_loc(self) -> TreeLoc<'a>;
+}
+
+impl ToTreeLoc<'static> for Inode {
+    fn to_tree_loc(self) -> TreeLoc<'static> {
+        TreeLoc::Inode(self)
+    }
+}
+
+impl<'a> ToTreeLoc<'a> for &'a Path {
+    fn to_tree_loc(self) -> TreeLoc<'a> {
+        TreeLoc::PathRef(self)
+    }
+}
+
+impl ToTreeLoc<'static> for Path {
+    fn to_tree_loc(self) -> TreeLoc<'static> {
+        TreeLoc::Path(self)
+    }
+}
+
 /// Extend [TreeReadOperations] with convenience functions for working
 /// with [Path].
 pub(crate) trait TreeExt {
@@ -182,6 +215,12 @@ pub(crate) trait TreeExt {
     /// Returns the inode of the leaf or None if one of the components
     /// of the path cannot be found.
     fn lookup_path<P: AsRef<Path>>(&self, path: P) -> Result<Option<Inode>, StorageError>;
+
+    /// Resolve the given tree location to an inode.
+    fn resolve<'a, L: ToTreeLoc<'a>>(&self, loc: L) -> Result<Option<Inode>, StorageError>;
+
+    /// Resolve the given tree location to an inode or return [Storage::NotFound].
+    fn expect<'a, L: ToTreeLoc<'a>>(&self, loc: L) -> Result<Inode, StorageError>;
 
     /// Lookup the given path, fail with [StorageError::NotFound] if
     /// it doesn't exist.
@@ -234,6 +273,19 @@ pub(crate) trait TreeExt {
 }
 
 impl<T: TreeReadOperations> TreeExt for T {
+    fn expect<'a, L: ToTreeLoc<'a>>(&self, loc: L) -> Result<Inode, StorageError> {
+        self.resolve(loc)?.ok_or(StorageError::NotFound)
+    }
+
+    fn resolve<'a, L: ToTreeLoc<'a>>(&self, loc: L) -> Result<Option<Inode>, StorageError> {
+        let loc = loc.to_tree_loc();
+        match loc {
+            TreeLoc::Inode(inode) => Ok(Some(inode)),
+            TreeLoc::PathRef(path) => self.lookup_path(path),
+            TreeLoc::Path(path) => self.lookup_path(&path),
+        }
+    }
+
     fn expect_path<P: AsRef<Path>>(&self, path: P) -> Result<Inode, StorageError> {
         self.lookup_path(path)?.ok_or(StorageError::NotFound)
     }
