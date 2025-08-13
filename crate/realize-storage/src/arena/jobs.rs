@@ -284,7 +284,7 @@ mod tests {
 
         fn find_in_cache(&self, path_str: &str) -> Result<Option<Inode>, StorageError> {
             match self.cache.lookup_path(&Path::parse(path_str)?) {
-                Ok((inode, _)) => Ok(Some(inode)),
+                Ok(inode) => Ok(Some(inode)),
                 Err(StorageError::NotFound) => Ok(None),
                 Err(err) => Err(err),
             }

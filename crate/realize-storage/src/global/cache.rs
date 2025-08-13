@@ -122,11 +122,7 @@ impl UnrealCacheBlocking {
     }
 
     /// Lookup the inode and type of the file or directory pointed to by a path.
-    pub fn lookup_path(
-        &self,
-        arena: Arena,
-        path: &Path,
-    ) -> Result<(Inode, InodeAssignment), StorageError> {
+    pub fn lookup_path(&self, arena: Arena, path: &Path) -> Result<Inode, StorageError> {
         self.arena_cache(arena)?.lookup_path(path)
     }
 
@@ -291,11 +287,7 @@ impl UnrealCacheAsync {
         task::spawn_blocking(move || inner.lookup(parent_inode, &name)).await?
     }
 
-    pub async fn lookup_path(
-        &self,
-        arena: Arena,
-        path: &Path,
-    ) -> Result<(Inode, InodeAssignment), StorageError> {
+    pub async fn lookup_path(&self, arena: Arena, path: &Path) -> Result<Inode, StorageError> {
         let path = path.clone();
         let inner = Arc::clone(&self.inner);
 

@@ -54,7 +54,7 @@ pub(crate) async fn download(
         Err(err) => {
             return Err(err.into());
         }
-        Ok((inode, _)) => inode,
+        Ok(inode) => inode,
     };
     match cache.local_availability(inode).await {
         Err(StorageError::NotFound) => {
@@ -362,7 +362,7 @@ mod tests {
 
         async fn open_file(&self, peer: Peer, path_str: &str) -> anyhow::Result<Blob> {
             let cache = self.inner.cache(peer)?;
-            let (inode, _) = cache
+            let inode = cache
                 .lookup_path(HouseholdFixture::test_arena(), &Path::parse(path_str)?)
                 .await?;
 
@@ -400,7 +400,7 @@ mod tests {
             path_str: &str,
         ) -> anyhow::Result<LocalAvailability> {
             let cache = self.inner.cache(peer)?;
-            let (inode, _) = cache
+            let inode = cache
                 .lookup_path(HouseholdFixture::test_arena(), &Path::parse(path_str)?)
                 .await?;
 

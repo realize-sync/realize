@@ -501,7 +501,7 @@ mod tests {
             let a = HouseholdFixture::a();
             let cache = self.inner.cache(a)?;
             let path = Path::parse(path_str)?;
-            let (inode, _) = cache.lookup_path(arena, &path).await?;
+            let inode = cache.lookup_path(arena, &path).await?;
 
             Ok(downloader.reader(inode).await?)
         }
@@ -903,7 +903,7 @@ mod tests {
         let downloader = Downloader::new(household, cache.clone());
 
         let arena = HouseholdFixture::test_arena();
-        let (inode, _) = cache
+        let inode = cache
             .lookup_path(arena, &Path::parse("large_file")?)
             .await?;
 

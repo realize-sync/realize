@@ -1284,7 +1284,7 @@ mod tests {
 
         fixture.marks.set_arena_mark(Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
-        let (inode, _) = fixture.acache.lookup_path(&barfile)?;
+        let inode = fixture.acache.lookup_path(&barfile)?;
         {
             let mut blob = fixture.acache.open_file(inode)?;
             blob.write_all(b"te").await?;
@@ -1314,7 +1314,7 @@ mod tests {
 
         fixture.marks.set_arena_mark(Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
-        let (inode, _) = fixture.acache.lookup_path(&barfile)?;
+        let inode = fixture.acache.lookup_path(&barfile)?;
         {
             let mut blob = fixture.acache.open_file(inode)?;
             blob.write_all(b"test").await?;
@@ -1345,7 +1345,7 @@ mod tests {
 
         fixture.marks.set_arena_mark(Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
-        let (inode, _) = fixture.acache.lookup_path(&barfile)?;
+        let inode = fixture.acache.lookup_path(&barfile)?;
         {
             let mut blob = fixture.acache.open_file(inode)?;
             blob.write_all(b"test").await?;
@@ -1822,7 +1822,7 @@ mod tests {
         fixture.add_file_to_cache(&barfile)?;
 
         let (_, job) = next_with_timeout(&mut job_stream).await?.unwrap();
-        let (inode, _) = fixture.acache.lookup_path(&barfile)?;
+        let inode = fixture.acache.lookup_path(&barfile)?;
         {
             let mut blob = fixture.acache.open_file(inode)?;
             blob.write_all(b"test").await?;

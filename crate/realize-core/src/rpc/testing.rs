@@ -146,7 +146,7 @@ impl HouseholdFixture {
         // First, wait for the file to appear in the cache
         let inode = loop {
             match cache.lookup_path(arena, &path).await {
-                Ok((inode, _)) => break inode,
+                Ok(inode) => break inode,
                 Err(_) => {
                     if let Some(delay) = retry.next() {
                         tokio::time::sleep(delay).await;
@@ -184,7 +184,7 @@ impl HouseholdFixture {
 
         let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
         let arena = HouseholdFixture::test_arena();
-        let (inode, _) = cache.lookup_path(arena, &Path::parse(filename)?).await?;
+        let inode = cache.lookup_path(arena, &Path::parse(filename)?).await?;
         while cache.file_availability(inode).await?.hash != *hash {
             if let Some(delay) = retry.next() {
                 tokio::time::sleep(delay).await;
@@ -216,7 +216,7 @@ impl HouseholdFixture {
 
     pub async fn open_file(&self, peer: Peer, path_str: &str) -> anyhow::Result<Blob> {
         let cache = self.cache(peer)?;
-        let (inode, _) = cache
+        let inode = cache
             .lookup_path(HouseholdFixture::test_arena(), &Path::parse(path_str)?)
             .await?;
 
