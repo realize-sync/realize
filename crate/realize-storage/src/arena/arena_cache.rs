@@ -627,7 +627,7 @@ impl ArenaCache {
 
             file_table.remove(FileTableKey::Default(inode))?;
             if let Some(name) = tree.name_in(parent_inode, inode)? {
-                tree.remove(inode, dir_table, (parent_inode, name.as_str()))?;
+                tree.remove_and_decref(inode, dir_table, (parent_inode, name.as_str()))?;
                 log::debug!("Tree.remove {inode} ({parent_inode}, {name})");
             }
             dir_table.insert(
@@ -801,10 +801,11 @@ impl ArenaCache {
             .flatten();
         let same_hash = old_hash.as_ref().map(|h| *h == hash).unwrap_or(false);
         let entry = FileTableEntry::new(path.clone(), size, mtime, hash);
-        tree.insert_at_path(
-            path,
+        let inode = tree.setup(path)?;
+        tree.insert_and_incref(
+            inode,
             &mut file_table,
-            |inode| FileTableKey::LocalCopy(inode),
+            FileTableKey::LocalCopy(inode),
             Holder::new(&entry)?,
         )?;
         if !same_hash {
@@ -870,7 +871,7 @@ impl ArenaCache {
             }
             Some(existing) => existing.value().parse()?,
         };
-        if tree.remove(inode, file_table, key)? {
+        if tree.remove_and_decref(inode, file_table, key)? {
             self.report_removed(txn, history_table, path, hash)?;
         }
 
@@ -885,7 +886,7 @@ impl ArenaCache {
         history_table: &mut Table<'_, u64, Holder<'static, HistoryTableEntry>>,
         inode: Inode,
     ) -> Result<(), StorageError> {
-        tree.remove_recursive(
+        tree.remove_recursive_and_decref(
             inode,
             file_table,
             |inode| Ok(FileTableKey::LocalCopy(inode)),
@@ -1233,10 +1234,11 @@ impl PathMarks for ArenaCache {
             let mut mark_table = txn.mark_table()?;
             let mut tree = txn.write_tree(&self.tree)?;
             let old_mark = resolve_mark_at_path(&mark_table, &tree, path)?;
-            let inode = tree.insert_at_path(
-                path,
+            let inode = tree.setup(path)?;
+            tree.insert_and_incref(
+                inode,
                 &mut mark_table,
-                |inode| inode,
+                inode,
                 Holder::with_content(MarkTableEntry { mark })?,
             )?;
 
@@ -1263,7 +1265,7 @@ impl PathMarks for ArenaCache {
             };
             let mut mark_table = txn.mark_table()?;
             let old_mark = resolve_mark(&mark_table, &tree, inode)?;
-            let removed = tree.remove(inode, &mut mark_table, inode)?;
+            let removed = tree.remove_and_decref(inode, &mut mark_table, inode)?;
             if removed && old_mark != resolve_mark(&mark_table, &tree, inode)? {
                 let file_table = txn.file_table()?;
                 mark_dirty_recursive(&txn, &tree, &file_table, inode, &self.dirty_paths)?;
@@ -1495,45 +1497,43 @@ fn add_dir_entry(
     name: &str,
     assignment: InodeAssignment,
 ) -> Result<Inode, StorageError> {
-    let (new_inode, created) = tree.insert_if_not_found(
-        parent_inode,
-        name,
-        dir_table,
-        |_| (parent_inode, name),
-        |inode| Holder::with_content(DirTableEntry::Regular(ReadDirEntry { inode, assignment })),
-        |_, v| {
-            if let DirTableEntry::Regular(e) = v.value().parse()? {
-                if e.assignment != assignment {
-                    return Err(match assignment {
-                        InodeAssignment::Directory => StorageError::NotADirectory,
-                        InodeAssignment::File => StorageError::IsADirectory,
-                    });
-                }
-            } else {
-                return Err(StorageError::InconsistentDatabase(format!(
-                    "expected regular entry for ({parent_inode}, {name:?}) in dir_table"
-                )));
+    let inode = tree.setup_name(parent_inode, name)?;
+    let key = (parent_inode, name);
+    if let Some(v) = dir_table.get(key)? {
+        if let DirTableEntry::Regular(e) = v.value().parse()? {
+            if e.assignment != assignment {
+                return Err(match assignment {
+                    InodeAssignment::Directory => StorageError::NotADirectory,
+                    InodeAssignment::File => StorageError::IsADirectory,
+                });
             }
-
-            Ok(())
-        },
-    )?;
-    if created {
-        log::debug!("new dir entry {parent_inode} {name} -> {new_inode} {assignment:?}");
+        } else {
+            return Err(StorageError::InconsistentDatabase(format!(
+                "expected regular entry for ({parent_inode}, {name:?}) in dir_table"
+            )));
+        }
+    } else {
+        tree.insert_and_incref(
+            inode,
+            dir_table,
+            key,
+            Holder::with_content(DirTableEntry::Regular(ReadDirEntry { inode, assignment }))?,
+        )?;
+        log::debug!("new dir entry {parent_inode} {name} -> {inode} {assignment:?}");
 
         let mtime = UnixTime::now();
         let dot = Holder::with_content(DirTableEntry::Dot(mtime))?;
         dir_table.insert((parent_inode, "."), dot.clone())?;
         if assignment == InodeAssignment::Directory {
-            dir_table.insert((new_inode, "."), dot.clone())?;
+            dir_table.insert((inode, "."), dot.clone())?;
             dir_table.insert(
-                (new_inode, ".."),
+                (inode, ".."),
                 Holder::with_content(DirTableEntry::DotDot(parent_inode))?,
             )?;
         }
     }
 
-    Ok(new_inode)
+    Ok(inode)
 }
 
 fn do_mark_peer_files(txn: &ArenaWriteTransaction, peer: Peer) -> Result<(), StorageError> {
