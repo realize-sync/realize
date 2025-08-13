@@ -97,7 +97,17 @@ impl ArenaCache {
         name: &str,
     ) -> Result<(Inode, InodeAssignment), StorageError> {
         let txn = self.db.begin_read()?;
-        do_lookup(&txn.dir_table()?, parent_inode, name)
+        let tree = txn.read_tree(&self.tree)?;
+        let dir_table = txn.dir_table()?;
+        let file_table = txn.file_table()?;
+        check_is_dir(&dir_table, &file_table, parent_inode)?;
+        if let Some(inode) = tree.lookup(parent_inode, name)? {
+            if let Some(assignment) = inode_assignment(&dir_table, &file_table, inode)? {
+                return Ok((inode, assignment));
+            }
+        }
+
+        Err(StorageError::NotFound)
     }
 
     pub(crate) fn expect<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<Inode, StorageError> {
@@ -139,8 +149,22 @@ impl ArenaCache {
         inode: Inode,
     ) -> Result<Vec<(String, Inode, InodeAssignment)>, StorageError> {
         let txn = self.db.begin_read()?;
+        let tree = txn.read_tree(&self.tree)?;
+        let dir_table = txn.dir_table()?;
+        let file_table = txn.file_table()?;
+        check_is_dir(&dir_table, &file_table, inode)?;
 
-        do_readdir(&txn.dir_table()?, inode)
+        // A Vec is not ideal, but redb iterators are bound to the
+        // transaction; we must collect the results.
+        let mut entries = vec![];
+        for entry in tree.readdir(inode) {
+            let (name, inode) = entry?;
+            if let Some(assignment) = inode_assignment(&dir_table, &file_table, inode)? {
+                entries.push((name, inode, assignment));
+            }
+        }
+
+        Ok(entries)
     }
 
     pub(crate) fn peer_progress(&self, peer: Peer) -> Result<Option<Progress>, StorageError> {
@@ -476,7 +500,7 @@ impl ArenaCache {
         if let Some(e) = get_file_entry(&txn.file_table()?, inode, None)? {
             return Ok(e);
         }
-        if txn.dir_table()?.get((inode, "."))?.is_some() {
+        if is_dir_in_cache(&txn.dir_table()?, inode)? {
             return Err(StorageError::IsADirectory);
         }
 
@@ -1301,42 +1325,6 @@ fn mark_dirty_recursive(
     Ok(())
 }
 
-fn do_readdir(
-    dir_table: &impl ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
-    inode: Inode,
-) -> Result<Vec<(String, Inode, InodeAssignment)>, StorageError> {
-    // This is not ideal, but redb iterators are bound to the transaction.
-    // We must collect the results.
-    let mut entries = Vec::new();
-
-    // The range will go from (inode, "") up to the next inode.
-    for item in dir_table.range((inode, "")..)? {
-        let (key, value) = item?;
-        if key.value().0 != inode {
-            break;
-        }
-        let name = key.value().1.to_string();
-        if let DirTableEntry::Regular(entry) = value.value().parse()? {
-            entries.push((name, entry.inode, entry.assignment));
-        }
-    }
-
-    Ok(entries)
-}
-
-fn do_lookup(
-    dir_table: &impl ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
-    parent_inode: Inode,
-    name: &str,
-) -> Result<(Inode, InodeAssignment), StorageError> {
-    Ok(dir_table
-        .get((parent_inode, name))?
-        .ok_or(StorageError::NotFound)?
-        .value()
-        .parse()?
-        .into_readdir_entry(parent_inode))
-}
-
 fn do_update_last_seen_notification(
     txn: &ArenaWriteTransaction,
     peer: Peer,
@@ -1621,6 +1609,50 @@ fn replaces_local_copy(entry: &FileTableEntry, old_hash: &Hash) -> bool {
             .as_ref()
             .map(|h| *h == *old_hash)
             .unwrap_or(false)
+}
+
+/// Check whether the given inode exists in the cache and whether it
+/// is a file or a directory.
+fn inode_assignment(
+    dir_table: &impl ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
+    file_table: &impl ReadableTable<FileTableKey, Holder<'static, FileTableEntry>>,
+    inode: Inode,
+) -> Result<Option<InodeAssignment>, StorageError> {
+    if is_file_in_cache(file_table, inode)? {
+        return Ok(Some(InodeAssignment::File));
+    }
+    if is_dir_in_cache(dir_table, inode)? {
+        return Ok(Some(InodeAssignment::Directory));
+    }
+
+    return Ok(None);
+}
+
+fn is_dir_in_cache(
+    dir_table: &impl ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
+    inode: Inode,
+) -> Result<bool, StorageError> {
+    Ok(dir_table.get((inode, "."))?.is_some())
+}
+
+fn is_file_in_cache(
+    file_table: &impl redb::ReadableTable<FileTableKey, Holder<'static, FileTableEntry>>,
+    inode: Inode,
+) -> Result<bool, StorageError> {
+    Ok(file_table.get(FileTableKey::Default(inode))?.is_some())
+}
+
+/// Make sure the given inode exists and is a directory.
+fn check_is_dir(
+    dir_table: &impl ReadableTable<(Inode, &'static str), Holder<'static, DirTableEntry>>,
+    file_table: &impl ReadableTable<FileTableKey, Holder<'static, FileTableEntry>>,
+    inode: Inode,
+) -> Result<(), StorageError> {
+    match inode_assignment(dir_table, file_table, inode)? {
+        None => Err(StorageError::NotFound),
+        Some(InodeAssignment::File) => Err(StorageError::NotADirectory),
+        Some(InodeAssignment::Directory) => Ok(()), // continue
+    }
 }
 
 #[cfg(test)]

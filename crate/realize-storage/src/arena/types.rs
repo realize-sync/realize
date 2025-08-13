@@ -787,15 +787,6 @@ pub enum DirTableEntry {
     Dot(UnixTime),
     DotDot(Inode),
 }
-impl DirTableEntry {
-    pub fn into_readdir_entry(self, inode: Inode) -> (Inode, InodeAssignment) {
-        match self {
-            DirTableEntry::Regular(e) => (e.inode, e.assignment),
-            DirTableEntry::Dot(_) => (inode, InodeAssignment::Directory),
-            DirTableEntry::DotDot(parent_inode) => (parent_inode, InodeAssignment::Directory),
-        }
-    }
-}
 
 impl NamedType for DirTableEntry {
     fn typename() -> &'static str {
