@@ -549,12 +549,7 @@ impl<'a> WritableOpenTree<'a> {
                 // Check refcount and delete the entry if it reaches
                 // 0. Note that the allocated inode is lost, so it's
                 // not a no-op.
-                decref(
-                    &mut txn.tree_refcount_table()?,
-                    &mut txn.tree_table()?,
-                    inode,
-                    0,
-                )
+                check_refcount(txn, inode)
             });
         }
         Ok(inode)
@@ -578,12 +573,7 @@ impl<'a> WritableOpenTree<'a> {
                 // Check refcount and delete the entry if it reaches
                 // 0. Note that the allocated inode is lost, so it's
                 // not a no-op.
-                decref(
-                    &mut txn.tree_refcount_table()?,
-                    &mut txn.tree_table()?,
-                    inode,
-                    0,
-                )
+                check_refcount(txn, inode)
             });
         }
         Ok(inode)
@@ -639,6 +629,10 @@ impl<'a> WritableOpenTree<'a> {
             .get(inode)?
             .map(|v| v.value())
             .unwrap_or(0);
+        if refcount == 0 {
+            log::debug!("Inode {inode} got its first reference");
+        }
+
         refcount += 1;
         self.refcount_table.insert(inode, refcount)?;
 
@@ -651,7 +645,7 @@ impl<'a> WritableOpenTree<'a> {
     /// class. Incrementing a reference should be tied to insertion in
     /// another table and removing to removal from another table.
     pub(crate) fn decref(&mut self, inode: Inode) -> Result<(), StorageError> {
-        decref(&mut self.refcount_table, &mut self.table, inode, 1)
+        decref(&mut self.refcount_table, &mut self.table, inode)
     }
 
     fn allocate_inode(&mut self) -> Result<Inode, StorageError> {
@@ -675,30 +669,49 @@ impl<'a> WritableOpenTree<'a> {
     }
 }
 
+fn check_refcount(txn: &ArenaWriteTransaction, inode: Inode) -> Result<(), StorageError> {
+    let mut refcount_table = txn.tree_refcount_table()?;
+    let refcount = refcount_table.get(inode)?.map(|v| v.value()).unwrap_or(0);
+    if refcount == 0 {
+        log::warn!("Refcount of {inode} was never increased; cleaning up.");
+        remove_mapping(&mut refcount_table, &mut txn.tree_table()?, inode)?;
+    }
+
+    Ok(())
+}
+
 /// Decrement reference count of `inode` by `decref`. If counter
 /// reaches 0, mapping for this inode is deleted.
 fn decref(
     refcount_table: &mut Table<'_, Inode, u32>,
     tree_table: &mut Table<'_, (Inode, &'static str), Inode>,
     inode: Inode,
-    decval: u32,
 ) -> Result<(), StorageError> {
     let mut refcount = refcount_table.get(inode)?.map(|v| v.value()).unwrap_or(0);
-    if decval > 0 {
-        refcount = refcount.saturating_sub(decval);
-    }
+    refcount = refcount.saturating_sub(1);
 
-    if refcount > 0 && decval > 0 {
+    if refcount > 0 {
         refcount_table.insert(inode, refcount)?;
+    } else {
+        remove_mapping(refcount_table, tree_table, inode)?;
     }
 
-    if refcount == 0 {
-        refcount_table.remove(inode)?;
-        let parent = tree_table.remove((inode, ".."))?.map(|v| v.value());
-        if let Some(parent) = parent {
-            tree_table.retain_in(inode_range(parent), |_, v| v != inode)?;
-            decref(refcount_table, tree_table, parent, 1)?;
-        }
+    Ok(())
+}
+
+/// Remove mapping of `inode` from its parent.
+///
+/// This must only be called after checking the inode refcount.
+fn remove_mapping(
+    refcount_table: &mut Table<'_, Inode, u32>,
+    tree_table: &mut Table<'_, (Inode, &'static str), Inode>,
+    inode: Inode,
+) -> Result<(), StorageError> {
+    refcount_table.remove(inode)?;
+    let parent = tree_table.remove((inode, ".."))?.map(|v| v.value());
+    if let Some(parent) = parent {
+        tree_table.retain_in(inode_range(parent), |_, v| v != inode)?;
+        decref(refcount_table, tree_table, parent)?;
     }
 
     Ok(())
