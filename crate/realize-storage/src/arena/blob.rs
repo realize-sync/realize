@@ -69,7 +69,7 @@ impl Blobstore {
     ) -> Result<Blob, StorageError> {
         let blob_table = txn.blob_table()?;
         let blob_entry = get_blob_entry(&blob_table, blob_id)?;
-        let file = self.open_blob_file(blob_id, file_entry.metadata.size, false)?;
+        let file = self.open_blob_file(blob_id, file_entry.size, false)?;
 
         return Ok(Blob::new(
             blob_id,
@@ -90,11 +90,11 @@ impl Blobstore {
         let mut blob_table = txn.blob_table()?;
         let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
         let mut blob_next_id_table = txn.blob_next_id_table()?;
-        let blob_id = match file_entry.content.blob {
+        let blob_id = match file_entry.blob {
             Some(blob_id) => blob_id,
             None => alloc_blob_id(&mut blob_next_id_table)?,
         };
-        let file = self.open_blob_file(blob_id, file_entry.metadata.size, true)?;
+        let file = self.open_blob_file(blob_id, file_entry.size, true)?;
         let blob_entry = init_blob_entry(
             &mut blob_lru_queue_table,
             &mut blob_table,
@@ -506,7 +506,7 @@ pub(crate) fn local_availability(
     txn: &ArenaReadTransaction,
     file_entry: &FileTableEntry,
 ) -> Result<LocalAvailability, StorageError> {
-    match file_entry.content.blob {
+    match file_entry.blob {
         None => Ok(LocalAvailability::Missing),
         Some(blob_id) => {
             let blob_table = txn.blob_table()?;
@@ -519,10 +519,10 @@ pub(crate) fn local_availability(
                     return Err(err);
                 }
             };
-            let file_range = ByteRanges::single(0, file_entry.metadata.size);
+            let file_range = ByteRanges::single(0, file_entry.size);
             if file_range == file_range.intersection(&blob_entry.written_areas) {
                 if let Some(content_hash) = &blob_entry.content_hash
-                    && file_entry.content.hash == *content_hash
+                    && file_entry.hash == *content_hash
                 {
                     return Ok(LocalAvailability::Verified);
                 }
@@ -533,7 +533,7 @@ pub(crate) fn local_availability(
             }
 
             Ok(LocalAvailability::Partial(
-                file_entry.metadata.size,
+                file_entry.size,
                 blob_entry.written_areas,
             ))
         }
@@ -687,8 +687,8 @@ impl Blob {
             available_ranges: blob_entry.written_areas,
             blobstore,
             pending_ranges: ByteRanges::new(),
-            size: file_entry.metadata.size,
-            hash: file_entry.content.hash,
+            size: file_entry.size,
+            hash: file_entry.hash,
             offset: 0,
         }
     }

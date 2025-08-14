@@ -588,29 +588,29 @@ impl Engine {
                 if let (Ok(cached), Ok(Some(indexed))) = (
                     self.cache.get_file_entry_for_path(txn, &path),
                     self.get_indexed_file(txn, &path),
-                ) && cached.content.hash == indexed.hash
+                ) && cached.hash == indexed.hash
                 {
                     return Ok(Some((
                         JobId(counter),
-                        StorageJob::Unrealize(path, cached.content.hash),
+                        StorageJob::Unrealize(path, cached.hash),
                     )));
                 }
             }
             Ok(Mark::Keep) => {
                 if let Ok(cached) = self.cache.get_file_entry_for_path(txn, &path) {
                     if let Ok(Some(indexed)) = self.get_indexed_file(txn, &path)
-                        && cached.content.hash == indexed.hash
+                        && cached.hash == indexed.hash
                     {
                         return Ok(Some((
                             JobId(counter),
-                            StorageJob::Unrealize(path, cached.content.hash),
+                            StorageJob::Unrealize(path, cached.hash),
                         )));
                     }
 
                     if blob::local_availability(txn, &cached)? != LocalAvailability::Verified {
                         return Ok(Some((
                             JobId(counter),
-                            StorageJob::External(Job::Download(path, cached.content.hash)),
+                            StorageJob::External(Job::Download(path, cached.hash)),
                         )));
                     }
                 }
@@ -623,21 +623,21 @@ impl Engine {
                         // File is missing from the index, move it there.
                         return Ok(Some((
                             JobId(counter),
-                            StorageJob::External(Job::Realize(path, cached.content.hash, None)),
+                            StorageJob::External(Job::Realize(path, cached.hash, None)),
                         )));
                     }
                     if let Some(indexed) = from_index
                         && indexed
                             .outdated_by
                             .as_ref()
-                            .map(|h| *h == cached.content.hash)
+                            .map(|h| *h == cached.hash)
                             .unwrap_or(false)
                     {
                         return Ok(Some((
                             JobId(counter),
                             StorageJob::External(Job::Realize(
                                 path,
-                                cached.content.hash,
+                                cached.hash,
                                 Some(indexed.hash),
                             )),
                         )));

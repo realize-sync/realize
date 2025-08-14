@@ -246,9 +246,9 @@ pub struct IndexedFileTableEntry {
 impl From<FileTableEntry> for IndexedFileTableEntry {
     fn from(value: FileTableEntry) -> Self {
         IndexedFileTableEntry {
-            hash: value.content.hash,
-            mtime: value.metadata.mtime,
-            size: value.metadata.size,
+            hash: value.hash,
+            mtime: value.mtime,
+            size: value.size,
             outdated_by: value.outdated_by,
         }
     }
@@ -256,9 +256,9 @@ impl From<FileTableEntry> for IndexedFileTableEntry {
 impl From<&FileTableEntry> for IndexedFileTableEntry {
     fn from(value: &FileTableEntry) -> Self {
         IndexedFileTableEntry {
-            hash: value.content.hash.clone(),
-            mtime: value.metadata.mtime,
-            size: value.metadata.size,
+            hash: value.hash.clone(),
+            mtime: value.mtime,
+            size: value.size,
             outdated_by: value.outdated_by.clone(),
         }
     }
@@ -647,11 +647,16 @@ impl Key for FileTableKey {
 /// An entry in the file table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileTableEntry {
-    /// The metadata of the file.
-    pub metadata: FileMetadata,
-    /// How the file can be fetched from the peer.
-    pub content: FileContent,
-
+    /// The size of the file in bytes.
+    pub size: u64,
+    /// The modification time of the file.
+    pub mtime: UnixTime,
+    /// The path to use to fetch file content in the peer.
+    pub path: Path,
+    /// Hash of the specific version of the content the peer has.
+    pub hash: Hash,
+    /// ID of a locally-available blob containing this version.
+    pub blob: Option<BlobId>,
     // If set, a version is known to exist that replaces the version
     // in this entry.
     pub outdated_by: Option<Hash>,
@@ -660,40 +665,13 @@ pub struct FileTableEntry {
 impl FileTableEntry {
     pub fn new(path: Path, size: u64, mtime: UnixTime, hash: Hash) -> Self {
         Self {
-            metadata: FileMetadata { size, mtime: mtime },
-            content: FileContent {
-                path,
-                hash,
-                blob: None,
-            },
+            size,
+            mtime,
+            path,
+            hash,
+            blob: None,
             outdated_by: None,
         }
-    }
-}
-
-/// Information needed to fetch a file from a remote peer.
-#[derive(Clone, PartialEq)]
-pub struct FileContent {
-    /// The path to use to fetch file content in the peer.
-    ///
-    /// Note that it shouldn't matter whether the path
-    /// here matches the path which led to this file. This
-    /// is to be treated as a key for downloading and nothing else..
-    ///
-    /// This is stored here as a key to fetch file content,
-    /// to be replaced by a blob id.
-    pub path: realize_types::Path,
-
-    /// Hash of the specific version of the content the peer has.
-    pub hash: realize_types::Hash,
-
-    /// ID of a locally-available blob containing this version.
-    pub blob: Option<BlobId>,
-}
-
-impl std::fmt::Debug for FileContent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} {}", self.path, self.hash)
     }
 }
 
@@ -709,10 +687,8 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
         let msg: cache_capnp::file_table_entry::Reader =
             message_reader.get_root::<cache_capnp::file_table_entry::Reader>()?;
 
-        let content = msg.get_content()?;
-        let metadata = msg.get_metadata()?;
-        let mtime = metadata.get_mtime()?;
-        let blob: Option<BlobId> = BlobId::as_optional(content.get_blob());
+        let mtime = msg.get_mtime()?;
+        let blob: Option<BlobId> = BlobId::as_optional(msg.get_blob());
         let outdated_by: &[u8] = msg.get_outdated_by()?;
         let outdated_by = if outdated_by.is_empty() {
             None
@@ -720,15 +696,11 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
             Some(parse_hash(outdated_by)?)
         };
         Ok(FileTableEntry {
-            metadata: FileMetadata {
-                size: metadata.get_size(),
-                mtime: UnixTime::new(mtime.get_secs(), mtime.get_nsecs()),
-            },
-            content: FileContent {
-                path: Path::parse(content.get_path()?.to_str()?)?,
-                hash: parse_hash(content.get_hash()?)?,
-                blob,
-            },
+            size: msg.get_size(),
+            mtime: UnixTime::new(mtime.get_secs(), mtime.get_nsecs()),
+            path: Path::parse(msg.get_path()?.to_str()?)?,
+            hash: parse_hash(msg.get_hash()?)?,
+            blob,
             outdated_by,
         })
     }
@@ -738,22 +710,19 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
         let mut builder: cache_capnp::file_table_entry::Builder =
             message.init_root::<cache_capnp::file_table_entry::Builder>();
 
-        let mut content = builder.reborrow().init_content();
-        content.set_path(self.content.path.as_str());
-        content.set_hash(&self.content.hash.0);
-        if let Some(blob) = self.content.blob {
-            content.set_blob(blob.into());
+        builder.set_size(self.size);
+        let mut mtime = builder.reborrow().init_mtime();
+        mtime.set_secs(self.mtime.as_secs());
+        mtime.set_nsecs(self.mtime.subsec_nanos());
+        builder.set_path(self.path.as_str());
+        builder.set_hash(&self.hash.0);
+        if let Some(blob) = self.blob {
+            builder.set_blob(blob.into());
         }
 
         if let Some(hash) = &self.outdated_by {
             builder.set_outdated_by(&hash.0)
         }
-
-        let mut metadata = builder.init_metadata();
-        metadata.set_size(self.metadata.size);
-        let mut mtime = metadata.init_mtime();
-        mtime.set_secs(self.metadata.mtime.as_secs());
-        mtime.set_nsecs(self.metadata.mtime.subsec_nanos());
 
         let mut buffer: Vec<u8> = Vec::new();
         serialize_packed::write_message(&mut buffer, &message)?;
@@ -1034,15 +1003,11 @@ mod tests {
     #[test]
     fn convert_file_table_entry() -> anyhow::Result<()> {
         let entry = FileTableEntry {
-            content: FileContent {
-                path: Path::parse("foo/bar.txt")?,
-                hash: Hash([0xa1u8; 32]),
-                blob: None,
-            },
-            metadata: FileMetadata {
-                size: 200,
-                mtime: UnixTime::from_secs(1234567890),
-            },
+            size: 200,
+            mtime: UnixTime::from_secs(1234567890),
+            path: Path::parse("foo/bar.txt")?,
+            hash: Hash([0xa1u8; 32]),
+            blob: None,
             outdated_by: Some(Hash([3u8; 32])),
         };
 
@@ -1057,15 +1022,11 @@ mod tests {
     #[test]
     fn convert_file_table_entry_with_blob() -> anyhow::Result<()> {
         let entry = FileTableEntry {
-            content: FileContent {
-                path: Path::parse("foo/bar.txt")?,
-                hash: Hash([0xa1u8; 32]),
-                blob: Some(BlobId(5541)),
-            },
-            metadata: FileMetadata {
-                size: 200,
-                mtime: UnixTime::from_secs(1234567890),
-            },
+            size: 200,
+            mtime: UnixTime::from_secs(1234567890),
+            path: Path::parse("foo/bar.txt")?,
+            hash: Hash([0xa1u8; 32]),
+            blob: Some(BlobId(5541)),
             outdated_by: None,
         };
 
@@ -1123,8 +1084,6 @@ mod tests {
 
         Ok(())
     }
-
-
 
     #[test]
     fn convert_file_table_key_peer_copy() -> anyhow::Result<()> {
@@ -1294,8 +1253,6 @@ mod tests {
         // with big endian encoding.
         assert_eq!(bytes.len(), 8);
         assert_eq!(bytes, [0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x21, 0xa3]);
-
-
 
         let key = FileTableKey::PeerCopy(Inode(11111), Peer::from("test"));
         let bytes = FileTableKey::as_bytes(&key);

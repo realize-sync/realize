@@ -26,22 +26,13 @@ enum InodeAssignment {
 
 # An entry in the file table.
 struct FileTableEntry {
-  metadata @0: FileMetadata;
-  content @1: FileContent;
-
-  # may be empty
-  outdatedBy @2: Data;
-}
-
-struct FileContent {
-  path @0: Text;
-  hash @1: Data;
-  blob @2: UInt64;
-}
-
-struct FileMetadata {
   size @0: UInt64;
   mtime @1: Time;
+  path @2: Text;
+  hash @3: Data;
+  blob @4: UInt64;
+  # may be empty
+  outdatedBy @5: Data;
 }
 
 struct PeerTableEntry {

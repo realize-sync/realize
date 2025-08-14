@@ -6,9 +6,8 @@ use super::tree::{
     OpenTree, OpenTreeWrite, Tree, TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree,
 };
 use super::types::{
-    DirTableEntry, FileAvailability, FileContent, FileMetadata, FileTableEntry, FileTableKey,
-    HistoryTableEntry, IndexedFileTableEntry, LocalAvailability, LruQueueId, MarkTableEntry,
-    PeerTableEntry,
+    DirTableEntry, FileAvailability, FileMetadata, FileTableEntry, FileTableKey, HistoryTableEntry,
+    IndexedFileTableEntry, LocalAvailability, LruQueueId, MarkTableEntry, PeerTableEntry,
 };
 use crate::arena::engine::DirtyPaths;
 use crate::arena::notifier::{Notification, Progress};
@@ -234,14 +233,14 @@ impl ArenaCache {
 
                 // replace peer
                 if let Some(e) = get_file_entry(&cache_table, file_inode, Some(peer))?
-                    && e.content.hash == old_hash
+                    && e.hash == old_hash
                 {
                     self.do_write_file_entry(&mut cache_table, file_inode, peer, &entry)?;
                 }
 
                 // replace default
                 if let Some(old_entry) = get_file_entry(&cache_table, file_inode, None)?
-                    && old_entry.content.hash == old_hash
+                    && old_entry.hash == old_hash
                 {
                     self.do_write_default_file_entry(
                         &txn,
@@ -331,9 +330,9 @@ impl ArenaCache {
                 // catchup peer; remove the older version and write a
                 // new one
                 if let Some(e) = get_file_entry(&cache_table, file_inode, None)?
-                    && e.content.hash != hash
+                    && e.hash != hash
                 {
-                    self.do_unlink(&txn, peer, &path, e.content.hash)?;
+                    self.do_unlink(&txn, peer, &path, e.hash)?;
                 }
                 self.do_write_file_entry(&mut cache_table, file_inode, peer, &entry)?;
 
@@ -378,7 +377,7 @@ impl ArenaCache {
         {
             let txn = self.db.begin_read()?;
             let file_entry = get_default_entry(&txn.cache_table()?, inode)?;
-            if let Some(blob_id) = file_entry.content.blob
+            if let Some(blob_id) = file_entry.blob
                 && blob::blob_exists(&txn, blob_id)?
             {
                 // Delegate to Blobstore
@@ -402,7 +401,7 @@ impl ArenaCache {
                 self.arena,
                 blob.id()
             );
-            file_entry.content.blob = Some(blob.id());
+            file_entry.blob = Some(blob.id());
             cache_table.insert(FileTableKey::Default(inode), Holder::new(&file_entry)?)?;
 
             blob
@@ -434,10 +433,10 @@ impl ArenaCache {
         let inode = tree.expect(path)?;
         let mut cache_table = txn.cache_table()?;
         let mut file_entry = get_default_entry(&cache_table, inode)?;
-        if file_entry.content.hash != *hash {
+        if file_entry.hash != *hash {
             return Ok(false);
         }
-        let blob_id = match file_entry.content.blob {
+        let blob_id = match file_entry.blob {
             None => {
                 return Err(StorageError::NotFound);
             }
@@ -451,7 +450,7 @@ impl ArenaCache {
             return Ok(false);
         }
 
-        file_entry.content.blob = None;
+        file_entry.blob = None;
         cache_table.insert(
             FileTableKey::Default(inode),
             Holder::with_content(file_entry)?,
@@ -494,17 +493,17 @@ impl ArenaCache {
                 return Err(err);
             }
         };
-        if file_entry.content.hash != *hash || file_entry.metadata.size != metadata.len() {
+        if file_entry.hash != *hash || file_entry.size != metadata.len() {
             return Ok(None);
         }
         let mark_table = txn.mark_table()?;
         let (blob_id, cachepath) = self.blobstore.move_into_blob(
             &txn,
-            file_entry.content.blob,
+            file_entry.blob,
             queue_for_inode(&mark_table, &tree, inode)?,
             metadata,
         )?;
-        file_entry.content.blob = Some(blob_id);
+        file_entry.blob = Some(blob_id);
         cache_table.insert(
             FileTableKey::Default(inode),
             Holder::with_content(file_entry)?,
@@ -547,8 +546,8 @@ impl ArenaCache {
         log::debug!(
             "[{}] new file entry {:?} {file_inode} on {peer} {}",
             self.arena,
-            entry.content.path,
-            entry.content.hash
+            entry.path,
+            entry.hash
         );
 
         cache_table.insert(
@@ -568,7 +567,7 @@ impl ArenaCache {
         path: &Path,
     ) -> Result<(), StorageError> {
         if let Some(old_entry) = old_entry {
-            if let Some(blob_id) = old_entry.content.blob {
+            if let Some(blob_id) = old_entry.blob {
                 self.blobstore.delete_blob(&txn, blob_id)?;
             }
         }
@@ -590,7 +589,7 @@ impl ArenaCache {
         old_entry: Option<&FileTableEntry>,
         new_entry: &FileTableEntry,
     ) -> Result<(), StorageError> {
-        self.before_default_file_entry_change(txn, old_entry, &new_entry.content.path)?;
+        self.before_default_file_entry_change(txn, old_entry, &new_entry.path)?;
         tree.insert_and_incref(
             file_inode,
             cache_table,
@@ -649,7 +648,7 @@ impl ArenaCache {
 
         if peer_entries
             .iter()
-            .find(|e| e.content.hash == default_entry.content.hash)
+            .find(|e| e.hash == default_entry.hash)
             .is_some()
         {
             // The default entry is still valid
@@ -658,7 +657,7 @@ impl ArenaCache {
 
         // Select a new hash. This selects the most recent one; since
         // version history is lost there's very little else we can do.
-        let new_entry = peer_entries.into_iter().max_by_key(|e| e.metadata.mtime);
+        let new_entry = peer_entries.into_iter().max_by_key(|e| e.mtime);
         match new_entry {
             Some(new_entry) => {
                 self.do_write_default_file_entry(
@@ -674,7 +673,7 @@ impl ArenaCache {
                 self.before_default_file_entry_change(
                     txn,
                     Some(&default_entry),
-                    &default_entry.content.path,
+                    &default_entry.path,
                 )?;
                 tree.remove_and_decref(inode, cache_table, FileTableKey::Default(inode))?;
 
@@ -717,7 +716,7 @@ impl ArenaCache {
                 let mut dir_table = txn.dir_table()?;
 
                 if let Some(e) = get_file_entry(&cache_table, inode, Some(peer))?
-                    && e.content.hash == old_hash
+                    && e.hash == old_hash
                 {
                     self.do_rm_file_entry(
                         txn,
@@ -829,7 +828,7 @@ impl ArenaCache {
                     .flatten()
                     .map(|e| e.value().parse().ok())
                     .flatten()
-                    .map(|e| e.content.hash)
+                    .map(|e| e.hash)
             })
             .flatten();
         let same_hash = old_hash.as_ref().map(|h| *h == hash).unwrap_or(false);
@@ -888,10 +887,7 @@ impl ArenaCache {
         history_table: &mut Table<'_, u64, Holder<'static, HistoryTableEntry>>,
         inode: Inode,
     ) -> Result<(), StorageError> {
-        let FileTableEntry {
-            content: FileContent { path, hash, .. },
-            ..
-        } = match index_table.get(inode)? {
+        let FileTableEntry { path, hash, .. } = match index_table.get(inode)? {
             None => {
                 // Nothing to do
                 return Ok(());
@@ -918,10 +914,7 @@ impl ArenaCache {
             index_table,
             |inode| Ok(inode),
             |_, e| {
-                let FileTableEntry {
-                    content: FileContent { path, hash, .. },
-                    ..
-                } = e.parse()?;
+                let FileTableEntry { path, hash, .. } = e.parse()?;
                 self.report_removed(txn, history_table, path, hash)?;
 
                 Ok(true)
@@ -1127,7 +1120,7 @@ impl RealIndex for ArenaCache {
             // Skip any entry with errors
             .flat_map(|(_, v)| {
                 if let Ok(entry) = v.value().parse() {
-                    let file_path = entry.content.path.clone();
+                    let file_path = entry.path.clone();
                     return Some((file_path, IndexedFileTableEntry::from(entry)));
                 }
 
@@ -1371,7 +1364,7 @@ fn mark_dirty_recursive(
     for inode in std::iter::once(Ok(inode)).chain(tree.recurse(inode, |_| true)) {
         let inode = inode?;
         if let Some(entry) = index_table.get(inode)? {
-            let path = &entry.value().parse()?.content.path;
+            let path = &entry.value().parse()?.path;
             dirty_paths.mark_dirty(txn, path)?;
             continue;
         }
@@ -1379,7 +1372,7 @@ fn mark_dirty_recursive(
             let entry = entry?;
             match entry.0.value() {
                 FileTableKey::Default(_) => {
-                    let path = &entry.1.value().parse()?.content.path;
+                    let path = &entry.1.value().parse()?.path;
                     dirty_paths.mark_dirty(txn, path)?;
                     break;
                 }
@@ -1474,7 +1467,11 @@ fn do_file_metadata(
     txn: &ArenaReadTransaction,
     inode: Inode,
 ) -> Result<FileMetadata, StorageError> {
-    Ok(get_default_entry(&txn.cache_table()?, inode)?.metadata)
+    let entry = get_default_entry(&txn.cache_table()?, inode)?;
+    Ok(FileMetadata {
+        size: entry.size,
+        mtime: entry.mtime,
+    })
 }
 
 fn do_file_availability(
@@ -1490,8 +1487,10 @@ fn do_file_availability(
         return Err(StorageError::NotFound);
     }
     let FileTableEntry {
-        metadata,
-        content: FileContent { path, hash, .. },
+        size,
+        mtime,
+        path,
+        hash,
         ..
     } = default_entry.value().parse()?;
 
@@ -1500,7 +1499,7 @@ fn do_file_availability(
         let entry = entry?;
         if let FileTableKey::PeerCopy(_, peer) = entry.0.value() {
             let file_entry: FileTableEntry = entry.1.value().parse()?;
-            if file_entry.content.hash == hash {
+            if file_entry.hash == hash {
                 peers.push(peer);
             }
         }
@@ -1513,7 +1512,7 @@ fn do_file_availability(
     Ok(FileAvailability {
         arena: arena,
         path,
-        metadata,
+        metadata: FileMetadata { size, mtime },
         hash,
         peers,
     })
@@ -1629,7 +1628,7 @@ fn file_matches_index(
 
 /// Check whether replacing `old_hash` replaces `entry`
 fn replaces_local_copy(entry: &FileTableEntry, old_hash: &Hash) -> bool {
-    entry.content.hash == *old_hash
+    entry.hash == *old_hash
         || entry
             .outdated_by
             .as_ref()
