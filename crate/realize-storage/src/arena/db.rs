@@ -1,3 +1,4 @@
+use super::tree::{ReadableOpenTree, Tree, TreeReadOperations, WritableOpenTree};
 use super::types::CacheTableKey;
 use super::types::{
     BlobTableEntry, CacheTableEntry, FailedJobTableEntry, FileTableEntry, HistoryTableEntry,
@@ -156,10 +157,34 @@ const FAILED_JOB_TABLE: TableDefinition<u64, Holder<FailedJobTableEntry>> =
 
 pub(crate) struct ArenaDatabase {
     db: redb::Database,
+    tree: Tree,
 }
 
 impl ArenaDatabase {
-    pub fn new(db: redb::Database) -> Result<Arc<Self>, StorageError> {
+    #[cfg(test)]
+    pub fn for_testing_single_arena(arena: realize_types::Arena) -> anyhow::Result<Arc<Self>> {
+        ArenaDatabase::for_testing(
+            arena,
+            crate::InodeAllocator::new(
+                crate::GlobalDatabase::new(crate::utils::redb_utils::in_memory()?)?,
+                [arena],
+            )?,
+        )
+    }
+
+    #[cfg(test)]
+    pub fn for_testing(
+        arena: realize_types::Arena,
+        allocator: Arc<crate::InodeAllocator>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let tree = Tree::new(arena, allocator)?;
+        Ok(ArenaDatabase::new(
+            crate::utils::redb_utils::in_memory()?,
+            tree,
+        )?)
+    }
+
+    pub fn new(db: redb::Database, tree: Tree) -> Result<Arc<Self>, StorageError> {
         let txn = db.begin_write()?;
         {
             // Create tables so they can safely be queried in read
@@ -185,26 +210,29 @@ impl ArenaDatabase {
         }
         txn.commit()?;
 
-        Ok(Arc::new(Self { db }))
+        Ok(Arc::new(Self { db, tree }))
     }
 
-    pub fn begin_write(&self) -> Result<ArenaWriteTransaction, StorageError> {
+    pub fn begin_write(&self) -> Result<ArenaWriteTransaction<'_>, StorageError> {
         Ok(ArenaWriteTransaction {
             inner: self.db.begin_write()?,
+            tree: &self.tree,
             before_commit: RefCell::new(vec![]),
             after_commit: RefCell::new(vec![]),
         })
     }
 
-    pub fn begin_read(&self) -> Result<ArenaReadTransaction, StorageError> {
+    pub fn begin_read(&self) -> Result<ArenaReadTransaction<'_>, StorageError> {
         Ok(ArenaReadTransaction {
             inner: self.db.begin_read()?,
+            tree: &self.tree,
         })
     }
 }
 
-pub struct ArenaWriteTransaction {
+pub struct ArenaWriteTransaction<'db> {
     inner: redb::WriteTransaction,
+    tree: &'db Tree,
 
     /// Callbacks to be run after the transaction is committed.
     ///
@@ -223,7 +251,7 @@ pub struct ArenaWriteTransaction {
     >,
 }
 
-impl ArenaWriteTransaction {
+impl<'db> ArenaWriteTransaction<'db> {
     /// Commit the changes.
     ///
     /// If the transaction is successfully committed, functions
@@ -274,16 +302,6 @@ impl ArenaWriteTransaction {
         Ok(self.inner.open_table(SETTIGS_TABLE)?)
     }
 
-    pub fn tree_table<'txn>(
-        &'txn self,
-    ) -> Result<Table<'txn, (Inode, &'static str), Inode>, StorageError> {
-        Ok(self.inner.open_table(TREE_TABLE)?)
-    }
-
-    pub fn tree_refcount_table<'txn>(&'txn self) -> Result<Table<'txn, Inode, u32>, StorageError> {
-        Ok(self.inner.open_table(TREE_REFCOUNT_TABLE)?)
-    }
-
     pub fn cache_table<'txn>(
         &'txn self,
     ) -> Result<Table<'txn, CacheTableKey, Holder<'static, CacheTableEntry>>, StorageError> {
@@ -312,12 +330,6 @@ impl ArenaWriteTransaction {
         &'txn self,
     ) -> Result<Table<'txn, &'static str, u64>, StorageError> {
         Ok(self.inner.open_table(NOTIFICATION_TABLE)?)
-    }
-
-    pub fn current_inode_range_table<'txn>(
-        &'txn self,
-    ) -> Result<Table<'txn, (), (Inode, Inode)>, StorageError> {
-        Ok(self.inner.open_table(CURRENT_INODE_RANGE_TABLE)?)
     }
 
     pub fn blob_table<'txn>(
@@ -361,21 +373,35 @@ impl ArenaWriteTransaction {
     ) -> Result<Table<'txn, u64, Holder<'static, FailedJobTableEntry>>, StorageError> {
         Ok(self.inner.open_table(FAILED_JOB_TABLE)?)
     }
+
+    pub(crate) fn read_tree(&self) -> Result<impl TreeReadOperations, StorageError> {
+        Ok(ReadableOpenTree::new(
+            self.inner.open_table(TREE_TABLE)?,
+            &self.tree,
+        ))
+    }
+
+    pub(crate) fn write_tree(&self) -> Result<WritableOpenTree<'_>, StorageError> {
+        Ok(WritableOpenTree::new(
+            &self,
+            self.inner.open_table(TREE_TABLE)?,
+            self.inner.open_table(TREE_REFCOUNT_TABLE)?,
+            self.inner.open_table(CURRENT_INODE_RANGE_TABLE)?,
+            &self.tree,
+        ))
+    }
 }
 
-pub struct ArenaReadTransaction {
+pub struct ArenaReadTransaction<'db> {
     inner: redb::ReadTransaction,
+    tree: &'db Tree,
 }
 
-impl ArenaReadTransaction {
+impl<'db> ArenaReadTransaction<'db> {
     pub fn history_table(
         &self,
     ) -> Result<ReadOnlyTable<u64, Holder<'static, HistoryTableEntry>>, StorageError> {
         Ok(self.inner.open_table(HISTORY_TABLE)?)
-    }
-
-    pub fn tree_table(&self) -> Result<ReadOnlyTable<(Inode, &'static str), Inode>, StorageError> {
-        Ok(self.inner.open_table(TREE_TABLE)?)
     }
 
     pub fn cache_table(
@@ -437,14 +463,20 @@ impl ArenaReadTransaction {
     ) -> Result<ReadOnlyTable<u64, Holder<'static, FailedJobTableEntry>>, StorageError> {
         Ok(self.inner.open_table(FAILED_JOB_TABLE)?)
     }
+
+    pub(crate) fn read_tree(&self) -> Result<impl TreeReadOperations, StorageError> {
+        Ok(ReadableOpenTree::new(
+            self.inner.open_table(TREE_TABLE)?,
+            &self.tree,
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use redb::ReadableTable;
-
     use super::*;
-    use crate::utils::redb_utils;
+    use realize_types::Arena;
+    use redb::ReadableTable;
 
     const TEST_TABLE: TableDefinition<&str, &str> = TableDefinition::new("test");
 
@@ -455,7 +487,8 @@ mod tests {
     impl Fixture {
         fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
-            let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
+
+            let db = ArenaDatabase::for_testing_single_arena(Arena::from("myarena"))?;
 
             Ok(Self { db })
         }
@@ -467,8 +500,8 @@ mod tests {
 
         // Make sure the tables can be opened in a read transaction.
         let txn = fixture.db.begin_read()?;
+        txn.read_tree()?;
         txn.history_table()?;
-        txn.tree_table()?;
         txn.cache_table()?;
         txn.peer_table()?;
         txn.notification_table()?;

@@ -712,12 +712,9 @@ mod tests {
     use std::time::Duration;
 
     use crate::arena::arena_cache::ArenaCache;
-    use crate::arena::db::ArenaDatabase;
-    use crate::arena::engine::DirtyPaths;
     use crate::arena::types::IndexedFileTableEntry;
     use crate::realize_types::Arena;
-    use crate::utils::{hash, redb_utils};
-    use crate::{GlobalDatabase, InodeAllocator};
+    use crate::utils::hash;
     use realize_types::Hash;
 
     use super::*;
@@ -741,19 +738,9 @@ mod tests {
             root.create_dir_all()?;
 
             let arena = Arena::from("test");
-            let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
-            let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-            let allocator =
-                InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
-            let index = ArenaCache::new(
-                arena,
-                allocator,
-                db,
-                &std::path::Path::new("/dev/null"),
-                dirty_paths,
-            )?
-            .as_index();
-            let index = RealIndexAsync::new(index);
+            let acache =
+                ArenaCache::for_testing_single_arena(arena, &std::path::Path::new("/dev/null"))?;
+            let index = RealIndexAsync::new(acache.as_index());
 
             Ok(Self {
                 root,

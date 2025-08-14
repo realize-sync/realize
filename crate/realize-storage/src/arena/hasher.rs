@@ -224,12 +224,7 @@ pub(crate) async fn hash_file<R: AsyncRead>(f: R) -> Result<Hash, std::io::Error
 
 #[cfg(test)]
 mod tests {
-    use crate::GlobalDatabase;
-    use crate::InodeAllocator;
     use crate::arena::arena_cache::ArenaCache;
-    use crate::arena::db::ArenaDatabase;
-    use crate::arena::engine::DirtyPaths;
-    use crate::utils::redb_utils;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_types::Arena;
@@ -248,19 +243,9 @@ mod tests {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
             let arena = Arena::from("myarena");
-            let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
-            let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-            let allocator =
-                InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
-            let index = ArenaCache::new(
-                arena,
-                allocator,
-                db,
-                &tempdir.path().join("blobs"),
-                dirty_paths,
-            )?
-            .as_index();
-            let index = RealIndexAsync::new(index);
+            let acache =
+                ArenaCache::for_testing_single_arena(arena, &tempdir.path().join("blobs"))?;
+            let index = RealIndexAsync::new(acache.as_index());
 
             let (shutdown_tx, _) = broadcast::channel(1);
             let options = HasherOptions::default();

@@ -147,9 +147,10 @@ mod tests {
 
     use super::*;
     use crate::arena::engine::DirtyPaths;
+    use crate::arena::tree::TreeReadOperations;
     use crate::arena::types::IndexedFileTableEntry;
-    use crate::utils::{hash, redb_utils};
-    use crate::{Blob, GlobalDatabase, Inode, InodeAllocator, Notification};
+    use crate::utils::hash;
+    use crate::{Blob, Inode, Notification};
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
@@ -177,19 +178,16 @@ mod tests {
         /// Call setup or setup_cache_only
         fn setup_internal(with_root: bool) -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
-            let arena = Arena::from("myarena");
             let tempdir = TempDir::new()?;
 
-            let globaldb = GlobalDatabase::new(redb_utils::in_memory()?)?;
-            let allocator = InodeAllocator::new(globaldb, [arena])?;
             let arena = Arena::from("myarena");
-            let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
+            let db = ArenaDatabase::for_testing_single_arena(arena)?;
             let dirty_paths = DirtyPaths::new_blocking(Arc::clone(&db))?;
             let root = tempdir.child("root");
             root.create_dir_all()?;
             let cache = ArenaCache::new(
                 arena,
-                allocator,
+                db.begin_read()?.read_tree()?.root(),
                 Arc::clone(&db),
                 &tempdir.path().join("blobs"),
                 Arc::clone(&dirty_paths),

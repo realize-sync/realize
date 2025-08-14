@@ -386,12 +386,9 @@ async fn send_notifications(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        GlobalDatabase, InodeAllocator,
-        arena::{arena_cache::ArenaCache, db::ArenaDatabase, engine::DirtyPaths},
-        utils::{hash, redb_utils},
-    };
-    use std::{sync::Arc, time::Duration};
+    use crate::arena::arena_cache::ArenaCache;
+    use crate::utils::hash;
+    use std::time::Duration;
 
     fn test_arena() -> Arena {
         Arena::from("myarena")
@@ -405,20 +402,10 @@ mod tests {
     impl Fixture {
         async fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
-            let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
-            let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
             let arena = test_arena();
-            let allocator =
-                InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
-            let index = ArenaCache::new(
-                arena,
-                allocator,
-                db,
-                &std::path::Path::new("/dev/null"),
-                dirty_paths,
-            )?
-            .as_index();
-            let index = RealIndexAsync::new(index);
+            let acache =
+                ArenaCache::for_testing_single_arena(arena, &std::path::Path::new("/dev/null"))?;
+            let index = RealIndexAsync::new(acache.as_index());
 
             Ok(Self {
                 index,

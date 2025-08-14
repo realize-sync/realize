@@ -430,8 +430,6 @@ fn check_arena_compatibility(arena: Arena, existing: Arena) -> anyhow::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arena::db::ArenaDatabase;
-    use crate::arena::engine::DirtyPaths;
     use crate::utils::redb_utils;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
@@ -465,14 +463,10 @@ mod tests {
             for arena in arenas {
                 let blob_dir = tempdir.child(format!("{arena}/blobs"));
                 blob_dir.create_dir_all()?;
-                let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
-                let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-                cache.register(ArenaCache::new(
+                cache.register(ArenaCache::for_testing(
                     arena,
                     Arc::clone(&allocator),
-                    db,
                     blob_dir.path(),
-                    dirty_paths,
                 )?)?;
             }
             Ok(Self {

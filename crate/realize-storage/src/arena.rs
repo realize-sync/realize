@@ -12,6 +12,7 @@ use std::{path::PathBuf, sync::Arc};
 use tokio::task;
 use tokio_util::sync::CancellationToken;
 use tokio_util::sync::DropGuard;
+use tree::Tree;
 use watcher::RealWatcher;
 
 pub mod arena_cache;
@@ -52,11 +53,13 @@ impl ArenaStorage {
         exclude: &Vec<&std::path::Path>,
         allocator: &Arc<InodeAllocator>,
     ) -> anyhow::Result<Self> {
-        let db = ArenaDatabase::new(redb_utils::open(&arena_config.db).await?)?;
+        let tree = Tree::new(arena, Arc::clone(allocator))?;
+        let arena_root = tree.root();
+        let db = ArenaDatabase::new(redb_utils::open(&arena_config.db).await?, tree)?;
         let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
         let arena_cache = ArenaCache::new(
             arena,
-            Arc::clone(allocator),
+            arena_root,
             Arc::clone(&db),
             &arena_config.blob_dir,
             Arc::clone(&dirty_paths),

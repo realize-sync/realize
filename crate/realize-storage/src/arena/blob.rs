@@ -933,8 +933,8 @@ mod tests {
     use crate::arena::arena_cache::ArenaCache;
     use crate::arena::engine::DirtyPaths;
     use crate::arena::mark::PathMarks;
-    use crate::utils::redb_utils;
-    use crate::{GlobalDatabase, Inode, InodeAllocator, Mark, Notification};
+    use crate::arena::tree::TreeReadOperations;
+    use crate::{Inode, Mark, Notification};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Path, Peer, UnixTime};
@@ -976,19 +976,16 @@ mod tests {
             let _ = env_logger::try_init();
             let arena = test_arena();
             let tempdir = TempDir::new()?;
-            let allocator =
-                InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
-
             let child = tempdir.child(format!("{arena}-cache.db"));
             let blob_dir = tempdir.child(format!("{arena}/blobs"));
             if let Some(p) = child.parent() {
                 std::fs::create_dir_all(p)?;
             }
-            let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
+            let db = ArenaDatabase::for_testing_single_arena(arena)?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
             let acache = ArenaCache::new(
                 arena,
-                allocator,
+                db.begin_read()?.read_tree()?.root(),
                 Arc::clone(&db),
                 blob_dir.path(),
                 Arc::clone(&dirty_paths),

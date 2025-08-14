@@ -113,14 +113,9 @@ pub(crate) async fn rsync(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
     use crate::arena::arena_cache::ArenaCache;
-    use crate::arena::db::ArenaDatabase;
-    use crate::arena::engine::DirtyPaths;
-    use crate::utils::{hash, redb_utils};
-    use crate::{GlobalDatabase, InodeAllocator};
+    use crate::utils::hash;
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
@@ -145,18 +140,9 @@ mod tests {
             let root = tempdir.child("root");
             root.create_dir_all()?;
 
-            let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
-            let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
             let arena = test_arena();
-            let allocator =
-                InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
-            let arena_cache = ArenaCache::new(
-                arena,
-                allocator,
-                db,
-                &tempdir.path().join("blobs"),
-                dirty_paths,
-            )?;
+            let arena_cache =
+                ArenaCache::for_testing_single_arena(arena, &tempdir.path().join("blobs"))?;
             let index = RealIndexAsync::new(arena_cache.as_index());
 
             Ok(Self {

@@ -901,6 +901,7 @@ mod tests {
     use crate::arena::arena_cache::ArenaCache;
     use crate::arena::index::RealIndex;
     use crate::arena::mark::PathMarks;
+    use crate::arena::tree::Tree;
     use crate::utils::redb_utils;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
@@ -924,7 +925,8 @@ mod tests {
     impl DirtyPathsFixture {
         async fn setup() -> anyhow::Result<DirtyPathsFixture> {
             let _ = env_logger::try_init();
-            let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
+            let arena = Arena::from("myarena");
+            let db = ArenaDatabase::for_testing_single_arena(arena)?;
             let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
             Ok(Self { db, dirty_paths })
         }
@@ -950,15 +952,17 @@ mod tests {
             let arena_path = tempdir.child("arena");
             arena_path.create_dir_all()?;
 
-            let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
-            let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-
             let arena = Arena::from("myarena");
-            let allocator =
-                InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
+            let tree = Tree::new(
+                arena,
+                InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?,
+            )?;
+            let arena_root = tree.root();
+            let db = ArenaDatabase::new(redb_utils::in_memory()?, tree)?;
+            let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
             let acache = ArenaCache::new(
                 arena,
-                allocator,
+                arena_root,
                 Arc::clone(&db),
                 &tempdir.path().join("blobs"),
                 Arc::clone(&dirty_paths),

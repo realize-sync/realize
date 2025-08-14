@@ -2,9 +2,7 @@ use super::blob::{self, Blobstore};
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
 use super::index::RealIndex;
 use super::mark::PathMarks;
-use super::tree::{
-    OpenTree, OpenTreeWrite, Tree, TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree,
-};
+use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
 use super::types::{
     CacheTableEntry, CacheTableKey, DirtableEntry, FileAvailability, FileMetadata, FileTableEntry,
     HistoryTableEntry, IndexedFileTableEntry, LocalAvailability, LruQueueId, MarkTableEntry,
@@ -15,7 +13,7 @@ use crate::arena::notifier::{Notification, Progress};
 use crate::types::BlobId;
 use crate::utils::fs_utils;
 use crate::utils::holder::{ByteConversionError, Holder};
-use crate::{Blob, InodeAllocator, InodeAssignment, Mark};
+use crate::{Blob, InodeAssignment, Mark};
 use crate::{Inode, StorageError};
 use realize_types::{Arena, ByteRanges, Hash, Path, Peer, UnixTime};
 use redb::{ReadableTable, Table};
@@ -33,7 +31,6 @@ pub(crate) struct ArenaCache {
     arena: Arena,
     arena_root: Inode,
     db: Arc<ArenaDatabase>,
-    tree: Tree,
     blobstore: Arc<Blobstore>,
     dirty_paths: Arc<DirtyPaths>,
 
@@ -44,19 +41,55 @@ pub(crate) struct ArenaCache {
 }
 
 impl ArenaCache {
+    #[cfg(test)]
+    pub fn for_testing_single_arena(
+        arena: realize_types::Arena,
+        blob_dir: &std::path::Path,
+    ) -> anyhow::Result<Arc<Self>> {
+        ArenaCache::for_testing(
+            arena,
+            crate::InodeAllocator::new(
+                crate::GlobalDatabase::new(crate::utils::redb_utils::in_memory()?)?,
+                [arena],
+            )?,
+            blob_dir,
+        )
+    }
+
+    #[cfg(test)]
+    pub fn for_testing(
+        arena: realize_types::Arena,
+        allocator: Arc<crate::InodeAllocator>,
+        blob_dir: &std::path::Path,
+    ) -> anyhow::Result<Arc<Self>> {
+        let tree = super::tree::Tree::new(arena, allocator)?;
+        let arena_root = tree.root();
+        let db = ArenaDatabase::new(crate::utils::redb_utils::in_memory()?, tree)?;
+        let dirty_paths = DirtyPaths::new_blocking(Arc::clone(&db))?;
+
+        Ok(ArenaCache::new(
+            arena,
+            arena_root,
+            Arc::clone(&db),
+            blob_dir,
+            dirty_paths,
+        )?)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn db(&self) -> Arc<ArenaDatabase> {
+        Arc::clone(&self.db)
+    }
+
     /// Create a new ArenaUnrealCacheBlocking from an arena, root inode, database, and blob directory.
     pub(crate) fn new(
         arena: Arena,
-        allocator: Arc<InodeAllocator>,
+        arena_root: Inode,
         db: Arc<ArenaDatabase>,
         blob_dir: &std::path::Path,
         dirty_paths: Arc<DirtyPaths>,
     ) -> Result<Arc<Self>, StorageError> {
         let blobstore = Blobstore::new(Arc::clone(&db), blob_dir)?;
-        let arena_root = allocator
-            .arena_root(arena)
-            .ok_or_else(|| StorageError::UnknownArena(arena))?;
-        let tree = Tree::new(arena, arena_root, Arc::clone(&allocator));
         let uuid = load_or_assign_uuid(&db)?;
         let last_history_index = {
             let txn = db.begin_read()?;
@@ -68,7 +101,6 @@ impl ArenaCache {
         Ok(Arc::new(Self {
             arena,
             arena_root,
-            tree,
             db,
             blobstore,
             dirty_paths,
@@ -96,7 +128,7 @@ impl ArenaCache {
         name: &str,
     ) -> Result<(Inode, InodeAssignment), StorageError> {
         let txn = self.db.begin_read()?;
-        let tree = txn.read_tree(&self.tree)?;
+        let tree = txn.read_tree()?;
         let cache_table = txn.cache_table()?;
         check_is_dir(&cache_table, parent_inode)?;
         if let Some(inode) = tree.lookup(parent_inode, name)? {
@@ -110,7 +142,7 @@ impl ArenaCache {
 
     pub(crate) fn expect<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<Inode, StorageError> {
         let txn = self.db.begin_read()?;
-        let tree = txn.read_tree(&self.tree)?;
+        let tree = txn.read_tree()?;
 
         tree.expect(loc)
     }
@@ -120,7 +152,7 @@ impl ArenaCache {
         loc: L,
     ) -> Result<Option<Inode>, StorageError> {
         let txn = self.db.begin_read()?;
-        let tree = txn.read_tree(&self.tree)?;
+        let tree = txn.read_tree()?;
 
         tree.resolve(loc)
     }
@@ -160,7 +192,7 @@ impl ArenaCache {
         inode: Inode,
     ) -> Result<Vec<(String, Inode, InodeAssignment)>, StorageError> {
         let txn = self.db.begin_read()?;
-        let tree = txn.read_tree(&self.tree)?;
+        let tree = txn.read_tree()?;
         let cache_table = txn.cache_table()?;
         check_is_dir(&cache_table, inode)?;
 
@@ -206,7 +238,7 @@ impl ArenaCache {
                 do_update_last_seen_notification(&txn, peer, index)?;
 
                 let mut cache_table = txn.cache_table()?;
-                let mut tree = txn.write_tree(&self.tree)?;
+                let mut tree = txn.write_tree()?;
                 let (_, file_inode) = do_create_file(&mut cache_table, &mut tree, &path)?;
                 let entry = FileTableEntry::new(path, size, mtime, hash);
 
@@ -238,7 +270,7 @@ impl ArenaCache {
             } => {
                 do_update_last_seen_notification(&txn, peer, index)?;
                 let mut cache_table = txn.cache_table()?;
-                let mut tree = txn.write_tree(&self.tree)?;
+                let mut tree = txn.write_tree()?;
                 let (_, file_inode) = do_create_file(&mut cache_table, &mut tree, &path)?;
                 let entry = FileTableEntry::new(path, size, mtime, hash.clone());
 
@@ -292,7 +324,7 @@ impl ArenaCache {
 
                 // remove local
                 if let Some(index_root) = index_root {
-                    let tree = txn.read_tree(&self.tree)?;
+                    let tree = txn.read_tree()?;
                     if let Some(inode) = tree.resolve(&path)? {
                         let index_table = txn.index_table()?;
                         if let Some(entry) = index_table.get(inode)? {
@@ -331,7 +363,7 @@ impl ArenaCache {
                 ..
             } => {
                 let mut cache_table = txn.cache_table()?;
-                let mut tree = txn.write_tree(&self.tree)?;
+                let mut tree = txn.write_tree()?;
                 let (_, file_inode) = do_create_file(&mut cache_table, &mut tree, &path)?;
 
                 do_unmark_peer_file(&txn, peer, file_inode)?;
@@ -403,7 +435,7 @@ impl ArenaCache {
             let mut cache_table = txn.cache_table()?;
             let mark_table = txn.mark_table()?;
             let mut file_entry = get_default_entry(&cache_table, inode)?;
-            let queue = queue_for_inode(&mark_table, &txn.read_tree(&self.tree)?, inode)?;
+            let queue = queue_for_inode(&mark_table, &txn.read_tree()?, inode)?;
             let blob = self
                 .blobstore
                 .create_blob(&txn, file_entry.clone(), queue)?;
@@ -443,7 +475,7 @@ impl ArenaCache {
         T: AsRef<Path>,
     {
         let path = path.as_ref();
-        let tree = txn.read_tree(&self.tree)?;
+        let tree = txn.read_tree()?;
         let inode = tree.expect(path)?;
         let mut cache_table = txn.cache_table()?;
         let mut file_entry = get_default_entry(&cache_table, inode)?;
@@ -490,7 +522,7 @@ impl ArenaCache {
         T: AsRef<Path>,
     {
         let path = path.as_ref();
-        let tree = txn.read_tree(&self.tree)?;
+        let tree = txn.read_tree()?;
         let inode = match tree.resolve(path)? {
             Some(inode) => inode,
             None => {
@@ -536,7 +568,7 @@ impl ArenaCache {
         T: AsRef<Path>,
     {
         let path = path.as_ref();
-        let tree = txn.read_tree(&self.tree)?;
+        let tree = txn.read_tree()?;
 
         let inode = tree.expect(path)?;
         if let Some(e) = get_file_entry(&txn.cache_table()?, inode, None)? {
@@ -714,7 +746,7 @@ impl ArenaCache {
         T: AsRef<Path>,
     {
         let path = path.as_ref();
-        let mut tree = txn.write_tree(&self.tree)?;
+        let mut tree = txn.write_tree()?;
         let parent_inode = {
             if let Some(parent_path) = path.parent() {
                 tree.resolve(parent_path)?
@@ -752,7 +784,7 @@ impl ArenaCache {
     ) -> Result<(), StorageError> {
         let mut pending_catchup_table = txn.pending_catchup_table()?;
         let mut cache_table = txn.cache_table()?;
-        let mut tree = txn.write_tree(&self.tree)?;
+        let mut tree = txn.write_tree()?;
         let peer_str = peer.as_str();
         for elt in pending_catchup_table
             .extract_from_if((peer_str, Inode::ZERO)..=(peer_str, Inode::MAX), |_, _| {
@@ -988,7 +1020,7 @@ impl RealIndex for ArenaCache {
         txn: &super::db::ArenaReadTransaction,
         path: &realize_types::Path,
     ) -> Result<Option<IndexedFileTableEntry>, StorageError> {
-        self.get_indexed_file(&txn.read_tree(&self.tree)?, &txn.index_table()?, path)
+        self.get_indexed_file(&txn.read_tree()?, &txn.index_table()?, path)
     }
 
     fn get_indexed_file_txn(
@@ -999,7 +1031,7 @@ impl RealIndex for ArenaCache {
         hash: Option<&Hash>,
     ) -> Result<Option<std::path::PathBuf>, StorageError> {
         let index_table = txn.index_table()?;
-        let entry = self.get_indexed_file(&txn.read_tree(&self.tree)?, &index_table, path)?;
+        let entry = self.get_indexed_file(&txn.read_tree()?, &index_table, path)?;
         match hash {
             Some(hash) => {
                 if let Some(entry) = entry
@@ -1045,14 +1077,7 @@ impl RealIndex for ArenaCache {
         hash: Hash,
     ) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
-        self.index_file(
-            &txn,
-            &mut txn.write_tree(&self.tree)?,
-            path,
-            size,
-            mtime,
-            hash,
-        )?;
+        self.index_file(&txn, &mut txn.write_tree()?, path, size, mtime, hash)?;
         txn.commit()?;
 
         Ok(())
@@ -1068,7 +1093,7 @@ impl RealIndex for ArenaCache {
     ) -> Result<bool, StorageError> {
         let txn = self.db.begin_write()?;
         let matches = {
-            let mut tree = txn.write_tree(&self.tree)?;
+            let mut tree = txn.write_tree()?;
             let entry = self.index_file(&txn, &mut tree, path, size, mtime, hash)?;
 
             file_matches_index(&entry, root, path)
@@ -1089,7 +1114,7 @@ impl RealIndex for ArenaCache {
         if fs_utils::metadata_no_symlink_blocking(root, path).is_err() {
             {
                 let path = path.as_ref();
-                let mut tree = txn.write_tree(&self.tree)?;
+                let mut tree = txn.write_tree()?;
                 if let Some(inode) = tree.resolve(path)? {
                     let mut index_table = txn.index_table()?;
                     let mut history_table = txn.history_table()?;
@@ -1161,7 +1186,7 @@ impl RealIndex for ArenaCache {
     fn remove_file_or_dir(&self, path: &realize_types::Path) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
         {
-            let mut tree = txn.write_tree(&self.tree)?;
+            let mut tree = txn.write_tree()?;
             if let Some(inode) = tree.resolve(path)? {
                 let mut index_table = txn.index_table()?;
                 let mut history_table = txn.history_table()?;
@@ -1181,7 +1206,7 @@ impl RealIndex for ArenaCache {
         path: &realize_types::Path,
         hash: &Hash,
     ) -> Result<bool, StorageError> {
-        let mut tree = txn.write_tree(&self.tree)?;
+        let mut tree = txn.write_tree()?;
         let inode = match tree.resolve(path)? {
             Some(inode) => inode,
             None => {
@@ -1228,7 +1253,7 @@ impl PathMarks for ArenaCache {
 
     fn get_mark_txn(&self, txn: &ArenaReadTransaction, path: &Path) -> Result<Mark, StorageError> {
         let mark_table = txn.mark_table()?;
-        let tree = txn.read_tree(&self.tree)?;
+        let tree = txn.read_tree()?;
 
         Ok(resolve_mark_at_path(&mark_table, &tree, path)?)
     }
@@ -1240,7 +1265,7 @@ impl PathMarks for ArenaCache {
 
             let mut mark_table = txn.mark_table()?;
             let cache_table = txn.cache_table()?;
-            let tree = txn.read_tree(&self.tree)?;
+            let tree = txn.read_tree()?;
             let old_mark = resolve_mark(&mark_table, &tree, inode)?;
             mark_table.insert(inode, Holder::with_content(MarkTableEntry { mark })?)?;
 
@@ -1265,7 +1290,7 @@ impl PathMarks for ArenaCache {
         let txn = self.db.begin_write()?;
         {
             let mut mark_table = txn.mark_table()?;
-            let mut tree = txn.write_tree(&self.tree)?;
+            let mut tree = txn.write_tree()?;
             let old_mark = resolve_mark_at_path(&mark_table, &tree, path)?;
             let inode = tree.setup(path)?;
             tree.insert_and_incref(
@@ -1296,7 +1321,7 @@ impl PathMarks for ArenaCache {
     fn clear_mark(&self, path: &Path) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
         {
-            let mut tree = txn.write_tree(&self.tree)?;
+            let mut tree = txn.write_tree()?;
             let inode = match tree.resolve(path)? {
                 Some(inode) => inode,
                 None => {
@@ -1666,7 +1691,7 @@ mod tests {
     use crate::arena::index::RealIndex;
     use crate::arena::mark::PathMarks;
     use crate::arena::notifier::Notification;
-    use crate::arena::tree::{OpenTree, TreeExt, TreeReadOperations};
+    use crate::arena::tree::{Tree, TreeExt, TreeReadOperations};
     use crate::arena::types::HistoryTableEntry;
     use crate::utils::hash;
     use crate::utils::redb_utils;
@@ -1710,24 +1735,13 @@ mod tests {
         async fn setup_with_arena(arena: Arena) -> anyhow::Result<Fixture> {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
-            let allocator =
-                InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
-
             let child = tempdir.child(format!("{arena}-cache.db"));
             let blob_dir = tempdir.child(format!("{arena}/blobs"));
             if let Some(p) = child.parent() {
                 std::fs::create_dir_all(p)?;
             }
-            let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
-            let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-            let acache = ArenaCache::new(
-                arena,
-                allocator,
-                Arc::clone(&db),
-                blob_dir.path(),
-                Arc::clone(&dirty_paths),
-            )?;
-
+            let acache = ArenaCache::for_testing_single_arena(arena, blob_dir.path())?;
+            let db = Arc::clone(&acache.db);
             Ok(Self {
                 arena,
                 acache,
@@ -1839,7 +1853,7 @@ mod tests {
 
         {
             let txn = fixture.db.begin_read()?;
-            let tree = txn.read_tree(&acache.tree)?;
+            let tree = txn.read_tree()?;
             assert_eq!(acache.arena_root(), tree.root());
             assert!(tree.inode_exists(a)?);
             assert!(tree.inode_exists(b)?);
@@ -1854,7 +1868,7 @@ mod tests {
         assert!(acache.lookup(b, "c.txt").is_err());
         {
             let txn = fixture.db.begin_read()?;
-            let tree = txn.read_tree(&acache.tree)?;
+            let tree = txn.read_tree()?;
 
             // The file is gone from tree, since this was the only
             // reference to it.
@@ -3018,30 +3032,25 @@ mod tests {
     #[tokio::test]
     async fn real_index_reopen_keeps_uuid() -> anyhow::Result<()> {
         let tempdir = TempDir::new()?;
-        let path = tempdir.path().join("index.db");
-        let db = ArenaDatabase::new(redb::Database::create(&path)?)?;
-        let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
         let arena = test_arena();
+        let path = tempdir.path().join("index.db");
         let allocator =
             InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
+        let tree = Tree::new(arena, Arc::clone(&allocator))?;
+        let arena_root = tree.root();
+        let db = ArenaDatabase::new(redb::Database::create(&path)?, tree)?;
+        let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
         let blob_dir = tempdir.child("blobs");
-        let acache = ArenaCache::new(
-            arena,
-            allocator.clone(),
-            db,
-            blob_dir.path(),
-            dirty_paths.clone(),
-        )?;
+        let acache = ArenaCache::new(arena, arena_root, db, blob_dir.path(), dirty_paths.clone())?;
         let uuid = acache.uuid().clone();
 
         // Drop the first instance to release the database lock
         drop(acache);
 
-        let db = ArenaDatabase::new(redb::Database::create(&path)?)?;
+        let tree = Tree::new(arena, Arc::clone(&allocator))?;
+        let db = ArenaDatabase::new(redb::Database::create(&path)?, tree)?;
         let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-        let allocator =
-            InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
-        let acache = ArenaCache::new(arena, allocator, db, blob_dir.path(), dirty_paths)?;
+        let acache = ArenaCache::new(arena, arena_root, db, blob_dir.path(), dirty_paths)?;
         assert!(!uuid.is_nil());
         assert_eq!(uuid, acache.uuid().clone());
 
@@ -3564,23 +3573,16 @@ mod tests {
             let _ = env_logger::try_init();
 
             let arena = Arena::from("test");
-            let db = ArenaDatabase::new(redb_utils::in_memory()?)?;
-            let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-            let allocator =
-                InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
-            let acache = ArenaCache::new(
+            let acache = ArenaCache::for_testing_single_arena(
                 arena,
-                allocator,
-                Arc::clone(&db),
                 &std::path::PathBuf::from("/dev/null"),
-                Arc::clone(&dirty_paths),
             )?;
             let index = acache.as_index();
             let marks = acache.clone() as Arc<dyn PathMarks>;
 
             Ok(Self {
                 arena,
-                db,
+                db: acache.db(),
                 acache,
                 index,
                 marks,
@@ -3841,7 +3843,7 @@ mod tests {
 
         assert_eq!(fixture.marks.get_mark(&path)?, Mark::Keep);
         let txn = fixture.db.begin_read()?;
-        let tree = txn.read_tree(&fixture.acache.tree)?;
+        let tree = txn.read_tree()?;
         assert!(tree.resolve(&path)?.is_none());
 
         Ok(())
