@@ -6,9 +6,9 @@ use super::tree::{
     OpenTree, OpenTreeWrite, Tree, TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree,
 };
 use super::types::{
-    FileAvailability, FileMetadata, FileOrDirTableEntry, FileTableEntry, FileTableKey,
+    CacheTableEntry, CacheTableKey, DirtableEntry, FileAvailability, FileMetadata, FileTableEntry,
     HistoryTableEntry, IndexedFileTableEntry, LocalAvailability, LruQueueId, MarkTableEntry,
-    PeerTableEntry, DirtableEntry,
+    PeerTableEntry,
 };
 use crate::arena::engine::DirtyPaths;
 use crate::arena::notifier::{Notification, Progress};
@@ -133,10 +133,10 @@ impl ArenaCache {
     pub(crate) fn dir_mtime(&self, inode: Inode) -> Result<UnixTime, StorageError> {
         let txn = self.db.begin_read()?;
         let cache_table = txn.cache_table()?;
-        match cache_table.get(FileTableKey::Default(inode))? {
+        match cache_table.get(CacheTableKey::Default(inode))? {
             Some(e) => match e.value().parse()? {
-                FileOrDirTableEntry::Dir(dir_entry) => Ok(dir_entry.mtime),
-                FileOrDirTableEntry::File(_) => Err(StorageError::NotADirectory),
+                CacheTableEntry::Dir(dir_entry) => Ok(dir_entry.mtime),
+                CacheTableEntry::File(_) => Err(StorageError::NotADirectory),
             },
             None => {
                 if inode == self.arena_root {
@@ -414,8 +414,8 @@ impl ArenaCache {
             );
             file_entry.blob = Some(blob.id());
             cache_table.insert(
-                FileTableKey::Default(inode),
-                Holder::with_content(FileOrDirTableEntry::File(file_entry))?,
+                CacheTableKey::Default(inode),
+                Holder::with_content(CacheTableEntry::File(file_entry))?,
             )?;
 
             blob
@@ -466,8 +466,8 @@ impl ArenaCache {
 
         file_entry.blob = None;
         cache_table.insert(
-            FileTableKey::Default(inode),
-            Holder::with_content(FileOrDirTableEntry::File(file_entry))?,
+            CacheTableKey::Default(inode),
+            Holder::with_content(CacheTableEntry::File(file_entry))?,
         )?;
 
         log::debug!("Realized [{}]/{path} {hash} as {dest:?}", self.arena);
@@ -519,8 +519,8 @@ impl ArenaCache {
         )?;
         file_entry.blob = Some(blob_id);
         cache_table.insert(
-            FileTableKey::Default(inode),
-            Holder::with_content(FileOrDirTableEntry::File(file_entry))?,
+            CacheTableKey::Default(inode),
+            Holder::with_content(CacheTableEntry::File(file_entry))?,
         )?;
 
         Ok(Some(cachepath))
@@ -549,7 +549,7 @@ impl ArenaCache {
     /// Write an entry in the file table, overwriting any existing one.
     fn do_write_file_entry(
         &self,
-        cache_table: &mut redb::Table<'_, FileTableKey, Holder<FileOrDirTableEntry>>,
+        cache_table: &mut redb::Table<'_, CacheTableKey, Holder<CacheTableEntry>>,
         file_inode: Inode,
         peer: Peer,
         entry: &FileTableEntry,
@@ -562,8 +562,8 @@ impl ArenaCache {
         );
 
         cache_table.insert(
-            FileTableKey::PeerCopy(file_inode, peer),
-            Holder::new(&FileOrDirTableEntry::File(entry.clone()))?,
+            CacheTableKey::PeerCopy(file_inode, peer),
+            Holder::new(&CacheTableEntry::File(entry.clone()))?,
         )?;
 
         Ok(())
@@ -595,7 +595,7 @@ impl ArenaCache {
         &self,
         txn: &ArenaWriteTransaction,
         tree: &mut WritableOpenTree,
-        cache_table: &mut redb::Table<'_, FileTableKey, Holder<FileOrDirTableEntry>>,
+        cache_table: &mut redb::Table<'_, CacheTableKey, Holder<CacheTableEntry>>,
         file_inode: Inode,
         old_entry: Option<&FileTableEntry>,
         new_entry: &FileTableEntry,
@@ -604,8 +604,8 @@ impl ArenaCache {
         tree.insert_and_incref(
             file_inode,
             cache_table,
-            FileTableKey::Default(file_inode),
-            Holder::new(&FileOrDirTableEntry::File(new_entry.clone()))?,
+            CacheTableKey::Default(file_inode),
+            Holder::new(&CacheTableEntry::File(new_entry.clone()))?,
         )?;
 
         Ok(())
@@ -616,7 +616,7 @@ impl ArenaCache {
     fn do_rm_file_entry(
         &self,
         txn: &ArenaWriteTransaction,
-        cache_table: &mut redb::Table<'_, FileTableKey, Holder<FileOrDirTableEntry>>,
+        cache_table: &mut redb::Table<'_, CacheTableKey, Holder<CacheTableEntry>>,
         tree: &mut WritableOpenTree,
         parent_inode: Inode,
         inode: Inode,
@@ -624,7 +624,7 @@ impl ArenaCache {
     ) -> Result<(), StorageError> {
         // Remove the entry
         if cache_table
-            .remove(FileTableKey::PeerCopy(inode, peer))?
+            .remove(CacheTableKey::PeerCopy(inode, peer))?
             .is_none()
         {
             // nothing was changed
@@ -636,13 +636,13 @@ impl ArenaCache {
 
         let mut peer_entries = vec![];
         let mut default_entry = None;
-        for elt in cache_table.range(FileTableKey::range(inode))? {
+        for elt in cache_table.range(CacheTableKey::range(inode))? {
             let (key, value) = elt?;
             match key.value() {
-                FileTableKey::PeerCopy(_, _) => {
+                CacheTableKey::PeerCopy(_, _) => {
                     peer_entries.push(value.value().parse()?.expect_file()?);
                 }
-                FileTableKey::Default(_) => {
+                CacheTableKey::Default(_) => {
                     default_entry = Some(value.value().parse()?.expect_file()?);
                 }
                 _ => {}
@@ -685,7 +685,7 @@ impl ArenaCache {
                     Some(&default_entry),
                     &default_entry.path,
                 )?;
-                tree.remove_and_decref(inode, cache_table, FileTableKey::Default(inode))?;
+                tree.remove_and_decref(inode, cache_table, CacheTableKey::Default(inode))?;
 
                 // Update the parent modification time, as removing an
                 // entry modifies it.
@@ -693,8 +693,8 @@ impl ArenaCache {
                     mtime: UnixTime::now(),
                 };
                 let parent_dir_holder =
-                    Holder::with_content(FileOrDirTableEntry::Dir(parent_dir_entry))?;
-                cache_table.insert(FileTableKey::Default(parent_inode), parent_dir_holder)?;
+                    Holder::with_content(CacheTableEntry::Dir(parent_dir_entry))?;
+                cache_table.insert(CacheTableKey::Default(parent_inode), parent_dir_holder)?;
 
                 return Ok(());
             }
@@ -1357,7 +1357,7 @@ fn resolve_mark(
 fn mark_dirty_recursive(
     txn: &ArenaWriteTransaction,
     tree: &impl TreeReadOperations,
-    cache_table: &redb::Table<'_, FileTableKey, Holder<FileOrDirTableEntry>>,
+    cache_table: &redb::Table<'_, CacheTableKey, Holder<CacheTableEntry>>,
     index_table: &redb::Table<'_, Inode, Holder<FileTableEntry>>,
     inode: Inode,
     dirty_paths: &Arc<DirtyPaths>,
@@ -1367,8 +1367,8 @@ fn mark_dirty_recursive(
         if let Some(entry) = index_table.get(inode)? {
             let path = &entry.value().parse()?.path;
             dirty_paths.mark_dirty(txn, path)?;
-        } else if let Some(entry) = cache_table.get(FileTableKey::Default(inode))? {
-            if let FileOrDirTableEntry::File(entry) = entry.value().parse()? {
+        } else if let Some(entry) = cache_table.get(CacheTableKey::Default(inode))? {
+            if let CacheTableEntry::File(entry) = entry.value().parse()? {
                 dirty_paths.mark_dirty(txn, entry.path)?;
             }
         }
@@ -1409,13 +1409,13 @@ fn do_peer_progress(
 
 /// Get a [FileTableEntry] for a specific peer.
 fn get_file_entry(
-    cache_table: &impl redb::ReadableTable<FileTableKey, Holder<'static, FileOrDirTableEntry>>,
+    cache_table: &impl redb::ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
     inode: Inode,
     peer: Option<Peer>,
 ) -> Result<Option<FileTableEntry>, StorageError> {
     match cache_table.get(
-        peer.map(|p| FileTableKey::PeerCopy(inode, p))
-            .unwrap_or_else(|| FileTableKey::Default(inode)),
+        peer.map(|p| CacheTableKey::PeerCopy(inode, p))
+            .unwrap_or_else(|| CacheTableKey::Default(inode)),
     )? {
         None => Ok(None),
         Some(e) => Ok(e.value().parse()?.file()),
@@ -1423,11 +1423,11 @@ fn get_file_entry(
 }
 
 fn get_default_entry(
-    cache_table: &impl redb::ReadableTable<FileTableKey, Holder<'static, FileOrDirTableEntry>>,
+    cache_table: &impl redb::ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
     inode: Inode,
 ) -> Result<FileTableEntry, StorageError> {
     let entry = cache_table
-        .get(FileTableKey::Default(inode))?
+        .get(CacheTableKey::Default(inode))?
         .ok_or(StorageError::NotFound)?;
 
     Ok(entry.value().parse()?.expect_file()?)
@@ -1451,9 +1451,9 @@ fn do_file_availability(
 ) -> Result<FileAvailability, StorageError> {
     let cache_table = txn.cache_table()?;
 
-    let mut range = cache_table.range(FileTableKey::range(inode))?;
+    let mut range = cache_table.range(CacheTableKey::range(inode))?;
     let (default_key, default_entry) = range.next().ok_or(StorageError::NotFound)??;
-    if !matches!(default_key.value(), FileTableKey::Default(_)) {
+    if !matches!(default_key.value(), CacheTableKey::Default(_)) {
         return Err(StorageError::NotFound);
     }
     let FileTableEntry {
@@ -1467,7 +1467,7 @@ fn do_file_availability(
     let mut peers = vec![];
     for entry in range {
         let entry = entry?;
-        if let FileTableKey::PeerCopy(_, peer) = entry.0.value() {
+        if let CacheTableKey::PeerCopy(_, peer) = entry.0.value() {
             let file_entry: FileTableEntry = entry.1.value().parse()?.expect_file()?;
             if file_entry.hash == hash {
                 peers.push(peer);
@@ -1492,7 +1492,7 @@ fn do_file_availability(
 ///
 /// Return the parent inode and the file inode.
 fn do_create_file<T>(
-    cache_table: &mut redb::Table<'_, FileTableKey, Holder<FileOrDirTableEntry>>,
+    cache_table: &mut redb::Table<'_, CacheTableKey, Holder<CacheTableEntry>>,
     tree: &mut WritableOpenTree,
     path: T,
 ) -> Result<(Inode, Inode), StorageError>
@@ -1511,14 +1511,14 @@ where
     let parent_dir_entry = DirtableEntry {
         mtime: UnixTime::now(),
     };
-    let parent_dir_holder = Holder::with_content(FileOrDirTableEntry::Dir(parent_dir_entry))?;
-    cache_table.insert(FileTableKey::Default(parent_inode), parent_dir_holder)?;
+    let parent_dir_holder = Holder::with_content(CacheTableEntry::Dir(parent_dir_entry))?;
+    cache_table.insert(CacheTableKey::Default(parent_inode), parent_dir_holder)?;
 
     Ok((parent_inode, file_inode))
 }
 
 fn setup_dir(
-    cache_table: &mut redb::Table<'_, FileTableKey, Holder<FileOrDirTableEntry>>,
+    cache_table: &mut redb::Table<'_, CacheTableKey, Holder<CacheTableEntry>>,
     tree: &mut WritableOpenTree,
     parent_inode: Inode,
     name: &str,
@@ -1528,23 +1528,22 @@ fn setup_dir(
     let dir_entry = DirtableEntry {
         mtime: UnixTime::now(),
     };
-    let dir_holder = Holder::with_content(FileOrDirTableEntry::Dir(dir_entry))?;
-    if cache_table.get(FileTableKey::Default(inode))?.is_none() {
+    let dir_holder = Holder::with_content(CacheTableEntry::Dir(dir_entry))?;
+    if cache_table.get(CacheTableKey::Default(inode))?.is_none() {
         // new directory; assign its mtime
-        cache_table.insert(FileTableKey::Default(inode), dir_holder.borrow())?;
+        cache_table.insert(CacheTableKey::Default(inode), dir_holder.borrow())?;
 
         // and update the parent mtime, since the parent content changed
         // Only update if the parent doesn't already have a directory entry
         if cache_table
-            .get(FileTableKey::Default(parent_inode))?
+            .get(CacheTableKey::Default(parent_inode))?
             .is_none()
         {
             let parent_dir_entry = DirtableEntry {
                 mtime: UnixTime::now(),
             };
-            let parent_dir_holder =
-                Holder::with_content(FileOrDirTableEntry::Dir(parent_dir_entry))?;
-            cache_table.insert(FileTableKey::Default(parent_inode), parent_dir_holder)?;
+            let parent_dir_holder = Holder::with_content(CacheTableEntry::Dir(parent_dir_entry))?;
+            cache_table.insert(CacheTableKey::Default(parent_inode), parent_dir_holder)?;
         }
     }
 
@@ -1556,7 +1555,7 @@ fn do_mark_peer_files(txn: &ArenaWriteTransaction, peer: Peer) -> Result<(), Sto
     let mut pending_catchup_table = txn.pending_catchup_table()?;
     for elt in cache_table.iter()? {
         let (k, _) = elt?;
-        if let FileTableKey::PeerCopy(inode, elt_peer) = k.value()
+        if let CacheTableKey::PeerCopy(inode, elt_peer) = k.value()
             && elt_peer == peer
         {
             pending_catchup_table.insert((peer.as_str(), inode), ())?;
@@ -1629,13 +1628,13 @@ fn replaces_local_copy(entry: &FileTableEntry, old_hash: &Hash) -> bool {
 /// Check whether the given inode exists in the cache and whether it
 /// is a file or a directory.
 fn inode_assignment(
-    cache_table: &impl ReadableTable<FileTableKey, Holder<'static, FileOrDirTableEntry>>,
+    cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
     inode: Inode,
 ) -> Result<Option<InodeAssignment>, StorageError> {
-    match cache_table.get(FileTableKey::Default(inode))? {
+    match cache_table.get(CacheTableKey::Default(inode))? {
         Some(e) => match e.value().parse()? {
-            FileOrDirTableEntry::Dir(_) => Ok(Some(InodeAssignment::Directory)),
-            FileOrDirTableEntry::File(_) => Ok(Some(InodeAssignment::File)),
+            CacheTableEntry::Dir(_) => Ok(Some(InodeAssignment::Directory)),
+            CacheTableEntry::File(_) => Ok(Some(InodeAssignment::File)),
         },
         None => Ok(None),
     }
@@ -1643,7 +1642,7 @@ fn inode_assignment(
 
 /// Make sure the given inode exists and is a directory.
 fn check_is_dir(
-    cache_table: &impl ReadableTable<FileTableKey, Holder<'static, FileOrDirTableEntry>>,
+    cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
     inode: Inode,
 ) -> Result<(), StorageError> {
     match inode_assignment(cache_table, inode)? {

@@ -1,6 +1,6 @@
-use super::types::FileTableKey;
+use super::types::CacheTableKey;
 use super::types::{
-    BlobTableEntry, FailedJobTableEntry, FileOrDirTableEntry, FileTableEntry, HistoryTableEntry,
+    BlobTableEntry, CacheTableEntry, FailedJobTableEntry, FileTableEntry, HistoryTableEntry,
     MarkTableEntry, PeerTableEntry, QueueTableEntry,
 };
 use crate::Inode;
@@ -46,9 +46,9 @@ pub(crate) const TREE_REFCOUNT_TABLE: TableDefinition<Inode, u32> =
 /// An inode available in no peers should be remove from all
 /// directories.
 ///
-/// Key: FileTableKey (inode, default|local|peer, peer)
-/// Value: FileOrDirTableEntry
-const CACHE_TABLE: TableDefinition<FileTableKey, Holder<FileOrDirTableEntry>> =
+/// Key: CacheTableKey (inode, default|local|peer, peer)
+/// Value: CacheTableEntry
+const CACHE_TABLE: TableDefinition<CacheTableKey, Holder<CacheTableEntry>> =
     TableDefinition::new("cache.file");
 
 /// Track local indexed files.
@@ -286,7 +286,7 @@ impl ArenaWriteTransaction {
 
     pub fn cache_table<'txn>(
         &'txn self,
-    ) -> Result<Table<'txn, FileTableKey, Holder<'static, FileOrDirTableEntry>>, StorageError> {
+    ) -> Result<Table<'txn, CacheTableKey, Holder<'static, CacheTableEntry>>, StorageError> {
         Ok(self.inner.open_table(CACHE_TABLE)?)
     }
 
@@ -380,8 +380,7 @@ impl ArenaReadTransaction {
 
     pub fn cache_table(
         &self,
-    ) -> Result<ReadOnlyTable<FileTableKey, Holder<'static, FileOrDirTableEntry>>, StorageError>
-    {
+    ) -> Result<ReadOnlyTable<CacheTableKey, Holder<'static, CacheTableEntry>>, StorageError> {
         Ok(self.inner.open_table(CACHE_TABLE)?)
     }
 

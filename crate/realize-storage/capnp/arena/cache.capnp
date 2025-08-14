@@ -9,7 +9,7 @@ struct DirtableEntry {
 }
 
 # A union that can be either a FileTableEntry or a DirtableEntry
-struct FileOrDirTableEntry {
+struct CacheTableEntry {
   union {
     file @0: FileTableEntry;
     dir @1: DirtableEntry;

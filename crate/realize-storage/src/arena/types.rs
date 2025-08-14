@@ -502,7 +502,7 @@ pub struct ReadDirEntry {
 
 /// Key for the file table of the [ArenaDatabase].
 #[derive(Debug, Clone)]
-pub enum FileTableKey {
+pub enum CacheTableKey {
     /// The default entry, containing the selected version and its
     /// metadata for the cache.
     Default(Inode),
@@ -513,38 +513,38 @@ pub enum FileTableKey {
     Invalid,
 }
 
-impl FileTableKey {
+impl CacheTableKey {
     /// A range that covers all keys with the given inode.
-    pub fn range(inode: Inode) -> std::ops::Range<FileTableKey> {
-        FileTableKey::Default(inode)..FileTableKey::Default(inode.plus(1))
+    pub fn range(inode: Inode) -> std::ops::Range<CacheTableKey> {
+        CacheTableKey::Default(inode)..CacheTableKey::Default(inode.plus(1))
     }
 
     /// The key's inode
     pub fn inode(&self) -> Inode {
         match self {
-            FileTableKey::Invalid => Inode::ZERO,
-            FileTableKey::Default(inode) => *inode,
-            FileTableKey::PeerCopy(inode, _) => *inode,
+            CacheTableKey::Invalid => Inode::ZERO,
+            CacheTableKey::Default(inode) => *inode,
+            CacheTableKey::PeerCopy(inode, _) => *inode,
         }
     }
 
     fn variant_order(&self) -> u8 {
         match self {
-            FileTableKey::Invalid => 0,
-            FileTableKey::Default(_) => 1,
-            FileTableKey::PeerCopy(_, _) => 2,
+            CacheTableKey::Invalid => 0,
+            CacheTableKey::Default(_) => 1,
+            CacheTableKey::PeerCopy(_, _) => 2,
         }
     }
 
     fn peer(&self) -> Option<&Peer> {
         match self {
-            FileTableKey::PeerCopy(_, peer) => Some(peer),
+            CacheTableKey::PeerCopy(_, peer) => Some(peer),
             _ => None,
         }
     }
 }
 
-impl PartialEq for FileTableKey {
+impl PartialEq for CacheTableKey {
     fn eq(&self, other: &Self) -> bool {
         self.inode() == other.inode()
             && self.variant_order() == other.variant_order()
@@ -552,15 +552,15 @@ impl PartialEq for FileTableKey {
     }
 }
 
-impl Eq for FileTableKey {}
+impl Eq for CacheTableKey {}
 
-impl PartialOrd for FileTableKey {
+impl PartialOrd for CacheTableKey {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for FileTableKey {
+impl Ord for CacheTableKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // First compare by inode
         let inode_cmp = self.inode().cmp(&other.inode());
@@ -584,8 +584,8 @@ impl Ord for FileTableKey {
     }
 }
 
-impl Value for FileTableKey {
-    type SelfType<'a> = FileTableKey;
+impl Value for CacheTableKey {
+    type SelfType<'a> = CacheTableKey;
 
     type AsBytes<'a> = Vec<u8>;
 
@@ -601,18 +601,18 @@ impl Value for FileTableKey {
             data[0..8].try_into().unwrap_or([0; 8]),
         ));
         if inode == Inode::ZERO {
-            return FileTableKey::Invalid;
+            return CacheTableKey::Invalid;
         }
         match data.get(8) {
-            None => FileTableKey::Default(inode),
+            None => CacheTableKey::Default(inode),
             Some(1) => {
-                FileTableKey::PeerCopy(inode, Peer::from(str::from_utf8(&data[9..]).unwrap()))
+                CacheTableKey::PeerCopy(inode, Peer::from(str::from_utf8(&data[9..]).unwrap()))
             }
-            Some(_) => FileTableKey::Invalid,
+            Some(_) => CacheTableKey::Invalid,
         }
     }
 
-    fn as_bytes<'a, 'b: 'a>(value: &FileTableKey) -> Vec<u8>
+    fn as_bytes<'a, 'b: 'a>(value: &CacheTableKey) -> Vec<u8>
     where
         Self: 'a,
         Self: 'b,
@@ -620,8 +620,8 @@ impl Value for FileTableKey {
         let mut ret = vec![];
         ret.extend_from_slice(&value.inode().as_u64().to_be_bytes());
         match value {
-            FileTableKey::Default(_) | FileTableKey::Invalid => {}
-            FileTableKey::PeerCopy(_, peer) => {
+            CacheTableKey::Default(_) | CacheTableKey::Invalid => {}
+            CacheTableKey::PeerCopy(_, peer) => {
                 ret.push(1);
                 ret.extend_from_slice(peer.as_str().as_bytes());
             }
@@ -631,11 +631,11 @@ impl Value for FileTableKey {
     }
 
     fn type_name() -> redb::TypeName {
-        redb::TypeName::new("FileTableKey")
+        redb::TypeName::new("CacheTableKey")
     }
 }
 
-impl Key for FileTableKey {
+impl Key for CacheTableKey {
     fn compare(data1: &[u8], data2: &[u8]) -> std::cmp::Ordering {
         // The byte representation is designed so that byte comparison
         // matches object comparison, except for Invalid. No need to
@@ -684,7 +684,7 @@ pub struct DirtableEntry {
 
 /// An entry that can be either a file or directory.
 #[derive(Debug, Clone, PartialEq)]
-pub enum FileOrDirTableEntry {
+pub enum CacheTableEntry {
     /// A file entry
     File(FileTableEntry),
     /// A directory entry
@@ -697,9 +697,9 @@ impl NamedType for FileTableEntry {
     }
 }
 
-impl NamedType for FileOrDirTableEntry {
+impl NamedType for CacheTableEntry {
     fn typename() -> &'static str {
-        "FileOrDirTableEntry"
+        "CacheTableEntry"
     }
 }
 
@@ -766,20 +766,18 @@ fn parse_file_table_entry(
     })
 }
 
-impl ByteConvertible<FileOrDirTableEntry> for FileOrDirTableEntry {
-    fn from_bytes(data: &[u8]) -> Result<FileOrDirTableEntry, ByteConversionError> {
+impl ByteConvertible<CacheTableEntry> for CacheTableEntry {
+    fn from_bytes(data: &[u8]) -> Result<CacheTableEntry, ByteConversionError> {
         let message_reader = serialize_packed::read_message(&mut &data[..], ReaderOptions::new())?;
-        let msg: cache_capnp::file_or_dir_table_entry::Reader =
-            message_reader.get_root::<cache_capnp::file_or_dir_table_entry::Reader>()?;
+        let msg: cache_capnp::cache_table_entry::Reader =
+            message_reader.get_root::<cache_capnp::cache_table_entry::Reader>()?;
 
         match msg.which()? {
-            cache_capnp::file_or_dir_table_entry::File(file_entry) => {
+            cache_capnp::cache_table_entry::File(file_entry) => {
                 let file_entry = file_entry?;
-                Ok(FileOrDirTableEntry::File(parse_file_table_entry(
-                    file_entry,
-                )?))
+                Ok(CacheTableEntry::File(parse_file_table_entry(file_entry)?))
             }
-            cache_capnp::file_or_dir_table_entry::Dir(dir_entry) => {
+            cache_capnp::cache_table_entry::Dir(dir_entry) => {
                 let dir_entry = dir_entry?;
                 let mtime = dir_entry.get_mtime()?;
 
@@ -787,21 +785,21 @@ impl ByteConvertible<FileOrDirTableEntry> for FileOrDirTableEntry {
                     mtime: UnixTime::new(mtime.get_secs(), mtime.get_nsecs()),
                 };
 
-                Ok(FileOrDirTableEntry::Dir(dir_table_entry))
+                Ok(CacheTableEntry::Dir(dir_table_entry))
             }
         }
     }
 
     fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError> {
         let mut message = ::capnp::message::Builder::new_default();
-        let builder: cache_capnp::file_or_dir_table_entry::Builder =
-            message.init_root::<cache_capnp::file_or_dir_table_entry::Builder>();
+        let builder: cache_capnp::cache_table_entry::Builder =
+            message.init_root::<cache_capnp::cache_table_entry::Builder>();
 
         match self {
-            FileOrDirTableEntry::File(file_entry) => {
+            CacheTableEntry::File(file_entry) => {
                 fill_file_table_entry(builder.init_file(), file_entry);
             }
-            FileOrDirTableEntry::Dir(dir_entry) => {
+            CacheTableEntry::Dir(dir_entry) => {
                 let dir_builder = builder.init_dir();
                 let mut mtime = dir_builder.init_mtime();
                 mtime.set_secs(dir_entry.mtime.as_secs());
@@ -816,20 +814,20 @@ impl ByteConvertible<FileOrDirTableEntry> for FileOrDirTableEntry {
     }
 }
 
-impl FileOrDirTableEntry {
+impl CacheTableEntry {
     /// Extract the file entry, returning an error if this is a directory entry.
     pub fn expect_file(self) -> Result<FileTableEntry, StorageError> {
         match self {
-            FileOrDirTableEntry::File(file_entry) => Ok(file_entry),
-            FileOrDirTableEntry::Dir(_) => Err(StorageError::IsADirectory),
+            CacheTableEntry::File(file_entry) => Ok(file_entry),
+            CacheTableEntry::Dir(_) => Err(StorageError::IsADirectory),
         }
     }
 
     /// Extract the file entry or return None
     pub fn file(self) -> Option<FileTableEntry> {
         match self {
-            FileOrDirTableEntry::File(file_entry) => Some(file_entry),
-            FileOrDirTableEntry::Dir(_) => None,
+            CacheTableEntry::File(file_entry) => Some(file_entry),
+            CacheTableEntry::Dir(_) => None,
         }
     }
 }
@@ -1066,11 +1064,11 @@ mod tests {
 
     #[test]
     fn convert_file_table_key_default() -> anyhow::Result<()> {
-        let key = FileTableKey::Default(Inode(12345));
+        let key = CacheTableKey::Default(Inode(12345));
 
         // Test round-trip conversion
-        let bytes = FileTableKey::as_bytes(&key);
-        let converted = FileTableKey::from_bytes(&bytes);
+        let bytes = CacheTableKey::as_bytes(&key);
+        let converted = CacheTableKey::from_bytes(&bytes);
         assert_eq!(key, converted);
 
         Ok(())
@@ -1078,11 +1076,11 @@ mod tests {
 
     #[test]
     fn convert_file_table_key_peer_copy() -> anyhow::Result<()> {
-        let key = FileTableKey::PeerCopy(Inode(11111), Peer::from("peer1"));
+        let key = CacheTableKey::PeerCopy(Inode(11111), Peer::from("peer1"));
 
         // Test round-trip conversion
-        let bytes = FileTableKey::as_bytes(&key);
-        let converted = FileTableKey::from_bytes(&bytes);
+        let bytes = CacheTableKey::as_bytes(&key);
+        let converted = CacheTableKey::from_bytes(&bytes);
         assert_eq!(key, converted);
 
         Ok(())
@@ -1090,11 +1088,11 @@ mod tests {
 
     #[test]
     fn convert_file_table_key_invalid() -> anyhow::Result<()> {
-        let key = FileTableKey::Invalid;
+        let key = CacheTableKey::Invalid;
 
         // Test round-trip conversion
-        let bytes = FileTableKey::as_bytes(&key);
-        let converted = FileTableKey::from_bytes(&bytes);
+        let bytes = CacheTableKey::as_bytes(&key);
+        let converted = CacheTableKey::from_bytes(&bytes);
         assert_eq!(key, converted);
 
         Ok(())
@@ -1103,19 +1101,19 @@ mod tests {
     #[test]
     fn convert_file_table_key_all_variants() -> anyhow::Result<()> {
         let test_cases = vec![
-            FileTableKey::Default(Inode(1)),
-            FileTableKey::Default(Inode(0xFFFFFFFFFFFFFFFF)),
-            FileTableKey::PeerCopy(Inode(3), Peer::from("short")),
-            FileTableKey::PeerCopy(
+            CacheTableKey::Default(Inode(1)),
+            CacheTableKey::Default(Inode(0xFFFFFFFFFFFFFFFF)),
+            CacheTableKey::PeerCopy(Inode(3), Peer::from("short")),
+            CacheTableKey::PeerCopy(
                 Inode(4),
                 Peer::from("very_long_peer_name_that_might_cause_issues"),
             ),
-            FileTableKey::Invalid,
+            CacheTableKey::Invalid,
         ];
 
         for key in test_cases {
-            let bytes = FileTableKey::as_bytes(&key);
-            let converted = FileTableKey::from_bytes(&bytes);
+            let bytes = CacheTableKey::as_bytes(&key);
+            let converted = CacheTableKey::from_bytes(&bytes);
             assert_eq!(key, converted, "Failed for key: {:?}", key);
         }
 
@@ -1127,11 +1125,11 @@ mod tests {
         // Test that byte comparison behavior is consistent and documented
 
         let test_cases = vec![
-            FileTableKey::Default(Inode(1)),
-            FileTableKey::Default(Inode(2)),
-            FileTableKey::PeerCopy(Inode(1), Peer::from("a")),
-            FileTableKey::PeerCopy(Inode(1), Peer::from("b")),
-            FileTableKey::PeerCopy(Inode(2), Peer::from("a")),
+            CacheTableKey::Default(Inode(1)),
+            CacheTableKey::Default(Inode(2)),
+            CacheTableKey::PeerCopy(Inode(1), Peer::from("a")),
+            CacheTableKey::PeerCopy(Inode(1), Peer::from("b")),
+            CacheTableKey::PeerCopy(Inode(2), Peer::from("a")),
         ];
 
         // Test that byte comparison is consistent (same inputs always give same result)
@@ -1140,12 +1138,12 @@ mod tests {
                 let key1 = &test_cases[i];
                 let key2 = &test_cases[j];
 
-                let bytes1 = FileTableKey::as_bytes(key1);
-                let bytes2 = FileTableKey::as_bytes(key2);
-                let byte_cmp = FileTableKey::compare(&bytes1, &bytes2);
+                let bytes1 = CacheTableKey::as_bytes(key1);
+                let bytes2 = CacheTableKey::as_bytes(key2);
+                let byte_cmp = CacheTableKey::compare(&bytes1, &bytes2);
 
                 // Test consistency: reverse comparison should be opposite
-                let byte_cmp_reverse = FileTableKey::compare(&bytes2, &bytes1);
+                let byte_cmp_reverse = CacheTableKey::compare(&bytes2, &bytes1);
                 assert_eq!(
                     byte_cmp,
                     byte_cmp_reverse.reverse(),
@@ -1171,13 +1169,13 @@ mod tests {
     fn file_table_key_byte_comparison_matches_object_comparison() {
         // Test that byte comparison matches object comparison for all valid keys
         let test_cases = vec![
-            FileTableKey::Default(Inode(1)),
-            FileTableKey::Default(Inode(2)),
-            FileTableKey::Default(Inode(0x110000)),
-            FileTableKey::PeerCopy(Inode(1), Peer::from("a")),
-            FileTableKey::PeerCopy(Inode(1), Peer::from("b")),
-            FileTableKey::PeerCopy(Inode(2), Peer::from("a")),
-            FileTableKey::PeerCopy(Inode(0x110000), Peer::from("a")),
+            CacheTableKey::Default(Inode(1)),
+            CacheTableKey::Default(Inode(2)),
+            CacheTableKey::Default(Inode(0x110000)),
+            CacheTableKey::PeerCopy(Inode(1), Peer::from("a")),
+            CacheTableKey::PeerCopy(Inode(1), Peer::from("b")),
+            CacheTableKey::PeerCopy(Inode(2), Peer::from("a")),
+            CacheTableKey::PeerCopy(Inode(0x110000), Peer::from("a")),
         ];
 
         for i in 0..test_cases.len() {
@@ -1186,9 +1184,9 @@ mod tests {
                 let key2 = &test_cases[j];
 
                 let object_cmp = key1.cmp(key2);
-                let bytes1 = FileTableKey::as_bytes(key1);
-                let bytes2 = FileTableKey::as_bytes(key2);
-                let byte_cmp = FileTableKey::compare(&bytes1, &bytes2);
+                let bytes1 = CacheTableKey::as_bytes(key1);
+                let bytes2 = CacheTableKey::as_bytes(key2);
+                let byte_cmp = CacheTableKey::compare(&bytes1, &bytes2);
 
                 assert_eq!(
                     object_cmp, byte_cmp,
@@ -1203,29 +1201,29 @@ mod tests {
     fn file_table_key_edge_cases() -> anyhow::Result<()> {
         // Test edge cases
         let edge_cases = vec![
-            FileTableKey::Default(Inode(1)),                   // Non-zero inode
-            FileTableKey::PeerCopy(Inode(1), Peer::from("")),  // Empty peer
-            FileTableKey::PeerCopy(Inode(1), Peer::from("a")), // Single char peer
+            CacheTableKey::Default(Inode(1)),                   // Non-zero inode
+            CacheTableKey::PeerCopy(Inode(1), Peer::from("")),  // Empty peer
+            CacheTableKey::PeerCopy(Inode(1), Peer::from("a")), // Single char peer
         ];
 
         for key in edge_cases {
-            let bytes = FileTableKey::as_bytes(&key);
-            let converted = FileTableKey::from_bytes(&bytes);
+            let bytes = CacheTableKey::as_bytes(&key);
+            let converted = CacheTableKey::from_bytes(&bytes);
             assert_eq!(key, converted, "Failed for edge case: {:?}", key);
         }
 
         // Test that Inode(0) gets converted to Invalid (this is the intended behavior)
         let zero_inode_cases = vec![
-            FileTableKey::Default(Inode(0)),
-            FileTableKey::PeerCopy(Inode(0), Peer::from("")),
+            CacheTableKey::Default(Inode(0)),
+            CacheTableKey::PeerCopy(Inode(0), Peer::from("")),
         ];
 
         for key in zero_inode_cases {
-            let bytes = FileTableKey::as_bytes(&key);
-            let converted = FileTableKey::from_bytes(&bytes);
+            let bytes = CacheTableKey::as_bytes(&key);
+            let converted = CacheTableKey::from_bytes(&bytes);
             assert_eq!(
                 converted,
-                FileTableKey::Invalid,
+                CacheTableKey::Invalid,
                 "Expected Invalid for zero inode case: {:?}",
                 key
             );
@@ -1237,16 +1235,16 @@ mod tests {
     #[test]
     fn file_table_key_serialization_format() {
         // Test that the serialization format is correct
-        let key = FileTableKey::Default(Inode(0x1021a3));
-        let bytes = FileTableKey::as_bytes(&key);
+        let key = CacheTableKey::Default(Inode(0x1021a3));
+        let bytes = CacheTableKey::as_bytes(&key);
 
         // Should be exactly 8 bytes for Default (just the inode),
         // with big endian encoding.
         assert_eq!(bytes.len(), 8);
         assert_eq!(bytes, [0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x21, 0xa3]);
 
-        let key = FileTableKey::PeerCopy(Inode(11111), Peer::from("test"));
-        let bytes = FileTableKey::as_bytes(&key);
+        let key = CacheTableKey::PeerCopy(Inode(11111), Peer::from("test"));
+        let bytes = CacheTableKey::as_bytes(&key);
 
         // Should be 13 bytes for PeerCopy (inode + 1 byte + peer string)
         assert_eq!(bytes.len(), 13);
@@ -1256,7 +1254,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_file_or_dir_table_entry_file() -> anyhow::Result<()> {
+    fn convert_cache_table_entry_file() -> anyhow::Result<()> {
         let file_entry = FileTableEntry {
             size: 200,
             mtime: UnixTime::from_secs(1234567890),
@@ -1266,34 +1264,34 @@ mod tests {
             outdated_by: Some(Hash([3u8; 32])),
         };
 
-        let entry = FileOrDirTableEntry::File(file_entry);
+        let entry = CacheTableEntry::File(file_entry);
 
         assert_eq!(
             entry,
-            FileOrDirTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
+            CacheTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
         );
 
         Ok(())
     }
 
     #[test]
-    fn convert_file_or_dir_table_entry_dir() -> anyhow::Result<()> {
+    fn convert_cache_table_entry_dir() -> anyhow::Result<()> {
         let dir_entry = DirtableEntry {
             mtime: UnixTime::from_secs(987654321),
         };
 
-        let entry = FileOrDirTableEntry::Dir(dir_entry);
+        let entry = CacheTableEntry::Dir(dir_entry);
 
         assert_eq!(
             entry,
-            FileOrDirTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
+            CacheTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
         );
 
         Ok(())
     }
 
     #[test]
-    fn convert_file_or_dir_table_entry_both_variants() -> anyhow::Result<()> {
+    fn convert_cache_table_entry_both_variants() -> anyhow::Result<()> {
         // Test both variants in the same test
         let file_entry = FileTableEntry {
             size: 100,
@@ -1308,19 +1306,19 @@ mod tests {
             mtime: UnixTime::from_secs(987654321),
         };
 
-        let file_variant = FileOrDirTableEntry::File(file_entry);
-        let dir_variant = FileOrDirTableEntry::Dir(dir_entry);
+        let file_variant = CacheTableEntry::File(file_entry);
+        let dir_variant = CacheTableEntry::Dir(dir_entry);
 
         // Test file variant round-trip
         assert_eq!(
             file_variant,
-            FileOrDirTableEntry::from_bytes(file_variant.clone().to_bytes()?.as_slice())?
+            CacheTableEntry::from_bytes(file_variant.clone().to_bytes()?.as_slice())?
         );
 
         // Test dir variant round-trip
         assert_eq!(
             dir_variant,
-            FileOrDirTableEntry::from_bytes(dir_variant.clone().to_bytes()?.as_slice())?
+            CacheTableEntry::from_bytes(dir_variant.clone().to_bytes()?.as_slice())?
         );
 
         Ok(())
