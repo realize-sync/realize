@@ -3,25 +3,17 @@
 using Rust = import "/capnpc/rust.capnp";
 $Rust.parentModule("arena::types");
 
-struct DirTableEntry {
-  union {
-    regular @0: ReadDirEntry;
-    dot :group {
-      mtime @1: Time;
-    }
-    dotDot :group {
-      parent @2: UInt64;
-    }
-  }
-}
-struct ReadDirEntry {
-  inode @0: UInt64;
-  assignment @1: InodeAssignment;
+# A new simplified DirTableEntry that only contains mtime
+struct DirtableEntry {
+  mtime @0: Time;
 }
 
-enum InodeAssignment {
-  file @0;
-  directory @1;
+# A union that can be either a FileTableEntry or a DirtableEntry
+struct FileOrDirTableEntry {
+  union {
+    file @0: FileTableEntry;
+    dir @1: DirtableEntry;
+  }
 }
 
 # An entry in the file table.

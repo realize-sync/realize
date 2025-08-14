@@ -1,6 +1,6 @@
 use crate::types::BlobId;
 use crate::utils::holder::{ByteConversionError, ByteConvertible, NamedType};
-use crate::{Inode, InodeAssignment};
+use crate::{Inode, InodeAssignment, StorageError};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
 use realize_types::{self, Arena, ByteRanges, Hash, Path, Peer, UnixTime};
@@ -675,9 +675,31 @@ impl FileTableEntry {
     }
 }
 
+/// A simplified directory entry that only contains modification time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirtableEntry {
+    /// The modification time of the directory.
+    pub mtime: UnixTime,
+}
+
+/// An entry that can be either a file or directory.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FileOrDirTableEntry {
+    /// A file entry
+    File(FileTableEntry),
+    /// A directory entry
+    Dir(DirtableEntry),
+}
+
 impl NamedType for FileTableEntry {
     fn typename() -> &'static str {
         "FileTableEntry"
+    }
+}
+
+impl NamedType for FileOrDirTableEntry {
+    fn typename() -> &'static str {
+        "FileOrDirTableEntry"
     }
 }
 
@@ -687,47 +709,128 @@ impl ByteConvertible<FileTableEntry> for FileTableEntry {
         let msg: cache_capnp::file_table_entry::Reader =
             message_reader.get_root::<cache_capnp::file_table_entry::Reader>()?;
 
-        let mtime = msg.get_mtime()?;
-        let blob: Option<BlobId> = BlobId::as_optional(msg.get_blob());
-        let outdated_by: &[u8] = msg.get_outdated_by()?;
-        let outdated_by = if outdated_by.is_empty() {
-            None
-        } else {
-            Some(parse_hash(outdated_by)?)
-        };
-        Ok(FileTableEntry {
-            size: msg.get_size(),
-            mtime: UnixTime::new(mtime.get_secs(), mtime.get_nsecs()),
-            path: Path::parse(msg.get_path()?.to_str()?)?,
-            hash: parse_hash(msg.get_hash()?)?,
-            blob,
-            outdated_by,
-        })
+        parse_file_table_entry(msg)
     }
 
     fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError> {
         let mut message = ::capnp::message::Builder::new_default();
-        let mut builder: cache_capnp::file_table_entry::Builder =
+        let builder: cache_capnp::file_table_entry::Builder =
             message.init_root::<cache_capnp::file_table_entry::Builder>();
 
-        builder.set_size(self.size);
-        let mut mtime = builder.reborrow().init_mtime();
-        mtime.set_secs(self.mtime.as_secs());
-        mtime.set_nsecs(self.mtime.subsec_nanos());
-        builder.set_path(self.path.as_str());
-        builder.set_hash(&self.hash.0);
-        if let Some(blob) = self.blob {
-            builder.set_blob(blob.into());
-        }
+        fill_file_table_entry(builder, self);
 
-        if let Some(hash) = &self.outdated_by {
-            builder.set_outdated_by(&hash.0)
+        let mut buffer: Vec<u8> = Vec::new();
+        serialize_packed::write_message(&mut buffer, &message)?;
+
+        Ok(buffer)
+    }
+}
+
+fn fill_file_table_entry(
+    mut builder: cache_capnp::file_table_entry::Builder<'_>,
+    entry: &FileTableEntry,
+) {
+    builder.set_size(entry.size);
+    let mut mtime = builder.reborrow().init_mtime();
+    mtime.set_secs(entry.mtime.as_secs());
+    mtime.set_nsecs(entry.mtime.subsec_nanos());
+    builder.set_path(entry.path.as_str());
+    builder.set_hash(&entry.hash.0);
+    if let Some(blob) = entry.blob {
+        builder.set_blob(blob.into());
+    }
+
+    if let Some(hash) = &entry.outdated_by {
+        builder.set_outdated_by(&hash.0)
+    }
+}
+
+fn parse_file_table_entry(
+    msg: cache_capnp::file_table_entry::Reader<'_>,
+) -> Result<FileTableEntry, ByteConversionError> {
+    let mtime = msg.get_mtime()?;
+    let blob: Option<BlobId> = BlobId::as_optional(msg.get_blob());
+    let outdated_by: &[u8] = msg.get_outdated_by()?;
+    let outdated_by = if outdated_by.is_empty() {
+        None
+    } else {
+        Some(parse_hash(outdated_by)?)
+    };
+    Ok(FileTableEntry {
+        size: msg.get_size(),
+        mtime: UnixTime::new(mtime.get_secs(), mtime.get_nsecs()),
+        path: Path::parse(msg.get_path()?.to_str()?)?,
+        hash: parse_hash(msg.get_hash()?)?,
+        blob,
+        outdated_by,
+    })
+}
+
+impl ByteConvertible<FileOrDirTableEntry> for FileOrDirTableEntry {
+    fn from_bytes(data: &[u8]) -> Result<FileOrDirTableEntry, ByteConversionError> {
+        let message_reader = serialize_packed::read_message(&mut &data[..], ReaderOptions::new())?;
+        let msg: cache_capnp::file_or_dir_table_entry::Reader =
+            message_reader.get_root::<cache_capnp::file_or_dir_table_entry::Reader>()?;
+
+        match msg.which()? {
+            cache_capnp::file_or_dir_table_entry::File(file_entry) => {
+                let file_entry = file_entry?;
+                Ok(FileOrDirTableEntry::File(parse_file_table_entry(
+                    file_entry,
+                )?))
+            }
+            cache_capnp::file_or_dir_table_entry::Dir(dir_entry) => {
+                let dir_entry = dir_entry?;
+                let mtime = dir_entry.get_mtime()?;
+
+                let dir_table_entry = DirtableEntry {
+                    mtime: UnixTime::new(mtime.get_secs(), mtime.get_nsecs()),
+                };
+
+                Ok(FileOrDirTableEntry::Dir(dir_table_entry))
+            }
+        }
+    }
+
+    fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError> {
+        let mut message = ::capnp::message::Builder::new_default();
+        let builder: cache_capnp::file_or_dir_table_entry::Builder =
+            message.init_root::<cache_capnp::file_or_dir_table_entry::Builder>();
+
+        match self {
+            FileOrDirTableEntry::File(file_entry) => {
+                fill_file_table_entry(builder.init_file(), file_entry);
+            }
+            FileOrDirTableEntry::Dir(dir_entry) => {
+                let dir_builder = builder.init_dir();
+                let mut mtime = dir_builder.init_mtime();
+                mtime.set_secs(dir_entry.mtime.as_secs());
+                mtime.set_nsecs(dir_entry.mtime.subsec_nanos());
+            }
         }
 
         let mut buffer: Vec<u8> = Vec::new();
         serialize_packed::write_message(&mut buffer, &message)?;
 
         Ok(buffer)
+    }
+}
+
+impl FileOrDirTableEntry {
+    /// Extract the file entry, returning an error if this is a directory entry.
+    pub fn expect_file(self) -> Result<FileTableEntry, StorageError> {
+        match self {
+            FileOrDirTableEntry::File(file_entry) => Ok(file_entry),
+            FileOrDirTableEntry::Dir(_) => Err(StorageError::IsADirectory),
+        }
+    }
+
+    /// Extract the file entry or return None
+    pub fn file(self) -> Option<FileTableEntry> {
+        match self {
+            FileOrDirTableEntry::File(file_entry) => Some(file_entry),
+            FileOrDirTableEntry::Dir(_) => None,
+        }
     }
 }
 
@@ -740,83 +843,6 @@ pub struct FileMetadata {
     ///
     /// This is the duration since the start of the UNIX epoch.
     pub mtime: UnixTime,
-}
-
-#[derive(PartialEq, Debug, Clone)]
-pub enum DirTableEntry {
-    Regular(ReadDirEntry),
-    Dot(UnixTime),
-    DotDot(Inode),
-}
-
-impl NamedType for DirTableEntry {
-    fn typename() -> &'static str {
-        "DirTableEntry"
-    }
-}
-
-impl ByteConvertible<DirTableEntry> for DirTableEntry {
-    fn from_bytes(data: &[u8]) -> Result<DirTableEntry, ByteConversionError> {
-        let message_reader = serialize_packed::read_message(&mut &data[..], ReaderOptions::new())?;
-        let msg: cache_capnp::dir_table_entry::Reader =
-            message_reader.get_root::<cache_capnp::dir_table_entry::Reader>()?;
-
-        match msg.which()? {
-            cache_capnp::dir_table_entry::Regular(entry) => {
-                let entry = entry?;
-                Ok(DirTableEntry::Regular(ReadDirEntry {
-                    inode: Inode(entry.get_inode()),
-                    assignment: match entry.get_assignment()? {
-                        cache_capnp::InodeAssignment::File => InodeAssignment::File,
-                        cache_capnp::InodeAssignment::Directory => InodeAssignment::Directory,
-                    },
-                }))
-            }
-            cache_capnp::dir_table_entry::Dot(group) => {
-                let mtime = group.get_mtime()?;
-
-                Ok(DirTableEntry::Dot(UnixTime::new(
-                    mtime.get_secs(),
-                    mtime.get_nsecs(),
-                )))
-            }
-            cache_capnp::dir_table_entry::DotDot(group) => {
-                let parent = group.get_parent();
-
-                Ok(DirTableEntry::DotDot(Inode(parent)))
-            }
-        }
-    }
-
-    fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError> {
-        let mut message = ::capnp::message::Builder::new_default();
-        let builder: cache_capnp::dir_table_entry::Builder =
-            message.init_root::<cache_capnp::dir_table_entry::Builder>();
-
-        match self {
-            DirTableEntry::Regular(entry) => {
-                let mut builder = builder.init_regular();
-                builder.set_inode(entry.inode.into());
-                builder.set_assignment(match entry.assignment {
-                    InodeAssignment::Directory => cache_capnp::InodeAssignment::Directory,
-                    InodeAssignment::File => cache_capnp::InodeAssignment::File,
-                })
-            }
-            DirTableEntry::Dot(mtime) => {
-                let mut builder = builder.init_dot().init_mtime();
-                builder.set_secs(mtime.as_secs());
-                builder.set_nsecs(mtime.subsec_nanos())
-            }
-            DirTableEntry::DotDot(parent) => {
-                builder.init_dot_dot().set_parent(parent.as_u64());
-            }
-        }
-
-        let mut buffer: Vec<u8> = Vec::new();
-        serialize_packed::write_message(&mut buffer, &message)?;
-
-        Ok(buffer)
-    }
 }
 
 /// An entry in the peer table.
@@ -1039,41 +1065,6 @@ mod tests {
     }
 
     #[test]
-    fn convert_dir_table_entry() -> anyhow::Result<()> {
-        let dot = DirTableEntry::Dot(UnixTime::from_secs(1234567890));
-        assert_eq!(
-            dot,
-            DirTableEntry::from_bytes(dot.clone().to_bytes()?.as_slice())?
-        );
-
-        let dotdot = DirTableEntry::DotDot(Inode(1023));
-        assert_eq!(
-            dotdot,
-            DirTableEntry::from_bytes(dotdot.clone().to_bytes()?.as_slice())?
-        );
-
-        let regular_dir = DirTableEntry::Regular(ReadDirEntry {
-            inode: Inode(1234),
-            assignment: InodeAssignment::Directory,
-        });
-        assert_eq!(
-            regular_dir,
-            DirTableEntry::from_bytes(regular_dir.clone().to_bytes()?.as_slice())?
-        );
-
-        let regular_file = DirTableEntry::Regular(ReadDirEntry {
-            inode: Inode(1234),
-            assignment: InodeAssignment::Directory,
-        });
-        assert_eq!(
-            regular_file,
-            DirTableEntry::from_bytes(regular_file.clone().to_bytes()?.as_slice())?
-        );
-
-        Ok(())
-    }
-
-    #[test]
     fn convert_file_table_key_default() -> anyhow::Result<()> {
         let key = FileTableKey::Default(Inode(12345));
 
@@ -1262,5 +1253,76 @@ mod tests {
         assert_eq!(&bytes[0..8], Inode(11111).as_u64().to_be_bytes());
         assert_eq!(bytes[8], 1);
         assert_eq!(&bytes[9..], b"test");
+    }
+
+    #[test]
+    fn convert_file_or_dir_table_entry_file() -> anyhow::Result<()> {
+        let file_entry = FileTableEntry {
+            size: 200,
+            mtime: UnixTime::from_secs(1234567890),
+            path: Path::parse("foo/bar.txt")?,
+            hash: Hash([0xa1u8; 32]),
+            blob: Some(BlobId(5541)),
+            outdated_by: Some(Hash([3u8; 32])),
+        };
+
+        let entry = FileOrDirTableEntry::File(file_entry);
+
+        assert_eq!(
+            entry,
+            FileOrDirTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn convert_file_or_dir_table_entry_dir() -> anyhow::Result<()> {
+        let dir_entry = DirtableEntry {
+            mtime: UnixTime::from_secs(987654321),
+        };
+
+        let entry = FileOrDirTableEntry::Dir(dir_entry);
+
+        assert_eq!(
+            entry,
+            FileOrDirTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn convert_file_or_dir_table_entry_both_variants() -> anyhow::Result<()> {
+        // Test both variants in the same test
+        let file_entry = FileTableEntry {
+            size: 100,
+            mtime: UnixTime::from_secs(1234567890),
+            path: Path::parse("test/file.txt")?,
+            hash: Hash([0x42u8; 32]),
+            blob: None,
+            outdated_by: None,
+        };
+
+        let dir_entry = DirtableEntry {
+            mtime: UnixTime::from_secs(987654321),
+        };
+
+        let file_variant = FileOrDirTableEntry::File(file_entry);
+        let dir_variant = FileOrDirTableEntry::Dir(dir_entry);
+
+        // Test file variant round-trip
+        assert_eq!(
+            file_variant,
+            FileOrDirTableEntry::from_bytes(file_variant.clone().to_bytes()?.as_slice())?
+        );
+
+        // Test dir variant round-trip
+        assert_eq!(
+            dir_variant,
+            FileOrDirTableEntry::from_bytes(dir_variant.clone().to_bytes()?.as_slice())?
+        );
+
+        Ok(())
     }
 }

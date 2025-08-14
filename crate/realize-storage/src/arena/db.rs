@@ -1,6 +1,6 @@
 use super::types::FileTableKey;
 use super::types::{
-    BlobTableEntry, DirTableEntry, FailedJobTableEntry, FileTableEntry, HistoryTableEntry,
+    BlobTableEntry, FailedJobTableEntry, FileOrDirTableEntry, FileTableEntry, HistoryTableEntry,
     MarkTableEntry, PeerTableEntry, QueueTableEntry,
 };
 use crate::Inode;
@@ -23,21 +23,6 @@ const HISTORY_TABLE: TableDefinition<u64, Holder<HistoryTableEntry>> =
 /// Key: string
 /// Value: depends on the setting
 const SETTIGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("index.settings");
-
-/// Tracks directory content.
-///
-/// Each entry in a directory has an entry in this table, keyed with
-/// the directory inode and the entry name.
-///
-/// To list directory content, do a range scan.
-///
-/// The special name "." store information about the current
-/// directory, in a DirTableEntry::Self.
-///
-/// Key: (inode, name)
-/// Value: DirTableEntry
-pub(crate) const DIR_TABLE: TableDefinition<(Inode, &str), Holder<DirTableEntry>> =
-    TableDefinition::new("acache.dir");
 
 /// Tree branches and leaves, associated to inodes.
 ///
@@ -62,9 +47,9 @@ pub(crate) const TREE_REFCOUNT_TABLE: TableDefinition<Inode, u32> =
 /// directories.
 ///
 /// Key: FileTableKey (inode, default|local|peer, peer)
-/// Value: FileTableEntry
-const CACHE_TABLE: TableDefinition<FileTableKey, Holder<FileTableEntry>> =
-    TableDefinition::new("acache.file");
+/// Value: FileOrDirTableEntry
+const CACHE_TABLE: TableDefinition<FileTableKey, Holder<FileOrDirTableEntry>> =
+    TableDefinition::new("cache.file");
 
 /// Track local indexed files.
 ///
@@ -74,7 +59,7 @@ const CACHE_TABLE: TableDefinition<FileTableKey, Holder<FileTableEntry>> =
 /// Key: Inode
 /// Value: FileTableEntry
 const INDEX_TABLE: TableDefinition<Inode, Holder<FileTableEntry>> =
-    TableDefinition::new("acache.local_file");
+    TableDefinition::new("index.file");
 
 /// Track peer files that might have been deleted remotely.
 ///
@@ -181,7 +166,6 @@ impl ArenaDatabase {
             // transactions in an empty database.
             txn.open_table(HISTORY_TABLE)?;
             txn.open_table(SETTIGS_TABLE)?;
-            txn.open_table(DIR_TABLE)?;
             txn.open_table(TREE_TABLE)?;
             txn.open_table(TREE_REFCOUNT_TABLE)?;
             txn.open_table(CACHE_TABLE)?;
@@ -300,16 +284,9 @@ impl ArenaWriteTransaction {
         Ok(self.inner.open_table(TREE_REFCOUNT_TABLE)?)
     }
 
-    pub fn dir_table<'txn>(
-        &'txn self,
-    ) -> Result<Table<'txn, (Inode, &'static str), Holder<'static, DirTableEntry>>, StorageError>
-    {
-        Ok(self.inner.open_table(DIR_TABLE)?)
-    }
-
     pub fn cache_table<'txn>(
         &'txn self,
-    ) -> Result<Table<'txn, FileTableKey, Holder<'static, FileTableEntry>>, StorageError> {
+    ) -> Result<Table<'txn, FileTableKey, Holder<'static, FileOrDirTableEntry>>, StorageError> {
         Ok(self.inner.open_table(CACHE_TABLE)?)
     }
 
@@ -401,16 +378,10 @@ impl ArenaReadTransaction {
         Ok(self.inner.open_table(TREE_TABLE)?)
     }
 
-    pub fn dir_table(
-        &self,
-    ) -> Result<ReadOnlyTable<(Inode, &'static str), Holder<'static, DirTableEntry>>, StorageError>
-    {
-        Ok(self.inner.open_table(DIR_TABLE)?)
-    }
-
     pub fn cache_table(
         &self,
-    ) -> Result<ReadOnlyTable<FileTableKey, Holder<'static, FileTableEntry>>, StorageError> {
+    ) -> Result<ReadOnlyTable<FileTableKey, Holder<'static, FileOrDirTableEntry>>, StorageError>
+    {
         Ok(self.inner.open_table(CACHE_TABLE)?)
     }
 
@@ -499,7 +470,7 @@ mod tests {
         let txn = fixture.db.begin_read()?;
         txn.history_table()?;
         txn.tree_table()?;
-        txn.dir_table()?;
+        txn.cache_table()?;
         txn.peer_table()?;
         txn.notification_table()?;
         txn.blob_table()?;
