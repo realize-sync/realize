@@ -41,6 +41,14 @@ impl<'a, T> Holder<'a, T> {
             Holder::Borrowed(arr, _) => arr,
         }
     }
+
+    /// Return a holder for a reference to the data
+    pub fn borrow(&self) -> Holder<'_, T> {
+        match self {
+            Holder::Owned(vec, p) => Holder::Borrowed(vec.as_slice(), *p),
+            Holder::Borrowed(arr, p) => Holder::Borrowed(arr, *p),
+        }
+    }
 }
 
 impl<'a, T> Holder<'a, T>
