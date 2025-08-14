@@ -506,8 +506,6 @@ pub enum FileTableKey {
     /// The default entry, containing the selected version and its
     /// metadata for the cache.
     Default(Inode),
-    /// An entry that represents the local copy.
-    LocalCopy(Inode),
     /// An entry that represents another peer's copy.
     PeerCopy(Inode, Peer),
 
@@ -526,7 +524,6 @@ impl FileTableKey {
         match self {
             FileTableKey::Invalid => Inode::ZERO,
             FileTableKey::Default(inode) => *inode,
-            FileTableKey::LocalCopy(inode) => *inode,
             FileTableKey::PeerCopy(inode, _) => *inode,
         }
     }
@@ -535,8 +532,7 @@ impl FileTableKey {
         match self {
             FileTableKey::Invalid => 0,
             FileTableKey::Default(_) => 1,
-            FileTableKey::LocalCopy(_) => 2,
-            FileTableKey::PeerCopy(_, _) => 3,
+            FileTableKey::PeerCopy(_, _) => 2,
         }
     }
 
@@ -609,7 +605,6 @@ impl Value for FileTableKey {
         }
         match data.get(8) {
             None => FileTableKey::Default(inode),
-            Some(0) => FileTableKey::LocalCopy(inode),
             Some(1) => {
                 FileTableKey::PeerCopy(inode, Peer::from(str::from_utf8(&data[9..]).unwrap()))
             }
@@ -626,9 +621,6 @@ impl Value for FileTableKey {
         ret.extend_from_slice(&value.inode().as_u64().to_be_bytes());
         match value {
             FileTableKey::Default(_) | FileTableKey::Invalid => {}
-            FileTableKey::LocalCopy(_) => {
-                ret.push(0);
-            }
             FileTableKey::PeerCopy(_, peer) => {
                 ret.push(1);
                 ret.extend_from_slice(peer.as_str().as_bytes());
@@ -1132,17 +1124,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn convert_file_table_key_local_copy() -> anyhow::Result<()> {
-        let key = FileTableKey::LocalCopy(Inode(67890));
 
-        // Test round-trip conversion
-        let bytes = FileTableKey::as_bytes(&key);
-        let converted = FileTableKey::from_bytes(&bytes);
-        assert_eq!(key, converted);
-
-        Ok(())
-    }
 
     #[test]
     fn convert_file_table_key_peer_copy() -> anyhow::Result<()> {
@@ -1173,8 +1155,6 @@ mod tests {
         let test_cases = vec![
             FileTableKey::Default(Inode(1)),
             FileTableKey::Default(Inode(0xFFFFFFFFFFFFFFFF)),
-            FileTableKey::LocalCopy(Inode(2)),
-            FileTableKey::LocalCopy(Inode(0xFFFFFFFFFFFFFFFF)),
             FileTableKey::PeerCopy(Inode(3), Peer::from("short")),
             FileTableKey::PeerCopy(
                 Inode(4),
@@ -1199,8 +1179,6 @@ mod tests {
         let test_cases = vec![
             FileTableKey::Default(Inode(1)),
             FileTableKey::Default(Inode(2)),
-            FileTableKey::LocalCopy(Inode(1)),
-            FileTableKey::LocalCopy(Inode(2)),
             FileTableKey::PeerCopy(Inode(1), Peer::from("a")),
             FileTableKey::PeerCopy(Inode(1), Peer::from("b")),
             FileTableKey::PeerCopy(Inode(2), Peer::from("a")),
@@ -1246,9 +1224,6 @@ mod tests {
             FileTableKey::Default(Inode(1)),
             FileTableKey::Default(Inode(2)),
             FileTableKey::Default(Inode(0x110000)),
-            FileTableKey::LocalCopy(Inode(1)),
-            FileTableKey::LocalCopy(Inode(2)),
-            FileTableKey::Default(Inode(0x110000)),
             FileTableKey::PeerCopy(Inode(1), Peer::from("a")),
             FileTableKey::PeerCopy(Inode(1), Peer::from("b")),
             FileTableKey::PeerCopy(Inode(2), Peer::from("a")),
@@ -1279,7 +1254,6 @@ mod tests {
         // Test edge cases
         let edge_cases = vec![
             FileTableKey::Default(Inode(1)),                   // Non-zero inode
-            FileTableKey::LocalCopy(Inode(1)),                 // Non-zero inode
             FileTableKey::PeerCopy(Inode(1), Peer::from("")),  // Empty peer
             FileTableKey::PeerCopy(Inode(1), Peer::from("a")), // Single char peer
         ];
@@ -1293,7 +1267,6 @@ mod tests {
         // Test that Inode(0) gets converted to Invalid (this is the intended behavior)
         let zero_inode_cases = vec![
             FileTableKey::Default(Inode(0)),
-            FileTableKey::LocalCopy(Inode(0)),
             FileTableKey::PeerCopy(Inode(0), Peer::from("")),
         ];
 
@@ -1322,13 +1295,7 @@ mod tests {
         assert_eq!(bytes.len(), 8);
         assert_eq!(bytes, [0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x21, 0xa3]);
 
-        let key = FileTableKey::LocalCopy(Inode(67890));
-        let bytes = FileTableKey::as_bytes(&key);
 
-        // Should be 9 bytes for LocalCopy (inode + 0 byte)
-        assert_eq!(bytes.len(), 9);
-        assert_eq!(&bytes[0..8], Inode(67890).as_u64().to_be_bytes());
-        assert_eq!(bytes[8], 0);
 
         let key = FileTableKey::PeerCopy(Inode(11111), Peer::from("test"));
         let bytes = FileTableKey::as_bytes(&key);

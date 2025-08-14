@@ -63,8 +63,18 @@ pub(crate) const TREE_REFCOUNT_TABLE: TableDefinition<Inode, u32> =
 ///
 /// Key: FileTableKey (inode, default|local|peer, peer)
 /// Value: FileTableEntry
-const FILE_TABLE: TableDefinition<FileTableKey, Holder<FileTableEntry>> =
+const CACHE_TABLE: TableDefinition<FileTableKey, Holder<FileTableEntry>> =
     TableDefinition::new("acache.file");
+
+/// Track local indexed files.
+///
+/// Each locally indexed file has an entry in this table, keyed with
+/// the file inode.
+///
+/// Key: Inode
+/// Value: FileTableEntry
+const INDEX_TABLE: TableDefinition<Inode, Holder<FileTableEntry>> =
+    TableDefinition::new("acache.local_file");
 
 /// Track peer files that might have been deleted remotely.
 ///
@@ -174,7 +184,8 @@ impl ArenaDatabase {
             txn.open_table(DIR_TABLE)?;
             txn.open_table(TREE_TABLE)?;
             txn.open_table(TREE_REFCOUNT_TABLE)?;
-            txn.open_table(FILE_TABLE)?;
+            txn.open_table(CACHE_TABLE)?;
+            txn.open_table(INDEX_TABLE)?;
             txn.open_table(PENDING_CATCHUP_TABLE)?;
             txn.open_table(PEER_TABLE)?;
             txn.open_table(NOTIFICATION_TABLE)?;
@@ -296,10 +307,16 @@ impl ArenaWriteTransaction {
         Ok(self.inner.open_table(DIR_TABLE)?)
     }
 
-    pub fn file_table<'txn>(
+    pub fn cache_table<'txn>(
         &'txn self,
     ) -> Result<Table<'txn, FileTableKey, Holder<'static, FileTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(FILE_TABLE)?)
+        Ok(self.inner.open_table(CACHE_TABLE)?)
+    }
+
+    pub fn index_table<'txn>(
+        &'txn self,
+    ) -> Result<Table<'txn, Inode, Holder<'static, FileTableEntry>>, StorageError> {
+        Ok(self.inner.open_table(INDEX_TABLE)?)
     }
 
     pub fn pending_catchup_table<'txn>(
@@ -391,10 +408,16 @@ impl ArenaReadTransaction {
         Ok(self.inner.open_table(DIR_TABLE)?)
     }
 
-    pub fn file_table(
+    pub fn cache_table(
         &self,
     ) -> Result<ReadOnlyTable<FileTableKey, Holder<'static, FileTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(FILE_TABLE)?)
+        Ok(self.inner.open_table(CACHE_TABLE)?)
+    }
+
+    pub fn index_table(
+        &self,
+    ) -> Result<ReadOnlyTable<Inode, Holder<'static, FileTableEntry>>, StorageError> {
+        Ok(self.inner.open_table(INDEX_TABLE)?)
     }
 
     pub fn peer_table(
