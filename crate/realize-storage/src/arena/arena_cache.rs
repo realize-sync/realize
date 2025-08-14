@@ -1687,7 +1687,7 @@ mod tests {
 
     use super::ArenaCache;
     use crate::arena::db::{ArenaDatabase, ArenaReadTransaction};
-    use crate::arena::engine::{self, DirtyPaths};
+    use crate::arena::engine::DirtyPaths;
     use crate::arena::index::RealIndex;
     use crate::arena::mark::PathMarks;
     use crate::arena::notifier::Notification;
@@ -1756,7 +1756,7 @@ mod tests {
 
         fn clear_dirty(&self) -> anyhow::Result<()> {
             let txn = self.db.begin_write()?;
-            while engine::take_dirty(&txn)?.is_some() {}
+            while self.acache.dirty_paths.take_next_dirty_path(&txn)?.is_some() {}
             txn.commit()?;
 
             Ok(())
@@ -1909,7 +1909,7 @@ mod tests {
 
         fixture.add_to_cache(&file_path, 100, test_time())?;
 
-        assert!(engine::is_dirty(&fixture.begin_read()?, &file_path)?);
+        assert!(fixture.acache.dirty_paths.is_dirty(&fixture.begin_read()?, &file_path)?);
 
         Ok(())
     }
@@ -1991,7 +1991,7 @@ mod tests {
             },
             None,
         )?;
-        assert!(engine::is_dirty(&fixture.begin_read()?, &file_path)?);
+        assert!(fixture.acache.dirty_paths.is_dirty(&fixture.begin_read()?, &file_path)?);
 
         Ok(())
     }
@@ -2032,7 +2032,7 @@ mod tests {
             },
             None,
         )?;
-        assert!(!engine::is_dirty(&fixture.begin_read()?, &file_path)?);
+        assert!(!fixture.acache.dirty_paths.is_dirty(&fixture.begin_read()?, &file_path)?);
 
         Ok(())
     }
@@ -2125,7 +2125,7 @@ mod tests {
 
         fixture.clear_dirty()?;
         fixture.remove_from_cache(&file_path)?;
-        assert!(engine::is_dirty(&fixture.begin_read()?, &file_path)?);
+        assert!(fixture.acache.dirty_paths.is_dirty(&fixture.begin_read()?, &file_path)?);
 
         Ok(())
     }
@@ -3592,7 +3592,7 @@ mod tests {
         /// Clear all dirty flags in both index and cache
         fn clear_all_dirty(&self) -> anyhow::Result<()> {
             let txn = self.db.begin_write()?;
-            while engine::take_dirty(&txn)?.is_some() {}
+            while self.acache.dirty_paths.take_next_dirty_path(&txn)?.is_some() {}
             txn.commit()?;
 
             Ok(())
@@ -3605,7 +3605,7 @@ mod tests {
         {
             let path = path.as_ref();
             let txn = self.db.begin_read()?;
-            Ok(engine::is_dirty(&txn, path)?)
+            Ok(self.acache.dirty_paths.is_dirty(&txn, path)?)
         }
 
         /// Add a file to the index for testing
