@@ -5,10 +5,11 @@ use super::types::{
     BlobTableEntry, CacheTableEntry, FailedJobTableEntry, FileTableEntry, HistoryTableEntry,
     MarkTableEntry, PeerTableEntry, QueueTableEntry,
 };
-use crate::Inode;
 use crate::StorageError;
 use crate::types::BlobId;
 use crate::utils::holder::Holder;
+use crate::{Inode, InodeAllocator};
+use realize_types::Arena;
 use redb::{ReadOnlyTable, Table, TableDefinition};
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -158,6 +159,11 @@ const FAILED_JOB_TABLE: TableDefinition<u64, Holder<FailedJobTableEntry>> =
 
 pub(crate) struct ArenaDatabase {
     db: redb::Database,
+    arena: Arena,
+    subsystems: Subsystems,
+}
+
+struct Subsystems {
     tree: Tree,
     dirty: Dirty,
 }
@@ -179,14 +185,19 @@ impl ArenaDatabase {
         arena: realize_types::Arena,
         allocator: Arc<crate::InodeAllocator>,
     ) -> anyhow::Result<Arc<Self>> {
-        let tree = Tree::new(arena, allocator)?;
         Ok(ArenaDatabase::new(
             crate::utils::redb_utils::in_memory()?,
-            tree,
+            arena,
+            allocator,
         )?)
     }
 
-    pub fn new(db: redb::Database, tree: Tree) -> Result<Arc<Self>, StorageError> {
+    pub fn new(
+        db: redb::Database,
+        arena: Arena,
+        allocator: Arc<InodeAllocator>,
+    ) -> Result<Arc<Self>, StorageError> {
+        let tree = Tree::new(arena, allocator)?;
         let dirty: Dirty;
         let txn = db.begin_write()?;
         {
@@ -215,26 +226,34 @@ impl ArenaDatabase {
         }
         txn.commit()?;
 
-        Ok(Arc::new(Self { db, tree, dirty }))
+        Ok(Arc::new(Self {
+            db,
+            arena,
+            subsystems: Subsystems { tree, dirty },
+        }))
+    }
+
+    #[allow(dead_code)]
+    pub fn arena(&self) -> Arena {
+        self.arena
     }
 
     /// Return handle on the Tree subsystem.
     #[allow(dead_code)]
     pub fn tree(&self) -> &Tree {
-        &self.tree
+        &self.subsystems.tree
     }
 
     /// Return handle on the Dirty subsystem.
     #[allow(dead_code)]
     pub fn dirty(&self) -> &Dirty {
-        &self.dirty
+        &self.subsystems.dirty
     }
 
     pub fn begin_write(&self) -> Result<ArenaWriteTransaction<'_>, StorageError> {
         Ok(ArenaWriteTransaction {
             inner: self.db.begin_write()?,
-            tree: &self.tree,
-            dirty: &self.dirty,
+            subsystems: &self.subsystems,
             before_commit: RefCell::new(vec![]),
             after_commit: RefCell::new(vec![]),
         })
@@ -243,15 +262,14 @@ impl ArenaDatabase {
     pub fn begin_read(&self) -> Result<ArenaReadTransaction<'_>, StorageError> {
         Ok(ArenaReadTransaction {
             inner: self.db.begin_read()?,
-            tree: &self.tree,
+            subsystems: &self.subsystems,
         })
     }
 }
 
 pub struct ArenaWriteTransaction<'db> {
     inner: redb::WriteTransaction,
-    tree: &'db Tree,
-    dirty: &'db Dirty,
+    subsystems: &'db Subsystems,
 
     /// Callbacks to be run after the transaction is committed.
     ///
@@ -376,7 +394,7 @@ impl<'db> ArenaWriteTransaction<'db> {
     pub(crate) fn read_tree(&self) -> Result<impl TreeReadOperations, StorageError> {
         Ok(ReadableOpenTree::new(
             self.inner.open_table(TREE_TABLE)?,
-            &self.tree,
+            &self.subsystems.tree,
         ))
     }
 
@@ -386,7 +404,7 @@ impl<'db> ArenaWriteTransaction<'db> {
             self.inner.open_table(TREE_TABLE)?,
             self.inner.open_table(TREE_REFCOUNT_TABLE)?,
             self.inner.open_table(CURRENT_INODE_RANGE_TABLE)?,
-            &self.tree,
+            &self.subsystems.tree,
         ))
     }
 
@@ -402,7 +420,7 @@ impl<'db> ArenaWriteTransaction<'db> {
     pub(crate) fn write_dirty(&self) -> Result<WritableOpenDirty<'_>, StorageError> {
         Ok(WritableOpenDirty::new(
             &self,
-            &self.dirty,
+            &self.subsystems.dirty,
             self.inner.open_table(DIRTY_TABLE)?,
             self.inner.open_table(DIRTY_LOG_TABLE)?,
             self.inner.open_table(FAILED_JOB_TABLE)?,
@@ -413,7 +431,7 @@ impl<'db> ArenaWriteTransaction<'db> {
 
 pub struct ArenaReadTransaction<'db> {
     inner: redb::ReadTransaction,
-    tree: &'db Tree,
+    subsystems: &'db Subsystems,
 }
 
 impl<'db> ArenaReadTransaction<'db> {
@@ -472,7 +490,7 @@ impl<'db> ArenaReadTransaction<'db> {
     pub(crate) fn read_tree(&self) -> Result<impl TreeReadOperations, StorageError> {
         Ok(ReadableOpenTree::new(
             self.inner.open_table(TREE_TABLE)?,
-            &self.tree,
+            &self.subsystems.tree,
         ))
     }
 

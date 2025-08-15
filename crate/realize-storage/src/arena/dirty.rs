@@ -1,14 +1,11 @@
 #![allow(dead_code)]
 
-use std::time::Duration;
-
-use super::{
-    db::ArenaWriteTransaction,
-    types::{FailedJobTableEntry, RetryJob},
-};
+use super::db::ArenaWriteTransaction;
+use super::types::{FailedJobTableEntry, RetryJob};
 use crate::{JobId, StorageError, utils::holder::Holder};
 use realize_types::{Path, UnixTime};
 use redb::{ReadableTable, Table};
+use std::time::Duration;
 use tokio::sync::watch;
 
 pub(crate) struct Dirty {

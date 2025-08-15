@@ -981,8 +981,7 @@ mod tests {
                 std::fs::create_dir_all(p)?;
             }
             let db = ArenaDatabase::for_testing_single_arena(arena)?;
-            let acache =
-                ArenaCache::new(arena, db.tree().root(), Arc::clone(&db), blob_dir.path())?;
+            let acache = ArenaCache::new(arena, Arc::clone(&db), blob_dir.path())?;
 
             Ok(Self {
                 arena,

@@ -60,16 +60,9 @@ impl ArenaCache {
         allocator: Arc<crate::InodeAllocator>,
         blob_dir: &std::path::Path,
     ) -> anyhow::Result<Arc<Self>> {
-        let tree = super::tree::Tree::new(arena, allocator)?;
-        let arena_root = tree.root();
-        let db = ArenaDatabase::new(crate::utils::redb_utils::in_memory()?, tree)?;
+        let db = ArenaDatabase::new(crate::utils::redb_utils::in_memory()?, arena, allocator)?;
 
-        Ok(ArenaCache::new(
-            arena,
-            arena_root,
-            Arc::clone(&db),
-            blob_dir,
-        )?)
+        Ok(ArenaCache::new(arena, Arc::clone(&db), blob_dir)?)
     }
 
     #[cfg(test)]
@@ -80,7 +73,6 @@ impl ArenaCache {
     /// Create a new ArenaUnrealCacheBlocking from an arena, root inode, database, and blob directory.
     pub(crate) fn new(
         arena: Arena,
-        arena_root: Inode,
         db: Arc<ArenaDatabase>,
         blob_dir: &std::path::Path,
     ) -> Result<Arc<Self>, StorageError> {
@@ -95,7 +87,7 @@ impl ArenaCache {
 
         Ok(Arc::new(Self {
             arena,
-            arena_root,
+            arena_root: db.tree().root(),
             db,
             blobstore,
             uuid,
@@ -1663,13 +1655,13 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::ArenaCache;
-    use crate::arena::db::{ArenaDatabase, ArenaReadTransaction};
+    use crate::arena::db::ArenaDatabase;
     use crate::arena::dirty::DirtyReadOperations;
 
     use crate::arena::index::RealIndex;
     use crate::arena::mark::PathMarks;
     use crate::arena::notifier::Notification;
-    use crate::arena::tree::{Tree, TreeExt, TreeReadOperations};
+    use crate::arena::tree::{TreeExt, TreeReadOperations};
     use crate::arena::types::HistoryTableEntry;
     use crate::utils::hash;
     use crate::utils::redb_utils;
@@ -3024,19 +3016,24 @@ mod tests {
         let path = tempdir.path().join("index.db");
         let allocator =
             InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
-        let tree = Tree::new(arena, Arc::clone(&allocator))?;
-        let arena_root = tree.root();
-        let db = ArenaDatabase::new(redb::Database::create(&path)?, tree)?;
+        let db = ArenaDatabase::new(
+            redb::Database::create(&path)?,
+            arena,
+            Arc::clone(&allocator),
+        )?;
         let blob_dir = tempdir.child("blobs");
-        let acache = ArenaCache::new(arena, arena_root, db, blob_dir.path())?;
+        let acache = ArenaCache::new(arena, db, blob_dir.path())?;
         let uuid = acache.uuid().clone();
 
         // Drop the first instance to release the database lock
         drop(acache);
 
-        let tree = Tree::new(arena, Arc::clone(&allocator))?;
-        let db = ArenaDatabase::new(redb::Database::create(&path)?, tree)?;
-        let acache = ArenaCache::new(arena, arena_root, db, blob_dir.path())?;
+        let db = ArenaDatabase::new(
+            redb::Database::create(&path)?,
+            arena,
+            Arc::clone(&allocator),
+        )?;
+        let acache = ArenaCache::new(arena, db, blob_dir.path())?;
         assert!(!uuid.is_nil());
         assert_eq!(uuid, acache.uuid().clone());
 

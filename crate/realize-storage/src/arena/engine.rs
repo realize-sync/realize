@@ -611,7 +611,6 @@ mod tests {
     use crate::arena::arena_cache::ArenaCache;
     use crate::arena::index::RealIndex;
     use crate::arena::mark::PathMarks;
-    use crate::arena::tree::Tree;
     use crate::utils::redb_utils;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
@@ -647,18 +646,12 @@ mod tests {
             arena_path.create_dir_all()?;
 
             let arena = Arena::from("myarena");
-            let tree = Tree::new(
+            let db = ArenaDatabase::new(
+                redb_utils::in_memory()?,
                 arena,
                 InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?,
             )?;
-            let arena_root = tree.root();
-            let db = ArenaDatabase::new(redb_utils::in_memory()?, tree)?;
-            let acache = ArenaCache::new(
-                arena,
-                arena_root,
-                Arc::clone(&db),
-                &tempdir.path().join("blobs"),
-            )?;
+            let acache = ArenaCache::new(arena, Arc::clone(&db), &tempdir.path().join("blobs"))?;
             let arena_root = acache.arena_root();
             let index = acache.as_index();
             let marks = acache.clone() as Arc<dyn PathMarks>;
