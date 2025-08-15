@@ -1728,10 +1728,6 @@ mod tests {
             })
         }
 
-        fn begin_read(&self) -> anyhow::Result<ArenaReadTransaction> {
-            Ok(self.db.begin_read()?)
-        }
-
         fn clear_dirty(&self) -> anyhow::Result<()> {
             let txn = self.db.begin_write()?;
             {
