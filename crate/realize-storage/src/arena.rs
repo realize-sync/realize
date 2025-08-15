@@ -20,6 +20,7 @@ pub mod db;
 mod dirty;
 pub mod engine;
 pub mod hasher;
+mod history;
 pub mod index;
 pub mod indexed_store;
 mod jobs;

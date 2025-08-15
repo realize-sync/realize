@@ -1,5 +1,6 @@
 use super::blob::{self, Blobstore};
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
+use super::history::HistoryReadOperations;
 use super::index::RealIndex;
 use super::mark::PathMarks;
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
@@ -16,10 +17,9 @@ use crate::{Blob, InodeAssignment, Mark};
 use crate::{Inode, StorageError};
 use realize_types::{Arena, ByteRanges, Hash, Path, Peer, UnixTime};
 use redb::{ReadableTable, Table};
-use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 /// A per-arena cache of remote files.
@@ -31,11 +31,7 @@ pub(crate) struct ArenaCache {
     arena_root: Inode,
     db: Arc<ArenaDatabase>,
     blobstore: Arc<Blobstore>,
-
-    history_tx: watch::Sender<u64>,
     uuid: Uuid,
-    /// This is just to keep history_tx alive and up-to-date.
-    _history_rx: watch::Receiver<u64>,
 }
 
 impl ArenaCache {
@@ -78,21 +74,12 @@ impl ArenaCache {
     ) -> Result<Arc<Self>, StorageError> {
         let blobstore = Blobstore::new(Arc::clone(&db), blob_dir)?;
         let uuid = load_or_assign_uuid(&db)?;
-        let last_history_index = {
-            let txn = db.begin_read()?;
-            let history_table = txn.history_table()?;
-            last_history_index(&history_table)?
-        };
-        let (history_tx, history_rx) = watch::channel(last_history_index);
-
         Ok(Arc::new(Self {
             arena,
             arena_root: db.tree().root(),
             db,
             blobstore,
             uuid,
-            history_tx,
-            _history_rx: history_rx,
         }))
     }
 
@@ -838,7 +825,6 @@ impl ArenaCache {
         hash: Hash,
     ) -> Result<IndexedFileTableEntry, StorageError> {
         let mut index_table = txn.index_table()?;
-        let mut history_table = txn.history_table()?;
         let old_hash = tree
             .resolve(path)?
             .map(|inode| {
@@ -856,49 +842,11 @@ impl ArenaCache {
         let inode = tree.setup(path)?;
         tree.insert_and_incref(inode, &mut index_table, inode, Holder::new(&entry)?)?;
         if !same_hash {
-            let mut dirty = txn.write_dirty()?;
-            dirty.mark_dirty(path)?;
-            let index = self.allocate_history_index(txn, &history_table)?;
-            let ev = if let Some(old_hash) = old_hash {
-                HistoryTableEntry::Replace(path.clone(), old_hash)
-            } else {
-                HistoryTableEntry::Add(path.clone())
-            };
-            log::debug!("[{}] History #{index}: {ev:?}", self.arena);
-            history_table.insert(index, Holder::with_content(ev)?)?;
+            txn.write_dirty()?.mark_dirty(path)?;
+            txn.write_history()?.report_added(path, old_hash.as_ref())?;
         }
 
         Ok(entry.into())
-    }
-
-    fn allocate_history_index(
-        &self,
-        txn: &ArenaWriteTransaction,
-        history_table: &impl ReadableTable<u64, Holder<'static, HistoryTableEntry>>,
-    ) -> Result<u64, StorageError> {
-        let entry_index = 1 + last_history_index(history_table)?;
-
-        let history_tx = self.history_tx.clone();
-        txn.after_commit(move || {
-            let _ = history_tx.send(entry_index);
-        });
-        Ok(entry_index)
-    }
-
-    fn report_removed(
-        &self,
-        txn: &ArenaWriteTransaction,
-        history_table: &mut redb::Table<'_, u64, Holder<'static, HistoryTableEntry>>,
-        path: realize_types::Path,
-        hash: Hash,
-    ) -> Result<(), StorageError> {
-        let index = self.allocate_history_index(txn, history_table)?;
-        let mut dirty = txn.write_dirty()?;
-        dirty.mark_dirty(&path)?;
-        let ev = HistoryTableEntry::Remove(path, hash);
-        log::debug!("[{}] History #{index}: {ev:?}", self.arena);
-        history_table.insert(index, Holder::with_content(ev)?)?;
-        Ok(())
     }
 
     fn unindex_file(
@@ -906,7 +854,6 @@ impl ArenaCache {
         txn: &ArenaWriteTransaction,
         tree: &mut WritableOpenTree,
         index_table: &mut Table<'_, Inode, Holder<'static, FileTableEntry>>,
-        history_table: &mut Table<'_, u64, Holder<'static, HistoryTableEntry>>,
         inode: Inode,
     ) -> Result<(), StorageError> {
         let FileTableEntry { path, hash, .. } = match index_table.get(inode)? {
@@ -917,7 +864,8 @@ impl ArenaCache {
             Some(existing) => existing.value().parse()?,
         };
         if tree.remove_and_decref(inode, index_table, inode)? {
-            self.report_removed(txn, history_table, path, hash)?;
+            txn.write_dirty()?.mark_dirty(&path)?;
+            txn.write_history()?.report_removed(&path, &hash)?;
         }
 
         Ok(())
@@ -928,16 +876,18 @@ impl ArenaCache {
         txn: &ArenaWriteTransaction,
         tree: &mut WritableOpenTree,
         index_table: &mut Table<'_, Inode, Holder<'static, FileTableEntry>>,
-        history_table: &mut Table<'_, u64, Holder<'static, HistoryTableEntry>>,
         inode: Inode,
     ) -> Result<(), StorageError> {
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
         tree.remove_recursive_and_decref(
             inode,
             index_table,
             |inode| Ok(inode),
             |_, e| {
                 let FileTableEntry { path, hash, .. } = e.parse()?;
-                self.report_removed(txn, history_table, path, hash)?;
+                dirty.mark_dirty(&path)?;
+                history.report_removed(&path, &hash)?;
 
                 Ok(true)
             },
@@ -985,14 +935,11 @@ impl RealIndex for ArenaCache {
     }
 
     fn watch_history(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.history_tx.subscribe()
+        self.db.history().watch()
     }
 
     fn last_history_index(&self) -> Result<u64, StorageError> {
-        let txn = self.db.begin_read()?;
-        let history_table = txn.history_table()?;
-
-        last_history_index(&history_table)
+        self.db.begin_read()?.read_history()?.last_history_index()
     }
 
     fn get_file(
@@ -1106,14 +1053,7 @@ impl RealIndex for ArenaCache {
                 let mut tree = txn.write_tree()?;
                 if let Some(inode) = tree.resolve(path)? {
                     let mut index_table = txn.index_table()?;
-                    let mut history_table = txn.history_table()?;
-                    self.unindex_file(
-                        &txn,
-                        &mut tree,
-                        &mut index_table,
-                        &mut history_table,
-                        inode,
-                    )?;
+                    self.unindex_file(&txn, &mut tree, &mut index_table, inode)?;
                 }
             }
             txn.commit()?;
@@ -1152,24 +1092,10 @@ impl RealIndex for ArenaCache {
 
     fn history(
         &self,
-        range: Range<u64>,
+        range: std::ops::Range<u64>,
         tx: mpsc::Sender<Result<(u64, HistoryTableEntry), StorageError>>,
     ) -> Result<(), StorageError> {
-        let txn = self.db.begin_read()?;
-        let history_table = txn.history_table()?;
-        for res in history_table.range(range)?.map(|res| match res {
-            Err(err) => Err(StorageError::from(err)),
-            Ok((k, v)) => match v.value().parse() {
-                Ok(v) => Ok((k.value(), v)),
-                Err(err) => Err(StorageError::from(err)),
-            },
-        }) {
-            if let Err(_) = tx.blocking_send(res) {
-                break;
-            }
-        }
-
-        Ok(())
+        self.db.begin_read()?.read_history()?.history(range, tx)
     }
 
     fn remove_file_or_dir(&self, path: &realize_types::Path) -> Result<(), StorageError> {
@@ -1178,9 +1104,8 @@ impl RealIndex for ArenaCache {
             let mut tree = txn.write_tree()?;
             if let Some(inode) = tree.resolve(path)? {
                 let mut index_table = txn.index_table()?;
-                let mut history_table = txn.history_table()?;
-                self.unindex_file(&txn, &mut tree, &mut index_table, &mut history_table, inode)?;
-                self.unindex_dir(&txn, &mut tree, &mut index_table, &mut history_table, inode)?;
+                self.unindex_file(&txn, &mut tree, &mut index_table, inode)?;
+                self.unindex_dir(&txn, &mut tree, &mut index_table, inode)?;
             }
         }
         txn.commit()?;
@@ -1204,19 +1129,13 @@ impl RealIndex for ArenaCache {
         };
 
         let mut index_table = txn.index_table()?;
-        let mut history_table = txn.history_table()?;
         if let Some(entry) = get_indexed_file_inode(&index_table, inode)?
             && entry.hash == *hash
             && file_matches_index(&entry.into(), root, path)
         {
             tree.remove_and_decref(inode, &mut index_table, inode)?;
-
-            let index = self.allocate_history_index(&txn, &history_table)?;
-            let mut dirty = txn.write_dirty()?;
-            dirty.mark_dirty(&path)?;
-            let ev = HistoryTableEntry::Drop(path.clone(), hash.clone());
-            log::debug!("[{}] History #{index}: {ev:?}", self.arena);
-            history_table.insert(index, Holder::with_content(ev)?)?;
+            txn.write_dirty()?.mark_dirty(path)?;
+            txn.write_history()?.report_dropped(path, hash)?;
             return Ok(true);
         }
 
@@ -1589,12 +1508,6 @@ fn load_or_assign_uuid(db: &Arc<ArenaDatabase>) -> Result<Uuid, StorageError> {
 
         Ok(uuid)
     }
-}
-
-fn last_history_index(
-    history_table: &impl redb::ReadableTable<u64, Holder<'static, HistoryTableEntry>>,
-) -> Result<u64, StorageError> {
-    Ok(history_table.last()?.map(|(k, _)| k.value()).unwrap_or(0))
 }
 
 fn file_matches_index(

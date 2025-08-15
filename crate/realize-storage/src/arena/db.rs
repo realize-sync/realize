@@ -1,4 +1,5 @@
 use super::dirty::{Dirty, DirtyReadOperations, ReadableOpenDirty, WritableOpenDirty};
+use super::history::{History, HistoryReadOperations, ReadableOpenHistory, WritableOpenHistory};
 use super::tree::{ReadableOpenTree, Tree, TreeReadOperations, WritableOpenTree};
 use super::types::CacheTableKey;
 use super::types::{
@@ -166,6 +167,7 @@ pub(crate) struct ArenaDatabase {
 struct Subsystems {
     tree: Tree,
     dirty: Dirty,
+    history: History,
 }
 
 impl ArenaDatabase {
@@ -199,11 +201,12 @@ impl ArenaDatabase {
     ) -> Result<Arc<Self>, StorageError> {
         let tree = Tree::new(arena, allocator)?;
         let dirty: Dirty;
+        let history: History;
         let txn = db.begin_write()?;
         {
             // Create tables so they can safely be queried in read
             // transactions in an empty database.
-            txn.open_table(HISTORY_TABLE)?;
+            let history_table = txn.open_table(HISTORY_TABLE)?;
             txn.open_table(SETTIGS_TABLE)?;
             txn.open_table(TREE_TABLE)?;
             txn.open_table(TREE_REFCOUNT_TABLE)?;
@@ -223,13 +226,18 @@ impl ArenaDatabase {
             txn.open_table(FAILED_JOB_TABLE)?;
 
             dirty = Dirty::new(&dirty_counter_table)?;
+            history = History::new(arena, &history_table)?;
         }
         txn.commit()?;
 
         Ok(Arc::new(Self {
             db,
             arena,
-            subsystems: Subsystems { tree, dirty },
+            subsystems: Subsystems {
+                tree,
+                dirty,
+                history,
+            },
         }))
     }
 
@@ -248,6 +256,12 @@ impl ArenaDatabase {
     #[allow(dead_code)]
     pub fn dirty(&self) -> &Dirty {
         &self.subsystems.dirty
+    }
+
+    /// Return handle on the History subsystem.
+    #[allow(dead_code)]
+    pub fn history(&self) -> &History {
+        &self.subsystems.history
     }
 
     pub fn begin_write(&self) -> Result<ArenaWriteTransaction<'_>, StorageError> {
@@ -325,12 +339,6 @@ impl<'db> ArenaWriteTransaction<'db> {
     /// After commit functions are run in order after a successful commit.
     pub fn after_commit(&self, cb: impl FnOnce() -> () + Send + 'static) {
         self.after_commit.borrow_mut().push(Box::new(cb));
-    }
-
-    pub fn history_table<'txn>(
-        &'txn self,
-    ) -> Result<Table<'txn, u64, Holder<'static, HistoryTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(HISTORY_TABLE)?)
     }
 
     pub fn settings_table<'txn>(
@@ -427,6 +435,20 @@ impl<'db> ArenaWriteTransaction<'db> {
             self.inner.open_table(DIRTY_COUNTER_TABLE)?,
         ))
     }
+    #[allow(dead_code)]
+    pub(crate) fn read_history(&self) -> Result<impl HistoryReadOperations, StorageError> {
+        Ok(ReadableOpenHistory::new(
+            self.inner.open_table(HISTORY_TABLE)?,
+        ))
+    }
+
+    pub(crate) fn write_history(&self) -> Result<WritableOpenHistory<'_>, StorageError> {
+        Ok(WritableOpenHistory::new(
+            &self,
+            &self.subsystems.history,
+            self.inner.open_table(HISTORY_TABLE)?,
+        ))
+    }
 }
 
 pub struct ArenaReadTransaction<'db> {
@@ -435,12 +457,6 @@ pub struct ArenaReadTransaction<'db> {
 }
 
 impl<'db> ArenaReadTransaction<'db> {
-    pub fn history_table(
-        &self,
-    ) -> Result<ReadOnlyTable<u64, Holder<'static, HistoryTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(HISTORY_TABLE)?)
-    }
-
     pub fn cache_table(
         &self,
     ) -> Result<ReadOnlyTable<CacheTableKey, Holder<'static, CacheTableEntry>>, StorageError> {
@@ -501,6 +517,13 @@ impl<'db> ArenaReadTransaction<'db> {
             self.inner.open_table(FAILED_JOB_TABLE)?,
         ))
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn read_history(&self) -> Result<impl HistoryReadOperations, StorageError> {
+        Ok(ReadableOpenHistory::new(
+            self.inner.open_table(HISTORY_TABLE)?,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -532,7 +555,6 @@ mod tests {
         // Make sure the tables can be opened in a read transaction.
         let txn = fixture.db.begin_read()?;
         txn.read_tree()?;
-        txn.history_table()?;
         txn.cache_table()?;
         txn.peer_table()?;
         txn.notification_table()?;
