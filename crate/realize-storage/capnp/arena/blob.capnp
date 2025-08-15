@@ -16,10 +16,10 @@ struct BlobTableEntry {
   # Queue ID enum
   queue @2: LruQueueId;
 
-  # Next blob in the queue (BlobId)
+  # Next blob in the queue (Inode)
   next @3: UInt64;
 
-  # Previous blob in the queue (BlobId)
+  # Previous blob in the queue (Inode)
   prev @4: UInt64;
 
   # Disk usage in bytes
@@ -46,10 +46,10 @@ enum LruQueueId {
 
 # An entry in the queue table.
 struct QueueTableEntry {
-  # First node in the queue (BlobId)
+  # First node in the queue (Inode)
   head @0: UInt64;
 
-  # Last node in the queue (BlobId)
+  # Last node in the queue (Inode)
   tail @1: UInt64;
 
   # Total disk usage in bytes

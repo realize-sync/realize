@@ -7,7 +7,6 @@ use super::types::{
     MarkTableEntry, PeerTableEntry, QueueTableEntry,
 };
 use crate::StorageError;
-use crate::types::BlobId;
 use crate::utils::holder::Holder;
 use crate::{Inode, InodeAllocator};
 use realize_types::Arena;
@@ -98,13 +97,12 @@ const NOTIFICATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("aca
 ///
 /// Key: BlodId
 /// Value: BlobTableEntry
-const BLOB_TABLE: TableDefinition<BlobId, Holder<BlobTableEntry>> = TableDefinition::new("blob");
+const BLOB_TABLE: TableDefinition<Inode, Holder<BlobTableEntry>> = TableDefinition::new("blob");
 
 /// Track the next blob ID to be allocated.
 ///
 /// Key: () (unit key)
-/// Value: BlobId (next ID to allocate)
-
+/// Value: Inode (next ID to allocate)
 
 /// Track LRU queue for blobs.
 ///
@@ -217,7 +215,7 @@ impl ArenaDatabase {
             txn.open_table(NOTIFICATION_TABLE)?;
             txn.open_table(CURRENT_INODE_RANGE_TABLE)?;
             txn.open_table(BLOB_TABLE)?;
-    
+
             txn.open_table(BLOB_LRU_QUEUE_TABLE)?;
             txn.open_table(MARK_TABLE)?;
             txn.open_table(DIRTY_TABLE)?;
@@ -379,7 +377,7 @@ impl<'db> ArenaWriteTransaction<'db> {
 
     pub fn blob_table<'txn>(
         &'txn self,
-    ) -> Result<Table<'txn, BlobId, Holder<'static, BlobTableEntry>>, StorageError> {
+    ) -> Result<Table<'txn, Inode, Holder<'static, BlobTableEntry>>, StorageError> {
         Ok(self.inner.open_table(BLOB_TABLE)?)
     }
 
@@ -388,8 +386,6 @@ impl<'db> ArenaWriteTransaction<'db> {
     ) -> Result<Table<'txn, u16, Holder<'static, QueueTableEntry>>, StorageError> {
         Ok(self.inner.open_table(BLOB_LRU_QUEUE_TABLE)?)
     }
-
-
 
     pub fn mark_table<'txn>(
         &'txn self,
@@ -479,7 +475,7 @@ impl<'db> ArenaReadTransaction<'db> {
 
     pub fn blob_table(
         &self,
-    ) -> Result<ReadOnlyTable<BlobId, Holder<'static, BlobTableEntry>>, StorageError> {
+    ) -> Result<ReadOnlyTable<Inode, Holder<'static, BlobTableEntry>>, StorageError> {
         Ok(self.inner.open_table(BLOB_TABLE)?)
     }
 
@@ -491,7 +487,6 @@ impl<'db> ArenaReadTransaction<'db> {
     }
 
     #[allow(dead_code)]
-
 
     pub fn mark_table(
         &self,

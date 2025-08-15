@@ -1,6 +1,6 @@
-use crate::types::BlobId;
+use crate::types::Inode;
 use crate::utils::holder::{ByteConversionError, ByteConvertible, NamedType};
-use crate::{Inode, InodeAssignment, StorageError};
+use crate::{InodeAssignment, StorageError};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
 use realize_types::{self, Arena, ByteRanges, Hash, Path, Peer, UnixTime};
@@ -65,10 +65,10 @@ use uuid::Uuid;
 /// An entry in the queue table.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct QueueTableEntry {
-    /// First node in the queue (BlobId)
-    pub head: Option<BlobId>,
-    /// Last node in the queue (BlobId)
-    pub tail: Option<BlobId>,
+    /// First node in the queue (Inode)
+    pub head: Option<Inode>,
+    /// Last node in the queue (Inode)
+    pub tail: Option<Inode>,
     /// Total disk usage in bytes
     pub disk_usage: u64,
 }
@@ -87,14 +87,14 @@ impl ByteConvertible<QueueTableEntry> for QueueTableEntry {
 
         let head_value = reader.get_head();
         let head = if head_value != 0 {
-            Some(BlobId(head_value))
+            Some(Inode(head_value))
         } else {
             None
         };
 
         let tail_value = reader.get_tail();
         let tail = if tail_value != 0 {
-            Some(BlobId(tail_value))
+            Some(Inode(tail_value))
         } else {
             None
         };
@@ -132,11 +132,11 @@ pub struct BlobTableEntry {
     /// Queue ID enum
     pub queue: LruQueueId,
 
-    /// Next blob in the queue (BlobId)
-    pub next: Option<BlobId>,
+    /// Next blob in the queue (Inode)
+    pub next: Option<Inode>,
 
-    /// Previous blob in the queue (BlobId)
-    pub prev: Option<BlobId>,
+    /// Previous blob in the queue (Inode)
+    pub prev: Option<Inode>,
 
     /// Disk usage in bytes
     pub disk_usage: u64,
@@ -162,14 +162,14 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
 
         let next_value = reader.get_next();
         let next = if next_value != 0 {
-            Some(BlobId(next_value))
+            Some(Inode(next_value))
         } else {
             None
         };
 
         let prev_value = reader.get_prev();
         let prev = if prev_value != 0 {
-            Some(BlobId(prev_value))
+            Some(Inode(prev_value))
         } else {
             None
         };
@@ -656,7 +656,7 @@ pub struct FileTableEntry {
     /// Hash of the specific version of the content the peer has.
     pub hash: Hash,
     /// ID of a locally-available blob containing this version.
-    pub blob: Option<BlobId>,
+    pub blob: Option<Inode>,
     // If set, a version is known to exist that replaces the version
     // in this entry.
     pub outdated_by: Option<Hash>,
@@ -749,7 +749,7 @@ fn parse_file_table_entry(
     msg: cache_capnp::file_table_entry::Reader<'_>,
 ) -> Result<FileTableEntry, ByteConversionError> {
     let mtime = msg.get_mtime()?;
-    let blob: Option<BlobId> = BlobId::as_optional(msg.get_blob());
+    let blob: Option<Inode> = Inode::as_optional(msg.get_blob());
     let outdated_by: &[u8] = msg.get_outdated_by()?;
     let outdated_by = if outdated_by.is_empty() {
         None
@@ -895,8 +895,8 @@ mod tests {
             ]),
             content_hash: None,
             queue: LruQueueId::WorkingArea,
-            next: Some(BlobId(0x0101010101010101)),
-            prev: Some(BlobId(0x0202020202020202)),
+            next: Some(Inode(0x0101010101010101)),
+            prev: Some(Inode(0x0202020202020202)),
             disk_usage: 1024,
         };
 
@@ -925,8 +925,8 @@ mod tests {
     #[test]
     fn convert_queue_table_entry() -> anyhow::Result<()> {
         let entry = QueueTableEntry {
-            head: Some(BlobId(0x0101010101010101)),
-            tail: Some(BlobId(0x0202020202020202)),
+            head: Some(Inode(0x0101010101010101)),
+            tail: Some(Inode(0x0202020202020202)),
             disk_usage: 1024,
         };
 
@@ -1050,7 +1050,7 @@ mod tests {
             mtime: UnixTime::from_secs(1234567890),
             path: Path::parse("foo/bar.txt")?,
             hash: Hash([0xa1u8; 32]),
-            blob: Some(BlobId(5541)),
+            blob: Some(Inode(5541)),
             outdated_by: None,
         };
 
@@ -1260,7 +1260,7 @@ mod tests {
             mtime: UnixTime::from_secs(1234567890),
             path: Path::parse("foo/bar.txt")?,
             hash: Hash([0xa1u8; 32]),
-            blob: Some(BlobId(5541)),
+            blob: Some(Inode(5541)),
             outdated_by: Some(Hash([3u8; 32])),
         };
 

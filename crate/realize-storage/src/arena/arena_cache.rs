@@ -10,7 +10,6 @@ use super::types::{
     PeerTableEntry,
 };
 use crate::arena::notifier::{Notification, Progress};
-use crate::types::BlobId;
 use crate::utils::fs_utils;
 use crate::utils::holder::{ByteConversionError, Holder};
 use crate::{Blob, InodeAssignment, Mark};
@@ -393,11 +392,11 @@ impl ArenaCache {
         {
             let txn = self.db.begin_read()?;
             let file_entry = get_default_entry(&txn.cache_table()?, inode)?;
-            if let Some(blob_id) = file_entry.blob
-                && blob::blob_exists(&txn, blob_id)?
+            if let Some(inode) = file_entry.blob
+                && blob::blob_exists(&txn, inode)?
             {
                 // Delegate to Blobstore
-                return self.blobstore.open_blob(&txn, file_entry, blob_id);
+                return self.blobstore.open_blob(&txn, file_entry, inode);
             }
         }
 
@@ -415,9 +414,9 @@ impl ArenaCache {
             log::debug!(
                 "[{}] assigned blob {} in {queue:?} to file {inode}",
                 self.arena,
-                blob.id()
+                blob.inode()
             );
-            file_entry.blob = Some(blob.id());
+            file_entry.blob = Some(blob.inode());
             cache_table.insert(
                 CacheTableKey::Default(inode),
                 Holder::with_content(CacheTableEntry::File(file_entry))?,
@@ -455,7 +454,7 @@ impl ArenaCache {
         if file_entry.hash != *hash {
             return Ok(false);
         }
-        let blob_id = match file_entry.blob {
+        let inode = match file_entry.blob {
             None => {
                 return Err(StorageError::NotFound);
             }
@@ -464,7 +463,7 @@ impl ArenaCache {
 
         if !self
             .blobstore
-            .move_blob_if_matches(&txn, blob_id, hash, dest)?
+            .move_blob_if_matches(&txn, inode, hash, dest)?
         {
             return Ok(false);
         }
@@ -516,14 +515,14 @@ impl ArenaCache {
             return Ok(None);
         }
         let mark_table = txn.mark_table()?;
-        let (blob_id, cachepath) = self.blobstore.move_into_blob(
+        let (inode, cachepath) = self.blobstore.move_into_blob(
             &txn,
             file_entry.blob,
             queue_for_inode(&mark_table, &tree, inode)?,
             metadata,
             inode,
         )?;
-        file_entry.blob = Some(blob_id);
+        file_entry.blob = Some(inode);
         cache_table.insert(
             CacheTableKey::Default(inode),
             Holder::with_content(CacheTableEntry::File(file_entry))?,
@@ -584,8 +583,8 @@ impl ArenaCache {
         path: &Path,
     ) -> Result<(), StorageError> {
         if let Some(old_entry) = old_entry {
-            if let Some(blob_id) = old_entry.blob {
-                self.blobstore.delete_blob(&txn, blob_id)?;
+            if let Some(inode) = old_entry.blob {
+                self.blobstore.delete_blob(&txn, inode)?;
             }
         }
 
@@ -789,10 +788,10 @@ impl ArenaCache {
     #[allow(dead_code)]
     pub(crate) fn extend_local_availability(
         &self,
-        blob_id: BlobId,
+        inode: Inode,
         new_range: &ByteRanges,
     ) -> Result<(), StorageError> {
-        self.blobstore.extend_local_availability(blob_id, new_range)
+        self.blobstore.extend_local_availability(inode, new_range)
     }
 
     /// Clean up the cache by removing blobs until the total disk usage is <= target_size.
