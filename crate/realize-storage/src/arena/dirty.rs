@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use super::db::AfterCommit;
+use super::tree::{TreeExt, TreeLoc, TreeReadOperations};
 use super::types::{FailedJobTableEntry, RetryJob};
 use crate::{JobId, StorageError, utils::holder::Holder};
 use realize_types::{Path, UnixTime};
@@ -335,6 +336,24 @@ impl<'a> WritableOpenDirty<'a> {
                 }
             }
         }
+    }
+
+    /// Mark a tree location and all its children dirty.
+    pub(crate) fn mark_dirty_recursive<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<(), StorageError> {
+        if let Some(start) = tree.resolve(loc)? {
+            for inode in std::iter::once(Ok(start)).chain(tree.recurse(start, |_| true)) {
+                let inode = inode?;
+                if let Ok(path) = tree.backtrack(inode) {
+                    self.mark_dirty(path)?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Mark a path dirty.
@@ -1562,6 +1581,46 @@ mod tests {
         let dirty = txn.read_dirty()?;
         assert!(!dirty.is_job_failed(job_id1)?);
         assert!(dirty.is_job_failed(job_id2)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn mark_dirty_recursive() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.db.begin_write()?;
+        {
+            let mut tree = txn.write_tree()?;
+            tree.setup(Path::parse("foo/bar/baz")?)?;
+            tree.setup(Path::parse("foo/bar/qux/quux")?)?;
+            tree.setup(Path::parse("waldo")?)?;
+
+            let mut dirty = txn.write_dirty()?;
+            dirty.mark_dirty_recursive(&tree, Path::parse("foo/bar")?)?;
+            assert!(!dirty.is_dirty(&Path::parse("foo")?)?);
+            assert!(!dirty.is_dirty(&Path::parse("waldo")?)?);
+            assert!(dirty.is_dirty(&Path::parse("foo/bar")?)?);
+            assert!(dirty.is_dirty(&Path::parse("foo/bar/baz")?)?);
+            assert!(dirty.is_dirty(&Path::parse("foo/bar/qux")?)?);
+            assert!(dirty.is_dirty(&Path::parse("foo/bar/qux/quux")?)?);
+        }
+
+        Ok(())
+    }
+    #[test]
+    fn mark_dirty_recursive_root() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.db.begin_write()?;
+        {
+            let mut tree = txn.write_tree()?;
+            tree.setup(Path::parse("foo/bar")?)?;
+            tree.setup(Path::parse("baz")?)?;
+
+            let mut dirty = txn.write_dirty()?;
+            dirty.mark_dirty_recursive(&tree, tree.root())?;
+            assert!(dirty.is_dirty(&Path::parse("foo/bar")?)?);
+            assert!(dirty.is_dirty(&Path::parse("baz")?)?);
+        }
 
         Ok(())
     }

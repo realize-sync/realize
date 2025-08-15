@@ -885,8 +885,7 @@ impl OpenBlobRefCounter {
 mod tests {
     use super::*;
     use crate::arena::arena_cache::ArenaCache;
-
-    use crate::arena::mark::PathMarks;
+    use crate::arena::mark;
     use crate::{Inode, Mark, Notification};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
@@ -1754,7 +1753,7 @@ mod tests {
         let file_path = Path::parse("test.txt")?;
 
         let inode = fixture.add_file(file_path.as_str(), 3)?;
-        acache.set_mark(&file_path, Mark::Keep)?;
+        mark::set(&fixture.db, &file_path, Mark::Keep)?;
 
         let tmpfile = fixture.tempdir.child("tmp");
         tmpfile.write_str("foo")?;
@@ -2436,7 +2435,7 @@ mod tests {
         let fixture = Fixture::setup().await?;
         let acache = &fixture.acache;
         let inode = fixture.add_file("test.txt", 6)?;
-        acache.set_mark(&Path::parse("test.txt")?, Mark::Keep)?;
+        mark::set(&fixture.db, &Path::parse("test.txt")?, Mark::Keep)?;
 
         {
             let mut blob = acache.open_file(inode)?;

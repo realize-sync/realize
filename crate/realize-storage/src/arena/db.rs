@@ -1,5 +1,6 @@
 use super::dirty::{Dirty, DirtyReadOperations, ReadableOpenDirty, WritableOpenDirty};
 use super::history::{History, HistoryReadOperations, ReadableOpenHistory, WritableOpenHistory};
+use super::mark::{MarkReadOperations, ReadableOpenMark, WritableOpenMark};
 use super::tree::{ReadableOpenTree, Tree, TreeReadOperations, WritableOpenTree};
 use super::types::CacheTableKey;
 use super::types::{
@@ -358,12 +359,6 @@ impl<'db> ArenaWriteTransaction<'db> {
         Ok(self.inner.open_table(BLOB_LRU_QUEUE_TABLE)?)
     }
 
-    pub fn mark_table<'txn>(
-        &'txn self,
-    ) -> Result<Table<'txn, Inode, Holder<'static, MarkTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(MARK_TABLE)?)
-    }
-
     pub(crate) fn read_tree(&self) -> Result<impl TreeReadOperations, StorageError> {
         Ok(ReadableOpenTree::new(
             self.inner.open_table(TREE_TABLE)?,
@@ -414,6 +409,16 @@ impl<'db> ArenaWriteTransaction<'db> {
             self.inner.open_table(HISTORY_TABLE)?,
         ))
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn read_marks(&self) -> Result<impl MarkReadOperations, StorageError> {
+        Ok(ReadableOpenMark::new(self.inner.open_table(MARK_TABLE)?))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn write_marks(&self) -> Result<WritableOpenMark<'_>, StorageError> {
+        Ok(WritableOpenMark::new(self.inner.open_table(MARK_TABLE)?))
+    }
 }
 
 pub struct ArenaReadTransaction<'db> {
@@ -459,12 +464,6 @@ impl<'db> ArenaReadTransaction<'db> {
 
     #[allow(dead_code)]
 
-    pub fn mark_table(
-        &self,
-    ) -> Result<ReadOnlyTable<Inode, Holder<'static, MarkTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(MARK_TABLE)?)
-    }
-
     pub(crate) fn read_tree(&self) -> Result<impl TreeReadOperations, StorageError> {
         Ok(ReadableOpenTree::new(
             self.inner.open_table(TREE_TABLE)?,
@@ -485,6 +484,11 @@ impl<'db> ArenaReadTransaction<'db> {
         Ok(ReadableOpenHistory::new(
             self.inner.open_table(HISTORY_TABLE)?,
         ))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn read_marks(&self) -> Result<impl MarkReadOperations, StorageError> {
+        Ok(ReadableOpenMark::new(self.inner.open_table(MARK_TABLE)?))
     }
 }
 
@@ -593,8 +597,6 @@ mod tests {
         txn.notification_table()?;
         txn.blob_table()?;
         txn.blob_lru_queue_table()?;
-
-        txn.mark_table()?;
 
         Ok(())
     }

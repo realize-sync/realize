@@ -536,9 +536,19 @@ impl<'a> WritableOpenTree<'a> {
     /// of 0 and is only valid until the end of the transaction until
     /// its reference count is incremented by one of the insert
     /// methods on [WritableOpenTree].
-    pub(crate) fn setup<P: AsRef<Path>>(&mut self, path: P) -> Result<Inode, StorageError> {
-        let (inode, added) = self.add_path(path.as_ref())?;
+    pub(crate) fn setup<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        loc: L,
+    ) -> Result<Inode, StorageError> {
+        match loc.into() {
+            TreeLoc::Inode(inode) => Ok(inode),
+            TreeLoc::Path(path) => self.setup_path(&path),
+            TreeLoc::PathRef(path) => self.setup_path(path),
+        }
+    }
 
+    fn setup_path(&mut self, path: &Path) -> Result<Inode, StorageError> {
+        let (inode, added) = self.add_path(path.as_ref())?;
         if added {
             self.before_commit.add(move |txn| {
                 // Check refcount and delete the entry if it reaches
@@ -547,6 +557,7 @@ impl<'a> WritableOpenTree<'a> {
                 txn.write_tree()?.check_refcount(inode)
             });
         }
+
         Ok(inode)
     }
 

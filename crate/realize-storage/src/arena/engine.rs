@@ -4,15 +4,13 @@ use super::arena_cache::ArenaCache;
 use super::db::{ArenaDatabase, ArenaReadTransaction};
 use super::dirty::DirtyReadOperations;
 use super::index::RealIndex;
-use super::mark::PathMarks;
+use super::mark::MarkExt;
 use super::tree::TreeExt;
 use super::types::LocalAvailability;
 use crate::arena::blob;
 use crate::types::JobId;
-
 use crate::{Inode, Mark, StorageError};
 use realize_types::{Arena, Hash, Path, UnixTime};
-
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -102,7 +100,6 @@ pub struct Engine {
     db: Arc<ArenaDatabase>,
     index: Option<Arc<dyn RealIndex>>,
     cache: Arc<ArenaCache>,
-    marks: Arc<dyn PathMarks>,
     arena_root: Inode,
     job_retry_strategy: Box<dyn (Fn(u32) -> Option<Duration>) + Sync + Send + 'static>,
 
@@ -121,7 +118,6 @@ impl Engine {
         db: Arc<ArenaDatabase>,
         index: Option<Arc<dyn RealIndex>>,
         cache: Arc<ArenaCache>,
-        marks: Arc<dyn PathMarks>,
         arena_root: Inode,
         job_retry_strategy: impl (Fn(u32) -> Option<Duration>) + Sync + Send + 'static,
     ) -> Arc<Engine> {
@@ -132,7 +128,6 @@ impl Engine {
             db,
             index,
             cache,
-            marks,
             arena_root,
             job_retry_strategy: Box::new(job_retry_strategy),
             failed_job_tx,
@@ -439,7 +434,9 @@ impl Engine {
         path: Path,
         counter: u64,
     ) -> Result<Option<(JobId, StorageJob)>, StorageError> {
-        match self.marks.get_mark_txn(txn, &path) {
+        let tree = txn.read_tree()?;
+        let marks = txn.read_marks()?;
+        match marks.get(&tree, &path) {
             Err(_) => {
                 return Ok(None);
             }
@@ -613,7 +610,7 @@ mod tests {
     use crate::Notification;
     use crate::arena::arena_cache::ArenaCache;
     use crate::arena::index::RealIndex;
-    use crate::arena::mark::PathMarks;
+    use crate::arena::mark;
     use crate::utils::redb_utils;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
@@ -635,7 +632,6 @@ mod tests {
         db: Arc<ArenaDatabase>,
         acache: Arc<ArenaCache>,
         index: Arc<dyn RealIndex>,
-        marks: Arc<dyn PathMarks>,
         engine: Arc<Engine>,
         arena_path: PathBuf,
         _tempdir: TempDir,
@@ -657,13 +653,11 @@ mod tests {
             let acache = ArenaCache::new(arena, Arc::clone(&db), &tempdir.path().join("blobs"))?;
             let arena_root = acache.arena_root();
             let index = acache.as_index();
-            let marks = acache.clone() as Arc<dyn PathMarks>;
             let engine = Engine::new(
                 arena,
                 Arc::clone(&db),
                 Some(index.clone()),
                 Arc::clone(&acache),
-                Arc::clone(&marks),
                 arena_root,
                 |attempt| {
                     if attempt < 3 {
@@ -679,7 +673,6 @@ mod tests {
                 db,
                 acache,
                 index,
-                marks,
                 engine,
                 arena_path: arena_path.to_path_buf(),
                 _tempdir: tempdir,
@@ -802,7 +795,7 @@ mod tests {
         let fixture = EngineFixture::setup().await?;
         let barfile = Path::parse("foo/bar.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.marks.set_arena_mark(Mark::Keep)?;
+        mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
 
         let job = next_with_timeout(&mut job_stream).await?;
@@ -822,7 +815,7 @@ mod tests {
         let fixture = EngineFixture::setup().await?;
         let barfile = Path::parse("foo/bar.txt")?;
 
-        fixture.marks.set_arena_mark(Mark::Keep)?;
+        mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         let mut job_stream = fixture.engine.job_stream();
         fixture.add_file_to_cache(&barfile)?;
         let mut job_stream2 = fixture.engine.job_stream();
@@ -846,8 +839,8 @@ mod tests {
         let foodir = Path::parse("foo")?;
         let barfile = Path::parse("foo/bar.txt")?;
         let mut job_stream = fixture.engine.job_stream();
+        mark::set(&fixture.db, &foodir, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
-        fixture.marks.set_mark(&foodir, Mark::Keep)?;
 
         let job = next_with_timeout(&mut job_stream).await?;
         // Counter is 2, because the job was created after the 2nd
@@ -871,7 +864,7 @@ mod tests {
         let fixture = EngineFixture::setup().await?;
         let barfile = Path::parse("foo/bar.txt")?;
 
-        fixture.marks.set_arena_mark(Mark::Keep)?;
+        mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         let inode = fixture.acache.expect(&barfile)?;
         {
@@ -901,7 +894,7 @@ mod tests {
         let fixture = EngineFixture::setup().await?;
         let barfile = Path::parse("foo/bar.txt")?;
 
-        fixture.marks.set_arena_mark(Mark::Keep)?;
+        mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         let inode = fixture.acache.expect(&barfile)?;
         {
@@ -932,7 +925,7 @@ mod tests {
         let barfile = Path::parse("foo/bar.txt")?;
         let otherfile = Path::parse("foo/other.txt")?;
 
-        fixture.marks.set_arena_mark(Mark::Keep)?;
+        mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         let inode = fixture.acache.expect(&barfile)?;
         {
@@ -971,7 +964,7 @@ mod tests {
         let barfile = Path::parse("foo/bar.txt")?;
         let otherfile = Path::parse("foo/other.txt")?;
 
-        fixture.marks.set_arena_mark(Mark::Keep)?;
+        mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         fixture.remove_file_from_cache(&barfile)?;
 
@@ -1004,7 +997,7 @@ mod tests {
         let fixture = EngineFixture::setup().await?;
         let foobar = Path::parse("foo/bar")?;
 
-        fixture.marks.set_arena_mark(Mark::Own)?;
+        mark::set_arena_mark(&fixture.db, Mark::Own)?;
         fixture.add_file_to_cache(&foobar)?;
 
         let mut job_stream = fixture.engine.job_stream();
@@ -1027,7 +1020,7 @@ mod tests {
         let foobar = Path::parse("foo/bar")?;
         let otherfile = Path::parse("other")?;
 
-        fixture.marks.set_arena_mark(Mark::Own)?;
+        mark::set_arena_mark(&fixture.db, Mark::Own)?;
         fixture.add_file_to_cache_with_version(&foobar, Hash([1; 32]))?;
         fixture.add_file_to_index_with_version(&foobar, Hash([1; 32]))?;
 
@@ -1050,7 +1043,7 @@ mod tests {
         let foobar = Path::parse("foo/bar")?;
         let otherfile = Path::parse("other")?;
 
-        fixture.marks.set_arena_mark(Mark::Own)?;
+        mark::set_arena_mark(&fixture.db, Mark::Own)?;
         fixture.add_file_to_cache_with_version(&foobar, Hash([1; 32]))?;
         fixture.add_file_to_index_with_version(&foobar, Hash([2; 32]))?;
 
@@ -1072,7 +1065,7 @@ mod tests {
         let fixture = EngineFixture::setup().await?;
         let foobar = Path::parse("foo/bar")?;
 
-        fixture.marks.set_arena_mark(Mark::Own)?;
+        mark::set_arena_mark(&fixture.db, Mark::Own)?;
 
         // Cache and index have the same version
         fixture.add_file_to_cache_with_version(&foobar, Hash([1; 32]))?;
@@ -1099,7 +1092,7 @@ mod tests {
         let barfile = Path::parse("foo/bar.txt")?;
         let otherfile = Path::parse("foo/other.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.marks.set_arena_mark(Mark::Keep)?;
+        mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         fixture.add_file_to_cache(&otherfile)?;
 
@@ -1129,7 +1122,7 @@ mod tests {
         let barfile = Path::parse("foo/bar.txt")?;
         let otherfile = Path::parse("foo/other.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.marks.set_arena_mark(Mark::Keep)?;
+        mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         fixture.add_file_to_cache(&otherfile)?;
 
@@ -1159,7 +1152,7 @@ mod tests {
         let fixture = EngineFixture::setup().await?;
         let barfile = Path::parse("foo/bar.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.marks.set_arena_mark(Mark::Keep)?;
+        mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
 
         let (job1_id, job1) = next_with_timeout(&mut job_stream).await?.unwrap();
@@ -1196,7 +1189,7 @@ mod tests {
         let barfile = Path::parse("foo/bar.txt")?;
         let otherfile = Path::parse("foo/other.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.marks.set_arena_mark(Mark::Keep)?;
+        mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         fixture.add_file_to_cache(&otherfile)?;
 
@@ -1247,7 +1240,7 @@ mod tests {
         let barfile = Path::parse("foo/bar.txt")?;
         let otherfile = Path::parse("foo/other.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.marks.set_arena_mark(Mark::Keep)?;
+        mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         fixture.add_file_to_cache(&otherfile)?;
 
@@ -1276,7 +1269,7 @@ mod tests {
         let barfile = Path::parse("foo/bar.txt")?;
         let otherfile = Path::parse("foo/other.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.marks.set_arena_mark(Mark::Keep)?;
+        mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         fixture.add_file_to_cache(&otherfile)?;
 
@@ -1314,7 +1307,7 @@ mod tests {
         let barfile = Path::parse("foo/bar.txt")?;
         let otherfile = Path::parse("foo/other.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.marks.set_arena_mark(Mark::Keep)?;
+        mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         fixture.add_file_to_cache(&otherfile)?;
 
@@ -1346,7 +1339,7 @@ mod tests {
         let barfile = Path::parse("foo/bar.txt")?;
         let otherfile = Path::parse("foo/other.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.marks.set_arena_mark(Mark::Keep)?;
+        mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         fixture.add_file_to_cache(&otherfile)?;
 
@@ -1375,7 +1368,7 @@ mod tests {
         let fixture = EngineFixture::setup().await?;
         let barfile = Path::parse("foo/bar.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.marks.set_arena_mark(Mark::Keep)?;
+        mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
 
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
@@ -1390,7 +1383,7 @@ mod tests {
         let fixture = EngineFixture::setup().await?;
         let barfile = Path::parse("foo/bar.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.marks.set_arena_mark(Mark::Keep)?;
+        mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
 
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
@@ -1407,7 +1400,7 @@ mod tests {
         let fixture = EngineFixture::setup().await?;
         let barfile = Path::parse("foo/bar.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.marks.set_arena_mark(Mark::Keep)?;
+        mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
 
         let (_, job) = next_with_timeout(&mut job_stream).await?.unwrap();
@@ -1426,7 +1419,7 @@ mod tests {
         let fixture = EngineFixture::setup().await?;
         let barfile = Path::parse("foo/bar.txt")?;
         let mut job_stream = fixture.engine.job_stream();
-        fixture.marks.set_arena_mark(Mark::Keep)?;
+        mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
 
         let (_, job) = next_with_timeout(&mut job_stream).await?.unwrap();

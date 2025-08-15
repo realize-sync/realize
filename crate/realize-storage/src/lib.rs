@@ -1,5 +1,4 @@
 use arena::engine::Engine;
-use arena::mark::PathMarks;
 use arena::{ArenaStorage, indexed_store};
 use config::StorageConfig;
 use futures::Stream;
@@ -130,8 +129,8 @@ impl Storage {
         arena: Arena,
         mark: Mark,
     ) -> Result<(), StorageError> {
-        let marks = self.arena_storage(arena)?.cache.clone() as Arc<dyn PathMarks>;
-        task::spawn_blocking(move || marks.set_arena_mark(mark)).await?
+        let db = self.arena_storage(arena)?.db.clone();
+        task::spawn_blocking(move || arena::mark::set_arena_mark(&db, mark)).await?
     }
 
     /// Set the default mark for the files in the given arena.
@@ -141,9 +140,9 @@ impl Storage {
         path: &Path,
         mark: Mark,
     ) -> Result<(), StorageError> {
-        let marks = self.arena_storage(arena)?.cache.clone() as Arc<dyn PathMarks>;
+        let db = self.arena_storage(arena)?.db.clone();
         let path = path.clone();
-        task::spawn_blocking(move || marks.set_mark(&path, mark)).await?
+        task::spawn_blocking(move || arena::mark::set(&db, &path, mark)).await?
     }
 
     /// Get the mark for a specific path in the given arena.
@@ -152,9 +151,9 @@ impl Storage {
         arena: Arena,
         path: &Path,
     ) -> Result<Mark, StorageError> {
-        let marks = self.arena_storage(arena)?.cache.clone() as Arc<dyn PathMarks>;
+        let db = self.arena_storage(arena)?.db.clone();
         let path = path.clone();
-        task::spawn_blocking(move || marks.get_mark(&path)).await?
+        task::spawn_blocking(move || arena::mark::get(&db, &path)).await?
     }
 
     /// Get a reader on the given file, if possible.

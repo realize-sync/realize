@@ -194,7 +194,6 @@ mod tests {
                     None
                 },
                 Arc::clone(&cache),
-                cache.clone(),
                 cache.arena_root(),
                 |attempt| {
                     if attempt < 3 {
