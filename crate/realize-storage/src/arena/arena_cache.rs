@@ -411,7 +411,7 @@ impl ArenaCache {
             let queue = queue_for_inode(&mark_table, &txn.read_tree()?, inode)?;
             let blob = self
                 .blobstore
-                .create_blob(&txn, file_entry.clone(), queue)?;
+                .create_blob(&txn, file_entry.clone(), queue, inode)?;
             log::debug!(
                 "[{}] assigned blob {} in {queue:?} to file {inode}",
                 self.arena,
@@ -521,6 +521,7 @@ impl ArenaCache {
             file_entry.blob,
             queue_for_inode(&mark_table, &tree, inode)?,
             metadata,
+            inode,
         )?;
         file_entry.blob = Some(blob_id);
         cache_table.insert(

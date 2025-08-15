@@ -104,7 +104,7 @@ const BLOB_TABLE: TableDefinition<BlobId, Holder<BlobTableEntry>> = TableDefinit
 ///
 /// Key: () (unit key)
 /// Value: BlobId (next ID to allocate)
-const BLOB_NEXT_ID_TABLE: TableDefinition<(), BlobId> = TableDefinition::new("blob.next_id");
+
 
 /// Track LRU queue for blobs.
 ///
@@ -217,7 +217,7 @@ impl ArenaDatabase {
             txn.open_table(NOTIFICATION_TABLE)?;
             txn.open_table(CURRENT_INODE_RANGE_TABLE)?;
             txn.open_table(BLOB_TABLE)?;
-            txn.open_table(BLOB_NEXT_ID_TABLE)?;
+    
             txn.open_table(BLOB_LRU_QUEUE_TABLE)?;
             txn.open_table(MARK_TABLE)?;
             txn.open_table(DIRTY_TABLE)?;
@@ -389,9 +389,7 @@ impl<'db> ArenaWriteTransaction<'db> {
         Ok(self.inner.open_table(BLOB_LRU_QUEUE_TABLE)?)
     }
 
-    pub fn blob_next_id_table<'txn>(&'txn self) -> Result<Table<'txn, (), BlobId>, StorageError> {
-        Ok(self.inner.open_table(BLOB_NEXT_ID_TABLE)?)
-    }
+
 
     pub fn mark_table<'txn>(
         &'txn self,
@@ -493,9 +491,7 @@ impl<'db> ArenaReadTransaction<'db> {
     }
 
     #[allow(dead_code)]
-    pub fn blob_next_id_table(&self) -> Result<ReadOnlyTable<(), BlobId>, StorageError> {
-        Ok(self.inner.open_table(BLOB_NEXT_ID_TABLE)?)
-    }
+
 
     pub fn mark_table(
         &self,
@@ -560,7 +556,7 @@ mod tests {
         txn.notification_table()?;
         txn.blob_table()?;
         txn.blob_lru_queue_table()?;
-        txn.blob_next_id_table()?;
+
         txn.mark_table()?;
 
         Ok(())

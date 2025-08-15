@@ -4,7 +4,7 @@ use super::types::{
     BlobTableEntry, FileTableEntry, LocalAvailability, LruQueueId, QueueTableEntry,
 };
 use crate::StorageError;
-use crate::types::BlobId;
+use crate::types::{BlobId, Inode};
 use crate::utils::holder::Holder;
 use realize_types::{ByteRange, ByteRanges, Hash};
 use redb::ReadableTable;
@@ -86,13 +86,13 @@ impl Blobstore {
         txn: &ArenaWriteTransaction,
         file_entry: FileTableEntry,
         queue: LruQueueId,
+        inode: Inode,
     ) -> Result<Blob, StorageError> {
         let mut blob_table = txn.blob_table()?;
         let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
-        let mut blob_next_id_table = txn.blob_next_id_table()?;
         let blob_id = match file_entry.blob {
             Some(blob_id) => blob_id,
-            None => alloc_blob_id(&mut blob_next_id_table)?,
+            None => BlobId(inode.0),
         };
         let file = self.open_blob_file(blob_id, file_entry.size, true)?;
         let blob_entry = init_blob_entry(
@@ -272,13 +272,13 @@ impl Blobstore {
         id: Option<BlobId>,
         queue: LruQueueId,
         metadata: &std::fs::Metadata,
+        inode: Inode,
     ) -> Result<(BlobId, PathBuf), StorageError> {
         let mut blob_table = txn.blob_table()?;
         let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
-        let mut blob_next_id_table = txn.blob_next_id_table()?;
         let id = match id {
             Some(blob_id) => blob_id,
-            None => alloc_blob_id(&mut blob_next_id_table)?,
+            None => BlobId(inode.0),
         };
         let mut entry = init_blob_entry(
             &mut blob_lru_queue_table,
@@ -459,17 +459,7 @@ fn get_queue_must_exist(
         .parse()?)
 }
 
-fn alloc_blob_id(
-    blob_next_id_table: &mut redb::Table<'_, (), BlobId>,
-) -> Result<BlobId, StorageError> {
-    let blob_id = match blob_next_id_table.get(())? {
-        Some(entry) => entry.value().plus(1),
-        None => BlobId(1), // First blob ever
-    };
-    blob_next_id_table.insert((), blob_id)?;
 
-    Ok(blob_id)
-}
 
 fn init_blob_entry(
     blob_lru_queue_table: &mut redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
@@ -1142,21 +1132,25 @@ mod tests {
         let inode2 = fixture.add_file("test2.txt", 200)?;
         let inode3 = fixture.add_file("test3.txt", 300)?;
 
-        assert_eq!(BlobId(1), acache.open_file(inode1)?.blob_id);
-        assert_eq!(BlobId(2), acache.open_file(inode2)?.blob_id);
-        assert_eq!(BlobId(3), acache.open_file(inode3)?.blob_id);
+        let blob_id1 = acache.open_file(inode1)?.blob_id;
+        let blob_id2 = acache.open_file(inode2)?.blob_id;
+        let blob_id3 = acache.open_file(inode3)?.blob_id;
 
-        assert!(fixture.blob_entry_exists(BlobId(1))?);
-        assert!(fixture.blob_entry_exists(BlobId(2))?);
-        assert!(fixture.blob_entry_exists(BlobId(3))?);
+        assert_eq!(BlobId(inode1.0), blob_id1);
+        assert_eq!(BlobId(inode2.0), blob_id2);
+        assert_eq!(BlobId(inode3.0), blob_id3);
 
-        assert!(fixture.blob_path(BlobId(1)).exists());
-        assert!(fixture.blob_path(BlobId(2)).exists());
-        assert!(fixture.blob_path(BlobId(3)).exists());
+        assert!(fixture.blob_entry_exists(blob_id1)?);
+        assert!(fixture.blob_entry_exists(blob_id2)?);
+        assert!(fixture.blob_entry_exists(blob_id3)?);
 
-        assert_eq!(100, fixture.blob_path(BlobId(1)).metadata()?.len());
-        assert_eq!(200, fixture.blob_path(BlobId(2)).metadata()?.len());
-        assert_eq!(300, fixture.blob_path(BlobId(3)).metadata()?.len());
+        assert!(fixture.blob_path(blob_id1).exists());
+        assert!(fixture.blob_path(blob_id2).exists());
+        assert!(fixture.blob_path(blob_id3).exists());
+
+        assert_eq!(100, fixture.blob_path(blob_id1).metadata()?.len());
+        assert_eq!(200, fixture.blob_path(blob_id2).metadata()?.len());
+        assert_eq!(300, fixture.blob_path(blob_id3).metadata()?.len());
 
         Ok(())
     }
@@ -1345,7 +1339,7 @@ mod tests {
 
         let blob_id = {
             let blob = acache.open_file(inode)?;
-            assert_eq!(BlobId(1), blob.id());
+            assert_eq!(BlobId(inode.0), blob.id());
 
             let m = fixture.blob_path(blob.id()).metadata()?;
 
@@ -2627,7 +2621,7 @@ mod tests {
         // Create a file and get its blob ID
         let inode = fixture.add_file("test.txt", 100)?;
         let first_blob_id = acache.open_file(inode)?.id();
-        assert_eq!(BlobId(1), first_blob_id);
+        assert_eq!(BlobId(inode.0), first_blob_id);
 
         // Verify the blob exists
         assert!(fixture.blob_entry_exists(first_blob_id)?);
@@ -2646,7 +2640,7 @@ mod tests {
 
         // Verify the new blob ID is different from the deleted one
         assert_ne!(first_blob_id, second_blob_id);
-        assert_eq!(BlobId(2), second_blob_id);
+        assert_eq!(BlobId(inode2.0), second_blob_id);
 
         // Verify the new blob exists
         assert!(fixture.blob_entry_exists(second_blob_id)?);
@@ -2656,35 +2650,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blob_next_id_table_tracks_allocation_correctly() -> anyhow::Result<()> {
+    async fn blob_id_uses_inode_value() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
 
-        // Initially, the next ID table should be empty
-        let txn = fixture.begin_read()?;
-        let next_id_table = txn.blob_next_id_table()?;
-        assert!(next_id_table.get(())?.is_none());
-
-        // Create a blob and verify the next ID is updated
+        // Create a blob and verify the blob ID matches the inode
         let inode = fixture.add_file("test.txt", 100)?;
         let blob_id = fixture.acache.open_file(inode)?.id();
-        assert_eq!(BlobId(1), blob_id);
+        assert_eq!(BlobId(inode.0), blob_id);
 
-        // Check that the next ID table now contains the next ID to allocate
-        let txn = fixture.begin_read()?;
-        let next_id_table = txn.blob_next_id_table()?;
-        let next_id = next_id_table.get(())?.unwrap().value();
-        assert_eq!(BlobId(1), next_id); // The table stores the last allocated ID
-
-        // Create another blob and verify the next ID is incremented
+        // Create another blob and verify the blob ID matches the inode
         let inode2 = fixture.add_file("test2.txt", 200)?;
         let blob_id2 = fixture.acache.open_file(inode2)?.id();
-        assert_eq!(BlobId(2), blob_id2);
+        assert_eq!(BlobId(inode2.0), blob_id2);
 
-        // Check that the next ID table is updated again
-        let txn = fixture.begin_read()?;
-        let next_id_table = txn.blob_next_id_table()?;
-        let next_id = next_id_table.get(())?.unwrap().value();
-        assert_eq!(BlobId(2), next_id); // The table stores the last allocated ID
+        // Verify that blob IDs are different when inodes are different
+        assert_ne!(blob_id, blob_id2);
 
         Ok(())
     }
@@ -2717,14 +2697,14 @@ mod tests {
         acache.cleanup_cache(0)?;
 
         // Verify the blob was deleted
-        let blob_id = BlobId(1); // First blob should have ID 1
+        let blob_id = BlobId(inode.0); // Blob ID should match inode
         assert!(!fixture.blob_entry_exists(blob_id)?);
         assert!(!fixture.blob_file_exists(blob_id));
 
         // 4. Call open_file() and make sure the returned blob can be written to normally
         let mut new_blob = acache.open_file(inode)?;
 
-        // It's not actually a new blob; the id is reused
+        // The blob ID should match the inode
         assert_eq!(blob_id, new_blob.id());
 
         // Verify the new blob exists and it has been added to the LRU queue.
