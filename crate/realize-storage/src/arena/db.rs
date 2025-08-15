@@ -496,27 +496,27 @@ impl<'db> ArenaReadTransaction<'db> {
 ///
 /// These callbacks cannot fail and are run after the transaction has been
 /// successfully committed to the database.
-pub struct AfterCommit {
+pub(crate) struct AfterCommit {
     inner: RefCell<Vec<Box<dyn FnOnce() -> () + Send + 'static>>>,
 }
 
 impl AfterCommit {
     /// Create a new empty after-commit callback collection.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: RefCell::new(vec![]),
         }
     }
 
     /// Add a callback to be run after the transaction is committed.
-    pub fn add(&self, cb: impl FnOnce() -> () + Send + 'static) {
+    pub(crate) fn add(&self, cb: impl FnOnce() -> () + Send + 'static) {
         self.inner.borrow_mut().push(Box::new(cb));
     }
 
     /// Run all registered callbacks.
     ///
     /// This consumes the callbacks, so they can only be run once.
-    pub fn run_all(self) {
+    pub(crate) fn run_all(self) {
         for cb in self.inner.into_inner() {
             cb();
         }
@@ -526,7 +526,7 @@ impl AfterCommit {
 /// Callbacks that run before a transaction is committed.
 ///
 /// These callbacks can interrupt the commit by returning an error.
-pub struct BeforeCommit {
+pub(crate) struct BeforeCommit {
     inner: RefCell<
         Vec<Box<dyn FnOnce(&ArenaWriteTransaction) -> Result<(), StorageError> + Send + 'static>>,
     >,
@@ -534,14 +534,14 @@ pub struct BeforeCommit {
 
 impl BeforeCommit {
     /// Create a new empty before-commit callback collection.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: RefCell::new(vec![]),
         }
     }
 
     /// Add a callback to be run before the transaction is committed.
-    pub fn add(
+    pub(crate) fn add(
         &self,
         cb: impl FnOnce(&ArenaWriteTransaction) -> Result<(), StorageError> + Send + 'static,
     ) {
@@ -551,7 +551,7 @@ impl BeforeCommit {
     /// Run all registered callbacks in order.
     ///
     /// Returns an error if any callback fails, which will interrupt the commit.
-    pub fn run_all(&self, txn: &ArenaWriteTransaction) -> Result<(), StorageError> {
+    pub(crate) fn run_all(&self, txn: &ArenaWriteTransaction) -> Result<(), StorageError> {
         while let cbs = self.inner.take()
             && !cbs.is_empty()
         {
