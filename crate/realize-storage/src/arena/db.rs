@@ -1,3 +1,4 @@
+use super::dirty::{Dirty, DirtyReadOperations, ReadableOpenDirty, WritableOpenDirty};
 use super::tree::{ReadableOpenTree, Tree, TreeReadOperations, WritableOpenTree};
 use super::types::CacheTableKey;
 use super::types::{
@@ -158,6 +159,7 @@ const FAILED_JOB_TABLE: TableDefinition<u64, Holder<FailedJobTableEntry>> =
 pub(crate) struct ArenaDatabase {
     db: redb::Database,
     tree: Tree,
+    dirty: Dirty,
 }
 
 impl ArenaDatabase {
@@ -185,6 +187,7 @@ impl ArenaDatabase {
     }
 
     pub fn new(db: redb::Database, tree: Tree) -> Result<Arc<Self>, StorageError> {
+        let dirty: Dirty;
         let txn = db.begin_write()?;
         {
             // Create tables so they can safely be queried in read
@@ -205,18 +208,33 @@ impl ArenaDatabase {
             txn.open_table(MARK_TABLE)?;
             txn.open_table(DIRTY_TABLE)?;
             txn.open_table(DIRTY_LOG_TABLE)?;
-            txn.open_table(DIRTY_COUNTER_TABLE)?;
+            let dirty_counter_table = txn.open_table(DIRTY_COUNTER_TABLE)?;
             txn.open_table(FAILED_JOB_TABLE)?;
+
+            dirty = Dirty::new(&dirty_counter_table)?;
         }
         txn.commit()?;
 
-        Ok(Arc::new(Self { db, tree }))
+        Ok(Arc::new(Self { db, tree, dirty }))
+    }
+
+    /// Return handle on the Tree subsystem.
+    #[allow(dead_code)]
+    pub fn tree(&self) -> &Tree {
+        &self.tree
+    }
+
+    /// Return handle on the Dirty subsystem.
+    #[allow(dead_code)]
+    pub fn dirty(&self) -> &Dirty {
+        &self.dirty
     }
 
     pub fn begin_write(&self) -> Result<ArenaWriteTransaction<'_>, StorageError> {
         Ok(ArenaWriteTransaction {
             inner: self.db.begin_write()?,
             tree: &self.tree,
+            dirty: &self.dirty,
             before_commit: RefCell::new(vec![]),
             after_commit: RefCell::new(vec![]),
         })
@@ -233,6 +251,7 @@ impl ArenaDatabase {
 pub struct ArenaWriteTransaction<'db> {
     inner: redb::WriteTransaction,
     tree: &'db Tree,
+    dirty: &'db Dirty,
 
     /// Callbacks to be run after the transaction is committed.
     ///
@@ -354,26 +373,6 @@ impl<'db> ArenaWriteTransaction<'db> {
         Ok(self.inner.open_table(MARK_TABLE)?)
     }
 
-    pub fn dirty_table<'txn>(&'txn self) -> Result<Table<'txn, &'static str, u64>, StorageError> {
-        Ok(self.inner.open_table(DIRTY_TABLE)?)
-    }
-
-    pub fn dirty_log_table<'txn>(
-        &'txn self,
-    ) -> Result<Table<'txn, u64, &'static str>, StorageError> {
-        Ok(self.inner.open_table(DIRTY_LOG_TABLE)?)
-    }
-
-    pub fn dirty_counter_table<'txn>(&'txn self) -> Result<Table<'txn, (), u64>, StorageError> {
-        Ok(self.inner.open_table(DIRTY_COUNTER_TABLE)?)
-    }
-
-    pub fn failed_job_table<'txn>(
-        &'txn self,
-    ) -> Result<Table<'txn, u64, Holder<'static, FailedJobTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(FAILED_JOB_TABLE)?)
-    }
-
     pub(crate) fn read_tree(&self) -> Result<impl TreeReadOperations, StorageError> {
         Ok(ReadableOpenTree::new(
             self.inner.open_table(TREE_TABLE)?,
@@ -388,6 +387,26 @@ impl<'db> ArenaWriteTransaction<'db> {
             self.inner.open_table(TREE_REFCOUNT_TABLE)?,
             self.inner.open_table(CURRENT_INODE_RANGE_TABLE)?,
             &self.tree,
+        ))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn read_dirty(&self) -> Result<impl DirtyReadOperations, StorageError> {
+        Ok(ReadableOpenDirty::new(
+            self.inner.open_table(DIRTY_TABLE)?,
+            self.inner.open_table(DIRTY_LOG_TABLE)?,
+            self.inner.open_table(FAILED_JOB_TABLE)?,
+        ))
+    }
+
+    pub(crate) fn write_dirty(&self) -> Result<WritableOpenDirty<'_>, StorageError> {
+        Ok(WritableOpenDirty::new(
+            &self,
+            &self.dirty,
+            self.inner.open_table(DIRTY_TABLE)?,
+            self.inner.open_table(DIRTY_LOG_TABLE)?,
+            self.inner.open_table(FAILED_JOB_TABLE)?,
+            self.inner.open_table(DIRTY_COUNTER_TABLE)?,
         ))
     }
 }
@@ -450,24 +469,18 @@ impl<'db> ArenaReadTransaction<'db> {
         Ok(self.inner.open_table(MARK_TABLE)?)
     }
 
-    pub fn dirty_table(&self) -> Result<ReadOnlyTable<&'static str, u64>, StorageError> {
-        Ok(self.inner.open_table(DIRTY_TABLE)?)
-    }
-
-    pub fn dirty_log_table(&self) -> Result<ReadOnlyTable<u64, &'static str>, StorageError> {
-        Ok(self.inner.open_table(DIRTY_LOG_TABLE)?)
-    }
-
-    pub fn failed_job_table(
-        &self,
-    ) -> Result<ReadOnlyTable<u64, Holder<'static, FailedJobTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(FAILED_JOB_TABLE)?)
-    }
-
     pub(crate) fn read_tree(&self) -> Result<impl TreeReadOperations, StorageError> {
         Ok(ReadableOpenTree::new(
             self.inner.open_table(TREE_TABLE)?,
             &self.tree,
+        ))
+    }
+
+    pub(crate) fn read_dirty(&self) -> Result<impl DirtyReadOperations, StorageError> {
+        Ok(ReadableOpenDirty::new(
+            self.inner.open_table(DIRTY_TABLE)?,
+            self.inner.open_table(DIRTY_LOG_TABLE)?,
+            self.inner.open_table(FAILED_JOB_TABLE)?,
         ))
     }
 }
@@ -509,9 +522,6 @@ mod tests {
         txn.blob_lru_queue_table()?;
         txn.blob_next_id_table()?;
         txn.mark_table()?;
-        txn.dirty_table()?;
-        txn.dirty_log_table()?;
-        txn.failed_job_table()?;
 
         Ok(())
     }

@@ -4,7 +4,7 @@ use crate::config;
 use crate::utils::redb_utils;
 use arena_cache::ArenaCache;
 use db::ArenaDatabase;
-use engine::{DirtyPaths, Engine};
+use engine::Engine;
 use index::RealIndexAsync;
 use realize_types::{Arena, Hash};
 use std::time::Duration;
@@ -18,6 +18,7 @@ use watcher::RealWatcher;
 pub mod arena_cache;
 pub mod blob;
 pub mod db;
+mod dirty;
 pub mod engine;
 pub mod hasher;
 pub mod index;
@@ -56,14 +57,8 @@ impl ArenaStorage {
         let tree = Tree::new(arena, Arc::clone(allocator))?;
         let arena_root = tree.root();
         let db = ArenaDatabase::new(redb_utils::open(&arena_config.db).await?, tree)?;
-        let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-        let arena_cache = ArenaCache::new(
-            arena,
-            arena_root,
-            Arc::clone(&db),
-            &arena_config.blob_dir,
-            Arc::clone(&dirty_paths),
-        )?;
+        let arena_cache =
+            ArenaCache::new(arena, arena_root, Arc::clone(&db), &arena_config.blob_dir)?;
         let indexed = match arena_config.root.as_ref() {
             None => None,
             Some(root) => {
@@ -95,7 +90,6 @@ impl ArenaStorage {
             indexed.as_ref().map(|indexed| indexed.index.blocking()),
             arena_cache.clone(),
             arena_cache.clone(),
-            Arc::clone(&dirty_paths),
             arena_root,
             job_retry_strategy,
         );

@@ -8,7 +8,6 @@ use super::types::{
     HistoryTableEntry, IndexedFileTableEntry, LocalAvailability, LruQueueId, MarkTableEntry,
     PeerTableEntry,
 };
-use crate::arena::engine::DirtyPaths;
 use crate::arena::notifier::{Notification, Progress};
 use crate::types::BlobId;
 use crate::utils::fs_utils;
@@ -32,7 +31,6 @@ pub(crate) struct ArenaCache {
     arena_root: Inode,
     db: Arc<ArenaDatabase>,
     blobstore: Arc<Blobstore>,
-    dirty_paths: Arc<DirtyPaths>,
 
     history_tx: watch::Sender<u64>,
     uuid: Uuid,
@@ -65,14 +63,12 @@ impl ArenaCache {
         let tree = super::tree::Tree::new(arena, allocator)?;
         let arena_root = tree.root();
         let db = ArenaDatabase::new(crate::utils::redb_utils::in_memory()?, tree)?;
-        let dirty_paths = DirtyPaths::new_blocking(Arc::clone(&db))?;
 
         Ok(ArenaCache::new(
             arena,
             arena_root,
             Arc::clone(&db),
             blob_dir,
-            dirty_paths,
         )?)
     }
 
@@ -87,7 +83,6 @@ impl ArenaCache {
         arena_root: Inode,
         db: Arc<ArenaDatabase>,
         blob_dir: &std::path::Path,
-        dirty_paths: Arc<DirtyPaths>,
     ) -> Result<Arc<Self>, StorageError> {
         let blobstore = Blobstore::new(Arc::clone(&db), blob_dir)?;
         let uuid = load_or_assign_uuid(&db)?;
@@ -103,7 +98,6 @@ impl ArenaCache {
             arena_root,
             db,
             blobstore,
-            dirty_paths,
             uuid,
             history_tx,
             _history_rx: history_rx,
@@ -617,7 +611,8 @@ impl ArenaCache {
 
         // This entry is the outside world view of the file, so
         // changes should be reported.
-        self.dirty_paths.mark_dirty(txn, path)?;
+        let mut dirty = txn.write_dirty()?;
+        dirty.mark_dirty(path)?;
 
         Ok(())
     }
@@ -869,7 +864,8 @@ impl ArenaCache {
         let inode = tree.setup(path)?;
         tree.insert_and_incref(inode, &mut index_table, inode, Holder::new(&entry)?)?;
         if !same_hash {
-            (&self.dirty_paths).mark_dirty(txn, path)?;
+            let mut dirty = txn.write_dirty()?;
+            dirty.mark_dirty(path)?;
             let index = self.allocate_history_index(txn, &history_table)?;
             let ev = if let Some(old_hash) = old_hash {
                 HistoryTableEntry::Replace(path.clone(), old_hash)
@@ -905,7 +901,8 @@ impl ArenaCache {
         hash: Hash,
     ) -> Result<(), StorageError> {
         let index = self.allocate_history_index(txn, history_table)?;
-        (&self.dirty_paths).mark_dirty(txn, &path)?;
+        let mut dirty = txn.write_dirty()?;
+        dirty.mark_dirty(&path)?;
         let ev = HistoryTableEntry::Remove(path, hash);
         log::debug!("[{}] History #{index}: {ev:?}", self.arena);
         history_table.insert(index, Holder::with_content(ev)?)?;
@@ -1223,7 +1220,8 @@ impl RealIndex for ArenaCache {
             tree.remove_and_decref(inode, &mut index_table, inode)?;
 
             let index = self.allocate_history_index(&txn, &history_table)?;
-            (&self.dirty_paths).mark_dirty(&txn, &path)?;
+            let mut dirty = txn.write_dirty()?;
+            dirty.mark_dirty(&path)?;
             let ev = HistoryTableEntry::Drop(path.clone(), hash.clone());
             log::debug!("[{}] History #{index}: {ev:?}", self.arena);
             history_table.insert(index, Holder::with_content(ev)?)?;
@@ -1271,14 +1269,7 @@ impl PathMarks for ArenaCache {
 
             if old_mark != mark {
                 let index_table = txn.index_table()?;
-                mark_dirty_recursive(
-                    &txn,
-                    &tree,
-                    &cache_table,
-                    &index_table,
-                    inode,
-                    &self.dirty_paths,
-                )?;
+                mark_dirty_recursive(&txn, &tree, &cache_table, &index_table, inode)?;
             }
         }
         txn.commit()?;
@@ -1303,14 +1294,7 @@ impl PathMarks for ArenaCache {
             if old_mark != mark {
                 let cache_table = txn.cache_table()?;
                 let index_table = txn.index_table()?;
-                mark_dirty_recursive(
-                    &txn,
-                    &tree,
-                    &cache_table,
-                    &index_table,
-                    inode,
-                    &self.dirty_paths,
-                )?;
+                mark_dirty_recursive(&txn, &tree, &cache_table, &index_table, inode)?;
             }
         }
         txn.commit()?;
@@ -1335,14 +1319,7 @@ impl PathMarks for ArenaCache {
             if removed && old_mark != resolve_mark(&mark_table, &tree, inode)? {
                 let cache_table = txn.cache_table()?;
                 let index_table = txn.index_table()?;
-                mark_dirty_recursive(
-                    &txn,
-                    &tree,
-                    &cache_table,
-                    &index_table,
-                    inode,
-                    &self.dirty_paths,
-                )?;
+                mark_dirty_recursive(&txn, &tree, &cache_table, &index_table, inode)?;
             }
         }
         txn.commit()?;
@@ -1385,16 +1362,16 @@ fn mark_dirty_recursive(
     cache_table: &redb::Table<'_, CacheTableKey, Holder<CacheTableEntry>>,
     index_table: &redb::Table<'_, Inode, Holder<FileTableEntry>>,
     inode: Inode,
-    dirty_paths: &Arc<DirtyPaths>,
 ) -> Result<(), StorageError> {
+    let mut dirty = txn.write_dirty()?;
     for inode in std::iter::once(Ok(inode)).chain(tree.recurse(inode, |_| true)) {
         let inode = inode?;
         if let Some(entry) = index_table.get(inode)? {
             let path = &entry.value().parse()?.path;
-            dirty_paths.mark_dirty(txn, path)?;
+            dirty.mark_dirty(path)?;
         } else if let Some(entry) = cache_table.get(CacheTableKey::Default(inode))? {
             if let CacheTableEntry::File(entry) = entry.value().parse()? {
-                dirty_paths.mark_dirty(txn, entry.path)?;
+                dirty.mark_dirty(entry.path)?;
             }
         }
     }
@@ -1687,7 +1664,8 @@ mod tests {
 
     use super::ArenaCache;
     use crate::arena::db::{ArenaDatabase, ArenaReadTransaction};
-    use crate::arena::engine::DirtyPaths;
+    use crate::arena::dirty::DirtyReadOperations;
+
     use crate::arena::index::RealIndex;
     use crate::arena::mark::PathMarks;
     use crate::arena::notifier::Notification;
@@ -1756,7 +1734,10 @@ mod tests {
 
         fn clear_dirty(&self) -> anyhow::Result<()> {
             let txn = self.db.begin_write()?;
-            while self.acache.dirty_paths.take_next_dirty_path(&txn)?.is_some() {}
+            {
+                let mut dirty = txn.write_dirty()?;
+                while dirty.take_next_dirty_path()?.is_some() {}
+            }
             txn.commit()?;
 
             Ok(())
@@ -1813,6 +1794,17 @@ mod tests {
 
         fn as_real_index(&self) -> Arc<dyn RealIndex> {
             Arc::clone(&self.acache) as Arc<dyn RealIndex>
+        }
+
+        /// Check if a path is dirty
+        fn is_dirty<T>(&self, path: T) -> anyhow::Result<bool>
+        where
+            T: AsRef<Path>,
+        {
+            let path = path.as_ref();
+            let txn = self.db.begin_read()?;
+            let dirty = txn.read_dirty()?;
+            Ok(dirty.is_dirty(path)?)
         }
 
         async fn setup() -> anyhow::Result<Fixture> {
@@ -1909,7 +1901,7 @@ mod tests {
 
         fixture.add_to_cache(&file_path, 100, test_time())?;
 
-        assert!(fixture.acache.dirty_paths.is_dirty(&fixture.begin_read()?, &file_path)?);
+        assert!(fixture.is_dirty(&file_path)?);
 
         Ok(())
     }
@@ -1991,7 +1983,7 @@ mod tests {
             },
             None,
         )?;
-        assert!(fixture.acache.dirty_paths.is_dirty(&fixture.begin_read()?, &file_path)?);
+        assert!(fixture.is_dirty(&file_path)?);
 
         Ok(())
     }
@@ -2032,7 +2024,7 @@ mod tests {
             },
             None,
         )?;
-        assert!(!fixture.acache.dirty_paths.is_dirty(&fixture.begin_read()?, &file_path)?);
+        assert!(!fixture.is_dirty(&file_path)?);
 
         Ok(())
     }
@@ -2125,7 +2117,7 @@ mod tests {
 
         fixture.clear_dirty()?;
         fixture.remove_from_cache(&file_path)?;
-        assert!(fixture.acache.dirty_paths.is_dirty(&fixture.begin_read()?, &file_path)?);
+        assert!(fixture.is_dirty(&file_path)?);
 
         Ok(())
     }
@@ -3039,9 +3031,8 @@ mod tests {
         let tree = Tree::new(arena, Arc::clone(&allocator))?;
         let arena_root = tree.root();
         let db = ArenaDatabase::new(redb::Database::create(&path)?, tree)?;
-        let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
         let blob_dir = tempdir.child("blobs");
-        let acache = ArenaCache::new(arena, arena_root, db, blob_dir.path(), dirty_paths.clone())?;
+        let acache = ArenaCache::new(arena, arena_root, db, blob_dir.path())?;
         let uuid = acache.uuid().clone();
 
         // Drop the first instance to release the database lock
@@ -3049,8 +3040,7 @@ mod tests {
 
         let tree = Tree::new(arena, Arc::clone(&allocator))?;
         let db = ArenaDatabase::new(redb::Database::create(&path)?, tree)?;
-        let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-        let acache = ArenaCache::new(arena, arena_root, db, blob_dir.path(), dirty_paths)?;
+        let acache = ArenaCache::new(arena, arena_root, db, blob_dir.path())?;
         assert!(!uuid.is_nil());
         assert_eq!(uuid, acache.uuid().clone());
 
@@ -3592,7 +3582,10 @@ mod tests {
         /// Clear all dirty flags in both index and cache
         fn clear_all_dirty(&self) -> anyhow::Result<()> {
             let txn = self.db.begin_write()?;
-            while self.acache.dirty_paths.take_next_dirty_path(&txn)?.is_some() {}
+            {
+                let mut dirty = txn.write_dirty()?;
+                while dirty.take_next_dirty_path()?.is_some() {}
+            }
             txn.commit()?;
 
             Ok(())
@@ -3605,7 +3598,8 @@ mod tests {
         {
             let path = path.as_ref();
             let txn = self.db.begin_read()?;
-            Ok(self.acache.dirty_paths.is_dirty(&txn, path)?)
+            let dirty = txn.read_dirty()?;
+            Ok(dirty.is_dirty(path)?)
         }
 
         /// Add a file to the index for testing

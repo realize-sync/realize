@@ -146,8 +146,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::arena::engine::DirtyPaths;
-    use crate::arena::tree::TreeReadOperations;
+
     use crate::arena::types::IndexedFileTableEntry;
     use crate::utils::hash;
     use crate::{Blob, Inode, Notification};
@@ -182,15 +181,13 @@ mod tests {
 
             let arena = Arena::from("myarena");
             let db = ArenaDatabase::for_testing_single_arena(arena)?;
-            let dirty_paths = DirtyPaths::new_blocking(Arc::clone(&db))?;
             let root = tempdir.child("root");
             root.create_dir_all()?;
             let cache = ArenaCache::new(
                 arena,
-                db.begin_read()?.read_tree()?.root(),
+                db.tree().root(),
                 Arc::clone(&db),
                 &tempdir.path().join("blobs"),
-                Arc::clone(&dirty_paths),
             )?;
 
             let engine = Engine::new(
@@ -203,7 +200,6 @@ mod tests {
                 },
                 Arc::clone(&cache),
                 cache.clone(),
-                Arc::clone(&dirty_paths),
                 cache.arena_root(),
                 |attempt| {
                     if attempt < 3 {

@@ -931,9 +931,8 @@ impl OpenBlobRefCounter {
 mod tests {
     use super::*;
     use crate::arena::arena_cache::ArenaCache;
-    use crate::arena::engine::DirtyPaths;
+
     use crate::arena::mark::PathMarks;
-    use crate::arena::tree::TreeReadOperations;
     use crate::{Inode, Mark, Notification};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
@@ -982,14 +981,8 @@ mod tests {
                 std::fs::create_dir_all(p)?;
             }
             let db = ArenaDatabase::for_testing_single_arena(arena)?;
-            let dirty_paths = DirtyPaths::new(Arc::clone(&db)).await?;
-            let acache = ArenaCache::new(
-                arena,
-                db.begin_read()?.read_tree()?.root(),
-                Arc::clone(&db),
-                blob_dir.path(),
-                Arc::clone(&dirty_paths),
-            )?;
+            let acache =
+                ArenaCache::new(arena, db.tree().root(), Arc::clone(&db), blob_dir.path())?;
 
             Ok(Self {
                 arena,
