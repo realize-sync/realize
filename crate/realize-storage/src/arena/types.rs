@@ -126,8 +126,14 @@ impl ByteConvertible<QueueTableEntry> for QueueTableEntry {
 pub struct BlobTableEntry {
     pub written_areas: realize_types::ByteRanges,
 
-    /// Hash of the content; this may be missing or different from the file hash.
-    pub content_hash: Option<Hash>,
+    /// Hash of the content.
+    pub content_hash: Hash,
+
+    /// Size of the content.
+    pub content_size: u64,
+
+    /// If true, content of the file was verified against the hash.
+    pub verified: bool,
 
     /// Queue ID enum
     pub queue: LruQueueId,
@@ -154,12 +160,7 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
         let reader: blob_capnp::blob_table_entry::Reader =
             message_reader.get_root::<blob_capnp::blob_table_entry::Reader>()?;
 
-        let content_hash = if reader.has_content_hash() {
-            Some(parse_hash(reader.get_content_hash()?)?)
-        } else {
-            None
-        };
-
+        let content_hash = parse_hash(reader.get_content_hash()?)?;
         let next_value = reader.get_next();
         let next = if next_value != 0 {
             Some(Inode(next_value))
@@ -179,6 +180,8 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
         Ok(BlobTableEntry {
             written_areas: parse_byte_ranges(reader.get_written_areas()?)?,
             content_hash,
+            content_size: reader.get_content_size(),
+            verified: reader.get_verified(),
             queue,
             next,
             prev,
@@ -191,9 +194,9 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
         let mut builder: blob_capnp::blob_table_entry::Builder =
             message.init_root::<blob_capnp::blob_table_entry::Builder>();
 
-        if let Some(h) = &self.content_hash {
-            builder.set_content_hash(&h.0);
-        }
+        builder.set_content_hash(&self.content_hash.0);
+        builder.set_content_size(self.content_size);
+        builder.set_verified(self.verified);
         builder.set_queue(self.queue);
         builder.set_next(self.next.map(|b| b.0).unwrap_or(0));
         builder.set_prev(self.prev.map(|b| b.0).unwrap_or(0));
@@ -655,8 +658,6 @@ pub struct FileTableEntry {
     pub path: Path,
     /// Hash of the specific version of the content the peer has.
     pub hash: Hash,
-    /// ID of a locally-available blob containing this version.
-    pub blob: Option<Inode>,
     // If set, a version is known to exist that replaces the version
     // in this entry.
     pub outdated_by: Option<Hash>,
@@ -669,7 +670,6 @@ impl FileTableEntry {
             mtime,
             path,
             hash,
-            blob: None,
             outdated_by: None,
         }
     }
@@ -736,9 +736,6 @@ fn fill_file_table_entry(
     mtime.set_nsecs(entry.mtime.subsec_nanos());
     builder.set_path(entry.path.as_str());
     builder.set_hash(&entry.hash.0);
-    if let Some(blob) = entry.blob {
-        builder.set_blob(blob.into());
-    }
 
     if let Some(hash) = &entry.outdated_by {
         builder.set_outdated_by(&hash.0)
@@ -749,7 +746,6 @@ fn parse_file_table_entry(
     msg: cache_capnp::file_table_entry::Reader<'_>,
 ) -> Result<FileTableEntry, ByteConversionError> {
     let mtime = msg.get_mtime()?;
-    let blob: Option<Inode> = Inode::as_optional(msg.get_blob());
     let outdated_by: &[u8] = msg.get_outdated_by()?;
     let outdated_by = if outdated_by.is_empty() {
         None
@@ -761,7 +757,6 @@ fn parse_file_table_entry(
         mtime: UnixTime::new(mtime.get_secs(), mtime.get_nsecs()),
         path: Path::parse(msg.get_path()?.to_str()?)?,
         hash: parse_hash(msg.get_hash()?)?,
-        blob,
         outdated_by,
     })
 }
@@ -893,7 +888,9 @@ mod tests {
                 realize_types::ByteRange::new(0, 1024),
                 realize_types::ByteRange::new(2048, 4096),
             ]),
-            content_hash: None,
+            content_hash: Hash([2u8; 32]),
+            content_size: 100,
+            verified: false,
             queue: LruQueueId::WorkingArea,
             next: Some(Inode(0x0101010101010101)),
             prev: Some(Inode(0x0202020202020202)),
@@ -907,7 +904,9 @@ mod tests {
 
         let empty_entry = BlobTableEntry {
             written_areas: realize_types::ByteRanges::from_ranges(vec![]),
-            content_hash: Some(Hash([0x03; 32])),
+            content_hash: Hash([0x03; 32]),
+            content_size: 0,
+            verified: false,
             queue: LruQueueId::WorkingArea,
             next: None,
             prev: None,
@@ -1031,27 +1030,7 @@ mod tests {
             mtime: UnixTime::from_secs(1234567890),
             path: Path::parse("foo/bar.txt")?,
             hash: Hash([0xa1u8; 32]),
-            blob: None,
             outdated_by: Some(Hash([3u8; 32])),
-        };
-
-        assert_eq!(
-            entry,
-            FileTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn convert_file_table_entry_with_blob() -> anyhow::Result<()> {
-        let entry = FileTableEntry {
-            size: 200,
-            mtime: UnixTime::from_secs(1234567890),
-            path: Path::parse("foo/bar.txt")?,
-            hash: Hash([0xa1u8; 32]),
-            blob: Some(Inode(5541)),
-            outdated_by: None,
         };
 
         assert_eq!(
@@ -1260,7 +1239,6 @@ mod tests {
             mtime: UnixTime::from_secs(1234567890),
             path: Path::parse("foo/bar.txt")?,
             hash: Hash([0xa1u8; 32]),
-            blob: Some(Inode(5541)),
             outdated_by: Some(Hash([3u8; 32])),
         };
 
@@ -1298,7 +1276,6 @@ mod tests {
             mtime: UnixTime::from_secs(1234567890),
             path: Path::parse("test/file.txt")?,
             hash: Hash([0x42u8; 32]),
-            blob: None,
             outdated_by: None,
         };
 

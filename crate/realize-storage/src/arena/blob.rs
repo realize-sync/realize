@@ -1,8 +1,6 @@
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
 use super::hasher::hash_file;
-use super::types::{
-    BlobTableEntry, FileTableEntry, LocalAvailability, LruQueueId, QueueTableEntry,
-};
+use super::types::{BlobTableEntry, LocalAvailability, LruQueueId, QueueTableEntry};
 use crate::StorageError;
 use crate::types::Inode;
 use crate::utils::holder::Holder;
@@ -64,53 +62,38 @@ impl Blobstore {
     pub(crate) fn open_blob(
         self: &Arc<Self>,
         txn: &ArenaReadTransaction,
-        file_entry: FileTableEntry,
         inode: Inode,
     ) -> Result<Blob, StorageError> {
         let blob_table = txn.blob_table()?;
         let blob_entry = get_blob_entry(&blob_table, inode)?;
-        let file = self.open_blob_file(inode, file_entry.size, false)?;
+        let file = self.open_blob_file(inode, blob_entry.content_size, false)?;
 
-        return Ok(Blob::new(
-            inode,
-            file_entry,
-            blob_entry,
-            file,
-            Arc::clone(self),
-        ));
+        return Ok(Blob::new(inode, blob_entry, file, Arc::clone(self)));
     }
 
     /// Create a new blob and returns its [Blob]
     pub(crate) fn create_blob(
         self: &Arc<Self>,
         txn: &ArenaWriteTransaction,
-        file_entry: FileTableEntry,
+        hash: &Hash,
+        size: u64,
         queue: LruQueueId,
         inode: Inode,
     ) -> Result<Blob, StorageError> {
         let mut blob_table = txn.blob_table()?;
         let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
-        let inode = match file_entry.blob {
-            Some(inode) => inode,
-            None => Inode(inode.0),
-        };
-        let file = self.open_blob_file(inode, file_entry.size, true)?;
+        let file = self.open_blob_file(inode, size, true)?;
         let blob_entry = init_blob_entry(
             &mut blob_lru_queue_table,
             &mut blob_table,
             inode,
             queue,
+            hash,
             &file.metadata()?,
         )?;
         blob_table.insert(inode, Holder::new(&blob_entry)?)?;
 
-        Ok(Blob::new(
-            inode,
-            file_entry,
-            blob_entry,
-            file,
-            Arc::clone(self),
-        ))
+        Ok(Blob::new(inode, blob_entry, file, Arc::clone(self)))
     }
 
     /// Open or create a file for the blob and make sure it has the
@@ -217,15 +200,17 @@ impl Blobstore {
         Ok(())
     }
 
-    fn set_content_hash(&self, inode: Inode, hash: Hash) -> Result<(), StorageError> {
+    fn mark_verified(&self, inode: Inode, hash: Hash) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
         {
             let mut blob_table = txn.blob_table()?;
             let mut blob_entry = get_blob_entry(&blob_table, inode)?;
-            log::debug!("{inode} content verified to be {hash}");
-            blob_entry.content_hash = Some(hash);
+            if blob_entry.content_hash == hash {
+                blob_entry.verified = true;
+                log::debug!("{inode} content verified to be {hash}");
 
-            blob_table.insert(inode, Holder::with_content(blob_entry)?)?;
+                blob_table.insert(inode, Holder::with_content(blob_entry)?)?;
+            }
         }
         txn.commit()?;
 
@@ -246,12 +231,7 @@ impl Blobstore {
     ) -> Result<bool, StorageError> {
         let mut blob_table = txn.blob_table()?;
         let blob_entry = get_blob_entry(&blob_table, inode)?;
-        if !blob_entry
-            .content_hash
-            .as_ref()
-            .map(|h| *h == *content_hash)
-            .unwrap_or(false)
-        {
+        if blob_entry.content_hash != *content_hash || !blob_entry.verified {
             return Ok(false);
         }
 
@@ -269,29 +249,26 @@ impl Blobstore {
     pub(crate) fn move_into_blob(
         &self,
         txn: &ArenaWriteTransaction,
-        id: Option<Inode>,
+        inode: Inode,
+        hash: &Hash,
         queue: LruQueueId,
         metadata: &std::fs::Metadata,
-        inode: Inode,
-    ) -> Result<(Inode, PathBuf), StorageError> {
+    ) -> Result<PathBuf, StorageError> {
         let mut blob_table = txn.blob_table()?;
         let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
-        let id = match id {
-            Some(inode) => inode,
-            None => Inode(inode.0),
-        };
         let mut entry = init_blob_entry(
             &mut blob_lru_queue_table,
             &mut blob_table,
-            id,
+            inode,
             queue,
+            hash,
             metadata,
         )?;
         entry.written_areas = ByteRanges::single(0, metadata.len());
         update_disk_usage(&mut blob_lru_queue_table, &mut entry, metadata)?;
-        blob_table.insert(id, Holder::with_content(entry)?)?;
+        blob_table.insert(inode, Holder::with_content(entry)?)?;
 
-        Ok((id, self.blob_path(id)))
+        Ok(self.blob_path(inode))
     }
 
     /// Remove blobs from the back of the given queue until the total
@@ -462,22 +439,25 @@ fn get_queue_must_exist(
 fn init_blob_entry(
     blob_lru_queue_table: &mut redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
     blob_table: &mut redb::Table<'_, Inode, Holder<'static, BlobTableEntry>>,
-    id: Inode,
+    inode: Inode,
     queue: LruQueueId,
+    hash: &Hash,
     metadata: &std::fs::Metadata,
 ) -> Result<BlobTableEntry, StorageError> {
-    let mut entry = if let Some(e) = blob_table.get(id)? {
+    let mut entry = if let Some(e) = blob_table.get(inode)? {
         e.value().parse()?
     } else {
         let mut entry = BlobTableEntry {
             written_areas: ByteRanges::new(),
-            content_hash: None,
+            content_hash: hash.clone(),
+            content_size: metadata.len(),
+            verified: false,
             queue,
             next: None,
             prev: None,
             disk_usage: 0,
         };
-        add_to_queue_front(blob_lru_queue_table, blob_table, queue, id, &mut entry)?;
+        add_to_queue_front(blob_lru_queue_table, blob_table, queue, inode, &mut entry)?;
 
         entry
     };
@@ -492,40 +472,33 @@ pub(crate) fn blob_exists(txn: &ArenaReadTransaction, id: Inode) -> Result<bool,
 
 pub(crate) fn local_availability(
     txn: &ArenaReadTransaction,
-    file_entry: &FileTableEntry,
+    inode: Inode,
 ) -> Result<LocalAvailability, StorageError> {
-    match file_entry.blob {
-        None => Ok(LocalAvailability::Missing),
-        Some(inode) => {
-            let blob_table = txn.blob_table()?;
-            let blob_entry = match get_blob_entry(&blob_table, inode) {
-                Ok(ret) => ret,
-                Err(StorageError::NotFound) => {
-                    return Ok(LocalAvailability::Missing);
-                }
-                Err(err) => {
-                    return Err(err);
-                }
-            };
-            let file_range = ByteRanges::single(0, file_entry.size);
-            if file_range == file_range.intersection(&blob_entry.written_areas) {
-                if let Some(content_hash) = &blob_entry.content_hash
-                    && file_entry.hash == *content_hash
-                {
-                    return Ok(LocalAvailability::Verified);
-                }
-                return Ok(LocalAvailability::Complete);
-            }
-            if blob_entry.written_areas.is_empty() {
-                return Ok(LocalAvailability::Missing);
-            }
-
-            Ok(LocalAvailability::Partial(
-                file_entry.size,
-                blob_entry.written_areas,
-            ))
+    let blob_table = txn.blob_table()?;
+    let blob_entry = match get_blob_entry(&blob_table, inode) {
+        Ok(ret) => ret,
+        Err(StorageError::NotFound) => {
+            return Ok(LocalAvailability::Missing);
         }
+        Err(err) => {
+            return Err(err);
+        }
+    };
+    let file_range = ByteRanges::single(0, blob_entry.content_size);
+    if file_range == file_range.intersection(&blob_entry.written_areas) {
+        if blob_entry.verified {
+            return Ok(LocalAvailability::Verified);
+        }
+        return Ok(LocalAvailability::Complete);
     }
+    if blob_entry.written_areas.is_empty() {
+        return Ok(LocalAvailability::Missing);
+    }
+
+    Ok(LocalAvailability::Partial(
+        blob_entry.content_size,
+        blob_entry.written_areas,
+    ))
 }
 
 fn get_blob_entry(
@@ -658,12 +631,10 @@ pub struct Blob {
     offset: u64,
 }
 
-#[allow(dead_code)]
 impl Blob {
     /// Create a new blob from a file and its available byte ranges.
     pub(crate) fn new(
         inode: Inode,
-        file_entry: FileTableEntry,
         blob_entry: BlobTableEntry,
         file: std::fs::File,
         blobstore: Arc<Blobstore>,
@@ -675,8 +646,8 @@ impl Blob {
             available_ranges: blob_entry.written_areas,
             blobstore,
             pending_ranges: ByteRanges::new(),
-            size: file_entry.size,
-            hash: file_entry.hash,
+            size: blob_entry.content_size,
+            hash: blob_entry.content_hash,
             offset: 0,
         }
     }
@@ -734,7 +705,7 @@ impl Blob {
         let inode = self.inode;
         let blobstore = self.blobstore.clone();
         let hash = self.hash.clone();
-        tokio::task::spawn_blocking(move || blobstore.set_content_hash(inode, hash)).await?
+        tokio::task::spawn_blocking(move || blobstore.mark_verified(inode, hash)).await?
     }
 
     /// Make sure any updated content is stored on disk before

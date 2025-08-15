@@ -9,9 +9,14 @@ $Rust.parentModule("arena::types");
 struct BlobTableEntry {
   writtenAreas @0: ByteRanges;
 
-  # Hash of the content, may be missing or inconsistent
-  # with the corresponding file entry.
+  # Hash of the content
   contentHash @1: Data;
+
+  # Size of the content
+  contentSize @6: UInt64;
+
+  # If true, content was verified against hash.
+  verified @7: Bool;
 
   # Queue ID enum
   queue @2: LruQueueId;

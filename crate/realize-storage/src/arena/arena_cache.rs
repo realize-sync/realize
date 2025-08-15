@@ -226,7 +226,6 @@ impl ArenaCache {
                         &mut tree,
                         &mut cache_table,
                         file_inode,
-                        None,
                         &entry,
                     )?;
                 }
@@ -262,7 +261,6 @@ impl ArenaCache {
                         &mut tree,
                         &mut cache_table,
                         file_inode,
-                        Some(&old_entry),
                         &entry,
                     )?;
                 }
@@ -358,7 +356,6 @@ impl ArenaCache {
                         &mut tree,
                         &mut cache_table,
                         file_inode,
-                        None,
                         &entry,
                     )?;
                 }
@@ -391,12 +388,9 @@ impl ArenaCache {
         // blob is there.
         {
             let txn = self.db.begin_read()?;
-            let file_entry = get_default_entry(&txn.cache_table()?, inode)?;
-            if let Some(inode) = file_entry.blob
-                && blob::blob_exists(&txn, inode)?
-            {
+            if blob::blob_exists(&txn, inode)? {
                 // Delegate to Blobstore
-                return self.blobstore.open_blob(&txn, file_entry, inode);
+                return self.blobstore.open_blob(&txn, inode);
             }
         }
 
@@ -404,23 +398,22 @@ impl ArenaCache {
         // the file entry again because it might have changed.
         let txn = self.db.begin_write()?;
         let ret = {
-            let mut cache_table = txn.cache_table()?;
+            let cache_table = txn.cache_table()?;
             let mark_table = txn.mark_table()?;
-            let mut file_entry = get_default_entry(&cache_table, inode)?;
-            let queue = queue_for_inode(&mark_table, &txn.read_tree()?, inode)?;
-            let blob = self
-                .blobstore
-                .create_blob(&txn, file_entry.clone(), queue, inode)?;
+            let file_entry = get_default_entry(&cache_table, inode)?;
+            let queue = queue_for_blob(&mark_table, &txn.read_tree()?, inode)?;
+            let blob = self.blobstore.create_blob(
+                &txn,
+                &file_entry.hash,
+                file_entry.size,
+                queue,
+                inode,
+            )?;
             log::debug!(
                 "[{}] assigned blob {} in {queue:?} to file {inode}",
                 self.arena,
                 blob.inode()
             );
-            file_entry.blob = Some(blob.inode());
-            cache_table.insert(
-                CacheTableKey::Default(inode),
-                Holder::with_content(CacheTableEntry::File(file_entry))?,
-            )?;
 
             blob
         };
@@ -449,30 +442,17 @@ impl ArenaCache {
         let path = path.as_ref();
         let tree = txn.read_tree()?;
         let inode = tree.expect(path)?;
-        let mut cache_table = txn.cache_table()?;
-        let mut file_entry = get_default_entry(&cache_table, inode)?;
+        let cache_table = txn.cache_table()?;
+        let file_entry = get_default_entry(&cache_table, inode)?;
         if file_entry.hash != *hash {
             return Ok(false);
         }
-        let inode = match file_entry.blob {
-            None => {
-                return Err(StorageError::NotFound);
-            }
-            Some(id) => id,
-        };
-
         if !self
             .blobstore
             .move_blob_if_matches(&txn, inode, hash, dest)?
         {
             return Ok(false);
         }
-
-        file_entry.blob = None;
-        cache_table.insert(
-            CacheTableKey::Default(inode),
-            Holder::with_content(CacheTableEntry::File(file_entry))?,
-        )?;
 
         log::debug!("Realized [{}]/{path} {hash} as {dest:?}", self.arena);
 
@@ -501,8 +481,8 @@ impl ArenaCache {
                 return Ok(None);
             }
         };
-        let mut cache_table = txn.cache_table()?;
-        let mut file_entry = match get_default_entry(&cache_table, inode) {
+        let cache_table = txn.cache_table()?;
+        let file_entry = match get_default_entry(&cache_table, inode) {
             Ok(e) => e,
             Err(StorageError::NotFound) => {
                 return Ok(None);
@@ -515,17 +495,12 @@ impl ArenaCache {
             return Ok(None);
         }
         let mark_table = txn.mark_table()?;
-        let (inode, cachepath) = self.blobstore.move_into_blob(
+        let cachepath = self.blobstore.move_into_blob(
             &txn,
-            file_entry.blob,
-            queue_for_inode(&mark_table, &tree, inode)?,
-            metadata,
             inode,
-        )?;
-        file_entry.blob = Some(inode);
-        cache_table.insert(
-            CacheTableKey::Default(inode),
-            Holder::with_content(CacheTableEntry::File(file_entry))?,
+            hash,
+            queue_for_blob(&mark_table, &tree, inode)?,
+            metadata,
         )?;
 
         Ok(Some(cachepath))
@@ -579,14 +554,10 @@ impl ArenaCache {
     fn before_default_file_entry_change(
         &self,
         txn: &ArenaWriteTransaction,
-        old_entry: Option<&FileTableEntry>,
+        inode: Inode,
         path: &Path,
     ) -> Result<(), StorageError> {
-        if let Some(old_entry) = old_entry {
-            if let Some(inode) = old_entry.blob {
-                self.blobstore.delete_blob(&txn, inode)?;
-            }
-        }
+        self.blobstore.delete_blob(&txn, inode)?;
 
         // This entry is the outside world view of the file, so
         // changes should be reported.
@@ -602,15 +573,14 @@ impl ArenaCache {
         txn: &ArenaWriteTransaction,
         tree: &mut WritableOpenTree,
         cache_table: &mut redb::Table<'_, CacheTableKey, Holder<CacheTableEntry>>,
-        file_inode: Inode,
-        old_entry: Option<&FileTableEntry>,
+        inode: Inode,
         new_entry: &FileTableEntry,
     ) -> Result<(), StorageError> {
-        self.before_default_file_entry_change(txn, old_entry, &new_entry.path)?;
+        self.before_default_file_entry_change(txn, inode, &new_entry.path)?;
         tree.insert_and_incref(
-            file_inode,
+            inode,
             cache_table,
-            CacheTableKey::Default(file_inode),
+            CacheTableKey::Default(inode),
             Holder::new(&CacheTableEntry::File(new_entry.clone()))?,
         )?;
 
@@ -676,21 +646,10 @@ impl ArenaCache {
         let new_entry = peer_entries.into_iter().max_by_key(|e| e.mtime);
         match new_entry {
             Some(new_entry) => {
-                self.do_write_default_file_entry(
-                    txn,
-                    tree,
-                    cache_table,
-                    inode,
-                    Some(&default_entry),
-                    &new_entry,
-                )?;
+                self.do_write_default_file_entry(txn, tree, cache_table, inode, &new_entry)?;
             }
             None => {
-                self.before_default_file_entry_change(
-                    txn,
-                    Some(&default_entry),
-                    &default_entry.path,
-                )?;
+                self.before_default_file_entry_change(txn, inode, &default_entry.path)?;
                 tree.remove_and_decref(inode, cache_table, CacheTableKey::Default(inode))?;
 
                 // Update the parent modification time, as removing an
@@ -779,9 +738,8 @@ impl ArenaCache {
         inode: Inode,
     ) -> Result<LocalAvailability, StorageError> {
         let txn = self.db.begin_read()?;
-        let file_entry = get_default_entry(&txn.cache_table()?, inode)?;
 
-        blob::local_availability(&txn, &file_entry)
+        blob::local_availability(&txn, inode)
     }
 
     // TODO: update tests to work on blobstore and remove
@@ -898,7 +856,7 @@ impl ArenaCache {
 }
 
 /// Choose the appropriate blob queue for the inode, given its mark.
-fn queue_for_inode(
+fn queue_for_blob(
     mark_table: &impl ReadableTable<Inode, Holder<'static, MarkTableEntry>>,
     tree: &impl TreeReadOperations,
     inode: Inode,
@@ -2862,12 +2820,11 @@ mod tests {
     async fn local_availability_handles_nonexistent_inode() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let acache = &fixture.acache;
-
-        // Try to get availability for a non-existent inode
         let nonexistent_inode = Inode(999999);
-        let result = acache.local_availability(nonexistent_inode);
-
-        assert!(matches!(result, Err(StorageError::NotFound)));
+        assert_eq!(
+            LocalAvailability::Missing,
+            acache.local_availability(nonexistent_inode)?,
+        );
 
         Ok(())
     }

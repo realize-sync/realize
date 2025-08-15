@@ -5,6 +5,7 @@ use super::db::{ArenaDatabase, ArenaReadTransaction};
 use super::dirty::DirtyReadOperations;
 use super::index::RealIndex;
 use super::mark::PathMarks;
+use super::tree::TreeExt;
 use super::types::LocalAvailability;
 use crate::arena::blob;
 use crate::types::JobId;
@@ -465,11 +466,13 @@ impl Engine {
                         )));
                     }
 
-                    if blob::local_availability(txn, &cached)? != LocalAvailability::Verified {
-                        return Ok(Some((
-                            JobId(counter),
-                            StorageJob::External(Job::Download(path, cached.hash)),
-                        )));
+                    if let Some(inode) = txn.read_tree()?.resolve(&path)? {
+                        if blob::local_availability(txn, inode)? != LocalAvailability::Verified {
+                            return Ok(Some((
+                                JobId(counter),
+                                StorageJob::External(Job::Download(path, cached.hash)),
+                            )));
+                        }
                     }
                 }
             }

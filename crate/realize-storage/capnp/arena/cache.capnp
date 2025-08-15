@@ -22,9 +22,8 @@ struct FileTableEntry {
   mtime @1: Time;
   path @2: Text;
   hash @3: Data;
-  blob @4: UInt64;
   # may be empty
-  outdatedBy @5: Data;
+  outdatedBy @4: Data;
 }
 
 struct PeerTableEntry {
