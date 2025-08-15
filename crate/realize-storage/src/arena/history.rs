@@ -1,4 +1,4 @@
-use super::db::ArenaWriteTransaction;
+use super::db::AfterCommit;
 use super::types::HistoryTableEntry;
 use crate::StorageError;
 use crate::utils::holder::Holder;
@@ -60,19 +60,19 @@ where
 }
 
 pub(crate) struct WritableOpenHistory<'a> {
-    txn: &'a ArenaWriteTransaction<'a>,
+    after_commit: &'a AfterCommit,
     history: &'a History,
     table: redb::Table<'a, u64, Holder<'static, HistoryTableEntry>>,
 }
 
 impl<'a> WritableOpenHistory<'a> {
     pub(crate) fn new(
-        txn: &'a ArenaWriteTransaction,
+        after_commit: &'a AfterCommit,
         history: &'a History,
         table: redb::Table<'a, u64, Holder<'static, HistoryTableEntry>>,
     ) -> Self {
         Self {
-            txn,
+            after_commit,
             history,
             table,
         }
@@ -180,7 +180,7 @@ impl<'a> WritableOpenHistory<'a> {
     fn allocate_history_index(&mut self) -> Result<u64, StorageError> {
         let entry_index = 1 + last_history_index(&mut self.table)?;
         let tx = self.history.tx.clone();
-        self.txn.after_commit(move || {
+        self.after_commit.add(move || {
             let _ = tx.send(entry_index);
         });
 

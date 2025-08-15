@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use super::db::ArenaWriteTransaction;
+use super::db::AfterCommit;
 use super::types::{FailedJobTableEntry, RetryJob};
 use crate::{JobId, StorageError, utils::holder::Holder};
 use realize_types::{Path, UnixTime};
@@ -55,7 +55,7 @@ where
 }
 
 pub(crate) struct WritableOpenDirty<'a> {
-    txn: &'a ArenaWriteTransaction<'a>,
+    after_commit: &'a AfterCommit,
     dirty: &'a Dirty,
     table: Table<'a, &'static str, u64>,
     log_table: Table<'a, u64, &'static str>,
@@ -65,7 +65,7 @@ pub(crate) struct WritableOpenDirty<'a> {
 
 impl<'a> WritableOpenDirty<'a> {
     pub(crate) fn new(
-        txn: &'a ArenaWriteTransaction,
+        after_commit: &'a AfterCommit,
         dirty: &'a Dirty,
         dirty_table: Table<'a, &str, u64>,
         log_table: Table<'a, u64, &str>,
@@ -73,7 +73,7 @@ impl<'a> WritableOpenDirty<'a> {
         counter_table: Table<'a, (), u64>,
     ) -> Self {
         Self {
-            txn,
+            after_commit,
             dirty,
             table: dirty_table,
             log_table,
@@ -356,7 +356,7 @@ impl<'a> WritableOpenDirty<'a> {
             self.failed_job_table.remove(counter)?;
         }
         let watch_tx = self.dirty.watch_tx.clone();
-        self.txn.after_commit(move || {
+        self.after_commit.add(move || {
             let _ = watch_tx.send(counter);
         });
 

@@ -266,8 +266,8 @@ impl ArenaDatabase {
         Ok(ArenaWriteTransaction {
             inner: self.db.begin_write()?,
             subsystems: &self.subsystems,
-            before_commit: RefCell::new(vec![]),
-            after_commit: RefCell::new(vec![]),
+            before_commit: BeforeCommit::new(),
+            after_commit: AfterCommit::new(),
         })
     }
 
@@ -289,15 +289,13 @@ pub struct ArenaWriteTransaction<'db> {
     /// much always borrowed immutably, with the tables it would be
     /// impractical to have pass around mutable references to
     /// transactions.
-    after_commit: RefCell<Vec<Box<dyn FnOnce() -> () + Send + 'static>>>,
+    after_commit: AfterCommit,
 
     /// Callbacks to be run before the transaction is committed.
     ///
     /// These callbacks can interrupt the commit by returning an
     /// error.
-    before_commit: RefCell<
-        Vec<Box<dyn FnOnce(&ArenaWriteTransaction) -> Result<(), StorageError> + Send + 'static>>,
-    >,
+    before_commit: BeforeCommit,
 }
 
 impl<'db> ArenaWriteTransaction<'db> {
@@ -306,37 +304,10 @@ impl<'db> ArenaWriteTransaction<'db> {
     /// If the transaction is successfully committed, functions
     /// registered by after_commit are run, and these may fail.
     pub fn commit(self) -> Result<(), StorageError> {
-        while let cbs = self.before_commit.take()
-            && !cbs.is_empty()
-        {
-            for cb in cbs {
-                (cb)(&self)?;
-            }
-        }
+        self.before_commit.run_all(&self)?;
         self.inner.commit()?;
-        for cb in self.after_commit.into_inner() {
-            cb();
-        }
+        self.after_commit.run_all();
         Ok(())
-    }
-
-    /// Register a function to be run just before committing the current transaction.
-    ///
-    /// Before commit functions are run in order from the time commit() is called until either
-    /// there isn't one left or one of them fails..
-    pub fn before_commit(
-        &self,
-        cb: impl FnOnce(&ArenaWriteTransaction) -> Result<(), StorageError> + Send + 'static,
-    ) {
-        self.before_commit.borrow_mut().push(Box::new(cb));
-    }
-
-    /// Register a function to be run after the current transaction
-    /// has been successfully committed.
-    ///
-    /// After commit functions are run in order after a successful commit.
-    pub fn after_commit(&self, cb: impl FnOnce() -> () + Send + 'static) {
-        self.after_commit.borrow_mut().push(Box::new(cb));
     }
 
     pub fn settings_table<'txn>(
@@ -402,7 +373,7 @@ impl<'db> ArenaWriteTransaction<'db> {
 
     pub(crate) fn write_tree(&self) -> Result<WritableOpenTree<'_>, StorageError> {
         Ok(WritableOpenTree::new(
-            &self,
+            &self.before_commit,
             self.inner.open_table(TREE_TABLE)?,
             self.inner.open_table(TREE_REFCOUNT_TABLE)?,
             self.inner.open_table(CURRENT_INODE_RANGE_TABLE)?,
@@ -421,7 +392,7 @@ impl<'db> ArenaWriteTransaction<'db> {
 
     pub(crate) fn write_dirty(&self) -> Result<WritableOpenDirty<'_>, StorageError> {
         Ok(WritableOpenDirty::new(
-            &self,
+            &self.after_commit,
             &self.subsystems.dirty,
             self.inner.open_table(DIRTY_TABLE)?,
             self.inner.open_table(DIRTY_LOG_TABLE)?,
@@ -438,7 +409,7 @@ impl<'db> ArenaWriteTransaction<'db> {
 
     pub(crate) fn write_history(&self) -> Result<WritableOpenHistory<'_>, StorageError> {
         Ok(WritableOpenHistory::new(
-            &self,
+            &self.after_commit,
             &self.subsystems.history,
             self.inner.open_table(HISTORY_TABLE)?,
         ))
@@ -517,6 +488,77 @@ impl<'db> ArenaReadTransaction<'db> {
     }
 }
 
+/// Callbacks that run after a transaction is committed.
+///
+/// These callbacks cannot fail and are run after the transaction has been
+/// successfully committed to the database.
+pub struct AfterCommit {
+    inner: RefCell<Vec<Box<dyn FnOnce() -> () + Send + 'static>>>,
+}
+
+impl AfterCommit {
+    /// Create a new empty after-commit callback collection.
+    pub fn new() -> Self {
+        Self {
+            inner: RefCell::new(vec![]),
+        }
+    }
+
+    /// Add a callback to be run after the transaction is committed.
+    pub fn add(&self, cb: impl FnOnce() -> () + Send + 'static) {
+        self.inner.borrow_mut().push(Box::new(cb));
+    }
+
+    /// Run all registered callbacks.
+    ///
+    /// This consumes the callbacks, so they can only be run once.
+    pub fn run_all(self) {
+        for cb in self.inner.into_inner() {
+            cb();
+        }
+    }
+}
+
+/// Callbacks that run before a transaction is committed.
+///
+/// These callbacks can interrupt the commit by returning an error.
+pub struct BeforeCommit {
+    inner: RefCell<
+        Vec<Box<dyn FnOnce(&ArenaWriteTransaction) -> Result<(), StorageError> + Send + 'static>>,
+    >,
+}
+
+impl BeforeCommit {
+    /// Create a new empty before-commit callback collection.
+    pub fn new() -> Self {
+        Self {
+            inner: RefCell::new(vec![]),
+        }
+    }
+
+    /// Add a callback to be run before the transaction is committed.
+    pub fn add(
+        &self,
+        cb: impl FnOnce(&ArenaWriteTransaction) -> Result<(), StorageError> + Send + 'static,
+    ) {
+        self.inner.borrow_mut().push(Box::new(cb));
+    }
+
+    /// Run all registered callbacks in order.
+    ///
+    /// Returns an error if any callback fails, which will interrupt the commit.
+    pub fn run_all(&self, txn: &ArenaWriteTransaction) -> Result<(), StorageError> {
+        while let cbs = self.inner.take()
+            && !cbs.is_empty()
+        {
+            for cb in cbs {
+                cb(txn)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,7 +616,7 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         {
             let mut test_table = txn.inner.open_table(TEST_TABLE)?;
-            txn.before_commit(|txn| {
+            txn.before_commit.add(|txn| {
                 let mut test_table = txn.inner.open_table(TEST_TABLE)?;
                 test_table.insert("2", "before_commit")?;
                 Ok(())
@@ -604,11 +646,11 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         {
             let mut test_table = txn.inner.open_table(TEST_TABLE)?;
-            txn.before_commit(|txn| {
+            txn.before_commit.add(|txn| {
                 let mut test_table = txn.inner.open_table(TEST_TABLE)?;
                 test_table.insert("2", "before_commit 1")?;
 
-                txn.before_commit(|txn| {
+                txn.before_commit.add(|txn| {
                     let mut test_table = txn.inner.open_table(TEST_TABLE)?;
                     test_table.insert("3", "before_commit 2")?;
 

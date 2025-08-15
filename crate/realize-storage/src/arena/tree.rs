@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use super::db::ArenaWriteTransaction;
+use super::db::BeforeCommit;
 use crate::InodeAllocator;
 use crate::utils::holder::ByteConversionError;
 use crate::{Inode, StorageError};
@@ -391,7 +391,7 @@ where
 
 /// A tree open for write with [OpenTree::write_tree].
 pub(crate) struct WritableOpenTree<'a> {
-    txn: &'a ArenaWriteTransaction<'a>,
+    before_commit: &'a BeforeCommit,
     table: Table<'a, (Inode, &'static str), Inode>,
     refcount_table: Table<'a, Inode, u32>,
     current_inode_range_table: redb::Table<'a, (), (Inode, Inode)>,
@@ -400,14 +400,14 @@ pub(crate) struct WritableOpenTree<'a> {
 
 impl<'a> WritableOpenTree<'a> {
     pub(crate) fn new(
-        txn: &'a ArenaWriteTransaction,
+        before_commit: &'a BeforeCommit,
         tree_table: Table<'a, (Inode, &'static str), Inode>,
         refcount_table: Table<'a, Inode, u32>,
         current_inode_range_table: redb::Table<'a, (), (Inode, Inode)>,
         tree: &'a Tree,
     ) -> Self {
         Self {
-            txn,
+            before_commit,
             table: tree_table,
             refcount_table,
             current_inode_range_table,
@@ -540,7 +540,7 @@ impl<'a> WritableOpenTree<'a> {
         let (inode, added) = self.add_path(path.as_ref())?;
 
         if added {
-            self.txn.before_commit(move |txn| {
+            self.before_commit.add(move |txn| {
                 // Check refcount and delete the entry if it reaches
                 // 0. Note that the allocated inode is lost, so it's
                 // not a no-op.
@@ -564,7 +564,7 @@ impl<'a> WritableOpenTree<'a> {
         let (inode, added) = self.add_name(parent_inode, name)?;
 
         if added {
-            self.txn.before_commit(move |txn| {
+            self.before_commit.add(move |txn| {
                 // Check refcount and delete the entry if it reaches
                 // 0. Note that the allocated inode is lost, so it's
                 // not a no-op.
