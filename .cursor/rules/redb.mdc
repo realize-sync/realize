@@ -1,5 +1,5 @@
 ---
-description: Working with redb tables and transactions
+description: How to work with redb tables and transactions
 globs:
 alwaysApply: false
 ---
@@ -51,6 +51,82 @@ fn do_something() -> Result<(), StorageError> {
     result
 }
 ```
+
+## Transaction Object Lifetimes and Borrow Checker Issues
+
+### The Problem: Objects Tied to Transactions
+
+Objects returned by transaction methods (like `WritableOpenIndex`, `WritableOpenTree`, etc.) hold mutable references to the transaction. This creates borrow checker issues when you try to commit the transaction while these objects are still alive.
+
+### Common Error: "cannot move out of `txn` because it is borrowed"
+
+```rust
+// BAD: This will cause borrow checker errors
+fn problematic_pattern() -> Result<(), StorageError> {
+    let txn = self.db.begin_write()?;
+    let mut index = txn.write_index()?;  // Mutable borrow of txn
+    let mut tree = txn.write_tree()?;    // Another mutable borrow of txn
+    
+    index.add(&mut tree, &path, size, mtime, hash)?;
+    
+    txn.commit()?;  // Error: txn is still borrowed by index and tree
+    Ok(())
+}
+```
+
+### Solution: Explicit Scoping
+
+Use explicit scope blocks to ensure objects are dropped before committing:
+
+```rust
+// GOOD: Explicit scoping to manage object lifetimes
+fn correct_pattern() -> Result<(), StorageError> {
+    let txn = self.db.begin_write()?;
+    {
+        let mut index = txn.write_index()?;
+        let mut tree = txn.write_tree()?;
+        index.add(&mut tree, &path, size, mtime, hash)?;
+    } // index and tree are dropped here, releasing their borrows
+    
+    txn.commit()?;  // Now txn can be committed
+    Ok(())
+}
+```
+
+### Alternative: Single Transaction for Entire Test
+
+For tests, you can often use a single transaction for the entire test
+without committing. In that case, call txn.write_tree() and so on at
+the very beginning and don't bother with txn.read_tree() and so on
+since you can use the tree returned by write_tree to read.
+
+```rust
+// GOOD: Single transaction for entire test
+#[test]
+fn test_operations() -> anyhow::Result<()> {
+    let fixture = Fixture::setup()?;
+    let txn = fixture.db.begin_write()?;
+    let mut index = txn.write_index()?;
+    let mut tree = txn.write_tree()?;
+    
+    // Perform all operations
+    index.add(&mut tree, &path, size, mtime, hash)?;
+    
+    // Verify results using the same transaction and
+    // same index and tree.
+    assert!(read_index.has(&tree, &path)?);
+    
+    // No commit needed - transaction will be discarded
+    Ok(())
+}
+```
+
+### Key Principles for Object Lifetimes
+
+1. **Objects from transactions hold borrows**: `WritableOpenIndex`, `WritableOpenTree`, etc. hold `&mut` references to the transaction
+2. **Drop objects before committing**: Use explicit scopes to ensure objects are dropped before `txn.commit()`
+3. **Single transaction per test**: For tests, often simpler to use one transaction without committing
+4. **Avoid multiple table opens**: Never open the same table multiple times within a transaction
 
 ## Helper Function Signatures
 
@@ -201,28 +277,44 @@ impl ArenaDatabase {
 
 ## Testing Pattern
 
-When testing table operations, use the same pattern:
+When testing table operations, use the simplified single-transaction pattern:
 
 ```rust
 #[test]
-fn test_table_operations() {
-    let fixture = Fixture::setup().await?;
-
-    // Use the fixture's transaction methods
-    let txn = fixture.begin_write()?;
-    let mut table = txn.my_table()?;
-
+fn test_table_operations() -> anyhow::Result<()> {
+    let fixture = Fixture::setup()?;
+    
+    // Single transaction for entire test
+    let txn = fixture.db.begin_write()?;
+    let mut index = txn.write_index()?;
+    let mut tree = txn.write_tree()?;
+    
     // Perform operations
-    table.insert(key, value)?;
-
-    txn.commit()?;
+    index.add(&mut tree, &path, size, mtime, hash)?;
+    
+    // Verify results using same transaction, index and tree objects.
+    assert!(read_index.has(&tree, &path)?);
+    
+    // No commit needed - transaction will be discarded
+    Ok(())
 }
 ```
+
+### Testing Best Practices
+
+1. **Use single transaction per test**: Avoid multiple transaction opens
+2. **No explicit commits**: Let the transaction be discarded at test end
+3. **Open tables once**: Call `write_index()`, `write_tree()`, etc. only once per test
+4. **Use same transaction for verification**: Use read methods on the same transaction for assertions
 
 ## Key Takeaways
 
 1. **Open tables once per transaction** - never open the same table twice
 2. **Pass table references** to helper functions, not transactions
 3. **Use proper scoping** to manage table lifetimes
+4. **Always handle Results** from table operations
+5. **Follow the pattern**: open transaction → open scope → open tables → pass around → commit
+6. **Manage object lifetimes**: Use explicit scopes to drop transaction objects before committing
+7. **Single transaction for tests**: Use one transaction per test without explicit commits
 4. **Always handle Results** from table operations
 5. **Follow the pattern**: open transaction → open scope → open tables → pass around → commit
