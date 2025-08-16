@@ -1374,16 +1374,9 @@ fn check_is_dir(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::fs;
-    use std::sync::Arc;
-    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-    use tokio::sync::mpsc;
-
     use super::ArenaCache;
     use crate::arena::db::ArenaDatabase;
     use crate::arena::dirty::DirtyReadOperations;
-
     use crate::arena::index::RealIndex;
     use crate::arena::notifier::Notification;
     use crate::arena::tree::TreeReadOperations;
@@ -1397,6 +1390,12 @@ mod tests {
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Hash, Path, Peer, UnixTime};
+    use std::collections::HashMap;
+    use std::collections::HashSet;
+    use std::fs;
+    use std::sync::Arc;
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+    use tokio::sync::mpsc;
 
     const TEST_TIME: u64 = 1234567890;
 
@@ -1443,17 +1442,6 @@ mod tests {
                 db,
                 _tempdir: tempdir,
             })
-        }
-
-        fn clear_dirty(&self) -> anyhow::Result<()> {
-            let txn = self.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                while dirty.take_next_dirty_path()?.is_some() {}
-            }
-            txn.commit()?;
-
-            Ok(())
         }
 
         fn dir_mtime<T>(&self, path: T) -> anyhow::Result<UnixTime>
@@ -1509,15 +1497,25 @@ mod tests {
             Arc::clone(&self.acache) as Arc<dyn RealIndex>
         }
 
-        /// Check if a path is dirty
-        fn is_dirty<T>(&self, path: T) -> anyhow::Result<bool>
-        where
-            T: AsRef<Path>,
-        {
-            let path = path.as_ref();
+        fn clear_dirty(&self) -> Result<(), StorageError> {
+            let txn = self.db.begin_write()?;
+            txn.write_dirty()?.delete_range(0, 999)?;
+            txn.commit()?;
+
+            Ok(())
+        }
+
+        fn dirty_paths(&self) -> Result<HashSet<Path>, StorageError> {
             let txn = self.db.begin_read()?;
             let dirty = txn.read_dirty()?;
-            Ok(dirty.is_dirty(path)?)
+            let mut start = 0;
+            let mut paths = HashSet::new();
+            while let Some((path, counter)) = dirty.next_dirty_path(start)? {
+                paths.insert(path);
+                start = counter + 1;
+            }
+
+            Ok(paths)
         }
 
         async fn setup() -> anyhow::Result<Fixture> {
@@ -1613,8 +1611,7 @@ mod tests {
         let file_path = Path::parse("a/b/c.txt")?;
 
         fixture.add_to_cache(&file_path, 100, test_time())?;
-
-        assert!(fixture.is_dirty(&file_path)?);
+        assert_eq!(HashSet::from([file_path.clone()]), fixture.dirty_paths()?);
 
         Ok(())
     }
@@ -1696,7 +1693,7 @@ mod tests {
             },
             None,
         )?;
-        assert!(fixture.is_dirty(&file_path)?);
+        assert_eq!(HashSet::from([file_path.clone()]), fixture.dirty_paths()?);
 
         Ok(())
     }
@@ -1737,7 +1734,7 @@ mod tests {
             },
             None,
         )?;
-        assert!(!fixture.is_dirty(&file_path)?);
+        assert_eq!(HashSet::new(), fixture.dirty_paths()?);
 
         Ok(())
     }
@@ -1830,7 +1827,7 @@ mod tests {
 
         fixture.clear_dirty()?;
         fixture.remove_from_cache(&file_path)?;
-        assert!(fixture.is_dirty(&file_path)?);
+        assert_eq!(HashSet::from([file_path.clone()]), fixture.dirty_paths()?);
 
         Ok(())
     }

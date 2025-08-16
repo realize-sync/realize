@@ -238,7 +238,7 @@ mod tests {
     use super::*;
     use crate::arena::{db::ArenaDatabase, dirty::DirtyReadOperations};
     use realize_types::Path;
-    use std::sync::Arc;
+    use std::{collections::HashSet, sync::Arc};
 
     struct Fixture {
         db: Arc<ArenaDatabase>,
@@ -252,6 +252,21 @@ mod tests {
 
             Ok(Self { db })
         }
+    }
+
+    fn clear_dirty(dirty: &mut WritableOpenDirty) -> Result<(), StorageError> {
+        dirty.delete_range(0, 999)
+    }
+
+    fn dirty_paths(dirty: &impl DirtyReadOperations) -> Result<HashSet<Path>, StorageError> {
+        let mut start = 0;
+        let mut paths = HashSet::new();
+        while let Some((path, counter)) = dirty.next_dirty_path(start)? {
+            paths.insert(path);
+            start = counter + 1;
+        }
+
+        Ok(paths)
     }
 
     #[test]
@@ -429,21 +444,37 @@ mod tests {
             Mark::Keep,
         )?;
 
-        assert!(dirty.is_dirty(&Path::parse("foo/qux/quux")?)?);
-        assert!(!dirty.is_dirty(&Path::parse("foo/qux")?)?);
-        assert!(!dirty.is_dirty(&Path::parse("foo")?)?);
+        assert_eq!(
+            HashSet::from([Path::parse("foo/qux/quux")?]),
+            dirty_paths(&dirty)?
+        );
+        clear_dirty(&mut dirty)?;
 
         mark.set(&mut tree, &mut dirty, Path::parse("foo")?, Mark::Own)?;
-        assert!(dirty.is_dirty(&Path::parse("foo")?)?);
-        assert!(dirty.is_dirty(&Path::parse("foo/bar")?)?);
-        assert!(dirty.is_dirty(&Path::parse("foo/bar/baz")?)?);
-        assert!(dirty.is_dirty(&Path::parse("foo/qux")?)?);
-        assert!(!dirty.is_dirty(&Path::parse("waldo")?)?);
-        assert!(!dirty.is_dirty(&Path::parse("fred")?)?); // doesn't exist
+        assert_eq!(
+            HashSet::from([
+                Path::parse("foo")?,
+                Path::parse("foo/qux")?,
+                Path::parse("foo/qux/quux")?,
+                Path::parse("foo/bar")?,
+                Path::parse("foo/bar/baz")?,
+            ]),
+            dirty_paths(&dirty)?
+        );
+        clear_dirty(&mut dirty)?;
 
         mark.set(&mut tree, &mut dirty, root, Mark::Keep)?;
-        assert!(dirty.is_dirty(&Path::parse("waldo")?)?);
-        assert!(!dirty.is_dirty(&Path::parse("fred")?)?); // doesn't exist
+        assert_eq!(
+            HashSet::from([
+                Path::parse("foo")?,
+                Path::parse("foo/qux")?,
+                Path::parse("foo/qux/quux")?,
+                Path::parse("foo/bar")?,
+                Path::parse("foo/bar/baz")?,
+                Path::parse("waldo")?,
+            ]),
+            dirty_paths(&dirty)?
+        );
 
         Ok(())
     }
@@ -460,17 +491,13 @@ mod tests {
         tree.setup(Path::parse("foo/qux/quux")?)?;
 
         mark.set(&mut tree, &mut dirty, Path::parse("foo/qux")?, Mark::Keep)?;
-        dirty.delete_range(0, 999)?;
-        assert!(!dirty.is_dirty(&Path::parse("foo/qux")?)?);
-        assert!(!dirty.is_dirty(&Path::parse("foo/qux/qux")?)?);
+        clear_dirty(&mut dirty)?;
 
         mark.clear(&mut tree, &mut dirty, Path::parse("foo/qux")?)?;
-        assert!(dirty.is_dirty(&Path::parse("foo/qux")?)?);
-        assert!(dirty.is_dirty(&Path::parse("foo/qux/quux")?)?);
-
-        assert!(!dirty.is_dirty(&Path::parse("foo/bar/baz")?)?);
-        assert!(!dirty.is_dirty(&Path::parse("foo/bar")?)?);
-        assert!(!dirty.is_dirty(&Path::parse("foo")?)?);
+        assert_eq!(
+            HashSet::from([Path::parse("foo/qux")?, Path::parse("foo/qux/quux")?,]),
+            dirty_paths(&dirty)?
+        );
 
         Ok(())
     }
@@ -485,20 +512,22 @@ mod tests {
         let root = tree.root();
 
         tree.setup(Path::parse("foo/bar/baz")?)?;
-        tree.setup(Path::parse("foo/qux/quux")?)?;
+        tree.setup(Path::parse("qux/quux")?)?;
 
         mark.set(&mut tree, &mut dirty, root, Mark::Keep)?;
-        dirty.delete_range(0, 999)?;
-
-        assert!(!dirty.is_dirty(&Path::parse("foo/bar/baz")?)?);
-        assert!(!dirty.is_dirty(&Path::parse("foo/qux/quux")?)?);
+        clear_dirty(&mut dirty)?;
 
         mark.clear(&mut tree, &mut dirty, root)?;
-        assert!(dirty.is_dirty(&Path::parse("foo/bar/baz")?)?);
-        assert!(dirty.is_dirty(&Path::parse("foo/bar")?)?);
-        assert!(dirty.is_dirty(&Path::parse("foo")?)?);
-        assert!(dirty.is_dirty(&Path::parse("foo/qux/quux")?)?);
-        assert!(dirty.is_dirty(&Path::parse("foo/qux")?)?);
+        assert_eq!(
+            HashSet::from([
+                Path::parse("foo")?,
+                Path::parse("foo/bar")?,
+                Path::parse("foo/bar/baz")?,
+                Path::parse("qux")?,
+                Path::parse("qux/quux")?,
+            ]),
+            dirty_paths(&dirty)?
+        );
 
         Ok(())
     }
@@ -514,9 +543,9 @@ mod tests {
         tree.setup(Path::parse("foo/bar/baz")?)?;
         tree.setup(Path::parse("foo/qux/quux")?)?;
 
+        // nothing to clear
         mark.clear(&mut tree, &mut dirty, Path::parse("foo/qux")?)?;
-        assert!(!dirty.is_dirty(&Path::parse("foo/qux/quux")?)?);
-        assert!(!dirty.is_dirty(&Path::parse("foo/bar/baz")?)?);
+        assert_eq!(HashSet::new(), dirty_paths(&dirty)?);
 
         Ok(())
     }
@@ -532,14 +561,14 @@ mod tests {
         tree.setup(Path::parse("foo/bar/baz")?)?;
         tree.setup(Path::parse("foo/qux/quux")?)?;
 
+        // This changes nothing; mark is already default
         mark.set(
             &mut tree,
             &mut dirty,
             Path::parse("foo/qux")?,
             Mark::default(),
         )?;
-        assert!(!dirty.is_dirty(&Path::parse("foo/qux/quux")?)?);
-        assert!(!dirty.is_dirty(&Path::parse("foo/bar/baz")?)?);
+        assert_eq!(HashSet::new(), dirty_paths(&dirty)?);
 
         Ok(())
     }

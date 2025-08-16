@@ -767,7 +767,7 @@ mod tests {
         fn lowest_counter(&self) -> anyhow::Result<Option<u64>> {
             let txn = self.db.begin_read()?;
             let dirty = txn.read_dirty()?;
-            Ok(dirty.get_lowest_counter()?)
+            Ok(dirty.next_dirty_path(0)?.map(|(_, c)| c))
         }
 
         fn mark_dirty<T>(&self, path: T) -> anyhow::Result<()>

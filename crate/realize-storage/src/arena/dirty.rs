@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use super::db::AfterCommit;
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations};
 use super::types::{FailedJobTableEntry, RetryJob};
@@ -87,18 +85,14 @@ impl<'a> WritableOpenDirty<'a> {
 pub(crate) trait DirtyReadOperations {
     fn next_dirty_path(&self, start_counter: u64) -> Result<Option<(Path, u64)>, StorageError>;
     fn get_last_counter(&self, start_counter: u64) -> Result<Option<u64>, StorageError>;
-    fn get_lowest_counter(&self) -> Result<Option<u64>, StorageError>;
     fn get_path_for_counter(&self, counter: u64) -> Result<Option<Path>, StorageError>;
     fn get_counter_for_path(&self, path: &Path) -> Result<Option<u64>, StorageError>;
     fn is_job_failed(&self, job_id: JobId) -> Result<bool, StorageError>;
-    fn get_retryable_jobs(&self, after_time: UnixTime) -> Result<Vec<u64>, StorageError>;
     fn get_jobs_waiting_for_peers(&self) -> Result<Vec<u64>, StorageError>;
     fn get_earliest_backoff(
         &self,
         lower_bound: Option<UnixTime>,
     ) -> Result<Option<(UnixTime, Vec<u64>)>, StorageError>;
-    fn is_dirty(&self, path: &Path) -> Result<bool, StorageError>;
-    fn get_dirty(&self, path: &Path) -> Result<Option<u64>, StorageError>;
 }
 
 impl<DT, LT, FT> DirtyReadOperations for ReadableOpenDirty<DT, LT, FT>
@@ -115,10 +109,6 @@ where
         get_last_counter(&self.log_table, start_counter)
     }
 
-    fn get_lowest_counter(&self) -> Result<Option<u64>, StorageError> {
-        get_lowest_counter(&self.log_table)
-    }
-
     fn get_path_for_counter(&self, counter: u64) -> Result<Option<Path>, StorageError> {
         get_path_for_counter(&self.log_table, counter)
     }
@@ -131,10 +121,6 @@ where
         is_job_failed(&self.failed_job_table, job_id)
     }
 
-    fn get_retryable_jobs(&self, after_time: UnixTime) -> Result<Vec<u64>, StorageError> {
-        get_retryable_jobs(&self.failed_job_table, after_time)
-    }
-
     fn get_jobs_waiting_for_peers(&self) -> Result<Vec<u64>, StorageError> {
         get_jobs_waiting_for_peers(&self.failed_job_table)
     }
@@ -144,14 +130,6 @@ where
         lower_bound: Option<UnixTime>,
     ) -> Result<Option<(UnixTime, Vec<u64>)>, StorageError> {
         get_earliest_backoff(&self.failed_job_table, lower_bound)
-    }
-
-    fn is_dirty(&self, path: &Path) -> Result<bool, StorageError> {
-        is_dirty(&self.table, path)
-    }
-
-    fn get_dirty(&self, path: &Path) -> Result<Option<u64>, StorageError> {
-        get_dirty(&self.table, path)
     }
 }
 
@@ -164,10 +142,6 @@ impl<'a> DirtyReadOperations for WritableOpenDirty<'a> {
         get_last_counter(&self.log_table, start_counter)
     }
 
-    fn get_lowest_counter(&self) -> Result<Option<u64>, StorageError> {
-        get_lowest_counter(&self.log_table)
-    }
-
     fn get_path_for_counter(&self, counter: u64) -> Result<Option<Path>, StorageError> {
         get_path_for_counter(&self.log_table, counter)
     }
@@ -180,10 +154,6 @@ impl<'a> DirtyReadOperations for WritableOpenDirty<'a> {
         is_job_failed(&self.failed_job_table, job_id)
     }
 
-    fn get_retryable_jobs(&self, after_time: UnixTime) -> Result<Vec<u64>, StorageError> {
-        get_retryable_jobs(&self.failed_job_table, after_time)
-    }
-
     fn get_jobs_waiting_for_peers(&self) -> Result<Vec<u64>, StorageError> {
         get_jobs_waiting_for_peers(&self.failed_job_table)
     }
@@ -193,14 +163,6 @@ impl<'a> DirtyReadOperations for WritableOpenDirty<'a> {
         lower_bound: Option<UnixTime>,
     ) -> Result<Option<(UnixTime, Vec<u64>)>, StorageError> {
         get_earliest_backoff(&self.failed_job_table, lower_bound)
-    }
-
-    fn is_dirty(&self, path: &Path) -> Result<bool, StorageError> {
-        is_dirty(&self.table, path)
-    }
-
-    fn get_dirty(&self, path: &Path) -> Result<Option<u64>, StorageError> {
-        get_dirty(&self.table, path)
     }
 }
 
@@ -305,39 +267,6 @@ impl<'a> WritableOpenDirty<'a> {
         Ok(())
     }
 
-    /// Clear the dirty mark for a specific path.
-    pub(crate) fn clear_dirty_for_path(&mut self, path: &Path) -> Result<(), StorageError> {
-        let prev = self.table.remove(path.as_str())?;
-        if let Some(prev) = prev {
-            let counter = prev.value();
-            self.log_table.remove(counter)?;
-            self.failed_job_table.remove(counter)?;
-        }
-
-        Ok(())
-    }
-
-    /// Take the next dirty path for processing (removes it from tracking).
-    pub(crate) fn take_next_dirty_path(&mut self) -> Result<Option<(Path, u64)>, StorageError> {
-        loop {
-            // This loop skips invalid paths.
-            match self.log_table.pop_first()? {
-                None => {
-                    return Ok(None);
-                }
-                Some((k, v)) => {
-                    let counter = k.value();
-                    let path = v.value();
-                    self.table.remove(path)?;
-                    if let Ok(path) = Path::parse(path) {
-                        return Ok(Some((path, counter)));
-                    }
-                    // otherwise, pop another
-                }
-            }
-        }
-    }
-
     /// Mark a tree location and all its children dirty.
     pub(crate) fn mark_dirty_recursive<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
@@ -413,12 +342,6 @@ fn get_last_counter(
     Ok(last_counter)
 }
 
-fn get_lowest_counter(
-    log_table: &impl ReadableTable<u64, &'static str>,
-) -> Result<Option<u64>, StorageError> {
-    Ok(log_table.first()?.map(|(k, _)| k.value()))
-}
-
 fn get_path_for_counter(
     log_table: &impl ReadableTable<u64, &'static str>,
     counter: u64,
@@ -447,29 +370,6 @@ fn is_job_failed(
     job_id: JobId,
 ) -> Result<bool, StorageError> {
     Ok(failed_job_table.get(job_id.as_u64())?.is_some())
-}
-
-fn get_retryable_jobs(
-    failed_job_table: &impl ReadableTable<u64, Holder<'static, FailedJobTableEntry>>,
-    after_time: UnixTime,
-) -> Result<Vec<u64>, StorageError> {
-    let mut jobs = vec![];
-    for e in failed_job_table.iter()? {
-        let (key, val) = e?;
-        let counter = key.value();
-        let entry = val.value().parse()?;
-        let backoff_until = match entry.retry {
-            RetryJob::After(time) => time,
-            RetryJob::WhenPeerConnects => {
-                // Skip jobs that are waiting for peer connection
-                continue;
-            }
-        };
-        if backoff_until <= after_time {
-            jobs.push(counter);
-        }
-    }
-    Ok(jobs)
 }
 
 fn get_jobs_waiting_for_peers(
@@ -530,21 +430,6 @@ fn get_earliest_backoff(
     })
 }
 
-fn is_dirty(
-    table: &impl ReadableTable<&'static str, u64>,
-    path: &Path,
-) -> Result<bool, StorageError> {
-    Ok(table.get(path.as_str())?.is_some())
-}
-
-fn get_dirty(
-    table: &impl ReadableTable<&'static str, u64>,
-    path: &Path,
-) -> Result<Option<u64>, StorageError> {
-    let entry = table.get(path.as_str())?;
-    Ok(entry.map(|e| e.value()))
-}
-
 fn last_counter(
     dirty_counter_table: &impl redb::ReadableTable<(), u64>,
 ) -> Result<u64, StorageError> {
@@ -558,6 +443,7 @@ mod tests {
     use super::*;
     use crate::JobId;
     use crate::arena::db::ArenaDatabase;
+    use std::collections::HashSet;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -575,6 +461,21 @@ mod tests {
         }
     }
 
+    fn all(dirty: &impl DirtyReadOperations) -> Result<Vec<(Path, u64)>, StorageError> {
+        let mut start = 0;
+        let mut vec = vec![];
+        while let Some((path, counter)) = dirty.next_dirty_path(start)? {
+            vec.push((path, counter));
+            start = counter + 1;
+        }
+
+        Ok(vec)
+    }
+
+    fn all_paths(dirty: &impl DirtyReadOperations) -> Result<HashSet<Path>, StorageError> {
+        Ok(all(dirty)?.into_iter().map(|(p, _)| p).collect())
+    }
+
     #[test]
     fn read_txn_with_dirty() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
@@ -582,7 +483,7 @@ mod tests {
         let dirty = txn.read_dirty()?;
 
         // just make sure it doesn't fail
-        dirty.is_dirty(&Path::parse("foo")?)?;
+        dirty.next_dirty_path(0)?;
 
         Ok(())
     }
@@ -594,7 +495,7 @@ mod tests {
         let dirty = txn.read_dirty()?;
 
         // just make sure it doesn't fail
-        dirty.is_dirty(&Path::parse("foo")?)?;
+        dirty.next_dirty_path(0)?;
 
         Ok(())
     }
@@ -611,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn mark_and_take() -> anyhow::Result<()> {
+    fn mark() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let path1 = Path::parse("path1")?;
@@ -622,10 +523,7 @@ mod tests {
             dirty.mark_dirty(&path1)?;
             dirty.mark_dirty(&path2)?;
 
-            assert_eq!(Some((path1, 1)), dirty.take_next_dirty_path()?);
-            assert_eq!(Some((path2, 2)), dirty.take_next_dirty_path()?);
-            assert_eq!(None, dirty.take_next_dirty_path()?);
-            assert_eq!(None, dirty.take_next_dirty_path()?);
+            assert_eq!(vec![(path1.clone(), 1), (path2.clone(), 2)], all(&dirty)?);
         }
 
         txn.commit()?;
@@ -648,83 +546,11 @@ mod tests {
             dirty.mark_dirty(&path1)?;
 
             // return path2 first, because its counter is lower
-            assert_eq!(Some((path2, 2)), dirty.take_next_dirty_path()?);
-            assert_eq!(Some((path1, 4)), dirty.take_next_dirty_path()?);
-            assert_eq!(None, dirty.take_next_dirty_path()?);
-            assert_eq!(None, dirty.take_next_dirty_path()?);
+            assert_eq!(vec![(path2.clone(), 2), (path1.clone(), 4)], all(&dirty)?);
         }
 
         txn.commit()?;
 
-        Ok(())
-    }
-
-    #[test]
-    fn check_dirty() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let path1 = Path::parse("path1")?;
-        let path2 = Path::parse("path2")?;
-
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.mark_dirty(&path2)?;
-            }
-            txn.commit()?;
-        }
-
-        let txn = fixture.db.begin_read()?;
-        let dirty = txn.read_dirty()?;
-        assert_eq!(false, dirty.is_dirty(&path1)?);
-        assert_eq!(true, dirty.is_dirty(&path2)?);
-        Ok(())
-    }
-
-    #[test]
-    fn clear_mark() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let txn = fixture.db.begin_write()?;
-        let path1 = Path::parse("path1")?;
-        let path2 = Path::parse("path2")?;
-
-        {
-            let mut dirty = txn.write_dirty()?;
-            dirty.mark_dirty(&path1)?;
-            dirty.mark_dirty(&path2)?;
-            dirty.clear_dirty_for_path(&path1)?;
-
-            assert_eq!(Some((path2, 2)), dirty.take_next_dirty_path()?);
-            assert_eq!(None, dirty.take_next_dirty_path()?);
-        }
-
-        txn.commit()?;
-        Ok(())
-    }
-
-    #[test]
-    fn skip_invalid_path() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let txn = fixture.db.begin_write()?;
-        {
-            let mut dirty = txn.write_dirty()?;
-            dirty.table.insert("///", 1)?;
-            dirty.counter_table.insert((), 1)?;
-            dirty.log_table.insert(1, "///")?;
-        }
-        txn.commit()?;
-
-        let path = Path::parse("path")?;
-        let txn = fixture.db.begin_write()?;
-        {
-            let mut dirty = txn.write_dirty()?;
-            dirty.mark_dirty(&path)?;
-
-            assert_eq!(Some((path, 2)), dirty.take_next_dirty_path()?);
-            assert_eq!(None, dirty.take_next_dirty_path()?);
-        }
-
-        txn.commit()?;
         Ok(())
     }
 
@@ -747,8 +573,10 @@ mod tests {
         // Verify it's dirty
         {
             let txn = fixture.db.begin_read()?;
-            let dirty = txn.read_dirty()?;
-            assert!(dirty.is_dirty(&path)?);
+            assert_eq!(
+                HashSet::from([path.clone()]),
+                all_paths(&txn.read_dirty()?)?
+            );
         }
 
         // Mark job as done
@@ -765,8 +593,7 @@ mod tests {
         // Verify path is no longer dirty
         {
             let txn = fixture.db.begin_read()?;
-            let dirty = txn.read_dirty()?;
-            assert!(!dirty.is_dirty(&path)?);
+            assert_eq!(HashSet::new(), all_paths(&txn.read_dirty()?)?);
         }
 
         // Mark job as done again (should return false)
@@ -823,14 +650,6 @@ mod tests {
             let txn = fixture.db.begin_read()?;
             let dirty = txn.read_dirty()?;
             assert!(dirty.is_job_failed(job_id)?);
-        }
-
-        // Get retryable jobs (should be empty since we're before retry time)
-        {
-            let txn = fixture.db.begin_read()?;
-            let dirty = txn.read_dirty()?;
-            let retryable = dirty.get_retryable_jobs(UnixTime::from_secs(0))?;
-            assert!(retryable.is_empty());
         }
 
         Ok(())
@@ -1008,57 +827,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_retryable_jobs() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let path1 = Path::parse("path1.txt")?;
-        let path2 = Path::parse("path2.txt")?;
-        let job_id1 = JobId::from(1);
-        let job_id2 = JobId::from(2);
-
-        // First mark paths as dirty to create the job entries
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.mark_dirty(&path1)?;
-                dirty.mark_dirty(&path2)?;
-            }
-            txn.commit()?;
-        }
-
-        // Mark jobs as failed with different retry times
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                let retry_strategy = |attempt: u32| {
-                    if attempt < 3 {
-                        Some(Duration::from_secs(attempt as u64 * 10))
-                    } else {
-                        None
-                    }
-                };
-
-                dirty.mark_job_failed(job_id1, &retry_strategy)?;
-                dirty.mark_job_failed(job_id2, &retry_strategy)?;
-            }
-            txn.commit()?;
-        }
-
-        // Get retryable jobs before retry time (should be empty)
-        let txn = fixture.db.begin_read()?;
-        let dirty = txn.read_dirty()?;
-        let retryable = dirty.get_retryable_jobs(UnixTime::from_secs(0))?;
-        assert!(retryable.is_empty());
-
-        // Get retryable jobs after retry time
-        let retryable = dirty.get_retryable_jobs(UnixTime::now().plus(Duration::from_secs(100)))?;
-        assert_eq!(retryable, vec![1, 2]);
-
-        Ok(())
-    }
-
-    #[test]
     fn test_get_earliest_backoff() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let path1 = Path::parse("path1.txt")?;
@@ -1153,166 +921,17 @@ mod tests {
         let path1 = Path::parse("path1.txt")?;
         let path2 = Path::parse("path2.txt")?;
         let path3 = Path::parse("path3.txt")?;
-
-        // Mark multiple paths as dirty
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.mark_dirty(&path1)?;
-                dirty.mark_dirty(&path2)?;
-                dirty.mark_dirty(&path3)?;
-            }
-            txn.commit()?;
-        }
-
-        // Delete range 1-2 (counters 1 and 2)
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.delete_range(1, 3)?;
-            }
-            txn.commit()?;
-        }
-
-        // Verify path1 and path2 are gone, path3 remains
-        {
-            let txn = fixture.db.begin_read()?;
-            let dirty = txn.read_dirty()?;
-            assert!(!dirty.is_dirty(&path1)?);
-            assert!(!dirty.is_dirty(&path2)?);
-            assert!(dirty.is_dirty(&path3)?);
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_clear_dirty_for_path() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let path = Path::parse("test/path.txt")?;
-
-        // Mark path as dirty
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.mark_dirty(&path)?;
-            }
-            txn.commit()?;
-        }
-
-        // Verify it's dirty
-        {
-            let txn = fixture.db.begin_read()?;
-            let dirty = txn.read_dirty()?;
-            assert!(dirty.is_dirty(&path)?);
-        }
-
-        // Clear dirty for path
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.clear_dirty_for_path(&path)?;
-            }
-            txn.commit()?;
-        }
-
-        // Verify it's no longer dirty
-        let txn = fixture.db.begin_read()?;
-        let dirty = txn.read_dirty()?;
-        assert!(!dirty.is_dirty(&path)?);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_take_next_dirty_path() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let path1 = Path::parse("path1.txt")?;
-        let path2 = Path::parse("path2.txt")?;
-
-        // Mark multiple paths as dirty
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.mark_dirty(&path1)?;
-                dirty.mark_dirty(&path2)?;
-            }
-            txn.commit()?;
-        }
-
-        // Take next dirty path
         let txn = fixture.db.begin_write()?;
-        {
-            let mut dirty = txn.write_dirty()?;
-            let result = dirty.take_next_dirty_path()?;
-            assert_eq!(result, Some((path1.clone(), 1)));
+        let mut dirty = txn.write_dirty()?;
+        dirty.mark_dirty(&path1)?;
+        dirty.mark_dirty(&path2)?;
+        dirty.mark_dirty(&path3)?;
 
-            // Take next dirty path
-            let result = dirty.take_next_dirty_path()?;
-            assert_eq!(result, Some((path2.clone(), 2)));
+        dirty.delete_range(1, 3)?;
 
-            // No more dirty paths
-            let result = dirty.take_next_dirty_path()?;
-            assert_eq!(result, None);
-        }
-
-        txn.commit()?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_get_lowest_counter() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let path1 = Path::parse("path1.txt")?;
-        let path2 = Path::parse("path2.txt")?;
-
-        // Initially no counters
-        {
-            let txn = fixture.db.begin_read()?;
-            let dirty = txn.read_dirty()?;
-            let lowest = dirty.get_lowest_counter()?;
-            assert_eq!(lowest, None);
-        }
-
-        // Mark paths as dirty
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.mark_dirty(&path1)?;
-                dirty.mark_dirty(&path2)?;
-            }
-            txn.commit()?;
-        }
-
-        // Get lowest counter
-        {
-            let txn = fixture.db.begin_read()?;
-            let dirty = txn.read_dirty()?;
-            let lowest = dirty.get_lowest_counter()?;
-            assert_eq!(lowest, Some(1));
-        }
-
-        // Take first path
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.take_next_dirty_path()?;
-            }
-            txn.commit()?;
-        }
-
-        // Get lowest counter again
-        let txn = fixture.db.begin_read()?;
-        let dirty = txn.read_dirty()?;
-        let lowest = dirty.get_lowest_counter()?;
-        assert_eq!(lowest, Some(2));
+        // path 1 and to should have been deleted (counters 1 and 2),
+        // but not 3, as range end is exclusive.
+        assert_eq!(HashSet::from([path3.clone()]), all_paths(&dirty)?);
 
         Ok(())
     }
@@ -1352,233 +971,54 @@ mod tests {
     }
 
     #[test]
-    fn test_is_dirty() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let path = Path::parse("test/path.txt")?;
-
-        // Initially not dirty
-        {
-            let txn = fixture.db.begin_read()?;
-            let dirty = txn.read_dirty()?;
-            assert!(!dirty.is_dirty(&path)?);
-        }
-
-        // Mark as dirty
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.mark_dirty(&path)?;
-            }
-            txn.commit()?;
-        }
-
-        // Verify it's dirty
-        {
-            let txn = fixture.db.begin_read()?;
-            let dirty = txn.read_dirty()?;
-            assert!(dirty.is_dirty(&path)?);
-        }
-
-        // Clear dirty
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.clear_dirty_for_path(&path)?;
-            }
-            txn.commit()?;
-        }
-
-        // Verify it's no longer dirty
-        let txn = fixture.db.begin_read()?;
-        let dirty = txn.read_dirty()?;
-        assert!(!dirty.is_dirty(&path)?);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_get_dirty() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let path = Path::parse("test/path.txt")?;
-
-        // Initially no dirty counter
-        {
-            let txn = fixture.db.begin_read()?;
-            let dirty = txn.read_dirty()?;
-            let dirty_counter = dirty.get_dirty(&path)?;
-            assert_eq!(dirty_counter, None);
-        }
-
-        // Mark as dirty
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.mark_dirty(&path)?;
-            }
-            txn.commit()?;
-        }
-
-        // Verify dirty counter
-        {
-            let txn = fixture.db.begin_read()?;
-            let dirty = txn.read_dirty()?;
-            let dirty_counter = dirty.get_dirty(&path)?;
-            assert_eq!(dirty_counter, Some(1));
-        }
-
-        // Clear dirty
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.clear_dirty_for_path(&path)?;
-            }
-            txn.commit()?;
-        }
-
-        // Verify no dirty counter
-        let txn = fixture.db.begin_read()?;
-        let dirty = txn.read_dirty()?;
-        let dirty_counter = dirty.get_dirty(&path)?;
-        assert_eq!(dirty_counter, None);
-
-        Ok(())
-    }
-
-    #[test]
     fn test_job_lifecycle() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let path = Path::parse("test/path.txt")?;
         let job_id = JobId::from(1);
+        let txn = fixture.db.begin_write()?;
+        let mut dirty = txn.write_dirty()?;
+        dirty.mark_dirty(&path)?;
+        let counter = dirty.get_counter_for_path(&path)?;
+        assert_eq!(counter, Some(1));
 
-        // 1. Mark path as dirty
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.mark_dirty(&path)?;
-            }
-            txn.commit()?;
-        }
+        let retry_strategy = |_| Some(Duration::from_secs(10));
+        dirty.mark_job_failed(job_id, &retry_strategy)?;
+        assert!(dirty.is_job_failed(job_id)?);
 
-        // Verify it's dirty
-        {
-            let txn = fixture.db.begin_read()?;
-            let dirty = txn.read_dirty()?;
-            assert!(dirty.is_dirty(&path)?);
-        }
-
-        // 2. Get counter for path
-        {
-            let txn = fixture.db.begin_read()?;
-            let dirty = txn.read_dirty()?;
-            let counter = dirty.get_counter_for_path(&path)?;
-            assert_eq!(counter, Some(1));
-        }
-
-        // 3. Mark job as failed
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                let retry_strategy = |_| Some(Duration::from_secs(10));
-                dirty.mark_job_failed(job_id, &retry_strategy)?;
-            }
-            txn.commit()?;
-        }
-
-        // Verify job is failed
-        {
-            let txn = fixture.db.begin_read()?;
-            let dirty = txn.read_dirty()?;
-            assert!(dirty.is_job_failed(job_id)?);
-        }
-
-        // 4. Mark job as done
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                let was_dirty = dirty.mark_job_done(job_id)?;
-                assert!(was_dirty);
-            }
-            txn.commit()?;
-        }
-
-        // Verify final state
-        let txn = fixture.db.begin_read()?;
-        let dirty = txn.read_dirty()?;
-        assert!(!dirty.is_dirty(&path)?);
+        let was_dirty = dirty.mark_job_done(job_id)?;
+        assert!(was_dirty);
+        assert_eq!(HashSet::new(), all_paths(&dirty)?);
         assert!(!dirty.is_job_failed(job_id)?);
 
         Ok(())
     }
 
     #[test]
-    fn test_multiple_jobs_same_path() -> anyhow::Result<()> {
+    fn test_multiple_jobs() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
+        let txn = fixture.db.begin_write()?;
+        let mut dirty = txn.write_dirty()?;
         let path1 = Path::parse("test/path1.txt")?;
         let path2 = Path::parse("test/path2.txt")?;
         let job_id1 = JobId::from(1);
         let job_id2 = JobId::from(2);
 
-        // Mark different paths as dirty
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.mark_dirty(&path1)?;
-                dirty.mark_dirty(&path2)?;
-            }
-            txn.commit()?;
-        }
+        dirty.mark_dirty(&path1)?;
+        dirty.mark_dirty(&path2)?;
 
-        // Get counters (should be 1 and 2)
-        {
-            let txn = fixture.db.begin_read()?;
-            let dirty = txn.read_dirty()?;
-            let counter1 = dirty.get_counter_for_path(&path1)?;
-            let counter2 = dirty.get_counter_for_path(&path2)?;
-            assert_eq!(counter1, Some(1));
-            assert_eq!(counter2, Some(2));
-        }
+        let counter1 = dirty.get_counter_for_path(&path1)?;
+        let counter2 = dirty.get_counter_for_path(&path2)?;
+        assert_eq!(counter1, Some(job_id1.as_u64()));
+        assert_eq!(counter2, Some(job_id2.as_u64()));
 
-        // Mark both jobs as failed
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                let retry_strategy = |_| Some(Duration::from_secs(10));
-                dirty.mark_job_failed(job_id1, &retry_strategy)?;
-                dirty.mark_job_failed(job_id2, &retry_strategy)?;
-            }
-            txn.commit()?;
-        }
+        let retry_strategy = |_| Some(Duration::from_secs(10));
+        dirty.mark_job_failed(job_id1, &retry_strategy)?;
+        dirty.mark_job_failed(job_id2, &retry_strategy)?;
+        assert!(dirty.is_job_failed(job_id1)?);
+        assert!(dirty.is_job_failed(job_id2)?);
 
-        // Both should be failed
-        {
-            let txn = fixture.db.begin_read()?;
-            let dirty = txn.read_dirty()?;
-            assert!(dirty.is_job_failed(job_id1)?);
-            assert!(dirty.is_job_failed(job_id2)?);
-        }
+        dirty.mark_job_done(job_id1)?;
 
-        // Mark one as done
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.mark_job_done(job_id1)?;
-            }
-            txn.commit()?;
-        }
-
-        // Verify final state
-        let txn = fixture.db.begin_read()?;
-        let dirty = txn.read_dirty()?;
         assert!(!dirty.is_job_failed(job_id1)?);
         assert!(dirty.is_job_failed(job_id2)?);
 
@@ -1597,12 +1037,16 @@ mod tests {
 
             let mut dirty = txn.write_dirty()?;
             dirty.mark_dirty_recursive(&tree, Path::parse("foo/bar")?)?;
-            assert!(!dirty.is_dirty(&Path::parse("foo")?)?);
-            assert!(!dirty.is_dirty(&Path::parse("waldo")?)?);
-            assert!(dirty.is_dirty(&Path::parse("foo/bar")?)?);
-            assert!(dirty.is_dirty(&Path::parse("foo/bar/baz")?)?);
-            assert!(dirty.is_dirty(&Path::parse("foo/bar/qux")?)?);
-            assert!(dirty.is_dirty(&Path::parse("foo/bar/qux/quux")?)?);
+            assert_eq!(
+                HashSet::from([
+                    Path::parse("foo/bar")?,
+                    Path::parse("foo/bar/baz")?,
+                    Path::parse("foo/bar/qux")?,
+                    Path::parse("foo/bar/qux/quux")?,
+                ]),
+                all_paths(&dirty)?
+            );
+            // foo and waldo are not dirty
         }
 
         Ok(())
@@ -1618,8 +1062,14 @@ mod tests {
 
             let mut dirty = txn.write_dirty()?;
             dirty.mark_dirty_recursive(&tree, tree.root())?;
-            assert!(dirty.is_dirty(&Path::parse("foo/bar")?)?);
-            assert!(dirty.is_dirty(&Path::parse("baz")?)?);
+            assert_eq!(
+                HashSet::from([
+                    Path::parse("foo")?,
+                    Path::parse("foo/bar")?,
+                    Path::parse("baz")?
+                ]),
+                all_paths(&dirty)?
+            );
         }
 
         Ok(())
