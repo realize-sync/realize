@@ -1,5 +1,6 @@
 use super::dirty::{Dirty, DirtyReadOperations, ReadableOpenDirty, WritableOpenDirty};
 use super::history::{History, HistoryReadOperations, ReadableOpenHistory, WritableOpenHistory};
+use super::index::{IndexReadOperations, ReadableOpenIndex, WritableOpenIndex};
 use super::mark::{MarkReadOperations, ReadableOpenMark, WritableOpenMark};
 use super::tree::{ReadableOpenTree, Tree, TreeReadOperations, WritableOpenTree};
 use super::types::CacheTableKey;
@@ -323,12 +324,6 @@ impl<'db> ArenaWriteTransaction<'db> {
         Ok(self.inner.open_table(CACHE_TABLE)?)
     }
 
-    pub fn index_table<'txn>(
-        &'txn self,
-    ) -> Result<Table<'txn, Inode, Holder<'static, FileTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(INDEX_TABLE)?)
-    }
-
     pub fn pending_catchup_table<'txn>(
         &'txn self,
     ) -> Result<Table<'txn, (&'static str, Inode), ()>, StorageError> {
@@ -419,6 +414,16 @@ impl<'db> ArenaWriteTransaction<'db> {
     pub(crate) fn write_marks(&self) -> Result<WritableOpenMark<'_>, StorageError> {
         Ok(WritableOpenMark::new(self.inner.open_table(MARK_TABLE)?))
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn read_index(&self) -> Result<impl IndexReadOperations, StorageError> {
+        Ok(ReadableOpenIndex::new(self.inner.open_table(INDEX_TABLE)?))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn write_index(&self) -> Result<WritableOpenIndex<'_>, StorageError> {
+        Ok(WritableOpenIndex::new(self.inner.open_table(INDEX_TABLE)?))
+    }
 }
 
 pub struct ArenaReadTransaction<'db> {
@@ -431,12 +436,6 @@ impl<'db> ArenaReadTransaction<'db> {
         &self,
     ) -> Result<ReadOnlyTable<CacheTableKey, Holder<'static, CacheTableEntry>>, StorageError> {
         Ok(self.inner.open_table(CACHE_TABLE)?)
-    }
-
-    pub fn index_table(
-        &self,
-    ) -> Result<ReadOnlyTable<Inode, Holder<'static, FileTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(INDEX_TABLE)?)
     }
 
     pub fn peer_table(
@@ -489,6 +488,11 @@ impl<'db> ArenaReadTransaction<'db> {
     #[allow(dead_code)]
     pub(crate) fn read_marks(&self) -> Result<impl MarkReadOperations, StorageError> {
         Ok(ReadableOpenMark::new(self.inner.open_table(MARK_TABLE)?))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn read_index(&self) -> Result<impl IndexReadOperations, StorageError> {
+        Ok(ReadableOpenIndex::new(self.inner.open_table(INDEX_TABLE)?))
     }
 }
 

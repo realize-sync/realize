@@ -3,7 +3,7 @@
 use super::arena_cache::ArenaCache;
 use super::db::{ArenaDatabase, ArenaReadTransaction};
 use super::dirty::DirtyReadOperations;
-use super::index::RealIndex;
+use super::index::{IndexedFile, RealIndex};
 use super::mark::MarkExt;
 use super::tree::TreeExt;
 use super::types::LocalAvailability;
@@ -511,7 +511,7 @@ impl Engine {
         &self,
         txn: &ArenaReadTransaction,
         path: &Path,
-    ) -> Result<Option<super::types::IndexedFileTableEntry>, StorageError> {
+    ) -> Result<Option<IndexedFile>, StorageError> {
         self.index
             .as_ref()
             .map(|i| i.get_file_txn(txn, &path))
@@ -736,7 +736,6 @@ mod tests {
                 hash,
                 old_hash,
             };
-            self.update_index(&notification)?;
             self.update_cache(notification)?;
 
             Ok(())
@@ -755,12 +754,6 @@ mod tests {
         fn update_cache(&self, notification: Notification) -> anyhow::Result<()> {
             let test_peer = Peer::from("other");
             self.acache.update(test_peer, notification, None)?;
-            Ok(())
-        }
-
-        fn update_index(&self, notification: &Notification) -> anyhow::Result<()> {
-            self.index.update(notification, &self.arena_path)?;
-
             Ok(())
         }
 

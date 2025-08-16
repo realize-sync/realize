@@ -1,12 +1,12 @@
 use super::blob::{self, Blobstore};
 use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
 use super::history::HistoryReadOperations;
-use super::index::RealIndex;
+use super::index::{IndexExt, IndexReadOperations, IndexedFile, RealIndex};
 use super::mark::{MarkExt, MarkReadOperations};
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
 use super::types::{
     CacheTableEntry, CacheTableKey, DirtableEntry, FileAvailability, FileMetadata, FileTableEntry,
-    HistoryTableEntry, IndexedFileTableEntry, LocalAvailability, LruQueueId, PeerTableEntry,
+    HistoryTableEntry, LocalAvailability, LruQueueId, PeerTableEntry,
 };
 use crate::arena::notifier::{Notification, Progress};
 use crate::utils::fs_utils;
@@ -14,7 +14,7 @@ use crate::utils::holder::{ByteConversionError, Holder};
 use crate::{Blob, InodeAssignment, Mark};
 use crate::{Inode, StorageError};
 use realize_types::{Arena, ByteRanges, Hash, Path, Peer, UnixTime};
-use redb::{ReadableTable, Table};
+use redb::ReadableTable;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -260,21 +260,8 @@ impl ArenaCache {
                 }
 
                 // replace local
-                let entry = txn
-                    .index_table()?
-                    .get(file_inode)?
-                    .map(|v| v.value().parse().ok())
-                    .flatten();
-                if let Some(mut entry) = entry {
-                    if replaces_local_copy(&entry, &old_hash) {
-                        // Just remember that a newer version exist in
-                        // a remote peer. This information is going to
-                        // be used to download that newer version later on.
-                        entry.outdated_by = Some(hash.clone());
-                        let mut index_table = txn.index_table()?;
-                        index_table.insert(file_inode, Holder::with_content(entry)?)?;
-                    }
-                }
+                let mut index = txn.write_index()?;
+                index.record_outdated(&tree, file_inode, &old_hash, &hash)?;
             }
             Notification::Remove {
                 index,
@@ -289,20 +276,17 @@ impl ArenaCache {
                 // remove local
                 if let Some(index_root) = index_root {
                     let tree = txn.read_tree()?;
-                    if let Some(inode) = tree.resolve(&path)? {
-                        let index_table = txn.index_table()?;
-                        if let Some(entry) = index_table.get(inode)? {
-                            let entry = entry.value().parse()?;
-                            if replaces_local_copy(&entry, &old_hash) {
-                                // This specific version has been removed
-                                // remotely. Make sure that the file hasn't
-                                // changed since it was indexed and if it hasn't,
-                                // remove it locally as well.
-                                if file_matches_index(&entry.into(), index_root, &path) {
-                                    std::fs::remove_file(&path.within(index_root))?;
-                                }
-                            }
-                        }
+                    let index = txn.read_index()?;
+
+                    if let Some(indexed) = index.get(&tree, &path)?
+                        && indexed.is_outdated_by(&old_hash)
+                        && indexed.matches_file(path.within(&index_root))
+                    {
+                        // This specific version has been removed
+                        // remotely. Make sure that the file hasn't
+                        // changed since it was indexed and if it hasn't,
+                        // remove it locally as well.
+                        std::fs::remove_file(&path.within(index_root))?;
                     }
                 }
             }
@@ -752,100 +736,6 @@ impl ArenaCache {
     pub(crate) fn cleanup_cache(&self, target_size: u64) -> Result<(), StorageError> {
         self.blobstore.cleanup_cache(target_size)
     }
-
-    fn get_indexed_file(
-        &self,
-        tree: &impl TreeReadOperations,
-        index_table: &impl ReadableTable<Inode, Holder<'static, FileTableEntry>>,
-        path: &Path,
-    ) -> Result<Option<IndexedFileTableEntry>, StorageError> {
-        if let Some(inode) = tree.resolve(path)? {
-            get_indexed_file_inode(index_table, inode)
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn index_file(
-        &self,
-        txn: &ArenaWriteTransaction,
-        tree: &mut WritableOpenTree,
-        path: &realize_types::Path,
-        size: u64,
-        mtime: UnixTime,
-        hash: Hash,
-    ) -> Result<IndexedFileTableEntry, StorageError> {
-        let mut index_table = txn.index_table()?;
-        let old_hash = tree
-            .resolve(path)?
-            .map(|inode| {
-                index_table
-                    .get(inode)
-                    .ok()
-                    .flatten()
-                    .map(|e| e.value().parse().ok())
-                    .flatten()
-                    .map(|e| e.hash)
-            })
-            .flatten();
-        let same_hash = old_hash.as_ref().map(|h| *h == hash).unwrap_or(false);
-        let entry = FileTableEntry::new(path.clone(), size, mtime, hash);
-        let inode = tree.setup(path)?;
-        tree.insert_and_incref(inode, &mut index_table, inode, Holder::new(&entry)?)?;
-        if !same_hash {
-            txn.write_dirty()?.mark_dirty(path)?;
-            txn.write_history()?.report_added(path, old_hash.as_ref())?;
-        }
-
-        Ok(entry.into())
-    }
-
-    fn unindex_file(
-        &self,
-        txn: &ArenaWriteTransaction,
-        tree: &mut WritableOpenTree,
-        index_table: &mut Table<'_, Inode, Holder<'static, FileTableEntry>>,
-        inode: Inode,
-    ) -> Result<(), StorageError> {
-        let FileTableEntry { path, hash, .. } = match index_table.get(inode)? {
-            None => {
-                // Nothing to do
-                return Ok(());
-            }
-            Some(existing) => existing.value().parse()?,
-        };
-        if tree.remove_and_decref(inode, index_table, inode)? {
-            txn.write_dirty()?.mark_dirty(&path)?;
-            txn.write_history()?.report_removed(&path, &hash)?;
-        }
-
-        Ok(())
-    }
-
-    fn unindex_dir(
-        &self,
-        txn: &ArenaWriteTransaction,
-        tree: &mut WritableOpenTree,
-        index_table: &mut Table<'_, Inode, Holder<'static, FileTableEntry>>,
-        inode: Inode,
-    ) -> Result<(), StorageError> {
-        let mut dirty = txn.write_dirty()?;
-        let mut history = txn.write_history()?;
-        tree.remove_recursive_and_decref(
-            inode,
-            index_table,
-            |inode| Ok(inode),
-            |_, e| {
-                let FileTableEntry { path, hash, .. } = e.parse()?;
-                dirty.mark_dirty(&path)?;
-                history.report_removed(&path, &hash)?;
-
-                Ok(true)
-            },
-        )?;
-
-        Ok(())
-    }
 }
 
 /// Choose the appropriate blob queue for the inode, given its mark.
@@ -862,16 +752,6 @@ fn queue_for_mark(mark: Mark) -> LruQueueId {
     match mark {
         Mark::Watch => LruQueueId::WorkingArea,
         Mark::Keep | Mark::Own => LruQueueId::Protected,
-    }
-}
-
-fn get_indexed_file_inode(
-    index_table: &impl ReadableTable<Inode, Holder<'static, FileTableEntry>>,
-    inode: Inode,
-) -> Result<Option<IndexedFileTableEntry>, StorageError> {
-    match index_table.get(inode)? {
-        None => Ok(None),
-        Some(v) => Ok(Some(v.value().parse()?.into())),
     }
 }
 
@@ -892,10 +772,7 @@ impl RealIndex for ArenaCache {
         self.db.begin_read()?.read_history()?.last_history_index()
     }
 
-    fn get_file(
-        &self,
-        path: &realize_types::Path,
-    ) -> Result<Option<IndexedFileTableEntry>, StorageError> {
+    fn get_file(&self, path: &realize_types::Path) -> Result<Option<IndexedFile>, StorageError> {
         let txn = self.db.begin_read()?;
 
         self.get_file_txn(&txn, path)
@@ -905,8 +782,11 @@ impl RealIndex for ArenaCache {
         &self,
         txn: &super::db::ArenaReadTransaction,
         path: &realize_types::Path,
-    ) -> Result<Option<IndexedFileTableEntry>, StorageError> {
-        self.get_indexed_file(&txn.read_tree()?, &txn.index_table()?, path)
+    ) -> Result<Option<IndexedFile>, StorageError> {
+        let index = txn.read_index()?;
+        let tree = txn.read_tree()?;
+
+        index.get(&tree, path)
     }
 
     fn get_indexed_file_txn(
@@ -916,20 +796,22 @@ impl RealIndex for ArenaCache {
         path: &realize_types::Path,
         hash: Option<&Hash>,
     ) -> Result<Option<std::path::PathBuf>, StorageError> {
-        let index_table = txn.index_table()?;
-        let entry = self.get_indexed_file(&txn.read_tree()?, &index_table, path)?;
+        let index = txn.read_index()?;
+        let tree = txn.read_tree()?;
+        let entry = index.get(&tree, path)?;
+        let file_path = path.within(root);
         match hash {
             Some(hash) => {
                 if let Some(entry) = entry
                     && entry.hash == *hash
-                    && file_matches_index(&entry, root, path)
+                    && entry.matches_file(&file_path)
                 {
-                    return Ok(Some(path.within(root)));
+                    return Ok(Some(file_path));
                 }
             }
             None => {
                 if entry.is_none() && fs_utils::metadata_no_symlink_blocking(root, path).is_err() {
-                    return Ok(Some(path.within(root)));
+                    return Ok(Some(file_path));
                 }
             }
         }
@@ -938,9 +820,11 @@ impl RealIndex for ArenaCache {
     }
 
     fn has_file(&self, path: &realize_types::Path) -> Result<bool, StorageError> {
-        // TODO: consider optimizing; parsing the final value can be skipped
+        let txn = self.db.begin_read()?;
+        let index = txn.read_index()?;
+        let tree = txn.read_tree()?;
 
-        Ok(self.get_file(path)?.is_some())
+        index.has(&tree, path)
     }
 
     fn has_matching_file(
@@ -949,10 +833,12 @@ impl RealIndex for ArenaCache {
         size: u64,
         mtime: UnixTime,
     ) -> Result<bool, StorageError> {
-        Ok(self
-            .get_file(path)?
-            .map(|e| e.size == size && e.mtime == mtime)
-            .unwrap_or(false))
+        let txn = self.db.begin_read()?;
+        let index = txn.read_index()?;
+        let tree = txn.read_tree()?;
+        let ret = index.get(&tree, path)?.map(|e| e.matches(size, mtime));
+
+        Ok(ret.unwrap_or(false))
     }
 
     fn add_file(
@@ -963,7 +849,15 @@ impl RealIndex for ArenaCache {
         hash: Hash,
     ) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
-        self.index_file(&txn, &mut txn.write_tree()?, path, size, mtime, hash)?;
+        {
+            let mut index = txn.write_index()?;
+            let mut tree = txn.write_tree()?;
+            let mut dirty = txn.write_dirty()?;
+            let mut history = txn.write_history()?;
+
+            index.add(&mut tree, &mut history, &mut dirty, path, size, mtime, hash)?;
+        }
+
         txn.commit()?;
 
         Ok(())
@@ -977,18 +871,24 @@ impl RealIndex for ArenaCache {
         mtime: UnixTime,
         hash: Hash,
     ) -> Result<bool, StorageError> {
-        let txn = self.db.begin_write()?;
-        let matches = {
-            let mut tree = txn.write_tree()?;
-            let entry = self.index_file(&txn, &mut tree, path, size, mtime, hash)?;
-
-            file_matches_index(&entry, root, path)
-        };
-        if matches {
+        if let Ok(m) = path.within(root).metadata()
+            && m.len() == size
+            && UnixTime::mtime(&m) == mtime
+        {
+            let txn = self.db.begin_write()?;
+            {
+                let mut index = txn.write_index()?;
+                let mut tree = txn.write_tree()?;
+                let mut dirty = txn.write_dirty()?;
+                let mut history = txn.write_history()?;
+                index.add(&mut tree, &mut history, &mut dirty, path, size, mtime, hash)?;
+            }
             txn.commit()?;
+
+            return Ok(true);
         }
 
-        Ok(matches)
+        Ok(false)
     }
 
     fn remove_file_if_missing(
@@ -999,12 +899,11 @@ impl RealIndex for ArenaCache {
         let txn = self.db.begin_write()?;
         if fs_utils::metadata_no_symlink_blocking(root, path).is_err() {
             {
-                let path = path.as_ref();
                 let mut tree = txn.write_tree()?;
-                if let Some(inode) = tree.resolve(path)? {
-                    let mut index_table = txn.index_table()?;
-                    self.unindex_file(&txn, &mut tree, &mut index_table, inode)?;
-                }
+                let mut index = txn.write_index()?;
+                let mut dirty = txn.write_dirty()?;
+                let mut history = txn.write_history()?;
+                index.remove(&mut tree, &mut history, &mut dirty, path)?;
             }
             txn.commit()?;
             return Ok(true);
@@ -1015,27 +914,11 @@ impl RealIndex for ArenaCache {
 
     fn all_files(
         &self,
-        tx: mpsc::Sender<(realize_types::Path, IndexedFileTableEntry)>,
+        tx: mpsc::Sender<(realize_types::Path, IndexedFile)>,
     ) -> Result<(), StorageError> {
         let txn = self.db.begin_read()?;
-        let index_table = txn.index_table()?;
-        for (file_path, entry) in index_table
-            .iter()?
-            .flatten()
-            // Skip any entry with errors
-            .flat_map(|(_, v)| {
-                if let Ok(entry) = v.value().parse() {
-                    let file_path = entry.path.clone();
-                    return Some((file_path, IndexedFileTableEntry::from(entry)));
-                }
-
-                None
-            })
-        {
-            if let Err(_) = tx.blocking_send((file_path, entry)) {
-                break;
-            }
-        }
+        let index = txn.read_index()?;
+        index.all(tx)?;
 
         Ok(())
     }
@@ -1052,11 +935,10 @@ impl RealIndex for ArenaCache {
         let txn = self.db.begin_write()?;
         {
             let mut tree = txn.write_tree()?;
-            if let Some(inode) = tree.resolve(path)? {
-                let mut index_table = txn.index_table()?;
-                self.unindex_file(&txn, &mut tree, &mut index_table, inode)?;
-                self.unindex_dir(&txn, &mut tree, &mut index_table, inode)?;
-            }
+            let mut index = txn.write_index()?;
+            let mut dirty = txn.write_dirty()?;
+            let mut history = txn.write_history()?;
+            index.remove_file_or_dir(&mut tree, &mut history, &mut dirty, path)?;
         }
         txn.commit()?;
 
@@ -1071,35 +953,21 @@ impl RealIndex for ArenaCache {
         hash: &Hash,
     ) -> Result<bool, StorageError> {
         let mut tree = txn.write_tree()?;
-        let inode = match tree.resolve(path)? {
-            Some(inode) => inode,
-            None => {
-                return Ok(false);
-            }
-        };
+        let mut index = txn.write_index()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
 
-        let mut index_table = txn.index_table()?;
-        if let Some(entry) = get_indexed_file_inode(&index_table, inode)?
-            && entry.hash == *hash
-            && file_matches_index(&entry.into(), root, path)
-        {
-            tree.remove_and_decref(inode, &mut index_table, inode)?;
-            txn.write_dirty()?.mark_dirty(path)?;
-            txn.write_history()?.report_dropped(path, hash)?;
-            return Ok(true);
+        if let Some(inode) = tree.resolve(path)? {
+            if let Some(entry) = index.get_at_inode(inode)?
+                && entry.hash == *hash
+                && entry.matches_file(path.within(root))
+            {
+                index.drop(&mut tree, &mut history, &mut dirty, inode)?;
+                return Ok(true);
+            }
         }
 
         Ok(false)
-    }
-
-    fn update(
-        &self,
-        _notification: &Notification,
-        _root: &std::path::Path,
-    ) -> Result<(), StorageError> {
-        // This now happens in on the ArenaCache side.
-        // TODO:remove this method once ArenaCache and index have been fully merged.
-        Ok(())
     }
 }
 
@@ -1321,28 +1189,6 @@ fn load_or_assign_uuid(db: &Arc<ArenaDatabase>) -> Result<Uuid, StorageError> {
 
         Ok(uuid)
     }
-}
-
-fn file_matches_index(
-    entry: &IndexedFileTableEntry,
-    root: &std::path::Path,
-    path: &realize_types::Path,
-) -> bool {
-    if let Ok(m) = fs_utils::metadata_no_symlink_blocking(root, path) {
-        UnixTime::mtime(&m) == entry.mtime && m.len() == entry.size
-    } else {
-        false
-    }
-}
-
-/// Check whether replacing `old_hash` replaces `entry`
-fn replaces_local_copy(entry: &FileTableEntry, old_hash: &Hash) -> bool {
-    entry.hash == *old_hash
-        || entry
-            .outdated_by
-            .as_ref()
-            .map(|h| *h == *old_hash)
-            .unwrap_or(false)
 }
 
 /// Check whether the given inode exists in the cache and whether it

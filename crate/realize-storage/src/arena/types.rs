@@ -236,39 +236,6 @@ fn fill_byte_ranges(ranges: &ByteRanges, builder: blob_capnp::byte_ranges::Build
 
 /// An entry in the file table.
 #[derive(Debug, Clone, PartialEq)]
-pub struct IndexedFileTableEntry {
-    pub hash: Hash,
-    pub mtime: UnixTime,
-    pub size: u64,
-
-    // If set, a version is known to exist that replaces the version
-    // in this entry.
-    pub outdated_by: Option<Hash>,
-}
-
-impl From<FileTableEntry> for IndexedFileTableEntry {
-    fn from(value: FileTableEntry) -> Self {
-        IndexedFileTableEntry {
-            hash: value.hash,
-            mtime: value.mtime,
-            size: value.size,
-            outdated_by: value.outdated_by,
-        }
-    }
-}
-impl From<&FileTableEntry> for IndexedFileTableEntry {
-    fn from(value: &FileTableEntry) -> Self {
-        IndexedFileTableEntry {
-            hash: value.hash.clone(),
-            mtime: value.mtime,
-            size: value.size,
-            outdated_by: value.outdated_by.clone(),
-        }
-    }
-}
-
-/// An entry in the file table.
-#[derive(Debug, Clone, PartialEq)]
 pub enum HistoryTableEntry {
     /// The file was modified by the user. Modification should be forwarded to other copies.
     Add(realize_types::Path),

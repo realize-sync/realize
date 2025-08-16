@@ -2,7 +2,6 @@
 
 use super::db::BeforeCommit;
 use crate::InodeAllocator;
-use crate::utils::holder::ByteConversionError;
 use crate::{Inode, StorageError};
 use realize_types::{Arena, Path};
 use redb::{ReadableTable, Table};
@@ -164,6 +163,20 @@ pub(crate) enum TreeLoc<'a> {
     Path(Path),
 }
 
+impl<'a> TreeLoc<'a> {
+    /// Return another location that might borrow from the original
+    /// one.
+    ///
+    /// This is cheaper than a clone() for `TreeLoc::Path`.
+    pub(crate) fn borrow(&self) -> TreeLoc<'_> {
+        match self {
+            TreeLoc::Inode(inode) => TreeLoc::Inode(*inode),
+            TreeLoc::PathRef(path) => TreeLoc::PathRef(*path),
+            TreeLoc::Path(path) => TreeLoc::PathRef(path),
+        }
+    }
+}
+
 impl From<Inode> for TreeLoc<'static> {
     fn from(value: Inode) -> Self {
         TreeLoc::Inode(value)
@@ -222,7 +235,7 @@ pub(crate) trait TreeExt {
         F: FnMut(Inode) -> bool;
 
     /// Follow the inodes back up to the root and build a path.
-    fn backtrack(&self, inode: Inode) -> Result<Path, StorageError>;
+    fn backtrack<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> Result<Path, StorageError>;
 
     /// Return an iterator that returns the parent of inode and it
     /// parent until the root.
@@ -291,24 +304,30 @@ impl<T: TreeReadOperations> TreeExt for T {
         }
     }
 
-    fn backtrack(&self, inode: Inode) -> Result<Path, StorageError> {
-        let mut components = VecDeque::new();
-        let mut current = inode;
-        while let Some(parent) = self.parent(current)? {
-            if let Some(name) = self.name_in(parent, current)? {
-                components.push_front(name);
-            } else {
-                return Err(StorageError::InconsistentDatabase(format!(
-                    "{current} not in its parent {parent}"
-                )));
-            }
-            current = parent;
-        }
-        if current != self.root() {
-            return Err(StorageError::NotFound);
-        }
+    fn backtrack<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> Result<Path, StorageError> {
+        match loc.into() {
+            TreeLoc::PathRef(path) => Ok(path.clone()),
+            TreeLoc::Path(path) => Ok(path),
+            TreeLoc::Inode(inode) => {
+                let mut components = VecDeque::new();
+                let mut current = inode;
+                while let Some(parent) = self.parent(current)? {
+                    if let Some(name) = self.name_in(parent, current)? {
+                        components.push_front(name);
+                    } else {
+                        return Err(StorageError::InconsistentDatabase(format!(
+                            "{current} not in its parent {parent}"
+                        )));
+                    }
+                    current = parent;
+                }
+                if current != self.root() {
+                    return Err(StorageError::NotFound);
+                }
 
-        Ok(Path::parse(components.make_contiguous().join("/"))?)
+                Ok(Path::parse(components.make_contiguous().join("/"))?)
+            }
+        }
     }
 
     fn ancestors(&self, inode: Inode) -> impl Iterator<Item = Result<Inode, StorageError>> {
@@ -489,7 +508,7 @@ impl<'a> WritableOpenTree<'a> {
     /// and their reference count is decreased in the tree.
     ///
     /// `keygen` generates keys for `table` from an inode.
-    pub fn remove_recursive_and_decref<'b, 'k, K, V, FK, KB, F, L>(
+    pub fn remove_recursive_and_decref_checked<'b, 'k, K, V, FK, KB, F, L>(
         &mut self,
         start: L,
         table: &mut Table<'_, K, V>,
@@ -500,7 +519,7 @@ impl<'a> WritableOpenTree<'a> {
         L: Into<TreeLoc<'b>>,
         K: redb::Key + 'static,
         V: redb::Value + 'static,
-        FK: Fn(Inode) -> Result<KB, ByteConversionError>,
+        FK: Fn(Inode) -> KB,
         KB: std::borrow::Borrow<K::SelfType<'k>>,
         F: for<'f> FnMut(Inode, V::SelfType<'f>) -> Result<bool, StorageError>,
     {
@@ -513,14 +532,53 @@ impl<'a> WritableOpenTree<'a> {
         };
         for inode in std::iter::once(Ok(start)).chain(self.recurse(start, |_| true)) {
             let inode = inode?;
-            let remove = match table.get((keygen)(inode)?)? {
+            let remove = match table.get((keygen)(inode))? {
                 None => false,
                 Some(v) => (pred)(inode, v.value())?,
             };
             if remove {
-                if table.remove((keygen)(inode)?)?.is_some() {
+                if table.remove((keygen)(inode))?.is_some() {
                     decrement.push(inode);
                 }
+            }
+        }
+        for inode in decrement {
+            self.decref(inode)?;
+        }
+
+        Ok(())
+    }
+
+    /// Remove the given inode and all of its children from the given table.
+    ///
+    /// The entries are removed from `table` if `pred` returns true
+    /// and their reference count is decreased in the tree.
+    ///
+    /// `keygen` generates keys for `table` from an inode.
+    pub fn remove_recursive_and_decref<'b, 'k, K, V, FK, KB, L>(
+        &mut self,
+        start: L,
+        table: &mut Table<'_, K, V>,
+        keygen: FK,
+    ) -> Result<(), StorageError>
+    where
+        L: Into<TreeLoc<'b>>,
+        K: redb::Key + 'static,
+        V: redb::Value + 'static,
+        FK: Fn(Inode) -> KB,
+        KB: std::borrow::Borrow<K::SelfType<'k>>,
+    {
+        let mut decrement = vec![];
+        let start = match self.resolve(start)? {
+            Some(inode) => inode,
+            None => {
+                return Ok(());
+            }
+        };
+        for inode in std::iter::once(Ok(start)).chain(self.recurse(start, |_| true)) {
+            let inode = inode?;
+            if table.remove((keygen)(inode))?.is_some() {
+                decrement.push(inode);
             }
         }
         for inode in decrement {

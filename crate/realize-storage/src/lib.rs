@@ -106,15 +106,6 @@ impl Storage {
     pub async fn update(&self, peer: Peer, notification: Notification) -> Result<(), StorageError> {
         // TODO: change both in the same transaction
         let arena_storage = self.arena_storage(notification.arena())?;
-        if let Some(indexed) = &arena_storage.indexed {
-            if let Err(err) = indexed
-                .index
-                .update(notification.clone(), &indexed.root)
-                .await
-            {
-                log::warn!("Failed to update local store for {notification:?}: {err:?}",);
-            }
-        }
         let cache = Arc::clone(&arena_storage.cache);
         let index_root = arena_storage.indexed.as_ref().map(|i| i.root.to_path_buf());
         task::spawn_blocking(move || cache.update(peer, notification, index_root.as_deref()))

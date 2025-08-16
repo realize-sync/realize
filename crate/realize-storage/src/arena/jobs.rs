@@ -143,17 +143,15 @@ impl StorageJobProcessor {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
-
-    use crate::arena::types::IndexedFileTableEntry;
+    use crate::arena::index::IndexedFile;
     use crate::utils::hash;
     use crate::{Blob, Inode, Notification};
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Path, Peer, UnixTime};
+    use std::time::Duration;
     use tokio::io::AsyncReadExt;
 
     struct Fixture {
@@ -263,10 +261,7 @@ mod tests {
             self.root.join(path).exists()
         }
 
-        fn find_in_index(
-            &self,
-            path_str: &str,
-        ) -> Result<Option<IndexedFileTableEntry>, StorageError> {
+        fn find_in_index(&self, path_str: &str) -> Result<Option<IndexedFile>, StorageError> {
             self.index.get_file(&Path::parse(path_str)?)
         }
 

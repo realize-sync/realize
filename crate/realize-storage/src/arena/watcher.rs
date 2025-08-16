@@ -709,19 +709,17 @@ async fn only_regular(e: async_walkdir::DirEntry) -> async_walkdir::Filtering {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
+    use super::*;
     use crate::arena::arena_cache::ArenaCache;
-    use crate::arena::types::IndexedFileTableEntry;
+    use crate::arena::index::IndexedFile;
     use crate::realize_types::Arena;
     use crate::utils::hash;
-    use realize_types::Hash;
-
-    use super::*;
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
+    use realize_types::Hash;
     use std::os::unix::fs::PermissionsExt as _;
+    use std::time::Duration;
 
     struct Fixture {
         index: RealIndexAsync,
@@ -816,7 +814,7 @@ mod tests {
         let path = realize_types::Path::parse("foobar")?;
         fixture.wait_for_history_event(1).await?;
         assert_eq!(
-            Some(IndexedFileTableEntry {
+            Some(IndexedFile {
                 size: 4,
                 mtime,
                 hash: hash::digest("test".as_bytes()),
@@ -840,7 +838,7 @@ mod tests {
         let path = realize_types::Path::parse("foobar")?;
         fixture.wait_for_history_event(1).await?;
         assert_eq!(
-            Some(IndexedFileTableEntry {
+            Some(IndexedFile {
                 size: 0,
                 mtime,
                 hash: hash::digest([]),
@@ -1223,7 +1221,7 @@ mod tests {
 
         // Foo is as added initially
         assert_eq!(
-            Some(IndexedFileTableEntry {
+            Some(IndexedFile {
                 size: 3,
                 mtime: UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
                 hash: hash::digest("foo".as_bytes()),
@@ -1234,7 +1232,7 @@ mod tests {
 
         // Bar was updated
         assert_eq!(
-            Some(IndexedFileTableEntry {
+            Some(IndexedFile {
                 size: 6,
                 mtime: UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
                 hash: hash::digest("barbar".as_bytes()),
@@ -1523,7 +1521,7 @@ mod tests {
         fixture.wait_for_history_event(2).await?;
 
         assert_eq!(
-            Some(IndexedFileTableEntry {
+            Some(IndexedFile {
                 size: 4,
                 mtime,
                 hash: hash::digest("test".as_bytes()),
