@@ -183,24 +183,13 @@ mod tests {
             root.create_dir_all()?;
             let cache = ArenaCache::new(arena, Arc::clone(&db), &tempdir.path().join("blobs"))?;
 
-            let engine = Engine::new(
-                arena,
-                Arc::clone(&db),
-                if with_root {
-                    Some(cache.as_index())
+            let engine = Engine::new(arena, Arc::clone(&db), Arc::clone(&cache), |attempt| {
+                if attempt < 3 {
+                    Some(Duration::from_secs(1))
                 } else {
                     None
-                },
-                Arc::clone(&cache),
-                cache.arena_root(),
-                |attempt| {
-                    if attempt < 3 {
-                        Some(Duration::from_secs(1))
-                    } else {
-                        None
-                    }
-                },
-            );
+                }
+            });
             let index = cache.as_index();
             let processor = StorageJobProcessor::new(
                 Arc::clone(&db),

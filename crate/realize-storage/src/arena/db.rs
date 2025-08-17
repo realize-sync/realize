@@ -137,26 +137,26 @@ const MARK_TABLE: TableDefinition<Inode, Holder<MarkTableEntry>> = TableDefiniti
 ///
 /// Key: &str (path)
 /// Value: dirty counter (key of DIRTY_LOG_TABLE)
-const DIRTY_TABLE: TableDefinition<&str, u64> = TableDefinition::new("engine.dirty");
+const DIRTY_TABLE: TableDefinition<Inode, u64> = TableDefinition::new("dirty");
 
 /// Path marked dirty, indexed by an increasing counter.
 ///
 /// Key: u64 (increasing counter)
 /// Value: &str (path)
-const DIRTY_LOG_TABLE: TableDefinition<u64, &str> = TableDefinition::new("engine.dirty_log");
+const DIRTY_LOG_TABLE: TableDefinition<u64, Inode> = TableDefinition::new("dirty_log");
 
 /// Highest counter value for DIRTY_LOG_TABLE.
 ///
 /// Can only be cleared if DIRTY_TABLE, DIRTY_LOG_TABLE and JOB_TABLE
 /// are empty and there is no active stream of Jobs.
-const DIRTY_COUNTER_TABLE: TableDefinition<(), u64> = TableDefinition::new("engine.dirty_counter");
+const DIRTY_COUNTER_TABLE: TableDefinition<(), u64> = TableDefinition::new("dirty_counter");
 
 /// Stores job failures.
 ///
 /// Key: u64 (key of the corresponding DIRTY_LOG_TABLE entry)
 /// Value: FailedJobTableEntry
 const FAILED_JOB_TABLE: TableDefinition<u64, Holder<FailedJobTableEntry>> =
-    TableDefinition::new("engine.failed_job");
+    TableDefinition::new("failed_job");
 
 pub(crate) struct ArenaDatabase {
     db: redb::Database,

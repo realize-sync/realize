@@ -484,18 +484,13 @@ impl ArenaCache {
     }
 
     // Return the default file entry for a path.
-    pub(crate) fn get_file_entry_for_path<T>(
+    pub(crate) fn get_file_entry_for_loc<'b, L: Into<TreeLoc<'b>>>(
         &self,
         txn: &ArenaReadTransaction,
-        path: T,
-    ) -> Result<FileTableEntry, StorageError>
-    where
-        T: AsRef<Path>,
-    {
-        let path = path.as_ref();
-        let tree = txn.read_tree()?;
-
-        let inode = tree.expect(path)?;
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<FileTableEntry, StorageError> {
+        let inode = tree.expect(loc)?;
         if let Some(e) = get_file_entry(&txn.cache_table()?, inode, None)? {
             return Ok(e);
         }
@@ -532,14 +527,13 @@ impl ArenaCache {
         &self,
         txn: &ArenaWriteTransaction,
         inode: Inode,
-        path: &Path,
     ) -> Result<(), StorageError> {
         self.blobstore.delete_blob(&txn, inode)?;
 
         // This entry is the outside world view of the file, so
         // changes should be reported.
         let mut dirty = txn.write_dirty()?;
-        dirty.mark_dirty(path)?;
+        dirty.mark_dirty(inode)?;
 
         Ok(())
     }
@@ -553,7 +547,7 @@ impl ArenaCache {
         inode: Inode,
         new_entry: &FileTableEntry,
     ) -> Result<(), StorageError> {
-        self.before_default_file_entry_change(txn, inode, &new_entry.path)?;
+        self.before_default_file_entry_change(txn, inode)?;
         tree.insert_and_incref(
             inode,
             cache_table,
@@ -626,7 +620,7 @@ impl ArenaCache {
                 self.do_write_default_file_entry(txn, tree, cache_table, inode, &new_entry)?;
             }
             None => {
-                self.before_default_file_entry_change(txn, inode, &default_entry.path)?;
+                self.before_default_file_entry_change(txn, inode)?;
                 tree.remove_and_decref(inode, cache_table, CacheTableKey::Default(inode))?;
 
                 // Update the parent modification time, as removing an
@@ -1225,6 +1219,7 @@ mod tests {
     use crate::arena::dirty::DirtyReadOperations;
     use crate::arena::index::RealIndex;
     use crate::arena::notifier::Notification;
+    use crate::arena::tree::TreeExt;
     use crate::arena::tree::TreeReadOperations;
     use crate::arena::types::HistoryTableEntry;
     use crate::utils::hash;
@@ -1351,17 +1346,28 @@ mod tests {
             Ok(())
         }
 
-        fn dirty_paths(&self) -> Result<HashSet<Path>, StorageError> {
+        fn dirty_inodes(&self) -> Result<HashSet<Inode>, StorageError> {
             let txn = self.db.begin_read()?;
             let dirty = txn.read_dirty()?;
             let mut start = 0;
-            let mut paths = HashSet::new();
-            while let Some((path, counter)) = dirty.next_dirty_path(start)? {
-                paths.insert(path);
+            let mut ret = HashSet::new();
+            while let Some((inode, counter)) = dirty.next_dirty(start)? {
+                ret.insert(inode);
                 start = counter + 1;
             }
 
-            Ok(paths)
+            Ok(ret)
+        }
+
+        fn dirty_paths(&self) -> Result<HashSet<Path>, StorageError> {
+            let inodes = self.dirty_inodes()?;
+            let txn = self.db.begin_read()?;
+            let tree = txn.read_tree()?;
+
+            Ok(inodes
+                .into_iter()
+                .filter_map(|i| tree.backtrack(i).ok())
+                .collect())
         }
 
         async fn setup() -> anyhow::Result<Fixture> {
@@ -1669,11 +1675,11 @@ mod tests {
 
         fixture.add_to_cache(&file_path, 100, mtime)?;
         let arena_root = acache.arena_root();
-        acache.lookup(arena_root, "file.txt")?;
+        let (inode, _) = acache.lookup(arena_root, "file.txt")?;
 
         fixture.clear_dirty()?;
         fixture.remove_from_cache(&file_path)?;
-        assert_eq!(HashSet::from([file_path.clone()]), fixture.dirty_paths()?);
+        assert_eq!(HashSet::from([inode]), fixture.dirty_inodes()?);
 
         Ok(())
     }

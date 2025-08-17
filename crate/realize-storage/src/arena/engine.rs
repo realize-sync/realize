@@ -1,9 +1,7 @@
-#![allow(dead_code)] // work in progress
-
 use super::arena_cache::ArenaCache;
 use super::db::{ArenaDatabase, ArenaReadTransaction};
 use super::dirty::DirtyReadOperations;
-use super::index::{IndexedFile, RealIndex};
+use super::index::IndexReadOperations;
 use super::mark::MarkExt;
 use super::tree::TreeExt;
 use super::types::LocalAvailability;
@@ -98,9 +96,7 @@ pub enum JobStatus {
 pub struct Engine {
     arena: Arena,
     db: Arc<ArenaDatabase>,
-    index: Option<Arc<dyn RealIndex>>,
     cache: Arc<ArenaCache>,
-    arena_root: Inode,
     job_retry_strategy: Box<dyn (Fn(u32) -> Option<Duration>) + Sync + Send + 'static>,
 
     /// A channel that triggers whenever a new failed job is created.
@@ -116,9 +112,8 @@ impl Engine {
     pub(crate) fn new(
         arena: Arena,
         db: Arc<ArenaDatabase>,
-        index: Option<Arc<dyn RealIndex>>,
         cache: Arc<ArenaCache>,
-        arena_root: Inode,
+
         job_retry_strategy: impl (Fn(u32) -> Option<Duration>) + Sync + Send + 'static,
     ) -> Arc<Engine> {
         let (failed_job_tx, _) = watch::channel(());
@@ -126,9 +121,7 @@ impl Engine {
         Arc::new(Self {
             arena,
             db,
-            index,
             cache,
-            arena_root,
             job_retry_strategy: Box::new(job_retry_strategy),
             failed_job_tx,
             retry_jobs_missing_peers,
@@ -377,7 +370,7 @@ impl Engine {
         let txn = self.db.begin_read()?;
         let dirty = txn.read_dirty()?;
 
-        while let Some((path, counter)) = dirty.next_dirty_path(start_counter)? {
+        while let Some((path, counter)) = dirty.next_dirty(start_counter)? {
             if let Some(job) = self.build_job(&txn, path, counter)? {
                 return Ok((Some(job), Some(counter)));
             }
@@ -398,8 +391,8 @@ impl Engine {
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
             let dirty = txn.read_dirty()?;
-            if let Some(path) = dirty.get_path_for_counter(counter)? {
-                return this.build_job(&txn, path, counter);
+            if let Some(inode) = dirty.get_inode_for_counter(counter)? {
+                return this.build_job(&txn, inode, counter);
             }
             return Ok::<_, StorageError>(None);
         })
@@ -418,9 +411,12 @@ impl Engine {
         let path = path.as_ref().clone();
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
+            let tree = txn.read_tree()?;
             let dirty = txn.read_dirty()?;
-            if let Some(counter) = dirty.get_counter_for_path(&path)? {
-                return this.build_job(&txn, path, counter);
+            if let Some(inode) = tree.resolve(path)? {
+                if let Some(counter) = dirty.get_counter(inode)? {
+                    return this.build_job(&txn, inode, counter);
+                }
             }
             return Ok::<_, StorageError>(None);
         })
@@ -431,40 +427,45 @@ impl Engine {
     fn build_job(
         &self,
         txn: &ArenaReadTransaction,
-        path: Path,
+        inode: Inode,
         counter: u64,
     ) -> Result<Option<(JobId, StorageJob)>, StorageError> {
         let tree = txn.read_tree()?;
         let marks = txn.read_marks()?;
-        match marks.get(&tree, &path) {
+        let index = txn.read_index()?;
+        match marks.get(&tree, inode) {
             Err(_) => {
                 return Ok(None);
             }
             Ok(Mark::Watch) => {
                 if let (Ok(cached), Ok(Some(indexed))) = (
-                    self.cache.get_file_entry_for_path(txn, &path),
-                    self.get_indexed_file(txn, &path),
+                    self.cache.get_file_entry_for_loc(txn, &tree, inode),
+                    index.get_at_inode(inode),
                 ) && cached.hash == indexed.hash
                 {
-                    return Ok(Some((
-                        JobId(counter),
-                        StorageJob::Unrealize(path, cached.hash),
-                    )));
-                }
-            }
-            Ok(Mark::Keep) => {
-                if let Ok(cached) = self.cache.get_file_entry_for_path(txn, &path) {
-                    if let Ok(Some(indexed)) = self.get_indexed_file(txn, &path)
-                        && cached.hash == indexed.hash
-                    {
+                    if let Ok(path) = tree.backtrack(inode) {
                         return Ok(Some((
                             JobId(counter),
                             StorageJob::Unrealize(path, cached.hash),
                         )));
                     }
+                }
+            }
+            Ok(Mark::Keep) => {
+                if let Ok(cached) = self.cache.get_file_entry_for_loc(txn, &tree, inode) {
+                    if let Ok(Some(indexed)) = index.get_at_inode(inode)
+                        && cached.hash == indexed.hash
+                    {
+                        if let Ok(path) = tree.backtrack(inode) {
+                            return Ok(Some((
+                                JobId(counter),
+                                StorageJob::Unrealize(path, cached.hash),
+                            )));
+                        }
+                    }
 
-                    if let Some(inode) = txn.read_tree()?.resolve(&path)? {
-                        if blob::local_availability(txn, inode)? != LocalAvailability::Verified {
+                    if blob::local_availability(txn, inode)? != LocalAvailability::Verified {
+                        if let Ok(path) = tree.backtrack(inode) {
                             return Ok(Some((
                                 JobId(counter),
                                 StorageJob::External(Job::Download(path, cached.hash)),
@@ -475,47 +476,37 @@ impl Engine {
             }
             Ok(Mark::Own) => {
                 // TODO: treat is as Keep if there is no index.
-                if let Ok(cached) = self.cache.get_file_entry_for_path(txn, &path) {
-                    let from_index = self.get_indexed_file(txn, &path)?;
+                if let Ok(cached) = self.cache.get_file_entry_for_loc(txn, &tree, inode) {
+                    let from_index = index.get_at_inode(inode)?;
                     if from_index.is_none() {
                         // File is missing from the index, move it there.
-                        return Ok(Some((
-                            JobId(counter),
-                            StorageJob::External(Job::Realize(path, cached.hash, None)),
-                        )));
+                        if let Ok(path) = tree.backtrack(inode) {
+                            return Ok(Some((
+                                JobId(counter),
+                                StorageJob::External(Job::Realize(path, cached.hash, None)),
+                            )));
+                        }
                     }
                     if let Some(indexed) = from_index
-                        && indexed
-                            .outdated_by
-                            .as_ref()
-                            .map(|h| *h == cached.hash)
-                            .unwrap_or(false)
+                        && indexed.hash != cached.hash
+                        && indexed.is_outdated_by(&cached.hash)
                     {
-                        return Ok(Some((
-                            JobId(counter),
-                            StorageJob::External(Job::Realize(
-                                path,
-                                cached.hash,
-                                Some(indexed.hash),
-                            )),
-                        )));
+                        if let Ok(path) = tree.backtrack(inode) {
+                            return Ok(Some((
+                                JobId(counter),
+                                StorageJob::External(Job::Realize(
+                                    path,
+                                    cached.hash,
+                                    Some(indexed.hash),
+                                )),
+                            )));
+                        }
                     }
                 }
             }
         };
 
         Ok(None)
-    }
-
-    fn get_indexed_file(
-        &self,
-        txn: &ArenaReadTransaction,
-        path: &Path,
-    ) -> Result<Option<IndexedFile>, StorageError> {
-        self.index
-            .as_ref()
-            .map(|i| i.get_file_txn(txn, &path))
-            .unwrap_or(Ok(None))
     }
 
     fn delete_range(&self, beg: u64, end: u64) -> Result<(), StorageError> {
@@ -597,11 +588,6 @@ impl Engine {
     }
 }
 
-fn last_counter(
-    dirty_counter_table: &impl redb::ReadableTable<(), u64>,
-) -> Result<u64, StorageError> {
-    Ok(dirty_counter_table.get(())?.map(|v| v.value()).unwrap_or(0))
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,12 +597,12 @@ mod tests {
     use crate::arena::arena_cache::ArenaCache;
     use crate::arena::index::RealIndex;
     use crate::arena::mark;
+    use crate::arena::tree::TreeLoc;
     use crate::utils::redb_utils;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use futures::StreamExt as _;
     use realize_types::{Arena, Peer, UnixTime};
-    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::io::AsyncWriteExt as _;
@@ -633,7 +619,6 @@ mod tests {
         acache: Arc<ArenaCache>,
         index: Arc<dyn RealIndex>,
         engine: Arc<Engine>,
-        arena_path: PathBuf,
         _tempdir: TempDir,
     }
     impl EngineFixture {
@@ -651,22 +636,14 @@ mod tests {
                 InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?,
             )?;
             let acache = ArenaCache::new(arena, Arc::clone(&db), &tempdir.path().join("blobs"))?;
-            let arena_root = acache.arena_root();
             let index = acache.as_index();
-            let engine = Engine::new(
-                arena,
-                Arc::clone(&db),
-                Some(index.clone()),
-                Arc::clone(&acache),
-                arena_root,
-                |attempt| {
-                    if attempt < 3 {
-                        Some(Duration::from_secs(attempt as u64 * 10))
-                    } else {
-                        None
-                    }
-                },
-            );
+            let engine = Engine::new(arena, Arc::clone(&db), Arc::clone(&acache), |attempt| {
+                if attempt < 3 {
+                    Some(Duration::from_secs(attempt as u64 * 10))
+                } else {
+                    None
+                }
+            });
 
             Ok(Self {
                 arena,
@@ -674,7 +651,6 @@ mod tests {
                 acache,
                 index,
                 engine,
-                arena_path: arena_path.to_path_buf(),
                 _tempdir: tempdir,
             })
         }
@@ -760,17 +736,15 @@ mod tests {
         fn lowest_counter(&self) -> anyhow::Result<Option<u64>> {
             let txn = self.db.begin_read()?;
             let dirty = txn.read_dirty()?;
-            Ok(dirty.next_dirty_path(0)?.map(|(_, c)| c))
+            Ok(dirty.next_dirty(0)?.map(|(_, c)| c))
         }
 
-        fn mark_dirty<T>(&self, path: T) -> anyhow::Result<()>
-        where
-            T: AsRef<Path>,
-        {
+        fn mark_dirty<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> anyhow::Result<()> {
             let txn = self.db.begin_write()?;
             {
                 let mut dirty = txn.write_dirty()?;
-                dirty.mark_dirty(path)?;
+                let tree = txn.read_tree()?;
+                dirty.mark_dirty(tree.expect(loc)?)?;
             }
             txn.commit()?;
             Ok(())
@@ -1385,39 +1359,6 @@ mod tests {
         let (new_job_id, new_job) = fixture.engine.job_for_path(job.path()).await?.unwrap();
         assert_eq!(job, new_job);
         assert!(new_job_id > job_id);
-
-        Ok(())
-    }
-
-    async fn check_job_returns_outdated_because_done() -> anyhow::Result<()> {
-        let fixture = EngineFixture::setup().await?;
-        let barfile = Path::parse("foo/bar.txt")?;
-        let mut job_stream = fixture.engine.job_stream();
-        mark::set_arena_mark(&fixture.db, Mark::Keep)?;
-        fixture.add_file_to_cache(&barfile)?;
-
-        let (_, job) = next_with_timeout(&mut job_stream).await?.unwrap();
-        let inode = fixture.acache.expect(&barfile)?;
-        {
-            let mut blob = fixture.acache.open_file(inode)?;
-            blob.write_all(b"test").await?;
-            blob.update_db().await?;
-        }
-        assert_eq!(None, fixture.engine.job_for_path(job.path()).await?);
-
-        Ok(())
-    }
-
-    async fn check_job_returns_outdated_because_irrelevant() -> anyhow::Result<()> {
-        let fixture = EngineFixture::setup().await?;
-        let barfile = Path::parse("foo/bar.txt")?;
-        let mut job_stream = fixture.engine.job_stream();
-        mark::set_arena_mark(&fixture.db, Mark::Keep)?;
-        fixture.add_file_to_cache(&barfile)?;
-
-        let (_, job) = next_with_timeout(&mut job_stream).await?.unwrap();
-        fixture.remove_file_from_cache(&barfile)?;
-        assert_eq!(None, fixture.engine.job_for_path(job.path()).await?);
 
         Ok(())
     }

@@ -487,7 +487,7 @@ impl<'a> WritableOpenIndex<'a> {
         size: u64,
         mtime: UnixTime,
         hash: Hash,
-    ) -> Result<(), StorageError> {
+    ) -> Result<Inode, StorageError> {
         let loc = loc.into();
         let inode = tree.setup(loc.borrow())?;
         let old_hash = self
@@ -500,7 +500,7 @@ impl<'a> WritableOpenIndex<'a> {
             .map(|e| e.hash);
         let same_hash = old_hash.as_ref().map(|h| *h == hash).unwrap_or(false);
         if same_hash {
-            return Ok(());
+            return Ok(inode);
         }
         if let Ok(path) = tree.backtrack(loc) {
             tree.insert_and_incref(
@@ -509,10 +509,10 @@ impl<'a> WritableOpenIndex<'a> {
                 inode,
                 Holder::with_content(FileTableEntry::new(path.clone(), size, mtime, hash))?,
             )?;
-            dirty.mark_dirty(&path)?;
+            dirty.mark_dirty(inode)?;
             history.report_added(&path, old_hash.as_ref())?;
         }
-        Ok(())
+        Ok(inode)
     }
 
     /// Remove a file entry at the given location, if it exists.
@@ -535,7 +535,7 @@ impl<'a> WritableOpenIndex<'a> {
                 Some(existing) => existing.value().parse()?,
             };
             if tree.remove_and_decref(inode, &mut self.table, inode)? {
-                dirty.mark_dirty(&path)?;
+                dirty.mark_dirty(inode)?;
                 history.report_removed(&path, &hash)?;
 
                 return Ok(true);
@@ -566,7 +566,7 @@ impl<'a> WritableOpenIndex<'a> {
                 Some(existing) => existing.value().parse()?,
             };
             if tree.remove_and_decref(inode, &mut self.table, inode)? {
-                dirty.mark_dirty(&path)?;
+                dirty.mark_dirty(inode)?;
                 history.report_dropped(&path, &hash)?;
 
                 return Ok(true);
@@ -597,9 +597,9 @@ impl<'a> WritableOpenIndex<'a> {
             loc,
             &mut self.table,
             |inode| inode,
-            |_, v| {
+            |inode, v| {
                 let FileTableEntry { path, hash, .. } = v.parse()?;
-                dirty.mark_dirty(&path)?;
+                dirty.mark_dirty(inode)?;
                 history.report_removed(&path, &hash)?;
 
                 Ok(true)
@@ -680,6 +680,7 @@ fn all(
 mod tests {
     use super::*;
     use crate::arena::db::ArenaDatabase;
+    use crate::arena::dirty::DirtyReadOperations;
     use realize_types::Arena;
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -697,16 +698,26 @@ mod tests {
             Ok(Self { db })
         }
     }
-    fn dirty_paths(
+    fn dirty_inodes(
         dirty: &impl crate::arena::dirty::DirtyReadOperations,
-    ) -> Result<HashSet<Path>, StorageError> {
+    ) -> Result<HashSet<Inode>, StorageError> {
         let mut start = 0;
-        let mut paths = HashSet::new();
-        while let Some((path, counter)) = dirty.next_dirty_path(start)? {
-            paths.insert(path);
+        let mut ret = HashSet::new();
+        while let Some((inode, counter)) = dirty.next_dirty(start)? {
+            ret.insert(inode);
             start = counter + 1;
         }
-        Ok(paths)
+        Ok(ret)
+    }
+
+    fn dirty_paths(
+        dirty: &impl DirtyReadOperations,
+        tree: &impl TreeReadOperations,
+    ) -> Result<HashSet<Path>, StorageError> {
+        Ok(dirty_inodes(dirty)?
+            .into_iter()
+            .filter_map(|i| tree.backtrack(i).ok())
+            .collect())
     }
 
     fn collect_history_entries(
@@ -1068,8 +1079,7 @@ mod tests {
         assert!(index.has(&tree, &path)?);
 
         // Verify the path was marked dirty
-        let dirty_paths = dirty_paths(&dirty)?;
-        assert!(dirty_paths.contains(&path));
+        assert!(dirty_paths(&dirty, &tree)?.contains(&path));
 
         // Verify history entry was added (Add entry)
         let history_entries = collect_history_entries(&history)?;
@@ -1132,7 +1142,7 @@ mod tests {
         assert_eq!(entry.hash, hash2);
 
         // Verify the path was marked dirty
-        let dirty_paths = dirty_paths(&dirty)?;
+        let dirty_paths = dirty_paths(&dirty, &tree)?;
         assert!(dirty_paths.contains(&path));
 
         // Verify history entries were added (Add + Replace entries)
@@ -1169,7 +1179,7 @@ mod tests {
         let mut history = txn.write_history()?;
 
         // Add a file first
-        index.add(
+        let inode = index.add(
             &mut tree,
             &mut history,
             &mut dirty,
@@ -1190,8 +1200,7 @@ mod tests {
         assert!(!index.has(&tree, &path)?);
 
         // Verify the path was marked dirty
-        let dirty_paths = dirty_paths(&dirty)?;
-        assert!(dirty_paths.contains(&path));
+        assert_eq!(HashSet::from([inode]), dirty_inodes(&dirty)?);
 
         // Verify history entries were added (Add + Remove entries)
         let history_entries = collect_history_entries(&history)?;
@@ -1230,7 +1239,7 @@ mod tests {
         let hash1 = Hash([0xfa; 32]);
         let hash2 = Hash([0xfb; 32]);
 
-        index.add(
+        let inode1 = index.add(
             &mut tree,
             &mut history,
             &mut dirty,
@@ -1239,7 +1248,7 @@ mod tests {
             mtime,
             hash1.clone(),
         )?;
-        index.add(
+        let inode2 = index.add(
             &mut tree,
             &mut history,
             &mut dirty,
@@ -1260,9 +1269,7 @@ mod tests {
         assert!(!index.has(&tree, &path2)?);
 
         // Verify the paths were marked dirty
-        let dirty_paths = dirty_paths(&dirty)?;
-        assert!(dirty_paths.contains(&path1));
-        assert!(dirty_paths.contains(&path2));
+        assert_eq!(HashSet::from([inode1, inode2]), dirty_inodes(&dirty)?);
 
         // Verify history entries were added (2 Add + 2 Remove entries)
         let history_entries = collect_history_entries(&history)?;

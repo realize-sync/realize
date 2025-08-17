@@ -258,15 +258,25 @@ mod tests {
         dirty.delete_range(0, 999)
     }
 
-    fn dirty_paths(dirty: &impl DirtyReadOperations) -> Result<HashSet<Path>, StorageError> {
+    fn dirty_inodes(dirty: &impl DirtyReadOperations) -> Result<HashSet<Inode>, StorageError> {
         let mut start = 0;
-        let mut paths = HashSet::new();
-        while let Some((path, counter)) = dirty.next_dirty_path(start)? {
-            paths.insert(path);
+        let mut inodes = HashSet::new();
+        while let Some((inode, counter)) = dirty.next_dirty(start)? {
+            inodes.insert(inode);
             start = counter + 1;
         }
 
-        Ok(paths)
+        Ok(inodes)
+    }
+
+    fn dirty_paths(
+        dirty: &impl DirtyReadOperations,
+        tree: &impl TreeReadOperations,
+    ) -> Result<HashSet<Path>, StorageError> {
+        Ok(dirty_inodes(dirty)?
+            .into_iter()
+            .filter_map(|i| tree.backtrack(i).ok())
+            .collect())
     }
 
     #[test]
@@ -446,7 +456,7 @@ mod tests {
 
         assert_eq!(
             HashSet::from([Path::parse("foo/qux/quux")?]),
-            dirty_paths(&dirty)?
+            dirty_paths(&dirty, &tree)?
         );
         clear_dirty(&mut dirty)?;
 
@@ -459,7 +469,7 @@ mod tests {
                 Path::parse("foo/bar")?,
                 Path::parse("foo/bar/baz")?,
             ]),
-            dirty_paths(&dirty)?
+            dirty_paths(&dirty, &tree)?
         );
         clear_dirty(&mut dirty)?;
 
@@ -473,7 +483,7 @@ mod tests {
                 Path::parse("foo/bar/baz")?,
                 Path::parse("waldo")?,
             ]),
-            dirty_paths(&dirty)?
+            dirty_paths(&dirty, &tree)?
         );
 
         Ok(())
@@ -496,7 +506,7 @@ mod tests {
         mark.clear(&mut tree, &mut dirty, Path::parse("foo/qux")?)?;
         assert_eq!(
             HashSet::from([Path::parse("foo/qux")?, Path::parse("foo/qux/quux")?,]),
-            dirty_paths(&dirty)?
+            dirty_paths(&dirty, &tree)?
         );
 
         Ok(())
@@ -526,7 +536,7 @@ mod tests {
                 Path::parse("qux")?,
                 Path::parse("qux/quux")?,
             ]),
-            dirty_paths(&dirty)?
+            dirty_paths(&dirty, &tree)?
         );
 
         Ok(())
@@ -545,7 +555,7 @@ mod tests {
 
         // nothing to clear
         mark.clear(&mut tree, &mut dirty, Path::parse("foo/qux")?)?;
-        assert_eq!(HashSet::new(), dirty_paths(&dirty)?);
+        assert_eq!(HashSet::new(), dirty_paths(&dirty, &tree)?);
 
         Ok(())
     }
@@ -568,7 +578,7 @@ mod tests {
             Path::parse("foo/qux")?,
             Mark::default(),
         )?;
-        assert_eq!(HashSet::new(), dirty_paths(&dirty)?);
+        assert_eq!(HashSet::new(), dirty_paths(&dirty, &tree)?);
 
         Ok(())
     }

@@ -1,8 +1,9 @@
 use super::db::AfterCommit;
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations};
 use super::types::{FailedJobTableEntry, RetryJob};
+use crate::Inode;
 use crate::{JobId, StorageError, utils::holder::Holder};
-use realize_types::{Path, UnixTime};
+use realize_types::UnixTime;
 use redb::{ReadableTable, Table};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -29,8 +30,8 @@ impl Dirty {
 
 pub(crate) struct ReadableOpenDirty<DT, LT, FT>
 where
-    DT: ReadableTable<&'static str, u64>,
-    LT: ReadableTable<u64, &'static str>,
+    DT: ReadableTable<Inode, u64>,
+    LT: ReadableTable<u64, Inode>,
     FT: ReadableTable<u64, Holder<'static, FailedJobTableEntry>>,
 {
     table: DT,
@@ -40,8 +41,8 @@ where
 
 impl<DT, LT, FT> ReadableOpenDirty<DT, LT, FT>
 where
-    DT: ReadableTable<&'static str, u64>,
-    LT: ReadableTable<u64, &'static str>,
+    DT: ReadableTable<Inode, u64>,
+    LT: ReadableTable<u64, Inode>,
     FT: ReadableTable<u64, Holder<'static, FailedJobTableEntry>>,
 {
     pub(crate) fn new(dirty_table: DT, log_table: LT, failed_job_table: FT) -> Self {
@@ -56,8 +57,8 @@ where
 pub(crate) struct WritableOpenDirty<'a> {
     after_commit: &'a AfterCommit,
     dirty: &'a Dirty,
-    table: Table<'a, &'static str, u64>,
-    log_table: Table<'a, u64, &'static str>,
+    table: Table<'a, Inode, u64>,
+    log_table: Table<'a, u64, Inode>,
     failed_job_table: Table<'a, u64, Holder<'static, FailedJobTableEntry>>,
     counter_table: Table<'a, (), u64>,
 }
@@ -66,8 +67,8 @@ impl<'a> WritableOpenDirty<'a> {
     pub(crate) fn new(
         after_commit: &'a AfterCommit,
         dirty: &'a Dirty,
-        dirty_table: Table<'a, &str, u64>,
-        log_table: Table<'a, u64, &str>,
+        dirty_table: Table<'a, Inode, u64>,
+        log_table: Table<'a, u64, Inode>,
         failed_job_table: Table<'a, u64, Holder<FailedJobTableEntry>>,
         counter_table: Table<'a, (), u64>,
     ) -> Self {
@@ -83,10 +84,10 @@ impl<'a> WritableOpenDirty<'a> {
 }
 
 pub(crate) trait DirtyReadOperations {
-    fn next_dirty_path(&self, start_counter: u64) -> Result<Option<(Path, u64)>, StorageError>;
+    fn next_dirty(&self, start_counter: u64) -> Result<Option<(Inode, u64)>, StorageError>;
     fn get_last_counter(&self, start_counter: u64) -> Result<Option<u64>, StorageError>;
-    fn get_path_for_counter(&self, counter: u64) -> Result<Option<Path>, StorageError>;
-    fn get_counter_for_path(&self, path: &Path) -> Result<Option<u64>, StorageError>;
+    fn get_inode_for_counter(&self, counter: u64) -> Result<Option<Inode>, StorageError>;
+    fn get_counter(&self, inode: Inode) -> Result<Option<u64>, StorageError>;
     fn is_job_failed(&self, job_id: JobId) -> Result<bool, StorageError>;
     fn get_jobs_waiting_for_peers(&self) -> Result<Vec<u64>, StorageError>;
     fn get_earliest_backoff(
@@ -97,24 +98,24 @@ pub(crate) trait DirtyReadOperations {
 
 impl<DT, LT, FT> DirtyReadOperations for ReadableOpenDirty<DT, LT, FT>
 where
-    DT: ReadableTable<&'static str, u64>,
-    LT: ReadableTable<u64, &'static str>,
+    DT: ReadableTable<Inode, u64>,
+    LT: ReadableTable<u64, Inode>,
     FT: ReadableTable<u64, Holder<'static, FailedJobTableEntry>>,
 {
-    fn next_dirty_path(&self, start_counter: u64) -> Result<Option<(Path, u64)>, StorageError> {
-        next_dirty_path(&self.log_table, start_counter)
+    fn next_dirty(&self, start_counter: u64) -> Result<Option<(Inode, u64)>, StorageError> {
+        next_dirty(&self.log_table, start_counter)
     }
 
     fn get_last_counter(&self, start_counter: u64) -> Result<Option<u64>, StorageError> {
         get_last_counter(&self.log_table, start_counter)
     }
 
-    fn get_path_for_counter(&self, counter: u64) -> Result<Option<Path>, StorageError> {
-        get_path_for_counter(&self.log_table, counter)
+    fn get_inode_for_counter(&self, counter: u64) -> Result<Option<Inode>, StorageError> {
+        get_inode_for_counter(&self.log_table, counter)
     }
 
-    fn get_counter_for_path(&self, path: &Path) -> Result<Option<u64>, StorageError> {
-        get_counter_for_path(&self.table, path)
+    fn get_counter(&self, inode: Inode) -> Result<Option<u64>, StorageError> {
+        get_counter(&self.table, inode)
     }
 
     fn is_job_failed(&self, job_id: JobId) -> Result<bool, StorageError> {
@@ -134,20 +135,20 @@ where
 }
 
 impl<'a> DirtyReadOperations for WritableOpenDirty<'a> {
-    fn next_dirty_path(&self, start_counter: u64) -> Result<Option<(Path, u64)>, StorageError> {
-        next_dirty_path(&self.log_table, start_counter)
+    fn next_dirty(&self, start_counter: u64) -> Result<Option<(Inode, u64)>, StorageError> {
+        next_dirty(&self.log_table, start_counter)
     }
 
     fn get_last_counter(&self, start_counter: u64) -> Result<Option<u64>, StorageError> {
         get_last_counter(&self.log_table, start_counter)
     }
 
-    fn get_path_for_counter(&self, counter: u64) -> Result<Option<Path>, StorageError> {
-        get_path_for_counter(&self.log_table, counter)
+    fn get_inode_for_counter(&self, counter: u64) -> Result<Option<Inode>, StorageError> {
+        get_inode_for_counter(&self.log_table, counter)
     }
 
-    fn get_counter_for_path(&self, path: &Path) -> Result<Option<u64>, StorageError> {
-        get_counter_for_path(&self.table, path)
+    fn get_counter(&self, inode: Inode) -> Result<Option<u64>, StorageError> {
+        get_counter(&self.table, inode)
     }
 
     fn is_job_failed(&self, job_id: JobId) -> Result<bool, StorageError> {
@@ -184,8 +185,8 @@ impl<'a> WritableOpenDirty<'a> {
         job_id: JobId,
         retry_strategy: &dyn Fn(u32) -> Option<Duration>,
     ) -> Result<Option<UnixTime>, StorageError> {
-        let path = match self.log_table.get(job_id.as_u64())? {
-            Some(v) => v.value().to_string(),
+        let inode = match self.log_table.get(job_id.as_u64())? {
+            Some(v) => v.value(),
             None => {
                 return Ok(None);
             }
@@ -202,7 +203,7 @@ impl<'a> WritableOpenDirty<'a> {
             None => {
                 self.log_table.remove(counter)?;
                 self.failed_job_table.remove(counter)?;
-                self.table.remove(path.as_str())?;
+                self.table.remove(inode)?;
 
                 Ok(None)
             }
@@ -223,12 +224,6 @@ impl<'a> WritableOpenDirty<'a> {
 
     /// Mark a job as waiting for peer connection.
     pub(crate) fn mark_job_missing_peers(&mut self, job_id: JobId) -> Result<(), StorageError> {
-        let _path = match self.log_table.get(job_id.as_u64())? {
-            Some(v) => v.value().to_string(),
-            None => {
-                return Ok(());
-            }
-        };
         let counter = job_id.as_u64();
 
         // This isn't considered a failure, but keep the existing failure count.
@@ -274,11 +269,14 @@ impl<'a> WritableOpenDirty<'a> {
         loc: L,
     ) -> Result<(), StorageError> {
         if let Some(start) = tree.resolve(loc)? {
-            for inode in std::iter::once(Ok(start)).chain(tree.recurse(start, |_| true)) {
-                let inode = inode?;
-                if let Ok(path) = tree.backtrack(inode) {
-                    self.mark_dirty(path)?;
-                }
+            // Marking a directory does nothing, so let's skip marking
+            // root. The other inodes, however, might be a file, at
+            // least in some subsystems so should always be marked.
+            if start != tree.root() {
+                self.mark_dirty(start)?;
+            }
+            for inode in tree.recurse(start, |_| true) {
+                self.mark_dirty(inode?)?;
             }
         }
 
@@ -288,16 +286,12 @@ impl<'a> WritableOpenDirty<'a> {
     /// Mark a path dirty.
     ///
     /// This does nothing if the path is already dirty.
-    pub(crate) fn mark_dirty<T>(&mut self, path: T) -> Result<(), StorageError>
-    where
-        T: AsRef<Path>,
-    {
-        let path = path.as_ref();
-        log::debug!("dirty: {path}");
+    pub(crate) fn mark_dirty(&mut self, inode: Inode) -> Result<(), StorageError> {
+        log::debug!("dirty: {inode}");
         let counter = last_counter(&self.counter_table)? + 1;
         self.counter_table.insert((), counter)?;
-        self.log_table.insert(counter, path.as_str())?;
-        let prev = self.table.insert(path.as_str(), counter)?;
+        self.log_table.insert(counter, inode)?;
+        let prev = self.table.insert(inode, counter)?;
         if let Some(prev) = prev {
             let counter = prev.value();
             self.log_table.remove(counter)?;
@@ -312,26 +306,21 @@ impl<'a> WritableOpenDirty<'a> {
     }
 }
 
-fn next_dirty_path(
-    log_table: &impl ReadableTable<u64, &'static str>,
+fn next_dirty(
+    log_table: &impl ReadableTable<u64, Inode>,
     start_counter: u64,
-) -> Result<Option<(Path, u64)>, StorageError> {
+) -> Result<Option<(Inode, u64)>, StorageError> {
     for entry in log_table.range(start_counter..)? {
         let (key, value) = entry?;
         let counter = key.value();
-        let path = match Path::parse(value.value()) {
-            Ok(p) => p,
-            Err(_) => {
-                continue;
-            }
-        };
-        return Ok(Some((path, counter)));
+        let inode = value.value();
+        return Ok(Some((inode, counter)));
     }
     Ok(None)
 }
 
 fn get_last_counter(
-    log_table: &impl ReadableTable<u64, &'static str>,
+    log_table: &impl ReadableTable<u64, Inode>,
     start_counter: u64,
 ) -> Result<Option<u64>, StorageError> {
     let mut last_counter = None;
@@ -342,23 +331,22 @@ fn get_last_counter(
     Ok(last_counter)
 }
 
-fn get_path_for_counter(
-    log_table: &impl ReadableTable<u64, &'static str>,
+fn get_inode_for_counter(
+    log_table: &impl ReadableTable<u64, Inode>,
     counter: u64,
-) -> Result<Option<Path>, StorageError> {
+) -> Result<Option<Inode>, StorageError> {
     if let Some(v) = log_table.get(counter)? {
-        let path = Path::parse(v.value())?;
-        Ok(Some(path))
+        Ok(Some(v.value()))
     } else {
         Ok(None)
     }
 }
 
-fn get_counter_for_path(
-    table: &impl ReadableTable<&'static str, u64>,
-    path: &Path,
+fn get_counter(
+    table: &impl ReadableTable<Inode, u64>,
+    inode: Inode,
 ) -> Result<Option<u64>, StorageError> {
-    if let Some(entry) = table.get(path.as_str())? {
+    if let Some(entry) = table.get(inode)? {
         Ok(Some(entry.value()))
     } else {
         Ok(None)
@@ -438,14 +426,11 @@ fn last_counter(
 
 #[cfg(test)]
 mod tests {
-    use realize_types::Arena;
-
     use super::*;
-    use crate::JobId;
     use crate::arena::db::ArenaDatabase;
+    use realize_types::{Arena, Path};
     use std::collections::HashSet;
     use std::sync::Arc;
-    use std::time::Duration;
 
     struct Fixture {
         db: Arc<ArenaDatabase>,
@@ -461,19 +446,29 @@ mod tests {
         }
     }
 
-    fn all(dirty: &impl DirtyReadOperations) -> Result<Vec<(Path, u64)>, StorageError> {
+    fn all(dirty: &impl DirtyReadOperations) -> Result<Vec<(Inode, u64)>, StorageError> {
         let mut start = 0;
         let mut vec = vec![];
-        while let Some((path, counter)) = dirty.next_dirty_path(start)? {
-            vec.push((path, counter));
+        while let Some((inode, counter)) = dirty.next_dirty(start)? {
+            vec.push((inode, counter));
             start = counter + 1;
         }
 
         Ok(vec)
     }
 
-    fn all_paths(dirty: &impl DirtyReadOperations) -> Result<HashSet<Path>, StorageError> {
-        Ok(all(dirty)?.into_iter().map(|(p, _)| p).collect())
+    fn all_inodes(dirty: &impl DirtyReadOperations) -> Result<HashSet<Inode>, StorageError> {
+        Ok(all(dirty)?.into_iter().map(|(i, _)| i).collect())
+    }
+
+    fn all_paths(
+        dirty: &impl DirtyReadOperations,
+        tree: &impl TreeReadOperations,
+    ) -> Result<HashSet<Path>, StorageError> {
+        Ok(all(dirty)?
+            .into_iter()
+            .filter_map(|(inode, _)| tree.backtrack(inode).ok())
+            .collect())
     }
 
     #[test]
@@ -483,7 +478,7 @@ mod tests {
         let dirty = txn.read_dirty()?;
 
         // just make sure it doesn't fail
-        dirty.next_dirty_path(0)?;
+        dirty.next_dirty(0)?;
 
         Ok(())
     }
@@ -495,7 +490,7 @@ mod tests {
         let dirty = txn.read_dirty()?;
 
         // just make sure it doesn't fail
-        dirty.next_dirty_path(0)?;
+        dirty.next_dirty(0)?;
 
         Ok(())
     }
@@ -506,7 +501,7 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut dirty = txn.write_dirty()?;
 
-        dirty.mark_dirty(&Path::parse("foo")?)?;
+        dirty.mark_dirty(Inode(1))?;
 
         Ok(())
     }
@@ -515,18 +510,15 @@ mod tests {
     fn mark() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
-        let path1 = Path::parse("path1")?;
-        let path2 = Path::parse("path2")?;
+        let mut tree = txn.write_tree()?;
+        let path1 = tree.setup(Path::parse("path1")?)?;
+        let path2 = tree.setup(Path::parse("path2")?)?;
 
-        {
-            let mut dirty = txn.write_dirty()?;
-            dirty.mark_dirty(&path1)?;
-            dirty.mark_dirty(&path2)?;
+        let mut dirty = txn.write_dirty()?;
+        dirty.mark_dirty(path1)?;
+        dirty.mark_dirty(path2)?;
 
-            assert_eq!(vec![(path1.clone(), 1), (path2.clone(), 2)], all(&dirty)?);
-        }
-
-        txn.commit()?;
+        assert_eq!(vec![(path1, 1), (path2, 2)], all(&dirty)?);
 
         Ok(())
     }
@@ -535,21 +527,18 @@ mod tests {
     fn increase_counter() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
-        let path1 = Path::parse("path1")?;
-        let path2 = Path::parse("path2")?;
+        let mut dirty = txn.write_dirty()?;
+        let mut tree = txn.write_tree()?;
+        let path1 = tree.setup(Path::parse("path1")?)?;
+        let path2 = tree.setup(Path::parse("path2")?)?;
 
-        {
-            let mut dirty = txn.write_dirty()?;
-            dirty.mark_dirty(&path1)?;
-            dirty.mark_dirty(&path2)?;
-            dirty.mark_dirty(&path1)?;
-            dirty.mark_dirty(&path1)?;
+        dirty.mark_dirty(path1)?;
+        dirty.mark_dirty(path2)?;
+        dirty.mark_dirty(path1)?;
+        dirty.mark_dirty(path1)?;
 
-            // return path2 first, because its counter is lower
-            assert_eq!(vec![(path2.clone(), 2), (path1.clone(), 4)], all(&dirty)?);
-        }
-
-        txn.commit()?;
+        // return path2 first, because its counter is lower
+        assert_eq!(vec![(path2, 2), (path1, 4)], all(&dirty)?);
 
         Ok(())
     }
@@ -557,55 +546,28 @@ mod tests {
     #[test]
     fn test_mark_job_done() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let path = Path::parse("test/path.txt")?;
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut dirty = txn.write_dirty()?;
+        let path = tree.setup(Path::parse("test/path.txt")?)?;
         let job_id = JobId::from(1);
 
         // Mark path as dirty first
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.mark_dirty(&path)?;
-            }
-            txn.commit()?;
-        }
+        dirty.mark_dirty(path)?;
 
         // Verify it's dirty
-        {
-            let txn = fixture.db.begin_read()?;
-            assert_eq!(
-                HashSet::from([path.clone()]),
-                all_paths(&txn.read_dirty()?)?
-            );
-        }
+        assert_eq!(HashSet::from([path]), all_inodes(&dirty)?);
 
         // Mark job as done
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                let was_dirty = dirty.mark_job_done(job_id)?;
-                assert!(was_dirty);
-            }
-            txn.commit()?;
-        }
+        let was_dirty = dirty.mark_job_done(job_id)?;
+        assert!(was_dirty);
 
         // Verify path is no longer dirty
-        {
-            let txn = fixture.db.begin_read()?;
-            assert_eq!(HashSet::new(), all_paths(&txn.read_dirty()?)?);
-        }
+        assert_eq!(HashSet::new(), all_inodes(&dirty)?);
 
         // Mark job as done again (should return false)
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                let was_dirty = dirty.mark_job_done(job_id)?;
-                assert!(!was_dirty);
-            }
-            txn.commit()?;
-        }
+        let was_dirty = dirty.mark_job_done(job_id)?;
+        assert!(!was_dirty);
 
         Ok(())
     }
@@ -613,44 +575,28 @@ mod tests {
     #[test]
     fn test_mark_job_failed() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let path = Path::parse("test/path.txt")?;
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut dirty = txn.write_dirty()?;
+        let path = tree.setup(Path::parse("test/path.txt")?)?;
         let job_id = JobId::from(1);
 
         // Mark path as dirty first
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.mark_dirty(&path)?;
-            }
-            txn.commit()?;
-        }
+        dirty.mark_dirty(path)?;
 
         // Mark job as failed with retry strategy
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                let retry_strategy = |attempt: u32| {
-                    if attempt < 3 {
-                        Some(Duration::from_secs(attempt as u64 * 10))
-                    } else {
-                        None
-                    }
-                };
-
-                let retry_after = dirty.mark_job_failed(job_id, &retry_strategy)?;
-                assert!(retry_after.is_some());
+        let retry_strategy = |attempt: u32| {
+            if attempt < 3 {
+                Some(Duration::from_secs(attempt as u64 * 10))
+            } else {
+                None
             }
-            txn.commit()?;
-        }
+        };
+        let retry_after = dirty.mark_job_failed(job_id, &retry_strategy)?;
+        assert!(retry_after.is_some());
 
         // Verify job is marked as failed
-        {
-            let txn = fixture.db.begin_read()?;
-            let dirty = txn.read_dirty()?;
-            assert!(dirty.is_job_failed(job_id)?);
-        }
+        assert!(dirty.is_job_failed(job_id)?);
 
         Ok(())
     }
@@ -658,32 +604,19 @@ mod tests {
     #[test]
     fn test_mark_job_missing_peers() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let path = Path::parse("test/path.txt")?;
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut dirty = txn.write_dirty()?;
+        let path = tree.setup(Path::parse("test/path.txt")?)?;
         let job_id = JobId::from(1);
 
         // First mark a path as dirty to create the job entry
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.mark_dirty(&path)?;
-            }
-            txn.commit()?;
-        }
+        dirty.mark_dirty(path)?;
 
         // Mark job as missing peers
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.mark_job_missing_peers(job_id)?;
-            }
-            txn.commit()?;
-        }
+        dirty.mark_job_missing_peers(job_id)?;
 
         // Verify job is waiting for peers
-        let txn = fixture.db.begin_read()?;
-        let dirty = txn.read_dirty()?;
         let waiting_jobs = dirty.get_jobs_waiting_for_peers()?;
         assert_eq!(waiting_jobs, vec![1]);
 
@@ -693,35 +626,29 @@ mod tests {
     #[test]
     fn test_next_dirty_path() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let path1 = Path::parse("path1.txt")?;
-        let path2 = Path::parse("path2.txt")?;
+        let txn = fixture.db.begin_write()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut tree = txn.write_tree()?;
+        let path1 = tree.setup(Path::parse("path1.txt")?)?;
+        let path2 = tree.setup(Path::parse("path2.txt")?)?;
 
         // Mark multiple paths as dirty
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.mark_dirty(&path1)?;
-                dirty.mark_dirty(&path2)?;
-            }
-            txn.commit()?;
-        }
+        dirty.mark_dirty(path1)?;
+        dirty.mark_dirty(path2)?;
 
         // Get next dirty path starting from counter 0
-        let txn = fixture.db.begin_read()?;
-        let dirty = txn.read_dirty()?;
         let mut start_counter = 0;
-        let result = dirty.next_dirty_path(start_counter)?;
+        let result = dirty.next_dirty(start_counter)?;
         assert_eq!(result, Some((path1.clone(), 1)));
         start_counter = 2; // Start from counter 2 to get the next entry
 
         // Get next dirty path
-        let result = dirty.next_dirty_path(start_counter)?;
+        let result = dirty.next_dirty(start_counter)?;
         assert_eq!(result, Some((path2.clone(), 2)));
         start_counter = 3; // Start from counter 3 to get the next entry
 
         // No more dirty paths
-        let result = dirty.next_dirty_path(start_counter)?;
+        let result = dirty.next_dirty(start_counter)?;
         assert_eq!(result, None);
 
         Ok(())
@@ -730,55 +657,43 @@ mod tests {
     #[test]
     fn test_get_path_for_counter() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let path = Path::parse("test/path.txt")?;
+        let txn = fixture.db.begin_write()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut tree = txn.write_tree()?;
+
+        let path = tree.setup(Path::parse("test/path.txt")?)?;
 
         // Mark path as dirty
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.mark_dirty(&path)?;
-            }
-            txn.commit()?;
-        }
+        dirty.mark_dirty(path)?;
 
         // Get path for counter 1
-        let txn = fixture.db.begin_read()?;
-        let dirty = txn.read_dirty()?;
-        let result = dirty.get_path_for_counter(1)?;
+        let result = dirty.get_inode_for_counter(1)?;
         assert_eq!(result, Some(path.clone()));
 
         // Get path for non-existent counter
-        let result = dirty.get_path_for_counter(999)?;
+        let result = dirty.get_inode_for_counter(999)?;
         assert_eq!(result, None);
 
         Ok(())
     }
 
     #[test]
-    fn test_get_counter_for_path() -> anyhow::Result<()> {
+    fn test_get_counter() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let path = Path::parse("test/path.txt")?;
+        let txn = fixture.db.begin_write()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut tree = txn.write_tree()?;
+        let path = tree.setup(Path::parse("test/path.txt")?)?;
 
         // Mark path as dirty
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.mark_dirty(&path)?;
-            }
-            txn.commit()?;
-        }
+        dirty.mark_dirty(path)?;
 
         // Get counter for path
-        let txn = fixture.db.begin_read()?;
-        let dirty = txn.read_dirty()?;
-        let result = dirty.get_counter_for_path(&path)?;
+        let result = dirty.get_counter(path)?;
         assert_eq!(result, Some(1));
 
         // Get counter for non-existent path
-        let non_existent_path = Path::parse("non/existent.txt")?;
-        let result = dirty.get_counter_for_path(&non_existent_path)?;
+        let result = dirty.get_counter(Inode(999))?;
         assert_eq!(result, None);
 
         Ok(())
@@ -787,40 +702,23 @@ mod tests {
     #[test]
     fn test_is_job_failed() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let path = Path::parse("test/path.txt")?;
+        let txn = fixture.db.begin_write()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut tree = txn.write_tree()?;
+        let path = tree.setup(Path::parse("test/path.txt")?)?;
         let job_id = JobId::from(1);
 
         // First mark a path as dirty to create the job entry
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.mark_dirty(&path)?;
-            }
-            txn.commit()?;
-        }
+        dirty.mark_dirty(path)?;
 
         // Job should not be failed initially
-        {
-            let txn = fixture.db.begin_read()?;
-            let dirty = txn.read_dirty()?;
-            assert!(!dirty.is_job_failed(job_id)?);
-        }
+        assert!(!dirty.is_job_failed(job_id)?);
 
         // Mark job as failed
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                let retry_strategy = |_| Some(Duration::from_secs(10));
-                dirty.mark_job_failed(job_id, &retry_strategy)?;
-            }
-            txn.commit()?;
-        }
+        let retry_strategy = |_| Some(Duration::from_secs(10));
+        dirty.mark_job_failed(job_id, &retry_strategy)?;
 
         // Job should now be failed
-        let txn = fixture.db.begin_read()?;
-        let dirty = txn.read_dirty()?;
         assert!(dirty.is_job_failed(job_id)?);
 
         Ok(())
@@ -829,44 +727,31 @@ mod tests {
     #[test]
     fn test_get_earliest_backoff() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let path1 = Path::parse("path1.txt")?;
-        let path2 = Path::parse("path2.txt")?;
+        let txn = fixture.db.begin_write()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut tree = txn.write_tree()?;
+        let path1 = tree.setup(Path::parse("path1.txt")?)?;
+        let path2 = tree.setup(Path::parse("path2.txt")?)?;
         let job_id1 = JobId::from(1);
         let job_id2 = JobId::from(2);
 
         // First mark paths as dirty to create the job entries
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.mark_dirty(&path1)?;
-                dirty.mark_dirty(&path2)?;
-            }
-            txn.commit()?;
-        }
+        dirty.mark_dirty(path1)?;
+        dirty.mark_dirty(path2)?;
 
         // Mark jobs as failed with different retry times
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                let retry_strategy = |attempt: u32| {
-                    if attempt < 3 {
-                        Some(Duration::from_secs(attempt as u64 * 10))
-                    } else {
-                        None
-                    }
-                };
-
-                dirty.mark_job_failed(job_id1, &retry_strategy)?;
-                dirty.mark_job_failed(job_id2, &retry_strategy)?;
+        let retry_strategy = |attempt: u32| {
+            if attempt < 3 {
+                Some(Duration::from_secs(attempt as u64 * 10))
+            } else {
+                None
             }
-            txn.commit()?;
-        }
+        };
+
+        dirty.mark_job_failed(job_id1, &retry_strategy)?;
+        dirty.mark_job_failed(job_id2, &retry_strategy)?;
 
         // Get earliest backoff time
-        let txn = fixture.db.begin_read()?;
-        let dirty = txn.read_dirty()?;
         let result = dirty.get_earliest_backoff(None)?;
         assert!(result.is_some());
         let (earliest_time, job_ids) = result.unwrap();
@@ -879,36 +764,23 @@ mod tests {
     #[test]
     fn test_get_jobs_waiting_for_peers() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let path1 = Path::parse("path1.txt")?;
-        let path2 = Path::parse("path2.txt")?;
+        let txn = fixture.db.begin_write()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut tree = txn.write_tree()?;
+        let path1 = tree.setup(Path::parse("path1.txt")?)?;
+        let path2 = tree.setup(Path::parse("path2.txt")?)?;
         let job_id1 = JobId::from(1);
         let job_id2 = JobId::from(2);
 
         // First mark paths as dirty to create the job entries
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.mark_dirty(&path1)?;
-                dirty.mark_dirty(&path2)?;
-            }
-            txn.commit()?;
-        }
+        dirty.mark_dirty(path1)?;
+        dirty.mark_dirty(path2)?;
 
         // Mark jobs as waiting for peers
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.mark_job_missing_peers(job_id1)?;
-                dirty.mark_job_missing_peers(job_id2)?;
-            }
-            txn.commit()?;
-        }
+        dirty.mark_job_missing_peers(job_id1)?;
+        dirty.mark_job_missing_peers(job_id2)?;
 
         // Get jobs waiting for peers
-        let txn = fixture.db.begin_read()?;
-        let dirty = txn.read_dirty()?;
         let waiting_jobs = dirty.get_jobs_waiting_for_peers()?;
         assert_eq!(waiting_jobs, vec![1, 2]);
 
@@ -918,20 +790,21 @@ mod tests {
     #[test]
     fn test_delete_range() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let path1 = Path::parse("path1.txt")?;
-        let path2 = Path::parse("path2.txt")?;
-        let path3 = Path::parse("path3.txt")?;
         let txn = fixture.db.begin_write()?;
         let mut dirty = txn.write_dirty()?;
-        dirty.mark_dirty(&path1)?;
-        dirty.mark_dirty(&path2)?;
-        dirty.mark_dirty(&path3)?;
+        let mut tree = txn.write_tree()?;
+        let path1 = tree.setup(Path::parse("path1.txt")?)?;
+        let path2 = tree.setup(Path::parse("path2.txt")?)?;
+        let path3 = tree.setup(Path::parse("path3.txt")?)?;
+        dirty.mark_dirty(path1)?;
+        dirty.mark_dirty(path2)?;
+        dirty.mark_dirty(path3)?;
 
         dirty.delete_range(1, 3)?;
 
-        // path 1 and to should have been deleted (counters 1 and 2),
-        // but not 3, as range end is exclusive.
-        assert_eq!(HashSet::from([path3.clone()]), all_paths(&dirty)?);
+        // path 1 and 2 should have been deleted but not 3, as range
+        // end is exclusive.
+        assert_eq!(HashSet::from([path3]), all_inodes(&dirty)?);
 
         Ok(())
     }
@@ -939,31 +812,21 @@ mod tests {
     #[test]
     fn test_get_last_counter() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let path1 = Path::parse("path1.txt")?;
-        let path2 = Path::parse("path2.txt")?;
+        let txn = fixture.db.begin_write()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut tree = txn.write_tree()?;
+        let path1 = tree.setup(Path::parse("path1.txt")?)?;
+        let path2 = tree.setup(Path::parse("path2.txt")?)?;
 
         // Initially no counters
-        {
-            let txn = fixture.db.begin_read()?;
-            let dirty = txn.read_dirty()?;
-            let last = dirty.get_last_counter(0)?;
-            assert_eq!(last, None);
-        }
+        let last = dirty.get_last_counter(0)?;
+        assert_eq!(last, None);
 
         // Mark paths as dirty
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut dirty = txn.write_dirty()?;
-                dirty.mark_dirty(&path1)?;
-                dirty.mark_dirty(&path2)?;
-            }
-            txn.commit()?;
-        }
+        dirty.mark_dirty(path1)?;
+        dirty.mark_dirty(path2)?;
 
         // Get last counter
-        let txn = fixture.db.begin_read()?;
-        let dirty = txn.read_dirty()?;
         let last = dirty.get_last_counter(0)?;
         assert_eq!(last, Some(2));
 
@@ -973,12 +836,14 @@ mod tests {
     #[test]
     fn test_job_lifecycle() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let path = Path::parse("test/path.txt")?;
-        let job_id = JobId::from(1);
         let txn = fixture.db.begin_write()?;
         let mut dirty = txn.write_dirty()?;
-        dirty.mark_dirty(&path)?;
-        let counter = dirty.get_counter_for_path(&path)?;
+        let mut tree = txn.write_tree()?;
+        let path = tree.setup(Path::parse("test/path.txt")?)?;
+        let job_id = JobId::from(1);
+
+        dirty.mark_dirty(path)?;
+        let counter = dirty.get_counter(path)?;
         assert_eq!(counter, Some(1));
 
         let retry_strategy = |_| Some(Duration::from_secs(10));
@@ -987,7 +852,7 @@ mod tests {
 
         let was_dirty = dirty.mark_job_done(job_id)?;
         assert!(was_dirty);
-        assert_eq!(HashSet::new(), all_paths(&dirty)?);
+        assert_eq!(HashSet::new(), all_inodes(&dirty)?);
         assert!(!dirty.is_job_failed(job_id)?);
 
         Ok(())
@@ -998,16 +863,17 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut dirty = txn.write_dirty()?;
-        let path1 = Path::parse("test/path1.txt")?;
-        let path2 = Path::parse("test/path2.txt")?;
+        let mut tree = txn.write_tree()?;
+        let path1 = tree.setup(Path::parse("test/path1.txt")?)?;
+        let path2 = tree.setup(Path::parse("test/path2.txt")?)?;
         let job_id1 = JobId::from(1);
         let job_id2 = JobId::from(2);
 
-        dirty.mark_dirty(&path1)?;
-        dirty.mark_dirty(&path2)?;
+        dirty.mark_dirty(path1)?;
+        dirty.mark_dirty(path2)?;
 
-        let counter1 = dirty.get_counter_for_path(&path1)?;
-        let counter2 = dirty.get_counter_for_path(&path2)?;
+        let counter1 = dirty.get_counter(path1)?;
+        let counter2 = dirty.get_counter(path2)?;
         assert_eq!(counter1, Some(job_id1.as_u64()));
         assert_eq!(counter2, Some(job_id2.as_u64()));
 
@@ -1044,13 +910,14 @@ mod tests {
                     Path::parse("foo/bar/qux")?,
                     Path::parse("foo/bar/qux/quux")?,
                 ]),
-                all_paths(&dirty)?
+                all_paths(&dirty, &tree)?
             );
             // foo and waldo are not dirty
         }
 
         Ok(())
     }
+
     #[test]
     fn mark_dirty_recursive_root() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
@@ -1068,7 +935,7 @@ mod tests {
                     Path::parse("foo/bar")?,
                     Path::parse("baz")?
                 ]),
-                all_paths(&dirty)?
+                all_paths(&dirty, &tree)?
             );
         }
 

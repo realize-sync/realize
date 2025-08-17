@@ -84,13 +84,10 @@ impl ArenaStorage {
                 })
             }
         };
-        let arena_root = arena_cache.arena_root();
         let engine = Engine::new(
             arena,
             Arc::clone(&db),
-            indexed.as_ref().map(|indexed| indexed.index.blocking()),
             arena_cache.clone(),
-            arena_root,
             job_retry_strategy,
         );
 
