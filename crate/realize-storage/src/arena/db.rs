@@ -14,6 +14,7 @@ use crate::{Inode, InodeAllocator};
 use realize_types::Arena;
 use redb::{ReadOnlyTable, Table, TableDefinition};
 use std::cell::RefCell;
+use std::panic::Location;
 use std::sync::Arc;
 
 /// Local file history.
@@ -354,17 +355,23 @@ impl<'db> ArenaWriteTransaction<'db> {
         Ok(self.inner.open_table(BLOB_LRU_QUEUE_TABLE)?)
     }
 
+    #[track_caller]
     pub(crate) fn read_tree(&self) -> Result<impl TreeReadOperations, StorageError> {
         Ok(ReadableOpenTree::new(
-            self.inner.open_table(TREE_TABLE)?,
+            self.inner
+                .open_table(TREE_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
             &self.subsystems.tree,
         ))
     }
 
+    #[track_caller]
     pub(crate) fn write_tree(&self) -> Result<WritableOpenTree<'_>, StorageError> {
         Ok(WritableOpenTree::new(
             &self.before_commit,
-            self.inner.open_table(TREE_TABLE)?,
+            self.inner
+                .open_table(TREE_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
             self.inner.open_table(TREE_REFCOUNT_TABLE)?,
             self.inner.open_table(CURRENT_INODE_RANGE_TABLE)?,
             &self.subsystems.tree,
@@ -372,57 +379,89 @@ impl<'db> ArenaWriteTransaction<'db> {
     }
 
     #[allow(dead_code)]
+    #[track_caller]
     pub(crate) fn read_dirty(&self) -> Result<impl DirtyReadOperations, StorageError> {
         Ok(ReadableOpenDirty::new(
-            self.inner.open_table(DIRTY_TABLE)?,
+            self.inner
+                .open_table(DIRTY_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
             self.inner.open_table(DIRTY_LOG_TABLE)?,
             self.inner.open_table(FAILED_JOB_TABLE)?,
         ))
     }
 
+    #[track_caller]
     pub(crate) fn write_dirty(&self) -> Result<WritableOpenDirty<'_>, StorageError> {
         Ok(WritableOpenDirty::new(
             &self.after_commit,
             &self.subsystems.dirty,
-            self.inner.open_table(DIRTY_TABLE)?,
+            self.inner
+                .open_table(DIRTY_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
             self.inner.open_table(DIRTY_LOG_TABLE)?,
             self.inner.open_table(FAILED_JOB_TABLE)?,
             self.inner.open_table(DIRTY_COUNTER_TABLE)?,
         ))
     }
     #[allow(dead_code)]
+    #[track_caller]
     pub(crate) fn read_history(&self) -> Result<impl HistoryReadOperations, StorageError> {
         Ok(ReadableOpenHistory::new(
-            self.inner.open_table(HISTORY_TABLE)?,
+            self.inner
+                .open_table(HISTORY_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
         ))
     }
 
+    #[track_caller]
     pub(crate) fn write_history(&self) -> Result<WritableOpenHistory<'_>, StorageError> {
         Ok(WritableOpenHistory::new(
             &self.after_commit,
             &self.subsystems.history,
-            self.inner.open_table(HISTORY_TABLE)?,
+            self.inner
+                .open_table(HISTORY_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
         ))
     }
 
     #[allow(dead_code)]
+    #[track_caller]
     pub(crate) fn read_marks(&self) -> Result<impl MarkReadOperations, StorageError> {
-        Ok(ReadableOpenMark::new(self.inner.open_table(MARK_TABLE)?))
+        Ok(ReadableOpenMark::new(
+            self.inner
+                .open_table(MARK_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
+        ))
     }
 
     #[allow(dead_code)]
+    #[track_caller]
     pub(crate) fn write_marks(&self) -> Result<WritableOpenMark<'_>, StorageError> {
-        Ok(WritableOpenMark::new(self.inner.open_table(MARK_TABLE)?))
+        Ok(WritableOpenMark::new(
+            self.inner
+                .open_table(MARK_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
+        ))
     }
 
     #[allow(dead_code)]
+    #[track_caller]
     pub(crate) fn read_index(&self) -> Result<impl IndexReadOperations, StorageError> {
-        Ok(ReadableOpenIndex::new(self.inner.open_table(INDEX_TABLE)?))
+        Ok(ReadableOpenIndex::new(
+            self.inner
+                .open_table(INDEX_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
+        ))
     }
 
     #[allow(dead_code)]
+    #[track_caller]
     pub(crate) fn write_index(&self) -> Result<WritableOpenIndex<'_>, StorageError> {
-        Ok(WritableOpenIndex::new(self.inner.open_table(INDEX_TABLE)?))
+        Ok(WritableOpenIndex::new(
+            self.inner
+                .open_table(INDEX_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
+        ))
     }
 }
 
@@ -462,37 +501,55 @@ impl<'db> ArenaReadTransaction<'db> {
     }
 
     #[allow(dead_code)]
-
+    #[track_caller]
     pub(crate) fn read_tree(&self) -> Result<impl TreeReadOperations, StorageError> {
         Ok(ReadableOpenTree::new(
-            self.inner.open_table(TREE_TABLE)?,
+            self.inner
+                .open_table(TREE_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
             &self.subsystems.tree,
         ))
     }
 
+    #[track_caller]
     pub(crate) fn read_dirty(&self) -> Result<impl DirtyReadOperations, StorageError> {
         Ok(ReadableOpenDirty::new(
-            self.inner.open_table(DIRTY_TABLE)?,
+            self.inner
+                .open_table(DIRTY_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
             self.inner.open_table(DIRTY_LOG_TABLE)?,
             self.inner.open_table(FAILED_JOB_TABLE)?,
         ))
     }
 
     #[allow(dead_code)]
+    #[track_caller]
     pub(crate) fn read_history(&self) -> Result<impl HistoryReadOperations, StorageError> {
         Ok(ReadableOpenHistory::new(
-            self.inner.open_table(HISTORY_TABLE)?,
+            self.inner
+                .open_table(HISTORY_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
         ))
     }
 
     #[allow(dead_code)]
+    #[track_caller]
     pub(crate) fn read_marks(&self) -> Result<impl MarkReadOperations, StorageError> {
-        Ok(ReadableOpenMark::new(self.inner.open_table(MARK_TABLE)?))
+        Ok(ReadableOpenMark::new(
+            self.inner
+                .open_table(MARK_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
+        ))
     }
 
     #[allow(dead_code)]
+    #[track_caller]
     pub(crate) fn read_index(&self) -> Result<impl IndexReadOperations, StorageError> {
-        Ok(ReadableOpenIndex::new(self.inner.open_table(INDEX_TABLE)?))
+        Ok(ReadableOpenIndex::new(
+            self.inner
+                .open_table(INDEX_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
+        ))
     }
 }
 

@@ -1,5 +1,7 @@
 use crate::utils::holder::ByteConversionError;
 use realize_types::{self, Arena};
+use redb::TableError;
+use std::panic::Location;
 use tokio::task::JoinError;
 
 /// Error returned types in this crate.
@@ -10,6 +12,9 @@ use tokio::task::JoinError;
 pub enum StorageError {
     #[error("redb error {0}")]
     Database(Box<redb::Error>), // a box to keep size in check
+
+    #[error("{0}, from {1}")]
+    OpenTable(redb::TableError, &'static Location<'static>),
 
     #[error("I/O error {0}")]
     Io(#[from] std::io::Error),
@@ -46,6 +51,14 @@ pub enum StorageError {
 }
 
 impl StorageError {
+    /// Create an error with location.
+    pub(crate) fn open_table(
+        err: TableError,
+        location: &'static Location<'static>,
+    ) -> StorageError {
+        StorageError::OpenTable(err, location)
+    }
+
     fn from_redb(err: redb::Error) -> StorageError {
         if let redb::Error::Io(_) = &err {
             match err {
