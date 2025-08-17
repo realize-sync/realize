@@ -4,7 +4,7 @@ use config::StorageConfig;
 use futures::Stream;
 use global::db::GlobalDatabase;
 use global::inode_allocator::InodeAllocator;
-use realize_types::{self, Arena, ByteRange, Delta, Hash, Path, Peer, Signature};
+use realize_types::{self, Arena, ByteRange, Delta, Path, Peer, Signature};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -176,28 +176,6 @@ impl Storage {
         indexed_store::rsync(&indexed.index, &indexed.root, path, range, sig).await
     }
 
-    /// Move a file from the cache to the filesystem.
-    ///
-    /// The file must have been fully downloaded and verified or the
-    /// move will fail.
-    ///
-    /// Gives up and returns false if the current versions in the cache
-    /// don't match `cache_hash` and `index_hash`.
-    ///
-    /// A `index_hash` value of `None` means that the file must not
-    /// exit. If it exists, realize gives up and returns false.
-    pub async fn realize(
-        &self,
-        arena: Arena,
-        path: &realize_types::Path,
-        cache_hash: &Hash,
-        index_hash: Option<&Hash>,
-    ) -> Result<bool, StorageError> {
-        self.arena_storage(arena)?
-            .realize(path, cache_hash, index_hash)
-            .await
-    }
-
     /// Return an infinite stream of jobs.
     ///
     /// Return a stream that looks at the dirty paths on the database
@@ -270,7 +248,7 @@ impl Storage {
         arena: Arena,
         path: &Path,
     ) -> Result<Option<(JobId, Job)>, StorageError> {
-        match self.engine(arena)?.job_for_path(path).await? {
+        match self.engine(arena)?.job_for_loc(path).await? {
             None => Ok(None),
             Some((id, job)) => Ok(job.into_external().map(|j| (id, j))),
         }

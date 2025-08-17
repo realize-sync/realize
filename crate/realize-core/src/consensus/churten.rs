@@ -275,19 +275,6 @@ impl JobHandler for JobHandlerImpl {
                 )
                 .await
             }
-            Job::Realize(path, hash, index_hash) => {
-                jobs::realize(
-                    &self.storage,
-                    &self.household,
-                    arena,
-                    path,
-                    hash,
-                    index_hash.as_ref(),
-                    progress,
-                    shutdown,
-                )
-                .await
-            }
         }
     }
 }

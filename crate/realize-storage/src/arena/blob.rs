@@ -210,6 +210,10 @@ impl Blobstore {
                 log::debug!("{inode} content verified to be {hash}");
 
                 blob_table.insert(inode, Holder::with_content(blob_entry)?)?;
+
+                // dirty because the file state changed and needs to
+                // be check again.
+                txn.write_dirty()?.mark_dirty(inode)?;
             }
         }
         txn.commit()?;

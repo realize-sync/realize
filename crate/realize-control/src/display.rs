@@ -323,7 +323,6 @@ fn prefix_for_job(job: &JobInfo) -> &'static str {
         Some(JobAction::Download) => "Download",
         Some(JobAction::Verify) => "Verify",
         Some(JobAction::Repair) => "Repair",
-        Some(JobAction::Move) => "Move",
         None => in_progress_job_name(job),
     }
 }
@@ -331,14 +330,12 @@ fn prefix_for_job(job: &JobInfo) -> &'static str {
 fn in_progress_job_name(job: &JobInfo) -> &'static str {
     match *job.job {
         Job::Download(_, _) => "Download",
-        Job::Realize(_, _, _) => "Realize",
     }
 }
 
 fn finished_job_name(job: &JobInfo) -> &'static str {
     match *job.job {
         Job::Download(_, _) => "Downloaded",
-        Job::Realize(_, _, _) => "Realized",
     }
 }
 

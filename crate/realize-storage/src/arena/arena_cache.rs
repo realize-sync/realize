@@ -80,10 +80,6 @@ impl ArenaCache {
         self.arena
     }
 
-    pub(crate) fn arena_root(&self) -> Inode {
-        self.arena_root
-    }
-
     pub(crate) fn as_index(self: &Arc<Self>) -> Arc<dyn RealIndex> {
         self.clone()
     }
@@ -783,36 +779,6 @@ impl RealIndex for ArenaCache {
         index.get(&tree, path)
     }
 
-    fn get_indexed_file_txn(
-        &self,
-        txn: &ArenaWriteTransaction,
-        root: &std::path::Path,
-        path: &realize_types::Path,
-        hash: Option<&Hash>,
-    ) -> Result<Option<std::path::PathBuf>, StorageError> {
-        let index = txn.read_index()?;
-        let tree = txn.read_tree()?;
-        let entry = index.get(&tree, path)?;
-        let file_path = path.within(root);
-        match hash {
-            Some(hash) => {
-                if let Some(entry) = entry
-                    && entry.hash == *hash
-                    && entry.matches_file(&file_path)
-                {
-                    return Ok(Some(file_path));
-                }
-            }
-            None => {
-                if entry.is_none() && fs_utils::metadata_no_symlink_blocking(root, path).is_err() {
-                    return Ok(Some(file_path));
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
     fn has_file(&self, path: &realize_types::Path) -> Result<bool, StorageError> {
         let txn = self.db.begin_read()?;
         let index = txn.read_index()?;
@@ -1384,7 +1350,7 @@ mod tests {
 
         fixture.add_to_cache(&file_path, 100, mtime)?;
 
-        let (inode, assignment) = acache.lookup(acache.arena_root(), "a")?;
+        let (inode, assignment) = acache.lookup(acache.arena_root, "a")?;
         assert_eq!(assignment, InodeAssignment::Directory, "a");
 
         let (_, assignment) = acache.lookup(inode, "b")?;
@@ -1402,14 +1368,14 @@ mod tests {
 
         fixture.add_to_cache(&file_path, 100, mtime)?;
 
-        let (a, _) = acache.lookup(acache.arena_root(), "a")?;
+        let (a, _) = acache.lookup(acache.arena_root, "a")?;
         let (b, _) = acache.lookup(a, "b")?;
         let (c, _) = acache.lookup(b, "c.txt")?;
 
         {
             let txn = fixture.db.begin_read()?;
             let tree = txn.read_tree()?;
-            assert_eq!(acache.arena_root(), tree.root());
+            assert_eq!(acache.arena_root, tree.root());
             assert!(tree.inode_exists(a)?);
             assert!(tree.inode_exists(b)?);
             assert!(tree.inode_exists(c)?);
@@ -1655,7 +1621,7 @@ mod tests {
         let mtime = test_time();
 
         fixture.add_to_cache(&file_path, 100, mtime)?;
-        let arena_root = acache.arena_root();
+        let arena_root = acache.arena_root;
         acache.lookup(arena_root, "file.txt")?;
         fixture.remove_from_cache(&file_path)?;
         assert!(matches!(
@@ -1674,7 +1640,7 @@ mod tests {
         let mtime = test_time();
 
         fixture.add_to_cache(&file_path, 100, mtime)?;
-        let arena_root = acache.arena_root();
+        let arena_root = acache.arena_root;
         let (inode, _) = acache.lookup(arena_root, "file.txt")?;
 
         fixture.clear_dirty()?;
@@ -1692,7 +1658,7 @@ mod tests {
         let mtime = test_time();
 
         fixture.add_to_cache(&file_path, 100, mtime)?;
-        let arena_root = fixture.acache.arena_root();
+        let arena_root = fixture.acache.arena_root;
         let dir_mtime = fixture.acache.dir_mtime(arena_root)?;
         fixture.remove_from_cache(&file_path)?;
 
@@ -1740,7 +1706,7 @@ mod tests {
         fixture.add_to_cache(&file_path, 100, mtime)?;
 
         // Lookup directory
-        let (inode, assignment) = acache.lookup(acache.arena_root(), "a")?;
+        let (inode, assignment) = acache.lookup(acache.arena_root, "a")?;
         assert_eq!(assignment, InodeAssignment::Directory);
 
         // Lookup file
@@ -1760,7 +1726,7 @@ mod tests {
         let acache = &fixture.acache;
 
         assert!(matches!(
-            acache.lookup(acache.arena_root(), "nonexistent"),
+            acache.lookup(acache.arena_root, "nonexistent"),
             Err(StorageError::NotFound),
         ));
 
@@ -1796,7 +1762,7 @@ mod tests {
         fixture.add_to_cache(&Path::parse("dir/file2.txt")?, 200, mtime)?;
         fixture.add_to_cache(&Path::parse("dir/subdir/file3.txt")?, 300, mtime)?;
 
-        let arena_root = acache.arena_root();
+        let arena_root = acache.arena_root;
         assert_unordered::assert_eq_unordered!(
             vec![("dir".to_string(), InodeAssignment::Directory),],
             acache
@@ -1926,7 +1892,7 @@ mod tests {
             },
             None,
         )?;
-        let (inode, _) = acache.lookup(acache.arena_root(), "file.txt")?;
+        let (inode, _) = acache.lookup(acache.arena_root, "file.txt")?;
         let avail = acache.file_availability(inode)?;
         assert_eq!(arena, avail.arena);
         assert_eq!(path, avail.path);

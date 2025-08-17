@@ -121,18 +121,6 @@ pub(crate) fn fill_job_info(source: &JobInfo, mut dest: control_capnp::job_info:
 fn fill_job(job: &Arc<Job>, mut builder: control_capnp::job::Builder<'_>) {
     builder.set_path(job.path().as_str());
     builder.set_hash(&job.hash().0);
-
-    match &**job {
-        realize_storage::Job::Download(_, _) => {
-            builder.init_download();
-        }
-        realize_storage::Job::Realize(_, _, index_hash) => {
-            let mut realize = builder.init_realize();
-            if let Some(h) = index_hash {
-                realize.set_index_hash(&h.0);
-            }
-        }
-    }
 }
 
 fn fill_progress(
@@ -170,7 +158,6 @@ fn to_capnp_action(action: Option<&JobAction>) -> control_capnp::JobAction {
         Some(JobAction::Download) => control_capnp::JobAction::Download,
         Some(JobAction::Verify) => control_capnp::JobAction::Verify,
         Some(JobAction::Repair) => control_capnp::JobAction::Repair,
-        Some(JobAction::Move) => control_capnp::JobAction::Move,
         None => control_capnp::JobAction::None,
     }
 }
@@ -212,21 +199,7 @@ fn parse_job(job_reader: control_capnp::job::Reader<'_>) -> Result<Job, capnp::E
     let path = parse_path(job_reader.get_path()?)?;
     let hash = parse_hash(job_reader.get_hash()?)?;
 
-    match job_reader.which()? {
-        control_capnp::job::Which::Download(_) => Ok(Job::Download(path, hash)),
-        control_capnp::job::Which::Realize(realize_reader_result) => {
-            let realize_reader = realize_reader_result?;
-            let index_hash = if realize_reader.has_index_hash() {
-                let index_hash_data = realize_reader.get_index_hash()?;
-                Some(Hash(index_hash_data.try_into().map_err(|_| {
-                    capnp::Error::failed("Invalid index hash length".to_string())
-                })?))
-            } else {
-                None
-            };
-            Ok(Job::Realize(path, hash, index_hash))
-        }
-    }
+    Ok(Job::Download(path, hash))
 }
 
 fn parse_progress(
@@ -252,7 +225,6 @@ fn parse_action(action: control_capnp::JobAction) -> Result<Option<JobAction>, c
         control_capnp::JobAction::Download => Ok(Some(JobAction::Download)),
         control_capnp::JobAction::Verify => Ok(Some(JobAction::Verify)),
         control_capnp::JobAction::Repair => Ok(Some(JobAction::Repair)),
-        control_capnp::JobAction::Move => Ok(Some(JobAction::Move)),
     }
 }
 
@@ -339,20 +311,6 @@ mod tests {
         }
     }
 
-    fn create_test_realize_notification() -> ChurtenNotification {
-        let arena = Arena::from("test-arena");
-        let job_id = JobId(123);
-        let path = Path::parse("test/file.txt").unwrap();
-        let hash = Hash([0x42; 32]);
-        let job = Job::Realize(path, hash, Some(Hash([0x24; 32])));
-
-        ChurtenNotification::New {
-            arena,
-            job_id,
-            job: std::sync::Arc::new(job),
-        }
-    }
-
     fn round_trip_test(original: ChurtenNotification) {
         // Convert to capnp
         let mut message = Builder::new_default();
@@ -373,11 +331,6 @@ mod tests {
     #[test]
     fn test_parse_new_download_notification() {
         round_trip_test(create_test_notification());
-    }
-
-    #[test]
-    fn test_parse_new_realize_notification() {
-        round_trip_test(create_test_realize_notification());
     }
 
     #[test]
@@ -406,12 +359,7 @@ mod tests {
         let job_id = JobId(123);
         let index = 3;
 
-        for action in [
-            JobAction::Download,
-            JobAction::Verify,
-            JobAction::Repair,
-            JobAction::Move,
-        ] {
+        for action in [JobAction::Download, JobAction::Verify, JobAction::Repair] {
             let notification = ChurtenNotification::UpdateAction {
                 arena,
                 job_id,
@@ -486,24 +434,6 @@ mod tests {
         }
     }
 
-    fn create_test_realize_job_info() -> JobInfo {
-        let arena = Arena::from("test-arena");
-        let id = JobId(456);
-        let path = Path::parse("test/file.txt").unwrap();
-        let hash = Hash([0x42; 32]);
-        let job = Job::Realize(path, hash, Some(Hash([0x24; 32])));
-
-        JobInfo {
-            arena,
-            id,
-            job: std::sync::Arc::new(job),
-            progress: JobProgress::Done,
-            action: Some(JobAction::Verify),
-            byte_progress: None,
-            notification_index: 4,
-        }
-    }
-
     fn job_info_round_trip_test(original: JobInfo) {
         // Convert to capnp
         let mut message = Builder::new_default();
@@ -524,11 +454,6 @@ mod tests {
     #[test]
     fn test_parse_job_info_download() {
         job_info_round_trip_test(create_test_job_info());
-    }
-
-    #[test]
-    fn test_parse_job_info_realize() {
-        job_info_round_trip_test(create_test_realize_job_info());
     }
 
     #[test]
@@ -568,12 +493,7 @@ mod tests {
         let hash = Hash([0x42; 32]);
         let job = Job::Download(path, hash);
 
-        for action in [
-            JobAction::Download,
-            JobAction::Verify,
-            JobAction::Repair,
-            JobAction::Move,
-        ] {
+        for action in [JobAction::Download, JobAction::Verify, JobAction::Repair] {
             let job_info = JobInfo {
                 arena,
                 id,

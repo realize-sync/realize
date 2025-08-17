@@ -3,7 +3,7 @@ use super::db::{ArenaDatabase, ArenaReadTransaction};
 use super::dirty::DirtyReadOperations;
 use super::index::IndexReadOperations;
 use super::mark::MarkExt;
-use super::tree::TreeExt;
+use super::tree::{TreeExt, TreeLoc};
 use super::types::LocalAvailability;
 use crate::arena::blob;
 use crate::types::JobId;
@@ -21,10 +21,6 @@ use tokio_stream::wrappers::ReceiverStream;
 pub enum Job {
     // TODO: use named fields
     Download(Path, Hash),
-
-    /// Realize `Path` with `counter`, moving `Hash` from cache to the
-    /// index, currently containing nothing or `Hash`.
-    Realize(Path, Hash, Option<Hash>),
 }
 
 impl Job {
@@ -32,7 +28,6 @@ impl Job {
     pub fn path(&self) -> &Path {
         match self {
             Self::Download(path, _) => path,
-            Self::Realize(path, _, _) => path,
         }
     }
 
@@ -40,7 +35,6 @@ impl Job {
     pub fn hash(&self) -> &Hash {
         match self {
             Self::Download(_, h) => h,
-            Self::Realize(_, h, _) => h,
         }
     }
 }
@@ -52,18 +46,14 @@ pub(crate) enum StorageJob {
     External(Job),
 
     /// Move file containing the given version into the cache.
-    Unrealize(Path, Hash),
+    Unrealize(Inode, Hash),
+
+    /// Realize the given file with `counter`, moving `Hash` from
+    /// cache to the index, currently containing nothing or `Hash`.
+    Realize(Inode, Hash, Option<Hash>),
 }
 
 impl StorageJob {
-    /// Return the path the job is for.
-    pub(crate) fn path(&self) -> &Path {
-        match self {
-            StorageJob::External(job) => job.path(),
-            Self::Unrealize(path, _) => path,
-        }
-    }
-
     pub(crate) fn into_external(self) -> Option<Job> {
         match self {
             Self::External(job) => Some(job),
@@ -400,20 +390,17 @@ impl Engine {
     }
 
     /// Build a Job for the given path, if any.
-    pub(crate) async fn job_for_path<T>(
+    pub(crate) async fn job_for_loc<'b, L: Into<TreeLoc<'b>>>(
         self: &Arc<Self>,
-        path: T,
-    ) -> Result<Option<(JobId, StorageJob)>, StorageError>
-    where
-        T: AsRef<Path>,
-    {
+        loc: L,
+    ) -> Result<Option<(JobId, StorageJob)>, StorageError> {
         let this = Arc::clone(self);
-        let path = path.as_ref().clone();
+        let loc = loc.into().into_owned();
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
             let tree = txn.read_tree()?;
             let dirty = txn.read_dirty()?;
-            if let Some(inode) = tree.resolve(path)? {
+            if let Some(inode) = tree.resolve(loc)? {
                 if let Some(counter) = dirty.get_counter(inode)? {
                     return this.build_job(&txn, inode, counter);
                 }
@@ -443,12 +430,10 @@ impl Engine {
                     index.get_at_inode(inode),
                 ) && cached.hash == indexed.hash
                 {
-                    if let Ok(path) = tree.backtrack(inode) {
-                        return Ok(Some((
-                            JobId(counter),
-                            StorageJob::Unrealize(path, cached.hash),
-                        )));
-                    }
+                    return Ok(Some((
+                        JobId(counter),
+                        StorageJob::Unrealize(inode, cached.hash),
+                    )));
                 }
             }
             Ok(Mark::Keep) => {
@@ -456,12 +441,10 @@ impl Engine {
                     if let Ok(Some(indexed)) = index.get_at_inode(inode)
                         && cached.hash == indexed.hash
                     {
-                        if let Ok(path) = tree.backtrack(inode) {
-                            return Ok(Some((
-                                JobId(counter),
-                                StorageJob::Unrealize(path, cached.hash),
-                            )));
-                        }
+                        return Ok(Some((
+                            JobId(counter),
+                            StorageJob::Unrealize(inode, cached.hash),
+                        )));
                     }
 
                     if blob::local_availability(txn, inode)? != LocalAvailability::Verified {
@@ -475,31 +458,30 @@ impl Engine {
                 }
             }
             Ok(Mark::Own) => {
-                // TODO: treat is as Keep if there is no index.
                 if let Ok(cached) = self.cache.get_file_entry_for_loc(txn, &tree, inode) {
-                    let from_index = index.get_at_inode(inode)?;
-                    if from_index.is_none() {
-                        // File is missing from the index, move it there.
-                        if let Ok(path) = tree.backtrack(inode) {
-                            return Ok(Some((
-                                JobId(counter),
-                                StorageJob::External(Job::Realize(path, cached.hash, None)),
-                            )));
+                    // File is missing from the index or version in
+                    // cache should overwrite the version in the
+                    // inedx.
+                    let indexed = index.get_at_inode(inode)?;
+                    let should_move = match &indexed {
+                        None => true,
+                        Some(indexed) => {
+                            indexed.hash != cached.hash && indexed.is_outdated_by(&cached.hash)
                         }
-                    }
-                    if let Some(indexed) = from_index
-                        && indexed.hash != cached.hash
-                        && indexed.is_outdated_by(&cached.hash)
-                    {
-                        if let Ok(path) = tree.backtrack(inode) {
+                    };
+                    if should_move {
+                        if blob::local_availability(txn, inode)? == LocalAvailability::Verified {
                             return Ok(Some((
                                 JobId(counter),
-                                StorageJob::External(Job::Realize(
-                                    path,
-                                    cached.hash,
-                                    Some(indexed.hash),
-                                )),
+                                StorageJob::Realize(inode, cached.hash, indexed.map(|i| i.hash)),
                             )));
+                        } else {
+                            if let Ok(path) = tree.backtrack(inode) {
+                                return Ok(Some((
+                                    JobId(counter),
+                                    StorageJob::External(Job::Download(path, cached.hash)),
+                                )));
+                            }
                         }
                     }
                 }
@@ -749,6 +731,12 @@ mod tests {
             txn.commit()?;
             Ok(())
         }
+
+        fn inode(&self, path: &Path) -> anyhow::Result<Inode> {
+            let txn = self.db.begin_read()?;
+
+            Ok(txn.read_tree()?.expect(path)?)
+        }
     }
 
     async fn next_with_timeout<T>(stream: &mut ReceiverStream<T>) -> anyhow::Result<Option<T>> {
@@ -909,18 +897,15 @@ mod tests {
         // hang forever.
         fixture.add_file_to_cache(&otherfile)?;
 
-        let job = next_with_timeout(&mut job_stream).await?;
-        // 1 has been skipped, because it is fully downloaded
+        let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
+        // barfile has been skipped, because it is fully downloaded
         assert_eq!(
-            Some((
-                JobId(2),
-                StorageJob::External(Job::Download(otherfile, test_hash()))
-            )),
-            job
+            job,
+            StorageJob::External(Job::Download(otherfile, test_hash()))
         );
 
         // The entries before the job that have been deleted.
-        assert_eq!(Some(2), fixture.lowest_counter()?);
+        assert_eq!(Some(job_id.as_u64()), fixture.lowest_counter()?);
 
         Ok(())
     }
@@ -960,29 +945,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn job_stream_file_to_own_not_in_index() -> anyhow::Result<()> {
+    async fn download_then_realize_file_to_own_not_in_index() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
         let foobar = Path::parse("foo/bar")?;
 
         mark::set_arena_mark(&fixture.db, Mark::Own)?;
         fixture.add_file_to_cache(&foobar)?;
+        let inode = fixture.acache.expect(&foobar)?;
 
         let mut job_stream = fixture.engine.job_stream();
 
-        let job = next_with_timeout(&mut job_stream).await?.unwrap();
+        let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
         assert_eq!(
-            (
-                JobId(1),
-                StorageJob::External(Job::Realize(foobar, test_hash(), None))
-            ),
-            job
+            StorageJob::External(Job::Download(foobar, test_hash())),
+            job,
         );
+        {
+            let mut blob = fixture.acache.open_file(inode)?;
+            blob.write_all(b"test").await?;
+            blob.mark_verified().await?;
+        }
+        fixture.engine.job_finished(job_id, Ok(JobStatus::Done))?;
+
+        let (new_job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
+        assert!(new_job_id > job_id);
+        assert_eq!(StorageJob::Realize(inode, test_hash(), None), job);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn job_stream_file_to_own_in_index_with_same_version() -> anyhow::Result<()> {
+    async fn realize_verified_file_to_own_not_in_index() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let foobar = Path::parse("foo/bar")?;
+
+        mark::set_arena_mark(&fixture.db, Mark::Own)?;
+        fixture.add_file_to_cache(&foobar)?;
+        let inode = fixture.acache.expect(&foobar)?;
+        {
+            let mut blob = fixture.acache.open_file(inode)?;
+            blob.write_all(b"test").await?;
+            blob.mark_verified().await?;
+        }
+
+        let mut job_stream = fixture.engine.job_stream();
+
+        let (_, job) = next_with_timeout(&mut job_stream).await?.unwrap();
+        assert_eq!(StorageJob::Realize(inode, test_hash(), None), job);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ignore_file_to_own_in_index_with_same_version() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
         let foobar = Path::parse("foo/bar")?;
         let otherfile = Path::parse("other")?;
@@ -1005,7 +1020,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn job_stream_file_to_own_in_index_with_different_version() -> anyhow::Result<()> {
+    async fn ignore_file_to_own_in_index_with_different_version() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
         let foobar = Path::parse("foo/bar")?;
         let otherfile = Path::parse("other")?;
@@ -1028,7 +1043,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn job_stream_file_to_own_in_index_with_outdated_version() -> anyhow::Result<()> {
+    async fn realize_file_to_own_in_index_with_outdated_version() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
         let foobar = Path::parse("foo/bar")?;
 
@@ -1038,14 +1053,20 @@ mod tests {
         fixture.add_file_to_cache_with_version(&foobar, Hash([1; 32]))?;
         fixture.add_file_to_index_with_version(&foobar, Hash([1; 32]))?;
         fixture.replace_in_cache_and_index(&foobar, Hash([2; 32]), Hash([1; 32]))?;
+        let inode = fixture.acache.expect(&foobar)?;
+        {
+            let mut blob = fixture.acache.open_file(inode)?;
+            blob.write_all(b"test").await?;
+            blob.mark_verified().await?;
+        }
 
         let mut job_stream = fixture.engine.job_stream();
 
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
         assert_eq!(
             (
-                JobId(3),
-                StorageJob::External(Job::Realize(foobar, Hash([2; 32]), Some(Hash([1; 32]))))
+                JobId(4),
+                StorageJob::Realize(fixture.inode(&foobar)?, Hash([2; 32]), Some(Hash([1; 32])))
             ),
             job
         );
@@ -1123,12 +1144,18 @@ mod tests {
         fixture.add_file_to_cache(&barfile)?;
 
         let (job1_id, job1) = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert_eq!(barfile, *job1.path());
+        assert_eq!(
+            StorageJob::External(Job::Download(barfile.clone(), test_hash())),
+            job1
+        );
         assert_eq!(1, job1_id.as_u64());
         fixture.mark_dirty(&barfile)?;
 
         let (job2_id, job2) = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert_eq!(barfile, *job2.path());
+        assert_eq!(
+            StorageJob::External(Job::Download(barfile.clone(), test_hash())),
+            job2
+        );
         assert_eq!(2, job2_id.as_u64());
 
         // Job1 is done, but that changes nothing, because the path has been modified afterwards
@@ -1161,7 +1188,10 @@ mod tests {
         fixture.add_file_to_cache(&otherfile)?;
 
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert_eq!(barfile, *job.path());
+        assert_eq!(
+            StorageJob::External(Job::Download(barfile.clone(), test_hash())),
+            job
+        );
         fixture
             .engine
             .job_finished(job_id, Err(anyhow::anyhow!("fake")))?;
@@ -1179,18 +1209,27 @@ mod tests {
         // Not using next_with_timeout because that wouldn't help with
         // time paused.
         let (_, job) = job_stream.next().await.unwrap();
-        assert_eq!(otherfile, *job.path());
+        assert_eq!(
+            StorageJob::External(Job::Download(otherfile.clone(), test_hash())),
+            job
+        );
 
         // 2nd attempt
         let (job_id, job) = job_stream.next().await.unwrap();
-        assert_eq!(barfile, *job.path());
+        assert_eq!(
+            StorageJob::External(Job::Download(barfile.clone(), test_hash())),
+            job
+        );
         fixture
             .engine
             .job_finished(job_id, Err(anyhow::anyhow!("fake")))?;
 
         // 3rd and last attempt
         let (job_id, job) = job_stream.next().await.unwrap();
-        assert_eq!(barfile, *job.path());
+        assert_eq!(
+            StorageJob::External(Job::Download(barfile.clone(), test_hash())),
+            job
+        );
         fixture
             .engine
             .job_finished(job_id, Err(anyhow::anyhow!("fake")))?;
@@ -1212,19 +1251,27 @@ mod tests {
         fixture.add_file_to_cache(&otherfile)?;
 
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert_eq!(barfile, *job.path());
+        assert_eq!(
+            StorageJob::External(Job::Download(barfile.clone(), test_hash())),
+            job
+        );
         fixture.engine.job_missing_peers(job_id)?;
 
         // barfile is still there
         assert_eq!(Some(1), fixture.lowest_counter()?);
 
         let (_, job) = job_stream.next().await.unwrap();
-        assert_eq!(otherfile, *job.path());
-
+        assert_eq!(
+            StorageJob::External(Job::Download(otherfile.clone(), test_hash())),
+            job
+        );
         fixture.engine.retry_jobs_missing_peers();
 
         let (retry_job_id, retry_job) = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert_eq!(barfile, *retry_job.path());
+        assert_eq!(
+            StorageJob::External(Job::Download(barfile.clone(), test_hash())),
+            retry_job
+        );
         assert_eq!(job_id, retry_job_id);
 
         Ok(())
@@ -1241,7 +1288,10 @@ mod tests {
         fixture.add_file_to_cache(&otherfile)?;
 
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert_eq!(barfile, *job.path());
+        assert_eq!(
+            StorageJob::External(Job::Download(barfile.clone(), test_hash())),
+            job
+        );
         fixture
             .engine
             .job_finished(job_id, Err(anyhow::anyhow!("fake")))?;
@@ -1251,7 +1301,10 @@ mod tests {
         let mut job_stream = fixture.engine.job_stream();
 
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert_eq!(otherfile, *job.path());
+        assert_eq!(
+            StorageJob::External(Job::Download(otherfile.clone(), test_hash())),
+            job
+        );
         fixture
             .engine
             .job_finished(job_id, Err(anyhow::anyhow!("fake")))?;
@@ -1260,7 +1313,11 @@ mod tests {
 
         // 2nd attempt
         let (job_id, job) = job_stream.next().await.unwrap();
-        assert_eq!(barfile, *job.path());
+        assert_eq!(
+            StorageJob::External(Job::Download(barfile.clone(), test_hash())),
+            job
+        );
+
         fixture
             .engine
             .job_finished(job_id, Err(anyhow::anyhow!("fake")))?;
@@ -1279,7 +1336,11 @@ mod tests {
         fixture.add_file_to_cache(&otherfile)?;
 
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert_eq!(barfile, *job.path());
+        assert_eq!(
+            StorageJob::External(Job::Download(barfile.clone(), test_hash())),
+            job
+        );
+
         fixture
             .engine
             .job_finished(job_id, Err(anyhow::anyhow!("fake")))?;
@@ -1290,11 +1351,19 @@ mod tests {
         assert_eq!(Some(2), fixture.lowest_counter()?);
 
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert_eq!(otherfile, *job.path());
+        assert_eq!(
+            StorageJob::External(Job::Download(otherfile.clone(), test_hash())),
+            job
+        );
+
         assert_eq!(2, job_id.as_u64());
 
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert_eq!(barfile, *job.path());
+        assert_eq!(
+            StorageJob::External(Job::Download(barfile.clone(), test_hash())),
+            job
+        );
+
         assert_eq!(3, job_id.as_u64());
 
         Ok(())
@@ -1311,7 +1380,11 @@ mod tests {
         fixture.add_file_to_cache(&otherfile)?;
 
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert_eq!(barfile, *job.path());
+        assert_eq!(
+            StorageJob::External(Job::Download(barfile.clone(), test_hash())),
+            job
+        );
+
         fixture.mark_dirty(&barfile)?;
         fixture
             .engine
@@ -1320,11 +1393,19 @@ mod tests {
         assert_eq!(Some(2), fixture.lowest_counter()?);
 
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert_eq!(otherfile, *job.path());
+        assert_eq!(
+            StorageJob::External(Job::Download(otherfile.clone(), test_hash())),
+            job
+        );
+
         assert_eq!(2, job_id.as_u64());
 
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert_eq!(barfile, *job.path());
+        assert_eq!(
+            StorageJob::External(Job::Download(barfile.clone(), test_hash())),
+            job
+        );
+
         assert_eq!(3, job_id.as_u64());
 
         Ok(())
@@ -1339,7 +1420,7 @@ mod tests {
         fixture.add_file_to_cache(&barfile)?;
 
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
-        let same_job = fixture.engine.job_for_path(job.path()).await?;
+        let same_job = fixture.engine.job_for_loc(&barfile).await?;
         assert_eq!(Some((job_id, job)), same_job);
 
         Ok(())
@@ -1356,7 +1437,7 @@ mod tests {
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
         assert_eq!(1, job_id.as_u64());
         fixture.mark_dirty(&barfile)?;
-        let (new_job_id, new_job) = fixture.engine.job_for_path(job.path()).await?.unwrap();
+        let (new_job_id, new_job) = fixture.engine.job_for_loc(&barfile).await?.unwrap();
         assert_eq!(job, new_job);
         assert!(new_job_id > job_id);
 

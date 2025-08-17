@@ -776,10 +776,6 @@ mod tests {
                 // Check the job details
                 let job_info = job.get_job()?;
                 assert_eq!(job_info.get_path()?, "foo");
-                assert!(matches!(
-                    job_info.which(),
-                    Ok(control_capnp::job::Download(_))
-                ));
 
                 // Shutdown churten
                 churten.shutdown_request().send().promise.await?;

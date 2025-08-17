@@ -2,8 +2,10 @@ use super::arena_cache::ArenaCache;
 use super::db::ArenaDatabase;
 use super::engine::{Engine, StorageJob};
 use super::index::RealIndex;
-use crate::{JobId, JobStatus, StorageError};
-use realize_types::{Hash, Path};
+use crate::arena::index;
+use crate::arena::tree::TreeExt;
+use crate::{Inode, JobId, JobStatus, StorageError};
+use realize_types::Hash;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::task::{self, JoinHandle};
@@ -76,7 +78,10 @@ impl StorageJobProcessor {
     fn process_job(&self, job: StorageJob) -> Option<Result<JobStatus, StorageError>> {
         match job {
             StorageJob::External(_) => None,
-            StorageJob::Unrealize(path, hash) => Some(self.unrealize(path, hash)),
+            StorageJob::Unrealize(inode, hash) => Some(self.unrealize(inode, hash)),
+            StorageJob::Realize(inode, hash, index_hash) => {
+                Some(self.realize(inode, hash, index_hash))
+            }
         }
     }
 
@@ -85,18 +90,27 @@ impl StorageJobProcessor {
     /// Gives up and returns [JobStatus::Abandoned] if the current
     /// versions in the cache or the current version in the index
     /// don't match `hash`.
-    fn unrealize(&self, path: Path, hash: Hash) -> Result<JobStatus, StorageError> {
-        let (index, root) = match &self.index {
+    fn unrealize(&self, inode: Inode, hash: Hash) -> Result<JobStatus, StorageError> {
+        let (index_obj, root) = match &self.index {
             Some(ret) => ret,
             None => return Err(StorageError::NoLocalStorage(self.cache.arena())),
         };
         let txn = self.db.begin_write()?;
-        let realpath = match index.get_indexed_file_txn(&txn, root, &path, Some(&hash))? {
-            Some(ret) => ret,
-            None => {
-                return Ok(JobStatus::Abandoned("get_indexed_file"));
+        let tree = txn.read_tree()?;
+        let path = match tree.backtrack(inode) {
+            Ok(path) => path,
+            Err(_) => {
+                return Ok(JobStatus::Abandoned("no_path"));
             }
         };
+        let realpath =
+            match index::indexed_file_path(&txn.read_index()?, &tree, root, inode, Some(&hash))? {
+                Some(ret) => ret,
+                None => {
+                    return Ok(JobStatus::Abandoned("get_indexed_file"));
+                }
+            };
+        drop(tree); // TODO: rewrite move_into_blob_if_matches to take a tree and TreeLoc
         let cachepath =
             match self
                 .cache
@@ -117,7 +131,7 @@ impl StorageJobProcessor {
         // file after the move, a change that would
         // eventually be lost when the file in the cache
         // is verified.
-        if !index.drop_file_if_matches(&txn, root, &path, &hash)? {
+        if !index_obj.drop_file_if_matches(&txn, root, &path, &hash)? {
             return Ok(JobStatus::Abandoned("drop_file_if_matches"));
         }
 
@@ -134,10 +148,64 @@ impl StorageJobProcessor {
 
         log::debug!(
             "Unrealized {realpath:?} {hash} into the cache as [{}]/{path}",
-            index.arena()
+            self.db.arena()
         );
 
         return Ok(JobStatus::Done);
+    }
+
+    /// Move a file from the cache to the filesystem.
+    ///
+    /// The file must have been fully downloaded and verified or the
+    /// move will fail.
+    ///
+    /// Give up and return false if the current versions in the cache
+    /// don't match `cache_hash` and `index_hash`.
+    ///
+    /// A `index_hash` value of `None` means that the file must not
+    /// exit. If it exists, realize gives up and returns false.
+    fn realize(
+        &self,
+        inode: Inode,
+        cache_hash: Hash,
+        index_hash: Option<Hash>,
+    ) -> Result<JobStatus, StorageError> {
+        let (_, root) = match &self.index {
+            Some(ret) => ret,
+            None => return Err(StorageError::NoLocalStorage(self.cache.arena())),
+        };
+        let moved: bool;
+        let txn = self.db.begin_write()?;
+        {
+            let tree = txn.read_tree()?;
+            let path = match tree.backtrack(inode) {
+                Ok(path) => path,
+                Err(_) => {
+                    return Ok(JobStatus::Abandoned("no_path"));
+                }
+            };
+            let realpath = index::indexed_file_path(
+                &txn.read_index()?,
+                &tree,
+                &root,
+                &path,
+                index_hash.as_ref(),
+            )?;
+            drop(tree); // TODO: rewrite move_blob_if_matches to take a tree and TreeLoc
+            if let Some(realpath) = realpath {
+                moved = self
+                    .cache
+                    .move_blob_if_matches(&txn, &path, &cache_hash, &realpath)?;
+            } else {
+                return Ok(JobStatus::Abandoned("indexed_file_path"));
+            }
+        }
+        if moved {
+            txn.commit()?;
+            Ok(JobStatus::Done)
+        } else {
+            Ok(JobStatus::Abandoned("move_blob_if_matches"))
+        }
     }
 }
 
@@ -146,16 +214,17 @@ mod tests {
     use super::*;
     use crate::arena::index::IndexedFile;
     use crate::utils::hash;
-    use crate::{Blob, Inode, Notification};
+    use crate::{Blob, Inode, LocalAvailability, Mark, Notification};
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Path, Peer, UnixTime};
     use std::time::Duration;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     struct Fixture {
         arena: Arena,
+        db: Arc<ArenaDatabase>,
         cache: Arc<ArenaCache>,
         index: Arc<dyn RealIndex>,
         root: ChildPath,
@@ -204,6 +273,7 @@ mod tests {
 
             let fixture = Self {
                 arena,
+                db,
                 cache,
                 index,
                 root,
@@ -239,8 +309,44 @@ mod tests {
                     size,
                     hash: hash.clone(),
                 },
-                None,
+                Some(&self.root),
             )?;
+
+            Ok(())
+        }
+
+        fn replace_in_cache(
+            &self,
+            path_str: &str,
+            old_hash: &Hash,
+            new_hash: &Hash,
+            size: u64,
+        ) -> anyhow::Result<()> {
+            self.cache.update(
+                Peer::from("peer"),
+                Notification::Replace {
+                    arena: self.arena,
+                    index: 1,
+                    path: Path::parse(path_str)?,
+                    mtime: UnixTime::from_secs(1234567890),
+                    size,
+                    old_hash: old_hash.clone(),
+                    hash: new_hash.clone(),
+                },
+                Some(&self.root),
+            )?;
+
+            Ok(())
+        }
+
+        fn set_mark(&self, path: &Path, mark: Mark) -> Result<(), StorageError> {
+            let txn = self.db.begin_write()?;
+            {
+                let mut tree = txn.write_tree()?;
+                let mut dirty = txn.write_dirty()?;
+                txn.write_marks()?.set(&mut tree, &mut dirty, path, mark)?;
+            }
+            txn.commit()?;
 
             Ok(())
         }
@@ -276,11 +382,35 @@ mod tests {
             Ok(buf)
         }
 
+        fn inode(&self, path: &Path) -> anyhow::Result<Inode> {
+            let txn = self.db.begin_read()?;
+
+            Ok(txn.read_tree()?.expect(path)?)
+        }
+
         async fn unrealize(&self, path: Path, hash: Hash) -> anyhow::Result<JobStatus> {
             log::debug!("unrealize({path}, {hash})");
+            let inode = self.inode(&path)?;
             let processor = Arc::clone(&self.processor);
             tokio::task::spawn_blocking(move || {
-                let status = processor.unrealize(path, hash)?;
+                let status = processor.unrealize(inode, hash)?;
+
+                log::debug!("-> {status:?}");
+                Ok::<JobStatus, anyhow::Error>(status)
+            })
+            .await?
+        }
+        async fn realize(
+            &self,
+            path: Path,
+            hash: Hash,
+            index_hash: Option<Hash>,
+        ) -> anyhow::Result<JobStatus> {
+            log::debug!("realize({path}, {hash})");
+            let inode = self.inode(&path)?;
+            let processor = Arc::clone(&self.processor);
+            tokio::task::spawn_blocking(move || {
+                let status = processor.realize(inode, hash, index_hash)?;
 
                 log::debug!("-> {status:?}");
                 Ok::<JobStatus, anyhow::Error>(status)
@@ -310,7 +440,7 @@ mod tests {
         fixture.add_to_cache("test.txt", &hash, 6)?;
         let path = Path::parse("test.txt")?;
         assert!(matches!(
-                fixture.processor.unrealize(path, hash),
+            fixture.processor.unrealize(fixture.inode(&path)?, hash),
                 Err(StorageError::NoLocalStorage(a)) if a == fixture.arena));
 
         Ok(())
@@ -363,4 +493,123 @@ mod tests {
 
     //     Ok(())
     // }
+
+    #[tokio::test]
+    async fn realize_new_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let path = Path::parse("test.txt")?;
+        fixture.set_mark(&path, Mark::Own)?;
+
+        let hash = hash::digest("test");
+        fixture.add_to_cache("test.txt", &hash, 4)?;
+        let inode = fixture.inode(&path)?;
+        {
+            let mut blob = fixture.cache.open_file(inode)?;
+            blob.write_all(b"test").await?;
+            blob.mark_verified().await?;
+        }
+
+        assert_eq!(
+            JobStatus::Done,
+            fixture.realize(path.clone(), hash.clone(), None).await?
+        );
+
+        assert_eq!(
+            "test".to_string(),
+            std::fs::read_to_string(path.within(&fixture.root))?
+        );
+        assert_eq!(
+            LocalAvailability::Missing,
+            fixture.cache.local_availability(inode)?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn realize_replaces_outdated() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let path = Path::parse("test.txt")?;
+        fixture.set_mark(&path, Mark::Own)?;
+        let inode = fixture.inode(&path)?;
+
+        let old_hash = hash::digest("old");
+        let new_hash = hash::digest("new!");
+        fixture.add_to_cache("test.txt", &old_hash, 3)?;
+        fixture.create_indexed_file("test.txt", "old").await?;
+        fixture.replace_in_cache("test.txt", &old_hash, &new_hash, 4)?;
+        {
+            let mut blob = fixture.cache.open_file(inode)?;
+            blob.write_all(b"new!").await?;
+            blob.mark_verified().await?;
+        }
+
+        assert_eq!(
+            JobStatus::Done,
+            fixture
+                .realize(path.clone(), new_hash.clone(), Some(old_hash.clone()))
+                .await?
+        );
+
+        assert_eq!(
+            "new!".to_string(),
+            std::fs::read_to_string(path.within(&fixture.root))?
+        );
+        assert_eq!(
+            LocalAvailability::Missing,
+            fixture.cache.local_availability(inode)?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn realize_skip_wrong_version() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let path = Path::parse("test.txt")?;
+        fixture.set_mark(&path, Mark::Own)?;
+
+        let hash = hash::digest("test");
+        fixture.add_to_cache("test.txt", &hash, 4)?;
+        let inode = fixture.inode(&path)?;
+        {
+            let mut blob = fixture.cache.open_file(inode)?;
+            blob.write_all(b"test").await?;
+            blob.mark_verified().await?;
+        }
+
+        assert!(matches!(
+            fixture
+                .realize(path.clone(), hash::digest("something else"), None)
+                .await?,
+            JobStatus::Abandoned(_)
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn realize_skip_not_verified() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let path = Path::parse("test.txt")?;
+        fixture.set_mark(&path, Mark::Own)?;
+
+        let hash = hash::digest("test");
+        fixture.add_to_cache("test.txt", &hash, 4)?;
+        let inode = fixture.inode(&path)?;
+        {
+            let mut blob = fixture.cache.open_file(inode)?;
+            blob.write_all(b"test").await?;
+            blob.update_db().await?; // complete, but not verified
+        }
+
+        assert!(matches!(
+            fixture
+                .realize(path.clone(), hash::digest("something else"), None)
+                .await?,
+            JobStatus::Abandoned(_)
+        ));
+
+        Ok(())
+    }
 }

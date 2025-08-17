@@ -95,16 +95,6 @@ struct ChurtenNotification {
 struct Job {
   path @0: Text;
   hash @1: Data;
-  union {
-    download@2 : Download;
-    realize@3: Realize;
-  }
-
-  struct Download {}
-  struct Realize {
-    # optional; None if empty
-    indexHash @0: Data;
-  }
 }
 
 struct JobInfo {
@@ -148,5 +138,4 @@ enum JobAction {
   download @1;
   verify @2;
   repair @3;
-  move @4;
 }

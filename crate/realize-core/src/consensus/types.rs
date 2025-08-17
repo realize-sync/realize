@@ -136,5 +136,4 @@ pub enum JobAction {
     Download,
     Verify,
     Repair,
-    Move,
 }

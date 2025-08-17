@@ -175,6 +175,14 @@ impl<'a> TreeLoc<'a> {
             TreeLoc::Path(path) => TreeLoc::PathRef(path),
         }
     }
+
+    pub(crate) fn into_owned(self) -> TreeLoc<'static> {
+        match self {
+            TreeLoc::Inode(inode) => TreeLoc::Inode(inode),
+            TreeLoc::PathRef(path) => TreeLoc::Path(path.clone()),
+            TreeLoc::Path(path) => TreeLoc::Path(path),
+        }
+    }
 }
 
 impl From<Inode> for TreeLoc<'static> {

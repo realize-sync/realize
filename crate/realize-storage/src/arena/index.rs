@@ -5,6 +5,7 @@ use super::dirty::WritableOpenDirty;
 use super::history::WritableOpenHistory;
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
 use super::types::{FileTableEntry, HistoryTableEntry};
+use crate::utils::fs_utils;
 use crate::utils::holder::Holder;
 use crate::{Inode, StorageError};
 use realize_types::{self, Arena, Hash, Path, UnixTime};
@@ -47,14 +48,6 @@ pub trait RealIndex: Send + Sync {
         txn: &super::db::ArenaReadTransaction,
         path: &realize_types::Path,
     ) -> Result<Option<IndexedFile>, StorageError>;
-
-    fn get_indexed_file_txn(
-        &self,
-        txn: &ArenaWriteTransaction,
-        root: &std::path::Path,
-        path: &realize_types::Path,
-        hash: Option<&Hash>,
-    ) -> Result<Option<std::path::PathBuf>, StorageError>;
 
     /// Check whether a given file is in the index already.
     fn has_file(&self, path: &realize_types::Path) -> Result<bool, StorageError>;
@@ -303,6 +296,42 @@ impl RealIndexAsync {
 
         task::spawn_blocking(move || inner.remove_file_if_missing(&root, &path)).await?
     }
+}
+
+/// Return the path for the given file if its current version matches `hash`.
+///
+/// If `hash` is none, the file must not exist. if `hash` is not none,
+/// its version in the index must match and its size and modification
+/// time must match those in the index.
+pub(crate) fn indexed_file_path<'b, L: Into<TreeLoc<'b>>, R: AsRef<std::path::Path>>(
+    index: &impl IndexReadOperations,
+    tree: &impl TreeReadOperations,
+    root: R,
+    loc: L,
+    hash: Option<&Hash>,
+) -> Result<Option<std::path::PathBuf>, StorageError> {
+    let loc = loc.into();
+    let entry = index.get(tree, loc.borrow())?;
+    if let Ok(path) = tree.backtrack(loc) {
+        let root = root.as_ref();
+        let file_path = path.within(root);
+        match hash {
+            Some(hash) => {
+                if let Some(entry) = entry
+                    && entry.hash == *hash
+                    && entry.matches_file(&file_path)
+                {
+                    return Ok(Some(file_path));
+                }
+            }
+            None => {
+                if entry.is_none() && fs_utils::metadata_no_symlink_blocking(root, &path).is_err() {
+                    return Ok(Some(file_path));
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Clone, PartialEq)]

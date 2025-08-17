@@ -1,15 +1,13 @@
 use crate::InodeAllocator;
-use crate::StorageError;
 use crate::config;
 use crate::utils::redb_utils;
 use arena_cache::ArenaCache;
 use db::ArenaDatabase;
 use engine::Engine;
 use index::RealIndexAsync;
-use realize_types::{Arena, Hash};
+use realize_types::Arena;
 use std::time::Duration;
 use std::{path::PathBuf, sync::Arc};
-use tokio::task;
 use tokio_util::sync::CancellationToken;
 use tokio_util::sync::DropGuard;
 use watcher::RealWatcher;
@@ -32,7 +30,6 @@ pub mod watcher;
 
 /// Gives access to arena-specific stores and functions.
 pub(crate) struct ArenaStorage {
-    pub(crate) arena: Arena,
     pub(crate) db: Arc<ArenaDatabase>,
     pub(crate) cache: Arc<ArenaCache>,
     pub(crate) engine: Arc<Engine>,
@@ -103,59 +100,12 @@ impl ArenaStorage {
         .spawn(shutdown.clone());
 
         Ok(ArenaStorage {
-            arena,
             db,
             cache: Arc::clone(&arena_cache),
             engine,
             indexed,
             _drop_guard: shutdown.drop_guard(),
         })
-    }
-
-    /// Move a file from the cache to the filesystem.
-    ///
-    /// The file must have been fully downloaded and verified or the
-    /// move will fail.
-    ///
-    /// Give up and return false if the current versions in the cache
-    /// don't match `cache_hash` and `index_hash`.
-    ///
-    /// A `index_hash` value of `None` means that the file must not
-    /// exit. If it exists, realize gives up and returns false.
-    pub(crate) async fn realize(
-        &self,
-        path: &realize_types::Path,
-        cache_hash: &Hash,
-        index_hash: Option<&Hash>,
-    ) -> Result<bool, StorageError> {
-        let indexed = match &self.indexed {
-            None => return Err(StorageError::NoLocalStorage(self.arena)),
-            Some(indexed) => indexed,
-        };
-
-        let cache = self.cache.clone();
-        let root = indexed.root.clone();
-        let path = path.clone();
-        let cache_hash = cache_hash.clone();
-        let index_hash = index_hash.cloned();
-        let db = Arc::clone(&self.db);
-        let index = indexed.index.blocking();
-        let done = task::spawn_blocking(move || {
-            let txn = db.begin_write()?;
-            if let Some(realpath) =
-                index.get_indexed_file_txn(&txn, &root, &path, index_hash.as_ref())?
-            {
-                if cache.move_blob_if_matches(&txn, &path, &cache_hash, &realpath)? {
-                    txn.commit()?;
-                    return Ok(true);
-                }
-            }
-
-            Ok::<bool, StorageError>(false)
-        })
-        .await??;
-
-        Ok(done)
     }
 }
 

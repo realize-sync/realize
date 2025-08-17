@@ -857,6 +857,7 @@ fn read_errno(err: StorageError) -> io_error::Errno {
     use io_error::Errno::*;
     match err {
         StorageError::Database(_) => Unavailable,
+        StorageError::OpenTable(_, _) => Unavailable,
         StorageError::Io(ioerr) => match ioerr.kind() {
             io::ErrorKind::NotFound => NotFound,
             io::ErrorKind::PermissionDenied => PermissionDenied,
