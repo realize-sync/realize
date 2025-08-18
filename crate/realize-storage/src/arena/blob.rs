@@ -1440,6 +1440,38 @@ mod tests {
 
             Ok(ret)
         }
+
+        fn create_blob_with_partial_data<'b, L: Into<TreeLoc<'b>>>(
+            &self,
+            loc: L,
+            test_data: &'static str,
+            partial: usize,
+        ) -> anyhow::Result<BlobInfo> {
+            let hash = hash::digest(test_data);
+
+            let txn = self.begin_write()?;
+            let info: BlobInfo;
+            {
+                let marks = txn.read_marks()?;
+                let mut blobs = txn.write_blobs()?;
+                let mut tree = txn.write_tree()?;
+
+                info = blobs.create(&mut tree, &marks, loc, &hash, test_data.len() as u64)?;
+
+                // Write some partial data to the blob file
+                let blob_path = self.blob_path(info.inode);
+                std::fs::write(&blob_path, &test_data[0..partial])?;
+                blobs.extend_local_availability(
+                    &tree,
+                    info.inode,
+                    &hash,
+                    &ByteRanges::single(0, partial as u64),
+                )?;
+            }
+            txn.commit()?;
+
+            Ok(info)
+        }
     }
 
     #[test]
@@ -1580,22 +1612,14 @@ mod tests {
     #[tokio::test]
     async fn read_blob_within_available_ranges() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
+        let path = Path::parse("baa/baa")?;
+        fixture.create_blob_with_partial_data(
+            &path,
+            "Baa, baa, black sheep, have you any wool? Yes, sir! Yes, sir! Three bags full",
+            41,
+        )?;
 
-        let inode = fixture.add_file("test.txt", 1000)?;
-
-        // Allocate blob id and create file
-        let inode = acache.open_file(inode)?.inode;
-
-        // Write some test data to the blob file
-        let blob_path = fixture.blob_path(inode);
-        let test_data = b"Baa, baa, black sheep, have you any wool?";
-        std::fs::write(&blob_path, test_data)?;
-
-        fixture.extend_local_availability(inode, &ByteRanges::single(0, test_data.len() as u64))?;
-
-        // Read from blob
-        let mut blob = fixture.acache.open_file(inode)?;
+        let mut blob = Blob::open(&fixture.db, &path)?;
 
         let mut buf = [0; 5];
         let n = blob.read(&mut buf).await?;
@@ -1611,22 +1635,14 @@ mod tests {
     #[tokio::test]
     async fn read_blob_after_seek_within_available_range() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
+        let path = Path::parse("baa/baa")?;
+        fixture.create_blob_with_partial_data(
+            &path,
+            "Baa, baa, black sheep, have you any wool? Yes, sir! Yes, sir! Three bags full",
+            41,
+        )?;
 
-        let inode = fixture.add_file("test.txt", 1000)?;
-
-        // Allocate blob id and create file
-        let inode = acache.open_file(inode)?.inode;
-
-        // Write test data to the blob file
-        let blob_path = fixture.blob_path(inode);
-        let test_data = b"Baa, baa, black sheep, have you any wool?";
-        std::fs::write(&blob_path, test_data)?;
-
-        fixture.extend_local_availability(inode, &ByteRanges::single(0, test_data.len() as u64))?;
-
-        // Read from blob
-        let mut blob = fixture.acache.open_file(inode)?;
+        let mut blob = Blob::open(&fixture.db, &path)?;
         blob.seek(SeekFrom::Start(b"Baa, baa, black sheep, ".len() as u64))
             .await?;
         let mut buf = [0; 100];
@@ -1639,22 +1655,11 @@ mod tests {
     #[tokio::test]
     async fn read_blob_outside_available_ranges() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
-        let inode = fixture.add_file("test.txt", 1000)?;
+        let path = Path::parse("baa/baa")?;
+        fixture.create_blob_with_partial_data(&path, "Baa, baa, black sheep", 3)?;
 
-        // Allocate blob id and create file
-        let inode = acache.open_file(inode)?.inode;
-
-        // Write test data to the blob file
-        let blob_path = fixture.blob_path(inode);
-        let test_data = b"baa, baa";
-        std::fs::write(&blob_path, test_data)?;
-
-        fixture.extend_local_availability(inode, &ByteRanges::single(0, test_data.len() as u64))?;
-
-        // Read from blob
-        let mut blob = fixture.acache.open_file(inode)?;
-        blob.seek(SeekFrom::Start(20)).await?;
+        let mut blob = Blob::open(&fixture.db, &path)?;
+        blob.seek(SeekFrom::Start(10)).await?;
         let mut buf = [0; 100];
         let res = blob.read(&mut buf).await;
         assert!(res.is_err());
