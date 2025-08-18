@@ -267,16 +267,17 @@ impl<'a> WritableOpenDirty<'a> {
         &mut self,
         tree: &impl TreeReadOperations,
         loc: L,
+        reason: &'static str,
     ) -> Result<(), StorageError> {
         if let Some(start) = tree.resolve(loc)? {
             // Marking a directory does nothing, so let's skip marking
             // root. The other inodes, however, might be a file, at
             // least in some subsystems so should always be marked.
             if start != tree.root() {
-                self.mark_dirty(start)?;
+                self.mark_dirty(start, reason)?;
             }
             for inode in tree.recurse(start, |_| true) {
-                self.mark_dirty(inode?)?;
+                self.mark_dirty(inode?, reason)?;
             }
         }
 
@@ -286,8 +287,12 @@ impl<'a> WritableOpenDirty<'a> {
     /// Mark a path dirty.
     ///
     /// This does nothing if the path is already dirty.
-    pub(crate) fn mark_dirty(&mut self, inode: Inode) -> Result<(), StorageError> {
-        log::debug!("dirty: {inode}");
+    pub(crate) fn mark_dirty(
+        &mut self,
+        inode: Inode,
+        reason: &'static str,
+    ) -> Result<(), StorageError> {
+        log::debug!("dirty: {inode} ({reason})");
         let last_counter = last_counter(&self.counter_table)?;
         let counter = last_counter + 1;
         self.counter_table.insert((), counter)?;
@@ -503,7 +508,7 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut dirty = txn.write_dirty()?;
 
-        dirty.mark_dirty(Inode(1))?;
+        dirty.mark_dirty(Inode(1), "test")?;
 
         Ok(())
     }
@@ -517,8 +522,8 @@ mod tests {
         let path2 = tree.setup(Path::parse("path2")?)?;
 
         let mut dirty = txn.write_dirty()?;
-        dirty.mark_dirty(path1)?;
-        dirty.mark_dirty(path2)?;
+        dirty.mark_dirty(path1, "test")?;
+        dirty.mark_dirty(path2, "test")?;
 
         assert_eq!(vec![(path1, 1), (path2, 2)], all(&dirty)?);
 
@@ -534,10 +539,10 @@ mod tests {
         let path1 = tree.setup(Path::parse("path1")?)?;
         let path2 = tree.setup(Path::parse("path2")?)?;
 
-        dirty.mark_dirty(path1)?;
-        dirty.mark_dirty(path2)?;
-        dirty.mark_dirty(path1)?;
-        dirty.mark_dirty(path1)?; // dup; just increase counter
+        dirty.mark_dirty(path1, "test")?;
+        dirty.mark_dirty(path2, "test")?;
+        dirty.mark_dirty(path1, "test")?;
+        dirty.mark_dirty(path1, "test")?; // dup; just increase counter
 
         // return path2 first, because its counter is lower
         assert_eq!(vec![(path2, 2), (path1, 4)], all(&dirty)?);
@@ -555,7 +560,7 @@ mod tests {
         let job_id = JobId::from(1);
 
         // Mark path as dirty first
-        dirty.mark_dirty(path)?;
+        dirty.mark_dirty(path, "test")?;
 
         // Verify it's dirty
         assert_eq!(HashSet::from([path]), all_inodes(&dirty)?);
@@ -584,7 +589,7 @@ mod tests {
         let job_id = JobId::from(1);
 
         // Mark path as dirty first
-        dirty.mark_dirty(path)?;
+        dirty.mark_dirty(path, "test")?;
 
         // Mark job as failed with retry strategy
         let retry_strategy = |attempt: u32| {
@@ -613,7 +618,7 @@ mod tests {
         let job_id = JobId::from(1);
 
         // First mark a path as dirty to create the job entry
-        dirty.mark_dirty(path)?;
+        dirty.mark_dirty(path, "test")?;
 
         // Mark job as missing peers
         dirty.mark_job_missing_peers(job_id)?;
@@ -635,8 +640,8 @@ mod tests {
         let path2 = tree.setup(Path::parse("path2.txt")?)?;
 
         // Mark multiple paths as dirty
-        dirty.mark_dirty(path1)?;
-        dirty.mark_dirty(path2)?;
+        dirty.mark_dirty(path1, "test")?;
+        dirty.mark_dirty(path2, "test")?;
 
         // Get next dirty path starting from counter 0
         let mut start_counter = 0;
@@ -666,7 +671,7 @@ mod tests {
         let path = tree.setup(Path::parse("test/path.txt")?)?;
 
         // Mark path as dirty
-        dirty.mark_dirty(path)?;
+        dirty.mark_dirty(path, "test")?;
 
         // Get path for counter 1
         let result = dirty.get_inode_for_counter(1)?;
@@ -688,7 +693,7 @@ mod tests {
         let path = tree.setup(Path::parse("test/path.txt")?)?;
 
         // Mark path as dirty
-        dirty.mark_dirty(path)?;
+        dirty.mark_dirty(path, "test")?;
 
         // Get counter for path
         let result = dirty.get_counter(path)?;
@@ -711,7 +716,7 @@ mod tests {
         let job_id = JobId::from(1);
 
         // First mark a path as dirty to create the job entry
-        dirty.mark_dirty(path)?;
+        dirty.mark_dirty(path, "test")?;
 
         // Job should not be failed initially
         assert!(!dirty.is_job_failed(job_id)?);
@@ -738,8 +743,8 @@ mod tests {
         let job_id2 = JobId::from(2);
 
         // First mark paths as dirty to create the job entries
-        dirty.mark_dirty(path1)?;
-        dirty.mark_dirty(path2)?;
+        dirty.mark_dirty(path1, "test")?;
+        dirty.mark_dirty(path2, "test")?;
 
         // Mark jobs as failed with different retry times
         let retry_strategy = |attempt: u32| {
@@ -775,8 +780,8 @@ mod tests {
         let job_id2 = JobId::from(2);
 
         // First mark paths as dirty to create the job entries
-        dirty.mark_dirty(path1)?;
-        dirty.mark_dirty(path2)?;
+        dirty.mark_dirty(path1, "test")?;
+        dirty.mark_dirty(path2, "test")?;
 
         // Mark jobs as waiting for peers
         dirty.mark_job_missing_peers(job_id1)?;
@@ -798,9 +803,9 @@ mod tests {
         let path1 = tree.setup(Path::parse("path1.txt")?)?;
         let path2 = tree.setup(Path::parse("path2.txt")?)?;
         let path3 = tree.setup(Path::parse("path3.txt")?)?;
-        dirty.mark_dirty(path1)?;
-        dirty.mark_dirty(path2)?;
-        dirty.mark_dirty(path3)?;
+        dirty.mark_dirty(path1, "test")?;
+        dirty.mark_dirty(path2, "test")?;
+        dirty.mark_dirty(path3, "test")?;
 
         dirty.delete_range(1, 3)?;
 
@@ -825,8 +830,8 @@ mod tests {
         assert_eq!(last, None);
 
         // Mark paths as dirty
-        dirty.mark_dirty(path1)?;
-        dirty.mark_dirty(path2)?;
+        dirty.mark_dirty(path1, "test")?;
+        dirty.mark_dirty(path2, "test")?;
 
         // Get last counter
         let last = dirty.get_last_counter(0)?;
@@ -844,7 +849,7 @@ mod tests {
         let path = tree.setup(Path::parse("test/path.txt")?)?;
         let job_id = JobId::from(1);
 
-        dirty.mark_dirty(path)?;
+        dirty.mark_dirty(path, "test")?;
         let counter = dirty.get_counter(path)?;
         assert_eq!(counter, Some(1));
 
@@ -871,8 +876,8 @@ mod tests {
         let job_id1 = JobId::from(1);
         let job_id2 = JobId::from(2);
 
-        dirty.mark_dirty(path1)?;
-        dirty.mark_dirty(path2)?;
+        dirty.mark_dirty(path1, "test")?;
+        dirty.mark_dirty(path2, "test")?;
 
         let counter1 = dirty.get_counter(path1)?;
         let counter2 = dirty.get_counter(path2)?;
@@ -904,7 +909,7 @@ mod tests {
             tree.setup(Path::parse("waldo")?)?;
 
             let mut dirty = txn.write_dirty()?;
-            dirty.mark_dirty_recursive(&tree, Path::parse("foo/bar")?)?;
+            dirty.mark_dirty_recursive(&tree, Path::parse("foo/bar")?, "test")?;
             assert_eq!(
                 HashSet::from([
                     Path::parse("foo/bar")?,
@@ -930,7 +935,7 @@ mod tests {
             tree.setup(Path::parse("baz")?)?;
 
             let mut dirty = txn.write_dirty()?;
-            dirty.mark_dirty_recursive(&tree, tree.root())?;
+            dirty.mark_dirty_recursive(&tree, tree.root(), "test")?;
             assert_eq!(
                 HashSet::from([
                     Path::parse("foo")?,

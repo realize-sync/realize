@@ -413,8 +413,7 @@ impl ArenaCache {
             return Ok(false);
         }
         let mut blobs = txn.write_blobs()?;
-        let mut dirty = txn.write_dirty()?;
-        if !blobs.export(&tree, &mut dirty, inode, hash, dest)? {
+        if !blobs.export(&tree, inode, hash, dest)? {
             return Ok(false);
         }
 
@@ -459,9 +458,8 @@ impl ArenaCache {
         }
         let mut blobs = txn.write_blobs()?;
         let marks = txn.read_marks()?;
-        let mut dirty = txn.write_dirty()?;
         let mut tree = txn.write_tree()?;
-        let cachepath = blobs.import(&mut tree, &marks, &mut dirty, inode, hash, metadata)?;
+        let cachepath = blobs.import(&mut tree, &marks, inode, hash, metadata)?;
 
         Ok(Some(cachepath))
     }
@@ -513,11 +511,11 @@ impl ArenaCache {
         dirty: &mut WritableOpenDirty,
         inode: Inode,
     ) -> Result<(), StorageError> {
-        blobs.delete(tree, dirty, inode)?;
+        blobs.delete(tree, inode)?;
 
         // This entry is the outside world view of the file, so
         // changes should be reported.
-        dirty.mark_dirty(inode)?;
+        dirty.mark_dirty(inode, "cache")?;
 
         Ok(())
     }
@@ -710,7 +708,7 @@ impl ArenaCache {
         let txn = self.db.begin_write()?;
         {
             let mut blobs = txn.write_blobs()?;
-            blobs.cleanup(&mut txn.write_dirty()?, target_size)?;
+            blobs.cleanup(target_size)?;
         }
         txn.commit()?;
 

@@ -283,7 +283,6 @@ impl<'a> WritableOpenBlob<'a> {
     pub(crate) fn delete<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &impl TreeReadOperations,
-        dirty: &mut WritableOpenDirty,
         loc: L,
     ) -> Result<(), StorageError> {
         let inode = match tree.resolve(loc)? {
@@ -291,12 +290,7 @@ impl<'a> WritableOpenBlob<'a> {
             None => return Ok(()), // Nothing to delete
         };
 
-        remove_blob_entry(
-            &mut self.blob_table,
-            &mut self.blob_lru_queue_table,
-            dirty,
-            inode,
-        )?;
+        remove_blob_entry(&mut self.blob_table, &mut self.blob_lru_queue_table, inode)?;
         let blob_path = self.subsystem.blob_dir.join(inode.hex());
         if blob_path.exists() {
             std::fs::remove_file(&blob_path)?;
@@ -367,7 +361,6 @@ impl<'a> WritableOpenBlob<'a> {
     pub(crate) fn export<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &impl TreeReadOperations,
-        dirty: &mut WritableOpenDirty,
         loc: L,
         hash: &Hash,
         dest: &std::path::Path,
@@ -387,12 +380,7 @@ impl<'a> WritableOpenBlob<'a> {
             return Ok(false);
         }
 
-        remove_blob_entry(
-            &mut self.blob_table,
-            &mut self.blob_lru_queue_table,
-            dirty,
-            inode,
-        )?;
+        remove_blob_entry(&mut self.blob_table, &mut self.blob_lru_queue_table, inode)?;
         let blob_path = self.subsystem.blob_dir.join(inode.hex());
         std::fs::rename(blob_path, dest)?;
 
@@ -408,7 +396,6 @@ impl<'a> WritableOpenBlob<'a> {
         &mut self,
         tree: &mut WritableOpenTree,
         marks: &impl MarkReadOperations,
-        _dirty: &mut WritableOpenDirty, // TODO: mark dirty
         loc: L,
         hash: &Hash,
         metadata: &std::fs::Metadata,
@@ -433,7 +420,6 @@ impl<'a> WritableOpenBlob<'a> {
         // Insert the entry into the table
         self.blob_table
             .insert(inode, Holder::with_content(entry)?)?;
-        //dirty.mark_dirty(inode)?;
 
         let path = self.prepare_blob_file(inode, size)?;
 
@@ -514,7 +500,7 @@ impl<'a> WritableOpenBlob<'a> {
 
             self.blob_table
                 .insert(inode, Holder::with_content(blob_entry)?)?;
-            dirty.mark_dirty(inode)?;
+            dirty.mark_dirty(inode, "verified")?;
         }
 
         Ok(())
@@ -563,11 +549,7 @@ impl<'a> WritableOpenBlob<'a> {
     }
 
     /// Delete blobs as necessary to reach the target total size, in bytes.
-    pub(crate) fn cleanup(
-        &mut self,
-        _dirty: &mut WritableOpenDirty, // TODO: mark dirty
-        target: u64,
-    ) -> Result<(), StorageError> {
+    pub(crate) fn cleanup(&mut self, target: u64) -> Result<(), StorageError> {
         // Get the WorkingArea queue
         let mut queue =
             match get_queue_if_available(&self.blob_lru_queue_table, LruQueueId::WorkingArea)? {
@@ -602,7 +584,6 @@ impl<'a> WritableOpenBlob<'a> {
             remove_from_queue_update_entry(&mut self.blob_table, &current, &mut queue)?;
             removed_count += 1;
             self.blob_table.remove(current_id)?;
-            //dirty.mark_dirty(current_id)?;
 
             // Remove the blob file
             let blob_path = self.subsystem.blob_dir.join(current_id.hex());
@@ -702,7 +683,6 @@ fn update_total_disk_usage(
 fn remove_blob_entry(
     blob_table: &mut redb::Table<'_, Inode, Holder<'static, BlobTableEntry>>,
     blob_lru_queue_table: &mut redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
-    _dirty: &mut WritableOpenDirty, // TODO: mark dirty
     inode: Inode,
 ) -> Result<(), StorageError> {
     let removed = blob_table.remove(inode)?;
@@ -712,7 +692,6 @@ fn remove_blob_entry(
         remove_from_queue(blob_lru_queue_table, blob_table, &entry)?;
     }
 
-    //dirty.mark_dirty(inode)?;
     Ok(())
 }
 
@@ -2541,8 +2520,7 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         {
             let mut blobs = txn.write_blobs()?;
-            let mut dirty = txn.write_dirty()?;
-            blobs.cleanup(&mut dirty, target_size)?;
+            blobs.cleanup(target_size)?;
         }
         txn.commit()?;
 
@@ -2597,8 +2575,7 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         {
             let mut blobs = txn.write_blobs()?;
-            let mut dirty = txn.write_dirty()?;
-            blobs.cleanup(&mut dirty, 0)?;
+            blobs.cleanup(0)?;
         }
         txn.commit()?;
 
@@ -2643,8 +2620,7 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         {
             let mut blobs = txn.write_blobs()?;
-            let mut dirty = txn.write_dirty()?;
-            blobs.cleanup(&mut dirty, target_size)?;
+            blobs.cleanup(target_size)?;
         }
         txn.commit()?;
 
@@ -2675,8 +2651,7 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         {
             let mut blobs = txn.write_blobs()?;
-            let mut dirty = txn.write_dirty()?;
-            blobs.cleanup(&mut dirty, 1000)?;
+            blobs.cleanup(1000)?;
         }
         txn.commit()?;
 
@@ -2742,8 +2717,7 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         {
             let mut blobs = txn.write_blobs()?;
-            let mut dirty = txn.write_dirty()?;
-            blobs.cleanup(&mut dirty, target_size)?;
+            blobs.cleanup(target_size)?;
         }
         txn.commit()?;
 

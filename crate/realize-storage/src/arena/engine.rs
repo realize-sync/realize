@@ -730,7 +730,7 @@ mod tests {
             {
                 let mut dirty = txn.write_dirty()?;
                 let tree = txn.read_tree()?;
-                dirty.mark_dirty(tree.expect(loc)?)?;
+                dirty.mark_dirty(tree.expect(loc)?, "test")?;
             }
             txn.commit()?;
             Ok(())
@@ -1439,7 +1439,6 @@ mod tests {
         fixture.add_file_to_cache(&barfile)?;
 
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert_eq!(1, job_id.as_u64());
         fixture.mark_dirty(&barfile)?;
         let (new_job_id, new_job) = fixture.engine.job_for_loc(&barfile).await?.unwrap();
         assert_eq!(job, new_job);

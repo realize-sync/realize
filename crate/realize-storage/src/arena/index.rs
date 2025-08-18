@@ -538,7 +538,7 @@ impl<'a> WritableOpenIndex<'a> {
                 inode,
                 Holder::with_content(FileTableEntry::new(path.clone(), size, mtime, hash))?,
             )?;
-            dirty.mark_dirty(inode)?;
+            dirty.mark_dirty(inode, "indexed")?;
             history.report_added(&path, old_hash.as_ref())?;
         }
         Ok(inode)
@@ -564,7 +564,7 @@ impl<'a> WritableOpenIndex<'a> {
                 Some(existing) => existing.value().parse()?,
             };
             if tree.remove_and_decref(inode, &mut self.table, inode)? {
-                dirty.mark_dirty(inode)?;
+                dirty.mark_dirty(inode, "unindexed")?;
                 history.report_removed(&path, &hash)?;
 
                 return Ok(true);
@@ -595,7 +595,7 @@ impl<'a> WritableOpenIndex<'a> {
                 Some(existing) => existing.value().parse()?,
             };
             if tree.remove_and_decref(inode, &mut self.table, inode)? {
-                dirty.mark_dirty(inode)?;
+                dirty.mark_dirty(inode, "dropped")?;
                 history.report_dropped(&path, &hash)?;
 
                 return Ok(true);
@@ -628,7 +628,7 @@ impl<'a> WritableOpenIndex<'a> {
             |inode| inode,
             |inode, v| {
                 let FileTableEntry { path, hash, .. } = v.parse()?;
-                dirty.mark_dirty(inode)?;
+                dirty.mark_dirty(inode, "unindexed")?;
                 history.report_removed(&path, &hash)?;
 
                 Ok(true)

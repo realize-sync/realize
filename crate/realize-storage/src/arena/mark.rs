@@ -184,7 +184,7 @@ impl<'a> WritableOpenMark<'a> {
             Holder::with_content(MarkTableEntry { mark })?,
         )?;
         if old_mark != mark {
-            dirty.mark_dirty_recursive(tree, inode)?;
+            dirty.mark_dirty_recursive(tree, inode, "marked")?;
         }
 
         Ok(())
@@ -209,7 +209,7 @@ impl<'a> WritableOpenMark<'a> {
         let old_mark = self.get_at_inode(tree, inode)?;
         let removed = tree.remove_and_decref(inode, &mut self.table, inode)?;
         if removed && old_mark != self.get_at_inode(tree, inode)? {
-            dirty.mark_dirty_recursive(tree, inode)?;
+            dirty.mark_dirty_recursive(tree, inode, "unmarked")?;
         }
 
         Ok(())
