@@ -366,7 +366,7 @@ impl ArenaCache {
             let txn = self.db.begin_read()?;
             let blobs = txn.read_blobs()?;
             if let Some(info) = blobs.get_with_inode(inode)? {
-                return Blob::open_with_info(Arc::clone(&self.db), info);
+                return Blob::open_with_info(&self.db, info);
             }
         }
 
@@ -380,7 +380,7 @@ impl ArenaCache {
             let mut tree = txn.write_tree()?;
             let marks = txn.read_marks()?;
             let info = blobs.create(&mut tree, &marks, inode, &file_entry.hash, file_entry.size)?;
-            Blob::open_with_info(Arc::clone(&self.db), info)?
+            Blob::open_with_info(&self.db, info)?
         };
         txn.commit()?;
 

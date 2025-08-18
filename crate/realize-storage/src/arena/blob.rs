@@ -78,6 +78,7 @@ impl<'a> WritableOpenBlob<'a> {
 }
 
 /// Public information about the blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlobInfo {
     pub(crate) inode: Inode,
     pub(crate) size: u64,
@@ -91,7 +92,6 @@ pub(crate) struct BlobInfo {
     /// [WritableOpenBlob::cleanup].
     ///
     /// Protected blobs belong to the protected LRU queue.
-    #[allow(dead_code)] // for later
     pub(crate) protected: bool,
 
     /// If true, content of the file was verified against the hash.
@@ -900,7 +900,7 @@ pub struct Blob {
 impl Blob {
     #[allow(dead_code)] // for later
     pub(crate) fn open<'a, L: Into<TreeLoc<'a>>>(
-        db: Arc<ArenaDatabase>,
+        db: &Arc<ArenaDatabase>,
         loc: L,
     ) -> Result<Blob, StorageError> {
         let info = {
@@ -915,7 +915,7 @@ impl Blob {
     }
 
     pub(crate) fn open_with_info(
-        db: Arc<ArenaDatabase>,
+        db: &Arc<ArenaDatabase>,
         info: BlobInfo,
     ) -> Result<Self, StorageError> {
         let blob_dir = db.blobs().blob_dir.as_path();
@@ -938,7 +938,7 @@ impl Blob {
             inode: info.inode,
             file: tokio::fs::File::from_std(file),
             available_ranges: info.available_ranges,
-            db,
+            db: Arc::clone(db),
             pending_ranges: ByteRanges::new(),
             size: info.size,
             hash: info.hash,
@@ -1227,6 +1227,7 @@ mod tests {
     use crate::arena::arena_cache::ArenaCache;
     use crate::arena::db::{ArenaReadTransaction, ArenaWriteTransaction};
     use crate::arena::mark;
+    use crate::utils::hash;
     use crate::{Inode, Mark, Notification};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
@@ -1441,30 +1442,137 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn open_file_creates_multiple_blobs_and_files() -> anyhow::Result<()> {
+    #[test]
+    fn create_blob() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
+        let txn = fixture.begin_write()?;
+        let mut blobs = txn.write_blobs()?;
+        let marks = txn.write_marks()?;
+        let mut tree = txn.write_tree()?;
+        let path = Path::parse("blob/test.txt")?;
 
-        let inode1 = fixture.add_file("test1.txt", 100)?;
-        let inode2 = fixture.add_file("test2.txt", 200)?;
-        let inode3 = fixture.add_file("test3.txt", 300)?;
+        let info = blobs.create(&mut tree, &marks, &path, &hash::digest("test"), 4)?;
+        assert_eq!(hash::digest("test"), info.hash);
+        assert_eq!(4, info.size);
+        assert_eq!(ByteRanges::new(), info.available_ranges);
 
-        assert_eq!(inode1, acache.open_file(inode1)?.inode);
-        assert_eq!(inode2, acache.open_file(inode2)?.inode);
-        assert_eq!(inode3, acache.open_file(inode3)?.inode);
+        let inode = info.inode;
+        assert_eq!(tree.resolve(path)?, Some(inode));
+        assert_eq!(Some(info), blobs.get_with_inode(inode)?);
 
-        assert!(fixture.blob_entry_exists(inode1)?);
-        assert!(fixture.blob_entry_exists(inode2)?);
-        assert!(fixture.blob_entry_exists(inode3)?);
+        let file_path = fixture.blob_path(inode);
+        assert!(file_path.exists());
+        let m = file_path.metadata()?;
+        assert_eq!(4, m.len());
+        assert_eq!(0, m.blocks()); // sparse file
 
-        assert!(fixture.blob_path(inode1).exists());
-        assert!(fixture.blob_path(inode2).exists());
-        assert!(fixture.blob_path(inode3).exists());
+        Ok(())
+    }
 
-        assert_eq!(100, fixture.blob_path(inode1).metadata()?.len());
-        assert_eq!(200, fixture.blob_path(inode2).metadata()?.len());
-        assert_eq!(300, fixture.blob_path(inode3).metadata()?.len());
+    #[tokio::test]
+    async fn recreate_blob() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.begin_write()?;
+        let mut blobs = txn.write_blobs()?;
+        let marks = txn.write_marks()?;
+        let mut tree = txn.write_tree()?;
+        let path = Path::parse("blob/test1.txt")?;
+
+        let old_info = blobs.create(&mut tree, &marks, &path, &hash::digest("old"), 3)?;
+        {
+            let mut blob = Blob::open_with_info(&fixture.db, old_info)?;
+            blob.write_all(b"old").await?;
+            blob.flush().await?;
+        }
+
+        let new_info = blobs.create(&mut tree, &marks, &path, &hash::digest("new!"), 4)?;
+
+        let actual_info = blobs.get_with_inode(new_info.inode)?.unwrap();
+        assert_eq!(actual_info, new_info);
+
+        let m = fixture.blob_path(actual_info.inode).metadata()?;
+        assert_eq!(4, m.len());
+        assert_eq!(0, m.blocks()); // sparse file
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_blob_noop_if_same_hash() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let path = Path::parse("blob/test1.txt")?;
+
+        let txn = fixture.begin_write()?;
+        {
+            let mut blobs = txn.write_blobs()?;
+            let marks = txn.write_marks()?;
+            let mut tree = txn.write_tree()?;
+            blobs.create(&mut tree, &marks, &path, &hash::digest("old"), 3)?;
+        }
+        txn.commit()?;
+
+        {
+            let mut blob = Blob::open(&fixture.db, &path)?;
+            blob.write_all(b"old").await?;
+            blob.flush().await?;
+        }
+
+        let txn = fixture.begin_write()?;
+        let mut blobs = txn.write_blobs()?;
+        let marks = txn.write_marks()?;
+        let mut tree = txn.write_tree()?;
+
+        // create does nothing given the same hash
+        let actual_info = blobs.get(&mut tree, &path)?.unwrap();
+        let new_info = blobs.create(&mut tree, &marks, &path, &hash::digest("old"), 3)?;
+
+        // neither the info nor the file data was modified.
+        assert_eq!(actual_info, new_info);
+        assert_eq!(
+            "old",
+            std::fs::read_to_string(fixture.blob_path(actual_info.inode))?
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn create_blob_with_mark() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.begin_write()?;
+        let mut marks = txn.write_marks()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut tree = txn.write_tree()?;
+
+        let watch_path = Path::parse("watch")?;
+        marks.set(&mut tree, &mut dirty, &watch_path, Mark::Watch)?;
+
+        let keep_path = Path::parse("keep")?;
+        marks.set(&mut tree, &mut dirty, &keep_path, Mark::Keep)?;
+
+        let own_path = Path::parse("own")?;
+        marks.set(&mut tree, &mut dirty, &own_path, Mark::Own)?;
+
+        let hash = test_hash();
+        assert_eq!(
+            false,
+            blobs
+                .create(&mut tree, &marks, &watch_path, &hash, 4)?
+                .protected
+        );
+        assert_eq!(
+            true,
+            blobs
+                .create(&mut tree, &marks, &keep_path, &hash, 4)?
+                .protected
+        );
+        assert_eq!(
+            true,
+            blobs
+                .create(&mut tree, &marks, &own_path, &hash, 4)?
+                .protected
+        );
 
         Ok(())
     }
