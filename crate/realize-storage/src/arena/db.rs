@@ -1,3 +1,4 @@
+use super::blob::{BlobReadOperations, Blobs, ReadableOpenBlob, WritableOpenBlob};
 use super::dirty::{Dirty, DirtyReadOperations, ReadableOpenDirty, WritableOpenDirty};
 use super::history::{History, HistoryReadOperations, ReadableOpenHistory, WritableOpenHistory};
 use super::index::{IndexReadOperations, ReadableOpenIndex, WritableOpenIndex};
@@ -169,40 +170,49 @@ struct Subsystems {
     tree: Tree,
     dirty: Dirty,
     history: History,
+    blobs: Blobs,
 }
 
 impl ArenaDatabase {
     #[cfg(test)]
-    pub fn for_testing_single_arena(arena: realize_types::Arena) -> anyhow::Result<Arc<Self>> {
+    pub fn for_testing_single_arena<P: AsRef<std::path::Path>>(
+        arena: realize_types::Arena,
+        blob_dir: P,
+    ) -> anyhow::Result<Arc<Self>> {
         ArenaDatabase::for_testing(
             arena,
             crate::InodeAllocator::new(
                 crate::GlobalDatabase::new(crate::utils::redb_utils::in_memory()?)?,
                 [arena],
             )?,
+            blob_dir,
         )
     }
 
     #[cfg(test)]
-    pub fn for_testing(
+    pub fn for_testing<P: AsRef<std::path::Path>>(
         arena: realize_types::Arena,
         allocator: Arc<crate::InodeAllocator>,
+        blob_dir: P,
     ) -> anyhow::Result<Arc<Self>> {
         Ok(ArenaDatabase::new(
             crate::utils::redb_utils::in_memory()?,
             arena,
             allocator,
+            blob_dir,
         )?)
     }
 
-    pub fn new(
+    pub fn new<P: AsRef<std::path::Path>>(
         db: redb::Database,
         arena: Arena,
         allocator: Arc<InodeAllocator>,
+        blob_dir: P,
     ) -> Result<Arc<Self>, StorageError> {
         let tree = Tree::new(arena, allocator)?;
         let dirty: Dirty;
         let history: History;
+        let blob = Blobs::new(blob_dir.as_ref());
         let txn = db.begin_write()?;
         {
             // Create tables so they can safely be queried in read
@@ -238,6 +248,7 @@ impl ArenaDatabase {
                 tree,
                 dirty,
                 history,
+                blobs: blob,
             },
         }))
     }
@@ -263,6 +274,11 @@ impl ArenaDatabase {
     #[allow(dead_code)]
     pub fn history(&self) -> &History {
         &self.subsystems.history
+    }
+
+    /// Return handle on the Blobs subsystem.
+    pub fn blobs(&self) -> &Blobs {
+        &self.subsystems.blobs
     }
 
     pub fn begin_write(&self) -> Result<ArenaWriteTransaction<'_>, StorageError> {
@@ -341,18 +357,6 @@ impl<'db> ArenaWriteTransaction<'db> {
         &'txn self,
     ) -> Result<Table<'txn, &'static str, u64>, StorageError> {
         Ok(self.inner.open_table(NOTIFICATION_TABLE)?)
-    }
-
-    pub fn blob_table<'txn>(
-        &'txn self,
-    ) -> Result<Table<'txn, Inode, Holder<'static, BlobTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(BLOB_TABLE)?)
-    }
-
-    pub fn blob_lru_queue_table<'txn>(
-        &'txn self,
-    ) -> Result<Table<'txn, u16, Holder<'static, QueueTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(BLOB_LRU_QUEUE_TABLE)?)
     }
 
     #[track_caller]
@@ -446,6 +450,28 @@ impl<'db> ArenaWriteTransaction<'db> {
 
     #[allow(dead_code)]
     #[track_caller]
+    pub(crate) fn read_blobs(&self) -> Result<impl BlobReadOperations, StorageError> {
+        Ok(ReadableOpenBlob::new(
+            self.inner
+                .open_table(BLOB_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
+        ))
+    }
+
+    #[allow(dead_code)]
+    #[track_caller]
+    pub(crate) fn write_blobs(&self) -> Result<WritableOpenBlob<'_>, StorageError> {
+        Ok(WritableOpenBlob::new(
+            self.inner
+                .open_table(BLOB_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
+            self.inner.open_table(BLOB_LRU_QUEUE_TABLE)?,
+            &self.subsystems.blobs,
+        ))
+    }
+
+    #[allow(dead_code)]
+    #[track_caller]
     pub(crate) fn read_index(&self) -> Result<impl IndexReadOperations, StorageError> {
         Ok(ReadableOpenIndex::new(
             self.inner
@@ -487,17 +513,18 @@ impl<'db> ArenaReadTransaction<'db> {
         Ok(self.inner.open_table(NOTIFICATION_TABLE)?)
     }
 
-    pub fn blob_table(
-        &self,
-    ) -> Result<ReadOnlyTable<Inode, Holder<'static, BlobTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(BLOB_TABLE)?)
-    }
-
     #[allow(dead_code)]
     pub fn blob_lru_queue_table(
         &self,
     ) -> Result<ReadOnlyTable<u16, Holder<'static, QueueTableEntry>>, StorageError> {
         Ok(self.inner.open_table(BLOB_LRU_QUEUE_TABLE)?)
+    }
+
+    #[allow(dead_code)]
+    pub fn blob_table(
+        &self,
+    ) -> Result<ReadOnlyTable<Inode, Holder<'static, BlobTableEntry>>, StorageError> {
+        Ok(self.inner.open_table(BLOB_TABLE)?)
     }
 
     #[allow(dead_code)]
@@ -538,6 +565,16 @@ impl<'db> ArenaReadTransaction<'db> {
         Ok(ReadableOpenMark::new(
             self.inner
                 .open_table(MARK_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
+        ))
+    }
+
+    #[allow(dead_code)]
+    #[track_caller]
+    pub(crate) fn read_blobs(&self) -> Result<impl BlobReadOperations, StorageError> {
+        Ok(ReadableOpenBlob::new(
+            self.inner
+                .open_table(BLOB_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
         ))
     }
@@ -640,7 +677,10 @@ mod tests {
         fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
 
-            let db = ArenaDatabase::for_testing_single_arena(Arena::from("myarena"))?;
+            let db = ArenaDatabase::for_testing_single_arena(
+                Arena::from("myarena"),
+                std::path::Path::new("/dev/null"),
+            )?;
 
             Ok(Self { db })
         }

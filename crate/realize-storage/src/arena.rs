@@ -55,6 +55,7 @@ impl ArenaStorage {
             redb_utils::open(&arena_config.db).await?,
             arena,
             Arc::clone(allocator),
+            &arena_config.blob_dir,
         )?;
         let arena_cache = ArenaCache::new(arena, Arc::clone(&db), &arena_config.blob_dir)?;
         let indexed = match arena_config.root.as_ref() {

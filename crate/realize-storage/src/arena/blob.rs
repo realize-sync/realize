@@ -1,11 +1,14 @@
-use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
+use super::db::ArenaDatabase;
+use super::dirty::WritableOpenDirty;
 use super::hasher::hash_file;
-use super::types::{BlobTableEntry, LocalAvailability, LruQueueId, QueueTableEntry};
+use super::mark::MarkReadOperations;
+use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
+use super::types::{BlobTableEntry, LocalAvailability, LruQueueId, Mark, QueueTableEntry};
 use crate::StorageError;
 use crate::types::Inode;
 use crate::utils::holder::Holder;
 use realize_types::{ByteRange, ByteRanges, Hash};
-use redb::ReadableTable;
+use redb::{ReadableTable, Table};
 use std::cmp::min;
 use std::collections::HashMap;
 use std::io::{SeekFrom, Write};
@@ -24,118 +27,277 @@ use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt as
 // correspond to the actual value, as it depends on the filesystem.
 const INODE_DISK_USAGE: u64 = 512;
 
-/// A blob store that handles blob-specific operations.
-///
-/// This struct contains blob-specific logic and database operations.
-pub(crate) struct Blobstore {
-    db: Arc<ArenaDatabase>,
+pub(crate) struct Blobs {
     blob_dir: PathBuf,
     /// Reference counter for open blobs. Maps Inode to the number of open handles.
     open_blobs: OpenBlobRefCounter,
 }
-
-impl Blobstore {
-    /// Create a new Blobstore from a database and blob directory.
-    pub(crate) fn new(
-        db: Arc<ArenaDatabase>,
-        blob_dir: &std::path::Path,
-    ) -> Result<Arc<Self>, StorageError> {
-        // Ensure the database has the required blob table
-        {
-            let txn = db.begin_write()?;
-            txn.blob_table()?;
-            txn.commit()?;
-        }
-
-        if !blob_dir.exists() {
-            std::fs::create_dir_all(&blob_dir)?;
-        }
-
-        Ok(Arc::new(Self {
-            db,
+impl Blobs {
+    pub(crate) fn new(blob_dir: &std::path::Path) -> Blobs {
+        Self {
             blob_dir: blob_dir.to_path_buf(),
             open_blobs: OpenBlobRefCounter::new(),
-        }))
+        }
+    }
+}
+
+pub(crate) struct ReadableOpenBlob<T>
+where
+    T: ReadableTable<Inode, Holder<'static, BlobTableEntry>>,
+{
+    blob_table: T,
+}
+
+impl<T> ReadableOpenBlob<T>
+where
+    T: ReadableTable<Inode, Holder<'static, BlobTableEntry>>,
+{
+    pub(crate) fn new(blob_table: T) -> Self {
+        Self { blob_table }
+    }
+}
+
+pub(crate) struct WritableOpenBlob<'a> {
+    blob_table: Table<'a, Inode, Holder<'static, BlobTableEntry>>,
+    blob_lru_queue_table: Table<'a, u16, Holder<'static, QueueTableEntry>>,
+    subsystem: &'a Blobs,
+}
+
+impl<'a> WritableOpenBlob<'a> {
+    pub(crate) fn new(
+        blob_table: Table<'a, Inode, Holder<'static, BlobTableEntry>>,
+        blob_lru_queue_table: Table<'a, u16, Holder<'static, QueueTableEntry>>,
+        subsystem: &'a Blobs,
+    ) -> Self {
+        Self {
+            blob_table,
+            blob_lru_queue_table,
+            subsystem: subsystem,
+        }
+    }
+}
+
+/// Public information about the blob.
+pub(crate) struct BlobInfo {
+    pub(crate) inode: Inode,
+    pub(crate) size: u64,
+    pub(crate) hash: Hash,
+
+    /// Byte ranges for which data is available locally.
+    /// May be empty or may be the entire range [0, size).]
+    pub(crate) available_ranges: ByteRanges,
+
+    /// If true, local data will not be deleted by
+    /// [WritableOpenBlob::cleanup].
+    ///
+    /// Protected blobs belong to the protected LRU queue.
+    #[allow(dead_code)] // for later
+    pub(crate) protected: bool,
+
+    /// If true, content of the file was verified against the hash.
+    pub(crate) verified: bool,
+}
+
+impl BlobInfo {
+    fn new(inode: Inode, entry: BlobTableEntry) -> Self {
+        Self {
+            inode,
+            size: entry.content_size,
+            hash: entry.content_hash,
+            available_ranges: entry.written_areas,
+            protected: entry.queue == LruQueueId::Protected,
+            verified: entry.verified,
+        }
+    }
+}
+
+/// Read operations for blobs. See also [BlobExt].
+pub(crate) trait BlobReadOperations {
+    /// Return some info about the blob.
+    ///
+    /// This call returns [StorageError::NotFound] if the blob doesn't
+    /// exist on the database. Use [WritableOpenBlob::create] to
+    /// create the blob entry.
+    fn get_with_inode(&self, inode: Inode) -> Result<Option<BlobInfo>, StorageError>;
+}
+
+impl<'a, T> BlobReadOperations for ReadableOpenBlob<T>
+where
+    T: ReadableTable<Inode, Holder<'static, BlobTableEntry>>,
+{
+    fn get_with_inode(&self, inode: Inode) -> Result<Option<BlobInfo>, StorageError> {
+        get_read_op(&self.blob_table, inode)
+    }
+}
+
+impl<'a> BlobReadOperations for WritableOpenBlob<'a> {
+    fn get_with_inode(&self, inode: Inode) -> Result<Option<BlobInfo>, StorageError> {
+        get_read_op(&self.blob_table, inode)
+    }
+}
+
+/// Extend [BlobReadOperations] with convenience functions.
+#[allow(dead_code)] // for later
+pub(crate) trait BlobExt {
+    /// Open the blob and return a handle on it.
+    ///
+    /// This call returns None if the blob doesn't exist on the
+    /// database. Use [WritableOpenBlob::create] to create the
+    /// blob entry.
+    fn get<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<Option<BlobInfo>, StorageError>;
+
+    /// Returns local availability for the blob.
+    ///
+    /// Note that non-existing as well as empty blobs have
+    /// [LocalAvailability::Missing].
+    fn local_availability<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<LocalAvailability, StorageError>;
+}
+
+impl<T: BlobReadOperations> BlobExt for T {
+    fn get<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<Option<BlobInfo>, StorageError> {
+        if let Some(inode) = tree.resolve(loc)? {
+            self.get_with_inode(inode)
+        } else {
+            Ok(None)
+        }
     }
 
-    /// Open an existing blob and returns its [Blob]
-    pub(crate) fn open_blob(
-        self: &Arc<Self>,
-        txn: &ArenaReadTransaction,
-        inode: Inode,
-    ) -> Result<Blob, StorageError> {
-        let blob_table = txn.blob_table()?;
-        let blob_entry = get_blob_entry(&blob_table, inode)?;
-        let file = self.open_blob_file(inode, blob_entry.content_size, false)?;
+    fn local_availability<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<LocalAvailability, StorageError> {
+        if let Some(blob_info) = self.get(tree, loc)? {
+            let file_range = ByteRanges::single(0, blob_info.size);
+            if file_range == file_range.intersection(&blob_info.available_ranges) {
+                // Check if the blob is verified
+                if blob_info.verified {
+                    return Ok(LocalAvailability::Verified);
+                } else {
+                    return Ok(LocalAvailability::Complete);
+                }
+            }
+            if blob_info.available_ranges.is_empty() {
+                return Ok(LocalAvailability::Missing);
+            }
 
-        return Ok(Blob::new(inode, blob_entry, file, Arc::clone(self)));
+            Ok(LocalAvailability::Partial(
+                blob_info.size,
+                blob_info.available_ranges,
+            ))
+        } else {
+            Ok(LocalAvailability::Missing)
+        }
     }
+}
 
-    /// Create a new blob and returns its [Blob]
-    pub(crate) fn create_blob(
-        self: &Arc<Self>,
-        txn: &ArenaWriteTransaction,
+impl<'a> WritableOpenBlob<'a> {
+    /// Create a new blob and prepare its associated file.
+    ///
+    /// The blob is put into the queue appropriate for the current
+    /// mark, reported by `mark` (working LRU queue for watch and
+    /// protected queue for keep and own).
+    ///
+    /// If a blob already exists with the same inode and hash, it is
+    /// reused and this call then works just like
+    /// [BlobReadOperations::get].
+    ///
+    /// If a blob already exists with the same inode, but another
+    /// hash, it is overwritten and its data cleared.
+    pub(crate) fn create<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        marks: &impl MarkReadOperations,
+        loc: L,
         hash: &Hash,
         size: u64,
-        queue: LruQueueId,
-        inode: Inode,
-    ) -> Result<Blob, StorageError> {
-        let mut blob_table = txn.blob_table()?;
-        let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
-        let file = self.open_blob_file(inode, size, true)?;
-        let blob_entry = init_blob_entry(
-            &mut blob_lru_queue_table,
-            &mut blob_table,
+    ) -> Result<BlobInfo, StorageError> {
+        let inode = tree.setup(loc)?;
+
+        // Check if blob already exists and get the hash if it does
+        let existing_entry = if let Some(e) = self.blob_table.get(inode)? {
+            Some(e.value().parse()?)
+        } else {
+            None
+        };
+        if let Some(e) = existing_entry {
+            if e.content_hash == *hash {
+                return Ok(BlobInfo::new(inode, e));
+            }
+
+            // Existing entry cannot be reuse; remove.
+            remove_from_queue(&mut self.blob_lru_queue_table, &mut self.blob_table, &e)?;
+        }
+
+        let blob_path = self.prepare_blob_file(inode, size)?;
+        let queue = choose_queue(tree, marks, inode)?;
+        let entry = init_blob_entry(
+            &mut self.blob_lru_queue_table,
+            &mut self.blob_table,
             inode,
             queue,
             hash,
-            &file.metadata()?,
+            &blob_path.metadata()?,
         )?;
-        blob_table.insert(inode, Holder::new(&blob_entry)?)?;
 
-        Ok(Blob::new(inode, blob_entry, file, Arc::clone(self)))
+        log::debug!("Created blob {inode} in {queue:?} at {blob_path:?}");
+
+        self.blob_table.insert(inode, Holder::new(&entry)?)?;
+
+        Ok(BlobInfo::new(inode, entry))
     }
 
-    /// Open or create a file for the blob and make sure it has the
-    /// right size.
-    fn open_blob_file(
-        &self,
-        inode: Inode,
-        file_size: u64,
-        new_file: bool,
-    ) -> Result<std::fs::File, StorageError> {
-        let path = self.blob_path(inode);
+    fn prepare_blob_file(&mut self, inode: Inode, size: u64) -> Result<PathBuf, StorageError> {
+        let blob_dir = self.subsystem.blob_dir.as_path();
+        let blob_path = blob_dir.join(inode.hex());
+        if !blob_dir.exists() {
+            std::fs::create_dir_all(blob_dir)?;
+        }
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .truncate(new_file)
+            .truncate(true)
             .create(true)
-            .open(path)?;
-        let file_meta = file.metadata()?;
-        if file_size != file_meta.len() {
-            file.set_len(file_size)?;
-            file.flush()?;
+            .open(&blob_path)?;
+        if size != 0 {
+            file.set_len(size)?;
         }
+        file.flush()?;
 
-        Ok(file)
+        Ok(blob_path)
     }
 
-    /// Return the path of the file for the given blob.
-    fn blob_path(&self, inode: Inode) -> PathBuf {
-        self.blob_dir.join(inode.hex())
-    }
-
-    /// Delete a blob and its associated file.
-    pub(crate) fn delete_blob(
-        &self,
-        txn: &ArenaWriteTransaction,
-        inode: Inode,
+    /// Delete the blob and its associated data on filesystem, if it exists.
+    pub(crate) fn delete<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &impl TreeReadOperations,
+        dirty: &mut WritableOpenDirty,
+        loc: L,
     ) -> Result<(), StorageError> {
-        let mut blob_table = txn.blob_table()?;
-        let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
-        remove_blob_entry(&mut blob_table, &mut blob_lru_queue_table, inode)?;
+        let inode = match tree.resolve(loc)? {
+            Some(inode) => inode,
+            None => return Ok(()), // Nothing to delete
+        };
 
-        let blob_path = self.blob_path(inode);
+        remove_blob_entry(
+            &mut self.blob_table,
+            &mut self.blob_lru_queue_table,
+            dirty,
+            inode,
+        )?;
+        let blob_path = self.subsystem.blob_dir.join(inode.hex());
         if blob_path.exists() {
             std::fs::remove_file(&blob_path)?;
         }
@@ -143,105 +305,96 @@ impl Blobstore {
         Ok(())
     }
 
-    /// Mark a blob as accessed by moving it to the front of its queue.
-    #[allow(dead_code)]
-    pub(crate) fn mark_accessed(&self, inode: Inode) -> Result<(), StorageError> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut blob_table = txn.blob_table()?;
-            let mut blob_entry = get_blob_entry(&blob_table, inode)?;
-            if blob_entry.prev.is_none() {
-                // Already the head
+    /// Move the blob into or out of the protected queue.
+    ///
+    /// Does nothing if the blob doesn't exist.
+    #[allow(dead_code)] // for later
+    fn set_protected<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        loc: L,
+        protected: bool,
+    ) -> Result<(), StorageError> {
+        let inode = match tree.resolve(loc)? {
+            Some(inode) => inode,
+            None => return Ok(()), // Nothing to modify
+        };
+
+        let mut blob_entry = match self.blob_table.get(inode)? {
+            None => {
                 return Ok(());
             }
+            Some(v) => v.value().parse()?,
+        };
+        let new_queue = if protected {
+            LruQueueId::Protected
+        } else {
+            LruQueueId::WorkingArea
+        };
 
-            let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
-            move_to_front(
-                &mut blob_lru_queue_table,
-                &mut blob_table,
-                inode,
-                &mut blob_entry,
-            )?;
-
-            blob_table.insert(inode, Holder::with_content(blob_entry)?)?;
+        // If the queue is already correct, nothing to do
+        if blob_entry.queue == new_queue {
+            return Ok(());
         }
-        txn.commit()?;
+
+        // Remove from current queue
+        remove_from_queue(
+            &mut self.blob_lru_queue_table,
+            &mut self.blob_table,
+            &blob_entry,
+        )?;
+
+        // Add to new queue
+        add_to_queue_front(
+            &mut self.blob_lru_queue_table,
+            &mut self.blob_table,
+            new_queue,
+            inode,
+            &mut blob_entry,
+        )?;
+
+        // Update the entry in the table
+        self.blob_table
+            .insert(inode, Holder::with_content(blob_entry)?)?;
 
         Ok(())
     }
 
-    /// Extend the local availability of a blob.
-    pub(crate) fn extend_local_availability(
-        &self,
-        inode: Inode,
-        new_range: &ByteRanges,
-    ) -> Result<(), StorageError> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut blob_table = txn.blob_table()?;
-            let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
-            let mut blob_entry = get_blob_entry(&blob_table, inode)?;
-
-            blob_entry.written_areas = blob_entry.written_areas.union(&new_range);
-            log::debug!(
-                "{inode} extended by {new_range}; available: {}",
-                blob_entry.written_areas
-            );
-            if let Ok(metadata) = self.blob_path(inode).metadata() {
-                update_disk_usage(&mut blob_lru_queue_table, &mut blob_entry, &metadata)?;
-            }
-            // This function is not an appropriate place to complain
-            // about missing file; just ignore the issue for now.
-
-            blob_table.insert(inode, Holder::new(&blob_entry)?)?;
-        }
-        txn.commit()?;
-
-        Ok(())
-    }
-
-    fn mark_verified(&self, inode: Inode, hash: Hash) -> Result<(), StorageError> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut blob_table = txn.blob_table()?;
-            let mut blob_entry = get_blob_entry(&blob_table, inode)?;
-            if blob_entry.content_hash == hash {
-                blob_entry.verified = true;
-                log::debug!("{inode} content verified to be {hash}");
-
-                blob_table.insert(inode, Holder::with_content(blob_entry)?)?;
-
-                // dirty because the file state changed and needs to
-                // be check again.
-                txn.write_dirty()?.mark_dirty(inode)?;
-            }
-        }
-        txn.commit()?;
-
-        Ok(())
-    }
-
-    /// Move the file of `inode` to `dest` and delete the entry.
+    /// Move the blob to `dest` and delete the blob entry.
     ///
     /// Does nothing and return false unless the blob content hash is
-    /// `content_hash`, which means that the corresponding file must
-    /// have been fully downloaded and verified before moving.
-    pub(crate) fn move_blob_if_matches(
-        &self,
-        txn: &ArenaWriteTransaction,
-        inode: Inode,
-        content_hash: &Hash,
+    /// `hash` and has been downloaded and verified.
+    pub(crate) fn export<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &impl TreeReadOperations,
+        dirty: &mut WritableOpenDirty,
+        loc: L,
+        hash: &Hash,
         dest: &std::path::Path,
     ) -> Result<bool, StorageError> {
-        let mut blob_table = txn.blob_table()?;
-        let blob_entry = get_blob_entry(&blob_table, inode)?;
-        if blob_entry.content_hash != *content_hash || !blob_entry.verified {
+        let inode = match tree.resolve(loc)? {
+            Some(inode) => inode,
+            None => return Ok(false), // Nothing to export
+        };
+
+        let blob_entry = match self.blob_table.get(inode)? {
+            None => {
+                return Ok(false);
+            }
+            Some(v) => v.value().parse()?,
+        };
+        if blob_entry.content_hash != *hash || !blob_entry.verified {
             return Ok(false);
         }
 
-        let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
-        remove_blob_entry(&mut blob_table, &mut blob_lru_queue_table, inode)?;
-        std::fs::rename(self.blob_path(inode), dest)?;
+        remove_blob_entry(
+            &mut self.blob_table,
+            &mut self.blob_lru_queue_table,
+            dirty,
+            inode,
+        )?;
+        let blob_path = self.subsystem.blob_dir.join(inode.hex());
+        std::fs::rename(blob_path, dest)?;
 
         Ok(true)
     }
@@ -249,48 +402,175 @@ impl Blobstore {
     /// Setup the database to move some existing file into and return the
     /// path to write to.
     ///
-    /// If `inode` is None, an entry is created.
-    pub(crate) fn move_into_blob(
-        &self,
-        txn: &ArenaWriteTransaction,
-        inode: Inode,
+    /// This assumes that the file will be written completely and so
+    /// sets up local availability to complete already (but not verified).
+    pub(crate) fn import<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        marks: &impl MarkReadOperations,
+        _dirty: &mut WritableOpenDirty, // TODO: mark dirty
+        loc: L,
         hash: &Hash,
-        queue: LruQueueId,
         metadata: &std::fs::Metadata,
     ) -> Result<PathBuf, StorageError> {
-        let mut blob_table = txn.blob_table()?;
-        let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
+        let inode = tree.setup(loc)?;
+
+        // Create the blob entry
         let mut entry = init_blob_entry(
-            &mut blob_lru_queue_table,
-            &mut blob_table,
+            &mut self.blob_lru_queue_table,
+            &mut self.blob_table,
             inode,
-            queue,
+            choose_queue(tree, marks, inode)?,
             hash,
             metadata,
         )?;
-        entry.written_areas = ByteRanges::single(0, metadata.len());
-        update_disk_usage(&mut blob_lru_queue_table, &mut entry, metadata)?;
-        blob_table.insert(inode, Holder::with_content(entry)?)?;
 
-        Ok(self.blob_path(inode))
+        // Set written areas to complete (but not verified)
+        let size = metadata.len();
+        entry.written_areas = ByteRanges::single(0, size);
+        update_disk_usage(&mut self.blob_lru_queue_table, &mut entry, metadata)?;
+
+        // Insert the entry into the table
+        self.blob_table
+            .insert(inode, Holder::with_content(entry)?)?;
+        //dirty.mark_dirty(inode)?;
+
+        let path = self.prepare_blob_file(inode, size)?;
+
+        // Return the path where the file should be moved
+        Ok(path)
     }
 
-    /// Remove blobs from the back of the given queue until the total
-    /// disk usage is <= target_size.
+    /// Mark the blob as accessed.
     ///
-    /// This method removes the least recently used blobs first (from the tail
-    /// of the queue) and continues until the total disk usage is at or below
-    /// the target size. Blobs that are currently open will be skipped.
-    pub(crate) fn cleanup_cache(&self, target: u64) -> Result<(), StorageError> {
-        self.cleanup_queue(LruQueueId::WorkingArea, target)
+    /// If the blob is in a LRU queue other than protected, it is put
+    /// at the front of its queue.
+    ///
+    /// Does nothing if the blob doesn't exist.
+    #[allow(dead_code)] // for later
+    fn mark_accessed<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<(), StorageError> {
+        let inode = match tree.resolve(loc)? {
+            Some(inode) => inode,
+            None => return Ok(()), // Nothing to mark
+        };
+
+        let mut blob_entry = match self.blob_table.get(inode)? {
+            None => {
+                return Ok(());
+            }
+            Some(v) => v.value().parse()?,
+        };
+
+        // If already at the head of its queue, nothing to do
+        if blob_entry.prev.is_none() {
+            return Ok(());
+        }
+
+        // Move to the front of the queue
+        move_to_front(
+            &mut self.blob_lru_queue_table,
+            &mut self.blob_table,
+            inode,
+            &mut blob_entry,
+        )?;
+
+        // Update the entry in the table
+        self.blob_table
+            .insert(inode, Holder::with_content(blob_entry)?)?;
+
+        Ok(())
     }
 
-    fn cleanup_queue(&self, queue_id: LruQueueId, target: u64) -> Result<(), StorageError> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut blob_lru_queue_table = txn.blob_lru_queue_table()?;
-            // Get the WorkingArea queue
-            let mut queue = match get_queue_if_available(&blob_lru_queue_table, queue_id)? {
+    /// Mark the blob as complete and verified for the given hash.
+    ///
+    /// Does nothing unless the hash match.
+    fn mark_verified<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &impl TreeReadOperations,
+        dirty: &mut WritableOpenDirty,
+        loc: L,
+        hash: &Hash,
+    ) -> Result<(), StorageError> {
+        let inode = match tree.resolve(loc)? {
+            Some(inode) => inode,
+            None => return Ok(()), // Nothing to mark
+        };
+
+        let mut blob_entry = match self.blob_table.get(inode)? {
+            None => {
+                return Err(StorageError::NotFound);
+            }
+            Some(v) => v.value().parse()?,
+        };
+
+        // Only mark as verified if the hash matches
+        if blob_entry.content_hash == *hash {
+            blob_entry.verified = true;
+            log::debug!("{inode} content verified to be {hash}");
+
+            self.blob_table
+                .insert(inode, Holder::with_content(blob_entry)?)?;
+            dirty.mark_dirty(inode)?;
+        }
+
+        Ok(())
+    }
+
+    /// Extend local availability of the blob with the given range.
+    ///
+    /// If the blob exists and has the same hash as was given, update
+    /// the blob and return true, otherwise do nothing and return
+    /// false.
+    pub(crate) fn extend_local_availability<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+        hash: &Hash,
+        new_range: &ByteRanges,
+    ) -> Result<bool, StorageError> {
+        let inode = match tree.resolve(loc)? {
+            Some(inode) => inode,
+            None => return Ok(false), // Nothing to extend
+        };
+
+        let mut blob_entry = match get_blob_entry(&self.blob_table, inode)? {
+            Some(e) => e,
+            None => return Ok(false),
+        };
+        if blob_entry.content_hash != *hash {
+            return Ok(false);
+        }
+        blob_entry.written_areas = blob_entry.written_areas.union(new_range);
+        log::debug!(
+            "{inode} extended by {new_range}; available: {}",
+            blob_entry.written_areas
+        );
+
+        // Update disk usage if the blob file exists
+        let blob_path = self.subsystem.blob_dir.join(inode.hex());
+        if let Ok(metadata) = blob_path.metadata() {
+            update_disk_usage(&mut self.blob_lru_queue_table, &mut blob_entry, &metadata)?;
+        }
+
+        self.blob_table
+            .insert(inode, Holder::with_content(blob_entry)?)?;
+
+        Ok(true)
+    }
+
+    /// Delete blobs as necessary to reach the target total size, in bytes.
+    pub(crate) fn cleanup(
+        &mut self,
+        _dirty: &mut WritableOpenDirty, // TODO: mark dirty
+        target: u64,
+    ) -> Result<(), StorageError> {
+        // Get the WorkingArea queue
+        let mut queue =
+            match get_queue_if_available(&self.blob_lru_queue_table, LruQueueId::WorkingArea)? {
                 Some(q) => q,
                 None => {
                     // No queue exists, nothing to clean up
@@ -298,48 +578,63 @@ impl Blobstore {
                 }
             };
 
-            log::debug!(
-                "Starting cleanup of {queue_id:?} with disk usage: {}, target: {}",
-                queue.disk_usage,
-                target
-            );
+        log::debug!(
+            "Starting cleanup of WorkingArea with disk usage: {}, target: {}",
+            queue.disk_usage,
+            target
+        );
 
-            let mut blob_table = txn.blob_table()?;
-            let mut prev = queue.tail;
-            let mut removed_count = 0;
-            while let Some(current_id) = prev
-                && queue.disk_usage > target
-            {
-                let current = get_blob_entry(&blob_table, current_id)?;
-                prev = current.prev;
-                if self.open_blobs.is_open(current_id) {
-                    continue;
-                }
-                log::debug!(
-                    "Evicted blob from {queue_id:?}: {current_id} ({} bytes)",
-                    current.disk_usage
-                );
-                remove_from_queue_update_entry(&mut blob_table, &current, &mut queue)?;
-                removed_count += 1;
-                blob_table.remove(current_id)?;
-                let blob_path = self.blob_path(current_id);
-                if blob_path.exists() {
-                    std::fs::remove_file(&blob_path)?;
-                }
+        let mut prev = queue.tail;
+        let mut removed_count = 0;
+        while let Some(current_id) = prev
+            && queue.disk_usage > target
+        {
+            let current = follow_queue_link(&self.blob_table, current_id)?;
+            prev = current.prev;
+
+            if self.subsystem.open_blobs.is_open(current_id) {
+                continue;
             }
             log::debug!(
-                "Evicted {removed_count} entries from {queue_id:?} disk usage now {} (target: {target})",
-                queue.disk_usage
+                "Evicted blob from WorkingArea: {current_id} ({} bytes)",
+                current.disk_usage
             );
-            if removed_count == 0 {
-                return Ok(());
+            remove_from_queue_update_entry(&mut self.blob_table, &current, &mut queue)?;
+            removed_count += 1;
+            self.blob_table.remove(current_id)?;
+            //dirty.mark_dirty(current_id)?;
+
+            // Remove the blob file
+            let blob_path = self.subsystem.blob_dir.join(current_id.hex());
+            if blob_path.exists() {
+                std::fs::remove_file(&blob_path)?;
             }
-            blob_lru_queue_table.insert(queue_id as u16, Holder::with_content(queue)?)?;
         }
-        txn.commit()?;
+
+        log::debug!(
+            "Evicted {removed_count} entries from WorkingArea disk usage now {} (target: {target})",
+            queue.disk_usage
+        );
+
+        if removed_count > 0 {
+            self.blob_lru_queue_table
+                .insert(LruQueueId::WorkingArea as u16, Holder::with_content(queue)?)?;
+        }
 
         Ok(())
     }
+}
+
+fn choose_queue(
+    tree: &mut WritableOpenTree<'_>,
+    marks: &impl MarkReadOperations,
+    inode: Inode,
+) -> Result<LruQueueId, StorageError> {
+    let queue = match marks.get_at_inode(tree, inode)? {
+        Mark::Watch => LruQueueId::WorkingArea,
+        Mark::Keep | Mark::Own => LruQueueId::Protected,
+    };
+    Ok(queue)
 }
 
 /// Move the blob to the front of its queue
@@ -407,14 +702,18 @@ fn update_total_disk_usage(
 fn remove_blob_entry(
     blob_table: &mut redb::Table<'_, Inode, Holder<'static, BlobTableEntry>>,
     blob_lru_queue_table: &mut redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
+    _dirty: &mut WritableOpenDirty, // TODO: mark dirty
     inode: Inode,
 ) -> Result<(), StorageError> {
     let removed = blob_table.remove(inode)?;
     let removed_entry = removed.map(|r| r.value().parse());
-    Ok(if let Some(entry) = removed_entry {
+    if let Some(entry) = removed_entry {
         let entry = entry?;
         remove_from_queue(blob_lru_queue_table, blob_table, &entry)?;
-    })
+    }
+
+    //dirty.mark_dirty(inode)?;
+    Ok(())
 }
 
 fn get_queue_if_available(
@@ -470,52 +769,23 @@ fn init_blob_entry(
     Ok(entry)
 }
 
-pub(crate) fn blob_exists(txn: &ArenaReadTransaction, id: Inode) -> Result<bool, StorageError> {
-    Ok(txn.blob_table()?.get(id)?.is_some())
-}
-
-pub(crate) fn local_availability(
-    txn: &ArenaReadTransaction,
-    inode: Inode,
-) -> Result<LocalAvailability, StorageError> {
-    let blob_table = txn.blob_table()?;
-    let blob_entry = match get_blob_entry(&blob_table, inode) {
-        Ok(ret) => ret,
-        Err(StorageError::NotFound) => {
-            return Ok(LocalAvailability::Missing);
-        }
-        Err(err) => {
-            return Err(err);
-        }
-    };
-    let file_range = ByteRanges::single(0, blob_entry.content_size);
-    if file_range == file_range.intersection(&blob_entry.written_areas) {
-        if blob_entry.verified {
-            return Ok(LocalAvailability::Verified);
-        }
-        return Ok(LocalAvailability::Complete);
-    }
-    if blob_entry.written_areas.is_empty() {
-        return Ok(LocalAvailability::Missing);
-    }
-
-    Ok(LocalAvailability::Partial(
-        blob_entry.content_size,
-        blob_entry.written_areas,
-    ))
-}
-
 fn get_blob_entry(
     blob_table: &impl redb::ReadableTable<Inode, Holder<'static, BlobTableEntry>>,
     inode: Inode,
-) -> Result<BlobTableEntry, StorageError> {
-    let entry = blob_table
-        .get(inode)?
-        .ok_or(StorageError::NotFound)?
-        .value()
-        .parse()?;
+) -> Result<Option<BlobTableEntry>, StorageError> {
+    if let Some(entry) = blob_table.get(inode)? {
+        Ok(Some(entry.value().parse()?))
+    } else {
+        Ok(None)
+    }
+}
 
-    Ok(entry)
+fn follow_queue_link(
+    blob_table: &impl redb::ReadableTable<Inode, Holder<'static, BlobTableEntry>>,
+    inode: Inode,
+) -> Result<BlobTableEntry, StorageError> {
+    get_blob_entry(blob_table, inode)?
+        .ok_or_else(|| StorageError::InconsistentDatabase(format!("invalid queue link {inode}")))
 }
 
 /// Add a blob to the front of the WorkingArea queue.
@@ -530,7 +800,7 @@ fn add_to_queue_front(
 
     let mut queue = get_queue_if_available(blob_lru_queue_table, queue_id)?.unwrap_or_default();
     if let Some(head_id) = queue.head {
-        let mut head = get_blob_entry(blob_table, head_id)?;
+        let mut head = follow_queue_link(blob_table, head_id)?;
         head.prev = Some(inode);
 
         blob_table.insert(head_id, Holder::with_content(head)?)?;
@@ -573,7 +843,7 @@ fn remove_from_queue_update_entry(
     queue: &mut QueueTableEntry,
 ) -> Result<(), StorageError> {
     if let Some(prev_id) = blob_entry.prev {
-        let mut prev = get_blob_entry(blob_table, prev_id)?;
+        let mut prev = follow_queue_link(blob_table, prev_id)?;
         prev.next = blob_entry.next;
         blob_table.insert(prev_id, Holder::with_content(prev)?)?;
     } else {
@@ -581,7 +851,7 @@ fn remove_from_queue_update_entry(
         queue.head = blob_entry.next;
     }
     if let Some(next_id) = blob_entry.next {
-        let mut next = get_blob_entry(blob_table, next_id)?;
+        let mut next = follow_queue_link(blob_table, next_id)?;
         next.prev = blob_entry.prev;
         blob_table.insert(next_id, Holder::with_content(next)?)?;
     } else {
@@ -623,7 +893,7 @@ pub struct Blob {
     file: tokio::fs::File,
     size: u64,
     hash: Hash,
-    blobstore: Arc<Blobstore>,
+    db: Arc<ArenaDatabase>,
 
     /// Complete available range
     available_ranges: ByteRanges,
@@ -636,24 +906,52 @@ pub struct Blob {
 }
 
 impl Blob {
-    /// Create a new blob from a file and its available byte ranges.
-    pub(crate) fn new(
-        inode: Inode,
-        blob_entry: BlobTableEntry,
-        file: std::fs::File,
-        blobstore: Arc<Blobstore>,
-    ) -> Self {
-        blobstore.open_blobs.increment(inode);
-        Self {
-            inode,
-            file: tokio::fs::File::from_std(file),
-            available_ranges: blob_entry.written_areas,
-            blobstore,
-            pending_ranges: ByteRanges::new(),
-            size: blob_entry.content_size,
-            hash: blob_entry.content_hash,
-            offset: 0,
+    #[allow(dead_code)] // for later
+    pub(crate) fn open<'a, L: Into<TreeLoc<'a>>>(
+        db: Arc<ArenaDatabase>,
+        loc: L,
+    ) -> Result<Blob, StorageError> {
+        let info = {
+            let txn = db.begin_read()?;
+            let tree = txn.read_tree()?;
+            let blobs = txn.read_blobs()?;
+
+            blobs.get(&tree, loc)?.ok_or(StorageError::NotFound)?
+        };
+
+        Self::open_with_info(db, info)
+    }
+
+    pub(crate) fn open_with_info(
+        db: Arc<ArenaDatabase>,
+        info: BlobInfo,
+    ) -> Result<Self, StorageError> {
+        let blob_dir = db.blobs().blob_dir.as_path();
+        let path = blob_dir.join(info.inode.hex());
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .create(true)
+            .open(path)?;
+        let file_meta = file.metadata()?;
+        if info.size != file_meta.len() {
+            file.set_len(info.size)?;
+            file.flush()?;
         }
+
+        db.blobs().open_blobs.increment(info.inode);
+
+        Ok(Self {
+            inode: info.inode,
+            file: tokio::fs::File::from_std(file),
+            available_ranges: info.available_ranges,
+            db,
+            pending_ranges: ByteRanges::new(),
+            size: info.size,
+            hash: info.hash,
+            offset: 0,
+        })
     }
 
     /// Get the size of the corresponding file.
@@ -684,11 +982,6 @@ impl Blob {
         &self.hash
     }
 
-    /// Get Inode used to identify the blob.
-    pub(crate) fn inode(&self) -> Inode {
-        self.inode
-    }
-
     /// Compute hash from the current local content.
     ///
     /// This hashes the entire content, no matter the current offset.
@@ -707,9 +1000,23 @@ impl Blob {
         self.update_db().await?;
 
         let inode = self.inode;
-        let blobstore = self.blobstore.clone();
+        let db = self.db.clone();
         let hash = self.hash.clone();
-        tokio::task::spawn_blocking(move || blobstore.mark_verified(inode, hash)).await?
+        tokio::task::spawn_blocking(move || {
+            let txn = db.begin_write()?;
+            {
+                let mut blobs = txn.write_blobs()?;
+                blobs.mark_verified(
+                    &mut txn.read_tree()?,
+                    &mut txn.write_dirty()?,
+                    inode,
+                    &hash,
+                )?;
+            }
+            txn.commit()?;
+            Ok::<(), StorageError>(())
+        })
+        .await?
     }
 
     /// Make sure any updated content is stored on disk before
@@ -730,12 +1037,38 @@ impl Blob {
 
         let inode = self.inode;
         let ranges = std::mem::take(&mut self.pending_ranges);
-        let blobstore = Arc::clone(&self.blobstore);
+        let db = Arc::clone(&self.db);
+        let hash = self.hash.clone();
+
         let (res, ranges) = tokio::task::spawn_blocking(move || {
-            (blobstore.extend_local_availability(inode, &ranges), ranges)
+            fn extend(
+                db: Arc<ArenaDatabase>,
+                inode: Inode,
+                hash: &Hash,
+                ranges: &ByteRanges,
+            ) -> Result<(), StorageError> {
+                let txn = db.begin_write()?;
+                {
+                    let mut blobs = txn.write_blobs()?;
+                    if !blobs.extend_local_availability(
+                        &mut txn.read_tree()?,
+                        inode,
+                        &hash,
+                        &ranges,
+                    )? {
+                        // The blob has changed in the database
+                        return Err(StorageError::NotFound);
+                    }
+                }
+                txn.commit()?;
+                Ok(())
+            }
+
+            (extend(db, inode, &hash, &ranges), ranges)
         })
         .await?;
-        if !res.is_ok() {
+        if res.is_err() {
+            // Keep the range as pending again, since updating fails.
             self.pending_ranges.extend(ranges);
         }
 
@@ -762,7 +1095,7 @@ impl Blob {
 impl Drop for Blob {
     fn drop(&mut self) {
         // Decrement the reference count when the blob is dropped
-        self.blobstore.open_blobs.decrement(self.inode);
+        self.db.blobs().open_blobs.decrement(self.inode);
     }
 }
 
@@ -885,10 +1218,22 @@ impl OpenBlobRefCounter {
     }
 }
 
+fn get_read_op(
+    blob_table: &impl ReadableTable<Inode, Holder<'static, BlobTableEntry>>,
+    inode: Inode,
+) -> Result<Option<BlobInfo>, StorageError> {
+    if let Some(e) = blob_table.get(inode)? {
+        Ok(Some(BlobInfo::new(inode, e.value().parse()?)))
+    } else {
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::arena::arena_cache::ArenaCache;
+    use crate::arena::db::{ArenaReadTransaction, ArenaWriteTransaction};
     use crate::arena::mark;
     use crate::{Inode, Mark, Notification};
     use assert_fs::TempDir;
@@ -924,11 +1269,10 @@ mod tests {
         arena: Arena,
         acache: Arc<ArenaCache>,
         db: Arc<ArenaDatabase>,
-        blob_dir: PathBuf,
         tempdir: TempDir,
     }
     impl Fixture {
-        async fn setup() -> anyhow::Result<Fixture> {
+        fn setup() -> anyhow::Result<Fixture> {
             let _ = env_logger::try_init();
             let arena = test_arena();
             let tempdir = TempDir::new()?;
@@ -937,14 +1281,13 @@ mod tests {
             if let Some(p) = child.parent() {
                 std::fs::create_dir_all(p)?;
             }
-            let db = ArenaDatabase::for_testing_single_arena(arena)?;
+            let db = ArenaDatabase::for_testing_single_arena(arena, blob_dir.path())?;
             let acache = ArenaCache::new(arena, Arc::clone(&db), blob_dir.path())?;
 
             Ok(Self {
                 arena,
                 db,
                 acache,
-                blob_dir: blob_dir.to_path_buf(),
                 tempdir,
             })
         }
@@ -1030,7 +1373,7 @@ mod tests {
         fn get_blob_entry(&self, inode: Inode) -> anyhow::Result<BlobTableEntry> {
             let txn = self.begin_read()?;
             let blob_table = txn.blob_table()?;
-            Ok(get_blob_entry(&blob_table, inode)?)
+            Ok(get_blob_entry(&blob_table, inode)?.ok_or(StorageError::NotFound)?)
         }
 
         /// Check if a blob entry exists in the database.
@@ -1056,7 +1399,7 @@ mod tests {
             let mut current = queue.head;
             while let Some(id) = current {
                 content.push(id);
-                current = get_blob_entry(&blob_table, id)?.next;
+                current = follow_queue_link(&blob_table, id)?.next;
             }
 
             Ok(content)
@@ -1075,7 +1418,7 @@ mod tests {
             let mut current = queue.tail;
             while let Some(id) = current {
                 content.push(id);
-                current = get_blob_entry(&blob_table, id)?.prev;
+                current = follow_queue_link(&blob_table, id)?.prev;
             }
 
             Ok(content)
@@ -1088,11 +1431,27 @@ mod tests {
                 .map(|q| q.disk_usage)
                 .unwrap_or(0))
         }
+
+        fn extend_local_availability<'b, L: Into<TreeLoc<'b>>>(
+            &self,
+            loc: L,
+            ranges: &ByteRanges,
+        ) -> anyhow::Result<bool> {
+            let txn = self.begin_write()?;
+            let ret = {
+                let mut blobs = txn.write_blobs()?;
+                let tree = txn.read_tree()?;
+                blobs.extend_local_availability(&tree, loc, &test_hash(), ranges)?
+            };
+            txn.commit()?;
+
+            Ok(ret)
+        }
     }
 
     #[tokio::test]
     async fn open_file_creates_multiple_blobs_and_files() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
 
         let inode1 = fixture.add_file("test1.txt", 100)?;
@@ -1120,7 +1479,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_blob_within_available_ranges() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
 
         let inode = fixture.add_file("test.txt", 1000)?;
@@ -1133,7 +1492,7 @@ mod tests {
         let test_data = b"Baa, baa, black sheep, have you any wool?";
         std::fs::write(&blob_path, test_data)?;
 
-        acache.extend_local_availability(inode, &ByteRanges::single(0, test_data.len() as u64))?;
+        fixture.extend_local_availability(inode, &ByteRanges::single(0, test_data.len() as u64))?;
 
         // Read from blob
         let mut blob = fixture.acache.open_file(inode)?;
@@ -1151,7 +1510,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_blob_after_seek_within_available_range() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
 
         let inode = fixture.add_file("test.txt", 1000)?;
@@ -1164,7 +1523,7 @@ mod tests {
         let test_data = b"Baa, baa, black sheep, have you any wool?";
         std::fs::write(&blob_path, test_data)?;
 
-        acache.extend_local_availability(inode, &ByteRanges::single(0, test_data.len() as u64))?;
+        fixture.extend_local_availability(inode, &ByteRanges::single(0, test_data.len() as u64))?;
 
         // Read from blob
         let mut blob = fixture.acache.open_file(inode)?;
@@ -1179,7 +1538,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_blob_outside_available_ranges() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
         let inode = fixture.add_file("test.txt", 1000)?;
 
@@ -1190,7 +1549,8 @@ mod tests {
         let blob_path = fixture.blob_path(inode);
         let test_data = b"baa, baa";
         std::fs::write(&blob_path, test_data)?;
-        acache.extend_local_availability(inode, &ByteRanges::single(0, test_data.len() as u64))?;
+
+        fixture.extend_local_availability(inode, &ByteRanges::single(0, test_data.len() as u64))?;
 
         // Read from blob
         let mut blob = fixture.acache.open_file(inode)?;
@@ -1206,7 +1566,7 @@ mod tests {
 
     #[tokio::test]
     async fn writing_to_blob_updates_local_availability() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let inode = fixture.add_file("test.txt", 21)?;
 
         // Write to blob
@@ -1228,7 +1588,7 @@ mod tests {
 
         // Get written areas from blob table after update
         let txn = fixture.begin_read()?;
-        let blob_entry = get_blob_entry(&txn.blob_table()?, inode)?;
+        let blob_entry = get_blob_entry(&txn.blob_table()?, inode)?.unwrap();
         assert_eq!(ByteRanges::single(0, 21), blob_entry.written_areas);
         drop(blob);
 
@@ -1242,7 +1602,7 @@ mod tests {
 
     #[tokio::test]
     async fn writing_to_blob_out_of_order() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let inode = fixture.add_file("test.txt", 21)?;
 
         // Write to blob
@@ -1270,7 +1630,7 @@ mod tests {
 
     #[tokio::test]
     async fn writing_to_blob_then_reading_it() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let inode = fixture.add_file("test.txt", 100)?;
 
         let mut blob = fixture.acache.open_file(inode)?;
@@ -1288,17 +1648,15 @@ mod tests {
 
     #[tokio::test]
     async fn open_file_creates_sparse_file() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
         let file_path = Path::parse("foobar")?;
 
         fixture.add_file_with_mtime(&file_path, 10000, test_time())?;
         let inode = acache.expect(&file_path)?;
 
-        let inode = {
+        {
             let blob = acache.open_file(inode)?;
-            assert_eq!(inode, blob.inode());
-
             let m = fixture.blob_path(inode).metadata()?;
 
             // File should have the right size
@@ -1309,13 +1667,10 @@ mod tests {
 
             // Range empty for now
             assert_eq!(ByteRanges::new(), *blob.local_availability());
-
-            blob.inode()
         };
 
         // If called a second time, it should return a handle on the same file.
         let blob = acache.open_file(inode)?;
-        assert_eq!(inode, blob.inode());
         assert_eq!(ByteRanges::new(), *blob.local_availability());
 
         Ok(())
@@ -1323,7 +1678,7 @@ mod tests {
 
     #[tokio::test]
     async fn blob_deleted_on_file_overwrite() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
@@ -1333,7 +1688,7 @@ mod tests {
 
         // Open the file to create a blob
         let inode = acache.expect(&file_path)?;
-        let inode = acache.open_file(inode)?.inode();
+        acache.open_file(inode)?;
 
         // Verify the blob file was created
         assert!(fixture.blob_file_exists(inode));
@@ -1365,7 +1720,7 @@ mod tests {
 
     #[tokio::test]
     async fn blob_deleted_on_file_removal() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
         let file_path = Path::parse("file.txt")?;
 
@@ -1374,7 +1729,7 @@ mod tests {
 
         // Open the file to create a blob
         let inode = acache.expect(&file_path)?;
-        let inode = acache.open_file(inode)?.inode();
+        acache.open_file(inode)?;
 
         // Verify the blob file was created
         assert!(fixture.blob_file_exists(inode));
@@ -1394,7 +1749,7 @@ mod tests {
 
     #[tokio::test]
     async fn blob_deleted_on_catchup_removal() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
@@ -1404,7 +1759,7 @@ mod tests {
 
         // Open the file to create a blob
         let inode = acache.expect(&file_path)?;
-        let inode = acache.open_file(inode)?.inode();
+        acache.open_file(inode)?;
 
         // Verify the blob file was created
         assert!(fixture.blob_file_exists(inode));
@@ -1433,7 +1788,7 @@ mod tests {
 
     #[tokio::test]
     async fn blob_update_extends_range() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
         let file_path = Path::parse("file.txt")?;
 
@@ -1442,11 +1797,11 @@ mod tests {
 
         // Open the file to create a blob
         let inode = acache.expect(&file_path)?;
-        let inode = acache.open_file(inode)?.inode();
+        acache.open_file(inode)?;
 
         // Initially, the blob should have empty written areas
         let txn = fixture.begin_read()?;
-        let initial_blob_entry = get_blob_entry(&txn.blob_table()?, inode)?;
+        let initial_blob_entry = get_blob_entry(&txn.blob_table()?, inode)?.unwrap();
         assert!(initial_blob_entry.written_areas.is_empty());
 
         // Update the blob with some written areas
@@ -1456,44 +1811,38 @@ mod tests {
             ByteRange::new(500, 600),
         ]);
 
-        acache.extend_local_availability(inode, &written_areas)?;
+        fixture.extend_local_availability(inode, &written_areas)?;
 
         // Verify the written areas were updated
         let txn = fixture.begin_read()?;
-        let retrieved_blob_entry = get_blob_entry(&txn.blob_table()?, inode)?;
+        let retrieved_blob_entry = get_blob_entry(&txn.blob_table()?, inode)?.unwrap();
         assert_eq!(retrieved_blob_entry.written_areas, written_areas);
 
-        acache.extend_local_availability(
+        fixture.extend_local_availability(
             inode,
             &ByteRanges::from_ranges(vec![ByteRange::new(50, 210), ByteRange::new(200, 400)]),
         )?;
 
         // Verify the ranges were updated again
         let txn = fixture.begin_read()?;
-        let final_blob_entry = get_blob_entry(&txn.blob_table()?, inode)?;
+        let final_blob_entry = get_blob_entry(&txn.blob_table()?, inode)?.unwrap();
         assert_eq!(
             final_blob_entry.written_areas,
             ByteRanges::from_ranges(vec![ByteRange::new(0, 400), ByteRange::new(500, 600)])
         );
 
-        // Test that getting ranges for a non-existent blob returns NotFound
-        assert!(matches!(
-            get_blob_entry(&txn.blob_table()?, Inode(99999)),
-            Err(StorageError::NotFound)
-        ));
-
-        // Test that updating ranges for a non-existent blob returns NotFound
-        assert!(matches!(
-            acache.extend_local_availability(Inode(99999), &ByteRanges::new()),
-            Err(StorageError::NotFound)
-        ));
+        // Test that updating ranges for a non-existent blob returns false
+        assert_eq!(
+            false,
+            fixture.extend_local_availability(Inode(99999), &ByteRanges::new())?,
+        );
 
         Ok(())
     }
 
     #[tokio::test]
     async fn move_blob_success() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
         let file_path = Path::parse("test.txt")?;
 
@@ -1502,7 +1851,7 @@ mod tests {
 
         // Open the file to create a blob
         let inode = acache.expect(&file_path)?;
-        let inode = acache.open_file(inode)?.inode();
+        acache.open_file(inode)?;
 
         // Write some data to the blob and mark it as verified
         let mut blob = fixture.acache.open_file(inode)?;
@@ -1548,7 +1897,7 @@ mod tests {
 
     #[tokio::test]
     async fn move_blob_wrong_hash() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
         let file_path = Path::parse("test.txt")?;
 
@@ -1557,7 +1906,7 @@ mod tests {
 
         // Open the file to create a blob
         let inode = acache.expect(&file_path)?;
-        let inode = acache.open_file(inode)?.inode();
+        acache.open_file(inode)?;
 
         // Write some data to the blob and mark it as verified
         let mut blob = fixture.acache.open_file(inode)?;
@@ -1593,7 +1942,7 @@ mod tests {
 
     #[tokio::test]
     async fn move_blob_not_verified() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
         let file_path = Path::parse("test.txt")?;
 
@@ -1602,7 +1951,7 @@ mod tests {
 
         // Open the file to create a blob
         let inode = acache.expect(&file_path)?;
-        let inode = acache.open_file(inode)?.inode();
+        acache.open_file(inode)?;
 
         // Write some data to the blob but don't mark it as verified
         let mut blob = fixture.acache.open_file(inode)?;
@@ -1637,7 +1986,7 @@ mod tests {
 
     #[tokio::test]
     async fn move_blob_nonexistent_blob() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
 
         // Create destination path
@@ -1661,7 +2010,7 @@ mod tests {
 
     #[tokio::test]
     async fn move_blob_verifies_hash_and_state() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
         let file_path = Path::parse("test.txt")?;
 
@@ -1670,7 +2019,7 @@ mod tests {
 
         // Open the file to create a blob
         let inode = acache.expect(&file_path)?;
-        let inode = acache.open_file(inode)?.inode();
+        acache.open_file(inode)?;
 
         // Write some data to the blob and mark it as verified
         let mut blob = fixture.acache.open_file(inode)?;
@@ -1715,7 +2064,7 @@ mod tests {
 
     #[tokio::test]
     async fn move_into_blob_if_matches_creates_new_blob() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
         let file_path = Path::parse("test.txt")?;
 
@@ -1744,7 +2093,7 @@ mod tests {
         assert_eq!(ByteRanges::single(0, 48), *blob.local_availability());
 
         // Disk usage must be set.
-        let blob_entry = fixture.get_blob_entry(blob.inode())?;
+        let blob_entry = fixture.get_blob_entry(inode)?;
         assert!(blob_entry.disk_usage > INODE_DISK_USAGE);
 
         Ok(())
@@ -1752,7 +2101,7 @@ mod tests {
 
     #[tokio::test]
     async fn move_into_blob_if_matches_creates_new_protected_blob() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
         let file_path = Path::parse("test.txt")?;
 
@@ -1770,7 +2119,7 @@ mod tests {
 
         // Since the file is marked keep, the blob that was created
         // must be in the protected queue.
-        let inode = acache.open_file(inode)?.inode();
+        acache.open_file(inode)?;
         assert_eq!(
             LruQueueId::Protected,
             fixture.get_blob_entry(inode).unwrap().queue
@@ -1781,7 +2130,7 @@ mod tests {
 
     #[tokio::test]
     async fn move_into_blob_if_matches_overwrites_existing_blob() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
         let file_path = Path::parse("test.txt")?;
 
@@ -1789,7 +2138,7 @@ mod tests {
         let inode = fixture.add_file(file_path.as_str(), 59)?;
 
         // First, create a blob through normal open_file
-        let existing_inode = acache.open_file(inode)?.inode();
+        acache.open_file(inode)?;
 
         // Now use move_into_blob_if_matches with the existing blob
         let tmpfile = fixture.tempdir.child("tmp");
@@ -1804,8 +2153,6 @@ mod tests {
 
         // Open the file again and verify we can read the content within the ranges
         let mut blob = acache.open_file(inode)?;
-        assert_eq!(existing_inode, blob.inode());
-
         let mut buf = String::new();
         blob.read_to_string(&mut buf).await?;
         assert_eq!(
@@ -1815,7 +2162,7 @@ mod tests {
         assert_eq!(ByteRanges::single(0, 59), *blob.local_availability());
 
         // Disk usage must be set.
-        let blob_entry = fixture.get_blob_entry(blob.inode())?;
+        let blob_entry = fixture.get_blob_entry(inode)?;
         assert!(blob_entry.disk_usage > INODE_DISK_USAGE);
 
         Ok(())
@@ -1823,7 +2170,7 @@ mod tests {
 
     #[tokio::test]
     async fn move_into_blob_if_matches_reject_wrong_file_size() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
         let file_path = Path::parse("test.txt")?;
 
@@ -1849,7 +2196,7 @@ mod tests {
 
     #[tokio::test]
     async fn move_into_blob_if_matches_rejects_wrong_hash() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
         let file_path = Path::parse("test.txt")?;
 
@@ -1877,10 +2224,11 @@ mod tests {
 
     #[tokio::test]
     async fn add_to_working_area_on_blob_creation() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
 
-        let one = acache.open_file(fixture.add_file("one", 100)?)?.inode();
+        let one = fixture.add_file("one", 100)?;
+        acache.open_file(one)?;
         assert_eq!(
             (vec![one], vec![one]),
             (
@@ -1889,7 +2237,8 @@ mod tests {
             )
         );
 
-        let two = acache.open_file(fixture.add_file("two", 100)?)?.inode();
+        let two = fixture.add_file("two", 100)?;
+        acache.open_file(two)?;
         assert_eq!(
             (vec![two, one], vec![one, two]),
             (
@@ -1898,7 +2247,8 @@ mod tests {
             )
         );
 
-        let three = acache.open_file(fixture.add_file("three", 100)?)?.inode();
+        let three = fixture.add_file("three", 100)?;
+        acache.open_file(three)?;
 
         assert_eq!(
             (vec![three, two, one], vec![one, two, three]),
@@ -1913,13 +2263,17 @@ mod tests {
 
     #[tokio::test]
     async fn remove_from_queue_on_blob_deletion() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
 
-        let one = acache.open_file(fixture.add_file("one", 100)?)?.inode();
-        let _two = acache.open_file(fixture.add_file("two", 100)?)?.inode();
-        let three = acache.open_file(fixture.add_file("three", 100)?)?.inode();
-        let four = acache.open_file(fixture.add_file("four", 100)?)?.inode();
+        let one = fixture.add_file("one", 100)?;
+        acache.open_file(one)?;
+        let two = fixture.add_file("two", 100)?;
+        acache.open_file(two)?;
+        let three = fixture.add_file("three", 100)?;
+        acache.open_file(three)?;
+        let four = fixture.add_file("four", 100)?;
+        acache.open_file(four)?;
 
         // Delete the file to delete the blob.
         fixture.remove_file(&Path::parse("two")?)?;
@@ -1965,18 +2319,27 @@ mod tests {
 
     #[tokio::test]
     async fn mark_accessed() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
 
-        let one = acache.open_file(fixture.add_file("one", 100)?)?.inode();
-        let two = acache.open_file(fixture.add_file("two", 100)?)?.inode();
-        let three = acache.open_file(fixture.add_file("three", 100)?)?.inode();
-        let four = acache.open_file(fixture.add_file("four", 100)?)?.inode();
+        let one = fixture.add_file("one", 100)?;
+        acache.open_file(one)?;
+        let two = fixture.add_file("two", 100)?;
+        acache.open_file(two)?;
+        let three = fixture.add_file("three", 100)?;
+        acache.open_file(three)?;
+        let four = fixture.add_file("four", 100)?;
+        acache.open_file(four)?;
 
         // four is now at the head, being the most recent. Let's move
         // two there, then one..
-        let blobstore = Blobstore::new(Arc::clone(&fixture.db), &fixture.blob_dir)?;
-        blobstore.mark_accessed(two)?;
+        let txn = fixture.db.begin_write()?;
+        {
+            let mut blobs = txn.write_blobs()?;
+            let tree = txn.read_tree()?;
+            blobs.mark_accessed(&tree, two)?;
+        }
+        txn.commit()?;
         assert_eq!(
             (vec![two, four, three, one], vec![one, three, four, two]),
             (
@@ -1985,7 +2348,13 @@ mod tests {
             )
         );
 
-        blobstore.mark_accessed(one)?;
+        let txn = fixture.db.begin_write()?;
+        {
+            let mut blobs = txn.write_blobs()?;
+            let tree = txn.read_tree()?;
+            blobs.mark_accessed(&tree, one)?;
+        }
+        txn.commit()?;
         assert_eq!(
             (vec![one, two, four, three], vec![three, four, two, one]),
             (
@@ -1994,7 +2363,13 @@ mod tests {
             )
         );
 
-        blobstore.mark_accessed(one)?;
+        let txn = fixture.db.begin_write()?;
+        {
+            let mut blobs = txn.write_blobs()?;
+            let tree = txn.read_tree()?;
+            blobs.mark_accessed(&tree, one)?;
+        }
+        txn.commit()?;
         assert_eq!(
             (vec![one, two, four, three], vec![three, four, two, one]),
             (
@@ -2008,12 +2383,12 @@ mod tests {
 
     #[tokio::test]
     async fn disk_usage_tracking() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
 
         // Create a blob and verify initial disk usage is 0
         let inode = fixture.add_file("test.txt", 1000)?;
-        let inode = acache.open_file(inode)?.inode();
+        acache.open_file(inode)?;
 
         let blob_entry = fixture.get_blob_entry(inode)?;
         // 512 bytes for an empty file, to account for inode usage.
@@ -2025,9 +2400,7 @@ mod tests {
         blob.update_db().await?;
 
         // disk usage is now 1 block
-        let blksize = fs::metadata(fixture.blob_path(blob.inode()))
-            .await?
-            .blksize();
+        let blksize = fs::metadata(fixture.blob_path(inode)).await?.blksize();
         let blob_entry = fixture.get_blob_entry(inode)?;
         assert_eq!(blob_entry.disk_usage, blksize + INODE_DISK_USAGE);
 
@@ -2041,12 +2414,12 @@ mod tests {
 
     #[tokio::test]
     async fn disk_usage_updates_on_blob_deletion() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
 
         // Create a blob and write some data
         let inode = fixture.add_file("test.txt", 1000)?;
-        let inode = acache.open_file(inode)?.inode();
+        acache.open_file(inode)?;
 
         let mut blob = acache.open_file(inode)?;
         blob.write(b"test data").await?;
@@ -2072,15 +2445,15 @@ mod tests {
 
     #[tokio::test]
     async fn disk_usage_tracking_multiple_blobs() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
 
         // Create multiple blobs and write data
         let inode1 = fixture.add_file("test1.txt", 1000)?;
         let inode2 = fixture.add_file("test2.txt", 2000)?;
 
-        let inode1 = acache.open_file(inode1)?.inode();
-        let inode2 = acache.open_file(inode2)?.inode();
+        acache.open_file(inode1)?;
+        acache.open_file(inode2)?;
 
         let blksize = fs::metadata(fixture.blob_path(inode1)).await?.blksize();
 
@@ -2113,7 +2486,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_cache_removes_blobs_until_target_size() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
 
         // Create multiple blobs with data
@@ -2122,29 +2495,33 @@ mod tests {
         let inode3 = fixture.add_file("test3.txt", 3000)?;
         let inode4 = fixture.add_file("test4.txt", 4000)?;
 
-        let inode1 = acache.open_file(inode1)?.inode();
-        let inode2 = acache.open_file(inode2)?.inode();
-        let inode3 = acache.open_file(inode3)?.inode();
-        let inode4 = acache.open_file(inode4)?.inode();
+        acache.open_file(inode1)?;
+        acache.open_file(inode2)?;
+        acache.open_file(inode3)?;
+        acache.open_file(inode4)?;
 
         // Write data to all blobs to create disk usage
         let mut blob1 = acache.open_file(inode1)?;
         blob1.write(b"data for blob 1").await?;
         blob1.update_db().await?;
+        drop(blob1);
 
         let mut blob2 = acache.open_file(inode2)?;
         blob2.write(b"data for blob 2 which is longer").await?;
         blob2.update_db().await?;
+        drop(blob2);
 
         let mut blob3 = acache.open_file(inode3)?;
         blob3.write(b"data for blob 3 which is even longer").await?;
         blob3.update_db().await?;
+        drop(blob3);
 
         let mut blob4 = acache.open_file(inode4)?;
         blob4
             .write(b"data for blob 4 which is the longest of all")
             .await?;
         blob4.update_db().await?;
+        drop(blob4);
 
         let initial_disk_usage = fixture.queue_disk_usage(LruQueueId::WorkingArea)?;
         assert!(initial_disk_usage > 0);
@@ -2161,8 +2538,13 @@ mod tests {
 
         // Clean up cache to target size (should remove some blobs)
         let target_size = initial_disk_usage / 2; // Remove half the blobs
-        let blobstore = Blobstore::new(Arc::clone(&fixture.db), &fixture.blob_dir)?;
-        blobstore.cleanup_cache(target_size)?;
+        let txn = fixture.db.begin_write()?;
+        {
+            let mut blobs = txn.write_blobs()?;
+            let mut dirty = txn.write_dirty()?;
+            blobs.cleanup(&mut dirty, target_size)?;
+        }
+        txn.commit()?;
 
         // Verify that some blobs were removed (the least recently used ones)
         // The queue order should be [4, 3, 2, 1] so 1 and 2 should be removed first
@@ -2189,15 +2571,15 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_cache_removes_all_blobs_when_target_is_zero() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
 
         // Create a few blobs with data
         let inode1 = fixture.add_file("test1.txt", 1000)?;
         let inode2 = fixture.add_file("test2.txt", 2000)?;
 
-        let inode1 = acache.open_file(inode1)?.inode();
-        let inode2 = acache.open_file(inode2)?.inode();
+        acache.open_file(inode1)?;
+        acache.open_file(inode2)?;
 
         // Write data so there is something to cleanup
         let mut blob1 = acache.open_file(inode1)?;
@@ -2212,8 +2594,13 @@ mod tests {
         assert!(fixture.blob_file_exists(inode2));
 
         // Clean up cache with target size 0 (should remove all blobs)
-        let blobstore = Blobstore::new(Arc::clone(&fixture.db), &fixture.blob_dir)?;
-        blobstore.cleanup_cache(0)?;
+        let txn = fixture.db.begin_write()?;
+        {
+            let mut blobs = txn.write_blobs()?;
+            let mut dirty = txn.write_dirty()?;
+            blobs.cleanup(&mut dirty, 0)?;
+        }
+        txn.commit()?;
 
         // Verify all blobs were removed
         assert!(!fixture.blob_entry_exists(inode1)?);
@@ -2234,12 +2621,12 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_cache_does_nothing_when_already_under_target() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
 
         // Create a blob with data
         let inode = fixture.add_file("test.txt", 1000)?;
-        let inode = acache.open_file(inode)?.inode();
+        acache.open_file(inode)?;
 
         let mut blob = acache.open_file(inode)?;
         blob.write(b"data for blob").await?;
@@ -2253,8 +2640,13 @@ mod tests {
 
         // Clean up cache with target size higher than current usage
         let target_size = current_disk_usage * 2;
-        let blobstore = Blobstore::new(Arc::clone(&fixture.db), &fixture.blob_dir)?;
-        blobstore.cleanup_cache(target_size)?;
+        let txn = fixture.db.begin_write()?;
+        {
+            let mut blobs = txn.write_blobs()?;
+            let mut dirty = txn.write_dirty()?;
+            blobs.cleanup(&mut dirty, target_size)?;
+        }
+        txn.commit()?;
 
         // Verify blob still exists (nothing should have been removed)
         assert!(fixture.blob_entry_exists(inode)?);
@@ -2277,13 +2669,16 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_cache_handles_empty_queue() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
-
-        // Create blobstore without any blobs
-        let blobstore = Blobstore::new(Arc::clone(&fixture.db), &fixture.blob_dir)?;
+        let fixture = Fixture::setup()?;
 
         // Clean up cache - should not error
-        blobstore.cleanup_cache(1000)?;
+        let txn = fixture.db.begin_write()?;
+        {
+            let mut blobs = txn.write_blobs()?;
+            let mut dirty = txn.write_dirty()?;
+            blobs.cleanup(&mut dirty, 1000)?;
+        }
+        txn.commit()?;
 
         // Verify the queue is still empty by checking that no queue entry exists
         let txn = fixture.begin_read()?;
@@ -2296,7 +2691,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_cache_removes_blobs_in_lru_order() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
 
         // Create blobs in order
@@ -2304,26 +2699,34 @@ mod tests {
         let inode2 = fixture.add_file("test2.txt", 1000)?;
         let inode3 = fixture.add_file("test3.txt", 1000)?;
 
-        let inode1 = acache.open_file(inode1)?.inode();
-        let inode2 = acache.open_file(inode2)?.inode();
-        let inode3 = acache.open_file(inode3)?.inode();
+        acache.open_file(inode1)?;
+        acache.open_file(inode2)?;
+        acache.open_file(inode3)?;
 
         // Write data to all blobs
         let mut blob1 = acache.open_file(inode1)?;
         blob1.write(b"data1").await?;
         blob1.update_db().await?;
+        drop(blob1);
 
         let mut blob2 = acache.open_file(inode2)?;
         blob2.write(b"data2").await?;
         blob2.update_db().await?;
+        drop(blob2);
 
         let mut blob3 = acache.open_file(inode3)?;
         blob3.write(b"data3").await?;
         blob3.update_db().await?;
+        drop(blob3);
 
         // Access blob1 to move it to the front (make it most recently used)
-        let blobstore = Blobstore::new(Arc::clone(&fixture.db), &fixture.blob_dir)?;
-        blobstore.mark_accessed(inode1)?;
+        let txn = fixture.db.begin_write()?;
+        {
+            let mut blobs = txn.write_blobs()?;
+            let tree = txn.read_tree()?;
+            blobs.mark_accessed(&tree, inode1)?;
+        }
+        txn.commit()?;
 
         // Verify the order is now [1, 3, 2] (1 is most recent, 2 is least recent)
         assert_eq!(
@@ -2336,7 +2739,13 @@ mod tests {
 
         // Clean up cache to remove one blob (should remove inode2 as it's least recently used)
         let target_size = current_disk_usage - 1; // Just under current usage
-        blobstore.cleanup_cache(target_size)?;
+        let txn = fixture.db.begin_write()?;
+        {
+            let mut blobs = txn.write_blobs()?;
+            let mut dirty = txn.write_dirty()?;
+            blobs.cleanup(&mut dirty, target_size)?;
+        }
+        txn.commit()?;
 
         // Verify inode2 was removed (least recently used)
         assert!(!fixture.blob_entry_exists(inode2)?);
@@ -2359,12 +2768,12 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_cache_skips_open_blobs() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
 
         // Create a single blob with data
         let inode = fixture.add_file("test.txt", 1000)?;
-        let inode = acache.open_file(inode)?.inode();
+        acache.open_file(inode)?;
 
         // Write data to the blob
         let mut blob = acache.open_file(inode)?;
@@ -2398,12 +2807,12 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_cache_deletes_blob_after_it_is_closed() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
 
         // Create a blob with data
         let inode = fixture.add_file("test.txt", 1000)?;
-        let inode = acache.open_file(inode)?.inode();
+        acache.open_file(inode)?;
 
         let mut blob = acache.open_file(inode)?;
         blob.write(b"data for blob").await?;
@@ -2436,7 +2845,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_cache_leaves_protected_blobs_alone() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
         let inode = fixture.add_file("test.txt", 6)?;
         mark::set(&fixture.db, &Path::parse("test.txt")?, Mark::Keep)?;
@@ -2459,12 +2868,12 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_open_handles_work_correctly() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
 
         // Create a blob with data
         let inode = fixture.add_file("test.txt", 1000)?;
-        let inode = acache.open_file(inode)?.inode();
+        acache.open_file(inode)?;
 
         let mut blob = acache.open_file(inode)?;
         blob.write(b"data for blob").await?;
@@ -2521,7 +2930,7 @@ mod tests {
 
     #[tokio::test]
     async fn reference_counting_with_mixed_open_and_closed_blobs() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
 
         // Create multiple blobs
@@ -2529,9 +2938,9 @@ mod tests {
         let inode2 = fixture.add_file("test2.txt", 2000)?;
         let inode3 = fixture.add_file("test3.txt", 3000)?;
 
-        let inode1 = acache.open_file(inode1)?.inode();
-        let inode2 = acache.open_file(inode2)?.inode();
-        let inode3 = acache.open_file(inode3)?.inode();
+        acache.open_file(inode1)?;
+        acache.open_file(inode2)?;
+        acache.open_file(inode3)?;
 
         // Write data to all blobs
         let mut blob1 = acache.open_file(inode1)?;
@@ -2575,12 +2984,11 @@ mod tests {
 
     #[tokio::test]
     async fn inodes_never_reused_after_deletion() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
 
-        // Create a file and get its blob ID
         let inode1 = fixture.add_file("test.txt", 100)?;
-        assert_eq!(inode1, acache.open_file(inode1)?.inode());
+        acache.open_file(inode1)?;
 
         // Verify the blob exists
         assert!(fixture.blob_entry_exists(inode1)?);
@@ -2595,7 +3003,7 @@ mod tests {
 
         // Create a new file
         let inode2 = fixture.add_file("test2.txt", 200)?;
-        assert_eq!(inode2, acache.open_file(inode2)?.inode());
+        acache.open_file(inode2)?;
 
         // Verify the new blob ID is different from the deleted one
         assert_ne!(inode1, inode2);
@@ -2609,7 +3017,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_file_handles_blob_deleted_by_cleanup_cache() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let acache = &fixture.acache;
 
         // 1. Add a file
@@ -2640,9 +3048,6 @@ mod tests {
         // 4. Call open_file() and make sure the returned blob can be written to normally
         let mut new_blob = acache.open_file(inode)?;
 
-        // The blob ID should match the inode
-        assert_eq!(inode, new_blob.inode());
-
         // Verify the new blob exists and it has been added to the LRU queue.
         assert!(fixture.blob_entry_exists(inode)?);
         assert!(fixture.blob_file_exists(inode));
@@ -2655,6 +3060,190 @@ mod tests {
         let test_data = b"Hello, world!";
         let bytes_written = new_blob.write(test_data).await?;
         assert_eq!(test_data.len(), bytes_written);
+
+        Ok(())
+    }
+
+    #[test]
+    fn read_blobs() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.begin_read()?;
+        let blobs = txn.read_blobs()?;
+
+        // Just test that the read transaction works correctly.
+        assert!(blobs.get_with_inode(Inode(999))?.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn write_blobs() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.begin_write()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut tree = txn.write_tree()?;
+        let mut mark = txn.write_marks()?;
+
+        // Just test that the write transaction works correctly.
+        let blob_info = blobs.create(&mut tree, &mut mark, Inode(10), &test_hash(), 100)?;
+        assert_eq!(blob_info.hash, test_hash());
+        assert_eq!(blob_info.size, 100);
+
+        Ok(())
+    }
+
+    #[test]
+    fn local_availability_missing_when_no_blob() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.begin_write()?;
+        let blobs = txn.write_blobs()?;
+        let tree = txn.read_tree()?;
+
+        // Test with a path that doesn't exist in the tree
+        let path = Path::parse("nonexistent.txt")?;
+        let availability = blobs.local_availability(&tree, &path)?;
+        assert_eq!(availability, LocalAvailability::Missing);
+
+        // Test with an inode that doesn't exist
+        let availability = blobs.local_availability(&tree, Inode(99999))?;
+        assert_eq!(availability, LocalAvailability::Missing);
+
+        Ok(())
+    }
+
+    #[test]
+    fn local_availability_missing_when_blob_empty() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.begin_write()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut tree = txn.write_tree()?;
+        let marks = txn.read_marks()?;
+
+        // Create a blob with empty written areas
+        let path = Path::parse("empty.txt")?;
+        let hash = test_hash();
+        let blob_info = blobs.create(&mut tree, &marks, &path, &hash, 100)?;
+
+        // Verify the blob was created with empty written areas
+        assert!(blob_info.available_ranges.is_empty());
+
+        // Test local availability - should be Missing for empty blob
+        let availability = blobs.local_availability(&tree, &path)?;
+        assert_eq!(availability, LocalAvailability::Missing);
+
+        Ok(())
+    }
+
+    #[test]
+    fn local_availability_partial_when_blob_incomplete() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.begin_write()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut tree = txn.write_tree()?;
+        let marks = txn.read_marks()?;
+
+        // Create a blob
+        let path = Path::parse("partial.txt")?;
+        let hash = test_hash();
+        blobs.create(&mut tree, &marks, &path, &hash, 1000)?;
+
+        // Extend with partial ranges
+        let partial_ranges =
+            ByteRanges::from_ranges(vec![ByteRange::new(0, 100), ByteRange::new(200, 300)]);
+        blobs.extend_local_availability(&tree, &path, &hash, &partial_ranges)?;
+
+        // Test local availability - should be Partial
+        let availability = blobs.local_availability(&tree, &path)?;
+        match availability {
+            LocalAvailability::Partial(size, ranges) => {
+                assert_eq!(size, 1000);
+                assert_eq!(ranges, partial_ranges);
+            }
+            _ => panic!("Expected Partial availability, got {:?}", availability),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn local_availability_complete_when_blob_full_but_unverified() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.begin_write()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut tree = txn.write_tree()?;
+        let marks = txn.read_marks()?;
+
+        // Create a blob
+        let path = Path::parse("complete.txt")?;
+        let hash = test_hash();
+        blobs.create(&mut tree, &marks, &path, &hash, 500)?;
+
+        // Extend with complete range (0 to size)
+        let complete_range = ByteRanges::single(0, 500);
+        blobs.extend_local_availability(&tree, &path, &hash, &complete_range)?;
+
+        // Test local availability - should be Complete (not verified)
+        let availability = blobs.local_availability(&tree, &path)?;
+        assert_eq!(availability, LocalAvailability::Complete);
+
+        Ok(())
+    }
+
+    #[test]
+    fn local_availability_verified_when_blob_full_and_verified() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.begin_write()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut tree = txn.write_tree()?;
+        let marks = txn.read_marks()?;
+        let mut dirty = txn.write_dirty()?;
+
+        // Create a blob
+        let path = Path::parse("verified.txt")?;
+        let hash = test_hash();
+        blobs.create(&mut tree, &marks, &path, &hash, 500)?;
+
+        // Extend with complete range
+        let complete_range = ByteRanges::single(0, 500);
+        blobs.extend_local_availability(&tree, &path, &hash, &complete_range)?;
+
+        // Mark as verified
+        blobs.mark_verified(&tree, &mut dirty, &path, &hash)?;
+
+        let availability = blobs.local_availability(&tree, &path)?;
+        assert_eq!(availability, LocalAvailability::Verified);
+
+        Ok(())
+    }
+
+    #[test]
+    fn local_availability_handles_zero_size_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.begin_write()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut tree = txn.write_tree()?;
+        let marks = txn.read_marks()?;
+
+        let path = Path::parse("zero.txt")?;
+        let hash = test_hash();
+        blobs.create(&mut tree, &marks, &path, &hash, 0)?;
+
+        let availability = blobs.local_availability(&tree, &path)?;
+        assert_eq!(availability, LocalAvailability::Complete);
+
+        Ok(())
+    }
+
+    #[test]
+    fn local_availability_handles_nonexistent_inode() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.begin_write()?;
+        let blobs = txn.write_blobs()?;
+        let tree = txn.read_tree()?;
+
+        // Test with a non-existent inode
+        let availability = blobs.local_availability(&tree, Inode(99999))?;
+        assert_eq!(availability, LocalAvailability::Missing);
 
         Ok(())
     }

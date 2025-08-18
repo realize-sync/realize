@@ -1,11 +1,11 @@
 use super::arena_cache::ArenaCache;
+use super::blob::BlobExt;
 use super::db::{ArenaDatabase, ArenaReadTransaction};
 use super::dirty::DirtyReadOperations;
 use super::index::IndexReadOperations;
 use super::mark::MarkExt;
 use super::tree::{TreeExt, TreeLoc};
 use super::types::LocalAvailability;
-use crate::arena::blob;
 use crate::types::JobId;
 use crate::{Inode, Mark, StorageError};
 use realize_types::{Arena, Hash, Path, UnixTime};
@@ -447,7 +447,8 @@ impl Engine {
                         )));
                     }
 
-                    if blob::local_availability(txn, inode)? != LocalAvailability::Verified {
+                    let blobs = txn.read_blobs()?;
+                    if blobs.local_availability(&tree, inode)? != LocalAvailability::Verified {
                         if let Ok(path) = tree.backtrack(inode) {
                             return Ok(Some((
                                 JobId(counter),
@@ -470,7 +471,8 @@ impl Engine {
                         }
                     };
                     if should_move {
-                        if blob::local_availability(txn, inode)? == LocalAvailability::Verified {
+                        let blobs = txn.read_blobs()?;
+                        if blobs.local_availability(&tree, inode)? == LocalAvailability::Verified {
                             return Ok(Some((
                                 JobId(counter),
                                 StorageJob::Realize(inode, cached.hash, indexed.map(|i| i.hash)),
@@ -612,12 +614,14 @@ mod tests {
             arena_path.create_dir_all()?;
 
             let arena = Arena::from("myarena");
+            let blob_dir = tempdir.path().join("blobs");
             let db = ArenaDatabase::new(
                 redb_utils::in_memory()?,
                 arena,
                 InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?,
+                &blob_dir,
             )?;
-            let acache = ArenaCache::new(arena, Arc::clone(&db), &tempdir.path().join("blobs"))?;
+            let acache = ArenaCache::new(arena, Arc::clone(&db), &blob_dir)?;
             let index = acache.as_index();
             let engine = Engine::new(arena, Arc::clone(&db), Arc::clone(&acache), |attempt| {
                 if attempt < 3 {

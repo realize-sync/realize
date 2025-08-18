@@ -288,7 +288,8 @@ impl<'a> WritableOpenDirty<'a> {
     /// This does nothing if the path is already dirty.
     pub(crate) fn mark_dirty(&mut self, inode: Inode) -> Result<(), StorageError> {
         log::debug!("dirty: {inode}");
-        let counter = last_counter(&self.counter_table)? + 1;
+        let last_counter = last_counter(&self.counter_table)?;
+        let counter = last_counter + 1;
         self.counter_table.insert((), counter)?;
         self.log_table.insert(counter, inode)?;
         let prev = self.table.insert(inode, counter)?;
@@ -440,7 +441,8 @@ mod tests {
         fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
             let arena = Arena::from("myarena");
-            let db = ArenaDatabase::for_testing_single_arena(arena)?;
+            let db =
+                ArenaDatabase::for_testing_single_arena(arena, std::path::Path::new("/dev/null"))?;
 
             Ok(Self { db })
         }
@@ -535,7 +537,7 @@ mod tests {
         dirty.mark_dirty(path1)?;
         dirty.mark_dirty(path2)?;
         dirty.mark_dirty(path1)?;
-        dirty.mark_dirty(path1)?;
+        dirty.mark_dirty(path1)?; // dup; just increase counter
 
         // return path2 first, because its counter is lower
         assert_eq!(vec![(path2, 2), (path1, 4)], all(&dirty)?);
