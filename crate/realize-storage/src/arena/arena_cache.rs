@@ -405,7 +405,7 @@ impl ArenaCache {
         T: AsRef<Path>,
     {
         let path = path.as_ref();
-        let tree = txn.read_tree()?;
+        let mut tree = txn.write_tree()?;
         let inode = tree.expect(path)?;
         let cache_table = txn.cache_table()?;
         let file_entry = get_default_entry(&cache_table, inode)?;
@@ -413,7 +413,7 @@ impl ArenaCache {
             return Ok(false);
         }
         let mut blobs = txn.write_blobs()?;
-        if !blobs.export(&tree, inode, hash, dest)? {
+        if !blobs.export(&mut tree, inode, hash, dest)? {
             return Ok(false);
         }
 
@@ -507,7 +507,7 @@ impl ArenaCache {
     fn before_default_file_entry_change(
         &self,
         blobs: &mut WritableOpenBlob,
-        tree: &impl TreeReadOperations,
+        tree: &mut WritableOpenTree,
         dirty: &mut WritableOpenDirty,
         inode: Inode,
     ) -> Result<(), StorageError> {
@@ -708,7 +708,8 @@ impl ArenaCache {
         let txn = self.db.begin_write()?;
         {
             let mut blobs = txn.write_blobs()?;
-            blobs.cleanup(target_size)?;
+            let mut tree = txn.write_tree()?;
+            blobs.cleanup(&mut tree, target_size)?;
         }
         txn.commit()?;
 
