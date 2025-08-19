@@ -2032,34 +2032,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn move_into_blob_if_matches_creates_new_blob() -> anyhow::Result<()> {
+    async fn import_new() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
-        let file_path = Path::parse("test.txt")?;
+        let path = Path::parse("test.txt")?;
 
-        // Create a file and add it to the cache
-        let inode = fixture.add_file(file_path.as_str(), 48)?;
-
+        let data = "When you light a candle, you also cast a shadow.";
         let tmpfile = fixture.tempdir.child("tmp");
-        tmpfile.write_str("When you light a candle, you also cast a shadow.")?;
+        tmpfile.write_str(data)?;
 
         let txn = fixture.begin_write()?;
-        let path_in_cache = acache
-            .move_into_blob_if_matches(&txn, &file_path, &test_hash(), &tmpfile.path().metadata()?)?
-            .unwrap();
+        {
+            let mut tree = txn.write_tree()?;
+            let mut blobs = txn.write_blobs()?;
+            let marks = txn.read_marks()?;
+            let path_in_cache = blobs.import(
+                &mut tree,
+                &marks,
+                &path,
+                &hash::digest(data),
+                &tmpfile.metadata()?,
+            )?;
+            std::fs::rename(tmpfile.path(), path_in_cache)?;
+        }
         txn.commit()?;
 
-        std::fs::rename(tmpfile.path(), path_in_cache)?;
-
-        // Now open the file through the normal open_file mechanism
-        let mut blob = acache.open_file(inode)?;
+        let mut blob = Blob::open(&fixture.db, &path)?;
+        assert_eq!(hash::digest(data), blob.hash);
+        assert_eq!(data.len() as u64, blob.size);
+        assert_eq!(
+            ByteRanges::single(0, data.len() as u64),
+            *blob.local_availability()
+        );
         let mut buf = String::new();
         blob.read_to_string(&mut buf).await?;
         assert_eq!(
             "When you light a candle, you also cast a shadow.".to_string(),
             buf
         );
-        assert_eq!(ByteRanges::single(0, 48), *blob.local_availability());
+
+        let BlobInfo {
+            inode, verified, ..
+        } = fixture.blob_info(&path)?.unwrap();
+        assert_eq!(false, verified);
 
         // Disk usage must be set.
         let blob_entry = fixture.get_blob_entry(inode)?;
@@ -2069,66 +2083,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn move_into_blob_if_matches_creates_new_protected_blob() -> anyhow::Result<()> {
+    async fn import_replaces_partial() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
-        let file_path = Path::parse("test.txt")?;
+        let path = Path::parse("test.txt")?;
 
-        let inode = fixture.add_file(file_path.as_str(), 3)?;
-        mark::set(&fixture.db, &file_path, Mark::Keep)?;
+        let data = "When you light a candle, you also cast a shadow.";
+        fixture.create_blob_with_partial_data(&path, data, 10)?;
 
         let tmpfile = fixture.tempdir.child("tmp");
-        tmpfile.write_str("foo")?;
+        tmpfile.write_str(data)?;
 
         let txn = fixture.begin_write()?;
-        acache
-            .move_into_blob_if_matches(&txn, &file_path, &test_hash(), &tmpfile.path().metadata()?)?
-            .unwrap();
+        {
+            let mut tree = txn.write_tree()?;
+            let mut blobs = txn.write_blobs()?;
+            let marks = txn.read_marks()?;
+            let path_in_cache = blobs.import(
+                &mut tree,
+                &marks,
+                &path,
+                &hash::digest(data),
+                &tmpfile.metadata()?,
+            )?;
+            std::fs::rename(tmpfile.path(), path_in_cache)?;
+        }
         txn.commit()?;
 
-        // Since the file is marked keep, the blob that was created
-        // must be in the protected queue.
-        acache.open_file(inode)?;
+        let mut blob = Blob::open(&fixture.db, &path)?;
+        assert_eq!(hash::digest(data), blob.hash);
+        assert_eq!(data.len() as u64, blob.size);
         assert_eq!(
-            LruQueueId::Protected,
-            fixture.get_blob_entry(inode).unwrap().queue
+            ByteRanges::single(0, data.len() as u64),
+            *blob.local_availability()
         );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn move_into_blob_if_matches_overwrites_existing_blob() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
-        let file_path = Path::parse("test.txt")?;
-
-        // Create a file and add it to the cache
-        let inode = fixture.add_file(file_path.as_str(), 59)?;
-
-        // First, create a blob through normal open_file
-        acache.open_file(inode)?;
-
-        // Now use move_into_blob_if_matches with the existing blob
-        let tmpfile = fixture.tempdir.child("tmp");
-        tmpfile.write_str("What sane person could live in this world and not be crazy?")?;
-
-        let txn = fixture.begin_write()?;
-        let dest_path = acache
-            .move_into_blob_if_matches(&txn, &file_path, &test_hash(), &tmpfile.path().metadata()?)?
-            .unwrap();
-        txn.commit()?;
-        std::fs::rename(tmpfile.path(), dest_path)?;
-
-        // Open the file again and verify we can read the content within the ranges
-        let mut blob = acache.open_file(inode)?;
         let mut buf = String::new();
         blob.read_to_string(&mut buf).await?;
         assert_eq!(
-            "What sane person could live in this world and not be crazy?".to_string(),
+            "When you light a candle, you also cast a shadow.".to_string(),
             buf
         );
-        assert_eq!(ByteRanges::single(0, 59), *blob.local_availability());
+
+        let BlobInfo {
+            inode, verified, ..
+        } = fixture.blob_info(&path)?.unwrap();
+        assert_eq!(false, verified);
 
         // Disk usage must be set.
         let blob_entry = fixture.get_blob_entry(inode)?;
@@ -2137,6 +2135,36 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn import_protected() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let path = Path::parse("test.txt")?;
+
+        let tmpfile = fixture.tempdir.child("tmp");
+        tmpfile.write_str("data")?;
+
+        let txn = fixture.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut marks = txn.write_marks()?;
+        let mut dirty = txn.write_dirty()?;
+        marks.set(&mut tree, &mut dirty, &path, Mark::Keep)?;
+        let path_in_cache = blobs.import(
+            &mut tree,
+            &marks,
+            &path,
+            &hash::digest("data"),
+            &tmpfile.metadata()?,
+        )?;
+
+        let info = blobs.get(&tree, &path)?.unwrap();
+        assert_eq!(true, info.protected);
+        std::fs::rename(tmpfile.path(), path_in_cache)?;
+
+        Ok(())
+    }
+
+    // TODO: move to arena_cache
     #[tokio::test]
     async fn move_into_blob_if_matches_reject_wrong_file_size() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
@@ -2157,34 +2185,6 @@ mod tests {
                 &file_path,
                 &test_hash(),
                 &tmpfile.path().metadata()?
-            )?
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn move_into_blob_if_matches_rejects_wrong_hash() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
-        let file_path = Path::parse("test.txt")?;
-
-        // Create a file and add it to the cache
-        fixture.add_file(file_path.as_str(), 5)?;
-
-        let txn = fixture.begin_write()?;
-
-        let tmpfile = fixture.tempdir.child("tmp");
-        tmpfile.write_str("hello")?;
-
-        // hash is test_hash(), which is not [99; 32]
-        assert_eq!(
-            None,
-            acache.move_into_blob_if_matches(
-                &txn,
-                &file_path,
-                &Hash([99; 32]),
-                &tmpfile.metadata()?
             )?
         );
 
