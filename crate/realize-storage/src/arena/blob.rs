@@ -224,9 +224,20 @@ impl<'a> WritableOpenBlob<'a> {
         hash: &Hash,
         size: u64,
     ) -> Result<BlobInfo, StorageError> {
-        let inode = tree.setup(loc)?;
+        let (inode, _, entry) = self.create_entry(tree, marks, loc, hash, size)?;
 
-        // Check if blob already exists and get the hash if it does
+        Ok(BlobInfo::new(inode, entry))
+    }
+
+    fn create_entry<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree<'_>,
+        marks: &impl MarkReadOperations,
+        loc: L,
+        hash: &Hash,
+        size: u64,
+    ) -> Result<(Inode, PathBuf, BlobTableEntry), StorageError> {
+        let inode = tree.setup(loc)?;
         let existing_entry = if let Some(e) = self.blob_table.get(inode)? {
             Some(e.value().parse()?)
         } else {
@@ -234,29 +245,40 @@ impl<'a> WritableOpenBlob<'a> {
         };
         if let Some(e) = existing_entry {
             if e.content_hash == *hash {
-                return Ok(BlobInfo::new(inode, e));
+                return Ok((inode, self.subsystem.blob_dir.join(inode.hex()), e));
             }
 
             // Existing entry cannot be reuse; remove.
             remove_from_queue(&mut self.blob_lru_queue_table, &mut self.blob_table, &e)?;
         }
-
         let blob_path = self.prepare_blob_file(inode, size)?;
         let queue = choose_queue(tree, marks, inode)?;
-        let entry = init_blob_entry(
+        let mut entry = BlobTableEntry {
+            written_areas: ByteRanges::new(),
+            content_hash: hash.clone(),
+            content_size: size,
+            verified: false,
+            queue,
+            next: None,
+            prev: None,
+            disk_usage: 0,
+        };
+        add_to_queue_front(
             &mut self.blob_lru_queue_table,
             &mut self.blob_table,
-            inode,
             queue,
-            hash,
+            inode,
+            &mut entry,
+        )?;
+        update_disk_usage(
+            &mut self.blob_lru_queue_table,
+            &mut entry,
             &blob_path.metadata()?,
         )?;
 
-        log::debug!("Created blob {inode} in {queue:?} at {blob_path:?}");
-
+        log::debug!("Created blob {inode} {hash} in {queue:?} at {blob_path:?} -> {entry:?}");
         tree.insert_and_incref(inode, &mut self.blob_table, inode, Holder::new(&entry)?)?;
-
-        Ok(BlobInfo::new(inode, entry))
+        Ok((inode, blob_path, entry))
     }
 
     fn prepare_blob_file(&mut self, inode: Inode, size: u64) -> Result<PathBuf, StorageError> {
@@ -410,31 +432,20 @@ impl<'a> WritableOpenBlob<'a> {
         hash: &Hash,
         metadata: &std::fs::Metadata,
     ) -> Result<PathBuf, StorageError> {
-        let inode = tree.setup(loc)?;
-
-        // Create the blob entry
-        let mut entry = init_blob_entry(
-            &mut self.blob_lru_queue_table,
-            &mut self.blob_table,
-            inode,
-            choose_queue(tree, marks, inode)?,
-            hash,
-            metadata,
-        )?;
-
-        // Set written areas to complete (but not verified)
         let size = metadata.len();
-        entry.written_areas = ByteRanges::single(0, size);
-        update_disk_usage(&mut self.blob_lru_queue_table, &mut entry, metadata)?;
+        let (inode, blob_path, mut entry) = self.create_entry(tree, marks, loc, hash, size)?;
 
-        // Insert the entry into the table
+        // Set written areas to complete (but not verified) and update
+        // trusting that metadata is going to be the blob file
+        // metadata.
+        entry.written_areas = ByteRanges::single(0, size);
+        entry.verified = false;
+        update_disk_usage(&mut self.blob_lru_queue_table, &mut entry, metadata)?;
         self.blob_table
             .insert(inode, Holder::with_content(entry)?)?;
 
-        let path = self.prepare_blob_file(inode, size)?;
-
         // Return the path where the file should be moved
-        Ok(path)
+        Ok(blob_path)
     }
 
     /// Mark the blob as accessed.
@@ -483,22 +494,24 @@ impl<'a> WritableOpenBlob<'a> {
 
     /// Mark the blob as complete and verified for the given hash.
     ///
-    /// Does nothing unless the hash match.
+    /// If the blob exists and has the same hash as was given, update
+    /// the blob and return true, otherwise do nothing and return
+    /// false.
     fn mark_verified<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &impl TreeReadOperations,
         dirty: &mut WritableOpenDirty,
         loc: L,
         hash: &Hash,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         let inode = match tree.resolve(loc)? {
             Some(inode) => inode,
-            None => return Ok(()), // Nothing to mark
+            None => return Ok(false), // Nothing to mark
         };
 
         let mut blob_entry = match self.blob_table.get(inode)? {
             None => {
-                return Err(StorageError::NotFound);
+                return Ok(false);
             }
             Some(v) => v.value().parse()?,
         };
@@ -511,9 +524,10 @@ impl<'a> WritableOpenBlob<'a> {
             self.blob_table
                 .insert(inode, Holder::with_content(blob_entry)?)?;
             dirty.mark_dirty(inode, "verified")?;
+            return Ok(true);
         }
 
-        Ok(())
+        Ok(false)
     }
 
     /// Extend local availability of the blob with the given range.
@@ -729,36 +743,6 @@ fn get_queue_must_exist(
         .ok_or_else(|| StorageError::InconsistentDatabase(format!("{queue_id:?} missing")))?
         .value()
         .parse()?)
-}
-
-fn init_blob_entry(
-    blob_lru_queue_table: &mut redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
-    blob_table: &mut redb::Table<'_, Inode, Holder<'static, BlobTableEntry>>,
-    inode: Inode,
-    queue: LruQueueId,
-    hash: &Hash,
-    metadata: &std::fs::Metadata,
-) -> Result<BlobTableEntry, StorageError> {
-    let mut entry = if let Some(e) = blob_table.get(inode)? {
-        e.value().parse()?
-    } else {
-        let mut entry = BlobTableEntry {
-            written_areas: ByteRanges::new(),
-            content_hash: hash.clone(),
-            content_size: metadata.len(),
-            verified: false,
-            queue,
-            next: None,
-            prev: None,
-            disk_usage: 0,
-        };
-        add_to_queue_front(blob_lru_queue_table, blob_table, queue, inode, &mut entry)?;
-
-        entry
-    };
-    update_disk_usage(blob_lru_queue_table, &mut entry, metadata)?;
-
-    Ok(entry)
 }
 
 fn get_blob_entry(
@@ -988,7 +972,9 @@ impl Blob {
     }
 
     /// Flush and mark file content as verified on the database.
-    pub async fn mark_verified(&mut self) -> Result<(), StorageError> {
+    ///
+    /// Return true if the database was updated
+    pub async fn mark_verified(&mut self) -> Result<bool, StorageError> {
         self.update_db().await?;
 
         let inode = self.inode;
@@ -998,15 +984,17 @@ impl Blob {
             let txn = db.begin_write()?;
             {
                 let mut blobs = txn.write_blobs()?;
-                blobs.mark_verified(
+                if !blobs.mark_verified(
                     &mut txn.read_tree()?,
                     &mut txn.write_dirty()?,
                     inode,
                     &hash,
-                )?;
-            }
+                )? {
+                    return Ok(false);
+                }
+            };
             txn.commit()?;
-            Ok::<(), StorageError>(())
+            Ok::<bool, StorageError>(true)
         })
         .await?
     }
@@ -1021,14 +1009,14 @@ impl Blob {
     }
 
     /// Flush data and report any ranges written to to the database.
-    pub async fn update_db(&mut self) -> Result<(), StorageError> {
+    pub async fn update_db(&mut self) -> Result<bool, StorageError> {
         if self.pending_ranges.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         self.flush_and_sync().await?;
 
         let inode = self.inode;
-        let ranges = std::mem::take(&mut self.pending_ranges);
+        let ranges = self.pending_ranges.clone();
         let db = Arc::clone(&self.db);
         let hash = self.hash.clone();
 
@@ -1038,7 +1026,7 @@ impl Blob {
                 inode: Inode,
                 hash: &Hash,
                 ranges: &ByteRanges,
-            ) -> Result<(), StorageError> {
+            ) -> Result<bool, StorageError> {
                 let txn = db.begin_write()?;
                 {
                     let mut blobs = txn.write_blobs()?;
@@ -1049,19 +1037,19 @@ impl Blob {
                         &ranges,
                     )? {
                         // The blob has changed in the database
-                        return Err(StorageError::NotFound);
+                        return Ok(false);
                     }
                 }
                 txn.commit()?;
-                Ok(())
+                Ok(true)
             }
 
             (extend(db, inode, &hash, &ranges), ranges)
         })
         .await?;
-        if res.is_err() {
-            // Keep the range as pending again, since updating fails.
-            self.pending_ranges.extend(ranges);
+        if matches!(res, Ok(true)) {
+            // Keep the range as pending again, since updating failed.
+            self.pending_ranges = self.pending_ranges.subtraction(&ranges);
         }
 
         res
@@ -1425,22 +1413,6 @@ mod tests {
                 .unwrap_or(0))
         }
 
-        fn extend_local_availability<'b, L: Into<TreeLoc<'b>>>(
-            &self,
-            loc: L,
-            ranges: &ByteRanges,
-        ) -> anyhow::Result<bool> {
-            let txn = self.begin_write()?;
-            let ret = {
-                let mut blobs = txn.write_blobs()?;
-                let tree = txn.read_tree()?;
-                blobs.extend_local_availability(&tree, loc, &test_hash(), ranges)?
-            };
-            txn.commit()?;
-
-            Ok(ret)
-        }
-
         fn create_blob_with_partial_data<'b, L: Into<TreeLoc<'b>>>(
             &self,
             loc: L,
@@ -1458,19 +1430,27 @@ mod tests {
 
                 info = blobs.create(&mut tree, &marks, loc, &hash, test_data.len() as u64)?;
 
-                // Write some partial data to the blob file
-                let blob_path = self.blob_path(info.inode);
-                std::fs::write(&blob_path, &test_data[0..partial])?;
-                blobs.extend_local_availability(
-                    &tree,
-                    info.inode,
-                    &hash,
-                    &ByteRanges::single(0, partial as u64),
-                )?;
+                if partial > 0 {
+                    let blob_path = self.blob_path(info.inode);
+                    std::fs::write(&blob_path, &test_data[0..partial])?;
+                    blobs.extend_local_availability(
+                        &tree,
+                        info.inode,
+                        &hash,
+                        &ByteRanges::single(0, partial as u64),
+                    )?;
+                }
             }
             txn.commit()?;
 
             Ok(info)
+        }
+
+        fn blob_info<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> anyhow::Result<Option<BlobInfo>> {
+            let txn = self.begin_read()?;
+            let tree = txn.read_tree()?;
+            let blobs = txn.read_blobs()?;
+            Ok(blobs.get(&tree, loc)?)
         }
     }
 
@@ -1672,35 +1652,38 @@ mod tests {
     #[tokio::test]
     async fn writing_to_blob_updates_local_availability() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let inode = fixture.add_file("test.txt", 21)?;
+        let path = Path::parse("baa/baa")?;
+        fixture.create_blob_with_partial_data(&path, "Baa, baa, black sheep", 0)?;
 
-        // Write to blob
-        let mut blob = fixture.acache.open_file(inode)?;
+        let mut blob = Blob::open(&fixture.db, &path)?;
 
-        blob.write(b"baa, baa").await?;
+        blob.write(b"Baa, baa").await?;
         assert_eq!(ByteRanges::single(0, 8), *blob.local_availability());
 
-        let blob_entry = fixture.get_blob_entry(inode)?;
-        assert_eq!(ByteRanges::new(), blob_entry.written_areas);
+        // At this point, local availability is only in the blob, not
+        // yet stored on the database.
+        assert_eq!(
+            ByteRanges::new(),
+            fixture.blob_info(&path).unwrap().unwrap().available_ranges
+        );
 
         blob.write(b", black sheep").await?;
         assert_eq!(ByteRanges::single(0, 21), *blob.local_availability());
 
-        let blob_entry = fixture.get_blob_entry(inode)?;
-        assert_eq!(ByteRanges::new(), blob_entry.written_areas);
-
         blob.update_db().await?;
-
-        // Get written areas from blob table after update
-        let txn = fixture.begin_read()?;
-        let blob_entry = get_blob_entry(&txn.blob_table()?, inode)?.unwrap();
-        assert_eq!(ByteRanges::single(0, 21), blob_entry.written_areas);
         drop(blob);
 
+        // After update_db, local availability changes on the database.
         assert_eq!(
-            "baa, baa, black sheep",
-            fs::read_to_string(fixture.blob_path(inode)).await?
+            ByteRanges::single(0, 21),
+            fixture.blob_info(&path)?.unwrap().available_ranges
         );
+
+        // The file can now be read fully
+        let mut blob = Blob::open(&fixture.db, &path)?;
+        let mut buf = String::new();
+        blob.read_to_string(&mut buf).await?;
+        assert_eq!("Baa, baa, black sheep", buf.as_str());
 
         Ok(())
     }
@@ -1708,79 +1691,100 @@ mod tests {
     #[tokio::test]
     async fn writing_to_blob_out_of_order() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let inode = fixture.add_file("test.txt", 21)?;
+        let path = Path::parse("baa/baa")?;
+        fixture.create_blob_with_partial_data(&path, "Baa, baa, black sheep", 0)?;
 
-        // Write to blob
-        let mut blob = fixture.acache.open_file(inode)?;
+        let mut blob = Blob::open(&fixture.db, &path)?;
 
         blob.seek(SeekFrom::Start(8)).await?;
         blob.write(b", black sheep").await?;
 
         blob.seek(SeekFrom::Start(0)).await?;
-        blob.write(b"baa, baa").await?;
+        blob.write(b"Baa, baa").await?;
 
         blob.update_db().await?;
 
-        let blob_entry = fixture.get_blob_entry(inode)?;
-        assert_eq!(ByteRanges::single(0, 21), blob_entry.written_areas);
-        drop(blob);
+        let mut blob = Blob::open(&fixture.db, &path)?;
+        let mut buf = String::new();
+        blob.read_to_string(&mut buf).await?;
+        assert_eq!("Baa, baa, black sheep", buf.as_str());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writing_to_blob_multiple_update_db() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let path = Path::parse("baa/baa")?;
+        fixture.create_blob_with_partial_data(&path, "Baa, baa, black sheep", 0)?;
+
+        let mut blob = Blob::open(&fixture.db, &path)?;
+
+        blob.seek(SeekFrom::Start(8)).await?;
+        blob.write(b", black sheep").await?;
+        blob.update_db().await?;
         assert_eq!(
-            "baa, baa, black sheep",
-            fs::read_to_string(fixture.blob_path(inode)).await?
+            ByteRanges::single(8, 21),
+            fixture.blob_info(&path)?.unwrap().available_ranges
+        );
+
+        blob.seek(SeekFrom::Start(0)).await?;
+        blob.write(b"Baa, baa").await?;
+
+        blob.update_db().await?;
+
+        let mut blob = Blob::open(&fixture.db, &path)?;
+        let mut buf = String::new();
+        blob.read_to_string(&mut buf).await?;
+        assert_eq!("Baa, baa, black sheep", buf.as_str());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writing_to_blob_new_hash_multiple_update_db() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let path = Path::parse("baa/baa")?;
+        fixture.create_blob_with_partial_data(&path, "Baa, baa, black sheep", 0)?;
+
+        let mut blob = Blob::open(&fixture.db, &path)?;
+
+        blob.write(b"Baa, baa").await?;
+        assert_eq!(true, blob.update_db().await?);
+        assert_eq!(
+            ByteRanges::single(0, 8),
+            fixture.blob_info(&path)?.unwrap().available_ranges
+        );
+
+        let txn = fixture.begin_write()?;
+        {
+            let marks = txn.read_marks()?;
+            let mut blobs = txn.write_blobs()?;
+            let mut tree = txn.write_tree()?;
+
+            blobs.create(&mut tree, &marks, &path, &hash::digest("other"), 100)?;
+        }
+        txn.commit()?;
+
+        blob.write(b", black sheep").await?;
+        assert_eq!(false, blob.update_db().await?);
+        assert_eq!(ByteRanges::single(0, 21), *blob.local_availability());
+        assert_eq!(
+            ByteRanges::new(),
+            fixture.blob_info(&path)?.unwrap().available_ranges
+        );
+
+        assert_eq!(false, blob.mark_verified().await?);
+        assert_eq!(ByteRanges::single(0, 21), *blob.local_availability());
+        assert_eq!(
+            ByteRanges::new(),
+            fixture.blob_info(&path)?.unwrap().available_ranges
         );
 
         Ok(())
     }
 
-    #[tokio::test]
-    async fn writing_to_blob_then_reading_it() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let inode = fixture.add_file("test.txt", 100)?;
-
-        let mut blob = fixture.acache.open_file(inode)?;
-
-        blob.write(b"baa, baa, black sheep").await?;
-
-        blob.seek(SeekFrom::Start(10)).await?;
-
-        let mut buf = [0; 100];
-        let n = blob.read(&mut buf).await?;
-        assert_eq!(b"black sheep", &buf[0..n]);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn open_file_creates_sparse_file() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
-        let file_path = Path::parse("foobar")?;
-
-        fixture.add_file_with_mtime(&file_path, 10000, test_time())?;
-        let inode = acache.expect(&file_path)?;
-
-        {
-            let blob = acache.open_file(inode)?;
-            let m = fixture.blob_path(inode).metadata()?;
-
-            // File should have the right size
-            assert_eq!(10000, m.len());
-
-            // File should be sparse
-            assert_eq!(0, m.blocks());
-
-            // Range empty for now
-            assert_eq!(ByteRanges::new(), *blob.local_availability());
-        };
-
-        // If called a second time, it should return a handle on the same file.
-        let blob = acache.open_file(inode)?;
-        assert_eq!(ByteRanges::new(), *blob.local_availability());
-
-        Ok(())
-    }
-
+    // TODO:move to arena_cache test
     #[tokio::test]
     async fn blob_deleted_on_file_overwrite() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
@@ -1823,6 +1827,7 @@ mod tests {
         Ok(())
     }
 
+    // TODO:move to arena_cache test
     #[tokio::test]
     async fn blob_deleted_on_file_removal() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
@@ -1852,6 +1857,7 @@ mod tests {
         Ok(())
     }
 
+    // TODO:move to arena_cache test
     #[tokio::test]
     async fn blob_deleted_on_catchup_removal() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
@@ -1892,105 +1898,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blob_update_extends_range() -> anyhow::Result<()> {
+    async fn mark_verified() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
-        let file_path = Path::parse("file.txt")?;
+        let path = Path::parse("baa/baa")?;
+        fixture.create_blob_with_partial_data(&path, "Baa, baa, black sheep", 21)?;
 
-        // Create a file
-        fixture.add_file_with_mtime(&file_path, 1000, test_time())?;
+        assert_eq!(false, fixture.blob_info(&path)?.unwrap().verified);
+        let mut blob = Blob::open(&fixture.db, &path)?;
+        assert_eq!(ByteRanges::single(0, 21), *blob.local_availability());
+        assert_eq!(true, blob.mark_verified().await?);
+        assert_eq!(true, fixture.blob_info(&path)?.unwrap().verified);
+        drop(blob);
 
-        // Open the file to create a blob
-        let inode = acache.expect(&file_path)?;
-        acache.open_file(inode)?;
+        Ok(())
+    }
 
-        // Initially, the blob should have empty written areas
-        let txn = fixture.begin_read()?;
-        let initial_blob_entry = get_blob_entry(&txn.blob_table()?, inode)?.unwrap();
-        assert!(initial_blob_entry.written_areas.is_empty());
+    #[test]
+    fn mark_verified_wrong_hash() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let path = Path::parse("baa/baa")?;
+        fixture.create_blob_with_partial_data(&path, "Baa, baa, black sheep", 21)?;
 
-        // Update the blob with some written areas
-        let written_areas = ByteRanges::from_ranges(vec![
-            ByteRange::new(0, 100),
-            ByteRange::new(200, 300),
-            ByteRange::new(500, 600),
-        ]);
-
-        fixture.extend_local_availability(inode, &written_areas)?;
-
-        // Verify the written areas were updated
-        let txn = fixture.begin_read()?;
-        let retrieved_blob_entry = get_blob_entry(&txn.blob_table()?, inode)?.unwrap();
-        assert_eq!(retrieved_blob_entry.written_areas, written_areas);
-
-        fixture.extend_local_availability(
-            inode,
-            &ByteRanges::from_ranges(vec![ByteRange::new(50, 210), ByteRange::new(200, 400)]),
-        )?;
-
-        // Verify the ranges were updated again
-        let txn = fixture.begin_read()?;
-        let final_blob_entry = get_blob_entry(&txn.blob_table()?, inode)?.unwrap();
-        assert_eq!(
-            final_blob_entry.written_areas,
-            ByteRanges::from_ranges(vec![ByteRange::new(0, 400), ByteRange::new(500, 600)])
-        );
-
-        // Test that updating ranges for a non-existent blob returns false
+        let txn = fixture.begin_write()?;
+        let mut blobs = txn.write_blobs()?;
+        let tree = txn.read_tree()?;
+        let mut dirty = txn.write_dirty()?;
         assert_eq!(
             false,
-            fixture.extend_local_availability(Inode(99999), &ByteRanges::new())?,
+            blobs.mark_verified(&tree, &mut dirty, &path, &hash::digest("wrong"))?
         );
+        assert_eq!(false, blobs.get(&tree, &path)?.unwrap().verified);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn move_blob_success() -> anyhow::Result<()> {
+    async fn export_success() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
-        let file_path = Path::parse("test.txt")?;
+        let path = Path::parse("baa/baa")?;
+        fixture.create_blob_with_partial_data(&path, "Baa, baa, black sheep", 21)?;
+        let BlobInfo { inode, hash, .. } = fixture.blob_info(&path)?.unwrap();
 
-        // Create a file and add it to the cache
-        fixture.add_file_with_mtime(&file_path, 100, test_time())?;
+        assert_eq!(true, Blob::open(&fixture.db, &path)?.mark_verified().await?);
 
-        // Open the file to create a blob
-        let inode = acache.expect(&file_path)?;
-        acache.open_file(inode)?;
-
-        // Write some data to the blob and mark it as verified
-        let mut blob = fixture.acache.open_file(inode)?;
-        blob.write(b"test content").await?;
-        blob.update_db().await?;
-        blob.mark_verified().await?;
-
-        // Verify the blob file exists and has content
-        assert!(fixture.blob_file_exists(inode));
-        assert!(fixture.blob_entry_exists(inode)?);
-
-        // Create destination path
-        let dest_path = fixture.tempdir.child("moved_blob").to_path_buf();
-
-        // Move the blob
+        // export to dest
+        let dest = fixture.tempdir.path().join("moved_blob");
         let txn = fixture.begin_write()?;
-        let result = acache.move_blob_if_matches(&txn, &file_path, &test_hash(), &dest_path)?;
+        {
+            let mut blobs = txn.write_blobs()?;
+            let mut tree = txn.write_tree()?;
+            assert_eq!(true, blobs.export(&mut tree, &path, &hash, &dest)?);
+        }
         txn.commit()?;
 
-        // Verify the move was successful
-        assert!(result);
+        assert_eq!("Baa, baa, black sheep", std::fs::read_to_string(&dest)?);
+        assert!(fixture.blob_info(inode)?.is_none());
 
-        // Verify the blob file has been moved
-        assert!(!fixture.blob_file_exists(inode));
-        assert!(dest_path.exists());
-
-        // Verify the blob entry has been deleted from the database
-        assert!(!fixture.blob_entry_exists(inode)?);
-
-        // Verify the content was moved correctly
-        let moved_content = std::fs::read_to_string(&dest_path)?;
-        assert_eq!("test content", moved_content.trim_end_matches('\0'));
-
-        // Verify the LRU queue has been updated properly.
+        // The LRU queue must have been updated properly.
         assert!(
             fixture
                 .list_queue_content(LruQueueId::WorkingArea)?
@@ -2001,168 +1965,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn move_blob_wrong_hash() -> anyhow::Result<()> {
+    async fn export_wrong_hash() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
-        let file_path = Path::parse("test.txt")?;
+        let path = Path::parse("baa/baa")?;
+        fixture.create_blob_with_partial_data(&path, "Baa, baa, black sheep", 21)?;
 
-        // Create a file and add it to the cache
-        fixture.add_file_with_mtime(&file_path, 100, test_time())?;
+        assert_eq!(true, Blob::open(&fixture.db, &path)?.mark_verified().await?);
 
-        // Open the file to create a blob
-        let inode = acache.expect(&file_path)?;
-        acache.open_file(inode)?;
-
-        // Write some data to the blob and mark it as verified
-        let mut blob = fixture.acache.open_file(inode)?;
-        blob.write(b"test content").await?;
-        blob.update_db().await?;
-        blob.mark_verified().await?;
-
-        // Verify the blob file exists
-        assert!(fixture.blob_file_exists(inode));
-        assert!(fixture.blob_entry_exists(inode)?);
-
-        // Create destination path
-        let dest_path = fixture.tempdir.child("moved_blob").to_path_buf();
-
-        // Try to move the blob with wrong hash
-        let wrong_hash = Hash([2u8; 32]);
+        // export to dest
+        let dest = fixture.tempdir.path().join("moved_blob");
         let txn = fixture.begin_write()?;
-        let result = acache.move_blob_if_matches(&txn, &file_path, &wrong_hash, &dest_path)?;
+        {
+            let mut blobs = txn.write_blobs()?;
+            let mut tree = txn.write_tree()?;
+            assert_eq!(
+                false,
+                blobs.export(&mut tree, &path, &hash::digest("wrong!"), &dest)?
+            );
+        }
         txn.commit()?;
 
-        // Verify the move was not successful
-        assert!(!result);
-
-        // Verify the blob file still exists
-        assert!(fixture.blob_file_exists(inode));
-        assert!(fixture.blob_entry_exists(inode)?);
-
-        // Verify the destination file was not created
-        assert!(!dest_path.exists());
+        assert!(!dest.exists());
+        assert!(fixture.blob_info(&path)?.is_some());
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn move_blob_not_verified() -> anyhow::Result<()> {
+    async fn export_not_verified() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
-        let file_path = Path::parse("test.txt")?;
+        let path = Path::parse("baa/baa")?;
+        fixture.create_blob_with_partial_data(&path, "Baa, baa, black sheep", 21)?;
+        let hash = fixture.blob_info(&path)?.unwrap().hash;
 
-        // Create a file and add it to the cache
-        fixture.add_file_with_mtime(&file_path, 100, test_time())?;
+        // do not mark verified
 
-        // Open the file to create a blob
-        let inode = acache.expect(&file_path)?;
-        acache.open_file(inode)?;
-
-        // Write some data to the blob but don't mark it as verified
-        let mut blob = fixture.acache.open_file(inode)?;
-        blob.write(b"test content").await?;
-        blob.update_db().await?;
-        // Note: Not calling mark_verified()
-
-        // Verify the blob file exists
-        assert!(fixture.blob_file_exists(inode));
-        assert!(fixture.blob_entry_exists(inode)?);
-
-        // Create destination path
-        let dest_path = fixture.tempdir.child("moved_blob").to_path_buf();
-
-        // Try to move the blob
+        // export to dest
+        let dest = fixture.tempdir.path().join("moved_blob");
         let txn = fixture.begin_write()?;
-        let result = acache.move_blob_if_matches(&txn, &file_path, &test_hash(), &dest_path)?;
-        txn.commit()?;
-
-        // Verify the move was not successful (not verified)
-        assert!(!result);
-
-        // Verify the blob file still exists
-        assert!(fixture.blob_file_exists(inode));
-        assert!(fixture.blob_entry_exists(inode)?);
-
-        // Verify the destination file was not created
-        assert!(!dest_path.exists());
+        {
+            let mut blobs = txn.write_blobs()?;
+            let mut tree = txn.write_tree()?;
+            assert_eq!(false, blobs.export(&mut tree, &path, &hash, &dest)?);
+        }
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn move_blob_nonexistent_blob() -> anyhow::Result<()> {
+    async fn export_no_blob() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
+        let path = Path::parse("baa/baa")?;
 
-        // Create destination path
-        let dest_path = fixture.tempdir.child("moved_blob").to_path_buf();
-
-        // Try to move a non-existent blob
-        let non_existent_path = Path::parse("non_existent.txt")?;
+        let dest = fixture.tempdir.path().join("moved_blob");
         let txn = fixture.begin_write()?;
-        let result =
-            acache.move_blob_if_matches(&txn, &non_existent_path, &test_hash(), &dest_path);
-        txn.commit()?;
-
-        // Verify the move failed with NotFound error
-        assert!(matches!(result, Err(StorageError::NotFound)));
-
-        // Verify the destination file was not created
-        assert!(!dest_path.exists());
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn move_blob_verifies_hash_and_state() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
-        let file_path = Path::parse("test.txt")?;
-
-        // Create a file and add it to the cache
-        fixture.add_file_with_mtime(&file_path, 34, test_time())?;
-
-        // Open the file to create a blob
-        let inode = acache.expect(&file_path)?;
-        acache.open_file(inode)?;
-
-        // Write some data to the blob and mark it as verified
-        let mut blob = fixture.acache.open_file(inode)?;
-        let content = b"test content for hash verification";
-        blob.write(content).await?;
-        blob.update_db().await?;
-        blob.mark_verified().await?;
-
-        // Get the actual hash of the content
-        let actual_hash = blob.hash().clone();
-
-        // Verify the blob file exists
-        assert!(fixture.blob_file_exists(inode));
-        assert!(fixture.blob_entry_exists(inode)?);
-
-        // Create destination path
-        let dest_path = fixture.tempdir.child("moved_blob").to_path_buf();
-
-        // Move the blob with the correct hash
-        let txn = fixture.begin_write()?;
-        let result = acache.move_blob_if_matches(&txn, &file_path, &actual_hash, &dest_path)?;
-        txn.commit()?;
-
-        // Verify the move was successful
-        assert!(result);
-
-        // Verify the blob file has been moved
-        assert!(!fixture.blob_file_exists(inode));
-        assert!(dest_path.exists());
-
-        // Verify the blob entry has been deleted from the database
-        assert!(!fixture.blob_entry_exists(inode)?);
-
-        // Verify the content was moved correctly
-        assert_eq!(
-            "test content for hash verification",
-            std::fs::read_to_string(&dest_path)?
-        );
+        {
+            let mut blobs = txn.write_blobs()?;
+            let mut tree = txn.write_tree()?;
+            assert_eq!(
+                false,
+                blobs.export(&mut tree, &path, &hash::digest("test"), &dest)?
+            );
+        }
 
         Ok(())
     }
