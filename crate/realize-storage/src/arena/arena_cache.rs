@@ -1153,11 +1153,13 @@ fn check_is_dir(
 #[cfg(test)]
 mod tests {
     use super::ArenaCache;
+    use crate::arena::blob::BlobExt;
     use crate::arena::db::ArenaDatabase;
     use crate::arena::dirty::DirtyReadOperations;
     use crate::arena::index::RealIndex;
     use crate::arena::notifier::Notification;
     use crate::arena::tree::TreeExt;
+    use crate::arena::tree::TreeLoc;
     use crate::arena::tree::TreeReadOperations;
     use crate::arena::types::HistoryTableEntry;
     use crate::utils::hash;
@@ -1200,7 +1202,7 @@ mod tests {
         arena: Arena,
         acache: Arc<ArenaCache>,
         db: Arc<ArenaDatabase>,
-        _tempdir: TempDir,
+        tempdir: TempDir,
     }
     impl Fixture {
         async fn setup_with_arena(arena: Arena) -> anyhow::Result<Fixture> {
@@ -1217,7 +1219,7 @@ mod tests {
                 arena,
                 acache,
                 db,
-                _tempdir: tempdir,
+                tempdir,
             })
         }
 
@@ -1268,6 +1270,14 @@ mod tests {
             )?;
 
             Ok(())
+        }
+
+        fn has_blob<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> Result<bool, StorageError> {
+            let txn = self.db.begin_read()?;
+            let blobs = txn.read_blobs()?;
+            let tree = txn.read_tree()?;
+
+            Ok(blobs.get(&tree, loc)?.is_some())
         }
 
         fn as_real_index(&self) -> Arc<dyn RealIndex> {
@@ -2791,6 +2801,115 @@ mod tests {
         // Verify no new history entry was created
         let final_history_count = index.last_history_index()?;
         assert_eq!(initial_history_count, final_history_count);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blob_deleted_on_file_overwrite() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let acache = &fixture.acache;
+        let arena = test_arena();
+        let file_path = Path::parse("file.txt")?;
+
+        // Create a file
+        fixture.add_to_cache(&file_path, 100, test_time())?;
+
+        // Open the file to create a blob
+        let inode = acache.expect(&file_path)?;
+        acache.open_file(inode)?;
+        assert!(fixture.has_blob(&file_path)?);
+
+        acache.update(
+            test_peer(),
+            Notification::Replace {
+                arena: arena,
+                index: 0,
+                path: file_path.clone(),
+                mtime: later_time(),
+                size: 200,
+                hash: Hash([2u8; 32]),
+                old_hash: test_hash(),
+            },
+            None,
+        )?;
+
+        // The version has changed, so the blob must have been deleted.
+        assert!(!fixture.has_blob(&file_path)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blob_deleted_on_file_removal() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let acache = &fixture.acache;
+        let file_path = Path::parse("file.txt")?;
+
+        // Create a file and open it to create the blob
+        fixture.add_to_cache(&file_path, 100, test_time())?;
+        let inode = acache.expect(&file_path)?;
+        acache.open_file(inode)?;
+        assert!(fixture.has_blob(&file_path)?);
+
+        fixture.remove_from_cache(&file_path)?;
+
+        // the blob must be gone
+        assert!(!fixture.has_blob(inode)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blob_deleted_on_catchup_removal() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let acache = &fixture.acache;
+        let arena = test_arena();
+        let file_path = Path::parse("file.txt")?;
+
+        // Create a file and open it to create the blob
+        fixture.add_to_cache(&file_path, 100, test_time())?;
+        let inode = acache.expect(&file_path)?;
+        acache.open_file(inode)?;
+        assert!(fixture.has_blob(&file_path)?);
+
+        // Do a catchup that doesn't include this file (simulating file removal)
+        acache.update(test_peer(), Notification::CatchupStart(arena), None)?;
+        // Note: No Catchup notification for the file, so it will be deleted
+        acache.update(
+            test_peer(),
+            Notification::CatchupComplete { arena, index: 0 },
+            None,
+        )?;
+
+        // The blob must be gone
+        assert!(!fixture.has_blob(inode)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn move_into_blob_if_matches_reject_wrong_file_size() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let acache = &fixture.acache;
+        let file_path = Path::parse("test.txt")?;
+
+        // Create a file and add it to the cache
+        fixture.add_to_cache(&file_path, 100, test_time())?;
+
+        let tmpfile = fixture.tempdir.child("tmp");
+        tmpfile.write_str("not 48 bytes")?;
+
+        let txn = fixture.db.begin_write()?;
+        assert_eq!(
+            None,
+            acache.move_into_blob_if_matches(
+                &txn,
+                &file_path,
+                &test_hash(),
+                &tmpfile.path().metadata()?
+            )?
+        );
 
         Ok(())
     }

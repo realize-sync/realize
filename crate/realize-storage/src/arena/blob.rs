@@ -1362,21 +1362,16 @@ fn disk_usage_op(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arena::arena_cache::ArenaCache;
     use crate::arena::db::{ArenaReadTransaction, ArenaWriteTransaction};
     use crate::utils::hash;
-    use crate::{Inode, Mark, Notification};
+    use crate::{Inode, Mark};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
-    use realize_types::{Arena, Path, Peer, UnixTime};
+    use realize_types::{Arena, Path};
     use std::io::SeekFrom;
     use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-
-    fn test_peer() -> Peer {
-        Peer::from("test_peer")
-    }
 
     fn test_arena() -> Arena {
         Arena::from("test_arena")
@@ -1386,17 +1381,8 @@ mod tests {
         Hash([1u8; 32])
     }
 
-    fn test_time() -> UnixTime {
-        UnixTime::from_secs(1234567890)
-    }
-
-    fn later_time() -> UnixTime {
-        UnixTime::from_secs(1234567891)
-    }
-
     struct Fixture {
         arena: Arena,
-        acache: Arc<ArenaCache>,
         db: Arc<ArenaDatabase>,
         tempdir: TempDir,
     }
@@ -1411,77 +1397,8 @@ mod tests {
                 std::fs::create_dir_all(p)?;
             }
             let db = ArenaDatabase::for_testing_single_arena(arena, blob_dir.path())?;
-            let acache = ArenaCache::new(arena, Arc::clone(&db), blob_dir.path())?;
 
-            Ok(Self {
-                arena,
-                db,
-                acache,
-                tempdir,
-            })
-        }
-
-        fn add_file(&self, path: &str, size: u64) -> anyhow::Result<Inode> {
-            let path = Path::parse(path)?;
-
-            self.acache.update(
-                test_peer(),
-                Notification::Add {
-                    arena: self.arena,
-                    index: 1,
-                    path: path.clone(),
-                    mtime: test_time(),
-                    size,
-                    hash: test_hash(),
-                },
-                None,
-            )?;
-
-            let inode = self.acache.expect(&path)?;
-
-            Ok(inode)
-        }
-
-        fn add_file_with_mtime(
-            &self,
-            path: &Path,
-            size: u64,
-            mtime: UnixTime,
-        ) -> anyhow::Result<()> {
-            self.acache.update(
-                test_peer(),
-                Notification::Add {
-                    arena: self.arena,
-                    index: 1,
-                    path: path.clone(),
-                    mtime: mtime.clone(),
-                    size,
-                    hash: test_hash(),
-                },
-                None,
-            )?;
-
-            Ok(())
-        }
-
-        fn remove_file(&self, path: &Path) -> anyhow::Result<()> {
-            self.acache.update(
-                test_peer(),
-                Notification::Remove {
-                    arena: self.arena,
-                    index: 1,
-                    path: path.clone(),
-                    old_hash: test_hash(),
-                },
-                None,
-            )?;
-
-            Ok(())
-        }
-
-        /// Check if a blob file exists for the given blob ID in the test arena.
-        fn blob_file_exists(&self, inode: Inode) -> bool {
-            self.blob_path(inode).exists()
+            Ok(Self { arena, db, tempdir })
         }
 
         /// Return the path to a blob file for test use.
@@ -1503,16 +1420,6 @@ mod tests {
             let txn = self.begin_read()?;
             let blob_table = txn.blob_table()?;
             Ok(get_blob_entry(&blob_table, inode)?.ok_or(StorageError::NotFound)?)
-        }
-
-        /// Check if a blob entry exists in the database.
-        fn blob_entry_exists(&self, inode: Inode) -> anyhow::Result<bool> {
-            let txn = self.begin_read()?;
-            let blob_table = txn.blob_table()?;
-            match blob_table.get(inode)? {
-                Some(_) => Ok(true),
-                None => Ok(false),
-            }
         }
 
         fn list_queue_content(&self, queue_id: LruQueueId) -> anyhow::Result<Vec<Inode>> {
@@ -1905,119 +1812,6 @@ mod tests {
         Ok(())
     }
 
-    // TODO:move to arena_cache test
-    #[tokio::test]
-    async fn blob_deleted_on_file_overwrite() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
-        let arena = test_arena();
-        let file_path = Path::parse("file.txt")?;
-
-        // Create a file
-        fixture.add_file_with_mtime(&file_path, 100, test_time())?;
-
-        // Open the file to create a blob
-        let inode = acache.expect(&file_path)?;
-        acache.open_file(inode)?;
-
-        // Verify the blob file was created
-        assert!(fixture.blob_file_exists(inode));
-        // Verify the blob entry exists in the database
-        assert!(fixture.blob_entry_exists(inode)?);
-
-        // Overwrite the file with a new version
-        acache.update(
-            test_peer(),
-            Notification::Replace {
-                arena: arena,
-                index: 0,
-                path: file_path.clone(),
-                mtime: later_time(),
-                size: 200,
-                hash: Hash([2u8; 32]),
-                old_hash: test_hash(),
-            },
-            None,
-        )?;
-
-        // Verify the blob file has been deleted
-        assert!(!fixture.blob_file_exists(inode));
-        // Verify the blob entry has been deleted from the database
-        assert!(!fixture.blob_entry_exists(inode)?);
-
-        Ok(())
-    }
-
-    // TODO:move to arena_cache test
-    #[tokio::test]
-    async fn blob_deleted_on_file_removal() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
-        let file_path = Path::parse("file.txt")?;
-
-        // Create a file
-        fixture.add_file_with_mtime(&file_path, 100, test_time())?;
-
-        // Open the file to create a blob
-        let inode = acache.expect(&file_path)?;
-        acache.open_file(inode)?;
-
-        // Verify the blob file was created
-        assert!(fixture.blob_file_exists(inode));
-        // Verify the blob entry exists in the database
-        assert!(fixture.blob_entry_exists(inode)?);
-
-        // Remove the file
-        fixture.remove_file(&file_path)?;
-
-        // Verify the blob file has been deleted
-        assert!(!fixture.blob_file_exists(inode));
-        // Verify the blob entry has been deleted from the database
-        assert!(!fixture.blob_entry_exists(inode)?);
-
-        Ok(())
-    }
-
-    // TODO:move to arena_cache test
-    #[tokio::test]
-    async fn blob_deleted_on_catchup_removal() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
-        let arena = test_arena();
-        let file_path = Path::parse("file.txt")?;
-
-        // Create a file
-        fixture.add_file_with_mtime(&file_path, 100, test_time())?;
-
-        // Open the file to create a blob
-        let inode = acache.expect(&file_path)?;
-        acache.open_file(inode)?;
-
-        // Verify the blob file was created
-        assert!(fixture.blob_file_exists(inode));
-        // Verify the blob entry exists in the database
-        assert!(fixture.blob_entry_exists(inode)?);
-
-        // Do a catchup that doesn't include this file (simulating file removal)
-        acache.update(test_peer(), Notification::CatchupStart(arena), None)?;
-        // Note: No Catchup notification for the file, so it will be deleted
-        acache.update(
-            test_peer(),
-            Notification::CatchupComplete {
-                arena: arena,
-                index: 0,
-            },
-            None,
-        )?;
-
-        // Verify the blob file has been deleted
-        assert!(!fixture.blob_file_exists(inode));
-        // Verify the blob entry has been deleted from the database
-        assert!(!fixture.blob_entry_exists(inode)?);
-
-        Ok(())
-    }
-
     #[tokio::test]
     async fn mark_verified() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
@@ -2281,33 +2075,6 @@ mod tests {
         let info = blobs.get(&tree, &path)?.unwrap();
         assert_eq!(true, info.protected);
         std::fs::rename(tmpfile.path(), path_in_cache)?;
-
-        Ok(())
-    }
-
-    // TODO: move to arena_cache
-    #[tokio::test]
-    async fn move_into_blob_if_matches_reject_wrong_file_size() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
-        let file_path = Path::parse("test.txt")?;
-
-        // Create a file and add it to the cache
-        fixture.add_file(file_path.as_str(), 48)?;
-
-        let tmpfile = fixture.tempdir.child("tmp");
-        tmpfile.write_str("not 48 bytes")?;
-
-        let txn = fixture.begin_write()?;
-        assert_eq!(
-            None,
-            acache.move_into_blob_if_matches(
-                &txn,
-                &file_path,
-                &test_hash(),
-                &tmpfile.path().metadata()?
-            )?
-        );
 
         Ok(())
     }
