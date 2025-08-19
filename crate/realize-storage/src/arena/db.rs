@@ -455,6 +455,7 @@ impl<'db> ArenaWriteTransaction<'db> {
             self.inner
                 .open_table(BLOB_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
+            self.inner.open_table(BLOB_LRU_QUEUE_TABLE)?,
         ))
     }
 
@@ -576,6 +577,7 @@ impl<'db> ArenaReadTransaction<'db> {
             self.inner
                 .open_table(BLOB_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
+            self.inner.open_table(BLOB_LRU_QUEUE_TABLE)?,
         ))
     }
 

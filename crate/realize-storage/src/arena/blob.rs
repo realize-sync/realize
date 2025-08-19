@@ -41,19 +41,26 @@ impl Blobs {
     }
 }
 
-pub(crate) struct ReadableOpenBlob<T>
+pub(crate) struct ReadableOpenBlob<T, TQ>
 where
     T: ReadableTable<Inode, Holder<'static, BlobTableEntry>>,
+    TQ: ReadableTable<u16, Holder<'static, QueueTableEntry>>,
 {
     blob_table: T,
+    #[allow(dead_code)]
+    blob_lru_queue_table: TQ,
 }
 
-impl<T> ReadableOpenBlob<T>
+impl<T, TQ> ReadableOpenBlob<T, TQ>
 where
     T: ReadableTable<Inode, Holder<'static, BlobTableEntry>>,
+    TQ: ReadableTable<u16, Holder<'static, QueueTableEntry>>,
 {
-    pub(crate) fn new(blob_table: T) -> Self {
-        Self { blob_table }
+    pub(crate) fn new(blob_table: T, blob_lru_queue_table: TQ) -> Self {
+        Self {
+            blob_table,
+            blob_lru_queue_table,
+        }
     }
 }
 
@@ -119,20 +126,61 @@ pub(crate) trait BlobReadOperations {
     /// exist on the database. Use [WritableOpenBlob::create] to
     /// create the blob entry.
     fn get_with_inode(&self, inode: Inode) -> Result<Option<BlobInfo>, StorageError>;
+
+    /// Returns a double-ended iterator over the given queue, starting at the head.
+    #[allow(dead_code)] // TODO: make it test-only
+    fn head(&self, queue: LruQueueId) -> impl Iterator<Item = Result<Inode, StorageError>>;
+
+    /// Returns a double-ended iterator over the given queue, starting at the tail.
+    #[allow(dead_code)] // TODO: make it test-only
+    fn tail(&self, queue: LruQueueId) -> impl Iterator<Item = Result<Inode, StorageError>>;
+
+    /// Disk space used for storing local copies.
+    ///
+    /// Returns (total, evictable) with total the total disk usage, in
+    /// bytes and evictable the portion of total that
+    /// [WritableOpenBlob::cleanup] can delete.
+    #[allow(dead_code)]
+    fn disk_usage(&self) -> Result<(u64, u64), StorageError>;
 }
 
-impl<'a, T> BlobReadOperations for ReadableOpenBlob<T>
+impl<T, TQ> BlobReadOperations for ReadableOpenBlob<T, TQ>
 where
     T: ReadableTable<Inode, Holder<'static, BlobTableEntry>>,
+    TQ: ReadableTable<u16, Holder<'static, QueueTableEntry>>,
 {
     fn get_with_inode(&self, inode: Inode) -> Result<Option<BlobInfo>, StorageError> {
         get_read_op(&self.blob_table, inode)
+    }
+
+    fn head(&self, queue: LruQueueId) -> impl Iterator<Item = Result<Inode, StorageError>> {
+        QueueIterator::head(&self.blob_table, &self.blob_lru_queue_table, queue)
+    }
+
+    fn tail(&self, queue: LruQueueId) -> impl Iterator<Item = Result<Inode, StorageError>> {
+        QueueIterator::tail(&self.blob_table, &self.blob_lru_queue_table, queue)
+    }
+
+    fn disk_usage(&self) -> Result<(u64, u64), StorageError> {
+        disk_usage_op(&self.blob_lru_queue_table)
     }
 }
 
 impl<'a> BlobReadOperations for WritableOpenBlob<'a> {
     fn get_with_inode(&self, inode: Inode) -> Result<Option<BlobInfo>, StorageError> {
         get_read_op(&self.blob_table, inode)
+    }
+
+    fn head(&self, queue: LruQueueId) -> impl Iterator<Item = Result<Inode, StorageError>> {
+        QueueIterator::head(&self.blob_table, &self.blob_lru_queue_table, queue)
+    }
+
+    fn tail(&self, queue: LruQueueId) -> impl Iterator<Item = Result<Inode, StorageError>> {
+        QueueIterator::tail(&self.blob_table, &self.blob_lru_queue_table, queue)
+    }
+
+    fn disk_usage(&self) -> Result<(u64, u64), StorageError> {
+        disk_usage_op(&self.blob_lru_queue_table)
     }
 }
 
@@ -631,6 +679,90 @@ impl<'a> WritableOpenBlob<'a> {
         }
 
         Ok(())
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) struct QueueIterator<'a, T>
+where
+    T: redb::ReadableTable<Inode, Holder<'static, BlobTableEntry>>,
+{
+    blob_table: &'a T,
+    err: Option<StorageError>,
+    next: Option<Inode>,
+    next_fn: fn(BlobTableEntry) -> Option<Inode>,
+}
+
+#[allow(dead_code)]
+impl<'a, T> QueueIterator<'a, T>
+where
+    T: redb::ReadableTable<Inode, Holder<'static, BlobTableEntry>>,
+{
+    fn head(
+        blob_table: &'a T,
+        blob_lru_queue_table: &'_ impl redb::ReadableTable<u16, Holder<'static, QueueTableEntry>>,
+        queue: LruQueueId,
+    ) -> Self {
+        let (err, next) = match get_queue_if_available(blob_lru_queue_table, queue) {
+            Err(e) => (Some(e), None),
+            Ok(None) => (None, None),
+            Ok(Some(e)) => (None, e.head),
+        };
+
+        Self {
+            blob_table,
+            err,
+            next,
+            next_fn: |e: BlobTableEntry| e.next,
+        }
+    }
+    fn tail(
+        blob_table: &'a T,
+        blob_lru_queue_table: &'_ impl redb::ReadableTable<u16, Holder<'static, QueueTableEntry>>,
+        queue: LruQueueId,
+    ) -> Self {
+        let (err, next) = match get_queue_if_available(blob_lru_queue_table, queue) {
+            Err(e) => (Some(e), None),
+            Ok(None) => (None, None),
+            Ok(Some(e)) => (None, e.tail),
+        };
+        Self {
+            blob_table,
+            err,
+            next,
+            next_fn: |e: BlobTableEntry| e.prev,
+        }
+    }
+}
+
+impl<'a, T> Iterator for QueueIterator<'a, T>
+where
+    T: redb::ReadableTable<Inode, Holder<'static, BlobTableEntry>>,
+{
+    type Item = Result<Inode, StorageError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(err) = self.err.take() {
+            return Some(Err(err));
+        }
+        match self.next.take() {
+            None => None,
+            Some(inode) => {
+                {
+                    // return current and move to next
+                    match follow_queue_link(self.blob_table, inode) {
+                        Err(err) => {
+                            self.err = Some(err);
+                            self.next = None;
+                        }
+                        Ok(e) => {
+                            self.next = (self.next_fn)(e);
+                        }
+                    };
+                };
+                Some(Ok(inode))
+            }
+        }
     }
 }
 
@@ -1209,6 +1341,24 @@ fn get_read_op(
     }
 }
 
+#[allow(dead_code)]
+fn disk_usage_op(
+    blob_lru_queue_table: &impl redb::ReadableTable<u16, Holder<'static, QueueTableEntry>>,
+) -> Result<(u64, u64), StorageError> {
+    let mut total: u64 = 0;
+    let mut evictable: u64 = 0;
+    for e in blob_lru_queue_table.iter()? {
+        let (k, v) = e?;
+        let disk_usage = v.value().parse()?.disk_usage;
+        total += disk_usage;
+        if k.value() == LruQueueId::WorkingArea as u16 {
+            evictable += disk_usage;
+        }
+    }
+
+    Ok((total, evictable))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1223,7 +1373,6 @@ mod tests {
     use std::io::SeekFrom;
     use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
-    use tokio::fs;
     use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
     fn test_peer() -> Peer {
@@ -1381,25 +1530,6 @@ mod tests {
             while let Some(id) = current {
                 content.push(id);
                 current = follow_queue_link(&blob_table, id)?.next;
-            }
-
-            Ok(content)
-        }
-
-        fn list_queue_content_backward(&self, queue_id: LruQueueId) -> anyhow::Result<Vec<Inode>> {
-            let mut content = vec![];
-            let txn = self.begin_read()?;
-            let blob_lru_queue_table = txn.blob_lru_queue_table()?;
-            let blob_table = txn.blob_table()?;
-            let queue = blob_lru_queue_table
-                .get(queue_id as u16)?
-                .unwrap()
-                .value()
-                .parse()?;
-            let mut current = queue.tail;
-            while let Some(id) = current {
-                content.push(id);
-                current = follow_queue_link(&blob_table, id)?.prev;
             }
 
             Ok(content)
@@ -2192,96 +2322,123 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_to_working_area_on_blob_creation() -> anyhow::Result<()> {
+    async fn create_adds_to_queue() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
+        let txn = fixture.begin_write()?;
+        let marks = txn.read_marks()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut tree = txn.write_tree()?;
 
-        let one = fixture.add_file("one", 100)?;
-        acache.open_file(one)?;
+        assert!(blobs.head(LruQueueId::WorkingArea).next().is_none());
+        assert!(blobs.tail(LruQueueId::WorkingArea).next().is_none());
+
+        let one = blobs
+            .create(
+                &mut tree,
+                &marks,
+                Path::parse("one")?,
+                &hash::digest("one"),
+                3,
+            )?
+            .inode;
+
         assert_eq!(
-            (vec![one], vec![one]),
-            (
-                fixture.list_queue_content(LruQueueId::WorkingArea)?,
-                fixture.list_queue_content_backward(LruQueueId::WorkingArea)?
-            )
+            vec![one],
+            blobs
+                .head(LruQueueId::WorkingArea)
+                .collect::<Result<Vec<_>, StorageError>>()?
+        );
+        assert_eq!(
+            vec![one],
+            blobs
+                .tail(LruQueueId::WorkingArea)
+                .collect::<Result<Vec<_>, StorageError>>()?
         );
 
-        let two = fixture.add_file("two", 100)?;
-        acache.open_file(two)?;
+        let two = blobs
+            .create(
+                &mut tree,
+                &marks,
+                Path::parse("two")?,
+                &hash::digest("two"),
+                3,
+            )?
+            .inode;
+
         assert_eq!(
-            (vec![two, one], vec![one, two]),
-            (
-                fixture.list_queue_content(LruQueueId::WorkingArea)?,
-                fixture.list_queue_content_backward(LruQueueId::WorkingArea)?
-            )
+            vec![two, one],
+            blobs
+                .head(LruQueueId::WorkingArea)
+                .collect::<Result<Vec<_>, StorageError>>()?
         );
-
-        let three = fixture.add_file("three", 100)?;
-        acache.open_file(three)?;
-
         assert_eq!(
-            (vec![three, two, one], vec![one, two, three]),
-            (
-                fixture.list_queue_content(LruQueueId::WorkingArea)?,
-                fixture.list_queue_content_backward(LruQueueId::WorkingArea)?
-            )
+            vec![one, two],
+            blobs
+                .tail(LruQueueId::WorkingArea)
+                .collect::<Result<Vec<_>, StorageError>>()?
         );
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn remove_from_queue_on_blob_deletion() -> anyhow::Result<()> {
+    async fn delete_removes_from_queue() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
+        let txn = fixture.begin_write()?;
+        let marks = txn.read_marks()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut tree = txn.write_tree()?;
 
-        let one = fixture.add_file("one", 100)?;
-        acache.open_file(one)?;
-        let two = fixture.add_file("two", 100)?;
-        acache.open_file(two)?;
-        let three = fixture.add_file("three", 100)?;
-        acache.open_file(three)?;
-        let four = fixture.add_file("four", 100)?;
-        acache.open_file(four)?;
+        let one = blobs
+            .create(
+                &mut tree,
+                &marks,
+                Path::parse("one")?,
+                &hash::digest("one"),
+                3,
+            )?
+            .inode;
 
-        // Delete the file to delete the blob.
-        fixture.remove_file(&Path::parse("two")?)?;
+        let two = blobs
+            .create(
+                &mut tree,
+                &marks,
+                Path::parse("two")?,
+                &hash::digest("two"),
+                3,
+            )?
+            .inode;
+        let three = blobs
+            .create(
+                &mut tree,
+                &marks,
+                Path::parse("three")?,
+                &hash::digest("three"),
+                3,
+            )?
+            .inode;
 
         assert_eq!(
-            (vec![four, three, one], vec![one, three, four]),
-            (
-                fixture.list_queue_content(LruQueueId::WorkingArea)?,
-                fixture.list_queue_content_backward(LruQueueId::WorkingArea)?
-            )
+            vec![three, two, one],
+            blobs
+                .head(LruQueueId::WorkingArea)
+                .collect::<Result<Vec<_>, StorageError>>()?
         );
 
-        fixture.remove_file(&Path::parse("one")?)?;
+        blobs.delete(&mut tree, two)?;
 
         assert_eq!(
-            (vec![four, three], vec![three, four]),
-            (
-                fixture.list_queue_content(LruQueueId::WorkingArea)?,
-                fixture.list_queue_content_backward(LruQueueId::WorkingArea)?
-            )
+            vec![three, one],
+            blobs
+                .head(LruQueueId::WorkingArea)
+                .collect::<Result<Vec<_>, StorageError>>()?
         );
 
-        fixture.remove_file(&Path::parse("four")?)?;
-        assert_eq!(
-            (vec![three], vec![three]),
-            (
-                fixture.list_queue_content(LruQueueId::WorkingArea)?,
-                fixture.list_queue_content_backward(LruQueueId::WorkingArea)?
-            )
-        );
+        blobs.delete(&mut tree, one)?;
+        blobs.delete(&mut tree, three)?;
 
-        fixture.remove_file(&Path::parse("three")?)?;
-        assert_eq!(
-            (vec![], vec![]),
-            (
-                fixture.list_queue_content(LruQueueId::WorkingArea)?,
-                fixture.list_queue_content_backward(LruQueueId::WorkingArea)?
-            )
-        );
+        assert!(blobs.head(LruQueueId::WorkingArea).next().is_none());
+        assert!(blobs.tail(LruQueueId::WorkingArea).next().is_none());
 
         Ok(())
     }
@@ -2289,62 +2446,71 @@ mod tests {
     #[tokio::test]
     async fn mark_accessed() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
+        let txn = fixture.begin_write()?;
+        let marks = txn.read_marks()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut tree = txn.write_tree()?;
 
-        let one = fixture.add_file("one", 100)?;
-        acache.open_file(one)?;
-        let two = fixture.add_file("two", 100)?;
-        acache.open_file(two)?;
-        let three = fixture.add_file("three", 100)?;
-        acache.open_file(three)?;
-        let four = fixture.add_file("four", 100)?;
-        acache.open_file(four)?;
+        let one = blobs
+            .create(
+                &mut tree,
+                &marks,
+                Path::parse("one")?,
+                &hash::digest("one"),
+                3,
+            )?
+            .inode;
 
-        // four is now at the head, being the most recent. Let's move
-        // two there, then one..
-        let txn = fixture.db.begin_write()?;
-        {
-            let mut blobs = txn.write_blobs()?;
-            let tree = txn.read_tree()?;
-            blobs.mark_accessed(&tree, two)?;
-        }
-        txn.commit()?;
+        let two = blobs
+            .create(
+                &mut tree,
+                &marks,
+                Path::parse("two")?,
+                &hash::digest("two"),
+                3,
+            )?
+            .inode;
+        let three = blobs
+            .create(
+                &mut tree,
+                &marks,
+                Path::parse("three")?,
+                &hash::digest("three"),
+                3,
+            )?
+            .inode;
+
         assert_eq!(
-            (vec![two, four, three, one], vec![one, three, four, two]),
-            (
-                fixture.list_queue_content(LruQueueId::WorkingArea)?,
-                fixture.list_queue_content_backward(LruQueueId::WorkingArea)?
-            )
+            vec![three, two, one],
+            blobs
+                .head(LruQueueId::WorkingArea)
+                .collect::<Result<Vec<_>, StorageError>>()?
         );
 
-        let txn = fixture.db.begin_write()?;
-        {
-            let mut blobs = txn.write_blobs()?;
-            let tree = txn.read_tree()?;
-            blobs.mark_accessed(&tree, one)?;
-        }
-        txn.commit()?;
+        blobs.mark_accessed(&tree, two)?;
+
         assert_eq!(
-            (vec![one, two, four, three], vec![three, four, two, one]),
-            (
-                fixture.list_queue_content(LruQueueId::WorkingArea)?,
-                fixture.list_queue_content_backward(LruQueueId::WorkingArea)?
-            )
+            vec![two, three, one],
+            blobs
+                .head(LruQueueId::WorkingArea)
+                .collect::<Result<Vec<_>, StorageError>>()?
         );
 
-        let txn = fixture.db.begin_write()?;
-        {
-            let mut blobs = txn.write_blobs()?;
-            let tree = txn.read_tree()?;
-            blobs.mark_accessed(&tree, one)?;
-        }
-        txn.commit()?;
+        blobs.mark_accessed(&tree, one)?;
+
         assert_eq!(
-            (vec![one, two, four, three], vec![three, four, two, one]),
-            (
-                fixture.list_queue_content(LruQueueId::WorkingArea)?,
-                fixture.list_queue_content_backward(LruQueueId::WorkingArea)?
-            )
+            vec![one, two, three],
+            blobs
+                .head(LruQueueId::WorkingArea)
+                .collect::<Result<Vec<_>, StorageError>>()?
+        );
+
+        // make sure the list is correct both ways
+        assert_eq!(
+            vec![three, two, one],
+            blobs
+                .tail(LruQueueId::WorkingArea)
+                .collect::<Result<Vec<_>, StorageError>>()?
         );
 
         Ok(())
@@ -2353,29 +2519,61 @@ mod tests {
     #[tokio::test]
     async fn disk_usage_tracking() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
+        let protected1 = Path::parse("protected/1")?;
+        let protected2 = Path::parse("protected/2")?;
+        let evictable1 = Path::parse("evictable/1")?;
+        let evictable2 = Path::parse("evictable/2")?;
 
-        // Create a blob and verify initial disk usage is 0
-        let inode = fixture.add_file("test.txt", 1000)?;
-        acache.open_file(inode)?;
+        let txn = fixture.begin_write()?;
+        {
+            let mut tree = txn.write_tree()?;
+            let mut blobs = txn.write_blobs()?;
+            let mut marks = txn.write_marks()?;
+            let mut dirty = txn.write_dirty()?;
+            marks.set(&mut tree, &mut dirty, Path::parse("protected")?, Mark::Keep)?;
+            assert_eq!((0, 0), blobs.disk_usage()?);
 
-        let blob_entry = fixture.get_blob_entry(inode)?;
-        // 512 bytes for an empty file, to account for inode usage.
-        assert_eq!(INODE_DISK_USAGE, blob_entry.disk_usage);
+            for path in [&protected1, &protected2, &evictable1, &evictable2] {
+                blobs.create(
+                    &mut tree,
+                    &marks,
+                    path,
+                    &test_hash(),
+                    1024 * 1024, // 1M
+                )?;
+            }
+            assert_eq!(
+                (4 * INODE_DISK_USAGE, 2 * INODE_DISK_USAGE),
+                blobs.disk_usage()?
+            );
+        }
+        txn.commit()?;
 
-        // Write some data to the blob
-        let mut blob = acache.open_file(inode)?;
-        blob.write(b"test data").await?;
+        let mut blob = Blob::open(&fixture.db, protected1)?;
+        blob.write_all(&vec![1u8; 4096]).await?;
         blob.update_db().await?;
 
-        // disk usage is now 1 block
-        let blksize = fs::metadata(fixture.blob_path(inode)).await?.blksize();
-        let blob_entry = fixture.get_blob_entry(inode)?;
-        assert_eq!(blob_entry.disk_usage, blksize + INODE_DISK_USAGE);
+        let mut blob = Blob::open(&fixture.db, protected2)?;
+        blob.write_all(&vec![1u8; 2 * 4096]).await?;
+        blob.update_db().await?;
+
+        let mut blob = Blob::open(&fixture.db, evictable1)?;
+        blob.write_all(&vec![1u8; 3 * 4096]).await?;
+        blob.update_db().await?;
+
+        let mut blob = Blob::open(&fixture.db, evictable2)?;
+        blob.write_all(&vec![1u8; 4 * 4096]).await?;
+        blob.update_db().await?;
+
+        let txn = fixture.begin_read()?;
+        let blobs = txn.read_blobs()?;
 
         assert_eq!(
-            blob_entry.disk_usage,
-            fixture.queue_disk_usage(LruQueueId::WorkingArea)?
+            (
+                INODE_DISK_USAGE * 4 + 10 * 4096,
+                INODE_DISK_USAGE * 2 + 7 * 4096
+            ),
+            blobs.disk_usage()?
         );
 
         Ok(())
@@ -2384,71 +2582,33 @@ mod tests {
     #[tokio::test]
     async fn disk_usage_updates_on_blob_deletion() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
+        let path = Path::parse("foobar")?;
 
-        // Create a blob and write some data
-        let inode = fixture.add_file("test.txt", 1000)?;
-        acache.open_file(inode)?;
+        let txn = fixture.begin_write()?;
+        {
+            let mut tree = txn.write_tree()?;
+            let mut blobs = txn.write_blobs()?;
+            let marks = txn.read_marks()?;
+            blobs.create(&mut tree, &marks, &path, &test_hash(), 1024 * 1024)?;
+        }
+        txn.commit()?;
 
-        let mut blob = acache.open_file(inode)?;
-        blob.write(b"test data").await?;
+        let mut blob = Blob::open(&fixture.db, &path)?;
+        blob.write_all(&vec![1u8; 4096]).await?;
         blob.update_db().await?;
 
-        // Get initial disk usage
-        let blob_entry = fixture.get_blob_entry(inode)?;
-        assert!(blob_entry.disk_usage > 0);
+        let txn = fixture.begin_write()?;
+        {
+            let mut tree = txn.write_tree()?;
+            let mut blobs = txn.write_blobs()?;
 
-        let initial_disk_usage = fixture.queue_disk_usage(LruQueueId::WorkingArea)?;
-        assert_eq!(initial_disk_usage, blob_entry.disk_usage);
+            assert!(blobs.disk_usage()?.0 > 0);
 
-        // Delete the blob
-        fixture.remove_file(&Path::parse("test.txt")?)?;
+            blobs.delete(&mut tree, &path)?;
 
-        // Verify blob entry is gone
-        assert!(!fixture.blob_entry_exists(inode)?);
-
-        assert_eq!(0, fixture.queue_disk_usage(LruQueueId::WorkingArea)?);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn disk_usage_tracking_multiple_blobs() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let acache = &fixture.acache;
-
-        // Create multiple blobs and write data
-        let inode1 = fixture.add_file("test1.txt", 1000)?;
-        let inode2 = fixture.add_file("test2.txt", 2000)?;
-
-        acache.open_file(inode1)?;
-        acache.open_file(inode2)?;
-
-        let blksize = fs::metadata(fixture.blob_path(inode1)).await?.blksize();
-
-        // Write data to first blob
-        let mut blob1 = acache.open_file(inode1)?;
-        blob1.write(b"data for blob 1").await?;
-        blob1.update_db().await?;
-
-        // Write data to second blob
-        let mut blob2 = acache.open_file(inode2)?;
-        blob2.write(b"data for blob 2 which is longer").await?;
-        blob2.update_db().await?;
-
-        // Get individual disk usages
-        let blob_entry1 = fixture.get_blob_entry(inode1)?;
-        let blob_entry2 = fixture.get_blob_entry(inode2)?;
-
-        // Check queue total disk usage
-        assert_eq!(
-            2 * blksize + 2 * INODE_DISK_USAGE,
-            fixture.queue_disk_usage(LruQueueId::WorkingArea)?
-        );
-        assert_eq!(
-            2 * blksize + 2 * INODE_DISK_USAGE,
-            blob_entry1.disk_usage + blob_entry2.disk_usage
-        );
+            assert_eq!(0, blobs.disk_usage()?.0);
+        }
+        txn.commit()?;
 
         Ok(())
     }
