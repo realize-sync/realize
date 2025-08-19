@@ -228,7 +228,6 @@ impl ArenaDatabase {
             txn.open_table(NOTIFICATION_TABLE)?;
             txn.open_table(CURRENT_INODE_RANGE_TABLE)?;
             txn.open_table(BLOB_TABLE)?;
-
             txn.open_table(BLOB_LRU_QUEUE_TABLE)?;
             txn.open_table(MARK_TABLE)?;
             txn.open_table(DIRTY_TABLE)?;
@@ -515,20 +514,6 @@ impl<'db> ArenaReadTransaction<'db> {
     }
 
     #[allow(dead_code)]
-    pub fn blob_lru_queue_table(
-        &self,
-    ) -> Result<ReadOnlyTable<u16, Holder<'static, QueueTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(BLOB_LRU_QUEUE_TABLE)?)
-    }
-
-    #[allow(dead_code)]
-    pub fn blob_table(
-        &self,
-    ) -> Result<ReadOnlyTable<Inode, Holder<'static, BlobTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(BLOB_TABLE)?)
-    }
-
-    #[allow(dead_code)]
     #[track_caller]
     pub(crate) fn read_tree(&self) -> Result<impl TreeReadOperations, StorageError> {
         Ok(ReadableOpenTree::new(
@@ -698,8 +683,13 @@ mod tests {
         txn.cache_table()?;
         txn.peer_table()?;
         txn.notification_table()?;
-        txn.blob_table()?;
-        txn.blob_lru_queue_table()?;
+
+        txn.read_tree()?;
+        txn.read_blobs()?;
+        txn.read_marks()?;
+        txn.read_dirty()?;
+        txn.read_history()?;
+        txn.read_index()?;
 
         Ok(())
     }

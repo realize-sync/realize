@@ -1417,28 +1417,9 @@ mod tests {
         }
 
         fn get_blob_entry(&self, inode: Inode) -> anyhow::Result<BlobTableEntry> {
-            let txn = self.begin_read()?;
-            let blob_table = txn.blob_table()?;
-            Ok(get_blob_entry(&blob_table, inode)?.ok_or(StorageError::NotFound)?)
-        }
-
-        fn list_queue_content(&self, queue_id: LruQueueId) -> anyhow::Result<Vec<Inode>> {
-            let mut content = vec![];
-            let txn = self.begin_read()?;
-            let blob_lru_queue_table = txn.blob_lru_queue_table()?;
-            let blob_table = txn.blob_table()?;
-            let queue = blob_lru_queue_table
-                .get(queue_id as u16)?
-                .unwrap()
-                .value()
-                .parse()?;
-            let mut current = queue.head;
-            while let Some(id) = current {
-                content.push(id);
-                current = follow_queue_link(&blob_table, id)?.next;
-            }
-
-            Ok(content)
+            let txn = self.begin_write()?;
+            let blobs = txn.write_blobs()?;
+            Ok(get_blob_entry(&blobs.blob_table, inode)?.ok_or(StorageError::NotFound)?)
         }
 
         fn create_blob_with_partial_data<'b, L: Into<TreeLoc<'b>>>(
@@ -1867,14 +1848,13 @@ mod tests {
         txn.commit()?;
 
         assert_eq!("Baa, baa, black sheep", std::fs::read_to_string(&dest)?);
-        assert!(fixture.blob_info(inode)?.is_none());
+
+        let txn = fixture.begin_read()?;
+        let blobs = txn.read_blobs()?;
+        assert!(blobs.get_with_inode(inode)?.is_none());
 
         // The LRU queue must have been updated properly.
-        assert!(
-            fixture
-                .list_queue_content(LruQueueId::WorkingArea)?
-                .is_empty()
-        );
+        assert!(blobs.head(LruQueueId::WorkingArea).next().is_none());
 
         Ok(())
     }
