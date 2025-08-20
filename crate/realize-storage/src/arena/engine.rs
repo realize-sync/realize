@@ -1,11 +1,12 @@
 use super::arena_cache::ArenaCache;
-use super::blob::BlobExt;
+use super::blob::BlobReadOperations;
 use super::db::{ArenaDatabase, ArenaReadTransaction};
 use super::dirty::DirtyReadOperations;
 use super::index::IndexReadOperations;
 use super::mark::MarkExt;
 use super::tree::{TreeExt, TreeLoc};
 use super::types::LocalAvailability;
+use crate::arena::tree::TreeReadOperations;
 use crate::types::JobId;
 use crate::{Inode, Mark, StorageError};
 use realize_types::{Arena, Hash, Path, UnixTime};
@@ -51,6 +52,12 @@ pub(crate) enum StorageJob {
     /// Realize the given file with `counter`, moving `Hash` from
     /// cache to the index, currently containing nothing or `Hash`.
     Realize(Inode, Hash, Option<Hash>),
+
+    /// Move the blob to the protected queue.
+    ProtectBlob(Inode),
+
+    /// Move the blob to the unprotected queue.
+    UnprotectBlob(Inode),
 }
 
 impl StorageJob {
@@ -268,6 +275,7 @@ impl Engine {
         self: &Arc<Engine>,
         tx: mpsc::Sender<(JobId, StorageJob)>,
     ) -> anyhow::Result<()> {
+        let mut watch = self.db.dirty().subscribe();
         let mut start_counter = 1;
         let mut retry_lower_bound = None;
         let mut retry_jobs_missing_peers = self.retry_jobs_missing_peers.subscribe();
@@ -280,6 +288,7 @@ impl Engine {
                 let arena = self.arena;
                 move || {
                     let (job, last_counter) = this.next_job(start_counter)?;
+                    log::debug!("next_job: {job:?}, {last_counter:?}");
                     if let Some(last_counter) = last_counter
                         && last_counter > start_counter
                     {
@@ -309,7 +318,6 @@ impl Engine {
                 // Wait for more dirty paths, then continue.
                 // Now is also a good time to retry failed jobs whose backoff period has passed.
                 log::debug!("[{arena}] waiting...");
-                let mut watch = self.db.dirty().subscribe();
                 let mut jobs_to_retry = vec![];
                 tokio::select!(
                     _ = tx.closed() => {
@@ -359,20 +367,19 @@ impl Engine {
     ) -> Result<(Option<(JobId, StorageJob)>, Option<u64>), StorageError> {
         let txn = self.db.begin_read()?;
         let dirty = txn.read_dirty()?;
-
-        while let Some((path, counter)) = dirty.next_dirty(start_counter)? {
-            if let Some(job) = self.build_job(&txn, path, counter)? {
-                return Ok((Some(job), Some(counter)));
+        let mut seen = None;
+        while let Some((inode, counter)) = dirty.next_dirty(start_counter)? {
+            if let Some(job) = self.build_job(&txn, &txn.read_tree()?, inode)? {
+                return Ok((Some((JobId(counter), job)), Some(counter)));
             }
+            seen = Some(counter);
             start_counter = counter + 1;
         }
 
-        // Get the last counter for cleanup purposes
-        let last_counter = dirty.get_last_counter(start_counter)?;
-        Ok((None, last_counter))
+        Ok((None, seen))
     }
 
-    /// Lookup the path of given a counter and build a job, if possible.
+    /// Lookup the path given a counter and build a job, if possible.
     async fn build_job_with_counter(
         self: &Arc<Self>,
         counter: u64,
@@ -382,7 +389,16 @@ impl Engine {
             let txn = this.db.begin_read()?;
             let dirty = txn.read_dirty()?;
             if let Some(inode) = dirty.get_inode_for_counter(counter)? {
-                return this.build_job(&txn, inode, counter);
+                match this.build_job(&txn, &txn.read_tree()?, inode) {
+                    Ok(None) => return Ok(None),
+                    Ok(Some(job)) => {
+                        return Ok(Some((JobId(counter), job)));
+                    }
+                    Err(err) => {
+                        log::warn!("build job failed for {counter}:{inode}: {err:?}");
+                        return Ok(None);
+                    }
+                }
             }
             return Ok::<_, StorageError>(None);
         })
@@ -402,7 +418,9 @@ impl Engine {
             let dirty = txn.read_dirty()?;
             if let Some(inode) = tree.resolve(loc)? {
                 if let Some(counter) = dirty.get_counter(inode)? {
-                    return this.build_job(&txn, inode, counter);
+                    return Ok(this
+                        .build_job(&txn, &tree, inode)?
+                        .map(|job| (JobId(counter), job)));
                 }
             }
             return Ok::<_, StorageError>(None);
@@ -414,81 +432,96 @@ impl Engine {
     fn build_job(
         &self,
         txn: &ArenaReadTransaction,
+        tree: &impl TreeReadOperations,
         inode: Inode,
-        counter: u64,
-    ) -> Result<Option<(JobId, StorageJob)>, StorageError> {
-        let tree = txn.read_tree()?;
-        let marks = txn.read_marks()?;
+    ) -> Result<Option<StorageJob>, StorageError> {
         let index = txn.read_index()?;
-        match marks.get(&tree, inode) {
-            Err(_) => {
-                return Ok(None);
-            }
-            Ok(Mark::Watch) => {
-                if let (Ok(cached), Ok(Some(indexed))) = (
-                    self.cache.get_file_entry_for_loc(txn, &tree, inode),
-                    index.get_at_inode(inode),
-                ) && cached.hash == indexed.hash
-                {
-                    return Ok(Some((
-                        JobId(counter),
-                        StorageJob::Unrealize(inode, cached.hash),
-                    )));
-                }
-            }
-            Ok(Mark::Keep) => {
-                if let Ok(cached) = self.cache.get_file_entry_for_loc(txn, &tree, inode) {
-                    if let Ok(Some(indexed)) = index.get_at_inode(inode)
-                        && cached.hash == indexed.hash
-                    {
-                        return Ok(Some((
-                            JobId(counter),
-                            StorageJob::Unrealize(inode, cached.hash),
-                        )));
-                    }
+        let blobs = txn.read_blobs()?;
 
-                    let blobs = txn.read_blobs()?;
-                    if blobs.local_availability(&tree, inode)? != LocalAvailability::Verified {
-                        if let Ok(path) = tree.backtrack(inode) {
-                            return Ok(Some((
-                                JobId(counter),
-                                StorageJob::External(Job::Download(path, cached.hash)),
-                            )));
-                        }
-                    }
+        let mut want_protect_blob = false;
+        let mut want_unprotect_blob = false;
+        let mut want_download = false;
+        let mut want_realize = false;
+        let mut want_unrealize = false;
+        match txn.read_marks()?.get(tree, inode)? {
+            Mark::Watch => {
+                want_unprotect_blob = true;
+                want_unrealize = true;
+            }
+            Mark::Keep => {
+                want_protect_blob = true;
+                want_download = true;
+                want_unrealize = true;
+            }
+            Mark::Own => {
+                want_protect_blob = true;
+                want_download = true;
+                want_realize = true;
+            }
+        };
+
+        let mut should_protect_blob = false;
+        let mut should_unprotect_blob = false;
+        let mut should_download = None;
+        let mut should_realize = None;
+        let mut should_unrealize = None;
+
+        if let Some(cached) = self.cache.get_file_entry_for_loc(txn, tree, inode)? {
+            if want_unrealize {
+                if let Some(indexed) = index.get_at_inode(inode)?
+                    && indexed.is_outdated_by(&cached.hash)
+                {
+                    should_unrealize = Some(indexed.hash);
                 }
             }
-            Ok(Mark::Own) => {
-                if let Ok(cached) = self.cache.get_file_entry_for_loc(txn, &tree, inode) {
-                    // File is missing from the index or version in
-                    // cache should overwrite the version in the
-                    // inedx.
-                    let indexed = index.get_at_inode(inode)?;
-                    let should_move = match &indexed {
-                        None => true,
-                        Some(indexed) => {
-                            indexed.hash != cached.hash && indexed.is_outdated_by(&cached.hash)
+
+            match blobs.get_with_inode(inode)? {
+                None => {
+                    if want_download {
+                        should_download = Some(cached.hash);
+                    }
+                }
+                Some(blob) => {
+                    if blob.protected {
+                        should_unprotect_blob = want_unprotect_blob;
+                    } else {
+                        should_protect_blob = want_protect_blob;
+                    }
+                    if blob.local_availability() != LocalAvailability::Verified {
+                        if want_download {
+                            should_download = Some(cached.hash);
                         }
-                    };
-                    if should_move {
-                        let blobs = txn.read_blobs()?;
-                        if blobs.local_availability(&tree, inode)? == LocalAvailability::Verified {
-                            return Ok(Some((
-                                JobId(counter),
-                                StorageJob::Realize(inode, cached.hash, indexed.map(|i| i.hash)),
-                            )));
-                        } else {
-                            if let Ok(path) = tree.backtrack(inode) {
-                                return Ok(Some((
-                                    JobId(counter),
-                                    StorageJob::External(Job::Download(path, cached.hash)),
-                                )));
+                    } else if want_realize {
+                        match index.get_at_inode(inode)? {
+                            None => should_realize = Some((cached.hash, None)),
+                            Some(indexed) => {
+                                if indexed.is_outdated_by(&cached.hash) {
+                                    should_realize = Some((cached.hash, Some(indexed.hash)));
+                                }
                             }
                         }
                     }
                 }
             }
-        };
+        }
+
+        if should_protect_blob {
+            return Ok(Some(StorageJob::ProtectBlob(inode)));
+        }
+        if should_unprotect_blob {
+            return Ok(Some(StorageJob::UnprotectBlob(inode)));
+        }
+        if let Some(hash) = should_download {
+            if let Some(path) = tree.backtrack(inode)? {
+                return Ok(Some(StorageJob::External(Job::Download(path, hash))));
+            }
+        }
+        if let Some((hash, index_hash)) = should_realize {
+            return Ok(Some(StorageJob::Realize(inode, hash, index_hash)));
+        }
+        if let Some(hash) = should_unrealize {
+            return Ok(Some(StorageJob::Unrealize(inode, hash)));
+        }
 
         Ok(None)
     }
@@ -575,6 +608,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Blob;
     use crate::GlobalDatabase;
     use crate::InodeAllocator;
     use crate::Notification;
@@ -641,6 +675,10 @@ mod tests {
             })
         }
 
+        fn last_counter(&self) -> anyhow::Result<u64> {
+            Ok(self.db.begin_read()?.read_dirty()?.last_counter()?)
+        }
+
         /// Add a file to the cache for testing
         fn add_file_to_cache<T>(&self, path: T) -> anyhow::Result<()>
         where
@@ -679,12 +717,7 @@ mod tests {
 
         // A new version comes in that replaces the version in the
         // cache/index.
-        fn replace_in_cache_and_index<T>(
-            &self,
-            path: T,
-            hash: Hash,
-            old_hash: Hash,
-        ) -> anyhow::Result<()>
+        fn replace<T>(&self, path: T, hash: Hash, old_hash: Hash) -> anyhow::Result<()>
         where
             T: AsRef<Path>,
         {
@@ -949,7 +982,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_then_realize_file_to_own_not_in_index() -> anyhow::Result<()> {
+    async fn download_then_realize() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
         let foobar = Path::parse("foo/bar")?;
 
@@ -974,6 +1007,103 @@ mod tests {
         let (new_job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
         assert!(new_job_id > job_id);
         assert_eq!(StorageJob::Realize(inode, test_hash(), None), job);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn protect_then_download_then_realize() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let foobar = Path::parse("foo/bar")?;
+
+        fixture.add_file_to_cache(&foobar)?;
+        let inode = fixture.acache.expect(&foobar)?;
+        {
+            let mut blob = fixture.acache.open_file(inode)?;
+            blob.write_all(b"te").await?;
+        }
+        // blob is partially available, but unprotected, going from
+        // Mark::Watch to Mark::Keep triggers the need to:
+        //
+        // 1. set it protected
+        // 2. download the rest and verify it
+        // 3. realize it
+        //
+        // This test makes sure that the chain of events is correct.
+
+        mark::set(&fixture.db, &foobar, Mark::Own)?;
+
+        let mut job_stream = fixture.engine.job_stream();
+        let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
+        assert_eq!(StorageJob::ProtectBlob(inode), job,);
+        let txn = fixture.db.begin_write()?;
+        {
+            let tree = txn.read_tree()?;
+            let mut dirty = txn.write_dirty()?;
+            txn.write_blobs()?
+                .set_protected(&tree, &mut dirty, inode, true)?;
+        }
+        txn.commit()?;
+        fixture.engine.job_finished(job_id, Ok(JobStatus::Done))?;
+
+        let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
+        assert_eq!(
+            StorageJob::External(Job::Download(foobar, test_hash())),
+            job,
+        );
+        {
+            let mut blob = Blob::open(&fixture.db, inode)?;
+            blob.write_all(b"test").await?;
+            blob.mark_verified().await?;
+        }
+        fixture.engine.job_finished(job_id, Ok(JobStatus::Done))?;
+
+        let (new_job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
+        assert!(new_job_id > job_id);
+        assert_eq!(StorageJob::Realize(inode, test_hash(), None), job);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unprotect_then_unrealize() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let foobar = Path::parse("foo/bar")?;
+
+        mark::set(&fixture.db, &foobar, Mark::Keep)?;
+        fixture.add_file_to_index_with_version(&foobar, test_hash())?;
+        fixture.add_file_to_cache_with_version(&foobar, test_hash())?;
+        let inode = fixture.acache.expect(&foobar)?;
+        {
+            let mut blob = fixture.acache.open_file(inode)?;
+            blob.write_all(b"te").await?;
+        }
+
+        // File is in the index and cache and has been partially
+        // downloaded. Going from Mark::Keep to Mark::Watch triggers
+        // the following sequence:
+        //
+        // 1. unprotect the blob
+        // 2. unrealize
+        mark::set(&fixture.db, &foobar, Mark::Watch)?;
+
+        let mut job_stream = fixture.engine.job_stream();
+
+        let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
+        assert_eq!(StorageJob::UnprotectBlob(inode), job);
+        let txn = fixture.db.begin_write()?;
+        {
+            let tree = txn.read_tree()?;
+            let mut dirty = txn.write_dirty()?;
+            txn.write_blobs()?
+                .set_protected(&tree, &mut dirty, inode, false)?;
+        }
+        txn.commit()?;
+        fixture.engine.job_finished(job_id, Ok(JobStatus::Done))?;
+
+        let (new_job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
+        assert!(new_job_id > job_id);
+        assert_eq!(StorageJob::Unrealize(inode, test_hash()), job);
 
         Ok(())
     }
@@ -1008,6 +1138,7 @@ mod tests {
 
         mark::set_arena_mark(&fixture.db, Mark::Own)?;
         fixture.add_file_to_cache_with_version(&foobar, Hash([1; 32]))?;
+        let counter = fixture.last_counter()?;
         fixture.add_file_to_index_with_version(&foobar, Hash([1; 32]))?;
 
         // Add something else for the stream to return, or it'll just
@@ -1017,8 +1148,8 @@ mod tests {
         let mut job_stream = fixture.engine.job_stream();
 
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
-        // 1 has been skipped, since the file is in the index
-        assert_eq!(JobId(3), job.0);
+        // adding the file to the index is what triggered the job
+        assert_eq!(JobId(counter + 1), job.0);
 
         Ok(())
     }
@@ -1031,6 +1162,8 @@ mod tests {
 
         mark::set_arena_mark(&fixture.db, Mark::Own)?;
         fixture.add_file_to_cache_with_version(&foobar, Hash([1; 32]))?;
+
+        let counter = fixture.last_counter()?;
         fixture.add_file_to_index_with_version(&foobar, Hash([2; 32]))?;
 
         // Add something else for the stream to return, or it'll just
@@ -1040,8 +1173,8 @@ mod tests {
         let mut job_stream = fixture.engine.job_stream();
 
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
-        // 1 has been skipped, since the file is in the index
-        assert_eq!(JobId(3), job.0);
+        // adding to index is what triggered the job
+        assert_eq!(JobId(counter + 1), job.0);
 
         Ok(())
     }
@@ -1056,7 +1189,7 @@ mod tests {
         // Cache and index have the same version
         fixture.add_file_to_cache_with_version(&foobar, Hash([1; 32]))?;
         fixture.add_file_to_index_with_version(&foobar, Hash([1; 32]))?;
-        fixture.replace_in_cache_and_index(&foobar, Hash([2; 32]), Hash([1; 32]))?;
+        fixture.replace(&foobar, Hash([2; 32]), Hash([1; 32]))?;
         let inode = fixture.acache.expect(&foobar)?;
         {
             let mut blob = fixture.acache.open_file(inode)?;

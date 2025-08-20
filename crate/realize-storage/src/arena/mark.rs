@@ -276,7 +276,7 @@ mod tests {
     ) -> Result<HashSet<Path>, StorageError> {
         Ok(dirty_inodes(dirty)?
             .into_iter()
-            .filter_map(|i| tree.backtrack(i).ok())
+            .filter_map(|i| tree.backtrack(i).ok().flatten())
             .collect())
     }
 

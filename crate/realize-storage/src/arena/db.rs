@@ -231,11 +231,11 @@ impl ArenaDatabase {
             txn.open_table(BLOB_LRU_QUEUE_TABLE)?;
             txn.open_table(MARK_TABLE)?;
             txn.open_table(DIRTY_TABLE)?;
-            txn.open_table(DIRTY_LOG_TABLE)?;
-            let dirty_counter_table = txn.open_table(DIRTY_COUNTER_TABLE)?;
+            let dirty_log_table = txn.open_table(DIRTY_LOG_TABLE)?;
+            txn.open_table(DIRTY_COUNTER_TABLE)?;
             txn.open_table(FAILED_JOB_TABLE)?;
 
-            dirty = Dirty::new(&dirty_counter_table)?;
+            dirty = Dirty::new(&dirty_log_table)?;
             history = History::new(arena, &history_table)?;
         }
         txn.commit()?;

@@ -14,9 +14,9 @@ pub(crate) struct Dirty {
 }
 
 impl Dirty {
-    pub(crate) fn new(counter_table: &impl ReadableTable<(), u64>) -> Result<Self, StorageError> {
-        let counter = last_counter(counter_table)?;
-        let (watch_tx, watch_rx) = watch::channel(counter);
+    pub(crate) fn new(log_table: &impl ReadableTable<u64, Inode>) -> Result<Self, StorageError> {
+        let last_counter = last_counter(log_table)?;
+        let (watch_tx, watch_rx) = watch::channel(last_counter);
 
         Ok(Self {
             watch_tx,
@@ -85,7 +85,8 @@ impl<'a> WritableOpenDirty<'a> {
 
 pub(crate) trait DirtyReadOperations {
     fn next_dirty(&self, start_counter: u64) -> Result<Option<(Inode, u64)>, StorageError>;
-    fn get_last_counter(&self, start_counter: u64) -> Result<Option<u64>, StorageError>;
+    #[allow(dead_code)] // for testing
+    fn last_counter(&self) -> Result<u64, StorageError>;
     fn get_inode_for_counter(&self, counter: u64) -> Result<Option<Inode>, StorageError>;
     fn get_counter(&self, inode: Inode) -> Result<Option<u64>, StorageError>;
     fn is_job_failed(&self, job_id: JobId) -> Result<bool, StorageError>;
@@ -106,8 +107,8 @@ where
         next_dirty(&self.log_table, start_counter)
     }
 
-    fn get_last_counter(&self, start_counter: u64) -> Result<Option<u64>, StorageError> {
-        get_last_counter(&self.log_table, start_counter)
+    fn last_counter(&self) -> Result<u64, StorageError> {
+        last_counter(&self.log_table)
     }
 
     fn get_inode_for_counter(&self, counter: u64) -> Result<Option<Inode>, StorageError> {
@@ -139,8 +140,8 @@ impl<'a> DirtyReadOperations for WritableOpenDirty<'a> {
         next_dirty(&self.log_table, start_counter)
     }
 
-    fn get_last_counter(&self, start_counter: u64) -> Result<Option<u64>, StorageError> {
-        get_last_counter(&self.log_table, start_counter)
+    fn last_counter(&self) -> Result<u64, StorageError> {
+        last_counter(&self.log_table)
     }
 
     fn get_inode_for_counter(&self, counter: u64) -> Result<Option<Inode>, StorageError> {
@@ -292,9 +293,9 @@ impl<'a> WritableOpenDirty<'a> {
         inode: Inode,
         reason: &'static str,
     ) -> Result<(), StorageError> {
-        log::debug!("dirty: {inode} ({reason})");
-        let last_counter = last_counter(&self.counter_table)?;
+        let last_counter = self.counter_table.get(())?.map(|e| e.value()).unwrap_or(0);
         let counter = last_counter + 1;
+        log::debug!("dirty: {inode} ({reason}): {counter}");
         self.counter_table.insert((), counter)?;
         self.log_table.insert(counter, inode)?;
         let prev = self.table.insert(inode, counter)?;
@@ -325,16 +326,8 @@ fn next_dirty(
     Ok(None)
 }
 
-fn get_last_counter(
-    log_table: &impl ReadableTable<u64, Inode>,
-    start_counter: u64,
-) -> Result<Option<u64>, StorageError> {
-    let mut last_counter = None;
-    for entry in log_table.range(start_counter..)? {
-        let (key, _) = entry?;
-        last_counter = Some(key.value());
-    }
-    Ok(last_counter)
+fn last_counter(log_table: &impl ReadableTable<u64, Inode>) -> Result<u64, StorageError> {
+    Ok(log_table.last()?.map(|(k, _)| k.value()).unwrap_or(0))
 }
 
 fn get_inode_for_counter(
@@ -424,12 +417,6 @@ fn get_earliest_backoff(
     })
 }
 
-fn last_counter(
-    dirty_counter_table: &impl redb::ReadableTable<(), u64>,
-) -> Result<u64, StorageError> {
-    Ok(dirty_counter_table.get(())?.map(|v| v.value()).unwrap_or(0))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,7 +461,7 @@ mod tests {
     ) -> Result<HashSet<Path>, StorageError> {
         Ok(all(dirty)?
             .into_iter()
-            .filter_map(|(inode, _)| tree.backtrack(inode).ok())
+            .filter_map(|(inode, _)| tree.backtrack(inode).ok().flatten())
             .collect())
     }
 
@@ -817,7 +804,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_last_counter() -> anyhow::Result<()> {
+    fn test_last_counter() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut dirty = txn.write_dirty()?;
@@ -825,17 +812,14 @@ mod tests {
         let path1 = tree.setup(Path::parse("path1.txt")?)?;
         let path2 = tree.setup(Path::parse("path2.txt")?)?;
 
-        // Initially no counters
-        let last = dirty.get_last_counter(0)?;
-        assert_eq!(last, None);
+        assert_eq!(0, dirty.last_counter()?);
 
         // Mark paths as dirty
         dirty.mark_dirty(path1, "test")?;
         dirty.mark_dirty(path2, "test")?;
 
         // Get last counter
-        let last = dirty.get_last_counter(0)?;
-        assert_eq!(last, Some(2));
+        assert_eq!(2, dirty.last_counter()?);
 
         Ok(())
     }

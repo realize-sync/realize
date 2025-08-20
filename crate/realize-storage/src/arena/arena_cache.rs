@@ -470,13 +470,10 @@ impl ArenaCache {
         txn: &ArenaReadTransaction,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> Result<FileTableEntry, StorageError> {
+    ) -> Result<Option<FileTableEntry>, StorageError> {
         let inode = tree.expect(loc)?;
-        if let Some(e) = get_file_entry(&txn.cache_table()?, inode, None)? {
-            return Ok(e);
-        }
 
-        Err(StorageError::NotFound)
+        get_file_entry(&txn.cache_table()?, inode, None)
     }
 
     /// Write an entry in the file table, overwriting any existing one.
@@ -1312,7 +1309,7 @@ mod tests {
 
             Ok(inodes
                 .into_iter()
-                .filter_map(|i| tree.backtrack(i).ok())
+                .filter_map(|i| tree.backtrack(i).ok().flatten())
                 .collect())
         }
 

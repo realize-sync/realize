@@ -82,7 +82,19 @@ impl StorageJobProcessor {
             StorageJob::Realize(inode, hash, index_hash) => {
                 Some(self.realize(inode, hash, index_hash))
             }
+            StorageJob::ProtectBlob(inode) => Some(self.set_protected(inode, true)),
+            StorageJob::UnprotectBlob(inode) => Some(self.set_protected(inode, false)),
         }
+    }
+
+    fn set_protected(&self, inode: Inode, protected: bool) -> Result<JobStatus, StorageError> {
+        let txn = self.db.begin_write()?;
+        let tree = txn.read_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+        blobs.set_protected(&tree, &mut dirty, inode, protected)?;
+
+        Ok(JobStatus::Done)
     }
 
     /// Move a file from the filesystem to the cache.
@@ -97,9 +109,9 @@ impl StorageJobProcessor {
         };
         let txn = self.db.begin_write()?;
         let tree = txn.read_tree()?;
-        let path = match tree.backtrack(inode) {
-            Ok(path) => path,
-            Err(_) => {
+        let path = match tree.backtrack(inode)? {
+            Some(path) => path,
+            None => {
                 return Ok(JobStatus::Abandoned("no_path"));
             }
         };
@@ -178,9 +190,9 @@ impl StorageJobProcessor {
         let txn = self.db.begin_write()?;
         {
             let tree = txn.read_tree()?;
-            let path = match tree.backtrack(inode) {
-                Ok(path) => path,
-                Err(_) => {
+            let path = match tree.backtrack(inode)? {
+                Some(path) => path,
+                None => {
                     return Ok(JobStatus::Abandoned("no_path"));
                 }
             };
@@ -478,22 +490,22 @@ mod tests {
         Ok(())
     }
 
-    // #[tokio::test]
-    // async fn unrealize_empty_file() -> anyhow::Result<()> {
-    //     let fixture = Fixture::setup()?;
+    #[tokio::test]
+    async fn unrealize_empty_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
 
-    //     let hash = fixture.create_indexed_file("test.txt", "").await?;
-    //     fixture.add_to_cache("test.txt", &hash, 0)?;
+        let hash = fixture.create_indexed_file("test.txt", "").await?;
+        fixture.add_to_cache("test.txt", &hash, 0)?;
 
-    //     let path = Path::parse("test.txt")?;
-    //     assert_eq!(JobStatus::Done, fixture.unrealize(path, hash).await?);
+        let path = Path::parse("test.txt")?;
+        assert_eq!(JobStatus::Done, fixture.unrealize(path, hash).await?);
 
-    //     assert!(fixture.find_in_index("test.txt")?.is_none());
-    //     assert!(!fixture.file_exists("test.txt"));
-    //     assert_eq!("", fixture.read_blob_content("test.txt").await?);
+        assert!(fixture.find_in_index("test.txt")?.is_none());
+        assert!(!fixture.file_exists("test.txt"));
+        assert_eq!("", fixture.read_blob_content("test.txt").await?);
 
-    //     Ok(())
-    // }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn realize_new_file() -> anyhow::Result<()> {

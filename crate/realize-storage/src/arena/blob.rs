@@ -116,6 +116,21 @@ impl BlobInfo {
             verified: entry.verified,
         }
     }
+
+    pub(crate) fn local_availability(&self) -> LocalAvailability {
+        let file_range = ByteRanges::single(0, self.size);
+        if file_range == file_range.intersection(&self.available_ranges) {
+            if self.verified {
+                return LocalAvailability::Verified;
+            }
+            return LocalAvailability::Complete;
+        }
+        if self.available_ranges.is_empty() {
+            return LocalAvailability::Missing;
+        }
+
+        LocalAvailability::Partial(self.size, self.available_ranges.clone())
+    }
 }
 
 /// Read operations for blobs. See also [BlobExt].
@@ -228,23 +243,7 @@ impl<T: BlobReadOperations> BlobExt for T {
         loc: L,
     ) -> Result<LocalAvailability, StorageError> {
         if let Some(blob_info) = self.get(tree, loc)? {
-            let file_range = ByteRanges::single(0, blob_info.size);
-            if file_range == file_range.intersection(&blob_info.available_ranges) {
-                // Check if the blob is verified
-                if blob_info.verified {
-                    return Ok(LocalAvailability::Verified);
-                } else {
-                    return Ok(LocalAvailability::Complete);
-                }
-            }
-            if blob_info.available_ranges.is_empty() {
-                return Ok(LocalAvailability::Missing);
-            }
-
-            Ok(LocalAvailability::Partial(
-                blob_info.size,
-                blob_info.available_ranges,
-            ))
+            Ok(blob_info.local_availability())
         } else {
             Ok(LocalAvailability::Missing)
         }
@@ -377,10 +376,10 @@ impl<'a> WritableOpenBlob<'a> {
     /// Move the blob into or out of the protected queue.
     ///
     /// Does nothing if the blob doesn't exist.
-    #[allow(dead_code)] // for later
-    fn set_protected<'b, L: Into<TreeLoc<'b>>>(
+    pub(crate) fn set_protected<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
-        tree: &mut WritableOpenTree,
+        tree: &impl TreeReadOperations,
+        dirty: &mut WritableOpenDirty,
         loc: L,
         protected: bool,
     ) -> Result<(), StorageError> {
@@ -425,6 +424,7 @@ impl<'a> WritableOpenBlob<'a> {
         // Update the entry in the table
         self.blob_table
             .insert(inode, Holder::with_content(blob_entry)?)?;
+        dirty.mark_dirty(inode, "set_protected")?;
 
         Ok(())
     }
@@ -1363,6 +1363,7 @@ fn disk_usage_op(
 mod tests {
     use super::*;
     use crate::arena::db::{ArenaReadTransaction, ArenaWriteTransaction};
+    use crate::arena::dirty::DirtyReadOperations;
     use crate::utils::hash;
     use crate::{Inode, Mark};
     use assert_fs::TempDir;
@@ -2727,6 +2728,157 @@ mod tests {
         // Test with a non-existent inode
         let availability = blobs.local_availability(&tree, Inode(99999))?;
         assert_eq!(availability, LocalAvailability::Missing);
+
+        Ok(())
+    }
+
+    #[test]
+    fn set_protected() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.begin_write()?;
+        let marks = txn.read_marks()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut tree = txn.write_tree()?;
+        let mut dirty = txn.write_dirty()?;
+
+        let path = Path::parse("test.txt")?;
+        let blob_info = blobs.create(&mut tree, &marks, &path, &test_hash(), 100)?;
+        assert_eq!(false, blob_info.protected);
+
+        dirty.delete_range(0, 999)?; // clear all
+        blobs.set_protected(&tree, &mut dirty, &path, true)?;
+
+        let updated_info = blobs.get(&tree, &path)?.unwrap();
+        assert_eq!(true, updated_info.protected);
+
+        assert_eq!(
+            vec![blob_info.inode],
+            blobs
+                .head(LruQueueId::Protected)
+                .collect::<Result<Vec<_>, StorageError>>()?
+        );
+        assert_eq!(
+            vec![blob_info.inode],
+            blobs
+                .tail(LruQueueId::Protected)
+                .collect::<Result<Vec<_>, StorageError>>()?
+        );
+
+        assert_eq!(
+            Some(blob_info.inode),
+            dirty.next_dirty(0)?.map(|(inode, _)| inode)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn set_protected_protected_to_working() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.begin_write()?;
+        let mut marks = txn.write_marks()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut tree = txn.write_tree()?;
+        let mut dirty = txn.write_dirty()?;
+
+        let path = Path::parse("test.txt")?;
+        marks.set(&mut tree, &mut dirty, &path, Mark::Keep)?;
+        let blob_info = blobs.create(&mut tree, &marks, &path, &test_hash(), 100)?;
+        assert_eq!(true, blob_info.protected);
+
+        dirty.delete_range(0, 999)?; // clear all
+        blobs.set_protected(&tree, &mut dirty, &path, false)?;
+
+        let updated_info = blobs.get(&tree, &path)?.unwrap();
+        assert_eq!(false, updated_info.protected);
+
+        assert_eq!(
+            vec![blob_info.inode],
+            blobs
+                .head(LruQueueId::WorkingArea)
+                .collect::<Result<Vec<_>, StorageError>>()?
+        );
+        assert_eq!(
+            vec![blob_info.inode],
+            blobs
+                .tail(LruQueueId::WorkingArea)
+                .collect::<Result<Vec<_>, StorageError>>()?
+        );
+
+        assert!(blobs.head(LruQueueId::Protected).next().is_none());
+
+        assert_eq!(
+            Some(blob_info.inode),
+            dirty.next_dirty(0)?.map(|(inode, _)| inode)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn set_protected_no_change_when_already_protected() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.begin_write()?;
+        let mut marks = txn.write_marks()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut tree = txn.write_tree()?;
+        let mut dirty = txn.write_dirty()?;
+
+        let path = Path::parse("test.txt")?;
+        marks.set(&mut tree, &mut dirty, &path, Mark::Keep)?;
+        let blob_info = blobs.create(&mut tree, &marks, &path, &test_hash(), 100)?;
+        assert_eq!(true, blob_info.protected);
+
+        dirty.delete_range(0, 999)?; // clear all
+        blobs.set_protected(&tree, &mut dirty, &path, true)?;
+
+        // nothing changed, and the dirty bit wasn't set
+        let updated_info = blobs.get(&tree, &path)?.unwrap();
+        assert_eq!(true, updated_info.protected);
+        assert_eq!(blob_info.inode, updated_info.inode);
+        assert!(dirty.next_dirty(0)?.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn set_protected_nonexistent_blob() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.begin_write()?;
+        let mut blobs = txn.write_blobs()?;
+        let tree = txn.read_tree()?;
+        let mut dirty = txn.write_dirty()?;
+
+        let path = Path::parse("nonexistent.txt")?;
+
+        // should not fail, just do noting
+        blobs.set_protected(&tree, &mut dirty, &path, true)?;
+
+        assert!(blobs.get(&tree, &path)?.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn set_protected_updates_disk_usage() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.begin_write()?;
+        let marks = txn.read_marks()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut tree = txn.write_tree()?;
+        let mut dirty = txn.write_dirty()?;
+
+        let path = Path::parse("test.txt")?;
+        let _blob_info = blobs.create(&mut tree, &marks, &path, &test_hash(), 100)?;
+
+        assert_eq!((INODE_DISK_USAGE, INODE_DISK_USAGE), blobs.disk_usage()?);
+
+        blobs.set_protected(&tree, &mut dirty, &path, true)?;
+
+        assert_eq!((INODE_DISK_USAGE, 0), blobs.disk_usage()?);
+
+        blobs.set_protected(&tree, &mut dirty, &path, false)?;
+
+        assert_eq!((INODE_DISK_USAGE, INODE_DISK_USAGE), blobs.disk_usage()?);
 
         Ok(())
     }

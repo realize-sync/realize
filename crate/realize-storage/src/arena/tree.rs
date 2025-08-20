@@ -243,7 +243,9 @@ pub(crate) trait TreeExt {
         F: FnMut(Inode) -> bool;
 
     /// Follow the inodes back up to the root and build a path.
-    fn backtrack<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> Result<Path, StorageError>;
+    ///
+    /// Not all inodes can be turned into a path, even valid ones.
+    fn backtrack<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> Result<Option<Path>, StorageError>;
 
     /// Return an iterator that returns the parent of inode and it
     /// parent until the root.
@@ -312,10 +314,10 @@ impl<T: TreeReadOperations> TreeExt for T {
         }
     }
 
-    fn backtrack<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> Result<Path, StorageError> {
+    fn backtrack<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> Result<Option<Path>, StorageError> {
         match loc.into() {
-            TreeLoc::PathRef(path) => Ok(path.clone()),
-            TreeLoc::Path(path) => Ok(path),
+            TreeLoc::PathRef(path) => Ok(Some(path.clone())),
+            TreeLoc::Path(path) => Ok(Some(path)),
             TreeLoc::Inode(inode) => {
                 let mut components = VecDeque::new();
                 let mut current = inode;
@@ -329,11 +331,11 @@ impl<T: TreeReadOperations> TreeExt for T {
                     }
                     current = parent;
                 }
-                if current != self.root() {
-                    return Err(StorageError::NotFound);
+                if current != self.root() || components.is_empty() {
+                    return Ok(None);
                 }
 
-                Ok(Path::parse(components.make_contiguous().join("/"))?)
+                Ok(Some(Path::parse(components.make_contiguous().join("/"))?))
             }
         }
     }
@@ -1158,16 +1160,16 @@ mod tests {
         let bar = tree.setup(&Path::parse("foo/bar")?)?;
         let baz = tree.setup(&Path::parse("foo/bar/baz")?)?;
 
-        assert_eq!(Path::parse("foo/bar/baz")?, tree.backtrack(baz)?);
-        assert_eq!(Path::parse("foo/bar")?, tree.backtrack(bar)?);
-        assert_eq!(Path::parse("foo")?, tree.backtrack(foo)?);
-        // Root cannot be turned into a path, as empty paths are invalid.
-        assert!(tree.backtrack(tree.root()).is_err());
+        assert_eq!(Path::parse("foo/bar/baz")?, tree.backtrack(baz)?.unwrap());
+        assert_eq!(Path::parse("foo/bar")?, tree.backtrack(bar)?.unwrap());
+        assert_eq!(Path::parse("foo")?, tree.backtrack(foo)?.unwrap());
 
-        assert!(matches!(
-            tree.backtrack(Inode(999)),
-            Err(StorageError::NotFound)
-        ));
+        // Roots cannot be turned into a path, as empty paths are invalid.
+        assert!(tree.backtrack(tree.root())?.is_none());
+        assert!(tree.backtrack(Inode(1))?.is_none());
+
+        // Invalid inodes are reported as None, not NotFound
+        assert!(tree.backtrack(Inode(999))?.is_none());
 
         Ok(())
     }

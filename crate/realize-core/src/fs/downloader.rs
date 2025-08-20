@@ -135,7 +135,8 @@ impl Download {
 
     /// Update local availability in the database.
     pub async fn update_db(&mut self) -> Result<(), StorageError> {
-        self.blob.update_db().await
+        self.blob.update_db().await?;
+        Ok(())
     }
 
     /// Get the parts of the file that are available locally.

@@ -312,7 +312,7 @@ pub(crate) fn indexed_file_path<'b, L: Into<TreeLoc<'b>>, R: AsRef<std::path::Pa
 ) -> Result<Option<std::path::PathBuf>, StorageError> {
     let loc = loc.into();
     let entry = index.get(tree, loc.borrow())?;
-    if let Ok(path) = tree.backtrack(loc) {
+    if let Some(path) = tree.backtrack(loc)? {
         let root = root.as_ref();
         let file_path = path.within(root);
         match hash {
@@ -531,7 +531,7 @@ impl<'a> WritableOpenIndex<'a> {
         if same_hash {
             return Ok(inode);
         }
-        if let Ok(path) = tree.backtrack(loc) {
+        if let Some(path) = tree.backtrack(loc)? {
             tree.insert_and_incref(
                 inode,
                 &mut self.table,
@@ -746,7 +746,7 @@ mod tests {
     ) -> Result<HashSet<Path>, StorageError> {
         Ok(dirty_inodes(dirty)?
             .into_iter()
-            .filter_map(|i| tree.backtrack(i).ok())
+            .filter_map(|i| tree.backtrack(i).ok().flatten())
             .collect())
     }
 
