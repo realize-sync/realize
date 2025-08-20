@@ -20,6 +20,8 @@ use tokio::sync::watch;
 pub(crate) struct History {
     arena: Arena,
     tx: watch::Sender<u64>,
+
+    /// Kept to not lose history when there are no receivers.
     _rx: watch::Receiver<u64>,
 }
 

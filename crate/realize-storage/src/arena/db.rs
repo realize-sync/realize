@@ -212,7 +212,7 @@ impl ArenaDatabase {
         let tree = Tree::new(arena, allocator)?;
         let dirty: Dirty;
         let history: History;
-        let blob = Blobs::new(blob_dir.as_ref());
+        let blobs: Blobs;
         let txn = db.begin_write()?;
         {
             // Create tables so they can safely be queried in read
@@ -228,7 +228,7 @@ impl ArenaDatabase {
             txn.open_table(NOTIFICATION_TABLE)?;
             txn.open_table(CURRENT_INODE_RANGE_TABLE)?;
             txn.open_table(BLOB_TABLE)?;
-            txn.open_table(BLOB_LRU_QUEUE_TABLE)?;
+            let blob_lru_queue_table = txn.open_table(BLOB_LRU_QUEUE_TABLE)?;
             txn.open_table(MARK_TABLE)?;
             txn.open_table(DIRTY_TABLE)?;
             let dirty_log_table = txn.open_table(DIRTY_LOG_TABLE)?;
@@ -237,6 +237,7 @@ impl ArenaDatabase {
 
             dirty = Dirty::new(&dirty_log_table)?;
             history = History::new(arena, &history_table)?;
+            blobs = Blobs::new(blob_dir.as_ref(), &blob_lru_queue_table)?;
         }
         txn.commit()?;
 
@@ -247,7 +248,7 @@ impl ArenaDatabase {
                 tree,
                 dirty,
                 history,
-                blobs: blob,
+                blobs,
             },
         }))
     }
@@ -358,6 +359,10 @@ impl<'db> ArenaWriteTransaction<'db> {
         Ok(self.inner.open_table(NOTIFICATION_TABLE)?)
     }
 
+    pub fn after_commit(&self, cb: impl FnOnce() -> () + Send + 'static) {
+        self.after_commit.add(cb)
+    }
+
     #[track_caller]
     pub(crate) fn read_tree(&self) -> Result<impl TreeReadOperations, StorageError> {
         Ok(ReadableOpenTree::new(
@@ -462,6 +467,7 @@ impl<'db> ArenaWriteTransaction<'db> {
     #[track_caller]
     pub(crate) fn write_blobs(&self) -> Result<WritableOpenBlob<'_>, StorageError> {
         Ok(WritableOpenBlob::new(
+            &self.before_commit,
             self.inner
                 .open_table(BLOB_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,

@@ -1,4 +1,4 @@
-use super::db::ArenaDatabase;
+use super::db::{ArenaDatabase, BeforeCommit};
 use super::dirty::WritableOpenDirty;
 use super::hasher::hash_file;
 use super::mark::MarkReadOperations;
@@ -18,18 +18,39 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt as _, ReadBuf};
+use tokio::sync::watch;
 
 pub(crate) struct Blobs {
     blob_dir: PathBuf,
     /// Reference counter for open blobs. Maps Inode to the number of open handles.
     open_blobs: OpenBlobRefCounter,
+
+    tx: watch::Sender<DiskUsage>,
+
+    /// Kept to not lose history when there are no receivers.
+    _rx: watch::Receiver<DiskUsage>,
 }
 impl Blobs {
-    pub(crate) fn new(blob_dir: &std::path::Path) -> Blobs {
-        Self {
+    pub(crate) fn new(
+        blob_dir: &std::path::Path,
+        blob_lru_queue_table: &impl redb::ReadableTable<u16, Holder<'static, QueueTableEntry>>,
+    ) -> Result<Blobs, StorageError> {
+        let (tx, rx) = watch::channel(disk_usage_op(blob_lru_queue_table)?);
+        Ok(Self {
             blob_dir: blob_dir.to_path_buf(),
             open_blobs: OpenBlobRefCounter::new(),
-        }
+            tx,
+            _rx: rx,
+        })
+    }
+
+    /// Get a watch channel that reports changes to disk usage.
+    ///
+    /// The current value is also available as
+    /// [BlobReadOperations::disk_usage].
+    #[allow(dead_code)] // will be used soon
+    pub(crate) fn watch_disk_usage(&self) -> watch::Receiver<DiskUsage> {
+        self.tx.subscribe()
     }
 }
 
@@ -57,22 +78,49 @@ where
 }
 
 pub(crate) struct WritableOpenBlob<'a> {
+    before_commit: &'a BeforeCommit,
+
     blob_table: Table<'a, Inode, Holder<'static, BlobTableEntry>>,
     blob_lru_queue_table: Table<'a, u16, Holder<'static, QueueTableEntry>>,
     subsystem: &'a Blobs,
+
+    /// If true, an after-commit has been registered to report disk usage at
+    /// the end of the transaction.
+    will_report_disk_usage: bool,
 }
 
 impl<'a> WritableOpenBlob<'a> {
     pub(crate) fn new(
+        before_commit: &'a BeforeCommit,
         blob_table: Table<'a, Inode, Holder<'static, BlobTableEntry>>,
         blob_lru_queue_table: Table<'a, u16, Holder<'static, QueueTableEntry>>,
         subsystem: &'a Blobs,
     ) -> Self {
         Self {
+            before_commit,
             blob_table,
             blob_lru_queue_table,
-            subsystem: subsystem,
+            subsystem,
+            will_report_disk_usage: false,
         }
+    }
+
+    /// Report disk usage changed to the watch channel after commit.
+    fn report_disk_usage_changed(&mut self) {
+        if self.will_report_disk_usage {
+            return;
+        }
+        let tx = self.subsystem.tx.clone();
+        self.before_commit.add(move |txn| {
+            if let Ok(disk_usage) = txn.read_blobs()?.disk_usage() {
+                txn.after_commit(move || {
+                    let _ = tx.send(disk_usage);
+                });
+            }
+
+            Ok::<(), StorageError>(())
+        });
+        self.will_report_disk_usage = true;
     }
 }
 
@@ -290,6 +338,7 @@ impl<'a> WritableOpenBlob<'a> {
         size: u64,
     ) -> Result<BlobInfo, StorageError> {
         let (inode, _, entry) = self.create_entry(tree, marks, loc, hash, size)?;
+        self.report_disk_usage_changed();
 
         Ok(BlobInfo::new(inode, entry))
     }
@@ -326,10 +375,9 @@ impl<'a> WritableOpenBlob<'a> {
             queue,
             next: None,
             prev: None,
-            disk_usage: 0,
+            disk_usage: calculate_disk_usage(&blob_path.metadata()?),
         };
         self.add_to_queue_front(queue, inode, &mut entry)?;
-        self.update_disk_usage(&mut entry, &blob_path.metadata()?)?;
 
         log::debug!("Created blob {inode} {hash} in {queue:?} at {blob_path:?} -> {entry:?}");
         tree.insert_and_incref(inode, &mut self.blob_table, inode, Holder::new(&entry)?)?;
@@ -367,11 +415,14 @@ impl<'a> WritableOpenBlob<'a> {
             None => return Ok(()), // Nothing to delete
         };
 
-        self.remove_blob_entry(tree, inode)?;
+        if !self.remove_blob_entry(tree, inode)? {
+            return Ok(());
+        }
         let blob_path = self.subsystem.blob_dir.join(inode.hex());
         if blob_path.exists() {
             std::fs::remove_file(&blob_path)?;
         }
+        self.report_disk_usage_changed();
 
         Ok(())
     }
@@ -418,6 +469,7 @@ impl<'a> WritableOpenBlob<'a> {
         self.blob_table
             .insert(inode, Holder::with_content(blob_entry)?)?;
         dirty.mark_dirty(inode, "set_protected")?;
+        self.report_disk_usage_changed();
 
         Ok(())
     }
@@ -451,6 +503,7 @@ impl<'a> WritableOpenBlob<'a> {
         self.remove_blob_entry(tree, inode)?;
         let blob_path = self.subsystem.blob_dir.join(inode.hex());
         std::fs::rename(blob_path, dest)?;
+        self.report_disk_usage_changed();
 
         Ok(true)
     }
@@ -479,6 +532,7 @@ impl<'a> WritableOpenBlob<'a> {
         self.update_disk_usage(&mut entry, metadata)?;
         self.blob_table
             .insert(inode, Holder::with_content(entry)?)?;
+        self.report_disk_usage_changed();
 
         // Return the path where the file should be moved
         Ok(blob_path)
@@ -595,6 +649,7 @@ impl<'a> WritableOpenBlob<'a> {
         let blob_path = self.subsystem.blob_dir.join(inode.hex());
         if let Ok(metadata) = blob_path.metadata() {
             self.update_disk_usage(&mut blob_entry, &metadata)?;
+            self.report_disk_usage_changed();
         }
 
         self.blob_table
@@ -659,6 +714,7 @@ impl<'a> WritableOpenBlob<'a> {
         if removed_count > 0 {
             self.blob_lru_queue_table
                 .insert(LruQueueId::WorkingArea as u16, Holder::with_content(queue)?)?;
+            self.report_disk_usage_changed();
         }
 
         Ok(())
@@ -780,13 +836,14 @@ impl<'a> WritableOpenBlob<'a> {
         &mut self,
         tree: &mut WritableOpenTree<'_>,
         inode: Inode,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         if let Some(entry) = get_blob_entry(&self.blob_table, inode)? {
             self.remove_from_queue(&entry)?;
             tree.remove_and_decref(inode, &mut self.blob_table, inode)?;
+            return Ok(true);
         }
 
-        Ok(())
+        Ok(false)
     }
 
     /// Move the blob to the front of its queue
@@ -1354,6 +1411,7 @@ mod tests {
     use crate::utils::hash;
     use crate::{Inode, Mark};
     use assert_fs::TempDir;
+    use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Path};
     use std::io::SeekFrom;
@@ -1372,6 +1430,7 @@ mod tests {
     struct Fixture {
         arena: Arena,
         db: Arc<ArenaDatabase>,
+        blob_dir: ChildPath,
         tempdir: TempDir,
     }
     impl Fixture {
@@ -1386,7 +1445,12 @@ mod tests {
             }
             let db = ArenaDatabase::for_testing_single_arena(arena, blob_dir.path())?;
 
-            Ok(Self { arena, db, tempdir })
+            Ok(Self {
+                arena,
+                db,
+                blob_dir,
+                tempdir,
+            })
         }
 
         /// Return the path to a blob file for test use.
@@ -1455,25 +1519,30 @@ mod tests {
     fn create_blob() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let txn = fixture.begin_write()?;
-        let mut blobs = txn.write_blobs()?;
-        let marks = txn.write_marks()?;
-        let mut tree = txn.write_tree()?;
-        let path = Path::parse("blob/test.txt")?;
+        {
+            let mut blobs = txn.write_blobs()?;
+            let marks = txn.write_marks()?;
+            let mut tree = txn.write_tree()?;
+            let path = Path::parse("blob/test.txt")?;
 
-        let info = blobs.create(&mut tree, &marks, &path, &hash::digest("test"), 4)?;
-        assert_eq!(hash::digest("test"), info.hash);
-        assert_eq!(4, info.size);
-        assert_eq!(ByteRanges::new(), info.available_ranges);
+            let info = blobs.create(&mut tree, &marks, &path, &hash::digest("test"), 4)?;
+            assert_eq!(hash::digest("test"), info.hash);
+            assert_eq!(4, info.size);
+            assert_eq!(ByteRanges::new(), info.available_ranges);
 
-        let inode = info.inode;
-        assert_eq!(tree.resolve(path)?, Some(inode));
-        assert_eq!(Some(info), blobs.get_with_inode(inode)?);
+            let inode = info.inode;
+            assert_eq!(tree.resolve(path)?, Some(inode));
+            assert_eq!(Some(info), blobs.get_with_inode(inode)?);
 
-        let file_path = fixture.blob_path(inode);
-        assert!(file_path.exists());
-        let m = file_path.metadata()?;
-        assert_eq!(4, m.len());
-        assert_eq!(0, m.blocks()); // sparse file
+            let file_path = fixture.blob_path(inode);
+            assert!(file_path.exists());
+            let m = file_path.metadata()?;
+            assert_eq!(4, m.len());
+            assert_eq!(0, m.blocks()); // sparse file
+        }
+        let watch = fixture.db.blobs().watch_disk_usage();
+        txn.commit()?;
+        assert!(watch.has_changed()?);
 
         Ok(())
     }
@@ -1586,6 +1655,42 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn delete_blob() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let path = Path::parse("blob/test.txt")?;
+        let txn = fixture.begin_write()?;
+        {
+            let mut blobs = txn.write_blobs()?;
+            let marks = txn.write_marks()?;
+            let mut tree = txn.write_tree()?;
+
+            blobs
+                .create(&mut tree, &marks, &path, &hash::digest("test"), 4)?
+                .inode;
+        }
+        txn.commit()?;
+
+        let txn = fixture.begin_write()?;
+        {
+            let mut blobs = txn.write_blobs()?;
+            let mut tree = txn.write_tree()?;
+
+            let inode = tree.expect(&path)?;
+            blobs.delete(&mut tree, &path)?;
+
+            assert_eq!(None, blobs.get_with_inode(inode)?);
+
+            let file_path = fixture.blob_path(inode);
+            assert!(!file_path.exists());
+        }
+        let watch = fixture.db.blobs().watch_disk_usage();
+        txn.commit()?;
+        assert!(watch.has_changed()?);
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn read_blob_within_available_ranges() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
@@ -1667,8 +1772,10 @@ mod tests {
         blob.write(b", black sheep").await?;
         assert_eq!(ByteRanges::single(0, 21), *blob.local_availability());
 
+        let watch = fixture.db.blobs().watch_disk_usage();
         blob.update_db().await?;
         drop(blob);
+        assert!(watch.has_changed()?);
 
         // After update_db, local availability changes on the database.
         assert_eq!(
@@ -1833,7 +1940,9 @@ mod tests {
             let mut tree = txn.write_tree()?;
             assert_eq!(true, blobs.export(&mut tree, &path, &hash, &dest)?);
         }
+        let watch = fixture.db.blobs().watch_disk_usage();
         txn.commit()?;
+        assert!(watch.has_changed()?);
 
         assert_eq!("Baa, baa, black sheep", std::fs::read_to_string(&dest)?);
 
@@ -1937,7 +2046,9 @@ mod tests {
             )?;
             std::fs::rename(tmpfile.path(), path_in_cache)?;
         }
+        let watch = fixture.db.blobs().watch_disk_usage();
         txn.commit()?;
+        assert!(watch.has_changed()?);
 
         let mut blob = Blob::open(&fixture.db, &path)?;
         assert_eq!(hash::digest(data), blob.hash);
@@ -2172,72 +2283,90 @@ mod tests {
     #[tokio::test]
     async fn mark_accessed() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
+
         let txn = fixture.begin_write()?;
-        let marks = txn.read_marks()?;
-        let mut blobs = txn.write_blobs()?;
-        let mut tree = txn.write_tree()?;
+        {
+            let marks = txn.read_marks()?;
+            let mut blobs = txn.write_blobs()?;
+            let mut tree = txn.write_tree()?;
 
-        let one = blobs
-            .create(
-                &mut tree,
-                &marks,
-                Path::parse("one")?,
-                &hash::digest("one"),
-                3,
-            )?
-            .inode;
+            let one = blobs
+                .create(
+                    &mut tree,
+                    &marks,
+                    Path::parse("one")?,
+                    &hash::digest("one"),
+                    3,
+                )?
+                .inode;
 
-        let two = blobs
-            .create(
-                &mut tree,
-                &marks,
-                Path::parse("two")?,
-                &hash::digest("two"),
-                3,
-            )?
-            .inode;
-        let three = blobs
-            .create(
-                &mut tree,
-                &marks,
-                Path::parse("three")?,
-                &hash::digest("three"),
-                3,
-            )?
-            .inode;
+            let two = blobs
+                .create(
+                    &mut tree,
+                    &marks,
+                    Path::parse("two")?,
+                    &hash::digest("two"),
+                    3,
+                )?
+                .inode;
+            let three = blobs
+                .create(
+                    &mut tree,
+                    &marks,
+                    Path::parse("three")?,
+                    &hash::digest("three"),
+                    3,
+                )?
+                .inode;
 
-        assert_eq!(
-            vec![three, two, one],
-            blobs
-                .head(LruQueueId::WorkingArea)
-                .collect::<Result<Vec<_>, StorageError>>()?
-        );
+            assert_eq!(
+                vec![three, two, one],
+                blobs
+                    .head(LruQueueId::WorkingArea)
+                    .collect::<Result<Vec<_>, StorageError>>()?
+            );
+        }
+        txn.commit()?;
 
-        blobs.mark_accessed(&tree, two)?;
+        let txn = fixture.begin_write()?;
+        {
+            let mut blobs = txn.write_blobs()?;
+            let tree = txn.read_tree()?;
 
-        assert_eq!(
-            vec![two, three, one],
-            blobs
-                .head(LruQueueId::WorkingArea)
-                .collect::<Result<Vec<_>, StorageError>>()?
-        );
+            let two_inode = tree.resolve(Path::parse("two")?)?.unwrap();
+            let three_inode = tree.resolve(Path::parse("three")?)?.unwrap();
+            let one_inode = tree.resolve(Path::parse("one")?)?.unwrap();
 
-        blobs.mark_accessed(&tree, one)?;
+            blobs.mark_accessed(&tree, Path::parse("two")?)?;
 
-        assert_eq!(
-            vec![one, two, three],
-            blobs
-                .head(LruQueueId::WorkingArea)
-                .collect::<Result<Vec<_>, StorageError>>()?
-        );
+            assert_eq!(
+                vec![two_inode, three_inode, one_inode],
+                blobs
+                    .head(LruQueueId::WorkingArea)
+                    .collect::<Result<Vec<_>, StorageError>>()?
+            );
 
-        // make sure the list is correct both ways
-        assert_eq!(
-            vec![three, two, one],
-            blobs
-                .tail(LruQueueId::WorkingArea)
-                .collect::<Result<Vec<_>, StorageError>>()?
-        );
+            blobs.mark_accessed(&tree, Path::parse("one")?)?;
+
+            assert_eq!(
+                vec![one_inode, two_inode, three_inode],
+                blobs
+                    .head(LruQueueId::WorkingArea)
+                    .collect::<Result<Vec<_>, StorageError>>()?
+            );
+
+            // make sure the list is correct both ways
+            assert_eq!(
+                vec![three_inode, two_inode, one_inode],
+                blobs
+                    .tail(LruQueueId::WorkingArea)
+                    .collect::<Result<Vec<_>, StorageError>>()?
+            );
+        }
+        let watch = fixture.db.blobs().watch_disk_usage();
+        txn.commit()?;
+        // mark_accessed should not change disk usage
+        assert!(!watch.has_changed()?);
 
         Ok(())
     }
@@ -2380,38 +2509,44 @@ mod tests {
         }
 
         let txn = fixture.begin_write()?;
-        let mut tree = txn.write_tree()?;
-        let mut blobs = txn.write_blobs()?;
-        assert_eq!(
-            DiskUsage {
-                total: DiskUsage::INODE * 4 + 4 * 4096,
-                evictable: DiskUsage::INODE * 4 + 4 * 4096,
-            },
-            blobs.disk_usage()?
-        );
+        {
+            let mut tree = txn.write_tree()?;
+            let mut blobs = txn.write_blobs()?;
+            assert_eq!(
+                DiskUsage {
+                    total: DiskUsage::INODE * 4 + 4 * 4096,
+                    evictable: DiskUsage::INODE * 4 + 4 * 4096,
+                },
+                blobs.disk_usage()?
+            );
 
-        blobs.cleanup(&mut tree, 8 * 4096)?; // does nothing
-        assert_eq!(
-            DiskUsage::INODE * 4 + 4 * 4096,
-            blobs.disk_usage()?.evictable
-        );
+            blobs.cleanup(&mut tree, 8 * 4096)?; // does nothing
+            assert_eq!(
+                DiskUsage::INODE * 4 + 4 * 4096,
+                blobs.disk_usage()?.evictable
+            );
 
-        blobs.cleanup(&mut tree, DiskUsage::INODE * 2 + 2 * 4096)?; // remove 2/4
-        assert_eq!(
-            DiskUsage::INODE * 2 + 2 * 4096,
-            blobs.disk_usage()?.evictable
-        );
+            blobs.cleanup(&mut tree, DiskUsage::INODE * 2 + 2 * 4096)?; // remove 2/4
+            assert_eq!(
+                DiskUsage::INODE * 2 + 2 * 4096,
+                blobs.disk_usage()?.evictable
+            );
 
-        // the 2 least recently accessed are the ones that were deleted
-        assert!(blobs.get(&tree, inodes[2])?.is_none());
-        assert!(blobs.get(&tree, inodes[1])?.is_none());
+            // the 2 least recently accessed are the ones that were deleted
+            assert!(blobs.get(&tree, inodes[2])?.is_none());
+            assert!(blobs.get(&tree, inodes[1])?.is_none());
 
-        blobs.cleanup(&mut tree, 0)?; // remove all
-        assert_eq!(0, blobs.disk_usage()?.evictable);
+            blobs.cleanup(&mut tree, 0)?; // remove all
+            assert_eq!(0, blobs.disk_usage()?.evictable);
 
-        for i in 0..4 {
-            assert!(blobs.get(&tree, inodes[i])?.is_none(), "blob {i}");
+            for i in 0..4 {
+                assert!(blobs.get(&tree, inodes[i])?.is_none(), "blob {i}");
+            }
         }
+        let watch = fixture.db.blobs().watch_disk_usage();
+        txn.commit()?;
+        assert!(watch.has_changed()?);
+
         Ok(())
     }
 
@@ -2735,38 +2870,43 @@ mod tests {
     fn set_protected() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let txn = fixture.begin_write()?;
-        let marks = txn.read_marks()?;
-        let mut blobs = txn.write_blobs()?;
-        let mut tree = txn.write_tree()?;
-        let mut dirty = txn.write_dirty()?;
+        {
+            let marks = txn.read_marks()?;
+            let mut blobs = txn.write_blobs()?;
+            let mut tree = txn.write_tree()?;
+            let mut dirty = txn.write_dirty()?;
 
-        let path = Path::parse("test.txt")?;
-        let blob_info = blobs.create(&mut tree, &marks, &path, &test_hash(), 100)?;
-        assert_eq!(false, blob_info.protected);
+            let path = Path::parse("test.txt")?;
+            let blob_info = blobs.create(&mut tree, &marks, &path, &test_hash(), 100)?;
+            assert_eq!(false, blob_info.protected);
 
-        dirty.delete_range(0, 999)?; // clear all
-        blobs.set_protected(&tree, &mut dirty, &path, true)?;
+            dirty.delete_range(0, 999)?; // clear all
+            blobs.set_protected(&tree, &mut dirty, &path, true)?;
 
-        let updated_info = blobs.get(&tree, &path)?.unwrap();
-        assert_eq!(true, updated_info.protected);
+            let updated_info = blobs.get(&tree, &path)?.unwrap();
+            assert_eq!(true, updated_info.protected);
 
-        assert_eq!(
-            vec![blob_info.inode],
-            blobs
-                .head(LruQueueId::Protected)
-                .collect::<Result<Vec<_>, StorageError>>()?
-        );
-        assert_eq!(
-            vec![blob_info.inode],
-            blobs
-                .tail(LruQueueId::Protected)
-                .collect::<Result<Vec<_>, StorageError>>()?
-        );
+            assert_eq!(
+                vec![blob_info.inode],
+                blobs
+                    .head(LruQueueId::Protected)
+                    .collect::<Result<Vec<_>, StorageError>>()?
+            );
+            assert_eq!(
+                vec![blob_info.inode],
+                blobs
+                    .tail(LruQueueId::Protected)
+                    .collect::<Result<Vec<_>, StorageError>>()?
+            );
 
-        assert_eq!(
-            Some(blob_info.inode),
-            dirty.next_dirty(0)?.map(|(inode, _)| inode)
-        );
+            assert_eq!(
+                Some(blob_info.inode),
+                dirty.next_dirty(0)?.map(|(inode, _)| inode)
+            );
+        }
+        let watch = fixture.db.blobs().watch_disk_usage();
+        txn.commit()?;
+        assert!(watch.has_changed()?);
 
         Ok(())
     }
@@ -2895,6 +3035,57 @@ mod tests {
                 evictable: DiskUsage::INODE
             },
             blobs.disk_usage()?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn watch_disk_usage() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        assert_eq!(
+            DiskUsage::ZERO,
+            *fixture.db.blobs().watch_disk_usage().borrow()
+        );
+
+        let path = Path::parse("test.txt")?;
+        let txn = fixture.begin_write()?;
+        {
+            let marks = txn.read_marks()?;
+            let mut blobs = txn.write_blobs()?;
+            let mut tree = txn.write_tree()?;
+
+            blobs.create(&mut tree, &marks, &path, &test_hash(), 100)?;
+
+            // Before commit, disk usage should still be the same
+            assert_eq!(
+                DiskUsage::ZERO,
+                *fixture.db.blobs().watch_disk_usage().borrow()
+            );
+        }
+        txn.commit()?;
+
+        // After commit, disk usage should include the new inode
+        assert_eq!(
+            DiskUsage {
+                total: DiskUsage::INODE,
+                evictable: DiskUsage::INODE
+            },
+            *fixture.db.blobs().watch_disk_usage().borrow()
+        );
+
+        let mut blob = Blob::open(&fixture.db, &path)?;
+        blob.write_all(b"hello").await?;
+        blob.update_db().await?;
+
+        let blksize = fixture.blob_dir.metadata()?.blksize();
+        assert_eq!(
+            DiskUsage {
+                total: DiskUsage::INODE + blksize,
+                evictable: DiskUsage::INODE + blksize
+            },
+            *fixture.db.blobs().watch_disk_usage().borrow()
         );
 
         Ok(())
