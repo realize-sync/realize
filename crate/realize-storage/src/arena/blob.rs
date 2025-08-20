@@ -19,14 +19,6 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 
-// Arbitrary disk space considered to be occupied by an inode.
-//
-// This value is added to the disk usage estimates. It is meant to
-// account for the disk space used by the inode itself, so it doesn't
-// look like empty files are free. This is arbitrary and might not
-// correspond to the actual value, as it depends on the filesystem.
-const INODE_DISK_USAGE: u64 = 512;
-
 pub(crate) struct Blobs {
     blob_dir: PathBuf,
     /// Reference counter for open blobs. Maps Inode to the number of open handles.
@@ -82,6 +74,32 @@ impl<'a> WritableOpenBlob<'a> {
             subsystem: subsystem,
         }
     }
+}
+
+/// Information about current disk usage
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DiskUsage {
+    /// Total disk used to store local blobs, in bytes.
+    pub(crate) total: u64,
+
+    /// Subset of the total that can be evicted, in bytes.
+    pub(crate) evictable: u64,
+}
+
+impl DiskUsage {
+    #[allow(dead_code)]
+    pub(crate) const ZERO: DiskUsage = DiskUsage {
+        total: 0,
+        evictable: 0,
+    };
+
+    // Arbitrary disk space considered to be occupied by an inode.
+    //
+    // This value is added to the disk usage estimates. It is meant to
+    // account for the disk space used by the inode itself, so it doesn't
+    // look like empty files are free. This is arbitrary and might not
+    // correspond to the actual value, as it depends on the filesystem.
+    pub(crate) const INODE: u64 = 512;
 }
 
 /// Public information about the blob.
@@ -156,7 +174,7 @@ pub(crate) trait BlobReadOperations {
     /// bytes and evictable the portion of total that
     /// [WritableOpenBlob::cleanup] can delete.
     #[allow(dead_code)]
-    fn disk_usage(&self) -> Result<(u64, u64), StorageError>;
+    fn disk_usage(&self) -> Result<DiskUsage, StorageError>;
 }
 
 impl<T, TQ> BlobReadOperations for ReadableOpenBlob<T, TQ>
@@ -176,7 +194,7 @@ where
         QueueIterator::tail(&self.blob_table, &self.blob_lru_queue_table, queue)
     }
 
-    fn disk_usage(&self) -> Result<(u64, u64), StorageError> {
+    fn disk_usage(&self) -> Result<DiskUsage, StorageError> {
         disk_usage_op(&self.blob_lru_queue_table)
     }
 }
@@ -194,7 +212,7 @@ impl<'a> BlobReadOperations for WritableOpenBlob<'a> {
         QueueIterator::tail(&self.blob_table, &self.blob_lru_queue_table, queue)
     }
 
-    fn disk_usage(&self) -> Result<(u64, u64), StorageError> {
+    fn disk_usage(&self) -> Result<DiskUsage, StorageError> {
         disk_usage_op(&self.blob_lru_queue_table)
     }
 }
@@ -808,7 +826,7 @@ fn calculate_disk_usage(metadata: &std::fs::Metadata) -> u64 {
     // block() takes into account actual usage, not the whole file
     // size, which might be sparse. Include the inode size into the
     // computation.
-    metadata.blocks() * 512 + INODE_DISK_USAGE
+    metadata.blocks() * 512 + DiskUsage::INODE
 }
 
 /// Update disk usage in the given blob entry and the total in its
@@ -1344,7 +1362,7 @@ fn get_read_op(
 #[allow(dead_code)]
 fn disk_usage_op(
     blob_lru_queue_table: &impl redb::ReadableTable<u16, Holder<'static, QueueTableEntry>>,
-) -> Result<(u64, u64), StorageError> {
+) -> Result<DiskUsage, StorageError> {
     let mut total: u64 = 0;
     let mut evictable: u64 = 0;
     for e in blob_lru_queue_table.iter()? {
@@ -1356,7 +1374,7 @@ fn disk_usage_op(
         }
     }
 
-    Ok((total, evictable))
+    Ok(DiskUsage { total, evictable })
 }
 
 #[cfg(test)]
@@ -1973,7 +1991,7 @@ mod tests {
 
         // Disk usage must be set.
         let blob_entry = fixture.get_blob_entry(inode)?;
-        assert!(blob_entry.disk_usage > INODE_DISK_USAGE);
+        assert!(blob_entry.disk_usage > DiskUsage::INODE);
 
         Ok(())
     }
@@ -2026,7 +2044,7 @@ mod tests {
 
         // Disk usage must be set.
         let blob_entry = fixture.get_blob_entry(inode)?;
-        assert!(blob_entry.disk_usage > INODE_DISK_USAGE);
+        assert!(blob_entry.disk_usage > DiskUsage::INODE);
 
         Ok(())
     }
@@ -2270,7 +2288,7 @@ mod tests {
             let mut marks = txn.write_marks()?;
             let mut dirty = txn.write_dirty()?;
             marks.set(&mut tree, &mut dirty, Path::parse("protected")?, Mark::Keep)?;
-            assert_eq!((0, 0), blobs.disk_usage()?);
+            assert_eq!(DiskUsage::ZERO, blobs.disk_usage()?);
 
             for path in [&protected1, &protected2, &evictable1, &evictable2] {
                 blobs.create(
@@ -2282,7 +2300,10 @@ mod tests {
                 )?;
             }
             assert_eq!(
-                (4 * INODE_DISK_USAGE, 2 * INODE_DISK_USAGE),
+                DiskUsage {
+                    total: 4 * DiskUsage::INODE,
+                    evictable: 2 * DiskUsage::INODE
+                },
                 blobs.disk_usage()?
             );
         }
@@ -2308,10 +2329,10 @@ mod tests {
         let blobs = txn.read_blobs()?;
 
         assert_eq!(
-            (
-                INODE_DISK_USAGE * 4 + 10 * 4096,
-                INODE_DISK_USAGE * 2 + 7 * 4096
-            ),
+            DiskUsage {
+                total: DiskUsage::INODE * 4 + 10 * 4096,
+                evictable: DiskUsage::INODE * 2 + 7 * 4096
+            },
             blobs.disk_usage()?
         );
 
@@ -2341,11 +2362,11 @@ mod tests {
             let mut tree = txn.write_tree()?;
             let mut blobs = txn.write_blobs()?;
 
-            assert!(blobs.disk_usage()?.0 > 0);
+            assert!(blobs.disk_usage()?.total > 0);
 
             blobs.delete(&mut tree, &path)?;
 
-            assert_eq!(0, blobs.disk_usage()?.0);
+            assert_eq!(0, blobs.disk_usage()?.total);
         }
         txn.commit()?;
 
@@ -2393,25 +2414,31 @@ mod tests {
         let mut tree = txn.write_tree()?;
         let mut blobs = txn.write_blobs()?;
         assert_eq!(
-            (
-                INODE_DISK_USAGE * 4 + 4 * 4096,
-                INODE_DISK_USAGE * 4 + 4 * 4096,
-            ),
+            DiskUsage {
+                total: DiskUsage::INODE * 4 + 4 * 4096,
+                evictable: DiskUsage::INODE * 4 + 4 * 4096,
+            },
             blobs.disk_usage()?
         );
 
         blobs.cleanup(&mut tree, 8 * 4096)?; // does nothing
-        assert_eq!(INODE_DISK_USAGE * 4 + 4 * 4096, blobs.disk_usage()?.1);
+        assert_eq!(
+            DiskUsage::INODE * 4 + 4 * 4096,
+            blobs.disk_usage()?.evictable
+        );
 
-        blobs.cleanup(&mut tree, INODE_DISK_USAGE * 2 + 2 * 4096)?; // remove 2/4
-        assert_eq!(INODE_DISK_USAGE * 2 + 2 * 4096, blobs.disk_usage()?.1);
+        blobs.cleanup(&mut tree, DiskUsage::INODE * 2 + 2 * 4096)?; // remove 2/4
+        assert_eq!(
+            DiskUsage::INODE * 2 + 2 * 4096,
+            blobs.disk_usage()?.evictable
+        );
 
         // the 2 least recently accessed are the ones that were deleted
         assert!(blobs.get(&tree, inodes[2])?.is_none());
         assert!(blobs.get(&tree, inodes[1])?.is_none());
 
         blobs.cleanup(&mut tree, 0)?; // remove all
-        assert_eq!(0, blobs.disk_usage()?.1);
+        assert_eq!(0, blobs.disk_usage()?.evictable);
 
         for i in 0..4 {
             assert!(blobs.get(&tree, inodes[i])?.is_none(), "blob {i}");
@@ -2479,7 +2506,10 @@ mod tests {
         assert!(blobs.get(&tree, inodes[2])?.is_some());
         assert!(blobs.get(&tree, inodes[3])?.is_none());
 
-        assert_eq!(2 * INODE_DISK_USAGE + 2 * 4096, blobs.disk_usage()?.1);
+        assert_eq!(
+            2 * DiskUsage::INODE + 2 * 4096,
+            blobs.disk_usage()?.evictable
+        );
 
         // dropping open2 allows it to be deleted, but dropping open1 isn't enough
         drop(open1);
@@ -2870,15 +2900,33 @@ mod tests {
         let path = Path::parse("test.txt")?;
         let _blob_info = blobs.create(&mut tree, &marks, &path, &test_hash(), 100)?;
 
-        assert_eq!((INODE_DISK_USAGE, INODE_DISK_USAGE), blobs.disk_usage()?);
+        assert_eq!(
+            DiskUsage {
+                total: DiskUsage::INODE,
+                evictable: DiskUsage::INODE
+            },
+            blobs.disk_usage()?
+        );
 
         blobs.set_protected(&tree, &mut dirty, &path, true)?;
 
-        assert_eq!((INODE_DISK_USAGE, 0), blobs.disk_usage()?);
+        assert_eq!(
+            DiskUsage {
+                total: DiskUsage::INODE,
+                evictable: 0
+            },
+            blobs.disk_usage()?
+        );
 
         blobs.set_protected(&tree, &mut dirty, &path, false)?;
 
-        assert_eq!((INODE_DISK_USAGE, INODE_DISK_USAGE), blobs.disk_usage()?);
+        assert_eq!(
+            DiskUsage {
+                total: DiskUsage::INODE,
+                evictable: DiskUsage::INODE
+            },
+            blobs.disk_usage()?
+        );
 
         Ok(())
     }
