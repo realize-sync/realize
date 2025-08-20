@@ -314,7 +314,7 @@ impl<'a> WritableOpenBlob<'a> {
             }
 
             // Existing entry cannot be reuse; remove.
-            remove_from_queue(&mut self.blob_lru_queue_table, &mut self.blob_table, &e)?;
+            self.remove_from_queue(&e)?;
         }
         let blob_path = self.prepare_blob_file(inode, size)?;
         let queue = choose_queue(tree, marks, inode)?;
@@ -328,18 +328,8 @@ impl<'a> WritableOpenBlob<'a> {
             prev: None,
             disk_usage: 0,
         };
-        add_to_queue_front(
-            &mut self.blob_lru_queue_table,
-            &mut self.blob_table,
-            queue,
-            inode,
-            &mut entry,
-        )?;
-        update_disk_usage(
-            &mut self.blob_lru_queue_table,
-            &mut entry,
-            &blob_path.metadata()?,
-        )?;
+        self.add_to_queue_front(queue, inode, &mut entry)?;
+        self.update_disk_usage(&mut entry, &blob_path.metadata()?)?;
 
         log::debug!("Created blob {inode} {hash} in {queue:?} at {blob_path:?} -> {entry:?}");
         tree.insert_and_incref(inode, &mut self.blob_table, inode, Holder::new(&entry)?)?;
@@ -377,12 +367,7 @@ impl<'a> WritableOpenBlob<'a> {
             None => return Ok(()), // Nothing to delete
         };
 
-        remove_blob_entry(
-            &mut self.blob_table,
-            &mut self.blob_lru_queue_table,
-            tree,
-            inode,
-        )?;
+        self.remove_blob_entry(tree, inode)?;
         let blob_path = self.subsystem.blob_dir.join(inode.hex());
         if blob_path.exists() {
             std::fs::remove_file(&blob_path)?;
@@ -424,20 +409,10 @@ impl<'a> WritableOpenBlob<'a> {
         }
 
         // Remove from current queue
-        remove_from_queue(
-            &mut self.blob_lru_queue_table,
-            &mut self.blob_table,
-            &blob_entry,
-        )?;
+        self.remove_from_queue(&blob_entry)?;
 
         // Add to new queue
-        add_to_queue_front(
-            &mut self.blob_lru_queue_table,
-            &mut self.blob_table,
-            new_queue,
-            inode,
-            &mut blob_entry,
-        )?;
+        self.add_to_queue_front(new_queue, inode, &mut blob_entry)?;
 
         // Update the entry in the table
         self.blob_table
@@ -473,12 +448,7 @@ impl<'a> WritableOpenBlob<'a> {
             return Ok(false);
         }
 
-        remove_blob_entry(
-            &mut self.blob_table,
-            &mut self.blob_lru_queue_table,
-            tree,
-            inode,
-        )?;
+        self.remove_blob_entry(tree, inode)?;
         let blob_path = self.subsystem.blob_dir.join(inode.hex());
         std::fs::rename(blob_path, dest)?;
 
@@ -506,7 +476,7 @@ impl<'a> WritableOpenBlob<'a> {
         // metadata.
         entry.written_areas = ByteRanges::single(0, size);
         entry.verified = false;
-        update_disk_usage(&mut self.blob_lru_queue_table, &mut entry, metadata)?;
+        self.update_disk_usage(&mut entry, metadata)?;
         self.blob_table
             .insert(inode, Holder::with_content(entry)?)?;
 
@@ -544,12 +514,7 @@ impl<'a> WritableOpenBlob<'a> {
         }
 
         // Move to the front of the queue
-        move_to_front(
-            &mut self.blob_lru_queue_table,
-            &mut self.blob_table,
-            inode,
-            &mut blob_entry,
-        )?;
+        self.move_to_front(inode, &mut blob_entry)?;
 
         // Update the entry in the table
         self.blob_table
@@ -629,7 +594,7 @@ impl<'a> WritableOpenBlob<'a> {
         // Update disk usage if the blob file exists
         let blob_path = self.subsystem.blob_dir.join(inode.hex());
         if let Ok(metadata) = blob_path.metadata() {
-            update_disk_usage(&mut self.blob_lru_queue_table, &mut blob_entry, &metadata)?;
+            self.update_disk_usage(&mut blob_entry, &metadata)?;
         }
 
         self.blob_table
@@ -675,7 +640,7 @@ impl<'a> WritableOpenBlob<'a> {
                 "Evicted blob from WorkingArea: {current_id} ({} bytes)",
                 current.disk_usage
             );
-            remove_from_queue_update_entry(&mut self.blob_table, &current, &mut queue)?;
+            self.remove_from_queue_update_entry(&current, &mut queue)?;
             removed_count += 1;
             tree.remove_and_decref(current_id, &mut self.blob_table, current_id)?;
 
@@ -696,6 +661,152 @@ impl<'a> WritableOpenBlob<'a> {
                 .insert(LruQueueId::WorkingArea as u16, Holder::with_content(queue)?)?;
         }
 
+        Ok(())
+    }
+
+    /// Add a blob to the front of the WorkingArea queue.
+    fn add_to_queue_front(
+        &mut self,
+        queue_id: LruQueueId,
+        inode: Inode,
+        blob_entry: &mut BlobTableEntry,
+    ) -> Result<(), StorageError> {
+        let mut queue =
+            get_queue_if_available(&self.blob_lru_queue_table, queue_id)?.unwrap_or_default();
+        self.add_to_queue_front_update_entry(queue_id, inode, blob_entry, &mut queue)?;
+        self.blob_lru_queue_table
+            .insert(queue_id as u16, Holder::with_content(queue)?)?;
+
+        Ok(())
+    }
+
+    fn add_to_queue_front_update_entry(
+        &mut self,
+        queue_id: LruQueueId,
+        inode: Inode,
+        blob_entry: &mut BlobTableEntry,
+        queue: &mut QueueTableEntry,
+    ) -> Result<(), StorageError> {
+        blob_entry.queue = queue_id;
+        if let Some(head_id) = queue.head {
+            let mut head = follow_queue_link(&self.blob_table, head_id)?;
+            head.prev = Some(inode);
+
+            self.blob_table
+                .insert(head_id, Holder::with_content(head)?)?;
+        } else {
+            // This is the first node in the queue, so both the head
+            // and the tail
+            queue.tail = Some(inode);
+        }
+        blob_entry.next = queue.head;
+        queue.head = Some(inode);
+        blob_entry.prev = None;
+        queue.disk_usage += blob_entry.disk_usage;
+
+        Ok(())
+    }
+
+    /// Remove a blob from its queue.
+    fn remove_from_queue(&mut self, blob_entry: &BlobTableEntry) -> Result<(), StorageError> {
+        let queue_id = blob_entry.queue;
+
+        // Get the queue entry
+        let mut queue = get_queue_must_exist(&self.blob_lru_queue_table, queue_id)?;
+        self.remove_from_queue_update_entry(blob_entry, &mut queue)?;
+        self.blob_lru_queue_table
+            .insert(queue_id as u16, Holder::with_content(queue)?)?;
+
+        Ok(())
+    }
+
+    fn remove_from_queue_update_entry(
+        &mut self,
+        blob_entry: &BlobTableEntry,
+        queue: &mut QueueTableEntry,
+    ) -> Result<(), StorageError> {
+        if let Some(prev_id) = blob_entry.prev {
+            let mut prev = follow_queue_link(&self.blob_table, prev_id)?;
+            prev.next = blob_entry.next;
+            self.blob_table
+                .insert(prev_id, Holder::with_content(prev)?)?;
+        } else {
+            // This was the first node
+            queue.head = blob_entry.next;
+        }
+        if let Some(next_id) = blob_entry.next {
+            let mut next = follow_queue_link(&self.blob_table, next_id)?;
+            next.prev = blob_entry.prev;
+            self.blob_table
+                .insert(next_id, Holder::with_content(next)?)?;
+        } else {
+            // This was the last node
+            queue.tail = blob_entry.prev;
+        }
+        queue.disk_usage = queue.disk_usage.saturating_sub(blob_entry.disk_usage);
+        Ok(())
+    }
+    /// Update disk usage in the given blob entry and the total in its
+    /// containing table.
+    fn update_disk_usage(
+        &mut self,
+        entry: &mut BlobTableEntry,
+        metadata: &std::fs::Metadata,
+    ) -> Result<(), StorageError> {
+        let disk_usage = calculate_disk_usage(metadata);
+        let disk_usage_diff = disk_usage as i64 - (entry.disk_usage as i64);
+        if disk_usage_diff == 0 {
+            return Ok(());
+        }
+        entry.disk_usage = disk_usage;
+        self.update_total_disk_usage(entry.queue, disk_usage_diff)?;
+
+        Ok(())
+    }
+
+    fn update_total_disk_usage(
+        &mut self,
+        queue_id: LruQueueId,
+        diff: i64,
+    ) -> Result<(), StorageError> {
+        let mut entry = get_queue_must_exist(&self.blob_lru_queue_table, queue_id)?;
+        entry.disk_usage = entry.disk_usage.saturating_add_signed(diff);
+        self.blob_lru_queue_table
+            .insert(queue_id as u16, Holder::with_content(entry)?)?;
+        Ok(())
+    }
+
+    fn remove_blob_entry(
+        &mut self,
+        tree: &mut WritableOpenTree<'_>,
+        inode: Inode,
+    ) -> Result<(), StorageError> {
+        if let Some(entry) = get_blob_entry(&self.blob_table, inode)? {
+            self.remove_from_queue(&entry)?;
+            tree.remove_and_decref(inode, &mut self.blob_table, inode)?;
+        }
+
+        Ok(())
+    }
+
+    /// Move the blob to the front of its queue
+    fn move_to_front(
+        &mut self,
+        inode: Inode,
+        blob_entry: &mut BlobTableEntry,
+    ) -> Result<(), StorageError> {
+        if blob_entry.prev.is_none() {
+            // Already at the head of its queue
+            return Ok(());
+        }
+
+        log::debug!("{inode} moved to the front of {:?}", blob_entry.queue);
+        let queue_id = blob_entry.queue;
+        let mut queue = get_queue_must_exist(&self.blob_lru_queue_table, queue_id)?;
+        self.remove_from_queue_update_entry(blob_entry, &mut queue)?;
+        self.add_to_queue_front_update_entry(queue_id, inode, blob_entry, &mut queue)?;
+        self.blob_lru_queue_table
+            .insert(queue_id as u16, Holder::with_content(queue)?)?;
         Ok(())
     }
 }
@@ -796,80 +907,12 @@ fn choose_queue(
     Ok(queue)
 }
 
-/// Move the blob to the front of its queue
-fn move_to_front(
-    blob_lru_queue_table: &mut redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
-    blob_table: &mut redb::Table<'_, Inode, Holder<'static, BlobTableEntry>>,
-    inode: Inode,
-    blob_entry: &mut BlobTableEntry,
-) -> Result<(), StorageError> {
-    if blob_entry.prev.is_none() {
-        // Already at the head of its queue
-        return Ok(());
-    }
-
-    log::debug!("{inode} moved to the front of {:?}", blob_entry.queue);
-    let queue_id = blob_entry.queue;
-    remove_from_queue(blob_lru_queue_table, blob_table, blob_entry)?;
-    add_to_queue_front(
-        blob_lru_queue_table,
-        blob_table,
-        queue_id,
-        inode,
-        blob_entry,
-    )?;
-    Ok(())
-}
-
 /// Calculate disk usage for a blob file using Unix metadata.
 fn calculate_disk_usage(metadata: &std::fs::Metadata) -> u64 {
     // block() takes into account actual usage, not the whole file
     // size, which might be sparse. Include the inode size into the
     // computation.
     metadata.blocks() * 512 + DiskUsage::INODE
-}
-
-/// Update disk usage in the given blob entry and the total in its
-/// containing table.
-fn update_disk_usage(
-    blob_lru_queue_table: &mut redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
-    entry: &mut BlobTableEntry,
-    metadata: &std::fs::Metadata,
-) -> Result<(), StorageError> {
-    let disk_usage = calculate_disk_usage(metadata);
-    let disk_usage_diff = disk_usage as i64 - (entry.disk_usage as i64);
-    if disk_usage_diff == 0 {
-        return Ok(());
-    }
-    entry.disk_usage = disk_usage;
-    update_total_disk_usage(blob_lru_queue_table, entry.queue, disk_usage_diff)?;
-
-    Ok(())
-}
-
-fn update_total_disk_usage(
-    blob_lru_queue_table: &mut redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
-    queue_id: LruQueueId,
-    diff: i64,
-) -> Result<(), StorageError> {
-    let mut entry = get_queue_must_exist(blob_lru_queue_table, queue_id)?;
-    entry.disk_usage = entry.disk_usage.saturating_add_signed(diff);
-    blob_lru_queue_table.insert(queue_id as u16, Holder::with_content(entry)?)?;
-    Ok(())
-}
-
-fn remove_blob_entry(
-    blob_table: &mut redb::Table<'_, Inode, Holder<'static, BlobTableEntry>>,
-    blob_lru_queue_table: &mut redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
-    tree: &mut WritableOpenTree<'_>,
-    inode: Inode,
-) -> Result<(), StorageError> {
-    if let Some(entry) = get_blob_entry(blob_table, inode)? {
-        remove_from_queue(blob_lru_queue_table, blob_table, &entry)?;
-        tree.remove_and_decref(inode, blob_table, inode)?;
-    }
-
-    Ok(())
 }
 
 fn get_queue_if_available(
@@ -912,80 +955,6 @@ fn follow_queue_link(
 ) -> Result<BlobTableEntry, StorageError> {
     get_blob_entry(blob_table, inode)?
         .ok_or_else(|| StorageError::InconsistentDatabase(format!("invalid queue link {inode}")))
-}
-
-/// Add a blob to the front of the WorkingArea queue.
-fn add_to_queue_front(
-    blob_lru_queue_table: &mut redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
-    blob_table: &mut redb::Table<'_, Inode, Holder<'static, BlobTableEntry>>,
-    queue_id: LruQueueId,
-    inode: Inode,
-    blob_entry: &mut BlobTableEntry,
-) -> Result<(), StorageError> {
-    blob_entry.queue = queue_id;
-
-    let mut queue = get_queue_if_available(blob_lru_queue_table, queue_id)?.unwrap_or_default();
-    if let Some(head_id) = queue.head {
-        let mut head = follow_queue_link(blob_table, head_id)?;
-        head.prev = Some(inode);
-
-        blob_table.insert(head_id, Holder::with_content(head)?)?;
-    } else {
-        // This is the first node in the queue, so both the head
-        // and the tail
-        queue.tail = Some(inode);
-    }
-    blob_entry.next = queue.head;
-    queue.head = Some(inode);
-    blob_entry.prev = None;
-
-    // Update queue's total disk usage
-    queue.disk_usage += blob_entry.disk_usage;
-
-    blob_lru_queue_table.insert(queue_id as u16, Holder::with_content(queue)?)?;
-
-    Ok(())
-}
-
-/// Remove a blob from its queue.
-fn remove_from_queue(
-    blob_lru_queue_table: &mut redb::Table<'_, u16, Holder<'static, QueueTableEntry>>,
-    blob_table: &mut redb::Table<'_, Inode, Holder<'static, BlobTableEntry>>,
-    blob_entry: &BlobTableEntry,
-) -> Result<(), StorageError> {
-    let queue_id = blob_entry.queue;
-
-    // Get the queue entry
-    let mut queue = get_queue_must_exist(blob_lru_queue_table, queue_id)?;
-    remove_from_queue_update_entry(blob_table, blob_entry, &mut queue)?;
-    blob_lru_queue_table.insert(queue_id as u16, Holder::with_content(queue)?)?;
-
-    Ok(())
-}
-
-fn remove_from_queue_update_entry(
-    blob_table: &mut redb::Table<'_, Inode, Holder<'static, BlobTableEntry>>,
-    blob_entry: &BlobTableEntry,
-    queue: &mut QueueTableEntry,
-) -> Result<(), StorageError> {
-    if let Some(prev_id) = blob_entry.prev {
-        let mut prev = follow_queue_link(blob_table, prev_id)?;
-        prev.next = blob_entry.next;
-        blob_table.insert(prev_id, Holder::with_content(prev)?)?;
-    } else {
-        // This was the first node
-        queue.head = blob_entry.next;
-    }
-    if let Some(next_id) = blob_entry.next {
-        let mut next = follow_queue_link(blob_table, next_id)?;
-        next.prev = blob_entry.prev;
-        blob_table.insert(next_id, Holder::with_content(next)?)?;
-    } else {
-        // This was the last node
-        queue.tail = blob_entry.prev;
-    }
-    queue.disk_usage = queue.disk_usage.saturating_sub(blob_entry.disk_usage);
-    Ok(())
 }
 
 /// Error returned by Blob when reading outside the available range.
