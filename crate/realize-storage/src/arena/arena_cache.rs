@@ -10,7 +10,7 @@ use super::types::{
 };
 use crate::arena::notifier::{Notification, Progress};
 use crate::utils::fs_utils;
-use crate::utils::holder::{ByteConversionError, Holder};
+use crate::utils::holder::Holder;
 use crate::{Blob, InodeAssignment, LocalAvailability};
 use crate::{Inode, StorageError};
 use realize_types::{Arena, Hash, Path, Peer, UnixTime};
@@ -18,7 +18,6 @@ use redb::ReadableTable;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use uuid::Uuid;
 
 /// A per-arena cache of remote files.
 ///
@@ -28,7 +27,6 @@ pub(crate) struct ArenaCache {
     arena: Arena,
     arena_root: Inode,
     db: Arc<ArenaDatabase>,
-    uuid: Uuid,
 }
 
 impl ArenaCache {
@@ -69,12 +67,10 @@ impl ArenaCache {
         db: Arc<ArenaDatabase>,
         _blob_dir: &std::path::Path,
     ) -> Result<Arc<Self>, StorageError> {
-        let uuid = load_or_assign_uuid(&db)?;
         Ok(Arc::new(Self {
             arena,
             arena_root: db.tree().root(),
             db,
-            uuid,
         }))
     }
 
@@ -716,7 +712,7 @@ impl ArenaCache {
 
 impl RealIndex for ArenaCache {
     fn uuid(&self) -> &uuid::Uuid {
-        &self.uuid
+        &self.db.uuid()
     }
 
     fn arena(&self) -> Arena {
@@ -1099,27 +1095,6 @@ fn do_unmark_peer_file(
     Ok(())
 }
 
-fn load_or_assign_uuid(db: &Arc<ArenaDatabase>) -> Result<Uuid, StorageError> {
-    let txn = db.begin_write()?;
-    let mut settings_table = txn.settings_table()?;
-    if let Some(value) = settings_table.get("uuid")? {
-        let bytes: uuid::Bytes = value
-            .value()
-            .try_into()
-            .map_err(|_| ByteConversionError::Invalid("uuid"))?;
-
-        Ok(Uuid::from_bytes(bytes))
-    } else {
-        let uuid = Uuid::now_v7();
-        let bytes: &[u8] = uuid.as_bytes();
-        settings_table.insert("uuid", &bytes)?;
-        drop(settings_table);
-        txn.commit()?;
-
-        Ok(uuid)
-    }
-}
-
 /// Check whether the given inode exists in the cache and whether it
 /// is a file or a directory.
 fn inode_assignment(
@@ -1160,10 +1135,7 @@ mod tests {
     use crate::arena::tree::TreeReadOperations;
     use crate::arena::types::HistoryTableEntry;
     use crate::utils::hash;
-    use crate::utils::redb_utils;
-    use crate::{
-        FileMetadata, GlobalDatabase, Inode, InodeAllocator, InodeAssignment, StorageError,
-    };
+    use crate::{FileMetadata, Inode, InodeAssignment, StorageError};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Hash, Path, Peer, UnixTime};
@@ -2266,39 +2238,6 @@ mod tests {
     }
 
     // RealIndex trait tests
-    #[tokio::test]
-    async fn real_index_reopen_keeps_uuid() -> anyhow::Result<()> {
-        let tempdir = TempDir::new()?;
-        let arena = test_arena();
-        let path = tempdir.path().join("index.db");
-        let blob_dir = tempdir.child("blobs");
-        let allocator =
-            InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
-        let db = ArenaDatabase::new(
-            redb::Database::create(&path)?,
-            arena,
-            Arc::clone(&allocator),
-            blob_dir.path(),
-        )?;
-        let acache = ArenaCache::new(arena, db, blob_dir.path())?;
-        let uuid = acache.uuid().clone();
-
-        // Drop the first instance to release the database lock
-        drop(acache);
-
-        let db = ArenaDatabase::new(
-            redb::Database::create(&path)?,
-            arena,
-            Arc::clone(&allocator),
-            blob_dir.path(),
-        )?;
-        let acache = ArenaCache::new(arena, db, blob_dir.path())?;
-        assert!(!uuid.is_nil());
-        assert_eq!(uuid, acache.uuid().clone());
-
-        Ok(())
-    }
-
     #[tokio::test]
     async fn real_index_add_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;

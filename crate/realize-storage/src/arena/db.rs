@@ -10,13 +10,14 @@ use super::types::{
     MarkTableEntry, PeerTableEntry, QueueTableEntry,
 };
 use crate::StorageError;
-use crate::utils::holder::Holder;
+use crate::utils::holder::{ByteConversionError, Holder};
 use crate::{Inode, InodeAllocator};
 use realize_types::Arena;
-use redb::{ReadOnlyTable, Table, TableDefinition};
+use redb::{ReadOnlyTable, ReadableTable, Table, TableDefinition};
 use std::cell::RefCell;
 use std::panic::Location;
 use std::sync::Arc;
+use uuid::Uuid;
 
 /// Local file history.
 ///
@@ -29,7 +30,7 @@ const HISTORY_TABLE: TableDefinition<u64, Holder<HistoryTableEntry>> =
 ///
 /// Key: string
 /// Value: depends on the setting
-const SETTIGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("index.settings");
+const SETTINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("index.settings");
 
 /// Tree branches and leaves, associated to inodes.
 ///
@@ -162,6 +163,7 @@ const FAILED_JOB_TABLE: TableDefinition<u64, Holder<FailedJobTableEntry>> =
 
 pub(crate) struct ArenaDatabase {
     db: redb::Database,
+    uuid: Uuid,
     arena: Arena,
     subsystems: Subsystems,
 }
@@ -213,12 +215,13 @@ impl ArenaDatabase {
         let dirty: Dirty;
         let history: History;
         let blobs: Blobs;
+        let uuid: Uuid;
         let txn = db.begin_write()?;
         {
             // Create tables so they can safely be queried in read
             // transactions in an empty database.
             let history_table = txn.open_table(HISTORY_TABLE)?;
-            txn.open_table(SETTIGS_TABLE)?;
+            let mut settings_table = txn.open_table(SETTINGS_TABLE)?;
             txn.open_table(TREE_TABLE)?;
             txn.open_table(TREE_REFCOUNT_TABLE)?;
             txn.open_table(CACHE_TABLE)?;
@@ -238,12 +241,14 @@ impl ArenaDatabase {
             dirty = Dirty::new(&dirty_log_table)?;
             history = History::new(arena, &history_table)?;
             blobs = Blobs::new(blob_dir.as_ref(), &blob_lru_queue_table)?;
+            uuid = load_or_assign_uuid(&mut settings_table)?;
         }
         txn.commit()?;
 
         Ok(Arc::new(Self {
             db,
             arena,
+            uuid,
             subsystems: Subsystems {
                 tree,
                 dirty,
@@ -251,6 +256,10 @@ impl ArenaDatabase {
                 blobs,
             },
         }))
+    }
+
+    pub fn uuid(&self) -> &Uuid {
+        &self.uuid
     }
 
     #[allow(dead_code)]
@@ -327,12 +336,6 @@ impl<'db> ArenaWriteTransaction<'db> {
         self.inner.commit()?;
         self.after_commit.run_all();
         Ok(())
-    }
-
-    pub fn settings_table<'txn>(
-        &'txn self,
-    ) -> Result<Table<'txn, &'static str, &'static [u8]>, StorageError> {
-        Ok(self.inner.open_table(SETTIGS_TABLE)?)
     }
 
     pub fn cache_table<'txn>(
@@ -654,9 +657,31 @@ impl BeforeCommit {
     }
 }
 
+fn load_or_assign_uuid(
+    settings_table: &mut Table<'_, &'static str, &'static [u8]>,
+) -> Result<Uuid, StorageError> {
+    if let Some(value) = settings_table.get("uuid")? {
+        let bytes: uuid::Bytes = value
+            .value()
+            .try_into()
+            .map_err(|_| ByteConversionError::Invalid("uuid"))?;
+
+        Ok(Uuid::from_bytes(bytes))
+    } else {
+        let uuid = Uuid::now_v7();
+        let bytes: &[u8] = uuid.as_bytes();
+        settings_table.insert("uuid", &bytes)?;
+
+        Ok(uuid)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::{GlobalDatabase, utils::redb_utils};
+
     use super::*;
+    use assert_fs::TempDir;
     use realize_types::Arena;
     use redb::ReadableTable;
 
@@ -774,6 +799,37 @@ mod tests {
             ],
             result
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn reopen_keeps_uuid() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+        let tempdir = TempDir::new()?;
+        let dbpath = tempdir.join("myarena.db");
+        let blob_dir = tempdir.join("blobs");
+        let arena = Arena::from("myarena");
+        let allocator =
+            InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
+        let db = ArenaDatabase::new(
+            redb::Database::create(&dbpath)?,
+            arena,
+            Arc::clone(&allocator),
+            &blob_dir,
+        )?;
+
+        let uuid = db.uuid().clone();
+        assert!(!uuid.is_nil());
+        drop(db);
+
+        let db = ArenaDatabase::new(
+            redb::Database::create(&dbpath)?,
+            arena,
+            Arc::clone(&allocator),
+            &blob_dir,
+        )?;
+        assert_eq!(uuid, *db.uuid());
 
         Ok(())
     }
