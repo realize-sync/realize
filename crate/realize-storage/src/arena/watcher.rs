@@ -710,7 +710,7 @@ async fn only_regular(e: async_walkdir::DirEntry) -> async_walkdir::Filtering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arena::arena_cache::ArenaCache;
+    use crate::arena::db::ArenaDatabase;
     use crate::arena::index::IndexedFile;
     use crate::realize_types::Arena;
     use crate::utils::hash;
@@ -736,9 +736,9 @@ mod tests {
             root.create_dir_all()?;
 
             let arena = Arena::from("test");
-            let acache =
-                ArenaCache::for_testing_single_arena(arena, &std::path::Path::new("/dev/null"))?;
-            let index = RealIndexAsync::new(acache.as_index());
+            let db =
+                ArenaDatabase::for_testing_single_arena(arena, &std::path::Path::new("/dev/null"))?;
+            let index = RealIndexAsync::new(db);
 
             Ok(Self {
                 root,

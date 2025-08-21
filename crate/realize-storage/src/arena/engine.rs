@@ -613,7 +613,7 @@ mod tests {
     use crate::InodeAllocator;
     use crate::Notification;
     use crate::arena::arena_cache::ArenaCache;
-    use crate::arena::index::RealIndex;
+    use crate::arena::index;
     use crate::arena::mark;
     use crate::arena::tree::TreeLoc;
     use crate::utils::redb_utils;
@@ -635,7 +635,6 @@ mod tests {
         arena: Arena,
         db: Arc<ArenaDatabase>,
         acache: Arc<ArenaCache>,
-        index: Arc<dyn RealIndex>,
         engine: Arc<Engine>,
         _tempdir: TempDir,
     }
@@ -656,7 +655,6 @@ mod tests {
                 &blob_dir,
             )?;
             let acache = ArenaCache::new(arena, Arc::clone(&db), &blob_dir)?;
-            let index = acache.as_index();
             let engine = Engine::new(arena, Arc::clone(&db), Arc::clone(&acache), |attempt| {
                 if attempt < 3 {
                     Some(Duration::from_secs(attempt as u64 * 10))
@@ -669,7 +667,6 @@ mod tests {
                 arena,
                 db,
                 acache,
-                index,
                 engine,
                 _tempdir: tempdir,
             })
@@ -741,9 +738,13 @@ mod tests {
             T: AsRef<Path>,
         {
             let path = path.as_ref();
-            Ok(self
-                .index
-                .add_file(path, 100, UnixTime::from_secs(1234567889), hash)?)
+            Ok(index::add_file(
+                &self.db,
+                path,
+                100,
+                UnixTime::from_secs(1234567889),
+                hash,
+            )?)
         }
 
         fn update_cache(&self, notification: Notification) -> anyhow::Result<()> {

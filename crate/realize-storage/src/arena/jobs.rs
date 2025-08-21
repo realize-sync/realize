@@ -1,7 +1,6 @@
 use super::arena_cache::ArenaCache;
 use super::db::ArenaDatabase;
 use super::engine::{Engine, StorageJob};
-use super::index::RealIndex;
 use crate::arena::index;
 use crate::arena::tree::TreeExt;
 use crate::{Inode, JobId, JobStatus, StorageError};
@@ -16,7 +15,7 @@ pub(crate) struct StorageJobProcessor {
     db: Arc<ArenaDatabase>,
     engine: Arc<Engine>,
     cache: Arc<ArenaCache>,
-    index: Option<(Arc<dyn RealIndex>, PathBuf)>,
+    index_root: Option<PathBuf>,
 }
 
 impl StorageJobProcessor {
@@ -24,13 +23,13 @@ impl StorageJobProcessor {
         db: Arc<ArenaDatabase>,
         engine: Arc<Engine>,
         cache: Arc<ArenaCache>,
-        index: Option<(Arc<dyn RealIndex>, PathBuf)>,
+        index_root: Option<PathBuf>,
     ) -> Arc<Self> {
         Arc::new(Self {
             db,
             engine,
             cache,
-            index,
+            index_root,
         })
     }
 
@@ -103,7 +102,7 @@ impl StorageJobProcessor {
     /// versions in the cache or the current version in the index
     /// don't match `hash`.
     fn unrealize(&self, inode: Inode, hash: Hash) -> Result<JobStatus, StorageError> {
-        let (index_obj, root) = match &self.index {
+        let root = match &self.index_root {
             Some(ret) => ret,
             None => return Err(StorageError::NoLocalStorage(self.cache.arena())),
         };
@@ -143,7 +142,7 @@ impl StorageJobProcessor {
         // file after the move, a change that would
         // eventually be lost when the file in the cache
         // is verified.
-        if !index_obj.drop_file_if_matches(&txn, root, &path, &hash)? {
+        if !index::drop_file_if_matches(&txn, root, &path, &hash)? {
             return Ok(JobStatus::Abandoned("drop_file_if_matches"));
         }
 
@@ -182,7 +181,7 @@ impl StorageJobProcessor {
         cache_hash: Hash,
         index_hash: Option<Hash>,
     ) -> Result<JobStatus, StorageError> {
-        let (_, root) = match &self.index {
+        let root = match &self.index_root {
             Some(ret) => ret,
             None => return Err(StorageError::NoLocalStorage(self.cache.arena())),
         };
@@ -238,7 +237,6 @@ mod tests {
         arena: Arena,
         db: Arc<ArenaDatabase>,
         cache: Arc<ArenaCache>,
-        index: Arc<dyn RealIndex>,
         root: ChildPath,
         processor: Arc<StorageJobProcessor>,
         _tempdir: TempDir,
@@ -272,13 +270,12 @@ mod tests {
                     None
                 }
             });
-            let index = cache.as_index();
             let processor = StorageJobProcessor::new(
                 Arc::clone(&db),
                 Arc::clone(&engine),
                 Arc::clone(&cache),
                 if with_root {
-                    Some((cache.as_index(), root.to_path_buf()))
+                    Some(root.to_path_buf())
                 } else {
                     None
                 },
@@ -288,7 +285,6 @@ mod tests {
                 arena,
                 db,
                 cache,
-                index,
                 root,
                 processor,
                 _tempdir: tempdir,
@@ -304,9 +300,18 @@ mod tests {
 
             let path = Path::parse(path_str)?;
             let m = child.path().metadata()?;
-            self.index
-                .add_file(&path, m.len(), UnixTime::mtime(&m), hash::digest(content))?;
-            let entry = self.find_in_index(path_str)?.expect("{path_str} indexed");
+            index::add_file(
+                &self.db,
+                &path,
+                m.len(),
+                UnixTime::mtime(&m),
+                hash::digest(content),
+            )?;
+            let entry = {
+                let this = &self;
+                index::get_file(&this.db, &Path::parse(path_str)?)
+            }?
+            .expect("{path_str} indexed");
 
             Ok(entry.hash)
         }
@@ -370,7 +375,7 @@ mod tests {
         }
 
         fn find_in_index(&self, path_str: &str) -> Result<Option<IndexedFile>, StorageError> {
-            self.index.get_file(&Path::parse(path_str)?)
+            index::get_file(&self.db, &Path::parse(path_str)?)
         }
 
         fn find_in_cache(&self, path_str: &str) -> Result<Option<Inode>, StorageError> {

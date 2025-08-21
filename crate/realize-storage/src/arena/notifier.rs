@@ -219,7 +219,7 @@ pub async fn subscribe(
 
     tx.send(Notification::Connected {
         arena: index.arena(),
-        uuid: index.uuid().clone(),
+        uuid: *index.uuid(),
     })
     .await?;
 
@@ -386,7 +386,7 @@ async fn send_notifications(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arena::arena_cache::ArenaCache;
+    use crate::arena::db::ArenaDatabase;
     use crate::utils::hash;
     use std::time::Duration;
 
@@ -403,9 +403,9 @@ mod tests {
         async fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
             let arena = test_arena();
-            let acache =
-                ArenaCache::for_testing_single_arena(arena, &std::path::Path::new("/dev/null"))?;
-            let index = RealIndexAsync::new(acache.as_index());
+            let db =
+                ArenaDatabase::for_testing_single_arena(arena, &std::path::Path::new("/dev/null"))?;
+            let index = RealIndexAsync::new(db);
 
             Ok(Self {
                 index,
@@ -437,7 +437,7 @@ mod tests {
             subscribe(
                 self.index.clone(),
                 tx,
-                Some(Progress::new(self.index.uuid().clone(), index)),
+                Some(Progress::new(*self.index.uuid(), index)),
             )
             .await?;
             self.expect_connected(&mut rx).await?;
@@ -452,7 +452,7 @@ mod tests {
             assert_eq!(
                 Notification::Connected {
                     arena: test_arena(),
-                    uuid: self.index.uuid().clone()
+                    uuid: *self.index.uuid()
                 },
                 next(rx, "connected").await?
             );

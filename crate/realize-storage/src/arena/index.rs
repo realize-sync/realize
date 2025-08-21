@@ -1,8 +1,8 @@
 #![allow(dead_code)] // work in progress
 
-use super::db::ArenaWriteTransaction;
+use super::db::{ArenaDatabase, ArenaWriteTransaction};
 use super::dirty::WritableOpenDirty;
-use super::history::WritableOpenHistory;
+use super::history::{HistoryReadOperations, WritableOpenHistory};
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
 use super::types::{FileTableEntry, HistoryTableEntry};
 use crate::utils::fs_utils;
@@ -18,122 +18,26 @@ use tokio::task;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-/// Trait for index operations that abstracts over the implementation.
-pub trait RealIndex: Send + Sync {
-    /// Returns the database UUID.
-    ///
-    /// A UUID is set when a new database is created.
-    fn uuid(&self) -> &Uuid;
-
-    /// The arena tied to this index.
-    fn arena(&self) -> Arena;
-
-    /// Subscribe to a watch channel reporting the highest history entry index.
-    ///
-    /// Entries can be later queried using [RealIndex::history].
-    ///
-    /// The value itself is also available as [RealIndex::last_history_index].
-    fn watch_history(&self) -> watch::Receiver<u64>;
-
-    /// Index of the last history entry that was written.
-    ///
-    /// This is the value tracked by [RealIndex::watch_history].
-    fn last_history_index(&self) -> Result<u64, StorageError>;
-
-    /// Get a file entry.
-    fn get_file(&self, path: &realize_types::Path) -> Result<Option<IndexedFile>, StorageError>;
-
-    fn get_file_txn(
-        &self,
-        txn: &super::db::ArenaReadTransaction,
-        path: &realize_types::Path,
-    ) -> Result<Option<IndexedFile>, StorageError>;
-
-    /// Check whether a given file is in the index already.
-    fn has_file(&self, path: &realize_types::Path) -> Result<bool, StorageError>;
-
-    /// Check whether a given file is in the index with the given size and mtime.
-    fn has_matching_file(
-        &self,
-        path: &realize_types::Path,
-        size: u64,
-        mtime: UnixTime,
-    ) -> Result<bool, StorageError>;
-
-    /// Add a file entry with the given values. Replace one if it exists.
-    fn add_file(
-        &self,
-        path: &realize_types::Path,
-        size: u64,
-        mtime: UnixTime,
-        hash: Hash,
-    ) -> Result<(), StorageError>;
-
-    fn add_file_if_matches(
-        &self,
-        root: &std::path::Path,
-        path: &realize_types::Path,
-        size: u64,
-        mtime: UnixTime,
-        hash: Hash,
-    ) -> Result<bool, StorageError>;
-
-    fn remove_file_if_missing(
-        &self,
-        root: &std::path::Path,
-        path: &realize_types::Path,
-    ) -> Result<bool, StorageError>;
-
-    /// Send all valid entries of the file table to the given channel.
-    fn all_files(
-        &self,
-        tx: mpsc::Sender<(realize_types::Path, IndexedFile)>,
-    ) -> Result<(), StorageError>;
-
-    /// Grab a range of history entries.
-    fn history(
-        &self,
-        range: std::ops::Range<u64>,
-        tx: mpsc::Sender<Result<(u64, HistoryTableEntry), StorageError>>,
-    ) -> Result<(), StorageError>;
-
-    /// Remove a path that can be a file or a directory.
-    ///
-    /// If the path is a directory, all files within that directory
-    /// are removed, recursively.
-    fn remove_file_or_dir(&self, path: &realize_types::Path) -> Result<(), StorageError>;
-
-    /// Remove `path` from the index if the hash and file match,
-    /// report it as a drop in the history.
-    fn drop_file_if_matches(
-        &self,
-        txn: &ArenaWriteTransaction,
-        root: &std::path::Path,
-        path: &realize_types::Path,
-        hash: &Hash,
-    ) -> Result<bool, StorageError>;
-}
-
 #[derive(Clone)]
 pub struct RealIndexAsync {
-    inner: Arc<dyn RealIndex>,
+    db: Arc<ArenaDatabase>,
 }
 
 impl RealIndexAsync {
-    pub fn new(inner: Arc<dyn RealIndex>) -> Self {
-        Self { inner }
+    pub fn new(db: Arc<ArenaDatabase>) -> Self {
+        Self { db }
     }
 
     /// Returns the database UUID.
     ///
     /// A UUID is set when a new database is created.
     pub fn uuid(&self) -> &Uuid {
-        self.inner.uuid()
+        self.db.uuid()
     }
 
     /// The arena tied to this index.
     pub fn arena(&self) -> Arena {
-        self.inner.arena()
+        self.db.arena()
     }
 
     /// Subscribe to a watch channel reporting the highest history entry index.
@@ -142,29 +46,29 @@ impl RealIndexAsync {
     ///
     /// The value itself is also available as [RealIndexAsync::last_history_index].
     pub fn watch_history(&self) -> watch::Receiver<u64> {
-        self.inner.watch_history()
+        self.db.history().watch()
     }
 
     /// Index of the last history entry that was written.
     ///
     /// This is the value tracked by [RealIndexAsync::watch_history].
     pub async fn last_history_index(&self) -> Result<u64, StorageError> {
-        let inner = Arc::clone(&self.inner);
+        let db = Arc::clone(&self.db);
 
-        task::spawn_blocking(move || inner.last_history_index()).await?
+        task::spawn_blocking(move || last_history_index(&db)).await?
     }
 
     /// Return a reference to the underlying blocking instance.
-    pub fn blocking(&self) -> Arc<dyn RealIndex> {
-        Arc::clone(&self.inner)
+    pub fn blocking(&self) -> Arc<ArenaDatabase> {
+        Arc::clone(&self.db)
     }
 
     /// Return all valid file entries as a stream.
     pub fn all_files(&self) -> ReceiverStream<(realize_types::Path, IndexedFile)> {
         let (tx, rx) = mpsc::channel(100);
 
-        let inner = Arc::clone(&self.inner);
-        task::spawn_blocking(move || inner.all_files(tx));
+        let db = Arc::clone(&self.db);
+        task::spawn_blocking(move || all_files(&db, tx));
 
         ReceiverStream::new(rx)
     }
@@ -176,23 +80,13 @@ impl RealIndexAsync {
     ) -> ReceiverStream<Result<(u64, HistoryTableEntry), StorageError>> {
         let (tx, rx) = mpsc::channel(100);
 
-        let inner = Arc::clone(&self.inner);
+        let db = Arc::clone(&self.db);
         let range = Box::new(range);
         task::spawn_blocking(move || {
             let tx_clone = tx.clone();
-            // Convert the generic range to a concrete Range<u64>
-            let start = match range.start_bound() {
-                std::ops::Bound::Included(&x) => x,
-                std::ops::Bound::Excluded(&x) => x + 1,
-                std::ops::Bound::Unbounded => 0,
-            };
-            let end = match range.end_bound() {
-                std::ops::Bound::Included(&x) => x + 1,
-                std::ops::Bound::Excluded(&x) => x,
-                std::ops::Bound::Unbounded => u64::MAX,
-            };
-            let concrete_range = start..end;
-            if let Err(err) = inner.history(concrete_range, tx) {
+            let execute = || db.begin_read()?.read_history()?.history(*range, tx);
+
+            if let Err(err) = (execute)() {
                 // Send any global error to the channel, so it ends up
                 // in the stream instead of getting lost.
                 let _ = tx_clone.blocking_send(Err(err));
@@ -207,10 +101,10 @@ impl RealIndexAsync {
         &self,
         path: &realize_types::Path,
     ) -> Result<Option<IndexedFile>, StorageError> {
-        let inner = Arc::clone(&self.inner);
+        let db = Arc::clone(&self.db);
         let path = path.clone();
 
-        task::spawn_blocking(move || inner.get_file(&path)).await?
+        task::spawn_blocking(move || get_file(&db, &path)).await?
     }
 
     /// Check whether a given file is in the index already.
@@ -219,10 +113,10 @@ impl RealIndexAsync {
         T: AsRef<realize_types::Path>,
     {
         let path = path.as_ref();
-        let inner = Arc::clone(&self.inner);
+        let db = Arc::clone(&self.db);
         let path = path.clone();
 
-        task::spawn_blocking(move || inner.has_file(&path)).await?
+        task::spawn_blocking(move || has_file(&db, &path)).await?
     }
 
     /// Check whether a given file is in the index already with the given size and mtime.
@@ -232,11 +126,11 @@ impl RealIndexAsync {
         size: u64,
         mtime: UnixTime,
     ) -> Result<bool, StorageError> {
-        let inner = Arc::clone(&self.inner);
+        let db = Arc::clone(&self.db);
         let path = path.clone();
         let mtime = mtime.clone();
 
-        task::spawn_blocking(move || inner.has_matching_file(&path, size, mtime)).await?
+        task::spawn_blocking(move || has_matching_file(&db, &path, size, mtime)).await?
     }
 
     /// Remove a path that can be a file or a directory.
@@ -248,10 +142,10 @@ impl RealIndexAsync {
         T: AsRef<realize_types::Path>,
     {
         let path = path.as_ref();
-        let inner = Arc::clone(&self.inner);
+        let db = Arc::clone(&self.db);
         let path = path.clone();
 
-        task::spawn_blocking(move || inner.remove_file_or_dir(&path)).await?
+        task::spawn_blocking(move || remove_file_or_dir(&db, &path)).await?
     }
 
     pub async fn add_file(
@@ -261,11 +155,11 @@ impl RealIndexAsync {
         mtime: UnixTime,
         hash: Hash,
     ) -> Result<(), StorageError> {
-        let inner = Arc::clone(&self.inner);
+        let db = Arc::clone(&self.db);
         let path = path.clone();
         let mtime = mtime.clone();
 
-        task::spawn_blocking(move || inner.add_file(&path, size, mtime, hash)).await?
+        task::spawn_blocking(move || add_file(&db, &path, size, mtime, hash)).await?
     }
 
     pub async fn add_file_if_matches(
@@ -276,12 +170,12 @@ impl RealIndexAsync {
         mtime: UnixTime,
         hash: Hash,
     ) -> Result<bool, StorageError> {
-        let inner = Arc::clone(&self.inner);
+        let db = Arc::clone(&self.db);
         let path = path.clone();
         let mtime = mtime.clone();
         let root = root.to_path_buf();
 
-        task::spawn_blocking(move || inner.add_file_if_matches(&root, &path, size, mtime, hash))
+        task::spawn_blocking(move || add_file_if_matches(&db, &root, &path, size, mtime, hash))
             .await?
     }
 
@@ -290,11 +184,11 @@ impl RealIndexAsync {
         root: &std::path::Path,
         path: &realize_types::Path,
     ) -> Result<bool, StorageError> {
-        let inner = Arc::clone(&self.inner);
+        let db = Arc::clone(&self.db);
         let root = root.to_path_buf();
         let path = path.clone();
 
-        task::spawn_blocking(move || inner.remove_file_if_missing(&root, &path)).await?
+        task::spawn_blocking(move || remove_file_if_missing(&db, &root, &path)).await?
     }
 }
 
@@ -705,13 +599,193 @@ fn all(
     Ok(())
 }
 
+/// Index of the last history entry that was written.
+pub(crate) fn last_history_index(db: &Arc<ArenaDatabase>) -> Result<u64, StorageError> {
+    db.begin_read()?.read_history()?.last_history_index()
+}
+
+/// Get a file entry.
+pub(crate) fn get_file(
+    db: &Arc<ArenaDatabase>,
+    path: &realize_types::Path,
+) -> Result<Option<IndexedFile>, StorageError> {
+    let txn = db.begin_read()?;
+    let index = txn.read_index()?;
+    let tree = txn.read_tree()?;
+
+    index.get(&tree, path)
+}
+
+/// Check whether a given file is in the index already.
+pub(crate) fn has_file(
+    db: &Arc<ArenaDatabase>,
+    path: &realize_types::Path,
+) -> Result<bool, StorageError> {
+    let txn = db.begin_read()?;
+    let index = txn.read_index()?;
+    let tree = txn.read_tree()?;
+
+    index.has(&tree, path)
+}
+
+/// Check whether a given file is in the index with the given size and mtime.
+pub(crate) fn has_matching_file(
+    db: &Arc<ArenaDatabase>,
+    path: &realize_types::Path,
+    size: u64,
+    mtime: UnixTime,
+) -> Result<bool, StorageError> {
+    let txn = db.begin_read()?;
+    let index = txn.read_index()?;
+    let tree = txn.read_tree()?;
+    let ret = index.get(&tree, path)?.map(|e| e.matches(size, mtime));
+
+    Ok(ret.unwrap_or(false))
+}
+
+/// Add a file entry with the given values. Replace one if it exists.
+pub(crate) fn add_file(
+    db: &Arc<ArenaDatabase>,
+    path: &realize_types::Path,
+    size: u64,
+    mtime: UnixTime,
+    hash: Hash,
+) -> Result<(), StorageError> {
+    let txn = db.begin_write()?;
+    {
+        let mut index = txn.write_index()?;
+        let mut tree = txn.write_tree()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        index.add(&mut tree, &mut history, &mut dirty, path, size, mtime, hash)?;
+    }
+
+    txn.commit()?;
+
+    Ok(())
+}
+
+/// Add a file entry if it matches the file on disk.
+pub(crate) fn add_file_if_matches(
+    db: &Arc<ArenaDatabase>,
+    root: &std::path::Path,
+    path: &realize_types::Path,
+    size: u64,
+    mtime: UnixTime,
+    hash: Hash,
+) -> Result<bool, StorageError> {
+    if let Ok(m) = path.within(root).metadata()
+        && m.len() == size
+        && UnixTime::mtime(&m) == mtime
+    {
+        let txn = db.begin_write()?;
+        {
+            let mut index = txn.write_index()?;
+            let mut tree = txn.write_tree()?;
+            let mut dirty = txn.write_dirty()?;
+            let mut history = txn.write_history()?;
+            index.add(&mut tree, &mut history, &mut dirty, path, size, mtime, hash)?;
+        }
+        txn.commit()?;
+
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+/// Remove a file entry if the file is missing from disk.
+pub(crate) fn remove_file_if_missing(
+    db: &Arc<ArenaDatabase>,
+    root: &std::path::Path,
+    path: &realize_types::Path,
+) -> Result<bool, StorageError> {
+    let txn = db.begin_write()?;
+    if fs_utils::metadata_no_symlink_blocking(root, path).is_err() {
+        {
+            let mut tree = txn.write_tree()?;
+            let mut index = txn.write_index()?;
+            let mut dirty = txn.write_dirty()?;
+            let mut history = txn.write_history()?;
+            index.remove(&mut tree, &mut history, &mut dirty, path)?;
+        }
+        txn.commit()?;
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+/// Send all valid entries of the file table to the given channel.
+pub(crate) fn all_files(
+    db: &Arc<ArenaDatabase>,
+    tx: mpsc::Sender<(realize_types::Path, IndexedFile)>,
+) -> Result<(), StorageError> {
+    let txn = db.begin_read()?;
+    let index = txn.read_index()?;
+    index.all(tx)?;
+
+    Ok(())
+}
+
+/// Remove a path that can be a file or a directory.
+///
+/// If the path is a directory, all files within that directory
+/// are removed, recursively.
+pub(crate) fn remove_file_or_dir(
+    db: &Arc<ArenaDatabase>,
+    path: &realize_types::Path,
+) -> Result<(), StorageError> {
+    let txn = db.begin_write()?;
+    {
+        let mut tree = txn.write_tree()?;
+        let mut index = txn.write_index()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+        index.remove_file_or_dir(&mut tree, &mut history, &mut dirty, path)?;
+    }
+    txn.commit()?;
+
+    Ok(())
+}
+
+/// Remove `path` from the index if the hash and file match,
+/// report it as a drop in the history.
+pub(crate) fn drop_file_if_matches(
+    txn: &ArenaWriteTransaction,
+    root: &std::path::Path,
+    path: &realize_types::Path,
+    hash: &Hash,
+) -> Result<bool, StorageError> {
+    let mut tree = txn.write_tree()?;
+    let mut index = txn.write_index()?;
+    let mut dirty = txn.write_dirty()?;
+    let mut history = txn.write_history()?;
+
+    if let Some(inode) = tree.resolve(path)? {
+        if let Some(entry) = index.get_at_inode(inode)?
+            && entry.hash == *hash
+            && entry.matches_file(path.within(root))
+        {
+            index.drop(&mut tree, &mut history, &mut dirty, inode)?;
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::arena::db::ArenaDatabase;
     use crate::arena::dirty::DirtyReadOperations;
+    use crate::utils::hash;
+    use assert_fs::TempDir;
+    use assert_fs::prelude::*;
     use realize_types::Arena;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     struct Fixture {
@@ -1078,8 +1152,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn add_file_marks_dirty_and_adds_history() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn add_file_marks_dirty_and_adds_history() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let mtime = UnixTime::from_secs(1234567890);
         let path = Path::parse("foo/bar.txt")?;
@@ -1407,6 +1481,520 @@ mod tests {
         let entry = index.get(&tree, &path)?.unwrap();
         assert_eq!(entry.hash, file_hash);
         assert_eq!(entry.outdated_by, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn index_add_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        super::add_file(&fixture.db, &path, 100, mtime, Hash([0xfa; 32]))?;
+
+        // Verify the file was added
+        assert!(super::has_file(&fixture.db, &path)?);
+        let entry = super::get_file(&fixture.db, &path)?.unwrap();
+        assert_eq!(entry.size, 100);
+        assert_eq!(entry.mtime, mtime);
+        assert_eq!(entry.hash, Hash([0xfa; 32]));
+
+        Ok(())
+    }
+
+    #[test]
+    fn index_add_file_if_matches_success() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        // Create a file on disk
+        let tempdir = TempDir::new()?;
+        let file_path = tempdir.child("foo");
+        file_path.write_str("foo")?;
+
+        assert!(super::add_file_if_matches(
+            &fixture.db,
+            tempdir.path(),
+            &realize_types::Path::parse("foo")?,
+            3,
+            UnixTime::mtime(&file_path.path().metadata()?),
+            hash::digest("foo"),
+        )?);
+        assert!(super::has_file(
+            &fixture.db,
+            &realize_types::Path::parse("foo")?
+        )?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn index_add_file_if_matches_time_mismatch() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        // Create a file on disk
+        let tempdir = TempDir::new()?;
+        let file_path = tempdir.child("foo");
+        file_path.write_str("foo")?;
+
+        assert!(!super::add_file_if_matches(
+            &fixture.db,
+            tempdir.path(),
+            &realize_types::Path::parse("foo")?,
+            3,
+            UnixTime::from_secs(1234567890),
+            hash::digest("foo"),
+        )?);
+        assert!(!super::has_file(
+            &fixture.db,
+            &realize_types::Path::parse("foo")?
+        )?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn index_add_file_if_matches_size_mismatch() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        // Create a file on disk
+        let tempdir = TempDir::new()?;
+        let file_path = tempdir.child("foo");
+        file_path.write_str("foo")?;
+
+        assert!(!super::add_file_if_matches(
+            &fixture.db,
+            tempdir.path(),
+            &realize_types::Path::parse("foo")?,
+            2,
+            UnixTime::mtime(&file_path.path().metadata()?),
+            hash::digest("foo"),
+        )?);
+        assert!(!super::has_file(
+            &fixture.db,
+            &realize_types::Path::parse("foo")?
+        )?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn index_add_file_if_matches_missing() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        // Create a file on disk then remove it
+        let tempdir = TempDir::new()?;
+        let file_path = tempdir.child("foo");
+        file_path.write_str("foo")?;
+        let mtime = UnixTime::mtime(&file_path.path().metadata()?);
+        std::fs::remove_file(file_path.path())?;
+
+        assert!(!super::add_file_if_matches(
+            &fixture.db,
+            tempdir.path(),
+            &realize_types::Path::parse("foo")?,
+            3,
+            mtime,
+            hash::digest("foo"),
+        )?);
+        assert!(!super::has_file(
+            &fixture.db,
+            &realize_types::Path::parse("foo")?
+        )?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn index_replace_file_in_index() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        let mtime1 = UnixTime::from_secs(1234567890);
+        let mtime2 = UnixTime::from_secs(1234567891);
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        super::add_file(&fixture.db, &path, 100, mtime1, Hash([0xfa; 32]))?;
+        super::add_file(&fixture.db, &path, 200, mtime2, Hash([0x07; 32]))?;
+
+        // Verify the file was replaced
+        assert!(super::has_file(&fixture.db, &path)?);
+        let entry = super::get_file(&fixture.db, &path)?.unwrap();
+        assert_eq!(entry.size, 200);
+        assert_eq!(entry.mtime, mtime2);
+        assert_eq!(entry.hash, Hash([0x07; 32]));
+
+        Ok(())
+    }
+
+    #[test]
+    fn index_has_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("foo.txt")?;
+        super::add_file(&fixture.db, &path, 100, mtime, Hash([0xfa; 32]))?;
+
+        assert!(super::has_file(&fixture.db, &path)?);
+        assert!(!super::has_file(
+            &fixture.db,
+            &realize_types::Path::parse("bar.txt")?
+        )?);
+        assert!(!super::has_file(
+            &fixture.db,
+            &realize_types::Path::parse("other.txt")?
+        )?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn index_get_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("foo/bar")?;
+        let hash = Hash([0xfa; 32]);
+        super::add_file(&fixture.db, &path, 100, mtime, hash.clone())?;
+
+        let entry = super::get_file(&fixture.db, &path)?.unwrap();
+        assert_eq!(entry.size, 100);
+        assert_eq!(entry.mtime, mtime);
+        assert_eq!(entry.hash, hash);
+
+        Ok(())
+    }
+
+    #[test]
+    fn index_has_matching_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("foo/bar")?;
+        super::add_file(&fixture.db, &path, 100, mtime, Hash([0xfa; 32]))?;
+
+        assert!(super::has_matching_file(&fixture.db, &path, 100, mtime)?);
+        assert!(!super::has_matching_file(
+            &fixture.db,
+            &realize_types::Path::parse("other")?,
+            100,
+            mtime
+        )?);
+        assert!(!super::has_matching_file(&fixture.db, &path, 200, mtime)?);
+        assert!(!super::has_matching_file(
+            &fixture.db,
+            &path,
+            100,
+            UnixTime::from_secs(1234567891)
+        )?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn index_remove_file_or_dir() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        super::add_file(&fixture.db, &path, 100, mtime, Hash([0xfa; 32]))?;
+        super::remove_file_or_dir(&fixture.db, &path)?;
+
+        assert!(!super::has_file(&fixture.db, &path)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn index_remove_file_if_missing_success() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("bar.txt")?;
+        super::add_file(&fixture.db, &path, 100, mtime, Hash([0xfa; 32]))?;
+        assert!(super::remove_file_if_missing(
+            &fixture.db,
+            &std::path::Path::new("/tmp"),
+            &path
+        )?);
+
+        assert!(!super::has_file(&fixture.db, &path)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn index_remove_file_if_missing_failure() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("bar.txt")?;
+        super::add_file(&fixture.db, &path, 100, mtime, Hash([0xfa; 32]))?;
+
+        // Create the file on disk
+        let tempdir = TempDir::new()?;
+        let file_path = tempdir.child("bar.txt");
+        file_path.write_str("content")?;
+
+        assert!(!super::remove_file_if_missing(
+            &fixture.db,
+            tempdir.path(),
+            &path
+        )?);
+        assert!(super::has_file(&fixture.db, &path)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn index_remove_dir_from_index() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        let mtime = UnixTime::from_secs(1234567890);
+
+        super::add_file(
+            &fixture.db,
+            &realize_types::Path::parse("foo/a")?,
+            100,
+            mtime,
+            Hash([1; 32]),
+        )?;
+        super::add_file(
+            &fixture.db,
+            &realize_types::Path::parse("foo/b")?,
+            100,
+            mtime,
+            Hash([2; 32]),
+        )?;
+        super::add_file(
+            &fixture.db,
+            &realize_types::Path::parse("foo/c")?,
+            100,
+            mtime,
+            Hash([3; 32]),
+        )?;
+        super::add_file(
+            &fixture.db,
+            &realize_types::Path::parse("foobar")?,
+            100,
+            mtime,
+            Hash([0x04; 32]),
+        )?;
+
+        // Remove the directory
+        super::remove_file_or_dir(&fixture.db, &realize_types::Path::parse("foo")?)?;
+
+        // Verify all files in the directory were removed
+        assert!(!super::has_file(
+            &fixture.db,
+            &realize_types::Path::parse("foo/a")?
+        )?);
+        assert!(!super::has_file(
+            &fixture.db,
+            &realize_types::Path::parse("foo/b")?
+        )?);
+        assert!(!super::has_file(
+            &fixture.db,
+            &realize_types::Path::parse("foo/c")?
+        )?);
+
+        // But the file outside the directory should remain
+        assert!(super::has_file(
+            &fixture.db,
+            &realize_types::Path::parse("foobar")?
+        )?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn index_all_files() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        let mtime = UnixTime::from_secs(1234567890);
+        let path1 = realize_types::Path::parse("foo/a")?;
+        let path2 = realize_types::Path::parse("foo/b")?;
+        let path3 = realize_types::Path::parse("bar.txt")?;
+
+        super::add_file(&fixture.db, &path1, 100, mtime, Hash([1; 32]))?;
+        super::add_file(&fixture.db, &path2, 200, mtime, Hash([2; 32]))?;
+        super::add_file(&fixture.db, &path3, 300, mtime, Hash([3; 32]))?;
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let task = tokio::task::spawn_blocking({
+            let db = fixture.db.clone();
+
+            move || super::all_files(&db, tx)
+        });
+
+        let mut files = HashMap::new();
+        while let Some((path, entry)) = rx.recv().await {
+            files.insert(path, entry);
+        }
+        task.await??; // make sure there are no errors
+
+        assert_eq!(files.len(), 3);
+        assert!(files.contains_key(&path1));
+        assert!(files.contains_key(&path2));
+        assert!(files.contains_key(&path3));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn index_watch_history() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let db = fixture.db;
+
+        let mut rx = db.history().watch();
+        let initial = *rx.borrow();
+
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        super::add_file(&db, &path, 100, mtime, Hash([0xfa; 32]))?;
+
+        // Wait for the history to be updated
+        let timeout = tokio::time::Duration::from_millis(100);
+        let _ = tokio::time::timeout(timeout, rx.changed()).await;
+
+        let updated = *rx.borrow();
+        assert!(updated > initial);
+
+        Ok(())
+    }
+
+    #[test]
+    fn index_last_history_index() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        let initial = super::last_history_index(&fixture.db)?;
+
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = realize_types::Path::parse("foo/bar.txt")?;
+        super::add_file(&fixture.db, &path, 100, mtime, Hash([0xfa; 32]))?;
+
+        let updated = super::last_history_index(&fixture.db)?;
+        assert!(updated > initial);
+
+        Ok(())
+    }
+
+    #[test]
+    fn index_drop_file_if_matches_success() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        let path = realize_types::Path::parse("test.txt")?;
+        let content = "test content";
+        let hash = hash::digest(content);
+
+        // Add file to index
+        super::add_file(
+            &fixture.db,
+            &path,
+            content.len() as u64,
+            UnixTime::from_secs(1234567890),
+            hash.clone(),
+        )?;
+
+        // Verify file exists in index
+        assert!(super::has_file(&fixture.db, &path)?);
+
+        // Get the initial history count
+        let initial_history_count = super::last_history_index(&fixture.db)?;
+
+        // Try to drop the file - this should fail because file doesn't exist on disk
+        // but the test is checking that the method returns the correct result
+        {
+            let txn = fixture.db.begin_write()?;
+            let result =
+                super::drop_file_if_matches(&txn, std::path::Path::new("/tmp"), &path, &hash)?;
+            // The method should return false because file_matches_index will fail
+            // since the file doesn't exist on disk at /tmp/test.txt
+            assert!(!result);
+            txn.commit()?;
+        }
+
+        // Verify file still exists in index (since drop failed)
+        assert!(super::has_file(&fixture.db, &path)?);
+
+        // Verify no new history entry was created
+        let final_history_count = super::last_history_index(&fixture.db)?;
+        assert_eq!(initial_history_count, final_history_count);
+
+        Ok(())
+    }
+
+    #[test]
+    fn index_drop_file_if_matches_wrong_hash() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        let path = realize_types::Path::parse("test.txt")?;
+        let content = "test content";
+        let hash = hash::digest(content);
+        let wrong_hash = hash::digest("wrong content");
+
+        // Add file to index
+        super::add_file(
+            &fixture.db,
+            &path,
+            content.len() as u64,
+            UnixTime::from_secs(1234567890),
+            hash.clone(),
+        )?;
+
+        // Verify file exists in index
+        assert!(super::has_file(&fixture.db, &path)?);
+
+        // Get the initial history count
+        let initial_history_count = super::last_history_index(&fixture.db)?;
+
+        // Try to drop the file with wrong hash
+        {
+            let txn = fixture.db.begin_write()?;
+            let result = super::drop_file_if_matches(
+                &txn,
+                std::path::Path::new("/tmp"),
+                &path,
+                &wrong_hash,
+            )?;
+            assert!(!result);
+            txn.commit()?;
+        }
+
+        // Verify file still exists in index
+        assert!(super::has_file(&fixture.db, &path)?);
+
+        // Verify no new history entry was created
+        let final_history_count = super::last_history_index(&fixture.db)?;
+        assert_eq!(initial_history_count, final_history_count);
+
+        Ok(())
+    }
+
+    #[test]
+    fn index_drop_file_if_matches_file_not_in_index() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        let path = realize_types::Path::parse("test.txt")?;
+        let hash = hash::digest("test content");
+
+        // Verify file doesn't exist in index
+        assert!(!super::has_file(&fixture.db, &path)?);
+
+        // Get the initial history count
+        let initial_history_count = super::last_history_index(&fixture.db)?;
+
+        // Try to drop the file
+        {
+            let txn = fixture.db.begin_write()?;
+            let result =
+                super::drop_file_if_matches(&txn, std::path::Path::new("/tmp"), &path, &hash)?;
+            assert!(!result);
+            txn.commit()?;
+        }
+
+        // Verify file still doesn't exist in index
+        assert!(!super::has_file(&fixture.db, &path)?);
+
+        // Verify no new history entry was created
+        let final_history_count = super::last_history_index(&fixture.db)?;
+        assert_eq!(initial_history_count, final_history_count);
 
         Ok(())
     }

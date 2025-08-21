@@ -114,7 +114,7 @@ pub(crate) async fn rsync(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arena::arena_cache::ArenaCache;
+    use crate::arena::db::ArenaDatabase;
     use crate::utils::hash;
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
@@ -141,9 +141,8 @@ mod tests {
             root.create_dir_all()?;
 
             let arena = test_arena();
-            let arena_cache =
-                ArenaCache::for_testing_single_arena(arena, &tempdir.path().join("blobs"))?;
-            let index = RealIndexAsync::new(arena_cache.as_index());
+            let db = ArenaDatabase::for_testing_single_arena(arena, &tempdir.path().join("blobs"))?;
+            let index = RealIndexAsync::new(db);
 
             Ok(Self {
                 index,
