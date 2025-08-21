@@ -19,9 +19,6 @@ pub enum StorageError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("I/O error: {0}")]
-    NixIo(#[from] nix::errno::Errno),
-
     #[error("bincode error: {0}")]
     ByteConversion(#[from] ByteConversionError),
 
@@ -74,6 +71,13 @@ impl StorageError {
     }
 }
 
+impl From<nix::errno::Errno> for StorageError {
+    fn from(errno: nix::errno::Errno) -> Self {
+        let ioerr: std::io::Error = errno.into();
+
+        StorageError::from(ioerr)
+    }
+}
 impl From<redb::Error> for StorageError {
     fn from(value: redb::Error) -> Self {
         StorageError::from_redb(value)
