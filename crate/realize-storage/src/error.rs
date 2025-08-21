@@ -10,16 +10,19 @@ use tokio::task::JoinError;
 /// needed to OS I/O errors.
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
-    #[error("redb error {0}")]
+    #[error("redb error: {0}")]
     Database(Box<redb::Error>), // a box to keep size in check
 
     #[error("{0}, from {1}")]
     OpenTable(redb::TableError, &'static Location<'static>),
 
-    #[error("I/O error {0}")]
+    #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("bincode error {0}")]
+    #[error("I/O error: {0}")]
+    NixIo(#[from] nix::errno::Errno),
+
+    #[error("bincode error: {0}")]
     ByteConversion(#[from] ByteConversionError),
 
     #[error{"data not available at this time"}]

@@ -14,6 +14,7 @@ use watcher::RealWatcher;
 
 pub mod arena_cache;
 pub mod blob;
+mod cleaner;
 pub mod db;
 mod dirty;
 pub mod engine;
@@ -74,6 +75,14 @@ impl ArenaStorage {
                     .max_parallel_hashers(arena_config.max_parallel_hashers.unwrap_or(4))
                     .spawn()
                     .await?;
+                if let Some(limits) = &arena_config.disk_usage {
+                    tokio::spawn({
+                        let db = Arc::clone(&db);
+                        let limits = limits.clone();
+
+                        async move { cleaner::run_loop(db, limits).await }
+                    });
+                }
 
                 Some(IndexedArenaStorage {
                     root: root.to_path_buf(),

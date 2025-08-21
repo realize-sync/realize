@@ -52,6 +52,17 @@ impl Blobs {
     pub(crate) fn watch_disk_usage(&self) -> watch::Receiver<DiskUsage> {
         self.tx.subscribe()
     }
+
+    /// Return total and available disk space on FS for the blob directory
+    pub(crate) fn disk_space(&self) -> Result<(u64, u64), StorageError> {
+        let stat = nix::sys::statvfs::statvfs(&self.blob_dir)?;
+        let unit = stat.fragment_size();
+
+        Ok((
+            stat.blocks() * unit as u64,
+            stat.blocks_free() * unit as u64,
+        ))
+    }
 }
 
 pub(crate) struct ReadableOpenBlob<T, TQ>
@@ -148,6 +159,11 @@ impl DiskUsage {
     // look like empty files are free. This is arbitrary and might not
     // correspond to the actual value, as it depends on the filesystem.
     pub(crate) const INODE: u64 = 512;
+
+    // How many bytes cannot be cleaned up by evicting blobs.
+    pub(crate) fn non_evictable(&self) -> u64 {
+        self.total.saturating_sub(self.evictable)
+    }
 }
 
 /// Public information about the blob.
@@ -659,6 +675,8 @@ impl<'a> WritableOpenBlob<'a> {
     }
 
     /// Delete blobs as necessary to reach the target total size, in bytes.
+    ///
+    /// Returns the final disk usage.
     pub(crate) fn cleanup(
         &mut self,
         tree: &mut WritableOpenTree,
@@ -713,7 +731,7 @@ impl<'a> WritableOpenBlob<'a> {
 
         if removed_count > 0 {
             self.blob_lru_queue_table
-                .insert(LruQueueId::WorkingArea as u16, Holder::with_content(queue)?)?;
+                .insert(LruQueueId::WorkingArea as u16, Holder::new(&queue)?)?;
             self.report_disk_usage_changed();
         }
 

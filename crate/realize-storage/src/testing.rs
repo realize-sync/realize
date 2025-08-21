@@ -29,6 +29,8 @@ where
                         // Disabled in tests
                         debounce_secs: Some(0),
                         max_parallel_hashers: Some(0),
+
+                        ..Default::default()
                     },
                 )
             })

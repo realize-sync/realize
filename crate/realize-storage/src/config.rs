@@ -61,6 +61,14 @@ pub struct ArenaConfig {
     /// Set debounce delay for hashing files. This allows some time for
     /// operations in progress to finish.
     pub debounce_secs: Option<u64>,
+
+    /// Limits how much disk space will be used to store local copies
+    /// of remote data.
+    ///
+    /// Note that it might not be possible to enforce this limitation:
+    /// if the size of files to keep goes above that limit, those
+    /// files are kept anyways.
+    pub disk_usage: Option<DiskUsageLimits>,
 }
 
 impl ArenaConfig {
@@ -90,4 +98,39 @@ impl ArenaConfig {
             ..Default::default()
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct DiskUsageLimits {
+    /// Try to use at most that many bytes or percent of disk.
+    ///
+    /// The cache can temporarily go above that value.
+    pub max: BytesOrPercent,
+
+    /// Reduce disk usage to keep at keep that many bytes or percent
+    /// of the disk free on the disk.
+    ///
+    /// This is applied after the `max` value.
+    pub leave: Option<BytesOrPercent>,
+}
+
+impl DiskUsageLimits {
+    pub fn max_bytes(v: u64) -> DiskUsageLimits {
+        Self {
+            max: BytesOrPercent::Bytes(v),
+            leave: None,
+        }
+    }
+    pub fn max_percent(v: u32) -> DiskUsageLimits {
+        Self {
+            max: BytesOrPercent::Percent(v),
+            leave: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum BytesOrPercent {
+    Percent(u32),
+    Bytes(u64),
 }

@@ -1784,6 +1784,7 @@ dependencies = [
  "fast_rsync",
  "futures",
  "log",
+ "nix",
  "notify",
  "realize-types",
  "redb",
