@@ -348,8 +348,7 @@ mod tests {
     use super::*;
     use crate::rpc::testing::HouseholdFixture;
     use nfsserve::nfs::nfsstring;
-    use realize_storage::{Notification, utils::hash};
-    use realize_types::{Hash, Path};
+    use realize_storage::utils::hash;
     use std::time::SystemTime;
     use tokio::fs;
 
@@ -431,19 +430,11 @@ mod tests {
                 let cache = fixture.cache(a)?;
                 let fs = UnrealFs::new(cache.clone(), Downloader::new(household_a, cache.clone()));
 
-                let mtime = UnixTime::now();
-                cache
-                    .update(
-                        b,
-                        Notification::Add {
-                            index: 1,
-                            arena: HouseholdFixture::test_arena(),
-                            path: Path::parse("somefile.txt")?,
-                            size: 5,
-                            mtime: mtime.clone(),
-                            hash: Hash([1u8; 32]),
-                        },
-                    )
+                fixture.write_file(b, "somefile.txt", "test!").await?;
+                let mtime =
+                    UnixTime::mtime(&fixture.arena_root(b).join("somefile.txt").metadata()?);
+                fixture
+                    .wait_for_file_in_cache(a, "somefile.txt", &hash::digest("test!"))
                     .await?;
 
                 let arena_root = cache
