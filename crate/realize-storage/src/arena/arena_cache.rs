@@ -230,14 +230,14 @@ impl<'a> WritableOpenCache<'a> {
         size: u64,
         hash: Hash,
     ) -> Result<(), StorageError> {
-        let (_, file_inode) = do_create_file(&mut self.table, tree, &path)?;
+        let (_, file_inode) = create_file(&mut self.table, tree, &path)?;
         let entry = FileTableEntry::new(path, size, mtime, hash);
         if get_file_entry(&self.table, file_inode, Some(peer))?.is_none() {
-            self.do_write_file_entry(file_inode, peer, &entry)?;
+            self.write_file_entry(file_inode, peer, &entry)?;
         }
         Ok(
             if get_file_entry(&self.table, file_inode, None)?.is_none() {
-                self.do_write_default_file_entry(tree, blobs, dirty, file_inode, &entry)?;
+                self.write_default_file_entry(tree, blobs, dirty, file_inode, &entry)?;
             },
         )
     }
@@ -255,17 +255,17 @@ impl<'a> WritableOpenCache<'a> {
         hash: &Hash,
         old_hash: &Hash,
     ) -> Result<(), StorageError> {
-        let (_, file_inode) = do_create_file(&mut self.table, tree, &path)?;
+        let (_, file_inode) = create_file(&mut self.table, tree, &path)?;
         let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
         if let Some(e) = get_file_entry(&self.table, file_inode, Some(peer))?
             && e.hash == *old_hash
         {
-            self.do_write_file_entry(file_inode, peer, &entry)?;
+            self.write_file_entry(file_inode, peer, &entry)?;
         }
         if let Some(old_entry) = get_file_entry(&self.table, file_inode, None)?
             && old_entry.hash == *old_hash
         {
-            self.do_write_default_file_entry(tree, blobs, dirty, file_inode, &entry)?;
+            self.write_default_file_entry(tree, blobs, dirty, file_inode, &entry)?;
         }
         Ok(())
     }
@@ -280,7 +280,7 @@ impl<'a> WritableOpenCache<'a> {
         path: &Path,
         old_hash: &Hash,
     ) -> Result<(), StorageError> {
-        self.do_unlink(tree, blobs, dirty, peer, &path, old_hash.clone())?;
+        self.unlink(tree, blobs, dirty, peer, &path, old_hash.clone())?;
 
         Ok(())
     }
@@ -295,7 +295,7 @@ impl<'a> WritableOpenCache<'a> {
         path: Path,
         old_hash: Hash,
     ) -> Result<(), StorageError> {
-        self.do_unlink(tree, blobs, dirty, peer, &path, old_hash)?;
+        self.unlink(tree, blobs, dirty, peer, &path, old_hash)?;
         Ok(())
     }
 
@@ -325,18 +325,18 @@ impl<'a> WritableOpenCache<'a> {
         size: u64,
         hash: Hash,
     ) -> Result<(), StorageError> {
-        let (_, file_inode) = do_create_file(&mut self.table, tree, &path)?;
-        do_unmark_peer_file(&mut self.pending_catchup_table, peer, file_inode)?;
+        let (_, file_inode) = create_file(&mut self.table, tree, &path)?;
+        unmark_peer_file(&mut self.pending_catchup_table, peer, file_inode)?;
         let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
         if let Some(e) = get_file_entry(&self.table, file_inode, None)?
             && e.hash != hash
         {
-            self.do_unlink(tree, blobs, dirty, peer, &path, e.hash)?;
+            self.unlink(tree, blobs, dirty, peer, &path, e.hash)?;
         }
-        self.do_write_file_entry(file_inode, peer, &entry)?;
+        self.write_file_entry(file_inode, peer, &entry)?;
         Ok(
             if !get_file_entry(&self.table, file_inode, None)?.is_some() {
-                self.do_write_default_file_entry(tree, blobs, dirty, file_inode, &entry)?;
+                self.write_default_file_entry(tree, blobs, dirty, file_inode, &entry)?;
             },
         )
     }
@@ -349,12 +349,12 @@ impl<'a> WritableOpenCache<'a> {
         dirty: &mut WritableOpenDirty,
         peer: Peer,
     ) -> Result<(), StorageError> {
-        self.do_delete_marked_files(tree, blobs, dirty, peer)?;
+        self.delete_marked_files(tree, blobs, dirty, peer)?;
         Ok(())
     }
 
     /// Write a file entry for a specific peer.
-    fn do_write_file_entry(
+    fn write_file_entry(
         &mut self,
         file_inode: Inode,
         peer: Peer,
@@ -376,7 +376,7 @@ impl<'a> WritableOpenCache<'a> {
     }
 
     /// Write the default file entry.
-    fn do_write_default_file_entry(
+    fn write_default_file_entry(
         &mut self,
         tree: &mut WritableOpenTree,
         blobs: &mut WritableOpenBlob,
@@ -415,7 +415,7 @@ impl<'a> WritableOpenCache<'a> {
 
     /// Remove a file entry for a specific peer and update or remove
     /// the corresponding default entry, as necessary.
-    fn do_rm_file_entry(
+    fn rm_file_entry(
         &mut self,
         tree: &mut WritableOpenTree,
         blobs: &mut WritableOpenBlob,
@@ -473,7 +473,7 @@ impl<'a> WritableOpenCache<'a> {
         let new_entry = peer_entries.into_iter().max_by_key(|e| e.mtime);
         match new_entry {
             Some(new_entry) => {
-                self.do_write_default_file_entry(tree, blobs, dirty, inode, &new_entry)?;
+                self.write_default_file_entry(tree, blobs, dirty, inode, &new_entry)?;
             }
             None => {
                 self.before_default_file_entry_change(tree, blobs, dirty, inode)?;
@@ -497,7 +497,7 @@ impl<'a> WritableOpenCache<'a> {
     }
 
     /// Unlink a file from a peer.
-    fn do_unlink<T>(
+    fn unlink<T>(
         &mut self,
         tree: &mut WritableOpenTree,
         blobs: &mut WritableOpenBlob,
@@ -522,7 +522,7 @@ impl<'a> WritableOpenCache<'a> {
                 if let Some(e) = get_file_entry(&self.table, inode, Some(peer))?
                     && e.hash == old_hash
                 {
-                    self.do_rm_file_entry(tree, blobs, dirty, parent_inode, inode, peer)?;
+                    self.rm_file_entry(tree, blobs, dirty, parent_inode, inode, peer)?;
                 }
             }
         }
@@ -531,7 +531,7 @@ impl<'a> WritableOpenCache<'a> {
     }
 
     /// Delete all marked files for a peer.
-    fn do_delete_marked_files(
+    fn delete_marked_files(
         &mut self,
         tree: &mut WritableOpenTree,
         blobs: &mut WritableOpenBlob,
@@ -552,7 +552,7 @@ impl<'a> WritableOpenCache<'a> {
         }
         for inode in inodes {
             if let Some(parent_inode) = tree.parent(inode)? {
-                self.do_rm_file_entry(tree, blobs, dirty, parent_inode, inode, peer)?;
+                self.rm_file_entry(tree, blobs, dirty, parent_inode, inode, peer)?;
             }
         }
         Ok(())
@@ -944,7 +944,7 @@ fn get_default_entry_or_err(
 /// Retrieve or create a file entry at the given path.
 ///
 /// Return the parent inode and the file inode.
-fn do_create_file<T>(
+fn create_file<T>(
     cache_table: &mut redb::Table<'_, CacheTableKey, Holder<CacheTableEntry>>,
     tree: &mut WritableOpenTree,
     path: T,
@@ -1003,7 +1003,7 @@ fn setup_dir(
     Ok(inode)
 }
 
-fn do_unmark_peer_file(
+fn unmark_peer_file(
     pending_catchup_table: &mut Table<'_, (&'static str, Inode), ()>,
     peer: Peer,
     inode: Inode,
