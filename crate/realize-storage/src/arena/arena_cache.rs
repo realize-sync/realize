@@ -188,28 +188,7 @@ impl ArenaCache {
                 hash,
                 ..
             } => {
-                do_update_last_seen_notification(&txn, peer, index)?;
-
-                let mut cache_table = txn.cache_table()?;
-                let mut tree = txn.write_tree()?;
-                let (_, file_inode) = do_create_file(&mut cache_table, &mut tree, &path)?;
-                let entry = FileTableEntry::new(path, size, mtime, hash);
-
-                // add peer
-                if get_file_entry(&cache_table, file_inode, Some(peer))?.is_none() {
-                    self.do_write_file_entry(&mut cache_table, file_inode, peer, &entry)?;
-                }
-
-                // add default
-                if get_file_entry(&cache_table, file_inode, None)?.is_none() {
-                    self.do_write_default_file_entry(
-                        &txn,
-                        &mut tree,
-                        &mut cache_table,
-                        file_inode,
-                        &entry,
-                    )?;
-                }
+                self.add(peer, &txn, index, path, mtime, size, hash)?;
             }
             Notification::Replace {
                 index,
@@ -220,35 +199,7 @@ impl ArenaCache {
                 old_hash,
                 ..
             } => {
-                do_update_last_seen_notification(&txn, peer, index)?;
-                let mut cache_table = txn.cache_table()?;
-                let mut tree = txn.write_tree()?;
-                let (_, file_inode) = do_create_file(&mut cache_table, &mut tree, &path)?;
-                let entry = FileTableEntry::new(path, size, mtime, hash.clone());
-
-                // replace peer
-                if let Some(e) = get_file_entry(&cache_table, file_inode, Some(peer))?
-                    && e.hash == old_hash
-                {
-                    self.do_write_file_entry(&mut cache_table, file_inode, peer, &entry)?;
-                }
-
-                // replace default
-                if let Some(old_entry) = get_file_entry(&cache_table, file_inode, None)?
-                    && old_entry.hash == old_hash
-                {
-                    self.do_write_default_file_entry(
-                        &txn,
-                        &mut tree,
-                        &mut cache_table,
-                        file_inode,
-                        &entry,
-                    )?;
-                }
-
-                // replace local
-                let mut index = txn.write_index()?;
-                index.record_outdated(&tree, file_inode, &old_hash, &hash)?;
+                self.replace(peer, &txn, index, path, mtime, size, hash, old_hash)?;
             }
             Notification::Remove {
                 index,
@@ -256,26 +207,7 @@ impl ArenaCache {
                 old_hash,
                 ..
             } => {
-                do_update_last_seen_notification(&txn, peer, index)?;
-
-                self.do_unlink(&txn, peer, &path, old_hash.clone())?;
-
-                // remove local
-                if let Some(index_root) = index_root {
-                    let tree = txn.read_tree()?;
-                    let index = txn.read_index()?;
-
-                    if let Some(indexed) = index.get(&tree, &path)?
-                        && indexed.is_outdated_by(&old_hash)
-                        && indexed.matches_file(path.within(&index_root))
-                    {
-                        // This specific version has been removed
-                        // remotely. Make sure that the file hasn't
-                        // changed since it was indexed and if it hasn't,
-                        // remove it locally as well.
-                        std::fs::remove_file(&path.within(index_root))?;
-                    }
-                }
+                self.remove(peer, index_root, &txn, index, path, old_hash)?;
             }
             Notification::Drop {
                 index,
@@ -283,12 +215,10 @@ impl ArenaCache {
                 old_hash,
                 ..
             } => {
-                do_update_last_seen_notification(&txn, peer, index)?;
-
-                self.do_unlink(&txn, peer, &path, old_hash)?;
+                self.drop(peer, &txn, index, path, old_hash)?;
             }
             Notification::CatchupStart(_) => {
-                do_mark_peer_files(&txn, peer)?;
+                catchup_start(&txn, peer)?;
             }
             Notification::Catchup {
                 path,
@@ -297,54 +227,164 @@ impl ArenaCache {
                 hash,
                 ..
             } => {
-                let mut cache_table = txn.cache_table()?;
-                let mut tree = txn.write_tree()?;
-                let (_, file_inode) = do_create_file(&mut cache_table, &mut tree, &path)?;
-
-                do_unmark_peer_file(&txn, peer, file_inode)?;
-
-                let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
-
-                // catchup peer; remove the older version and write a
-                // new one
-                if let Some(e) = get_file_entry(&cache_table, file_inode, None)?
-                    && e.hash != hash
-                {
-                    self.do_unlink(&txn, peer, &path, e.hash)?;
-                }
-                self.do_write_file_entry(&mut cache_table, file_inode, peer, &entry)?;
-
-                // catchup default (same as add)
-                if !get_file_entry(&cache_table, file_inode, None)?.is_some() {
-                    self.do_write_default_file_entry(
-                        &txn,
-                        &mut tree,
-                        &mut cache_table,
-                        file_inode,
-                        &entry,
-                    )?;
-                }
+                self.catchup(peer, &txn, path, mtime, size, hash)?;
             }
             Notification::CatchupComplete { index, .. } => {
-                self.do_delete_marked_files(&txn, peer)?;
-                do_update_last_seen_notification(&txn, peer, index)?;
+                self.catchup_complete(peer, &txn, index)?;
             }
             Notification::Connected { uuid, .. } => {
-                let mut peer_table = txn.peer_table()?;
-                let key = peer.as_str();
-                if let Some(entry) = peer_table.get(key)? {
-                    if entry.value().parse()?.uuid == uuid {
-                        // We're connected to the same store as before; there's nothing to do.
-                        return Ok(());
-                    }
-                }
-                peer_table.insert(key, Holder::with_content(PeerTableEntry { uuid })?)?;
-                let mut notification_table = txn.notification_table()?;
-                notification_table.remove(key)?;
+                connected(peer, &txn, uuid)?;
             }
         }
         txn.commit()?;
         Ok(())
+    }
+
+    fn catchup_complete(
+        &self,
+        peer: Peer,
+        txn: &ArenaWriteTransaction<'_>,
+        index: u64,
+    ) -> Result<(), StorageError> {
+        self.do_delete_marked_files(txn, peer)?;
+        do_update_last_seen_notification(txn, peer, index)?;
+        Ok(())
+    }
+
+    fn catchup(
+        &self,
+        peer: Peer,
+        txn: &ArenaWriteTransaction<'_>,
+        path: Path,
+        mtime: UnixTime,
+        size: u64,
+        hash: Hash,
+    ) -> Result<(), StorageError> {
+        let mut cache_table = txn.cache_table()?;
+        let mut tree = txn.write_tree()?;
+        let (_, file_inode) = do_create_file(&mut cache_table, &mut tree, &path)?;
+        do_unmark_peer_file(txn, peer, file_inode)?;
+        let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
+        if let Some(e) = get_file_entry(&cache_table, file_inode, None)?
+            && e.hash != hash
+        {
+            self.do_unlink(txn, peer, &path, e.hash)?;
+        }
+        self.do_write_file_entry(&mut cache_table, file_inode, peer, &entry)?;
+        Ok(
+            if !get_file_entry(&cache_table, file_inode, None)?.is_some() {
+                self.do_write_default_file_entry(
+                    txn,
+                    &mut tree,
+                    &mut cache_table,
+                    file_inode,
+                    &entry,
+                )?;
+            },
+        )
+    }
+
+    fn drop(
+        &self,
+        peer: Peer,
+        txn: &ArenaWriteTransaction<'_>,
+        index: u64,
+        path: Path,
+        old_hash: Hash,
+    ) -> Result<(), StorageError> {
+        do_update_last_seen_notification(txn, peer, index)?;
+        self.do_unlink(txn, peer, &path, old_hash)?;
+        Ok(())
+    }
+
+    fn remove(
+        &self,
+        peer: Peer,
+        index_root: Option<&std::path::Path>,
+        txn: &ArenaWriteTransaction<'_>,
+        index: u64,
+        path: Path,
+        old_hash: Hash,
+    ) -> Result<(), StorageError> {
+        do_update_last_seen_notification(txn, peer, index)?;
+        self.do_unlink(txn, peer, &path, old_hash.clone())?;
+        Ok(if let Some(index_root) = index_root {
+            let tree = txn.read_tree()?;
+            let index = txn.read_index()?;
+
+            if let Some(indexed) = index.get(&tree, &path)?
+                && indexed.is_outdated_by(&old_hash)
+                && indexed.matches_file(path.within(&index_root))
+            {
+                // This specific version has been removed
+                // remotely. Make sure that the file hasn't
+                // changed since it was indexed and if it hasn't,
+                // remove it locally as well.
+                std::fs::remove_file(&path.within(index_root))?;
+            }
+        })
+    }
+
+    fn replace(
+        &self,
+        peer: Peer,
+        txn: &ArenaWriteTransaction<'_>,
+        index: u64,
+        path: Path,
+        mtime: UnixTime,
+        size: u64,
+        hash: Hash,
+        old_hash: Hash,
+    ) -> Result<(), StorageError> {
+        do_update_last_seen_notification(txn, peer, index)?;
+        let mut cache_table = txn.cache_table()?;
+        let mut tree = txn.write_tree()?;
+        let (_, file_inode) = do_create_file(&mut cache_table, &mut tree, &path)?;
+        let entry = FileTableEntry::new(path, size, mtime, hash.clone());
+        if let Some(e) = get_file_entry(&cache_table, file_inode, Some(peer))?
+            && e.hash == old_hash
+        {
+            self.do_write_file_entry(&mut cache_table, file_inode, peer, &entry)?;
+        }
+        if let Some(old_entry) = get_file_entry(&cache_table, file_inode, None)?
+            && old_entry.hash == old_hash
+        {
+            self.do_write_default_file_entry(txn, &mut tree, &mut cache_table, file_inode, &entry)?;
+        }
+        let mut index = txn.write_index()?;
+        index.record_outdated(&tree, file_inode, &old_hash, &hash)?;
+        Ok(())
+    }
+
+    fn add(
+        &self,
+        peer: Peer,
+        txn: &ArenaWriteTransaction<'_>,
+        index: u64,
+        path: Path,
+        mtime: UnixTime,
+        size: u64,
+        hash: Hash,
+    ) -> Result<(), StorageError> {
+        do_update_last_seen_notification(txn, peer, index)?;
+        let mut cache_table = txn.cache_table()?;
+        let mut tree = txn.write_tree()?;
+        let (_, file_inode) = do_create_file(&mut cache_table, &mut tree, &path)?;
+        let entry = FileTableEntry::new(path, size, mtime, hash);
+        if get_file_entry(&cache_table, file_inode, Some(peer))?.is_none() {
+            self.do_write_file_entry(&mut cache_table, file_inode, peer, &entry)?;
+        }
+        Ok(
+            if get_file_entry(&cache_table, file_inode, None)?.is_none() {
+                self.do_write_default_file_entry(
+                    txn,
+                    &mut tree,
+                    &mut cache_table,
+                    file_inode,
+                    &entry,
+                )?;
+            },
+        )
     }
 
     /// Open a file for reading/writing.
@@ -703,6 +743,25 @@ impl ArenaCache {
     }
 }
 
+fn connected(
+    peer: Peer,
+    txn: &ArenaWriteTransaction<'_>,
+    uuid: uuid::Uuid,
+) -> Result<(), StorageError> {
+    let mut peer_table = txn.peer_table()?;
+    let key = peer.as_str();
+    if let Some(entry) = peer_table.get(key)? {
+        if entry.value().parse()?.uuid == uuid {
+            // We're connected to the same store as before; there's nothing to do.
+            return Ok(());
+        }
+    }
+    peer_table.insert(key, Holder::with_content(PeerTableEntry { uuid })?)?;
+    let mut notification_table = txn.notification_table()?;
+    notification_table.remove(key)?;
+    Ok(())
+}
+
 fn do_update_last_seen_notification(
     txn: &ArenaWriteTransaction,
     peer: Peer,
@@ -876,7 +935,7 @@ fn setup_dir(
     Ok(inode)
 }
 
-fn do_mark_peer_files(txn: &ArenaWriteTransaction, peer: Peer) -> Result<(), StorageError> {
+fn catchup_start(txn: &ArenaWriteTransaction, peer: Peer) -> Result<(), StorageError> {
     let cache_table = txn.cache_table()?;
     let mut pending_catchup_table = txn.pending_catchup_table()?;
     for elt in cache_table.iter()? {
