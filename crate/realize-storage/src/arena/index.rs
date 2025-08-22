@@ -83,13 +83,26 @@ impl RealIndexAsync {
         let db = Arc::clone(&self.db);
         let range = Box::new(range);
         task::spawn_blocking(move || {
-            let tx_clone = tx.clone();
-            let execute = || db.begin_read()?.read_history()?.history(*range, tx);
-
-            if let Err(err) = (execute)() {
-                // Send any global error to the channel, so it ends up
-                // in the stream instead of getting lost.
-                let _ = tx_clone.blocking_send(Err(err));
+            let txn = match db.begin_read() {
+                Ok(v) => v,
+                Err(err) => {
+                    // Send any global error to the channel, so it ends up
+                    // in the stream instead of getting lost.
+                    let _ = tx.blocking_send(Err(err.into()));
+                    return;
+                }
+            };
+            let history = match txn.read_history() {
+                Ok(v) => v,
+                Err(err) => {
+                    let _ = tx.blocking_send(Err(err));
+                    return;
+                }
+            };
+            for res in history.history(*range) {
+                if tx.blocking_send(res).is_err() {
+                    return;
+                }
             }
         });
 
@@ -827,17 +840,10 @@ mod tests {
     fn collect_history_entries(
         history: &impl crate::arena::history::HistoryReadOperations,
     ) -> Result<Vec<HistoryTableEntry>, StorageError> {
-        let (tx, mut rx) = mpsc::channel(100);
-
-        // Collect history entries in a blocking manner
-        history.history(0.., tx)?;
-
-        let mut entries = Vec::new();
-        while let Some(Ok((_, entry))) = rx.blocking_recv() {
-            entries.push(entry);
-        }
-
-        Ok(entries)
+        history
+            .history(0..)
+            .map(|res| res.map(|(_, e)| e))
+            .collect()
     }
 
     #[test]

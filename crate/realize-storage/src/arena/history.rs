@@ -6,7 +6,6 @@ use realize_types::Arena;
 use realize_types::{Hash, Path};
 use redb::ReadableTable;
 use std::ops::RangeBounds;
-use tokio::sync::mpsc;
 use tokio::sync::watch;
 
 /// A subsystem that track local changes for reporting to remote peers.
@@ -86,7 +85,7 @@ pub(crate) trait HistoryReadOperations {
     /// This is always the highest index value.
     fn last_history_index(&self) -> Result<u64, StorageError>;
 
-    /// Grab a range of history entries and send them to a channel.
+    /// Grab a range of history entries.
     ///
     /// This function will not block, if the requested range is higher
     /// than the highest history index, it will just return up to the
@@ -97,8 +96,7 @@ pub(crate) trait HistoryReadOperations {
     fn history(
         &self,
         range: impl RangeBounds<u64>,
-        tx: mpsc::Sender<Result<(u64, HistoryTableEntry), StorageError>>,
-    ) -> Result<(), StorageError>;
+    ) -> impl Iterator<Item = Result<(u64, HistoryTableEntry), StorageError>>;
 }
 
 impl<T> HistoryReadOperations for ReadableOpenHistory<T>
@@ -112,9 +110,8 @@ where
     fn history(
         &self,
         range: impl RangeBounds<u64>,
-        tx: mpsc::Sender<Result<(u64, HistoryTableEntry), StorageError>>,
-    ) -> Result<(), StorageError> {
-        history(&self.table, range, tx)
+    ) -> impl Iterator<Item = Result<(u64, HistoryTableEntry), StorageError>> {
+        HistoryIterator::new(&self.table, range)
     }
 }
 
@@ -126,9 +123,8 @@ impl<'a> HistoryReadOperations for WritableOpenHistory<'a> {
     fn history(
         &self,
         range: impl RangeBounds<u64>,
-        tx: mpsc::Sender<Result<(u64, HistoryTableEntry), StorageError>>,
-    ) -> Result<(), StorageError> {
-        history(&self.table, range, tx)
+    ) -> impl Iterator<Item = Result<(u64, HistoryTableEntry), StorageError>> {
+        HistoryIterator::new(&self.table, range)
     }
 }
 
@@ -196,23 +192,42 @@ fn last_history_index(
     Ok(table.last()?.map(|(k, _)| k.value()).unwrap_or(0))
 }
 
-/// Grab a range of history entries and send them to the given channel.
-fn history(
-    table: &impl redb::ReadableTable<u64, Holder<'static, HistoryTableEntry>>,
-    range: impl RangeBounds<u64>,
-    tx: mpsc::Sender<Result<(u64, HistoryTableEntry), StorageError>>,
-) -> Result<(), StorageError> {
-    for res in table.range(range)?.map(|res| match res {
-        Err(err) => Err(StorageError::from(err)),
-        Ok((k, v)) => match v.value().parse() {
-            Ok(v) => Ok((k.value(), v)),
-            Err(err) => Err(StorageError::from(err)),
-        },
-    }) {
-        if let Err(_) = tx.blocking_send(res) {
-            break;
+struct HistoryIterator<'a> {
+    range: Option<Result<redb::Range<'a, u64, Holder<'static, HistoryTableEntry>>, StorageError>>,
+}
+
+impl<'a> HistoryIterator<'a> {
+    fn new(
+        table: &'a impl redb::ReadableTable<u64, Holder<'static, HistoryTableEntry>>,
+        range: impl RangeBounds<u64>,
+    ) -> Self {
+        Self {
+            range: Some(table.range(range).map_err(StorageError::from)),
         }
     }
+}
 
-    Ok(())
+impl<'a> Iterator for HistoryIterator<'a> {
+    type Item = Result<(u64, HistoryTableEntry), StorageError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.range.take() {
+            None => None,
+            Some(Err(err)) => Some(Err(err)),
+            Some(Ok(mut range)) => match range.next() {
+                None => None,
+                Some(Err(e)) => Some(Err(e.into())),
+                Some(Ok((k, v))) => {
+                    self.range = Some(Ok(range));
+                    let index = k.value();
+                    Some(
+                        v.value()
+                            .parse()
+                            .map_err(StorageError::from)
+                            .map(|e| (index, e)),
+                    )
+                }
+            },
+        }
+    }
 }
