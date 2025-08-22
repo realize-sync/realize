@@ -98,7 +98,6 @@ impl ArenaStorage {
         jobs::StorageJobProcessor::new(
             Arc::clone(&db),
             Arc::clone(&engine),
-            Arc::clone(&arena_cache),
             indexed.as_ref().map(|indexed| indexed.root.to_path_buf()),
         )
         .spawn(shutdown.clone());

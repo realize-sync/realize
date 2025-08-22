@@ -1,3 +1,4 @@
+use arena::arena_cache::ArenaCache;
 use arena::engine::Engine;
 use arena::{ArenaStorage, indexed_store};
 use config::StorageConfig;
@@ -106,7 +107,7 @@ impl Storage {
     pub async fn update(&self, peer: Peer, notification: Notification) -> Result<(), StorageError> {
         // TODO: change both in the same transaction
         let arena_storage = self.arena_storage(notification.arena())?;
-        let cache = Arc::clone(&arena_storage.cache);
+        let cache: Arc<ArenaCache> = Arc::clone(&arena_storage.cache);
         let index_root = arena_storage.indexed.as_ref().map(|i| i.root.to_path_buf());
         task::spawn_blocking(move || cache.update(peer, notification, index_root.as_deref()))
             .await??;

@@ -13,7 +13,6 @@ use crate::{Blob, InodeAssignment, LocalAvailability};
 use crate::{Inode, StorageError};
 use realize_types::{Arena, Hash, Path, Peer, UnixTime};
 use redb::{ReadableTable, Table};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Read operations for cache. See also [CacheExt].
@@ -217,42 +216,6 @@ impl<'a> WritableOpenCache<'a> {
         let mut tree = txn.write_tree()?;
         let marks = txn.read_marks()?;
         blobs.create(&mut tree, &marks, inode, &file_entry.hash, file_entry.size)
-    }
-
-    /// Prepare the database and return the path to write into to move some
-    /// file into the blob, replacing any existing ones.
-    pub(crate) fn move_into_blob_if_matches<T>(
-        &self,
-        txn: &ArenaWriteTransaction,
-        path: T,
-        hash: &Hash,
-        metadata: &std::fs::Metadata,
-    ) -> Result<Option<PathBuf>, StorageError>
-    where
-        T: AsRef<Path>,
-    {
-        let path = path.as_ref();
-        let inode = match txn.read_tree()?.resolve(path)? {
-            Some(inode) => inode,
-            None => {
-                return Ok(None);
-            }
-        };
-        let file_entry = match get_default_entry(&self.table, inode)? {
-            Some(e) => e,
-            None => {
-                return Ok(None);
-            }
-        };
-        if file_entry.hash != *hash || file_entry.size != metadata.len() {
-            return Ok(None);
-        }
-        let mut blobs = txn.write_blobs()?;
-        let marks = txn.read_marks()?;
-        let mut tree = txn.write_tree()?;
-        let cachepath = blobs.import(&mut tree, &marks, inode, hash, metadata)?;
-
-        Ok(Some(cachepath))
     }
 
     /// Add a file entry for a peer.
@@ -921,24 +884,6 @@ impl ArenaCache {
         Ok(Blob::open_with_info(&self.db, info)?)
     }
 
-    /// Prepare the database and return the path to write into to move some
-    /// file into the blob, replacing any existing ones.
-    ///
-    /// Gives up and returns None if `hash` doesn't match the entry version.
-    pub(crate) fn move_into_blob_if_matches<T>(
-        &self,
-        txn: &ArenaWriteTransaction,
-        path: T,
-        hash: &Hash,
-        metadata: &std::fs::Metadata,
-    ) -> Result<Option<PathBuf>, StorageError>
-    where
-        T: AsRef<Path>,
-    {
-        let cache = txn.write_cache()?;
-        cache.move_into_blob_if_matches(txn, path, hash, metadata)
-    }
-
     pub(crate) fn local_availability(
         &self,
         inode: Inode,
@@ -1138,7 +1083,7 @@ mod tests {
         arena: Arena,
         acache: Arc<ArenaCache>,
         db: Arc<ArenaDatabase>,
-        tempdir: TempDir,
+        _tempdir: TempDir,
     }
     impl Fixture {
         async fn setup_with_arena(arena: Arena) -> anyhow::Result<Fixture> {
@@ -1155,7 +1100,7 @@ mod tests {
                 arena,
                 acache,
                 db,
-                tempdir,
+                _tempdir: tempdir,
             })
         }
 
@@ -2279,32 +2224,6 @@ mod tests {
 
         // The blob must be gone
         assert!(!fixture.has_blob(inode)?);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn move_into_blob_if_matches_reject_wrong_file_size() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
-        let acache = &fixture.acache;
-        let file_path = Path::parse("test.txt")?;
-
-        // Create a file and add it to the cache
-        fixture.add_to_cache(&file_path, 100, test_time())?;
-
-        let tmpfile = fixture.tempdir.child("tmp");
-        tmpfile.write_str("not 48 bytes")?;
-
-        let txn = fixture.db.begin_write()?;
-        assert_eq!(
-            None,
-            acache.move_into_blob_if_matches(
-                &txn,
-                &file_path,
-                &test_hash(),
-                &tmpfile.path().metadata()?
-            )?
-        );
 
         Ok(())
     }

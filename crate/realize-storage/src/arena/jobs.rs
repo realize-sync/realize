@@ -1,7 +1,7 @@
-use super::arena_cache::ArenaCache;
 use super::db::ArenaDatabase;
 use super::engine::{Engine, StorageJob};
-use crate::arena::index;
+use crate::arena::arena_cache::CacheReadOperations;
+use crate::arena::index::{self, IndexReadOperations};
 use crate::arena::tree::TreeExt;
 use crate::{Inode, JobId, JobStatus, StorageError};
 use realize_types::Hash;
@@ -14,7 +14,6 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct StorageJobProcessor {
     db: Arc<ArenaDatabase>,
     engine: Arc<Engine>,
-    cache: Arc<ArenaCache>,
     index_root: Option<PathBuf>,
 }
 
@@ -22,13 +21,11 @@ impl StorageJobProcessor {
     pub(crate) fn new(
         db: Arc<ArenaDatabase>,
         engine: Arc<Engine>,
-        cache: Arc<ArenaCache>,
         index_root: Option<PathBuf>,
     ) -> Arc<Self> {
         Arc::new(Self {
             db,
             engine,
-            cache,
             index_root,
         })
     }
@@ -49,7 +46,7 @@ impl StorageJobProcessor {
             if let Err(err) = self.process_and_report(job_id, job).await {
                 log::debug!(
                     "[{}] Failed to report result of Job {job_id}: {err}",
-                    self.cache.arena()
+                    self.db.arena()
                 )
             }
         }
@@ -104,51 +101,57 @@ impl StorageJobProcessor {
     fn unrealize(&self, inode: Inode, hash: Hash) -> Result<JobStatus, StorageError> {
         let root = match &self.index_root {
             Some(ret) => ret,
-            None => return Err(StorageError::NoLocalStorage(self.cache.arena())),
+            None => return Err(StorageError::NoLocalStorage(self.db.arena())),
         };
+        let path: realize_types::Path;
+        let realpath: PathBuf;
+        let cachepath: PathBuf;
         let txn = self.db.begin_write()?;
-        let tree = txn.read_tree()?;
-        let path = match tree.backtrack(inode)? {
-            Some(path) => path,
-            None => {
-                return Ok(JobStatus::Abandoned("no_path"));
+        {
+            let mut tree = txn.write_tree()?;
+            let mut index = txn.write_index()?;
+            path = match tree.backtrack(inode)? {
+                Some(v) => v,
+                None => return Ok(JobStatus::Abandoned("no_path")),
+            };
+            realpath = path.within(root);
+            let indexed = match index.get_at_inode(inode)? {
+                Some(v) => v,
+                None => return Ok(JobStatus::Abandoned("not_in_index")),
+            };
+            if !indexed.matches_file(&realpath) {
+                return Ok(JobStatus::Abandoned("file_mismatch"));
             }
-        };
-        let realpath =
-            match index::indexed_file_path(&txn.read_index()?, &tree, root, inode, Some(&hash))? {
-                Some(ret) => ret,
-                None => {
-                    return Ok(JobStatus::Abandoned("get_indexed_file"));
-                }
+            let cached = match txn.write_cache()?.get_at_inode(inode)? {
+                Some(v) => v,
+                None => return Ok(JobStatus::Abandoned("no_cache_entry")),
             };
-        drop(tree); // TODO: rewrite move_into_blob_if_matches to take a tree and TreeLoc
-        let cachepath =
-            match self
-                .cache
-                .move_into_blob_if_matches(&txn, &path, &hash, &realpath.metadata()?)?
-            {
-                Some(ret) => ret,
-                None => {
-                    return Ok(JobStatus::Abandoned("move_into_blob"));
-                }
-            };
+            if cached.hash != hash {
+                return Ok(JobStatus::Abandoned("cache_version_mismatch"));
+            }
+            let mut blobs = txn.write_blobs()?;
+            let marks = txn.read_marks()?;
+            cachepath = blobs.import(&mut tree, &marks, inode, &hash, &realpath.metadata()?)?;
 
-        // drop_file_if_matches makes a second check of
-        // the file mtime and size just before renaming,
-        // in case it has changed.
+            let mut history = txn.write_history()?;
+            let mut dirty = txn.write_dirty()?;
+            index.drop(&mut tree, &mut history, &mut dirty, inode)?;
 
-        // Even with that, it's *still* possible some
-        // handle is open and is going to write on the
-        // file after the move, a change that would
-        // eventually be lost when the file in the cache
-        // is verified.
-        if !index::drop_file_if_matches(&txn, root, &path, &hash)? {
-            return Ok(JobStatus::Abandoned("drop_file_if_matches"));
+            // We make a second check of the file mtime and size just
+            // before renaming, in case it has changed.
+            //
+            // Even with that, it's *still* possible some handle is
+            // open and is going to write on the file after the move,
+            // a change that would eventually be lost when the file in
+            // the cache is verified.
+            if !indexed.matches_file(&realpath) {
+                return Ok(JobStatus::Abandoned("file_mismatch(late)"));
+            }
+
+            // Database changes are ready. Make the fs change.
+            std::fs::rename(&realpath, &cachepath)?;
+            log::debug!("renamed {realpath:?} to {cachepath:?}");
         }
-
-        // Database changes are ready. Make the fs change.
-        std::fs::rename(&realpath, &cachepath)?;
-        log::debug!("renamed {realpath:?} to {cachepath:?}");
         let committed = txn.commit();
         if committed.is_err() {
             log::warn!("commit failed; revert {realpath:?}");
@@ -181,7 +184,7 @@ impl StorageJobProcessor {
         cache_hash: Hash,
         index_hash: Option<Hash>,
     ) -> Result<JobStatus, StorageError> {
-        let arena = self.cache.arena();
+        let arena = self.db.arena();
         let root = match &self.index_root {
             Some(ret) => ret,
             None => return Err(StorageError::NoLocalStorage(arena)),
@@ -227,7 +230,7 @@ mod tests {
     use super::*;
     use crate::arena::index::IndexedFile;
     use crate::utils::hash;
-    use crate::{Blob, Inode, LocalAvailability, Mark, Notification};
+    use crate::{ArenaCache, Blob, Inode, LocalAvailability, Mark, Notification};
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
@@ -275,7 +278,6 @@ mod tests {
             let processor = StorageJobProcessor::new(
                 Arc::clone(&db),
                 Arc::clone(&engine),
-                Arc::clone(&cache),
                 if with_root {
                     Some(root.to_path_buf())
                 } else {

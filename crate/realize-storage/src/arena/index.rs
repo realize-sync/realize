@@ -1,6 +1,6 @@
 #![allow(dead_code)] // work in progress
 
-use super::db::{ArenaDatabase, ArenaWriteTransaction};
+use super::db::ArenaDatabase;
 use super::dirty::WritableOpenDirty;
 use super::history::{HistoryReadOperations, WritableOpenHistory};
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
@@ -761,32 +761,6 @@ pub(crate) fn remove_file_or_dir(
     txn.commit()?;
 
     Ok(())
-}
-
-/// Remove `path` from the index if the hash and file match,
-/// report it as a drop in the history.
-pub(crate) fn drop_file_if_matches(
-    txn: &ArenaWriteTransaction,
-    root: &std::path::Path,
-    path: &realize_types::Path,
-    hash: &Hash,
-) -> Result<bool, StorageError> {
-    let mut tree = txn.write_tree()?;
-    let mut index = txn.write_index()?;
-    let mut dirty = txn.write_dirty()?;
-    let mut history = txn.write_history()?;
-
-    if let Some(inode) = tree.resolve(path)? {
-        if let Some(entry) = index.get_at_inode(inode)?
-            && entry.hash == *hash
-            && entry.matches_file(path.within(root))
-        {
-            index.drop(&mut tree, &mut history, &mut dirty, inode)?;
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
 }
 
 #[cfg(test)]
@@ -1877,130 +1851,6 @@ mod tests {
 
         let updated = super::last_history_index(&fixture.db)?;
         assert!(updated > initial);
-
-        Ok(())
-    }
-
-    #[test]
-    fn index_drop_file_if_matches_success() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-
-        let path = realize_types::Path::parse("test.txt")?;
-        let content = "test content";
-        let hash = hash::digest(content);
-
-        // Add file to index
-        super::add_file(
-            &fixture.db,
-            &path,
-            content.len() as u64,
-            UnixTime::from_secs(1234567890),
-            hash.clone(),
-        )?;
-
-        // Verify file exists in index
-        assert!(super::has_file(&fixture.db, &path)?);
-
-        // Get the initial history count
-        let initial_history_count = super::last_history_index(&fixture.db)?;
-
-        // Try to drop the file - this should fail because file doesn't exist on disk
-        // but the test is checking that the method returns the correct result
-        {
-            let txn = fixture.db.begin_write()?;
-            let result =
-                super::drop_file_if_matches(&txn, std::path::Path::new("/tmp"), &path, &hash)?;
-            // The method should return false because file_matches_index will fail
-            // since the file doesn't exist on disk at /tmp/test.txt
-            assert!(!result);
-            txn.commit()?;
-        }
-
-        // Verify file still exists in index (since drop failed)
-        assert!(super::has_file(&fixture.db, &path)?);
-
-        // Verify no new history entry was created
-        let final_history_count = super::last_history_index(&fixture.db)?;
-        assert_eq!(initial_history_count, final_history_count);
-
-        Ok(())
-    }
-
-    #[test]
-    fn index_drop_file_if_matches_wrong_hash() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-
-        let path = realize_types::Path::parse("test.txt")?;
-        let content = "test content";
-        let hash = hash::digest(content);
-        let wrong_hash = hash::digest("wrong content");
-
-        // Add file to index
-        super::add_file(
-            &fixture.db,
-            &path,
-            content.len() as u64,
-            UnixTime::from_secs(1234567890),
-            hash.clone(),
-        )?;
-
-        // Verify file exists in index
-        assert!(super::has_file(&fixture.db, &path)?);
-
-        // Get the initial history count
-        let initial_history_count = super::last_history_index(&fixture.db)?;
-
-        // Try to drop the file with wrong hash
-        {
-            let txn = fixture.db.begin_write()?;
-            let result = super::drop_file_if_matches(
-                &txn,
-                std::path::Path::new("/tmp"),
-                &path,
-                &wrong_hash,
-            )?;
-            assert!(!result);
-            txn.commit()?;
-        }
-
-        // Verify file still exists in index
-        assert!(super::has_file(&fixture.db, &path)?);
-
-        // Verify no new history entry was created
-        let final_history_count = super::last_history_index(&fixture.db)?;
-        assert_eq!(initial_history_count, final_history_count);
-
-        Ok(())
-    }
-
-    #[test]
-    fn index_drop_file_if_matches_file_not_in_index() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-
-        let path = realize_types::Path::parse("test.txt")?;
-        let hash = hash::digest("test content");
-
-        // Verify file doesn't exist in index
-        assert!(!super::has_file(&fixture.db, &path)?);
-
-        // Get the initial history count
-        let initial_history_count = super::last_history_index(&fixture.db)?;
-
-        // Try to drop the file
-        {
-            let txn = fixture.db.begin_write()?;
-            let result =
-                super::drop_file_if_matches(&txn, std::path::Path::new("/tmp"), &path, &hash)?;
-            assert!(!result);
-            txn.commit()?;
-        }
-
-        // Verify file still doesn't exist in index
-        assert!(!super::has_file(&fixture.db, &path)?);
-
-        // Verify no new history entry was created
-        let final_history_count = super::last_history_index(&fixture.db)?;
-        assert_eq!(initial_history_count, final_history_count);
 
         Ok(())
     }
