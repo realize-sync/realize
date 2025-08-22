@@ -219,34 +219,6 @@ impl<'a> WritableOpenCache<'a> {
         blobs.create(&mut tree, &marks, inode, &file_entry.hash, file_entry.size)
     }
 
-    /// Move the blob entry for `path` to `dest` and delete the blob.
-    pub(crate) fn move_blob_if_matches<T>(
-        &self,
-        txn: &ArenaWriteTransaction,
-        path: T,
-        hash: &Hash,
-        dest: &std::path::Path,
-    ) -> Result<bool, StorageError>
-    where
-        T: AsRef<Path>,
-    {
-        let path = path.as_ref();
-        let mut tree = txn.write_tree()?;
-        let inode = tree.expect(path)?;
-        let file_entry = get_default_entry_or_err(&self.table, inode)?;
-        if file_entry.hash != *hash {
-            return Ok(false);
-        }
-        let mut blobs = txn.write_blobs()?;
-        if !blobs.export(&mut tree, inode, hash, dest)? {
-            return Ok(false);
-        }
-
-        log::debug!("Realized [{}]/{path} {hash} as {dest:?}", self.arena);
-
-        Ok(true)
-    }
-
     /// Prepare the database and return the path to write into to move some
     /// file into the blob, replacing any existing ones.
     pub(crate) fn move_into_blob_if_matches<T>(
@@ -949,27 +921,6 @@ impl ArenaCache {
         Ok(Blob::open_with_info(&self.db, info)?)
     }
 
-    /// Move the blob entry for `path` to `dest` and delete the blob.
-    ///
-    /// Also enables version tracking on `path` to allow detecting
-    /// when `dest` becomes out-of-date.
-    ///
-    /// Gives up and returns false if `path` doesn't have a verified
-    /// blob with version `hash`.
-    pub(crate) fn move_blob_if_matches<T>(
-        &self,
-        txn: &ArenaWriteTransaction,
-        path: T,
-        hash: &Hash,
-        dest: &std::path::Path,
-    ) -> Result<bool, StorageError>
-    where
-        T: AsRef<Path>,
-    {
-        let cache = txn.write_cache()?;
-        cache.move_blob_if_matches(txn, path, hash, dest)
-    }
-
     /// Prepare the database and return the path to write into to move some
     /// file into the blob, replacing any existing ones.
     ///
@@ -996,22 +947,6 @@ impl ArenaCache {
         let tree = txn.read_tree()?;
         let blobs = txn.read_blobs()?;
         blobs.local_availability(&tree, inode)
-    }
-
-    /// Clean up the cache by removing blobs until the total disk usage is <= target_size.
-    ///
-    /// This method removes the least recently used blobs first, but skips blobs that are currently open.
-    #[allow(dead_code)]
-    pub(crate) fn cleanup_cache(&self, target_size: u64) -> Result<(), StorageError> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut blobs = txn.write_blobs()?;
-            let mut tree = txn.write_tree()?;
-            blobs.cleanup(&mut tree, target_size)?;
-        }
-        txn.commit()?;
-
-        Ok(())
     }
 }
 

@@ -181,14 +181,15 @@ impl StorageJobProcessor {
         cache_hash: Hash,
         index_hash: Option<Hash>,
     ) -> Result<JobStatus, StorageError> {
+        let arena = self.cache.arena();
         let root = match &self.index_root {
             Some(ret) => ret,
-            None => return Err(StorageError::NoLocalStorage(self.cache.arena())),
+            None => return Err(StorageError::NoLocalStorage(arena)),
         };
         let moved: bool;
         let txn = self.db.begin_write()?;
         {
-            let tree = txn.read_tree()?;
+            let mut tree = txn.write_tree()?;
             let path = match tree.backtrack(inode)? {
                 Some(path) => path,
                 None => {
@@ -202,11 +203,12 @@ impl StorageJobProcessor {
                 &path,
                 index_hash.as_ref(),
             )?;
-            drop(tree); // TODO: rewrite move_blob_if_matches to take a tree and TreeLoc
+            let mut blobs = txn.write_blobs()?;
             if let Some(realpath) = realpath {
-                moved = self
-                    .cache
-                    .move_blob_if_matches(&txn, &path, &cache_hash, &realpath)?;
+                moved = blobs.export(&mut tree, &path, &cache_hash, &realpath)?;
+                if moved {
+                    log::debug!("Realized [{arena}]/{path} {cache_hash} as {realpath:?}");
+                }
             } else {
                 return Ok(JobStatus::Abandoned("indexed_file_path"));
             }
@@ -215,7 +217,7 @@ impl StorageJobProcessor {
             txn.commit()?;
             Ok(JobStatus::Done)
         } else {
-            Ok(JobStatus::Abandoned("move_blob_if_matches"))
+            Ok(JobStatus::Abandoned("blobs.export"))
         }
     }
 }
