@@ -1,8 +1,10 @@
+use super::arena_cache::WritableOpenCache;
 use super::blob::{BlobReadOperations, Blobs, ReadableOpenBlob, WritableOpenBlob};
 use super::dirty::{Dirty, DirtyReadOperations, ReadableOpenDirty, WritableOpenDirty};
 use super::history::{History, HistoryReadOperations, ReadableOpenHistory, WritableOpenHistory};
 use super::index::{IndexReadOperations, ReadableOpenIndex, WritableOpenIndex};
 use super::mark::{MarkReadOperations, ReadableOpenMark, WritableOpenMark};
+use super::peer::{PeersReadOperations, ReadableOpenPeers, WritableOpenPeers};
 use super::tree::{ReadableOpenTree, Tree, TreeReadOperations, WritableOpenTree};
 use super::types::CacheTableKey;
 use super::types::{
@@ -13,7 +15,7 @@ use crate::StorageError;
 use crate::utils::holder::{ByteConversionError, Holder};
 use crate::{Inode, InodeAllocator};
 use realize_types::Arena;
-use redb::{ReadOnlyTable, ReadableTable, Table, TableDefinition};
+use redb::{ReadableTable, Table, TableDefinition};
 use std::cell::RefCell;
 use std::panic::Location;
 use std::sync::Arc;
@@ -293,6 +295,7 @@ impl ArenaDatabase {
     pub fn begin_write(&self) -> Result<ArenaWriteTransaction<'_>, StorageError> {
         Ok(ArenaWriteTransaction {
             inner: self.db.begin_write()?,
+            arena: self.arena,
             subsystems: &self.subsystems,
             before_commit: BeforeCommit::new(),
             after_commit: AfterCommit::new(),
@@ -302,6 +305,7 @@ impl ArenaDatabase {
     pub fn begin_read(&self) -> Result<ArenaReadTransaction<'_>, StorageError> {
         Ok(ArenaReadTransaction {
             inner: self.db.begin_read()?,
+            arena: self.arena,
             subsystems: &self.subsystems,
         })
     }
@@ -309,6 +313,7 @@ impl ArenaDatabase {
 
 pub struct ArenaWriteTransaction<'db> {
     inner: redb::WriteTransaction,
+    arena: Arena,
     subsystems: &'db Subsystems,
 
     /// Callbacks to be run after the transaction is committed.
@@ -338,28 +343,51 @@ impl<'db> ArenaWriteTransaction<'db> {
         Ok(())
     }
 
-    pub fn cache_table<'txn>(
-        &'txn self,
-    ) -> Result<Table<'txn, CacheTableKey, Holder<'static, CacheTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(CACHE_TABLE)?)
+    #[allow(dead_code)]
+    #[track_caller]
+    pub(crate) fn read_cache(
+        &self,
+    ) -> Result<impl crate::arena::arena_cache::CacheReadOperations, StorageError> {
+        Ok(crate::arena::arena_cache::ReadableOpenCache::new(
+            self.inner
+                .open_table(CACHE_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
+            self.arena,
+        ))
     }
 
-    pub fn pending_catchup_table<'txn>(
-        &'txn self,
-    ) -> Result<Table<'txn, (&'static str, Inode), ()>, StorageError> {
-        Ok(self.inner.open_table(PENDING_CATCHUP_TABLE)?)
+    #[track_caller]
+    pub(crate) fn write_cache(
+        &self,
+    ) -> Result<crate::arena::arena_cache::WritableOpenCache<'_>, StorageError> {
+        Ok(WritableOpenCache::new(
+            self.inner
+                .open_table(CACHE_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
+            self.inner.open_table(PENDING_CATCHUP_TABLE)?,
+            self.arena,
+        ))
     }
 
-    pub fn peer_table<'txn>(
-        &'txn self,
-    ) -> Result<Table<'txn, &'static str, Holder<'static, PeerTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(PEER_TABLE)?)
+    #[track_caller]
+    #[allow(dead_code)]
+    pub(crate) fn read_peers(&self) -> Result<impl PeersReadOperations, StorageError> {
+        Ok(ReadableOpenPeers::new(
+            self.inner
+                .open_table(PEER_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
+            self.inner.open_table(NOTIFICATION_TABLE)?,
+        ))
     }
 
-    pub fn notification_table<'txn>(
-        &'txn self,
-    ) -> Result<Table<'txn, &'static str, u64>, StorageError> {
-        Ok(self.inner.open_table(NOTIFICATION_TABLE)?)
+    #[track_caller]
+    pub(crate) fn write_peers(&self) -> Result<WritableOpenPeers<'_>, StorageError> {
+        Ok(WritableOpenPeers::new(
+            self.inner
+                .open_table(PEER_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
+            self.inner.open_table(NOTIFICATION_TABLE)?,
+        ))
     }
 
     pub fn after_commit(&self, cb: impl FnOnce() -> () + Send + 'static) {
@@ -502,26 +530,11 @@ impl<'db> ArenaWriteTransaction<'db> {
 
 pub struct ArenaReadTransaction<'db> {
     inner: redb::ReadTransaction,
+    arena: Arena,
     subsystems: &'db Subsystems,
 }
 
 impl<'db> ArenaReadTransaction<'db> {
-    pub fn cache_table(
-        &self,
-    ) -> Result<ReadOnlyTable<CacheTableKey, Holder<'static, CacheTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(CACHE_TABLE)?)
-    }
-
-    pub fn peer_table(
-        &self,
-    ) -> Result<ReadOnlyTable<&'static str, Holder<'static, PeerTableEntry>>, StorageError> {
-        Ok(self.inner.open_table(PEER_TABLE)?)
-    }
-
-    pub fn notification_table(&self) -> Result<ReadOnlyTable<&'static str, u64>, StorageError> {
-        Ok(self.inner.open_table(NOTIFICATION_TABLE)?)
-    }
-
     #[allow(dead_code)]
     #[track_caller]
     pub(crate) fn read_tree(&self) -> Result<impl TreeReadOperations, StorageError> {
@@ -582,6 +595,30 @@ impl<'db> ArenaReadTransaction<'db> {
             self.inner
                 .open_table(INDEX_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
+        ))
+    }
+
+    #[allow(dead_code)]
+    #[track_caller]
+    pub(crate) fn read_cache(
+        &self,
+    ) -> Result<impl crate::arena::arena_cache::CacheReadOperations, StorageError> {
+        Ok(crate::arena::arena_cache::ReadableOpenCache::new(
+            self.inner
+                .open_table(CACHE_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
+            self.arena,
+        ))
+    }
+
+    #[allow(dead_code)]
+    #[track_caller]
+    pub(crate) fn read_peers(&self) -> Result<impl PeersReadOperations, StorageError> {
+        Ok(ReadableOpenPeers::new(
+            self.inner
+                .open_table(PEER_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
+            self.inner.open_table(NOTIFICATION_TABLE)?,
         ))
     }
 }
@@ -683,7 +720,7 @@ mod tests {
     use super::*;
     use assert_fs::TempDir;
     use realize_types::Arena;
-    use redb::ReadableTable;
+    use redb::{ReadOnlyTable, ReadableTable};
 
     const TEST_TABLE: TableDefinition<&str, &str> = TableDefinition::new("test");
 
@@ -710,11 +747,6 @@ mod tests {
 
         // Make sure the tables can be opened in a read transaction.
         let txn = fixture.db.begin_read()?;
-        txn.read_tree()?;
-        txn.cache_table()?;
-        txn.peer_table()?;
-        txn.notification_table()?;
-
         txn.read_tree()?;
         txn.read_blobs()?;
         txn.read_marks()?;

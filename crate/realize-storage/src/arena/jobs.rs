@@ -263,7 +263,7 @@ mod tests {
             root.create_dir_all()?;
             let cache = ArenaCache::new(arena, Arc::clone(&db), &blob_dir)?;
 
-            let engine = Engine::new(arena, Arc::clone(&db), Arc::clone(&cache), |attempt| {
+            let engine = Engine::new(arena, Arc::clone(&db), |attempt| {
                 if attempt < 3 {
                     Some(Duration::from_secs(1))
                 } else {

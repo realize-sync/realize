@@ -1,20 +1,727 @@
-use super::blob::{BlobExt, BlobReadOperations, WritableOpenBlob};
-use super::db::{ArenaDatabase, ArenaReadTransaction, ArenaWriteTransaction};
+use super::blob::{BlobExt, BlobInfo, BlobReadOperations, WritableOpenBlob};
+use super::db::{ArenaDatabase, ArenaWriteTransaction};
 use super::dirty::WritableOpenDirty;
 use super::index::IndexExt;
+use super::peer::PeersReadOperations;
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
 use super::types::{
     CacheTableEntry, CacheTableKey, DirtableEntry, FileAvailability, FileMetadata, FileTableEntry,
-    PeerTableEntry,
 };
 use crate::arena::notifier::{Notification, Progress};
 use crate::utils::holder::Holder;
 use crate::{Blob, InodeAssignment, LocalAvailability};
 use crate::{Inode, StorageError};
 use realize_types::{Arena, Hash, Path, Peer, UnixTime};
-use redb::ReadableTable;
+use redb::{ReadableTable, Table};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Read operations for cache. See also [CacheExt].
+pub(crate) trait CacheReadOperations {
+    /// Lookup a specific name in the given directory inode.
+    fn lookup(
+        &self,
+        tree: &impl TreeReadOperations,
+        parent_inode: Inode,
+        name: &str,
+    ) -> Result<(Inode, InodeAssignment), StorageError>;
+
+    /// Get directory modification time for the given inode.
+    fn dir_mtime(&self, inode: Inode) -> Result<UnixTime, StorageError>;
+
+    /// Get file availability information for the given inode.
+    fn file_availability(&self, inode: Inode) -> Result<FileAvailability, StorageError>;
+
+    /// Read directory contents for the given inode.
+    fn readdir(
+        &self,
+        tree: &impl TreeReadOperations,
+        inode: Inode,
+    ) -> Result<Vec<(String, Inode, InodeAssignment)>, StorageError>;
+
+    /// Get the default file entry for the given inode.
+    fn get_at_inode(&self, inode: Inode) -> Result<Option<FileTableEntry>, StorageError>;
+
+    /// Get the default file entry for the given inode; fail if the entry
+    /// cannot be found or if it is a directory.
+    fn get_at_inode_or_err(&self, inode: Inode) -> Result<FileTableEntry, StorageError>;
+}
+
+/// A cache open for reading with a read transaction.
+pub(crate) struct ReadableOpenCache<T>
+where
+    T: ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+{
+    table: T,
+    arena: Arena,
+}
+
+impl<T> ReadableOpenCache<T>
+where
+    T: ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+{
+    pub(crate) fn new(table: T, arena: Arena) -> Self {
+        Self { table, arena }
+    }
+}
+
+impl<T> CacheReadOperations for ReadableOpenCache<T>
+where
+    T: ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+{
+    fn lookup(
+        &self,
+        tree: &impl TreeReadOperations,
+        parent_inode: Inode,
+        name: &str,
+    ) -> Result<(Inode, InodeAssignment), StorageError> {
+        lookup(&self.table, tree, parent_inode, name)
+    }
+
+    fn dir_mtime(&self, inode: Inode) -> Result<UnixTime, StorageError> {
+        dir_mtime(&self.table, inode)
+    }
+
+    fn file_availability(&self, inode: Inode) -> Result<FileAvailability, StorageError> {
+        file_availability(&self.table, inode, self.arena)
+    }
+
+    fn readdir(
+        &self,
+        tree: &impl TreeReadOperations,
+        inode: Inode,
+    ) -> Result<Vec<(String, Inode, InodeAssignment)>, StorageError> {
+        readdir(&self.table, tree, inode)
+    }
+
+    fn get_at_inode(&self, inode: Inode) -> Result<Option<FileTableEntry>, StorageError> {
+        get_default_entry(&self.table, inode)
+    }
+
+    fn get_at_inode_or_err(&self, inode: Inode) -> Result<FileTableEntry, StorageError> {
+        get_default_entry_or_err(&self.table, inode)
+    }
+}
+
+impl<'a> CacheReadOperations for WritableOpenCache<'a> {
+    fn lookup(
+        &self,
+        tree: &impl TreeReadOperations,
+        parent_inode: Inode,
+        name: &str,
+    ) -> Result<(Inode, InodeAssignment), StorageError> {
+        lookup(&self.table, tree, parent_inode, name)
+    }
+
+    fn dir_mtime(&self, inode: Inode) -> Result<UnixTime, StorageError> {
+        dir_mtime(&self.table, inode)
+    }
+
+    fn file_availability(&self, inode: Inode) -> Result<FileAvailability, StorageError> {
+        file_availability(&self.table, inode, self.arena)
+    }
+
+    fn readdir(
+        &self,
+        tree: &impl TreeReadOperations,
+        inode: Inode,
+    ) -> Result<Vec<(String, Inode, InodeAssignment)>, StorageError> {
+        readdir(&self.table, tree, inode)
+    }
+
+    fn get_at_inode(&self, inode: Inode) -> Result<Option<FileTableEntry>, StorageError> {
+        get_default_entry(&self.table, inode)
+    }
+
+    fn get_at_inode_or_err(&self, inode: Inode) -> Result<FileTableEntry, StorageError> {
+        get_default_entry_or_err(&self.table, inode)
+    }
+}
+
+/// Extend [CacheReadOperations] with convenience functions for working
+/// with paths and tree locations.
+pub(crate) trait CacheExt {
+    /// Get a file entry.
+    ///
+    /// Return None if the file is not found or if it is a directory.
+    #[allow(dead_code)]
+    fn get<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<Option<FileTableEntry>, StorageError>;
+
+    /// Get a file entry, failing if the file is not found or if it is a directory.
+    #[allow(dead_code)]
+    fn get_or_err<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<FileTableEntry, StorageError>;
+
+    fn file_metadata(&self, inode: Inode) -> Result<FileMetadata, StorageError>;
+}
+
+impl<T: CacheReadOperations> CacheExt for T {
+    fn file_metadata(&self, inode: Inode) -> Result<FileMetadata, StorageError> {
+        let FileTableEntry { size, mtime, .. } =
+            self.get_at_inode(inode)?.ok_or(StorageError::NotFound)?;
+
+        Ok(FileMetadata { size, mtime })
+    }
+
+    fn get<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<Option<FileTableEntry>, StorageError> {
+        self.get_at_inode(tree.expect(loc)?)
+    }
+    fn get_or_err<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<FileTableEntry, StorageError> {
+        self.get_at_inode_or_err(tree.expect(loc)?)
+    }
+}
+
+/// A cache open for writing with a write transaction.
+pub(crate) struct WritableOpenCache<'a> {
+    table: Table<'a, CacheTableKey, Holder<'static, CacheTableEntry>>,
+    pending_catchup_table: Table<'a, (&'static str, Inode), ()>,
+    arena: Arena,
+}
+
+impl<'a> WritableOpenCache<'a> {
+    pub(crate) fn new(
+        table: Table<'a, CacheTableKey, Holder<CacheTableEntry>>,
+        pending_catchup_table: Table<'a, (&'static str, Inode), ()>,
+        arena: Arena,
+    ) -> Self {
+        Self {
+            table,
+            pending_catchup_table,
+            arena,
+        }
+    }
+
+    /// Create a blob for that file, unless one already exists.
+    pub(crate) fn create_blob(
+        &mut self,
+        txn: &ArenaWriteTransaction,
+        inode: Inode,
+    ) -> Result<BlobInfo, StorageError> {
+        let file_entry = get_default_entry_or_err(&self.table, inode)?;
+        let mut blobs = txn.write_blobs()?;
+        let mut tree = txn.write_tree()?;
+        let marks = txn.read_marks()?;
+        blobs.create(&mut tree, &marks, inode, &file_entry.hash, file_entry.size)
+    }
+
+    /// Move the blob entry for `path` to `dest` and delete the blob.
+    pub(crate) fn move_blob_if_matches<T>(
+        &self,
+        txn: &ArenaWriteTransaction,
+        path: T,
+        hash: &Hash,
+        dest: &std::path::Path,
+    ) -> Result<bool, StorageError>
+    where
+        T: AsRef<Path>,
+    {
+        let path = path.as_ref();
+        let mut tree = txn.write_tree()?;
+        let inode = tree.expect(path)?;
+        let file_entry = get_default_entry_or_err(&self.table, inode)?;
+        if file_entry.hash != *hash {
+            return Ok(false);
+        }
+        let mut blobs = txn.write_blobs()?;
+        if !blobs.export(&mut tree, inode, hash, dest)? {
+            return Ok(false);
+        }
+
+        log::debug!("Realized [{}]/{path} {hash} as {dest:?}", self.arena);
+
+        Ok(true)
+    }
+
+    /// Prepare the database and return the path to write into to move some
+    /// file into the blob, replacing any existing ones.
+    pub(crate) fn move_into_blob_if_matches<T>(
+        &self,
+        txn: &ArenaWriteTransaction,
+        path: T,
+        hash: &Hash,
+        metadata: &std::fs::Metadata,
+    ) -> Result<Option<PathBuf>, StorageError>
+    where
+        T: AsRef<Path>,
+    {
+        let path = path.as_ref();
+        let inode = match txn.read_tree()?.resolve(path)? {
+            Some(inode) => inode,
+            None => {
+                return Ok(None);
+            }
+        };
+        let file_entry = match get_default_entry(&self.table, inode)? {
+            Some(e) => e,
+            None => {
+                return Ok(None);
+            }
+        };
+        if file_entry.hash != *hash || file_entry.size != metadata.len() {
+            return Ok(None);
+        }
+        let mut blobs = txn.write_blobs()?;
+        let marks = txn.read_marks()?;
+        let mut tree = txn.write_tree()?;
+        let cachepath = blobs.import(&mut tree, &marks, inode, hash, metadata)?;
+
+        Ok(Some(cachepath))
+    }
+
+    /// Add a file entry for a peer.
+    pub(crate) fn add(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
+        dirty: &mut WritableOpenDirty,
+        peer: Peer,
+        path: Path,
+        mtime: UnixTime,
+        size: u64,
+        hash: Hash,
+    ) -> Result<(), StorageError> {
+        let (_, file_inode) = do_create_file(&mut self.table, tree, &path)?;
+        let entry = FileTableEntry::new(path, size, mtime, hash);
+        if get_file_entry(&self.table, file_inode, Some(peer))?.is_none() {
+            self.do_write_file_entry(file_inode, peer, &entry)?;
+        }
+        Ok(
+            if get_file_entry(&self.table, file_inode, None)?.is_none() {
+                self.do_write_default_file_entry(tree, blobs, dirty, file_inode, &entry)?;
+            },
+        )
+    }
+
+    /// Replace a file entry for a peer.
+    pub(crate) fn replace(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
+        dirty: &mut WritableOpenDirty,
+        peer: Peer,
+        path: &Path,
+        mtime: UnixTime,
+        size: u64,
+        hash: &Hash,
+        old_hash: &Hash,
+    ) -> Result<(), StorageError> {
+        let (_, file_inode) = do_create_file(&mut self.table, tree, &path)?;
+        let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
+        if let Some(e) = get_file_entry(&self.table, file_inode, Some(peer))?
+            && e.hash == *old_hash
+        {
+            self.do_write_file_entry(file_inode, peer, &entry)?;
+        }
+        if let Some(old_entry) = get_file_entry(&self.table, file_inode, None)?
+            && old_entry.hash == *old_hash
+        {
+            self.do_write_default_file_entry(tree, blobs, dirty, file_inode, &entry)?;
+        }
+        Ok(())
+    }
+
+    /// Remove a file entry for a peer.
+    pub(crate) fn remove(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
+        dirty: &mut WritableOpenDirty,
+        peer: Peer,
+        path: &Path,
+        old_hash: &Hash,
+    ) -> Result<(), StorageError> {
+        self.do_unlink(tree, blobs, dirty, peer, &path, old_hash.clone())?;
+
+        Ok(())
+    }
+
+    /// Drop a file entry for a peer.
+    pub(crate) fn drop(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
+        dirty: &mut WritableOpenDirty,
+        peer: Peer,
+        path: Path,
+        old_hash: Hash,
+    ) -> Result<(), StorageError> {
+        self.do_unlink(tree, blobs, dirty, peer, &path, old_hash)?;
+        Ok(())
+    }
+
+    /// Start catchup for a peer.
+    pub(crate) fn catchup_start(&mut self, peer: Peer) -> Result<(), StorageError> {
+        for elt in self.table.iter()? {
+            let (k, _) = elt?;
+            if let CacheTableKey::PeerCopy(inode, elt_peer) = k.value()
+                && elt_peer == peer
+            {
+                self.pending_catchup_table
+                    .insert((peer.as_str(), inode), ())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Process a catchup notification.
+    pub(crate) fn catchup(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
+        dirty: &mut WritableOpenDirty,
+        peer: Peer,
+        path: Path,
+        mtime: UnixTime,
+        size: u64,
+        hash: Hash,
+    ) -> Result<(), StorageError> {
+        let (_, file_inode) = do_create_file(&mut self.table, tree, &path)?;
+        do_unmark_peer_file(&mut self.pending_catchup_table, peer, file_inode)?;
+        let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
+        if let Some(e) = get_file_entry(&self.table, file_inode, None)?
+            && e.hash != hash
+        {
+            self.do_unlink(tree, blobs, dirty, peer, &path, e.hash)?;
+        }
+        self.do_write_file_entry(file_inode, peer, &entry)?;
+        Ok(
+            if !get_file_entry(&self.table, file_inode, None)?.is_some() {
+                self.do_write_default_file_entry(tree, blobs, dirty, file_inode, &entry)?;
+            },
+        )
+    }
+
+    /// Complete catchup for a peer.
+    pub(crate) fn catchup_complete(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
+        dirty: &mut WritableOpenDirty,
+        peer: Peer,
+    ) -> Result<(), StorageError> {
+        self.do_delete_marked_files(tree, blobs, dirty, peer)?;
+        Ok(())
+    }
+
+    /// Write a file entry for a specific peer.
+    fn do_write_file_entry(
+        &mut self,
+        file_inode: Inode,
+        peer: Peer,
+        entry: &FileTableEntry,
+    ) -> Result<(), StorageError> {
+        log::debug!(
+            "[{}] new file entry {:?} {file_inode} on {peer} {}",
+            self.arena,
+            entry.path,
+            entry.hash
+        );
+
+        self.table.insert(
+            CacheTableKey::PeerCopy(file_inode, peer),
+            Holder::new(&CacheTableEntry::File(entry.clone()))?,
+        )?;
+
+        Ok(())
+    }
+
+    /// Write the default file entry.
+    fn do_write_default_file_entry(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
+        dirty: &mut WritableOpenDirty,
+        inode: Inode,
+        new_entry: &FileTableEntry,
+    ) -> Result<(), StorageError> {
+        self.before_default_file_entry_change(tree, blobs, dirty, inode)?;
+        tree.insert_and_incref(
+            inode,
+            &mut self.table,
+            CacheTableKey::Default(inode),
+            Holder::new(&CacheTableEntry::File(new_entry.clone()))?,
+        )?;
+
+        Ok(())
+    }
+
+    /// This must be executed before updating or removing the default
+    /// file entry.
+    fn before_default_file_entry_change(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
+        dirty: &mut WritableOpenDirty,
+        inode: Inode,
+    ) -> Result<(), StorageError> {
+        blobs.delete(tree, inode)?;
+
+        // This entry is the outside world view of the file, so
+        // changes should be reported.
+        dirty.mark_dirty(inode, "cache")?;
+
+        Ok(())
+    }
+
+    /// Remove a file entry for a specific peer and update or remove
+    /// the corresponding default entry, as necessary.
+    fn do_rm_file_entry(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
+        dirty: &mut WritableOpenDirty,
+        parent_inode: Inode,
+        inode: Inode,
+        peer: Peer,
+    ) -> Result<(), StorageError> {
+        // Remove the entry
+        if self
+            .table
+            .remove(CacheTableKey::PeerCopy(inode, peer))?
+            .is_none()
+        {
+            // nothing was changed
+            return Ok(());
+        }
+
+        // Update or remove the default entry, if it relied on the now
+        // removed peer entry.
+
+        let mut peer_entries = vec![];
+        let mut default_entry = None;
+        for elt in self.table.range(CacheTableKey::range(inode))? {
+            let (key, value) = elt?;
+            match key.value() {
+                CacheTableKey::PeerCopy(_, _) => {
+                    peer_entries.push(value.value().parse()?.expect_file()?);
+                }
+                CacheTableKey::Default(_) => {
+                    default_entry = Some(value.value().parse()?.expect_file()?);
+                }
+                _ => {}
+            }
+        }
+        let default_entry = match default_entry {
+            Some(e) => e,
+            None => {
+                // if there's no default entry, there's nothing to do
+                return Ok(());
+            }
+        };
+
+        if peer_entries
+            .iter()
+            .find(|e| e.hash == default_entry.hash)
+            .is_some()
+        {
+            // The default entry is still valid
+            return Ok(());
+        }
+
+        // Select a new hash. This selects the most recent one; since
+        // version history is lost there's very little else we can do.
+        let new_entry = peer_entries.into_iter().max_by_key(|e| e.mtime);
+        match new_entry {
+            Some(new_entry) => {
+                self.do_write_default_file_entry(tree, blobs, dirty, inode, &new_entry)?;
+            }
+            None => {
+                self.before_default_file_entry_change(tree, blobs, dirty, inode)?;
+                tree.remove_and_decref(inode, &mut self.table, CacheTableKey::Default(inode))?;
+
+                // Update the parent modification time, as removing an
+                // entry modifies it.
+                let parent_dir_entry = DirtableEntry {
+                    mtime: UnixTime::now(),
+                };
+                let parent_dir_holder =
+                    Holder::with_content(CacheTableEntry::Dir(parent_dir_entry))?;
+                self.table
+                    .insert(CacheTableKey::Default(parent_inode), parent_dir_holder)?;
+
+                return Ok(());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Unlink a file from a peer.
+    fn do_unlink<T>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
+        dirty: &mut WritableOpenDirty,
+        peer: Peer,
+        path: T,
+        old_hash: Hash,
+    ) -> Result<(), StorageError>
+    where
+        T: AsRef<Path>,
+    {
+        let path = path.as_ref();
+        let parent_inode = {
+            if let Some(parent_path) = path.parent() {
+                tree.resolve(parent_path)?
+            } else {
+                Some(tree.root())
+            }
+        };
+        if let Some(parent_inode) = parent_inode {
+            if let Some(inode) = tree.lookup(parent_inode, path.name())? {
+                if let Some(e) = get_file_entry(&self.table, inode, Some(peer))?
+                    && e.hash == old_hash
+                {
+                    self.do_rm_file_entry(tree, blobs, dirty, parent_inode, inode, peer)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Delete all marked files for a peer.
+    fn do_delete_marked_files(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
+        dirty: &mut WritableOpenDirty,
+        peer: Peer,
+    ) -> Result<(), StorageError> {
+        let peer_str = peer.as_str();
+        let mut inodes = vec![];
+        for elt in self
+            .pending_catchup_table
+            .extract_from_if((peer_str, Inode::ZERO)..=(peer_str, Inode::MAX), |_, _| {
+                true
+            })?
+        {
+            let elt = elt?;
+            let (_, inode) = elt.0.value();
+            inodes.push(inode);
+        }
+        for inode in inodes {
+            if let Some(parent_inode) = tree.parent(inode)? {
+                self.do_rm_file_entry(tree, blobs, dirty, parent_inode, inode, peer)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Lookup a specific name in the given directory inode.
+fn lookup(
+    cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    tree: &impl TreeReadOperations,
+    parent_inode: Inode,
+    name: &str,
+) -> Result<(Inode, InodeAssignment), StorageError> {
+    check_is_dir(cache_table, parent_inode)?;
+    if let Some(inode) = tree.lookup(parent_inode, name)? {
+        if let Some(assignment) = inode_assignment(cache_table, inode)? {
+            return Ok((inode, assignment));
+        }
+    }
+
+    Err(StorageError::NotFound)
+}
+
+/// Get directory modification time for the given inode.
+fn dir_mtime(
+    cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    inode: Inode,
+) -> Result<UnixTime, StorageError> {
+    match cache_table.get(CacheTableKey::Default(inode))? {
+        Some(e) => match e.value().parse()? {
+            CacheTableEntry::Dir(dir_entry) => Ok(dir_entry.mtime),
+            CacheTableEntry::File(_) => Err(StorageError::NotADirectory),
+        },
+        None => {
+            // When the filesystem is empty, the root dir might not
+            // have a mtime. This is not an error.
+            Ok(UnixTime::ZERO)
+        }
+    }
+}
+
+/// Get file availability information for the given inode.
+fn file_availability(
+    cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    inode: Inode,
+    arena: Arena,
+) -> Result<FileAvailability, StorageError> {
+    let mut range = cache_table.range(CacheTableKey::range(inode))?;
+    let (default_key, default_entry) = range.next().ok_or(StorageError::NotFound)??;
+    if !matches!(default_key.value(), CacheTableKey::Default(_)) {
+        return Err(StorageError::NotFound);
+    }
+    let FileTableEntry {
+        size,
+        mtime,
+        path,
+        hash,
+        ..
+    } = default_entry.value().parse()?.expect_file()?;
+
+    let mut peers = vec![];
+    for entry in range {
+        let entry = entry?;
+        if let CacheTableKey::PeerCopy(_, peer) = entry.0.value() {
+            let file_entry: FileTableEntry = entry.1.value().parse()?.expect_file()?;
+            if file_entry.hash == hash {
+                peers.push(peer);
+            }
+        }
+    }
+    if peers.is_empty() {
+        log::warn!("No peer has hash {hash} for {inode}");
+        return Err(StorageError::NotFound);
+    }
+
+    Ok(FileAvailability {
+        arena: arena,
+        path,
+        metadata: FileMetadata { size, mtime },
+        hash,
+        peers,
+    })
+}
+
+/// Read directory contents for the given inode.
+fn readdir(
+    cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    tree: &impl TreeReadOperations,
+    inode: Inode,
+) -> Result<Vec<(String, Inode, InodeAssignment)>, StorageError> {
+    check_is_dir(cache_table, inode)?;
+
+    // A Vec is not ideal, but redb iterators are bound to the
+    // transaction; we must collect the results.
+    let mut entries = vec![];
+    for entry in tree.readdir(inode) {
+        let (name, inode) = entry?;
+        if let Some(assignment) = inode_assignment(cache_table, inode)? {
+            entries.push((name, inode, assignment));
+        }
+    }
+
+    Ok(entries)
+}
 
 /// A per-arena cache of remote files.
 ///
@@ -22,7 +729,6 @@ use std::sync::Arc;
 /// It contains the arena's database and root inode.
 pub(crate) struct ArenaCache {
     arena: Arena,
-    arena_root: Inode,
     db: Arc<ArenaDatabase>,
 }
 
@@ -64,11 +770,7 @@ impl ArenaCache {
         db: Arc<ArenaDatabase>,
         _blob_dir: &std::path::Path,
     ) -> Result<Arc<Self>, StorageError> {
-        Ok(Arc::new(Self {
-            arena,
-            arena_root: db.tree().root(),
-            db,
-        }))
+        Ok(Arc::new(Self { arena, db }))
     }
 
     pub(crate) fn arena(&self) -> Arena {
@@ -82,15 +784,8 @@ impl ArenaCache {
     ) -> Result<(Inode, InodeAssignment), StorageError> {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
-        let cache_table = txn.cache_table()?;
-        check_is_dir(&cache_table, parent_inode)?;
-        if let Some(inode) = tree.lookup(parent_inode, name)? {
-            if let Some(assignment) = inode_assignment(&cache_table, inode)? {
-                return Ok((inode, assignment));
-            }
-        }
-
-        Err(StorageError::NotFound)
+        let cache = txn.read_cache()?;
+        cache.lookup(&tree, parent_inode, name)
     }
 
     pub(crate) fn expect<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<Inode, StorageError> {
@@ -112,32 +807,20 @@ impl ArenaCache {
 
     pub(crate) fn file_metadata(&self, inode: Inode) -> Result<FileMetadata, StorageError> {
         let txn = self.db.begin_read()?;
-        do_file_metadata(&txn, inode)
+        let cache = txn.read_cache()?;
+        cache.file_metadata(inode)
     }
 
     pub(crate) fn dir_mtime(&self, inode: Inode) -> Result<UnixTime, StorageError> {
         let txn = self.db.begin_read()?;
-        let cache_table = txn.cache_table()?;
-        match cache_table.get(CacheTableKey::Default(inode))? {
-            Some(e) => match e.value().parse()? {
-                CacheTableEntry::Dir(dir_entry) => Ok(dir_entry.mtime),
-                CacheTableEntry::File(_) => Err(StorageError::NotADirectory),
-            },
-            None => {
-                if inode == self.arena_root {
-                    // When the filesystem is empty, the root dir might not
-                    // have a mtime. This is not an error.
-                    return Ok(UnixTime::ZERO);
-                }
-                Err(StorageError::NotFound)
-            }
-        }
+        let cache = txn.read_cache()?;
+        cache.dir_mtime(inode)
     }
 
     pub(crate) fn file_availability(&self, inode: Inode) -> Result<FileAvailability, StorageError> {
         let txn = self.db.begin_read()?;
-
-        do_file_availability(&txn, inode, self.arena)
+        let cache = txn.read_cache()?;
+        cache.file_availability(inode)
     }
 
     pub(crate) fn readdir(
@@ -146,26 +829,14 @@ impl ArenaCache {
     ) -> Result<Vec<(String, Inode, InodeAssignment)>, StorageError> {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
-        let cache_table = txn.cache_table()?;
-        check_is_dir(&cache_table, inode)?;
-
-        // A Vec is not ideal, but redb iterators are bound to the
-        // transaction; we must collect the results.
-        let mut entries = vec![];
-        for entry in tree.readdir(inode) {
-            let (name, inode) = entry?;
-            if let Some(assignment) = inode_assignment(&cache_table, inode)? {
-                entries.push((name, inode, assignment));
-            }
-        }
-
-        Ok(entries)
+        let cache = txn.read_cache()?;
+        cache.readdir(&tree, inode)
     }
 
     pub(crate) fn peer_progress(&self, peer: Peer) -> Result<Option<Progress>, StorageError> {
         let txn = self.db.begin_read()?;
-
-        do_peer_progress(&txn, peer)
+        let peers = txn.read_peers()?;
+        peers.progress(peer)
     }
 
     pub(crate) fn update(
@@ -175,216 +846,83 @@ impl ArenaCache {
         index_root: Option<&std::path::Path>,
     ) -> Result<(), StorageError> {
         log::debug!("notification from {peer}: {notification:?}");
-        // Arc<UnrealCache>::update, is responsible for dispatching properly
+        // UnrealCache::update, is responsible for dispatching properly
         assert_eq!(self.arena, notification.arena());
 
         let txn = self.db.begin_write()?;
-        match notification {
-            Notification::Add {
-                index,
-                path,
-                mtime,
-                size,
-                hash,
-                ..
-            } => {
-                self.add(peer, &txn, index, path, mtime, size, hash)?;
+        {
+            let mut tree = txn.write_tree()?;
+            let mut peers = txn.write_peers()?;
+            let mut cache = txn.write_cache()?;
+            let mut blobs = txn.write_blobs()?;
+            let mut dirty = txn.write_dirty()?;
+            if let Some(index) = notification.index() {
+                peers.update_last_seen_notification(peer, index)?;
             }
-            Notification::Replace {
-                index,
-                path,
-                mtime,
-                size,
-                hash,
-                old_hash,
-                ..
-            } => {
-                self.replace(peer, &txn, index, path, mtime, size, hash, old_hash)?;
-            }
-            Notification::Remove {
-                index,
-                path,
-                old_hash,
-                ..
-            } => {
-                self.remove(peer, index_root, &txn, index, path, old_hash)?;
-            }
-            Notification::Drop {
-                index,
-                path,
-                old_hash,
-                ..
-            } => {
-                self.drop(peer, &txn, index, path, old_hash)?;
-            }
-            Notification::CatchupStart(_) => {
-                catchup_start(&txn, peer)?;
-            }
-            Notification::Catchup {
-                path,
-                mtime,
-                size,
-                hash,
-                ..
-            } => {
-                self.catchup(peer, &txn, path, mtime, size, hash)?;
-            }
-            Notification::CatchupComplete { index, .. } => {
-                self.catchup_complete(peer, &txn, index)?;
-            }
-            Notification::Connected { uuid, .. } => {
-                connected(peer, &txn, uuid)?;
+            match notification {
+                Notification::Add {
+                    path,
+                    mtime,
+                    size,
+                    hash,
+                    ..
+                } => cache.add(
+                    &mut tree, &mut blobs, &mut dirty, peer, path, mtime, size, hash,
+                )?,
+                Notification::Replace {
+                    path,
+                    mtime,
+                    size,
+                    hash,
+                    old_hash,
+                    ..
+                } => {
+                    cache.replace(
+                        &mut tree, &mut blobs, &mut dirty, peer, &path, mtime, size, &hash,
+                        &old_hash,
+                    )?;
+
+                    let mut index = txn.write_index()?;
+                    index.record_outdated(&tree, &path, &old_hash, &hash)?;
+                }
+
+                Notification::Remove { path, old_hash, .. } => {
+                    cache.remove(&mut tree, &mut blobs, &mut dirty, peer, &path, &old_hash)?;
+
+                    if let Some(index_root) = index_root {
+                        if let Some(indexed) = txn.read_index()?.get(&tree, &path)?
+                            && indexed.is_outdated_by(&old_hash)
+                            && indexed.matches_file(path.within(&index_root))
+                        {
+                            // This specific version has been removed
+                            // remotely. Make sure that the file hasn't
+                            // changed since it was indexed and if it hasn't,
+                            // remove it locally as well.
+                            std::fs::remove_file(&path.within(index_root))?;
+                        }
+                    }
+                }
+                Notification::Drop { path, old_hash, .. } => {
+                    cache.drop(&mut tree, &mut blobs, &mut dirty, peer, path, old_hash)?
+                }
+                Notification::CatchupStart(_) => cache.catchup_start(peer)?,
+                Notification::Catchup {
+                    path,
+                    mtime,
+                    size,
+                    hash,
+                    ..
+                } => cache.catchup(
+                    &mut tree, &mut blobs, &mut dirty, peer, path, mtime, size, hash,
+                )?,
+                Notification::CatchupComplete { .. } => {
+                    cache.catchup_complete(&mut tree, &mut blobs, &mut dirty, peer)?
+                }
+                Notification::Connected { uuid, .. } => peers.connected(peer, uuid)?,
             }
         }
         txn.commit()?;
         Ok(())
-    }
-
-    fn catchup_complete(
-        &self,
-        peer: Peer,
-        txn: &ArenaWriteTransaction<'_>,
-        index: u64,
-    ) -> Result<(), StorageError> {
-        self.do_delete_marked_files(txn, peer)?;
-        do_update_last_seen_notification(txn, peer, index)?;
-        Ok(())
-    }
-
-    fn catchup(
-        &self,
-        peer: Peer,
-        txn: &ArenaWriteTransaction<'_>,
-        path: Path,
-        mtime: UnixTime,
-        size: u64,
-        hash: Hash,
-    ) -> Result<(), StorageError> {
-        let mut cache_table = txn.cache_table()?;
-        let mut tree = txn.write_tree()?;
-        let (_, file_inode) = do_create_file(&mut cache_table, &mut tree, &path)?;
-        do_unmark_peer_file(txn, peer, file_inode)?;
-        let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
-        if let Some(e) = get_file_entry(&cache_table, file_inode, None)?
-            && e.hash != hash
-        {
-            self.do_unlink(txn, peer, &path, e.hash)?;
-        }
-        self.do_write_file_entry(&mut cache_table, file_inode, peer, &entry)?;
-        Ok(
-            if !get_file_entry(&cache_table, file_inode, None)?.is_some() {
-                self.do_write_default_file_entry(
-                    txn,
-                    &mut tree,
-                    &mut cache_table,
-                    file_inode,
-                    &entry,
-                )?;
-            },
-        )
-    }
-
-    fn drop(
-        &self,
-        peer: Peer,
-        txn: &ArenaWriteTransaction<'_>,
-        index: u64,
-        path: Path,
-        old_hash: Hash,
-    ) -> Result<(), StorageError> {
-        do_update_last_seen_notification(txn, peer, index)?;
-        self.do_unlink(txn, peer, &path, old_hash)?;
-        Ok(())
-    }
-
-    fn remove(
-        &self,
-        peer: Peer,
-        index_root: Option<&std::path::Path>,
-        txn: &ArenaWriteTransaction<'_>,
-        index: u64,
-        path: Path,
-        old_hash: Hash,
-    ) -> Result<(), StorageError> {
-        do_update_last_seen_notification(txn, peer, index)?;
-        self.do_unlink(txn, peer, &path, old_hash.clone())?;
-        Ok(if let Some(index_root) = index_root {
-            let tree = txn.read_tree()?;
-            let index = txn.read_index()?;
-
-            if let Some(indexed) = index.get(&tree, &path)?
-                && indexed.is_outdated_by(&old_hash)
-                && indexed.matches_file(path.within(&index_root))
-            {
-                // This specific version has been removed
-                // remotely. Make sure that the file hasn't
-                // changed since it was indexed and if it hasn't,
-                // remove it locally as well.
-                std::fs::remove_file(&path.within(index_root))?;
-            }
-        })
-    }
-
-    fn replace(
-        &self,
-        peer: Peer,
-        txn: &ArenaWriteTransaction<'_>,
-        index: u64,
-        path: Path,
-        mtime: UnixTime,
-        size: u64,
-        hash: Hash,
-        old_hash: Hash,
-    ) -> Result<(), StorageError> {
-        do_update_last_seen_notification(txn, peer, index)?;
-        let mut cache_table = txn.cache_table()?;
-        let mut tree = txn.write_tree()?;
-        let (_, file_inode) = do_create_file(&mut cache_table, &mut tree, &path)?;
-        let entry = FileTableEntry::new(path, size, mtime, hash.clone());
-        if let Some(e) = get_file_entry(&cache_table, file_inode, Some(peer))?
-            && e.hash == old_hash
-        {
-            self.do_write_file_entry(&mut cache_table, file_inode, peer, &entry)?;
-        }
-        if let Some(old_entry) = get_file_entry(&cache_table, file_inode, None)?
-            && old_entry.hash == old_hash
-        {
-            self.do_write_default_file_entry(txn, &mut tree, &mut cache_table, file_inode, &entry)?;
-        }
-        let mut index = txn.write_index()?;
-        index.record_outdated(&tree, file_inode, &old_hash, &hash)?;
-        Ok(())
-    }
-
-    fn add(
-        &self,
-        peer: Peer,
-        txn: &ArenaWriteTransaction<'_>,
-        index: u64,
-        path: Path,
-        mtime: UnixTime,
-        size: u64,
-        hash: Hash,
-    ) -> Result<(), StorageError> {
-        do_update_last_seen_notification(txn, peer, index)?;
-        let mut cache_table = txn.cache_table()?;
-        let mut tree = txn.write_tree()?;
-        let (_, file_inode) = do_create_file(&mut cache_table, &mut tree, &path)?;
-        let entry = FileTableEntry::new(path, size, mtime, hash);
-        if get_file_entry(&cache_table, file_inode, Some(peer))?.is_none() {
-            self.do_write_file_entry(&mut cache_table, file_inode, peer, &entry)?;
-        }
-        Ok(
-            if get_file_entry(&cache_table, file_inode, None)?.is_none() {
-                self.do_write_default_file_entry(
-                    txn,
-                    &mut tree,
-                    &mut cache_table,
-                    file_inode,
-                    &entry,
-                )?;
-            },
-        )
     }
 
     /// Open a file for reading/writing.
@@ -402,18 +940,13 @@ impl ArenaCache {
         // Switch to a write transaction to create the blob. We need to read
         // the file entry again because it might have changed.
         let txn = self.db.begin_write()?;
-        let ret = {
-            let cache_table = txn.cache_table()?;
-            let file_entry = get_default_entry(&cache_table, inode)?;
-            let mut blobs = txn.write_blobs()?;
-            let mut tree = txn.write_tree()?;
-            let marks = txn.read_marks()?;
-            let info = blobs.create(&mut tree, &marks, inode, &file_entry.hash, file_entry.size)?;
-            Blob::open_with_info(&self.db, info)?
+        let info = {
+            let mut cache = txn.write_cache()?;
+            cache.create_blob(&txn, inode)?
         };
         txn.commit()?;
 
-        Ok(ret)
+        Ok(Blob::open_with_info(&self.db, info)?)
     }
 
     /// Move the blob entry for `path` to `dest` and delete the blob.
@@ -433,22 +966,8 @@ impl ArenaCache {
     where
         T: AsRef<Path>,
     {
-        let path = path.as_ref();
-        let mut tree = txn.write_tree()?;
-        let inode = tree.expect(path)?;
-        let cache_table = txn.cache_table()?;
-        let file_entry = get_default_entry(&cache_table, inode)?;
-        if file_entry.hash != *hash {
-            return Ok(false);
-        }
-        let mut blobs = txn.write_blobs()?;
-        if !blobs.export(&mut tree, inode, hash, dest)? {
-            return Ok(false);
-        }
-
-        log::debug!("Realized [{}]/{path} {hash} as {dest:?}", self.arena);
-
-        Ok(true)
+        let cache = txn.write_cache()?;
+        cache.move_blob_if_matches(txn, path, hash, dest)
     }
 
     /// Prepare the database and return the path to write into to move some
@@ -465,255 +984,8 @@ impl ArenaCache {
     where
         T: AsRef<Path>,
     {
-        let path = path.as_ref();
-        let inode = match txn.read_tree()?.resolve(path)? {
-            Some(inode) => inode,
-            None => {
-                return Ok(None);
-            }
-        };
-        let cache_table = txn.cache_table()?;
-        let file_entry = match get_default_entry(&cache_table, inode) {
-            Ok(e) => e,
-            Err(StorageError::NotFound) => {
-                return Ok(None);
-            }
-            Err(err) => {
-                return Err(err);
-            }
-        };
-        if file_entry.hash != *hash || file_entry.size != metadata.len() {
-            return Ok(None);
-        }
-        let mut blobs = txn.write_blobs()?;
-        let marks = txn.read_marks()?;
-        let mut tree = txn.write_tree()?;
-        let cachepath = blobs.import(&mut tree, &marks, inode, hash, metadata)?;
-
-        Ok(Some(cachepath))
-    }
-
-    // Return the default file entry for a path.
-    pub(crate) fn get_file_entry_for_loc<'b, L: Into<TreeLoc<'b>>>(
-        &self,
-        txn: &ArenaReadTransaction,
-        tree: &impl TreeReadOperations,
-        loc: L,
-    ) -> Result<Option<FileTableEntry>, StorageError> {
-        let inode = tree.expect(loc)?;
-
-        get_file_entry(&txn.cache_table()?, inode, None)
-    }
-
-    /// Write an entry in the file table, overwriting any existing one.
-    fn do_write_file_entry(
-        &self,
-        cache_table: &mut redb::Table<'_, CacheTableKey, Holder<CacheTableEntry>>,
-        file_inode: Inode,
-        peer: Peer,
-        entry: &FileTableEntry,
-    ) -> Result<(), StorageError> {
-        log::debug!(
-            "[{}] new file entry {:?} {file_inode} on {peer} {}",
-            self.arena,
-            entry.path,
-            entry.hash
-        );
-
-        cache_table.insert(
-            CacheTableKey::PeerCopy(file_inode, peer),
-            Holder::new(&CacheTableEntry::File(entry.clone()))?,
-        )?;
-
-        Ok(())
-    }
-
-    /// This must be executed before updating or removing the default
-    /// file entry.
-    fn before_default_file_entry_change(
-        &self,
-        blobs: &mut WritableOpenBlob,
-        tree: &mut WritableOpenTree,
-        dirty: &mut WritableOpenDirty,
-        inode: Inode,
-    ) -> Result<(), StorageError> {
-        blobs.delete(tree, inode)?;
-
-        // This entry is the outside world view of the file, so
-        // changes should be reported.
-        dirty.mark_dirty(inode, "cache")?;
-
-        Ok(())
-    }
-
-    /// Write an entry in the file table, overwriting any existing one.
-    fn do_write_default_file_entry(
-        &self,
-        txn: &ArenaWriteTransaction,
-        tree: &mut WritableOpenTree,
-        cache_table: &mut redb::Table<'_, CacheTableKey, Holder<CacheTableEntry>>,
-        inode: Inode,
-        new_entry: &FileTableEntry,
-    ) -> Result<(), StorageError> {
-        let mut blobs = txn.write_blobs()?;
-        let mut dirty = txn.write_dirty()?;
-        self.before_default_file_entry_change(&mut blobs, tree, &mut dirty, inode)?;
-        tree.insert_and_incref(
-            inode,
-            cache_table,
-            CacheTableKey::Default(inode),
-            Holder::new(&CacheTableEntry::File(new_entry.clone()))?,
-        )?;
-
-        Ok(())
-    }
-
-    /// Remove a file entry for a specific peer and update or remove
-    /// the corresponding default entry, as necessary.
-    fn do_rm_file_entry(
-        &self,
-        txn: &ArenaWriteTransaction,
-        cache_table: &mut redb::Table<'_, CacheTableKey, Holder<CacheTableEntry>>,
-        tree: &mut WritableOpenTree,
-        parent_inode: Inode,
-        inode: Inode,
-        peer: Peer,
-    ) -> Result<(), StorageError> {
-        // Remove the entry
-        if cache_table
-            .remove(CacheTableKey::PeerCopy(inode, peer))?
-            .is_none()
-        {
-            // nothing was changed
-            return Ok(());
-        }
-
-        // Update or remove the default entry, if it relied on the now
-        // removed peer entry.
-
-        let mut peer_entries = vec![];
-        let mut default_entry = None;
-        for elt in cache_table.range(CacheTableKey::range(inode))? {
-            let (key, value) = elt?;
-            match key.value() {
-                CacheTableKey::PeerCopy(_, _) => {
-                    peer_entries.push(value.value().parse()?.expect_file()?);
-                }
-                CacheTableKey::Default(_) => {
-                    default_entry = Some(value.value().parse()?.expect_file()?);
-                }
-                _ => {}
-            }
-        }
-        let default_entry = match default_entry {
-            Some(e) => e,
-            None => {
-                // if there's no default entry, there's nothing to do
-                return Ok(());
-            }
-        };
-
-        if peer_entries
-            .iter()
-            .find(|e| e.hash == default_entry.hash)
-            .is_some()
-        {
-            // The default entry is still valid
-            return Ok(());
-        }
-
-        // Select a new hash. This selects the most recent one; since
-        // version history is lost there's very little else we can do.
-        let new_entry = peer_entries.into_iter().max_by_key(|e| e.mtime);
-        match new_entry {
-            Some(new_entry) => {
-                self.do_write_default_file_entry(txn, tree, cache_table, inode, &new_entry)?;
-            }
-            None => {
-                let mut blobs = txn.write_blobs()?;
-                let mut dirty = txn.write_dirty()?;
-                self.before_default_file_entry_change(&mut blobs, tree, &mut dirty, inode)?;
-                tree.remove_and_decref(inode, cache_table, CacheTableKey::Default(inode))?;
-
-                // Update the parent modification time, as removing an
-                // entry modifies it.
-                let parent_dir_entry = DirtableEntry {
-                    mtime: UnixTime::now(),
-                };
-                let parent_dir_holder =
-                    Holder::with_content(CacheTableEntry::Dir(parent_dir_entry))?;
-                cache_table.insert(CacheTableKey::Default(parent_inode), parent_dir_holder)?;
-
-                return Ok(());
-            }
-        }
-
-        Ok(())
-    }
-
-    fn do_unlink<T>(
-        &self,
-        txn: &ArenaWriteTransaction,
-        peer: Peer,
-        path: T,
-        old_hash: Hash,
-    ) -> Result<(), StorageError>
-    where
-        T: AsRef<Path>,
-    {
-        let path = path.as_ref();
-        let mut tree = txn.write_tree()?;
-        let parent_inode = {
-            if let Some(parent_path) = path.parent() {
-                tree.resolve(parent_path)?
-            } else {
-                Some(tree.root())
-            }
-        };
-        if let Some(parent_inode) = parent_inode {
-            if let Some(inode) = tree.lookup(parent_inode, path.name())? {
-                let mut cache_table = txn.cache_table()?;
-
-                if let Some(e) = get_file_entry(&cache_table, inode, Some(peer))?
-                    && e.hash == old_hash
-                {
-                    self.do_rm_file_entry(
-                        txn,
-                        &mut cache_table,
-                        &mut tree,
-                        parent_inode,
-                        inode,
-                        peer,
-                    )?;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Delete all marked files for a peer.
-    fn do_delete_marked_files(
-        &self,
-        txn: &ArenaWriteTransaction,
-        peer: Peer,
-    ) -> Result<(), StorageError> {
-        let mut pending_catchup_table = txn.pending_catchup_table()?;
-        let mut cache_table = txn.cache_table()?;
-        let mut tree = txn.write_tree()?;
-        let peer_str = peer.as_str();
-        for elt in pending_catchup_table
-            .extract_from_if((peer_str, Inode::ZERO)..=(peer_str, Inode::MAX), |_, _| {
-                true
-            })?
-        {
-            let elt = elt?;
-            let (_, inode) = elt.0.value();
-            if let Some(parent_inode) = tree.parent(inode)? {
-                self.do_rm_file_entry(txn, &mut cache_table, &mut tree, parent_inode, inode, peer)?;
-            }
-        }
-        Ok(())
+        let cache = txn.write_cache()?;
+        cache.move_into_blob_if_matches(txn, path, hash, metadata)
     }
 
     pub(crate) fn local_availability(
@@ -743,55 +1015,6 @@ impl ArenaCache {
     }
 }
 
-fn connected(
-    peer: Peer,
-    txn: &ArenaWriteTransaction<'_>,
-    uuid: uuid::Uuid,
-) -> Result<(), StorageError> {
-    let mut peer_table = txn.peer_table()?;
-    let key = peer.as_str();
-    if let Some(entry) = peer_table.get(key)? {
-        if entry.value().parse()?.uuid == uuid {
-            // We're connected to the same store as before; there's nothing to do.
-            return Ok(());
-        }
-    }
-    peer_table.insert(key, Holder::with_content(PeerTableEntry { uuid })?)?;
-    let mut notification_table = txn.notification_table()?;
-    notification_table.remove(key)?;
-    Ok(())
-}
-
-fn do_update_last_seen_notification(
-    txn: &ArenaWriteTransaction,
-    peer: Peer,
-    index: u64,
-) -> Result<(), StorageError> {
-    let mut notification_table = txn.notification_table()?;
-    notification_table.insert(peer.as_str(), index)?;
-
-    Ok(())
-}
-
-fn do_peer_progress(
-    txn: &ArenaReadTransaction,
-    peer: Peer,
-) -> Result<Option<Progress>, StorageError> {
-    let key = peer.as_str();
-
-    let peer_table = txn.peer_table()?;
-    if let Some(entry) = peer_table.get(key)? {
-        let PeerTableEntry { uuid, .. } = entry.value().parse()?;
-
-        let notification_table = txn.notification_table()?;
-        if let Some(last_seen) = notification_table.get(key)? {
-            return Ok(Some(Progress::new(uuid, last_seen.value())));
-        }
-    }
-
-    Ok(None)
-}
-
 /// Get a [FileTableEntry] for a specific peer.
 fn get_file_entry(
     cache_table: &impl redb::ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
@@ -807,70 +1030,35 @@ fn get_file_entry(
     }
 }
 
+/// Get the default entry for the given inode.
+///
+/// Returns None if the file cannot be found or if it is a directory.
 fn get_default_entry(
     cache_table: &impl redb::ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
     inode: Inode,
-) -> Result<FileTableEntry, StorageError> {
-    let entry = cache_table
-        .get(CacheTableKey::Default(inode))?
-        .ok_or(StorageError::NotFound)?;
-
-    Ok(entry.value().parse()?.expect_file()?)
-}
-
-fn do_file_metadata(
-    txn: &ArenaReadTransaction,
-    inode: Inode,
-) -> Result<FileMetadata, StorageError> {
-    let entry = get_default_entry(&txn.cache_table()?, inode)?;
-    Ok(FileMetadata {
-        size: entry.size,
-        mtime: entry.mtime,
-    })
-}
-
-fn do_file_availability(
-    txn: &ArenaReadTransaction,
-    inode: Inode,
-    arena: Arena,
-) -> Result<FileAvailability, StorageError> {
-    let cache_table = txn.cache_table()?;
-
-    let mut range = cache_table.range(CacheTableKey::range(inode))?;
-    let (default_key, default_entry) = range.next().ok_or(StorageError::NotFound)??;
-    if !matches!(default_key.value(), CacheTableKey::Default(_)) {
-        return Err(StorageError::NotFound);
-    }
-    let FileTableEntry {
-        size,
-        mtime,
-        path,
-        hash,
-        ..
-    } = default_entry.value().parse()?.expect_file()?;
-
-    let mut peers = vec![];
-    for entry in range {
-        let entry = entry?;
-        if let CacheTableKey::PeerCopy(_, peer) = entry.0.value() {
-            let file_entry: FileTableEntry = entry.1.value().parse()?.expect_file()?;
-            if file_entry.hash == hash {
-                peers.push(peer);
-            }
+) -> Result<Option<FileTableEntry>, StorageError> {
+    if let Some(entry) = cache_table.get(CacheTableKey::Default(inode))? {
+        if let CacheTableEntry::File(entry) = entry.value().parse()? {
+            return Ok(Some(entry));
         }
     }
-    if peers.is_empty() {
-        log::warn!("No peer has hash {hash} for {inode}");
-        return Err(StorageError::NotFound);
-    }
 
-    Ok(FileAvailability {
-        arena: arena,
-        path,
-        metadata: FileMetadata { size, mtime },
-        hash,
-        peers,
-    })
+    Ok(None)
+}
+
+/// Get the default entry for the given inode.
+///
+/// Fail if the file cannot be found or if it is a directory.
+fn get_default_entry_or_err(
+    cache_table: &impl redb::ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    inode: Inode,
+) -> Result<FileTableEntry, StorageError> {
+    cache_table
+        .get(CacheTableKey::Default(inode))?
+        .ok_or(StorageError::NotFound)?
+        .value()
+        .parse()?
+        .expect_file()
 }
 
 /// Retrieve or create a file entry at the given path.
@@ -935,27 +1123,11 @@ fn setup_dir(
     Ok(inode)
 }
 
-fn catchup_start(txn: &ArenaWriteTransaction, peer: Peer) -> Result<(), StorageError> {
-    let cache_table = txn.cache_table()?;
-    let mut pending_catchup_table = txn.pending_catchup_table()?;
-    for elt in cache_table.iter()? {
-        let (k, _) = elt?;
-        if let CacheTableKey::PeerCopy(inode, elt_peer) = k.value()
-            && elt_peer == peer
-        {
-            pending_catchup_table.insert((peer.as_str(), inode), ())?;
-        }
-    }
-
-    Ok(())
-}
-
 fn do_unmark_peer_file(
-    txn: &ArenaWriteTransaction,
+    pending_catchup_table: &mut Table<'_, (&'static str, Inode), ()>,
     peer: Peer,
     inode: Inode,
 ) -> Result<(), StorageError> {
-    let mut pending_catchup_table = txn.pending_catchup_table()?;
     pending_catchup_table.remove((peer.as_str(), inode))?;
 
     Ok(())
@@ -1155,7 +1327,7 @@ mod tests {
 
         fixture.add_to_cache(&file_path, 100, mtime)?;
 
-        let (inode, assignment) = acache.lookup(acache.arena_root, "a")?;
+        let (inode, assignment) = acache.lookup(fixture.db.tree().root(), "a")?;
         assert_eq!(assignment, InodeAssignment::Directory, "a");
 
         let (_, assignment) = acache.lookup(inode, "b")?;
@@ -1173,14 +1345,14 @@ mod tests {
 
         fixture.add_to_cache(&file_path, 100, mtime)?;
 
-        let (a, _) = acache.lookup(acache.arena_root, "a")?;
+        let (a, _) = acache.lookup(fixture.db.tree().root(), "a")?;
         let (b, _) = acache.lookup(a, "b")?;
         let (c, _) = acache.lookup(b, "c.txt")?;
 
         {
             let txn = fixture.db.begin_read()?;
             let tree = txn.read_tree()?;
-            assert_eq!(acache.arena_root, tree.root());
+            assert_eq!(fixture.db.tree().root(), tree.root());
             assert!(tree.inode_exists(a)?);
             assert!(tree.inode_exists(b)?);
             assert!(tree.inode_exists(c)?);
@@ -1426,7 +1598,7 @@ mod tests {
         let mtime = test_time();
 
         fixture.add_to_cache(&file_path, 100, mtime)?;
-        let arena_root = acache.arena_root;
+        let arena_root = fixture.db.tree().root();
         acache.lookup(arena_root, "file.txt")?;
         fixture.remove_from_cache(&file_path)?;
         assert!(matches!(
@@ -1445,7 +1617,7 @@ mod tests {
         let mtime = test_time();
 
         fixture.add_to_cache(&file_path, 100, mtime)?;
-        let arena_root = acache.arena_root;
+        let arena_root = fixture.db.tree().root();
         let (inode, _) = acache.lookup(arena_root, "file.txt")?;
 
         fixture.clear_dirty()?;
@@ -1463,7 +1635,7 @@ mod tests {
         let mtime = test_time();
 
         fixture.add_to_cache(&file_path, 100, mtime)?;
-        let arena_root = fixture.acache.arena_root;
+        let arena_root = fixture.db.tree().root();
         let dir_mtime = fixture.acache.dir_mtime(arena_root)?;
         fixture.remove_from_cache(&file_path)?;
 
@@ -1511,7 +1683,7 @@ mod tests {
         fixture.add_to_cache(&file_path, 100, mtime)?;
 
         // Lookup directory
-        let (inode, assignment) = acache.lookup(acache.arena_root, "a")?;
+        let (inode, assignment) = acache.lookup(fixture.db.tree().root(), "a")?;
         assert_eq!(assignment, InodeAssignment::Directory);
 
         // Lookup file
@@ -1531,7 +1703,7 @@ mod tests {
         let acache = &fixture.acache;
 
         assert!(matches!(
-            acache.lookup(acache.arena_root, "nonexistent"),
+            acache.lookup(fixture.db.tree().root(), "nonexistent"),
             Err(StorageError::NotFound),
         ));
 
@@ -1567,7 +1739,7 @@ mod tests {
         fixture.add_to_cache(&Path::parse("dir/file2.txt")?, 200, mtime)?;
         fixture.add_to_cache(&Path::parse("dir/subdir/file3.txt")?, 300, mtime)?;
 
-        let arena_root = acache.arena_root;
+        let arena_root = fixture.db.tree().root();
         assert_unordered::assert_eq_unordered!(
             vec![("dir".to_string(), InodeAssignment::Directory),],
             acache
@@ -1642,7 +1814,7 @@ mod tests {
             None,
         )?;
 
-        let (inode, _) = acache.lookup(acache.arena_root, "file.txt")?;
+        let (inode, _) = acache.lookup(fixture.db.tree().root(), "file.txt")?;
         let metadata = acache.file_metadata(inode)?;
         assert_eq!(metadata.size, 200);
         assert_eq!(metadata.mtime, later_time());
@@ -1697,7 +1869,7 @@ mod tests {
             },
             None,
         )?;
-        let (inode, _) = acache.lookup(acache.arena_root, "file.txt")?;
+        let (inode, _) = acache.lookup(fixture.db.tree().root(), "file.txt")?;
         let avail = acache.file_availability(inode)?;
         assert_eq!(arena, avail.arena);
         assert_eq!(path, avail.path);
@@ -1776,7 +1948,7 @@ mod tests {
             },
             None,
         )?;
-        let (inode, _) = acache.lookup(acache.arena_root, "file.txt")?;
+        let (inode, _) = acache.lookup(fixture.db.tree().root(), "file.txt")?;
         let avail = acache.file_availability(inode)?;
 
         //  Replace with old_hash=1 means that hash=2 is the most
@@ -1906,7 +2078,7 @@ mod tests {
             },
             None,
         )?;
-        let (inode, _) = acache.lookup(acache.arena_root, "file.txt")?;
+        let (inode, _) = acache.lookup(fixture.db.tree().root(), "file.txt")?;
         let avail = acache.file_availability(inode)?;
         assert_eq!(vec![a], avail.peers);
         assert_eq!(Hash([3u8; 32]), avail.hash);

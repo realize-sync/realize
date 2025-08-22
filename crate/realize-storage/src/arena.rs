@@ -25,6 +25,7 @@ pub mod indexed_store;
 mod jobs;
 pub mod mark;
 pub mod notifier;
+mod peer;
 mod tree;
 pub mod types;
 pub mod watcher;
@@ -91,12 +92,7 @@ impl ArenaStorage {
                 })
             }
         };
-        let engine = Engine::new(
-            arena,
-            Arc::clone(&db),
-            arena_cache.clone(),
-            job_retry_strategy,
-        );
+        let engine = Engine::new(arena, Arc::clone(&db), job_retry_strategy);
 
         let shutdown = CancellationToken::new();
         jobs::StorageJobProcessor::new(

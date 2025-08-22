@@ -1,4 +1,4 @@
-use super::arena_cache::ArenaCache;
+use super::arena_cache::CacheReadOperations;
 use super::blob::BlobReadOperations;
 use super::db::{ArenaDatabase, ArenaReadTransaction};
 use super::dirty::DirtyReadOperations;
@@ -93,7 +93,6 @@ pub enum JobStatus {
 pub struct Engine {
     arena: Arena,
     db: Arc<ArenaDatabase>,
-    cache: Arc<ArenaCache>,
     job_retry_strategy: Box<dyn (Fn(u32) -> Option<Duration>) + Sync + Send + 'static>,
 
     /// A channel that triggers whenever a new failed job is created.
@@ -109,8 +108,6 @@ impl Engine {
     pub(crate) fn new(
         arena: Arena,
         db: Arc<ArenaDatabase>,
-        cache: Arc<ArenaCache>,
-
         job_retry_strategy: impl (Fn(u32) -> Option<Duration>) + Sync + Send + 'static,
     ) -> Arc<Engine> {
         let (failed_job_tx, _) = watch::channel(());
@@ -118,7 +115,6 @@ impl Engine {
         Arc::new(Self {
             arena,
             db,
-            cache,
             job_retry_strategy: Box::new(job_retry_strategy),
             failed_job_tx,
             retry_jobs_missing_peers,
@@ -436,6 +432,7 @@ impl Engine {
         inode: Inode,
     ) -> Result<Option<StorageJob>, StorageError> {
         let index = txn.read_index()?;
+        let cache = txn.read_cache()?;
         let blobs = txn.read_blobs()?;
 
         let mut want_protect_blob = false;
@@ -466,7 +463,7 @@ impl Engine {
         let mut should_realize = None;
         let mut should_unrealize = None;
 
-        if let Some(cached) = self.cache.get_file_entry_for_loc(txn, tree, inode)? {
+        if let Some(cached) = cache.get_at_inode(inode)? {
             if want_unrealize {
                 if let Some(indexed) = index.get_at_inode(inode)?
                     && indexed.is_outdated_by(&cached.hash)
@@ -655,7 +652,7 @@ mod tests {
                 &blob_dir,
             )?;
             let acache = ArenaCache::new(arena, Arc::clone(&db), &blob_dir)?;
-            let engine = Engine::new(arena, Arc::clone(&db), Arc::clone(&acache), |attempt| {
+            let engine = Engine::new(arena, Arc::clone(&db), |attempt| {
                 if attempt < 3 {
                     Some(Duration::from_secs(attempt as u64 * 10))
                 } else {
