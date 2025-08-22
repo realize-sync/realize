@@ -59,7 +59,7 @@ impl SetupHelper {
 
         let downloader = Downloader::new(self.household.clone(), cache.clone());
 
-        nfs::export(cache.clone(), downloader, addr).await?;
+        nfs::export(Arc::clone(cache), downloader, addr).await?;
 
         Ok(())
     }

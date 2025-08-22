@@ -58,7 +58,7 @@ impl ArenaCache {
         Ok(ArenaCache::new(arena, Arc::clone(&db), blob_dir)?)
     }
 
-    /// Create a new ArenaUnrealCacheBlocking from an arena, root inode, database, and blob directory.
+    /// Create a new ArenaCache from an arena, root inode, database, and blob directory.
     pub(crate) fn new(
         arena: Arena,
         db: Arc<ArenaDatabase>,
@@ -175,7 +175,7 @@ impl ArenaCache {
         index_root: Option<&std::path::Path>,
     ) -> Result<(), StorageError> {
         log::debug!("notification from {peer}: {notification:?}");
-        // UnrealCacheBlocking::update, is responsible for dispatching properly
+        // Arc<UnrealCache>::update, is responsible for dispatching properly
         assert_eq!(self.arena, notification.arena());
 
         let txn = self.db.begin_write()?;

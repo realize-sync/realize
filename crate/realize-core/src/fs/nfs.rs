@@ -6,7 +6,7 @@ use nfsserve::nfs::{
 };
 use nfsserve::tcp::{NFSTcp as _, NFSTcpListener};
 use nfsserve::vfs::{NFSFileSystem, ReadDirResult, VFSCapabilities};
-use realize_storage::{FileMetadata, Inode, InodeAssignment, StorageError, UnrealCacheAsync};
+use realize_storage::{FileMetadata, GlobalCache, Inode, InodeAssignment, StorageError};
 use realize_types::UnixTime;
 use std::io::{ErrorKind, SeekFrom};
 use std::net::SocketAddr;
@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 
 /// Export the given cache at the given socket address.
 pub async fn export(
-    cache: UnrealCacheAsync,
+    cache: Arc<GlobalCache>,
     downloader: Downloader,
     addr: SocketAddr,
 ) -> std::io::Result<JoinHandle<std::io::Result<()>>> {
@@ -34,7 +34,7 @@ pub async fn export(
 }
 
 struct UnrealFs {
-    cache: UnrealCacheAsync,
+    cache: Arc<GlobalCache>,
     downloader: Downloader,
     readers: Cache<Inode, Arc<Mutex<Download>>>,
     uid: uid3,
@@ -42,7 +42,7 @@ struct UnrealFs {
 }
 
 impl UnrealFs {
-    fn new(cache: UnrealCacheAsync, downloader: Downloader) -> UnrealFs {
+    fn new(cache: Arc<GlobalCache>, downloader: Downloader) -> UnrealFs {
         Self {
             cache,
             downloader,
@@ -171,7 +171,7 @@ impl UnrealFs {
 #[async_trait]
 impl NFSFileSystem for UnrealFs {
     fn root_dir(&self) -> fileid3 {
-        UnrealCacheAsync::ROOT_DIR.into()
+        GlobalCache::ROOT_DIR.into()
     }
 
     fn capabilities(&self) -> VFSCapabilities {
@@ -366,10 +366,10 @@ mod tests {
                 let cache = fixture.cache(a)?;
                 let fs = UnrealFs::new(cache.clone(), Downloader::new(household_a, cache.clone()));
 
-                assert_eq!(UnrealCacheAsync::ROOT_DIR.as_u64(), fs.root_dir());
+                assert_eq!(GlobalCache::ROOT_DIR.as_u64(), fs.root_dir());
 
                 let attrs = fs
-                    .getattr(UnrealCacheAsync::ROOT_DIR.into())
+                    .getattr(GlobalCache::ROOT_DIR.into())
                     .await
                     .map_err(to_anyhow)?;
                 assert_eq!(0o0550, attrs.mode);
@@ -400,7 +400,7 @@ mod tests {
                 let arena = HouseholdFixture::test_arena();
                 let arena_root = fs
                     .lookup(
-                        UnrealCacheAsync::ROOT_DIR.into(),
+                        GlobalCache::ROOT_DIR.into(),
                         &nfsstring::from(arena.as_str().as_bytes()),
                     )
                     .await

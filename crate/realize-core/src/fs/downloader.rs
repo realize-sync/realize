@@ -1,11 +1,12 @@
 use crate::rpc::{ExecutionMode, Household};
 use futures::Future;
-use realize_storage::{Blob, Inode, StorageError, UnrealCacheAsync};
+use realize_storage::{Blob, GlobalCache, Inode, StorageError};
 use realize_types::{Arena, ByteRange, ByteRanges, Path, Peer};
 use std::cmp::min;
 use std::collections::VecDeque;
 use std::io::{ErrorKind, SeekFrom};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite as _, ReadBuf};
 use tokio_stream::StreamExt;
@@ -24,11 +25,11 @@ const MAX_CHUNK_SIZE: u64 = 4 * MIN_CHUNK_SIZE;
 #[derive(Clone)]
 pub struct Downloader {
     household: Household,
-    cache: UnrealCacheAsync,
+    cache: Arc<GlobalCache>,
 }
 
 impl Downloader {
-    pub fn new(household: Household, cache: UnrealCacheAsync) -> Self {
+    pub fn new(household: Household, cache: Arc<GlobalCache>) -> Self {
         Self { household, cache }
     }
 
@@ -901,7 +902,7 @@ mod tests {
             .await?;
 
         let cache = fixture.cache(a)?;
-        let downloader = Downloader::new(household, cache.clone());
+        let downloader = Downloader::new(household, Arc::clone(cache));
 
         let arena = HouseholdFixture::test_arena();
         let inode = cache.expect(arena, &Path::parse("large_file")?).await?;

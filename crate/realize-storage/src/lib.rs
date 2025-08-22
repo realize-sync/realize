@@ -28,13 +28,13 @@ pub use arena::notifier::Notification;
 pub use arena::notifier::Progress;
 pub use arena::types::{FileAvailability, FileMetadata, LocalAvailability, Mark};
 pub use error::StorageError;
-pub use global::cache::UnrealCacheAsync;
+pub use global::cache::GlobalCache;
 pub use global::types::InodeAssignment;
 pub use types::{Inode, JobId};
 
 /// Local storage, including the real store and an unreal cache.
 pub struct Storage {
-    cache: UnrealCacheAsync,
+    cache: Arc<GlobalCache>,
     arena_storage: HashMap<Arena, ArenaStorage>,
 }
 
@@ -56,7 +56,7 @@ impl Storage {
             );
         }
 
-        let cache = UnrealCacheAsync::with_db(
+        let cache = GlobalCache::with_db(
             globaldb,
             allocator,
             arena_storage
@@ -73,7 +73,7 @@ impl Storage {
     }
 
     /// Return a handle on the unreal cache.
-    pub fn cache(&self) -> &UnrealCacheAsync {
+    pub fn cache(&self) -> &Arc<GlobalCache> {
         &self.cache
     }
 
