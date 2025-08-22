@@ -361,30 +361,6 @@ mod tests {
             })
         }
 
-        async fn add_file_to_cache<T: AsRef<Path>>(
-            &self,
-            peer: Peer,
-            path: T,
-        ) -> anyhow::Result<()> {
-            let path = path.as_ref().clone();
-            self.inner
-                .cache(peer)?
-                .update(
-                    Peer::from("other"),
-                    Notification::Add {
-                        arena: HouseholdFixture::test_arena(),
-                        index: 1,
-                        path,
-                        mtime: UnixTime::from_secs(1234567890),
-                        size: 100,
-                        hash: Hash([1u8; 32]),
-                    },
-                )
-                .await?;
-
-            Ok(())
-        }
-
         async fn bind_server<H: JobHandler + 'static>(
             &self,
             local: &LocalSet,
@@ -430,7 +406,6 @@ mod tests {
             )
             .await?;
         let foo = Path::parse("foo")?;
-        fixture.add_file_to_cache(peer, &foo).await?;
 
         local
             .run_until(async move {
@@ -469,7 +444,6 @@ mod tests {
             )
             .await?;
         let foo = Path::parse("foo")?;
-        fixture.add_file_to_cache(peer, &foo).await?;
 
         local
             .run_until(async move {
@@ -507,7 +481,6 @@ mod tests {
             )
             .await?;
         let foo = Path::parse("foo")?;
-        fixture.add_file_to_cache(peer, &foo).await?;
 
         local
             .run_until(async move {
