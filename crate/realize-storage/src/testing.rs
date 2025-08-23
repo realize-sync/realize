@@ -2,13 +2,25 @@ use super::Storage;
 use super::config::{ArenaConfig, CacheConfig, StorageConfig};
 use realize_types::Arena;
 use std::sync::Arc;
-use tokio::fs;
 
 /// Build a storage with a cache and indexes for the given arenas.
 ///
 /// The database and arena roots are put into the provided directory.
 /// Use [arena_root] to get the root path of a specific arena.
 pub async fn storage<T, P>(dir: P, arenas: T) -> anyhow::Result<Arc<Storage>>
+where
+    T: IntoIterator<Item = Arena>,
+    P: AsRef<std::path::Path>,
+{
+    let config = config(dir, arenas)?;
+    Storage::from_config(&config).await
+}
+
+/// Create a test configuration with the given arenas.
+///
+/// The database and arena roots are put into the provided directory.
+/// Use [arena_root] to get the root path of a specific arena.
+pub fn config<T, P>(dir: P, arenas: T) -> anyhow::Result<StorageConfig>
 where
     T: IntoIterator<Item = Arena>,
     P: AsRef<std::path::Path>,
@@ -42,12 +54,12 @@ where
 
     for arena_config in config.arenas.values() {
         if let Some(root) = &arena_config.root {
-            fs::create_dir_all(root).await?;
+            std::fs::create_dir_all(root)?;
         }
-        fs::create_dir_all(&arena_config.blob_dir).await?;
+        std::fs::create_dir_all(&arena_config.blob_dir)?;
     }
 
-    Storage::from_config(&config).await
+    Ok(config)
 }
 
 /// Returns a directory in the given dir to store the files of the

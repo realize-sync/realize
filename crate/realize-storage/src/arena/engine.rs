@@ -277,7 +277,6 @@ impl Engine {
         let mut retry_jobs_missing_peers = self.retry_jobs_missing_peers.subscribe();
 
         loop {
-            log::debug!("[{}] collecting jobs: {start_counter}..", self.arena);
             let (job, last_counter) = task::spawn_blocking({
                 let this = Arc::clone(self);
                 let start_counter = start_counter;
@@ -321,8 +320,6 @@ impl Engine {
                     }
 
                     ret = watch.wait_for(|v| *v >= start_counter) => {
-                        log::debug!("[{arena}] done waiting for v >= {start_counter} / {ret:?}");
-
                         ret?;
                     }
 
