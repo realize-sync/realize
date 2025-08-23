@@ -53,6 +53,7 @@ impl ArenaStorage {
         exclude: &Vec<&std::path::Path>,
         allocator: &Arc<InodeAllocator>,
     ) -> anyhow::Result<Self> {
+        let shutdown = CancellationToken::new();
         let db = ArenaDatabase::new(
             redb_utils::open(&arena_config.db).await?,
             arena,
@@ -79,11 +80,17 @@ impl ArenaStorage {
                 if let Some(limits) = &arena_config.disk_usage {
                     tokio::spawn({
                         let db = Arc::clone(&db);
+                        let shutdown = shutdown.clone();
                         let limits = limits.clone();
 
-                        async move { cleaner::run_loop(db, limits).await }
+                        async move { cleaner::run_loop(db, limits, shutdown).await }
                     });
                 }
+                tokio::spawn({
+                    let db = Arc::clone(&db);
+                    let shutdown = shutdown.clone();
+                    async move { blob::mark_accessed_loop(db, Duration::from_millis(500), shutdown).await }
+                });
 
                 Some(IndexedArenaStorage {
                     root: root.to_path_buf(),
@@ -94,7 +101,6 @@ impl ArenaStorage {
         };
         let engine = Engine::new(arena, Arc::clone(&db), job_retry_strategy);
 
-        let shutdown = CancellationToken::new();
         jobs::StorageJobProcessor::new(
             Arc::clone(&db),
             Arc::clone(&engine),

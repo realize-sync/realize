@@ -1,6 +1,8 @@
-#![allow(dead_code)] // work in progress
+//#![allow(dead_code)] // work in progress
+
 use super::blob::DiskUsage;
 use super::db::ArenaDatabase;
+use tokio_util::sync::CancellationToken;
 use crate::StorageError;
 use crate::arena::blob::BlobReadOperations;
 use crate::config::{BytesOrPercent, DiskUsageLimits};
@@ -8,7 +10,7 @@ use std::cmp::min;
 use std::sync::Arc;
 
 /// Enforce these limits on the given database.
-pub(crate) async fn run_loop(db: Arc<ArenaDatabase>, limits: DiskUsageLimits) {
+pub(crate) async fn run_loop(db: Arc<ArenaDatabase>, limits: DiskUsageLimits, shutdown: CancellationToken) {
     let mut rx = db.blobs().watch_disk_usage();
 
     loop {
@@ -19,9 +21,14 @@ pub(crate) async fn run_loop(db: Arc<ArenaDatabase>, limits: DiskUsageLimits) {
                 db.arena()
             )
         }
-        if rx.changed().await.is_err() {
-            return;
-        };
+        tokio::select!(
+            _ = shutdown.cancelled() => { return; }
+            ret = rx.changed() => {
+                match ret {
+                    Err(_) => return,
+                    Ok(_) => continue,
+                }
+            });
     }
 }
 
@@ -138,15 +145,10 @@ mod tests {
         Arena::from("test_arena")
     }
 
-    fn test_hash() -> realize_types::Hash {
-        realize_types::Hash([1u8; 32])
-    }
-
     struct Fixture {
-        arena: Arena,
         db: Arc<ArenaDatabase>,
         blob_dir: assert_fs::fixture::ChildPath,
-        tempdir: TempDir,
+        _tempdir: TempDir,
     }
 
     impl Fixture {
@@ -162,10 +164,9 @@ mod tests {
             let db = ArenaDatabase::for_testing_single_arena(arena, blob_dir.path())?;
 
             Ok(Self {
-                arena,
                 db,
                 blob_dir,
-                tempdir,
+                _tempdir: tempdir,
             })
         }
 

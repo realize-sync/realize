@@ -7,9 +7,11 @@ use super::types::{BlobTableEntry, LocalAvailability, LruQueueId, Mark, QueueTab
 use crate::StorageError;
 use crate::types::Inode;
 use crate::utils::holder::Holder;
+use priority_queue::PriorityQueue;
 use realize_types::{ByteRange, ByteRanges, Hash};
 use redb::{ReadableTable, Table};
-use std::cmp::min;
+use tokio_util::sync::CancellationToken;
+use std::cmp::{min, Reverse};
 use std::collections::HashMap;
 use std::io::{SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
@@ -17,18 +19,68 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt as _, ReadBuf};
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
+
+/// Background job that marks blobs that are accessed after a cooldown delay.
+///
+/// Marking blobs accessed is best effort. It may fail or skip blobs. The process
+/// shutting down might leave accessed blobs unmarked.
+///
+/// This loop should run as long as blobs can be used, to be able to track
+/// access and keep the LRU queue in the right order. It terminates when `shutdown` is cancelled.
+pub(crate) async fn mark_accessed_loop(db: Arc<ArenaDatabase>, cooldown:Duration,shutdown: CancellationToken){
+    let mut queue = PriorityQueue::new();
+    let mut rx = db.blobs().subscribe_accessed();
+    loop {
+        tokio::select!(
+            _ = shutdown.cancelled() => {
+                return;
+            }
+            ret = rx.recv() => {
+                let inode = match ret {
+                    Ok(inode) => inode,
+                    Err(broadcast::error::RecvError::Lagged(_))=> continue,
+                    Err(broadcast::error::RecvError::Closed) => return
+                };
+                queue.push(inode, Reverse(Instant::now()));
+            }
+            _ = tokio::time::sleep(cooldown), if !queue.is_empty() => {
+                let db = Arc::clone(&db);
+                let mut queue = std::mem::take(&mut queue);
+                // This is all best effort.
+                let _ = tokio::task::spawn_blocking(move || {
+                    let txn = db.begin_write()?;
+                    {
+                        let mut blobs = txn.write_blobs()?;
+                        while let Some((inode, _)) = queue.pop() {
+                            // If marking one inode fails, don't make
+                            // other inodes fail.
+                            let _ = blobs.mark_accessed(inode);
+                        }
+                    }
+                    txn.commit()?;
+
+                    Ok::<(), StorageError>(())
+                }).await;
+            }
+        );
+    }
+}
 
 pub(crate) struct Blobs {
     blob_dir: PathBuf,
     /// Reference counter for open blobs. Maps Inode to the number of open handles.
     open_blobs: OpenBlobRefCounter,
 
-    tx: watch::Sender<DiskUsage>,
+    disk_usage_tx: watch::Sender<DiskUsage>,
 
     /// Kept to not lose history when there are no receivers.
-    _rx: watch::Receiver<DiskUsage>,
+    _disk_usage_tx: watch::Receiver<DiskUsage>,
+
+    /// Report blob accesses
+    accessed_tx: broadcast::Sender<Inode>,
 }
 impl Blobs {
     pub(crate) fn new(
@@ -36,11 +88,13 @@ impl Blobs {
         blob_lru_queue_table: &impl redb::ReadableTable<u16, Holder<'static, QueueTableEntry>>,
     ) -> Result<Blobs, StorageError> {
         let (tx, rx) = watch::channel(disk_usage_op(blob_lru_queue_table)?);
+        let (accessed_tx, _) = broadcast::channel(16);
         Ok(Self {
             blob_dir: blob_dir.to_path_buf(),
             open_blobs: OpenBlobRefCounter::new(),
-            tx,
-            _rx: rx,
+            disk_usage_tx: tx,
+            _disk_usage_tx: rx,
+            accessed_tx,
         })
     }
 
@@ -50,7 +104,12 @@ impl Blobs {
     /// [BlobReadOperations::disk_usage].
     #[allow(dead_code)] // will be used soon
     pub(crate) fn watch_disk_usage(&self) -> watch::Receiver<DiskUsage> {
-        self.tx.subscribe()
+        self.disk_usage_tx.subscribe()
+    }
+
+    /// Return a receiver that can receive report about blob accesses.
+    fn subscribe_accessed(&self) -> broadcast::Receiver<Inode> {
+        self.accessed_tx.subscribe()
     }
 
     /// Return total and available disk space on FS for the blob directory
@@ -121,7 +180,7 @@ impl<'a> WritableOpenBlob<'a> {
         if self.will_report_disk_usage {
             return;
         }
-        let tx = self.subsystem.tx.clone();
+        let tx = self.subsystem.disk_usage_tx.clone();
         self.before_commit.add(move |txn| {
             if let Ok(disk_usage) = txn.read_blobs()?.disk_usage() {
                 txn.after_commit(move || {
@@ -560,17 +619,10 @@ impl<'a> WritableOpenBlob<'a> {
     /// at the front of its queue.
     ///
     /// Does nothing if the blob doesn't exist.
-    #[allow(dead_code)] // for later
-    fn mark_accessed<'b, L: Into<TreeLoc<'b>>>(
+    fn mark_accessed(
         &mut self,
-        tree: &impl TreeReadOperations,
-        loc: L,
+        inode: Inode,
     ) -> Result<(), StorageError> {
-        let inode = match tree.resolve(loc)? {
-            Some(inode) => inode,
-            None => return Ok(()), // Nothing to mark
-        };
-
         let mut blob_entry = match self.blob_table.get(inode)? {
             None => {
                 return Ok(());
@@ -1110,7 +1162,9 @@ impl Blob {
             file.flush()?;
         }
 
-        db.blobs().open_blobs.increment(info.inode);
+        let blobs = db.blobs();
+        blobs.open_blobs.increment(info.inode);
+        let _ = blobs.accessed_tx.send(info.inode);
 
         Ok(Self {
             inode: info.inode,
@@ -2355,7 +2409,7 @@ mod tests {
             let three_inode = tree.resolve(Path::parse("three")?)?.unwrap();
             let one_inode = tree.resolve(Path::parse("one")?)?.unwrap();
 
-            blobs.mark_accessed(&tree, Path::parse("two")?)?;
+            blobs.mark_accessed(two_inode)?;
 
             assert_eq!(
                 vec![two_inode, three_inode, one_inode],
@@ -2364,7 +2418,7 @@ mod tests {
                     .collect::<Result<Vec<_>, StorageError>>()?
             );
 
-            blobs.mark_accessed(&tree, Path::parse("one")?)?;
+            blobs.mark_accessed(one_inode)?;
 
             assert_eq!(
                 vec![one_inode, two_inode, three_inode],
@@ -2515,10 +2569,10 @@ mod tests {
 
             // set LRU order, from least recently used (2) to most
             // recently used (0)
-            blobs.mark_accessed(&tree, inodes[2])?;
-            blobs.mark_accessed(&tree, inodes[1])?;
-            blobs.mark_accessed(&tree, inodes[3])?;
-            blobs.mark_accessed(&tree, inodes[0])?;
+            blobs.mark_accessed(inodes[2])?;
+            blobs.mark_accessed(inodes[1])?;
+            blobs.mark_accessed(inodes[3])?;
+            blobs.mark_accessed(inodes[0])?;
         }
         txn.commit()?;
 
@@ -3110,4 +3164,62 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn mark_accessed_loop_updates_blob_queue() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let shutdown = CancellationToken::new();
+
+        let txn = fixture.begin_write()?;
+        let mut inodes = vec![];
+        {
+            let marks = txn.read_marks()?;
+            let mut blobs = txn.write_blobs()?;
+            let mut tree = txn.write_tree()?;
+
+            for i in 0..3 {
+                let path = Path::parse(format!("blob{i}.txt"))?;
+                let info = blobs.create(&mut tree, &marks, &path, &test_hash(), 100)?;
+                inodes.push(info.inode);
+            }
+        }
+        txn.commit()?;
+
+        let handle = tokio::spawn({
+            let db = Arc::clone(&fixture.db);
+            let shutdown = shutdown.clone();
+            async move {
+                mark_accessed_loop(db, Duration::from_millis(10), shutdown).await;
+        }});
+
+        // Wait a bit for the loop to start
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fixture.db.blobs().accessed_tx.receiver_count() == 0 && Instant::now() < deadline{
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(1, fixture.db.blobs().accessed_tx.receiver_count());
+
+        for _ in 0..20 {
+            drop(Blob::open(&fixture.db, inodes[0])?);
+            let _ = fixture.db.blobs().accessed_tx.send(Inode(999)); // invalid; should be ignored
+            drop(Blob::open(&fixture.db, inodes[2])?);
+            drop(Blob::open(&fixture.db, inodes[1])?);
+        }
+
+        // Cooldown period plus some buffer
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let txn = fixture.begin_read()?;
+        let blobs = txn.read_blobs()?;
+        let queue_order: Vec<Inode> = blobs
+            .head(LruQueueId::WorkingArea)
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        assert_eq!(vec![inodes[1], inodes[2], inodes[0]], queue_order);
+
+        shutdown.cancel();
+        handle.await?;
+
+        Ok(())
+    }
+
 }
