@@ -43,6 +43,7 @@ pub(crate) trait CacheReadOperations {
 
     /// Get the default file entry for the given inode; fail if the entry
     /// cannot be found or if it is a directory.
+    #[allow(dead_code)]
     fn get_at_inode_or_err(&self, inode: Inode) -> Result<FileTableEntry, StorageError>;
 }
 
