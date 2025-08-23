@@ -2396,6 +2396,8 @@ mod tests {
         let protected2 = Path::parse("protected/2")?;
         let evictable1 = Path::parse("evictable/1")?;
         let evictable2 = Path::parse("evictable/2")?;
+        fixture.blob_dir.create_dir_all()?;
+        let blksize = fixture.blob_dir.metadata()?.blksize() as u64;
 
         let txn = fixture.begin_write()?;
         {
@@ -2429,19 +2431,19 @@ mod tests {
         txn.commit()?;
 
         let mut blob = Blob::open(&fixture.db, protected1)?;
-        blob.write_all(&vec![1u8; 4096]).await?;
+        blob.write_all(&vec![1u8; 1 * blksize as usize]).await?;
         blob.update_db().await?;
 
         let mut blob = Blob::open(&fixture.db, protected2)?;
-        blob.write_all(&vec![1u8; 2 * 4096]).await?;
+        blob.write_all(&vec![1u8; 2 * blksize as usize]).await?;
         blob.update_db().await?;
 
         let mut blob = Blob::open(&fixture.db, evictable1)?;
-        blob.write_all(&vec![1u8; 3 * 4096]).await?;
+        blob.write_all(&vec![1u8; 3 * blksize as usize]).await?;
         blob.update_db().await?;
 
         let mut blob = Blob::open(&fixture.db, evictable2)?;
-        blob.write_all(&vec![1u8; 4 * 4096]).await?;
+        blob.write_all(&vec![1u8; 4 * blksize as usize]).await?;
         blob.update_db().await?;
 
         let txn = fixture.begin_read()?;
@@ -2452,8 +2454,8 @@ mod tests {
         // smaller numbers here, sparse file likely don't work.
         assert_eq!(
             DiskUsage {
-                total: DiskUsage::INODE * 4 + 10 * 4096,
-                evictable: DiskUsage::INODE * 2 + 7 * 4096
+                total: DiskUsage::INODE * 4 + 10 * blksize,
+                evictable: DiskUsage::INODE * 2 + 7 * blksize
             },
             blobs.disk_usage()?
         );
