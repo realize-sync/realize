@@ -56,11 +56,11 @@ impl Blobs {
     /// Return total and available disk space on FS for the blob directory
     pub(crate) fn disk_space(&self) -> Result<(u64, u64), StorageError> {
         let stat = nix::sys::statvfs::statvfs(&self.blob_dir)?;
-        let unit = stat.fragment_size();
+        let unit = stat.fragment_size() as u64;
 
         Ok((
-            stat.blocks() * unit as u64,
-            stat.blocks_free() * unit as u64,
+            stat.blocks() as u64 * unit,
+            stat.blocks_free() as u64 * unit,
         ))
     }
 }
