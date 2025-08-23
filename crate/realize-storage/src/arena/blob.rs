@@ -2412,7 +2412,10 @@ mod tests {
                     &marks,
                     path,
                     &test_hash(),
-                    1024 * 1024, // 1M
+                    // Using 64M files on macos apparently won't
+                    // remain sparse after data is written to them
+                    // below a certain size.
+                    64 * 1024 * 1024, // 64M
                 )?;
             }
             assert_eq!(
@@ -2444,6 +2447,9 @@ mod tests {
         let txn = fixture.begin_read()?;
         let blobs = txn.read_blobs()?;
 
+        // This test also tests sparse file support on the FS/OS. If
+        // you're getting the size of the file here instead of the
+        // smaller numbers here, sparse file likely don't work.
         assert_eq!(
             DiskUsage {
                 total: DiskUsage::INODE * 4 + 10 * 4096,
