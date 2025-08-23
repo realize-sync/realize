@@ -2398,6 +2398,10 @@ mod tests {
         let evictable2 = Path::parse("evictable/2")?;
         fixture.blob_dir.create_dir_all()?;
         let blksize = fixture.blob_dir.metadata()?.blksize() as u64;
+        // Using 64M files on macos apparently won't
+        // remain sparse after data is written to them
+        // below a certain size.
+        let filesize = 64 * 1024 * 1024;
 
         let txn = fixture.begin_write()?;
         {
@@ -2409,16 +2413,7 @@ mod tests {
             assert_eq!(DiskUsage::ZERO, blobs.disk_usage()?);
 
             for path in [&protected1, &protected2, &evictable1, &evictable2] {
-                blobs.create(
-                    &mut tree,
-                    &marks,
-                    path,
-                    &test_hash(),
-                    // Using 64M files on macos apparently won't
-                    // remain sparse after data is written to them
-                    // below a certain size.
-                    64 * 1024 * 1024, // 64M
-                )?;
+                blobs.create(&mut tree, &marks, path, &test_hash(), filesize)?;
             }
             assert_eq!(
                 DiskUsage {
@@ -2449,16 +2444,15 @@ mod tests {
         let txn = fixture.begin_read()?;
         let blobs = txn.read_blobs()?;
 
-        // This test also tests sparse file support on the FS/OS. If
-        // you're getting the size of the file here instead of the
-        // smaller numbers here, sparse file likely don't work.
-        assert_eq!(
-            DiskUsage {
-                total: DiskUsage::INODE * 4 + 10 * blksize,
-                evictable: DiskUsage::INODE * 2 + 7 * blksize
-            },
-            blobs.disk_usage()?
-        );
+        let disk_usage = blobs.disk_usage()?;
+        assert!(disk_usage.total > disk_usage.evictable);
+
+        // This test also tests sparse file support on the FS/OS.
+        // While actual disk usage is unpredictable, with sparse files
+        // on different OS, disk usage should be less than the whole
+        // file size.
+        assert!(disk_usage.total < 4 * filesize);
+        assert!(disk_usage.evictable < 2 * filesize);
 
         Ok(())
     }
