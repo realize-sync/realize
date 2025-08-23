@@ -1,6 +1,6 @@
 use crate::types::Inode;
 use crate::utils::holder::{ByteConversionError, ByteConvertible, NamedType};
-use crate::{InodeAssignment, StorageError};
+use crate::{StorageError};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
 use realize_types::{self, Arena, ByteRanges, Hash, Path, Peer, UnixTime};
@@ -459,15 +459,6 @@ pub struct FileAvailability {
     pub metadata: FileMetadata,
     pub hash: Hash,
     pub peers: Vec<Peer>,
-}
-
-/// An entry in a directory listing.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ReadDirEntry {
-    /// The inode of the entry.
-    pub inode: Inode,
-    /// The type of the entry.
-    pub assignment: InodeAssignment,
 }
 
 /// Key for the file table of the [ArenaDatabase].
