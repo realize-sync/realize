@@ -91,7 +91,7 @@ pub(crate) trait TreeReadOperations {
     fn lookup_inode(&self, inode: Inode, name: &str) -> Result<Option<Inode>, StorageError>;
 
     /// List names under the given inode.
-    fn readdir_inode(&self, inode: Inode) -> ReadDirIterator;
+    fn readdir_inode(&self, inode: Inode) -> ReadDirIterator<'_>;
 
     /// Check whether the given inode exists
     fn inode_exists(&self, inode: Inode) -> Result<bool, StorageError>;

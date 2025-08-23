@@ -1478,11 +1478,11 @@ mod tests {
                 .to_path_buf()
         }
 
-        fn begin_read(&self) -> anyhow::Result<ArenaReadTransaction> {
+        fn begin_read(&self) -> anyhow::Result<ArenaReadTransaction<'_>> {
             Ok(self.db.begin_read()?)
         }
 
-        fn begin_write(&self) -> anyhow::Result<ArenaWriteTransaction> {
+        fn begin_write(&self) -> anyhow::Result<ArenaWriteTransaction<'_>> {
             Ok(self.db.begin_write()?)
         }
 
