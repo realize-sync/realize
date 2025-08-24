@@ -2,11 +2,15 @@
 root = "one-a"
 db = "one-a.db"
 blob_dir = "one-a.blobs"
+disk_usage.max.Bytes = 16777216
+disk_usage.leave.Percent = 10
 
 [arenas.two]
 root = "two-a"
 db = "two-a.db"
 blob_dir = "two-a.blobs"
+disk_usage.max.Bytes = 16777216
+disk_usage.leave.Percent = 10
 
 [peers.client]
 pubkey = """

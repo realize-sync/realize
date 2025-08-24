@@ -22,7 +22,7 @@ function rebuild_all {
 }
 
 function up_all {
-    maybe_rebuild realize-daemon release && up a 7001 7002 7003 && up b 8001 8002 8003
+    maybe_rebuild realize-daemon release && up a 7001 7003 && up b 8001 8003
 }
 
 function down_all {
@@ -33,8 +33,7 @@ function down_all {
 function up {
     inst=$1
     port=$2
-    metrics_port=$3
-    nfs_port=$4
+    nfs_port=$3
     configfile="${this}/${inst}.toml"
     keyfile="${root}/resources/test/${inst}.key"
     outfile="${this}/${inst}.out"
@@ -43,7 +42,7 @@ function up {
     rm -f "${sockfile}"
     down $inst
 
-    echo "=== ${inst} Starting on ${port} [metrics ${metrics_port}]"
+    echo "=== ${inst} Starting on ${port} [nfs ${nfs_port}] [sock ${sockfile}]"
     {
         cd "${this}"
         RUST_LOG=${RUST_LOG:-${rust_log}} "${realized_bin}" \
@@ -52,7 +51,6 @@ function up {
             --address "127.0.0.1:${port}" \
             --socket "${sockfile}" \
             --nfs "127.0.0.1:${nfs_port}" \
-            --metrics-addr "127.0.0.1:${metrics_port}" \
             </dev/null >"${outfile}" 2>&1 &
         pid=$!
         echo $pid >"${pidfile}"
@@ -100,26 +98,12 @@ function status {
     tail "${outfile}"
 }
 
-function metrics_all {
-    metrics a && metrics b
-}
-function metrics {
-    inst=$1
-    case $inst in
-        a) port=7002;;
-        b) port=8002;;
-        *) echo >&2 "error: unknown instance"
-    esac
-
-    echo "=== metrics $inst at ${port}"
-    curl http://127.0.0.1:${port}/metrics
-    echo
-}
-
 function control {
+    inst="${1:-a}"
+    shift
     maybe_rebuild realize-control debug && \
         exec "${realize_bin}" \
-             --socket "${this}/a.socket"\
+             --socket "${this}/${inst}.socket"\
              "$@"
 }
 
@@ -150,4 +134,8 @@ function unmount {
 function unmount_all {
     unmount a
     unmount b
+}
+
+function clean {
+    rm -fr *.db *.out *.blob*
 }
