@@ -1,5 +1,5 @@
 use crate::InodeAllocator;
-use crate::config;
+use crate::config::{self, HumanDuration};
 use crate::utils::redb_utils;
 use arena_cache::ArenaCache;
 use db::ArenaDatabase;
@@ -73,7 +73,13 @@ impl ArenaStorage {
                 let watcher = RealWatcher::builder(root, index.clone())
                     .with_initial_scan()
                     .exclude_all(exclude.iter())
-                    .debounce(Duration::from_secs(arena_config.debounce_secs.unwrap_or(3)))
+                    .debounce(
+                        arena_config
+                            .debounce
+                            .clone()
+                            .unwrap_or(HumanDuration(Duration::from_secs(3)))
+                            .into(),
+                    )
                     .max_parallel_hashers(arena_config.max_parallel_hashers.unwrap_or(4))
                     .spawn()
                     .await?;

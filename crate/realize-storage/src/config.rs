@@ -1,6 +1,118 @@
 use realize_types::Arena;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
+
+/// A wrapper around Duration that supports deserialization from both numbers (seconds) and strings with units
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct HumanDuration(pub Duration);
+
+impl HumanDuration {
+    pub fn from_secs(secs: u64) -> Self {
+        HumanDuration(Duration::from_secs(secs))
+    }
+
+    pub fn from_secs_f64(secs: f64) -> Self {
+        HumanDuration(Duration::from_secs_f64(secs))
+    }
+
+    pub fn from_millis(millis: u64) -> Self {
+        HumanDuration(Duration::from_millis(millis))
+    }
+
+    /// Parse a string that can be either a number (seconds) or a human-readable duration with units
+    fn from_str(s: &str) -> Result<Self, String> {
+        // Parse human-readable duration with units
+        let (number_str, unit) = if s.ends_with("ms") {
+            (&s[..s.len() - 2], "ms")
+        } else if s.ends_with("s") {
+            (&s[..s.len() - 1], "s")
+        } else if s.ends_with("m") {
+            (&s[..s.len() - 1], "m")
+        } else {
+            // No unit specified, assume seconds
+            (s, "s")
+        };
+
+        let number: f64 = number_str
+            .parse()
+            .map_err(|_| format!("Invalid number in duration: {}", s))?;
+
+        let duration = match unit {
+            "ms" => Duration::from_millis(number as u64),
+            "s" => Duration::from_secs_f64(number),
+            "m" => Duration::from_secs_f64(number * 60.0),
+            _ => return Err(format!("Unknown unit: {}", unit)),
+        };
+
+        Ok(HumanDuration(duration))
+    }
+}
+
+impl From<HumanDuration> for Duration {
+    fn from(wrapper: HumanDuration) -> Self {
+        wrapper.0
+    }
+}
+
+impl From<Duration> for HumanDuration {
+    fn from(duration: Duration) -> Self {
+        HumanDuration(duration)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for HumanDuration {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct DurationWrapperVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for DurationWrapperVisitor {
+            type Value = HumanDuration;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a number (seconds) or a string like '500ms', '5s', or '3m'")
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(HumanDuration::from_secs(v))
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if v < 0 {
+                    return Err(E::custom("negative values are not allowed"));
+                }
+                Ok(HumanDuration::from_secs(v as u64))
+            }
+
+            fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if v < 0.0 {
+                    return Err(E::custom("negative values are not allowed"));
+                }
+                Ok(HumanDuration::from_secs_f64(v))
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                HumanDuration::from_str(v).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_any(DurationWrapperVisitor)
+    }
+}
 
 /// Storage configuration.
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug, PartialEq, Eq)]
@@ -60,7 +172,7 @@ pub struct ArenaConfig {
 
     /// Set debounce delay for hashing files. This allows some time for
     /// operations in progress to finish.
-    pub debounce_secs: Option<u64>,
+    pub debounce: Option<HumanDuration>,
 
     /// Limits how much disk space will be used to store local copies
     /// of remote data.
@@ -244,7 +356,7 @@ mod tests {
             db = "/path/to/arena1.db"
             blob_dir = "/path/to/arena1/blobs"
             max_parallel_hashers = 4
-            debounce_secs = 5
+            debounce = "500ms"
 
             [arenas."arena2"]
             db = "/path/to/arena2.db"
@@ -265,7 +377,7 @@ mod tests {
                         db: PathBuf::from("/path/to/arena1.db"),
                         blob_dir: PathBuf::from("/path/to/arena1/blobs"),
                         max_parallel_hashers: Some(4),
-                        debounce_secs: Some(5),
+                        debounce: Some(HumanDuration::from_millis(500)),
                         disk_usage: None,
                     },
                 ),
@@ -276,7 +388,7 @@ mod tests {
                         db: PathBuf::from("/path/to/arena2.db"),
                         blob_dir: PathBuf::from("/path/to/arena2/blobs"),
                         max_parallel_hashers: None,
-                        debounce_secs: None,
+                        debounce: None,
                         disk_usage: Some(DiskUsageLimits {
                             max: BytesOrPercent::Bytes(1073741824),
                             leave: None,
@@ -414,5 +526,161 @@ mod tests {
         assert!(BytesOrPercent::from_str("1.5X").is_err()); // Unknown unit
         assert!(BytesOrPercent::from_str("10%invalid").is_err()); // Invalid percentage
         assert!(BytesOrPercent::from_str("").is_err()); // Empty string
+    }
+
+    #[test]
+    fn test_duration_wrapper_from_str() {
+        // Test milliseconds parsing
+        assert_eq!(
+            HumanDuration::from_str("500ms").unwrap(),
+            HumanDuration::from_millis(500)
+        );
+        assert_eq!(
+            HumanDuration::from_str("1000ms").unwrap(),
+            HumanDuration::from_millis(1000)
+        );
+        assert_eq!(
+            HumanDuration::from_str("0ms").unwrap(),
+            HumanDuration::from_millis(0)
+        );
+
+        // Test seconds parsing
+        assert_eq!(
+            HumanDuration::from_str("5s").unwrap(),
+            HumanDuration::from_secs(5)
+        );
+        assert_eq!(
+            HumanDuration::from_str("0s").unwrap(),
+            HumanDuration::from_secs(0)
+        );
+        assert_eq!(
+            HumanDuration::from_str("1.5s").unwrap(),
+            HumanDuration::from_secs_f64(1.5)
+        );
+
+        // Test minutes parsing
+        assert_eq!(
+            HumanDuration::from_str("3m").unwrap(),
+            HumanDuration::from_secs(180)
+        );
+        assert_eq!(
+            HumanDuration::from_str("0m").unwrap(),
+            HumanDuration::from_secs(0)
+        );
+        assert_eq!(
+            HumanDuration::from_str("1.5m").unwrap(),
+            HumanDuration::from_secs_f64(90.0)
+        );
+
+        // Test no unit specified (assumes seconds)
+        assert_eq!(
+            HumanDuration::from_str("5").unwrap(),
+            HumanDuration::from_secs(5)
+        );
+        assert_eq!(
+            HumanDuration::from_str("0").unwrap(),
+            HumanDuration::from_secs(0)
+        );
+        assert_eq!(
+            HumanDuration::from_str("1.5").unwrap(),
+            HumanDuration::from_secs_f64(1.5)
+        );
+
+        // Test error cases
+        assert!(HumanDuration::from_str("invalid").is_err());
+        assert!(HumanDuration::from_str("1.5X").is_err()); // Unknown unit
+        assert!(HumanDuration::from_str("").is_err()); // Empty string
+        assert!(HumanDuration::from_str("5msinvalid").is_err()); // Invalid format
+    }
+
+    #[test]
+    fn test_duration_wrapper_deserialization() {
+        #[derive(serde::Deserialize)]
+        struct ConfigWithDebounce {
+            debounce: Option<HumanDuration>,
+        }
+
+        fn parse(str: &str) -> Option<HumanDuration> {
+            toml::from_str::<ConfigWithDebounce>(str).unwrap().debounce
+        }
+
+        // Test number deserialization (seconds)
+        assert_eq!(parse(r#"debounce = 5"#), Some(HumanDuration::from_secs(5)));
+        assert_eq!(parse(r#"debounce = 0"#), Some(HumanDuration::from_secs(0)));
+        assert_eq!(
+            parse(r#"debounce = 1.5"#),
+            Some(HumanDuration::from_secs_f64(1.5))
+        );
+
+        // Test string deserialization with units
+        assert_eq!(
+            parse(r#"debounce = "500ms""#),
+            Some(HumanDuration::from_millis(500))
+        );
+        assert_eq!(
+            parse(r#"debounce = "5s""#),
+            Some(HumanDuration::from_secs(5))
+        );
+        assert_eq!(
+            parse(r#"debounce = "3m""#),
+            Some(HumanDuration::from_secs(180))
+        );
+        assert_eq!(
+            parse(r#"debounce = "1.5s""#),
+            Some(HumanDuration::from_secs_f64(1.5))
+        );
+        assert_eq!(
+            parse(r#"debounce = "0.5m""#),
+            Some(HumanDuration::from_secs_f64(30.0))
+        );
+
+        // Test missing field
+        assert_eq!(parse(""), None);
+    }
+
+    #[test]
+    fn test_duration_wrapper_conversions() {
+        let duration = Duration::from_secs(5);
+        let wrapper = HumanDuration::from(duration);
+        let converted_duration: Duration = wrapper.into();
+
+        assert_eq!(duration, converted_duration);
+    }
+
+    #[test]
+    fn test_debounce_integration() {
+        // Test all the formats mentioned in the user query
+        let test_cases = vec![
+            (r#"debounce = 5"#, Duration::from_secs(5)),    // 5s
+            (r#"debounce = "5s""#, Duration::from_secs(5)), // 5s
+            (r#"debounce = "5000ms""#, Duration::from_millis(5000)), // 5s
+            (r#"debounce = "3m""#, Duration::from_secs(180)), // 3 minutes
+        ];
+
+        for (toml_str, expected_duration) in test_cases {
+            let full_toml = format!(
+                r#"
+                [cache]
+                db = "/tmp/test.db"
+                
+                [arenas."test"]
+                root = "/tmp/test"
+                db = "/tmp/test.db"
+                blob_dir = "/tmp/test/blobs"
+                {}
+                "#,
+                toml_str
+            );
+
+            let config: StorageConfig = toml::from_str(&full_toml).unwrap();
+            let arena_config = config.arenas.get(&Arena::from("test")).unwrap();
+
+            assert_eq!(
+                arena_config.debounce,
+                Some(HumanDuration(expected_duration)),
+                "Failed for TOML: {}",
+                toml_str
+            );
+        }
     }
 }

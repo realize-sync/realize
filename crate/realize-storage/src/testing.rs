@@ -1,7 +1,8 @@
 use super::Storage;
-use super::config::{ArenaConfig, CacheConfig, StorageConfig};
+use super::config::{ArenaConfig, CacheConfig, HumanDuration, StorageConfig};
 use realize_types::Arena;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Build a storage with a cache and indexes for the given arenas.
 ///
@@ -39,7 +40,7 @@ where
                         blob_dir: arena_dir.join(".arena.blobs"),
 
                         // Disabled in tests
-                        debounce_secs: Some(0),
+                        debounce: Some(HumanDuration(Duration::ZERO)),
                         max_parallel_hashers: Some(0),
 
                         ..Default::default()

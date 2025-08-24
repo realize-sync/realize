@@ -9,12 +9,6 @@ Currently, cleanup runs when disk usage changes, but cannot delete
 open blobs, meaning that very often it'll leave possibly large files
 that used to be open until some other disk usage changes.
 
-## Make config file nicer {#configfile}
-
-Config file should be able to take units for byte fields. disk_usage
-format should be nicer, it could, for example, use suffixes to choose
-the unit (bytes if nothing, percentage if %, bytes if MB, G, ...)
-
 ## Make blobs directory at startup or require it to exist {#blobdir}
 
 Without it, disk_usage fails.
