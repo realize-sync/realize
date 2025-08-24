@@ -53,7 +53,7 @@ mod tests {
             blob_dir = "/path/to/arena1/blobs"
             max_parallel_hashers = 4
             debounce_secs = 5
-            disk_usage = { max = { Percent = 50 }, leave = { Bytes = 1073741824 } }
+            disk_usage = { max = "50%", leave = "1G" }
         "#;
 
         let config: Config = toml::from_str(toml_str).unwrap();
@@ -82,7 +82,7 @@ mod tests {
                             debounce_secs: Some(5),
                             disk_usage: Some(realize_storage::config::DiskUsageLimits {
                                 max: realize_storage::config::BytesOrPercent::Percent(50),
-                                leave: Some(realize_storage::config::BytesOrPercent::Bytes(1073741824)),
+                                leave: Some(realize_storage::config::BytesOrPercent::Bytes(1024 * 1024 * 1024)),
                             }),
                         },
                     )]),
