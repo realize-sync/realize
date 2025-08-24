@@ -31,7 +31,7 @@ impl PeerSetup {
     fn from_config(config: &PeerConfig) -> Self {
         Self {
             address: config.address.clone(),
-            batch_rate_limit: config.batch_rate_limit.clone(),
+            batch_rate_limit: config.batch_rate_limit.as_ref().map(|bv| bv.0),
         }
     }
 }

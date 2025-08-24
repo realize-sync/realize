@@ -67,7 +67,7 @@ mod tests {
                             realize_network::config::PeerConfig {
                                 address: Some("192.168.1.100:8080".to_string()),
                                 pubkey: "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...\n-----END PUBLIC KEY-----".to_string(),
-                                batch_rate_limit: Some(1000),
+                                batch_rate_limit: Some(realize_network::config::ByteValue(1000)),
                             },
                         )]),
                 },
