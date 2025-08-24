@@ -4,8 +4,8 @@
 #  docker build -t realize-daemon -f docker/Dockerfile $PWD
 
 # --- 1. Build stage
-FROM rust:1.87.0-alpine3.21 AS builder
-RUN apk add gcc make musl-dev
+FROM rust:1.89.0-alpine3.21 AS builder
+RUN apk add gcc make musl-dev capnproto capnproto-dev
 WORKDIR /usr/src/app
 
 # --- 1.1 copy source
@@ -21,13 +21,13 @@ FROM alpine:3.21 AS runtime
 
 # --- 2.1 Configuration
 ENV ADDRESS=0.0.0.0:9771
-ENV METRICS_ADDRESS=0.0.0.0:9772
+ENV SOCKFILE=/var/run/realize/realize.socket
 
 # Server private key
 ENV PRIVKEY=/config/private.key
 
 # Config file
-ENV CONFIG=/config/config.yaml
+ENV CONFIG=/config/config.toml
 
 # Configure logging
 ENV RUST_LOG=warn,realize_lib::transport::tcp=info,realize_lib::security=debug,realize_lib::server=info,realize_daemon

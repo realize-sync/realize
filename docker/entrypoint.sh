@@ -1,7 +1,7 @@
 #!/bin/sh
 args="--address ${ADDRESS}\
- --metrics-addr ${METRICS_ADDRESS}\
  --privkey ${PRIVKEY}\
+ --socket ${SOCKFILE}\
  --config ${CONFIG}"
 
 if [ "z${NFS_ADDRESS}" != "z" ]; then
