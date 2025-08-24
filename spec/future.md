@@ -20,6 +20,33 @@ There might be a need for an "audit" concept to log some of these.
 Churten downloads one file at a time, instead of 4. 4 are displayed,
 but only one progresses.
 
+## Make config file nicer {#configfile}
+
+Config file should be able to take units for byte fields. disk_usage
+format should be nicer, it could, for example, use suffixes to choose
+the unit (bytes if nothing, percentage if %, bytes if MB, G, ...)
+
+## realize-control mark get should return arena mark {#getarena}
+
+Currently realize-control mark get expects files and since there
+aren't any, returns nothing. That's not useful.
+
+## It should be possible to read a large file without storing it {#largedl}
+
+Currently, when accessing remote files, the data is always downloaded.
+If the file is kept as long as it's open, even if it's too large to
+fit in the working area. That's wrong.
+
+## Use tracing {#tracing}
+
+Add tracing with context to the whole app; review log messages.
+
+## Call updatedb regularly while downloading {#updatedb}
+
+Currently, Blob::updatedb is called only after closing the file,
+possibly losing a lot of data and delaying cache eviction. Call
+Blob::updatedb regularly to avoid that; every MB for example.
+
 ## Attempt cleanup when blob is closed {#cleanup}
 
 Currently, cleanup runs when disk usage changes, but cannot delete
