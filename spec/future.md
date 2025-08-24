@@ -3,44 +3,6 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
-## Re-design churten {#nochurten}
-
-With the latest changes, churten doesn't make much sense anymore; it's
-just download. Also, important information is missing such as:
-
-- initial hashing, which could take a while
-- realize/unrealize
-- connect/disconnect
-- local changes caused driven by remote notification (out-of-date, deletion)
-
-There might be a need for an "audit" concept to log some of these.
-
-## Investigate why only one file is downloaded at a time {#onefile}
-
-Churten downloads one file at a time, instead of 4. 4 are displayed,
-but only one progresses.
-
-## Make config file nicer {#configfile}
-
-Config file should be able to take units for byte fields. disk_usage
-format should be nicer, it could, for example, use suffixes to choose
-the unit (bytes if nothing, percentage if %, bytes if MB, G, ...)
-
-## realize-control mark get should return arena mark {#getarena}
-
-Currently realize-control mark get expects files and since there
-aren't any, returns nothing. That's not useful.
-
-## It should be possible to read a large file without storing it {#largedl}
-
-Currently, when accessing remote files, the data is always downloaded.
-If the file is kept as long as it's open, even if it's too large to
-fit in the working area. That's wrong.
-
-## Use tracing {#tracing}
-
-Add tracing with context to the whole app; review log messages.
-
 ## Call updatedb regularly while downloading {#updatedb}
 
 Currently, Blob::updatedb is called only after closing the file,
@@ -52,6 +14,56 @@ Blob::updatedb regularly to avoid that; every MB for example.
 Currently, cleanup runs when disk usage changes, but cannot delete
 open blobs, meaning that very often it'll leave possibly large files
 that used to be open until some other disk usage changes.
+
+## realize-control mark get should return arena mark {#getarena}
+
+Currently realize-control mark get expects files and since there
+aren't any, returns nothing. That's not useful.
+
+## Make config file nicer {#configfile}
+
+Config file should be able to take units for byte fields. disk_usage
+format should be nicer, it could, for example, use suffixes to choose
+the unit (bytes if nothing, percentage if %, bytes if MB, G, ...)
+
+## Make blobs directory at startup or require it to exist {#blobdir}
+
+Without it, disk_usage fails.
+
+## Re-design churten {#nochurten}
+
+With the latest changes, churten doesn't make much sense anymore; it's
+just download. Also, important information is missing such as:
+
+- initial hashing, which could take a while
+- download/verify/evict
+- realize/unrealize
+- connect/disconnect
+- local changes caused by remote notifications (out-of-date, deletion)
+
+There might be a need for an "audit" concept to log some of these.
+
+Possibly use or integrate with tracing.
+
+## Reconsider needing to hash before adding file {#musthash}
+
+What if "no version" files could be reported? Remote FS could be up
+and ready quicker, though without version.
+
+## Investigate why only one file is downloaded at a time {#onefile}
+
+Churten downloads one file at a time, instead of 4. 4 are displayed,
+but only one progresses.
+
+## Trim history {#trimhistory}
+
+Decide on rules for trimming history.
+
+## It should be possible to read a large file without storing it {#largedl}
+
+Currently, when accessing remote files, the data is always downloaded.
+If the file is kept as long as it's open, even if it's too large to
+fit in the working area. That's wrong.
 
 ## Add Mark::Ignore {#ignore}
 
