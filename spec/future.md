@@ -3,12 +3,6 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
-## Call updatedb regularly while downloading {#updatedb}
-
-Currently, Blob::updatedb is called only after closing the file,
-possibly losing a lot of data and delaying cache eviction. Call
-Blob::updatedb regularly to avoid that; every MB for example.
-
 ## Attempt cleanup when blob is closed {#cleanup}
 
 Currently, cleanup runs when disk usage changes, but cannot delete

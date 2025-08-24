@@ -14,7 +14,11 @@ use tokio_util::sync::CancellationToken;
 /// Maximum byterange to sync with rsync. This is also the worst-case
 /// size of the Delta to send back, so must be something that fits
 /// reasonably well into one message without slowing everything down.
-const RSYNC_BLOCK_SIZE: usize = 32 * 1024;
+const RSYNC_BLOCK_SIZE: usize = 32 * 1024; // 32K
+
+/// Interval at which to update the database during downloads, in
+/// bytes.
+const UPDATE_DB_INTERVAL_BYTES: u64 = 4 * 1024 * 1024; // 4M
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum JobError {
@@ -132,6 +136,7 @@ async fn write_to_blob(
     }
     let total_bytes = missing.bytecount();
     let mut current_bytes: u64 = 0;
+    let mut last_update_bytes = 0;
     progress.update_action(JobAction::Download);
     progress.update(0, total_bytes);
 
@@ -159,10 +164,13 @@ async fn write_to_blob(
 
             current_bytes += chunk.len() as u64;
             progress.update(current_bytes, total_bytes);
+
+            if current_bytes - last_update_bytes >= UPDATE_DB_INTERVAL_BYTES {
+                let _ = blob.update_db().await;
+                last_update_bytes = current_bytes;
+            }
         }
     }
-    // TODO: Call update_db at regular intervals, so we don't lose too
-    // much data in case the process is interrupted.
 
     Ok(JobStatus::Done)
 }
