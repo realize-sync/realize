@@ -3,119 +3,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// A wrapper around Duration that supports deserialization from both numbers (seconds) and strings with units
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct HumanDuration(pub Duration);
-
-impl HumanDuration {
-    pub fn from_secs(secs: u64) -> Self {
-        HumanDuration(Duration::from_secs(secs))
-    }
-
-    pub fn from_secs_f64(secs: f64) -> Self {
-        HumanDuration(Duration::from_secs_f64(secs))
-    }
-
-    pub fn from_millis(millis: u64) -> Self {
-        HumanDuration(Duration::from_millis(millis))
-    }
-
-    /// Parse a string that can be either a number (seconds) or a human-readable duration with units
-    fn from_str(s: &str) -> Result<Self, String> {
-        // Parse human-readable duration with units
-        let (number_str, unit) = if s.ends_with("ms") {
-            (&s[..s.len() - 2], "ms")
-        } else if s.ends_with("s") {
-            (&s[..s.len() - 1], "s")
-        } else if s.ends_with("m") {
-            (&s[..s.len() - 1], "m")
-        } else {
-            // No unit specified, assume seconds
-            (s, "s")
-        };
-
-        let number: f64 = number_str
-            .parse()
-            .map_err(|_| format!("Invalid number in duration: {}", s))?;
-
-        let duration = match unit {
-            "ms" => Duration::from_millis(number as u64),
-            "s" => Duration::from_secs_f64(number),
-            "m" => Duration::from_secs_f64(number * 60.0),
-            _ => return Err(format!("Unknown unit: {}", unit)),
-        };
-
-        Ok(HumanDuration(duration))
-    }
-}
-
-impl From<HumanDuration> for Duration {
-    fn from(wrapper: HumanDuration) -> Self {
-        wrapper.0
-    }
-}
-
-impl From<Duration> for HumanDuration {
-    fn from(duration: Duration) -> Self {
-        HumanDuration(duration)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for HumanDuration {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct DurationWrapperVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for DurationWrapperVisitor {
-            type Value = HumanDuration;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a number (seconds) or a string like '500ms', '5s', or '3m'")
-            }
-
-            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(HumanDuration::from_secs(v))
-            }
-
-            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                if v < 0 {
-                    return Err(E::custom("negative values are not allowed"));
-                }
-                Ok(HumanDuration::from_secs(v as u64))
-            }
-
-            fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                if v < 0.0 {
-                    return Err(E::custom("negative values are not allowed"));
-                }
-                Ok(HumanDuration::from_secs_f64(v))
-            }
-
-            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                HumanDuration::from_str(v).map_err(E::custom)
-            }
-        }
-
-        deserializer.deserialize_any(DurationWrapperVisitor)
-    }
-}
-
 /// Storage configuration.
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     pub arenas: HashMap<Arena, ArenaConfig>,
     pub cache: CacheConfig,
@@ -137,6 +27,7 @@ impl StorageConfig {
 
 /// For the global cache (no blob_dir)
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CacheConfig {
     /// Path to the cache database.
     pub db: PathBuf,
@@ -154,6 +45,7 @@ impl CacheConfig {
 }
 
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ArenaConfig {
     /// Optional local path to the directory where files for that arena are stored.
     /// If specified, an indexer will be created for this arena.
@@ -213,6 +105,7 @@ impl ArenaConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiskUsageLimits {
     /// Try to use at most that many bytes or percent of disk.
     ///
@@ -339,6 +232,117 @@ impl<'de> serde::Deserialize<'de> for BytesOrPercent {
         }
 
         deserializer.deserialize_any(BytesOrPercentVisitor)
+    }
+}
+
+/// A wrapper around Duration that supports deserialization from both numbers (seconds) and strings with units
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct HumanDuration(pub Duration);
+
+impl HumanDuration {
+    pub fn from_secs(secs: u64) -> Self {
+        HumanDuration(Duration::from_secs(secs))
+    }
+
+    pub fn from_secs_f64(secs: f64) -> Self {
+        HumanDuration(Duration::from_secs_f64(secs))
+    }
+
+    pub fn from_millis(millis: u64) -> Self {
+        HumanDuration(Duration::from_millis(millis))
+    }
+
+    /// Parse a string that can be either a number (seconds) or a human-readable duration with units
+    fn from_str(s: &str) -> Result<Self, String> {
+        // Parse human-readable duration with units
+        let (number_str, unit) = if s.ends_with("ms") {
+            (&s[..s.len() - 2], "ms")
+        } else if s.ends_with("s") {
+            (&s[..s.len() - 1], "s")
+        } else if s.ends_with("m") {
+            (&s[..s.len() - 1], "m")
+        } else {
+            // No unit specified, assume seconds
+            (s, "s")
+        };
+
+        let number: f64 = number_str
+            .parse()
+            .map_err(|_| format!("Invalid number in duration: {}", s))?;
+
+        let duration = match unit {
+            "ms" => Duration::from_millis(number as u64),
+            "s" => Duration::from_secs_f64(number),
+            "m" => Duration::from_secs_f64(number * 60.0),
+            _ => return Err(format!("Unknown unit: {}", unit)),
+        };
+
+        Ok(HumanDuration(duration))
+    }
+}
+
+impl From<HumanDuration> for Duration {
+    fn from(wrapper: HumanDuration) -> Self {
+        wrapper.0
+    }
+}
+
+impl From<Duration> for HumanDuration {
+    fn from(duration: Duration) -> Self {
+        HumanDuration(duration)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for HumanDuration {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct DurationWrapperVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for DurationWrapperVisitor {
+            type Value = HumanDuration;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a number (seconds) or a string like '500ms', '5s', or '3m'")
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(HumanDuration::from_secs(v))
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if v < 0 {
+                    return Err(E::custom("negative values are not allowed"));
+                }
+                Ok(HumanDuration::from_secs(v as u64))
+            }
+
+            fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if v < 0.0 {
+                    return Err(E::custom("negative values are not allowed"));
+                }
+                Ok(HumanDuration::from_secs_f64(v))
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                HumanDuration::from_str(v).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_any(DurationWrapperVisitor)
     }
 }
 
@@ -682,5 +686,19 @@ mod tests {
                 toml_str
             );
         }
+    }
+    #[test]
+    fn parse_storage_config_wrong_field_name() {
+        let toml_str = r#"
+            [cache]
+            db = "/path/to/cache.db"
+
+            [arenas."arena1"]
+            wrongname = "/path/to/arena1" # should be root
+            db = "/path/to/arena1.db"
+            blob_dir = "/path/to/arena1/blobs"
+        "#;
+
+        assert!(toml::from_str::<StorageConfig>(toml_str).is_err())
     }
 }
