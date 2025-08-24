@@ -3,25 +3,28 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
-## Refactoring realize-storage::arena {#arenastorage}
+## Re-design churten {#nochurten}
 
-Write future refactoring plans in [Arena Storage
-Refactoring](arenastorage.md) and turn it into concrete tasks.
+With the latest changes, churten doesn't make much sense anymore; it's
+just download. Also, important information is missing such as:
 
-## Turn Blobstore into a LRU cache {#bloblru}
+- initial hashing, which could take a while
+- realize/unrealize
+- connect/disconnect
+- local changes caused driven by remote notification (out-of-date, deletion)
 
-Add a single-level LRU cache for the Working cache of the blobstore,
-described in the section BlobStore of [unreal.md](unreal.md)
+There might be a need for an "audit" concept to log some of these.
 
-The infrastructure is there except for the following:
+## Investigate why only one file is downloaded at a time {#onefile}
 
-7. call cleanup queue after update_db, also call update_db regularly
-   so that we don't go too far above the limit
+Churten downloads one file at a time, instead of 4. 4 are displayed,
+but only one progresses.
 
-8. call mark_accessed either from downloader or from open_file (in the
-   background)
+## Attempt cleanup when blob is closed {#cleanup}
 
-## Expose connection info through RPC and display in realize-control {#conninfo}
+Currently, cleanup runs when disk usage changes, but cannot delete
+open blobs, meaning that very often it'll leave possibly large files
+that used to be open until some other disk usage changes.
 
 ## Add Mark::Ignore {#ignore}
 
