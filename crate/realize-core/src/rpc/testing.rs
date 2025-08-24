@@ -5,9 +5,9 @@ use realize_network::Server;
 use realize_network::capnp::PeerStatus;
 use realize_network::hostport::HostPort;
 use realize_network::testing::TestingPeers;
-use realize_storage::config::StorageConfig;
 use realize_storage::Blob;
 use realize_storage::Storage;
+use realize_storage::config::StorageConfig;
 use realize_storage::utils::hash;
 use realize_storage::{self, GlobalCache};
 use realize_types::Path;
@@ -47,10 +47,14 @@ impl HouseholdFixtureBuilder {
             HouseholdFixture::b(),
             HouseholdFixture::c(),
         ] {
-            config.insert(peer, realize_storage::testing::config(
-                tempdir.child(peer.as_str()).path(),
-                [HouseholdFixture::test_arena()],
-            ).expect("config for {peer}"));
+            config.insert(
+                peer,
+                realize_storage::testing::config(
+                    tempdir.child(peer.as_str()).path(),
+                    [HouseholdFixture::test_arena()],
+                )
+                .expect("config for {peer}"),
+            );
         }
 
         Self { tempdir, config }
@@ -58,7 +62,9 @@ impl HouseholdFixtureBuilder {
 
     /// Return a modifiable [StorageConfig] for the peer.
     pub fn config_mut(&mut self, peer: Peer) -> &mut StorageConfig {
-        self.config.get_mut(&peer).expect("StorageConfig for {peer}")
+        self.config
+            .get_mut(&peer)
+            .expect("StorageConfig for {peer}")
     }
 
     pub async fn setup(self) -> anyhow::Result<HouseholdFixture> {
@@ -76,7 +82,6 @@ impl HouseholdFixtureBuilder {
         })
     }
 }
-
 
 impl HouseholdFixture {
     pub fn a() -> Peer {

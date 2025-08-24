@@ -9,11 +9,6 @@ Currently, cleanup runs when disk usage changes, but cannot delete
 open blobs, meaning that very often it'll leave possibly large files
 that used to be open until some other disk usage changes.
 
-## realize-control mark get should return arena mark {#getarena}
-
-Currently realize-control mark get expects files and since there
-aren't any, returns nothing. That's not useful.
-
 ## Make config file nicer {#configfile}
 
 Config file should be able to take units for byte fields. disk_usage

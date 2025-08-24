@@ -1,6 +1,6 @@
+use crate::StorageError;
 use crate::types::Inode;
 use crate::utils::holder::{ByteConversionError, ByteConvertible, NamedType};
-use crate::{StorageError};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
 use realize_types::{self, Arena, ByteRanges, Hash, Path, Peer, UnixTime};

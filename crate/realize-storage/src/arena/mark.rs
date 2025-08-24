@@ -64,6 +64,13 @@ pub(crate) fn set_arena_mark(db: &Arc<ArenaDatabase>, mark: Mark) -> Result<(), 
     txn.commit()?;
     Ok(())
 }
+
+pub(crate) fn get_arena_mark(db: &Arc<ArenaDatabase>) -> Result<Mark, StorageError> {
+    let txn = db.begin_read()?;
+    let root = txn.read_tree()?.root();
+    let mark = txn.read_marks()?.get_at_inode(&txn.read_tree()?, root)?;
+    Ok(mark)
+}
 pub(crate) fn clear_arena_mark<'a, L: Into<TreeLoc<'a>>>(
     db: &Arc<ArenaDatabase>,
 ) -> Result<(), StorageError> {

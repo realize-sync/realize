@@ -10,8 +10,7 @@ use crate::utils::holder::Holder;
 use priority_queue::PriorityQueue;
 use realize_types::{ByteRange, ByteRanges, Hash};
 use redb::{ReadableTable, Table};
-use tokio_util::sync::CancellationToken;
-use std::cmp::{min, Reverse};
+use std::cmp::{Reverse, min};
 use std::collections::HashMap;
 use std::io::{SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
@@ -22,6 +21,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::sync::{broadcast, watch};
+use tokio_util::sync::CancellationToken;
 
 /// Background job that marks blobs that are accessed after a cooldown delay.
 ///
@@ -30,7 +30,11 @@ use tokio::sync::{broadcast, watch};
 ///
 /// This loop should run as long as blobs can be used, to be able to track
 /// access and keep the LRU queue in the right order. It terminates when `shutdown` is cancelled.
-pub(crate) async fn mark_accessed_loop(db: Arc<ArenaDatabase>, cooldown:Duration,shutdown: CancellationToken){
+pub(crate) async fn mark_accessed_loop(
+    db: Arc<ArenaDatabase>,
+    cooldown: Duration,
+    shutdown: CancellationToken,
+) {
     let mut queue = PriorityQueue::new();
     let mut rx = db.blobs().subscribe_accessed();
     loop {
@@ -619,10 +623,7 @@ impl<'a> WritableOpenBlob<'a> {
     /// at the front of its queue.
     ///
     /// Does nothing if the blob doesn't exist.
-    fn mark_accessed(
-        &mut self,
-        inode: Inode,
-    ) -> Result<(), StorageError> {
+    fn mark_accessed(&mut self, inode: Inode) -> Result<(), StorageError> {
         let mut blob_entry = match self.blob_table.get(inode)? {
             None => {
                 return Ok(());
@@ -3190,11 +3191,12 @@ mod tests {
             let shutdown = shutdown.clone();
             async move {
                 mark_accessed_loop(db, Duration::from_millis(10), shutdown).await;
-        }});
+            }
+        });
 
         // Wait a bit for the loop to start
         let deadline = Instant::now() + Duration::from_secs(5);
-        while fixture.db.blobs().accessed_tx.receiver_count() == 0 && Instant::now() < deadline{
+        while fixture.db.blobs().accessed_tx.receiver_count() == 0 && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(1, fixture.db.blobs().accessed_tx.receiver_count());
@@ -3221,5 +3223,4 @@ mod tests {
 
         Ok(())
     }
-
 }

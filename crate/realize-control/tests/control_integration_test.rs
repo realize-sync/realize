@@ -180,7 +180,7 @@ async fn churten_is_running_quiet() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn churten_mark_set_arena() -> anyhow::Result<()> {
+async fn mark_set_arena() -> anyhow::Result<()> {
     let local = LocalSet::new();
     let fixture = Fixture::setup(&local).await?;
     fixture.add_file_to_cache("file1.txt").await?;
@@ -224,7 +224,7 @@ async fn churten_mark_set_arena() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn churten_mark_set_paths() -> anyhow::Result<()> {
+async fn mark_set_paths() -> anyhow::Result<()> {
     let local = LocalSet::new();
     let fixture = Fixture::setup(&local).await?;
     fixture.add_file_to_cache("file1.txt").await?;
@@ -280,7 +280,7 @@ async fn churten_mark_set_paths() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn churten_mark_get() -> anyhow::Result<()> {
+async fn mark_get() -> anyhow::Result<()> {
     let local = LocalSet::new();
     let fixture = Fixture::setup(&local).await?;
     fixture.add_file_to_cache("file1.txt").await?;
@@ -328,7 +328,7 @@ async fn churten_mark_get() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn churten_mark_get_multiple_paths() -> anyhow::Result<()> {
+async fn mark_get_multiple_paths() -> anyhow::Result<()> {
     let local = LocalSet::new();
     let fixture = Fixture::setup(&local).await?;
     fixture.add_file_to_cache("file1.txt").await?;
@@ -363,6 +363,44 @@ async fn churten_mark_get_multiple_paths() -> anyhow::Result<()> {
             assert!(
                 output_str.contains("file2.txt: keep"),
                 "Expected file2 mark, got '{}'",
+                output_str
+            );
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mark_get_arena() -> anyhow::Result<()> {
+    let local = LocalSet::new();
+    let fixture = Fixture::setup(&local).await?;
+
+    local
+        .run_until(async move {
+            // First set an arena mark
+            let set_output = fixture
+                .control_command(&["mark", "set", "own", "myarena"])?
+                .output()
+                .await?;
+            assert!(set_output.status.success());
+
+            // Then get the arena mark
+            let output = fixture
+                .control_command(&["mark", "get", "myarena"])?
+                .output()
+                .await?;
+
+            assert!(
+                output.status.success(),
+                "Control command failed: {output:?}"
+            );
+
+            let output_str = String::from_utf8(output.stdout)?;
+            assert_eq!(
+                "arena: own\n", output_str,
+                "Expected arena mark output, got '{}'",
                 output_str
             );
 

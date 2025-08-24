@@ -89,7 +89,9 @@ impl ArenaStorage {
                 tokio::spawn({
                     let db = Arc::clone(&db);
                     let shutdown = shutdown.clone();
-                    async move { blob::mark_accessed_loop(db, Duration::from_millis(500), shutdown).await }
+                    async move {
+                        blob::mark_accessed_loop(db, Duration::from_millis(500), shutdown).await
+                    }
                 });
 
                 Some(IndexedArenaStorage {

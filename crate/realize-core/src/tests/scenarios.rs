@@ -1,12 +1,12 @@
-use std::time::Instant;
-use std::{time::Duration};
-use std::sync::Arc;
+use crate::consensus::churten::Churten;
+use crate::rpc::testing::HouseholdFixture;
 use realize_storage::config::DiskUsageLimits;
 use realize_storage::utils::hash;
 use realize_storage::{LocalAvailability, Mark};
 use realize_types::Path;
-use crate::rpc::testing::HouseholdFixture;
-use crate::consensus::churten::Churten;
+use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
 
 #[tokio::test]
 async fn file_drop() -> anyhow::Result<()> {
@@ -14,7 +14,12 @@ async fn file_drop() -> anyhow::Result<()> {
     let b = HouseholdFixture::b();
     let arena = HouseholdFixture::test_arena();
     let mut builder = HouseholdFixture::builder();
-    builder.config_mut(a).arenas.get_mut(&arena).unwrap().disk_usage = Some(DiskUsageLimits::max_bytes(0));
+    builder
+        .config_mut(a)
+        .arenas
+        .get_mut(&arena)
+        .unwrap()
+        .disk_usage = Some(DiskUsageLimits::max_bytes(0));
 
     let mut fixture = builder.setup().await?;
     fixture
@@ -29,13 +34,10 @@ async fn file_drop() -> anyhow::Result<()> {
 
             // write a file to a; it'll get downloaded by b then a's
             // copy will be deleted.
-            let mut churten = Churten::new(
-                Arc::clone(&storage_b),
-                household_b.clone(),
-            );
+            let mut churten = Churten::new(Arc::clone(&storage_b), household_b.clone());
             churten.start();
 
-            let content = b"foo!".repeat(2*1024*1024/4); // 2M
+            let content = b"foo!".repeat(2 * 1024 * 1024 / 4); // 2M
             let hash = hash::digest(&content);
 
             let root_a = fixture.arena_root(a);
@@ -62,10 +64,15 @@ async fn file_drop() -> anyhow::Result<()> {
             // deleted, because max disk usage is 0.
             let cache_a = storage_a.cache();
             let foo_inode = cache_a.expect(arena, &foo).await?;
-            while cache_a.local_availability(foo_inode).await? != LocalAvailability::Missing && Instant::now() < limit {
+            while cache_a.local_availability(foo_inode).await? != LocalAvailability::Missing
+                && Instant::now() < limit
+            {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            assert_eq!(LocalAvailability::Missing, cache_a.local_availability(foo_inode).await?);
+            assert_eq!(
+                LocalAvailability::Missing,
+                cache_a.local_availability(foo_inode).await?
+            );
 
             Ok::<(), anyhow::Error>(())
         })

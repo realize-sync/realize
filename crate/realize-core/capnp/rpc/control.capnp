@@ -8,24 +8,18 @@ interface Control {
   churten @0 () -> (churten: Churten);
 
   setMark @1 (req: SetMarkRequest) -> ();
-  setArenaMark @2 (req: SetArenaMarkRequest) -> ();
-  getMark @3 (req: GetMarkRequest) -> (res: GetMarkResponse);
+  getMark @2 (req: GetMarkRequest) -> (res: GetMarkResponse);
 }
 
 struct SetMarkRequest {
   arena @0: Text;
-  path @1: Text;
+  path @1: Text;  # Optional: if empty, sets arena mark
   mark @2: Mark;
-}
-
-struct SetArenaMarkRequest {
-  arena @0: Text;
-  mark @1: Mark;
 }
 
 struct GetMarkRequest {
   arena @0: Text;
-  path @1: Text;
+  path @1: Text;  # Optional: if empty, gets arena mark
 }
 
 struct GetMarkResponse {

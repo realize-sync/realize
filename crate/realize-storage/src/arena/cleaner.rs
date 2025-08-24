@@ -2,15 +2,19 @@
 
 use super::blob::DiskUsage;
 use super::db::ArenaDatabase;
-use tokio_util::sync::CancellationToken;
 use crate::StorageError;
 use crate::arena::blob::BlobReadOperations;
 use crate::config::{BytesOrPercent, DiskUsageLimits};
 use std::cmp::min;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 /// Enforce these limits on the given database.
-pub(crate) async fn run_loop(db: Arc<ArenaDatabase>, limits: DiskUsageLimits, shutdown: CancellationToken) {
+pub(crate) async fn run_loop(
+    db: Arc<ArenaDatabase>,
+    limits: DiskUsageLimits,
+    shutdown: CancellationToken,
+) {
     let mut rx = db.blobs().watch_disk_usage();
 
     loop {
@@ -22,13 +26,13 @@ pub(crate) async fn run_loop(db: Arc<ArenaDatabase>, limits: DiskUsageLimits, sh
             )
         }
         tokio::select!(
-            _ = shutdown.cancelled() => { return; }
-            ret = rx.changed() => {
-                match ret {
-                    Err(_) => return,
-                    Ok(_) => continue,
-                }
-            });
+        _ = shutdown.cancelled() => { return; }
+        ret = rx.changed() => {
+            match ret {
+                Err(_) => return,
+                Ok(_) => continue,
+            }
+        });
     }
 }
 

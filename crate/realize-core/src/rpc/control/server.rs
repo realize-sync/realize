@@ -6,8 +6,8 @@ use super::control_capnp::churten::{
     ShutdownResults, StartParams, StartResults, SubscribeParams, SubscribeResults,
 };
 use super::control_capnp::control::{
-    self, ChurtenParams, ChurtenResults, GetMarkParams, GetMarkResults, SetArenaMarkParams,
-    SetArenaMarkResults, SetMarkParams, SetMarkResults,
+    self, ChurtenParams, ChurtenResults, GetMarkParams, GetMarkResults, SetMarkParams,
+    SetMarkResults,
 };
 use super::convert;
 use crate::consensus::churten::{Churten, JobHandler};
@@ -57,33 +57,23 @@ impl<H: JobHandler + 'static> control::Server for ControlServer<H> {
         Promise::from_future(async move {
             let req = params.get()?.get_req()?;
             let arena = parse_arena(req.get_arena()?)?;
-            let path = parse_path(req.get_path()?)?;
+            let path_str = req.get_path()?;
             let mark = parse_mark(req.get_mark()?);
 
-            storage
-                .set_mark(arena, &path, mark)
-                .await
-                .map_err(from_storage_err)?;
-
-            Ok(())
-        })
-    }
-
-    fn set_arena_mark(
-        &mut self,
-        params: SetArenaMarkParams,
-        _: SetArenaMarkResults,
-    ) -> Promise<(), capnp::Error> {
-        let storage = Arc::clone(&self.storage);
-        Promise::from_future(async move {
-            let req = params.get()?.get_req()?;
-            let arena = parse_arena(req.get_arena()?)?;
-            let mark = parse_mark(req.get_mark()?);
-
-            storage
-                .set_arena_mark(arena, mark)
-                .await
-                .map_err(from_storage_err)?;
+            if path_str.is_empty() {
+                // Set arena mark when no path is provided
+                storage
+                    .set_arena_mark(arena, mark)
+                    .await
+                    .map_err(from_storage_err)?;
+            } else {
+                // Set path-specific mark
+                let path = parse_path(path_str)?;
+                storage
+                    .set_mark(arena, &path, mark)
+                    .await
+                    .map_err(from_storage_err)?;
+            }
 
             Ok(())
         })
@@ -98,12 +88,22 @@ impl<H: JobHandler + 'static> control::Server for ControlServer<H> {
         Promise::from_future(async move {
             let req = params.get()?.get_req()?;
             let arena = parse_arena(req.get_arena()?)?;
-            let path = parse_path(req.get_path()?)?;
+            let path_str = req.get_path()?;
 
-            let mark = storage
-                .get_mark(arena, &path)
-                .await
-                .map_err(from_storage_err)?;
+            let mark = if path_str.is_empty() {
+                // Get arena mark when no path is provided
+                storage
+                    .get_arena_mark(arena)
+                    .await
+                    .map_err(from_storage_err)?
+            } else {
+                // Get path-specific mark
+                let path = parse_path(path_str)?;
+                storage
+                    .get_mark(arena, &path)
+                    .await
+                    .map_err(from_storage_err)?
+            };
 
             let mut res = results.get().init_res();
             res.set_mark(mark_to_capnp(mark));
@@ -450,9 +450,10 @@ mod tests {
             .run_until(async move {
                 let control: control::Client = unixsocket::connect(&sockpath).await?;
 
-                let mut request = control.set_arena_mark_request();
+                let mut request = control.set_mark_request();
                 let mut req = request.get().init_req();
                 req.set_arena(arena.as_str());
+                req.set_path(""); // Empty path means arena mark
                 req.set_mark(control_capnp::Mark::Keep);
                 request.send().promise.await?;
 
@@ -517,12 +518,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_arena_mark() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let arena = HouseholdFixture::test_arena();
+        let peer = HouseholdFixture::a();
+        let local = LocalSet::new();
+        let household = fixture.inner.create_household(&local, peer)?;
+        let sockpath = fixture
+            .bind_server(
+                &local,
+                peer,
+                household.clone(),
+                JobHandlerImpl::new(Arc::clone(fixture.inner.storage(peer)?), household.clone()),
+            )
+            .await?;
+
+        local
+            .run_until(async move {
+                let control: control::Client = unixsocket::connect(&sockpath).await?;
+
+                // First, set an arena mark
+                let mut request = control.set_mark_request();
+                let mut req = request.get().init_req();
+                req.set_arena(arena.as_str());
+                req.set_path(""); // Empty path means arena mark
+                req.set_mark(control_capnp::Mark::Keep);
+                request.send().promise.await?;
+
+                // Now get the arena mark
+                let mut request = control.get_mark_request();
+                let mut req = request.get().init_req();
+                req.set_arena(arena.as_str());
+                req.set_path(""); // Empty path means arena mark
+                let result = request.send().promise.await?;
+                assert_eq!(
+                    control_capnp::Mark::Keep,
+                    result.get()?.get_res()?.get_mark()?
+                );
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn churten_rpc_job_succeeds() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let arena = HouseholdFixture::test_arena();
         let peer = HouseholdFixture::a();
         let local = LocalSet::new();
-        let storage = Arc::clone(fixture.inner.storage(peer)?);
         let household = fixture.inner.create_household(&local, peer)?;
 
         // Create a fake job handler that succeeds
@@ -561,7 +607,13 @@ mod tests {
                 );
 
                 // Create a job by setting up a file to download
-                storage.set_arena_mark(arena, Mark::Keep).await?;
+                // Set arena mark using the RPC method
+                let mut request = control.set_mark_request();
+                let mut req = request.get().init_req();
+                req.set_arena(arena.as_str());
+                req.set_path(""); // Empty path means arena mark
+                req.set_mark(control_capnp::Mark::Keep);
+                request.send().promise.await?;
                 let foo = Path::parse("foo")?;
                 let hash = Hash([1; 32]);
                 fixture
@@ -673,7 +725,6 @@ mod tests {
         let arena = HouseholdFixture::test_arena();
         let peer = HouseholdFixture::a();
         let local = LocalSet::new();
-        let storage = Arc::clone(fixture.inner.storage(peer)?);
         let household = fixture.inner.create_household(&local, peer)?;
 
         // Create a fake job handler that succeeds
@@ -703,7 +754,13 @@ mod tests {
                 subscribe_request.send().promise.await?;
 
                 // Create a job by setting up a file to download
-                storage.set_arena_mark(arena, Mark::Keep).await?;
+                // Set arena mark using the RPC method
+                let mut request = control.set_mark_request();
+                let mut req = request.get().init_req();
+                req.set_arena(arena.as_str());
+                req.set_path(""); // Empty path means arena mark
+                req.set_mark(control_capnp::Mark::Keep);
+                request.send().promise.await?;
                 fixture
                     .inner
                     .cache(peer)?

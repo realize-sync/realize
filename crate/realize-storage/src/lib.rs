@@ -148,6 +148,12 @@ impl Storage {
         task::spawn_blocking(move || arena::mark::get(&db, &path)).await?
     }
 
+    /// Get the default mark for the files in the given arena.
+    pub async fn get_arena_mark(self: &Arc<Self>, arena: Arena) -> Result<Mark, StorageError> {
+        let db = self.arena_storage(arena)?.db.clone();
+        task::spawn_blocking(move || arena::mark::get_arena_mark(&db)).await?
+    }
+
     /// Get a reader on the given file, if possible.
     pub async fn reader(
         &self,
