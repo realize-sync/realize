@@ -69,6 +69,7 @@ impl SetupHelper {
         &self,
         local: &LocalSet,
         path: Option<&std::path::Path>,
+        umask: u32,
     ) -> anyhow::Result<CancellationToken> {
         let path = match path {
             Some(p) => p.to_path_buf(),
@@ -89,6 +90,7 @@ impl SetupHelper {
         unixsocket::bind(
             local,
             path.as_ref(),
+            umask,
             move || control_server.clone().into_client().client,
             token.clone(),
         )

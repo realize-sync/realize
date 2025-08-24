@@ -15,22 +15,28 @@ use tokio_util::sync::CancellationToken;
 /// Serves Cap'n Proto clients created by `new_client` on the socket.
 ///
 /// If `path` parent directory doesn't exist, it is created with a
-/// UNIX permission of 700 (u=rwx).
+/// UNIX permission of 777 & ~`umask`
+///
+/// If `path` exists, it is replaced. Socket permissions are 777 &
+/// ~`umask`.
 pub async fn bind(
     local: &LocalSet,
     path: &Path,
+    umask: u32,
     new_client: impl Fn() -> capnp::capability::Client + 'static,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         if !fs::metadata(parent).await.is_ok() {
             fs::create_dir_all(parent).await?;
-            let mut permissions = fs::metadata(parent).await?.permissions();
-            permissions.set_mode(0o700);
-            fs::set_permissions(parent, permissions).await?;
+            set_mode(umask, parent).await?;
         }
     }
+    if fs::metadata(path).await.is_ok() {
+        fs::remove_file(path).await?;
+    }
     let listener = tokio::net::UnixListener::bind(path)?;
+    set_mode(umask, path).await?;
     local.spawn_local(async move {
         loop {
             let res = tokio::select!(
@@ -82,6 +88,15 @@ pub async fn bind(
         }
     });
 
+    Ok(())
+}
+
+/// Set mode of the socket and its parent directory, based on the
+/// umask parameter.
+async fn set_mode(umask: u32, parent: &Path) -> Result<(), anyhow::Error> {
+    let mut permissions = fs::metadata(parent).await?.permissions();
+    permissions.set_mode(0o777 & !umask);
+    fs::set_permissions(parent, permissions).await?;
     Ok(())
 }
 
@@ -148,7 +163,7 @@ mod tests {
         let server_fn = || capnp_rpc::new_client::<hello::Client, _>(HelloServer).client;
         let shutdown = CancellationToken::new();
 
-        bind(&local, &path, server_fn, shutdown.clone()).await?;
+        bind(&local, &path, 0o077, server_fn, shutdown.clone()).await?;
 
         local
             .run_until(async move {
@@ -184,11 +199,55 @@ mod tests {
         let server_fn = || capnp_rpc::new_client::<hello::Client, _>(HelloServer).client;
         let shutdown = CancellationToken::new();
 
-        bind(&local, &path, server_fn, shutdown.clone()).await?;
+        bind(&local, &path, 0o077, server_fn, shutdown.clone()).await?;
 
         let parent = tempdir.path().join("parent");
         assert!(parent.exists());
         assert_eq!(0o700, parent.metadata()?.permissions().mode() & 0o777);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bind_applies_umask() -> anyhow::Result<()> {
+        let tempdir = TempDir::new()?;
+        let path = tempdir.path().join("parent/unix_socket");
+
+        let local = LocalSet::new();
+        let server_fn = || capnp_rpc::new_client::<hello::Client, _>(HelloServer).client;
+        let shutdown = CancellationToken::new();
+
+        bind(&local, &path, 0o007, server_fn, shutdown.clone()).await?;
+
+        let parent = tempdir.path().join("parent");
+        assert!(parent.exists());
+        assert_eq!(0o770, parent.metadata()?.permissions().mode() & 0o777);
+
+        assert!(path.exists());
+        assert_eq!(0o770, path.metadata()?.permissions().mode() & 0o777);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bind_overwrite_existing() -> anyhow::Result<()> {
+        let tempdir = TempDir::new()?;
+        let path = tempdir.path().join("unix_socket");
+
+        let local = LocalSet::new();
+        let server_fn = || capnp_rpc::new_client::<hello::Client, _>(HelloServer).client;
+        let shutdown = CancellationToken::new();
+
+        fs::write(&path, "").await?;
+
+        bind(&local, &path, 0o007, server_fn, shutdown.clone()).await?;
+
+        assert!(path.exists());
+        assert_eq!(0o770, path.metadata()?.permissions().mode() & 0o777);
+
+        local
+            .run_until(async move { connect::<_, hello::Client>(&path).await })
+            .await?;
 
         Ok(())
     }

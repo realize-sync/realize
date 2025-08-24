@@ -72,7 +72,9 @@ impl Fixture {
         let server_privkey = resources.join("a.key");
         let socket = tempdir.path().join("realize/control.socket");
         let setup = SetupHelper::setup(config, &server_privkey, local).await?;
-        setup.bind_control_socket(local, Some(&socket)).await?;
+        setup
+            .bind_control_socket(local, Some(&socket), 0o077)
+            .await?;
 
         Ok(Self {
             arena,

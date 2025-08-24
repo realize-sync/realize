@@ -42,9 +42,13 @@ struct Cli {
 
     /// Path to the control socket file to use.
     ///
+    /// The socket is created with permission 0o777 & ~umask (with
+    /// the default umask, that's, 0o700 u=rwx).
+    ///
     /// If the containing directory doesn't exist in the path, it'll
-    /// be created with mod 700 (u=rwx), so it's a good idea to point
-    /// this path to a non-existing containing directory.
+    /// be created with the same permission as the socket, so it's a
+    /// good idea to point this path to a non-existing containing
+    /// directory.
     ///
     /// If unset, the following paths are tried:
     ///  - `/run/realize/control.socket`
@@ -52,6 +56,14 @@ struct Cli {
     ///  - `/tmp/realize/control.socket`
     #[arg(long)]
     socket: Option<PathBuf>,
+
+    /// Umask for the socket file and its containing directory.
+    #[arg(long, default_value = "077", value_parser=parse_umask)]
+    socket_umask: u32,
+}
+
+fn parse_umask(string: &str) -> Result<u32, std::num::ParseIntError> {
+    u32::from_str_radix(string, 8)
 }
 
 #[tokio::main]
@@ -89,7 +101,7 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
     }
 
     setup
-        .bind_control_socket(&local, cli.socket.as_deref())
+        .bind_control_socket(&local, cli.socket.as_deref(), cli.socket_umask)
         .await?;
 
     let server = setup.setup_server().await?;

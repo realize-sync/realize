@@ -380,6 +380,7 @@ mod tests {
             unixsocket::bind(
                 &local,
                 &sockpath,
+                0o077,
                 move || server.clone().into_client().client,
                 self.shutdown.clone(),
             )
