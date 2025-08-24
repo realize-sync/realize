@@ -22,6 +22,7 @@ FROM alpine:3.21 AS runtime
 # --- 2.1 Configuration
 ENV ADDRESS=0.0.0.0:9771
 ENV SOCKFILE=/var/run/realize/realize.socket
+ENV SOCKFILE_UMASK=077
 
 # Server private key
 ENV PRIVKEY=/config/private.key

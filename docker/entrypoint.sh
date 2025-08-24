@@ -2,6 +2,7 @@
 args="--address ${ADDRESS}\
  --privkey ${PRIVKEY}\
  --socket ${SOCKFILE}\
+ --socket_umask ${SOCKFILE_UMASK}\
  --config ${CONFIG}"
 
 if [ "z${NFS_ADDRESS}" != "z" ]; then
