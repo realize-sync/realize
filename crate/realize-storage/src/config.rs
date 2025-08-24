@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Storage configuration.
-#[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
+#[derive(Clone, serde::Deserialize, serde::Serialize, Debug, PartialEq, Eq)]
 pub struct StorageConfig {
     pub arenas: HashMap<Arena, ArenaConfig>,
     pub cache: CacheConfig,
@@ -24,7 +24,7 @@ impl StorageConfig {
 }
 
 /// For the global cache (no blob_dir)
-#[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
+#[derive(Clone, serde::Deserialize, serde::Serialize, Debug, PartialEq, Eq)]
 pub struct CacheConfig {
     /// Path to the cache database.
     pub db: PathBuf,
@@ -41,7 +41,7 @@ impl CacheConfig {
     }
 }
 
-#[derive(Clone, serde::Deserialize, serde::Serialize, Debug, Default)]
+#[derive(Clone, serde::Deserialize, serde::Serialize, Debug, Default, PartialEq, Eq)]
 pub struct ArenaConfig {
     /// Optional local path to the directory where files for that arena are stored.
     /// If specified, an indexer will be created for this arena.
@@ -133,4 +133,64 @@ impl DiskUsageLimits {
 pub enum BytesOrPercent {
     Percent(u32),
     Bytes(u64),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn parse_storage_config() {
+        let toml_str = r#"
+            [cache]
+            db = "/path/to/cache.db"
+
+            [arenas."arena1"]
+            root = "/path/to/arena1"
+            db = "/path/to/arena1.db"
+            blob_dir = "/path/to/arena1/blobs"
+            max_parallel_hashers = 4
+            debounce_secs = 5
+
+            [arenas."arena2"]
+            db = "/path/to/arena2.db"
+            blob_dir = "/path/to/arena2/blobs"
+            disk_usage = { max = { Bytes = 1073741824 } }
+        "#;
+
+        let config: StorageConfig = toml::from_str(toml_str).unwrap();
+        let expected_config = StorageConfig {
+            cache: CacheConfig {
+                db: PathBuf::from("/path/to/cache.db"),
+            },
+            arenas: HashMap::from([
+                (
+                    Arena::from("arena1"),
+                    ArenaConfig {
+                        root: Some(PathBuf::from("/path/to/arena1")),
+                        db: PathBuf::from("/path/to/arena1.db"),
+                        blob_dir: PathBuf::from("/path/to/arena1/blobs"),
+                        max_parallel_hashers: Some(4),
+                        debounce_secs: Some(5),
+                        disk_usage: None,
+                    },
+                ),
+                (
+                    Arena::from("arena2"),
+                    ArenaConfig {
+                        root: None,
+                        db: PathBuf::from("/path/to/arena2.db"),
+                        blob_dir: PathBuf::from("/path/to/arena2/blobs"),
+                        max_parallel_hashers: None,
+                        debounce_secs: None,
+                        disk_usage: Some(DiskUsageLimits {
+                            max: BytesOrPercent::Bytes(1073741824),
+                            leave: None,
+                        }),
+                    },
+                ),
+            ]),
+        };
+
+        assert_eq!(config, expected_config);
+    }
 }

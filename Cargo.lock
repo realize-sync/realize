@@ -1777,6 +1777,7 @@ dependencies = [
  "tokio-retry",
  "tokio-rustls",
  "tokio-util",
+ "toml",
 ]
 
 [[package]]
@@ -1805,6 +1806,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "toml",
  "uuid",
 ]
 

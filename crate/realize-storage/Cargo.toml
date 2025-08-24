@@ -33,6 +33,7 @@ priority-queue = "2.5.0"
 assert_fs = "1.1"
 assert_unordered = "0.3"
 tokio = { version = "1", features = ["test-util"] }
+toml = "0.8"
 
 
 [build-dependencies]
