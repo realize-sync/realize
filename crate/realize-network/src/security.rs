@@ -72,6 +72,11 @@ impl PeerVerifier {
         }
     }
 
+    /// Return the set of peers this verifier may accept.
+    pub fn peers(&self) -> impl Iterator<Item = Peer> {
+        self.allowed_peers.values().map(|p| *p)
+    }
+
     /// Create a verifier and fill it from [PeerConfig] instances.
     pub fn from_config(peers: &HashMap<Peer, PeerConfig>) -> anyhow::Result<Arc<Self>> {
         let mut verifier = Self::new();

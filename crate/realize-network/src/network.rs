@@ -74,6 +74,11 @@ impl Networking {
         self.peer_setup.iter().map(|(p, s)| (*p, s))
     }
 
+    /// All known peers.
+    pub fn peers(&self) -> impl Iterator<Item = Peer> {
+        self.verifier.peers()
+    }
+
     /// Set of peers that have a known address.
     pub fn connectable_peers(&self) -> impl Iterator<Item = Peer> {
         self.peer_setup

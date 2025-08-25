@@ -36,6 +36,20 @@ pub enum ExecutionMode {
     Batch,
 }
 
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub enum ConnectionStatus {
+    Connected,
+    #[default]
+    Disconnected,
+}
+
+/// Information about a peer, reported by [Household::query_peers].
+#[derive(Clone, Eq, PartialEq, Debug, Default)]
+pub struct ConnectionInfo {
+    connection: ConnectionStatus,
+    keep_connected: bool,
+}
+
 /// A set of peers and their connections.
 ///
 /// Cap'n Proto connections are handled or their own thread. This
@@ -46,6 +60,9 @@ pub enum ExecutionMode {
 pub struct Household {
     manager: ConnectionManager,
     operation_tx: mpsc::Sender<HouseholdOperation>,
+
+    /// Set of all known peers
+    peers: HashSet<Peer>,
 }
 
 impl Household {
@@ -60,6 +77,7 @@ impl Household {
         networking: Networking,
         storage: Arc<Storage>,
     ) -> anyhow::Result<Arc<Self>> {
+        let peers = networking.peers().collect();
         let (tx, rx) = mpsc::channel(128);
         let handler = PeerConnectionHandler::new(storage, &networking, rx);
         let manager = ConnectionManager::spawn(local, networking, handler)?;
@@ -67,6 +85,7 @@ impl Household {
         Ok(Arc::new(Self {
             manager,
             operation_tx: tx,
+            peers,
         }))
     }
 
@@ -173,6 +192,31 @@ impl Household {
 
         Ok(delta)
     }
+
+    /// Report peers that are connected or that we're trying to connect to.
+    ///
+    /// May return empty if no peer is connected and we're not trying
+    /// to connect to any peers.
+    pub async fn query_peers(&self) -> anyhow::Result<HashMap<Peer, ConnectionInfo>> {
+        let (tx, rx) = oneshot::channel();
+        self.operation_tx
+            .send(HouseholdOperation::QueryConnectedPeers { tx })
+            .await?;
+        let (connected, keep_connected) = tokio::join!(rx, self.manager.peers_to_keep_connected());
+        let connected = connected?;
+        let keep_connected = keep_connected?;
+
+        let mut connection_info: HashMap<Peer, ConnectionInfo> = HashMap::new();
+        for peer in &self.peers {
+            let info = connection_info.entry(*peer).or_default();
+            if connected.contains(peer) {
+                info.connection = ConnectionStatus::Connected;
+            }
+            info.keep_connected = keep_connected.contains(peer);
+        }
+
+        Ok(connection_info)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -244,6 +288,9 @@ enum HouseholdOperation {
         path: realize_types::Path,
         range: ByteRange,
         sig: Signature,
+    },
+    QueryConnectedPeers {
+        tx: oneshot::Sender<HashSet<Peer>>,
     },
 }
 struct PeerConnectionHandler {
@@ -356,6 +403,9 @@ impl PeerConnectionTracker {
                 let res =
                     execute_rsync(self.find_store(&peers, mode), arena, &path, &range, sig).await;
                 let _ = tx.send(res);
+            }
+            HouseholdOperation::QueryConnectedPeers { tx } => {
+                let _ = tx.send(self.stores.borrow().keys().map(|p| *p).collect());
             }
         }
     }
@@ -1815,5 +1865,67 @@ mod tests {
 
             Promise::ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn household_peers() -> anyhow::Result<()> {
+        let mut fixture = HouseholdFixture::setup().await?;
+        fixture
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _| {
+                let b = HouseholdFixture::b();
+                let c = HouseholdFixture::c();
+
+                assert_eq!(
+                    HashMap::from([
+                        (
+                            b,
+                            ConnectionInfo {
+                                connection: ConnectionStatus::Connected,
+                                keep_connected: true
+                            }
+                        ),
+                        (
+                            c,
+                            ConnectionInfo {
+                                connection: ConnectionStatus::Disconnected,
+                                keep_connected: false
+                            }
+                        )
+                    ]),
+                    household_a.query_peers().await?
+                );
+
+                let mut status_a = household_a.peer_status();
+                fixture.server(b).unwrap().shutdown().await?;
+                assert_eq!(PeerStatus::Disconnected(b), status_a.recv().await?);
+
+                assert_eq!(
+                    HashMap::from([
+                        (
+                            b,
+                            ConnectionInfo {
+                                connection: ConnectionStatus::Disconnected,
+                                keep_connected: true
+                            }
+                        ),
+                        (
+                            c,
+                            ConnectionInfo {
+                                connection: ConnectionStatus::Disconnected,
+                                keep_connected: false
+                            }
+                        )
+                    ]),
+                    household_a.query_peers().await?
+                );
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
     }
 }

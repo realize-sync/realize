@@ -4,13 +4,13 @@ use capnp_rpc::{RpcSystem, VatNetwork as _};
 use futures::AsyncReadExt;
 use futures::io::{BufReader, BufWriter};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::sync::broadcast;
 use tokio::sync::mpsc;
+use tokio::sync::{broadcast, oneshot};
 use tokio::task::{JoinHandle, LocalSet};
 use tokio_retry::strategy::ExponentialBackoff;
 use tokio_util::compat::TokioAsyncReadCompatExt;
@@ -50,6 +50,9 @@ enum ConnectionMessage {
 
     /// Disconnects the peer and/or stop trying to connect to it.
     DisconnectPeer(Peer),
+
+    /// Query the set of peers that are kept connected.
+    PeersToKeepConnected(oneshot::Sender<HashSet<Peer>>),
 }
 
 #[allow(async_fn_in_trait)]
@@ -115,6 +118,9 @@ impl ConnectionManager {
                             }
                         }
                         ConnectionMessage::DisconnectPeer(peer) => ctx.disconnect_peer(peer),
+                        ConnectionMessage::PeersToKeepConnected(tx) => {
+                            ctx.peers_to_keep_connected(tx)
+                        }
                     }
                 }
             }
@@ -160,6 +166,14 @@ impl ConnectionManager {
         self.tx.send(ConnectionMessage::DisconnectPeer(peer))?;
 
         Ok(())
+    }
+
+    /// Return the set of peers that are kept connected.
+    pub async fn peers_to_keep_connected(&self) -> anyhow::Result<HashSet<Peer>> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(ConnectionMessage::PeersToKeepConnected(tx))?;
+
+        Ok(rx.await?)
     }
 
     /// Register peer connections to the given server.
@@ -305,6 +319,19 @@ where
         for conn in borrow.values() {
             conn.cancel.cancel();
         }
+    }
+
+    fn peers_to_keep_connected(self: &Rc<Self>, tx: oneshot::Sender<HashSet<Peer>>) {
+        let borrow = self.connections.borrow();
+        let mut peers = HashSet::new();
+        for (peer, conn) in borrow.iter() {
+            if let Some(handle) = &conn.tracker
+                && !handle.is_finished()
+            {
+                peers.insert(*peer);
+            }
+        }
+        let _ = tx.send(peers);
     }
 
     async fn track_peer(self: &Rc<Self>, peer: Peer, cancel: CancellationToken) {
@@ -794,6 +821,62 @@ mod tests {
 
                 assert_eq!(HashSet::from([]), fixture.get_registered(a).await?);
 
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manager_peers_to_keep_connected() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        let local = LocalSet::new();
+
+        let a = a();
+        let b = b();
+        fixture.peers.pick_port(b)?;
+
+        let c = c();
+        fixture.peers.pick_port(c)?;
+
+        let manager_a = fixture.manager(&local, a)?;
+
+        let manager_b = fixture.manager(&local, b)?;
+        let _server_b = fixture.launch_server(b, &manager_b).await?;
+
+        let manager_c = fixture.manager(&local, c)?;
+        let _server_c = fixture.launch_server(c, &manager_c).await?;
+
+        local
+            .run_until(async move {
+                let mut status_a = manager_a.peer_status();
+                assert!(manager_a.peers_to_keep_connected().await?.is_empty());
+
+                manager_a.keep_peer_connected(b)?;
+                assert_eq!(PeerStatus::Connected(b), status_a.recv().await?);
+                assert_eq!(
+                    HashSet::from([b]),
+                    manager_a.peers_to_keep_connected().await?
+                );
+
+                manager_a.keep_peer_connected(c)?;
+                assert_eq!(PeerStatus::Connected(c), status_a.recv().await?);
+                assert_eq!(
+                    HashSet::from([b, c]),
+                    manager_a.peers_to_keep_connected().await?
+                );
+
+                manager_a.disconnect_peer(c)?;
+                assert_eq!(PeerStatus::Disconnected(c), status_a.recv().await?);
+                assert_eq!(
+                    HashSet::from([b]),
+                    manager_a.peers_to_keep_connected().await?
+                );
+
+                manager_a.disconnect_all()?;
+                assert_eq!(PeerStatus::Disconnected(b), status_a.recv().await?);
+                assert!(manager_a.peers_to_keep_connected().await?.is_empty());
                 Ok::<(), anyhow::Error>(())
             })
             .await?;

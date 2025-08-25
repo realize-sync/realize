@@ -30,7 +30,7 @@ pub struct HouseholdFixture {
     pub peers: TestingPeers,
     peer_storage: HashMap<Peer, Arc<Storage>>,
     tempdir: TempDir,
-    servers: Vec<Arc<Server>>,
+    servers: HashMap<Peer, Arc<Server>>,
 }
 
 pub struct HouseholdFixtureBuilder {
@@ -78,7 +78,7 @@ impl HouseholdFixtureBuilder {
             peers: TestingPeers::new()?,
             peer_storage,
             tempdir: self.tempdir,
-            servers: vec![],
+            servers: HashMap::new(),
         })
     }
 }
@@ -108,6 +108,10 @@ impl HouseholdFixture {
         HouseholdFixture::builder().setup().await
     }
 
+    pub fn server(&self, peer: Peer) -> Option<&Arc<Server>> {
+        self.servers.get(&peer)
+    }
+
     /// Run a test with two peers, [HouseholdFixture::a] and
     /// [HouseholdFixture::b] running and inter-connected.
     pub async fn with_two_peers(&mut self) -> anyhow::Result<WithTwoPeers> {
@@ -123,13 +127,13 @@ impl HouseholdFixture {
         let mut server_a = Server::new(self.peers.networking(a)?);
         household_a.register(&mut server_a);
         let server_a = Arc::new(server_a);
-        self.servers.push(Arc::clone(&server_a));
+        self.servers.insert(a, Arc::clone(&server_a));
 
         let household_b = self.create_household(&local, b)?;
         let mut server_b = Server::new(self.peers.networking(b)?);
         household_b.register(&mut server_b);
         let server_b = Arc::new(server_b);
-        self.servers.push(Arc::clone(&server_b));
+        self.servers.insert(b, Arc::clone(&server_b));
 
         Ok(WithTwoPeers {
             local,
