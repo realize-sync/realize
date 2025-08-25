@@ -1,6 +1,7 @@
 use crate::InodeAllocator;
 use crate::config::{self, HumanDuration};
 use crate::utils::redb_utils;
+use anyhow::Context;
 use arena_cache::ArenaCache;
 use db::ArenaDatabase;
 use engine::Engine;
@@ -54,12 +55,9 @@ impl ArenaStorage {
         allocator: &Arc<InodeAllocator>,
     ) -> anyhow::Result<Self> {
         let shutdown = CancellationToken::new();
-        let db = ArenaDatabase::new(
-            redb_utils::open(&arena_config.db).await?,
-            arena,
-            Arc::clone(allocator),
-            &arena_config.blob_dir,
-        )?;
+        let db = create_db(arena, arena_config, allocator)
+            .await
+            .with_context(|| format!("database {:?}", arena_config.db))?;
         let arena_cache = ArenaCache::new(arena, Arc::clone(&db), &arena_config.blob_dir)?;
         let indexed = match arena_config.root.as_ref() {
             None => None,
@@ -82,7 +80,8 @@ impl ArenaStorage {
                     )
                     .max_parallel_hashers(arena_config.max_parallel_hashers.unwrap_or(4))
                     .spawn()
-                    .await?;
+                    .await
+                    .with_context(|| format!("{root:?}"))?;
                 if let Some(limits) = &arena_config.disk_usage {
                     tokio::spawn({
                         let db = Arc::clone(&db);
@@ -124,6 +123,20 @@ impl ArenaStorage {
             _drop_guard: shutdown.drop_guard(),
         })
     }
+}
+
+async fn create_db(
+    arena: Arena,
+    arena_config: &config::ArenaConfig,
+    allocator: &Arc<InodeAllocator>,
+) -> anyhow::Result<Arc<ArenaDatabase>> {
+    let db = ArenaDatabase::new(
+        redb_utils::open(&arena_config.db).await?,
+        arena,
+        Arc::clone(allocator),
+        &arena_config.blob_dir,
+    )?;
+    Ok(db)
 }
 
 /// Minimum wait time after a failed job.

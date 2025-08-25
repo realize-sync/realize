@@ -1,3 +1,4 @@
+use anyhow::Context;
 use arena::arena_cache::ArenaCache;
 use arena::engine::Engine;
 use arena::{ArenaStorage, indexed_store};
@@ -45,7 +46,9 @@ impl Storage {
         let mut arena_storage = HashMap::new();
         let exclude = build_exclude(&config);
 
-        let globaldb = GlobalDatabase::new(redb_utils::open(&config.cache.db).await?)?;
+        let globaldb = create_globaldb(&config.cache.db)
+            .await
+            .with_context(|| format!("global database {:?}", config.cache.db))?;
         let allocator = InodeAllocator::new(
             Arc::clone(&globaldb),
             config.arenas.keys().map(|a| *a).collect::<Vec<_>>(),
@@ -53,7 +56,9 @@ impl Storage {
         for (arena, arena_config) in &config.arenas {
             arena_storage.insert(
                 *arena,
-                ArenaStorage::from_config(*arena, arena_config, &exclude, &allocator).await?,
+                ArenaStorage::from_config(*arena, arena_config, &exclude, &allocator)
+                    .await
+                    .with_context(|| format!("in arena {arena}"))?,
             );
         }
 
@@ -65,7 +70,8 @@ impl Storage {
                 .map(|s| Arc::clone(&s.cache))
                 .collect::<Vec<_>>(),
         )
-        .await?;
+        .await
+        .context("global cache")?;
 
         Ok(Arc::new(Self {
             cache,
@@ -274,6 +280,10 @@ impl Storage {
             .get(&arena)
             .ok_or_else(|| StorageError::UnknownArena(arena))
     }
+}
+
+async fn create_globaldb(path: &std::path::Path) -> anyhow::Result<Arc<GlobalDatabase>> {
+    Ok(GlobalDatabase::new(redb_utils::open(path).await?)?)
 }
 
 /// Build a vector of all databases listed in `config`, to be excluded
