@@ -133,3 +133,83 @@ impl From<fast_rsync::SignatureParseError> for StorageError {
         StorageError::InvalidRsyncSignature
     }
 }
+
+impl Into<std::io::Error> for StorageError {
+    fn into(self) -> std::io::Error {
+        use std::io::ErrorKind;
+        match self {
+            StorageError::Database(_) => std::io::Error::new(ErrorKind::Other, "database error"),
+            StorageError::OpenTable(_, _) => {
+                std::io::Error::new(ErrorKind::Other, "failed to open table")
+            }
+            StorageError::Io(ioerr) => ioerr,
+            StorageError::ByteConversion(ByteConversionError::Path(_)) => {
+                std::io::Error::new(ErrorKind::InvalidInput, "invalid path")
+            }
+            StorageError::ByteConversion(_) => {
+                std::io::Error::new(ErrorKind::Other, "byte conversion error")
+            }
+            StorageError::Unavailable => {
+                std::io::Error::new(ErrorKind::Other, "data not available")
+            }
+            StorageError::NotFound => std::io::Error::new(ErrorKind::NotFound, "not found"),
+            StorageError::NotADirectory => {
+                std::io::Error::new(ErrorKind::NotADirectory, "not a directory")
+            }
+            StorageError::IsADirectory => {
+                std::io::Error::new(ErrorKind::IsADirectory, "is a directory")
+            }
+            StorageError::JoinError(_) => std::io::Error::new(ErrorKind::Other, "join error"),
+            StorageError::InvalidRsyncSignature => {
+                std::io::Error::new(ErrorKind::InvalidInput, "invalid rsync signature")
+            }
+            StorageError::UnknownArena(_) => {
+                std::io::Error::new(ErrorKind::NotFound, "unknown arena")
+            }
+            StorageError::NoLocalStorage(_) => {
+                std::io::Error::new(ErrorKind::NotFound, "no local storage")
+            }
+            StorageError::InconsistentDatabase(_) => {
+                std::io::Error::new(ErrorKind::Other, "inconsistent database")
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn test_storage_error_into_io_error() {
+        // Test various StorageError variants
+        let db_error = StorageError::Database(Box::new(redb::Error::Io(std::io::Error::new(
+            ErrorKind::Other,
+            "test",
+        ))));
+        let io_error: std::io::Error = db_error.into();
+        assert_eq!(io_error.kind(), ErrorKind::Other);
+        assert_eq!(io_error.to_string(), "database error");
+
+        let not_found = StorageError::NotFound;
+        let io_error: std::io::Error = not_found.into();
+        assert_eq!(io_error.kind(), ErrorKind::NotFound);
+        assert_eq!(io_error.to_string(), "not found");
+
+        let not_a_dir = StorageError::NotADirectory;
+        let io_error: std::io::Error = not_a_dir.into();
+        assert_eq!(io_error.kind(), ErrorKind::NotADirectory);
+        assert_eq!(io_error.to_string(), "not a directory");
+
+        let is_a_dir = StorageError::IsADirectory;
+        let io_error: std::io::Error = is_a_dir.into();
+        assert_eq!(io_error.kind(), ErrorKind::IsADirectory);
+        assert_eq!(io_error.to_string(), "is a directory");
+
+        let invalid_input = StorageError::InvalidRsyncSignature;
+        let io_error: std::io::Error = invalid_input.into();
+        assert_eq!(io_error.kind(), ErrorKind::InvalidInput);
+        assert_eq!(io_error.to_string(), "invalid rsync signature");
+    }
+}

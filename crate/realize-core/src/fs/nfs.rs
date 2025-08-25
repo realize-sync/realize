@@ -220,12 +220,16 @@ impl NFSFileSystem for UnrealFs {
             .readers
             .entry(Inode(id))
             .or_try_insert_with(async {
-                let reader = self.downloader.reader(Inode(id)).await?;
+                let reader = self
+                    .downloader
+                    .reader(Inode(id))
+                    .await
+                    .map_err(|e| <StorageError as Into<std::io::Error>>::into(e))?;
 
-                Ok::<_, StorageError>(Arc::new(Mutex::new(reader)))
+                Ok::<_, std::io::Error>(Arc::new(Mutex::new(reader)))
             })
             .await
-            .map_err(|e| unreal_to_nfsstat3(e.as_ref()))?
+            .map_err(|e| io_to_nfsstat3(e.as_ref()))?
             .into_value();
 
         Ok(self.do_read(reader, offset, count).await?)
@@ -299,24 +303,8 @@ impl From<UnrealFsError> for nfsstat3 {
         use nfsstat3::*;
         match err {
             UnrealFsError::Utf8(_) => NFS3ERR_NOENT,
-            UnrealFsError::Cache(e) => unreal_to_nfsstat3(&e),
+            UnrealFsError::Cache(e) => io_to_nfsstat3(&e.into()),
             UnrealFsError::Io(e) => io_to_nfsstat3(&e),
-        }
-    }
-}
-
-fn unreal_to_nfsstat3(err: &StorageError) -> nfsstat3 {
-    use StorageError::*;
-    use nfsstat3::*;
-    match err {
-        NotFound => NFS3ERR_NOENT,
-        NotADirectory => NFS3ERR_NOTDIR,
-        IsADirectory => NFS3ERR_ISDIR,
-        Io(e) => io_to_nfsstat3(e),
-        _ => {
-            log::debug!("Unexpected error {err:?}");
-
-            NFS3ERR_SERVERFAULT
         }
     }
 }

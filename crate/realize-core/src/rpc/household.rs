@@ -12,7 +12,6 @@ use capnp::capability::Promise;
 use capnp_rpc::pry;
 use realize_network::capnp::{ConnectionHandler, ConnectionManager, ConnectionTracker, PeerStatus};
 use realize_network::{Networking, Server};
-use realize_storage::utils::holder::ByteConversionError;
 use realize_storage::{Notification, Progress, Storage, StorageError};
 use realize_types::{self, Arena, ByteRange, Delta, Hash, Path, Peer, Signature, UnixTime};
 use std::cell::RefCell;
@@ -538,6 +537,22 @@ fn errno_to_io_error(errno: io_error::Errno) -> io::Error {
     )
 }
 
+fn io_error_to_errno(err: std::io::Error) -> io_error::Errno {
+    use io_error::Errno;
+    use std::io::ErrorKind;
+
+    match err.kind() {
+        ErrorKind::NotFound => Errno::NotFound,
+        ErrorKind::PermissionDenied => Errno::PermissionDenied,
+        ErrorKind::ConnectionAborted => Errno::Aborted,
+        ErrorKind::NotADirectory => Errno::NotADirectory,
+        ErrorKind::IsADirectory => Errno::IsADirectory,
+        ErrorKind::InvalidInput => Errno::InvalidInput,
+        ErrorKind::ResourceBusy => Errno::ResourceBusy,
+        _ => Errno::GenericIo,
+    }
+}
+
 fn already_finished() -> capnp::Error {
     capnp::Error::failed("already finished".to_string())
 }
@@ -854,32 +869,8 @@ impl StoreServer {
 }
 
 fn read_errno(err: StorageError) -> io_error::Errno {
-    use io_error::Errno::*;
-    match err {
-        StorageError::Database(_) => Unavailable,
-        StorageError::OpenTable(_, _) => Unavailable,
-        StorageError::Io(ioerr) => match ioerr.kind() {
-            io::ErrorKind::NotFound => NotFound,
-            io::ErrorKind::PermissionDenied => PermissionDenied,
-            io::ErrorKind::ConnectionAborted => Aborted,
-            io::ErrorKind::NotADirectory => NotADirectory,
-            io::ErrorKind::IsADirectory => IsADirectory,
-            io::ErrorKind::InvalidInput => InvalidInput,
-            io::ErrorKind::ResourceBusy => ResourceBusy,
-            _ => GenericIo,
-        },
-        StorageError::ByteConversion(ByteConversionError::Path(_)) => InvalidPath,
-        StorageError::ByteConversion(_) => Unavailable,
-        StorageError::Unavailable => Unavailable,
-        StorageError::NotFound => NotFound,
-        StorageError::NotADirectory => NotADirectory,
-        StorageError::IsADirectory => IsADirectory,
-        StorageError::JoinError(_) => Other,
-        StorageError::InvalidRsyncSignature => InvalidInput,
-        StorageError::UnknownArena(_) => NotFound,
-        StorageError::NoLocalStorage(_) => NotFound,
-        StorageError::InconsistentDatabase(_) => Other,
-    }
+    let io_err: std::io::Error = err.into();
+    io_error_to_errno(io_err)
 }
 
 impl store::Server for StoreServer {
