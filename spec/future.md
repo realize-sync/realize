@@ -9,10 +9,6 @@ Currently, cleanup runs when disk usage changes, but cannot delete
 open blobs, meaning that very often it'll leave possibly large files
 that used to be open until some other disk usage changes.
 
-## Make blobs directory at startup or require it to exist {#blobdir}
-
-Without it, disk_usage fails.
-
 ## Re-design churten {#nochurten}
 
 With the latest changes, churten doesn't make much sense anymore; it's
