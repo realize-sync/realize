@@ -43,9 +43,8 @@ pub enum ExecutionMode {
 /// the rest of the application.
 ///
 /// To listen to incoming connections, call [Household::register].
-#[derive(Clone)]
 pub struct Household {
-    manager: Arc<ConnectionManager>,
+    manager: ConnectionManager,
     operation_tx: mpsc::Sender<HouseholdOperation>,
 }
 
@@ -60,15 +59,15 @@ impl Household {
         local: &LocalSet,
         networking: Networking,
         storage: Arc<Storage>,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<Arc<Self>> {
         let (tx, rx) = mpsc::channel(128);
         let handler = PeerConnectionHandler::new(storage, &networking, rx);
         let manager = ConnectionManager::spawn(local, networking, handler)?;
 
-        Ok(Self {
-            manager: Arc::new(manager),
+        Ok(Arc::new(Self {
+            manager,
             operation_tx: tx,
-        })
+        }))
     }
 
     /// Keep a client connection up to all peers for which an address is known.

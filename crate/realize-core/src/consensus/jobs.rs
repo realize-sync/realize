@@ -43,7 +43,7 @@ pub(crate) enum JobError {
 /// Executes a [realize_storage::Job::Download]
 pub(crate) async fn download(
     storage: &Arc<Storage>,
-    household: &Household,
+    household: &Arc<Household>,
     arena: Arena,
     path: &Path,
     hash: &Hash,
@@ -122,7 +122,7 @@ pub(crate) async fn download(
 
 /// Read file data from `peers` into `blob`.
 async fn write_to_blob(
-    household: &Household,
+    household: &Arc<Household>,
     arena: Arena,
     path: &Path,
     peers: Vec<Peer>,
@@ -181,7 +181,7 @@ async fn write_to_blob(
 /// first if necessary.
 pub(crate) async fn verify(
     storage: &Arc<Storage>,
-    household: &Household,
+    household: &Arc<Household>,
     arena: Arena,
     path: &Path,
     inode: Inode,

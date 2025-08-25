@@ -44,7 +44,7 @@ pub(crate) trait JobHandler: Sync + Send + Clone {
 /// happens on that job.
 pub(crate) struct Churten<H: JobHandler> {
     storage: Arc<Storage>,
-    household: Household,
+    household: Arc<Household>,
     handler: H,
     task: Option<(JoinHandle<()>, CancellationToken)>,
     tx: broadcast::Sender<ChurtenNotification>,
@@ -52,7 +52,7 @@ pub(crate) struct Churten<H: JobHandler> {
 }
 
 impl Churten<JobHandlerImpl> {
-    pub(crate) fn new(storage: Arc<Storage>, household: Household) -> Self {
+    pub(crate) fn new(storage: Arc<Storage>, household: Arc<Household>) -> Self {
         Self::with_handler(
             Arc::clone(&storage),
             household.clone(),
@@ -62,7 +62,7 @@ impl Churten<JobHandlerImpl> {
 }
 
 impl<H: JobHandler + 'static> Churten<H> {
-    pub(crate) fn with_handler(storage: Arc<Storage>, household: Household, handler: H) -> Self {
+    pub(crate) fn with_handler(storage: Arc<Storage>, household: Arc<Household>, handler: H) -> Self {
         let (tx, mut rx) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
 
         let tracker = Arc::new(RwLock::new(JobInfoTracker::new(16)));
@@ -245,11 +245,11 @@ async fn run_job<H: JobHandler>(
 #[derive(Clone)]
 pub(crate) struct JobHandlerImpl {
     storage: Arc<Storage>,
-    household: Household,
+    household: Arc<Household>,
 }
 
 impl JobHandlerImpl {
-    pub(crate) fn new(storage: Arc<Storage>, household: Household) -> Self {
+    pub(crate) fn new(storage: Arc<Storage>, household: Arc<Household>) -> Self {
         Self { storage, household }
     }
 }

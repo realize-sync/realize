@@ -274,7 +274,7 @@ impl HouseholdFixture {
     /// must be run for the household to do something.
     ///
     /// This is a lower-level call that's usually not called directly. Prefer calling with_two_peers or with_three_peers
-    pub fn create_household(&self, local: &LocalSet, peer: Peer) -> anyhow::Result<Household> {
+    pub fn create_household(&self, local: &LocalSet, peer: Peer) -> anyhow::Result<Arc<Household>> {
         let storage = self
             .peer_storage
             .get(&peer)
@@ -287,7 +287,7 @@ impl HouseholdFixture {
 /// Connect from `household` to `peer`.
 ///
 /// Assumes that the household is not already connected to the peer.
-pub async fn connect(household: &Household, peer: Peer) -> anyhow::Result<()> {
+pub async fn connect(household: &Arc<Household>, peer: Peer) -> anyhow::Result<()> {
     let mut status = household.peer_status();
     household.keep_peer_connected(peer)?;
 
@@ -305,7 +305,7 @@ pub async fn connect(household: &Household, peer: Peer) -> anyhow::Result<()> {
 /// Disconnects from `household` to `peer`.
 ///
 /// Assumes that the household is connected to the peer.
-pub async fn disconnect(household: &Household, peer: Peer) -> anyhow::Result<()> {
+pub async fn disconnect(household: &Arc<Household>, peer: Peer) -> anyhow::Result<()> {
     let mut status = household.peer_status();
     household.disconnect_peer(peer)?;
 
@@ -322,11 +322,11 @@ pub async fn disconnect(household: &Household, peer: Peer) -> anyhow::Result<()>
 
 pub struct WithTwoPeers {
     local: LocalSet,
-    household_a: Household,
+    household_a: Arc<Household>,
     addr_a: HostPort,
     server_a: Arc<Server>,
     addr_b: HostPort,
-    household_b: Household,
+    household_b: Arc<Household>,
     server_b: Arc<Server>,
     connected: bool,
 }
@@ -340,7 +340,7 @@ impl WithTwoPeers {
 
     pub async fn run(
         self,
-        test: impl AsyncFnOnce(Household, Household) -> anyhow::Result<()>,
+        test: impl AsyncFnOnce(Arc<Household>, Arc<Household>) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         let Self {
             local,

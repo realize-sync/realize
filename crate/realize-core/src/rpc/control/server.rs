@@ -365,7 +365,7 @@ mod tests {
             &self,
             local: &LocalSet,
             peer: Peer,
-            household: Household,
+            household: Arc<Household>,
             handler: H,
         ) -> anyhow::Result<PathBuf> {
             let storage = self.inner.storage(peer)?;

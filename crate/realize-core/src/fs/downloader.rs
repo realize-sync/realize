@@ -24,12 +24,12 @@ const MAX_CHUNK_SIZE: u64 = 4 * MIN_CHUNK_SIZE;
 
 #[derive(Clone)]
 pub struct Downloader {
-    household: Household,
+    household: Arc<Household>,
     cache: Arc<GlobalCache>,
 }
 
 impl Downloader {
-    pub fn new(household: Household, cache: Arc<GlobalCache>) -> Self {
+    pub fn new(household: Arc<Household>, cache: Arc<GlobalCache>) -> Self {
         Self { household, cache }
     }
 
@@ -57,7 +57,7 @@ impl Downloader {
 /// Call [Download::update_db] when you're done to update the database
 /// with any data that had to be downloaded, to keep it for later.
 pub struct Download {
-    household: Household,
+    household: Arc<Household>,
     peers: Vec<Peer>,
     arena: Arena,
     path: Path,
@@ -108,7 +108,7 @@ type PendingDownload = Pin<
 
 impl Download {
     fn new(
-        household: Household,
+        household: Arc<Household>,
         peers: Vec<Peer>,
         arena: Arena,
         path: Path,
@@ -882,7 +882,7 @@ mod tests {
 
     async fn test_read_file(
         fixture: &HouseholdFixture,
-        household: Household,
+        household: Arc<Household>,
         file_size: usize,
         buf_size: usize,
         allow_short_reads: bool,

@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 pub struct SetupHelper {
     pub networking: Networking,
     pub storage: Arc<Storage>,
-    pub household: Household,
+    pub household: Arc<Household>,
 }
 
 impl SetupHelper {
