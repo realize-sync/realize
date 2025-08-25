@@ -46,8 +46,8 @@ pub enum ConnectionStatus {
 /// Information about a peer, reported by [Household::query_peers].
 #[derive(Clone, Eq, PartialEq, Debug, Default)]
 pub struct ConnectionInfo {
-    connection: ConnectionStatus,
-    keep_connected: bool,
+    pub connection: ConnectionStatus,
+    pub keep_connected: bool,
 }
 
 /// A set of peers and their connections.

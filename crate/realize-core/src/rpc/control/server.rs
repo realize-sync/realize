@@ -6,14 +6,16 @@ use super::control_capnp::churten::{
     ShutdownResults, StartParams, StartResults, SubscribeParams, SubscribeResults,
 };
 use super::control_capnp::control::{
-    self, ChurtenParams, ChurtenResults, GetMarkParams, GetMarkResults, SetMarkParams,
-    SetMarkResults,
+    self, ChurtenParams, ChurtenResults, DisconnectParams, DisconnectResults, GetMarkParams,
+    GetMarkResults, KeepConnectedParams, KeepConnectedResults, ListPeersParams, ListPeersResults,
+    SetMarkParams, SetMarkResults,
 };
 use super::convert;
 use crate::consensus::churten::{Churten, JobHandler};
+use crate::rpc::{Household, household::ConnectionStatus};
 use capnp::capability::Promise;
 use realize_storage::{Mark, Storage, StorageError};
-use realize_types::{Arena, Hash, Path};
+use realize_types::{Arena, Hash, Path, Peer};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -22,13 +24,19 @@ use std::sync::Arc;
 pub(crate) struct ControlServer<H: JobHandler + 'static> {
     storage: Arc<Storage>,
     churten: Rc<RefCell<Churten<H>>>,
+    household: Arc<Household>,
 }
 
 impl<H: JobHandler + 'static> ControlServer<H> {
-    pub(crate) fn new(storage: Arc<Storage>, churten: Churten<H>) -> ControlServer<H> {
+    pub(crate) fn new(
+        storage: Arc<Storage>,
+        churten: Churten<H>,
+        household: Arc<Household>,
+    ) -> ControlServer<H> {
         Self {
             storage,
             churten: Rc::new(RefCell::new(churten)),
+            household,
         }
     }
 
@@ -107,6 +115,66 @@ impl<H: JobHandler + 'static> control::Server for ControlServer<H> {
 
             let mut res = results.get().init_res();
             res.set_mark(mark_to_capnp(mark));
+            Ok(())
+        })
+    }
+
+    fn list_peers(
+        &mut self,
+        _: ListPeersParams,
+        mut results: ListPeersResults,
+    ) -> Promise<(), capnp::Error> {
+        let household = Arc::clone(&self.household);
+        Promise::from_future(async move {
+            let connection_info = household
+                .query_peers()
+                .await
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+            let mut peer_list = results.get().init_res(connection_info.len() as u32);
+            for (i, (peer, info)) in connection_info.into_iter().enumerate() {
+                let mut peer_info = peer_list.reborrow().get(i as u32);
+                peer_info.set_peer(peer.as_str());
+                peer_info.set_connected(matches!(info.connection, ConnectionStatus::Connected));
+                peer_info.set_keep_connected(info.keep_connected);
+            }
+
+            Ok(())
+        })
+    }
+
+    fn keep_connected(
+        &mut self,
+        params: KeepConnectedParams,
+        _: KeepConnectedResults,
+    ) -> Promise<(), capnp::Error> {
+        let household = Arc::clone(&self.household);
+        Promise::from_future(async move {
+            let peer_str = params.get()?.get_peer()?;
+            let peer = parse_peer(peer_str)?;
+
+            household
+                .keep_peer_connected(peer)
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+            Ok(())
+        })
+    }
+
+    fn disconnect(
+        &mut self,
+        params: DisconnectParams,
+        _: DisconnectResults,
+    ) -> Promise<(), capnp::Error> {
+        let household = Arc::clone(&self.household);
+        Promise::from_future(async move {
+            let peer_str = params.get()?.get_peer()?;
+            let peer = parse_peer(peer_str)?;
+
+            household
+                .disconnect_peer(peer)
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
             Ok(())
         })
     }
@@ -257,6 +325,10 @@ fn parse_hash(hash: &[u8]) -> Result<Hash, capnp::Error> {
     Ok(Hash(hash))
 }
 
+fn parse_peer(reader: capnp::text::Reader<'_>) -> Result<Peer, capnp::Error> {
+    Ok(Peer::from(reader.to_str()?))
+}
+
 fn parse_mark(mark: control_capnp::Mark) -> Mark {
     match mark {
         control_capnp::Mark::Own => Mark::Own,
@@ -284,6 +356,7 @@ mod tests {
     use crate::rpc::control::client::{self, ChurtenUpdates, TxChurtenSubscriber};
     use crate::rpc::testing::HouseholdFixture;
     use assert_fs::TempDir;
+    use realize_network::capnp::PeerStatus;
     use realize_network::unixsocket;
     use realize_storage::{Job, JobId, JobStatus, Mark, Notification};
     use realize_types::{Peer, UnixTime};
@@ -369,8 +442,8 @@ mod tests {
             handler: H,
         ) -> anyhow::Result<PathBuf> {
             let storage = self.inner.storage(peer)?;
-            let churten = Churten::with_handler(Arc::clone(storage), household, handler);
-            let server = ControlServer::new(Arc::clone(storage), churten);
+            let churten = Churten::with_handler(Arc::clone(storage), household.clone(), handler);
+            let server = ControlServer::new(Arc::clone(storage), churten, household);
 
             let sockpath = self
                 .tempdir
@@ -811,6 +884,310 @@ mod tests {
                 // Shutdown churten
                 churten.shutdown_request().send().promise.await?;
 
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_peers() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                let local = LocalSet::new();
+
+                let handler = FakeJobHandler::new(|| Ok(JobStatus::Done));
+                let sockpath = fixture
+                    .bind_server(&local, a, household_a.clone(), handler)
+                    .await?;
+
+                local
+                    .run_until(async move {
+                        let control: control::Client = unixsocket::connect(&sockpath).await?;
+
+                        // Initially, should have peers B and C (from fixture setup)
+                        let list_peers_result = control.list_peers_request().send().promise.await?;
+                        let peers = list_peers_result.get()?.get_res()?;
+                        assert_eq!(peers.len(), 2);
+
+                        // Find peer B in the list
+                        let mut b_info = None;
+                        for i in 0..peers.len() {
+                            let peer_info = peers.get(i);
+                            if peer_info.get_peer()? == b.as_str() {
+                                b_info = Some(peer_info);
+                                break;
+                            }
+                        }
+                        let b_info = b_info.expect("Peer B should be in the list");
+
+                        // Initially peer B should be connected (due to interconnected setup)
+                        assert!(b_info.get_connected());
+                        assert!(b_info.get_keep_connected());
+
+                        // Disconnect from peer B
+                        let mut status_a = household_a.peer_status();
+                        household_a.disconnect_peer(b)?;
+                        assert_eq!(
+                            PeerStatus::Disconnected(b),
+                            tokio::time::timeout(Duration::from_secs(3), status_a.recv())
+                                .await
+                                .unwrap()?
+                        );
+
+                        // Now list peers again
+                        let list_peers_result = control.list_peers_request().send().promise.await?;
+                        let peers = list_peers_result.get()?.get_res()?;
+
+                        // Should still have 2 peers
+                        assert_eq!(peers.len(), 2);
+
+                        // Find peer B again and check it's now disconnected
+                        let mut b_info = None;
+                        for i in 0..peers.len() {
+                            let peer_info = peers.get(i);
+                            if peer_info.get_peer()? == b.as_str() {
+                                b_info = Some(peer_info);
+                                break;
+                            }
+                        }
+                        let b_info = b_info.expect("Peer B should be in the list");
+                        assert!(!b_info.get_connected());
+                        assert!(!b_info.get_keep_connected());
+
+                        // Reconnect to peer B
+                        household_a.keep_peer_connected(b)?;
+                        assert_eq!(
+                            PeerStatus::Connected(b),
+                            tokio::time::timeout(Duration::from_secs(3), status_a.recv())
+                                .await
+                                .unwrap()?
+                        );
+
+                        // List peers again
+                        let list_peers_result = control.list_peers_request().send().promise.await?;
+                        let peers = list_peers_result.get()?.get_res()?;
+
+                        // Should still have 2 peers
+                        assert_eq!(peers.len(), 2);
+
+                        // Find peer B again and check it's now connected
+                        let mut b_info = None;
+                        for i in 0..peers.len() {
+                            let peer_info = peers.get(i);
+                            if peer_info.get_peer()? == b.as_str() {
+                                b_info = Some(peer_info);
+                                break;
+                            }
+                        }
+                        let b_info = b_info.expect("Peer B should be in the list");
+                        assert!(b_info.get_connected());
+                        assert!(b_info.get_keep_connected());
+                        Ok::<(), anyhow::Error>(())
+                    })
+                    .await?;
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn keep_connected() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                let local = LocalSet::new();
+
+                let handler = FakeJobHandler::new(|| Ok(JobStatus::Done));
+                let sockpath = fixture
+                    .bind_server(&local, a, household_a.clone(), handler)
+                    .await?;
+                local
+                    .run_until(async move {
+                        let control: control::Client = unixsocket::connect(&sockpath).await?;
+
+                        // Initially, should have peers B and C (from fixture setup)
+                        let list_peers_result = control.list_peers_request().send().promise.await?;
+                        let peers = list_peers_result.get()?.get_res()?;
+                        assert_eq!(peers.len(), 2);
+
+                        // Find peer B in the list
+                        let mut b_info = None;
+                        for i in 0..peers.len() {
+                            let peer_info = peers.get(i);
+                            if peer_info.get_peer()? == b.as_str() {
+                                b_info = Some(peer_info);
+                                break;
+                            }
+                        }
+                        let b_info = b_info.expect("Peer B should be in the list");
+
+                        // Initially peer B should be connected (due to interconnected setup)
+                        assert!(b_info.get_connected());
+                        assert!(b_info.get_keep_connected());
+
+                        // Disconnect from peer B first
+                        let mut status_a = household_a.peer_status();
+                        household_a.disconnect_peer(b)?;
+                        assert_eq!(
+                            PeerStatus::Disconnected(b),
+                            tokio::time::timeout(Duration::from_secs(3), status_a.recv())
+                                .await
+                                .unwrap()?
+                        );
+
+                        // Verify peer is now disconnected
+                        let list_peers_result = control.list_peers_request().send().promise.await?;
+                        let peers = list_peers_result.get()?.get_res()?;
+                        assert_eq!(peers.len(), 2);
+
+                        // Find peer B again and check it's now disconnected
+                        let mut b_info = None;
+                        for i in 0..peers.len() {
+                            let peer_info = peers.get(i);
+                            if peer_info.get_peer()? == b.as_str() {
+                                b_info = Some(peer_info);
+                                break;
+                            }
+                        }
+                        let b_info = b_info.expect("Peer B should be in the list");
+                        assert!(!b_info.get_connected());
+                        assert!(!b_info.get_keep_connected());
+
+                        // Use keep_connected RPC method
+                        let mut request = control.keep_connected_request();
+                        request.get().set_peer(b.as_str());
+                        request.send().promise.await?;
+
+                        // Wait a bit for connection to establish
+                        assert_eq!(
+                            PeerStatus::Connected(b),
+                            tokio::time::timeout(Duration::from_secs(3), status_a.recv())
+                                .await
+                                .unwrap()?
+                        );
+
+                        // Verify peer is now connected
+                        let list_peers_result = control.list_peers_request().send().promise.await?;
+                        let peers = list_peers_result.get()?.get_res()?;
+                        assert_eq!(peers.len(), 2);
+
+                        // Find peer B again and check it's now connected
+                        let mut b_info = None;
+                        for i in 0..peers.len() {
+                            let peer_info = peers.get(i);
+                            if peer_info.get_peer()? == b.as_str() {
+                                b_info = Some(peer_info);
+                                break;
+                            }
+                        }
+                        let b_info = b_info.expect("Peer B should be in the list");
+                        assert!(b_info.get_connected());
+                        assert!(b_info.get_keep_connected());
+                        Ok::<(), anyhow::Error>(())
+                    })
+                    .await?;
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disconnect() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                let local = LocalSet::new();
+
+                // Create a fake job handler
+                let handler = FakeJobHandler::new(|| Ok(JobStatus::Done));
+                let sockpath = fixture
+                    .bind_server(&local, a, household_a.clone(), handler)
+                    .await?;
+
+                local
+                    .run_until(async move {
+                        let control: control::Client = unixsocket::connect(&sockpath).await?;
+
+                        // Initially peer B should be connected (due to interconnected setup)
+                        let list_peers_result = control.list_peers_request().send().promise.await?;
+                        let peers = list_peers_result.get()?.get_res()?;
+                        assert_eq!(peers.len(), 2);
+
+                        // Find peer B and check it's connected
+                        let mut b_info = None;
+                        for i in 0..peers.len() {
+                            let peer_info = peers.get(i);
+                            if peer_info.get_peer()? == b.as_str() {
+                                b_info = Some(peer_info);
+                                break;
+                            }
+                        }
+                        let b_info = b_info.expect("Peer B should be in the list");
+                        assert!(b_info.get_connected());
+                        assert!(b_info.get_keep_connected());
+
+                        let mut status_a = household_a.peer_status();
+
+                        // Use disconnect RPC method
+                        let mut request = control.disconnect_request();
+                        request.get().set_peer(b.as_str());
+                        request.send().promise.await?;
+
+                        assert_eq!(
+                            PeerStatus::Disconnected(b),
+                            tokio::time::timeout(Duration::from_secs(3), status_a.recv())
+                                .await
+                                .unwrap()?
+                        );
+
+                        // Verify peer is now disconnected
+                        let list_peers_result = control.list_peers_request().send().promise.await?;
+                        let peers = list_peers_result.get()?.get_res()?;
+                        assert_eq!(peers.len(), 2);
+
+                        // Find peer B again and check it's now disconnected
+                        let mut b_info = None;
+                        for i in 0..peers.len() {
+                            let peer_info = peers.get(i);
+                            if peer_info.get_peer()? == b.as_str() {
+                                b_info = Some(peer_info);
+                                break;
+                            }
+                        }
+                        let b_info = b_info.expect("Peer B should be in the list");
+                        assert!(!b_info.get_connected());
+                        assert!(!b_info.get_keep_connected());
+
+                        Ok::<(), anyhow::Error>(())
+                    })
+                    .await?;
                 Ok::<(), anyhow::Error>(())
             })
             .await?;

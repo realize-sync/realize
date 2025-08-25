@@ -9,6 +9,21 @@ interface Control {
 
   setMark @1 (req: SetMarkRequest) -> ();
   getMark @2 (req: GetMarkRequest) -> (res: GetMarkResponse);
+
+  listPeers @3 () -> (res:List(PeerConnectionInfo));
+  # list peers and their connection status
+  
+  keepConnected @4 (peer: Text) -> ();
+  # attempt to keep connected to the given peer
+  
+  disconnect @5 (peer: Text) -> ();
+  # disconnect to the given peer or stop trying to connect
+}
+
+struct PeerConnectionInfo {
+  peer @0:Text;
+  connected @1:Bool; # if ture, peer is currently connected
+  keepConnected @2:Bool; # if true, the server will keep trying to connect
 }
 
 struct SetMarkRequest {
