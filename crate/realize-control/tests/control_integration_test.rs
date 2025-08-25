@@ -409,3 +409,97 @@ async fn mark_get_arena() -> anyhow::Result<()> {
         .await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn peer_query() -> anyhow::Result<()> {
+    let local = LocalSet::new();
+    let fixture = Fixture::setup(&local).await?;
+
+    local
+        .run_until(async move {
+            // Test the peer query command
+            let output = fixture
+                .control_command(&["peer", "query"])?
+                .output()
+                .await?;
+
+            assert!(
+                output.status.success(),
+                "Control command failed: {output:?}"
+            );
+
+            let output_str = String::from_utf8(output.stdout)?;
+            // Should show at least one peer (the one configured in setup)
+            assert!(
+                output_str.contains("a:"),
+                "Expected peer 'a' in output, got '{}'",
+                output_str
+            );
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn peer_connect() -> anyhow::Result<()> {
+    let local = LocalSet::new();
+    let fixture = Fixture::setup(&local).await?;
+
+    local
+        .run_until(async move {
+            // Test the peer connect command
+            let output = fixture
+                .control_command(&["peer", "connect", "a"])?
+                .output()
+                .await?;
+
+            assert!(
+                output.status.success(),
+                "Control command failed: {output:?}"
+            );
+
+            let output_str = String::from_utf8(output.stdout)?;
+            assert!(
+                output_str.contains("Connecting to peer: a"),
+                "Expected success message, got '{}'",
+                output_str
+            );
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn peer_disconnect() -> anyhow::Result<()> {
+    let local = LocalSet::new();
+    let fixture = Fixture::setup(&local).await?;
+
+    local
+        .run_until(async move {
+            // Test the peer disconnect command
+            let output = fixture
+                .control_command(&["peer", "disconnect", "a"])?
+                .output()
+                .await?;
+
+            assert!(
+                output.status.success(),
+                "Control command failed: {output:?}"
+            );
+
+            let output_str = String::from_utf8(output.stdout)?;
+            assert!(
+                output_str.contains("Disconnected from peer: a"),
+                "Expected success message, got '{}'",
+                output_str
+            );
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    Ok(())
+}

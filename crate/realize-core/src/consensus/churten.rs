@@ -62,7 +62,11 @@ impl Churten<JobHandlerImpl> {
 }
 
 impl<H: JobHandler + 'static> Churten<H> {
-    pub(crate) fn with_handler(storage: Arc<Storage>, household: Arc<Household>, handler: H) -> Self {
+    pub(crate) fn with_handler(
+        storage: Arc<Storage>,
+        household: Arc<Household>,
+        handler: H,
+    ) -> Self {
         let (tx, mut rx) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
 
         let tracker = Arc::new(RwLock::new(JobInfoTracker::new(16)));

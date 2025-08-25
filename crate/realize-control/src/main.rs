@@ -11,6 +11,7 @@ mod churten_cmd;
 mod display;
 mod mark_cmd;
 mod output;
+mod peer_cmd;
 
 /// Command-line tool for controlling a running instance of realize-daemon
 #[derive(Parser, Debug)]
@@ -41,6 +42,10 @@ enum Commands {
     Mark {
         #[command(subcommand)]
         command: MarkCommands,
+    },
+    Peer {
+        #[command(subcommand)]
+        command: PeerCommands,
     },
 }
 
@@ -77,6 +82,22 @@ enum MarkCommands {
         arena: String,
         /// Paths to get marks for
         paths: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PeerCommands {
+    /// List all peers and their connection status
+    Query,
+    /// Connect to a peer
+    Connect {
+        /// The peer to connect to
+        peer: String,
+    },
+    /// Disconnect from a peer
+    Disconnect {
+        /// The peer to disconnect from
+        peer: String,
     },
 }
 
@@ -165,6 +186,16 @@ async fn execute(cli: Cli) -> anyhow::Result<i32> {
 
                     MarkCommands::Get { arena, paths } => {
                         mark_cmd::execute_mark_get(&control, &arena, &paths, cli.output).await
+                    }
+                },
+
+                Commands::Peer { command } => match command {
+                    PeerCommands::Query => peer_cmd::execute_peer_query(&control, cli.output).await,
+                    PeerCommands::Connect { peer } => {
+                        peer_cmd::execute_peer_connect(&control, &peer, cli.output).await
+                    }
+                    PeerCommands::Disconnect { peer } => {
+                        peer_cmd::execute_peer_disconnect(&control, &peer, cli.output).await
                     }
                 },
             }
