@@ -132,13 +132,14 @@ impl BytesOrPercent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Mark;
     use crate::arena::blob::{BlobExt, BlobReadOperations};
     use crate::arena::db::{ArenaReadTransaction, ArenaWriteTransaction};
     use crate::utils::hash;
+    use crate::{Blob, Mark};
     use assert_fs::{TempDir, fixture::PathChild};
     use realize_types::{Arena, Path};
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     const MB: u64 = 1024 * 1024;
     const GB: u64 = 1024 * MB;
@@ -558,6 +559,62 @@ mod tests {
         let tree = txn.read_tree()?;
         assert!(blobs.get(&tree, Path::parse("test.txt")?)?.is_none());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_after_blobs_dropped() -> anyhow::Result<()> {
+        let path1 = Path::parse("1")?;
+        let path2 = Path::parse("2")?;
+        let fixture = Fixture::setup()?;
+
+        fixture.create_blob_with_data(&path1, "x".repeat(2 * MB as usize))?;
+        fixture.create_blob_with_data(&path2, "y".repeat(2 * MB as usize))?;
+
+        let blob1 = Blob::open(&fixture.db, &path1)?;
+        let blob2 = Blob::open(&fixture.db, &path2)?;
+
+        let limits = DiskUsageLimits::max_bytes(0);
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn({
+            let db = Arc::clone(&fixture.db);
+            let shutdown = shutdown.clone();
+            async move { run_loop(db, limits, shutdown).await }
+        });
+
+        // make sure the blobs still exist
+        let blob1_2 = Blob::open(&fixture.db, &path1);
+        let blob2_2 = Blob::open(&fixture.db, &path2);
+
+        let blobs_exist = || {
+            let txn = fixture.db.begin_read()?;
+            let tree = txn.read_tree()?;
+            let blobs = txn.read_blobs()?;
+            Ok::<(bool, bool), StorageError>((
+                blobs.get(&tree, &path1)?.is_some(),
+                blobs.get(&tree, &path2)?.is_some(),
+            ))
+        };
+        tokio::task::yield_now().await;
+
+        assert_eq!((true, true), blobs_exist()?);
+
+        drop(blob1);
+        drop(blob2);
+        drop(blob1_2);
+        drop(blob2_2);
+
+        // Now that all blobs have been dropped, cleanup should run
+        // and delete them.
+        let limit = Instant::now() + Duration::from_secs(3);
+        while blobs_exist()? != (false, false) && Instant::now() < limit {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert_eq!((false, false), blobs_exist()?);
+
+        shutdown.cancel();
+        handle.await?;
         Ok(())
     }
 }

@@ -1323,8 +1323,13 @@ impl Blob {
 
 impl Drop for Blob {
     fn drop(&mut self) {
-        // Decrement the reference count when the blob is dropped
-        self.db.blobs().open_blobs.decrement(self.inode);
+        let blobs = self.db.blobs();
+        if blobs.open_blobs.decrement(self.inode) {
+            // poke disk usage without modifying it so the cleaner
+            // attempts to evict files it couldn't previously evict
+            // because they were open.
+            blobs.disk_usage_tx.send_modify(|_| {});
+        }
     }
 }
 
@@ -1425,21 +1430,28 @@ impl OpenBlobRefCounter {
         }
     }
 
-    fn increment(&self, id: Inode) {
+    fn increment(&self, inode: Inode) {
         let mut guard = self.counts.lock().unwrap();
-        *guard.entry(id).or_insert(0) += 1;
-        log::debug!("Blob {} opened, ref count: {}", id, guard[&id]);
+        *guard.entry(inode).or_insert(0) += 1;
+        log::debug!("Blob {} opened, ref count: {}", inode, guard[&inode]);
     }
-    fn decrement(&self, id: Inode) {
+
+    /// Decrement refcount for the given inode.
+    ///
+    /// Returns true once all counters have reached 0.
+    fn decrement(&self, inode: Inode) -> bool {
         let mut guard = self.counts.lock().unwrap();
-        if let Some(count) = guard.get_mut(&id) {
+        if let Some(count) = guard.get_mut(&inode) {
             *count = count.saturating_sub(1);
-            log::debug!("Blob {} closed, ref count: {}", id, *count);
+            log::debug!("Blob {} closed, ref count: {}", inode, *count);
             if *count == 0 {
-                guard.remove(&id);
-                log::debug!("Blob {} removed from open blobs", id);
+                guard.remove(&inode);
+                log::debug!("Blob {} removed from open blobs", inode);
+                return guard.is_empty();
             }
         }
+
+        false
     }
     fn is_open(&self, id: Inode) -> bool {
         let guard = self.counts.lock().unwrap();

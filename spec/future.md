@@ -19,12 +19,6 @@ Currently connection attempts appear as, for example:
 ...DEBUG realize_network::network] 199.45.155.104:49506: connection rejected: received corrupt message of type InvalidContentType
 ```
 
-## Attempt cleanup when blob is closed {#cleanup}
-
-Currently, cleanup runs when disk usage changes, but cannot delete
-open blobs, meaning that very often it'll leave possibly large files
-that used to be open until some other disk usage changes.
-
 ## Re-design churten {#nochurten}
 
 With the latest changes, churten doesn't make much sense anymore; it's
