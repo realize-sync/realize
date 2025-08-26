@@ -1,8 +1,9 @@
+use crate::rpc::PeerStatus;
+
 use super::Household;
 use assert_fs::TempDir;
 use assert_fs::prelude::*;
 use realize_network::Server;
-use realize_network::capnp::PeerStatus;
 use realize_network::hostport::HostPort;
 use realize_network::testing::TestingPeers;
 use realize_storage::Blob;

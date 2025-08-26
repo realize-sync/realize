@@ -27,4 +27,4 @@ mod store_capnp {
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
-pub use household::{ExecutionMode, Household, HouseholdOperationError};
+pub use household::{ExecutionMode, Household, HouseholdOperationError, PeerStatus};

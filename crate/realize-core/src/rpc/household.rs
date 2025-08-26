@@ -10,7 +10,7 @@ use super::store_capnp::{io_error, notification, read_callback};
 use async_speed_limit::Limiter;
 use capnp::capability::Promise;
 use capnp_rpc::pry;
-use realize_network::capnp::{ConnectionHandler, ConnectionManager, ConnectionTracker, PeerStatus};
+use realize_network::capnp::{ConnectionHandler, ConnectionManager, ConnectionTracker};
 use realize_network::{Networking, Server};
 use realize_storage::{Notification, Progress, Storage, StorageError};
 use realize_types::{self, Arena, ByteRange, Delta, Hash, Path, Peer, Signature, UnixTime};
@@ -34,6 +34,15 @@ const TAG: &[u8; 4] = b"PEER";
 pub enum ExecutionMode {
     Interactive,
     Batch,
+}
+
+/// Connection status of a peer, broadcast by [Household::peer_status]
+#[derive(Clone, PartialEq, Debug)]
+pub enum PeerStatus {
+    // The given remote peer connected to the local peer.
+    Connected(Peer),
+    // The given remote peer was disconnected from the local peer.
+    Disconnected(Peer),
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
@@ -60,6 +69,7 @@ pub struct ConnectionInfo {
 pub struct Household {
     manager: ConnectionManager,
     operation_tx: mpsc::Sender<HouseholdOperation>,
+    connection_tx: broadcast::Sender<PeerStatus>,
 
     /// Set of all known peers
     peers: HashSet<Peer>,
@@ -79,12 +89,14 @@ impl Household {
     ) -> anyhow::Result<Arc<Self>> {
         let peers = networking.peers().collect();
         let (tx, rx) = mpsc::channel(128);
-        let handler = PeerConnectionHandler::new(storage, &networking, rx);
+        let (connection_tx, _) = broadcast::channel(128);
+        let handler = PeerConnectionHandler::new(storage, &networking, rx, connection_tx.clone());
         let manager = ConnectionManager::spawn(local, networking, handler)?;
 
         Ok(Arc::new(Self {
             manager,
             operation_tx: tx,
+            connection_tx,
             peers,
         }))
     }
@@ -113,7 +125,7 @@ impl Household {
 
     /// Report peer status changes through the given receiver.
     pub fn peer_status(&self) -> broadcast::Receiver<PeerStatus> {
-        self.manager.peer_status()
+        self.connection_tx.subscribe()
     }
 
     /// Register peer connections to the given server.
@@ -297,6 +309,7 @@ struct PeerConnectionHandler {
     storage: Arc<Storage>,
     batch_rate_limits: HashMap<Peer, f64>,
     rx: mpsc::Receiver<HouseholdOperation>,
+    connection_tx: broadcast::Sender<PeerStatus>,
 }
 
 impl PeerConnectionHandler {
@@ -304,6 +317,7 @@ impl PeerConnectionHandler {
         storage: Arc<Storage>,
         networking: &Networking,
         rx: mpsc::Receiver<HouseholdOperation>,
+        connection_tx: broadcast::Sender<PeerStatus>,
     ) -> Self {
         let batch_rate_limits = networking
             .peer_setup()
@@ -315,6 +329,7 @@ impl PeerConnectionHandler {
             storage,
             batch_rate_limits,
             rx,
+            connection_tx,
         }
     }
 }
@@ -329,8 +344,9 @@ impl ConnectionHandler<PeerConnectionTracker, connected_peer::Client> for PeerCo
             storage,
             batch_rate_limits,
             mut rx,
+            connection_tx,
         } = self;
-        let tracker = PeerConnectionTracker::new(storage, batch_rate_limits);
+        let tracker = PeerConnectionTracker::new(storage, batch_rate_limits, connection_tx);
 
         tokio::task::spawn_local({
             let tracker = Rc::clone(&tracker);
@@ -350,6 +366,7 @@ struct PeerConnectionTracker {
     storage: Arc<Storage>,
     batch_rate_limits: HashMap<Peer, f64>,
     stores: RefCell<HashMap<Peer, TrackedClients>>,
+    connection_tx: broadcast::Sender<PeerStatus>,
 }
 
 struct TrackedClients {
@@ -358,11 +375,16 @@ struct TrackedClients {
 }
 
 impl PeerConnectionTracker {
-    fn new(storage: Arc<Storage>, batch_rate_limits: HashMap<Peer, f64>) -> Rc<Self> {
+    fn new(
+        storage: Arc<Storage>,
+        batch_rate_limits: HashMap<Peer, f64>,
+        connection_tx: broadcast::Sender<PeerStatus>,
+    ) -> Rc<Self> {
         Rc::new(Self {
             storage,
             batch_rate_limits,
             stores: RefCell::new(HashMap::new()),
+            connection_tx,
         })
     }
 
@@ -451,6 +473,7 @@ impl ConnectionTracker<connected_peer::Client> for PeerConnectionTracker {
         self.stores
             .borrow_mut()
             .insert(peer, TrackedClients { store, batch_store });
+        let _ = self.connection_tx.send(PeerStatus::Connected(peer));
 
         if let Err(err) = subscribe_self(&self.storage, peer, store_for_subscribe).await {
             log::warn!("Failed to subscribe to {peer}: {err}");
@@ -460,7 +483,9 @@ impl ConnectionTracker<connected_peer::Client> for PeerConnectionTracker {
     }
 
     fn unregister(&self, peer: Peer) {
-        self.stores.borrow_mut().remove(&peer);
+        if self.stores.borrow_mut().remove(&peer).is_some() {
+            let _ = self.connection_tx.send(PeerStatus::Disconnected(peer));
+        }
     }
 }
 
@@ -1673,10 +1698,12 @@ mod tests {
         fixture.peers.set_batch_rate_limit(b, 1024);
 
         let (tx, rx) = mpsc::channel(128);
+        let (connection_tx, _) = broadcast::channel(128);
         let handler = PeerConnectionHandler::new(
             Arc::clone(fixture.storage(a)?),
             &fixture.peers.networking(a)?,
             rx,
+            connection_tx,
         );
 
         let local = LocalSet::new();

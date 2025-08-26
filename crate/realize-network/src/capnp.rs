@@ -20,13 +20,6 @@ use realize_types::Peer;
 
 use crate::{Networking, Server};
 
-/// Connection status of a peer, broadcast by [ConnectionManager].
-#[derive(Clone, PartialEq, Debug)]
-pub enum PeerStatus {
-    Connected(Peer),
-    Disconnected(Peer),
-}
-
 /// Messages used to communicate with capnp on the main thread.
 enum ConnectionMessage {
     /// Send incoming (server) TCP connections to the capnp threads to
@@ -74,7 +67,6 @@ pub trait ConnectionTracker<C> {
 pub struct ConnectionManager {
     tag: &'static [u8; 4],
     tx: mpsc::UnboundedSender<ConnectionMessage>,
-    broadcast_tx: broadcast::Sender<PeerStatus>,
 }
 
 impl ConnectionManager {
@@ -94,15 +86,12 @@ impl ConnectionManager {
         C: capnp::capability::FromClientHook + Clone + 'static,
     {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let (broadcast_tx, _) = broadcast::channel(128);
         let tag = handler.tag();
 
         local.spawn_local({
-            let broadcast_tx = broadcast_tx.clone();
-
             async move {
                 let tracker = handler.create_tracker().await;
-                let ctx = AppContext::new(networking, tag, tracker, broadcast_tx);
+                let ctx = AppContext::new(networking, tag, tracker);
                 while let Some(conn) = rx.recv().await {
                     match conn {
                         ConnectionMessage::Incoming {
@@ -126,16 +115,7 @@ impl ConnectionManager {
             }
         });
 
-        Ok(Self {
-            tx,
-            broadcast_tx,
-            tag,
-        })
-    }
-
-    /// Report peer status changes through the given receiver.
-    pub fn peer_status(&self) -> broadcast::Receiver<PeerStatus> {
-        self.broadcast_tx.subscribe()
+        Ok(Self { tx, tag })
     }
 
     /// Keep a client connection up to all peers for which an address is known.
@@ -200,7 +180,6 @@ where
     networking: Networking,
     tracker: Rc<T>,
     tag: &'static [u8; 4],
-    broadcast_tx: broadcast::Sender<PeerStatus>,
     connections: RefCell<HashMap<Peer, TrackedPeerConnections>>,
     _phantom1: PhantomData<C>,
 }
@@ -223,17 +202,11 @@ where
     T: ConnectionTracker<C> + 'static,
     C: capnp::capability::FromClientHook + Clone + 'static,
 {
-    fn new(
-        networking: Networking,
-        tag: &'static [u8; 4],
-        tracker: Rc<T>,
-        broadcast_tx: broadcast::Sender<PeerStatus>,
-    ) -> Rc<Self> {
+    fn new(networking: Networking, tag: &'static [u8; 4], tracker: Rc<T>) -> Rc<Self> {
         Rc::new(Self {
             networking,
             tag,
             tracker,
-            broadcast_tx,
             connections: RefCell::new(HashMap::new()),
             _phantom1: PhantomData,
         })
@@ -397,11 +370,6 @@ where
                 continue;
             }
 
-            let _ = self.broadcast_tx.send(PeerStatus::Connected(peer));
-            scopeguard::defer!({
-                let _ = self.broadcast_tx.send(PeerStatus::Disconnected(peer));
-            });
-
             // We're fully connected. Reset the backoff delay for next time.
             current_backoff = None;
 
@@ -449,13 +417,31 @@ mod tests {
         TestingPeers::c()
     }
 
+    /// Connection status of a peer, broadcast by [ConnectionManager].
+    #[derive(Clone, PartialEq, Debug)]
+    pub enum PeerStatus {
+        // Remote peer connected to local peer. Local peer (.0), remote peer (.1)
+        Connected(Peer, Peer),
+        // Remote peer disconnected from local peer, Local peer (.0), remote peer (.1)
+        Disconnected(Peer, Peer),
+    }
+
     struct HelloConnectionHandler {
         peer: Peer,
         rx: mpsc::Receiver<oneshot::Sender<HashSet<Peer>>>,
+        connection_tx: broadcast::Sender<PeerStatus>,
     }
     impl HelloConnectionHandler {
-        fn new(peer: Peer, rx: mpsc::Receiver<oneshot::Sender<HashSet<Peer>>>) -> Self {
-            Self { peer, rx }
+        fn new(
+            peer: Peer,
+            rx: mpsc::Receiver<oneshot::Sender<HashSet<Peer>>>,
+            connection_tx: broadcast::Sender<PeerStatus>,
+        ) -> Self {
+            Self {
+                peer,
+                rx,
+                connection_tx,
+            }
         }
     }
     impl ConnectionHandler<HelloConnectionTracker, hello::Client> for HelloConnectionHandler {
@@ -464,10 +450,15 @@ mod tests {
         }
 
         async fn create_tracker(self) -> Rc<HelloConnectionTracker> {
-            let HelloConnectionHandler { peer, mut rx } = self;
+            let HelloConnectionHandler {
+                peer,
+                mut rx,
+                connection_tx,
+            } = self;
             let tracker = Rc::new(HelloConnectionTracker {
                 peer,
                 registered: RefCell::new(HashSet::new()),
+                connection_tx,
             });
 
             tokio::task::spawn_local({
@@ -487,6 +478,7 @@ mod tests {
     struct HelloConnectionTracker {
         peer: Peer,
         registered: RefCell<HashSet<Peer>>,
+        connection_tx: broadcast::Sender<PeerStatus>,
     }
 
     impl ConnectionTracker<hello::Client> for HelloConnectionTracker {
@@ -511,10 +503,16 @@ mod tests {
             );
 
             self.registered.borrow_mut().insert(peer);
+            let _ = self
+                .connection_tx
+                .send(PeerStatus::Connected(self.peer, peer));
             Ok(())
         }
 
         fn unregister(&self, peer: Peer) {
+            let _ = self
+                .connection_tx
+                .send(PeerStatus::Disconnected(self.peer, peer));
             self.registered.borrow_mut().remove(&peer);
         }
     }
@@ -543,21 +541,40 @@ mod tests {
     struct Fixture {
         peers: TestingPeers,
         peer_tx: HashMap<Peer, mpsc::Sender<oneshot::Sender<HashSet<Peer>>>>,
+        connection_tx: broadcast::Sender<PeerStatus>,
+        connection_rx: broadcast::Receiver<PeerStatus>,
     }
     impl Fixture {
         async fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
 
             let peers = TestingPeers::new()?;
+            let (connection_tx, connection_rx) = broadcast::channel(128);
             Ok(Self {
                 peers,
                 peer_tx: HashMap::new(),
+                connection_tx,
+                connection_rx,
             })
+        }
+
+        /// Wait until the given [PeerStatus] is reported. Ignores any other status.
+        async fn wait_until(&mut self, expected: PeerStatus) -> anyhow::Result<()> {
+            let mut got = vec![];
+            while let Ok(status) =
+                tokio::time::timeout(Duration::from_secs(3), self.connection_rx.recv()).await?
+            {
+                if status == expected {
+                    return Ok(());
+                }
+                got.push(status);
+            }
+            panic!("Expected {expected:?}, got {got:?}")
         }
 
         fn manager(&mut self, local: &LocalSet, peer: Peer) -> anyhow::Result<ConnectionManager> {
             let (tx, rx) = mpsc::channel(10);
-            let handler = HelloConnectionHandler::new(peer, rx);
+            let handler = HelloConnectionHandler::new(peer, rx, self.connection_tx.clone());
             self.peer_tx.insert(peer, tx);
             ConnectionManager::spawn(local, self.peers.networking(peer)?, handler)
         }
@@ -656,14 +673,11 @@ mod tests {
 
         local
             .run_until(async move {
-                let mut status_a = manager_a.peer_status();
-                let mut status_b = manager_b.peer_status();
-
                 manager_a.keep_all_connected()?;
-                assert_eq!(PeerStatus::Connected(b), status_a.recv().await?);
+                fixture.wait_until(PeerStatus::Connected(a, b)).await?;
 
                 manager_b.keep_all_connected()?;
-                assert_eq!(PeerStatus::Connected(a), status_b.recv().await?);
+                fixture.wait_until(PeerStatus::Connected(b, a)).await?;
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -689,17 +703,16 @@ mod tests {
         let manager_b = fixture.manager(&local, b)?;
         let server_b = fixture.launch_server(b, &manager_b).await?;
 
-        let mut status_a = manager_a.peer_status();
         manager_a.keep_all_connected()?;
 
         local
             .run_until(async move {
-                assert_eq!(PeerStatus::Connected(b), status_a.recv().await?);
+                fixture.wait_until(PeerStatus::Connected(a, b)).await?;
                 server_b.shutdown().await?;
-                assert_eq!(PeerStatus::Disconnected(b), status_a.recv().await?);
+                fixture.wait_until(PeerStatus::Disconnected(a, b)).await?;
 
                 let _server_b = fixture.launch_server(b, &manager_b).await?;
-                assert_eq!(PeerStatus::Connected(b), status_a.recv().await?);
+                fixture.wait_until(PeerStatus::Connected(a, b)).await?;
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -724,19 +737,17 @@ mod tests {
 
         local
             .run_until(async move {
-                let mut status_a = manager_a.peer_status();
-
                 manager_a.keep_all_connected()?;
-                assert_eq!(PeerStatus::Connected(b), status_a.recv().await?);
+                fixture.wait_until(PeerStatus::Connected(a, b)).await?;
 
                 manager_a.disconnect_all()?;
-                assert_eq!(PeerStatus::Disconnected(b), status_a.recv().await?);
+                fixture.wait_until(PeerStatus::Disconnected(a, b)).await?;
 
                 manager_a.keep_all_connected()?;
-                assert_eq!(PeerStatus::Connected(b), status_a.recv().await?);
+                fixture.wait_until(PeerStatus::Connected(a, b)).await?;
 
                 manager_a.disconnect_all()?;
-                assert_eq!(PeerStatus::Disconnected(b), status_a.recv().await?);
+                fixture.wait_until(PeerStatus::Disconnected(a, b)).await?;
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -767,22 +778,20 @@ mod tests {
 
         local
             .run_until(async move {
-                let mut status_a = manager_a.peer_status();
-
                 manager_a.keep_peer_connected(b)?;
-                assert_eq!(PeerStatus::Connected(b), status_a.recv().await?);
+                fixture.wait_until(PeerStatus::Connected(a, b)).await?;
 
                 manager_a.keep_peer_connected(c)?;
-                assert_eq!(PeerStatus::Connected(c), status_a.recv().await?);
+                fixture.wait_until(PeerStatus::Connected(a, c)).await?;
 
                 manager_a.disconnect_peer(c)?;
-                assert_eq!(PeerStatus::Disconnected(c), status_a.recv().await?);
+                fixture.wait_until(PeerStatus::Disconnected(a, c)).await?;
 
                 manager_a.keep_peer_connected(c)?;
-                assert_eq!(PeerStatus::Connected(c), status_a.recv().await?);
+                fixture.wait_until(PeerStatus::Connected(a, c)).await?;
 
                 manager_a.disconnect_peer(b)?;
-                assert_eq!(PeerStatus::Disconnected(b), status_a.recv().await?);
+                fixture.wait_until(PeerStatus::Disconnected(a, b)).await?;
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -807,17 +816,15 @@ mod tests {
 
         local
             .run_until(async move {
-                let mut status_a = manager_a.peer_status();
-
                 assert_eq!(HashSet::new(), fixture.get_registered(a).await?);
 
                 manager_a.keep_all_connected()?;
-                assert_eq!(PeerStatus::Connected(b), status_a.recv().await?);
+                fixture.wait_until(PeerStatus::Connected(a, b)).await?;
 
                 assert_eq!(HashSet::from([b]), fixture.get_registered(a).await?);
 
                 manager_a.disconnect_all()?;
-                assert_eq!(PeerStatus::Disconnected(b), status_a.recv().await?);
+                fixture.wait_until(PeerStatus::Disconnected(a, b)).await?;
 
                 assert_eq!(HashSet::from([]), fixture.get_registered(a).await?);
 
@@ -850,32 +857,31 @@ mod tests {
 
         local
             .run_until(async move {
-                let mut status_a = manager_a.peer_status();
                 assert!(manager_a.peers_to_keep_connected().await?.is_empty());
 
                 manager_a.keep_peer_connected(b)?;
-                assert_eq!(PeerStatus::Connected(b), status_a.recv().await?);
+                fixture.wait_until(PeerStatus::Connected(a, b)).await?;
                 assert_eq!(
                     HashSet::from([b]),
                     manager_a.peers_to_keep_connected().await?
                 );
 
                 manager_a.keep_peer_connected(c)?;
-                assert_eq!(PeerStatus::Connected(c), status_a.recv().await?);
+                fixture.wait_until(PeerStatus::Connected(a, c)).await?;
                 assert_eq!(
                     HashSet::from([b, c]),
                     manager_a.peers_to_keep_connected().await?
                 );
 
                 manager_a.disconnect_peer(c)?;
-                assert_eq!(PeerStatus::Disconnected(c), status_a.recv().await?);
+                fixture.wait_until(PeerStatus::Disconnected(a, c)).await?;
                 assert_eq!(
                     HashSet::from([b]),
                     manager_a.peers_to_keep_connected().await?
                 );
 
                 manager_a.disconnect_all()?;
-                assert_eq!(PeerStatus::Disconnected(b), status_a.recv().await?);
+                fixture.wait_until(PeerStatus::Disconnected(a, b)).await?;
                 assert!(manager_a.peers_to_keep_connected().await?.is_empty());
                 Ok::<(), anyhow::Error>(())
             })

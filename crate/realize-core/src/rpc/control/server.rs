@@ -352,11 +352,10 @@ mod tests {
     use crate::consensus::jobs::JobError;
     use crate::consensus::progress::{ByteCountProgress, TxByteCountProgress};
     use crate::consensus::types::{ChurtenNotification, JobAction, JobProgress};
-    use crate::rpc::Household;
     use crate::rpc::control::client::{self, ChurtenUpdates, TxChurtenSubscriber};
     use crate::rpc::testing::HouseholdFixture;
+    use crate::rpc::{Household, PeerStatus};
     use assert_fs::TempDir;
-    use realize_network::capnp::PeerStatus;
     use realize_network::unixsocket;
     use realize_storage::{Job, JobId, JobStatus, Mark, Notification};
     use realize_types::{Peer, UnixTime};
