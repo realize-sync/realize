@@ -3,6 +3,22 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
+## nfs mount arenas or subdirectories {#mountarena}
+
+It should be possible to specify an arena when mounting the NFS dir
+and getting only the content of that arena.
+
+## configure "auth" logs {#logauth}
+
+setup configuration so that connection attempts and auth error/accept
+can easily be singled out.
+
+Currently connection attempts appear as, for example:
+
+```
+...DEBUG realize_network::network] 199.45.155.104:49506: connection rejected: received corrupt message of type InvalidContentType
+```
+
 ## Attempt cleanup when blob is closed {#cleanup}
 
 Currently, cleanup runs when disk usage changes, but cannot delete
@@ -50,7 +66,35 @@ Mark::Ignore means that a file or directory must not be indexed. It
 might also mean that a file or directory must not be added into the
 cache, even if reported by another peer.
 
-## Update marks from xattrs {#marksxattrs}
+## bug: overlay reports no file if lower is brand new, empty arena even if upper has files {#overlaynew}
+
+## Support editing files through overlay fs {#overlaymod}
+
+1. edit
+
+Editing files through overlay fs looks like an already cached file is
+added to the index with a new version.
+
+This should be reported to other peers as a modification of the cached
+version.
+
+2. move directory
+
+When a remote directory is moved, a xattr is stored locally. The move should be applied remotely.
+
+From https://docs.kernel.org/filesystems/overlayfs.html:
+""the directory will be copied up (but not the contents). Then the “trusted.overlay.redirect” extended attribute is set to the path of the original location from the root of the overlay. Finally the directory is moved to the new location."
+
+3. move (rename) a remote file
+
+What will happen? Proper support might require decoupling blobs from inodes.
+
+4. hard link from a remote file to a local file
+
+What will happen?
+
+
+## Read and write marks from xattrs {#marksxattrs}
 
 Arenas, files and directories can be marked *own*, *watch* or *keep*
 as described in the section Consensus of [real.md](real.md) and the
