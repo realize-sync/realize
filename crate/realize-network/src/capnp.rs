@@ -9,7 +9,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::{JoinHandle, LocalSet};
 use tokio_retry::strategy::ExponentialBackoff;
@@ -189,6 +189,7 @@ where
 
 struct TrackedPeerConnections {
     tracker: Option<JoinHandle<()>>,
+    poke: Rc<Notify>,
     cancel: CancellationToken,
 }
 
@@ -197,6 +198,7 @@ impl TrackedPeerConnections {
         TrackedPeerConnections {
             tracker: None,
             cancel: CancellationToken::new(),
+            poke: Rc::new(Notify::new()),
         }
     }
 }
@@ -272,15 +274,18 @@ where
                 .map(|t| !t.is_finished())
                 .unwrap_or(false);
             if has_usable_tracker {
-                // Already running
+                // Already running, wake it up if it's sleeping, so it
+                // reconnects right away.
+                conn.poke.notify_waiters();
                 return;
             }
         }
 
         let this = Rc::clone(self);
         let cancel = conn.cancel.clone();
+        let poke = conn.poke.clone();
         conn.tracker = Some(tokio::task::spawn_local(async move {
-            this.track_peer(peer, cancel).await
+            this.track_peer(peer, poke, cancel).await
         }));
     }
 
@@ -311,7 +316,7 @@ where
         let _ = tx.send(peers);
     }
 
-    async fn track_peer(self: &Rc<Self>, peer: Peer, cancel: CancellationToken) {
+    async fn track_peer(self: &Rc<Self>, peer: Peer, poke: Rc<Notify>, cancel: CancellationToken) {
         let retry_strategy =
             ExponentialBackoff::from_millis(500).max_delay(Duration::from_secs(5 * 60));
         let mut current_backoff: Option<ExponentialBackoff> = None;
@@ -325,7 +330,9 @@ where
                     Some(delay) => {
                         tokio::select!(
                         _ = cancel.cancelled() => { return },
-                        _ = tokio::time::sleep(delay) => {});
+                            _ = tokio::time::sleep(delay) => {},
+                            _ = poke.notified() => {}
+                        );
                     }
                 },
                 None => {
