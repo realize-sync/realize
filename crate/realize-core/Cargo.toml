@@ -13,8 +13,8 @@ realize-storage = { path = "../realize-storage" }
 anyhow = "1.0"
 assert_fs = { version = "1.1", optional = true } # for feature = "testing"
 async-speed-limit = { version = "0.4.2", features = ["futures-timer","futures-core"] }
-async-trait = "0.1.88"
-capnp = "0.21.1"
+async-trait = "0.1.89"
+capnp = "0.21.4"
 capnp-rpc = "0.21.0"
 env_logger = "0.11"
 futures = "0.3"
@@ -27,7 +27,7 @@ thiserror = "2.0"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "fs", "io-util"] }
 tokio-retry = "0.3.0"
 tokio-stream = "0.1.17"
-uuid = { version = "1.17.0", features = ["std", "v7"] }
+uuid = { version = "1.18.0", features = ["std", "v7"] }
 fast_rsync = "0.2.0"
 tokio-util = { version = "0.7.16", features = ["join-map"] }
 
@@ -41,9 +41,9 @@ futures = "0.3"
 nix = { version = "0.30.1", features = ["fs"] }
 portpicker = "0.1"
 predicates = "3.1"
-redb = { version = "2.6.0", features = ["logging"] }
+redb = { version = "2.6.3", features = ["logging"] }
 serial_test = "3.2.0"
-tempfile = "3.20"
+tempfile = "3.21"
 test-tag = "0.1"
 tokio = { version = "1", features = ["process"] }
 toml = { version = "0.8.23", features = ["display", "parse"] }
@@ -51,4 +51,4 @@ rand = "0.9.2"
 
 [build-dependencies]
 anyhow = "1.0"
-capnpc = "0.21.0"
+capnpc = "0.21.2"

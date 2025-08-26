@@ -14,7 +14,7 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "proces
 log = "0.4.27"
 console = "0.16.0"
 indicatif = "0.18.0"
-tokio-util = "0.7.15"
+tokio-util = "0.7.16"
 
 [dev-dependencies]
 assert_fs = "1.1"
