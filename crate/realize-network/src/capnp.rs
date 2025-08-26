@@ -57,11 +57,14 @@ where
     async fn create_tracker(self) -> Rc<T>;
 }
 
-#[allow(async_fn_in_trait)]
+#[allow(async_fn_in_trait, unused_variables)]
 pub trait ConnectionTracker<C> {
     fn server(&self, peer: Peer) -> capnp::capability::Client;
-    async fn register(&self, peer: Peer, client: C) -> anyhow::Result<()>;
-    fn unregister(&self, peer: Peer);
+    async fn register(&self, peer: Peer, client: C) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn unregister(&self, peer: Peer) {}
+    fn client_disconnected(&self, peer: Peer) {}
 }
 
 pub struct ConnectionManager {
@@ -244,6 +247,7 @@ where
                     }
                 }
             );
+            this.tracker.client_disconnected(peer);
         });
     }
 

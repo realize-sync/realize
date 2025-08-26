@@ -10,6 +10,7 @@ use super::store_capnp::{io_error, notification, read_callback};
 use async_speed_limit::Limiter;
 use capnp::capability::Promise;
 use capnp_rpc::pry;
+use capnp_rpc::rpc_twoparty_capnp::Side;
 use realize_network::capnp::{ConnectionHandler, ConnectionManager, ConnectionTracker};
 use realize_network::{Networking, Server};
 use realize_storage::{Notification, Progress, Storage, StorageError};
@@ -72,7 +73,7 @@ pub struct Household {
     connection_tx: broadcast::Sender<PeerStatus>,
 
     /// Set of all known peers
-    peers: HashSet<Peer>,
+    known_peers: HashSet<Peer>,
 }
 
 impl Household {
@@ -97,7 +98,7 @@ impl Household {
             manager,
             operation_tx: tx,
             connection_tx,
-            peers,
+            known_peers: peers,
         }))
     }
 
@@ -219,7 +220,7 @@ impl Household {
         let keep_connected = keep_connected?;
 
         let mut connection_info: HashMap<Peer, ConnectionInfo> = HashMap::new();
-        for peer in &self.peers {
+        for peer in &self.known_peers {
             let info = connection_info.entry(*peer).or_default();
             if connected.contains(peer) {
                 info.connection = ConnectionStatus::Connected;
@@ -364,14 +365,7 @@ impl ConnectionHandler<PeerConnectionTracker, connected_peer::Client> for PeerCo
 
 struct PeerConnectionTracker {
     storage: Arc<Storage>,
-    batch_rate_limits: HashMap<Peer, f64>,
-    stores: RefCell<HashMap<Peer, TrackedClients>>,
-    connection_tx: broadcast::Sender<PeerStatus>,
-}
-
-struct TrackedClients {
-    store: store::Client,
-    batch_store: Option<store::Client>,
+    clients: Rc<TrackedClientMap>,
 }
 
 impl PeerConnectionTracker {
@@ -382,9 +376,7 @@ impl PeerConnectionTracker {
     ) -> Rc<Self> {
         Rc::new(Self {
             storage,
-            batch_rate_limits,
-            stores: RefCell::new(HashMap::new()),
-            connection_tx,
+            clients: Rc::new(TrackedClientMap::new(batch_rate_limits, connection_tx)),
         })
     }
 
@@ -401,7 +393,7 @@ impl PeerConnectionTracker {
             } => {
                 let tx_clone = tx.clone();
                 if let Err(err) = execute_read(
-                    self.find_store(&peers, mode),
+                    self.clients.find_store(&peers, mode),
                     arena,
                     path,
                     offset,
@@ -422,18 +414,133 @@ impl PeerConnectionTracker {
                 range,
                 sig,
             } => {
-                let res =
-                    execute_rsync(self.find_store(&peers, mode), arena, &path, &range, sig).await;
+                let res = execute_rsync(
+                    self.clients.find_store(&peers, mode),
+                    arena,
+                    &path,
+                    &range,
+                    sig,
+                )
+                .await;
                 let _ = tx.send(res);
             }
             HouseholdOperation::QueryConnectedPeers { tx } => {
-                let _ = tx.send(self.stores.borrow().keys().map(|p| *p).collect());
+                let _ = tx.send(self.clients.connected_peers());
             }
         }
     }
 
+    // Offer our local store to the peer we just connected to (best
+    // effort).
+    async fn share_local_store_with_peer(&self, peer: Peer, client: connected_peer::Client) {
+        let mut request = client.register_request();
+        request.get().set_store(
+            StoreServer {
+                peer: peer,
+                storage: self.storage.clone(),
+                limiter: None,
+            }
+            .into_client(),
+        );
+        if let Err(err) = request.send().promise.await {
+            log::debug!("Failed to share local store with {peer}: {err:?}",);
+        }
+    }
+}
+
+/// Tracked client stores.
+///
+/// Stores can come from either connecting to a peer and getting its
+/// store ([Side::Server]), or having a peer connect and register its
+/// store ([Side::Client]).
+///
+/// When choosing a client, the server side is preferred if both are
+/// available.
+struct TrackedClientMap {
+    client_stores: RefCell<HashMap<Peer, TrackedClients>>,
+    server_stores: RefCell<HashMap<Peer, TrackedClients>>,
+    connection_tx: broadcast::Sender<PeerStatus>,
+    batch_rate_limits: HashMap<Peer, f64>,
+}
+
+struct TrackedClients {
+    store: store::Client,
+    batch_store: Option<store::Client>,
+}
+
+impl TrackedClientMap {
+    fn new(
+        batch_rate_limits: HashMap<Peer, f64>,
+        connection_tx: broadcast::Sender<PeerStatus>,
+    ) -> Self {
+        Self {
+            client_stores: RefCell::new(HashMap::new()),
+            server_stores: RefCell::new(HashMap::new()),
+            connection_tx,
+            batch_rate_limits,
+        }
+    }
+
+    fn unregister(&self, peer: Peer, side: Side) {
+        log::debug!("Store for {peer} ({side:?}) has become unavailable",);
+        let was_connected = self.is_connected(peer);
+        self.stores(side).borrow_mut().remove(&peer);
+        if was_connected && !self.is_connected(peer) {
+            log::debug!("Disconnected: {peer}");
+            let _ = self.connection_tx.send(PeerStatus::Disconnected(peer));
+        }
+    }
+
+    async fn register(
+        &self,
+        peer: Peer,
+        store: store::Client,
+        storage: &Arc<Storage>,
+        side: Side,
+    ) -> Result<(), capnp::Error> {
+        log::debug!("Store for {peer} ({side:?}) now available.");
+        let batch_store = if let Some(bytes_per_second) = self.batch_rate_limits.get(&peer) {
+            log::debug!(
+                "Rate-limiting batch calls from {peer} ({side:?}), rate-limit={bytes_per_second}",
+            );
+            let mut request = store.with_rate_limit_request();
+            request.get().set_rate_limit(*bytes_per_second);
+            let reply = request.send().promise.await?;
+
+            Some(reply.get()?.get_store()?)
+        } else {
+            None
+        };
+
+        let store_for_subscribe = batch_store.as_ref().unwrap_or(&store).clone();
+        let was_connected = self.is_connected(peer);
+        self.stores(side)
+            .borrow_mut()
+            .insert(peer, TrackedClients { store, batch_store });
+        if !was_connected {
+            log::debug!("Connected: {peer}");
+            let _ = self.connection_tx.send(PeerStatus::Connected(peer));
+        }
+
+        if let Err(err) = subscribe_self(storage, peer, store_for_subscribe).await {
+            log::warn!("Failed to subscribe to {peer}: {err}");
+        }
+
+        Ok(())
+    }
+
     fn find_store(&self, peers: &Vec<Peer>, mode: ExecutionMode) -> Option<(Peer, store::Client)> {
-        let stores = self.stores.borrow();
+        self.find_store_for_side(peers, mode, Side::Server)
+            .or_else(|| self.find_store_for_side(peers, mode, Side::Client))
+    }
+
+    fn find_store_for_side(
+        &self,
+        peers: &Vec<Peer>,
+        mode: ExecutionMode,
+        side: Side,
+    ) -> Option<(Peer, store::Client)> {
+        let stores = self.stores(side).borrow();
         peers
             .iter()
             .find_map(|p| stores.get(p).map(|s| (*p, s)))
@@ -447,45 +554,53 @@ impl PeerConnectionTracker {
                 )
             })
     }
+
+    fn connected_peers(&self) -> HashSet<Peer> {
+        self.client_stores
+            .borrow()
+            .keys()
+            .map(|p| *p)
+            .chain(self.server_stores.borrow().keys().map(|p| *p))
+            .collect()
+    }
+
+    fn is_connected(&self, peer: Peer) -> bool {
+        self.server_stores.borrow().contains_key(&peer)
+            || self.client_stores.borrow().contains_key(&peer)
+    }
+
+    fn stores(&self, side: Side) -> &RefCell<HashMap<Peer, TrackedClients>> {
+        match side {
+            Side::Client => &self.client_stores,
+            Side::Server => &self.server_stores,
+        }
+    }
 }
 
 impl ConnectionTracker<connected_peer::Client> for PeerConnectionTracker {
     fn server(&self, peer: Peer) -> capnp::capability::Client {
-        ConnectedPeerServer::new(peer, self.storage.clone())
-            .into_connected_peer()
+        ConnectedPeerServer::new(peer, self.storage.clone(), Rc::clone(&self.clients))
+            .into_client()
             .client
     }
 
     async fn register(&self, peer: Peer, mut client: connected_peer::Client) -> anyhow::Result<()> {
         let store = get_connected_peer_store(&mut client).await?;
-        let batch_store = if let Some(bytes_per_second) = self.batch_rate_limits.get(&peer) {
-            log::debug!("Rate-limiting batch calls from {peer}, rate-limit={bytes_per_second}");
-            let mut request = store.with_rate_limit_request();
-            request.get().set_rate_limit(*bytes_per_second);
-            let reply = request.send().promise.await?;
+        self.clients
+            .register(peer, store, &self.storage, Side::Server)
+            .await?;
 
-            Some(reply.get()?.get_store()?)
-        } else {
-            None
-        };
-
-        let store_for_subscribe = batch_store.as_ref().unwrap_or(&store).clone();
-        self.stores
-            .borrow_mut()
-            .insert(peer, TrackedClients { store, batch_store });
-        let _ = self.connection_tx.send(PeerStatus::Connected(peer));
-
-        if let Err(err) = subscribe_self(&self.storage, peer, store_for_subscribe).await {
-            log::warn!("Failed to subscribe to {peer}: {err}");
-        }
+        self.share_local_store_with_peer(peer, client).await;
 
         Ok(())
     }
 
     fn unregister(&self, peer: Peer) {
-        if self.stores.borrow_mut().remove(&peer).is_some() {
-            let _ = self.connection_tx.send(PeerStatus::Disconnected(peer));
-        }
+        self.clients.unregister(peer, Side::Server);
+    }
+
+    fn client_disconnected(&self, peer: Peer) {
+        self.clients.unregister(peer, Side::Client);
     }
 }
 
@@ -687,7 +802,7 @@ async fn subscribe_self(
     })
     .await??;
 
-    let subscriber = ConnectedPeerServer::new(peer, storage.clone()).into_subscriber();
+    let subscriber = SubscriberServer::new(peer, storage.clone()).into_client();
     for arena in goal_arenas {
         let mut request = store.subscribe_request();
         let mut request_builder = request.get().init_req();
@@ -716,18 +831,19 @@ async fn subscribe_self(
 struct ConnectedPeerServer {
     peer: Peer,
     storage: Arc<Storage>,
+    clients: Rc<TrackedClientMap>,
 }
 
 impl ConnectedPeerServer {
-    fn new(peer: Peer, storage: Arc<Storage>) -> Self {
-        Self { peer, storage }
+    fn new(peer: Peer, storage: Arc<Storage>, clients: Rc<TrackedClientMap>) -> Self {
+        Self {
+            peer,
+            storage,
+            clients,
+        }
     }
 
-    fn into_connected_peer(self) -> connected_peer::Client {
-        capnp_rpc::new_client(self)
-    }
-
-    fn into_subscriber(self) -> subscriber::Client {
+    fn into_client(self) -> connected_peer::Client {
         capnp_rpc::new_client(self)
     }
 }
@@ -748,6 +864,24 @@ impl connected_peer::Server for ConnectedPeerServer {
         );
 
         Promise::ok(())
+    }
+
+    fn register(
+        &mut self,
+        params: connected_peer::RegisterParams,
+        _: connected_peer::RegisterResults,
+    ) -> Promise<(), capnp::Error> {
+        let peer = self.peer;
+        let clients = Rc::clone(&self.clients);
+        let storage = Arc::clone(&self.storage);
+        Promise::from_future(async move {
+            let remote_store = params.get()?.get_store()?;
+            clients
+                .register(peer, remote_store, &storage, Side::Client)
+                .await?;
+
+            Ok(())
+        })
     }
 }
 
@@ -802,7 +936,7 @@ impl StoreServer {
 
         let peer = self.peer;
         let limiter = self.limiter.clone();
-        log::debug!("{peer} subscribed to notifications from {arena}");
+        log::debug!("{peer} subscribed to notifications from {arena}",);
         tokio::task::spawn_local(async move {
             let mut notifications = Vec::new();
             loop {
@@ -1008,7 +1142,25 @@ impl store::Server for StoreServer {
     }
 }
 
-impl subscriber::Server for ConnectedPeerServer {
+/// Implement capnp interface Subscriber, defined in
+/// `capnp/peer.capnp`.
+#[derive(Clone)]
+struct SubscriberServer {
+    peer: Peer,
+    storage: Arc<Storage>,
+}
+
+impl SubscriberServer {
+    fn new(peer: Peer, storage: Arc<Storage>) -> Self {
+        Self { peer, storage }
+    }
+
+    fn into_client(self) -> subscriber::Client {
+        capnp_rpc::new_client(self)
+    }
+}
+
+impl subscriber::Server for SubscriberServer {
     fn notify(
         &mut self,
         params: NotifyParams,
@@ -1367,13 +1519,32 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::rpc::testing::HouseholdFixture;
+    use crate::rpc::testing::{self, HouseholdFixture};
     use fast_rsync::SignatureOptions;
     use futures::TryStreamExt as _;
     use realize_network::testing::TestingPeers;
     use realize_storage::{Mark, utils::hash};
     use tokio::fs;
 
+    async fn test_read_all(
+        household: &Household,
+        peer: Peer,
+        path_str: &str,
+        expected_content: &[u8],
+    ) -> anyhow::Result<()> {
+        let stream = household.read(
+            vec![peer],
+            ExecutionMode::Interactive,
+            HouseholdFixture::test_arena(),
+            realize_types::Path::parse(path_str)?,
+            0,
+            None,
+        )?;
+        let collected = stream.try_collect::<Vec<_>>().await?;
+        assert_eq!(vec![(0, expected_content.to_vec())], collected);
+
+        Ok(())
+    }
     #[tokio::test]
     async fn household_subscribes() -> anyhow::Result<()> {
         let mut fixture = HouseholdFixture::setup().await?;
@@ -1419,16 +1590,7 @@ mod tests {
                     .wait_for_file_in_cache(a, "bar.txt", &hash::digest(b"test"))
                     .await?;
 
-                let stream = household_a.read(
-                    vec![b.clone()],
-                    ExecutionMode::Interactive,
-                    HouseholdFixture::test_arena(),
-                    realize_types::Path::parse("bar.txt")?,
-                    0,
-                    None,
-                )?;
-                let collected = stream.try_collect::<Vec<_>>().await?;
-                assert_eq!(vec![(0, b"test".to_vec())], collected);
+                test_read_all(&household_a, b, "bar.txt", b"test").await?;
 
                 let stream = household_a.read(
                     vec![b.clone()],
@@ -1948,6 +2110,113 @@ mod tests {
                     ]),
                     household_a.query_peers().await?
                 );
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reverse_connection() -> anyhow::Result<()> {
+        let mut fixture = HouseholdFixture::setup().await?;
+        fixture
+            .with_two_peers() // not interconnected
+            .await?
+            .run(async |household_a, household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+
+                let mut peer_status_a = household_a.peer_status();
+                let mut peer_status_b = household_b.peer_status();
+
+                // Only one side is connected, from A to B.
+                testing::connect(&household_a, b).await?;
+
+                // Both sides end up being able to talk to each other
+                // thanks to reverse connections.
+                assert_eq!(
+                    PeerStatus::Connected(b),
+                    tokio::time::timeout(Duration::from_secs(3), peer_status_a.recv()).await??,
+                );
+                assert_eq!(
+                    PeerStatus::Connected(a),
+                    tokio::time::timeout(Duration::from_secs(3), peer_status_b.recv()).await??,
+                );
+
+                // A file created in B's arena should eventually become
+                // available in cache A and vice-versa.
+                fs::write(&fixture.arena_root(b).join("in_b"), b"test").await?;
+                fs::write(&fixture.arena_root(a).join("in_a"), b"test").await?;
+
+                fixture
+                    .wait_for_file_in_cache(a, "in_b", &hash::digest(b"test"))
+                    .await?;
+                fixture
+                    .wait_for_file_in_cache(b, "in_a", &hash::digest(b"test"))
+                    .await?;
+
+                // Make sure that the remote peer can be read from, no
+                // matter the side.
+                test_read_all(&household_b, a, "in_a", b"test").await?;
+                test_read_all(&household_a, b, "in_b", b"test").await?;
+
+                // A single disconnection disconnects both sides.
+                household_a.disconnect_peer(b)?;
+                assert_eq!(
+                    PeerStatus::Disconnected(b),
+                    tokio::time::timeout(Duration::from_secs(3), peer_status_a.recv()).await??,
+                );
+                assert_eq!(
+                    PeerStatus::Disconnected(a),
+                    tokio::time::timeout(Duration::from_secs(3), peer_status_b.recv()).await??,
+                );
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+    #[tokio::test]
+    async fn single_side_disconnect() -> anyhow::Result<()> {
+        let mut fixture = HouseholdFixture::setup().await?;
+        fixture
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+
+                // A is connected to B and B to A, since interconnected() was called.
+
+                fs::write(&fixture.arena_root(b).join("in_b"), b"test").await?;
+                fs::write(&fixture.arena_root(a).join("in_a"), b"test").await?;
+                fixture
+                    .wait_for_file_in_cache(a, "in_b", &hash::digest(b"test"))
+                    .await?;
+                fixture
+                    .wait_for_file_in_cache(b, "in_a", &hash::digest(b"test"))
+                    .await?;
+
+                test_read_all(&household_b, a, "in_a", b"test").await?;
+                test_read_all(&household_a, b, "in_b", b"test").await?;
+
+                // If one side disconnects (A->B), the other side
+                // takes over.
+                //
+                // We can't wait for disconnections, since it's not
+                // reported to peer_status; after all both sides are
+                // still connected. As a result, the code below is a
+                // bit racy, but it shouldn't matter since it should
+                // always work no matter the timing.
+                household_a.disconnect_all()?;
+                tokio::task::yield_now().await; // allow disconnection to happen
+
+                test_read_all(&household_b, a, "in_a", b"test").await?;
+                test_read_all(&household_a, b, "in_b", b"test").await?;
 
                 Ok::<(), anyhow::Error>(())
             })

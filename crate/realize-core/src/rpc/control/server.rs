@@ -353,7 +353,7 @@ mod tests {
     use crate::consensus::progress::{ByteCountProgress, TxByteCountProgress};
     use crate::consensus::types::{ChurtenNotification, JobAction, JobProgress};
     use crate::rpc::control::client::{self, ChurtenUpdates, TxChurtenSubscriber};
-    use crate::rpc::testing::HouseholdFixture;
+    use crate::rpc::testing::{self, HouseholdFixture};
     use crate::rpc::{Household, PeerStatus};
     use assert_fs::TempDir;
     use realize_network::unixsocket;
@@ -897,11 +897,12 @@ mod tests {
             .inner
             .with_two_peers()
             .await?
-            .interconnected()
             .run(async |household_a, _| {
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
                 let local = LocalSet::new();
+
+                testing::connect(&household_a, b).await?;
 
                 let handler = FakeJobHandler::new(|| Ok(JobStatus::Done));
                 let sockpath = fixture
@@ -1008,11 +1009,12 @@ mod tests {
             .inner
             .with_two_peers()
             .await?
-            .interconnected()
             .run(async |household_a, _| {
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
                 let local = LocalSet::new();
+
+                testing::connect(&household_a, b).await?;
 
                 let handler = FakeJobHandler::new(|| Ok(JobStatus::Done));
                 let sockpath = fixture
@@ -1118,11 +1120,12 @@ mod tests {
             .inner
             .with_two_peers()
             .await?
-            .interconnected()
             .run(async |household_a, _| {
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
                 let local = LocalSet::new();
+
+                testing::connect(&household_a, b).await?;
 
                 // Create a fake job handler
                 let handler = FakeJobHandler::new(|| Ok(JobStatus::Done));

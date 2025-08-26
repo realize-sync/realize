@@ -6,6 +6,7 @@ $Rust.parentModule("rpc");
 using import "store.capnp".Store;
 
 interface ConnectedPeer {
-  # Return a handle on the peer store.
-  store @0 () -> (store: Store);
+  store @0 () -> (store: Store); # Return a handle on the store.
+
+  register @1 (store: Store) -> (); # Register another peer's store
 }
