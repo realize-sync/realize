@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
     - name: Install build dependencies
-      run: "sudo apt-get install capnproto libcapnp-dev fuse libfuse3-dev"
+      run: "sudo apt-get install capnproto libcapnp-dev fuse3 libfuse3-dev"
     - uses: actions/checkout@v4
     - uses: taiki-e/install-action@nextest
     - name: Build
@@ -40,7 +40,7 @@ jobs:
     runs-on: macos-15
     steps:
     - name: Install build dependencies
-      run: "brew install capnp fuse-t macfuse@dev"
+      run: "brew install capnp macfuse fuse-t"
     - uses: actions/checkout@v4
     - uses: taiki-e/install-action@nextest
     - name: Build
