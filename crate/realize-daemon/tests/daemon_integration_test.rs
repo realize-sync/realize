@@ -592,3 +592,66 @@ async fn daemon_binds_socket() -> anyhow::Result<()> {
         .await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn daemon_exports_fuse() -> anyhow::Result<()> {
+    let fixture = Fixture::setup().await?;
+
+    // Create a mount point for FUSE
+    let mount_point = fixture.tempdir.child("fuse-mount");
+    mount_point.create_dir_all()?;
+
+    // Run daemon with FUSE mount
+    let mut daemon = fixture
+        .command()?
+        .arg("--fuse")
+        .arg(mount_point.path())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let pid = daemon.id();
+    scopeguard::defer! { let _ = kill(pid); }
+
+    fixture.collect_stderr("daemon", &mut daemon);
+
+    // the FUSE mountpoint is mounted before listening
+    fixture.assert_listening().await;
+
+    // List the root directory content - the arena must appear
+    let entries = std::fs::read_dir(mount_point.path())?;
+    let entry_names: Vec<String> = entries
+        .filter_map(|entry| {
+            entry
+                .ok()
+                .and_then(|e| e.file_name().to_str().map(|s| s.to_string()))
+        })
+        .collect();
+
+    // The arena "testdir" should be visible in the FUSE mount
+    assert!(
+        entry_names.contains(&"testdir".to_string()),
+        "Expected to find 'testdir' arena in FUSE mount, found: {:?}",
+        entry_names
+    );
+
+    // List the arena directory content - it should be empty
+    let arena_path = mount_point.path().join("testdir");
+    let arena_entries = std::fs::read_dir(&arena_path)?;
+    let arena_entry_names: Vec<String> = arena_entries
+        .filter_map(|entry| {
+            entry
+                .ok()
+                .and_then(|e| e.file_name().to_str().map(|s| s.to_string()))
+        })
+        .collect();
+
+    // The arena directory should be empty (no files synced yet)
+    assert!(
+        arena_entry_names.is_empty(),
+        "Expected arena directory to be empty, found: {:?}",
+        arena_entry_names
+    );
+
+    daemon.start_kill()?;
+
+    Ok(())
+}
