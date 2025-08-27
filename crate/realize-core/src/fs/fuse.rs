@@ -21,6 +21,8 @@ pub fn export(
     };
     let bgsession =
         fuser::spawn_mount2(fs, mountpoint, &[MountOption::AutoUnmount, MountOption::RO])?;
+    log::info!("FUSE filesystem mounted on {mountpoint:?}");
+
     Ok(FuseHandle { inner: bgsession })
 }
 
@@ -320,7 +322,12 @@ async fn do_getattr(cache: Arc<GlobalCache>, ino: u64) -> Result<fuser::FileAttr
     }
 }
 
-async fn do_read(downloader: Downloader, ino: u64, offset: i64, size: u32) -> Result<Vec<u8>, FuseError> {
+async fn do_read(
+    downloader: Downloader,
+    ino: u64,
+    offset: i64,
+    size: u32,
+) -> Result<Vec<u8>, FuseError> {
     let reader = downloader
         .reader(Inode(ino))
         .await
@@ -338,7 +345,11 @@ async fn do_read(downloader: Downloader, ino: u64, offset: i64, size: u32) -> Re
     Ok(buffer)
 }
 
-async fn do_readdir(cache: Arc<GlobalCache>, ino: u64, offset: i64) -> Result<Vec<(u64, i64, fuser::FileType, std::ffi::OsString)>, FuseError> {
+async fn do_readdir(
+    cache: Arc<GlobalCache>,
+    ino: u64,
+    offset: i64,
+) -> Result<Vec<(u64, i64, fuser::FileType, std::ffi::OsString)>, FuseError> {
     let mut entries = cache.readdir(Inode(ino)).await.map_err(FuseError::Cache)?;
     entries.sort_by(|a, b| a.1.cmp(&b.1));
 
@@ -443,5 +454,230 @@ fn io_errno(err: std::io::Error) -> c_int {
         errno as c_int
     } else {
         nix::libc::EIO
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rpc::testing::HouseholdFixture;
+    use realize_storage::utils::hash;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+    use tokio::fs;
+
+    /// Fixture for mounting FUSE filesystem for testing
+    struct FuseFixture {
+        inner: HouseholdFixture,
+        mountpoint: TempDir,
+        fuse_handle: Option<FuseHandle>,
+    }
+
+    impl FuseFixture {
+        async fn setup() -> anyhow::Result<Self> {
+            let _ = env_logger::try_init();
+            let household_fixture = HouseholdFixture::setup().await?;
+            let mountpoint = TempDir::new()?;
+
+            Ok(Self {
+                inner: household_fixture,
+                mountpoint,
+                fuse_handle: None,
+            })
+        }
+
+        /// Mount the FUSE filesystem for the given peer
+        ///
+        /// WARNING: use async I/O operations from tokio *exclusively*
+        /// on this filesystem. Using blocking I/O will block, as
+        /// there would be no tokio free thread to execute them on.
+        async fn mount(&mut self, household: Arc<crate::rpc::Household>) -> anyhow::Result<()> {
+            let a = HouseholdFixture::a();
+            let cache = self.inner.cache(a)?;
+            let downloader = Downloader::new(household, cache.clone());
+
+            let handle = export(cache.clone(), downloader, self.mountpoint.path())?;
+            self.fuse_handle = Some(handle);
+
+            Ok(())
+        }
+
+        /// Get the path to the mounted filesystem
+        fn mount_path(&self) -> PathBuf {
+            self.mountpoint.path().to_path_buf()
+        }
+
+        /// Unmount the filesystem.
+        ///
+        /// WARNING: keeping open files might cause this function to block.
+        async fn unmount(&mut self) -> anyhow::Result<()> {
+            if let Some(handle) = self.fuse_handle.take() {
+                handle.join().await?;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn root_dir() -> anyhow::Result<()> {
+        let start_time =
+            std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH)?;
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let _a = HouseholdFixture::a();
+
+                // Mount the filesystem
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let root_attr = fs::metadata(&mount_path).await?;
+
+                // Check root directory attributes
+                assert!(root_attr.is_dir());
+                assert_eq!(0o0550, root_attr.permissions().mode() & 0o777);
+                assert_eq!(nix::unistd::getuid().as_raw(), root_attr.uid());
+                assert_eq!(nix::unistd::getgid().as_raw(), root_attr.gid());
+
+                // mtime should have been set when the arena was added
+                let mtime = root_attr
+                    .modified()?
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)?;
+                assert!(mtime.as_secs() >= start_time.as_secs());
+
+                fixture.unmount().await?;
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn arena_dir() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let _a = HouseholdFixture::a();
+
+                // Mount the filesystem
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena = HouseholdFixture::test_arena();
+                let arena_path = mount_path.join(arena.as_str());
+
+                // Check that arena directory exists and has correct attributes
+                let arena_attr = fs::metadata(&arena_path).await?;
+                assert!(arena_attr.is_dir());
+                assert_eq!(0o0550, arena_attr.permissions().mode() & 0o777);
+                assert_eq!(nix::unistd::getuid().as_raw(), arena_attr.uid());
+                assert_eq!(nix::unistd::getgid().as_raw(), arena_attr.gid());
+
+                fixture.unmount().await?;
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn file_attrs() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+
+                // Create a file in peer B's arena
+                fixture.inner.write_file(b, "somefile.txt", "test!").await?;
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "somefile.txt", &hash::digest("test!"))
+                    .await?;
+
+                // Mount the filesystem
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                let file_path = arena_path.join("somefile.txt");
+
+                // Check file attributes
+                let file_attr = fs::metadata(&file_path).await?;
+                assert!(file_attr.is_file());
+                assert_eq!(0o0440, file_attr.permissions().mode() & 0o777);
+                assert_eq!(nix::unistd::getuid().as_raw(), file_attr.uid());
+                assert_eq!(nix::unistd::getgid().as_raw(), file_attr.gid());
+                assert_eq!(5, file_attr.len());
+
+                fixture.unmount().await?;
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn file_content() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+
+                let b_dir = fixture.inner.arena_root(b);
+                let file = b_dir.join("hello.txt");
+                fs::write(&file, "world").await?;
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "hello.txt", &hash::digest("world"))
+                    .await?;
+
+                // Mount the filesystem and access its content through
+                // normal async I/O operation.
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                let file_path = arena_path.join("hello.txt");
+
+                // Test normal read
+                let content = fs::read_to_string(&file_path).await?;
+                assert_eq!("world", content);
+
+                // Test reading the entire file as bytes
+                let content_bytes = fs::read(&file_path).await?;
+                assert_eq!(b"world", content_bytes.as_slice());
+
+                fixture.unmount().await?;
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
     }
 }
