@@ -42,7 +42,9 @@ jobs:
     runs-on: macos-15
     steps:
     - name: Install build dependencies
-      run: "brew install capnp macfuse@dev fuse-t"
+      run: "brew install capnp fuse-t"
+    - name: Configure FUSE-t
+      run: "cat /usr/local/lib/pkgconfig/fuse-t.pc | sed -e 's/Name: fuse-t/Name:fuse/' -e 's/Version:.*/Version: 2.6.0/' >/usr/local/lib/pkgconfig/fuse.pc"
     - uses: actions/checkout@v4
     - uses: taiki-e/install-action@nextest
     - name: Build
