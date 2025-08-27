@@ -27,6 +27,8 @@ jobs:
     steps:
     - name: Install build dependencies
       run: "sudo apt-get install capnproto libcapnp-dev fuse3 libfuse3-dev"
+    - name: Configure fuse
+      run: "echo 'user_allow_other' >/etc/fuse.conf"
     - uses: actions/checkout@v4
     - uses: taiki-e/install-action@nextest
     - name: Build
@@ -40,12 +42,14 @@ jobs:
     runs-on: macos-15
     steps:
     - name: Install build dependencies
-      run: "brew install capnp macfuse fuse-t"
+      run: "brew install capnp macfuse@dev fuse-t"
     - uses: actions/checkout@v4
     - uses: taiki-e/install-action@nextest
     - name: Build
       run: "cargo build"
     - name: Run tests
-      run: "RUST_LOG=realize_=debug cargo nextest run --retries 1 --no-fail-fast"
+      run: "RUST_LOG=realize_=debug cargo nextest run --retries 1 --no-fail-fast --skip fuse"
     - name: Run doctests
       run: "cargo test --doc"
+    - name: Run fuse tests
+      run: "RUST_LOG=realize_=debug cargo nextest run fuse --no-capture"
