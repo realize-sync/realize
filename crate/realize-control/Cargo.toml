@@ -3,6 +3,10 @@ name = "realize-control"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "realize"
+path = "src/main.rs"
+
 [dependencies]
 realize-core = { path = "../realize-core" }
 realize-storage = { path = "../realize-storage" }

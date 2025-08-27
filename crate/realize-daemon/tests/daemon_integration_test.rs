@@ -35,7 +35,7 @@ fn command_path() -> PathBuf {
         .unwrap()
         .parent()
         .unwrap()
-        .join("realize-daemon")
+        .join("realized")
 }
 
 struct Fixture {
@@ -350,7 +350,7 @@ async fn daemon_interrupted() -> anyhow::Result<()> {
         .command()?
         .env(
             "RUST_LOG",
-            "realize_network::network::tcp=debug,realize_daemon=debug",
+            "realize_network::network::tcp=debug,realized=info",
         )
         .stderr(Stdio::piped())
         .spawn()?;

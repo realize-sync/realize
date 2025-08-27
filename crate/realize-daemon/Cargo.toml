@@ -3,6 +3,10 @@ name = "realize-daemon"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "realized"
+path = "src/main.rs"
+
 [dependencies]
 realize-core = { path = "../realize-core" }
 realize-types = { path = "../realize-types" }

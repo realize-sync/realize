@@ -73,7 +73,7 @@ fn parse_umask(string: &str) -> Result<u32, std::num::ParseIntError> {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    logging::init_with_info_modules(vec!["realize_daemon"]);
+    logging::init_with_info_modules(vec!["realized"]);
 
     if let Err(err) = execute(cli).await {
         eprintln!("ERROR: {err:#}");
@@ -113,6 +113,13 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
         .bind_control_socket(&local, cli.socket.as_deref(), cli.socket_umask)
         .await?;
 
+    let mut signals = Signals::new([
+        signal_hook::consts::SIGHUP,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGQUIT,
+    ])?;
+
     let server = setup.setup_server().await?;
 
     let addr = server
@@ -122,13 +129,6 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
 
     local
         .run_until(async move {
-            let mut signals = Signals::new([
-                signal_hook::consts::SIGHUP,
-                signal_hook::consts::SIGTERM,
-                signal_hook::consts::SIGINT,
-                signal_hook::consts::SIGQUIT,
-            ])?;
-
             log::info!("Listening on {addr}");
             println!("Listening on {addr}");
 

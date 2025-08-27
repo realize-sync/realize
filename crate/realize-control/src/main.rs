@@ -131,7 +131,7 @@ fn resolve_socket_path(socket_arg: Option<PathBuf>) -> Result<PathBuf> {
 async fn main() {
     let mut cli = Cli::parse();
     if cli.output == OutputMode::Log {
-        logging::init_with_info_modules(vec!["realize_control"]);
+        logging::init_with_info_modules(vec!["realize"]);
     } else {
         logging::init(log::LevelFilter::Off);
     }

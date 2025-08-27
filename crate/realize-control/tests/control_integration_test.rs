@@ -85,7 +85,7 @@ impl Fixture {
     }
 
     pub fn control_command(&self, args: &[&str]) -> anyhow::Result<Command> {
-        let mut cmd = tokio::process::Command::new(command_path("realize-control"));
+        let mut cmd = tokio::process::Command::new(command_path("realize"));
         cmd.arg("--socket")
             .arg(&self.socket)
             .args(args)
