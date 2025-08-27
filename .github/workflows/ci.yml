@@ -28,7 +28,7 @@ jobs:
     - name: Install build dependencies
       run: "sudo apt-get install capnproto libcapnp-dev fuse3 libfuse3-dev"
     - name: Configure fuse
-      run: "echo 'user_allow_other' >/etc/fuse.conf"
+      run: "sudo sh -c \"echo user_allow_other >/etc/fuse.conf\""
     - uses: actions/checkout@v4
     - uses: taiki-e/install-action@nextest
     - name: Build
