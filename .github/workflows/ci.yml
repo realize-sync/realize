@@ -50,8 +50,6 @@ jobs:
     - name: Build
       run: "cargo build"
     - name: Run tests
-      run: "RUST_LOG=realize_=debug cargo nextest run --retries 1 --no-fail-fast -- --skip fuse"
+      run: "RUST_LOG=realize_=debug cargo nextest run --retries 1 --no-fail-fast"
     - name: Run doctests
       run: "cargo test --doc"
-    - name: Run fuse tests
-      run: "RUST_LOG=realize_=debug cargo nextest run fuse --no-capture"
