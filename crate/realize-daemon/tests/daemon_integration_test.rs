@@ -11,10 +11,12 @@ use realize_types;
 use realize_types::{Arena, Peer};
 use std::env;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::io::AsyncBufReadExt as _;
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::Child;
@@ -600,6 +602,7 @@ async fn daemon_exports_fuse() -> anyhow::Result<()> {
     // Create a mount point for FUSE
     let mount_point = fixture.tempdir.child("fuse-mount");
     mount_point.create_dir_all()?;
+    let original_dev = fs::metadata(mount_point.path())?.dev();
 
     // Run daemon with FUSE mount
     let mut daemon = fixture
@@ -613,8 +616,12 @@ async fn daemon_exports_fuse() -> anyhow::Result<()> {
 
     fixture.collect_stderr("daemon", &mut daemon);
 
-    // the FUSE mountpoint is mounted before listening
-    fixture.assert_listening().await;
+    // The FUSE filesystem is mounted once the mount point reports being on another device.
+    let limit = Instant::now() + Duration::from_secs(3);
+    while fs::metadata(mount_point.path())?.dev() == original_dev && Instant::now() < limit {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_ne!(fs::metadata(mount_point.path())?.dev(), original_dev);
 
     // List the root directory content - the arena must appear
     let entries = std::fs::read_dir(mount_point.path())?;

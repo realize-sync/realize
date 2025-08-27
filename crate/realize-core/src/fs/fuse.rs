@@ -464,6 +464,7 @@ mod tests {
     use realize_storage::utils::hash;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::PathBuf;
+    use std::time::Instant;
     use tempfile::TempDir;
     use tokio::fs;
 
@@ -497,8 +498,23 @@ mod tests {
             let cache = self.inner.cache(a)?;
             let downloader = Downloader::new(household, cache.clone());
 
+            let m = fs::metadata(self.mountpoint.path()).await?;
+            let original_dev = m.dev();
+            log::debug!("mounting {}", self.mountpoint.path().display());
             let handle = export(cache.clone(), downloader, self.mountpoint.path())?;
             self.fuse_handle = Some(handle);
+
+            let limit = Instant::now() + Duration::from_secs(3);
+            while fs::metadata(self.mountpoint.path()).await?.dev() == original_dev
+                && Instant::now() < limit
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert_ne!(
+                fs::metadata(self.mountpoint.path()).await?.dev(),
+                original_dev
+            );
+            log::debug!("mounting {}", self.mountpoint.path().display());
 
             Ok(())
         }
@@ -512,9 +528,11 @@ mod tests {
         ///
         /// WARNING: keeping open files might cause this function to block.
         async fn unmount(&mut self) -> anyhow::Result<()> {
+            log::debug!("unmounting {}...", self.mountpoint.path().display());
             if let Some(handle) = self.fuse_handle.take() {
-                handle.join().await?;
+                tokio::time::timeout(Duration::from_secs(3), handle.join()).await??;
             }
+            log::debug!("unmounted {}...", self.mountpoint.path().display());
             Ok(())
         }
     }
