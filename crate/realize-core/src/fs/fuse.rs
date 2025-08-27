@@ -538,6 +538,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
     async fn root_dir() -> anyhow::Result<()> {
         let start_time =
             std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH)?;
@@ -578,6 +579,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
     async fn arena_dir() -> anyhow::Result<()> {
         let mut fixture = FuseFixture::setup().await?;
         fixture
@@ -612,6 +614,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
     async fn file_attrs() -> anyhow::Result<()> {
         let mut fixture = FuseFixture::setup().await?;
         fixture
@@ -655,6 +658,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
     async fn file_content() -> anyhow::Result<()> {
         let mut fixture = FuseFixture::setup().await?;
         fixture
