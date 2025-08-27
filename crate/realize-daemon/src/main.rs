@@ -32,6 +32,10 @@ struct Cli {
     #[arg(long)]
     nfs: Option<String>,
 
+    /// Path to mount the FUSE filesystem on.
+    #[arg(long)]
+    fuse: Option<PathBuf>,
+
     /// Path to the PEM-encoded ED25519 private key file
     #[arg(long)]
     privkey: PathBuf,
@@ -99,6 +103,11 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
             )
             .await?;
     }
+    let fuse = if let Some(path) = &cli.fuse {
+        Some(setup.export_fuse(path).await?)
+    } else {
+        None
+    };
 
     setup
         .bind_control_socket(&local, cli.socket.as_deref(), cli.socket_umask)
@@ -127,6 +136,9 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
 
             log::info!("Interrupted. Shutting down..");
             signals.handle().close(); // A 2nd signal kills the process
+            if let Some(fuse) = fuse {
+                fuse.join().await?;
+            }
             server.shutdown().await?;
 
             Ok::<(), anyhow::Error>(())

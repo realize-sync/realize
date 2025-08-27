@@ -1,6 +1,7 @@
 use super::config::Config;
 use crate::consensus::churten::Churten;
 use crate::fs::downloader::Downloader;
+use crate::fs::fuse::{self, FuseHandle};
 use crate::fs::nfs;
 use crate::rpc::Household;
 use crate::rpc::control::server::ControlServer;
@@ -62,6 +63,15 @@ impl SetupHelper {
         nfs::export(Arc::clone(cache), downloader, addr).await?;
 
         Ok(())
+    }
+
+    /// Mount a FUSE filesystem at the given mountpoint.
+    ///
+    /// The returned object must be kept to keep the filesytem mounted. Call join() on it to
+    pub async fn export_fuse(&self, mountpoint: &std::path::Path) -> anyhow::Result<FuseHandle> {
+        let cache = self.storage.cache();
+        let downloader = Downloader::new(self.household.clone(), cache.clone());
+        fuse::export(Arc::clone(self.storage.cache()), downloader, mountpoint)
     }
 
     /// Bind to a UNIX socket that allows the owning user to control the server

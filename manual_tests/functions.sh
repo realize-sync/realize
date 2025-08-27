@@ -51,6 +51,7 @@ function up {
             --address "127.0.0.1:${port}" \
             --socket "${sockfile}" \
             --nfs "127.0.0.1:${nfs_port}" \
+            --fuse "${this}/${inst}-fuse" \
             </dev/null >"${outfile}" 2>&1 &
         pid=$!
         echo $pid >"${pidfile}"
