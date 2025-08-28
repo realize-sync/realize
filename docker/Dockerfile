@@ -5,7 +5,7 @@
 
 # --- 1. Build stage
 FROM rust:1.89.0-alpine3.21 AS builder
-RUN apk add gcc make musl-dev capnproto capnproto-dev
+RUN apk add gcc make musl-dev capnproto capnproto-dev fuse3-dev fuse3-static
 WORKDIR /usr/src/app
 
 # --- 1.1 copy source
@@ -18,6 +18,7 @@ RUN cargo build -p realize-daemon --release
 
 # --- 2. Runtime stage
 FROM alpine:3.21 AS runtime
+RUN apk add fuse3
 
 # --- 2.1 Configuration
 ENV ADDRESS=0.0.0.0:9771
@@ -41,7 +42,7 @@ RUN chmod +x /entrypoint.sh
 WORKDIR /app
 
 # --- 2.4 binary
-COPY --from=builder /usr/src/app/target/release/realize-daemon /usr/local/bin/realized
+COPY --from=builder /usr/src/app/target/release/realized /usr/local/bin/realized
 
 # --- 2.5 run
 EXPOSE 9771
