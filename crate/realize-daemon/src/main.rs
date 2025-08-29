@@ -133,10 +133,11 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
 
             log::info!("Interrupted. Shutting down..");
             signals.handle().close(); // A 2nd signal kills the process
-            if let Some(fuse) = fuse {
-                fuse.join().await?;
-            }
-            server.shutdown().await?;
+            let _ = tokio::join!(server.shutdown(), async move {
+                if let Some(handle) = fuse {
+                    let _ = handle.join().await;
+                }
+            });
 
             Ok::<(), anyhow::Error>(())
         })
