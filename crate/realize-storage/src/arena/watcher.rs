@@ -652,7 +652,6 @@ impl RealWatcherWorker {
         {
             return Ok(());
         }
-        log::info!("[{}] Requested: \"{path}\"", self.index.arena());
         self.hasher.hash_content(path, mtime, size).await?;
 
         Ok(())

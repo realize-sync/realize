@@ -316,7 +316,6 @@ impl Engine {
             } else {
                 // Wait for more dirty paths, then continue.
                 // Now is also a good time to retry failed jobs whose backoff period has passed.
-                log::debug!("[{arena}] Waiting for new jobs");
                 let mut jobs_to_retry = vec![];
                 tokio::select!(
                     _ = tx.closed() => {
