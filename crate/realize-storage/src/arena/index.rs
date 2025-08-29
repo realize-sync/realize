@@ -426,16 +426,8 @@ impl<'a> WritableOpenIndex<'a> {
     ) -> Result<Inode, StorageError> {
         let loc = loc.into();
         let inode = tree.setup(loc.borrow())?;
-        let old_hash = self
-            .table
-            .get(inode)
-            .ok()
-            .flatten()
-            .map(|e| e.value().parse().ok())
-            .flatten()
-            .map(|e| e.hash);
-        let same_hash = old_hash.as_ref().map(|h| *h == hash).unwrap_or(false);
-        if same_hash {
+        let old_hash = self.indexed_hash(inode);
+        if hash.matches(old_hash.as_ref()) {
             return Ok(inode);
         }
         if let Some(path) = tree.backtrack(loc)? {
@@ -449,6 +441,17 @@ impl<'a> WritableOpenIndex<'a> {
             history.report_added(&path, old_hash.as_ref())?;
         }
         Ok(inode)
+    }
+
+    /// Hash of the indexed file or None.
+    fn indexed_hash(&mut self, inode: Inode) -> Option<Hash> {
+        self.table
+            .get(inode)
+            .ok()
+            .flatten()
+            .map(|e| e.value().parse().ok())
+            .flatten()
+            .map(|e| e.hash)
     }
 
     /// Remove a file entry at the given location, if it exists.

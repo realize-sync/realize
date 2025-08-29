@@ -38,6 +38,11 @@ impl UnixTime {
         Ok(UnixTime(time.duration_since(SystemTime::UNIX_EPOCH)?))
     }
 
+    /// Convert to a SystemTime, if possible.
+    pub fn as_system_time(&self) -> Option<SystemTime> {
+        SystemTime::UNIX_EPOCH.checked_add(self.0)
+    }
+
     /// Return duration since some other time.
     ///
     /// Return 0 if `self < other`

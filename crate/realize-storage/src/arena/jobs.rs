@@ -5,6 +5,7 @@ use crate::arena::index::{self, IndexReadOperations};
 use crate::arena::tree::TreeExt;
 use crate::{Inode, JobId, JobStatus, StorageError};
 use realize_types::Hash;
+use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::task::{self, JoinHandle};
@@ -189,39 +190,76 @@ impl StorageJobProcessor {
             Some(ret) => ret,
             None => return Err(StorageError::NoLocalStorage(arena)),
         };
-        let moved: bool;
+        let source: PathBuf;
+        let dest: PathBuf;
+        let path: realize_types::Path;
         let txn = self.db.begin_write()?;
         {
             let mut tree = txn.write_tree()?;
-            let path = match tree.backtrack(inode)? {
+            path = match tree.backtrack(inode)? {
                 Some(path) => path,
                 None => {
                     return Ok(JobStatus::Abandoned("no_path"));
                 }
             };
-            let realpath = index::indexed_file_path(
-                &txn.read_index()?,
-                &tree,
-                &root,
-                &path,
-                index_hash.as_ref(),
-            )?;
-            let mut blobs = txn.write_blobs()?;
-            if let Some(realpath) = realpath {
-                moved = blobs.export(&mut tree, &path, &cache_hash, &realpath)?;
-                if moved {
-                    log::debug!("Realized [{arena}]/{path} {cache_hash} as {realpath:?}");
+            let cache = txn.read_cache()?;
+            let cached = match cache.get_at_inode(inode)? {
+                Some(e) => e,
+                None => {
+                    return Ok(JobStatus::Abandoned("cache_entry"));
                 }
-            } else {
-                return Ok(JobStatus::Abandoned("indexed_file_path"));
+            };
+            if cached.hash != cache_hash {
+                return Ok(JobStatus::Abandoned("cache_version"));
             }
+
+            let mut index = txn.write_index()?;
+            dest = match index::indexed_file_path(&index, &tree, &root, &path, index_hash.as_ref())?
+            {
+                Some(p) => p,
+                None => {
+                    return Ok(JobStatus::Abandoned("indexed_file_path"));
+                }
+            };
+            let mut blobs = txn.write_blobs()?;
+            source = match blobs.prepare_export(&mut tree, &path, &cache_hash)? {
+                Some(p) => p,
+                None => {
+                    return Ok(JobStatus::Abandoned("blob_export"));
+                }
+            };
+            // Make sure that mtime and size match
+            if source.metadata()?.len() != cached.size {
+                return Ok(JobStatus::Abandoned("wrong_size"));
+            }
+
+            // Set modification time on file (best effort)
+            if let Some(time) = cached.mtime.as_system_time() {
+                let f = File::open(&source)?;
+                let _ = f.set_modified(time);
+            }
+            let mut history = txn.write_history()?;
+            let mut dirty = txn.write_dirty()?;
+            index.add(
+                &mut tree,
+                &mut history,
+                &mut dirty,
+                &path,
+                cached.size,
+                cached.mtime,
+                cached.hash,
+            )?;
         }
-        if moved {
-            txn.commit()?;
-            Ok(JobStatus::Done)
-        } else {
-            Ok(JobStatus::Abandoned("blobs.export"))
+        std::fs::rename(&source, &dest)?;
+        let ret = txn.commit();
+        if !ret.is_ok() {
+            // Commit didn't work; try to revert the file change
+            std::fs::rename(&dest, &source)?;
         }
+        ret?;
+        log::debug!("Realized [{arena}]/{path} {cache_hash} as {dest:?}");
+
+        Ok(JobStatus::Done)
     }
 }
 
@@ -237,6 +275,10 @@ mod tests {
     use realize_types::{Arena, Path, Peer, UnixTime};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn test_time() -> UnixTime {
+        UnixTime::from_secs(1234567890)
+    }
 
     struct Fixture {
         arena: Arena,
@@ -327,7 +369,7 @@ mod tests {
                     arena: self.arena,
                     index: 1,
                     path: Path::parse(path_str)?,
-                    mtime: UnixTime::from_secs(1234567890),
+                    mtime: test_time(),
                     size,
                     hash: hash.clone(),
                 },
@@ -350,7 +392,7 @@ mod tests {
                     arena: self.arena,
                     index: 1,
                     path: Path::parse(path_str)?,
-                    mtime: UnixTime::from_secs(1234567890),
+                    mtime: test_time(),
                     size,
                     old_hash: old_hash.clone(),
                     hash: new_hash.clone(),
@@ -536,14 +578,20 @@ mod tests {
             fixture.realize(path.clone(), hash.clone(), None).await?
         );
 
-        assert_eq!(
-            "test".to_string(),
-            std::fs::read_to_string(path.within(&fixture.root))?
-        );
+        let realpath = path.within(&fixture.root);
+        assert_eq!("test".to_string(), std::fs::read_to_string(&realpath)?);
+        assert_eq!(test_time(), UnixTime::mtime(&realpath.metadata()?));
+
         assert_eq!(
             LocalAvailability::Missing,
             fixture.cache.local_availability(inode)?
         );
+
+        let txn = fixture.db.begin_read()?;
+        let index = txn.read_index()?;
+        let indexed = index.get_at_inode(inode)?.expect("must have been indexed");
+        assert_eq!(hash, indexed.hash);
+        assert_eq!(test_time(), indexed.mtime);
 
         Ok(())
     }
@@ -573,14 +621,20 @@ mod tests {
                 .await?
         );
 
-        assert_eq!(
-            "new!".to_string(),
-            std::fs::read_to_string(path.within(&fixture.root))?
-        );
+        let realpath = path.within(&fixture.root);
+        assert_eq!("new!".to_string(), std::fs::read_to_string(&realpath)?);
+        assert_eq!(test_time(), UnixTime::mtime(&realpath.metadata()?));
         assert_eq!(
             LocalAvailability::Missing,
             fixture.cache.local_availability(inode)?
         );
+
+        let txn = fixture.db.begin_read()?;
+        let index = txn.read_index()?;
+        let indexed = index.get_at_inode(inode)?.expect("must have been indexed");
+        assert_eq!(new_hash, indexed.hash);
+        assert_eq!(test_time(), indexed.mtime);
+        assert_eq!(None, indexed.outdated_by);
 
         Ok(())
     }

@@ -553,38 +553,37 @@ impl<'a> WritableOpenBlob<'a> {
         Ok(())
     }
 
-    /// Move the blob to `dest` and delete the blob entry.
+    /// Prepare the move the blob file out of the blob store.
     ///
-    /// Does nothing and return false unless the blob content hash is
+    /// Does nothing and return None unless the blob content hash is
     /// `hash` and has been downloaded and verified.
-    pub(crate) fn export<'b, L: Into<TreeLoc<'b>>>(
+    ///
+    /// Upon success, return the path of the blob file. That file
+    /// should be moved; The blob entry has been deleted already.
+    pub(crate) fn prepare_export<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree,
         loc: L,
         hash: &Hash,
-        dest: &std::path::Path,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<Option<std::path::PathBuf>, StorageError> {
         let inode = match tree.resolve(loc)? {
             Some(inode) => inode,
-            None => return Ok(false), // Nothing to export
+            None => return Ok(None), // Nothing to export
         };
 
         let blob_entry = match self.blob_table.get(inode)? {
             None => {
-                return Ok(false);
+                return Ok(None);
             }
             Some(v) => v.value().parse()?,
         };
         if blob_entry.content_hash != *hash || !blob_entry.verified {
-            return Ok(false);
+            return Ok(None);
         }
 
         self.remove_blob_entry(tree, inode)?;
-        let blob_path = self.subsystem.blob_dir.join(inode.hex());
-        std::fs::rename(blob_path, dest)?;
         self.report_disk_usage_changed();
-
-        Ok(true)
+        Ok(Some(self.subsystem.blob_dir.join(inode.hex())))
     }
 
     /// Setup the database to move some existing file into and return the
@@ -2023,7 +2022,8 @@ mod tests {
         {
             let mut blobs = txn.write_blobs()?;
             let mut tree = txn.write_tree()?;
-            assert_eq!(true, blobs.export(&mut tree, &path, &hash, &dest)?);
+            let source = blobs.prepare_export(&mut tree, &path, &hash)?.unwrap();
+            std::fs::rename(source, &dest)?;
         }
         let watch = fixture.db.blobs().watch_disk_usage();
         txn.commit()?;
@@ -2050,19 +2050,17 @@ mod tests {
         assert_eq!(true, Blob::open(&fixture.db, &path)?.mark_verified().await?);
 
         // export to dest
-        let dest = fixture.tempdir.path().join("moved_blob");
         let txn = fixture.begin_write()?;
         {
             let mut blobs = txn.write_blobs()?;
             let mut tree = txn.write_tree()?;
             assert_eq!(
-                false,
-                blobs.export(&mut tree, &path, &hash::digest("wrong!"), &dest)?
+                None,
+                blobs.prepare_export(&mut tree, &path, &hash::digest("wrong!"))?
             );
         }
         txn.commit()?;
 
-        assert!(!dest.exists());
         assert!(fixture.blob_info(&path)?.is_some());
 
         Ok(())
@@ -2077,13 +2075,11 @@ mod tests {
 
         // do not mark verified
 
-        // export to dest
-        let dest = fixture.tempdir.path().join("moved_blob");
         let txn = fixture.begin_write()?;
         {
             let mut blobs = txn.write_blobs()?;
             let mut tree = txn.write_tree()?;
-            assert_eq!(false, blobs.export(&mut tree, &path, &hash, &dest)?);
+            assert_eq!(None, blobs.prepare_export(&mut tree, &path, &hash)?);
         }
 
         Ok(())
@@ -2094,14 +2090,13 @@ mod tests {
         let fixture = Fixture::setup()?;
         let path = Path::parse("baa/baa")?;
 
-        let dest = fixture.tempdir.path().join("moved_blob");
         let txn = fixture.begin_write()?;
         {
             let mut blobs = txn.write_blobs()?;
             let mut tree = txn.write_tree()?;
             assert_eq!(
-                false,
-                blobs.export(&mut tree, &path, &hash::digest("test"), &dest)?
+                None,
+                blobs.prepare_export(&mut tree, &path, &hash::digest("test"))?
             );
         }
 

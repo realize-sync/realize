@@ -27,6 +27,14 @@ impl Hash {
 
         true
     }
+
+    /// True if `other` contains this hash.
+    pub fn matches(&self, other: Option<&Hash>) -> bool {
+        if let Some(other) = other {
+            return *self == *other;
+        }
+        false
+    }
 }
 
 impl std::fmt::Debug for Hash {
