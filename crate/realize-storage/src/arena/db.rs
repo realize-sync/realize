@@ -12,6 +12,7 @@ use super::types::{
     MarkTableEntry, PeerTableEntry, QueueTableEntry,
 };
 use crate::StorageError;
+use crate::arena::arena_cache;
 use crate::utils::holder::{ByteConversionError, Holder};
 use crate::{Inode, InodeAllocator};
 use realize_types::Arena;
@@ -226,7 +227,7 @@ impl ArenaDatabase {
             let mut settings_table = txn.open_table(SETTINGS_TABLE)?;
             txn.open_table(TREE_TABLE)?;
             txn.open_table(TREE_REFCOUNT_TABLE)?;
-            txn.open_table(CACHE_TABLE)?;
+            let mut cache_table = txn.open_table(CACHE_TABLE)?;
             txn.open_table(INDEX_TABLE)?;
             txn.open_table(PENDING_CATCHUP_TABLE)?;
             txn.open_table(PEER_TABLE)?;
@@ -244,6 +245,7 @@ impl ArenaDatabase {
             history = History::new(arena, &history_table)?;
             blobs = Blobs::new(blob_dir.as_ref(), &blob_lru_queue_table)?;
             uuid = load_or_assign_uuid(&mut settings_table)?;
+            arena_cache::init(&mut cache_table, tree.root())?;
         }
         txn.commit()?;
 

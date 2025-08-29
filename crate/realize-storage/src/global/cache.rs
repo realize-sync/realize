@@ -8,6 +8,7 @@ use super::types::InodeAssignment;
 use crate::arena::arena_cache::ArenaCache;
 use crate::arena::notifier::{Notification, Progress};
 use crate::arena::types::LocalAvailability;
+use crate::global::db::GlobalWriteTransaction;
 use crate::global::types::PathTableEntry;
 use crate::utils::holder::Holder;
 use crate::{Blob, FileAvailability, FileMetadata, Inode, StorageError};
@@ -44,10 +45,33 @@ impl GlobalCache {
         task::spawn_blocking(move || {
             let mut arena_caches = HashMap::new();
             let mut paths = HashMap::new();
+            let txn = db.begin_write()?;
+            {
+                let mut path_table = txn.path_table()?;
 
-            for arena_cache in caches.into_iter() {
-                register(arena_cache, &db, &allocator, &mut arena_caches, &mut paths)?;
+                // Make sure root is setup, even if there are no arenas.
+                let root_mtime =
+                    get_or_add_path_entry(&txn, &mut path_table, &allocator, "")?.mtime;
+                paths.insert(
+                    InodeAllocator::ROOT_INODE,
+                    IntermediatePath {
+                        entries: HashMap::new(),
+                        mtime: root_mtime,
+                    },
+                );
+
+                for arena_cache in caches.into_iter() {
+                    register(
+                        arena_cache,
+                        &txn,
+                        &mut path_table,
+                        &allocator,
+                        &mut arena_caches,
+                        &mut paths,
+                    )?;
+                }
             }
+            txn.commit()?;
 
             Ok::<_, anyhow::Error>(Arc::new(Self {
                 db,
@@ -321,7 +345,8 @@ fn check_arena_compatibility(arena: Arena, existing: Arena) -> anyhow::Result<()
 /// Calls for inode assigned to the cache arena will be directed there.
 fn register(
     cache: Arc<ArenaCache>,
-    db: &Arc<GlobalDatabase>,
+    txn: &GlobalWriteTransaction,
+    path_table: &mut redb::Table<&'static str, Holder<'static, PathTableEntry>>,
     allocator: &Arc<InodeAllocator>,
     arena_caches: &mut HashMap<Arena, Arc<ArenaCache>>,
     paths: &mut HashMap<Inode, IntermediatePath>,
@@ -334,7 +359,7 @@ fn register(
     for existing in arena_caches.keys().map(|a| *a) {
         check_arena_compatibility(arena, existing)?;
     }
-    add_arena_root(arena, arena_root, db, allocator, paths)?;
+    add_arena_root(arena, arena_root, txn, path_table, allocator, paths)?;
     arena_caches.insert(cache.arena(), cache);
 
     Ok(())
@@ -343,52 +368,52 @@ fn register(
 fn add_arena_root(
     arena: Arena,
     arena_root: Inode,
-    db: &Arc<GlobalDatabase>,
+    txn: &GlobalWriteTransaction,
+    path_table: &mut redb::Table<&'static str, Holder<'static, PathTableEntry>>,
     allocator: &Arc<InodeAllocator>,
     paths: &mut HashMap<Inode, IntermediatePath>,
 ) -> anyhow::Result<()> {
     let arena_path = Path::parse(arena.as_str())?;
-    let txn = db.begin_write()?;
-    {
-        let mut path_table = txn.path_table()?;
-        let mut names = Path::components(Some(&arena_path))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .chain(/* root */ std::iter::once(""));
-        let mut current_inode = arena_root;
-        let mut current_name = names.next().unwrap();
-        for dirname in names {
-            let entry = if let Some(e) = path_table.get(dirname)? {
-                e.value().parse()?
-            } else {
-                let entry_inode = if dirname == "" {
-                    InodeAllocator::ROOT_INODE
-                } else {
-                    allocator.allocate_global_inode(&txn)?
-                };
-                let entry = PathTableEntry {
-                    inode: entry_inode,
-                    mtime: UnixTime::now(),
-                };
-                path_table.insert(dirname, Holder::new(&entry)?)?;
-
-                entry
-            };
-            add_intermediate_path_entry(
-                entry.inode,
-                entry.mtime,
-                current_name,
-                current_inode,
-                paths,
-            );
-            current_name = dirname;
-            current_inode = entry.inode;
-        }
+    let mut names = Path::components(Some(&arena_path))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .chain(/* root */ std::iter::once(""));
+    let mut current_inode = arena_root;
+    let mut current_name = names.next().unwrap();
+    for dirname in names {
+        let entry = get_or_add_path_entry(txn, path_table, allocator, dirname)?;
+        add_intermediate_path_entry(entry.inode, entry.mtime, current_name, current_inode, paths);
+        current_name = dirname;
+        current_inode = entry.inode;
     }
-    txn.commit()?;
 
     Ok(())
+}
+
+fn get_or_add_path_entry(
+    txn: &GlobalWriteTransaction,
+    path_table: &mut redb::Table<'_, &'static str, Holder<'static, PathTableEntry>>,
+    allocator: &Arc<InodeAllocator>,
+    dirname: &str,
+) -> Result<PathTableEntry, anyhow::Error> {
+    let entry = if let Some(e) = path_table.get(dirname)? {
+        e.value().parse()?
+    } else {
+        let entry_inode = if dirname == "" {
+            InodeAllocator::ROOT_INODE
+        } else {
+            allocator.allocate_global_inode(&txn)?
+        };
+        let entry = PathTableEntry {
+            inode: entry_inode,
+            mtime: UnixTime::now(),
+        };
+        path_table.insert(dirname, Holder::new(&entry)?)?;
+
+        entry
+    };
+    Ok(entry)
 }
 
 /// Adds an entry in the intermediate path with the given inode.
@@ -460,19 +485,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_cache_readdir() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arenas([]).await?;
+
+        assert!(fixture.cache.readdir(Inode(1)).await?.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_cache_mtime() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arenas([]).await?;
+
+        assert_ne!(UnixTime::ZERO, fixture.cache.dir_mtime(Inode(1)).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn initial_dir_mtime() -> anyhow::Result<()> {
         let arena = Arena::from("documents/letters");
         let fixture = Fixture::setup_with_arena(arena).await?;
 
-        // There might not be any mtime at this point, but dir_mtime should not fail.
-        fixture.cache.dir_mtime(Inode(1)).await?;
+        assert_ne!(UnixTime::ZERO, fixture.cache.dir_mtime(Inode(1)).await?);
         fixture
             .cache
             .dir_mtime(fixture.cache.arena_root(arena)?)
             .await?;
 
         let (documents, _) = fixture.cache.lookup(Inode(1), "documents").await?;
-        fixture.cache.dir_mtime(documents).await?;
+        assert_ne!(UnixTime::ZERO, fixture.cache.dir_mtime(documents).await?);
+
+        let (letters, _) = fixture.cache.lookup(documents, "letters").await?;
+        assert_ne!(UnixTime::ZERO, fixture.cache.dir_mtime(letters).await?);
 
         Ok(())
     }
@@ -551,6 +596,25 @@ mod tests {
                 .into_iter()
                 .map(|(name, _, assignment)| (name, assignment))
                 .collect::<Vec<_>>(),
+        );
+
+        assert!(
+            cache
+                .readdir(cache.arena_root(Arena::from("arenas/test1"))?)
+                .await?
+                .is_empty()
+        );
+        assert!(
+            cache
+                .readdir(cache.arena_root(Arena::from("arenas/test2"))?)
+                .await?
+                .is_empty()
+        );
+        assert!(
+            cache
+                .readdir(cache.arena_root(Arena::from("other"))?)
+                .await?
+                .is_empty()
         );
 
         Ok(())

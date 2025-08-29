@@ -371,13 +371,6 @@ impl<'a> WritableOpenCache<'a> {
         peer: Peer,
         entry: &FileTableEntry,
     ) -> Result<(), StorageError> {
-        log::debug!(
-            "[{}]@{peer} New file entry \"{:?}\" inode {file_inode} {}",
-            self.arena,
-            entry.path,
-            entry.hash
-        );
-
         self.table.insert(
             CacheTableKey::PeerCopy(file_inode, peer),
             Holder::new(&CacheTableEntry::File(entry.clone()))?,
@@ -586,6 +579,27 @@ impl<'a> WritableOpenCache<'a> {
     }
 }
 
+/// Initialize the database. This should be called at startup, in the
+/// transaction that crates new tables.
+pub(crate) fn init(
+    cache_table: &mut redb::Table<'_, CacheTableKey, Holder<CacheTableEntry>>,
+    root_inode: Inode,
+) -> Result<(), StorageError> {
+    if cache_table
+        .get(CacheTableKey::Default(root_inode))?
+        .is_none()
+    {
+        // Assign root mtime to initial startup time.
+        cache_table.insert(
+            CacheTableKey::Default(root_inode),
+            Holder::with_content(CacheTableEntry::Dir(DirtableEntry {
+                mtime: UnixTime::now(),
+            }))?,
+        )?;
+    }
+    Ok(())
+}
+
 /// Lookup a specific name in the given directory inode.
 fn lookup(
     cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
@@ -608,16 +622,13 @@ fn dir_mtime(
     cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
     inode: Inode,
 ) -> Result<UnixTime, StorageError> {
-    match cache_table.get(CacheTableKey::Default(inode))? {
-        Some(e) => match e.value().parse()? {
-            CacheTableEntry::Dir(dir_entry) => Ok(dir_entry.mtime),
-            CacheTableEntry::File(_) => Err(StorageError::NotADirectory),
-        },
-        None => {
-            // When the filesystem is empty, the root dir might not
-            // have a mtime. This is not an error.
-            Ok(UnixTime::ZERO)
-        }
+    let e = cache_table
+        .get(CacheTableKey::Default(inode))?
+        .ok_or(StorageError::NotFound)?;
+
+    match e.value().parse()? {
+        CacheTableEntry::Dir(dir_entry) => Ok(dir_entry.mtime),
+        CacheTableEntry::File(_) => Err(StorageError::NotADirectory),
     }
 }
 
@@ -1226,6 +1237,27 @@ mod tests {
         async fn setup() -> anyhow::Result<Fixture> {
             Self::setup_with_arena(test_arena()).await
         }
+    }
+
+    #[tokio::test]
+    async fn empty_cache_readdir() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+
+        assert!(fixture.acache.readdir(fixture.db.tree().root())?.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_cache_mtime() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+
+        assert_ne!(
+            UnixTime::ZERO,
+            fixture.acache.dir_mtime(fixture.db.tree().root())?
+        );
+
+        Ok(())
     }
 
     #[tokio::test]
