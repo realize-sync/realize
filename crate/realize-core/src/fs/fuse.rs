@@ -19,8 +19,23 @@ pub fn export(
         downloader,
         handle: Handle::current(),
     };
-    let bgsession =
-        fuser::spawn_mount2(fs, mountpoint, &[MountOption::AutoUnmount, MountOption::RO])?;
+    let bgsession = fuser::spawn_mount2(
+        fs,
+        mountpoint,
+        &[
+            MountOption::AutoUnmount,
+            MountOption::AllowOther,
+            MountOption::DefaultPermissions,
+            MountOption::NoDev,
+            MountOption::NoSuid,
+            MountOption::NoExec,
+            MountOption::NoAtime,
+            MountOption::Async,
+            MountOption::FSName("realized".to_string()),
+            MountOption::Subtype("realize".to_string()),
+            MountOption::RO,
+        ],
+    )?;
 
     Ok(FuseHandle { inner: bgsession })
 }
@@ -436,6 +451,8 @@ enum FuseError {
 
 impl FuseError {
     fn into_errno(self) -> c_int {
+        log::debug!("FUSE operation error: {self:?}");
+
         match self {
             FuseError::Cache(err) => storage_errno(err),
             FuseError::Utf8 => nix::libc::EINVAL,
