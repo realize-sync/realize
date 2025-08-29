@@ -186,16 +186,9 @@ impl Filesystem for RealizeFs {
         let cache = self.cache.clone();
 
         self.handle.spawn(async move {
-            match do_readdir(cache, ino, offset).await {
+            match do_readdir(cache, ino, offset, &mut reply).await {
                 Err(err) => reply.error(err.into_errno()),
-                Ok(entries) => {
-                    for (ino, offset, kind, name) in entries {
-                        if reply.add(ino, offset, kind, name) {
-                            break;
-                        }
-                    }
-                    reply.ok();
-                }
+                Ok(()) => reply.ok(),
             }
         });
     }
@@ -363,24 +356,32 @@ async fn do_readdir(
     cache: Arc<GlobalCache>,
     ino: u64,
     offset: i64,
-) -> Result<Vec<(u64, i64, fuser::FileType, std::ffi::OsString)>, FuseError> {
+    reply: &mut fuser::ReplyDirectory,
+) -> Result<(), FuseError> {
     let mut entries = cache.readdir(Inode(ino)).await.map_err(FuseError::Cache)?;
     entries.sort_by(|a, b| a.1.cmp(&b.1));
 
-    let mut fuse_entries = Vec::new();
-    for (name, inode, assignment) in entries.into_iter().skip(offset as usize) {
-        fuse_entries.push((
+    let pivot = Inode(offset as u64); // offset is actually a u64 in fuse
+    let start = match entries.binary_search_by(|(_, inode, _)| inode.cmp(&pivot)) {
+        Ok(i) => i + 1,
+        Err(i) => i,
+    };
+    for (name, inode, assignment) in entries.into_iter().skip(start) {
+        if reply.add(
             inode.as_u64(),
-            fuse_entries.len() as i64 + 1,
+            inode.as_u64() as i64,
             match assignment {
                 InodeAssignment::Directory => fuser::FileType::Directory,
                 InodeAssignment::File => fuser::FileType::RegularFile,
             },
-            name.into(),
-        ));
+            name,
+        ) {
+            // buffer full
+            break;
+        }
     }
 
-    Ok(fuse_entries)
+    Ok(())
 }
 
 fn build_file_attr(inode: Inode, metadata: &FileMetadata) -> fuser::FileAttr {
@@ -585,11 +586,10 @@ mod tests {
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)?;
                 assert!(mtime.as_secs() >= start_time.as_secs());
 
-                fixture.unmount().await?;
-
                 Ok::<(), anyhow::Error>(())
             })
             .await?;
+        fixture.unmount().await?;
 
         Ok(())
     }
@@ -620,12 +620,11 @@ mod tests {
                 assert_eq!(nix::unistd::getuid().as_raw(), arena_attr.uid());
                 assert_eq!(nix::unistd::getgid().as_raw(), arena_attr.gid());
 
-                fixture.unmount().await?;
-
                 Ok::<(), anyhow::Error>(())
             })
             .await?;
 
+        fixture.unmount().await?;
         Ok(())
     }
 
@@ -664,11 +663,10 @@ mod tests {
                 assert_eq!(nix::unistd::getgid().as_raw(), file_attr.gid());
                 assert_eq!(5, file_attr.len());
 
-                fixture.unmount().await?;
-
                 Ok::<(), anyhow::Error>(())
             })
             .await?;
+        fixture.unmount().await?;
 
         Ok(())
     }
@@ -710,11 +708,66 @@ mod tests {
                 let content_bytes = fs::read(&file_path).await?;
                 assert_eq!(b"world", content_bytes.as_slice());
 
-                fixture.unmount().await?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn large_dir() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+
+                fn fname(i: usize) -> String {
+                    format!("dir/file{i:03}.txt")
+                }
+                let b_dir = fixture.inner.arena_root(b);
+                fs::create_dir_all(b_dir.join("dir")).await?;
+                for i in 0..250 {
+                    let file = b_dir.join(fname(i));
+                    fs::write(&file, "test").await?;
+                }
+                for i in 0..250 {
+                    fixture
+                        .inner
+                        .wait_for_file_in_cache(a, &fname(i), &hash::digest("test"))
+                        .await?;
+                }
+
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+
+                let mut read_dir = fs::read_dir(arena_path.join("dir")).await?;
+                let mut collected = vec![];
+                while let Some(entry) = read_dir.next_entry().await? {
+                    let name = entry.file_name();
+                    collected.push(format!("dir/{}", name.to_string_lossy()));
+                }
+                drop(read_dir);
+                collected.sort();
+                assert_eq!(250, collected.len());
+                for i in 0..250 {
+                    assert_eq!(fname(i), collected[i]);
+                }
 
                 Ok::<(), anyhow::Error>(())
             })
             .await?;
+
+        fixture.unmount().await?;
 
         Ok(())
     }
