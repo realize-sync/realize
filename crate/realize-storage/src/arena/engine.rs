@@ -465,41 +465,41 @@ impl Engine {
         let mut should_unrealize = None;
 
         if let Some(cached) = cache.get_at_inode(inode)? {
+            let hash = cached.hash;
+            let indexed = index.get_at_inode(inode)?;
+            let is_indexed = indexed.is_some();
             if want_unrealize {
-                if let Some(indexed) = index.get_at_inode(inode)?
-                    && indexed.is_outdated_by(&cached.hash)
+                if let Some(indexed) = indexed
+                    && indexed.is_outdated_by(&hash)
                 {
                     should_unrealize = Some(indexed.hash);
                 }
+            } else if want_realize {
+                match indexed {
+                    None => should_realize = Some((hash.clone(), None)),
+                    Some(indexed) => {
+                        if indexed.hash != hash && indexed.is_outdated_by(&hash) {
+                            should_realize = Some((hash.clone(), Some(indexed.hash)))
+                        }
+                    }
+                }
             }
-
-            match blobs.get_with_inode(inode)? {
-                None => {
-                    if want_download {
-                        should_download = Some(cached.hash);
-                    }
+            let blob = blobs.get_with_inode(inode)?;
+            if let Some(blob) = &blob {
+                if blob.protected {
+                    should_unprotect_blob = want_unprotect_blob;
+                } else {
+                    should_protect_blob = want_protect_blob;
                 }
-                Some(blob) => {
-                    if blob.protected {
-                        should_unprotect_blob = want_unprotect_blob;
-                    } else {
-                        should_protect_blob = want_protect_blob;
-                    }
-                    if blob.local_availability() != LocalAvailability::Verified {
-                        if want_download {
-                            should_download = Some(cached.hash);
-                        }
-                    } else if want_realize {
-                        match index.get_at_inode(inode)? {
-                            None => should_realize = Some((cached.hash, None)),
-                            Some(indexed) => {
-                                if indexed.is_outdated_by(&cached.hash) {
-                                    should_realize = Some((cached.hash, Some(indexed.hash)));
-                                }
-                            }
-                        }
-                    }
-                }
+            }
+            if want_download
+                && blob
+                    .map(|b| b.local_availability())
+                    .unwrap_or(LocalAvailability::Missing)
+                    != LocalAvailability::Verified
+                && (!is_indexed || should_realize.is_some())
+            {
+                should_download = Some(hash);
             }
         }
 
@@ -668,10 +668,6 @@ mod tests {
                 engine,
                 _tempdir: tempdir,
             })
-        }
-
-        fn last_counter(&self) -> anyhow::Result<u64> {
-            Ok(self.db.begin_read()?.read_dirty()?.last_counter()?)
         }
 
         /// Add a file to the cache for testing
@@ -1133,22 +1129,12 @@ mod tests {
     async fn ignore_file_to_own_in_index_with_same_version() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
         let foobar = Path::parse("foo/bar")?;
-        let otherfile = Path::parse("other")?;
 
         mark::set_arena_mark(&fixture.db, Mark::Own)?;
         fixture.add_file_to_cache_with_version(&foobar, Hash([1; 32]))?;
-        let counter = fixture.last_counter()?;
         fixture.add_file_to_index_with_version(&foobar, Hash([1; 32]))?;
 
-        // Add something else for the stream to return, or it'll just
-        // hang forever.
-        fixture.add_file_to_cache(&otherfile)?;
-
-        let mut job_stream = fixture.engine.job_stream();
-
-        let job = next_with_timeout(&mut job_stream).await?.unwrap();
-        // adding the file to the index is what triggered the job
-        assert_eq!(JobId(counter + 1), job.0);
+        assert_eq!(None, fixture.engine.job_for_loc(&foobar).await?);
 
         Ok(())
     }
@@ -1157,23 +1143,12 @@ mod tests {
     async fn ignore_file_to_own_in_index_with_different_version() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
         let foobar = Path::parse("foo/bar")?;
-        let otherfile = Path::parse("other")?;
 
         mark::set_arena_mark(&fixture.db, Mark::Own)?;
         fixture.add_file_to_cache_with_version(&foobar, Hash([1; 32]))?;
-
-        let counter = fixture.last_counter()?;
         fixture.add_file_to_index_with_version(&foobar, Hash([2; 32]))?;
 
-        // Add something else for the stream to return, or it'll just
-        // hang forever.
-        fixture.add_file_to_cache(&otherfile)?;
-
-        let mut job_stream = fixture.engine.job_stream();
-
-        let job = next_with_timeout(&mut job_stream).await?.unwrap();
-        // adding to index is what triggered the job
-        assert_eq!(JobId(counter + 1), job.0);
+        assert_eq!(None, fixture.engine.job_for_loc(&foobar).await?);
 
         Ok(())
     }
