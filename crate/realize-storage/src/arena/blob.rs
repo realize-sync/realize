@@ -8,6 +8,7 @@ use crate::StorageError;
 use crate::types::Inode;
 use crate::utils::holder::Holder;
 use priority_queue::PriorityQueue;
+use realize_types::Arena;
 use realize_types::{ByteRange, ByteRanges, Hash};
 use redb::{ReadableTable, Table};
 use std::cmp::{Reverse, min};
@@ -157,6 +158,7 @@ pub(crate) struct WritableOpenBlob<'a> {
     blob_table: Table<'a, Inode, Holder<'static, BlobTableEntry>>,
     blob_lru_queue_table: Table<'a, u16, Holder<'static, QueueTableEntry>>,
     subsystem: &'a Blobs,
+    arena: Arena,
 
     /// If true, an after-commit has been registered to report disk usage at
     /// the end of the transaction.
@@ -169,12 +171,14 @@ impl<'a> WritableOpenBlob<'a> {
         blob_table: Table<'a, Inode, Holder<'static, BlobTableEntry>>,
         blob_lru_queue_table: Table<'a, u16, Holder<'static, QueueTableEntry>>,
         subsystem: &'a Blobs,
+        arena: Arena,
     ) -> Self {
         Self {
             before_commit,
             blob_table,
             blob_lru_queue_table,
             subsystem,
+            arena,
             will_report_disk_usage: false,
         }
     }
@@ -458,7 +462,10 @@ impl<'a> WritableOpenBlob<'a> {
         };
         self.add_to_queue_front(queue, inode, &mut entry)?;
 
-        log::debug!("Created blob {inode} {hash} in {queue:?} at {blob_path:?} -> {entry:?}");
+        log::debug!(
+            "[{arena}] Created blob {inode} {hash} in {queue:?} at {blob_path:?} -> {entry:?}",
+            arena = self.arena
+        );
         tree.insert_and_incref(inode, &mut self.blob_table, inode, Holder::new(&entry)?)?;
         Ok((inode, blob_path, entry))
     }
@@ -672,7 +679,10 @@ impl<'a> WritableOpenBlob<'a> {
         // Only mark as verified if the hash matches
         if blob_entry.content_hash == *hash {
             blob_entry.verified = true;
-            log::debug!("{inode} content verified to be {hash}");
+            log::debug!(
+                "[{arena}] {inode} content verified to be {hash}",
+                arena = self.arena
+            );
 
             self.blob_table
                 .insert(inode, Holder::with_content(blob_entry)?)?;
@@ -708,10 +718,6 @@ impl<'a> WritableOpenBlob<'a> {
             return Ok(false);
         }
         blob_entry.written_areas = blob_entry.written_areas.union(new_range);
-        log::debug!(
-            "{inode} extended by {new_range}; available: {}",
-            blob_entry.written_areas
-        );
 
         // Update disk usage if the blob file exists
         let blob_path = self.subsystem.blob_dir.join(inode.hex());
@@ -745,9 +751,10 @@ impl<'a> WritableOpenBlob<'a> {
             };
 
         log::debug!(
-            "Starting cleanup of WorkingArea with disk usage: {}, target: {}",
+            "[{arena}] Cleaning up of WorkingArea with disk usage: {}, target: {}",
             queue.disk_usage,
-            target
+            target,
+            arena = self.arena
         );
 
         let mut prev = queue.tail;
@@ -762,8 +769,9 @@ impl<'a> WritableOpenBlob<'a> {
                 continue;
             }
             log::debug!(
-                "Evicted blob from WorkingArea: {current_id} ({} bytes)",
-                current.disk_usage
+                "[{arena}] Evicted blob from WorkingArea: {current_id} ({} bytes)",
+                current.disk_usage,
+                arena = self.arena
             );
             self.remove_from_queue_update_entry(&current, &mut queue)?;
             removed_count += 1;
@@ -777,8 +785,9 @@ impl<'a> WritableOpenBlob<'a> {
         }
 
         log::debug!(
-            "Evicted {removed_count} entries from WorkingArea disk usage now {} (target: {target})",
-            queue.disk_usage
+            "[{arena}] Evicted {removed_count} entries from WorkingArea disk usage now {} (target: {target})",
+            queue.disk_usage,
+            arena = self.arena
         );
 
         if removed_count > 0 {
@@ -926,8 +935,6 @@ impl<'a> WritableOpenBlob<'a> {
             // Already at the head of its queue
             return Ok(());
         }
-
-        log::debug!("{inode} moved to the front of {:?}", blob_entry.queue);
         let queue_id = blob_entry.queue;
         let mut queue = get_queue_must_exist(&self.blob_lru_queue_table, queue_id)?;
         self.remove_from_queue_update_entry(blob_entry, &mut queue)?;
@@ -1432,7 +1439,7 @@ impl OpenBlobRefCounter {
     fn increment(&self, inode: Inode) {
         let mut guard = self.counts.lock().unwrap();
         *guard.entry(inode).or_insert(0) += 1;
-        log::debug!("Blob {} opened, ref count: {}", inode, guard[&inode]);
+        log::trace!("Blob {} opened, ref count: {}", inode, guard[&inode]);
     }
 
     /// Decrement refcount for the given inode.
@@ -1442,10 +1449,10 @@ impl OpenBlobRefCounter {
         let mut guard = self.counts.lock().unwrap();
         if let Some(count) = guard.get_mut(&inode) {
             *count = count.saturating_sub(1);
-            log::debug!("Blob {} closed, ref count: {}", inode, *count);
+            log::trace!("Blob {} closed, ref count: {}", inode, *count);
             if *count == 0 {
                 guard.remove(&inode);
-                log::debug!("Blob {} removed from open blobs", inode);
+                log::trace!("Blob {} removed from open blobs", inode);
                 return guard.is_empty();
             }
         }

@@ -3,7 +3,7 @@ use super::tree::{TreeExt, TreeLoc, TreeReadOperations};
 use super::types::{FailedJobTableEntry, RetryJob};
 use crate::Inode;
 use crate::{JobId, StorageError, utils::holder::Holder};
-use realize_types::UnixTime;
+use realize_types::{Arena, UnixTime};
 use redb::{ReadableTable, Table};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -61,6 +61,7 @@ pub(crate) struct WritableOpenDirty<'a> {
     log_table: Table<'a, u64, Inode>,
     failed_job_table: Table<'a, u64, Holder<'static, FailedJobTableEntry>>,
     counter_table: Table<'a, (), u64>,
+    arena: Arena,
 }
 
 impl<'a> WritableOpenDirty<'a> {
@@ -71,6 +72,7 @@ impl<'a> WritableOpenDirty<'a> {
         log_table: Table<'a, u64, Inode>,
         failed_job_table: Table<'a, u64, Holder<FailedJobTableEntry>>,
         counter_table: Table<'a, (), u64>,
+        arena: Arena,
     ) -> Self {
         Self {
             after_commit,
@@ -79,6 +81,7 @@ impl<'a> WritableOpenDirty<'a> {
             log_table,
             failed_job_table,
             counter_table,
+            arena,
         }
     }
 }
@@ -295,7 +298,7 @@ impl<'a> WritableOpenDirty<'a> {
     ) -> Result<(), StorageError> {
         let last_counter = self.counter_table.get(())?.map(|e| e.value()).unwrap_or(0);
         let counter = last_counter + 1;
-        log::debug!("dirty: {inode} ({reason}): {counter}");
+        log::debug!("[{}] Dirty inode {inode} ({reason}) #{counter}", self.arena);
         self.counter_table.insert((), counter)?;
         self.log_table.insert(counter, inode)?;
         let prev = self.table.insert(inode, counter)?;

@@ -200,7 +200,7 @@ impl Download {
 
         let range = ByteRange::new(next, min(end, next + bufsize));
 
-        log::debug!("Download [{}]/{} {range}", self.arena, self.path);
+        log::debug!("[{}] Download \"{}\" {range}", self.arena, self.path);
 
         let fut = {
             let household = self.household.clone();

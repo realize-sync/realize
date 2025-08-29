@@ -139,7 +139,7 @@ impl<H: JobHandler + 'static> Churten<H> {
     ///
     /// Does nothing if the jobs aren't running.
     pub(crate) fn shutdown(&mut self) {
-        log::debug!("shutting down");
+        log::debug!("Shutting down");
         if let Some((_, shutdown)) = self.task.take() {
             shutdown.cancel();
         }
@@ -159,12 +159,11 @@ async fn background_job<H: JobHandler>(
     mut peer_status: broadcast::Receiver<PeerStatus>,
     shutdown: CancellationToken,
 ) {
-    log::debug!("Collecting jobs...");
+    log::debug!("Collecting jobs");
     let mut result_stream = storage
         .job_stream()
         .map(|(arena, job_id, job)| {
             let job = Arc::new(job);
-            log::debug!("[{arena}] PENDING: {job_id} {job:?}");
             let _ = tx.send(ChurtenNotification::New {
                 arena,
                 job_id,
@@ -217,13 +216,13 @@ async fn background_job<H: JobHandler>(
                     });
                     if let Err(err) = storage.job_finished(arena, job_id, status.map_err(|err| err.into())).await {
                         // We don't want to interrupt job processing, even in this case.
-                        log::warn!("[{arena}] failed to report status of job {job_id}: {err}");
+                        log::warn!("[{arena}] Job #{job_id} Failed to report status: {err}");
                     }
                 }
             }
         });
     }
-    log::debug!("Done collecting jobs...");
+    log::debug!("Done collecting jobs");
 }
 
 async fn run_job<H: JobHandler>(
@@ -234,7 +233,7 @@ async fn run_job<H: JobHandler>(
     tx: &broadcast::Sender<ChurtenNotification>,
     shutdown: CancellationToken,
 ) -> (Arena, JobId, Result<JobStatus, JobError>) {
-    log::debug!("[{arena}] STARTING: {job_id} {job:?}");
+    log::debug!("[{arena}] Starting Job #{job_id} {job:?}");
     let _ = tx.send(ChurtenNotification::Start { arena, job_id });
     let mut progress = TxByteCountProgress::new(arena, job_id, tx.clone())
         .adaptive(BROADCAST_CHANNEL_CAPACITY)
@@ -963,7 +962,6 @@ mod tests {
                     match notification {
                         ChurtenNotification::Finish { .. } => {
                             finished_count += 1;
-                            log::debug!("Finished {finished_count}/3");
                             if finished_count == 3 {
                                 break;
                             }

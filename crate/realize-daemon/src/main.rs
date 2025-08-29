@@ -122,16 +122,13 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
 
     let server = setup.setup_server().await?;
 
-    let addr = server
+    server
         .listen(&hostport)
         .await
         .with_context(|| format!("Failed to start server on {hostport}"))?;
 
     local
         .run_until(async move {
-            log::info!("Listening on {addr}");
-            println!("Listening on {addr}");
-
             let _ = signals.next().await;
 
             log::info!("Interrupted. Shutting down..");

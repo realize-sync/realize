@@ -136,7 +136,7 @@ impl<'a> WritableOpenHistory<'a> {
     pub(crate) fn report_removed(&mut self, path: &Path, hash: &Hash) -> Result<(), StorageError> {
         let index = self.allocate_history_index()?;
         let ev = HistoryTableEntry::Remove(path.clone(), hash.clone());
-        log::debug!("[{}] History #{index}: {ev:?}", self.history.arena);
+        log::info!("[{}] History #{index}: {ev:?}", self.history.arena);
         self.table.insert(index, Holder::with_content(ev)?)?;
         Ok(())
     }
@@ -148,7 +148,7 @@ impl<'a> WritableOpenHistory<'a> {
     pub(crate) fn report_dropped(&mut self, path: &Path, hash: &Hash) -> Result<(), StorageError> {
         let index = self.allocate_history_index()?;
         let ev = HistoryTableEntry::Drop(path.clone(), hash.clone());
-        log::debug!("[{}] History #{index}: {ev:?}", self.history.arena);
+        log::info!("[{}] History #{index}: {ev:?}", self.history.arena);
         self.table.insert(index, Holder::with_content(ev)?)?;
         Ok(())
     }
@@ -168,7 +168,7 @@ impl<'a> WritableOpenHistory<'a> {
         } else {
             HistoryTableEntry::Add(path.clone())
         };
-        log::debug!("[{}] History #{index}: {ev:?}", self.history.arena);
+        log::info!("[{}] History #{index}: {ev:?}", self.history.arena);
         self.table.insert(index, Holder::with_content(ev)?)?;
 
         Ok(())

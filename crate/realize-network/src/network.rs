@@ -206,11 +206,8 @@ impl Server {
     pub async fn listen(self: &Arc<Self>, hostport: &HostPort) -> anyhow::Result<SocketAddr> {
         let listener = TcpListener::bind(hostport.addr()).await?;
         log::info!(
-            "Listening for RPC connections on {:?}",
-            listener
-                .local_addr()
-                .map(|addr| addr.to_string())
-                .unwrap_or_else(|err| err.to_string())
+            "Listening on {addr}",
+            addr = listener.local_addr()?.to_string()
         );
 
         let addr = listener.local_addr()?;
@@ -228,7 +225,7 @@ impl Server {
                             Some(strong_self) => {
                                 match strong_self.accept(stream).await {
                                     Ok(_) => {}
-                                    Err(err) => log::debug!("{peer}: connection rejected: {err}"),
+                                    Err(err) => log::debug!("@{peer} Connection rejected: {err}"),
                                 };
                             }
                             None => {
@@ -253,7 +250,7 @@ impl Server {
         if let Some(handler) = self.handlers.get(&tag) {
             (*handler)(peer, tls_stream, shutdown_rx);
         } else {
-            log::info!("Got unsupported RPC service tag '{tag:?}' from {peer}");
+            log::info!("@peer Unknown RPC service tag '{tag:?}'; Shutting down.");
             // We log this separately from generic errors, because
             // bad tags might highlight peer versioning issues.
 

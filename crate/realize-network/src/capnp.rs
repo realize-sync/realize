@@ -244,7 +244,7 @@ where
                 res = until_shutdown => {
                     if let Err(err) = res {
                         if err.kind != capnp::ErrorKind::Disconnected {
-                            log::debug!("RPC connection from {peer} failed: {err}")
+                            log::debug!("@{peer} RPC connection failed: {err}")
                         }
                     }
                 }
@@ -324,7 +324,7 @@ where
             match &mut current_backoff {
                 Some(backoff) => match backoff.next() {
                     None => {
-                        log::warn!("Giving up connecting to {peer}");
+                        log::warn!("@{peer} Giving up connecting to peer");
                         return;
                     }
                     Some(delay) => {
@@ -346,12 +346,12 @@ where
                 }
                 connected = self.networking.connect_raw(peer, self.tag) =>  match connected {
                     Ok(stream) => {
-                        log::debug!("Connected to {peer}.");
+                        log::debug!("@{peer} Connected");
 
                         stream
                     },
                     Err(err) => {
-                        log::debug!("Failed to connect to {peer}: {err}; Will retry.");
+                        log::debug!("@{peer} Failed to connect; Will retry: {err}");
                         continue;
                     }
                 }
@@ -377,7 +377,7 @@ where
                 self.tracker.unregister(peer);
             });
             if let Err(err) = self.tracker.register(peer, client).await {
-                log::debug!("Registration on {peer} failed: {err}");
+                log::debug!("@{peer} Registration failed: {err}");
                 continue;
             }
 
@@ -389,7 +389,7 @@ where
                     return;
                 }
                 res = until_shutdown => if let Err(err) = res {
-                    log::debug!("Connection to {peer} was shutdown: {err}; Will reconnect.")
+                    log::debug!("@{peer} Connection shutdown; Will reconnect: {err}")
                 },
             );
         }

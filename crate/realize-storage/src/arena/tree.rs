@@ -66,6 +66,7 @@ where
 {
     table: T,
     root: Inode,
+    arena: Arena,
 }
 
 impl<T> ReadableOpenTree<T>
@@ -76,6 +77,7 @@ where
         Self {
             table,
             root: tree.root,
+            arena: tree.arena,
         }
     }
 }
@@ -106,6 +108,9 @@ pub(crate) trait TreeReadOperations {
 
     /// Return the name {inode} can be found in in {parent_inode}.
     fn name_in(&self, parent_inode: Inode, inode: Inode) -> Result<Option<String>, StorageError>;
+
+    /// Returns the arena this tree belongs to.
+    fn arena(&self) -> Arena;
 }
 
 impl<T> TreeReadOperations for ReadableOpenTree<T>
@@ -130,6 +135,9 @@ where
     fn name_in(&self, parent_inode: Inode, inode: Inode) -> Result<Option<String>, StorageError> {
         name_in(&self.table, parent_inode, inode)
     }
+    fn arena(&self) -> Arena {
+        self.arena
+    }
 }
 
 impl<'a> TreeReadOperations for WritableOpenTree<'a> {
@@ -150,6 +158,9 @@ impl<'a> TreeReadOperations for WritableOpenTree<'a> {
     }
     fn name_in(&self, parent_inode: Inode, inode: Inode) -> Result<Option<String>, StorageError> {
         name_in(&self.table, parent_inode, inode)
+    }
+    fn arena(&self) -> Arena {
+        self.tree.arena
     }
 }
 
@@ -618,6 +629,7 @@ impl<'a> WritableOpenTree<'a> {
     fn setup_path(&mut self, path: &Path) -> Result<Inode, StorageError> {
         let (inode, added) = self.add_path(path.as_ref())?;
         if added {
+            log::debug!("[{}] \"{path}\" = inode {inode}", self.tree.arena);
             self.before_commit.add(move |txn| {
                 // Check refcount and delete the entry if it reaches
                 // 0. Note that the allocated inode is lost, so it's
@@ -643,6 +655,10 @@ impl<'a> WritableOpenTree<'a> {
         let (inode, added) = self.add_name(parent_inode, name)?;
 
         if added {
+            log::debug!(
+                "[{}] \"{name}\" = inode {inode}, in parent inode {parent_inode} ",
+                self.tree.arena
+            );
             self.before_commit.add(move |txn| {
                 // Check refcount and delete the entry if it reaches
                 // 0. Note that the allocated inode is lost, so it's
@@ -677,15 +693,10 @@ impl<'a> WritableOpenTree<'a> {
     /// Return (inode, added), with added true if the inode is new.
     fn add_name(&mut self, parent_inode: Inode, name: &str) -> Result<(Inode, bool), StorageError> {
         match get_inode(&self.table, parent_inode, name)? {
-            Some(inode) => {
-                log::debug!("found {name} in {parent_inode} -> {inode}");
-
-                Ok((inode, false))
-            }
+            Some(inode) => Ok((inode, false)),
             None => {
                 let new_inode = self.allocate_inode()?;
                 self.add_inode(parent_inode, new_inode, name)?;
-                log::debug!("add {name} in {parent_inode} -> {new_inode}");
 
                 Ok((new_inode, true))
             }
@@ -704,7 +715,10 @@ impl<'a> WritableOpenTree<'a> {
             .map(|v| v.value())
             .unwrap_or(0);
         if refcount == 0 {
-            log::debug!("Inode {inode} got its first reference");
+            log::trace!(
+                "[{}] Inode {inode} got its first reference",
+                self.tree.arena
+            );
         }
 
         refcount += 1;
@@ -742,7 +756,10 @@ impl<'a> WritableOpenTree<'a> {
             .map(|v| v.value())
             .unwrap_or(0);
         if refcount == 0 {
-            log::warn!("Refcount of {inode} was never increased; cleaning up.");
+            log::warn!(
+                "[{}] Refcount of {inode} was never increased; Cleaning up.",
+                self.tree.arena
+            );
             self.remove_mapping(inode)?;
         }
 
@@ -753,6 +770,10 @@ impl<'a> WritableOpenTree<'a> {
     ///
     /// This must only be called after checking the inode refcount.
     fn remove_mapping(&mut self, inode: Inode) -> Result<(), StorageError> {
+        log::trace!(
+            "[{}] Inode {inode} lost its last reference; Cleaning up.",
+            self.tree.arena
+        );
         self.refcount_table.remove(inode)?;
         let parent = self.table.remove((inode, ".."))?.map(|v| v.value());
         if let Some(parent) = parent {
@@ -776,7 +797,6 @@ impl<'a> WritableOpenTree<'a> {
         new_inode: Inode,
         name: &str,
     ) -> Result<(), StorageError> {
-        log::debug!("new tree node {parent_inode} {name} -> {new_inode}");
         self.table.insert((parent_inode, name), new_inode)?;
         self.table.insert((new_inode, ".."), parent_inode)?;
         self.incref(parent_inode)?;
@@ -911,7 +931,6 @@ fn resolve_path(
         if let Some(e) = tree.lookup_inode(current, component)? {
             current = e
         } else {
-            log::debug!("not found: {component} in {current}");
             return Ok(None);
         };
     }
@@ -929,7 +948,6 @@ fn resolve_path_partial(
         if let Some(e) = tree.lookup_inode(current, component)? {
             current = e
         } else {
-            log::debug!("not found: {component} in {current}");
             break;
         };
     }

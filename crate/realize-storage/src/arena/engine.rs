@@ -146,7 +146,7 @@ impl Engine {
 
         tokio::spawn(async move {
             if let Err(err) = this.build_jobs(tx).await {
-                log::warn!("[{}] failed to collect jobs: {err}", this.arena)
+                log::warn!("[{}] Failed to collect jobs: {err}", this.arena)
             }
         });
 
@@ -161,31 +161,34 @@ impl Engine {
     ) -> Result<(), StorageError> {
         match status {
             Ok(JobStatus::Done) => {
-                log::debug!("[{}] DONE: {job_id}", self.arena);
+                log::info!("[{arena}] Job #{job_id} Done", arena = self.arena);
                 self.job_done(job_id)
             }
             Ok(JobStatus::Abandoned(reason)) => {
-                log::debug!("[{}] ABANDONED: {job_id} ({reason})", self.arena);
+                log::info!("[{}] Job #{job_id} Abandoned ({reason})", self.arena);
                 self.job_done(job_id)
             }
             Ok(JobStatus::Cancelled) => {
-                log::debug!("[{}] CANCELLED: {job_id}", self.arena);
+                log::debug!("[{}] Job #{job_id} Cancelled", self.arena);
                 self.job_failed(job_id)?;
                 Ok(())
             }
             Ok(JobStatus::NoPeers) => {
-                log::debug!("[{}] MISSING PEERS: {job_id}; will retry", self.arena);
+                log::info!(
+                    "[{}] Job #{job_id} Peers offline; will retry after connection",
+                    self.arena
+                );
                 self.job_missing_peers(job_id)
             }
             Err(err) => match self.job_failed(job_id) {
                 Ok(None) => {
-                    log::warn!("[{}] FAILED; giving up: {job_id}: {err}", self.arena);
+                    log::warn!("[{}] Job #{job_id} failed; giving up: {err}", self.arena);
 
                     Ok(())
                 }
                 Ok(Some(backoff_time)) => {
                     log::debug!(
-                        "[{}] FAILED; retry after {backoff_time:?}, in {}s: {job_id}: {err}",
+                        "[{}] Job #{job_id} failed; will retry after {backoff_time:?}, in {}s: {err}",
                         self.arena,
                         backoff_time.duration_since(UnixTime::now()).as_secs()
                     );
@@ -194,7 +197,7 @@ impl Engine {
                 }
                 Err(err) => {
                     log::warn!(
-                        "[{}] FAILED; failed to reschedule: {job_id}: {err}",
+                        "[{}] Job #{job_id} Failed to reschedule; giving up: {err}",
                         self.arena
                     );
 
@@ -283,11 +286,12 @@ impl Engine {
                 let arena = self.arena;
                 move || {
                     let (job, last_counter) = this.next_job(start_counter)?;
-                    log::debug!("next_job: {job:?}, {last_counter:?}");
                     if let Some(last_counter) = last_counter
                         && last_counter > start_counter
                     {
-                        log::debug!("[{arena}] delete [{start_counter}, {last_counter})");
+                        log::debug!(
+                            "[{arena}] Cleanup dirty entries [{start_counter}, {last_counter})",
+                        );
                         this.delete_range(start_counter, last_counter)?;
                     }
 
@@ -304,7 +308,7 @@ impl Engine {
                     // Skip it for now; it'll be handled after a delay.
                     continue;
                 }
-                log::debug!("[{arena}] job {job_id} {job:?}");
+                log::debug!("[{arena}] Job #{job_id} {job:?}");
                 if tx.send((job_id, job)).await.is_err() {
                     // Broken channel; normal end of this loop
                     return Ok(());
@@ -312,7 +316,7 @@ impl Engine {
             } else {
                 // Wait for more dirty paths, then continue.
                 // Now is also a good time to retry failed jobs whose backoff period has passed.
-                log::debug!("[{arena}] waiting...");
+                log::debug!("[{arena}] Waiting for new jobs");
                 let mut jobs_to_retry = vec![];
                 tokio::select!(
                     _ = tx.closed() => {
@@ -324,7 +328,6 @@ impl Engine {
                     }
 
                     Ok(Some((backoff_until, mut jobs))) = self.wait_until_next_backoff(retry_lower_bound) => {
-                        log::debug!("[{arena}] jobs to retry: {jobs:?}");
                         jobs_to_retry.append(&mut jobs);
 
                         // From now on, only retry jobs whose backoff
@@ -336,16 +339,15 @@ impl Engine {
                     }
 
                     Ok(mut jobs) = self.jobs_to_retry_missing_peers(&mut retry_jobs_missing_peers) => {
-                        log::debug!("[{arena}] {} jobs to retry after peer connected", jobs.len());
-
                         jobs_to_retry.append(&mut jobs);
                     }
                 );
                 for counter in jobs_to_retry {
-                    let job = self.build_job_with_counter(counter).await.ok().flatten();
-                    log::debug!("[{arena}] retry {job:?}");
-                    if let Some(job) = job {
-                        if tx.send(job).await.is_err() {
+                    if let Some((job_id, job)) =
+                        self.build_job_with_counter(counter).await.ok().flatten()
+                    {
+                        log::debug!("[{arena}] Retry Job #{job_id}: {job:?}");
+                        if tx.send((job_id, job)).await.is_err() {
                             return Ok(());
                         }
                     }
@@ -388,7 +390,10 @@ impl Engine {
                         return Ok(Some((JobId(counter), job)));
                     }
                     Err(err) => {
-                        log::warn!("build job failed for {counter}:{inode}: {err:?}");
+                        log::warn!(
+                            "[{arena}] Job #{counter} failed to build job for inode {inode}: {err:?}",
+                            arena = this.arena
+                        );
                         return Ok(None);
                     }
                 }

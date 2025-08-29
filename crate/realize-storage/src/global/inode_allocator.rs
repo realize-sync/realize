@@ -110,7 +110,7 @@ impl InodeAllocator {
                 inode
             };
             self.arena_roots.insert(arena, inode);
-            log::debug!("arena root for {arena}: {inode}");
+            log::debug!("[{arena}]: Root inode {inode}");
         }
         txn.commit()?;
         Ok(())
@@ -158,7 +158,7 @@ impl InodeAllocator {
         let txn = self.db.begin_write()?;
         let ret = do_alloc_inode_range(&txn, arena_root, range_size)?;
 
-        log::debug!("new inode range for {arena}: {ret:?}");
+        log::debug!("[{arena}] Allocated inode range: {ret:?}");
         // If the transaction inside the arena cache fails to commit,
         // the range is lost. TODO: find a way of avoiding such
         // issues.

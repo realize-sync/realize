@@ -5,7 +5,7 @@ use std::time::Duration;
 use crate::StorageError;
 use crate::utils::hash::{self};
 use futures::TryStreamExt as _;
-use realize_types::{self, Hash, Path, UnixTime};
+use realize_types::{self, Arena, Hash, Path, UnixTime};
 use tokio::fs::File;
 use tokio::io::AsyncRead;
 use tokio::sync::{Semaphore, broadcast, mpsc};
@@ -34,6 +34,7 @@ pub(crate) struct HasherOptions {
 
 /// A type that puts new file into the index or remove deleted files.
 pub(crate) struct Hasher {
+    arena: Arena,
     tx: mpsc::Sender<Request>,
 }
 
@@ -44,10 +45,7 @@ impl Hasher {
         shutdown_rx: broadcast::Receiver<()>,
         options: &HasherOptions,
     ) -> Self {
-        log::debug!(
-            "[{}] Starting hasher with options {options:?}",
-            index.arena()
-        );
+        log::debug!("[{}] Setup with {options:?}", index.arena());
 
         let (tx, rx) = mpsc::channel(16);
         let sem = if options.max_parallelism > 0 {
@@ -56,6 +54,7 @@ impl Hasher {
             None
         };
 
+        let arena = index.arena();
         tokio::spawn(hasher_loop(
             root,
             index,
@@ -65,7 +64,7 @@ impl Hasher {
             options.debounce,
         ));
 
-        Self { tx }
+        Self { arena, tx }
     }
 
     /// Hash content of the given path.
@@ -79,6 +78,7 @@ impl Hasher {
         mtime: UnixTime,
         size: u64,
     ) -> anyhow::Result<()> {
+        log::info!("[{}] Hash requested for \"{path}\"", self.arena);
         Ok(self
             .tx
             .send(Request::HashFileVersion(path.clone(), mtime.clone(), size))
@@ -133,13 +133,12 @@ async fn hasher_loop(
             Some((path, verdict)) = map.join_next() => {
                 match verdict {
                    Ok(Ok(verdict)) => {
-                       log::debug!("[{arena}] {path}: hasher:  {verdict:?}");
-                       if let Err(err) = apply_verdict(&root, &index, &path, verdict).await {
-                           log::debug!("[{arena}] error updating index for {path}: {err}")
+                       if let Err(err) = apply_verdict(arena, &root, &index, &path, verdict).await {
+                           log::warn!("[{arena}] Error updating index for \"{path}\": {err}")
                        }
                    }
                     Ok(Err(err)) =>{
-                        log::debug!("[{arena}] {path}: hasher:  {err}");
+                        log::debug!("[{arena}] Error for \"{path}\": {err}");
                     }
                     Err(_) => {}
                 }
@@ -149,6 +148,7 @@ async fn hasher_loop(
 }
 
 async fn apply_verdict(
+    arena: Arena,
     root: &std::path::Path,
     index: &RealIndexAsync,
     path: &Path,
@@ -156,18 +156,26 @@ async fn apply_verdict(
 ) -> Result<(), StorageError> {
     match verdict {
         Verdict::Remove => {
+            log::info!("[{arena}] Remove: \"{path}\"");
             if !index.remove_file_if_missing(root, path).await? {
-                log::debug!("Mismatch; skipped removing {path}");
+                log::debug!(
+                    "[{arena}] Mismatch; Skipped removing \"{path}\"",
+                    arena = index.arena()
+                );
             }
 
             Ok(())
         }
         Verdict::FileContent(hash, mtime, size) => {
+            log::info!("[{arena}] Hashed: \"{path}\" {hash} size={size}");
             if !index
                 .add_file_if_matches(root, path, size, mtime, hash)
                 .await?
             {
-                log::debug!("Mismatch; skipped adding {path}");
+                log::debug!(
+                    "[{arena}] Mismatch; Skipped adding \"{path}\"",
+                    arena = index.arena()
+                );
             }
 
             Ok(())

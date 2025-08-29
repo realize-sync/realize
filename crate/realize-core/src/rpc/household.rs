@@ -443,7 +443,7 @@ impl PeerConnectionTracker {
             .into_client(),
         );
         if let Err(err) = request.send().promise.await {
-            log::debug!("Failed to share local store with {peer}: {err:?}",);
+            log::debug!("@{peer} ConnectedPeer::register failed: {err:?}",);
         }
     }
 }
@@ -482,11 +482,11 @@ impl TrackedClientMap {
     }
 
     fn unregister(&self, peer: Peer, side: Side) {
-        log::debug!("Store for {peer} ({side:?}) has become unavailable",);
+        log::debug!("@{peer} Store has become unavailable ({side:?}) ",);
         let was_connected = self.is_connected(peer);
         self.stores(side).borrow_mut().remove(&peer);
         if was_connected && !self.is_connected(peer) {
-            log::debug!("Disconnected: {peer}");
+            log::info!("@{peer} Peer has become unavailable");
             let _ = self.connection_tx.send(PeerStatus::Disconnected(peer));
         }
     }
@@ -498,11 +498,12 @@ impl TrackedClientMap {
         storage: &Arc<Storage>,
         side: Side,
     ) -> Result<(), capnp::Error> {
-        log::debug!("Store for {peer} ({side:?}) now available.");
-        let batch_store = if let Some(bytes_per_second) = self.batch_rate_limits.get(&peer) {
-            log::debug!(
-                "Rate-limiting batch calls from {peer} ({side:?}), rate-limit={bytes_per_second}",
-            );
+        let batch_rate_limit = self.batch_rate_limits.get(&peer);
+        log::debug!(
+            "@{peer} Store has become available ({side:?}, batch-rate-limit={:?})",
+            batch_rate_limit
+        );
+        let batch_store = if let Some(bytes_per_second) = batch_rate_limit {
             let mut request = store.with_rate_limit_request();
             request.get().set_rate_limit(*bytes_per_second);
             let reply = request.send().promise.await?;
@@ -518,12 +519,12 @@ impl TrackedClientMap {
             .borrow_mut()
             .insert(peer, TrackedClients { store, batch_store });
         if !was_connected {
-            log::debug!("Connected: {peer}");
+            log::debug!("@{peer} Peer has become available");
             let _ = self.connection_tx.send(PeerStatus::Connected(peer));
         }
 
         if let Err(err) = subscribe_self(storage, peer, store_for_subscribe).await {
-            log::warn!("Failed to subscribe to {peer}: {err}");
+            log::warn!("@{peer} ConnectedPeer::subscribe failed: {err}");
         }
 
         Ok(())
@@ -618,7 +619,7 @@ async fn execute_read(
             return Err(HouseholdOperationError::NoPeers);
         }
     };
-    log::debug!("Reading [{arena}]/{path} from {peer}");
+    log::debug!("[{arena}]@{peer} Downloading \"{path}\"");
 
     let mut request = store.read_request();
     let mut builder = request.get();
@@ -650,7 +651,7 @@ async fn execute_rsync(
         }
     };
     log::debug!(
-        "Rsyncing [{arena}]/{path} {range} with {peer} ({} bytes in)",
+        "[{arena}]@{peer} Rsyncing \"{path}\" {range} ({} bytes in)",
         sig.0.len()
     );
 
@@ -663,7 +664,7 @@ async fn execute_rsync(
     let reply = request.send().promise.await?;
     let delta = Delta(reply.get()?.get_res()?.get_delta()?.into());
     log::debug!(
-        "Rsynced [{arena}]/{path} {range} with {peer} ({} bytes out)",
+        "[{arena}]@{peer} Rsynced \"{path}\" {range} ({} bytes out)",
         delta.0.len()
     );
 
@@ -762,7 +763,14 @@ async fn subscribe_self(
     let reply = request.send().promise.await?;
     let arenas = reply.get()?.get_arenas()?;
     let peer_arenas = parse_arena_set(arenas)?;
-    log::debug!("{peer} arenas: {peer_arenas:?}");
+    log::debug!(
+        "@{peer} Arenas: {}",
+        peer_arenas
+            .iter()
+            .map(|a| a.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
     let goal_arenas = cache
         .arenas()
@@ -771,21 +779,16 @@ async fn subscribe_self(
         .collect::<Vec<_>>();
     if goal_arenas.is_empty() {
         log::debug!(
-            "Not subscribing to {peer}: no common arena. {:?} vs {:?}",
+            "@{peer} No common arenas. peer: {:?} vs local: {:?}",
             peer_arenas,
             cache.arenas().collect::<Vec<_>>(),
         );
 
         return Ok(());
     }
-    log::debug!(
-        "Subscribe to {} on {peer}",
-        goal_arenas
-            .iter()
-            .map(|a| a.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    for arena in &goal_arenas {
+        log::debug!("[{arena}]@{peer} Tracking")
+    }
     let mut progress = tokio::spawn({
         let goal_arenas = goal_arenas.clone();
         let cache = cache.clone();
@@ -936,7 +939,7 @@ impl StoreServer {
 
         let peer = self.peer;
         let limiter = self.limiter.clone();
-        log::debug!("{peer} subscribed to notifications from {arena}",);
+        log::debug!("[{arena}]@{peer} Will report local changes to peer",);
         tokio::task::spawn_local(async move {
             let mut notifications = Vec::new();
             loop {
@@ -945,7 +948,7 @@ impl StoreServer {
                     // Channel has been closed
                     return;
                 }
-                log::debug!("notify {peer}: {notifications:?}");
+                log::trace!("[{arena}@{peer}] Notify: {notifications:?}");
 
                 let mut request = subscriber.notify_request();
                 let mut builder = request.get().init_notifications(notifications.len() as u32);
@@ -1092,10 +1095,7 @@ impl store::Server for StoreServer {
             return Promise::err(capnp::Error::failed("invalid rate limit".to_string()));
         }
 
-        log::debug!(
-            "Created rate-limited store for {}, rate-limit={rate_limit}",
-            self.peer
-        );
+        log::debug!("@{} Rate-limiting batch access: {rate_limit}", self.peer);
         results.get().set_store(
             StoreServer {
                 peer: self.peer,

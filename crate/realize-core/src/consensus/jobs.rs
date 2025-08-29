@@ -202,10 +202,12 @@ pub(crate) async fn verify(
     });
     if content_hash == *hash {
         blob.mark_verified().await?;
-        log::debug!("[{arena}]/{path} verified against {hash}");
+        log::debug!("[{arena}] Verified \"{path}\" against {hash}");
         return Ok(JobStatus::Done);
     }
-    log::debug!("[{arena}]/{path} {hash}: inconsistent content hash {content_hash}; repairing");
+    log::debug!(
+        "[{arena}] Inconsistent hash for \"{path}\"; Repairing. Expected {hash}, got {content_hash}."
+    );
 
     // repair
     progress.update_action(JobAction::Repair);
@@ -254,12 +256,12 @@ pub(crate) async fn verify(
     });
     if content_hash != *hash {
         log::debug!(
-            "[{arena}]/{path} {hash}: inconsistent content hash {content_hash} after repair"
+            "[{arena}] Inconsistent hash after repair for \"{path}\"; Giving up. Expected {hash}, got {content_hash}"
         );
         return Err(JobError::InconsistentHash);
     }
     blob.mark_verified().await?;
-    log::debug!("[{arena}]/{path} fixed and verified against {hash}");
+    log::debug!("[{arena}] Fixed and verified \"{path}\" {hash}");
 
     Ok(JobStatus::Done)
 }

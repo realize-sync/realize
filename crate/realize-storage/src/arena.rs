@@ -60,14 +60,27 @@ impl ArenaStorage {
             .with_context(|| format!("database {:?}", arena_config.db))?;
         let arena_cache = ArenaCache::new(arena, Arc::clone(&db), &arena_config.blob_dir)?;
         let indexed = match arena_config.root.as_ref() {
-            None => None,
+            None => {
+                log::info!("[{arena}] Arena setup for caching");
+
+                None
+            }
             Some(root) => {
+                log::info!("[{arena}] Arena setup with root {root:?}");
+
                 let index = RealIndexAsync::new(Arc::clone(&db));
                 let exclude = exclude
                     .iter()
                     .filter_map(|p| realize_types::Path::from_real_path_in(p, root))
                     .collect::<Vec<_>>();
-                log::debug!("Watch {root:?}, excluding {exclude:?}");
+                log::info!(
+                    "[{arena}] Watching {root:?}{}",
+                    exclude
+                        .iter()
+                        .map(|p| format!(" -\"{p}\""))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
                 let watcher = RealWatcher::builder(root, index.clone())
                     .with_initial_scan()
                     .exclude_all(exclude.iter())

@@ -126,23 +126,24 @@ impl RealWatcher {
         hasher_options: HasherOptions,
     ) -> anyhow::Result<Self> {
         let root = fs::canonicalize(&root).await?;
-        let arena = index.arena().clone();
+        let arena = index.arena();
 
         let (watch_tx, watch_rx) = mpsc::channel(100);
 
         let watcher = {
             let root = root.clone();
             let watch_tx = watch_tx.clone();
+            let exclude = exclude.clone();
             tokio::task::spawn_blocking(move || {
                 let mut watcher = notify::recommended_watcher({
                     let root = root.clone();
-
                     move |ev: Result<Event, notify::Error>| {
                         if let Ok(ev) = ev {
+                            log::trace!("[{arena}] Notify event: {ev:?}");
                             if ev.flag() == Some(notify::event::Flag::Rescan) {
                                 let _ = watch_tx.blocking_send(FsEvent::Rescan);
                             }
-                            if let Some(ev) = FsEvent::from_notify(&root, ev) {
+                            if let Some(ev) = FsEvent::from_notify(&root, &exclude, ev) {
                                 let _ = watch_tx.blocking_send(ev);
                             }
                         }
@@ -150,7 +151,6 @@ impl RealWatcher {
                 })?;
                 watcher.configure(notify::Config::default().with_follow_symlinks(false))?;
                 watcher.watch(&root, notify::RecursiveMode::Recursive)?;
-                log::debug!("[{}] Watching {root:?} recursively.", arena);
 
                 Ok::<RecommendedWatcher, notify::Error>(watcher)
             })
@@ -241,48 +241,46 @@ enum FsEvent {
 
 impl FsEvent {
     /// Create a [FsEvent] from a [notify::Event]
-    fn from_notify<P>(root: P, ev: Event) -> Option<Self>
-    where
-        P: AsRef<std::path::Path>,
-    {
-        let root = root.as_ref();
+    fn from_notify(root: &std::path::Path, exclude: &Vec<Path>, ev: Event) -> Option<Self> {
         match ev.kind {
-            EventKind::Remove(_) => take_path(root, ev).map(|p| FsEvent::Removed(p)),
+            EventKind::Remove(_) => take_path(root, exclude, ev).map(|p| FsEvent::Removed(p)),
             EventKind::Create(CreateKind::Folder) => {
-                take_path(root, ev).map(|p| FsEvent::DirCreated(p))
+                take_path(root, exclude, ev).map(|p| FsEvent::DirCreated(p))
             }
             EventKind::Create(CreateKind::File) => {
-                take_path(root, ev).map(|p| FsEvent::FileCreated(p))
+                take_path(root, exclude, ev).map(|p| FsEvent::FileCreated(p))
             }
             EventKind::Modify(ModifyKind::Name(_)) => Some(FsEvent::Moved(
                 ev.paths
                     .into_iter()
                     .flat_map(|p| Path::from_real_path_in(&p, root))
+                    .filter(|p| !p.matches_any(exclude))
                     .collect(),
             )),
             EventKind::Modify(ModifyKind::Metadata(
                 MetadataKind::Permissions | MetadataKind::Ownership | MetadataKind::Any,
-            )) => take_path(root, ev).map(|p| FsEvent::MetadataChanged(p)),
+            )) => take_path(root, exclude, ev).map(|p| FsEvent::MetadataChanged(p)),
 
             #[cfg(target_os = "linux")]
             EventKind::Access(notify::event::AccessKind::Close(
                 notify::event::AccessMode::Write,
-            )) => take_path(root, ev).map(|p| FsEvent::ContentModified(p)),
+            )) => take_path(root, exclude, ev).map(|p| FsEvent::ContentModified(p)),
             #[cfg(target_os = "macos")]
             EventKind::Modify(ModifyKind::Data(_)) => {
-                take_path(root, ev).map(|p| FsEvent::ContentModified(p))
+                take_path(root, exclude, ev).map(|p| FsEvent::ContentModified(p))
             }
             _ => None,
         }
     }
 }
 
-fn take_path<P>(root: P, mut ev: Event) -> Option<Path>
-where
-    P: AsRef<std::path::Path>,
-{
-    let root = root.as_ref();
-    Path::from_real_path_in(&ev.paths.pop()?, root)
+fn take_path(root: &std::path::Path, exclude: &Vec<Path>, mut ev: Event) -> Option<Path> {
+    if let Some(p) = Path::from_real_path_in(&ev.paths.pop()?, root)
+        && !p.matches_any(exclude)
+    {
+        return Some(p);
+    }
+    None
 }
 
 struct RealWatcherWorker {
@@ -308,7 +306,6 @@ impl RealWatcherWorker {
     ) {
         let arena = self.index.arena();
         loop {
-            log::debug!("[{arena}] Scanner idle");
             tokio::select!(
             _ = shutdown_rx.recv() =>{
                 return;
@@ -319,17 +316,20 @@ impl RealWatcherWorker {
                 }
                 // run scan, below
             });
-            log::debug!("[{arena}] Scanning starts");
+            let root = &self.root;
+            log::info!("[{arena}] Scanning {root:?}");
             if let Err(err) = self.rescan_added(&watch_tx, &mut shutdown_rx).await {
-                log::warn!("[{arena}] Scanning for added files failed: {err}");
+                log::warn!("[{arena}] Scanning {root:?} for added files failed: {err}");
             }
             if let Err(err) = self
                 .rescan_removed_or_modified(&watch_tx, &mut shutdown_rx)
                 .await
             {
-                log::warn!("[{arena}] Scanning for modified or removed files failed: {err}",);
+                log::warn!(
+                    "[{arena}] Scanning {root:?} for modified or removed files failed: {err}",
+                );
             }
-            log::debug!("[{arena}] Scanning finished");
+            log::info!("[{arena}] Finished scanning {root:?}");
         }
     }
 
@@ -356,7 +356,7 @@ impl RealWatcherWorker {
 
                 let mut is_deleted = false;
                 let mut is_modified = false;
-                if self.is_excluded(&path) {
+                if path.matches_any(&self.exclude) {
                     // If the file is now to be excluded, delete it
                     // from the index.
                     is_deleted = true;
@@ -428,7 +428,7 @@ impl RealWatcherWorker {
                 }
 
                 // Skip if the file is to be excluded
-                if self.is_excluded(&path) {
+                if path.matches_any(&self.exclude) {
                     continue;
                 }
 
@@ -584,7 +584,6 @@ impl RealWatcherWorker {
     }
 
     async fn file_or_dir_removed(&self, path: &Path) -> anyhow::Result<()> {
-        log::debug!("Direct removal of {path}");
         self.index.remove_file_or_dir(&path).await?;
 
         Ok(())
@@ -627,7 +626,7 @@ impl RealWatcherWorker {
             };
 
             if let Err(err) = self.file_created_or_modified(&path, &m).await {
-                log::debug!("[{}] Failed to add {path}: {err}", self.index.arena());
+                log::debug!("[{}] Failed to add \"{path}\": {err}", self.index.arena());
             }
         }
 
@@ -639,8 +638,7 @@ impl RealWatcherWorker {
         path: &Path,
         m: &Metadata,
     ) -> Result<(), anyhow::Error> {
-        // Skip if the file is to be excluded from the index.
-        if self.is_excluded(path) {
+        if path.matches_any(&self.exclude) {
             return Ok(());
         }
 
@@ -654,7 +652,7 @@ impl RealWatcherWorker {
         {
             return Ok(());
         }
-        log::debug!("[{}] Requesting hash of {path}", self.index.arena());
+        log::info!("[{}] Requested: \"{path}\"", self.index.arena());
         self.hasher.hash_content(path, mtime, size).await?;
 
         Ok(())
@@ -669,11 +667,6 @@ impl RealWatcherWorker {
         // TODO: Should this use a PathResolver? We may or may not want
         // to care about partial/full files here.
         realize_types::Path::from_real_path_in(&path, &self.root)
-    }
-
-    /// Check whether the given path should be excluded from the index.
-    fn is_excluded(&self, path: &realize_types::Path) -> bool {
-        self.exclude.iter().any(|e| path.starts_with(e))
     }
 }
 
@@ -1323,7 +1316,10 @@ mod tests {
                 // The inotify backend won't start if a subdirectory
                 // is inacessible.
                 // TODO: fix it
-                log::warn!("FIXME: Watch with an inaccessible subdir failed: {err}");
+                log::warn!(
+                    "[{arena}] FIXME: Watch with an inaccessible subdir failed: {err}",
+                    arena = fixture.index.arena()
+                );
                 return Ok(());
             }
         };

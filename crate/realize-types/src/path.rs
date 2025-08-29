@@ -133,6 +133,12 @@ impl Path {
 
         false
     }
+
+    /// Returns true if any member of `paths` starts with or is the
+    /// same as this path.
+    pub fn matches_any(&self, paths: &Vec<Path>) -> bool {
+        paths.iter().any(|e| self.starts_with(e))
+    }
 }
 
 impl AsRef<Path> for Path {

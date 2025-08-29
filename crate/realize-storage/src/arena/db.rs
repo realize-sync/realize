@@ -440,6 +440,7 @@ impl<'db> ArenaWriteTransaction<'db> {
             self.inner.open_table(DIRTY_LOG_TABLE)?,
             self.inner.open_table(FAILED_JOB_TABLE)?,
             self.inner.open_table(DIRTY_COUNTER_TABLE)?,
+            self.arena,
         ))
     }
     #[allow(dead_code)]
@@ -504,6 +505,7 @@ impl<'db> ArenaWriteTransaction<'db> {
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
             self.inner.open_table(BLOB_LRU_QUEUE_TABLE)?,
             &self.subsystems.blobs,
+            self.arena,
         ))
     }
 

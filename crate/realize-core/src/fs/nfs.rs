@@ -23,14 +23,10 @@ pub async fn export(
     downloader: Downloader,
     addr: SocketAddr,
 ) -> std::io::Result<JoinHandle<std::io::Result<()>>> {
-    log::debug!("Listening to {addr}");
     let listener =
         NFSTcpListener::bind(&addr.to_string(), UnrealFs::new(cache, downloader)).await?;
 
-    Ok(tokio::spawn(async move {
-        log::debug!("Running listener to {addr}");
-        listener.handle_forever().await
-    }))
+    Ok(tokio::spawn(async move { listener.handle_forever().await }))
 }
 
 struct UnrealFs {

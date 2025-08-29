@@ -21,7 +21,7 @@ pub(crate) async fn run_loop(
         let usage = rx.borrow_and_update().clone();
         if let Err(err) = check_limits_async(&db, &limits, usage).await {
             log::warn!(
-                "[{}] failed to enforce disk usage limits: {err:?}",
+                "[{}] Failed to enforce disk usage limits: {err:?}",
                 db.arena()
             )
         }
@@ -81,11 +81,6 @@ fn check_limits(
     );
 
     if usage.total >= byte_limit + tolerance {
-        log::info!(
-            "[{arena}] {:?} exceeds limit {byte_limit} bytes + tolerance {tolerance} bytes",
-            usage,
-        );
-
         // Calculate target for cleanup. The target should be
         // effective_limit - tolerance, but we need to account for
         // non-evictable usage.
@@ -95,7 +90,7 @@ fn check_limits(
 
         if evictable_target < usage.evictable {
             log::debug!(
-                "[{arena}] Triggering cleanup of {} evictable bytes out of {} to target {evictable_target} bytes",
+                "[{arena}] Will cleanup {} evictable bytes out of {} to target {evictable_target} bytes",
                 usage.evictable,
                 usage.total,
             );

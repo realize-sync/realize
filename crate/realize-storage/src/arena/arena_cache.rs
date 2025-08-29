@@ -232,12 +232,14 @@ impl<'a> WritableOpenCache<'a> {
         hash: Hash,
     ) -> Result<(), StorageError> {
         let (_, file_inode) = create_file(&mut self.table, tree, &path)?;
-        let entry = FileTableEntry::new(path, size, mtime, hash);
+        let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
         if get_file_entry(&self.table, file_inode, Some(peer))?.is_none() {
+            log::debug!("[{}]@{peer} Add \"{path}\" {hash} size={size}", self.arena);
             self.write_file_entry(file_inode, peer, &entry)?;
         }
         Ok(
             if get_file_entry(&self.table, file_inode, None)?.is_none() {
+                log::debug!("[{}] Add \"{path}\" {hash} size={size}", self.arena);
                 self.write_default_file_entry(tree, blobs, dirty, file_inode, &entry)?;
             },
         )
@@ -261,11 +263,19 @@ impl<'a> WritableOpenCache<'a> {
         if let Some(e) = get_file_entry(&self.table, file_inode, Some(peer))?
             && e.hash == *old_hash
         {
+            log::debug!(
+                "[{}]@{peer} \"{path}\" {hash} size={size} replaces {old_hash}",
+                self.arena
+            );
             self.write_file_entry(file_inode, peer, &entry)?;
         }
         if let Some(old_entry) = get_file_entry(&self.table, file_inode, None)?
             && old_entry.hash == *old_hash
         {
+            log::debug!(
+                "[{}] \"{path}\" {hash} size={size} replaces {old_hash}",
+                self.arena
+            );
             self.write_default_file_entry(tree, blobs, dirty, file_inode, &entry)?;
         }
         Ok(())
@@ -362,7 +372,7 @@ impl<'a> WritableOpenCache<'a> {
         entry: &FileTableEntry,
     ) -> Result<(), StorageError> {
         log::debug!(
-            "[{}] new file entry {:?} {file_inode} on {peer} {}",
+            "[{}]@{peer} New file entry \"{:?}\" inode {file_inode} {}",
             self.arena,
             entry.path,
             entry.hash
@@ -474,9 +484,20 @@ impl<'a> WritableOpenCache<'a> {
         let new_entry = peer_entries.into_iter().max_by_key(|e| e.mtime);
         match new_entry {
             Some(new_entry) => {
+                log::debug!(
+                    "[{}] Falling back on {} for inode {inode}",
+                    self.arena,
+                    new_entry.hash,
+                );
+
                 self.write_default_file_entry(tree, blobs, dirty, inode, &new_entry)?;
             }
             None => {
+                log::debug!(
+                    "[{}] Removing inode {inode} from cache (no versions left)",
+                    self.arena,
+                );
+
                 self.before_default_file_entry_change(tree, blobs, dirty, inode)?;
                 tree.remove_and_decref(inode, &mut self.table, CacheTableKey::Default(inode))?;
 
@@ -523,6 +544,11 @@ impl<'a> WritableOpenCache<'a> {
                 if let Some(e) = get_file_entry(&self.table, inode, Some(peer))?
                     && e.hash == old_hash
                 {
+                    log::debug!(
+                        "[{}]@{peer} Remove \"{path}\" inode {inode} {old_hash}",
+                        self.arena
+                    );
+
                     self.rm_file_entry(tree, blobs, dirty, parent_inode, inode, peer)?;
                 }
             }
@@ -625,7 +651,7 @@ fn file_availability(
         }
     }
     if peers.is_empty() {
-        log::warn!("No peer has hash {hash} for {inode}");
+        log::warn!("[{arena}] No peer has hash {hash} for {inode}",);
         return Err(StorageError::NotFound);
     }
 
@@ -781,7 +807,10 @@ impl ArenaCache {
         notification: Notification,
         index_root: Option<&std::path::Path>,
     ) -> Result<(), StorageError> {
-        log::debug!("notification from {peer}: {notification:?}");
+        log::trace!(
+            "[{arena}]@{peer} Notification: {notification:?}",
+            arena = self.arena
+        );
         // UnrealCache::update, is responsible for dispatching properly
         assert_eq!(self.arena, notification.arena());
 

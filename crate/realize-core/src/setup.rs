@@ -35,13 +35,22 @@ impl SetupHelper {
 
         let networking = Networking::from_config(&config.network.peers, privkey)?;
         let storage = Storage::from_config(&config.storage).await?;
-        log::debug!(
-            "Storage: Cached {:?}",
-            storage.cache().arenas().collect::<Vec<_>>()
+        log::info!(
+            "Cached arenas: {:?}",
+            storage
+                .cache()
+                .arenas()
+                .map(|a| a.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
-        log::debug!(
-            "Storage: Indexed {:?}",
-            storage.indexed_arenas().collect::<Vec<_>>()
+        log::info!(
+            "Indexed arenas: {:?}",
+            storage
+                .indexed_arenas()
+                .map(|a| a.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         let household = Household::spawn(local, networking.clone(), storage.clone())?;
 
@@ -62,6 +71,7 @@ impl SetupHelper {
 
         nfs::export(Arc::clone(cache), downloader, addr).await?;
 
+        log::info!("NFS filesystem available on {addr:?}");
         Ok(())
     }
 
@@ -71,7 +81,10 @@ impl SetupHelper {
     pub async fn export_fuse(&self, mountpoint: &std::path::Path) -> anyhow::Result<FuseHandle> {
         let cache = self.storage.cache();
         let downloader = Downloader::new(self.household.clone(), cache.clone());
-        fuse::export(Arc::clone(self.storage.cache()), downloader, mountpoint)
+        let handle = fuse::export(Arc::clone(self.storage.cache()), downloader, mountpoint)?;
+        log::info!("FUSE filesystem mounted on {mountpoint:?}");
+
+        Ok(handle)
     }
 
     /// Bind to a UNIX socket that allows the owning user to control the server
@@ -108,7 +121,7 @@ impl SetupHelper {
         .await
         .with_context(|| format!("binding socket at {path:?}"))?;
 
-        log::debug!("Control socket available at {path:?}");
+        log::info!("Control socket created at {path:?}");
 
         Ok(token)
     }
@@ -166,24 +179,21 @@ fn check_dirs(arenas: &HashMap<Arena, ArenaConfig>) -> anyhow::Result<()> {
         // Check root directory if specified
         if let Some(root) = &config.root {
             if !root.exists() {
-                anyhow::bail!("[{arena}] {}: arena root not found", root.display());
+                anyhow::bail!("[{arena}] Arena root not found: {root:?}");
             }
 
             check_is_accessible_dir(root, arena, "arena root")?;
             if !is_writable_dir(root) {
-                log::warn!("[{arena}/{}]: arena root not writable", root.display());
+                log::warn!("[{arena}] Arena root not writable: {root:?}");
             }
         }
 
         // Check blob_dir (required)
         let blob_dir = &config.blob_dir;
         if !blob_dir.exists() {
-            log::debug!("[{arena}] {}: will create blob dir", blob_dir.display());
+            log::debug!("[{arena}] Blob dir missing; will create: {blob_dir:?}");
             if let Err(e) = std::fs::create_dir_all(blob_dir) {
-                anyhow::bail!(
-                    "[{arena}] {}: cannot create blob dir: {e:?}",
-                    blob_dir.display()
-                );
+                anyhow::bail!("[{arena}] Failed to create blob dir {blob_dir:?}: {e:?}",);
             }
         }
         check_is_accessible_dir(blob_dir, arena, "blob dir")?;

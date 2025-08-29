@@ -243,21 +243,21 @@ impl ChurtenDisplay {
                     match progress {
                         JobProgress::Pending => {}
                         JobProgress::Running => {
-                            log::info!("START: {}", format_log_string(job));
+                            log::info!("{}", format_log_string(job, "Start "));
                         }
                         JobProgress::Done => {
-                            log::info!("DONE: {}", format_log_string(job));
+                            log::info!("{}", format_log_string(job, "Done "));
                         }
                         JobProgress::Failed(msg) => {
-                            log::warn!("FAIL: {msg}: {}", format_log_string(job));
+                            log::warn!("{}: {msg}", format_log_string(job, "Failed "));
                         }
                         _ => {
-                            log::warn!("{progress:?}: {}", format_log_string(job));
+                            log::warn!("{}", format_log_string(job, &format!("{progress:?} ")));
                         }
                     };
                 }
                 ChurtenNotification::UpdateAction { action, .. } => {
-                    log::info!("{action:?} {}", format_log_string(job));
+                    log::info!("{}", format_log_string(job, &format!("{action:?} ")));
                 }
                 ChurtenNotification::UpdateByteCount { .. } => {}
             }
@@ -276,17 +276,17 @@ fn log_jobs(jobs: &Vec<JobInfo>, total: usize) {
             } else {
                 "".to_string()
             },
-            format_log_string(job)
+            format_log_string(job, "")
         );
     }
 }
 
-fn format_log_string(job: &JobInfo) -> String {
+fn format_log_string(job: &JobInfo, prefix: &str) -> String {
     format!(
-        "[{}]/{} {} {}",
+        "[{}] {prefix}{} {} {}",
         job.arena,
-        job.job.path(),
         in_progress_job_name(job),
+        job.job.path(),
         job.job.hash(),
     )
 }

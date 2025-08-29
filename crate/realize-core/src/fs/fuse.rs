@@ -21,7 +21,6 @@ pub fn export(
     };
     let bgsession =
         fuser::spawn_mount2(fs, mountpoint, &[MountOption::AutoUnmount, MountOption::RO])?;
-    log::info!("FUSE filesystem mounted on {mountpoint:?}");
 
     Ok(FuseHandle { inner: bgsession })
 }
