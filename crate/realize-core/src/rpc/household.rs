@@ -519,7 +519,7 @@ impl TrackedClientMap {
             .borrow_mut()
             .insert(peer, TrackedClients { store, batch_store });
         if !was_connected {
-            log::debug!("@{peer} Peer has become available");
+            log::info!("@{peer} Peer has become available");
             let _ = self.connection_tx.send(PeerStatus::Connected(peer));
         }
 
