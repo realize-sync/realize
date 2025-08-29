@@ -1,7 +1,7 @@
 #![allow(dead_code)] // in progress
 use crate::fs::downloader::Downloader;
 use fuser::{Filesystem, MountOption};
-use nix::{errno::Errno, libc::c_int};
+use nix::libc::c_int;
 use realize_storage::{FileMetadata, GlobalCache, Inode, InodeAssignment, StorageError};
 use std::ffi::OsString;
 use std::{sync::Arc, time::Duration};
@@ -54,6 +54,11 @@ impl FuseHandle {
         let Self { inner } = self;
         tokio::task::spawn_blocking(move || inner.join()).await
     }
+
+    /// Unmount the filesystem and wait for the fuse run loop to stop.
+    pub fn join_blocking(self) {
+        self.inner.join();
+    }
 }
 
 struct RealizeFs {
@@ -91,7 +96,7 @@ impl Filesystem for RealizeFs {
 
         self.handle.spawn(async move {
             match do_lookup(cache, parent, name).await {
-                Err(err) => reply.error(err.into_errno()),
+                Err(err) => reply.error(err.log_and_convert()),
                 Ok(attr) => reply.entry(&Duration::from_secs(1), &attr, 0),
             }
         });
@@ -116,7 +121,7 @@ impl Filesystem for RealizeFs {
 
         self.handle.spawn(async move {
             match do_getattr(cache, ino).await {
-                Err(err) => reply.error(err.into_errno()),
+                Err(err) => reply.error(err.log_and_convert()),
                 Ok(attr) => reply.attr(&Duration::from_secs(1), &attr),
             }
         });
@@ -146,7 +151,7 @@ impl Filesystem for RealizeFs {
 
         self.handle.spawn(async move {
             match do_read(downloader, ino, offset, size).await {
-                Err(err) => reply.error(err.into_errno()),
+                Err(err) => reply.error(err.log_and_convert()),
                 Ok(data) => reply.data(&data),
             }
         });
@@ -187,7 +192,7 @@ impl Filesystem for RealizeFs {
 
         self.handle.spawn(async move {
             match do_readdir(cache, ino, offset, &mut reply).await {
-                Err(err) => reply.error(err.into_errno()),
+                Err(err) => reply.error(err.log_and_convert()),
                 Ok(()) => reply.ok(),
             }
         });
@@ -451,26 +456,66 @@ enum FuseError {
 }
 
 impl FuseError {
-    fn into_errno(self) -> c_int {
-        log::debug!("FUSE operation error: {self:?}");
-
-        match self {
-            FuseError::Cache(err) => storage_errno(err),
+    /// Return a libc error code to represent this error, fuse-side.
+    fn errno(&self) -> c_int {
+        match &self {
+            FuseError::Cache(err) => io_errno(err.io_kind()),
             FuseError::Utf8 => nix::libc::EINVAL,
-            FuseError::Io(ioerr) => io_errno(ioerr),
+            FuseError::Io(ioerr) => io_errno(ioerr.kind()),
         }
+    }
+
+    /// Convert into a libc error code.
+    fn log_and_convert(self) -> c_int {
+        let errno = self.errno();
+
+        log::debug!("FUSE operation error: {self:?} -> {errno}");
+
+        errno
     }
 }
 
-fn storage_errno(err: StorageError) -> c_int {
-    io_errno(err.into())
-}
-
-fn io_errno(err: std::io::Error) -> c_int {
-    if let Ok(errno) = <std::io::Error as TryInto<Errno>>::try_into(err) {
-        errno as c_int
-    } else {
-        nix::libc::EIO
+/// Convert a Rust [std::io::ErrorKind] into a libc error code.
+fn io_errno(kind: std::io::ErrorKind) -> c_int {
+    match kind {
+        std::io::ErrorKind::NotFound => nix::libc::ENOENT,
+        std::io::ErrorKind::PermissionDenied => nix::libc::EACCES,
+        std::io::ErrorKind::ConnectionRefused => nix::libc::ECONNREFUSED,
+        std::io::ErrorKind::ConnectionReset => nix::libc::ECONNRESET,
+        std::io::ErrorKind::HostUnreachable => nix::libc::EHOSTUNREACH,
+        std::io::ErrorKind::NetworkUnreachable => nix::libc::ENETUNREACH,
+        std::io::ErrorKind::ConnectionAborted => nix::libc::ECONNABORTED,
+        std::io::ErrorKind::NotConnected => nix::libc::ENOTCONN,
+        std::io::ErrorKind::AddrInUse => nix::libc::EADDRINUSE,
+        std::io::ErrorKind::AddrNotAvailable => nix::libc::EADDRNOTAVAIL,
+        std::io::ErrorKind::NetworkDown => nix::libc::ENETDOWN,
+        std::io::ErrorKind::BrokenPipe => nix::libc::EPIPE,
+        std::io::ErrorKind::AlreadyExists => nix::libc::EEXIST,
+        std::io::ErrorKind::WouldBlock => nix::libc::EAGAIN,
+        std::io::ErrorKind::NotADirectory => nix::libc::ENOTDIR,
+        std::io::ErrorKind::IsADirectory => nix::libc::EISDIR,
+        std::io::ErrorKind::DirectoryNotEmpty => nix::libc::ENOTEMPTY,
+        std::io::ErrorKind::ReadOnlyFilesystem => nix::libc::EROFS,
+        std::io::ErrorKind::StaleNetworkFileHandle => nix::libc::ESTALE,
+        std::io::ErrorKind::InvalidInput => nix::libc::EINVAL,
+        std::io::ErrorKind::InvalidData => nix::libc::EINVAL,
+        std::io::ErrorKind::TimedOut => nix::libc::ETIMEDOUT,
+        std::io::ErrorKind::WriteZero => nix::libc::EIO,
+        std::io::ErrorKind::StorageFull => nix::libc::ENOSPC,
+        std::io::ErrorKind::NotSeekable => nix::libc::ESPIPE,
+        std::io::ErrorKind::QuotaExceeded => nix::libc::EDQUOT,
+        std::io::ErrorKind::FileTooLarge => nix::libc::EFBIG,
+        std::io::ErrorKind::ResourceBusy => nix::libc::EBUSY,
+        std::io::ErrorKind::ExecutableFileBusy => nix::libc::ETXTBSY,
+        std::io::ErrorKind::Deadlock => nix::libc::EDEADLK,
+        std::io::ErrorKind::CrossesDevices => nix::libc::EXDEV,
+        std::io::ErrorKind::TooManyLinks => nix::libc::EMLINK,
+        std::io::ErrorKind::InvalidFilename => nix::libc::EINVAL,
+        std::io::ErrorKind::ArgumentListTooLong => nix::libc::E2BIG,
+        std::io::ErrorKind::Interrupted => nix::libc::EINTR,
+        std::io::ErrorKind::Unsupported => nix::libc::ENOSYS,
+        std::io::ErrorKind::OutOfMemory => nix::libc::ENOMEM,
+        _ => nix::libc::EIO,
     }
 }
 
@@ -551,6 +596,14 @@ mod tests {
             }
             log::debug!("unmounted {}...", self.mountpoint.path().display());
             Ok(())
+        }
+    }
+
+    impl Drop for FuseFixture {
+        fn drop(&mut self) {
+            if let Some(handle) = self.fuse_handle.take() {
+                handle.join_blocking();
+            }
         }
     }
 
@@ -767,6 +820,33 @@ mod tests {
             })
             .await?;
 
+        fixture.unmount().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn file_not_found() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+
+                let ret = fs::metadata(arena_path.join("doesnotexist")).await;
+                assert!(ret.is_err());
+                assert_eq!(std::io::ErrorKind::NotFound, ret.err().unwrap().kind());
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
         fixture.unmount().await?;
 
         Ok(())

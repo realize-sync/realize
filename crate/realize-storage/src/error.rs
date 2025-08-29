@@ -69,6 +69,29 @@ impl StorageError {
             StorageError::Database(Box::new(err))
         }
     }
+
+    pub fn io_kind(&self) -> std::io::ErrorKind {
+        use std::io::ErrorKind::*;
+        match self {
+            StorageError::Database(_) => Other,
+            StorageError::OpenTable(_, _) => Other,
+            StorageError::Io(ioerr) => ioerr.kind(),
+            StorageError::ByteConversion(_) => InvalidInput,
+            StorageError::Unavailable => Other,
+            StorageError::NotFound => NotFound,
+            StorageError::NotADirectory => NotADirectory,
+            StorageError::IsADirectory => IsADirectory,
+            StorageError::JoinError(_) => Other,
+            StorageError::InvalidRsyncSignature => InvalidInput,
+            StorageError::UnknownArena(_) => NotFound,
+            StorageError::NoLocalStorage(_) => NotFound,
+            StorageError::InconsistentDatabase(_) => Other,
+        }
+    }
+
+    pub fn as_ioerr(&self) -> std::io::Error {
+        std::io::Error::from(self.io_kind())
+    }
 }
 
 impl From<nix::errno::Errno> for StorageError {
@@ -136,43 +159,13 @@ impl From<fast_rsync::SignatureParseError> for StorageError {
 
 impl Into<std::io::Error> for StorageError {
     fn into(self) -> std::io::Error {
-        use std::io::ErrorKind;
-        match self {
-            StorageError::Database(_) => std::io::Error::new(ErrorKind::Other, "database error"),
-            StorageError::OpenTable(_, _) => {
-                std::io::Error::new(ErrorKind::Other, "failed to open table")
-            }
-            StorageError::Io(ioerr) => ioerr,
-            StorageError::ByteConversion(ByteConversionError::Path(_)) => {
-                std::io::Error::new(ErrorKind::InvalidInput, "invalid path")
-            }
-            StorageError::ByteConversion(_) => {
-                std::io::Error::new(ErrorKind::Other, "byte conversion error")
-            }
-            StorageError::Unavailable => {
-                std::io::Error::new(ErrorKind::Other, "data not available")
-            }
-            StorageError::NotFound => std::io::Error::new(ErrorKind::NotFound, "not found"),
-            StorageError::NotADirectory => {
-                std::io::Error::new(ErrorKind::NotADirectory, "not a directory")
-            }
-            StorageError::IsADirectory => {
-                std::io::Error::new(ErrorKind::IsADirectory, "is a directory")
-            }
-            StorageError::JoinError(_) => std::io::Error::new(ErrorKind::Other, "join error"),
-            StorageError::InvalidRsyncSignature => {
-                std::io::Error::new(ErrorKind::InvalidInput, "invalid rsync signature")
-            }
-            StorageError::UnknownArena(_) => {
-                std::io::Error::new(ErrorKind::NotFound, "unknown arena")
-            }
-            StorageError::NoLocalStorage(_) => {
-                std::io::Error::new(ErrorKind::NotFound, "no local storage")
-            }
-            StorageError::InconsistentDatabase(_) => {
-                std::io::Error::new(ErrorKind::Other, "inconsistent database")
-            }
-        }
+        self.as_ioerr()
+    }
+}
+
+impl Into<std::io::Error> for &StorageError {
+    fn into(self) -> std::io::Error {
+        self.as_ioerr()
     }
 }
 
