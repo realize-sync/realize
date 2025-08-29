@@ -1,9 +1,9 @@
 this="$(realpath "$(dirname "$0")")"
 root="$(realpath "${this}/..")"
 releasedir="${root}/target/release"
-realize_bin="${root}/target/debug/realize-control"
-realized_bin="${root}/target/release/realize-daemon"
-rust_log="realize_=debug"
+realize_bin="${root}/target/debug/realize"
+realized_bin="${root}/target/release/realized"
+rust_log="realize_=debug,fuser=debug"
 
 function rebuild {
     local args=""
@@ -22,7 +22,7 @@ function rebuild_all {
 }
 
 function up_all {
-    maybe_rebuild realize-daemon release && up a 7001 7003 && up b 8001 8003
+    maybe_rebuild realized release && up a 7001 7003 && up b 8001 8003
 }
 
 function down_all {
@@ -57,7 +57,7 @@ function up {
         echo $pid >"${pidfile}"
     }
     sleep 0.25
-    if pgrep -F "${pidfile}" realize-daemon 2>/dev/null; then
+    if pgrep -F "${pidfile}" realized 2>/dev/null; then
         echo "== ${inst} STARTED: PID $pid out ${outfile}"
         tail "${outfile}"
         return 0
@@ -72,7 +72,7 @@ function down {
     inst=$1
     pidfile="${this}/${inst}.pid"
 
-    if [ -f "${pidfile}" ] && pgrep -F "${pidfile}" realize-daemon 2>/dev/null; then
+    if [ -f "${pidfile}" ] && pgrep -F "${pidfile}" realized 2>/dev/null; then
         pkill -F "${pidfile}"
         echo "=== ${inst} killed"
     else
@@ -91,7 +91,7 @@ function status {
     outfile="${this}/${inst}.out"
     pidfile="${this}/${inst}.pid"
 
-    if [ -f "${pidfile}" ] && pgrep -F "${pidfile}" realize-daemon 2>/dev/null; then
+    if [ -f "${pidfile}" ] && pgrep -F "${pidfile}" realized 2>/dev/null; then
         echo "== ${inst} UP $(cat "${pidfile}")"
     else
         echo "== ${inst} DOWN"
