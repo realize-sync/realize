@@ -39,7 +39,8 @@ mod tests {
     #[test]
     fn parse_config() {
         let toml_str = r#"
-            [peers."peer1"]
+            [[peer]]
+            name = "peer1"
             address = "192.168.1.100:8080"
             pubkey = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...\n-----END PUBLIC KEY-----"
             batch_rate_limit = "512K"
@@ -62,15 +63,14 @@ mod tests {
             config,
             Config {
                 network: realize_network::config::NetworkConfig {
-                    peers: std::collections::HashMap::from([
-                        (
-                            Peer::from("peer1"),
-                            realize_network::config::PeerConfig {
-                                address: Some("192.168.1.100:8080".to_string()),
-                                pubkey: "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...\n-----END PUBLIC KEY-----".to_string(),
-                                batch_rate_limit: Some(realize_network::config::ByteValue(512*1024)),
-                            },
-                        )]),
+                    peers: vec![
+                        realize_network::config::PeerConfig {
+                            peer: Peer::from("peer1"),
+                            address: Some("192.168.1.100:8080".to_string()),
+                            pubkey: "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...\n-----END PUBLIC KEY-----".to_string(),
+                            batch_rate_limit: Some(realize_network::config::ByteValue(512*1024)),
+                        },
+                    ],
                 },
                 storage: realize_storage::config::StorageConfig {
                     arena: vec![

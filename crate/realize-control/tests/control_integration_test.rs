@@ -59,11 +59,12 @@ impl Fixture {
             .join("../../resources/test");
 
         // Add a simple peer configuration
-        config.network.peers.insert(
-            Peer::from("a"),
+        config.network.peers.push(
             realize_network::config::PeerConfig {
+                peer: Peer::from("a"),
                 pubkey: std::fs::read_to_string(resources.join("a-spki.pem"))?,
-                ..Default::default()
+                address: None,
+                batch_rate_limit: None,
             },
         );
 

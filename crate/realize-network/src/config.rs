@@ -1,10 +1,10 @@
 use realize_types::Peer;
-use std::collections::HashMap;
 
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
-    pub peers: HashMap<Peer, PeerConfig>,
+    #[serde(rename = "peer")]
+    pub peers: Vec<PeerConfig>,
 }
 
 impl Default for NetworkConfig {
@@ -16,17 +16,31 @@ impl Default for NetworkConfig {
 impl NetworkConfig {
     pub fn new() -> Self {
         NetworkConfig {
-            peers: HashMap::new(),
+            peers: Vec::new(),
         }
+    }
+
+    /// Get peer config by name
+    pub fn peer_config(&self, peer: Peer) -> Option<&PeerConfig> {
+        self.peers.iter().find(|c| c.peer == peer)
+    }
+
+    /// Get peer config by name (mutable)
+    pub fn peer_config_mut(&mut self, peer: Peer) -> Option<&mut PeerConfig> {
+        self.peers.iter_mut().find(|c| c.peer == peer)
     }
 }
 
 /// Define a peer.
 ///
 /// A peer is identified by [realize_types::Peer].
-#[derive(Clone, serde::Deserialize, serde::Serialize, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, serde::Deserialize, serde::Serialize, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PeerConfig {
+    /// The name of this peer.
+    #[serde(rename = "name")]
+    pub peer: Peer,
+
     /// Address of the peer, if available.
     ///
     /// Not all peers can be connected to. Peers that can should have
@@ -331,15 +345,18 @@ mod tests {
     #[test]
     fn parse_network_config() {
         let toml_str = r#"
-            [peers."peer1"]
+            [[peer]]
+            name = "peer1"
             address = "192.168.1.100:8080"
             pubkey = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...\n-----END PUBLIC KEY-----"
             batch_rate_limit = 1000
 
-            [peers."peer2"]
+            [[peer]]
+            name = "peer2"
             pubkey = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...\n-----END PUBLIC KEY-----"
 
-            [peers."peer3"]
+            [[peer]]
+            name = "peer3"
             address = "10.0.0.1:9000"
             pubkey = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...\n-----END PUBLIC KEY-----"
             batch_rate_limit = "512K"
@@ -348,34 +365,34 @@ mod tests {
         let config: NetworkConfig = toml::from_str(toml_str).unwrap();
 
         assert_eq!(config, NetworkConfig {
-            peers: HashMap::from([(
-            Peer::from("peer1"),
-            PeerConfig {
-                address: Some("192.168.1.100:8080".to_string()),
-                pubkey: "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...\n-----END PUBLIC KEY-----".to_string(),
-                batch_rate_limit: Some(ByteValue(1000)),
-            },
-        ),(
-            Peer::from("peer2"),
-            PeerConfig {
-                address: None,
-                pubkey: "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...\n-----END PUBLIC KEY-----".to_string(),
-                batch_rate_limit: None,
-            },
-        ),(
-            Peer::from("peer3"),
-            PeerConfig {
-                address: Some("10.0.0.1:9000".to_string()),
-                pubkey: "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...\n-----END PUBLIC KEY-----".to_string(),
-                batch_rate_limit: Some(ByteValue(512*1024)),
-            },
-        )])});
+            peers: vec![
+                PeerConfig {
+                    peer: Peer::from("peer1"),
+                    address: Some("192.168.1.100:8080".to_string()),
+                    pubkey: "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...\n-----END PUBLIC KEY-----".to_string(),
+                    batch_rate_limit: Some(ByteValue(1000)),
+                },
+                PeerConfig {
+                    peer: Peer::from("peer2"),
+                    address: None,
+                    pubkey: "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...\n-----END PUBLIC KEY-----".to_string(),
+                    batch_rate_limit: None,
+                },
+                PeerConfig {
+                    peer: Peer::from("peer3"),
+                    address: Some("10.0.0.1:9000".to_string()),
+                    pubkey: "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...\n-----END PUBLIC KEY-----".to_string(),
+                    batch_rate_limit: Some(ByteValue(512*1024)),
+                },
+            ],
+        });
     }
 
     #[test]
     fn wrong_field_name() {
         let toml_str = r#"
-            [peers."peer1"]
+            [[peer]]
+            name = "peer1"
             pubkey = "..."
             wrong_field_name = 1 
         "#;

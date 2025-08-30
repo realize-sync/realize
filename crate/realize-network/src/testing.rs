@@ -156,9 +156,10 @@ impl TestingPeers {
         self.peers.insert(
             peer,
             PeerConfig {
+                peer,
                 pubkey: String::from_utf8(pubkey.to_vec())?,
                 address: None,
-                ..Default::default()
+                batch_rate_limit: None,
             },
         );
         self.private_keys.insert(peer, private_key);
@@ -205,8 +206,12 @@ impl TestingPeers {
     ///
     /// Other peer public keys and addreses will be available.
     pub fn networking(&self, peer: Peer) -> anyhow::Result<crate::Networking> {
-        let mut others = self.peers.clone();
-        others.remove(&peer);
+        let others: Vec<PeerConfig> = self
+            .peers
+            .values()
+            .filter(|config| config.peer != peer)
+            .cloned()
+            .collect();
 
         let verifier = PeerVerifier::from_config(&others)?;
         let resolver = RawPublicKeyResolver::from_private_key(

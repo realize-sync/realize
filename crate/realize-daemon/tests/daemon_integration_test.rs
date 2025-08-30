@@ -88,18 +88,20 @@ impl Fixture {
         let resources = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
             .join("../../resources/test");
 
-        config.network.peers.insert(
-            Peer::from("a"),
+        config.network.peers.push(
             PeerConfig {
+                peer: Peer::from("a"),
                 pubkey: std::fs::read_to_string(resources.join("a-spki.pem"))?,
-                ..Default::default()
+                address: None,
+                batch_rate_limit: None,
             },
         );
-        config.network.peers.insert(
-            Peer::from("b"),
+        config.network.peers.push(
             PeerConfig {
+                peer: Peer::from("b"),
                 pubkey: std::fs::read_to_string(resources.join("b-spki.pem"))?,
-                ..Default::default()
+                address: None,
+                batch_rate_limit: None,
             },
         );
 
@@ -462,8 +464,7 @@ async fn daemon_updates_cache() -> anyhow::Result<()> {
     fixture_b
         .config
         .network
-        .peers
-        .get_mut(&Peer::from("a"))
+        .peer_config_mut(Peer::from("a"))
         .expect("peer a")
         .address = Some(fixture_a.server_address);
 

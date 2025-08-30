@@ -10,7 +10,7 @@ use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer};
 use rustls::sign::CertifiedKey;
 use rustls::version::TLS13;
 use rustls::{ClientConfig, Error, ServerConfig};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio_rustls::rustls::server::danger::ClientCertVerifier;
@@ -78,12 +78,12 @@ impl PeerVerifier {
     }
 
     /// Create a verifier and fill it from [PeerConfig] instances.
-    pub fn from_config(peers: &HashMap<Peer, PeerConfig>) -> anyhow::Result<Arc<Self>> {
+    pub fn from_config(peers: &[PeerConfig]) -> anyhow::Result<Arc<Self>> {
         let mut verifier = Self::new();
-        for (peer, config) in peers {
+        for config in peers {
             let spki = SubjectPublicKeyInfoDer::from_pem_slice(config.pubkey.as_bytes())
-                .with_context(|| format!("Failed to parse public key for peer {peer}"))?;
-            verifier.add_peer(*peer, spki);
+                .with_context(|| format!("Failed to parse public key for peer {}", config.peer))?;
+            verifier.add_peer(config.peer, spki);
         }
 
         Ok(Arc::new(verifier))

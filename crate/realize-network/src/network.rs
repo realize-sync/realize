@@ -37,14 +37,11 @@ impl PeerSetup {
 }
 
 impl Networking {
-    pub fn from_config(
-        peers: &HashMap<Peer, PeerConfig>,
-        privkey: &path::Path,
-    ) -> anyhow::Result<Self> {
+    pub fn from_config(peers: &[PeerConfig], privkey: &path::Path) -> anyhow::Result<Self> {
         let verifier = PeerVerifier::from_config(peers)?;
         let resolver = RawPublicKeyResolver::from_private_key_file(privkey)?;
         Ok(Self::new(
-            peers.iter().map(|(p, c)| (*p, PeerSetup::from_config(c))),
+            peers.iter().map(|c| (c.peer, PeerSetup::from_config(c))),
             resolver,
             verifier,
         ))
