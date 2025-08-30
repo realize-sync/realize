@@ -13,36 +13,48 @@ Overlays must be configured separately per arena. This needs extra configuration
 
 [[arena]]
 name= ...
-data= ...
-metadata= ...
-mountpoint = ...
+data= ...  # was root
+metadata= ... # new
+mountpoint = ... # new
 
 metadata is required (this is where the db and blobs are stored)
 data is optional.
 mountpoint is optional. If set, requires data. Requires option --fuse.
 
-1. Replace db and blobdir with metadata in ArenaConfig. db becomes
-   <metadata>/arena.db and blobdir <metadata>/blobs (created if
+Task list:
+
+1. Replace the fields ArenaConfig::db and blob_dir with metadata.
+
+   In [arena.rs](../crate/realize-storage/src/arena.rs) db is set to
+   <metadata>/arena.db and blobdir to <metadata>/blobs (created if
    necessary).
 
-   <metadata> must be writable. It is created if necessary by
-   check_dirs() in [setup.rs](../crate/realize-core/src/setup.rs)
+   <metadata> must be writable directory. It is created if necessary
+   by check_dirs() in [setup.rs](../crate/realize-core/src/setup.rs)
 
    The following rules are also enforced by check_dirs():
 
-   If <data> is specified, <metadata> must be on the same device
+   - If <data> is specified, <metadata> must be on the same device
    (std::os::unix::fs::MetadataExt::dev must be the same on both).
 
-   If <data> is specified, <data> must not be a child of <metadata>.
+   - If <data> is specified, <data> must not be a child of <metadata>.
 
-2. Add function mount_overlays to
+   Update the code and the test, then add new tests to
+   [setup.rs](../crate/realize-core/src/setup.rs) to cover the new
+   directory checks.
+
+2. Add a function mount_overlays to
    [setup.rs](../crate/realize-core/src/setup.rs).
 
    This function is called once on each ArenaConfig that defines a
-   mountpoint and is passed the ArenaConfig and mountpoint and mounts
-   the overlayfs with a call to nix::mount::mount equivalent to:
+   mountpoint and is passed the ArenaConfig and fuse mountpoint and
+   mounts the overlayfs with a call to nix::mount::mount equivalent
+   to:
 
-   mount -t overlay -o lowerdir=<fuse-mountpoint>/<arena>,upperdir=<arena-data>,workdir=<arena-meta>/work,redirect_dir=on,metacopy=on overlay
+   mount -t overlay -o lowerdir=<fuse-mountpoint>/<arena>,upperdir=<arena-data>,workdir=<arena-meta>/work,redirect_dir=on,metacopy=on,userxattr overlay <mountpoint>
+
+   For details on the available options, see:
+   https://wiki.archlinux.org/title/Overlay_filesystem
 
    Unmount the mountpoint first with MNT_FORCE (using
    nix::mount::unmount2), in case it already exists.
@@ -51,7 +63,32 @@ mountpoint is optional. If set, requires data. Requires option --fuse.
    unmounts the directory with MNT_FORCE. The handle also has a method
    fn unmount(self) to unmount cleanly, without MNT_FORCE.
 
-   ^^ This is going to be a problem. Should it be a separate command?
+   Write the code and make sure it compiles, then write a unit test
+   for it that mounts an overlay in a tempdir using a normal directory
+   for <fuse-mountpoint>. Make sure it passes.
+
+3. Add a function unmount_overlays to [setup.rs](../crate/realize-core/src/setup.rs)
+
+   Write the code and make sure it compiles, then write a unit test
+   for it. Make sure it passes.
+
+4. Add commands using clap to realized
+   [main.rs](../crate/realize-daemon/src/main.rs) to mount and unmount
+   overlays.
+
+   mount overlays (calls mount_overlays for each arena mountpoint defined in config.toml):
+     realized mountall --config config.toml --fuse /fuse/mountpoint
+
+   unmount overlays (calls unmount_overlays for each arena mountpoint defined in config.toml):
+     realized unmountall --config config.toml
+
+   normal daemon; doesn't mount or unmount overlays;
+     realized --config config.toml --fuse /fuse/mountpoint ...
+
+   Write the code then extend the test daemon_export_fuse in
+   [daemon_integration_test.rs](../crate/realize-daemon/tests/daemon_integration_test.rs)
+   to include the calls to mountall and unmountall and a test of the
+   overlays
 
 ## configure "auth" logs {#logauth}
 
