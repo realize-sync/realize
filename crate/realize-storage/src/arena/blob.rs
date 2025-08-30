@@ -2146,8 +2146,8 @@ mod tests {
         assert!(watch.has_changed()?);
 
         let mut blob = Blob::open(&fixture.db, &path)?;
-        assert_eq!(hash::digest(data), blob.hash);
-        assert_eq!(data.len() as u64, blob.size);
+        assert_eq!(hash::digest(data), *blob.hash());
+        assert_eq!(data.len() as u64, blob.size());
         assert_eq!(
             ByteRanges::single(0, data.len() as u64),
             *blob.available_range()
@@ -2199,8 +2199,8 @@ mod tests {
         txn.commit()?;
 
         let mut blob = Blob::open(&fixture.db, &path)?;
-        assert_eq!(hash::digest(data), blob.hash);
-        assert_eq!(data.len() as u64, blob.size);
+        assert_eq!(hash::digest(data), *blob.hash());
+        assert_eq!(data.len() as u64, blob.size());
         assert_eq!(
             ByteRanges::single(0, data.len() as u64),
             *blob.available_range()
