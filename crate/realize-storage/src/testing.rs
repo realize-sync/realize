@@ -28,7 +28,7 @@ where
 {
     let dir = dir.as_ref();
     let config = StorageConfig {
-        arena: arenas
+        arenas: arenas
             .into_iter()
             .map(|arena| {
                 let arena_dir = arena_root(dir, arena);
@@ -50,7 +50,7 @@ where
         },
     };
 
-    for arena_config in &config.arena {
+    for arena_config in &config.arenas {
         if let Some(root) = &arena_config.root {
             std::fs::create_dir_all(root)?;
         }

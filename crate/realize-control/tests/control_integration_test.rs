@@ -48,7 +48,7 @@ impl Fixture {
         };
 
         // Configure arena with required cache and optional local path
-        config.storage.arena.push(ArenaConfig::new(
+        config.storage.arenas.push(ArenaConfig::new(
             arena,
             myarena.to_path_buf(),
             tempdir.child("myarena-cache.db").to_path_buf(),
@@ -59,14 +59,15 @@ impl Fixture {
             .join("../../resources/test");
 
         // Add a simple peer configuration
-        config.network.peers.push(
-            realize_network::config::PeerConfig {
+        config
+            .network
+            .peers
+            .push(realize_network::config::PeerConfig {
                 peer: Peer::from("a"),
                 pubkey: std::fs::read_to_string(resources.join("a-spki.pem"))?,
                 address: None,
                 batch_rate_limit: None,
-            },
-        );
+            });
 
         let server_privkey = resources.join("a.key");
         let socket = tempdir.path().join("realize/control.socket");

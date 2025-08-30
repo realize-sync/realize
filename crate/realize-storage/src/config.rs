@@ -6,7 +6,8 @@ use std::time::Duration;
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
-    pub arena: Vec<ArenaConfig>,
+    #[serde(rename = "arena")]
+    pub arenas: Vec<ArenaConfig>,
     pub cache: CacheConfig,
 }
 
@@ -16,7 +17,7 @@ impl StorageConfig {
         P: AsRef<std::path::Path>,
     {
         StorageConfig {
-            arena: Vec::new(),
+            arenas: Vec::new(),
             cache: CacheConfig {
                 db: cache_db.as_ref().to_path_buf(),
             },
@@ -25,12 +26,12 @@ impl StorageConfig {
 
     /// Get arena config by name
     pub fn arena_config(&self, arena: Arena) -> Option<&ArenaConfig> {
-        self.arena.iter().find(|c| c.arena == arena)
+        self.arenas.iter().find(|c| c.arena == arena)
     }
 
     /// Get arena config by name (mutable)
     pub fn arena_config_mut(&mut self, arena: Arena) -> Option<&mut ArenaConfig> {
-        self.arena.iter_mut().find(|c| c.arena == arena)
+        self.arenas.iter_mut().find(|c| c.arena == arena)
     }
 }
 
@@ -395,7 +396,7 @@ mod tests {
             cache: CacheConfig {
                 db: PathBuf::from("/path/to/cache.db"),
             },
-            arena: vec![
+            arenas: vec![
                 ArenaConfig {
                     arena: Arena::from("arena1"),
                     root: Some(PathBuf::from("/path/to/arena1")),

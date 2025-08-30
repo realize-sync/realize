@@ -51,9 +51,9 @@ impl Storage {
             .with_context(|| format!("global database {:?}", config.cache.db))?;
         let allocator = InodeAllocator::new(
             Arc::clone(&globaldb),
-            config.arena.iter().map(|a| a.arena).collect::<Vec<_>>(),
+            config.arenas.iter().map(|a| a.arena).collect::<Vec<_>>(),
         )?;
-        for arena_config in &config.arena {
+        for arena_config in &config.arenas {
             let arena = Arena::from(arena_config.arena.as_str());
             arena_storage.insert(
                 arena,
@@ -293,7 +293,7 @@ fn build_exclude(config: &StorageConfig) -> Vec<&std::path::Path> {
     let mut exclude = vec![];
     // Cache is now required
     exclude.push(config.cache.db.as_ref());
-    for arena_config in &config.arena {
+    for arena_config in &config.arenas {
         // Arena cache (db + blob_dir) is now required for all arenas
         exclude.push(arena_config.db.as_ref());
         exclude.push(arena_config.blob_dir.as_ref());

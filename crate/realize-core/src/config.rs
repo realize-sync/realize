@@ -21,7 +21,7 @@ impl Config {
         Self {
             network: NetworkConfig::new(),
             storage: StorageConfig {
-                arena: Vec::new(),
+                arenas: Vec::new(),
                 cache: realize_storage::config::CacheConfig {
                     db: PathBuf::from("cache.db"), // Default for backward compatibility
                 },
@@ -73,7 +73,7 @@ mod tests {
                     ],
                 },
                 storage: realize_storage::config::StorageConfig {
-                    arena: vec![
+                    arenas: vec![
                         realize_storage::config::ArenaConfig {
                             arena: Arena::from("arena1"),
                             root: Some(PathBuf::from("/path/to/arena1")),

@@ -30,7 +30,7 @@ impl SetupHelper {
         privkey: &std::path::Path,
         local: &LocalSet,
     ) -> anyhow::Result<Self> {
-        check_dirs(&config.storage.arena)?;
+        check_dirs(&config.storage.arenas)?;
 
         let networking = Networking::from_config(&config.network.peers, privkey)?;
         let storage = Storage::from_config(&config.storage).await?;

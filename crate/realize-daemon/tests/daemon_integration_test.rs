@@ -76,7 +76,7 @@ impl Fixture {
         };
 
         // Configure arena with required cache and optional local path
-        config.storage.arena.push(ArenaConfig::new(
+        config.storage.arenas.push(ArenaConfig::new(
             arena,
             testdir.to_path_buf(),
             tempdir.child("testdir-cache.db").to_path_buf(),
@@ -88,22 +88,18 @@ impl Fixture {
         let resources = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
             .join("../../resources/test");
 
-        config.network.peers.push(
-            PeerConfig {
-                peer: Peer::from("a"),
-                pubkey: std::fs::read_to_string(resources.join("a-spki.pem"))?,
-                address: None,
-                batch_rate_limit: None,
-            },
-        );
-        config.network.peers.push(
-            PeerConfig {
-                peer: Peer::from("b"),
-                pubkey: std::fs::read_to_string(resources.join("b-spki.pem"))?,
-                address: None,
-                batch_rate_limit: None,
-            },
-        );
+        config.network.peers.push(PeerConfig {
+            peer: Peer::from("a"),
+            pubkey: std::fs::read_to_string(resources.join("a-spki.pem"))?,
+            address: None,
+            batch_rate_limit: None,
+        });
+        config.network.peers.push(PeerConfig {
+            peer: Peer::from("b"),
+            pubkey: std::fs::read_to_string(resources.join("b-spki.pem"))?,
+            address: None,
+            batch_rate_limit: None,
+        });
 
         let server_privkey = resources.join("a.key");
         let server_port = portpicker::pick_unused_port().expect("No ports free");
@@ -124,7 +120,7 @@ impl Fixture {
     fn configure_cache(&mut self) {
         // Cache is now always configured in setup, but this method can be used
         // to override cache configuration if needed for specific tests
-        for arena_config in &mut self.config.storage.arena {
+        for arena_config in &mut self.config.storage.arenas {
             let child = self
                 .tempdir
                 .child(format!("{}-cache.db", arena_config.arena));
