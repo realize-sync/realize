@@ -8,9 +8,8 @@ use crate::rpc::control::server::ControlServer;
 use anyhow::Context;
 use realize_network::{Networking, Server, unixsocket};
 use realize_storage::Storage;
-use realize_storage::config::ArenaConfig;
+
 use realize_types::Arena;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -31,7 +30,7 @@ impl SetupHelper {
         privkey: &std::path::Path,
         local: &LocalSet,
     ) -> anyhow::Result<Self> {
-        check_dirs(&config.storage.arenas)?;
+        check_dirs(&config.storage.arena)?;
 
         let networking = Networking::from_config(&config.network.peers, privkey)?;
         let storage = Storage::from_config(&config.storage).await?;
@@ -174,15 +173,16 @@ async fn make_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
 }
 
 /// Checks that all directories in the config file are accessible.
-fn check_dirs(arenas: &HashMap<Arena, ArenaConfig>) -> anyhow::Result<()> {
-    for (arena, config) in arenas {
+fn check_dirs(arenas: &[realize_storage::config::ArenaConfig]) -> anyhow::Result<()> {
+    for config in arenas {
+        let arena = Arena::from(config.arena.as_str());
         // Check root directory if specified
         if let Some(root) = &config.root {
             if !root.exists() {
                 anyhow::bail!("[{arena}] Arena root not found: {root:?}");
             }
 
-            check_is_accessible_dir(root, arena, "arena root")?;
+            check_is_accessible_dir(root, &arena, "arena root")?;
             if !is_writable_dir(root) {
                 log::warn!("[{arena}] Arena root not writable: {root:?}");
             }
@@ -196,7 +196,7 @@ fn check_dirs(arenas: &HashMap<Arena, ArenaConfig>) -> anyhow::Result<()> {
                 anyhow::bail!("[{arena}] Failed to create blob dir {blob_dir:?}: {e:?}",);
             }
         }
-        check_is_accessible_dir(blob_dir, arena, "blob dir")?;
+        check_is_accessible_dir(blob_dir, &arena, "blob dir")?;
         if !is_writable_dir(blob_dir) {
             anyhow::bail!("[{arena}/{}]: blob dir not writable", blob_dir.display());
         }
@@ -247,7 +247,7 @@ mod tests {
     use super::*;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
-    use std::collections::HashMap;
+    use realize_storage::config::ArenaConfig;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -260,15 +260,12 @@ mod tests {
         root_path.create_dir_all()?;
         let blob_dir_path = tempdir.child("blobs");
 
-        let mut arenas = HashMap::new();
-        arenas.insert(
-            arena.clone(),
-            ArenaConfig::new(
-                root_path.to_path_buf(),
-                tempdir.child("cache.db").to_path_buf(),
-                blob_dir_path.to_path_buf(),
-            ),
-        );
+        let arenas = vec![ArenaConfig::new(
+            arena,
+            root_path.to_path_buf(),
+            tempdir.child("cache.db").to_path_buf(),
+            blob_dir_path.to_path_buf(),
+        )];
 
         // Should succeed - directories will be created
         check_dirs(&arenas)?;
@@ -289,15 +286,12 @@ mod tests {
         let blob_dir_path = tempdir.child("blobs");
         blob_dir_path.create_dir_all()?;
 
-        let mut arenas = HashMap::new();
-        arenas.insert(
-            arena.clone(),
-            ArenaConfig::new(
-                root_path.to_path_buf(),
-                tempdir.child("cache.db").to_path_buf(),
-                blob_dir_path.to_path_buf(),
-            ),
-        );
+        let arenas = vec![ArenaConfig::new(
+            arena,
+            root_path.to_path_buf(),
+            tempdir.child("cache.db").to_path_buf(),
+            blob_dir_path.to_path_buf(),
+        )];
 
         let result = check_dirs(&arenas);
         assert!(result.is_err());
@@ -317,15 +311,12 @@ mod tests {
         root_path.create_dir_all()?;
         blob_dir_path.create_dir_all()?;
 
-        let mut arenas = HashMap::new();
-        arenas.insert(
-            arena.clone(),
-            ArenaConfig::new(
-                root_path.to_path_buf(),
-                tempdir.child("cache.db").to_path_buf(),
-                blob_dir_path.to_path_buf(),
-            ),
-        );
+        let arenas = vec![ArenaConfig::new(
+            arena,
+            root_path.to_path_buf(),
+            tempdir.child("cache.db").to_path_buf(),
+            blob_dir_path.to_path_buf(),
+        )];
 
         // Should succeed with existing directories
         check_dirs(&arenas)?;
@@ -340,14 +331,11 @@ mod tests {
 
         let blob_dir_path = tempdir.child("blobs");
 
-        let mut arenas = HashMap::new();
-        arenas.insert(
-            arena.clone(),
-            ArenaConfig::rootless(
-                tempdir.child("cache.db").to_path_buf(),
-                blob_dir_path.to_path_buf(),
-            ),
-        );
+        let arenas = vec![ArenaConfig::rootless(
+            arena,
+            tempdir.child("cache.db").to_path_buf(),
+            blob_dir_path.to_path_buf(),
+        )];
 
         // Should succeed - only blob_dir is required
         check_dirs(&arenas)?;
@@ -371,15 +359,12 @@ mod tests {
         root_path.write_str("not a directory")?;
         blob_dir_path.create_dir_all()?;
 
-        let mut arenas = HashMap::new();
-        arenas.insert(
-            arena.clone(),
-            ArenaConfig::new(
-                root_path.to_path_buf(),
-                tempdir.child("cache.db").to_path_buf(),
-                blob_dir_path.to_path_buf(),
-            ),
-        );
+        let arenas = vec![ArenaConfig::new(
+            arena,
+            root_path.to_path_buf(),
+            tempdir.child("cache.db").to_path_buf(),
+            blob_dir_path.to_path_buf(),
+        )];
 
         // Should fail because root path is a file, not directory
         let result = check_dirs(&arenas);
@@ -410,15 +395,12 @@ mod tests {
         perms.set_mode(0o000); // No permissions
         fs::set_permissions(root_path.path(), perms)?;
 
-        let mut arenas = HashMap::new();
-        arenas.insert(
-            arena.clone(),
-            ArenaConfig::new(
-                root_path.to_path_buf(),
-                tempdir.child("cache.db").to_path_buf(),
-                blob_dir_path.to_path_buf(),
-            ),
-        );
+        let arenas = vec![ArenaConfig::new(
+            arena,
+            root_path.to_path_buf(),
+            tempdir.child("cache.db").to_path_buf(),
+            blob_dir_path.to_path_buf(),
+        )];
 
         // Should fail because root has no read access
         let result = check_dirs(&arenas);
@@ -444,15 +426,12 @@ mod tests {
         perms.set_mode(0o444); // Read-only
         fs::set_permissions(root_path.path(), perms)?;
 
-        let mut arenas = HashMap::new();
-        arenas.insert(
-            arena.clone(),
-            ArenaConfig::new(
-                root_path.to_path_buf(),
-                tempdir.child("cache.db").to_path_buf(),
-                blob_dir_path.to_path_buf(),
-            ),
-        );
+        let arenas = vec![ArenaConfig::new(
+            arena,
+            root_path.to_path_buf(),
+            tempdir.child("cache.db").to_path_buf(),
+            blob_dir_path.to_path_buf(),
+        )];
 
         // Should succeed but log a warning about write access
         check_dirs(&arenas)?;
@@ -476,15 +455,12 @@ mod tests {
         perms.set_mode(0o444); // Read-only
         fs::set_permissions(blob_dir_path.path(), perms)?;
 
-        let mut arenas = HashMap::new();
-        arenas.insert(
-            arena.clone(),
-            ArenaConfig::new(
-                root_path.to_path_buf(),
-                tempdir.child("cache.db").to_path_buf(),
-                blob_dir_path.to_path_buf(),
-            ),
-        );
+        let arenas = vec![ArenaConfig::new(
+            arena,
+            root_path.to_path_buf(),
+            tempdir.child("cache.db").to_path_buf(),
+            blob_dir_path.to_path_buf(),
+        )];
 
         let result = check_dirs(&arenas);
         assert!(result.is_err());

@@ -1,6 +1,5 @@
 use realize_network::config::NetworkConfig;
 use realize_storage::config::StorageConfig;
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -22,7 +21,7 @@ impl Config {
         Self {
             network: NetworkConfig::new(),
             storage: StorageConfig {
-                arenas: HashMap::new(),
+                arena: Vec::new(),
                 cache: realize_storage::config::CacheConfig {
                     db: PathBuf::from("cache.db"), // Default for backward compatibility
                 },
@@ -48,7 +47,8 @@ mod tests {
             [cache]
             db = "/path/to/cache.db"
 
-            [arenas."arena1"]
+            [[arena]]
+            name = "arena1"
             root = "/path/to/arena1"
             db = "/path/to/arena1.db"
             blob_dir = "/path/to/arena1/blobs"
@@ -62,7 +62,7 @@ mod tests {
             config,
             Config {
                 network: realize_network::config::NetworkConfig {
-                    peers: HashMap::from([
+                    peers: std::collections::HashMap::from([
                         (
                             Peer::from("peer1"),
                             realize_network::config::PeerConfig {
@@ -73,9 +73,9 @@ mod tests {
                         )]),
                 },
                 storage: realize_storage::config::StorageConfig {
-                    arenas: HashMap::from([(
-                        Arena::from("arena1"),
+                    arena: vec![
                         realize_storage::config::ArenaConfig {
+                            arena: Arena::from("arena1"),
                             root: Some(PathBuf::from("/path/to/arena1")),
                             db: PathBuf::from("/path/to/arena1.db"),
                             blob_dir: PathBuf::from("/path/to/arena1/blobs"),
@@ -86,7 +86,7 @@ mod tests {
                                 leave: Some(realize_storage::config::BytesOrPercent::Bytes(1024 * 1024 * 1024)),
                             }),
                         },
-                    )]),
+                    ],
                     cache: realize_storage::config::CacheConfig {
                         db: PathBuf::from("/path/to/cache.db"),
                     },

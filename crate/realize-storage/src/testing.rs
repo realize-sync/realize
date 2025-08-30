@@ -28,24 +28,21 @@ where
 {
     let dir = dir.as_ref();
     let config = StorageConfig {
-        arenas: arenas
+        arena: arenas
             .into_iter()
             .map(|arena| {
                 let arena_dir = arena_root(dir, arena);
-                (
+                ArenaConfig {
                     arena,
-                    ArenaConfig {
-                        root: Some(arena_dir.clone()),
-                        db: arena_dir.join(".arena.db"),
-                        blob_dir: arena_dir.join(".arena.blobs"),
+                    root: Some(arena_dir.clone()),
+                    db: arena_dir.join(".arena.db"),
+                    blob_dir: arena_dir.join(".arena.blobs"),
 
-                        // Disabled in tests
-                        debounce: Some(HumanDuration(Duration::ZERO)),
-                        max_parallel_hashers: Some(0),
-
-                        ..Default::default()
-                    },
-                )
+                    // Disabled in tests
+                    debounce: Some(HumanDuration(Duration::ZERO)),
+                    max_parallel_hashers: Some(0),
+                    disk_usage: None,
+                }
             })
             .collect(),
         cache: CacheConfig {
@@ -53,7 +50,7 @@ where
         },
     };
 
-    for arena_config in config.arenas.values() {
+    for arena_config in &config.arena {
         if let Some(root) = &arena_config.root {
             std::fs::create_dir_all(root)?;
         }

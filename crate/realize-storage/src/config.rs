@@ -1,5 +1,4 @@
 use realize_types::Arena;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -7,7 +6,7 @@ use std::time::Duration;
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
-    pub arenas: HashMap<Arena, ArenaConfig>,
+    pub arena: Vec<ArenaConfig>,
     pub cache: CacheConfig,
 }
 
@@ -17,11 +16,21 @@ impl StorageConfig {
         P: AsRef<std::path::Path>,
     {
         StorageConfig {
-            arenas: HashMap::new(),
+            arena: Vec::new(),
             cache: CacheConfig {
                 db: cache_db.as_ref().to_path_buf(),
             },
         }
+    }
+
+    /// Get arena config by name
+    pub fn arena_config(&self, arena: Arena) -> Option<&ArenaConfig> {
+        self.arena.iter().find(|c| c.arena == arena)
+    }
+
+    /// Get arena config by name (mutable)
+    pub fn arena_config_mut(&mut self, arena: Arena) -> Option<&mut ArenaConfig> {
+        self.arena.iter_mut().find(|c| c.arena == arena)
     }
 }
 
@@ -44,9 +53,13 @@ impl CacheConfig {
     }
 }
 
-#[derive(Clone, serde::Deserialize, serde::Serialize, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, serde::Deserialize, serde::Serialize, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ArenaConfig {
+    /// The name of this arena
+    #[serde(rename = "name")]
+    pub arena: Arena,
+
     /// Optional local path to the directory where files for that arena are stored.
     /// If specified, an indexer will be created for this arena.
     pub root: Option<PathBuf>,
@@ -76,30 +89,37 @@ pub struct ArenaConfig {
 }
 
 impl ArenaConfig {
-    pub fn new<P1, P2, P3>(root: P1, db: P2, blob_dir: P3) -> Self
+    pub fn new<P1, P2, P3>(arena: Arena, root: P1, db: P2, blob_dir: P3) -> Self
     where
         P1: AsRef<std::path::Path>,
         P2: AsRef<std::path::Path>,
         P3: AsRef<std::path::Path>,
     {
         Self {
+            arena,
             root: Some(root.as_ref().to_path_buf()),
             db: db.as_ref().to_path_buf(),
             blob_dir: blob_dir.as_ref().to_path_buf(),
-            ..Default::default()
+            max_parallel_hashers: None,
+            debounce: None,
+            disk_usage: None,
         }
     }
 
     /// Configure an arena without local root folder.
-    pub fn rootless<P1, P2>(db: P1, blob_dir: P2) -> Self
+    pub fn rootless<P1, P2>(arena: Arena, db: P1, blob_dir: P2) -> Self
     where
         P1: AsRef<std::path::Path>,
         P2: AsRef<std::path::Path>,
     {
         Self {
+            arena,
             db: db.as_ref().to_path_buf(),
             blob_dir: blob_dir.as_ref().to_path_buf(),
-            ..Default::default()
+            root: None,
+            max_parallel_hashers: None,
+            debounce: None,
+            disk_usage: None,
         }
     }
 }
@@ -355,14 +375,16 @@ mod tests {
             [cache]
             db = "/path/to/cache.db"
 
-            [arenas."arena1"]
+            [[arena]]
+            name = "arena1"
             root = "/path/to/arena1"
             db = "/path/to/arena1.db"
             blob_dir = "/path/to/arena1/blobs"
             max_parallel_hashers = 4
             debounce = "500ms"
 
-            [arenas."arena2"]
+            [[arena]]
+            name = "arena2"
             db = "/path/to/arena2.db"
             blob_dir = "/path/to/arena2/blobs"
             disk_usage = { max = "1G" }
@@ -373,33 +395,29 @@ mod tests {
             cache: CacheConfig {
                 db: PathBuf::from("/path/to/cache.db"),
             },
-            arenas: HashMap::from([
-                (
-                    Arena::from("arena1"),
-                    ArenaConfig {
-                        root: Some(PathBuf::from("/path/to/arena1")),
-                        db: PathBuf::from("/path/to/arena1.db"),
-                        blob_dir: PathBuf::from("/path/to/arena1/blobs"),
-                        max_parallel_hashers: Some(4),
-                        debounce: Some(HumanDuration::from_millis(500)),
-                        disk_usage: None,
-                    },
-                ),
-                (
-                    Arena::from("arena2"),
-                    ArenaConfig {
-                        root: None,
-                        db: PathBuf::from("/path/to/arena2.db"),
-                        blob_dir: PathBuf::from("/path/to/arena2/blobs"),
-                        max_parallel_hashers: None,
-                        debounce: None,
-                        disk_usage: Some(DiskUsageLimits {
-                            max: BytesOrPercent::Bytes(1073741824),
-                            leave: None,
-                        }),
-                    },
-                ),
-            ]),
+            arena: vec![
+                ArenaConfig {
+                    arena: Arena::from("arena1"),
+                    root: Some(PathBuf::from("/path/to/arena1")),
+                    db: PathBuf::from("/path/to/arena1.db"),
+                    blob_dir: PathBuf::from("/path/to/arena1/blobs"),
+                    max_parallel_hashers: Some(4),
+                    debounce: Some(HumanDuration::from_millis(500)),
+                    disk_usage: None,
+                },
+                ArenaConfig {
+                    arena: Arena::from("arena2"),
+                    root: None,
+                    db: PathBuf::from("/path/to/arena2.db"),
+                    blob_dir: PathBuf::from("/path/to/arena2/blobs"),
+                    max_parallel_hashers: None,
+                    debounce: None,
+                    disk_usage: Some(DiskUsageLimits {
+                        max: BytesOrPercent::Bytes(1073741824),
+                        leave: None,
+                    }),
+                },
+            ],
         };
 
         assert_eq!(config, expected_config);
@@ -667,7 +685,8 @@ mod tests {
                 [cache]
                 db = "/tmp/test.db"
                 
-                [arenas."test"]
+                [[arena]]
+                name = "test"
                 root = "/tmp/test"
                 db = "/tmp/test.db"
                 blob_dir = "/tmp/test/blobs"
@@ -677,7 +696,7 @@ mod tests {
             );
 
             let config: StorageConfig = toml::from_str(&full_toml).unwrap();
-            let arena_config = config.arenas.get(&Arena::from("test")).unwrap();
+            let arena_config = config.arena_config(Arena::from("test")).unwrap();
 
             assert_eq!(
                 arena_config.debounce,
@@ -693,7 +712,8 @@ mod tests {
             [cache]
             db = "/path/to/cache.db"
 
-            [arenas."arena1"]
+            [[arena]]
+            name = "arena1"
             wrongname = "/path/to/arena1" # should be root
             db = "/path/to/arena1.db"
             blob_dir = "/path/to/arena1/blobs"

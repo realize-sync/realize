@@ -14,12 +14,9 @@ async fn file_drop() -> anyhow::Result<()> {
     let b = HouseholdFixture::b();
     let arena = HouseholdFixture::test_arena();
     let mut builder = HouseholdFixture::builder();
-    builder
-        .config_mut(a)
-        .arenas
-        .get_mut(&arena)
-        .unwrap()
-        .disk_usage = Some(DiskUsageLimits::max_bytes(0));
+    let config = builder.config_mut(a);
+    let arena_config = config.arena_config_mut(arena).unwrap();
+    arena_config.disk_usage = Some(DiskUsageLimits::max_bytes(0));
 
     let mut fixture = builder.setup().await?;
     fixture

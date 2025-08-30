@@ -76,14 +76,12 @@ impl Fixture {
         };
 
         // Configure arena with required cache and optional local path
-        config.storage.arenas.insert(
+        config.storage.arena.push(ArenaConfig::new(
             arena,
-            ArenaConfig::new(
-                testdir.to_path_buf(),
-                tempdir.child("testdir-cache.db").to_path_buf(),
-                tempdir.child("testdir-blobs").to_path_buf(),
-            ),
-        );
+            testdir.to_path_buf(),
+            tempdir.child("testdir-cache.db").to_path_buf(),
+            tempdir.child("testdir-blobs").to_path_buf(),
+        ));
 
         testdir.child("foo.txt").write_str("hello")?;
 
@@ -124,9 +122,11 @@ impl Fixture {
     fn configure_cache(&mut self) {
         // Cache is now always configured in setup, but this method can be used
         // to override cache configuration if needed for specific tests
-        for (arena, arena_config) in &mut self.config.storage.arenas {
-            let child = self.tempdir.child(format!("{arena}-cache.db"));
-            let blob_dir = self.tempdir.child(format!("{arena}-blobs"));
+        for arena_config in &mut self.config.storage.arena {
+            let child = self
+                .tempdir
+                .child(format!("{}-cache.db", arena_config.arena));
+            let blob_dir = self.tempdir.child(format!("{}-blobs", arena_config.arena));
             arena_config.db = child.to_path_buf();
             arena_config.blob_dir = blob_dir.to_path_buf();
         }
@@ -436,13 +436,12 @@ async fn daemon_updates_cache() -> anyhow::Result<()> {
     use tokio_retry::strategy::FixedInterval;
 
     let mut fixture_a = Fixture::setup().await?;
-    fixture_a
+    let arena_config = fixture_a
         .config
         .storage
-        .arenas
-        .get_mut(&Arena::from("testdir"))
-        .unwrap()
-        .db = fixture_a.tempdir.join("index.db");
+        .arena_config_mut(Arena::from("testdir"))
+        .unwrap();
+    arena_config.db = fixture_a.tempdir.join("index.db");
 
     let mut daemon_a = fixture_a
         .command()?
