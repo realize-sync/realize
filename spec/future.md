@@ -3,10 +3,55 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
-## nfs mount arenas or subdirectories {#mountarena}
+## unprivileged mounting of overlayfs {#overlayfs}
 
-It should be possible to specify an arena when mounting the NFS dir
-and getting only the content of that arena.
+Unprivileged mounting of overlayfs is available since Linux 5.11.
+Unprivileged mounting must be associated with -o userxattr, which
+switches to using user xattrs, which can be read by normal processes.
+
+Overlays must be configured separately per arena. This needs extra configuration:
+
+[[arena]]
+name= ...
+data= ...
+metadata= ...
+mountpoint = ...
+
+metadata is required (this is where the db and blobs are stored)
+data is optional.
+mountpoint is optional. If set, requires data. Requires option --fuse.
+
+1. Replace db and blobdir with metadata in ArenaConfig. db becomes
+   <metadata>/arena.db and blobdir <metadata>/blobs (created if
+   necessary).
+
+   <metadata> must be writable. It is created if necessary by
+   check_dirs() in [setup.rs](../crate/realize-core/src/setup.rs)
+
+   The following rules are also enforced by check_dirs():
+
+   If <data> is specified, <metadata> must be on the same device
+   (std::os::unix::fs::MetadataExt::dev must be the same on both).
+
+   If <data> is specified, <data> must not be a child of <metadata>.
+
+2. Add function mount_overlays to
+   [setup.rs](../crate/realize-core/src/setup.rs).
+
+   This function is called once on each ArenaConfig that defines a
+   mountpoint and is passed the ArenaConfig and mountpoint and mounts
+   the overlayfs with a call to nix::mount::mount equivalent to:
+
+   mount -t overlay -o lowerdir=<fuse-mountpoint>/<arena>,upperdir=<arena-data>,workdir=<arena-meta>/work,redirect_dir=on,metacopy=on overlay
+
+   Unmount the mountpoint first with MNT_FORCE (using
+   nix::mount::unmount2), in case it already exists.
+
+   The function mount_overlays returns a handle that, when dropped,
+   unmounts the directory with MNT_FORCE. The handle also has a method
+   fn unmount(self) to unmount cleanly, without MNT_FORCE.
+
+   ^^ This is going to be a problem. Should it be a separate command?
 
 ## configure "auth" logs {#logauth}
 
@@ -39,11 +84,6 @@ Possibly use or integrate with tracing.
 What if "no version" files could be reported? Remote FS could be up
 and ready quicker, though without version.
 
-## Investigate why only one file is downloaded at a time {#onefile}
-
-Churten downloads one file at a time, instead of 4. 4 are displayed,
-but only one progresses.
-
 ## Trim history {#trimhistory}
 
 Decide on rules for trimming history.
@@ -53,14 +93,6 @@ Decide on rules for trimming history.
 Currently, when accessing remote files, the data is always downloaded.
 If the file is kept as long as it's open, even if it's too large to
 fit in the working area. That's wrong.
-
-## Add Mark::Ignore {#ignore}
-
-Mark::Ignore means that a file or directory must not be indexed. It
-might also mean that a file or directory must not be added into the
-cache, even if reported by another peer.
-
-## bug: overlay reports no file if lower is brand new, empty arena even if upper has files {#overlaynew}
 
 ## Support editing files through overlay fs {#overlaymod}
 
@@ -195,19 +227,3 @@ stable 1.8MB/s when limited to 2MB/s (I assume 0.2MB/s for TLS)
 
 This might not help much as long as the data is already compressed
 (audio or video).
-
-## Fix error message output {#errormsg}
-
-When caught by with_context, error cause are printed.
-
-When not caught by with_context, in move_files, error causes are not
-printed. Also, in move_files, remote errors don't say which end (src
-or dst) threw this.
-
-- Fix error messages so that causes are printed. Keep error type cruft
-  to a minimum.
-
-- Add with_context to errors returned by a client (give a name to a
-  client? use the address?)
-
-- Print app errors in client at debug level
