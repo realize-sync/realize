@@ -4,7 +4,7 @@ use crate::rpc::HouseholdOperationError;
 use crate::rpc::{ExecutionMode, Household};
 use fast_rsync::ApplyError;
 use futures::StreamExt;
-use realize_storage::{Inode, JobStatus, LocalAvailability, Storage, StorageError};
+use realize_storage::{Blob, JobStatus, LocalAvailability, Storage, StorageError};
 use realize_types::{Arena, ByteRanges, Hash, Path, Peer, Signature};
 use std::io::SeekFrom;
 use std::sync::Arc;
@@ -50,50 +50,47 @@ pub(crate) async fn download(
     progress: &mut impl ByteCountProgress,
     shutdown: CancellationToken,
 ) -> Result<JobStatus, JobError> {
+    log::debug!("[{arena}] Download \"{path}\": Checking");
     let cache = storage.cache();
-    let inode = match cache.expect(arena, path).await {
-        Err(StorageError::NotFound) => {
+    let inode = match cache.resolve(arena, path).await? {
+        Some(inode) => inode,
+        None => {
             return Ok(JobStatus::Abandoned("not in cache"));
         }
-        Err(err) => {
-            return Err(err.into());
-        }
-        Ok(inode) => inode,
     };
-    match cache.local_availability(inode).await {
+    let mut blob = match storage.cache().open_file(inode).await {
+        Ok(blob) => blob,
         Err(StorageError::NotFound) => {
             return Ok(JobStatus::Abandoned("not in cache"));
         }
         Err(err) => {
             return Err(err.into());
         }
-        Ok(LocalAvailability::Verified) => {
-            return Ok(JobStatus::Done);
-        }
-
-        Ok(LocalAvailability::Complete) => {
-            return verify(
-                storage, household, arena, path, inode, hash, progress, shutdown,
-            )
-            .await;
-        }
-
-        Ok(LocalAvailability::Missing) | Ok(LocalAvailability::Partial(_, _)) => {
+    };
+    if *blob.hash() != *hash {
+        return Ok(JobStatus::Abandoned("hash mismatch"));
+    }
+    match blob.local_availability() {
+        LocalAvailability::Verified => return Ok(JobStatus::Done),
+        LocalAvailability::Complete => {
             let peers = storage.cache().file_availability(inode).await?.peers;
             if peers.is_empty() {
                 return Ok(JobStatus::Abandoned("no peer has it"));
             }
+            return verify(household, arena, path, blob, peers, progress, shutdown).await;
+        }
 
-            let mut blob = storage.cache().open_file(inode).await?;
-            if *blob.hash() != *hash {
-                return Ok(JobStatus::Abandoned("Blob.hash is wrong"));
+        LocalAvailability::Missing | LocalAvailability::Partial(_, _) => {
+            let peers = storage.cache().file_availability(inode).await?.peers;
+            if peers.is_empty() {
+                return Ok(JobStatus::Abandoned("no peer has it"));
             }
 
             let res = write_to_blob(
                 household,
                 arena,
                 path,
-                peers,
+                &peers,
                 &mut blob,
                 progress,
                 shutdown.clone(),
@@ -110,12 +107,7 @@ pub(crate) async fn download(
                 }
             }
 
-            drop(blob); // Make sure the file is closed before verifying
-
-            return verify(
-                storage, household, arena, path, inode, hash, progress, shutdown,
-            )
-            .await;
+            return verify(household, arena, path, blob, peers, progress, shutdown).await;
         }
     }
 }
@@ -125,12 +117,12 @@ async fn write_to_blob(
     household: &Arc<Household>,
     arena: Arena,
     path: &Path,
-    peers: Vec<Peer>,
+    peers: &Vec<Peer>,
     blob: &mut realize_storage::Blob,
     progress: &mut impl ByteCountProgress,
     shutdown: CancellationToken,
 ) -> Result<JobStatus, JobError> {
-    let missing = ByteRanges::single(0, blob.size()).subtraction(blob.local_availability());
+    let missing = ByteRanges::single(0, blob.size()).subtraction(blob.available_range());
     if missing.is_empty() {
         return Ok(JobStatus::Done);
     }
@@ -139,6 +131,7 @@ async fn write_to_blob(
     let mut last_update_bytes = 0;
     progress.update_action(JobAction::Download);
     progress.update(0, total_bytes);
+    log::debug!("[{arena}] Download \"{path}\": Blob incomplete; download {missing}");
 
     for range in missing {
         let mut stream = household.read(
@@ -180,41 +173,33 @@ async fn write_to_blob(
 /// This call will fail if the file is incomplete. Call download()
 /// first if necessary.
 pub(crate) async fn verify(
-    storage: &Arc<Storage>,
     household: &Arc<Household>,
     arena: Arena,
     path: &Path,
-    inode: Inode,
-    hash: &Hash,
+    mut blob: Blob,
+    peers: Vec<Peer>,
     progress: &mut impl ByteCountProgress,
     shutdown: CancellationToken,
 ) -> Result<JobStatus, JobError> {
-    let mut blob = storage.cache().open_file(inode).await?;
-    if *blob.hash() != *hash {
-        return Ok(JobStatus::Abandoned("Blob.hash mismatch"));
-    }
-
+    log::debug!("[{arena}] Download \"{path}\": Blob complete; Verify");
     progress.update_action(JobAction::Verify);
-    let content_hash = tokio::select!(
+    let computed_hash = tokio::select!(
     res = blob.compute_hash() => { res? },
     _ = shutdown.cancelled() => {
         return Ok(JobStatus::Cancelled);
     });
-    if content_hash == *hash {
+    if computed_hash == *blob.hash() {
         blob.mark_verified().await?;
-        log::debug!("[{arena}] Verified \"{path}\" against {hash}");
+        log::debug!("[{arena}] Verified \"{path}\" against {computed_hash}");
         return Ok(JobStatus::Done);
     }
-    log::debug!(
-        "[{arena}] Inconsistent hash for \"{path}\"; Repairing. Expected {hash}, got {content_hash}."
-    );
 
     // repair
+    log::debug!(
+        "[{arena}] Download \"{path}\": Hash mismatch (expected: {} got: {computed_hash}); Repair",
+        blob.hash()
+    );
     progress.update_action(JobAction::Repair);
-    let peers = storage.cache().file_availability(inode).await?.peers;
-    if peers.is_empty() {
-        return Ok(JobStatus::Abandoned("not available anywhere"));
-    }
     let opts = fast_rsync::SignatureOptions {
         block_size: 4 * 1024 as u32,
         crypto_hash_size: 8,
@@ -248,20 +233,22 @@ pub(crate) async fn verify(
     }
     blob.flush_and_sync().await?;
 
+    log::debug!("[{arena}] Download \"{path}\": Repaired; Verify");
     progress.update_action(JobAction::Verify);
-    let content_hash = tokio::select!(
+    let computed_hash = tokio::select!(
     res = blob.compute_hash() => { res? },
     _ = shutdown.cancelled() => {
         return Ok(JobStatus::Cancelled);
     });
-    if content_hash != *hash {
+    if computed_hash != *blob.hash() {
         log::debug!(
-            "[{arena}] Inconsistent hash after repair for \"{path}\"; Giving up. Expected {hash}, got {content_hash}"
+            "[{arena}] Inconsistent hash after repair for \"{path}\"; Giving up. Expected {}, got {computed_hash}",
+            blob.hash()
         );
         return Err(JobError::InconsistentHash);
     }
     blob.mark_verified().await?;
-    log::debug!("[{arena}] Fixed and verified \"{path}\" {hash}");
+    log::debug!("[{arena}] Download \"{path}\": Fixed and verified to be {computed_hash}");
 
     Ok(JobStatus::Done)
 }
@@ -439,7 +426,7 @@ mod tests {
                 );
 
                 let mut blob = fixture.open_file(a, "foobar").await?;
-                assert_eq!(ByteRanges::single(0, 12), *blob.local_availability());
+                assert_eq!(ByteRanges::single(0, 12), *blob.available_range());
 
                 let mut buf = String::new();
                 blob.read_to_string(&mut buf).await?;
@@ -486,7 +473,7 @@ mod tests {
                 );
 
                 let blob = fixture.open_file(a, "foobar").await?;
-                assert!(blob.local_availability().is_empty());
+                assert!(blob.available_range().is_empty());
 
                 assert_eq!(
                     LocalAvailability::Verified,
@@ -546,7 +533,7 @@ mod tests {
                 );
 
                 let mut blob = fixture.open_file(a, "foobar").await?;
-                assert_eq!(ByteRanges::single(0, 21), *blob.local_availability());
+                assert_eq!(ByteRanges::single(0, 21), *blob.available_range());
 
                 let mut buf = String::new();
                 blob.read_to_string(&mut buf).await?;
@@ -603,7 +590,7 @@ mod tests {
                 );
 
                 let mut blob = fixture.open_file(a, "foobar").await?;
-                assert_eq!(ByteRanges::single(0, 21), *blob.local_availability());
+                assert_eq!(ByteRanges::single(0, 21), *blob.available_range());
 
                 let mut buf = String::new();
                 blob.read_to_string(&mut buf).await?;
@@ -725,7 +712,7 @@ mod tests {
                 );
 
                 let blob = fixture.open_file(a, "foobar").await?;
-                assert!(blob.local_availability().is_empty());
+                assert!(blob.available_range().is_empty());
 
                 Ok::<(), anyhow::Error>(())
             })

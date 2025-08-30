@@ -1118,14 +1118,10 @@ impl BlobIncomplete {
 /// error of kind [std::io::ErrorKind::InvalidData] with a
 /// [BlobIncomplete] error.
 pub struct Blob {
-    inode: Inode,
+    info: BlobInfo,
     file: tokio::fs::File,
-    size: u64,
-    hash: Hash,
     db: Arc<ArenaDatabase>,
 
-    /// Complete available range
-    available_ranges: ByteRanges,
     /// Updates to the available range already integrated into
     /// available_range but not yet reported to update_tx.
     pending_ranges: ByteRanges,
@@ -1174,20 +1170,22 @@ impl Blob {
         let _ = blobs.accessed_tx.send(info.inode);
 
         Ok(Self {
-            inode: info.inode,
+            info,
             file: tokio::fs::File::from_std(file),
-            available_ranges: info.available_ranges,
             db: Arc::clone(db),
             pending_ranges: ByteRanges::new(),
-            size: info.size,
-            hash: info.hash,
             offset: 0,
         })
     }
 
     /// Get the size of the corresponding file.
     pub fn size(&self) -> u64 {
-        self.size
+        self.info.size
+    }
+
+    /// Return the blob inode.
+    pub fn inode(&self) -> Inode {
+        self.info.inode
     }
 
     /// Current read/write position within the file.
@@ -1204,13 +1202,21 @@ impl Blob {
     /// - includes ranges that have been written to the file, but
     ///   haven't been flushed yet.
     /// - does not include ranges written through other file handles
-    pub fn local_availability(&self) -> &ByteRanges {
-        &self.available_ranges
+    pub fn available_range(&self) -> &ByteRanges {
+        &self.info.available_ranges
+    }
+
+    /// Return local availability for the blob.
+    ///
+    /// This is based on the [Blob::available_range] so might return a
+    /// different result than if you checked the database.
+    pub fn local_availability(&self) -> LocalAvailability {
+        self.info.local_availability()
     }
 
     /// Get the hash of the corresponding file.
     pub fn hash(&self) -> &Hash {
-        &self.hash
+        &self.info.hash
     }
 
     /// Compute hash from the current local content.
@@ -1232,9 +1238,10 @@ impl Blob {
     pub async fn mark_verified(&mut self) -> Result<bool, StorageError> {
         self.update_db().await?;
 
-        let inode = self.inode;
+        self.info.verified = true;
+        let inode = self.info.inode;
         let db = self.db.clone();
-        let hash = self.hash.clone();
+        let hash = self.info.hash.clone();
         tokio::task::spawn_blocking(move || {
             let txn = db.begin_write()?;
             {
@@ -1270,10 +1277,10 @@ impl Blob {
         }
         self.flush_and_sync().await?;
 
-        let inode = self.inode;
+        let inode = self.info.inode;
         let ranges = self.pending_ranges.clone();
         let db = Arc::clone(&self.db);
-        let hash = self.hash.clone();
+        let hash = self.info.hash.clone();
 
         let (res, ranges) = tokio::task::spawn_blocking(move || {
             fn extend(
@@ -1321,7 +1328,8 @@ impl Blob {
             return Some(0);
         }
         // Read what's left in a range containing offset
-        self.available_ranges
+        self.info
+            .available_ranges
             .containing_range(offset)
             .map(|r| min(requested_len, (r.end - offset) as usize))
     }
@@ -1330,7 +1338,7 @@ impl Blob {
 impl Drop for Blob {
     fn drop(&mut self) {
         let blobs = self.db.blobs();
-        if blobs.open_blobs.decrement(self.inode) {
+        if blobs.open_blobs.decrement(self.info.inode) {
             // poke disk usage without modifying it so the cleaner
             // attempts to evict files it couldn't previously evict
             // because they were open.
@@ -1409,7 +1417,7 @@ impl AsyncWrite for Blob {
                 let end = start + (*len as u64);
                 self.offset = end;
                 let range = ByteRange::new(start, end);
-                self.available_ranges.add(&range);
+                self.info.available_ranges.add(&range);
                 self.pending_ranges.add(&range);
             }
         }
@@ -1851,7 +1859,7 @@ mod tests {
         let mut blob = Blob::open(&fixture.db, &path)?;
 
         blob.write(b"Baa, baa").await?;
-        assert_eq!(ByteRanges::single(0, 8), *blob.local_availability());
+        assert_eq!(ByteRanges::single(0, 8), *blob.available_range());
 
         // At this point, local availability is only in the blob, not
         // yet stored on the database.
@@ -1861,7 +1869,7 @@ mod tests {
         );
 
         blob.write(b", black sheep").await?;
-        assert_eq!(ByteRanges::single(0, 21), *blob.local_availability());
+        assert_eq!(ByteRanges::single(0, 21), *blob.available_range());
 
         let watch = fixture.db.blobs().watch_disk_usage();
         blob.update_db().await?;
@@ -1963,14 +1971,14 @@ mod tests {
 
         blob.write(b", black sheep").await?;
         assert_eq!(false, blob.update_db().await?);
-        assert_eq!(ByteRanges::single(0, 21), *blob.local_availability());
+        assert_eq!(ByteRanges::single(0, 21), *blob.available_range());
         assert_eq!(
             ByteRanges::new(),
             fixture.blob_info(&path)?.unwrap().available_ranges
         );
 
         assert_eq!(false, blob.mark_verified().await?);
-        assert_eq!(ByteRanges::single(0, 21), *blob.local_availability());
+        assert_eq!(ByteRanges::single(0, 21), *blob.available_range());
         assert_eq!(
             ByteRanges::new(),
             fixture.blob_info(&path)?.unwrap().available_ranges
@@ -1987,7 +1995,7 @@ mod tests {
 
         assert_eq!(false, fixture.blob_info(&path)?.unwrap().verified);
         let mut blob = Blob::open(&fixture.db, &path)?;
-        assert_eq!(ByteRanges::single(0, 21), *blob.local_availability());
+        assert_eq!(ByteRanges::single(0, 21), *blob.available_range());
         assert_eq!(true, blob.mark_verified().await?);
         assert_eq!(true, fixture.blob_info(&path)?.unwrap().verified);
         drop(blob);
@@ -2142,7 +2150,7 @@ mod tests {
         assert_eq!(data.len() as u64, blob.size);
         assert_eq!(
             ByteRanges::single(0, data.len() as u64),
-            *blob.local_availability()
+            *blob.available_range()
         );
         let mut buf = String::new();
         blob.read_to_string(&mut buf).await?;
@@ -2195,7 +2203,7 @@ mod tests {
         assert_eq!(data.len() as u64, blob.size);
         assert_eq!(
             ByteRanges::single(0, data.len() as u64),
-            *blob.local_availability()
+            *blob.available_range()
         );
         let mut buf = String::new();
         blob.read_to_string(&mut buf).await?;

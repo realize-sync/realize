@@ -148,7 +148,7 @@ impl Download {
     ///   haven't been flushed yet.
     /// - does not include ranges written through other file handles
     pub fn local_availability(&self) -> &ByteRanges {
-        self.blob.local_availability()
+        self.blob.available_range()
     }
 
     fn fill(&mut self, buf: &mut ReadBuf<'_>) -> bool {
