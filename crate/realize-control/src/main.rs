@@ -105,9 +105,9 @@ enum PeerCommands {
 /// among the standard locations
 fn get_default_socket_path() -> Option<PathBuf> {
     let socket_paths = [
-        PathBuf::from("/run/realize/control.socket"),
-        PathBuf::from("/var/run/realize/control.socket"),
-        PathBuf::from("/tmp/realize/control.socket"),
+        PathBuf::from("/run/realized/control.socket"),
+        PathBuf::from("/var/run/realized/control.socket"),
+        PathBuf::from("/tmp/realized/control.socket"),
     ];
 
     for path in socket_paths {
