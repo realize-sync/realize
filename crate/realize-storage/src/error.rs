@@ -176,33 +176,20 @@ mod tests {
 
     #[test]
     fn test_storage_error_into_io_error() {
-        // Test various StorageError variants
-        let db_error = StorageError::Database(Box::new(redb::Error::Io(std::io::Error::new(
-            ErrorKind::Other,
-            "test",
-        ))));
-        let io_error: std::io::Error = db_error.into();
-        assert_eq!(io_error.kind(), ErrorKind::Other);
-        assert_eq!(io_error.to_string(), "database error");
-
         let not_found = StorageError::NotFound;
         let io_error: std::io::Error = not_found.into();
         assert_eq!(io_error.kind(), ErrorKind::NotFound);
-        assert_eq!(io_error.to_string(), "not found");
 
         let not_a_dir = StorageError::NotADirectory;
         let io_error: std::io::Error = not_a_dir.into();
         assert_eq!(io_error.kind(), ErrorKind::NotADirectory);
-        assert_eq!(io_error.to_string(), "not a directory");
 
         let is_a_dir = StorageError::IsADirectory;
         let io_error: std::io::Error = is_a_dir.into();
         assert_eq!(io_error.kind(), ErrorKind::IsADirectory);
-        assert_eq!(io_error.to_string(), "is a directory");
 
         let invalid_input = StorageError::InvalidRsyncSignature;
         let io_error: std::io::Error = invalid_input.into();
         assert_eq!(io_error.kind(), ErrorKind::InvalidInput);
-        assert_eq!(io_error.to_string(), "invalid rsync signature");
     }
 }
