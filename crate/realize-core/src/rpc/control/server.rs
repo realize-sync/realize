@@ -399,6 +399,7 @@ mod tests {
         async fn run(
             &self,
             _arena: Arena,
+            _job_id: JobId,
             _job: &Arc<realize_storage::Job>,
             progress: &mut TxByteCountProgress,
             shutdown: CancellationToken,

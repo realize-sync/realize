@@ -30,6 +30,7 @@ pub(crate) trait JobHandler: Sync + Send + Clone {
     fn run(
         &self,
         arena: Arena,
+        job_id: JobId,
         job: &Arc<Job>,
         progress: &mut TxByteCountProgress,
         shutdown: CancellationToken,
@@ -233,12 +234,14 @@ async fn run_job<H: JobHandler>(
     tx: &broadcast::Sender<ChurtenNotification>,
     shutdown: CancellationToken,
 ) -> (Arena, JobId, Result<JobStatus, JobError>) {
-    log::debug!("[{arena}] Starting Job #{job_id} {job:?}");
+    log::debug!("[{arena}] Job #{job_id} Starting {job:?}");
     let _ = tx.send(ChurtenNotification::Start { arena, job_id });
     let mut progress = TxByteCountProgress::new(arena, job_id, tx.clone())
         .adaptive(BROADCAST_CHANNEL_CAPACITY)
         .with_min_byte_delta(BROADCAST_CHANNEL_RESOLUTION_BYTES);
-    let result = handler.run(arena, &job, &mut progress, shutdown).await;
+    let result = handler
+        .run(arena, job_id, &job, &mut progress, shutdown)
+        .await;
 
     (arena, job_id, result)
 }
@@ -260,6 +263,7 @@ impl JobHandler for JobHandlerImpl {
     async fn run(
         &self,
         arena: Arena,
+        job_id: JobId,
         job: &Arc<Job>,
         progress: &mut TxByteCountProgress,
         shutdown: CancellationToken,
@@ -270,6 +274,7 @@ impl JobHandler for JobHandlerImpl {
                     &self.storage,
                     &self.household,
                     arena,
+                    job_id,
                     path,
                     hash,
                     progress,
@@ -507,6 +512,7 @@ mod tests {
         async fn run(
             &self,
             _arena: Arena,
+            _job_id: JobId,
             _job: &Arc<Job>,
             progress: &mut TxByteCountProgress,
             shutdown: CancellationToken,

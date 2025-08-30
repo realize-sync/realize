@@ -61,7 +61,7 @@ impl StorageJobProcessor {
         let this = Arc::clone(self);
         task::spawn_blocking(move || {
             if !matches!(job, StorageJob::External(_)) {
-                log::info!("[{}] Starting Job #{job_id}: {job:?}", this.db.arena());
+                log::info!("[{}] Job #{job_id} Starting {job:?}", this.db.arena());
             }
             if let Some(status) = this.process_job(job) {
                 this.engine

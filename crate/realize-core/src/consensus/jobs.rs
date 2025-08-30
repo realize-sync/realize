@@ -4,7 +4,7 @@ use crate::rpc::HouseholdOperationError;
 use crate::rpc::{ExecutionMode, Household};
 use fast_rsync::ApplyError;
 use futures::StreamExt;
-use realize_storage::{Blob, JobStatus, LocalAvailability, Storage, StorageError};
+use realize_storage::{Blob, JobId, JobStatus, LocalAvailability, Storage, StorageError};
 use realize_types::{Arena, ByteRanges, Hash, Path, Peer, Signature};
 use std::io::SeekFrom;
 use std::sync::Arc;
@@ -45,12 +45,13 @@ pub(crate) async fn download(
     storage: &Arc<Storage>,
     household: &Arc<Household>,
     arena: Arena,
+    job_id: JobId,
     path: &Path,
     hash: &Hash,
     progress: &mut impl ByteCountProgress,
     shutdown: CancellationToken,
 ) -> Result<JobStatus, JobError> {
-    log::debug!("[{arena}] Download \"{path}\": Checking");
+    log::debug!("[{arena}] Job #{job_id} Checking");
     let cache = storage.cache();
     let inode = match cache.resolve(arena, path).await? {
         Some(inode) => inode,
@@ -77,7 +78,10 @@ pub(crate) async fn download(
             if peers.is_empty() {
                 return Ok(JobStatus::Abandoned("no peer has it"));
             }
-            return verify(household, arena, path, blob, peers, progress, shutdown).await;
+            return verify(
+                household, arena, job_id, path, blob, peers, progress, shutdown,
+            )
+            .await;
         }
 
         LocalAvailability::Missing | LocalAvailability::Partial(_, _) => {
@@ -89,6 +93,7 @@ pub(crate) async fn download(
             let res = write_to_blob(
                 household,
                 arena,
+                job_id,
                 path,
                 &peers,
                 &mut blob,
@@ -107,7 +112,10 @@ pub(crate) async fn download(
                 }
             }
 
-            return verify(household, arena, path, blob, peers, progress, shutdown).await;
+            return verify(
+                household, arena, job_id, path, blob, peers, progress, shutdown,
+            )
+            .await;
         }
     }
 }
@@ -116,6 +124,7 @@ pub(crate) async fn download(
 async fn write_to_blob(
     household: &Arc<Household>,
     arena: Arena,
+    job_id: JobId,
     path: &Path,
     peers: &Vec<Peer>,
     blob: &mut realize_storage::Blob,
@@ -131,7 +140,7 @@ async fn write_to_blob(
     let mut last_update_bytes = 0;
     progress.update_action(JobAction::Download);
     progress.update(0, total_bytes);
-    log::debug!("[{arena}] Download \"{path}\": Blob incomplete; download {missing}");
+    log::debug!("[{arena}] Job #{job_id} Blob incomplete; Download {missing}");
 
     for range in missing {
         let mut stream = household.read(
@@ -175,13 +184,14 @@ async fn write_to_blob(
 pub(crate) async fn verify(
     household: &Arc<Household>,
     arena: Arena,
+    job_id: JobId,
     path: &Path,
     mut blob: Blob,
     peers: Vec<Peer>,
     progress: &mut impl ByteCountProgress,
     shutdown: CancellationToken,
 ) -> Result<JobStatus, JobError> {
-    log::debug!("[{arena}] Download \"{path}\": Blob complete; Verify");
+    log::debug!("[{arena}] Job #{job_id} Blob complete; Verify");
     progress.update_action(JobAction::Verify);
     let computed_hash = tokio::select!(
     res = blob.compute_hash() => { res? },
@@ -190,13 +200,13 @@ pub(crate) async fn verify(
     });
     if computed_hash == *blob.hash() {
         blob.mark_verified().await?;
-        log::debug!("[{arena}] Verified \"{path}\" against {computed_hash}");
+        log::debug!("[{arena}] Job #{job_id} Verified against {computed_hash}");
         return Ok(JobStatus::Done);
     }
 
     // repair
     log::debug!(
-        "[{arena}] Download \"{path}\": Hash mismatch (expected: {} got: {computed_hash}); Repair",
+        "[{arena}] Job #{job_id} Hash mismatch (expected: {} got: {computed_hash}); Repair",
         blob.hash()
     );
     progress.update_action(JobAction::Repair);
@@ -233,7 +243,7 @@ pub(crate) async fn verify(
     }
     blob.flush_and_sync().await?;
 
-    log::debug!("[{arena}] Download \"{path}\": Repaired; Verify");
+    log::debug!("[{arena}] Job #{job_id}: Repaired; Verify");
     progress.update_action(JobAction::Verify);
     let computed_hash = tokio::select!(
     res = blob.compute_hash() => { res? },
@@ -242,13 +252,13 @@ pub(crate) async fn verify(
     });
     if computed_hash != *blob.hash() {
         log::debug!(
-            "[{arena}] Inconsistent hash after repair for \"{path}\"; Giving up. Expected {}, got {computed_hash}",
+            "[{arena}] Job #{job_id} Inconsistent hash after repair; Giving up. Expected {}, got {computed_hash}",
             blob.hash()
         );
         return Err(JobError::InconsistentHash);
     }
     blob.mark_verified().await?;
-    log::debug!("[{arena}] Download \"{path}\": Fixed and verified to be {computed_hash}");
+    log::debug!("[{arena}] Job #{job_id} Fixed and verified to be {computed_hash}");
 
     Ok(JobStatus::Done)
 }
@@ -417,6 +427,7 @@ mod tests {
                         fixture.inner.storage(a)?,
                         &household_a,
                         HouseholdFixture::test_arena(),
+                        JobId(1),
                         &path,
                         &hash,
                         &mut NoOpByteCountProgress,
@@ -464,6 +475,7 @@ mod tests {
                         fixture.inner.storage(a)?,
                         &household_a,
                         HouseholdFixture::test_arena(),
+                        JobId(1),
                         &path,
                         &hash::digest(""),
                         &mut progress,
@@ -524,6 +536,7 @@ mod tests {
                         fixture.inner.storage(a)?,
                         &household_a,
                         HouseholdFixture::test_arena(),
+                        JobId(1),
                         &path,
                         &hash::digest("baa, baa, black sheep"),
                         &mut NoOpByteCountProgress,
@@ -581,6 +594,7 @@ mod tests {
                         fixture.inner.storage(a)?,
                         &household_a,
                         HouseholdFixture::test_arena(),
+                        JobId(1),
                         &path,
                         &hash::digest("baa, baa, black sheep"),
                         &mut NoOpByteCountProgress,
@@ -627,6 +641,7 @@ mod tests {
                         fixture.inner.storage(a)?,
                         &household_a,
                         HouseholdFixture::test_arena(),
+                        JobId(1),
                         &path,
                         &hash::digest("barfoo"), // mismatch
                         &mut NoOpByteCountProgress,
@@ -660,6 +675,7 @@ mod tests {
                         fixture.inner.storage(a)?,
                         &household_a,
                         HouseholdFixture::test_arena(),
+                        JobId(1),
                         &Path::parse("doesnotexist")?,
                         &hash::digest(""),
                         &mut NoOpByteCountProgress,
@@ -703,6 +719,7 @@ mod tests {
                         fixture.inner.storage(a)?,
                         &household_a,
                         HouseholdFixture::test_arena(),
+                        JobId(1),
                         &path,
                         &hash,
                         &mut NoOpByteCountProgress,
@@ -755,6 +772,7 @@ mod tests {
                         fixture.inner.storage(a)?,
                         &household_a,
                         HouseholdFixture::test_arena(),
+                        JobId(1),
                         &path,
                         &hash,
                         &mut progress,
@@ -806,6 +824,7 @@ mod tests {
                         fixture.inner.storage(a)?,
                         &household_a,
                         HouseholdFixture::test_arena(),
+                        JobId(1),
                         &path,
                         &hash,
                         &mut progress,
@@ -857,6 +876,7 @@ mod tests {
                         fixture.inner.storage(a)?,
                         &household_a,
                         arena,
+                        JobId(1),
                         &foobar,
                         &hash,
                         &mut progress,
@@ -914,6 +934,7 @@ mod tests {
                         fixture.inner.storage(a)?,
                         &household_a,
                         arena,
+                        JobId(1),
                         &foobar,
                         &hash,
                         &mut progress,
@@ -973,6 +994,7 @@ mod tests {
                         fixture.inner.storage(a)?,
                         &household_a,
                         HouseholdFixture::test_arena(),
+                        JobId(1),
                         &path,
                         &hash,
                         &mut NoOpByteCountProgress,
@@ -1033,6 +1055,7 @@ mod tests {
                         fixture.inner.storage(a)?,
                         &household_a,
                         HouseholdFixture::test_arena(),
+                        JobId(1),
                         &path,
                         &hash,
                         &mut progress,

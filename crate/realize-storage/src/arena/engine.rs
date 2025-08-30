@@ -308,7 +308,7 @@ impl Engine {
                     // Skip it for now; it'll be handled after a delay.
                     continue;
                 }
-                log::debug!("[{arena}] Job #{job_id} {job:?}");
+                log::debug!("[{arena}] Job #{job_id} Pending {job:?}");
                 if tx.send((job_id, job)).await.is_err() {
                     // Broken channel; normal end of this loop
                     return Ok(());
