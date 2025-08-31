@@ -63,11 +63,11 @@ pub struct ArenaConfig {
 
     /// Optional local path to the directory where files for that arena are stored.
     /// If specified, an indexer will be created for this arena.
-    pub root: Option<PathBuf>,
-    /// Path to the database that contains both index and cache data (required for arena cache).
-    pub db: PathBuf,
-    /// Path to the directory where blob files are stored (required for arena cache).
-    pub blob_dir: PathBuf,
+    pub datadir: Option<PathBuf>,
+    /// Path to the directory where the database, blobs and overlay workdir are kept.
+    ///
+    /// This directory must be on the same directory as datadir, if specified.
+    pub workdir: PathBuf,
 
     /// Maximum number of hashers running in parallel.
     ///
@@ -90,17 +90,15 @@ pub struct ArenaConfig {
 }
 
 impl ArenaConfig {
-    pub fn new<P1, P2, P3>(arena: Arena, root: P1, db: P2, blob_dir: P3) -> Self
+    pub fn new<P1, P2>(arena: Arena, root: P1, metadata: P2) -> Self
     where
         P1: AsRef<std::path::Path>,
         P2: AsRef<std::path::Path>,
-        P3: AsRef<std::path::Path>,
     {
         Self {
             arena,
-            root: Some(root.as_ref().to_path_buf()),
-            db: db.as_ref().to_path_buf(),
-            blob_dir: blob_dir.as_ref().to_path_buf(),
+            datadir: Some(root.as_ref().to_path_buf()),
+            workdir: metadata.as_ref().to_path_buf(),
             max_parallel_hashers: None,
             debounce: None,
             disk_usage: None,
@@ -108,16 +106,14 @@ impl ArenaConfig {
     }
 
     /// Configure an arena without local root folder.
-    pub fn rootless<P1, P2>(arena: Arena, db: P1, blob_dir: P2) -> Self
+    pub fn rootless<P>(arena: Arena, metadata: P) -> Self
     where
-        P1: AsRef<std::path::Path>,
-        P2: AsRef<std::path::Path>,
+        P: AsRef<std::path::Path>,
     {
         Self {
             arena,
-            db: db.as_ref().to_path_buf(),
-            blob_dir: blob_dir.as_ref().to_path_buf(),
-            root: None,
+            workdir: metadata.as_ref().to_path_buf(),
+            datadir: None,
             max_parallel_hashers: None,
             debounce: None,
             disk_usage: None,
@@ -378,16 +374,14 @@ mod tests {
 
             [[arena]]
             name = "arena1"
-            root = "/path/to/arena1"
-            db = "/path/to/arena1.db"
-            blob_dir = "/path/to/arena1/blobs"
+            workdir = "/path/to/arena1"
+            datadir = "/path/to/arena1/data"
             max_parallel_hashers = 4
             debounce = "500ms"
 
             [[arena]]
             name = "arena2"
-            db = "/path/to/arena2.db"
-            blob_dir = "/path/to/arena2/blobs"
+            workdir = "/path/to/arena2"
             disk_usage = { max = "1G" }
         "#;
 
@@ -399,18 +393,16 @@ mod tests {
             arenas: vec![
                 ArenaConfig {
                     arena: Arena::from("arena1"),
-                    root: Some(PathBuf::from("/path/to/arena1")),
-                    db: PathBuf::from("/path/to/arena1.db"),
-                    blob_dir: PathBuf::from("/path/to/arena1/blobs"),
+                    workdir: PathBuf::from("/path/to/arena1"),
+                    datadir: Some(PathBuf::from("/path/to/arena1/data")),
                     max_parallel_hashers: Some(4),
                     debounce: Some(HumanDuration::from_millis(500)),
                     disk_usage: None,
                 },
                 ArenaConfig {
                     arena: Arena::from("arena2"),
-                    root: None,
-                    db: PathBuf::from("/path/to/arena2.db"),
-                    blob_dir: PathBuf::from("/path/to/arena2/blobs"),
+                    workdir: PathBuf::from("/path/to/arena2"),
+                    datadir: None,
                     max_parallel_hashers: None,
                     debounce: None,
                     disk_usage: Some(DiskUsageLimits {
@@ -688,9 +680,8 @@ mod tests {
                 
                 [[arena]]
                 name = "test"
-                root = "/tmp/test"
-                db = "/tmp/test.db"
-                blob_dir = "/tmp/test/blobs"
+                workdir = "/tmp/test"
+                datadir = "/tmp/test/data"
                 {}
                 "#,
                 toml_str
@@ -716,8 +707,7 @@ mod tests {
             [[arena]]
             name = "arena1"
             wrongname = "/path/to/arena1" # should be root
-            db = "/path/to/arena1.db"
-            blob_dir = "/path/to/arena1/blobs"
+            workdir = "/path/to/arena1/"
         "#;
 
         assert!(toml::from_str::<StorageConfig>(toml_str).is_err())

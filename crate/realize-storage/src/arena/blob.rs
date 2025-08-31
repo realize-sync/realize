@@ -88,10 +88,14 @@ pub(crate) struct Blobs {
     accessed_tx: broadcast::Sender<Inode>,
 }
 impl Blobs {
-    pub(crate) fn new(
+    pub(crate) fn setup(
         blob_dir: &std::path::Path,
         blob_lru_queue_table: &impl redb::ReadableTable<u16, Holder<'static, QueueTableEntry>>,
     ) -> Result<Blobs, StorageError> {
+        if !blob_dir.exists() {
+            std::fs::create_dir_all(blob_dir)?;
+        }
+
         let (tx, rx) = watch::channel(disk_usage_op(blob_lru_queue_table)?);
         let (accessed_tx, _) = broadcast::channel(16);
         Ok(Self {

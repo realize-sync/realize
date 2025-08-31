@@ -13,35 +13,48 @@ Overlays must be configured separately per arena. This needs extra configuration
 
 [[arena]]
 name= ...
-data= ...  # was root
-metadata= ... # new
+datadir= ...  # was root
+workdir= ... # new
 mountpoint = ... # new
 
-metadata is required (this is where the db and blobs are stored)
-data is optional.
-mountpoint is optional. If set, requires data. Requires option --fuse.
+workdir is require. This is where the db and blobs are stored. datadir
+is optional.
+
+mountpoint is optional. If mountpoint is set
+ - datadir must be set and
+ - the option --fuse must be passed to the process
 
 Task list:
 
-1. Replace the fields ArenaConfig::db and blob_dir with metadata.
+1. Replace the fields ArenaConfig::db and blob_dir with datadir and workdir
 
-   In [arena.rs](../crate/realize-storage/src/arena.rs) db is set to
-   <metadata>/arena.db and blobdir to <metadata>/blobs (created if
-   necessary).
+With this change the recommended layout is now to have the workdir be a
+    parent or sibling of datadir. This is required for overlayfs, which
+    needs a workdir of its out outside of datadir.
 
-   <metadata> must be writable directory. It is created if necessary
-   by check_dirs() in [setup.rs](../crate/realize-core/src/setup.rs)
+    Example configurations:
 
-   The following rules are also enforced by check_dirs():
+    ```
+    [[arena]]
+    name = "example1"
+    workdir = "/store/example1"
+    datadir = "/store/example1/data"
+    ```
 
-   - If <data> is specified, <metadata> must be on the same device
-   (std::os::unix::fs::MetadataExt::dev must be the same on both).
+    In this example, the database is in `/store/example1/arena.db` and the
+    blobs are in `/store/example1/blobs`
 
-   - If <data> is specified, <data> must not be a child of <metadata>.
+    ```
+    [[arena]]
+    name = "example2"
+    workdir = "/store/.example2.realize"
+    datadir = "/store/example2"
+    ```
 
-   Update the code and the test, then add new tests to
-   [setup.rs](../crate/realize-core/src/setup.rs) to cover the new
-   directory checks.
+    With this example, realize-specific files are hidden, but still on the
+    same device as example2. The database is in
+    `/store/.example2.realize/arena.db` and the blobs are in
+    `/store/.example2.realize/blobs`.
 
 2. Add a function mount_overlays to
    [setup.rs](../crate/realize-core/src/setup.rs).

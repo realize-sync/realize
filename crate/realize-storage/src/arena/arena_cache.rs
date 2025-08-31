@@ -734,15 +734,11 @@ impl ArenaCache {
             blob_dir,
         )?;
 
-        Ok(ArenaCache::new(arena, Arc::clone(&db), blob_dir)?)
+        Ok(ArenaCache::new(arena, Arc::clone(&db))?)
     }
 
     /// Create a new ArenaCache from an arena, root inode, database, and blob directory.
-    pub(crate) fn new(
-        arena: Arena,
-        db: Arc<ArenaDatabase>,
-        _blob_dir: &std::path::Path,
-    ) -> Result<Arc<Self>, StorageError> {
+    pub(crate) fn new(arena: Arena, db: Arc<ArenaDatabase>) -> Result<Arc<Self>, StorageError> {
         Ok(Arc::new(Self { arena, db }))
     }
 

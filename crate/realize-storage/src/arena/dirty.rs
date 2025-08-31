@@ -14,7 +14,7 @@ pub(crate) struct Dirty {
 }
 
 impl Dirty {
-    pub(crate) fn new(log_table: &impl ReadableTable<u64, Inode>) -> Result<Self, StorageError> {
+    pub(crate) fn setup(log_table: &impl ReadableTable<u64, Inode>) -> Result<Self, StorageError> {
         let last_counter = last_counter(log_table)?;
         let (watch_tx, watch_rx) = watch::channel(last_counter);
 

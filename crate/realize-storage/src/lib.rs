@@ -57,9 +57,14 @@ impl Storage {
             let arena = Arena::from(arena_config.arena.as_str());
             arena_storage.insert(
                 arena,
-                ArenaStorage::from_config(arena, arena_config, &exclude, &allocator)
-                    .await
-                    .with_context(|| format!("in arena {arena}"))?,
+                ArenaStorage::from_config(
+                    arena,
+                    arena_config,
+                    &exclude.iter().map(|p| p.as_path()).collect::<Vec<_>>(),
+                    &allocator,
+                )
+                .await
+                .with_context(|| format!("in arena {arena}"))?,
             );
         }
 
@@ -289,14 +294,12 @@ async fn create_globaldb(path: &std::path::Path) -> anyhow::Result<Arc<GlobalDat
 
 /// Build a vector of all databases listed in `config`, to be excluded
 /// from syncing.
-fn build_exclude(config: &StorageConfig) -> Vec<&std::path::Path> {
+fn build_exclude(config: &StorageConfig) -> Vec<std::path::PathBuf> {
     let mut exclude = vec![];
     // Cache is now required
-    exclude.push(config.cache.db.as_ref());
+    exclude.push(config.cache.db.clone());
     for arena_config in &config.arenas {
-        // Arena cache (db + blob_dir) is now required for all arenas
-        exclude.push(arena_config.db.as_ref());
-        exclude.push(arena_config.blob_dir.as_ref());
+        exclude.push(arena_config.workdir.clone())
     }
 
     exclude

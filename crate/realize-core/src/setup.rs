@@ -8,10 +8,8 @@ use crate::rpc::control::server::ControlServer;
 use anyhow::Context;
 use realize_network::{Networking, Server, unixsocket};
 use realize_storage::Storage;
-
-use realize_types::Arena;
 use std::net::SocketAddr;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
@@ -175,56 +173,57 @@ async fn make_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
 /// Checks that all directories in the config file are accessible.
 fn check_dirs(arenas: &[realize_storage::config::ArenaConfig]) -> anyhow::Result<()> {
     for config in arenas {
-        let arena = Arena::from(config.arena.as_str());
-        // Check root directory if specified
-        if let Some(root) = &config.root {
-            if !root.exists() {
-                anyhow::bail!("[{arena}] Arena root not found: {root:?}");
+        let arena = config.arena;
+        let workdir = &config.workdir;
+        let workdir_m = match config.workdir.metadata() {
+            Ok(m) => m,
+            Err(_) => {
+                log::debug!("[{arena}] Arena workdir missing; will create: {workdir:?}");
+                if let Err(e) = std::fs::create_dir_all(workdir) {
+                    anyhow::bail!("[{arena}] Failed to create arena workdir {workdir:?}: {e:?}",);
+                }
+                config.workdir.metadata()?
             }
+        };
+        if !is_writable_dir(workdir) {
+            anyhow::bail!("[{arena}]: Arena workdir must be a writable directory: {workdir:?}",);
+        }
 
-            check_is_accessible_dir(root, &arena, "arena root")?;
+        if let Some(root) = &config.datadir {
+            let root_m = root
+                .metadata()
+                .with_context(|| format!("[{arena}] Arena datadir not found: {root:?}"))?;
+            if !is_readable_dir(root) {
+                anyhow::bail!("[{arena}] Arena datadir must be a readable directory :{workdir:?}");
+            }
             if !is_writable_dir(root) {
-                log::warn!("[{arena}] Arena root not writable: {root:?}");
+                log::warn!("[{arena}] Arena datadir should be a writable directory: {root:?}");
             }
-        }
 
-        // Check blob_dir (required)
-        let blob_dir = &config.blob_dir;
-        if !blob_dir.exists() {
-            log::debug!("[{arena}] Blob dir missing; will create: {blob_dir:?}");
-            if let Err(e) = std::fs::create_dir_all(blob_dir) {
-                anyhow::bail!("[{arena}] Failed to create blob dir {blob_dir:?}: {e:?}",);
+            if workdir_m.dev() != root_m.dev() {
+                anyhow::bail!(
+                    "[{arena}] Workdir and datadir of an arena must be on the same device.\n\
+                     workdir: {workdir:?}\n\
+                     datadir: {root:?}"
+                );
             }
-        }
-        check_is_accessible_dir(blob_dir, &arena, "blob dir")?;
-        if !is_writable_dir(blob_dir) {
-            anyhow::bail!("[{arena}/{}]: blob dir not writable", blob_dir.display());
+
+            if workdir.canonicalize()?.starts_with(root.canonicalize()?) {
+                anyhow::bail!(
+                    "[{arena}] Workdir of an arena cannot be a child of its datadir \
+                     (the reverse is possible)\n\
+                     workdir: {workdir:?}\n\
+                     datadir: {root:?}"
+                );
+            }
         }
     }
 
     Ok(())
 }
 
-/// Check if a directory path exists, is a directory, and is
-/// accessible. If the directory doesn't exist, try to create it with
-/// create_dir_all.
-fn check_is_accessible_dir(
-    path: &std::path::Path,
-    arena: &Arena,
-    path_type: &str,
-) -> anyhow::Result<()> {
-    if !std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
-        anyhow::bail!(
-            "[{arena}] {}: {path_type} is not a directory",
-            path.display()
-        );
-    }
-
-    if std::fs::read_dir(path).is_err() {
-        anyhow::bail!("[{arena}] {}: {path_type} not accessible", path.display());
-    }
-
-    Ok(())
+fn is_readable_dir(root: &PathBuf) -> bool {
+    std::fs::read_dir(&root).is_ok()
 }
 
 fn is_writable_dir(path: &std::path::Path) -> bool {
@@ -248,31 +247,29 @@ mod tests {
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_storage::config::ArenaConfig;
+    use realize_types::Arena;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn check_creates_blob_dir() -> anyhow::Result<()> {
+    fn check_creates_metadata_dir() -> anyhow::Result<()> {
         let tempdir = TempDir::new()?;
         let arena = Arena::from("test-arena");
 
         let root_path = tempdir.child("root");
         root_path.create_dir_all()?;
-        let blob_dir_path = tempdir.child("blobs");
+        let metadata = tempdir.child("metadata");
 
         let arenas = vec![ArenaConfig::new(
             arena,
             root_path.to_path_buf(),
-            tempdir.child("cache.db").to_path_buf(),
-            blob_dir_path.to_path_buf(),
+            metadata.to_path_buf(),
         )];
 
-        // Should succeed - directories will be created
         check_dirs(&arenas)?;
 
-        // Verify directory was created
-        assert!(blob_dir_path.exists());
-        assert!(blob_dir_path.is_dir());
+        assert!(metadata.exists());
+        assert!(metadata.is_dir());
 
         Ok(())
     }
@@ -283,14 +280,12 @@ mod tests {
         let arena = Arena::from("test-arena");
 
         let root_path = tempdir.child("root");
-        let blob_dir_path = tempdir.child("blobs");
-        blob_dir_path.create_dir_all()?;
+        let metadata_path = tempdir.child("metadata");
 
         let arenas = vec![ArenaConfig::new(
             arena,
             root_path.to_path_buf(),
-            tempdir.child("cache.db").to_path_buf(),
-            blob_dir_path.to_path_buf(),
+            metadata_path.to_path_buf(),
         )];
 
         let result = check_dirs(&arenas);
@@ -305,17 +300,16 @@ mod tests {
         let arena = Arena::from("test-arena");
 
         let root_path = tempdir.child("root");
-        let blob_dir_path = tempdir.child("blobs");
+        let metadata_path = tempdir.child("metadata");
 
         // Create directories beforehand
         root_path.create_dir_all()?;
-        blob_dir_path.create_dir_all()?;
+        metadata_path.create_dir_all()?;
 
         let arenas = vec![ArenaConfig::new(
             arena,
             root_path.to_path_buf(),
-            tempdir.child("cache.db").to_path_buf(),
-            blob_dir_path.to_path_buf(),
+            metadata_path.to_path_buf(),
         )];
 
         // Should succeed with existing directories
@@ -329,20 +323,14 @@ mod tests {
         let tempdir = TempDir::new()?;
         let arena = Arena::from("test-arena");
 
-        let blob_dir_path = tempdir.child("blobs");
+        let metadata = tempdir.child("metadata");
 
-        let arenas = vec![ArenaConfig::rootless(
-            arena,
-            tempdir.child("cache.db").to_path_buf(),
-            blob_dir_path.to_path_buf(),
-        )];
+        let arenas = vec![ArenaConfig::rootless(arena, metadata.to_path_buf())];
 
-        // Should succeed - only blob_dir is required
         check_dirs(&arenas)?;
 
-        // Verify blob_dir was created
-        assert!(blob_dir_path.exists());
-        assert!(blob_dir_path.is_dir());
+        assert!(metadata.exists());
+        assert!(metadata.is_dir());
 
         Ok(())
     }
@@ -353,28 +341,22 @@ mod tests {
         let arena = Arena::from("test-arena");
 
         let root_path = tempdir.child("root");
-        let blob_dir_path = tempdir.child("blobs");
+        let metadata_path = tempdir.child("metadata");
 
         // Create a file instead of directory
         root_path.write_str("not a directory")?;
-        blob_dir_path.create_dir_all()?;
+        metadata_path.create_dir_all()?;
 
         let arenas = vec![ArenaConfig::new(
             arena,
             root_path.to_path_buf(),
-            tempdir.child("cache.db").to_path_buf(),
-            blob_dir_path.to_path_buf(),
+            metadata_path.to_path_buf(),
         )];
 
         // Should fail because root path is a file, not directory
         let result = check_dirs(&arenas);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("is not a directory")
-        );
+        let errmsg = result.unwrap_err().to_string();
+        assert!(errmsg.contains("readable dir"), "Message: {errmsg}");
 
         Ok(())
     }
@@ -385,12 +367,12 @@ mod tests {
         let arena = Arena::from("test-arena");
 
         let root_path = tempdir.child("root");
-        let blob_dir_path = tempdir.child("blobs");
+        let metadata_path = tempdir.child("metadata");
 
         root_path.create_dir_all()?;
-        blob_dir_path.create_dir_all()?;
+        metadata_path.create_dir_all()?;
 
-        // Remove read permissions from blob_dir
+        // Remove read permissions from root
         let mut perms = fs::metadata(root_path.path())?.permissions();
         perms.set_mode(0o000); // No permissions
         fs::set_permissions(root_path.path(), perms)?;
@@ -398,14 +380,13 @@ mod tests {
         let arenas = vec![ArenaConfig::new(
             arena,
             root_path.to_path_buf(),
-            tempdir.child("cache.db").to_path_buf(),
-            blob_dir_path.to_path_buf(),
+            metadata_path.to_path_buf(),
         )];
 
         // Should fail because root has no read access
         let result = check_dirs(&arenas);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not accessible"));
+        let errmsg = result.unwrap_err().to_string();
+        assert!(errmsg.contains("readable dir"), "Message: {errmsg}");
 
         Ok(())
     }
@@ -416,10 +397,10 @@ mod tests {
         let arena = Arena::from("test-arena");
 
         let root_path = tempdir.child("root");
-        let blob_dir_path = tempdir.child("blobs");
+        let metadata_path = tempdir.child("metadata");
 
         root_path.create_dir_all()?;
-        blob_dir_path.create_dir_all()?;
+        metadata_path.create_dir_all()?;
 
         // Remove write permissions from root
         let mut perms = fs::metadata(root_path.path())?.permissions();
@@ -429,8 +410,7 @@ mod tests {
         let arenas = vec![ArenaConfig::new(
             arena,
             root_path.to_path_buf(),
-            tempdir.child("cache.db").to_path_buf(),
-            blob_dir_path.to_path_buf(),
+            metadata_path.to_path_buf(),
         )];
 
         // Should succeed but log a warning about write access
@@ -440,30 +420,49 @@ mod tests {
     }
 
     #[test]
-    fn check_rejects_blob_dir_not_writable() -> anyhow::Result<()> {
+    fn check_rejects_metadata_child_of_root() -> anyhow::Result<()> {
         let tempdir = TempDir::new()?;
         let arena = Arena::from("test-arena");
 
-        let root_path = tempdir.child("root");
-        let blob_dir_path = tempdir.child("blobs");
+        let root = tempdir.child("root");
+        let metadata = tempdir.child("root/metadata");
 
-        root_path.create_dir_all()?;
-        blob_dir_path.create_dir_all()?;
-
-        // Remove write permissions from blob_dir
-        let mut perms = fs::metadata(blob_dir_path.path())?.permissions();
-        perms.set_mode(0o444); // Read-only
-        fs::set_permissions(blob_dir_path.path(), perms)?;
+        metadata.create_dir_all()?;
+        root.create_dir_all()?;
 
         let arenas = vec![ArenaConfig::new(
             arena,
-            root_path.to_path_buf(),
-            tempdir.child("cache.db").to_path_buf(),
-            blob_dir_path.to_path_buf(),
+            root.to_path_buf(),
+            metadata.to_path_buf(),
         )];
 
+        // Should fail because metadat is a child of root
         let result = check_dirs(&arenas);
-        assert!(result.is_err());
+        let errmsg = result.unwrap_err().to_string();
+        assert!(errmsg.contains("child of"), "Message: {errmsg}");
+
+        Ok(())
+    }
+
+    #[test]
+    fn check_rejects_metadata_not_writable() -> anyhow::Result<()> {
+        let tempdir = TempDir::new()?;
+        let arena = Arena::from("test-arena");
+
+        let metadata = tempdir.child("metadata");
+        metadata.create_dir_all()?;
+
+        // Remove write permissions from metadata dir
+        let mut perms = fs::metadata(metadata.path())?.permissions();
+        perms.set_mode(0o444); // Read-only
+        fs::set_permissions(metadata.path(), perms)?;
+
+        let arenas = vec![ArenaConfig::rootless(arena, metadata.to_path_buf())];
+
+        // Should fail because metadata dir is not writable
+        let result = check_dirs(&arenas);
+        let errmsg = result.unwrap_err().to_string();
+        assert!(errmsg.contains("writable dir"), "Message: {errmsg}");
 
         Ok(())
     }

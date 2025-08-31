@@ -31,12 +31,11 @@ where
         arenas: arenas
             .into_iter()
             .map(|arena| {
-                let arena_dir = arena_root(dir, arena);
+                let arena_datadir = arena_root(dir, arena);
                 ArenaConfig {
                     arena,
-                    root: Some(arena_dir.clone()),
-                    db: arena_dir.join(".arena.db"),
-                    blob_dir: arena_dir.join(".arena.blobs"),
+                    workdir: arena_datadir.parent().unwrap().to_path_buf(),
+                    datadir: Some(arena_datadir),
 
                     // Disabled in tests
                     debounce: Some(HumanDuration(Duration::ZERO)),
@@ -51,10 +50,9 @@ where
     };
 
     for arena_config in &config.arenas {
-        if let Some(root) = &arena_config.root {
-            std::fs::create_dir_all(root)?;
+        if let Some(datadir) = &arena_config.datadir {
+            std::fs::create_dir_all(datadir)?;
         }
-        std::fs::create_dir_all(&arena_config.blob_dir)?;
     }
 
     Ok(config)
@@ -69,5 +67,5 @@ where
     P: AsRef<std::path::Path>,
 {
     let root = root.as_ref();
-    root.join(arena.as_str())
+    root.join(arena.as_str()).join("data")
 }

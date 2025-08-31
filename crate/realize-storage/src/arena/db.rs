@@ -241,9 +241,9 @@ impl ArenaDatabase {
             txn.open_table(DIRTY_COUNTER_TABLE)?;
             txn.open_table(FAILED_JOB_TABLE)?;
 
-            dirty = Dirty::new(&dirty_log_table)?;
-            history = History::new(arena, &history_table)?;
-            blobs = Blobs::new(blob_dir.as_ref(), &blob_lru_queue_table)?;
+            dirty = Dirty::setup(&dirty_log_table)?;
+            history = History::setup(arena, &history_table)?;
+            blobs = Blobs::setup(blob_dir.as_ref(), &blob_lru_queue_table)?;
             uuid = load_or_assign_uuid(&mut settings_table)?;
             arena_cache::init(&mut cache_table, tree.root())?;
         }

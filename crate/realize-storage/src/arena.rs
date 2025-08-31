@@ -55,33 +55,39 @@ impl ArenaStorage {
         allocator: &Arc<InodeAllocator>,
     ) -> anyhow::Result<Self> {
         let shutdown = CancellationToken::new();
-        let db = create_db(arena, arena_config, allocator)
-            .await
-            .with_context(|| format!("database {:?}", arena_config.db))?;
-        let arena_cache = ArenaCache::new(arena, Arc::clone(&db), &arena_config.blob_dir)?;
-        let indexed = match arena_config.root.as_ref() {
+        let dbpath = arena_config.workdir.join("arena.db");
+        log::debug!("[{arena}] Arena setup with database {dbpath:?}");
+        let db = ArenaDatabase::new(
+            redb_utils::open(&dbpath).await?,
+            arena,
+            Arc::clone(allocator),
+            &arena_config.workdir.join("blobs"),
+        )
+        .with_context(|| format!("[{arena}] Arena database in {dbpath:?}",))?;
+        let arena_cache = ArenaCache::new(arena, Arc::clone(&db))?;
+        let indexed = match arena_config.datadir.as_ref() {
             None => {
                 log::info!("[{arena}] Arena setup for caching");
 
                 None
             }
-            Some(root) => {
-                log::info!("[{arena}] Arena setup with root {root:?}");
+            Some(datadir) => {
+                log::info!("[{arena}] Arena setup with datadir {datadir:?}");
 
                 let index = RealIndexAsync::new(Arc::clone(&db));
                 let exclude = exclude
                     .iter()
-                    .filter_map(|p| realize_types::Path::from_real_path_in(p, root))
+                    .filter_map(|p| realize_types::Path::from_real_path_in(p, datadir))
                     .collect::<Vec<_>>();
                 log::info!(
-                    "[{arena}] Watching {root:?}{}",
+                    "[{arena}] Watching {datadir:?}{}",
                     exclude
                         .iter()
                         .map(|p| format!(" -\"{p}\""))
                         .collect::<Vec<_>>()
                         .join(",")
                 );
-                let watcher = RealWatcher::builder(root, index.clone())
+                let watcher = RealWatcher::builder(datadir, index.clone())
                     .with_initial_scan()
                     .exclude_all(exclude.iter())
                     .debounce(
@@ -94,7 +100,7 @@ impl ArenaStorage {
                     .max_parallel_hashers(arena_config.max_parallel_hashers.unwrap_or(4))
                     .spawn()
                     .await
-                    .with_context(|| format!("{root:?}"))?;
+                    .with_context(|| format!("{datadir:?}"))?;
                 if let Some(limits) = &arena_config.disk_usage {
                     tokio::spawn({
                         let db = Arc::clone(&db);
@@ -113,7 +119,7 @@ impl ArenaStorage {
                 });
 
                 Some(IndexedArenaStorage {
-                    root: root.to_path_buf(),
+                    root: datadir.to_path_buf(),
                     index,
                     _watcher: watcher,
                 })
@@ -136,20 +142,6 @@ impl ArenaStorage {
             _drop_guard: shutdown.drop_guard(),
         })
     }
-}
-
-async fn create_db(
-    arena: Arena,
-    arena_config: &config::ArenaConfig,
-    allocator: &Arc<InodeAllocator>,
-) -> anyhow::Result<Arc<ArenaDatabase>> {
-    let db = ArenaDatabase::new(
-        redb_utils::open(&arena_config.db).await?,
-        arena,
-        Arc::clone(allocator),
-        &arena_config.blob_dir,
-    )?;
-    Ok(db)
 }
 
 /// Minimum wait time after a failed job.

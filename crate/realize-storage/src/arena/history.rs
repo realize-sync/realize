@@ -25,7 +25,7 @@ pub(crate) struct History {
 }
 
 impl History {
-    pub(crate) fn new(
+    pub(crate) fn setup(
         arena: Arena,
         table: &impl redb::ReadableTable<u64, Holder<'static, HistoryTableEntry>>,
     ) -> Result<Self, StorageError> {

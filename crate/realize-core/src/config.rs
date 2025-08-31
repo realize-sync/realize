@@ -50,9 +50,8 @@ mod tests {
 
             [[arena]]
             name = "arena1"
-            root = "/path/to/arena1"
-            db = "/path/to/arena1.db"
-            blob_dir = "/path/to/arena1/blobs"
+            datadir = "/path/to/arena1/data"
+            workdir = "/path/to/arena1/"
             max_parallel_hashers = 4
             debounce = "500ms"
             disk_usage = { max = "50%", leave = "1G" }
@@ -76,9 +75,8 @@ mod tests {
                     arenas: vec![
                         realize_storage::config::ArenaConfig {
                             arena: Arena::from("arena1"),
-                            root: Some(PathBuf::from("/path/to/arena1")),
-                            db: PathBuf::from("/path/to/arena1.db"),
-                            blob_dir: PathBuf::from("/path/to/arena1/blobs"),
+                            datadir: Some(PathBuf::from("/path/to/arena1/data")),
+                            workdir: PathBuf::from("/path/to/arena1"),
                             max_parallel_hashers: Some(4),
                             debounce: Some(HumanDuration::from_millis(500)),
                             disk_usage: Some(realize_storage::config::DiskUsageLimits {

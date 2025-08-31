@@ -652,7 +652,7 @@ mod tests {
                 InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?,
                 &blob_dir,
             )?;
-            let acache = ArenaCache::new(arena, Arc::clone(&db), &blob_dir)?;
+            let acache = ArenaCache::new(arena, Arc::clone(&db))?;
             let engine = Engine::new(arena, Arc::clone(&db), |attempt| {
                 if attempt < 3 {
                     Some(Duration::from_secs(attempt as u64 * 10))

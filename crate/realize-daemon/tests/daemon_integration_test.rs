@@ -79,8 +79,7 @@ impl Fixture {
         config.storage.arenas.push(ArenaConfig::new(
             arena,
             testdir.to_path_buf(),
-            tempdir.child("testdir-cache.db").to_path_buf(),
-            tempdir.child("testdir-blobs").to_path_buf(),
+            tempdir.child("testdir-metadata").to_path_buf(),
         ));
 
         testdir.child("foo.txt").write_str("hello")?;
@@ -115,19 +114,6 @@ impl Fixture {
             debug_output: debug,
             socket,
         })
-    }
-
-    fn configure_cache(&mut self) {
-        // Cache is now always configured in setup, but this method can be used
-        // to override cache configuration if needed for specific tests
-        for arena_config in &mut self.config.storage.arenas {
-            let child = self
-                .tempdir
-                .child(format!("{}-cache.db", arena_config.arena));
-            let blob_dir = self.tempdir.child(format!("{}-blobs", arena_config.arena));
-            arena_config.db = child.to_path_buf();
-            arena_config.blob_dir = blob_dir.to_path_buf();
-        }
     }
 
     pub fn command(&self) -> anyhow::Result<Command> {
@@ -262,7 +248,7 @@ async fn daemon_fails_on_missing_directory() -> anyhow::Result<()> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "stderr<<EOF\n{stderr}\nEOF");
     assert!(
-        stderr.contains("Arena root not found"),
+        stderr.contains("datadir not found"),
         "stderr<<EOF\n{stderr}\nEOF"
     );
 
@@ -279,7 +265,7 @@ async fn daemon_fails_on_unreadable_directory() -> anyhow::Result<()> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "stderr<<EOF\n{stderr}\nEOF");
     assert!(
-        stderr.contains("arena root not accessible"),
+        stderr.contains("readable dir"),
         "stderr<<EOF\n{stderr}\nEOF"
     );
 
@@ -303,7 +289,7 @@ async fn daemon_warns_on_unwritable_directory() -> anyhow::Result<()> {
 
     let stderr = stderr.await??;
     assert!(
-        stderr.contains("Arena root not writable"),
+        stderr.contains("writable dir"),
         "stderr<<EOF\n{stderr}\nEOF"
     );
     Ok(())
@@ -372,12 +358,10 @@ async fn daemon_interrupted() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn daemon_exports_nfs() -> anyhow::Result<()> {
-    let mut fixture = Fixture::setup().await?;
+    let fixture = Fixture::setup().await?;
 
     let nfs_port = portpicker::pick_unused_port().expect("No ports free");
     let nfs_addr = format!("127.0.0.1:{nfs_port}");
-
-    fixture.configure_cache();
 
     // Run process in the background and in a way that allows reading
     // its output, so we know what port to connect to.
@@ -439,7 +423,7 @@ async fn daemon_updates_cache() -> anyhow::Result<()> {
         .storage
         .arena_config_mut(Arena::from("testdir"))
         .unwrap();
-    arena_config.db = fixture_a.tempdir.join("index.db");
+    arena_config.datadir = Some(fixture_a.testdir.clone());
 
     let mut daemon_a = fixture_a
         .command()?
@@ -466,7 +450,6 @@ async fn daemon_updates_cache() -> anyhow::Result<()> {
 
     let nfs_port = portpicker::pick_unused_port().expect("No ports free");
     let nfs_addr = format!("127.0.0.1:{nfs_port}");
-    fixture_b.configure_cache();
 
     let mut daemon_b = fixture_b
         .command()?
