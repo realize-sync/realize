@@ -23,34 +23,6 @@ Since this design relies on OverlayFS, it is a Linux-only solution.
 The proposed cross-platform solution is to make The Unreal read-write
 and is outside the scope of this document.
 
-## Stages
-
-Design and implementation happens in stages, incrementally:
-
-1. In this phase, consensus consists of copying entire arenas from one
-   peer to another using a command line tool, described in
-   [movedirs](./movedirs.md)
-
-2. Report local changes as `link`, `unlink` notifications with a
-   catchup phase to deals with unknown changes happening between
-   disconnections, described in [The Unreal](./unreal.md) and
-   implemented based on
-   [inotify](https://man7.org/linux/man-pages/man7/inotify.7.html).
-
-3. Track changes and file content hash, used as both integrity check
-   and version, in an index table. Upon restart, catchup with the
-   latest changes by comparing index with directory content. This is a
-   requirement for the next two phases. [Index]
-
-4. Report local change to remote data to peers and update local data
-   on interested peers using such reports [Update From Peers].
-   Download, move files from cache to real, from real to cache
-   [Consensus](consensus.md)
-
-5. Use hashes to download the right version of a file or make sure
-   file content is consistent. This allows [The Unreal](./unreal.md)
-   to store and serve file data. [Future](./unreal.md#Future)
-
 ## Details
 
 ### Overlay
@@ -264,4 +236,225 @@ How that happens is detailed in [Consensus](consensus.md)
 
 ## Future
 
-TBD
+## Local modification of remote files
+
+With [OverlayFS](https://docs.kernel.org/filesystems/overlayfs.html)
+local modifications can be made to the remote cache filesystem. These
+modifications are stored as file in the local filesystem and can be
+sent to remote peers.
+
+TODO: for each entry, when are the placeholders/whiteout deleted?
+
+### Edit a file
+
+When the [Watcher](../crate/realize-storage/src/arena/watcher.rs)
+detects a new file in the index, it should check it in the cache. If
+the file is in the cache, it should report the cached version as
+original version.
+
+It should do it regardless of whether OverlayFS sets the xattr
+`user|trusted.overlay.origin` as it is possible to access the
+directory directly.
+
+When the index sees an Add, Replace or Delete that matches the file
+and hash, it removes the special file and the corresponding entry.
+
+*** OverlayFS ***
+
+When a remote file is edited, OverlayFS stores the modified file
+content in the local filesystem with the xattr
+`user|trusted.overlay.origin` set.
+
+
+Example:
+
+remote:
+```
+echo "hello" > editme
+```
+
+local:
+```
+vi editme (write ", world" and save)
+```
+
+Result:
+```
+# file: editme content: hello, world
+trusted.overlay.origin=0sAPshAIEAAAAAAAAAAAAAAAAAAAAAAAAAAH8EAAAAAAAA
+```
+
+### Delete a file
+
+Detect 0-size files with xattr `user|trusted.overlay.whiteout` or
+character devices with 0/0 device-number and treat them as whiteout.
+
+Placing a whiteout on the file deletes the file. This is treated and
+reported as file deletion except that the index entry contains
+type=whiteout (instead of type=file).
+
+When a whiteout is detected, check the cache. If there is a
+corresponding file, store the whiteout with old_hash=cache hash and
+report the file with that hash deleted to remote peers.
+
+Catchup must wait until it has checked all possible redirection
+destination before reporting such a file as deleted.
+
+When the index sees an Add, Replace or Delete that matches the file
+and hash, it removes the special file and the corresponding entry.
+
+*** OverlayFS behavior ***
+
+OverlayFS writes whiteout when a remote file or directory is deleted.
+
+"A whiteout is created as a character device with 0/0 device number or
+as a zero-size regular file with the xattr “trusted.overlay.whiteout”."
+
+### Hard link
+
+If a 0-byte file with the xattr `trusted.overlay.redirect` is detected
+that points to a file in the cache different from the current one,
+store it in the index with type=redirect and hash=cache.hash and
+report it to history as:
+ - Redirect from=<orig path> to=<dest path> hash=cache.hash
+
+This is a new notification type.
+
+Indexes that own <dest path> should replicate that hard link locally
+and mark it owned as well, then report it normally. It'll then be
+available in other caches.
+
+Possible extension: Caches might detect this notification and store it
+as a redirect waiting for the owner to report it as added.
+
+When the index sees an Add, Replace or Delete that matches the file
+and hash, it removes the special file and the corresponding entry.
+
+*** OverlayFS behavior **
+
+remote peer:
+```
+echo test >work/hardlinkme
+```
+
+local peer:
+```
+ln work/hardlinkme work/hardlinked
+```
+
+Result
+
+```
+# file: hardlinked 0-byte file
+trusted.overlay.metacopy=""
+trusted.overlay.origin=0sAPshAIEAAAAAAAAAAAAAAAAAAAAAAAAAAIAEAAAAAAAA
+trusted.overlay.redirect="/work/hardlinkme"
+
+# file: hardlinkme original file, content: "test"
+trusted.overlay.metacopy=""
+trusted.overlay.origin=0sAPshAIEAAAAAAAAAAAAAAAAAAAAAAAAAAIAEAAAAAAAA
+trusted.overlay.redirect="/work/hardlinkme"
+```
+
+### Move/Rename a file
+
+This is a combination of delete and hard link. The destination appears
+as a hard line and the source has a whiteout.
+
+It could be treated history events Delete(hash) + Redirect(from,hash),
+with a twist, since it's important for Redirect to be handled before
+Delete. To avoid ordering issues, the Watcher should generate a single
+event Move(from,hash) based on inotify reporting this as a move.
+During catchup, it's important to not report a deletion before having
+looked for redirection.
+
+This is a new notification type.
+
+Indexes that own <dest path> should replicate the move locally, mark
+the result owned as well, then report Add first, then Delete. It'll
+then be available in other caches.
+
+This is stored in the index in the source and destination file as a
+type=MoveFrom and type=MoveTo.
+
+Catchup must wait until it has checked all possible redirection
+destination before reporting a file as deleted, as it's difficult to
+tell deletion from MoveFrom.
+
+Possible extension: Caches might detect this new notification and
+store it as a redirect waiting for the owner to report it as added and
+deleted.
+
+When the index sees an Add, Replace or Delete that matches the file
+and hash, it removes the special file and the corresponding entry for
+both MoveFrom and MoveTo.
+
+*** OverlayFS behavior **
+
+remote peer:
+```
+echo test >moveme
+```
+
+local peer:
+```
+mv moveme moved
+```
+
+Result
+
+# file: moveme char dev 0/0
+
+# file: moved
+trusted.overlay.metacopy=""
+trusted.overlay.origin=0sAPshAIEAAAAAAAAAAAAAAAAAAAAAAAAAAIEEAAAAAAAA
+trusted.overlay.redirect="moveme"
+
+### Delete a directory
+
+Detect 0-size files with xattr `user|trusted.overlay.whiteout` or
+character devices with 0/0 device-number and treat them as whiteout.
+
+When a directory is deleted that way, all files within that directory
+are recursively deleted, as described in [Delete a file].
+
+An entry is stored in the index for that directory, so catchup knows that
+the directory entry as been handled.
+
+Catchup needs to not report directory delete before having looked for
+directory redirect. See the next section.
+
+The whiteout and index entry are deleted once the directory contains
+no cached entry. (This requires the cache triggering a change on the
+index!)
+
+*** OverlayFS behavior **
+
+A whiteout for a directory is the same as a whiteout for a file, that
+is, a character device with 0/0 device number or as a zero-size
+regular file with the xattr `user|trusted.overlay.whiteout`
+
+### Rename a directory
+
+This might be tricky since a rename applies to the files at the time
+of the rename only - and with a catchup, we don't know what that time
+is.
+
+The rename is then applied and reported for each file separately,
+recursively, as described in [Rename a file]
+
+A rename for a directory should be stored in the index so catchup
+knows that it's been applied when it sees that entry again. Catchup
+needs to not report directory delete before having looked for
+directory redirect.
+
+The whiteout and index entry are deleted once the source directory
+contains no cached entry. (This requires the cache triggering a change
+on the index!)
+
+
+*** OverlayFS behavior **
+
+This appears as a directory with `user|trusted.overlay.redirect`
+pointing to the original location and a directory whiteout (to be
+confirmed)
