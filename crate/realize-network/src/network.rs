@@ -4,10 +4,12 @@ use crate::security::{PeerVerifier, RawPublicKeyResolver};
 use anyhow::Context as _;
 use realize_types::Peer;
 use rustls::pki_types::ServerName;
+use socket2::{SockRef, TcpKeepalive};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
@@ -115,7 +117,7 @@ impl Networking {
             .with_context(|| format!("address for {peer} is invalid"))?;
         let domain = ServerName::try_from(addr.host().to_string())?;
         let stream = TcpStream::connect(addr.addr()).await?;
-        stream.set_nodelay(true)?;
+        init_stream(&stream)?;
 
         let mut tls_stream = self.connector.connect(domain, stream).await?;
         tls_stream.write_all(tag).await?;
@@ -240,7 +242,7 @@ impl Server {
     }
 
     async fn accept(&self, stream: TcpStream) -> anyhow::Result<()> {
-        stream.set_nodelay(true)?;
+        init_stream(&stream)?;
 
         let shutdown_rx = self.shutdown_tx.subscribe();
         let (peer, tag, mut tls_stream) = self.networking.accept(stream).await?;
@@ -257,6 +259,15 @@ impl Server {
 
         Ok(())
     }
+}
+
+/// Set TCP connection flags.
+fn init_stream(stream: &TcpStream) -> anyhow::Result<()> {
+    let socket = SockRef::from(&stream);
+    socket.set_tcp_nodelay(true)?;
+    socket.set_tcp_keepalive(&TcpKeepalive::new().with_time(Duration::from_secs(600)))?;
+
+    Ok(())
 }
 
 #[cfg(test)]
