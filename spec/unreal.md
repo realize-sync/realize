@@ -712,4 +712,111 @@ These changes are planned and described in [the overall
 design](./design.md) but not yet integrated into this design and its
 implementation.
 
-TBD
+## Local modification of remote files
+
+### Edit a file
+
+When a blob is open for writing through Fuse, its default copy is
+flagged modified, but otherwise keeps the original hash and metadata.
+(Though the entry hash is unknown, the hash is used for downloading.
+This might require splitting the field in two)
+
+When a section of the blob is read that is not available locally, but
+available remotely, it is downloaded.
+
+When a section of the blob is read that was written locally, it is
+accessed directly from file.
+
+When a section of the blob is written, the written range is stored
+into a `local_modification` `ByteRanges`.
+
+When the blob is closed after it was written, the file is scheduled to
+be realized, that is:
+ - all remaining undownloaded sections are to be downloaded, but not verified
+ - the file is hashed
+ - the file is then moved to the index, into a real file and reported as modified to other peers
+
+Add or Replace from other peers during that time has no effect, since
+the hash cannot match.
+
+If the blob has no section that need to be download remotely anymore,
+it can be served in passthough mode.
+
+Metadata cannot be modified, for now, only content, as long as the
+file is in the cache.
+
+### Delete a file
+
+When a file in cache is deleted, it is marked as locally deleted in
+the default copy and not served from the filesystem anymore. It is
+then reported as deleted to other peers.
+
+Add from remove peers undoes the local deletion.
+Delete from remote peer means that the
+
+Prerequisite: when tracked version is deleted, the default copy is
+marked deleted and not served anymore, even if other versions exist.
+
+### Hard link
+
+When a file in cache is hard linked, the destination is marked as a
+redirect in the local copy, then reported as a new notification:
+
+ - Redirect(from, to, hash, old_hash) with old hash the old hash of "to", usually None
+
+Locally, any access to `to` is transformed into an access to `from` as
+long as the redirect exists. (The blob of `from` is used.)
+
+Upon receiving the notification, and if the hash matches, the owner
+creates a hard link locally then report the resulting `to` file as
+added or modified.
+
+- A Replace on `to` from remote peers with the right old_hash removes the redirect.
+- An Add on `to` from remote peers with the same hash removes the redirect.
+- Realizing `to` removes the redirect (realize is different, as it
+  requires copying the blob from `from` to `to`).
+
+A change to `from` does not affect the redirect (though the new
+version is served if `to` is accessed.)
+
+If `from` becomes completely unavailable (unavailable from all peers),
+`from` becomes invalid and can only be deleted by the user.
+
+### Move a file
+
+When a file in cache is moved locally, it is marked as a move then
+reported as a new notification:
+
+ - Move(from, to, hash, old_hash) with old hash the old hash of "to", usually None
+
+Locally, any remote access to `to` is transformed into a remote access
+to `from` *for that specific hash* as long as it is available. The
+blob value of `from` should be moved to the blob of `to` during the
+move and kept handled separately. The redirect only matters when
+downloading.
+
+Upon receiving that notification, and if the hash matches, the owner
+execute the move locally then report a Delete for `from` and Add or
+Remove for `to`.
+
+If the specific version of `from` become unavailable, `to` cannot be
+accessed anymore.
+
+- A Replace on `to` from remote peers with the right old_hash removes
+the redirect, but `from` remains deleted.
+- A Add on `to` from remote peers with the same hash removes the
+  redirect, but `from` remains deleted.
+- Realizing `to` removes the redirect, but `from` remains deleted.
+
+A change on `from` does not affect the redirect on `to` (though it may
+become invalid and unusable)
+
+### Delete a directory
+
+If a cached directory is deleted, all remote files within that
+directory are separately deleted.
+
+### Move a directory
+
+If a cached directory is moved, all remote files within that directory
+are separately moved.
