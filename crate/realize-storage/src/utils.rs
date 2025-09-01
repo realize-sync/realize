@@ -1,3 +1,4 @@
+pub(crate) mod debouncer;
 pub mod fs_utils;
 pub mod hash;
 pub mod holder;

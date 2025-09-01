@@ -1,11 +1,11 @@
 use super::db::{ArenaDatabase, BeforeCommit};
 use super::dirty::WritableOpenDirty;
-use super::hasher::hash_file;
 use super::mark::MarkReadOperations;
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
 use super::types::{BlobTableEntry, LocalAvailability, LruQueueId, Mark, QueueTableEntry};
 use crate::StorageError;
 use crate::types::Inode;
+use crate::utils::hash;
 use crate::utils::holder::Holder;
 use priority_queue::PriorityQueue;
 use realize_types::Arena;
@@ -1233,7 +1233,7 @@ impl Blob {
             self.seek(SeekFrom::Start(0)).await?;
         }
 
-        hash_file(self).await
+        hash::hash_file(self).await
     }
 
     /// Flush and mark file content as verified on the database.

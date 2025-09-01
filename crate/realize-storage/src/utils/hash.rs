@@ -24,7 +24,10 @@
 
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest};
+use futures::TryStreamExt as _;
 use realize_types::Hash;
+use tokio::io::AsyncRead;
+use tokio_util::io::ReaderStream;
 
 type Blake2b256 = Blake2b<U32>;
 
@@ -72,4 +75,17 @@ impl RunningHash {
     pub fn finalize(self) -> Hash {
         Hash(self.digest.finalize().into())
     }
+}
+
+pub(crate) async fn hash_file<R: AsyncRead>(f: R) -> Result<Hash, std::io::Error> {
+    let mut hasher = running();
+    ReaderStream::with_capacity(f, 8 * 1024)
+        .try_for_each(|chunk| {
+            hasher.update(chunk);
+
+            std::future::ready(Ok(()))
+        })
+        .await?;
+    let hash = hasher.finalize();
+    Ok(hash)
 }

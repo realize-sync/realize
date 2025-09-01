@@ -1,9 +1,10 @@
 #![allow(dead_code)] // work in progress
 
 use super::db::ArenaDatabase;
-use super::hasher::{self, Hasher, HasherOptions};
 use super::index;
-use crate::utils::fs_utils;
+use crate::StorageError;
+use crate::utils::debouncer::DebouncerMap;
+use crate::utils::{fs_utils, hash};
 use futures::StreamExt as _;
 use notify::event::{CreateKind, MetadataKind, ModifyKind};
 use notify::{Event, EventKind, RecommendedWatcher, Watcher as _};
@@ -31,7 +32,8 @@ pub struct RealWatcherBuilder {
     db: Arc<ArenaDatabase>,
     exclude: Vec<realize_types::Path>,
     initial_scan: bool,
-    hasher_options: HasherOptions,
+    debounce: Duration,
+    max_parallelism: usize,
 }
 
 impl RealWatcherBuilder {
@@ -46,7 +48,8 @@ impl RealWatcherBuilder {
             db,
             exclude: Vec::new(),
             initial_scan: false,
-            hasher_options: Default::default(),
+            debounce: Duration::ZERO,
+            max_parallelism: 0,
         }
     }
 
@@ -57,15 +60,15 @@ impl RealWatcherBuilder {
         self
     }
 
-    /// Set debounce delay for hashing files. This allows some time
+    /// Set debounce delay for processing files. This allows some time
     /// for operations in progress to finish.
     pub fn debounce(mut self, duration: Duration) -> Self {
-        self.hasher_options.debounce = duration;
+        self.debounce = duration;
 
         self
     }
 
-    /// Maximum number of hashers running in parallel.
+    /// Maximum number of debouncers running in parallel.
     ///
     /// Hashing is CPU intensive, so hashing several large files in
     /// parallel can become a problem. It's a good idea to limit
@@ -73,7 +76,7 @@ impl RealWatcherBuilder {
     ///
     /// Set it to 0 to not limit parallelism. This is the default.
     pub fn max_parallel_hashers(mut self, n: usize) -> Self {
-        self.hasher_options.max_parallelism = n;
+        self.max_parallelism = n;
 
         self
     }
@@ -104,7 +107,8 @@ impl RealWatcherBuilder {
             self.exclude,
             Arc::clone(&self.db),
             self.initial_scan,
-            self.hasher_options,
+            self.debounce,
+            self.max_parallelism,
         )
         .await
     }
@@ -124,7 +128,8 @@ impl RealWatcher {
         exclude: Vec<realize_types::Path>,
         db: Arc<ArenaDatabase>,
         initial_scan: bool,
-        hasher_options: HasherOptions,
+        debounce: Duration,
+        max_parallelism: usize,
     ) -> anyhow::Result<Self> {
         let root = fs::canonicalize(&root).await?;
         let arena = db.arena();
@@ -161,16 +166,9 @@ impl RealWatcher {
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
         let (rescan_tx, rescan_rx) = mpsc::channel(16);
 
-        let hasher = hasher::Hasher::spawn(
-            root.clone(),
-            Arc::clone(&db),
-            shutdown_tx.subscribe(),
-            &hasher_options,
-        );
         let worker = Arc::new(RealWatcherWorker {
-            root,
-            db,
-            hasher,
+            root: root.clone(),
+            db: db.clone(),
             exclude,
         });
 
@@ -189,7 +187,9 @@ impl RealWatcher {
         });
         task::spawn(async move {
             let _watcher = watcher;
-            worker.event_loop(watch_rx, rescan_tx, shutdown_rx).await;
+            worker
+                .event_loop(debounce, max_parallelism, watch_rx, rescan_tx, shutdown_rx)
+                .await;
         });
 
         Ok(Self { shutdown_tx })
@@ -287,7 +287,6 @@ fn take_path(root: &std::path::Path, exclude: &Vec<Path>, mut ev: Event) -> Opti
 struct RealWatcherWorker {
     root: PathBuf,
     db: Arc<ArenaDatabase>,
-    hasher: Hasher,
 
     /// Paths that should be excluded from the index. These may be
     /// files or directories. For directories, the whole directory
@@ -446,11 +445,14 @@ impl RealWatcherWorker {
     /// Listen to notifications from the filesystem or when scanning files.
     async fn event_loop(
         &self,
+        debounce: Duration,
+        max_parallelism: usize,
         mut watch_rx: mpsc::Receiver<FsEvent>,
         rescan_tx: mpsc::Sender<()>,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) {
         let arena = self.db.arena();
+        let mut debouncer = DebouncerMap::new(debounce, max_parallelism);
         loop {
             tokio::select!(
                 _ = shutdown_rx.recv() => {
@@ -461,25 +463,45 @@ impl RealWatcherWorker {
                         None =>{ break; }
                         Some(ev) =>{
                             log::debug!("[{arena}] {ev:?}");
-                            if let Err(err) = self.handle_event(&ev, &rescan_tx).await {
+                            if let Err(err) = self.handle_event(&ev, &rescan_tx, &mut debouncer).await {
                                 log::warn!("[{arena}] Handling of {ev:?} failed: {err}");
                             }
                         }
                     }
                 }
+                Some((path, Err(err))) = debouncer.join_next() => {
+                    log::debug!("[{arena}] Indexing failed for \"{path}\": {err:?}");
+                }
             );
         }
     }
 
-    async fn handle_event(&self, ev: &FsEvent, rescan_tx: &mpsc::Sender<()>) -> anyhow::Result<()> {
+    async fn handle_event(
+        &self,
+        ev: &FsEvent,
+        rescan_tx: &mpsc::Sender<()>,
+        debouncer: &mut DebouncerMap<Path, Result<(), StorageError>>,
+    ) -> anyhow::Result<()> {
         match ev {
             FsEvent::Removed(path) => {
                 if index::has_file_async(&self.db, &path).await? {
-                    // For a single-file deletion, use the hasher, so
-                    // the call is debounced. This avoids removing a
-                    // file that might be recreated by the application
-                    // right away.
-                    self.hasher.remove_content(path).await?;
+                    // For a single-file deletion, use the debouncer,
+                    // which adds a little delay. This avoids removing
+                    // a file that might be recreated by the
+                    // application right away.
+                    debouncer.spawn_unlimited(path.clone(), {
+                        let db = self.db.clone();
+                        let root = self.root.clone();
+                        let path = path.clone();
+                        async move {
+                            let arena = db.arena();
+                            log::info!("[{arena}] Remove: \"{path}\"");
+                            if !index::remove_file_if_missing_async(&db, &root, &path).await? {
+                                log::debug!("[{arena}] Mismatch; Skipped removing \"{path}\"",);
+                            }
+                            Ok(())
+                        }
+                    });
                     return Ok(());
                 }
                 self.file_or_dir_removed(path).await?;
@@ -493,7 +515,7 @@ impl RealWatcherWorker {
                 let m = fs_utils::metadata_no_symlink(&self.root, path).await?;
                 // Checking is_dir() because the  folder might actually be a symlink.
                 if m.is_dir() {
-                    self.dir_created_or_modified(path).await?;
+                    self.dir_created_or_modified(path, debouncer).await?;
                 }
             }
 
@@ -506,7 +528,7 @@ impl RealWatcherWorker {
                     // started, so there's no point in creating an
                     // entry; we'll get a Modify event soon enough.
                     if m.nlink() > 1 || m.len() == 0 {
-                        self.file_created_or_modified(path, &m).await?;
+                        self.file_created_or_modified(path, &m, debouncer).await?;
                     }
                 }
             }
@@ -525,9 +547,9 @@ impl RealWatcherWorker {
                         Ok(m) => {
                             // Possibly moved to; add or update
                             if m.is_file() {
-                                self.file_created_or_modified(path, &m).await?;
+                                self.file_created_or_modified(path, &m, debouncer).await?;
                             } else if m.is_dir() {
-                                self.dir_created_or_modified(path).await?;
+                                self.dir_created_or_modified(path, debouncer).await?;
                             }
                         }
                         Err(_) => {
@@ -551,7 +573,7 @@ impl RealWatcherWorker {
                         if m.is_dir() {
                             if fs::read_dir(path.within(&self.root)).await.is_ok() {
                                 // Might have just become accessible.
-                                self.dir_created_or_modified(path).await?;
+                                self.dir_created_or_modified(path, debouncer).await?;
                             } else {
                                 // Might have just become inaccessible
                                 self.file_or_dir_removed(path).await?;
@@ -559,7 +581,7 @@ impl RealWatcherWorker {
                         } else {
                             if file_is_readable(&path.within(&self.root)).await {
                                 // Might have just become accessible.
-                                self.file_created_or_modified(path, &m).await?;
+                                self.file_created_or_modified(path, &m, debouncer).await?;
                             } else {
                                 // Might have just become inaccessible
                                 self.file_or_dir_removed(path).await?;
@@ -573,7 +595,7 @@ impl RealWatcherWorker {
                 let m = fs_utils::metadata_no_symlink(&self.root, path).await?;
                 if m.is_file() {
                     // This event only matters if it's a file.
-                    self.file_created_or_modified(path, &m).await?;
+                    self.file_created_or_modified(path, &m, debouncer).await?;
                 }
             }
             FsEvent::Rescan => {
@@ -590,7 +612,11 @@ impl RealWatcherWorker {
         Ok(())
     }
 
-    async fn dir_created_or_modified(&self, dirpath: &Path) -> Result<(), anyhow::Error> {
+    async fn dir_created_or_modified(
+        &self,
+        dirpath: &Path,
+        debouncer: &mut DebouncerMap<Path, Result<(), StorageError>>,
+    ) -> Result<(), anyhow::Error> {
         let mut direntries =
             async_walkdir::WalkDir::new(dirpath.within(&self.root)).filter(only_regular);
         while let Some(direntry) = direntries.next().await {
@@ -626,7 +652,7 @@ impl RealWatcherWorker {
                 }
             };
 
-            if let Err(err) = self.file_created_or_modified(&path, &m).await {
+            if let Err(err) = self.file_created_or_modified(&path, &m, debouncer).await {
                 log::debug!("[{}] Failed to add \"{path}\": {err}", self.db.arena());
             }
         }
@@ -638,6 +664,7 @@ impl RealWatcherWorker {
         &self,
         path: &Path,
         m: &Metadata,
+        debouncer: &mut DebouncerMap<Path, Result<(), StorageError>>,
     ) -> Result<(), anyhow::Error> {
         if path.matches_any(&self.exclude) {
             return Ok(());
@@ -651,7 +678,24 @@ impl RealWatcherWorker {
         {
             return Ok(());
         }
-        self.hasher.hash_content(path, mtime, size).await?;
+        debouncer.spawn_limited(path.clone(), size > 0, {
+            let db = self.db.clone();
+            let root = self.root.clone();
+            let path = path.clone();
+            async move {
+                let hash = if size > 0 {
+                    hash::hash_file(File::open(path.within(&root)).await?).await?
+                } else {
+                    hash::empty()
+                };
+                let arena = db.arena();
+                log::info!("[{arena}] Hashed: \"{path}\" {hash} size={size}");
+                if !index::add_file_if_matches_async(&db, &root, &path, size, mtime, hash).await? {
+                    log::debug!("[{arena}] Mismatch; Skipped adding \"{path}\"",);
+                }
+                Ok(())
+            }
+        });
 
         Ok(())
     }
