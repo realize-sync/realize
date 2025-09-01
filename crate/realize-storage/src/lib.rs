@@ -110,7 +110,7 @@ impl Storage {
     ) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
         let index = match &self.arena_storage(arena)?.indexed {
             None => return Err(StorageError::NoLocalStorage(arena).into()),
-            Some(indexed) => indexed.index.clone(),
+            Some(indexed) => Arc::clone(&indexed.db),
         };
         arena::notifier::subscribe(index, tx, progress).await
     }
@@ -177,7 +177,7 @@ impl Storage {
             Some(indexed) => indexed,
         };
 
-        Reader::open(&indexed.index, indexed.root.as_ref(), path).await
+        Reader::open(&indexed.db, indexed.root.as_ref(), path).await
     }
 
     pub async fn rsync(
@@ -192,7 +192,7 @@ impl Storage {
             Some(indexed) => indexed,
         };
 
-        indexed_store::rsync(&indexed.index, &indexed.root, path, range, sig).await
+        indexed_store::rsync(&indexed.db, &indexed.root, path, range, sig).await
     }
 
     /// Return an infinite stream of jobs.

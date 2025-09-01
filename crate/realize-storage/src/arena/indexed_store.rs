@@ -1,32 +1,36 @@
-use super::index::RealIndexAsync;
+use super::db::ArenaDatabase;
+use super::index;
 use crate::StorageError;
 use realize_types::{self, ByteRange, Delta, Hash, Signature, UnixTime};
 use std::io::{self, SeekFrom};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, ReadBuf};
 
 /// A handle on a filesystem file, with a known hash.
 pub struct Reader {
-    index: RealIndexAsync,
+    db: Arc<ArenaDatabase>,
     path: realize_types::Path,
     file: File,
 }
 
 impl Reader {
     pub(crate) async fn open(
-        index: &RealIndexAsync,
+        db: &Arc<ArenaDatabase>,
         root: &std::path::Path,
         path: &realize_types::Path,
     ) -> Result<Self, StorageError> {
         // The file must exist in the index
-        index.get_file(path).await?.ok_or(StorageError::NotFound)?;
+        index::get_file_async(db, path)
+            .await?
+            .ok_or(StorageError::NotFound)?;
 
         let realpath = path.within(root);
         let file = File::open(realpath).await?;
         Ok(Self {
-            index: index.clone(),
+            db: Arc::clone(db),
             path: path.clone(),
             file,
         })
@@ -37,7 +41,10 @@ impl Reader {
     // The hash might not be available if the file has just been
     // updated locally.
     pub async fn metadata(&self) -> Result<(u64, Option<Hash>), StorageError> {
-        let (m, entry) = tokio::join!(self.file.metadata(), self.index.get_file(&self.path));
+        let (m, entry) = tokio::join!(
+            self.file.metadata(),
+            index::get_file_async(&self.db, &self.path)
+        );
         let m = m?;
 
         // The index and file might not be consistent if the file has
@@ -88,14 +95,16 @@ impl AsyncSeek for Reader {
 /// index, then check that the size/mtime of the file on the
 /// filesystem correspond to the index.
 pub(crate) async fn rsync(
-    index: &RealIndexAsync,
+    db: &Arc<ArenaDatabase>,
     root: &std::path::Path,
     path: &realize_types::Path,
     range: &ByteRange,
     sig: Signature,
 ) -> Result<Delta, StorageError> {
     let sig = fast_rsync::Signature::deserialize(sig.0)?;
-    index.get_file(path).await?.ok_or(StorageError::NotFound)?;
+    index::get_file_async(db, path)
+        .await?
+        .ok_or(StorageError::NotFound)?;
 
     let realpath = path.within(root);
     let len = range.bytecount() as usize;
@@ -127,7 +136,7 @@ mod tests {
     }
 
     struct Fixture {
-        index: RealIndexAsync,
+        db: Arc<ArenaDatabase>,
         root: ChildPath,
         _tempdir: TempDir,
     }
@@ -142,10 +151,9 @@ mod tests {
 
             let arena = test_arena();
             let db = ArenaDatabase::for_testing_single_arena(arena, &tempdir.path().join("blobs"))?;
-            let index = RealIndexAsync::new(db);
 
             Ok(Self {
-                index,
+                db,
                 root,
                 _tempdir: tempdir,
             })
@@ -161,14 +169,14 @@ mod tests {
             let child = self.root.child(path_str);
             child.write_str(content)?;
             let m = fs::metadata(child.path()).await?;
-            self.index
-                .add_file(
-                    &path,
-                    content.len() as u64,
-                    UnixTime::mtime(&m),
-                    hash.clone(),
-                )
-                .await?;
+            index::add_file_async(
+                &self.db,
+                &path,
+                content.len() as u64,
+                UnixTime::mtime(&m),
+                hash.clone(),
+            )
+            .await?;
 
             Ok((path, hash))
         }
@@ -179,7 +187,7 @@ mod tests {
         let fixture = Fixture::setup().await?;
         let root = &fixture.root;
         let (path, _) = fixture.add_file("foo/bar.txt", "foobar").await?;
-        let mut reader = Reader::open(&fixture.index, root.path(), &path).await?;
+        let mut reader = Reader::open(&fixture.db, root.path(), &path).await?;
         let mut str = String::new();
         reader.read_to_string(&mut str).await?;
         assert_eq!("foobar", str.as_str());
@@ -193,7 +201,7 @@ mod tests {
         let root = &fixture.root;
         let (path, hash) = fixture.add_file("foo/bar.txt", "foobar").await?;
 
-        let reader = Reader::open(&fixture.index, root.path(), &path).await?;
+        let reader = Reader::open(&fixture.db, root.path(), &path).await?;
         assert_eq!((6, Some(hash)), reader.metadata().await?);
 
         Ok(())
@@ -205,7 +213,7 @@ mod tests {
         let root = &fixture.root;
         let (path, hash) = fixture.add_file("foo/bar.txt", "foobar").await?;
 
-        let reader = Reader::open(&fixture.index, root.path(), &path).await?;
+        let reader = Reader::open(&fixture.db, root.path(), &path).await?;
 
         assert_eq!((6, Some(hash)), reader.metadata().await?);
 
@@ -223,7 +231,7 @@ mod tests {
         let (path, _) = fixture.add_file("foo/bar.txt", "foobar").await?;
         root.child("foo/bar.txt").write_str("new data")?;
 
-        let reader = Reader::open(&fixture.index, root.path(), &path).await?;
+        let reader = Reader::open(&fixture.db, root.path(), &path).await?;
 
         assert_eq!((8, None), reader.metadata().await?);
 
@@ -236,7 +244,7 @@ mod tests {
         let root = &fixture.root;
         assert!(matches!(
             Reader::open(
-                &fixture.index,
+                &fixture.db,
                 root.path(),
                 &realize_types::Path::parse("doesnotexist")?
             )
@@ -255,7 +263,7 @@ mod tests {
 
         assert!(matches!(
             Reader::open(
-                &fixture.index,
+                &fixture.db,
                 root.path(),
                 &realize_types::Path::parse("fs_only")?
             )
@@ -275,7 +283,7 @@ mod tests {
         fs::remove_file(root.child("foo/bar.txt").path()).await?;
 
         assert!(matches!(
-            Reader::open(&fixture.index, root.path(), &path).await,
+            Reader::open(&fixture.db, root.path(), &path).await,
             Err(StorageError::Io(e)) if e.kind() == io::ErrorKind::NotFound
         ));
 
@@ -301,7 +309,7 @@ mod tests {
         let signature = Signature(sig.into_serialized());
 
         let range = ByteRange::new(0, modified_content.len() as u64);
-        let delta = rsync(&fixture.index, root.path(), &path, &range, signature).await?;
+        let delta = rsync(&fixture.db, root.path(), &path, &range, signature).await?;
 
         // Apply delta to bad content to fix it
         let mut reconstructed = Vec::new();
@@ -334,7 +342,7 @@ mod tests {
         let signature = Signature(sig.into_serialized());
 
         let range = ByteRange::new(0, 10);
-        let result = rsync(&fixture.index, root.path(), &path, &range, signature).await;
+        let result = rsync(&fixture.db, root.path(), &path, &range, signature).await;
         println!("Result: {:?}", result);
         assert!(matches!(result, Err(StorageError::NotFound)));
 
@@ -369,7 +377,7 @@ mod tests {
 
             let sig = fast_rsync::Signature::calculate(incorrect.as_bytes(), opts);
             let delta = rsync(
-                &fixture.index,
+                &fixture.db,
                 root.path(),
                 &path,
                 &range,

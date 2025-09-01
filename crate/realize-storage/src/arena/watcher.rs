@@ -1,7 +1,8 @@
 #![allow(dead_code)] // work in progress
 
+use super::db::ArenaDatabase;
 use super::hasher::{self, Hasher, HasherOptions};
-use super::index::RealIndexAsync;
+use super::index;
 use crate::utils::fs_utils;
 use futures::StreamExt as _;
 use notify::event::{CreateKind, MetadataKind, ModifyKind};
@@ -27,22 +28,22 @@ pub struct RealWatcher {
 /// Builder for creating a RealWatcher with convenient configuration options.
 pub struct RealWatcherBuilder {
     root: std::path::PathBuf,
-    index: RealIndexAsync,
+    db: Arc<ArenaDatabase>,
     exclude: Vec<realize_types::Path>,
     initial_scan: bool,
     hasher_options: HasherOptions,
 }
 
 impl RealWatcherBuilder {
-    /// Create a new builder for watching the given root directory with the specified index.
-    pub fn new<P>(root: P, index: RealIndexAsync) -> Self
+    /// Create a new builder for watching the given root directory with the specified database.
+    pub fn new<P>(root: P, db: Arc<ArenaDatabase>) -> Self
     where
         P: AsRef<std::path::Path>,
     {
         let root = root.as_ref();
         Self {
             root: root.to_path_buf(),
-            index,
+            db,
             exclude: Vec::new(),
             initial_scan: false,
             hasher_options: Default::default(),
@@ -101,7 +102,7 @@ impl RealWatcherBuilder {
         RealWatcher::spawn(
             &self.root,
             self.exclude,
-            self.index,
+            Arc::clone(&self.db),
             self.initial_scan,
             self.hasher_options,
         )
@@ -111,22 +112,22 @@ impl RealWatcherBuilder {
 
 impl RealWatcher {
     /// Create a builder for configuring and spawning a RealWatcher.
-    pub fn builder<P>(root: P, index: RealIndexAsync) -> RealWatcherBuilder
+    pub fn builder<P>(root: P, db: Arc<ArenaDatabase>) -> RealWatcherBuilder
     where
         P: AsRef<std::path::Path>,
     {
-        RealWatcherBuilder::new(root, index)
+        RealWatcherBuilder::new(root, db)
     }
 
     async fn spawn(
         root: &std::path::Path,
         exclude: Vec<realize_types::Path>,
-        index: RealIndexAsync,
+        db: Arc<ArenaDatabase>,
         initial_scan: bool,
         hasher_options: HasherOptions,
     ) -> anyhow::Result<Self> {
         let root = fs::canonicalize(&root).await?;
-        let arena = index.arena();
+        let arena = db.arena();
 
         let (watch_tx, watch_rx) = mpsc::channel(100);
 
@@ -162,13 +163,13 @@ impl RealWatcher {
 
         let hasher = hasher::Hasher::spawn(
             root.clone(),
-            index.clone(),
+            Arc::clone(&db),
             shutdown_tx.subscribe(),
             &hasher_options,
         );
         let worker = Arc::new(RealWatcherWorker {
             root,
-            index,
+            db,
             hasher,
             exclude,
         });
@@ -285,7 +286,7 @@ fn take_path(root: &std::path::Path, exclude: &Vec<Path>, mut ev: Event) -> Opti
 
 struct RealWatcherWorker {
     root: PathBuf,
-    index: RealIndexAsync,
+    db: Arc<ArenaDatabase>,
     hasher: Hasher,
 
     /// Paths that should be excluded from the index. These may be
@@ -304,7 +305,7 @@ impl RealWatcherWorker {
         watch_tx: mpsc::Sender<FsEvent>,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) {
-        let arena = self.index.arena();
+        let arena = self.db.arena();
         loop {
             tokio::select!(
             _ = shutdown_rx.recv() =>{
@@ -340,7 +341,7 @@ impl RealWatcherWorker {
         watch_tx: &mpsc::Sender<FsEvent>,
         shutdown_rx: &mut broadcast::Receiver<()>,
     ) -> anyhow::Result<()> {
-        let mut files = std::pin::pin!(self.index.all_files());
+        let mut files = std::pin::pin!(index::all_files_stream(&self.db));
         loop {
             tokio::select!(
             _ = shutdown_rx.recv() => {
@@ -423,7 +424,7 @@ impl RealWatcherWorker {
                 };
 
                 // Skip if the file is already in the index.
-                if self.index.has_file(&path).await.unwrap_or(false) {
+                if index::has_file_async(&self.db, &path).await.unwrap_or(false) {
                     continue;
                 }
 
@@ -449,7 +450,7 @@ impl RealWatcherWorker {
         rescan_tx: mpsc::Sender<()>,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) {
-        let arena = self.index.arena();
+        let arena = self.db.arena();
         loop {
             tokio::select!(
                 _ = shutdown_rx.recv() => {
@@ -473,7 +474,7 @@ impl RealWatcherWorker {
     async fn handle_event(&self, ev: &FsEvent, rescan_tx: &mpsc::Sender<()>) -> anyhow::Result<()> {
         match ev {
             FsEvent::Removed(path) => {
-                if self.index.has_file(&path).await? {
+                if index::has_file_async(&self.db, &path).await? {
                     // For a single-file deletion, use the hasher, so
                     // the call is debounced. This avoids removing a
                     // file that might be recreated by the application
@@ -584,7 +585,7 @@ impl RealWatcherWorker {
     }
 
     async fn file_or_dir_removed(&self, path: &Path) -> anyhow::Result<()> {
-        self.index.remove_file_or_dir(&path).await?;
+        index::remove_file_or_dir_async(&self.db, &path).await?;
 
         Ok(())
     }
@@ -626,7 +627,7 @@ impl RealWatcherWorker {
             };
 
             if let Err(err) = self.file_created_or_modified(&path, &m).await {
-                log::debug!("[{}] Failed to add \"{path}\": {err}", self.index.arena());
+                log::debug!("[{}] Failed to add \"{path}\": {err}", self.db.arena());
             }
         }
 
@@ -644,9 +645,7 @@ impl RealWatcherWorker {
 
         let mtime = UnixTime::mtime(m);
         let size = m.len();
-        if self
-            .index
-            .has_matching_file(path, size, mtime)
+        if index::has_matching_file_async(&self.db, path, size, mtime)
             .await
             .unwrap_or(false)
         {
@@ -714,7 +713,7 @@ mod tests {
     use std::time::Duration;
 
     struct Fixture {
-        index: RealIndexAsync,
+        db: Arc<ArenaDatabase>,
         root: ChildPath,
         tempdir: TempDir,
         exclude: Vec<realize_types::Path>,
@@ -730,11 +729,9 @@ mod tests {
             let arena = Arena::from("test");
             let db =
                 ArenaDatabase::for_testing_single_arena(arena, &std::path::Path::new("/dev/null"))?;
-            let index = RealIndexAsync::new(db);
-
             Ok(Self {
                 root,
-                index,
+                db,
                 tempdir,
                 exclude: vec![],
             })
@@ -747,7 +744,7 @@ mod tests {
 
         /// Catch up to any previous changes and watch for anything new.
         async fn scan_and_watch(&self) -> anyhow::Result<RealWatcher> {
-            RealWatcher::builder(self.root.path(), self.index.clone())
+            RealWatcher::builder(self.root.path(), Arc::clone(&self.db))
                 .with_initial_scan()
                 .exclude_all(self.exclude.iter())
                 .spawn()
@@ -759,7 +756,7 @@ mod tests {
         /// Note that filesystem modifications made just before this
         /// is called might still get reported.
         async fn watch(&self) -> anyhow::Result<RealWatcher> {
-            RealWatcher::builder(self.root.path(), self.index.clone())
+            RealWatcher::builder(self.root.path(), Arc::clone(&self.db))
                 .exclude_all(self.exclude.iter())
                 .spawn()
                 .await
@@ -771,8 +768,9 @@ mod tests {
         async fn wait_for_history_event(&self, goal_index: u64) -> anyhow::Result<()> {
             tokio::time::timeout(
                 Duration::from_secs(3),
-                self.index
-                    .watch_history()
+                self.db
+                    .history()
+                    .watch()
                     .wait_for(|index| *index >= goal_index),
             )
             .await
@@ -812,7 +810,7 @@ mod tests {
                 hash: hash::digest("test".as_bytes()),
                 outdated_by: None,
             }),
-            fixture.index.get_file(&path).await?
+            index::get_file_async(&fixture.db, &path).await?
         );
 
         Ok(())
@@ -836,7 +834,7 @@ mod tests {
                 hash: hash::digest([]),
                 outdated_by: None,
             }),
-            fixture.index.get_file(&path).await?
+            index::get_file_async(&fixture.db, &path).await?
         );
 
         Ok(())
@@ -851,12 +849,12 @@ mod tests {
 
         let path = realize_types::Path::parse("foobar")?;
         fixture.wait_for_history_event(1).await?;
-        assert!(fixture.index.has_file(&path).await?);
+        assert!(index::has_file_async(&fixture.db, &path).await?);
 
         foobar.write_str("boo")?;
         let mtime = UnixTime::mtime(&fs::metadata(foobar.path()).await?);
         fixture.wait_for_history_event(2).await?;
-        assert!(fixture.index.has_matching_file(&path, 3, mtime).await?);
+        assert!(index::has_matching_file_async(&fixture.db, &path, 3, mtime).await?);
 
         Ok(())
     }
@@ -870,11 +868,11 @@ mod tests {
         foobar.write_str("test")?;
         fixture.wait_for_history_event(1).await?;
         let path = realize_types::Path::parse("foobar")?;
-        assert!(fixture.index.has_file(&path).await?);
+        assert!(index::has_file_async(&fixture.db, &path).await?);
 
         fs::remove_file(foobar.path()).await?;
         fixture.wait_for_history_event(2).await?;
-        assert!(!fixture.index.has_file(&path).await?);
+        assert!(!index::has_file_async(&fixture.db, &path).await?);
 
         Ok(())
     }
@@ -883,7 +881,7 @@ mod tests {
     async fn create_dir_with_files() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let _watcher = fixture.watch().await?;
-        let index = &fixture.index;
+        let db = &fixture.db;
         let dir = fixture.root.child("a/b");
         dir.create_dir_all()?;
 
@@ -891,16 +889,8 @@ mod tests {
         fixture.root.child("a/b/bar").write_str("test")?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(
-            index
-                .has_file(&realize_types::Path::parse("a/b/foo")?)
-                .await?
-        );
-        assert!(
-            index
-                .has_file(&realize_types::Path::parse("a/b/bar")?)
-                .await?
-        );
+        assert!(index::has_file_async(db, &realize_types::Path::parse("a/b/foo")?).await?);
+        assert!(index::has_file_async(db, &realize_types::Path::parse("a/b/bar")?).await?);
 
         Ok(())
     }
@@ -909,7 +899,7 @@ mod tests {
     async fn remove_dir_with_files() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let _watcher = fixture.watch().await?;
-        let index = &fixture.index;
+        let db = &fixture.db;
         let dir = fixture.root.child("a/b");
         dir.create_dir_all()?;
 
@@ -920,14 +910,14 @@ mod tests {
         let bar = realize_types::Path::parse("a/b/bar")?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(index.has_file(&foo).await?);
-        assert!(index.has_file(&bar).await?);
+        assert!(index::has_file_async(db, &foo).await?);
+        assert!(index::has_file_async(db, &bar).await?);
 
         fs::remove_dir_all(dir.path()).await?;
 
         fixture.wait_for_history_event(4).await?;
-        assert!(!index.has_file(&foo).await?);
-        assert!(!index.has_file(&bar).await?);
+        assert!(!index::has_file_async(db, &foo).await?);
+        assert!(!index::has_file_async(db, &bar).await?);
 
         Ok(())
     }
@@ -936,7 +926,7 @@ mod tests {
     async fn move_dir_with_files_into() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let _watcher = fixture.watch().await?;
-        let index = &fixture.index;
+        let db = &fixture.db;
         let dir = fixture.tempdir.child("newdir");
         dir.create_dir_all()?;
 
@@ -949,8 +939,8 @@ mod tests {
         fs::rename(dir, fixture.root.join("newdir")).await?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(index.has_file(&foo).await?);
-        assert!(index.has_file(&bar).await?);
+        assert!(index::has_file_async(db, &foo).await?);
+        assert!(index::has_file_async(db, &bar).await?);
 
         Ok(())
     }
@@ -959,7 +949,7 @@ mod tests {
     async fn move_dir_with_files_out() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let _watcher = fixture.watch().await?;
-        let index = &fixture.index;
+        let db = &fixture.db;
         let dir = fixture.root.child("a/b");
         dir.create_dir_all()?;
 
@@ -970,14 +960,14 @@ mod tests {
         let bar = realize_types::Path::parse("a/b/bar")?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(index.has_file(&foo).await?);
-        assert!(index.has_file(&bar).await?);
+        assert!(index::has_file_async(db, &foo).await?);
+        assert!(index::has_file_async(db, &bar).await?);
 
         fs::rename(dir.path(), fixture.tempdir.child("out").path()).await?;
 
         fixture.wait_for_history_event(4).await?;
-        assert!(!index.has_file(&foo).await?);
-        assert!(!index.has_file(&bar).await?);
+        assert!(!index::has_file_async(db, &foo).await?);
+        assert!(!index::has_file_async(db, &bar).await?);
 
         Ok(())
     }
@@ -986,7 +976,7 @@ mod tests {
     async fn rename_dir_with_files() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let _watcher = fixture.watch().await?;
-        let index = &fixture.index;
+        let db = &fixture.db;
         let dir = fixture.root.child("a/b");
         dir.create_dir_all()?;
 
@@ -997,8 +987,8 @@ mod tests {
         let bar = realize_types::Path::parse("a/b/bar")?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(index.has_file(&foo).await?);
-        assert!(index.has_file(&bar).await?);
+        assert!(index::has_file_async(db, &foo).await?);
+        assert!(index::has_file_async(db, &bar).await?);
 
         fs::rename(
             fixture.root.child("a").path(),
@@ -1007,13 +997,13 @@ mod tests {
         .await?;
 
         fixture.wait_for_history_event(6).await?;
-        assert!(!index.has_file(&foo).await?);
-        assert!(!index.has_file(&bar).await?);
+        assert!(!index::has_file_async(db, &foo).await?);
+        assert!(!index::has_file_async(db, &bar).await?);
 
         let newfoo = realize_types::Path::parse("newa/b/foo")?;
         let newbar = realize_types::Path::parse("newa/b/bar")?;
-        assert!(index.has_file(&newfoo).await?);
-        assert!(index.has_file(&newbar).await?);
+        assert!(index::has_file_async(db, &newfoo).await?);
+        assert!(index::has_file_async(db, &newbar).await?);
 
         Ok(())
     }
@@ -1022,18 +1012,14 @@ mod tests {
     async fn move_file_into() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let _watcher = fixture.watch().await?;
-        let index = &fixture.index;
+        let db = &fixture.db;
         let newfile = fixture.tempdir.child("newfile");
         newfile.write_str("test")?;
 
         fs::rename(newfile.path(), fixture.root.join("newfile")).await?;
 
         fixture.wait_for_history_event(1).await?;
-        assert!(
-            index
-                .has_file(&realize_types::Path::parse("newfile")?)
-                .await?
-        );
+        assert!(index::has_file_async(db, &realize_types::Path::parse("newfile")?).await?);
 
         Ok(())
     }
@@ -1047,12 +1033,12 @@ mod tests {
         foobar.write_str("test")?;
         fixture.wait_for_history_event(1).await?;
         let path = realize_types::Path::parse("foobar")?;
-        assert!(fixture.index.has_file(&path).await?);
+        assert!(index::has_file_async(&fixture.db, &path).await?);
 
         fs::rename(foobar.path(), fixture.tempdir.child("out").path()).await?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(!fixture.index.has_file(&path).await?);
+        assert!(!index::has_file_async(&fixture.db, &path).await?);
 
         Ok(())
     }
@@ -1066,14 +1052,14 @@ mod tests {
         foo.write_str("test")?;
         fixture.wait_for_history_event(1).await?;
         let path = realize_types::Path::parse("foo")?;
-        assert!(fixture.index.has_file(&path).await?);
+        assert!(index::has_file_async(&fixture.db, &path).await?);
 
         fs::rename(foo.path(), fixture.root.child("bar")).await?;
 
         fixture.wait_for_history_event(3).await?;
-        assert!(!fixture.index.has_file(&path).await?);
+        assert!(!index::has_file_async(&fixture.db, &path).await?);
         let path = realize_types::Path::parse("bar")?;
-        assert!(fixture.index.has_file(&path).await?);
+        assert!(index::has_file_async(&fixture.db, &path).await?);
 
         Ok(())
     }
@@ -1082,7 +1068,7 @@ mod tests {
     async fn change_file_accessibility() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let _watcher = fixture.watch().await?;
-        let index = &fixture.index;
+        let db = &fixture.db;
         let dir = fixture.root.child("a/b");
         dir.create_dir_all()?;
 
@@ -1094,11 +1080,11 @@ mod tests {
         make_inaccessible(&foo_pathbuf).await?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(!index.has_file(&foo).await?);
+        assert!(!index::has_file_async(db, &foo).await?);
 
         make_accessible(&foo_pathbuf).await?;
         fixture.wait_for_history_event(3).await?;
-        assert!(index.has_file(&foo).await?);
+        assert!(index::has_file_async(db, &foo).await?);
 
         Ok(())
     }
@@ -1107,7 +1093,7 @@ mod tests {
     async fn change_dir_accessibility() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let _watcher = fixture.watch().await?;
-        let index = &fixture.index;
+        let db = &fixture.db;
         let dir = fixture.root.child("a/b");
         dir.create_dir_all()?;
 
@@ -1117,21 +1103,21 @@ mod tests {
         fixture.wait_for_history_event(2).await?;
         let foo = realize_types::Path::parse("a/b/foo")?;
         let bar = realize_types::Path::parse("a/b/foo")?;
-        assert!(index.has_file(&foo).await?);
-        assert!(index.has_file(&bar).await?);
+        assert!(index::has_file_async(db, &foo).await?);
+        assert!(index::has_file_async(db, &bar).await?);
 
         let dir = fixture.root.join("a");
         make_inaccessible(&dir).await?;
 
         fixture.wait_for_history_event(4).await?;
-        assert!(!index.has_file(&foo).await?);
-        assert!(!index.has_file(&bar).await?);
+        assert!(!index::has_file_async(db, &foo).await?);
+        assert!(!index::has_file_async(db, &bar).await?);
 
         make_accessible(&dir).await?;
 
         fixture.wait_for_history_event(6).await?;
-        assert!(index.has_file(&foo).await?);
-        assert!(index.has_file(&bar).await?);
+        assert!(index::has_file_async(db, &foo).await?);
+        assert!(index::has_file_async(db, &bar).await?);
 
         Ok(())
     }
@@ -1139,7 +1125,7 @@ mod tests {
     #[tokio::test]
     async fn initial_scan_adds_existing_files() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let index = &fixture.index;
+        let db = &fixture.db;
 
         fixture.root.child("foo").write_str("foo")?;
         fixture.root.child("a/b/c").create_dir_all()?;
@@ -1150,8 +1136,8 @@ mod tests {
         fixture.wait_for_history_event(2).await?;
         let foo = realize_types::Path::parse("foo")?;
         let bar = realize_types::Path::parse("a/b/c/bar")?;
-        assert!(index.has_file(&foo).await?);
-        assert!(index.has_file(&bar).await?);
+        assert!(index::has_file_async(db, &foo).await?);
+        assert!(index::has_file_async(db, &bar).await?);
 
         Ok(())
     }
@@ -1159,19 +1145,19 @@ mod tests {
     #[tokio::test]
     async fn initial_scan_removes_old_files() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let index = &fixture.index;
+        let db = &fixture.db;
 
         let foo = realize_types::Path::parse("foo")?;
         let bar = realize_types::Path::parse("a/b/c/bar")?;
         let mtime = UnixTime::from_secs(1234567890);
-        index.add_file(&foo, 4, mtime, Hash([1; 32])).await?;
-        index.add_file(&bar, 4, mtime, Hash([2; 32])).await?;
+        index::add_file_async(db, &foo, 4, mtime, Hash([1; 32])).await?;
+        index::add_file_async(db, &bar, 4, mtime, Hash([2; 32])).await?;
 
         let _watcher = fixture.scan_and_watch().await?;
 
         fixture.wait_for_history_event(4).await?;
-        assert!(!index.has_file(&foo).await?);
-        assert!(!index.has_file(&bar).await?);
+        assert!(!index::has_file_async(db, &foo).await?);
+        assert!(!index::has_file_async(db, &foo).await?);
 
         Ok(())
     }
@@ -1179,7 +1165,7 @@ mod tests {
     #[tokio::test]
     async fn initial_scan_updates_modified_files() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let index = &fixture.index;
+        let db = &fixture.db;
 
         let foo = realize_types::Path::parse("foo")?;
         let bar = realize_types::Path::parse("a/b/c/bar")?;
@@ -1188,22 +1174,22 @@ mod tests {
         let bar_child = fixture.root.child("a/b/c/bar");
         bar_child.write_str("bar")?;
 
-        index
-            .add_file(
-                &foo,
-                3,
-                UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
-                hash::digest("foo".as_bytes()),
-            )
-            .await?;
-        index
-            .add_file(
-                &bar,
-                3,
-                UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
-                hash::digest("bar".as_bytes()),
-            )
-            .await?;
+        index::add_file_async(
+            db,
+            &foo,
+            3,
+            UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
+            hash::digest("foo".as_bytes()),
+        )
+        .await?;
+        index::add_file_async(
+            db,
+            &bar,
+            3,
+            UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
+            hash::digest("bar".as_bytes()),
+        )
+        .await?;
 
         bar_child.write_str("barbar")?;
 
@@ -1219,7 +1205,7 @@ mod tests {
                 hash: hash::digest("foo".as_bytes()),
                 outdated_by: None,
             }),
-            fixture.index.get_file(&foo).await?
+            index::get_file_async(&fixture.db, &foo).await?
         );
 
         // Bar was updated
@@ -1230,7 +1216,7 @@ mod tests {
                 hash: hash::digest("barbar".as_bytes()),
                 outdated_by: None,
             }),
-            fixture.index.get_file(&bar).await?
+            index::get_file_async(&fixture.db, &bar).await?
         );
 
         Ok(())
@@ -1239,7 +1225,7 @@ mod tests {
     #[tokio::test]
     async fn initial_scan_removes_inaccessible_files() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let index = &fixture.index;
+        let db = &fixture.db;
 
         let foo = realize_types::Path::parse("foo")?;
         let bar = realize_types::Path::parse("a/b/c/bar")?;
@@ -1248,22 +1234,22 @@ mod tests {
         let bar_child = fixture.root.child("a/b/c/bar");
         bar_child.write_str("bar")?;
 
-        index
-            .add_file(
-                &foo,
-                3,
-                UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
-                hash::digest("foo".as_bytes()),
-            )
-            .await?;
-        index
-            .add_file(
-                &bar,
-                3,
-                UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
-                hash::digest("bar".as_bytes()),
-            )
-            .await?;
+        index::add_file_async(
+            db,
+            &foo,
+            3,
+            UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
+            hash::digest("foo".as_bytes()),
+        )
+        .await?;
+        index::add_file_async(
+            db,
+            &bar,
+            3,
+            UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
+            hash::digest("bar".as_bytes()),
+        )
+        .await?;
 
         make_inaccessible(foo_child.path()).await?;
         make_inaccessible(bar_child.path()).await?;
@@ -1272,8 +1258,8 @@ mod tests {
 
         fixture.wait_for_history_event(4).await?;
 
-        assert!(!index.has_file(&foo).await?);
-        assert!(!index.has_file(&bar).await?);
+        assert!(!index::has_file_async(db, &foo).await?);
+        assert!(!index::has_file_async(db, &foo).await?);
 
         Ok(())
     }
@@ -1281,7 +1267,7 @@ mod tests {
     #[tokio::test]
     async fn initial_scan_removes_files_in_inaccessible_dirs() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let index = &fixture.index;
+        let db = &fixture.db;
 
         let foo = realize_types::Path::parse("a/b/c/foo")?;
         let bar = realize_types::Path::parse("a/b/d/bar")?;
@@ -1290,22 +1276,22 @@ mod tests {
         let bar_child = fixture.root.child("a/b/d/bar");
         bar_child.write_str("bar")?;
 
-        index
-            .add_file(
-                &foo,
-                3,
-                UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
-                hash::digest("foo".as_bytes()),
-            )
-            .await?;
-        index
-            .add_file(
-                &bar,
-                3,
-                UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
-                hash::digest("bar".as_bytes()),
-            )
-            .await?;
+        index::add_file_async(
+            db,
+            &foo,
+            3,
+            UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
+            hash::digest("foo".as_bytes()),
+        )
+        .await?;
+        index::add_file_async(
+            db,
+            &bar,
+            3,
+            UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
+            hash::digest("bar".as_bytes()),
+        )
+        .await?;
 
         make_inaccessible(fixture.root.child("a").path()).await?;
 
@@ -1317,7 +1303,7 @@ mod tests {
                 // TODO: fix it
                 log::warn!(
                     "[{arena}] FIXME: Watch with an inaccessible subdir failed: {err}",
-                    arena = fixture.index.arena()
+                    arena = fixture.db.arena()
                 );
                 return Ok(());
             }
@@ -1325,8 +1311,8 @@ mod tests {
 
         fixture.wait_for_history_event(4).await?;
 
-        assert!(!index.has_file(&foo).await?);
-        assert!(!index.has_file(&bar).await?);
+        assert!(!index::has_file_async(db, &foo).await?);
+        assert!(!index::has_file_async(db, &bar).await?);
 
         Ok(())
     }
@@ -1335,7 +1321,7 @@ mod tests {
     async fn ignore_new_symlinks() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let _watcher = fixture.watch().await?;
-        let index = &fixture.index;
+        let db = &fixture.db;
 
         let file_symlink = fixture.root.child("file_symlink");
         let dir_symlink = fixture.root.child("dir_symlink");
@@ -1347,22 +1333,10 @@ mod tests {
         bar.write_str("test")?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(
-            !index
-                .has_file(&realize_types::Path::parse("file_symlink")?)
-                .await?
-        );
-        assert!(
-            !index
-                .has_file(&realize_types::Path::parse("dir_symlink/bar")?)
-                .await?
-        );
-        assert!(index.has_file(&realize_types::Path::parse("foo")?).await?);
-        assert!(
-            index
-                .has_file(&realize_types::Path::parse("b/bar")?)
-                .await?
-        );
+        assert!(!index::has_file_async(db, &realize_types::Path::parse("file_symlink")?).await?);
+        assert!(!index::has_file_async(db, &realize_types::Path::parse("dir_symlink/bar")?).await?);
+        assert!(index::has_file_async(db, &realize_types::Path::parse("foo")?).await?);
+        assert!(index::has_file_async(db, &realize_types::Path::parse("b/bar")?).await?);
 
         Ok(())
     }
@@ -1370,7 +1344,7 @@ mod tests {
     #[tokio::test]
     async fn initial_scan_ignores_symlinks() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let index = &fixture.index;
+        let db = &fixture.db;
 
         let foo = fixture.root.child("foo");
         foo.write_str("foo")?;
@@ -1389,10 +1363,10 @@ mod tests {
         let bar = realize_types::Path::parse("a/b/c/bar")?;
         let file_symlink = realize_types::Path::parse("file_symlink")?;
         let bar_through_symlink = realize_types::Path::parse("dir_symlink/b/c/bar")?;
-        assert!(index.has_file(&foo).await?);
-        assert!(index.has_file(&bar).await?);
-        assert!(!index.has_file(&file_symlink).await?);
-        assert!(!index.has_file(&bar_through_symlink).await?);
+        assert!(index::has_file_async(db, &foo).await?);
+        assert!(index::has_file_async(db, &bar).await?);
+        assert!(!index::has_file_async(db, &file_symlink).await?);
+        assert!(!index::has_file_async(db, &bar_through_symlink).await?);
 
         Ok(())
     }
@@ -1409,14 +1383,14 @@ mod tests {
         let foo = realize_types::Path::parse("foo")?;
         let bar = realize_types::Path::parse("bar")?;
         fixture.wait_for_history_event(2).await?;
-        assert!(fixture.index.has_file(&foo).await?);
-        assert!(fixture.index.has_file(&bar).await?);
+        assert!(index::has_file_async(&fixture.db, &foo).await?);
+        assert!(index::has_file_async(&fixture.db, &bar).await?);
 
         fs::remove_file(bar_child.path()).await?;
         fs::symlink(foo_child.path(), bar_child.path()).await?;
 
         fixture.wait_for_history_event(3).await?;
-        assert!(!fixture.index.has_file(&bar).await?);
+        assert!(!index::has_file_async(&fixture.db, &bar).await?);
 
         Ok(())
     }
@@ -1424,7 +1398,7 @@ mod tests {
     #[tokio::test]
     async fn initial_scan_removes_files_turned_into_symlinks() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let index = &fixture.index;
+        let db = &fixture.db;
 
         let foo_child = fixture.root.child("foo");
         let foo = realize_types::Path::parse("foo")?;
@@ -1433,22 +1407,22 @@ mod tests {
 
         foo_child.write_str("foo")?;
         bar_child.write_str("bar")?;
-        index
-            .add_file(
-                &foo,
-                3,
-                UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
-                hash::digest("foo".as_bytes()),
-            )
-            .await?;
-        index
-            .add_file(
-                &bar,
-                3,
-                UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
-                hash::digest("bar".as_bytes()),
-            )
-            .await?;
+        index::add_file_async(
+            db,
+            &foo,
+            3,
+            UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
+            hash::digest("foo".as_bytes()),
+        )
+        .await?;
+        index::add_file_async(
+            db,
+            &bar,
+            3,
+            UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
+            hash::digest("bar".as_bytes()),
+        )
+        .await?;
 
         fs::remove_file(bar_child.path()).await?;
         fs::symlink(foo_child.path(), bar_child.path()).await?;
@@ -1456,8 +1430,8 @@ mod tests {
         let _watcher = fixture.scan_and_watch().await?;
 
         fixture.wait_for_history_event(3).await?;
-        assert!(index.has_file(&foo).await?);
-        assert!(!index.has_file(&bar).await?);
+        assert!(index::has_file_async(db, &foo).await?);
+        assert!(!index::has_file_async(db, &bar).await?);
 
         Ok(())
     }
@@ -1465,20 +1439,20 @@ mod tests {
     #[tokio::test]
     async fn initial_scan_removes_files_in_dirs_turned_into_symlinks() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let index = &fixture.index;
+        let db = &fixture.db;
 
         let foo_child = fixture.root.child("a/foo");
         let foo = realize_types::Path::parse("a/foo")?;
 
         foo_child.write_str("foo")?;
-        index
-            .add_file(
-                &foo,
-                3,
-                UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
-                hash::digest("foo".as_bytes()),
-            )
-            .await?;
+        index::add_file_async(
+            db,
+            &foo,
+            3,
+            UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
+            hash::digest("foo".as_bytes()),
+        )
+        .await?;
 
         let dir = fixture.root.child("a");
         let newdir = fixture.root.child("b");
@@ -1492,8 +1466,8 @@ mod tests {
         assert_eq!(
             (true, false),
             (
-                index.has_file(&foo_in_b).await?,
-                index.has_file(&foo).await?,
+                index::has_file_async(db, &foo_in_b).await?,
+                index::has_file_async(db, &foo).await?,
             )
         );
 
@@ -1504,7 +1478,7 @@ mod tests {
     async fn create_hard_link() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let _watcher = fixture.watch().await?;
-        let index = &fixture.index;
+        let db = &fixture.db;
         let foo_child = fixture.root.child("foo");
         foo_child.write_str("test")?;
         let mtime = UnixTime::mtime(&fs::metadata(foo_child.path()).await?);
@@ -1522,7 +1496,7 @@ mod tests {
                 hash: hash::digest("test".as_bytes()),
                 outdated_by: None,
             }),
-            index.get_file(&realize_types::Path::parse("bar")?).await?
+            index::get_file_async(db, &realize_types::Path::parse("bar")?).await?
         );
 
         Ok(())
@@ -1542,22 +1516,12 @@ mod tests {
 
         fixture.wait_for_history_event(1).await?;
 
-        let index = &fixture.index;
+        let db = &fixture.db;
+        assert!(!index::has_file_async(db, &realize_types::Path::parse("excluded")?).await?);
         assert!(
-            !index
-                .has_file(&realize_types::Path::parse("excluded")?)
-                .await?
+            !index::has_file_async(db, &realize_types::Path::parse("a/b/also_excluded")?).await?
         );
-        assert!(
-            !index
-                .has_file(&realize_types::Path::parse("a/b/also_excluded")?)
-                .await?
-        );
-        assert!(
-            index
-                .has_file(&realize_types::Path::parse("a/not_excluded")?)
-                .await?
-        );
+        assert!(index::has_file_async(db, &realize_types::Path::parse("a/not_excluded")?).await?);
 
         Ok(())
     }
@@ -1567,7 +1531,7 @@ mod tests {
         let mut fixture = Fixture::setup().await?;
         fixture.exclude(realize_types::Path::parse("a/b")?);
         fixture.exclude(realize_types::Path::parse("excluded")?);
-        let index = &fixture.index;
+        let db = &fixture.db;
 
         fixture.root.child("excluded").write_str("test")?;
         fixture.root.child("a/b/excluded_too").write_str("test")?;
@@ -1577,7 +1541,7 @@ mod tests {
 
         fixture.wait_for_history_event(1).await?;
         let not_excluded = realize_types::Path::parse("not_excluded")?;
-        assert!(index.has_file(&not_excluded).await?);
+        assert!(index::has_file_async(db, &not_excluded).await?);
 
         Ok(())
     }
@@ -1587,7 +1551,7 @@ mod tests {
         let mut fixture = Fixture::setup().await?;
         fixture.exclude(realize_types::Path::parse("a/b")?);
         fixture.exclude(realize_types::Path::parse("excluded")?);
-        let index = &fixture.index;
+        let db = &fixture.db;
 
         let excluded_child = fixture.root.child("excluded");
         excluded_child.write_str("test")?;
@@ -1596,28 +1560,28 @@ mod tests {
 
         let excluded = realize_types::Path::parse("excluded")?;
         let excluded_too = realize_types::Path::parse("a/b/excluded_too")?;
-        index
-            .add_file(
-                &excluded,
-                4,
-                UnixTime::mtime(&fs::metadata(excluded_child.path()).await?),
-                hash::digest("test".as_bytes()),
-            )
-            .await?;
-        index
-            .add_file(
-                &excluded_too,
-                4,
-                UnixTime::mtime(&fs::metadata(excluded_too_child.path()).await?),
-                hash::digest("test".as_bytes()),
-            )
-            .await?;
+        index::add_file_async(
+            db,
+            &excluded,
+            4,
+            UnixTime::mtime(&fs::metadata(excluded_child.path()).await?),
+            hash::digest("test".as_bytes()),
+        )
+        .await?;
+        index::add_file_async(
+            db,
+            &excluded_too,
+            4,
+            UnixTime::mtime(&fs::metadata(excluded_too_child.path()).await?),
+            hash::digest("test".as_bytes()),
+        )
+        .await?;
 
         let _watcher = fixture.scan_and_watch().await?;
 
         fixture.wait_for_history_event(4).await?;
-        assert!(!index.has_file(&excluded).await?);
-        assert!(!index.has_file(&excluded_too).await?);
+        assert!(!index::has_file_async(db, &excluded).await?);
+        assert!(!index::has_file_async(db, &excluded_too).await?);
 
         Ok(())
     }
@@ -1636,22 +1600,12 @@ mod tests {
 
         fixture.wait_for_history_event(1).await?;
 
-        let index = &fixture.index;
+        let db = &fixture.db;
+        assert!(!index::has_file_async(db, &realize_types::Path::parse("excluded")?).await?);
         assert!(
-            !index
-                .has_file(&realize_types::Path::parse("excluded")?)
-                .await?
+            !index::has_file_async(db, &realize_types::Path::parse("a/b/also_excluded")?).await?
         );
-        assert!(
-            !index
-                .has_file(&realize_types::Path::parse("a/b/also_excluded")?)
-                .await?
-        );
-        assert!(
-            index
-                .has_file(&realize_types::Path::parse("a/not_excluded")?)
-                .await?
-        );
+        assert!(index::has_file_async(db, &realize_types::Path::parse("a/not_excluded")?).await?);
 
         Ok(())
     }

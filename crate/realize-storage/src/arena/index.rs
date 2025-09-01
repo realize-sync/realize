@@ -8,202 +8,13 @@ use super::types::{FileTableEntry, HistoryTableEntry};
 use crate::utils::fs_utils;
 use crate::utils::holder::Holder;
 use crate::{Inode, StorageError};
-use realize_types::{self, Arena, Hash, Path, UnixTime};
+use realize_types::{self, Hash, Path, UnixTime};
 use redb::{ReadableTable, Table};
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::sync::watch;
 use tokio::task;
 use tokio_stream::wrappers::ReceiverStream;
-use uuid::Uuid;
-
-#[derive(Clone)]
-pub struct RealIndexAsync {
-    db: Arc<ArenaDatabase>,
-}
-
-impl RealIndexAsync {
-    pub fn new(db: Arc<ArenaDatabase>) -> Self {
-        Self { db }
-    }
-
-    /// Returns the database UUID.
-    ///
-    /// A UUID is set when a new database is created.
-    pub fn uuid(&self) -> &Uuid {
-        self.db.uuid()
-    }
-
-    /// The arena tied to this index.
-    pub fn arena(&self) -> Arena {
-        self.db.arena()
-    }
-
-    /// Subscribe to a watch channel reporting the highest history entry index.
-    ///
-    /// Entries can be later queried using [RealIndexAsync::history].
-    ///
-    /// The value itself is also available as [RealIndexAsync::last_history_index].
-    pub fn watch_history(&self) -> watch::Receiver<u64> {
-        self.db.history().watch()
-    }
-
-    /// Index of the last history entry that was written.
-    ///
-    /// This is the value tracked by [RealIndexAsync::watch_history].
-    pub async fn last_history_index(&self) -> Result<u64, StorageError> {
-        let db = Arc::clone(&self.db);
-
-        task::spawn_blocking(move || last_history_index(&db)).await?
-    }
-
-    /// Return a reference to the underlying blocking instance.
-    pub fn blocking(&self) -> Arc<ArenaDatabase> {
-        Arc::clone(&self.db)
-    }
-
-    /// Return all valid file entries as a stream.
-    pub fn all_files(&self) -> ReceiverStream<(realize_types::Path, IndexedFile)> {
-        let (tx, rx) = mpsc::channel(100);
-
-        let db = Arc::clone(&self.db);
-        task::spawn_blocking(move || all_files(&db, tx));
-
-        ReceiverStream::new(rx)
-    }
-
-    /// Grab a range of history entries.
-    pub fn history(
-        &self,
-        range: impl RangeBounds<u64> + Send + 'static,
-    ) -> ReceiverStream<Result<(u64, HistoryTableEntry), StorageError>> {
-        let (tx, rx) = mpsc::channel(100);
-
-        let db = Arc::clone(&self.db);
-        let range = Box::new(range);
-        task::spawn_blocking(move || {
-            let txn = match db.begin_read() {
-                Ok(v) => v,
-                Err(err) => {
-                    // Send any global error to the channel, so it ends up
-                    // in the stream instead of getting lost.
-                    let _ = tx.blocking_send(Err(err.into()));
-                    return;
-                }
-            };
-            let history = match txn.read_history() {
-                Ok(v) => v,
-                Err(err) => {
-                    let _ = tx.blocking_send(Err(err));
-                    return;
-                }
-            };
-            for res in history.history(*range) {
-                if tx.blocking_send(res).is_err() {
-                    return;
-                }
-            }
-        });
-
-        ReceiverStream::new(rx)
-    }
-
-    /// Get a file entry
-    pub async fn get_file(
-        &self,
-        path: &realize_types::Path,
-    ) -> Result<Option<IndexedFile>, StorageError> {
-        let db = Arc::clone(&self.db);
-        let path = path.clone();
-
-        task::spawn_blocking(move || get_file(&db, &path)).await?
-    }
-
-    /// Check whether a given file is in the index already.
-    pub async fn has_file<T>(&self, path: T) -> Result<bool, StorageError>
-    where
-        T: AsRef<realize_types::Path>,
-    {
-        let path = path.as_ref();
-        let db = Arc::clone(&self.db);
-        let path = path.clone();
-
-        task::spawn_blocking(move || has_file(&db, &path)).await?
-    }
-
-    /// Check whether a given file is in the index already with the given size and mtime.
-    pub async fn has_matching_file(
-        &self,
-        path: &realize_types::Path,
-        size: u64,
-        mtime: UnixTime,
-    ) -> Result<bool, StorageError> {
-        let db = Arc::clone(&self.db);
-        let path = path.clone();
-        let mtime = mtime.clone();
-
-        task::spawn_blocking(move || has_matching_file(&db, &path, size, mtime)).await?
-    }
-
-    /// Remove a path that can be a file or a directory.
-    ///
-    /// If the path is a directory, all files within that directory
-    /// are removed, recursively.
-    pub async fn remove_file_or_dir<T>(&self, path: T) -> Result<(), StorageError>
-    where
-        T: AsRef<realize_types::Path>,
-    {
-        let path = path.as_ref();
-        let db = Arc::clone(&self.db);
-        let path = path.clone();
-
-        task::spawn_blocking(move || remove_file_or_dir(&db, &path)).await?
-    }
-
-    pub async fn add_file(
-        &self,
-        path: &realize_types::Path,
-        size: u64,
-        mtime: UnixTime,
-        hash: Hash,
-    ) -> Result<(), StorageError> {
-        let db = Arc::clone(&self.db);
-        let path = path.clone();
-        let mtime = mtime.clone();
-
-        task::spawn_blocking(move || add_file(&db, &path, size, mtime, hash)).await?
-    }
-
-    pub async fn add_file_if_matches(
-        &self,
-        root: &std::path::Path,
-        path: &realize_types::Path,
-        size: u64,
-        mtime: UnixTime,
-        hash: Hash,
-    ) -> Result<bool, StorageError> {
-        let db = Arc::clone(&self.db);
-        let path = path.clone();
-        let mtime = mtime.clone();
-        let root = root.to_path_buf();
-
-        task::spawn_blocking(move || add_file_if_matches(&db, &root, &path, size, mtime, hash))
-            .await?
-    }
-
-    pub async fn remove_file_if_missing(
-        &self,
-        root: &std::path::Path,
-        path: &realize_types::Path,
-    ) -> Result<bool, StorageError> {
-        let db = Arc::clone(&self.db);
-        let root = root.to_path_buf();
-        let path = path.clone();
-
-        task::spawn_blocking(move || remove_file_if_missing(&db, &root, &path)).await?
-    }
-}
 
 /// Return the path for the given file if its current version matches `hash`.
 ///
@@ -632,6 +443,17 @@ pub(crate) fn get_file(
     index.get(&tree, path)
 }
 
+/// Get a file entry
+pub async fn get_file_async(
+    db: &Arc<ArenaDatabase>,
+    path: &realize_types::Path,
+) -> Result<Option<IndexedFile>, StorageError> {
+    let db = Arc::clone(db);
+    let path = path.clone();
+
+    task::spawn_blocking(move || get_file(&db, &path)).await?
+}
+
 /// Check whether a given file is in the index already.
 pub(crate) fn has_file(
     db: &Arc<ArenaDatabase>,
@@ -642,6 +464,18 @@ pub(crate) fn has_file(
     let tree = txn.read_tree()?;
 
     index.has(&tree, path)
+}
+
+/// Check whether a given file is in the index already.
+pub async fn has_file_async<T>(db: &Arc<ArenaDatabase>, path: T) -> Result<bool, StorageError>
+where
+    T: AsRef<realize_types::Path>,
+{
+    let path = path.as_ref();
+    let db = Arc::clone(db);
+    let path = path.clone();
+
+    task::spawn_blocking(move || has_file(&db, &path)).await?
 }
 
 /// Check whether a given file is in the index with the given size and mtime.
@@ -657,6 +491,20 @@ pub(crate) fn has_matching_file(
     let ret = index.get(&tree, path)?.map(|e| e.matches(size, mtime));
 
     Ok(ret.unwrap_or(false))
+}
+
+/// Check whether a given file is in the index already with the given size and mtime.
+pub async fn has_matching_file_async(
+    db: &Arc<ArenaDatabase>,
+    path: &realize_types::Path,
+    size: u64,
+    mtime: UnixTime,
+) -> Result<bool, StorageError> {
+    let db = Arc::clone(db);
+    let path = path.clone();
+    let mtime = mtime.clone();
+
+    task::spawn_blocking(move || has_matching_file(&db, &path, size, mtime)).await?
 }
 
 /// Add a file entry with the given values. Replace one if it exists.
@@ -680,6 +528,20 @@ pub(crate) fn add_file(
     txn.commit()?;
 
     Ok(())
+}
+
+pub async fn add_file_async(
+    db: &Arc<ArenaDatabase>,
+    path: &realize_types::Path,
+    size: u64,
+    mtime: UnixTime,
+    hash: Hash,
+) -> Result<(), StorageError> {
+    let db = Arc::clone(db);
+    let path = path.clone();
+    let mtime = mtime.clone();
+
+    task::spawn_blocking(move || add_file(&db, &path, size, mtime, hash)).await?
 }
 
 /// Add a file entry if it matches the file on disk.
@@ -711,6 +573,22 @@ pub(crate) fn add_file_if_matches(
     Ok(false)
 }
 
+pub async fn add_file_if_matches_async(
+    db: &Arc<ArenaDatabase>,
+    root: &std::path::Path,
+    path: &realize_types::Path,
+    size: u64,
+    mtime: UnixTime,
+    hash: Hash,
+) -> Result<bool, StorageError> {
+    let db = Arc::clone(db);
+    let path = path.clone();
+    let mtime = mtime.clone();
+    let root = root.to_path_buf();
+
+    task::spawn_blocking(move || add_file_if_matches(&db, &root, &path, size, mtime, hash)).await?
+}
+
 /// Remove a file entry if the file is missing from disk.
 pub(crate) fn remove_file_if_missing(
     db: &Arc<ArenaDatabase>,
@@ -733,8 +611,20 @@ pub(crate) fn remove_file_if_missing(
     Ok(false)
 }
 
+pub async fn remove_file_if_missing_async(
+    db: &Arc<ArenaDatabase>,
+    root: &std::path::Path,
+    path: &realize_types::Path,
+) -> Result<bool, StorageError> {
+    let db = Arc::clone(db);
+    let root = root.to_path_buf();
+    let path = path.clone();
+
+    task::spawn_blocking(move || remove_file_if_missing(&db, &root, &path)).await?
+}
+
 /// Send all valid entries of the file table to the given channel.
-pub(crate) fn all_files(
+fn all_files(
     db: &Arc<ArenaDatabase>,
     tx: mpsc::Sender<(realize_types::Path, IndexedFile)>,
 ) -> Result<(), StorageError> {
@@ -743,6 +633,18 @@ pub(crate) fn all_files(
     index.all(tx)?;
 
     Ok(())
+}
+
+/// Return all valid file entries as a stream.
+pub fn all_files_stream(
+    db: &Arc<ArenaDatabase>,
+) -> ReceiverStream<(realize_types::Path, IndexedFile)> {
+    let (tx, rx) = mpsc::channel(100);
+
+    let db = Arc::clone(db);
+    task::spawn_blocking(move || all_files(&db, tx));
+
+    ReceiverStream::new(rx)
 }
 
 /// Remove a path that can be a file or a directory.
@@ -764,6 +666,67 @@ pub(crate) fn remove_file_or_dir(
     txn.commit()?;
 
     Ok(())
+}
+
+/// Grab a range of history entries.
+pub fn history_stream(
+    db: &Arc<ArenaDatabase>,
+    range: impl RangeBounds<u64> + Send + 'static,
+) -> ReceiverStream<Result<(u64, HistoryTableEntry), StorageError>> {
+    let (tx, rx) = mpsc::channel(100);
+
+    let db = Arc::clone(db);
+    let range = Box::new(range);
+    task::spawn_blocking(move || {
+        let txn = match db.begin_read() {
+            Ok(v) => v,
+            Err(err) => {
+                // Send any global error to the channel, so it ends up
+                // in the stream instead of getting lost.
+                let _ = tx.blocking_send(Err(err.into()));
+                return;
+            }
+        };
+        let history = match txn.read_history() {
+            Ok(v) => v,
+            Err(err) => {
+                let _ = tx.blocking_send(Err(err));
+                return;
+            }
+        };
+        for res in history.history(*range) {
+            if tx.blocking_send(res).is_err() {
+                return;
+            }
+        }
+    });
+
+    ReceiverStream::new(rx)
+}
+
+/// Remove a path that can be a file or a directory.
+///
+/// If the path is a directory, all files within that directory
+/// are removed, recursively.
+pub async fn remove_file_or_dir_async<T>(
+    db: &Arc<ArenaDatabase>,
+    path: T,
+) -> Result<(), StorageError>
+where
+    T: AsRef<realize_types::Path>,
+{
+    let path = path.as_ref();
+    let db = Arc::clone(db);
+    let path = path.clone();
+
+    task::spawn_blocking(move || remove_file_or_dir(&db, &path)).await?
+}
+
+/// Index of the last history entry that was written.
+pub async fn last_history_index_async(db: &Arc<ArenaDatabase>) -> Result<u64, StorageError> {
+    let db = Arc::clone(db);
+
+    task::spawn_blocking(move || last_history_index(&db)).await?
 }
 
 #[cfg(test)]

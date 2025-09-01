@@ -1,18 +1,17 @@
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
-
+use super::db::ArenaDatabase;
+use super::index;
 use crate::StorageError;
 use crate::utils::hash::{self};
 use futures::TryStreamExt as _;
 use realize_types::{self, Arena, Hash, Path, UnixTime};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::AsyncRead;
 use tokio::sync::{Semaphore, broadcast, mpsc};
 use tokio_util::io::ReaderStream;
 use tokio_util::task::JoinMap;
-
-use super::index::RealIndexAsync;
 
 #[derive(Debug)]
 enum Verdict {
@@ -41,11 +40,11 @@ pub(crate) struct Hasher {
 impl Hasher {
     pub(crate) fn spawn(
         root: PathBuf,
-        index: RealIndexAsync,
+        db: Arc<ArenaDatabase>,
         shutdown_rx: broadcast::Receiver<()>,
         options: &HasherOptions,
     ) -> Self {
-        log::debug!("[{}] Setup with {options:?}", index.arena());
+        log::debug!("[{}] Setup with {options:?}", db.arena());
 
         let (tx, rx) = mpsc::channel(16);
         let sem = if options.max_parallelism > 0 {
@@ -54,10 +53,10 @@ impl Hasher {
             None
         };
 
-        let arena = index.arena();
+        let arena = db.arena();
         tokio::spawn(hasher_loop(
             root,
-            index,
+            db,
             rx,
             shutdown_rx,
             sem,
@@ -98,7 +97,7 @@ impl Hasher {
 
 async fn hasher_loop(
     root: PathBuf,
-    index: RealIndexAsync,
+    db: Arc<ArenaDatabase>,
     mut rx: mpsc::Receiver<Request>,
     mut shutdown_rx: broadcast::Receiver<()>,
     sem: Option<Arc<Semaphore>>,
@@ -106,7 +105,7 @@ async fn hasher_loop(
 ) {
     let root = root;
     let mut map: JoinMap<Path, Result<Verdict, std::io::Error>> = JoinMap::new();
-    let arena = index.arena();
+    let arena = db.arena();
 
     loop {
         tokio::select!(
@@ -133,7 +132,7 @@ async fn hasher_loop(
             Some((path, verdict)) = map.join_next() => {
                 match verdict {
                    Ok(Ok(verdict)) => {
-                       if let Err(err) = apply_verdict(arena, &root, &index, &path, verdict).await {
+                       if let Err(err) = apply_verdict(arena, &root, &db, &path, verdict).await {
                            log::warn!("[{arena}] Error updating index for \"{path}\": {err}")
                        }
                    }
@@ -150,17 +149,17 @@ async fn hasher_loop(
 async fn apply_verdict(
     arena: Arena,
     root: &std::path::Path,
-    index: &RealIndexAsync,
+    db: &Arc<ArenaDatabase>,
     path: &Path,
     verdict: Verdict,
 ) -> Result<(), StorageError> {
     match verdict {
         Verdict::Remove => {
             log::info!("[{arena}] Remove: \"{path}\"");
-            if !index.remove_file_if_missing(root, path).await? {
+            if !index::remove_file_if_missing_async(db, root, path).await? {
                 log::debug!(
                     "[{arena}] Mismatch; Skipped removing \"{path}\"",
-                    arena = index.arena()
+                    arena = db.arena()
                 );
             }
 
@@ -168,13 +167,10 @@ async fn apply_verdict(
         }
         Verdict::FileContent(hash, mtime, size) => {
             log::info!("[{arena}] Hashed: \"{path}\" {hash} size={size}");
-            if !index
-                .add_file_if_matches(root, path, size, mtime, hash)
-                .await?
-            {
+            if !index::add_file_if_matches_async(db, root, path, size, mtime, hash).await? {
                 log::debug!(
                     "[{arena}] Mismatch; Skipped adding \"{path}\"",
-                    arena = index.arena()
+                    arena = db.arena()
                 );
             }
 
@@ -240,7 +236,7 @@ mod tests {
     use super::*;
 
     struct Fixture {
-        index: RealIndexAsync,
+        db: Arc<ArenaDatabase>,
         tempdir: TempDir,
         shutdown_tx: broadcast::Sender<()>,
         options: HasherOptions,
@@ -252,13 +248,12 @@ mod tests {
             let tempdir = TempDir::new()?;
             let arena = Arena::from("myarena");
             let db = ArenaDatabase::for_testing_single_arena(arena, &tempdir.path().join("blobs"))?;
-            let index = RealIndexAsync::new(db);
 
             let (shutdown_tx, _) = broadcast::channel(1);
             let options = HasherOptions::default();
 
             Ok(Self {
-                index,
+                db,
                 tempdir,
                 shutdown_tx,
                 options,
@@ -268,7 +263,7 @@ mod tests {
         fn hasher(&self) -> Hasher {
             Hasher::spawn(
                 self.tempdir.to_path_buf(),
-                self.index.clone(),
+                Arc::clone(&self.db),
                 self.shutdown_tx.subscribe(),
                 &self.options,
             )
@@ -284,11 +279,13 @@ mod tests {
         foo.write_str("some content")?;
         let mtime = UnixTime::mtime(&foo.path().metadata()?);
 
-        let mut history_rx = fixture.index.watch_history();
+        let mut history_rx = fixture.db.history().watch();
         hasher.hash_content(&Path::parse("foo")?, mtime, 12).await?;
         tokio::time::timeout(Duration::from_secs(3), history_rx.changed()).await??;
 
-        let entry = fixture.index.get_file(&Path::parse("foo")?).await?.unwrap();
+        let entry = index::get_file_async(&fixture.db, &Path::parse("foo")?)
+            .await?
+            .unwrap();
         assert_eq!(hash::digest("some content"), entry.hash);
         assert_eq!(12, entry.size);
         assert_eq!(mtime, entry.mtime);
@@ -304,11 +301,13 @@ mod tests {
         let foo = fixture.tempdir.child("foo");
         foo.write_str("")?;
         let mtime = UnixTime::mtime(&foo.path().metadata()?);
-        let mut history_rx = fixture.index.watch_history();
+        let mut history_rx = fixture.db.history().watch();
         hasher.hash_content(&Path::parse("foo")?, mtime, 0).await?;
         tokio::time::timeout(Duration::from_secs(3), history_rx.changed()).await??;
 
-        let entry = fixture.index.get_file(&Path::parse("foo")?).await?.unwrap();
+        let entry = index::get_file_async(&fixture.db, &Path::parse("foo")?)
+            .await?
+            .unwrap();
         assert_eq!(hash::empty(), entry.hash);
         assert_eq!(0, entry.size);
         assert_eq!(mtime, entry.mtime);
@@ -340,12 +339,14 @@ mod tests {
             .hash_content(&path, UnixTime::mtime(&foo.path().metadata()?), 5)
             .await?;
 
-        let mut history_rx = fixture.index.watch_history();
+        let mut history_rx = fixture.db.history().watch();
         history_rx.changed().await?; // timeout not available when paused
         let history_index = *history_rx.borrow_and_update();
 
         // The version that is finally hashed must be the last one.
-        let entry = fixture.index.get_file(&Path::parse("foo")?).await?.unwrap();
+        let entry = index::get_file_async(&fixture.db, &Path::parse("foo")?)
+            .await?
+            .unwrap();
         assert_eq!(hash::digest("three"), entry.hash);
 
         // and this is the first entry that was written (intermediate values were not hashed).g
@@ -359,21 +360,20 @@ mod tests {
         let fixture = Fixture::setup().await?;
         let hasher = fixture.hasher();
 
-        fixture
-            .index
-            .add_file(
-                &Path::parse("foo")?,
-                3,
-                UnixTime::from_secs(1234567890),
-                hash::digest("foo"),
-            )
-            .await?;
+        index::add_file_async(
+            &fixture.db,
+            &Path::parse("foo")?,
+            3,
+            UnixTime::from_secs(1234567890),
+            hash::digest("foo"),
+        )
+        .await?;
 
-        let mut history_rx = fixture.index.watch_history();
+        let mut history_rx = fixture.db.history().watch();
         hasher.remove_content(&Path::parse("foo")?).await?;
         tokio::time::timeout(Duration::from_secs(3), history_rx.changed()).await??;
 
-        assert!(!fixture.index.has_file(&Path::parse("foo")?).await?);
+        assert!(!index::has_file_async(&fixture.db, &Path::parse("foo")?).await?);
 
         Ok(())
     }
@@ -386,17 +386,16 @@ mod tests {
         let hasher = fixture.hasher();
         let foo = fixture.tempdir.child("foo");
         let path = Path::parse("foo")?;
-        fixture
-            .index
-            .add_file(
-                &path,
-                3,
-                UnixTime::from_secs(1234567890),
-                hash::digest("foo"),
-            )
-            .await?;
+        index::add_file_async(
+            &fixture.db,
+            &path,
+            3,
+            UnixTime::from_secs(1234567890),
+            hash::digest("foo"),
+        )
+        .await?;
 
-        let mut history_rx = fixture.index.watch_history();
+        let mut history_rx = fixture.db.history().watch();
         hasher.remove_content(&Path::parse("foo")?).await?;
 
         foo.write_str("new!")?;
@@ -408,7 +407,9 @@ mod tests {
         history_rx.changed().await?; // cannot use timeout when time paused
         let history_index = *history_rx.borrow_and_update();
 
-        let entry = fixture.index.get_file(&Path::parse("foo")?).await?.unwrap();
+        let entry = index::get_file_async(&fixture.db, &Path::parse("foo")?)
+            .await?
+            .unwrap();
         assert_eq!(hash::digest("new!"), entry.hash);
 
         // one entry for add, one for replace; the removal was skipped

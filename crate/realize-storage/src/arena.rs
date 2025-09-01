@@ -5,7 +5,6 @@ use anyhow::Context;
 use arena_cache::ArenaCache;
 use db::ArenaDatabase;
 use engine::Engine;
-use index::RealIndexAsync;
 use realize_types::Arena;
 use std::time::Duration;
 use std::{path::PathBuf, sync::Arc};
@@ -43,7 +42,7 @@ pub(crate) struct ArenaStorage {
 /// Indexed (FS-based) local storage.
 pub(crate) struct IndexedArenaStorage {
     pub(crate) root: PathBuf,
-    pub(crate) index: RealIndexAsync,
+    pub(crate) db: Arc<ArenaDatabase>,
     _watcher: RealWatcher,
 }
 
@@ -74,7 +73,6 @@ impl ArenaStorage {
             Some(datadir) => {
                 log::info!("[{arena}] Arena setup with datadir {datadir:?}");
 
-                let index = RealIndexAsync::new(Arc::clone(&db));
                 let exclude = exclude
                     .iter()
                     .filter_map(|p| realize_types::Path::from_real_path_in(p, datadir))
@@ -87,7 +85,7 @@ impl ArenaStorage {
                         .collect::<Vec<_>>()
                         .join(",")
                 );
-                let watcher = RealWatcher::builder(datadir, index.clone())
+                let watcher = RealWatcher::builder(datadir, Arc::clone(&db))
                     .with_initial_scan()
                     .exclude_all(exclude.iter())
                     .debounce(
@@ -120,7 +118,7 @@ impl ArenaStorage {
 
                 Some(IndexedArenaStorage {
                     root: datadir.to_path_buf(),
-                    index,
+                    db: Arc::clone(&db),
                     _watcher: watcher,
                 })
             }

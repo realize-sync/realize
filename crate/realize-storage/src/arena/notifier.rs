@@ -1,9 +1,11 @@
 #![allow(dead_code)] // work in progress
 
-use super::index::{IndexedFile, RealIndexAsync};
+use super::db::ArenaDatabase;
+use super::index::{self, IndexedFile};
 use super::types::HistoryTableEntry;
 use futures::StreamExt as _;
 use realize_types::{Arena, Hash, Path, UnixTime};
+use std::sync::Arc;
 use tokio::{sync::mpsc, task::JoinHandle};
 use uuid::Uuid;
 
@@ -198,19 +200,19 @@ impl Progress {
     }
 }
 
-/// Subscribe to notifications from the given index.
+/// Subscribe to notifications from the given database.
 ///
 /// This call spawns a background that that sends notifications as
 /// long as the given channel is alive.
 ///
 /// This call creates a task that sends notifications in the background.
 pub async fn subscribe(
-    index: RealIndexAsync,
+    db: Arc<ArenaDatabase>,
     tx: mpsc::Sender<Notification>,
     progress: Option<Progress>,
 ) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
     let mut last_seen = if let Some(progress) = progress
-        && progress.uuid == *index.uuid()
+        && progress.uuid == *db.uuid()
     {
         progress.last_seen
     } else {
@@ -218,19 +220,19 @@ pub async fn subscribe(
     };
 
     tx.send(Notification::Connected {
-        arena: index.arena(),
-        uuid: *index.uuid(),
+        arena: db.arena(),
+        uuid: *db.uuid(),
     })
     .await?;
 
-    let mut watch_rx = index.watch_history();
+    let mut watch_rx = db.history().watch();
     let current = *watch_rx.borrow_and_update();
 
     Ok(tokio::spawn(async move {
         if last_seen == 0 && current > last_seen {
-            catchup(&index, current, &tx).await?;
+            catchup(&db, current, &tx).await?;
         } else {
-            send_notifications(&index, last_seen, current, &tx).await?;
+            send_notifications(&db, last_seen, current, &tx).await?;
         }
         last_seen = current;
         loop {
@@ -243,7 +245,7 @@ pub async fn subscribe(
                         break;
                     }
                     let current = *watch_rx.borrow_and_update();
-                    if let Err(err) =  send_notifications(&index, last_seen, current, &tx).await {
+                    if let Err(err) =  send_notifications(&db, last_seen, current, &tx).await {
                         if tx.is_closed() {
                             break;
                         }
@@ -263,13 +265,13 @@ pub async fn subscribe(
 /// subscriber is caught up to the current index state, so to
 /// everything up to that history index.
 async fn catchup(
-    index: &RealIndexAsync,
+    db: &Arc<ArenaDatabase>,
     catchup_index: u64,
     tx: &mpsc::Sender<Notification>,
 ) -> anyhow::Result<()> {
-    tx.send(Notification::CatchupStart(index.arena())).await?;
+    tx.send(Notification::CatchupStart(db.arena())).await?;
 
-    let mut all_files = index.all_files();
+    let mut all_files = index::all_files_stream(db);
     while let Some((
         path,
         IndexedFile {
@@ -278,7 +280,7 @@ async fn catchup(
     )) = all_files.next().await
     {
         tx.send(Notification::Catchup {
-            arena: index.arena(),
+            arena: db.arena(),
             path,
             size,
             mtime,
@@ -288,7 +290,7 @@ async fn catchup(
     }
 
     tx.send(Notification::CatchupComplete {
-        arena: index.arena(),
+        arena: db.arena(),
         index: catchup_index,
     })
     .await?;
@@ -304,23 +306,23 @@ async fn catchup(
 /// file version even for older changes, so notifications might not
 /// match history events.
 async fn send_notifications(
-    index: &RealIndexAsync,
+    db: &Arc<ArenaDatabase>,
     last_seen: u64,
     current: u64,
     tx: &mpsc::Sender<Notification>,
 ) -> anyhow::Result<()> {
-    let mut range = index.history(last_seen + 1..current + 1);
+    let mut range = index::history_stream(db, last_seen + 1..current + 1);
     while let Some(entry) = range.next().await {
         let (hist_index, hist_entry) = entry?;
         let notification = match hist_entry {
             HistoryTableEntry::Add(path) => {
                 if let Some(IndexedFile {
                     size, mtime, hash, ..
-                }) = index.get_file(&path).await?
+                }) = index::get_file_async(db, &path).await?
                 {
                     Some(Notification::Add {
                         index: hist_index,
-                        arena: index.arena(),
+                        arena: db.arena(),
                         path,
                         size,
                         mtime,
@@ -341,11 +343,11 @@ async fn send_notifications(
 
                 if let Some(IndexedFile {
                     size, mtime, hash, ..
-                }) = index.get_file(&path).await?
+                }) = index::get_file_async(db, &path).await?
                 {
                     Some(Notification::Replace {
                         index: hist_index,
-                        arena: index.arena(),
+                        arena: db.arena(),
                         path,
                         size,
                         mtime,
@@ -355,19 +357,19 @@ async fn send_notifications(
                 } else {
                     Some(Notification::Remove {
                         index: hist_index,
-                        arena: index.arena(),
+                        arena: db.arena(),
                         path,
                         old_hash,
                     })
                 }
             }
             HistoryTableEntry::Drop(path, old_hash) => {
-                if index.has_file(&path).await? {
+                if index::has_file_async(db, &path).await? {
                     None
                 } else {
                     Some(Notification::Drop {
                         index: hist_index,
-                        arena: index.arena(),
+                        arena: db.arena(),
                         path,
                         old_hash,
                     })
@@ -395,7 +397,7 @@ mod tests {
     }
 
     struct Fixture {
-        index: RealIndexAsync,
+        db: Arc<ArenaDatabase>,
         current_time: UnixTime,
     }
 
@@ -405,10 +407,8 @@ mod tests {
             let arena = test_arena();
             let db =
                 ArenaDatabase::for_testing_single_arena(arena, &std::path::Path::new("/dev/null"))?;
-            let index = RealIndexAsync::new(db);
-
             Ok(Self {
-                index,
+                db,
                 current_time: UnixTime::from_secs(1234567890),
             })
         }
@@ -423,7 +423,7 @@ mod tests {
 
         async fn subscribe(&self) -> anyhow::Result<mpsc::Receiver<Notification>> {
             let (tx, mut rx) = mpsc::channel(128);
-            subscribe(self.index.clone(), tx, None).await?;
+            subscribe(Arc::clone(&self.db), tx, None).await?;
             self.expect_connected(&mut rx).await?;
 
             Ok(rx)
@@ -435,9 +435,9 @@ mod tests {
         ) -> anyhow::Result<mpsc::Receiver<Notification>> {
             let (tx, mut rx) = mpsc::channel(128);
             subscribe(
-                self.index.clone(),
+                Arc::clone(&self.db),
                 tx,
-                Some(Progress::new(*self.index.uuid(), index)),
+                Some(Progress::new(*self.db.uuid(), index)),
             )
             .await?;
             self.expect_connected(&mut rx).await?;
@@ -452,7 +452,7 @@ mod tests {
             assert_eq!(
                 Notification::Connected {
                     arena: test_arena(),
-                    uuid: *self.index.uuid()
+                    uuid: *self.db.uuid()
                 },
                 next(rx, "connected").await?
             );
@@ -462,24 +462,24 @@ mod tests {
 
         async fn add(&self, path: &str, content: &str) -> anyhow::Result<Path> {
             let path = Path::parse(path)?;
-            let last = self.index.last_history_index().await?;
-            self.index
-                .add_file(
-                    &path,
-                    content.len() as u64,
-                    self.current_time,
-                    hash::digest(content),
-                )
-                .await?;
-            self.index.watch_history().wait_for(|v| *v > last).await?;
+            let last = index::last_history_index_async(&self.db).await?;
+            index::add_file_async(
+                &self.db,
+                &path,
+                content.len() as u64,
+                self.current_time,
+                hash::digest(content),
+            )
+            .await?;
+            self.db.history().watch().wait_for(|v| *v > last).await?;
 
             Ok(path)
         }
 
         async fn delete(&self, path: &str) -> anyhow::Result<()> {
-            let last = self.index.last_history_index().await?;
-            self.index.remove_file_or_dir(&Path::parse(path)?).await?;
-            self.index.watch_history().wait_for(|v| *v > last).await?;
+            let last = index::last_history_index_async(&self.db).await?;
+            index::remove_file_or_dir_async(&self.db, &Path::parse(path)?).await?;
+            self.db.history().watch().wait_for(|v| *v > last).await?;
 
             Ok(())
         }
@@ -489,7 +489,7 @@ mod tests {
             mut rx: mpsc::Receiver<Notification>,
         ) -> anyhow::Result<Vec<Notification>> {
             let mut all = vec![];
-            let last = self.index.last_history_index().await?;
+            let last = index::last_history_index_async(&self.db).await?;
             while let Some(notification) = rx.recv().await {
                 let index = notification.index();
                 all.push(notification);
