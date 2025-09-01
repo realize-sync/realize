@@ -63,11 +63,15 @@ struct Cli {
 
     /// Umask for the socket file and its containing directory.
     #[arg(long, default_value = "077", value_parser=parse_umask)]
-    socket_umask: u32,
+    socket_umask: u16,
+
+    /// Umask for the FUSE filesystem
+    #[arg(long, default_value = "0227", value_parser=parse_umask)]
+    fuse_umask: u16,
 }
 
-fn parse_umask(string: &str) -> Result<u32, std::num::ParseIntError> {
-    u32::from_str_radix(string, 8)
+fn parse_umask(string: &str) -> Result<u16, std::num::ParseIntError> {
+    u16::from_str_radix(string, 8)
 }
 
 #[tokio::main]
@@ -104,13 +108,13 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
             .await?;
     }
     let fuse = if let Some(path) = &cli.fuse {
-        Some(setup.export_fuse(path).await?)
+        Some(setup.export_fuse(path, cli.fuse_umask).await?)
     } else {
         None
     };
 
     setup
-        .bind_control_socket(&local, cli.socket.as_deref(), cli.socket_umask)
+        .bind_control_socket(&local, cli.socket.as_deref(), cli.socket_umask as u32)
         .await?;
 
     let mut signals = Signals::new([

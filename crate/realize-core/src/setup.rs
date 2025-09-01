@@ -75,10 +75,19 @@ impl SetupHelper {
     /// Mount a FUSE filesystem at the given mountpoint.
     ///
     /// The returned object must be kept to keep the filesytem mounted. Call join() on it to
-    pub async fn export_fuse(&self, mountpoint: &std::path::Path) -> anyhow::Result<FuseHandle> {
+    pub async fn export_fuse(
+        &self,
+        mountpoint: &std::path::Path,
+        umask: u16,
+    ) -> anyhow::Result<FuseHandle> {
         let cache = self.storage.cache();
         let downloader = Downloader::new(self.household.clone(), cache.clone());
-        let handle = fuse::export(Arc::clone(self.storage.cache()), downloader, mountpoint)?;
+        let handle = fuse::export(
+            Arc::clone(self.storage.cache()),
+            downloader,
+            mountpoint,
+            umask,
+        )?;
         log::info!("FUSE filesystem mounted on {mountpoint:?}");
 
         Ok(handle)
