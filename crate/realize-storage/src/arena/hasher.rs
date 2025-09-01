@@ -14,12 +14,6 @@ use tokio_util::io::ReaderStream;
 use tokio_util::task::JoinMap;
 
 #[derive(Debug)]
-enum Verdict {
-    FileContent(Hash, UnixTime, u64),
-    Remove,
-}
-
-#[derive(Debug)]
 enum Request {
     HashFileVersion(Path, UnixTime, u64),
     RemoveFileVersion(Path),
@@ -104,7 +98,7 @@ async fn hasher_loop(
     debounce: Duration,
 ) {
     let root = root;
-    let mut map: JoinMap<Path, Result<Verdict, std::io::Error>> = JoinMap::new();
+    let mut map: JoinMap<Path, Result<(), StorageError>> = JoinMap::new();
     let arena = db.arena();
 
     loop {
@@ -122,70 +116,31 @@ async fn hasher_loop(
                         // running for this path is cancelled by this
                         // call; we only want to hash the very latest
                         // version.
-                        map.spawn(path.clone(), add_version(path.within(&root), mtime, size, sem.clone(), debounce));
+                        map.spawn(path.clone(), add_version(db.clone(), path, root.clone(), mtime, size, sem.clone(), debounce));
                     }
                     Some(Request::RemoveFileVersion(path)) => {
-                        map.spawn(path.clone(), remove_version(debounce));
+                        map.spawn(path.clone(), remove_version(db.clone(), path, root.clone(), debounce));
                     }
                 }
             }
-            Some((path, verdict)) = map.join_next() => {
-                match verdict {
-                   Ok(Ok(verdict)) => {
-                       if let Err(err) = apply_verdict(arena, &root, &db, &path, verdict).await {
-                           log::warn!("[{arena}] Error updating index for \"{path}\": {err}")
-                       }
-                   }
-                    Ok(Err(err)) =>{
-                        log::debug!("[{arena}] Error for \"{path}\": {err}");
-                    }
-                    Err(_) => {}
+            Some((path, result)) = map.join_next() => {
+                if let Ok(Err(err)) = result {
+                    log::debug!("[{arena}] Error for \"{path}\": {err}");
                 }
             }
         );
     }
 }
 
-async fn apply_verdict(
-    arena: Arena,
-    root: &std::path::Path,
-    db: &Arc<ArenaDatabase>,
-    path: &Path,
-    verdict: Verdict,
-) -> Result<(), StorageError> {
-    match verdict {
-        Verdict::Remove => {
-            log::info!("[{arena}] Remove: \"{path}\"");
-            if !index::remove_file_if_missing_async(db, root, path).await? {
-                log::debug!(
-                    "[{arena}] Mismatch; Skipped removing \"{path}\"",
-                    arena = db.arena()
-                );
-            }
-
-            Ok(())
-        }
-        Verdict::FileContent(hash, mtime, size) => {
-            log::info!("[{arena}] Hashed: \"{path}\" {hash} size={size}");
-            if !index::add_file_if_matches_async(db, root, path, size, mtime, hash).await? {
-                log::debug!(
-                    "[{arena}] Mismatch; Skipped adding \"{path}\"",
-                    arena = db.arena()
-                );
-            }
-
-            Ok(())
-        }
-    }
-}
-
 async fn add_version(
-    realpath: PathBuf,
+    db: Arc<ArenaDatabase>,
+    path: Path,
+    root: PathBuf,
     mtime: UnixTime,
     size: u64,
     sem: Option<Arc<Semaphore>>,
     debounce: Duration,
-) -> Result<Verdict, std::io::Error> {
+) -> Result<(), StorageError> {
     if !debounce.is_zero() {
         tokio::time::sleep(debounce).await;
     }
@@ -197,20 +152,38 @@ async fn add_version(
             None
         };
 
-        hash_file(File::open(&realpath).await?).await?
+        hash_file(File::open(path.within(&root)).await?).await?
     } else {
         hash::empty()
     };
-
-    Ok(Verdict::FileContent(hash, mtime, size))
+    let arena = db.arena();
+    log::info!("[{arena}] Hashed: \"{path}\" {hash} size={size}");
+    if !index::add_file_if_matches_async(&db, &root, &path, size, mtime, hash).await? {
+        log::debug!("[{arena}] Mismatch; Skipped adding \"{path}\"",);
+    }
+    Ok(())
 }
 
-async fn remove_version(debounce: Duration) -> Result<Verdict, std::io::Error> {
+async fn remove_version(
+    db: Arc<ArenaDatabase>,
+    path: Path,
+    root: PathBuf,
+    debounce: Duration,
+) -> Result<(), StorageError> {
     if !debounce.is_zero() {
         tokio::time::sleep(debounce).await;
     }
 
-    Ok(Verdict::Remove)
+    let arena = db.arena();
+    log::info!("[{arena}] Remove: \"{path}\"");
+    if !index::remove_file_if_missing_async(&db, &root, &path).await? {
+        log::debug!(
+            "[{arena}] Mismatch; Skipped removing \"{path}\"",
+            arena = db.arena()
+        );
+    }
+
+    Ok(())
 }
 
 pub(crate) async fn hash_file<R: AsyncRead>(f: R) -> Result<Hash, std::io::Error> {
