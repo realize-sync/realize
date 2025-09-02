@@ -236,11 +236,11 @@ impl<'a> WritableOpenCache<'a> {
         let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
         if get_file_entry(&self.table, file_inode, Some(peer))?.is_none() {
             log::debug!("[{}]@{peer} Add \"{path}\" {hash} size={size}", self.arena);
-            self.write_file_entry(file_inode, peer, &entry)?;
+            self.write_file_entry(tree, file_inode, peer, &entry)?;
         }
         Ok(
             if get_file_entry(&self.table, file_inode, None)?.is_none() {
-                log::debug!("[{}] Add \"{path}\" {hash} size={size}", self.arena);
+                log::debug!("[{}]@local Add \"{path}\" {hash} size={size}", self.arena);
                 self.write_default_file_entry(tree, blobs, dirty, file_inode, &entry)?;
             },
         )
@@ -268,13 +268,13 @@ impl<'a> WritableOpenCache<'a> {
                 "[{}]@{peer} \"{path}\" {hash} size={size} replaces {old_hash}",
                 self.arena
             );
-            self.write_file_entry(file_inode, peer, &entry)?;
+            self.write_file_entry(tree, file_inode, peer, &entry)?;
         }
         if let Some(old_entry) = get_file_entry(&self.table, file_inode, None)?
             && old_entry.hash == *old_hash
         {
             log::debug!(
-                "[{}] \"{path}\" {hash} size={size} replaces {old_hash}",
+                "[{}]@local \"{path}\" {hash} size={size} replaces {old_hash}",
                 self.arena
             );
             self.write_default_file_entry(tree, blobs, dirty, file_inode, &entry)?;
@@ -345,7 +345,7 @@ impl<'a> WritableOpenCache<'a> {
         {
             self.unlink(tree, blobs, dirty, peer, &path, e.hash)?;
         }
-        self.write_file_entry(file_inode, peer, &entry)?;
+        self.write_file_entry(tree, file_inode, peer, &entry)?;
         Ok(
             if !get_file_entry(&self.table, file_inode, None)?.is_some() {
                 self.write_default_file_entry(tree, blobs, dirty, file_inode, &entry)?;
@@ -368,11 +368,14 @@ impl<'a> WritableOpenCache<'a> {
     /// Write a file entry for a specific peer.
     fn write_file_entry(
         &mut self,
+        tree: &mut WritableOpenTree,
         file_inode: Inode,
         peer: Peer,
         entry: &FileTableEntry,
     ) -> Result<(), StorageError> {
-        self.table.insert(
+        tree.insert_and_incref(
+            file_inode,
+            &mut self.table,
             CacheTableKey::PeerCopy(file_inode, peer),
             Holder::new(&CacheTableEntry::File(entry.clone()))?,
         )?;
@@ -418,96 +421,40 @@ impl<'a> WritableOpenCache<'a> {
         Ok(())
     }
 
-    /// Remove a file entry for a specific peer and update or remove
-    /// the corresponding default entry, as necessary.
-    fn rm_file_entry(
+    /// Remove a file entry for a specific peer. The default entry
+    /// must be updated separately, as needed.
+    fn rm_peer_file_entry(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        inode: Inode,
+        peer: Peer,
+    ) -> Result<(), StorageError> {
+        // Remove the entry
+        tree.remove_and_decref(inode, &mut self.table, CacheTableKey::PeerCopy(inode, peer))?;
+
+        Ok(())
+    }
+
+    /// Remove a default file entry, leaving peer entries untouched.
+    fn rm_default_file_entry(
         &mut self,
         tree: &mut WritableOpenTree,
         blobs: &mut WritableOpenBlob,
         dirty: &mut WritableOpenDirty,
         parent_inode: Inode,
         inode: Inode,
-        peer: Peer,
     ) -> Result<(), StorageError> {
-        // Remove the entry
-        if self
-            .table
-            .remove(CacheTableKey::PeerCopy(inode, peer))?
-            .is_none()
-        {
-            // nothing was changed
-            return Ok(());
-        }
+        self.before_default_file_entry_change(tree, blobs, dirty, inode)?;
+        tree.remove_and_decref(inode, &mut self.table, CacheTableKey::Default(inode))?;
 
-        // Update or remove the default entry, if it relied on the now
-        // removed peer entry.
-
-        let mut peer_entries = vec![];
-        let mut default_entry = None;
-        for elt in self.table.range(CacheTableKey::range(inode))? {
-            let (key, value) = elt?;
-            match key.value() {
-                CacheTableKey::PeerCopy(_, _) => {
-                    peer_entries.push(value.value().parse()?.expect_file()?);
-                }
-                CacheTableKey::Default(_) => {
-                    default_entry = Some(value.value().parse()?.expect_file()?);
-                }
-                _ => {}
-            }
-        }
-        let default_entry = match default_entry {
-            Some(e) => e,
-            None => {
-                // if there's no default entry, there's nothing to do
-                return Ok(());
-            }
+        // Update the parent modification time, as removing an
+        // entry modifies it.
+        let parent_dir_entry = DirtableEntry {
+            mtime: UnixTime::now(),
         };
-
-        if peer_entries
-            .iter()
-            .find(|e| e.hash == default_entry.hash)
-            .is_some()
-        {
-            // The default entry is still valid
-            return Ok(());
-        }
-
-        // Select a new hash. This selects the most recent one; since
-        // version history is lost there's very little else we can do.
-        let new_entry = peer_entries.into_iter().max_by_key(|e| e.mtime);
-        match new_entry {
-            Some(new_entry) => {
-                log::debug!(
-                    "[{}] Falling back on {} for inode {inode}",
-                    self.arena,
-                    new_entry.hash,
-                );
-
-                self.write_default_file_entry(tree, blobs, dirty, inode, &new_entry)?;
-            }
-            None => {
-                log::debug!(
-                    "[{}] Removing inode {inode} from cache (no versions left)",
-                    self.arena,
-                );
-
-                self.before_default_file_entry_change(tree, blobs, dirty, inode)?;
-                tree.remove_and_decref(inode, &mut self.table, CacheTableKey::Default(inode))?;
-
-                // Update the parent modification time, as removing an
-                // entry modifies it.
-                let parent_dir_entry = DirtableEntry {
-                    mtime: UnixTime::now(),
-                };
-                let parent_dir_holder =
-                    Holder::with_content(CacheTableEntry::Dir(parent_dir_entry))?;
-                self.table
-                    .insert(CacheTableKey::Default(parent_inode), parent_dir_holder)?;
-
-                return Ok(());
-            }
-        }
+        let parent_dir_holder = Holder::with_content(CacheTableEntry::Dir(parent_dir_entry))?;
+        self.table
+            .insert(CacheTableKey::Default(parent_inode), parent_dir_holder)?;
 
         Ok(())
     }
@@ -543,7 +490,16 @@ impl<'a> WritableOpenCache<'a> {
                         self.arena
                     );
 
-                    self.rm_file_entry(tree, blobs, dirty, parent_inode, inode, peer)?;
+                    self.rm_peer_file_entry(tree, inode, peer)?;
+                }
+                if let Some(e) = get_file_entry(&self.table, inode, None)?
+                    && e.hash == old_hash
+                {
+                    log::debug!(
+                        "[{}]@local Remove \"{path}\" inode {inode} {old_hash}",
+                        self.arena
+                    );
+                    self.rm_default_file_entry(tree, blobs, dirty, parent_inode, inode)?;
                 }
             }
         }
@@ -572,8 +528,13 @@ impl<'a> WritableOpenCache<'a> {
             inodes.push(inode);
         }
         for inode in inodes {
-            if let Some(parent_inode) = tree.parent(inode)? {
-                self.rm_file_entry(tree, blobs, dirty, parent_inode, inode, peer)?;
+            self.rm_peer_file_entry(tree, inode, peer)?;
+            if let Err(StorageError::NotFound) = self.file_availability(inode) {
+                if let Some(parent_inode) = tree.parent(inode)? {
+                    // If the file has become unavailable because of
+                    // this removal, remove the file itself as well.
+                    self.rm_default_file_entry(tree, blobs, dirty, parent_inode, inode)?;
+                }
             }
         }
         Ok(())
@@ -1616,6 +1577,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unlink_applied_to_tracked_version_immediately() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena).await?;
+        let acache = &fixture.acache;
+        let peer1 = Peer::from("peer1");
+        let peer2 = Peer::from("peer2");
+        let file_path = Path::parse("file.txt")?;
+
+        acache.update(
+            peer1,
+            Notification::Add {
+                arena: arena,
+                index: 0,
+                path: file_path.clone(),
+                mtime: test_time(),
+                size: 100,
+                hash: Hash([1u8; 32]),
+            },
+            None,
+        )?;
+        acache.update(
+            peer2,
+            Notification::Add {
+                arena: arena,
+                index: 0,
+                path: file_path.clone(),
+                mtime: test_time(),
+                size: 100,
+                hash: Hash([1u8; 32]),
+            },
+            None,
+        )?;
+
+        let inode = acache.expect(&file_path)?;
+        assert!(acache.file_metadata(inode).is_ok());
+
+        acache.update(
+            peer1,
+            Notification::Remove {
+                arena: arena,
+                index: 0,
+                path: file_path.clone(),
+                old_hash: Hash([1u8; 32]),
+            },
+            None,
+        )?;
+
+        // The default version has been removed by this notification,
+        // even though it's still available in peer2; this is
+        // considered outdated.
+        assert!(matches!(
+            acache.file_metadata(inode),
+            Err(StorageError::NotFound)
+        ));
+        assert!(matches!(
+            acache.lookup(fixture.db.tree().root(), "file.txt"),
+            Err(StorageError::NotFound)
+        ));
+
+        // Inode should still be resolvable, because some peers still have it.
+        assert_eq!(Some(inode), acache.resolve(&file_path)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn lookup_finds_entry() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(arena).await?;
@@ -2035,18 +2062,16 @@ mod tests {
             },
             None,
         )?;
-        // All entries from A are now lost! We've lost the single peer
-        // that has the selected version.
-
-        // From the two conflicting versions that remain, Hash=2 from
-        // C should be chosen, because it has the most recent mtime.
-        //
-        // (If we kept a history, we would probably go
-        // back to Hash=1, but we don't have that kind of information)
-        let acache = &fixture.acache;
-        let avail = acache.file_availability(inode)?;
-        assert_eq!(vec![c], avail.peers);
-        assert_eq!(Hash([2u8; 32]), avail.hash);
+        // We've lost the single peer that had the tracked version.
+        // This is handled as if A had reported that file as deleted.
+        assert!(matches!(
+            acache.file_availability(inode),
+            Err(StorageError::NotFound)
+        ));
+        assert!(matches!(
+            acache.file_metadata(inode),
+            Err(StorageError::NotFound)
+        ));
 
         Ok(())
     }
