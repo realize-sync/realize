@@ -221,7 +221,7 @@ impl<'a> WritableOpenCache<'a> {
     }
 
     /// Add a file entry for a peer.
-    pub(crate) fn add(
+    pub(crate) fn notify_added(
         &mut self,
         tree: &mut WritableOpenTree,
         blobs: &mut WritableOpenBlob,
@@ -247,7 +247,7 @@ impl<'a> WritableOpenCache<'a> {
     }
 
     /// Replace a file entry for a peer.
-    pub(crate) fn replace(
+    pub(crate) fn notify_replaced(
         &mut self,
         tree: &mut WritableOpenTree,
         blobs: &mut WritableOpenBlob,
@@ -279,35 +279,6 @@ impl<'a> WritableOpenCache<'a> {
             );
             self.write_default_file_entry(tree, blobs, dirty, file_inode, &entry)?;
         }
-        Ok(())
-    }
-
-    /// Remove a file entry for a peer.
-    pub(crate) fn remove(
-        &mut self,
-        tree: &mut WritableOpenTree,
-        blobs: &mut WritableOpenBlob,
-        dirty: &mut WritableOpenDirty,
-        peer: Peer,
-        path: &Path,
-        old_hash: &Hash,
-    ) -> Result<(), StorageError> {
-        self.unlink(tree, blobs, dirty, peer, &path, old_hash.clone())?;
-
-        Ok(())
-    }
-
-    /// Drop a file entry for a peer.
-    pub(crate) fn drop(
-        &mut self,
-        tree: &mut WritableOpenTree,
-        blobs: &mut WritableOpenBlob,
-        dirty: &mut WritableOpenDirty,
-        peer: Peer,
-        path: Path,
-        old_hash: Hash,
-    ) -> Result<(), StorageError> {
-        self.unlink(tree, blobs, dirty, peer, &path, old_hash)?;
         Ok(())
     }
 
@@ -343,7 +314,7 @@ impl<'a> WritableOpenCache<'a> {
         if let Some(e) = get_file_entry(&self.table, file_inode, None)?
             && e.hash != hash
         {
-            self.unlink(tree, blobs, dirty, peer, &path, e.hash)?;
+            self.notify_dropped_or_removed(tree, blobs, dirty, peer, &path, &e.hash, false)?;
         }
         self.write_file_entry(tree, file_inode, peer, &entry)?;
         Ok(
@@ -459,15 +430,16 @@ impl<'a> WritableOpenCache<'a> {
         Ok(())
     }
 
-    /// Unlink a file from a peer.
-    fn unlink<T>(
+    /// Unlink a remove or a drop from a peer.
+    fn notify_dropped_or_removed<T>(
         &mut self,
         tree: &mut WritableOpenTree,
         blobs: &mut WritableOpenBlob,
         dirty: &mut WritableOpenDirty,
         peer: Peer,
         path: T,
-        old_hash: Hash,
+        old_hash: &Hash,
+        dropped: bool,
     ) -> Result<(), StorageError>
     where
         T: AsRef<Path>,
@@ -483,7 +455,7 @@ impl<'a> WritableOpenCache<'a> {
         if let Some(parent_inode) = parent_inode {
             if let Some(inode) = tree.lookup(parent_inode, path.name())? {
                 if let Some(e) = get_file_entry(&self.table, inode, Some(peer))?
-                    && e.hash == old_hash
+                    && e.hash == *old_hash
                 {
                     log::debug!(
                         "[{}]@{peer} Remove \"{path}\" inode {inode} {old_hash}",
@@ -492,14 +464,16 @@ impl<'a> WritableOpenCache<'a> {
 
                     self.rm_peer_file_entry(tree, inode, peer)?;
                 }
-                if let Some(e) = get_file_entry(&self.table, inode, None)?
-                    && e.hash == old_hash
-                {
-                    log::debug!(
-                        "[{}]@local Remove \"{path}\" inode {inode} {old_hash}",
-                        self.arena
-                    );
-                    self.rm_default_file_entry(tree, blobs, dirty, parent_inode, inode)?;
+                if !dropped {
+                    if let Some(e) = get_file_entry(&self.table, inode, None)?
+                        && e.hash == *old_hash
+                    {
+                        log::debug!(
+                            "[{}]@local Remove \"{path}\" inode {inode} {old_hash}",
+                            self.arena
+                        );
+                        self.rm_default_file_entry(tree, blobs, dirty, parent_inode, inode)?;
+                    }
                 }
             }
         }
@@ -803,7 +777,7 @@ impl ArenaCache {
                     size,
                     hash,
                     ..
-                } => cache.add(
+                } => cache.notify_added(
                     &mut tree, &mut blobs, &mut dirty, peer, path, mtime, size, hash,
                 )?,
                 Notification::Replace {
@@ -814,7 +788,7 @@ impl ArenaCache {
                     old_hash,
                     ..
                 } => {
-                    cache.replace(
+                    cache.notify_replaced(
                         &mut tree, &mut blobs, &mut dirty, peer, &path, mtime, size, &hash,
                         &old_hash,
                     )?;
@@ -824,7 +798,9 @@ impl ArenaCache {
                 }
 
                 Notification::Remove { path, old_hash, .. } => {
-                    cache.remove(&mut tree, &mut blobs, &mut dirty, peer, &path, &old_hash)?;
+                    cache.notify_dropped_or_removed(
+                        &mut tree, &mut blobs, &mut dirty, peer, &path, &old_hash, false,
+                    )?;
 
                     if let Some(index_root) = index_root {
                         if let Some(indexed) = txn.read_index()?.get(&tree, &path)?
@@ -839,9 +815,9 @@ impl ArenaCache {
                         }
                     }
                 }
-                Notification::Drop { path, old_hash, .. } => {
-                    cache.drop(&mut tree, &mut blobs, &mut dirty, peer, path, old_hash)?
-                }
+                Notification::Drop { path, old_hash, .. } => cache.notify_dropped_or_removed(
+                    &mut tree, &mut blobs, &mut dirty, peer, path, &old_hash, true,
+                )?,
                 Notification::CatchupStart(_) => cache.catchup_start(peer)?,
                 Notification::Catchup {
                     path,
@@ -1495,7 +1471,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unlink_removes_file() -> anyhow::Result<()> {
+    async fn remove_removes_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let acache = &fixture.acache;
         let file_path = Path::parse("file.txt")?;
@@ -1514,7 +1490,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unlink_marks_dirty() -> anyhow::Result<()> {
+    async fn remove_marks_dirty() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena()).await?;
         let acache = &fixture.acache;
         let file_path = Path::parse("file.txt")?;
@@ -1532,7 +1508,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unlink_updates_dir_mtime() -> anyhow::Result<()> {
+    async fn remove_updates_dir_mtime() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(arena).await?;
         let file_path = Path::parse("file.txt")?;
@@ -1549,7 +1525,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unlink_ignores_wrong_old_hash() -> anyhow::Result<()> {
+    async fn remove_ignores_wrong_old_hash() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(arena).await?;
         let acache = &fixture.acache;
@@ -1577,7 +1553,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unlink_applied_to_tracked_version_immediately() -> anyhow::Result<()> {
+    async fn remove_applied_to_tracked_version_immediately() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(arena).await?;
         let acache = &fixture.acache;
@@ -1638,6 +1614,61 @@ mod tests {
 
         // Inode should still be resolvable, because some peers still have it.
         assert_eq!(Some(inode), acache.resolve(&file_path)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drop_not_applied_to_tracked_version() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena).await?;
+        let acache = &fixture.acache;
+        let peer1 = Peer::from("peer1");
+        let peer2 = Peer::from("peer2");
+        let file_path = Path::parse("file.txt")?;
+
+        acache.update(
+            peer1,
+            Notification::Add {
+                arena: arena,
+                index: 0,
+                path: file_path.clone(),
+                mtime: test_time(),
+                size: 100,
+                hash: Hash([1u8; 32]),
+            },
+            None,
+        )?;
+        acache.update(
+            peer2,
+            Notification::Add {
+                arena: arena,
+                index: 0,
+                path: file_path.clone(),
+                mtime: test_time(),
+                size: 100,
+                hash: Hash([1u8; 32]),
+            },
+            None,
+        )?;
+
+        let inode = acache.expect(&file_path)?;
+        assert!(acache.file_metadata(inode).is_ok());
+
+        acache.update(
+            peer1,
+            Notification::Drop {
+                arena: arena,
+                index: 0,
+                path: file_path.clone(),
+                old_hash: Hash([1u8; 32]),
+            },
+            None,
+        )?;
+
+        // The default version has not been removed by this notification,
+        // since this is a Drop, not a Remove.
+        assert!(acache.file_metadata(inode).is_ok());
 
         Ok(())
     }
