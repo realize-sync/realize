@@ -7,6 +7,7 @@ use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
 use super::types::{
     CacheTableEntry, CacheTableKey, DirtableEntry, FileAvailability, FileMetadata, FileTableEntry,
 };
+use crate::arena::history::WritableOpenHistory;
 use crate::arena::notifier::{Notification, Progress};
 use crate::arena::types::DirMetadata;
 use crate::utils::holder::Holder;
@@ -218,6 +219,34 @@ impl<'a> WritableOpenCache<'a> {
         let mut tree = txn.write_tree()?;
         let marks = txn.read_marks()?;
         blobs.create(&mut tree, &marks, inode, &file_entry.hash, file_entry.size)
+    }
+
+    /// Remove file locally, even though it might still be available in other peers.
+    ///
+    /// Also lets other peers know about this local change.
+    pub(crate) fn unlink(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
+        history: &mut WritableOpenHistory,
+        dirty: &mut WritableOpenDirty,
+        parent_inode: Inode,
+        name: &str,
+    ) -> Result<(), StorageError> {
+        let inode = tree
+            .lookup(parent_inode, name)?
+            .ok_or(StorageError::NotFound)?;
+        let e = get_file_entry(&self.table, inode, None)?.ok_or(StorageError::NotFound)?;
+        log::debug!(
+            "[{}]@local Local removal of \"{}\" inode {inode} {}",
+            self.arena,
+            e.path,
+            e.hash
+        );
+        self.rm_default_file_entry(tree, blobs, dirty, parent_inode, inode)?;
+        history.report_removed(&e.path, &e.hash)?;
+
+        Ok(())
     }
 
     /// Add a file entry for a peer.
@@ -747,6 +776,29 @@ impl ArenaCache {
         peers.progress(peer)
     }
 
+    pub(crate) fn unlink(&self, parent_inode: Inode, name: &str) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut tree = txn.write_tree()?;
+            let mut blobs = txn.write_blobs()?;
+            let mut history = txn.write_history()?;
+            let mut dirty = txn.write_dirty()?;
+            let mut cache = txn.write_cache()?;
+
+            cache.unlink(
+                &mut tree,
+                &mut blobs,
+                &mut history,
+                &mut dirty,
+                parent_inode,
+                name,
+            )?;
+        }
+        txn.commit()?;
+
+        Ok(())
+    }
+
     pub(crate) fn update(
         &self,
         peer: Peer,
@@ -1024,11 +1076,13 @@ mod tests {
     use crate::arena::blob::BlobExt;
     use crate::arena::db::ArenaDatabase;
     use crate::arena::dirty::DirtyReadOperations;
+    use crate::arena::history::HistoryReadOperations;
     use crate::arena::notifier::Notification;
     use crate::arena::tree::TreeExt;
     use crate::arena::tree::TreeLoc;
     use crate::arena::tree::TreeReadOperations;
     use crate::arena::types::DirMetadata;
+    use crate::arena::types::HistoryTableEntry;
     use crate::{FileMetadata, Inode, InodeAssignment, StorageError};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
@@ -2346,4 +2400,70 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn unlink() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let acache = &fixture.acache;
+        let file_path = Path::parse("file.txt")?;
+        let mtime = test_time();
+
+        fixture.add_to_cache(&file_path, 100, mtime)?;
+        let arena_root = fixture.db.tree().root();
+
+        let (inode, _) = acache.lookup(arena_root, "file.txt")?;
+        assert!(acache.file_metadata(inode).is_ok());
+
+        fixture.clear_dirty()?;
+        let dir_mtime_before = acache.dir_metadata(arena_root)?.mtime;
+
+        acache.unlink(arena_root, "file.txt")?;
+
+        assert!(matches!(
+            acache.lookup(arena_root, "file.txt"),
+            Err(StorageError::NotFound)
+        ));
+        assert!(matches!(
+            acache.file_metadata(inode),
+            Err(StorageError::NotFound)
+        ));
+
+        assert_eq!(HashSet::from([inode]), fixture.dirty_inodes()?);
+
+        assert!(acache.dir_metadata(arena_root)?.mtime > dir_mtime_before);
+
+        let txn = fixture.db.begin_read()?;
+        let history = txn.read_history()?;
+        let (_, history_entry) = history.history(0..).last().unwrap().unwrap();
+        assert_eq!(
+            HistoryTableEntry::Remove(file_path, test_hash()),
+            history_entry
+        );
+
+        Ok(())
+    }
+
+    // #[tokio::test]
+    // async fn unlink_updates_parent_directory_mtime() -> anyhow::Result<()> {
+    //     let fixture = Fixture::setup_with_arena(test_arena()).await?;
+    //     let acache = &fixture.acache;
+    //     let file_path = Path::parse("file.txt")?;
+    //     let mtime = test_time();
+
+    //     // Add a file to the cache
+    //     fixture.add_to_cache(&file_path, 100, mtime)?;
+    //     let arena_root = fixture.db.tree().root();
+
+    //     // Get initial directory mtime
+    //     let initial_mtime = acache.dir_metadata(arena_root)?.mtime;
+
+    //     // Unlink the file
+    //     acache.unlink(arena_root, "file.txt")?;
+
+    //     // Verify parent directory mtime was updated
+    //     let updated_mtime = acache.dir_metadata(arena_root)?.mtime;
+    //     assert!(updated_mtime > initial_mtime);
+
+    //     Ok(())
+    // }
 }

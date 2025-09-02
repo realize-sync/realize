@@ -40,7 +40,6 @@ pub fn export(
             MountOption::Async,
             MountOption::FSName("realized".to_string()),
             MountOption::Subtype("realize".to_string()),
-            MountOption::RO,
         ],
     )?;
 
@@ -305,6 +304,24 @@ impl Filesystem for RealizeFs {
         );
         reply.error(nix::libc::ENOSYS);
     }
+
+    fn unlink(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_owned();
+
+        self.handle.spawn(async move {
+            match inner.unlink(parent, name).await {
+                Err(err) => reply.error(err.log_and_convert()),
+                Ok(()) => reply.ok(),
+            }
+        });
+    }
 }
 
 struct InnerRealizeFs {
@@ -315,9 +332,9 @@ struct InnerRealizeFs {
 
 impl InnerRealizeFs {
     async fn lookup(&self, parent: u64, name: OsString) -> Result<fuser::FileAttr, FuseError> {
-        let name_str = name.to_str().ok_or(FuseError::Utf8)?;
+        let name = name.to_str().ok_or(FuseError::Utf8)?;
 
-        let (inode, assignment) = self.cache.lookup(Inode(parent), name_str).await?;
+        let (inode, assignment) = self.cache.lookup(Inode(parent), name).await?;
         match assignment {
             InodeAssignment::Directory => {
                 let metadata = self.cache.dir_metadata(inode).await?;
@@ -393,6 +410,13 @@ impl InnerRealizeFs {
                 break;
             }
         }
+
+        Ok(())
+    }
+
+    async fn unlink(&self, parent: u64, name: OsString) -> Result<(), FuseError> {
+        let name = name.to_str().ok_or(FuseError::Utf8)?;
+        self.cache.unlink(Inode(parent), name).await?;
 
         Ok(())
     }
@@ -854,6 +878,62 @@ mod tests {
                 let ret = fs::metadata(arena_path.join("doesnotexist")).await;
                 assert!(ret.is_err());
                 assert_eq!(std::io::ErrorKind::NotFound, ret.err().unwrap().kind());
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn unlink() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+
+                // Create a file in peer B's arena
+                fixture
+                    .inner
+                    .write_file(b, "todelete.txt", "delete me")
+                    .await?;
+                let realpath_in_b = fixture.inner.arena_root(b).join("todelete.txt");
+                assert!(fs::metadata(&realpath_in_b).await.is_ok());
+
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "todelete.txt", &hash::digest("delete me"))
+                    .await?;
+
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                let file_path = arena_path.join("todelete.txt");
+
+                assert!(fs::metadata(&file_path).await.is_ok());
+
+                fs::remove_file(&file_path).await?;
+
+                // The file is deleted on a.
+                let ret = fs::metadata(&file_path).await;
+                assert!(ret.is_err());
+                assert_eq!(std::io::ErrorKind::NotFound, ret.err().unwrap().kind());
+
+                // Deletion is eventually propagated back to b.
+                let limit = Instant::now() + Duration::from_secs(3);
+                while fs::metadata(&realpath_in_b).await.is_ok() && Instant::now() < limit {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert!(fs::metadata(&realpath_in_b).await.is_err());
 
                 Ok::<(), anyhow::Error>(())
             })

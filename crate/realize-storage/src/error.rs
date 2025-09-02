@@ -28,6 +28,9 @@ pub enum StorageError {
     #[error{"not found"}]
     NotFound,
 
+    #[error{"permission denied"}]
+    PermissionDenied,
+
     #[error{"not a directory"}]
     NotADirectory,
 
@@ -79,6 +82,7 @@ impl StorageError {
             StorageError::ByteConversion(_) => InvalidInput,
             StorageError::Unavailable => Other,
             StorageError::NotFound => NotFound,
+            StorageError::PermissionDenied => PermissionDenied,
             StorageError::NotADirectory => NotADirectory,
             StorageError::IsADirectory => IsADirectory,
             StorageError::JoinError(_) => Other,

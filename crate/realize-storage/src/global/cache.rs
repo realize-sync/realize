@@ -316,6 +316,38 @@ impl GlobalCache {
         })
         .await?
     }
+
+    pub async fn unlink(
+        self: &Arc<Self>,
+        parent_inode: Inode,
+        name: &str,
+    ) -> Result<(), StorageError> {
+        let name = name.to_string();
+        let this = Arc::clone(self);
+
+        task::spawn_blocking(move || {
+            let txn = this.db.begin_read()?;
+            match this.allocator.arena_for_inode(&txn, parent_inode)? {
+                Some(arena) => {
+                    let cache = this.arena_cache(arena)?;
+                    cache.unlink(parent_inode, &name)
+                }
+                None => {
+                    if this
+                        .paths
+                        .get(&parent_inode)
+                        .and_then(|paths| paths.entries.get(&name))
+                        .is_some()
+                    {
+                        Err(StorageError::IsADirectory)
+                    } else {
+                        Err(StorageError::NotFound)
+                    }
+                }
+            }
+        })
+        .await?
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -623,6 +655,32 @@ mod tests {
                 .await?
                 .is_empty()
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unlink() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let cache = &fixture.cache;
+
+        assert!(matches!(
+            cache.unlink(GlobalCache::ROOT_DIR, "test_arena").await,
+            Err(StorageError::IsADirectory)
+        ));
+        assert!(matches!(
+            cache.unlink(GlobalCache::ROOT_DIR, "doesnotexist").await,
+            Err(StorageError::NotFound)
+        ));
+
+        // This just checks that the call is dispatched down to the
+        // arena cache.
+        assert!(matches!(
+            cache
+                .unlink(cache.arena_root(test_arena())?, "doesnotexist")
+                .await,
+            Err(StorageError::NotFound)
+        ));
 
         Ok(())
     }
