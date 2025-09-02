@@ -2,13 +2,11 @@ use super::config::Config;
 use crate::consensus::churten::Churten;
 use crate::fs::downloader::Downloader;
 use crate::fs::fuse::{self, FuseHandle};
-use crate::fs::nfs;
 use crate::rpc::Household;
 use crate::rpc::control::server::ControlServer;
 use anyhow::Context;
 use realize_network::{Networking, Server, unixsocket};
 use realize_storage::Storage;
-use std::net::SocketAddr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,20 +54,6 @@ impl SetupHelper {
             storage,
             household,
         })
-    }
-
-    /// Export NFS at the given address.
-    ///
-    /// A local cache must be configured.
-    pub async fn export_nfs(&self, addr: SocketAddr) -> anyhow::Result<()> {
-        let cache = self.storage.cache();
-
-        let downloader = Downloader::new(self.household.clone(), cache.clone());
-
-        nfs::export(Arc::clone(cache), downloader, addr).await?;
-
-        log::info!("NFS filesystem available on {addr:?}");
-        Ok(())
     }
 
     /// Mount a FUSE filesystem at the given mountpoint.

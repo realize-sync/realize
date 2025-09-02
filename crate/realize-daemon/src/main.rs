@@ -28,10 +28,6 @@ struct Cli {
     #[arg(long, default_value = "localhost:9771")]
     address: String,
 
-    /// TCP address to export NFS on.
-    #[arg(long)]
-    nfs: Option<String>,
-
     /// Path to mount the FUSE filesystem on.
     #[arg(long)]
     fuse: Option<PathBuf>,
@@ -97,16 +93,6 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
         .with_context(|| format!("Failed to parse --address {}", cli.address))?;
     log::debug!("Starting server on {}/{:?}...", hostport, hostport.addr());
 
-    if let Some(addr) = &cli.nfs {
-        setup
-            .export_nfs(
-                HostPort::parse(addr)
-                    .await
-                    .with_context(|| format!("Failed to parse --nfs {addr}"))?
-                    .addr(),
-            )
-            .await?;
-    }
     let fuse = if let Some(path) = &cli.fuse {
         Some(setup.export_fuse(path, cli.fuse_umask).await?)
     } else {

@@ -1,8 +1,5 @@
 use assert_fs::TempDir;
 use assert_fs::prelude::*;
-use nfs3_client::Nfs3ConnectionBuilder;
-use nfs3_client::tokio::TokioConnector;
-use nfs3_types::nfs3::{Nfs3Result, READDIR3args};
 use realize_core::config::Config;
 use realize_network::config::PeerConfig;
 use realize_network::unixsocket;
@@ -357,65 +354,8 @@ async fn daemon_interrupted() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn daemon_exports_nfs() -> anyhow::Result<()> {
-    let fixture = Fixture::setup().await?;
-
-    let nfs_port = portpicker::pick_unused_port().expect("No ports free");
-    let nfs_addr = format!("127.0.0.1:{nfs_port}");
-
-    // Run process in the background and in a way that allows reading
-    // its output, so we know what port to connect to.
-    let mut daemon = fixture.command()?.arg("--nfs").arg(&nfs_addr).spawn()?;
-    let pid = daemon.id();
-    scopeguard::defer! { let _ = kill(pid); }
-
-    assert_listening_to(&nfs_addr).await;
-
-    log::debug!("Connecting to NFS port {nfs_port}");
-    let mut connection =
-        Nfs3ConnectionBuilder::new(TokioConnector, "127.0.0.1".to_string(), "/".to_string())
-            .connect_from_privileged_port(false)
-            .mount_port(nfs_port)
-            .nfs3_port(nfs_port)
-            .mount()
-            .await?;
-
-    log::debug!("Connected to NFS port {nfs_port}");
-    let root = connection.root_nfs_fh3();
-    let readdir = connection
-        .readdir(READDIR3args {
-            dir: root,
-            cookie: 0,
-            cookieverf: nfs3_types::nfs3::cookieverf3::default(),
-            count: 128 * 1024 * 1024,
-        })
-        .await?;
-    match readdir {
-        Nfs3Result::Err(err) => panic!("readdir failed:{err:?}"),
-        Nfs3Result::Ok(res) => {
-            assert_unordered::assert_eq_unordered!(
-                vec!["testdir"],
-                res.reply
-                    .entries
-                    .0
-                    .iter()
-                    .map(|e| std::str::from_utf8(e.name.as_ref()).expect("utf-8"))
-                    .collect::<Vec<_>>()
-            );
-        }
-    };
-    let _ = connection.unmount().await;
-
-    daemon.start_kill()?;
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn daemon_updates_cache() -> anyhow::Result<()> {
-    use nfs3_types::nfs3::{LOOKUP3args, READ3args, diropargs3, nfs_fh3};
     use std::time::Duration;
-    use tokio_retry::strategy::FixedInterval;
 
     let mut fixture_a = Fixture::setup().await?;
     let arena_config = fixture_a
@@ -448,92 +388,34 @@ async fn daemon_updates_cache() -> anyhow::Result<()> {
         .expect("peer a")
         .address = Some(fixture_a.server_address);
 
-    let nfs_port = portpicker::pick_unused_port().expect("No ports free");
-    let nfs_addr = format!("127.0.0.1:{nfs_port}");
-
+    // Create a mount point for FUSE
+    let mount_point = fixture_b.tempdir.child("fuse-mount");
+    mount_point.create_dir_all()?;
     let mut daemon_b = fixture_b
         .command()?
         .stderr(Stdio::piped())
         .stdout(Stdio::piped())
-        .arg("--nfs")
-        .arg(&nfs_addr)
+        .arg("--fuse")
+        .arg(mount_point.path())
         .spawn()?;
     let pid = daemon_b.id();
     scopeguard::defer! { let _ = kill(pid); }
 
     fixture_b.collect_stderr("B", &mut daemon_b);
     fixture_b.collect_stdout("B", &mut daemon_b);
-    assert_listening_to(&nfs_addr).await;
+    fixture_b.assert_listening().await;
 
     tokio::fs::write(fixture_a.testdir.join("hello.txt"), "Hello, world!").await?;
 
-    log::debug!("Connecting to NFS port {nfs_port}");
-    let mut connection =
-        Nfs3ConnectionBuilder::new(TokioConnector, "127.0.0.1".to_string(), "/".to_string())
-            .connect_from_privileged_port(false)
-            .mount_port(nfs_port)
-            .nfs3_port(nfs_port)
-            .mount()
-            .await?;
-
-    let root_fh3 = connection.root_nfs_fh3();
-    let lookup = connection
-        .lookup(LOOKUP3args {
-            what: diropargs3 {
-                dir: root_fh3,
-                name: "testdir".as_bytes().into(),
-            },
-        })
-        .await?;
-    let testdir_fh3 = match lookup {
-        Nfs3Result::Err(e) => panic!("testdir lookup: {e:?}"),
-        Nfs3Result::Ok(res) => res.object,
-    };
-
     // It might take a while for the new file to be reported by
-    // inotify and then daemon_a.
-    let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
-    let hello_txt_fh3: nfs_fh3;
-    loop {
-        let lookup = connection
-            .lookup(LOOKUP3args {
-                what: diropargs3 {
-                    dir: testdir_fh3.clone(),
-                    name: "hello.txt".as_bytes().into(),
-                },
-            })
-            .await?;
-        match lookup {
-            Nfs3Result::Err(e) => {
-                if let Some(delay) = retry.next() {
-                    tokio::time::sleep(delay).await;
-                    continue;
-                } else {
-                    panic!("hello.txt lookup: {e:?}");
-                }
-            }
-            Nfs3Result::Ok(res) => {
-                hello_txt_fh3 = res.object;
-                break;
-            }
-        };
+    // inotify and then daemon_a, so retry.
+    let goal = mount_point.path().join("testdir/hello.txt");
+    let limit = Instant::now() + Duration::from_secs(3);
+    while !tokio::fs::metadata(&goal).await.is_ok() && Instant::now() < limit {
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-
-    let read = connection
-        .read(READ3args {
-            file: hello_txt_fh3,
-            offset: 0,
-            count: 100,
-        })
-        .await?;
-    let hello_txt_content = match read {
-        Nfs3Result::Err(e) => panic!("hello.txt read: {e:?}"),
-        Nfs3Result::Ok(res) => String::from_utf8(res.data.to_vec())?,
-    };
-
-    assert_eq!("Hello, world!", hello_txt_content);
-
-    let _ = connection.unmount().await;
+    assert!(tokio::fs::metadata(&goal).await.is_ok());
+    assert_eq!("Hello, world!", tokio::fs::read_to_string(&goal).await?);
 
     daemon_b.start_kill()?;
     daemon_a.start_kill()?;
