@@ -8,6 +8,7 @@ use super::types::{
     CacheTableEntry, CacheTableKey, DirtableEntry, FileAvailability, FileMetadata, FileTableEntry,
 };
 use crate::arena::notifier::{Notification, Progress};
+use crate::arena::types::DirMetadata;
 use crate::utils::holder::Holder;
 use crate::{Blob, InodeAssignment, LocalAvailability};
 use crate::{Inode, StorageError};
@@ -780,10 +781,13 @@ impl ArenaCache {
         cache.file_metadata(inode)
     }
 
-    pub(crate) fn dir_mtime(&self, inode: Inode) -> Result<UnixTime, StorageError> {
+    pub(crate) fn dir_metadata(&self, inode: Inode) -> Result<DirMetadata, StorageError> {
         let txn = self.db.begin_read()?;
         let cache = txn.read_cache()?;
-        cache.dir_mtime(inode)
+        Ok(DirMetadata {
+            read_only: false,
+            mtime: cache.dir_mtime(inode)?,
+        })
     }
 
     pub(crate) fn file_availability(&self, inode: Inode) -> Result<FileAvailability, StorageError> {
@@ -1087,6 +1091,7 @@ mod tests {
     use crate::arena::tree::TreeExt;
     use crate::arena::tree::TreeLoc;
     use crate::arena::tree::TreeReadOperations;
+    use crate::arena::types::DirMetadata;
     use crate::{FileMetadata, Inode, InodeAssignment, StorageError};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
@@ -1141,13 +1146,13 @@ mod tests {
             })
         }
 
-        fn dir_mtime<T>(&self, path: T) -> anyhow::Result<UnixTime>
+        fn dir_metadata<T>(&self, path: T) -> anyhow::Result<DirMetadata>
         where
             T: AsRef<Path>,
         {
             let path = path.as_ref();
             let inode = self.acache.expect(path)?;
-            Ok(self.acache.dir_mtime(inode)?)
+            Ok(self.acache.dir_metadata(inode)?)
         }
 
         fn add_to_cache<T>(&self, path: T, size: u64, mtime: UnixTime) -> anyhow::Result<()>
@@ -1250,7 +1255,7 @@ mod tests {
 
         assert_ne!(
             UnixTime::ZERO,
-            fixture.acache.dir_mtime(fixture.db.tree().root())?
+            fixture.acache.dir_metadata(fixture.db.tree().root())?.mtime
         );
 
         Ok(())
@@ -1329,12 +1334,12 @@ mod tests {
         let path1 = Path::parse("a/b/1.txt")?;
         fixture.add_to_cache(&path1, 100, mtime)?;
         let dir = Path::parse("a/b")?;
-        let dir_mtime = fixture.dir_mtime(&dir)?;
+        let dir_mtime = fixture.dir_metadata(&dir)?.mtime;
 
         let path2 = Path::parse("a/b/2.txt")?;
         fixture.add_to_cache(&path2, 100, mtime)?;
 
-        assert!(fixture.dir_mtime(&dir)? > dir_mtime);
+        assert!(fixture.dir_metadata(&dir)?.mtime > dir_mtime);
         Ok(())
     }
 
@@ -1574,10 +1579,10 @@ mod tests {
 
         fixture.add_to_cache(&file_path, 100, mtime)?;
         let arena_root = fixture.db.tree().root();
-        let dir_mtime = fixture.acache.dir_mtime(arena_root)?;
+        let dir_mtime = fixture.acache.dir_metadata(arena_root)?.mtime;
         fixture.remove_from_cache(&file_path)?;
 
-        assert!(fixture.acache.dir_mtime(arena_root)? > dir_mtime);
+        assert!(fixture.acache.dir_metadata(arena_root)?.mtime > dir_mtime);
 
         Ok(())
     }

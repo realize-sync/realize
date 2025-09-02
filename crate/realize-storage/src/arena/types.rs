@@ -796,6 +796,15 @@ pub struct FileMetadata {
     pub mtime: UnixTime,
 }
 
+/// The metadata of a directory.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirMetadata {
+    pub read_only: bool,
+
+    /// The modification time of the directory.
+    pub mtime: UnixTime,
+}
+
 /// An entry in the peer table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PeerTableEntry {

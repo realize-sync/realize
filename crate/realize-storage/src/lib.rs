@@ -28,7 +28,7 @@ pub use arena::engine::{Job, JobStatus};
 pub use arena::indexed_store::Reader;
 pub use arena::notifier::Notification;
 pub use arena::notifier::Progress;
-pub use arena::types::{FileAvailability, FileMetadata, LocalAvailability, Mark};
+pub use arena::types::{DirMetadata, FileAvailability, FileMetadata, LocalAvailability, Mark};
 pub use error::StorageError;
 pub use global::cache::GlobalCache;
 pub use global::types::InodeAssignment;

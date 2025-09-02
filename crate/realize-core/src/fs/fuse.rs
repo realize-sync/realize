@@ -2,7 +2,9 @@
 use crate::fs::downloader::Downloader;
 use fuser::{Filesystem, MountOption};
 use nix::libc::c_int;
-use realize_storage::{FileMetadata, GlobalCache, Inode, InodeAssignment, StorageError};
+use realize_storage::{
+    DirMetadata, FileMetadata, GlobalCache, Inode, InodeAssignment, StorageError,
+};
 use std::ffi::OsString;
 use std::time::SystemTime;
 use std::{sync::Arc, time::Duration};
@@ -318,8 +320,8 @@ impl InnerRealizeFs {
         let (inode, assignment) = self.cache.lookup(Inode(parent), name_str).await?;
         match assignment {
             InodeAssignment::Directory => {
-                let mtime = self.cache.dir_mtime(inode).await?;
-                return Ok(self.build_dir_attr(inode, mtime));
+                let metadata = self.cache.dir_metadata(inode).await?;
+                return Ok(self.build_dir_attr(inode, metadata));
             }
             InodeAssignment::File => {
                 let metadata = self.cache.file_metadata(inode).await?;
@@ -331,7 +333,7 @@ impl InnerRealizeFs {
     async fn getattr(&self, ino: u64) -> Result<fuser::FileAttr, FuseError> {
         let (file_metadata, dir_mtime) = tokio::join!(
             self.cache.file_metadata(Inode(ino)),
-            self.cache.dir_mtime(Inode(ino))
+            self.cache.dir_metadata(Inode(ino))
         );
         if let Ok(mtime) = dir_mtime {
             Ok(self.build_dir_attr(Inode(ino), mtime))
@@ -422,10 +424,13 @@ impl InnerRealizeFs {
         }
     }
 
-    fn build_dir_attr(&self, inode: Inode, mtime: realize_types::UnixTime) -> fuser::FileAttr {
+    fn build_dir_attr(&self, inode: Inode, metadata: DirMetadata) -> fuser::FileAttr {
         let uid = nix::unistd::getuid().as_raw();
         let gid = nix::unistd::getgid().as_raw();
-        let mtime = mtime.as_system_time().unwrap_or(SystemTime::UNIX_EPOCH);
+        let mtime = metadata
+            .mtime
+            .as_system_time()
+            .unwrap_or(SystemTime::UNIX_EPOCH);
 
         fuser::FileAttr {
             ino: inode.as_u64(),
@@ -436,7 +441,7 @@ impl InnerRealizeFs {
             ctime: mtime,
             crtime: SystemTime::UNIX_EPOCH,
             kind: fuser::FileType::Directory,
-            perm: 0o0777 & !self.umask,
+            perm: if metadata.read_only { 0o0555 } else { 0o0777 } & !self.umask,
             nlink: 1,
             uid,
             gid,
@@ -635,7 +640,7 @@ mod tests {
 
                 // Check root directory attributes
                 assert!(root_attr.is_dir());
-                assert_eq!(0o0750, root_attr.permissions().mode() & 0o777);
+                assert_eq!(0o0550, root_attr.permissions().mode() & 0o777);
                 assert_eq!(nix::unistd::getuid().as_raw(), root_attr.uid());
                 assert_eq!(nix::unistd::getgid().as_raw(), root_attr.gid());
 

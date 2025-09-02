@@ -6,7 +6,9 @@ use nfsserve::nfs::{
 };
 use nfsserve::tcp::{NFSTcp as _, NFSTcpListener};
 use nfsserve::vfs::{NFSFileSystem, ReadDirResult, VFSCapabilities};
-use realize_storage::{FileMetadata, GlobalCache, Inode, InodeAssignment, StorageError};
+use realize_storage::{
+    DirMetadata, FileMetadata, GlobalCache, Inode, InodeAssignment, StorageError,
+};
 use realize_types::UnixTime;
 use std::io::{ErrorKind, SeekFrom};
 use std::net::SocketAddr;
@@ -99,7 +101,7 @@ impl UnrealFs {
                 name: name.as_bytes().into(),
                 attr: match assignment {
                     InodeAssignment::Directory => {
-                        self.build_dir_attr(inode, *&self.cache.dir_mtime(inode).await?)
+                        self.build_dir_attr(inode, &self.cache.dir_metadata(inode).await?)
                     }
                     InodeAssignment::File => {
                         self.build_file_attr(inode, &self.cache.file_metadata(inode).await?)
@@ -116,10 +118,10 @@ impl UnrealFs {
     }
 
     async fn do_getattr(&self, id: Inode) -> Result<fattr3, UnrealFsError> {
-        let (file_metadata, dir_mtime) =
-            tokio::join!(self.cache.file_metadata(id), self.cache.dir_mtime(id));
-        if let Ok(mtime) = dir_mtime {
-            return Ok(self.build_dir_attr(id, mtime));
+        let (file_metadata, dir_metadata) =
+            tokio::join!(self.cache.file_metadata(id), self.cache.dir_metadata(id));
+        if let Ok(dir_metadata) = dir_metadata {
+            return Ok(self.build_dir_attr(id, &dir_metadata));
         }
         Ok(self.build_file_attr(id, &file_metadata?))
     }
@@ -144,8 +146,8 @@ impl UnrealFs {
         }
     }
 
-    fn build_dir_attr(&self, inode: Inode, mtime: UnixTime) -> fattr3 {
-        let mtime = to_nfs_time(mtime);
+    fn build_dir_attr(&self, inode: Inode, metadata: &DirMetadata) -> fattr3 {
+        let mtime = to_nfs_time(metadata.mtime);
         fattr3 {
             ftype: ftype3::NF3DIR,
             mode: 0o0550,

@@ -7,7 +7,7 @@ use super::inode_allocator::InodeAllocator;
 use super::types::InodeAssignment;
 use crate::arena::arena_cache::ArenaCache;
 use crate::arena::notifier::{Notification, Progress};
-use crate::arena::types::LocalAvailability;
+use crate::arena::types::{DirMetadata, LocalAvailability};
 use crate::global::db::GlobalWriteTransaction;
 use crate::global::types::PathTableEntry;
 use crate::utils::holder::Holder;
@@ -184,7 +184,7 @@ impl GlobalCache {
     }
 
     /// Return the mtime of the directory.
-    pub async fn dir_mtime(self: &Arc<Self>, inode: Inode) -> Result<UnixTime, StorageError> {
+    pub async fn dir_metadata(self: &Arc<Self>, inode: Inode) -> Result<DirMetadata, StorageError> {
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
@@ -192,11 +192,14 @@ impl GlobalCache {
             match this.allocator.arena_for_inode(&txn, inode)? {
                 Some(arena) => {
                     let cache = this.arena_cache(arena)?;
-                    cache.dir_mtime(inode)
+                    cache.dir_metadata(inode)
                 }
                 None => match this.paths.get(&inode) {
                     None => Err(StorageError::NotFound),
-                    Some(IntermediatePath { mtime, .. }) => Ok(*mtime),
+                    Some(IntermediatePath { mtime, .. }) => Ok(DirMetadata {
+                        read_only: true,
+                        mtime: *mtime,
+                    }),
                 },
             }
         })
@@ -494,10 +497,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_cache_mtime() -> anyhow::Result<()> {
+    async fn empty_cache_metadata() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arenas([]).await?;
 
-        assert_ne!(UnixTime::ZERO, fixture.cache.dir_mtime(Inode(1)).await?);
+        let m = fixture.cache.dir_metadata(Inode(1)).await?;
+        assert!(m.read_only);
+        assert_ne!(UnixTime::ZERO, m.mtime);
 
         Ok(())
     }
@@ -507,17 +512,19 @@ mod tests {
         let arena = Arena::from("documents/letters");
         let fixture = Fixture::setup_with_arena(arena).await?;
 
-        assert_ne!(UnixTime::ZERO, fixture.cache.dir_mtime(Inode(1)).await?);
-        fixture
-            .cache
-            .dir_mtime(fixture.cache.arena_root(arena)?)
-            .await?;
+        let root_m = fixture.cache.dir_metadata(Inode(1)).await?;
+        assert!(root_m.read_only);
+        assert_ne!(UnixTime::ZERO, root_m.mtime);
 
         let (documents, _) = fixture.cache.lookup(Inode(1), "documents").await?;
-        assert_ne!(UnixTime::ZERO, fixture.cache.dir_mtime(documents).await?);
+        let documents_m = fixture.cache.dir_metadata(documents).await?;
+        assert!(documents_m.read_only);
+        assert_ne!(UnixTime::ZERO, documents_m.mtime);
 
         let (letters, _) = fixture.cache.lookup(documents, "letters").await?;
-        assert_ne!(UnixTime::ZERO, fixture.cache.dir_mtime(letters).await?);
+        let letters_m = fixture.cache.dir_metadata(letters).await?;
+        assert!(!letters_m.read_only);
+        assert_ne!(UnixTime::ZERO, letters_m.mtime);
 
         Ok(())
     }
