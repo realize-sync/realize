@@ -1187,11 +1187,6 @@ impl Blob {
         self.info.size
     }
 
-    /// Return the blob inode.
-    pub fn inode(&self) -> Inode {
-        self.info.inode
-    }
-
     /// Current read/write position within the file.
     ///
     /// This is the position relative to the start of the file.
