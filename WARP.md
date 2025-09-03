@@ -1,0 +1,144 @@
+# WARP.md
+
+This file provides guidance to WARP (warp.dev) when working with code in this repository.
+
+## Commands
+
+### Build and Development
+```bash
+# Install build dependencies (Linux)
+sudo apt-get install capnproto libcapnp-dev fuse3 libfuse3-dev
+
+# Install build dependencies (macOS) 
+brew install capnp fuse-t
+
+# Build the project
+cargo build
+
+# Run all tests 
+cargo test
+
+# Run crate-specific test (Example with crate-storage; substitute as appropriate) 
+cargo test -p crate-storage
+
+# Format code
+cargo fmt
+
+# Check code in crate (required after every change) (Example with crate-storage; substitute as appropriate)
+cargo check -p crate-storage
+```
+
+### Testing
+```bash
+# Run specific test module
+cargo test test_module_name
+
+# Run integration tests only
+cargo test --test "*integration_test"
+
+# Run tests with debug logging
+RUST_LOG=realize_=debug cargo test
+
+# Run single test with full output
+cargo test test_name -- --nocapture
+```
+
+### Executables
+```bash
+# Run the daemon
+cargo run --bin realized
+
+# Run the control CLI
+cargo run --bin realize
+```
+
+## Project Architecture
+
+### High-Level Overview
+Realize is a decentralized file-syncing solution that presents remote files as a unified filesystem. The architecture is built around two key concepts:
+
+- **The Real**: Files available locally and complete, stored as regular files
+- **The Unreal**: Files not completely available locally, kept in a key-value store and served from cache
+
+### Crate Structure
+The project uses a workspace architecture with these core crates:
+
+- **realize-core**: Central business logic, filesystem operations, consensus mechanisms, and RPC server implementation
+- **realize-daemon** (`realized` binary): Background service that runs the file sync daemon
+- **realize-control** (`realize` binary): Command-line interface for interacting with the daemon
+- **realize-network**: Network communication layer using Cap'n Proto RPC
+- **realize-storage**: Data storage layer with arena-based storage and caching
+- **realize-types**: Shared type definitions used across all crates
+
+### Key Architectural Patterns
+
+#### Arena-Based Storage
+Files are organized into "Arenas" - logical groupings of files that can be synced independently. Each peer can choose which arenas to participate in and which files to keep locally vs. in cache.
+
+#### Real/Unreal Filesystem Layers
+- **Real Layer**: Complete files stored locally on the filesystem
+- **Unreal Layer**: Partial/remote files served from cache and key-value store
+- Files move between layers based on usage, consensus, and local storage policies
+
+#### Consensus Mechanism
+Peers synchronize changes through a consensus protocol where:
+- Local modifications are tracked in history
+- History is shared between trusted peers
+- Conflicts are resolved through configurable strategies
+- Files transition from Real to Unreal after consensus
+
+#### Cap'n Proto RPC
+All network communication uses Cap'n Proto for:
+- Efficient binary serialization
+- Schema evolution
+- RPC between daemon and control client
+- Peer-to-peer communication
+
+## Development Rules and Standards
+
+### Code Quality
+- **Always run `cargo check` after every code change** - fix all errors and warnings
+- **Always run `cargo test -- --skip :slow:` after every code change** - fix all test failures
+- Run `cargo fmt` before committing any Rust files
+- Use `cargo nextest` for improved test running with retries
+
+### Module Organization  
+- **Never create `mod.rs` files** - use `module_name.rs` instead for better discoverability
+- Follow the pattern: `src/media.rs` not `src/media/mod.rs`
+
+### Async I/O Requirements
+**In server code (realize-core), all I/O must be async:**
+- Use `tokio::fs::*` instead of `std::fs::*`
+- Use `tokio::io::*` instead of `std::io::*`  
+- Wrap blocking operations in `tokio::task::spawn_blocking`
+- Always call `flush().await?` after async writes
+- Use `tokio::fs::metadata(&path).await.is_ok()` instead of `path.exists()`
+
+### Cap'n Proto Patterns
+When working with Cap'n Proto:
+- Use `reborrow()` when building nested structures to avoid ownership issues
+- Create lists with correct size: `init_res(items.len() as u32)`
+- Handle union variants carefully - they return `Result<Reader, Error>`
+- Boolean methods return `bool`, not `Result`
+- Write round-trip tests for all data structures
+- Use `Promise::from_future()` for async RPC methods
+
+### Integration Testing
+- Integration tests must use `*_integration_test.rs` suffix
+- Use `assert_cmd::Command` instead of `std::process::Command`
+- Use `assert_fs` for filesystem operations in tests
+- Focus on CLI behavior and end-to-end scenarios
+
+### Dependencies
+The project has specific dependency requirements:
+- **FUSE**: Linux (fuse3/libfuse3-dev) or macOS (fuse-t)
+- **Cap'n Proto**: Required for protocol buffer code generation
+- **Tokio**: Async runtime with specific feature flags for each crate
+- **Testing**: Uses nextest, assert_cmd, assert_fs for comprehensive testing
+
+### Platform Support
+- **Linux**: Full functionality including filesystem layer and inotify
+- **macOS**: Subset of functionality with read-only filesystem view  
+- **Windows**: Planned but not yet supported
+
+Development should prioritize Linux compatibility, with macOS as a secondary target.
