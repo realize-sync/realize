@@ -89,11 +89,13 @@ impl StorageJobProcessor {
 
     fn set_protected(&self, inode: Inode, protected: bool) -> Result<JobStatus, StorageError> {
         let txn = self.db.begin_write()?;
-        let tree = txn.read_tree()?;
-        let mut blobs = txn.write_blobs()?;
-        let mut dirty = txn.write_dirty()?;
-        blobs.set_protected(&tree, &mut dirty, inode, protected)?;
-
+        {
+            let tree = txn.read_tree()?;
+            let mut blobs = txn.write_blobs()?;
+            let mut dirty = txn.write_dirty()?;
+            blobs.set_protected(&tree, &mut dirty, inode, protected)?;
+        }
+        txn.commit()?;
         Ok(JobStatus::Done)
     }
 

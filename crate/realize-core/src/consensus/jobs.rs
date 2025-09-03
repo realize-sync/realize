@@ -4,8 +4,10 @@ use crate::rpc::HouseholdOperationError;
 use crate::rpc::{ExecutionMode, Household};
 use fast_rsync::ApplyError;
 use futures::StreamExt;
-use realize_storage::{Blob, JobId, JobStatus, LocalAvailability, Storage, StorageError};
-use realize_types::{Arena, ByteRanges, Hash, Path, Peer, Signature};
+use realize_storage::{
+    Blob, FileAvailability, JobId, JobStatus, LocalAvailability, Storage, StorageError,
+};
+use realize_types::{Arena, ByteRanges, Hash, Path, Signature};
 use std::io::SeekFrom;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -74,29 +76,27 @@ pub(crate) async fn download(
     match blob.local_availability() {
         LocalAvailability::Verified => return Ok(JobStatus::Done),
         LocalAvailability::Complete => {
-            let peers = storage.cache().file_availability(inode).await?.peers;
-            if peers.is_empty() {
-                return Ok(JobStatus::Abandoned("no peer has it"));
-            }
-            return verify(
-                household, arena, job_id, path, blob, peers, progress, shutdown,
-            )
-            .await;
+            let avail = match blob.remote_availability().await? {
+                Some(a) => a,
+                None => {
+                    return Ok(JobStatus::Abandoned("no peer has it"));
+                }
+            };
+            return verify(household, job_id, blob, avail, progress, shutdown).await;
         }
 
         LocalAvailability::Missing | LocalAvailability::Partial(_, _) => {
-            let peers = storage.cache().file_availability(inode).await?.peers;
-            if peers.is_empty() {
-                return Ok(JobStatus::Abandoned("no peer has it"));
-            }
-
+            let avail = match blob.remote_availability().await? {
+                Some(a) => a,
+                None => {
+                    return Ok(JobStatus::Abandoned("no peer has it"));
+                }
+            };
             let res = write_to_blob(
                 household,
-                arena,
                 job_id,
-                path,
-                &peers,
                 &mut blob,
+                &avail,
                 progress,
                 shutdown.clone(),
             )
@@ -112,10 +112,7 @@ pub(crate) async fn download(
                 }
             }
 
-            return verify(
-                household, arena, job_id, path, blob, peers, progress, shutdown,
-            )
-            .await;
+            return verify(household, job_id, blob, avail, progress, shutdown).await;
         }
     }
 }
@@ -123,11 +120,9 @@ pub(crate) async fn download(
 /// Read file data from `peers` into `blob`.
 async fn write_to_blob(
     household: &Arc<Household>,
-    arena: Arena,
     job_id: JobId,
-    path: &Path,
-    peers: &Vec<Peer>,
     blob: &mut realize_storage::Blob,
+    avail: &FileAvailability,
     progress: &mut impl ByteCountProgress,
     shutdown: CancellationToken,
 ) -> Result<JobStatus, JobError> {
@@ -140,14 +135,15 @@ async fn write_to_blob(
     let mut last_update_bytes = 0;
     progress.update_action(JobAction::Download);
     progress.update(0, total_bytes);
+    let arena = avail.arena;
     log::debug!("[{arena}] Job #{job_id} Blob incomplete; Download {missing}");
 
     for range in missing {
         let mut stream = household.read(
-            peers.clone(),
+            avail.peers.clone(),
             ExecutionMode::Batch,
-            arena,
-            path.clone(),
+            avail.arena,
+            avail.path.clone(),
             range.start,
             Some(range.bytecount()),
         )?;
@@ -183,14 +179,13 @@ async fn write_to_blob(
 /// first if necessary.
 pub(crate) async fn verify(
     household: &Arc<Household>,
-    arena: Arena,
     job_id: JobId,
-    path: &Path,
     mut blob: Blob,
-    peers: Vec<Peer>,
+    avail: FileAvailability,
     progress: &mut impl ByteCountProgress,
     shutdown: CancellationToken,
 ) -> Result<JobStatus, JobError> {
+    let arena = avail.arena;
     log::debug!("[{arena}] Job #{job_id} Blob complete; Verify");
     progress.update_action(JobAction::Verify);
     let computed_hash = tokio::select!(
@@ -228,7 +223,7 @@ pub(crate) async fn verify(
 
         let sig = Signature(fast_rsync::Signature::calculate(limited_buf, opts).into_serialized());
         let delta = tokio::select!(
-            res = household.rsync(peers.clone(), ExecutionMode::Batch, arena, path, &range, sig) => {res?},
+            res = household.rsync(avail.peers.clone(), ExecutionMode::Batch, arena, &avail.path, &range, sig) => {res?},
             _ = shutdown.cancelled() => {
                 return Ok(JobStatus::Cancelled);
             }
@@ -272,6 +267,7 @@ mod tests {
     use rand::{RngCore, SeedableRng};
     use realize_storage::Blob;
     use realize_storage::utils::hash;
+    use realize_types::Peer;
     use tokio::fs::File;
     use tokio::io::{AsyncWrite, BufReader, BufWriter};
     use tokio::{fs, io::AsyncReadExt};

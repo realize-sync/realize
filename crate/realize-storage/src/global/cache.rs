@@ -11,7 +11,7 @@ use crate::arena::types::{DirMetadata, LocalAvailability};
 use crate::global::db::GlobalWriteTransaction;
 use crate::global::types::PathTableEntry;
 use crate::utils::holder::Holder;
-use crate::{Blob, FileAvailability, FileMetadata, Inode, StorageError};
+use crate::{Blob, FileMetadata, Inode, StorageError};
 use realize_types::{Arena, Path, Peer, UnixTime};
 use redb::ReadableTable;
 use std::collections::HashMap;
@@ -300,19 +300,6 @@ impl GlobalCache {
         task::spawn_blocking(move || {
             let cache = this.arena_cache_for_inode(inode)?;
             cache.file_metadata(inode)
-        })
-        .await?
-    }
-
-    pub async fn file_availability(
-        self: &Arc<Self>,
-        inode: Inode,
-    ) -> Result<FileAvailability, StorageError> {
-        let this = Arc::clone(self);
-
-        task::spawn_blocking(move || {
-            let cache = this.arena_cache_for_inode(inode)?;
-            cache.file_availability(inode)
         })
         .await?
     }

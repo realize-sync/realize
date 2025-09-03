@@ -492,6 +492,16 @@ impl Engine {
                     should_protect_blob = want_protect_blob;
                 }
             }
+            log::debug!(
+                "=== want_dl={} LA = {:?}, is_indexed={} should_realize={}",
+                want_download,
+                blob.as_ref()
+                    .map(|b| b.local_availability())
+                    .unwrap_or(LocalAvailability::Missing)
+                    != LocalAvailability::Verified,
+                is_indexed,
+                should_realize.is_some()
+            );
             if want_download
                 && blob
                     .map(|b| b.local_availability())
@@ -502,7 +512,7 @@ impl Engine {
                 should_download = Some(hash);
             }
         }
-
+        log::debug!("should_download={should_download:?}");
         if should_protect_blob {
             return Ok(Some(StorageJob::ProtectBlob(inode)));
         }

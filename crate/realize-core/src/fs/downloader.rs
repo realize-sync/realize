@@ -34,8 +34,11 @@ impl Downloader {
     }
 
     pub async fn reader(&self, inode: Inode) -> Result<Download, StorageError> {
-        let avail = self.cache.file_availability(inode).await?;
         let blob = self.cache.open_file(inode).await?;
+        let avail = blob
+            .remote_availability()
+            .await?
+            .ok_or(StorageError::NotFound)?;
 
         // TODO: check hash
         Ok(Download::new(
@@ -43,7 +46,7 @@ impl Downloader {
             avail.peers,
             avail.arena,
             avail.path,
-            avail.metadata.size,
+            avail.size,
             blob,
         ))
     }

@@ -30,8 +30,12 @@ pub(crate) trait CacheReadOperations {
     /// Get directory modification time for the given inode.
     fn dir_mtime(&self, inode: Inode) -> Result<UnixTime, StorageError>;
 
-    /// Get file availability information for the given inode.
-    fn file_availability(&self, inode: Inode) -> Result<FileAvailability, StorageError>;
+    /// Get remote file availability information for the given inode and version.
+    fn file_availability(
+        &self,
+        inode: Inode,
+        hash: &Hash,
+    ) -> Result<Option<FileAvailability>, StorageError>;
 
     /// Read directory contents for the given inode.
     fn readdir(
@@ -84,8 +88,12 @@ where
         dir_mtime(&self.table, inode)
     }
 
-    fn file_availability(&self, inode: Inode) -> Result<FileAvailability, StorageError> {
-        file_availability(&self.table, inode, self.arena)
+    fn file_availability(
+        &self,
+        inode: Inode,
+        hash: &Hash,
+    ) -> Result<Option<FileAvailability>, StorageError> {
+        file_availability(&self.table, inode, self.arena, hash)
     }
 
     fn readdir(
@@ -119,8 +127,12 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         dir_mtime(&self.table, inode)
     }
 
-    fn file_availability(&self, inode: Inode) -> Result<FileAvailability, StorageError> {
-        file_availability(&self.table, inode, self.arena)
+    fn file_availability(
+        &self,
+        inode: Inode,
+        hash: &Hash,
+    ) -> Result<Option<FileAvailability>, StorageError> {
+        file_availability(&self.table, inode, self.arena, hash)
     }
 
     fn readdir(
@@ -166,10 +178,11 @@ pub(crate) trait CacheExt {
 
 impl<T: CacheReadOperations> CacheExt for T {
     fn file_metadata(&self, inode: Inode) -> Result<FileMetadata, StorageError> {
-        let FileTableEntry { size, mtime, .. } =
-            self.get_at_inode(inode)?.ok_or(StorageError::NotFound)?;
+        let FileTableEntry {
+            size, mtime, hash, ..
+        } = self.get_at_inode(inode)?.ok_or(StorageError::NotFound)?;
 
-        Ok(FileMetadata { size, mtime })
+        Ok(FileMetadata { size, mtime, hash })
     }
 
     fn get<'b, L: Into<TreeLoc<'b>>>(
@@ -177,7 +190,11 @@ impl<T: CacheReadOperations> CacheExt for T {
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<Option<FileTableEntry>, StorageError> {
-        self.get_at_inode(tree.expect(loc)?)
+        if let Some(inode) = tree.resolve(loc)? {
+            self.get_at_inode(inode)
+        } else {
+            Ok(None)
+        }
     }
     fn get_or_err<'b, L: Into<TreeLoc<'b>>>(
         &self,
@@ -532,11 +549,13 @@ impl<'a> WritableOpenCache<'a> {
         }
         for inode in inodes {
             self.rm_peer_file_entry(tree, inode, peer)?;
-            if let Err(StorageError::NotFound) = self.file_availability(inode) {
-                if let Some(parent_inode) = tree.parent(inode)? {
-                    // If the file has become unavailable because of
-                    // this removal, remove the file itself as well.
-                    self.rm_default_file_entry(tree, blobs, dirty, parent_inode, inode)?;
+            if let Some(entry) = self.get_at_inode(inode)? {
+                if self.file_availability(inode, &entry.hash)?.is_none() {
+                    if let Some(parent_inode) = tree.parent(inode)? {
+                        // If the file has become unavailable because of
+                        // this removal, remove the file itself as well.
+                        self.rm_default_file_entry(tree, blobs, dirty, parent_inode, inode)?;
+                    }
                 }
             }
         }
@@ -602,42 +621,32 @@ fn file_availability(
     cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
     inode: Inode,
     arena: Arena,
-) -> Result<FileAvailability, StorageError> {
-    let mut range = cache_table.range(CacheTableKey::range(inode))?;
-    let (default_key, default_entry) = range.next().ok_or(StorageError::NotFound)??;
-    if !matches!(default_key.value(), CacheTableKey::Default(_)) {
-        return Err(StorageError::NotFound);
-    }
-    let FileTableEntry {
-        size,
-        mtime,
-        path,
-        hash,
-        ..
-    } = default_entry.value().parse()?.expect_file()?;
-
-    let mut peers = vec![];
-    for entry in range {
+    hash: &Hash,
+) -> Result<Option<FileAvailability>, StorageError> {
+    let mut avail = None;
+    for entry in cache_table.range(CacheTableKey::range(inode))? {
         let entry = entry?;
         if let CacheTableKey::PeerCopy(_, peer) = entry.0.value() {
             let file_entry: FileTableEntry = entry.1.value().parse()?.expect_file()?;
-            if file_entry.hash == hash {
-                peers.push(peer);
+            if file_entry.hash == *hash {
+                avail
+                    .get_or_insert_with(|| FileAvailability {
+                        arena,
+                        path: file_entry.path,
+                        size: file_entry.size,
+                        hash: file_entry.hash,
+                        peers: vec![],
+                    })
+                    .peers
+                    .push(peer);
             }
         }
     }
-    if peers.is_empty() {
+    if avail.is_none() {
         log::warn!("[{arena}] No peer has hash {hash} for {inode}",);
-        return Err(StorageError::NotFound);
     }
 
-    Ok(FileAvailability {
-        arena: arena,
-        path,
-        metadata: FileMetadata { size, mtime },
-        hash,
-        peers,
-    })
+    Ok(avail)
 }
 
 /// Read directory contents for the given inode.
@@ -752,12 +761,6 @@ impl ArenaCache {
             read_only: false,
             mtime: cache.dir_mtime(inode)?,
         })
-    }
-
-    pub(crate) fn file_availability(&self, inode: Inode) -> Result<FileAvailability, StorageError> {
-        let txn = self.db.begin_read()?;
-        let cache = txn.read_cache()?;
-        cache.file_availability(inode)
     }
 
     pub(crate) fn readdir(
@@ -1073,6 +1076,8 @@ fn check_is_dir(
 #[cfg(test)]
 mod tests {
     use super::ArenaCache;
+    use crate::arena::arena_cache::CacheExt;
+    use crate::arena::arena_cache::CacheReadOperations;
     use crate::arena::blob::BlobExt;
     use crate::arena::db::ArenaDatabase;
     use crate::arena::dirty::DirtyReadOperations;
@@ -1083,7 +1088,7 @@ mod tests {
     use crate::arena::tree::TreeReadOperations;
     use crate::arena::types::DirMetadata;
     use crate::arena::types::HistoryTableEntry;
-    use crate::{FileMetadata, Inode, InodeAssignment, StorageError};
+    use crate::{Inode, InodeAssignment, StorageError};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Hash, Path, Peer, UnixTime};
@@ -1924,21 +1929,29 @@ mod tests {
             },
             None,
         )?;
-        let (inode, _) = acache.lookup(fixture.db.tree().root(), "file.txt")?;
-        let avail = acache.file_availability(inode)?;
+        let txn = fixture.db.begin_read()?;
+        let tree = txn.read_tree()?;
+        let cache = txn.read_cache()?;
+
+        let inode = tree.lookup(fixture.db.tree().root(), "file.txt")?.unwrap();
+        let avail = cache.file_availability(inode, &Hash([1u8; 32]))?.unwrap();
         assert_eq!(arena, avail.arena);
         assert_eq!(path, avail.path);
         // Since they're just independent additions, the cache chooses
         // the first one.
         assert_eq!(Hash([1u8; 32]), avail.hash);
-        assert_eq!(
-            FileMetadata {
-                size: 100,
-                mtime: test_time(),
-            },
-            avail.metadata
-        );
+        assert_eq!(100, avail.size,);
         assert_unordered::assert_eq_unordered!(vec![a, b], avail.peers);
+
+        assert_eq!(
+            vec![c],
+            cache
+                .file_availability(inode, &Hash([2u8; 32]))?
+                .unwrap()
+                .peers
+        );
+
+        assert_eq!(None, cache.file_availability(inode, &Hash([3u8; 32]))?);
 
         Ok(())
     }
@@ -2003,20 +2016,22 @@ mod tests {
             },
             None,
         )?;
-        let (inode, _) = acache.lookup(fixture.db.tree().root(), "file.txt")?;
-        let avail = acache.file_availability(inode)?;
+        let inode = acache.expect(&path)?;
+        {
+            let txn = fixture.db.begin_read()?;
+            let cache = txn.read_cache()?;
+            let entry = cache.get_at_inode(inode)?.unwrap();
 
-        //  Replace with old_hash=1 means that hash=2 is the most
-        //  recent one. This is the one chosen.
-        assert_eq!(Hash([2u8; 32]), avail.hash);
-        assert_eq!(
-            FileMetadata {
-                size: 200,
-                mtime: later_time(),
-            },
-            avail.metadata
-        );
-        assert_eq!(vec![b], avail.peers);
+            //  Replace with old_hash=1 means that hash=2 is the most
+            //  recent one. This is the one chosen.
+            assert_eq!(Hash([2u8; 32]), entry.hash);
+            assert_eq!(200, entry.size);
+            assert_eq!(later_time(), entry.mtime);
+            assert_eq!(
+                vec![b],
+                cache.file_availability(inode, &entry.hash)?.unwrap().peers
+            );
+        }
 
         // We reconnect to c, which has yet another version. Following
         // the hash chain, Hash 3 is now the newest version.
@@ -2046,10 +2061,31 @@ mod tests {
             },
             None,
         )?;
-        let acache = &fixture.acache;
-        let avail = acache.file_availability(inode)?;
-        assert_eq!(Hash([3u8; 32]), avail.hash);
-        assert_eq!(vec![c], avail.peers);
+        {
+            let txn = fixture.db.begin_read()?;
+            let cache = txn.read_cache()?;
+            let entry = cache.get_at_inode(inode)?.unwrap();
+
+            //  Replace with old_hash=1 means that hash=2 is the most
+            //  recent one. This is the one chosen.
+            assert_eq!(Hash([3u8; 32]), entry.hash);
+            assert_eq!(
+                vec![c],
+                cache.file_availability(inode, &entry.hash)?.unwrap().peers
+            );
+        }
+
+        {
+            let txn = fixture.db.begin_read()?;
+            let cache = txn.read_cache()?;
+            let entry = cache.get_at_inode(inode)?.unwrap();
+
+            assert_eq!(Hash([3u8; 32]), entry.hash);
+            assert_eq!(
+                vec![c],
+                cache.file_availability(inode, &entry.hash)?.unwrap().peers
+            );
+        }
 
         // Later on, b joins the party
         acache.update(
@@ -2066,9 +2102,17 @@ mod tests {
             None,
         )?;
 
-        let avail = acache.file_availability(inode)?;
-        assert_eq!(Hash([3u8; 32]), avail.hash);
-        assert_unordered::assert_eq_unordered!(vec![b, c], avail.peers);
+        {
+            let txn = fixture.db.begin_read()?;
+            let cache = txn.read_cache()?;
+            let entry = cache.get_at_inode(inode)?.unwrap();
+
+            assert_eq!(Hash([3u8; 32]), entry.hash);
+            assert_eq!(
+                vec![b, c],
+                cache.file_availability(inode, &entry.hash)?.unwrap().peers
+            );
+        }
 
         Ok(())
     }
@@ -2134,9 +2178,17 @@ mod tests {
             None,
         )?;
         let (inode, _) = acache.lookup(fixture.db.tree().root(), "file.txt")?;
-        let avail = acache.file_availability(inode)?;
-        assert_eq!(vec![a], avail.peers);
-        assert_eq!(Hash([3u8; 32]), avail.hash);
+        {
+            let txn = fixture.db.begin_read()?;
+            let cache = txn.read_cache()?;
+            let entry = cache.get_at_inode(inode)?.unwrap();
+
+            assert_eq!(Hash([3u8; 32]), entry.hash);
+            assert_eq!(
+                vec![a],
+                cache.file_availability(inode, &entry.hash)?.unwrap().peers
+            );
+        }
 
         acache.update(a, Notification::CatchupStart(arena), None)?;
         acache.update(
@@ -2149,10 +2201,6 @@ mod tests {
         )?;
         // We've lost the single peer that had the tracked version.
         // This is handled as if A had reported that file as deleted.
-        assert!(matches!(
-            acache.file_availability(inode),
-            Err(StorageError::NotFound)
-        ));
         assert!(matches!(
             acache.file_metadata(inode),
             Err(StorageError::NotFound)
@@ -2297,23 +2345,39 @@ mod tests {
             None,
         )?;
 
+        let txn = fixture.db.begin_read()?;
+        let tree = txn.read_tree()?;
+        let cache = txn.read_cache()?;
+
         // File1 should have been deleted, since it was only on peer1,
-        assert!(matches!(acache.expect(&file1), Err(StorageError::NotFound)));
+        assert!(cache.get(&tree, &file1)?.is_none());
 
-        // File2 should still be available, from peer2
-        let file2_inode = acache.expect(&file2)?;
-        let file2_availability = acache.file_availability(file2_inode)?;
-        assert!(file2_availability.peers.contains(&peer2));
+        let file2_inode = tree.resolve(&file2)?.unwrap();
+        assert_eq!(
+            vec![peer1, peer2],
+            cache
+                .file_availability(file2_inode, &test_hash())?
+                .unwrap()
+                .peers
+        );
 
-        // File3 should still be available, from peer3
-        let file3_inode = acache.expect(&file3)?;
-        let file3_availability = acache.file_availability(file3_inode)?;
-        assert!(file3_availability.peers.contains(&peer3));
+        let file3_inode = tree.resolve(&file3)?.unwrap();
+        assert_eq!(
+            vec![peer3],
+            cache
+                .file_availability(file3_inode, &test_hash())?
+                .unwrap()
+                .peers
+        );
 
-        // File4 should still be available, from peer1
-        let file4_inode = acache.expect(&file4)?;
-        let file4_availability = acache.file_availability(file4_inode)?;
-        assert!(file4_availability.peers.contains(&peer1));
+        let file4_inode = tree.resolve(&file4)?.unwrap();
+        assert_eq!(
+            vec![peer1],
+            cache
+                .file_availability(file4_inode, &test_hash())?
+                .unwrap()
+                .peers
+        );
 
         Ok(())
     }
@@ -2442,28 +2506,4 @@ mod tests {
 
         Ok(())
     }
-
-    // #[tokio::test]
-    // async fn unlink_updates_parent_directory_mtime() -> anyhow::Result<()> {
-    //     let fixture = Fixture::setup_with_arena(test_arena()).await?;
-    //     let acache = &fixture.acache;
-    //     let file_path = Path::parse("file.txt")?;
-    //     let mtime = test_time();
-
-    //     // Add a file to the cache
-    //     fixture.add_to_cache(&file_path, 100, mtime)?;
-    //     let arena_root = fixture.db.tree().root();
-
-    //     // Get initial directory mtime
-    //     let initial_mtime = acache.dir_metadata(arena_root)?.mtime;
-
-    //     // Unlink the file
-    //     acache.unlink(arena_root, "file.txt")?;
-
-    //     // Verify parent directory mtime was updated
-    //     let updated_mtime = acache.dir_metadata(arena_root)?.mtime;
-    //     assert!(updated_mtime > initial_mtime);
-
-    //     Ok(())
-    // }
 }

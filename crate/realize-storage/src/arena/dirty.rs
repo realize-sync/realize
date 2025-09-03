@@ -320,12 +320,15 @@ fn next_dirty(
     log_table: &impl ReadableTable<u64, Inode>,
     start_counter: u64,
 ) -> Result<Option<(Inode, u64)>, StorageError> {
+    log::debug!("next dirty({start_counter})");
     for entry in log_table.range(start_counter..)? {
         let (key, value) = entry?;
         let counter = key.value();
         let inode = value.value();
+        log::debug!("-> {counter} {inode}");
         return Ok(Some((inode, counter)));
     }
+    log::debug!("-> None");
     Ok(None)
 }
 

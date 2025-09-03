@@ -3,10 +3,11 @@ use super::dirty::WritableOpenDirty;
 use super::mark::MarkReadOperations;
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
 use super::types::{BlobTableEntry, LocalAvailability, LruQueueId, Mark, QueueTableEntry};
-use crate::StorageError;
+use crate::arena::arena_cache::CacheReadOperations;
 use crate::types::Inode;
 use crate::utils::hash;
 use crate::utils::holder::Holder;
+use crate::{FileAvailability, StorageError};
 use priority_queue::PriorityQueue;
 use realize_types::Arena;
 use realize_types::{ByteRange, ByteRanges, Hash};
@@ -1213,6 +1214,24 @@ impl Blob {
         self.info.local_availability()
     }
 
+    /// Return the information needed for fetching data for that blob
+    /// from remote peers.
+    ///
+    /// Returns None if the data isn't available from
+    /// any remote peers. The returned [FileAvailability] is guaranteed to have at least one peer.
+    pub async fn remote_availability(&self) -> Result<Option<FileAvailability>, StorageError> {
+        let db = Arc::clone(&self.db);
+        let inode = self.info.inode;
+        let hash = self.info.hash.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let txn = db.begin_read()?;
+
+            txn.read_cache()?.file_availability(inode, &hash)
+        })
+        .await?
+    }
+
     /// Get the hash of the corresponding file.
     pub fn hash(&self) -> &Hash {
         &self.info.hash
@@ -1333,7 +1352,6 @@ impl Blob {
             .map(|r| min(requested_len, (r.end - offset) as usize))
     }
 }
-
 impl Drop for Blob {
     fn drop(&mut self) {
         let blobs = self.db.blobs();

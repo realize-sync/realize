@@ -456,7 +456,7 @@ impl ByteConvertible<MarkTableEntry> for MarkTableEntry {
 pub struct FileAvailability {
     pub arena: Arena,
     pub path: Path,
-    pub metadata: FileMetadata,
+    pub size: u64,
     pub hash: Hash,
     pub peers: Vec<Peer>,
 }
@@ -794,6 +794,8 @@ pub struct FileMetadata {
     ///
     /// This is the duration since the start of the UNIX epoch.
     pub mtime: UnixTime,
+    /// File version.
+    pub hash: Hash,
 }
 
 /// The metadata of a directory.

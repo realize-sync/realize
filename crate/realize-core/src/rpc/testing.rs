@@ -17,9 +17,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::task::LocalSet;
 use tokio::time::timeout;
-use tokio_retry::strategy::FixedInterval;
 
 /// Create up to 3 inter-connected [Household]s for testing, with one
 /// arena.
@@ -179,64 +179,36 @@ impl HouseholdFixture {
         hash: &Hash,
     ) -> anyhow::Result<()> {
         let cache = self.cache(peer)?;
-
-        let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
         let arena = HouseholdFixture::test_arena();
         let path = Path::parse(filename)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let delay = Duration::from_millis(50);
 
         // First, wait for the file to appear in the cache
-        let inode = loop {
-            match cache.expect(arena, &path).await {
-                Ok(inode) => break inode,
-                Err(_) => {
-                    if let Some(delay) = retry.next() {
-                        tokio::time::sleep(delay).await;
-                    } else {
-                        panic!("[arena]/{filename} was never added to the cache of {peer}");
-                    }
-                }
-            }
-        };
+        while cache.resolve(arena, &path).await?.is_none() && Instant::now() < deadline {
+            tokio::time::sleep(delay).await;
+        }
+        let inode = cache
+            .resolve(arena, &path)
+            .await?
+            .expect("[{arena}]/{path}");
+        while cache.file_metadata(inode).await.is_err() && Instant::now() < deadline {
+            tokio::time::sleep(delay).await;
+        }
+        assert!(
+            cache.file_metadata(inode).await.is_ok(),
+            "[arena]/{filename} never appeared in the cache of {peer}"
+        );
 
         // Then, wait for the file to have the expected hash
-        let goal = Some(hash.clone());
-        while cache.file_availability(inode).await.ok().map(|e| e.hash) != goal {
-            if let Some(delay) = retry.next() {
-                tokio::time::sleep(delay).await;
-            } else {
-                panic!(
-                    "[arena]/{filename} in the cache of {peer} never became {} (current: {})",
-                    *hash,
-                    cache.file_availability(inode).await?.hash
-                );
-            }
+        while cache.file_metadata(inode).await?.hash != *hash && Instant::now() < deadline {
+            tokio::time::sleep(delay).await;
         }
-
-        Ok(())
-    }
-
-    pub async fn wait_for_file_version_in_cache(
-        &self,
-        peer: Peer,
-        filename: &str,
-        hash: &Hash,
-    ) -> anyhow::Result<()> {
-        let cache = &self.cache(peer)?;
-
-        let mut retry = FixedInterval::new(Duration::from_millis(50)).take(100);
-        let arena = HouseholdFixture::test_arena();
-        let inode = cache.expect(arena, &Path::parse(filename)?).await?;
-        while cache.file_availability(inode).await?.hash != *hash {
-            if let Some(delay) = retry.next() {
-                tokio::time::sleep(delay).await;
-            } else {
-                panic!(
-                    "[arena]/{filename} never became {} (current: {})",
-                    *hash,
-                    cache.file_availability(inode).await?.hash
-                );
-            }
-        }
+        assert_eq!(
+            *hash,
+            cache.file_metadata(inode).await?.hash,
+            "[arena]/{filename} {hash} never appeared the cache of {peer}"
+        );
 
         Ok(())
     }
