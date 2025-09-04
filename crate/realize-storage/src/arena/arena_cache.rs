@@ -8,6 +8,7 @@ use super::types::{
     CacheTableEntry, CacheTableKey, DirtableEntry, FileAvailability, FileMetadata, FileTableEntry,
 };
 use crate::arena::history::WritableOpenHistory;
+use crate::arena::index;
 use crate::arena::notifier::{Notification, Progress};
 use crate::arena::types::DirMetadata;
 use crate::utils::holder::Holder;
@@ -247,12 +248,10 @@ impl<'a> WritableOpenCache<'a> {
         blobs: &mut WritableOpenBlob,
         history: &mut WritableOpenHistory,
         dirty: &mut WritableOpenDirty,
-        parent_inode: Inode,
+        parent: Inode,
         name: &str,
     ) -> Result<(), StorageError> {
-        let inode = tree
-            .lookup(parent_inode, name)?
-            .ok_or(StorageError::NotFound)?;
+        let inode = tree.lookup(parent, name)?.ok_or(StorageError::NotFound)?;
         let e = get_file_entry(&self.table, inode, None)?.ok_or(StorageError::NotFound)?;
         log::debug!(
             "[{}]@local Local removal of \"{}\" inode {inode} {}",
@@ -260,8 +259,34 @@ impl<'a> WritableOpenCache<'a> {
             e.path,
             e.hash
         );
-        self.rm_default_file_entry(tree, blobs, dirty, parent_inode, inode)?;
+        self.rm_default_file_entry(tree, blobs, dirty, parent, inode)?;
         history.report_removed(&e.path, &e.hash)?;
+
+        Ok(())
+    }
+
+    /// Branch a file to another location in the tree.
+    pub(crate) fn branch(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
+        history: &mut WritableOpenHistory,
+        dirty: &mut WritableOpenDirty,
+        source: Inode,
+        parent: Inode,
+        name: &str,
+    ) -> Result<(), StorageError> {
+        let mut entry = self.get_at_inode_or_err(source)?;
+        let dest = tree.setup_name(parent, name)?;
+        entry.branched_from = Some(source);
+        let old_hash = self.get_at_inode(dest)?.map(|e| e.hash);
+        self.write_default_file_entry(tree, blobs, dirty, dest, &entry)?;
+
+        if let (Some(source_path), Some(dest_path)) =
+            (tree.backtrack(source)?, tree.backtrack(dest)?)
+        {
+            history.request_branch(&source_path, &dest_path, &entry.hash, old_hash.as_ref())?;
+        }
 
         Ok(())
     }
@@ -624,21 +649,33 @@ fn file_availability(
     hash: &Hash,
 ) -> Result<Option<FileAvailability>, StorageError> {
     let mut avail = None;
-    for entry in cache_table.range(CacheTableKey::range(inode))? {
-        let entry = entry?;
-        if let CacheTableKey::PeerCopy(_, peer) = entry.0.value() {
-            let file_entry: FileTableEntry = entry.1.value().parse()?.expect_file()?;
-            if file_entry.hash == *hash {
-                avail
-                    .get_or_insert_with(|| FileAvailability {
-                        arena,
-                        path: file_entry.path,
-                        size: file_entry.size,
-                        hash: file_entry.hash,
-                        peers: vec![],
-                    })
-                    .peers
-                    .push(peer);
+    let mut next = Some(inode);
+    while let Some(inode) = next
+        && avail.is_none()
+    {
+        for entry in cache_table.range(CacheTableKey::range(inode))? {
+            let entry = entry?;
+            match entry.0.value() {
+                CacheTableKey::PeerCopy(_, peer) => {
+                    let file_entry: FileTableEntry = entry.1.value().parse()?.expect_file()?;
+                    if file_entry.hash == *hash {
+                        avail
+                            .get_or_insert_with(|| FileAvailability {
+                                arena,
+                                path: file_entry.path,
+                                size: file_entry.size,
+                                hash: file_entry.hash,
+                                peers: vec![],
+                            })
+                            .peers
+                            .push(peer);
+                    }
+                }
+                CacheTableKey::Default(_) => {
+                    let file_entry: FileTableEntry = entry.1.value().parse()?.expect_file()?;
+                    next = file_entry.branched_from;
+                }
+                _ => {}
             }
         }
     }
@@ -779,7 +816,7 @@ impl ArenaCache {
         peers.progress(peer)
     }
 
-    pub(crate) fn unlink(&self, parent_inode: Inode, name: &str) -> Result<(), StorageError> {
+    pub(crate) fn unlink(&self, parent: Inode, name: &str) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
         {
             let mut tree = txn.write_tree()?;
@@ -793,7 +830,36 @@ impl ArenaCache {
                 &mut blobs,
                 &mut history,
                 &mut dirty,
-                parent_inode,
+                parent,
+                name,
+            )?;
+        }
+        txn.commit()?;
+
+        Ok(())
+    }
+
+    pub(crate) fn branch(
+        &self,
+        source: Inode,
+        parent: Inode,
+        name: &str,
+    ) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut tree = txn.write_tree()?;
+            let mut blobs = txn.write_blobs()?;
+            let mut history = txn.write_history()?;
+            let mut dirty = txn.write_dirty()?;
+            let mut cache = txn.write_cache()?;
+
+            cache.branch(
+                &mut tree,
+                &mut blobs,
+                &mut history,
+                &mut dirty,
+                source,
+                parent,
                 name,
             )?;
         }
@@ -808,10 +874,8 @@ impl ArenaCache {
         notification: Notification,
         index_root: Option<&std::path::Path>,
     ) -> Result<(), StorageError> {
-        log::trace!(
-            "[{arena}]@{peer} Notification: {notification:?}",
-            arena = self.arena
-        );
+        let arena = self.arena;
+        log::trace!("[{arena}]@{peer} Notification: {notification:?}",);
         // UnrealCache::update, is responsible for dispatching properly
         assert_eq!(self.arena, notification.arena());
 
@@ -887,6 +951,33 @@ impl ArenaCache {
                     cache.catchup_complete(&mut tree, &mut blobs, &mut dirty, peer)?
                 }
                 Notification::Connected { uuid, .. } => peers.connected(peer, uuid)?,
+                Notification::Branch {
+                    source,
+                    dest,
+                    hash,
+                    old_hash,
+                    ..
+                } => {
+                    if let Some(index_root) = index_root {
+                        let index = txn.read_index()?;
+                        if index::branch(
+                            &index,
+                            &tree,
+                            index_root,
+                            &source,
+                            &dest,
+                            &hash,
+                            old_hash.as_ref(),
+                        )? {
+                            log::debug!("[{arena}] branched {source} {hash} -> {dest}");
+                        } else {
+                            log::debug!(
+                                "[{arena}] wrong versions; ignored:
+  branch {source} {hash} -> {dest} {old_hash:?}"
+                            )
+                        }
+                    }
+                }
             }
         }
         txn.commit()?;
@@ -1076,6 +1167,7 @@ fn check_is_dir(
 #[cfg(test)]
 mod tests {
     use super::ArenaCache;
+    use crate::FileMetadata;
     use crate::arena::arena_cache::CacheExt;
     use crate::arena::arena_cache::CacheReadOperations;
     use crate::arena::blob::BlobExt;
@@ -1088,6 +1180,7 @@ mod tests {
     use crate::arena::tree::TreeReadOperations;
     use crate::arena::types::DirMetadata;
     use crate::arena::types::HistoryTableEntry;
+    use crate::utils::hash;
     use crate::{Inode, InodeAssignment, StorageError};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
@@ -2503,6 +2596,100 @@ mod tests {
             HistoryTableEntry::Remove(file_path, test_hash()),
             history_entry
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn branch() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let dir_path = Path::parse("mydir")?;
+        let source_path = Path::parse("mydir/source")?;
+        let dest_path = Path::parse("mydir/dest")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        let peer1 = Peer::from("peer1");
+        let peer2 = Peer::from("peer2");
+        let hash = hash::digest("foobar");
+        cache.notify_added(
+            &mut tree,
+            &mut blobs,
+            &mut dirty,
+            peer1,
+            source_path.clone(),
+            test_time(),
+            6,
+            hash.clone(),
+        )?;
+        let source_inode = tree.expect(&source_path)?;
+        let dir_inode = tree.expect(&dir_path)?;
+
+        dirty.delete_range(0, 999)?; // clear dirty
+
+        cache.branch(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            source_inode,
+            dir_inode,
+            "dest",
+        )?;
+
+        let dest_inode = tree.expect(&dest_path)?;
+        assert_eq!(
+            Some(dest_inode),
+            dirty.next_dirty(0)?.map(|(inode, _)| inode)
+        );
+        let (_, history_entry) = history.history(0..).last().unwrap().unwrap();
+        assert_eq!(
+            HistoryTableEntry::Branch(source_path.clone(), dest_path.clone(), hash.clone(), None),
+            history_entry
+        );
+
+        // Dest file exists and can be downloaded from peer1, using source path
+        assert_eq!(
+            FileMetadata {
+                size: 6,
+                mtime: test_time(),
+                hash: hash.clone(),
+            },
+            cache.file_metadata(dest_inode)?
+        );
+        let avail = cache.file_availability(dest_inode, &hash)?.unwrap();
+        assert_eq!(source_path, avail.path);
+        assert_eq!(vec![peer1], avail.peers);
+
+        cache.notify_added(
+            &mut tree,
+            &mut blobs,
+            &mut dirty,
+            peer2,
+            dest_path.clone(),
+            test_time(),
+            6,
+            hash.clone(),
+        )?;
+
+        // Dest file exists and can now be downloaded normally from peer2
+        assert_eq!(
+            FileMetadata {
+                size: 6,
+                mtime: test_time(),
+                hash: hash.clone(),
+            },
+            cache.file_metadata(dest_inode)?
+        );
+        let avail = cache.file_availability(dest_inode, &hash)?.unwrap();
+        assert_eq!(dest_path, avail.path);
+        assert_eq!(hash, avail.hash);
+        assert_eq!(vec![peer2], avail.peers);
 
         Ok(())
     }

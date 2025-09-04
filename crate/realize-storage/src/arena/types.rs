@@ -254,6 +254,9 @@ pub enum HistoryTableEntry {
     ///
     /// The hash is the dropped hash version.
     Drop(realize_types::Path, Hash),
+
+    /// The file was branched from another file.
+    Branch(realize_types::Path, realize_types::Path, Hash, Option<Hash>),
 }
 
 impl NamedType for HistoryTableEntry {
@@ -283,6 +286,16 @@ impl ByteConvertible<HistoryTableEntry> for HistoryTableEntry {
                 parse_path(msg.get_path()?)?,
                 parse_hash(msg.get_old_hash()?)?,
             )),
+            history_capnp::history_table_entry::Kind::Branch => Ok(HistoryTableEntry::Branch(
+                parse_path(msg.get_path()?)?,
+                parse_path(msg.get_dest_path()?)?,
+                parse_hash(msg.get_hash()?)?,
+                if msg.get_old_hash()?.is_empty() {
+                    None
+                } else {
+                    Some(parse_hash(msg.get_old_hash()?)?)
+                },
+            )),
         }
     }
 
@@ -310,6 +323,15 @@ impl ByteConvertible<HistoryTableEntry> for HistoryTableEntry {
                 builder.set_kind(history_capnp::history_table_entry::Kind::Drop);
                 builder.set_path(path.as_str());
                 builder.set_old_hash(&old_hash.0);
+            }
+            HistoryTableEntry::Branch(path, dest_path, hash, old_hash) => {
+                builder.set_kind(history_capnp::history_table_entry::Kind::Branch);
+                builder.set_path(path.as_str());
+                builder.set_dest_path(dest_path.as_str());
+                builder.set_hash(&hash.0);
+                if let Some(old_hash) = old_hash {
+                    builder.set_old_hash(&old_hash.0);
+                }
             }
         }
 
@@ -619,6 +641,8 @@ pub struct FileTableEntry {
     // If set, a version is known to exist that replaces the version
     // in this entry.
     pub outdated_by: Option<Hash>,
+    /// Inode this specific version was branched from
+    pub branched_from: Option<Inode>,
 }
 
 impl FileTableEntry {
@@ -629,6 +653,7 @@ impl FileTableEntry {
             path,
             hash,
             outdated_by: None,
+            branched_from: None,
         }
     }
 }
@@ -694,6 +719,7 @@ fn fill_file_table_entry(
     mtime.set_nsecs(entry.mtime.subsec_nanos());
     builder.set_path(entry.path.as_str());
     builder.set_hash(&entry.hash.0);
+    builder.set_branched_from(Inode::from_optional(entry.branched_from));
 
     if let Some(hash) = &entry.outdated_by {
         builder.set_outdated_by(&hash.0)
@@ -716,6 +742,7 @@ fn parse_file_table_entry(
         path: Path::parse(msg.get_path()?.to_str()?)?,
         hash: parse_hash(msg.get_hash()?)?,
         outdated_by,
+        branched_from: Inode::as_optional(msg.get_branched_from()),
     })
 }
 
@@ -1000,6 +1027,7 @@ mod tests {
             path: Path::parse("foo/bar.txt")?,
             hash: Hash([0xa1u8; 32]),
             outdated_by: Some(Hash([3u8; 32])),
+            branched_from: Some(Inode(123)),
         };
 
         assert_eq!(
@@ -1209,6 +1237,7 @@ mod tests {
             path: Path::parse("foo/bar.txt")?,
             hash: Hash([0xa1u8; 32]),
             outdated_by: Some(Hash([3u8; 32])),
+            branched_from: None,
         };
 
         let entry = CacheTableEntry::File(file_entry);
@@ -1246,6 +1275,7 @@ mod tests {
             path: Path::parse("test/file.txt")?,
             hash: Hash([0x42u8; 32]),
             outdated_by: None,
+            branched_from: None,
         };
 
         let dir_entry = DirtableEntry {

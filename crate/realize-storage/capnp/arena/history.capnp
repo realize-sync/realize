@@ -28,6 +28,9 @@ struct HistoryTableEntry {
     # File has been dropped from this peer,
     # but should remain available elsewhere.
     drop @3;
+
+    # A request to branch a file from source to dest.
+    branch @4;
   }
 
   path @1: Text;
@@ -35,6 +38,12 @@ struct HistoryTableEntry {
   # Hash of the content that was removed
   # (kind=remove) or replaced (kind=replace).
   oldHash @2: Data;
+
+  # For branch operations: destination path
+  destPath @3: Text;
+
+  # For branch operations: hash of the content to branch
+  hash @4: Data;
 }
 
 # Time as duration since UNIX_EPOCH.

@@ -137,6 +137,20 @@ pub enum Notification {
         /// generate [Progress].
         uuid: Uuid,
     },
+
+    /// `source` version `hash` should be branched to `dest`,
+    /// replacing `dest` old content `old_hash`.
+    ///
+    /// This a request made to the owner(s) of source. It doesn't
+    /// imply that dest is available for download from the sender of
+    /// the notification.
+    Branch {
+        arena: Arena,
+        source: Path,
+        dest: Path,
+        hash: Hash,
+        old_hash: Option<Hash>,
+    },
 }
 
 impl Notification {
@@ -150,6 +164,7 @@ impl Notification {
             Notification::Catchup { arena, .. } => *arena,
             Notification::CatchupComplete { arena, .. } => *arena,
             Notification::Connected { arena, .. } => *arena,
+            Notification::Branch { arena, .. } => *arena,
         }
     }
     pub fn path(&self) -> Option<&Path> {
@@ -162,6 +177,7 @@ impl Notification {
             Notification::Catchup { path, .. } => Some(path),
             Notification::CatchupComplete { .. } => None,
             Notification::Connected { .. } => None,
+            Notification::Branch { source, .. } => Some(source),
         }
     }
     pub fn index(&self) -> Option<u64> {
@@ -174,6 +190,7 @@ impl Notification {
             Notification::Catchup { .. } => None,
             Notification::CatchupComplete { index, .. } => Some(*index),
             Notification::Connected { .. } => None,
+            Notification::Branch { .. } => None,
         }
     }
 }
@@ -374,6 +391,15 @@ async fn send_notifications(
                         old_hash,
                     })
                 }
+            }
+            HistoryTableEntry::Branch(source, dest, hash, old_hash) => {
+                Some(Notification::Branch {
+                    arena: db.arena(),
+                    source,
+                    dest,
+                    hash,
+                    old_hash,
+                })
             }
         };
 
@@ -738,6 +764,59 @@ mod tests {
             ],
             fixture.consume(rx).await?
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn branch_notification() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+
+        // Create a source file
+        let source = fixture.add("source", "source content").await?;
+        let source_hash = hash::digest("source content");
+
+        // Create a destination file
+        let dest = fixture.add("dest", "dest content").await?;
+        let dest_hash = hash::digest("dest content");
+
+        // Subscribe to notifications
+        let mut rx = fixture.subscribe().await?;
+
+        // Wait for catchup start (Connected was already consumed by subscribe)
+        let catchup_start = next(&mut rx, "catchup start").await?;
+        assert!(matches!(catchup_start, Notification::CatchupStart(_)));
+
+        // Wait for catchup notifications (we have 2 files: source and dest)
+        let catchup1 = next(&mut rx, "catchup 1").await?;
+        assert!(matches!(catchup1, Notification::Catchup { .. }));
+        let catchup2 = next(&mut rx, "catchup 2").await?;
+        assert!(matches!(catchup2, Notification::Catchup { .. }));
+
+        // Wait for catchup complete
+        let catchup_complete = next(&mut rx, "catchup complete").await?;
+        assert!(matches!(catchup_complete, Notification::CatchupComplete { .. }));
+
+        // Now request a branch operation
+        let txn = fixture.db.begin_write()?;
+        {
+            let mut history = txn.write_history()?;
+            history.request_branch(&source, &dest, &source_hash, Some(&dest_hash))?;
+        }
+        txn.commit()?;
+
+        // Wait for the branch notification
+        let branch_notification = next(&mut rx, "branch").await?;
+        match branch_notification {
+            Notification::Branch { arena, source: src, dest: dst, hash, old_hash } => {
+                assert_eq!(arena, test_arena());
+                assert_eq!(src, source);
+                assert_eq!(dst, dest);
+                assert_eq!(hash, source_hash);
+                assert_eq!(old_hash, Some(dest_hash));
+            }
+            _ => panic!("Expected Branch notification, got {:?}", branch_notification),
+        }
 
         Ok(())
     }

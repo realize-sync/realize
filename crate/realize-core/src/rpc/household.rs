@@ -1253,6 +1253,21 @@ async fn do_notify(
                     uuid: parse_uuid(connected.get_uuid()?),
                 }
             }
+            notification::Which::Branch(branch) => {
+                let branch = branch?;
+
+                Notification::Branch {
+                    arena: parse_arena(branch.get_arena()?)?,
+                    source: parse_path(branch.get_source()?)?,
+                    dest: parse_path(branch.get_dest()?)?,
+                    hash: parse_hash(branch.get_hash()?)?,
+                    old_hash: if branch.has_old_hash() {
+                        Some(parse_hash(branch.get_old_hash()?)?)
+                    } else {
+                        None
+                    },
+                }
+            }
         });
     }
 
@@ -1358,6 +1373,23 @@ fn fill_catchup(
     fill_time(builder.init_mtime(), mtime);
 }
 
+fn fill_branch(
+    mut builder: super::store_capnp::branch::Builder<'_>,
+    arena: Arena,
+    source: &realize_types::Path,
+    dest: &realize_types::Path,
+    hash: &realize_types::Hash,
+    old_hash: Option<&realize_types::Hash>,
+) {
+    builder.set_arena(arena.as_str());
+    builder.set_source(source.as_str());
+    builder.set_dest(dest.as_str());
+    builder.set_hash(&hash.0);
+    if let Some(old_hash) = old_hash {
+        builder.set_old_hash(&old_hash.0);
+    }
+}
+
 fn fill_time(
     mut mtime_builder: super::store_capnp::time::Builder<'_>,
     mtime: &realize_types::UnixTime,
@@ -1448,6 +1480,21 @@ fn fill_notification(notif: &Notification, notif_builder: notification::Builder<
             builder.set_arena(arena.as_str());
             fill_uuid(builder.init_uuid(), &uuid);
         }
+
+        Notification::Branch {
+            arena,
+            source,
+            dest,
+            hash,
+            old_hash,
+        } => fill_branch(
+            notif_builder.init_branch(),
+            *arena,
+            source,
+            dest,
+            hash,
+            old_hash.as_ref(),
+        )
     }
 }
 

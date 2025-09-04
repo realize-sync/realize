@@ -130,6 +130,7 @@ struct Notification {
     catchup @4: Catchup;
     catchupComplete @5: CatchupComplete;
     connected @6: Connected;
+    branch @8: Branch;
   }
 }
 
@@ -179,6 +180,14 @@ struct CatchupComplete {
 struct Connected {
   arena @0: Text;
   uuid @1: Uuid;
+}
+
+struct Branch {
+  arena @0: Text;
+  source @1: Text;
+  dest @2: Text;
+  hash @3: Data;
+  oldHash @4: Data;
 }
 
 struct Time {
