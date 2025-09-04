@@ -9,6 +9,7 @@ use super::types::{
 use super::update;
 use crate::arena::history::WritableOpenHistory;
 use crate::arena::notifier::{Notification, Progress};
+use crate::arena::tree;
 use crate::arena::types::DirMetadata;
 use crate::utils::holder::Holder;
 use crate::{Blob, InodeAssignment, LocalAvailability};
@@ -42,7 +43,7 @@ pub(crate) trait CacheReadOperations {
         &self,
         tree: &impl TreeReadOperations,
         inode: Inode,
-    ) -> Result<Vec<(String, Inode, InodeAssignment)>, StorageError>;
+    ) -> impl Iterator<Item = Result<(String, Inode, InodeAssignment), StorageError>>;
 
     /// Get the default file entry for the given inode.
     fn get_at_inode(&self, inode: Inode) -> Result<Option<FileTableEntry>, StorageError>;
@@ -100,8 +101,8 @@ where
         &self,
         tree: &impl TreeReadOperations,
         inode: Inode,
-    ) -> Result<Vec<(String, Inode, InodeAssignment)>, StorageError> {
-        readdir(&self.table, tree, inode)
+    ) -> impl Iterator<Item = Result<(String, Inode, InodeAssignment), StorageError>> {
+        ReadDirIterator::new(&self.table, tree, inode)
     }
 
     fn get_at_inode(&self, inode: Inode) -> Result<Option<FileTableEntry>, StorageError> {
@@ -139,8 +140,8 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         &self,
         tree: &impl TreeReadOperations,
         inode: Inode,
-    ) -> Result<Vec<(String, Inode, InodeAssignment)>, StorageError> {
-        readdir(&self.table, tree, inode)
+    ) -> impl Iterator<Item = Result<(String, Inode, InodeAssignment), StorageError>> {
+        ReadDirIterator::new(&self.table, tree, inode)
     }
 
     fn get_at_inode(&self, inode: Inode) -> Result<Option<FileTableEntry>, StorageError> {
@@ -689,25 +690,47 @@ fn file_availability(
     Ok(avail)
 }
 
-/// Read directory contents for the given inode.
-fn readdir(
-    cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
-    tree: &impl TreeReadOperations,
-    inode: Inode,
-) -> Result<Vec<(String, Inode, InodeAssignment)>, StorageError> {
-    check_is_dir(cache_table, inode)?;
+struct ReadDirIterator<'a, 'b, T> {
+    table: &'a T,
+    iter: tree::ReadDirIterator<'b>,
+}
 
-    // A Vec is not ideal, but redb iterators are bound to the
-    // transaction; we must collect the results.
-    let mut entries = vec![];
-    for entry in tree.readdir(inode) {
-        let (name, inode) = entry?;
-        if let Some(assignment) = inode_assignment(cache_table, inode)? {
-            entries.push((name, inode, assignment));
+impl<'a, 'b, T> ReadDirIterator<'a, 'b, T>
+where
+    T: ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+{
+    fn new(table: &'a T, tree: &'b impl TreeReadOperations, inode: Inode) -> Self {
+        ReadDirIterator {
+            table,
+            iter: match check_is_dir(table, inode) {
+                Err(err) => tree::ReadDirIterator::failed(err),
+                Ok(_) => tree.readdir_inode(inode),
+            },
         }
     }
+}
 
-    Ok(entries)
+impl<'a, 'b, T> Iterator for ReadDirIterator<'a, 'b, T>
+where
+    T: ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+{
+    type Item = Result<(String, Inode, InodeAssignment), StorageError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(entry) = self.iter.next() {
+            match entry {
+                Err(err) => return Some(Err(err)),
+                Ok((name, inode)) => {
+                    match inode_assignment(self.table, inode) {
+                        Err(err) => return Some(Err(err)),
+                        Ok(Some(assignment)) => return Some(Ok((name, inode, assignment))),
+                        Ok(None) => {} // not in the cache; skip
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 /// A per-arena cache of remote files.
@@ -810,7 +833,7 @@ impl ArenaCache {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
-        cache.readdir(&tree, inode)
+        cache.readdir(&tree, inode).collect()
     }
 
     pub(crate) fn peer_progress(&self, peer: Peer) -> Result<Option<Progress>, StorageError> {
