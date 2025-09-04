@@ -27,6 +27,7 @@ pub mod notifier;
 mod peer;
 mod tree;
 pub mod types;
+mod update;
 pub mod watcher;
 
 /// Gives access to arena-specific stores and functions.
