@@ -497,12 +497,7 @@ impl<'a> WritableOpenCache<'a> {
 
         // Update the parent modification time, as removing an
         // entry modifies it.
-        let parent_dir_entry = DirtableEntry {
-            mtime: UnixTime::now(),
-        };
-        let parent_dir_holder = Holder::with_content(CacheTableEntry::Dir(parent_dir_entry))?;
-        self.table
-            .insert(CacheTableKey::Default(parent_inode), parent_dir_holder)?;
+        write_dir_mtime(&mut self.table, tree, parent_inode, UnixTime::now())?;
 
         Ok(())
     }
@@ -604,7 +599,9 @@ pub(crate) fn init(
         .get(CacheTableKey::Default(root_inode))?
         .is_none()
     {
-        // Assign root mtime to initial startup time.
+        // Exceptionally not using write_dir_mtime and not going
+        // through tree because , arena roots aren't refcounted by
+        // tree and are never deleted.
         cache_table.insert(
             CacheTableKey::Default(root_inode),
             Holder::with_content(CacheTableEntry::Dir(DirtableEntry {
@@ -984,11 +981,7 @@ where
     let file_inode = tree.setup_name(parent_inode, path.name())?;
 
     // Update the parent directory mtime since we're adding a file to it
-    let parent_dir_entry = DirtableEntry {
-        mtime: UnixTime::now(),
-    };
-    let parent_dir_holder = Holder::with_content(CacheTableEntry::Dir(parent_dir_entry))?;
-    cache_table.insert(CacheTableKey::Default(parent_inode), parent_dir_holder)?;
+    write_dir_mtime(cache_table, tree, parent_inode, UnixTime::now())?;
 
     Ok((parent_inode, file_inode))
 }
@@ -1001,29 +994,34 @@ fn setup_dir(
 ) -> Result<Inode, StorageError> {
     let inode = tree.setup_name(parent_inode, name)?;
 
-    let dir_entry = DirtableEntry {
-        mtime: UnixTime::now(),
-    };
-    let dir_holder = Holder::with_content(CacheTableEntry::Dir(dir_entry))?;
     if cache_table.get(CacheTableKey::Default(inode))?.is_none() {
-        // new directory; assign its mtime
-        cache_table.insert(CacheTableKey::Default(inode), dir_holder.borrow())?;
-
-        // and update the parent mtime, since the parent content changed
-        // Only update if the parent doesn't already have a directory entry
-        if cache_table
-            .get(CacheTableKey::Default(parent_inode))?
-            .is_none()
-        {
-            let parent_dir_entry = DirtableEntry {
-                mtime: UnixTime::now(),
-            };
-            let parent_dir_holder = Holder::with_content(CacheTableEntry::Dir(parent_dir_entry))?;
-            cache_table.insert(CacheTableKey::Default(parent_inode), parent_dir_holder)?;
-        }
+        // new directory
+        let now = UnixTime::now();
+        write_dir_mtime(cache_table, tree, inode, now)?;
+        write_dir_mtime(cache_table, tree, parent_inode, now)?;
     }
 
     Ok(inode)
+}
+
+/// Insert or update a directory entry in the cache table.
+///
+/// The presence of this entry is what marks a directory as existing,
+/// both in the cache and in the tree.
+fn write_dir_mtime(
+    cache_table: &mut redb::Table<'_, CacheTableKey, Holder<CacheTableEntry>>,
+    tree: &mut WritableOpenTree,
+    inode: Inode,
+    mtime: UnixTime,
+) -> Result<(), StorageError> {
+    tree.insert_and_incref(
+        inode,
+        cache_table,
+        CacheTableKey::Default(inode),
+        Holder::with_content(CacheTableEntry::Dir(DirtableEntry { mtime }))?,
+    )?;
+
+    Ok(())
 }
 
 fn unmark_peer_file(
@@ -1304,12 +1302,12 @@ mod tests {
             assert!(!tree.inode_exists(c)?);
             assert_eq!(None, tree.lookup_inode(b, "c.txt")?);
 
-            // The directories were cleaned up as well, since this was
-            // the last file.
-            assert!(!tree.inode_exists(a)?);
-            assert!(!tree.inode_exists(b)?);
-            assert_eq!(None, tree.lookup_inode(tree.root(), "a")?);
-            assert_eq!(None, tree.lookup_inode(a, "b")?);
+            // The directories were not cleaned up, even though this
+            // was the last file. They need to be rmdir'ed explicitly.
+            assert!(tree.inode_exists(a)?);
+            assert!(tree.inode_exists(b)?);
+            assert_eq!(Some(a), tree.lookup_inode(tree.root(), "a")?);
+            assert_eq!(Some(b), tree.lookup_inode(a, "b")?);
         }
         Ok(())
     }
