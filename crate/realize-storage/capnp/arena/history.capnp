@@ -7,43 +7,39 @@ $Rust.parentModule("arena::types");
 
 # An entry in the history table
 struct HistoryTableEntry {
-  kind @0: Kind;
-  enum Kind {
-
-    # File content has been set.
-    #
-    # Check the file table for the content and
-    # metadata.
-    add @0;
-
-    # File content has been modified.
-    #
-    # Check the file table for the content and
-    # metadata.
-    replace @1;
-
-    # File has been removed.
-    remove @2;
-
-    # File has been dropped from this peer,
-    # but should remain available elsewhere.
-    drop @3;
-
-    # A request to branch a file from source to dest.
-    branch @4;
+  union {
+    add @0: Add;
+    replace @1: Replace;
+    remove @2: Remove;
+    drop @3: Drop;
+    branch @4: Branch;
   }
 
-  path @1: Text;
+  struct Add {
+    path @0: Text;
+  }
 
-  # Hash of the content that was removed
-  # (kind=remove) or replaced (kind=replace).
-  oldHash @2: Data;
+  struct Replace {
+    path @0: Text;
+    oldHash @1: Data;
+  }
 
-  # For branch operations: destination path
-  destPath @3: Text;
+  struct Remove {
+    path @0: Text;
+    oldHash @1: Data;
+  }
 
-  # For branch operations: hash of the content to branch
-  hash @4: Data;
+  struct Drop {
+    path @0: Text;
+    oldHash @1: Data;
+  }
+
+  struct Branch {
+    path @0: Text;
+    destPath @1: Text;
+    hash @2: Data;
+    oldHash @3: Data;
+  }
 }
 
 # Time as duration since UNIX_EPOCH.

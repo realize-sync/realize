@@ -270,67 +270,80 @@ impl ByteConvertible<HistoryTableEntry> for HistoryTableEntry {
         let message_reader = serialize_packed::read_message(&mut &data[..], ReaderOptions::new())?;
         let msg: history_capnp::history_table_entry::Reader =
             message_reader.get_root::<history_capnp::history_table_entry::Reader>()?;
-        match msg.get_kind()? {
-            history_capnp::history_table_entry::Kind::Add => {
-                Ok(HistoryTableEntry::Add(parse_path(msg.get_path()?)?))
+        match msg.which()? {
+            history_capnp::history_table_entry::Which::Add(add_reader) => {
+                let add_reader = add_reader?;
+                Ok(HistoryTableEntry::Add(parse_path(add_reader.get_path()?)?))
             }
-            history_capnp::history_table_entry::Kind::Replace => Ok(HistoryTableEntry::Replace(
-                parse_path(msg.get_path()?)?,
-                parse_hash(msg.get_old_hash()?)?,
-            )),
-            history_capnp::history_table_entry::Kind::Remove => Ok(HistoryTableEntry::Remove(
-                parse_path(msg.get_path()?)?,
-                parse_hash(msg.get_old_hash()?)?,
-            )),
-            history_capnp::history_table_entry::Kind::Drop => Ok(HistoryTableEntry::Drop(
-                parse_path(msg.get_path()?)?,
-                parse_hash(msg.get_old_hash()?)?,
-            )),
-            history_capnp::history_table_entry::Kind::Branch => Ok(HistoryTableEntry::Branch(
-                parse_path(msg.get_path()?)?,
-                parse_path(msg.get_dest_path()?)?,
-                parse_hash(msg.get_hash()?)?,
-                if msg.get_old_hash()?.is_empty() {
-                    None
-                } else {
-                    Some(parse_hash(msg.get_old_hash()?)?)
-                },
-            )),
+            history_capnp::history_table_entry::Which::Replace(replace_reader) => {
+                let replace_reader = replace_reader?;
+                Ok(HistoryTableEntry::Replace(
+                    parse_path(replace_reader.get_path()?)?,
+                    parse_hash(replace_reader.get_old_hash()?)?,
+                ))
+            }
+            history_capnp::history_table_entry::Which::Remove(remove_reader) => {
+                let remove_reader = remove_reader?;
+                Ok(HistoryTableEntry::Remove(
+                    parse_path(remove_reader.get_path()?)?,
+                    parse_hash(remove_reader.get_old_hash()?)?,
+                ))
+            }
+            history_capnp::history_table_entry::Which::Drop(drop_reader) => {
+                let drop_reader = drop_reader?;
+                Ok(HistoryTableEntry::Drop(
+                    parse_path(drop_reader.get_path()?)?,
+                    parse_hash(drop_reader.get_old_hash()?)?,
+                ))
+            }
+            history_capnp::history_table_entry::Which::Branch(branch_reader) => {
+                let branch_reader = branch_reader?;
+                Ok(HistoryTableEntry::Branch(
+                    parse_path(branch_reader.get_path()?)?,
+                    parse_path(branch_reader.get_dest_path()?)?,
+                    parse_hash(branch_reader.get_hash()?)?,
+                    if branch_reader.get_old_hash()?.is_empty() {
+                        None
+                    } else {
+                        Some(parse_hash(branch_reader.get_old_hash()?)?)
+                    },
+                ))
+            }
         }
     }
 
     fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError> {
         let mut message = ::capnp::message::Builder::new_default();
-        let mut builder: history_capnp::history_table_entry::Builder =
+        let builder: history_capnp::history_table_entry::Builder =
             message.init_root::<history_capnp::history_table_entry::Builder>();
 
         match self {
             HistoryTableEntry::Add(path) => {
-                builder.set_kind(history_capnp::history_table_entry::Kind::Add);
-                builder.set_path(path.as_str());
+                let mut add_builder = builder.init_add();
+                add_builder.set_path(path.as_str());
             }
             HistoryTableEntry::Replace(path, old_hash) => {
-                builder.set_kind(history_capnp::history_table_entry::Kind::Replace);
-                builder.set_path(path.as_str());
-                builder.set_old_hash(&old_hash.0);
+                let mut replace_builder = builder.init_replace();
+                replace_builder.set_path(path.as_str());
+                replace_builder.set_old_hash(&old_hash.0);
             }
             HistoryTableEntry::Remove(path, old_hash) => {
-                builder.set_kind(history_capnp::history_table_entry::Kind::Remove);
-                builder.set_path(path.as_str());
-                builder.set_old_hash(&old_hash.0);
+                let mut remove_builder = builder.init_remove();
+                remove_builder.set_path(path.as_str());
+                remove_builder.set_old_hash(&old_hash.0);
             }
             HistoryTableEntry::Drop(path, old_hash) => {
-                builder.set_kind(history_capnp::history_table_entry::Kind::Drop);
-                builder.set_path(path.as_str());
-                builder.set_old_hash(&old_hash.0);
+                let mut drop_builder = builder.init_drop();
+                drop_builder.set_path(path.as_str());
+                drop_builder.set_old_hash(&old_hash.0);
             }
             HistoryTableEntry::Branch(path, dest_path, hash, old_hash) => {
-                builder.set_kind(history_capnp::history_table_entry::Kind::Branch);
-                builder.set_path(path.as_str());
-                builder.set_dest_path(dest_path.as_str());
-                builder.set_hash(&hash.0);
+                let mut branch_builder = builder.init_branch();
+                branch_builder.set_path(path.as_str());
+                branch_builder.set_dest_path(dest_path.as_str());
+                branch_builder.set_hash(&hash.0);
                 if let Some(old_hash) = old_hash {
-                    builder.set_old_hash(&old_hash.0);
+                    branch_builder.set_old_hash(&old_hash.0);
                 }
             }
         }
