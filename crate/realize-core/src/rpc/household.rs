@@ -1494,7 +1494,7 @@ fn fill_notification(notif: &Notification, notif_builder: notification::Builder<
             dest,
             hash,
             old_hash.as_ref(),
-        )
+        ),
     }
 }
 

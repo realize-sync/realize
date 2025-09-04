@@ -15,9 +15,7 @@ impl Default for NetworkConfig {
 
 impl NetworkConfig {
     pub fn new() -> Self {
-        NetworkConfig {
-            peers: Vec::new(),
-        }
+        NetworkConfig { peers: Vec::new() }
     }
 
     /// Get peer config by name

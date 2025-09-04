@@ -392,15 +392,13 @@ async fn send_notifications(
                     })
                 }
             }
-            HistoryTableEntry::Branch(source, dest, hash, old_hash) => {
-                Some(Notification::Branch {
-                    arena: db.arena(),
-                    source,
-                    dest,
-                    hash,
-                    old_hash,
-                })
-            }
+            HistoryTableEntry::Branch(source, dest, hash, old_hash) => Some(Notification::Branch {
+                arena: db.arena(),
+                source,
+                dest,
+                hash,
+                old_hash,
+            }),
         };
 
         if let Some(notification) = notification {
@@ -795,7 +793,10 @@ mod tests {
 
         // Wait for catchup complete
         let catchup_complete = next(&mut rx, "catchup complete").await?;
-        assert!(matches!(catchup_complete, Notification::CatchupComplete { .. }));
+        assert!(matches!(
+            catchup_complete,
+            Notification::CatchupComplete { .. }
+        ));
 
         // Now request a branch operation
         let txn = fixture.db.begin_write()?;
@@ -808,14 +809,23 @@ mod tests {
         // Wait for the branch notification
         let branch_notification = next(&mut rx, "branch").await?;
         match branch_notification {
-            Notification::Branch { arena, source: src, dest: dst, hash, old_hash } => {
+            Notification::Branch {
+                arena,
+                source: src,
+                dest: dst,
+                hash,
+                old_hash,
+            } => {
                 assert_eq!(arena, test_arena());
                 assert_eq!(src, source);
                 assert_eq!(dst, dest);
                 assert_eq!(hash, source_hash);
                 assert_eq!(old_hash, Some(dest_hash));
             }
-            _ => panic!("Expected Branch notification, got {:?}", branch_notification),
+            _ => panic!(
+                "Expected Branch notification, got {:?}",
+                branch_notification
+            ),
         }
 
         Ok(())

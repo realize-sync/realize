@@ -786,8 +786,8 @@ mod tests {
     use assert_fs::prelude::*;
     use realize_types::Arena;
     use std::collections::{HashMap, HashSet};
-    use std::sync::Arc;
     use std::os::unix::fs::MetadataExt;
+    use std::sync::Arc;
 
     struct Fixture {
         db: Arc<ArenaDatabase>,
@@ -1873,36 +1873,48 @@ mod tests {
     fn test_branch_function() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let tempdir = TempDir::new()?;
-        
+
         // Create source file on disk
         let source_path = tempdir.child("source.txt");
         source_path.write_str("source content")?;
         let source_mtime = UnixTime::mtime(&source_path.path().metadata()?);
         let source_hash = hash::digest("source content");
-        
+
         // Create destination file on disk with different content
         let dest_path = tempdir.child("dest.txt");
         dest_path.write_str("dest content")?;
         let dest_mtime = UnixTime::mtime(&dest_path.path().metadata()?);
         let dest_hash = hash::digest("dest content");
-        
+
         // Add source file to index
         let source_index_path = Path::parse("source.txt")?;
-        super::add_file(&fixture.db, &source_index_path, 14, source_mtime, source_hash.clone())?;
-        
+        super::add_file(
+            &fixture.db,
+            &source_index_path,
+            14,
+            source_mtime,
+            source_hash.clone(),
+        )?;
+
         // Add destination file to index
         let dest_index_path = Path::parse("dest.txt")?;
-        super::add_file(&fixture.db, &dest_index_path, 12, dest_mtime, dest_hash.clone())?;
-        
+        super::add_file(
+            &fixture.db,
+            &dest_index_path,
+            12,
+            dest_mtime,
+            dest_hash.clone(),
+        )?;
+
         // Verify both files are in the index
         assert!(super::has_file(&fixture.db, &source_index_path)?);
         assert!(super::has_file(&fixture.db, &dest_index_path)?);
-        
+
         // Test successful branch (create hard link)
         let txn = fixture.db.begin_read()?;
         let index = txn.read_index()?;
         let tree = txn.read_tree()?;
-        
+
         let result = super::branch(
             &index,
             &tree,
@@ -1912,9 +1924,9 @@ mod tests {
             &source_hash,
             Some(&dest_hash), // old_hash matches current dest
         )?;
-        
+
         assert!(result, "Branch should succeed when conditions are met");
-        
+
         // Verify hard link was created by checking inode numbers
         let source_metadata = std::fs::metadata(source_path.path())?;
         let dest_metadata = std::fs::metadata(dest_path.path())?;
@@ -1923,7 +1935,7 @@ mod tests {
             dest_metadata.ino(),
             "Files should have same inode after hard link"
         );
-        
+
         // Test branch failure when source hash doesn't match
         let wrong_hash = Hash([0x99; 32]);
         let result = super::branch(
@@ -1935,9 +1947,9 @@ mod tests {
             &wrong_hash,
             Some(&dest_hash),
         )?;
-        
+
         assert!(!result, "Branch should fail when source hash doesn't match");
-        
+
         // Test branch failure when dest doesn't match old_hash
         let result = super::branch(
             &index,
@@ -1948,9 +1960,12 @@ mod tests {
             &source_hash,
             Some(&wrong_hash), // old_hash doesn't match current dest
         )?;
-        
-        assert!(!result, "Branch should fail when dest doesn't match old_hash");
-        
+
+        assert!(
+            !result,
+            "Branch should fail when dest doesn't match old_hash"
+        );
+
         // Test branch failure when source doesn't exist in tree
         let nonexistent_path = Path::parse("nonexistent.txt")?;
         let result = super::branch(
@@ -1962,9 +1977,12 @@ mod tests {
             &source_hash,
             Some(&dest_hash),
         )?;
-        
-        assert!(!result, "Branch should fail when source doesn't exist in tree");
-        
+
+        assert!(
+            !result,
+            "Branch should fail when source doesn't exist in tree"
+        );
+
         Ok(())
     }
 }
