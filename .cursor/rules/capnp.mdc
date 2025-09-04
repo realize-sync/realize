@@ -16,13 +16,15 @@ This rule documents best practices for working with capnp protocol buffers in Ru
 
 ## Key Concepts
 
-### 1. Generated Code Structure
+### 1. Generated Code 
 
 Capnp generates Rust code with the following structure:
 - **Reader types**: For reading data from capnp messages
 - **Builder types**: For constructing capnp messages
 - **Which enums**: For handling union types
 - **Owned types**: Type aliases for owned versions
+
+The code is generated automatically from .capnp files by cargo commands such as "cargo check", "cargo test" or "cargo build"; this is controlled by a build.rs file.
 
 ### 2. Message Lifecycle
 
