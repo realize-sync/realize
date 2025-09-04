@@ -982,6 +982,37 @@ impl ArenaCache {
         let blobs = txn.read_blobs()?;
         blobs.local_availability(&tree, inode)
     }
+
+    /// Create a directory at the given path.
+    pub(crate) fn mkdir<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        loc: L,
+    ) -> Result<(Inode, DirMetadata), StorageError> {
+        let txn = self.db.begin_write()?;
+        let result = {
+            let mut tree = txn.write_tree()?;
+            let mut cache = txn.write_cache()?;
+
+            cache.mkdir(&mut tree, loc)
+        };
+        txn.commit()?;
+
+        result
+    }
+
+    /// Remove an empty directory at the given path.
+    pub(crate) fn rmdir<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut tree = txn.write_tree()?;
+            let mut cache = txn.write_cache()?;
+
+            cache.rmdir(&mut tree, loc)?;
+        }
+        txn.commit()?;
+
+        Ok(())
+    }
 }
 
 /// Get a [FileTableEntry] for a specific peer.

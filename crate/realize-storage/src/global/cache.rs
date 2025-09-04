@@ -368,6 +368,38 @@ impl GlobalCache {
         })
         .await?
     }
+
+    /// Create a directory at the given path in the specified arena.
+    pub async fn mkdir(
+        self: &Arc<Self>,
+        parent_inode: Inode,
+        name: &str,
+    ) -> Result<(Inode, DirMetadata), StorageError> {
+        let name = name.to_string();
+        let this = Arc::clone(self);
+
+        task::spawn_blocking(move || {
+            let cache = this.arena_cache_for_inode(parent_inode)?;
+            cache.mkdir((parent_inode, &name))
+        })
+        .await?
+    }
+
+    /// Remove an empty directory at the given path in the specified arena.
+    pub async fn rmdir(
+        self: &Arc<Self>,
+        parent_inode: Inode,
+        name: &str,
+    ) -> Result<(), StorageError> {
+        let name = name.to_string();
+        let this = Arc::clone(self);
+
+        task::spawn_blocking(move || {
+            let cache = this.arena_cache_for_inode(parent_inode)?;
+            cache.rmdir((parent_inode, &name))
+        })
+        .await?
+    }
 }
 
 #[derive(Debug, Clone)]

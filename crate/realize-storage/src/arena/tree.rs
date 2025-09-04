@@ -5,6 +5,7 @@ use crate::InodeAllocator;
 use crate::{Inode, StorageError};
 use realize_types::{Arena, Path};
 use redb::{ReadableTable, Table};
+use std::borrow::{Borrow, Cow};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -172,6 +173,7 @@ pub(crate) enum TreeLoc<'a> {
     Inode(Inode),
     PathRef(&'a Path),
     Path(Path),
+    InodeAndName(Inode, Cow<'a, str>),
 }
 
 impl<'a> TreeLoc<'a> {
@@ -184,6 +186,9 @@ impl<'a> TreeLoc<'a> {
             TreeLoc::Inode(inode) => TreeLoc::Inode(*inode),
             TreeLoc::PathRef(path) => TreeLoc::PathRef(*path),
             TreeLoc::Path(path) => TreeLoc::PathRef(path),
+            TreeLoc::InodeAndName(inode, str) => {
+                TreeLoc::InodeAndName(*inode, Cow::Borrowed(str.borrow()))
+            }
         }
     }
 
@@ -192,6 +197,9 @@ impl<'a> TreeLoc<'a> {
             TreeLoc::Inode(inode) => TreeLoc::Inode(inode),
             TreeLoc::PathRef(path) => TreeLoc::Path(path.clone()),
             TreeLoc::Path(path) => TreeLoc::Path(path),
+            TreeLoc::InodeAndName(inode, str) => {
+                TreeLoc::InodeAndName(inode, Cow::Owned(str.into_owned()))
+            }
         }
     }
 }
@@ -211,6 +219,23 @@ impl From<Path> for TreeLoc<'static> {
 impl<'a> From<&'a Path> for TreeLoc<'a> {
     fn from(value: &'a Path) -> Self {
         TreeLoc::PathRef(value)
+    }
+}
+
+impl<'a> From<(Inode, &'a str)> for TreeLoc<'a> {
+    fn from(value: (Inode, &'a str)) -> Self {
+        TreeLoc::InodeAndName(value.0, Cow::from(value.1))
+    }
+}
+
+impl<'a> From<(Inode, &'a String)> for TreeLoc<'a> {
+    fn from(value: (Inode, &'a String)) -> Self {
+        TreeLoc::InodeAndName(value.0, Cow::from(value.1))
+    }
+}
+impl From<(Inode, String)> for TreeLoc<'static> {
+    fn from(value: (Inode, String)) -> Self {
+        TreeLoc::InodeAndName(value.0, Cow::from(value.1))
     }
 }
 
@@ -274,6 +299,7 @@ impl<T: TreeReadOperations> TreeExt for T {
             TreeLoc::Inode(inode) => Ok(Some(inode)),
             TreeLoc::PathRef(path) => resolve_path(self, path),
             TreeLoc::Path(path) => resolve_path(self, &path),
+            TreeLoc::InodeAndName(inode, name) => self.lookup_inode(inode, name.as_ref()),
         }
     }
 
@@ -283,6 +309,10 @@ impl<T: TreeReadOperations> TreeExt for T {
             TreeLoc::Inode(inode) => Ok(inode),
             TreeLoc::PathRef(path) => resolve_path_partial(self, path),
             TreeLoc::Path(path) => resolve_path_partial(self, &path),
+            TreeLoc::InodeAndName(inode, name) => match self.lookup_inode(inode, name.as_ref())? {
+                None => Ok(inode),
+                Some(inode) => Ok(inode),
+            },
         }
     }
 
@@ -306,6 +336,7 @@ impl<T: TreeReadOperations> TreeExt for T {
             TreeLoc::Inode(inode) => self.inode_exists(inode)?,
             TreeLoc::Path(path) => resolve_path(self, &path)?.is_some(),
             TreeLoc::PathRef(path) => resolve_path(self, path)?.is_some(),
+            TreeLoc::InodeAndName(inode, cow) => self.lookup(inode, cow.as_ref())?.is_some(),
         })
     }
 
@@ -329,6 +360,10 @@ impl<T: TreeReadOperations> TreeExt for T {
         match loc.into() {
             TreeLoc::PathRef(path) => Ok(Some(path.clone())),
             TreeLoc::Path(path) => Ok(Some(path)),
+            TreeLoc::InodeAndName(inode, name) => match self.backtrack(inode)? {
+                None => Ok(Some(Path::parse(name)?)),
+                Some(path) => Ok(Some(Path::parse(&format!("{}/{}", path, name))?)),
+            },
             TreeLoc::Inode(inode) => {
                 let mut components = VecDeque::new();
                 let mut current = inode;
@@ -482,6 +517,7 @@ impl<'a> WritableOpenTree<'a> {
             TreeLoc::Inode(inode) => inode,
             TreeLoc::PathRef(path) => self.setup(path)?,
             TreeLoc::Path(path) => self.setup(path)?,
+            TreeLoc::InodeAndName(inode, name) => self.setup_name(inode, name.as_ref())?,
         };
         if table.insert(key, value)?.is_none() {
             self.incref(inode)?;
@@ -623,6 +659,7 @@ impl<'a> WritableOpenTree<'a> {
             TreeLoc::Inode(inode) => Ok(inode),
             TreeLoc::Path(path) => self.setup_path(&path),
             TreeLoc::PathRef(path) => self.setup_path(path),
+            TreeLoc::InodeAndName(inode, name) => self.setup_name(inode, name.as_ref()),
         }
     }
 
