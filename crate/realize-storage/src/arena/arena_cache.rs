@@ -275,7 +275,7 @@ impl<'a> WritableOpenCache<'a> {
         source: Inode,
         parent: Inode,
         name: &str,
-    ) -> Result<(), StorageError> {
+    ) -> Result<(Inode, FileMetadata), StorageError> {
         let mut entry = self.get_at_inode_or_err(source)?;
         let dest = tree.setup_name(parent, name)?;
         entry.branched_from = Some(source);
@@ -288,7 +288,14 @@ impl<'a> WritableOpenCache<'a> {
             history.request_branch(&source_path, &dest_path, &entry.hash, old_hash.as_ref())?;
         }
 
-        Ok(())
+        Ok((
+            dest,
+            FileMetadata {
+                size: entry.size,
+                mtime: entry.mtime,
+                hash: entry.hash,
+            },
+        ))
     }
 
     /// Add a file entry for a peer.
@@ -844,9 +851,9 @@ impl ArenaCache {
         source: Inode,
         parent: Inode,
         name: &str,
-    ) -> Result<(), StorageError> {
+    ) -> Result<(Inode, FileMetadata), StorageError> {
         let txn = self.db.begin_write()?;
-        {
+        let result = {
             let mut tree = txn.write_tree()?;
             let mut blobs = txn.write_blobs()?;
             let mut history = txn.write_history()?;
@@ -861,11 +868,11 @@ impl ArenaCache {
                 source,
                 parent,
                 name,
-            )?;
-        }
+            )?
+        };
         txn.commit()?;
 
-        Ok(())
+        Ok(result)
     }
 
     pub(crate) fn update(

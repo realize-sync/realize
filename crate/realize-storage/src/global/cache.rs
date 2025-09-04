@@ -335,6 +335,39 @@ impl GlobalCache {
         })
         .await?
     }
+
+    pub async fn branch(
+        self: &Arc<Self>,
+        source: Inode,
+        parent: Inode,
+        name: &str,
+    ) -> Result<(Inode, FileMetadata), StorageError> {
+        let name = name.to_string();
+        let this = Arc::clone(self);
+
+        task::spawn_blocking(move || {
+            let txn = this.db.begin_read()?;
+            let source_arena = this.allocator.arena_for_inode(&txn, source)?;
+            let parent_arena = this.allocator.arena_for_inode(&txn, parent)?;
+            if source_arena != parent_arena {
+                return Err(StorageError::CrossesDevices);
+            }
+            match source_arena {
+                Some(arena) => {
+                    let cache = this.arena_cache(arena)?;
+                    cache.branch(source, parent, &name)
+                }
+                None => {
+                    if this.paths.get(&source).is_some() {
+                        Err(StorageError::IsADirectory)
+                    } else {
+                        Err(StorageError::NotFound)
+                    }
+                }
+            }
+        })
+        .await?
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -667,6 +700,35 @@ mod tests {
                 .unlink(cache.arena_root(test_arena())?, "doesnotexist")
                 .await,
             Err(StorageError::NotFound)
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn branch() -> anyhow::Result<()> {
+        let arena1 = Arena::from("arenas/1");
+        let arena2 = Arena::from("arenas/2");
+        let fixture = Fixture::setup_with_arenas([arena1, arena2]).await?;
+        let cache = &fixture.cache;
+
+        let arenas_dir = cache.lookup(GlobalCache::ROOT_DIR, "arenas").await?.0;
+        assert!(matches!(
+            cache
+                .branch(arenas_dir, GlobalCache::ROOT_DIR, "test_arena2")
+                .await,
+            Err(StorageError::IsADirectory)
+        ));
+
+        assert!(matches!(
+            cache
+                .branch(
+                    cache.arena_root(arena1)?,
+                    cache.arena_root(arena2)?,
+                    "test_arena2"
+                )
+                .await,
+            Err(StorageError::CrossesDevices)
         ));
 
         Ok(())

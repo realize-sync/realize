@@ -322,6 +322,25 @@ impl Filesystem for RealizeFs {
             }
         });
     }
+
+    fn link(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        newparent: u64,
+        newname: &std::ffi::OsStr,
+        reply: fuser::ReplyEntry,
+    ) {
+        let inner = Arc::clone(&self.inner);
+        let newname = newname.to_owned();
+
+        self.handle.spawn(async move {
+            match inner.link(ino, newparent, newname).await {
+                Err(err) => reply.error(err.log_and_convert()),
+                Ok(attr) => reply.entry(&Duration::from_secs(1), &attr, 0),
+            }
+        });
+    }
 }
 
 struct InnerRealizeFs {
@@ -419,6 +438,21 @@ impl InnerRealizeFs {
         self.cache.unlink(Inode(parent), name).await?;
 
         Ok(())
+    }
+
+    async fn link(
+        &self,
+        source: u64,
+        parent: u64,
+        name: OsString,
+    ) -> Result<fuser::FileAttr, FuseError> {
+        let name = name.to_str().ok_or(FuseError::Utf8)?;
+        let (dest, metadata) = self
+            .cache
+            .branch(Inode(source), Inode(parent), name)
+            .await?;
+
+        Ok(self.build_file_attr(dest, &metadata))
     }
 
     fn build_file_attr(&self, inode: Inode, metadata: &FileMetadata) -> fuser::FileAttr {
@@ -934,6 +968,63 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 assert!(fs::metadata(&realpath_in_b).await.is_err());
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn link() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+
+                // Create a file in peer B's arena
+                fixture
+                    .inner
+                    .write_file(b, "source.txt", "source content")
+                    .await?;
+                let realpath_in_b = fixture.inner.arena_root(b).join("source.txt");
+                assert!(fs::metadata(&realpath_in_b).await.is_ok());
+
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "source.txt", &hash::digest("source content"))
+                    .await?;
+
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                let source_path = arena_path.join("source.txt");
+                let link_path = arena_path.join("link.txt");
+
+                assert!(fs::metadata(&source_path).await.is_ok());
+
+                fs::hard_link(&source_path, &link_path).await?;
+
+                // The files should have the same content
+                assert_eq!("source content", fs::read_to_string(&source_path).await?);
+                assert_eq!("source content", fs::read_to_string(&link_path).await?);
+
+                // The link should be propagated back to peer B
+                let limit = Instant::now() + Duration::from_secs(3);
+                let link_in_b = fixture.inner.arena_root(b).join("link.txt");
+                while !link_in_b.exists() && Instant::now() < limit {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert_eq!("source content", fs::read_to_string(link_in_b).await?);
 
                 Ok::<(), anyhow::Error>(())
             })

@@ -51,6 +51,9 @@ pub enum StorageError {
 
     #[error("database is inconsistent. This is a bug. {0}")]
     InconsistentDatabase(String),
+
+    #[error("cannot cross devices")]
+    CrossesDevices,
 }
 
 impl StorageError {
@@ -90,6 +93,7 @@ impl StorageError {
             StorageError::UnknownArena(_) => NotFound,
             StorageError::NoLocalStorage(_) => NotFound,
             StorageError::InconsistentDatabase(_) => Other,
+            StorageError::CrossesDevices => CrossesDevices,
         }
     }
 
