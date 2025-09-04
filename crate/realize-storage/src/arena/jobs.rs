@@ -258,6 +258,9 @@ impl StorageJobProcessor {
                 cached.hash,
             )?;
         }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         std::fs::rename(&source, &dest)?;
         let ret = txn.commit();
         if !ret.is_ok() {
@@ -502,13 +505,15 @@ mod tests {
     #[tokio::test]
     async fn unrealize_success() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let hash = fixture.create_indexed_file("test.txt", "foobar").await?;
-        fixture.add_to_cache("test.txt", &hash, 6)?;
-        let path = Path::parse("test.txt")?;
+        let hash = fixture
+            .create_indexed_file("dir/test.txt", "foobar")
+            .await?;
+        fixture.add_to_cache("dir/test.txt", &hash, 6)?;
+        let path = Path::parse("dir/test.txt")?;
         assert_eq!(JobStatus::Done, fixture.unrealize(path, hash).await?);
-        assert!(fixture.find_in_index("test.txt")?.is_none());
-        assert!(!fixture.file_exists("test.txt"));
-        assert_eq!("foobar", fixture.read_blob_content("test.txt").await?);
+        assert!(fixture.find_in_index("dir/test.txt")?.is_none());
+        assert!(!fixture.file_exists("dir/test.txt"));
+        assert_eq!("foobar", fixture.read_blob_content("dir/test.txt").await?);
 
         Ok(())
     }
@@ -577,11 +582,11 @@ mod tests {
     #[tokio::test]
     async fn realize_new_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let path = Path::parse("test.txt")?;
+        let path = Path::parse("dir/test.txt")?;
         fixture.set_mark(&path, Mark::Own)?;
 
         let hash = hash::digest("test");
-        fixture.add_to_cache("test.txt", &hash, 4)?;
+        fixture.add_to_cache("dir/test.txt", &hash, 4)?;
         let inode = fixture.inode(&path)?;
         {
             let mut blob = fixture.cache.open_file(inode)?;
