@@ -298,6 +298,52 @@ impl<'a> WritableOpenCache<'a> {
         ))
     }
 
+    pub(crate) fn mkdir<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        loc: L,
+    ) -> Result<(Inode, DirMetadata), StorageError> {
+        let inode = tree.setup(loc)?;
+        if self.table.get(CacheTableKey::Default(inode))?.is_some() {
+            return Err(StorageError::AlreadyExists);
+        }
+        if let Some(parent) = tree.parent(inode)? {
+            // The parent must exist and be a directory. Note that
+            // None is the arena root which always exist.
+            check_is_dir(&self.table, parent)?;
+        }
+        let mtime = UnixTime::now();
+        write_dir_mtime(&mut self.table, tree, inode, mtime)?;
+
+        Ok((
+            inode,
+            DirMetadata {
+                read_only: false,
+                mtime,
+            },
+        ))
+    }
+
+    pub(crate) fn rmdir<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        loc: L,
+    ) -> Result<(), StorageError> {
+        let inode = tree.expect(loc)?;
+        match inode_assignment(&self.table, inode)? {
+            Some(InodeAssignment::File) => Err(StorageError::NotADirectory),
+            None => Err(StorageError::NotFound),
+            Some(InodeAssignment::Directory) => {
+                if !self.readdir(tree, inode).next().is_none() {
+                    return Err(StorageError::DirectoryNotEmpty);
+                }
+                tree.remove_and_decref(inode, &mut self.table, CacheTableKey::Default(inode))?;
+
+                Ok(())
+            }
+        }
+    }
+
     /// Add a file entry for a peer.
     pub(crate) fn notify_added(
         &mut self,
@@ -2610,6 +2656,256 @@ mod tests {
         assert_eq!(dest_path, avail.path);
         assert_eq!(hash, avail.hash);
         assert_eq!(vec![peer2], avail.peers);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mkdir_creates_directory() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let dir_path = Path::parse("newdir")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut dirty = txn.write_dirty()?;
+
+        // Clear dirty state
+        dirty.delete_range(0, 999)?;
+
+        let (inode, metadata) = cache.mkdir(&mut tree, &dir_path)?;
+
+        // Verify directory was created
+        assert!(tree.inode_exists(inode)?);
+        assert_eq!(
+            Some(inode),
+            tree.lookup_inode(fixture.db.tree().root(), "newdir")?
+        );
+
+        // Verify metadata
+        assert!(!metadata.read_only);
+        assert!(metadata.mtime > UnixTime::ZERO);
+
+        // Verify directory entry exists in cache by checking dir_mtime
+        let mtime = cache.dir_mtime(inode)?;
+        assert!(mtime > UnixTime::ZERO);
+
+        // Verify parent directory mtime was updated
+        let parent_mtime = cache.dir_mtime(fixture.db.tree().root())?;
+        assert!(parent_mtime > UnixTime::ZERO);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mkdir_creates_nested_directories() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+
+        // The following fails, because a/b doesn't exist
+        assert!(cache.mkdir(&mut tree, Path::parse("a/b/c")?).is_err());
+
+        let (a_inode, _) = cache.mkdir(&mut tree, Path::parse("a")?)?;
+        let (b_inode, _) = cache.mkdir(&mut tree, Path::parse("a/b")?)?;
+        let (c_inode, _) = cache.mkdir(&mut tree, Path::parse("a/b/c")?)?;
+
+        assert!(cache.dir_mtime(a_inode).is_ok());
+        assert!(cache.dir_mtime(b_inode).is_ok());
+        assert!(cache.dir_mtime(c_inode).is_ok());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mkdir_fails_if_directory_already_exists() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let dir_path = Path::parse("existing_dir")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut dirty = txn.write_dirty()?;
+
+        // Clear dirty state
+        dirty.delete_range(0, 999)?;
+
+        // Create directory first time
+        let (inode1, _) = cache.mkdir(&mut tree, &dir_path)?;
+        assert!(tree.inode_exists(inode1)?);
+
+        // Try to create same directory again
+        let result = cache.mkdir(&mut tree, &dir_path);
+        assert!(matches!(result, Err(StorageError::AlreadyExists)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rmdir_removes_empty_directory() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let dir_path = Path::parse("empty_dir")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut dirty = txn.write_dirty()?;
+
+        // Clear dirty state
+        dirty.delete_range(0, 999)?;
+
+        // Create directory
+        let (inode, _) = cache.mkdir(&mut tree, &dir_path)?;
+        assert!(tree.inode_exists(inode)?);
+
+        // Remove directory
+        cache.rmdir(&mut tree, &dir_path)?;
+
+        // Verify directory is gone
+        assert!(!tree.inode_exists(inode)?);
+        assert_eq!(
+            None,
+            tree.lookup_inode(fixture.db.tree().root(), "empty_dir")?
+        );
+
+        // Verify cache entry is gone
+        assert!(cache.get_at_inode(inode)?.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rmdir_fails_if_directory_not_empty() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let dir_path = Path::parse("non_empty_dir")?;
+        let file_path = Path::parse("non_empty_dir/file.txt")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+
+        // Clear dirty state
+        dirty.delete_range(0, 999)?;
+
+        // Create directory
+        let (dir_inode, _) = cache.mkdir(&mut tree, &dir_path)?;
+
+        // Add a file to the directory
+        let peer = Peer::from("test_peer");
+        cache.notify_added(
+            &mut tree,
+            &mut blobs,
+            &mut dirty,
+            peer,
+            file_path.clone(),
+            test_time(),
+            100,
+            test_hash(),
+        )?;
+
+        // Try to remove non-empty directory
+        let result = cache.rmdir(&mut tree, &dir_path);
+        assert!(matches!(result, Err(StorageError::DirectoryNotEmpty)));
+
+        // Verify directory still exists
+        assert!(tree.inode_exists(dir_inode)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rmdir_fails_if_not_a_directory() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let file_path = Path::parse("file.txt")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+
+        // Clear dirty state
+        dirty.delete_range(0, 999)?;
+
+        // Add a file
+        let peer = Peer::from("test_peer");
+        cache.notify_added(
+            &mut tree,
+            &mut blobs,
+            &mut dirty,
+            peer,
+            file_path.clone(),
+            test_time(),
+            100,
+            test_hash(),
+        )?;
+
+        let file_inode = tree.expect(&file_path)?;
+
+        // Try to remove file as directory
+        let result = cache.rmdir(&mut tree, &file_path);
+        assert!(matches!(result, Err(StorageError::NotADirectory)));
+
+        // Verify file still exists
+        assert!(tree.inode_exists(file_inode)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rmdir_fails_if_directory_not_found() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let nonexistent_path = Path::parse("nonexistent_dir")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut dirty = txn.write_dirty()?;
+
+        // Clear dirty state
+        dirty.delete_range(0, 999)?;
+
+        // Try to remove non-existent directory
+        let result = cache.rmdir(&mut tree, &nonexistent_path);
+        assert!(matches!(result, Err(StorageError::NotFound)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rmdir_updates_parent_mtime() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let parent_path = Path::parse("parent")?;
+        let child_path = Path::parse("parent/child")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut dirty = txn.write_dirty()?;
+
+        // Clear dirty state
+        dirty.delete_range(0, 999)?;
+
+        // Create parent and child directories
+        let (parent_inode, _) = cache.mkdir(&mut tree, &parent_path)?;
+        let (child_inode, _) = cache.mkdir(&mut tree, &child_path)?;
+
+        // Get parent mtime before removal
+        let parent_mtime_before = cache.dir_mtime(parent_inode)?;
+
+        // Remove child directory
+        cache.rmdir(&mut tree, &child_path)?;
+
+        // Verify parent mtime was updated (should be >= since operations can be fast)
+        let parent_mtime_after = cache.dir_mtime(parent_inode)?;
+        assert!(parent_mtime_after >= parent_mtime_before);
+
+        // Verify child is gone
+        assert!(!tree.inode_exists(child_inode)?);
 
         Ok(())
     }

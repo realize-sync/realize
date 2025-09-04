@@ -54,6 +54,12 @@ pub enum StorageError {
 
     #[error("cannot cross devices")]
     CrossesDevices,
+
+    #[error("already exists")]
+    AlreadyExists,
+
+    #[error("directory not empty")]
+    DirectoryNotEmpty,
 }
 
 impl StorageError {
@@ -94,6 +100,8 @@ impl StorageError {
             StorageError::NoLocalStorage(_) => NotFound,
             StorageError::InconsistentDatabase(_) => Other,
             StorageError::CrossesDevices => CrossesDevices,
+            StorageError::AlreadyExists => AlreadyExists,
+            StorageError::DirectoryNotEmpty => DirectoryNotEmpty,
         }
     }
 
