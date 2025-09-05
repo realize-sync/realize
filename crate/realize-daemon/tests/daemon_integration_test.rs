@@ -410,8 +410,11 @@ async fn daemon_updates_cache() -> anyhow::Result<()> {
     // It might take a while for the new file to be reported by
     // inotify and then daemon_a, so retry.
     let goal = mount_point.path().join("testdir/hello.txt");
-    let limit = Instant::now() + Duration::from_secs(3);
-    while !tokio::fs::metadata(&goal).await.is_ok() && Instant::now() < limit {
+
+    // The deadline is generous, because it can take a very long time
+    // for the mountpoint to be truly available on MacOS.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !tokio::fs::metadata(&goal).await.is_ok() && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(tokio::fs::metadata(&goal).await.is_ok());
@@ -477,9 +480,11 @@ async fn daemon_exports_fuse() -> anyhow::Result<()> {
 
     fixture.collect_stderr("daemon", &mut daemon);
 
-    // The FUSE filesystem is mounted once the mount point reports being on another device.
-    let limit = Instant::now() + Duration::from_secs(3);
-    while fs::metadata(mount_point.path())?.dev() == original_dev && Instant::now() < limit {
+    // The FUSE filesystem is mounted once the mount point reports
+    // being on another device. The deadline is generous, because it
+    // can take a very long time to mount the filesystem on MacOS.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while fs::metadata(mount_point.path())?.dev() == original_dev && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_ne!(fs::metadata(mount_point.path())?.dev(), original_dev);
