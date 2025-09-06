@@ -8,7 +8,7 @@ use super::tree::{TreeExt, TreeLoc};
 use super::types::LocalAvailability;
 use crate::arena::tree::TreeReadOperations;
 use crate::types::JobId;
-use crate::{Inode, Mark, StorageError};
+use crate::{PathId, Mark, StorageError};
 use realize_types::{Arena, Hash, Path, UnixTime};
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,17 +47,17 @@ pub(crate) enum StorageJob {
     External(Job),
 
     /// Move file containing the given version into the cache.
-    Unrealize(Inode, Hash),
+    Unrealize(PathId, Hash),
 
     /// Realize the given file with `counter`, moving `Hash` from
     /// cache to the index, currently containing nothing or `Hash`.
-    Realize(Inode, Hash, Option<Hash>),
+    Realize(PathId, Hash, Option<Hash>),
 
     /// Move the blob to the protected queue.
-    ProtectBlob(Inode),
+    ProtectBlob(PathId),
 
     /// Move the blob to the unprotected queue.
-    UnprotectBlob(Inode),
+    UnprotectBlob(PathId),
 }
 
 impl StorageJob {
@@ -362,8 +362,8 @@ impl Engine {
         let txn = self.db.begin_read()?;
         let dirty = txn.read_dirty()?;
         let mut seen = None;
-        while let Some((inode, counter)) = dirty.next_dirty(start_counter)? {
-            if let Some(job) = self.build_job(&txn, &txn.read_tree()?, inode)? {
+        while let Some((pathid, counter)) = dirty.next_dirty(start_counter)? {
+            if let Some(job) = self.build_job(&txn, &txn.read_tree()?, pathid)? {
                 return Ok((Some((JobId(counter), job)), Some(counter)));
             }
             seen = Some(counter);
@@ -382,15 +382,15 @@ impl Engine {
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
             let dirty = txn.read_dirty()?;
-            if let Some(inode) = dirty.get_inode_for_counter(counter)? {
-                match this.build_job(&txn, &txn.read_tree()?, inode) {
+            if let Some(pathid) = dirty.get_pathid_for_counter(counter)? {
+                match this.build_job(&txn, &txn.read_tree()?, pathid) {
                     Ok(None) => return Ok(None),
                     Ok(Some(job)) => {
                         return Ok(Some((JobId(counter), job)));
                     }
                     Err(err) => {
                         log::warn!(
-                            "[{arena}] Job #{counter} failed to build job for inode {inode}: {err:?}",
+                            "[{arena}] Job #{counter} failed to build job for pathid {pathid}: {err:?}",
                             arena = this.arena
                         );
                         return Ok(None);
@@ -413,10 +413,10 @@ impl Engine {
             let txn = this.db.begin_read()?;
             let tree = txn.read_tree()?;
             let dirty = txn.read_dirty()?;
-            if let Some(inode) = tree.resolve(loc)? {
-                if let Some(counter) = dirty.get_counter(inode)? {
+            if let Some(pathid) = tree.resolve(loc)? {
+                if let Some(counter) = dirty.get_counter(pathid)? {
                     return Ok(this
-                        .build_job(&txn, &tree, inode)?
+                        .build_job(&txn, &tree, pathid)?
                         .map(|job| (JobId(counter), job)));
                 }
             }
@@ -430,7 +430,7 @@ impl Engine {
         &self,
         txn: &ArenaReadTransaction,
         tree: &impl TreeReadOperations,
-        inode: Inode,
+        pathid: PathId,
     ) -> Result<Option<StorageJob>, StorageError> {
         let index = txn.read_index()?;
         let cache = txn.read_cache()?;
@@ -441,7 +441,7 @@ impl Engine {
         let mut want_download = false;
         let mut want_realize = false;
         let mut want_unrealize = false;
-        match txn.read_marks()?.get(tree, inode)? {
+        match txn.read_marks()?.get(tree, pathid)? {
             Mark::Watch => {
                 want_unprotect_blob = true;
                 want_unrealize = true;
@@ -464,9 +464,9 @@ impl Engine {
         let mut should_realize = None;
         let mut should_unrealize = None;
 
-        if let Some(cached) = cache.get_at_inode(inode)? {
+        if let Some(cached) = cache.get_at_pathid(pathid)? {
             let hash = cached.hash;
-            let indexed = index.get_at_inode(inode)?;
+            let indexed = index.get_at_pathid(pathid)?;
             let is_indexed = indexed.is_some();
             if want_unrealize {
                 if let Some(indexed) = indexed
@@ -484,7 +484,7 @@ impl Engine {
                     }
                 }
             }
-            let blob = blobs.get_with_inode(inode)?;
+            let blob = blobs.get_with_pathid(pathid)?;
             if let Some(blob) = &blob {
                 if blob.protected {
                     should_unprotect_blob = want_unprotect_blob;
@@ -503,21 +503,21 @@ impl Engine {
             }
         }
         if should_protect_blob {
-            return Ok(Some(StorageJob::ProtectBlob(inode)));
+            return Ok(Some(StorageJob::ProtectBlob(pathid)));
         }
         if should_unprotect_blob {
-            return Ok(Some(StorageJob::UnprotectBlob(inode)));
+            return Ok(Some(StorageJob::UnprotectBlob(pathid)));
         }
         if let Some(hash) = should_download {
-            if let Some(path) = tree.backtrack(inode)? {
+            if let Some(path) = tree.backtrack(pathid)? {
                 return Ok(Some(StorageJob::External(Job::Download(path, hash))));
             }
         }
         if let Some((hash, index_hash)) = should_realize {
-            return Ok(Some(StorageJob::Realize(inode, hash, index_hash)));
+            return Ok(Some(StorageJob::Realize(pathid, hash, index_hash)));
         }
         if let Some(hash) = should_unrealize {
-            return Ok(Some(StorageJob::Unrealize(inode, hash)));
+            return Ok(Some(StorageJob::Unrealize(pathid, hash)));
         }
 
         Ok(None)
@@ -607,7 +607,7 @@ mod tests {
     use super::*;
     use crate::Blob;
     use crate::GlobalDatabase;
-    use crate::InodeAllocator;
+    use crate::PathIdAllocator;
     use crate::Notification;
     use crate::arena::arena_cache::ArenaCache;
     use crate::arena::index;
@@ -648,7 +648,7 @@ mod tests {
             let db = ArenaDatabase::new(
                 redb_utils::in_memory()?,
                 arena,
-                InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?,
+                PathIdAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?,
                 &blob_dir,
             )?;
             let acache = ArenaCache::new(arena, Arc::clone(&db))?;
@@ -763,7 +763,7 @@ mod tests {
             Ok(())
         }
 
-        fn inode(&self, path: &Path) -> anyhow::Result<Inode> {
+        fn pathid(&self, path: &Path) -> anyhow::Result<PathId> {
             let txn = self.db.begin_read()?;
 
             Ok(txn.read_tree()?.expect(path)?)
@@ -852,9 +852,9 @@ mod tests {
 
         mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
-        let inode = fixture.acache.expect(&barfile)?;
+        let pathid = fixture.acache.expect(&barfile)?;
         {
-            let mut blob = fixture.acache.open_file(inode)?;
+            let mut blob = fixture.acache.open_file(pathid)?;
             blob.write_all(b"te").await?;
             blob.update_db().await?;
         }
@@ -882,9 +882,9 @@ mod tests {
 
         mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
-        let inode = fixture.acache.expect(&barfile)?;
+        let pathid = fixture.acache.expect(&barfile)?;
         {
-            let mut blob = fixture.acache.open_file(inode)?;
+            let mut blob = fixture.acache.open_file(pathid)?;
             blob.write_all(b"test").await?;
             blob.update_db().await?;
         }
@@ -913,9 +913,9 @@ mod tests {
 
         mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
-        let inode = fixture.acache.expect(&barfile)?;
+        let pathid = fixture.acache.expect(&barfile)?;
         {
-            let mut blob = fixture.acache.open_file(inode)?;
+            let mut blob = fixture.acache.open_file(pathid)?;
             blob.write_all(b"test").await?;
             blob.mark_verified().await?;
         }
@@ -982,7 +982,7 @@ mod tests {
 
         mark::set_arena_mark(&fixture.db, Mark::Own)?;
         fixture.add_file_to_cache(&foobar)?;
-        let inode = fixture.acache.expect(&foobar)?;
+        let pathid = fixture.acache.expect(&foobar)?;
 
         let mut job_stream = fixture.engine.job_stream();
 
@@ -992,7 +992,7 @@ mod tests {
             job,
         );
         {
-            let mut blob = fixture.acache.open_file(inode)?;
+            let mut blob = fixture.acache.open_file(pathid)?;
             blob.write_all(b"test").await?;
             blob.mark_verified().await?;
         }
@@ -1000,7 +1000,7 @@ mod tests {
 
         let (new_job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
         assert!(new_job_id > job_id);
-        assert_eq!(StorageJob::Realize(inode, test_hash(), None), job);
+        assert_eq!(StorageJob::Realize(pathid, test_hash(), None), job);
 
         Ok(())
     }
@@ -1011,9 +1011,9 @@ mod tests {
         let foobar = Path::parse("foo/bar")?;
 
         fixture.add_file_to_cache(&foobar)?;
-        let inode = fixture.acache.expect(&foobar)?;
+        let pathid = fixture.acache.expect(&foobar)?;
         {
-            let mut blob = fixture.acache.open_file(inode)?;
+            let mut blob = fixture.acache.open_file(pathid)?;
             blob.write_all(b"te").await?;
         }
         // blob is partially available, but unprotected, going from
@@ -1029,13 +1029,13 @@ mod tests {
 
         let mut job_stream = fixture.engine.job_stream();
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert_eq!(StorageJob::ProtectBlob(inode), job,);
+        assert_eq!(StorageJob::ProtectBlob(pathid), job,);
         let txn = fixture.db.begin_write()?;
         {
             let tree = txn.read_tree()?;
             let mut dirty = txn.write_dirty()?;
             txn.write_blobs()?
-                .set_protected(&tree, &mut dirty, inode, true)?;
+                .set_protected(&tree, &mut dirty, pathid, true)?;
         }
         txn.commit()?;
         fixture.engine.job_finished(job_id, Ok(JobStatus::Done))?;
@@ -1046,7 +1046,7 @@ mod tests {
             job,
         );
         {
-            let mut blob = Blob::open(&fixture.db, inode)?;
+            let mut blob = Blob::open(&fixture.db, pathid)?;
             blob.write_all(b"test").await?;
             blob.mark_verified().await?;
         }
@@ -1054,7 +1054,7 @@ mod tests {
 
         let (new_job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
         assert!(new_job_id > job_id);
-        assert_eq!(StorageJob::Realize(inode, test_hash(), None), job);
+        assert_eq!(StorageJob::Realize(pathid, test_hash(), None), job);
 
         Ok(())
     }
@@ -1067,9 +1067,9 @@ mod tests {
         mark::set(&fixture.db, &foobar, Mark::Keep)?;
         fixture.add_file_to_index_with_version(&foobar, test_hash())?;
         fixture.add_file_to_cache_with_version(&foobar, test_hash())?;
-        let inode = fixture.acache.expect(&foobar)?;
+        let pathid = fixture.acache.expect(&foobar)?;
         {
-            let mut blob = fixture.acache.open_file(inode)?;
+            let mut blob = fixture.acache.open_file(pathid)?;
             blob.write_all(b"te").await?;
         }
 
@@ -1084,20 +1084,20 @@ mod tests {
         let mut job_stream = fixture.engine.job_stream();
 
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert_eq!(StorageJob::UnprotectBlob(inode), job);
+        assert_eq!(StorageJob::UnprotectBlob(pathid), job);
         let txn = fixture.db.begin_write()?;
         {
             let tree = txn.read_tree()?;
             let mut dirty = txn.write_dirty()?;
             txn.write_blobs()?
-                .set_protected(&tree, &mut dirty, inode, false)?;
+                .set_protected(&tree, &mut dirty, pathid, false)?;
         }
         txn.commit()?;
         fixture.engine.job_finished(job_id, Ok(JobStatus::Done))?;
 
         let (new_job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
         assert!(new_job_id > job_id);
-        assert_eq!(StorageJob::Unrealize(inode, test_hash()), job);
+        assert_eq!(StorageJob::Unrealize(pathid, test_hash()), job);
 
         Ok(())
     }
@@ -1109,9 +1109,9 @@ mod tests {
 
         mark::set_arena_mark(&fixture.db, Mark::Own)?;
         fixture.add_file_to_cache(&foobar)?;
-        let inode = fixture.acache.expect(&foobar)?;
+        let pathid = fixture.acache.expect(&foobar)?;
         {
-            let mut blob = fixture.acache.open_file(inode)?;
+            let mut blob = fixture.acache.open_file(pathid)?;
             blob.write_all(b"test").await?;
             blob.mark_verified().await?;
         }
@@ -1119,7 +1119,7 @@ mod tests {
         let mut job_stream = fixture.engine.job_stream();
 
         let (_, job) = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert_eq!(StorageJob::Realize(inode, test_hash(), None), job);
+        assert_eq!(StorageJob::Realize(pathid, test_hash(), None), job);
 
         Ok(())
     }
@@ -1163,9 +1163,9 @@ mod tests {
         fixture.add_file_to_cache_with_version(&foobar, Hash([1; 32]))?;
         fixture.add_file_to_index_with_version(&foobar, Hash([1; 32]))?;
         fixture.replace(&foobar, Hash([2; 32]), Hash([1; 32]))?;
-        let inode = fixture.acache.expect(&foobar)?;
+        let pathid = fixture.acache.expect(&foobar)?;
         {
-            let mut blob = fixture.acache.open_file(inode)?;
+            let mut blob = fixture.acache.open_file(pathid)?;
             blob.write_all(b"test").await?;
             blob.mark_verified().await?;
         }
@@ -1176,7 +1176,7 @@ mod tests {
         assert_eq!(
             (
                 JobId(4),
-                StorageJob::Realize(fixture.inode(&foobar)?, Hash([2; 32]), Some(Hash([1; 32])))
+                StorageJob::Realize(fixture.pathid(&foobar)?, Hash([2; 32]), Some(Hash([1; 32])))
             ),
             job
         );

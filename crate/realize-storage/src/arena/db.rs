@@ -14,7 +14,7 @@ use super::types::{
 use crate::StorageError;
 use crate::arena::arena_cache;
 use crate::utils::holder::{ByteConversionError, Holder};
-use crate::{Inode, InodeAllocator};
+use crate::{PathId, PathIdAllocator};
 use realize_types::Arena;
 use redb::{ReadableTable, Table, TableDefinition};
 use std::cell::RefCell;
@@ -35,29 +35,29 @@ const HISTORY_TABLE: TableDefinition<u64, Holder<HistoryTableEntry>> =
 /// Value: depends on the setting
 const SETTINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("index.settings");
 
-/// Tree branches and leaves, associated to inodes.
+/// Tree branches and leaves, associated to pathids.
 ///
-/// Key: (inode, name)
-/// Value: inode
-pub(crate) const TREE_TABLE: TableDefinition<(Inode, &str), Inode> = TableDefinition::new("tree");
+/// Key: (pathid, name)
+/// Value: pathid
+pub(crate) const TREE_TABLE: TableDefinition<(PathId, &str), PathId> = TableDefinition::new("tree");
 
 /// Refcount for tree nodes
 ///
-/// Key: inode
+/// Key: pathid
 /// Value: u32 (refcount)
-pub(crate) const TREE_REFCOUNT_TABLE: TableDefinition<Inode, u32> =
+pub(crate) const TREE_REFCOUNT_TABLE: TableDefinition<PathId, u32> =
     TableDefinition::new("tree.refcount");
 
 /// Track peer files.
 ///
 /// Each known peer file has an entry in this table, keyed with the
-/// file inode and the peer name. More than one peer might have the
+/// file pathid and the peer name. More than one peer might have the
 /// same entry.
 ///
-/// An inode available in no peers should be remove from all
+/// An pathid available in no peers should be remove from all
 /// directories.
 ///
-/// Key: CacheTableKey (inode, default|local|peer, peer)
+/// Key: CacheTableKey (pathid, default|local|peer, peer)
 /// Value: CacheTableEntry
 const CACHE_TABLE: TableDefinition<CacheTableKey, Holder<CacheTableEntry>> =
     TableDefinition::new("cache.file");
@@ -65,11 +65,11 @@ const CACHE_TABLE: TableDefinition<CacheTableKey, Holder<CacheTableEntry>> =
 /// Track local indexed files.
 ///
 /// Each locally indexed file has an entry in this table, keyed with
-/// the file inode.
+/// the file pathid.
 ///
-/// Key: Inode
+/// Key: PathId
 /// Value: FileTableEntry
-const INDEX_TABLE: TableDefinition<Inode, Holder<FileTableEntry>> =
+const INDEX_TABLE: TableDefinition<PathId, Holder<FileTableEntry>> =
     TableDefinition::new("index.file");
 
 /// Track peer files that might have been deleted remotely.
@@ -79,9 +79,9 @@ const INDEX_TABLE: TableDefinition<Inode, Holder<FileTableEntry>> =
 /// corresponding entry in the table. At the end of catchup, files
 /// still in this table are deleted.
 ///
-/// Key: (peer, file inode)
+/// Key: (peer, file pathid)
 /// Value: ()
-const PENDING_CATCHUP_TABLE: TableDefinition<(&str, Inode), ()> =
+const PENDING_CATCHUP_TABLE: TableDefinition<(&str, PathId), ()> =
     TableDefinition::new("acache.pending_catchup");
 
 /// Track Peer UUIDs.
@@ -105,12 +105,12 @@ const NOTIFICATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("aca
 ///
 /// Key: BlodId
 /// Value: BlobTableEntry
-const BLOB_TABLE: TableDefinition<Inode, Holder<BlobTableEntry>> = TableDefinition::new("blob");
+const BLOB_TABLE: TableDefinition<PathId, Holder<BlobTableEntry>> = TableDefinition::new("blob");
 
 /// Track the next blob ID to be allocated.
 ///
 /// Key: () (unit key)
-/// Value: Inode (next ID to allocate)
+/// Value: PathId (next ID to allocate)
 
 /// Track LRU queue for blobs.
 ///
@@ -119,21 +119,21 @@ const BLOB_TABLE: TableDefinition<Inode, Holder<BlobTableEntry>> = TableDefiniti
 const BLOB_LRU_QUEUE_TABLE: TableDefinition<u16, Holder<QueueTableEntry>> =
     TableDefinition::new("blob.lru_queue");
 
-/// Track current inode range for each arena.
+/// Track current pathid range for each arena.
 ///
-/// The current inode is the last inode that was allocated for the
+/// The current pathid is the last pathid that was allocated for the
 /// arena.
 ///
 /// Key: ()
-/// Value: (Inode, Inode) (last inode allocated, end of range)
-pub(crate) const CURRENT_INODE_RANGE_TABLE: TableDefinition<(), (Inode, Inode)> =
-    TableDefinition::new("acache.current_inode_range");
+/// Value: (PathId, PathId) (last pathid allocated, end of range)
+pub(crate) const CURRENT_INODE_RANGE_TABLE: TableDefinition<(), (PathId, PathId)> =
+    TableDefinition::new("acache.current_pathid_range");
 
 /// Mark table for storing file marks within an Arena.
 ///
 /// Key: &str (path)
 /// Value: Holder<MarkTableEntry>
-const MARK_TABLE: TableDefinition<Inode, Holder<MarkTableEntry>> = TableDefinition::new("mark");
+const MARK_TABLE: TableDefinition<PathId, Holder<MarkTableEntry>> = TableDefinition::new("mark");
 
 /// Path marked dirty, indexed by path.
 ///
@@ -143,13 +143,13 @@ const MARK_TABLE: TableDefinition<Inode, Holder<MarkTableEntry>> = TableDefiniti
 ///
 /// Key: &str (path)
 /// Value: dirty counter (key of DIRTY_LOG_TABLE)
-const DIRTY_TABLE: TableDefinition<Inode, u64> = TableDefinition::new("dirty");
+const DIRTY_TABLE: TableDefinition<PathId, u64> = TableDefinition::new("dirty");
 
 /// Path marked dirty, indexed by an increasing counter.
 ///
 /// Key: u64 (increasing counter)
 /// Value: &str (path)
-const DIRTY_LOG_TABLE: TableDefinition<u64, Inode> = TableDefinition::new("dirty_log");
+const DIRTY_LOG_TABLE: TableDefinition<u64, PathId> = TableDefinition::new("dirty_log");
 
 /// Highest counter value for DIRTY_LOG_TABLE.
 ///
@@ -186,7 +186,7 @@ impl ArenaDatabase {
     ) -> anyhow::Result<Arc<Self>> {
         ArenaDatabase::for_testing(
             arena,
-            crate::InodeAllocator::new(
+            crate::PathIdAllocator::new(
                 crate::GlobalDatabase::new(crate::utils::redb_utils::in_memory()?)?,
                 [arena],
             )?,
@@ -197,7 +197,7 @@ impl ArenaDatabase {
     #[cfg(test)]
     pub fn for_testing<P: AsRef<std::path::Path>>(
         arena: realize_types::Arena,
-        allocator: Arc<crate::InodeAllocator>,
+        allocator: Arc<crate::PathIdAllocator>,
         blob_dir: P,
     ) -> anyhow::Result<Arc<Self>> {
         Ok(ArenaDatabase::new(
@@ -211,7 +211,7 @@ impl ArenaDatabase {
     pub fn new<P: AsRef<std::path::Path>>(
         db: redb::Database,
         arena: Arena,
-        allocator: Arc<InodeAllocator>,
+        allocator: Arc<PathIdAllocator>,
         blob_dir: P,
     ) -> Result<Arc<Self>, StorageError> {
         let tree = Tree::new(arena, allocator)?;
@@ -847,7 +847,7 @@ mod tests {
         let blob_dir = tempdir.join("blobs");
         let arena = Arena::from("myarena");
         let allocator =
-            InodeAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
+            PathIdAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
         let db = ArenaDatabase::new(
             redb::Database::create(&dbpath)?,
             arena,

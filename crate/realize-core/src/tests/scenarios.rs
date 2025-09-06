@@ -60,15 +60,15 @@ async fn file_drop() -> anyhow::Result<()> {
             // copy that was moved into the cache must eventually be
             // deleted, because max disk usage is 0.
             let cache_a = storage_a.cache();
-            let foo_inode = cache_a.expect(arena, &foo).await?;
-            while cache_a.local_availability(foo_inode).await? != LocalAvailability::Missing
+            let foo_pathid = cache_a.expect(arena, &foo).await?;
+            while cache_a.local_availability(foo_pathid).await? != LocalAvailability::Missing
                 && Instant::now() < limit
             {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             assert_eq!(
                 LocalAvailability::Missing,
-                cache_a.local_availability(foo_inode).await?
+                cache_a.local_availability(foo_pathid).await?
             );
 
             Ok::<(), anyhow::Error>(())
@@ -113,11 +113,11 @@ async fn link_to_own() -> anyhow::Result<()> {
 
             fixture.wait_for_file_in_cache(b, "work/foo", &hash).await?;
             let cache_b = fixture.cache(b)?;
-            let (store_inode, _) = cache_b.mkdir(cache_b.arena_root(arena)?, "store").await?;
+            let (store_pathid, _) = cache_b.mkdir(cache_b.arena_root(arena)?, "store").await?;
             cache_b
                 .branch(
                     cache_b.expect(arena, &Path::parse("work/foo")?).await?,
-                    store_inode,
+                    store_pathid,
                     "foo",
                 )
                 .await?;

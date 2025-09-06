@@ -1,7 +1,7 @@
 use super::db::AfterCommit;
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations};
 use super::types::{FailedJobTableEntry, RetryJob};
-use crate::Inode;
+use crate::PathId;
 use crate::{JobId, StorageError, utils::holder::Holder};
 use realize_types::{Arena, UnixTime};
 use redb::{ReadableTable, Table};
@@ -14,7 +14,7 @@ pub(crate) struct Dirty {
 }
 
 impl Dirty {
-    pub(crate) fn setup(log_table: &impl ReadableTable<u64, Inode>) -> Result<Self, StorageError> {
+    pub(crate) fn setup(log_table: &impl ReadableTable<u64, PathId>) -> Result<Self, StorageError> {
         let last_counter = last_counter(log_table)?;
         let (watch_tx, watch_rx) = watch::channel(last_counter);
 
@@ -30,8 +30,8 @@ impl Dirty {
 
 pub(crate) struct ReadableOpenDirty<DT, LT, FT>
 where
-    DT: ReadableTable<Inode, u64>,
-    LT: ReadableTable<u64, Inode>,
+    DT: ReadableTable<PathId, u64>,
+    LT: ReadableTable<u64, PathId>,
     FT: ReadableTable<u64, Holder<'static, FailedJobTableEntry>>,
 {
     table: DT,
@@ -41,8 +41,8 @@ where
 
 impl<DT, LT, FT> ReadableOpenDirty<DT, LT, FT>
 where
-    DT: ReadableTable<Inode, u64>,
-    LT: ReadableTable<u64, Inode>,
+    DT: ReadableTable<PathId, u64>,
+    LT: ReadableTable<u64, PathId>,
     FT: ReadableTable<u64, Holder<'static, FailedJobTableEntry>>,
 {
     pub(crate) fn new(dirty_table: DT, log_table: LT, failed_job_table: FT) -> Self {
@@ -57,8 +57,8 @@ where
 pub(crate) struct WritableOpenDirty<'a> {
     after_commit: &'a AfterCommit,
     dirty: &'a Dirty,
-    table: Table<'a, Inode, u64>,
-    log_table: Table<'a, u64, Inode>,
+    table: Table<'a, PathId, u64>,
+    log_table: Table<'a, u64, PathId>,
     failed_job_table: Table<'a, u64, Holder<'static, FailedJobTableEntry>>,
     counter_table: Table<'a, (), u64>,
     arena: Arena,
@@ -68,8 +68,8 @@ impl<'a> WritableOpenDirty<'a> {
     pub(crate) fn new(
         after_commit: &'a AfterCommit,
         dirty: &'a Dirty,
-        dirty_table: Table<'a, Inode, u64>,
-        log_table: Table<'a, u64, Inode>,
+        dirty_table: Table<'a, PathId, u64>,
+        log_table: Table<'a, u64, PathId>,
         failed_job_table: Table<'a, u64, Holder<FailedJobTableEntry>>,
         counter_table: Table<'a, (), u64>,
         arena: Arena,
@@ -87,11 +87,11 @@ impl<'a> WritableOpenDirty<'a> {
 }
 
 pub(crate) trait DirtyReadOperations {
-    fn next_dirty(&self, start_counter: u64) -> Result<Option<(Inode, u64)>, StorageError>;
+    fn next_dirty(&self, start_counter: u64) -> Result<Option<(PathId, u64)>, StorageError>;
     #[allow(dead_code)] // for testing
     fn last_counter(&self) -> Result<u64, StorageError>;
-    fn get_inode_for_counter(&self, counter: u64) -> Result<Option<Inode>, StorageError>;
-    fn get_counter(&self, inode: Inode) -> Result<Option<u64>, StorageError>;
+    fn get_pathid_for_counter(&self, counter: u64) -> Result<Option<PathId>, StorageError>;
+    fn get_counter(&self, pathid: PathId) -> Result<Option<u64>, StorageError>;
     fn is_job_failed(&self, job_id: JobId) -> Result<bool, StorageError>;
     fn get_jobs_waiting_for_peers(&self) -> Result<Vec<u64>, StorageError>;
     fn get_earliest_backoff(
@@ -102,11 +102,11 @@ pub(crate) trait DirtyReadOperations {
 
 impl<DT, LT, FT> DirtyReadOperations for ReadableOpenDirty<DT, LT, FT>
 where
-    DT: ReadableTable<Inode, u64>,
-    LT: ReadableTable<u64, Inode>,
+    DT: ReadableTable<PathId, u64>,
+    LT: ReadableTable<u64, PathId>,
     FT: ReadableTable<u64, Holder<'static, FailedJobTableEntry>>,
 {
-    fn next_dirty(&self, start_counter: u64) -> Result<Option<(Inode, u64)>, StorageError> {
+    fn next_dirty(&self, start_counter: u64) -> Result<Option<(PathId, u64)>, StorageError> {
         next_dirty(&self.log_table, start_counter)
     }
 
@@ -114,12 +114,12 @@ where
         last_counter(&self.log_table)
     }
 
-    fn get_inode_for_counter(&self, counter: u64) -> Result<Option<Inode>, StorageError> {
-        get_inode_for_counter(&self.log_table, counter)
+    fn get_pathid_for_counter(&self, counter: u64) -> Result<Option<PathId>, StorageError> {
+        get_pathid_for_counter(&self.log_table, counter)
     }
 
-    fn get_counter(&self, inode: Inode) -> Result<Option<u64>, StorageError> {
-        get_counter(&self.table, inode)
+    fn get_counter(&self, pathid: PathId) -> Result<Option<u64>, StorageError> {
+        get_counter(&self.table, pathid)
     }
 
     fn is_job_failed(&self, job_id: JobId) -> Result<bool, StorageError> {
@@ -139,7 +139,7 @@ where
 }
 
 impl<'a> DirtyReadOperations for WritableOpenDirty<'a> {
-    fn next_dirty(&self, start_counter: u64) -> Result<Option<(Inode, u64)>, StorageError> {
+    fn next_dirty(&self, start_counter: u64) -> Result<Option<(PathId, u64)>, StorageError> {
         next_dirty(&self.log_table, start_counter)
     }
 
@@ -147,12 +147,12 @@ impl<'a> DirtyReadOperations for WritableOpenDirty<'a> {
         last_counter(&self.log_table)
     }
 
-    fn get_inode_for_counter(&self, counter: u64) -> Result<Option<Inode>, StorageError> {
-        get_inode_for_counter(&self.log_table, counter)
+    fn get_pathid_for_counter(&self, counter: u64) -> Result<Option<PathId>, StorageError> {
+        get_pathid_for_counter(&self.log_table, counter)
     }
 
-    fn get_counter(&self, inode: Inode) -> Result<Option<u64>, StorageError> {
-        get_counter(&self.table, inode)
+    fn get_counter(&self, pathid: PathId) -> Result<Option<u64>, StorageError> {
+        get_counter(&self.table, pathid)
     }
 
     fn is_job_failed(&self, job_id: JobId) -> Result<bool, StorageError> {
@@ -189,7 +189,7 @@ impl<'a> WritableOpenDirty<'a> {
         job_id: JobId,
         retry_strategy: &dyn Fn(u32) -> Option<Duration>,
     ) -> Result<Option<UnixTime>, StorageError> {
-        let inode = match self.log_table.get(job_id.as_u64())? {
+        let pathid = match self.log_table.get(job_id.as_u64())? {
             Some(v) => v.value(),
             None => {
                 return Ok(None);
@@ -207,7 +207,7 @@ impl<'a> WritableOpenDirty<'a> {
             None => {
                 self.log_table.remove(counter)?;
                 self.failed_job_table.remove(counter)?;
-                self.table.remove(inode)?;
+                self.table.remove(pathid)?;
 
                 Ok(None)
             }
@@ -275,13 +275,13 @@ impl<'a> WritableOpenDirty<'a> {
     ) -> Result<(), StorageError> {
         if let Some(start) = tree.resolve(loc)? {
             // Marking a directory does nothing, so let's skip marking
-            // root. The other inodes, however, might be a file, at
+            // root. The other pathids, however, might be a file, at
             // least in some subsystems so should always be marked.
             if start != tree.root() {
                 self.mark_dirty(start, reason)?;
             }
-            for inode in tree.recurse(start, |_| true) {
-                self.mark_dirty(inode?, reason)?;
+            for pathid in tree.recurse(start, |_| true) {
+                self.mark_dirty(pathid?, reason)?;
             }
         }
 
@@ -293,15 +293,15 @@ impl<'a> WritableOpenDirty<'a> {
     /// This does nothing if the path is already dirty.
     pub(crate) fn mark_dirty(
         &mut self,
-        inode: Inode,
+        pathid: PathId,
         reason: &'static str,
     ) -> Result<(), StorageError> {
         let last_counter = self.counter_table.get(())?.map(|e| e.value()).unwrap_or(0);
         let counter = last_counter + 1;
-        log::debug!("[{}] Dirty inode {inode} ({reason}) #{counter}", self.arena);
+        log::debug!("[{}] Dirty pathid {pathid} ({reason}) #{counter}", self.arena);
         self.counter_table.insert((), counter)?;
-        self.log_table.insert(counter, inode)?;
-        let prev = self.table.insert(inode, counter)?;
+        self.log_table.insert(counter, pathid)?;
+        let prev = self.table.insert(pathid, counter)?;
         if let Some(prev) = prev {
             let counter = prev.value();
             self.log_table.remove(counter)?;
@@ -317,29 +317,29 @@ impl<'a> WritableOpenDirty<'a> {
 }
 
 fn next_dirty(
-    log_table: &impl ReadableTable<u64, Inode>,
+    log_table: &impl ReadableTable<u64, PathId>,
     start_counter: u64,
-) -> Result<Option<(Inode, u64)>, StorageError> {
+) -> Result<Option<(PathId, u64)>, StorageError> {
     log::debug!("next dirty({start_counter})");
     for entry in log_table.range(start_counter..)? {
         let (key, value) = entry?;
         let counter = key.value();
-        let inode = value.value();
-        log::debug!("-> {counter} {inode}");
-        return Ok(Some((inode, counter)));
+        let pathid = value.value();
+        log::debug!("-> {counter} {pathid}");
+        return Ok(Some((pathid, counter)));
     }
     log::debug!("-> None");
     Ok(None)
 }
 
-fn last_counter(log_table: &impl ReadableTable<u64, Inode>) -> Result<u64, StorageError> {
+fn last_counter(log_table: &impl ReadableTable<u64, PathId>) -> Result<u64, StorageError> {
     Ok(log_table.last()?.map(|(k, _)| k.value()).unwrap_or(0))
 }
 
-fn get_inode_for_counter(
-    log_table: &impl ReadableTable<u64, Inode>,
+fn get_pathid_for_counter(
+    log_table: &impl ReadableTable<u64, PathId>,
     counter: u64,
-) -> Result<Option<Inode>, StorageError> {
+) -> Result<Option<PathId>, StorageError> {
     if let Some(v) = log_table.get(counter)? {
         Ok(Some(v.value()))
     } else {
@@ -348,10 +348,10 @@ fn get_inode_for_counter(
 }
 
 fn get_counter(
-    table: &impl ReadableTable<Inode, u64>,
-    inode: Inode,
+    table: &impl ReadableTable<PathId, u64>,
+    pathid: PathId,
 ) -> Result<Option<u64>, StorageError> {
-    if let Some(entry) = table.get(inode)? {
+    if let Some(entry) = table.get(pathid)? {
         Ok(Some(entry.value()))
     } else {
         Ok(None)
@@ -446,18 +446,18 @@ mod tests {
         }
     }
 
-    fn all(dirty: &impl DirtyReadOperations) -> Result<Vec<(Inode, u64)>, StorageError> {
+    fn all(dirty: &impl DirtyReadOperations) -> Result<Vec<(PathId, u64)>, StorageError> {
         let mut start = 0;
         let mut vec = vec![];
-        while let Some((inode, counter)) = dirty.next_dirty(start)? {
-            vec.push((inode, counter));
+        while let Some((pathid, counter)) = dirty.next_dirty(start)? {
+            vec.push((pathid, counter));
             start = counter + 1;
         }
 
         Ok(vec)
     }
 
-    fn all_inodes(dirty: &impl DirtyReadOperations) -> Result<HashSet<Inode>, StorageError> {
+    fn all_pathids(dirty: &impl DirtyReadOperations) -> Result<HashSet<PathId>, StorageError> {
         Ok(all(dirty)?.into_iter().map(|(i, _)| i).collect())
     }
 
@@ -467,7 +467,7 @@ mod tests {
     ) -> Result<HashSet<Path>, StorageError> {
         Ok(all(dirty)?
             .into_iter()
-            .filter_map(|(inode, _)| tree.backtrack(inode).ok().flatten())
+            .filter_map(|(pathid, _)| tree.backtrack(pathid).ok().flatten())
             .collect())
     }
 
@@ -501,7 +501,7 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut dirty = txn.write_dirty()?;
 
-        dirty.mark_dirty(Inode(1), "test")?;
+        dirty.mark_dirty(PathId(1), "test")?;
 
         Ok(())
     }
@@ -556,14 +556,14 @@ mod tests {
         dirty.mark_dirty(path, "test")?;
 
         // Verify it's dirty
-        assert_eq!(HashSet::from([path]), all_inodes(&dirty)?);
+        assert_eq!(HashSet::from([path]), all_pathids(&dirty)?);
 
         // Mark job as done
         let was_dirty = dirty.mark_job_done(job_id)?;
         assert!(was_dirty);
 
         // Verify path is no longer dirty
-        assert_eq!(HashSet::new(), all_inodes(&dirty)?);
+        assert_eq!(HashSet::new(), all_pathids(&dirty)?);
 
         // Mark job as done again (should return false)
         let was_dirty = dirty.mark_job_done(job_id)?;
@@ -667,11 +667,11 @@ mod tests {
         dirty.mark_dirty(path, "test")?;
 
         // Get path for counter 1
-        let result = dirty.get_inode_for_counter(1)?;
+        let result = dirty.get_pathid_for_counter(1)?;
         assert_eq!(result, Some(path.clone()));
 
         // Get path for non-existent counter
-        let result = dirty.get_inode_for_counter(999)?;
+        let result = dirty.get_pathid_for_counter(999)?;
         assert_eq!(result, None);
 
         Ok(())
@@ -693,7 +693,7 @@ mod tests {
         assert_eq!(result, Some(1));
 
         // Get counter for non-existent path
-        let result = dirty.get_counter(Inode(999))?;
+        let result = dirty.get_counter(PathId(999))?;
         assert_eq!(result, None);
 
         Ok(())
@@ -804,7 +804,7 @@ mod tests {
 
         // path 1 and 2 should have been deleted but not 3, as range
         // end is exclusive.
-        assert_eq!(HashSet::from([path3]), all_inodes(&dirty)?);
+        assert_eq!(HashSet::from([path3]), all_pathids(&dirty)?);
 
         Ok(())
     }
@@ -849,7 +849,7 @@ mod tests {
 
         let was_dirty = dirty.mark_job_done(job_id)?;
         assert!(was_dirty);
-        assert_eq!(HashSet::new(), all_inodes(&dirty)?);
+        assert_eq!(HashSet::new(), all_pathids(&dirty)?);
         assert!(!dirty.is_job_failed(job_id)?);
 
         Ok(())

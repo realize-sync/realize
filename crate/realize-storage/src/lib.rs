@@ -5,7 +5,7 @@ use arena::{ArenaStorage, indexed_store};
 use config::StorageConfig;
 use futures::Stream;
 use global::db::GlobalDatabase;
-use global::inode_allocator::InodeAllocator;
+use global::pathid_allocator::PathIdAllocator;
 use realize_types::{self, Arena, ByteRange, Delta, Path, Peer, Signature};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,8 +31,8 @@ pub use arena::notifier::Progress;
 pub use arena::types::{DirMetadata, FileAvailability, FileMetadata, LocalAvailability, Mark};
 pub use error::StorageError;
 pub use global::cache::GlobalCache;
-pub use global::types::InodeAssignment;
-pub use types::{Inode, JobId};
+pub use global::types::PathAssignment;
+pub use types::{PathId, JobId};
 
 /// Local storage, including the real store and an unreal cache.
 pub struct Storage {
@@ -49,7 +49,7 @@ impl Storage {
         let globaldb = create_globaldb(&config.cache.db)
             .await
             .with_context(|| format!("global database {:?}", config.cache.db))?;
-        let allocator = InodeAllocator::new(
+        let allocator = PathIdAllocator::new(
             Arc::clone(&globaldb),
             config.arenas.iter().map(|a| a.arena).collect::<Vec<_>>(),
         )?;

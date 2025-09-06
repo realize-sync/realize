@@ -188,25 +188,25 @@ impl HouseholdFixture {
         while cache.resolve(arena, &path).await?.is_none() && Instant::now() < deadline {
             tokio::time::sleep(delay).await;
         }
-        let inode = cache
+        let pathid = cache
             .resolve(arena, &path)
             .await?
             .expect("[{arena}]/{path}");
-        while cache.file_metadata(inode).await.is_err() && Instant::now() < deadline {
+        while cache.file_metadata(pathid).await.is_err() && Instant::now() < deadline {
             tokio::time::sleep(delay).await;
         }
         assert!(
-            cache.file_metadata(inode).await.is_ok(),
+            cache.file_metadata(pathid).await.is_ok(),
             "[arena]/{filename} never appeared in the cache of {peer}"
         );
 
         // Then, wait for the file to have the expected hash
-        while cache.file_metadata(inode).await?.hash != *hash && Instant::now() < deadline {
+        while cache.file_metadata(pathid).await?.hash != *hash && Instant::now() < deadline {
             tokio::time::sleep(delay).await;
         }
         assert_eq!(
             *hash,
-            cache.file_metadata(inode).await?.hash,
+            cache.file_metadata(pathid).await?.hash,
             "[arena]/{filename} {hash} never appeared the cache of {peer}"
         );
 
@@ -229,11 +229,11 @@ impl HouseholdFixture {
 
     pub async fn open_file(&self, peer: Peer, path_str: &str) -> anyhow::Result<Blob> {
         let cache = self.cache(peer)?;
-        let inode = cache
+        let pathid = cache
             .expect(HouseholdFixture::test_arena(), &Path::parse(path_str)?)
             .await?;
 
-        Ok(cache.open_file(inode).await?)
+        Ok(cache.open_file(pathid).await?)
     }
 
     // Pick a port for the given peer and store it in the network

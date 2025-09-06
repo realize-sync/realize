@@ -1,4 +1,4 @@
-use crate::types::Inode;
+use crate::types::PathId;
 use crate::utils::holder::{ByteConversionError, ByteConvertible, NamedType};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
@@ -12,12 +12,12 @@ mod cache_capnp {
     include!(concat!(env!("OUT_DIR"), "/global/cache_capnp.rs"));
 }
 
-/// The type of an inode.
+/// The type of an pathid.
 #[derive(Debug, Copy, Clone, PartialEq)]
-pub enum InodeAssignment {
-    /// The inode of a file, look it up in the file table.
+pub enum PathAssignment {
+    /// The pathid of a file, look it up in the file table.
     File,
-    /// The inode of a directory, look it up in the directory table.
+    /// The pathid of a directory, look it up in the directory table.
     ///
     /// Note that an empty directory won't have any entries in
     /// the directory table.
@@ -27,8 +27,8 @@ pub enum InodeAssignment {
 /// An entry in the path table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PathTableEntry {
-    /// Directory or arena inode
-    pub inode: Inode,
+    /// Directory or arena pathid
+    pub pathid: PathId,
     /// The modification time when the directory was created.
     pub mtime: UnixTime,
 }
@@ -47,7 +47,7 @@ impl ByteConvertible<PathTableEntry> for PathTableEntry {
 
         let mtime = msg.get_mtime()?;
         Ok(PathTableEntry {
-            inode: Inode(msg.get_inode()),
+            pathid: PathId(msg.get_pathid()),
             mtime: UnixTime::new(mtime.get_secs(), mtime.get_nsecs()),
         })
     }
@@ -57,7 +57,7 @@ impl ByteConvertible<PathTableEntry> for PathTableEntry {
         let mut builder: cache_capnp::path_table_entry::Builder =
             message.init_root::<cache_capnp::path_table_entry::Builder>();
 
-        builder.set_inode(self.inode.as_u64());
+        builder.set_pathid(self.pathid.as_u64());
         let mut mtime = builder.init_mtime();
         mtime.set_secs(self.mtime.as_secs());
         mtime.set_nsecs(self.mtime.subsec_nanos());
@@ -76,7 +76,7 @@ mod tests {
     #[test]
     fn convert_path_table_entry() -> anyhow::Result<()> {
         let entry = PathTableEntry {
-            inode: Inode(442),
+            pathid: PathId(442),
             mtime: UnixTime::from_secs(1234567890),
         };
 

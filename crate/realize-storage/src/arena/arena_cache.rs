@@ -12,46 +12,46 @@ use crate::arena::notifier::{Notification, Progress};
 use crate::arena::tree;
 use crate::arena::types::DirMetadata;
 use crate::utils::holder::Holder;
-use crate::{Blob, InodeAssignment, LocalAvailability};
-use crate::{Inode, StorageError};
+use crate::{Blob, PathAssignment, LocalAvailability};
+use crate::{PathId, StorageError};
 use realize_types::{Arena, Hash, Path, Peer, UnixTime};
 use redb::{ReadableTable, Table};
 use std::sync::Arc;
 
 /// Read operations for cache. See also [CacheExt].
 pub(crate) trait CacheReadOperations {
-    /// Lookup a specific name in the given directory inode.
+    /// Lookup a specific name in the given directory pathid.
     fn lookup(
         &self,
         tree: &impl TreeReadOperations,
-        parent_inode: Inode,
+        parent_pathid: PathId,
         name: &str,
-    ) -> Result<(Inode, InodeAssignment), StorageError>;
+    ) -> Result<(PathId, PathAssignment), StorageError>;
 
-    /// Get directory modification time for the given inode.
-    fn dir_mtime(&self, inode: Inode) -> Result<UnixTime, StorageError>;
+    /// Get directory modification time for the given pathid.
+    fn dir_mtime(&self, pathid: PathId) -> Result<UnixTime, StorageError>;
 
-    /// Get remote file availability information for the given inode and version.
+    /// Get remote file availability information for the given pathid and version.
     fn file_availability(
         &self,
-        inode: Inode,
+        pathid: PathId,
         hash: &Hash,
     ) -> Result<Option<FileAvailability>, StorageError>;
 
-    /// Read directory contents for the given inode.
+    /// Read directory contents for the given pathid.
     fn readdir(
         &self,
         tree: &impl TreeReadOperations,
-        inode: Inode,
-    ) -> impl Iterator<Item = Result<(String, Inode, InodeAssignment), StorageError>>;
+        pathid: PathId,
+    ) -> impl Iterator<Item = Result<(String, PathId, PathAssignment), StorageError>>;
 
-    /// Get the default file entry for the given inode.
-    fn get_at_inode(&self, inode: Inode) -> Result<Option<FileTableEntry>, StorageError>;
+    /// Get the default file entry for the given pathid.
+    fn get_at_pathid(&self, pathid: PathId) -> Result<Option<FileTableEntry>, StorageError>;
 
-    /// Get the default file entry for the given inode; fail if the entry
+    /// Get the default file entry for the given pathid; fail if the entry
     /// cannot be found or if it is a directory.
     #[allow(dead_code)]
-    fn get_at_inode_or_err(&self, inode: Inode) -> Result<FileTableEntry, StorageError>;
+    fn get_at_pathid_or_err(&self, pathid: PathId) -> Result<FileTableEntry, StorageError>;
 }
 
 /// A cache open for reading with a read transaction.
@@ -79,38 +79,38 @@ where
     fn lookup(
         &self,
         tree: &impl TreeReadOperations,
-        parent_inode: Inode,
+        parent_pathid: PathId,
         name: &str,
-    ) -> Result<(Inode, InodeAssignment), StorageError> {
-        lookup(&self.table, tree, parent_inode, name)
+    ) -> Result<(PathId, PathAssignment), StorageError> {
+        lookup(&self.table, tree, parent_pathid, name)
     }
 
-    fn dir_mtime(&self, inode: Inode) -> Result<UnixTime, StorageError> {
-        dir_mtime(&self.table, inode)
+    fn dir_mtime(&self, pathid: PathId) -> Result<UnixTime, StorageError> {
+        dir_mtime(&self.table, pathid)
     }
 
     fn file_availability(
         &self,
-        inode: Inode,
+        pathid: PathId,
         hash: &Hash,
     ) -> Result<Option<FileAvailability>, StorageError> {
-        file_availability(&self.table, inode, self.arena, hash)
+        file_availability(&self.table, pathid, self.arena, hash)
     }
 
     fn readdir(
         &self,
         tree: &impl TreeReadOperations,
-        inode: Inode,
-    ) -> impl Iterator<Item = Result<(String, Inode, InodeAssignment), StorageError>> {
-        ReadDirIterator::new(&self.table, tree, inode)
+        pathid: PathId,
+    ) -> impl Iterator<Item = Result<(String, PathId, PathAssignment), StorageError>> {
+        ReadDirIterator::new(&self.table, tree, pathid)
     }
 
-    fn get_at_inode(&self, inode: Inode) -> Result<Option<FileTableEntry>, StorageError> {
-        get_default_entry(&self.table, inode)
+    fn get_at_pathid(&self, pathid: PathId) -> Result<Option<FileTableEntry>, StorageError> {
+        get_default_entry(&self.table, pathid)
     }
 
-    fn get_at_inode_or_err(&self, inode: Inode) -> Result<FileTableEntry, StorageError> {
-        get_default_entry_or_err(&self.table, inode)
+    fn get_at_pathid_or_err(&self, pathid: PathId) -> Result<FileTableEntry, StorageError> {
+        get_default_entry_or_err(&self.table, pathid)
     }
 }
 
@@ -118,38 +118,38 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
     fn lookup(
         &self,
         tree: &impl TreeReadOperations,
-        parent_inode: Inode,
+        parent_pathid: PathId,
         name: &str,
-    ) -> Result<(Inode, InodeAssignment), StorageError> {
-        lookup(&self.table, tree, parent_inode, name)
+    ) -> Result<(PathId, PathAssignment), StorageError> {
+        lookup(&self.table, tree, parent_pathid, name)
     }
 
-    fn dir_mtime(&self, inode: Inode) -> Result<UnixTime, StorageError> {
-        dir_mtime(&self.table, inode)
+    fn dir_mtime(&self, pathid: PathId) -> Result<UnixTime, StorageError> {
+        dir_mtime(&self.table, pathid)
     }
 
     fn file_availability(
         &self,
-        inode: Inode,
+        pathid: PathId,
         hash: &Hash,
     ) -> Result<Option<FileAvailability>, StorageError> {
-        file_availability(&self.table, inode, self.arena, hash)
+        file_availability(&self.table, pathid, self.arena, hash)
     }
 
     fn readdir(
         &self,
         tree: &impl TreeReadOperations,
-        inode: Inode,
-    ) -> impl Iterator<Item = Result<(String, Inode, InodeAssignment), StorageError>> {
-        ReadDirIterator::new(&self.table, tree, inode)
+        pathid: PathId,
+    ) -> impl Iterator<Item = Result<(String, PathId, PathAssignment), StorageError>> {
+        ReadDirIterator::new(&self.table, tree, pathid)
     }
 
-    fn get_at_inode(&self, inode: Inode) -> Result<Option<FileTableEntry>, StorageError> {
-        get_default_entry(&self.table, inode)
+    fn get_at_pathid(&self, pathid: PathId) -> Result<Option<FileTableEntry>, StorageError> {
+        get_default_entry(&self.table, pathid)
     }
 
-    fn get_at_inode_or_err(&self, inode: Inode) -> Result<FileTableEntry, StorageError> {
-        get_default_entry_or_err(&self.table, inode)
+    fn get_at_pathid_or_err(&self, pathid: PathId) -> Result<FileTableEntry, StorageError> {
+        get_default_entry_or_err(&self.table, pathid)
     }
 }
 
@@ -174,14 +174,14 @@ pub(crate) trait CacheExt {
         loc: L,
     ) -> Result<FileTableEntry, StorageError>;
 
-    fn file_metadata(&self, inode: Inode) -> Result<FileMetadata, StorageError>;
+    fn file_metadata(&self, pathid: PathId) -> Result<FileMetadata, StorageError>;
 }
 
 impl<T: CacheReadOperations> CacheExt for T {
-    fn file_metadata(&self, inode: Inode) -> Result<FileMetadata, StorageError> {
+    fn file_metadata(&self, pathid: PathId) -> Result<FileMetadata, StorageError> {
         let FileTableEntry {
             size, mtime, hash, ..
-        } = self.get_at_inode(inode)?.ok_or(StorageError::NotFound)?;
+        } = self.get_at_pathid(pathid)?.ok_or(StorageError::NotFound)?;
 
         Ok(FileMetadata { size, mtime, hash })
     }
@@ -191,8 +191,8 @@ impl<T: CacheReadOperations> CacheExt for T {
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<Option<FileTableEntry>, StorageError> {
-        if let Some(inode) = tree.resolve(loc)? {
-            self.get_at_inode(inode)
+        if let Some(pathid) = tree.resolve(loc)? {
+            self.get_at_pathid(pathid)
         } else {
             Ok(None)
         }
@@ -202,21 +202,21 @@ impl<T: CacheReadOperations> CacheExt for T {
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<FileTableEntry, StorageError> {
-        self.get_at_inode_or_err(tree.expect(loc)?)
+        self.get_at_pathid_or_err(tree.expect(loc)?)
     }
 }
 
 /// A cache open for writing with a write transaction.
 pub(crate) struct WritableOpenCache<'a> {
     table: Table<'a, CacheTableKey, Holder<'static, CacheTableEntry>>,
-    pending_catchup_table: Table<'a, (&'static str, Inode), ()>,
+    pending_catchup_table: Table<'a, (&'static str, PathId), ()>,
     arena: Arena,
 }
 
 impl<'a> WritableOpenCache<'a> {
     pub(crate) fn new(
         table: Table<'a, CacheTableKey, Holder<CacheTableEntry>>,
-        pending_catchup_table: Table<'a, (&'static str, Inode), ()>,
+        pending_catchup_table: Table<'a, (&'static str, PathId), ()>,
         arena: Arena,
     ) -> Self {
         Self {
@@ -230,13 +230,13 @@ impl<'a> WritableOpenCache<'a> {
     pub(crate) fn create_blob(
         &mut self,
         txn: &ArenaWriteTransaction,
-        inode: Inode,
+        pathid: PathId,
     ) -> Result<BlobInfo, StorageError> {
-        let file_entry = get_default_entry_or_err(&self.table, inode)?;
+        let file_entry = get_default_entry_or_err(&self.table, pathid)?;
         let mut blobs = txn.write_blobs()?;
         let mut tree = txn.write_tree()?;
         let marks = txn.read_marks()?;
-        blobs.create(&mut tree, &marks, inode, &file_entry.hash, file_entry.size)
+        blobs.create(&mut tree, &marks, pathid, &file_entry.hash, file_entry.size)
     }
 
     /// Remove file locally, even though it might still be available in other peers.
@@ -248,18 +248,18 @@ impl<'a> WritableOpenCache<'a> {
         blobs: &mut WritableOpenBlob,
         history: &mut WritableOpenHistory,
         dirty: &mut WritableOpenDirty,
-        parent: Inode,
+        parent: PathId,
         name: &str,
     ) -> Result<(), StorageError> {
-        let inode = tree.lookup(parent, name)?.ok_or(StorageError::NotFound)?;
-        let e = get_file_entry(&self.table, inode, None)?.ok_or(StorageError::NotFound)?;
+        let pathid = tree.lookup(parent, name)?.ok_or(StorageError::NotFound)?;
+        let e = get_file_entry(&self.table, pathid, None)?.ok_or(StorageError::NotFound)?;
         log::debug!(
-            "[{}]@local Local removal of \"{}\" inode {inode} {}",
+            "[{}]@local Local removal of \"{}\" pathid {pathid} {}",
             self.arena,
             e.path,
             e.hash
         );
-        self.rm_default_file_entry(tree, blobs, dirty, parent, inode)?;
+        self.rm_default_file_entry(tree, blobs, dirty, parent, pathid)?;
         history.report_removed(&e.path, &e.hash)?;
 
         Ok(())
@@ -272,14 +272,14 @@ impl<'a> WritableOpenCache<'a> {
         blobs: &mut WritableOpenBlob,
         history: &mut WritableOpenHistory,
         dirty: &mut WritableOpenDirty,
-        source: Inode,
-        parent: Inode,
+        source: PathId,
+        parent: PathId,
         name: &str,
-    ) -> Result<(Inode, FileMetadata), StorageError> {
-        let mut entry = self.get_at_inode_or_err(source)?;
+    ) -> Result<(PathId, FileMetadata), StorageError> {
+        let mut entry = self.get_at_pathid_or_err(source)?;
         let dest = tree.setup_name(parent, name)?;
         entry.branched_from = Some(source);
-        let old_hash = self.get_at_inode(dest)?.map(|e| e.hash);
+        let old_hash = self.get_at_pathid(dest)?.map(|e| e.hash);
         self.write_default_file_entry(tree, blobs, dirty, dest, &entry)?;
 
         if let (Some(source_path), Some(dest_path)) =
@@ -302,21 +302,21 @@ impl<'a> WritableOpenCache<'a> {
         &mut self,
         tree: &mut WritableOpenTree,
         loc: L,
-    ) -> Result<(Inode, DirMetadata), StorageError> {
-        let inode = tree.setup(loc)?;
-        if self.table.get(CacheTableKey::Default(inode))?.is_some() {
+    ) -> Result<(PathId, DirMetadata), StorageError> {
+        let pathid = tree.setup(loc)?;
+        if self.table.get(CacheTableKey::Default(pathid))?.is_some() {
             return Err(StorageError::AlreadyExists);
         }
-        if let Some(parent) = tree.parent(inode)? {
+        if let Some(parent) = tree.parent(pathid)? {
             // The parent must exist and be a directory. Note that
             // None is the arena root which always exist.
             check_is_dir(&self.table, parent)?;
         }
         let mtime = UnixTime::now();
-        write_dir_mtime(&mut self.table, tree, inode, mtime)?;
+        write_dir_mtime(&mut self.table, tree, pathid, mtime)?;
 
         Ok((
-            inode,
+            pathid,
             DirMetadata {
                 read_only: false,
                 mtime,
@@ -329,15 +329,15 @@ impl<'a> WritableOpenCache<'a> {
         tree: &mut WritableOpenTree,
         loc: L,
     ) -> Result<(), StorageError> {
-        let inode = tree.expect(loc)?;
-        match inode_assignment(&self.table, inode)? {
-            Some(InodeAssignment::File) => Err(StorageError::NotADirectory),
+        let pathid = tree.expect(loc)?;
+        match pathid_assignment(&self.table, pathid)? {
+            Some(PathAssignment::File) => Err(StorageError::NotADirectory),
             None => Err(StorageError::NotFound),
-            Some(InodeAssignment::Directory) => {
-                if !self.readdir(tree, inode).next().is_none() {
+            Some(PathAssignment::Directory) => {
+                if !self.readdir(tree, pathid).next().is_none() {
                     return Err(StorageError::DirectoryNotEmpty);
                 }
-                tree.remove_and_decref(inode, &mut self.table, CacheTableKey::Default(inode))?;
+                tree.remove_and_decref(pathid, &mut self.table, CacheTableKey::Default(pathid))?;
 
                 Ok(())
             }
@@ -356,16 +356,16 @@ impl<'a> WritableOpenCache<'a> {
         size: u64,
         hash: Hash,
     ) -> Result<(), StorageError> {
-        let (_, file_inode) = create_file(&mut self.table, tree, &path)?;
+        let (_, file_pathid) = create_file(&mut self.table, tree, &path)?;
         let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
-        if get_file_entry(&self.table, file_inode, Some(peer))?.is_none() {
+        if get_file_entry(&self.table, file_pathid, Some(peer))?.is_none() {
             log::debug!("[{}]@{peer} Add \"{path}\" {hash} size={size}", self.arena);
-            self.write_file_entry(tree, file_inode, peer, &entry)?;
+            self.write_file_entry(tree, file_pathid, peer, &entry)?;
         }
         Ok(
-            if get_file_entry(&self.table, file_inode, None)?.is_none() {
+            if get_file_entry(&self.table, file_pathid, None)?.is_none() {
                 log::debug!("[{}]@local Add \"{path}\" {hash} size={size}", self.arena);
-                self.write_default_file_entry(tree, blobs, dirty, file_inode, &entry)?;
+                self.write_default_file_entry(tree, blobs, dirty, file_pathid, &entry)?;
             },
         )
     }
@@ -383,25 +383,25 @@ impl<'a> WritableOpenCache<'a> {
         hash: &Hash,
         old_hash: &Hash,
     ) -> Result<(), StorageError> {
-        let (_, file_inode) = create_file(&mut self.table, tree, &path)?;
+        let (_, file_pathid) = create_file(&mut self.table, tree, &path)?;
         let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
-        if let Some(e) = get_file_entry(&self.table, file_inode, Some(peer))?
+        if let Some(e) = get_file_entry(&self.table, file_pathid, Some(peer))?
             && e.hash == *old_hash
         {
             log::debug!(
                 "[{}]@{peer} \"{path}\" {hash} size={size} replaces {old_hash}",
                 self.arena
             );
-            self.write_file_entry(tree, file_inode, peer, &entry)?;
+            self.write_file_entry(tree, file_pathid, peer, &entry)?;
         }
-        if let Some(old_entry) = get_file_entry(&self.table, file_inode, None)?
+        if let Some(old_entry) = get_file_entry(&self.table, file_pathid, None)?
             && old_entry.hash == *old_hash
         {
             log::debug!(
                 "[{}]@local \"{path}\" {hash} size={size} replaces {old_hash}",
                 self.arena
             );
-            self.write_default_file_entry(tree, blobs, dirty, file_inode, &entry)?;
+            self.write_default_file_entry(tree, blobs, dirty, file_pathid, &entry)?;
         }
         Ok(())
     }
@@ -410,11 +410,11 @@ impl<'a> WritableOpenCache<'a> {
     pub(crate) fn catchup_start(&mut self, peer: Peer) -> Result<(), StorageError> {
         for elt in self.table.iter()? {
             let (k, _) = elt?;
-            if let CacheTableKey::PeerCopy(inode, elt_peer) = k.value()
+            if let CacheTableKey::PeerCopy(pathid, elt_peer) = k.value()
                 && elt_peer == peer
             {
                 self.pending_catchup_table
-                    .insert((peer.as_str(), inode), ())?;
+                    .insert((peer.as_str(), pathid), ())?;
             }
         }
         Ok(())
@@ -432,18 +432,18 @@ impl<'a> WritableOpenCache<'a> {
         size: u64,
         hash: Hash,
     ) -> Result<(), StorageError> {
-        let (_, file_inode) = create_file(&mut self.table, tree, &path)?;
-        unmark_peer_file(&mut self.pending_catchup_table, peer, file_inode)?;
+        let (_, file_pathid) = create_file(&mut self.table, tree, &path)?;
+        unmark_peer_file(&mut self.pending_catchup_table, peer, file_pathid)?;
         let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
-        if let Some(e) = get_file_entry(&self.table, file_inode, None)?
+        if let Some(e) = get_file_entry(&self.table, file_pathid, None)?
             && e.hash != hash
         {
             self.notify_dropped_or_removed(tree, blobs, dirty, peer, &path, &e.hash, false)?;
         }
-        self.write_file_entry(tree, file_inode, peer, &entry)?;
+        self.write_file_entry(tree, file_pathid, peer, &entry)?;
         Ok(
-            if !get_file_entry(&self.table, file_inode, None)?.is_some() {
-                self.write_default_file_entry(tree, blobs, dirty, file_inode, &entry)?;
+            if !get_file_entry(&self.table, file_pathid, None)?.is_some() {
+                self.write_default_file_entry(tree, blobs, dirty, file_pathid, &entry)?;
             },
         )
     }
@@ -464,14 +464,14 @@ impl<'a> WritableOpenCache<'a> {
     fn write_file_entry(
         &mut self,
         tree: &mut WritableOpenTree,
-        file_inode: Inode,
+        file_pathid: PathId,
         peer: Peer,
         entry: &FileTableEntry,
     ) -> Result<(), StorageError> {
         tree.insert_and_incref(
-            file_inode,
+            file_pathid,
             &mut self.table,
-            CacheTableKey::PeerCopy(file_inode, peer),
+            CacheTableKey::PeerCopy(file_pathid, peer),
             Holder::new(&CacheTableEntry::File(entry.clone()))?,
         )?;
 
@@ -484,14 +484,14 @@ impl<'a> WritableOpenCache<'a> {
         tree: &mut WritableOpenTree,
         blobs: &mut WritableOpenBlob,
         dirty: &mut WritableOpenDirty,
-        inode: Inode,
+        pathid: PathId,
         new_entry: &FileTableEntry,
     ) -> Result<(), StorageError> {
-        self.before_default_file_entry_change(tree, blobs, dirty, inode)?;
+        self.before_default_file_entry_change(tree, blobs, dirty, pathid)?;
         tree.insert_and_incref(
-            inode,
+            pathid,
             &mut self.table,
-            CacheTableKey::Default(inode),
+            CacheTableKey::Default(pathid),
             Holder::new(&CacheTableEntry::File(new_entry.clone()))?,
         )?;
 
@@ -505,13 +505,13 @@ impl<'a> WritableOpenCache<'a> {
         tree: &mut WritableOpenTree,
         blobs: &mut WritableOpenBlob,
         dirty: &mut WritableOpenDirty,
-        inode: Inode,
+        pathid: PathId,
     ) -> Result<(), StorageError> {
-        blobs.delete(tree, inode)?;
+        blobs.delete(tree, pathid)?;
 
         // This entry is the outside world view of the file, so
         // changes should be reported.
-        dirty.mark_dirty(inode, "cache")?;
+        dirty.mark_dirty(pathid, "cache")?;
 
         Ok(())
     }
@@ -521,11 +521,11 @@ impl<'a> WritableOpenCache<'a> {
     fn rm_peer_file_entry(
         &mut self,
         tree: &mut WritableOpenTree,
-        inode: Inode,
+        pathid: PathId,
         peer: Peer,
     ) -> Result<(), StorageError> {
         // Remove the entry
-        tree.remove_and_decref(inode, &mut self.table, CacheTableKey::PeerCopy(inode, peer))?;
+        tree.remove_and_decref(pathid, &mut self.table, CacheTableKey::PeerCopy(pathid, peer))?;
 
         Ok(())
     }
@@ -536,15 +536,15 @@ impl<'a> WritableOpenCache<'a> {
         tree: &mut WritableOpenTree,
         blobs: &mut WritableOpenBlob,
         dirty: &mut WritableOpenDirty,
-        parent_inode: Inode,
-        inode: Inode,
+        parent_pathid: PathId,
+        pathid: PathId,
     ) -> Result<(), StorageError> {
-        self.before_default_file_entry_change(tree, blobs, dirty, inode)?;
-        tree.remove_and_decref(inode, &mut self.table, CacheTableKey::Default(inode))?;
+        self.before_default_file_entry_change(tree, blobs, dirty, pathid)?;
+        tree.remove_and_decref(pathid, &mut self.table, CacheTableKey::Default(pathid))?;
 
         // Update the parent modification time, as removing an
         // entry modifies it.
-        write_dir_mtime(&mut self.table, tree, parent_inode, UnixTime::now())?;
+        write_dir_mtime(&mut self.table, tree, parent_pathid, UnixTime::now())?;
 
         Ok(())
     }
@@ -564,34 +564,34 @@ impl<'a> WritableOpenCache<'a> {
         T: AsRef<Path>,
     {
         let path = path.as_ref();
-        let parent_inode = {
+        let parent_pathid = {
             if let Some(parent_path) = path.parent() {
                 tree.resolve(parent_path)?
             } else {
                 Some(tree.root())
             }
         };
-        if let Some(parent_inode) = parent_inode {
-            if let Some(inode) = tree.lookup(parent_inode, path.name())? {
-                if let Some(e) = get_file_entry(&self.table, inode, Some(peer))?
+        if let Some(parent_pathid) = parent_pathid {
+            if let Some(pathid) = tree.lookup(parent_pathid, path.name())? {
+                if let Some(e) = get_file_entry(&self.table, pathid, Some(peer))?
                     && e.hash == *old_hash
                 {
                     log::debug!(
-                        "[{}]@{peer} Remove \"{path}\" inode {inode} {old_hash}",
+                        "[{}]@{peer} Remove \"{path}\" pathid {pathid} {old_hash}",
                         self.arena
                     );
 
-                    self.rm_peer_file_entry(tree, inode, peer)?;
+                    self.rm_peer_file_entry(tree, pathid, peer)?;
                 }
                 if !dropped {
-                    if let Some(e) = get_file_entry(&self.table, inode, None)?
+                    if let Some(e) = get_file_entry(&self.table, pathid, None)?
                         && e.hash == *old_hash
                     {
                         log::debug!(
-                            "[{}]@local Remove \"{path}\" inode {inode} {old_hash}",
+                            "[{}]@local Remove \"{path}\" pathid {pathid} {old_hash}",
                             self.arena
                         );
-                        self.rm_default_file_entry(tree, blobs, dirty, parent_inode, inode)?;
+                        self.rm_default_file_entry(tree, blobs, dirty, parent_pathid, pathid)?;
                     }
                 }
             }
@@ -609,25 +609,25 @@ impl<'a> WritableOpenCache<'a> {
         peer: Peer,
     ) -> Result<(), StorageError> {
         let peer_str = peer.as_str();
-        let mut inodes = vec![];
+        let mut pathids = vec![];
         for elt in self
             .pending_catchup_table
-            .extract_from_if((peer_str, Inode::ZERO)..=(peer_str, Inode::MAX), |_, _| {
+            .extract_from_if((peer_str, PathId::ZERO)..=(peer_str, PathId::MAX), |_, _| {
                 true
             })?
         {
             let elt = elt?;
-            let (_, inode) = elt.0.value();
-            inodes.push(inode);
+            let (_, pathid) = elt.0.value();
+            pathids.push(pathid);
         }
-        for inode in inodes {
-            self.rm_peer_file_entry(tree, inode, peer)?;
-            if let Some(entry) = self.get_at_inode(inode)? {
-                if self.file_availability(inode, &entry.hash)?.is_none() {
-                    if let Some(parent_inode) = tree.parent(inode)? {
+        for pathid in pathids {
+            self.rm_peer_file_entry(tree, pathid, peer)?;
+            if let Some(entry) = self.get_at_pathid(pathid)? {
+                if self.file_availability(pathid, &entry.hash)?.is_none() {
+                    if let Some(parent_pathid) = tree.parent(pathid)? {
                         // If the file has become unavailable because of
                         // this removal, remove the file itself as well.
-                        self.rm_default_file_entry(tree, blobs, dirty, parent_inode, inode)?;
+                        self.rm_default_file_entry(tree, blobs, dirty, parent_pathid, pathid)?;
                     }
                 }
             }
@@ -640,17 +640,17 @@ impl<'a> WritableOpenCache<'a> {
 /// transaction that crates new tables.
 pub(crate) fn init(
     cache_table: &mut redb::Table<'_, CacheTableKey, Holder<CacheTableEntry>>,
-    root_inode: Inode,
+    root_pathid: PathId,
 ) -> Result<(), StorageError> {
     if cache_table
-        .get(CacheTableKey::Default(root_inode))?
+        .get(CacheTableKey::Default(root_pathid))?
         .is_none()
     {
         // Exceptionally not using write_dir_mtime and not going
         // through tree because , arena roots aren't refcounted by
         // tree and are never deleted.
         cache_table.insert(
-            CacheTableKey::Default(root_inode),
+            CacheTableKey::Default(root_pathid),
             Holder::with_content(CacheTableEntry::Dir(DirtableEntry {
                 mtime: UnixTime::now(),
             }))?,
@@ -659,30 +659,30 @@ pub(crate) fn init(
     Ok(())
 }
 
-/// Lookup a specific name in the given directory inode.
+/// Lookup a specific name in the given directory pathid.
 fn lookup(
     cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
     tree: &impl TreeReadOperations,
-    parent_inode: Inode,
+    parent_pathid: PathId,
     name: &str,
-) -> Result<(Inode, InodeAssignment), StorageError> {
-    check_is_dir(cache_table, parent_inode)?;
-    if let Some(inode) = tree.lookup(parent_inode, name)? {
-        if let Some(assignment) = inode_assignment(cache_table, inode)? {
-            return Ok((inode, assignment));
+) -> Result<(PathId, PathAssignment), StorageError> {
+    check_is_dir(cache_table, parent_pathid)?;
+    if let Some(pathid) = tree.lookup(parent_pathid, name)? {
+        if let Some(assignment) = pathid_assignment(cache_table, pathid)? {
+            return Ok((pathid, assignment));
         }
     }
 
     Err(StorageError::NotFound)
 }
 
-/// Get directory modification time for the given inode.
+/// Get directory modification time for the given pathid.
 fn dir_mtime(
     cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
-    inode: Inode,
+    pathid: PathId,
 ) -> Result<UnixTime, StorageError> {
     let e = cache_table
-        .get(CacheTableKey::Default(inode))?
+        .get(CacheTableKey::Default(pathid))?
         .ok_or(StorageError::NotFound)?;
 
     match e.value().parse()? {
@@ -691,19 +691,19 @@ fn dir_mtime(
     }
 }
 
-/// Get file availability information for the given inode.
+/// Get file availability information for the given pathid.
 fn file_availability(
     cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
-    inode: Inode,
+    pathid: PathId,
     arena: Arena,
     hash: &Hash,
 ) -> Result<Option<FileAvailability>, StorageError> {
     let mut avail = None;
-    let mut next = Some(inode);
-    while let Some(inode) = next
+    let mut next = Some(pathid);
+    while let Some(pathid) = next
         && avail.is_none()
     {
-        for entry in cache_table.range(CacheTableKey::range(inode))? {
+        for entry in cache_table.range(CacheTableKey::range(pathid))? {
             let entry = entry?;
             match entry.0.value() {
                 CacheTableKey::PeerCopy(_, peer) => {
@@ -730,7 +730,7 @@ fn file_availability(
         }
     }
     if avail.is_none() {
-        log::warn!("[{arena}] No peer has hash {hash} for {inode}",);
+        log::warn!("[{arena}] No peer has hash {hash} for {pathid}",);
     }
 
     Ok(avail)
@@ -745,12 +745,12 @@ impl<'a, 'b, T> ReadDirIterator<'a, 'b, T>
 where
     T: ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
 {
-    fn new(table: &'a T, tree: &'b impl TreeReadOperations, inode: Inode) -> Self {
+    fn new(table: &'a T, tree: &'b impl TreeReadOperations, pathid: PathId) -> Self {
         ReadDirIterator {
             table,
-            iter: match check_is_dir(table, inode) {
+            iter: match check_is_dir(table, pathid) {
                 Err(err) => tree::ReadDirIterator::failed(err),
-                Ok(_) => tree.readdir_inode(inode),
+                Ok(_) => tree.readdir_pathid(pathid),
             },
         }
     }
@@ -760,16 +760,16 @@ impl<'a, 'b, T> Iterator for ReadDirIterator<'a, 'b, T>
 where
     T: ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
 {
-    type Item = Result<(String, Inode, InodeAssignment), StorageError>;
+    type Item = Result<(String, PathId, PathAssignment), StorageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(entry) = self.iter.next() {
             match entry {
                 Err(err) => return Some(Err(err)),
-                Ok((name, inode)) => {
-                    match inode_assignment(self.table, inode) {
+                Ok((name, pathid)) => {
+                    match pathid_assignment(self.table, pathid) {
                         Err(err) => return Some(Err(err)),
-                        Ok(Some(assignment)) => return Some(Ok((name, inode, assignment))),
+                        Ok(Some(assignment)) => return Some(Ok((name, pathid, assignment))),
                         Ok(None) => {} // not in the cache; skip
                     }
                 }
@@ -782,7 +782,7 @@ where
 /// A per-arena cache of remote files.
 ///
 /// This struct handles all cache operations for a specific arena.
-/// It contains the arena's database and root inode.
+/// It contains the arena's database and root pathid.
 pub(crate) struct ArenaCache {
     arena: Arena,
     db: Arc<ArenaDatabase>,
@@ -796,7 +796,7 @@ impl ArenaCache {
     ) -> anyhow::Result<Arc<Self>> {
         ArenaCache::for_testing(
             arena,
-            crate::InodeAllocator::new(
+            crate::PathIdAllocator::new(
                 crate::GlobalDatabase::new(crate::utils::redb_utils::in_memory()?)?,
                 [arena],
             )?,
@@ -807,7 +807,7 @@ impl ArenaCache {
     #[cfg(test)]
     pub fn for_testing(
         arena: realize_types::Arena,
-        allocator: Arc<crate::InodeAllocator>,
+        allocator: Arc<crate::PathIdAllocator>,
         blob_dir: &std::path::Path,
     ) -> anyhow::Result<Arc<Self>> {
         let db = ArenaDatabase::new(
@@ -820,7 +820,7 @@ impl ArenaCache {
         Ok(ArenaCache::new(arena, Arc::clone(&db))?)
     }
 
-    /// Create a new ArenaCache from an arena, root inode, database, and blob directory.
+    /// Create a new ArenaCache from an arena, root pathid, database, and blob directory.
     pub(crate) fn new(arena: Arena, db: Arc<ArenaDatabase>) -> Result<Arc<Self>, StorageError> {
         Ok(Arc::new(Self { arena, db }))
     }
@@ -831,16 +831,16 @@ impl ArenaCache {
 
     pub(crate) fn lookup(
         &self,
-        parent_inode: Inode,
+        parent_pathid: PathId,
         name: &str,
-    ) -> Result<(Inode, InodeAssignment), StorageError> {
+    ) -> Result<(PathId, PathAssignment), StorageError> {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
-        cache.lookup(&tree, parent_inode, name)
+        cache.lookup(&tree, parent_pathid, name)
     }
 
-    pub(crate) fn expect<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<Inode, StorageError> {
+    pub(crate) fn expect<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<PathId, StorageError> {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
 
@@ -850,36 +850,36 @@ impl ArenaCache {
     pub(crate) fn resolve<'a, L: Into<TreeLoc<'a>>>(
         &self,
         loc: L,
-    ) -> Result<Option<Inode>, StorageError> {
+    ) -> Result<Option<PathId>, StorageError> {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
 
         tree.resolve(loc)
     }
 
-    pub(crate) fn file_metadata(&self, inode: Inode) -> Result<FileMetadata, StorageError> {
+    pub(crate) fn file_metadata(&self, pathid: PathId) -> Result<FileMetadata, StorageError> {
         let txn = self.db.begin_read()?;
         let cache = txn.read_cache()?;
-        cache.file_metadata(inode)
+        cache.file_metadata(pathid)
     }
 
-    pub(crate) fn dir_metadata(&self, inode: Inode) -> Result<DirMetadata, StorageError> {
+    pub(crate) fn dir_metadata(&self, pathid: PathId) -> Result<DirMetadata, StorageError> {
         let txn = self.db.begin_read()?;
         let cache = txn.read_cache()?;
         Ok(DirMetadata {
             read_only: false,
-            mtime: cache.dir_mtime(inode)?,
+            mtime: cache.dir_mtime(pathid)?,
         })
     }
 
     pub(crate) fn readdir(
         &self,
-        inode: Inode,
-    ) -> Result<Vec<(String, Inode, InodeAssignment)>, StorageError> {
+        pathid: PathId,
+    ) -> Result<Vec<(String, PathId, PathAssignment)>, StorageError> {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
-        cache.readdir(&tree, inode).collect()
+        cache.readdir(&tree, pathid).collect()
     }
 
     pub(crate) fn peer_progress(&self, peer: Peer) -> Result<Option<Progress>, StorageError> {
@@ -888,7 +888,7 @@ impl ArenaCache {
         peers.progress(peer)
     }
 
-    pub(crate) fn unlink(&self, parent: Inode, name: &str) -> Result<(), StorageError> {
+    pub(crate) fn unlink(&self, parent: PathId, name: &str) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
         {
             let mut tree = txn.write_tree()?;
@@ -913,10 +913,10 @@ impl ArenaCache {
 
     pub(crate) fn branch(
         &self,
-        source: Inode,
-        parent: Inode,
+        source: PathId,
+        parent: PathId,
         name: &str,
-    ) -> Result<(Inode, FileMetadata), StorageError> {
+    ) -> Result<(PathId, FileMetadata), StorageError> {
         let txn = self.db.begin_write()?;
         let result = {
             let mut tree = txn.write_tree()?;
@@ -950,13 +950,13 @@ impl ArenaCache {
     }
 
     /// Open a file for reading/writing.
-    pub(crate) fn open_file(&self, inode: Inode) -> Result<Blob, StorageError> {
+    pub(crate) fn open_file(&self, pathid: PathId) -> Result<Blob, StorageError> {
         // Optimistically, try a read transaction to check whether the
         // blob is there.
         {
             let txn = self.db.begin_read()?;
             let blobs = txn.read_blobs()?;
-            if let Some(info) = blobs.get_with_inode(inode)? {
+            if let Some(info) = blobs.get_with_pathid(pathid)? {
                 return Blob::open_with_info(&self.db, info);
             }
         }
@@ -966,7 +966,7 @@ impl ArenaCache {
         let txn = self.db.begin_write()?;
         let info = {
             let mut cache = txn.write_cache()?;
-            cache.create_blob(&txn, inode)?
+            cache.create_blob(&txn, pathid)?
         };
         txn.commit()?;
 
@@ -975,19 +975,19 @@ impl ArenaCache {
 
     pub(crate) fn local_availability(
         &self,
-        inode: Inode,
+        pathid: PathId,
     ) -> Result<LocalAvailability, StorageError> {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
         let blobs = txn.read_blobs()?;
-        blobs.local_availability(&tree, inode)
+        blobs.local_availability(&tree, pathid)
     }
 
     /// Create a directory at the given path.
     pub(crate) fn mkdir<'b, L: Into<TreeLoc<'b>>>(
         &self,
         loc: L,
-    ) -> Result<(Inode, DirMetadata), StorageError> {
+    ) -> Result<(PathId, DirMetadata), StorageError> {
         let txn = self.db.begin_write()?;
         let result = {
             let mut tree = txn.write_tree()?;
@@ -1018,26 +1018,26 @@ impl ArenaCache {
 /// Get a [FileTableEntry] for a specific peer.
 fn get_file_entry(
     cache_table: &impl redb::ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
-    inode: Inode,
+    pathid: PathId,
     peer: Option<Peer>,
 ) -> Result<Option<FileTableEntry>, StorageError> {
     match cache_table.get(
-        peer.map(|p| CacheTableKey::PeerCopy(inode, p))
-            .unwrap_or_else(|| CacheTableKey::Default(inode)),
+        peer.map(|p| CacheTableKey::PeerCopy(pathid, p))
+            .unwrap_or_else(|| CacheTableKey::Default(pathid)),
     )? {
         None => Ok(None),
         Some(e) => Ok(e.value().parse()?.file()),
     }
 }
 
-/// Get the default entry for the given inode.
+/// Get the default entry for the given pathid.
 ///
 /// Returns None if the file cannot be found or if it is a directory.
 fn get_default_entry(
     cache_table: &impl redb::ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
-    inode: Inode,
+    pathid: PathId,
 ) -> Result<Option<FileTableEntry>, StorageError> {
-    if let Some(entry) = cache_table.get(CacheTableKey::Default(inode))? {
+    if let Some(entry) = cache_table.get(CacheTableKey::Default(pathid))? {
         if let CacheTableEntry::File(entry) = entry.value().parse()? {
             return Ok(Some(entry));
         }
@@ -1046,15 +1046,15 @@ fn get_default_entry(
     Ok(None)
 }
 
-/// Get the default entry for the given inode.
+/// Get the default entry for the given pathid.
 ///
 /// Fail if the file cannot be found or if it is a directory.
 fn get_default_entry_or_err(
     cache_table: &impl redb::ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
-    inode: Inode,
+    pathid: PathId,
 ) -> Result<FileTableEntry, StorageError> {
     cache_table
-        .get(CacheTableKey::Default(inode))?
+        .get(CacheTableKey::Default(pathid))?
         .ok_or(StorageError::NotFound)?
         .value()
         .parse()?
@@ -1063,45 +1063,45 @@ fn get_default_entry_or_err(
 
 /// Retrieve or create a file entry at the given path.
 ///
-/// Return the parent inode and the file inode.
+/// Return the parent pathid and the file pathid.
 fn create_file<T>(
     cache_table: &mut redb::Table<'_, CacheTableKey, Holder<CacheTableEntry>>,
     tree: &mut WritableOpenTree,
     path: T,
-) -> Result<(Inode, Inode), StorageError>
+) -> Result<(PathId, PathId), StorageError>
 where
     T: AsRef<Path>,
 {
     let path = path.as_ref();
-    let mut parent_inode = tree.root();
+    let mut parent_pathid = tree.root();
     for component in Path::components(path.parent().as_ref()) {
-        parent_inode = setup_dir(cache_table, tree, parent_inode, component)?;
+        parent_pathid = setup_dir(cache_table, tree, parent_pathid, component)?;
     }
 
-    let file_inode = tree.setup_name(parent_inode, path.name())?;
+    let file_pathid = tree.setup_name(parent_pathid, path.name())?;
 
     // Update the parent directory mtime since we're adding a file to it
-    write_dir_mtime(cache_table, tree, parent_inode, UnixTime::now())?;
+    write_dir_mtime(cache_table, tree, parent_pathid, UnixTime::now())?;
 
-    Ok((parent_inode, file_inode))
+    Ok((parent_pathid, file_pathid))
 }
 
 fn setup_dir(
     cache_table: &mut redb::Table<'_, CacheTableKey, Holder<CacheTableEntry>>,
     tree: &mut WritableOpenTree,
-    parent_inode: Inode,
+    parent_pathid: PathId,
     name: &str,
-) -> Result<Inode, StorageError> {
-    let inode = tree.setup_name(parent_inode, name)?;
+) -> Result<PathId, StorageError> {
+    let pathid = tree.setup_name(parent_pathid, name)?;
 
-    if cache_table.get(CacheTableKey::Default(inode))?.is_none() {
+    if cache_table.get(CacheTableKey::Default(pathid))?.is_none() {
         // new directory
         let now = UnixTime::now();
-        write_dir_mtime(cache_table, tree, inode, now)?;
-        write_dir_mtime(cache_table, tree, parent_inode, now)?;
+        write_dir_mtime(cache_table, tree, pathid, now)?;
+        write_dir_mtime(cache_table, tree, parent_pathid, now)?;
     }
 
-    Ok(inode)
+    Ok(pathid)
 }
 
 /// Insert or update a directory entry in the cache table.
@@ -1111,13 +1111,13 @@ fn setup_dir(
 fn write_dir_mtime(
     cache_table: &mut redb::Table<'_, CacheTableKey, Holder<CacheTableEntry>>,
     tree: &mut WritableOpenTree,
-    inode: Inode,
+    pathid: PathId,
     mtime: UnixTime,
 ) -> Result<(), StorageError> {
     tree.insert_and_incref(
-        inode,
+        pathid,
         cache_table,
-        CacheTableKey::Default(inode),
+        CacheTableKey::Default(pathid),
         Holder::with_content(CacheTableEntry::Dir(DirtableEntry { mtime }))?,
     )?;
 
@@ -1125,39 +1125,39 @@ fn write_dir_mtime(
 }
 
 fn unmark_peer_file(
-    pending_catchup_table: &mut Table<'_, (&'static str, Inode), ()>,
+    pending_catchup_table: &mut Table<'_, (&'static str, PathId), ()>,
     peer: Peer,
-    inode: Inode,
+    pathid: PathId,
 ) -> Result<(), StorageError> {
-    pending_catchup_table.remove((peer.as_str(), inode))?;
+    pending_catchup_table.remove((peer.as_str(), pathid))?;
 
     Ok(())
 }
 
-/// Check whether the given inode exists in the cache and whether it
+/// Check whether the given pathid exists in the cache and whether it
 /// is a file or a directory.
-fn inode_assignment(
+fn pathid_assignment(
     cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
-    inode: Inode,
-) -> Result<Option<InodeAssignment>, StorageError> {
-    match cache_table.get(CacheTableKey::Default(inode))? {
+    pathid: PathId,
+) -> Result<Option<PathAssignment>, StorageError> {
+    match cache_table.get(CacheTableKey::Default(pathid))? {
         Some(e) => match e.value().parse()? {
-            CacheTableEntry::Dir(_) => Ok(Some(InodeAssignment::Directory)),
-            CacheTableEntry::File(_) => Ok(Some(InodeAssignment::File)),
+            CacheTableEntry::Dir(_) => Ok(Some(PathAssignment::Directory)),
+            CacheTableEntry::File(_) => Ok(Some(PathAssignment::File)),
         },
         None => Ok(None),
     }
 }
 
-/// Make sure the given inode exists and is a directory.
+/// Make sure the given pathid exists and is a directory.
 fn check_is_dir(
     cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
-    inode: Inode,
+    pathid: PathId,
 ) -> Result<(), StorageError> {
-    match inode_assignment(cache_table, inode)? {
+    match pathid_assignment(cache_table, pathid)? {
         None => Err(StorageError::NotFound),
-        Some(InodeAssignment::File) => Err(StorageError::NotADirectory),
-        Some(InodeAssignment::Directory) => Ok(()), // continue
+        Some(PathAssignment::File) => Err(StorageError::NotADirectory),
+        Some(PathAssignment::Directory) => Ok(()), // continue
     }
 }
 
@@ -1178,7 +1178,7 @@ mod tests {
     use crate::arena::types::DirMetadata;
     use crate::arena::types::HistoryTableEntry;
     use crate::utils::hash;
-    use crate::{Inode, InodeAssignment, StorageError};
+    use crate::{PathId, PathAssignment, StorageError};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Hash, Path, Peer, UnixTime};
@@ -1237,8 +1237,8 @@ mod tests {
             T: AsRef<Path>,
         {
             let path = path.as_ref();
-            let inode = self.acache.expect(path)?;
-            Ok(self.acache.dir_metadata(inode)?)
+            let pathid = self.acache.expect(path)?;
+            Ok(self.acache.dir_metadata(pathid)?)
         }
 
         fn add_to_cache<T>(&self, path: T, size: u64, mtime: UnixTime) -> anyhow::Result<()>
@@ -1297,13 +1297,13 @@ mod tests {
             Ok(())
         }
 
-        fn dirty_inodes(&self) -> Result<HashSet<Inode>, StorageError> {
+        fn dirty_pathids(&self) -> Result<HashSet<PathId>, StorageError> {
             let txn = self.db.begin_read()?;
             let dirty = txn.read_dirty()?;
             let mut start = 0;
             let mut ret = HashSet::new();
-            while let Some((inode, counter)) = dirty.next_dirty(start)? {
-                ret.insert(inode);
+            while let Some((pathid, counter)) = dirty.next_dirty(start)? {
+                ret.insert(pathid);
                 start = counter + 1;
             }
 
@@ -1311,11 +1311,11 @@ mod tests {
         }
 
         fn dirty_paths(&self) -> Result<HashSet<Path>, StorageError> {
-            let inodes = self.dirty_inodes()?;
+            let pathids = self.dirty_pathids()?;
             let txn = self.db.begin_read()?;
             let tree = txn.read_tree()?;
 
-            Ok(inodes
+            Ok(pathids
                 .into_iter()
                 .filter_map(|i| tree.backtrack(i).ok().flatten())
                 .collect())
@@ -1356,11 +1356,11 @@ mod tests {
 
         fixture.add_to_cache(&file_path, 100, mtime)?;
 
-        let (inode, assignment) = acache.lookup(fixture.db.tree().root(), "a")?;
-        assert_eq!(assignment, InodeAssignment::Directory, "a");
+        let (pathid, assignment) = acache.lookup(fixture.db.tree().root(), "a")?;
+        assert_eq!(assignment, PathAssignment::Directory, "a");
 
-        let (_, assignment) = acache.lookup(inode, "b")?;
-        assert_eq!(assignment, InodeAssignment::Directory, "b");
+        let (_, assignment) = acache.lookup(pathid, "b")?;
+        assert_eq!(assignment, PathAssignment::Directory, "b");
 
         Ok(())
     }
@@ -1382,12 +1382,12 @@ mod tests {
             let txn = fixture.db.begin_read()?;
             let tree = txn.read_tree()?;
             assert_eq!(fixture.db.tree().root(), tree.root());
-            assert!(tree.inode_exists(a)?);
-            assert!(tree.inode_exists(b)?);
-            assert!(tree.inode_exists(c)?);
-            assert_eq!(Some(a), tree.lookup_inode(tree.root(), "a")?);
-            assert_eq!(Some(b), tree.lookup_inode(a, "b")?);
-            assert_eq!(Some(c), tree.lookup_inode(b, "c.txt")?);
+            assert!(tree.pathid_exists(a)?);
+            assert!(tree.pathid_exists(b)?);
+            assert!(tree.pathid_exists(c)?);
+            assert_eq!(Some(a), tree.lookup_pathid(tree.root(), "a")?);
+            assert_eq!(Some(b), tree.lookup_pathid(a, "b")?);
+            assert_eq!(Some(c), tree.lookup_pathid(b, "c.txt")?);
         }
 
         fixture.remove_from_cache(&file_path)?;
@@ -1399,15 +1399,15 @@ mod tests {
 
             // The file is gone from tree, since this was the only
             // reference to it.
-            assert!(!tree.inode_exists(c)?);
-            assert_eq!(None, tree.lookup_inode(b, "c.txt")?);
+            assert!(!tree.pathid_exists(c)?);
+            assert_eq!(None, tree.lookup_pathid(b, "c.txt")?);
 
             // The directories were not cleaned up, even though this
             // was the last file. They need to be rmdir'ed explicitly.
-            assert!(tree.inode_exists(a)?);
-            assert!(tree.inode_exists(b)?);
-            assert_eq!(Some(a), tree.lookup_inode(tree.root(), "a")?);
-            assert_eq!(Some(b), tree.lookup_inode(a, "b")?);
+            assert!(tree.pathid_exists(a)?);
+            assert!(tree.pathid_exists(b)?);
+            assert_eq!(Some(a), tree.lookup_pathid(tree.root(), "a")?);
+            assert_eq!(Some(b), tree.lookup_pathid(a, "b")?);
         }
         Ok(())
     }
@@ -1474,8 +1474,8 @@ mod tests {
             None,
         )?;
 
-        let inode = acache.expect(&file_path)?;
-        let metadata = acache.file_metadata(inode)?;
+        let pathid = acache.expect(&file_path)?;
+        let metadata = acache.file_metadata(pathid)?;
         assert_eq!(metadata.size, 200);
         assert_eq!(metadata.mtime, later_time());
 
@@ -1572,8 +1572,8 @@ mod tests {
         fixture.add_to_cache(&file_path, 200, test_time())?;
 
         let acache = &fixture.acache;
-        let inode = acache.expect(&file_path)?;
-        let metadata = acache.file_metadata(inode)?;
+        let pathid = acache.expect(&file_path)?;
+        let metadata = acache.file_metadata(pathid)?;
         assert_eq!(metadata.size, 100);
 
         Ok(())
@@ -1612,8 +1612,8 @@ mod tests {
             None,
         )?;
 
-        let inode = acache.expect(&file_path)?;
-        let metadata = acache.file_metadata(inode)?;
+        let pathid = acache.expect(&file_path)?;
+        let metadata = acache.file_metadata(pathid)?;
         assert_eq!(metadata.size, 100);
 
         Ok(())
@@ -1647,11 +1647,11 @@ mod tests {
 
         fixture.add_to_cache(&file_path, 100, mtime)?;
         let arena_root = fixture.db.tree().root();
-        let (inode, _) = acache.lookup(arena_root, "file.txt")?;
+        let (pathid, _) = acache.lookup(arena_root, "file.txt")?;
 
         fixture.clear_dirty()?;
         fixture.remove_from_cache(&file_path)?;
-        assert_eq!(HashSet::from([inode]), fixture.dirty_inodes()?);
+        assert_eq!(HashSet::from([pathid]), fixture.dirty_pathids()?);
 
         Ok(())
     }
@@ -1694,8 +1694,8 @@ mod tests {
         )?;
 
         // File should still exist because wrong hash was provided
-        let inode = acache.expect(&file_path)?;
-        let metadata = acache.file_metadata(inode)?;
+        let pathid = acache.expect(&file_path)?;
+        let metadata = acache.file_metadata(pathid)?;
         assert_eq!(metadata.size, 100);
 
         Ok(())
@@ -1735,8 +1735,8 @@ mod tests {
             None,
         )?;
 
-        let inode = acache.expect(&file_path)?;
-        assert!(acache.file_metadata(inode).is_ok());
+        let pathid = acache.expect(&file_path)?;
+        assert!(acache.file_metadata(pathid).is_ok());
 
         acache.update(
             peer1,
@@ -1753,7 +1753,7 @@ mod tests {
         // even though it's still available in peer2; this is
         // considered outdated.
         assert!(matches!(
-            acache.file_metadata(inode),
+            acache.file_metadata(pathid),
             Err(StorageError::NotFound)
         ));
         assert!(matches!(
@@ -1761,8 +1761,8 @@ mod tests {
             Err(StorageError::NotFound)
         ));
 
-        // Inode should still be resolvable, because some peers still have it.
-        assert_eq!(Some(inode), acache.resolve(&file_path)?);
+        // PathId should still be resolvable, because some peers still have it.
+        assert_eq!(Some(pathid), acache.resolve(&file_path)?);
 
         Ok(())
     }
@@ -1801,8 +1801,8 @@ mod tests {
             None,
         )?;
 
-        let inode = acache.expect(&file_path)?;
-        assert!(acache.file_metadata(inode).is_ok());
+        let pathid = acache.expect(&file_path)?;
+        assert!(acache.file_metadata(pathid).is_ok());
 
         acache.update(
             peer1,
@@ -1817,7 +1817,7 @@ mod tests {
 
         // The default version has not been removed by this notification,
         // since this is a Drop, not a Remove.
-        assert!(acache.file_metadata(inode).is_ok());
+        assert!(acache.file_metadata(pathid).is_ok());
 
         Ok(())
     }
@@ -1833,14 +1833,14 @@ mod tests {
         fixture.add_to_cache(&file_path, 100, mtime)?;
 
         // Lookup directory
-        let (inode, assignment) = acache.lookup(fixture.db.tree().root(), "a")?;
-        assert_eq!(assignment, InodeAssignment::Directory);
+        let (pathid, assignment) = acache.lookup(fixture.db.tree().root(), "a")?;
+        assert_eq!(assignment, PathAssignment::Directory);
 
         // Lookup file
-        let (inode, assignment) = acache.lookup(inode, "file.txt")?;
-        assert_eq!(assignment, InodeAssignment::File);
+        let (pathid, assignment) = acache.lookup(pathid, "file.txt")?;
+        assert_eq!(assignment, PathAssignment::File);
 
-        let metadata = acache.file_metadata(inode)?;
+        let metadata = acache.file_metadata(pathid)?;
         assert_eq!(metadata.mtime, mtime);
         assert_eq!(metadata.size, 100);
 
@@ -1870,8 +1870,8 @@ mod tests {
 
         fixture.add_to_cache(&path, 100, mtime)?;
 
-        let inode = acache.expect(&path)?;
-        let metadata = acache.file_metadata(inode)?;
+        let pathid = acache.expect(&path)?;
+        let metadata = acache.file_metadata(pathid)?;
         assert_eq!(metadata.mtime, mtime);
         assert_eq!(metadata.size, 100);
 
@@ -1891,7 +1891,7 @@ mod tests {
 
         let arena_root = fixture.db.tree().root();
         assert_unordered::assert_eq_unordered!(
-            vec![("dir".to_string(), InodeAssignment::Directory),],
+            vec![("dir".to_string(), PathAssignment::Directory),],
             acache
                 .readdir(arena_root)?
                 .into_iter()
@@ -1899,15 +1899,15 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
 
-        let (inode, _) = acache.lookup(arena_root, "dir")?;
+        let (pathid, _) = acache.lookup(arena_root, "dir")?;
         assert_unordered::assert_eq_unordered!(
             vec![
-                ("file1.txt".to_string(), InodeAssignment::File),
-                ("file2.txt".to_string(), InodeAssignment::File),
-                ("subdir".to_string(), InodeAssignment::Directory),
+                ("file1.txt".to_string(), PathAssignment::File),
+                ("file2.txt".to_string(), PathAssignment::File),
+                ("subdir".to_string(), PathAssignment::Directory),
             ],
             acache
-                .readdir(inode)?
+                .readdir(pathid)?
                 .into_iter()
                 .map(|(name, _, assignment)| (name, assignment))
                 .collect::<Vec<_>>(),
@@ -1964,8 +1964,8 @@ mod tests {
             None,
         )?;
 
-        let (inode, _) = acache.lookup(fixture.db.tree().root(), "file.txt")?;
-        let metadata = acache.file_metadata(inode)?;
+        let (pathid, _) = acache.lookup(fixture.db.tree().root(), "file.txt")?;
+        let metadata = acache.file_metadata(pathid)?;
         assert_eq!(metadata.size, 200);
         assert_eq!(metadata.mtime, later_time());
 
@@ -2023,8 +2023,8 @@ mod tests {
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
 
-        let inode = tree.lookup(fixture.db.tree().root(), "file.txt")?.unwrap();
-        let avail = cache.file_availability(inode, &Hash([1u8; 32]))?.unwrap();
+        let pathid = tree.lookup(fixture.db.tree().root(), "file.txt")?.unwrap();
+        let avail = cache.file_availability(pathid, &Hash([1u8; 32]))?.unwrap();
         assert_eq!(arena, avail.arena);
         assert_eq!(path, avail.path);
         // Since they're just independent additions, the cache chooses
@@ -2036,12 +2036,12 @@ mod tests {
         assert_eq!(
             vec![c],
             cache
-                .file_availability(inode, &Hash([2u8; 32]))?
+                .file_availability(pathid, &Hash([2u8; 32]))?
                 .unwrap()
                 .peers
         );
 
-        assert_eq!(None, cache.file_availability(inode, &Hash([3u8; 32]))?);
+        assert_eq!(None, cache.file_availability(pathid, &Hash([3u8; 32]))?);
 
         Ok(())
     }
@@ -2106,11 +2106,11 @@ mod tests {
             },
             None,
         )?;
-        let inode = acache.expect(&path)?;
+        let pathid = acache.expect(&path)?;
         {
             let txn = fixture.db.begin_read()?;
             let cache = txn.read_cache()?;
-            let entry = cache.get_at_inode(inode)?.unwrap();
+            let entry = cache.get_at_pathid(pathid)?.unwrap();
 
             //  Replace with old_hash=1 means that hash=2 is the most
             //  recent one. This is the one chosen.
@@ -2119,7 +2119,7 @@ mod tests {
             assert_eq!(later_time(), entry.mtime);
             assert_eq!(
                 vec![b],
-                cache.file_availability(inode, &entry.hash)?.unwrap().peers
+                cache.file_availability(pathid, &entry.hash)?.unwrap().peers
             );
         }
 
@@ -2154,26 +2154,26 @@ mod tests {
         {
             let txn = fixture.db.begin_read()?;
             let cache = txn.read_cache()?;
-            let entry = cache.get_at_inode(inode)?.unwrap();
+            let entry = cache.get_at_pathid(pathid)?.unwrap();
 
             //  Replace with old_hash=1 means that hash=2 is the most
             //  recent one. This is the one chosen.
             assert_eq!(Hash([3u8; 32]), entry.hash);
             assert_eq!(
                 vec![c],
-                cache.file_availability(inode, &entry.hash)?.unwrap().peers
+                cache.file_availability(pathid, &entry.hash)?.unwrap().peers
             );
         }
 
         {
             let txn = fixture.db.begin_read()?;
             let cache = txn.read_cache()?;
-            let entry = cache.get_at_inode(inode)?.unwrap();
+            let entry = cache.get_at_pathid(pathid)?.unwrap();
 
             assert_eq!(Hash([3u8; 32]), entry.hash);
             assert_eq!(
                 vec![c],
-                cache.file_availability(inode, &entry.hash)?.unwrap().peers
+                cache.file_availability(pathid, &entry.hash)?.unwrap().peers
             );
         }
 
@@ -2195,12 +2195,12 @@ mod tests {
         {
             let txn = fixture.db.begin_read()?;
             let cache = txn.read_cache()?;
-            let entry = cache.get_at_inode(inode)?.unwrap();
+            let entry = cache.get_at_pathid(pathid)?.unwrap();
 
             assert_eq!(Hash([3u8; 32]), entry.hash);
             assert_eq!(
                 vec![b, c],
-                cache.file_availability(inode, &entry.hash)?.unwrap().peers
+                cache.file_availability(pathid, &entry.hash)?.unwrap().peers
             );
         }
 
@@ -2267,16 +2267,16 @@ mod tests {
             },
             None,
         )?;
-        let (inode, _) = acache.lookup(fixture.db.tree().root(), "file.txt")?;
+        let (pathid, _) = acache.lookup(fixture.db.tree().root(), "file.txt")?;
         {
             let txn = fixture.db.begin_read()?;
             let cache = txn.read_cache()?;
-            let entry = cache.get_at_inode(inode)?.unwrap();
+            let entry = cache.get_at_pathid(pathid)?.unwrap();
 
             assert_eq!(Hash([3u8; 32]), entry.hash);
             assert_eq!(
                 vec![a],
-                cache.file_availability(inode, &entry.hash)?.unwrap().peers
+                cache.file_availability(pathid, &entry.hash)?.unwrap().peers
             );
         }
 
@@ -2292,7 +2292,7 @@ mod tests {
         // We've lost the single peer that had the tracked version.
         // This is handled as if A had reported that file as deleted.
         assert!(matches!(
-            acache.file_metadata(inode),
+            acache.file_metadata(pathid),
             Err(StorageError::NotFound)
         ));
 
@@ -2442,29 +2442,29 @@ mod tests {
         // File1 should have been deleted, since it was only on peer1,
         assert!(cache.get(&tree, &file1)?.is_none());
 
-        let file2_inode = tree.resolve(&file2)?.unwrap();
+        let file2_pathid = tree.resolve(&file2)?.unwrap();
         assert_eq!(
             vec![peer1, peer2],
             cache
-                .file_availability(file2_inode, &test_hash())?
+                .file_availability(file2_pathid, &test_hash())?
                 .unwrap()
                 .peers
         );
 
-        let file3_inode = tree.resolve(&file3)?.unwrap();
+        let file3_pathid = tree.resolve(&file3)?.unwrap();
         assert_eq!(
             vec![peer3],
             cache
-                .file_availability(file3_inode, &test_hash())?
+                .file_availability(file3_pathid, &test_hash())?
                 .unwrap()
                 .peers
         );
 
-        let file4_inode = tree.resolve(&file4)?.unwrap();
+        let file4_pathid = tree.resolve(&file4)?.unwrap();
         assert_eq!(
             vec![peer1],
             cache
-                .file_availability(file4_inode, &test_hash())?
+                .file_availability(file4_pathid, &test_hash())?
                 .unwrap()
                 .peers
         );
@@ -2483,8 +2483,8 @@ mod tests {
         fixture.add_to_cache(&file_path, 100, test_time())?;
 
         // Open the file to create a blob
-        let inode = acache.expect(&file_path)?;
-        acache.open_file(inode)?;
+        let pathid = acache.expect(&file_path)?;
+        acache.open_file(pathid)?;
         assert!(fixture.has_blob(&file_path)?);
 
         acache.update(
@@ -2515,14 +2515,14 @@ mod tests {
 
         // Create a file and open it to create the blob
         fixture.add_to_cache(&file_path, 100, test_time())?;
-        let inode = acache.expect(&file_path)?;
-        acache.open_file(inode)?;
+        let pathid = acache.expect(&file_path)?;
+        acache.open_file(pathid)?;
         assert!(fixture.has_blob(&file_path)?);
 
         fixture.remove_from_cache(&file_path)?;
 
         // the blob must be gone
-        assert!(!fixture.has_blob(inode)?);
+        assert!(!fixture.has_blob(pathid)?);
 
         Ok(())
     }
@@ -2536,8 +2536,8 @@ mod tests {
 
         // Create a file and open it to create the blob
         fixture.add_to_cache(&file_path, 100, test_time())?;
-        let inode = acache.expect(&file_path)?;
-        acache.open_file(inode)?;
+        let pathid = acache.expect(&file_path)?;
+        acache.open_file(pathid)?;
         assert!(fixture.has_blob(&file_path)?);
 
         // Do a catchup that doesn't include this file (simulating file removal)
@@ -2550,7 +2550,7 @@ mod tests {
         )?;
 
         // The blob must be gone
-        assert!(!fixture.has_blob(inode)?);
+        assert!(!fixture.has_blob(pathid)?);
 
         Ok(())
     }
@@ -2565,8 +2565,8 @@ mod tests {
         fixture.add_to_cache(&file_path, 100, mtime)?;
         let arena_root = fixture.db.tree().root();
 
-        let (inode, _) = acache.lookup(arena_root, "file.txt")?;
-        assert!(acache.file_metadata(inode).is_ok());
+        let (pathid, _) = acache.lookup(arena_root, "file.txt")?;
+        assert!(acache.file_metadata(pathid).is_ok());
 
         fixture.clear_dirty()?;
         let dir_mtime_before = acache.dir_metadata(arena_root)?.mtime;
@@ -2578,11 +2578,11 @@ mod tests {
             Err(StorageError::NotFound)
         ));
         assert!(matches!(
-            acache.file_metadata(inode),
+            acache.file_metadata(pathid),
             Err(StorageError::NotFound)
         ));
 
-        assert_eq!(HashSet::from([inode]), fixture.dirty_inodes()?);
+        assert_eq!(HashSet::from([pathid]), fixture.dirty_pathids()?);
 
         assert!(acache.dir_metadata(arena_root)?.mtime > dir_mtime_before);
 
@@ -2624,8 +2624,8 @@ mod tests {
             6,
             hash.clone(),
         )?;
-        let source_inode = tree.expect(&source_path)?;
-        let dir_inode = tree.expect(&dir_path)?;
+        let source_pathid = tree.expect(&source_path)?;
+        let dir_pathid = tree.expect(&dir_path)?;
 
         dirty.delete_range(0, 999)?; // clear dirty
 
@@ -2634,15 +2634,15 @@ mod tests {
             &mut blobs,
             &mut history,
             &mut dirty,
-            source_inode,
-            dir_inode,
+            source_pathid,
+            dir_pathid,
             "dest",
         )?;
 
-        let dest_inode = tree.expect(&dest_path)?;
+        let dest_pathid = tree.expect(&dest_path)?;
         assert_eq!(
-            Some(dest_inode),
-            dirty.next_dirty(0)?.map(|(inode, _)| inode)
+            Some(dest_pathid),
+            dirty.next_dirty(0)?.map(|(pathid, _)| pathid)
         );
         let (_, history_entry) = history.history(0..).last().unwrap().unwrap();
         assert_eq!(
@@ -2657,9 +2657,9 @@ mod tests {
                 mtime: test_time(),
                 hash: hash.clone(),
             },
-            cache.file_metadata(dest_inode)?
+            cache.file_metadata(dest_pathid)?
         );
-        let avail = cache.file_availability(dest_inode, &hash)?.unwrap();
+        let avail = cache.file_availability(dest_pathid, &hash)?.unwrap();
         assert_eq!(source_path, avail.path);
         assert_eq!(vec![peer1], avail.peers);
 
@@ -2681,9 +2681,9 @@ mod tests {
                 mtime: test_time(),
                 hash: hash.clone(),
             },
-            cache.file_metadata(dest_inode)?
+            cache.file_metadata(dest_pathid)?
         );
-        let avail = cache.file_availability(dest_inode, &hash)?.unwrap();
+        let avail = cache.file_availability(dest_pathid, &hash)?.unwrap();
         assert_eq!(dest_path, avail.path);
         assert_eq!(hash, avail.hash);
         assert_eq!(vec![peer2], avail.peers);
@@ -2704,13 +2704,13 @@ mod tests {
         // Clear dirty state
         dirty.delete_range(0, 999)?;
 
-        let (inode, metadata) = cache.mkdir(&mut tree, &dir_path)?;
+        let (pathid, metadata) = cache.mkdir(&mut tree, &dir_path)?;
 
         // Verify directory was created
-        assert!(tree.inode_exists(inode)?);
+        assert!(tree.pathid_exists(pathid)?);
         assert_eq!(
-            Some(inode),
-            tree.lookup_inode(fixture.db.tree().root(), "newdir")?
+            Some(pathid),
+            tree.lookup_pathid(fixture.db.tree().root(), "newdir")?
         );
 
         // Verify metadata
@@ -2718,7 +2718,7 @@ mod tests {
         assert!(metadata.mtime > UnixTime::ZERO);
 
         // Verify directory entry exists in cache by checking dir_mtime
-        let mtime = cache.dir_mtime(inode)?;
+        let mtime = cache.dir_mtime(pathid)?;
         assert!(mtime > UnixTime::ZERO);
 
         // Verify parent directory mtime was updated
@@ -2739,13 +2739,13 @@ mod tests {
         // The following fails, because a/b doesn't exist
         assert!(cache.mkdir(&mut tree, Path::parse("a/b/c")?).is_err());
 
-        let (a_inode, _) = cache.mkdir(&mut tree, Path::parse("a")?)?;
-        let (b_inode, _) = cache.mkdir(&mut tree, Path::parse("a/b")?)?;
-        let (c_inode, _) = cache.mkdir(&mut tree, Path::parse("a/b/c")?)?;
+        let (a_pathid, _) = cache.mkdir(&mut tree, Path::parse("a")?)?;
+        let (b_pathid, _) = cache.mkdir(&mut tree, Path::parse("a/b")?)?;
+        let (c_pathid, _) = cache.mkdir(&mut tree, Path::parse("a/b/c")?)?;
 
-        assert!(cache.dir_mtime(a_inode).is_ok());
-        assert!(cache.dir_mtime(b_inode).is_ok());
-        assert!(cache.dir_mtime(c_inode).is_ok());
+        assert!(cache.dir_mtime(a_pathid).is_ok());
+        assert!(cache.dir_mtime(b_pathid).is_ok());
+        assert!(cache.dir_mtime(c_pathid).is_ok());
 
         Ok(())
     }
@@ -2764,8 +2764,8 @@ mod tests {
         dirty.delete_range(0, 999)?;
 
         // Create directory first time
-        let (inode1, _) = cache.mkdir(&mut tree, &dir_path)?;
-        assert!(tree.inode_exists(inode1)?);
+        let (pathid1, _) = cache.mkdir(&mut tree, &dir_path)?;
+        assert!(tree.pathid_exists(pathid1)?);
 
         // Try to create same directory again
         let result = cache.mkdir(&mut tree, &dir_path);
@@ -2788,21 +2788,21 @@ mod tests {
         dirty.delete_range(0, 999)?;
 
         // Create directory
-        let (inode, _) = cache.mkdir(&mut tree, &dir_path)?;
-        assert!(tree.inode_exists(inode)?);
+        let (pathid, _) = cache.mkdir(&mut tree, &dir_path)?;
+        assert!(tree.pathid_exists(pathid)?);
 
         // Remove directory
         cache.rmdir(&mut tree, &dir_path)?;
 
         // Verify directory is gone
-        assert!(!tree.inode_exists(inode)?);
+        assert!(!tree.pathid_exists(pathid)?);
         assert_eq!(
             None,
-            tree.lookup_inode(fixture.db.tree().root(), "empty_dir")?
+            tree.lookup_pathid(fixture.db.tree().root(), "empty_dir")?
         );
 
         // Verify cache entry is gone
-        assert!(cache.get_at_inode(inode)?.is_none());
+        assert!(cache.get_at_pathid(pathid)?.is_none());
 
         Ok(())
     }
@@ -2823,7 +2823,7 @@ mod tests {
         dirty.delete_range(0, 999)?;
 
         // Create directory
-        let (dir_inode, _) = cache.mkdir(&mut tree, &dir_path)?;
+        let (dir_pathid, _) = cache.mkdir(&mut tree, &dir_path)?;
 
         // Add a file to the directory
         let peer = Peer::from("test_peer");
@@ -2843,7 +2843,7 @@ mod tests {
         assert!(matches!(result, Err(StorageError::DirectoryNotEmpty)));
 
         // Verify directory still exists
-        assert!(tree.inode_exists(dir_inode)?);
+        assert!(tree.pathid_exists(dir_pathid)?);
 
         Ok(())
     }
@@ -2875,14 +2875,14 @@ mod tests {
             test_hash(),
         )?;
 
-        let file_inode = tree.expect(&file_path)?;
+        let file_pathid = tree.expect(&file_path)?;
 
         // Try to remove file as directory
         let result = cache.rmdir(&mut tree, &file_path);
         assert!(matches!(result, Err(StorageError::NotADirectory)));
 
         // Verify file still exists
-        assert!(tree.inode_exists(file_inode)?);
+        assert!(tree.pathid_exists(file_pathid)?);
 
         Ok(())
     }
@@ -2922,21 +2922,21 @@ mod tests {
         dirty.delete_range(0, 999)?;
 
         // Create parent and child directories
-        let (parent_inode, _) = cache.mkdir(&mut tree, &parent_path)?;
-        let (child_inode, _) = cache.mkdir(&mut tree, &child_path)?;
+        let (parent_pathid, _) = cache.mkdir(&mut tree, &parent_path)?;
+        let (child_pathid, _) = cache.mkdir(&mut tree, &child_path)?;
 
         // Get parent mtime before removal
-        let parent_mtime_before = cache.dir_mtime(parent_inode)?;
+        let parent_mtime_before = cache.dir_mtime(parent_pathid)?;
 
         // Remove child directory
         cache.rmdir(&mut tree, &child_path)?;
 
         // Verify parent mtime was updated (should be >= since operations can be fast)
-        let parent_mtime_after = cache.dir_mtime(parent_inode)?;
+        let parent_mtime_after = cache.dir_mtime(parent_pathid)?;
         assert!(parent_mtime_after >= parent_mtime_before);
 
         // Verify child is gone
-        assert!(!tree.inode_exists(child_inode)?);
+        assert!(!tree.pathid_exists(child_pathid)?);
 
         Ok(())
     }

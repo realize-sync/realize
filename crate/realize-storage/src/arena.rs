@@ -1,4 +1,4 @@
-use crate::InodeAllocator;
+use crate::PathIdAllocator;
 use crate::config::{self, HumanDuration};
 use crate::utils::redb_utils;
 use anyhow::Context;
@@ -51,7 +51,7 @@ impl ArenaStorage {
         arena: Arena,
         arena_config: &config::ArenaConfig,
         exclude: &Vec<&std::path::Path>,
-        allocator: &Arc<InodeAllocator>,
+        allocator: &Arc<PathIdAllocator>,
     ) -> anyhow::Result<Self> {
         let shutdown = CancellationToken::new();
         let dbpath = arena_config.workdir.join("arena.db");

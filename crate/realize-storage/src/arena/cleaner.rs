@@ -195,11 +195,11 @@ mod tests {
                 info = blobs.create(&mut tree, &marks, loc, &hash, test_data.len() as u64)?;
 
                 // Write data to the blob file
-                let blob_path = self.blob_dir.child(info.inode.hex());
+                let blob_path = self.blob_dir.child(info.pathid.hex());
                 std::fs::write(blob_path.path(), &test_data)?;
                 blobs.extend_local_availability(
                     &tree,
-                    info.inode,
+                    info.pathid,
                     &hash,
                     &realize_types::ByteRanges::single(0, test_data.len() as u64),
                 )?;

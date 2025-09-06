@@ -7,7 +7,7 @@ use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
 use super::types::{FileTableEntry, HistoryTableEntry};
 use crate::utils::fs_utils;
 use crate::utils::holder::Holder;
-use crate::{Inode, StorageError};
+use crate::{PathId, StorageError};
 use realize_types::{self, Hash, Path, UnixTime};
 use redb::{ReadableTable, Table};
 use std::ops::RangeBounds;
@@ -161,14 +161,14 @@ impl From<&FileTableEntry> for IndexedFile {
 
 pub(crate) struct ReadableOpenIndex<T>
 where
-    T: ReadableTable<Inode, Holder<'static, FileTableEntry>>,
+    T: ReadableTable<PathId, Holder<'static, FileTableEntry>>,
 {
     table: T,
 }
 
 impl<T> ReadableOpenIndex<T>
 where
-    T: ReadableTable<Inode, Holder<'static, FileTableEntry>>,
+    T: ReadableTable<PathId, Holder<'static, FileTableEntry>>,
 {
     pub(crate) fn new(table: T) -> Self {
         Self { table }
@@ -176,22 +176,22 @@ where
 }
 
 pub(crate) struct WritableOpenIndex<'a> {
-    table: Table<'a, Inode, Holder<'static, FileTableEntry>>,
+    table: Table<'a, PathId, Holder<'static, FileTableEntry>>,
 }
 
 impl<'a> WritableOpenIndex<'a> {
-    pub(crate) fn new(table: Table<'a, Inode, Holder<FileTableEntry>>) -> Self {
+    pub(crate) fn new(table: Table<'a, PathId, Holder<FileTableEntry>>) -> Self {
         Self { table }
     }
 }
 
 /// Read operations for index. See also [IndexExt].
 pub(crate) trait IndexReadOperations {
-    /// Get a file entry by inode.
-    fn get_at_inode(&self, inode: Inode) -> Result<Option<IndexedFile>, StorageError>;
+    /// Get a file entry by pathid.
+    fn get_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError>;
 
     /// Check whether a given file is in the index already.
-    fn has_at_inode(&self, inode: Inode) -> Result<bool, StorageError>;
+    fn has_at_pathid(&self, pathid: PathId) -> Result<bool, StorageError>;
 
     /// Get all files in the index.
     fn all(&self, tx: mpsc::Sender<(Path, IndexedFile)>) -> Result<(), StorageError>;
@@ -199,14 +199,14 @@ pub(crate) trait IndexReadOperations {
 
 impl<T> IndexReadOperations for ReadableOpenIndex<T>
 where
-    T: ReadableTable<Inode, Holder<'static, FileTableEntry>>,
+    T: ReadableTable<PathId, Holder<'static, FileTableEntry>>,
 {
-    fn get_at_inode(&self, inode: Inode) -> Result<Option<IndexedFile>, StorageError> {
-        get_at_inode(&self.table, inode)
+    fn get_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError> {
+        get_at_pathid(&self.table, pathid)
     }
 
-    fn has_at_inode(&self, inode: Inode) -> Result<bool, StorageError> {
-        has_at_inode(&self.table, inode)
+    fn has_at_pathid(&self, pathid: PathId) -> Result<bool, StorageError> {
+        has_at_pathid(&self.table, pathid)
     }
 
     fn all(&self, tx: mpsc::Sender<(Path, IndexedFile)>) -> Result<(), StorageError> {
@@ -215,12 +215,12 @@ where
 }
 
 impl<'a> IndexReadOperations for WritableOpenIndex<'a> {
-    fn get_at_inode(&self, inode: Inode) -> Result<Option<IndexedFile>, StorageError> {
-        get_at_inode(&self.table, inode)
+    fn get_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError> {
+        get_at_pathid(&self.table, pathid)
     }
 
-    fn has_at_inode(&self, inode: Inode) -> Result<bool, StorageError> {
-        has_at_inode(&self.table, inode)
+    fn has_at_pathid(&self, pathid: PathId) -> Result<bool, StorageError> {
+        has_at_pathid(&self.table, pathid)
     }
 
     fn all(&self, tx: mpsc::Sender<(Path, IndexedFile)>) -> Result<(), StorageError> {
@@ -251,8 +251,8 @@ impl<T: IndexReadOperations> IndexExt for T {
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<Option<IndexedFile>, StorageError> {
-        if let Some(inode) = tree.resolve(loc)? {
-            self.get_at_inode(inode)
+        if let Some(pathid) = tree.resolve(loc)? {
+            self.get_at_pathid(pathid)
         } else {
             Ok(None)
         }
@@ -262,8 +262,8 @@ impl<T: IndexReadOperations> IndexExt for T {
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<bool, StorageError> {
-        if let Some(inode) = tree.resolve(loc)? {
-            self.has_at_inode(inode)
+        if let Some(pathid) = tree.resolve(loc)? {
+            self.has_at_pathid(pathid)
         } else {
             Ok(false)
         }
@@ -281,30 +281,30 @@ impl<'a> WritableOpenIndex<'a> {
         size: u64,
         mtime: UnixTime,
         hash: Hash,
-    ) -> Result<Inode, StorageError> {
+    ) -> Result<PathId, StorageError> {
         let loc = loc.into();
-        let inode = tree.setup(loc.borrow())?;
-        let old_hash = self.indexed_hash(inode);
+        let pathid = tree.setup(loc.borrow())?;
+        let old_hash = self.indexed_hash(pathid);
         if hash.matches(old_hash.as_ref()) {
-            return Ok(inode);
+            return Ok(pathid);
         }
         if let Some(path) = tree.backtrack(loc)? {
             tree.insert_and_incref(
-                inode,
+                pathid,
                 &mut self.table,
-                inode,
+                pathid,
                 Holder::with_content(FileTableEntry::new(path.clone(), size, mtime, hash))?,
             )?;
-            dirty.mark_dirty(inode, "indexed")?;
+            dirty.mark_dirty(pathid, "indexed")?;
             history.report_added(&path, old_hash.as_ref())?;
         }
-        Ok(inode)
+        Ok(pathid)
     }
 
     /// Hash of the indexed file or None.
-    fn indexed_hash(&mut self, inode: Inode) -> Option<Hash> {
+    fn indexed_hash(&mut self, pathid: PathId) -> Option<Hash> {
         self.table
-            .get(inode)
+            .get(pathid)
             .ok()
             .flatten()
             .map(|e| e.value().parse().ok())
@@ -323,16 +323,16 @@ impl<'a> WritableOpenIndex<'a> {
         loc: L,
     ) -> Result<bool, StorageError> {
         let loc = loc.into();
-        if let Some(inode) = tree.resolve(loc)? {
-            let FileTableEntry { path, hash, .. } = match self.table.get(inode)? {
+        if let Some(pathid) = tree.resolve(loc)? {
+            let FileTableEntry { path, hash, .. } = match self.table.get(pathid)? {
                 None => {
                     // Nothing to do
                     return Ok(false);
                 }
                 Some(existing) => existing.value().parse()?,
             };
-            if tree.remove_and_decref(inode, &mut self.table, inode)? {
-                dirty.mark_dirty(inode, "unindexed")?;
+            if tree.remove_and_decref(pathid, &mut self.table, pathid)? {
+                dirty.mark_dirty(pathid, "unindexed")?;
                 history.report_removed(&path, &hash)?;
 
                 return Ok(true);
@@ -354,16 +354,16 @@ impl<'a> WritableOpenIndex<'a> {
         loc: L,
     ) -> Result<bool, StorageError> {
         let loc = loc.into();
-        if let Some(inode) = tree.resolve(loc)? {
-            let FileTableEntry { path, hash, .. } = match self.table.get(inode)? {
+        if let Some(pathid) = tree.resolve(loc)? {
+            let FileTableEntry { path, hash, .. } = match self.table.get(pathid)? {
                 None => {
                     // Nothing to do
                     return Ok(false);
                 }
                 Some(existing) => existing.value().parse()?,
             };
-            if tree.remove_and_decref(inode, &mut self.table, inode)? {
-                dirty.mark_dirty(inode, "dropped")?;
+            if tree.remove_and_decref(pathid, &mut self.table, pathid)? {
+                dirty.mark_dirty(pathid, "dropped")?;
                 history.report_dropped(&path, &hash)?;
 
                 return Ok(true);
@@ -373,7 +373,7 @@ impl<'a> WritableOpenIndex<'a> {
         Ok(false)
     }
 
-    /// Remove a tree location (path or inode) that can be a file or a
+    /// Remove a tree location (path or pathid) that can be a file or a
     /// directory.
     ///
     /// If the location is a directory, all files within that
@@ -393,10 +393,10 @@ impl<'a> WritableOpenIndex<'a> {
         tree.remove_recursive_and_decref_checked(
             loc,
             &mut self.table,
-            |inode| inode,
-            |inode, v| {
+            |pathid| pathid,
+            |pathid, v| {
                 let FileTableEntry { path, hash, .. } = v.parse()?;
-                dirty.mark_dirty(inode, "unindexed")?;
+                dirty.mark_dirty(pathid, "unindexed")?;
                 history.report_removed(&path, &hash)?;
 
                 Ok(true)
@@ -418,8 +418,8 @@ impl<'a> WritableOpenIndex<'a> {
         old_hash: &Hash,
         new_hash: &Hash,
     ) -> Result<(), StorageError> {
-        if let Some(inode) = tree.resolve(loc)? {
-            let entry = match self.table.get(inode)? {
+        if let Some(pathid) = tree.resolve(loc)? {
+            let entry = match self.table.get(pathid)? {
                 None => None,
                 Some(v) => Some(v.value().parse()?),
             };
@@ -431,7 +431,7 @@ impl<'a> WritableOpenIndex<'a> {
                 // to download that newer version later on.
                 entry.outdated_by = Some(new_hash.clone());
 
-                self.table.insert(inode, Holder::with_content(entry)?)?;
+                self.table.insert(pathid, Holder::with_content(entry)?)?;
             }
         }
 
@@ -439,25 +439,25 @@ impl<'a> WritableOpenIndex<'a> {
     }
 }
 
-fn get_at_inode(
-    index_table: &impl ReadableTable<Inode, Holder<'static, FileTableEntry>>,
-    inode: Inode,
+fn get_at_pathid(
+    index_table: &impl ReadableTable<PathId, Holder<'static, FileTableEntry>>,
+    pathid: PathId,
 ) -> Result<Option<IndexedFile>, StorageError> {
-    match index_table.get(inode)? {
+    match index_table.get(pathid)? {
         None => Ok(None),
         Some(v) => Ok(Some(v.value().parse()?.into())),
     }
 }
 
-fn has_at_inode(
-    index_table: &impl ReadableTable<Inode, Holder<'static, FileTableEntry>>,
-    inode: Inode,
+fn has_at_pathid(
+    index_table: &impl ReadableTable<PathId, Holder<'static, FileTableEntry>>,
+    pathid: PathId,
 ) -> Result<bool, StorageError> {
-    Ok(index_table.get(inode)?.is_some())
+    Ok(index_table.get(pathid)?.is_some())
 }
 
 fn all(
-    index_table: &impl ReadableTable<Inode, Holder<'static, FileTableEntry>>,
+    index_table: &impl ReadableTable<PathId, Holder<'static, FileTableEntry>>,
     tx: mpsc::Sender<(Path, IndexedFile)>,
 ) -> Result<(), StorageError> {
     for entry in index_table.iter()? {
@@ -803,13 +803,13 @@ mod tests {
             Ok(Self { db })
         }
     }
-    fn dirty_inodes(
+    fn dirty_pathids(
         dirty: &impl crate::arena::dirty::DirtyReadOperations,
-    ) -> Result<HashSet<Inode>, StorageError> {
+    ) -> Result<HashSet<PathId>, StorageError> {
         let mut start = 0;
         let mut ret = HashSet::new();
-        while let Some((inode, counter)) = dirty.next_dirty(start)? {
-            ret.insert(inode);
+        while let Some((pathid, counter)) = dirty.next_dirty(start)? {
+            ret.insert(pathid);
             start = counter + 1;
         }
         Ok(ret)
@@ -819,7 +819,7 @@ mod tests {
         dirty: &impl DirtyReadOperations,
         tree: &impl TreeReadOperations,
     ) -> Result<HashSet<Path>, StorageError> {
-        Ok(dirty_inodes(dirty)?
+        Ok(dirty_pathids(dirty)?
             .into_iter()
             .filter_map(|i| tree.backtrack(i).ok().flatten())
             .collect())
@@ -1277,7 +1277,7 @@ mod tests {
         let mut history = txn.write_history()?;
 
         // Add a file first
-        let inode = index.add(
+        let pathid = index.add(
             &mut tree,
             &mut history,
             &mut dirty,
@@ -1298,7 +1298,7 @@ mod tests {
         assert!(!index.has(&tree, &path)?);
 
         // Verify the path was marked dirty
-        assert_eq!(HashSet::from([inode]), dirty_inodes(&dirty)?);
+        assert_eq!(HashSet::from([pathid]), dirty_pathids(&dirty)?);
 
         // Verify history entries were added (Add + Remove entries)
         let history_entries = collect_history_entries(&history)?;
@@ -1337,7 +1337,7 @@ mod tests {
         let hash1 = Hash([0xfa; 32]);
         let hash2 = Hash([0xfb; 32]);
 
-        let inode1 = index.add(
+        let pathid1 = index.add(
             &mut tree,
             &mut history,
             &mut dirty,
@@ -1346,7 +1346,7 @@ mod tests {
             mtime,
             hash1.clone(),
         )?;
-        let inode2 = index.add(
+        let pathid2 = index.add(
             &mut tree,
             &mut history,
             &mut dirty,
@@ -1367,7 +1367,7 @@ mod tests {
         assert!(!index.has(&tree, &path2)?);
 
         // Verify the paths were marked dirty
-        assert_eq!(HashSet::from([inode1, inode2]), dirty_inodes(&dirty)?);
+        assert_eq!(HashSet::from([pathid1, pathid2]), dirty_pathids(&dirty)?);
 
         // Verify history entries were added (2 Add + 2 Remove entries)
         let history_entries = collect_history_entries(&history)?;
@@ -1927,13 +1927,13 @@ mod tests {
 
         assert!(result, "Branch should succeed when conditions are met");
 
-        // Verify hard link was created by checking inode numbers
+        // Verify hard link was created by checking pathid numbers
         let source_metadata = std::fs::metadata(source_path.path())?;
         let dest_metadata = std::fs::metadata(dest_path.path())?;
         assert_eq!(
             source_metadata.ino(),
             dest_metadata.ino(),
-            "Files should have same inode after hard link"
+            "Files should have same pathid after hard link"
         );
 
         // Test branch failure when source hash doesn't match

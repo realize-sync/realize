@@ -3,7 +3,7 @@ use super::engine::{Engine, StorageJob};
 use crate::arena::arena_cache::CacheReadOperations;
 use crate::arena::index::{self, IndexReadOperations};
 use crate::arena::tree::TreeExt;
-use crate::{Inode, JobId, JobStatus, StorageError};
+use crate::{PathId, JobId, JobStatus, StorageError};
 use realize_types::Hash;
 use std::fs::File;
 use std::path::PathBuf;
@@ -78,22 +78,22 @@ impl StorageJobProcessor {
     fn process_job(&self, job: StorageJob) -> Option<Result<JobStatus, StorageError>> {
         match job {
             StorageJob::External(_) => None,
-            StorageJob::Unrealize(inode, hash) => Some(self.unrealize(inode, hash)),
-            StorageJob::Realize(inode, hash, index_hash) => {
-                Some(self.realize(inode, hash, index_hash))
+            StorageJob::Unrealize(pathid, hash) => Some(self.unrealize(pathid, hash)),
+            StorageJob::Realize(pathid, hash, index_hash) => {
+                Some(self.realize(pathid, hash, index_hash))
             }
-            StorageJob::ProtectBlob(inode) => Some(self.set_protected(inode, true)),
-            StorageJob::UnprotectBlob(inode) => Some(self.set_protected(inode, false)),
+            StorageJob::ProtectBlob(pathid) => Some(self.set_protected(pathid, true)),
+            StorageJob::UnprotectBlob(pathid) => Some(self.set_protected(pathid, false)),
         }
     }
 
-    fn set_protected(&self, inode: Inode, protected: bool) -> Result<JobStatus, StorageError> {
+    fn set_protected(&self, pathid: PathId, protected: bool) -> Result<JobStatus, StorageError> {
         let txn = self.db.begin_write()?;
         {
             let tree = txn.read_tree()?;
             let mut blobs = txn.write_blobs()?;
             let mut dirty = txn.write_dirty()?;
-            blobs.set_protected(&tree, &mut dirty, inode, protected)?;
+            blobs.set_protected(&tree, &mut dirty, pathid, protected)?;
         }
         txn.commit()?;
         Ok(JobStatus::Done)
@@ -104,7 +104,7 @@ impl StorageJobProcessor {
     /// Gives up and returns [JobStatus::Abandoned] if the current
     /// versions in the cache or the current version in the index
     /// don't match `hash`.
-    fn unrealize(&self, inode: Inode, hash: Hash) -> Result<JobStatus, StorageError> {
+    fn unrealize(&self, pathid: PathId, hash: Hash) -> Result<JobStatus, StorageError> {
         let root = match &self.index_root {
             Some(ret) => ret,
             None => return Err(StorageError::NoLocalStorage(self.db.arena())),
@@ -116,19 +116,19 @@ impl StorageJobProcessor {
         {
             let mut tree = txn.write_tree()?;
             let mut index = txn.write_index()?;
-            path = match tree.backtrack(inode)? {
+            path = match tree.backtrack(pathid)? {
                 Some(v) => v,
                 None => return Ok(JobStatus::Abandoned("no_path")),
             };
             realpath = path.within(root);
-            let indexed = match index.get_at_inode(inode)? {
+            let indexed = match index.get_at_pathid(pathid)? {
                 Some(v) => v,
                 None => return Ok(JobStatus::Abandoned("not_in_index")),
             };
             if !indexed.matches_file(&realpath) {
                 return Ok(JobStatus::Abandoned("file_mismatch"));
             }
-            let cached = match txn.write_cache()?.get_at_inode(inode)? {
+            let cached = match txn.write_cache()?.get_at_pathid(pathid)? {
                 Some(v) => v,
                 None => return Ok(JobStatus::Abandoned("no_cache_entry")),
             };
@@ -137,11 +137,11 @@ impl StorageJobProcessor {
             }
             let mut blobs = txn.write_blobs()?;
             let marks = txn.read_marks()?;
-            cachepath = blobs.import(&mut tree, &marks, inode, &hash, &realpath.metadata()?)?;
+            cachepath = blobs.import(&mut tree, &marks, pathid, &hash, &realpath.metadata()?)?;
 
             let mut history = txn.write_history()?;
             let mut dirty = txn.write_dirty()?;
-            index.drop(&mut tree, &mut history, &mut dirty, inode)?;
+            index.drop(&mut tree, &mut history, &mut dirty, pathid)?;
 
             // We make a second check of the file mtime and size just
             // before renaming, in case it has changed.
@@ -189,7 +189,7 @@ impl StorageJobProcessor {
     /// exit. If it exists, realize gives up and returns false.
     fn realize(
         &self,
-        inode: Inode,
+        pathid: PathId,
         cache_hash: Hash,
         index_hash: Option<Hash>,
     ) -> Result<JobStatus, StorageError> {
@@ -204,14 +204,14 @@ impl StorageJobProcessor {
         let txn = self.db.begin_write()?;
         {
             let mut tree = txn.write_tree()?;
-            path = match tree.backtrack(inode)? {
+            path = match tree.backtrack(pathid)? {
                 Some(path) => path,
                 None => {
                     return Ok(JobStatus::Abandoned("no_path"));
                 }
             };
             let cache = txn.read_cache()?;
-            let cached = match cache.get_at_inode(inode)? {
+            let cached = match cache.get_at_pathid(pathid)? {
                 Some(e) => e,
                 None => {
                     return Ok(JobStatus::Abandoned("cache_entry"));
@@ -279,7 +279,7 @@ mod tests {
     use super::*;
     use crate::arena::index::IndexedFile;
     use crate::utils::hash;
-    use crate::{ArenaCache, Blob, Inode, LocalAvailability, Mark, Notification};
+    use crate::{ArenaCache, Blob, PathId, LocalAvailability, Mark, Notification};
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
@@ -435,18 +435,18 @@ mod tests {
             index::get_file(&self.db, &Path::parse(path_str)?)
         }
 
-        fn find_in_cache(&self, path_str: &str) -> Result<Option<Inode>, StorageError> {
+        fn find_in_cache(&self, path_str: &str) -> Result<Option<PathId>, StorageError> {
             match self.cache.expect(&Path::parse(path_str)?) {
-                Ok(inode) => Ok(Some(inode)),
+                Ok(pathid) => Ok(Some(pathid)),
                 Err(StorageError::NotFound) => Ok(None),
                 Err(err) => Err(err),
             }
         }
 
         fn open_blob(&self, path_str: &str) -> anyhow::Result<Blob> {
-            let inode = self.find_in_cache(path_str)?.expect("{path_str} in cache");
+            let pathid = self.find_in_cache(path_str)?.expect("{path_str} in cache");
 
-            Ok(self.cache.open_file(inode)?)
+            Ok(self.cache.open_file(pathid)?)
         }
 
         async fn read_blob_content(&self, path_str: &str) -> anyhow::Result<String> {
@@ -457,7 +457,7 @@ mod tests {
             Ok(buf)
         }
 
-        fn inode(&self, path: &Path) -> anyhow::Result<Inode> {
+        fn pathid(&self, path: &Path) -> anyhow::Result<PathId> {
             let txn = self.db.begin_read()?;
 
             Ok(txn.read_tree()?.expect(path)?)
@@ -468,11 +468,11 @@ mod tests {
                 "[{arena}] Unrealize \"{path}\" {hash}",
                 arena = self.processor.db.arena()
             );
-            let inode = self.inode(&path)?;
+            let pathid = self.pathid(&path)?;
             let processor = Arc::clone(&self.processor);
             let arena = self.processor.db.arena();
             tokio::task::spawn_blocking(move || {
-                let status = processor.unrealize(inode, hash)?;
+                let status = processor.unrealize(pathid, hash)?;
 
                 log::debug!("[{arena}] -> {status:?}", arena = arena);
                 Ok::<JobStatus, anyhow::Error>(status)
@@ -489,11 +489,11 @@ mod tests {
                 "[{arena}] Realize({path}, {hash})",
                 arena = self.processor.db.arena()
             );
-            let inode = self.inode(&path)?;
+            let pathid = self.pathid(&path)?;
             let processor = Arc::clone(&self.processor);
             let arena = self.processor.db.arena();
             tokio::task::spawn_blocking(move || {
-                let status = processor.realize(inode, hash, index_hash)?;
+                let status = processor.realize(pathid, hash, index_hash)?;
 
                 log::debug!("[{arena}] -> {status:?}", arena = arena);
                 Ok::<JobStatus, anyhow::Error>(status)
@@ -525,7 +525,7 @@ mod tests {
         fixture.add_to_cache("test.txt", &hash, 6)?;
         let path = Path::parse("test.txt")?;
         assert!(matches!(
-            fixture.processor.unrealize(fixture.inode(&path)?, hash),
+            fixture.processor.unrealize(fixture.pathid(&path)?, hash),
                 Err(StorageError::NoLocalStorage(a)) if a == fixture.arena));
 
         Ok(())
@@ -587,9 +587,9 @@ mod tests {
 
         let hash = hash::digest("test");
         fixture.add_to_cache("dir/test.txt", &hash, 4)?;
-        let inode = fixture.inode(&path)?;
+        let pathid = fixture.pathid(&path)?;
         {
-            let mut blob = fixture.cache.open_file(inode)?;
+            let mut blob = fixture.cache.open_file(pathid)?;
             blob.write_all(b"test").await?;
             blob.mark_verified().await?;
         }
@@ -605,12 +605,12 @@ mod tests {
 
         assert_eq!(
             LocalAvailability::Missing,
-            fixture.cache.local_availability(inode)?
+            fixture.cache.local_availability(pathid)?
         );
 
         let txn = fixture.db.begin_read()?;
         let index = txn.read_index()?;
-        let indexed = index.get_at_inode(inode)?.expect("must have been indexed");
+        let indexed = index.get_at_pathid(pathid)?.expect("must have been indexed");
         assert_eq!(hash, indexed.hash);
         assert_eq!(test_time(), indexed.mtime);
 
@@ -622,7 +622,7 @@ mod tests {
         let fixture = Fixture::setup()?;
         let path = Path::parse("test.txt")?;
         fixture.set_mark(&path, Mark::Own)?;
-        let inode = fixture.inode(&path)?;
+        let pathid = fixture.pathid(&path)?;
 
         let old_hash = hash::digest("old");
         let new_hash = hash::digest("new!");
@@ -630,7 +630,7 @@ mod tests {
         fixture.create_indexed_file("test.txt", "old").await?;
         fixture.replace_in_cache("test.txt", &old_hash, &new_hash, 4)?;
         {
-            let mut blob = fixture.cache.open_file(inode)?;
+            let mut blob = fixture.cache.open_file(pathid)?;
             blob.write_all(b"new!").await?;
             blob.mark_verified().await?;
         }
@@ -647,12 +647,12 @@ mod tests {
         assert_eq!(test_time(), UnixTime::mtime(&realpath.metadata()?));
         assert_eq!(
             LocalAvailability::Missing,
-            fixture.cache.local_availability(inode)?
+            fixture.cache.local_availability(pathid)?
         );
 
         let txn = fixture.db.begin_read()?;
         let index = txn.read_index()?;
-        let indexed = index.get_at_inode(inode)?.expect("must have been indexed");
+        let indexed = index.get_at_pathid(pathid)?.expect("must have been indexed");
         assert_eq!(new_hash, indexed.hash);
         assert_eq!(test_time(), indexed.mtime);
         assert_eq!(None, indexed.outdated_by);
@@ -668,9 +668,9 @@ mod tests {
 
         let hash = hash::digest("test");
         fixture.add_to_cache("test.txt", &hash, 4)?;
-        let inode = fixture.inode(&path)?;
+        let pathid = fixture.pathid(&path)?;
         {
-            let mut blob = fixture.cache.open_file(inode)?;
+            let mut blob = fixture.cache.open_file(pathid)?;
             blob.write_all(b"test").await?;
             blob.mark_verified().await?;
         }
@@ -693,9 +693,9 @@ mod tests {
 
         let hash = hash::digest("test");
         fixture.add_to_cache("test.txt", &hash, 4)?;
-        let inode = fixture.inode(&path)?;
+        let pathid = fixture.pathid(&path)?;
         {
-            let mut blob = fixture.cache.open_file(inode)?;
+            let mut blob = fixture.cache.open_file(pathid)?;
             blob.write_all(b"test").await?;
             blob.update_db().await?; // complete, but not verified
         }

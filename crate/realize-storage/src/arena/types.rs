@@ -1,5 +1,5 @@
 use crate::StorageError;
-use crate::types::Inode;
+use crate::types::PathId;
 use crate::utils::holder::{ByteConversionError, ByteConvertible, NamedType};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
@@ -65,10 +65,10 @@ use uuid::Uuid;
 /// An entry in the queue table.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct QueueTableEntry {
-    /// First node in the queue (Inode)
-    pub head: Option<Inode>,
-    /// Last node in the queue (Inode)
-    pub tail: Option<Inode>,
+    /// First node in the queue (PathId)
+    pub head: Option<PathId>,
+    /// Last node in the queue (PathId)
+    pub tail: Option<PathId>,
     /// Total disk usage in bytes
     pub disk_usage: u64,
 }
@@ -87,14 +87,14 @@ impl ByteConvertible<QueueTableEntry> for QueueTableEntry {
 
         let head_value = reader.get_head();
         let head = if head_value != 0 {
-            Some(Inode(head_value))
+            Some(PathId(head_value))
         } else {
             None
         };
 
         let tail_value = reader.get_tail();
         let tail = if tail_value != 0 {
-            Some(Inode(tail_value))
+            Some(PathId(tail_value))
         } else {
             None
         };
@@ -138,11 +138,11 @@ pub struct BlobTableEntry {
     /// Queue ID enum
     pub queue: LruQueueId,
 
-    /// Next blob in the queue (Inode)
-    pub next: Option<Inode>,
+    /// Next blob in the queue (PathId)
+    pub next: Option<PathId>,
 
-    /// Previous blob in the queue (Inode)
-    pub prev: Option<Inode>,
+    /// Previous blob in the queue (PathId)
+    pub prev: Option<PathId>,
 
     /// Disk usage in bytes
     pub disk_usage: u64,
@@ -163,14 +163,14 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
         let content_hash = parse_hash(reader.get_content_hash()?)?;
         let next_value = reader.get_next();
         let next = if next_value != 0 {
-            Some(Inode(next_value))
+            Some(PathId(next_value))
         } else {
             None
         };
 
         let prev_value = reader.get_prev();
         let prev = if prev_value != 0 {
-            Some(Inode(prev_value))
+            Some(PathId(prev_value))
         } else {
             None
         };
@@ -501,26 +501,26 @@ pub struct FileAvailability {
 pub enum CacheTableKey {
     /// The default entry, containing the selected version and its
     /// metadata for the cache.
-    Default(Inode),
+    Default(PathId),
     /// An entry that represents another peer's copy.
-    PeerCopy(Inode, Peer),
+    PeerCopy(PathId, Peer),
 
     /// A key that could not be parsed
     Invalid,
 }
 
 impl CacheTableKey {
-    /// A range that covers all keys with the given inode.
-    pub fn range(inode: Inode) -> std::ops::Range<CacheTableKey> {
-        CacheTableKey::Default(inode)..CacheTableKey::Default(inode.plus(1))
+    /// A range that covers all keys with the given pathid.
+    pub fn range(pathid: PathId) -> std::ops::Range<CacheTableKey> {
+        CacheTableKey::Default(pathid)..CacheTableKey::Default(pathid.plus(1))
     }
 
-    /// The key's inode
-    pub fn inode(&self) -> Inode {
+    /// The key's pathid
+    pub fn pathid(&self) -> PathId {
         match self {
-            CacheTableKey::Invalid => Inode::ZERO,
-            CacheTableKey::Default(inode) => *inode,
-            CacheTableKey::PeerCopy(inode, _) => *inode,
+            CacheTableKey::Invalid => PathId::ZERO,
+            CacheTableKey::Default(pathid) => *pathid,
+            CacheTableKey::PeerCopy(pathid, _) => *pathid,
         }
     }
 
@@ -542,7 +542,7 @@ impl CacheTableKey {
 
 impl PartialEq for CacheTableKey {
     fn eq(&self, other: &Self) -> bool {
-        self.inode() == other.inode()
+        self.pathid() == other.pathid()
             && self.variant_order() == other.variant_order()
             && self.peer() == other.peer()
     }
@@ -558,10 +558,10 @@ impl PartialOrd for CacheTableKey {
 
 impl Ord for CacheTableKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // First compare by inode
-        let inode_cmp = self.inode().cmp(&other.inode());
-        if inode_cmp != std::cmp::Ordering::Equal {
-            return inode_cmp;
+        // First compare by pathid
+        let pathid_cmp = self.pathid().cmp(&other.pathid());
+        if pathid_cmp != std::cmp::Ordering::Equal {
+            return pathid_cmp;
         }
 
         // Then compare by variant type
@@ -593,16 +593,16 @@ impl Value for CacheTableKey {
     where
         Self: 'a,
     {
-        let inode = Inode(<u64>::from_be_bytes(
+        let pathid = PathId(<u64>::from_be_bytes(
             data[0..8].try_into().unwrap_or([0; 8]),
         ));
-        if inode == Inode::ZERO {
+        if pathid == PathId::ZERO {
             return CacheTableKey::Invalid;
         }
         match data.get(8) {
-            None => CacheTableKey::Default(inode),
+            None => CacheTableKey::Default(pathid),
             Some(1) => {
-                CacheTableKey::PeerCopy(inode, Peer::from(str::from_utf8(&data[9..]).unwrap()))
+                CacheTableKey::PeerCopy(pathid, Peer::from(str::from_utf8(&data[9..]).unwrap()))
             }
             Some(_) => CacheTableKey::Invalid,
         }
@@ -614,7 +614,7 @@ impl Value for CacheTableKey {
         Self: 'b,
     {
         let mut ret = vec![];
-        ret.extend_from_slice(&value.inode().as_u64().to_be_bytes());
+        ret.extend_from_slice(&value.pathid().as_u64().to_be_bytes());
         match value {
             CacheTableKey::Default(_) | CacheTableKey::Invalid => {}
             CacheTableKey::PeerCopy(_, peer) => {
@@ -654,8 +654,8 @@ pub struct FileTableEntry {
     // If set, a version is known to exist that replaces the version
     // in this entry.
     pub outdated_by: Option<Hash>,
-    /// Inode this specific version was branched from
-    pub branched_from: Option<Inode>,
+    /// PathId this specific version was branched from
+    pub branched_from: Option<PathId>,
 }
 
 impl FileTableEntry {
@@ -732,7 +732,7 @@ fn fill_file_table_entry(
     mtime.set_nsecs(entry.mtime.subsec_nanos());
     builder.set_path(entry.path.as_str());
     builder.set_hash(&entry.hash.0);
-    builder.set_branched_from(Inode::from_optional(entry.branched_from));
+    builder.set_branched_from(PathId::from_optional(entry.branched_from));
 
     if let Some(hash) = &entry.outdated_by {
         builder.set_outdated_by(&hash.0)
@@ -755,7 +755,7 @@ fn parse_file_table_entry(
         path: Path::parse(msg.get_path()?.to_str()?)?,
         hash: parse_hash(msg.get_hash()?)?,
         outdated_by,
-        branched_from: Inode::as_optional(msg.get_branched_from()),
+        branched_from: PathId::as_optional(msg.get_branched_from()),
     })
 }
 
@@ -901,8 +901,8 @@ mod tests {
             content_size: 100,
             verified: false,
             queue: LruQueueId::WorkingArea,
-            next: Some(Inode(0x0101010101010101)),
-            prev: Some(Inode(0x0202020202020202)),
+            next: Some(PathId(0x0101010101010101)),
+            prev: Some(PathId(0x0202020202020202)),
             disk_usage: 1024,
         };
 
@@ -933,8 +933,8 @@ mod tests {
     #[test]
     fn convert_queue_table_entry() -> anyhow::Result<()> {
         let entry = QueueTableEntry {
-            head: Some(Inode(0x0101010101010101)),
-            tail: Some(Inode(0x0202020202020202)),
+            head: Some(PathId(0x0101010101010101)),
+            tail: Some(PathId(0x0202020202020202)),
             disk_usage: 1024,
         };
 
@@ -1040,7 +1040,7 @@ mod tests {
             path: Path::parse("foo/bar.txt")?,
             hash: Hash([0xa1u8; 32]),
             outdated_by: Some(Hash([3u8; 32])),
-            branched_from: Some(Inode(123)),
+            branched_from: Some(PathId(123)),
         };
 
         assert_eq!(
@@ -1053,7 +1053,7 @@ mod tests {
 
     #[test]
     fn convert_file_table_key_default() -> anyhow::Result<()> {
-        let key = CacheTableKey::Default(Inode(12345));
+        let key = CacheTableKey::Default(PathId(12345));
 
         // Test round-trip conversion
         let bytes = CacheTableKey::as_bytes(&key);
@@ -1065,7 +1065,7 @@ mod tests {
 
     #[test]
     fn convert_file_table_key_peer_copy() -> anyhow::Result<()> {
-        let key = CacheTableKey::PeerCopy(Inode(11111), Peer::from("peer1"));
+        let key = CacheTableKey::PeerCopy(PathId(11111), Peer::from("peer1"));
 
         // Test round-trip conversion
         let bytes = CacheTableKey::as_bytes(&key);
@@ -1090,11 +1090,11 @@ mod tests {
     #[test]
     fn convert_file_table_key_all_variants() -> anyhow::Result<()> {
         let test_cases = vec![
-            CacheTableKey::Default(Inode(1)),
-            CacheTableKey::Default(Inode(0xFFFFFFFFFFFFFFFF)),
-            CacheTableKey::PeerCopy(Inode(3), Peer::from("short")),
+            CacheTableKey::Default(PathId(1)),
+            CacheTableKey::Default(PathId(0xFFFFFFFFFFFFFFFF)),
+            CacheTableKey::PeerCopy(PathId(3), Peer::from("short")),
             CacheTableKey::PeerCopy(
-                Inode(4),
+                PathId(4),
                 Peer::from("very_long_peer_name_that_might_cause_issues"),
             ),
             CacheTableKey::Invalid,
@@ -1114,11 +1114,11 @@ mod tests {
         // Test that byte comparison behavior is consistent and documented
 
         let test_cases = vec![
-            CacheTableKey::Default(Inode(1)),
-            CacheTableKey::Default(Inode(2)),
-            CacheTableKey::PeerCopy(Inode(1), Peer::from("a")),
-            CacheTableKey::PeerCopy(Inode(1), Peer::from("b")),
-            CacheTableKey::PeerCopy(Inode(2), Peer::from("a")),
+            CacheTableKey::Default(PathId(1)),
+            CacheTableKey::Default(PathId(2)),
+            CacheTableKey::PeerCopy(PathId(1), Peer::from("a")),
+            CacheTableKey::PeerCopy(PathId(1), Peer::from("b")),
+            CacheTableKey::PeerCopy(PathId(2), Peer::from("a")),
         ];
 
         // Test that byte comparison is consistent (same inputs always give same result)
@@ -1158,13 +1158,13 @@ mod tests {
     fn file_table_key_byte_comparison_matches_object_comparison() {
         // Test that byte comparison matches object comparison for all valid keys
         let test_cases = vec![
-            CacheTableKey::Default(Inode(1)),
-            CacheTableKey::Default(Inode(2)),
-            CacheTableKey::Default(Inode(0x110000)),
-            CacheTableKey::PeerCopy(Inode(1), Peer::from("a")),
-            CacheTableKey::PeerCopy(Inode(1), Peer::from("b")),
-            CacheTableKey::PeerCopy(Inode(2), Peer::from("a")),
-            CacheTableKey::PeerCopy(Inode(0x110000), Peer::from("a")),
+            CacheTableKey::Default(PathId(1)),
+            CacheTableKey::Default(PathId(2)),
+            CacheTableKey::Default(PathId(0x110000)),
+            CacheTableKey::PeerCopy(PathId(1), Peer::from("a")),
+            CacheTableKey::PeerCopy(PathId(1), Peer::from("b")),
+            CacheTableKey::PeerCopy(PathId(2), Peer::from("a")),
+            CacheTableKey::PeerCopy(PathId(0x110000), Peer::from("a")),
         ];
 
         for i in 0..test_cases.len() {
@@ -1190,9 +1190,9 @@ mod tests {
     fn file_table_key_edge_cases() -> anyhow::Result<()> {
         // Test edge cases
         let edge_cases = vec![
-            CacheTableKey::Default(Inode(1)),                   // Non-zero inode
-            CacheTableKey::PeerCopy(Inode(1), Peer::from("")),  // Empty peer
-            CacheTableKey::PeerCopy(Inode(1), Peer::from("a")), // Single char peer
+            CacheTableKey::Default(PathId(1)),                   // Non-zero pathid
+            CacheTableKey::PeerCopy(PathId(1), Peer::from("")),  // Empty peer
+            CacheTableKey::PeerCopy(PathId(1), Peer::from("a")), // Single char peer
         ];
 
         for key in edge_cases {
@@ -1201,19 +1201,19 @@ mod tests {
             assert_eq!(key, converted, "Failed for edge case: {:?}", key);
         }
 
-        // Test that Inode(0) gets converted to Invalid (this is the intended behavior)
-        let zero_inode_cases = vec![
-            CacheTableKey::Default(Inode(0)),
-            CacheTableKey::PeerCopy(Inode(0), Peer::from("")),
+        // Test that PathId(0) gets converted to Invalid (this is the intended behavior)
+        let zero_pathid_cases = vec![
+            CacheTableKey::Default(PathId(0)),
+            CacheTableKey::PeerCopy(PathId(0), Peer::from("")),
         ];
 
-        for key in zero_inode_cases {
+        for key in zero_pathid_cases {
             let bytes = CacheTableKey::as_bytes(&key);
             let converted = CacheTableKey::from_bytes(&bytes);
             assert_eq!(
                 converted,
                 CacheTableKey::Invalid,
-                "Expected Invalid for zero inode case: {:?}",
+                "Expected Invalid for zero pathid case: {:?}",
                 key
             );
         }
@@ -1224,20 +1224,20 @@ mod tests {
     #[test]
     fn file_table_key_serialization_format() {
         // Test that the serialization format is correct
-        let key = CacheTableKey::Default(Inode(0x1021a3));
+        let key = CacheTableKey::Default(PathId(0x1021a3));
         let bytes = CacheTableKey::as_bytes(&key);
 
-        // Should be exactly 8 bytes for Default (just the inode),
+        // Should be exactly 8 bytes for Default (just the pathid),
         // with big endian encoding.
         assert_eq!(bytes.len(), 8);
         assert_eq!(bytes, [0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x21, 0xa3]);
 
-        let key = CacheTableKey::PeerCopy(Inode(11111), Peer::from("test"));
+        let key = CacheTableKey::PeerCopy(PathId(11111), Peer::from("test"));
         let bytes = CacheTableKey::as_bytes(&key);
 
-        // Should be 13 bytes for PeerCopy (inode + 1 byte + peer string)
+        // Should be 13 bytes for PeerCopy (pathid + 1 byte + peer string)
         assert_eq!(bytes.len(), 13);
-        assert_eq!(&bytes[0..8], Inode(11111).as_u64().to_be_bytes());
+        assert_eq!(&bytes[0..8], PathId(11111).as_u64().to_be_bytes());
         assert_eq!(bytes[8], 1);
         assert_eq!(&bytes[9..], b"test");
     }

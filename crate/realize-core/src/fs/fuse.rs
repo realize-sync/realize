@@ -3,7 +3,7 @@ use crate::fs::downloader::Downloader;
 use fuser::{Filesystem, MountOption};
 use nix::libc::c_int;
 use realize_storage::{
-    DirMetadata, FileMetadata, GlobalCache, Inode, InodeAssignment, StorageError,
+    DirMetadata, FileMetadata, GlobalCache, PathId, PathAssignment, StorageError,
 };
 use std::ffi::OsString;
 use std::time::SystemTime;
@@ -391,35 +391,35 @@ impl InnerRealizeFs {
     async fn lookup(&self, parent: u64, name: OsString) -> Result<fuser::FileAttr, FuseError> {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
 
-        let (inode, assignment) = self.cache.lookup(Inode(parent), name).await?;
+        let (pathid, assignment) = self.cache.lookup(PathId(parent), name).await?;
         match assignment {
-            InodeAssignment::Directory => {
-                let metadata = self.cache.dir_metadata(inode).await?;
-                return Ok(self.build_dir_attr(inode, metadata));
+            PathAssignment::Directory => {
+                let metadata = self.cache.dir_metadata(pathid).await?;
+                return Ok(self.build_dir_attr(pathid, metadata));
             }
-            InodeAssignment::File => {
-                let metadata = self.cache.file_metadata(inode).await?;
-                return Ok(self.build_file_attr(inode, &metadata));
+            PathAssignment::File => {
+                let metadata = self.cache.file_metadata(pathid).await?;
+                return Ok(self.build_file_attr(pathid, &metadata));
             }
         };
     }
 
     async fn getattr(&self, ino: u64) -> Result<fuser::FileAttr, FuseError> {
         let (file_metadata, dir_mtime) = tokio::join!(
-            self.cache.file_metadata(Inode(ino)),
-            self.cache.dir_metadata(Inode(ino))
+            self.cache.file_metadata(PathId(ino)),
+            self.cache.dir_metadata(PathId(ino))
         );
         if let Ok(mtime) = dir_mtime {
-            Ok(self.build_dir_attr(Inode(ino), mtime))
+            Ok(self.build_dir_attr(PathId(ino), mtime))
         } else {
-            Ok(self.build_file_attr(Inode(ino), &file_metadata.map_err(FuseError::Cache)?))
+            Ok(self.build_file_attr(PathId(ino), &file_metadata.map_err(FuseError::Cache)?))
         }
     }
 
     async fn read(&self, ino: u64, offset: i64, size: u32) -> Result<Vec<u8>, FuseError> {
         let reader = self
             .downloader
-            .reader(Inode(ino))
+            .reader(PathId(ino))
             .await
             .map_err(FuseError::Cache)?;
         let mut reader = tokio::io::BufReader::new(reader);
@@ -443,23 +443,23 @@ impl InnerRealizeFs {
     ) -> Result<(), FuseError> {
         let mut entries = self
             .cache
-            .readdir(Inode(ino))
+            .readdir(PathId(ino))
             .await
             .map_err(FuseError::Cache)?;
         entries.sort_by(|a, b| a.1.cmp(&b.1));
 
-        let pivot = Inode(offset as u64); // offset is actually a u64 in fuse
-        let start = match entries.binary_search_by(|(_, inode, _)| inode.cmp(&pivot)) {
+        let pivot = PathId(offset as u64); // offset is actually a u64 in fuse
+        let start = match entries.binary_search_by(|(_, pathid, _)| pathid.cmp(&pivot)) {
             Ok(i) => i + 1,
             Err(i) => i,
         };
-        for (name, inode, assignment) in entries.into_iter().skip(start) {
+        for (name, pathid, assignment) in entries.into_iter().skip(start) {
             if reply.add(
-                inode.as_u64(),
-                inode.as_u64() as i64,
+                pathid.as_u64(),
+                pathid.as_u64() as i64,
                 match assignment {
-                    InodeAssignment::Directory => fuser::FileType::Directory,
-                    InodeAssignment::File => fuser::FileType::RegularFile,
+                    PathAssignment::Directory => fuser::FileType::Directory,
+                    PathAssignment::File => fuser::FileType::RegularFile,
                 },
                 name,
             ) {
@@ -473,7 +473,7 @@ impl InnerRealizeFs {
 
     async fn unlink(&self, parent: u64, name: OsString) -> Result<(), FuseError> {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
-        self.cache.unlink(Inode(parent), name).await?;
+        self.cache.unlink(PathId(parent), name).await?;
 
         Ok(())
     }
@@ -487,7 +487,7 @@ impl InnerRealizeFs {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
         let (dest, metadata) = self
             .cache
-            .branch(Inode(source), Inode(parent), name)
+            .branch(PathId(source), PathId(parent), name)
             .await?;
 
         Ok(self.build_file_attr(dest, &metadata))
@@ -502,7 +502,7 @@ impl InnerRealizeFs {
     ) -> Result<fuser::FileAttr, FuseError> {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
 
-        let (dest, metadata) = self.cache.mkdir(Inode(parent), name).await?;
+        let (dest, metadata) = self.cache.mkdir(PathId(parent), name).await?;
 
         Ok(self.build_dir_attr(dest, metadata))
     }
@@ -510,12 +510,12 @@ impl InnerRealizeFs {
     async fn rmdir(&self, parent: u64, name: OsString) -> Result<(), FuseError> {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
 
-        self.cache.rmdir(Inode(parent), name).await?;
+        self.cache.rmdir(PathId(parent), name).await?;
 
         Ok(())
     }
 
-    fn build_file_attr(&self, inode: Inode, metadata: &FileMetadata) -> fuser::FileAttr {
+    fn build_file_attr(&self, pathid: PathId, metadata: &FileMetadata) -> fuser::FileAttr {
         let uid = nix::unistd::getuid().as_raw();
         let gid = nix::unistd::getgid().as_raw();
         let mtime = metadata
@@ -524,7 +524,7 @@ impl InnerRealizeFs {
             .unwrap_or(SystemTime::UNIX_EPOCH);
 
         fuser::FileAttr {
-            ino: inode.as_u64(),
+            ino: pathid.as_u64(),
             size: metadata.size,
             blocks: (metadata.size + 511) / 512, // Round up to block size
             atime: mtime,
@@ -542,7 +542,7 @@ impl InnerRealizeFs {
         }
     }
 
-    fn build_dir_attr(&self, inode: Inode, metadata: DirMetadata) -> fuser::FileAttr {
+    fn build_dir_attr(&self, pathid: PathId, metadata: DirMetadata) -> fuser::FileAttr {
         let uid = nix::unistd::getuid().as_raw();
         let gid = nix::unistd::getgid().as_raw();
         let mtime = metadata
@@ -551,7 +551,7 @@ impl InnerRealizeFs {
             .unwrap_or(SystemTime::UNIX_EPOCH);
 
         fuser::FileAttr {
-            ino: inode.as_u64(),
+            ino: pathid.as_u64(),
             size: 512,
             blocks: 1,
             atime: mtime,

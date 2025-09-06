@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 use super::db::BeforeCommit;
-use crate::InodeAllocator;
-use crate::{Inode, StorageError};
+use crate::PathIdAllocator;
+use crate::{PathId, StorageError};
 use realize_types::{Arena, Path};
 use redb::{ReadableTable, Table};
 use std::borrow::{Borrow, Cow};
@@ -20,7 +20,7 @@ use std::sync::Arc;
 /// let tree: Tree = ...;
 /// let txn = db.begin_read()?;
 /// let readable_tree = txn.read_tree();
-/// let inode = readable_tree.lookup(tree.root(), "mydir")?;
+/// let pathid = readable_tree.lookup(tree.root(), "mydir")?;
 /// ```
 ///
 /// or a write transaction:
@@ -28,7 +28,7 @@ use std::sync::Arc;
 /// ```ignore
 /// let txn = db.begin_write()?;
 /// let readable_tree = txn.read_tree();
-/// let inode = readable_tree.lookup(tree.root(), "mydir")?;
+/// let pathid = readable_tree.lookup(tree.root(), "mydir")?;
 /// ```
 ///
 /// It can also be open for writing, given a write transaction:
@@ -40,12 +40,12 @@ use std::sync::Arc;
 /// ```
 pub(crate) struct Tree {
     arena: Arena,
-    root: Inode,
-    allocator: Arc<InodeAllocator>,
+    root: PathId,
+    allocator: Arc<PathIdAllocator>,
 }
 
 impl Tree {
-    pub(crate) fn new(arena: Arena, allocator: Arc<InodeAllocator>) -> Result<Self, StorageError> {
+    pub(crate) fn new(arena: Arena, allocator: Arc<PathIdAllocator>) -> Result<Self, StorageError> {
         let root = allocator
             .arena_root(arena)
             .ok_or_else(|| StorageError::UnknownArena(arena))?;
@@ -56,23 +56,23 @@ impl Tree {
         })
     }
 
-    pub(crate) fn root(&self) -> Inode {
+    pub(crate) fn root(&self) -> PathId {
         self.root
     }
 }
 
 pub(crate) struct ReadableOpenTree<T>
 where
-    T: ReadableTable<(Inode, &'static str), Inode>,
+    T: ReadableTable<(PathId, &'static str), PathId>,
 {
     table: T,
-    root: Inode,
+    root: PathId,
     arena: Arena,
 }
 
 impl<T> ReadableOpenTree<T>
 where
-    T: ReadableTable<(Inode, &'static str), Inode>,
+    T: ReadableTable<(PathId, &'static str), PathId>,
 {
     pub(crate) fn new(table: T, tree: &Tree) -> Self {
         Self {
@@ -87,28 +87,28 @@ where
 ///
 /// See also [TreeExt] for path-based operations.
 pub(crate) trait TreeReadOperations {
-    /// Returns the tree root inode.
-    fn root(&self) -> Inode;
+    /// Returns the tree root pathid.
+    fn root(&self) -> PathId;
 
     /// Lookup a specific name in the given node.
-    fn lookup_inode(&self, inode: Inode, name: &str) -> Result<Option<Inode>, StorageError>;
+    fn lookup_pathid(&self, pathid: PathId, name: &str) -> Result<Option<PathId>, StorageError>;
 
-    /// List names under the given inode.
-    fn readdir_inode(&self, inode: Inode) -> ReadDirIterator<'_>;
+    /// List names under the given pathid.
+    fn readdir_pathid(&self, pathid: PathId) -> ReadDirIterator<'_>;
 
-    /// Check whether the given inode exists
-    fn inode_exists(&self, inode: Inode) -> Result<bool, StorageError>;
+    /// Check whether the given pathid exists
+    fn pathid_exists(&self, pathid: PathId) -> Result<bool, StorageError>;
 
-    /// Return the parent of the given inode, or None if not found.
+    /// Return the parent of the given pathid, or None if not found.
     ///
-    /// The parent of the root inode is None. All other existing inodes
+    /// The parent of the root pathid is None. All other existing pathids
     /// have a parent.
     ///
     /// See also [TreeExt::ancestors]
-    fn parent(&self, inode: Inode) -> Result<Option<Inode>, StorageError>;
+    fn parent(&self, pathid: PathId) -> Result<Option<PathId>, StorageError>;
 
-    /// Return the name {inode} can be found in in {parent_inode}.
-    fn name_in(&self, parent_inode: Inode, inode: Inode) -> Result<Option<String>, StorageError>;
+    /// Return the name {pathid} can be found in in {parent_pathid}.
+    fn name_in(&self, parent_pathid: PathId, pathid: PathId) -> Result<Option<String>, StorageError>;
 
     /// Returns the arena this tree belongs to.
     fn arena(&self) -> Arena;
@@ -116,25 +116,25 @@ pub(crate) trait TreeReadOperations {
 
 impl<T> TreeReadOperations for ReadableOpenTree<T>
 where
-    T: ReadableTable<(Inode, &'static str), Inode>,
+    T: ReadableTable<(PathId, &'static str), PathId>,
 {
-    fn root(&self) -> Inode {
+    fn root(&self) -> PathId {
         self.root
     }
-    fn lookup_inode(&self, inode: Inode, name: &str) -> Result<Option<Inode>, StorageError> {
-        lookup(&self.table, inode, name)
+    fn lookup_pathid(&self, pathid: PathId, name: &str) -> Result<Option<PathId>, StorageError> {
+        lookup(&self.table, pathid, name)
     }
-    fn readdir_inode(&self, inode: Inode) -> ReadDirIterator<'_> {
-        readdir(&self.table, inode)
+    fn readdir_pathid(&self, pathid: PathId) -> ReadDirIterator<'_> {
+        readdir(&self.table, pathid)
     }
-    fn inode_exists(&self, inode: Inode) -> Result<bool, StorageError> {
-        exists(&self.table, self.root, inode)
+    fn pathid_exists(&self, pathid: PathId) -> Result<bool, StorageError> {
+        exists(&self.table, self.root, pathid)
     }
-    fn parent(&self, inode: Inode) -> Result<Option<Inode>, StorageError> {
-        parent(&self.table, inode)
+    fn parent(&self, pathid: PathId) -> Result<Option<PathId>, StorageError> {
+        parent(&self.table, pathid)
     }
-    fn name_in(&self, parent_inode: Inode, inode: Inode) -> Result<Option<String>, StorageError> {
-        name_in(&self.table, parent_inode, inode)
+    fn name_in(&self, parent_pathid: PathId, pathid: PathId) -> Result<Option<String>, StorageError> {
+        name_in(&self.table, parent_pathid, pathid)
     }
     fn arena(&self) -> Arena {
         self.arena
@@ -142,38 +142,38 @@ where
 }
 
 impl<'a> TreeReadOperations for WritableOpenTree<'a> {
-    fn root(&self) -> Inode {
+    fn root(&self) -> PathId {
         self.tree.root
     }
-    fn lookup_inode(&self, inode: Inode, name: &str) -> Result<Option<Inode>, StorageError> {
-        lookup(&self.table, inode, name)
+    fn lookup_pathid(&self, pathid: PathId, name: &str) -> Result<Option<PathId>, StorageError> {
+        lookup(&self.table, pathid, name)
     }
-    fn readdir_inode(&self, inode: Inode) -> ReadDirIterator<'_> {
-        readdir(&self.table, inode)
+    fn readdir_pathid(&self, pathid: PathId) -> ReadDirIterator<'_> {
+        readdir(&self.table, pathid)
     }
-    fn inode_exists(&self, inode: Inode) -> Result<bool, StorageError> {
-        exists(&self.table, self.tree.root, inode)
+    fn pathid_exists(&self, pathid: PathId) -> Result<bool, StorageError> {
+        exists(&self.table, self.tree.root, pathid)
     }
-    fn parent(&self, inode: Inode) -> Result<Option<Inode>, StorageError> {
-        parent(&self.table, inode)
+    fn parent(&self, pathid: PathId) -> Result<Option<PathId>, StorageError> {
+        parent(&self.table, pathid)
     }
-    fn name_in(&self, parent_inode: Inode, inode: Inode) -> Result<Option<String>, StorageError> {
-        name_in(&self.table, parent_inode, inode)
+    fn name_in(&self, parent_pathid: PathId, pathid: PathId) -> Result<Option<String>, StorageError> {
+        name_in(&self.table, parent_pathid, pathid)
     }
     fn arena(&self) -> Arena {
         self.tree.arena
     }
 }
 
-/// A location within the tree, which can be expressed as an inode or
+/// A location within the tree, which can be expressed as an pathid or
 /// a path.
 ///
 /// Such locations are usually created automatically using into().
 pub(crate) enum TreeLoc<'a> {
-    Inode(Inode),
+    PathId(PathId),
     PathRef(&'a Path),
     Path(Path),
-    InodeAndName(Inode, Cow<'a, str>),
+    PathIdAndName(PathId, Cow<'a, str>),
 }
 
 impl<'a> TreeLoc<'a> {
@@ -183,30 +183,30 @@ impl<'a> TreeLoc<'a> {
     /// This is cheaper than a clone() for `TreeLoc::Path`.
     pub(crate) fn borrow(&self) -> TreeLoc<'_> {
         match self {
-            TreeLoc::Inode(inode) => TreeLoc::Inode(*inode),
+            TreeLoc::PathId(pathid) => TreeLoc::PathId(*pathid),
             TreeLoc::PathRef(path) => TreeLoc::PathRef(*path),
             TreeLoc::Path(path) => TreeLoc::PathRef(path),
-            TreeLoc::InodeAndName(inode, str) => {
-                TreeLoc::InodeAndName(*inode, Cow::Borrowed(str.borrow()))
+            TreeLoc::PathIdAndName(pathid, str) => {
+                TreeLoc::PathIdAndName(*pathid, Cow::Borrowed(str.borrow()))
             }
         }
     }
 
     pub(crate) fn into_owned(self) -> TreeLoc<'static> {
         match self {
-            TreeLoc::Inode(inode) => TreeLoc::Inode(inode),
+            TreeLoc::PathId(pathid) => TreeLoc::PathId(pathid),
             TreeLoc::PathRef(path) => TreeLoc::Path(path.clone()),
             TreeLoc::Path(path) => TreeLoc::Path(path),
-            TreeLoc::InodeAndName(inode, str) => {
-                TreeLoc::InodeAndName(inode, Cow::Owned(str.into_owned()))
+            TreeLoc::PathIdAndName(pathid, str) => {
+                TreeLoc::PathIdAndName(pathid, Cow::Owned(str.into_owned()))
             }
         }
     }
 }
 
-impl From<Inode> for TreeLoc<'static> {
-    fn from(value: Inode) -> Self {
-        TreeLoc::Inode(value)
+impl From<PathId> for TreeLoc<'static> {
+    fn from(value: PathId) -> Self {
+        TreeLoc::PathId(value)
     }
 }
 
@@ -222,42 +222,42 @@ impl<'a> From<&'a Path> for TreeLoc<'a> {
     }
 }
 
-impl<'a> From<(Inode, &'a str)> for TreeLoc<'a> {
-    fn from(value: (Inode, &'a str)) -> Self {
-        TreeLoc::InodeAndName(value.0, Cow::from(value.1))
+impl<'a> From<(PathId, &'a str)> for TreeLoc<'a> {
+    fn from(value: (PathId, &'a str)) -> Self {
+        TreeLoc::PathIdAndName(value.0, Cow::from(value.1))
     }
 }
 
-impl<'a> From<(Inode, &'a String)> for TreeLoc<'a> {
-    fn from(value: (Inode, &'a String)) -> Self {
-        TreeLoc::InodeAndName(value.0, Cow::from(value.1))
+impl<'a> From<(PathId, &'a String)> for TreeLoc<'a> {
+    fn from(value: (PathId, &'a String)) -> Self {
+        TreeLoc::PathIdAndName(value.0, Cow::from(value.1))
     }
 }
-impl From<(Inode, String)> for TreeLoc<'static> {
-    fn from(value: (Inode, String)) -> Self {
-        TreeLoc::InodeAndName(value.0, Cow::from(value.1))
+impl From<(PathId, String)> for TreeLoc<'static> {
+    fn from(value: (PathId, String)) -> Self {
+        TreeLoc::PathIdAndName(value.0, Cow::from(value.1))
     }
 }
 
 /// Extend [TreeReadOperations] with convenience functions for working
 /// with [Path].
 pub(crate) trait TreeExt {
-    /// Resolve the given tree location to an inode.
-    fn resolve<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<Option<Inode>, StorageError>;
+    /// Resolve the given tree location to an pathid.
+    fn resolve<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<Option<PathId>, StorageError>;
 
-    /// Resolve the given tree location to an inode or return [Storage::NotFound].
-    fn expect<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<Inode, StorageError>;
+    /// Resolve the given tree location to an pathid or return [Storage::NotFound].
+    fn expect<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<PathId, StorageError>;
 
-    /// Lookup the given path and return the most specific inode matching the
+    /// Lookup the given path and return the most specific pathid matching the
     /// path - which might just be the root if nothing matches.
-    fn resolve_partial<'a, L: Into<TreeLoc<'a>>>(&self, path: L) -> Result<Inode, StorageError>;
+    fn resolve_partial<'a, L: Into<TreeLoc<'a>>>(&self, path: L) -> Result<PathId, StorageError>;
 
     /// Lookup a specific entry in the given directory.
     fn lookup<'a, L: Into<TreeLoc<'a>>>(
         &self,
         loc: L,
         name: &str,
-    ) -> Result<Option<Inode>, StorageError>;
+    ) -> Result<Option<PathId>, StorageError>;
 
     /// Read the content of the given directory.
     fn readdir<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> ReadDirIterator<'_>;
@@ -265,7 +265,7 @@ pub(crate) trait TreeExt {
     /// Checks whether a given location exists in the tree.
     fn exists<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<bool, StorageError>;
 
-    /// Goes through whole tree, starting at inode and return it as an
+    /// Goes through whole tree, starting at pathid and return it as an
     /// iterator (depth-first).
     ///
     /// Only enters the node for which `enter` returns true.
@@ -273,45 +273,45 @@ pub(crate) trait TreeExt {
         &self,
         loc: L,
         enter: F,
-    ) -> impl Iterator<Item = Result<Inode, StorageError>>
+    ) -> impl Iterator<Item = Result<PathId, StorageError>>
     where
         L: Into<TreeLoc<'a>>,
-        F: FnMut(Inode) -> bool;
+        F: FnMut(PathId) -> bool;
 
-    /// Follow the inodes back up to the root and build a path.
+    /// Follow the pathids back up to the root and build a path.
     ///
-    /// Not all inodes can be turned into a path, even valid ones.
+    /// Not all pathids can be turned into a path, even valid ones.
     fn backtrack<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> Result<Option<Path>, StorageError>;
 
-    /// Return an iterator that returns the parent of inode and it
+    /// Return an iterator that returns the parent of pathid and it
     /// parent until the root.
-    fn ancestors(&self, inode: Inode) -> impl Iterator<Item = Result<Inode, StorageError>>;
+    fn ancestors(&self, pathid: PathId) -> impl Iterator<Item = Result<PathId, StorageError>>;
 }
 
 impl<T: TreeReadOperations> TreeExt for T {
-    fn expect<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<Inode, StorageError> {
+    fn expect<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<PathId, StorageError> {
         self.resolve(loc)?.ok_or(StorageError::NotFound)
     }
 
-    fn resolve<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<Option<Inode>, StorageError> {
+    fn resolve<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<Option<PathId>, StorageError> {
         let loc = loc.into();
         match loc {
-            TreeLoc::Inode(inode) => Ok(Some(inode)),
+            TreeLoc::PathId(pathid) => Ok(Some(pathid)),
             TreeLoc::PathRef(path) => resolve_path(self, path),
             TreeLoc::Path(path) => resolve_path(self, &path),
-            TreeLoc::InodeAndName(inode, name) => self.lookup_inode(inode, name.as_ref()),
+            TreeLoc::PathIdAndName(pathid, name) => self.lookup_pathid(pathid, name.as_ref()),
         }
     }
 
-    fn resolve_partial<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<Inode, StorageError> {
+    fn resolve_partial<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<PathId, StorageError> {
         let loc = loc.into();
         match loc {
-            TreeLoc::Inode(inode) => Ok(inode),
+            TreeLoc::PathId(pathid) => Ok(pathid),
             TreeLoc::PathRef(path) => resolve_path_partial(self, path),
             TreeLoc::Path(path) => resolve_path_partial(self, &path),
-            TreeLoc::InodeAndName(inode, name) => match self.lookup_inode(inode, name.as_ref())? {
-                None => Ok(inode),
-                Some(inode) => Ok(inode),
+            TreeLoc::PathIdAndName(pathid, name) => match self.lookup_pathid(pathid, name.as_ref())? {
+                None => Ok(pathid),
+                Some(pathid) => Ok(pathid),
             },
         }
     }
@@ -320,23 +320,23 @@ impl<T: TreeReadOperations> TreeExt for T {
         &self,
         loc: L,
         name: &str,
-    ) -> Result<Option<Inode>, StorageError> {
-        self.lookup_inode(self.expect(loc)?, name)
+    ) -> Result<Option<PathId>, StorageError> {
+        self.lookup_pathid(self.expect(loc)?, name)
     }
 
     fn readdir<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> ReadDirIterator<'_> {
         match self.expect(loc) {
             Err(err) => ReadDirIterator::failed(err),
-            Ok(inode) => self.readdir_inode(inode),
+            Ok(pathid) => self.readdir_pathid(pathid),
         }
     }
 
     fn exists<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<bool, StorageError> {
         Ok(match loc.into() {
-            TreeLoc::Inode(inode) => self.inode_exists(inode)?,
+            TreeLoc::PathId(pathid) => self.pathid_exists(pathid)?,
             TreeLoc::Path(path) => resolve_path(self, &path)?.is_some(),
             TreeLoc::PathRef(path) => resolve_path(self, path)?.is_some(),
-            TreeLoc::InodeAndName(inode, cow) => self.lookup(inode, cow.as_ref())?.is_some(),
+            TreeLoc::PathIdAndName(pathid, cow) => self.lookup(pathid, cow.as_ref())?.is_some(),
         })
     }
 
@@ -344,10 +344,10 @@ impl<T: TreeReadOperations> TreeExt for T {
         &self,
         loc: L,
         enter: F,
-    ) -> impl Iterator<Item = Result<Inode, StorageError>>
+    ) -> impl Iterator<Item = Result<PathId, StorageError>>
     where
         L: Into<TreeLoc<'a>>,
-        F: FnMut(Inode) -> bool,
+        F: FnMut(PathId) -> bool,
     {
         RecurseIterator {
             tree: self,
@@ -360,13 +360,13 @@ impl<T: TreeReadOperations> TreeExt for T {
         match loc.into() {
             TreeLoc::PathRef(path) => Ok(Some(path.clone())),
             TreeLoc::Path(path) => Ok(Some(path)),
-            TreeLoc::InodeAndName(inode, name) => match self.backtrack(inode)? {
+            TreeLoc::PathIdAndName(pathid, name) => match self.backtrack(pathid)? {
                 None => Ok(Some(Path::parse(name)?)),
                 Some(path) => Ok(Some(Path::parse(&format!("{}/{}", path, name))?)),
             },
-            TreeLoc::Inode(inode) => {
+            TreeLoc::PathId(pathid) => {
                 let mut components = VecDeque::new();
-                let mut current = inode;
+                let mut current = pathid;
                 while let Some(parent) = self.parent(current)? {
                     if let Some(name) = self.name_in(parent, current)? {
                         components.push_front(name);
@@ -386,10 +386,10 @@ impl<T: TreeReadOperations> TreeExt for T {
         }
     }
 
-    fn ancestors(&self, inode: Inode) -> impl Iterator<Item = Result<Inode, StorageError>> {
+    fn ancestors(&self, pathid: PathId) -> impl Iterator<Item = Result<PathId, StorageError>> {
         Ancestors {
             tree: self,
-            current: Some(inode),
+            current: Some(pathid),
         }
     }
 }
@@ -399,24 +399,24 @@ where
     T: TreeReadOperations,
 {
     tree: &'a T,
-    current: Option<Inode>,
+    current: Option<PathId>,
 }
 
 impl<'a, T> Iterator for Ancestors<'a, T>
 where
     T: TreeReadOperations,
 {
-    type Item = Result<Inode, StorageError>;
+    type Item = Result<PathId, StorageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.current.take() {
             None => None,
-            Some(inode) => match self.tree.parent(inode) {
+            Some(pathid) => match self.tree.parent(pathid) {
                 Err(err) => Some(Err(err)),
-                Ok(Some(inode)) => {
-                    self.current = Some(inode);
+                Ok(Some(pathid)) => {
+                    self.current = Some(pathid);
 
-                    Some(Ok(inode))
+                    Some(Ok(pathid))
                 }
                 Ok(None) => None,
             },
@@ -428,7 +428,7 @@ where
 struct RecurseIterator<'a, T, F>
 where
     T: TreeReadOperations,
-    F: FnMut(Inode) -> bool,
+    F: FnMut(PathId) -> bool,
 {
     tree: &'a T,
     enter: F,
@@ -438,9 +438,9 @@ where
 impl<'a, T, F> Iterator for RecurseIterator<'a, T, F>
 where
     T: TreeReadOperations,
-    F: FnMut(Inode) -> bool,
+    F: FnMut(PathId) -> bool,
 {
-    type Item = Result<Inode, StorageError>;
+    type Item = Result<PathId, StorageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(iter) = self.stack.back_mut() {
@@ -449,11 +449,11 @@ where
                     Err(err) => {
                         return Some(Err(err));
                     }
-                    Ok((_, inode)) => {
-                        if (self.enter)(inode) {
-                            self.stack.push_back(self.tree.readdir_inode(inode));
+                    Ok((_, pathid)) => {
+                        if (self.enter)(pathid) {
+                            self.stack.push_back(self.tree.readdir_pathid(pathid));
                         }
-                        return Some(Ok(inode));
+                        return Some(Ok(pathid));
                     }
                 }
             }
@@ -467,31 +467,31 @@ where
 /// A tree open for write with [OpenTree::write_tree].
 pub(crate) struct WritableOpenTree<'a> {
     before_commit: &'a BeforeCommit,
-    table: Table<'a, (Inode, &'static str), Inode>,
-    refcount_table: Table<'a, Inode, u32>,
-    current_inode_range_table: redb::Table<'a, (), (Inode, Inode)>,
+    table: Table<'a, (PathId, &'static str), PathId>,
+    refcount_table: Table<'a, PathId, u32>,
+    current_pathid_range_table: redb::Table<'a, (), (PathId, PathId)>,
     tree: &'a Tree,
 }
 
 impl<'a> WritableOpenTree<'a> {
     pub(crate) fn new(
         before_commit: &'a BeforeCommit,
-        tree_table: Table<'a, (Inode, &'static str), Inode>,
-        refcount_table: Table<'a, Inode, u32>,
-        current_inode_range_table: redb::Table<'a, (), (Inode, Inode)>,
+        tree_table: Table<'a, (PathId, &'static str), PathId>,
+        refcount_table: Table<'a, PathId, u32>,
+        current_pathid_range_table: redb::Table<'a, (), (PathId, PathId)>,
         tree: &'a Tree,
     ) -> Self {
         Self {
             before_commit,
             table: tree_table,
             refcount_table,
-            current_inode_range_table,
+            current_pathid_range_table,
             tree,
         }
     }
 
     /// Insert the given entry into the table and increment the
-    /// reference count of the inode at `loc` if an entry was inserted
+    /// reference count of the pathid at `loc` if an entry was inserted
     /// (as opposed to an old entry being replaced).
     ///
     /// This function, together with the `remove` functions below are
@@ -513,14 +513,14 @@ impl<'a> WritableOpenTree<'a> {
         K: redb::Key + 'static,
         V: redb::Value + 'static,
     {
-        let inode = match loc.into() {
-            TreeLoc::Inode(inode) => inode,
+        let pathid = match loc.into() {
+            TreeLoc::PathId(pathid) => pathid,
             TreeLoc::PathRef(path) => self.setup(path)?,
             TreeLoc::Path(path) => self.setup(path)?,
-            TreeLoc::InodeAndName(inode, name) => self.setup_name(inode, name.as_ref())?,
+            TreeLoc::PathIdAndName(pathid, name) => self.setup_name(pathid, name.as_ref())?,
         };
         if table.insert(key, value)?.is_none() {
-            self.incref(inode)?;
+            self.incref(pathid)?;
             return Ok(true);
         }
 
@@ -528,12 +528,12 @@ impl<'a> WritableOpenTree<'a> {
     }
 
     /// Remove the entry `key` in `table`, releasing any reference
-    /// held for `inode`.
+    /// held for `pathid`.
     ///
     /// The entry must have been created by an `insert` method in
     /// [WritableOpenTree]. Using this method to remove guarantees
     /// reference counting is correct in that a strong reference is
-    /// held to the name/inode pair in the tree as long as the entry
+    /// held to the name/pathid pair in the tree as long as the entry
     /// `key` in `table` exists.
     ///
     /// Return true if an entry existed before this call and was
@@ -549,9 +549,9 @@ impl<'a> WritableOpenTree<'a> {
         K: redb::Key + 'static,
         V: redb::Value + 'static,
     {
-        if let Some(inode) = self.resolve(loc)? {
+        if let Some(pathid) = self.resolve(loc)? {
             if table.remove(key)?.is_some() {
-                self.decref(inode)?;
+                self.decref(pathid)?;
                 return Ok(true);
             }
         }
@@ -559,12 +559,12 @@ impl<'a> WritableOpenTree<'a> {
         Ok(false)
     }
 
-    /// Remove the given inode and all of its children from the given table.
+    /// Remove the given pathid and all of its children from the given table.
     ///
     /// The entries are removed from `table` if `pred` returns true
     /// and their reference count is decreased in the tree.
     ///
-    /// `keygen` generates keys for `table` from an inode.
+    /// `keygen` generates keys for `table` from an pathid.
     pub fn remove_recursive_and_decref_checked<'b, 'k, K, V, FK, KB, F, L>(
         &mut self,
         start: L,
@@ -576,42 +576,42 @@ impl<'a> WritableOpenTree<'a> {
         L: Into<TreeLoc<'b>>,
         K: redb::Key + 'static,
         V: redb::Value + 'static,
-        FK: Fn(Inode) -> KB,
+        FK: Fn(PathId) -> KB,
         KB: std::borrow::Borrow<K::SelfType<'k>>,
-        F: for<'f> FnMut(Inode, V::SelfType<'f>) -> Result<bool, StorageError>,
+        F: for<'f> FnMut(PathId, V::SelfType<'f>) -> Result<bool, StorageError>,
     {
         let mut decrement = vec![];
         let start = match self.resolve(start)? {
-            Some(inode) => inode,
+            Some(pathid) => pathid,
             None => {
                 return Ok(());
             }
         };
-        for inode in std::iter::once(Ok(start)).chain(self.recurse(start, |_| true)) {
-            let inode = inode?;
-            let remove = match table.get((keygen)(inode))? {
+        for pathid in std::iter::once(Ok(start)).chain(self.recurse(start, |_| true)) {
+            let pathid = pathid?;
+            let remove = match table.get((keygen)(pathid))? {
                 None => false,
-                Some(v) => (pred)(inode, v.value())?,
+                Some(v) => (pred)(pathid, v.value())?,
             };
             if remove {
-                if table.remove((keygen)(inode))?.is_some() {
-                    decrement.push(inode);
+                if table.remove((keygen)(pathid))?.is_some() {
+                    decrement.push(pathid);
                 }
             }
         }
-        for inode in decrement {
-            self.decref(inode)?;
+        for pathid in decrement {
+            self.decref(pathid)?;
         }
 
         Ok(())
     }
 
-    /// Remove the given inode and all of its children from the given table.
+    /// Remove the given pathid and all of its children from the given table.
     ///
     /// The entries are removed from `table` if `pred` returns true
     /// and their reference count is decreased in the tree.
     ///
-    /// `keygen` generates keys for `table` from an inode.
+    /// `keygen` generates keys for `table` from an pathid.
     pub fn remove_recursive_and_decref<'b, 'k, K, V, FK, KB, L>(
         &mut self,
         start: L,
@@ -622,24 +622,24 @@ impl<'a> WritableOpenTree<'a> {
         L: Into<TreeLoc<'b>>,
         K: redb::Key + 'static,
         V: redb::Value + 'static,
-        FK: Fn(Inode) -> KB,
+        FK: Fn(PathId) -> KB,
         KB: std::borrow::Borrow<K::SelfType<'k>>,
     {
         let mut decrement = vec![];
         let start = match self.resolve(start)? {
-            Some(inode) => inode,
+            Some(pathid) => pathid,
             None => {
                 return Ok(());
             }
         };
-        for inode in std::iter::once(Ok(start)).chain(self.recurse(start, |_| true)) {
-            let inode = inode?;
-            if table.remove((keygen)(inode))?.is_some() {
-                decrement.push(inode);
+        for pathid in std::iter::once(Ok(start)).chain(self.recurse(start, |_| true)) {
+            let pathid = pathid?;
+            if table.remove((keygen)(pathid))?.is_some() {
+                decrement.push(pathid);
             }
         }
-        for inode in decrement {
-            self.decref(inode)?;
+        for pathid in decrement {
+            self.decref(pathid)?;
         }
 
         Ok(())
@@ -647,63 +647,63 @@ impl<'a> WritableOpenTree<'a> {
 
     /// Get or create a mapping for all parts of the given path.
     ///
-    /// A new inode allocated by this function has a reference count
+    /// A new pathid allocated by this function has a reference count
     /// of 0 and is only valid until the end of the transaction until
     /// its reference count is incremented by one of the insert
     /// methods on [WritableOpenTree].
     pub(crate) fn setup<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         loc: L,
-    ) -> Result<Inode, StorageError> {
+    ) -> Result<PathId, StorageError> {
         match loc.into() {
-            TreeLoc::Inode(inode) => Ok(inode),
+            TreeLoc::PathId(pathid) => Ok(pathid),
             TreeLoc::Path(path) => self.setup_path(&path),
             TreeLoc::PathRef(path) => self.setup_path(path),
-            TreeLoc::InodeAndName(inode, name) => self.setup_name(inode, name.as_ref()),
+            TreeLoc::PathIdAndName(pathid, name) => self.setup_name(pathid, name.as_ref()),
         }
     }
 
-    fn setup_path(&mut self, path: &Path) -> Result<Inode, StorageError> {
-        let (inode, added) = self.add_path(path.as_ref())?;
+    fn setup_path(&mut self, path: &Path) -> Result<PathId, StorageError> {
+        let (pathid, added) = self.add_path(path.as_ref())?;
         if added {
-            log::debug!("[{}] \"{path}\" = inode {inode}", self.tree.arena);
+            log::debug!("[{}] \"{path}\" = pathid {pathid}", self.tree.arena);
             self.before_commit.add(move |txn| {
                 // Check refcount and delete the entry if it reaches
-                // 0. Note that the allocated inode is lost, so it's
+                // 0. Note that the allocated pathid is lost, so it's
                 // not a no-op.
-                txn.write_tree()?.check_refcount(inode)
+                txn.write_tree()?.check_refcount(pathid)
             });
         }
 
-        Ok(inode)
+        Ok(pathid)
     }
 
-    /// Get or create a mapping for `name` in `parent_inode`
+    /// Get or create a mapping for `name` in `parent_pathid`
     ///
-    /// A new inode allocated by this function has a reference count
+    /// A new pathid allocated by this function has a reference count
     /// of 0 and is only valid until the end of the transaction until
     /// its reference count is incremented by one of the insert
     /// methods on [WritableOpenTree].
     pub(crate) fn setup_name(
         &mut self,
-        parent_inode: Inode,
+        parent_pathid: PathId,
         name: &str,
-    ) -> Result<Inode, StorageError> {
-        let (inode, added) = self.add_name(parent_inode, name)?;
+    ) -> Result<PathId, StorageError> {
+        let (pathid, added) = self.add_name(parent_pathid, name)?;
 
         if added {
             log::debug!(
-                "[{}] \"{name}\" = inode {inode}, in parent inode {parent_inode} ",
+                "[{}] \"{name}\" = pathid {pathid}, in parent pathid {parent_pathid} ",
                 self.tree.arena
             );
             self.before_commit.add(move |txn| {
                 // Check refcount and delete the entry if it reaches
-                // 0. Note that the allocated inode is lost, so it's
+                // 0. Note that the allocated pathid is lost, so it's
                 // not a no-op.
-                txn.write_tree()?.check_refcount(inode)
+                txn.write_tree()?.check_refcount(pathid)
             });
         }
-        Ok(inode)
+        Ok(pathid)
     }
 
     /// Create a mapping for `path` but don't increment reference
@@ -712,8 +712,8 @@ impl<'a> WritableOpenTree<'a> {
     /// Caller must make sure of incrementing reference count or call
     /// setup instead.
     ///
-    /// Return (inode, added), with added true if the leaf inode is new.
-    fn add_path(&mut self, path: &Path) -> Result<(Inode, bool), StorageError> {
+    /// Return (pathid, added), with added true if the leaf pathid is new.
+    fn add_path(&mut self, path: &Path) -> Result<(PathId, bool), StorageError> {
         let path = path.as_ref();
         let mut current = (self.tree.root, false);
         for component in Path::components(Some(path)) {
@@ -723,154 +723,154 @@ impl<'a> WritableOpenTree<'a> {
         Ok(current)
     }
 
-    /// Create a mapping for `name` in `parent_inode` but don't increment reference count.
+    /// Create a mapping for `name` in `parent_pathid` but don't increment reference count.
     ///
     /// Caller must make sure of incrementing reference count.
     ///
-    /// Return (inode, added), with added true if the inode is new.
-    fn add_name(&mut self, parent_inode: Inode, name: &str) -> Result<(Inode, bool), StorageError> {
-        match get_inode(&self.table, parent_inode, name)? {
-            Some(inode) => Ok((inode, false)),
+    /// Return (pathid, added), with added true if the pathid is new.
+    fn add_name(&mut self, parent_pathid: PathId, name: &str) -> Result<(PathId, bool), StorageError> {
+        match get_pathid(&self.table, parent_pathid, name)? {
+            Some(pathid) => Ok((pathid, false)),
             None => {
-                let new_inode = self.allocate_inode()?;
-                self.add_inode(parent_inode, new_inode, name)?;
+                let new_pathid = self.allocate_pathid()?;
+                self.add_pathid(parent_pathid, new_pathid, name)?;
 
-                Ok((new_inode, true))
+                Ok((new_pathid, true))
             }
         }
     }
 
-    /// Increment reference count on the given inode.
+    /// Increment reference count on the given pathid.
     ///
     /// This is called automatically by the insert methods in this
     /// class. Incrementing a reference should be tied to insertion in
     /// another table and removing to removal from another table.
-    fn incref(&mut self, inode: Inode) -> Result<(), StorageError> {
+    fn incref(&mut self, pathid: PathId) -> Result<(), StorageError> {
         let mut refcount = self
             .refcount_table
-            .get(inode)?
+            .get(pathid)?
             .map(|v| v.value())
             .unwrap_or(0);
         if refcount == 0 {
             log::trace!(
-                "[{}] Inode {inode} got its first reference",
+                "[{}] PathId {pathid} got its first reference",
                 self.tree.arena
             );
         }
 
         refcount += 1;
-        self.refcount_table.insert(inode, refcount)?;
+        self.refcount_table.insert(pathid, refcount)?;
 
         Ok(())
     }
 
-    /// Decrement reference count on the given inode.
+    /// Decrement reference count on the given pathid.
     ///
     /// This is called automatically by the remove methods in this
     /// class. Incrementing a reference should be tied to insertion in
     /// another table and removing to removal from another table.
-    fn decref(&mut self, inode: Inode) -> Result<(), StorageError> {
+    fn decref(&mut self, pathid: PathId) -> Result<(), StorageError> {
         let mut refcount = self
             .refcount_table
-            .get(inode)?
+            .get(pathid)?
             .map(|v| v.value())
             .unwrap_or(0);
         refcount = refcount.saturating_sub(1);
 
         if refcount > 0 {
-            self.refcount_table.insert(inode, refcount)?;
+            self.refcount_table.insert(pathid, refcount)?;
         } else {
-            self.remove_mapping(inode)?;
+            self.remove_mapping(pathid)?;
         }
 
         Ok(())
     }
 
-    fn check_refcount(&mut self, inode: Inode) -> Result<(), StorageError> {
+    fn check_refcount(&mut self, pathid: PathId) -> Result<(), StorageError> {
         let refcount = self
             .refcount_table
-            .get(inode)?
+            .get(pathid)?
             .map(|v| v.value())
             .unwrap_or(0);
         if refcount == 0 {
             log::warn!(
-                "[{}] Refcount of {inode} was never increased; Cleaning up.",
+                "[{}] Refcount of {pathid} was never increased; Cleaning up.",
                 self.tree.arena
             );
-            self.remove_mapping(inode)?;
+            self.remove_mapping(pathid)?;
         }
 
         Ok(())
     }
 
-    /// Remove mapping of `inode` from its parent.
+    /// Remove mapping of `pathid` from its parent.
     ///
-    /// This must only be called after checking the inode refcount.
-    fn remove_mapping(&mut self, inode: Inode) -> Result<(), StorageError> {
+    /// This must only be called after checking the pathid refcount.
+    fn remove_mapping(&mut self, pathid: PathId) -> Result<(), StorageError> {
         log::trace!(
-            "[{}] Inode {inode} lost its last reference; Cleaning up.",
+            "[{}] PathId {pathid} lost its last reference; Cleaning up.",
             self.tree.arena
         );
-        self.refcount_table.remove(inode)?;
-        let parent = self.table.remove((inode, ".."))?.map(|v| v.value());
+        self.refcount_table.remove(pathid)?;
+        let parent = self.table.remove((pathid, ".."))?.map(|v| v.value());
         if let Some(parent) = parent {
             self.table
-                .retain_in(inode_range(parent), |_, v| v != inode)?;
+                .retain_in(pathid_range(parent), |_, v| v != pathid)?;
             self.decref(parent)?;
         }
 
         Ok(())
     }
 
-    fn allocate_inode(&mut self) -> Result<Inode, StorageError> {
+    fn allocate_pathid(&mut self) -> Result<PathId, StorageError> {
         self.tree
             .allocator
-            .allocate_arena_inode(&mut self.current_inode_range_table, self.tree.arena)
+            .allocate_arena_pathid(&mut self.current_pathid_range_table, self.tree.arena)
     }
 
-    fn add_inode(
+    fn add_pathid(
         &mut self,
-        parent_inode: Inode,
-        new_inode: Inode,
+        parent_pathid: PathId,
+        new_pathid: PathId,
         name: &str,
     ) -> Result<(), StorageError> {
-        self.table.insert((parent_inode, name), new_inode)?;
-        self.table.insert((new_inode, ".."), parent_inode)?;
-        self.incref(parent_inode)?;
+        self.table.insert((parent_pathid, name), new_pathid)?;
+        self.table.insert((new_pathid, ".."), parent_pathid)?;
+        self.incref(parent_pathid)?;
 
         Ok(())
     }
 }
 
 fn lookup(
-    tree_table: &impl ReadableTable<(Inode, &'static str), Inode>,
-    inode: Inode,
+    tree_table: &impl ReadableTable<(PathId, &'static str), PathId>,
+    pathid: PathId,
     name: &str,
-) -> Result<Option<Inode>, StorageError> {
-    Ok(tree_table.get((inode, name))?.map(|v| v.value()))
+) -> Result<Option<PathId>, StorageError> {
+    Ok(tree_table.get((pathid, name))?.map(|v| v.value()))
 }
 
 fn exists(
-    tree_table: &impl ReadableTable<(Inode, &'static str), Inode>,
-    root_inode: Inode,
-    inode: Inode,
+    tree_table: &impl ReadableTable<(PathId, &'static str), PathId>,
+    root_pathid: PathId,
+    pathid: PathId,
 ) -> Result<bool, StorageError> {
-    if root_inode == inode {
+    if root_pathid == pathid {
         return Ok(true);
     }
 
-    Ok(tree_table.get((inode, ".."))?.is_some())
+    Ok(tree_table.get((pathid, ".."))?.is_some())
 }
 
 fn name_in(
-    tree_table: &impl ReadableTable<(Inode, &'static str), Inode>,
-    parent_inode: Inode,
-    inode: Inode,
+    tree_table: &impl ReadableTable<(PathId, &'static str), PathId>,
+    parent_pathid: PathId,
+    pathid: PathId,
 ) -> Result<Option<String>, StorageError> {
-    for v in tree_table.range(inode_range(parent_inode))? {
+    for v in tree_table.range(pathid_range(parent_pathid))? {
         let v = v?;
         let (key, value) = v;
-        if value.value() == inode {
+        if value.value() == pathid {
             let (_, name) = key.value();
             if name == ".." || name == "." {
                 return Ok(None);
@@ -883,18 +883,18 @@ fn name_in(
 }
 
 fn parent(
-    tree_table: &impl ReadableTable<(Inode, &'static str), Inode>,
-    inode: Inode,
-) -> Result<Option<Inode>, StorageError> {
-    Ok(tree_table.get((inode, ".."))?.map(|v| v.value()))
+    tree_table: &impl ReadableTable<(PathId, &'static str), PathId>,
+    pathid: PathId,
+) -> Result<Option<PathId>, StorageError> {
+    Ok(tree_table.get((pathid, ".."))?.map(|v| v.value()))
 }
 
 fn readdir(
-    tree_table: &impl ReadableTable<(Inode, &'static str), Inode>,
-    inode: Inode,
+    tree_table: &impl ReadableTable<(PathId, &'static str), PathId>,
+    pathid: PathId,
 ) -> ReadDirIterator<'_> {
     let range = tree_table
-        .range(inode_range(inode))
+        .range(pathid_range(pathid))
         .map_err(|e| StorageError::from(e));
 
     ReadDirIterator { iter: Some(range) }
@@ -902,7 +902,7 @@ fn readdir(
 
 /// Iterator returned by [TreeReadOperations::readdir]
 pub(crate) struct ReadDirIterator<'a> {
-    iter: Option<Result<redb::Range<'a, (Inode, &'static str), Inode>, StorageError>>,
+    iter: Option<Result<redb::Range<'a, (PathId, &'static str), PathId>, StorageError>>,
 }
 
 impl<'a> ReadDirIterator<'a> {
@@ -915,7 +915,7 @@ impl<'a> ReadDirIterator<'a> {
 }
 
 impl<'a> Iterator for ReadDirIterator<'a> {
-    type Item = Result<(String, Inode), StorageError>;
+    type Item = Result<(String, PathId), StorageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match &mut self.iter {
@@ -930,8 +930,8 @@ impl<'a> Iterator for ReadDirIterator<'a> {
                         Ok(v) => {
                             let name = v.0.value().1;
                             if name != "." && name != ".." {
-                                let inode = v.1.value();
-                                return Some(Ok((name.to_string(), inode)));
+                                let pathid = v.1.value();
+                                return Some(Ok((name.to_string(), pathid)));
                             }
                         }
                     }
@@ -943,29 +943,29 @@ impl<'a> Iterator for ReadDirIterator<'a> {
     }
 }
 
-fn get_inode(
-    table: &impl redb::ReadableTable<(Inode, &'static str), Inode>,
-    parent_inode: Inode,
+fn get_pathid(
+    table: &impl redb::ReadableTable<(PathId, &'static str), PathId>,
+    parent_pathid: PathId,
     name: &str,
-) -> Result<Option<Inode>, StorageError> {
-    match table.get((parent_inode, name))? {
+) -> Result<Option<PathId>, StorageError> {
+    match table.get((parent_pathid, name))? {
         None => Ok(None),
         Some(e) => Ok(Some(e.value())),
     }
 }
 
-/// Builds a range that covers all entries for the given inode.
-fn inode_range(inode: Inode) -> std::ops::Range<(Inode, &'static str)> {
-    (inode, "")..(inode.plus(1), "")
+/// Builds a range that covers all entries for the given pathid.
+fn pathid_range(pathid: PathId) -> std::ops::Range<(PathId, &'static str)> {
+    (pathid, "")..(pathid.plus(1), "")
 }
 
 fn resolve_path(
     tree: &impl TreeReadOperations,
     path: &Path,
-) -> Result<Option<Inode>, StorageError> {
+) -> Result<Option<PathId>, StorageError> {
     let mut current = tree.root();
     for component in Path::components(Some(path)) {
-        if let Some(e) = tree.lookup_inode(current, component)? {
+        if let Some(e) = tree.lookup_pathid(current, component)? {
             current = e
         } else {
             return Ok(None);
@@ -978,11 +978,11 @@ fn resolve_path(
 fn resolve_path_partial(
     tree: &impl TreeReadOperations,
     path: &Path,
-) -> Result<Inode, StorageError> {
+) -> Result<PathId, StorageError> {
     let path = path.as_ref();
     let mut current = tree.root();
     for component in Path::components(Some(path)) {
-        if let Some(e) = tree.lookup_inode(current, component)? {
+        if let Some(e) = tree.lookup_pathid(current, component)? {
             current = e
         } else {
             break;
@@ -1018,7 +1018,7 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_read()?;
         let tree = txn.read_tree()?;
-        assert_eq!(None, tree.lookup_inode(tree.root(), "test")?,);
+        assert_eq!(None, tree.lookup_pathid(tree.root(), "test")?,);
 
         Ok(())
     }
@@ -1028,7 +1028,7 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let tree = txn.read_tree()?;
-        assert_eq!(None, tree.lookup_inode(tree.root(), "test")?);
+        assert_eq!(None, tree.lookup_pathid(tree.root(), "test")?);
 
         Ok(())
     }
@@ -1050,7 +1050,7 @@ mod tests {
         let mut tree = txn.write_tree()?;
         let node = tree.setup(&Path::parse("test")?)?;
 
-        assert_eq!(Some(node), tree.lookup_inode(tree.root(), "test")?);
+        assert_eq!(Some(node), tree.lookup_pathid(tree.root(), "test")?);
 
         Ok(())
     }
@@ -1062,8 +1062,8 @@ mod tests {
         let mut tree = txn.write_tree()?;
         let bar = tree.setup(&Path::parse("foo/bar")?)?;
 
-        let foo = tree.lookup_inode(tree.root(), "foo")?.unwrap();
-        assert_eq!(bar, tree.lookup_inode(foo, "bar")?.unwrap());
+        let foo = tree.lookup_pathid(tree.root(), "foo")?.unwrap();
+        assert_eq!(bar, tree.lookup_pathid(foo, "bar")?.unwrap());
 
         Ok(())
     }
@@ -1088,9 +1088,9 @@ mod tests {
         let bar = tree.setup(&Path::parse("foo/bar")?)?;
         let baz = tree.setup(&Path::parse("foo/bar/baz")?)?;
 
-        let foo = tree.lookup_inode(tree.root(), "foo")?.unwrap();
-        assert_eq!(bar, tree.lookup_inode(foo, "bar")?.unwrap());
-        assert_eq!(baz, tree.lookup_inode(bar, "baz")?.unwrap());
+        let foo = tree.lookup_pathid(tree.root(), "foo")?.unwrap();
+        assert_eq!(bar, tree.lookup_pathid(foo, "bar")?.unwrap());
+        assert_eq!(baz, tree.lookup_pathid(bar, "baz")?.unwrap());
 
         Ok(())
     }
@@ -1103,10 +1103,10 @@ mod tests {
         let baz = tree.setup(&Path::parse("foo/bar/baz")?)?;
         let qux = tree.setup(&Path::parse("foo/bar/baz/qux")?)?;
 
-        let foo = tree.lookup_inode(tree.root(), "foo")?.unwrap();
-        let bar = tree.lookup_inode(foo, "bar")?.unwrap();
-        assert_eq!(baz, tree.lookup_inode(bar, "baz")?.unwrap());
-        assert_eq!(qux, tree.lookup_inode(baz, "qux")?.unwrap());
+        let foo = tree.lookup_pathid(tree.root(), "foo")?.unwrap();
+        let bar = tree.lookup_pathid(foo, "bar")?.unwrap();
+        assert_eq!(baz, tree.lookup_pathid(bar, "baz")?.unwrap());
+        assert_eq!(qux, tree.lookup_pathid(baz, "qux")?.unwrap());
 
         Ok(())
     }
@@ -1118,8 +1118,8 @@ mod tests {
         let mut tree = txn.write_tree()?;
         let baz = tree.setup(&Path::parse("foo/bar/baz")?)?;
         let qux = tree.setup(&Path::parse("foo/bar/baz/qux")?)?;
-        let foo = tree.lookup_inode(tree.root(), "foo")?.unwrap();
-        let bar = tree.lookup_inode(foo, "bar")?.unwrap();
+        let foo = tree.lookup_pathid(tree.root(), "foo")?.unwrap();
+        let bar = tree.lookup_pathid(foo, "bar")?.unwrap();
 
         assert_eq!(foo, tree.resolve(Path::parse("foo")?)?.unwrap());
         assert_eq!(bar, tree.resolve(Path::parse("foo/bar")?)?.unwrap());
@@ -1154,8 +1154,8 @@ mod tests {
         let mut tree = txn.write_tree()?;
         let baz = tree.setup(&Path::parse("foo/bar/baz")?)?;
         tree.setup(&Path::parse("foo/bar/baz/qux")?)?;
-        let foo = tree.lookup_inode(tree.root(), "foo")?.unwrap();
-        let bar = tree.lookup_inode(foo, "bar")?.unwrap();
+        let foo = tree.lookup_pathid(tree.root(), "foo")?.unwrap();
+        let bar = tree.lookup_pathid(foo, "bar")?.unwrap();
 
         assert_eq!(baz, tree.resolve_partial(Path::parse("foo/bar/baz")?)?);
         assert_eq!(baz, tree.resolve_partial(Path::parse("foo/bar/baz/quux")?)?);
@@ -1185,13 +1185,13 @@ mod tests {
 
         assert_eq!(
             Some(vec![("foo".to_string(), foo)]),
-            tree.readdir_inode(tree.root())
+            tree.readdir_pathid(tree.root())
                 .collect::<Result<Vec<_>, _>>()
                 .ok()
         );
         assert_eq!(
             Some(vec![("bar".to_string(), bar)]),
-            tree.readdir_inode(foo).collect::<Result<Vec<_>, _>>().ok()
+            tree.readdir_pathid(foo).collect::<Result<Vec<_>, _>>().ok()
         );
 
         assert_eq!(
@@ -1200,7 +1200,7 @@ mod tests {
                 ("quux".to_string(), quux),
                 ("qux".to_string(), qux),
             ]),
-            tree.readdir_inode(bar).collect::<Result<Vec<_>, _>>().ok()
+            tree.readdir_pathid(bar).collect::<Result<Vec<_>, _>>().ok()
         );
 
         Ok(())
@@ -1221,10 +1221,10 @@ mod tests {
 
         // Roots cannot be turned into a path, as empty paths are invalid.
         assert!(tree.backtrack(tree.root())?.is_none());
-        assert!(tree.backtrack(Inode(1))?.is_none());
+        assert!(tree.backtrack(PathId(1))?.is_none());
 
-        // Invalid inodes are reported as None, not NotFound
-        assert!(tree.backtrack(Inode(999))?.is_none());
+        // Invalid pathids are reported as None, not NotFound
+        assert!(tree.backtrack(PathId(999))?.is_none());
 
         Ok(())
     }
@@ -1234,13 +1234,13 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree()?;
-        assert!(tree.inode_exists(tree.root())?);
-        assert!(!tree.inode_exists(Inode(999))?);
+        assert!(tree.pathid_exists(tree.root())?);
+        assert!(!tree.pathid_exists(PathId(999))?);
 
         let foo = tree.setup(&Path::parse("foo")?)?;
         let bar = tree.setup(&Path::parse("foo/bar")?)?;
-        assert!(tree.inode_exists(foo)?);
-        assert!(tree.inode_exists(bar)?);
+        assert!(tree.pathid_exists(foo)?);
+        assert!(tree.pathid_exists(bar)?);
 
         Ok(())
     }
@@ -1250,8 +1250,8 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree()?;
-        assert!(tree.inode_exists(tree.root())?);
-        assert!(!tree.inode_exists(Inode(999))?);
+        assert!(tree.pathid_exists(tree.root())?);
+        assert!(!tree.pathid_exists(PathId(999))?);
 
         let foo = tree.setup(&Path::parse("foo")?)?;
         let bar = tree.setup(&Path::parse("foo/bar")?)?;
@@ -1259,7 +1259,7 @@ mod tests {
         assert_eq!(Some(tree.root()), tree.parent(foo)?);
         assert_eq!(Some(foo), tree.parent(bar)?);
         assert_eq!(Some(bar), tree.parent(baz)?);
-        assert_eq!(None, tree.parent(Inode(999))?);
+        assert_eq!(None, tree.parent(PathId(999))?);
         assert_eq!(None, tree.parent(tree.root())?);
 
         Ok(())
@@ -1270,8 +1270,8 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree()?;
-        assert!(tree.inode_exists(tree.root())?);
-        assert!(!tree.inode_exists(Inode(999))?);
+        assert!(tree.pathid_exists(tree.root())?);
+        assert!(!tree.pathid_exists(PathId(999))?);
 
         let foo = tree.setup(&Path::parse("foo")?)?;
         let bar = tree.setup(&Path::parse("foo/bar")?)?;
@@ -1298,8 +1298,8 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree()?;
-        assert!(tree.inode_exists(tree.root())?);
-        assert!(!tree.inode_exists(Inode(999))?);
+        assert!(tree.pathid_exists(tree.root())?);
+        assert!(!tree.pathid_exists(PathId(999))?);
 
         let foo = tree.setup(&Path::parse("foo")?)?;
         let bar = tree.setup(&Path::parse("foo/bar")?)?;
@@ -1319,7 +1319,7 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree()?;
         let bar = tree.setup(&Path::parse("foo/bar")?)?;
-        let foo = tree.lookup_inode(tree.root(), "foo")?.unwrap();
+        let foo = tree.lookup_pathid(tree.root(), "foo")?.unwrap();
         let baz = tree.setup(&Path::parse("foo/bar/baz")?)?;
         let qux = tree.setup(&Path::parse("foo/qux")?)?;
 
@@ -1329,22 +1329,22 @@ mod tests {
 
         // decref qux deletes it, but not foo
         tree.decref(qux)?;
-        assert!(tree.inode_exists(foo)?);
-        assert!(tree.inode_exists(bar)?);
-        assert!(tree.inode_exists(baz)?);
-        assert!(!tree.inode_exists(qux)?);
+        assert!(tree.pathid_exists(foo)?);
+        assert!(tree.pathid_exists(bar)?);
+        assert!(tree.pathid_exists(baz)?);
+        assert!(!tree.pathid_exists(qux)?);
 
         // decref bar does not delete it, because it contains baz
         tree.decref(bar)?;
-        assert!(tree.inode_exists(foo)?);
-        assert!(tree.inode_exists(bar)?);
-        assert!(tree.inode_exists(baz)?);
+        assert!(tree.pathid_exists(foo)?);
+        assert!(tree.pathid_exists(bar)?);
+        assert!(tree.pathid_exists(baz)?);
 
         // decref baz deletes bar and baz, but not foo
         tree.decref(baz)?;
-        assert!(!tree.inode_exists(foo)?);
-        assert!(!tree.inode_exists(bar)?);
-        assert!(!tree.inode_exists(baz)?);
+        assert!(!tree.pathid_exists(foo)?);
+        assert!(!tree.pathid_exists(bar)?);
+        assert!(!tree.pathid_exists(baz)?);
 
         Ok(())
     }
@@ -1353,10 +1353,10 @@ mod tests {
     fn setup() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
-        let bar: Inode;
-        let foo: Inode;
-        let qux: Inode;
-        let baz: Inode;
+        let bar: PathId;
+        let foo: PathId;
+        let qux: PathId;
+        let baz: PathId;
         {
             let mut tree = txn.write_tree()?;
             bar = tree.setup(&Path::parse("foo/bar")?)?;
@@ -1386,10 +1386,10 @@ mod tests {
     fn setup_name() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
-        let bar: Inode;
-        let foo: Inode;
-        let qux: Inode;
-        let baz: Inode;
+        let bar: PathId;
+        let foo: PathId;
+        let qux: PathId;
+        let baz: PathId;
         {
             let mut tree = txn.write_tree()?;
             foo = tree.setup_name(tree.root(), "foo")?;
@@ -1430,16 +1430,16 @@ mod tests {
 
         // decref baz deletes baz, but not bar
         tree.decref(baz)?;
-        assert!(tree.inode_exists(bar)?);
-        assert!(!tree.inode_exists(baz)?);
+        assert!(tree.pathid_exists(bar)?);
+        assert!(!tree.pathid_exists(baz)?);
 
         // now that baz is gone, it still takes 3 decref to delete bar
         tree.decref(bar)?;
-        assert!(tree.inode_exists(bar)?);
+        assert!(tree.pathid_exists(bar)?);
         tree.decref(bar)?;
-        assert!(tree.inode_exists(bar)?);
+        assert!(tree.pathid_exists(bar)?);
         tree.decref(bar)?;
-        assert!(!tree.inode_exists(bar)?);
+        assert!(!tree.pathid_exists(bar)?);
 
         Ok(())
     }
@@ -1470,7 +1470,7 @@ mod tests {
         // don't enter corge or baz
         assert_eq!(
             vec![bar, baz, corge, quux, waldo, fred],
-            tree.recurse(foo, |inode| inode != baz && inode != corge)
+            tree.recurse(foo, |pathid| pathid != baz && pathid != corge)
                 .collect::<Result<Vec<_>, _>>()?
         );
 

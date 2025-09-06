@@ -5,7 +5,7 @@ $Rust.parentModule("global::types");
 
 # An entry in the path table.
 struct PathTableEntry {
-  inode @0: UInt64;
+  pathid @0: UInt64;
   mtime @1: Time;
 }
 

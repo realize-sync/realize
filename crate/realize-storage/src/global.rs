@@ -1,4 +1,4 @@
 pub mod cache;
 pub(crate) mod db;
-pub(crate) mod inode_allocator;
+pub(crate) mod pathid_allocator;
 pub mod types;

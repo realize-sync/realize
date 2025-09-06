@@ -3,15 +3,15 @@
 //! See `spec/unreal.md` for details.
 
 use super::db::GlobalDatabase;
-use super::inode_allocator::InodeAllocator;
-use super::types::InodeAssignment;
+use super::pathid_allocator::PathIdAllocator;
+use super::types::PathAssignment;
 use crate::arena::arena_cache::ArenaCache;
 use crate::arena::notifier::{Notification, Progress};
 use crate::arena::types::{DirMetadata, LocalAvailability};
 use crate::global::db::GlobalWriteTransaction;
 use crate::global::types::PathTableEntry;
 use crate::utils::holder::Holder;
-use crate::{Blob, FileMetadata, Inode, StorageError};
+use crate::{Blob, FileMetadata, PathId, StorageError};
 use realize_types::{Arena, Path, Peer, UnixTime};
 use redb::ReadableTable;
 use std::collections::HashMap;
@@ -21,22 +21,22 @@ use tokio::task;
 /// A cache of remote files.
 pub struct GlobalCache {
     db: Arc<GlobalDatabase>,
-    allocator: Arc<InodeAllocator>,
+    allocator: Arc<PathIdAllocator>,
 
     arena_caches: HashMap<Arena, Arc<ArenaCache>>,
 
-    /// Inodes to intermediate paths, before arenas, includes root.
-    paths: HashMap<Inode, IntermediatePath>,
+    /// PathIds to intermediate paths, before arenas, includes root.
+    paths: HashMap<PathId, IntermediatePath>,
 }
 
 impl GlobalCache {
-    /// Inode of the root dir.
-    pub const ROOT_DIR: Inode = InodeAllocator::ROOT_INODE;
+    /// PathId of the root dir.
+    pub const ROOT_DIR: PathId = PathIdAllocator::ROOT_INODE;
 
     /// Create a new cache with the database at the given path.
     pub(crate) async fn with_db<T>(
         db: Arc<GlobalDatabase>,
-        allocator: Arc<InodeAllocator>,
+        allocator: Arc<PathIdAllocator>,
         caches: T,
     ) -> Result<Arc<Self>, anyhow::Error>
     where
@@ -53,7 +53,7 @@ impl GlobalCache {
                 let root_mtime =
                     get_or_add_path_entry(&txn, &mut path_table, &allocator, "")?.mtime;
                 paths.insert(
-                    InodeAllocator::ROOT_INODE,
+                    PathIdAllocator::ROOT_INODE,
                     IntermediatePath {
                         entries: HashMap::new(),
                         mtime: root_mtime,
@@ -88,11 +88,11 @@ impl GlobalCache {
         self.arena_caches.keys().map(|a| *a)
     }
 
-    /// Returns the inode of an arena.
+    /// Returns the pathid of an arena.
     ///
     /// Will return [StorageError::UnknownArena] unless the arena
     /// is available in the cache.
-    pub fn arena_root(&self, arena: Arena) -> Result<Inode, StorageError> {
+    pub fn arena_root(&self, arena: Arena) -> Result<PathId, StorageError> {
         self.allocator
             .arena_root(arena)
             .ok_or_else(|| StorageError::UnknownArena(arena))
@@ -106,35 +106,35 @@ impl GlobalCache {
             .ok_or(StorageError::NotFound)?)
     }
 
-    /// Returns the cache for the given inode or fail.
-    fn arena_cache_for_inode(&self, inode: Inode) -> Result<&ArenaCache, StorageError> {
+    /// Returns the cache for the given pathid or fail.
+    fn arena_cache_for_pathid(&self, pathid: PathId) -> Result<&ArenaCache, StorageError> {
         let arena = self
             .allocator
-            .arena_for_inode(&self.db.begin_read()?, inode)?
+            .arena_for_pathid(&self.db.begin_read()?, pathid)?
             .ok_or(StorageError::NotFound)?;
         self.arena_cache(arena)
     }
     /// Lookup a directory entry.
     pub async fn lookup(
         self: &Arc<Self>,
-        parent_inode: Inode,
+        parent_pathid: PathId,
         name: &str,
-    ) -> Result<(Inode, InodeAssignment), StorageError> {
+    ) -> Result<(PathId, PathAssignment), StorageError> {
         let name = name.to_string();
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
-            match this.allocator.arena_for_inode(&txn, parent_inode)? {
+            match this.allocator.arena_for_pathid(&txn, parent_pathid)? {
                 Some(arena) => {
                     let cache = this.arena_cache(arena)?;
-                    cache.lookup(parent_inode, &name)
+                    cache.lookup(parent_pathid, &name)
                 }
-                None => match this.paths.get(&parent_inode) {
+                None => match this.paths.get(&parent_pathid) {
                     None => Err(StorageError::NotFound),
                     Some(IntermediatePath { entries, .. }) => entries
                         .get(&name)
-                        .map(|inode| (*inode, InodeAssignment::Directory))
+                        .map(|pathid| (*pathid, PathAssignment::Directory))
                         .ok_or(StorageError::NotFound),
                 },
             }
@@ -142,17 +142,17 @@ impl GlobalCache {
         .await?
     }
 
-    /// Lookup the inode and type of the file or directory pointed to
+    /// Lookup the pathid and type of the file or directory pointed to
     /// by a path.
     ///
     /// Fail with [StorageError::NotFound] if the path is not found in the tree. Note
     /// that a successful return doesn't mean that a file or directory
-    /// with that inode actually exists in the cache.
+    /// with that pathid actually exists in the cache.
     pub async fn expect(
         self: &Arc<Self>,
         arena: Arena,
         path: &Path,
-    ) -> Result<Inode, StorageError> {
+    ) -> Result<PathId, StorageError> {
         let path = path.clone();
         let this = Arc::clone(self);
 
@@ -163,16 +163,16 @@ impl GlobalCache {
         .await?
     }
 
-    /// Lookup the inode and type of the file or directory pointed to by a path.
+    /// Lookup the pathid and type of the file or directory pointed to by a path.
     ///
     /// Return Non if the path is not found in the tree. Note that a
     /// successful return doesn't mean that a file or directory with
-    /// that inode actually exists in the cache.
+    /// that pathid actually exists in the cache.
     pub async fn resolve(
         self: &Arc<Self>,
         arena: Arena,
         path: &Path,
-    ) -> Result<Option<Inode>, StorageError> {
+    ) -> Result<Option<PathId>, StorageError> {
         let path = path.clone();
         let this = Arc::clone(self);
 
@@ -184,17 +184,17 @@ impl GlobalCache {
     }
 
     /// Return the mtime of the directory.
-    pub async fn dir_metadata(self: &Arc<Self>, inode: Inode) -> Result<DirMetadata, StorageError> {
+    pub async fn dir_metadata(self: &Arc<Self>, pathid: PathId) -> Result<DirMetadata, StorageError> {
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
-            match this.allocator.arena_for_inode(&txn, inode)? {
+            match this.allocator.arena_for_pathid(&txn, pathid)? {
                 Some(arena) => {
                     let cache = this.arena_cache(arena)?;
-                    cache.dir_metadata(inode)
+                    cache.dir_metadata(pathid)
                 }
-                None => match this.paths.get(&inode) {
+                None => match this.paths.get(&pathid) {
                     None => Err(StorageError::NotFound),
                     Some(IntermediatePath { mtime, .. }) => Ok(DirMetadata {
                         read_only: true,
@@ -208,22 +208,22 @@ impl GlobalCache {
 
     pub async fn readdir(
         self: &Arc<Self>,
-        inode: Inode,
-    ) -> Result<Vec<(String, Inode, InodeAssignment)>, StorageError> {
+        pathid: PathId,
+    ) -> Result<Vec<(String, PathId, PathAssignment)>, StorageError> {
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
-            match this.allocator.arena_for_inode(&txn, inode)? {
+            match this.allocator.arena_for_pathid(&txn, pathid)? {
                 Some(arena) => {
                     let cache = this.arena_cache(arena)?;
-                    cache.readdir(inode)
+                    cache.readdir(pathid)
                 }
-                None => match this.paths.get(&inode) {
+                None => match this.paths.get(&pathid) {
                     None => Err(StorageError::NotFound),
                     Some(IntermediatePath { entries, .. }) => Ok(entries
                         .iter()
-                        .map(|(name, inode)| (name.to_string(), *inode, InodeAssignment::Directory))
+                        .map(|(name, pathid)| (name.to_string(), *pathid, PathAssignment::Directory))
                         .collect()),
                 },
             }
@@ -263,13 +263,13 @@ impl GlobalCache {
     /// Check local file content availability.
     pub async fn local_availability(
         self: &Arc<Self>,
-        inode: Inode,
+        pathid: PathId,
     ) -> Result<LocalAvailability, StorageError> {
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let cache = this.arena_cache_for_inode(inode)?;
-            cache.local_availability(inode)
+            let cache = this.arena_cache_for_pathid(pathid)?;
+            cache.local_availability(pathid)
         })
         .await?
     }
@@ -281,32 +281,32 @@ impl GlobalCache {
     ///
     /// This is usually used through the `Downloader`, which can
     /// download incomplete portions of the file.
-    pub async fn open_file(self: &Arc<Self>, inode: Inode) -> Result<Blob, StorageError> {
+    pub async fn open_file(self: &Arc<Self>, pathid: PathId) -> Result<Blob, StorageError> {
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let cache = this.arena_cache_for_inode(inode)?;
-            cache.open_file(inode)
+            let cache = this.arena_cache_for_pathid(pathid)?;
+            cache.open_file(pathid)
         })
         .await?
     }
 
     pub async fn file_metadata(
         self: &Arc<Self>,
-        inode: Inode,
+        pathid: PathId,
     ) -> Result<FileMetadata, StorageError> {
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let cache = this.arena_cache_for_inode(inode)?;
-            cache.file_metadata(inode)
+            let cache = this.arena_cache_for_pathid(pathid)?;
+            cache.file_metadata(pathid)
         })
         .await?
     }
 
     pub async fn unlink(
         self: &Arc<Self>,
-        parent_inode: Inode,
+        parent_pathid: PathId,
         name: &str,
     ) -> Result<(), StorageError> {
         let name = name.to_string();
@@ -314,15 +314,15 @@ impl GlobalCache {
 
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
-            match this.allocator.arena_for_inode(&txn, parent_inode)? {
+            match this.allocator.arena_for_pathid(&txn, parent_pathid)? {
                 Some(arena) => {
                     let cache = this.arena_cache(arena)?;
-                    cache.unlink(parent_inode, &name)
+                    cache.unlink(parent_pathid, &name)
                 }
                 None => {
                     if this
                         .paths
-                        .get(&parent_inode)
+                        .get(&parent_pathid)
                         .and_then(|paths| paths.entries.get(&name))
                         .is_some()
                     {
@@ -338,17 +338,17 @@ impl GlobalCache {
 
     pub async fn branch(
         self: &Arc<Self>,
-        source: Inode,
-        parent: Inode,
+        source: PathId,
+        parent: PathId,
         name: &str,
-    ) -> Result<(Inode, FileMetadata), StorageError> {
+    ) -> Result<(PathId, FileMetadata), StorageError> {
         let name = name.to_string();
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
-            let source_arena = this.allocator.arena_for_inode(&txn, source)?;
-            let parent_arena = this.allocator.arena_for_inode(&txn, parent)?;
+            let source_arena = this.allocator.arena_for_pathid(&txn, source)?;
+            let parent_arena = this.allocator.arena_for_pathid(&txn, parent)?;
             if source_arena != parent_arena {
                 return Err(StorageError::CrossesDevices);
             }
@@ -372,15 +372,15 @@ impl GlobalCache {
     /// Create a directory at the given path in the specified arena.
     pub async fn mkdir(
         self: &Arc<Self>,
-        parent_inode: Inode,
+        parent_pathid: PathId,
         name: &str,
-    ) -> Result<(Inode, DirMetadata), StorageError> {
+    ) -> Result<(PathId, DirMetadata), StorageError> {
         let name = name.to_string();
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let cache = this.arena_cache_for_inode(parent_inode)?;
-            cache.mkdir((parent_inode, &name))
+            let cache = this.arena_cache_for_pathid(parent_pathid)?;
+            cache.mkdir((parent_pathid, &name))
         })
         .await?
     }
@@ -388,15 +388,15 @@ impl GlobalCache {
     /// Remove an empty directory at the given path in the specified arena.
     pub async fn rmdir(
         self: &Arc<Self>,
-        parent_inode: Inode,
+        parent_pathid: PathId,
         name: &str,
     ) -> Result<(), StorageError> {
         let name = name.to_string();
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let cache = this.arena_cache_for_inode(parent_inode)?;
-            cache.rmdir((parent_inode, &name))
+            let cache = this.arena_cache_for_pathid(parent_pathid)?;
+            cache.rmdir((parent_pathid, &name))
         })
         .await?
     }
@@ -404,7 +404,7 @@ impl GlobalCache {
 
 #[derive(Debug, Clone)]
 struct IntermediatePath {
-    entries: HashMap<String, Inode>,
+    entries: HashMap<String, PathId>,
     mtime: UnixTime,
 }
 
@@ -429,14 +429,14 @@ fn check_arena_compatibility(arena: Arena, existing: Arena) -> anyhow::Result<()
 
 /// Register an [ArenaCache] that handles calls for a specific arena.
 ///
-/// Calls for inode assigned to the cache arena will be directed there.
+/// Calls for pathid assigned to the cache arena will be directed there.
 fn register(
     cache: Arc<ArenaCache>,
     txn: &GlobalWriteTransaction,
     path_table: &mut redb::Table<&'static str, Holder<'static, PathTableEntry>>,
-    allocator: &Arc<InodeAllocator>,
+    allocator: &Arc<PathIdAllocator>,
     arena_caches: &mut HashMap<Arena, Arc<ArenaCache>>,
-    paths: &mut HashMap<Inode, IntermediatePath>,
+    paths: &mut HashMap<PathId, IntermediatePath>,
 ) -> anyhow::Result<()> {
     let arena = cache.arena();
     let arena_root = allocator
@@ -454,11 +454,11 @@ fn register(
 
 fn add_arena_root(
     arena: Arena,
-    arena_root: Inode,
+    arena_root: PathId,
     txn: &GlobalWriteTransaction,
     path_table: &mut redb::Table<&'static str, Holder<'static, PathTableEntry>>,
-    allocator: &Arc<InodeAllocator>,
-    paths: &mut HashMap<Inode, IntermediatePath>,
+    allocator: &Arc<PathIdAllocator>,
+    paths: &mut HashMap<PathId, IntermediatePath>,
 ) -> anyhow::Result<()> {
     let arena_path = Path::parse(arena.as_str())?;
     let mut names = Path::components(Some(&arena_path))
@@ -466,13 +466,13 @@ fn add_arena_root(
         .into_iter()
         .rev()
         .chain(/* root */ std::iter::once(""));
-    let mut current_inode = arena_root;
+    let mut current_pathid = arena_root;
     let mut current_name = names.next().unwrap();
     for dirname in names {
         let entry = get_or_add_path_entry(txn, path_table, allocator, dirname)?;
-        add_intermediate_path_entry(entry.inode, entry.mtime, current_name, current_inode, paths);
+        add_intermediate_path_entry(entry.pathid, entry.mtime, current_name, current_pathid, paths);
         current_name = dirname;
-        current_inode = entry.inode;
+        current_pathid = entry.pathid;
     }
 
     Ok(())
@@ -481,19 +481,19 @@ fn add_arena_root(
 fn get_or_add_path_entry(
     txn: &GlobalWriteTransaction,
     path_table: &mut redb::Table<'_, &'static str, Holder<'static, PathTableEntry>>,
-    allocator: &Arc<InodeAllocator>,
+    allocator: &Arc<PathIdAllocator>,
     dirname: &str,
 ) -> Result<PathTableEntry, anyhow::Error> {
     let entry = if let Some(e) = path_table.get(dirname)? {
         e.value().parse()?
     } else {
-        let entry_inode = if dirname == "" {
-            InodeAllocator::ROOT_INODE
+        let entry_pathid = if dirname == "" {
+            PathIdAllocator::ROOT_INODE
         } else {
-            allocator.allocate_global_inode(&txn)?
+            allocator.allocate_global_pathid(&txn)?
         };
         let entry = PathTableEntry {
-            inode: entry_inode,
+            pathid: entry_pathid,
             mtime: UnixTime::now(),
         };
         path_table.insert(dirname, Holder::new(&entry)?)?;
@@ -503,21 +503,21 @@ fn get_or_add_path_entry(
     Ok(entry)
 }
 
-/// Adds an entry in the intermediate path with the given inode.
+/// Adds an entry in the intermediate path with the given pathid.
 ///
 /// If no such intermediate path exists, it is added.
 fn add_intermediate_path_entry(
-    inode: Inode,
+    pathid: PathId,
     mtime: UnixTime,
     entry_name: &str,
-    entry_inode: Inode,
-    paths: &mut HashMap<Inode, IntermediatePath>,
+    entry_pathid: PathId,
+    paths: &mut HashMap<PathId, IntermediatePath>,
 ) {
-    let mapping = paths.entry(inode).or_insert_with(|| IntermediatePath {
+    let mapping = paths.entry(pathid).or_insert_with(|| IntermediatePath {
         entries: HashMap::new(),
         mtime,
     });
-    mapping.entries.insert(entry_name.to_string(), entry_inode);
+    mapping.entries.insert(entry_name.to_string(), entry_pathid);
 }
 
 #[cfg(test)]
@@ -550,7 +550,7 @@ mod tests {
 
             let arenas = arenas.into_iter().collect::<Vec<_>>();
             let db = GlobalDatabase::new(redb_utils::in_memory()?)?;
-            let allocator = InodeAllocator::new(Arc::clone(&db), arenas.clone())?;
+            let allocator = PathIdAllocator::new(Arc::clone(&db), arenas.clone())?;
             let mut arena_caches = vec![];
             for arena in arenas {
                 let blob_dir = tempdir.child(format!("{arena}/blobs"));
@@ -575,7 +575,7 @@ mod tests {
     async fn empty_cache_readdir() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arenas([]).await?;
 
-        assert!(fixture.cache.readdir(Inode(1)).await?.is_empty());
+        assert!(fixture.cache.readdir(PathId(1)).await?.is_empty());
 
         Ok(())
     }
@@ -584,7 +584,7 @@ mod tests {
     async fn empty_cache_metadata() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arenas([]).await?;
 
-        let m = fixture.cache.dir_metadata(Inode(1)).await?;
+        let m = fixture.cache.dir_metadata(PathId(1)).await?;
         assert!(m.read_only);
         assert_ne!(UnixTime::ZERO, m.mtime);
 
@@ -596,11 +596,11 @@ mod tests {
         let arena = Arena::from("documents/letters");
         let fixture = Fixture::setup_with_arena(arena).await?;
 
-        let root_m = fixture.cache.dir_metadata(Inode(1)).await?;
+        let root_m = fixture.cache.dir_metadata(PathId(1)).await?;
         assert!(root_m.read_only);
         assert_ne!(UnixTime::ZERO, root_m.mtime);
 
-        let (documents, _) = fixture.cache.lookup(Inode(1), "documents").await?;
+        let (documents, _) = fixture.cache.lookup(PathId(1), "documents").await?;
         let documents_m = fixture.cache.dir_metadata(documents).await?;
         assert!(documents_m.read_only);
         assert_ne!(UnixTime::ZERO, documents_m.mtime);
@@ -624,17 +624,17 @@ mod tests {
 
         let cache = &fixture.cache;
 
-        let (arenas, assignment) = cache.lookup(Inode(1), "arenas").await?;
-        assert_eq!(assignment, InodeAssignment::Directory);
+        let (arenas, assignment) = cache.lookup(PathId(1), "arenas").await?;
+        assert_eq!(assignment, PathAssignment::Directory);
 
-        let (_, assignment) = cache.lookup(Inode(1), "other").await?;
-        assert_eq!(assignment, InodeAssignment::Directory);
+        let (_, assignment) = cache.lookup(PathId(1), "other").await?;
+        assert_eq!(assignment, PathAssignment::Directory);
 
         let (_, assignment) = cache.lookup(arenas, "test1").await?;
-        assert_eq!(assignment, InodeAssignment::Directory);
+        assert_eq!(assignment, PathAssignment::Directory);
 
         let (_, assignment) = cache.lookup(arenas, "test2").await?;
-        assert_eq!(assignment, InodeAssignment::Directory);
+        assert_eq!(assignment, PathAssignment::Directory);
 
         Ok(())
     }
@@ -664,22 +664,22 @@ mod tests {
         let cache = &fixture.cache;
         assert_unordered::assert_eq_unordered!(
             vec![
-                ("arenas".to_string(), InodeAssignment::Directory),
-                ("other".to_string(), InodeAssignment::Directory)
+                ("arenas".to_string(), PathAssignment::Directory),
+                ("other".to_string(), PathAssignment::Directory)
             ],
             cache
-                .readdir(Inode(1))
+                .readdir(PathId(1))
                 .await?
                 .into_iter()
                 .map(|(name, _, assignment)| (name, assignment))
                 .collect::<Vec<_>>(),
         );
 
-        let (arenas, _) = cache.lookup(Inode(1), "arenas").await?;
+        let (arenas, _) = cache.lookup(PathId(1), "arenas").await?;
         assert_unordered::assert_eq_unordered!(
             vec![
-                ("test1".to_string(), InodeAssignment::Directory),
-                ("test2".to_string(), InodeAssignment::Directory)
+                ("test1".to_string(), PathAssignment::Directory),
+                ("test2".to_string(), PathAssignment::Directory)
             ],
             cache
                 .readdir(arenas)

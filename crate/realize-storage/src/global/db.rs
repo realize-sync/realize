@@ -1,51 +1,51 @@
 use crate::global::types::PathTableEntry;
 use crate::utils::holder::Holder;
-use crate::{Inode, StorageError};
+use crate::{PathId, StorageError};
 use redb::{ReadOnlyTable, Table, TableDefinition};
 use std::sync::Arc;
 
-/// Track inode range allocation for arenas.
+/// Track pathid range allocation for arenas.
 ///
-/// This table allocates increasing ranges of inodes to arenas.
-/// Key: Inode (inode - end of range)
-/// Value: Inode (arena root, 1 for the no-arena range)
+/// This table allocates increasing ranges of pathids to arenas.
+/// Key: PathId (pathid - end of range)
+/// Value: PathId (arena root, 1 for the no-arena range)
 ///
-/// To find which arena a given inode N belongs to, lookup the range [N..];
+/// To find which arena a given pathid N belongs to, lookup the range [N..];
 /// the first element returned is the end of the current range to which N belongs.
-const INODE_RANGE_ALLOCATION_TABLE: TableDefinition<Inode, Inode> =
-    TableDefinition::new("cache.inode_range_allocation");
+const INODE_RANGE_ALLOCATION_TABLE: TableDefinition<PathId, PathId> =
+    TableDefinition::new("cache.pathid_range_allocation");
 
-/// Track current inode range for each arena.
+/// Track current pathid range for each arena.
 ///
-/// The current inode is the last inode that was allocated for the
+/// The current pathid is the last pathid that was allocated for the
 /// arena.
 ///
 /// Key: ()
-/// Value: (Inode, Inode) (last inode allocated, end of range)
-const CURRENT_INODE_RANGE_TABLE: TableDefinition<(), (Inode, Inode)> =
-    TableDefinition::new("acache.current_inode_range");
+/// Value: (PathId, PathId) (last pathid allocated, end of range)
+const CURRENT_INODE_RANGE_TABLE: TableDefinition<(), (PathId, PathId)> =
+    TableDefinition::new("acache.current_pathid_range");
 
-/// Maps arena to their root directory inode.
+/// Maps arena to their root directory pathid.
 ///
 /// Arenas in this table can also be accessed as subdirectories of the
 /// root directory (1).
 ///
 /// Key: arena name
-/// Value: root inode of arena
-const ARENA_TABLE: TableDefinition<&str, Inode> = TableDefinition::new("cache.arena");
+/// Value: root pathid of arena
+const ARENA_TABLE: TableDefinition<&str, PathId> = TableDefinition::new("cache.arena");
 
-/// Tracks mapping of inode to path and mtime for global directories
+/// Tracks mapping of pathid to path and mtime for global directories
 /// (non-arena).
 ///
 /// This table stores the path and modification time for the root
-/// inode (1) as well as any intermediate directories, if arenas
+/// pathid (1) as well as any intermediate directories, if arenas
 /// contain slashes. (For example, if the arena is "documents/letters"
 /// the intermediate directory "documents" is in path_table, but
 /// "letters" isn't because it's an arena root and is in the arena
 /// table.)
 ///
 /// Key: &str (path or "" for root)
-/// Value: PathTableEntry (inode  and mtime)
+/// Value: PathTableEntry (pathid  and mtime)
 const PATH_TABLE: TableDefinition<&str, Holder<PathTableEntry>> =
     TableDefinition::new("cache.path");
 
@@ -97,19 +97,19 @@ impl GlobalWriteTransaction {
         Ok(())
     }
 
-    pub fn arena_table<'txn>(&'txn self) -> Result<Table<'txn, &'static str, Inode>, StorageError> {
+    pub fn arena_table<'txn>(&'txn self) -> Result<Table<'txn, &'static str, PathId>, StorageError> {
         Ok(self.inner.open_table(ARENA_TABLE)?)
     }
 
-    pub fn inode_range_allocation_table<'txn>(
+    pub fn pathid_range_allocation_table<'txn>(
         &'txn self,
-    ) -> Result<Table<'txn, Inode, Inode>, StorageError> {
+    ) -> Result<Table<'txn, PathId, PathId>, StorageError> {
         Ok(self.inner.open_table(INODE_RANGE_ALLOCATION_TABLE)?)
     }
 
-    pub fn current_inode_range_table<'txn>(
+    pub fn current_pathid_range_table<'txn>(
         &'txn self,
-    ) -> Result<Table<'txn, (), (Inode, Inode)>, StorageError> {
+    ) -> Result<Table<'txn, (), (PathId, PathId)>, StorageError> {
         Ok(self.inner.open_table(CURRENT_INODE_RANGE_TABLE)?)
     }
 
@@ -125,9 +125,9 @@ pub struct GlobalReadTransaction {
 }
 
 impl GlobalReadTransaction {
-    pub fn inode_range_allocation_table(
+    pub fn pathid_range_allocation_table(
         &self,
-    ) -> Result<ReadOnlyTable<Inode, Inode>, StorageError> {
+    ) -> Result<ReadOnlyTable<PathId, PathId>, StorageError> {
         Ok(self.inner.open_table(INODE_RANGE_ALLOCATION_TABLE)?)
     }
 }

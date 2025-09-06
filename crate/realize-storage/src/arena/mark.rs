@@ -8,7 +8,7 @@ use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
 use super::types::Mark;
 use super::types::MarkTableEntry;
 use crate::utils::holder::Holder;
-use crate::{Inode, StorageError};
+use crate::{PathId, StorageError};
 use redb::{ReadableTable, Table};
 
 pub(crate) fn get<'a, L: Into<TreeLoc<'a>>>(
@@ -68,7 +68,7 @@ pub(crate) fn set_arena_mark(db: &Arc<ArenaDatabase>, mark: Mark) -> Result<(), 
 pub(crate) fn get_arena_mark(db: &Arc<ArenaDatabase>) -> Result<Mark, StorageError> {
     let txn = db.begin_read()?;
     let root = txn.read_tree()?.root();
-    let mark = txn.read_marks()?.get_at_inode(&txn.read_tree()?, root)?;
+    let mark = txn.read_marks()?.get_at_pathid(&txn.read_tree()?, root)?;
     Ok(mark)
 }
 pub(crate) fn clear_arena_mark<'a, L: Into<TreeLoc<'a>>>(
@@ -89,14 +89,14 @@ pub(crate) fn clear_arena_mark<'a, L: Into<TreeLoc<'a>>>(
 
 pub(crate) struct ReadableOpenMark<T>
 where
-    T: ReadableTable<Inode, Holder<'static, MarkTableEntry>>,
+    T: ReadableTable<PathId, Holder<'static, MarkTableEntry>>,
 {
     table: T,
 }
 
 impl<T> ReadableOpenMark<T>
 where
-    T: ReadableTable<Inode, Holder<'static, MarkTableEntry>>,
+    T: ReadableTable<PathId, Holder<'static, MarkTableEntry>>,
 {
     pub(crate) fn new(table: T) -> Self {
         Self { table }
@@ -104,47 +104,47 @@ where
 }
 
 pub(crate) struct WritableOpenMark<'a> {
-    table: Table<'a, Inode, Holder<'static, MarkTableEntry>>,
+    table: Table<'a, PathId, Holder<'static, MarkTableEntry>>,
 }
 
 impl<'a> WritableOpenMark<'a> {
-    pub(crate) fn new(table: Table<'a, Inode, Holder<MarkTableEntry>>) -> Self {
+    pub(crate) fn new(table: Table<'a, PathId, Holder<MarkTableEntry>>) -> Self {
         Self { table }
     }
 }
 
 /// Read operations for marks. See also [MarkExt].
 pub(crate) trait MarkReadOperations {
-    /// Get the mark at the given inode.
+    /// Get the mark at the given pathid.
     ///
-    /// [MarkExt::get] is usually more convenient, as it accepts paths as well as inodes.
-    fn get_at_inode(
+    /// [MarkExt::get] is usually more convenient, as it accepts paths as well as pathids.
+    fn get_at_pathid(
         &self,
         tree: &impl TreeReadOperations,
-        inode: Inode,
+        pathid: PathId,
     ) -> Result<Mark, StorageError>;
 }
 
 impl<T> MarkReadOperations for ReadableOpenMark<T>
 where
-    T: ReadableTable<Inode, Holder<'static, MarkTableEntry>>,
+    T: ReadableTable<PathId, Holder<'static, MarkTableEntry>>,
 {
-    fn get_at_inode(
+    fn get_at_pathid(
         &self,
         tree: &impl TreeReadOperations,
-        inode: Inode,
+        pathid: PathId,
     ) -> Result<Mark, StorageError> {
-        get_at_inode(&self.table, tree, inode)
+        get_at_pathid(&self.table, tree, pathid)
     }
 }
 
 impl<'a> MarkReadOperations for WritableOpenMark<'a> {
-    fn get_at_inode(
+    fn get_at_pathid(
         &self,
         tree: &impl TreeReadOperations,
-        inode: Inode,
+        pathid: PathId,
     ) -> Result<Mark, StorageError> {
-        get_at_inode(&self.table, tree, inode)
+        get_at_pathid(&self.table, tree, pathid)
     }
 }
 /// Extend [MarkReadOperations] with convenience functions for working
@@ -154,7 +154,7 @@ pub(crate) trait MarkExt {
     ///
     /// If the location is a path, the path doesn't need to exist. The
     /// mark that's returned will be the mark of the last matching
-    /// inode in the path - or that of the area root.
+    /// pathid in the path - or that of the area root.
     fn get<'a, L: Into<TreeLoc<'a>>>(
         &self,
         tree: &impl TreeReadOperations,
@@ -167,7 +167,7 @@ impl<T: MarkReadOperations> MarkExt for T {
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<Mark, StorageError> {
-        self.get_at_inode(tree, tree.resolve_partial(loc)?)
+        self.get_at_pathid(tree, tree.resolve_partial(loc)?)
     }
 }
 
@@ -182,16 +182,16 @@ impl<'a> WritableOpenMark<'a> {
         loc: L,
         mark: Mark,
     ) -> Result<(), StorageError> {
-        let inode = tree.setup(loc)?;
-        let old_mark = self.get_at_inode(tree, inode)?;
+        let pathid = tree.setup(loc)?;
+        let old_mark = self.get_at_pathid(tree, pathid)?;
         tree.insert_and_incref(
-            inode,
+            pathid,
             &mut self.table,
-            inode,
+            pathid,
             Holder::with_content(MarkTableEntry { mark })?,
         )?;
         if old_mark != mark {
-            dirty.mark_dirty_recursive(tree, inode, "marked")?;
+            dirty.mark_dirty_recursive(tree, pathid, "marked")?;
         }
 
         Ok(())
@@ -206,31 +206,31 @@ impl<'a> WritableOpenMark<'a> {
         dirty: &mut WritableOpenDirty,
         loc: L,
     ) -> Result<(), StorageError> {
-        let inode = match tree.resolve(loc)? {
-            Some(inode) => inode,
+        let pathid = match tree.resolve(loc)? {
+            Some(pathid) => pathid,
             None => {
                 // No mark to remove
                 return Ok(());
             }
         };
-        let old_mark = self.get_at_inode(tree, inode)?;
-        let removed = tree.remove_and_decref(inode, &mut self.table, inode)?;
-        if removed && old_mark != self.get_at_inode(tree, inode)? {
-            dirty.mark_dirty_recursive(tree, inode, "unmarked")?;
+        let old_mark = self.get_at_pathid(tree, pathid)?;
+        let removed = tree.remove_and_decref(pathid, &mut self.table, pathid)?;
+        if removed && old_mark != self.get_at_pathid(tree, pathid)? {
+            dirty.mark_dirty_recursive(tree, pathid, "unmarked")?;
         }
 
         Ok(())
     }
 }
 
-fn get_at_inode(
-    mark_table: &impl ReadableTable<Inode, Holder<'static, MarkTableEntry>>,
+fn get_at_pathid(
+    mark_table: &impl ReadableTable<PathId, Holder<'static, MarkTableEntry>>,
     tree: &impl TreeReadOperations,
-    inode: Inode,
+    pathid: PathId,
 ) -> Result<Mark, StorageError> {
-    for inode in std::iter::once(Ok(inode)).chain(tree.ancestors(inode)) {
-        let inode = inode?;
-        if let Some(e) = mark_table.get(inode)? {
+    for pathid in std::iter::once(Ok(pathid)).chain(tree.ancestors(pathid)) {
+        let pathid = pathid?;
+        if let Some(e) = mark_table.get(pathid)? {
             return Ok(e.value().parse()?.mark);
         }
     }
@@ -266,22 +266,22 @@ mod tests {
         dirty.delete_range(0, 999)
     }
 
-    fn dirty_inodes(dirty: &impl DirtyReadOperations) -> Result<HashSet<Inode>, StorageError> {
+    fn dirty_pathids(dirty: &impl DirtyReadOperations) -> Result<HashSet<PathId>, StorageError> {
         let mut start = 0;
-        let mut inodes = HashSet::new();
-        while let Some((inode, counter)) = dirty.next_dirty(start)? {
-            inodes.insert(inode);
+        let mut pathids = HashSet::new();
+        while let Some((pathid, counter)) = dirty.next_dirty(start)? {
+            pathids.insert(pathid);
             start = counter + 1;
         }
 
-        Ok(inodes)
+        Ok(pathids)
     }
 
     fn dirty_paths(
         dirty: &impl DirtyReadOperations,
         tree: &impl TreeReadOperations,
     ) -> Result<HashSet<Path>, StorageError> {
-        Ok(dirty_inodes(dirty)?
+        Ok(dirty_pathids(dirty)?
             .into_iter()
             .filter_map(|i| tree.backtrack(i).ok().flatten())
             .collect())

@@ -4,7 +4,7 @@ use super::mark::MarkReadOperations;
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
 use super::types::{BlobTableEntry, LocalAvailability, LruQueueId, Mark, QueueTableEntry};
 use crate::arena::arena_cache::CacheReadOperations;
-use crate::types::Inode;
+use crate::types::PathId;
 use crate::utils::hash;
 use crate::utils::holder::Holder;
 use crate::{FileAvailability, StorageError};
@@ -45,12 +45,12 @@ pub(crate) async fn mark_accessed_loop(
                 return;
             }
             ret = rx.recv() => {
-                let inode = match ret {
-                    Ok(inode) => inode,
+                let pathid = match ret {
+                    Ok(pathid) => pathid,
                     Err(broadcast::error::RecvError::Lagged(_))=> continue,
                     Err(broadcast::error::RecvError::Closed) => return
                 };
-                queue.push(inode, Reverse(Instant::now()));
+                queue.push(pathid, Reverse(Instant::now()));
             }
             _ = tokio::time::sleep(cooldown), if !queue.is_empty() => {
                 let db = Arc::clone(&db);
@@ -60,10 +60,10 @@ pub(crate) async fn mark_accessed_loop(
                     let txn = db.begin_write()?;
                     {
                         let mut blobs = txn.write_blobs()?;
-                        while let Some((inode, _)) = queue.pop() {
-                            // If marking one inode fails, don't make
-                            // other inodes fail.
-                            let _ = blobs.mark_accessed(inode);
+                        while let Some((pathid, _)) = queue.pop() {
+                            // If marking one pathid fails, don't make
+                            // other pathids fail.
+                            let _ = blobs.mark_accessed(pathid);
                         }
                     }
                     txn.commit()?;
@@ -77,7 +77,7 @@ pub(crate) async fn mark_accessed_loop(
 
 pub(crate) struct Blobs {
     blob_dir: PathBuf,
-    /// Reference counter for open blobs. Maps Inode to the number of open handles.
+    /// Reference counter for open blobs. Maps PathId to the number of open handles.
     open_blobs: OpenBlobRefCounter,
 
     disk_usage_tx: watch::Sender<DiskUsage>,
@@ -86,7 +86,7 @@ pub(crate) struct Blobs {
     _disk_usage_tx: watch::Receiver<DiskUsage>,
 
     /// Report blob accesses
-    accessed_tx: broadcast::Sender<Inode>,
+    accessed_tx: broadcast::Sender<PathId>,
 }
 impl Blobs {
     pub(crate) fn setup(
@@ -118,7 +118,7 @@ impl Blobs {
     }
 
     /// Return a receiver that can receive report about blob accesses.
-    fn subscribe_accessed(&self) -> broadcast::Receiver<Inode> {
+    fn subscribe_accessed(&self) -> broadcast::Receiver<PathId> {
         self.accessed_tx.subscribe()
     }
 
@@ -136,7 +136,7 @@ impl Blobs {
 
 pub(crate) struct ReadableOpenBlob<T, TQ>
 where
-    T: ReadableTable<Inode, Holder<'static, BlobTableEntry>>,
+    T: ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
     TQ: ReadableTable<u16, Holder<'static, QueueTableEntry>>,
 {
     blob_table: T,
@@ -146,7 +146,7 @@ where
 
 impl<T, TQ> ReadableOpenBlob<T, TQ>
 where
-    T: ReadableTable<Inode, Holder<'static, BlobTableEntry>>,
+    T: ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
     TQ: ReadableTable<u16, Holder<'static, QueueTableEntry>>,
 {
     pub(crate) fn new(blob_table: T, blob_lru_queue_table: TQ) -> Self {
@@ -160,7 +160,7 @@ where
 pub(crate) struct WritableOpenBlob<'a> {
     before_commit: &'a BeforeCommit,
 
-    blob_table: Table<'a, Inode, Holder<'static, BlobTableEntry>>,
+    blob_table: Table<'a, PathId, Holder<'static, BlobTableEntry>>,
     blob_lru_queue_table: Table<'a, u16, Holder<'static, QueueTableEntry>>,
     subsystem: &'a Blobs,
     arena: Arena,
@@ -173,7 +173,7 @@ pub(crate) struct WritableOpenBlob<'a> {
 impl<'a> WritableOpenBlob<'a> {
     pub(crate) fn new(
         before_commit: &'a BeforeCommit,
-        blob_table: Table<'a, Inode, Holder<'static, BlobTableEntry>>,
+        blob_table: Table<'a, PathId, Holder<'static, BlobTableEntry>>,
         blob_lru_queue_table: Table<'a, u16, Holder<'static, QueueTableEntry>>,
         subsystem: &'a Blobs,
         arena: Arena,
@@ -224,10 +224,10 @@ impl DiskUsage {
         evictable: 0,
     };
 
-    // Arbitrary disk space considered to be occupied by an inode.
+    // Arbitrary disk space considered to be occupied by an pathid.
     //
     // This value is added to the disk usage estimates. It is meant to
-    // account for the disk space used by the inode itself, so it doesn't
+    // account for the disk space used by the pathid itself, so it doesn't
     // look like empty files are free. This is arbitrary and might not
     // correspond to the actual value, as it depends on the filesystem.
     pub(crate) const INODE: u64 = 512;
@@ -241,7 +241,7 @@ impl DiskUsage {
 /// Public information about the blob.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlobInfo {
-    pub(crate) inode: Inode,
+    pub(crate) pathid: PathId,
     pub(crate) size: u64,
     pub(crate) hash: Hash,
 
@@ -260,9 +260,9 @@ pub(crate) struct BlobInfo {
 }
 
 impl BlobInfo {
-    fn new(inode: Inode, entry: BlobTableEntry) -> Self {
+    fn new(pathid: PathId, entry: BlobTableEntry) -> Self {
         Self {
-            inode,
+            pathid,
             size: entry.content_size,
             hash: entry.content_hash,
             available_ranges: entry.written_areas,
@@ -294,15 +294,15 @@ pub(crate) trait BlobReadOperations {
     /// This call returns [StorageError::NotFound] if the blob doesn't
     /// exist on the database. Use [WritableOpenBlob::create] to
     /// create the blob entry.
-    fn get_with_inode(&self, inode: Inode) -> Result<Option<BlobInfo>, StorageError>;
+    fn get_with_pathid(&self, pathid: PathId) -> Result<Option<BlobInfo>, StorageError>;
 
     /// Returns a double-ended iterator over the given queue, starting at the head.
     #[allow(dead_code)] // TODO: make it test-only
-    fn head(&self, queue: LruQueueId) -> impl Iterator<Item = Result<Inode, StorageError>>;
+    fn head(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PathId, StorageError>>;
 
     /// Returns a double-ended iterator over the given queue, starting at the tail.
     #[allow(dead_code)] // TODO: make it test-only
-    fn tail(&self, queue: LruQueueId) -> impl Iterator<Item = Result<Inode, StorageError>>;
+    fn tail(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PathId, StorageError>>;
 
     /// Disk space used for storing local copies.
     ///
@@ -315,18 +315,18 @@ pub(crate) trait BlobReadOperations {
 
 impl<T, TQ> BlobReadOperations for ReadableOpenBlob<T, TQ>
 where
-    T: ReadableTable<Inode, Holder<'static, BlobTableEntry>>,
+    T: ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
     TQ: ReadableTable<u16, Holder<'static, QueueTableEntry>>,
 {
-    fn get_with_inode(&self, inode: Inode) -> Result<Option<BlobInfo>, StorageError> {
-        get_read_op(&self.blob_table, inode)
+    fn get_with_pathid(&self, pathid: PathId) -> Result<Option<BlobInfo>, StorageError> {
+        get_read_op(&self.blob_table, pathid)
     }
 
-    fn head(&self, queue: LruQueueId) -> impl Iterator<Item = Result<Inode, StorageError>> {
+    fn head(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PathId, StorageError>> {
         QueueIterator::head(&self.blob_table, &self.blob_lru_queue_table, queue)
     }
 
-    fn tail(&self, queue: LruQueueId) -> impl Iterator<Item = Result<Inode, StorageError>> {
+    fn tail(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PathId, StorageError>> {
         QueueIterator::tail(&self.blob_table, &self.blob_lru_queue_table, queue)
     }
 
@@ -336,15 +336,15 @@ where
 }
 
 impl<'a> BlobReadOperations for WritableOpenBlob<'a> {
-    fn get_with_inode(&self, inode: Inode) -> Result<Option<BlobInfo>, StorageError> {
-        get_read_op(&self.blob_table, inode)
+    fn get_with_pathid(&self, pathid: PathId) -> Result<Option<BlobInfo>, StorageError> {
+        get_read_op(&self.blob_table, pathid)
     }
 
-    fn head(&self, queue: LruQueueId) -> impl Iterator<Item = Result<Inode, StorageError>> {
+    fn head(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PathId, StorageError>> {
         QueueIterator::head(&self.blob_table, &self.blob_lru_queue_table, queue)
     }
 
-    fn tail(&self, queue: LruQueueId) -> impl Iterator<Item = Result<Inode, StorageError>> {
+    fn tail(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PathId, StorageError>> {
         QueueIterator::tail(&self.blob_table, &self.blob_lru_queue_table, queue)
     }
 
@@ -384,8 +384,8 @@ impl<T: BlobReadOperations> BlobExt for T {
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<Option<BlobInfo>, StorageError> {
-        if let Some(inode) = tree.resolve(loc)? {
-            self.get_with_inode(inode)
+        if let Some(pathid) = tree.resolve(loc)? {
+            self.get_with_pathid(pathid)
         } else {
             Ok(None)
         }
@@ -411,11 +411,11 @@ impl<'a> WritableOpenBlob<'a> {
     /// mark, reported by `mark` (working LRU queue for watch and
     /// protected queue for keep and own).
     ///
-    /// If a blob already exists with the same inode and hash, it is
+    /// If a blob already exists with the same pathid and hash, it is
     /// reused and this call then works just like
     /// [BlobReadOperations::get].
     ///
-    /// If a blob already exists with the same inode, but another
+    /// If a blob already exists with the same pathid, but another
     /// hash, it is overwritten and its data cleared.
     pub(crate) fn create<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
@@ -425,10 +425,10 @@ impl<'a> WritableOpenBlob<'a> {
         hash: &Hash,
         size: u64,
     ) -> Result<BlobInfo, StorageError> {
-        let (inode, _, entry) = self.create_entry(tree, marks, loc, hash, size)?;
+        let (pathid, _, entry) = self.create_entry(tree, marks, loc, hash, size)?;
         self.report_disk_usage_changed();
 
-        Ok(BlobInfo::new(inode, entry))
+        Ok(BlobInfo::new(pathid, entry))
     }
 
     fn create_entry<'b, L: Into<TreeLoc<'b>>>(
@@ -438,23 +438,23 @@ impl<'a> WritableOpenBlob<'a> {
         loc: L,
         hash: &Hash,
         size: u64,
-    ) -> Result<(Inode, PathBuf, BlobTableEntry), StorageError> {
-        let inode = tree.setup(loc)?;
-        let existing_entry = if let Some(e) = self.blob_table.get(inode)? {
+    ) -> Result<(PathId, PathBuf, BlobTableEntry), StorageError> {
+        let pathid = tree.setup(loc)?;
+        let existing_entry = if let Some(e) = self.blob_table.get(pathid)? {
             Some(e.value().parse()?)
         } else {
             None
         };
         if let Some(e) = existing_entry {
             if e.content_hash == *hash {
-                return Ok((inode, self.subsystem.blob_dir.join(inode.hex()), e));
+                return Ok((pathid, self.subsystem.blob_dir.join(pathid.hex()), e));
             }
 
             // Existing entry cannot be reuse; remove.
             self.remove_from_queue(&e)?;
         }
-        let blob_path = self.prepare_blob_file(inode, size)?;
-        let queue = choose_queue(tree, marks, inode)?;
+        let blob_path = self.prepare_blob_file(pathid, size)?;
+        let queue = choose_queue(tree, marks, pathid)?;
         let mut entry = BlobTableEntry {
             written_areas: ByteRanges::new(),
             content_hash: hash.clone(),
@@ -465,19 +465,19 @@ impl<'a> WritableOpenBlob<'a> {
             prev: None,
             disk_usage: calculate_disk_usage(&blob_path.metadata()?),
         };
-        self.add_to_queue_front(queue, inode, &mut entry)?;
+        self.add_to_queue_front(queue, pathid, &mut entry)?;
 
         log::debug!(
-            "[{arena}] Created blob {inode} {hash} in {queue:?} at {blob_path:?} -> {entry:?}",
+            "[{arena}] Created blob {pathid} {hash} in {queue:?} at {blob_path:?} -> {entry:?}",
             arena = self.arena
         );
-        tree.insert_and_incref(inode, &mut self.blob_table, inode, Holder::new(&entry)?)?;
-        Ok((inode, blob_path, entry))
+        tree.insert_and_incref(pathid, &mut self.blob_table, pathid, Holder::new(&entry)?)?;
+        Ok((pathid, blob_path, entry))
     }
 
-    fn prepare_blob_file(&mut self, inode: Inode, size: u64) -> Result<PathBuf, StorageError> {
+    fn prepare_blob_file(&mut self, pathid: PathId, size: u64) -> Result<PathBuf, StorageError> {
         let blob_dir = self.subsystem.blob_dir.as_path();
-        let blob_path = blob_dir.join(inode.hex());
+        let blob_path = blob_dir.join(pathid.hex());
         if !blob_dir.exists() {
             std::fs::create_dir_all(blob_dir)?;
         }
@@ -501,15 +501,15 @@ impl<'a> WritableOpenBlob<'a> {
         tree: &mut WritableOpenTree,
         loc: L,
     ) -> Result<(), StorageError> {
-        let inode = match tree.resolve(loc)? {
-            Some(inode) => inode,
+        let pathid = match tree.resolve(loc)? {
+            Some(pathid) => pathid,
             None => return Ok(()), // Nothing to delete
         };
 
-        if !self.remove_blob_entry(tree, inode)? {
+        if !self.remove_blob_entry(tree, pathid)? {
             return Ok(());
         }
-        let blob_path = self.subsystem.blob_dir.join(inode.hex());
+        let blob_path = self.subsystem.blob_dir.join(pathid.hex());
         if blob_path.exists() {
             std::fs::remove_file(&blob_path)?;
         }
@@ -528,12 +528,12 @@ impl<'a> WritableOpenBlob<'a> {
         loc: L,
         protected: bool,
     ) -> Result<(), StorageError> {
-        let inode = match tree.resolve(loc)? {
-            Some(inode) => inode,
+        let pathid = match tree.resolve(loc)? {
+            Some(pathid) => pathid,
             None => return Ok(()), // Nothing to modify
         };
 
-        let mut blob_entry = match self.blob_table.get(inode)? {
+        let mut blob_entry = match self.blob_table.get(pathid)? {
             None => {
                 return Ok(());
             }
@@ -554,12 +554,12 @@ impl<'a> WritableOpenBlob<'a> {
         self.remove_from_queue(&blob_entry)?;
 
         // Add to new queue
-        self.add_to_queue_front(new_queue, inode, &mut blob_entry)?;
+        self.add_to_queue_front(new_queue, pathid, &mut blob_entry)?;
 
         // Update the entry in the table
         self.blob_table
-            .insert(inode, Holder::with_content(blob_entry)?)?;
-        dirty.mark_dirty(inode, "set_protected")?;
+            .insert(pathid, Holder::with_content(blob_entry)?)?;
+        dirty.mark_dirty(pathid, "set_protected")?;
         self.report_disk_usage_changed();
 
         Ok(())
@@ -578,12 +578,12 @@ impl<'a> WritableOpenBlob<'a> {
         loc: L,
         hash: &Hash,
     ) -> Result<Option<std::path::PathBuf>, StorageError> {
-        let inode = match tree.resolve(loc)? {
-            Some(inode) => inode,
+        let pathid = match tree.resolve(loc)? {
+            Some(pathid) => pathid,
             None => return Ok(None), // Nothing to export
         };
 
-        let blob_entry = match self.blob_table.get(inode)? {
+        let blob_entry = match self.blob_table.get(pathid)? {
             None => {
                 return Ok(None);
             }
@@ -593,9 +593,9 @@ impl<'a> WritableOpenBlob<'a> {
             return Ok(None);
         }
 
-        self.remove_blob_entry(tree, inode)?;
+        self.remove_blob_entry(tree, pathid)?;
         self.report_disk_usage_changed();
-        Ok(Some(self.subsystem.blob_dir.join(inode.hex())))
+        Ok(Some(self.subsystem.blob_dir.join(pathid.hex())))
     }
 
     /// Setup the database to move some existing file into and return the
@@ -612,7 +612,7 @@ impl<'a> WritableOpenBlob<'a> {
         metadata: &std::fs::Metadata,
     ) -> Result<PathBuf, StorageError> {
         let size = metadata.len();
-        let (inode, blob_path, mut entry) = self.create_entry(tree, marks, loc, hash, size)?;
+        let (pathid, blob_path, mut entry) = self.create_entry(tree, marks, loc, hash, size)?;
 
         // Set written areas to complete (but not verified) and update
         // trusting that metadata is going to be the blob file
@@ -621,7 +621,7 @@ impl<'a> WritableOpenBlob<'a> {
         entry.verified = false;
         self.update_disk_usage(&mut entry, metadata)?;
         self.blob_table
-            .insert(inode, Holder::with_content(entry)?)?;
+            .insert(pathid, Holder::with_content(entry)?)?;
         self.report_disk_usage_changed();
 
         // Return the path where the file should be moved
@@ -634,8 +634,8 @@ impl<'a> WritableOpenBlob<'a> {
     /// at the front of its queue.
     ///
     /// Does nothing if the blob doesn't exist.
-    fn mark_accessed(&mut self, inode: Inode) -> Result<(), StorageError> {
-        let mut blob_entry = match self.blob_table.get(inode)? {
+    fn mark_accessed(&mut self, pathid: PathId) -> Result<(), StorageError> {
+        let mut blob_entry = match self.blob_table.get(pathid)? {
             None => {
                 return Ok(());
             }
@@ -648,11 +648,11 @@ impl<'a> WritableOpenBlob<'a> {
         }
 
         // Move to the front of the queue
-        self.move_to_front(inode, &mut blob_entry)?;
+        self.move_to_front(pathid, &mut blob_entry)?;
 
         // Update the entry in the table
         self.blob_table
-            .insert(inode, Holder::with_content(blob_entry)?)?;
+            .insert(pathid, Holder::with_content(blob_entry)?)?;
 
         Ok(())
     }
@@ -669,12 +669,12 @@ impl<'a> WritableOpenBlob<'a> {
         loc: L,
         hash: &Hash,
     ) -> Result<bool, StorageError> {
-        let inode = match tree.resolve(loc)? {
-            Some(inode) => inode,
+        let pathid = match tree.resolve(loc)? {
+            Some(pathid) => pathid,
             None => return Ok(false), // Nothing to mark
         };
 
-        let mut blob_entry = match self.blob_table.get(inode)? {
+        let mut blob_entry = match self.blob_table.get(pathid)? {
             None => {
                 return Ok(false);
             }
@@ -685,13 +685,13 @@ impl<'a> WritableOpenBlob<'a> {
         if blob_entry.content_hash == *hash {
             blob_entry.verified = true;
             log::debug!(
-                "[{arena}] {inode} content verified to be {hash}",
+                "[{arena}] {pathid} content verified to be {hash}",
                 arena = self.arena
             );
 
             self.blob_table
-                .insert(inode, Holder::with_content(blob_entry)?)?;
-            dirty.mark_dirty(inode, "verified")?;
+                .insert(pathid, Holder::with_content(blob_entry)?)?;
+            dirty.mark_dirty(pathid, "verified")?;
             return Ok(true);
         }
 
@@ -710,12 +710,12 @@ impl<'a> WritableOpenBlob<'a> {
         hash: &Hash,
         new_range: &ByteRanges,
     ) -> Result<bool, StorageError> {
-        let inode = match tree.resolve(loc)? {
-            Some(inode) => inode,
+        let pathid = match tree.resolve(loc)? {
+            Some(pathid) => pathid,
             None => return Ok(false), // Nothing to extend
         };
 
-        let mut blob_entry = match get_blob_entry(&self.blob_table, inode)? {
+        let mut blob_entry = match get_blob_entry(&self.blob_table, pathid)? {
             Some(e) => e,
             None => return Ok(false),
         };
@@ -725,14 +725,14 @@ impl<'a> WritableOpenBlob<'a> {
         blob_entry.written_areas = blob_entry.written_areas.union(new_range);
 
         // Update disk usage if the blob file exists
-        let blob_path = self.subsystem.blob_dir.join(inode.hex());
+        let blob_path = self.subsystem.blob_dir.join(pathid.hex());
         if let Ok(metadata) = blob_path.metadata() {
             self.update_disk_usage(&mut blob_entry, &metadata)?;
             self.report_disk_usage_changed();
         }
 
         self.blob_table
-            .insert(inode, Holder::with_content(blob_entry)?)?;
+            .insert(pathid, Holder::with_content(blob_entry)?)?;
 
         Ok(true)
     }
@@ -808,12 +808,12 @@ impl<'a> WritableOpenBlob<'a> {
     fn add_to_queue_front(
         &mut self,
         queue_id: LruQueueId,
-        inode: Inode,
+        pathid: PathId,
         blob_entry: &mut BlobTableEntry,
     ) -> Result<(), StorageError> {
         let mut queue =
             get_queue_if_available(&self.blob_lru_queue_table, queue_id)?.unwrap_or_default();
-        self.add_to_queue_front_update_entry(queue_id, inode, blob_entry, &mut queue)?;
+        self.add_to_queue_front_update_entry(queue_id, pathid, blob_entry, &mut queue)?;
         self.blob_lru_queue_table
             .insert(queue_id as u16, Holder::with_content(queue)?)?;
 
@@ -823,24 +823,24 @@ impl<'a> WritableOpenBlob<'a> {
     fn add_to_queue_front_update_entry(
         &mut self,
         queue_id: LruQueueId,
-        inode: Inode,
+        pathid: PathId,
         blob_entry: &mut BlobTableEntry,
         queue: &mut QueueTableEntry,
     ) -> Result<(), StorageError> {
         blob_entry.queue = queue_id;
         if let Some(head_id) = queue.head {
             let mut head = follow_queue_link(&self.blob_table, head_id)?;
-            head.prev = Some(inode);
+            head.prev = Some(pathid);
 
             self.blob_table
                 .insert(head_id, Holder::with_content(head)?)?;
         } else {
             // This is the first node in the queue, so both the head
             // and the tail
-            queue.tail = Some(inode);
+            queue.tail = Some(pathid);
         }
         blob_entry.next = queue.head;
-        queue.head = Some(inode);
+        queue.head = Some(pathid);
         blob_entry.prev = None;
         queue.disk_usage += blob_entry.disk_usage;
 
@@ -919,11 +919,11 @@ impl<'a> WritableOpenBlob<'a> {
     fn remove_blob_entry(
         &mut self,
         tree: &mut WritableOpenTree<'_>,
-        inode: Inode,
+        pathid: PathId,
     ) -> Result<bool, StorageError> {
-        if let Some(entry) = get_blob_entry(&self.blob_table, inode)? {
+        if let Some(entry) = get_blob_entry(&self.blob_table, pathid)? {
             self.remove_from_queue(&entry)?;
-            tree.remove_and_decref(inode, &mut self.blob_table, inode)?;
+            tree.remove_and_decref(pathid, &mut self.blob_table, pathid)?;
             return Ok(true);
         }
 
@@ -933,7 +933,7 @@ impl<'a> WritableOpenBlob<'a> {
     /// Move the blob to the front of its queue
     fn move_to_front(
         &mut self,
-        inode: Inode,
+        pathid: PathId,
         blob_entry: &mut BlobTableEntry,
     ) -> Result<(), StorageError> {
         if blob_entry.prev.is_none() {
@@ -943,7 +943,7 @@ impl<'a> WritableOpenBlob<'a> {
         let queue_id = blob_entry.queue;
         let mut queue = get_queue_must_exist(&self.blob_lru_queue_table, queue_id)?;
         self.remove_from_queue_update_entry(blob_entry, &mut queue)?;
-        self.add_to_queue_front_update_entry(queue_id, inode, blob_entry, &mut queue)?;
+        self.add_to_queue_front_update_entry(queue_id, pathid, blob_entry, &mut queue)?;
         self.blob_lru_queue_table
             .insert(queue_id as u16, Holder::with_content(queue)?)?;
         Ok(())
@@ -953,18 +953,18 @@ impl<'a> WritableOpenBlob<'a> {
 #[allow(dead_code)]
 pub(crate) struct QueueIterator<'a, T>
 where
-    T: redb::ReadableTable<Inode, Holder<'static, BlobTableEntry>>,
+    T: redb::ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
 {
     blob_table: &'a T,
     err: Option<StorageError>,
-    next: Option<Inode>,
-    next_fn: fn(BlobTableEntry) -> Option<Inode>,
+    next: Option<PathId>,
+    next_fn: fn(BlobTableEntry) -> Option<PathId>,
 }
 
 #[allow(dead_code)]
 impl<'a, T> QueueIterator<'a, T>
 where
-    T: redb::ReadableTable<Inode, Holder<'static, BlobTableEntry>>,
+    T: redb::ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
 {
     fn head(
         blob_table: &'a T,
@@ -1005,9 +1005,9 @@ where
 
 impl<'a, T> Iterator for QueueIterator<'a, T>
 where
-    T: redb::ReadableTable<Inode, Holder<'static, BlobTableEntry>>,
+    T: redb::ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
 {
-    type Item = Result<Inode, StorageError>;
+    type Item = Result<PathId, StorageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(err) = self.err.take() {
@@ -1015,10 +1015,10 @@ where
         }
         match self.next.take() {
             None => None,
-            Some(inode) => {
+            Some(pathid) => {
                 {
                     // return current and move to next
-                    match follow_queue_link(self.blob_table, inode) {
+                    match follow_queue_link(self.blob_table, pathid) {
                         Err(err) => {
                             self.err = Some(err);
                             self.next = None;
@@ -1028,7 +1028,7 @@ where
                         }
                     };
                 };
-                Some(Ok(inode))
+                Some(Ok(pathid))
             }
         }
     }
@@ -1037,9 +1037,9 @@ where
 fn choose_queue(
     tree: &mut WritableOpenTree<'_>,
     marks: &impl MarkReadOperations,
-    inode: Inode,
+    pathid: PathId,
 ) -> Result<LruQueueId, StorageError> {
-    let queue = match marks.get_at_inode(tree, inode)? {
+    let queue = match marks.get_at_pathid(tree, pathid)? {
         Mark::Watch => LruQueueId::WorkingArea,
         Mark::Keep | Mark::Own => LruQueueId::Protected,
     };
@@ -1049,7 +1049,7 @@ fn choose_queue(
 /// Calculate disk usage for a blob file using Unix metadata.
 fn calculate_disk_usage(metadata: &std::fs::Metadata) -> u64 {
     // block() takes into account actual usage, not the whole file
-    // size, which might be sparse. Include the inode size into the
+    // size, which might be sparse. Include the pathid size into the
     // computation.
     metadata.blocks() * 512 + DiskUsage::INODE
 }
@@ -1078,10 +1078,10 @@ fn get_queue_must_exist(
 }
 
 fn get_blob_entry(
-    blob_table: &impl redb::ReadableTable<Inode, Holder<'static, BlobTableEntry>>,
-    inode: Inode,
+    blob_table: &impl redb::ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
+    pathid: PathId,
 ) -> Result<Option<BlobTableEntry>, StorageError> {
-    if let Some(entry) = blob_table.get(inode)? {
+    if let Some(entry) = blob_table.get(pathid)? {
         Ok(Some(entry.value().parse()?))
     } else {
         Ok(None)
@@ -1089,11 +1089,11 @@ fn get_blob_entry(
 }
 
 fn follow_queue_link(
-    blob_table: &impl redb::ReadableTable<Inode, Holder<'static, BlobTableEntry>>,
-    inode: Inode,
+    blob_table: &impl redb::ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
+    pathid: PathId,
 ) -> Result<BlobTableEntry, StorageError> {
-    get_blob_entry(blob_table, inode)?
-        .ok_or_else(|| StorageError::InconsistentDatabase(format!("invalid queue link {inode}")))
+    get_blob_entry(blob_table, pathid)?
+        .ok_or_else(|| StorageError::InconsistentDatabase(format!("invalid queue link {pathid}")))
 }
 
 /// Error returned by Blob when reading outside the available range.
@@ -1157,7 +1157,7 @@ impl Blob {
         info: BlobInfo,
     ) -> Result<Self, StorageError> {
         let blob_dir = db.blobs().blob_dir.as_path();
-        let path = blob_dir.join(info.inode.hex());
+        let path = blob_dir.join(info.pathid.hex());
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -1171,8 +1171,8 @@ impl Blob {
         }
 
         let blobs = db.blobs();
-        blobs.open_blobs.increment(info.inode);
-        let _ = blobs.accessed_tx.send(info.inode);
+        blobs.open_blobs.increment(info.pathid);
+        let _ = blobs.accessed_tx.send(info.pathid);
 
         Ok(Self {
             info,
@@ -1221,13 +1221,13 @@ impl Blob {
     /// any remote peers. The returned [FileAvailability] is guaranteed to have at least one peer.
     pub async fn remote_availability(&self) -> Result<Option<FileAvailability>, StorageError> {
         let db = Arc::clone(&self.db);
-        let inode = self.info.inode;
+        let pathid = self.info.pathid;
         let hash = self.info.hash.clone();
 
         tokio::task::spawn_blocking(move || {
             let txn = db.begin_read()?;
 
-            txn.read_cache()?.file_availability(inode, &hash)
+            txn.read_cache()?.file_availability(pathid, &hash)
         })
         .await?
     }
@@ -1257,7 +1257,7 @@ impl Blob {
         self.update_db().await?;
 
         self.info.verified = true;
-        let inode = self.info.inode;
+        let pathid = self.info.pathid;
         let db = self.db.clone();
         let hash = self.info.hash.clone();
         tokio::task::spawn_blocking(move || {
@@ -1267,7 +1267,7 @@ impl Blob {
                 if !blobs.mark_verified(
                     &mut txn.read_tree()?,
                     &mut txn.write_dirty()?,
-                    inode,
+                    pathid,
                     &hash,
                 )? {
                     return Ok(false);
@@ -1295,7 +1295,7 @@ impl Blob {
         }
         self.flush_and_sync().await?;
 
-        let inode = self.info.inode;
+        let pathid = self.info.pathid;
         let ranges = self.pending_ranges.clone();
         let db = Arc::clone(&self.db);
         let hash = self.info.hash.clone();
@@ -1303,7 +1303,7 @@ impl Blob {
         let (res, ranges) = tokio::task::spawn_blocking(move || {
             fn extend(
                 db: Arc<ArenaDatabase>,
-                inode: Inode,
+                pathid: PathId,
                 hash: &Hash,
                 ranges: &ByteRanges,
             ) -> Result<bool, StorageError> {
@@ -1312,7 +1312,7 @@ impl Blob {
                     let mut blobs = txn.write_blobs()?;
                     if !blobs.extend_local_availability(
                         &mut txn.read_tree()?,
-                        inode,
+                        pathid,
                         &hash,
                         &ranges,
                     )? {
@@ -1324,7 +1324,7 @@ impl Blob {
                 Ok(true)
             }
 
-            (extend(db, inode, &hash, &ranges), ranges)
+            (extend(db, pathid, &hash, &ranges), ranges)
         })
         .await?;
         if matches!(res, Ok(true)) {
@@ -1355,7 +1355,7 @@ impl Blob {
 impl Drop for Blob {
     fn drop(&mut self) {
         let blobs = self.db.blobs();
-        if blobs.open_blobs.decrement(self.info.inode) {
+        if blobs.open_blobs.decrement(self.info.pathid) {
             // poke disk usage without modifying it so the cleaner
             // attempts to evict files it couldn't previously evict
             // because they were open.
@@ -1452,7 +1452,7 @@ impl AsyncWrite for Blob {
 }
 
 struct OpenBlobRefCounter {
-    counts: Mutex<HashMap<Inode, u32>>,
+    counts: Mutex<HashMap<PathId, u32>>,
 }
 impl OpenBlobRefCounter {
     fn new() -> Self {
@@ -1461,41 +1461,41 @@ impl OpenBlobRefCounter {
         }
     }
 
-    fn increment(&self, inode: Inode) {
+    fn increment(&self, pathid: PathId) {
         let mut guard = self.counts.lock().unwrap();
-        *guard.entry(inode).or_insert(0) += 1;
-        log::trace!("Blob {} opened, ref count: {}", inode, guard[&inode]);
+        *guard.entry(pathid).or_insert(0) += 1;
+        log::trace!("Blob {} opened, ref count: {}", pathid, guard[&pathid]);
     }
 
-    /// Decrement refcount for the given inode.
+    /// Decrement refcount for the given pathid.
     ///
     /// Returns true once all counters have reached 0.
-    fn decrement(&self, inode: Inode) -> bool {
+    fn decrement(&self, pathid: PathId) -> bool {
         let mut guard = self.counts.lock().unwrap();
-        if let Some(count) = guard.get_mut(&inode) {
+        if let Some(count) = guard.get_mut(&pathid) {
             *count = count.saturating_sub(1);
-            log::trace!("Blob {} closed, ref count: {}", inode, *count);
+            log::trace!("Blob {} closed, ref count: {}", pathid, *count);
             if *count == 0 {
-                guard.remove(&inode);
-                log::trace!("Blob {} removed from open blobs", inode);
+                guard.remove(&pathid);
+                log::trace!("Blob {} removed from open blobs", pathid);
                 return guard.is_empty();
             }
         }
 
         false
     }
-    fn is_open(&self, id: Inode) -> bool {
+    fn is_open(&self, id: PathId) -> bool {
         let guard = self.counts.lock().unwrap();
         guard.contains_key(&id)
     }
 }
 
 fn get_read_op(
-    blob_table: &impl ReadableTable<Inode, Holder<'static, BlobTableEntry>>,
-    inode: Inode,
+    blob_table: &impl ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
+    pathid: PathId,
 ) -> Result<Option<BlobInfo>, StorageError> {
-    if let Some(e) = blob_table.get(inode)? {
-        Ok(Some(BlobInfo::new(inode, e.value().parse()?)))
+    if let Some(e) = blob_table.get(pathid)? {
+        Ok(Some(BlobInfo::new(pathid, e.value().parse()?)))
     } else {
         Ok(None)
     }
@@ -1525,7 +1525,7 @@ mod tests {
     use crate::arena::db::{ArenaReadTransaction, ArenaWriteTransaction};
     use crate::arena::dirty::DirtyReadOperations;
     use crate::utils::hash;
-    use crate::{Inode, Mark};
+    use crate::{PathId, Mark};
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
@@ -1570,9 +1570,9 @@ mod tests {
         }
 
         /// Return the path to a blob file for test use.
-        fn blob_path(&self, inode: Inode) -> std::path::PathBuf {
+        fn blob_path(&self, pathid: PathId) -> std::path::PathBuf {
             self.tempdir
-                .child(format!("{}/blobs/{}", self.arena, inode.hex()))
+                .child(format!("{}/blobs/{}", self.arena, pathid.hex()))
                 .to_path_buf()
         }
 
@@ -1584,10 +1584,10 @@ mod tests {
             Ok(self.db.begin_write()?)
         }
 
-        fn get_blob_entry(&self, inode: Inode) -> anyhow::Result<BlobTableEntry> {
+        fn get_blob_entry(&self, pathid: PathId) -> anyhow::Result<BlobTableEntry> {
             let txn = self.begin_write()?;
             let blobs = txn.write_blobs()?;
-            Ok(get_blob_entry(&blobs.blob_table, inode)?.ok_or(StorageError::NotFound)?)
+            Ok(get_blob_entry(&blobs.blob_table, pathid)?.ok_or(StorageError::NotFound)?)
         }
 
         fn create_blob_with_partial_data<'b, L: Into<TreeLoc<'b>>>(
@@ -1608,11 +1608,11 @@ mod tests {
                 info = blobs.create(&mut tree, &marks, loc, &hash, test_data.len() as u64)?;
 
                 if partial > 0 {
-                    let blob_path = self.blob_path(info.inode);
+                    let blob_path = self.blob_path(info.pathid);
                     std::fs::write(&blob_path, &test_data[0..partial])?;
                     blobs.extend_local_availability(
                         &tree,
-                        info.inode,
+                        info.pathid,
                         &hash,
                         &ByteRanges::single(0, partial as u64),
                     )?;
@@ -1646,11 +1646,11 @@ mod tests {
             assert_eq!(4, info.size);
             assert_eq!(ByteRanges::new(), info.available_ranges);
 
-            let inode = info.inode;
-            assert_eq!(tree.resolve(path)?, Some(inode));
-            assert_eq!(Some(info), blobs.get_with_inode(inode)?);
+            let pathid = info.pathid;
+            assert_eq!(tree.resolve(path)?, Some(pathid));
+            assert_eq!(Some(info), blobs.get_with_pathid(pathid)?);
 
-            let file_path = fixture.blob_path(inode);
+            let file_path = fixture.blob_path(pathid);
             assert!(file_path.exists());
             let m = file_path.metadata()?;
             assert_eq!(4, m.len());
@@ -1681,10 +1681,10 @@ mod tests {
 
         let new_info = blobs.create(&mut tree, &marks, &path, &hash::digest("new!"), 4)?;
 
-        let actual_info = blobs.get_with_inode(new_info.inode)?.unwrap();
+        let actual_info = blobs.get_with_pathid(new_info.pathid)?.unwrap();
         assert_eq!(actual_info, new_info);
 
-        let m = fixture.blob_path(actual_info.inode).metadata()?;
+        let m = fixture.blob_path(actual_info.pathid).metadata()?;
         assert_eq!(4, m.len());
         assert_eq!(0, m.blocks()); // sparse file
 
@@ -1724,7 +1724,7 @@ mod tests {
         assert_eq!(actual_info, new_info);
         assert_eq!(
             "old",
-            std::fs::read_to_string(fixture.blob_path(actual_info.inode))?
+            std::fs::read_to_string(fixture.blob_path(actual_info.pathid))?
         );
 
         Ok(())
@@ -1783,7 +1783,7 @@ mod tests {
 
             blobs
                 .create(&mut tree, &marks, &path, &hash::digest("test"), 4)?
-                .inode;
+                .pathid;
         }
         txn.commit()?;
 
@@ -1792,12 +1792,12 @@ mod tests {
             let mut blobs = txn.write_blobs()?;
             let mut tree = txn.write_tree()?;
 
-            let inode = tree.expect(&path)?;
+            let pathid = tree.expect(&path)?;
             blobs.delete(&mut tree, &path)?;
 
-            assert_eq!(None, blobs.get_with_inode(inode)?);
+            assert_eq!(None, blobs.get_with_pathid(pathid)?);
 
-            let file_path = fixture.blob_path(inode);
+            let file_path = fixture.blob_path(pathid);
             assert!(!file_path.exists());
         }
         let watch = fixture.db.blobs().watch_disk_usage();
@@ -2044,7 +2044,7 @@ mod tests {
         let fixture = Fixture::setup()?;
         let path = Path::parse("baa/baa")?;
         fixture.create_blob_with_partial_data(&path, "Baa, baa, black sheep", 21)?;
-        let BlobInfo { inode, hash, .. } = fixture.blob_info(&path)?.unwrap();
+        let BlobInfo { pathid, hash, .. } = fixture.blob_info(&path)?.unwrap();
 
         assert_eq!(true, Blob::open(&fixture.db, &path)?.mark_verified().await?);
 
@@ -2065,7 +2065,7 @@ mod tests {
 
         let txn = fixture.begin_read()?;
         let blobs = txn.read_blobs()?;
-        assert!(blobs.get_with_inode(inode)?.is_none());
+        assert!(blobs.get_with_pathid(pathid)?.is_none());
 
         // The LRU queue must have been updated properly.
         assert!(blobs.head(LruQueueId::WorkingArea).next().is_none());
@@ -2177,12 +2177,12 @@ mod tests {
         );
 
         let BlobInfo {
-            inode, verified, ..
+            pathid, verified, ..
         } = fixture.blob_info(&path)?.unwrap();
         assert_eq!(false, verified);
 
         // Disk usage must be set.
-        let blob_entry = fixture.get_blob_entry(inode)?;
+        let blob_entry = fixture.get_blob_entry(pathid)?;
         assert!(blob_entry.disk_usage > DiskUsage::INODE);
 
         Ok(())
@@ -2230,12 +2230,12 @@ mod tests {
         );
 
         let BlobInfo {
-            inode, verified, ..
+            pathid, verified, ..
         } = fixture.blob_info(&path)?.unwrap();
         assert_eq!(false, verified);
 
         // Disk usage must be set.
-        let blob_entry = fixture.get_blob_entry(inode)?;
+        let blob_entry = fixture.get_blob_entry(pathid)?;
         assert!(blob_entry.disk_usage > DiskUsage::INODE);
 
         Ok(())
@@ -2289,7 +2289,7 @@ mod tests {
                 &hash::digest("one"),
                 3,
             )?
-            .inode;
+            .pathid;
 
         assert_eq!(
             vec![one],
@@ -2312,7 +2312,7 @@ mod tests {
                 &hash::digest("two"),
                 3,
             )?
-            .inode;
+            .pathid;
 
         assert_eq!(
             vec![two, one],
@@ -2346,7 +2346,7 @@ mod tests {
                 &hash::digest("one"),
                 3,
             )?
-            .inode;
+            .pathid;
 
         let two = blobs
             .create(
@@ -2356,7 +2356,7 @@ mod tests {
                 &hash::digest("two"),
                 3,
             )?
-            .inode;
+            .pathid;
         let three = blobs
             .create(
                 &mut tree,
@@ -2365,7 +2365,7 @@ mod tests {
                 &hash::digest("three"),
                 3,
             )?
-            .inode;
+            .pathid;
 
         assert_eq!(
             vec![three, two, one],
@@ -2410,7 +2410,7 @@ mod tests {
                     &hash::digest("one"),
                     3,
                 )?
-                .inode;
+                .pathid;
 
             let two = blobs
                 .create(
@@ -2420,7 +2420,7 @@ mod tests {
                     &hash::digest("two"),
                     3,
                 )?
-                .inode;
+                .pathid;
             let three = blobs
                 .create(
                     &mut tree,
@@ -2429,7 +2429,7 @@ mod tests {
                     &hash::digest("three"),
                     3,
                 )?
-                .inode;
+                .pathid;
 
             assert_eq!(
                 vec![three, two, one],
@@ -2445,23 +2445,23 @@ mod tests {
             let mut blobs = txn.write_blobs()?;
             let tree = txn.read_tree()?;
 
-            let two_inode = tree.resolve(Path::parse("two")?)?.unwrap();
-            let three_inode = tree.resolve(Path::parse("three")?)?.unwrap();
-            let one_inode = tree.resolve(Path::parse("one")?)?.unwrap();
+            let two_pathid = tree.resolve(Path::parse("two")?)?.unwrap();
+            let three_pathid = tree.resolve(Path::parse("three")?)?.unwrap();
+            let one_pathid = tree.resolve(Path::parse("one")?)?.unwrap();
 
-            blobs.mark_accessed(two_inode)?;
+            blobs.mark_accessed(two_pathid)?;
 
             assert_eq!(
-                vec![two_inode, three_inode, one_inode],
+                vec![two_pathid, three_pathid, one_pathid],
                 blobs
                     .head(LruQueueId::WorkingArea)
                     .collect::<Result<Vec<_>, StorageError>>()?
             );
 
-            blobs.mark_accessed(one_inode)?;
+            blobs.mark_accessed(one_pathid)?;
 
             assert_eq!(
-                vec![one_inode, two_inode, three_inode],
+                vec![one_pathid, two_pathid, three_pathid],
                 blobs
                     .head(LruQueueId::WorkingArea)
                     .collect::<Result<Vec<_>, StorageError>>()?
@@ -2469,7 +2469,7 @@ mod tests {
 
             // make sure the list is correct both ways
             assert_eq!(
-                vec![three_inode, two_inode, one_inode],
+                vec![three_pathid, two_pathid, one_pathid],
                 blobs
                     .tail(LruQueueId::WorkingArea)
                     .collect::<Result<Vec<_>, StorageError>>()?
@@ -2589,14 +2589,14 @@ mod tests {
     async fn cleanup() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
 
-        let mut inodes = vec![Inode::ZERO; 4];
+        let mut pathids = vec![PathId::ZERO; 4];
         let txn = fixture.begin_write()?;
         {
             let mut tree = txn.write_tree()?;
             let mut blobs = txn.write_blobs()?;
             let marks = txn.read_marks()?;
             for i in 0..4 {
-                inodes[i] = blobs
+                pathids[i] = blobs
                     .create(
                         &mut tree,
                         &marks,
@@ -2604,20 +2604,20 @@ mod tests {
                         &test_hash(),
                         4096,
                     )?
-                    .inode;
+                    .pathid;
             }
 
             // set LRU order, from least recently used (2) to most
             // recently used (0)
-            blobs.mark_accessed(inodes[2])?;
-            blobs.mark_accessed(inodes[1])?;
-            blobs.mark_accessed(inodes[3])?;
-            blobs.mark_accessed(inodes[0])?;
+            blobs.mark_accessed(pathids[2])?;
+            blobs.mark_accessed(pathids[1])?;
+            blobs.mark_accessed(pathids[3])?;
+            blobs.mark_accessed(pathids[0])?;
         }
         txn.commit()?;
 
         for i in 0..4 {
-            let mut blob = Blob::open(&fixture.db, inodes[i])?;
+            let mut blob = Blob::open(&fixture.db, pathids[i])?;
             blob.write_all(&vec![1u8; 4096]).await?;
             blob.update_db().await?;
         }
@@ -2647,14 +2647,14 @@ mod tests {
             );
 
             // the 2 least recently accessed are the ones that were deleted
-            assert!(blobs.get(&tree, inodes[2])?.is_none());
-            assert!(blobs.get(&tree, inodes[1])?.is_none());
+            assert!(blobs.get(&tree, pathids[2])?.is_none());
+            assert!(blobs.get(&tree, pathids[1])?.is_none());
 
             blobs.cleanup(&mut tree, 0)?; // remove all
             assert_eq!(0, blobs.disk_usage()?.evictable);
 
             for i in 0..4 {
-                assert!(blobs.get(&tree, inodes[i])?.is_none(), "blob {i}");
+                assert!(blobs.get(&tree, pathids[i])?.is_none(), "blob {i}");
             }
         }
         let watch = fixture.db.blobs().watch_disk_usage();
@@ -2683,14 +2683,14 @@ mod tests {
     async fn cleanup_skips_open_blobs() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
 
-        let mut inodes = vec![Inode::ZERO; 4];
+        let mut pathids = vec![PathId::ZERO; 4];
         let txn = fixture.begin_write()?;
         {
             let mut tree = txn.write_tree()?;
             let mut blobs = txn.write_blobs()?;
             let marks = txn.read_marks()?;
             for i in 0..4 {
-                inodes[i] = blobs
+                pathids[i] = blobs
                     .create(
                         &mut tree,
                         &marks,
@@ -2698,20 +2698,20 @@ mod tests {
                         &test_hash(),
                         4096,
                     )?
-                    .inode;
+                    .pathid;
             }
         }
         txn.commit()?;
 
         for i in 0..4 {
-            let mut blob = Blob::open(&fixture.db, inodes[i])?;
+            let mut blob = Blob::open(&fixture.db, pathids[i])?;
             blob.write_all(&vec![1u8; 4096]).await?;
             blob.update_db().await?;
         }
 
-        let open1 = Blob::open(&fixture.db, inodes[1])?;
-        let open1_again = Blob::open(&fixture.db, inodes[1])?;
-        let open2 = Blob::open(&fixture.db, inodes[2])?;
+        let open1 = Blob::open(&fixture.db, pathids[1])?;
+        let open1_again = Blob::open(&fixture.db, pathids[1])?;
+        let open2 = Blob::open(&fixture.db, pathids[2])?;
 
         let txn = fixture.begin_write()?;
         let mut tree = txn.write_tree()?;
@@ -2719,10 +2719,10 @@ mod tests {
         blobs.cleanup(&mut tree, 0)?;
 
         // blobs 1 and 2 could not be cleaned up, because they were open
-        assert!(blobs.get(&tree, inodes[0])?.is_none());
-        assert!(blobs.get(&tree, inodes[1])?.is_some());
-        assert!(blobs.get(&tree, inodes[2])?.is_some());
-        assert!(blobs.get(&tree, inodes[3])?.is_none());
+        assert!(blobs.get(&tree, pathids[0])?.is_none());
+        assert!(blobs.get(&tree, pathids[1])?.is_some());
+        assert!(blobs.get(&tree, pathids[2])?.is_some());
+        assert!(blobs.get(&tree, pathids[3])?.is_none());
 
         assert_eq!(
             2 * DiskUsage::INODE + 2 * 4096,
@@ -2735,14 +2735,14 @@ mod tests {
 
         blobs.cleanup(&mut tree, 0)?;
 
-        assert!(blobs.get(&tree, inodes[1])?.is_some());
-        assert!(blobs.get(&tree, inodes[2])?.is_none());
+        assert!(blobs.get(&tree, pathids[1])?.is_some());
+        assert!(blobs.get(&tree, pathids[2])?.is_none());
 
         // dropping open1_again allows 1 to be deleted
         drop(open1_again);
         blobs.cleanup(&mut tree, 0)?;
 
-        assert!(blobs.get(&tree, inodes[1])?.is_none());
+        assert!(blobs.get(&tree, pathids[1])?.is_none());
 
         Ok(())
     }
@@ -2803,7 +2803,7 @@ mod tests {
         let blobs = txn.read_blobs()?;
 
         // Just test that the read transaction works correctly.
-        assert!(blobs.get_with_inode(Inode(999))?.is_none());
+        assert!(blobs.get_with_pathid(PathId(999))?.is_none());
 
         Ok(())
     }
@@ -2817,7 +2817,7 @@ mod tests {
         let mut mark = txn.write_marks()?;
 
         // Just test that the write transaction works correctly.
-        let blob_info = blobs.create(&mut tree, &mut mark, Inode(10), &test_hash(), 100)?;
+        let blob_info = blobs.create(&mut tree, &mut mark, PathId(10), &test_hash(), 100)?;
         assert_eq!(blob_info.hash, test_hash());
         assert_eq!(blob_info.size, 100);
 
@@ -2836,8 +2836,8 @@ mod tests {
         let availability = blobs.local_availability(&tree, &path)?;
         assert_eq!(availability, LocalAvailability::Missing);
 
-        // Test with an inode that doesn't exist
-        let availability = blobs.local_availability(&tree, Inode(99999))?;
+        // Test with an pathid that doesn't exist
+        let availability = blobs.local_availability(&tree, PathId(99999))?;
         assert_eq!(availability, LocalAvailability::Missing);
 
         Ok(())
@@ -2967,14 +2967,14 @@ mod tests {
     }
 
     #[test]
-    fn local_availability_handles_nonexistent_inode() -> anyhow::Result<()> {
+    fn local_availability_handles_nonexistent_pathid() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let txn = fixture.begin_write()?;
         let blobs = txn.write_blobs()?;
         let tree = txn.read_tree()?;
 
-        // Test with a non-existent inode
-        let availability = blobs.local_availability(&tree, Inode(99999))?;
+        // Test with a non-existent pathid
+        let availability = blobs.local_availability(&tree, PathId(99999))?;
         assert_eq!(availability, LocalAvailability::Missing);
 
         Ok(())
@@ -3001,21 +3001,21 @@ mod tests {
             assert_eq!(true, updated_info.protected);
 
             assert_eq!(
-                vec![blob_info.inode],
+                vec![blob_info.pathid],
                 blobs
                     .head(LruQueueId::Protected)
                     .collect::<Result<Vec<_>, StorageError>>()?
             );
             assert_eq!(
-                vec![blob_info.inode],
+                vec![blob_info.pathid],
                 blobs
                     .tail(LruQueueId::Protected)
                     .collect::<Result<Vec<_>, StorageError>>()?
             );
 
             assert_eq!(
-                Some(blob_info.inode),
-                dirty.next_dirty(0)?.map(|(inode, _)| inode)
+                Some(blob_info.pathid),
+                dirty.next_dirty(0)?.map(|(pathid, _)| pathid)
             );
         }
         let watch = fixture.db.blobs().watch_disk_usage();
@@ -3046,13 +3046,13 @@ mod tests {
         assert_eq!(false, updated_info.protected);
 
         assert_eq!(
-            vec![blob_info.inode],
+            vec![blob_info.pathid],
             blobs
                 .head(LruQueueId::WorkingArea)
                 .collect::<Result<Vec<_>, StorageError>>()?
         );
         assert_eq!(
-            vec![blob_info.inode],
+            vec![blob_info.pathid],
             blobs
                 .tail(LruQueueId::WorkingArea)
                 .collect::<Result<Vec<_>, StorageError>>()?
@@ -3061,8 +3061,8 @@ mod tests {
         assert!(blobs.head(LruQueueId::Protected).next().is_none());
 
         assert_eq!(
-            Some(blob_info.inode),
-            dirty.next_dirty(0)?.map(|(inode, _)| inode)
+            Some(blob_info.pathid),
+            dirty.next_dirty(0)?.map(|(pathid, _)| pathid)
         );
         Ok(())
     }
@@ -3087,7 +3087,7 @@ mod tests {
         // nothing changed, and the dirty bit wasn't set
         let updated_info = blobs.get(&tree, &path)?.unwrap();
         assert_eq!(true, updated_info.protected);
-        assert_eq!(blob_info.inode, updated_info.inode);
+        assert_eq!(blob_info.pathid, updated_info.pathid);
         assert!(dirty.next_dirty(0)?.is_none());
 
         Ok(())
@@ -3180,7 +3180,7 @@ mod tests {
         }
         txn.commit()?;
 
-        // After commit, disk usage should include the new inode
+        // After commit, disk usage should include the new pathid
         assert_eq!(
             DiskUsage {
                 total: DiskUsage::INODE,
@@ -3211,7 +3211,7 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         let txn = fixture.begin_write()?;
-        let mut inodes = vec![];
+        let mut pathids = vec![];
         {
             let marks = txn.read_marks()?;
             let mut blobs = txn.write_blobs()?;
@@ -3220,7 +3220,7 @@ mod tests {
             for i in 0..3 {
                 let path = Path::parse(format!("blob{i}.txt"))?;
                 let info = blobs.create(&mut tree, &marks, &path, &test_hash(), 100)?;
-                inodes.push(info.inode);
+                pathids.push(info.pathid);
             }
         }
         txn.commit()?;
@@ -3241,10 +3241,10 @@ mod tests {
         assert_eq!(1, fixture.db.blobs().accessed_tx.receiver_count());
 
         for _ in 0..20 {
-            drop(Blob::open(&fixture.db, inodes[0])?);
-            let _ = fixture.db.blobs().accessed_tx.send(Inode(999)); // invalid; should be ignored
-            drop(Blob::open(&fixture.db, inodes[2])?);
-            drop(Blob::open(&fixture.db, inodes[1])?);
+            drop(Blob::open(&fixture.db, pathids[0])?);
+            let _ = fixture.db.blobs().accessed_tx.send(PathId(999)); // invalid; should be ignored
+            drop(Blob::open(&fixture.db, pathids[2])?);
+            drop(Blob::open(&fixture.db, pathids[1])?);
         }
 
         // Cooldown period plus some buffer
@@ -3252,10 +3252,10 @@ mod tests {
 
         let txn = fixture.begin_read()?;
         let blobs = txn.read_blobs()?;
-        let queue_order: Vec<Inode> = blobs
+        let queue_order: Vec<PathId> = blobs
             .head(LruQueueId::WorkingArea)
             .collect::<Result<Vec<_>, StorageError>>()?;
-        assert_eq!(vec![inodes[1], inodes[2], inodes[0]], queue_order);
+        assert_eq!(vec![pathids[1], pathids[2], pathids[0]], queue_order);
 
         shutdown.cancel();
         handle.await?;
