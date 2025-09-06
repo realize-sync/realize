@@ -2,10 +2,10 @@
 //!
 //! See `spec/unreal.md` for details.
 
-use super::db::GlobalDatabase;
+use super::db::{GlobalDatabase, GlobalReadTransaction};
 use super::pathid_allocator::PathIdAllocator;
 use super::types::PathAssignment;
-use crate::arena::arena_cache::ArenaCache;
+use crate::arena::arena_cache::{ArenaCache, TreeLoc};
 use crate::arena::notifier::{Notification, Progress};
 use crate::arena::types::{DirMetadata, LocalAvailability};
 use crate::global::db::GlobalWriteTransaction;
@@ -14,6 +14,7 @@ use crate::utils::holder::Holder;
 use crate::{Blob, FileMetadata, PathId, StorageError};
 use realize_types::{Arena, Path, Peer, UnixTime};
 use redb::ReadableTable;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task;
@@ -114,29 +115,96 @@ impl GlobalCache {
             .ok_or(StorageError::NotFound)?;
         self.arena_cache(arena)
     }
+
+    /// Convert a [GlobalTreeLoc] into an arena or global location.
+    fn resolve_loc<L: Into<GlobalTreeLoc>>(
+        &self,
+        txn: &GlobalReadTransaction,
+        loc: L,
+    ) -> Result<ResolvedLoc<'static>, StorageError> {
+        Ok(match self.resolve_arena_root(loc.into()) {
+            GlobalTreeLoc::PathId(pathid) => match self.allocator.arena_for_pathid(txn, pathid)? {
+                Some(arena) => ResolvedLoc::InArena(arena, TreeLoc::PathId(pathid)),
+                None => ResolvedLoc::Global(if self.paths.contains_key(&pathid) {
+                    Some(pathid)
+                } else {
+                    None
+                }),
+            },
+            GlobalTreeLoc::PathIdAndName(pathid, name) => {
+                match self.allocator.arena_for_pathid(txn, pathid)? {
+                    Some(arena) => {
+                        ResolvedLoc::InArena(arena, TreeLoc::PathIdAndName(pathid, Cow::from(name)))
+                    }
+                    None => ResolvedLoc::Global(match self.paths.get(&pathid) {
+                        None => return Err(StorageError::NotFound),
+                        Some(IntermediatePath { entries, .. }) => {
+                            entries.get(&name).map(|pathid| *pathid)
+                        }
+                    }),
+                }
+            }
+            GlobalTreeLoc::Path(arena, path) => ResolvedLoc::InArena(arena, TreeLoc::Path(path)),
+        })
+    }
+
+    /// Convert a [GlobalTreeLoc] into an arena and arena [TreeLoc] or fail.
+    fn resolve_arena_loc<L: Into<GlobalTreeLoc>>(
+        &self,
+        loc: L,
+    ) -> Result<(&ArenaCache, TreeLoc<'static>), StorageError> {
+        Ok(match self.resolve_arena_root(loc.into()) {
+            GlobalTreeLoc::PathId(pathid) => (
+                self.arena_cache_for_pathid(pathid)?,
+                TreeLoc::PathId(pathid),
+            ),
+            GlobalTreeLoc::PathIdAndName(pathid, name) => (
+                self.arena_cache_for_pathid(pathid)?,
+                TreeLoc::PathIdAndName(pathid, name.into()),
+            ),
+            GlobalTreeLoc::Path(arena, path) => (self.arena_cache(arena)?, TreeLoc::Path(path)),
+        })
+    }
+
+    /// Cover the special case of a PathIdAndName where name points to an arena root.
+    fn resolve_arena_root(&self, loc: GlobalTreeLoc) -> GlobalTreeLoc {
+        if let GlobalTreeLoc::PathIdAndName(pathid, name) = &loc {
+            if let Some(IntermediatePath { entries, .. }) = self.paths.get(&pathid) {
+                if let Some(pathid) = entries.get(name) {
+                    if self.allocator.is_arena_root(*pathid) {
+                        return GlobalTreeLoc::PathId(*pathid);
+                    }
+                }
+            }
+        }
+
+        loc
+    }
+
     /// Lookup a directory entry.
-    pub async fn lookup(
+    pub async fn lookup<L: Into<GlobalTreeLoc>>(
         self: &Arc<Self>,
-        parent_pathid: PathId,
-        name: &str,
+        loc: L,
     ) -> Result<(PathId, PathAssignment), StorageError> {
-        let name = name.to_string();
+        let loc = loc.into();
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
-            match this.allocator.arena_for_pathid(&txn, parent_pathid)? {
-                Some(arena) => {
+            match this.resolve_loc(&txn, loc)? {
+                ResolvedLoc::InArena(arena, loc) => {
                     let cache = this.arena_cache(arena)?;
-                    cache.lookup((parent_pathid, &name))
+                    cache.lookup(loc)
                 }
-                None => match this.paths.get(&parent_pathid) {
-                    None => Err(StorageError::NotFound),
-                    Some(IntermediatePath { entries, .. }) => entries
-                        .get(&name)
-                        .map(|pathid| (*pathid, PathAssignment::Directory))
-                        .ok_or(StorageError::NotFound),
-                },
+                ResolvedLoc::Global(pathid) => {
+                    if let Some(pathid) = pathid
+                        && this.paths.contains_key(&pathid)
+                    {
+                        Ok((pathid, PathAssignment::Directory))
+                    } else {
+                        Err(StorageError::NotFound)
+                    }
+                }
             }
         })
         .await?
@@ -184,20 +252,22 @@ impl GlobalCache {
     }
 
     /// Return the mtime of the directory.
-    pub async fn dir_metadata(
+    pub async fn dir_metadata<L: Into<GlobalTreeLoc>>(
         self: &Arc<Self>,
-        pathid: PathId,
+        loc: L,
     ) -> Result<DirMetadata, StorageError> {
+        let loc = loc.into();
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
-            match this.allocator.arena_for_pathid(&txn, pathid)? {
-                Some(arena) => {
+            match this.resolve_loc(&txn, loc)? {
+                ResolvedLoc::InArena(arena, loc) => {
                     let cache = this.arena_cache(arena)?;
-                    cache.dir_metadata(pathid)
+                    cache.dir_metadata(loc)
                 }
-                None => match this.paths.get(&pathid) {
+                ResolvedLoc::Global(None) => Err(StorageError::NotFound),
+                ResolvedLoc::Global(Some(pathid)) => match this.paths.get(&pathid) {
                     None => Err(StorageError::NotFound),
                     Some(IntermediatePath { mtime, .. }) => Ok(DirMetadata {
                         read_only: true,
@@ -209,20 +279,22 @@ impl GlobalCache {
         .await?
     }
 
-    pub async fn readdir(
+    pub async fn readdir<L: Into<GlobalTreeLoc>>(
         self: &Arc<Self>,
-        pathid: PathId,
+        loc: L,
     ) -> Result<Vec<(String, PathId, PathAssignment)>, StorageError> {
+        let loc = loc.into();
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
-            match this.allocator.arena_for_pathid(&txn, pathid)? {
-                Some(arena) => {
+            match this.resolve_loc(&txn, loc)? {
+                ResolvedLoc::InArena(arena, loc) => {
                     let cache = this.arena_cache(arena)?;
-                    cache.readdir(pathid)
+                    cache.readdir(loc)
                 }
-                None => match this.paths.get(&pathid) {
+                ResolvedLoc::Global(None) => Err(StorageError::NotFound),
+                ResolvedLoc::Global(Some(pathid)) => match this.paths.get(&pathid) {
                     None => Err(StorageError::NotFound),
                     Some(IntermediatePath { entries, .. }) => Ok(entries
                         .iter()
@@ -266,15 +338,16 @@ impl GlobalCache {
     }
 
     /// Check local file content availability.
-    pub async fn local_availability(
+    pub async fn local_availability<L: Into<GlobalTreeLoc>>(
         self: &Arc<Self>,
-        pathid: PathId,
+        loc: L,
     ) -> Result<LocalAvailability, StorageError> {
+        let loc = loc.into();
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let cache = this.arena_cache_for_pathid(pathid)?;
-            cache.local_availability(pathid)
+            let (cache, loc) = this.resolve_arena_loc(loc)?;
+            cache.local_availability(loc)
         })
         .await?
     }
@@ -286,125 +359,169 @@ impl GlobalCache {
     ///
     /// This is usually used through the `Downloader`, which can
     /// download incomplete portions of the file.
-    pub async fn open_file(self: &Arc<Self>, pathid: PathId) -> Result<Blob, StorageError> {
+    pub async fn open_file<L: Into<GlobalTreeLoc>>(
+        self: &Arc<Self>,
+        loc: L,
+    ) -> Result<Blob, StorageError> {
+        let loc = loc.into();
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let cache = this.arena_cache_for_pathid(pathid)?;
-            cache.open_file(pathid)
+            let (cache, loc) = this.resolve_arena_loc(loc)?;
+            cache.open_file(loc)
         })
         .await?
     }
 
-    pub async fn file_metadata(
+    pub async fn file_metadata<L: Into<GlobalTreeLoc>>(
         self: &Arc<Self>,
-        pathid: PathId,
+        loc: L,
     ) -> Result<FileMetadata, StorageError> {
+        let loc = loc.into();
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let cache = this.arena_cache_for_pathid(pathid)?;
-            cache.file_metadata(pathid)
+            let (cache, loc) = this.resolve_arena_loc(loc)?;
+            cache.file_metadata(loc)
         })
         .await?
     }
 
-    pub async fn unlink(
+    pub async fn unlink<L: Into<GlobalTreeLoc>>(
         self: &Arc<Self>,
-        parent_pathid: PathId,
-        name: &str,
+        loc: L,
     ) -> Result<(), StorageError> {
-        let name = name.to_string();
+        let loc = loc.into();
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
-            match this.allocator.arena_for_pathid(&txn, parent_pathid)? {
-                Some(arena) => {
+            match this.resolve_loc(&txn, loc)? {
+                ResolvedLoc::InArena(arena, loc) => {
                     let cache = this.arena_cache(arena)?;
-                    cache.unlink((parent_pathid, &name))
+                    cache.unlink(loc)
                 }
-                None => {
-                    if this
-                        .paths
-                        .get(&parent_pathid)
-                        .and_then(|paths| paths.entries.get(&name))
-                        .is_some()
-                    {
-                        Err(StorageError::IsADirectory)
-                    } else {
-                        Err(StorageError::NotFound)
-                    }
-                }
+                ResolvedLoc::Global(Some(_)) => Err(StorageError::IsADirectory),
+                ResolvedLoc::Global(None) => Err(StorageError::NotFound),
             }
         })
         .await?
     }
 
-    pub async fn branch(
+    pub async fn branch<L1: Into<GlobalTreeLoc>, L2: Into<GlobalTreeLoc>>(
         self: &Arc<Self>,
-        source: PathId,
-        parent: PathId,
-        name: &str,
+        source: L1,
+        dest: L2,
     ) -> Result<(PathId, FileMetadata), StorageError> {
-        let name = name.to_string();
+        let source = source.into();
+        let dest = dest.into();
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
-            let source_arena = this.allocator.arena_for_pathid(&txn, source)?;
-            let parent_arena = this.allocator.arena_for_pathid(&txn, parent)?;
-            if source_arena != parent_arena {
-                return Err(StorageError::CrossesDevices);
-            }
-            match source_arena {
-                Some(arena) => {
-                    let cache = this.arena_cache(arena)?;
-                    cache.branch(source, (parent, &name))
-                }
-                None => {
-                    if this.paths.get(&source).is_some() {
-                        Err(StorageError::IsADirectory)
-                    } else {
-                        Err(StorageError::NotFound)
+            match (
+                this.resolve_loc(&txn, source)?,
+                this.resolve_loc(&txn, dest)?,
+            ) {
+                (
+                    ResolvedLoc::InArena(source_arena, source),
+                    ResolvedLoc::InArena(dest_arena, dest),
+                ) => {
+                    if source_arena != dest_arena {
+                        return Err(StorageError::CrossesDevices);
                     }
+                    let cache = this.arena_cache(source_arena)?;
+                    cache.branch(source, dest)
                 }
+                (ResolvedLoc::Global(_), ResolvedLoc::Global(_)) => Err(StorageError::IsADirectory),
+                (_, _) => Err(StorageError::CrossesDevices),
             }
         })
         .await?
     }
 
     /// Create a directory at the given path in the specified arena.
-    pub async fn mkdir(
+    pub async fn mkdir<L: Into<GlobalTreeLoc>>(
         self: &Arc<Self>,
-        parent_pathid: PathId,
-        name: &str,
+        loc: L,
     ) -> Result<(PathId, DirMetadata), StorageError> {
-        let name = name.to_string();
+        let loc = loc.into();
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let cache = this.arena_cache_for_pathid(parent_pathid)?;
-            cache.mkdir((parent_pathid, &name))
+            let (cache, loc) = this.resolve_arena_loc(loc)?;
+
+            cache.mkdir(loc)
         })
         .await?
     }
 
     /// Remove an empty directory at the given path in the specified arena.
-    pub async fn rmdir(
+    pub async fn rmdir<L: Into<GlobalTreeLoc>>(
         self: &Arc<Self>,
-        parent_pathid: PathId,
-        name: &str,
+        loc: L,
     ) -> Result<(), StorageError> {
-        let name = name.to_string();
+        let loc = loc.into();
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let cache = this.arena_cache_for_pathid(parent_pathid)?;
-            cache.rmdir((parent_pathid, &name))
+            let (cache, loc) = this.resolve_arena_loc(loc)?;
+
+            cache.rmdir(loc)
         })
         .await?
     }
+}
+
+/// A location within the cache.
+///
+/// This is usually a [Path] within an [Arena] or a [PathId], but can
+/// also be a [PathId] and a name to specify a child of a known
+/// directory.
+pub enum GlobalTreeLoc {
+    PathId(PathId),
+    Path(Arena, Path),
+    PathIdAndName(PathId, String),
+}
+
+impl From<PathId> for GlobalTreeLoc {
+    fn from(value: PathId) -> Self {
+        GlobalTreeLoc::PathId(value)
+    }
+}
+
+impl From<(Arena, Path)> for GlobalTreeLoc {
+    fn from(value: (Arena, Path)) -> Self {
+        GlobalTreeLoc::Path(value.0, value.1)
+    }
+}
+
+impl From<(Arena, &Path)> for GlobalTreeLoc {
+    fn from(value: (Arena, &Path)) -> Self {
+        GlobalTreeLoc::Path(value.0, value.1.clone())
+    }
+}
+
+impl From<(PathId, &str)> for GlobalTreeLoc {
+    fn from(value: (PathId, &str)) -> Self {
+        GlobalTreeLoc::PathIdAndName(value.0, value.1.to_string())
+    }
+}
+
+impl From<(PathId, &String)> for GlobalTreeLoc {
+    fn from(value: (PathId, &String)) -> Self {
+        GlobalTreeLoc::PathIdAndName(value.0, value.1.clone())
+    }
+}
+impl From<(PathId, String)> for GlobalTreeLoc {
+    fn from(value: (PathId, String)) -> Self {
+        GlobalTreeLoc::PathIdAndName(value.0, value.1)
+    }
+}
+
+enum ResolvedLoc<'a> {
+    Global(Option<PathId>),
+    InArena(Arena, TreeLoc<'a>),
 }
 
 #[derive(Debug, Clone)]
@@ -611,12 +728,12 @@ mod tests {
         assert!(root_m.read_only);
         assert_ne!(UnixTime::ZERO, root_m.mtime);
 
-        let (documents, _) = fixture.cache.lookup(PathId(1), "documents").await?;
+        let (documents, _) = fixture.cache.lookup((PathId(1), "documents")).await?;
         let documents_m = fixture.cache.dir_metadata(documents).await?;
         assert!(documents_m.read_only);
         assert_ne!(UnixTime::ZERO, documents_m.mtime);
 
-        let (letters, _) = fixture.cache.lookup(documents, "letters").await?;
+        let (letters, _) = fixture.cache.lookup((documents, "letters")).await?;
         let letters_m = fixture.cache.dir_metadata(letters).await?;
         assert!(!letters_m.read_only);
         assert_ne!(UnixTime::ZERO, letters_m.mtime);
@@ -635,16 +752,16 @@ mod tests {
 
         let cache = &fixture.cache;
 
-        let (arenas, assignment) = cache.lookup(PathId(1), "arenas").await?;
+        let (arenas, assignment) = cache.lookup((PathId(1), "arenas")).await.unwrap();
         assert_eq!(assignment, PathAssignment::Directory);
 
-        let (_, assignment) = cache.lookup(PathId(1), "other").await?;
+        let (_, assignment) = cache.lookup((PathId(1), "other")).await.unwrap();
         assert_eq!(assignment, PathAssignment::Directory);
 
-        let (_, assignment) = cache.lookup(arenas, "test1").await?;
+        let (_, assignment) = cache.lookup((arenas, "test1")).await.unwrap();
         assert_eq!(assignment, PathAssignment::Directory);
 
-        let (_, assignment) = cache.lookup(arenas, "test2").await?;
+        let (_, assignment) = cache.lookup((arenas, "test2")).await.unwrap();
         assert_eq!(assignment, PathAssignment::Directory);
 
         Ok(())
@@ -656,7 +773,7 @@ mod tests {
         let cache = &fixture.cache;
 
         assert!(matches!(
-            cache.lookup(GlobalCache::ROOT_DIR, "nonexistent").await,
+            cache.lookup((GlobalCache::ROOT_DIR, "nonexistent")).await,
             Err(StorageError::NotFound),
         ));
 
@@ -686,7 +803,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
 
-        let (arenas, _) = cache.lookup(PathId(1), "arenas").await?;
+        let (arenas, _) = cache.lookup((PathId(1), "arenas")).await?;
         assert_unordered::assert_eq_unordered!(
             vec![
                 ("test1".to_string(), PathAssignment::Directory),
@@ -724,23 +841,27 @@ mod tests {
 
     #[tokio::test]
     async fn unlink() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let arena = Arena::from("arenas/1");
+        let fixture = Fixture::setup_with_arena(arena).await?;
         let cache = &fixture.cache;
 
+        let res = cache.unlink((GlobalCache::ROOT_DIR, "doesnotexist")).await;
+        assert!(matches!(res, Err(StorageError::NotFound)), "{res:?}");
         assert!(matches!(
-            cache.unlink(GlobalCache::ROOT_DIR, "test_arena").await,
+            cache.unlink((GlobalCache::ROOT_DIR, "arenas")).await,
             Err(StorageError::IsADirectory)
         ));
+        let (arenas_pathid, _) = cache.lookup((GlobalCache::ROOT_DIR, "arenas")).await?;
         assert!(matches!(
-            cache.unlink(GlobalCache::ROOT_DIR, "doesnotexist").await,
-            Err(StorageError::NotFound)
+            cache.unlink((arenas_pathid, "1")).await,
+            Err(StorageError::IsADirectory)
         ));
 
         // This just checks that the call is dispatched down to the
         // arena cache.
         assert!(matches!(
             cache
-                .unlink(cache.arena_root(test_arena())?, "doesnotexist")
+                .unlink((cache.arena_root(arena)?, "doesnotexist"))
                 .await,
             Err(StorageError::NotFound)
         ));
@@ -755,20 +876,17 @@ mod tests {
         let fixture = Fixture::setup_with_arenas([arena1, arena2]).await?;
         let cache = &fixture.cache;
 
-        let arenas_dir = cache.lookup(GlobalCache::ROOT_DIR, "arenas").await?.0;
-        assert!(matches!(
-            cache
-                .branch(arenas_dir, GlobalCache::ROOT_DIR, "test_arena2")
-                .await,
-            Err(StorageError::IsADirectory)
-        ));
+        let arenas_dir = cache.lookup((GlobalCache::ROOT_DIR, "arenas")).await?.0;
+        let res = cache
+            .branch(arenas_dir, (GlobalCache::ROOT_DIR, "test_arena2"))
+            .await;
+        assert!(matches!(res, Err(StorageError::IsADirectory)), "{res:?}");
 
         assert!(matches!(
             cache
                 .branch(
                     cache.arena_root(arena1)?,
-                    cache.arena_root(arena2)?,
-                    "test_arena2"
+                    (cache.arena_root(arena2)?, "test_arena2")
                 )
                 .await,
             Err(StorageError::CrossesDevices)

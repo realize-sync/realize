@@ -43,6 +43,11 @@ impl PathIdAllocator {
         self.arena_roots.get_by_left(&arena).copied()
     }
 
+    /// Check whether [PathId] is an arena root.
+    pub(crate) fn is_arena_root(&self, pathid: PathId) -> bool {
+        self.arena_roots.get_by_right(&pathid).is_some()
+    }
+
     /// Allocate an pathid for an arena.
     ///
     /// `current_range_table` must be an opened table within the arena database.

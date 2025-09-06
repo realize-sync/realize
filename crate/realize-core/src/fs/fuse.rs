@@ -3,7 +3,7 @@ use crate::fs::downloader::Downloader;
 use fuser::{Filesystem, MountOption};
 use nix::libc::c_int;
 use realize_storage::{
-    DirMetadata, FileMetadata, GlobalCache, PathId, PathAssignment, StorageError,
+    DirMetadata, FileMetadata, GlobalCache, PathAssignment, PathId, StorageError,
 };
 use std::ffi::OsString;
 use std::time::SystemTime;
@@ -391,7 +391,7 @@ impl InnerRealizeFs {
     async fn lookup(&self, parent: u64, name: OsString) -> Result<fuser::FileAttr, FuseError> {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
 
-        let (pathid, assignment) = self.cache.lookup(PathId(parent), name).await?;
+        let (pathid, assignment) = self.cache.lookup((PathId(parent), name)).await?;
         match assignment {
             PathAssignment::Directory => {
                 let metadata = self.cache.dir_metadata(pathid).await?;
@@ -473,7 +473,7 @@ impl InnerRealizeFs {
 
     async fn unlink(&self, parent: u64, name: OsString) -> Result<(), FuseError> {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
-        self.cache.unlink(PathId(parent), name).await?;
+        self.cache.unlink((PathId(parent), name)).await?;
 
         Ok(())
     }
@@ -487,7 +487,7 @@ impl InnerRealizeFs {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
         let (dest, metadata) = self
             .cache
-            .branch(PathId(source), PathId(parent), name)
+            .branch(PathId(source), (PathId(parent), name))
             .await?;
 
         Ok(self.build_file_attr(dest, &metadata))
@@ -502,7 +502,7 @@ impl InnerRealizeFs {
     ) -> Result<fuser::FileAttr, FuseError> {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
 
-        let (dest, metadata) = self.cache.mkdir(PathId(parent), name).await?;
+        let (dest, metadata) = self.cache.mkdir((PathId(parent), name)).await?;
 
         Ok(self.build_dir_attr(dest, metadata))
     }
@@ -510,7 +510,7 @@ impl InnerRealizeFs {
     async fn rmdir(&self, parent: u64, name: OsString) -> Result<(), FuseError> {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
 
-        self.cache.rmdir(PathId(parent), name).await?;
+        self.cache.rmdir((PathId(parent), name)).await?;
 
         Ok(())
     }

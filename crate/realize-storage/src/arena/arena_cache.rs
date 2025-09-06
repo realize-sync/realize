@@ -2,7 +2,7 @@ use super::blob::{BlobExt, BlobInfo, BlobReadOperations, WritableOpenBlob};
 use super::db::{ArenaDatabase, ArenaWriteTransaction};
 use super::dirty::WritableOpenDirty;
 use super::peer::PeersReadOperations;
-use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
+use super::tree::{TreeExt, TreeReadOperations, WritableOpenTree};
 use super::types::{
     CacheTableEntry, CacheTableKey, DirtableEntry, FileAvailability, FileMetadata, FileTableEntry,
 };
@@ -17,6 +17,9 @@ use crate::{PathId, StorageError};
 use realize_types::{Arena, Hash, Path, Peer, UnixTime};
 use redb::{ReadableTable, Table};
 use std::sync::Arc;
+
+// TreeLoc is necessary to call ArenaCache methods
+pub(crate) use super::tree::TreeLoc;
 
 /// Read operations for cache. See also [CacheExt].
 pub(crate) trait CacheReadOperations {
@@ -271,7 +274,7 @@ impl<'a> WritableOpenCache<'a> {
         loc: L,
     ) -> Result<(), StorageError> {
         let pathid = tree.expect(loc)?;
-        let e = get_file_entry(&self.table, pathid, None)?.ok_or(StorageError::NotFound)?;
+        let e = get_default_entry_or_err(&self.table, pathid)?;
         log::debug!(
             "[{}]@local Local removal of \"{}\" pathid {pathid} {}",
             self.arena,

@@ -113,12 +113,11 @@ async fn link_to_own() -> anyhow::Result<()> {
 
             fixture.wait_for_file_in_cache(b, "work/foo", &hash).await?;
             let cache_b = fixture.cache(b)?;
-            let (store_pathid, _) = cache_b.mkdir(cache_b.arena_root(arena)?, "store").await?;
+            let (store_pathid, _) = cache_b.mkdir((cache_b.arena_root(arena)?, "store")).await?;
             cache_b
                 .branch(
                     cache_b.expect(arena, &Path::parse("work/foo")?).await?,
-                    store_pathid,
-                    "foo",
+                    (store_pathid, "foo"),
                 )
                 .await?;
 
