@@ -12,7 +12,7 @@ use crate::arena::notifier::{Notification, Progress};
 use crate::arena::tree;
 use crate::arena::types::DirMetadata;
 use crate::utils::holder::Holder;
-use crate::{Blob, PathAssignment, LocalAvailability};
+use crate::{Blob, LocalAvailability, PathAssignment};
 use crate::{PathId, StorageError};
 use realize_types::{Arena, Hash, Path, Peer, UnixTime};
 use redb::{ReadableTable, Table};
@@ -20,16 +20,22 @@ use std::sync::Arc;
 
 /// Read operations for cache. See also [CacheExt].
 pub(crate) trait CacheReadOperations {
-    /// Lookup a specific name in the given directory pathid.
-    fn lookup(
+    /// Lookup a specific location.
+    ///
+    /// The location is usually either a path or a (pathid, name)
+    /// pair.
+    fn lookup<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
-        parent_pathid: PathId,
-        name: &str,
+        loc: L,
     ) -> Result<(PathId, PathAssignment), StorageError>;
 
     /// Get directory modification time for the given pathid.
-    fn dir_mtime(&self, pathid: PathId) -> Result<UnixTime, StorageError>;
+    fn dir_mtime<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<UnixTime, StorageError>;
 
     /// Get remote file availability information for the given pathid and version.
     fn file_availability(
@@ -39,10 +45,10 @@ pub(crate) trait CacheReadOperations {
     ) -> Result<Option<FileAvailability>, StorageError>;
 
     /// Read directory contents for the given pathid.
-    fn readdir(
+    fn readdir<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
-        pathid: PathId,
+        loc: L,
     ) -> impl Iterator<Item = Result<(String, PathId, PathAssignment), StorageError>>;
 
     /// Get the default file entry for the given pathid.
@@ -76,17 +82,20 @@ impl<T> CacheReadOperations for ReadableOpenCache<T>
 where
     T: ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
 {
-    fn lookup(
+    fn lookup<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
-        parent_pathid: PathId,
-        name: &str,
+        loc: L,
     ) -> Result<(PathId, PathAssignment), StorageError> {
-        lookup(&self.table, tree, parent_pathid, name)
+        lookup(&self.table, tree, loc)
     }
 
-    fn dir_mtime(&self, pathid: PathId) -> Result<UnixTime, StorageError> {
-        dir_mtime(&self.table, pathid)
+    fn dir_mtime<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<UnixTime, StorageError> {
+        dir_mtime(&self.table, tree, loc)
     }
 
     fn file_availability(
@@ -97,12 +106,12 @@ where
         file_availability(&self.table, pathid, self.arena, hash)
     }
 
-    fn readdir(
+    fn readdir<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
-        pathid: PathId,
+        loc: L,
     ) -> impl Iterator<Item = Result<(String, PathId, PathAssignment), StorageError>> {
-        ReadDirIterator::new(&self.table, tree, pathid)
+        ReadDirIterator::new(&self.table, tree, loc)
     }
 
     fn get_at_pathid(&self, pathid: PathId) -> Result<Option<FileTableEntry>, StorageError> {
@@ -115,17 +124,20 @@ where
 }
 
 impl<'a> CacheReadOperations for WritableOpenCache<'a> {
-    fn lookup(
+    fn lookup<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
-        parent_pathid: PathId,
-        name: &str,
+        loc: L,
     ) -> Result<(PathId, PathAssignment), StorageError> {
-        lookup(&self.table, tree, parent_pathid, name)
+        lookup(&self.table, tree, loc)
     }
 
-    fn dir_mtime(&self, pathid: PathId) -> Result<UnixTime, StorageError> {
-        dir_mtime(&self.table, pathid)
+    fn dir_mtime<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<UnixTime, StorageError> {
+        dir_mtime(&self.table, tree, loc)
     }
 
     fn file_availability(
@@ -136,12 +148,12 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         file_availability(&self.table, pathid, self.arena, hash)
     }
 
-    fn readdir(
+    fn readdir<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
-        pathid: PathId,
+        loc: L,
     ) -> impl Iterator<Item = Result<(String, PathId, PathAssignment), StorageError>> {
-        ReadDirIterator::new(&self.table, tree, pathid)
+        ReadDirIterator::new(&self.table, tree, loc)
     }
 
     fn get_at_pathid(&self, pathid: PathId) -> Result<Option<FileTableEntry>, StorageError> {
@@ -174,14 +186,22 @@ pub(crate) trait CacheExt {
         loc: L,
     ) -> Result<FileTableEntry, StorageError>;
 
-    fn file_metadata(&self, pathid: PathId) -> Result<FileMetadata, StorageError>;
+    fn file_metadata<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<FileMetadata, StorageError>;
 }
 
 impl<T: CacheReadOperations> CacheExt for T {
-    fn file_metadata(&self, pathid: PathId) -> Result<FileMetadata, StorageError> {
+    fn file_metadata<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<FileMetadata, StorageError> {
         let FileTableEntry {
             size, mtime, hash, ..
-        } = self.get_at_pathid(pathid)?.ok_or(StorageError::NotFound)?;
+        } = self.get(tree, loc)?.ok_or(StorageError::NotFound)?;
 
         Ok(FileMetadata { size, mtime, hash })
     }
@@ -242,16 +262,15 @@ impl<'a> WritableOpenCache<'a> {
     /// Remove file locally, even though it might still be available in other peers.
     ///
     /// Also lets other peers know about this local change.
-    pub(crate) fn unlink(
+    pub(crate) fn unlink<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree,
         blobs: &mut WritableOpenBlob,
         history: &mut WritableOpenHistory,
         dirty: &mut WritableOpenDirty,
-        parent: PathId,
-        name: &str,
+        loc: L,
     ) -> Result<(), StorageError> {
-        let pathid = tree.lookup(parent, name)?.ok_or(StorageError::NotFound)?;
+        let pathid = tree.expect(loc)?;
         let e = get_file_entry(&self.table, pathid, None)?.ok_or(StorageError::NotFound)?;
         log::debug!(
             "[{}]@local Local removal of \"{}\" pathid {pathid} {}",
@@ -259,28 +278,31 @@ impl<'a> WritableOpenCache<'a> {
             e.path,
             e.hash
         );
-        self.rm_default_file_entry(tree, blobs, dirty, parent, pathid)?;
+        self.rm_default_file_entry(tree, blobs, dirty, pathid)?;
         history.report_removed(&e.path, &e.hash)?;
 
         Ok(())
     }
 
     /// Branch a file to another location in the tree.
-    pub(crate) fn branch(
+    pub(crate) fn branch<'l1, 'l2, L1: Into<TreeLoc<'l1>>, L2: Into<TreeLoc<'l2>>>(
         &mut self,
         tree: &mut WritableOpenTree,
         blobs: &mut WritableOpenBlob,
         history: &mut WritableOpenHistory,
         dirty: &mut WritableOpenDirty,
-        source: PathId,
-        parent: PathId,
-        name: &str,
+        source: L1,
+        dest: L2,
     ) -> Result<(PathId, FileMetadata), StorageError> {
-        let mut entry = self.get_at_pathid_or_err(source)?;
-        let dest = tree.setup_name(parent, name)?;
-        entry.branched_from = Some(source);
-        let old_hash = self.get_at_pathid(dest)?.map(|e| e.hash);
-        self.write_default_file_entry(tree, blobs, dirty, dest, &entry)?;
+        let source = source.into();
+        let dest = dest.into();
+        let source_pathid = tree.expect(source.borrow())?;
+        let mut entry = self.get_at_pathid_or_err(source_pathid)?;
+        entry.branched_from = Some(source_pathid);
+        let dest_pathid = tree.setup(dest.borrow())?;
+        let old_hash = self.get_at_pathid(dest_pathid)?.map(|e| e.hash);
+        check_parent_is_dir(&self.table, tree, dest_pathid)?;
+        self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &entry)?;
 
         if let (Some(source_path), Some(dest_path)) =
             (tree.backtrack(source)?, tree.backtrack(dest)?)
@@ -289,7 +311,7 @@ impl<'a> WritableOpenCache<'a> {
         }
 
         Ok((
-            dest,
+            dest_pathid,
             FileMetadata {
                 size: entry.size,
                 mtime: entry.mtime,
@@ -307,11 +329,7 @@ impl<'a> WritableOpenCache<'a> {
         if self.table.get(CacheTableKey::Default(pathid))?.is_some() {
             return Err(StorageError::AlreadyExists);
         }
-        if let Some(parent) = tree.parent(pathid)? {
-            // The parent must exist and be a directory. Note that
-            // None is the arena root which always exist.
-            check_is_dir(&self.table, parent)?;
-        }
+        check_parent_is_dir(&self.table, tree, pathid)?;
         let mtime = UnixTime::now();
         write_dir_mtime(&mut self.table, tree, pathid, mtime)?;
 
@@ -356,7 +374,7 @@ impl<'a> WritableOpenCache<'a> {
         size: u64,
         hash: Hash,
     ) -> Result<(), StorageError> {
-        let (_, file_pathid) = create_file(&mut self.table, tree, &path)?;
+        let file_pathid = tree.setup(&path)?;
         let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
         if get_file_entry(&self.table, file_pathid, Some(peer))?.is_none() {
             log::debug!("[{}]@{peer} Add \"{path}\" {hash} size={size}", self.arena);
@@ -383,25 +401,26 @@ impl<'a> WritableOpenCache<'a> {
         hash: &Hash,
         old_hash: &Hash,
     ) -> Result<(), StorageError> {
-        let (_, file_pathid) = create_file(&mut self.table, tree, &path)?;
-        let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
-        if let Some(e) = get_file_entry(&self.table, file_pathid, Some(peer))?
-            && e.hash == *old_hash
-        {
-            log::debug!(
-                "[{}]@{peer} \"{path}\" {hash} size={size} replaces {old_hash}",
-                self.arena
-            );
-            self.write_file_entry(tree, file_pathid, peer, &entry)?;
-        }
-        if let Some(old_entry) = get_file_entry(&self.table, file_pathid, None)?
-            && old_entry.hash == *old_hash
-        {
-            log::debug!(
-                "[{}]@local \"{path}\" {hash} size={size} replaces {old_hash}",
-                self.arena
-            );
-            self.write_default_file_entry(tree, blobs, dirty, file_pathid, &entry)?;
+        if let Some(file_pathid) = tree.resolve(path)? {
+            let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
+            if let Some(e) = get_file_entry(&self.table, file_pathid, Some(peer))?
+                && e.hash == *old_hash
+            {
+                log::debug!(
+                    "[{}]@{peer} \"{path}\" {hash} size={size} replaces {old_hash}",
+                    self.arena
+                );
+                self.write_file_entry(tree, file_pathid, peer, &entry)?;
+            }
+            if let Some(old_entry) = get_file_entry(&self.table, file_pathid, None)?
+                && old_entry.hash == *old_hash
+            {
+                log::debug!(
+                    "[{}]@local \"{path}\" {hash} size={size} replaces {old_hash}",
+                    self.arena
+                );
+                self.write_default_file_entry(tree, blobs, dirty, file_pathid, &entry)?;
+            }
         }
         Ok(())
     }
@@ -432,7 +451,7 @@ impl<'a> WritableOpenCache<'a> {
         size: u64,
         hash: Hash,
     ) -> Result<(), StorageError> {
-        let (_, file_pathid) = create_file(&mut self.table, tree, &path)?;
+        let file_pathid = tree.setup(&path)?;
         unmark_peer_file(&mut self.pending_catchup_table, peer, file_pathid)?;
         let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
         if let Some(e) = get_file_entry(&self.table, file_pathid, None)?
@@ -488,12 +507,17 @@ impl<'a> WritableOpenCache<'a> {
         new_entry: &FileTableEntry,
     ) -> Result<(), StorageError> {
         self.before_default_file_entry_change(tree, blobs, dirty, pathid)?;
-        tree.insert_and_incref(
+        if tree.insert_and_incref(
             pathid,
             &mut self.table,
             CacheTableKey::Default(pathid),
             Holder::new(&CacheTableEntry::File(new_entry.clone()))?,
-        )?;
+        )? {
+            // Update the parent directory mtime since we're adding a file to it
+            if let Some(parent_pathid) = tree.parent(pathid)? {
+                write_dir_mtime(&mut self.table, tree, parent_pathid, UnixTime::now())?;
+            }
+        }
 
         Ok(())
     }
@@ -525,7 +549,11 @@ impl<'a> WritableOpenCache<'a> {
         peer: Peer,
     ) -> Result<(), StorageError> {
         // Remove the entry
-        tree.remove_and_decref(pathid, &mut self.table, CacheTableKey::PeerCopy(pathid, peer))?;
+        tree.remove_and_decref(
+            pathid,
+            &mut self.table,
+            CacheTableKey::PeerCopy(pathid, peer),
+        )?;
 
         Ok(())
     }
@@ -536,15 +564,21 @@ impl<'a> WritableOpenCache<'a> {
         tree: &mut WritableOpenTree,
         blobs: &mut WritableOpenBlob,
         dirty: &mut WritableOpenDirty,
-        parent_pathid: PathId,
         pathid: PathId,
     ) -> Result<(), StorageError> {
-        self.before_default_file_entry_change(tree, blobs, dirty, pathid)?;
-        tree.remove_and_decref(pathid, &mut self.table, CacheTableKey::Default(pathid))?;
+        // We check the parent before removing, since the link to
+        // parent might not exist anymore afterwards if the pathid is
+        // deleted as well.
+        let parent = tree.parent(pathid)?;
 
-        // Update the parent modification time, as removing an
-        // entry modifies it.
-        write_dir_mtime(&mut self.table, tree, parent_pathid, UnixTime::now())?;
+        self.before_default_file_entry_change(tree, blobs, dirty, pathid)?;
+        if tree.remove_and_decref(pathid, &mut self.table, CacheTableKey::Default(pathid))? {
+            // Update the parent modification time, as removing an
+            // entry modifies it.
+            if let Some(parent) = parent {
+                write_dir_mtime(&mut self.table, tree, parent, UnixTime::now())?;
+            }
+        }
 
         Ok(())
     }
@@ -564,35 +598,26 @@ impl<'a> WritableOpenCache<'a> {
         T: AsRef<Path>,
     {
         let path = path.as_ref();
-        let parent_pathid = {
-            if let Some(parent_path) = path.parent() {
-                tree.resolve(parent_path)?
-            } else {
-                Some(tree.root())
+        if let Some(pathid) = tree.resolve(path)? {
+            if let Some(e) = get_file_entry(&self.table, pathid, Some(peer))?
+                && e.hash == *old_hash
+            {
+                log::debug!(
+                    "[{}]@{peer} Remove \"{path}\" pathid {pathid} {old_hash}",
+                    self.arena
+                );
+
+                self.rm_peer_file_entry(tree, pathid, peer)?;
             }
-        };
-        if let Some(parent_pathid) = parent_pathid {
-            if let Some(pathid) = tree.lookup(parent_pathid, path.name())? {
-                if let Some(e) = get_file_entry(&self.table, pathid, Some(peer))?
+            if !dropped {
+                if let Some(e) = get_file_entry(&self.table, pathid, None)?
                     && e.hash == *old_hash
                 {
                     log::debug!(
-                        "[{}]@{peer} Remove \"{path}\" pathid {pathid} {old_hash}",
+                        "[{}]@local Remove \"{path}\" pathid {pathid} {old_hash}",
                         self.arena
                     );
-
-                    self.rm_peer_file_entry(tree, pathid, peer)?;
-                }
-                if !dropped {
-                    if let Some(e) = get_file_entry(&self.table, pathid, None)?
-                        && e.hash == *old_hash
-                    {
-                        log::debug!(
-                            "[{}]@local Remove \"{path}\" pathid {pathid} {old_hash}",
-                            self.arena
-                        );
-                        self.rm_default_file_entry(tree, blobs, dirty, parent_pathid, pathid)?;
-                    }
+                    self.rm_default_file_entry(tree, blobs, dirty, pathid)?;
                 }
             }
         }
@@ -610,12 +635,10 @@ impl<'a> WritableOpenCache<'a> {
     ) -> Result<(), StorageError> {
         let peer_str = peer.as_str();
         let mut pathids = vec![];
-        for elt in self
-            .pending_catchup_table
-            .extract_from_if((peer_str, PathId::ZERO)..=(peer_str, PathId::MAX), |_, _| {
-                true
-            })?
-        {
+        for elt in self.pending_catchup_table.extract_from_if(
+            (peer_str, PathId::ZERO)..=(peer_str, PathId::MAX),
+            |_, _| true,
+        )? {
             let elt = elt?;
             let (_, pathid) = elt.0.value();
             pathids.push(pathid);
@@ -624,11 +647,9 @@ impl<'a> WritableOpenCache<'a> {
             self.rm_peer_file_entry(tree, pathid, peer)?;
             if let Some(entry) = self.get_at_pathid(pathid)? {
                 if self.file_availability(pathid, &entry.hash)?.is_none() {
-                    if let Some(parent_pathid) = tree.parent(pathid)? {
-                        // If the file has become unavailable because of
-                        // this removal, remove the file itself as well.
-                        self.rm_default_file_entry(tree, blobs, dirty, parent_pathid, pathid)?;
-                    }
+                    // If the file has become unavailable because of
+                    // this removal, remove the file itself as well.
+                    self.rm_default_file_entry(tree, blobs, dirty, pathid)?;
                 }
             }
         }
@@ -660,14 +681,12 @@ pub(crate) fn init(
 }
 
 /// Lookup a specific name in the given directory pathid.
-fn lookup(
+fn lookup<'b, L: Into<TreeLoc<'b>>>(
     cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
     tree: &impl TreeReadOperations,
-    parent_pathid: PathId,
-    name: &str,
+    loc: L,
 ) -> Result<(PathId, PathAssignment), StorageError> {
-    check_is_dir(cache_table, parent_pathid)?;
-    if let Some(pathid) = tree.lookup(parent_pathid, name)? {
+    if let Some(pathid) = tree.resolve(loc)? {
         if let Some(assignment) = pathid_assignment(cache_table, pathid)? {
             return Ok((pathid, assignment));
         }
@@ -677,10 +696,12 @@ fn lookup(
 }
 
 /// Get directory modification time for the given pathid.
-fn dir_mtime(
+fn dir_mtime<'b, L: Into<TreeLoc<'b>>>(
     cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
-    pathid: PathId,
+    tree: &impl TreeReadOperations,
+    loc: L,
 ) -> Result<UnixTime, StorageError> {
+    let pathid = tree.expect(loc)?;
     let e = cache_table
         .get(CacheTableKey::Default(pathid))?
         .ok_or(StorageError::NotFound)?;
@@ -745,12 +766,17 @@ impl<'a, 'b, T> ReadDirIterator<'a, 'b, T>
 where
     T: ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
 {
-    fn new(table: &'a T, tree: &'b impl TreeReadOperations, pathid: PathId) -> Self {
+    fn new<'l, L: Into<TreeLoc<'l>>>(
+        table: &'a T,
+        tree: &'b impl TreeReadOperations,
+        loc: L,
+    ) -> Self {
         ReadDirIterator {
             table,
-            iter: match check_is_dir(table, pathid) {
+            iter: match lookup(table, tree, loc) {
                 Err(err) => tree::ReadDirIterator::failed(err),
-                Ok(_) => tree.readdir_pathid(pathid),
+                Ok((pathid, PathAssignment::Directory)) => tree.readdir_pathid(pathid),
+                Ok(_) => tree::ReadDirIterator::failed(StorageError::NotADirectory),
             },
         }
     }
@@ -829,15 +855,14 @@ impl ArenaCache {
         self.arena
     }
 
-    pub(crate) fn lookup(
+    pub(crate) fn lookup<'b, L: Into<TreeLoc<'b>>>(
         &self,
-        parent_pathid: PathId,
-        name: &str,
+        loc: L,
     ) -> Result<(PathId, PathAssignment), StorageError> {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
-        cache.lookup(&tree, parent_pathid, name)
+        cache.lookup(&tree, loc)
     }
 
     pub(crate) fn expect<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<PathId, StorageError> {
@@ -857,29 +882,37 @@ impl ArenaCache {
         tree.resolve(loc)
     }
 
-    pub(crate) fn file_metadata(&self, pathid: PathId) -> Result<FileMetadata, StorageError> {
+    pub(crate) fn file_metadata<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        loc: L,
+    ) -> Result<FileMetadata, StorageError> {
         let txn = self.db.begin_read()?;
+        let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
-        cache.file_metadata(pathid)
+        cache.file_metadata(&tree, loc)
     }
 
-    pub(crate) fn dir_metadata(&self, pathid: PathId) -> Result<DirMetadata, StorageError> {
+    pub(crate) fn dir_metadata<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        loc: L,
+    ) -> Result<DirMetadata, StorageError> {
         let txn = self.db.begin_read()?;
+        let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
         Ok(DirMetadata {
             read_only: false,
-            mtime: cache.dir_mtime(pathid)?,
+            mtime: cache.dir_mtime(&tree, loc)?,
         })
     }
 
-    pub(crate) fn readdir(
+    pub(crate) fn readdir<'b, L: Into<TreeLoc<'b>>>(
         &self,
-        pathid: PathId,
+        loc: L,
     ) -> Result<Vec<(String, PathId, PathAssignment)>, StorageError> {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
-        cache.readdir(&tree, pathid).collect()
+        cache.readdir(&tree, loc).collect()
     }
 
     pub(crate) fn peer_progress(&self, peer: Peer) -> Result<Option<Progress>, StorageError> {
@@ -888,7 +921,7 @@ impl ArenaCache {
         peers.progress(peer)
     }
 
-    pub(crate) fn unlink(&self, parent: PathId, name: &str) -> Result<(), StorageError> {
+    pub(crate) fn unlink<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
         {
             let mut tree = txn.write_tree()?;
@@ -897,25 +930,17 @@ impl ArenaCache {
             let mut dirty = txn.write_dirty()?;
             let mut cache = txn.write_cache()?;
 
-            cache.unlink(
-                &mut tree,
-                &mut blobs,
-                &mut history,
-                &mut dirty,
-                parent,
-                name,
-            )?;
+            cache.unlink(&mut tree, &mut blobs, &mut history, &mut dirty, loc)?;
         }
         txn.commit()?;
 
         Ok(())
     }
 
-    pub(crate) fn branch(
+    pub(crate) fn branch<'l1, 'l2, L1: Into<TreeLoc<'l1>>, L2: Into<TreeLoc<'l2>>>(
         &self,
-        source: PathId,
-        parent: PathId,
-        name: &str,
+        source: L1,
+        dest: L2,
     ) -> Result<(PathId, FileMetadata), StorageError> {
         let txn = self.db.begin_write()?;
         let result = {
@@ -931,8 +956,7 @@ impl ArenaCache {
                 &mut history,
                 &mut dirty,
                 source,
-                parent,
-                name,
+                dest,
             )?
         };
         txn.commit()?;
@@ -950,11 +974,15 @@ impl ArenaCache {
     }
 
     /// Open a file for reading/writing.
-    pub(crate) fn open_file(&self, pathid: PathId) -> Result<Blob, StorageError> {
+    pub(crate) fn open_file<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> Result<Blob, StorageError> {
         // Optimistically, try a read transaction to check whether the
-        // blob is there.
+        // blob is there. The pathid is kept between transaction,
+        // since it's guaranteed not to change.
+        let pathid;
         {
             let txn = self.db.begin_read()?;
+            let tree = txn.read_tree()?;
+            pathid = tree.expect(loc)?;
             let blobs = txn.read_blobs()?;
             if let Some(info) = blobs.get_with_pathid(pathid)? {
                 return Blob::open_with_info(&self.db, info);
@@ -973,14 +1001,14 @@ impl ArenaCache {
         Ok(Blob::open_with_info(&self.db, info)?)
     }
 
-    pub(crate) fn local_availability(
+    pub(crate) fn local_availability<'b, L: Into<TreeLoc<'b>>>(
         &self,
-        pathid: PathId,
+        loc: L,
     ) -> Result<LocalAvailability, StorageError> {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
         let blobs = txn.read_blobs()?;
-        blobs.local_availability(&tree, pathid)
+        blobs.local_availability(&tree, loc)
     }
 
     /// Create a directory at the given path.
@@ -1061,49 +1089,6 @@ fn get_default_entry_or_err(
         .expect_file()
 }
 
-/// Retrieve or create a file entry at the given path.
-///
-/// Return the parent pathid and the file pathid.
-fn create_file<T>(
-    cache_table: &mut redb::Table<'_, CacheTableKey, Holder<CacheTableEntry>>,
-    tree: &mut WritableOpenTree,
-    path: T,
-) -> Result<(PathId, PathId), StorageError>
-where
-    T: AsRef<Path>,
-{
-    let path = path.as_ref();
-    let mut parent_pathid = tree.root();
-    for component in Path::components(path.parent().as_ref()) {
-        parent_pathid = setup_dir(cache_table, tree, parent_pathid, component)?;
-    }
-
-    let file_pathid = tree.setup_name(parent_pathid, path.name())?;
-
-    // Update the parent directory mtime since we're adding a file to it
-    write_dir_mtime(cache_table, tree, parent_pathid, UnixTime::now())?;
-
-    Ok((parent_pathid, file_pathid))
-}
-
-fn setup_dir(
-    cache_table: &mut redb::Table<'_, CacheTableKey, Holder<CacheTableEntry>>,
-    tree: &mut WritableOpenTree,
-    parent_pathid: PathId,
-    name: &str,
-) -> Result<PathId, StorageError> {
-    let pathid = tree.setup_name(parent_pathid, name)?;
-
-    if cache_table.get(CacheTableKey::Default(pathid))?.is_none() {
-        // new directory
-        let now = UnixTime::now();
-        write_dir_mtime(cache_table, tree, pathid, now)?;
-        write_dir_mtime(cache_table, tree, parent_pathid, now)?;
-    }
-
-    Ok(pathid)
-}
-
 /// Insert or update a directory entry in the cache table.
 ///
 /// The presence of this entry is what marks a directory as existing,
@@ -1114,12 +1099,17 @@ fn write_dir_mtime(
     pathid: PathId,
     mtime: UnixTime,
 ) -> Result<(), StorageError> {
-    tree.insert_and_incref(
+    if tree.insert_and_incref(
         pathid,
         cache_table,
         CacheTableKey::Default(pathid),
         Holder::with_content(CacheTableEntry::Dir(DirtableEntry { mtime }))?,
-    )?;
+    )? {
+        // Update the parent directory mtime since we're adding a directory to it.
+        if let Some(parent_pathid) = tree.parent(pathid)? {
+            write_dir_mtime(cache_table, tree, parent_pathid, UnixTime::now())?;
+        }
+    }
 
     Ok(())
 }
@@ -1147,6 +1137,21 @@ fn pathid_assignment(
         },
         None => Ok(None),
     }
+}
+
+/// The parent must exist and be a directory. This is typically used
+/// just before creating a file entry, to reproduce the strict behavior
+/// of filesystems.
+fn check_parent_is_dir(
+    cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    tree: &impl TreeReadOperations,
+    pathid: PathId,
+) -> Result<(), StorageError> {
+    if let Some(parent) = tree.parent(pathid)? {
+        check_is_dir(cache_table, parent)?;
+    }
+
+    Ok(())
 }
 
 /// Make sure the given pathid exists and is a directory.
@@ -1178,7 +1183,7 @@ mod tests {
     use crate::arena::types::DirMetadata;
     use crate::arena::types::HistoryTableEntry;
     use crate::utils::hash;
-    use crate::{PathId, PathAssignment, StorageError};
+    use crate::{PathAssignment, PathId, StorageError};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Hash, Path, Peer, UnixTime};
@@ -1356,10 +1361,10 @@ mod tests {
 
         fixture.add_to_cache(&file_path, 100, mtime)?;
 
-        let (pathid, assignment) = acache.lookup(fixture.db.tree().root(), "a")?;
+        let (pathid, assignment) = acache.lookup((fixture.db.tree().root(), "a"))?;
         assert_eq!(assignment, PathAssignment::Directory, "a");
 
-        let (_, assignment) = acache.lookup(pathid, "b")?;
+        let (_, assignment) = acache.lookup((pathid, "b"))?;
         assert_eq!(assignment, PathAssignment::Directory, "b");
 
         Ok(())
@@ -1374,9 +1379,9 @@ mod tests {
 
         fixture.add_to_cache(&file_path, 100, mtime)?;
 
-        let (a, _) = acache.lookup(fixture.db.tree().root(), "a")?;
-        let (b, _) = acache.lookup(a, "b")?;
-        let (c, _) = acache.lookup(b, "c.txt")?;
+        let (a, _) = acache.lookup((fixture.db.tree().root(), "a"))?;
+        let (b, _) = acache.lookup((a, "b"))?;
+        let (c, _) = acache.lookup((b, "c.txt"))?;
 
         {
             let txn = fixture.db.begin_read()?;
@@ -1392,7 +1397,7 @@ mod tests {
 
         fixture.remove_from_cache(&file_path)?;
 
-        assert!(acache.lookup(b, "c.txt").is_err());
+        assert!(acache.lookup((b, "c.txt")).is_err());
         {
             let txn = fixture.db.begin_read()?;
             let tree = txn.read_tree()?;
@@ -1628,10 +1633,10 @@ mod tests {
 
         fixture.add_to_cache(&file_path, 100, mtime)?;
         let arena_root = fixture.db.tree().root();
-        acache.lookup(arena_root, "file.txt")?;
+        acache.lookup((arena_root, "file.txt"))?;
         fixture.remove_from_cache(&file_path)?;
         assert!(matches!(
-            acache.lookup(arena_root, "file.txt"),
+            acache.lookup((arena_root, "file.txt")),
             Err(StorageError::NotFound)
         ));
 
@@ -1647,7 +1652,7 @@ mod tests {
 
         fixture.add_to_cache(&file_path, 100, mtime)?;
         let arena_root = fixture.db.tree().root();
-        let (pathid, _) = acache.lookup(arena_root, "file.txt")?;
+        let (pathid, _) = acache.lookup((arena_root, "file.txt"))?;
 
         fixture.clear_dirty()?;
         fixture.remove_from_cache(&file_path)?;
@@ -1757,7 +1762,7 @@ mod tests {
             Err(StorageError::NotFound)
         ));
         assert!(matches!(
-            acache.lookup(fixture.db.tree().root(), "file.txt"),
+            acache.lookup((fixture.db.tree().root(), "file.txt")),
             Err(StorageError::NotFound)
         ));
 
@@ -1833,11 +1838,11 @@ mod tests {
         fixture.add_to_cache(&file_path, 100, mtime)?;
 
         // Lookup directory
-        let (pathid, assignment) = acache.lookup(fixture.db.tree().root(), "a")?;
+        let (pathid, assignment) = acache.lookup((fixture.db.tree().root(), "a"))?;
         assert_eq!(assignment, PathAssignment::Directory);
 
         // Lookup file
-        let (pathid, assignment) = acache.lookup(pathid, "file.txt")?;
+        let (pathid, assignment) = acache.lookup((pathid, "file.txt"))?;
         assert_eq!(assignment, PathAssignment::File);
 
         let metadata = acache.file_metadata(pathid)?;
@@ -1853,7 +1858,7 @@ mod tests {
         let acache = &fixture.acache;
 
         assert!(matches!(
-            acache.lookup(fixture.db.tree().root(), "nonexistent"),
+            acache.lookup((fixture.db.tree().root(), "nonexistent")),
             Err(StorageError::NotFound),
         ));
 
@@ -1899,7 +1904,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
 
-        let (pathid, _) = acache.lookup(arena_root, "dir")?;
+        let (pathid, _) = acache.lookup((arena_root, "dir"))?;
         assert_unordered::assert_eq_unordered!(
             vec![
                 ("file1.txt".to_string(), PathAssignment::File),
@@ -1964,7 +1969,7 @@ mod tests {
             None,
         )?;
 
-        let (pathid, _) = acache.lookup(fixture.db.tree().root(), "file.txt")?;
+        let (pathid, _) = acache.lookup((fixture.db.tree().root(), "file.txt"))?;
         let metadata = acache.file_metadata(pathid)?;
         assert_eq!(metadata.size, 200);
         assert_eq!(metadata.mtime, later_time());
@@ -2267,7 +2272,7 @@ mod tests {
             },
             None,
         )?;
-        let (pathid, _) = acache.lookup(fixture.db.tree().root(), "file.txt")?;
+        let (pathid, _) = acache.lookup((fixture.db.tree().root(), "file.txt"))?;
         {
             let txn = fixture.db.begin_read()?;
             let cache = txn.read_cache()?;
@@ -2565,16 +2570,16 @@ mod tests {
         fixture.add_to_cache(&file_path, 100, mtime)?;
         let arena_root = fixture.db.tree().root();
 
-        let (pathid, _) = acache.lookup(arena_root, "file.txt")?;
+        let (pathid, _) = acache.lookup((arena_root, "file.txt"))?;
         assert!(acache.file_metadata(pathid).is_ok());
 
         fixture.clear_dirty()?;
         let dir_mtime_before = acache.dir_metadata(arena_root)?.mtime;
 
-        acache.unlink(arena_root, "file.txt")?;
+        acache.unlink((arena_root, "file.txt"))?;
 
         assert!(matches!(
-            acache.lookup(arena_root, "file.txt"),
+            acache.lookup((arena_root, "file.txt")),
             Err(StorageError::NotFound)
         ));
         assert!(matches!(
@@ -2635,8 +2640,7 @@ mod tests {
             &mut history,
             &mut dirty,
             source_pathid,
-            dir_pathid,
-            "dest",
+            (dir_pathid, "dest"),
         )?;
 
         let dest_pathid = tree.expect(&dest_path)?;
@@ -2657,7 +2661,7 @@ mod tests {
                 mtime: test_time(),
                 hash: hash.clone(),
             },
-            cache.file_metadata(dest_pathid)?
+            cache.file_metadata(&tree, dest_pathid)?
         );
         let avail = cache.file_availability(dest_pathid, &hash)?.unwrap();
         assert_eq!(source_path, avail.path);
@@ -2681,7 +2685,7 @@ mod tests {
                 mtime: test_time(),
                 hash: hash.clone(),
             },
-            cache.file_metadata(dest_pathid)?
+            cache.file_metadata(&tree, dest_pathid)?
         );
         let avail = cache.file_availability(dest_pathid, &hash)?.unwrap();
         assert_eq!(dest_path, avail.path);
@@ -2718,11 +2722,11 @@ mod tests {
         assert!(metadata.mtime > UnixTime::ZERO);
 
         // Verify directory entry exists in cache by checking dir_mtime
-        let mtime = cache.dir_mtime(pathid)?;
+        let mtime = cache.dir_mtime(&tree, pathid)?;
         assert!(mtime > UnixTime::ZERO);
 
         // Verify parent directory mtime was updated
-        let parent_mtime = cache.dir_mtime(fixture.db.tree().root())?;
+        let parent_mtime = cache.dir_mtime(&tree, fixture.db.tree().root())?;
         assert!(parent_mtime > UnixTime::ZERO);
 
         Ok(())
@@ -2743,9 +2747,9 @@ mod tests {
         let (b_pathid, _) = cache.mkdir(&mut tree, Path::parse("a/b")?)?;
         let (c_pathid, _) = cache.mkdir(&mut tree, Path::parse("a/b/c")?)?;
 
-        assert!(cache.dir_mtime(a_pathid).is_ok());
-        assert!(cache.dir_mtime(b_pathid).is_ok());
-        assert!(cache.dir_mtime(c_pathid).is_ok());
+        assert!(cache.dir_mtime(&tree, a_pathid).is_ok());
+        assert!(cache.dir_mtime(&tree, b_pathid).is_ok());
+        assert!(cache.dir_mtime(&tree, c_pathid).is_ok());
 
         Ok(())
     }
@@ -2926,13 +2930,13 @@ mod tests {
         let (child_pathid, _) = cache.mkdir(&mut tree, &child_path)?;
 
         // Get parent mtime before removal
-        let parent_mtime_before = cache.dir_mtime(parent_pathid)?;
+        let parent_mtime_before = cache.dir_mtime(&tree, parent_pathid)?;
 
         // Remove child directory
         cache.rmdir(&mut tree, &child_path)?;
 
         // Verify parent mtime was updated (should be >= since operations can be fast)
-        let parent_mtime_after = cache.dir_mtime(parent_pathid)?;
+        let parent_mtime_after = cache.dir_mtime(&tree, parent_pathid)?;
         assert!(parent_mtime_after >= parent_mtime_before);
 
         // Verify child is gone

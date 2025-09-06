@@ -108,7 +108,11 @@ pub(crate) trait TreeReadOperations {
     fn parent(&self, pathid: PathId) -> Result<Option<PathId>, StorageError>;
 
     /// Return the name {pathid} can be found in in {parent_pathid}.
-    fn name_in(&self, parent_pathid: PathId, pathid: PathId) -> Result<Option<String>, StorageError>;
+    fn name_in(
+        &self,
+        parent_pathid: PathId,
+        pathid: PathId,
+    ) -> Result<Option<String>, StorageError>;
 
     /// Returns the arena this tree belongs to.
     fn arena(&self) -> Arena;
@@ -133,7 +137,11 @@ where
     fn parent(&self, pathid: PathId) -> Result<Option<PathId>, StorageError> {
         parent(&self.table, pathid)
     }
-    fn name_in(&self, parent_pathid: PathId, pathid: PathId) -> Result<Option<String>, StorageError> {
+    fn name_in(
+        &self,
+        parent_pathid: PathId,
+        pathid: PathId,
+    ) -> Result<Option<String>, StorageError> {
         name_in(&self.table, parent_pathid, pathid)
     }
     fn arena(&self) -> Arena {
@@ -157,7 +165,11 @@ impl<'a> TreeReadOperations for WritableOpenTree<'a> {
     fn parent(&self, pathid: PathId) -> Result<Option<PathId>, StorageError> {
         parent(&self.table, pathid)
     }
-    fn name_in(&self, parent_pathid: PathId, pathid: PathId) -> Result<Option<String>, StorageError> {
+    fn name_in(
+        &self,
+        parent_pathid: PathId,
+        pathid: PathId,
+    ) -> Result<Option<String>, StorageError> {
         name_in(&self.table, parent_pathid, pathid)
     }
     fn arena(&self) -> Arena {
@@ -309,10 +321,12 @@ impl<T: TreeReadOperations> TreeExt for T {
             TreeLoc::PathId(pathid) => Ok(pathid),
             TreeLoc::PathRef(path) => resolve_path_partial(self, path),
             TreeLoc::Path(path) => resolve_path_partial(self, &path),
-            TreeLoc::PathIdAndName(pathid, name) => match self.lookup_pathid(pathid, name.as_ref())? {
-                None => Ok(pathid),
-                Some(pathid) => Ok(pathid),
-            },
+            TreeLoc::PathIdAndName(pathid, name) => {
+                match self.lookup_pathid(pathid, name.as_ref())? {
+                    None => Ok(pathid),
+                    Some(pathid) => Ok(pathid),
+                }
+            }
         }
     }
 
@@ -728,7 +742,11 @@ impl<'a> WritableOpenTree<'a> {
     /// Caller must make sure of incrementing reference count.
     ///
     /// Return (pathid, added), with added true if the pathid is new.
-    fn add_name(&mut self, parent_pathid: PathId, name: &str) -> Result<(PathId, bool), StorageError> {
+    fn add_name(
+        &mut self,
+        parent_pathid: PathId,
+        name: &str,
+    ) -> Result<(PathId, bool), StorageError> {
         match get_pathid(&self.table, parent_pathid, name)? {
             Some(pathid) => Ok((pathid, false)),
             None => {

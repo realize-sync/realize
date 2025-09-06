@@ -128,7 +128,7 @@ impl GlobalCache {
             match this.allocator.arena_for_pathid(&txn, parent_pathid)? {
                 Some(arena) => {
                     let cache = this.arena_cache(arena)?;
-                    cache.lookup(parent_pathid, &name)
+                    cache.lookup((parent_pathid, &name))
                 }
                 None => match this.paths.get(&parent_pathid) {
                     None => Err(StorageError::NotFound),
@@ -184,7 +184,10 @@ impl GlobalCache {
     }
 
     /// Return the mtime of the directory.
-    pub async fn dir_metadata(self: &Arc<Self>, pathid: PathId) -> Result<DirMetadata, StorageError> {
+    pub async fn dir_metadata(
+        self: &Arc<Self>,
+        pathid: PathId,
+    ) -> Result<DirMetadata, StorageError> {
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
@@ -223,7 +226,9 @@ impl GlobalCache {
                     None => Err(StorageError::NotFound),
                     Some(IntermediatePath { entries, .. }) => Ok(entries
                         .iter()
-                        .map(|(name, pathid)| (name.to_string(), *pathid, PathAssignment::Directory))
+                        .map(|(name, pathid)| {
+                            (name.to_string(), *pathid, PathAssignment::Directory)
+                        })
                         .collect()),
                 },
             }
@@ -317,7 +322,7 @@ impl GlobalCache {
             match this.allocator.arena_for_pathid(&txn, parent_pathid)? {
                 Some(arena) => {
                     let cache = this.arena_cache(arena)?;
-                    cache.unlink(parent_pathid, &name)
+                    cache.unlink((parent_pathid, &name))
                 }
                 None => {
                     if this
@@ -355,7 +360,7 @@ impl GlobalCache {
             match source_arena {
                 Some(arena) => {
                     let cache = this.arena_cache(arena)?;
-                    cache.branch(source, parent, &name)
+                    cache.branch(source, (parent, &name))
                 }
                 None => {
                     if this.paths.get(&source).is_some() {
@@ -470,7 +475,13 @@ fn add_arena_root(
     let mut current_name = names.next().unwrap();
     for dirname in names {
         let entry = get_or_add_path_entry(txn, path_table, allocator, dirname)?;
-        add_intermediate_path_entry(entry.pathid, entry.mtime, current_name, current_pathid, paths);
+        add_intermediate_path_entry(
+            entry.pathid,
+            entry.mtime,
+            current_name,
+            current_pathid,
+            paths,
+        );
         current_name = dirname;
         current_pathid = entry.pathid;
     }
