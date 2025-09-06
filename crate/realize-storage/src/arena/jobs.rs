@@ -3,7 +3,7 @@ use super::engine::{Engine, StorageJob};
 use crate::arena::arena_cache::CacheReadOperations;
 use crate::arena::index::{self, IndexReadOperations};
 use crate::arena::tree::TreeExt;
-use crate::{PathId, JobId, JobStatus, StorageError};
+use crate::{JobId, JobStatus, PathId, StorageError};
 use realize_types::Hash;
 use std::fs::File;
 use std::path::PathBuf;
@@ -279,7 +279,7 @@ mod tests {
     use super::*;
     use crate::arena::index::IndexedFile;
     use crate::utils::hash;
-    use crate::{ArenaCache, Blob, PathId, LocalAvailability, Mark, Notification};
+    use crate::{ArenaCache, Blob, LocalAvailability, Mark, Notification, PathId};
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
@@ -436,8 +436,8 @@ mod tests {
         }
 
         fn find_in_cache(&self, path_str: &str) -> Result<Option<PathId>, StorageError> {
-            match self.cache.expect(&Path::parse(path_str)?) {
-                Ok(pathid) => Ok(Some(pathid)),
+            match self.cache.lookup(&Path::parse(path_str)?) {
+                Ok((pathid, _)) => Ok(Some(pathid)),
                 Err(StorageError::NotFound) => Ok(None),
                 Err(err) => Err(err),
             }
@@ -610,7 +610,9 @@ mod tests {
 
         let txn = fixture.db.begin_read()?;
         let index = txn.read_index()?;
-        let indexed = index.get_at_pathid(pathid)?.expect("must have been indexed");
+        let indexed = index
+            .get_at_pathid(pathid)?
+            .expect("must have been indexed");
         assert_eq!(hash, indexed.hash);
         assert_eq!(test_time(), indexed.mtime);
 
@@ -652,7 +654,9 @@ mod tests {
 
         let txn = fixture.db.begin_read()?;
         let index = txn.read_index()?;
-        let indexed = index.get_at_pathid(pathid)?.expect("must have been indexed");
+        let indexed = index
+            .get_at_pathid(pathid)?
+            .expect("must have been indexed");
         assert_eq!(new_hash, indexed.hash);
         assert_eq!(test_time(), indexed.mtime);
         assert_eq!(None, indexed.outdated_by);

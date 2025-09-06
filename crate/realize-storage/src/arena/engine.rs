@@ -8,7 +8,7 @@ use super::tree::{TreeExt, TreeLoc};
 use super::types::LocalAvailability;
 use crate::arena::tree::TreeReadOperations;
 use crate::types::JobId;
-use crate::{PathId, Mark, StorageError};
+use crate::{Mark, PathId, StorageError};
 use realize_types::{Arena, Hash, Path, UnixTime};
 use std::sync::Arc;
 use std::time::Duration;
@@ -607,8 +607,8 @@ mod tests {
     use super::*;
     use crate::Blob;
     use crate::GlobalDatabase;
-    use crate::PathIdAllocator;
     use crate::Notification;
+    use crate::PathIdAllocator;
     use crate::arena::arena_cache::ArenaCache;
     use crate::arena::index;
     use crate::arena::mark;
@@ -852,9 +852,8 @@ mod tests {
 
         mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
-        let pathid = fixture.acache.expect(&barfile)?;
         {
-            let mut blob = fixture.acache.open_file(pathid)?;
+            let mut blob = fixture.acache.open_file(&barfile)?;
             blob.write_all(b"te").await?;
             blob.update_db().await?;
         }
@@ -882,9 +881,8 @@ mod tests {
 
         mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
-        let pathid = fixture.acache.expect(&barfile)?;
         {
-            let mut blob = fixture.acache.open_file(pathid)?;
+            let mut blob = fixture.acache.open_file(&barfile)?;
             blob.write_all(b"test").await?;
             blob.update_db().await?;
         }
@@ -913,9 +911,8 @@ mod tests {
 
         mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
-        let pathid = fixture.acache.expect(&barfile)?;
         {
-            let mut blob = fixture.acache.open_file(pathid)?;
+            let mut blob = fixture.acache.open_file(&barfile)?;
             blob.write_all(b"test").await?;
             blob.mark_verified().await?;
         }
@@ -982,17 +979,16 @@ mod tests {
 
         mark::set_arena_mark(&fixture.db, Mark::Own)?;
         fixture.add_file_to_cache(&foobar)?;
-        let pathid = fixture.acache.expect(&foobar)?;
 
         let mut job_stream = fixture.engine.job_stream();
 
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
         assert_eq!(
-            StorageJob::External(Job::Download(foobar, test_hash())),
+            StorageJob::External(Job::Download(foobar.clone(), test_hash())),
             job,
         );
         {
-            let mut blob = fixture.acache.open_file(pathid)?;
+            let mut blob = fixture.acache.open_file(&foobar)?;
             blob.write_all(b"test").await?;
             blob.mark_verified().await?;
         }
@@ -1000,6 +996,7 @@ mod tests {
 
         let (new_job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
         assert!(new_job_id > job_id);
+        let (pathid, _) = fixture.acache.lookup(&foobar)?;
         assert_eq!(StorageJob::Realize(pathid, test_hash(), None), job);
 
         Ok(())
@@ -1011,9 +1008,8 @@ mod tests {
         let foobar = Path::parse("foo/bar")?;
 
         fixture.add_file_to_cache(&foobar)?;
-        let pathid = fixture.acache.expect(&foobar)?;
         {
-            let mut blob = fixture.acache.open_file(pathid)?;
+            let mut blob = fixture.acache.open_file(&foobar)?;
             blob.write_all(b"te").await?;
         }
         // blob is partially available, but unprotected, going from
@@ -1027,6 +1023,7 @@ mod tests {
 
         mark::set(&fixture.db, &foobar, Mark::Own)?;
 
+        let (pathid, _) = fixture.acache.lookup(&foobar)?;
         let mut job_stream = fixture.engine.job_stream();
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
         assert_eq!(StorageJob::ProtectBlob(pathid), job,);
@@ -1067,9 +1064,8 @@ mod tests {
         mark::set(&fixture.db, &foobar, Mark::Keep)?;
         fixture.add_file_to_index_with_version(&foobar, test_hash())?;
         fixture.add_file_to_cache_with_version(&foobar, test_hash())?;
-        let pathid = fixture.acache.expect(&foobar)?;
         {
-            let mut blob = fixture.acache.open_file(pathid)?;
+            let mut blob = fixture.acache.open_file(&foobar)?;
             blob.write_all(b"te").await?;
         }
 
@@ -1084,6 +1080,7 @@ mod tests {
         let mut job_stream = fixture.engine.job_stream();
 
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
+        let (pathid, _) = fixture.acache.lookup(&foobar)?;
         assert_eq!(StorageJob::UnprotectBlob(pathid), job);
         let txn = fixture.db.begin_write()?;
         {
@@ -1109,9 +1106,8 @@ mod tests {
 
         mark::set_arena_mark(&fixture.db, Mark::Own)?;
         fixture.add_file_to_cache(&foobar)?;
-        let pathid = fixture.acache.expect(&foobar)?;
         {
-            let mut blob = fixture.acache.open_file(pathid)?;
+            let mut blob = fixture.acache.open_file(&foobar)?;
             blob.write_all(b"test").await?;
             blob.mark_verified().await?;
         }
@@ -1119,6 +1115,7 @@ mod tests {
         let mut job_stream = fixture.engine.job_stream();
 
         let (_, job) = next_with_timeout(&mut job_stream).await?.unwrap();
+        let (pathid, _) = fixture.acache.lookup(&foobar)?;
         assert_eq!(StorageJob::Realize(pathid, test_hash(), None), job);
 
         Ok(())
@@ -1163,9 +1160,8 @@ mod tests {
         fixture.add_file_to_cache_with_version(&foobar, Hash([1; 32]))?;
         fixture.add_file_to_index_with_version(&foobar, Hash([1; 32]))?;
         fixture.replace(&foobar, Hash([2; 32]), Hash([1; 32]))?;
-        let pathid = fixture.acache.expect(&foobar)?;
         {
-            let mut blob = fixture.acache.open_file(pathid)?;
+            let mut blob = fixture.acache.open_file(&foobar)?;
             blob.write_all(b"test").await?;
             blob.mark_verified().await?;
         }

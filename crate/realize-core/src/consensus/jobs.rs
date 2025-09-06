@@ -54,14 +54,7 @@ pub(crate) async fn download(
     shutdown: CancellationToken,
 ) -> Result<JobStatus, JobError> {
     log::debug!("[{arena}] Job #{job_id} Checking");
-    let cache = storage.cache();
-    let pathid = match cache.resolve(arena, path).await? {
-        Some(pathid) => pathid,
-        None => {
-            return Ok(JobStatus::Abandoned("not in cache"));
-        }
-    };
-    let mut blob = match storage.cache().open_file(pathid).await {
+    let mut blob = match storage.cache().open_file((arena, path)).await {
         Ok(blob) => blob,
         Err(StorageError::NotFound) => {
             return Ok(JobStatus::Abandoned("not in cache"));
@@ -334,11 +327,9 @@ mod tests {
 
         async fn open_file(&self, peer: Peer, path_str: &str) -> anyhow::Result<Blob> {
             let cache = self.inner.cache(peer)?;
-            let pathid = cache
-                .expect(HouseholdFixture::test_arena(), &Path::parse(path_str)?)
-                .await?;
-
-            Ok(cache.open_file(pathid).await?)
+            Ok(cache
+                .open_file((HouseholdFixture::test_arena(), &Path::parse(path_str)?))
+                .await?)
         }
 
         async fn set_blob_content(
@@ -372,11 +363,10 @@ mod tests {
             path_str: &str,
         ) -> anyhow::Result<LocalAvailability> {
             let cache = self.inner.cache(peer)?;
-            let pathid = cache
-                .expect(HouseholdFixture::test_arena(), &Path::parse(path_str)?)
-                .await?;
 
-            Ok(cache.local_availability(pathid).await?)
+            Ok(cache
+                .local_availability((HouseholdFixture::test_arena(), &Path::parse(path_str)?))
+                .await?)
         }
     }
 

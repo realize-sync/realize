@@ -30,9 +30,9 @@ pub use arena::notifier::Notification;
 pub use arena::notifier::Progress;
 pub use arena::types::{DirMetadata, FileAvailability, FileMetadata, LocalAvailability, Mark};
 pub use error::StorageError;
-pub use global::cache::GlobalCache;
+pub use global::cache::{GlobalCache, GlobalTreeLoc};
 pub use global::types::PathAssignment;
-pub use types::{PathId, JobId};
+pub use types::{JobId, PathId};
 
 /// Local storage, including the real store and an unreal cache.
 pub struct Storage {

@@ -41,9 +41,10 @@ pub(crate) trait CacheReadOperations {
     ) -> Result<UnixTime, StorageError>;
 
     /// Get remote file availability information for the given pathid and version.
-    fn file_availability(
+    fn file_availability<'b, L: Into<TreeLoc<'b>>>(
         &self,
-        pathid: PathId,
+        tree: &impl TreeReadOperations,
+        loc: L,
         hash: &Hash,
     ) -> Result<Option<FileAvailability>, StorageError>;
 
@@ -101,12 +102,13 @@ where
         dir_mtime(&self.table, tree, loc)
     }
 
-    fn file_availability(
+    fn file_availability<'b, L: Into<TreeLoc<'b>>>(
         &self,
-        pathid: PathId,
+        tree: &impl TreeReadOperations,
+        loc: L,
         hash: &Hash,
     ) -> Result<Option<FileAvailability>, StorageError> {
-        file_availability(&self.table, pathid, self.arena, hash)
+        file_availability(&self.table, tree, loc, self.arena, hash)
     }
 
     fn readdir<'b, L: Into<TreeLoc<'b>>>(
@@ -143,12 +145,13 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         dir_mtime(&self.table, tree, loc)
     }
 
-    fn file_availability(
+    fn file_availability<'b, L: Into<TreeLoc<'b>>>(
         &self,
-        pathid: PathId,
+        tree: &impl TreeReadOperations,
+        loc: L,
         hash: &Hash,
     ) -> Result<Option<FileAvailability>, StorageError> {
-        file_availability(&self.table, pathid, self.arena, hash)
+        file_availability(&self.table, tree, loc, self.arena, hash)
     }
 
     fn readdir<'b, L: Into<TreeLoc<'b>>>(
@@ -649,7 +652,7 @@ impl<'a> WritableOpenCache<'a> {
         for pathid in pathids {
             self.rm_peer_file_entry(tree, pathid, peer)?;
             if let Some(entry) = self.get_at_pathid(pathid)? {
-                if self.file_availability(pathid, &entry.hash)?.is_none() {
+                if self.file_availability(tree, pathid, &entry.hash)?.is_none() {
                     // If the file has become unavailable because of
                     // this removal, remove the file itself as well.
                     self.rm_default_file_entry(tree, blobs, dirty, pathid)?;
@@ -716,13 +719,15 @@ fn dir_mtime<'b, L: Into<TreeLoc<'b>>>(
 }
 
 /// Get file availability information for the given pathid.
-fn file_availability(
+fn file_availability<'b, L: Into<TreeLoc<'b>>>(
     cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
-    pathid: PathId,
+    tree: &impl TreeReadOperations,
+    loc: L,
     arena: Arena,
     hash: &Hash,
 ) -> Result<Option<FileAvailability>, StorageError> {
     let mut avail = None;
+    let pathid = tree.expect(loc)?;
     let mut next = Some(pathid);
     while let Some(pathid) = next
         && avail.is_none()
@@ -866,23 +871,6 @@ impl ArenaCache {
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
         cache.lookup(&tree, loc)
-    }
-
-    pub(crate) fn expect<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<PathId, StorageError> {
-        let txn = self.db.begin_read()?;
-        let tree = txn.read_tree()?;
-
-        tree.expect(loc)
-    }
-
-    pub(crate) fn resolve<'a, L: Into<TreeLoc<'a>>>(
-        &self,
-        loc: L,
-    ) -> Result<Option<PathId>, StorageError> {
-        let txn = self.db.begin_read()?;
-        let tree = txn.read_tree()?;
-
-        tree.resolve(loc)
     }
 
     pub(crate) fn file_metadata<'b, L: Into<TreeLoc<'b>>>(
@@ -1240,13 +1228,8 @@ mod tests {
             })
         }
 
-        fn dir_metadata<T>(&self, path: T) -> anyhow::Result<DirMetadata>
-        where
-            T: AsRef<Path>,
-        {
-            let path = path.as_ref();
-            let pathid = self.acache.expect(path)?;
-            Ok(self.acache.dir_metadata(pathid)?)
+        fn dir_metadata<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> anyhow::Result<DirMetadata> {
+            Ok(self.acache.dir_metadata(loc)?)
         }
 
         fn add_to_cache<T>(&self, path: T, size: u64, mtime: UnixTime) -> anyhow::Result<()>
@@ -1482,8 +1465,7 @@ mod tests {
             None,
         )?;
 
-        let pathid = acache.expect(&file_path)?;
-        let metadata = acache.file_metadata(pathid)?;
+        let metadata = acache.file_metadata(&file_path)?;
         assert_eq!(metadata.size, 200);
         assert_eq!(metadata.mtime, later_time());
 
@@ -1580,8 +1562,7 @@ mod tests {
         fixture.add_to_cache(&file_path, 200, test_time())?;
 
         let acache = &fixture.acache;
-        let pathid = acache.expect(&file_path)?;
-        let metadata = acache.file_metadata(pathid)?;
+        let metadata = acache.file_metadata(&file_path)?;
         assert_eq!(metadata.size, 100);
 
         Ok(())
@@ -1620,8 +1601,7 @@ mod tests {
             None,
         )?;
 
-        let pathid = acache.expect(&file_path)?;
-        let metadata = acache.file_metadata(pathid)?;
+        let metadata = acache.file_metadata(&file_path)?;
         assert_eq!(metadata.size, 100);
 
         Ok(())
@@ -1702,8 +1682,7 @@ mod tests {
         )?;
 
         // File should still exist because wrong hash was provided
-        let pathid = acache.expect(&file_path)?;
-        let metadata = acache.file_metadata(pathid)?;
+        let metadata = acache.file_metadata(&file_path)?;
         assert_eq!(metadata.size, 100);
 
         Ok(())
@@ -1743,8 +1722,7 @@ mod tests {
             None,
         )?;
 
-        let pathid = acache.expect(&file_path)?;
-        assert!(acache.file_metadata(pathid).is_ok());
+        assert!(acache.file_metadata(&file_path).is_ok());
 
         acache.update(
             peer1,
@@ -1761,7 +1739,7 @@ mod tests {
         // even though it's still available in peer2; this is
         // considered outdated.
         assert!(matches!(
-            acache.file_metadata(pathid),
+            acache.file_metadata(&file_path),
             Err(StorageError::NotFound)
         ));
         assert!(matches!(
@@ -1770,7 +1748,9 @@ mod tests {
         ));
 
         // PathId should still be resolvable, because some peers still have it.
-        assert_eq!(Some(pathid), acache.resolve(&file_path)?);
+        let txn = fixture.db.begin_read()?;
+        let tree = txn.read_tree()?;
+        assert!(tree.resolve(&file_path)?.is_some());
 
         Ok(())
     }
@@ -1809,8 +1789,7 @@ mod tests {
             None,
         )?;
 
-        let pathid = acache.expect(&file_path)?;
-        assert!(acache.file_metadata(pathid).is_ok());
+        assert!(acache.file_metadata(&file_path).is_ok());
 
         acache.update(
             peer1,
@@ -1825,7 +1804,7 @@ mod tests {
 
         // The default version has not been removed by this notification,
         // since this is a Drop, not a Remove.
-        assert!(acache.file_metadata(pathid).is_ok());
+        assert!(acache.file_metadata(&file_path).is_ok());
 
         Ok(())
     }
@@ -1878,8 +1857,7 @@ mod tests {
 
         fixture.add_to_cache(&path, 100, mtime)?;
 
-        let pathid = acache.expect(&path)?;
-        let metadata = acache.file_metadata(pathid)?;
+        let metadata = acache.file_metadata(&path)?;
         assert_eq!(metadata.mtime, mtime);
         assert_eq!(metadata.size, 100);
 
@@ -2031,8 +2009,9 @@ mod tests {
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
 
-        let pathid = tree.lookup(fixture.db.tree().root(), "file.txt")?.unwrap();
-        let avail = cache.file_availability(pathid, &Hash([1u8; 32]))?.unwrap();
+        let avail = cache
+            .file_availability(&tree, &path, &Hash([1u8; 32]))?
+            .unwrap();
         assert_eq!(arena, avail.arena);
         assert_eq!(path, avail.path);
         // Since they're just independent additions, the cache chooses
@@ -2044,12 +2023,15 @@ mod tests {
         assert_eq!(
             vec![c],
             cache
-                .file_availability(pathid, &Hash([2u8; 32]))?
+                .file_availability(&tree, &path, &Hash([2u8; 32]))?
                 .unwrap()
                 .peers
         );
 
-        assert_eq!(None, cache.file_availability(pathid, &Hash([3u8; 32]))?);
+        assert_eq!(
+            None,
+            cache.file_availability(&tree, &path, &Hash([3u8; 32]))?
+        );
 
         Ok(())
     }
@@ -2114,11 +2096,11 @@ mod tests {
             },
             None,
         )?;
-        let pathid = acache.expect(&path)?;
         {
             let txn = fixture.db.begin_read()?;
             let cache = txn.read_cache()?;
-            let entry = cache.get_at_pathid(pathid)?.unwrap();
+            let tree = txn.read_tree()?;
+            let entry = cache.get(&tree, &path)?.unwrap();
 
             //  Replace with old_hash=1 means that hash=2 is the most
             //  recent one. This is the one chosen.
@@ -2127,7 +2109,10 @@ mod tests {
             assert_eq!(later_time(), entry.mtime);
             assert_eq!(
                 vec![b],
-                cache.file_availability(pathid, &entry.hash)?.unwrap().peers
+                cache
+                    .file_availability(&tree, &path, &entry.hash)?
+                    .unwrap()
+                    .peers
             );
         }
 
@@ -2162,26 +2147,34 @@ mod tests {
         {
             let txn = fixture.db.begin_read()?;
             let cache = txn.read_cache()?;
-            let entry = cache.get_at_pathid(pathid)?.unwrap();
+            let tree = txn.read_tree()?;
+            let entry = cache.get(&txn.read_tree()?, &path)?.unwrap();
 
             //  Replace with old_hash=1 means that hash=2 is the most
             //  recent one. This is the one chosen.
             assert_eq!(Hash([3u8; 32]), entry.hash);
             assert_eq!(
                 vec![c],
-                cache.file_availability(pathid, &entry.hash)?.unwrap().peers
+                cache
+                    .file_availability(&tree, &path, &entry.hash)?
+                    .unwrap()
+                    .peers
             );
         }
 
         {
             let txn = fixture.db.begin_read()?;
             let cache = txn.read_cache()?;
-            let entry = cache.get_at_pathid(pathid)?.unwrap();
+            let tree = txn.read_tree()?;
+            let entry = cache.get(&txn.read_tree()?, &path)?.unwrap();
 
             assert_eq!(Hash([3u8; 32]), entry.hash);
             assert_eq!(
                 vec![c],
-                cache.file_availability(pathid, &entry.hash)?.unwrap().peers
+                cache
+                    .file_availability(&tree, &path, &entry.hash)?
+                    .unwrap()
+                    .peers
             );
         }
 
@@ -2203,12 +2196,16 @@ mod tests {
         {
             let txn = fixture.db.begin_read()?;
             let cache = txn.read_cache()?;
-            let entry = cache.get_at_pathid(pathid)?.unwrap();
+            let tree = txn.read_tree()?;
+            let entry = cache.get(&txn.read_tree()?, &path)?.unwrap();
 
             assert_eq!(Hash([3u8; 32]), entry.hash);
             assert_eq!(
                 vec![b, c],
-                cache.file_availability(pathid, &entry.hash)?.unwrap().peers
+                cache
+                    .file_availability(&tree, &path, &entry.hash)?
+                    .unwrap()
+                    .peers
             );
         }
 
@@ -2279,12 +2276,16 @@ mod tests {
         {
             let txn = fixture.db.begin_read()?;
             let cache = txn.read_cache()?;
+            let tree = txn.read_tree()?;
             let entry = cache.get_at_pathid(pathid)?.unwrap();
 
             assert_eq!(Hash([3u8; 32]), entry.hash);
             assert_eq!(
                 vec![a],
-                cache.file_availability(pathid, &entry.hash)?.unwrap().peers
+                cache
+                    .file_availability(&tree, pathid, &entry.hash)?
+                    .unwrap()
+                    .peers
             );
         }
 
@@ -2444,35 +2445,32 @@ mod tests {
         )?;
 
         let txn = fixture.db.begin_read()?;
-        let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
+        let tree = txn.read_tree()?;
 
         // File1 should have been deleted, since it was only on peer1,
         assert!(cache.get(&tree, &file1)?.is_none());
 
-        let file2_pathid = tree.resolve(&file2)?.unwrap();
         assert_eq!(
             vec![peer1, peer2],
             cache
-                .file_availability(file2_pathid, &test_hash())?
+                .file_availability(&tree, &file2, &test_hash())?
                 .unwrap()
                 .peers
         );
 
-        let file3_pathid = tree.resolve(&file3)?.unwrap();
         assert_eq!(
             vec![peer3],
             cache
-                .file_availability(file3_pathid, &test_hash())?
+                .file_availability(&tree, &file3, &test_hash())?
                 .unwrap()
                 .peers
         );
 
-        let file4_pathid = tree.resolve(&file4)?.unwrap();
         assert_eq!(
             vec![peer1],
             cache
-                .file_availability(file4_pathid, &test_hash())?
+                .file_availability(&tree, &file4, &test_hash())?
                 .unwrap()
                 .peers
         );
@@ -2491,8 +2489,7 @@ mod tests {
         fixture.add_to_cache(&file_path, 100, test_time())?;
 
         // Open the file to create a blob
-        let pathid = acache.expect(&file_path)?;
-        acache.open_file(pathid)?;
+        acache.open_file(&file_path)?;
         assert!(fixture.has_blob(&file_path)?);
 
         acache.update(
@@ -2523,14 +2520,13 @@ mod tests {
 
         // Create a file and open it to create the blob
         fixture.add_to_cache(&file_path, 100, test_time())?;
-        let pathid = acache.expect(&file_path)?;
-        acache.open_file(pathid)?;
+        acache.open_file(&file_path)?;
         assert!(fixture.has_blob(&file_path)?);
 
         fixture.remove_from_cache(&file_path)?;
 
         // the blob must be gone
-        assert!(!fixture.has_blob(pathid)?);
+        assert!(!fixture.has_blob(&file_path)?);
 
         Ok(())
     }
@@ -2544,8 +2540,7 @@ mod tests {
 
         // Create a file and open it to create the blob
         fixture.add_to_cache(&file_path, 100, test_time())?;
-        let pathid = acache.expect(&file_path)?;
-        acache.open_file(pathid)?;
+        acache.open_file(&file_path)?;
         assert!(fixture.has_blob(&file_path)?);
 
         // Do a catchup that doesn't include this file (simulating file removal)
@@ -2558,7 +2553,7 @@ mod tests {
         )?;
 
         // The blob must be gone
-        assert!(!fixture.has_blob(pathid)?);
+        assert!(!fixture.has_blob(&file_path)?);
 
         Ok(())
     }
@@ -2666,7 +2661,7 @@ mod tests {
             },
             cache.file_metadata(&tree, dest_pathid)?
         );
-        let avail = cache.file_availability(dest_pathid, &hash)?.unwrap();
+        let avail = cache.file_availability(&tree, dest_pathid, &hash)?.unwrap();
         assert_eq!(source_path, avail.path);
         assert_eq!(vec![peer1], avail.peers);
 
@@ -2690,7 +2685,7 @@ mod tests {
             },
             cache.file_metadata(&tree, dest_pathid)?
         );
-        let avail = cache.file_availability(dest_pathid, &hash)?.unwrap();
+        let avail = cache.file_availability(&tree, dest_pathid, &hash)?.unwrap();
         assert_eq!(dest_path, avail.path);
         assert_eq!(hash, avail.hash);
         assert_eq!(vec![peer2], avail.peers);

@@ -1227,7 +1227,8 @@ impl Blob {
         tokio::task::spawn_blocking(move || {
             let txn = db.begin_read()?;
 
-            txn.read_cache()?.file_availability(pathid, &hash)
+            txn.read_cache()?
+                .file_availability(&txn.read_tree()?, pathid, &hash)
         })
         .await?
     }
@@ -1525,7 +1526,7 @@ mod tests {
     use crate::arena::db::{ArenaReadTransaction, ArenaWriteTransaction};
     use crate::arena::dirty::DirtyReadOperations;
     use crate::utils::hash;
-    use crate::{PathId, Mark};
+    use crate::{Mark, PathId};
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;

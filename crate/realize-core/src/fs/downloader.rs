@@ -1,6 +1,6 @@
 use crate::rpc::{ExecutionMode, Household};
 use futures::Future;
-use realize_storage::{Blob, GlobalCache, PathId, StorageError};
+use realize_storage::{Blob, GlobalCache, GlobalTreeLoc, StorageError};
 use realize_types::{Arena, ByteRange, ByteRanges, Path, Peer};
 use std::cmp::min;
 use std::collections::VecDeque;
@@ -33,8 +33,8 @@ impl Downloader {
         Self { household, cache }
     }
 
-    pub async fn reader(&self, pathid: PathId) -> Result<Download, StorageError> {
-        let blob = self.cache.open_file(pathid).await?;
+    pub async fn reader<L: Into<GlobalTreeLoc>>(&self, loc: L) -> Result<Download, StorageError> {
+        let blob = self.cache.open_file(loc).await?;
         let avail = blob
             .remote_availability()
             .await?
@@ -503,12 +503,9 @@ mod tests {
             path_str: &str,
         ) -> Result<Download, anyhow::Error> {
             let arena = HouseholdFixture::test_arena();
-            let a = HouseholdFixture::a();
-            let cache = self.inner.cache(a)?;
             let path = Path::parse(path_str)?;
-            let pathid = cache.expect(arena, &path).await?;
 
-            Ok(downloader.reader(pathid).await?)
+            Ok(downloader.reader((arena, &path)).await?)
         }
     }
 
@@ -908,9 +905,9 @@ mod tests {
         let downloader = Downloader::new(household, Arc::clone(cache));
 
         let arena = HouseholdFixture::test_arena();
-        let pathid = cache.expect(arena, &Path::parse("large_file")?).await?;
-
-        let mut reader = downloader.reader(pathid).await?;
+        let mut reader = downloader
+            .reader((arena, &Path::parse("large_file")?))
+            .await?;
 
         if allow_short_reads {
             let mut bytes_read = 0;

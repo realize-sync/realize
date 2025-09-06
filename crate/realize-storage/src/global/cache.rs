@@ -210,47 +210,6 @@ impl GlobalCache {
         .await?
     }
 
-    /// Lookup the pathid and type of the file or directory pointed to
-    /// by a path.
-    ///
-    /// Fail with [StorageError::NotFound] if the path is not found in the tree. Note
-    /// that a successful return doesn't mean that a file or directory
-    /// with that pathid actually exists in the cache.
-    pub async fn expect(
-        self: &Arc<Self>,
-        arena: Arena,
-        path: &Path,
-    ) -> Result<PathId, StorageError> {
-        let path = path.clone();
-        let this = Arc::clone(self);
-
-        task::spawn_blocking(move || {
-            let cache = this.arena_cache(arena)?;
-            cache.expect(path)
-        })
-        .await?
-    }
-
-    /// Lookup the pathid and type of the file or directory pointed to by a path.
-    ///
-    /// Return Non if the path is not found in the tree. Note that a
-    /// successful return doesn't mean that a file or directory with
-    /// that pathid actually exists in the cache.
-    pub async fn resolve(
-        self: &Arc<Self>,
-        arena: Arena,
-        path: &Path,
-    ) -> Result<Option<PathId>, StorageError> {
-        let path = path.clone();
-        let this = Arc::clone(self);
-
-        task::spawn_blocking(move || {
-            let cache = this.arena_cache(arena)?;
-            cache.resolve(path)
-        })
-        .await?
-    }
-
     /// Return the mtime of the directory.
     pub async fn dir_metadata<L: Into<GlobalTreeLoc>>(
         self: &Arc<Self>,
