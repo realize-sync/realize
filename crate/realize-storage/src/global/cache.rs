@@ -5,16 +5,15 @@
 use super::db::{GlobalDatabase, GlobalReadTransaction};
 use super::pathid_allocator::PathIdAllocator;
 use super::types::PathAssignment;
-use crate::arena::arena_cache::{ArenaCache, TreeLoc};
+use crate::arena::arena_cache::{ArenaCache, CacheLoc};
 use crate::arena::notifier::{Notification, Progress};
 use crate::arena::types::{DirMetadata, LocalAvailability};
 use crate::global::db::GlobalWriteTransaction;
 use crate::global::types::PathTableEntry;
 use crate::utils::holder::Holder;
-use crate::{Blob, FileMetadata, PathId, StorageError};
+use crate::{Blob, FileMetadata, Inode, PathId, StorageError};
 use realize_types::{Arena, Path, Peer, UnixTime};
 use redb::ReadableTable;
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task;
@@ -116,25 +115,56 @@ impl GlobalCache {
         self.arena_cache(arena)
     }
 
+    fn arena_cache_for_inode(&self, inode: Inode) -> Result<&ArenaCache, StorageError> {
+        // We ignore the difference between PathId and Inodes for this
+        // lookup, as they come from the same ranges.
+        self.arena_cache_for_pathid(PathId(inode.as_u64()))
+    }
+
+    fn arena_for_inode(
+        &self,
+        txn: &GlobalReadTransaction,
+        inode: Inode,
+    ) -> Result<Option<Arena>, StorageError> {
+        // We ignore the difference between PathId and Inodes for this
+        // lookup, as they come from the same ranges.
+        self.allocator.arena_for_pathid(txn, PathId(inode.as_u64()))
+    }
+
     /// Convert a [GlobalTreeLoc] into an arena or global location.
-    fn resolve_loc<L: Into<GlobalTreeLoc>>(
+    fn resolve_loc<L: Into<GlobalLoc>>(
         &self,
         txn: &GlobalReadTransaction,
         loc: L,
-    ) -> Result<ResolvedLoc<'static>, StorageError> {
+    ) -> Result<ResolvedLoc, StorageError> {
         Ok(match self.resolve_arena_root(loc.into()) {
-            GlobalTreeLoc::PathId(pathid) => match self.allocator.arena_for_pathid(txn, pathid)? {
-                Some(arena) => ResolvedLoc::InArena(arena, TreeLoc::PathId(pathid)),
+            GlobalLoc::PathId(pathid) => match self.allocator.arena_for_pathid(txn, pathid)? {
+                Some(arena) => ResolvedLoc::InArena(arena, CacheLoc::PathId(pathid)),
                 None => ResolvedLoc::Global(if self.paths.contains_key(&pathid) {
                     Some(pathid)
                 } else {
                     None
                 }),
             },
-            GlobalTreeLoc::PathIdAndName(pathid, name) => {
+            GlobalLoc::Inode(inode) => {
+                match self.arena_for_inode(txn, inode)? {
+                    Some(arena) => ResolvedLoc::InArena(arena, CacheLoc::Inode(inode)),
+                    None => {
+                        // global inodes and pathids are identical
+                        let pathid = PathId(inode.as_u64());
+
+                        ResolvedLoc::Global(if self.paths.contains_key(&pathid) {
+                            Some(pathid)
+                        } else {
+                            None
+                        })
+                    }
+                }
+            }
+            GlobalLoc::PathIdAndName(pathid, name) => {
                 match self.allocator.arena_for_pathid(txn, pathid)? {
                     Some(arena) => {
-                        ResolvedLoc::InArena(arena, TreeLoc::PathIdAndName(pathid, Cow::from(name)))
+                        ResolvedLoc::InArena(arena, CacheLoc::PathIdAndName(pathid, name))
                     }
                     None => ResolvedLoc::Global(match self.paths.get(&pathid) {
                         None => return Err(StorageError::NotFound),
@@ -144,35 +174,60 @@ impl GlobalCache {
                     }),
                 }
             }
-            GlobalTreeLoc::Path(arena, path) => ResolvedLoc::InArena(arena, TreeLoc::Path(path)),
+            GlobalLoc::InodeAndName(inode, name) => {
+                match self.arena_for_inode(txn, inode)? {
+                    Some(arena) => ResolvedLoc::InArena(arena, CacheLoc::InodeAndName(inode, name)),
+                    None => {
+                        // global inodes and pathids are identical
+                        let pathid = PathId(inode.as_u64());
+
+                        ResolvedLoc::Global(match self.paths.get(&pathid) {
+                            None => return Err(StorageError::NotFound),
+                            Some(IntermediatePath { entries, .. }) => {
+                                entries.get(&name).map(|pathid| *pathid)
+                            }
+                        })
+                    }
+                }
+            }
+            GlobalLoc::Path(arena, path) => ResolvedLoc::InArena(arena, CacheLoc::Path(path)),
         })
     }
 
     /// Convert a [GlobalTreeLoc] into an arena and arena [TreeLoc] or fail.
-    fn resolve_arena_loc<L: Into<GlobalTreeLoc>>(
+    fn resolve_arena_loc<L: Into<GlobalLoc>>(
         &self,
         loc: L,
-    ) -> Result<(&ArenaCache, TreeLoc<'static>), StorageError> {
+    ) -> Result<(&ArenaCache, CacheLoc), StorageError> {
         Ok(match self.resolve_arena_root(loc.into()) {
-            GlobalTreeLoc::PathId(pathid) => (
+            GlobalLoc::PathId(pathid) => (
                 self.arena_cache_for_pathid(pathid)?,
-                TreeLoc::PathId(pathid),
+                CacheLoc::PathId(pathid),
             ),
-            GlobalTreeLoc::PathIdAndName(pathid, name) => (
+            GlobalLoc::Inode(inode) => (self.arena_cache_for_inode(inode)?, CacheLoc::Inode(inode)),
+            GlobalLoc::PathIdAndName(pathid, name) => (
                 self.arena_cache_for_pathid(pathid)?,
-                TreeLoc::PathIdAndName(pathid, name.into()),
+                CacheLoc::PathIdAndName(pathid, name.into()),
             ),
-            GlobalTreeLoc::Path(arena, path) => (self.arena_cache(arena)?, TreeLoc::Path(path)),
+            GlobalLoc::InodeAndName(inode, name) => (
+                self.arena_cache_for_inode(inode)?,
+                CacheLoc::InodeAndName(inode, name.into()),
+            ),
+            GlobalLoc::Path(arena, path) => (self.arena_cache(arena)?, CacheLoc::Path(path)),
         })
     }
 
     /// Cover the special case of a PathIdAndName where name points to an arena root.
-    fn resolve_arena_root(&self, loc: GlobalTreeLoc) -> GlobalTreeLoc {
-        if let GlobalTreeLoc::PathIdAndName(pathid, name) = &loc {
+    fn resolve_arena_root(&self, loc: GlobalLoc) -> GlobalLoc {
+        if let Some((pathid, name)) = match &loc {
+            GlobalLoc::PathIdAndName(pathid, name) => Some((*pathid, name)),
+            GlobalLoc::InodeAndName(inode, name) => Some((PathId(inode.as_u64()), name)),
+            _ => None,
+        } {
             if let Some(IntermediatePath { entries, .. }) = self.paths.get(&pathid) {
                 if let Some(pathid) = entries.get(name) {
                     if self.allocator.is_arena_root(*pathid) {
-                        return GlobalTreeLoc::PathId(*pathid);
+                        return GlobalLoc::PathId(*pathid);
                     }
                 }
             }
@@ -182,7 +237,7 @@ impl GlobalCache {
     }
 
     /// Lookup a directory entry.
-    pub async fn lookup<L: Into<GlobalTreeLoc>>(
+    pub async fn lookup<L: Into<GlobalLoc>>(
         self: &Arc<Self>,
         loc: L,
     ) -> Result<(PathId, PathAssignment), StorageError> {
@@ -211,7 +266,7 @@ impl GlobalCache {
     }
 
     /// Return the mtime of the directory.
-    pub async fn dir_metadata<L: Into<GlobalTreeLoc>>(
+    pub async fn dir_metadata<L: Into<GlobalLoc>>(
         self: &Arc<Self>,
         loc: L,
     ) -> Result<DirMetadata, StorageError> {
@@ -238,7 +293,7 @@ impl GlobalCache {
         .await?
     }
 
-    pub async fn readdir<L: Into<GlobalTreeLoc>>(
+    pub async fn readdir<L: Into<GlobalLoc>>(
         self: &Arc<Self>,
         loc: L,
     ) -> Result<Vec<(String, PathId, PathAssignment)>, StorageError> {
@@ -297,7 +352,7 @@ impl GlobalCache {
     }
 
     /// Check local file content availability.
-    pub async fn local_availability<L: Into<GlobalTreeLoc>>(
+    pub async fn local_availability<L: Into<GlobalLoc>>(
         self: &Arc<Self>,
         loc: L,
     ) -> Result<LocalAvailability, StorageError> {
@@ -318,7 +373,7 @@ impl GlobalCache {
     ///
     /// This is usually used through the `Downloader`, which can
     /// download incomplete portions of the file.
-    pub async fn open_file<L: Into<GlobalTreeLoc>>(
+    pub async fn open_file<L: Into<GlobalLoc>>(
         self: &Arc<Self>,
         loc: L,
     ) -> Result<Blob, StorageError> {
@@ -332,7 +387,7 @@ impl GlobalCache {
         .await?
     }
 
-    pub async fn file_metadata<L: Into<GlobalTreeLoc>>(
+    pub async fn file_metadata<L: Into<GlobalLoc>>(
         self: &Arc<Self>,
         loc: L,
     ) -> Result<FileMetadata, StorageError> {
@@ -346,10 +401,7 @@ impl GlobalCache {
         .await?
     }
 
-    pub async fn unlink<L: Into<GlobalTreeLoc>>(
-        self: &Arc<Self>,
-        loc: L,
-    ) -> Result<(), StorageError> {
+    pub async fn unlink<L: Into<GlobalLoc>>(self: &Arc<Self>, loc: L) -> Result<(), StorageError> {
         let loc = loc.into();
         let this = Arc::clone(self);
 
@@ -367,7 +419,7 @@ impl GlobalCache {
         .await?
     }
 
-    pub async fn branch<L1: Into<GlobalTreeLoc>, L2: Into<GlobalTreeLoc>>(
+    pub async fn branch<L1: Into<GlobalLoc>, L2: Into<GlobalLoc>>(
         self: &Arc<Self>,
         source: L1,
         dest: L2,
@@ -400,7 +452,7 @@ impl GlobalCache {
     }
 
     /// Create a directory at the given path in the specified arena.
-    pub async fn mkdir<L: Into<GlobalTreeLoc>>(
+    pub async fn mkdir<L: Into<GlobalLoc>>(
         self: &Arc<Self>,
         loc: L,
     ) -> Result<(PathId, DirMetadata), StorageError> {
@@ -416,10 +468,7 @@ impl GlobalCache {
     }
 
     /// Remove an empty directory at the given path in the specified arena.
-    pub async fn rmdir<L: Into<GlobalTreeLoc>>(
-        self: &Arc<Self>,
-        loc: L,
-    ) -> Result<(), StorageError> {
+    pub async fn rmdir<L: Into<GlobalLoc>>(self: &Arc<Self>, loc: L) -> Result<(), StorageError> {
         let loc = loc.into();
         let this = Arc::clone(self);
 
@@ -437,50 +486,75 @@ impl GlobalCache {
 /// This is usually a [Path] within an [Arena] or a [PathId], but can
 /// also be a [PathId] and a name to specify a child of a known
 /// directory.
-pub enum GlobalTreeLoc {
+pub enum GlobalLoc {
     PathId(PathId),
+    Inode(Inode),
     Path(Arena, Path),
     PathIdAndName(PathId, String),
+    InodeAndName(Inode, String),
 }
 
-impl From<PathId> for GlobalTreeLoc {
+impl From<PathId> for GlobalLoc {
     fn from(value: PathId) -> Self {
-        GlobalTreeLoc::PathId(value)
+        GlobalLoc::PathId(value)
     }
 }
 
-impl From<(Arena, Path)> for GlobalTreeLoc {
+impl From<Inode> for GlobalLoc {
+    fn from(value: Inode) -> Self {
+        GlobalLoc::Inode(value)
+    }
+}
+
+impl From<(Arena, Path)> for GlobalLoc {
     fn from(value: (Arena, Path)) -> Self {
-        GlobalTreeLoc::Path(value.0, value.1)
+        GlobalLoc::Path(value.0, value.1)
     }
 }
 
-impl From<(Arena, &Path)> for GlobalTreeLoc {
+impl From<(Arena, &Path)> for GlobalLoc {
     fn from(value: (Arena, &Path)) -> Self {
-        GlobalTreeLoc::Path(value.0, value.1.clone())
+        GlobalLoc::Path(value.0, value.1.clone())
     }
 }
 
-impl From<(PathId, &str)> for GlobalTreeLoc {
+impl From<(PathId, &str)> for GlobalLoc {
     fn from(value: (PathId, &str)) -> Self {
-        GlobalTreeLoc::PathIdAndName(value.0, value.1.to_string())
+        GlobalLoc::PathIdAndName(value.0, value.1.to_string())
     }
 }
 
-impl From<(PathId, &String)> for GlobalTreeLoc {
+impl From<(PathId, &String)> for GlobalLoc {
     fn from(value: (PathId, &String)) -> Self {
-        GlobalTreeLoc::PathIdAndName(value.0, value.1.clone())
+        GlobalLoc::PathIdAndName(value.0, value.1.clone())
     }
 }
-impl From<(PathId, String)> for GlobalTreeLoc {
+impl From<(PathId, String)> for GlobalLoc {
     fn from(value: (PathId, String)) -> Self {
-        GlobalTreeLoc::PathIdAndName(value.0, value.1)
+        GlobalLoc::PathIdAndName(value.0, value.1)
     }
 }
 
-enum ResolvedLoc<'a> {
+impl From<(Inode, &str)> for GlobalLoc {
+    fn from(value: (Inode, &str)) -> Self {
+        GlobalLoc::InodeAndName(value.0, value.1.to_string())
+    }
+}
+
+impl From<(Inode, &String)> for GlobalLoc {
+    fn from(value: (Inode, &String)) -> Self {
+        GlobalLoc::InodeAndName(value.0, value.1.clone())
+    }
+}
+impl From<(Inode, String)> for GlobalLoc {
+    fn from(value: (Inode, String)) -> Self {
+        GlobalLoc::InodeAndName(value.0, value.1)
+    }
+}
+
+enum ResolvedLoc {
     Global(Option<PathId>),
-    InArena(Arena, TreeLoc<'a>),
+    InArena(Arena, CacheLoc),
 }
 
 #[derive(Debug, Clone)]

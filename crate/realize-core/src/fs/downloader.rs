@@ -1,6 +1,6 @@
 use crate::rpc::{ExecutionMode, Household};
 use futures::Future;
-use realize_storage::{Blob, GlobalCache, GlobalTreeLoc, StorageError};
+use realize_storage::{Blob, GlobalCache, GlobalLoc, StorageError};
 use realize_types::{Arena, ByteRange, ByteRanges, Path, Peer};
 use std::cmp::min;
 use std::collections::VecDeque;
@@ -33,7 +33,7 @@ impl Downloader {
         Self { household, cache }
     }
 
-    pub async fn reader<L: Into<GlobalTreeLoc>>(&self, loc: L) -> Result<Download, StorageError> {
+    pub async fn reader<L: Into<GlobalLoc>>(&self, loc: L) -> Result<Download, StorageError> {
         let blob = self.cache.open_file(loc).await?;
         let avail = blob
             .remote_availability()

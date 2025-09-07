@@ -863,47 +863,49 @@ impl ArenaCache {
         self.arena
     }
 
-    pub(crate) fn lookup<'b, L: Into<TreeLoc<'b>>>(
+    pub(crate) fn lookup(
         &self,
-        loc: L,
+        loc: impl Into<CacheLoc>,
     ) -> Result<(PathId, PathAssignment), StorageError> {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
-        cache.lookup(&tree, loc)
+        cache.lookup(&tree, loc.into().into_tree_loc(&cache)?)
     }
 
-    pub(crate) fn file_metadata<'b, L: Into<TreeLoc<'b>>>(
+    pub(crate) fn file_metadata(
         &self,
-        loc: L,
+        loc: impl Into<CacheLoc>,
     ) -> Result<FileMetadata, StorageError> {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
-        cache.file_metadata(&tree, loc)
+        cache.file_metadata(&tree, loc.into().into_tree_loc(&cache)?)
     }
 
-    pub(crate) fn dir_metadata<'b, L: Into<TreeLoc<'b>>>(
+    pub(crate) fn dir_metadata(
         &self,
-        loc: L,
+        loc: impl Into<CacheLoc>,
     ) -> Result<DirMetadata, StorageError> {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
         Ok(DirMetadata {
             read_only: false,
-            mtime: cache.dir_mtime(&tree, loc)?,
+            mtime: cache.dir_mtime(&tree, loc.into().into_tree_loc(&cache)?)?,
         })
     }
 
-    pub(crate) fn readdir<'b, L: Into<TreeLoc<'b>>>(
+    pub(crate) fn readdir(
         &self,
-        loc: L,
+        loc: impl Into<CacheLoc>,
     ) -> Result<Vec<(String, PathId, PathAssignment)>, StorageError> {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
-        cache.readdir(&tree, loc).collect()
+        cache
+            .readdir(&tree, loc.into().into_tree_loc(&cache)?)
+            .collect()
     }
 
     pub(crate) fn peer_progress(&self, peer: Peer) -> Result<Option<Progress>, StorageError> {
@@ -912,7 +914,7 @@ impl ArenaCache {
         peers.progress(peer)
     }
 
-    pub(crate) fn unlink<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> Result<(), StorageError> {
+    pub(crate) fn unlink(&self, loc: impl Into<CacheLoc>) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
         {
             let mut tree = txn.write_tree()?;
@@ -921,17 +923,23 @@ impl ArenaCache {
             let mut dirty = txn.write_dirty()?;
             let mut cache = txn.write_cache()?;
 
-            cache.unlink(&mut tree, &mut blobs, &mut history, &mut dirty, loc)?;
+            cache.unlink(
+                &mut tree,
+                &mut blobs,
+                &mut history,
+                &mut dirty,
+                loc.into().into_tree_loc(&cache)?,
+            )?;
         }
         txn.commit()?;
 
         Ok(())
     }
 
-    pub(crate) fn branch<'l1, 'l2, L1: Into<TreeLoc<'l1>>, L2: Into<TreeLoc<'l2>>>(
+    pub(crate) fn branch(
         &self,
-        source: L1,
-        dest: L2,
+        source: impl Into<CacheLoc>,
+        dest: impl Into<CacheLoc>,
     ) -> Result<(PathId, FileMetadata), StorageError> {
         let txn = self.db.begin_write()?;
         let result = {
@@ -946,8 +954,8 @@ impl ArenaCache {
                 &mut blobs,
                 &mut history,
                 &mut dirty,
-                source,
-                dest,
+                source.into().into_tree_loc(&cache)?,
+                dest.into().into_tree_loc(&cache)?,
             )?
         };
         txn.commit()?;
@@ -965,15 +973,15 @@ impl ArenaCache {
     }
 
     /// Open a file for reading/writing.
-    pub(crate) fn open_file<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> Result<Blob, StorageError> {
+    pub(crate) fn open_file(&self, loc: impl Into<CacheLoc>) -> Result<Blob, StorageError> {
         // Optimistically, try a read transaction to check whether the
-        // blob is there. The pathid is kept between transaction,
-        // since it's guaranteed not to change.
+        // blob is there. The pathid is kept across transactions,
+        // because it is guaranteed to be stable.
         let pathid;
         {
             let txn = self.db.begin_read()?;
             let tree = txn.read_tree()?;
-            pathid = tree.expect(loc)?;
+            pathid = tree.expect(loc.into().into_tree_loc(&txn.read_cache()?)?)?;
             let blobs = txn.read_blobs()?;
             if let Some(info) = blobs.get_with_pathid(pathid)? {
                 return Blob::open_with_info(&self.db, info);
@@ -992,27 +1000,28 @@ impl ArenaCache {
         Ok(Blob::open_with_info(&self.db, info)?)
     }
 
-    pub(crate) fn local_availability<'b, L: Into<TreeLoc<'b>>>(
+    pub(crate) fn local_availability(
         &self,
-        loc: L,
+        loc: impl Into<CacheLoc>,
     ) -> Result<LocalAvailability, StorageError> {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
         let blobs = txn.read_blobs()?;
-        blobs.local_availability(&tree, loc)
+        let cache = txn.read_cache()?;
+        blobs.local_availability(&tree, loc.into().into_tree_loc(&cache)?)
     }
 
     /// Create a directory at the given path.
-    pub(crate) fn mkdir<'b, L: Into<TreeLoc<'b>>>(
+    pub(crate) fn mkdir(
         &self,
-        loc: L,
+        loc: impl Into<CacheLoc>,
     ) -> Result<(PathId, DirMetadata), StorageError> {
         let txn = self.db.begin_write()?;
         let result = {
             let mut tree = txn.write_tree()?;
             let mut cache = txn.write_cache()?;
 
-            cache.mkdir(&mut tree, loc)
+            cache.mkdir(&mut tree, loc.into().into_tree_loc(&cache)?)
         };
         txn.commit()?;
 
@@ -1020,17 +1029,98 @@ impl ArenaCache {
     }
 
     /// Remove an empty directory at the given path.
-    pub(crate) fn rmdir<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> Result<(), StorageError> {
+    pub(crate) fn rmdir(&self, loc: impl Into<CacheLoc>) -> Result<(), StorageError> {
         let txn = self.db.begin_write()?;
         {
             let mut tree = txn.write_tree()?;
             let mut cache = txn.write_cache()?;
-
-            cache.rmdir(&mut tree, loc)?;
+            cache.rmdir(&mut tree, loc.into().into_tree_loc(&cache)?)?;
         }
         txn.commit()?;
 
         Ok(())
+    }
+}
+
+pub(crate) enum CacheLoc {
+    PathId(PathId),
+    Inode(Inode),
+    Path(Path),
+    PathIdAndName(PathId, String),
+    InodeAndName(Inode, String),
+}
+
+impl CacheLoc {
+    fn into_tree_loc(
+        self,
+        cache: &impl CacheReadOperations,
+    ) -> Result<TreeLoc<'static>, StorageError> {
+        Ok(match self {
+            CacheLoc::PathId(pathid) => TreeLoc::PathId(pathid),
+            CacheLoc::Path(path) => TreeLoc::Path(path),
+            CacheLoc::PathIdAndName(pathid, name) => TreeLoc::PathIdAndName(pathid, name.into()),
+            CacheLoc::Inode(inode) => TreeLoc::PathId(cache.map_to_ipath(inode)?),
+            CacheLoc::InodeAndName(inode, name) => {
+                TreeLoc::PathIdAndName(cache.map_to_ipath(inode)?, name.into())
+            }
+        })
+    }
+}
+impl From<PathId> for CacheLoc {
+    fn from(value: PathId) -> Self {
+        CacheLoc::PathId(value)
+    }
+}
+
+impl From<Inode> for CacheLoc {
+    fn from(value: Inode) -> Self {
+        CacheLoc::Inode(value)
+    }
+}
+
+impl From<Path> for CacheLoc {
+    fn from(value: Path) -> Self {
+        CacheLoc::Path(value)
+    }
+}
+
+impl From<&Path> for CacheLoc {
+    fn from(value: &Path) -> Self {
+        CacheLoc::Path(value.clone())
+    }
+}
+
+impl From<(PathId, &str)> for CacheLoc {
+    fn from(value: (PathId, &str)) -> Self {
+        CacheLoc::PathIdAndName(value.0, value.1.to_string())
+    }
+}
+
+impl From<(PathId, &String)> for CacheLoc {
+    fn from(value: (PathId, &String)) -> Self {
+        CacheLoc::PathIdAndName(value.0, value.1.to_string())
+    }
+}
+impl From<(PathId, String)> for CacheLoc {
+    fn from(value: (PathId, String)) -> Self {
+        CacheLoc::PathIdAndName(value.0, value.1)
+    }
+}
+
+impl From<(Inode, &str)> for CacheLoc {
+    fn from(value: (Inode, &str)) -> Self {
+        CacheLoc::InodeAndName(value.0, value.1.to_string())
+    }
+}
+
+impl From<(Inode, &String)> for CacheLoc {
+    fn from(value: (Inode, &String)) -> Self {
+        CacheLoc::InodeAndName(value.0, value.1.to_string())
+    }
+}
+impl From<(Inode, String)> for CacheLoc {
+    fn from(value: (Inode, String)) -> Self {
+        CacheLoc::InodeAndName(value.0, value.1)
     }
 }
 
@@ -1159,20 +1249,15 @@ fn check_is_dir(
 
 #[cfg(test)]
 mod tests {
-    use super::ArenaCache;
+    use super::*;
     use crate::FileMetadata;
-    use crate::arena::arena_cache::CacheExt;
-    use crate::arena::arena_cache::CacheReadOperations;
     use crate::arena::blob::BlobExt;
     use crate::arena::db::ArenaDatabase;
     use crate::arena::dirty::DirtyReadOperations;
     use crate::arena::history::HistoryReadOperations;
     use crate::arena::notifier::Notification;
-    use crate::arena::tree::TreeExt;
-    use crate::arena::tree::TreeLoc;
-    use crate::arena::tree::TreeReadOperations;
-    use crate::arena::types::DirMetadata;
-    use crate::arena::types::HistoryTableEntry;
+    use crate::arena::tree::{TreeExt, TreeLoc, TreeReadOperations};
+    use crate::arena::types::{DirMetadata, HistoryTableEntry};
     use crate::utils::hash;
     use crate::{PathAssignment, PathId, StorageError};
     use assert_fs::TempDir;
@@ -1228,7 +1313,7 @@ mod tests {
             })
         }
 
-        fn dir_metadata<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> anyhow::Result<DirMetadata> {
+        fn dir_metadata(&self, loc: impl Into<CacheLoc>) -> anyhow::Result<DirMetadata> {
             Ok(self.acache.dir_metadata(loc)?)
         }
 
