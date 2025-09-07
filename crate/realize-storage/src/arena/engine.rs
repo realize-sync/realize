@@ -996,8 +996,10 @@ mod tests {
 
         let (new_job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
         assert!(new_job_id > job_id);
-        let (pathid, _) = fixture.acache.lookup(&foobar)?;
-        assert_eq!(StorageJob::Realize(pathid, test_hash(), None), job);
+        assert_eq!(
+            StorageJob::Realize(fixture.pathid(&foobar)?, test_hash(), None),
+            job
+        );
 
         Ok(())
     }
@@ -1023,7 +1025,7 @@ mod tests {
 
         mark::set(&fixture.db, &foobar, Mark::Own)?;
 
-        let (pathid, _) = fixture.acache.lookup(&foobar)?;
+        let pathid = fixture.pathid(&foobar)?;
         let mut job_stream = fixture.engine.job_stream();
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
         assert_eq!(StorageJob::ProtectBlob(pathid), job,);
@@ -1080,7 +1082,7 @@ mod tests {
         let mut job_stream = fixture.engine.job_stream();
 
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
-        let (pathid, _) = fixture.acache.lookup(&foobar)?;
+        let pathid = fixture.pathid(&foobar)?;
         assert_eq!(StorageJob::UnprotectBlob(pathid), job);
         let txn = fixture.db.begin_write()?;
         {
@@ -1115,7 +1117,7 @@ mod tests {
         let mut job_stream = fixture.engine.job_stream();
 
         let (_, job) = next_with_timeout(&mut job_stream).await?.unwrap();
-        let (pathid, _) = fixture.acache.lookup(&foobar)?;
+        let pathid = fixture.pathid(&foobar)?;
         assert_eq!(StorageJob::Realize(pathid, test_hash(), None), job);
 
         Ok(())

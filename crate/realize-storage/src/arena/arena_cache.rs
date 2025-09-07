@@ -866,11 +866,13 @@ impl ArenaCache {
     pub(crate) fn lookup(
         &self,
         loc: impl Into<CacheLoc>,
-    ) -> Result<(PathId, PathAssignment), StorageError> {
+    ) -> Result<(Inode, PathAssignment), StorageError> {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
-        cache.lookup(&tree, loc.into().into_tree_loc(&cache)?)
+        let (pathid, assn) = cache.lookup(&tree, loc.into().into_tree_loc(&cache)?)?;
+
+        Ok((cache.map_to_inode(pathid)?, assn))
     }
 
     pub(crate) fn file_metadata(
@@ -899,13 +901,17 @@ impl ArenaCache {
     pub(crate) fn readdir(
         &self,
         loc: impl Into<CacheLoc>,
-    ) -> Result<Vec<(String, PathId, PathAssignment)>, StorageError> {
+    ) -> Result<Vec<(String, Inode, PathAssignment)>, StorageError> {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
-        cache
-            .readdir(&tree, loc.into().into_tree_loc(&cache)?)
-            .collect()
+        let mut vec = vec![];
+        for res in cache.readdir(&tree, loc.into().into_tree_loc(&cache)?) {
+            let (name, pathid, assn) = res?;
+            vec.push((name, cache.map_to_inode(pathid)?, assn));
+        }
+
+        Ok(vec)
     }
 
     pub(crate) fn peer_progress(&self, peer: Peer) -> Result<Option<Progress>, StorageError> {
@@ -940,7 +946,7 @@ impl ArenaCache {
         &self,
         source: impl Into<CacheLoc>,
         dest: impl Into<CacheLoc>,
-    ) -> Result<(PathId, FileMetadata), StorageError> {
+    ) -> Result<(Inode, FileMetadata), StorageError> {
         let txn = self.db.begin_write()?;
         let result = {
             let mut tree = txn.write_tree()?;
@@ -949,14 +955,16 @@ impl ArenaCache {
             let mut dirty = txn.write_dirty()?;
             let mut cache = txn.write_cache()?;
 
-            cache.branch(
+            let (pathid, m) = cache.branch(
                 &mut tree,
                 &mut blobs,
                 &mut history,
                 &mut dirty,
                 source.into().into_tree_loc(&cache)?,
                 dest.into().into_tree_loc(&cache)?,
-            )?
+            )?;
+
+            (cache.map_to_inode(pathid)?, m)
         };
         txn.commit()?;
 
@@ -1015,17 +1023,19 @@ impl ArenaCache {
     pub(crate) fn mkdir(
         &self,
         loc: impl Into<CacheLoc>,
-    ) -> Result<(PathId, DirMetadata), StorageError> {
+    ) -> Result<(Inode, DirMetadata), StorageError> {
         let txn = self.db.begin_write()?;
         let result = {
             let mut tree = txn.write_tree()?;
             let mut cache = txn.write_cache()?;
 
-            cache.mkdir(&mut tree, loc.into().into_tree_loc(&cache)?)
+            let (pathid, m) = cache.mkdir(&mut tree, loc.into().into_tree_loc(&cache)?)?;
+
+            (cache.map_to_inode(pathid)?, m)
         };
         txn.commit()?;
 
-        result
+        Ok(result)
     }
 
     /// Remove an empty directory at the given path.
@@ -1386,6 +1396,19 @@ mod tests {
             Ok(ret)
         }
 
+        fn dirty_inodes(&self) -> Result<HashSet<Inode>, StorageError> {
+            let txn = self.db.begin_read()?;
+            let dirty = txn.read_dirty()?;
+            let cache = txn.read_cache()?;
+            let mut start = 0;
+            let mut ret = HashSet::new();
+            while let Some((pathid, counter)) = dirty.next_dirty(start)? {
+                ret.insert(cache.map_to_inode(pathid)?);
+                start = counter + 1;
+            }
+            Ok(ret)
+        }
+
         fn dirty_paths(&self) -> Result<HashSet<Path>, StorageError> {
             let pathids = self.dirty_pathids()?;
             let txn = self.db.begin_read()?;
@@ -1444,20 +1467,23 @@ mod tests {
     #[tokio::test]
     async fn add_and_remove_mirrored_in_tree() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let acache = &fixture.acache;
         let file_path = Path::parse("a/b/c.txt")?;
         let mtime = test_time();
 
         fixture.add_to_cache(&file_path, 100, mtime)?;
 
-        let (a, _) = acache.lookup((fixture.db.tree().root(), "a"))?;
-        let (b, _) = acache.lookup((a, "b"))?;
-        let (c, _) = acache.lookup((b, "c.txt"))?;
-
+        let a: PathId;
+        let b: PathId;
+        let c: PathId;
         {
             let txn = fixture.db.begin_read()?;
             let tree = txn.read_tree()?;
+            let cache = txn.read_cache()?;
             assert_eq!(fixture.db.tree().root(), tree.root());
+
+            a = cache.lookup(&tree, (fixture.db.tree().root(), "a"))?.0;
+            b = cache.lookup(&tree, (a, "b"))?.0;
+            c = cache.lookup(&tree, (b, "c.txt"))?.0;
             assert!(tree.pathid_exists(a)?);
             assert!(tree.pathid_exists(b)?);
             assert!(tree.pathid_exists(c)?);
@@ -1468,10 +1494,12 @@ mod tests {
 
         fixture.remove_from_cache(&file_path)?;
 
-        assert!(acache.lookup((b, "c.txt")).is_err());
         {
             let txn = fixture.db.begin_read()?;
             let tree = txn.read_tree()?;
+            let cache = txn.read_cache()?;
+
+            assert!(cache.lookup(&tree, (b, "c.txt")).is_err());
 
             // The file is gone from tree, since this was the only
             // reference to it.
@@ -1714,13 +1742,15 @@ mod tests {
     #[tokio::test]
     async fn remove_marks_dirty() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let acache = &fixture.acache;
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
 
         fixture.add_to_cache(&file_path, 100, mtime)?;
         let arena_root = fixture.db.tree().root();
-        let (pathid, _) = acache.lookup((arena_root, "file.txt"))?;
+        let txn = fixture.db.begin_read()?;
+        let cache = txn.read_cache()?;
+        let tree = txn.read_tree()?;
+        let (pathid, _) = cache.lookup(&tree, (arena_root, "file.txt"))?;
 
         fixture.clear_dirty()?;
         fixture.remove_from_cache(&file_path)?;
@@ -2357,11 +2387,14 @@ mod tests {
             },
             None,
         )?;
-        let (pathid, _) = acache.lookup((fixture.db.tree().root(), "file.txt"))?;
+        let pathid: PathId;
         {
             let txn = fixture.db.begin_read()?;
             let cache = txn.read_cache()?;
             let tree = txn.read_tree()?;
+            pathid = cache
+                .lookup(&tree, (fixture.db.tree().root(), "file.txt"))?
+                .0;
             let entry = cache.get_at_pathid(pathid)?.unwrap();
 
             assert_eq!(Hash([3u8; 32]), entry.hash);
@@ -2653,8 +2686,8 @@ mod tests {
         fixture.add_to_cache(&file_path, 100, mtime)?;
         let arena_root = fixture.db.tree().root();
 
-        let (pathid, _) = acache.lookup((arena_root, "file.txt"))?;
-        assert!(acache.file_metadata(pathid).is_ok());
+        let (inode, _) = acache.lookup((arena_root, "file.txt"))?;
+        assert!(acache.file_metadata(inode).is_ok());
 
         fixture.clear_dirty()?;
         let dir_mtime_before = acache.dir_metadata(arena_root)?.mtime;
@@ -2666,11 +2699,11 @@ mod tests {
             Err(StorageError::NotFound)
         ));
         assert!(matches!(
-            acache.file_metadata(pathid),
+            acache.file_metadata(inode),
             Err(StorageError::NotFound)
         ));
 
-        assert_eq!(HashSet::from([pathid]), fixture.dirty_pathids()?);
+        assert_eq!(HashSet::from([inode]), fixture.dirty_inodes()?);
 
         assert!(acache.dir_metadata(arena_root)?.mtime > dir_mtime_before);
 

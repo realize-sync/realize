@@ -436,7 +436,10 @@ mod tests {
         }
 
         fn find_in_cache(&self, path_str: &str) -> Result<Option<PathId>, StorageError> {
-            match self.cache.lookup(&Path::parse(path_str)?) {
+            let txn = self.db.begin_read()?;
+            let tree = txn.read_tree()?;
+            let cache = txn.read_cache()?;
+            match cache.lookup(&tree, &Path::parse(path_str)?) {
                 Ok((pathid, _)) => Ok(Some(pathid)),
                 Err(StorageError::NotFound) => Ok(None),
                 Err(err) => Err(err),

@@ -240,7 +240,7 @@ impl GlobalCache {
     pub async fn lookup<L: Into<GlobalLoc>>(
         self: &Arc<Self>,
         loc: L,
-    ) -> Result<(PathId, PathAssignment), StorageError> {
+    ) -> Result<(Inode, PathAssignment), StorageError> {
         let loc = loc.into();
         let this = Arc::clone(self);
 
@@ -255,7 +255,7 @@ impl GlobalCache {
                     if let Some(pathid) = pathid
                         && this.paths.contains_key(&pathid)
                     {
-                        Ok((pathid, PathAssignment::Directory))
+                        Ok((Inode(pathid.as_u64()), PathAssignment::Directory))
                     } else {
                         Err(StorageError::NotFound)
                     }
@@ -296,7 +296,7 @@ impl GlobalCache {
     pub async fn readdir<L: Into<GlobalLoc>>(
         self: &Arc<Self>,
         loc: L,
-    ) -> Result<Vec<(String, PathId, PathAssignment)>, StorageError> {
+    ) -> Result<Vec<(String, Inode, PathAssignment)>, StorageError> {
         let loc = loc.into();
         let this = Arc::clone(self);
 
@@ -313,7 +313,12 @@ impl GlobalCache {
                     Some(IntermediatePath { entries, .. }) => Ok(entries
                         .iter()
                         .map(|(name, pathid)| {
-                            (name.to_string(), *pathid, PathAssignment::Directory)
+                            (
+                                name.to_string(),
+                                // global inodes and pathids map 1:1
+                                Inode(pathid.as_u64()),
+                                PathAssignment::Directory,
+                            )
                         })
                         .collect()),
                 },
@@ -423,7 +428,7 @@ impl GlobalCache {
         self: &Arc<Self>,
         source: L1,
         dest: L2,
-    ) -> Result<(PathId, FileMetadata), StorageError> {
+    ) -> Result<(Inode, FileMetadata), StorageError> {
         let source = source.into();
         let dest = dest.into();
         let this = Arc::clone(self);
@@ -455,7 +460,7 @@ impl GlobalCache {
     pub async fn mkdir<L: Into<GlobalLoc>>(
         self: &Arc<Self>,
         loc: L,
-    ) -> Result<(PathId, DirMetadata), StorageError> {
+    ) -> Result<(Inode, DirMetadata), StorageError> {
         let loc = loc.into();
         let this = Arc::clone(self);
 
