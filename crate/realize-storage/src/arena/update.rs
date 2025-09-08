@@ -124,10 +124,13 @@ pub(crate) fn apply(
                 ..
             } => {
                 if let Some(index_root) = index_root {
-                    let index = txn.read_index()?;
+                    let mut index = txn.write_index()?;
+                    let mut history = txn.write_history()?;
                     if index::rename(
-                        &index,
-                        &tree,
+                        &mut index,
+                        &mut tree,
+                        &mut history,
+                        &mut dirty,
                         index_root,
                         &source,
                         &dest,

@@ -111,12 +111,15 @@ pub(crate) fn branch<
 /// Otherwise, it does nothing and returns `false`.
 pub(crate) fn rename<
     'b,
+    'c,
     L1: Into<TreeLoc<'b>>,
-    L2: Into<TreeLoc<'b>>,
+    L2: Into<TreeLoc<'c>>,
     R: AsRef<std::path::Path>,
 >(
-    index: &impl IndexReadOperations,
-    tree: &impl TreeReadOperations,
+    index: &mut WritableOpenIndex,
+    tree: &mut WritableOpenTree,
+    history: &mut WritableOpenHistory,
+    dirty: &mut WritableOpenDirty,
     root: R,
     source: L1,
     dest: L2,
@@ -124,20 +127,35 @@ pub(crate) fn rename<
     old_hash: Option<&Hash>,
 ) -> Result<bool, StorageError> {
     let root = root.as_ref();
-    let source = match tree.backtrack(source)? {
+    let source = source.into();
+    let dest = dest.into();
+    let source_path = match tree.backtrack(source.borrow())? {
         Some(p) => p,
         None => return Ok(false),
     };
-    let source_realpath = source.within(root);
-    if let Some(indexed) = index.get(tree, source)?
+    let source_realpath = source_path.within(root);
+    if let Some(indexed) = index.get(tree, source.borrow())?
         && indexed.hash == *hash
         && indexed.matches_file(&source_realpath)
     {
-        if let Some(dest_realpath) = indexed_file_path(index, tree, root, dest, old_hash)? {
+        if let Some(dest_realpath) = indexed_file_path(index, tree, root, dest.borrow(), old_hash)?
+        {
             if let Some(parent) = dest_realpath.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            //let _ = std::fs::remove_file(&dest_realpath);
+            // This makes sure the destination is added before the
+            // source is deleted, so it won't be gone entirely from
+            // peers during the transition.
+            index.add(
+                tree,
+                history,
+                dirty,
+                dest,
+                indexed.size,
+                indexed.mtime,
+                hash.clone(),
+            )?;
+            index.remove(tree, history, dirty, source)?;
             std::fs::rename(source_realpath, dest_realpath)?;
             return Ok(true);
         }

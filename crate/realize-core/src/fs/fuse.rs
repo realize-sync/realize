@@ -1295,6 +1295,7 @@ mod tests {
                 fs::rename(&source_in_a, &dest_in_a).await.unwrap();
                 assert!(fs::metadata(&source_in_a).await.is_err());
                 assert!(fs::metadata(&dest_in_a).await.is_ok());
+                assert_eq!("source content", fs::read_to_string(&dest_in_a).await?);
 
                 // Rename should be executed on B.
                 let deadline = Instant::now() + Duration::from_secs(3);

@@ -17,6 +17,7 @@ use crate::{Blob, LocalAvailability, PathAssignment};
 use crate::{PathId, StorageError};
 use realize_types::{Arena, Hash, Path, Peer, UnixTime};
 use redb::{ReadableTable, Table};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 // TreeLoc is necessary to call ArenaCache methods
@@ -818,10 +819,14 @@ fn file_availability<'b, L: Into<TreeLoc<'b>>>(
 ) -> Result<Option<FileAvailability>, StorageError> {
     let mut avail = None;
     let pathid = tree.expect(loc)?;
+    let mut visited = HashSet::new();
     let mut next = Some(pathid);
     while let Some(pathid) = next
         && avail.is_none()
+        && !visited.contains(&pathid)
     {
+        visited.insert(pathid); // avoid loops
+        next = None;
         for entry in cache_table.range(CacheTableKey::range(pathid))? {
             let entry = entry?;
             match entry.0.value() {
