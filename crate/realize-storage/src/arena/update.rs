@@ -116,6 +116,33 @@ pub(crate) fn apply(
                     }
                 }
             }
+            Notification::Rename {
+                source,
+                dest,
+                hash,
+                old_hash,
+                ..
+            } => {
+                if let Some(index_root) = index_root {
+                    let index = txn.read_index()?;
+                    if index::rename(
+                        &index,
+                        &tree,
+                        index_root,
+                        &source,
+                        &dest,
+                        &hash,
+                        old_hash.as_ref(),
+                    )? {
+                        log::debug!("[{arena}] renamed {source} {hash} -> {dest}");
+                    } else {
+                        log::debug!(
+                            "[{arena}] wrong versions; ignored:
+  rename {source} {hash} -> {dest} {old_hash:?}"
+                        )
+                    }
+                }
+            }
         }
     }
     txn.commit()?;

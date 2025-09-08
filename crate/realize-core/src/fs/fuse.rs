@@ -379,6 +379,38 @@ impl Filesystem for RealizeFs {
             }
         });
     }
+
+    fn rename(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        newparent: u64,
+        newname: &std::ffi::OsStr,
+        flags: u32,
+        reply: fuser::ReplyEmpty,
+    ) {
+        if (flags & (!nix::libc::RENAME_NOREPLACE)) != 0 {
+            // only NOREPLACE is supported
+            reply.error(nix::libc::EINVAL);
+            return;
+        }
+        let noreplace = (flags & nix::libc::RENAME_NOREPLACE) != 0;
+
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_owned();
+        let newname = newname.to_owned();
+
+        self.handle.spawn(async move {
+            match inner
+                .rename(parent, name, newparent, newname, noreplace)
+                .await
+            {
+                Err(err) => reply.error(err.log_and_convert()),
+                Ok(()) => reply.ok(),
+            }
+        });
+    }
 }
 
 struct InnerRealizeFs {
@@ -511,6 +543,28 @@ impl InnerRealizeFs {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
 
         self.cache.rmdir((Inode(parent), name)).await?;
+
+        Ok(())
+    }
+
+    async fn rename(
+        &self,
+        old_parent: u64,
+        old_name: OsString,
+        new_parent: u64,
+        new_name: OsString,
+        noreplace: bool,
+    ) -> Result<(), FuseError> {
+        let old_name = old_name.to_str().ok_or(FuseError::Utf8)?;
+        let new_name = new_name.to_str().ok_or(FuseError::Utf8)?;
+
+        self.cache
+            .rename(
+                (Inode(old_parent), old_name),
+                (Inode(new_parent), new_name),
+                noreplace,
+            )
+            .await?;
 
         Ok(())
     }
@@ -651,7 +705,7 @@ fn io_errno(kind: std::io::ErrorKind) -> c_int {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc::testing::HouseholdFixture;
+    use crate::rpc::testing::{self, HouseholdFixture};
     use realize_storage::utils::hash;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::PathBuf;
@@ -1199,6 +1253,63 @@ mod tests {
                 let ret = fs::metadata(&dir_to_remove_path).await;
                 assert!(ret.is_err());
                 assert_eq!(std::io::ErrorKind::NotFound, ret.err().unwrap().kind());
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn rename() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                testing::connect(&household_a, b).await?;
+
+                // Create a file in peer B's arena
+                fixture
+                    .inner
+                    .write_file(b, "source.txt", "source content")
+                    .await?;
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "source.txt", &hash::digest("source content"))
+                    .await?;
+
+                fixture.mount(household_a).await?;
+
+                let mountpoint = fixture.mount_path();
+                let source_in_a = mountpoint.join("myarena/source.txt");
+                let dest_in_a = mountpoint.join("myarena/dest.txt");
+
+                assert!(fs::metadata(&source_in_a).await.is_ok());
+                fs::rename(&source_in_a, &dest_in_a).await.unwrap();
+                assert!(fs::metadata(&source_in_a).await.is_err());
+                assert!(fs::metadata(&dest_in_a).await.is_ok());
+
+                // Rename should be executed on B.
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let root_b = fixture.inner.arena_root(b);
+                let source_in_b = root_b.join("source.txt");
+                let dest_in_b = root_b.join("dest.txt");
+                while fs::metadata(&source_in_b).await.is_ok() && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                while fs::metadata(&dest_in_b).await.is_err() && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert!(fs::metadata(&dest_in_b).await.is_ok());
+                assert!(fs::metadata(&source_in_b).await.is_err());
+                assert_eq!("source content", fs::read_to_string(dest_in_b).await?);
 
                 Ok::<(), anyhow::Error>(())
             })

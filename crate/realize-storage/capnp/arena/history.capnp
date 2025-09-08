@@ -13,6 +13,7 @@ struct HistoryTableEntry {
     remove @2: Remove;
     drop @3: Drop;
     branch @4: Branch;
+    rename @5: Rename;
   }
 
   struct Add {
@@ -35,6 +36,13 @@ struct HistoryTableEntry {
   }
 
   struct Branch {
+    path @0: Text;
+    destPath @1: Text;
+    hash @2: Data;
+    oldHash @3: Data;
+  }
+  
+  struct Rename {
     path @0: Text;
     destPath @1: Text;
     hash @2: Data;

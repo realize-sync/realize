@@ -146,6 +146,32 @@ pub enum Notification {
     /// the notification.
     Branch {
         arena: Arena,
+
+        /// Notification index.
+        ///
+        /// Should be stored and reported back as [Progress::last_seen] when re-subscribing.
+        index: u64,
+
+        source: Path,
+        dest: Path,
+        hash: Hash,
+        old_hash: Option<Hash>,
+    },
+
+    /// `source` version `hash` should be moved to `dest`,
+    /// replacing `dest` old content `old_hash`.
+    ///
+    /// This a request made to the owner(s) of source. It doesn't
+    /// imply that dest is available for download from the sender of
+    /// the notification.
+    Rename {
+        arena: Arena,
+
+        /// Notification index.
+        ///
+        /// Should be stored and reported back as [Progress::last_seen] when re-subscribing.
+        index: u64,
+
         source: Path,
         dest: Path,
         hash: Hash,
@@ -165,6 +191,7 @@ impl Notification {
             Notification::CatchupComplete { arena, .. } => *arena,
             Notification::Connected { arena, .. } => *arena,
             Notification::Branch { arena, .. } => *arena,
+            Notification::Rename { arena, .. } => *arena,
         }
     }
     pub fn path(&self) -> Option<&Path> {
@@ -178,6 +205,7 @@ impl Notification {
             Notification::CatchupComplete { .. } => None,
             Notification::Connected { .. } => None,
             Notification::Branch { source, .. } => Some(source),
+            Notification::Rename { source, .. } => Some(source),
         }
     }
     pub fn index(&self) -> Option<u64> {
@@ -190,7 +218,8 @@ impl Notification {
             Notification::Catchup { .. } => None,
             Notification::CatchupComplete { index, .. } => Some(*index),
             Notification::Connected { .. } => None,
-            Notification::Branch { .. } => None,
+            Notification::Branch { index, .. } => Some(*index),
+            Notification::Rename { index, .. } => Some(*index),
         }
     }
 }
@@ -394,6 +423,15 @@ async fn send_notifications(
             }
             HistoryTableEntry::Branch(source, dest, hash, old_hash) => Some(Notification::Branch {
                 arena: db.arena(),
+                index: hist_index,
+                source,
+                dest,
+                hash,
+                old_hash,
+            }),
+            HistoryTableEntry::Rename(source, dest, hash, old_hash) => Some(Notification::Rename {
+                arena: db.arena(),
+                index: hist_index,
                 source,
                 dest,
                 hash,
@@ -815,6 +853,7 @@ mod tests {
                 dest: dst,
                 hash,
                 old_hash,
+                ..
             } => {
                 assert_eq!(arena, test_arena());
                 assert_eq!(src, source);

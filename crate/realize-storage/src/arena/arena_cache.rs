@@ -335,6 +335,51 @@ impl<'a> WritableOpenCache<'a> {
         Ok(())
     }
 
+    /// Rename a file from one location to another.
+    pub(crate) fn rename<'l1, 'l2, L1: Into<TreeLoc<'l1>>, L2: Into<TreeLoc<'l2>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
+        history: &mut WritableOpenHistory,
+        dirty: &mut WritableOpenDirty,
+        source: L1,
+        dest: L2,
+        noreplace: bool,
+    ) -> Result<(), StorageError> {
+        let source = source.into();
+        let source_pathid = tree.expect(source.borrow())?;
+        // get_at_pathid_or_err requires a file. TODO:support directory moves
+        let mut entry = self.get_at_pathid_or_err(source_pathid)?;
+        entry.branched_from = Some(source_pathid);
+
+        let dest = dest.into();
+        let dest_pathid = tree.setup(dest.borrow())?;
+        let old_hash = self.get_at_pathid(dest_pathid)?.map(|e| e.hash);
+        if old_hash.is_some() && noreplace {
+            return Err(StorageError::AlreadyExists);
+        }
+
+        self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &entry)?;
+        self.rm_default_file_entry(tree, blobs, dirty, source_pathid)?;
+
+        // swap source and destination inodes, to meet FUSE's
+        // expectation of what rename does.
+        let source_inode = self.map_to_inode(source_pathid)?;
+        let dest_inode = self.map_to_inode(dest_pathid)?;
+        self.pathid_to_inode.insert(source_pathid, dest_inode)?;
+        self.pathid_to_inode.insert(dest_pathid, source_inode)?;
+        self.inode_to_pathid.insert(source_inode, dest_pathid)?;
+        self.inode_to_pathid.insert(dest_inode, source_pathid)?;
+
+        if let (Some(source_path), Some(dest_path)) =
+            (tree.backtrack(source)?, tree.backtrack(dest)?)
+        {
+            history.request_rename(&source_path, &dest_path, &entry.hash, old_hash.as_ref())?;
+        }
+
+        Ok(())
+    }
+
     /// Branch a file to another location in the tree.
     pub(crate) fn branch<'l1, 'l2, L1: Into<TreeLoc<'l1>>, L2: Into<TreeLoc<'l2>>>(
         &mut self,
@@ -1014,6 +1059,35 @@ impl ArenaCache {
         txn.commit()?;
 
         Ok(result)
+    }
+
+    pub(crate) fn rename(
+        &self,
+        source: impl Into<CacheLoc>,
+        dest: impl Into<CacheLoc>,
+        noreplace: bool,
+    ) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut tree = txn.write_tree()?;
+            let mut blobs = txn.write_blobs()?;
+            let mut history = txn.write_history()?;
+            let mut dirty = txn.write_dirty()?;
+            let mut cache = txn.write_cache()?;
+
+            cache.rename(
+                &mut tree,
+                &mut blobs,
+                &mut history,
+                &mut dirty,
+                source.into().into_tree_loc(&cache)?,
+                dest.into().into_tree_loc(&cache)?,
+                noreplace,
+            )?;
+        };
+        txn.commit()?;
+
+        Ok(())
     }
 
     pub(crate) fn update(

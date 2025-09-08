@@ -131,6 +131,7 @@ struct Notification {
     catchupComplete @5: CatchupComplete;
     connected @6: Connected;
     branch @8: Branch;
+    rename @9: Rename;
   }
 }
 
@@ -184,10 +185,20 @@ struct Connected {
 
 struct Branch {
   arena @0: Text;
-  source @1: Text;
-  dest @2: Text;
-  hash @3: Data;
-  oldHash @4: Data;
+  index @1: UInt64;
+  source @2: Text;
+  dest @3: Text;
+  hash @4: Data;
+  oldHash @5: Data;
+}
+
+struct Rename {
+  arena @0: Text;
+  index @1: UInt64;
+  source @2: Text;
+  dest @3: Text;
+  hash @4: Data;
+  oldHash @5: Data;
 }
 
 struct Time {

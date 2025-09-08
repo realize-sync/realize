@@ -14,6 +14,7 @@ use realize_types::{ByteRange, ByteRanges, Hash};
 use redb::{ReadableTable, Table};
 use std::cmp::{Reverse, min};
 use std::collections::HashMap;
+use std::fs;
 use std::io::{SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
@@ -452,6 +453,7 @@ impl<'a> WritableOpenBlob<'a> {
 
             // Existing entry cannot be reuse; remove.
             self.remove_from_queue(&e)?;
+            let _ = fs::remove_file(self.subsystem.blob_dir.join(pathid.hex()));
         }
         let blob_path = self.prepare_blob_file(pathid, size)?;
         let queue = choose_queue(tree, marks, pathid)?;
@@ -481,6 +483,7 @@ impl<'a> WritableOpenBlob<'a> {
         if !blob_dir.exists() {
             std::fs::create_dir_all(blob_dir)?;
         }
+
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)

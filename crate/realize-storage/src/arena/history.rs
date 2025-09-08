@@ -195,6 +195,27 @@ impl<'a> WritableOpenHistory<'a> {
         Ok(())
     }
 
+    /// Ask the owner of the files to rename source to dest.
+    pub(crate) fn request_rename(
+        &mut self,
+        source: &Path,
+        dest: &Path,
+        hash: &Hash,
+        old_hash: Option<&Hash>,
+    ) -> Result<(), StorageError> {
+        let index = self.allocate_history_index()?;
+        let ev = HistoryTableEntry::Rename(
+            source.clone(),
+            dest.clone(),
+            hash.clone(),
+            old_hash.cloned(),
+        );
+        log::info!("[{}] History #{index}: {ev:?}", self.history.arena);
+        self.table.insert(index, Holder::with_content(ev)?)?;
+
+        Ok(())
+    }
+
     /// Allocate a new index and ping the watch channel.
     fn allocate_history_index(&mut self) -> Result<u64, StorageError> {
         let entry_index = 1 + last_history_index(&mut self.table)?;

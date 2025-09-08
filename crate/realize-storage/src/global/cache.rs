@@ -456,6 +456,39 @@ impl GlobalCache {
         .await?
     }
 
+    pub async fn rename<L1: Into<GlobalLoc>, L2: Into<GlobalLoc>>(
+        self: &Arc<Self>,
+        source: L1,
+        dest: L2,
+        noreplace: bool,
+    ) -> Result<(), StorageError> {
+        let source = source.into();
+        let dest = dest.into();
+        let this = Arc::clone(self);
+
+        task::spawn_blocking(move || {
+            let txn = this.db.begin_read()?;
+            match (
+                this.resolve_loc(&txn, source)?,
+                this.resolve_loc(&txn, dest)?,
+            ) {
+                (
+                    ResolvedLoc::InArena(source_arena, source),
+                    ResolvedLoc::InArena(dest_arena, dest),
+                ) => {
+                    if source_arena != dest_arena {
+                        return Err(StorageError::CrossesDevices);
+                    }
+                    let cache = this.arena_cache(source_arena)?;
+                    cache.rename(source, dest, noreplace)
+                }
+                (ResolvedLoc::Global(_), ResolvedLoc::Global(_)) => Err(StorageError::IsADirectory),
+                (_, _) => Err(StorageError::CrossesDevices),
+            }
+        })
+        .await?
+    }
+
     /// Create a directory at the given path in the specified arena.
     pub async fn mkdir<L: Into<GlobalLoc>>(
         self: &Arc<Self>,

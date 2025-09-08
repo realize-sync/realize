@@ -99,6 +99,53 @@ pub(crate) fn branch<
     Ok(false)
 }
 
+/// Move a file from `source` to `dest` if possible.
+///
+/// This function moves a file, possibly overwriting `dest`, and
+/// returns `true` if the following conditions are met:
+///
+/// - `source` must exist, and have hash `hash`
+/// - `dest` must match `old_hash`, that is, if `old_hash` is None, it
+///   must not exist and otherwise it must have hash `old_hash`
+///
+/// Otherwise, it does nothing and returns `false`.
+pub(crate) fn rename<
+    'b,
+    L1: Into<TreeLoc<'b>>,
+    L2: Into<TreeLoc<'b>>,
+    R: AsRef<std::path::Path>,
+>(
+    index: &impl IndexReadOperations,
+    tree: &impl TreeReadOperations,
+    root: R,
+    source: L1,
+    dest: L2,
+    hash: &Hash,
+    old_hash: Option<&Hash>,
+) -> Result<bool, StorageError> {
+    let root = root.as_ref();
+    let source = match tree.backtrack(source)? {
+        Some(p) => p,
+        None => return Ok(false),
+    };
+    let source_realpath = source.within(root);
+    if let Some(indexed) = index.get(tree, source)?
+        && indexed.hash == *hash
+        && indexed.matches_file(&source_realpath)
+    {
+        if let Some(dest_realpath) = indexed_file_path(index, tree, root, dest, old_hash)? {
+            if let Some(parent) = dest_realpath.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            //let _ = std::fs::remove_file(&dest_realpath);
+            std::fs::rename(source_realpath, dest_realpath)?;
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexedFile {
     pub hash: Hash,
@@ -1981,6 +2028,161 @@ mod tests {
         assert!(
             !result,
             "Branch should fail when source doesn't exist in tree"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rename_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let tempdir = TempDir::new()?;
+
+        // Create source file on disk
+        let source_path = tempdir.child("source.txt");
+        source_path.write_str("source content")?;
+        let source_mtime = UnixTime::mtime(&source_path.path().metadata()?);
+        let source_hash = hash::digest("source content");
+
+        // Create destination file on disk with different content
+        let dest_path = tempdir.child("dest.txt");
+        dest_path.write_str("dest content")?;
+        let dest_mtime = UnixTime::mtime(&dest_path.path().metadata()?);
+        let dest_hash = hash::digest("dest content");
+
+        // Add source file to index
+        let source_index_path = Path::parse("source.txt")?;
+        super::add_file(
+            &fixture.db,
+            &source_index_path,
+            14,
+            source_mtime,
+            source_hash.clone(),
+        )?;
+
+        // Add destination file to index
+        let dest_index_path = Path::parse("dest.txt")?;
+        super::add_file(
+            &fixture.db,
+            &dest_index_path,
+            12,
+            dest_mtime,
+            dest_hash.clone(),
+        )?;
+
+        // Verify both files are in the index
+        assert!(super::has_file(&fixture.db, &source_index_path)?);
+        assert!(super::has_file(&fixture.db, &dest_index_path)?);
+
+        // Test successful rename
+        let txn = fixture.db.begin_read()?;
+        let index = txn.read_index()?;
+        let tree = txn.read_tree()?;
+
+        let result = super::rename(
+            &index,
+            &tree,
+            tempdir.path(),
+            &source_index_path,
+            &dest_index_path,
+            &source_hash,
+            Some(&dest_hash), // old_hash matches current dest
+        )?;
+
+        assert!(result, "Rename should succeed when conditions are met");
+
+        assert!(!source_path.exists());
+        assert_eq!("source content", std::fs::read_to_string(dest_path)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rename_conditions_not_met() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let tempdir = TempDir::new()?;
+
+        // Create source file on disk
+        let source_path = tempdir.child("source.txt");
+        source_path.write_str("source content")?;
+        let source_mtime = UnixTime::mtime(&source_path.path().metadata()?);
+        let source_hash = hash::digest("source content");
+
+        // Create destination file on disk with different content
+        let dest_path = tempdir.child("dest.txt");
+        dest_path.write_str("dest content")?;
+        let dest_mtime = UnixTime::mtime(&dest_path.path().metadata()?);
+        let dest_hash = hash::digest("dest content");
+
+        // Add source file to index
+        let source_index_path = Path::parse("source.txt")?;
+        super::add_file(
+            &fixture.db,
+            &source_index_path,
+            14,
+            source_mtime,
+            source_hash.clone(),
+        )?;
+
+        // Add destination file to index
+        let dest_index_path = Path::parse("dest.txt")?;
+        super::add_file(
+            &fixture.db,
+            &dest_index_path,
+            12,
+            dest_mtime,
+            dest_hash.clone(),
+        )?;
+
+        let txn = fixture.db.begin_read()?;
+        let index = txn.read_index()?;
+        let tree = txn.read_tree()?;
+
+        // Test rename failure when source hash doesn't match
+        let wrong_hash = Hash([0x99; 32]);
+        let result = super::rename(
+            &index,
+            &tree,
+            tempdir.path(),
+            &source_index_path,
+            &dest_index_path,
+            &wrong_hash,
+            Some(&dest_hash),
+        )?;
+
+        assert!(!result, "Rename should fail when source hash doesn't match");
+
+        // Test rename failure when dest doesn't match old_hash
+        let result = super::rename(
+            &index,
+            &tree,
+            tempdir.path(),
+            &source_index_path,
+            &dest_index_path,
+            &source_hash,
+            Some(&wrong_hash), // old_hash doesn't match current dest
+        )?;
+
+        assert!(
+            !result,
+            "Rename should fail when dest doesn't match old_hash"
+        );
+
+        // Test rename failure when source doesn't exist in tree
+        let nonexistent_path = Path::parse("nonexistent.txt")?;
+        let result = super::rename(
+            &index,
+            &tree,
+            tempdir.path(),
+            &nonexistent_path,
+            &dest_index_path,
+            &source_hash,
+            Some(&dest_hash),
+        )?;
+
+        assert!(
+            !result,
+            "Rename should fail when source doesn't exist in tree"
         );
 
         Ok(())

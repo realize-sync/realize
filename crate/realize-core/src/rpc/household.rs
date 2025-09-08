@@ -1257,12 +1257,29 @@ async fn do_notify(
                 let branch = branch?;
 
                 Notification::Branch {
+                    index: branch.get_index(),
                     arena: parse_arena(branch.get_arena()?)?,
                     source: parse_path(branch.get_source()?)?,
                     dest: parse_path(branch.get_dest()?)?,
                     hash: parse_hash(branch.get_hash()?)?,
                     old_hash: if branch.has_old_hash() {
                         Some(parse_hash(branch.get_old_hash()?)?)
+                    } else {
+                        None
+                    },
+                }
+            }
+            notification::Which::Rename(rename) => {
+                let rename = rename?;
+
+                Notification::Rename {
+                    index: rename.get_index(),
+                    arena: parse_arena(rename.get_arena()?)?,
+                    source: parse_path(rename.get_source()?)?,
+                    dest: parse_path(rename.get_dest()?)?,
+                    hash: parse_hash(rename.get_hash()?)?,
+                    old_hash: if rename.has_old_hash() {
+                        Some(parse_hash(rename.get_old_hash()?)?)
                     } else {
                         None
                     },
@@ -1376,12 +1393,33 @@ fn fill_catchup(
 fn fill_branch(
     mut builder: super::store_capnp::branch::Builder<'_>,
     arena: Arena,
+    index: u64,
     source: &realize_types::Path,
     dest: &realize_types::Path,
     hash: &realize_types::Hash,
     old_hash: Option<&realize_types::Hash>,
 ) {
     builder.set_arena(arena.as_str());
+    builder.set_index(index);
+    builder.set_source(source.as_str());
+    builder.set_dest(dest.as_str());
+    builder.set_hash(&hash.0);
+    if let Some(old_hash) = old_hash {
+        builder.set_old_hash(&old_hash.0);
+    }
+}
+
+fn fill_rename(
+    mut builder: super::store_capnp::rename::Builder<'_>,
+    arena: Arena,
+    index: u64,
+    source: &realize_types::Path,
+    dest: &realize_types::Path,
+    hash: &realize_types::Hash,
+    old_hash: Option<&realize_types::Hash>,
+) {
+    builder.set_arena(arena.as_str());
+    builder.set_index(index);
     builder.set_source(source.as_str());
     builder.set_dest(dest.as_str());
     builder.set_hash(&hash.0);
@@ -1487,9 +1525,27 @@ fn fill_notification(notif: &Notification, notif_builder: notification::Builder<
             dest,
             hash,
             old_hash,
+            index,
         } => fill_branch(
             notif_builder.init_branch(),
             *arena,
+            *index,
+            source,
+            dest,
+            hash,
+            old_hash.as_ref(),
+        ),
+        Notification::Rename {
+            arena,
+            source,
+            dest,
+            hash,
+            old_hash,
+            index,
+        } => fill_rename(
+            notif_builder.init_rename(),
+            *arena,
+            *index,
             source,
             dest,
             hash,
