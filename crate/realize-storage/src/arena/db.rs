@@ -13,6 +13,7 @@ use super::types::{
 };
 use crate::StorageError;
 use crate::arena::arena_cache;
+use crate::types::Inode;
 use crate::utils::holder::{ByteConversionError, Holder};
 use crate::{PathId, PathIdAllocator};
 use realize_types::Arena;
@@ -126,7 +127,7 @@ const BLOB_LRU_QUEUE_TABLE: TableDefinition<u16, Holder<QueueTableEntry>> =
 ///
 /// Key: ()
 /// Value: (PathId, PathId) (last pathid allocated, end of range)
-pub(crate) const CURRENT_INODE_RANGE_TABLE: TableDefinition<(), (PathId, PathId)> =
+pub(crate) const CURRENT_PATHID_RANGE_TABLE: TableDefinition<(), (PathId, PathId)> =
     TableDefinition::new("acache.current_pathid_range");
 
 /// Mark table for storing file marks within an Arena.
@@ -163,6 +164,17 @@ const DIRTY_COUNTER_TABLE: TableDefinition<(), u64> = TableDefinition::new("dirt
 /// Value: FailedJobTableEntry
 const FAILED_JOB_TABLE: TableDefinition<u64, Holder<FailedJobTableEntry>> =
     TableDefinition::new("failed_job");
+
+/// Maps [Inode] to [PathId].
+///
+/// In most cases, pathids are converted to inodes directly. In some cases, however
+/// a mapping is required which is what this table and its reverse provide.
+const INODE_TO_PATHID_TABLE: TableDefinition<Inode, PathId> =
+    TableDefinition::new("inode_to_pathid");
+
+/// Maps [PathId] to [Inode]; the reverse of [INODE_TO_PATHID_TABLE];
+const PATHID_TO_INODE_TABLE: TableDefinition<PathId, Inode> =
+    TableDefinition::new("pathid_to_inode");
 
 pub(crate) struct ArenaDatabase {
     db: redb::Database,
@@ -232,7 +244,7 @@ impl ArenaDatabase {
             txn.open_table(PENDING_CATCHUP_TABLE)?;
             txn.open_table(PEER_TABLE)?;
             txn.open_table(NOTIFICATION_TABLE)?;
-            txn.open_table(CURRENT_INODE_RANGE_TABLE)?;
+            txn.open_table(CURRENT_PATHID_RANGE_TABLE)?;
             txn.open_table(BLOB_TABLE)?;
             let blob_lru_queue_table = txn.open_table(BLOB_LRU_QUEUE_TABLE)?;
             txn.open_table(MARK_TABLE)?;
@@ -240,6 +252,8 @@ impl ArenaDatabase {
             let dirty_log_table = txn.open_table(DIRTY_LOG_TABLE)?;
             txn.open_table(DIRTY_COUNTER_TABLE)?;
             txn.open_table(FAILED_JOB_TABLE)?;
+            txn.open_table(PATHID_TO_INODE_TABLE)?;
+            txn.open_table(INODE_TO_PATHID_TABLE)?;
 
             dirty = Dirty::setup(&dirty_log_table)?;
             history = History::setup(arena, &history_table)?;
@@ -354,6 +368,8 @@ impl<'db> ArenaWriteTransaction<'db> {
             self.inner
                 .open_table(CACHE_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
+            self.inner.open_table(PATHID_TO_INODE_TABLE)?,
+            self.inner.open_table(INODE_TO_PATHID_TABLE)?,
             self.arena,
         ))
     }
@@ -366,6 +382,8 @@ impl<'db> ArenaWriteTransaction<'db> {
             self.inner
                 .open_table(CACHE_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
+            self.inner.open_table(PATHID_TO_INODE_TABLE)?,
+            self.inner.open_table(INODE_TO_PATHID_TABLE)?,
             self.inner.open_table(PENDING_CATCHUP_TABLE)?,
             self.arena,
         ))
@@ -414,7 +432,7 @@ impl<'db> ArenaWriteTransaction<'db> {
                 .open_table(TREE_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
             self.inner.open_table(TREE_REFCOUNT_TABLE)?,
-            self.inner.open_table(CURRENT_INODE_RANGE_TABLE)?,
+            self.inner.open_table(CURRENT_PATHID_RANGE_TABLE)?,
             &self.subsystems.tree,
         ))
     }
@@ -611,6 +629,8 @@ impl<'db> ArenaReadTransaction<'db> {
             self.inner
                 .open_table(CACHE_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
+            self.inner.open_table(PATHID_TO_INODE_TABLE)?,
+            self.inner.open_table(INODE_TO_PATHID_TABLE)?,
             self.arena,
         ))
     }

@@ -11,6 +11,7 @@ use crate::arena::history::WritableOpenHistory;
 use crate::arena::notifier::{Notification, Progress};
 use crate::arena::tree;
 use crate::arena::types::DirMetadata;
+use crate::types::Inode;
 use crate::utils::holder::Holder;
 use crate::{Blob, LocalAvailability, PathAssignment};
 use crate::{PathId, StorageError};
@@ -60,31 +61,53 @@ pub(crate) trait CacheReadOperations {
 
     /// Get the default file entry for the given pathid; fail if the entry
     /// cannot be found or if it is a directory.
-    #[allow(dead_code)]
     fn get_at_pathid_or_err(&self, pathid: PathId) -> Result<FileTableEntry, StorageError>;
+
+    /// Return the [Inode] appropriate for the given [PathId].
+    #[allow(dead_code)]
+    fn map_to_inode(&self, pathid: PathId) -> Result<Inode, StorageError>;
+
+    /// Return the [PathId] appropriate for the given [Inode].
+    #[allow(dead_code)]
+    fn map_to_ipath(&self, inode: Inode) -> Result<PathId, StorageError>;
 }
 
 /// A cache open for reading with a read transaction.
-pub(crate) struct ReadableOpenCache<T>
+pub(crate) struct ReadableOpenCache<T, PN, NP>
 where
     T: ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    PN: ReadableTable<PathId, Inode>,
+    NP: ReadableTable<Inode, PathId>,
 {
     table: T,
+    #[allow(dead_code)]
+    pathid_to_inode: PN,
+    #[allow(dead_code)]
+    inode_to_pathid: NP,
     arena: Arena,
 }
 
-impl<T> ReadableOpenCache<T>
+impl<T, PN, NP> ReadableOpenCache<T, PN, NP>
 where
     T: ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    PN: ReadableTable<PathId, Inode>,
+    NP: ReadableTable<Inode, PathId>,
 {
-    pub(crate) fn new(table: T, arena: Arena) -> Self {
-        Self { table, arena }
+    pub(crate) fn new(table: T, pathid_to_inode: PN, inode_to_pathid: NP, arena: Arena) -> Self {
+        Self {
+            table,
+            pathid_to_inode,
+            inode_to_pathid,
+            arena,
+        }
     }
 }
 
-impl<T> CacheReadOperations for ReadableOpenCache<T>
+impl<T, PN, NP> CacheReadOperations for ReadableOpenCache<T, PN, NP>
 where
     T: ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    PN: ReadableTable<PathId, Inode>,
+    NP: ReadableTable<Inode, PathId>,
 {
     fn lookup<'b, L: Into<TreeLoc<'b>>>(
         &self,
@@ -125,6 +148,14 @@ where
 
     fn get_at_pathid_or_err(&self, pathid: PathId) -> Result<FileTableEntry, StorageError> {
         get_default_entry_or_err(&self.table, pathid)
+    }
+
+    fn map_to_inode(&self, pathid: PathId) -> Result<Inode, StorageError> {
+        map_to_inode(&self.pathid_to_inode, pathid)
+    }
+
+    fn map_to_ipath(&self, inode: Inode) -> Result<PathId, StorageError> {
+        map_to_pathid(&self.inode_to_pathid, inode)
     }
 }
 
@@ -168,6 +199,14 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
 
     fn get_at_pathid_or_err(&self, pathid: PathId) -> Result<FileTableEntry, StorageError> {
         get_default_entry_or_err(&self.table, pathid)
+    }
+
+    fn map_to_inode(&self, pathid: PathId) -> Result<Inode, StorageError> {
+        map_to_inode(&self.pathid_to_inode, pathid)
+    }
+
+    fn map_to_ipath(&self, inode: Inode) -> Result<PathId, StorageError> {
+        map_to_pathid(&self.inode_to_pathid, inode)
     }
 }
 
@@ -235,6 +274,8 @@ impl<T: CacheReadOperations> CacheExt for T {
 /// A cache open for writing with a write transaction.
 pub(crate) struct WritableOpenCache<'a> {
     table: Table<'a, CacheTableKey, Holder<'static, CacheTableEntry>>,
+    pathid_to_inode: Table<'a, PathId, Inode>,
+    inode_to_pathid: Table<'a, Inode, PathId>,
     pending_catchup_table: Table<'a, (&'static str, PathId), ()>,
     arena: Arena,
 }
@@ -242,11 +283,15 @@ pub(crate) struct WritableOpenCache<'a> {
 impl<'a> WritableOpenCache<'a> {
     pub(crate) fn new(
         table: Table<'a, CacheTableKey, Holder<CacheTableEntry>>,
+        pathid_to_inode: Table<'a, PathId, Inode>,
+        inode_to_pathid: Table<'a, Inode, PathId>,
         pending_catchup_table: Table<'a, (&'static str, PathId), ()>,
         arena: Arena,
     ) -> Self {
         Self {
             table,
+            pathid_to_inode,
+            inode_to_pathid,
             pending_catchup_table,
             arena,
         }
@@ -1255,6 +1300,30 @@ fn check_is_dir(
         Some(PathAssignment::File) => Err(StorageError::NotADirectory),
         Some(PathAssignment::Directory) => Ok(()), // continue
     }
+}
+
+#[allow(dead_code)]
+fn map_to_inode(
+    pathid_to_inode: &impl ReadableTable<PathId, Inode>,
+    pathid: PathId,
+) -> Result<Inode, StorageError> {
+    if let Some(inode) = pathid_to_inode.get(pathid)? {
+        return Ok(inode.value());
+    }
+
+    Ok(Inode(pathid.as_u64()))
+}
+
+#[allow(dead_code)]
+fn map_to_pathid(
+    inode_to_pathid: &impl ReadableTable<Inode, PathId>,
+    inode: Inode,
+) -> Result<PathId, StorageError> {
+    if let Some(pathid) = inode_to_pathid.get(inode)? {
+        return Ok(pathid.value());
+    }
+
+    Ok(PathId(inode.as_u64()))
 }
 
 #[cfg(test)]
