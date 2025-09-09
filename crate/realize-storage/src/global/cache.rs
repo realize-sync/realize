@@ -4,7 +4,6 @@
 
 use super::db::{GlobalDatabase, GlobalReadTransaction};
 use super::pathid_allocator::PathIdAllocator;
-use super::types::PathAssignment;
 use crate::arena::arena_cache::{ArenaCache, CacheLoc};
 use crate::arena::notifier::{Notification, Progress};
 use crate::arena::types::{DirMetadata, LocalAvailability};
@@ -306,7 +305,7 @@ impl GlobalCache {
     pub async fn readdir<L: Into<GlobalLoc>>(
         self: &Arc<Self>,
         loc: L,
-    ) -> Result<Vec<(String, Inode, PathAssignment)>, StorageError> {
+    ) -> Result<Vec<(String, Inode, crate::arena::types::Metadata)>, StorageError> {
         let loc = loc.into();
         let this = Arc::clone(self);
 
@@ -320,14 +319,17 @@ impl GlobalCache {
                 ResolvedLoc::Global(None) => Err(StorageError::NotFound),
                 ResolvedLoc::Global(Some(pathid)) => match this.paths.get(&pathid) {
                     None => Err(StorageError::NotFound),
-                    Some(IntermediatePath { entries, .. }) => Ok(entries
+                    Some(IntermediatePath { entries, mtime, .. }) => Ok(entries
                         .iter()
                         .map(|(name, pathid)| {
                             (
                                 name.to_string(),
                                 // global inodes and pathids map 1:1
                                 Inode(pathid.as_u64()),
-                                PathAssignment::Directory,
+                                crate::arena::types::Metadata::Dir(crate::arena::types::DirMetadata {
+                                    read_only: true, // Global directories are read-only
+                                    mtime: *mtime,
+                                }),
                             )
                         })
                         .collect()),
@@ -904,32 +906,42 @@ mod tests {
         .await?;
 
         let cache = &fixture.cache;
-        assert_unordered::assert_eq_unordered!(
-            vec![
-                ("arenas".to_string(), PathAssignment::Directory),
-                ("other".to_string(), PathAssignment::Directory)
-            ],
-            cache
-                .readdir(PathId(1))
-                .await?
-                .into_iter()
-                .map(|(name, _, assignment)| (name, assignment))
-                .collect::<Vec<_>>(),
-        );
+        let entries = cache.readdir(PathId(1)).await?;
+        assert_eq!(entries.len(), 2);
+        
+        let mut names: Vec<String> = entries.iter().map(|(name, _, _)| name.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec!["arenas", "other"]);
+        
+        // Verify all entries are directories and read-only
+        for (name, _, metadata) in entries {
+            match metadata {
+                crate::arena::types::Metadata::Dir(dir_meta) => {
+                    assert!(dir_meta.read_only);
+                    assert_ne!(dir_meta.mtime, UnixTime::ZERO);
+                }
+                _ => panic!("Expected directory metadata for {}", name),
+            }
+        }
 
         let (arenas, _) = cache.lookup((PathId(1), "arenas")).await?;
-        assert_unordered::assert_eq_unordered!(
-            vec![
-                ("test1".to_string(), PathAssignment::Directory),
-                ("test2".to_string(), PathAssignment::Directory)
-            ],
-            cache
-                .readdir(arenas)
-                .await?
-                .into_iter()
-                .map(|(name, _, assignment)| (name, assignment))
-                .collect::<Vec<_>>(),
-        );
+        let entries = cache.readdir(arenas).await?;
+        assert_eq!(entries.len(), 2);
+        
+        let mut names: Vec<String> = entries.iter().map(|(name, _, _)| name.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec!["test1", "test2"]);
+        
+        // Verify all entries are directories and read-only
+        for (name, _, metadata) in entries {
+            match metadata {
+                crate::arena::types::Metadata::Dir(dir_meta) => {
+                    assert!(dir_meta.read_only);
+                    assert_ne!(dir_meta.mtime, UnixTime::ZERO);
+                }
+                _ => panic!("Expected directory metadata for {}", name),
+            }
+        }
 
         assert!(
             cache

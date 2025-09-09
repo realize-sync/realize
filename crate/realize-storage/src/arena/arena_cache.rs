@@ -11,9 +11,10 @@ use crate::arena::history::WritableOpenHistory;
 use crate::arena::notifier::{Notification, Progress};
 use crate::arena::tree;
 use crate::arena::types::DirMetadata;
+use crate::global::types::PathAssignment;
 use crate::types::Inode;
 use crate::utils::holder::Holder;
-use crate::{Blob, LocalAvailability, PathAssignment};
+use crate::{Blob, LocalAvailability};
 use crate::{PathId, StorageError};
 use realize_types::{Arena, Hash, Path, Peer, UnixTime};
 use redb::{ReadableTable, Table};
@@ -45,7 +46,7 @@ pub(crate) trait CacheReadOperations {
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> impl Iterator<Item = Result<(String, PathId, PathAssignment), StorageError>>;
+    ) -> impl Iterator<Item = Result<(String, PathId, crate::arena::types::Metadata), StorageError>>;
 
     /// Get the default file entry for the given pathid.
     fn get_at_pathid(&self, pathid: PathId) -> Result<Option<FileTableEntry>, StorageError>;
@@ -105,7 +106,7 @@ where
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<crate::arena::types::Metadata, StorageError> {
-        metadata(&self.table, tree.expect(loc)?)
+        metadata(&self.table, tree.expect(loc)?)?.ok_or(StorageError::NotFound)
     }
 
     fn file_availability<'b, L: Into<TreeLoc<'b>>>(
@@ -121,7 +122,8 @@ where
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> impl Iterator<Item = Result<(String, PathId, PathAssignment), StorageError>> {
+    ) -> impl Iterator<Item = Result<(String, PathId, crate::arena::types::Metadata), StorageError>>
+    {
         ReadDirIterator::new(&self.table, tree, loc)
     }
 
@@ -148,7 +150,7 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<crate::arena::types::Metadata, StorageError> {
-        metadata(&self.table, tree.expect(loc)?)
+        metadata(&self.table, tree.expect(loc)?)?.ok_or(StorageError::NotFound)
     }
 
     fn file_availability<'b, L: Into<TreeLoc<'b>>>(
@@ -164,7 +166,8 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> impl Iterator<Item = Result<(String, PathId, PathAssignment), StorageError>> {
+    ) -> impl Iterator<Item = Result<(String, PathId, crate::arena::types::Metadata), StorageError>>
+    {
         ReadDirIterator::new(&self.table, tree, loc)
     }
 
@@ -784,7 +787,7 @@ fn lookup<'b, L: Into<TreeLoc<'b>>>(
     loc: L,
 ) -> Result<(PathId, crate::arena::types::Metadata), StorageError> {
     let pathid = tree.expect(loc)?;
-    let metadata = metadata(cache_table, pathid)?;
+    let metadata = metadata(cache_table, pathid)?.ok_or(StorageError::NotFound)?;
 
     return Ok((pathid, metadata));
 }
@@ -793,27 +796,25 @@ fn lookup<'b, L: Into<TreeLoc<'b>>>(
 fn metadata(
     cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
     pathid: PathId,
-) -> Result<crate::arena::types::Metadata, StorageError> {
-    let e = cache_table
-        .get(CacheTableKey::Default(pathid))?
-        .ok_or(StorageError::NotFound)?;
-
-    match e.value().parse()? {
-        CacheTableEntry::File(file_entry) => Ok(crate::arena::types::Metadata::File(
-            crate::arena::types::FileMetadata {
-                size: file_entry.size,
-                mtime: file_entry.mtime,
-                hash: file_entry.hash,
-            },
-        )),
-        CacheTableEntry::Dir(dir_entry) => {
-            Ok(crate::arena::types::Metadata::Dir(
-                crate::arena::types::DirMetadata {
+) -> Result<Option<crate::arena::types::Metadata>, StorageError> {
+    if let Some(e) = cache_table.get(CacheTableKey::Default(pathid))? {
+        Ok(Some(match e.value().parse()? {
+            CacheTableEntry::File(file_entry) => {
+                crate::arena::types::Metadata::File(crate::arena::types::FileMetadata {
+                    size: file_entry.size,
+                    mtime: file_entry.mtime,
+                    hash: file_entry.hash,
+                })
+            }
+            CacheTableEntry::Dir(dir_entry) => {
+                crate::arena::types::Metadata::Dir(crate::arena::types::DirMetadata {
                     read_only: false, // Arena directories are writable
                     mtime: dir_entry.mtime,
-                },
-            ))
-        }
+                })
+            }
+        }))
+    } else {
+        Ok(None)
     }
 }
 
@@ -897,16 +898,16 @@ impl<'a, 'b, T> Iterator for ReadDirIterator<'a, 'b, T>
 where
     T: ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
 {
-    type Item = Result<(String, PathId, PathAssignment), StorageError>;
+    type Item = Result<(String, PathId, crate::arena::types::Metadata), StorageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(entry) = self.iter.next() {
             match entry {
                 Err(err) => return Some(Err(err)),
                 Ok((name, pathid)) => {
-                    match pathid_assignment(self.table, pathid) {
+                    match metadata(self.table, pathid) {
                         Err(err) => return Some(Err(err)),
-                        Ok(Some(assignment)) => return Some(Ok((name, pathid, assignment))),
+                        Ok(Some(metadata)) => return Some(Ok((name, pathid, metadata))),
                         Ok(None) => {} // not in the cache; skip
                     }
                 }
@@ -1014,14 +1015,14 @@ impl ArenaCache {
     pub(crate) fn readdir(
         &self,
         loc: impl Into<CacheLoc>,
-    ) -> Result<Vec<(String, Inode, PathAssignment)>, StorageError> {
+    ) -> Result<Vec<(String, Inode, crate::arena::types::Metadata)>, StorageError> {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
         let mut vec = vec![];
         for res in cache.readdir(&tree, loc.into().into_tree_loc(&cache)?) {
-            let (name, pathid, assn) = res?;
-            vec.push((name, cache.map_to_inode(pathid)?, assn));
+            let (name, pathid, metadata) = res?;
+            vec.push((name, cache.map_to_inode(pathid)?, metadata));
         }
 
         Ok(vec)
@@ -1435,7 +1436,7 @@ mod tests {
     use crate::arena::tree::{TreeExt, TreeLoc, TreeReadOperations};
     use crate::arena::types::{DirMetadata, HistoryTableEntry};
     use crate::utils::hash;
-    use crate::{PathAssignment, PathId, StorageError};
+    use crate::{PathId, StorageError};
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Hash, Path, Peer, UnixTime};
@@ -2163,28 +2164,31 @@ mod tests {
         fixture.add_to_cache(&Path::parse("dir/subdir/file3.txt")?, 300, mtime)?;
 
         let arena_root = fixture.db.tree().root();
-        assert_unordered::assert_eq_unordered!(
-            vec![("dir".to_string(), PathAssignment::Directory),],
-            acache
-                .readdir(arena_root)?
-                .into_iter()
-                .map(|(name, _, assignment)| (name, assignment))
-                .collect::<Vec<_>>(),
-        );
+        let entries = acache.readdir(arena_root)?;
+        assert_eq!(entries.len(), 1);
+        let (name, _, metadata) = &entries[0];
+        assert_eq!(name, "dir");
+        match metadata {
+            crate::arena::types::Metadata::Dir(_) => {}
+            _ => panic!("Expected directory metadata"),
+        }
 
         let (pathid, _) = acache.lookup((arena_root, "dir"))?;
-        assert_unordered::assert_eq_unordered!(
-            vec![
-                ("file1.txt".to_string(), PathAssignment::File),
-                ("file2.txt".to_string(), PathAssignment::File),
-                ("subdir".to_string(), PathAssignment::Directory),
-            ],
-            acache
-                .readdir(pathid)?
-                .into_iter()
-                .map(|(name, _, assignment)| (name, assignment))
-                .collect::<Vec<_>>(),
-        );
+        let entries = acache.readdir(pathid)?;
+        assert_eq!(entries.len(), 3);
+
+        let mut names: Vec<String> = entries.iter().map(|(name, _, _)| name.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec!["file1.txt", "file2.txt", "subdir"]);
+
+        // Verify metadata types
+        for (name, _, metadata) in entries {
+            match (name.as_str(), &metadata) {
+                ("file1.txt" | "file2.txt", crate::arena::types::Metadata::File(_)) => {}
+                ("subdir", crate::arena::types::Metadata::Dir(_)) => {}
+                _ => panic!("Unexpected entry: {} with metadata {:?}", name, metadata),
+            }
+        }
 
         Ok(())
     }

@@ -33,7 +33,6 @@ pub use arena::types::{
 };
 pub use error::StorageError;
 pub use global::cache::{GlobalCache, GlobalLoc};
-pub use global::types::PathAssignment;
 pub use types::{Inode, JobId, PathId};
 
 /// Local storage, including the real store and an unreal cache.

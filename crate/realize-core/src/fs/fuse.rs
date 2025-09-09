@@ -3,7 +3,7 @@ use crate::fs::downloader::Downloader;
 use fuser::{Filesystem, MountOption};
 use nix::libc::c_int;
 use realize_storage::{
-    DirMetadata, FileMetadata, GlobalCache, Inode, Metadata, PathAssignment, StorageError,
+    DirMetadata, FileMetadata, GlobalCache, Inode, Metadata, StorageError,
 };
 use std::ffi::OsString;
 use std::time::SystemTime;
@@ -474,13 +474,13 @@ impl InnerRealizeFs {
             Ok(i) => i + 1,
             Err(i) => i,
         };
-        for (name, pathid, assignment) in entries.into_iter().skip(start) {
+        for (name, pathid, metadata) in entries.into_iter().skip(start) {
             if reply.add(
                 pathid.as_u64(),
                 pathid.as_u64() as i64,
-                match assignment {
-                    PathAssignment::Directory => fuser::FileType::Directory,
-                    PathAssignment::File => fuser::FileType::RegularFile,
+                match metadata {
+                    Metadata::Dir(_) => fuser::FileType::Directory,
+                    Metadata::File(_) => fuser::FileType::RegularFile,
                 },
                 name,
             ) {
