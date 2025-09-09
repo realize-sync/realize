@@ -277,6 +277,7 @@ impl StorageJobProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arena::arena_cache::CacheExt;
     use crate::arena::index::IndexedFile;
     use crate::utils::hash;
     use crate::{ArenaCache, Blob, LocalAvailability, Mark, Notification, PathId};

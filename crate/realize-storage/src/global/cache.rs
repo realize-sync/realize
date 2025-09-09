@@ -240,7 +240,7 @@ impl GlobalCache {
     pub async fn lookup<L: Into<GlobalLoc>>(
         self: &Arc<Self>,
         loc: L,
-    ) -> Result<(Inode, PathAssignment), StorageError> {
+    ) -> Result<(Inode, crate::arena::types::Metadata), StorageError> {
         let loc = loc.into();
         let this = Arc::clone(self);
 
@@ -255,7 +255,17 @@ impl GlobalCache {
                     if let Some(pathid) = pathid
                         && this.paths.contains_key(&pathid)
                     {
-                        Ok((Inode(pathid.as_u64()), PathAssignment::Directory))
+                        // For global directories, construct DirMetadata
+                        if let Some(IntermediatePath { mtime, .. }) = this.paths.get(&pathid) {
+                            Ok((Inode(pathid.as_u64()), crate::arena::types::Metadata::Dir(
+                                crate::arena::types::DirMetadata {
+                                    read_only: true, // Global directories are read-only
+                                    mtime: *mtime,
+                                },
+                            )))
+                        } else {
+                            Err(StorageError::NotFound)
+                        }
                     } else {
                         Err(StorageError::NotFound)
                     }
@@ -402,6 +412,39 @@ impl GlobalCache {
         task::spawn_blocking(move || {
             let (cache, loc) = this.resolve_arena_loc(loc)?;
             cache.file_metadata(loc)
+        })
+        .await?
+    }
+
+    pub async fn metadata<L: Into<GlobalLoc>>(
+        self: &Arc<Self>,
+        loc: L,
+    ) -> Result<crate::arena::types::Metadata, StorageError> {
+        let loc = loc.into();
+        let this = Arc::clone(self);
+
+        task::spawn_blocking(move || {
+            let txn = this.db.begin_read()?;
+            match this.resolve_loc(&txn, loc)? {
+                ResolvedLoc::InArena(arena, loc) => {
+                    let cache = this.arena_cache(arena)?;
+                    cache.metadata(loc)
+                }
+                ResolvedLoc::Global(Some(pathid)) => {
+                    // For global directories, we need to construct DirMetadata
+                    if let Some(IntermediatePath { mtime, .. }) = this.paths.get(&pathid) {
+                        Ok(crate::arena::types::Metadata::Dir(
+                            crate::arena::types::DirMetadata {
+                                read_only: true, // Global directories are read-only
+                                mtime: *mtime,
+                            },
+                        ))
+                    } else {
+                        Err(StorageError::NotFound)
+                    }
+                }
+                ResolvedLoc::Global(None) => Err(StorageError::NotFound),
+            }
         })
         .await?
     }
@@ -823,17 +866,17 @@ mod tests {
 
         let cache = &fixture.cache;
 
-        let (arenas, assignment) = cache.lookup((PathId(1), "arenas")).await.unwrap();
-        assert_eq!(assignment, PathAssignment::Directory);
+        let (arenas, metadata) = cache.lookup((PathId(1), "arenas")).await.unwrap();
+        assert!(matches!(metadata, crate::arena::types::Metadata::Dir(_)));
 
-        let (_, assignment) = cache.lookup((PathId(1), "other")).await.unwrap();
-        assert_eq!(assignment, PathAssignment::Directory);
+        let (_, metadata) = cache.lookup((PathId(1), "other")).await.unwrap();
+        assert!(matches!(metadata, crate::arena::types::Metadata::Dir(_)));
 
-        let (_, assignment) = cache.lookup((arenas, "test1")).await.unwrap();
-        assert_eq!(assignment, PathAssignment::Directory);
+        let (_, metadata) = cache.lookup((arenas, "test1")).await.unwrap();
+        assert!(matches!(metadata, crate::arena::types::Metadata::Dir(_)));
 
-        let (_, assignment) = cache.lookup((arenas, "test2")).await.unwrap();
-        assert_eq!(assignment, PathAssignment::Directory);
+        let (_, metadata) = cache.lookup((arenas, "test2")).await.unwrap();
+        assert!(matches!(metadata, crate::arena::types::Metadata::Dir(_)));
 
         Ok(())
     }

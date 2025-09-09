@@ -25,22 +25,12 @@ pub(crate) use super::tree::TreeLoc;
 
 /// Read operations for cache. See also [CacheExt].
 pub(crate) trait CacheReadOperations {
-    /// Lookup a specific location.
-    ///
-    /// The location is usually either a path or a (pathid, name)
-    /// pair.
-    fn lookup<'b, L: Into<TreeLoc<'b>>>(
+    /// Get metadata for a file or directory.
+    fn metadata<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> Result<(PathId, PathAssignment), StorageError>;
-
-    /// Get directory modification time for the given pathid.
-    fn dir_mtime<'b, L: Into<TreeLoc<'b>>>(
-        &self,
-        tree: &impl TreeReadOperations,
-        loc: L,
-    ) -> Result<UnixTime, StorageError>;
+    ) -> Result<crate::arena::types::Metadata, StorageError>;
 
     /// Get remote file availability information for the given pathid and version.
     fn file_availability<'b, L: Into<TreeLoc<'b>>>(
@@ -110,20 +100,12 @@ where
     PN: ReadableTable<PathId, Inode>,
     NP: ReadableTable<Inode, PathId>,
 {
-    fn lookup<'b, L: Into<TreeLoc<'b>>>(
+    fn metadata<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> Result<(PathId, PathAssignment), StorageError> {
-        lookup(&self.table, tree, loc)
-    }
-
-    fn dir_mtime<'b, L: Into<TreeLoc<'b>>>(
-        &self,
-        tree: &impl TreeReadOperations,
-        loc: L,
-    ) -> Result<UnixTime, StorageError> {
-        dir_mtime(&self.table, tree, loc)
+    ) -> Result<crate::arena::types::Metadata, StorageError> {
+        metadata(&self.table, tree.expect(loc)?)
     }
 
     fn file_availability<'b, L: Into<TreeLoc<'b>>>(
@@ -161,20 +143,12 @@ where
 }
 
 impl<'a> CacheReadOperations for WritableOpenCache<'a> {
-    fn lookup<'b, L: Into<TreeLoc<'b>>>(
+    fn metadata<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> Result<(PathId, PathAssignment), StorageError> {
-        lookup(&self.table, tree, loc)
-    }
-
-    fn dir_mtime<'b, L: Into<TreeLoc<'b>>>(
-        &self,
-        tree: &impl TreeReadOperations,
-        loc: L,
-    ) -> Result<UnixTime, StorageError> {
-        dir_mtime(&self.table, tree, loc)
+    ) -> Result<crate::arena::types::Metadata, StorageError> {
+        metadata(&self.table, tree.expect(loc)?)
     }
 
     fn file_availability<'b, L: Into<TreeLoc<'b>>>(
@@ -237,6 +211,18 @@ pub(crate) trait CacheExt {
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<FileMetadata, StorageError>;
+
+    fn lookup<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<(PathId, crate::arena::types::Metadata), StorageError>;
+
+    fn dir_mtime<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<UnixTime, StorageError>;
 }
 
 impl<T: CacheReadOperations> CacheExt for T {
@@ -245,11 +231,25 @@ impl<T: CacheReadOperations> CacheExt for T {
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<FileMetadata, StorageError> {
-        let FileTableEntry {
-            size, mtime, hash, ..
-        } = self.get(tree, loc)?.ok_or(StorageError::NotFound)?;
+        self.metadata(tree, loc)?.expect_file()
+    }
 
-        Ok(FileMetadata { size, mtime, hash })
+    fn lookup<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<(PathId, crate::arena::types::Metadata), StorageError> {
+        let pathid = tree.expect(loc)?;
+
+        Ok((pathid, self.metadata(tree, pathid)?))
+    }
+
+    fn dir_mtime<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<UnixTime, StorageError> {
+        Ok(self.metadata(tree, loc)?.expect_dir()?.mtime)
     }
 
     fn get<'b, L: Into<TreeLoc<'b>>>(
@@ -782,30 +782,38 @@ fn lookup<'b, L: Into<TreeLoc<'b>>>(
     cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
     tree: &impl TreeReadOperations,
     loc: L,
-) -> Result<(PathId, PathAssignment), StorageError> {
-    if let Some(pathid) = tree.resolve(loc)? {
-        if let Some(assignment) = pathid_assignment(cache_table, pathid)? {
-            return Ok((pathid, assignment));
-        }
-    }
+) -> Result<(PathId, crate::arena::types::Metadata), StorageError> {
+    let pathid = tree.expect(loc)?;
+    let metadata = metadata(cache_table, pathid)?;
 
-    Err(StorageError::NotFound)
+    return Ok((pathid, metadata));
 }
 
-/// Get directory modification time for the given pathid.
-fn dir_mtime<'b, L: Into<TreeLoc<'b>>>(
+/// Get metadata for a file or directory.
+fn metadata(
     cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
-    tree: &impl TreeReadOperations,
-    loc: L,
-) -> Result<UnixTime, StorageError> {
-    let pathid = tree.expect(loc)?;
+    pathid: PathId,
+) -> Result<crate::arena::types::Metadata, StorageError> {
     let e = cache_table
         .get(CacheTableKey::Default(pathid))?
         .ok_or(StorageError::NotFound)?;
 
     match e.value().parse()? {
-        CacheTableEntry::Dir(dir_entry) => Ok(dir_entry.mtime),
-        CacheTableEntry::File(_) => Err(StorageError::NotADirectory),
+        CacheTableEntry::File(file_entry) => Ok(crate::arena::types::Metadata::File(
+            crate::arena::types::FileMetadata {
+                size: file_entry.size,
+                mtime: file_entry.mtime,
+                hash: file_entry.hash,
+            },
+        )),
+        CacheTableEntry::Dir(dir_entry) => {
+            Ok(crate::arena::types::Metadata::Dir(
+                crate::arena::types::DirMetadata {
+                    read_only: false, // Arena directories are writable
+                    mtime: dir_entry.mtime,
+                },
+            ))
+        }
     }
 }
 
@@ -878,7 +886,7 @@ where
             table,
             iter: match lookup(table, tree, loc) {
                 Err(err) => tree::ReadDirIterator::failed(err),
-                Ok((pathid, PathAssignment::Directory)) => tree.readdir_pathid(pathid),
+                Ok((pathid, crate::arena::types::Metadata::Dir(_))) => tree.readdir_pathid(pathid),
                 Ok(_) => tree::ReadDirIterator::failed(StorageError::NotADirectory),
             },
         }
@@ -961,13 +969,13 @@ impl ArenaCache {
     pub(crate) fn lookup(
         &self,
         loc: impl Into<CacheLoc>,
-    ) -> Result<(Inode, PathAssignment), StorageError> {
+    ) -> Result<(Inode, crate::arena::types::Metadata), StorageError> {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
-        let (pathid, assn) = cache.lookup(&tree, loc.into().into_tree_loc(&cache)?)?;
+        let (pathid, metadata) = cache.lookup(&tree, loc.into().into_tree_loc(&cache)?)?;
 
-        Ok((cache.map_to_inode(pathid)?, assn))
+        Ok((cache.map_to_inode(pathid)?, metadata))
     }
 
     pub(crate) fn file_metadata(
@@ -991,6 +999,16 @@ impl ArenaCache {
             read_only: false,
             mtime: cache.dir_mtime(&tree, loc.into().into_tree_loc(&cache)?)?,
         })
+    }
+
+    pub(crate) fn metadata(
+        &self,
+        loc: impl Into<CacheLoc>,
+    ) -> Result<crate::arena::types::Metadata, StorageError> {
+        let txn = self.db.begin_read()?;
+        let tree = txn.read_tree()?;
+        let cache = txn.read_cache()?;
+        cache.metadata(&tree, loc.into().into_tree_loc(&cache)?)
     }
 
     pub(crate) fn readdir(
@@ -1603,11 +1621,17 @@ mod tests {
 
         fixture.add_to_cache(&file_path, 100, mtime)?;
 
-        let (pathid, assignment) = acache.lookup((fixture.db.tree().root(), "a"))?;
-        assert_eq!(assignment, PathAssignment::Directory, "a");
+        let (pathid, metadata) = acache.lookup((fixture.db.tree().root(), "a"))?;
+        assert!(
+            matches!(metadata, crate::arena::types::Metadata::Dir(_)),
+            "a"
+        );
 
-        let (_, assignment) = acache.lookup((pathid, "b"))?;
-        assert_eq!(assignment, PathAssignment::Directory, "b");
+        let (_, metadata) = acache.lookup((pathid, "b"))?;
+        assert!(
+            matches!(metadata, crate::arena::types::Metadata::Dir(_)),
+            "b"
+        );
 
         Ok(())
     }
@@ -2083,12 +2107,12 @@ mod tests {
         fixture.add_to_cache(&file_path, 100, mtime)?;
 
         // Lookup directory
-        let (pathid, assignment) = acache.lookup((fixture.db.tree().root(), "a"))?;
-        assert_eq!(assignment, PathAssignment::Directory);
+        let (pathid, metadata) = acache.lookup((fixture.db.tree().root(), "a"))?;
+        assert!(matches!(metadata, crate::arena::types::Metadata::Dir(_)));
 
         // Lookup file
-        let (pathid, assignment) = acache.lookup((pathid, "file.txt"))?;
-        assert_eq!(assignment, PathAssignment::File);
+        let (pathid, metadata) = acache.lookup((pathid, "file.txt"))?;
+        assert!(matches!(metadata, crate::arena::types::Metadata::File(_)));
 
         let metadata = acache.file_metadata(pathid)?;
         assert_eq!(metadata.mtime, mtime);
@@ -3205,6 +3229,126 @@ mod tests {
 
         // Verify child is gone
         assert!(!tree.pathid_exists(child_pathid)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dir_or_file_metadata() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let file_path = Path::parse("test_file")?;
+        let dir_path = Path::parse("test_dir")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+
+        cache.notify_added(
+            &mut tree,
+            &mut blobs,
+            &mut dirty,
+            test_peer(),
+            file_path.clone(),
+            test_time(),
+            1024,
+            test_hash(),
+        )?;
+        let file_pathid = tree.expect(&file_path)?;
+
+        // Create a directory
+        let (dir_pathid, _) = cache.mkdir(&mut tree, &dir_path)?;
+
+        // Test file metadata
+        let file_metadata = cache.metadata(&tree, file_pathid)?;
+        match file_metadata {
+            crate::arena::types::Metadata::File(meta) => {
+                assert_eq!(meta.size, 1024);
+                assert_eq!(meta.mtime, test_time());
+                assert_eq!(meta.hash, test_hash());
+            }
+            crate::arena::types::Metadata::Dir(_) => {
+                panic!("Expected file metadata, got directory metadata");
+            }
+        }
+
+        // Test directory metadata
+        let dir_metadata = cache.metadata(&tree, dir_pathid)?;
+        match dir_metadata {
+            crate::arena::types::Metadata::Dir(meta) => {
+                assert!(!meta.read_only); // Arena directories are writable
+                assert!(meta.mtime >= test_time());
+            }
+            crate::arena::types::Metadata::File(_) => {
+                panic!("Expected directory metadata, got file metadata");
+            }
+        }
+
+        // Test error cases
+        let nonexistent_pathid = PathId(99999);
+        let result = cache.metadata(&tree, nonexistent_pathid);
+        assert!(matches!(result, Err(StorageError::NotFound)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dir_or_file_metadata_acache() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let file_path = Path::parse("test_file")?;
+        let dir_path = Path::parse("test_dir")?;
+
+        let txn = fixture.db.begin_write()?;
+        {
+            let mut tree = txn.write_tree()?;
+            let mut cache = txn.write_cache()?;
+            let mut blobs = txn.write_blobs()?;
+            let mut dirty = txn.write_dirty()?;
+
+            cache.notify_added(
+                &mut tree,
+                &mut blobs,
+                &mut dirty,
+                test_peer(),
+                file_path.clone(),
+                test_time(),
+                1024,
+                test_hash(),
+            )?;
+            cache.mkdir(&mut tree, &dir_path)?;
+        }
+        txn.commit()?;
+
+        // Test file metadata through ArenaCache
+        let file_metadata = fixture.acache.metadata(&file_path)?;
+        match file_metadata {
+            crate::arena::types::Metadata::File(meta) => {
+                assert_eq!(meta.size, 1024);
+                assert_eq!(meta.mtime, test_time());
+                assert_eq!(meta.hash, test_hash());
+            }
+            crate::arena::types::Metadata::Dir(_) => {
+                panic!("Expected file metadata, got directory metadata");
+            }
+        }
+
+        // Test directory metadata through ArenaCache
+        let dir_metadata = fixture.acache.metadata(&dir_path)?;
+        match dir_metadata {
+            crate::arena::types::Metadata::Dir(meta) => {
+                assert!(!meta.read_only); // Arena directories are writable
+                assert!(meta.mtime >= test_time());
+            }
+            crate::arena::types::Metadata::File(_) => {
+                panic!("Expected directory metadata, got file metadata");
+            }
+        }
+
+        // Test error cases
+        let nonexistent_pathid = PathId(99999);
+        let result = fixture.acache.metadata(nonexistent_pathid);
+        assert!(matches!(result, Err(StorageError::NotFound)));
 
         Ok(())
     }

@@ -28,11 +28,13 @@ pub use arena::engine::{Job, JobStatus};
 pub use arena::indexed_store::Reader;
 pub use arena::notifier::Notification;
 pub use arena::notifier::Progress;
-pub use arena::types::{DirMetadata, FileAvailability, FileMetadata, LocalAvailability, Mark};
+pub use arena::types::{
+    DirMetadata, FileAvailability, FileMetadata, LocalAvailability, Mark, Metadata,
+};
 pub use error::StorageError;
 pub use global::cache::{GlobalCache, GlobalLoc};
 pub use global::types::PathAssignment;
-pub use types::{JobId, Inode, PathId};
+pub use types::{Inode, JobId, PathId};
 
 /// Local storage, including the real store and an unreal cache.
 pub struct Storage {

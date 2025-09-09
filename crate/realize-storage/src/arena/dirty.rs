@@ -298,7 +298,10 @@ impl<'a> WritableOpenDirty<'a> {
     ) -> Result<(), StorageError> {
         let last_counter = self.counter_table.get(())?.map(|e| e.value()).unwrap_or(0);
         let counter = last_counter + 1;
-        log::debug!("[{}] Dirty pathid {pathid} ({reason}) #{counter}", self.arena);
+        log::debug!(
+            "[{}] Dirty pathid {pathid} ({reason}) #{counter}",
+            self.arena
+        );
         self.counter_table.insert((), counter)?;
         self.log_table.insert(counter, pathid)?;
         let prev = self.table.insert(pathid, counter)?;

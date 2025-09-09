@@ -3,7 +3,7 @@ use crate::fs::downloader::Downloader;
 use fuser::{Filesystem, MountOption};
 use nix::libc::c_int;
 use realize_storage::{
-    DirMetadata, FileMetadata, GlobalCache, Inode, PathAssignment, StorageError,
+    DirMetadata, FileMetadata, GlobalCache, Inode, Metadata, PathAssignment, StorageError,
 };
 use std::ffi::OsString;
 use std::time::SystemTime;
@@ -422,29 +422,18 @@ struct InnerRealizeFs {
 impl InnerRealizeFs {
     async fn lookup(&self, parent: u64, name: OsString) -> Result<fuser::FileAttr, FuseError> {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
-
-        let (pathid, assignment) = self.cache.lookup((Inode(parent), name)).await?;
-        match assignment {
-            PathAssignment::Directory => {
-                let metadata = self.cache.dir_metadata(pathid).await?;
-                return Ok(self.build_dir_attr(pathid, metadata));
-            }
-            PathAssignment::File => {
-                let metadata = self.cache.file_metadata(pathid).await?;
-                return Ok(self.build_file_attr(pathid, &metadata));
-            }
-        };
+        let (pathid, metadata) = self.cache.lookup((Inode(parent), name)).await?;
+        match metadata {
+            Metadata::File(file_metadata) => Ok(self.build_file_attr(pathid, &file_metadata)),
+            Metadata::Dir(dir_metadata) => Ok(self.build_dir_attr(pathid, dir_metadata)),
+        }
     }
 
     async fn getattr(&self, ino: u64) -> Result<fuser::FileAttr, FuseError> {
-        let (file_metadata, dir_mtime) = tokio::join!(
-            self.cache.file_metadata(Inode(ino)),
-            self.cache.dir_metadata(Inode(ino))
-        );
-        if let Ok(mtime) = dir_mtime {
-            Ok(self.build_dir_attr(Inode(ino), mtime))
-        } else {
-            Ok(self.build_file_attr(Inode(ino), &file_metadata.map_err(FuseError::Cache)?))
+        let metadata = self.cache.metadata(Inode(ino)).await?;
+        match metadata {
+            Metadata::File(file_metadata) => Ok(self.build_file_attr(Inode(ino), &file_metadata)),
+            Metadata::Dir(dir_metadata) => Ok(self.build_dir_attr(Inode(ino), dir_metadata)),
         }
     }
 

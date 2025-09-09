@@ -872,6 +872,41 @@ pub struct DirMetadata {
     pub mtime: UnixTime,
 }
 
+/// Unified metadata that can represent either a file or directory.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Metadata {
+    /// File metadata
+    File(FileMetadata),
+    /// Directory metadata
+    Dir(DirMetadata),
+}
+
+impl Metadata {
+    /// Extract the file metadata, returning an error if this is a directory.
+    pub fn expect_file(self) -> Result<FileMetadata, StorageError> {
+        match self {
+            Metadata::File(file_metadata) => Ok(file_metadata),
+            Metadata::Dir(_) => Err(StorageError::IsADirectory),
+        }
+    }
+
+    /// Extract the directory metadata, returning an error if this is a file.
+    pub fn expect_dir(self) -> Result<DirMetadata, StorageError> {
+        match self {
+            Metadata::Dir(dir_metadata) => Ok(dir_metadata),
+            Metadata::File(_) => Err(StorageError::NotADirectory),
+        }
+    }
+
+    /// Get the modification time regardless of whether this is a file or directory.
+    pub fn mtime(&self) -> UnixTime {
+        match self {
+            Metadata::File(file_metadata) => file_metadata.mtime,
+            Metadata::Dir(dir_metadata) => dir_metadata.mtime,
+        }
+    }
+}
+
 /// An entry in the peer table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PeerTableEntry {

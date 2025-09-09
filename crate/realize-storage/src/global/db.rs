@@ -97,7 +97,9 @@ impl GlobalWriteTransaction {
         Ok(())
     }
 
-    pub fn arena_table<'txn>(&'txn self) -> Result<Table<'txn, &'static str, PathId>, StorageError> {
+    pub fn arena_table<'txn>(
+        &'txn self,
+    ) -> Result<Table<'txn, &'static str, PathId>, StorageError> {
         Ok(self.inner.open_table(ARENA_TABLE)?)
     }
 
