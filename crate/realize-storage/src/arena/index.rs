@@ -2093,13 +2093,17 @@ mod tests {
         assert!(super::has_file(&fixture.db, &dest_index_path)?);
 
         // Test successful rename
-        let txn = fixture.db.begin_read()?;
-        let index = txn.read_index()?;
-        let tree = txn.read_tree()?;
+        let txn = fixture.db.begin_write()?;
+        let mut index = txn.write_index()?;
+        let mut tree = txn.write_tree()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
 
         let result = super::rename(
-            &index,
-            &tree,
+            &mut index,
+            &mut tree,
+            &mut history,
+            &mut dirty,
             tempdir.path(),
             &source_index_path,
             &dest_index_path,
@@ -2152,15 +2156,19 @@ mod tests {
             dest_hash.clone(),
         )?;
 
-        let txn = fixture.db.begin_read()?;
-        let index = txn.read_index()?;
-        let tree = txn.read_tree()?;
+        let txn = fixture.db.begin_write()?;
+        let mut index = txn.write_index()?;
+        let mut tree = txn.write_tree()?;
+        let mut history = txn.write_history()?;
+        let mut dirty = txn.write_dirty()?;
 
         // Test rename failure when source hash doesn't match
         let wrong_hash = Hash([0x99; 32]);
         let result = super::rename(
-            &index,
-            &tree,
+            &mut index,
+            &mut tree,
+            &mut history,
+            &mut dirty,
             tempdir.path(),
             &source_index_path,
             &dest_index_path,
@@ -2172,8 +2180,10 @@ mod tests {
 
         // Test rename failure when dest doesn't match old_hash
         let result = super::rename(
-            &index,
-            &tree,
+            &mut index,
+            &mut tree,
+            &mut history,
+            &mut dirty,
             tempdir.path(),
             &source_index_path,
             &dest_index_path,
@@ -2189,8 +2199,10 @@ mod tests {
         // Test rename failure when source doesn't exist in tree
         let nonexistent_path = Path::parse("nonexistent.txt")?;
         let result = super::rename(
-            &index,
-            &tree,
+            &mut index,
+            &mut tree,
+            &mut history,
+            &mut dirty,
             tempdir.path(),
             &nonexistent_path,
             &dest_index_path,
