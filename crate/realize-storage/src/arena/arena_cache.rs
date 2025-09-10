@@ -49,11 +49,11 @@ pub(crate) trait CacheReadOperations {
     ) -> impl Iterator<Item = Result<(String, PathId, crate::arena::types::Metadata), StorageError>>;
 
     /// Get the default file entry for the given pathid.
-    fn get_at_pathid(&self, pathid: PathId) -> Result<Option<FileTableEntry>, StorageError>;
+    fn file_at_pathid(&self, pathid: PathId) -> Result<Option<FileTableEntry>, StorageError>;
 
     /// Get the default file entry for the given pathid; fail if the entry
     /// cannot be found or if it is a directory.
-    fn get_at_pathid_or_err(&self, pathid: PathId) -> Result<FileTableEntry, StorageError>;
+    fn file_at_pathid_or_err(&self, pathid: PathId) -> Result<FileTableEntry, StorageError>;
 
     /// Return the [Inode] appropriate for the given [PathId].
     #[allow(dead_code)]
@@ -61,7 +61,7 @@ pub(crate) trait CacheReadOperations {
 
     /// Return the [PathId] appropriate for the given [Inode].
     #[allow(dead_code)]
-    fn map_to_ipath(&self, inode: Inode) -> Result<PathId, StorageError>;
+    fn map_to_pathid(&self, inode: Inode) -> Result<PathId, StorageError>;
 }
 
 /// A cache open for reading with a read transaction.
@@ -127,19 +127,19 @@ where
         ReadDirIterator::new(&self.table, tree, loc)
     }
 
-    fn get_at_pathid(&self, pathid: PathId) -> Result<Option<FileTableEntry>, StorageError> {
-        get_default_entry(&self.table, pathid)
+    fn file_at_pathid(&self, pathid: PathId) -> Result<Option<FileTableEntry>, StorageError> {
+        default_file_entry(&self.table, pathid)
     }
 
-    fn get_at_pathid_or_err(&self, pathid: PathId) -> Result<FileTableEntry, StorageError> {
-        get_default_entry_or_err(&self.table, pathid)
+    fn file_at_pathid_or_err(&self, pathid: PathId) -> Result<FileTableEntry, StorageError> {
+        default_file_entry_or_err(&self.table, pathid)
     }
 
     fn map_to_inode(&self, pathid: PathId) -> Result<Inode, StorageError> {
         map_to_inode(&self.pathid_to_inode, pathid)
     }
 
-    fn map_to_ipath(&self, inode: Inode) -> Result<PathId, StorageError> {
+    fn map_to_pathid(&self, inode: Inode) -> Result<PathId, StorageError> {
         map_to_pathid(&self.inode_to_pathid, inode)
     }
 }
@@ -171,19 +171,19 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         ReadDirIterator::new(&self.table, tree, loc)
     }
 
-    fn get_at_pathid(&self, pathid: PathId) -> Result<Option<FileTableEntry>, StorageError> {
-        get_default_entry(&self.table, pathid)
+    fn file_at_pathid(&self, pathid: PathId) -> Result<Option<FileTableEntry>, StorageError> {
+        default_file_entry(&self.table, pathid)
     }
 
-    fn get_at_pathid_or_err(&self, pathid: PathId) -> Result<FileTableEntry, StorageError> {
-        get_default_entry_or_err(&self.table, pathid)
+    fn file_at_pathid_or_err(&self, pathid: PathId) -> Result<FileTableEntry, StorageError> {
+        default_file_entry_or_err(&self.table, pathid)
     }
 
     fn map_to_inode(&self, pathid: PathId) -> Result<Inode, StorageError> {
         map_to_inode(&self.pathid_to_inode, pathid)
     }
 
-    fn map_to_ipath(&self, inode: Inode) -> Result<PathId, StorageError> {
+    fn map_to_pathid(&self, inode: Inode) -> Result<PathId, StorageError> {
         map_to_pathid(&self.inode_to_pathid, inode)
     }
 }
@@ -195,7 +195,7 @@ pub(crate) trait CacheExt {
     ///
     /// Return None if the file is not found or if it is a directory.
     #[allow(dead_code)]
-    fn get<'b, L: Into<TreeLoc<'b>>>(
+    fn file_entry<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
@@ -203,7 +203,7 @@ pub(crate) trait CacheExt {
 
     /// Get a file entry, failing if the file is not found or if it is a directory.
     #[allow(dead_code)]
-    fn get_or_err<'b, L: Into<TreeLoc<'b>>>(
+    fn file_entry_or_err<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
@@ -255,23 +255,23 @@ impl<T: CacheReadOperations> CacheExt for T {
         Ok(self.metadata(tree, loc)?.expect_dir()?.mtime)
     }
 
-    fn get<'b, L: Into<TreeLoc<'b>>>(
+    fn file_entry<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<Option<FileTableEntry>, StorageError> {
         if let Some(pathid) = tree.resolve(loc)? {
-            self.get_at_pathid(pathid)
+            self.file_at_pathid(pathid)
         } else {
             Ok(None)
         }
     }
-    fn get_or_err<'b, L: Into<TreeLoc<'b>>>(
+    fn file_entry_or_err<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<FileTableEntry, StorageError> {
-        self.get_at_pathid_or_err(tree.expect(loc)?)
+        self.file_at_pathid_or_err(tree.expect(loc)?)
     }
 }
 
@@ -307,7 +307,7 @@ impl<'a> WritableOpenCache<'a> {
         txn: &ArenaWriteTransaction,
         pathid: PathId,
     ) -> Result<BlobInfo, StorageError> {
-        let file_entry = get_default_entry_or_err(&self.table, pathid)?;
+        let file_entry = default_file_entry_or_err(&self.table, pathid)?;
         let mut blobs = txn.write_blobs()?;
         let mut tree = txn.write_tree()?;
         let marks = txn.read_marks()?;
@@ -326,7 +326,7 @@ impl<'a> WritableOpenCache<'a> {
         loc: L,
     ) -> Result<(), StorageError> {
         let pathid = tree.expect(loc)?;
-        let e = get_default_entry_or_err(&self.table, pathid)?;
+        let e = default_file_entry_or_err(&self.table, pathid)?;
         log::debug!(
             "[{}]@local Local removal of \"{}\" pathid {pathid} {}",
             self.arena,
@@ -351,21 +351,52 @@ impl<'a> WritableOpenCache<'a> {
         noreplace: bool,
     ) -> Result<(), StorageError> {
         let source = source.into();
-        let source_pathid = tree.expect(source.borrow())?;
-        // get_at_pathid_or_err requires a file. TODO:support directory moves
-        let mut entry = self.get_at_pathid_or_err(source_pathid)?;
-        entry.branched_from = Some(source_pathid);
-
         let dest = dest.into();
-        let dest_pathid = tree.setup(dest.borrow())?;
-        let old_hash = self.get_at_pathid(dest_pathid)?.map(|e| e.hash);
-        if old_hash.is_some() && noreplace {
-            return Err(StorageError::AlreadyExists);
+        let source_pathid = tree.expect(source.borrow())?;
+        let dest_pathid; // delay calling tree.setup until source is checked
+        match default_entry(&self.table, source_pathid)?.ok_or(StorageError::NotFound)? {
+            CacheTableEntry::Dir(_) => {
+                dest_pathid = tree.setup(dest.borrow())?;
+                match default_entry(&self.table, dest_pathid)? {
+                    None => {}
+                    Some(CacheTableEntry::File(_)) => return Err(StorageError::NotADirectory),
+                    Some(CacheTableEntry::Dir(_)) => {
+                        // Reproduces Linux renameat behavior: with noreplace=false, if dest
+                        // is a directory, it must be empty.
+                        if noreplace || !self.readdir(tree, dest_pathid).next().is_none() {
+                            return Err(StorageError::AlreadyExists);
+                        }
+                    }
+                }
+                self.rename_files_in_dir(tree, blobs, history, dirty, source_pathid, dest_pathid)?;
+            }
+            CacheTableEntry::File(mut entry) => {
+                dest_pathid = tree.setup(dest.borrow())?;
+                let old_hash = match default_entry(&self.table, dest_pathid)? {
+                    None => None,
+                    Some(CacheTableEntry::File(entry)) => Some(entry.hash),
+                    Some(CacheTableEntry::Dir(_)) => return Err(StorageError::IsADirectory),
+                };
+                if old_hash.is_some() && noreplace {
+                    return Err(StorageError::AlreadyExists);
+                }
+
+                entry.branched_from = Some(source_pathid);
+                self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &entry)?;
+                self.rm_default_file_entry(tree, blobs, dirty, source_pathid)?;
+
+                if let (Some(source_path), Some(dest_path)) =
+                    (tree.backtrack(source)?, tree.backtrack(dest)?)
+                {
+                    history.request_rename(
+                        &source_path,
+                        &dest_path,
+                        &entry.hash,
+                        old_hash.as_ref(),
+                    )?;
+                }
+            }
         }
-
-        self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &entry)?;
-        self.rm_default_file_entry(tree, blobs, dirty, source_pathid)?;
-
         // swap source and destination inodes, to meet FUSE's
         // expectation of what rename does.
         let source_inode = self.map_to_inode(source_pathid)?;
@@ -374,11 +405,51 @@ impl<'a> WritableOpenCache<'a> {
         self.pathid_to_inode.insert(dest_pathid, source_inode)?;
         self.inode_to_pathid.insert(source_inode, dest_pathid)?;
         self.inode_to_pathid.insert(dest_inode, source_pathid)?;
+        Ok(())
+    }
 
-        if let (Some(source_path), Some(dest_path)) =
-            (tree.backtrack(source)?, tree.backtrack(dest)?)
+    /// Recursively move all entries in `source_dir` to `dest_dir`.
+    fn rename_files_in_dir(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
+        history: &mut WritableOpenHistory,
+        dirty: &mut WritableOpenDirty,
+        source_dir: PathId,
+        dest_dir: PathId,
+    ) -> Result<(), StorageError> {
+        for (name, source_entry) in tree
+            .readdir(source_dir)
+            .map(|res| res.map(|(n, p)| (n.to_string(), p)))
+            .collect::<Result<Vec<_>, _>>()?
         {
-            history.request_rename(&source_path, &dest_path, &entry.hash, old_hash.as_ref())?;
+            match default_entry(&self.table, source_entry)? {
+                None => {}
+                Some(CacheTableEntry::Dir(dir_entry)) => {
+                    let dest_entry = tree.setup((dest_dir, name))?;
+                    self.rename_files_in_dir(
+                        tree,
+                        blobs,
+                        history,
+                        dirty,
+                        source_entry,
+                        dest_entry,
+                    )?;
+                    write_dir_mtime(&mut self.table, tree, dest_entry, dir_entry.mtime)?;
+                }
+                Some(CacheTableEntry::File(mut file_entry)) => {
+                    let dest_entry = tree.setup((dest_dir, name))?;
+                    file_entry.branched_from = Some(source_entry);
+                    self.write_default_file_entry(tree, blobs, dirty, dest_entry, &file_entry)?;
+                    self.rm_default_file_entry(tree, blobs, dirty, source_entry)?;
+
+                    if let (Some(source_path), Some(dest_path)) =
+                        (tree.backtrack(source_entry)?, tree.backtrack(dest_entry)?)
+                    {
+                        history.request_rename(&source_path, &dest_path, &file_entry.hash, None)?;
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -397,10 +468,10 @@ impl<'a> WritableOpenCache<'a> {
         let source = source.into();
         let dest = dest.into();
         let source_pathid = tree.expect(source.borrow())?;
-        let mut entry = self.get_at_pathid_or_err(source_pathid)?;
+        let mut entry = self.file_at_pathid_or_err(source_pathid)?;
         entry.branched_from = Some(source_pathid);
         let dest_pathid = tree.setup(dest.borrow())?;
-        let old_hash = self.get_at_pathid(dest_pathid)?.map(|e| e.hash);
+        let old_hash = self.file_at_pathid(dest_pathid)?.map(|e| e.hash);
         check_parent_is_dir(&self.table, tree, dest_pathid)?;
         self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &entry)?;
 
@@ -476,12 +547,12 @@ impl<'a> WritableOpenCache<'a> {
     ) -> Result<(), StorageError> {
         let file_pathid = tree.setup(&path)?;
         let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
-        if get_file_entry(&self.table, file_pathid, Some(peer))?.is_none() {
+        if peer_file_entry(&self.table, file_pathid, Some(peer))?.is_none() {
             log::debug!("[{}]@{peer} Add \"{path}\" {hash} size={size}", self.arena);
             self.write_file_entry(tree, file_pathid, peer, &entry)?;
         }
         Ok(
-            if get_file_entry(&self.table, file_pathid, None)?.is_none() {
+            if peer_file_entry(&self.table, file_pathid, None)?.is_none() {
                 log::debug!("[{}]@local Add \"{path}\" {hash} size={size}", self.arena);
                 self.write_default_file_entry(tree, blobs, dirty, file_pathid, &entry)?;
             },
@@ -503,7 +574,7 @@ impl<'a> WritableOpenCache<'a> {
     ) -> Result<(), StorageError> {
         if let Some(file_pathid) = tree.resolve(path)? {
             let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
-            if let Some(e) = get_file_entry(&self.table, file_pathid, Some(peer))?
+            if let Some(e) = peer_file_entry(&self.table, file_pathid, Some(peer))?
                 && e.hash == *old_hash
             {
                 log::debug!(
@@ -512,7 +583,7 @@ impl<'a> WritableOpenCache<'a> {
                 );
                 self.write_file_entry(tree, file_pathid, peer, &entry)?;
             }
-            if let Some(old_entry) = get_file_entry(&self.table, file_pathid, None)?
+            if let Some(old_entry) = peer_file_entry(&self.table, file_pathid, None)?
                 && old_entry.hash == *old_hash
             {
                 log::debug!(
@@ -554,14 +625,14 @@ impl<'a> WritableOpenCache<'a> {
         let file_pathid = tree.setup(&path)?;
         unmark_peer_file(&mut self.pending_catchup_table, peer, file_pathid)?;
         let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
-        if let Some(e) = get_file_entry(&self.table, file_pathid, None)?
+        if let Some(e) = peer_file_entry(&self.table, file_pathid, None)?
             && e.hash != hash
         {
             self.notify_dropped_or_removed(tree, blobs, dirty, peer, &path, &e.hash, false)?;
         }
         self.write_file_entry(tree, file_pathid, peer, &entry)?;
         Ok(
-            if !get_file_entry(&self.table, file_pathid, None)?.is_some() {
+            if !peer_file_entry(&self.table, file_pathid, None)?.is_some() {
                 self.write_default_file_entry(tree, blobs, dirty, file_pathid, &entry)?;
             },
         )
@@ -699,7 +770,7 @@ impl<'a> WritableOpenCache<'a> {
     {
         let path = path.as_ref();
         if let Some(pathid) = tree.resolve(path)? {
-            if let Some(e) = get_file_entry(&self.table, pathid, Some(peer))?
+            if let Some(e) = peer_file_entry(&self.table, pathid, Some(peer))?
                 && e.hash == *old_hash
             {
                 log::debug!(
@@ -710,7 +781,7 @@ impl<'a> WritableOpenCache<'a> {
                 self.rm_peer_file_entry(tree, pathid, peer)?;
             }
             if !dropped {
-                if let Some(e) = get_file_entry(&self.table, pathid, None)?
+                if let Some(e) = peer_file_entry(&self.table, pathid, None)?
                     && e.hash == *old_hash
                 {
                     log::debug!(
@@ -745,7 +816,7 @@ impl<'a> WritableOpenCache<'a> {
         }
         for pathid in pathids {
             self.rm_peer_file_entry(tree, pathid, peer)?;
-            if let Some(entry) = self.get_at_pathid(pathid)? {
+            if let Some(entry) = self.file_at_pathid(pathid)? {
                 if self.file_availability(tree, pathid, &entry.hash)?.is_none() {
                     // If the file has become unavailable because of
                     // this removal, remove the file itself as well.
@@ -1212,9 +1283,9 @@ impl CacheLoc {
             CacheLoc::PathId(pathid) => TreeLoc::PathId(pathid),
             CacheLoc::Path(path) => TreeLoc::Path(path),
             CacheLoc::PathIdAndName(pathid, name) => TreeLoc::PathIdAndName(pathid, name.into()),
-            CacheLoc::Inode(inode) => TreeLoc::PathId(cache.map_to_ipath(inode)?),
+            CacheLoc::Inode(inode) => TreeLoc::PathId(cache.map_to_pathid(inode)?),
             CacheLoc::InodeAndName(inode, name) => {
-                TreeLoc::PathIdAndName(cache.map_to_ipath(inode)?, name.into())
+                TreeLoc::PathIdAndName(cache.map_to_pathid(inode)?, name.into())
             }
         })
     }
@@ -1278,7 +1349,7 @@ impl From<(Inode, String)> for CacheLoc {
 }
 
 /// Get a [FileTableEntry] for a specific peer.
-fn get_file_entry(
+fn peer_file_entry(
     cache_table: &impl redb::ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
     pathid: PathId,
     peer: Option<Peer>,
@@ -1295,14 +1366,26 @@ fn get_file_entry(
 /// Get the default entry for the given pathid.
 ///
 /// Returns None if the file cannot be found or if it is a directory.
-fn get_default_entry(
+fn default_file_entry(
     cache_table: &impl redb::ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
     pathid: PathId,
 ) -> Result<Option<FileTableEntry>, StorageError> {
+    if let Some(CacheTableEntry::File(entry)) = default_entry(cache_table, pathid)? {
+        return Ok(Some(entry));
+    }
+
+    Ok(None)
+}
+
+/// Get the default entry for the given pathid.
+///
+/// Returns None if the file cannot be found or if it is a directory.
+fn default_entry(
+    cache_table: &impl redb::ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    pathid: PathId,
+) -> Result<Option<CacheTableEntry>, StorageError> {
     if let Some(entry) = cache_table.get(CacheTableKey::Default(pathid))? {
-        if let CacheTableEntry::File(entry) = entry.value().parse()? {
-            return Ok(Some(entry));
-        }
+        return Ok(Some(entry.value().parse()?));
     }
 
     Ok(None)
@@ -1311,15 +1394,12 @@ fn get_default_entry(
 /// Get the default entry for the given pathid.
 ///
 /// Fail if the file cannot be found or if it is a directory.
-fn get_default_entry_or_err(
+fn default_file_entry_or_err(
     cache_table: &impl redb::ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
     pathid: PathId,
 ) -> Result<FileTableEntry, StorageError> {
-    cache_table
-        .get(CacheTableKey::Default(pathid))?
+    default_entry(cache_table, pathid)?
         .ok_or(StorageError::NotFound)?
-        .value()
-        .parse()?
         .expect_file()
 }
 
@@ -1553,14 +1633,8 @@ mod tests {
         fn dirty_pathids(&self) -> Result<HashSet<PathId>, StorageError> {
             let txn = self.db.begin_read()?;
             let dirty = txn.read_dirty()?;
-            let mut start = 0;
-            let mut ret = HashSet::new();
-            while let Some((pathid, counter)) = dirty.next_dirty(start)? {
-                ret.insert(pathid);
-                start = counter + 1;
-            }
 
-            Ok(ret)
+            dirty_pathids_in_txn(&dirty)
         }
 
         fn dirty_inodes(&self) -> Result<HashSet<Inode>, StorageError> {
@@ -1590,6 +1664,19 @@ mod tests {
         async fn setup() -> anyhow::Result<Fixture> {
             Self::setup_with_arena(test_arena()).await
         }
+    }
+
+    fn dirty_pathids_in_txn(
+        dirty: &impl DirtyReadOperations,
+    ) -> Result<HashSet<PathId>, StorageError> {
+        let mut start = 0;
+        let mut ret = HashSet::new();
+        while let Some((pathid, counter)) = dirty.next_dirty(start)? {
+            ret.insert(pathid);
+            start = counter + 1;
+        }
+
+        Ok(ret)
     }
 
     #[tokio::test]
@@ -2391,7 +2478,7 @@ mod tests {
             let txn = fixture.db.begin_read()?;
             let cache = txn.read_cache()?;
             let tree = txn.read_tree()?;
-            let entry = cache.get(&tree, &path)?.unwrap();
+            let entry = cache.file_entry(&tree, &path)?.unwrap();
 
             //  Replace with old_hash=1 means that hash=2 is the most
             //  recent one. This is the one chosen.
@@ -2439,7 +2526,7 @@ mod tests {
             let txn = fixture.db.begin_read()?;
             let cache = txn.read_cache()?;
             let tree = txn.read_tree()?;
-            let entry = cache.get(&txn.read_tree()?, &path)?.unwrap();
+            let entry = cache.file_entry(&txn.read_tree()?, &path)?.unwrap();
 
             //  Replace with old_hash=1 means that hash=2 is the most
             //  recent one. This is the one chosen.
@@ -2457,7 +2544,7 @@ mod tests {
             let txn = fixture.db.begin_read()?;
             let cache = txn.read_cache()?;
             let tree = txn.read_tree()?;
-            let entry = cache.get(&txn.read_tree()?, &path)?.unwrap();
+            let entry = cache.file_entry(&txn.read_tree()?, &path)?.unwrap();
 
             assert_eq!(Hash([3u8; 32]), entry.hash);
             assert_eq!(
@@ -2488,7 +2575,7 @@ mod tests {
             let txn = fixture.db.begin_read()?;
             let cache = txn.read_cache()?;
             let tree = txn.read_tree()?;
-            let entry = cache.get(&txn.read_tree()?, &path)?.unwrap();
+            let entry = cache.file_entry(&txn.read_tree()?, &path)?.unwrap();
 
             assert_eq!(Hash([3u8; 32]), entry.hash);
             assert_eq!(
@@ -2571,7 +2658,7 @@ mod tests {
             pathid = cache
                 .lookup(&tree, (fixture.db.tree().root(), "file.txt"))?
                 .0;
-            let entry = cache.get_at_pathid(pathid)?.unwrap();
+            let entry = cache.file_at_pathid(pathid)?.unwrap();
 
             assert_eq!(Hash([3u8; 32]), entry.hash);
             assert_eq!(
@@ -2743,7 +2830,7 @@ mod tests {
         let tree = txn.read_tree()?;
 
         // File1 should have been deleted, since it was only on peer1,
-        assert!(cache.get(&tree, &file1)?.is_none());
+        assert!(cache.file_entry(&tree, &file1)?.is_none());
 
         assert_eq!(
             vec![peer1, peer2],
@@ -3098,7 +3185,7 @@ mod tests {
         );
 
         // Verify cache entry is gone
-        assert!(cache.get_at_pathid(pathid)?.is_none());
+        assert!(cache.file_at_pathid(pathid)?.is_none());
 
         Ok(())
     }
@@ -3355,5 +3442,172 @@ mod tests {
         assert!(matches!(result, Err(StorageError::NotFound)));
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn rename_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let source_path = Path::parse("source")?;
+        let dest_path = Path::parse("dest")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut history = txn.write_history()?;
+
+        let hash = hash::digest("foobar");
+        cache.notify_added(
+            &mut tree,
+            &mut blobs,
+            &mut dirty,
+            Peer::from("peer"),
+            source_path.clone(),
+            test_time(),
+            6,
+            hash.clone(),
+        )?;
+
+        let source_pathid = tree.expect(&source_path)?;
+        dirty.delete_range(0, 999)?;
+        cache.rename(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &source_path,
+            &dest_path,
+            true,
+        )?;
+
+        // dest is gone, source replaces it and points to it
+        assert!(cache.file_entry(&tree, &source_path)?.is_none());
+        let dest_entry = cache.file_entry_or_err(&tree, &dest_path).unwrap();
+        assert_eq!(tree.resolve(&source_path)?, dest_entry.branched_from);
+        assert_eq!(hash, dest_entry.hash);
+        assert_eq!(6, dest_entry.size);
+        assert_eq!(test_time(), dest_entry.mtime);
+
+        // both dest and source are dirty
+        let dest_pathid = tree.expect(&dest_path)?;
+        assert_eq!(
+            HashSet::from([source_pathid, dest_pathid]),
+            dirty_pathids_in_txn(&dirty)?
+        );
+
+        // inodes are swapped
+        assert_eq!(
+            Inode(source_pathid.as_u64()),
+            cache.map_to_inode(dest_pathid)?
+        );
+        assert_eq!(
+            Inode(dest_pathid.as_u64()),
+            cache.map_to_inode(source_pathid)?
+        );
+        assert_eq!(
+            source_pathid,
+            cache.map_to_pathid(Inode(dest_pathid.as_u64()))?
+        );
+        assert_eq!(
+            dest_pathid,
+            cache.map_to_pathid(Inode(source_pathid.as_u64()))?
+        );
+
+        // history entry was added
+        let (_, history_entry) = history.history(0..).last().unwrap().unwrap();
+        assert_eq!(
+            HistoryTableEntry::Rename(source_path, dest_path, hash, None),
+            history_entry
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rename_file_replace() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let source_path = Path::parse("source")?;
+        let dest_path = Path::parse("dest")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut history = txn.write_history()?;
+
+        let source_hash = hash::digest("source");
+        cache.notify_added(
+            &mut tree,
+            &mut blobs,
+            &mut dirty,
+            Peer::from("peer"),
+            source_path.clone(),
+            test_time(),
+            6,
+            source_hash.clone(),
+        )?;
+
+        let dest_hash = hash::digest("dest");
+        cache.notify_added(
+            &mut tree,
+            &mut blobs,
+            &mut dirty,
+            Peer::from("peer"),
+            dest_path.clone(),
+            test_time(),
+            4,
+            dest_hash.clone(),
+        )?;
+
+        assert!(matches!(
+            cache.rename(
+                &mut tree,
+                &mut blobs,
+                &mut history,
+                &mut dirty,
+                &source_path,
+                &dest_path,
+                /*noreplace=*/ true,
+            ),
+            Err(StorageError::AlreadyExists)
+        ));
+
+        cache.rename(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &source_path,
+            &dest_path,
+            /*noreplace=*/ false,
+        )?;
+
+        // dest is gone, source replaces it and points to it
+        assert!(cache.file_entry(&tree, &source_path)?.is_none());
+        let dest_entry = cache.file_entry_or_err(&tree, &dest_path).unwrap();
+        assert_eq!(tree.resolve(&source_path)?, dest_entry.branched_from);
+        assert_eq!(source_hash, dest_entry.hash);
+        assert_eq!(6, dest_entry.size);
+
+        // history entry reports old hash
+        let (_, history_entry) = history.history(0..).last().unwrap().unwrap();
+        assert_eq!(
+            HistoryTableEntry::Rename(source_path, dest_path, source_hash, Some(dest_hash)),
+            history_entry
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rename_dir() -> anyhow::Result<()> {
+        todo!();
+    }
+
+    #[tokio::test]
+    async fn rename_dir_replace() -> anyhow::Result<()> {
+        todo!();
     }
 }

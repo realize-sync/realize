@@ -128,7 +128,7 @@ impl StorageJobProcessor {
             if !indexed.matches_file(&realpath) {
                 return Ok(JobStatus::Abandoned("file_mismatch"));
             }
-            let cached = match txn.write_cache()?.get_at_pathid(pathid)? {
+            let cached = match txn.write_cache()?.file_at_pathid(pathid)? {
                 Some(v) => v,
                 None => return Ok(JobStatus::Abandoned("no_cache_entry")),
             };
@@ -211,7 +211,7 @@ impl StorageJobProcessor {
                 }
             };
             let cache = txn.read_cache()?;
-            let cached = match cache.get_at_pathid(pathid)? {
+            let cached = match cache.file_at_pathid(pathid)? {
                 Some(e) => e,
                 None => {
                     return Ok(JobStatus::Abandoned("cache_entry"));

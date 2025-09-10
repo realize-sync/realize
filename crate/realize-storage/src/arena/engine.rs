@@ -464,7 +464,7 @@ impl Engine {
         let mut should_realize = None;
         let mut should_unrealize = None;
 
-        if let Some(cached) = cache.get_at_pathid(pathid)? {
+        if let Some(cached) = cache.file_at_pathid(pathid)? {
             let hash = cached.hash;
             let indexed = index.get_at_pathid(pathid)?;
             let is_indexed = indexed.is_some();
