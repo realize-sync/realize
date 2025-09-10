@@ -380,6 +380,10 @@ impl Filesystem for RealizeFs {
         });
     }
 
+    /// Rename a file or directory.
+    /// 
+    /// The `noreplace` semantics (RENAME_NOREPLACE flag) are only supported on Linux.
+    /// On other platforms, the noreplace flag is always treated as false.
     fn rename(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -390,12 +394,19 @@ impl Filesystem for RealizeFs {
         flags: u32,
         reply: fuser::ReplyEmpty,
     ) {
-        if (flags & (!nix::libc::RENAME_NOREPLACE)) != 0 {
+        #[cfg(target_os = "linux")]
+        const RENAME_NOREPLACE_FLAG: u32 = nix::libc::RENAME_NOREPLACE;
+        #[cfg(not(target_os = "linux"))]
+        const RENAME_NOREPLACE_FLAG: u32 = 0;
+
+        if (flags & (!RENAME_NOREPLACE_FLAG)) != 0 {
             // only NOREPLACE is supported
             reply.error(nix::libc::EINVAL);
             return;
         }
-        let noreplace = (flags & nix::libc::RENAME_NOREPLACE) != 0;
+        
+        // On non-Linux platforms, noreplace is always false
+        let noreplace = cfg!(target_os = "linux") && (flags & RENAME_NOREPLACE_FLAG) != 0;
 
         let inner = Arc::clone(&self.inner);
         let name = name.to_owned();
