@@ -355,7 +355,7 @@ impl<'a> WritableOpenCache<'a> {
         let source_pathid = tree.expect(source.borrow())?;
         let dest_pathid; // delay calling tree.setup until source is checked
         match default_entry(&self.table, source_pathid)?.ok_or(StorageError::NotFound)? {
-            CacheTableEntry::Dir(_) => {
+            CacheTableEntry::Dir(dir_entry) => {
                 dest_pathid = tree.setup(dest.borrow())?;
                 match default_entry(&self.table, dest_pathid)? {
                     None => {}
@@ -369,6 +369,12 @@ impl<'a> WritableOpenCache<'a> {
                     }
                 }
                 self.rename_files_in_dir(tree, blobs, history, dirty, source_pathid, dest_pathid)?;
+                write_dir_mtime(&mut self.table, tree, dest_pathid, dir_entry.mtime)?;
+                tree.remove_and_decref(
+                    source_pathid,
+                    &mut self.table,
+                    CacheTableKey::Default(source_pathid),
+                )?;
             }
             CacheTableEntry::File(mut entry) => {
                 dest_pathid = tree.setup(dest.borrow())?;
@@ -436,6 +442,11 @@ impl<'a> WritableOpenCache<'a> {
                         dest_entry,
                     )?;
                     write_dir_mtime(&mut self.table, tree, dest_entry, dir_entry.mtime)?;
+                    tree.remove_and_decref(
+                        source_entry,
+                        &mut self.table,
+                        CacheTableKey::Default(source_entry),
+                    )?;
                 }
                 Some(CacheTableEntry::File(mut file_entry)) => {
                     let dest_entry = tree.setup((dest_dir, name))?;
@@ -3603,11 +3614,267 @@ mod tests {
 
     #[tokio::test]
     async fn rename_dir() -> anyhow::Result<()> {
-        todo!();
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let source_dir = Path::parse("source_dir")?;
+        let dest_dir = Path::parse("dest_dir")?;
+        let file1_path = Path::parse("source_dir/file1.txt")?;
+        let file2_path = Path::parse("source_dir/subdir/file2.txt")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut history = txn.write_history()?;
+
+        // Create source directory with files
+        let hash1 = hash::digest("file1");
+        cache.notify_added(
+            &mut tree,
+            &mut blobs,
+            &mut dirty,
+            Peer::from("peer"),
+            file1_path.clone(),
+            test_time(),
+            5,
+            hash1.clone(),
+        )?;
+
+        let hash2 = hash::digest("file2");
+        cache.notify_added(
+            &mut tree,
+            &mut blobs,
+            &mut dirty,
+            Peer::from("peer"),
+            file2_path.clone(),
+            test_time(),
+            5,
+            hash2.clone(),
+        )?;
+
+        let source_dir_pathid = tree.expect(&source_dir)?;
+        dirty.delete_range(0, 999)?;
+
+        // Perform the directory rename
+        cache.rename(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &source_dir,
+            &dest_dir,
+            /*noreplace=*/ true,
+        )?;
+
+        // After directory rename, the updated implementation should remove the source directory
+        // and all of its subdirectories once their contents are moved to the destination
+        log::debug!("check dir {source_dir:?} {:?}", tree.resolve(&source_dir));
+        assert!(
+            cache.metadata(&tree, &source_dir).is_err(),
+            "Source directory should be removed after rename"
+        );
+        let dest_metadata = cache.metadata(&tree, &dest_dir)?;
+        assert!(
+            matches!(dest_metadata, crate::arena::types::Metadata::Dir(_)),
+            "Destination directory should exist after rename"
+        );
+
+        // Verify files moved correctly to destination directory
+        let moved_file1 = Path::parse("dest_dir/file1.txt")?;
+        let moved_file2 = Path::parse("dest_dir/subdir/file2.txt")?;
+
+        let file1_entry = cache.file_entry_or_err(&tree, &moved_file1)?;
+        assert_eq!(hash1, file1_entry.hash);
+        assert_eq!(5, file1_entry.size);
+        assert_eq!(test_time(), file1_entry.mtime);
+
+        let file2_entry = cache.file_entry_or_err(&tree, &moved_file2)?;
+        assert_eq!(hash2, file2_entry.hash);
+        assert_eq!(5, file2_entry.size);
+        assert_eq!(test_time(), file2_entry.mtime);
+
+        // Original file paths should not exist (since source directory tree is removed)
+        assert!(
+            cache.file_entry(&tree, &file1_path)?.is_none(),
+            "Original file1 path should not exist after directory rename"
+        );
+        assert!(
+            cache.file_entry(&tree, &file2_path)?.is_none(),
+            "Original file2 path should not exist after directory rename"
+        );
+
+        // Source subdirectory should also be removed
+        let source_subdir = Path::parse("source_dir/subdir")?;
+        assert!(
+            cache.metadata(&tree, &source_subdir).is_err(),
+            "Source subdirectory should be removed after rename"
+        );
+
+        // Check that files are marked dirty
+        let dest_dir_pathid = tree.expect(&dest_dir)?;
+        let dirty_pathids = dirty_pathids_in_txn(&dirty)?;
+        assert!(dirty_pathids.contains(&tree.resolve(&file1_path)?.unwrap()));
+        assert!(dirty_pathids.contains(&tree.resolve(&file2_path)?.unwrap()));
+        assert!(dirty_pathids.contains(&tree.resolve(&moved_file1)?.unwrap()));
+        assert!(dirty_pathids.contains(&tree.resolve(&moved_file2)?.unwrap()));
+
+        // Directory inode should be swapped - at least for the top
+        // directories.
+        assert_eq!(
+            Inode(source_dir_pathid.as_u64()),
+            cache.map_to_inode(dest_dir_pathid)?
+        );
+        assert_eq!(
+            Inode(dest_dir_pathid.as_u64()),
+            cache.map_to_inode(source_dir_pathid)?
+        );
+        assert_eq!(
+            source_dir_pathid,
+            cache.map_to_pathid(Inode(dest_dir_pathid.as_u64()))?
+        );
+        assert_eq!(
+            dest_dir_pathid,
+            cache.map_to_pathid(Inode(source_dir_pathid.as_u64()))?
+        );
+
+        let history_entries: Vec<_> = history
+            .history(0..)
+            .map(|res| res.map(|(_, val)| val))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_unordered::assert_eq_unordered!(
+            vec![
+                HistoryTableEntry::Rename(file1_path, moved_file1, hash1, None),
+                HistoryTableEntry::Rename(file2_path, moved_file2, hash2, None)
+            ],
+            history_entries
+        );
+
+        Ok(())
     }
 
     #[tokio::test]
     async fn rename_dir_replace() -> anyhow::Result<()> {
-        todo!();
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let source_dir = Path::parse("source_dir")?;
+        let dest_dir = Path::parse("dest_dir")?;
+        let source_file = Path::parse("source_dir/file.txt")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut history = txn.write_history()?;
+
+        // Create source directory with a file
+        let source_hash = hash::digest("source_file");
+        cache.notify_added(
+            &mut tree,
+            &mut blobs,
+            &mut dirty,
+            Peer::from("peer"),
+            source_file.clone(),
+            test_time(),
+            11,
+            source_hash.clone(),
+        )?;
+
+        // Create empty destination directory
+        cache.mkdir(&mut tree, &dest_dir)?;
+
+        // Test noreplace=true should fail with AlreadyExists
+        assert!(matches!(
+            cache.rename(
+                &mut tree,
+                &mut blobs,
+                &mut history,
+                &mut dirty,
+                &source_dir,
+                &dest_dir,
+                /*noreplace=*/ true,
+            ),
+            Err(StorageError::AlreadyExists)
+        ));
+
+        // Test noreplace=false should succeed (replacing empty directory)
+        cache.rename(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &source_dir,
+            &dest_dir,
+            /*noreplace=*/ false,
+        )?;
+
+        assert!(
+            cache.metadata(&tree, &source_dir).is_err(),
+            "Source directory should be removed after rename"
+        );
+        let dest_metadata = cache.metadata(&tree, &dest_dir)?;
+        assert!(
+            matches!(dest_metadata, crate::arena::types::Metadata::Dir(_)),
+            "Destination directory should exist after rename"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rename_dir_nonempty_dest() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let source_dir = Path::parse("source_dir")?;
+        let dest_dir = Path::parse("dest_dir")?;
+        let source_file = Path::parse("source_dir/file.txt")?;
+        let dest_file = Path::parse("dest_dir/otherfile.txt")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut history = txn.write_history()?;
+
+        // Create source and dest directories with a file
+        let source_hash = hash::digest("source_file");
+        cache.notify_added(
+            &mut tree,
+            &mut blobs,
+            &mut dirty,
+            Peer::from("peer"),
+            source_file.clone(),
+            test_time(),
+            11,
+            source_hash.clone(),
+        )?;
+
+        let dest_hash = hash::digest("dest_file");
+        cache.notify_added(
+            &mut tree,
+            &mut blobs,
+            &mut dirty,
+            Peer::from("peer"),
+            dest_file.clone(),
+            test_time(),
+            11,
+            dest_hash.clone(),
+        )?;
+
+        // Even with noreplace=false, this should fail because dest is
+        // nonempty.
+        assert!(matches!(
+            cache.rename(
+                &mut tree,
+                &mut blobs,
+                &mut history,
+                &mut dirty,
+                &source_dir,
+                &dest_dir,
+                /*noreplace=*/ false,
+            ),
+            Err(StorageError::AlreadyExists)
+        ));
+
+        Ok(())
     }
 }
