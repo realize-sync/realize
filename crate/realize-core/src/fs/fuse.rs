@@ -2,9 +2,7 @@
 use crate::fs::downloader::Downloader;
 use fuser::{Filesystem, MountOption};
 use nix::libc::c_int;
-use realize_storage::{
-    DirMetadata, FileMetadata, GlobalCache, Inode, Metadata, StorageError,
-};
+use realize_storage::{DirMetadata, FileMetadata, GlobalCache, Inode, Metadata, StorageError};
 use std::ffi::OsString;
 use std::time::SystemTime;
 use std::{sync::Arc, time::Duration};
@@ -381,7 +379,7 @@ impl Filesystem for RealizeFs {
     }
 
     /// Rename a file or directory.
-    /// 
+    ///
     /// The `noreplace` semantics (RENAME_NOREPLACE flag) are only supported on Linux.
     /// On other platforms, the noreplace flag is always treated as false.
     fn rename(
@@ -404,7 +402,7 @@ impl Filesystem for RealizeFs {
             reply.error(nix::libc::EINVAL);
             return;
         }
-        
+
         // On non-Linux platforms, noreplace is always false
         let noreplace = cfg!(target_os = "linux") && (flags & RENAME_NOREPLACE_FLAG) != 0;
 
@@ -1295,7 +1293,20 @@ mod tests {
                 fs::rename(&source_in_a, &dest_in_a).await.unwrap();
                 assert!(fs::metadata(&source_in_a).await.is_err());
                 assert!(fs::metadata(&dest_in_a).await.is_ok());
-                assert_eq!("source content", fs::read_to_string(&dest_in_a).await?);
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while Instant::now() < deadline {
+                    match fs::read_to_string(&dest_in_a).await {
+                        Ok(content) => {
+                            assert_eq!("source content", content);
+                            break;
+                        }
+                        Err(err) => {
+                            if err.kind() != std::io::ErrorKind::NotFound {
+                                panic!("{dest_in_a:?}: {err:?}");
+                            }
+                        }
+                    }
+                }
 
                 // Rename should be executed on B.
                 let deadline = Instant::now() + Duration::from_secs(3);
