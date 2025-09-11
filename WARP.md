@@ -28,6 +28,10 @@ cargo fmt
 cargo check -p crate-storage
 ```
 
+The project doesn't use a CHANGELOG. It relies instead on conventional
+commits to track changes. Commits that introduce backward-incompatibly
+changes are marked with an exclamation mark in their short comment.
+
 ### Testing
 ```bash
 # Run specific test module
