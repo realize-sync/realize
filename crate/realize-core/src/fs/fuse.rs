@@ -1,13 +1,16 @@
 #![allow(dead_code)] // in progress
-use crate::fs::downloader::Downloader;
+use crate::fs::downloader::{Download, Downloader};
 use fuser::{Filesystem, MountOption};
-use nix::libc::c_int;
+use nix::libc::{self, c_int};
 use realize_storage::{DirMetadata, FileMetadata, GlobalCache, Inode, Metadata, StorageError};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::time::SystemTime;
 use std::{sync::Arc, time::Duration};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
 use tokio::runtime::Handle;
+use tokio::sync::Mutex;
+use tokio_util::bytes::BufMut;
 
 /// Mount the cache as FUSE filesystem at the given mountpoint.
 pub fn export(
@@ -22,6 +25,7 @@ pub fn export(
             cache,
             downloader,
             umask,
+            handles: Arc::new(Mutex::new(BTreeMap::new())),
         }),
     };
     let bgsession = fuser::spawn_mount2(
@@ -81,7 +85,7 @@ impl Filesystem for RealizeFs {
         &mut self,
         _req: &fuser::Request<'_>,
         _config: &mut fuser::KernelConfig,
-    ) -> Result<(), nix::libc::c_int> {
+    ) -> Result<(), libc::c_int> {
         Ok(())
     }
 
@@ -132,18 +136,43 @@ impl Filesystem for RealizeFs {
 
     fn readlink(&mut self, _req: &fuser::Request<'_>, ino: u64, reply: fuser::ReplyData) {
         log::debug!("[Not Implemented] readlink(ino: {:#x?})", ino);
-        reply.error(nix::libc::ENOSYS);
+        reply.error(libc::ENOSYS);
     }
 
-    fn open(&mut self, _req: &fuser::Request<'_>, _ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
-        reply.opened(0, 0);
+    fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
+        let inner = Arc::clone(&self.inner);
+
+        self.handle.spawn(async move {
+            match inner.open(ino, flags).await {
+                Err(err) => reply.error(err.log_and_convert()),
+                Ok((fh, flags)) => reply.opened(fh, flags),
+            }
+        });
+    }
+
+    fn release(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let inner = Arc::clone(&self.inner);
+
+        self.handle.spawn(async move {
+            inner.release(fh).await;
+            reply.ok();
+        });
     }
 
     fn read(
         &mut self,
         _req: &fuser::Request<'_>,
-        ino: u64,
-        _fh: u64,
+        _ino: u64,
+        fh: u64,
         offset: i64,
         size: u32,
         _flags: i32,
@@ -153,24 +182,11 @@ impl Filesystem for RealizeFs {
         let inner = Arc::clone(&self.inner);
 
         self.handle.spawn(async move {
-            match inner.read(ino, offset, size).await {
+            match inner.read(fh, offset, size).await {
                 Err(err) => reply.error(err.log_and_convert()),
                 Ok(data) => reply.data(&data),
             }
         });
-    }
-
-    fn release(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        _ino: u64,
-        _fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-        _flush: bool,
-        reply: fuser::ReplyEmpty,
-    ) {
-        reply.ok();
     }
 
     fn opendir(
@@ -214,7 +230,7 @@ impl Filesystem for RealizeFs {
             ino,
             offset
         );
-        reply.error(nix::libc::ENOSYS);
+        reply.error(libc::ENOSYS);
     }
 
     fn releasedir(
@@ -246,7 +262,7 @@ impl Filesystem for RealizeFs {
             name,
             size
         );
-        reply.error(nix::libc::ENOSYS);
+        reply.error(libc::ENOSYS);
     }
 
     fn listxattr(
@@ -261,7 +277,7 @@ impl Filesystem for RealizeFs {
             ino,
             size
         );
-        reply.error(nix::libc::ENOSYS);
+        reply.error(libc::ENOSYS);
     }
 
     fn removexattr(
@@ -276,12 +292,12 @@ impl Filesystem for RealizeFs {
             ino,
             name
         );
-        reply.error(nix::libc::ENOSYS);
+        reply.error(libc::ENOSYS);
     }
 
     fn access(&mut self, _req: &fuser::Request<'_>, ino: u64, mask: i32, reply: fuser::ReplyEmpty) {
         log::debug!("[Not Implemented] access(ino: {:#x?}, mask: {})", ino, mask);
-        reply.error(nix::libc::ENOSYS);
+        reply.error(libc::ENOSYS);
     }
 
     fn lseek(
@@ -300,7 +316,7 @@ impl Filesystem for RealizeFs {
             offset,
             whence
         );
-        reply.error(nix::libc::ENOSYS);
+        reply.error(libc::ENOSYS);
     }
 
     fn unlink(
@@ -393,13 +409,13 @@ impl Filesystem for RealizeFs {
         reply: fuser::ReplyEmpty,
     ) {
         #[cfg(target_os = "linux")]
-        const RENAME_NOREPLACE_FLAG: u32 = nix::libc::RENAME_NOREPLACE;
+        const RENAME_NOREPLACE_FLAG: u32 = libc::RENAME_NOREPLACE;
         #[cfg(not(target_os = "linux"))]
         const RENAME_NOREPLACE_FLAG: u32 = 0;
 
         if (flags & (!RENAME_NOREPLACE_FLAG)) != 0 {
             // only NOREPLACE is supported
-            reply.error(nix::libc::EINVAL);
+            reply.error(libc::EINVAL);
             return;
         }
 
@@ -426,6 +442,7 @@ struct InnerRealizeFs {
     cache: Arc<GlobalCache>,
     downloader: Downloader,
     umask: u16,
+    handles: Arc<Mutex<BTreeMap<u64, Arc<Mutex<tokio::io::BufReader<Download>>>>>>,
 }
 
 impl InnerRealizeFs {
@@ -446,23 +463,31 @@ impl InnerRealizeFs {
         }
     }
 
-    async fn read(&self, ino: u64, offset: i64, size: u32) -> Result<Vec<u8>, FuseError> {
-        let reader = self
-            .downloader
-            .reader(Inode(ino))
-            .await
-            .map_err(FuseError::Cache)?;
-        let mut reader = tokio::io::BufReader::new(reader);
+    async fn read(&self, fh: u64, offset: i64, size: u32) -> Result<Vec<u8>, FuseError> {
+        let reader = {
+            let handles = self.handles.lock().await;
+            match handles.get(&fh) {
+                None => return Err(FuseError::Errno(libc::EINVAL)),
+                Some(h) => Arc::clone(h),
+            }
+        };
+        let mut reader = reader.lock().await;
         reader
             .seek(tokio::io::SeekFrom::Start(offset as u64))
-            .await
-            .map_err(FuseError::Io)?;
+            .await?;
 
-        let mut buffer = vec![0; size as usize];
-        let bytes_read = reader.read(&mut buffer).await.map_err(FuseError::Io)?;
-        buffer.truncate(bytes_read);
+        // As requested by FUSE: Read as much as possible up to size
+        // (no short reads). Only stop if EOF is reached.
+        let size = size as usize;
+        let mut buffer = Vec::with_capacity(size).limit(size);
+        while buffer.remaining_mut() > 0 {
+            if reader.read_buf(&mut buffer).await? == 0 {
+                // EOF
+                break;
+            }
+        }
 
-        Ok(buffer)
+        Ok(buffer.into_inner())
     }
 
     async fn readdir(
@@ -620,6 +645,24 @@ impl InnerRealizeFs {
             flags: 0,
         }
     }
+
+    async fn open(&self, ino: u64, flags: i32) -> Result<(u64, u32), FuseError> {
+        if (flags & (libc::O_RDONLY | libc::O_WRONLY | libc::O_RDWR)) != libc::O_RDONLY {
+            return Err(FuseError::Errno(libc::ENOSYS));
+        }
+
+        let reader = self.downloader.reader(Inode(ino)).await?;
+        let mut handles = self.handles.lock().await;
+        let fh = handles.last_key_value().map(|(k, _)| *k + 1).unwrap_or(1);
+        handles.insert(fh, Arc::new(Mutex::new(BufReader::new(reader))));
+
+        Ok((fh, 0))
+    }
+
+    async fn release(&self, fh: u64) {
+        let mut handles = self.handles.lock().await;
+        handles.remove(&fh);
+    }
 }
 
 /// Intermediate error type to catch and convert to libc errno to
@@ -634,6 +677,9 @@ enum FuseError {
 
     #[error("I/O error")]
     Io(#[from] std::io::Error),
+
+    #[error("errno {0}")]
+    Errno(c_int),
 }
 
 impl FuseError {
@@ -641,8 +687,9 @@ impl FuseError {
     fn errno(&self) -> c_int {
         match &self {
             FuseError::Cache(err) => io_errno(err.io_kind()),
-            FuseError::Utf8 => nix::libc::EINVAL,
+            FuseError::Utf8 => libc::EINVAL,
             FuseError::Io(ioerr) => io_errno(ioerr.kind()),
+            FuseError::Errno(errno) => *errno,
         }
     }
 
@@ -659,44 +706,44 @@ impl FuseError {
 /// Convert a Rust [std::io::ErrorKind] into a libc error code.
 fn io_errno(kind: std::io::ErrorKind) -> c_int {
     match kind {
-        std::io::ErrorKind::NotFound => nix::libc::ENOENT,
-        std::io::ErrorKind::PermissionDenied => nix::libc::EACCES,
-        std::io::ErrorKind::ConnectionRefused => nix::libc::ECONNREFUSED,
-        std::io::ErrorKind::ConnectionReset => nix::libc::ECONNRESET,
-        std::io::ErrorKind::HostUnreachable => nix::libc::EHOSTUNREACH,
-        std::io::ErrorKind::NetworkUnreachable => nix::libc::ENETUNREACH,
-        std::io::ErrorKind::ConnectionAborted => nix::libc::ECONNABORTED,
-        std::io::ErrorKind::NotConnected => nix::libc::ENOTCONN,
-        std::io::ErrorKind::AddrInUse => nix::libc::EADDRINUSE,
-        std::io::ErrorKind::AddrNotAvailable => nix::libc::EADDRNOTAVAIL,
-        std::io::ErrorKind::NetworkDown => nix::libc::ENETDOWN,
-        std::io::ErrorKind::BrokenPipe => nix::libc::EPIPE,
-        std::io::ErrorKind::AlreadyExists => nix::libc::EEXIST,
-        std::io::ErrorKind::WouldBlock => nix::libc::EAGAIN,
-        std::io::ErrorKind::NotADirectory => nix::libc::ENOTDIR,
-        std::io::ErrorKind::IsADirectory => nix::libc::EISDIR,
-        std::io::ErrorKind::DirectoryNotEmpty => nix::libc::ENOTEMPTY,
-        std::io::ErrorKind::ReadOnlyFilesystem => nix::libc::EROFS,
-        std::io::ErrorKind::StaleNetworkFileHandle => nix::libc::ESTALE,
-        std::io::ErrorKind::InvalidInput => nix::libc::EINVAL,
-        std::io::ErrorKind::InvalidData => nix::libc::EINVAL,
-        std::io::ErrorKind::TimedOut => nix::libc::ETIMEDOUT,
-        std::io::ErrorKind::WriteZero => nix::libc::EIO,
-        std::io::ErrorKind::StorageFull => nix::libc::ENOSPC,
-        std::io::ErrorKind::NotSeekable => nix::libc::ESPIPE,
-        std::io::ErrorKind::QuotaExceeded => nix::libc::EDQUOT,
-        std::io::ErrorKind::FileTooLarge => nix::libc::EFBIG,
-        std::io::ErrorKind::ResourceBusy => nix::libc::EBUSY,
-        std::io::ErrorKind::ExecutableFileBusy => nix::libc::ETXTBSY,
-        std::io::ErrorKind::Deadlock => nix::libc::EDEADLK,
-        std::io::ErrorKind::CrossesDevices => nix::libc::EXDEV,
-        std::io::ErrorKind::TooManyLinks => nix::libc::EMLINK,
-        std::io::ErrorKind::InvalidFilename => nix::libc::EINVAL,
-        std::io::ErrorKind::ArgumentListTooLong => nix::libc::E2BIG,
-        std::io::ErrorKind::Interrupted => nix::libc::EINTR,
-        std::io::ErrorKind::Unsupported => nix::libc::ENOSYS,
-        std::io::ErrorKind::OutOfMemory => nix::libc::ENOMEM,
-        _ => nix::libc::EIO,
+        std::io::ErrorKind::NotFound => libc::ENOENT,
+        std::io::ErrorKind::PermissionDenied => libc::EACCES,
+        std::io::ErrorKind::ConnectionRefused => libc::ECONNREFUSED,
+        std::io::ErrorKind::ConnectionReset => libc::ECONNRESET,
+        std::io::ErrorKind::HostUnreachable => libc::EHOSTUNREACH,
+        std::io::ErrorKind::NetworkUnreachable => libc::ENETUNREACH,
+        std::io::ErrorKind::ConnectionAborted => libc::ECONNABORTED,
+        std::io::ErrorKind::NotConnected => libc::ENOTCONN,
+        std::io::ErrorKind::AddrInUse => libc::EADDRINUSE,
+        std::io::ErrorKind::AddrNotAvailable => libc::EADDRNOTAVAIL,
+        std::io::ErrorKind::NetworkDown => libc::ENETDOWN,
+        std::io::ErrorKind::BrokenPipe => libc::EPIPE,
+        std::io::ErrorKind::AlreadyExists => libc::EEXIST,
+        std::io::ErrorKind::WouldBlock => libc::EAGAIN,
+        std::io::ErrorKind::NotADirectory => libc::ENOTDIR,
+        std::io::ErrorKind::IsADirectory => libc::EISDIR,
+        std::io::ErrorKind::DirectoryNotEmpty => libc::ENOTEMPTY,
+        std::io::ErrorKind::ReadOnlyFilesystem => libc::EROFS,
+        std::io::ErrorKind::StaleNetworkFileHandle => libc::ESTALE,
+        std::io::ErrorKind::InvalidInput => libc::EINVAL,
+        std::io::ErrorKind::InvalidData => libc::EINVAL,
+        std::io::ErrorKind::TimedOut => libc::ETIMEDOUT,
+        std::io::ErrorKind::WriteZero => libc::EIO,
+        std::io::ErrorKind::StorageFull => libc::ENOSPC,
+        std::io::ErrorKind::NotSeekable => libc::ESPIPE,
+        std::io::ErrorKind::QuotaExceeded => libc::EDQUOT,
+        std::io::ErrorKind::FileTooLarge => libc::EFBIG,
+        std::io::ErrorKind::ResourceBusy => libc::EBUSY,
+        std::io::ErrorKind::ExecutableFileBusy => libc::ETXTBSY,
+        std::io::ErrorKind::Deadlock => libc::EDEADLK,
+        std::io::ErrorKind::CrossesDevices => libc::EXDEV,
+        std::io::ErrorKind::TooManyLinks => libc::EMLINK,
+        std::io::ErrorKind::InvalidFilename => libc::EINVAL,
+        std::io::ErrorKind::ArgumentListTooLong => libc::E2BIG,
+        std::io::ErrorKind::Interrupted => libc::EINTR,
+        std::io::ErrorKind::Unsupported => libc::ENOSYS,
+        std::io::ErrorKind::OutOfMemory => libc::ENOMEM,
+        _ => libc::EIO,
     }
 }
 
