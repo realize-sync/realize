@@ -256,12 +256,15 @@ impl GlobalCache {
                     {
                         // For global directories, construct DirMetadata
                         if let Some(IntermediatePath { mtime, .. }) = this.paths.get(&pathid) {
-                            Ok((Inode(pathid.as_u64()), crate::arena::types::Metadata::Dir(
-                                crate::arena::types::DirMetadata {
-                                    read_only: true, // Global directories are read-only
-                                    mtime: *mtime,
-                                },
-                            )))
+                            Ok((
+                                Inode(pathid.as_u64()),
+                                crate::arena::types::Metadata::Dir(
+                                    crate::arena::types::DirMetadata {
+                                        read_only: true, // Global directories are read-only
+                                        mtime: *mtime,
+                                    },
+                                ),
+                            ))
                         } else {
                             Err(StorageError::NotFound)
                         }
@@ -326,10 +329,12 @@ impl GlobalCache {
                                 name.to_string(),
                                 // global inodes and pathids map 1:1
                                 Inode(pathid.as_u64()),
-                                crate::arena::types::Metadata::Dir(crate::arena::types::DirMetadata {
-                                    read_only: true, // Global directories are read-only
-                                    mtime: *mtime,
-                                }),
+                                crate::arena::types::Metadata::Dir(
+                                    crate::arena::types::DirMetadata {
+                                        read_only: true, // Global directories are read-only
+                                        mtime: *mtime,
+                                    },
+                                ),
                             )
                         })
                         .collect()),
@@ -908,11 +913,11 @@ mod tests {
         let cache = &fixture.cache;
         let entries = cache.readdir(PathId(1)).await?;
         assert_eq!(entries.len(), 2);
-        
+
         let mut names: Vec<String> = entries.iter().map(|(name, _, _)| name.clone()).collect();
         names.sort();
         assert_eq!(names, vec!["arenas", "other"]);
-        
+
         // Verify all entries are directories and read-only
         for (name, _, metadata) in entries {
             match metadata {
@@ -927,11 +932,11 @@ mod tests {
         let (arenas, _) = cache.lookup((PathId(1), "arenas")).await?;
         let entries = cache.readdir(arenas).await?;
         assert_eq!(entries.len(), 2);
-        
+
         let mut names: Vec<String> = entries.iter().map(|(name, _, _)| name.clone()).collect();
         names.sort();
         assert_eq!(names, vec!["test1", "test2"]);
-        
+
         // Verify all entries are directories and read-only
         for (name, _, metadata) in entries {
             match metadata {
