@@ -1,14 +1,11 @@
 use crate::rpc::{ExecutionMode, Household};
-use futures::Future;
 use realize_storage::{Blob, GlobalCache, GlobalLoc, StorageError};
 use realize_types::{Arena, ByteRange, ByteRanges, Path, Peer};
 use std::cmp::min;
 use std::collections::VecDeque;
-use std::io::{ErrorKind, SeekFrom};
-use std::pin::Pin;
+use std::io::SeekFrom;
 use std::sync::Arc;
-use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio_stream::StreamExt;
 use tokio_util::bytes::BufMut;
 
@@ -66,76 +63,15 @@ pub struct Download {
     arena: Arena,
     path: Path,
     size: u64,
-    offset: u64,
-    pending_seek: Option<u64>,
 
     /// Chunks kept in memory, sorted by ByteRange.start.
     ///
     /// The first range should always contain offset.
-    avail: VecDeque<(ByteRange, Vec<u8>)>,
-    read: ReadState,
+    /// This should be continguous.
+    ///
+    buffer: VecDeque<(ByteRange, Vec<u8>)>, // TODO: consider using a Buf/BufMut
     blob: Blob,
 }
-
-impl Download {
-    /// Read remote peer data at the given offset.
-    ///
-    /// Data is downloaded or read from local store.
-    ///
-    /// This function fills `buf` to capacity, even if it means making
-    /// several read operations. It stops only if `buf` is full or
-    /// when reaching EOF.
-    pub async fn read_at<B: BufMut + ?Sized>(
-        &mut self,
-        offset: u64,
-        buf: &mut B,
-    ) -> Result<usize, std::io::Error> {
-        self.seek(tokio::io::SeekFrom::Start(offset as u64)).await?;
-        let mut bytes_read = 0;
-        while buf.remaining_mut() > 0 {
-            let n = self.read_buf(buf).await?;
-            if n == 0 {
-                // EOF
-                break;
-            }
-            bytes_read += n;
-        }
-        Ok(bytes_read)
-    }
-}
-
-/// States for AsyncRead::poll_read.
-#[derive(Default)]
-enum ReadState {
-    /// Answer [tokio::io::AsyncRead::poll_read] immediately or dispatch to
-    /// another state to get the data.
-    #[default]
-    Default,
-
-    /// Run [tokio::io::AsyncSeek::poll_complete] on the blob, then
-    /// [tokio::io::AsyncSeek::start_seek].
-    StartSeek(SeekFrom, Box<ReadState>),
-
-    /// [tokio::io::AsyncSeek::poll_complete] on the blob after
-    /// calling [tokio::io::AsyncSeek::start_seek].
-    Seek(Box<ReadState>),
-
-    /// Call [tokio::io::AsyncRead::poll_read] on the blob
-    Read,
-
-    /// Call [tokio::io::AsyncWrite::poll_write] on the blob.
-    ///
-    /// Once this is done, schedule the ranges left in the deque for
-    /// writing, if any.
-    Write(ByteRange, Vec<u8>, VecDeque<(ByteRange, Vec<u8>)>),
-
-    /// A future that downloads the given range from a remote peer.
-    Download(ByteRange, PendingDownload),
-}
-
-type PendingDownload = Pin<
-    Box<dyn Future<Output = Result<VecDeque<(ByteRange, Vec<u8>)>, std::io::Error>> + Send + Sync>,
->;
 
 impl Download {
     fn new(
@@ -152,17 +88,9 @@ impl Download {
             arena,
             path,
             size,
-            offset: 0,
-            pending_seek: None,
-            avail: VecDeque::new(),
-            read: ReadState::Default,
+            buffer: VecDeque::new(),
             blob,
         }
-    }
-
-    /// Check whether the current offset is at or past the file end.
-    pub fn at_end(&self) -> bool {
-        self.offset >= self.size
     }
 
     /// Update local availability in the database.
@@ -182,40 +110,124 @@ impl Download {
         self.blob.available_range()
     }
 
-    fn fill(&mut self, buf: &mut ReadBuf<'_>) -> bool {
-        let requested = ByteRange::new_with_size(self.offset, buf.remaining() as u64);
-        let mut filled = false;
-        while let Some((range, data)) = self.avail.front() {
+    /// Read remote peer data at the given offset.
+    ///
+    /// Data is downloaded or read from local store.
+    ///
+    /// This function fills `buf` to capacity, even if it means making
+    /// several read operations. It stops only if `buf` is full or
+    /// when reaching EOF.
+    pub async fn read_all_at<B: BufMut + ?Sized>(
+        &mut self,
+        mut offset: u64,
+        buf: &mut B,
+    ) -> Result<usize, std::io::Error> {
+        let mut bytes_read = 0;
+        loop {
+            let n = self.read_some_at(offset, buf).await?;
+            if n == 0 {
+                // EOF
+                break;
+            }
+            bytes_read += n;
+            offset += n as u64;
+        }
+        Ok(bytes_read)
+    }
+
+    /// Read or download a chunk of data and put it into `buf`.
+    ///
+    /// Returns 0 when EOF is reached or buf is full. Short reads are
+    /// possible
+    async fn read_some_at<B: BufMut + ?Sized>(
+        &mut self,
+        offset: u64,
+        buf: &mut B,
+    ) -> Result<usize, std::io::Error> {
+        let capacity = buf.remaining_mut();
+        if capacity == 0 || offset >= self.size {
+            return Ok(0);
+        }
+        let filled = self.fill_from_buffer(offset, buf);
+        if filled > 0 {
+            // at least partially available in memory
+            return Ok(filled);
+        }
+        if let Some(readable_length) = self.blob.readable_length(offset, buf.remaining_mut()) {
+            // at least partially available in the blob
+            self.blob.seek(SeekFrom::Start(offset)).await?;
+            return self.blob.read_buf(&mut buf.limit(readable_length)).await;
+        }
+
+        // download into buffer, optionally store into the blob
+        let ranges = self.download_range(offset, capacity).await?;
+        for (range, data) in ranges {
+            let _ = self.store_range(&range, &data).await; // best effort
+            log::debug!("=== got {range}");
+            self.buffer.push_back((range, data));
+        }
+        self.buffer.make_contiguous().sort_by_key(|elt| elt.0.start);
+
+        Ok(self.fill_from_buffer(offset, buf))
+    }
+
+    /// Store remote peer data into the blob for next time.
+    async fn store_range(
+        &mut self,
+        range: &ByteRange,
+        data: &Vec<u8>,
+    ) -> Result<(), std::io::Error> {
+        let mut updater = self.blob.updater();
+        if updater.offset() != range.start {
+            updater.seek(SeekFrom::Start(range.start)).await?;
+        }
+
+        updater.write_all(&data.as_slice()).await
+    }
+
+    /// Fill `buf` with previously downloaded data, kept in memory.
+    fn fill_from_buffer<B: BufMut + ?Sized>(&mut self, offset: u64, buf: &mut B) -> usize {
+        while self
+            .buffer
+            .front()
+            .map(|(range, _)| !range.contains(offset))
+            .unwrap_or(false)
+        {
+            self.buffer.pop_front();
+        }
+
+        let requested = ByteRange::new_with_size(offset, buf.remaining_mut() as u64);
+        let mut filled_bytes = 0;
+        if let Some((range, data)) = self.buffer.front() {
             let intersection = requested.intersection(range);
-            if !intersection.is_empty() && intersection.start == self.offset {
+            if !intersection.is_empty() && intersection.start == offset {
                 buf.put_slice(
                     &data[(intersection.start - range.start) as usize
                         ..(intersection.end - range.start) as usize],
                 );
-                self.offset += intersection.bytecount();
+                filled_bytes += intersection.bytecount();
 
-                filled = true;
-                if intersection.end < range.end {
-                    return true;
-                }
-                self.avail.pop_front();
-                if buf.remaining() == 0 {
-                    return true;
+                if intersection.end == range.end {
+                    self.buffer.pop_front();
                 }
             }
         }
 
-        filled
+        filled_bytes as usize
     }
 
-    fn next_request(&mut self, bufsize: usize) -> (ByteRange, PendingDownload) {
-        let offset = self.offset;
+    /// Download a range of data for reading `bufsize` at `offset`.
+    ///
+    /// Downloaded data will intersect with the requested range, but
+    /// it might not match exactly, as more data than strictly
+    /// necessary can be downloaded to keep for later.
+    async fn download_range(
+        &mut self,
+        offset: u64,
+        requested_bufsize: usize,
+    ) -> Result<VecDeque<(ByteRange, Vec<u8>)>, std::io::Error> {
         let end = self.size;
-        let mut next = self
-            .avail
-            .back()
-            .map(|(range, _)| range.end)
-            .unwrap_or(offset);
+        let mut next = offset;
 
         // Align to MIN_CHUNK_SIZE, so the blocks start and end at
         // consistent positions. This will also match filesystem
@@ -223,7 +235,7 @@ impl Download {
         // stored in sparse files.
         let align = next % MIN_CHUNK_SIZE;
         next -= align;
-        let mut bufsize = bufsize as u64 + align;
+        let mut bufsize = requested_bufsize as u64 + align;
         bufsize += MIN_CHUNK_SIZE - (bufsize % MIN_CHUNK_SIZE);
         if bufsize > MAX_CHUNK_SIZE {
             bufsize = MAX_CHUNK_SIZE;
@@ -231,249 +243,33 @@ impl Download {
 
         let range = ByteRange::new(next, min(end, next + bufsize));
 
-        log::debug!("[{}] Download \"{}\" {range}", self.arena, self.path);
-
-        let fut = {
-            let household = self.household.clone();
-            let peers = self.peers.clone();
-            let arena = self.arena;
-            let path = self.path.clone();
-            let range = range.clone();
-
-            Box::pin(async move {
-                let mut result = VecDeque::new();
-                let mut stream = household.read(
-                    peers,
-                    ExecutionMode::Interactive,
-                    arena,
-                    path,
-                    range.start,
-                    Some(range.bytecount()),
-                )?;
-                while let Some(chunk_result) = stream.next().await {
-                    match chunk_result {
-                        Ok((offset, chunk)) => {
-                            result.push_back((
-                                ByteRange::new_with_size(offset, chunk.len() as u64),
-                                chunk,
-                            ));
-                        }
-                        Err(err) => return Err(err.into_io()),
-                    }
-                }
-                result.make_contiguous().sort_by_key(|elt| elt.0.start);
-
-                Ok(result)
-            })
-        };
-
-        (range, fut)
-    }
-
-    /// State-based handler for poll_read.
-    ///
-    /// Returns the next state and optionally a poll value to return.
-    ///
-    /// ## [ReadState] transitions
-    ///
-    /// - `Default` → ( `StartSeek` → `Seek` ) → `Read` → `Default`
-    ///
-    /// - `Default` → `Download` → ( `StartSeek` → `Seek` ) → `Write` → `Default`
-    ///
-    /// On error, go back to `Default`.
-    ///
-    fn handle_poll_read(
-        self: &mut Pin<&mut Self>,
-        state: ReadState,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> (ReadState, Option<Poll<std::io::Result<()>>>) {
-        match state {
-            // Return the data or dispatch to Read or Download.
-            ReadState::Default => {
-                if self.offset >= self.size || self.fill(buf) {
-                    return (ReadState::Default, Some(Poll::Ready(Ok(()))));
-                }
-
-                let readable = self.blob.readable_length(self.offset, buf.remaining());
-                if readable.is_none() {
-                    let (r, fut) = self.next_request(buf.capacity());
-
-                    return (ReadState::Download(r, fut), None);
-                }
-
-                (
-                    if self.blob.offset() == self.offset {
-                        ReadState::Read
-                    } else {
-                        ReadState::StartSeek(
-                            SeekFrom::Start(self.offset),
-                            Box::new(ReadState::Read),
-                        )
-                    },
-                    None,
-                )
-            }
-
-            // Call poll_complete on the blob, then start_seek.
-            //
-            // As the documentation of start_seek recommends, this
-            // implementation always call poll_complete before
-            // start_seek to make sure any pending operations are
-            // done.
-            ReadState::StartSeek(position, next) => {
-                match Pin::new(&mut self.blob).poll_complete(cx) {
-                    Poll::Pending => (ReadState::StartSeek(position, next), Some(Poll::Pending)),
-                    Poll::Ready(Err(err)) => (ReadState::Default, Some(Poll::Ready(Err(err)))),
-                    Poll::Ready(Ok(_)) => {
-                        if let Err(err) = Pin::new(&mut self.blob).start_seek(position) {
-                            return (ReadState::Default, Some(Poll::Ready(Err(err))));
-                        }
-                        (ReadState::Seek(next), None)
-                    }
-                }
-            }
-
-            // Call poll_complete on the blob after start_seek
-            ReadState::Seek(next) => match Pin::new(&mut self.blob).poll_complete(cx) {
-                Poll::Pending => (ReadState::Seek(next), Some(Poll::Pending)),
-                Poll::Ready(Err(err)) => (ReadState::Default, Some(Poll::Ready(Err(err)))),
-                Poll::Ready(Ok(_)) => (*next, None),
-            },
-
-            // Read data from the blob
-            ReadState::Read => {
-                let start = buf.filled().len();
-                match Pin::new(&mut self.blob).poll_read(cx, buf) {
-                    Poll::Pending => (ReadState::Read, Some(Poll::Pending)),
-                    Poll::Ready(Err(err)) => (ReadState::Default, Some(Poll::Ready(Err(err)))),
-                    Poll::Ready(Ok(())) => {
-                        let n = buf.filled().len() - start;
-                        self.offset += n as u64;
-
-                        (ReadState::Default, Some(Poll::Ready(Ok(()))))
-                    }
-                }
-            }
-
-            // Download data from another peer
-            ReadState::Download(r, mut fut) => match fut.as_mut().poll(cx) {
-                Poll::Pending => (ReadState::Download(r, fut), Some(Poll::Pending)),
-                Poll::Ready(Err(err)) => (ReadState::Default, Some(Poll::Ready(Err(err)))),
-                Poll::Ready(Ok(chunks)) => (self.write_chunks_state(chunks), None),
-            },
-
-            // Write data to the blob.
-            ReadState::Write(r, data, chunks) => {
-                match Pin::new(&mut self.blob.updater()).poll_write(cx, data.as_slice()) {
-                    Poll::Pending => (ReadState::Write(r, data, chunks), Some(Poll::Pending)),
-                    Poll::Ready(Err(err)) => (ReadState::Default, Some(Poll::Ready(Err(err)))),
-                    Poll::Ready(Ok(_)) => {
-                        // Keep in memory so data is immediately available for reading
-                        self.avail.push_back((r, data));
-                        if chunks.is_empty() {
-                            self.avail.make_contiguous().sort_by_key(|elt| elt.0.start);
-                        }
-
-                        (self.write_chunks_state(chunks), None)
-                    }
-                }
-            }
-        }
-    }
-
-    /// Build a state appropriate to write the given chunk list.
-    fn write_chunks_state(&self, mut chunks: VecDeque<(ByteRange, Vec<u8>)>) -> ReadState {
-        if let Some((chunk_range, chunk_data)) = chunks.pop_front() {
-            let start = chunk_range.start;
-            let write_state = ReadState::Write(chunk_range, chunk_data, chunks);
-            if start == self.blob.offset() {
-                write_state
-            } else {
-                ReadState::StartSeek(SeekFrom::Start(start), Box::new(write_state))
-            }
-        } else {
-            ReadState::Default
-        }
-    }
-}
-
-/// Add the given offset to the base.
-///
-/// Return an error if the shift would be below 0.
-fn relative_offset(offset: i64, base: u64) -> Result<u64, std::io::Error> {
-    if offset < 0 {
-        let diff = (-offset) as u64;
-        if diff > base {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidInput,
-                "Seek before start",
-            ));
-        }
-
-        Ok(base - diff)
-    } else {
-        Ok(base + offset as u64)
-    }
-}
-
-impl AsyncSeek for Download {
-    fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> std::io::Result<()> {
-        let end = self.size;
-        let goal = std::cmp::min(
-            end,
-            match position {
-                SeekFrom::Current(offset) => relative_offset(offset, self.offset)?,
-                SeekFrom::End(offset) => relative_offset(offset, end)?,
-                SeekFrom::Start(offset) => offset,
-            },
+        log::debug!(
+            "[{}] Download \"{}\" {range} for read [{offset},{})",
+            self.arena,
+            self.path,
+            offset + requested_bufsize as u64
         );
-        self.get_mut().pending_seek = Some(goal);
 
-        Ok(())
-    }
-
-    fn poll_complete(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
-        let this = self.get_mut();
-
-        match this.pending_seek.take() {
-            None => Poll::Ready(Ok(this.offset)),
-            Some(goal) => {
-                if let ReadState::Download(range, _) = &this.read
-                    && !range.contains(goal)
-                {
-                    this.read = ReadState::Default;
+        let mut result = VecDeque::new();
+        let mut stream = self.household.read(
+            self.peers.clone(),
+            ExecutionMode::Interactive,
+            self.arena,
+            self.path.clone(),
+            range.start,
+            Some(range.bytecount()),
+        )?;
+        while let Some(chunk_result) = stream.next().await {
+            match chunk_result {
+                Ok((offset, chunk)) => {
+                    result.push_back((ByteRange::new_with_size(offset, chunk.len() as u64), chunk));
                 }
-                while this
-                    .avail
-                    .front()
-                    .map(|(range, _)| !range.contains(goal))
-                    .unwrap_or(false)
-                {
-                    this.avail.pop_front();
-                }
-                this.offset = goal;
-
-                Poll::Ready(Ok(this.offset))
+                Err(err) => return Err(err.into_io()),
             }
         }
-    }
-}
+        result.make_contiguous().sort_by_key(|elt| elt.0.start);
 
-impl AsyncRead for Download {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        loop {
-            let prev = std::mem::take(&mut self.read);
-            let (next, ret) = self.handle_poll_read(prev, cx, buf);
-            self.read = next;
-            if let Some(ret) = ret {
-                return ret;
-            }
-        }
+        Ok(result)
     }
 }
 
@@ -586,7 +382,6 @@ mod tests {
                 testing::disconnect(&household_a, b).await?;
 
                 // Reading back from the reader works.
-                reader.seek(SeekFrom::Start(0)).await?;
                 assert_eq!("File content", read_string(0, &mut reader).await?);
 
                 // Reading back from another reader works, once the
@@ -695,19 +490,19 @@ mod tests {
                 let mut reader = fixture.reader(&downloader, "large_file").await?;
 
                 let mut buf = vec![].limit(16);
-                reader.read_at(0, &mut buf).await?;
+                reader.read_all_at(0, &mut buf).await?;
                 assert_eq!(vec![1u8; 16], buf.into_inner());
 
                 let mut buf = vec![].limit(16);
-                reader.read_at(3 * 8 * 1024 - 100, &mut buf).await?;
+                reader.read_all_at(3 * 8 * 1024 - 100, &mut buf).await?;
                 assert_eq!(vec![2u8; 16], buf.into_inner());
 
                 let mut buf = vec![].limit(16);
-                reader.read_at(100, &mut buf).await?;
+                reader.read_all_at(100, &mut buf).await?;
                 assert_eq!(vec![1u8; 16], buf.into_inner());
 
                 let mut buf = vec![].limit(16);
-                reader.read_at(8 * 1024, &mut buf).await?;
+                reader.read_all_at(8 * 1024, &mut buf).await?;
                 assert_eq!(vec![0u8; 16], buf.into_inner());
 
                 Ok::<(), anyhow::Error>(())
@@ -755,11 +550,11 @@ mod tests {
                 let mut reader = fixture.reader(&downloader, "large_file").await?;
 
                 // Read near start; stores the 1st block
-                reader.read_at(100, &mut vec![].limit(16)).await?;
+                reader.read_all_at(100, &mut vec![].limit(16)).await?;
 
                 // Read near end; stores the last block
                 reader
-                    .read_at(3 * MIN_CHUNK_SIZE - 100, &mut vec![].limit(16))
+                    .read_all_at(3 * MIN_CHUNK_SIZE - 100, &mut vec![].limit(16))
                     .await?;
 
                 testing::disconnect(&household_a, b).await?;
@@ -775,16 +570,21 @@ mod tests {
 
                 // Read from first block succeeds.
                 let mut buf = vec![].limit(16);
-                reader.read_at(16, &mut buf).await?;
+                reader.read_all_at(16, &mut buf).await?;
                 assert_eq!(vec![1u8; 16], buf.into_inner());
 
                 // Read from last block succeeds.
                 let mut buf = vec![].limit(16);
-                reader.read_at(3 * block - 100, &mut buf).await?;
+                reader.read_all_at(3 * block - 100, &mut buf).await?;
                 assert_eq!(vec![2u8; 16], buf.into_inner());
 
                 // Read from middle block fails.
-                assert!(reader.read_at(block, &mut vec![].limit(16)).await.is_err());
+                assert!(
+                    reader
+                        .read_all_at(block, &mut vec![].limit(16))
+                        .await
+                        .is_err()
+                );
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -888,7 +688,7 @@ mod tests {
         for i in 0..(file_size / buf_size) {
             let offset = i * buf_size;
             let mut buf = vec![].limit(buf_size);
-            assert_eq!(buf_size, reader.read_at(offset as u64, &mut buf).await?);
+            assert_eq!(buf_size, reader.read_all_at(offset as u64, &mut buf).await?);
             assert_eq!(
                 file_content[offset..(offset + buf_size)],
                 buf.into_inner(),
@@ -899,7 +699,7 @@ mod tests {
         if rest > 0 {
             let offset = file_size - rest;
             let mut buf = vec![].limit(buf_size);
-            assert_eq!(rest, reader.read_at(offset as u64, &mut buf).await?);
+            assert_eq!(rest, reader.read_all_at(offset as u64, &mut buf).await?);
             assert_eq!(
                 file_content[offset..],
                 buf.into_inner(),
@@ -907,14 +707,14 @@ mod tests {
             );
         }
 
-        assert_eq!(0, reader.read_at(file_size as u64, &mut vec![]).await?);
+        assert_eq!(0, reader.read_all_at(file_size as u64, &mut vec![]).await?);
 
         Ok(())
     }
 
     async fn read_string(offset: u64, reader: &mut Download) -> anyhow::Result<String> {
         let mut buffer = vec![];
-        reader.read_at(offset, &mut buffer).await?;
+        reader.read_all_at(offset, &mut buffer).await?;
         Ok(String::from_utf8(buffer)?)
     }
 }

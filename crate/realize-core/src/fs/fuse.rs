@@ -478,7 +478,7 @@ impl InnerRealizeFs {
 
         // TODO: clarify type situation for offset. offset is i64 in
         // fuser, but u64 in libfuse and Linux. What's happening?
-        reader.read_at(offset as u64, &mut buffer).await?;
+        reader.read_all_at(offset as u64, &mut buffer).await?;
 
         Ok(buffer.into_inner())
     }
