@@ -1217,6 +1217,26 @@ impl Blob {
         self.info.local_availability()
     }
 
+    /// Get a writer that can be used to write data to this blob.
+    ///
+    /// The returned writer implements AsyncWrite and tracks available ranges
+    /// as data is written. Only one updater can be active at a time due to
+    /// Rust's borrowing rules.
+    ///
+    /// The updater delegates seek(), offset() and update_db() calls
+    /// to the original blob.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut blob = storage.open_blob(pathid)?;
+    /// let mut updater = blob.updater();
+    /// updater.write_all(b"hello").await?;
+    /// updater.flush().await?;
+    /// ```
+    pub fn updater(&mut self) -> BlobUpdater<'_> {
+        BlobUpdater { inner: self }
+    }
+
     /// Return the information needed for fetching data for that blob
     /// from remote peers.
     ///
@@ -1424,22 +1444,40 @@ impl AsyncSeek for Blob {
     }
 }
 
-impl AsyncWrite for Blob {
+/// Provides write access to a blob for remote peer data.
+///
+/// This struct borrows the blob mutably and implements AsyncWrite,
+/// allowing data from remote peers to be stored into the blob.
+pub struct BlobUpdater<'a> {
+    inner: &'a mut Blob,
+}
+impl<'a> BlobUpdater<'a> {
+    // Convenience shortcut to [Blob::offset]
+    pub fn offset(&self) -> u64 {
+        self.inner.offset
+    }
+
+    // Convenience shortcut to [Blob::update_db]
+    pub async fn update_db(&mut self) -> Result<bool, StorageError> {
+        self.inner.update_db().await
+    }
+}
+impl<'a> AsyncWrite for BlobUpdater<'a> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        let res = Pin::new(&mut self.file).poll_write(cx, buf);
+        let res = Pin::new(&mut self.inner.file).poll_write(cx, buf);
 
         if let Poll::Ready(Ok(len)) = &res {
             if *len > 0 {
-                let start = self.offset;
+                let start = self.inner.offset;
                 let end = start + (*len as u64);
-                self.offset = end;
+                self.inner.offset = end;
                 let range = ByteRange::new(start, end);
-                self.info.available_ranges.add(&range);
-                self.pending_ranges.add(&range);
+                self.inner.info.available_ranges.add(&range);
+                self.inner.pending_ranges.add(&range);
             }
         }
 
@@ -1447,11 +1485,21 @@ impl AsyncWrite for Blob {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.file).poll_flush(cx)
+        Pin::new(&mut self.inner.file).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.file).poll_shutdown(cx)
+        Pin::new(&mut self.inner.file).poll_shutdown(cx)
+    }
+}
+
+impl<'a> AsyncSeek for BlobUpdater<'a> {
+    fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> std::io::Result<()> {
+        Pin::new(&mut self.inner).start_seek(position)
+    }
+
+    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
+        Pin::new(&mut self.inner).poll_complete(cx)
     }
 }
 
@@ -1679,8 +1727,9 @@ mod tests {
         let old_info = blobs.create(&mut tree, &marks, &path, &hash::digest("old"), 3)?;
         {
             let mut blob = Blob::open_with_info(&fixture.db, old_info)?;
-            blob.write_all(b"old").await?;
-            blob.flush().await?;
+            let mut updater = blob.updater();
+            updater.write_all(b"old").await?;
+            updater.flush().await?;
         }
 
         let new_info = blobs.create(&mut tree, &marks, &path, &hash::digest("new!"), 4)?;
@@ -1711,8 +1760,9 @@ mod tests {
 
         {
             let mut blob = Blob::open(&fixture.db, &path)?;
-            blob.write_all(b"old").await?;
-            blob.flush().await?;
+            let mut updater = blob.updater();
+            updater.write_all(b"old").await?;
+            updater.flush().await?;
         }
 
         let txn = fixture.begin_write()?;
@@ -1879,7 +1929,7 @@ mod tests {
 
         let mut blob = Blob::open(&fixture.db, &path)?;
 
-        blob.write(b"Baa, baa").await?;
+        blob.updater().write(b"Baa, baa").await?;
         assert_eq!(ByteRanges::single(0, 8), *blob.available_range());
 
         // At this point, local availability is only in the blob, not
@@ -1889,7 +1939,7 @@ mod tests {
             fixture.blob_info(&path).unwrap().unwrap().available_ranges
         );
 
-        blob.write(b", black sheep").await?;
+        blob.updater().write(b", black sheep").await?;
         assert_eq!(ByteRanges::single(0, 21), *blob.available_range());
 
         let watch = fixture.db.blobs().watch_disk_usage();
@@ -1919,14 +1969,14 @@ mod tests {
         fixture.create_blob_with_partial_data(&path, "Baa, baa, black sheep", 0)?;
 
         let mut blob = Blob::open(&fixture.db, &path)?;
+        let mut updater = blob.updater();
+        updater.seek(SeekFrom::Start(8)).await?;
+        updater.write(b", black sheep").await?;
 
-        blob.seek(SeekFrom::Start(8)).await?;
-        blob.write(b", black sheep").await?;
+        updater.seek(SeekFrom::Start(0)).await?;
+        updater.write(b"Baa, baa").await?;
 
-        blob.seek(SeekFrom::Start(0)).await?;
-        blob.write(b"Baa, baa").await?;
-
-        blob.update_db().await?;
+        updater.update_db().await?;
 
         let mut blob = Blob::open(&fixture.db, &path)?;
         let mut buf = String::new();
@@ -1943,19 +1993,19 @@ mod tests {
         fixture.create_blob_with_partial_data(&path, "Baa, baa, black sheep", 0)?;
 
         let mut blob = Blob::open(&fixture.db, &path)?;
-
-        blob.seek(SeekFrom::Start(8)).await?;
-        blob.write(b", black sheep").await?;
-        blob.update_db().await?;
+        let mut updater = blob.updater();
+        updater.seek(SeekFrom::Start(8)).await?;
+        updater.write(b", black sheep").await?;
+        updater.update_db().await?;
         assert_eq!(
             ByteRanges::single(8, 21),
             fixture.blob_info(&path)?.unwrap().available_ranges
         );
 
-        blob.seek(SeekFrom::Start(0)).await?;
-        blob.write(b"Baa, baa").await?;
+        updater.seek(SeekFrom::Start(0)).await?;
+        updater.write(b"Baa, baa").await?;
 
-        blob.update_db().await?;
+        updater.update_db().await?;
 
         let mut blob = Blob::open(&fixture.db, &path)?;
         let mut buf = String::new();
@@ -1973,7 +2023,7 @@ mod tests {
 
         let mut blob = Blob::open(&fixture.db, &path)?;
 
-        blob.write(b"Baa, baa").await?;
+        blob.updater().write(b"Baa, baa").await?;
         assert_eq!(true, blob.update_db().await?);
         assert_eq!(
             ByteRanges::single(0, 8),
@@ -1990,7 +2040,7 @@ mod tests {
         }
         txn.commit()?;
 
-        blob.write(b", black sheep").await?;
+        blob.updater().write(b", black sheep").await?;
         assert_eq!(false, blob.update_db().await?);
         assert_eq!(ByteRanges::single(0, 21), *blob.available_range());
         assert_eq!(
@@ -2524,19 +2574,27 @@ mod tests {
         txn.commit()?;
 
         let mut blob = Blob::open(&fixture.db, protected1)?;
-        blob.write_all(&vec![1u8; 1 * blksize as usize]).await?;
+        blob.updater()
+            .write_all(&vec![1u8; 1 * blksize as usize])
+            .await?;
         blob.update_db().await?;
 
         let mut blob = Blob::open(&fixture.db, protected2)?;
-        blob.write_all(&vec![1u8; 2 * blksize as usize]).await?;
+        blob.updater()
+            .write_all(&vec![1u8; 2 * blksize as usize])
+            .await?;
         blob.update_db().await?;
 
         let mut blob = Blob::open(&fixture.db, evictable1)?;
-        blob.write_all(&vec![1u8; 3 * blksize as usize]).await?;
+        blob.updater()
+            .write_all(&vec![1u8; 3 * blksize as usize])
+            .await?;
         blob.update_db().await?;
 
         let mut blob = Blob::open(&fixture.db, evictable2)?;
-        blob.write_all(&vec![1u8; 4 * blksize as usize]).await?;
+        blob.updater()
+            .write_all(&vec![1u8; 4 * blksize as usize])
+            .await?;
         blob.update_db().await?;
 
         let txn = fixture.begin_read()?;
@@ -2570,7 +2628,7 @@ mod tests {
         txn.commit()?;
 
         let mut blob = Blob::open(&fixture.db, &path)?;
-        blob.write_all(&vec![1u8; 4096]).await?;
+        blob.updater().write_all(&vec![1u8; 4096]).await?;
         blob.update_db().await?;
 
         let txn = fixture.begin_write()?;
@@ -2622,8 +2680,9 @@ mod tests {
 
         for i in 0..4 {
             let mut blob = Blob::open(&fixture.db, pathids[i])?;
-            blob.write_all(&vec![1u8; 4096]).await?;
-            blob.update_db().await?;
+            let mut updater = blob.updater();
+            updater.write_all(&vec![1u8; 4096]).await?;
+            updater.update_db().await?;
         }
 
         let txn = fixture.begin_write()?;
@@ -2709,8 +2768,9 @@ mod tests {
 
         for i in 0..4 {
             let mut blob = Blob::open(&fixture.db, pathids[i])?;
-            blob.write_all(&vec![1u8; 4096]).await?;
-            blob.update_db().await?;
+            let mut updater = blob.updater();
+            updater.write_all(&vec![1u8; 4096]).await?;
+            updater.update_db().await?;
         }
 
         let open1 = Blob::open(&fixture.db, pathids[1])?;
@@ -2781,8 +2841,9 @@ mod tests {
 
         for path in [&protected1, &protected2, &evictable1, &evictable2] {
             let mut blob = Blob::open(&fixture.db, path)?;
-            blob.write_all(&vec![1u8; 4096]).await?;
-            blob.update_db().await?;
+            let mut updater = blob.updater();
+            updater.write_all(&vec![1u8; 4096]).await?;
+            updater.update_db().await?;
         }
 
         let txn = fixture.begin_write()?;
@@ -3194,7 +3255,7 @@ mod tests {
         );
 
         let mut blob = Blob::open(&fixture.db, &path)?;
-        blob.write_all(b"hello").await?;
+        blob.updater().write_all(b"hello").await?;
         blob.update_db().await?;
 
         let blksize = fixture.blob_dir.metadata()?.blksize();

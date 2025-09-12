@@ -8,7 +8,7 @@ use std::io::{ErrorKind, SeekFrom};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite as _, ReadBuf};
+use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 use tokio_stream::StreamExt;
 
 /// Minimum size of a chunk read from a remote peer.
@@ -337,7 +337,7 @@ impl Download {
 
             // Write data to the blob.
             ReadState::Write(r, data, chunks) => {
-                match Pin::new(&mut self.blob).poll_write(cx, data.as_slice()) {
+                match Pin::new(&mut self.blob.updater()).poll_write(cx, data.as_slice()) {
                     Poll::Pending => (ReadState::Write(r, data, chunks), Some(Poll::Pending)),
                     Poll::Ready(Err(err)) => (ReadState::Default, Some(Poll::Ready(Err(err)))),
                     Poll::Ready(Ok(_)) => {

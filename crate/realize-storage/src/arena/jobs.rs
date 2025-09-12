@@ -594,7 +594,7 @@ mod tests {
         let pathid = fixture.pathid(&path)?;
         {
             let mut blob = fixture.cache.open_file(pathid)?;
-            blob.write_all(b"test").await?;
+            blob.updater().write_all(b"test").await?;
             blob.mark_verified().await?;
         }
 
@@ -637,7 +637,7 @@ mod tests {
         fixture.replace_in_cache("test.txt", &old_hash, &new_hash, 4)?;
         {
             let mut blob = fixture.cache.open_file(pathid)?;
-            blob.write_all(b"new!").await?;
+            blob.updater().write_all(b"new!").await?;
             blob.mark_verified().await?;
         }
 
@@ -679,7 +679,7 @@ mod tests {
         let pathid = fixture.pathid(&path)?;
         {
             let mut blob = fixture.cache.open_file(pathid)?;
-            blob.write_all(b"test").await?;
+            blob.updater().write_all(b"test").await?;
             blob.mark_verified().await?;
         }
 
@@ -704,8 +704,9 @@ mod tests {
         let pathid = fixture.pathid(&path)?;
         {
             let mut blob = fixture.cache.open_file(pathid)?;
-            blob.write_all(b"test").await?;
-            blob.update_db().await?; // complete, but not verified
+            let mut updater = blob.updater();
+            updater.write_all(b"test").await?;
+            updater.update_db().await?; // complete, but not verified
         }
 
         assert!(matches!(
