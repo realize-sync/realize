@@ -8,8 +8,9 @@ use std::io::{ErrorKind, SeekFrom};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, ReadBuf};
 use tokio_stream::StreamExt;
+use tokio_util::bytes::BufMut;
 
 /// Minimum size of a chunk read from a remote peer.
 ///
@@ -74,6 +75,33 @@ pub struct Download {
     avail: VecDeque<(ByteRange, Vec<u8>)>,
     read: ReadState,
     blob: Blob,
+}
+
+impl Download {
+    /// Read remote peer data at the given offset.
+    ///
+    /// Data is downloaded or read from local store.
+    ///
+    /// This function fills `buf` to capacity, even if it means making
+    /// several read operations. It stops only if `buf` is full or
+    /// when reaching EOF.
+    pub async fn read_at<B: BufMut + ?Sized>(
+        &mut self,
+        offset: u64,
+        buf: &mut B,
+    ) -> Result<usize, std::io::Error> {
+        self.seek(tokio::io::SeekFrom::Start(offset as u64)).await?;
+        let mut bytes_read = 0;
+        while buf.remaining_mut() > 0 {
+            let n = self.read_buf(buf).await?;
+            if n == 0 {
+                // EOF
+                break;
+            }
+            bytes_read += n;
+        }
+        Ok(bytes_read)
+    }
 }
 
 /// States for AsyncRead::poll_read.
@@ -459,7 +487,6 @@ mod tests {
     use realize_types::Path;
     use std::io::Write as _;
     use tokio::fs;
-    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
     struct Fixture {
         inner: HouseholdFixture,
@@ -525,7 +552,7 @@ mod tests {
                 let mut reader = fixture
                     .download_file_from_b(&downloader, "test.txt", "File content")
                     .await?;
-                assert_eq!("File content", read_string(&mut reader).await?);
+                assert_eq!("File content", read_string(0, &mut reader).await?);
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -552,7 +579,7 @@ mod tests {
                 let mut reader = fixture
                     .download_file_from_b(&downloader, "test.txt", "File content")
                     .await?;
-                assert_eq!("File content", read_string(&mut reader).await?);
+                assert_eq!("File content", read_string(0, &mut reader).await?);
 
                 // The entire content of test.txt is available
                 // locally. We don't need a connection anymore.
@@ -560,7 +587,7 @@ mod tests {
 
                 // Reading back from the reader works.
                 reader.seek(SeekFrom::Start(0)).await?;
-                assert_eq!("File content", read_string(&mut reader).await?);
+                assert_eq!("File content", read_string(0, &mut reader).await?);
 
                 // Reading back from another reader works, once the
                 // database has been updated..
@@ -568,7 +595,7 @@ mod tests {
                 drop(reader);
 
                 let mut reader = fixture.reader(&downloader, "test.txt").await?;
-                assert_eq!("File content", read_string(&mut reader).await?);
+                assert_eq!("File content", read_string(0, &mut reader).await?);
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -578,7 +605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seek() -> anyhow::Result<()> {
+    async fn read_at_offset() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
         fixture
             .inner
@@ -594,21 +621,9 @@ mod tests {
                     .download_file_from_b(&downloader, "test.txt", "baa, baa, black sheep")
                     .await?;
 
-                reader.seek(SeekFrom::Start(10)).await?;
-                assert_eq!("black sheep", read_string(&mut reader).await?);
-
-                reader.seek(SeekFrom::Start(5)).await?;
-                assert_eq!("baa, black sheep", read_string(&mut reader).await?);
-
-                reader.seek(SeekFrom::Start(5)).await?;
-                reader.seek(SeekFrom::Current(5)).await?;
-                assert_eq!("black sheep", read_string(&mut reader).await?);
-
-                reader.seek(SeekFrom::Current(-5)).await?;
-                assert_eq!("sheep", read_string(&mut reader).await?);
-
-                reader.seek(SeekFrom::End(-11)).await?;
-                assert_eq!("black sheep", read_string(&mut reader).await?);
+                assert_eq!("black sheep", read_string(10, &mut reader).await?);
+                assert_eq!("baa, black sheep", read_string(5, &mut reader).await?);
+                assert_eq!("", read_string(25, &mut reader).await?);
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -634,42 +649,7 @@ mod tests {
                     .download_file_from_b(&downloader, "test.txt", "baa, baa, black sheep")
                     .await?;
 
-                reader.seek(SeekFrom::Start(100)).await?;
-                assert_eq!("", read_string(&mut reader).await?);
-
-                reader.seek(SeekFrom::End(5)).await?;
-                assert_eq!("", read_string(&mut reader).await?);
-
-                reader.seek(SeekFrom::Start(5)).await?;
-                reader.seek(SeekFrom::Current(100)).await?;
-                assert_eq!("", read_string(&mut reader).await?);
-
-                Ok::<(), anyhow::Error>(())
-            })
-            .await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn seek_before_start() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup().await?;
-        fixture
-            .inner
-            .with_two_peers()
-            .await?
-            .interconnected()
-            .run(async |household_a, _household_b| {
-                let downloader = Downloader::new(
-                    household_a,
-                    fixture.inner.cache(HouseholdFixture::a())?.clone(),
-                );
-                let mut reader = fixture
-                    .download_file_from_b(&downloader, "test.txt", "baa, baa, black sheep")
-                    .await?;
-
-                assert!(reader.seek(SeekFrom::End(-100)).await.is_err());
-                assert!(reader.seek(SeekFrom::Current(-100)).await.is_err());
+                assert_eq!("", read_string(100, &mut reader).await?);
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -714,21 +694,21 @@ mod tests {
 
                 let mut reader = fixture.reader(&downloader, "large_file").await?;
 
-                let mut buf = [0u8; 16];
-                reader.read_exact(&mut buf).await?;
-                assert_eq!([1u8; 16], buf);
+                let mut buf = vec![].limit(16);
+                reader.read_at(0, &mut buf).await?;
+                assert_eq!(vec![1u8; 16], buf.into_inner());
 
-                reader.seek(SeekFrom::End(-100)).await?;
-                reader.read_exact(&mut buf).await?;
-                assert_eq!([2u8; 16], buf);
+                let mut buf = vec![].limit(16);
+                reader.read_at(3 * 8 * 1024 - 100, &mut buf).await?;
+                assert_eq!(vec![2u8; 16], buf.into_inner());
 
-                reader.seek(SeekFrom::Start(100)).await?;
-                reader.read_exact(&mut buf).await?;
-                assert_eq!([1u8; 16], buf);
+                let mut buf = vec![].limit(16);
+                reader.read_at(100, &mut buf).await?;
+                assert_eq!(vec![1u8; 16], buf.into_inner());
 
-                reader.seek(SeekFrom::Start(8 * 1024)).await?;
-                reader.read_exact(&mut buf).await?;
-                assert_eq!([0u8; 16], buf);
+                let mut buf = vec![].limit(16);
+                reader.read_at(8 * 1024, &mut buf).await?;
+                assert_eq!(vec![0u8; 16], buf.into_inner());
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -775,13 +755,12 @@ mod tests {
                 let mut reader = fixture.reader(&downloader, "large_file").await?;
 
                 // Read near start; stores the 1st block
-                reader.seek(SeekFrom::Start(100)).await?;
-                let mut buf = [0u8; 16];
-                reader.read_exact(&mut buf).await?;
+                reader.read_at(100, &mut vec![].limit(16)).await?;
 
                 // Read near end; stores the last block
-                reader.seek(SeekFrom::End(-100)).await?;
-                reader.read_exact(&mut buf).await?;
+                reader
+                    .read_at(3 * MIN_CHUNK_SIZE - 100, &mut vec![].limit(16))
+                    .await?;
 
                 testing::disconnect(&household_a, b).await?;
 
@@ -795,19 +774,17 @@ mod tests {
                 );
 
                 // Read from first block succeeds.
-                reader.seek(SeekFrom::Start(16)).await?;
-                let mut buf = [0u8; 16];
-                reader.read_exact(&mut buf).await?;
-                assert_eq!([1u8; 16], buf);
+                let mut buf = vec![].limit(16);
+                reader.read_at(16, &mut buf).await?;
+                assert_eq!(vec![1u8; 16], buf.into_inner());
 
                 // Read from last block succeeds.
-                reader.seek(SeekFrom::End(-32)).await?;
-                reader.read_exact(&mut buf).await?;
-                assert_eq!([2u8; 16], buf);
+                let mut buf = vec![].limit(16);
+                reader.read_at(3 * block - 100, &mut buf).await?;
+                assert_eq!(vec![2u8; 16], buf.into_inner());
 
                 // Read from middle block fails.
-                reader.seek(SeekFrom::Start(block)).await?;
-                assert!(reader.read_exact(&mut buf).await.is_err());
+                assert!(reader.read_at(block, &mut vec![].limit(16)).await.is_err());
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -824,7 +801,7 @@ mod tests {
             .await?
             .interconnected()
             .run(async |household_a, _household_b| {
-                test_read_file(&fixture, household_a, 12 * 1024, 1024, false).await?;
+                test_read_file(&fixture, household_a, 12 * 1024, 1024).await?;
                 Ok::<(), anyhow::Error>(())
             })
             .await?;
@@ -840,7 +817,7 @@ mod tests {
             .await?
             .interconnected()
             .run(async |household_a, _household_b| {
-                test_read_file(&fixture, household_a, 12 * 1024, 2000, true).await?;
+                test_read_file(&fixture, household_a, 12 * 1024, 2000).await?;
                 Ok::<(), anyhow::Error>(())
             })
             .await?;
@@ -856,7 +833,7 @@ mod tests {
             .await?
             .interconnected()
             .run(async |household_a, _household_b| {
-                test_read_file(&fixture, household_a, 48 * 1024, 32 * 1024, false).await?;
+                test_read_file(&fixture, household_a, 48 * 1024, 32 * 1024).await?;
                 Ok::<(), anyhow::Error>(())
             })
             .await?;
@@ -872,7 +849,7 @@ mod tests {
             .await?
             .interconnected()
             .run(async |household_a, _household_b| {
-                test_read_file(&fixture, household_a, 64 * 1024, 48 * 1024, true).await?;
+                test_read_file(&fixture, household_a, 64 * 1024, 48 * 1024).await?;
                 Ok::<(), anyhow::Error>(())
             })
             .await?;
@@ -885,7 +862,6 @@ mod tests {
         household: Arc<Household>,
         file_size: usize,
         buf_size: usize,
-        allow_short_reads: bool,
     ) -> anyhow::Result<()> {
         let a = HouseholdFixture::a();
         let b = HouseholdFixture::b();
@@ -909,57 +885,36 @@ mod tests {
             .reader((arena, &Path::parse("large_file")?))
             .await?;
 
-        if allow_short_reads {
-            let mut bytes_read = 0;
-            let mut offset = 0;
-            while bytes_read < file_size {
-                let mut buf = vec![0u8; buf_size];
-                let n = reader.read(&mut buf).await?;
-                assert!(n > 0);
-                for i in 0..n {
-                    assert_eq!(file_content[offset + i], buf[i], "at offset {}", offset + i);
-                }
-                for i in n..buf_size {
-                    assert_eq!(0, buf[i], "at offset {}", offset + i);
-                }
-                bytes_read += n;
-                offset += n;
-            }
-        } else {
-            for i in 0..(file_size / buf_size) {
-                let offset = i * buf_size;
-                let mut buf = vec![0u8; buf_size];
-                assert_eq!(buf_size, reader.read(&mut buf).await?);
-                assert_eq!(
-                    file_content[offset..(offset + buf_size)],
-                    buf,
-                    "chunk {i}, offset {offset}"
-                );
-            }
-            let rest = file_size % buf_size;
-            if rest > 0 {
-                let offset = file_size - rest;
-                let mut buf = vec![0u8; buf_size];
-                assert_eq!(rest, reader.read(&mut buf).await?);
-                assert_eq!(
-                    file_content[offset..],
-                    buf[0..rest],
-                    "last chunk, offset {offset}"
-                );
-                for i in rest..buf_size {
-                    assert_eq!(0, buf[i]);
-                }
-            }
+        for i in 0..(file_size / buf_size) {
+            let offset = i * buf_size;
+            let mut buf = vec![].limit(buf_size);
+            assert_eq!(buf_size, reader.read_at(offset as u64, &mut buf).await?);
+            assert_eq!(
+                file_content[offset..(offset + buf_size)],
+                buf.into_inner(),
+                "chunk {i}, offset {offset}"
+            );
+        }
+        let rest = file_size % buf_size;
+        if rest > 0 {
+            let offset = file_size - rest;
+            let mut buf = vec![].limit(buf_size);
+            assert_eq!(rest, reader.read_at(offset as u64, &mut buf).await?);
+            assert_eq!(
+                file_content[offset..],
+                buf.into_inner(),
+                "last chunk, offset {offset}"
+            );
         }
 
-        assert_eq!(0, reader.read(&mut vec![0u8; buf_size]).await?);
+        assert_eq!(0, reader.read_at(file_size as u64, &mut vec![]).await?);
 
         Ok(())
     }
 
-    async fn read_string(reader: &mut Download) -> anyhow::Result<String> {
-        let mut buffer = String::new();
-        reader.read_to_string(&mut buffer).await?;
-        Ok(buffer)
+    async fn read_string(offset: u64, reader: &mut Download) -> anyhow::Result<String> {
+        let mut buffer = vec![];
+        reader.read_at(offset, &mut buffer).await?;
+        Ok(String::from_utf8(buffer)?)
     }
 }

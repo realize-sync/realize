@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::time::SystemTime;
 use std::{sync::Arc, time::Duration};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tokio_util::bytes::BufMut;
@@ -442,7 +441,7 @@ struct InnerRealizeFs {
     cache: Arc<GlobalCache>,
     downloader: Downloader,
     umask: u16,
-    handles: Arc<Mutex<BTreeMap<u64, Arc<Mutex<tokio::io::BufReader<Download>>>>>>,
+    handles: Arc<Mutex<BTreeMap<u64, Arc<Mutex<Download>>>>>,
 }
 
 impl InnerRealizeFs {
@@ -471,21 +470,15 @@ impl InnerRealizeFs {
                 Some(h) => Arc::clone(h),
             }
         };
-        let mut reader = reader.lock().await;
-        reader
-            .seek(tokio::io::SeekFrom::Start(offset as u64))
-            .await?;
-
         // As requested by FUSE: Read as much as possible up to size
         // (no short reads). Only stop if EOF is reached.
         let size = size as usize;
         let mut buffer = Vec::with_capacity(size).limit(size);
-        while buffer.remaining_mut() > 0 {
-            if reader.read_buf(&mut buffer).await? == 0 {
-                // EOF
-                break;
-            }
-        }
+        let mut reader = reader.lock().await;
+
+        // TODO: clarify type situation for offset. offset is i64 in
+        // fuser, but u64 in libfuse and Linux. What's happening?
+        reader.read_at(offset as u64, &mut buffer).await?;
 
         Ok(buffer.into_inner())
     }
@@ -654,7 +647,7 @@ impl InnerRealizeFs {
         let reader = self.downloader.reader(Inode(ino)).await?;
         let mut handles = self.handles.lock().await;
         let fh = handles.last_key_value().map(|(k, _)| *k + 1).unwrap_or(1);
-        handles.insert(fh, Arc::new(Mutex::new(BufReader::new(reader))));
+        handles.insert(fh, Arc::new(Mutex::new(reader)));
 
         Ok((fh, 0))
     }
