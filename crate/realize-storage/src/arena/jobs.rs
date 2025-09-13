@@ -286,7 +286,7 @@ mod tests {
     use assert_fs::prelude::*;
     use realize_types::{Arena, Path, Peer, UnixTime};
     use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
 
     fn test_time() -> UnixTime {
         UnixTime::from_secs(1234567890)
@@ -594,7 +594,7 @@ mod tests {
         let pathid = fixture.pathid(&path)?;
         {
             let mut blob = fixture.cache.open_file(pathid)?;
-            blob.updater().write_all(b"test").await?;
+            blob.update(0, b"test").await?;
             blob.mark_verified().await?;
         }
 
@@ -637,7 +637,7 @@ mod tests {
         fixture.replace_in_cache("test.txt", &old_hash, &new_hash, 4)?;
         {
             let mut blob = fixture.cache.open_file(pathid)?;
-            blob.updater().write_all(b"new!").await?;
+            blob.update(0, b"new!").await?;
             blob.mark_verified().await?;
         }
 
@@ -679,7 +679,7 @@ mod tests {
         let pathid = fixture.pathid(&path)?;
         {
             let mut blob = fixture.cache.open_file(pathid)?;
-            blob.updater().write_all(b"test").await?;
+            blob.update(0, b"test").await?;
             blob.mark_verified().await?;
         }
 
@@ -704,9 +704,8 @@ mod tests {
         let pathid = fixture.pathid(&path)?;
         {
             let mut blob = fixture.cache.open_file(pathid)?;
-            let mut updater = blob.updater();
-            updater.write_all(b"test").await?;
-            updater.update_db().await?; // complete, but not verified
+            blob.update(0, b"test").await?;
+            blob.update_db().await?; // complete, but not verified
         }
 
         assert!(matches!(

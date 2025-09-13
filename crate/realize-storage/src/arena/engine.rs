@@ -620,7 +620,6 @@ mod tests {
     use realize_types::{Arena, Peer, UnixTime};
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::io::AsyncWriteExt as _;
     use tokio::time;
 
     fn test_hash() -> Hash {
@@ -854,9 +853,8 @@ mod tests {
         fixture.add_file_to_cache(&barfile)?;
         {
             let mut blob = fixture.acache.open_file(&barfile)?;
-            let mut updater = blob.updater();
-            updater.write_all(b"te").await?;
-            updater.update_db().await?;
+            blob.update(0, b"te").await?;
+            blob.update_db().await?;
         }
 
         // The stream is created after downloading to be sure it sees
@@ -884,9 +882,8 @@ mod tests {
         fixture.add_file_to_cache(&barfile)?;
         {
             let mut blob = fixture.acache.open_file(&barfile)?;
-            let mut updater = blob.updater();
-            updater.write_all(b"test").await?;
-            updater.update_db().await?;
+            blob.update(0, b"test").await?;
+            blob.update_db().await?;
         }
 
         // The stream is created after downloading to be sure it sees
@@ -915,7 +912,7 @@ mod tests {
         fixture.add_file_to_cache(&barfile)?;
         {
             let mut blob = fixture.acache.open_file(&barfile)?;
-            blob.updater().write_all(b"test").await?;
+            blob.update(0, b"test").await?;
             blob.mark_verified().await?;
         }
 
@@ -991,7 +988,7 @@ mod tests {
         );
         {
             let mut blob = fixture.acache.open_file(&foobar)?;
-            blob.updater().write_all(b"test").await?;
+            blob.update(0, b"test").await?;
             blob.mark_verified().await?;
         }
         fixture.engine.job_finished(job_id, Ok(JobStatus::Done))?;
@@ -1014,7 +1011,7 @@ mod tests {
         fixture.add_file_to_cache(&foobar)?;
         {
             let mut blob = fixture.acache.open_file(&foobar)?;
-            blob.updater().write_all(b"te").await?;
+            blob.update(0, b"te").await?;
         }
         // blob is partially available, but unprotected, going from
         // Mark::Watch to Mark::Keep triggers the need to:
@@ -1048,7 +1045,7 @@ mod tests {
         );
         {
             let mut blob = Blob::open(&fixture.db, pathid)?;
-            blob.updater().write_all(b"test").await?;
+            blob.update(0, b"test").await?;
             blob.mark_verified().await?;
         }
         fixture.engine.job_finished(job_id, Ok(JobStatus::Done))?;
@@ -1070,7 +1067,7 @@ mod tests {
         fixture.add_file_to_cache_with_version(&foobar, test_hash())?;
         {
             let mut blob = fixture.acache.open_file(&foobar)?;
-            blob.updater().write_all(b"te").await?;
+            blob.update(0, b"te").await?;
         }
 
         // File is in the index and cache and has been partially
@@ -1112,7 +1109,7 @@ mod tests {
         fixture.add_file_to_cache(&foobar)?;
         {
             let mut blob = fixture.acache.open_file(&foobar)?;
-            blob.updater().write_all(b"test").await?;
+            blob.update(0, b"test").await?;
             blob.mark_verified().await?;
         }
 
@@ -1166,7 +1163,7 @@ mod tests {
         fixture.replace(&foobar, Hash([2; 32]), Hash([1; 32]))?;
         {
             let mut blob = fixture.acache.open_file(&foobar)?;
-            blob.updater().write_all(b"test").await?;
+            blob.update(0, b"test").await?;
             blob.mark_verified().await?;
         }
 

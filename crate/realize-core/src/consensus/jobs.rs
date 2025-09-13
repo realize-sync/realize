@@ -10,7 +10,7 @@ use realize_storage::{
 use realize_types::{Arena, ByteRanges, Hash, Path, Signature};
 use std::io::SeekFrom;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::sync::CancellationToken;
 
 /// Maximum byterange to sync with rsync. This is also the worst-case
@@ -141,7 +141,6 @@ async fn write_to_blob(
             Some(range.bytecount()),
         )?;
 
-        let mut updater = blob.updater();
         while let Some(chunk) = tokio::select!(
             res = stream.next() => {res}
             _ = shutdown.cancelled() => {
@@ -149,16 +148,13 @@ async fn write_to_blob(
             }
         ) {
             let (chunk_offset, chunk) = chunk?;
-            if chunk_offset != updater.offset() {
-                updater.seek(SeekFrom::Start(chunk_offset)).await?;
-            }
-            updater.write_all(&chunk).await?;
+            blob.update(chunk_offset, &chunk).await?;
 
             current_bytes += chunk.len() as u64;
             progress.update(current_bytes, total_bytes);
 
             if current_bytes - last_update_bytes >= UPDATE_DB_INTERVAL_BYTES {
-                let _ = updater.update_db().await;
+                let _ = blob.update_db().await;
                 last_update_bytes = current_bytes;
             }
         }
@@ -225,8 +221,7 @@ pub(crate) async fn verify(
         fixed_buf.clear();
         fast_rsync::apply_limited(limited_buf, delta.0.as_slice(), &mut fixed_buf, range_len)?;
         assert_eq!(range_len, fixed_buf.len());
-        blob.seek(SeekFrom::Start(range.start)).await?;
-        blob.updater().write_all(fixed_buf.as_slice()).await?;
+        blob.update(range.start, fixed_buf.as_slice()).await?;
 
         progress.update(range.end, size);
     }
@@ -263,7 +258,7 @@ mod tests {
     use realize_storage::utils::hash;
     use realize_types::Peer;
     use tokio::fs::File;
-    use tokio::io::{AsyncWrite, BufReader, BufWriter};
+    use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
     use tokio::{fs, io::AsyncReadExt};
 
     struct Fixture {
@@ -306,7 +301,7 @@ mod tests {
             let realpath = path.within(&root);
 
             let mut file = File::create(realpath).await?;
-            let hash = write_random_data(&mut file, seed, size_kb).await?;
+            let hash = write_rnd_to_file(&mut file, seed, size_kb).await?;
 
             Ok((path, hash))
         }
@@ -340,9 +335,8 @@ mod tests {
             content: &str,
         ) -> anyhow::Result<()> {
             let mut blob = self.inner.open_file(peer, path_str).await?;
-            let mut updater = blob.updater();
-            updater.write_all(content.as_bytes()).await?;
-            updater.update_db().await?;
+            blob.update(0, content.as_bytes()).await?;
+            blob.update_db().await?;
 
             Ok(())
         }
@@ -372,7 +366,7 @@ mod tests {
         }
     }
 
-    async fn write_random_data(
+    async fn write_rnd_to_file(
         out: impl AsyncWrite,
         seed: u64,
         size_kb: u64,
@@ -387,6 +381,25 @@ mod tests {
             hasher.update(&bytes);
         }
         out.flush().await?;
+        let hash = hasher.finalize();
+        Ok(hash)
+    }
+
+    async fn write_rnd_to_blob(
+        blob: &mut Blob,
+        seed: u64,
+        size_kb: u64,
+    ) -> Result<Hash, anyhow::Error> {
+        let mut rng = SmallRng::seed_from_u64(seed);
+        let mut hasher = hash::running();
+        let mut bytes = [0; 1024];
+        let mut offset = 0;
+        for _ in 0..size_kb {
+            rng.fill_bytes(&mut bytes);
+            blob.update(offset, &bytes).await?;
+            offset += size_kb;
+            hasher.update(&bytes);
+        }
         let hash = hasher.finalize();
         Ok(hash)
     }
@@ -513,11 +526,9 @@ mod tests {
 
                 {
                     let mut blob = fixture.open_file(a, "foobar").await?;
-                    let mut updater = blob.updater();
-                    updater.write(b"baa, baa").await?;
-                    updater.seek(SeekFrom::End(-5)).await?;
-                    updater.write(b"sheep").await?;
-                    updater.update_db().await?;
+                    blob.update(0, b"baa, baa").await?;
+                    blob.update(16, b"sheep").await?;
+                    blob.update_db().await?;
                 }
                 assert_eq!(
                     JobStatus::Done,
@@ -571,10 +582,8 @@ mod tests {
 
                 {
                     let mut blob = fixture.open_file(a, "foobar").await?;
-                    let mut updater = blob.updater();
-                    updater.seek(SeekFrom::Start(10)).await?;
-                    updater.write(b"black").await?;
-                    updater.update_db().await?;
+                    blob.update(10, b"black").await?;
+                    blob.update_db().await?;
 
                     // There are two holes to fill, one at the
                     // beginning and one at the end.
@@ -752,9 +761,8 @@ mod tests {
                 // Write the complete file content
                 {
                     let mut blob = fixture.open_file(a, "foobar").await?;
-                    let mut updater = blob.updater();
-                    updater.write(b"baa, baa, black sheep").await?;
-                    updater.update_db().await?;
+                    blob.update(0, b"baa, baa, black sheep").await?;
+                    blob.update_db().await?;
                 }
 
                 let mut progress = SimpleByteCountProgress::new();
@@ -806,9 +814,8 @@ mod tests {
 
                 {
                     let mut blob = fixture.open_file(a, "foobar").await?;
-                    let mut updater = blob.updater();
-                    updater.write(b"baa").await?;
-                    updater.update_db().await?;
+                    blob.update(0, b"baa").await?;
+                    blob.update_db().await?;
                 }
                 let mut progress = SimpleByteCountProgress::new();
                 assert_eq!(
@@ -1034,11 +1041,11 @@ mod tests {
                 // have to repair it to get to the correct hash.
                 let mut blob = fixture.open_file(a, "large").await?;
                 // Same data as in the file (generated from the same seed)
-                let hash2 = write_random_data(&mut blob.updater(), 415, 1024).await?;
+                let hash2 = write_rnd_to_blob(&mut blob, 415, 1024).await?;
                 assert_eq!(hash, hash2); // same seed,same data
                 blob.seek(SeekFrom::Start(3 * 1024)).await?;
                 // 16k of bad data.
-                write_random_data(&mut blob.updater(), 512, 16).await?;
+                write_rnd_to_blob(&mut blob, 512, 16).await?;
                 blob.update_db().await?;
 
                 let mut progress = SimpleByteCountProgress::new();

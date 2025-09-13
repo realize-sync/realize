@@ -5,7 +5,7 @@ use std::cmp::min;
 use std::collections::VecDeque;
 use std::io::SeekFrom;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_stream::StreamExt;
 use tokio_util::bytes::BufMut;
 
@@ -162,27 +162,12 @@ impl Download {
         // download into buffer, optionally store into the blob
         let ranges = self.download_range(offset, capacity).await?;
         for (range, data) in ranges {
-            let _ = self.store_range(&range, &data).await; // best effort
-            log::debug!("=== got {range}");
+            let _ = self.blob.update(range.start, &data).await; // best effort
             self.buffer.push_back((range, data));
         }
         self.buffer.make_contiguous().sort_by_key(|elt| elt.0.start);
 
         Ok(self.fill_from_buffer(offset, buf))
-    }
-
-    /// Store remote peer data into the blob for next time.
-    async fn store_range(
-        &mut self,
-        range: &ByteRange,
-        data: &Vec<u8>,
-    ) -> Result<(), std::io::Error> {
-        let mut updater = self.blob.updater();
-        if updater.offset() != range.start {
-            updater.seek(SeekFrom::Start(range.start)).await?;
-        }
-
-        updater.write_all(&data.as_slice()).await
     }
 
     /// Fill `buf` with previously downloaded data, kept in memory.
