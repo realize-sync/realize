@@ -34,7 +34,7 @@ jobs:
     - name: Build
       run: "cargo build"
     - name: Run tests
-      run: "RUST_LOG=realize_=debug cargo nextest run --retries 1 --no-fail-fast"
+      run: "RUST_LOG=realize_=debug cargo nextest run --profile ci"
     - name: Run doctests
       run: "cargo test --doc"
 
@@ -50,6 +50,6 @@ jobs:
     - name: Build
       run: "cargo build"
     - name: Run tests
-      run: "RUST_LOG=realize_=debug cargo nextest run --retries 1 --no-fail-fast"
+      run: "RUST_LOG=realize_=debug cargo nextest run --profile ci"
     - name: Run doctests
       run: "cargo test --doc"
