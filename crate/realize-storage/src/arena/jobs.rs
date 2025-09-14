@@ -277,7 +277,6 @@ impl StorageJobProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arena::cache::CacheExt;
     use crate::arena::index::IndexedFile;
     use crate::utils::hash;
     use crate::{ArenaFilesystem, Blob, LocalAvailability, Mark, Notification, PathId};
@@ -436,21 +435,8 @@ mod tests {
             index::get_file(&self.db, &Path::parse(path_str)?)
         }
 
-        fn find_in_cache(&self, path_str: &str) -> Result<Option<PathId>, StorageError> {
-            let txn = self.db.begin_read()?;
-            let tree = txn.read_tree()?;
-            let cache = txn.read_cache()?;
-            match cache.lookup(&tree, &Path::parse(path_str)?) {
-                Ok((pathid, _)) => Ok(Some(pathid)),
-                Err(StorageError::NotFound) => Ok(None),
-                Err(err) => Err(err),
-            }
-        }
-
         fn open_blob(&self, path_str: &str) -> anyhow::Result<Blob> {
-            let pathid = self.find_in_cache(path_str)?.expect("{path_str} in cache");
-
-            Ok(self.cache.open_file(pathid)?)
+            Ok(self.cache.open_file(Path::parse(path_str)?)?)
         }
 
         async fn read_blob_content(&self, path_str: &str) -> anyhow::Result<String> {

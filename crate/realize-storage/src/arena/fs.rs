@@ -74,9 +74,12 @@ impl ArenaFilesystem {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
-        let (pathid, metadata) = cache.lookup(&tree, loc.into().into_tree_loc(&cache)?)?;
-
-        Ok((cache.map_to_inode(pathid)?, metadata))
+        let pathid = tree.expect(loc.into().into_tree_loc(&cache)?)?;
+        let metadata = cache
+            .metadata(&tree, pathid)?
+            .ok_or(StorageError::NotFound)?;
+        let inode = cache.map_to_inode(pathid)?;
+        Ok((inode, metadata))
     }
 
     pub(crate) fn file_metadata(
@@ -109,7 +112,9 @@ impl ArenaFilesystem {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
-        cache.metadata(&tree, loc.into().into_tree_loc(&cache)?)
+        cache
+            .metadata(&tree, loc.into().into_tree_loc(&cache)?)?
+            .ok_or(StorageError::NotFound)
     }
 
     pub(crate) fn readdir(
@@ -382,6 +387,7 @@ mod tests {
     use super::*;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
+    use realize_types::{Hash, Path, Peer, UnixTime};
 
     struct Fixture {
         acache: Arc<ArenaFilesystem>,
@@ -417,7 +423,38 @@ mod tests {
         Ok(())
     }
 
-    // TODO: add tests for this layer. This used to be covered by the tests in
-    // cache.rs, but these were converted to use transactions
-    // directly.
+    #[test]
+    fn lookup_in_cache() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let test_path = Path::parse("dir/test_file.txt")?;
+        update::apply(
+            &fixture.db,
+            None,
+            Peer::from("test_peer"),
+            Notification::Add {
+                arena: fixture.acache.arena(),
+                index: 1,
+                path: test_path.clone(),
+                mtime: UnixTime::from_secs(1234567890),
+                size: 1024,
+                hash: Hash([1u8; 32]),
+            },
+        )?;
+
+        // lookup should find the file and dir metadata in cache
+        fixture.acache.lookup(&test_path).unwrap();
+        fixture.acache.lookup(Path::parse("dir")?).unwrap();
+
+        Ok(())
+    }
+
+    #[test]
+    fn lookup_not_found() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let nonexistent_path = Path::parse("nonexistent.txt")?;
+        let result = fixture.acache.lookup(&nonexistent_path);
+        assert!(matches!(result, Err(StorageError::NotFound)));
+
+        Ok(())
+    }
 }

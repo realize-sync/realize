@@ -23,7 +23,7 @@ pub(crate) trait CacheReadOperations {
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> Result<crate::arena::types::Metadata, StorageError>;
+    ) -> Result<Option<crate::arena::types::Metadata>, StorageError>;
 
     /// Get remote file availability information for the given pathid and version.
     fn file_availability<'b, L: Into<TreeLoc<'b>>>(
@@ -97,8 +97,12 @@ where
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> Result<crate::arena::types::Metadata, StorageError> {
-        metadata(&self.table, tree.expect(loc)?)?.ok_or(StorageError::NotFound)
+    ) -> Result<Option<crate::arena::types::Metadata>, StorageError> {
+        if let Some(pathid) = tree.resolve(loc)? {
+            return metadata(&self.table, pathid);
+        }
+
+        Ok(None)
     }
 
     fn file_availability<'b, L: Into<TreeLoc<'b>>>(
@@ -141,8 +145,12 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> Result<crate::arena::types::Metadata, StorageError> {
-        metadata(&self.table, tree.expect(loc)?)?.ok_or(StorageError::NotFound)
+    ) -> Result<Option<crate::arena::types::Metadata>, StorageError> {
+        if let Some(pathid) = tree.resolve(loc)? {
+            return metadata(&self.table, pathid);
+        }
+
+        Ok(None)
     }
 
     fn file_availability<'b, L: Into<TreeLoc<'b>>>(
@@ -207,12 +215,6 @@ pub(crate) trait CacheExt {
         loc: L,
     ) -> Result<FileMetadata, StorageError>;
 
-    fn lookup<'b, L: Into<TreeLoc<'b>>>(
-        &self,
-        tree: &impl TreeReadOperations,
-        loc: L,
-    ) -> Result<(PathId, crate::arena::types::Metadata), StorageError>;
-
     fn dir_mtime<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
@@ -226,17 +228,9 @@ impl<T: CacheReadOperations> CacheExt for T {
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<FileMetadata, StorageError> {
-        self.metadata(tree, loc)?.expect_file()
-    }
-
-    fn lookup<'b, L: Into<TreeLoc<'b>>>(
-        &self,
-        tree: &impl TreeReadOperations,
-        loc: L,
-    ) -> Result<(PathId, crate::arena::types::Metadata), StorageError> {
-        let pathid = tree.expect(loc)?;
-
-        Ok((pathid, self.metadata(tree, pathid)?))
+        self.metadata(tree, loc)?
+            .ok_or(StorageError::NotFound)?
+            .expect_file()
     }
 
     fn dir_mtime<'b, L: Into<TreeLoc<'b>>>(
@@ -244,7 +238,11 @@ impl<T: CacheReadOperations> CacheExt for T {
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<UnixTime, StorageError> {
-        Ok(self.metadata(tree, loc)?.expect_dir()?.mtime)
+        Ok(self
+            .metadata(tree, loc)?
+            .ok_or(StorageError::NotFound)?
+            .expect_dir()?
+            .mtime)
     }
 
     fn file_entry<'b, L: Into<TreeLoc<'b>>>(
@@ -1221,7 +1219,10 @@ mod tests {
             let tree = txn.read_tree()?;
             let cache = txn.read_cache()?;
 
-            cache.metadata(&tree, loc)?.expect_dir()
+            cache
+                .metadata(&tree, loc)?
+                .ok_or(StorageError::NotFound)?
+                .expect_dir()
         }
 
         fn metadata<'b, L: Into<TreeLoc<'b>>>(
@@ -1232,7 +1233,7 @@ mod tests {
             let tree = txn.read_tree()?;
             let cache = txn.read_cache()?;
 
-            cache.metadata(&tree, loc)
+            cache.metadata(&tree, loc)?.ok_or(StorageError::NotFound)
         }
 
         fn file_metadata<'b, L: Into<TreeLoc<'b>>>(
@@ -1253,8 +1254,14 @@ mod tests {
             let txn = self.db.begin_read()?;
             let tree = txn.read_tree()?;
             let cache = txn.read_cache()?;
+            let pathid = tree.expect(loc)?;
 
-            cache.lookup(&tree, loc)
+            Ok((
+                pathid,
+                cache
+                    .metadata(&tree, pathid)?
+                    .ok_or(StorageError::NotFound)?,
+            ))
         }
 
         fn readdir<'b, L: Into<TreeLoc<'b>>>(
@@ -1423,12 +1430,18 @@ mod tests {
             let cache = txn.read_cache()?;
             assert_eq!(fixture.db.tree().root(), tree.root());
 
-            a = cache.lookup(&tree, (fixture.db.tree().root(), "a"))?.0;
-            b = cache.lookup(&tree, (a, "b"))?.0;
-            c = cache.lookup(&tree, (b, "c.txt"))?.0;
+            a = tree.resolve(Path::parse("a")?)?.unwrap();
+            b = tree.resolve(Path::parse("a/b")?)?.unwrap();
+            c = tree.resolve(Path::parse("a/b/c.txt")?)?.unwrap();
+
+            assert!(cache.metadata(&tree, b)?.is_some());
+            assert!(cache.metadata(&tree, a)?.is_some());
+            assert!(cache.metadata(&tree, c)?.is_some());
+
             assert!(tree.pathid_exists(a)?);
             assert!(tree.pathid_exists(b)?);
             assert!(tree.pathid_exists(c)?);
+
             assert_eq!(Some(a), tree.lookup_pathid(tree.root(), "a")?);
             assert_eq!(Some(b), tree.lookup_pathid(a, "b")?);
             assert_eq!(Some(c), tree.lookup_pathid(b, "c.txt")?);
@@ -1441,7 +1454,7 @@ mod tests {
             let tree = txn.read_tree()?;
             let cache = txn.read_cache()?;
 
-            assert!(cache.lookup(&tree, (b, "c.txt")).is_err());
+            assert!(cache.metadata(&tree, &file_path)?.is_none());
 
             // The file is gone from tree, since this was the only
             // reference to it.
@@ -1690,11 +1703,9 @@ mod tests {
         let mtime = test_time();
 
         fixture.add_to_cache(&file_path, 100, mtime)?;
-        let arena_root = fixture.db.tree().root();
         let txn = fixture.db.begin_read()?;
-        let cache = txn.read_cache()?;
         let tree = txn.read_tree()?;
-        let (pathid, _) = cache.lookup(&tree, (arena_root, "file.txt"))?;
+        let pathid = tree.resolve(&file_path)?.unwrap();
 
         fixture.clear_dirty()?;
         fixture.remove_from_cache(&file_path)?;
@@ -2351,9 +2362,9 @@ mod tests {
             let txn = fixture.db.begin_read()?;
             let cache = txn.read_cache()?;
             let tree = txn.read_tree()?;
-            pathid = cache
-                .lookup(&tree, (fixture.db.tree().root(), "file.txt"))?
-                .0;
+            pathid = tree
+                .resolve((fixture.db.tree().root(), "file.txt"))?
+                .unwrap();
             let entry = cache.file_at_pathid(pathid)?.unwrap();
 
             assert_eq!(Hash([3u8; 32]), entry.hash);
@@ -2687,7 +2698,7 @@ mod tests {
         let mut history = txn.write_history()?;
         let mut blobs = txn.write_blobs()?;
 
-        let (pathid, _) = cache.lookup(&tree, (arena_root, "file.txt"))?;
+        let pathid = tree.resolve((arena_root, "file.txt"))?.unwrap();
         assert!(cache.file_metadata(&tree, pathid).is_ok());
 
         let dir_mtime_before = cache.dir_mtime(&tree, arena_root)?;
@@ -2700,14 +2711,8 @@ mod tests {
             (arena_root, "file.txt"),
         )?;
 
-        assert!(matches!(
-            cache.lookup(&tree, (arena_root, "file.txt")),
-            Err(StorageError::NotFound)
-        ));
-        assert!(matches!(
-            cache.file_metadata(&tree, pathid),
-            Err(StorageError::NotFound)
-        ));
+        assert!(cache.metadata(&tree, (arena_root, "file.txt"))?.is_none(),);
+        assert!(cache.metadata(&tree, pathid)?.is_none(),);
 
         assert_eq!(HashSet::from([pathid]), dirty_pathids_in_txn(&dirty)?);
 
@@ -3095,32 +3100,38 @@ mod tests {
         // Test file metadata
         let file_metadata = cache.metadata(&tree, file_pathid)?;
         match file_metadata {
-            crate::arena::types::Metadata::File(meta) => {
+            Some(crate::arena::types::Metadata::File(meta)) => {
                 assert_eq!(meta.size, 1024);
                 assert_eq!(meta.mtime, test_time());
                 assert_eq!(meta.hash, test_hash());
             }
-            crate::arena::types::Metadata::Dir(_) => {
+            Some(crate::arena::types::Metadata::Dir(_)) => {
                 panic!("Expected file metadata, got directory metadata");
+            }
+            None => {
+                panic!("Expected file metadata, got None");
             }
         }
 
         // Test directory metadata
         let dir_metadata = cache.metadata(&tree, dir_pathid)?;
         match dir_metadata {
-            crate::arena::types::Metadata::Dir(meta) => {
+            Some(crate::arena::types::Metadata::Dir(meta)) => {
                 assert!(!meta.read_only); // Arena directories are writable
                 assert!(meta.mtime >= test_time());
             }
-            crate::arena::types::Metadata::File(_) => {
+            Some(crate::arena::types::Metadata::File(_)) => {
                 panic!("Expected directory metadata, got file metadata");
+            }
+            None => {
+                panic!("Expected directory metadata, got None");
             }
         }
 
         // Test error cases
         let nonexistent_pathid = PathId(99999);
         let result = cache.metadata(&tree, nonexistent_pathid);
-        assert!(matches!(result, Err(StorageError::NotFound)));
+        assert!(matches!(result, Ok(None)));
 
         Ok(())
     }
@@ -3398,12 +3409,12 @@ mod tests {
         // and all of its subdirectories once their contents are moved to the destination
         log::debug!("check dir {source_dir:?} {:?}", tree.resolve(&source_dir));
         assert!(
-            cache.metadata(&tree, &source_dir).is_err(),
+            cache.metadata(&tree, &source_dir)?.is_none(),
             "Source directory should be removed after rename"
         );
         let dest_metadata = cache.metadata(&tree, &dest_dir)?;
         assert!(
-            matches!(dest_metadata, crate::arena::types::Metadata::Dir(_)),
+            matches!(dest_metadata, Some(crate::arena::types::Metadata::Dir(_))),
             "Destination directory should exist after rename"
         );
 
@@ -3434,7 +3445,7 @@ mod tests {
         // Source subdirectory should also be removed
         let source_subdir = Path::parse("source_dir/subdir")?;
         assert!(
-            cache.metadata(&tree, &source_subdir).is_err(),
+            cache.metadata(&tree, &source_subdir)?.is_none(),
             "Source subdirectory should be removed after rename"
         );
 
@@ -3536,12 +3547,12 @@ mod tests {
         )?;
 
         assert!(
-            cache.metadata(&tree, &source_dir).is_err(),
+            cache.metadata(&tree, &source_dir)?.is_none(),
             "Source directory should be removed after rename"
         );
         let dest_metadata = cache.metadata(&tree, &dest_dir)?;
         assert!(
-            matches!(dest_metadata, crate::arena::types::Metadata::Dir(_)),
+            matches!(dest_metadata, Some(crate::arena::types::Metadata::Dir(_))),
             "Destination directory should exist after rename"
         );
 
