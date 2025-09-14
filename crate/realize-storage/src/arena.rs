@@ -2,9 +2,9 @@ use crate::PathIdAllocator;
 use crate::config::{self, HumanDuration};
 use crate::utils::redb_utils;
 use anyhow::Context;
-use arena_cache::ArenaCache;
 use db::ArenaDatabase;
 use engine::Engine;
+use fs::ArenaFilesystem;
 use realize_types::Arena;
 use std::time::Duration;
 use std::{path::PathBuf, sync::Arc};
@@ -12,12 +12,13 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::sync::DropGuard;
 use watcher::RealWatcher;
 
-pub mod arena_cache;
 pub mod blob;
+pub mod cache;
 mod cleaner;
 pub mod db;
 mod dirty;
 pub mod engine;
+pub mod fs;
 mod history;
 pub mod index;
 pub mod indexed_store;
@@ -33,7 +34,7 @@ pub mod watcher;
 /// Gives access to arena-specific stores and functions.
 pub(crate) struct ArenaStorage {
     pub(crate) db: Arc<ArenaDatabase>,
-    pub(crate) cache: Arc<ArenaCache>,
+    pub(crate) cache: Arc<ArenaFilesystem>,
     pub(crate) engine: Arc<Engine>,
     pub(crate) indexed: Option<IndexedArenaStorage>,
     _drop_guard: DropGuard,
@@ -63,7 +64,7 @@ impl ArenaStorage {
             &arena_config.workdir.join("blobs"),
         )
         .with_context(|| format!("[{arena}] Arena database in {dbpath:?}",))?;
-        let arena_cache = ArenaCache::new(arena, Arc::clone(&db))?;
+        let arena_cache = ArenaFilesystem::new(arena, Arc::clone(&db))?;
         let indexed = match arena_config.datadir.as_ref() {
             None => {
                 log::info!("[{arena}] Arena setup for caching");

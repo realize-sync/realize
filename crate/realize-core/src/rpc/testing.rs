@@ -10,7 +10,7 @@ use realize_storage::Blob;
 use realize_storage::Storage;
 use realize_storage::config::StorageConfig;
 use realize_storage::utils::hash;
-use realize_storage::{self, GlobalCache};
+use realize_storage::{self, Filesystem};
 use realize_types::Path;
 use realize_types::{Arena, Hash, Peer};
 use std::collections::HashMap;
@@ -164,7 +164,7 @@ impl HouseholdFixture {
     }
 
     /// Get a peer cache.
-    pub fn cache(&self, peer: Peer) -> anyhow::Result<&Arc<GlobalCache>> {
+    pub fn cache(&self, peer: Peer) -> anyhow::Result<&Arc<Filesystem>> {
         Ok(self.storage(peer)?.cache())
     }
 

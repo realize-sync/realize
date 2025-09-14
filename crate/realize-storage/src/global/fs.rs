@@ -1,10 +1,6 @@
-//! The Unreal cache - a partial local cache of remote files.
-//!
-//! See `spec/unreal.md` for details.
-
 use super::db::{GlobalDatabase, GlobalReadTransaction};
 use super::pathid_allocator::PathIdAllocator;
-use crate::arena::arena_cache::{ArenaCache, CacheLoc};
+use crate::arena::fs::{ArenaFilesystem, ArenaFsLoc};
 use crate::arena::notifier::{Notification, Progress};
 use crate::arena::types::{DirMetadata, LocalAvailability};
 use crate::global::db::GlobalWriteTransaction;
@@ -17,33 +13,33 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task;
 
-/// A cache of remote files.
-pub struct GlobalCache {
+/// A view on remote and local files.
+pub struct Filesystem {
     db: Arc<GlobalDatabase>,
     allocator: Arc<PathIdAllocator>,
 
-    arena_caches: HashMap<Arena, Arc<ArenaCache>>,
+    by_arena: HashMap<Arena, Arc<ArenaFilesystem>>,
 
     /// PathIds to intermediate paths, before arenas, includes root.
-    paths: HashMap<PathId, IntermediatePath>,
+    globals: HashMap<PathId, IntermediatePath>,
 }
 
-impl GlobalCache {
+impl Filesystem {
     /// PathId of the root dir.
     pub const ROOT_DIR: PathId = PathIdAllocator::ROOT_INODE;
 
-    /// Create a new cache with the database at the given path.
+    /// Create a new Filesystems with the database at the given path.
     pub(crate) async fn with_db<T>(
         db: Arc<GlobalDatabase>,
         allocator: Arc<PathIdAllocator>,
-        caches: T,
+        by_arena: T,
     ) -> Result<Arc<Self>, anyhow::Error>
     where
-        T: IntoIterator<Item = Arc<ArenaCache>> + Send + 'static,
+        T: IntoIterator<Item = Arc<ArenaFilesystem>> + Send + 'static,
     {
         task::spawn_blocking(move || {
-            let mut arena_caches = HashMap::new();
-            let mut paths = HashMap::new();
+            let mut map = HashMap::new();
+            let mut globals = HashMap::new();
             let txn = db.begin_write()?;
             {
                 let mut path_table = txn.path_table()?;
@@ -51,7 +47,7 @@ impl GlobalCache {
                 // Make sure root is setup, even if there are no arenas.
                 let root_mtime =
                     get_or_add_path_entry(&txn, &mut path_table, &allocator, "")?.mtime;
-                paths.insert(
+                globals.insert(
                     PathIdAllocator::ROOT_INODE,
                     IntermediatePath {
                         entries: HashMap::new(),
@@ -59,14 +55,14 @@ impl GlobalCache {
                     },
                 );
 
-                for arena_cache in caches.into_iter() {
+                for fs in by_arena.into_iter() {
                     register(
-                        arena_cache,
+                        fs,
                         &txn,
                         &mut path_table,
                         &allocator,
-                        &mut arena_caches,
-                        &mut paths,
+                        &mut map,
+                        &mut globals,
                     )?;
                 }
             }
@@ -75,8 +71,8 @@ impl GlobalCache {
             Ok::<_, anyhow::Error>(Arc::new(Self {
                 db,
                 allocator,
-                arena_caches,
-                paths,
+                by_arena: map,
+                globals,
             }))
         })
         .await?
@@ -84,40 +80,37 @@ impl GlobalCache {
 
     /// Lists arenas available in this database
     pub fn arenas(&self) -> impl Iterator<Item = Arena> {
-        self.arena_caches.keys().map(|a| *a)
+        self.by_arena.keys().map(|a| *a)
     }
 
     /// Returns the pathid of an arena.
     ///
     /// Will return [StorageError::UnknownArena] unless the arena
-    /// is available in the cache.
+    /// is available.
     pub fn arena_root(&self, arena: Arena) -> Result<PathId, StorageError> {
         self.allocator
             .arena_root(arena)
             .ok_or_else(|| StorageError::UnknownArena(arena))
     }
 
-    /// Returns the cache for the given arena or fail.
-    fn arena_cache(&self, arena: Arena) -> Result<&ArenaCache, StorageError> {
-        Ok(self
-            .arena_caches
-            .get(&arena)
-            .ok_or(StorageError::NotFound)?)
+    /// Returns the FS for the given arena or fail.
+    fn arena_fs(&self, arena: Arena) -> Result<&ArenaFilesystem, StorageError> {
+        Ok(self.by_arena.get(&arena).ok_or(StorageError::NotFound)?)
     }
 
-    /// Returns the cache for the given pathid or fail.
-    fn arena_cache_for_pathid(&self, pathid: PathId) -> Result<&ArenaCache, StorageError> {
+    /// Returns the FS for the given pathid or fail.
+    fn arena_fs_for_pathid(&self, pathid: PathId) -> Result<&ArenaFilesystem, StorageError> {
         let arena = self
             .allocator
             .arena_for_pathid(&self.db.begin_read()?, pathid)?
             .ok_or(StorageError::NotFound)?;
-        self.arena_cache(arena)
+        self.arena_fs(arena)
     }
 
-    fn arena_cache_for_inode(&self, inode: Inode) -> Result<&ArenaCache, StorageError> {
+    fn arena_fs_for_inode(&self, inode: Inode) -> Result<&ArenaFilesystem, StorageError> {
         // We ignore the difference between PathId and Inodes for this
         // lookup, as they come from the same ranges.
-        self.arena_cache_for_pathid(PathId(inode.as_u64()))
+        self.arena_fs_for_pathid(PathId(inode.as_u64()))
     }
 
     fn arena_for_inode(
@@ -131,28 +124,28 @@ impl GlobalCache {
     }
 
     /// Convert a [GlobalTreeLoc] into an arena or global location.
-    fn resolve_loc<L: Into<GlobalLoc>>(
+    fn resolve_loc<L: Into<FsLoc>>(
         &self,
         txn: &GlobalReadTransaction,
         loc: L,
     ) -> Result<ResolvedLoc, StorageError> {
         Ok(match self.resolve_arena_root(loc.into()) {
-            GlobalLoc::PathId(pathid) => match self.allocator.arena_for_pathid(txn, pathid)? {
-                Some(arena) => ResolvedLoc::InArena(arena, CacheLoc::PathId(pathid)),
-                None => ResolvedLoc::Global(if self.paths.contains_key(&pathid) {
+            FsLoc::PathId(pathid) => match self.allocator.arena_for_pathid(txn, pathid)? {
+                Some(arena) => ResolvedLoc::InArena(arena, ArenaFsLoc::PathId(pathid)),
+                None => ResolvedLoc::Global(if self.globals.contains_key(&pathid) {
                     Some(pathid)
                 } else {
                     None
                 }),
             },
-            GlobalLoc::Inode(inode) => {
+            FsLoc::Inode(inode) => {
                 match self.arena_for_inode(txn, inode)? {
-                    Some(arena) => ResolvedLoc::InArena(arena, CacheLoc::Inode(inode)),
+                    Some(arena) => ResolvedLoc::InArena(arena, ArenaFsLoc::Inode(inode)),
                     None => {
                         // global inodes and pathids are identical
                         let pathid = PathId(inode.as_u64());
 
-                        ResolvedLoc::Global(if self.paths.contains_key(&pathid) {
+                        ResolvedLoc::Global(if self.globals.contains_key(&pathid) {
                             Some(pathid)
                         } else {
                             None
@@ -160,12 +153,12 @@ impl GlobalCache {
                     }
                 }
             }
-            GlobalLoc::PathIdAndName(pathid, name) => {
+            FsLoc::PathIdAndName(pathid, name) => {
                 match self.allocator.arena_for_pathid(txn, pathid)? {
                     Some(arena) => {
-                        ResolvedLoc::InArena(arena, CacheLoc::PathIdAndName(pathid, name))
+                        ResolvedLoc::InArena(arena, ArenaFsLoc::PathIdAndName(pathid, name))
                     }
-                    None => ResolvedLoc::Global(match self.paths.get(&pathid) {
+                    None => ResolvedLoc::Global(match self.globals.get(&pathid) {
                         None => return Err(StorageError::NotFound),
                         Some(IntermediatePath { entries, .. }) => {
                             entries.get(&name).map(|pathid| *pathid)
@@ -173,14 +166,16 @@ impl GlobalCache {
                     }),
                 }
             }
-            GlobalLoc::InodeAndName(inode, name) => {
+            FsLoc::InodeAndName(inode, name) => {
                 match self.arena_for_inode(txn, inode)? {
-                    Some(arena) => ResolvedLoc::InArena(arena, CacheLoc::InodeAndName(inode, name)),
+                    Some(arena) => {
+                        ResolvedLoc::InArena(arena, ArenaFsLoc::InodeAndName(inode, name))
+                    }
                     None => {
                         // global inodes and pathids are identical
                         let pathid = PathId(inode.as_u64());
 
-                        ResolvedLoc::Global(match self.paths.get(&pathid) {
+                        ResolvedLoc::Global(match self.globals.get(&pathid) {
                             None => return Err(StorageError::NotFound),
                             Some(IntermediatePath { entries, .. }) => {
                                 entries.get(&name).map(|pathid| *pathid)
@@ -189,44 +184,44 @@ impl GlobalCache {
                     }
                 }
             }
-            GlobalLoc::Path(arena, path) => ResolvedLoc::InArena(arena, CacheLoc::Path(path)),
+            FsLoc::Path(arena, path) => ResolvedLoc::InArena(arena, ArenaFsLoc::Path(path)),
         })
     }
 
     /// Convert a [GlobalTreeLoc] into an arena and arena [TreeLoc] or fail.
-    fn resolve_arena_loc<L: Into<GlobalLoc>>(
+    fn resolve_arena_loc<L: Into<FsLoc>>(
         &self,
         loc: L,
-    ) -> Result<(&ArenaCache, CacheLoc), StorageError> {
+    ) -> Result<(&ArenaFilesystem, ArenaFsLoc), StorageError> {
         Ok(match self.resolve_arena_root(loc.into()) {
-            GlobalLoc::PathId(pathid) => (
-                self.arena_cache_for_pathid(pathid)?,
-                CacheLoc::PathId(pathid),
+            FsLoc::PathId(pathid) => (
+                self.arena_fs_for_pathid(pathid)?,
+                ArenaFsLoc::PathId(pathid),
             ),
-            GlobalLoc::Inode(inode) => (self.arena_cache_for_inode(inode)?, CacheLoc::Inode(inode)),
-            GlobalLoc::PathIdAndName(pathid, name) => (
-                self.arena_cache_for_pathid(pathid)?,
-                CacheLoc::PathIdAndName(pathid, name.into()),
+            FsLoc::Inode(inode) => (self.arena_fs_for_inode(inode)?, ArenaFsLoc::Inode(inode)),
+            FsLoc::PathIdAndName(pathid, name) => (
+                self.arena_fs_for_pathid(pathid)?,
+                ArenaFsLoc::PathIdAndName(pathid, name.into()),
             ),
-            GlobalLoc::InodeAndName(inode, name) => (
-                self.arena_cache_for_inode(inode)?,
-                CacheLoc::InodeAndName(inode, name.into()),
+            FsLoc::InodeAndName(inode, name) => (
+                self.arena_fs_for_inode(inode)?,
+                ArenaFsLoc::InodeAndName(inode, name.into()),
             ),
-            GlobalLoc::Path(arena, path) => (self.arena_cache(arena)?, CacheLoc::Path(path)),
+            FsLoc::Path(arena, path) => (self.arena_fs(arena)?, ArenaFsLoc::Path(path)),
         })
     }
 
     /// Cover the special case of a PathIdAndName where name points to an arena root.
-    fn resolve_arena_root(&self, loc: GlobalLoc) -> GlobalLoc {
+    fn resolve_arena_root(&self, loc: FsLoc) -> FsLoc {
         if let Some((pathid, name)) = match &loc {
-            GlobalLoc::PathIdAndName(pathid, name) => Some((*pathid, name)),
-            GlobalLoc::InodeAndName(inode, name) => Some((PathId(inode.as_u64()), name)),
+            FsLoc::PathIdAndName(pathid, name) => Some((*pathid, name)),
+            FsLoc::InodeAndName(inode, name) => Some((PathId(inode.as_u64()), name)),
             _ => None,
         } {
-            if let Some(IntermediatePath { entries, .. }) = self.paths.get(&pathid) {
+            if let Some(IntermediatePath { entries, .. }) = self.globals.get(&pathid) {
                 if let Some(pathid) = entries.get(name) {
                     if self.allocator.is_arena_root(*pathid) {
-                        return GlobalLoc::PathId(*pathid);
+                        return FsLoc::PathId(*pathid);
                     }
                 }
             }
@@ -236,7 +231,7 @@ impl GlobalCache {
     }
 
     /// Lookup a directory entry.
-    pub async fn lookup<L: Into<GlobalLoc>>(
+    pub async fn lookup<L: Into<FsLoc>>(
         self: &Arc<Self>,
         loc: L,
     ) -> Result<(Inode, crate::arena::types::Metadata), StorageError> {
@@ -247,15 +242,15 @@ impl GlobalCache {
             let txn = this.db.begin_read()?;
             match this.resolve_loc(&txn, loc)? {
                 ResolvedLoc::InArena(arena, loc) => {
-                    let cache = this.arena_cache(arena)?;
-                    cache.lookup(loc)
+                    let fs = this.arena_fs(arena)?;
+                    fs.lookup(loc)
                 }
                 ResolvedLoc::Global(pathid) => {
                     if let Some(pathid) = pathid
-                        && this.paths.contains_key(&pathid)
+                        && this.globals.contains_key(&pathid)
                     {
                         // For global directories, construct DirMetadata
-                        if let Some(IntermediatePath { mtime, .. }) = this.paths.get(&pathid) {
+                        if let Some(IntermediatePath { mtime, .. }) = this.globals.get(&pathid) {
                             Ok((
                                 Inode(pathid.as_u64()),
                                 crate::arena::types::Metadata::Dir(
@@ -278,7 +273,7 @@ impl GlobalCache {
     }
 
     /// Return the mtime of the directory.
-    pub async fn dir_metadata<L: Into<GlobalLoc>>(
+    pub async fn dir_metadata<L: Into<FsLoc>>(
         self: &Arc<Self>,
         loc: L,
     ) -> Result<DirMetadata, StorageError> {
@@ -289,11 +284,11 @@ impl GlobalCache {
             let txn = this.db.begin_read()?;
             match this.resolve_loc(&txn, loc)? {
                 ResolvedLoc::InArena(arena, loc) => {
-                    let cache = this.arena_cache(arena)?;
-                    cache.dir_metadata(loc)
+                    let fs = this.arena_fs(arena)?;
+                    fs.dir_metadata(loc)
                 }
                 ResolvedLoc::Global(None) => Err(StorageError::NotFound),
-                ResolvedLoc::Global(Some(pathid)) => match this.paths.get(&pathid) {
+                ResolvedLoc::Global(Some(pathid)) => match this.globals.get(&pathid) {
                     None => Err(StorageError::NotFound),
                     Some(IntermediatePath { mtime, .. }) => Ok(DirMetadata {
                         read_only: true,
@@ -305,7 +300,7 @@ impl GlobalCache {
         .await?
     }
 
-    pub async fn readdir<L: Into<GlobalLoc>>(
+    pub async fn readdir<L: Into<FsLoc>>(
         self: &Arc<Self>,
         loc: L,
     ) -> Result<Vec<(String, Inode, crate::arena::types::Metadata)>, StorageError> {
@@ -316,11 +311,11 @@ impl GlobalCache {
             let txn = this.db.begin_read()?;
             match this.resolve_loc(&txn, loc)? {
                 ResolvedLoc::InArena(arena, loc) => {
-                    let cache = this.arena_cache(arena)?;
-                    cache.readdir(loc)
+                    let fs = this.arena_fs(arena)?;
+                    fs.readdir(loc)
                 }
                 ResolvedLoc::Global(None) => Err(StorageError::NotFound),
-                ResolvedLoc::Global(Some(pathid)) => match this.paths.get(&pathid) {
+                ResolvedLoc::Global(Some(pathid)) => match this.globals.get(&pathid) {
                     None => Err(StorageError::NotFound),
                     Some(IntermediatePath { entries, mtime, .. }) => Ok(entries
                         .iter()
@@ -351,13 +346,13 @@ impl GlobalCache {
     ) -> Result<(), StorageError> {
         let this = Arc::clone(self);
         task::spawn_blocking(move || {
-            let cache = this.arena_cache(notification.arena())?;
-            cache.update(peer, notification, None)
+            let fs = this.arena_fs(notification.arena())?;
+            fs.update(peer, notification, None)
         })
         .await?
     }
     /// Return a [Progress] instance that represents how up-to-date
-    /// the information in the cache is for that peer and arena.
+    /// the information in the database is for that peer and arena.
     ///
     /// This should be passed to the peer when subscribing.
     pub async fn peer_progress(
@@ -367,14 +362,14 @@ impl GlobalCache {
     ) -> Result<Option<Progress>, StorageError> {
         let this = Arc::clone(self);
         task::spawn_blocking(move || {
-            let cache = this.arena_cache(arena)?;
-            cache.peer_progress(peer)
+            let fs = this.arena_fs(arena)?;
+            fs.peer_progress(peer)
         })
         .await?
     }
 
     /// Check local file content availability.
-    pub async fn local_availability<L: Into<GlobalLoc>>(
+    pub async fn local_availability<L: Into<FsLoc>>(
         self: &Arc<Self>,
         loc: L,
     ) -> Result<LocalAvailability, StorageError> {
@@ -382,8 +377,8 @@ impl GlobalCache {
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let (cache, loc) = this.resolve_arena_loc(loc)?;
-            cache.local_availability(loc)
+            let (fs, loc) = this.resolve_arena_loc(loc)?;
+            fs.local_availability(loc)
         })
         .await?
     }
@@ -395,21 +390,18 @@ impl GlobalCache {
     ///
     /// This is usually used through the `Downloader`, which can
     /// download incomplete portions of the file.
-    pub async fn open_file<L: Into<GlobalLoc>>(
-        self: &Arc<Self>,
-        loc: L,
-    ) -> Result<Blob, StorageError> {
+    pub async fn open_file<L: Into<FsLoc>>(self: &Arc<Self>, loc: L) -> Result<Blob, StorageError> {
         let loc = loc.into();
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let (cache, loc) = this.resolve_arena_loc(loc)?;
-            cache.open_file(loc)
+            let (fs, loc) = this.resolve_arena_loc(loc)?;
+            fs.open_file(loc)
         })
         .await?
     }
 
-    pub async fn file_metadata<L: Into<GlobalLoc>>(
+    pub async fn file_metadata<L: Into<FsLoc>>(
         self: &Arc<Self>,
         loc: L,
     ) -> Result<FileMetadata, StorageError> {
@@ -417,13 +409,13 @@ impl GlobalCache {
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let (cache, loc) = this.resolve_arena_loc(loc)?;
-            cache.file_metadata(loc)
+            let (fs, loc) = this.resolve_arena_loc(loc)?;
+            fs.file_metadata(loc)
         })
         .await?
     }
 
-    pub async fn metadata<L: Into<GlobalLoc>>(
+    pub async fn metadata<L: Into<FsLoc>>(
         self: &Arc<Self>,
         loc: L,
     ) -> Result<crate::arena::types::Metadata, StorageError> {
@@ -434,12 +426,12 @@ impl GlobalCache {
             let txn = this.db.begin_read()?;
             match this.resolve_loc(&txn, loc)? {
                 ResolvedLoc::InArena(arena, loc) => {
-                    let cache = this.arena_cache(arena)?;
-                    cache.metadata(loc)
+                    let fs = this.arena_fs(arena)?;
+                    fs.metadata(loc)
                 }
                 ResolvedLoc::Global(Some(pathid)) => {
                     // For global directories, we need to construct DirMetadata
-                    if let Some(IntermediatePath { mtime, .. }) = this.paths.get(&pathid) {
+                    if let Some(IntermediatePath { mtime, .. }) = this.globals.get(&pathid) {
                         Ok(crate::arena::types::Metadata::Dir(
                             crate::arena::types::DirMetadata {
                                 read_only: true, // Global directories are read-only
@@ -456,7 +448,7 @@ impl GlobalCache {
         .await?
     }
 
-    pub async fn unlink<L: Into<GlobalLoc>>(self: &Arc<Self>, loc: L) -> Result<(), StorageError> {
+    pub async fn unlink<L: Into<FsLoc>>(self: &Arc<Self>, loc: L) -> Result<(), StorageError> {
         let loc = loc.into();
         let this = Arc::clone(self);
 
@@ -464,8 +456,8 @@ impl GlobalCache {
             let txn = this.db.begin_read()?;
             match this.resolve_loc(&txn, loc)? {
                 ResolvedLoc::InArena(arena, loc) => {
-                    let cache = this.arena_cache(arena)?;
-                    cache.unlink(loc)
+                    let fs = this.arena_fs(arena)?;
+                    fs.unlink(loc)
                 }
                 ResolvedLoc::Global(Some(_)) => Err(StorageError::IsADirectory),
                 ResolvedLoc::Global(None) => Err(StorageError::NotFound),
@@ -474,7 +466,7 @@ impl GlobalCache {
         .await?
     }
 
-    pub async fn branch<L1: Into<GlobalLoc>, L2: Into<GlobalLoc>>(
+    pub async fn branch<L1: Into<FsLoc>, L2: Into<FsLoc>>(
         self: &Arc<Self>,
         source: L1,
         dest: L2,
@@ -496,8 +488,8 @@ impl GlobalCache {
                     if source_arena != dest_arena {
                         return Err(StorageError::CrossesDevices);
                     }
-                    let cache = this.arena_cache(source_arena)?;
-                    cache.branch(source, dest)
+                    let fs = this.arena_fs(source_arena)?;
+                    fs.branch(source, dest)
                 }
                 (ResolvedLoc::Global(_), ResolvedLoc::Global(_)) => Err(StorageError::IsADirectory),
                 (_, _) => Err(StorageError::CrossesDevices),
@@ -506,7 +498,7 @@ impl GlobalCache {
         .await?
     }
 
-    pub async fn rename<L1: Into<GlobalLoc>, L2: Into<GlobalLoc>>(
+    pub async fn rename<L1: Into<FsLoc>, L2: Into<FsLoc>>(
         self: &Arc<Self>,
         source: L1,
         dest: L2,
@@ -529,8 +521,8 @@ impl GlobalCache {
                     if source_arena != dest_arena {
                         return Err(StorageError::CrossesDevices);
                     }
-                    let cache = this.arena_cache(source_arena)?;
-                    cache.rename(source, dest, noreplace)
+                    let fs = this.arena_fs(source_arena)?;
+                    fs.rename(source, dest, noreplace)
                 }
                 (ResolvedLoc::Global(_), ResolvedLoc::Global(_)) => Err(StorageError::IsADirectory),
                 (_, _) => Err(StorageError::CrossesDevices),
@@ -540,7 +532,7 @@ impl GlobalCache {
     }
 
     /// Create a directory at the given path in the specified arena.
-    pub async fn mkdir<L: Into<GlobalLoc>>(
+    pub async fn mkdir<L: Into<FsLoc>>(
         self: &Arc<Self>,
         loc: L,
     ) -> Result<(Inode, DirMetadata), StorageError> {
@@ -548,33 +540,33 @@ impl GlobalCache {
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let (cache, loc) = this.resolve_arena_loc(loc)?;
+            let (fs, loc) = this.resolve_arena_loc(loc)?;
 
-            cache.mkdir(loc)
+            fs.mkdir(loc)
         })
         .await?
     }
 
     /// Remove an empty directory at the given path in the specified arena.
-    pub async fn rmdir<L: Into<GlobalLoc>>(self: &Arc<Self>, loc: L) -> Result<(), StorageError> {
+    pub async fn rmdir<L: Into<FsLoc>>(self: &Arc<Self>, loc: L) -> Result<(), StorageError> {
         let loc = loc.into();
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let (cache, loc) = this.resolve_arena_loc(loc)?;
+            let (fs, loc) = this.resolve_arena_loc(loc)?;
 
-            cache.rmdir(loc)
+            fs.rmdir(loc)
         })
         .await?
     }
 }
 
-/// A location within the cache.
+/// A location within the Filesystem.
 ///
 /// This is usually a [Path] within an [Arena] or a [PathId], but can
 /// also be a [PathId] and a name to specify a child of a known
 /// directory.
-pub enum GlobalLoc {
+pub enum FsLoc {
     PathId(PathId),
     Inode(Inode),
     Path(Arena, Path),
@@ -582,67 +574,67 @@ pub enum GlobalLoc {
     InodeAndName(Inode, String),
 }
 
-impl From<PathId> for GlobalLoc {
+impl From<PathId> for FsLoc {
     fn from(value: PathId) -> Self {
-        GlobalLoc::PathId(value)
+        FsLoc::PathId(value)
     }
 }
 
-impl From<Inode> for GlobalLoc {
+impl From<Inode> for FsLoc {
     fn from(value: Inode) -> Self {
-        GlobalLoc::Inode(value)
+        FsLoc::Inode(value)
     }
 }
 
-impl From<(Arena, Path)> for GlobalLoc {
+impl From<(Arena, Path)> for FsLoc {
     fn from(value: (Arena, Path)) -> Self {
-        GlobalLoc::Path(value.0, value.1)
+        FsLoc::Path(value.0, value.1)
     }
 }
 
-impl From<(Arena, &Path)> for GlobalLoc {
+impl From<(Arena, &Path)> for FsLoc {
     fn from(value: (Arena, &Path)) -> Self {
-        GlobalLoc::Path(value.0, value.1.clone())
+        FsLoc::Path(value.0, value.1.clone())
     }
 }
 
-impl From<(PathId, &str)> for GlobalLoc {
+impl From<(PathId, &str)> for FsLoc {
     fn from(value: (PathId, &str)) -> Self {
-        GlobalLoc::PathIdAndName(value.0, value.1.to_string())
+        FsLoc::PathIdAndName(value.0, value.1.to_string())
     }
 }
 
-impl From<(PathId, &String)> for GlobalLoc {
+impl From<(PathId, &String)> for FsLoc {
     fn from(value: (PathId, &String)) -> Self {
-        GlobalLoc::PathIdAndName(value.0, value.1.clone())
+        FsLoc::PathIdAndName(value.0, value.1.clone())
     }
 }
-impl From<(PathId, String)> for GlobalLoc {
+impl From<(PathId, String)> for FsLoc {
     fn from(value: (PathId, String)) -> Self {
-        GlobalLoc::PathIdAndName(value.0, value.1)
+        FsLoc::PathIdAndName(value.0, value.1)
     }
 }
 
-impl From<(Inode, &str)> for GlobalLoc {
+impl From<(Inode, &str)> for FsLoc {
     fn from(value: (Inode, &str)) -> Self {
-        GlobalLoc::InodeAndName(value.0, value.1.to_string())
+        FsLoc::InodeAndName(value.0, value.1.to_string())
     }
 }
 
-impl From<(Inode, &String)> for GlobalLoc {
+impl From<(Inode, &String)> for FsLoc {
     fn from(value: (Inode, &String)) -> Self {
-        GlobalLoc::InodeAndName(value.0, value.1.clone())
+        FsLoc::InodeAndName(value.0, value.1.clone())
     }
 }
-impl From<(Inode, String)> for GlobalLoc {
+impl From<(Inode, String)> for FsLoc {
     fn from(value: (Inode, String)) -> Self {
-        GlobalLoc::InodeAndName(value.0, value.1)
+        FsLoc::InodeAndName(value.0, value.1)
     }
 }
 
 enum ResolvedLoc {
     Global(Option<PathId>),
-    InArena(Arena, CacheLoc),
+    InArena(Arena, ArenaFsLoc),
 }
 
 #[derive(Debug, Clone)]
@@ -670,27 +662,27 @@ fn check_arena_compatibility(arena: Arena, existing: Arena) -> anyhow::Result<()
     Ok(())
 }
 
-/// Register an [ArenaCache] that handles calls for a specific arena.
+/// Register an [ArenaFilesystem] that handles calls for a specific arena.
 ///
-/// Calls for pathid assigned to the cache arena will be directed there.
+/// Calls for pathid assigned to the arena will be directed there.
 fn register(
-    cache: Arc<ArenaCache>,
+    fs: Arc<ArenaFilesystem>,
     txn: &GlobalWriteTransaction,
     path_table: &mut redb::Table<&'static str, Holder<'static, PathTableEntry>>,
     allocator: &Arc<PathIdAllocator>,
-    arena_caches: &mut HashMap<Arena, Arc<ArenaCache>>,
+    map: &mut HashMap<Arena, Arc<ArenaFilesystem>>,
     paths: &mut HashMap<PathId, IntermediatePath>,
 ) -> anyhow::Result<()> {
-    let arena = cache.arena();
+    let arena = fs.arena();
     let arena_root = allocator
         .arena_root(arena)
         .ok_or_else(|| StorageError::UnknownArena(arena))?;
 
-    for existing in arena_caches.keys().map(|a| *a) {
+    for existing in map.keys().map(|a| *a) {
         check_arena_compatibility(arena, existing)?;
     }
     add_arena_root(arena, arena_root, txn, path_table, allocator, paths)?;
-    arena_caches.insert(cache.arena(), cache);
+    map.insert(fs.arena(), fs);
 
     Ok(())
 }
@@ -782,7 +774,7 @@ mod tests {
     }
 
     struct Fixture {
-        cache: Arc<GlobalCache>,
+        fs: Arc<Filesystem>,
         _tempdir: TempDir,
     }
     impl Fixture {
@@ -800,40 +792,39 @@ mod tests {
             let arenas = arenas.into_iter().collect::<Vec<_>>();
             let db = GlobalDatabase::new(redb_utils::in_memory()?)?;
             let allocator = PathIdAllocator::new(Arc::clone(&db), arenas.clone())?;
-            let mut arena_caches = vec![];
+            let mut arena_fs = vec![];
             for arena in arenas {
                 let blob_dir = tempdir.child(format!("{arena}/blobs"));
                 blob_dir.create_dir_all()?;
-                arena_caches.push(ArenaCache::for_testing(
+                arena_fs.push(ArenaFilesystem::for_testing(
                     arena,
                     Arc::clone(&allocator),
                     blob_dir.path(),
                 )?);
             }
-            let cache =
-                GlobalCache::with_db(Arc::clone(&db), Arc::clone(&allocator), arena_caches).await?;
+            let fs = Filesystem::with_db(Arc::clone(&db), Arc::clone(&allocator), arena_fs).await?;
 
             Ok(Self {
-                cache,
+                fs,
                 _tempdir: tempdir,
             })
         }
     }
 
     #[tokio::test]
-    async fn empty_cache_readdir() -> anyhow::Result<()> {
+    async fn empty_fs_readdir() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arenas([]).await?;
 
-        assert!(fixture.cache.readdir(PathId(1)).await?.is_empty());
+        assert!(fixture.fs.readdir(PathId(1)).await?.is_empty());
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn empty_cache_metadata() -> anyhow::Result<()> {
+    async fn empty_fs_metadata() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arenas([]).await?;
 
-        let m = fixture.cache.dir_metadata(PathId(1)).await?;
+        let m = fixture.fs.dir_metadata(PathId(1)).await?;
         assert!(m.read_only);
         assert_ne!(UnixTime::ZERO, m.mtime);
 
@@ -845,17 +836,17 @@ mod tests {
         let arena = Arena::from("documents/letters");
         let fixture = Fixture::setup_with_arena(arena).await?;
 
-        let root_m = fixture.cache.dir_metadata(PathId(1)).await?;
+        let root_m = fixture.fs.dir_metadata(PathId(1)).await?;
         assert!(root_m.read_only);
         assert_ne!(UnixTime::ZERO, root_m.mtime);
 
-        let (documents, _) = fixture.cache.lookup((PathId(1), "documents")).await?;
-        let documents_m = fixture.cache.dir_metadata(documents).await?;
+        let (documents, _) = fixture.fs.lookup((PathId(1), "documents")).await?;
+        let documents_m = fixture.fs.dir_metadata(documents).await?;
         assert!(documents_m.read_only);
         assert_ne!(UnixTime::ZERO, documents_m.mtime);
 
-        let (letters, _) = fixture.cache.lookup((documents, "letters")).await?;
-        let letters_m = fixture.cache.dir_metadata(letters).await?;
+        let (letters, _) = fixture.fs.lookup((documents, "letters")).await?;
+        let letters_m = fixture.fs.dir_metadata(letters).await?;
         assert!(!letters_m.read_only);
         assert_ne!(UnixTime::ZERO, letters_m.mtime);
 
@@ -871,18 +862,18 @@ mod tests {
         ])
         .await?;
 
-        let cache = &fixture.cache;
+        let fs = &fixture.fs;
 
-        let (arenas, metadata) = cache.lookup((PathId(1), "arenas")).await.unwrap();
+        let (arenas, metadata) = fs.lookup((PathId(1), "arenas")).await.unwrap();
         assert!(matches!(metadata, crate::arena::types::Metadata::Dir(_)));
 
-        let (_, metadata) = cache.lookup((PathId(1), "other")).await.unwrap();
+        let (_, metadata) = fs.lookup((PathId(1), "other")).await.unwrap();
         assert!(matches!(metadata, crate::arena::types::Metadata::Dir(_)));
 
-        let (_, metadata) = cache.lookup((arenas, "test1")).await.unwrap();
+        let (_, metadata) = fs.lookup((arenas, "test1")).await.unwrap();
         assert!(matches!(metadata, crate::arena::types::Metadata::Dir(_)));
 
-        let (_, metadata) = cache.lookup((arenas, "test2")).await.unwrap();
+        let (_, metadata) = fs.lookup((arenas, "test2")).await.unwrap();
         assert!(matches!(metadata, crate::arena::types::Metadata::Dir(_)));
 
         Ok(())
@@ -891,10 +882,10 @@ mod tests {
     #[tokio::test]
     async fn lookup_returns_notfound_for_missing_entry() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena()).await?;
-        let cache = &fixture.cache;
+        let fs = &fixture.fs;
 
         assert!(matches!(
-            cache.lookup((GlobalCache::ROOT_DIR, "nonexistent")).await,
+            fs.lookup((Filesystem::ROOT_DIR, "nonexistent")).await,
             Err(StorageError::NotFound),
         ));
 
@@ -910,8 +901,8 @@ mod tests {
         ])
         .await?;
 
-        let cache = &fixture.cache;
-        let entries = cache.readdir(PathId(1)).await?;
+        let fs = &fixture.fs;
+        let entries = fs.readdir(PathId(1)).await?;
         assert_eq!(entries.len(), 2);
 
         let mut names: Vec<String> = entries.iter().map(|(name, _, _)| name.clone()).collect();
@@ -929,8 +920,8 @@ mod tests {
             }
         }
 
-        let (arenas, _) = cache.lookup((PathId(1), "arenas")).await?;
-        let entries = cache.readdir(arenas).await?;
+        let (arenas, _) = fs.lookup((PathId(1), "arenas")).await?;
+        let entries = fs.readdir(arenas).await?;
         assert_eq!(entries.len(), 2);
 
         let mut names: Vec<String> = entries.iter().map(|(name, _, _)| name.clone()).collect();
@@ -949,20 +940,17 @@ mod tests {
         }
 
         assert!(
-            cache
-                .readdir(cache.arena_root(Arena::from("arenas/test1"))?)
+            fs.readdir(fs.arena_root(Arena::from("arenas/test1"))?)
                 .await?
                 .is_empty()
         );
         assert!(
-            cache
-                .readdir(cache.arena_root(Arena::from("arenas/test2"))?)
+            fs.readdir(fs.arena_root(Arena::from("arenas/test2"))?)
                 .await?
                 .is_empty()
         );
         assert!(
-            cache
-                .readdir(cache.arena_root(Arena::from("other"))?)
+            fs.readdir(fs.arena_root(Arena::from("other"))?)
                 .await?
                 .is_empty()
         );
@@ -974,26 +962,24 @@ mod tests {
     async fn unlink() -> anyhow::Result<()> {
         let arena = Arena::from("arenas/1");
         let fixture = Fixture::setup_with_arena(arena).await?;
-        let cache = &fixture.cache;
+        let fs = &fixture.fs;
 
-        let res = cache.unlink((GlobalCache::ROOT_DIR, "doesnotexist")).await;
+        let res = fs.unlink((Filesystem::ROOT_DIR, "doesnotexist")).await;
         assert!(matches!(res, Err(StorageError::NotFound)), "{res:?}");
         assert!(matches!(
-            cache.unlink((GlobalCache::ROOT_DIR, "arenas")).await,
+            fs.unlink((Filesystem::ROOT_DIR, "arenas")).await,
             Err(StorageError::IsADirectory)
         ));
-        let (arenas_pathid, _) = cache.lookup((GlobalCache::ROOT_DIR, "arenas")).await?;
+        let (arenas_pathid, _) = fs.lookup((Filesystem::ROOT_DIR, "arenas")).await?;
         assert!(matches!(
-            cache.unlink((arenas_pathid, "1")).await,
+            fs.unlink((arenas_pathid, "1")).await,
             Err(StorageError::IsADirectory)
         ));
 
         // This just checks that the call is dispatched down to the
-        // arena cache.
+        // arena fs.
         assert!(matches!(
-            cache
-                .unlink((cache.arena_root(arena)?, "doesnotexist"))
-                .await,
+            fs.unlink((fs.arena_root(arena)?, "doesnotexist")).await,
             Err(StorageError::NotFound)
         ));
 
@@ -1005,21 +991,20 @@ mod tests {
         let arena1 = Arena::from("arenas/1");
         let arena2 = Arena::from("arenas/2");
         let fixture = Fixture::setup_with_arenas([arena1, arena2]).await?;
-        let cache = &fixture.cache;
+        let fs = &fixture.fs;
 
-        let arenas_dir = cache.lookup((GlobalCache::ROOT_DIR, "arenas")).await?.0;
-        let res = cache
-            .branch(arenas_dir, (GlobalCache::ROOT_DIR, "test_arena2"))
+        let arenas_dir = fs.lookup((Filesystem::ROOT_DIR, "arenas")).await?.0;
+        let res = fs
+            .branch(arenas_dir, (Filesystem::ROOT_DIR, "test_arena2"))
             .await;
         assert!(matches!(res, Err(StorageError::IsADirectory)), "{res:?}");
 
         assert!(matches!(
-            cache
-                .branch(
-                    cache.arena_root(arena1)?,
-                    (cache.arena_root(arena2)?, "test_arena2")
-                )
-                .await,
+            fs.branch(
+                fs.arena_root(arena1)?,
+                (fs.arena_root(arena2)?, "test_arena2")
+            )
+            .await,
             Err(StorageError::CrossesDevices)
         ));
 

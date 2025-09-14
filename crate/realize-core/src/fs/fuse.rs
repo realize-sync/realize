@@ -1,8 +1,8 @@
 #![allow(dead_code)] // in progress
 use crate::fs::downloader::{Download, Downloader};
-use fuser::{Filesystem, MountOption};
+use fuser::MountOption;
 use nix::libc::{self, c_int};
-use realize_storage::{DirMetadata, FileMetadata, GlobalCache, Inode, Metadata, StorageError};
+use realize_storage::{DirMetadata, FileMetadata, Filesystem, Inode, Metadata, StorageError};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::time::SystemTime;
@@ -13,7 +13,7 @@ use tokio_util::bytes::BufMut;
 
 /// Mount the cache as FUSE filesystem at the given mountpoint.
 pub fn export(
-    cache: Arc<GlobalCache>,
+    cache: Arc<Filesystem>,
     downloader: Downloader,
     mountpoint: &std::path::Path,
     umask: u16,
@@ -79,7 +79,7 @@ struct RealizeFs {
 // Handle::spawn to run async code. reply can moved into the spawn and
 // captured there; there's no need for the function to return before
 // filling in the reply.
-impl Filesystem for RealizeFs {
+impl fuser::Filesystem for RealizeFs {
     fn init(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -438,7 +438,7 @@ impl Filesystem for RealizeFs {
 }
 
 struct InnerRealizeFs {
-    cache: Arc<GlobalCache>,
+    cache: Arc<Filesystem>,
     downloader: Downloader,
     umask: u16,
     handles: Arc<Mutex<BTreeMap<u64, Arc<Mutex<Download>>>>>,

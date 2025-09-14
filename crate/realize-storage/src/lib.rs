@@ -1,6 +1,6 @@
 use anyhow::Context;
-use arena::arena_cache::ArenaCache;
 use arena::engine::Engine;
+use arena::fs::ArenaFilesystem;
 use arena::{ArenaStorage, indexed_store};
 use config::StorageConfig;
 use futures::Stream;
@@ -32,12 +32,12 @@ pub use arena::types::{
     DirMetadata, FileAvailability, FileMetadata, LocalAvailability, Mark, Metadata,
 };
 pub use error::StorageError;
-pub use global::cache::{GlobalCache, GlobalLoc};
+pub use global::fs::{Filesystem, FsLoc};
 pub use types::{Inode, JobId, PathId};
 
 /// Local storage, including the real store and an unreal cache.
 pub struct Storage {
-    cache: Arc<GlobalCache>,
+    cache: Arc<Filesystem>,
     arena_storage: HashMap<Arena, ArenaStorage>,
 }
 
@@ -69,7 +69,7 @@ impl Storage {
             );
         }
 
-        let cache = GlobalCache::with_db(
+        let cache = Filesystem::with_db(
             globaldb,
             allocator,
             arena_storage
@@ -87,7 +87,7 @@ impl Storage {
     }
 
     /// Return a handle on the unreal cache.
-    pub fn cache(&self) -> &Arc<GlobalCache> {
+    pub fn cache(&self) -> &Arc<Filesystem> {
         &self.cache
     }
 
@@ -120,7 +120,7 @@ impl Storage {
     pub async fn update(&self, peer: Peer, notification: Notification) -> Result<(), StorageError> {
         // TODO: change both in the same transaction
         let arena_storage = self.arena_storage(notification.arena())?;
-        let cache: Arc<ArenaCache> = Arc::clone(&arena_storage.cache);
+        let cache: Arc<ArenaFilesystem> = Arc::clone(&arena_storage.cache);
         let index_root = arena_storage.indexed.as_ref().map(|i| i.root.to_path_buf());
         task::spawn_blocking(move || cache.update(peer, notification, index_root.as_deref()))
             .await??;

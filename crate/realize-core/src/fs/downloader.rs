@@ -1,5 +1,5 @@
 use crate::rpc::{ExecutionMode, Household};
-use realize_storage::{Blob, GlobalCache, GlobalLoc, StorageError};
+use realize_storage::{Blob, Filesystem, FsLoc, StorageError};
 use realize_types::{Arena, ByteRange, ByteRanges, Path, Peer};
 use std::cmp::min;
 use std::collections::VecDeque;
@@ -23,15 +23,15 @@ const MAX_CHUNK_SIZE: u64 = 4 * MIN_CHUNK_SIZE;
 #[derive(Clone)]
 pub struct Downloader {
     household: Arc<Household>,
-    cache: Arc<GlobalCache>,
+    cache: Arc<Filesystem>,
 }
 
 impl Downloader {
-    pub fn new(household: Arc<Household>, cache: Arc<GlobalCache>) -> Self {
+    pub fn new(household: Arc<Household>, cache: Arc<Filesystem>) -> Self {
         Self { household, cache }
     }
 
-    pub async fn reader<L: Into<GlobalLoc>>(&self, loc: L) -> Result<Download, StorageError> {
+    pub async fn reader<L: Into<FsLoc>>(&self, loc: L) -> Result<Download, StorageError> {
         let blob = self.cache.open_file(loc).await?;
         let avail = blob
             .remote_availability()

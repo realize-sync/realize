@@ -1,6 +1,6 @@
 use super::db::ArenaDatabase;
 use super::engine::{Engine, StorageJob};
-use crate::arena::arena_cache::CacheReadOperations;
+use crate::arena::cache::CacheReadOperations;
 use crate::arena::index::{self, IndexReadOperations};
 use crate::arena::tree::TreeExt;
 use crate::{JobId, JobStatus, PathId, StorageError};
@@ -277,10 +277,10 @@ impl StorageJobProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arena::arena_cache::CacheExt;
+    use crate::arena::cache::CacheExt;
     use crate::arena::index::IndexedFile;
     use crate::utils::hash;
-    use crate::{ArenaCache, Blob, LocalAvailability, Mark, Notification, PathId};
+    use crate::{ArenaFilesystem, Blob, LocalAvailability, Mark, Notification, PathId};
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
@@ -295,7 +295,7 @@ mod tests {
     struct Fixture {
         arena: Arena,
         db: Arc<ArenaDatabase>,
-        cache: Arc<ArenaCache>,
+        cache: Arc<ArenaFilesystem>,
         root: ChildPath,
         processor: Arc<StorageJobProcessor>,
         _tempdir: TempDir,
@@ -320,7 +320,7 @@ mod tests {
             let db = ArenaDatabase::for_testing_single_arena(arena, &blob_dir)?;
             let root = tempdir.child("root");
             root.create_dir_all()?;
-            let cache = ArenaCache::new(arena, Arc::clone(&db))?;
+            let cache = ArenaFilesystem::new(arena, Arc::clone(&db))?;
 
             let engine = Engine::new(arena, Arc::clone(&db), |attempt| {
                 if attempt < 3 {

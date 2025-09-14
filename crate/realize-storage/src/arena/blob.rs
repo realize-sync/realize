@@ -3,7 +3,7 @@ use super::dirty::WritableOpenDirty;
 use super::mark::MarkReadOperations;
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
 use super::types::{BlobTableEntry, LocalAvailability, LruQueueId, Mark, QueueTableEntry};
-use crate::arena::arena_cache::CacheReadOperations;
+use crate::arena::cache::CacheReadOperations;
 use crate::types::PathId;
 use crate::utils::hash;
 use crate::utils::holder::Holder;

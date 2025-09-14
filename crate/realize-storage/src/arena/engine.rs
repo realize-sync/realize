@@ -1,5 +1,5 @@
-use super::arena_cache::CacheReadOperations;
 use super::blob::BlobReadOperations;
+use super::cache::CacheReadOperations;
 use super::db::{ArenaDatabase, ArenaReadTransaction};
 use super::dirty::DirtyReadOperations;
 use super::index::IndexReadOperations;
@@ -609,7 +609,7 @@ mod tests {
     use crate::GlobalDatabase;
     use crate::Notification;
     use crate::PathIdAllocator;
-    use crate::arena::arena_cache::ArenaCache;
+    use crate::arena::fs::ArenaFilesystem;
     use crate::arena::index;
     use crate::arena::mark;
     use crate::arena::tree::TreeLoc;
@@ -630,7 +630,7 @@ mod tests {
     struct EngineFixture {
         arena: Arena,
         db: Arc<ArenaDatabase>,
-        acache: Arc<ArenaCache>,
+        acache: Arc<ArenaFilesystem>,
         engine: Arc<Engine>,
         _tempdir: TempDir,
     }
@@ -650,7 +650,7 @@ mod tests {
                 PathIdAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?,
                 &blob_dir,
             )?;
-            let acache = ArenaCache::new(arena, Arc::clone(&db))?;
+            let acache = ArenaFilesystem::new(arena, Arc::clone(&db))?;
             let engine = Engine::new(arena, Arc::clone(&db), |attempt| {
                 if attempt < 3 {
                     Some(Duration::from_secs(attempt as u64 * 10))

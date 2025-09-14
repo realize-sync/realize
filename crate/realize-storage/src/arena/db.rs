@@ -1,5 +1,5 @@
-use super::arena_cache::WritableOpenCache;
 use super::blob::{BlobReadOperations, Blobs, ReadableOpenBlob, WritableOpenBlob};
+use super::cache::{self, WritableOpenCache};
 use super::dirty::{Dirty, DirtyReadOperations, ReadableOpenDirty, WritableOpenDirty};
 use super::history::{History, HistoryReadOperations, ReadableOpenHistory, WritableOpenHistory};
 use super::index::{IndexReadOperations, ReadableOpenIndex, WritableOpenIndex};
@@ -12,7 +12,6 @@ use super::types::{
     MarkTableEntry, PeerTableEntry, QueueTableEntry,
 };
 use crate::StorageError;
-use crate::arena::arena_cache;
 use crate::types::Inode;
 use crate::utils::holder::{ByteConversionError, Holder};
 use crate::{PathId, PathIdAllocator};
@@ -259,7 +258,7 @@ impl ArenaDatabase {
             history = History::setup(arena, &history_table)?;
             blobs = Blobs::setup(blob_dir.as_ref(), &blob_lru_queue_table)?;
             uuid = load_or_assign_uuid(&mut settings_table)?;
-            arena_cache::init(&mut cache_table, tree.root())?;
+            cache::init(&mut cache_table, tree.root())?;
         }
         txn.commit()?;
 
@@ -363,8 +362,8 @@ impl<'db> ArenaWriteTransaction<'db> {
     #[track_caller]
     pub(crate) fn read_cache(
         &self,
-    ) -> Result<impl crate::arena::arena_cache::CacheReadOperations, StorageError> {
-        Ok(crate::arena::arena_cache::ReadableOpenCache::new(
+    ) -> Result<impl crate::arena::cache::CacheReadOperations, StorageError> {
+        Ok(crate::arena::cache::ReadableOpenCache::new(
             self.inner
                 .open_table(CACHE_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
@@ -377,7 +376,7 @@ impl<'db> ArenaWriteTransaction<'db> {
     #[track_caller]
     pub(crate) fn write_cache(
         &self,
-    ) -> Result<crate::arena::arena_cache::WritableOpenCache<'_>, StorageError> {
+    ) -> Result<crate::arena::cache::WritableOpenCache<'_>, StorageError> {
         Ok(WritableOpenCache::new(
             self.inner
                 .open_table(CACHE_TABLE)
@@ -624,8 +623,8 @@ impl<'db> ArenaReadTransaction<'db> {
     #[track_caller]
     pub(crate) fn read_cache(
         &self,
-    ) -> Result<impl crate::arena::arena_cache::CacheReadOperations, StorageError> {
-        Ok(crate::arena::arena_cache::ReadableOpenCache::new(
+    ) -> Result<impl crate::arena::cache::CacheReadOperations, StorageError> {
+        Ok(crate::arena::cache::ReadableOpenCache::new(
             self.inner
                 .open_table(CACHE_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
