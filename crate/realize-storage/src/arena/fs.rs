@@ -27,6 +27,7 @@ pub(crate) struct ArenaFilesystem {
 
 impl ArenaFilesystem {
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn for_testing_single_arena(
         arena: realize_types::Arena,
         blob_dir: &std::path::Path,
@@ -64,11 +65,6 @@ impl ArenaFilesystem {
 
     pub(crate) fn arena(&self) -> Arena {
         self.arena
-    }
-
-    #[cfg(test)]
-    pub(crate) fn db(&self) -> &Arc<ArenaDatabase> {
-        &self.db
     }
 
     pub(crate) fn lookup(
@@ -379,4 +375,49 @@ impl From<(Inode, String)> for ArenaFsLoc {
     fn from(value: (Inode, String)) -> Self {
         ArenaFsLoc::InodeAndName(value.0, value.1)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assert_fs::TempDir;
+    use assert_fs::prelude::*;
+
+    struct Fixture {
+        acache: Arc<ArenaFilesystem>,
+        db: Arc<ArenaDatabase>,
+        _tempdir: TempDir,
+    }
+    impl Fixture {
+        fn setup() -> anyhow::Result<Fixture> {
+            let _ = env_logger::try_init();
+            let arena = Arena::from("myarena");
+            let tempdir = TempDir::new()?;
+            let child = tempdir.child(format!("{arena}-cache.db"));
+            let blob_dir = tempdir.child(format!("{arena}/blobs"));
+            if let Some(p) = child.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            let acache = ArenaFilesystem::for_testing_single_arena(arena, blob_dir.path())?;
+            let db = Arc::clone(&acache.db);
+            Ok(Self {
+                acache,
+                db,
+                _tempdir: tempdir,
+            })
+        }
+    }
+
+    #[test]
+    fn empty_cache_readdir() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        assert!(fixture.acache.readdir(fixture.db.tree().root())?.is_empty());
+
+        Ok(())
+    }
+
+    // TODO: add tests for this layer. This used to be covered by the tests in
+    // cache.rs, but these were converted to use transactions
+    // directly.
 }
