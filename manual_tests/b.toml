@@ -1,21 +1,15 @@
-[arenas.one]
-root = "one-b"
-db = "one-b.db"
-blob_dir = "one-b.blobs"
+[[arena]]
+name = "one"
+workdir = "one-b"
+datadir = "one-b/data"
 
-[arenas.two]
-root = "two-b"
-db = "two-b.db"
-blob_dir = "two-b.blobs"
+[[arena]]
+name = "two"
+workdir = "two-b"
+datadir = "two-b/data"
 
-[peers.client]
-pubkey = """
------BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEA5Fk9nDDOyj9z4bjRHmuQ0+yIksTrkLq8tjRH63xTAqs=
------END PUBLIC KEY-----
-"""
-
-[peers.a]
+[[peer]]
+name = "a"
 address = "127.0.0.1:7001"
 pubkey = """
 -----BEGIN PUBLIC KEY-----

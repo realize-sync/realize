@@ -1,6 +1,8 @@
 /target
 manual_tests/one-*
 manual_tests/two-*
+manual_tests/a-*
+manual_tests/b-*
 manual_tests/*.pid
 manual_tests/*.out
 manual_tests/*.db

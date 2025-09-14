@@ -1,25 +1,19 @@
-[arenas.one]
-root = "one-a"
-db = "one-a.db"
-blob_dir = "one-a.blobs"
+[[arena]]
+name = "one"
+workdir = "one-a"
+datadir = "one-a/data"
 disk_usage.max = "16M"
 disk_usage.leave = "10%"
 
-[arenas.two]
-root = "two-a"
-db = "two-a.db"
-blob_dir = "two-a.blobs"
+[[arena]]
+name = "two"
+workdir = "two-a"
+datadir = "two-a/data"
 disk_usage.max = "16M"
 disk_usage.leave = "10%"
 
-[peers.client]
-pubkey = """
------BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEA5Fk9nDDOyj9z4bjRHmuQ0+yIksTrkLq8tjRH63xTAqs=
------END PUBLIC KEY-----
-"""
-
-[peers.b]
+[[peer]]
+name = "b"
 address = "127.0.0.1:8001"
 pubkey = """
 -----BEGIN PUBLIC KEY-----
