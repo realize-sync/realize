@@ -1109,11 +1109,7 @@ impl store::Server for StoreServer {
     }
 
     fn arenas(&mut self, _: ArenasParams, mut results: ArenasResults) -> Promise<(), capnp::Error> {
-        let arenas = self
-            .storage
-            .indexed_arenas()
-            .map(|a| a.clone())
-            .collect::<Vec<_>>();
+        let arenas = self.storage.arenas().map(|a| a.clone()).collect::<Vec<_>>();
         let mut list = results.get().init_arenas(arenas.len() as u32);
         for (i, arena) in arenas.into_iter().enumerate() {
             list.set(i as u32, arena.as_str());

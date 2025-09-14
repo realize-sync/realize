@@ -75,7 +75,7 @@ mod tests {
                     arenas: vec![
                         realize_storage::config::ArenaConfig {
                             arena: Arena::from("arena1"),
-                            datadir: Some(PathBuf::from("/path/to/arena1/data")),
+                            datadir: PathBuf::from("/path/to/arena1/data"),
                             workdir: PathBuf::from("/path/to/arena1"),
                             max_parallel_hashers: Some(4),
                             debounce: Some(HumanDuration::from_millis(500)),

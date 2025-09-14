@@ -35,7 +35,7 @@ where
                 ArenaConfig {
                     arena,
                     workdir: arena_datadir.parent().unwrap().to_path_buf(),
-                    datadir: Some(arena_datadir),
+                    datadir: arena_datadir,
 
                     // Disabled in tests
                     debounce: Some(HumanDuration(Duration::ZERO)),
@@ -50,9 +50,7 @@ where
     };
 
     for arena_config in &config.arenas {
-        if let Some(datadir) = &arena_config.datadir {
-            std::fs::create_dir_all(datadir)?;
-        }
+        std::fs::create_dir_all(&arena_config.datadir)?;
     }
 
     Ok(config)

@@ -63,7 +63,7 @@ pub struct ArenaConfig {
 
     /// Optional local path to the directory where files for that arena are stored.
     /// If specified, an indexer will be created for this arena.
-    pub datadir: Option<PathBuf>,
+    pub datadir: PathBuf,
     /// Path to the directory where the database, blobs and overlay workdir are kept.
     ///
     /// This directory must be on the same directory as datadir, if specified.
@@ -97,23 +97,8 @@ impl ArenaConfig {
     {
         Self {
             arena,
-            datadir: Some(root.as_ref().to_path_buf()),
+            datadir: root.as_ref().to_path_buf(),
             workdir: metadata.as_ref().to_path_buf(),
-            max_parallel_hashers: None,
-            debounce: None,
-            disk_usage: None,
-        }
-    }
-
-    /// Configure an arena without local root folder.
-    pub fn rootless<P>(arena: Arena, metadata: P) -> Self
-    where
-        P: AsRef<std::path::Path>,
-    {
-        Self {
-            arena,
-            workdir: metadata.as_ref().to_path_buf(),
-            datadir: None,
             max_parallel_hashers: None,
             debounce: None,
             disk_usage: None,
@@ -381,6 +366,7 @@ mod tests {
 
             [[arena]]
             name = "arena2"
+            datadir = "/path/to/arena2/data"
             workdir = "/path/to/arena2"
             disk_usage = { max = "1G" }
         "#;
@@ -394,7 +380,7 @@ mod tests {
                 ArenaConfig {
                     arena: Arena::from("arena1"),
                     workdir: PathBuf::from("/path/to/arena1"),
-                    datadir: Some(PathBuf::from("/path/to/arena1/data")),
+                    datadir: PathBuf::from("/path/to/arena1/data"),
                     max_parallel_hashers: Some(4),
                     debounce: Some(HumanDuration::from_millis(500)),
                     disk_usage: None,
@@ -402,7 +388,7 @@ mod tests {
                 ArenaConfig {
                     arena: Arena::from("arena2"),
                     workdir: PathBuf::from("/path/to/arena2"),
-                    datadir: None,
+                    datadir: PathBuf::from("/path/to/arena2/data"),
                     max_parallel_hashers: None,
                     debounce: None,
                     disk_usage: Some(DiskUsageLimits {

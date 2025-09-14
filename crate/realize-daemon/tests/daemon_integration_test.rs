@@ -363,7 +363,7 @@ async fn daemon_updates_cache() -> anyhow::Result<()> {
         .storage
         .arena_config_mut(Arena::from("testdir"))
         .unwrap();
-    arena_config.datadir = Some(fixture_a.testdir.clone());
+    arena_config.datadir = fixture_a.testdir.clone();
 
     let mut daemon_a = fixture_a
         .command()?

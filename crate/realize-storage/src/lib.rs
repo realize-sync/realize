@@ -74,7 +74,7 @@ impl Storage {
             allocator,
             arena_storage
                 .values()
-                .map(|s| Arc::clone(&s.cache))
+                .map(|s| Arc::clone(&s.fs))
                 .collect::<Vec<_>>(),
         )
         .await
@@ -91,13 +91,9 @@ impl Storage {
         &self.cache
     }
 
-    /// Return an iterator over arenas that have an index, and so can
-    /// be subscribed to.
-    pub fn indexed_arenas(&self) -> impl Iterator<Item = Arena> {
-        self.arena_storage
-            .iter()
-            .filter(|(_, s)| s.indexed.is_some())
-            .map(|(a, _)| *a)
+    /// Return an iterator over registered arenas.
+    pub fn arenas(&self) -> impl Iterator<Item = Arena> {
+        self.arena_storage.iter().map(|(a, _)| *a)
     }
 
     /// Subscribe to files in the given arena.
@@ -109,21 +105,15 @@ impl Storage {
         tx: mpsc::Sender<Notification>,
         progress: Option<Progress>,
     ) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
-        let index = match &self.arena_storage(arena)?.indexed {
-            None => return Err(StorageError::NoLocalStorage(arena).into()),
-            Some(indexed) => Arc::clone(&indexed.db),
-        };
-        arena::notifier::subscribe(index, tx, progress).await
+        arena::notifier::subscribe(Arc::clone(&self.arena_storage(arena)?.db), tx, progress).await
     }
 
     /// Take into account notification from a remote peer.
     pub async fn update(&self, peer: Peer, notification: Notification) -> Result<(), StorageError> {
-        // TODO: change both in the same transaction
         let arena_storage = self.arena_storage(notification.arena())?;
-        let cache: Arc<ArenaFilesystem> = Arc::clone(&arena_storage.cache);
-        let index_root = arena_storage.indexed.as_ref().map(|i| i.root.to_path_buf());
-        task::spawn_blocking(move || cache.update(peer, notification, index_root.as_deref()))
-            .await??;
+        let fs: Arc<ArenaFilesystem> = Arc::clone(&arena_storage.fs);
+        let datadir = arena_storage.datadir.clone();
+        task::spawn_blocking(move || fs.update(peer, notification, Some(&datadir))).await??;
 
         Ok(())
     }
@@ -173,12 +163,9 @@ impl Storage {
         arena: Arena,
         path: &realize_types::Path,
     ) -> Result<Reader, StorageError> {
-        let indexed = match &self.arena_storage(arena)?.indexed {
-            None => return Err(StorageError::NoLocalStorage(arena)),
-            Some(indexed) => indexed,
-        };
+        let arena_storage = self.arena_storage(arena)?;
 
-        Reader::open(&indexed.db, indexed.root.as_ref(), path).await
+        Reader::open(&arena_storage.db, &arena_storage.datadir, path).await
     }
 
     pub async fn rsync(
@@ -188,12 +175,9 @@ impl Storage {
         range: &ByteRange,
         sig: Signature,
     ) -> anyhow::Result<Delta, StorageError> {
-        let indexed = match &self.arena_storage(arena)?.indexed {
-            None => return Err(StorageError::NoLocalStorage(arena)),
-            Some(indexed) => indexed,
-        };
+        let arena_storage = self.arena_storage(arena)?;
 
-        indexed_store::rsync(&indexed.db, &indexed.root, path, range, sig).await
+        indexed_store::rsync(&arena_storage.db, &arena_storage.datadir, path, range, sig).await
     }
 
     /// Return an infinite stream of jobs.

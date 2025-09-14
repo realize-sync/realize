@@ -34,17 +34,11 @@ pub mod watcher;
 /// Gives access to arena-specific stores and functions.
 pub(crate) struct ArenaStorage {
     pub(crate) db: Arc<ArenaDatabase>,
-    pub(crate) cache: Arc<ArenaFilesystem>,
+    pub(crate) fs: Arc<ArenaFilesystem>,
     pub(crate) engine: Arc<Engine>,
-    pub(crate) indexed: Option<IndexedArenaStorage>,
-    _drop_guard: DropGuard,
-}
-
-/// Indexed (FS-based) local storage.
-pub(crate) struct IndexedArenaStorage {
-    pub(crate) root: PathBuf,
-    pub(crate) db: Arc<ArenaDatabase>,
+    pub(crate) datadir: PathBuf,
     _watcher: RealWatcher,
+    _drop_guard: DropGuard,
 }
 
 impl ArenaStorage {
@@ -56,7 +50,8 @@ impl ArenaStorage {
     ) -> anyhow::Result<Self> {
         let shutdown = CancellationToken::new();
         let dbpath = arena_config.workdir.join("arena.db");
-        log::debug!("[{arena}] Arena setup with database {dbpath:?}");
+        let datadir = &arena_config.datadir;
+        log::debug!("[{arena}] Arena setup with database {dbpath:?} and datadir {datadir:?}");
         let db = ArenaDatabase::new(
             redb_utils::open(&dbpath).await?,
             arena,
@@ -64,80 +59,60 @@ impl ArenaStorage {
             &arena_config.workdir.join("blobs"),
         )
         .with_context(|| format!("[{arena}] Arena database in {dbpath:?}",))?;
-        let arena_cache = ArenaFilesystem::new(arena, Arc::clone(&db))?;
-        let indexed = match arena_config.datadir.as_ref() {
-            None => {
-                log::info!("[{arena}] Arena setup for caching");
 
-                None
-            }
-            Some(datadir) => {
-                log::info!("[{arena}] Arena setup with datadir {datadir:?}");
+        let arena_fs = ArenaFilesystem::new(arena, Arc::clone(&db))?;
+        let exclude = exclude
+            .iter()
+            .filter_map(|p| realize_types::Path::from_real_path_in(p, &datadir))
+            .collect::<Vec<_>>();
+        log::info!(
+            "[{arena}] Watching {datadir:?}{}",
+            exclude
+                .iter()
+                .map(|p| format!(" -\"{p}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let watcher = RealWatcher::builder(datadir, Arc::clone(&db))
+            .with_initial_scan()
+            .exclude_all(exclude.iter())
+            .debounce(
+                arena_config
+                    .debounce
+                    .clone()
+                    .unwrap_or(HumanDuration(Duration::from_secs(3)))
+                    .into(),
+            )
+            .max_parallel_hashers(arena_config.max_parallel_hashers.unwrap_or(4))
+            .spawn()
+            .await
+            .with_context(|| format!("{datadir:?}"))?;
+        if let Some(limits) = &arena_config.disk_usage {
+            tokio::spawn({
+                let db = Arc::clone(&db);
+                let shutdown = shutdown.clone();
+                let limits = limits.clone();
 
-                let exclude = exclude
-                    .iter()
-                    .filter_map(|p| realize_types::Path::from_real_path_in(p, datadir))
-                    .collect::<Vec<_>>();
-                log::info!(
-                    "[{arena}] Watching {datadir:?}{}",
-                    exclude
-                        .iter()
-                        .map(|p| format!(" -\"{p}\""))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                );
-                let watcher = RealWatcher::builder(datadir, Arc::clone(&db))
-                    .with_initial_scan()
-                    .exclude_all(exclude.iter())
-                    .debounce(
-                        arena_config
-                            .debounce
-                            .clone()
-                            .unwrap_or(HumanDuration(Duration::from_secs(3)))
-                            .into(),
-                    )
-                    .max_parallel_hashers(arena_config.max_parallel_hashers.unwrap_or(4))
-                    .spawn()
-                    .await
-                    .with_context(|| format!("{datadir:?}"))?;
-                if let Some(limits) = &arena_config.disk_usage {
-                    tokio::spawn({
-                        let db = Arc::clone(&db);
-                        let shutdown = shutdown.clone();
-                        let limits = limits.clone();
+                async move { cleaner::run_loop(db, limits, shutdown).await }
+            });
+        }
+        tokio::spawn({
+            let db = Arc::clone(&db);
+            let shutdown = shutdown.clone();
+            async move { blob::mark_accessed_loop(db, Duration::from_millis(500), shutdown).await }
+        });
 
-                        async move { cleaner::run_loop(db, limits, shutdown).await }
-                    });
-                }
-                tokio::spawn({
-                    let db = Arc::clone(&db);
-                    let shutdown = shutdown.clone();
-                    async move {
-                        blob::mark_accessed_loop(db, Duration::from_millis(500), shutdown).await
-                    }
-                });
-
-                Some(IndexedArenaStorage {
-                    root: datadir.to_path_buf(),
-                    db: Arc::clone(&db),
-                    _watcher: watcher,
-                })
-            }
-        };
         let engine = Engine::new(arena, Arc::clone(&db), job_retry_strategy);
 
-        jobs::StorageJobProcessor::new(
-            Arc::clone(&db),
-            Arc::clone(&engine),
-            indexed.as_ref().map(|indexed| indexed.root.to_path_buf()),
-        )
-        .spawn(shutdown.clone());
+        jobs::StorageJobProcessor::new(Arc::clone(&db), Arc::clone(&engine), datadir.clone())
+            .spawn(shutdown.clone());
 
         Ok(ArenaStorage {
             db,
-            cache: Arc::clone(&arena_cache),
+            fs: Arc::clone(&arena_fs),
             engine,
-            indexed,
+            datadir: datadir.clone(),
+            _watcher: watcher,
             _drop_guard: shutdown.drop_guard(),
         })
     }

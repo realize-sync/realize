@@ -42,7 +42,7 @@ impl SetupHelper {
         log::info!(
             "Indexed arenas: {:?}",
             storage
-                .indexed_arenas()
+                .arenas()
                 .map(|a| a.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -182,33 +182,32 @@ fn check_dirs(arenas: &[realize_storage::config::ArenaConfig]) -> anyhow::Result
             anyhow::bail!("[{arena}]: Arena workdir must be a writable directory: {workdir:?}",);
         }
 
-        if let Some(root) = &config.datadir {
-            let root_m = root
-                .metadata()
-                .with_context(|| format!("[{arena}] Arena datadir not found: {root:?}"))?;
-            if !is_readable_dir(root) {
-                anyhow::bail!("[{arena}] Arena datadir must be a readable directory :{workdir:?}");
-            }
-            if !is_writable_dir(root) {
-                log::warn!("[{arena}] Arena datadir should be a writable directory: {root:?}");
-            }
+        let datadir = &config.datadir;
+        let datadir_m = datadir
+            .metadata()
+            .with_context(|| format!("[{arena}] Arena datadir not found: {datadir:?}"))?;
+        if !is_readable_dir(datadir) {
+            anyhow::bail!("[{arena}] Arena datadir must be a readable directory :{workdir:?}");
+        }
+        if !is_writable_dir(datadir) {
+            log::warn!("[{arena}] Arena datadir should be a writable directory: {datadir:?}");
+        }
 
-            if workdir_m.dev() != root_m.dev() {
-                anyhow::bail!(
-                    "[{arena}] Workdir and datadir of an arena must be on the same device.\n\
+        if workdir_m.dev() != datadir_m.dev() {
+            anyhow::bail!(
+                "[{arena}] Workdir and datadir of an arena must be on the same device.\n\
                      workdir: {workdir:?}\n\
-                     datadir: {root:?}"
-                );
-            }
+                     datadir: {datadir:?}"
+            );
+        }
 
-            if workdir.canonicalize()?.starts_with(root.canonicalize()?) {
-                anyhow::bail!(
-                    "[{arena}] Workdir of an arena cannot be a child of its datadir \
+        if workdir.canonicalize()?.starts_with(datadir.canonicalize()?) {
+            anyhow::bail!(
+                "[{arena}] Workdir of an arena cannot be a child of its datadir \
                      (the reverse is possible)\n\
                      workdir: {workdir:?}\n\
-                     datadir: {root:?}"
-                );
-            }
+                     datadir: {datadir:?}"
+            );
         }
     }
 
@@ -245,40 +244,40 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn check_creates_metadata_dir() -> anyhow::Result<()> {
+    fn check_creates_workdir() -> anyhow::Result<()> {
         let tempdir = TempDir::new()?;
         let arena = Arena::from("test-arena");
 
-        let root_path = tempdir.child("root");
-        root_path.create_dir_all()?;
-        let metadata = tempdir.child("metadata");
+        let datadir = tempdir.child("root");
+        datadir.create_dir_all()?;
+        let workdir = tempdir.child("metadata");
 
         let arenas = vec![ArenaConfig::new(
             arena,
-            root_path.to_path_buf(),
-            metadata.to_path_buf(),
+            datadir.to_path_buf(),
+            workdir.to_path_buf(),
         )];
 
         check_dirs(&arenas)?;
 
-        assert!(metadata.exists());
-        assert!(metadata.is_dir());
+        assert!(workdir.exists());
+        assert!(workdir.is_dir());
 
         Ok(())
     }
 
     #[test]
-    fn check_rejects_missing_root_dir() -> anyhow::Result<()> {
+    fn check_rejects_missing_datadir() -> anyhow::Result<()> {
         let tempdir = TempDir::new()?;
         let arena = Arena::from("test-arena");
 
-        let root_path = tempdir.child("root");
-        let metadata_path = tempdir.child("metadata");
+        let datadir = tempdir.child("root");
+        let workdir = tempdir.child("metadata");
 
         let arenas = vec![ArenaConfig::new(
             arena,
-            root_path.to_path_buf(),
-            metadata_path.to_path_buf(),
+            datadir.to_path_buf(),
+            workdir.to_path_buf(),
         )];
 
         let result = check_dirs(&arenas);
@@ -292,17 +291,17 @@ mod tests {
         let tempdir = TempDir::new()?;
         let arena = Arena::from("test-arena");
 
-        let root_path = tempdir.child("root");
-        let metadata_path = tempdir.child("metadata");
+        let datadir = tempdir.child("root");
+        let workdir = tempdir.child("metadata");
 
         // Create directories beforehand
-        root_path.create_dir_all()?;
-        metadata_path.create_dir_all()?;
+        datadir.create_dir_all()?;
+        workdir.create_dir_all()?;
 
         let arenas = vec![ArenaConfig::new(
             arena,
-            root_path.to_path_buf(),
-            metadata_path.to_path_buf(),
+            datadir.to_path_buf(),
+            workdir.to_path_buf(),
         )];
 
         // Should succeed with existing directories
@@ -312,38 +311,21 @@ mod tests {
     }
 
     #[test]
-    fn check_accepts_rootless_arena() -> anyhow::Result<()> {
-        let tempdir = TempDir::new()?;
-        let arena = Arena::from("test-arena");
-
-        let metadata = tempdir.child("metadata");
-
-        let arenas = vec![ArenaConfig::rootless(arena, metadata.to_path_buf())];
-
-        check_dirs(&arenas)?;
-
-        assert!(metadata.exists());
-        assert!(metadata.is_dir());
-
-        Ok(())
-    }
-
-    #[test]
     fn check_rejects_nondirectory_root() -> anyhow::Result<()> {
         let tempdir = TempDir::new()?;
         let arena = Arena::from("test-arena");
 
-        let root_path = tempdir.child("root");
-        let metadata_path = tempdir.child("metadata");
+        let datadir = tempdir.child("root");
+        let workdir = tempdir.child("metadata");
 
         // Create a file instead of directory
-        root_path.write_str("not a directory")?;
-        metadata_path.create_dir_all()?;
+        datadir.write_str("not a directory")?;
+        workdir.create_dir_all()?;
 
         let arenas = vec![ArenaConfig::new(
             arena,
-            root_path.to_path_buf(),
-            metadata_path.to_path_buf(),
+            datadir.to_path_buf(),
+            workdir.to_path_buf(),
         )];
 
         // Should fail because root path is a file, not directory
@@ -359,21 +341,21 @@ mod tests {
         let tempdir = TempDir::new()?;
         let arena = Arena::from("test-arena");
 
-        let root_path = tempdir.child("root");
-        let metadata_path = tempdir.child("metadata");
+        let datadir = tempdir.child("root");
+        let workdir = tempdir.child("metadata");
 
-        root_path.create_dir_all()?;
-        metadata_path.create_dir_all()?;
+        datadir.create_dir_all()?;
+        workdir.create_dir_all()?;
 
         // Remove read permissions from root
-        let mut perms = fs::metadata(root_path.path())?.permissions();
+        let mut perms = fs::metadata(datadir.path())?.permissions();
         perms.set_mode(0o000); // No permissions
-        fs::set_permissions(root_path.path(), perms)?;
+        fs::set_permissions(datadir.path(), perms)?;
 
         let arenas = vec![ArenaConfig::new(
             arena,
-            root_path.to_path_buf(),
-            metadata_path.to_path_buf(),
+            datadir.to_path_buf(),
+            workdir.to_path_buf(),
         )];
 
         // Should fail because root has no read access
@@ -389,21 +371,21 @@ mod tests {
         let tempdir = TempDir::new()?;
         let arena = Arena::from("test-arena");
 
-        let root_path = tempdir.child("root");
-        let metadata_path = tempdir.child("metadata");
+        let datadir = tempdir.child("root");
+        let workdir = tempdir.child("metadata");
 
-        root_path.create_dir_all()?;
-        metadata_path.create_dir_all()?;
+        datadir.create_dir_all()?;
+        workdir.create_dir_all()?;
 
         // Remove write permissions from root
-        let mut perms = fs::metadata(root_path.path())?.permissions();
+        let mut perms = fs::metadata(datadir.path())?.permissions();
         perms.set_mode(0o444); // Read-only
-        fs::set_permissions(root_path.path(), perms)?;
+        fs::set_permissions(datadir.path(), perms)?;
 
         let arenas = vec![ArenaConfig::new(
             arena,
-            root_path.to_path_buf(),
-            metadata_path.to_path_buf(),
+            datadir.to_path_buf(),
+            workdir.to_path_buf(),
         )];
 
         // Should succeed but log a warning about write access
@@ -417,16 +399,16 @@ mod tests {
         let tempdir = TempDir::new()?;
         let arena = Arena::from("test-arena");
 
-        let root = tempdir.child("root");
-        let metadata = tempdir.child("root/metadata");
+        let datadir = tempdir.child("root");
+        let workdir = tempdir.child("root/metadata");
 
-        metadata.create_dir_all()?;
-        root.create_dir_all()?;
+        workdir.create_dir_all()?;
+        datadir.create_dir_all()?;
 
         let arenas = vec![ArenaConfig::new(
             arena,
-            root.to_path_buf(),
-            metadata.to_path_buf(),
+            datadir.to_path_buf(),
+            workdir.to_path_buf(),
         )];
 
         // Should fail because metadat is a child of root
@@ -442,15 +424,21 @@ mod tests {
         let tempdir = TempDir::new()?;
         let arena = Arena::from("test-arena");
 
-        let metadata = tempdir.child("metadata");
-        metadata.create_dir_all()?;
+        let datadir = tempdir.child("root");
+        datadir.create_dir_all()?;
+        let workdir = tempdir.child("metadata");
+        workdir.create_dir_all()?;
 
         // Remove write permissions from metadata dir
-        let mut perms = fs::metadata(metadata.path())?.permissions();
+        let mut perms = fs::metadata(workdir.path())?.permissions();
         perms.set_mode(0o444); // Read-only
-        fs::set_permissions(metadata.path(), perms)?;
+        fs::set_permissions(workdir.path(), perms)?;
 
-        let arenas = vec![ArenaConfig::rootless(arena, metadata.to_path_buf())];
+        let arenas = vec![ArenaConfig::new(
+            arena,
+            datadir.to_path_buf(),
+            workdir.to_path_buf(),
+        )];
 
         // Should fail because metadata dir is not writable
         let result = check_dirs(&arenas);

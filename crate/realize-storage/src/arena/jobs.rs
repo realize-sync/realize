@@ -15,14 +15,14 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct StorageJobProcessor {
     db: Arc<ArenaDatabase>,
     engine: Arc<Engine>,
-    index_root: Option<PathBuf>,
+    index_root: PathBuf,
 }
 
 impl StorageJobProcessor {
     pub(crate) fn new(
         db: Arc<ArenaDatabase>,
         engine: Arc<Engine>,
-        index_root: Option<PathBuf>,
+        index_root: PathBuf,
     ) -> Arc<Self> {
         Arc::new(Self {
             db,
@@ -105,10 +105,7 @@ impl StorageJobProcessor {
     /// versions in the cache or the current version in the index
     /// don't match `hash`.
     fn unrealize(&self, pathid: PathId, hash: Hash) -> Result<JobStatus, StorageError> {
-        let root = match &self.index_root {
-            Some(ret) => ret,
-            None => return Err(StorageError::NoLocalStorage(self.db.arena())),
-        };
+        let root = &self.index_root;
         let path: realize_types::Path;
         let realpath: PathBuf;
         let cachepath: PathBuf;
@@ -194,10 +191,7 @@ impl StorageJobProcessor {
         index_hash: Option<Hash>,
     ) -> Result<JobStatus, StorageError> {
         let arena = self.db.arena();
-        let root = match &self.index_root {
-            Some(ret) => ret,
-            None => return Err(StorageError::NoLocalStorage(arena)),
-        };
+        let root = &self.index_root;
         let source: PathBuf;
         let dest: PathBuf;
         let path: realize_types::Path;
@@ -302,15 +296,6 @@ mod tests {
 
     impl Fixture {
         fn setup() -> anyhow::Result<Self> {
-            Self::setup_internal(true)
-        }
-
-        fn setup_cache_only() -> anyhow::Result<Self> {
-            Self::setup_internal(false)
-        }
-
-        /// Call setup or setup_cache_only
-        fn setup_internal(with_root: bool) -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
 
@@ -328,15 +313,8 @@ mod tests {
                     None
                 }
             });
-            let processor = StorageJobProcessor::new(
-                Arc::clone(&db),
-                Arc::clone(&engine),
-                if with_root {
-                    Some(root.to_path_buf())
-                } else {
-                    None
-                },
-            );
+            let processor =
+                StorageJobProcessor::new(Arc::clone(&db), Arc::clone(&engine), root.to_path_buf());
 
             let fixture = Self {
                 arena,
@@ -504,19 +482,6 @@ mod tests {
         assert!(fixture.find_in_index("dir/test.txt")?.is_none());
         assert!(!fixture.file_exists("dir/test.txt"));
         assert_eq!("foobar", fixture.read_blob_content("dir/test.txt").await?);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn unrealize_no_local_storage() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_cache_only()?;
-        let hash = hash::digest("foobar");
-        fixture.add_to_cache("test.txt", &hash, 6)?;
-        let path = Path::parse("test.txt")?;
-        assert!(matches!(
-            fixture.processor.unrealize(fixture.pathid(&path)?, hash),
-                Err(StorageError::NoLocalStorage(a)) if a == fixture.arena));
 
         Ok(())
     }
