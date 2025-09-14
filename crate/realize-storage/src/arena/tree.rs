@@ -292,7 +292,7 @@ pub(crate) trait TreeExt {
 
     /// Follow the pathids back up to the root and build a path.
     ///
-    /// Not all pathids can be turned into a path, even valid ones.
+    /// Returns None if the location points to the arena root.
     fn backtrack<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> Result<Option<Path>, StorageError>;
 
     /// Return an iterator that returns the parent of pathid and it
@@ -391,7 +391,7 @@ impl<T: TreeReadOperations> TreeExt for T {
                     }
                     current = parent;
                 }
-                if current != self.root() || components.is_empty() {
+                if components.is_empty() {
                     return Ok(None);
                 }
 

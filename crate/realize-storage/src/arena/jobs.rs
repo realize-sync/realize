@@ -310,7 +310,7 @@ mod tests {
             let db = ArenaDatabase::for_testing_single_arena(arena, &blob_dir)?;
             let root = tempdir.child("root");
             root.create_dir_all()?;
-            let cache = ArenaFilesystem::new(arena, Arc::clone(&db))?;
+            let cache = ArenaFilesystem::new(arena, Arc::clone(&db), &root)?;
 
             let engine = Engine::new(arena, Arc::clone(&db), |attempt| {
                 if attempt < 3 {

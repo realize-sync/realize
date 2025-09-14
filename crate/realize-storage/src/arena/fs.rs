@@ -11,6 +11,7 @@ use crate::types::Inode;
 use crate::{Blob, LocalAvailability};
 use crate::{PathId, StorageError};
 use realize_types::{Arena, Path, Peer};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 // TreeLoc is necessary to call ArenaCache methods
@@ -23,6 +24,8 @@ pub(crate) use super::tree::TreeLoc;
 pub(crate) struct ArenaFilesystem {
     arena: Arena,
     db: Arc<ArenaDatabase>,
+    #[allow(dead_code)] // do not submit
+    datadir: PathBuf,
 }
 
 impl ArenaFilesystem {
@@ -31,6 +34,7 @@ impl ArenaFilesystem {
     pub fn for_testing_single_arena(
         arena: realize_types::Arena,
         blob_dir: &std::path::Path,
+        datadir: &std::path::Path,
     ) -> anyhow::Result<Arc<Self>> {
         ArenaFilesystem::for_testing(
             arena,
@@ -39,6 +43,7 @@ impl ArenaFilesystem {
                 [arena],
             )?,
             blob_dir,
+            datadir,
         )
     }
 
@@ -47,6 +52,7 @@ impl ArenaFilesystem {
         arena: realize_types::Arena,
         allocator: Arc<crate::PathIdAllocator>,
         blob_dir: &std::path::Path,
+        datadir: &std::path::Path,
     ) -> anyhow::Result<Arc<Self>> {
         let db = ArenaDatabase::new(
             crate::utils::redb_utils::in_memory()?,
@@ -55,12 +61,20 @@ impl ArenaFilesystem {
             blob_dir,
         )?;
 
-        Ok(ArenaFilesystem::new(arena, Arc::clone(&db))?)
+        Ok(ArenaFilesystem::new(arena, Arc::clone(&db), datadir)?)
     }
 
     /// Create a new ArenaCache from an arena, root pathid, database, and blob directory.
-    pub(crate) fn new(arena: Arena, db: Arc<ArenaDatabase>) -> Result<Arc<Self>, StorageError> {
-        Ok(Arc::new(Self { arena, db }))
+    pub(crate) fn new(
+        arena: Arena,
+        db: Arc<ArenaDatabase>,
+        datadir: &std::path::Path,
+    ) -> Result<Arc<Self>, StorageError> {
+        Ok(Arc::new(Self {
+            arena,
+            db,
+            datadir: datadir.to_path_buf(),
+        }))
     }
 
     pub(crate) fn arena(&self) -> Arena {
@@ -390,7 +404,7 @@ mod tests {
     use realize_types::{Hash, Path, Peer, UnixTime};
 
     struct Fixture {
-        acache: Arc<ArenaFilesystem>,
+        fs: Arc<ArenaFilesystem>,
         db: Arc<ArenaDatabase>,
         _tempdir: TempDir,
     }
@@ -399,15 +413,15 @@ mod tests {
             let _ = env_logger::try_init();
             let arena = Arena::from("myarena");
             let tempdir = TempDir::new()?;
-            let child = tempdir.child(format!("{arena}-cache.db"));
             let blob_dir = tempdir.child(format!("{arena}/blobs"));
-            if let Some(p) = child.parent() {
-                std::fs::create_dir_all(p)?;
-            }
-            let acache = ArenaFilesystem::for_testing_single_arena(arena, blob_dir.path())?;
-            let db = Arc::clone(&acache.db);
+            let datadir = tempdir.child(format!("{arena}/blobs"));
+            blob_dir.create_dir_all()?;
+            datadir.create_dir_all()?;
+            let fs =
+                ArenaFilesystem::for_testing_single_arena(arena, blob_dir.path(), datadir.path())?;
+            let db = Arc::clone(&fs.db);
             Ok(Self {
-                acache,
+                fs,
                 db,
                 _tempdir: tempdir,
             })
@@ -418,7 +432,7 @@ mod tests {
     fn empty_cache_readdir() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
 
-        assert!(fixture.acache.readdir(fixture.db.tree().root())?.is_empty());
+        assert!(fixture.fs.readdir(fixture.db.tree().root())?.is_empty());
 
         Ok(())
     }
@@ -432,7 +446,7 @@ mod tests {
             None,
             Peer::from("test_peer"),
             Notification::Add {
-                arena: fixture.acache.arena(),
+                arena: fixture.fs.arena(),
                 index: 1,
                 path: test_path.clone(),
                 mtime: UnixTime::from_secs(1234567890),
@@ -442,8 +456,8 @@ mod tests {
         )?;
 
         // lookup should find the file and dir metadata in cache
-        fixture.acache.lookup(&test_path).unwrap();
-        fixture.acache.lookup(Path::parse("dir")?).unwrap();
+        fixture.fs.lookup(&test_path).unwrap();
+        fixture.fs.lookup(Path::parse("dir")?).unwrap();
 
         Ok(())
     }
@@ -452,7 +466,7 @@ mod tests {
     fn lookup_not_found() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let nonexistent_path = Path::parse("nonexistent.txt")?;
-        let result = fixture.acache.lookup(&nonexistent_path);
+        let result = fixture.fs.lookup(&nonexistent_path);
         assert!(matches!(result, Err(StorageError::NotFound)));
 
         Ok(())

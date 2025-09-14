@@ -615,7 +615,6 @@ mod tests {
     use crate::arena::tree::TreeLoc;
     use crate::utils::redb_utils;
     use assert_fs::TempDir;
-    use assert_fs::prelude::*;
     use futures::StreamExt as _;
     use realize_types::{Arena, Peer, UnixTime};
     use std::sync::Arc;
@@ -639,18 +638,19 @@ mod tests {
             let _ = env_logger::try_init();
 
             let tempdir = TempDir::new()?;
-            let arena_path = tempdir.child("arena");
-            arena_path.create_dir_all()?;
-
             let arena = Arena::from("myarena");
             let blob_dir = tempdir.path().join("blobs");
+            std::fs::create_dir_all(&blob_dir)?;
+            let datadir = tempdir.path().join("data");
+            std::fs::create_dir_all(&datadir)?;
+
             let db = ArenaDatabase::new(
                 redb_utils::in_memory()?,
                 arena,
                 PathIdAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?,
                 &blob_dir,
             )?;
-            let acache = ArenaFilesystem::new(arena, Arc::clone(&db))?;
+            let acache = ArenaFilesystem::new(arena, Arc::clone(&db), &datadir)?;
             let engine = Engine::new(arena, Arc::clone(&db), |attempt| {
                 if attempt < 3 {
                     Some(Duration::from_secs(attempt as u64 * 10))

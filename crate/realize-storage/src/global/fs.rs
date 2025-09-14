@@ -796,10 +796,13 @@ mod tests {
             for arena in arenas {
                 let blob_dir = tempdir.child(format!("{arena}/blobs"));
                 blob_dir.create_dir_all()?;
+                let datadir = tempdir.child(format!("{arena}/data"));
+                datadir.create_dir_all()?;
                 arena_fs.push(ArenaFilesystem::for_testing(
                     arena,
                     Arc::clone(&allocator),
                     blob_dir.path(),
+                    datadir.path(),
                 )?);
             }
             let fs = Filesystem::with_db(Arc::clone(&db), Arc::clone(&allocator), arena_fs).await?;
