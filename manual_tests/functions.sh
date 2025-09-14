@@ -109,3 +109,27 @@ function control {
 function clean {
     rm -fr *.db *.out *.blob*
 }
+
+function merge {
+    opts=(
+        cache.files=off
+        category.create=ff
+        category.action=ff
+        category.search=ff
+        dropcacheonclose=false
+        link_cow=true
+    )
+    sudo mergerfs \
+         -o $(IFS=, ; echo "${opts[*]}")\
+         ${this}/one-a/data:${this}/a-fuse/one \
+         ${this}/one-a/merged
+    sudo mergerfs \
+         -o $(IFS=, ; echo "${opts[*]}")\
+         ${this}/two-a/data:${this}/a-fuse/two \
+         ${this}/two-a/merged
+}
+
+function unmerge {
+    sudo umount ${this}/one-a/merged
+    sudo umount ${this}/two-a/merged
+}
