@@ -1,5 +1,6 @@
 use super::db::ArenaDatabase;
 use super::engine::{Engine, StorageJob};
+use crate::arena::blob::BlobExt;
 use crate::arena::cache::CacheReadOperations;
 use crate::arena::index::{self, IndexReadOperations};
 use crate::arena::tree::TreeExt;
@@ -224,17 +225,22 @@ impl StorageJobProcessor {
                 }
             };
             let mut blobs = txn.write_blobs()?;
-            source = match blobs.prepare_export(&mut tree, &path, &cache_hash)? {
+            let blobinfo = match blobs.get(&tree, &path)? {
+                Some(b) => b,
+                None => return Ok(JobStatus::Abandoned("no_blob")),
+            };
+            if blobinfo.hash != cache_hash {
+                return Ok(JobStatus::Abandoned("blob_version"));
+            }
+            if !blobinfo.verified {
+                return Ok(JobStatus::Abandoned("not_verified"));
+            }
+            source = match blobs.prepare_export(&mut tree, &path)? {
                 Some(p) => p,
                 None => {
                     return Ok(JobStatus::Abandoned("blob_export"));
                 }
             };
-            // Make sure that mtime and size match
-            if source.metadata()?.len() != cached.size {
-                return Ok(JobStatus::Abandoned("wrong_size"));
-            }
-
             // Set modification time on file (best effort)
             if let Some(time) = cached.mtime.as_system_time() {
                 let f = File::open(&source)?;

@@ -579,26 +579,19 @@ impl<'a> WritableOpenBlob<'a> {
         &mut self,
         tree: &mut WritableOpenTree,
         loc: L,
-        hash: &Hash,
     ) -> Result<Option<std::path::PathBuf>, StorageError> {
         let pathid = match tree.resolve(loc)? {
             Some(pathid) => pathid,
             None => return Ok(None), // Nothing to export
         };
-
-        let blob_entry = match self.blob_table.get(pathid)? {
-            None => {
-                return Ok(None);
-            }
-            Some(v) => v.value().parse()?,
-        };
-        if blob_entry.content_hash != *hash || !blob_entry.verified {
+        let realpath = self.subsystem.blob_dir.join(pathid.hex());
+        if !realpath.exists() {
             return Ok(None);
         }
-
         self.remove_blob_entry(tree, pathid)?;
         self.report_disk_usage_changed();
-        Ok(Some(self.subsystem.blob_dir.join(pathid.hex())))
+
+        Ok(Some(realpath))
     }
 
     /// Setup the database to move some existing file into and return the
@@ -2033,7 +2026,7 @@ mod tests {
         let fixture = Fixture::setup()?;
         let path = Path::parse("baa/baa")?;
         fixture.create_blob_with_partial_data(&path, "Baa, baa, black sheep", 21)?;
-        let BlobInfo { pathid, hash, .. } = fixture.blob_info(&path)?.unwrap();
+        let BlobInfo { pathid, .. } = fixture.blob_info(&path)?.unwrap();
 
         assert_eq!(true, Blob::open(&fixture.db, &path)?.mark_verified().await?);
 
@@ -2043,7 +2036,7 @@ mod tests {
         {
             let mut blobs = txn.write_blobs()?;
             let mut tree = txn.write_tree()?;
-            let source = blobs.prepare_export(&mut tree, &path, &hash)?.unwrap();
+            let source = blobs.prepare_export(&mut tree, &path)?.unwrap();
             std::fs::rename(source, &dest)?;
         }
         let watch = fixture.db.blobs().watch_disk_usage();
@@ -2063,50 +2056,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn export_wrong_hash() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let path = Path::parse("baa/baa")?;
-        fixture.create_blob_with_partial_data(&path, "Baa, baa, black sheep", 21)?;
-
-        assert_eq!(true, Blob::open(&fixture.db, &path)?.mark_verified().await?);
-
-        // export to dest
-        let txn = fixture.begin_write()?;
-        {
-            let mut blobs = txn.write_blobs()?;
-            let mut tree = txn.write_tree()?;
-            assert_eq!(
-                None,
-                blobs.prepare_export(&mut tree, &path, &hash::digest("wrong!"))?
-            );
-        }
-        txn.commit()?;
-
-        assert!(fixture.blob_info(&path)?.is_some());
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn export_not_verified() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let path = Path::parse("baa/baa")?;
-        fixture.create_blob_with_partial_data(&path, "Baa, baa, black sheep", 21)?;
-        let hash = fixture.blob_info(&path)?.unwrap().hash;
-
-        // do not mark verified
-
-        let txn = fixture.begin_write()?;
-        {
-            let mut blobs = txn.write_blobs()?;
-            let mut tree = txn.write_tree()?;
-            assert_eq!(None, blobs.prepare_export(&mut tree, &path, &hash)?);
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn export_no_blob() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let path = Path::parse("baa/baa")?;
@@ -2115,10 +2064,7 @@ mod tests {
         {
             let mut blobs = txn.write_blobs()?;
             let mut tree = txn.write_tree()?;
-            assert_eq!(
-                None,
-                blobs.prepare_export(&mut tree, &path, &hash::digest("test"))?
-            );
+            assert_eq!(None, blobs.prepare_export(&mut tree, &path)?);
         }
 
         Ok(())
