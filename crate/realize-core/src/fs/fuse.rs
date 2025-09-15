@@ -1,19 +1,20 @@
 #![allow(dead_code)] // in progress
 use crate::fs::downloader::{Download, Downloader};
-use fuser::MountOption;
+use fuser::{FileType, MountOption};
 use nix::libc::{self, c_int};
 use realize_storage::{DirMetadata, FileMetadata, Filesystem, Inode, Metadata, StorageError};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::time::SystemTime;
-use std::{sync::Arc, time::Duration};
+use std::os::unix::fs::MetadataExt;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tokio_util::bytes::BufMut;
 
 /// Mount the cache as FUSE filesystem at the given mountpoint.
 pub fn export(
-    cache: Arc<Filesystem>,
+    fs: Arc<Filesystem>,
     downloader: Downloader,
     mountpoint: &std::path::Path,
     umask: u16,
@@ -21,7 +22,7 @@ pub fn export(
     let fs = RealizeFs {
         handle: Handle::current(),
         inner: Arc::new(InnerRealizeFs {
-            cache,
+            fs,
             downloader,
             umask,
             handles: Arc::new(Mutex::new(BTreeMap::new())),
@@ -438,7 +439,7 @@ impl fuser::Filesystem for RealizeFs {
 }
 
 struct InnerRealizeFs {
-    cache: Arc<Filesystem>,
+    fs: Arc<Filesystem>,
     downloader: Downloader,
     umask: u16,
     handles: Arc<Mutex<BTreeMap<u64, Arc<Mutex<Download>>>>>,
@@ -447,7 +448,7 @@ struct InnerRealizeFs {
 impl InnerRealizeFs {
     async fn lookup(&self, parent: u64, name: OsString) -> Result<fuser::FileAttr, FuseError> {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
-        let (pathid, metadata) = self.cache.lookup((Inode(parent), name)).await?;
+        let (pathid, metadata) = self.fs.lookup((Inode(parent), name)).await?;
         match metadata {
             Metadata::File(file_metadata) => Ok(self.build_file_attr(pathid, &file_metadata)),
             Metadata::Dir(dir_metadata) => Ok(self.build_dir_attr(pathid, dir_metadata)),
@@ -455,7 +456,7 @@ impl InnerRealizeFs {
     }
 
     async fn getattr(&self, ino: u64) -> Result<fuser::FileAttr, FuseError> {
-        let metadata = self.cache.metadata(Inode(ino)).await?;
+        let metadata = self.fs.metadata(Inode(ino)).await?;
         match metadata {
             Metadata::File(file_metadata) => Ok(self.build_file_attr(Inode(ino), &file_metadata)),
             Metadata::Dir(dir_metadata) => Ok(self.build_dir_attr(Inode(ino), dir_metadata)),
@@ -490,7 +491,7 @@ impl InnerRealizeFs {
         reply: &mut fuser::ReplyDirectory,
     ) -> Result<(), FuseError> {
         let mut entries = self
-            .cache
+            .fs
             .readdir(Inode(ino))
             .await
             .map_err(FuseError::Cache)?;
@@ -521,7 +522,7 @@ impl InnerRealizeFs {
 
     async fn unlink(&self, parent: u64, name: OsString) -> Result<(), FuseError> {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
-        self.cache.unlink((Inode(parent), name)).await?;
+        self.fs.unlink((Inode(parent), name)).await?;
 
         Ok(())
     }
@@ -533,10 +534,7 @@ impl InnerRealizeFs {
         name: OsString,
     ) -> Result<fuser::FileAttr, FuseError> {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
-        let (dest, metadata) = self
-            .cache
-            .branch(Inode(source), (Inode(parent), name))
-            .await?;
+        let (dest, metadata) = self.fs.branch(Inode(source), (Inode(parent), name)).await?;
 
         Ok(self.build_file_attr(dest, &metadata))
     }
@@ -550,7 +548,7 @@ impl InnerRealizeFs {
     ) -> Result<fuser::FileAttr, FuseError> {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
 
-        let (dest, metadata) = self.cache.mkdir((Inode(parent), name)).await?;
+        let (dest, metadata) = self.fs.mkdir((Inode(parent), name)).await?;
 
         Ok(self.build_dir_attr(dest, metadata))
     }
@@ -558,7 +556,7 @@ impl InnerRealizeFs {
     async fn rmdir(&self, parent: u64, name: OsString) -> Result<(), FuseError> {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
 
-        self.cache.rmdir((Inode(parent), name)).await?;
+        self.fs.rmdir((Inode(parent), name)).await?;
 
         Ok(())
     }
@@ -574,7 +572,7 @@ impl InnerRealizeFs {
         let old_name = old_name.to_str().ok_or(FuseError::Utf8)?;
         let new_name = new_name.to_str().ok_or(FuseError::Utf8)?;
 
-        self.cache
+        self.fs
             .rename(
                 (Inode(old_parent), old_name),
                 (Inode(new_parent), new_name),
@@ -608,7 +606,7 @@ impl InnerRealizeFs {
             gid,
             rdev: 0,
             blksize: 512,
-            flags: 0,
+            flags: 0, // macOS ony
         }
     }
 
