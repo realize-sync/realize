@@ -50,6 +50,7 @@ function up {
             --address "127.0.0.1:${port}" \
             --socket "${sockfile}" \
             --fuse "${this}/${inst}-fuse" \
+            --fuse-umask 007 \
             </dev/null >"${outfile}" 2>&1 &
         pid=$!
         echo $pid >"${pidfile}"
@@ -118,14 +119,15 @@ function merge {
         category.search=ff
         dropcacheonclose=false
         link_cow=true
+        minfreespace=0
     )
     sudo mergerfs \
          -o $(IFS=, ; echo "${opts[*]}")\
-         ${this}/one-a/data:${this}/a-fuse/one \
+         $(realpath ${this}/one-a/data)=RW:${this}/a-fuse/one=NC \
          ${this}/one-a/merged
     sudo mergerfs \
          -o $(IFS=, ; echo "${opts[*]}")\
-         ${this}/two-a/data:${this}/a-fuse/two \
+         $(realpath ${this}/two-a/data):${this}/a-fuse/two \
          ${this}/two-a/merged
 }
 
