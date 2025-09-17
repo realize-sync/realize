@@ -45,6 +45,12 @@ RUST_LOG=realize_=debug cargo test
 
 # Run single test with full output
 cargo test test_name -- --nocapture
+
+# Debug FUSE tests with detailed logging
+RUST_LOG=realize_=debug,fuser=debug cargo test fuse_test_name -- --nocapture
+
+# Run only FUSE tests (Linux only)
+cargo test --package realize-core fuse
 ```
 
 ### Executables
@@ -118,6 +124,16 @@ All network communication uses Cap'n Proto for:
 - Always call `flush().await?` after async writes
 - Use `tokio::fs::metadata(&path).await.is_ok()` instead of `path.exists()`
 
+### FUSE Testing Requirements
+**When testing FUSE filesystem operations:**
+- **Never use synchronous I/O** on FUSE mountpoints - it will hang in single-threaded test environments
+- **Always use `tokio::fs::*`** functions when accessing files through FUSE
+- **Avoid manual file handle management** - use `tokio::fs::write()` instead of opening/writing/closing manually
+- **Use `tokio::task::spawn_blocking`** for system calls like `chown()` that must be synchronous
+- **Always drop/close file handles** before attempting to unmount FUSE filesystems
+- **Use timeout wrappers** for potentially blocking operations: `tokio::time::timeout(Duration::from_secs(30), operation)`
+- **Test both FUSE mountpoint and underlying datadir** to verify writes are properly persisted
+
 ### Cap'n Proto Patterns
 When working with Cap'n Proto:
 - Use `reborrow()` when building nested structures to avoid ownership issues
@@ -146,3 +162,33 @@ The project has specific dependency requirements:
 - **Windows**: Planned but not yet supported
 
 Development should prioritize Linux compatibility, with macOS as a secondary target.
+
+## FUSE Development Notes
+
+### Common FUSE Test Issues
+**If FUSE tests hang, check for these common causes:**
+1. **Synchronous I/O deadlock**: Using `std::fs::*` instead of `tokio::fs::*` on FUSE mountpoints
+2. **File handle leaks**: Not properly closing file handles before unmounting
+3. **Blocking system calls**: Using synchronous syscalls like `chown()` without `spawn_blocking`
+4. **Manual file handle management**: Using `OpenOptions` with manual `read`/`write`/`flush` instead of `tokio::fs::write()`
+
+### FUSE Testing Patterns
+**Successful FUSE test pattern:**
+```rust
+// ✅ Good - uses tokio::fs throughout
+let content = tokio::fs::read_to_string(&fuse_path).await?;
+tokio::fs::write(&fuse_path, "new content").await?;
+let updated = tokio::fs::read_to_string(&fuse_path).await?;
+
+// ❌ Bad - will hang in tests
+let content = std::fs::read_to_string(&fuse_path)?;
+let mut file = std::fs::OpenOptions::new().write(true).open(&fuse_path)?;
+file.write_all(b"data")?;  // This will hang
+```
+
+### FUSE Architecture
+**File State Transitions:**
+- **Cached Files**: Exist in cache, accessed via `Download` reader for read-only operations
+- **Realized Files**: When opened for write, cached files are "realized" to actual files in the datadir
+- **Real Files**: Files that exist in the datadir and are mapped via the `realpaths` HashMap
+- Write operations always require file realization, which downloads the complete file content first
