@@ -70,10 +70,20 @@ impl StorageJobProcessor {
     fn process_job(&self, job: StorageJob) -> Option<Result<JobStatus, StorageError>> {
         match job {
             StorageJob::External(_) => None,
-            StorageJob::Unrealize(pathid, hash) => Some(self.unrealize(pathid, hash)),
-            StorageJob::Realize(pathid, hash, index_hash) => {
-                Some(self.realize(pathid, hash, index_hash))
-            }
+            StorageJob::Unrealize {
+                pathid,
+                common_hash,
+            } => Some(self.unrealize(pathid, common_hash)),
+            StorageJob::DropOutdated {
+                pathid,
+                cached_hash,
+                indexed_hash,
+            } => Some(self.drop_outdated(pathid, cached_hash, indexed_hash)),
+            StorageJob::Realize {
+                pathid,
+                cached_hash,
+                indexed_hash,
+            } => Some(self.realize(pathid, cached_hash, indexed_hash)),
             StorageJob::ProtectBlob(pathid) => Some(self.set_protected(pathid, true)),
             StorageJob::UnprotectBlob(pathid) => Some(self.set_protected(pathid, false)),
         }
@@ -97,7 +107,7 @@ impl StorageJobProcessor {
     /// versions in the cache or the current version in the index
     /// don't match `hash`.
     fn unrealize(&self, pathid: PathId, hash: Hash) -> Result<JobStatus, StorageError> {
-        let root = self.db.index().datadir();
+        let root = &self.db.index().datadir();
         let path: realize_types::Path;
         let realpath: PathBuf;
         let cachepath: PathBuf;
@@ -161,6 +171,60 @@ impl StorageJobProcessor {
         log::info!(
             "[{}] Unrealized {realpath:?} as \"{path}\" {hash}",
             self.db.arena()
+        );
+
+        return Ok(JobStatus::Done);
+    }
+
+    /// Delete a file from the index outdated by a cached file.
+    ///
+    /// Gives up and returns [JobStatus::Abandoned] if the current
+    /// versions in the cache or the current version in the index
+    /// don't match the expected hashes.
+    fn drop_outdated(
+        &self,
+        pathid: PathId,
+        cache_hash: Hash,
+        index_hash: Hash,
+    ) -> Result<JobStatus, StorageError> {
+        let path: realize_types::Path;
+        let realpath;
+        let txn = self.db.begin_write()?;
+        {
+            let mut tree = txn.write_tree()?;
+            let mut index = txn.write_index()?;
+            path = match tree.backtrack(pathid)? {
+                Some(v) => v,
+                None => return Ok(JobStatus::Abandoned("no_path")),
+            };
+            realpath = path.within(self.db.index().datadir());
+
+            let indexed = match index.get_at_pathid(pathid)? {
+                Some(v) => v,
+                None => return Ok(JobStatus::Abandoned("not_in_index")),
+            };
+            if indexed.hash != index_hash {
+                return Ok(JobStatus::Abandoned("indexed_version_mismatch"));
+            }
+            if !indexed.matches_file(&realpath) {
+                return Ok(JobStatus::Abandoned("file_mismatch"));
+            }
+            let cached = match txn.write_cache()?.file_at_pathid(pathid)? {
+                Some(v) => v,
+                None => return Ok(JobStatus::Abandoned("no_cache_entry")),
+            };
+            if cached.hash != cache_hash {
+                return Ok(JobStatus::Abandoned("cache_version_mismatch"));
+            }
+            let mut history = txn.write_history()?;
+            let mut dirty = txn.write_dirty()?;
+            index.drop(&mut tree, &mut history, &mut dirty, pathid)?;
+        }
+        txn.commit()?;
+        std::fs::remove_file(&realpath)?;
+        log::debug!(
+            "[{arena}] Dropped real {path:?} {index_hash}, outdated by cached {cache_hash}",
+            arena = self.db.arena()
         );
 
         return Ok(JobStatus::Done);
@@ -266,7 +330,9 @@ impl StorageJobProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arena::index::IndexedFile;
+    use crate::arena::history::HistoryReadOperations;
+    use crate::arena::index::{IndexExt, IndexedFile};
+    use crate::arena::types::HistoryTableEntry;
     use crate::utils::hash;
     use crate::{ArenaFilesystem, Blob, LocalAvailability, Mark, Notification, PathId};
     use assert_fs::TempDir;
@@ -439,6 +505,31 @@ mod tests {
             })
             .await?
         }
+
+        async fn drop_outdated(
+            &self,
+            path: &Path,
+            cached_hash: &Hash,
+            indexed_hash: &Hash,
+        ) -> anyhow::Result<JobStatus> {
+            log::debug!(
+                "[{arena}] DropOutdated \"{path}\" cached={cached_hash} indexed={indexed_hash}",
+                arena = self.processor.db.arena()
+            );
+            let pathid = self.pathid(path)?;
+            let processor = Arc::clone(&self.processor);
+            let arena = self.processor.db.arena();
+            let cached_hash = cached_hash.clone();
+            let indexed_hash = indexed_hash.clone();
+            tokio::task::spawn_blocking(move || {
+                let status = processor.drop_outdated(pathid, cached_hash, indexed_hash)?;
+
+                log::debug!("[{arena}] -> {status:?}", arena = arena);
+                Ok::<JobStatus, anyhow::Error>(status)
+            })
+            .await?
+        }
+
         async fn realize(
             &self,
             path: Path,
@@ -522,6 +613,47 @@ mod tests {
         assert!(fixture.find_in_index("test.txt")?.is_none());
         assert!(!fixture.file_exists("test.txt"));
         assert_eq!("", fixture.read_blob_content("test.txt").await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drop_outdated_success() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let indexed_hash = fixture
+            .create_indexed_file("dir/test.txt", "foobar")
+            .await?;
+        let cached_hash = hash::digest("cached");
+        fixture.add_to_cache("dir/test.txt", &indexed_hash, 6)?;
+        fixture.replace_in_cache("dir/test.txt", &indexed_hash, &cached_hash, 8)?;
+
+        let path = Path::parse("dir/test.txt")?;
+        assert_eq!(
+            JobStatus::Done,
+            fixture
+                .drop_outdated(&path, &cached_hash, &indexed_hash)
+                .await?
+        );
+
+        let txn = fixture.db.begin_read()?;
+        let tree = txn.read_tree()?;
+        let cache = txn.read_cache()?;
+        let index = txn.read_index()?;
+        let history = txn.read_history()?;
+        assert!(!index.has(&tree, &path)?);
+        assert!(!fixture.file_exists("dir/test.txt"));
+
+        assert!(cache.metadata(&tree, &path)?.is_some());
+
+        // The removal must be reported as a Drop, not Remove.
+        let history_entry = history
+            .history(history.last_history_index()?..)
+            .map(|res| res.map(|(_, e)| e))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            vec![HistoryTableEntry::Drop(path.clone(), indexed_hash)],
+            history_entry
+        );
 
         Ok(())
     }

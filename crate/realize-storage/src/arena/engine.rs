@@ -47,11 +47,26 @@ pub(crate) enum StorageJob {
     External(Job),
 
     /// Move file containing the given version into the cache.
-    Unrealize(PathId, Hash),
+    Unrealize {
+        pathid: PathId,
+        common_hash: Hash,
+    },
+
+    /// Drop indexed file with the second hash, outdated by cached file
+    /// with the first hash.
+    DropOutdated {
+        pathid: PathId,
+        cached_hash: Hash,
+        indexed_hash: Hash,
+    },
 
     /// Realize the given file with `counter`, moving `Hash` from
     /// cache to the index, currently containing nothing or `Hash`.
-    Realize(PathId, Hash, Option<Hash>),
+    Realize {
+        pathid: PathId,
+        cached_hash: Hash,
+        indexed_hash: Option<Hash>,
+    },
 
     /// Move the blob to the protected queue.
     ProtectBlob(PathId),
@@ -472,7 +487,7 @@ impl Engine {
                 if let Some(indexed) = indexed
                     && indexed.is_outdated_by(&hash)
                 {
-                    should_unrealize = Some(indexed.hash);
+                    should_unrealize = Some((hash.clone(), indexed.hash));
                 }
             } else if want_realize {
                 match indexed {
@@ -514,10 +529,24 @@ impl Engine {
             }
         }
         if let Some((hash, index_hash)) = should_realize {
-            return Ok(Some(StorageJob::Realize(pathid, hash, index_hash)));
+            return Ok(Some(StorageJob::Realize {
+                pathid,
+                cached_hash: hash,
+                indexed_hash: index_hash,
+            }));
         }
-        if let Some(hash) = should_unrealize {
-            return Ok(Some(StorageJob::Unrealize(pathid, hash)));
+        if let Some((cached_hash, index_hash)) = should_unrealize {
+            if cached_hash == index_hash {
+                return Ok(Some(StorageJob::Unrealize {
+                    pathid,
+                    common_hash: cached_hash,
+                }));
+            }
+            return Ok(Some(StorageJob::DropOutdated {
+                pathid,
+                cached_hash,
+                indexed_hash: index_hash,
+            }));
         }
 
         Ok(None)
@@ -613,6 +642,7 @@ mod tests {
     use crate::arena::index;
     use crate::arena::mark;
     use crate::arena::tree::TreeLoc;
+    use crate::utils::hash;
     use crate::utils::redb_utils;
     use assert_fs::TempDir;
     use futures::StreamExt as _;
@@ -997,7 +1027,11 @@ mod tests {
         let (new_job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
         assert!(new_job_id > job_id);
         assert_eq!(
-            StorageJob::Realize(fixture.pathid(&foobar)?, test_hash(), None),
+            StorageJob::Realize {
+                pathid: fixture.pathid(&foobar)?,
+                cached_hash: test_hash(),
+                indexed_hash: None
+            },
             job
         );
 
@@ -1053,7 +1087,14 @@ mod tests {
 
         let (new_job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
         assert!(new_job_id > job_id);
-        assert_eq!(StorageJob::Realize(pathid, test_hash(), None), job);
+        assert_eq!(
+            StorageJob::Realize {
+                pathid: pathid,
+                cached_hash: test_hash(),
+                indexed_hash: None
+            },
+            job
+        );
 
         Ok(())
     }
@@ -1096,7 +1137,41 @@ mod tests {
 
         let (new_job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
         assert!(new_job_id > job_id);
-        assert_eq!(StorageJob::Unrealize(pathid, test_hash()), job);
+        assert_eq!(
+            StorageJob::Unrealize {
+                pathid: pathid,
+                common_hash: test_hash()
+            },
+            job
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drop_outdated() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let foobar = Path::parse("foo/bar")?;
+
+        let version1 = hash::digest("version1");
+        fixture.add_file_to_index_with_version(&foobar, version1.clone())?;
+        fixture.add_file_to_cache_with_version(&foobar, version1.clone())?;
+
+        let version2 = hash::digest("version2");
+        fixture.replace(&foobar, version2.clone(), version1.clone())?;
+
+        let mut job_stream = fixture.engine.job_stream();
+
+        let (_, job) = next_with_timeout(&mut job_stream).await?.unwrap();
+        let pathid = fixture.pathid(&foobar)?;
+        assert_eq!(
+            StorageJob::DropOutdated {
+                pathid,
+                cached_hash: version2,
+                indexed_hash: version1
+            },
+            job
+        );
 
         Ok(())
     }
@@ -1118,7 +1193,14 @@ mod tests {
 
         let (_, job) = next_with_timeout(&mut job_stream).await?.unwrap();
         let pathid = fixture.pathid(&foobar)?;
-        assert_eq!(StorageJob::Realize(pathid, test_hash(), None), job);
+        assert_eq!(
+            StorageJob::Realize {
+                pathid: pathid,
+                cached_hash: test_hash(),
+                indexed_hash: None
+            },
+            job
+        );
 
         Ok(())
     }
@@ -1173,8 +1255,12 @@ mod tests {
         let job = next_with_timeout(&mut job_stream).await?.unwrap();
         assert_eq!(
             (
-                JobId(4),
-                StorageJob::Realize(fixture.pathid(&foobar)?, Hash([2; 32]), Some(Hash([1; 32])))
+                JobId(5),
+                StorageJob::Realize {
+                    pathid: fixture.pathid(&foobar)?,
+                    cached_hash: Hash([2; 32]),
+                    indexed_hash: Some(Hash([1; 32]))
+                }
             ),
             job
         );

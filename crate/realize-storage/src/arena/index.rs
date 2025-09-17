@@ -529,6 +529,7 @@ impl<'a> WritableOpenIndex<'a> {
     pub(crate) fn record_outdated<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &impl TreeReadOperations,
+        dirty: &mut WritableOpenDirty,
         loc: L,
         old_hash: &Hash,
         new_hash: &Hash,
@@ -552,6 +553,7 @@ impl<'a> WritableOpenIndex<'a> {
                 );
 
                 self.table.insert(pathid, Holder::with_content(entry)?)?;
+                dirty.mark_dirty(pathid, "outdated")?;
             }
         }
 
@@ -1555,7 +1557,7 @@ mod tests {
         )?;
 
         // Record that this version is outdated by the new hash
-        index.record_outdated(&tree, &path, &old_hash, &new_hash)?;
+        index.record_outdated(&tree, &mut dirty, &path, &old_hash, &new_hash)?;
 
         // Verify the entry was updated with outdated_by field
         let entry = index.get(&tree, &path)?.unwrap();
@@ -1592,7 +1594,7 @@ mod tests {
         )?;
 
         // Record that an unrelated hash is outdated by the new hash
-        index.record_outdated(&tree, &path, &unrelated_hash, &new_hash)?;
+        index.record_outdated(&tree, &mut dirty, &path, &unrelated_hash, &new_hash)?;
 
         // Verify the entry was NOT updated (outdated_by should remain None)
         let entry = index.get(&tree, &path)?.unwrap();

@@ -1675,6 +1675,55 @@ mod tests {
 
     #[tokio::test]
     #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn overwritten_file_removed_from_original() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                testing::connect(&household_a, b).await?;
+
+                fixture
+                    .inner
+                    .write_file_and_wait(b, a, "testfile.txt", "original")
+                    .await?;
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                let file_path = arena_path.join("testfile.txt");
+
+                tokio::fs::write(&file_path, "overwrite").await?;
+
+                // Check that the file has been written to datadir
+                let datadir_path = fixture.inner.arena_root(a).join("testfile.txt");
+                assert!(tokio::fs::metadata(&datadir_path).await.is_ok());
+
+                // file_in_b should be deleted from b, since it's marked watch (by default) and
+                // a now has the latest version.
+                let b_datadir = fixture.inner.arena_root(b);
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let file_in_b = b_datadir.join("testfile.txt");
+                while tokio::fs::metadata(&file_in_b).await.is_ok() && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert!(
+                    tokio::fs::metadata(&file_in_b).await.is_err(),
+                    "{file_in_b:?} should eventually be removed"
+                );
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
     async fn partially_overwrite_cached_file() -> anyhow::Result<()> {
         let mut fixture = FuseFixture::setup().await?;
         fixture
