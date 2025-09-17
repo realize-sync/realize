@@ -369,6 +369,30 @@ impl<'a> WritableOpenIndex<'a> {
         mtime: UnixTime,
         hash: Hash,
     ) -> Result<PathId, StorageError> {
+        self.add_internal(tree, Some(history), Some(dirty), loc, size, mtime, hash)
+    }
+
+    pub(crate) fn silent_add<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        loc: L,
+        size: u64,
+        mtime: UnixTime,
+        hash: Hash,
+    ) -> Result<PathId, StorageError> {
+        self.add_internal(tree, None, None, loc, size, mtime, hash)
+    }
+
+    fn add_internal<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        history: Option<&mut WritableOpenHistory>,
+        dirty: Option<&mut WritableOpenDirty>,
+        loc: L,
+        size: u64,
+        mtime: UnixTime,
+        hash: Hash,
+    ) -> Result<PathId, StorageError> {
         let loc = loc.into();
         let pathid = tree.setup(loc.borrow())?;
         let old_hash = self.indexed_hash(pathid);
@@ -382,8 +406,12 @@ impl<'a> WritableOpenIndex<'a> {
                 pathid,
                 Holder::with_content(FileTableEntry::new(path.clone(), size, mtime, hash))?,
             )?;
-            dirty.mark_dirty(pathid, "indexed")?;
-            history.report_added(&path, old_hash.as_ref())?;
+            if let Some(dirty) = dirty {
+                dirty.mark_dirty(pathid, "indexed")?;
+            }
+            if let Some(history) = history {
+                history.report_added(&path, old_hash.as_ref())?;
+            }
         }
         Ok(pathid)
     }
@@ -517,6 +545,11 @@ impl<'a> WritableOpenIndex<'a> {
                 // remote peer. This information is going to be used
                 // to download that newer version later on.
                 entry.outdated_by = Some(new_hash.clone());
+                log::debug!(
+                    "[{}] outdated: {} {old_hash}, new version: {new_hash})",
+                    self.arena,
+                    entry.path
+                );
 
                 self.table.insert(pathid, Holder::with_content(entry)?)?;
             }

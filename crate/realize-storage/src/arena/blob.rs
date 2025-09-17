@@ -9,7 +9,7 @@ use crate::utils::hash;
 use crate::utils::holder::Holder;
 use crate::{FileAvailability, StorageError};
 use priority_queue::PriorityQueue;
-use realize_types::Arena;
+use realize_types::{Arena, UnixTime};
 use realize_types::{ByteRange, ByteRanges, Hash};
 use redb::{ReadableTable, Table};
 use std::cmp::{Reverse, min};
@@ -1372,7 +1372,62 @@ impl Blob {
             .containing_range(offset)
             .map(|r| min(requested_len, (r.end - offset) as usize))
     }
+
+    /// Realize the blob, that is, move the file into the data
+    /// directory, and return the file handle.
+    pub async fn realize(mut self) -> Result<(std::path::PathBuf, tokio::fs::File), StorageError> {
+        let txn = self.db.begin_write()?;
+        let source: PathBuf;
+        let dest: PathBuf;
+        {
+            let mut tree = txn.write_tree()?;
+            let path = tree
+                .backtrack(self.info.pathid)?
+                .ok_or(StorageError::IsADirectory)?;
+            dest = path.within(self.db.index().datadir());
+
+            let mut blobs = txn.write_blobs()?;
+            let pathid = self.info.pathid;
+            // Create an entry without broadcasting it, as it's going
+            // to be modified.
+            let mut index = txn.write_index()?;
+            index.silent_add(
+                &mut tree,
+                pathid,
+                self.info.size,
+                // mtime really doesn't matter as long as it doesn't
+                // match the real file mtime, because the file should
+                // be re-processed by the watcher.
+                //
+                // TODO: This is a sign that creating a dummy entry
+                // juts to get old_hash property set in future
+                // notifications from the index is not the right
+                // solution. Clean this up.
+                UnixTime::ZERO,
+                self.info.hash.clone(),
+            )?;
+            source = blobs
+                .prepare_export(&mut tree, pathid)?
+                .ok_or(StorageError::Unavailable)?;
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        self.file.flush().await?;
+        self.file.sync_all().await?;
+        std::fs::rename(&source, &dest)?;
+        if let Err(err) = txn.commit() {
+            let _ = std::fs::rename(&dest, &source);
+            return Err(err);
+        }
+
+        // Since Blob implements Drop, we can't just take file out.
+        // Cloning works in this case, as the first file gets dropped
+        // right after.
+        Ok((dest, self.file.try_clone().await?))
+    }
 }
+
 impl Drop for Blob {
     fn drop(&mut self) {
         let blobs = self.db.blobs();
@@ -1514,6 +1569,7 @@ mod tests {
     use super::*;
     use crate::arena::db::{ArenaReadTransaction, ArenaWriteTransaction};
     use crate::arena::dirty::DirtyReadOperations;
+    use crate::arena::index::IndexExt;
     use crate::utils::hash;
     use crate::{Mark, PathId};
     use assert_fs::TempDir;
@@ -3194,6 +3250,67 @@ mod tests {
 
         shutdown.cancel();
         handle.await?;
+
+        Ok(())
+    }
+
+    fn collect_history_entries(
+        history: &impl crate::arena::history::HistoryReadOperations,
+    ) -> Result<Vec<crate::arena::types::HistoryTableEntry>, StorageError> {
+        history
+            .history(0..)
+            .map(|res| res.map(|(_, e)| e))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn realize_blob() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let path = Path::parse("test/file.txt")?;
+        let test_data = "Hello, blob world!";
+
+        // Arrange: Create a blob with the expected data (but no partial data initially)
+        let blob_info = fixture.create_blob_with_partial_data(&path, test_data, 0)?;
+
+        let mut blob = Blob::open(&fixture.db, &path)?;
+
+        // Act: Download data using update/update_db
+        blob.update(0, test_data.as_bytes()).await?;
+        blob.update_db().await?;
+
+        // Realize the blob
+        let (realized_path, mut file) = blob.realize().await?;
+
+        // Verify the file contains the downloaded content
+        let mut buf = String::new();
+        file.seek(SeekFrom::Start(0)).await?;
+        file.read_to_string(&mut buf).await?;
+        assert_eq!(test_data, buf);
+
+        // Make sure the path point to the file.
+        let m_from_file = file.metadata().await?;
+        let m_from_path = tokio::fs::metadata(&realized_path).await?;
+        assert_eq!(
+            (m_from_file.rdev(), m_from_file.ino()),
+            (m_from_path.rdev(), m_from_path.ino())
+        );
+
+        // Verify an entry was added to the index with the old hash
+        let txn = fixture.begin_read()?;
+        let index = txn.read_index()?;
+        let tree = txn.read_tree()?;
+        let indexed = index.get(&tree, &path)?.unwrap();
+        assert_eq!(blob_info.hash, indexed.hash);
+
+        // Verify no history entry was added (the old version should
+        // not be broadcast)
+        let history = txn.read_history()?;
+        let history_entries = collect_history_entries(&history)?;
+        assert!(
+            history_entries.is_empty(),
+            "Expected no history entries, but found: {:?}",
+            history_entries
+        );
 
         Ok(())
     }
