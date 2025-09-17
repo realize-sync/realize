@@ -548,10 +548,8 @@ impl InnerRealizeFs {
         let (inode, metadata) = self.fs.lookup((Inode(parent), name)).await?;
         match metadata {
             Metadata::File(file_metadata) => {
-                if let Some(realpath) = self.get_realpath(inode.as_u64()).await {
-                    if let Ok(m) = realpath.metadata() {
-                        return Ok(metadata_to_attr(&m, inode.as_u64()));
-                    }
+                if let Some((_, m)) = self.get_realpath(inode.as_u64()).await {
+                    return Ok(metadata_to_attr(&m, inode.as_u64()));
                 }
                 Ok(self.build_file_attr(inode, &file_metadata))
             }
@@ -566,10 +564,8 @@ impl InnerRealizeFs {
                 return Ok(metadata_to_attr(&file.metadata().await?, ino));
             }
         }
-        if let Some(realpath) = self.get_realpath(ino).await {
-            if let Ok(m) = realpath.metadata() {
-                return Ok(metadata_to_attr(&m, ino));
-            }
+        if let Some((_, m)) = self.get_realpath(ino).await {
+            return Ok(metadata_to_attr(&m, ino));
         }
 
         let metadata = self.fs.metadata(Inode(ino)).await?;
@@ -636,7 +632,7 @@ impl InnerRealizeFs {
                 return Ok(metadata_to_attr(&file.metadata().await?, ino));
             }
         }
-        if let Some(realpath) = self.get_realpath(ino).await {
+        if let Some((realpath, _)) = self.get_realpath(ino).await {
             log::debug!("SETATTR {ino}: Truncate file, mapped to {realpath:?} to {size}");
             if let Ok(file) = tokio::fs::OpenOptions::new()
                 .write(true)
@@ -689,8 +685,14 @@ impl InnerRealizeFs {
 
     async fn unlink(&self, parent: u64, name: OsString) -> Result<(), FuseError> {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
-        // TODO: detect realpath
-        self.fs.unlink((Inode(parent), name)).await?;
+        let (inode, _) = self.fs.lookup((Inode(parent), name)).await?;
+        if let Some((realpath, _)) = self.get_realpath(inode.as_u64()).await {
+            tokio::fs::remove_file(realpath).await?;
+            self.realpaths.lock().await.remove(&inode.as_u64());
+            return Ok(());
+        }
+
+        self.fs.unlink(inode).await?;
 
         Ok(())
     }
@@ -703,9 +705,7 @@ impl InnerRealizeFs {
     ) -> Result<fuser::FileAttr, FuseError> {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
 
-        if let Some(realpath) = self.get_realpath(source).await
-            && tokio::fs::metadata(&realpath).await.is_ok()
-        {
+        if self.get_realpath(source).await.is_some() {
             return Err(FuseError::Errno(libc::EXDEV));
         }
         let (dest, metadata) = self.fs.branch(Inode(source), (Inode(parent), name)).await?;
@@ -745,14 +745,14 @@ impl InnerRealizeFs {
     ) -> Result<(), FuseError> {
         let old_name = old_name.to_str().ok_or(FuseError::Utf8)?;
         let new_name = new_name.to_str().ok_or(FuseError::Utf8)?;
+        let (source, _) = self.fs.lookup((Inode(old_parent), old_name)).await?;
+        if self.get_realpath(source.as_u64()).await.is_some() {
+            // Rename must be executed on the real path.
+            return Err(FuseError::Errno(libc::EXDEV));
+        }
 
-        // TODO: detect realpath and return EXDEV
         self.fs
-            .rename(
-                (Inode(old_parent), old_name),
-                (Inode(new_parent), new_name),
-                noreplace,
-            )
+            .rename(source, (Inode(new_parent), new_name), noreplace)
             .await?;
 
         Ok(())
@@ -760,9 +760,7 @@ impl InnerRealizeFs {
 
     async fn open(&self, ino: u64, flags: i32) -> Result<(u64, u32), FuseError> {
         let mode = flags & (libc::O_RDONLY | libc::O_WRONLY | libc::O_RDWR);
-        let handle = if let Some(realpath) = self.get_realpath(ino).await
-            && tokio::fs::metadata(&realpath).await.is_ok()
-        {
+        let handle = if let Some((realpath, _)) = self.get_realpath(ino).await {
             log::debug!("Opening Inode({ino}), mapped to {realpath:?}");
             FileHandle::Real(openoptions_from_flags(flags).open(&realpath).await?)
         } else if mode == libc::O_RDONLY {
@@ -843,10 +841,19 @@ impl InnerRealizeFs {
         }
     }
 
-    async fn get_realpath(&self, ino: u64) -> Option<PathBuf> {
-        let guard = self.realpaths.lock().await;
+    async fn get_realpath(&self, ino: u64) -> Option<(PathBuf, std::fs::Metadata)> {
+        let realpath = {
+            let guard = self.realpaths.lock().await;
 
-        guard.get(&ino).cloned()
+            guard.get(&ino).cloned()
+        };
+        if let Some(realpath) = realpath {
+            if let Ok(m) = tokio::fs::metadata(&realpath).await {
+                return Some((realpath, m));
+            }
+        }
+
+        None
     }
 
     fn build_file_attr(&self, pathid: Inode, metadata: &FileMetadata) -> fuser::FileAttr {
@@ -2080,6 +2087,146 @@ mod tests {
             })
             .await?;
         fixture.unmount().await?;
+        Ok(())
+    }
+
+    /// Test unlink behavior on cached files that were just overwritten.
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn unlink_overwritten_cached_file() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+
+                // Create file in peer B and wait for sync to A's cache
+                fixture
+                    .inner
+                    .write_file_and_wait(b, a, "test_file.txt", "original content")
+                    .await?;
+
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                let file_path = arena_path.join("test_file.txt");
+
+                tokio::fs::write(&file_path, "new overwritten content").await?;
+
+                fs::remove_file(&file_path).await.unwrap();
+
+                // Remove file applies on the overwritten file, in datadir.
+                let datadir_path = fixture.inner.arena_root(a).join("testfile.txt");
+                assert!(tokio::fs::metadata(datadir_path).await.is_err());
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+
+        Ok(())
+    }
+
+    /// Test link behavior on cached files that were just overwritten.
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn link_overwritten_cached_file() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+
+                fixture
+                    .inner
+                    .write_file_and_wait(b, a, "link_test.txt", "original content")
+                    .await?;
+
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                let file_path = arena_path.join("link_test.txt");
+                let link_path = arena_path.join("link_test_link.txt");
+
+                tokio::fs::write(&file_path, "new overwritten content").await?;
+
+                let link_result = fs::hard_link(&file_path, &link_path).await;
+                assert_eq!(
+                    Some(libc::EXDEV),
+                    link_result.err().and_then(|e| e.raw_os_error()),
+                    "Link should fail with EXDEV on overwritten cached file"
+                );
+
+                // Verify no link was created
+                assert!(fs::metadata(&link_path).await.is_err());
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+
+        Ok(())
+    }
+
+    /// Test rename behavior on cached files that were just overwritten.
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn rename_overwritten_cached_file() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                testing::connect(&household_a, b).await?;
+
+                fixture
+                    .inner
+                    .write_file_and_wait(b, a, "rename_test.txt", "original content")
+                    .await?;
+
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                let file_path = arena_path.join("rename_test.txt");
+                let new_path = arena_path.join("rename_test_new.txt");
+
+                tokio::fs::write(&file_path, "new overwritten content").await?;
+
+                let rename_result = fs::rename(&file_path, &new_path).await;
+                assert_eq!(
+                    Some(libc::EXDEV),
+                    rename_result.err().and_then(|e| e.raw_os_error()),
+                    "Rename should fail with EXDEV on overwritten cached file"
+                );
+
+                // Verify no new file was created
+                assert!(fs::metadata(&new_path).await.is_err());
+
+                // Verify original file is still accessible at original location
+                assert_eq!(
+                    "new overwritten content",
+                    fs::read_to_string(&file_path).await?
+                );
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+
         Ok(())
     }
 }
