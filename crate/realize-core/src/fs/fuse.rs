@@ -1,13 +1,17 @@
 #![allow(dead_code)] // in progress
 use crate::fs::downloader::{Download, Downloader};
+use crate::rpc::HouseholdOperationError;
 use fuser::{FileType, MountOption};
 use nix::libc::{self, c_int};
 use realize_storage::{DirMetadata, FileMetadata, Filesystem, Inode, Metadata, StorageError};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
+use std::io::SeekFrom;
 use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tokio_util::bytes::BufMut;
@@ -26,6 +30,7 @@ pub fn export(
             downloader,
             umask,
             handles: Arc::new(Mutex::new(BTreeMap::new())),
+            realpaths: Arc::new(Mutex::new(HashMap::new())),
         }),
     };
     let bgsession = fuser::spawn_mount2(
@@ -109,29 +114,65 @@ impl fuser::Filesystem for RealizeFs {
         });
     }
 
-    fn forget(&mut self, _req: &fuser::Request<'_>, _ino: u64, _nlookup: u64) {}
-
-    fn batch_forget(&mut self, req: &fuser::Request<'_>, nodes: &[fuser::fuse_forget_one]) {
-        for node in nodes {
-            self.forget(req, node.nodeid, node.nlookup);
-        }
-    }
-
     fn getattr(
         &mut self,
         _req: &fuser::Request<'_>,
         ino: u64,
-        _fh: Option<u64>,
+        fh: Option<u64>,
         reply: fuser::ReplyAttr,
     ) {
         let inner = Arc::clone(&self.inner);
 
         self.handle.spawn(async move {
-            match inner.getattr(ino).await {
+            match inner.getattr(ino, fh).await {
                 Err(err) => reply.error(err.log_and_convert()),
                 Ok(attr) => reply.attr(&Duration::from_secs(1), &attr),
             }
         });
+    }
+
+    /// Set file attributes.
+    fn setattr(
+        &mut self,
+        req: &fuser::Request<'_>,
+        ino: u64,
+        _mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<fuser::TimeOrNow>,
+        _mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<u32>,
+        reply: fuser::ReplyAttr,
+    ) {
+        if uid.is_some_and(|uid| uid != nix::unistd::getuid().as_raw())
+            || gid.is_some_and(|gid| gid != nix::unistd::getgid().as_raw())
+        {
+            log::debug!("SETATTR Inode({ino}): cannot change uid or gid");
+            reply.error(libc::EPERM);
+            return;
+        }
+
+        if let Some(size) = size {
+            let inner = Arc::clone(&self.inner);
+
+            self.handle.spawn(async move {
+                match inner.truncate(ino, fh, size).await {
+                    Err(err) => reply.error(err.log_and_convert()),
+                    Ok(attr) => reply.attr(&Duration::from_secs(1), &attr),
+                }
+            });
+            return;
+        }
+
+        // Ignore the rest
+        log::debug!("SETATTR {ino}: ignore");
+        self.getattr(req, ino, fh, reply)
     }
 
     fn readlink(&mut self, _req: &fuser::Request<'_>, ino: u64, reply: fuser::ReplyData) {
@@ -163,8 +204,18 @@ impl fuser::Filesystem for RealizeFs {
         let inner = Arc::clone(&self.inner);
 
         self.handle.spawn(async move {
-            inner.release(fh).await;
-            reply.ok();
+            match inner.release(fh).await {
+                Err(err) => reply.error(err.log_and_convert()),
+                Ok(()) => reply.ok(),
+            }
+        });
+    }
+
+    fn forget(&mut self, _req: &fuser::Request<'_>, ino: u64, _nlookup: u64) {
+        let inner = Arc::clone(&self.inner);
+
+        self.handle.spawn(async move {
+            inner.forget(ino).await;
         });
     }
 
@@ -185,6 +236,46 @@ impl fuser::Filesystem for RealizeFs {
             match inner.read(fh, offset, size).await {
                 Err(err) => reply.error(err.log_and_convert()),
                 Ok(data) => reply.data(&data),
+            }
+        });
+    }
+
+    fn write(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: fuser::ReplyWrite,
+    ) {
+        let inner = Arc::clone(&self.inner);
+        let data = data.to_vec();
+        self.handle.spawn(async move {
+            match inner.write(fh, offset, &data).await {
+                Err(err) => reply.error(err.log_and_convert()),
+                Ok(nbytes) => reply.written(nbytes),
+            }
+        });
+    }
+
+    fn flush(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        fh: u64,
+        _lock_owner: u64,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let inner = Arc::clone(&self.inner);
+
+        self.handle.spawn(async move {
+            match inner.flush(fh).await {
+                Err(err) => reply.error(err.log_and_convert()),
+                Ok(()) => reply.ok(),
             }
         });
     }
@@ -442,20 +533,45 @@ struct InnerRealizeFs {
     fs: Arc<Filesystem>,
     downloader: Downloader,
     umask: u16,
-    handles: Arc<Mutex<BTreeMap<u64, Arc<Mutex<Download>>>>>,
+    handles: Arc<Mutex<BTreeMap<u64, Arc<Mutex<FileHandle>>>>>,
+    realpaths: Arc<Mutex<HashMap<u64, PathBuf>>>,
+}
+
+enum FileHandle {
+    Cached(Download),
+    Real(tokio::fs::File),
 }
 
 impl InnerRealizeFs {
     async fn lookup(&self, parent: u64, name: OsString) -> Result<fuser::FileAttr, FuseError> {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
-        let (pathid, metadata) = self.fs.lookup((Inode(parent), name)).await?;
+        let (inode, metadata) = self.fs.lookup((Inode(parent), name)).await?;
         match metadata {
-            Metadata::File(file_metadata) => Ok(self.build_file_attr(pathid, &file_metadata)),
-            Metadata::Dir(dir_metadata) => Ok(self.build_dir_attr(pathid, dir_metadata)),
+            Metadata::File(file_metadata) => {
+                if let Some(realpath) = self.get_realpath(inode.as_u64()).await {
+                    if let Ok(m) = realpath.metadata() {
+                        return Ok(metadata_to_attr(&m, inode.as_u64()));
+                    }
+                }
+                Ok(self.build_file_attr(inode, &file_metadata))
+            }
+            Metadata::Dir(dir_metadata) => Ok(self.build_dir_attr(inode, dir_metadata)),
         }
     }
 
-    async fn getattr(&self, ino: u64) -> Result<fuser::FileAttr, FuseError> {
+    async fn getattr(&self, ino: u64, fh: Option<u64>) -> Result<fuser::FileAttr, FuseError> {
+        if let Some(fh) = fh {
+            let handle = self.get_handle(fh).await?;
+            if let FileHandle::Real(file) = &*handle.lock().await {
+                return Ok(metadata_to_attr(&file.metadata().await?, ino));
+            }
+        }
+        if let Some(realpath) = self.get_realpath(ino).await {
+            if let Ok(m) = realpath.metadata() {
+                return Ok(metadata_to_attr(&m, ino));
+            }
+        }
+
         let metadata = self.fs.metadata(Inode(ino)).await?;
         match metadata {
             Metadata::File(file_metadata) => Ok(self.build_file_attr(Inode(ino), &file_metadata)),
@@ -464,24 +580,75 @@ impl InnerRealizeFs {
     }
 
     async fn read(&self, fh: u64, offset: i64, size: u32) -> Result<Vec<u8>, FuseError> {
-        let reader = {
-            let handles = self.handles.lock().await;
-            match handles.get(&fh) {
-                None => return Err(FuseError::Errno(libc::EINVAL)),
-                Some(h) => Arc::clone(h),
-            }
-        };
-        // As requested by FUSE: Read as much as possible up to size
-        // (no short reads). Only stop if EOF is reached.
+        let handle = self.get_handle(fh).await?;
         let size = size as usize;
-        let mut buffer = Vec::with_capacity(size).limit(size);
-        let mut reader = reader.lock().await;
 
         // TODO: clarify type situation for offset. offset is i64 in
         // fuser, but u64 in libfuse and Linux. What's happening?
-        reader.read_all_at(offset as u64, &mut buffer).await?;
+        let offset = offset as u64;
+        let mut buffer = Vec::with_capacity(size).limit(size);
+        match &mut *handle.lock().await {
+            FileHandle::Cached(reader) => {
+                reader.read_all_at(offset, &mut buffer).await?;
+            }
+            FileHandle::Real(file) => {
+                file.seek(SeekFrom::Start(offset)).await?;
+                while buffer.has_remaining_mut() {
+                    if file.read_buf(&mut buffer).await? == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        // Note: As requested by FUSE: the above reads as much as
+        // possible up to size (no short reads). Only stop if EOF is
+        // reached.
 
         Ok(buffer.into_inner())
+    }
+
+    async fn write(&self, fh: u64, offset: i64, data: &[u8]) -> Result<u32, FuseError> {
+        let handle = self.get_handle(fh).await?;
+        let offset = offset as u64; // TODO: clarify type situation for offset.
+        match &mut *handle.lock().await {
+            FileHandle::Cached(_) => Err(FuseError::Errno(libc::EBADF)),
+            FileHandle::Real(file) => {
+                file.seek(SeekFrom::Start(offset)).await?;
+                file.write_all(data).await?;
+
+                Ok(data.len() as u32)
+            }
+        }
+    }
+
+    async fn truncate(
+        &self,
+        ino: u64,
+        fh: Option<u64>,
+        size: u64,
+    ) -> Result<fuser::FileAttr, FuseError> {
+        if let Some(fh) = fh {
+            let handle = self.get_handle(fh).await?;
+            if let FileHandle::Real(file) = &mut *handle.lock().await {
+                file.set_len(size).await?;
+                log::debug!("SETATTR {ino}: Truncate file FH#{fh} to {size}");
+
+                return Ok(metadata_to_attr(&file.metadata().await?, ino));
+            }
+        }
+        if let Some(realpath) = self.get_realpath(ino).await {
+            log::debug!("SETATTR {ino}: Truncate file, mapped to {realpath:?} to {size}");
+            if let Ok(file) = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&realpath)
+                .await
+            {
+                file.set_len(size).await?;
+                return Ok(metadata_to_attr(&file.metadata().await?, ino));
+            }
+        }
+
+        return Err(FuseError::Errno(libc::EBADF));
     }
 
     async fn readdir(
@@ -522,6 +689,7 @@ impl InnerRealizeFs {
 
     async fn unlink(&self, parent: u64, name: OsString) -> Result<(), FuseError> {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
+        // TODO: detect realpath
         self.fs.unlink((Inode(parent), name)).await?;
 
         Ok(())
@@ -534,6 +702,12 @@ impl InnerRealizeFs {
         name: OsString,
     ) -> Result<fuser::FileAttr, FuseError> {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
+
+        if let Some(realpath) = self.get_realpath(source).await
+            && tokio::fs::metadata(&realpath).await.is_ok()
+        {
+            return Err(FuseError::Errno(libc::EXDEV));
+        }
         let (dest, metadata) = self.fs.branch(Inode(source), (Inode(parent), name)).await?;
 
         Ok(self.build_file_attr(dest, &metadata))
@@ -572,6 +746,7 @@ impl InnerRealizeFs {
         let old_name = old_name.to_str().ok_or(FuseError::Utf8)?;
         let new_name = new_name.to_str().ok_or(FuseError::Utf8)?;
 
+        // TODO: detect realpath and return EXDEV
         self.fs
             .rename(
                 (Inode(old_parent), old_name),
@@ -581,6 +756,97 @@ impl InnerRealizeFs {
             .await?;
 
         Ok(())
+    }
+
+    async fn open(&self, ino: u64, flags: i32) -> Result<(u64, u32), FuseError> {
+        let mode = flags & (libc::O_RDONLY | libc::O_WRONLY | libc::O_RDWR);
+        let handle = if let Some(realpath) = self.get_realpath(ino).await
+            && tokio::fs::metadata(&realpath).await.is_ok()
+        {
+            log::debug!("Opening Inode({ino}), mapped to {realpath:?}");
+            FileHandle::Real(openoptions_from_flags(flags).open(&realpath).await?)
+        } else if mode == libc::O_RDONLY {
+            let reader = self.downloader.reader(Inode(ino)).await?;
+            log::debug!("Opened Inode({ino}) read-only (download enabled)");
+
+            FileHandle::Cached(reader)
+        } else {
+            log::debug!("Opening {ino}; realizing it first...");
+            let blob = self.downloader.complete_blob(Inode(ino)).await?;
+            let (path, file) = blob.realize().await?;
+            log::debug!("Map Inode({ino}) to {path:?}");
+            self.realpaths.lock().await.insert(ino, path.clone());
+
+            log::debug!("File at Inode({ino}) realized successfully");
+            if (flags & libc::O_TRUNC) != 0 {
+                // TODO: don't bother downloading in this case and when
+                // setattr is called immediately after open
+                file.set_len(0).await?;
+                log::debug!("File at Inode({ino}) truncated");
+            }
+            if (flags & libc::O_APPEND) != 0 {
+                drop(file);
+
+                FileHandle::Real(openoptions_from_flags(flags).open(path).await?)
+            } else {
+                FileHandle::Real(file)
+            }
+        };
+        let mut handles = self.handles.lock().await;
+        let fh = handles.last_key_value().map(|(k, _)| *k + 1).unwrap_or(1);
+        log::debug!("Opened file Inode({ino}) as FH#{fh}");
+        handles.insert(fh, Arc::new(Mutex::new(handle)));
+
+        return Ok((fh, 0));
+    }
+
+    async fn flush(&self, fh: u64) -> Result<(), FuseError> {
+        let handle = self.get_handle(fh).await?;
+        match &mut *handle.lock().await {
+            FileHandle::Cached(_) => {}
+            FileHandle::Real(file) => {
+                log::debug!("Flush FH#{fh}");
+                file.flush().await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn forget(&self, ino: u64) {
+        if let Some(realpath) = self.realpaths.lock().await.remove(&ino) {
+            log::debug!("Forget mapping from Inode({ino}) to {realpath:?}");
+        }
+    }
+
+    async fn release(&self, fh: u64) -> Result<(), FuseError> {
+        let mut handles = self.handles.lock().await;
+        if let Some(handle) = handles.remove(&fh) {
+            match &mut *handle.lock().await {
+                FileHandle::Cached(_) => {}
+                FileHandle::Real(file) => {
+                    log::debug!("Flush FH#{fh}");
+                    file.flush().await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get a [FileHandle] from its ID.
+    async fn get_handle(&self, fh: u64) -> Result<Arc<Mutex<FileHandle>>, FuseError> {
+        let handles = self.handles.lock().await;
+        match handles.get(&fh) {
+            None => Err(FuseError::Errno(libc::EBADF)),
+            Some(h) => Ok(Arc::clone(h)),
+        }
+    }
+
+    async fn get_realpath(&self, ino: u64) -> Option<PathBuf> {
+        let guard = self.realpaths.lock().await;
+
+        guard.get(&ino).cloned()
     }
 
     fn build_file_attr(&self, pathid: Inode, metadata: &FileMetadata) -> fuser::FileAttr {
@@ -636,24 +902,17 @@ impl InnerRealizeFs {
             flags: 0,
         }
     }
+}
 
-    async fn open(&self, ino: u64, flags: i32) -> Result<(u64, u32), FuseError> {
-        if (flags & (libc::O_RDONLY | libc::O_WRONLY | libc::O_RDWR)) != libc::O_RDONLY {
-            return Err(FuseError::Errno(libc::ENOSYS));
-        }
+fn openoptions_from_flags(flags: i32) -> tokio::fs::OpenOptions {
+    let mut opt = tokio::fs::OpenOptions::new();
+    let mode = flags & (libc::O_RDONLY | libc::O_WRONLY | libc::O_RDWR);
+    opt.write(mode == libc::O_WRONLY || mode == libc::O_RDWR)
+        .read(mode == libc::O_RDONLY || mode == libc::O_RDWR)
+        .truncate((flags & libc::O_TRUNC) != 0)
+        .append((flags & libc::O_APPEND) != 0);
 
-        let reader = self.downloader.reader(Inode(ino)).await?;
-        let mut handles = self.handles.lock().await;
-        let fh = handles.last_key_value().map(|(k, _)| *k + 1).unwrap_or(1);
-        handles.insert(fh, Arc::new(Mutex::new(reader)));
-
-        Ok((fh, 0))
-    }
-
-    async fn release(&self, fh: u64) {
-        let mut handles = self.handles.lock().await;
-        handles.remove(&fh);
-    }
+    opt
 }
 
 /// Intermediate error type to catch and convert to libc errno to
@@ -662,6 +921,9 @@ impl InnerRealizeFs {
 enum FuseError {
     #[error(transparent)]
     Cache(#[from] StorageError),
+
+    #[error(transparent)]
+    Rpc(#[from] HouseholdOperationError),
 
     #[error("invalid UTF-8 string")]
     Utf8,
@@ -681,6 +943,7 @@ impl FuseError {
             FuseError::Utf8 => libc::EINVAL,
             FuseError::Io(ioerr) => io_errno(ioerr.kind()),
             FuseError::Errno(errno) => *errno,
+            FuseError::Rpc(err) => io_errno(err.io_kind()),
         }
     }
 
@@ -738,11 +1001,42 @@ fn io_errno(kind: std::io::ErrorKind) -> c_int {
     }
 }
 
+// Build a FileAttr from a real file metadata and map it to `ino`.
+fn metadata_to_attr(m: &std::fs::Metadata, ino: u64) -> fuser::FileAttr {
+    fuser::FileAttr {
+        ino,
+        size: m.len(),
+        blocks: m.blocks(),
+        atime: m.accessed().unwrap_or(SystemTime::UNIX_EPOCH),
+        mtime: m.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        ctime: SystemTime::UNIX_EPOCH + Duration::from_secs(m.ctime() as u64),
+        crtime: m.created().unwrap_or(SystemTime::UNIX_EPOCH),
+        kind: match m.mode() & libc::S_IFMT {
+            libc::S_IFIFO => FileType::NamedPipe,
+            libc::S_IFCHR => FileType::CharDevice,
+            libc::S_IFBLK => FileType::BlockDevice,
+            libc::S_IFDIR => FileType::Directory,
+            libc::S_IFREG => FileType::RegularFile,
+            libc::S_IFLNK => FileType::Symlink,
+            libc::S_IFSOCK => FileType::Socket,
+            _ => FileType::RegularFile,
+        },
+        perm: (m.mode() & 0xffff) as u16,
+        nlink: 1,
+        uid: m.uid(),
+        gid: m.gid(),
+        rdev: m.rdev() as u32,
+        blksize: m.blksize() as u32,
+        flags: 0, // macOS only
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::rpc::testing::{self, HouseholdFixture};
     use realize_storage::utils::hash;
+    use std::io::Write;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::PathBuf;
     use std::time::Instant;
@@ -913,14 +1207,11 @@ mod tests {
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
 
-                // Create a file in peer B's arena
-                fixture.inner.write_file(b, "somefile.txt", "test!").await?;
                 fixture
                     .inner
-                    .wait_for_file_in_cache(a, "somefile.txt", &hash::digest("test!"))
+                    .write_file_and_wait(b, a, "somefile.txt", "test!")
                     .await?;
 
-                // Mount the filesystem
                 fixture.mount(household_a).await?;
 
                 let mount_path = fixture.mount_path();
@@ -956,12 +1247,9 @@ mod tests {
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
 
-                let b_dir = fixture.inner.arena_root(b);
-                let file = b_dir.join("hello.txt");
-                fs::write(&file, "world").await?;
                 fixture
                     .inner
-                    .wait_for_file_in_cache(a, "hello.txt", &hash::digest("world"))
+                    .write_file_and_wait(b, a, "hello.txt", "world")
                     .await?;
 
                 // Mount the filesystem and access its content through
@@ -1084,18 +1372,12 @@ mod tests {
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
 
-                // Create a file in peer B's arena
                 fixture
                     .inner
-                    .write_file(b, "todelete.txt", "delete me")
+                    .write_file_and_wait(b, a, "todelete.txt", "delete me")
                     .await?;
                 let realpath_in_b = fixture.inner.arena_root(b).join("todelete.txt");
                 assert!(fs::metadata(&realpath_in_b).await.is_ok());
-
-                fixture
-                    .inner
-                    .wait_for_file_in_cache(a, "todelete.txt", &hash::digest("delete me"))
-                    .await?;
 
                 fixture.mount(household_a).await?;
 
@@ -1140,18 +1422,12 @@ mod tests {
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
 
-                // Create a file in peer B's arena
                 fixture
                     .inner
-                    .write_file(b, "source.txt", "source content")
+                    .write_file_and_wait(b, a, "source.txt", "source content")
                     .await?;
                 let realpath_in_b = fixture.inner.arena_root(b).join("source.txt");
                 assert!(fs::metadata(&realpath_in_b).await.is_ok());
-
-                fixture
-                    .inner
-                    .wait_for_file_in_cache(a, "source.txt", &hash::digest("source content"))
-                    .await?;
 
                 fixture.mount(household_a).await?;
 
@@ -1197,20 +1473,9 @@ mod tests {
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
 
-                // Create a directory with a file in peer B's arena
-                let b_dir = fixture.inner.arena_root(b);
-                let new_dir = b_dir.join("new_directory");
-                fs::create_dir_all(&new_dir).await?;
-                fs::write(new_dir.join("test.txt"), "test content").await?;
-
-                // Wait for the file to appear in peer A's cache
                 fixture
                     .inner
-                    .wait_for_file_in_cache(
-                        a,
-                        "new_directory/test.txt",
-                        &hash::digest("test content"),
-                    )
+                    .write_file_and_wait(b, a, "new_directory/test.txt", "test content")
                     .await?;
 
                 fixture.mount(household_a).await?;
@@ -1252,11 +1517,10 @@ mod tests {
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
 
-                // Create a directory with a file in peer B's arena
-                let b_dir = fixture.inner.arena_root(b);
-                let dir_to_remove = b_dir.join("dir_to_remove");
-                fs::create_dir_all(&dir_to_remove).await?;
-                fs::write(dir_to_remove.join("test.txt"), "test content").await?;
+                fixture
+                    .inner
+                    .write_file_and_wait(b, a, "dir_to_remove/test.txt", "test content")
+                    .await?;
 
                 // Wait for the file to appear in peer A's cache
                 fixture
@@ -1311,16 +1575,10 @@ mod tests {
                 let b = HouseholdFixture::b();
                 testing::connect(&household_a, b).await?;
 
-                // Create a file in peer B's arena
                 fixture
                     .inner
-                    .write_file(b, "source.txt", "source content")
+                    .write_file_and_wait(b, a, "source.txt", "source content")
                     .await?;
-                fixture
-                    .inner
-                    .wait_for_file_in_cache(a, "source.txt", &hash::digest("source content"))
-                    .await?;
-
                 fixture.mount(household_a).await?;
 
                 let mountpoint = fixture.mount_path();
@@ -1366,6 +1624,413 @@ mod tests {
             .await?;
         fixture.unmount().await?;
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn overwrite_cached_file() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                testing::connect(&household_a, b).await?;
+
+                fixture
+                    .inner
+                    .write_file_and_wait(b, a, "testfile.txt", "will be overritten")
+                    .await?;
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                let file_path = arena_path.join("testfile.txt");
+
+                // Write shorter string to the cached file
+                let new_content = "short";
+                tokio::fs::write(&file_path, new_content).await?;
+
+                // Read it back from FUSE mountpoint. We should get
+                // the updated value. If truncating the file didn't
+                // work, some data from the original content might be
+                // left over.
+                let updated_content = tokio::fs::read_to_string(&file_path).await?;
+                assert_eq!(new_content, updated_content);
+
+                // Check that the file has been written to datadir
+                let datadir_path = fixture.inner.arena_root(a).join("testfile.txt");
+                let datadir_content = tokio::fs::read_to_string(&datadir_path).await?;
+                assert_eq!(new_content, datadir_content);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn partially_overwrite_cached_file() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+
+                testing::connect(&household_a, b).await?;
+
+                // Create a file in peer B's arena
+                let original_content = "123456789";
+                fixture
+                    .inner
+                    .write_file_and_wait(b, a, "partial.txt", original_content)
+                    .await?;
+
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                let file_path = arena_path.join("partial.txt");
+
+                tokio::task::spawn_blocking({
+                    // Flushing AsyncWrite file gets stuck if there's
+                    // only one thread. Using blocking I/O and
+                    // spawn_blocking avoids the issue.
+                    let file_path = file_path.clone();
+
+                    move || {
+                        let mut file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .truncate(false)
+                            .open(&file_path)?;
+                        file.write_all(b"abc")?;
+                        file.flush()?;
+                        drop(file);
+
+                        Ok::<(), std::io::Error>(())
+                    }
+                })
+                .await??;
+
+                // File should have new prefix + original suffix
+                let result_content = tokio::fs::read_to_string(&file_path).await?;
+                let expected = "abc456789";
+                assert_eq!(expected, result_content);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn overwritten_file_metadata() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                testing::connect(&household_a, b).await?;
+
+                fixture
+                    .inner
+                    .write_file_and_wait(b, a, "metadata.txt", "content")
+                    .await?;
+
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                let file_path = arena_path.join("metadata.txt");
+
+                let new_content = "new content";
+                tokio::fs::write(&file_path, new_content).await?;
+
+                let fuse_meta = tokio::fs::metadata(&file_path).await?;
+
+                let datadir_path = fixture.inner.arena_root(a).join("metadata.txt");
+                let datadir_meta = tokio::fs::metadata(&datadir_path).await?;
+
+                assert_eq!(fuse_meta.len(), datadir_meta.len());
+                assert_eq!(fuse_meta.modified()?, datadir_meta.modified()?);
+                assert_eq!(fuse_meta.mode() & 0o777, datadir_meta.mode() & 0o777);
+                assert!(fuse_meta.is_file());
+                assert!(datadir_meta.is_file());
+
+                // inodes should NOT match (they're different files)
+                assert_ne!(fuse_meta.ino(), datadir_meta.ino());
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn chown_fails() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                testing::connect(&household_a, b).await?;
+
+                fixture
+                    .inner
+                    .write_file_and_wait(b, a, "unmodified", "content")
+                    .await?;
+                fixture
+                    .inner
+                    .write_file_and_wait(b, a, "modified", "content")
+                    .await?;
+
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                let modified_path = arena_path.join("modified");
+                let unmodified_path = arena_path.join("unmodified");
+                tokio::fs::write(&modified_path, "modified").await.unwrap();
+
+                let current_uid = nix::unistd::getuid();
+                let current_gid = nix::unistd::getgid();
+                let mut groups = nix::unistd::getgroups()?;
+                groups.retain(|gid| *gid != current_gid);
+                let othergroup = groups.into_iter().next();
+
+                // We test chown against the following files:
+                //  - unmodified, a cached file.
+                //  - modified, locally modified file, stored in
+                //    datadir, that's accessed through FUSE.
+                for path in [&modified_path, &unmodified_path] {
+                    // no-op chown succeeds
+                    tokio::task::spawn_blocking({
+                        let path = path.clone();
+                        move || nix::unistd::chown(&path, Some(current_uid), Some(current_gid))
+                    })
+                    .await?
+                    .expect("chown {path:?}");
+
+                    // modified chown fails (changing groups would
+                    // normally be allowed, but realize doesn't allow
+                    // it)
+                    if let Some(othergroup) = othergroup {
+                        assert_eq!(
+                            tokio::task::spawn_blocking({
+                                let path = path.clone();
+                                move || {
+                                    nix::unistd::chown(&path, Some(current_uid), Some(othergroup))
+                                }
+                            })
+                            .await?,
+                            Err(nix::errno::Errno::EPERM)
+                        )
+                    }
+                    // modified chown fails (changing uid would normally be disallowed)
+                    assert_eq!(
+                        tokio::task::spawn_blocking({
+                            let path = path.clone();
+                            move || {
+                                nix::unistd::chown(
+                                    &path,
+                                    Some(nix::unistd::Uid::from_raw(current_uid.as_raw() + 1)),
+                                    None,
+                                )
+                            }
+                        })
+                        .await?,
+                        Err(nix::errno::Errno::EPERM)
+                    );
+                }
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn truncate_cached_file() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                testing::connect(&household_a, b).await?;
+
+                // Create a file in peer B's arena
+                let original_content = "0123456789";
+                fixture
+                    .inner
+                    .write_file_and_wait(b, a, "setlen.txt", original_content)
+                    .await?;
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                let file_path = arena_path.join("setlen.txt");
+
+                tokio::task::spawn_blocking({
+                    // Flushing AsyncWrite file gets stuck if there's
+                    // only one thread. Using blocking I/O and
+                    // spawn_blocking avoids the issue.
+                    let file_path = file_path.clone();
+
+                    move || {
+                        let file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .truncate(false)
+                            .open(&file_path)?;
+                        file.set_len(5)?;
+                        drop(file);
+
+                        Ok::<(), std::io::Error>(())
+                    }
+                })
+                .await??;
+
+                // Check the file is now 5 bytes
+                assert_eq!(5, tokio::fs::metadata(&file_path).await?.len());
+                assert_eq!("01234", tokio::fs::read_to_string(&file_path).await?);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn expand_cached_file() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                testing::connect(&household_a, b).await?;
+
+                // Create a file in peer B's arena
+                let original_content = "0123456789";
+                fixture
+                    .inner
+                    .write_file_and_wait(b, a, "setlen.txt", original_content)
+                    .await?;
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                let file_path = arena_path.join("setlen.txt");
+
+                tokio::task::spawn_blocking({
+                    // Flushing AsyncWrite file gets stuck if there's
+                    // only one thread. Using blocking I/O and
+                    // spawn_blocking avoids the issue.
+                    let file_path = file_path.clone();
+
+                    move || {
+                        let file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .truncate(false)
+                            .open(&file_path)?;
+                        file.set_len(12)?;
+                        drop(file);
+
+                        Ok::<(), std::io::Error>(())
+                    }
+                })
+                .await??;
+
+                // Check the file is now 12 bytes
+                assert_eq!(12, tokio::fs::metadata(&file_path).await?.len());
+                assert_eq!(
+                    "0123456789\0\0",
+                    tokio::fs::read_to_string(&file_path).await?
+                );
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn cached_file_written_to_multiple_times() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                testing::connect(&household_a, b).await?;
+
+                fixture
+                    .inner
+                    .write_file_and_wait(b, a, "multi.txt", "start")
+                    .await?;
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                let file_path = arena_path.join("multi.txt");
+
+                // Write multiple times by reading current content and appending
+                let mut current_content = String::from("start");
+                for i in 1..=5 {
+                    let addition = format!("-{}", i);
+                    current_content.push_str(&addition);
+
+                    // Write the complete updated content
+                    tokio::fs::write(&file_path, &current_content).await?;
+
+                    // Verify after each write
+                    let read_content = tokio::fs::read_to_string(&file_path).await?;
+                    assert_eq!(current_content, read_content);
+                }
+
+                // Final check - should be "start-1-2-3-4-5"
+                let final_content = tokio::fs::read_to_string(&file_path).await?;
+                assert_eq!("start-1-2-3-4-5", final_content);
+
+                // Check datadir has the same
+                let datadir_path = fixture.inner.arena_root(a).join("multi.txt");
+                let datadir_content = tokio::fs::read_to_string(&datadir_path).await?;
+                assert_eq!("start-1-2-3-4-5", datadir_content);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
         Ok(())
     }
 }
