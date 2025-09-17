@@ -9,16 +9,16 @@ This file provides guidance to WARP (warp.dev) when working with code in this re
 # Install build dependencies (Linux)
 sudo apt-get install capnproto libcapnp-dev fuse3 libfuse3-dev
 
-# Install build dependencies (macOS) 
+# Install build dependencies (macOS)
 brew install capnp fuse-t
 
 # Build the project
 cargo build
 
-# Run all tests 
+# Run all tests
 cargo test
 
-# Run crate-specific test (Example with crate-storage; substitute as appropriate) 
+# Run crate-specific test (Example with crate-storage; substitute as appropriate)
 cargo test -p crate-storage
 
 # Format code
@@ -112,14 +112,14 @@ All network communication uses Cap'n Proto for:
 - Run `cargo fmt` before committing any Rust files
 - Use `cargo nextest` for improved test running with retries
 
-### Module Organization  
+### Module Organization
 - **Never create `mod.rs` files** - use `module_name.rs` instead for better discoverability
 - Follow the pattern: `src/media.rs` not `src/media/mod.rs`
 
 ### Async I/O Requirements
 **In server code (realize-core), all I/O must be async:**
 - Use `tokio::fs::*` instead of `std::fs::*`
-- Use `tokio::io::*` instead of `std::io::*`  
+- Use `tokio::io::*` instead of `std::io::*`
 - Wrap blocking operations in `tokio::task::spawn_blocking`
 - Always call `flush().await?` after async writes
 - Use `tokio::fs::metadata(&path).await.is_ok()` instead of `path.exists()`
@@ -143,15 +143,15 @@ When working with Cap'n Proto:
 - Write round-trip tests for all data structures
 - Use `Promise::from_future()` for async RPC methods
 
-### Unit Testing 
+### Unit Testing
 - Place unit tests in the same file as the code being tested
-- Make sure unit tests cover all cases, avoid relying only no integration tests 
+- Make sure unit tests cover all cases, avoid relying only no integration tests
 - Follow the AAA (Arrange-Act-Assert) pattern
 - Avoid mocking; prefer having tests working on the real implementation
 - Keep tests focused: if several aspects need to be tested, instead of
   writing a large test write multiple tests, well named, with any
   common setup kept in the fixture.
-  
+
 - Never just sleep some arbitrary duration in tests to wait for
   something ha happen. It's not reliable as tests can run fast or slow
   depending on the machine.
@@ -176,7 +176,7 @@ The project has specific dependency requirements:
 
 ### Platform Support
 - **Linux**: Full functionality including filesystem layer and inotify
-- **macOS**: Subset of functionality with read-only filesystem view  
+- **macOS**: Subset of functionality with read-only filesystem view
 - **Windows**: Planned but not yet supported
 
 Development should prioritize Linux compatibility, with macOS as a secondary target.
