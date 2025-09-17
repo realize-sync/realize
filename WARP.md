@@ -143,6 +143,24 @@ When working with Cap'n Proto:
 - Write round-trip tests for all data structures
 - Use `Promise::from_future()` for async RPC methods
 
+### Unit Testing 
+- Place unit tests in the same file as the code being tested
+- Make sure unit tests cover all cases, avoid relying only no integration tests 
+- Follow the AAA (Arrange-Act-Assert) pattern
+- Avoid mocking; prefer having tests working on the real implementation
+- Keep tests focused: if several aspects need to be tested, instead of
+  writing a large test write multiple tests, well named, with any
+  common setup kept in the fixture.
+  
+- Never just sleep some arbitrary duration in tests to wait for
+  something ha happen. It's not reliable as tests can run fast or slow
+  depending on the machine.
+
+  To wait for something to happen, you might, either:
+    - wait for some notification to be sent to a notification channel,
+      when there is one
+    - poll at regular intervals (and give up after a reasonable delay, like 5 or 10s)
+
 ### Integration Testing
 - Integration tests must use `*_integration_test.rs` suffix
 - Use `assert_cmd::Command` instead of `std::process::Command`
