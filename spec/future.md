@@ -3,46 +3,6 @@
 Each section describes a planned change. Sections should be tagged,
 for easy reference, and end with a detailled and numbered task list.
 
-## rename for directories {#renamedir}
-
-Implement support for renaming directories. That is, rename everything
-inside of them.
-
-## support writes, with index root {#writewithroot}
-
-1. add support for create, including tempfile create; this just
-  directly creates the file in the index root and returns a
-  file handle to it
-
-2. add support for direct read access, when the file is fully
-  downloaded (including passthrough)
-
-3. add support for direct write access, when the file is fully
-  downloaded (including passthrough)
-
-  This requires being able to deal with locally modified blobs. This
-  might be a separate type of blobs or a flag on existing blobs.
-  locally modified blobs must not be garbage collected
-
-  We might want to realize locally modified blob, and share them from
-  there or directly share them from the cache (for the 2nd solution,
-  why not share everything that's fully available from the cache?).
-
-4. add support for download for reads + writes
-
-  This requires orchestrating two type of writes: writes after read
-  that come from downloads and real writes. It gets tricky in an async
-  setting.
-
-  It might be worth having two files layering the reads - but then a
-  file might then need to be stored up to three times (once for the
-  downloaded parts, once for the written parts once to put both
-  together before realizing.)
-
-  Alternatively, we'd need a central piece of code behind a mutex that
-  makes sure download-then-write doesn't interfere with real writes,
-  dealing with pending writes as well.
-
 ## ipath-to-inode mapping {#fastinode}
 
 ipath-to-inode could be stored into the FileTableEntry instead of
