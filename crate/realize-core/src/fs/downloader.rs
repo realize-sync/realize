@@ -1,5 +1,5 @@
-use crate::rpc::{ExecutionMode, Household};
-use realize_storage::{Blob, Filesystem, FsLoc, StorageError};
+use crate::rpc::{ExecutionMode, Household, HouseholdOperationError};
+use realize_storage::{Blob, Filesystem, FsLoc, LocalAvailability, StorageError};
 use realize_types::{Arena, ByteRange, ByteRanges, Path, Peer};
 use std::cmp::min;
 use std::collections::VecDeque;
@@ -20,6 +20,10 @@ const MIN_CHUNK_SIZE: u64 = 8 * 1024;
 /// This should be a multiple of MIN_CHUNK_SIZE.
 const MAX_CHUNK_SIZE: u64 = 4 * MIN_CHUNK_SIZE;
 
+/// Interval at which to update the database during downloads, in
+/// bytes.
+const UPDATE_DB_INTERVAL_BYTES: u64 = 4 * 1024 * 1024; // 4M
+
 #[derive(Clone)]
 pub struct Downloader {
     household: Arc<Household>,
@@ -29,6 +33,55 @@ pub struct Downloader {
 impl Downloader {
     pub fn new(household: Arc<Household>, cache: Arc<Filesystem>) -> Self {
         Self { household, cache }
+    }
+
+    // Make sure the blob contains a full copy of the remote data and
+    // return it.
+    pub async fn complete_blob<L: Into<FsLoc>>(
+        &self,
+        loc: L,
+    ) -> Result<Blob, HouseholdOperationError> {
+        let mut blob = self.cache.open_file(loc).await?;
+        if matches!(
+            blob.local_availability(),
+            LocalAvailability::Complete | LocalAvailability::Verified,
+        ) {
+            // Nothing to do
+            return Ok(blob);
+        }
+        let missing = ByteRanges::single(0, blob.size()).subtraction(blob.available_range());
+        log::debug!("Blob incomplete; downloading {missing}");
+        let avail = blob
+            .remote_availability()
+            .await?
+            .ok_or(HouseholdOperationError::NoPeers)?;
+
+        let mut bytes_since_last_update = 0;
+        for range in missing {
+            let mut stream = self.household.read(
+                avail.peers.clone(),
+                ExecutionMode::Interactive,
+                avail.arena,
+                avail.path.clone(),
+                range.start,
+                Some(range.bytecount()),
+            )?;
+
+            while let Some(chunk) = stream.next().await {
+                let (chunk_offset, chunk) = chunk?;
+                blob.update(chunk_offset, &chunk).await?;
+
+                // TODO: have Blob::update do that
+                bytes_since_last_update += chunk.len() as u64;
+                if bytes_since_last_update >= UPDATE_DB_INTERVAL_BYTES {
+                    let _ = blob.update_db().await;
+                    bytes_since_last_update = 0;
+                }
+            }
+        }
+        blob.update_db().await?;
+
+        Ok(blob)
     }
 
     pub async fn reader<L: Into<FsLoc>>(&self, loc: L) -> Result<Download, StorageError> {
@@ -314,6 +367,86 @@ mod tests {
             let path = Path::parse(path_str)?;
 
             Ok(downloader.reader((arena, &path)).await?)
+        }
+
+        /// Create a file on peer B and wait for it to appear in peer A's cache
+        async fn create_file_on_peer_b(&self, path_str: &str, content: &str) -> anyhow::Result<()> {
+            self.inner
+                .write_file_and_wait(
+                    HouseholdFixture::b(),
+                    HouseholdFixture::a(),
+                    path_str,
+                    content,
+                )
+                .await?;
+
+            Ok(())
+        }
+
+        /// Create a file with partial local availability by downloading only the first N bytes
+        async fn create_partially_downloaded_file(
+            &self,
+            downloader: &Downloader,
+            path_str: &str,
+            content: &str,
+            partial_bytes: usize,
+        ) -> anyhow::Result<()> {
+            self.create_file_on_peer_b(path_str, content).await?;
+
+            // Download only part of the file to create Partial state
+            let mut partial_reader = self.reader(downloader, path_str).await?;
+            let mut partial_buf = vec![0u8; partial_bytes];
+            partial_reader.read_all_at(0, &mut partial_buf).await?;
+            partial_reader.update_db().await?;
+            drop(partial_reader);
+
+            Ok(())
+        }
+
+        /// Create a file that is already complete by downloading it fully
+        async fn create_complete_file(
+            &self,
+            downloader: &Downloader,
+            path_str: &str,
+            content: &str,
+        ) -> anyhow::Result<()> {
+            self.create_file_on_peer_b(path_str, content).await?;
+
+            let arena = HouseholdFixture::test_arena();
+            let _complete_blob = downloader
+                .complete_blob((arena, &Path::parse(path_str)?))
+                .await?;
+
+            Ok(())
+        }
+
+        /// Verify that a blob has complete availability and matches expected content
+        async fn verify_complete_blob(
+            mut blob: Blob,
+            expected_content: &str,
+            test_name: &str,
+        ) -> anyhow::Result<()> {
+            assert!(
+                matches!(
+                    blob.local_availability(),
+                    LocalAvailability::Complete | LocalAvailability::Verified
+                ),
+                "{} should have Complete or Verified availability",
+                test_name
+            );
+            assert_eq!(blob.size(), expected_content.len() as u64);
+
+            // Verify we can read the complete content
+            let mut actual_content = String::new();
+            blob.seek(SeekFrom::Start(0)).await?;
+            blob.read_to_string(&mut actual_content).await?;
+            assert_eq!(
+                actual_content, expected_content,
+                "{} content should match",
+                test_name
+            );
+
+            Ok(())
         }
     }
 
@@ -701,5 +834,124 @@ mod tests {
         let mut buffer = vec![];
         reader.read_all_at(offset, &mut buffer).await?;
         Ok(String::from_utf8(buffer)?)
+    }
+
+    #[tokio::test]
+    async fn complete_missing_blob() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let downloader = Downloader::new(
+                    household_a.clone(),
+                    fixture.inner.cache(HouseholdFixture::a())?.clone(),
+                );
+                let arena = HouseholdFixture::test_arena();
+
+                let missing_data = "This file was never downloaded";
+
+                // Create file that was never downloaded (Missing state)
+                fixture
+                    .create_file_on_peer_b("missing.txt", missing_data)
+                    .await?;
+
+                // Test: Complete a cached file that was never downloaded (Missing -> Complete)
+                let missing_blob = downloader
+                    .complete_blob((arena, &Path::parse("missing.txt")?))
+                    .await?;
+
+                Fixture::verify_complete_blob(missing_blob, missing_data, "Missing file").await?;
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn complete_partial_blob() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let downloader = Downloader::new(
+                    household_a.clone(),
+                    fixture.inner.cache(HouseholdFixture::a())?.clone(),
+                );
+                let arena = HouseholdFixture::test_arena();
+
+                let partial_data =
+                    "This file will be partially downloaded to test resuming downloads";
+
+                // Create file that was partially downloaded (Partial state)
+                fixture
+                    .create_partially_downloaded_file(
+                        &downloader,
+                        "partial.txt",
+                        partial_data,
+                        20, // Download first 20 bytes
+                    )
+                    .await?;
+
+                // Test: Complete a cached file that was partially downloaded (Partial -> Complete)
+                let partial_blob = downloader
+                    .complete_blob((arena, &Path::parse("partial.txt")?))
+                    .await?;
+
+                Fixture::verify_complete_blob(partial_blob, partial_data, "Partial file").await?;
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn complete_already_complete_blob() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let downloader = Downloader::new(
+                    household_a.clone(),
+                    fixture.inner.cache(HouseholdFixture::a())?.clone(),
+                );
+                let arena = HouseholdFixture::test_arena();
+
+                let complete_data = "This file is already complete";
+
+                // Create file that is already complete
+                fixture
+                    .create_complete_file(&downloader, "complete.txt", complete_data)
+                    .await?;
+
+                // Test: Complete an already complete blob (should be no-op)
+                let already_complete_blob = downloader
+                    .complete_blob((arena, &Path::parse("complete.txt")?))
+                    .await?;
+
+                Fixture::verify_complete_blob(
+                    already_complete_blob,
+                    complete_data,
+                    "Already complete file",
+                )
+                .await?;
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
     }
 }

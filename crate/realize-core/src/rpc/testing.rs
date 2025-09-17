@@ -208,9 +208,27 @@ impl HouseholdFixture {
         let root = self.arena_root(peer);
         let path = Path::parse(path_str)?;
         let realpath = path.within(&root);
+        if let Some(parent) = realpath.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
         tokio::fs::write(realpath, content).await?;
 
         Ok((path, hash::digest(content)))
+    }
+
+    /// Write file to peer `write_peer` and wait for it to appear in the cache of `cached_peer`
+    pub async fn write_file_and_wait(
+        &self,
+        write_peer: Peer,
+        cache_peer: Peer,
+        path_str: &str,
+        content: &str,
+    ) -> anyhow::Result<(Path, Hash)> {
+        let (parsed_path, hash) = self.write_file(write_peer, path_str, content).await?;
+        self.wait_for_file_in_cache(cache_peer, path_str, &hash)
+            .await?;
+
+        Ok((parsed_path, hash))
     }
 
     pub async fn open_file(&self, peer: Peer, path_str: &str) -> anyhow::Result<Blob> {

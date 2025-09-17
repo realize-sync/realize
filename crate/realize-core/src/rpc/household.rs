@@ -245,6 +245,9 @@ pub enum HouseholdOperationError {
 
     #[error("RPC error {0}")]
     Rpc(capnp::Error),
+
+    #[error("{0}")]
+    Storage(#[from] realize_storage::StorageError),
 }
 
 impl From<capnp::Error> for HouseholdOperationError {
@@ -279,6 +282,18 @@ impl HouseholdOperationError {
             }
             Io(ioerr) => ioerr,
             Rpc(err) => io::Error::other(err),
+            Storage(err) => err.into(),
+        }
+    }
+
+    pub fn io_kind(&self) -> std::io::ErrorKind {
+        use HouseholdOperationError::*;
+        match self {
+            NoPeers => std::io::ErrorKind::NotConnected,
+            Disconnected => std::io::ErrorKind::ConnectionAborted,
+            Io(ioerr) => ioerr.kind(),
+            Rpc(_) => std::io::ErrorKind::Other,
+            Storage(err) => err.io_kind(),
         }
     }
 }
