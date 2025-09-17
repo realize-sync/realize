@@ -50,7 +50,7 @@ pub(crate) fn apply(
                 )?;
 
                 let mut index = txn.write_index()?;
-                index.record_outdated(&tree, &path, &old_hash, &hash)?;
+                index.record_outdated(&tree, &mut dirty, &path, &old_hash, &hash)?;
             }
 
             Notification::Remove { path, old_hash, .. } => {

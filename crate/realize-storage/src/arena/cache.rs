@@ -575,26 +575,27 @@ impl<'a> WritableOpenCache<'a> {
         hash: &Hash,
         old_hash: &Hash,
     ) -> Result<(), StorageError> {
-        if let Some(file_pathid) = tree.resolve(path)? {
-            let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
-            if let Some(e) = peer_file_entry(&self.table, file_pathid, Some(peer))?
-                && e.hash == *old_hash
-            {
-                log::debug!(
-                    "[{}]@{peer} \"{path}\" {hash} size={size} replaces {old_hash}",
-                    self.arena
-                );
-                self.write_file_entry(tree, file_pathid, peer, &entry)?;
-            }
-            if let Some(old_entry) = peer_file_entry(&self.table, file_pathid, None)?
-                && old_entry.hash == *old_hash
-            {
-                log::debug!(
-                    "[{}]@local \"{path}\" {hash} size={size} replaces {old_hash}",
-                    self.arena
-                );
-                self.write_default_file_entry(tree, blobs, dirty, file_pathid, &entry)?;
-            }
+        let file_pathid = tree.setup(path)?;
+        let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
+        if peer_file_entry(&self.table, file_pathid, Some(peer))?
+            .map(|e| e.hash == *old_hash)
+            .unwrap_or(true)
+        {
+            log::debug!(
+                "[{}]@{peer} \"{path}\" {hash} size={size} replaces {old_hash}",
+                self.arena
+            );
+            self.write_file_entry(tree, file_pathid, peer, &entry)?;
+        }
+        if peer_file_entry(&self.table, file_pathid, None)?
+            .map(|e| e.hash == *old_hash)
+            .unwrap_or(true)
+        {
+            log::debug!(
+                "[{}]@local \"{path}\" {hash} size={size} replaces {old_hash}",
+                self.arena
+            );
+            self.write_default_file_entry(tree, blobs, dirty, file_pathid, &entry)?;
         }
         Ok(())
     }
@@ -1616,6 +1617,44 @@ mod tests {
             },
         )?;
         assert_eq!(HashSet::new(), fixture.dirty_paths()?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_nothing() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena).await?;
+        let peer = test_peer();
+        let file_path = Path::parse("file.txt")?;
+
+        update::apply(
+            &fixture.db,
+            peer,
+            Notification::Replace {
+                arena: arena,
+                index: 0,
+                path: file_path.clone(),
+                mtime: test_time(),
+                size: 200,
+                hash: Hash([2u8; 32]),
+                old_hash: test_hash(),
+            },
+        )?;
+
+        let metadata = fixture.file_metadata(&file_path).unwrap();
+        assert_eq!(metadata.size, 200);
+        assert_eq!(metadata.hash, Hash([2u8; 32]));
+        assert_eq!(metadata.mtime, test_time());
+
+        let txn = fixture.db.begin_read()?;
+        let tree = txn.read_tree()?;
+        let cache = txn.read_cache()?;
+
+        let avail = cache
+            .file_availability(&tree, &file_path, &Hash([2u8; 32]))?
+            .unwrap();
+        assert_eq!(vec![peer], avail.peers);
 
         Ok(())
     }
