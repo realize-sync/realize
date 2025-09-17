@@ -16,20 +16,11 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct StorageJobProcessor {
     db: Arc<ArenaDatabase>,
     engine: Arc<Engine>,
-    index_root: PathBuf,
 }
 
 impl StorageJobProcessor {
-    pub(crate) fn new(
-        db: Arc<ArenaDatabase>,
-        engine: Arc<Engine>,
-        index_root: PathBuf,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            db,
-            engine,
-            index_root,
-        })
+    pub(crate) fn new(db: Arc<ArenaDatabase>, engine: Arc<Engine>) -> Arc<Self> {
+        Arc::new(Self { db, engine })
     }
 
     pub fn spawn(self: Arc<Self>, shutdown: CancellationToken) -> JoinHandle<()> {
@@ -106,7 +97,7 @@ impl StorageJobProcessor {
     /// versions in the cache or the current version in the index
     /// don't match `hash`.
     fn unrealize(&self, pathid: PathId, hash: Hash) -> Result<JobStatus, StorageError> {
-        let root = &self.index_root;
+        let root = self.db.index().datadir();
         let path: realize_types::Path;
         let realpath: PathBuf;
         let cachepath: PathBuf;
@@ -192,7 +183,6 @@ impl StorageJobProcessor {
         index_hash: Option<Hash>,
     ) -> Result<JobStatus, StorageError> {
         let arena = self.db.arena();
-        let root = &self.index_root;
         let source: PathBuf;
         let dest: PathBuf;
         let path: realize_types::Path;
@@ -217,8 +207,7 @@ impl StorageJobProcessor {
             }
 
             let mut index = txn.write_index()?;
-            dest = match index::indexed_file_path(&index, &tree, &root, &path, index_hash.as_ref())?
-            {
+            dest = match index::indexed_file_path(&index, &tree, &path, index_hash.as_ref())? {
                 Some(p) => p,
                 None => {
                     return Ok(JobStatus::Abandoned("indexed_file_path"));
@@ -319,8 +308,7 @@ mod tests {
                     None
                 }
             });
-            let processor =
-                StorageJobProcessor::new(Arc::clone(&db), Arc::clone(&engine), root.to_path_buf());
+            let processor = StorageJobProcessor::new(Arc::clone(&db), Arc::clone(&engine));
 
             let fixture = Self {
                 arena,
@@ -368,7 +356,6 @@ mod tests {
                     size,
                     hash: hash.clone(),
                 },
-                Some(&self.root),
             )?;
 
             Ok(())
@@ -392,7 +379,6 @@ mod tests {
                     old_hash: old_hash.clone(),
                     hash: new_hash.clone(),
                 },
-                Some(&self.root),
             )?;
 
             Ok(())

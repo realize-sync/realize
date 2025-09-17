@@ -22,18 +22,16 @@ use tokio_stream::wrappers::ReceiverStream;
 /// If `hash` is none, the file must not exist. if `hash` is not none,
 /// its version in the index must match and its size and modification
 /// time must match those in the index.
-pub(crate) fn indexed_file_path<'b, L: Into<TreeLoc<'b>>, R: AsRef<std::path::Path>>(
+pub(crate) fn indexed_file_path<'b, L: Into<TreeLoc<'b>>>(
     index: &impl IndexReadOperations,
     tree: &impl TreeReadOperations,
-    root: R,
     loc: L,
     hash: Option<&Hash>,
 ) -> Result<Option<std::path::PathBuf>, StorageError> {
     let loc = loc.into();
     let entry = index.get(tree, loc.borrow())?;
     if let Some(path) = tree.backtrack(loc)? {
-        let root = root.as_ref();
-        let file_path = path.within(root);
+        let file_path = path.within(index.datadir());
         match hash {
             Some(hash) => {
                 if let Some(entry) = entry
@@ -44,7 +42,9 @@ pub(crate) fn indexed_file_path<'b, L: Into<TreeLoc<'b>>, R: AsRef<std::path::Pa
                 }
             }
             None => {
-                if entry.is_none() && fs_utils::metadata_no_symlink_blocking(root, &path).is_err() {
+                if entry.is_none()
+                    && fs_utils::metadata_no_symlink_blocking(index.datadir(), &path).is_err()
+                {
                     return Ok(Some(file_path));
                 }
             }
@@ -63,31 +63,24 @@ pub(crate) fn indexed_file_path<'b, L: Into<TreeLoc<'b>>, R: AsRef<std::path::Pa
 ///   must not exist and otherwise it must have hash `old_hash`
 ///
 /// Otherwise, it does nothing and returns `false`.
-pub(crate) fn branch<
-    'b,
-    L1: Into<TreeLoc<'b>>,
-    L2: Into<TreeLoc<'b>>,
-    R: AsRef<std::path::Path>,
->(
+pub(crate) fn branch<'b, L1: Into<TreeLoc<'b>>, L2: Into<TreeLoc<'b>>>(
     index: &impl IndexReadOperations,
     tree: &impl TreeReadOperations,
-    root: R,
     source: L1,
     dest: L2,
     hash: &Hash,
     old_hash: Option<&Hash>,
 ) -> Result<bool, StorageError> {
-    let root = root.as_ref();
     let source = match tree.backtrack(source)? {
         Some(p) => p,
         None => return Ok(false),
     };
-    let source_realpath = source.within(root);
+    let source_realpath = source.within(index.datadir());
     if let Some(indexed) = index.get(tree, source)?
         && indexed.hash == *hash
         && indexed.matches_file(&source_realpath)
     {
-        if let Some(dest_realpath) = indexed_file_path(index, tree, root, dest, old_hash)? {
+        if let Some(dest_realpath) = indexed_file_path(index, tree, dest, old_hash)? {
             if let Some(parent) = dest_realpath.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -110,24 +103,17 @@ pub(crate) fn branch<
 ///   must not exist and otherwise it must have hash `old_hash`
 ///
 /// Otherwise, it does nothing and returns `false`.
-pub(crate) fn rename<
-    'b,
-    'c,
-    L1: Into<TreeLoc<'b>>,
-    L2: Into<TreeLoc<'c>>,
-    R: AsRef<std::path::Path>,
->(
+pub(crate) fn rename<'b, 'c, L1: Into<TreeLoc<'b>>, L2: Into<TreeLoc<'c>>>(
     index: &mut WritableOpenIndex,
     tree: &mut WritableOpenTree,
     history: &mut WritableOpenHistory,
     dirty: &mut WritableOpenDirty,
-    root: R,
     source: L1,
     dest: L2,
     hash: &Hash,
     old_hash: Option<&Hash>,
 ) -> Result<bool, StorageError> {
-    let root = root.as_ref();
+    let root = index.datadir();
     let source = source.into();
     let dest = dest.into();
     let source_path = match tree.backtrack(source.borrow())? {
@@ -139,8 +125,7 @@ pub(crate) fn rename<
         && indexed.hash == *hash
         && indexed.matches_file(&source_realpath)
     {
-        if let Some(dest_realpath) = indexed_file_path(index, tree, root, dest.borrow(), old_hash)?
-        {
+        if let Some(dest_realpath) = indexed_file_path(index, tree, dest.borrow(), old_hash)? {
             if let Some(parent) = dest_realpath.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -240,30 +225,40 @@ impl Index {
     }
 }
 
-pub(crate) struct ReadableOpenIndex<T>
+pub(crate) struct ReadableOpenIndex<'a, T>
 where
     T: ReadableTable<PathId, Holder<'static, FileTableEntry>>,
 {
+    index: &'a Index,
     table: T,
 }
 
-impl<T> ReadableOpenIndex<T>
+impl<'a, T> ReadableOpenIndex<'a, T>
 where
     T: ReadableTable<PathId, Holder<'static, FileTableEntry>>,
 {
-    pub(crate) fn new(table: T) -> Self {
-        Self { table }
+    pub(crate) fn new(index: &'a Index, table: T) -> Self {
+        Self { index, table }
     }
 }
 
 pub(crate) struct WritableOpenIndex<'a> {
     arena: Arena,
+    index: &'a Index,
     table: Table<'a, PathId, Holder<'static, FileTableEntry>>,
 }
 
 impl<'a> WritableOpenIndex<'a> {
-    pub(crate) fn new(arena: Arena, table: Table<'a, PathId, Holder<FileTableEntry>>) -> Self {
-        Self { arena, table }
+    pub(crate) fn new(
+        arena: Arena,
+        index: &'a Index,
+        table: Table<'a, PathId, Holder<FileTableEntry>>,
+    ) -> Self {
+        Self {
+            arena,
+            index,
+            table,
+        }
     }
 }
 
@@ -277,9 +272,11 @@ pub(crate) trait IndexReadOperations {
 
     /// Get all files in the index.
     fn all(&self, tx: mpsc::Sender<(Path, IndexedFile)>) -> Result<(), StorageError>;
+
+    fn datadir(&self) -> &std::path::Path;
 }
 
-impl<T> IndexReadOperations for ReadableOpenIndex<T>
+impl<'a, T> IndexReadOperations for ReadableOpenIndex<'a, T>
 where
     T: ReadableTable<PathId, Holder<'static, FileTableEntry>>,
 {
@@ -293,6 +290,10 @@ where
 
     fn all(&self, tx: mpsc::Sender<(Path, IndexedFile)>) -> Result<(), StorageError> {
         all(&self.table, tx)
+    }
+
+    fn datadir(&self) -> &std::path::Path {
+        self.index.datadir()
     }
 }
 
@@ -307,6 +308,10 @@ impl<'a> IndexReadOperations for WritableOpenIndex<'a> {
 
     fn all(&self, tx: mpsc::Sender<(Path, IndexedFile)>) -> Result<(), StorageError> {
         all(&self.table, tx)
+    }
+
+    fn datadir(&self) -> &std::path::Path {
+        self.index.datadir()
     }
 }
 
@@ -676,13 +681,12 @@ pub async fn add_file_async(
 /// Add a file entry if it matches the file on disk.
 pub(crate) fn add_file_if_matches(
     db: &Arc<ArenaDatabase>,
-    root: &std::path::Path,
     path: &realize_types::Path,
     size: u64,
     mtime: UnixTime,
     hash: Hash,
 ) -> Result<bool, StorageError> {
-    if let Ok(m) = path.within(root).metadata()
+    if let Ok(m) = path.within(db.index().datadir()).metadata()
         && m.len() == size
         && UnixTime::mtime(&m) == mtime
     {
@@ -704,7 +708,6 @@ pub(crate) fn add_file_if_matches(
 
 pub async fn add_file_if_matches_async(
     db: &Arc<ArenaDatabase>,
-    root: &std::path::Path,
     path: &realize_types::Path,
     size: u64,
     mtime: UnixTime,
@@ -713,19 +716,17 @@ pub async fn add_file_if_matches_async(
     let db = Arc::clone(db);
     let path = path.clone();
     let mtime = mtime.clone();
-    let root = root.to_path_buf();
 
-    task::spawn_blocking(move || add_file_if_matches(&db, &root, &path, size, mtime, hash)).await?
+    task::spawn_blocking(move || add_file_if_matches(&db, &path, size, mtime, hash)).await?
 }
 
 /// Remove a file entry if the file is missing from disk.
 pub(crate) fn remove_file_if_missing(
     db: &Arc<ArenaDatabase>,
-    root: &std::path::Path,
     path: &realize_types::Path,
 ) -> Result<bool, StorageError> {
     let txn = db.begin_write()?;
-    if fs_utils::metadata_no_symlink_blocking(root, path).is_err() {
+    if fs_utils::metadata_no_symlink_blocking(db.index().datadir(), path).is_err() {
         {
             let mut tree = txn.write_tree()?;
             let mut index = txn.write_index()?;
@@ -742,14 +743,12 @@ pub(crate) fn remove_file_if_missing(
 
 pub async fn remove_file_if_missing_async(
     db: &Arc<ArenaDatabase>,
-    root: &std::path::Path,
     path: &realize_types::Path,
 ) -> Result<bool, StorageError> {
     let db = Arc::clone(db);
-    let root = root.to_path_buf();
     let path = path.clone();
 
-    task::spawn_blocking(move || remove_file_if_missing(&db, &root, &path)).await?
+    task::spawn_blocking(move || remove_file_if_missing(&db, &path)).await?
 }
 
 /// Send all valid entries of the file table to the given channel.
@@ -1596,7 +1595,6 @@ mod tests {
 
         assert!(super::add_file_if_matches(
             &fixture.db,
-            datadir,
             &realize_types::Path::parse("foo")?,
             3,
             UnixTime::mtime(&foo.metadata()?),
@@ -1619,7 +1617,6 @@ mod tests {
 
         assert!(!super::add_file_if_matches(
             &fixture.db,
-            datadir,
             &realize_types::Path::parse("foo")?,
             3,
             UnixTime::from_secs(1234567890),
@@ -1642,7 +1639,6 @@ mod tests {
 
         assert!(!super::add_file_if_matches(
             &fixture.db,
-            datadir,
             &realize_types::Path::parse("foo")?,
             2,
             UnixTime::mtime(&file_path.metadata()?),
@@ -1667,7 +1663,6 @@ mod tests {
 
         assert!(!super::add_file_if_matches(
             &fixture.db,
-            datadir,
             &realize_types::Path::parse("foo")?,
             3,
             mtime,
@@ -1786,11 +1781,7 @@ mod tests {
         let mtime = UnixTime::from_secs(1234567890);
         let path = realize_types::Path::parse("bar.txt")?;
         super::add_file(&fixture.db, &path, 100, mtime, Hash([0xfa; 32]))?;
-        assert!(super::remove_file_if_missing(
-            &fixture.db,
-            &std::path::Path::new("/tmp"),
-            &path
-        )?);
+        assert!(super::remove_file_if_missing(&fixture.db, &path)?);
 
         assert!(!super::has_file(&fixture.db, &path)?);
 
@@ -1806,15 +1797,10 @@ mod tests {
         super::add_file(&fixture.db, &path, 100, mtime, Hash([0xfa; 32]))?;
 
         // Create the file on disk
-        let tempdir = TempDir::new()?;
-        let file_path = tempdir.child("bar.txt");
-        file_path.write_str("content")?;
+        let file_path = fixture.db.index().datadir().join("bar.txt");
+        std::fs::write(&file_path, "content")?;
 
-        assert!(!super::remove_file_if_missing(
-            &fixture.db,
-            tempdir.path(),
-            &path
-        )?);
+        assert!(!super::remove_file_if_missing(&fixture.db, &path)?);
         assert!(super::has_file(&fixture.db, &path)?);
 
         Ok(())
@@ -1956,18 +1942,18 @@ mod tests {
     #[test]
     fn test_branch_function() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let tempdir = TempDir::new()?;
+        let datadir = fixture.db.index().datadir();
 
         // Create source file on disk
-        let source_path = tempdir.child("source.txt");
-        source_path.write_str("source content")?;
-        let source_mtime = UnixTime::mtime(&source_path.path().metadata()?);
+        let source_path = datadir.join("source.txt");
+        std::fs::write(&source_path, "source content")?;
+        let source_mtime = UnixTime::mtime(&source_path.metadata()?);
         let source_hash = hash::digest("source content");
 
         // Create destination file on disk with different content
-        let dest_path = tempdir.child("dest.txt");
-        dest_path.write_str("dest content")?;
-        let dest_mtime = UnixTime::mtime(&dest_path.path().metadata()?);
+        let dest_path = datadir.join("dest.txt");
+        std::fs::write(&dest_path, "dest content")?;
+        let dest_mtime = UnixTime::mtime(&dest_path.metadata()?);
         let dest_hash = hash::digest("dest content");
 
         // Add source file to index
@@ -2002,7 +1988,6 @@ mod tests {
         let result = super::branch(
             &index,
             &tree,
-            tempdir.path(),
             &source_index_path,
             &dest_index_path,
             &source_hash,
@@ -2012,8 +1997,8 @@ mod tests {
         assert!(result, "Branch should succeed when conditions are met");
 
         // Verify hard link was created by checking pathid numbers
-        let source_metadata = std::fs::metadata(source_path.path())?;
-        let dest_metadata = std::fs::metadata(dest_path.path())?;
+        let source_metadata = std::fs::metadata(source_path)?;
+        let dest_metadata = std::fs::metadata(dest_path)?;
         assert_eq!(
             source_metadata.ino(),
             dest_metadata.ino(),
@@ -2025,7 +2010,6 @@ mod tests {
         let result = super::branch(
             &index,
             &tree,
-            tempdir.path(),
             &source_index_path,
             &dest_index_path,
             &wrong_hash,
@@ -2038,7 +2022,6 @@ mod tests {
         let result = super::branch(
             &index,
             &tree,
-            tempdir.path(),
             &source_index_path,
             &dest_index_path,
             &source_hash,
@@ -2055,7 +2038,6 @@ mod tests {
         let result = super::branch(
             &index,
             &tree,
-            tempdir.path(),
             &nonexistent_path,
             &dest_index_path,
             &source_hash,
@@ -2073,18 +2055,18 @@ mod tests {
     #[test]
     fn rename_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let tempdir = TempDir::new()?;
+        let datadir = fixture.db.index().datadir();
 
         // Create source file on disk
-        let source_path = tempdir.child("source.txt");
-        source_path.write_str("source content")?;
-        let source_mtime = UnixTime::mtime(&source_path.path().metadata()?);
+        let source_path = datadir.join("source.txt");
+        std::fs::write(&source_path, "source content")?;
+        let source_mtime = UnixTime::mtime(&source_path.metadata()?);
         let source_hash = hash::digest("source content");
 
         // Create destination file on disk with different content
-        let dest_path = tempdir.child("dest.txt");
-        dest_path.write_str("dest content")?;
-        let dest_mtime = UnixTime::mtime(&dest_path.path().metadata()?);
+        let dest_path = datadir.join("dest.txt");
+        std::fs::write(&dest_path, "dest content")?;
+        let dest_mtime = UnixTime::mtime(&dest_path.metadata()?);
         let dest_hash = hash::digest("dest content");
 
         // Add source file to index
@@ -2123,7 +2105,6 @@ mod tests {
             &mut tree,
             &mut history,
             &mut dirty,
-            tempdir.path(),
             &source_index_path,
             &dest_index_path,
             &source_hash,
@@ -2141,18 +2122,18 @@ mod tests {
     #[test]
     fn rename_conditions_not_met() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let tempdir = TempDir::new()?;
+        let datadir = fixture.db.index().datadir();
 
         // Create source file on disk
-        let source_path = tempdir.child("source.txt");
-        source_path.write_str("source content")?;
-        let source_mtime = UnixTime::mtime(&source_path.path().metadata()?);
+        let source_path = datadir.join("source.txt");
+        std::fs::write(&source_path, "source content")?;
+        let source_mtime = UnixTime::mtime(&source_path.metadata()?);
         let source_hash = hash::digest("source content");
 
         // Create destination file on disk with different content
-        let dest_path = tempdir.child("dest.txt");
-        dest_path.write_str("dest content")?;
-        let dest_mtime = UnixTime::mtime(&dest_path.path().metadata()?);
+        let dest_path = datadir.join("dest.txt");
+        std::fs::write(&dest_path, "dest content")?;
+        let dest_mtime = UnixTime::mtime(&dest_path.metadata()?);
         let dest_hash = hash::digest("dest content");
 
         // Add source file to index
@@ -2188,7 +2169,6 @@ mod tests {
             &mut tree,
             &mut history,
             &mut dirty,
-            tempdir.path(),
             &source_index_path,
             &dest_index_path,
             &wrong_hash,
@@ -2203,7 +2183,6 @@ mod tests {
             &mut tree,
             &mut history,
             &mut dirty,
-            tempdir.path(),
             &source_index_path,
             &dest_index_path,
             &source_hash,
@@ -2222,7 +2201,6 @@ mod tests {
             &mut tree,
             &mut history,
             &mut dirty,
-            tempdir.path(),
             &nonexistent_path,
             &dest_index_path,
             &source_hash,

@@ -546,6 +546,7 @@ impl<'db> ArenaWriteTransaction<'db> {
     #[track_caller]
     pub(crate) fn read_index(&self) -> Result<impl IndexReadOperations, StorageError> {
         Ok(ReadableOpenIndex::new(
+            &self.subsystems.index,
             self.inner
                 .open_table(INDEX_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
@@ -557,6 +558,7 @@ impl<'db> ArenaWriteTransaction<'db> {
     pub(crate) fn write_index(&self) -> Result<WritableOpenIndex<'_>, StorageError> {
         Ok(WritableOpenIndex::new(
             self.arena,
+            &self.subsystems.index,
             self.inner
                 .open_table(INDEX_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
@@ -628,6 +630,7 @@ impl<'db> ArenaReadTransaction<'db> {
     #[track_caller]
     pub(crate) fn read_index(&self) -> Result<impl IndexReadOperations, StorageError> {
         Ok(ReadableOpenIndex::new(
+            &self.subsystems.index,
             self.inner
                 .open_table(INDEX_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,

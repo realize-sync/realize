@@ -1286,7 +1286,6 @@ mod tests {
             let path = path.as_ref();
             update::apply(
                 &self.db,
-                None,
                 test_peer(),
                 Notification::Add {
                     arena: self.arena,
@@ -1308,7 +1307,6 @@ mod tests {
             let path = path.as_ref();
             update::apply(
                 &self.db,
-                None,
                 test_peer(),
                 Notification::Remove {
                     arena: self.arena,
@@ -1512,7 +1510,6 @@ mod tests {
 
         update::apply(
             &fixture.db,
-            None,
             peer,
             Notification::Add {
                 arena: arena,
@@ -1525,7 +1522,6 @@ mod tests {
         )?;
         update::apply(
             &fixture.db,
-            None,
             peer,
             Notification::Replace {
                 arena: arena,
@@ -1554,7 +1550,6 @@ mod tests {
 
         update::apply(
             &fixture.db,
-            None,
             peer,
             Notification::Add {
                 arena: arena,
@@ -1569,7 +1564,6 @@ mod tests {
 
         update::apply(
             &fixture.db,
-            None,
             peer,
             Notification::Replace {
                 arena: arena,
@@ -1595,7 +1589,6 @@ mod tests {
 
         update::apply(
             &fixture.db,
-            None,
             peer,
             Notification::Add {
                 arena: arena,
@@ -1611,7 +1604,6 @@ mod tests {
         // Replace is ignored because old_hash != current hash.
         update::apply(
             &fixture.db,
-            None,
             peer,
             Notification::Replace {
                 arena: arena,
@@ -1650,7 +1642,6 @@ mod tests {
 
         update::apply(
             &fixture.db,
-            None,
             peer,
             Notification::Add {
                 arena: test_arena(),
@@ -1663,7 +1654,6 @@ mod tests {
         )?;
         update::apply(
             &fixture.db,
-            None,
             peer,
             Notification::Replace {
                 arena: test_arena(),
@@ -1745,7 +1735,6 @@ mod tests {
         fixture.add_to_cache(&file_path, 100, mtime)?;
         update::apply(
             &fixture.db,
-            None,
             test_peer(),
             Notification::Remove {
                 arena,
@@ -1772,7 +1761,6 @@ mod tests {
 
         update::apply(
             &fixture.db,
-            None,
             peer1,
             Notification::Add {
                 arena: arena,
@@ -1785,7 +1773,6 @@ mod tests {
         )?;
         update::apply(
             &fixture.db,
-            None,
             peer2,
             Notification::Add {
                 arena: arena,
@@ -1801,7 +1788,6 @@ mod tests {
 
         update::apply(
             &fixture.db,
-            None,
             peer1,
             Notification::Remove {
                 arena: arena,
@@ -1841,7 +1827,6 @@ mod tests {
 
         update::apply(
             &fixture.db,
-            None,
             peer1,
             Notification::Add {
                 arena: arena,
@@ -1854,7 +1839,6 @@ mod tests {
         )?;
         update::apply(
             &fixture.db,
-            None,
             peer2,
             Notification::Add {
                 arena: arena,
@@ -1870,7 +1854,6 @@ mod tests {
 
         update::apply(
             &fixture.db,
-            None,
             peer1,
             Notification::Drop {
                 arena: arena,
@@ -1989,7 +1972,6 @@ mod tests {
 
         update::apply(
             &fixture.db,
-            None,
             peer1,
             Notification::Add {
                 arena: arena,
@@ -2002,7 +1984,6 @@ mod tests {
         )?;
         update::apply(
             &fixture.db,
-            None,
             peer2,
             Notification::Add {
                 arena: arena,
@@ -2015,7 +1996,6 @@ mod tests {
         )?;
         update::apply(
             &fixture.db,
-            None,
             peer2,
             Notification::Replace {
                 arena: arena,
@@ -2048,7 +2028,6 @@ mod tests {
 
         update::apply(
             &fixture.db,
-            None,
             a,
             Notification::Add {
                 arena: arena,
@@ -2061,7 +2040,6 @@ mod tests {
         )?;
         update::apply(
             &fixture.db,
-            None,
             b,
             Notification::Add {
                 arena: arena,
@@ -2074,7 +2052,6 @@ mod tests {
         )?;
         update::apply(
             &fixture.db,
-            None,
             c,
             Notification::Add {
                 arena: arena,
@@ -2128,7 +2105,6 @@ mod tests {
 
         update::apply(
             &fixture.db,
-            None,
             a,
             Notification::Add {
                 arena: arena,
@@ -2141,7 +2117,6 @@ mod tests {
         )?;
         update::apply(
             &fixture.db,
-            None,
             b,
             Notification::Add {
                 arena: arena,
@@ -2154,7 +2129,6 @@ mod tests {
         )?;
         update::apply(
             &fixture.db,
-            None,
             c,
             Notification::Add {
                 arena: arena,
@@ -2167,7 +2141,6 @@ mod tests {
         )?;
         update::apply(
             &fixture.db,
-            None,
             b,
             Notification::Replace {
                 arena: arena,
@@ -2203,7 +2176,6 @@ mod tests {
         // the hash chain, Hash 3 is now the newest version.
         update::apply(
             &fixture.db,
-            None,
             c,
             Notification::Replace {
                 arena: arena,
@@ -2217,7 +2189,6 @@ mod tests {
         )?;
         update::apply(
             &fixture.db,
-            None,
             c,
             Notification::Replace {
                 arena: arena,
@@ -2266,7 +2237,6 @@ mod tests {
         // Later on, b joins the party
         update::apply(
             &fixture.db,
-            None,
             b,
             Notification::Replace {
                 arena: arena,
@@ -2310,7 +2280,6 @@ mod tests {
 
         update::apply(
             &fixture.db,
-            None,
             a,
             Notification::Add {
                 arena: arena,
@@ -2323,7 +2292,6 @@ mod tests {
         )?;
         update::apply(
             &fixture.db,
-            None,
             b,
             Notification::Add {
                 arena: arena,
@@ -2336,7 +2304,6 @@ mod tests {
         )?;
         update::apply(
             &fixture.db,
-            None,
             c,
             Notification::Add {
                 arena: arena,
@@ -2349,7 +2316,6 @@ mod tests {
         )?;
         update::apply(
             &fixture.db,
-            None,
             a,
             Notification::Replace {
                 arena: arena,
@@ -2381,15 +2347,9 @@ mod tests {
             );
         }
 
+        update::apply(&fixture.db, a, Notification::CatchupStart(fixture.arena))?;
         update::apply(
             &fixture.db,
-            None,
-            a,
-            Notification::CatchupStart(fixture.arena),
-        )?;
-        update::apply(
-            &fixture.db,
-            None,
             a,
             Notification::CatchupComplete {
                 arena: arena,
@@ -2422,7 +2382,6 @@ mod tests {
 
         update::apply(
             &fixture.db,
-            None,
             peer1,
             Notification::Add {
                 arena: arena,
@@ -2436,7 +2395,6 @@ mod tests {
 
         update::apply(
             &fixture.db,
-            None,
             peer1,
             Notification::Add {
                 arena: arena,
@@ -2449,7 +2407,6 @@ mod tests {
         )?;
         update::apply(
             &fixture.db,
-            None,
             peer2,
             Notification::Add {
                 arena: arena,
@@ -2463,7 +2420,6 @@ mod tests {
 
         update::apply(
             &fixture.db,
-            None,
             peer1,
             Notification::Add {
                 arena: arena,
@@ -2476,7 +2432,6 @@ mod tests {
         )?;
         update::apply(
             &fixture.db,
-            None,
             peer2,
             Notification::Add {
                 arena: arena,
@@ -2489,7 +2444,6 @@ mod tests {
         )?;
         update::apply(
             &fixture.db,
-            None,
             peer3,
             Notification::Add {
                 arena: arena,
@@ -2503,7 +2457,6 @@ mod tests {
 
         update::apply(
             &fixture.db,
-            None,
             peer1,
             Notification::Add {
                 arena: arena,
@@ -2518,13 +2471,11 @@ mod tests {
         // Simulate a catchup that only reports file2 and file4.
         update::apply(
             &fixture.db,
-            None,
             peer1,
             Notification::CatchupStart(fixture.arena),
         )?;
         update::apply(
             &fixture.db,
-            None,
             peer1,
             Notification::Catchup {
                 arena: arena,
@@ -2536,7 +2487,6 @@ mod tests {
         )?;
         update::apply(
             &fixture.db,
-            None,
             peer1,
             Notification::Catchup {
                 arena: arena,
@@ -2548,7 +2498,6 @@ mod tests {
         )?;
         update::apply(
             &fixture.db,
-            None,
             peer1,
             Notification::CatchupComplete {
                 arena: arena,
@@ -2608,7 +2557,6 @@ mod tests {
 
         update::apply(
             &fixture.db,
-            None,
             test_peer(),
             Notification::Replace {
                 arena: arena,
@@ -2667,14 +2615,12 @@ mod tests {
         // Do a catchup that doesn't include this file (simulating file removal)
         update::apply(
             &fixture.db,
-            None,
             test_peer(),
             Notification::CatchupStart(fixture.arena),
         )?;
         // Note: No Catchup notification for the file, so it will be deleted
         update::apply(
             &fixture.db,
-            None,
             test_peer(),
             Notification::CatchupComplete { arena, index: 0 },
         )?;

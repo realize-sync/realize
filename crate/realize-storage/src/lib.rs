@@ -112,8 +112,7 @@ impl Storage {
     pub async fn update(&self, peer: Peer, notification: Notification) -> Result<(), StorageError> {
         let arena_storage = self.arena_storage(notification.arena())?;
         let fs: Arc<ArenaFilesystem> = Arc::clone(&arena_storage.fs);
-        let datadir = arena_storage.datadir.clone();
-        task::spawn_blocking(move || fs.update(peer, notification, Some(&datadir))).await??;
+        task::spawn_blocking(move || fs.update(peer, notification)).await??;
 
         Ok(())
     }
@@ -165,7 +164,7 @@ impl Storage {
     ) -> Result<Reader, StorageError> {
         let arena_storage = self.arena_storage(arena)?;
 
-        Reader::open(&arena_storage.db, &arena_storage.datadir, path).await
+        Reader::open(&arena_storage.db, path).await
     }
 
     pub async fn rsync(
@@ -177,7 +176,7 @@ impl Storage {
     ) -> anyhow::Result<Delta, StorageError> {
         let arena_storage = self.arena_storage(arena)?;
 
-        indexed_store::rsync(&arena_storage.db, &arena_storage.datadir, path, range, sig).await
+        indexed_store::rsync(&arena_storage.db, path, range, sig).await
     }
 
     /// Return an infinite stream of jobs.

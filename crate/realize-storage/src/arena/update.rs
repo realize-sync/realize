@@ -9,7 +9,6 @@ use std::sync::Arc;
 /// The notification must be meant for this arena.
 pub(crate) fn apply(
     db: &Arc<ArenaDatabase>,
-    index_root: Option<&std::path::Path>,
     peer: Peer,
     notification: Notification,
 ) -> Result<(), StorageError> {
@@ -59,17 +58,15 @@ pub(crate) fn apply(
                     &mut tree, &mut blobs, &mut dirty, peer, &path, &old_hash, false,
                 )?;
 
-                if let Some(index_root) = index_root {
-                    if let Some(indexed) = txn.read_index()?.get(&tree, &path)?
-                        && indexed.is_outdated_by(&old_hash)
-                        && indexed.matches_file(path.within(&index_root))
-                    {
-                        // This specific version has been removed
-                        // remotely. Make sure that the file hasn't
-                        // changed since it was indexed and if it hasn't,
-                        // remove it locally as well.
-                        std::fs::remove_file(&path.within(index_root))?;
-                    }
+                if let Some(indexed) = txn.read_index()?.get(&tree, &path)?
+                    && indexed.is_outdated_by(&old_hash)
+                    && indexed.matches_file(path.within(db.index().datadir()))
+                {
+                    // This specific version has been removed
+                    // remotely. Make sure that the file hasn't
+                    // changed since it was indexed and if it hasn't,
+                    // remove it locally as well.
+                    std::fs::remove_file(&path.within(db.index().datadir()))?;
                 }
             }
             Notification::Drop { path, old_hash, .. } => cache.notify_dropped_or_removed(
@@ -96,24 +93,14 @@ pub(crate) fn apply(
                 old_hash,
                 ..
             } => {
-                if let Some(index_root) = index_root {
-                    let index = txn.read_index()?;
-                    if index::branch(
-                        &index,
-                        &tree,
-                        index_root,
-                        &source,
-                        &dest,
-                        &hash,
-                        old_hash.as_ref(),
-                    )? {
-                        log::debug!("[{arena}] branched {source} {hash} -> {dest}");
-                    } else {
-                        log::debug!(
-                            "[{arena}] wrong versions; ignored:
+                let index = txn.read_index()?;
+                if index::branch(&index, &tree, &source, &dest, &hash, old_hash.as_ref())? {
+                    log::debug!("[{arena}] branched {source} {hash} -> {dest}");
+                } else {
+                    log::debug!(
+                        "[{arena}] wrong versions; ignored:
   branch {source} {hash} -> {dest} {old_hash:?}"
-                        )
-                    }
+                    )
                 }
             }
             Notification::Rename {
@@ -123,27 +110,24 @@ pub(crate) fn apply(
                 old_hash,
                 ..
             } => {
-                if let Some(index_root) = index_root {
-                    let mut index = txn.write_index()?;
-                    let mut history = txn.write_history()?;
-                    if index::rename(
-                        &mut index,
-                        &mut tree,
-                        &mut history,
-                        &mut dirty,
-                        index_root,
-                        &source,
-                        &dest,
-                        &hash,
-                        old_hash.as_ref(),
-                    )? {
-                        log::debug!("[{arena}] renamed {source} {hash} -> {dest}");
-                    } else {
-                        log::debug!(
-                            "[{arena}] wrong versions; ignored:
+                let mut index = txn.write_index()?;
+                let mut history = txn.write_history()?;
+                if index::rename(
+                    &mut index,
+                    &mut tree,
+                    &mut history,
+                    &mut dirty,
+                    &source,
+                    &dest,
+                    &hash,
+                    old_hash.as_ref(),
+                )? {
+                    log::debug!("[{arena}] renamed {source} {hash} -> {dest}");
+                } else {
+                    log::debug!(
+                        "[{arena}] wrong versions; ignored:
   rename {source} {hash} -> {dest} {old_hash:?}"
-                        )
-                    }
+                    )
                 }
             }
         }

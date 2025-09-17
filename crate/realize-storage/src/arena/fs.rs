@@ -227,9 +227,8 @@ impl ArenaFilesystem {
         &self,
         peer: Peer,
         notification: Notification,
-        index_root: Option<&std::path::Path>,
     ) -> Result<(), StorageError> {
-        update::apply(&self.db, index_root, peer, notification)
+        update::apply(&self.db, peer, notification)
     }
 
     /// Open a file for reading/writing.
@@ -393,6 +392,10 @@ mod tests {
     use assert_fs::prelude::*;
     use realize_types::{Hash, Path, Peer, UnixTime};
 
+    fn test_peer() -> Peer {
+        Peer::from("test")
+    }
+
     struct Fixture {
         fs: Arc<ArenaFilesystem>,
         db: Arc<ArenaDatabase>,
@@ -433,8 +436,7 @@ mod tests {
         let test_path = Path::parse("dir/test_file.txt")?;
         update::apply(
             &fixture.db,
-            None,
-            Peer::from("test_peer"),
+            test_peer(),
             Notification::Add {
                 arena: fixture.fs.arena(),
                 index: 1,

@@ -11,7 +11,6 @@ use notify::{Event, EventKind, RecommendedWatcher, Watcher as _};
 use realize_types::{self, Path, UnixTime};
 use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt as _;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs::{self, File};
@@ -103,7 +102,6 @@ impl RealWatcherBuilder {
     /// Background work is also stopped at some point after the instance is dropped.
     pub async fn spawn(self) -> anyhow::Result<RealWatcher> {
         RealWatcher::spawn(
-            &self.root,
             self.exclude,
             Arc::clone(&self.db),
             self.initial_scan,
@@ -116,22 +114,19 @@ impl RealWatcherBuilder {
 
 impl RealWatcher {
     /// Create a builder for configuring and spawning a RealWatcher.
-    pub fn builder<P>(root: P, db: Arc<ArenaDatabase>) -> RealWatcherBuilder
-    where
-        P: AsRef<std::path::Path>,
-    {
+    pub fn builder(db: Arc<ArenaDatabase>) -> RealWatcherBuilder {
+        let root = db.index().datadir().to_path_buf();
         RealWatcherBuilder::new(root, db)
     }
 
     async fn spawn(
-        root: &std::path::Path,
         exclude: Vec<realize_types::Path>,
         db: Arc<ArenaDatabase>,
         initial_scan: bool,
         debounce: Duration,
         max_parallelism: usize,
     ) -> anyhow::Result<Self> {
-        let root = fs::canonicalize(&root).await?;
+        let root = fs::canonicalize(db.index().datadir()).await?;
         let arena = db.arena();
 
         let (watch_tx, watch_rx) = mpsc::channel(100);
@@ -167,7 +162,6 @@ impl RealWatcher {
         let (rescan_tx, rescan_rx) = mpsc::channel(16);
 
         let worker = Arc::new(RealWatcherWorker {
-            root: root.clone(),
             db: db.clone(),
             exclude,
         });
@@ -285,7 +279,6 @@ fn take_path(root: &std::path::Path, exclude: &Vec<Path>, mut ev: Event) -> Opti
 }
 
 struct RealWatcherWorker {
-    root: PathBuf,
     db: Arc<ArenaDatabase>,
 
     /// Paths that should be excluded from the index. These may be
@@ -316,7 +309,7 @@ impl RealWatcherWorker {
                 }
                 // run scan, below
             });
-            let root = &self.root;
+            let root = self.db.index().datadir();
             log::info!("[{arena}] Scanning {root:?}");
             if let Err(err) = self.rescan_added(&watch_tx, &mut shutdown_rx).await {
                 log::warn!("[{arena}] Scanning {root:?} for added files failed: {err}");
@@ -340,6 +333,7 @@ impl RealWatcherWorker {
         watch_tx: &mpsc::Sender<FsEvent>,
         shutdown_rx: &mut broadcast::Receiver<()>,
     ) -> anyhow::Result<()> {
+        let root = self.db.index().datadir();
         let mut files = std::pin::pin!(index::all_files_stream(&self.db));
         loop {
             tokio::select!(
@@ -361,12 +355,12 @@ impl RealWatcherWorker {
                     // from the index.
                     is_deleted = true;
                 } else {
-                    match fs_utils::metadata_no_symlink(&self.root, &path).await {
+                    match fs_utils::metadata_no_symlink(root, &path).await {
                         Err(_) => {
                             is_deleted = true;
                         }
                         Ok(m) => {
-                            if !file_is_readable(&path.within(&self.root)).await {
+                            if !file_is_readable(&path.within(root)).await {
                                 is_deleted = true;
                             } else if m.len() != entry.size || UnixTime::mtime(&m) != entry.mtime {
                                 is_modified = true;
@@ -391,7 +385,8 @@ impl RealWatcherWorker {
         watch_tx: &mpsc::Sender<FsEvent>,
         shutdown_rx: &mut broadcast::Receiver<()>,
     ) -> anyhow::Result<()> {
-        let mut direntries = async_walkdir::WalkDir::new(&self.root).filter(only_regular);
+        let root = self.db.index().datadir();
+        let mut direntries = async_walkdir::WalkDir::new(root).filter(only_regular);
 
         loop {
             tokio::select!(
@@ -482,6 +477,7 @@ impl RealWatcherWorker {
         rescan_tx: &mpsc::Sender<()>,
         debouncer: &mut DebouncerMap<Path, Result<(), StorageError>>,
     ) -> anyhow::Result<()> {
+        let root = self.db.index().datadir();
         match ev {
             FsEvent::Removed(path) => {
                 if index::has_file_async(&self.db, &path).await? {
@@ -491,12 +487,11 @@ impl RealWatcherWorker {
                     // application right away.
                     debouncer.spawn_unlimited(path.clone(), {
                         let db = self.db.clone();
-                        let root = self.root.clone();
                         let path = path.clone();
                         async move {
                             let arena = db.arena();
                             log::info!("[{arena}] Remove: \"{path}\"");
-                            if !index::remove_file_if_missing_async(&db, &root, &path).await? {
+                            if !index::remove_file_if_missing_async(&db, &path).await? {
                                 log::debug!("[{arena}] Mismatch; Skipped removing \"{path}\"",);
                             }
                             Ok(())
@@ -512,7 +507,7 @@ impl RealWatcherWorker {
             }
 
             FsEvent::DirCreated(path) => {
-                let m = fs_utils::metadata_no_symlink(&self.root, path).await?;
+                let m = fs_utils::metadata_no_symlink(root, path).await?;
                 // Checking is_dir() because the  folder might actually be a symlink.
                 if m.is_dir() {
                     self.dir_created_or_modified(path, debouncer).await?;
@@ -520,7 +515,7 @@ impl RealWatcherWorker {
             }
 
             FsEvent::FileCreated(path) => {
-                if let Ok(m) = fs_utils::metadata_no_symlink(&self.root, path).await
+                if let Ok(m) = fs_utils::metadata_no_symlink(root, path).await
                     && m.is_file()
                 {
                     // If not a hard link, not a rename and len > 0,
@@ -543,7 +538,7 @@ impl RealWatcherWorker {
                 // checking here.
 
                 for path in paths {
-                    match fs_utils::metadata_no_symlink(&self.root, path).await {
+                    match fs_utils::metadata_no_symlink(root, path).await {
                         Ok(m) => {
                             // Possibly moved to; add or update
                             if m.is_file() {
@@ -564,14 +559,14 @@ impl RealWatcherWorker {
                 // inacessible or the other way round. This is stored
                 // as add/remove, with inaccessible files treated as
                 // if they're gone.
-                match fs_utils::metadata_no_symlink(&self.root, path).await {
+                match fs_utils::metadata_no_symlink(root, path).await {
                     Err(_) => {
                         // Not accessible anymore.
                         self.file_or_dir_removed(path).await?;
                     }
                     Ok(m) => {
                         if m.is_dir() {
-                            if fs::read_dir(path.within(&self.root)).await.is_ok() {
+                            if fs::read_dir(path.within(root)).await.is_ok() {
                                 // Might have just become accessible.
                                 self.dir_created_or_modified(path, debouncer).await?;
                             } else {
@@ -579,7 +574,7 @@ impl RealWatcherWorker {
                                 self.file_or_dir_removed(path).await?;
                             }
                         } else {
-                            if file_is_readable(&path.within(&self.root)).await {
+                            if file_is_readable(&path.within(root)).await {
                                 // Might have just become accessible.
                                 self.file_created_or_modified(path, &m, debouncer).await?;
                             } else {
@@ -592,7 +587,7 @@ impl RealWatcherWorker {
             }
 
             FsEvent::ContentModified(path) | FsEvent::NeedsUpdate(path) => {
-                let m = fs_utils::metadata_no_symlink(&self.root, path).await?;
+                let m = fs_utils::metadata_no_symlink(root, path).await?;
                 if m.is_file() {
                     // This event only matters if it's a file.
                     self.file_created_or_modified(path, &m, debouncer).await?;
@@ -618,7 +613,8 @@ impl RealWatcherWorker {
         debouncer: &mut DebouncerMap<Path, Result<(), StorageError>>,
     ) -> Result<(), anyhow::Error> {
         let mut direntries =
-            async_walkdir::WalkDir::new(dirpath.within(&self.root)).filter(only_regular);
+            async_walkdir::WalkDir::new(dirpath.within(&self.db.index().datadir()))
+                .filter(only_regular);
         while let Some(direntry) = direntries.next().await {
             let direntry = match direntry {
                 Err(_) => {
@@ -680,17 +676,16 @@ impl RealWatcherWorker {
         }
         debouncer.spawn_limited(path.clone(), size > 0, {
             let db = self.db.clone();
-            let root = self.root.clone();
             let path = path.clone();
             async move {
                 let hash = if size > 0 {
-                    hash::hash_file(File::open(path.within(&root)).await?).await?
+                    hash::hash_file(File::open(path.within(db.index().datadir())).await?).await?
                 } else {
                     hash::empty()
                 };
                 let arena = db.arena();
                 log::info!("[{arena}] Hashed: \"{path}\" {hash} size={size}");
-                if !index::add_file_if_matches_async(&db, &root, &path, size, mtime, hash).await? {
+                if !index::add_file_if_matches_async(&db, &path, size, mtime, hash).await? {
                     log::debug!("[{arena}] Mismatch; Skipped adding \"{path}\"",);
                 }
                 Ok(())
@@ -708,7 +703,7 @@ impl RealWatcherWorker {
         let path = path.as_ref();
         // TODO: Should this use a PathResolver? We may or may not want
         // to care about partial/full files here.
-        realize_types::Path::from_real_path_in(&path, &self.root)
+        realize_types::Path::from_real_path_in(&path, &self.db.index().datadir())
     }
 }
 
@@ -791,7 +786,7 @@ mod tests {
 
         /// Catch up to any previous changes and watch for anything new.
         async fn scan_and_watch(&self) -> anyhow::Result<RealWatcher> {
-            RealWatcher::builder(self.root.path(), Arc::clone(&self.db))
+            RealWatcher::builder(Arc::clone(&self.db))
                 .with_initial_scan()
                 .exclude_all(self.exclude.iter())
                 .spawn()
@@ -803,7 +798,7 @@ mod tests {
         /// Note that filesystem modifications made just before this
         /// is called might still get reported.
         async fn watch(&self) -> anyhow::Result<RealWatcher> {
-            RealWatcher::builder(self.root.path(), Arc::clone(&self.db))
+            RealWatcher::builder(Arc::clone(&self.db))
                 .exclude_all(self.exclude.iter())
                 .spawn()
                 .await

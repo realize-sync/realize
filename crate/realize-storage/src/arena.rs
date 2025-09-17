@@ -6,8 +6,8 @@ use db::ArenaDatabase;
 use engine::Engine;
 use fs::ArenaFilesystem;
 use realize_types::Arena;
+use std::sync::Arc;
 use std::time::Duration;
-use std::{path::PathBuf, sync::Arc};
 use tokio_util::sync::CancellationToken;
 use tokio_util::sync::DropGuard;
 use watcher::RealWatcher;
@@ -36,7 +36,6 @@ pub(crate) struct ArenaStorage {
     pub(crate) db: Arc<ArenaDatabase>,
     pub(crate) fs: Arc<ArenaFilesystem>,
     pub(crate) engine: Arc<Engine>,
-    pub(crate) datadir: PathBuf,
     _watcher: RealWatcher,
     _drop_guard: DropGuard,
 }
@@ -74,7 +73,7 @@ impl ArenaStorage {
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        let watcher = RealWatcher::builder(datadir, Arc::clone(&db))
+        let watcher = RealWatcher::builder(Arc::clone(&db))
             .with_initial_scan()
             .exclude_all(exclude.iter())
             .debounce(
@@ -105,14 +104,13 @@ impl ArenaStorage {
 
         let engine = Engine::new(arena, Arc::clone(&db), job_retry_strategy);
 
-        jobs::StorageJobProcessor::new(Arc::clone(&db), Arc::clone(&engine), datadir.clone())
+        jobs::StorageJobProcessor::new(Arc::clone(&db), Arc::clone(&engine))
             .spawn(shutdown.clone());
 
         Ok(ArenaStorage {
             db,
             fs: Arc::clone(&arena_fs),
             engine,
-            datadir: datadir.clone(),
             _watcher: watcher,
             _drop_guard: shutdown.drop_guard(),
         })

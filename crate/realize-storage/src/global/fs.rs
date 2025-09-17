@@ -347,7 +347,7 @@ impl Filesystem {
         let this = Arc::clone(self);
         task::spawn_blocking(move || {
             let fs = this.arena_fs(notification.arena())?;
-            fs.update(peer, notification, None)
+            fs.update(peer, notification)
         })
         .await?
     }
