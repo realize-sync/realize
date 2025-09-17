@@ -8,9 +8,10 @@ use super::types::{FileTableEntry, HistoryTableEntry};
 use crate::utils::fs_utils;
 use crate::utils::holder::Holder;
 use crate::{PathId, StorageError};
-use realize_types::{self, Hash, Path, UnixTime};
+use realize_types::{self, Arena, Hash, Path, UnixTime};
 use redb::{ReadableTable, Table};
 use std::ops::RangeBounds;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task;
@@ -224,6 +225,21 @@ impl From<&FileTableEntry> for IndexedFile {
     }
 }
 
+pub(crate) struct Index {
+    datadir: PathBuf,
+}
+impl Index {
+    pub(crate) fn new(datadir: &std::path::Path) -> Self {
+        Self {
+            datadir: datadir.to_path_buf(),
+        }
+    }
+
+    pub(crate) fn datadir(&self) -> &std::path::Path {
+        &self.datadir
+    }
+}
+
 pub(crate) struct ReadableOpenIndex<T>
 where
     T: ReadableTable<PathId, Holder<'static, FileTableEntry>>,
@@ -241,12 +257,13 @@ where
 }
 
 pub(crate) struct WritableOpenIndex<'a> {
+    arena: Arena,
     table: Table<'a, PathId, Holder<'static, FileTableEntry>>,
 }
 
 impl<'a> WritableOpenIndex<'a> {
-    pub(crate) fn new(table: Table<'a, PathId, Holder<FileTableEntry>>) -> Self {
-        Self { table }
+    pub(crate) fn new(arena: Arena, table: Table<'a, PathId, Holder<FileTableEntry>>) -> Self {
+        Self { arena, table }
     }
 }
 
@@ -851,21 +868,30 @@ mod tests {
     use assert_fs::prelude::*;
     use realize_types::Arena;
     use std::collections::{HashMap, HashSet};
+    use std::fs;
     use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
 
     struct Fixture {
         db: Arc<ArenaDatabase>,
+        _tempdir: TempDir,
     }
 
     impl Fixture {
         fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
             let arena = Arena::from("myarena");
-            let db =
-                ArenaDatabase::for_testing_single_arena(arena, std::path::Path::new("/dev/null"))?;
+            let tempdir = TempDir::new()?;
+            let blob_dir = tempdir.child("blobs");
+            blob_dir.create_dir_all()?;
+            let datadir = tempdir.child("data");
+            datadir.create_dir_all()?;
+            let db = ArenaDatabase::for_testing_single_arena(arena, blob_dir, datadir)?;
 
-            Ok(Self { db })
+            Ok(Self {
+                db,
+                _tempdir: tempdir,
+            })
         }
     }
     fn dirty_pathids(
@@ -1564,18 +1590,16 @@ mod tests {
     #[test]
     fn index_add_file_if_matches_success() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-
-        // Create a file on disk
-        let tempdir = TempDir::new()?;
-        let file_path = tempdir.child("foo");
-        file_path.write_str("foo")?;
+        let datadir = fixture.db.index().datadir();
+        let foo = datadir.join("foo");
+        fs::write(&foo, b"foo")?;
 
         assert!(super::add_file_if_matches(
             &fixture.db,
-            tempdir.path(),
+            datadir,
             &realize_types::Path::parse("foo")?,
             3,
-            UnixTime::mtime(&file_path.path().metadata()?),
+            UnixTime::mtime(&foo.metadata()?),
             hash::digest("foo"),
         )?);
         assert!(super::has_file(
@@ -1589,14 +1613,13 @@ mod tests {
     #[test]
     fn index_add_file_if_matches_time_mismatch() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        // Create a file on disk
-        let tempdir = TempDir::new()?;
-        let file_path = tempdir.child("foo");
-        file_path.write_str("foo")?;
+        let datadir = fixture.db.index().datadir();
+        let file_path = datadir.join("foo");
+        fs::write(&file_path, b"foo")?;
 
         assert!(!super::add_file_if_matches(
             &fixture.db,
-            tempdir.path(),
+            datadir,
             &realize_types::Path::parse("foo")?,
             3,
             UnixTime::from_secs(1234567890),
@@ -1613,18 +1636,16 @@ mod tests {
     #[test]
     fn index_add_file_if_matches_size_mismatch() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-
-        // Create a file on disk
-        let tempdir = TempDir::new()?;
-        let file_path = tempdir.child("foo");
-        file_path.write_str("foo")?;
+        let datadir = fixture.db.index().datadir();
+        let file_path = datadir.join("foo");
+        fs::write(&file_path, b"foo")?;
 
         assert!(!super::add_file_if_matches(
             &fixture.db,
-            tempdir.path(),
+            datadir,
             &realize_types::Path::parse("foo")?,
             2,
-            UnixTime::mtime(&file_path.path().metadata()?),
+            UnixTime::mtime(&file_path.metadata()?),
             hash::digest("foo"),
         )?);
         assert!(!super::has_file(
@@ -1638,17 +1659,15 @@ mod tests {
     #[test]
     fn index_add_file_if_matches_missing() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-
-        // Create a file on disk then remove it
-        let tempdir = TempDir::new()?;
-        let file_path = tempdir.child("foo");
-        file_path.write_str("foo")?;
-        let mtime = UnixTime::mtime(&file_path.path().metadata()?);
-        std::fs::remove_file(file_path.path())?;
+        let datadir = fixture.db.index().datadir();
+        let file_path = datadir.join("foo");
+        fs::write(&file_path, b"foo")?;
+        let mtime = UnixTime::mtime(&file_path.metadata()?);
+        std::fs::remove_file(&file_path)?;
 
         assert!(!super::add_file_if_matches(
             &fixture.db,
-            tempdir.path(),
+            datadir,
             &realize_types::Path::parse("foo")?,
             3,
             mtime,

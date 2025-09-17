@@ -467,8 +467,8 @@ mod tests {
         async fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
             let arena = test_arena();
-            let db =
-                ArenaDatabase::for_testing_single_arena(arena, &std::path::Path::new("/dev/null"))?;
+            let null = std::path::Path::new("/dev/null");
+            let db = ArenaDatabase::for_testing_single_arena(arena, &null, &null)?;
             Ok(Self {
                 db,
                 current_time: UnixTime::from_secs(1234567890),

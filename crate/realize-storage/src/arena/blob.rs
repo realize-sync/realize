@@ -1544,12 +1544,12 @@ mod tests {
             let _ = env_logger::try_init();
             let arena = test_arena();
             let tempdir = TempDir::new()?;
-            let child = tempdir.child(format!("{arena}-cache.db"));
             let blob_dir = tempdir.child(format!("{arena}/blobs"));
-            if let Some(p) = child.parent() {
-                std::fs::create_dir_all(p)?;
-            }
-            let db = ArenaDatabase::for_testing_single_arena(arena, blob_dir.path())?;
+            blob_dir.create_dir_all()?;
+            let datadir = tempdir.child(format!("{arena}/data"));
+            datadir.create_dir_all()?;
+            let db =
+                ArenaDatabase::for_testing_single_arena(arena, blob_dir.path(), datadir.path())?;
 
             Ok(Self {
                 arena,

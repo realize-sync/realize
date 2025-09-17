@@ -57,10 +57,11 @@ impl ArenaStorage {
             arena,
             Arc::clone(allocator),
             &arena_config.workdir.join("blobs"),
+            datadir,
         )
         .with_context(|| format!("[{arena}] Arena database in {dbpath:?}",))?;
 
-        let arena_fs = ArenaFilesystem::new(arena, Arc::clone(&db), datadir)?;
+        let arena_fs = ArenaFilesystem::new(arena, Arc::clone(&db))?;
         let exclude = exclude
             .iter()
             .filter_map(|p| realize_types::Path::from_real_path_in(p, &datadir))

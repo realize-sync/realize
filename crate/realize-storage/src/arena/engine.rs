@@ -649,8 +649,9 @@ mod tests {
                 arena,
                 PathIdAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?,
                 &blob_dir,
+                &datadir,
             )?;
-            let acache = ArenaFilesystem::new(arena, Arc::clone(&db), &datadir)?;
+            let acache = ArenaFilesystem::new(arena, Arc::clone(&db))?;
             let engine = Engine::new(arena, Arc::clone(&db), |attempt| {
                 if attempt < 3 {
                     Some(Duration::from_secs(attempt as u64 * 10))

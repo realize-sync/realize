@@ -12,6 +12,7 @@ use super::types::{
     MarkTableEntry, PeerTableEntry, QueueTableEntry,
 };
 use crate::StorageError;
+use crate::arena::index::Index;
 use crate::types::Inode;
 use crate::utils::holder::{ByteConversionError, Holder};
 use crate::{PathId, PathIdAllocator};
@@ -187,13 +188,15 @@ struct Subsystems {
     dirty: Dirty,
     history: History,
     blobs: Blobs,
+    index: Index,
 }
 
 impl ArenaDatabase {
     #[cfg(test)]
-    pub fn for_testing_single_arena<P: AsRef<std::path::Path>>(
+    pub fn for_testing_single_arena(
         arena: realize_types::Arena,
-        blob_dir: P,
+        blob_dir: impl AsRef<std::path::Path>,
+        datadir: impl AsRef<std::path::Path>,
     ) -> anyhow::Result<Arc<Self>> {
         ArenaDatabase::for_testing(
             arena,
@@ -202,30 +205,35 @@ impl ArenaDatabase {
                 [arena],
             )?,
             blob_dir,
+            datadir,
         )
     }
 
     #[cfg(test)]
-    pub fn for_testing<P: AsRef<std::path::Path>>(
+    pub fn for_testing(
         arena: realize_types::Arena,
         allocator: Arc<crate::PathIdAllocator>,
-        blob_dir: P,
+        blob_dir: impl AsRef<std::path::Path>,
+        datadir: impl AsRef<std::path::Path>,
     ) -> anyhow::Result<Arc<Self>> {
         Ok(ArenaDatabase::new(
             crate::utils::redb_utils::in_memory()?,
             arena,
             allocator,
             blob_dir,
+            datadir,
         )?)
     }
 
-    pub fn new<P: AsRef<std::path::Path>>(
+    pub fn new(
         db: redb::Database,
         arena: Arena,
         allocator: Arc<PathIdAllocator>,
-        blob_dir: P,
+        blob_dir: impl AsRef<std::path::Path>,
+        datadir: impl AsRef<std::path::Path>,
     ) -> Result<Arc<Self>, StorageError> {
         let tree = Tree::new(arena, allocator)?;
+        let index = Index::new(datadir.as_ref());
         let dirty: Dirty;
         let history: History;
         let blobs: Blobs;
@@ -271,6 +279,7 @@ impl ArenaDatabase {
                 dirty,
                 history,
                 blobs,
+                index,
             },
         }))
     }
@@ -305,6 +314,11 @@ impl ArenaDatabase {
     /// Return handle on the Blobs subsystem.
     pub fn blobs(&self) -> &Blobs {
         &self.subsystems.blobs
+    }
+
+    /// Return handle on the Index subsystem.
+    pub fn index(&self) -> &Index {
+        &self.subsystems.index
     }
 
     pub fn begin_write(&self) -> Result<ArenaWriteTransaction<'_>, StorageError> {
@@ -542,6 +556,7 @@ impl<'db> ArenaWriteTransaction<'db> {
     #[track_caller]
     pub(crate) fn write_index(&self) -> Result<WritableOpenIndex<'_>, StorageError> {
         Ok(WritableOpenIndex::new(
+            self.arena,
             self.inner
                 .open_table(INDEX_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
@@ -758,6 +773,7 @@ mod tests {
             let db = ArenaDatabase::for_testing_single_arena(
                 Arena::from("myarena"),
                 std::path::Path::new("/dev/null"),
+                std::path::Path::new("/dev/null"),
             )?;
 
             Ok(Self { db })
@@ -864,6 +880,7 @@ mod tests {
         let tempdir = TempDir::new()?;
         let dbpath = tempdir.join("myarena.db");
         let blob_dir = tempdir.join("blobs");
+        let datadir = tempdir.join("data");
         let arena = Arena::from("myarena");
         let allocator =
             PathIdAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
@@ -872,6 +889,7 @@ mod tests {
             arena,
             Arc::clone(&allocator),
             &blob_dir,
+            &datadir,
         )?;
 
         let uuid = db.uuid().clone();
@@ -883,6 +901,7 @@ mod tests {
             arena,
             Arc::clone(&allocator),
             &blob_dir,
+            &datadir,
         )?;
         assert_eq!(uuid, *db.uuid());
 

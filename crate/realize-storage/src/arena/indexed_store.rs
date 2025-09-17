@@ -150,7 +150,11 @@ mod tests {
             root.create_dir_all()?;
 
             let arena = test_arena();
-            let db = ArenaDatabase::for_testing_single_arena(arena, &tempdir.path().join("blobs"))?;
+            let db = ArenaDatabase::for_testing_single_arena(
+                arena,
+                &tempdir.path().join("blobs"),
+                root.path(),
+            )?;
 
             Ok(Self {
                 db,

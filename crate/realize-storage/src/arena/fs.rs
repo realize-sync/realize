@@ -11,7 +11,6 @@ use crate::types::Inode;
 use crate::{Blob, LocalAvailability};
 use crate::{PathId, StorageError};
 use realize_types::{Arena, Path, Peer};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 // TreeLoc is necessary to call ArenaCache methods
@@ -24,8 +23,6 @@ pub(crate) use super::tree::TreeLoc;
 pub(crate) struct ArenaFilesystem {
     arena: Arena,
     db: Arc<ArenaDatabase>,
-    #[allow(dead_code)] // do not submit
-    datadir: PathBuf,
 }
 
 impl ArenaFilesystem {
@@ -59,22 +56,15 @@ impl ArenaFilesystem {
             arena,
             allocator,
             blob_dir,
+            datadir,
         )?;
 
-        Ok(ArenaFilesystem::new(arena, Arc::clone(&db), datadir)?)
+        Ok(ArenaFilesystem::new(arena, Arc::clone(&db))?)
     }
 
     /// Create a new ArenaCache from an arena, root pathid, database, and blob directory.
-    pub(crate) fn new(
-        arena: Arena,
-        db: Arc<ArenaDatabase>,
-        datadir: &std::path::Path,
-    ) -> Result<Arc<Self>, StorageError> {
-        Ok(Arc::new(Self {
-            arena,
-            db,
-            datadir: datadir.to_path_buf(),
-        }))
+    pub(crate) fn new(arena: Arena, db: Arc<ArenaDatabase>) -> Result<Arc<Self>, StorageError> {
+        Ok(Arc::new(Self { arena, db }))
     }
 
     pub(crate) fn arena(&self) -> Arena {

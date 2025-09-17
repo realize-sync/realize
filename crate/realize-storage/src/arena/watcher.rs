@@ -771,8 +771,11 @@ mod tests {
             root.create_dir_all()?;
 
             let arena = Arena::from("test");
-            let db =
-                ArenaDatabase::for_testing_single_arena(arena, &std::path::Path::new("/dev/null"))?;
+            let db = ArenaDatabase::for_testing_single_arena(
+                arena,
+                &std::path::Path::new("/dev/null"),
+                root.path(),
+            )?;
             Ok(Self {
                 root,
                 db,
