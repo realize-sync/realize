@@ -58,7 +58,7 @@ pub(crate) fn apply(
                     &mut tree, &mut blobs, &mut dirty, peer, &path, &old_hash, false,
                 )?;
 
-                if let Some(indexed) = txn.read_index()?.get(&tree, &path)?
+                if let Some(indexed) = txn.read_index()?.indexed(&tree, &path)?
                     && indexed.is_outdated_by(&old_hash)
                     && indexed.matches_file(path.within(db.index().datadir()))
                 {

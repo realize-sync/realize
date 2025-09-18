@@ -140,7 +140,7 @@ impl StorageJobProcessor {
 
             let mut history = txn.write_history()?;
             let mut dirty = txn.write_dirty()?;
-            index.drop(&mut tree, &mut history, &mut dirty, pathid)?;
+            index.drop_from_index(&mut tree, &mut history, &mut dirty, pathid)?;
 
             // We make a second check of the file mtime and size just
             // before renaming, in case it has changed.
@@ -218,7 +218,7 @@ impl StorageJobProcessor {
             }
             let mut history = txn.write_history()?;
             let mut dirty = txn.write_dirty()?;
-            index.drop(&mut tree, &mut history, &mut dirty, pathid)?;
+            index.drop_from_index(&mut tree, &mut history, &mut dirty, pathid)?;
         }
         txn.commit()?;
         std::fs::remove_file(&realpath)?;
@@ -301,7 +301,7 @@ impl StorageJobProcessor {
             }
             let mut history = txn.write_history()?;
             let mut dirty = txn.write_dirty()?;
-            index.add(
+            index.index(
                 &mut tree,
                 &mut history,
                 &mut dirty,
@@ -641,7 +641,7 @@ mod tests {
         let cache = txn.read_cache()?;
         let index = txn.read_index()?;
         let history = txn.read_history()?;
-        assert!(!index.has(&tree, &path)?);
+        assert!(!index.is_indexed(&tree, &path)?);
         assert!(!fixture.file_exists("dir/test.txt"));
 
         assert!(cache.metadata(&tree, &path)?.is_some());

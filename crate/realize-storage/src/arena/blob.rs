@@ -1391,7 +1391,7 @@ impl Blob {
             // Create an entry without broadcasting it, as it's going
             // to be modified.
             let mut index = txn.write_index()?;
-            index.silent_add(
+            index.index_silently(
                 &mut tree,
                 pathid,
                 self.info.size,
@@ -3299,7 +3299,7 @@ mod tests {
         let txn = fixture.begin_read()?;
         let index = txn.read_index()?;
         let tree = txn.read_tree()?;
-        let indexed = index.get(&tree, &path)?.unwrap();
+        let indexed = index.indexed(&tree, &path)?.unwrap();
         assert_eq!(blob_info.hash, indexed.hash);
 
         // Verify no history entry was added (the old version should

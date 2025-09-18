@@ -58,7 +58,7 @@ pub(crate) trait CacheReadOperations {
     fn map_to_pathid(&self, inode: Inode) -> Result<PathId, StorageError>;
 
     /// Get the indexed entry at the given pathid
-    fn indexed_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError>;
+    fn index_entry_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError>;
 
     /// Return all indexed files in the index layer
     fn all_indexed(&self) -> impl Iterator<Item = Result<(PathId, IndexedFile), StorageError>>;
@@ -158,7 +158,7 @@ where
         map_to_pathid(&self.inode_to_pathid, inode)
     }
 
-    fn indexed_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError> {
+    fn index_entry_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError> {
         indexed_entry(&self.table, pathid)
     }
 
@@ -218,7 +218,7 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         map_to_pathid(&self.inode_to_pathid, inode)
     }
 
-    fn indexed_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError> {
+    fn index_entry_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError> {
         indexed_entry(&self.table, pathid)
     }
 
@@ -875,7 +875,7 @@ impl<'a> WritableOpenCache<'a> {
     }
 
     /// Add a entry to the index layer
-    pub(crate) fn index<'b, L: Into<TreeLoc<'b>>>(
+    pub(crate) fn add_index_entry<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree,
         loc: L,
@@ -898,7 +898,7 @@ impl<'a> WritableOpenCache<'a> {
     /// Remove an entry from the index layer.
     ///
     /// Does nothing if the entry is not there
-    pub(crate) fn unindex<'b, L: Into<TreeLoc<'b>>>(
+    pub(crate) fn remove_index_entry<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree,
         loc: L,
@@ -2780,10 +2780,10 @@ mod tests {
         let mut cache = txn.write_cache()?;
         let mut tree = txn.write_tree()?;
 
-        cache.index(&mut tree, &path, indexed_file.clone())?;
+        cache.add_index_entry(&mut tree, &path, indexed_file.clone())?;
 
         let pathid = tree.resolve(&path)?.unwrap();
-        let retrieved = cache.indexed_at_pathid(pathid)?.unwrap();
+        let retrieved = cache.index_entry_at_pathid(pathid)?.unwrap();
         assert_eq!(indexed_file, retrieved);
 
         Ok(())
@@ -2798,7 +2798,7 @@ mod tests {
         let mut cache = txn.write_cache()?;
         let mut tree = txn.write_tree()?;
 
-        cache.index(
+        cache.add_index_entry(
             &mut tree,
             &path,
             IndexedFile {
@@ -2809,11 +2809,11 @@ mod tests {
             },
         )?;
         let pathid = tree.expect(&path)?;
-        cache.unindex(&mut tree, &path)?;
-        assert!(cache.indexed_at_pathid(pathid)?.is_none());
+        cache.remove_index_entry(&mut tree, &path)?;
+        assert!(cache.index_entry_at_pathid(pathid)?.is_none());
 
         // A second unindex doesn't fail
-        cache.unindex(&mut tree, &path)?;
+        cache.remove_index_entry(&mut tree, &path)?;
 
         Ok(())
     }
@@ -2846,12 +2846,12 @@ mod tests {
         let mut cache = txn.write_cache()?;
         let mut tree = txn.write_tree()?;
 
-        cache.index(&mut tree, &path, indexed_file1)?;
-        cache.index(&mut tree, &path, indexed_file2)?;
+        cache.add_index_entry(&mut tree, &path, indexed_file1)?;
+        cache.add_index_entry(&mut tree, &path, indexed_file2)?;
 
         // Verify the second entry is now stored
         let pathid = tree.resolve(&path)?.unwrap();
-        let retrieved = cache.indexed_at_pathid(pathid)?.unwrap();
+        let retrieved = cache.index_entry_at_pathid(pathid)?.unwrap();
         assert_eq!(retrieved.hash, hash2);
         assert_eq!(retrieved.size, size2);
 
@@ -2917,9 +2917,9 @@ mod tests {
                 let mut cache = txn.write_cache()?;
                 let mut tree = txn.write_tree()?;
 
-                cache.index(&mut tree, &path1, indexed_file1.clone())?;
-                cache.index(&mut tree, &path2, indexed_file2.clone())?;
-                cache.index(&mut tree, &path3, indexed_file3.clone())?;
+                cache.add_index_entry(&mut tree, &path1, indexed_file1.clone())?;
+                cache.add_index_entry(&mut tree, &path2, indexed_file2.clone())?;
+                cache.add_index_entry(&mut tree, &path3, indexed_file3.clone())?;
             }
             txn.commit()?;
         }
@@ -2981,7 +2981,7 @@ mod tests {
                 let mut cache = txn.write_cache()?;
                 let mut tree = txn.write_tree()?;
 
-                cache.index(&mut tree, &path, indexed_file.clone())?;
+                cache.add_index_entry(&mut tree, &path, indexed_file.clone())?;
             }
             txn.commit()?;
         }

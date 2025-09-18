@@ -29,7 +29,7 @@ pub(crate) fn indexed_file_path<'b, L: Into<TreeLoc<'b>>>(
     hash: Option<&Hash>,
 ) -> Result<Option<std::path::PathBuf>, StorageError> {
     let loc = loc.into();
-    let entry = index.get(tree, loc.borrow())?;
+    let entry = index.indexed(tree, loc.borrow())?;
     if let Some(path) = tree.backtrack(loc)? {
         let file_path = path.within(index.datadir());
         match hash {
@@ -76,7 +76,7 @@ pub(crate) fn branch<'b, L1: Into<TreeLoc<'b>>, L2: Into<TreeLoc<'b>>>(
         None => return Ok(false),
     };
     let source_realpath = source.within(index.datadir());
-    if let Some(indexed) = index.get(tree, source)?
+    if let Some(indexed) = index.indexed(tree, source)?
         && indexed.hash == *hash
         && indexed.matches_file(&source_realpath)
     {
@@ -121,7 +121,7 @@ pub(crate) fn rename<'b, 'c, L1: Into<TreeLoc<'b>>, L2: Into<TreeLoc<'c>>>(
         None => return Ok(false),
     };
     let source_realpath = source_path.within(root);
-    if let Some(indexed) = index.get(tree, source.borrow())?
+    if let Some(indexed) = index.indexed(tree, source.borrow())?
         && indexed.hash == *hash
         && indexed.matches_file(&source_realpath)
     {
@@ -132,7 +132,7 @@ pub(crate) fn rename<'b, 'c, L1: Into<TreeLoc<'b>>, L2: Into<TreeLoc<'c>>>(
             // This makes sure the destination is added before the
             // source is deleted, so it won't be gone entirely from
             // peers during the transition.
-            index.add(
+            index.index(
                 tree,
                 history,
                 dirty,
@@ -141,7 +141,7 @@ pub(crate) fn rename<'b, 'c, L1: Into<TreeLoc<'b>>, L2: Into<TreeLoc<'c>>>(
                 indexed.mtime,
                 hash.clone(),
             )?;
-            index.remove(tree, history, dirty, source)?;
+            index.remove_from_index(tree, history, dirty, source)?;
             std::fs::rename(source_realpath, dest_realpath)?;
             return Ok(true);
         }
@@ -259,13 +259,13 @@ impl<'a> IndexReadOperations for WritableOpenIndex<'a> {
 /// with [Path].
 pub(crate) trait IndexExt {
     /// Get a file entry by path.
-    fn get<'b, L: Into<TreeLoc<'b>>>(
+    fn indexed<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<Option<IndexedFile>, StorageError>;
 
-    fn has<'b, L: Into<TreeLoc<'b>>>(
+    fn is_indexed<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
@@ -273,7 +273,7 @@ pub(crate) trait IndexExt {
 }
 
 impl<T: IndexReadOperations> IndexExt for T {
-    fn get<'b, L: Into<TreeLoc<'b>>>(
+    fn indexed<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
@@ -284,7 +284,7 @@ impl<T: IndexReadOperations> IndexExt for T {
             Ok(None)
         }
     }
-    fn has<'b, L: Into<TreeLoc<'b>>>(
+    fn is_indexed<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
@@ -299,7 +299,7 @@ impl<T: IndexReadOperations> IndexExt for T {
 
 impl<'a> WritableOpenIndex<'a> {
     /// Add a file entry with the given values. Replace one if it exists.
-    pub(crate) fn add<'b, L: Into<TreeLoc<'b>>>(
+    pub(crate) fn index<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree,
         history: &mut WritableOpenHistory,
@@ -312,7 +312,7 @@ impl<'a> WritableOpenIndex<'a> {
         self.add_internal(tree, Some(history), Some(dirty), loc, size, mtime, hash)
     }
 
-    pub(crate) fn silent_add<'b, L: Into<TreeLoc<'b>>>(
+    pub(crate) fn index_silently<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree,
         loc: L,
@@ -370,7 +370,7 @@ impl<'a> WritableOpenIndex<'a> {
     /// Remove a file entry at the given location, if it exists.
     ///
     /// Return true if something was removed.
-    pub(crate) fn remove<'b, L: Into<TreeLoc<'b>>>(
+    pub(crate) fn remove_from_index<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree,
         history: &mut WritableOpenHistory,
@@ -401,7 +401,7 @@ impl<'a> WritableOpenIndex<'a> {
     /// report it as dropped.
     ///
     /// Return true if something was removed.
-    pub(crate) fn drop<'b, L: Into<TreeLoc<'b>>>(
+    pub(crate) fn drop_from_index<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree,
         history: &mut WritableOpenHistory,
@@ -433,7 +433,7 @@ impl<'a> WritableOpenIndex<'a> {
     ///
     /// If the location is a directory, all files within that
     /// directory are removed, recursively.
-    pub(crate) fn remove_file_or_dir<'b, L: Into<TreeLoc<'b>>>(
+    pub(crate) fn remove_from_index_recurse<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree,
         history: &mut WritableOpenHistory,
@@ -441,7 +441,7 @@ impl<'a> WritableOpenIndex<'a> {
         loc: L,
     ) -> Result<(), StorageError> {
         let loc = loc.into();
-        if self.remove(tree, history, dirty, loc.borrow())? {
+        if self.remove_from_index(tree, history, dirty, loc.borrow())? {
             return Ok(()); // it was a file
         }
 
@@ -549,7 +549,7 @@ pub(crate) fn get_file(
     let index = txn.read_index()?;
     let tree = txn.read_tree()?;
 
-    index.get(&tree, path)
+    index.indexed(&tree, path)
 }
 
 /// Get a file entry
@@ -572,7 +572,7 @@ pub(crate) fn has_file(
     let index = txn.read_index()?;
     let tree = txn.read_tree()?;
 
-    index.has(&tree, path)
+    index.is_indexed(&tree, path)
 }
 
 /// Check whether a given file is in the index already.
@@ -597,7 +597,7 @@ pub(crate) fn has_matching_file(
     let txn = db.begin_read()?;
     let index = txn.read_index()?;
     let tree = txn.read_tree()?;
-    let ret = index.get(&tree, path)?.map(|e| e.matches(size, mtime));
+    let ret = index.indexed(&tree, path)?.map(|e| e.matches(size, mtime));
 
     Ok(ret.unwrap_or(false))
 }
@@ -631,7 +631,7 @@ pub(crate) fn add_file(
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
 
-        index.add(&mut tree, &mut history, &mut dirty, path, size, mtime, hash)?;
+        index.index(&mut tree, &mut history, &mut dirty, path, size, mtime, hash)?;
     }
 
     txn.commit()?;
@@ -671,7 +671,7 @@ pub(crate) fn add_file_if_matches(
             let mut tree = txn.write_tree()?;
             let mut dirty = txn.write_dirty()?;
             let mut history = txn.write_history()?;
-            index.add(&mut tree, &mut history, &mut dirty, path, size, mtime, hash)?;
+            index.index(&mut tree, &mut history, &mut dirty, path, size, mtime, hash)?;
         }
         txn.commit()?;
 
@@ -707,7 +707,7 @@ pub(crate) fn remove_file_if_missing(
             let mut index = txn.write_index()?;
             let mut dirty = txn.write_dirty()?;
             let mut history = txn.write_history()?;
-            index.remove(&mut tree, &mut history, &mut dirty, path)?;
+            index.remove_from_index(&mut tree, &mut history, &mut dirty, path)?;
         }
         txn.commit()?;
         return Ok(true);
@@ -764,7 +764,7 @@ pub(crate) fn remove_file_or_dir(
         let mut index = txn.write_index()?;
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
-        index.remove_file_or_dir(&mut tree, &mut history, &mut dirty, path)?;
+        index.remove_from_index_recurse(&mut tree, &mut history, &mut dirty, path)?;
     }
     txn.commit()?;
 
@@ -906,7 +906,7 @@ mod tests {
         let index = txn.read_index()?;
         let tree = txn.read_tree()?;
         let path = Path::parse("test.txt")?;
-        assert_eq!(None, index.get(&tree, &path)?);
+        assert_eq!(None, index.indexed(&tree, &path)?);
 
         Ok(())
     }
@@ -918,7 +918,7 @@ mod tests {
         let index = txn.read_index()?;
         let tree = txn.read_tree()?;
         let path = Path::parse("test.txt")?;
-        assert_eq!(None, index.get(&tree, &path)?);
+        assert_eq!(None, index.indexed(&tree, &path)?);
 
         Ok(())
     }
@@ -932,7 +932,7 @@ mod tests {
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
         let path = Path::parse("test.txt")?;
-        index.add(
+        index.index(
             &mut tree,
             &mut history,
             &mut dirty,
@@ -956,7 +956,7 @@ mod tests {
         let mut tree = txn.write_tree()?;
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
-        index.add(
+        index.index(
             &mut tree,
             &mut history,
             &mut dirty,
@@ -966,8 +966,8 @@ mod tests {
             Hash([0xfa; 32]),
         )?;
 
-        assert!(index.has(&tree, &path)?);
-        let entry = index.get(&tree, &path)?.unwrap();
+        assert!(index.is_indexed(&tree, &path)?);
+        let entry = index.indexed(&tree, &path)?.unwrap();
         assert_eq!(entry.size, 100);
         assert_eq!(entry.mtime, mtime);
         assert_eq!(entry.hash, Hash([0xfa; 32]));
@@ -987,7 +987,7 @@ mod tests {
         let mut tree = txn.write_tree()?;
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
-        index.add(
+        index.index(
             &mut tree,
             &mut history,
             &mut dirty,
@@ -996,7 +996,7 @@ mod tests {
             mtime1,
             Hash([0xfa; 32]),
         )?;
-        index.add(
+        index.index(
             &mut tree,
             &mut history,
             &mut dirty,
@@ -1007,8 +1007,8 @@ mod tests {
         )?;
 
         // Verify the file was replaced
-        assert!(index.has(&tree, &path)?);
-        let entry = index.get(&tree, &path)?.unwrap();
+        assert!(index.is_indexed(&tree, &path)?);
+        let entry = index.indexed(&tree, &path)?.unwrap();
         assert_eq!(entry.size, 200);
         assert_eq!(entry.mtime, mtime2);
         assert_eq!(entry.hash, Hash([0x07; 32]));
@@ -1027,7 +1027,7 @@ mod tests {
         let mut tree = txn.write_tree()?;
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
-        index.add(
+        index.index(
             &mut tree,
             &mut history,
             &mut dirty,
@@ -1037,9 +1037,9 @@ mod tests {
             Hash([0xfa; 32]),
         )?;
 
-        assert!(index.has(&tree, &path)?);
-        assert!(!index.has(&tree, &Path::parse("bar.txt")?)?);
-        assert!(!index.has(&tree, &Path::parse("other.txt")?)?);
+        assert!(index.is_indexed(&tree, &path)?);
+        assert!(!index.is_indexed(&tree, &Path::parse("bar.txt")?)?);
+        assert!(!index.is_indexed(&tree, &Path::parse("other.txt")?)?);
 
         Ok(())
     }
@@ -1055,7 +1055,7 @@ mod tests {
         let mut tree = txn.write_tree()?;
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
-        index.add(
+        index.index(
             &mut tree,
             &mut history,
             &mut dirty,
@@ -1065,7 +1065,7 @@ mod tests {
             hash.clone(),
         )?;
 
-        let entry = index.get(&tree, &path)?.unwrap();
+        let entry = index.indexed(&tree, &path)?.unwrap();
         assert_eq!(entry.size, 100);
         assert_eq!(entry.mtime, mtime);
         assert_eq!(entry.hash, hash);
@@ -1085,7 +1085,7 @@ mod tests {
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
 
-        index.add(
+        index.index(
             &mut tree,
             &mut history,
             &mut dirty,
@@ -1095,9 +1095,9 @@ mod tests {
             Hash([0xfa; 32]),
         )?;
 
-        index.remove_file_or_dir(&mut tree, &mut history, &mut dirty, &path)?;
+        index.remove_from_index_recurse(&mut tree, &mut history, &mut dirty, &path)?;
 
-        assert!(!index.has(&tree, &path)?);
+        assert!(!index.is_indexed(&tree, &path)?);
 
         Ok(())
     }
@@ -1113,7 +1113,7 @@ mod tests {
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
 
-        index.add(
+        index.index(
             &mut tree,
             &mut history,
             &mut dirty,
@@ -1122,7 +1122,7 @@ mod tests {
             mtime,
             Hash([0xfa; 32]),
         )?;
-        index.add(
+        index.index(
             &mut tree,
             &mut history,
             &mut dirty,
@@ -1132,10 +1132,15 @@ mod tests {
             Hash([0xfa; 32]),
         )?;
 
-        index.remove_file_or_dir(&mut tree, &mut history, &mut dirty, Path::parse("foo")?)?;
+        index.remove_from_index_recurse(
+            &mut tree,
+            &mut history,
+            &mut dirty,
+            Path::parse("foo")?,
+        )?;
 
-        assert!(!index.has(&tree, Path::parse("foo/bar1.txt")?)?);
-        assert!(!index.has(&tree, Path::parse("foo/bar2.txt")?)?);
+        assert!(!index.is_indexed(&tree, Path::parse("foo/bar1.txt")?)?);
+        assert!(!index.is_indexed(&tree, Path::parse("foo/bar2.txt")?)?);
 
         Ok(())
     }
@@ -1155,7 +1160,7 @@ mod tests {
             let mut history = txn.write_history()?;
             let mut dirty = txn.write_dirty()?;
 
-            index.add(
+            index.index(
                 &mut tree,
                 &mut history,
                 &mut dirty,
@@ -1164,7 +1169,7 @@ mod tests {
                 mtime,
                 Hash([1; 32]),
             )?;
-            index.add(
+            index.index(
                 &mut tree,
                 &mut history,
                 &mut dirty,
@@ -1173,7 +1178,7 @@ mod tests {
                 mtime,
                 Hash([2; 32]),
             )?;
-            index.add(
+            index.index(
                 &mut tree,
                 &mut history,
                 &mut dirty,
@@ -1228,7 +1233,7 @@ mod tests {
         dirty.delete_range(0, 999)?;
 
         // Add a file
-        index.add(
+        index.index(
             &mut tree,
             &mut history,
             &mut dirty,
@@ -1239,7 +1244,7 @@ mod tests {
         )?;
 
         // Verify the file was added to the index
-        assert!(index.has(&tree, &path)?);
+        assert!(index.is_indexed(&tree, &path)?);
 
         // Verify the path was marked dirty
         assert!(dirty_paths(&dirty, &tree)?.contains(&path));
@@ -1276,7 +1281,7 @@ mod tests {
         dirty.delete_range(0, 999)?;
 
         // Add initial file
-        index.add(
+        index.index(
             &mut tree,
             &mut history,
             &mut dirty,
@@ -1290,7 +1295,7 @@ mod tests {
         dirty.delete_range(0, 999)?;
 
         // Replace the file
-        index.add(
+        index.index(
             &mut tree,
             &mut history,
             &mut dirty,
@@ -1301,7 +1306,7 @@ mod tests {
         )?;
 
         // Verify the file was replaced in the index
-        let entry = index.get(&tree, &path)?.unwrap();
+        let entry = index.indexed(&tree, &path)?.unwrap();
         assert_eq!(entry.hash, hash2);
 
         // Verify the path was marked dirty
@@ -1342,7 +1347,7 @@ mod tests {
         let mut history = txn.write_history()?;
 
         // Add a file first
-        let pathid = index.add(
+        let pathid = index.index(
             &mut tree,
             &mut history,
             &mut dirty,
@@ -1356,11 +1361,11 @@ mod tests {
         dirty.delete_range(0, 999)?;
 
         // Remove the file
-        let removed = index.remove(&mut tree, &mut history, &mut dirty, &path)?;
+        let removed = index.remove_from_index(&mut tree, &mut history, &mut dirty, &path)?;
         assert!(removed);
 
         // Verify the file was removed from the index
-        assert!(!index.has(&tree, &path)?);
+        assert!(!index.is_indexed(&tree, &path)?);
 
         // Verify the path was marked dirty
         assert_eq!(HashSet::from([pathid]), dirty_pathids(&dirty)?);
@@ -1402,7 +1407,7 @@ mod tests {
         let hash1 = Hash([0xfa; 32]);
         let hash2 = Hash([0xfb; 32]);
 
-        let pathid1 = index.add(
+        let pathid1 = index.index(
             &mut tree,
             &mut history,
             &mut dirty,
@@ -1411,7 +1416,7 @@ mod tests {
             mtime,
             hash1.clone(),
         )?;
-        let pathid2 = index.add(
+        let pathid2 = index.index(
             &mut tree,
             &mut history,
             &mut dirty,
@@ -1425,11 +1430,16 @@ mod tests {
         dirty.delete_range(0, 999)?;
 
         // Remove the directory
-        index.remove_file_or_dir(&mut tree, &mut history, &mut dirty, Path::parse("foo")?)?;
+        index.remove_from_index_recurse(
+            &mut tree,
+            &mut history,
+            &mut dirty,
+            Path::parse("foo")?,
+        )?;
 
         // Verify the files were removed from the index
-        assert!(!index.has(&tree, &path1)?);
-        assert!(!index.has(&tree, &path2)?);
+        assert!(!index.is_indexed(&tree, &path1)?);
+        assert!(!index.is_indexed(&tree, &path2)?);
 
         // Verify the paths were marked dirty
         assert_eq!(HashSet::from([pathid1, pathid2]), dirty_pathids(&dirty)?);
@@ -1486,7 +1496,7 @@ mod tests {
         let mut history = txn.write_history()?;
 
         // Add a file with the old hash
-        index.add(
+        index.index(
             &mut tree,
             &mut history,
             &mut dirty,
@@ -1500,7 +1510,7 @@ mod tests {
         index.record_outdated(&tree, &mut dirty, &path, &old_hash, &new_hash)?;
 
         // Verify the entry was updated with outdated_by field
-        let entry = index.get(&tree, &path)?.unwrap();
+        let entry = index.indexed(&tree, &path)?.unwrap();
         assert_eq!(entry.hash, old_hash);
         assert_eq!(entry.outdated_by, Some(new_hash));
 
@@ -1523,7 +1533,7 @@ mod tests {
         let mut history = txn.write_history()?;
 
         // Add a file with file_hash
-        index.add(
+        index.index(
             &mut tree,
             &mut history,
             &mut dirty,
@@ -1537,7 +1547,7 @@ mod tests {
         index.record_outdated(&tree, &mut dirty, &path, &unrelated_hash, &new_hash)?;
 
         // Verify the entry was NOT updated (outdated_by should remain None)
-        let entry = index.get(&tree, &path)?.unwrap();
+        let entry = index.indexed(&tree, &path)?.unwrap();
         assert_eq!(entry.hash, file_hash);
         assert_eq!(entry.outdated_by, None);
 
