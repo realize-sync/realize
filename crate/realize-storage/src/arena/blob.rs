@@ -4,6 +4,7 @@ use super::mark::MarkReadOperations;
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
 use super::types::{BlobTableEntry, LocalAvailability, LruQueueId, Mark, QueueTableEntry};
 use crate::arena::cache::CacheReadOperations;
+use crate::arena::index::IndexWriteOperations;
 use crate::types::PathId;
 use crate::utils::hash;
 use crate::utils::holder::Holder;
@@ -1390,8 +1391,8 @@ impl Blob {
             let pathid = self.info.pathid;
             // Create an entry without broadcasting it, as it's going
             // to be modified.
-            let mut index = txn.write_index()?;
-            index.index_silently(
+            let mut cache = txn.write_cache()?;
+            cache.index_silently(
                 &mut tree,
                 pathid,
                 self.info.size,
@@ -1569,7 +1570,7 @@ mod tests {
     use super::*;
     use crate::arena::db::{ArenaReadTransaction, ArenaWriteTransaction};
     use crate::arena::dirty::DirtyReadOperations;
-    use crate::arena::index::IndexExt;
+    use crate::arena::index::IndexReadOperations;
     use crate::utils::hash;
     use crate::{Mark, PathId};
     use assert_fs::TempDir;
@@ -3297,9 +3298,9 @@ mod tests {
 
         // Verify an entry was added to the index with the old hash
         let txn = fixture.begin_read()?;
-        let index = txn.read_index()?;
+        let cache = txn.read_cache()?;
         let tree = txn.read_tree()?;
-        let indexed = index.indexed(&tree, &path)?.unwrap();
+        let indexed = cache.indexed(&tree, &path)?.unwrap();
         assert_eq!(blob_info.hash, indexed.hash);
 
         // Verify no history entry was added (the old version should

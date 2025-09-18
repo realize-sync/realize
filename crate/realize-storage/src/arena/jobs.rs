@@ -2,7 +2,7 @@ use super::db::ArenaDatabase;
 use super::engine::{Engine, StorageJob};
 use crate::arena::blob::BlobExt;
 use crate::arena::cache::CacheReadOperations;
-use crate::arena::index::{self, IndexReadOperations};
+use crate::arena::index::{self, IndexReadOperations, IndexWriteOperations};
 use crate::arena::tree::TreeExt;
 use crate::{JobId, JobStatus, PathId, StorageError};
 use realize_types::Hash;
@@ -114,20 +114,20 @@ impl StorageJobProcessor {
         let txn = self.db.begin_write()?;
         {
             let mut tree = txn.write_tree()?;
-            let mut index = txn.write_index()?;
+            let mut cache = txn.write_cache()?;
             path = match tree.backtrack(pathid)? {
                 Some(v) => v,
                 None => return Ok(JobStatus::Abandoned("no_path")),
             };
             realpath = path.within(root);
-            let indexed = match index.get_at_pathid(pathid)? {
+            let indexed = match cache.index_entry_at_pathid(pathid)? {
                 Some(v) => v,
                 None => return Ok(JobStatus::Abandoned("not_in_index")),
             };
             if !indexed.matches_file(&realpath) {
                 return Ok(JobStatus::Abandoned("file_mismatch"));
             }
-            let cached = match txn.write_cache()?.file_at_pathid(pathid)? {
+            let cached = match cache.file_at_pathid(pathid)? {
                 Some(v) => v,
                 None => return Ok(JobStatus::Abandoned("no_cache_entry")),
             };
@@ -140,7 +140,7 @@ impl StorageJobProcessor {
 
             let mut history = txn.write_history()?;
             let mut dirty = txn.write_dirty()?;
-            index.drop_from_index(&mut tree, &mut history, &mut dirty, pathid)?;
+            cache.drop_from_index(&mut tree, &mut history, &mut dirty, pathid)?;
 
             // We make a second check of the file mtime and size just
             // before renaming, in case it has changed.
@@ -192,14 +192,14 @@ impl StorageJobProcessor {
         let txn = self.db.begin_write()?;
         {
             let mut tree = txn.write_tree()?;
-            let mut index = txn.write_index()?;
+            let mut cache = txn.write_cache()?;
             path = match tree.backtrack(pathid)? {
                 Some(v) => v,
                 None => return Ok(JobStatus::Abandoned("no_path")),
             };
             realpath = path.within(self.db.index().datadir());
 
-            let indexed = match index.get_at_pathid(pathid)? {
+            let indexed = match cache.index_entry_at_pathid(pathid)? {
                 Some(v) => v,
                 None => return Ok(JobStatus::Abandoned("not_in_index")),
             };
@@ -209,7 +209,7 @@ impl StorageJobProcessor {
             if !indexed.matches_file(&realpath) {
                 return Ok(JobStatus::Abandoned("file_mismatch"));
             }
-            let cached = match txn.write_cache()?.file_at_pathid(pathid)? {
+            let cached = match cache.file_at_pathid(pathid)? {
                 Some(v) => v,
                 None => return Ok(JobStatus::Abandoned("no_cache_entry")),
             };
@@ -218,7 +218,7 @@ impl StorageJobProcessor {
             }
             let mut history = txn.write_history()?;
             let mut dirty = txn.write_dirty()?;
-            index.drop_from_index(&mut tree, &mut history, &mut dirty, pathid)?;
+            cache.drop_from_index(&mut tree, &mut history, &mut dirty, pathid)?;
         }
         txn.commit()?;
         std::fs::remove_file(&realpath)?;
@@ -259,7 +259,7 @@ impl StorageJobProcessor {
                     return Ok(JobStatus::Abandoned("no_path"));
                 }
             };
-            let cache = txn.read_cache()?;
+            let mut cache = txn.write_cache()?;
             let cached = match cache.file_at_pathid(pathid)? {
                 Some(e) => e,
                 None => {
@@ -270,8 +270,7 @@ impl StorageJobProcessor {
                 return Ok(JobStatus::Abandoned("cache_version"));
             }
 
-            let mut index = txn.write_index()?;
-            dest = match index::indexed_file_path(&index, &tree, &path, index_hash.as_ref())? {
+            dest = match index::indexed_file_path(&cache, &tree, &path, index_hash.as_ref())? {
                 Some(p) => p,
                 None => {
                     return Ok(JobStatus::Abandoned("indexed_file_path"));
@@ -301,7 +300,7 @@ impl StorageJobProcessor {
             }
             let mut history = txn.write_history()?;
             let mut dirty = txn.write_dirty()?;
-            index.index(
+            cache.index(
                 &mut tree,
                 &mut history,
                 &mut dirty,
@@ -331,7 +330,6 @@ impl StorageJobProcessor {
 mod tests {
     use super::*;
     use crate::arena::history::HistoryReadOperations;
-    use crate::arena::index::IndexExt;
     use crate::arena::types::HistoryTableEntry;
     use crate::arena::types::IndexedFile;
     use crate::utils::hash;
@@ -639,9 +637,8 @@ mod tests {
         let txn = fixture.db.begin_read()?;
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
-        let index = txn.read_index()?;
         let history = txn.read_history()?;
-        assert!(!index.is_indexed(&tree, &path)?);
+        assert!(!cache.is_indexed(&tree, &path)?);
         assert!(!fixture.file_exists("dir/test.txt"));
 
         assert!(cache.metadata(&tree, &path)?.is_some());
@@ -689,9 +686,9 @@ mod tests {
         );
 
         let txn = fixture.db.begin_read()?;
-        let index = txn.read_index()?;
-        let indexed = index
-            .get_at_pathid(pathid)?
+        let cache = txn.read_cache()?;
+        let indexed = cache
+            .index_entry_at_pathid(pathid)?
             .expect("must have been indexed");
         assert_eq!(hash, indexed.hash);
         assert_eq!(test_time(), indexed.mtime);
@@ -733,9 +730,9 @@ mod tests {
         );
 
         let txn = fixture.db.begin_read()?;
-        let index = txn.read_index()?;
-        let indexed = index
-            .get_at_pathid(pathid)?
+        let cache = txn.read_cache()?;
+        let indexed = cache
+            .index_entry_at_pathid(pathid)?
             .expect("must have been indexed");
         assert_eq!(new_hash, indexed.hash);
         assert_eq!(test_time(), indexed.mtime);

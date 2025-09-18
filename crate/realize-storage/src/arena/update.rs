@@ -1,5 +1,5 @@
 use crate::arena::db::ArenaDatabase;
-use crate::arena::index::{self, IndexExt};
+use crate::arena::index::{self, IndexReadOperations, IndexWriteOperations};
 use crate::{Notification, StorageError};
 use realize_types::Peer;
 use std::sync::Arc;
@@ -49,8 +49,7 @@ pub(crate) fn apply(
                     &mut tree, &mut blobs, &mut dirty, peer, &path, mtime, size, &hash, &old_hash,
                 )?;
 
-                let mut index = txn.write_index()?;
-                index.record_outdated(&tree, &mut dirty, &path, &old_hash, &hash)?;
+                cache.record_outdated(&mut tree, &mut dirty, &path, &old_hash, &hash)?;
             }
 
             Notification::Remove { path, old_hash, .. } => {
@@ -58,7 +57,7 @@ pub(crate) fn apply(
                     &mut tree, &mut blobs, &mut dirty, peer, &path, &old_hash, false,
                 )?;
 
-                if let Some(indexed) = txn.read_index()?.indexed(&tree, &path)?
+                if let Some(indexed) = cache.indexed(&tree, &path)?
                     && indexed.is_outdated_by(&old_hash)
                     && indexed.matches_file(path.within(db.index().datadir()))
                 {
@@ -93,8 +92,7 @@ pub(crate) fn apply(
                 old_hash,
                 ..
             } => {
-                let index = txn.read_index()?;
-                if index::branch(&index, &tree, &source, &dest, &hash, old_hash.as_ref())? {
+                if index::branch(&cache, &tree, &source, &dest, &hash, old_hash.as_ref())? {
                     log::debug!("[{arena}] branched {source} {hash} -> {dest}");
                 } else {
                     log::debug!(
@@ -110,10 +108,9 @@ pub(crate) fn apply(
                 old_hash,
                 ..
             } => {
-                let mut index = txn.write_index()?;
                 let mut history = txn.write_history()?;
                 if index::rename(
-                    &mut index,
+                    &mut cache,
                     &mut tree,
                     &mut history,
                     &mut dirty,

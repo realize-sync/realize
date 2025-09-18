@@ -61,7 +61,7 @@ pub(crate) trait CacheReadOperations {
     fn index_entry_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError>;
 
     /// Return all indexed files in the index layer
-    fn all_indexed(&self) -> impl Iterator<Item = Result<(PathId, IndexedFile), StorageError>>;
+    fn all_indexed(&self) -> impl Iterator<Item = Result<(Path, IndexedFile), StorageError>>;
 
     /// Return the datadir path.
     fn datadir(&self) -> &std::path::Path;
@@ -162,7 +162,7 @@ where
         indexed_entry(&self.table, pathid)
     }
 
-    fn all_indexed(&self) -> impl Iterator<Item = Result<(PathId, IndexedFile), StorageError>> {
+    fn all_indexed(&self) -> impl Iterator<Item = Result<(Path, IndexedFile), StorageError>> {
         AllIndexedIterator::new(&self.table)
     }
 
@@ -222,7 +222,7 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         indexed_entry(&self.table, pathid)
     }
 
-    fn all_indexed(&self) -> impl Iterator<Item = Result<(PathId, IndexedFile), StorageError>> {
+    fn all_indexed(&self) -> impl Iterator<Item = Result<(Path, IndexedFile), StorageError>> {
         AllIndexedIterator::new(&self.table)
     }
 
@@ -902,12 +902,13 @@ impl<'a> WritableOpenCache<'a> {
         &mut self,
         tree: &mut WritableOpenTree,
         loc: L,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
+        let mut removed = false;
         if let Some(pathid) = tree.resolve(loc)? {
-            tree.remove_and_decref(pathid, &mut self.table, (pathid, Layer::Index))?;
+            removed = tree.remove_and_decref(pathid, &mut self.table, (pathid, Layer::Index))?;
         }
 
-        Ok(())
+        Ok(removed)
     }
 }
 
@@ -1093,7 +1094,7 @@ impl<'a> AllIndexedIterator<'a> {
 }
 
 impl<'a> Iterator for AllIndexedIterator<'a> {
-    type Item = Result<(PathId, IndexedFile), StorageError>;
+    type Item = Result<(Path, IndexedFile), StorageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match &mut self.iter {
@@ -1104,12 +1105,12 @@ impl<'a> Iterator for AllIndexedIterator<'a> {
                     match entry {
                         Err(err) => return Some(Err(err.into())),
                         Ok((key, value)) => {
-                            let (pathid, layer) = key.value();
+                            let (_, layer) = key.value();
                             if let Layer::Index = layer {
                                 match value.value().parse() {
                                     Err(err) => return Some(Err(StorageError::from(err))),
                                     Ok(CacheTableEntry::File(e)) => {
-                                        return Some(Ok((pathid, e.into())));
+                                        return Some(Ok((e.path.clone(), e.into())));
                                     }
                                     Ok(_) => {} // continue
                                 }
@@ -1311,7 +1312,7 @@ mod tests {
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Hash, Path, Peer, UnixTime};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     const TEST_TIME: u64 = 1234567890;
@@ -2865,8 +2866,8 @@ mod tests {
         let cache = txn.read_cache()?;
 
         // Collect all indexed files - should be empty
-        let indexed_files: Result<Vec<_>, _> = cache.all_indexed().collect();
-        assert_eq!(indexed_files?, Vec::<(PathId, IndexedFile)>::new());
+        let indexed_files = cache.all_indexed().collect::<Result<Vec<_>, _>>()?;
+        assert!(indexed_files.is_empty());
 
         Ok(())
     }
@@ -2928,7 +2929,6 @@ mod tests {
         {
             let txn = fixture.db.begin_read()?;
             let cache = txn.read_cache()?;
-            let tree = txn.read_tree()?;
 
             let indexed_files: Result<Vec<_>, _> = cache.all_indexed().collect();
             let indexed_files = indexed_files?;
@@ -2936,19 +2936,13 @@ mod tests {
             // Should have exactly 3 entries
             assert_eq!(indexed_files.len(), 3);
 
-            // Get pathids for comparison
-            let pathid1 = tree.resolve(&path1)?.unwrap();
-            let pathid2 = tree.resolve(&path2)?.unwrap();
-            let pathid3 = tree.resolve(&path3)?.unwrap();
-
             // Convert to a map for easier checking
-            let indexed_map: std::collections::HashMap<PathId, IndexedFile> =
-                indexed_files.into_iter().collect();
+            let indexed_map = indexed_files.into_iter().collect::<HashMap<_, _>>();
 
             // Verify each entry
-            assert_eq!(indexed_map.get(&pathid1).unwrap(), &indexed_file1);
-            assert_eq!(indexed_map.get(&pathid2).unwrap(), &indexed_file2);
-            assert_eq!(indexed_map.get(&pathid3).unwrap(), &indexed_file3);
+            assert_eq!(indexed_map.get(&path1).unwrap(), &indexed_file1);
+            assert_eq!(indexed_map.get(&path2).unwrap(), &indexed_file2);
+            assert_eq!(indexed_map.get(&path3).unwrap(), &indexed_file3);
 
             // Verify no extra entries
             assert_eq!(indexed_map.len(), 3);
@@ -2990,7 +2984,6 @@ mod tests {
         {
             let txn = fixture.db.begin_read()?;
             let cache = txn.read_cache()?;
-            let tree = txn.read_tree()?;
 
             let indexed_files: Result<Vec<_>, _> = cache.all_indexed().collect();
             let indexed_files = indexed_files?;
@@ -2998,11 +2991,9 @@ mod tests {
             // Should have exactly 1 entry (only the indexed one)
             assert_eq!(indexed_files.len(), 1);
 
-            let (pathid, retrieved_file) = &indexed_files[0];
-            let expected_pathid = tree.resolve(&path)?.unwrap();
-
-            assert_eq!(*pathid, expected_pathid);
-            assert_eq!(*retrieved_file, indexed_file);
+            let (retrieved_path, retrieved_file) = &indexed_files[0];
+            assert_eq!(path, *retrieved_path);
+            assert_eq!(indexed_file, *retrieved_file);
         }
 
         Ok(())

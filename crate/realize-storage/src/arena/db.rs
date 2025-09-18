@@ -2,14 +2,13 @@ use super::blob::{BlobReadOperations, Blobs, ReadableOpenBlob, WritableOpenBlob}
 use super::cache::{self, WritableOpenCache};
 use super::dirty::{Dirty, DirtyReadOperations, ReadableOpenDirty, WritableOpenDirty};
 use super::history::{History, HistoryReadOperations, ReadableOpenHistory, WritableOpenHistory};
-use super::index::{IndexReadOperations, ReadableOpenIndex, WritableOpenIndex};
 use super::mark::{MarkReadOperations, ReadableOpenMark, WritableOpenMark};
 use super::peer::{PeersReadOperations, ReadableOpenPeers, WritableOpenPeers};
 use super::tree::{ReadableOpenTree, Tree, TreeReadOperations, WritableOpenTree};
 use super::types::Layer;
 use super::types::{
-    BlobTableEntry, CacheTableEntry, FailedJobTableEntry, FileTableEntry, HistoryTableEntry,
-    MarkTableEntry, PeerTableEntry, QueueTableEntry,
+    BlobTableEntry, CacheTableEntry, FailedJobTableEntry, HistoryTableEntry, MarkTableEntry,
+    PeerTableEntry, QueueTableEntry,
 };
 use crate::StorageError;
 use crate::arena::index::Index;
@@ -62,16 +61,6 @@ pub(crate) const TREE_REFCOUNT_TABLE: TableDefinition<PathId, u32> =
 /// Value: CacheTableEntry
 const CACHE_TABLE: TableDefinition<(PathId, Layer), Holder<CacheTableEntry>> =
     TableDefinition::new("cache.file");
-
-/// Track local indexed files.
-///
-/// Each locally indexed file has an entry in this table, keyed with
-/// the file pathid.
-///
-/// Key: PathId
-/// Value: FileTableEntry
-const INDEX_TABLE: TableDefinition<PathId, Holder<FileTableEntry>> =
-    TableDefinition::new("index.file");
 
 /// Track peer files that might have been deleted remotely.
 ///
@@ -247,7 +236,6 @@ impl ArenaDatabase {
             txn.open_table(TREE_TABLE)?;
             txn.open_table(TREE_REFCOUNT_TABLE)?;
             let mut cache_table = txn.open_table(CACHE_TABLE)?;
-            txn.open_table(INDEX_TABLE)?;
             txn.open_table(PENDING_CATCHUP_TABLE)?;
             txn.open_table(PEER_TABLE)?;
             txn.open_table(NOTIFICATION_TABLE)?;
@@ -543,29 +531,6 @@ impl<'db> ArenaWriteTransaction<'db> {
             self.arena,
         ))
     }
-
-    #[allow(dead_code)]
-    #[track_caller]
-    pub(crate) fn read_index(&self) -> Result<impl IndexReadOperations, StorageError> {
-        Ok(ReadableOpenIndex::new(
-            &self.subsystems.index,
-            self.inner
-                .open_table(INDEX_TABLE)
-                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
-        ))
-    }
-
-    #[allow(dead_code)]
-    #[track_caller]
-    pub(crate) fn write_index(&self) -> Result<WritableOpenIndex<'_>, StorageError> {
-        Ok(WritableOpenIndex::new(
-            self.arena,
-            &self.subsystems.index,
-            self.inner
-                .open_table(INDEX_TABLE)
-                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
-        ))
-    }
 }
 
 pub struct ArenaReadTransaction<'db> {
@@ -625,17 +590,6 @@ impl<'db> ArenaReadTransaction<'db> {
                 .open_table(BLOB_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
             self.inner.open_table(BLOB_LRU_QUEUE_TABLE)?,
-        ))
-    }
-
-    #[allow(dead_code)]
-    #[track_caller]
-    pub(crate) fn read_index(&self) -> Result<impl IndexReadOperations, StorageError> {
-        Ok(ReadableOpenIndex::new(
-            &self.subsystems.index,
-            self.inner
-                .open_table(INDEX_TABLE)
-                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
         ))
     }
 
@@ -797,7 +751,6 @@ mod tests {
         txn.read_marks()?;
         txn.read_dirty()?;
         txn.read_history()?;
-        txn.read_index()?;
 
         Ok(())
     }

@@ -2,7 +2,6 @@ use super::blob::BlobReadOperations;
 use super::cache::CacheReadOperations;
 use super::db::{ArenaDatabase, ArenaReadTransaction};
 use super::dirty::DirtyReadOperations;
-use super::index::IndexReadOperations;
 use super::mark::MarkExt;
 use super::tree::{TreeExt, TreeLoc};
 use super::types::LocalAvailability;
@@ -447,7 +446,6 @@ impl Engine {
         tree: &impl TreeReadOperations,
         pathid: PathId,
     ) -> Result<Option<StorageJob>, StorageError> {
-        let index = txn.read_index()?;
         let cache = txn.read_cache()?;
         let blobs = txn.read_blobs()?;
 
@@ -481,7 +479,7 @@ impl Engine {
 
         if let Some(cached) = cache.file_at_pathid(pathid)? {
             let hash = cached.hash;
-            let indexed = index.get_at_pathid(pathid)?;
+            let indexed = cache.index_entry_at_pathid(pathid)?;
             let is_indexed = indexed.is_some();
             if want_unrealize {
                 if let Some(indexed) = indexed
