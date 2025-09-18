@@ -60,6 +60,9 @@ pub(crate) trait CacheReadOperations {
     /// Get the indexed entry at the given pathid
     fn indexed_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError>;
 
+    /// Return all indexed files in the index layer
+    fn all_indexed(&self) -> impl Iterator<Item = Result<(PathId, IndexedFile), StorageError>>;
+
     /// Return the datadir path.
     fn datadir(&self) -> &std::path::Path;
 }
@@ -159,6 +162,10 @@ where
         indexed_entry(&self.table, pathid)
     }
 
+    fn all_indexed(&self) -> impl Iterator<Item = Result<(PathId, IndexedFile), StorageError>> {
+        AllIndexedIterator::new(&self.table)
+    }
+
     fn datadir(&self) -> &std::path::Path {
         self.index.datadir()
     }
@@ -213,6 +220,10 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
 
     fn indexed_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError> {
         indexed_entry(&self.table, pathid)
+    }
+
+    fn all_indexed(&self) -> impl Iterator<Item = Result<(PathId, IndexedFile), StorageError>> {
+        AllIndexedIterator::new(&self.table)
     }
 
     fn datadir(&self) -> &std::path::Path {
@@ -1061,6 +1072,54 @@ where
             }
         }
         None
+    }
+}
+
+/// Iterator for all indexed files in the index layer
+struct AllIndexedIterator<'a> {
+    iter: Option<
+        Result<redb::Range<'a, (PathId, Layer), Holder<'static, CacheTableEntry>>, StorageError>,
+    >,
+}
+
+impl<'a> AllIndexedIterator<'a> {
+    fn new(
+        table: &'a impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
+    ) -> Self {
+        AllIndexedIterator {
+            iter: Some(table.iter().map_err(StorageError::from)),
+        }
+    }
+}
+
+impl<'a> Iterator for AllIndexedIterator<'a> {
+    type Item = Result<(PathId, IndexedFile), StorageError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.iter {
+            None => None,
+            Some(Err(_)) => Some(Err(self.iter.take().unwrap().err().unwrap())),
+            Some(Ok(range)) => {
+                while let Some(entry) = range.next() {
+                    match entry {
+                        Err(err) => return Some(Err(err.into())),
+                        Ok((key, value)) => {
+                            let (pathid, layer) = key.value();
+                            if let Layer::Index = layer {
+                                match value.value().parse() {
+                                    Err(err) => return Some(Err(StorageError::from(err))),
+                                    Ok(CacheTableEntry::File(e)) => {
+                                        return Some(Ok((pathid, e.into())));
+                                    }
+                                    Ok(_) => {} // continue
+                                }
+                            }
+                        }
+                    }
+                }
+                None
+            }
+        }
     }
 }
 
@@ -2795,6 +2854,156 @@ mod tests {
         let retrieved = cache.indexed_at_pathid(pathid)?.unwrap();
         assert_eq!(retrieved.hash, hash2);
         assert_eq!(retrieved.size, size2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn all_indexed_empty() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let txn = fixture.db.begin_read()?;
+        let cache = txn.read_cache()?;
+
+        // Collect all indexed files - should be empty
+        let indexed_files: Result<Vec<_>, _> = cache.all_indexed().collect();
+        assert_eq!(indexed_files?, Vec::<(PathId, IndexedFile)>::new());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn all_indexed_with_entries() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+
+        // Create test data
+        let path1 = Path::parse("test1.txt")?;
+        let path2 = Path::parse("dir/test2.txt")?;
+        let path3 = Path::parse("dir/subdir/test3.txt")?;
+
+        let hash1 = Hash([0x11; 32]);
+        let hash2 = Hash([0x22; 32]);
+        let hash3 = Hash([0x33; 32]);
+
+        let mtime = test_time();
+
+        let indexed_file1 = IndexedFile {
+            hash: hash1.clone(),
+            mtime,
+            size: 100,
+            outdated_by: None,
+        };
+
+        let indexed_file2 = IndexedFile {
+            hash: hash2.clone(),
+            mtime,
+            size: 200,
+            outdated_by: Some(hash3.clone()),
+        };
+
+        let indexed_file3 = IndexedFile {
+            hash: hash3.clone(),
+            mtime,
+            size: 300,
+            outdated_by: None,
+        };
+
+        // Add some regular cache entries (should not appear in all_indexed)
+        fixture.add_to_cache(&Path::parse("regular.txt")?, 500, mtime)?;
+
+        // Add indexed entries
+        {
+            let txn = fixture.db.begin_write()?;
+            {
+                let mut cache = txn.write_cache()?;
+                let mut tree = txn.write_tree()?;
+
+                cache.index(&mut tree, &path1, indexed_file1.clone())?;
+                cache.index(&mut tree, &path2, indexed_file2.clone())?;
+                cache.index(&mut tree, &path3, indexed_file3.clone())?;
+            }
+            txn.commit()?;
+        }
+
+        // Test all_indexed
+        {
+            let txn = fixture.db.begin_read()?;
+            let cache = txn.read_cache()?;
+            let tree = txn.read_tree()?;
+
+            let indexed_files: Result<Vec<_>, _> = cache.all_indexed().collect();
+            let indexed_files = indexed_files?;
+
+            // Should have exactly 3 entries
+            assert_eq!(indexed_files.len(), 3);
+
+            // Get pathids for comparison
+            let pathid1 = tree.resolve(&path1)?.unwrap();
+            let pathid2 = tree.resolve(&path2)?.unwrap();
+            let pathid3 = tree.resolve(&path3)?.unwrap();
+
+            // Convert to a map for easier checking
+            let indexed_map: std::collections::HashMap<PathId, IndexedFile> =
+                indexed_files.into_iter().collect();
+
+            // Verify each entry
+            assert_eq!(indexed_map.get(&pathid1).unwrap(), &indexed_file1);
+            assert_eq!(indexed_map.get(&pathid2).unwrap(), &indexed_file2);
+            assert_eq!(indexed_map.get(&pathid3).unwrap(), &indexed_file3);
+
+            // Verify no extra entries
+            assert_eq!(indexed_map.len(), 3);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn all_indexed_skips_non_index_layers() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+
+        let path = Path::parse("test.txt")?;
+        let hash = Hash([0x42; 32]);
+        let mtime = test_time();
+
+        let indexed_file = IndexedFile {
+            hash: hash.clone(),
+            mtime,
+            size: 100,
+            outdated_by: None,
+        };
+
+        // Add both a regular cache entry and an indexed entry for the same path
+        fixture.add_to_cache(&path, 200, mtime)?;
+
+        {
+            let txn = fixture.db.begin_write()?;
+            {
+                let mut cache = txn.write_cache()?;
+                let mut tree = txn.write_tree()?;
+
+                cache.index(&mut tree, &path, indexed_file.clone())?;
+            }
+            txn.commit()?;
+        }
+
+        // Test all_indexed - should only return the indexed entry
+        {
+            let txn = fixture.db.begin_read()?;
+            let cache = txn.read_cache()?;
+            let tree = txn.read_tree()?;
+
+            let indexed_files: Result<Vec<_>, _> = cache.all_indexed().collect();
+            let indexed_files = indexed_files?;
+
+            // Should have exactly 1 entry (only the indexed one)
+            assert_eq!(indexed_files.len(), 1);
+
+            let (pathid, retrieved_file) = &indexed_files[0];
+            let expected_pathid = tree.resolve(&path)?.unwrap();
+
+            assert_eq!(*pathid, expected_pathid);
+            assert_eq!(*retrieved_file, indexed_file);
+        }
 
         Ok(())
     }
