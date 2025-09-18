@@ -384,6 +384,7 @@ impl<'db> ArenaWriteTransaction<'db> {
             self.inner.open_table(PATHID_TO_INODE_TABLE)?,
             self.inner.open_table(INODE_TO_PATHID_TABLE)?,
             self.arena,
+            &self.subsystems.index,
         ))
     }
 
@@ -399,6 +400,7 @@ impl<'db> ArenaWriteTransaction<'db> {
             self.inner.open_table(INODE_TO_PATHID_TABLE)?,
             self.inner.open_table(PENDING_CATCHUP_TABLE)?,
             self.arena,
+            &self.subsystems.index,
         ))
     }
 
@@ -649,6 +651,7 @@ impl<'db> ArenaReadTransaction<'db> {
             self.inner.open_table(PATHID_TO_INODE_TABLE)?,
             self.inner.open_table(INODE_TO_PATHID_TABLE)?,
             self.arena,
+            &self.subsystems.index,
         ))
     }
 

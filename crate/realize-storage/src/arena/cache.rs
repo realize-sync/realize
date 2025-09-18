@@ -1,6 +1,7 @@
 use super::blob::{BlobInfo, WritableOpenBlob};
 use super::db::ArenaWriteTransaction;
 use super::dirty::WritableOpenDirty;
+use super::index::Index;
 use super::tree::{TreeExt, TreeReadOperations, WritableOpenTree};
 use super::types::{
     CacheTableEntry, DirtableEntry, FileAvailability, FileMetadata, FileTableEntry, IndexedFile,
@@ -58,10 +59,13 @@ pub(crate) trait CacheReadOperations {
 
     /// Get the indexed entry at the given pathid
     fn indexed_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError>;
+
+    /// Return the datadir path.
+    fn datadir(&self) -> &std::path::Path;
 }
 
 /// A cache open for reading with a read transaction.
-pub(crate) struct ReadableOpenCache<T, PN, NP>
+pub(crate) struct ReadableOpenCache<'a, T, PN, NP>
 where
     T: ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
     PN: ReadableTable<PathId, Inode>,
@@ -73,25 +77,33 @@ where
     #[allow(dead_code)]
     inode_to_pathid: NP,
     arena: Arena,
+    index: &'a Index,
 }
 
-impl<T, PN, NP> ReadableOpenCache<T, PN, NP>
+impl<'a, T, PN, NP> ReadableOpenCache<'a, T, PN, NP>
 where
     T: ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
     PN: ReadableTable<PathId, Inode>,
     NP: ReadableTable<Inode, PathId>,
 {
-    pub(crate) fn new(table: T, pathid_to_inode: PN, inode_to_pathid: NP, arena: Arena) -> Self {
+    pub(crate) fn new(
+        table: T,
+        pathid_to_inode: PN,
+        inode_to_pathid: NP,
+        arena: Arena,
+        index: &'a Index,
+    ) -> Self {
         Self {
             table,
             pathid_to_inode,
             inode_to_pathid,
             arena,
+            index,
         }
     }
 }
 
-impl<T, PN, NP> CacheReadOperations for ReadableOpenCache<T, PN, NP>
+impl<'a, T, PN, NP> CacheReadOperations for ReadableOpenCache<'a, T, PN, NP>
 where
     T: ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
     PN: ReadableTable<PathId, Inode>,
@@ -145,6 +157,10 @@ where
 
     fn indexed_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError> {
         indexed_entry(&self.table, pathid)
+    }
+
+    fn datadir(&self) -> &std::path::Path {
+        self.index.datadir()
     }
 }
 
@@ -197,6 +213,10 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
 
     fn indexed_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError> {
         indexed_entry(&self.table, pathid)
+    }
+
+    fn datadir(&self) -> &std::path::Path {
+        self.index.datadir()
     }
 }
 
@@ -284,6 +304,7 @@ pub(crate) struct WritableOpenCache<'a> {
     inode_to_pathid: Table<'a, Inode, PathId>,
     pending_catchup_table: Table<'a, (&'static str, PathId), ()>,
     arena: Arena,
+    index: &'a Index,
 }
 
 impl<'a> WritableOpenCache<'a> {
@@ -293,6 +314,7 @@ impl<'a> WritableOpenCache<'a> {
         inode_to_pathid: Table<'a, Inode, PathId>,
         pending_catchup_table: Table<'a, (&'static str, PathId), ()>,
         arena: Arena,
+        index: &'a Index,
     ) -> Self {
         Self {
             table,
@@ -300,6 +322,7 @@ impl<'a> WritableOpenCache<'a> {
             inode_to_pathid,
             pending_catchup_table,
             arena,
+            index,
         }
     }
 
@@ -1226,6 +1249,7 @@ mod tests {
     use crate::utils::hash;
     use crate::{PathId, StorageError};
     use assert_fs::TempDir;
+    use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
     use realize_types::{Arena, Hash, Path, Peer, UnixTime};
     use std::collections::HashSet;
@@ -1256,6 +1280,7 @@ mod tests {
     struct Fixture {
         arena: Arena,
         db: Arc<ArenaDatabase>,
+        datadir: ChildPath,
         _tempdir: TempDir,
     }
     impl Fixture {
@@ -1275,6 +1300,7 @@ mod tests {
             Ok(Self {
                 arena,
                 db,
+                datadir,
                 _tempdir: tempdir,
             })
         }
@@ -3761,6 +3787,18 @@ mod tests {
             ),
             Err(StorageError::AlreadyExists)
         ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_datadir() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+
+        let txn = fixture.db.begin_read()?;
+        let cache = txn.read_cache()?;
+
+        assert_eq!(fixture.datadir.path(), cache.datadir());
 
         Ok(())
     }
