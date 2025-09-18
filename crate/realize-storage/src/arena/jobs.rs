@@ -331,7 +331,8 @@ impl StorageJobProcessor {
 mod tests {
     use super::*;
     use crate::arena::history::HistoryReadOperations;
-    use crate::arena::index::{IndexExt, IndexedFile};
+    use crate::arena::index::IndexExt;
+    use crate::arena::types::IndexedFile;
     use crate::arena::types::HistoryTableEntry;
     use crate::utils::hash;
     use crate::{ArenaFilesystem, Blob, LocalAvailability, Mark, Notification, PathId};

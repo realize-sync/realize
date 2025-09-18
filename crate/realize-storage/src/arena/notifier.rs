@@ -1,8 +1,9 @@
 #![allow(dead_code)] // work in progress
 
 use super::db::ArenaDatabase;
-use super::index::{self, IndexedFile};
+use super::index::{self};
 use super::types::HistoryTableEntry;
+use super::types::IndexedFile;
 use futures::StreamExt as _;
 use realize_types::{Arena, Hash, Path, UnixTime};
 use std::sync::Arc;

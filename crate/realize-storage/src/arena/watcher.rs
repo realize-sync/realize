@@ -741,7 +741,7 @@ async fn only_regular(e: async_walkdir::DirEntry) -> async_walkdir::Filtering {
 mod tests {
     use super::*;
     use crate::arena::db::ArenaDatabase;
-    use crate::arena::index::IndexedFile;
+    use crate::arena::types::IndexedFile;
     use crate::realize_types::Arena;
     use crate::utils::hash;
     use assert_fs::TempDir;

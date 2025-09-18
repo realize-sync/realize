@@ -3,7 +3,8 @@ use super::db::ArenaWriteTransaction;
 use super::dirty::WritableOpenDirty;
 use super::tree::{TreeExt, TreeReadOperations, WritableOpenTree};
 use super::types::{
-    CacheTableEntry, DirtableEntry, FileAvailability, FileMetadata, FileTableEntry, Layer,
+    CacheTableEntry, DirtableEntry, FileAvailability, FileMetadata, FileTableEntry, IndexedFile,
+    Layer,
 };
 use crate::arena::history::WritableOpenHistory;
 use crate::arena::tree::{self, TreeLoc};
@@ -54,6 +55,9 @@ pub(crate) trait CacheReadOperations {
     /// Return the [PathId] appropriate for the given [Inode].
     #[allow(dead_code)]
     fn map_to_pathid(&self, inode: Inode) -> Result<PathId, StorageError>;
+
+    /// Get the indexed entry at the given pathid
+    fn indexed_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError>;
 }
 
 /// A cache open for reading with a read transaction.
@@ -138,6 +142,10 @@ where
     fn map_to_pathid(&self, inode: Inode) -> Result<PathId, StorageError> {
         map_to_pathid(&self.inode_to_pathid, inode)
     }
+
+    fn indexed_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError> {
+        indexed_entry(&self.table, pathid)
+    }
 }
 
 impl<'a> CacheReadOperations for WritableOpenCache<'a> {
@@ -185,6 +193,10 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
 
     fn map_to_pathid(&self, inode: Inode) -> Result<PathId, StorageError> {
         map_to_pathid(&self.inode_to_pathid, inode)
+    }
+
+    fn indexed_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError> {
+        indexed_entry(&self.table, pathid)
     }
 }
 
@@ -500,11 +512,7 @@ impl<'a> WritableOpenCache<'a> {
         loc: L,
     ) -> Result<(PathId, DirMetadata), StorageError> {
         let pathid = tree.setup(loc)?;
-        if self
-            .table
-            .get((pathid, Layer::Default))?
-            .is_some()
-        {
+        if self.table.get((pathid, Layer::Default))?.is_some() {
             return Err(StorageError::AlreadyExists);
         }
         check_parent_is_dir(&self.table, tree, pathid)?;
@@ -533,11 +541,7 @@ impl<'a> WritableOpenCache<'a> {
                 if !self.readdir(tree, pathid).next().is_none() {
                     return Err(StorageError::DirectoryNotEmpty);
                 }
-                tree.remove_and_decref(
-                    pathid,
-                    &mut self.table,
-                    (pathid, Layer::Default),
-                )?;
+                tree.remove_and_decref(pathid, &mut self.table, (pathid, Layer::Default))?;
 
                 Ok(())
             }
@@ -733,11 +737,7 @@ impl<'a> WritableOpenCache<'a> {
         peer: Peer,
     ) -> Result<(), StorageError> {
         // Remove the entry
-        tree.remove_and_decref(
-            pathid,
-            &mut self.table,
-            (pathid, Layer::Remote(peer)),
-        )?;
+        tree.remove_and_decref(pathid, &mut self.table, (pathid, Layer::Remote(peer)))?;
 
         Ok(())
     }
@@ -756,11 +756,7 @@ impl<'a> WritableOpenCache<'a> {
         let parent = tree.parent(pathid)?;
 
         self.before_default_file_entry_change(tree, blobs, dirty, pathid)?;
-        if tree.remove_and_decref(
-            pathid,
-            &mut self.table,
-            (pathid, Layer::Default),
-        )? {
+        if tree.remove_and_decref(pathid, &mut self.table, (pathid, Layer::Default))? {
             // Update the parent modification time, as removing an
             // entry modifies it.
             if let Some(parent) = parent {
@@ -843,6 +839,42 @@ impl<'a> WritableOpenCache<'a> {
         }
         Ok(())
     }
+
+    /// Add a entry to the index layer
+    pub(crate) fn index<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        loc: L,
+        e: IndexedFile,
+    ) -> Result<(), StorageError> {
+        let loc = loc.into();
+        let pathid = tree.setup(loc.borrow())?;
+        if let Some(path) = tree.backtrack(loc)? {
+            tree.insert_and_incref(
+                pathid,
+                &mut self.table,
+                (pathid, Layer::Index),
+                Holder::new(&CacheTableEntry::File(e.into_file(path)))?,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Remove an entry from the index layer.
+    ///
+    /// Does nothing if the entry is not there
+    pub(crate) fn unindex<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        loc: L,
+    ) -> Result<(), StorageError> {
+        if let Some(pathid) = tree.resolve(loc)? {
+            tree.remove_and_decref(pathid, &mut self.table, (pathid, Layer::Index))?;
+        }
+
+        Ok(())
+    }
 }
 
 /// Initialize the database. This should be called at startup, in the
@@ -851,10 +883,7 @@ pub(crate) fn init(
     cache_table: &mut redb::Table<'_, (PathId, Layer), Holder<CacheTableEntry>>,
     root_pathid: PathId,
 ) -> Result<(), StorageError> {
-    if cache_table
-        .get((root_pathid, Layer::Default))?
-        .is_none()
-    {
+    if cache_table.get((root_pathid, Layer::Default))?.is_none() {
         // Exceptionally not using write_dir_mtime and not going
         // through tree because , arena roots aren't refcounted by
         // tree and are never deleted.
@@ -925,9 +954,9 @@ fn file_availability<'b, L: Into<TreeLoc<'b>>>(
         visited.insert(pathid); // avoid loops
         next = None;
         // Range over all entries for this pathid
-        for entry in cache_table.range(
-            (pathid, Layer::Default)..(pathid.plus(1), Layer::Default),
-        )? {
+        for entry in
+            cache_table.range((pathid, Layer::Default)..(pathid.plus(1), Layer::Default))?
+        {
             let entry = entry?;
             let (path_id, layer) = entry.0.value();
             if path_id != pathid {
@@ -953,6 +982,7 @@ fn file_availability<'b, L: Into<TreeLoc<'b>>>(
                     let file_entry: FileTableEntry = entry.1.value().parse()?.expect_file()?;
                     next = file_entry.branched_from;
                 }
+                Layer::Index => {}
             }
         }
     }
@@ -1165,6 +1195,20 @@ fn map_to_pathid(
     }
 
     Ok(PathId(inode.as_u64()))
+}
+
+/// Get an [IndexedFile] for the given pathid.
+fn indexed_entry(
+    cache_table: &impl redb::ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
+    pathid: PathId,
+) -> Result<Option<IndexedFile>, StorageError> {
+    if let Some(e) = cache_table.get((pathid, Layer::Index))? {
+        if let CacheTableEntry::File(e) = e.value().parse()? {
+            return Ok(Some(e.into()));
+        }
+    }
+
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -2629,6 +2673,102 @@ mod tests {
 
         // The version has changed, so the blob must have been deleted.
         assert!(!fixture.has_blob(&file_path)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn index_adds_entry() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let path = Path::parse("test.txt")?;
+        let hash = Hash([0x42; 32]);
+        let mtime = test_time();
+        let size = 100;
+
+        let indexed_file = IndexedFile {
+            hash: hash.clone(),
+            mtime,
+            size,
+            outdated_by: None,
+        };
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+
+        cache.index(&mut tree, &path, indexed_file.clone())?;
+
+        let pathid = tree.resolve(&path)?.unwrap();
+        let retrieved = cache.indexed_at_pathid(pathid)?.unwrap();
+        assert_eq!(indexed_file, retrieved);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unindex_removes_entry() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let path = Path::parse("test.txt")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+
+        cache.index(
+            &mut tree,
+            &path,
+            IndexedFile {
+                hash: Hash([1; 32]),
+                mtime: test_time(),
+                size: 100,
+                outdated_by: None,
+            },
+        )?;
+        let pathid = tree.expect(&path)?;
+        cache.unindex(&mut tree, &path)?;
+        assert!(cache.indexed_at_pathid(pathid)?.is_none());
+
+        // A second unindex doesn't fail
+        cache.unindex(&mut tree, &path)?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn index_overwrites_existing() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let path = Path::parse("test.txt")?;
+        let hash1 = Hash([0x42; 32]);
+        let hash2 = Hash([0x43; 32]);
+        let mtime = test_time();
+        let size1 = 100;
+        let size2 = 200;
+
+        let indexed_file1 = IndexedFile {
+            hash: hash1.clone(),
+            mtime,
+            size: size1,
+            outdated_by: None,
+        };
+
+        let indexed_file2 = IndexedFile {
+            hash: hash2.clone(),
+            mtime,
+            size: size2,
+            outdated_by: None,
+        };
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+
+        cache.index(&mut tree, &path, indexed_file1)?;
+        cache.index(&mut tree, &path, indexed_file2)?;
+
+        // Verify the second entry is now stored
+        let pathid = tree.resolve(&path)?.unwrap();
+        let retrieved = cache.indexed_at_pathid(pathid)?.unwrap();
+        assert_eq!(retrieved.hash, hash2);
+        assert_eq!(retrieved.size, size2);
 
         Ok(())
     }

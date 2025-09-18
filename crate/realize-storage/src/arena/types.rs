@@ -70,6 +70,8 @@ pub enum Layer {
     /// The default entry, containing the selected version and its
     /// metadata for the cache.
     Default,
+    /// An entry in the index layer.
+    Index,
     /// An entry that represents another peer's copy.
     Remote(Peer),
 }
@@ -92,7 +94,8 @@ impl Value for Layer {
         }
         match data.get(0) {
             Some(1) => Layer::Default,
-            Some(2) => Layer::Remote(Peer::from(str::from_utf8(&data[1..]).unwrap())),
+            Some(2) => Layer::Index,
+            Some(3) => Layer::Remote(Peer::from(str::from_utf8(&data[1..]).unwrap())),
             _ => Layer::Default,
         }
     }
@@ -104,11 +107,10 @@ impl Value for Layer {
     {
         let mut ret = vec![];
         match value {
-            Layer::Default => {
-                ret.push(1);
-            }
+            Layer::Default => ret.push(1),
+            Layer::Index => ret.push(2),
             Layer::Remote(peer) => {
-                ret.push(2);
+                ret.push(3);
                 ret.extend_from_slice(peer.as_str().as_bytes());
             }
         };
@@ -127,7 +129,6 @@ impl Key for Layer {
         data1.cmp(data2)
     }
 }
-
 
 /// An entry in the queue table.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -869,6 +870,79 @@ impl ByteConvertible<PeerTableEntry> for PeerTableEntry {
     }
 }
 
+/// A file entry for the index layer.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct IndexedFile {
+    pub hash: Hash,
+    pub mtime: UnixTime,
+    pub size: u64,
+
+    // If set, a version is known to exist that replaces the version
+    // in this entry.
+    pub outdated_by: Option<Hash>,
+}
+
+impl IndexedFile {
+    /// Return true if replacing `old_hash` makes this entry outdated.
+    pub(crate) fn is_outdated_by(&self, old_hash: &Hash) -> bool {
+        self.hash == *old_hash
+            || self
+                .outdated_by
+                .as_ref()
+                .map(|h| *h == *old_hash)
+                .unwrap_or(false)
+    }
+
+    /// Check whether `file_path` size and mtime match this entry's.
+    pub(crate) fn matches_file<P: AsRef<std::path::Path>>(&self, file_path: P) -> bool {
+        if let Ok(m) = file_path.as_ref().metadata()
+            && self.matches(m.len(), UnixTime::mtime(&m))
+        {
+            return true;
+        }
+
+        false
+    }
+
+    /// Check whether `file_path` size and mtime match this entry's.
+    pub(crate) fn matches(&self, size: u64, mtime: UnixTime) -> bool {
+        size == self.size && mtime == self.mtime
+    }
+
+    pub(crate) fn into_file(self, path: Path) -> FileTableEntry {
+        FileTableEntry {
+            size: self.size,
+            mtime: self.mtime,
+            path: path,
+            hash: self.hash,
+            outdated_by: self.outdated_by,
+            branched_from: None,
+        }
+    }
+}
+
+impl From<FileTableEntry> for IndexedFile {
+    fn from(value: FileTableEntry) -> Self {
+        IndexedFile {
+            hash: value.hash,
+            mtime: value.mtime,
+            size: value.size,
+            outdated_by: value.outdated_by,
+        }
+    }
+}
+
+impl From<&FileTableEntry> for IndexedFile {
+    fn from(value: &FileTableEntry) -> Self {
+        IndexedFile {
+            hash: value.hash.clone(),
+            mtime: value.mtime,
+            size: value.size,
+            outdated_by: value.outdated_by.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1118,6 +1192,18 @@ mod tests {
     }
 
     #[test]
+    fn convert_layer_index() -> anyhow::Result<()> {
+        let layer = Layer::Index;
+
+        // Test round-trip conversion
+        let bytes = Layer::as_bytes(&layer);
+        let converted = Layer::from_bytes(&bytes);
+        assert_eq!(layer, converted);
+
+        Ok(())
+    }
+
+    #[test]
     fn convert_layer_remote() -> anyhow::Result<()> {
         let layer = Layer::Remote(Peer::from("peer1"));
 
@@ -1153,6 +1239,7 @@ mod tests {
 
         let test_cases = vec![
             Layer::Default,
+            Layer::Index,
             Layer::Remote(Peer::from("a")),
             Layer::Remote(Peer::from("b")),
             Layer::Remote(Peer::from("z")),
@@ -1196,6 +1283,7 @@ mod tests {
         // Test that byte comparison matches object comparison for all valid layers
         let test_cases = vec![
             Layer::Default,
+            Layer::Index,
             Layer::Remote(Peer::from("a")),
             Layer::Remote(Peer::from("b")),
             Layer::Remote(Peer::from("z")),
@@ -1235,7 +1323,7 @@ mod tests {
 
         // Should be 5 bytes for Remote (1 byte + "test")
         assert_eq!(bytes.len(), 5);
-        assert_eq!(bytes[0], 2);
+        assert_eq!(bytes[0], 3);
         assert_eq!(&bytes[1..], b"test");
     }
 
@@ -1243,14 +1331,21 @@ mod tests {
     fn layer_ordering_semantics() {
         // Test that Layer ordering matches the spec
         let default = Layer::Default;
+        let index = Layer::Index;
         let remote_a = Layer::Remote(Peer::from("a"));
         let remote_b = Layer::Remote(Peer::from("b"));
         let remote_z = Layer::Remote(Peer::from("z"));
 
-        // Default should come before Remote
+        // Default should come before Remote and index
         assert!(default < remote_a);
         assert!(default < remote_b);
         assert!(default < remote_z);
+        assert!(default < index);
+
+        // Index should come before Remote
+        assert!(index < remote_a);
+        assert!(index < remote_b);
+        assert!(index < remote_z);
 
         // Remote peers should be ordered by peer name
         assert!(remote_a < remote_b);

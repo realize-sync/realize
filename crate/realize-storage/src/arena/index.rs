@@ -4,7 +4,7 @@ use super::db::ArenaDatabase;
 use super::dirty::WritableOpenDirty;
 use super::history::{HistoryReadOperations, WritableOpenHistory};
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
-use super::types::{FileTableEntry, HistoryTableEntry};
+use super::types::{FileTableEntry, HistoryTableEntry, IndexedFile};
 use crate::utils::fs_utils;
 use crate::utils::holder::Holder;
 use crate::{PathId, StorageError};
@@ -148,66 +148,6 @@ pub(crate) fn rename<'b, 'c, L1: Into<TreeLoc<'b>>, L2: Into<TreeLoc<'c>>>(
     }
 
     Ok(false)
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct IndexedFile {
-    pub hash: Hash,
-    pub mtime: UnixTime,
-    pub size: u64,
-
-    // If set, a version is known to exist that replaces the version
-    // in this entry.
-    pub outdated_by: Option<Hash>,
-}
-
-impl IndexedFile {
-    /// Return true if replacing `old_hash` makes this entry outdated.
-    pub(crate) fn is_outdated_by(&self, old_hash: &Hash) -> bool {
-        self.hash == *old_hash
-            || self
-                .outdated_by
-                .as_ref()
-                .map(|h| *h == *old_hash)
-                .unwrap_or(false)
-    }
-
-    /// Check whether `file_path` size and mtime match this entry's.
-    pub(crate) fn matches_file<P: AsRef<std::path::Path>>(&self, file_path: P) -> bool {
-        if let Ok(m) = file_path.as_ref().metadata()
-            && self.matches(m.len(), UnixTime::mtime(&m))
-        {
-            return true;
-        }
-
-        false
-    }
-
-    /// Check whether `file_path` size and mtime match this entry's.
-    pub(crate) fn matches(&self, size: u64, mtime: UnixTime) -> bool {
-        size == self.size && mtime == self.mtime
-    }
-}
-
-impl From<FileTableEntry> for IndexedFile {
-    fn from(value: FileTableEntry) -> Self {
-        IndexedFile {
-            hash: value.hash,
-            mtime: value.mtime,
-            size: value.size,
-            outdated_by: value.outdated_by,
-        }
-    }
-}
-impl From<&FileTableEntry> for IndexedFile {
-    fn from(value: &FileTableEntry) -> Self {
-        IndexedFile {
-            hash: value.hash.clone(),
-            mtime: value.mtime,
-            size: value.size,
-            outdated_by: value.outdated_by.clone(),
-        }
-    }
 }
 
 pub(crate) struct Index {
