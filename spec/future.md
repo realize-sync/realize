@@ -8,16 +8,6 @@ for easy reference, and end with a detailled and numbered task list.
 ipath-to-inode could be stored into the FileTableEntry instead of
 using a separate table. That would speed up readdir.
 
-## cache umask {#cacheumask}
-
-It should be possible to specify a umask for cache entries, to
-configure who can access the entries and whether write access is
-allowed.
-
-Write access doesn't really apply to the cache, which is read-only,
-but is followed by OverlayFs, which might then allow local
-modification of remote files.
-
 ## configure "auth" logs {#logauth}
 
 setup configuration so that connection attempts and auth error/accept
