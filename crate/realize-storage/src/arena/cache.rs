@@ -3,7 +3,7 @@ use super::db::ArenaWriteTransaction;
 use super::dirty::WritableOpenDirty;
 use super::tree::{TreeExt, TreeReadOperations, WritableOpenTree};
 use super::types::{
-    CacheTableEntry, CacheTableKey, DirtableEntry, FileAvailability, FileMetadata, FileTableEntry,
+    CacheTableEntry, DirtableEntry, FileAvailability, FileMetadata, FileTableEntry, Layer,
 };
 use crate::arena::history::WritableOpenHistory;
 use crate::arena::tree::{self, TreeLoc};
@@ -59,7 +59,7 @@ pub(crate) trait CacheReadOperations {
 /// A cache open for reading with a read transaction.
 pub(crate) struct ReadableOpenCache<T, PN, NP>
 where
-    T: ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    T: ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
     PN: ReadableTable<PathId, Inode>,
     NP: ReadableTable<Inode, PathId>,
 {
@@ -73,7 +73,7 @@ where
 
 impl<T, PN, NP> ReadableOpenCache<T, PN, NP>
 where
-    T: ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    T: ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
     PN: ReadableTable<PathId, Inode>,
     NP: ReadableTable<Inode, PathId>,
 {
@@ -89,7 +89,7 @@ where
 
 impl<T, PN, NP> CacheReadOperations for ReadableOpenCache<T, PN, NP>
 where
-    T: ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    T: ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
     PN: ReadableTable<PathId, Inode>,
     NP: ReadableTable<Inode, PathId>,
 {
@@ -267,7 +267,7 @@ impl<T: CacheReadOperations> CacheExt for T {
 
 /// A cache open for writing with a write transaction.
 pub(crate) struct WritableOpenCache<'a> {
-    table: Table<'a, CacheTableKey, Holder<'static, CacheTableEntry>>,
+    table: Table<'a, (PathId, Layer), Holder<'static, CacheTableEntry>>,
     pathid_to_inode: Table<'a, PathId, Inode>,
     inode_to_pathid: Table<'a, Inode, PathId>,
     pending_catchup_table: Table<'a, (&'static str, PathId), ()>,
@@ -276,7 +276,7 @@ pub(crate) struct WritableOpenCache<'a> {
 
 impl<'a> WritableOpenCache<'a> {
     pub(crate) fn new(
-        table: Table<'a, CacheTableKey, Holder<CacheTableEntry>>,
+        table: Table<'a, (PathId, Layer), Holder<CacheTableEntry>>,
         pathid_to_inode: Table<'a, PathId, Inode>,
         inode_to_pathid: Table<'a, Inode, PathId>,
         pending_catchup_table: Table<'a, (&'static str, PathId), ()>,
@@ -365,7 +365,7 @@ impl<'a> WritableOpenCache<'a> {
                 tree.remove_and_decref(
                     source_pathid,
                     &mut self.table,
-                    CacheTableKey::Default(source_pathid),
+                    (source_pathid, Layer::Default),
                 )?;
             }
             CacheTableEntry::File(mut entry) => {
@@ -437,7 +437,7 @@ impl<'a> WritableOpenCache<'a> {
                     tree.remove_and_decref(
                         source_entry,
                         &mut self.table,
-                        CacheTableKey::Default(source_entry),
+                        (source_entry, Layer::Default),
                     )?;
                 }
                 Some(CacheTableEntry::File(mut file_entry)) => {
@@ -500,7 +500,11 @@ impl<'a> WritableOpenCache<'a> {
         loc: L,
     ) -> Result<(PathId, DirMetadata), StorageError> {
         let pathid = tree.setup(loc)?;
-        if self.table.get(CacheTableKey::Default(pathid))?.is_some() {
+        if self
+            .table
+            .get((pathid, Layer::Default))?
+            .is_some()
+        {
             return Err(StorageError::AlreadyExists);
         }
         check_parent_is_dir(&self.table, tree, pathid)?;
@@ -529,7 +533,11 @@ impl<'a> WritableOpenCache<'a> {
                 if !self.readdir(tree, pathid).next().is_none() {
                     return Err(StorageError::DirectoryNotEmpty);
                 }
-                tree.remove_and_decref(pathid, &mut self.table, CacheTableKey::Default(pathid))?;
+                tree.remove_and_decref(
+                    pathid,
+                    &mut self.table,
+                    (pathid, Layer::Default),
+                )?;
 
                 Ok(())
             }
@@ -604,7 +612,8 @@ impl<'a> WritableOpenCache<'a> {
     pub(crate) fn catchup_start(&mut self, peer: Peer) -> Result<(), StorageError> {
         for elt in self.table.iter()? {
             let (k, _) = elt?;
-            if let CacheTableKey::PeerCopy(pathid, elt_peer) = k.value()
+            let (pathid, layer) = k.value();
+            if let Layer::Remote(elt_peer) = layer
                 && elt_peer == peer
             {
                 self.pending_catchup_table
@@ -665,7 +674,7 @@ impl<'a> WritableOpenCache<'a> {
         tree.insert_and_incref(
             file_pathid,
             &mut self.table,
-            CacheTableKey::PeerCopy(file_pathid, peer),
+            (file_pathid, Layer::Remote(peer)),
             Holder::new(&CacheTableEntry::File(entry.clone()))?,
         )?;
 
@@ -685,7 +694,7 @@ impl<'a> WritableOpenCache<'a> {
         if tree.insert_and_incref(
             pathid,
             &mut self.table,
-            CacheTableKey::Default(pathid),
+            (pathid, Layer::Default),
             Holder::new(&CacheTableEntry::File(new_entry.clone()))?,
         )? {
             // Update the parent directory mtime since we're adding a file to it
@@ -727,7 +736,7 @@ impl<'a> WritableOpenCache<'a> {
         tree.remove_and_decref(
             pathid,
             &mut self.table,
-            CacheTableKey::PeerCopy(pathid, peer),
+            (pathid, Layer::Remote(peer)),
         )?;
 
         Ok(())
@@ -747,7 +756,11 @@ impl<'a> WritableOpenCache<'a> {
         let parent = tree.parent(pathid)?;
 
         self.before_default_file_entry_change(tree, blobs, dirty, pathid)?;
-        if tree.remove_and_decref(pathid, &mut self.table, CacheTableKey::Default(pathid))? {
+        if tree.remove_and_decref(
+            pathid,
+            &mut self.table,
+            (pathid, Layer::Default),
+        )? {
             // Update the parent modification time, as removing an
             // entry modifies it.
             if let Some(parent) = parent {
@@ -835,18 +848,18 @@ impl<'a> WritableOpenCache<'a> {
 /// Initialize the database. This should be called at startup, in the
 /// transaction that crates new tables.
 pub(crate) fn init(
-    cache_table: &mut redb::Table<'_, CacheTableKey, Holder<CacheTableEntry>>,
+    cache_table: &mut redb::Table<'_, (PathId, Layer), Holder<CacheTableEntry>>,
     root_pathid: PathId,
 ) -> Result<(), StorageError> {
     if cache_table
-        .get(CacheTableKey::Default(root_pathid))?
+        .get((root_pathid, Layer::Default))?
         .is_none()
     {
         // Exceptionally not using write_dir_mtime and not going
         // through tree because , arena roots aren't refcounted by
         // tree and are never deleted.
         cache_table.insert(
-            CacheTableKey::Default(root_pathid),
+            (root_pathid, Layer::Default),
             Holder::with_content(CacheTableEntry::Dir(DirtableEntry {
                 mtime: UnixTime::now(),
             }))?,
@@ -857,7 +870,7 @@ pub(crate) fn init(
 
 /// Lookup a specific name in the given directory pathid.
 fn lookup<'b, L: Into<TreeLoc<'b>>>(
-    cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
     tree: &impl TreeReadOperations,
     loc: L,
 ) -> Result<(PathId, crate::arena::types::Metadata), StorageError> {
@@ -869,10 +882,10 @@ fn lookup<'b, L: Into<TreeLoc<'b>>>(
 
 /// Get metadata for a file or directory.
 fn metadata(
-    cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
     pathid: PathId,
 ) -> Result<Option<crate::arena::types::Metadata>, StorageError> {
-    if let Some(e) = cache_table.get(CacheTableKey::Default(pathid))? {
+    if let Some(e) = cache_table.get((pathid, Layer::Default))? {
         Ok(Some(match e.value().parse()? {
             CacheTableEntry::File(file_entry) => {
                 crate::arena::types::Metadata::File(crate::arena::types::FileMetadata {
@@ -895,7 +908,7 @@ fn metadata(
 
 /// Get file availability information for the given pathid.
 fn file_availability<'b, L: Into<TreeLoc<'b>>>(
-    cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
     tree: &impl TreeReadOperations,
     loc: L,
     arena: Arena,
@@ -911,10 +924,17 @@ fn file_availability<'b, L: Into<TreeLoc<'b>>>(
     {
         visited.insert(pathid); // avoid loops
         next = None;
-        for entry in cache_table.range(CacheTableKey::range(pathid))? {
+        // Range over all entries for this pathid
+        for entry in cache_table.range(
+            (pathid, Layer::Default)..(pathid.plus(1), Layer::Default),
+        )? {
             let entry = entry?;
-            match entry.0.value() {
-                CacheTableKey::PeerCopy(_, peer) => {
+            let (path_id, layer) = entry.0.value();
+            if path_id != pathid {
+                break; // Out of range
+            }
+            match layer {
+                Layer::Remote(peer) => {
                     let file_entry: FileTableEntry = entry.1.value().parse()?.expect_file()?;
                     if file_entry.hash == *hash {
                         avail
@@ -929,11 +949,10 @@ fn file_availability<'b, L: Into<TreeLoc<'b>>>(
                             .push(peer);
                     }
                 }
-                CacheTableKey::Default(_) => {
+                Layer::Default => {
                     let file_entry: FileTableEntry = entry.1.value().parse()?.expect_file()?;
                     next = file_entry.branched_from;
                 }
-                _ => {}
             }
         }
     }
@@ -951,7 +970,7 @@ struct ReadDirIterator<'a, 'b, T> {
 
 impl<'a, 'b, T> ReadDirIterator<'a, 'b, T>
 where
-    T: ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    T: ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
 {
     fn new<'l, L: Into<TreeLoc<'l>>>(
         table: &'a T,
@@ -971,7 +990,7 @@ where
 
 impl<'a, 'b, T> Iterator for ReadDirIterator<'a, 'b, T>
 where
-    T: ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    T: ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
 {
     type Item = Result<(String, PathId, crate::arena::types::Metadata), StorageError>;
 
@@ -994,14 +1013,14 @@ where
 
 /// Get a [FileTableEntry] for a specific peer.
 fn peer_file_entry(
-    cache_table: &impl redb::ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    cache_table: &impl redb::ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
     pathid: PathId,
     peer: Option<Peer>,
 ) -> Result<Option<FileTableEntry>, StorageError> {
-    match cache_table.get(
-        peer.map(|p| CacheTableKey::PeerCopy(pathid, p))
-            .unwrap_or_else(|| CacheTableKey::Default(pathid)),
-    )? {
+    let key = peer
+        .map(|p| (pathid, Layer::Remote(p)))
+        .unwrap_or_else(|| (pathid, Layer::Default));
+    match cache_table.get(key)? {
         None => Ok(None),
         Some(e) => Ok(e.value().parse()?.file()),
     }
@@ -1011,7 +1030,7 @@ fn peer_file_entry(
 ///
 /// Returns None if the file cannot be found or if it is a directory.
 fn default_file_entry(
-    cache_table: &impl redb::ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    cache_table: &impl redb::ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
     pathid: PathId,
 ) -> Result<Option<FileTableEntry>, StorageError> {
     if let Some(CacheTableEntry::File(entry)) = default_entry(cache_table, pathid)? {
@@ -1025,10 +1044,10 @@ fn default_file_entry(
 ///
 /// Returns None if the file cannot be found or if it is a directory.
 fn default_entry(
-    cache_table: &impl redb::ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    cache_table: &impl redb::ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
     pathid: PathId,
 ) -> Result<Option<CacheTableEntry>, StorageError> {
-    if let Some(entry) = cache_table.get(CacheTableKey::Default(pathid))? {
+    if let Some(entry) = cache_table.get((pathid, Layer::Default))? {
         return Ok(Some(entry.value().parse()?));
     }
 
@@ -1039,7 +1058,7 @@ fn default_entry(
 ///
 /// Fail if the file cannot be found or if it is a directory.
 fn default_file_entry_or_err(
-    cache_table: &impl redb::ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    cache_table: &impl redb::ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
     pathid: PathId,
 ) -> Result<FileTableEntry, StorageError> {
     default_entry(cache_table, pathid)?
@@ -1052,7 +1071,7 @@ fn default_file_entry_or_err(
 /// The presence of this entry is what marks a directory as existing,
 /// both in the cache and in the tree.
 fn write_dir_mtime(
-    cache_table: &mut redb::Table<'_, CacheTableKey, Holder<CacheTableEntry>>,
+    cache_table: &mut redb::Table<'_, (PathId, Layer), Holder<CacheTableEntry>>,
     tree: &mut WritableOpenTree,
     pathid: PathId,
     mtime: UnixTime,
@@ -1060,7 +1079,7 @@ fn write_dir_mtime(
     if tree.insert_and_incref(
         pathid,
         cache_table,
-        CacheTableKey::Default(pathid),
+        (pathid, Layer::Default),
         Holder::with_content(CacheTableEntry::Dir(DirtableEntry { mtime }))?,
     )? {
         // Update the parent directory mtime since we're adding a directory to it.
@@ -1085,10 +1104,10 @@ fn unmark_peer_file(
 /// Check whether the given pathid exists in the cache and whether it
 /// is a file or a directory.
 fn pathid_assignment(
-    cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
     pathid: PathId,
 ) -> Result<Option<PathAssignment>, StorageError> {
-    match cache_table.get(CacheTableKey::Default(pathid))? {
+    match cache_table.get((pathid, Layer::Default))? {
         Some(e) => match e.value().parse()? {
             CacheTableEntry::Dir(_) => Ok(Some(PathAssignment::Directory)),
             CacheTableEntry::File(_) => Ok(Some(PathAssignment::File)),
@@ -1101,7 +1120,7 @@ fn pathid_assignment(
 /// just before creating a file entry, to reproduce the strict behavior
 /// of filesystems.
 fn check_parent_is_dir(
-    cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
     tree: &impl TreeReadOperations,
     pathid: PathId,
 ) -> Result<(), StorageError> {
@@ -1114,7 +1133,7 @@ fn check_parent_is_dir(
 
 /// Make sure the given pathid exists and is a directory.
 fn check_is_dir(
-    cache_table: &impl ReadableTable<CacheTableKey, Holder<'static, CacheTableEntry>>,
+    cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
     pathid: PathId,
 ) -> Result<(), StorageError> {
     match pathid_assignment(cache_table, pathid)? {

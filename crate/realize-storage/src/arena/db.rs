@@ -6,7 +6,7 @@ use super::index::{IndexReadOperations, ReadableOpenIndex, WritableOpenIndex};
 use super::mark::{MarkReadOperations, ReadableOpenMark, WritableOpenMark};
 use super::peer::{PeersReadOperations, ReadableOpenPeers, WritableOpenPeers};
 use super::tree::{ReadableOpenTree, Tree, TreeReadOperations, WritableOpenTree};
-use super::types::CacheTableKey;
+use super::types::Layer;
 use super::types::{
     BlobTableEntry, CacheTableEntry, FailedJobTableEntry, FileTableEntry, HistoryTableEntry,
     MarkTableEntry, PeerTableEntry, QueueTableEntry,
@@ -58,9 +58,9 @@ pub(crate) const TREE_REFCOUNT_TABLE: TableDefinition<PathId, u32> =
 /// An pathid available in no peers should be remove from all
 /// directories.
 ///
-/// Key: CacheTableKey (pathid, default|local|peer, peer)
+/// Key: (PathId, Layer) (layer, pathid)
 /// Value: CacheTableEntry
-const CACHE_TABLE: TableDefinition<CacheTableKey, Holder<CacheTableEntry>> =
+const CACHE_TABLE: TableDefinition<(PathId, Layer), Holder<CacheTableEntry>> =
     TableDefinition::new("cache.file");
 
 /// Track local indexed files.

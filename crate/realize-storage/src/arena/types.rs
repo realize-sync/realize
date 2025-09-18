@@ -62,6 +62,73 @@ pub use blob_capnp::LruQueueId;
 use redb::{Key, Value};
 use uuid::Uuid;
 
+/// Layer enum for cache table keys.
+///
+/// Used in combination with PathId to form cache table keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Layer {
+    /// The default entry, containing the selected version and its
+    /// metadata for the cache.
+    Default,
+    /// An entry that represents another peer's copy.
+    Remote(Peer),
+}
+
+impl Value for Layer {
+    type SelfType<'a> = Layer;
+
+    type AsBytes<'a> = Vec<u8>;
+
+    fn fixed_width() -> Option<usize> {
+        None
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
+    where
+        Self: 'a,
+    {
+        if data.is_empty() {
+            return Layer::Default;
+        }
+        match data.get(0) {
+            Some(1) => Layer::Default,
+            Some(2) => Layer::Remote(Peer::from(str::from_utf8(&data[1..]).unwrap())),
+            _ => Layer::Default,
+        }
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &Layer) -> Vec<u8>
+    where
+        Self: 'a,
+        Self: 'b,
+    {
+        let mut ret = vec![];
+        match value {
+            Layer::Default => {
+                ret.push(1);
+            }
+            Layer::Remote(peer) => {
+                ret.push(2);
+                ret.extend_from_slice(peer.as_str().as_bytes());
+            }
+        };
+        ret
+    }
+
+    fn type_name() -> redb::TypeName {
+        redb::TypeName::new("Layer")
+    }
+}
+
+impl Key for Layer {
+    fn compare(data1: &[u8], data2: &[u8]) -> std::cmp::Ordering {
+        // The byte representation is designed so that byte comparison
+        // matches object comparison.
+        data1.cmp(data2)
+    }
+}
+
+
 /// An entry in the queue table.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct QueueTableEntry {
@@ -521,150 +588,6 @@ pub struct FileAvailability {
     pub peers: Vec<Peer>,
 }
 
-/// Key for the file table of the [ArenaDatabase].
-#[derive(Debug, Clone)]
-pub enum CacheTableKey {
-    /// The default entry, containing the selected version and its
-    /// metadata for the cache.
-    Default(PathId),
-    /// An entry that represents another peer's copy.
-    PeerCopy(PathId, Peer),
-
-    /// A key that could not be parsed
-    Invalid,
-}
-
-impl CacheTableKey {
-    /// A range that covers all keys with the given pathid.
-    pub fn range(pathid: PathId) -> std::ops::Range<CacheTableKey> {
-        CacheTableKey::Default(pathid)..CacheTableKey::Default(pathid.plus(1))
-    }
-
-    /// The key's pathid
-    pub fn pathid(&self) -> PathId {
-        match self {
-            CacheTableKey::Invalid => PathId::ZERO,
-            CacheTableKey::Default(pathid) => *pathid,
-            CacheTableKey::PeerCopy(pathid, _) => *pathid,
-        }
-    }
-
-    fn variant_order(&self) -> u8 {
-        match self {
-            CacheTableKey::Invalid => 0,
-            CacheTableKey::Default(_) => 1,
-            CacheTableKey::PeerCopy(_, _) => 2,
-        }
-    }
-
-    fn peer(&self) -> Option<&Peer> {
-        match self {
-            CacheTableKey::PeerCopy(_, peer) => Some(peer),
-            _ => None,
-        }
-    }
-}
-
-impl PartialEq for CacheTableKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.pathid() == other.pathid()
-            && self.variant_order() == other.variant_order()
-            && self.peer() == other.peer()
-    }
-}
-
-impl Eq for CacheTableKey {}
-
-impl PartialOrd for CacheTableKey {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for CacheTableKey {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // First compare by pathid
-        let pathid_cmp = self.pathid().cmp(&other.pathid());
-        if pathid_cmp != std::cmp::Ordering::Equal {
-            return pathid_cmp;
-        }
-
-        // Then compare by variant type
-        let variant_cmp = self.variant_order().cmp(&other.variant_order());
-        if variant_cmp != std::cmp::Ordering::Equal {
-            return variant_cmp;
-        }
-
-        // Finally compare by peer (only relevant for PeerCopy variants)
-        match (self.peer(), other.peer()) {
-            (Some(peer1), Some(peer2)) => peer1.cmp(peer2),
-            (None, None) => std::cmp::Ordering::Equal,
-            (Some(_), None) => std::cmp::Ordering::Greater,
-            (None, Some(_)) => std::cmp::Ordering::Less,
-        }
-    }
-}
-
-impl Value for CacheTableKey {
-    type SelfType<'a> = CacheTableKey;
-
-    type AsBytes<'a> = Vec<u8>;
-
-    fn fixed_width() -> Option<usize> {
-        None
-    }
-
-    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
-    where
-        Self: 'a,
-    {
-        let pathid = PathId(<u64>::from_be_bytes(
-            data[0..8].try_into().unwrap_or([0; 8]),
-        ));
-        if pathid == PathId::ZERO {
-            return CacheTableKey::Invalid;
-        }
-        match data.get(8) {
-            None => CacheTableKey::Default(pathid),
-            Some(1) => {
-                CacheTableKey::PeerCopy(pathid, Peer::from(str::from_utf8(&data[9..]).unwrap()))
-            }
-            Some(_) => CacheTableKey::Invalid,
-        }
-    }
-
-    fn as_bytes<'a, 'b: 'a>(value: &CacheTableKey) -> Vec<u8>
-    where
-        Self: 'a,
-        Self: 'b,
-    {
-        let mut ret = vec![];
-        ret.extend_from_slice(&value.pathid().as_u64().to_be_bytes());
-        match value {
-            CacheTableKey::Default(_) | CacheTableKey::Invalid => {}
-            CacheTableKey::PeerCopy(_, peer) => {
-                ret.push(1);
-                ret.extend_from_slice(peer.as_str().as_bytes());
-            }
-        };
-
-        ret
-    }
-
-    fn type_name() -> redb::TypeName {
-        redb::TypeName::new("CacheTableKey")
-    }
-}
-
-impl Key for CacheTableKey {
-    fn compare(data1: &[u8], data2: &[u8]) -> std::cmp::Ordering {
-        // The byte representation is designed so that byte comparison
-        // matches object comparison, except for Invalid. No need to
-        // parse.
-        data1.cmp(data2)
-    }
-}
-
 /// An entry in the file table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileTableEntry {
@@ -1112,197 +1035,6 @@ mod tests {
     }
 
     #[test]
-    fn convert_file_table_key_default() -> anyhow::Result<()> {
-        let key = CacheTableKey::Default(PathId(12345));
-
-        // Test round-trip conversion
-        let bytes = CacheTableKey::as_bytes(&key);
-        let converted = CacheTableKey::from_bytes(&bytes);
-        assert_eq!(key, converted);
-
-        Ok(())
-    }
-
-    #[test]
-    fn convert_file_table_key_peer_copy() -> anyhow::Result<()> {
-        let key = CacheTableKey::PeerCopy(PathId(11111), Peer::from("peer1"));
-
-        // Test round-trip conversion
-        let bytes = CacheTableKey::as_bytes(&key);
-        let converted = CacheTableKey::from_bytes(&bytes);
-        assert_eq!(key, converted);
-
-        Ok(())
-    }
-
-    #[test]
-    fn convert_file_table_key_invalid() -> anyhow::Result<()> {
-        let key = CacheTableKey::Invalid;
-
-        // Test round-trip conversion
-        let bytes = CacheTableKey::as_bytes(&key);
-        let converted = CacheTableKey::from_bytes(&bytes);
-        assert_eq!(key, converted);
-
-        Ok(())
-    }
-
-    #[test]
-    fn convert_file_table_key_all_variants() -> anyhow::Result<()> {
-        let test_cases = vec![
-            CacheTableKey::Default(PathId(1)),
-            CacheTableKey::Default(PathId(0xFFFFFFFFFFFFFFFF)),
-            CacheTableKey::PeerCopy(PathId(3), Peer::from("short")),
-            CacheTableKey::PeerCopy(
-                PathId(4),
-                Peer::from("very_long_peer_name_that_might_cause_issues"),
-            ),
-            CacheTableKey::Invalid,
-        ];
-
-        for key in test_cases {
-            let bytes = CacheTableKey::as_bytes(&key);
-            let converted = CacheTableKey::from_bytes(&bytes);
-            assert_eq!(key, converted, "Failed for key: {:?}", key);
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn file_table_key_byte_comparison_behavior() {
-        // Test that byte comparison behavior is consistent and documented
-
-        let test_cases = vec![
-            CacheTableKey::Default(PathId(1)),
-            CacheTableKey::Default(PathId(2)),
-            CacheTableKey::PeerCopy(PathId(1), Peer::from("a")),
-            CacheTableKey::PeerCopy(PathId(1), Peer::from("b")),
-            CacheTableKey::PeerCopy(PathId(2), Peer::from("a")),
-        ];
-
-        // Test that byte comparison is consistent (same inputs always give same result)
-        for i in 0..test_cases.len() {
-            for j in 0..test_cases.len() {
-                let key1 = &test_cases[i];
-                let key2 = &test_cases[j];
-
-                let bytes1 = CacheTableKey::as_bytes(key1);
-                let bytes2 = CacheTableKey::as_bytes(key2);
-                let byte_cmp = CacheTableKey::compare(&bytes1, &bytes2);
-
-                // Test consistency: reverse comparison should be opposite
-                let byte_cmp_reverse = CacheTableKey::compare(&bytes2, &bytes1);
-                assert_eq!(
-                    byte_cmp,
-                    byte_cmp_reverse.reverse(),
-                    "Byte comparison not consistent for {:?} vs {:?}",
-                    key1,
-                    key2
-                );
-
-                // Test reflexivity: same key should compare equal
-                if i == j {
-                    assert_eq!(
-                        byte_cmp,
-                        std::cmp::Ordering::Equal,
-                        "Byte comparison not reflexive for {:?}",
-                        key1
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn file_table_key_byte_comparison_matches_object_comparison() {
-        // Test that byte comparison matches object comparison for all valid keys
-        let test_cases = vec![
-            CacheTableKey::Default(PathId(1)),
-            CacheTableKey::Default(PathId(2)),
-            CacheTableKey::Default(PathId(0x110000)),
-            CacheTableKey::PeerCopy(PathId(1), Peer::from("a")),
-            CacheTableKey::PeerCopy(PathId(1), Peer::from("b")),
-            CacheTableKey::PeerCopy(PathId(2), Peer::from("a")),
-            CacheTableKey::PeerCopy(PathId(0x110000), Peer::from("a")),
-        ];
-
-        for i in 0..test_cases.len() {
-            for j in 0..test_cases.len() {
-                let key1 = &test_cases[i];
-                let key2 = &test_cases[j];
-
-                let object_cmp = key1.cmp(key2);
-                let bytes1 = CacheTableKey::as_bytes(key1);
-                let bytes2 = CacheTableKey::as_bytes(key2);
-                let byte_cmp = CacheTableKey::compare(&bytes1, &bytes2);
-
-                assert_eq!(
-                    object_cmp, byte_cmp,
-                    "Comparison mismatch for {:?} vs {:?}",
-                    key1, key2
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn file_table_key_edge_cases() -> anyhow::Result<()> {
-        // Test edge cases
-        let edge_cases = vec![
-            CacheTableKey::Default(PathId(1)), // Non-zero pathid
-            CacheTableKey::PeerCopy(PathId(1), Peer::from("")), // Empty peer
-            CacheTableKey::PeerCopy(PathId(1), Peer::from("a")), // Single char peer
-        ];
-
-        for key in edge_cases {
-            let bytes = CacheTableKey::as_bytes(&key);
-            let converted = CacheTableKey::from_bytes(&bytes);
-            assert_eq!(key, converted, "Failed for edge case: {:?}", key);
-        }
-
-        // Test that PathId(0) gets converted to Invalid (this is the intended behavior)
-        let zero_pathid_cases = vec![
-            CacheTableKey::Default(PathId(0)),
-            CacheTableKey::PeerCopy(PathId(0), Peer::from("")),
-        ];
-
-        for key in zero_pathid_cases {
-            let bytes = CacheTableKey::as_bytes(&key);
-            let converted = CacheTableKey::from_bytes(&bytes);
-            assert_eq!(
-                converted,
-                CacheTableKey::Invalid,
-                "Expected Invalid for zero pathid case: {:?}",
-                key
-            );
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn file_table_key_serialization_format() {
-        // Test that the serialization format is correct
-        let key = CacheTableKey::Default(PathId(0x1021a3));
-        let bytes = CacheTableKey::as_bytes(&key);
-
-        // Should be exactly 8 bytes for Default (just the pathid),
-        // with big endian encoding.
-        assert_eq!(bytes.len(), 8);
-        assert_eq!(bytes, [0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x21, 0xa3]);
-
-        let key = CacheTableKey::PeerCopy(PathId(11111), Peer::from("test"));
-        let bytes = CacheTableKey::as_bytes(&key);
-
-        // Should be 13 bytes for PeerCopy (pathid + 1 byte + peer string)
-        assert_eq!(bytes.len(), 13);
-        assert_eq!(&bytes[0..8], PathId(11111).as_u64().to_be_bytes());
-        assert_eq!(bytes[8], 1);
-        assert_eq!(&bytes[9..], b"test");
-    }
-
-    #[test]
     fn convert_cache_table_entry_file() -> anyhow::Result<()> {
         let file_entry = FileTableEntry {
             size: 200,
@@ -1371,5 +1103,158 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn convert_layer_default() -> anyhow::Result<()> {
+        let layer = Layer::Default;
+
+        // Test round-trip conversion
+        let bytes = Layer::as_bytes(&layer);
+        let converted = Layer::from_bytes(&bytes);
+        assert_eq!(layer, converted);
+
+        Ok(())
+    }
+
+    #[test]
+    fn convert_layer_remote() -> anyhow::Result<()> {
+        let layer = Layer::Remote(Peer::from("peer1"));
+
+        // Test round-trip conversion
+        let bytes = Layer::as_bytes(&layer);
+        let converted = Layer::from_bytes(&bytes);
+        assert_eq!(layer, converted);
+
+        Ok(())
+    }
+
+    #[test]
+    fn convert_layer_all_variants() -> anyhow::Result<()> {
+        let test_cases = vec![
+            Layer::Default,
+            Layer::Remote(Peer::from("short")),
+            Layer::Remote(Peer::from("very_long_peer_name_that_might_cause_issues")),
+            Layer::Remote(Peer::from("")), // Empty peer name edge case
+        ];
+
+        for layer in test_cases {
+            let bytes = Layer::as_bytes(&layer);
+            let converted = Layer::from_bytes(&bytes);
+            assert_eq!(layer, converted, "Failed for layer: {:?}", layer);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn layer_byte_comparison_behavior() {
+        // Test that byte comparison behavior is consistent and documented
+
+        let test_cases = vec![
+            Layer::Default,
+            Layer::Remote(Peer::from("a")),
+            Layer::Remote(Peer::from("b")),
+            Layer::Remote(Peer::from("z")),
+        ];
+
+        // Test that byte comparison is consistent (same inputs always give same result)
+        for i in 0..test_cases.len() {
+            for j in 0..test_cases.len() {
+                let layer1 = &test_cases[i];
+                let layer2 = &test_cases[j];
+
+                let bytes1 = Layer::as_bytes(layer1);
+                let bytes2 = Layer::as_bytes(layer2);
+                let byte_cmp = Layer::compare(&bytes1, &bytes2);
+
+                // Test consistency: reverse comparison should be opposite
+                let byte_cmp_reverse = Layer::compare(&bytes2, &bytes1);
+                assert_eq!(
+                    byte_cmp,
+                    byte_cmp_reverse.reverse(),
+                    "Byte comparison not consistent for {:?} vs {:?}",
+                    layer1,
+                    layer2
+                );
+
+                // Test reflexivity: same layer should compare equal
+                if i == j {
+                    assert_eq!(
+                        byte_cmp,
+                        std::cmp::Ordering::Equal,
+                        "Byte comparison not reflexive for {:?}",
+                        layer1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn layer_byte_comparison_matches_object_comparison() {
+        // Test that byte comparison matches object comparison for all valid layers
+        let test_cases = vec![
+            Layer::Default,
+            Layer::Remote(Peer::from("a")),
+            Layer::Remote(Peer::from("b")),
+            Layer::Remote(Peer::from("z")),
+        ];
+
+        for i in 0..test_cases.len() {
+            for j in 0..test_cases.len() {
+                let layer1 = &test_cases[i];
+                let layer2 = &test_cases[j];
+
+                let object_cmp = layer1.cmp(layer2);
+                let bytes1 = Layer::as_bytes(layer1);
+                let bytes2 = Layer::as_bytes(layer2);
+                let byte_cmp = Layer::compare(&bytes1, &bytes2);
+
+                assert_eq!(
+                    object_cmp, byte_cmp,
+                    "Comparison mismatch for {:?} vs {:?}",
+                    layer1, layer2
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn layer_serialization_format() {
+        // Test that the serialization format is correct
+        let layer = Layer::Default;
+        let bytes = Layer::as_bytes(&layer);
+
+        // Should be exactly 1 byte for Default
+        assert_eq!(bytes.len(), 1);
+        assert_eq!(bytes, [1]);
+
+        let layer = Layer::Remote(Peer::from("test"));
+        let bytes = Layer::as_bytes(&layer);
+
+        // Should be 5 bytes for Remote (1 byte + "test")
+        assert_eq!(bytes.len(), 5);
+        assert_eq!(bytes[0], 2);
+        assert_eq!(&bytes[1..], b"test");
+    }
+
+    #[test]
+    fn layer_ordering_semantics() {
+        // Test that Layer ordering matches the spec
+        let default = Layer::Default;
+        let remote_a = Layer::Remote(Peer::from("a"));
+        let remote_b = Layer::Remote(Peer::from("b"));
+        let remote_z = Layer::Remote(Peer::from("z"));
+
+        // Default should come before Remote
+        assert!(default < remote_a);
+        assert!(default < remote_b);
+        assert!(default < remote_z);
+
+        // Remote peers should be ordered by peer name
+        assert!(remote_a < remote_b);
+        assert!(remote_b < remote_z);
+        assert!(remote_a < remote_z);
     }
 }
