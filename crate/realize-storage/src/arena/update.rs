@@ -1,5 +1,6 @@
+use crate::arena::cache::CacheExt;
 use crate::arena::db::ArenaDatabase;
-use crate::arena::index::{self, IndexReadOperations, IndexWriteOperations};
+use crate::arena::index::{self};
 use crate::{Notification, StorageError};
 use realize_types::Peer;
 use std::sync::Arc;

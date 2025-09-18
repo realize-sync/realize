@@ -263,6 +263,19 @@ pub(crate) trait CacheExt {
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<UnixTime, StorageError>;
+
+    /// Get a file entry by path.
+    fn indexed<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<Option<IndexedFile>, StorageError>;
+
+    fn is_indexed<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<bool, StorageError>;
 }
 
 impl<T: CacheReadOperations> CacheExt for T {
@@ -305,6 +318,29 @@ impl<T: CacheReadOperations> CacheExt for T {
         loc: L,
     ) -> Result<FileTableEntry, StorageError> {
         self.file_at_pathid_or_err(tree.expect(loc)?)
+    }
+
+    fn indexed<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<Option<IndexedFile>, StorageError> {
+        if let Some(pathid) = tree.resolve(loc)? {
+            self.index_entry_at_pathid(pathid)
+        } else {
+            Ok(None)
+        }
+    }
+    fn is_indexed<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<bool, StorageError> {
+        if let Some(pathid) = tree.resolve(loc)? {
+            return Ok(self.index_entry_at_pathid(pathid)?.is_some());
+        }
+
+        Ok(false)
     }
 }
 
@@ -874,8 +910,191 @@ impl<'a> WritableOpenCache<'a> {
         Ok(())
     }
 
+    pub(crate) fn index<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        history: &mut WritableOpenHistory,
+        dirty: &mut WritableOpenDirty,
+        loc: L,
+        size: u64,
+        mtime: UnixTime,
+        hash: Hash,
+    ) -> Result<PathId, StorageError> {
+        self.add_internal(tree, Some(history), Some(dirty), loc, size, mtime, hash)
+    }
+
+    pub(crate) fn index_silently<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        loc: L,
+        size: u64,
+        mtime: UnixTime,
+        hash: Hash,
+    ) -> Result<PathId, StorageError> {
+        self.add_internal(tree, None, None, loc, size, mtime, hash)
+    }
+
+    /// Remove a file entry at the given location, if it exists.
+    ///
+    /// Return true if something was removed.
+    pub(crate) fn remove_from_index<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        history: &mut WritableOpenHistory,
+        dirty: &mut WritableOpenDirty,
+        loc: L,
+    ) -> Result<bool, StorageError> {
+        let loc = loc.into();
+        if let Some(pathid) = tree.resolve(loc.borrow())? {
+            if let Some(old_hash) = self.indexed_hash(pathid) {
+                if let Some(path) = tree.backtrack(loc)? {
+                    history.report_removed(&path, &old_hash)?;
+                }
+                self.remove_index_entry(tree, pathid)?;
+                dirty.mark_dirty(pathid, "removed_from_index")?;
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Remove a file entry at the given location, if it exists and
+    /// report it as dropped.
+    ///
+    /// Return true if something was removed.
+    pub(crate) fn drop_from_index<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        history: &mut WritableOpenHistory,
+        dirty: &mut WritableOpenDirty,
+        loc: L,
+    ) -> Result<bool, StorageError> {
+        let loc = loc.into();
+        if let Some(pathid) = tree.resolve(loc.borrow())? {
+            if let Some(old_hash) = self.indexed_hash(pathid) {
+                if let Some(path) = tree.backtrack(loc)? {
+                    history.report_dropped(&path, &old_hash)?;
+                }
+                self.remove_index_entry(tree, pathid)?;
+                dirty.mark_dirty(pathid, "dropped_from_index")?;
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Remove a tree location (path or pathid) that can be a file or a
+    /// directory.
+    ///
+    /// If the location is a directory, all files within that
+    /// directory are removed, recursively.
+    pub(crate) fn remove_from_index_recursively<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        history: &mut WritableOpenHistory,
+        dirty: &mut WritableOpenDirty,
+        loc: L,
+    ) -> Result<(), StorageError> {
+        let pathid = match tree.resolve(loc)? {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        if self.remove_from_index(tree, history, dirty, pathid)? {
+            log::debug!("removed {pathid:?}");
+        }
+        let children = tree.readdir_pathid(pathid).collect::<Result<Vec<_>, _>>()?;
+        log::debug!("children: {children:?}");
+        for (_, pathid) in children.into_iter() {
+            self.remove_from_index_recursively(tree, history, dirty, pathid)?;
+        }
+        Ok(())
+    }
+
+    /// Record that the given file and version has been outdated by
+    /// `new_hash`.
+    ///
+    /// Does nothing if the file is missing or if its version is not
+    /// `old_hash` or a version derived from it.
+    pub(crate) fn record_outdated<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        dirty: &mut WritableOpenDirty,
+        loc: L,
+        old_hash: &Hash,
+        new_hash: &Hash,
+    ) -> Result<(), StorageError> {
+        if let Some(pathid) = tree.resolve(loc)? {
+            if let Some(mut entry) = self.index_entry_at_pathid(pathid)?
+                && entry.is_outdated_by(old_hash)
+            {
+                // Just remember that a newer version exist in a
+                // remote peer. This information is going to be used
+                // to download that newer version later on.
+                entry.outdated_by = Some(new_hash.clone());
+                log::debug!(
+                    "[{}] outdated: {} {old_hash}, new version: {new_hash})",
+                    tree.arena(),
+                    pathid
+                );
+
+                self.add_index_entry(tree, pathid, entry)?;
+                dirty.mark_dirty(pathid, "outdated")?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn add_internal<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        history: Option<&mut WritableOpenHistory>,
+        dirty: Option<&mut WritableOpenDirty>,
+        loc: L,
+        size: u64,
+        mtime: UnixTime,
+        hash: Hash,
+    ) -> Result<PathId, StorageError> {
+        let loc = loc.into();
+        let pathid = tree.setup(loc.borrow())?;
+        let old_hash = self.indexed_hash(pathid);
+        if hash.matches(old_hash.as_ref()) {
+            return Ok(pathid);
+        }
+        if let Some(path) = tree.backtrack(loc.borrow())? {
+            self.add_index_entry(
+                tree,
+                pathid,
+                IndexedFile {
+                    hash,
+                    mtime,
+                    size,
+                    outdated_by: None,
+                },
+            )?;
+            if let Some(dirty) = dirty {
+                dirty.mark_dirty(pathid, "indexed")?;
+            }
+            if let Some(history) = history {
+                history.report_added(&path, old_hash.as_ref())?;
+            }
+        }
+        Ok(pathid)
+    }
+
+    /// Hash of the indexed file or None.
+    fn indexed_hash(&mut self, pathid: PathId) -> Option<Hash> {
+        if let Ok(Some(e)) = self.index_entry_at_pathid(pathid) {
+            return Some(e.hash);
+        }
+
+        None
+    }
+
     /// Add a entry to the index layer
-    pub(crate) fn add_index_entry<'b, L: Into<TreeLoc<'b>>>(
+    fn add_index_entry<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree,
         loc: L,
@@ -898,7 +1117,7 @@ impl<'a> WritableOpenCache<'a> {
     /// Remove an entry from the index layer.
     ///
     /// Does nothing if the entry is not there
-    pub(crate) fn remove_index_entry<'b, L: Into<TreeLoc<'b>>>(
+    fn remove_index_entry<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree,
         loc: L,
@@ -1344,7 +1563,11 @@ mod tests {
         _tempdir: TempDir,
     }
     impl Fixture {
-        async fn setup_with_arena(arena: Arena) -> anyhow::Result<Fixture> {
+        fn setup() -> anyhow::Result<Fixture> {
+            Self::setup_with_arena(test_arena())
+        }
+
+        fn setup_with_arena(arena: Arena) -> anyhow::Result<Fixture> {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
             let child = tempdir.child(format!("{arena}-cache.db"));
@@ -1489,7 +1712,7 @@ mod tests {
             let txn = self.db.begin_read()?;
             let dirty = txn.read_dirty()?;
 
-            dirty_pathids_in_txn(&dirty)
+            dirty_pathids(&dirty)
         }
 
         fn dirty_paths(&self) -> Result<HashSet<Path>, StorageError> {
@@ -1502,14 +1725,10 @@ mod tests {
                 .filter_map(|i| tree.backtrack(i).ok().flatten())
                 .collect())
         }
-
-        async fn setup() -> anyhow::Result<Fixture> {
-            Self::setup_with_arena(test_arena()).await
-        }
     }
 
-    fn dirty_pathids_in_txn(
-        dirty: &impl DirtyReadOperations,
+    fn dirty_pathids(
+        dirty: &impl crate::arena::dirty::DirtyReadOperations,
     ) -> Result<HashSet<PathId>, StorageError> {
         let mut start = 0;
         let mut ret = HashSet::new();
@@ -1517,13 +1736,31 @@ mod tests {
             ret.insert(pathid);
             start = counter + 1;
         }
-
         Ok(ret)
+    }
+
+    fn dirty_paths(
+        dirty: &impl DirtyReadOperations,
+        tree: &impl TreeReadOperations,
+    ) -> Result<HashSet<Path>, StorageError> {
+        Ok(dirty_pathids(dirty)?
+            .into_iter()
+            .filter_map(|i| tree.backtrack(i).ok().flatten())
+            .collect())
+    }
+
+    fn collect_history_entries(
+        history: &impl crate::arena::history::HistoryReadOperations,
+    ) -> Result<Vec<HistoryTableEntry>, StorageError> {
+        history
+            .history(0..)
+            .map(|res| res.map(|(_, e)| e))
+            .collect()
     }
 
     #[tokio::test]
     async fn empty_cache_readdir() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
 
         assert!(fixture.readdir(fixture.db.tree().root())?.is_empty());
 
@@ -1532,7 +1769,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_cache_mtime() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
 
         assert_ne!(
             UnixTime::ZERO,
@@ -1544,7 +1781,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_creates_directories() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let file_path = Path::parse("a/b/c.txt")?;
         let mtime = test_time();
 
@@ -1567,7 +1804,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_and_remove_mirrored_in_tree() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let file_path = Path::parse("a/b/c.txt")?;
         let mtime = test_time();
 
@@ -1626,7 +1863,7 @@ mod tests {
     #[tokio::test]
     async fn add_updates_dir_mtime() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup_with_arena(arena)?;
         let mtime = test_time();
         let path1 = Path::parse("a/b/1.txt")?;
         fixture.add_to_cache(&path1, 100, mtime)?;
@@ -1642,7 +1879,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_marks_dirty() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let file_path = Path::parse("a/b/c.txt")?;
 
         fixture.add_to_cache(&file_path, 100, test_time())?;
@@ -1654,7 +1891,7 @@ mod tests {
     #[tokio::test]
     async fn replace_existing_file() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup_with_arena(arena)?;
         let peer = test_peer();
         let file_path = Path::parse("file.txt")?;
 
@@ -1694,7 +1931,7 @@ mod tests {
     #[tokio::test]
     async fn replace_marks_dirty() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup_with_arena(arena)?;
         let peer = test_peer();
         let file_path = Path::parse("file.txt")?;
 
@@ -1733,7 +1970,7 @@ mod tests {
     #[tokio::test]
     async fn ignored_replace_does_not_mark_dirty() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup_with_arena(arena)?;
         let peer = test_peer();
         let file_path = Path::parse("file.txt")?;
 
@@ -1773,7 +2010,7 @@ mod tests {
     #[tokio::test]
     async fn replace_nothing() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup_with_arena(arena)?;
         let peer = test_peer();
         let file_path = Path::parse("file.txt")?;
 
@@ -1810,7 +2047,7 @@ mod tests {
 
     #[tokio::test]
     async fn ignore_duplicate_add() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let file_path = Path::parse("file.txt")?;
 
         fixture.add_to_cache(&file_path, 100, test_time())?;
@@ -1824,7 +2061,7 @@ mod tests {
 
     #[tokio::test]
     async fn ignore_replace_with_wrong_hash() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let file_path = Path::parse("file.txt")?;
         let peer = test_peer();
 
@@ -1862,7 +2099,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_removes_file() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
 
@@ -1880,7 +2117,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_marks_dirty() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
 
@@ -1899,7 +2136,7 @@ mod tests {
     #[tokio::test]
     async fn remove_updates_dir_mtime() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup_with_arena(arena)?;
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
 
@@ -1916,7 +2153,7 @@ mod tests {
     #[tokio::test]
     async fn remove_ignores_wrong_old_hash() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup_with_arena(arena)?;
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
 
@@ -1942,7 +2179,7 @@ mod tests {
     #[tokio::test]
     async fn remove_applied_to_tracked_version_immediately() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup_with_arena(arena)?;
         let peer1 = Peer::from("peer1");
         let peer2 = Peer::from("peer2");
         let file_path = Path::parse("file.txt")?;
@@ -2008,7 +2245,7 @@ mod tests {
     #[tokio::test]
     async fn drop_not_applied_to_tracked_version() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup_with_arena(arena)?;
         let peer1 = Peer::from("peer1");
         let peer2 = Peer::from("peer2");
         let file_path = Path::parse("file.txt")?;
@@ -2061,7 +2298,7 @@ mod tests {
     #[tokio::test]
     async fn lookup_finds_entry() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup_with_arena(arena)?;
         let file_path = Path::parse("a/file.txt")?;
         let mtime = test_time();
 
@@ -2084,7 +2321,7 @@ mod tests {
 
     #[tokio::test]
     async fn lookup_returns_notfound_for_missing_entry() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
 
         assert!(matches!(
             fixture.lookup((fixture.db.tree().root(), "nonexistent")),
@@ -2097,7 +2334,7 @@ mod tests {
     #[tokio::test]
     async fn lookup_path_finds_entry() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup_with_arena(arena)?;
         let path = Path::parse("a/b/c/file.txt")?;
         let mtime = test_time();
 
@@ -2113,7 +2350,7 @@ mod tests {
     #[tokio::test]
     async fn readdir_returns_all_entries() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup_with_arena(arena)?;
         let mtime = test_time();
 
         fixture.add_to_cache(&Path::parse("dir/file1.txt")?, 100, mtime)?;
@@ -2153,7 +2390,7 @@ mod tests {
     #[tokio::test]
     async fn get_file_metadata_tracks_hash_chain() -> anyhow::Result<()> {
         let arena = test_arena();
-        let fixture = Fixture::setup_with_arena(arena).await?;
+        let fixture = Fixture::setup_with_arena(arena)?;
         let peer1 = Peer::from("peer1");
         let peer2 = Peer::from("peer2");
         let file_path = Path::parse("file.txt")?;
@@ -2206,7 +2443,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_availability_deals_with_conflicting_adds() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
 
         let a = Peer::from("a");
         let b = Peer::from("b");
@@ -2283,7 +2520,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_availablility_deals_with_different_versions() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
 
         let a = Peer::from("a");
         let b = Peer::from("b");
@@ -2458,7 +2695,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_availability_when_a_peer_goes_away() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
 
         let a = Peer::from("a");
         let b = Peer::from("b");
@@ -2556,7 +2793,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_and_delete_peer_files() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let arena = test_arena();
         let peer1 = Peer::from("1");
         let peer2 = Peer::from("2");
@@ -2729,7 +2966,7 @@ mod tests {
 
     #[tokio::test]
     async fn blob_deleted_on_file_overwrite() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
 
@@ -2764,7 +3001,7 @@ mod tests {
 
     #[tokio::test]
     async fn index_adds_entry() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let path = Path::parse("test.txt")?;
         let hash = Hash([0x42; 32]);
         let mtime = test_time();
@@ -2792,7 +3029,7 @@ mod tests {
 
     #[tokio::test]
     async fn unindex_removes_entry() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let path = Path::parse("test.txt")?;
 
         let txn = fixture.db.begin_write()?;
@@ -2821,7 +3058,7 @@ mod tests {
 
     #[tokio::test]
     async fn index_overwrites_existing() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let path = Path::parse("test.txt")?;
         let hash1 = Hash([0x42; 32]);
         let hash2 = Hash([0x43; 32]);
@@ -2861,7 +3098,7 @@ mod tests {
 
     #[tokio::test]
     async fn all_indexed_empty() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_read()?;
         let cache = txn.read_cache()?;
 
@@ -2874,7 +3111,7 @@ mod tests {
 
     #[tokio::test]
     async fn all_indexed_with_entries() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
 
         // Create test data
         let path1 = Path::parse("test1.txt")?;
@@ -2953,7 +3190,7 @@ mod tests {
 
     #[tokio::test]
     async fn all_indexed_skips_non_index_layers() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
 
         let path = Path::parse("test.txt")?;
         let hash = Hash([0x42; 32]);
@@ -3001,7 +3238,7 @@ mod tests {
 
     #[tokio::test]
     async fn blob_deleted_on_file_removal() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let file_path = Path::parse("file.txt")?;
 
         // Create a file and make sure it has a blob
@@ -3023,7 +3260,7 @@ mod tests {
 
     #[tokio::test]
     async fn blob_deleted_on_catchup_removal() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
         let arena = test_arena();
         let file_path = Path::parse("file.txt")?;
 
@@ -3057,7 +3294,7 @@ mod tests {
 
     #[tokio::test]
     async fn unlink() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
 
@@ -3088,7 +3325,7 @@ mod tests {
         assert!(cache.metadata(&tree, (arena_root, "file.txt"))?.is_none(),);
         assert!(cache.metadata(&tree, pathid)?.is_none(),);
 
-        assert_eq!(HashSet::from([pathid]), dirty_pathids_in_txn(&dirty)?);
+        assert_eq!(HashSet::from([pathid]), dirty_pathids(&dirty)?);
 
         assert!(cache.dir_mtime(&tree, arena_root)? > dir_mtime_before);
 
@@ -3103,7 +3340,7 @@ mod tests {
 
     #[tokio::test]
     async fn branch() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let dir_path = Path::parse("mydir")?;
         let source_path = Path::parse("mydir/source")?;
         let dest_path = Path::parse("mydir/dest")?;
@@ -3196,7 +3433,7 @@ mod tests {
 
     #[tokio::test]
     async fn mkdir_creates_directory() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let dir_path = Path::parse("newdir")?;
 
         let txn = fixture.db.begin_write()?;
@@ -3233,7 +3470,7 @@ mod tests {
 
     #[tokio::test]
     async fn mkdir_creates_nested_directories() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
 
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree()?;
@@ -3255,7 +3492,7 @@ mod tests {
 
     #[tokio::test]
     async fn mkdir_fails_if_directory_already_exists() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let dir_path = Path::parse("existing_dir")?;
 
         let txn = fixture.db.begin_write()?;
@@ -3279,7 +3516,7 @@ mod tests {
 
     #[tokio::test]
     async fn rmdir_removes_empty_directory() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let dir_path = Path::parse("empty_dir")?;
 
         let txn = fixture.db.begin_write()?;
@@ -3312,7 +3549,7 @@ mod tests {
 
     #[tokio::test]
     async fn rmdir_fails_if_directory_not_empty() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let dir_path = Path::parse("non_empty_dir")?;
         let file_path = Path::parse("non_empty_dir/file.txt")?;
 
@@ -3353,7 +3590,7 @@ mod tests {
 
     #[tokio::test]
     async fn rmdir_fails_if_not_a_directory() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let file_path = Path::parse("file.txt")?;
 
         let txn = fixture.db.begin_write()?;
@@ -3392,7 +3629,7 @@ mod tests {
 
     #[tokio::test]
     async fn rmdir_fails_if_directory_not_found() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let nonexistent_path = Path::parse("nonexistent_dir")?;
 
         let txn = fixture.db.begin_write()?;
@@ -3412,7 +3649,7 @@ mod tests {
 
     #[tokio::test]
     async fn rmdir_updates_parent_mtime() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let parent_path = Path::parse("parent")?;
         let child_path = Path::parse("parent/child")?;
 
@@ -3446,7 +3683,7 @@ mod tests {
 
     #[tokio::test]
     async fn dir_or_file_metadata() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let file_path = Path::parse("test_file")?;
         let dir_path = Path::parse("test_dir")?;
 
@@ -3512,7 +3749,7 @@ mod tests {
 
     #[tokio::test]
     async fn dir_or_file_metadata_acache() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let file_path = Path::parse("test_file")?;
         let dir_path = Path::parse("test_dir")?;
 
@@ -3570,7 +3807,7 @@ mod tests {
 
     #[tokio::test]
     async fn rename_file() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let source_path = Path::parse("source")?;
         let dest_path = Path::parse("dest")?;
 
@@ -3617,7 +3854,7 @@ mod tests {
         let dest_pathid = tree.expect(&dest_path)?;
         assert_eq!(
             HashSet::from([source_pathid, dest_pathid]),
-            dirty_pathids_in_txn(&dirty)?
+            dirty_pathids(&dirty)?
         );
 
         // inodes are swapped
@@ -3650,7 +3887,7 @@ mod tests {
 
     #[tokio::test]
     async fn rename_file_replace() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let source_path = Path::parse("source")?;
         let dest_path = Path::parse("dest")?;
 
@@ -3727,7 +3964,7 @@ mod tests {
 
     #[tokio::test]
     async fn rename_dir() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let source_dir = Path::parse("source_dir")?;
         let dest_dir = Path::parse("dest_dir")?;
         let file1_path = Path::parse("source_dir/file1.txt")?;
@@ -3825,7 +4062,7 @@ mod tests {
 
         // Check that files are marked dirty
         let dest_dir_pathid = tree.expect(&dest_dir)?;
-        let dirty_pathids = dirty_pathids_in_txn(&dirty)?;
+        let dirty_pathids = dirty_pathids(&dirty)?;
         assert!(dirty_pathids.contains(&tree.resolve(&file1_path)?.unwrap()));
         assert!(dirty_pathids.contains(&tree.resolve(&file2_path)?.unwrap()));
         assert!(dirty_pathids.contains(&tree.resolve(&moved_file1)?.unwrap()));
@@ -3867,7 +4104,7 @@ mod tests {
 
     #[tokio::test]
     async fn rename_dir_replace() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let source_dir = Path::parse("source_dir")?;
         let dest_dir = Path::parse("dest_dir")?;
         let source_file = Path::parse("source_dir/file.txt")?;
@@ -3935,7 +4172,7 @@ mod tests {
 
     #[tokio::test]
     async fn rename_dir_nonempty_dest() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena()).await?;
+        let fixture = Fixture::setup_with_arena(test_arena())?;
         let source_dir = Path::parse("source_dir")?;
         let dest_dir = Path::parse("dest_dir")?;
         let source_file = Path::parse("source_dir/file.txt")?;
@@ -3993,12 +4230,528 @@ mod tests {
 
     #[tokio::test]
     async fn test_datadir() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let fixture = Fixture::setup()?;
 
         let txn = fixture.db.begin_read()?;
         let cache = txn.read_cache()?;
 
         assert_eq!(fixture.datadir.path(), cache.datadir());
+
+        Ok(())
+    }
+
+    #[test]
+    fn index() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = Path::parse("foo/bar.txt")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+        cache.index(
+            &mut tree,
+            &mut history,
+            &mut dirty,
+            &path,
+            100,
+            mtime,
+            Hash([0xfa; 32]),
+        )?;
+
+        assert!(cache.is_indexed(&tree, &path)?);
+        let entry = cache.indexed(&tree, &path)?.unwrap();
+        assert_eq!(entry.size, 100);
+        assert_eq!(entry.mtime, mtime);
+        assert_eq!(entry.hash, Hash([0xfa; 32]));
+
+        Ok(())
+    }
+
+    #[test]
+    fn replace_file_in_index() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let mtime1 = UnixTime::from_secs(1234567890);
+        let mtime2 = UnixTime::from_secs(1234567891);
+        let path = Path::parse("foo/bar.txt")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+        cache.index(
+            &mut tree,
+            &mut history,
+            &mut dirty,
+            &path,
+            100,
+            mtime1,
+            Hash([0xfa; 32]),
+        )?;
+        cache.index(
+            &mut tree,
+            &mut history,
+            &mut dirty,
+            &path,
+            200,
+            mtime2,
+            Hash([0x07; 32]),
+        )?;
+
+        // Verify the file was replaced
+        assert!(cache.is_indexed(&tree, &path)?);
+        let entry = cache.indexed(&tree, &path)?.unwrap();
+        assert_eq!(entry.size, 200);
+        assert_eq!(entry.mtime, mtime2);
+        assert_eq!(entry.hash, Hash([0x07; 32]));
+
+        Ok(())
+    }
+
+    #[test]
+    fn is_indexed() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = Path::parse("foo.txt")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+        cache.index(
+            &mut tree,
+            &mut history,
+            &mut dirty,
+            &path,
+            100,
+            mtime,
+            Hash([0xfa; 32]),
+        )?;
+
+        assert!(cache.is_indexed(&tree, &path)?);
+        assert!(!cache.is_indexed(&tree, &Path::parse("bar.txt")?)?);
+        assert!(!cache.is_indexed(&tree, &Path::parse("other.txt")?)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn indexed() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = Path::parse("foo/bar")?;
+        let hash = Hash([0xfa; 32]);
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+        cache.index(
+            &mut tree,
+            &mut history,
+            &mut dirty,
+            &path,
+            100,
+            mtime,
+            hash.clone(),
+        )?;
+
+        let entry = cache.indexed(&tree, &path)?.unwrap();
+        assert_eq!(entry.size, 100);
+        assert_eq!(entry.mtime, mtime);
+        assert_eq!(entry.hash, hash);
+
+        Ok(())
+    }
+
+    #[test]
+    fn remove_file_from_index_recursively() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = Path::parse("foo/bar.txt")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        cache.index(
+            &mut tree,
+            &mut history,
+            &mut dirty,
+            &path,
+            100,
+            mtime,
+            Hash([0xfa; 32]),
+        )?;
+
+        cache.remove_from_index_recursively(&mut tree, &mut history, &mut dirty, &path)?;
+
+        assert!(!cache.is_indexed(&tree, &path)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn remove_dir_from_index_recursively() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let mtime = UnixTime::from_secs(1234567890);
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        cache.index(
+            &mut tree,
+            &mut history,
+            &mut dirty,
+            Path::parse("foo/bar1.txt")?,
+            100,
+            mtime,
+            Hash([0xfa; 32]),
+        )?;
+        cache.index(
+            &mut tree,
+            &mut history,
+            &mut dirty,
+            Path::parse("foo/bar2.txt")?,
+            100,
+            mtime,
+            Hash([0xfa; 32]),
+        )?;
+
+        cache.remove_from_index_recursively(
+            &mut tree,
+            &mut history,
+            &mut dirty,
+            Path::parse("foo")?,
+        )?;
+
+        assert!(!cache.is_indexed(&tree, Path::parse("foo/bar1.txt")?)?);
+        assert!(!cache.is_indexed(&tree, Path::parse("foo/bar2.txt")?)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn index_marks_dirty_and_adds_history() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = Path::parse("foo/bar.txt")?;
+        let hash = Hash([0xfa; 32]);
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        // Clear any existing dirty entries
+        dirty.delete_range(0, 999)?;
+
+        // Add a file
+        cache.index(
+            &mut tree,
+            &mut history,
+            &mut dirty,
+            &path,
+            100,
+            mtime,
+            hash.clone(),
+        )?;
+
+        // Verify the file was added to the index
+        assert!(cache.is_indexed(&tree, &path)?);
+
+        // Verify the path was marked dirty
+        assert!(dirty_paths(&dirty, &tree)?.contains(&path));
+
+        // Verify history entry was added (Add entry)
+        let history_entries = collect_history_entries(&history)?;
+        assert_eq!(history_entries.len(), 1);
+        match &history_entries[0] {
+            HistoryTableEntry::Add(entry_path) => {
+                assert_eq!(entry_path, &path);
+            }
+            _ => panic!("Expected Add history entry"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn replace_indexed_marks_dirty_and_adds_history() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let mtime1 = UnixTime::from_secs(1234567890);
+        let mtime2 = UnixTime::from_secs(1234567891);
+        let path = Path::parse("foo/bar.txt")?;
+        let hash1 = Hash([0xfa; 32]);
+        let hash2 = Hash([0x07; 32]);
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        // Clear any existing dirty entries
+        dirty.delete_range(0, 999)?;
+
+        // Add initial file
+        cache.index(
+            &mut tree,
+            &mut history,
+            &mut dirty,
+            &path,
+            100,
+            mtime1,
+            hash1.clone(),
+        )?;
+
+        // Clear dirty entries from first add
+        dirty.delete_range(0, 999)?;
+
+        // Replace the file
+        cache.index(
+            &mut tree,
+            &mut history,
+            &mut dirty,
+            &path,
+            200,
+            mtime2,
+            hash2.clone(),
+        )?;
+
+        // Verify the file was replaced in the index
+        let entry = cache.indexed(&tree, &path)?.unwrap();
+        assert_eq!(entry.hash, hash2);
+
+        // Verify the path was marked dirty
+        let dirty_paths = dirty_paths(&dirty, &tree)?;
+        assert!(dirty_paths.contains(&path));
+
+        // Verify history entries were added (Add + Replace entries)
+        let history_entries = collect_history_entries(&history)?;
+        assert_eq!(history_entries.len(), 2);
+        match &history_entries[0] {
+            HistoryTableEntry::Add(entry_path) => {
+                assert_eq!(entry_path, &path);
+            }
+            _ => panic!("Expected Add history entry"),
+        }
+        match &history_entries[1] {
+            HistoryTableEntry::Replace(entry_path, old_hash) => {
+                assert_eq!(entry_path, &path);
+                assert_eq!(old_hash, &hash1);
+            }
+            _ => panic!("Expected Replace history entry"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn remove_from_index_marks_dirty_and_adds_history() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = Path::parse("foo/bar.txt")?;
+        let hash = Hash([0xfa; 32]);
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        // Add a file first
+        let pathid = cache.index(
+            &mut tree,
+            &mut history,
+            &mut dirty,
+            &path,
+            100,
+            mtime,
+            hash.clone(),
+        )?;
+
+        // Clear dirty entries from add
+        dirty.delete_range(0, 999)?;
+
+        // Remove the file
+        let removed = cache.remove_from_index(&mut tree, &mut history, &mut dirty, &path)?;
+        assert!(removed);
+
+        // Verify the file was removed from the index
+        assert!(!cache.is_indexed(&tree, &path)?);
+
+        // Verify the path was marked dirty
+        assert_eq!(HashSet::from([pathid]), dirty_pathids(&dirty)?);
+
+        // Verify history entries were added (Add + Remove entries)
+        let history_entries = collect_history_entries(&history)?;
+        assert_eq!(history_entries.len(), 2);
+        match &history_entries[0] {
+            HistoryTableEntry::Add(entry_path) => {
+                assert_eq!(entry_path, &path);
+            }
+            _ => panic!("Expected Add history entry"),
+        }
+        match &history_entries[1] {
+            HistoryTableEntry::Remove(entry_path, removed_hash) => {
+                assert_eq!(entry_path, &path);
+                assert_eq!(removed_hash, &hash);
+            }
+            _ => panic!("Expected Remove history entry"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn remove_from_index_recursively_marks_dirty_and_adds_history() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let mtime = UnixTime::from_secs(1234567890);
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        // Add files in a directory
+        let path1 = Path::parse("foo/bar1.txt")?;
+        let path2 = Path::parse("foo/bar2.txt")?;
+        let hash1 = Hash([0xfa; 32]);
+        let hash2 = Hash([0xfb; 32]);
+
+        let pathid1 = cache.index(
+            &mut tree,
+            &mut history,
+            &mut dirty,
+            &path1,
+            100,
+            mtime,
+            hash1.clone(),
+        )?;
+        let pathid2 = cache.index(
+            &mut tree,
+            &mut history,
+            &mut dirty,
+            &path2,
+            200,
+            mtime,
+            hash2.clone(),
+        )?;
+
+        // Clear dirty entries from adds
+        dirty.delete_range(0, 999)?;
+
+        // Remove the directory
+        cache.remove_from_index_recursively(
+            &mut tree,
+            &mut history,
+            &mut dirty,
+            Path::parse("foo")?,
+        )?;
+
+        // Verify the files were removed from the index
+        assert!(!cache.is_indexed(&tree, &path1)?);
+        assert!(!cache.is_indexed(&tree, &path2)?);
+
+        // Verify the paths were marked dirty
+        assert_eq!(HashSet::from([pathid1, pathid2]), dirty_pathids(&dirty)?);
+
+        // Verify history entries were added (2 Add + 2 Remove entries)
+        let history_entries = collect_history_entries(&history)?;
+        assert_unordered::assert_eq_unordered!(
+            vec![
+                HistoryTableEntry::Add(path1.clone()),
+                HistoryTableEntry::Add(path2.clone()),
+                HistoryTableEntry::Remove(path1.clone(), hash1.clone()),
+                HistoryTableEntry::Remove(path2.clone(), hash2.clone()),
+            ],
+            history_entries
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn record_outdated_updates_entry() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = Path::parse("foo/bar.txt")?;
+        let old_hash = Hash([0xfa; 32]);
+        let new_hash = Hash([0x07; 32]);
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        // Add a file with the old hash
+        cache.index(
+            &mut tree,
+            &mut history,
+            &mut dirty,
+            &path,
+            100,
+            mtime,
+            old_hash.clone(),
+        )?;
+
+        // Record that this version is outdated by the new hash
+        cache.record_outdated(&mut tree, &mut dirty, &path, &old_hash, &new_hash)?;
+
+        // Verify the entry was updated with outdated_by field
+        let entry = cache.indexed(&tree, &path)?.unwrap();
+        assert_eq!(entry.hash, old_hash);
+        assert_eq!(entry.outdated_by, Some(new_hash));
+
+        Ok(())
+    }
+
+    #[test]
+    fn record_outdated_ignores_unrelated_files() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = Path::parse("foo/bar.txt")?;
+        let file_hash = Hash([0xfa; 32]);
+        let unrelated_hash = Hash([0xbb; 32]);
+        let new_hash = Hash([0x07; 32]);
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        // Add a file with file_hash
+        cache.index(
+            &mut tree,
+            &mut history,
+            &mut dirty,
+            &path,
+            100,
+            mtime,
+            file_hash.clone(),
+        )?;
+
+        // Record that an unrelated hash is outdated by the new hash
+        cache.record_outdated(&mut tree, &mut dirty, &path, &unrelated_hash, &new_hash)?;
+
+        // Verify the entry was NOT updated (outdated_by should remain None)
+        let entry = cache.indexed(&tree, &path)?.unwrap();
+        assert_eq!(entry.hash, file_hash);
+        assert_eq!(entry.outdated_by, None);
 
         Ok(())
     }

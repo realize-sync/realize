@@ -4,7 +4,6 @@ use super::mark::MarkReadOperations;
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
 use super::types::{BlobTableEntry, LocalAvailability, LruQueueId, Mark, QueueTableEntry};
 use crate::arena::cache::CacheReadOperations;
-use crate::arena::index::IndexWriteOperations;
 use crate::types::PathId;
 use crate::utils::hash;
 use crate::utils::holder::Holder;
@@ -1568,9 +1567,9 @@ fn disk_usage_op(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arena::cache::CacheExt;
     use crate::arena::db::{ArenaReadTransaction, ArenaWriteTransaction};
     use crate::arena::dirty::DirtyReadOperations;
-    use crate::arena::index::IndexReadOperations;
     use crate::utils::hash;
     use crate::{Mark, PathId};
     use assert_fs::TempDir;

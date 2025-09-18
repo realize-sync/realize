@@ -2,7 +2,7 @@ use super::db::ArenaDatabase;
 use super::engine::{Engine, StorageJob};
 use crate::arena::blob::BlobExt;
 use crate::arena::cache::CacheReadOperations;
-use crate::arena::index::{self, IndexReadOperations, IndexWriteOperations};
+use crate::arena::index::{self};
 use crate::arena::tree::TreeExt;
 use crate::{JobId, JobStatus, PathId, StorageError};
 use realize_types::Hash;
@@ -329,6 +329,7 @@ impl StorageJobProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arena::cache::CacheExt;
     use crate::arena::history::HistoryReadOperations;
     use crate::arena::types::HistoryTableEntry;
     use crate::arena::types::IndexedFile;
