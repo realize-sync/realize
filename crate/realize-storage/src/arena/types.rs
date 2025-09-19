@@ -600,11 +600,13 @@ pub struct FileTableEntry {
     pub path: Path,
     /// Hash of the specific version of the content the peer has.
     pub hash: Hash,
-    // If set, a version is known to exist that replaces the version
-    // in this entry.
+    /// If set, a version is known to exist that replaces the version
+    /// in this entry.
     pub outdated_by: Option<Hash>,
     /// PathId this specific version was branched from
     pub branched_from: Option<PathId>,
+    /// If true, the file is on the local disk, in the datadir.
+    pub local: bool,
 }
 
 impl FileTableEntry {
@@ -616,6 +618,7 @@ impl FileTableEntry {
             hash,
             outdated_by: None,
             branched_from: None,
+            local: false,
         }
     }
 }
@@ -682,6 +685,7 @@ fn fill_file_table_entry(
     builder.set_path(entry.path.as_str());
     builder.set_hash(&entry.hash.0);
     builder.set_branched_from(PathId::from_optional(entry.branched_from));
+    builder.set_local(entry.local);
 
     if let Some(hash) = &entry.outdated_by {
         builder.set_outdated_by(&hash.0)
@@ -705,6 +709,7 @@ fn parse_file_table_entry(
         hash: parse_hash(msg.get_hash()?)?,
         outdated_by,
         branched_from: PathId::as_optional(msg.get_branched_from()),
+        local: msg.get_local(),
     })
 }
 
@@ -917,6 +922,7 @@ impl IndexedFile {
             hash: self.hash,
             outdated_by: self.outdated_by,
             branched_from: None,
+            local: true,
         }
     }
 }
@@ -1098,6 +1104,7 @@ mod tests {
             hash: Hash([0xa1u8; 32]),
             outdated_by: Some(Hash([3u8; 32])),
             branched_from: Some(PathId(123)),
+            local: true,
         };
 
         assert_eq!(
@@ -1117,6 +1124,7 @@ mod tests {
             hash: Hash([0xa1u8; 32]),
             outdated_by: Some(Hash([3u8; 32])),
             branched_from: None,
+            local: false,
         };
 
         let entry = CacheTableEntry::File(file_entry);
@@ -1155,6 +1163,7 @@ mod tests {
             hash: Hash([0x42u8; 32]),
             outdated_by: None,
             branched_from: None,
+            local: false,
         };
 
         let dir_entry = DirtableEntry {

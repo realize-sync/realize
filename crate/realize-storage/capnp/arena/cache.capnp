@@ -24,6 +24,7 @@ struct FileTableEntry {
   hash @3: Data;
   outdatedBy @4: Data; # may be empty
   branchedFrom @5: UInt64; # 0 for None
+  local @6: Bool;
 }
 
 struct PeerTableEntry {
