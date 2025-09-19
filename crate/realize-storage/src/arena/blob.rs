@@ -9,7 +9,7 @@ use crate::utils::hash;
 use crate::utils::holder::Holder;
 use crate::{FileAvailability, StorageError};
 use priority_queue::PriorityQueue;
-use realize_types::{Arena, UnixTime};
+use realize_types::Arena;
 use realize_types::{ByteRange, ByteRanges, Hash};
 use redb::{ReadableTable, Table};
 use std::cmp::{Reverse, min};
@@ -1381,34 +1381,17 @@ impl Blob {
         let dest: PathBuf;
         {
             let mut tree = txn.write_tree()?;
-            let path = tree
-                .backtrack(self.info.pathid)?
-                .ok_or(StorageError::IsADirectory)?;
-            dest = path.within(self.db.index().datadir());
-
             let mut blobs = txn.write_blobs()?;
-            let pathid = self.info.pathid;
-            // Create an entry without broadcasting it, as it's going
-            // to be modified.
             let mut cache = txn.write_cache()?;
-            cache.index_silently(
+            let mut dirty = txn.write_dirty()?;
+            let mut history = txn.write_history()?;
+            (source, dest) = cache.realize(
                 &mut tree,
-                pathid,
-                self.info.size,
-                // mtime really doesn't matter as long as it doesn't
-                // match the real file mtime, because the file should
-                // be re-processed by the watcher.
-                //
-                // TODO: This is a sign that creating a dummy entry
-                // juts to get old_hash property set in future
-                // notifications from the index is not the right
-                // solution. Clean this up.
-                UnixTime::ZERO,
-                self.info.hash.clone(),
+                &mut blobs,
+                &mut dirty,
+                &mut history,
+                self.info.pathid,
             )?;
-            source = blobs
-                .prepare_export(&mut tree, pathid)?
-                .ok_or(StorageError::Unavailable)?;
         }
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1570,12 +1553,13 @@ mod tests {
     use crate::arena::cache::CacheExt;
     use crate::arena::db::{ArenaReadTransaction, ArenaWriteTransaction};
     use crate::arena::dirty::DirtyReadOperations;
+    use crate::arena::update;
     use crate::utils::hash;
-    use crate::{Mark, PathId};
+    use crate::{Mark, Notification, PathId};
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
-    use realize_types::{Arena, Path};
+    use realize_types::{Arena, Path, Peer, UnixTime};
     use std::io::SeekFrom;
     use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
@@ -3254,27 +3238,33 @@ mod tests {
         Ok(())
     }
 
-    fn collect_history_entries(
-        history: &impl crate::arena::history::HistoryReadOperations,
-    ) -> Result<Vec<crate::arena::types::HistoryTableEntry>, StorageError> {
-        history
-            .history(0..)
-            .map(|res| res.map(|(_, e)| e))
-            .collect()
-    }
-
     #[tokio::test]
     async fn realize_blob() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let path = Path::parse("test/file.txt")?;
         let test_data = "Hello, blob world!";
+        let hash = hash::digest(test_data);
 
-        // Arrange: Create a blob with the expected data (but no partial data initially)
-        let blob_info = fixture.create_blob_with_partial_data(&path, test_data, 0)?;
+        update::apply(
+            &fixture.db,
+            Peer::from("peer"),
+            Notification::Add {
+                arena: fixture.arena,
+                index: 0,
+                path: path.clone(),
+                mtime: UnixTime::from_secs(1234567890),
+                size: test_data.len() as u64,
+                hash: hash.clone(),
+            },
+        )?;
+        let txn = fixture.db.begin_write()?;
+        {
+            let mut cache = txn.write_cache()?;
+            cache.create_blob(&txn, &path)?;
+        }
+        txn.commit()?;
 
         let mut blob = Blob::open(&fixture.db, &path)?;
-
-        // Act: Download data using update/update_db
         blob.update(0, test_data.as_bytes()).await?;
         blob.update_db().await?;
 
@@ -3295,22 +3285,12 @@ mod tests {
             (m_from_path.rdev(), m_from_path.ino())
         );
 
-        // Verify an entry was added to the index with the old hash
+        // An entry was added to the index with the old hash
         let txn = fixture.begin_read()?;
         let cache = txn.read_cache()?;
         let tree = txn.read_tree()?;
         let indexed = cache.indexed(&tree, &path)?.unwrap();
-        assert_eq!(blob_info.hash, indexed.hash);
-
-        // Verify no history entry was added (the old version should
-        // not be broadcast)
-        let history = txn.read_history()?;
-        let history_entries = collect_history_entries(&history)?;
-        assert!(
-            history_entries.is_empty(),
-            "Expected no history entries, but found: {:?}",
-            history_entries
-        );
+        assert_eq!(hash, indexed.hash);
 
         Ok(())
     }

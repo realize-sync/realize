@@ -17,6 +17,7 @@ use crate::{PathId, StorageError};
 use realize_types::{Arena, Hash, Path, Peer, UnixTime};
 use redb::{ReadableTable, Table};
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 /// Read operations for cache. See also [CacheExt].
 pub(crate) trait CacheReadOperations {
@@ -159,7 +160,7 @@ where
     }
 
     fn index_entry_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError> {
-        indexed_entry(&self.table, pathid)
+        Ok(indexed_entry(&self.table, pathid)?.map(|e| e.into()))
     }
 
     fn all_indexed(&self) -> impl Iterator<Item = Result<(Path, IndexedFile), StorageError>> {
@@ -219,7 +220,7 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
     }
 
     fn index_entry_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError> {
-        indexed_entry(&self.table, pathid)
+        Ok(indexed_entry(&self.table, pathid)?.map(|e| e.into()))
     }
 
     fn all_indexed(&self) -> impl Iterator<Item = Result<(Path, IndexedFile), StorageError>> {
@@ -920,18 +921,63 @@ impl<'a> WritableOpenCache<'a> {
         mtime: UnixTime,
         hash: Hash,
     ) -> Result<PathId, StorageError> {
-        self.add_internal(tree, Some(history), Some(dirty), loc, size, mtime, hash)
+        let loc = loc.into();
+        let pathid = tree.setup(loc.borrow())?;
+        let old_hash = self.indexed_hash(pathid);
+        if hash.matches(old_hash.as_ref()) {
+            return Ok(pathid);
+        }
+        if let Some(path) = tree.backtrack(loc.borrow())? {
+            self.write_index_entry(
+                tree,
+                pathid,
+                &IndexedFile {
+                    hash,
+                    mtime,
+                    size,
+                    outdated_by: None,
+                }
+                .into_file(path.clone()),
+            )?;
+            dirty.mark_dirty(pathid, "indexed")?;
+            history.report_added(&path, old_hash.as_ref())?;
+        }
+        Ok(pathid)
     }
 
-    pub(crate) fn index_silently<'b, L: Into<TreeLoc<'b>>>(
+    /// Prepare the database to realize the given entry, that is
+    /// make entry in the index layer the default entry.
+    ///
+    /// Return (source, dest); to really realize the file, source must
+    /// be moved to dest after committing the change.
+    pub(crate) fn realize<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
+        dirty: &mut WritableOpenDirty,
+        history: &mut WritableOpenHistory,
         loc: L,
-        size: u64,
-        mtime: UnixTime,
-        hash: Hash,
-    ) -> Result<PathId, StorageError> {
-        self.add_internal(tree, None, None, loc, size, mtime, hash)
+    ) -> Result<(PathBuf, PathBuf), StorageError> {
+        let pathid = tree.expect(loc)?;
+        let entry = default_file_entry_or_err(&self.table, pathid)?;
+        let path = &entry.path;
+        let source = blobs
+            .prepare_export(tree, pathid)?
+            .ok_or(StorageError::Unavailable)?;
+        let dest = path.within(self.datadir());
+        let index_entry = IndexedFile {
+            mtime: entry.mtime,
+            size: entry.size,
+            hash: entry.hash,
+            outdated_by: None,
+        }
+        .into_file(path.clone());
+        let old_hash = self.indexed_hash(pathid);
+        self.write_index_entry(tree, pathid, &index_entry)?;
+        self.write_default_file_entry(tree, blobs, dirty, pathid, &index_entry)?;
+        history.report_added(&path, old_hash.as_ref())?;
+
+        return Ok((source, dest));
     }
 
     /// Remove a file entry at the given location, if it exists.
@@ -950,7 +996,7 @@ impl<'a> WritableOpenCache<'a> {
                 if let Some(path) = tree.backtrack(loc)? {
                     history.report_removed(&path, &old_hash)?;
                 }
-                self.remove_index_entry(tree, pathid)?;
+                self.rm_index_entry(tree, pathid)?;
                 dirty.mark_dirty(pathid, "removed_from_index")?;
                 return Ok(true);
             }
@@ -976,7 +1022,7 @@ impl<'a> WritableOpenCache<'a> {
                 if let Some(path) = tree.backtrack(loc)? {
                     history.report_dropped(&path, &old_hash)?;
                 }
-                self.remove_index_entry(tree, pathid)?;
+                self.rm_index_entry(tree, pathid)?;
                 dirty.mark_dirty(pathid, "dropped_from_index")?;
                 return Ok(true);
             }
@@ -1026,7 +1072,7 @@ impl<'a> WritableOpenCache<'a> {
         new_hash: &Hash,
     ) -> Result<(), StorageError> {
         if let Some(pathid) = tree.resolve(loc)? {
-            if let Some(mut entry) = self.index_entry_at_pathid(pathid)?
+            if let Some(mut entry) = indexed_entry(&self.table, pathid)?
                 && entry.is_outdated_by(old_hash)
             {
                 // Just remember that a newer version exist in a
@@ -1039,49 +1085,12 @@ impl<'a> WritableOpenCache<'a> {
                     pathid
                 );
 
-                self.add_index_entry(tree, pathid, entry)?;
+                self.write_index_entry(tree, pathid, &entry)?;
                 dirty.mark_dirty(pathid, "outdated")?;
             }
         }
 
         Ok(())
-    }
-
-    fn add_internal<'b, L: Into<TreeLoc<'b>>>(
-        &mut self,
-        tree: &mut WritableOpenTree,
-        history: Option<&mut WritableOpenHistory>,
-        dirty: Option<&mut WritableOpenDirty>,
-        loc: L,
-        size: u64,
-        mtime: UnixTime,
-        hash: Hash,
-    ) -> Result<PathId, StorageError> {
-        let loc = loc.into();
-        let pathid = tree.setup(loc.borrow())?;
-        let old_hash = self.indexed_hash(pathid);
-        if hash.matches(old_hash.as_ref()) {
-            return Ok(pathid);
-        }
-        if let Some(path) = tree.backtrack(loc.borrow())? {
-            self.add_index_entry(
-                tree,
-                pathid,
-                IndexedFile {
-                    hash,
-                    mtime,
-                    size,
-                    outdated_by: None,
-                },
-            )?;
-            if let Some(dirty) = dirty {
-                dirty.mark_dirty(pathid, "indexed")?;
-            }
-            if let Some(history) = history {
-                history.report_added(&path, old_hash.as_ref())?;
-            }
-        }
-        Ok(pathid)
     }
 
     /// Hash of the indexed file or None.
@@ -1094,22 +1103,20 @@ impl<'a> WritableOpenCache<'a> {
     }
 
     /// Add a entry to the index layer
-    fn add_index_entry<'b, L: Into<TreeLoc<'b>>>(
+    fn write_index_entry<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree,
         loc: L,
-        e: IndexedFile,
+        e: &FileTableEntry,
     ) -> Result<(), StorageError> {
         let loc = loc.into();
         let pathid = tree.setup(loc.borrow())?;
-        if let Some(path) = tree.backtrack(loc)? {
-            tree.insert_and_incref(
-                pathid,
-                &mut self.table,
-                (pathid, Layer::Index),
-                Holder::new(&CacheTableEntry::File(e.into_file(path)))?,
-            )?;
-        }
+        tree.insert_and_incref(
+            pathid,
+            &mut self.table,
+            (pathid, Layer::Index),
+            Holder::with_content(CacheTableEntry::File(e.clone()))?,
+        )?;
 
         Ok(())
     }
@@ -1117,7 +1124,7 @@ impl<'a> WritableOpenCache<'a> {
     /// Remove an entry from the index layer.
     ///
     /// Does nothing if the entry is not there
-    fn remove_index_entry<'b, L: Into<TreeLoc<'b>>>(
+    fn rm_index_entry<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree,
         loc: L,
@@ -1503,10 +1510,10 @@ fn map_to_pathid(
 fn indexed_entry(
     cache_table: &impl redb::ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
     pathid: PathId,
-) -> Result<Option<IndexedFile>, StorageError> {
+) -> Result<Option<FileTableEntry>, StorageError> {
     if let Some(e) = cache_table.get((pathid, Layer::Index))? {
         if let CacheTableEntry::File(e) = e.value().parse()? {
-            return Ok(Some(e.into()));
+            return Ok(Some(e));
         }
     }
 
@@ -3000,103 +3007,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn index_adds_entry() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let path = Path::parse("test.txt")?;
-        let hash = Hash([0x42; 32]);
-        let mtime = test_time();
-        let size = 100;
-
-        let indexed_file = IndexedFile {
-            hash: hash.clone(),
-            mtime,
-            size,
-            outdated_by: None,
-        };
-
-        let txn = fixture.db.begin_write()?;
-        let mut cache = txn.write_cache()?;
-        let mut tree = txn.write_tree()?;
-
-        cache.add_index_entry(&mut tree, &path, indexed_file.clone())?;
-
-        let pathid = tree.resolve(&path)?.unwrap();
-        let retrieved = cache.index_entry_at_pathid(pathid)?.unwrap();
-        assert_eq!(indexed_file, retrieved);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn unindex_removes_entry() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let path = Path::parse("test.txt")?;
-
-        let txn = fixture.db.begin_write()?;
-        let mut cache = txn.write_cache()?;
-        let mut tree = txn.write_tree()?;
-
-        cache.add_index_entry(
-            &mut tree,
-            &path,
-            IndexedFile {
-                hash: Hash([1; 32]),
-                mtime: test_time(),
-                size: 100,
-                outdated_by: None,
-            },
-        )?;
-        let pathid = tree.expect(&path)?;
-        cache.remove_index_entry(&mut tree, &path)?;
-        assert!(cache.index_entry_at_pathid(pathid)?.is_none());
-
-        // A second unindex doesn't fail
-        cache.remove_index_entry(&mut tree, &path)?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn index_overwrites_existing() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let path = Path::parse("test.txt")?;
-        let hash1 = Hash([0x42; 32]);
-        let hash2 = Hash([0x43; 32]);
-        let mtime = test_time();
-        let size1 = 100;
-        let size2 = 200;
-
-        let indexed_file1 = IndexedFile {
-            hash: hash1.clone(),
-            mtime,
-            size: size1,
-            outdated_by: None,
-        };
-
-        let indexed_file2 = IndexedFile {
-            hash: hash2.clone(),
-            mtime,
-            size: size2,
-            outdated_by: None,
-        };
-
-        let txn = fixture.db.begin_write()?;
-        let mut cache = txn.write_cache()?;
-        let mut tree = txn.write_tree()?;
-
-        cache.add_index_entry(&mut tree, &path, indexed_file1)?;
-        cache.add_index_entry(&mut tree, &path, indexed_file2)?;
-
-        // Verify the second entry is now stored
-        let pathid = tree.resolve(&path)?.unwrap();
-        let retrieved = cache.index_entry_at_pathid(pathid)?.unwrap();
-        assert_eq!(retrieved.hash, hash2);
-        assert_eq!(retrieved.size, size2);
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn all_indexed_empty() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_read()?;
@@ -3135,7 +3045,7 @@ mod tests {
             hash: hash2.clone(),
             mtime,
             size: 200,
-            outdated_by: Some(hash3.clone()),
+            outdated_by: None,
         };
 
         let indexed_file3 = IndexedFile {
@@ -3147,6 +3057,7 @@ mod tests {
 
         // Add some regular cache entries (should not appear in all_indexed)
         fixture.add_to_cache(&Path::parse("regular.txt")?, 500, mtime)?;
+        fixture.add_to_cache(&path1, 500, mtime)?;
 
         // Add indexed entries
         {
@@ -3154,10 +3065,24 @@ mod tests {
             {
                 let mut cache = txn.write_cache()?;
                 let mut tree = txn.write_tree()?;
+                let mut dirty = txn.write_dirty()?;
+                let mut history = txn.write_history()?;
 
-                cache.add_index_entry(&mut tree, &path1, indexed_file1.clone())?;
-                cache.add_index_entry(&mut tree, &path2, indexed_file2.clone())?;
-                cache.add_index_entry(&mut tree, &path3, indexed_file3.clone())?;
+                for (path, indexed) in [
+                    (&path1, &indexed_file1),
+                    (&path2, &indexed_file2),
+                    (&path3, &indexed_file3),
+                ] {
+                    cache.index(
+                        &mut tree,
+                        &mut history,
+                        &mut dirty,
+                        path,
+                        indexed.size,
+                        indexed.mtime,
+                        indexed.hash.clone(),
+                    )?;
+                }
             }
             txn.commit()?;
         }
@@ -3183,54 +3108,6 @@ mod tests {
 
             // Verify no extra entries
             assert_eq!(indexed_map.len(), 3);
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn all_indexed_skips_non_index_layers() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-
-        let path = Path::parse("test.txt")?;
-        let hash = Hash([0x42; 32]);
-        let mtime = test_time();
-
-        let indexed_file = IndexedFile {
-            hash: hash.clone(),
-            mtime,
-            size: 100,
-            outdated_by: None,
-        };
-
-        // Add both a regular cache entry and an indexed entry for the same path
-        fixture.add_to_cache(&path, 200, mtime)?;
-
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut cache = txn.write_cache()?;
-                let mut tree = txn.write_tree()?;
-
-                cache.add_index_entry(&mut tree, &path, indexed_file.clone())?;
-            }
-            txn.commit()?;
-        }
-
-        // Test all_indexed - should only return the indexed entry
-        {
-            let txn = fixture.db.begin_read()?;
-            let cache = txn.read_cache()?;
-
-            let indexed_files: Result<Vec<_>, _> = cache.all_indexed().collect();
-            let indexed_files = indexed_files?;
-
-            // Should have exactly 1 entry (only the indexed one)
-            assert_eq!(indexed_files.len(), 1);
-
-            let (retrieved_path, retrieved_file) = &indexed_files[0];
-            assert_eq!(path, *retrieved_path);
-            assert_eq!(indexed_file, *retrieved_file);
         }
 
         Ok(())

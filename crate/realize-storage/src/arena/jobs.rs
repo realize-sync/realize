@@ -1,8 +1,7 @@
 use super::db::ArenaDatabase;
 use super::engine::{Engine, StorageJob};
 use crate::arena::blob::BlobExt;
-use crate::arena::cache::CacheReadOperations;
-use crate::arena::index::{self};
+use crate::arena::cache::{CacheExt, CacheReadOperations};
 use crate::arena::tree::TreeExt;
 use crate::{JobId, JobStatus, PathId, StorageError};
 use realize_types::Hash;
@@ -249,16 +248,9 @@ impl StorageJobProcessor {
         let arena = self.db.arena();
         let source: PathBuf;
         let dest: PathBuf;
-        let path: realize_types::Path;
         let txn = self.db.begin_write()?;
         {
             let mut tree = txn.write_tree()?;
-            path = match tree.backtrack(pathid)? {
-                Some(path) => path,
-                None => {
-                    return Ok(JobStatus::Abandoned("no_path"));
-                }
-            };
             let mut cache = txn.write_cache()?;
             let cached = match cache.file_at_pathid(pathid)? {
                 Some(e) => e,
@@ -270,14 +262,26 @@ impl StorageJobProcessor {
                 return Ok(JobStatus::Abandoned("cache_version"));
             }
 
-            dest = match index::indexed_file_path(&cache, &tree, &path, index_hash.as_ref())? {
-                Some(p) => p,
+            // Make sure that indexed file corresponds to index_hash.
+            let indexed_previously = cache.indexed(&tree, pathid)?;
+            match index_hash {
                 None => {
-                    return Ok(JobStatus::Abandoned("indexed_file_path"));
+                    if indexed_previously.is_some() {
+                        return Ok(JobStatus::Abandoned("indexed_previously"));
+                    }
                 }
-            };
+                Some(index_hash) => match &indexed_previously {
+                    None => return Ok(JobStatus::Abandoned("not_indexed")),
+                    Some(e) => {
+                        if e.hash != index_hash {
+                            return Ok(JobStatus::Abandoned("indexed_version_mismatch"));
+                        }
+                    }
+                },
+            }
+
             let mut blobs = txn.write_blobs()?;
-            let blobinfo = match blobs.get(&tree, &path)? {
+            let blobinfo = match blobs.get(&tree, pathid)? {
                 Some(b) => b,
                 None => return Ok(JobStatus::Abandoned("no_blob")),
             };
@@ -287,28 +291,31 @@ impl StorageJobProcessor {
             if !blobinfo.verified {
                 return Ok(JobStatus::Abandoned("not_verified"));
             }
-            source = match blobs.prepare_export(&mut tree, &path)? {
-                Some(p) => p,
-                None => {
-                    return Ok(JobStatus::Abandoned("blob_export"));
+            let mut history = txn.write_history()?;
+            let mut dirty = txn.write_dirty()?;
+            (source, dest) =
+                cache.realize(&mut tree, &mut blobs, &mut dirty, &mut history, pathid)?;
+
+            // Make sure that dest corresponds to indexed_previously
+            // and that we're not overwriting something else.
+            match indexed_previously {
+                Some(indexed_previously) => {
+                    if !indexed_previously.matches_file(&dest) {
+                        return Ok(JobStatus::Abandoned("file_mismatch"));
+                    }
                 }
-            };
-            // Set modification time on file (best effort)
+                None => {
+                    if dest.exists() {
+                        return Ok(JobStatus::Abandoned("unexpected_file"));
+                    }
+                }
+            }
+
+            // Set mtime on source (best effort)
             if let Some(time) = cached.mtime.as_system_time() {
                 let f = File::open(&source)?;
                 let _ = f.set_modified(time);
             }
-            let mut history = txn.write_history()?;
-            let mut dirty = txn.write_dirty()?;
-            cache.index(
-                &mut tree,
-                &mut history,
-                &mut dirty,
-                &path,
-                cached.size,
-                cached.mtime,
-                cached.hash,
-            )?;
         }
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
@@ -320,7 +327,7 @@ impl StorageJobProcessor {
             std::fs::rename(&dest, &source)?;
         }
         ret?;
-        log::info!("[{arena}] Realized \"{path}\" {cache_hash} as {dest:?}");
+        log::info!("[{arena}] Realized pathid {pathid} {cache_hash} as {dest:?}");
 
         Ok(JobStatus::Done)
     }
@@ -331,6 +338,7 @@ mod tests {
     use super::*;
     use crate::arena::cache::CacheExt;
     use crate::arena::history::HistoryReadOperations;
+    use crate::arena::index;
     use crate::arena::types::HistoryTableEntry;
     use crate::arena::types::IndexedFile;
     use crate::utils::hash;

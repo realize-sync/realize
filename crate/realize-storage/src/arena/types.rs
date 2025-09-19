@@ -621,6 +621,16 @@ impl FileTableEntry {
             local: false,
         }
     }
+
+    /// Return true if replacing `old_hash` makes this entry outdated.
+    pub(crate) fn is_outdated_by(&self, old_hash: &Hash) -> bool {
+        self.hash == *old_hash
+            || self
+                .outdated_by
+                .as_ref()
+                .map(|h| *h == *old_hash)
+                .unwrap_or(false)
+    }
 }
 
 /// A simplified directory entry that only contains modification time.
