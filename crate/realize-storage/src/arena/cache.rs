@@ -8,6 +8,7 @@ use super::types::{
     Layer,
 };
 use crate::arena::history::WritableOpenHistory;
+use crate::arena::mark::MarkReadOperations;
 use crate::arena::tree::{self, TreeLoc};
 use crate::arena::types::DirMetadata;
 use crate::global::types::PathAssignment;
@@ -980,6 +981,61 @@ impl<'a> WritableOpenCache<'a> {
         return Ok((source, dest));
     }
 
+    /// Prepare the database to unrealize the given entry, that is
+    /// remove the entry from the index and keep the current file as a
+    /// blob, if possible.
+    ///
+    /// An indexed entry must exist.
+    pub(crate) fn unrealize<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
+        history: &mut WritableOpenHistory,
+        dirty: &mut WritableOpenDirty,
+        marks: &impl MarkReadOperations,
+        loc: L,
+    ) -> Result<(PathBuf, Option<PathBuf>), StorageError> {
+        let loc = loc.into();
+        let pathid = tree.expect(loc.borrow())?;
+        let path = tree
+            .backtrack(loc.borrow())?
+            .ok_or(StorageError::IsADirectory)?;
+        let source = path.within(self.datadir());
+        let metadata = source.metadata()?;
+
+        let indexed = indexed_entry(&self.table, pathid)?.ok_or(StorageError::NotFound)?;
+        if indexed.size != metadata.len() || indexed.mtime != UnixTime::mtime(&metadata) {
+            return Err(StorageError::DatabaseOutdated(format!(
+                "[{}] index outdated for {pathid} \"{path:?}\"",
+                tree.arena()
+            )));
+        }
+        history.report_dropped(&path, &indexed.hash)?;
+        self.rm_index_entry(tree, pathid)?;
+        dirty.mark_dirty(pathid, "dropped_from_index")?;
+
+        let cached = default_file_entry_or_err(&self.table, pathid)?;
+        if cached.hash == indexed.hash {
+            // The file is useful as a blob; import it
+            log::debug!(
+                "[{}] Unrealize; import \"{path:?}\" {}",
+                tree.arena(),
+                cached.hash
+            );
+            let dest = blobs.import(tree, marks, pathid, &indexed.hash, &metadata)?;
+
+            return Ok((source, Some(dest)));
+        }
+        log::debug!(
+            "[{}] Unrealize; drop outdated \"{path:?}\" {}",
+            tree.arena(),
+            indexed.hash
+        );
+
+        // We can't use the blob; just delete the file
+        return Ok((source, None));
+    }
+
     /// Remove a file entry at the given location, if it exists.
     ///
     /// Return true if something was removed.
@@ -998,32 +1054,6 @@ impl<'a> WritableOpenCache<'a> {
                 }
                 self.rm_index_entry(tree, pathid)?;
                 dirty.mark_dirty(pathid, "removed_from_index")?;
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
-    }
-
-    /// Remove a file entry at the given location, if it exists and
-    /// report it as dropped.
-    ///
-    /// Return true if something was removed.
-    pub(crate) fn drop_from_index<'b, L: Into<TreeLoc<'b>>>(
-        &mut self,
-        tree: &mut WritableOpenTree,
-        history: &mut WritableOpenHistory,
-        dirty: &mut WritableOpenDirty,
-        loc: L,
-    ) -> Result<bool, StorageError> {
-        let loc = loc.into();
-        if let Some(pathid) = tree.resolve(loc.borrow())? {
-            if let Some(old_hash) = self.indexed_hash(pathid) {
-                if let Some(path) = tree.backtrack(loc)? {
-                    history.report_dropped(&path, &old_hash)?;
-                }
-                self.rm_index_entry(tree, pathid)?;
-                dirty.mark_dirty(pathid, "dropped_from_index")?;
                 return Ok(true);
             }
         }

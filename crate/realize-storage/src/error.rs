@@ -49,6 +49,9 @@ pub enum StorageError {
     #[error("database is inconsistent. This is a bug. {0}")]
     InconsistentDatabase(String),
 
+    #[error("database hasn't caught up to FS changes; retry later. {0}")]
+    DatabaseOutdated(String),
+
     #[error("cannot cross devices")]
     CrossesDevices,
 
@@ -93,6 +96,7 @@ impl StorageError {
             StorageError::IsADirectory => IsADirectory,
             StorageError::JoinError(_) => Other,
             StorageError::InvalidRsyncSignature => InvalidInput,
+            StorageError::DatabaseOutdated(_) => InvalidData,
             StorageError::UnknownArena(_) => NotFound,
             StorageError::InconsistentDatabase(_) => Other,
             StorageError::CrossesDevices => CrossesDevices,

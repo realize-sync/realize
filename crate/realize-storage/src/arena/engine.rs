@@ -45,17 +45,12 @@ impl Job {
 pub(crate) enum StorageJob {
     External(Job),
 
-    /// Move file containing the given version into the cache.
+    /// Move indexed file containing the given version into the cache.
+    ///
+    /// If the cache already has a newer version, the indexed file is
+    /// just dropped.
     Unrealize {
         pathid: PathId,
-        common_hash: Hash,
-    },
-
-    /// Drop indexed file with the second hash, outdated by cached file
-    /// with the first hash.
-    DropOutdated {
-        pathid: PathId,
-        cached_hash: Hash,
         indexed_hash: Hash,
     },
 
@@ -485,7 +480,7 @@ impl Engine {
                 if let Some(indexed) = indexed
                     && indexed.is_outdated_by(&hash)
                 {
-                    should_unrealize = Some((hash.clone(), indexed.hash));
+                    should_unrealize = Some(indexed.hash);
                 }
             } else if want_realize {
                 match indexed {
@@ -533,16 +528,9 @@ impl Engine {
                 indexed_hash: index_hash,
             }));
         }
-        if let Some((cached_hash, index_hash)) = should_unrealize {
-            if cached_hash == index_hash {
-                return Ok(Some(StorageJob::Unrealize {
-                    pathid,
-                    common_hash: cached_hash,
-                }));
-            }
-            return Ok(Some(StorageJob::DropOutdated {
+        if let Some(index_hash) = should_unrealize {
+            return Ok(Some(StorageJob::Unrealize {
                 pathid,
-                cached_hash,
                 indexed_hash: index_hash,
             }));
         }
@@ -1138,7 +1126,7 @@ mod tests {
         assert_eq!(
             StorageJob::Unrealize {
                 pathid: pathid,
-                common_hash: test_hash()
+                indexed_hash: test_hash()
             },
             job
         );
@@ -1163,9 +1151,8 @@ mod tests {
         let (_, job) = next_with_timeout(&mut job_stream).await?.unwrap();
         let pathid = fixture.pathid(&foobar)?;
         assert_eq!(
-            StorageJob::DropOutdated {
+            StorageJob::Unrealize {
                 pathid,
-                cached_hash: version2,
                 indexed_hash: version1
             },
             job
