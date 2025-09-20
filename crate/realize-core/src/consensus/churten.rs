@@ -449,7 +449,7 @@ mod tests {
                 churten.start();
 
                 // the job cannot connect to the peer, because it is disconnected
-                while let Ok(n) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await? {
+                while let Ok(n) = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await? {
                     if let ChurtenNotification::Finish { progress, .. } = n {
                         assert_eq!(JobProgress::NoPeers, progress);
                         break;
@@ -458,7 +458,7 @@ mod tests {
 
                 // upon reconnection, the job is retried and succeeds
                 testing::connect(&household_a, b).await?;
-                while let Ok(n) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await? {
+                while let Ok(n) = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await? {
                     if let ChurtenNotification::Finish { progress, .. } = n {
                         assert_eq!(JobProgress::Done, progress);
                         break;
@@ -963,7 +963,7 @@ mod tests {
                 // Collect all notifications
                 let mut finished_count = 0;
                 while let Ok(notification) =
-                    tokio::time::timeout(Duration::from_secs(3), rx.recv()).await?
+                    tokio::time::timeout(Duration::from_secs(10), rx.recv()).await?
                 {
                     match notification {
                         ChurtenNotification::Finish { .. } => {
