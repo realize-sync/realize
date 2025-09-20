@@ -2,7 +2,7 @@ use super::db::{GlobalDatabase, GlobalReadTransaction};
 use super::pathid_allocator::PathIdAllocator;
 use crate::arena::fs::{ArenaFilesystem, ArenaFsLoc};
 use crate::arena::notifier::{Notification, Progress};
-use crate::arena::types::{DirMetadata, LocalAvailability};
+use crate::arena::types::{DirMetadata, FileRealm};
 use crate::global::db::GlobalWriteTransaction;
 use crate::global::types::PathTableEntry;
 use crate::utils::holder::Holder;
@@ -368,17 +368,17 @@ impl Filesystem {
         .await?
     }
 
-    /// Check local file content availability.
-    pub async fn local_availability<L: Into<FsLoc>>(
+    /// Specifies the type of file (local or remote) and its cache status.
+    pub async fn file_realm<L: Into<FsLoc>>(
         self: &Arc<Self>,
         loc: L,
-    ) -> Result<LocalAvailability, StorageError> {
+    ) -> Result<FileRealm, StorageError> {
         let loc = loc.into();
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
             let (fs, loc) = this.resolve_arena_loc(loc)?;
-            fs.local_availability(loc)
+            fs.file_realm(loc)
         })
         .await?
     }

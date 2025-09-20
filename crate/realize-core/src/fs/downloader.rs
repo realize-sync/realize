@@ -1,5 +1,5 @@
 use crate::rpc::{ExecutionMode, Household, HouseholdOperationError};
-use realize_storage::{Blob, Filesystem, FsLoc, LocalAvailability, StorageError};
+use realize_storage::{Blob, CacheStatus, Filesystem, FsLoc, StorageError};
 use realize_types::{Arena, ByteRange, ByteRanges, Path, Peer};
 use std::cmp::min;
 use std::collections::VecDeque;
@@ -43,8 +43,8 @@ impl Downloader {
     ) -> Result<Blob, HouseholdOperationError> {
         let mut blob = self.cache.open_file(loc).await?;
         if matches!(
-            blob.local_availability(),
-            LocalAvailability::Complete | LocalAvailability::Verified,
+            blob.cache_status(),
+            CacheStatus::Complete | CacheStatus::Verified,
         ) {
             // Nothing to do
             return Ok(blob);
@@ -159,7 +159,7 @@ impl Download {
     /// - includes ranges that have been written to the file, but
     ///   haven't been flushed yet.
     /// - does not include ranges written through other file handles
-    pub fn local_availability(&self) -> &ByteRanges {
+    pub fn cache_status(&self) -> &ByteRanges {
         self.blob.available_range()
     }
 
@@ -428,8 +428,8 @@ mod tests {
         ) -> anyhow::Result<()> {
             assert!(
                 matches!(
-                    blob.local_availability(),
-                    LocalAvailability::Complete | LocalAvailability::Verified
+                    blob.cache_status(),
+                    CacheStatus::Complete | CacheStatus::Verified
                 ),
                 "{} should have Complete or Verified availability",
                 test_name
@@ -683,7 +683,7 @@ mod tests {
                         ByteRange::new(0, block),
                         ByteRange::new(2 * block, 3 * block)
                     ]),
-                    *reader.local_availability()
+                    *reader.cache_status()
                 );
 
                 // Read from first block succeeds.

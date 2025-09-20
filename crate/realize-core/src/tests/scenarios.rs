@@ -2,7 +2,7 @@ use crate::consensus::churten::Churten;
 use crate::rpc::testing::HouseholdFixture;
 use realize_storage::config::DiskUsageLimits;
 use realize_storage::utils::hash;
-use realize_storage::{LocalAvailability, Mark};
+use realize_storage::{CacheStatus, FileRealm, Mark};
 use realize_types::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,14 +60,15 @@ async fn file_drop() -> anyhow::Result<()> {
             // copy that was moved into the cache must eventually be
             // deleted, because max disk usage is 0.
             let cache_a = storage_a.cache();
-            while cache_a.local_availability((arena, &foo)).await? != LocalAvailability::Missing
+            while cache_a.file_realm((arena, &foo)).await?
+                != FileRealm::Remote(CacheStatus::Missing)
                 && Instant::now() < limit
             {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             assert_eq!(
-                LocalAvailability::Missing,
-                cache_a.local_availability((arena, &foo)).await?
+                FileRealm::Remote(CacheStatus::Missing),
+                cache_a.file_realm((arena, &foo)).await?
             );
 
             Ok::<(), anyhow::Error>(())

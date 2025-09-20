@@ -198,7 +198,7 @@ mod tests {
                 // Write data to the blob file
                 let blob_path = self.blob_dir.child(info.pathid.hex());
                 std::fs::write(blob_path.path(), &test_data)?;
-                blobs.extend_local_availability(
+                blobs.extend_cache_status(
                     &tree,
                     info.pathid,
                     &hash,

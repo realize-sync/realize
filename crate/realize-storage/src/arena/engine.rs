@@ -4,7 +4,7 @@ use super::db::{ArenaDatabase, ArenaReadTransaction};
 use super::dirty::DirtyReadOperations;
 use super::mark::MarkExt;
 use super::tree::{TreeExt, TreeLoc};
-use super::types::LocalAvailability;
+use super::types::CacheStatus;
 use crate::arena::tree::TreeReadOperations;
 use crate::types::JobId;
 use crate::{Mark, PathId, StorageError};
@@ -502,9 +502,9 @@ impl Engine {
             }
             if want_download
                 && blob
-                    .map(|b| b.local_availability())
-                    .unwrap_or(LocalAvailability::Missing)
-                    != LocalAvailability::Verified
+                    .map(|b| b.cache_status())
+                    .unwrap_or(CacheStatus::Missing)
+                    != CacheStatus::Verified
                 && (!is_indexed || should_realize.is_some())
             {
                 should_download = Some(hash);

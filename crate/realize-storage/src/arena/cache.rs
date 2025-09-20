@@ -1,12 +1,13 @@
-use super::blob::{BlobInfo, WritableOpenBlob};
+use super::blob::{BlobExt, BlobInfo, WritableOpenBlob};
 use super::db::ArenaWriteTransaction;
 use super::dirty::WritableOpenDirty;
 use super::index::Index;
 use super::tree::{TreeExt, TreeReadOperations, WritableOpenTree};
 use super::types::{
-    CacheTableEntry, DirtableEntry, FileAvailability, FileMetadata, FileTableEntry, IndexedFile,
-    Layer,
+    CacheTableEntry, DirtableEntry, FileMetadata, FileRealm, FileTableEntry, IndexedFile, Layer,
+    RemoteAvailability,
 };
+use crate::arena::blob::BlobReadOperations;
 use crate::arena::history::WritableOpenHistory;
 use crate::arena::mark::MarkReadOperations;
 use crate::arena::tree::{self, TreeLoc};
@@ -29,13 +30,21 @@ pub(crate) trait CacheReadOperations {
         loc: L,
     ) -> Result<Option<crate::arena::types::Metadata>, StorageError>;
 
+    /// Specifies the type of file (local or remote) and its cache status.
+    fn file_realm<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        blobs: &impl BlobReadOperations,
+        loc: L,
+    ) -> Result<FileRealm, StorageError>;
+
     /// Get remote file availability information for the given pathid and version.
-    fn file_availability<'b, L: Into<TreeLoc<'b>>>(
+    fn remote_availability<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
         hash: &Hash,
-    ) -> Result<Option<FileAvailability>, StorageError>;
+    ) -> Result<Option<RemoteAvailability>, StorageError>;
 
     /// Read directory contents for the given pathid.
     fn readdir<'b, L: Into<TreeLoc<'b>>>(
@@ -126,13 +135,22 @@ where
         Ok(None)
     }
 
-    fn file_availability<'b, L: Into<TreeLoc<'b>>>(
+    fn file_realm<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        blobs: &impl BlobReadOperations,
+        loc: L,
+    ) -> Result<FileRealm, StorageError> {
+        file_realm(&self.table, tree, blobs, loc)
+    }
+
+    fn remote_availability<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
         hash: &Hash,
-    ) -> Result<Option<FileAvailability>, StorageError> {
-        file_availability(&self.table, tree, loc, self.arena, hash)
+    ) -> Result<Option<RemoteAvailability>, StorageError> {
+        remote_availability(&self.table, tree, loc, self.arena, hash)
     }
 
     fn readdir<'b, L: Into<TreeLoc<'b>>>(
@@ -186,13 +204,22 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         Ok(None)
     }
 
-    fn file_availability<'b, L: Into<TreeLoc<'b>>>(
+    fn file_realm<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        blobs: &impl BlobReadOperations,
+        loc: L,
+    ) -> Result<FileRealm, StorageError> {
+        file_realm(&self.table, tree, blobs, loc)
+    }
+
+    fn remote_availability<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
         hash: &Hash,
-    ) -> Result<Option<FileAvailability>, StorageError> {
-        file_availability(&self.table, tree, loc, self.arena, hash)
+    ) -> Result<Option<RemoteAvailability>, StorageError> {
+        remote_availability(&self.table, tree, loc, self.arena, hash)
     }
 
     fn readdir<'b, L: Into<TreeLoc<'b>>>(
@@ -930,7 +957,11 @@ impl<'a> WritableOpenCache<'a> {
         for pathid in pathids {
             self.rm_peer_file_entry(tree, pathid, peer)?;
             if let Some(entry) = self.file_at_pathid(pathid)? {
-                if !entry.local && self.file_availability(tree, pathid, &entry.hash)?.is_none() {
+                if !entry.local
+                    && self
+                        .remote_availability(tree, pathid, &entry.hash)?
+                        .is_none()
+                {
                     // If the file has become unavailable because of
                     // this removal, remove the file itself as well.
                     self.rm_default_file_entry(tree, blobs, dirty, pathid)?;
@@ -1270,14 +1301,28 @@ fn metadata(
     }
 }
 
+fn file_realm<'b, L: Into<TreeLoc<'b>>>(
+    cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
+    tree: &impl TreeReadOperations,
+    blobs: &impl BlobReadOperations,
+    loc: L,
+) -> Result<FileRealm, StorageError> {
+    let pathid = tree.expect(loc)?;
+    if default_file_entry_or_err(cache_table, pathid)?.local {
+        return Ok(FileRealm::Local);
+    }
+
+    Ok(FileRealm::Remote(blobs.cache_status(tree, pathid)?))
+}
+
 /// Get file availability information for the given pathid.
-fn file_availability<'b, L: Into<TreeLoc<'b>>>(
+fn remote_availability<'b, L: Into<TreeLoc<'b>>>(
     cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
     tree: &impl TreeReadOperations,
     loc: L,
     arena: Arena,
     hash: &Hash,
-) -> Result<Option<FileAvailability>, StorageError> {
+) -> Result<Option<RemoteAvailability>, StorageError> {
     let mut avail = None;
     let pathid = tree.expect(loc)?;
     let mut visited = HashSet::new();
@@ -1291,7 +1336,7 @@ fn file_availability<'b, L: Into<TreeLoc<'b>>>(
         for entry in find_peer_entry(cache_table, pathid, hash)? {
             let (peer, file_entry) = entry?;
             avail
-                .get_or_insert_with(|| FileAvailability {
+                .get_or_insert_with(|| RemoteAvailability {
                     arena,
                     path: file_entry.path,
                     size: file_entry.size,
@@ -1600,7 +1645,6 @@ fn indexed_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FileMetadata;
     use crate::arena::blob::BlobExt;
     use crate::arena::db::ArenaDatabase;
     use crate::arena::dirty::DirtyReadOperations;
@@ -1610,6 +1654,7 @@ mod tests {
     use crate::arena::types::{DirMetadata, HistoryTableEntry};
     use crate::arena::update;
     use crate::utils::hash;
+    use crate::{CacheStatus, FileMetadata};
     use crate::{PathId, StorageError};
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
@@ -2122,7 +2167,7 @@ mod tests {
         let cache = txn.read_cache()?;
 
         let avail = cache
-            .file_availability(&tree, &file_path, &Hash([2u8; 32]))?
+            .remote_availability(&tree, &file_path, &Hash([2u8; 32]))?
             .unwrap();
         assert_eq!(vec![peer], avail.peers);
 
@@ -2526,7 +2571,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_availability_deals_with_conflicting_adds() -> anyhow::Result<()> {
+    async fn remote_availability_deals_with_conflicting_adds() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena())?;
 
         let a = Peer::from("a");
@@ -2576,7 +2621,7 @@ mod tests {
         let cache = txn.read_cache()?;
 
         let avail = cache
-            .file_availability(&tree, &path, &Hash([1u8; 32]))?
+            .remote_availability(&tree, &path, &Hash([1u8; 32]))?
             .unwrap();
         assert_eq!(arena, avail.arena);
         assert_eq!(path, avail.path);
@@ -2589,14 +2634,14 @@ mod tests {
         assert_eq!(
             vec![c],
             cache
-                .file_availability(&tree, &path, &Hash([2u8; 32]))?
+                .remote_availability(&tree, &path, &Hash([2u8; 32]))?
                 .unwrap()
                 .peers
         );
 
         assert_eq!(
             None,
-            cache.file_availability(&tree, &path, &Hash([3u8; 32]))?
+            cache.remote_availability(&tree, &path, &Hash([3u8; 32]))?
         );
 
         Ok(())
@@ -2675,7 +2720,7 @@ mod tests {
             assert_eq!(
                 vec![b],
                 cache
-                    .file_availability(&tree, &path, &entry.hash)?
+                    .remote_availability(&tree, &path, &entry.hash)?
                     .unwrap()
                     .peers
             );
@@ -2721,7 +2766,7 @@ mod tests {
             assert_eq!(
                 vec![c],
                 cache
-                    .file_availability(&tree, &path, &entry.hash)?
+                    .remote_availability(&tree, &path, &entry.hash)?
                     .unwrap()
                     .peers
             );
@@ -2737,7 +2782,7 @@ mod tests {
             assert_eq!(
                 vec![c],
                 cache
-                    .file_availability(&tree, &path, &entry.hash)?
+                    .remote_availability(&tree, &path, &entry.hash)?
                     .unwrap()
                     .peers
             );
@@ -2768,7 +2813,7 @@ mod tests {
             assert_eq!(
                 vec![b, c],
                 cache
-                    .file_availability(&tree, &path, &entry.hash)?
+                    .remote_availability(&tree, &path, &entry.hash)?
                     .unwrap()
                     .peers
             );
@@ -2778,7 +2823,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_availability_when_a_peer_goes_away() -> anyhow::Result<()> {
+    async fn remote_availability_when_a_peer_goes_away() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena())?;
 
         let a = Peer::from("a");
@@ -2850,7 +2895,7 @@ mod tests {
             assert_eq!(
                 vec![a],
                 cache
-                    .file_availability(&tree, pathid, &entry.hash)?
+                    .remote_availability(&tree, pathid, &entry.hash)?
                     .unwrap()
                     .peers
             );
@@ -3024,7 +3069,7 @@ mod tests {
         assert_eq!(
             vec![peer1, peer2],
             cache
-                .file_availability(&tree, &file2, &test_hash())?
+                .remote_availability(&tree, &file2, &test_hash())?
                 .unwrap()
                 .peers
         );
@@ -3032,7 +3077,7 @@ mod tests {
         assert_eq!(
             vec![peer3],
             cache
-                .file_availability(&tree, &file3, &test_hash())?
+                .remote_availability(&tree, &file3, &test_hash())?
                 .unwrap()
                 .peers
         );
@@ -3040,7 +3085,7 @@ mod tests {
         assert_eq!(
             vec![peer1],
             cache
-                .file_availability(&tree, &file4, &test_hash())?
+                .remote_availability(&tree, &file4, &test_hash())?
                 .unwrap()
                 .peers
         );
@@ -3080,6 +3125,44 @@ mod tests {
 
         // The version has changed, so the blob must have been deleted.
         assert!(!fixture.has_blob(&file_path)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn file_realm() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let testfile = Path::parse("testfile")?;
+
+        fixture.add_to_cache(&testfile, 5, test_time())?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+
+        assert_eq!(
+            FileRealm::Remote(CacheStatus::Missing),
+            cache.file_realm(&tree, &blobs, &testfile)?,
+        );
+
+        let mut history = txn.write_history()?;
+        let mut dirty = txn.write_dirty()?;
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &testfile,
+            5,
+            test_time(),
+            test_hash(),
+        )?;
+
+        assert_eq!(
+            FileRealm::Local,
+            cache.file_realm(&tree, &blobs, &testfile)?,
+        );
+
         Ok(())
     }
 
@@ -3355,7 +3438,9 @@ mod tests {
             },
             cache.file_metadata(&tree, dest_pathid)?
         );
-        let avail = cache.file_availability(&tree, dest_pathid, &hash)?.unwrap();
+        let avail = cache
+            .remote_availability(&tree, dest_pathid, &hash)?
+            .unwrap();
         assert_eq!(source_path, avail.path);
         assert_eq!(vec![peer1], avail.peers);
 
@@ -3379,7 +3464,9 @@ mod tests {
             },
             cache.file_metadata(&tree, dest_pathid)?
         );
-        let avail = cache.file_availability(&tree, dest_pathid, &hash)?.unwrap();
+        let avail = cache
+            .remote_availability(&tree, dest_pathid, &hash)?
+            .unwrap();
         assert_eq!(dest_path, avail.path);
         assert_eq!(hash, avail.hash);
         assert_eq!(vec![peer2], avail.peers);

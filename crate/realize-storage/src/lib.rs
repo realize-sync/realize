@@ -29,7 +29,7 @@ pub use arena::indexed_store::Reader;
 pub use arena::notifier::Notification;
 pub use arena::notifier::Progress;
 pub use arena::types::{
-    DirMetadata, FileAvailability, FileMetadata, LocalAvailability, Mark, Metadata,
+    CacheStatus, DirMetadata, FileMetadata, FileRealm, Mark, Metadata, RemoteAvailability,
 };
 pub use error::StorageError;
 pub use global::fs::{Filesystem, FsLoc};

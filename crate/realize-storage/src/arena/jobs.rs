@@ -275,7 +275,7 @@ mod tests {
     use crate::arena::types::HistoryTableEntry;
     use crate::arena::types::IndexedFile;
     use crate::utils::hash;
-    use crate::{ArenaFilesystem, Blob, LocalAvailability, Mark, Notification, PathId};
+    use crate::{ArenaFilesystem, Blob, CacheStatus, Mark, Notification, PathId};
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
@@ -582,13 +582,11 @@ mod tests {
         assert_eq!("test".to_string(), std::fs::read_to_string(&realpath)?);
         assert_eq!(test_time(), UnixTime::mtime(&realpath.metadata()?));
 
-        assert_eq!(
-            LocalAvailability::Missing,
-            fixture.cache.local_availability(pathid)?
-        );
-
         let txn = fixture.db.begin_read()?;
         let cache = txn.read_cache()?;
+        let tree = txn.read_tree()?;
+        let blobs = txn.read_blobs()?;
+        assert_eq!(CacheStatus::Missing, blobs.cache_status(&tree, pathid)?);
         let indexed = cache
             .index_entry_at_pathid(pathid)?
             .expect("must have been indexed");
@@ -626,13 +624,12 @@ mod tests {
         let realpath = path.within(&fixture.root);
         assert_eq!("new!".to_string(), std::fs::read_to_string(&realpath)?);
         assert_eq!(test_time(), UnixTime::mtime(&realpath.metadata()?));
-        assert_eq!(
-            LocalAvailability::Missing,
-            fixture.cache.local_availability(pathid)?
-        );
 
         let txn = fixture.db.begin_read()?;
         let cache = txn.read_cache()?;
+        let tree = txn.read_tree()?;
+        let blobs = txn.read_blobs()?;
+        assert_eq!(CacheStatus::Missing, blobs.cache_status(&tree, pathid)?);
         let indexed = cache
             .index_entry_at_pathid(pathid)?
             .expect("must have been indexed");

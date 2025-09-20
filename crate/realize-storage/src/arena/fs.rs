@@ -1,4 +1,4 @@
-use super::blob::{BlobExt, BlobReadOperations};
+use super::blob::BlobReadOperations;
 use super::cache::{CacheExt, CacheReadOperations};
 use super::db::ArenaDatabase;
 use super::peer::PeersReadOperations;
@@ -8,7 +8,7 @@ use super::update;
 use crate::arena::notifier::{Notification, Progress};
 use crate::arena::types::DirMetadata;
 use crate::types::Inode;
-use crate::{Blob, LocalAvailability};
+use crate::{Blob, FileRealm};
 use crate::{PathId, StorageError};
 use realize_types::{Arena, Path, Peer};
 use std::sync::Arc;
@@ -259,15 +259,13 @@ impl ArenaFilesystem {
         Ok(Blob::open_with_info(&self.db, info)?)
     }
 
-    pub(crate) fn local_availability(
-        &self,
-        loc: impl Into<ArenaFsLoc>,
-    ) -> Result<LocalAvailability, StorageError> {
+    /// Specifies the type of file (local or remote) and its cache status.
+    pub(crate) fn file_realm(&self, loc: impl Into<ArenaFsLoc>) -> Result<FileRealm, StorageError> {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
         let blobs = txn.read_blobs()?;
         let cache = txn.read_cache()?;
-        blobs.local_availability(&tree, loc.into().into_tree_loc(&cache)?)
+        cache.file_realm(&tree, &blobs, loc.into().into_tree_loc(&cache)?)
     }
 
     /// Create a directory at the given path.

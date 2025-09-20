@@ -5,7 +5,7 @@ use crate::rpc::{ExecutionMode, Household};
 use fast_rsync::ApplyError;
 use futures::StreamExt;
 use realize_storage::{
-    Blob, FileAvailability, JobId, JobStatus, LocalAvailability, Storage, StorageError,
+    Blob, CacheStatus, JobId, JobStatus, RemoteAvailability, Storage, StorageError,
 };
 use realize_types::{Arena, ByteRanges, Hash, Path, Signature};
 use std::io::SeekFrom;
@@ -66,9 +66,9 @@ pub(crate) async fn download(
     if *blob.hash() != *hash {
         return Ok(JobStatus::Abandoned("hash mismatch"));
     }
-    match blob.local_availability() {
-        LocalAvailability::Verified => return Ok(JobStatus::Done),
-        LocalAvailability::Complete => {
+    match blob.cache_status() {
+        CacheStatus::Verified => return Ok(JobStatus::Done),
+        CacheStatus::Complete => {
             let avail = match blob.remote_availability().await? {
                 Some(a) => a,
                 None => {
@@ -78,7 +78,7 @@ pub(crate) async fn download(
             return verify(household, job_id, blob, avail, progress, shutdown).await;
         }
 
-        LocalAvailability::Missing | LocalAvailability::Partial(_, _) => {
+        CacheStatus::Missing | CacheStatus::Partial => {
             let avail = match blob.remote_availability().await? {
                 Some(a) => a,
                 None => {
@@ -115,7 +115,7 @@ async fn write_to_blob(
     household: &Arc<Household>,
     job_id: JobId,
     blob: &mut realize_storage::Blob,
-    avail: &FileAvailability,
+    avail: &RemoteAvailability,
     progress: &mut impl ByteCountProgress,
     shutdown: CancellationToken,
 ) -> Result<JobStatus, JobError> {
@@ -171,7 +171,7 @@ pub(crate) async fn verify(
     household: &Arc<Household>,
     job_id: JobId,
     mut blob: Blob,
-    avail: FileAvailability,
+    avail: RemoteAvailability,
     progress: &mut impl ByteCountProgress,
     shutdown: CancellationToken,
 ) -> Result<JobStatus, JobError> {
@@ -254,8 +254,8 @@ mod tests {
     use crate::rpc::testing::{self, HouseholdFixture};
     use rand::rngs::SmallRng;
     use rand::{RngCore, SeedableRng};
-    use realize_storage::Blob;
     use realize_storage::utils::hash;
+    use realize_storage::{Blob, FileRealm};
     use realize_types::Peer;
     use tokio::fs::File;
     use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
@@ -353,15 +353,11 @@ mod tests {
             Ok(buf)
         }
 
-        async fn local_availability(
-            &self,
-            peer: Peer,
-            path_str: &str,
-        ) -> anyhow::Result<LocalAvailability> {
+        async fn file_realm(&self, peer: Peer, path_str: &str) -> anyhow::Result<FileRealm> {
             let cache = self.inner.cache(peer)?;
 
             Ok(cache
-                .local_availability((HouseholdFixture::test_arena(), &Path::parse(path_str)?))
+                .file_realm((HouseholdFixture::test_arena(), &Path::parse(path_str)?))
                 .await?)
         }
     }
@@ -489,8 +485,8 @@ mod tests {
                 assert!(blob.available_range().is_empty());
 
                 assert_eq!(
-                    LocalAvailability::Verified,
-                    fixture.local_availability(a, "foobar").await?
+                    FileRealm::Remote(CacheStatus::Verified),
+                    fixture.file_realm(a, "foobar").await?
                 );
 
                 assert_eq!("", fixture.get_blob_content_as_string(a, "foobar").await?);
@@ -886,8 +882,8 @@ mod tests {
                 );
 
                 assert_eq!(
-                    LocalAvailability::Verified,
-                    fixture.local_availability(a, "foobar").await?
+                    FileRealm::Remote(CacheStatus::Verified),
+                    fixture.file_realm(a, "foobar").await?
                 );
 
                 assert_eq!(
@@ -944,8 +940,8 @@ mod tests {
                 );
 
                 assert_eq!(
-                    LocalAvailability::Verified,
-                    fixture.local_availability(a, "foobar").await?
+                    FileRealm::Remote(CacheStatus::Verified),
+                    fixture.file_realm(a, "foobar").await?
                 );
 
                 assert_eq!(
@@ -1004,8 +1000,8 @@ mod tests {
                 );
 
                 assert_eq!(
-                    LocalAvailability::Verified,
-                    fixture.local_availability(a, "large").await?
+                    FileRealm::Remote(CacheStatus::Verified),
+                    fixture.file_realm(a, "large").await?
                 );
 
                 let blob = fixture.open_file(a, "large").await?;
@@ -1072,8 +1068,8 @@ mod tests {
 
                 // repair was successful
                 assert_eq!(
-                    LocalAvailability::Verified,
-                    fixture.local_availability(a, "large").await?
+                    FileRealm::Remote(CacheStatus::Verified),
+                    fixture.file_realm(a, "large").await?
                 );
 
                 // check the content again

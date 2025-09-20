@@ -41,14 +41,35 @@ mod engine_capnp {
     include!(concat!(env!("OUT_DIR"), "/arena/engine_capnp.rs"));
 }
 
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum FileRealm {
+    /// File is available as a regular file on the local filesystem
+    Local,
+    /// File is remote. Its content may have been cached.
+    Remote(CacheStatus),
+}
+
+impl FileRealm {
+    /// Return true if the file can be accessed without
+    /// connecting to another host.
+    pub fn is_available_offline(&self) -> bool {
+        match self {
+            FileRealm::Local => true,
+            FileRealm::Remote(CacheStatus::Complete) => true,
+            FileRealm::Remote(CacheStatus::Verified) => true,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Eq, PartialEq, Debug)]
-pub enum LocalAvailability {
+pub enum CacheStatus {
     /// File is not available locally
     Missing,
 
     /// File is only partially available locally, and here is its size
     /// and available range.
-    Partial(u64, ByteRanges),
+    Partial,
 
     /// File is available locally, but its content hasn't been verified.
     Complete,
@@ -591,7 +612,7 @@ impl ByteConvertible<MarkTableEntry> for MarkTableEntry {
 
 /// A file and all versions known to the cache.
 #[derive(Clone, Debug, PartialEq)]
-pub struct FileAvailability {
+pub struct RemoteAvailability {
     pub arena: Arena,
     pub path: Path,
     pub size: u64,

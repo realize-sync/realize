@@ -2,12 +2,12 @@ use super::db::{ArenaDatabase, BeforeCommit};
 use super::dirty::WritableOpenDirty;
 use super::mark::MarkReadOperations;
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
-use super::types::{BlobTableEntry, LocalAvailability, LruQueueId, Mark, QueueTableEntry};
+use super::types::{BlobTableEntry, CacheStatus, LruQueueId, Mark, QueueTableEntry};
 use crate::arena::cache::CacheReadOperations;
 use crate::types::PathId;
 use crate::utils::hash;
 use crate::utils::holder::Holder;
-use crate::{FileAvailability, StorageError};
+use crate::{RemoteAvailability, StorageError};
 use priority_queue::PriorityQueue;
 use realize_types::Arena;
 use realize_types::{ByteRange, ByteRanges, Hash};
@@ -272,19 +272,19 @@ impl BlobInfo {
         }
     }
 
-    pub(crate) fn local_availability(&self) -> LocalAvailability {
+    pub(crate) fn cache_status(&self) -> CacheStatus {
         let file_range = ByteRanges::single(0, self.size);
         if file_range == file_range.intersection(&self.available_ranges) {
             if self.verified {
-                return LocalAvailability::Verified;
+                return CacheStatus::Verified;
             }
-            return LocalAvailability::Complete;
+            return CacheStatus::Complete;
         }
         if self.available_ranges.is_empty() {
-            return LocalAvailability::Missing;
+            return CacheStatus::Missing;
         }
 
-        LocalAvailability::Partial(self.size, self.available_ranges.clone())
+        CacheStatus::Partial
     }
 }
 
@@ -372,11 +372,11 @@ pub(crate) trait BlobExt {
     ///
     /// Note that non-existing as well as empty blobs have
     /// [LocalAvailability::Missing].
-    fn local_availability<'b, L: Into<TreeLoc<'b>>>(
+    fn cache_status<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> Result<LocalAvailability, StorageError>;
+    ) -> Result<CacheStatus, StorageError>;
 }
 
 impl<T: BlobReadOperations> BlobExt for T {
@@ -392,15 +392,15 @@ impl<T: BlobReadOperations> BlobExt for T {
         }
     }
 
-    fn local_availability<'b, L: Into<TreeLoc<'b>>>(
+    fn cache_status<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> Result<LocalAvailability, StorageError> {
+    ) -> Result<CacheStatus, StorageError> {
         if let Some(blob_info) = self.get(tree, loc)? {
-            Ok(blob_info.local_availability())
+            Ok(blob_info.cache_status())
         } else {
-            Ok(LocalAvailability::Missing)
+            Ok(CacheStatus::Missing)
         }
     }
 }
@@ -699,7 +699,7 @@ impl<'a> WritableOpenBlob<'a> {
     /// If the blob exists and has the same hash as was given, update
     /// the blob and return true, otherwise do nothing and return
     /// false.
-    pub(crate) fn extend_local_availability<'b, L: Into<TreeLoc<'b>>>(
+    pub(crate) fn extend_cache_status<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &impl TreeReadOperations,
         loc: L,
@@ -1206,8 +1206,8 @@ impl Blob {
     ///
     /// This is based on the [Blob::available_range] so might return a
     /// different result than if you checked the database.
-    pub fn local_availability(&self) -> LocalAvailability {
-        self.info.local_availability()
+    pub fn cache_status(&self) -> CacheStatus {
+        self.info.cache_status()
     }
 
     /// Cache data from a remote peer locally, into the blob file.
@@ -1239,7 +1239,7 @@ impl Blob {
     ///
     /// Returns None if the data isn't available from
     /// any remote peers. The returned [FileAvailability] is guaranteed to have at least one peer.
-    pub async fn remote_availability(&self) -> Result<Option<FileAvailability>, StorageError> {
+    pub async fn remote_availability(&self) -> Result<Option<RemoteAvailability>, StorageError> {
         let db = Arc::clone(&self.db);
         let pathid = self.info.pathid;
         let hash = self.info.hash.clone();
@@ -1248,7 +1248,7 @@ impl Blob {
             let txn = db.begin_read()?;
 
             txn.read_cache()?
-                .file_availability(&txn.read_tree()?, pathid, &hash)
+                .remote_availability(&txn.read_tree()?, pathid, &hash)
         })
         .await?
     }
@@ -1331,12 +1331,7 @@ impl Blob {
                 let txn = db.begin_write()?;
                 {
                     let mut blobs = txn.write_blobs()?;
-                    if !blobs.extend_local_availability(
-                        &mut txn.read_tree()?,
-                        pathid,
-                        &hash,
-                        &ranges,
-                    )? {
+                    if !blobs.extend_cache_status(&mut txn.read_tree()?, pathid, &hash, &ranges)? {
                         // The blob has changed in the database
                         return Ok(false);
                     }
@@ -1640,7 +1635,7 @@ mod tests {
                 if partial > 0 {
                     let blob_path = self.blob_path(info.pathid);
                     std::fs::write(&blob_path, &test_data[0..partial])?;
-                    blobs.extend_local_availability(
+                    blobs.extend_cache_status(
                         &tree,
                         info.pathid,
                         &hash,
@@ -1898,7 +1893,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writing_to_blob_updates_local_availability() -> anyhow::Result<()> {
+    async fn writing_to_blob_updates_cache_status() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let path = Path::parse("baa/baa")?;
         fixture.create_blob_with_partial_data(&path, "Baa, baa, black sheep", 0)?;
@@ -2800,7 +2795,7 @@ mod tests {
     }
 
     #[test]
-    fn local_availability_missing_when_no_blob() -> anyhow::Result<()> {
+    fn cache_status_missing_when_no_blob() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let txn = fixture.begin_write()?;
         let blobs = txn.write_blobs()?;
@@ -2808,18 +2803,18 @@ mod tests {
 
         // Test with a path that doesn't exist in the tree
         let path = Path::parse("nonexistent.txt")?;
-        let availability = blobs.local_availability(&tree, &path)?;
-        assert_eq!(availability, LocalAvailability::Missing);
+        let availability = blobs.cache_status(&tree, &path)?;
+        assert_eq!(availability, CacheStatus::Missing);
 
         // Test with an pathid that doesn't exist
-        let availability = blobs.local_availability(&tree, PathId(99999))?;
-        assert_eq!(availability, LocalAvailability::Missing);
+        let availability = blobs.cache_status(&tree, PathId(99999))?;
+        assert_eq!(availability, CacheStatus::Missing);
 
         Ok(())
     }
 
     #[test]
-    fn local_availability_missing_when_blob_empty() -> anyhow::Result<()> {
+    fn cache_status_missing_when_blob_empty() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let txn = fixture.begin_write()?;
         let mut blobs = txn.write_blobs()?;
@@ -2835,14 +2830,14 @@ mod tests {
         assert!(blob_info.available_ranges.is_empty());
 
         // Test local availability - should be Missing for empty blob
-        let availability = blobs.local_availability(&tree, &path)?;
-        assert_eq!(availability, LocalAvailability::Missing);
+        let availability = blobs.cache_status(&tree, &path)?;
+        assert_eq!(availability, CacheStatus::Missing);
 
         Ok(())
     }
 
     #[test]
-    fn local_availability_partial_when_blob_incomplete() -> anyhow::Result<()> {
+    fn cache_status_partial_when_blob_incomplete() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let txn = fixture.begin_write()?;
         let mut blobs = txn.write_blobs()?;
@@ -2857,15 +2852,12 @@ mod tests {
         // Extend with partial ranges
         let partial_ranges =
             ByteRanges::from_ranges(vec![ByteRange::new(0, 100), ByteRange::new(200, 300)]);
-        blobs.extend_local_availability(&tree, &path, &hash, &partial_ranges)?;
+        blobs.extend_cache_status(&tree, &path, &hash, &partial_ranges)?;
 
         // Test local availability - should be Partial
-        let availability = blobs.local_availability(&tree, &path)?;
+        let availability = blobs.cache_status(&tree, &path)?;
         match availability {
-            LocalAvailability::Partial(size, ranges) => {
-                assert_eq!(size, 1000);
-                assert_eq!(ranges, partial_ranges);
-            }
+            CacheStatus::Partial => {}
             _ => panic!("Expected Partial availability, got {:?}", availability),
         }
 
@@ -2873,7 +2865,7 @@ mod tests {
     }
 
     #[test]
-    fn local_availability_complete_when_blob_full_but_unverified() -> anyhow::Result<()> {
+    fn cache_status_complete_when_blob_full_but_unverified() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let txn = fixture.begin_write()?;
         let mut blobs = txn.write_blobs()?;
@@ -2887,17 +2879,17 @@ mod tests {
 
         // Extend with complete range (0 to size)
         let complete_range = ByteRanges::single(0, 500);
-        blobs.extend_local_availability(&tree, &path, &hash, &complete_range)?;
+        blobs.extend_cache_status(&tree, &path, &hash, &complete_range)?;
 
         // Test local availability - should be Complete (not verified)
-        let availability = blobs.local_availability(&tree, &path)?;
-        assert_eq!(availability, LocalAvailability::Complete);
+        let availability = blobs.cache_status(&tree, &path)?;
+        assert_eq!(availability, CacheStatus::Complete);
 
         Ok(())
     }
 
     #[test]
-    fn local_availability_verified_when_blob_full_and_verified() -> anyhow::Result<()> {
+    fn cache_status_verified_when_blob_full_and_verified() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let txn = fixture.begin_write()?;
         let mut blobs = txn.write_blobs()?;
@@ -2912,19 +2904,19 @@ mod tests {
 
         // Extend with complete range
         let complete_range = ByteRanges::single(0, 500);
-        blobs.extend_local_availability(&tree, &path, &hash, &complete_range)?;
+        blobs.extend_cache_status(&tree, &path, &hash, &complete_range)?;
 
         // Mark as verified
         blobs.mark_verified(&tree, &mut dirty, &path, &hash)?;
 
-        let availability = blobs.local_availability(&tree, &path)?;
-        assert_eq!(availability, LocalAvailability::Verified);
+        let availability = blobs.cache_status(&tree, &path)?;
+        assert_eq!(availability, CacheStatus::Verified);
 
         Ok(())
     }
 
     #[test]
-    fn local_availability_handles_zero_size_file() -> anyhow::Result<()> {
+    fn cache_status_handles_zero_size_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let txn = fixture.begin_write()?;
         let mut blobs = txn.write_blobs()?;
@@ -2935,22 +2927,22 @@ mod tests {
         let hash = test_hash();
         blobs.create(&mut tree, &marks, &path, &hash, 0)?;
 
-        let availability = blobs.local_availability(&tree, &path)?;
-        assert_eq!(availability, LocalAvailability::Complete);
+        let availability = blobs.cache_status(&tree, &path)?;
+        assert_eq!(availability, CacheStatus::Complete);
 
         Ok(())
     }
 
     #[test]
-    fn local_availability_handles_nonexistent_pathid() -> anyhow::Result<()> {
+    fn cache_status_handles_nonexistent_pathid() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let txn = fixture.begin_write()?;
         let blobs = txn.write_blobs()?;
         let tree = txn.read_tree()?;
 
         // Test with a non-existent pathid
-        let availability = blobs.local_availability(&tree, PathId(99999))?;
-        assert_eq!(availability, LocalAvailability::Missing);
+        let availability = blobs.cache_status(&tree, PathId(99999))?;
+        assert_eq!(availability, CacheStatus::Missing);
 
         Ok(())
     }
