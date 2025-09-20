@@ -60,6 +60,9 @@ pub enum StorageError {
 
     #[error("directory not empty")]
     DirectoryNotEmpty,
+
+    #[error("data not available from any peers")]
+    NoPeers,
 }
 
 impl StorageError {
@@ -102,6 +105,7 @@ impl StorageError {
             StorageError::CrossesDevices => CrossesDevices,
             StorageError::AlreadyExists => AlreadyExists,
             StorageError::DirectoryNotEmpty => DirectoryNotEmpty,
+            StorageError::NoPeers => InvalidData,
         }
     }
 

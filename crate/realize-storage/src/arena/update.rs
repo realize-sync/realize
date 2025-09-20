@@ -113,6 +113,7 @@ pub(crate) fn apply(
                 if index::rename(
                     &mut cache,
                     &mut tree,
+                    &mut blobs,
                     &mut history,
                     &mut dirty,
                     &source,

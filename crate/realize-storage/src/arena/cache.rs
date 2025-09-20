@@ -384,6 +384,9 @@ impl<'a> WritableOpenCache<'a> {
         let mut tree = txn.write_tree()?;
         let pathid = tree.expect(loc)?;
         let file_entry = default_file_entry_or_err(&self.table, pathid)?;
+        if file_entry.local {
+            todo!();
+        }
         let mut blobs = txn.write_blobs()?;
 
         let marks = txn.read_marks()?;
@@ -403,6 +406,9 @@ impl<'a> WritableOpenCache<'a> {
     ) -> Result<(), StorageError> {
         let pathid = tree.expect(loc)?;
         let e = default_file_entry_or_err(&self.table, pathid)?;
+        if e.local {
+            todo!();
+        }
         log::debug!(
             "[{}]@local Local removal of \"{}\" pathid {pathid} {}",
             self.arena,
@@ -453,10 +459,19 @@ impl<'a> WritableOpenCache<'a> {
                 )?;
             }
             CacheTableEntry::File(mut entry) => {
+                if entry.local {
+                    todo!();
+                }
                 dest_pathid = tree.setup(dest.borrow())?;
                 let old_hash = match default_entry(&self.table, dest_pathid)? {
                     None => None,
-                    Some(CacheTableEntry::File(entry)) => Some(entry.hash),
+                    Some(CacheTableEntry::File(entry)) => {
+                        if entry.local {
+                            todo!();
+                        }
+
+                        Some(entry.hash)
+                    }
                     Some(CacheTableEntry::Dir(_)) => return Err(StorageError::IsADirectory),
                 };
                 if old_hash.is_some() && noreplace {
@@ -525,6 +540,10 @@ impl<'a> WritableOpenCache<'a> {
                     )?;
                 }
                 Some(CacheTableEntry::File(mut file_entry)) => {
+                    if file_entry.local {
+                        todo!();
+                    }
+
                     let dest_entry = tree.setup((dest_dir, name))?;
                     file_entry.branched_from = Some(source_entry);
                     self.write_default_file_entry(tree, blobs, dirty, dest_entry, &file_entry)?;
@@ -556,8 +575,17 @@ impl<'a> WritableOpenCache<'a> {
         let dest = dest.into();
         let source_pathid = tree.expect(source.borrow())?;
         let mut entry = self.file_at_pathid_or_err(source_pathid)?;
+        if entry.local {
+            todo!();
+        }
+
         entry.branched_from = Some(source_pathid);
         let dest_pathid = tree.setup(dest.borrow())?;
+        if let Some(dest_entry) = self.file_at_pathid(dest_pathid)?
+            && dest_entry.local
+        {
+            todo!();
+        }
         let old_hash = self.file_at_pathid(dest_pathid)?.map(|e| e.hash);
         check_parent_is_dir(&self.table, tree, dest_pathid)?;
         self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &entry)?;
@@ -902,7 +930,7 @@ impl<'a> WritableOpenCache<'a> {
         for pathid in pathids {
             self.rm_peer_file_entry(tree, pathid, peer)?;
             if let Some(entry) = self.file_at_pathid(pathid)? {
-                if self.file_availability(tree, pathid, &entry.hash)?.is_none() {
+                if !entry.local && self.file_availability(tree, pathid, &entry.hash)?.is_none() {
                     // If the file has become unavailable because of
                     // this removal, remove the file itself as well.
                     self.rm_default_file_entry(tree, blobs, dirty, pathid)?;
@@ -915,6 +943,7 @@ impl<'a> WritableOpenCache<'a> {
     pub(crate) fn index<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
         history: &mut WritableOpenHistory,
         dirty: &mut WritableOpenDirty,
         loc: L,
@@ -929,18 +958,15 @@ impl<'a> WritableOpenCache<'a> {
             return Ok(pathid);
         }
         if let Some(path) = tree.backtrack(loc.borrow())? {
-            self.write_index_entry(
-                tree,
-                pathid,
-                &IndexedFile {
-                    hash,
-                    mtime,
-                    size,
-                    outdated_by: None,
-                }
-                .into_file(path.clone()),
-            )?;
-            dirty.mark_dirty(pathid, "indexed")?;
+            let entry = IndexedFile {
+                hash,
+                mtime,
+                size,
+                outdated_by: None,
+            }
+            .into_file(path.clone());
+            self.write_index_entry(tree, pathid, &entry)?;
+            self.write_default_file_entry(tree, blobs, dirty, pathid, &entry)?;
             history.report_added(&path, old_hash.as_ref())?;
         }
         Ok(pathid)
@@ -1022,6 +1048,15 @@ impl<'a> WritableOpenCache<'a> {
                 tree.arena(),
                 cached.hash
             );
+
+            // The default entry doesn't reference the local entry
+            // anymore, but rather an entry from cache. Caller should
+            // have made sure it exists.
+            let (_, peer_entry) = find_peer_entry(&self.table, pathid, &indexed.hash)?
+                .next()
+                .ok_or(StorageError::NoPeers)??;
+            self.write_default_file_entry(tree, blobs, dirty, pathid, &peer_entry)?;
+
             let dest = blobs.import(tree, marks, pathid, &indexed.hash, &metadata)?;
 
             return Ok((source, Some(dest)));
@@ -1042,6 +1077,7 @@ impl<'a> WritableOpenCache<'a> {
     pub(crate) fn remove_from_index<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
         history: &mut WritableOpenHistory,
         dirty: &mut WritableOpenDirty,
         loc: L,
@@ -1053,7 +1089,14 @@ impl<'a> WritableOpenCache<'a> {
                     history.report_removed(&path, &old_hash)?;
                 }
                 self.rm_index_entry(tree, pathid)?;
-                dirty.mark_dirty(pathid, "removed_from_index")?;
+                if default_file_entry(&self.table, pathid)?
+                    .map(|e| e.hash == old_hash)
+                    .unwrap_or(false)
+                {
+                    self.rm_default_file_entry(tree, blobs, dirty, pathid)?;
+                } else {
+                    dirty.mark_dirty(pathid, "removed_from_index")?;
+                }
                 return Ok(true);
             }
         }
@@ -1069,6 +1112,7 @@ impl<'a> WritableOpenCache<'a> {
     pub(crate) fn remove_from_index_recursively<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
         history: &mut WritableOpenHistory,
         dirty: &mut WritableOpenDirty,
         loc: L,
@@ -1077,13 +1121,13 @@ impl<'a> WritableOpenCache<'a> {
             Some(p) => p,
             None => return Ok(()),
         };
-        if self.remove_from_index(tree, history, dirty, pathid)? {
+        if self.remove_from_index(tree, blobs, history, dirty, pathid)? {
             log::debug!("removed {pathid:?}");
         }
         let children = tree.readdir_pathid(pathid).collect::<Result<Vec<_>, _>>()?;
         log::debug!("children: {children:?}");
         for (_, pathid) in children.into_iter() {
-            self.remove_from_index_recursively(tree, history, dirty, pathid)?;
+            self.remove_from_index_recursively(tree, blobs, history, dirty, pathid)?;
         }
         Ok(())
     }
@@ -1243,38 +1287,19 @@ fn file_availability<'b, L: Into<TreeLoc<'b>>>(
         && !visited.contains(&pathid)
     {
         visited.insert(pathid); // avoid loops
-        next = None;
-        // Range over all entries for this pathid
-        for entry in
-            cache_table.range((pathid, Layer::Default)..(pathid.plus(1), Layer::Default))?
-        {
-            let entry = entry?;
-            let (path_id, layer) = entry.0.value();
-            if path_id != pathid {
-                break; // Out of range
-            }
-            match layer {
-                Layer::Remote(peer) => {
-                    let file_entry: FileTableEntry = entry.1.value().parse()?.expect_file()?;
-                    if file_entry.hash == *hash {
-                        avail
-                            .get_or_insert_with(|| FileAvailability {
-                                arena,
-                                path: file_entry.path,
-                                size: file_entry.size,
-                                hash: file_entry.hash,
-                                peers: vec![],
-                            })
-                            .peers
-                            .push(peer);
-                    }
-                }
-                Layer::Default => {
-                    let file_entry: FileTableEntry = entry.1.value().parse()?.expect_file()?;
-                    next = file_entry.branched_from;
-                }
-                Layer::Index => {}
-            }
+        next = default_file_entry_or_err(cache_table, pathid)?.branched_from;
+        for entry in find_peer_entry(cache_table, pathid, hash)? {
+            let (peer, file_entry) = entry?;
+            avail
+                .get_or_insert_with(|| FileAvailability {
+                    arena,
+                    path: file_entry.path,
+                    size: file_entry.size,
+                    hash: file_entry.hash,
+                    peers: vec![],
+                })
+                .peers
+                .push(peer);
         }
     }
     if avail.is_none() {
@@ -1282,6 +1307,28 @@ fn file_availability<'b, L: Into<TreeLoc<'b>>>(
     }
 
     Ok(avail)
+}
+
+fn find_peer_entry(
+    cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
+    pathid: PathId,
+    hash: &Hash,
+) -> Result<impl Iterator<Item = Result<(Peer, FileTableEntry), StorageError>>, StorageError> {
+    Ok(cache_table
+        .range((pathid, Layer::Remote(Peer::from("")))..(pathid.plus(1), Layer::Default))?
+        .map(|entry| {
+            let (k, v) = entry?;
+            let (_, layer) = k.value();
+            let peer = layer.peer().unwrap(); // range should guarantee it
+            let entry = v.value().parse()?.expect_file()?;
+            Ok::<(Peer, FileTableEntry), StorageError>((peer, entry))
+        })
+        .filter(|e| {
+            e.as_ref()
+                .ok()
+                .map(|(_, e)| e.hash == *hash)
+                .unwrap_or(false)
+        }))
 }
 
 struct ReadDirIterator<'a, 'b, T> {
@@ -3095,6 +3142,7 @@ mod tests {
             {
                 let mut cache = txn.write_cache()?;
                 let mut tree = txn.write_tree()?;
+                let mut blobs = txn.write_blobs()?;
                 let mut dirty = txn.write_dirty()?;
                 let mut history = txn.write_history()?;
 
@@ -3105,6 +3153,7 @@ mod tests {
                 ] {
                     cache.index(
                         &mut tree,
+                        &mut blobs,
                         &mut history,
                         &mut dirty,
                         path,
@@ -4156,10 +4205,12 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
         let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
         cache.index(
             &mut tree,
+            &mut blobs,
             &mut history,
             &mut dirty,
             &path,
@@ -4187,10 +4238,12 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
         let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
         cache.index(
             &mut tree,
+            &mut blobs,
             &mut history,
             &mut dirty,
             &path,
@@ -4200,6 +4253,7 @@ mod tests {
         )?;
         cache.index(
             &mut tree,
+            &mut blobs,
             &mut history,
             &mut dirty,
             &path,
@@ -4227,10 +4281,12 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
         let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
         cache.index(
             &mut tree,
+            &mut blobs,
             &mut history,
             &mut dirty,
             &path,
@@ -4255,10 +4311,12 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
         let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
         cache.index(
             &mut tree,
+            &mut blobs,
             &mut history,
             &mut dirty,
             &path,
@@ -4284,11 +4342,13 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
         let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
 
         cache.index(
             &mut tree,
+            &mut blobs,
             &mut history,
             &mut dirty,
             &path,
@@ -4297,7 +4357,13 @@ mod tests {
             Hash([0xfa; 32]),
         )?;
 
-        cache.remove_from_index_recursively(&mut tree, &mut history, &mut dirty, &path)?;
+        cache.remove_from_index_recursively(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &path,
+        )?;
 
         assert!(!cache.is_indexed(&tree, &path)?);
 
@@ -4312,11 +4378,13 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
         let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
 
         cache.index(
             &mut tree,
+            &mut blobs,
             &mut history,
             &mut dirty,
             Path::parse("foo/bar1.txt")?,
@@ -4326,6 +4394,7 @@ mod tests {
         )?;
         cache.index(
             &mut tree,
+            &mut blobs,
             &mut history,
             &mut dirty,
             Path::parse("foo/bar2.txt")?,
@@ -4336,6 +4405,7 @@ mod tests {
 
         cache.remove_from_index_recursively(
             &mut tree,
+            &mut blobs,
             &mut history,
             &mut dirty,
             Path::parse("foo")?,
@@ -4357,6 +4427,7 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
         let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
 
@@ -4366,6 +4437,7 @@ mod tests {
         // Add a file
         cache.index(
             &mut tree,
+            &mut blobs,
             &mut history,
             &mut dirty,
             &path,
@@ -4405,6 +4477,7 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
         let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
 
@@ -4414,6 +4487,7 @@ mod tests {
         // Add initial file
         cache.index(
             &mut tree,
+            &mut blobs,
             &mut history,
             &mut dirty,
             &path,
@@ -4428,6 +4502,7 @@ mod tests {
         // Replace the file
         cache.index(
             &mut tree,
+            &mut blobs,
             &mut history,
             &mut dirty,
             &path,
@@ -4474,12 +4549,14 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
         let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
 
         // Add a file first
         let pathid = cache.index(
             &mut tree,
+            &mut blobs,
             &mut history,
             &mut dirty,
             &path,
@@ -4492,7 +4569,8 @@ mod tests {
         dirty.delete_range(0, 999)?;
 
         // Remove the file
-        let removed = cache.remove_from_index(&mut tree, &mut history, &mut dirty, &path)?;
+        let removed =
+            cache.remove_from_index(&mut tree, &mut blobs, &mut history, &mut dirty, &path)?;
         assert!(removed);
 
         // Verify the file was removed from the index
@@ -4529,6 +4607,7 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
         let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
 
@@ -4540,6 +4619,7 @@ mod tests {
 
         let pathid1 = cache.index(
             &mut tree,
+            &mut blobs,
             &mut history,
             &mut dirty,
             &path1,
@@ -4549,6 +4629,7 @@ mod tests {
         )?;
         let pathid2 = cache.index(
             &mut tree,
+            &mut blobs,
             &mut history,
             &mut dirty,
             &path2,
@@ -4563,6 +4644,7 @@ mod tests {
         // Remove the directory
         cache.remove_from_index_recursively(
             &mut tree,
+            &mut blobs,
             &mut history,
             &mut dirty,
             Path::parse("foo")?,
@@ -4601,12 +4683,14 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
         let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
 
         // Add a file with the old hash
         cache.index(
             &mut tree,
+            &mut blobs,
             &mut history,
             &mut dirty,
             &path,
@@ -4638,12 +4722,14 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
         let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
 
         // Add a file with file_hash
         cache.index(
             &mut tree,
+            &mut blobs,
             &mut history,
             &mut dirty,
             &path,

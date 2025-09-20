@@ -113,9 +113,6 @@ impl StorageJobProcessor {
             if indexed.hash != hash {
                 return Ok(JobStatus::Abandoned("indexed_version_mismatch"));
             }
-            if cache.file_entry(&tree, pathid)?.is_none() {
-                return Ok(JobStatus::Abandoned("not_in_cache"));
-            }
             let mut blobs = txn.write_blobs()?;
             let mut history = txn.write_history()?;
             let mut dirty = txn.write_dirty()?;
@@ -134,6 +131,9 @@ impl StorageJobProcessor {
                 }
                 Err(StorageError::DatabaseOutdated(_)) => {
                     return Ok(JobStatus::Abandoned("file_version_mismatch"));
+                }
+                Err(StorageError::NoPeers) => {
+                    return Ok(JobStatus::Abandoned("not_in_cache"));
                 }
                 Err(err) => return Err(err),
             }

@@ -76,6 +76,16 @@ pub enum Layer {
     Remote(Peer),
 }
 
+impl Layer {
+    pub fn peer(&self) -> Option<Peer> {
+        match self {
+            Layer::Default => None,
+            Layer::Index => None,
+            Layer::Remote(peer) => Some(*peer),
+        }
+    }
+}
+
 impl Value for Layer {
     type SelfType<'a> = Layer;
 

@@ -6,6 +6,7 @@ use super::history::{HistoryReadOperations, WritableOpenHistory};
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
 use super::types::{HistoryTableEntry, IndexedFile};
 use crate::StorageError;
+use crate::arena::blob::WritableOpenBlob;
 use crate::arena::cache::{CacheExt, CacheReadOperations, WritableOpenCache};
 use crate::utils::fs_utils;
 use realize_types::{self, Hash, UnixTime};
@@ -105,6 +106,7 @@ pub(crate) fn branch<'b, L1: Into<TreeLoc<'b>>, L2: Into<TreeLoc<'b>>>(
 pub(crate) fn rename<'b, 'c, L1: Into<TreeLoc<'b>>, L2: Into<TreeLoc<'c>>>(
     cache: &mut WritableOpenCache,
     tree: &mut WritableOpenTree,
+    blobs: &mut WritableOpenBlob,
     history: &mut WritableOpenHistory,
     dirty: &mut WritableOpenDirty,
     source: L1,
@@ -133,6 +135,7 @@ pub(crate) fn rename<'b, 'c, L1: Into<TreeLoc<'b>>, L2: Into<TreeLoc<'c>>>(
             // peers during the transition.
             cache.index(
                 tree,
+                blobs,
                 history,
                 dirty,
                 dest,
@@ -140,7 +143,7 @@ pub(crate) fn rename<'b, 'c, L1: Into<TreeLoc<'b>>, L2: Into<TreeLoc<'c>>>(
                 indexed.mtime,
                 hash.clone(),
             )?;
-            cache.remove_from_index(tree, history, dirty, source)?;
+            cache.remove_from_index(tree, blobs, history, dirty, source)?;
             std::fs::rename(source_realpath, dest_realpath)?;
             return Ok(true);
         }
@@ -253,9 +256,19 @@ pub(crate) fn add_file(
         let mut cache = txn.write_cache()?;
         let mut tree = txn.write_tree()?;
         let mut dirty = txn.write_dirty()?;
+        let mut blobs = txn.write_blobs()?;
         let mut history = txn.write_history()?;
 
-        cache.index(&mut tree, &mut history, &mut dirty, path, size, mtime, hash)?;
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            path,
+            size,
+            mtime,
+            hash,
+        )?;
     }
 
     txn.commit()?;
@@ -293,9 +306,19 @@ pub(crate) fn add_file_if_matches(
         {
             let mut cache = txn.write_cache()?;
             let mut tree = txn.write_tree()?;
+            let mut blobs = txn.write_blobs()?;
             let mut dirty = txn.write_dirty()?;
             let mut history = txn.write_history()?;
-            cache.index(&mut tree, &mut history, &mut dirty, path, size, mtime, hash)?;
+            cache.index(
+                &mut tree,
+                &mut blobs,
+                &mut history,
+                &mut dirty,
+                path,
+                size,
+                mtime,
+                hash,
+            )?;
         }
         txn.commit()?;
 
@@ -328,10 +351,11 @@ pub(crate) fn remove_file_if_missing(
     if fs_utils::metadata_no_symlink_blocking(db.index().datadir(), path).is_err() {
         {
             let mut tree = txn.write_tree()?;
+            let mut blobs = txn.write_blobs()?;
             let mut cache = txn.write_cache()?;
             let mut dirty = txn.write_dirty()?;
             let mut history = txn.write_history()?;
-            cache.remove_from_index(&mut tree, &mut history, &mut dirty, path)?;
+            cache.remove_from_index(&mut tree, &mut blobs, &mut history, &mut dirty, path)?;
         }
         txn.commit()?;
         return Ok(true);
@@ -390,10 +414,17 @@ pub(crate) fn remove_file_or_dir(
     let txn = db.begin_write()?;
     {
         let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
         let mut cache = txn.write_cache()?;
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
-        cache.remove_from_index_recursively(&mut tree, &mut history, &mut dirty, path)?;
+        cache.remove_from_index_recursively(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            path,
+        )?;
     }
     txn.commit()?;
 
@@ -1040,12 +1071,14 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
         let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
 
         let result = super::rename(
             &mut cache,
             &mut tree,
+            &mut blobs,
             &mut history,
             &mut dirty,
             &source_index_path,
@@ -1102,6 +1135,7 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
         let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
         let mut history = txn.write_history()?;
         let mut dirty = txn.write_dirty()?;
 
@@ -1110,6 +1144,7 @@ mod tests {
         let result = super::rename(
             &mut cache,
             &mut tree,
+            &mut blobs,
             &mut history,
             &mut dirty,
             &source_index_path,
@@ -1124,6 +1159,7 @@ mod tests {
         let result = super::rename(
             &mut cache,
             &mut tree,
+            &mut blobs,
             &mut history,
             &mut dirty,
             &source_index_path,
@@ -1142,6 +1178,7 @@ mod tests {
         let result = super::rename(
             &mut cache,
             &mut tree,
+            &mut blobs,
             &mut history,
             &mut dirty,
             &nonexistent_path,
