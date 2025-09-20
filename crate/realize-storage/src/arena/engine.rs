@@ -869,7 +869,7 @@ mod tests {
         mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         {
-            let mut blob = fixture.acache.open_file(&barfile)?;
+            let mut blob = fixture.acache.file_content(&barfile)?.blob().unwrap();
             blob.update(0, b"te").await?;
             blob.update_db().await?;
         }
@@ -898,7 +898,7 @@ mod tests {
         mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         {
-            let mut blob = fixture.acache.open_file(&barfile)?;
+            let mut blob = fixture.acache.file_content(&barfile)?.blob().unwrap();
             blob.update(0, b"test").await?;
             blob.update_db().await?;
         }
@@ -928,7 +928,7 @@ mod tests {
         mark::set_arena_mark(&fixture.db, Mark::Keep)?;
         fixture.add_file_to_cache(&barfile)?;
         {
-            let mut blob = fixture.acache.open_file(&barfile)?;
+            let mut blob = fixture.acache.file_content(&barfile)?.blob().unwrap();
             blob.update(0, b"test").await?;
             blob.mark_verified().await?;
         }
@@ -1004,7 +1004,7 @@ mod tests {
             job,
         );
         {
-            let mut blob = fixture.acache.open_file(&foobar)?;
+            let mut blob = fixture.acache.file_content(&foobar)?.blob().unwrap();
             blob.update(0, b"test").await?;
             blob.mark_verified().await?;
         }
@@ -1031,7 +1031,7 @@ mod tests {
 
         fixture.add_file_to_cache(&foobar)?;
         {
-            let mut blob = fixture.acache.open_file(&foobar)?;
+            let mut blob = fixture.acache.file_content(&foobar)?.blob().unwrap();
             blob.update(0, b"te").await?;
         }
         // blob is partially available, but unprotected, going from
@@ -1094,7 +1094,7 @@ mod tests {
         fixture.add_file_to_index_with_version(&foobar, test_hash())?;
         fixture.add_file_to_cache_with_version(&foobar, test_hash())?;
         {
-            let mut blob = fixture.acache.open_file(&foobar)?;
+            let mut blob = fixture.acache.file_content(&foobar)?.blob().unwrap();
             blob.update(0, b"te").await?;
         }
 
@@ -1169,7 +1169,7 @@ mod tests {
         mark::set_arena_mark(&fixture.db, Mark::Own)?;
         fixture.add_file_to_cache(&foobar)?;
         {
-            let mut blob = fixture.acache.open_file(&foobar)?;
+            let mut blob = fixture.acache.file_content(&foobar)?.blob().unwrap();
             blob.update(0, b"test").await?;
             blob.mark_verified().await?;
         }
@@ -1230,7 +1230,7 @@ mod tests {
         fixture.add_file_to_index_with_version(&foobar, Hash([1; 32]))?;
         fixture.replace(&foobar, Hash([2; 32]), Hash([1; 32]))?;
         {
-            let mut blob = fixture.acache.open_file(&foobar)?;
+            let mut blob = fixture.acache.file_content(&foobar)?.blob().unwrap();
             blob.update(0, b"test").await?;
             blob.mark_verified().await?;
         }

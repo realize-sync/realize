@@ -32,7 +32,7 @@ pub use arena::types::{
     CacheStatus, DirMetadata, FileMetadata, FileRealm, Mark, Metadata, RemoteAvailability,
 };
 pub use error::StorageError;
-pub use global::fs::{Filesystem, FsLoc};
+pub use global::fs::{FileContent, Filesystem, FsLoc};
 pub use types::{Inode, JobId, PathId};
 
 /// Local storage, including the real store and an unreal cache.

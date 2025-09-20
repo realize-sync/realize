@@ -10,8 +10,37 @@ use crate::{Blob, FileMetadata, Inode, PathId, StorageError};
 use realize_types::{Arena, Path, Peer, UnixTime};
 use redb::ReadableTable;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::task;
+
+/// File content, returned by [FileSystem::file_content].
+///
+/// The content that's returned is different depending on whether the
+/// file is local or remote.
+///
+/// You may with [Filesystem::file_realm] first to know whether the file is
+/// local or remote.
+pub enum FileContent {
+    Local(PathBuf),
+    Remote(Blob),
+}
+
+impl FileContent {
+    pub fn path(self) -> Option<PathBuf> {
+        match self {
+            FileContent::Local(path) => Some(path),
+            _ => None,
+        }
+    }
+
+    pub fn blob(self) -> Option<Blob> {
+        match self {
+            FileContent::Remote(blob) => Some(blob),
+            _ => None,
+        }
+    }
+}
 
 /// A view on remote and local files.
 pub struct Filesystem {
@@ -383,20 +412,27 @@ impl Filesystem {
         .await?
     }
 
-    /// Open a file for reading/writing, creating a new blob entry.
+    /// Get hold of the file content.
     ///
-    /// The returned [Blob] is available for reading. However, reading outside
-    /// the range of data that is locally available causes [crate::BlobIncomplete] error.
+    /// For local files, this returns the path of the local file that can then be accessed normally.
     ///
-    /// This is usually used through the `Downloader`, which can
+    /// For remote files, this returns a [Blob]. The returned Blob is
+    /// available for reading. However, reading outside the range of
+    /// data that is locally available causes [crate::BlobIncomplete]
+    /// error.
+    ///
+    /// Blobs are usually used through the `Downloader`, which can
     /// download incomplete portions of the file.
-    pub async fn open_file<L: Into<FsLoc>>(self: &Arc<Self>, loc: L) -> Result<Blob, StorageError> {
+    pub async fn file_content<L: Into<FsLoc>>(
+        self: &Arc<Self>,
+        loc: L,
+    ) -> Result<FileContent, StorageError> {
         let loc = loc.into();
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
             let (fs, loc) = this.resolve_arena_loc(loc)?;
-            fs.open_file(loc)
+            fs.file_content(loc)
         })
         .await?
     }

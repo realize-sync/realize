@@ -234,8 +234,10 @@ impl HouseholdFixture {
     pub async fn open_file(&self, peer: Peer, path_str: &str) -> anyhow::Result<Blob> {
         let cache = self.cache(peer)?;
         Ok(cache
-            .open_file((HouseholdFixture::test_arena(), &Path::parse(path_str)?))
-            .await?)
+            .file_content((HouseholdFixture::test_arena(), &Path::parse(path_str)?))
+            .await?
+            .blob()
+            .ok_or_else(|| anyhow::anyhow!("expected {path_str} on {peer} to be a remote file"))?)
     }
 
     // Pick a port for the given peer and store it in the network

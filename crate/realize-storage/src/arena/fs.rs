@@ -7,6 +7,7 @@ use super::types::FileMetadata;
 use super::update;
 use crate::arena::notifier::{Notification, Progress};
 use crate::arena::types::DirMetadata;
+use crate::global::fs::FileContent;
 use crate::types::Inode;
 use crate::{Blob, FileRealm};
 use crate::{PathId, StorageError};
@@ -232,18 +233,27 @@ impl ArenaFilesystem {
     }
 
     /// Open a file for reading/writing.
-    pub(crate) fn open_file(&self, loc: impl Into<ArenaFsLoc>) -> Result<Blob, StorageError> {
-        // Optimistically, try a read transaction to check whether the
-        // blob is there. The pathid is kept across transactions,
-        // because it is guaranteed to be stable.
+    pub(crate) fn file_content(
+        &self,
+        loc: impl Into<ArenaFsLoc>,
+    ) -> Result<FileContent, StorageError> {
+        // Optimistically start with a read transaction, which may
+        // need to be upgraded to a write transaction if a blob need
+        // to be created.
         let pathid;
         {
             let txn = self.db.begin_read()?;
             let tree = txn.read_tree()?;
-            pathid = tree.expect(loc.into().into_tree_loc(&txn.read_cache()?)?)?;
+            let loc = loc.into().into_tree_loc(&txn.read_cache()?)?;
+            pathid = tree.expect(loc.borrow())?;
+            let cache = txn.read_cache()?;
+            if cache.file_entry_or_err(&tree, pathid)?.local {
+                let path = tree.backtrack(loc)?.ok_or(StorageError::IsADirectory)?;
+                return Ok(FileContent::Local(path.within(cache.datadir())));
+            }
             let blobs = txn.read_blobs()?;
             if let Some(info) = blobs.get_with_pathid(pathid)? {
-                return Blob::open_with_info(&self.db, info);
+                return Ok(FileContent::Remote(Blob::open_with_info(&self.db, info)?));
             }
         }
 
@@ -261,7 +271,7 @@ impl ArenaFilesystem {
         };
         txn.commit()?;
 
-        Ok(Blob::open_with_info(&self.db, info)?)
+        Ok(FileContent::Remote(Blob::open_with_info(&self.db, info)?))
     }
 
     /// Specifies the type of file (local or remote) and its cache status.

@@ -1,5 +1,5 @@
 use crate::rpc::{ExecutionMode, Household, HouseholdOperationError};
-use realize_storage::{Blob, CacheStatus, Filesystem, FsLoc, StorageError};
+use realize_storage::{Blob, CacheStatus, StorageError};
 use realize_types::{Arena, ByteRange, ByteRanges, Path, Peer};
 use std::cmp::min;
 use std::collections::VecDeque;
@@ -27,27 +27,22 @@ const UPDATE_DB_INTERVAL_BYTES: u64 = 4 * 1024 * 1024; // 4M
 #[derive(Clone)]
 pub struct Downloader {
     household: Arc<Household>,
-    cache: Arc<Filesystem>,
 }
 
 impl Downloader {
-    pub fn new(household: Arc<Household>, cache: Arc<Filesystem>) -> Self {
-        Self { household, cache }
+    pub fn new(household: Arc<Household>) -> Self {
+        Self { household }
     }
 
     // Make sure the blob contains a full copy of the remote data and
     // return it.
-    pub async fn complete_blob<L: Into<FsLoc>>(
-        &self,
-        loc: L,
-    ) -> Result<Blob, HouseholdOperationError> {
-        let mut blob = self.cache.open_file(loc).await?;
+    pub async fn complete_blob(&self, blob: &mut Blob) -> Result<(), HouseholdOperationError> {
         if matches!(
             blob.cache_status(),
             CacheStatus::Complete | CacheStatus::Verified,
         ) {
             // Nothing to do
-            return Ok(blob);
+            return Ok(());
         }
         let missing = ByteRanges::single(0, blob.size()).subtraction(blob.available_range());
         log::debug!("Blob incomplete; downloading {missing}");
@@ -81,15 +76,14 @@ impl Downloader {
         }
         blob.update_db().await?;
 
-        Ok(blob)
+        Ok(())
     }
 
-    pub async fn reader<L: Into<FsLoc>>(&self, loc: L) -> Result<Download, StorageError> {
-        let blob = self.cache.open_file(loc).await?;
+    pub async fn reader(&self, blob: Blob) -> Result<Download, StorageError> {
         let avail = blob
             .remote_availability()
             .await?
-            .ok_or(StorageError::NotFound)?;
+            .ok_or(StorageError::NoPeers)?;
 
         // TODO: check hash
         Ok(Download::new(
@@ -364,9 +358,32 @@ mod tests {
             path_str: &str,
         ) -> Result<Download, anyhow::Error> {
             let arena = HouseholdFixture::test_arena();
-            let path = Path::parse(path_str)?;
+            let blob = self
+                .inner
+                .cache(HouseholdFixture::a())?
+                .file_content((arena, &Path::parse(path_str)?))
+                .await?
+                .blob()
+                .ok_or(anyhow::anyhow!("{path_str} should be a remote file"))?;
+            Ok(downloader.reader(blob).await?)
+        }
 
-            Ok(downloader.reader((arena, &path)).await?)
+        async fn complete_blob(
+            &self,
+            downloader: &Downloader,
+            path_str: &str,
+        ) -> anyhow::Result<Blob> {
+            let arena = HouseholdFixture::test_arena();
+            let mut blob = self
+                .inner
+                .cache(HouseholdFixture::a())?
+                .file_content((arena, &Path::parse(path_str)?))
+                .await?
+                .blob()
+                .ok_or(anyhow::anyhow!("{path_str} should be a remote file"))?;
+            downloader.complete_blob(&mut blob).await?;
+
+            Ok(blob)
         }
 
         /// Create a file on peer B and wait for it to appear in peer A's cache
@@ -411,11 +428,7 @@ mod tests {
             content: &str,
         ) -> anyhow::Result<()> {
             self.create_file_on_peer_b(path_str, content).await?;
-
-            let arena = HouseholdFixture::test_arena();
-            let _complete_blob = downloader
-                .complete_blob((arena, &Path::parse(path_str)?))
-                .await?;
+            self.complete_blob(&downloader, path_str).await?;
 
             Ok(())
         }
@@ -459,10 +472,7 @@ mod tests {
             .await?
             .interconnected()
             .run(async |household_a, _household_b| {
-                let downloader = Downloader::new(
-                    household_a,
-                    fixture.inner.cache(HouseholdFixture::a())?.clone(),
-                );
+                let downloader = Downloader::new(household_a);
                 let mut reader = fixture
                     .download_file_from_b(&downloader, "test.txt", "File content")
                     .await?;
@@ -486,10 +496,7 @@ mod tests {
                 let b = HouseholdFixture::b();
                 testing::connect(&household_a, b).await?;
 
-                let downloader = Downloader::new(
-                    household_a.clone(),
-                    fixture.inner.cache(HouseholdFixture::a())?.clone(),
-                );
+                let downloader = Downloader::new(household_a.clone());
                 let mut reader = fixture
                     .download_file_from_b(&downloader, "test.txt", "File content")
                     .await?;
@@ -526,10 +533,7 @@ mod tests {
             .await?
             .interconnected()
             .run(async |household_a, _household_b| {
-                let downloader = Downloader::new(
-                    household_a,
-                    fixture.inner.cache(HouseholdFixture::a())?.clone(),
-                );
+                let downloader = Downloader::new(household_a);
                 let mut reader = fixture
                     .download_file_from_b(&downloader, "test.txt", "baa, baa, black sheep")
                     .await?;
@@ -554,10 +558,7 @@ mod tests {
             .await?
             .interconnected()
             .run(async |household_a, _household_b| {
-                let downloader = Downloader::new(
-                    household_a,
-                    fixture.inner.cache(HouseholdFixture::a())?.clone(),
-                );
+                let downloader = Downloader::new(household_a);
                 let mut reader = fixture
                     .download_file_from_b(&downloader, "test.txt", "baa, baa, black sheep")
                     .await?;
@@ -603,7 +604,7 @@ mod tests {
                     .wait_for_file_in_cache(a, "large_file", &hash::digest(&large_file_content))
                     .await?;
 
-                let downloader = Downloader::new(household_a, fixture.inner.cache(a)?.clone());
+                let downloader = Downloader::new(household_a);
 
                 let mut reader = fixture.reader(&downloader, "large_file").await?;
 
@@ -662,8 +663,7 @@ mod tests {
                     .wait_for_file_in_cache(a, "large_file", &hash::digest(&large_file_content))
                     .await?;
 
-                let downloader =
-                    Downloader::new(household_a.clone(), fixture.inner.cache(a)?.clone());
+                let downloader = Downloader::new(household_a.clone());
 
                 let mut reader = fixture.reader(&downloader, "large_file").await?;
 
@@ -713,8 +713,9 @@ mod tests {
 
     #[tokio::test]
     async fn read_large_file_small_buffer() -> anyhow::Result<()> {
-        let mut fixture = HouseholdFixture::setup().await?;
+        let mut fixture = Fixture::setup().await?;
         fixture
+            .inner
             .with_two_peers()
             .await?
             .interconnected()
@@ -729,8 +730,9 @@ mod tests {
 
     #[tokio::test]
     async fn read_large_file_unusual_buffer_size() -> anyhow::Result<()> {
-        let mut fixture = HouseholdFixture::setup().await?;
+        let mut fixture = Fixture::setup().await?;
         fixture
+            .inner
             .with_two_peers()
             .await?
             .interconnected()
@@ -745,8 +747,9 @@ mod tests {
 
     #[tokio::test]
     async fn read_large_file_large_buffer() -> anyhow::Result<()> {
-        let mut fixture = HouseholdFixture::setup().await?;
+        let mut fixture = Fixture::setup().await?;
         fixture
+            .inner
             .with_two_peers()
             .await?
             .interconnected()
@@ -761,8 +764,9 @@ mod tests {
 
     #[tokio::test]
     async fn read_large_file_overly_large_buffer() -> anyhow::Result<()> {
-        let mut fixture = HouseholdFixture::setup().await?;
+        let mut fixture = Fixture::setup().await?;
         fixture
+            .inner
             .with_two_peers()
             .await?
             .interconnected()
@@ -776,7 +780,7 @@ mod tests {
     }
 
     async fn test_read_file(
-        fixture: &HouseholdFixture,
+        fixture: &Fixture,
         household: Arc<Household>,
         file_size: usize,
         buf_size: usize,
@@ -784,7 +788,7 @@ mod tests {
         let a = HouseholdFixture::a();
         let b = HouseholdFixture::b();
 
-        let b_dir = fixture.arena_root(b);
+        let b_dir = fixture.inner.arena_root(b);
         let path = b_dir.join("large_file");
         let mut rng = SmallRng::seed_from_u64(1191);
         let mut file_content = vec![0; file_size];
@@ -792,17 +796,13 @@ mod tests {
         std::fs::write(&path, &mut file_content)?;
 
         fixture
+            .inner
             .wait_for_file_in_cache(a, "large_file", &hash::digest(&file_content))
             .await?;
 
-        let cache = fixture.cache(a)?;
-        let downloader = Downloader::new(household, Arc::clone(cache));
+        let downloader = Downloader::new(household);
 
-        let arena = HouseholdFixture::test_arena();
-        let mut reader = downloader
-            .reader((arena, &Path::parse("large_file")?))
-            .await?;
-
+        let mut reader = fixture.reader(&downloader, "large_file").await?;
         for i in 0..(file_size / buf_size) {
             let offset = i * buf_size;
             let mut buf = vec![].limit(buf_size);
@@ -845,12 +845,7 @@ mod tests {
             .await?
             .interconnected()
             .run(async |household_a, _household_b| {
-                let downloader = Downloader::new(
-                    household_a.clone(),
-                    fixture.inner.cache(HouseholdFixture::a())?.clone(),
-                );
-                let arena = HouseholdFixture::test_arena();
-
+                let downloader = Downloader::new(household_a.clone());
                 let missing_data = "This file was never downloaded";
 
                 // Create file that was never downloaded (Missing state)
@@ -859,9 +854,7 @@ mod tests {
                     .await?;
 
                 // Test: Complete a cached file that was never downloaded (Missing -> Complete)
-                let missing_blob = downloader
-                    .complete_blob((arena, &Path::parse("missing.txt")?))
-                    .await?;
+                let missing_blob = fixture.complete_blob(&downloader, "missing.txt").await?;
 
                 Fixture::verify_complete_blob(missing_blob, missing_data, "Missing file").await?;
 
@@ -881,12 +874,7 @@ mod tests {
             .await?
             .interconnected()
             .run(async |household_a, _household_b| {
-                let downloader = Downloader::new(
-                    household_a.clone(),
-                    fixture.inner.cache(HouseholdFixture::a())?.clone(),
-                );
-                let arena = HouseholdFixture::test_arena();
-
+                let downloader = Downloader::new(household_a.clone());
                 let partial_data =
                     "This file will be partially downloaded to test resuming downloads";
 
@@ -901,9 +889,7 @@ mod tests {
                     .await?;
 
                 // Test: Complete a cached file that was partially downloaded (Partial -> Complete)
-                let partial_blob = downloader
-                    .complete_blob((arena, &Path::parse("partial.txt")?))
-                    .await?;
+                let partial_blob = fixture.complete_blob(&downloader, "partial.txt").await?;
 
                 Fixture::verify_complete_blob(partial_blob, partial_data, "Partial file").await?;
 
@@ -923,12 +909,7 @@ mod tests {
             .await?
             .interconnected()
             .run(async |household_a, _household_b| {
-                let downloader = Downloader::new(
-                    household_a.clone(),
-                    fixture.inner.cache(HouseholdFixture::a())?.clone(),
-                );
-                let arena = HouseholdFixture::test_arena();
-
+                let downloader = Downloader::new(household_a.clone());
                 let complete_data = "This file is already complete";
 
                 // Create file that is already complete
@@ -937,9 +918,8 @@ mod tests {
                     .await?;
 
                 // Test: Complete an already complete blob (should be no-op)
-                let already_complete_blob = downloader
-                    .complete_blob((arena, &Path::parse("complete.txt")?))
-                    .await?;
+                let already_complete_blob =
+                    fixture.complete_blob(&downloader, "complete.txt").await?;
 
                 Fixture::verify_complete_blob(
                     already_complete_blob,

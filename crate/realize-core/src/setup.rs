@@ -64,8 +64,7 @@ impl SetupHelper {
         mountpoint: &std::path::Path,
         umask: u16,
     ) -> anyhow::Result<FuseHandle> {
-        let cache = self.storage.cache();
-        let downloader = Downloader::new(self.household.clone(), cache.clone());
+        let downloader = Downloader::new(self.household.clone());
         let handle = fuse::export(
             Arc::clone(self.storage.cache()),
             downloader,

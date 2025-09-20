@@ -413,7 +413,11 @@ mod tests {
         }
 
         fn open_blob(&self, path_str: &str) -> anyhow::Result<Blob> {
-            Ok(self.cache.open_file(Path::parse(path_str)?)?)
+            Ok(self
+                .cache
+                .file_content(Path::parse(path_str)?)?
+                .blob()
+                .unwrap())
         }
 
         async fn read_blob_content(&self, path_str: &str) -> anyhow::Result<String> {
@@ -568,7 +572,7 @@ mod tests {
         fixture.add_to_cache("dir/test.txt", &hash, 4)?;
         let pathid = fixture.pathid(&path)?;
         {
-            let mut blob = fixture.cache.open_file(pathid)?;
+            let mut blob = fixture.cache.file_content(pathid)?.blob().unwrap();
             blob.update(0, b"test").await?;
             blob.mark_verified().await?;
         }
@@ -609,7 +613,7 @@ mod tests {
         fixture.create_indexed_file("test.txt", "old").await?;
         fixture.replace_in_cache("test.txt", &old_hash, &new_hash, 4)?;
         {
-            let mut blob = fixture.cache.open_file(pathid)?;
+            let mut blob = fixture.cache.file_content(pathid)?.blob().unwrap();
             blob.update(0, b"new!").await?;
             blob.mark_verified().await?;
         }
@@ -650,7 +654,7 @@ mod tests {
         fixture.add_to_cache("test.txt", &hash, 4)?;
         let pathid = fixture.pathid(&path)?;
         {
-            let mut blob = fixture.cache.open_file(pathid)?;
+            let mut blob = fixture.cache.file_content(pathid)?.blob().unwrap();
             blob.update(0, b"test").await?;
             blob.mark_verified().await?;
         }
@@ -675,7 +679,7 @@ mod tests {
         fixture.add_to_cache("test.txt", &hash, 4)?;
         let pathid = fixture.pathid(&path)?;
         {
-            let mut blob = fixture.cache.open_file(pathid)?;
+            let mut blob = fixture.cache.file_content(pathid)?.blob().unwrap();
             blob.update(0, b"test").await?;
             blob.update_db().await?; // complete, but not verified
         }

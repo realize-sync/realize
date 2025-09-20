@@ -5,7 +5,7 @@ use crate::rpc::{ExecutionMode, Household};
 use fast_rsync::ApplyError;
 use futures::StreamExt;
 use realize_storage::{
-    Blob, CacheStatus, JobId, JobStatus, RemoteAvailability, Storage, StorageError,
+    Blob, CacheStatus, FileContent, JobId, JobStatus, RemoteAvailability, Storage, StorageError,
 };
 use realize_types::{Arena, ByteRanges, Hash, Path, Signature};
 use std::io::SeekFrom;
@@ -54,8 +54,11 @@ pub(crate) async fn download(
     shutdown: CancellationToken,
 ) -> Result<JobStatus, JobError> {
     log::debug!("[{arena}] Job #{job_id} Checking");
-    let mut blob = match storage.cache().open_file((arena, path)).await {
-        Ok(blob) => blob,
+    let mut blob = match storage.cache().file_content((arena, path)).await {
+        Ok(FileContent::Remote(blob)) => blob,
+        Ok(FileContent::Local(_)) => {
+            return Ok(JobStatus::Abandoned("local file"));
+        }
         Err(StorageError::NotFound) => {
             return Ok(JobStatus::Abandoned("not in cache"));
         }
@@ -324,8 +327,10 @@ mod tests {
         async fn open_file(&self, peer: Peer, path_str: &str) -> anyhow::Result<Blob> {
             let cache = self.inner.cache(peer)?;
             Ok(cache
-                .open_file((HouseholdFixture::test_arena(), &Path::parse(path_str)?))
-                .await?)
+                .file_content((HouseholdFixture::test_arena(), &Path::parse(path_str)?))
+                .await?
+                .blob()
+                .ok_or_else(|| anyhow::anyhow!("expected {path_str} on {peer} to be a remote"))?)
         }
 
         async fn set_blob_content(

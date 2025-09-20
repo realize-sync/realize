@@ -3,7 +3,9 @@ use crate::fs::downloader::{Download, Downloader};
 use crate::rpc::HouseholdOperationError;
 use fuser::{FileType, MountOption};
 use nix::libc::{self, c_int};
-use realize_storage::{DirMetadata, FileMetadata, Filesystem, Inode, Metadata, StorageError};
+use realize_storage::{
+    DirMetadata, FileContent, FileMetadata, Filesystem, Inode, Metadata, StorageError,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::io::SeekFrom;
@@ -763,31 +765,40 @@ impl InnerRealizeFs {
         let handle = if let Some((realpath, _)) = self.get_realpath(ino).await {
             log::debug!("Opening Inode({ino}), mapped to {realpath:?}");
             FileHandle::Real(openoptions_from_flags(flags).open(&realpath).await?)
-        } else if mode == libc::O_RDONLY {
-            let reader = self.downloader.reader(Inode(ino)).await?;
-            log::debug!("Opened Inode({ino}) read-only (download enabled)");
-
-            FileHandle::Cached(reader)
         } else {
-            log::debug!("Opening {ino}; realizing it first...");
-            let blob = self.downloader.complete_blob(Inode(ino)).await?;
-            let (path, file) = blob.realize().await?;
-            log::debug!("Map Inode({ino}) to {path:?}");
-            self.realpaths.lock().await.insert(ino, path.clone());
+            match self.fs.file_content(Inode(ino)).await? {
+                FileContent::Local(path) => {
+                    FileHandle::Real(openoptions_from_flags(flags).open(path).await?)
+                }
+                FileContent::Remote(mut blob) => {
+                    if mode == libc::O_RDONLY {
+                        let reader = self.downloader.reader(blob).await?;
+                        log::debug!("Opened Inode({ino}) read-only (download enabled)");
 
-            log::debug!("File at Inode({ino}) realized successfully");
-            if (flags & libc::O_TRUNC) != 0 {
-                // TODO: don't bother downloading in this case and when
-                // setattr is called immediately after open
-                file.set_len(0).await?;
-                log::debug!("File at Inode({ino}) truncated");
-            }
-            if (flags & libc::O_APPEND) != 0 {
-                drop(file);
+                        FileHandle::Cached(reader)
+                    } else {
+                        log::debug!("Opening {ino}; realizing it first...");
+                        self.downloader.complete_blob(&mut blob).await?;
+                        let (path, file) = blob.realize().await?;
+                        log::debug!("Map Inode({ino}) to {path:?}");
+                        self.realpaths.lock().await.insert(ino, path.clone());
 
-                FileHandle::Real(openoptions_from_flags(flags).open(path).await?)
-            } else {
-                FileHandle::Real(file)
+                        log::debug!("File at Inode({ino}) realized successfully");
+                        if (flags & libc::O_TRUNC) != 0 {
+                            // TODO: don't bother downloading in this case and when
+                            // setattr is called immediately after open
+                            file.set_len(0).await?;
+                            log::debug!("File at Inode({ino}) truncated");
+                        }
+                        if (flags & libc::O_APPEND) != 0 {
+                            drop(file);
+
+                            FileHandle::Real(openoptions_from_flags(flags).open(path).await?)
+                        } else {
+                            FileHandle::Real(file)
+                        }
+                    }
+                }
             }
         };
         let mut handles = self.handles.lock().await;
@@ -1078,7 +1089,7 @@ mod tests {
         async fn mount(&mut self, household: Arc<crate::rpc::Household>) -> anyhow::Result<()> {
             let a = HouseholdFixture::a();
             let cache = self.inner.cache(a)?;
-            let downloader = Downloader::new(household, cache.clone());
+            let downloader = Downloader::new(household);
 
             let m = fs::metadata(self.mountpoint.path()).await?;
             let original_dev = m.dev();
