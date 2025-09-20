@@ -428,17 +428,20 @@ impl<'a> WritableOpenCache<'a> {
         dirty: &mut WritableOpenDirty,
         loc: L,
     ) -> Result<(), StorageError> {
-        let pathid = tree.expect(loc)?;
+        let loc = loc.into();
+        let pathid = tree.expect(loc.borrow())?;
         let e = default_file_entry_or_err(&self.table, pathid)?;
-        if e.local {
-            todo!();
-        }
         log::debug!(
             "[{}]@local Local removal of \"{}\" pathid {pathid} {}",
             self.arena,
             e.path,
             e.hash
         );
+        if e.local {
+            let path = tree.backtrack(loc)?.ok_or(StorageError::IsADirectory)?;
+            std::fs::remove_file(path.within(self.datadir()))?;
+            self.rm_index_entry(tree, pathid)?;
+        }
         self.rm_default_file_entry(tree, blobs, dirty, pathid)?;
         history.report_removed(&e.path, &e.hash)?;
 
@@ -1649,7 +1652,7 @@ mod tests {
     use crate::arena::notifier::Notification;
     use crate::arena::tree::{TreeExt, TreeLoc, TreeReadOperations};
     use crate::arena::types::{DirMetadata, HistoryTableEntry};
-    use crate::arena::update;
+    use crate::arena::{index, update};
     use crate::utils::hash;
     use crate::{CacheStatus, FileMetadata};
     use crate::{PathId, StorageError};
@@ -3344,7 +3347,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unlink() -> anyhow::Result<()> {
+    async fn unlink_cached() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena())?;
         let file_path = Path::parse("file.txt")?;
         let mtime = test_time();
@@ -3385,6 +3388,37 @@ mod tests {
             HistoryTableEntry::Remove(file_path, test_hash()),
             history_entry
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unlink_indexed() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let file_path = Path::parse("file.txt")?;
+        let mtime = test_time();
+        let hash = hash::digest("test");
+
+        fixture.add_to_cache(&file_path, 100, mtime)?;
+        index::add_file(&fixture.db, &file_path, 200, mtime, hash.clone())?;
+        let childpath = fixture.datadir.child("file.txt");
+        childpath.write_str("test")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+        let mut blobs = txn.write_blobs()?;
+
+        cache.unlink(&mut tree, &mut blobs, &mut history, &mut dirty, &file_path)?;
+
+        assert!(cache.metadata(&tree, &file_path)?.is_none());
+        assert!(!cache.is_indexed(&tree, &file_path)?);
+        assert!(!childpath.exists());
+
+        let (_, history_entry) = history.history(0..).last().unwrap().unwrap();
+        assert_eq!(HistoryTableEntry::Remove(file_path, hash), history_entry);
 
         Ok(())
     }
