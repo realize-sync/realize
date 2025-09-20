@@ -482,19 +482,15 @@ impl<'a> WritableOpenCache<'a> {
                     (source_pathid, Layer::Default),
                 )?;
             }
-            CacheTableEntry::File(mut entry) => {
-                if entry.local {
-                    todo!();
-                }
+            CacheTableEntry::File(mut source_entry) => {
                 dest_pathid = tree.setup(dest.borrow())?;
-                let old_hash = match default_entry(&self.table, dest_pathid)? {
-                    None => None,
+                let mut old_hash: Option<Hash> = None;
+                let mut dest_is_local = false;
+                match default_entry(&self.table, dest_pathid)? {
+                    None => {}
                     Some(CacheTableEntry::File(entry)) => {
-                        if entry.local {
-                            todo!();
-                        }
-
-                        Some(entry.hash)
+                        dest_is_local = entry.local;
+                        old_hash = Some(entry.hash)
                     }
                     Some(CacheTableEntry::Dir(_)) => return Err(StorageError::IsADirectory),
                 };
@@ -502,20 +498,41 @@ impl<'a> WritableOpenCache<'a> {
                     return Err(StorageError::AlreadyExists);
                 }
 
-                entry.branched_from = Some(source_pathid);
-                self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &entry)?;
-                self.rm_default_file_entry(tree, blobs, dirty, source_pathid)?;
-
-                if let (Some(source_path), Some(dest_path)) =
-                    (tree.backtrack(source)?, tree.backtrack(dest)?)
-                {
-                    history.request_rename(
-                        &source_path,
-                        &dest_path,
-                        &entry.hash,
-                        old_hash.as_ref(),
+                let source_path = tree.backtrack(source)?.ok_or(StorageError::IsADirectory)?;
+                let dest_path = tree.backtrack(dest)?.ok_or(StorageError::IsADirectory)?;
+                if source_entry.local {
+                    std::fs::rename(
+                        &source_path.within(self.datadir()),
+                        &dest_path.within(self.datadir()),
                     )?;
+
+                    // (over)write new entry in database
+                    let dest_entry = IndexedFile::from(&source_entry).into_file(dest_path.clone());
+                    self.write_index_entry(tree, dest_pathid, &dest_entry)?;
+                    self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &dest_entry)?;
+
+                    // delete older entry in database
+                    self.rm_default_file_entry(tree, blobs, dirty, source_pathid)?;
+                    self.rm_index_entry(tree, source_pathid)?;
+                } else {
+                    // (over)write new entry
+                    source_entry.branched_from = Some(source_pathid);
+                    self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &source_entry)?;
+                    if dest_is_local {
+                        self.rm_index_entry(tree, dest_pathid)?;
+                        std::fs::remove_file(dest_path.within(self.datadir()))?;
+                    }
+
+                    // delete older entry
+                    self.rm_default_file_entry(tree, blobs, dirty, source_pathid)?;
                 }
+
+                history.request_rename(
+                    &source_path,
+                    &dest_path,
+                    &source_entry.hash,
+                    old_hash.as_ref(),
+                )?;
             }
         }
         // swap source and destination inodes, to meet FUSE's
@@ -4243,6 +4260,343 @@ mod tests {
         assert_eq!(tree.resolve(&source_path)?, dest_entry.branched_from);
         assert_eq!(source_hash, dest_entry.hash);
         assert_eq!(6, dest_entry.size);
+
+        // history entry reports old hash
+        let (_, history_entry) = history.history(0..).last().unwrap().unwrap();
+        assert_eq!(
+            HistoryTableEntry::Rename(source_path, dest_path, source_hash, Some(dest_hash)),
+            history_entry
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rename_local_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let source_path = Path::parse("source")?;
+        let dest_path = Path::parse("dest")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut history = txn.write_history()?;
+
+        // Create and index a local file
+        let datadir = fixture.datadir.path();
+        let source_realpath = source_path.within(&datadir);
+        std::fs::write(&source_realpath, "test content")?;
+        let mtime = UnixTime::mtime(&source_realpath.metadata()?);
+        let hash = hash::digest("test content");
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &source_path,
+            12,
+            mtime,
+            hash.clone(),
+        )?;
+
+        let source_pathid = tree.expect(&source_path)?;
+        let dest_realpath = dest_path.within(&datadir);
+
+        // Verify source file exists and dest doesn't
+        assert!(source_realpath.exists());
+        assert!(!dest_realpath.exists());
+
+        dirty.delete_range(0, 999)?; // clear dirty
+        cache.rename(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &source_path,
+            &dest_path,
+            true, // noreplace
+        )?;
+
+        // File should be moved on disk
+        assert!(!source_realpath.exists());
+        assert!(dest_realpath.exists());
+        assert_eq!(std::fs::read_to_string(&dest_realpath)?, "test content");
+
+        // Source entry should be gone, dest should exist
+        assert!(cache.file_entry(&tree, &source_path)?.is_none());
+        let dest_entry = cache.file_entry_or_err(&tree, &dest_path).unwrap();
+        assert_eq!(hash, dest_entry.hash);
+        assert_eq!(12, dest_entry.size);
+        assert_eq!(mtime, dest_entry.mtime);
+        assert!(dest_entry.local);
+
+        // Check dirty entries
+        let dest_pathid = tree.expect(&dest_path)?;
+        let dirty_set = dirty_pathids(&dirty)?;
+        assert!(dirty_set.contains(&source_pathid));
+        assert!(dirty_set.contains(&dest_pathid));
+
+        // inodes are swapped
+        assert_eq!(
+            Inode(source_pathid.as_u64()),
+            cache.map_to_inode(dest_pathid)?
+        );
+        assert_eq!(
+            Inode(dest_pathid.as_u64()),
+            cache.map_to_inode(source_pathid)?
+        );
+
+        // history entry was added
+        let (_, history_entry) = history.history(0..).last().unwrap().unwrap();
+        assert_eq!(
+            HistoryTableEntry::Rename(source_path, dest_path, hash, None),
+            history_entry
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rename_local_file_replace() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let source_path = Path::parse("source")?;
+        let dest_path = Path::parse("dest")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut history = txn.write_history()?;
+
+        let datadir = fixture.datadir.path();
+
+        // Create and index source file
+        let source_realpath = source_path.within(&datadir);
+        std::fs::write(&source_realpath, "source content")?;
+        let source_mtime = UnixTime::mtime(&source_realpath.metadata()?);
+        let source_hash = hash::digest("source content");
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &source_path,
+            14,
+            source_mtime,
+            source_hash.clone(),
+        )?;
+
+        // Create and index dest file
+        let dest_realpath = dest_path.within(&datadir);
+        std::fs::write(&dest_realpath, "dest content")?;
+        let dest_mtime = UnixTime::mtime(&dest_realpath.metadata()?);
+        let dest_hash = hash::digest("dest content");
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &dest_path,
+            12,
+            dest_mtime,
+            dest_hash.clone(),
+        )?;
+
+        // Both files should exist
+        assert!(source_realpath.exists());
+        assert!(dest_realpath.exists());
+
+        // Test noreplace=true first (should fail)
+        assert!(matches!(
+            cache.rename(
+                &mut tree,
+                &mut blobs,
+                &mut history,
+                &mut dirty,
+                &source_path,
+                &dest_path,
+                true, // noreplace
+            ),
+            Err(StorageError::AlreadyExists)
+        ));
+
+        cache.rename(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &source_path,
+            &dest_path,
+            false, // allow replace
+        )?;
+
+        assert!(!source_realpath.exists());
+        assert!(dest_realpath.exists());
+        assert_eq!(std::fs::read_to_string(&dest_realpath)?, "source content");
+
+        assert!(cache.file_entry(&tree, &source_path)?.is_none());
+        let dest_entry = cache.file_entry_or_err(&tree, &dest_path).unwrap();
+        assert_eq!(tree.resolve(&source_path)?, dest_entry.branched_from);
+        assert_eq!(source_hash, dest_entry.hash);
+        assert_eq!(14, dest_entry.size);
+        assert!(dest_entry.local);
+
+        // history entry reports old hash
+        let (_, history_entry) = history.history(0..).last().unwrap().unwrap();
+        assert_eq!(
+            HistoryTableEntry::Rename(source_path, dest_path, source_hash, Some(dest_hash)),
+            history_entry
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rename_local_file_replace_cached() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let source_path = Path::parse("source")?;
+        let dest_path = Path::parse("dest")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut history = txn.write_history()?;
+
+        let datadir = fixture.datadir.path();
+
+        // Create and index source file (local)
+        let source_realpath = source_path.within(&datadir);
+        std::fs::write(&source_realpath, "source content")?;
+        let source_mtime = UnixTime::mtime(&source_realpath.metadata()?);
+        let source_hash = hash::digest("source content");
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &source_path,
+            14,
+            source_mtime,
+            source_hash.clone(),
+        )?;
+
+        // Create dest as cached only (notify_added)
+        let dest_hash = hash::digest("cached dest content");
+        cache.notify_added(
+            &mut tree,
+            &mut blobs,
+            &mut dirty,
+            Peer::from("peer"),
+            dest_path.clone(),
+            test_time(),
+            19,
+            dest_hash.clone(),
+        )?;
+
+        let dest_realpath = dest_path.within(&datadir);
+
+        cache.rename(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &source_path,
+            &dest_path,
+            false, // allow replace
+        )?;
+
+        // Source file should be gone, dest should now exist with source content
+        assert!(!source_realpath.exists());
+        assert!(dest_realpath.exists());
+        assert_eq!(std::fs::read_to_string(&dest_realpath)?, "source content");
+
+        // Source entry should be gone, dest should exist with source data and be local
+        assert!(cache.file_entry(&tree, &source_path)?.is_none());
+        let dest_entry = cache.file_entry_or_err(&tree, &dest_path).unwrap();
+        assert_eq!(tree.resolve(&source_path)?, dest_entry.branched_from);
+        assert_eq!(source_hash, dest_entry.hash);
+        assert_eq!(14, dest_entry.size);
+        assert!(dest_entry.local,);
+
+        // history entry reports old hash
+        let (_, history_entry) = history.history(0..).last().unwrap().unwrap();
+        assert_eq!(
+            HistoryTableEntry::Rename(source_path, dest_path, source_hash, Some(dest_hash)),
+            history_entry
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rename_cached_file_replace_local() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let source_path = Path::parse("source")?;
+        let dest_path = Path::parse("dest")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut history = txn.write_history()?;
+
+        let datadir = fixture.datadir.path();
+
+        // Create source as cached only (notify_added)
+        let source_hash = hash::digest("cached source content");
+        cache.notify_added(
+            &mut tree,
+            &mut blobs,
+            &mut dirty,
+            Peer::from("peer"),
+            source_path.clone(),
+            test_time(),
+            21,
+            source_hash.clone(),
+        )?;
+
+        // Create and index dest file (local)
+        let dest_realpath = dest_path.within(&datadir);
+        std::fs::write(&dest_realpath, "dest content")?;
+        let dest_mtime = UnixTime::mtime(&dest_realpath.metadata()?);
+        let dest_hash = hash::digest("dest content");
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &dest_path,
+            12,
+            dest_mtime,
+            dest_hash.clone(),
+        )?;
+
+        cache.rename(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &source_path,
+            &dest_path,
+            false, // allow replace
+        )?;
+
+        // Since source was not local, dest file should be removed from disk
+        assert!(!dest_realpath.exists());
+
+        // Source entry should be gone, dest should exist with source data but not be local
+        assert!(cache.file_entry(&tree, &source_path)?.is_none());
+        let dest_entry = cache.file_entry_or_err(&tree, &dest_path).unwrap();
+        assert_eq!(tree.resolve(&source_path)?, dest_entry.branched_from);
+        assert_eq!(source_hash, dest_entry.hash);
+        assert_eq!(21, dest_entry.size);
+        assert!(!dest_entry.local,);
 
         // history entry reports old hash
         let (_, history_entry) = history.history(0..).last().unwrap().unwrap();
