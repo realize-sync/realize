@@ -599,36 +599,57 @@ impl<'a> WritableOpenCache<'a> {
         dest: L2,
     ) -> Result<(PathId, FileMetadata), StorageError> {
         let source = source.into();
-        let dest = dest.into();
         let source_pathid = tree.expect(source.borrow())?;
-        let mut entry = self.file_at_pathid_or_err(source_pathid)?;
-        if entry.local {
-            todo!();
-        }
+        let source_path = tree.backtrack(source)?.ok_or(StorageError::IsADirectory)?;
+        let mut source_entry = self.file_at_pathid_or_err(source_pathid)?;
 
-        entry.branched_from = Some(source_pathid);
+        // prepare dest, but only after checking source existence
+        let dest = dest.into();
         let dest_pathid = tree.setup(dest.borrow())?;
-        if let Some(dest_entry) = self.file_at_pathid(dest_pathid)?
-            && dest_entry.local
-        {
-            todo!();
-        }
-        let old_hash = self.file_at_pathid(dest_pathid)?.map(|e| e.hash);
+        let dest_path = tree.backtrack(dest)?.ok_or(StorageError::IsADirectory)?;
         check_parent_is_dir(&self.table, tree, dest_pathid)?;
-        self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &entry)?;
+        if self.file_at_pathid(dest_pathid)?.is_some() {
+            return Err(StorageError::AlreadyExists);
+        }
 
-        if let (Some(source_path), Some(dest_path)) =
-            (tree.backtrack(source)?, tree.backtrack(dest)?)
-        {
-            history.request_branch(&source_path, &dest_path, &entry.hash, old_hash.as_ref())?;
+        if source_entry.local {
+            // We own the source, make change on the filesystem
+            std::fs::hard_link(
+                &source_path.within(self.datadir()),
+                &dest_path.within(self.datadir()),
+            )?;
+
+            // write dest in the database
+            let old_hash = default_file_entry(&self.table, dest_pathid)?.map(|e| e.hash);
+            let dest_entry = IndexedFile::from(&source_entry).into_file(dest_path.clone());
+            self.write_index_entry(tree, dest_pathid, &dest_entry)?;
+            self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &dest_entry)?;
+
+            // history starts with add in case sync is interrupted
+            history.report_added(&dest_path, old_hash.as_ref())?;
+        } else {
+            // We don't own the source, so request the owner of the
+            // source to execute the branch, and simulate it in the
+            // cache for now.
+            let dest_entry = self.file_at_pathid(dest_pathid)?;
+            history.request_branch(
+                &source_path,
+                &dest_path,
+                &source_entry.hash,
+                dest_entry.as_ref().map(|e| &e.hash),
+            )?;
+
+            // write dest in the database and optionally the filesystem
+            source_entry.branched_from = Some(source_pathid);
+            self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &source_entry)?;
         }
 
         Ok((
             dest_pathid,
             FileMetadata {
-                size: entry.size,
-                mtime: entry.mtime,
-                hash: entry.hash,
+                size: source_entry.size,
+                mtime: source_entry.mtime,
+                hash: source_entry.hash,
             },
         ))
     }
@@ -1328,11 +1349,9 @@ fn remote_availability<'b, L: Into<TreeLoc<'b>>>(
     let mut visited = HashSet::new();
     let mut next = Some(pathid);
     while let Some(pathid) = next
-        && avail.is_none()
         && !visited.contains(&pathid)
     {
         visited.insert(pathid); // avoid loops
-        next = default_file_entry_or_err(cache_table, pathid)?.branched_from;
         for entry in find_peer_entry(cache_table, pathid, hash)? {
             let (peer, file_entry) = entry?;
             avail
@@ -1345,6 +1364,9 @@ fn remote_availability<'b, L: Into<TreeLoc<'b>>>(
                 })
                 .peers
                 .push(peer);
+        }
+        if avail.is_none() {
+            next = default_file_entry(cache_table, pathid)?.and_then(|e| e.branched_from);
         }
     }
     if avail.is_none() {
@@ -1661,6 +1683,7 @@ mod tests {
     use assert_fs::prelude::*;
     use realize_types::{Arena, Hash, Path, Peer, UnixTime};
     use std::collections::{HashMap, HashSet};
+    use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
 
     const TEST_TIME: u64 = 1234567890;
@@ -3424,9 +3447,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn branch() -> anyhow::Result<()> {
+    async fn branch_remote() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena())?;
-        let dir_path = Path::parse("mydir")?;
         let source_path = Path::parse("mydir/source")?;
         let dest_path = Path::parse("mydir/dest")?;
 
@@ -3450,25 +3472,24 @@ mod tests {
             6,
             hash.clone(),
         )?;
-        let source_pathid = tree.expect(&source_path)?;
-        let dir_pathid = tree.expect(&dir_path)?;
-
         dirty.delete_range(0, 999)?; // clear dirty
 
-        cache.branch(
-            &mut tree,
-            &mut blobs,
-            &mut history,
-            &mut dirty,
-            source_pathid,
-            (dir_pathid, "dest"),
-        )?;
+        cache
+            .branch(
+                &mut tree,
+                &mut blobs,
+                &mut history,
+                &mut dirty,
+                &source_path,
+                &dest_path,
+            )
+            .unwrap();
 
-        let dest_pathid = tree.expect(&dest_path)?;
         assert_eq!(
-            Some(dest_pathid),
-            dirty.next_dirty(0)?.map(|(pathid, _)| pathid)
+            HashSet::from([dest_path.clone()]),
+            dirty_paths(&dirty, &tree)?
         );
+
         let (_, history_entry) = history.history(0..).last().unwrap().unwrap();
         assert_eq!(
             HistoryTableEntry::Branch(source_path.clone(), dest_path.clone(), hash.clone(), None),
@@ -3482,10 +3503,11 @@ mod tests {
                 mtime: test_time(),
                 hash: hash.clone(),
             },
-            cache.file_metadata(&tree, dest_pathid)?
+            cache.file_metadata(&tree, &dest_path).unwrap()
         );
         let avail = cache
-            .remote_availability(&tree, dest_pathid, &hash)?
+            .remote_availability(&tree, &dest_path, &hash)
+            .unwrap()
             .unwrap();
         assert_eq!(source_path, avail.path);
         assert_eq!(vec![peer1], avail.peers);
@@ -3501,21 +3523,205 @@ mod tests {
             hash.clone(),
         )?;
 
-        // Dest file exists and can now be downloaded normally from peer2
-        assert_eq!(
-            FileMetadata {
-                size: 6,
-                mtime: test_time(),
-                hash: hash.clone(),
-            },
-            cache.file_metadata(&tree, dest_pathid)?
-        );
+        // Dest file can now downloaded normally from peer2, the normal way
         let avail = cache
-            .remote_availability(&tree, dest_pathid, &hash)?
+            .remote_availability(&tree, &dest_path, &hash)
+            .unwrap()
             .unwrap();
         assert_eq!(dest_path, avail.path);
-        assert_eq!(hash, avail.hash);
         assert_eq!(vec![peer2], avail.peers);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn branch_local() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let source_path = Path::parse("source")?;
+        let dest_path = Path::parse("dest")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        let datadir = fixture.datadir.path();
+        let source_realpath = source_path.within(&datadir);
+        std::fs::write(&source_realpath, "test")?;
+        let mtime = UnixTime::mtime(&source_realpath.metadata()?);
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &source_path,
+            4,
+            mtime,
+            hash::digest("test"),
+        )?;
+
+        dirty.delete_range(0, 999)?; // clear dirty
+        cache
+            .branch(
+                &mut tree,
+                &mut blobs,
+                &mut history,
+                &mut dirty,
+                &source_path,
+                &dest_path,
+            )
+            .unwrap();
+
+        let dest_realpath = dest_path.within(&datadir);
+        assert!(dest_realpath.exists());
+        assert!(source_realpath.exists());
+        assert_eq!(
+            source_realpath.metadata()?.ino(),
+            dest_realpath.metadata()?.ino()
+        );
+
+        assert_eq!(
+            HashSet::from([dest_path.clone()]),
+            dirty_paths(&dirty, &tree)?
+        );
+
+        let (_, last_history_entry) = history.history(0..).last().unwrap().unwrap();
+        assert_eq!(
+            HistoryTableEntry::Add(dest_path.clone()),
+            last_history_entry,
+        );
+
+        assert_eq!(
+            FileMetadata {
+                size: 4,
+                mtime,
+                hash: hash::digest("test"),
+            },
+            cache.file_metadata(&tree, &dest_path).unwrap()
+        );
+        assert_eq!(
+            FileRealm::Local,
+            cache.file_realm(&tree, &blobs, &dest_path).unwrap()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn branch_overwrite_local() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let source_path = Path::parse("source")?;
+        let dest_path = Path::parse("dest")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        let datadir = fixture.datadir.path();
+        let source_realpath = source_path.within(&datadir);
+        std::fs::write(&source_realpath, "test")?;
+        let source_mtime = UnixTime::mtime(&source_realpath.metadata()?);
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &source_path,
+            4,
+            source_mtime,
+            hash::digest("test"),
+        )?;
+
+        let dest_realpath = dest_path.within(&datadir);
+        std::fs::write(&dest_realpath, "overwrite")?;
+        let dest_mtime = UnixTime::mtime(&dest_realpath.metadata()?);
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &dest_path,
+            9,
+            dest_mtime,
+            hash::digest("overwrite"),
+        )?;
+
+        assert_eq!(
+            Some(std::io::ErrorKind::AlreadyExists),
+            cache
+                .branch(
+                    &mut tree,
+                    &mut blobs,
+                    &mut history,
+                    &mut dirty,
+                    &source_path,
+                    &dest_path,
+                )
+                .err()
+                .map(|e| e.io_kind())
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn branch_overwrite_cached() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let source_path = Path::parse("source")?;
+        let dest_path = Path::parse("dest")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        let datadir = fixture.datadir.path();
+        let source_realpath = source_path.within(&datadir);
+        std::fs::write(&source_realpath, "test")?;
+        let source_mtime = UnixTime::mtime(&source_realpath.metadata()?);
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &source_path,
+            4,
+            source_mtime,
+            hash::digest("test"),
+        )?;
+
+        cache.notify_added(
+            &mut tree,
+            &mut blobs,
+            &mut dirty,
+            Peer::from("peer"),
+            dest_path.clone(),
+            test_time(),
+            9,
+            hash::digest("overwrite"),
+        )?;
+
+        assert_eq!(
+            Some(std::io::ErrorKind::AlreadyExists),
+            cache
+                .branch(
+                    &mut tree,
+                    &mut blobs,
+                    &mut history,
+                    &mut dirty,
+                    &source_path,
+                    &dest_path,
+                )
+                .err()
+                .map(|e| e.io_kind())
+        );
 
         Ok(())
     }
