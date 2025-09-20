@@ -3252,7 +3252,12 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         {
             let mut cache = txn.write_cache()?;
-            cache.create_blob(&txn, &path)?;
+            cache.create_blob(
+                &mut txn.write_tree()?,
+                &mut txn.write_blobs()?,
+                &txn.read_marks()?,
+                &path,
+            )?;
         }
         txn.commit()?;
 

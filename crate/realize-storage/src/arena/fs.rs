@@ -252,7 +252,12 @@ impl ArenaFilesystem {
         let txn = self.db.begin_write()?;
         let info = {
             let mut cache = txn.write_cache()?;
-            cache.create_blob(&txn, pathid)?
+            cache.create_blob(
+                &mut txn.write_tree()?,
+                &mut txn.write_blobs()?,
+                &txn.read_marks()?,
+                pathid,
+            )?
         };
         txn.commit()?;
 

@@ -1,5 +1,4 @@
 use super::blob::{BlobExt, BlobInfo, WritableOpenBlob};
-use super::db::ArenaWriteTransaction;
 use super::dirty::WritableOpenDirty;
 use super::index::Index;
 use super::tree::{TreeExt, TreeReadOperations, WritableOpenTree};
@@ -405,19 +404,17 @@ impl<'a> WritableOpenCache<'a> {
     /// Create a blob for that file, unless one already exists.
     pub(crate) fn create_blob<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
-        txn: &ArenaWriteTransaction,
+        tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
+        marks: &impl MarkReadOperations,
         loc: L,
     ) -> Result<BlobInfo, StorageError> {
-        let mut tree = txn.write_tree()?;
         let pathid = tree.expect(loc)?;
         let file_entry = default_file_entry_or_err(&self.table, pathid)?;
         if file_entry.local {
             todo!();
         }
-        let mut blobs = txn.write_blobs()?;
-
-        let marks = txn.read_marks()?;
-        blobs.create(&mut tree, &marks, pathid, &file_entry.hash, file_entry.size)
+        blobs.create(tree, marks, pathid, &file_entry.hash, file_entry.size)
     }
 
     /// Remove file locally, even though it might still be available in other peers.
@@ -3105,7 +3102,12 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         {
             let mut cache = txn.write_cache()?;
-            cache.create_blob(&txn, &file_path)?
+            cache.create_blob(
+                &mut txn.write_tree()?,
+                &mut txn.write_blobs()?,
+                &txn.read_marks()?,
+                &file_path,
+            )?;
         };
         txn.commit()?;
 
@@ -3285,7 +3287,12 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         {
             let mut cache = txn.write_cache()?;
-            cache.create_blob(&txn, &file_path)?
+            cache.create_blob(
+                &mut txn.write_tree()?,
+                &mut txn.write_blobs()?,
+                &txn.read_marks()?,
+                &file_path,
+            )?;
         };
         txn.commit()?;
 
@@ -3308,7 +3315,12 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         {
             let mut cache = txn.write_cache()?;
-            cache.create_blob(&txn, &file_path)?
+            cache.create_blob(
+                &mut txn.write_tree()?,
+                &mut txn.write_blobs()?,
+                &txn.read_marks()?,
+                &file_path,
+            )?;
         };
         txn.commit()?;
 
