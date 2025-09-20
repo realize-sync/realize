@@ -411,9 +411,6 @@ impl<'a> WritableOpenCache<'a> {
     ) -> Result<BlobInfo, StorageError> {
         let pathid = tree.expect(loc)?;
         let file_entry = default_file_entry_or_err(&self.table, pathid)?;
-        if file_entry.local {
-            todo!();
-        }
         blobs.create(tree, marks, pathid, &file_entry.hash, file_entry.size)
     }
 
