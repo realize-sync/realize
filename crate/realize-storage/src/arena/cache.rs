@@ -710,17 +710,20 @@ impl<'a> WritableOpenCache<'a> {
     ) -> Result<(), StorageError> {
         let file_pathid = tree.setup(&path)?;
         let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
+        let mut updated_default = false;
+        if peer_file_entry(&self.table, file_pathid, None)?.is_none() {
+            log::debug!("[{}]@local Add \"{path}\" {hash} size={size}", self.tag);
+            self.write_default_file_entry(tree, blobs, dirty, file_pathid, &entry)?;
+            updated_default = true;
+        }
         if peer_file_entry(&self.table, file_pathid, Some(peer))?.is_none() {
             log::debug!("[{}]@{peer} Add \"{path}\" {hash} size={size}", self.tag);
             self.write_file_entry(tree, file_pathid, peer, &entry)?;
-            dirty.mark_dirty(file_pathid, "add_from_peer")?;
+            if !updated_default {
+                dirty.mark_dirty(file_pathid, "add_from_peer")?;
+            }
         }
-        Ok(
-            if peer_file_entry(&self.table, file_pathid, None)?.is_none() {
-                log::debug!("[{}]@local Add \"{path}\" {hash} size={size}", self.tag);
-                self.write_default_file_entry(tree, blobs, dirty, file_pathid, &entry)?;
-            },
-        )
+        Ok(())
     }
 
     /// Replace a file entry for a peer.
@@ -738,17 +741,7 @@ impl<'a> WritableOpenCache<'a> {
     ) -> Result<(), StorageError> {
         let file_pathid = tree.setup(path)?;
         let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
-        if peer_file_entry(&self.table, file_pathid, Some(peer))?
-            .map(|e| e.hash == *old_hash)
-            .unwrap_or(true)
-        {
-            log::debug!(
-                "[{}]@{peer} \"{path}\" {hash} size={size} replaces {old_hash}",
-                self.tag
-            );
-            self.write_file_entry(tree, file_pathid, peer, &entry)?;
-            dirty.mark_dirty(file_pathid, "replace_from_peer")?;
-        }
+        let mut default_modified = false;
         if peer_file_entry(&self.table, file_pathid, None)?
             .map(|e| e.hash == *old_hash)
             .unwrap_or(true)
@@ -758,6 +751,20 @@ impl<'a> WritableOpenCache<'a> {
                 self.tag
             );
             self.write_default_file_entry(tree, blobs, dirty, file_pathid, &entry)?;
+            default_modified = true;
+        }
+        if peer_file_entry(&self.table, file_pathid, Some(peer))?
+            .map(|e| e.hash == *old_hash)
+            .unwrap_or(true)
+        {
+            log::debug!(
+                "[{}]@{peer} \"{path}\" {hash} size={size} replaces {old_hash}",
+                self.tag
+            );
+            self.write_file_entry(tree, file_pathid, peer, &entry)?;
+            if !default_modified {
+                dirty.mark_dirty(file_pathid, "replace_from_peer")?;
+            }
         }
         Ok(())
     }
@@ -5268,12 +5275,8 @@ mod tests {
         let dirty_paths = dirty_paths(&dirty, &tree)?;
         assert!(dirty_paths.contains(&path));
 
-        // Verify history entries were added (Add + Replace entries)
         assert_eq!(
-            vec![
-                HistoryTableEntry::Add(path.clone()),
-                HistoryTableEntry::Replace(path.clone(), hash1)
-            ],
+            vec![HistoryTableEntry::Replace(path.clone(), hash1)],
             collect_history_entries(&history, history_start)?
         );
 
@@ -5320,12 +5323,8 @@ mod tests {
         // Verify the path was marked dirty
         assert_eq!(HashSet::from([pathid]), dirty_pathids(&dirty)?);
 
-        // Verify history entries were added (Add + Remove entries)
         assert_eq!(
-            vec![
-                HistoryTableEntry::Add(path.clone()),
-                HistoryTableEntry::Remove(path.clone(), hash)
-            ],
+            vec![HistoryTableEntry::Remove(path.clone(), hash)],
             collect_history_entries(&history, history_start)?
         );
 
@@ -5394,8 +5393,6 @@ mod tests {
         let history_entries = collect_history_entries(&history, history_start)?;
         assert_unordered::assert_eq_unordered!(
             vec![
-                HistoryTableEntry::Add(path1.clone()),
-                HistoryTableEntry::Add(path2.clone()),
                 HistoryTableEntry::Remove(path1.clone(), hash1.clone()),
                 HistoryTableEntry::Remove(path2.clone(), hash2.clone()),
             ],
