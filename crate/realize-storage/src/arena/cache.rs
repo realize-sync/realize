@@ -715,6 +715,7 @@ impl<'a> WritableOpenCache<'a> {
         if peer_file_entry(&self.table, file_pathid, Some(peer))?.is_none() {
             log::debug!("[{}]@{peer} Add \"{path}\" {hash} size={size}", self.arena);
             self.write_file_entry(tree, file_pathid, peer, &entry)?;
+            dirty.mark_dirty(file_pathid, "add_from_peer")?;
         }
         Ok(
             if peer_file_entry(&self.table, file_pathid, None)?.is_none() {
@@ -748,6 +749,7 @@ impl<'a> WritableOpenCache<'a> {
                 self.arena
             );
             self.write_file_entry(tree, file_pathid, peer, &entry)?;
+            dirty.mark_dirty(file_pathid, "replace_from_peer")?;
         }
         if peer_file_entry(&self.table, file_pathid, None)?
             .map(|e| e.hash == *old_hash)
