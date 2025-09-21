@@ -1,5 +1,5 @@
 use crate::consensus::churten::Churten;
-use crate::rpc::testing::HouseholdFixture;
+use crate::rpc::testing::{self, HouseholdFixture};
 use realize_storage::config::DiskUsageLimits;
 use realize_storage::utils::hash;
 use realize_storage::{CacheStatus, FileRealm, Mark};
@@ -92,8 +92,8 @@ async fn link_to_own() -> anyhow::Result<()> {
     fixture
         .with_two_peers()
         .await?
-        .interconnected()
-        .run(async |_household_a, household_b| {
+        .run(async |household_a, household_b| {
+            testing::connect(&household_a, b).await?;
             let work = Path::parse("work")?;
             let store = Path::parse("store")?;
             let storage_a = fixture.storage(a)?;
@@ -106,11 +106,13 @@ async fn link_to_own() -> anyhow::Result<()> {
             let content = b"foo!".repeat(2 * 1024 * 1024 / 4); // 2M
             let hash = hash::digest(&content);
 
+            // A: create work/foo (on the filesystem)
             let root_a = fixture.arena_root(a);
             let work_foo_in_a = Path::parse("work/foo")?.within(&root_a);
             std::fs::create_dir(work_foo_in_a.parent().unwrap())?;
             std::fs::write(&work_foo_in_a, content.as_slice())?;
 
+            // B: branch work/foo -> store/foo (on the filesystem)
             fixture.wait_for_file_in_cache(b, "work/foo", &hash).await?;
             let cache_b = fixture.cache(b)?;
             let (store_pathid, _) = cache_b.mkdir((cache_b.arena_root(arena)?, "store")).await?;
@@ -121,6 +123,7 @@ async fn link_to_own() -> anyhow::Result<()> {
             let mut churten = Churten::new(Arc::clone(&storage_b), household_b.clone());
             churten.start();
 
+            // B should download and realize store/foo since it's marked owned
             let root_b = fixture.arena_root(b);
             let store_foo_in_b = Path::parse("store/foo")?.within(&root_b);
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -130,6 +133,9 @@ async fn link_to_own() -> anyhow::Result<()> {
             assert!(store_foo_in_b.exists());
             assert_eq!(hash, hash::digest(std::fs::read_to_string(store_foo_in_b)?));
 
+            // Once B has reported that it has store/foo, A should
+            // unrealize store/foo, since it's marked watched. This
+            // deletes B's local copy of store/foo.
             let store_foo_in_a = Path::parse("store/foo")?.within(&root_a);
             while store_foo_in_a.exists() && Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(100)).await;
