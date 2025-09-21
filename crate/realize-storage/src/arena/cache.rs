@@ -456,6 +456,30 @@ impl<'a> WritableOpenCache<'a> {
         dest: L2,
         noreplace: bool,
     ) -> Result<(), StorageError> {
+        let (source_pathid, dest_pathid) =
+            self.rename_internal(tree, blobs, history, dirty, source, dest, noreplace)?;
+
+        // swap source and destination inodes, to meet FUSE's
+        // expectation of what rename does.
+        let source_inode = self.map_to_inode(source_pathid)?;
+        let dest_inode = self.map_to_inode(dest_pathid)?;
+        self.pathid_to_inode.insert(source_pathid, dest_inode)?;
+        self.pathid_to_inode.insert(dest_pathid, source_inode)?;
+        self.inode_to_pathid.insert(source_inode, dest_pathid)?;
+        self.inode_to_pathid.insert(dest_inode, source_pathid)?;
+        Ok(())
+    }
+
+    fn rename_internal<'l1, 'l2, L1: Into<TreeLoc<'l1>>, L2: Into<TreeLoc<'l2>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
+        history: &mut WritableOpenHistory,
+        dirty: &mut WritableOpenDirty,
+        source: L1,
+        dest: L2,
+        noreplace: bool,
+    ) -> Result<(PathId, PathId), StorageError> {
         let source = source.into();
         let dest = dest.into();
         let source_pathid = tree.expect(source.borrow())?;
@@ -474,13 +498,34 @@ impl<'a> WritableOpenCache<'a> {
                         }
                     }
                 }
-                self.rename_files_in_dir(tree, blobs, history, dirty, source_pathid, dest_pathid)?;
+                for (direntry_name, direntry_pathid) in tree
+                    .readdir(source_pathid)
+                    .map(|res| res.map(|(n, p)| (n.to_string(), p)))
+                    .collect::<Result<Vec<_>, _>>()?
+                {
+                    match self.rename_internal(
+                        tree,
+                        blobs,
+                        history,
+                        dirty,
+                        direntry_pathid,
+                        (dest_pathid, direntry_name),
+                        noreplace,
+                    ) {
+                        Ok(_) => {}
+                        Err(StorageError::NotFound) => {}
+                        Err(err) => return Err(err),
+                    };
+                }
                 write_dir_mtime(&mut self.table, tree, dest_pathid, dir_entry.mtime)?;
                 tree.remove_and_decref(
                     source_pathid,
                     &mut self.table,
                     (source_pathid, Layer::Default),
                 )?;
+                if let Some(source_path) = tree.backtrack(source_pathid)? {
+                    let _ = std::fs::remove_dir(source_path.within(self.datadir()));
+                }
             }
             CacheTableEntry::File(mut source_entry) => {
                 dest_pathid = tree.setup(dest.borrow())?;
@@ -501,10 +546,13 @@ impl<'a> WritableOpenCache<'a> {
                 let source_path = tree.backtrack(source)?.ok_or(StorageError::IsADirectory)?;
                 let dest_path = tree.backtrack(dest)?.ok_or(StorageError::IsADirectory)?;
                 if source_entry.local {
-                    std::fs::rename(
-                        &source_path.within(self.datadir()),
-                        &dest_path.within(self.datadir()),
-                    )?;
+                    let source_realpath = source_path.within(self.datadir());
+                    let dest_realpath = dest_path.within(self.datadir());
+
+                    if let Some(parent) = dest_realpath.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::rename(&source_realpath, &dest_realpath)?;
 
                     // (over)write new entry in database
                     let dest_entry = IndexedFile::from(&source_entry).into_file(dest_path.clone());
@@ -514,6 +562,9 @@ impl<'a> WritableOpenCache<'a> {
                     // delete older entry in database
                     self.rm_default_file_entry(tree, blobs, dirty, source_pathid)?;
                     self.rm_index_entry(tree, source_pathid)?;
+
+                    history.report_added(&dest_path, old_hash.as_ref())?;
+                    history.report_removed(&source_path, &source_entry.hash)?;
                 } else {
                     // (over)write new entry
                     source_entry.branched_from = Some(source_pathid);
@@ -525,81 +576,18 @@ impl<'a> WritableOpenCache<'a> {
 
                     // delete older entry
                     self.rm_default_file_entry(tree, blobs, dirty, source_pathid)?;
-                }
 
-                history.request_rename(
-                    &source_path,
-                    &dest_path,
-                    &source_entry.hash,
-                    old_hash.as_ref(),
-                )?;
-            }
-        }
-        // swap source and destination inodes, to meet FUSE's
-        // expectation of what rename does.
-        let source_inode = self.map_to_inode(source_pathid)?;
-        let dest_inode = self.map_to_inode(dest_pathid)?;
-        self.pathid_to_inode.insert(source_pathid, dest_inode)?;
-        self.pathid_to_inode.insert(dest_pathid, source_inode)?;
-        self.inode_to_pathid.insert(source_inode, dest_pathid)?;
-        self.inode_to_pathid.insert(dest_inode, source_pathid)?;
-        Ok(())
-    }
-
-    /// Recursively move all entries in `source_dir` to `dest_dir`.
-    fn rename_files_in_dir(
-        &mut self,
-        tree: &mut WritableOpenTree,
-        blobs: &mut WritableOpenBlob,
-        history: &mut WritableOpenHistory,
-        dirty: &mut WritableOpenDirty,
-        source_dir: PathId,
-        dest_dir: PathId,
-    ) -> Result<(), StorageError> {
-        for (name, source_entry) in tree
-            .readdir(source_dir)
-            .map(|res| res.map(|(n, p)| (n.to_string(), p)))
-            .collect::<Result<Vec<_>, _>>()?
-        {
-            match default_entry(&self.table, source_entry)? {
-                None => {}
-                Some(CacheTableEntry::Dir(dir_entry)) => {
-                    let dest_entry = tree.setup((dest_dir, name))?;
-                    self.rename_files_in_dir(
-                        tree,
-                        blobs,
-                        history,
-                        dirty,
-                        source_entry,
-                        dest_entry,
+                    history.request_rename(
+                        &source_path,
+                        &dest_path,
+                        &source_entry.hash,
+                        old_hash.as_ref(),
                     )?;
-                    write_dir_mtime(&mut self.table, tree, dest_entry, dir_entry.mtime)?;
-                    tree.remove_and_decref(
-                        source_entry,
-                        &mut self.table,
-                        (source_entry, Layer::Default),
-                    )?;
-                }
-                Some(CacheTableEntry::File(mut file_entry)) => {
-                    if file_entry.local {
-                        todo!();
-                    }
-
-                    let dest_entry = tree.setup((dest_dir, name))?;
-                    file_entry.branched_from = Some(source_entry);
-                    self.write_default_file_entry(tree, blobs, dirty, dest_entry, &file_entry)?;
-                    self.rm_default_file_entry(tree, blobs, dirty, source_entry)?;
-
-                    if let (Some(source_path), Some(dest_path)) =
-                        (tree.backtrack(source_entry)?, tree.backtrack(dest_entry)?)
-                    {
-                        history.request_rename(&source_path, &dest_path, &file_entry.hash, None)?;
-                    }
                 }
             }
         }
 
-        Ok(())
+        Ok((source_pathid, dest_pathid))
     }
 
     /// Branch a file to another location in the tree.
@@ -1699,6 +1687,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
+    use std::u64;
 
     const TEST_TIME: u64 = 1234567890;
 
@@ -1868,7 +1857,7 @@ mod tests {
 
         fn clear_dirty(&self) -> Result<(), StorageError> {
             let txn = self.db.begin_write()?;
-            txn.write_dirty()?.delete_range(0, 999)?;
+            clear_dirty(&mut txn.write_dirty()?)?;
             txn.commit()?;
 
             Ok(())
@@ -1893,6 +1882,36 @@ mod tests {
         }
     }
 
+    /// Return a value to pass to `collect_history_entries` to ignore
+    /// all history entries before this point.
+    fn history_start(
+        history: &impl crate::arena::history::HistoryReadOperations,
+    ) -> Result<u64, StorageError> {
+        Ok(history.last_history_index()? + 1)
+    }
+
+    /// Collect history entries starting from `start`.
+    ///
+    /// To compute `history_start` call [history_start]
+    /// just before making the change under test. This way,
+    /// history entries that are part of the test setup are not
+    /// included.
+    fn collect_history_entries(
+        history: &impl crate::arena::history::HistoryReadOperations,
+        history_start: u64,
+    ) -> Result<Vec<HistoryTableEntry>, StorageError> {
+        history
+            .history(history_start..)
+            .map(|res| res.map(|(_, e)| e))
+            .collect()
+    }
+
+    fn clear_dirty(dirty: &mut WritableOpenDirty) -> Result<(), StorageError> {
+        dirty.delete_range(0, 99)?;
+
+        Ok(())
+    }
+
     fn dirty_pathids(
         dirty: &impl crate::arena::dirty::DirtyReadOperations,
     ) -> Result<HashSet<PathId>, StorageError> {
@@ -1913,15 +1932,6 @@ mod tests {
             .into_iter()
             .filter_map(|i| tree.backtrack(i).ok().flatten())
             .collect())
-    }
-
-    fn collect_history_entries(
-        history: &impl crate::arena::history::HistoryReadOperations,
-    ) -> Result<Vec<HistoryTableEntry>, StorageError> {
-        history
-            .history(0..)
-            .map(|res| res.map(|(_, e)| e))
-            .collect()
     }
 
     #[tokio::test]
@@ -3486,7 +3496,7 @@ mod tests {
             6,
             hash.clone(),
         )?;
-        dirty.delete_range(0, 999)?; // clear dirty
+        clear_dirty(&mut dirty)?;
 
         cache
             .branch(
@@ -3576,7 +3586,7 @@ mod tests {
             hash::digest("test"),
         )?;
 
-        dirty.delete_range(0, 999)?; // clear dirty
+        clear_dirty(&mut dirty)?;
         cache
             .branch(
                 &mut tree,
@@ -3750,8 +3760,7 @@ mod tests {
         let mut cache = txn.write_cache()?;
         let mut dirty = txn.write_dirty()?;
 
-        // Clear dirty state
-        dirty.delete_range(0, 999)?;
+        clear_dirty(&mut dirty)?;
 
         let (pathid, metadata) = cache.mkdir(&mut tree, &dir_path)?;
 
@@ -3809,8 +3818,7 @@ mod tests {
         let mut cache = txn.write_cache()?;
         let mut dirty = txn.write_dirty()?;
 
-        // Clear dirty state
-        dirty.delete_range(0, 999)?;
+        clear_dirty(&mut dirty)?;
 
         // Create directory first time
         let (pathid1, _) = cache.mkdir(&mut tree, &dir_path)?;
@@ -3833,8 +3841,7 @@ mod tests {
         let mut cache = txn.write_cache()?;
         let mut dirty = txn.write_dirty()?;
 
-        // Clear dirty state
-        dirty.delete_range(0, 999)?;
+        clear_dirty(&mut dirty)?;
 
         // Create directory
         let (pathid, _) = cache.mkdir(&mut tree, &dir_path)?;
@@ -3868,8 +3875,7 @@ mod tests {
         let mut blobs = txn.write_blobs()?;
         let mut dirty = txn.write_dirty()?;
 
-        // Clear dirty state
-        dirty.delete_range(0, 999)?;
+        clear_dirty(&mut dirty)?;
 
         // Create directory
         let (dir_pathid, _) = cache.mkdir(&mut tree, &dir_path)?;
@@ -3908,8 +3914,7 @@ mod tests {
         let mut blobs = txn.write_blobs()?;
         let mut dirty = txn.write_dirty()?;
 
-        // Clear dirty state
-        dirty.delete_range(0, 999)?;
+        clear_dirty(&mut dirty)?;
 
         // Add a file
         let peer = Peer::from("test_peer");
@@ -3946,8 +3951,7 @@ mod tests {
         let mut cache = txn.write_cache()?;
         let mut dirty = txn.write_dirty()?;
 
-        // Clear dirty state
-        dirty.delete_range(0, 999)?;
+        clear_dirty(&mut dirty)?;
 
         // Try to remove non-existent directory
         let result = cache.rmdir(&mut tree, &nonexistent_path);
@@ -3967,8 +3971,7 @@ mod tests {
         let mut cache = txn.write_cache()?;
         let mut dirty = txn.write_dirty()?;
 
-        // Clear dirty state
-        dirty.delete_range(0, 999)?;
+        clear_dirty(&mut dirty)?;
 
         // Create parent and child directories
         let (parent_pathid, _) = cache.mkdir(&mut tree, &parent_path)?;
@@ -4140,7 +4143,7 @@ mod tests {
         )?;
 
         let source_pathid = tree.expect(&source_path)?;
-        dirty.delete_range(0, 999)?;
+        clear_dirty(&mut dirty)?;
         cache.rename(
             &mut tree,
             &mut blobs,
@@ -4308,7 +4311,8 @@ mod tests {
         assert!(source_realpath.exists());
         assert!(!dest_realpath.exists());
 
-        dirty.delete_range(0, 999)?; // clear dirty
+        let history_start = history_start(&history)?;
+        clear_dirty(&mut dirty)?;
         cache.rename(
             &mut tree,
             &mut blobs,
@@ -4349,10 +4353,18 @@ mod tests {
         );
 
         // history entry was added
-        let (_, history_entry) = history.history(0..).last().unwrap().unwrap();
+
         assert_eq!(
-            HistoryTableEntry::Rename(source_path, dest_path, hash, None),
-            history_entry
+            vec![
+                HistoryTableEntry::Add(dest_path),
+                HistoryTableEntry::Remove(source_path, hash)
+            ],
+            collect_history_entries(&history, history_start)?
+                .into_iter()
+                .rev()
+                .take(2)
+                .rev()
+                .collect::<Vec<_>>()
         );
 
         Ok(())
@@ -4409,6 +4421,8 @@ mod tests {
         assert!(source_realpath.exists());
         assert!(dest_realpath.exists());
 
+        let history_start = history_start(&history)?;
+
         // Test noreplace=true first (should fail)
         assert!(matches!(
             cache.rename(
@@ -4444,11 +4458,17 @@ mod tests {
         assert_eq!(14, dest_entry.size);
         assert!(dest_entry.local);
 
-        // history entry reports old hash
-        let (_, history_entry) = history.history(0..).last().unwrap().unwrap();
         assert_eq!(
-            HistoryTableEntry::Rename(source_path, dest_path, source_hash, Some(dest_hash)),
-            history_entry
+            vec![
+                HistoryTableEntry::Replace(dest_path, dest_hash),
+                HistoryTableEntry::Remove(source_path, source_hash)
+            ],
+            collect_history_entries(&history, history_start)?
+                .into_iter()
+                .rev()
+                .take(2)
+                .rev()
+                .collect::<Vec<_>>()
         );
 
         Ok(())
@@ -4499,7 +4519,7 @@ mod tests {
         )?;
 
         let dest_realpath = dest_path.within(&datadir);
-
+        let history_start = history_start(&history)?;
         cache.rename(
             &mut tree,
             &mut blobs,
@@ -4523,11 +4543,17 @@ mod tests {
         assert_eq!(14, dest_entry.size);
         assert!(dest_entry.local,);
 
-        // history entry reports old hash
-        let (_, history_entry) = history.history(0..).last().unwrap().unwrap();
         assert_eq!(
-            HistoryTableEntry::Rename(source_path, dest_path, source_hash, Some(dest_hash)),
-            history_entry
+            vec![
+                HistoryTableEntry::Replace(dest_path, dest_hash),
+                HistoryTableEntry::Remove(source_path, source_hash)
+            ],
+            collect_history_entries(&history, history_start)?
+                .into_iter()
+                .rev()
+                .take(2)
+                .rev()
+                .collect::<Vec<_>>()
         );
 
         Ok(())
@@ -4615,6 +4641,7 @@ mod tests {
         let dest_dir = Path::parse("dest_dir")?;
         let file1_path = Path::parse("source_dir/file1.txt")?;
         let file2_path = Path::parse("source_dir/subdir/file2.txt")?;
+        let file3_path = Path::parse("source_dir/subdir/file3.txt")?;
 
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree()?;
@@ -4635,6 +4662,7 @@ mod tests {
             5,
             hash1.clone(),
         )?;
+        let file1_pathid = tree.resolve(&file1_path)?.unwrap();
 
         let hash2 = hash::digest("file2");
         cache.notify_added(
@@ -4647,10 +4675,28 @@ mod tests {
             5,
             hash2.clone(),
         )?;
+        let file2_pathid = tree.resolve(&file2_path)?.unwrap();
+
+        let file3_realpath = file3_path.within(cache.datadir());
+        std::fs::create_dir_all(file3_realpath.parent().unwrap()).unwrap();
+        std::fs::write(&file3_realpath, "test").unwrap();
+        let file3_mtime = UnixTime::mtime(&file3_realpath.metadata()?);
+        let hash3 = hash::digest("test");
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &file3_path,
+            4,
+            file3_mtime,
+            hash3.clone(),
+        )?;
+        let file3_pathid = tree.resolve(&file3_path)?.unwrap();
 
         let source_dir_pathid = tree.expect(&source_dir)?;
-        dirty.delete_range(0, 999)?;
-
+        clear_dirty(&mut dirty)?;
+        let history_start = history_start(&history)?;
         // Perform the directory rename
         cache.rename(
             &mut tree,
@@ -4662,9 +4708,9 @@ mod tests {
             /*noreplace=*/ true,
         )?;
 
-        // After directory rename, the updated implementation should remove the source directory
-        // and all of its subdirectories once their contents are moved to the destination
-        log::debug!("check dir {source_dir:?} {:?}", tree.resolve(&source_dir));
+        // After directory rename, rename should remove the source
+        // directory and all of its subdirectories once their contents
+        // are moved to the destination
         assert!(
             cache.metadata(&tree, &source_dir)?.is_none(),
             "Source directory should be removed after rename"
@@ -4678,41 +4724,57 @@ mod tests {
         // Verify files moved correctly to destination directory
         let moved_file1 = Path::parse("dest_dir/file1.txt")?;
         let moved_file2 = Path::parse("dest_dir/subdir/file2.txt")?;
+        let moved_file3 = Path::parse("dest_dir/subdir/file3.txt")?;
 
-        let file1_entry = cache.file_entry_or_err(&tree, &moved_file1)?;
+        let file1_entry = cache.file_entry(&tree, &moved_file1)?.unwrap();
         assert_eq!(hash1, file1_entry.hash);
         assert_eq!(5, file1_entry.size);
         assert_eq!(test_time(), file1_entry.mtime);
+        assert!(!file1_entry.local);
 
-        let file2_entry = cache.file_entry_or_err(&tree, &moved_file2)?;
+        let file2_entry = cache.file_entry(&tree, &moved_file2)?.unwrap();
         assert_eq!(hash2, file2_entry.hash);
         assert_eq!(5, file2_entry.size);
         assert_eq!(test_time(), file2_entry.mtime);
+        assert!(!file2_entry.local);
+
+        let file3_entry = cache.file_entry(&tree, &moved_file3)?.unwrap();
+        assert_eq!(hash3, file3_entry.hash);
+        assert_eq!(4, file3_entry.size);
+        assert_eq!(file3_mtime, file3_entry.mtime);
+        assert!(file3_entry.local);
+
+        let moved_file3_realpath = moved_file3.within(cache.datadir());
+        assert!(moved_file3_realpath.exists());
+        assert_eq!("test", std::fs::read_to_string(&moved_file3_realpath)?);
 
         // Original file paths should not exist (since source directory tree is removed)
-        assert!(
-            cache.file_entry(&tree, &file1_path)?.is_none(),
-            "Original file1 path should not exist after directory rename"
-        );
-        assert!(
-            cache.file_entry(&tree, &file2_path)?.is_none(),
-            "Original file2 path should not exist after directory rename"
-        );
+        assert!(cache.file_entry(&tree, &file1_path)?.is_none(),);
+        assert!(cache.file_entry(&tree, &file2_path)?.is_none(),);
+        assert!(cache.file_entry(&tree, &file3_path)?.is_none(),);
+        assert!(!file3_path.within(cache.datadir()).exists());
 
-        // Source subdirectory should also be removed
-        let source_subdir = Path::parse("source_dir/subdir")?;
-        assert!(
-            cache.metadata(&tree, &source_subdir)?.is_none(),
-            "Source subdirectory should be removed after rename"
-        );
+        // Source directory should also be removed, both in the cache and the filesystem.
+        let source_dir = Path::parse("source_dir")?;
+        assert!(cache.metadata(&tree, &source_dir)?.is_none(),);
+        assert!(!source_dir.within(cache.datadir()).exists());
 
         // Check that files are marked dirty
+        let moved_file1_pathid = tree.resolve(&moved_file1)?.unwrap();
+        let moved_file2_pathid = tree.resolve(&moved_file2)?.unwrap();
+        let moved_file3_pathid = tree.resolve(&moved_file3)?.unwrap();
         let dest_dir_pathid = tree.expect(&dest_dir)?;
-        let dirty_pathids = dirty_pathids(&dirty)?;
-        assert!(dirty_pathids.contains(&tree.resolve(&file1_path)?.unwrap()));
-        assert!(dirty_pathids.contains(&tree.resolve(&file2_path)?.unwrap()));
-        assert!(dirty_pathids.contains(&tree.resolve(&moved_file1)?.unwrap()));
-        assert!(dirty_pathids.contains(&tree.resolve(&moved_file2)?.unwrap()));
+        assert_eq!(
+            HashSet::from([
+                file1_pathid,
+                file2_pathid,
+                file3_pathid,
+                moved_file1_pathid,
+                moved_file2_pathid,
+                moved_file3_pathid
+            ]),
+            dirty_pathids(&dirty)?
+        );
 
         // Directory inode should be swapped - at least for the top
         // directories.
@@ -4733,16 +4795,14 @@ mod tests {
             cache.map_to_pathid(Inode(source_dir_pathid.as_u64()))?
         );
 
-        let history_entries: Vec<_> = history
-            .history(0..)
-            .map(|res| res.map(|(_, val)| val))
-            .collect::<Result<Vec<_>, _>>()?;
         assert_unordered::assert_eq_unordered!(
             vec![
                 HistoryTableEntry::Rename(file1_path, moved_file1, hash1, None),
-                HistoryTableEntry::Rename(file2_path, moved_file2, hash2, None)
+                HistoryTableEntry::Rename(file2_path, moved_file2, hash2, None),
+                HistoryTableEntry::Add(moved_file3),
+                HistoryTableEntry::Remove(file3_path, hash3),
             ],
-            history_entries
+            collect_history_entries(&history, history_start)?
         );
 
         Ok(())
@@ -5121,8 +5181,8 @@ mod tests {
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
 
-        // Clear any existing dirty entries
-        dirty.delete_range(0, 999)?;
+        clear_dirty(&mut dirty)?;
+        let history_start = history_start(&history)?;
 
         // Add a file
         cache.index(
@@ -5143,7 +5203,7 @@ mod tests {
         assert!(dirty_paths(&dirty, &tree)?.contains(&path));
 
         // Verify history entry was added (Add entry)
-        let history_entries = collect_history_entries(&history)?;
+        let history_entries = collect_history_entries(&history, history_start)?;
         assert_eq!(history_entries.len(), 1);
         match &history_entries[0] {
             HistoryTableEntry::Add(entry_path) => {
@@ -5172,7 +5232,7 @@ mod tests {
         let mut history = txn.write_history()?;
 
         // Clear any existing dirty entries
-        dirty.delete_range(0, 999)?;
+        clear_dirty(&mut dirty)?;
 
         // Add initial file
         cache.index(
@@ -5186,10 +5246,10 @@ mod tests {
             hash1.clone(),
         )?;
 
-        // Clear dirty entries from first add
-        dirty.delete_range(0, 999)?;
+        clear_dirty(&mut dirty)?;
 
         // Replace the file
+        let history_start = history_start(&history)?;
         cache.index(
             &mut tree,
             &mut blobs,
@@ -5210,21 +5270,13 @@ mod tests {
         assert!(dirty_paths.contains(&path));
 
         // Verify history entries were added (Add + Replace entries)
-        let history_entries = collect_history_entries(&history)?;
-        assert_eq!(history_entries.len(), 2);
-        match &history_entries[0] {
-            HistoryTableEntry::Add(entry_path) => {
-                assert_eq!(entry_path, &path);
-            }
-            _ => panic!("Expected Add history entry"),
-        }
-        match &history_entries[1] {
-            HistoryTableEntry::Replace(entry_path, old_hash) => {
-                assert_eq!(entry_path, &path);
-                assert_eq!(old_hash, &hash1);
-            }
-            _ => panic!("Expected Replace history entry"),
-        }
+        assert_eq!(
+            vec![
+                HistoryTableEntry::Add(path.clone()),
+                HistoryTableEntry::Replace(path.clone(), hash1)
+            ],
+            collect_history_entries(&history, history_start)?
+        );
 
         Ok(())
     }
@@ -5255,8 +5307,8 @@ mod tests {
             hash.clone(),
         )?;
 
-        // Clear dirty entries from add
-        dirty.delete_range(0, 999)?;
+        let history_start = history_start(&history)?;
+        clear_dirty(&mut dirty)?;
 
         // Remove the file
         let removed =
@@ -5270,21 +5322,13 @@ mod tests {
         assert_eq!(HashSet::from([pathid]), dirty_pathids(&dirty)?);
 
         // Verify history entries were added (Add + Remove entries)
-        let history_entries = collect_history_entries(&history)?;
-        assert_eq!(history_entries.len(), 2);
-        match &history_entries[0] {
-            HistoryTableEntry::Add(entry_path) => {
-                assert_eq!(entry_path, &path);
-            }
-            _ => panic!("Expected Add history entry"),
-        }
-        match &history_entries[1] {
-            HistoryTableEntry::Remove(entry_path, removed_hash) => {
-                assert_eq!(entry_path, &path);
-                assert_eq!(removed_hash, &hash);
-            }
-            _ => panic!("Expected Remove history entry"),
-        }
+        assert_eq!(
+            vec![
+                HistoryTableEntry::Add(path.clone()),
+                HistoryTableEntry::Remove(path.clone(), hash)
+            ],
+            collect_history_entries(&history, history_start)?
+        );
 
         Ok(())
     }
@@ -5328,8 +5372,8 @@ mod tests {
             hash2.clone(),
         )?;
 
-        // Clear dirty entries from adds
-        dirty.delete_range(0, 999)?;
+        clear_dirty(&mut dirty)?;
+        let history_start = history_start(&history)?;
 
         // Remove the directory
         cache.remove_from_index_recursively(
@@ -5348,7 +5392,7 @@ mod tests {
         assert_eq!(HashSet::from([pathid1, pathid2]), dirty_pathids(&dirty)?);
 
         // Verify history entries were added (2 Add + 2 Remove entries)
-        let history_entries = collect_history_entries(&history)?;
+        let history_entries = collect_history_entries(&history, history_start)?;
         assert_unordered::assert_eq_unordered!(
             vec![
                 HistoryTableEntry::Add(path1.clone()),
