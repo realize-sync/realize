@@ -1041,9 +1041,13 @@ impl<'a> WritableOpenCache<'a> {
         history: &mut WritableOpenHistory,
         loc: L,
     ) -> Result<(PathBuf, PathBuf), StorageError> {
-        let pathid = tree.expect(loc)?;
+        let loc = loc.into();
+        let pathid = tree.expect(loc.borrow())?;
+        let path = tree.backtrack(loc)?.ok_or(StorageError::IsADirectory)?;
+        // Note that entry.path is not usable here as it would be
+        // incorrect in a branched entry.
+
         let entry = default_file_entry_or_err(&self.table, pathid)?;
-        let path = &entry.path;
         let source = blobs
             .prepare_export(tree, pathid)?
             .ok_or(StorageError::Unavailable)?;
