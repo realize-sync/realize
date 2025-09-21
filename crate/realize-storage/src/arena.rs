@@ -50,7 +50,6 @@ impl ArenaStorage {
         let shutdown = CancellationToken::new();
         let dbpath = arena_config.workdir.join("arena.db");
         let datadir = &arena_config.datadir;
-        log::debug!("[{arena}] Arena setup with database {dbpath:?} and datadir {datadir:?}");
         let db = ArenaDatabase::new(
             redb_utils::open(&dbpath).await?,
             arena,
@@ -58,7 +57,9 @@ impl ArenaStorage {
             &arena_config.workdir.join("blobs"),
             datadir,
         )
-        .with_context(|| format!("[{arena}] Arena database in {dbpath:?}",))?;
+        .with_context(|| format!("Arena {arena} database in {dbpath:?}",))?;
+        let tag = db.tag();
+        log::debug!("[{tag}] Arena setup with database {dbpath:?} and datadir {datadir:?}",);
 
         let arena_fs = ArenaFilesystem::new(arena, Arc::clone(&db))?;
         let exclude = exclude
@@ -66,7 +67,7 @@ impl ArenaStorage {
             .filter_map(|p| realize_types::Path::from_real_path_in(p, &datadir))
             .collect::<Vec<_>>();
         log::info!(
-            "[{arena}] Watching {datadir:?}{}",
+            "[{tag}] Watching {datadir:?}{}",
             exclude
                 .iter()
                 .map(|p| format!(" -\"{p}\""))
@@ -102,7 +103,7 @@ impl ArenaStorage {
             async move { blob::mark_accessed_loop(db, Duration::from_millis(500), shutdown).await }
         });
 
-        let engine = Engine::new(arena, Arc::clone(&db), job_retry_strategy);
+        let engine = Engine::new(Arc::clone(&db), job_retry_strategy);
 
         jobs::StorageJobProcessor::new(Arc::clone(&db), Arc::clone(&engine))
             .spawn(shutdown.clone());

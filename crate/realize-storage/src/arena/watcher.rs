@@ -127,7 +127,7 @@ impl RealWatcher {
         max_parallelism: usize,
     ) -> anyhow::Result<Self> {
         let root = fs::canonicalize(db.index().datadir()).await?;
-        let arena = db.arena();
+        let tag = db.tag();
 
         let (watch_tx, watch_rx) = mpsc::channel(100);
 
@@ -140,7 +140,7 @@ impl RealWatcher {
                     let root = root.clone();
                     move |ev: Result<Event, notify::Error>| {
                         if let Ok(ev) = ev {
-                            log::trace!("[{arena}] Notify event: {ev:?}");
+                            log::trace!("[{tag}] Notify event: {ev:?}");
                             if ev.flag() == Some(notify::event::Flag::Rescan) {
                                 let _ = watch_tx.blocking_send(FsEvent::Rescan);
                             }
@@ -297,7 +297,7 @@ impl RealWatcherWorker {
         watch_tx: mpsc::Sender<FsEvent>,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) {
-        let arena = self.db.arena();
+        let tag = self.db.tag();
         loop {
             tokio::select!(
             _ = shutdown_rx.recv() =>{
@@ -310,19 +310,17 @@ impl RealWatcherWorker {
                 // run scan, below
             });
             let root = self.db.index().datadir();
-            log::info!("[{arena}] Scanning {root:?}");
+            log::info!("[{tag}] Scanning {root:?}");
             if let Err(err) = self.rescan_added(&watch_tx, &mut shutdown_rx).await {
-                log::warn!("[{arena}] Scanning {root:?} for added files failed: {err}");
+                log::warn!("[{tag}] Scanning {root:?} for added files failed: {err}");
             }
             if let Err(err) = self
                 .rescan_removed_or_modified(&watch_tx, &mut shutdown_rx)
                 .await
             {
-                log::warn!(
-                    "[{arena}] Scanning {root:?} for modified or removed files failed: {err}",
-                );
+                log::warn!("[{tag}] Scanning {root:?} for modified or removed files failed: {err}",);
             }
-            log::info!("[{arena}] Finished scanning {root:?}");
+            log::info!("[{tag}] Finished scanning {root:?}");
         }
     }
 
@@ -446,7 +444,7 @@ impl RealWatcherWorker {
         rescan_tx: mpsc::Sender<()>,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) {
-        let arena = self.db.arena();
+        let tag = self.db.tag();
         let mut debouncer = DebouncerMap::new(debounce, max_parallelism);
         loop {
             tokio::select!(
@@ -457,15 +455,15 @@ impl RealWatcherWorker {
                     match ev {
                         None =>{ break; }
                         Some(ev) =>{
-                            log::debug!("[{arena}] {ev:?}");
+                            log::debug!("[{tag}] {ev:?}");
                             if let Err(err) = self.handle_event(&ev, &rescan_tx, &mut debouncer).await {
-                                log::warn!("[{arena}] Handling of {ev:?} failed: {err}");
+                                log::warn!("[{tag}] Handling of {ev:?} failed: {err}");
                             }
                         }
                     }
                 }
                 Some((path, Err(err))) = debouncer.join_next() => {
-                    log::debug!("[{arena}] Indexing failed for \"{path}\": {err:?}");
+                    log::debug!("[{tag}] Indexing failed for \"{path}\": {err:?}");
                 }
             );
         }
@@ -489,10 +487,10 @@ impl RealWatcherWorker {
                         let db = self.db.clone();
                         let path = path.clone();
                         async move {
-                            let arena = db.arena();
-                            log::info!("[{arena}] Remove: \"{path}\"");
+                            let tag = db.tag();
+                            log::info!("[{tag}] Remove: \"{path}\"");
                             if !index::remove_file_if_missing_async(&db, &path).await? {
-                                log::debug!("[{arena}] Mismatch; Skipped removing \"{path}\"",);
+                                log::debug!("[{tag}] Mismatch; Skipped removing \"{path}\"",);
                             }
                             Ok(())
                         }
@@ -649,7 +647,7 @@ impl RealWatcherWorker {
             };
 
             if let Err(err) = self.file_created_or_modified(&path, &m, debouncer).await {
-                log::debug!("[{}] Failed to add \"{path}\": {err}", self.db.arena());
+                log::debug!("[{}] Failed to add \"{path}\": {err}", self.db.tag());
             }
         }
 
@@ -683,10 +681,10 @@ impl RealWatcherWorker {
                 } else {
                     hash::empty()
                 };
-                let arena = db.arena();
-                log::info!("[{arena}] Hashed: \"{path}\" {hash} size={size}");
+                let tag = db.tag();
+                log::info!("[{tag}] Hashed: \"{path}\" {hash} size={size}");
                 if !index::add_file_if_matches_async(&db, &path, size, mtime, hash).await? {
-                    log::debug!("[{arena}] Mismatch; Skipped adding \"{path}\"",);
+                    log::debug!("[{tag}] Mismatch; Skipped adding \"{path}\"",);
                 }
                 Ok(())
             }
@@ -1344,8 +1342,8 @@ mod tests {
                 // is inacessible.
                 // TODO: fix it
                 log::warn!(
-                    "[{arena}] FIXME: Watch with an inaccessible subdir failed: {err}",
-                    arena = fixture.db.arena()
+                    "[{tag}] FIXME: Watch with an inaccessible subdir failed: {err}",
+                    tag = fixture.db.tag()
                 );
                 return Ok(());
             }

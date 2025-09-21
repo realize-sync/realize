@@ -7,6 +7,7 @@ use super::types::{
     RemoteAvailability,
 };
 use crate::arena::blob::BlobReadOperations;
+use crate::arena::db::Tag;
 use crate::arena::history::WritableOpenHistory;
 use crate::arena::mark::MarkReadOperations;
 use crate::arena::tree::{self, TreeLoc};
@@ -15,7 +16,7 @@ use crate::global::types::PathAssignment;
 use crate::types::Inode;
 use crate::utils::holder::Holder;
 use crate::{PathId, StorageError};
-use realize_types::{Arena, Hash, Path, Peer, UnixTime};
+use realize_types::{Hash, Path, Peer, UnixTime};
 use redb::{ReadableTable, Table};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -89,7 +90,6 @@ where
     pathid_to_inode: PN,
     #[allow(dead_code)]
     inode_to_pathid: NP,
-    arena: Arena,
     index: &'a Index,
 }
 
@@ -103,14 +103,12 @@ where
         table: T,
         pathid_to_inode: PN,
         inode_to_pathid: NP,
-        arena: Arena,
         index: &'a Index,
     ) -> Self {
         Self {
             table,
             pathid_to_inode,
             inode_to_pathid,
-            arena,
             index,
         }
     }
@@ -149,7 +147,7 @@ where
         loc: L,
         hash: &Hash,
     ) -> Result<Option<RemoteAvailability>, StorageError> {
-        remote_availability(&self.table, tree, loc, self.arena, hash)
+        remote_availability(&self.table, tree, loc, hash)
     }
 
     fn readdir<'b, L: Into<TreeLoc<'b>>>(
@@ -218,7 +216,7 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         loc: L,
         hash: &Hash,
     ) -> Result<Option<RemoteAvailability>, StorageError> {
-        remote_availability(&self.table, tree, loc, self.arena, hash)
+        remote_availability(&self.table, tree, loc, hash)
     }
 
     fn readdir<'b, L: Into<TreeLoc<'b>>>(
@@ -378,17 +376,17 @@ pub(crate) struct WritableOpenCache<'a> {
     pathid_to_inode: Table<'a, PathId, Inode>,
     inode_to_pathid: Table<'a, Inode, PathId>,
     pending_catchup_table: Table<'a, (&'static str, PathId), ()>,
-    arena: Arena,
+    tag: Tag,
     index: &'a Index,
 }
 
 impl<'a> WritableOpenCache<'a> {
     pub(crate) fn new(
+        tag: Tag,
         table: Table<'a, (PathId, Layer), Holder<CacheTableEntry>>,
         pathid_to_inode: Table<'a, PathId, Inode>,
         inode_to_pathid: Table<'a, Inode, PathId>,
         pending_catchup_table: Table<'a, (&'static str, PathId), ()>,
-        arena: Arena,
         index: &'a Index,
     ) -> Self {
         Self {
@@ -396,7 +394,7 @@ impl<'a> WritableOpenCache<'a> {
             pathid_to_inode,
             inode_to_pathid,
             pending_catchup_table,
-            arena,
+            tag,
             index,
         }
     }
@@ -430,7 +428,7 @@ impl<'a> WritableOpenCache<'a> {
         let e = default_file_entry_or_err(&self.table, pathid)?;
         log::debug!(
             "[{}]@local Local removal of \"{}\" pathid {pathid} {}",
-            self.arena,
+            self.tag,
             e.path,
             e.hash
         );
@@ -713,13 +711,13 @@ impl<'a> WritableOpenCache<'a> {
         let file_pathid = tree.setup(&path)?;
         let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
         if peer_file_entry(&self.table, file_pathid, Some(peer))?.is_none() {
-            log::debug!("[{}]@{peer} Add \"{path}\" {hash} size={size}", self.arena);
+            log::debug!("[{}]@{peer} Add \"{path}\" {hash} size={size}", self.tag);
             self.write_file_entry(tree, file_pathid, peer, &entry)?;
             dirty.mark_dirty(file_pathid, "add_from_peer")?;
         }
         Ok(
             if peer_file_entry(&self.table, file_pathid, None)?.is_none() {
-                log::debug!("[{}]@local Add \"{path}\" {hash} size={size}", self.arena);
+                log::debug!("[{}]@local Add \"{path}\" {hash} size={size}", self.tag);
                 self.write_default_file_entry(tree, blobs, dirty, file_pathid, &entry)?;
             },
         )
@@ -746,7 +744,7 @@ impl<'a> WritableOpenCache<'a> {
         {
             log::debug!(
                 "[{}]@{peer} \"{path}\" {hash} size={size} replaces {old_hash}",
-                self.arena
+                self.tag
             );
             self.write_file_entry(tree, file_pathid, peer, &entry)?;
             dirty.mark_dirty(file_pathid, "replace_from_peer")?;
@@ -757,7 +755,7 @@ impl<'a> WritableOpenCache<'a> {
         {
             log::debug!(
                 "[{}]@local \"{path}\" {hash} size={size} replaces {old_hash}",
-                self.arena
+                self.tag
             );
             self.write_default_file_entry(tree, blobs, dirty, file_pathid, &entry)?;
         }
@@ -940,7 +938,7 @@ impl<'a> WritableOpenCache<'a> {
             {
                 log::debug!(
                     "[{}]@{peer} Remove \"{path}\" pathid {pathid} {old_hash}",
-                    self.arena
+                    self.tag
                 );
 
                 self.rm_peer_file_entry(tree, pathid, peer)?;
@@ -951,7 +949,7 @@ impl<'a> WritableOpenCache<'a> {
                 {
                     log::debug!(
                         "[{}]@local Remove \"{path}\" pathid {pathid} {old_hash}",
-                        self.arena
+                        self.tag
                     );
                     self.rm_default_file_entry(tree, blobs, dirty, pathid)?;
                 }
@@ -1093,7 +1091,7 @@ impl<'a> WritableOpenCache<'a> {
         if indexed.size != metadata.len() || indexed.mtime != UnixTime::mtime(&metadata) {
             return Err(StorageError::DatabaseOutdated(format!(
                 "[{}] index outdated for {pathid} \"{path:?}\"",
-                tree.arena()
+                self.tag
             )));
         }
         history.report_dropped(&path, &indexed.hash)?;
@@ -1105,7 +1103,7 @@ impl<'a> WritableOpenCache<'a> {
             // The file is useful as a blob; import it
             log::debug!(
                 "[{}] Unrealize; import \"{path:?}\" {}",
-                tree.arena(),
+                self.tag,
                 cached.hash
             );
 
@@ -1123,7 +1121,7 @@ impl<'a> WritableOpenCache<'a> {
         }
         log::debug!(
             "[{}] Unrealize; drop outdated \"{path:?}\" {}",
-            tree.arena(),
+            self.tag,
             indexed.hash
         );
 
@@ -1215,7 +1213,7 @@ impl<'a> WritableOpenCache<'a> {
                 entry.outdated_by = Some(new_hash.clone());
                 log::debug!(
                     "[{}] outdated: {} {old_hash}, new version: {new_hash})",
-                    tree.arena(),
+                    self.tag,
                     pathid
                 );
 
@@ -1349,7 +1347,6 @@ fn remote_availability<'b, L: Into<TreeLoc<'b>>>(
     cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
     tree: &impl TreeReadOperations,
     loc: L,
-    arena: Arena,
     hash: &Hash,
 ) -> Result<Option<RemoteAvailability>, StorageError> {
     let mut avail = None;
@@ -1364,7 +1361,7 @@ fn remote_availability<'b, L: Into<TreeLoc<'b>>>(
             let (peer, file_entry) = entry?;
             avail
                 .get_or_insert_with(|| RemoteAvailability {
-                    arena,
+                    arena: tree.arena(),
                     path: file_entry.path,
                     size: file_entry.size,
                     hash: file_entry.hash,
@@ -1377,10 +1374,6 @@ fn remote_availability<'b, L: Into<TreeLoc<'b>>>(
             next = default_file_entry(cache_table, pathid)?.and_then(|e| e.branched_from);
         }
     }
-    if avail.is_none() {
-        log::warn!("[{arena}] No peer has hash {hash} for {pathid}",);
-    }
-
     Ok(avail)
 }
 

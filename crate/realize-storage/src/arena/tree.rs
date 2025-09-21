@@ -2,6 +2,7 @@
 
 use super::db::BeforeCommit;
 use crate::PathIdAllocator;
+use crate::arena::db::Tag;
 use crate::{PathId, StorageError};
 use realize_types::{Arena, Path};
 use redb::{ReadableTable, Table};
@@ -65,6 +66,7 @@ pub(crate) struct ReadableOpenTree<T>
 where
     T: ReadableTable<(PathId, &'static str), PathId>,
 {
+    tag: Tag,
     table: T,
     root: PathId,
     arena: Arena,
@@ -74,8 +76,9 @@ impl<T> ReadableOpenTree<T>
 where
     T: ReadableTable<(PathId, &'static str), PathId>,
 {
-    pub(crate) fn new(table: T, tree: &Tree) -> Self {
+    pub(crate) fn new(tag: Tag, table: T, tree: &Tree) -> Self {
         Self {
+            tag,
             table,
             root: tree.root,
             arena: tree.arena,
@@ -116,6 +119,9 @@ pub(crate) trait TreeReadOperations {
 
     /// Returns the arena this tree belongs to.
     fn arena(&self) -> Arena;
+
+    /// Return the database tag, for logging.
+    fn tag(&self) -> Tag;
 }
 
 impl<T> TreeReadOperations for ReadableOpenTree<T>
@@ -147,6 +153,9 @@ where
     fn arena(&self) -> Arena {
         self.arena
     }
+    fn tag(&self) -> Tag {
+        self.tag
+    }
 }
 
 impl<'a> TreeReadOperations for WritableOpenTree<'a> {
@@ -174,6 +183,9 @@ impl<'a> TreeReadOperations for WritableOpenTree<'a> {
     }
     fn arena(&self) -> Arena {
         self.tree.arena
+    }
+    fn tag(&self) -> Tag {
+        self.tag
     }
 }
 
@@ -480,6 +492,7 @@ where
 
 /// A tree open for write with [OpenTree::write_tree].
 pub(crate) struct WritableOpenTree<'a> {
+    tag: Tag,
     before_commit: &'a BeforeCommit,
     table: Table<'a, (PathId, &'static str), PathId>,
     refcount_table: Table<'a, PathId, u32>,
@@ -489,6 +502,7 @@ pub(crate) struct WritableOpenTree<'a> {
 
 impl<'a> WritableOpenTree<'a> {
     pub(crate) fn new(
+        tag: Tag,
         before_commit: &'a BeforeCommit,
         tree_table: Table<'a, (PathId, &'static str), PathId>,
         refcount_table: Table<'a, PathId, u32>,
@@ -496,6 +510,7 @@ impl<'a> WritableOpenTree<'a> {
         tree: &'a Tree,
     ) -> Self {
         Self {
+            tag,
             before_commit,
             table: tree_table,
             refcount_table,
@@ -680,7 +695,7 @@ impl<'a> WritableOpenTree<'a> {
     fn setup_path(&mut self, path: &Path) -> Result<PathId, StorageError> {
         let (pathid, added) = self.add_path(path.as_ref())?;
         if added {
-            log::debug!("[{}] \"{path}\" = pathid {pathid}", self.tree.arena);
+            log::debug!("[{}] \"{path}\" = pathid {pathid}", self.tag);
             self.before_commit.add(move |txn| {
                 // Check refcount and delete the entry if it reaches
                 // 0. Note that the allocated pathid is lost, so it's
@@ -708,7 +723,7 @@ impl<'a> WritableOpenTree<'a> {
         if added {
             log::debug!(
                 "[{}] \"{name}\" = pathid {pathid}, in parent pathid {parent_pathid} ",
-                self.tree.arena
+                self.tag
             );
             self.before_commit.add(move |txn| {
                 // Check refcount and delete the entry if it reaches
@@ -770,10 +785,7 @@ impl<'a> WritableOpenTree<'a> {
             .map(|v| v.value())
             .unwrap_or(0);
         if refcount == 0 {
-            log::trace!(
-                "[{}] PathId {pathid} got its first reference",
-                self.tree.arena
-            );
+            log::trace!("[{}] PathId {pathid} got its first reference", self.tag);
         }
 
         refcount += 1;
@@ -813,7 +825,7 @@ impl<'a> WritableOpenTree<'a> {
         if refcount == 0 {
             log::warn!(
                 "[{}] Refcount of {pathid} was never increased; Cleaning up.",
-                self.tree.arena
+                self.tag
             );
             self.remove_mapping(pathid)?;
         }
@@ -827,7 +839,7 @@ impl<'a> WritableOpenTree<'a> {
     fn remove_mapping(&mut self, pathid: PathId) -> Result<(), StorageError> {
         log::trace!(
             "[{}] PathId {pathid} lost its last reference; Cleaning up.",
-            self.tree.arena
+            self.tag
         );
         self.refcount_table.remove(pathid)?;
         let parent = self.table.remove((pathid, ".."))?.map(|v| v.value());

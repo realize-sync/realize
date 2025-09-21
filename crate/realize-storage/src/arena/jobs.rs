@@ -37,7 +37,7 @@ impl StorageJobProcessor {
             if let Err(err) = self.process_and_report(job_id, job).await {
                 log::debug!(
                     "[{}] Job #{job_id} Failed to report result: {err}",
-                    self.db.arena()
+                    self.db.tag()
                 )
             }
         }
@@ -51,7 +51,7 @@ impl StorageJobProcessor {
         let this = Arc::clone(self);
         task::spawn_blocking(move || {
             if !matches!(job, StorageJob::External(_)) {
-                log::info!("[{}] Job #{job_id} Starting {job:?}", this.db.arena());
+                log::info!("[{}] Job #{job_id} Starting {job:?}", this.db.tag());
             }
             if let Some(status) = this.process_job(job) {
                 this.engine
@@ -140,7 +140,7 @@ impl StorageJobProcessor {
         }
         txn.commit()?;
 
-        let arena = self.db.arena();
+        let tag = self.db.tag();
 
         // Database changes are ready. Make the fs change.
         //
@@ -150,13 +150,13 @@ impl StorageJobProcessor {
         // be propagated to other peers.
         if let Some(cachepath) = &cachepath {
             std::fs::rename(&realpath, cachepath)?;
-            log::debug!("[{arena}] Renamed {realpath:?} to {cachepath:?}",);
+            log::debug!("[{tag}] Renamed {realpath:?} to {cachepath:?}",);
         } else {
             std::fs::remove_file(&realpath)?;
-            log::debug!("[{arena}] Deleted {realpath:?}");
+            log::debug!("[{tag}] Deleted {realpath:?}");
         }
 
-        log::info!("[{arena}] Unrealized pathid {pathid} {hash} from {realpath:?}",);
+        log::info!("[{tag}] Unrealized pathid {pathid} {hash} from {realpath:?}",);
 
         return Ok(JobStatus::Done);
     }
@@ -177,7 +177,7 @@ impl StorageJobProcessor {
         cache_hash: Hash,
         index_hash: Option<Hash>,
     ) -> Result<JobStatus, StorageError> {
-        let arena = self.db.arena();
+        let tag = self.db.tag();
         let source: PathBuf;
         let dest: PathBuf;
         let txn = self.db.begin_write()?;
@@ -259,7 +259,7 @@ impl StorageJobProcessor {
             std::fs::rename(&dest, &source)?;
         }
         ret?;
-        log::info!("[{arena}] Realized pathid {pathid} {cache_hash} as {dest:?}");
+        log::info!("[{tag}] Realized pathid {pathid} {cache_hash} as {dest:?}");
 
         Ok(JobStatus::Done)
     }
@@ -308,7 +308,7 @@ mod tests {
             let db = ArenaDatabase::for_testing_single_arena(arena, &blob_dir, &root)?;
             let cache = ArenaFilesystem::new(arena, Arc::clone(&db))?;
 
-            let engine = Engine::new(arena, Arc::clone(&db), |attempt| {
+            let engine = Engine::new(Arc::clone(&db), |attempt| {
                 if attempt < 3 {
                     Some(Duration::from_secs(1))
                 } else {
@@ -435,17 +435,14 @@ mod tests {
         }
 
         async fn unrealize(&self, path: Path, hash: Hash) -> anyhow::Result<JobStatus> {
-            log::debug!(
-                "[{arena}] Unrealize \"{path}\" {hash}",
-                arena = self.processor.db.arena()
-            );
+            log::debug!("[{}] Unrealize \"{path}\" {hash}", self.processor.db.tag());
             let pathid = self.pathid(&path)?;
             let processor = Arc::clone(&self.processor);
-            let arena = self.processor.db.arena();
+            let tag = self.processor.db.tag();
             tokio::task::spawn_blocking(move || {
                 let status = processor.unrealize(pathid, hash)?;
 
-                log::debug!("[{arena}] -> {status:?}", arena = arena);
+                log::debug!("[{tag}] -> {status:?}");
                 Ok::<JobStatus, anyhow::Error>(status)
             })
             .await?
@@ -457,17 +454,14 @@ mod tests {
             hash: Hash,
             index_hash: Option<Hash>,
         ) -> anyhow::Result<JobStatus> {
-            log::debug!(
-                "[{arena}] Realize({path}, {hash})",
-                arena = self.processor.db.arena()
-            );
+            let tag = self.processor.db.tag();
+            log::debug!("[{tag}] Realize({path}, {hash})",);
             let pathid = self.pathid(&path)?;
             let processor = Arc::clone(&self.processor);
-            let arena = self.processor.db.arena();
             tokio::task::spawn_blocking(move || {
                 let status = processor.realize(pathid, hash, index_hash)?;
 
-                log::debug!("[{arena}] -> {status:?}", arena = arena);
+                log::debug!("[{tag}] -> {status:?}");
                 Ok::<JobStatus, anyhow::Error>(status)
             })
             .await?

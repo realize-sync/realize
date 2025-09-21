@@ -170,6 +170,7 @@ pub(crate) struct ArenaDatabase {
     uuid: Uuid,
     arena: Arena,
     subsystems: Subsystems,
+    tag: Tag,
 }
 
 struct Subsystems {
@@ -227,6 +228,7 @@ impl ArenaDatabase {
         let history: History;
         let blobs: Blobs;
         let uuid: Uuid;
+        let tag: Tag;
         let txn = db.begin_write()?;
         {
             // Create tables so they can safely be queried in read
@@ -251,9 +253,10 @@ impl ArenaDatabase {
             txn.open_table(INODE_TO_PATHID_TABLE)?;
 
             dirty = Dirty::setup(&dirty_log_table)?;
-            history = History::setup(arena, &history_table)?;
-            blobs = Blobs::setup(blob_dir.as_ref(), &blob_lru_queue_table)?;
+            history = History::setup(&history_table)?;
             uuid = load_or_assign_uuid(&mut settings_table)?;
+            tag = Tag::new(uuid, arena);
+            blobs = Blobs::setup(tag, blob_dir.as_ref(), &blob_lru_queue_table)?;
             cache::init(&mut cache_table, tree.root())?;
         }
         txn.commit()?;
@@ -269,6 +272,7 @@ impl ArenaDatabase {
                 blobs,
                 index,
             },
+            tag,
         }))
     }
 
@@ -279,6 +283,10 @@ impl ArenaDatabase {
     #[allow(dead_code)]
     pub fn arena(&self) -> Arena {
         self.arena
+    }
+
+    pub fn tag(&self) -> Tag {
+        self.tag
     }
 
     /// Return handle on the Tree subsystem.
@@ -312,7 +320,7 @@ impl ArenaDatabase {
     pub fn begin_write(&self) -> Result<ArenaWriteTransaction<'_>, StorageError> {
         Ok(ArenaWriteTransaction {
             inner: self.db.begin_write()?,
-            arena: self.arena,
+            tag: self.tag,
             subsystems: &self.subsystems,
             before_commit: BeforeCommit::new(),
             after_commit: AfterCommit::new(),
@@ -322,15 +330,35 @@ impl ArenaDatabase {
     pub fn begin_read(&self) -> Result<ArenaReadTransaction<'_>, StorageError> {
         Ok(ArenaReadTransaction {
             inner: self.db.begin_read()?,
-            arena: self.arena,
+            tag: self.tag,
             subsystems: &self.subsystems,
         })
     }
 }
 
+/// A short tag that represents the database for logging.
+#[derive(Clone, Copy)]
+pub struct Tag {
+    inner: internment::Intern<String>,
+}
+impl Tag {
+    fn new(uuid: Uuid, arena: Arena) -> Self {
+        let bytes = uuid.as_bytes();
+
+        Self {
+            inner: internment::Intern::new(format!("{:02x?}{:02x?}/{arena}", bytes[14], bytes[15])),
+        }
+    }
+}
+impl std::fmt::Display for Tag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.inner)
+    }
+}
+
 pub struct ArenaWriteTransaction<'db> {
     inner: redb::WriteTransaction,
-    arena: Arena,
+    tag: Tag,
     subsystems: &'db Subsystems,
 
     /// Callbacks to be run after the transaction is committed.
@@ -371,7 +399,6 @@ impl<'db> ArenaWriteTransaction<'db> {
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
             self.inner.open_table(PATHID_TO_INODE_TABLE)?,
             self.inner.open_table(INODE_TO_PATHID_TABLE)?,
-            self.arena,
             &self.subsystems.index,
         ))
     }
@@ -381,13 +408,13 @@ impl<'db> ArenaWriteTransaction<'db> {
         &self,
     ) -> Result<crate::arena::cache::WritableOpenCache<'_>, StorageError> {
         Ok(WritableOpenCache::new(
+            self.tag,
             self.inner
                 .open_table(CACHE_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
             self.inner.open_table(PATHID_TO_INODE_TABLE)?,
             self.inner.open_table(INODE_TO_PATHID_TABLE)?,
             self.inner.open_table(PENDING_CATCHUP_TABLE)?,
-            self.arena,
             &self.subsystems.index,
         ))
     }
@@ -420,6 +447,7 @@ impl<'db> ArenaWriteTransaction<'db> {
     #[track_caller]
     pub(crate) fn read_tree(&self) -> Result<impl TreeReadOperations, StorageError> {
         Ok(ReadableOpenTree::new(
+            self.tag,
             self.inner
                 .open_table(TREE_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
@@ -430,6 +458,7 @@ impl<'db> ArenaWriteTransaction<'db> {
     #[track_caller]
     pub(crate) fn write_tree(&self) -> Result<WritableOpenTree<'_>, StorageError> {
         Ok(WritableOpenTree::new(
+            self.tag,
             &self.before_commit,
             self.inner
                 .open_table(TREE_TABLE)
@@ -455,6 +484,7 @@ impl<'db> ArenaWriteTransaction<'db> {
     #[track_caller]
     pub(crate) fn write_dirty(&self) -> Result<WritableOpenDirty<'_>, StorageError> {
         Ok(WritableOpenDirty::new(
+            self.tag,
             &self.after_commit,
             &self.subsystems.dirty,
             self.inner
@@ -463,7 +493,6 @@ impl<'db> ArenaWriteTransaction<'db> {
             self.inner.open_table(DIRTY_LOG_TABLE)?,
             self.inner.open_table(FAILED_JOB_TABLE)?,
             self.inner.open_table(DIRTY_COUNTER_TABLE)?,
-            self.arena,
         ))
     }
     #[allow(dead_code)]
@@ -479,6 +508,7 @@ impl<'db> ArenaWriteTransaction<'db> {
     #[track_caller]
     pub(crate) fn write_history(&self) -> Result<WritableOpenHistory<'_>, StorageError> {
         Ok(WritableOpenHistory::new(
+            self.tag,
             &self.after_commit,
             &self.subsystems.history,
             self.inner
@@ -522,20 +552,20 @@ impl<'db> ArenaWriteTransaction<'db> {
     #[track_caller]
     pub(crate) fn write_blobs(&self) -> Result<WritableOpenBlob<'_>, StorageError> {
         Ok(WritableOpenBlob::new(
+            self.tag,
             &self.before_commit,
             self.inner
                 .open_table(BLOB_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
             self.inner.open_table(BLOB_LRU_QUEUE_TABLE)?,
             &self.subsystems.blobs,
-            self.arena,
         ))
     }
 }
 
 pub struct ArenaReadTransaction<'db> {
     inner: redb::ReadTransaction,
-    arena: Arena,
+    tag: Tag,
     subsystems: &'db Subsystems,
 }
 
@@ -544,6 +574,7 @@ impl<'db> ArenaReadTransaction<'db> {
     #[track_caller]
     pub(crate) fn read_tree(&self) -> Result<impl TreeReadOperations, StorageError> {
         Ok(ReadableOpenTree::new(
+            self.tag,
             self.inner
                 .open_table(TREE_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
@@ -604,7 +635,6 @@ impl<'db> ArenaReadTransaction<'db> {
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
             self.inner.open_table(PATHID_TO_INODE_TABLE)?,
             self.inner.open_table(INODE_TO_PATHID_TABLE)?,
-            self.arena,
             &self.subsystems.index,
         ))
     }

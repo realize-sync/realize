@@ -2,8 +2,9 @@ use super::db::AfterCommit;
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations};
 use super::types::{FailedJobTableEntry, RetryJob};
 use crate::PathId;
+use crate::arena::db::Tag;
 use crate::{JobId, StorageError, utils::holder::Holder};
-use realize_types::{Arena, UnixTime};
+use realize_types::UnixTime;
 use redb::{ReadableTable, Table};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -55,33 +56,33 @@ where
 }
 
 pub(crate) struct WritableOpenDirty<'a> {
+    tag: Tag,
     after_commit: &'a AfterCommit,
     dirty: &'a Dirty,
     table: Table<'a, PathId, u64>,
     log_table: Table<'a, u64, PathId>,
     failed_job_table: Table<'a, u64, Holder<'static, FailedJobTableEntry>>,
     counter_table: Table<'a, (), u64>,
-    arena: Arena,
 }
 
 impl<'a> WritableOpenDirty<'a> {
     pub(crate) fn new(
+        tag: Tag,
         after_commit: &'a AfterCommit,
         dirty: &'a Dirty,
         dirty_table: Table<'a, PathId, u64>,
         log_table: Table<'a, u64, PathId>,
         failed_job_table: Table<'a, u64, Holder<FailedJobTableEntry>>,
         counter_table: Table<'a, (), u64>,
-        arena: Arena,
     ) -> Self {
         Self {
+            tag,
             after_commit,
             dirty,
             table: dirty_table,
             log_table,
             failed_job_table,
             counter_table,
-            arena,
         }
     }
 }
@@ -298,10 +299,7 @@ impl<'a> WritableOpenDirty<'a> {
     ) -> Result<(), StorageError> {
         let last_counter = self.counter_table.get(())?.map(|e| e.value()).unwrap_or(0);
         let counter = last_counter + 1;
-        log::debug!(
-            "[{}] Dirty pathid {pathid} ({reason}) #{counter}",
-            self.arena
-        );
+        log::debug!("[{}] Dirty pathid {pathid} ({reason}) #{counter}", self.tag);
         self.counter_table.insert((), counter)?;
         self.log_table.insert(counter, pathid)?;
         let prev = self.table.insert(pathid, counter)?;
@@ -323,15 +321,12 @@ fn next_dirty(
     log_table: &impl ReadableTable<u64, PathId>,
     start_counter: u64,
 ) -> Result<Option<(PathId, u64)>, StorageError> {
-    log::debug!("next dirty({start_counter})");
     for entry in log_table.range(start_counter..)? {
         let (key, value) = entry?;
         let counter = key.value();
         let pathid = value.value();
-        log::debug!("-> {counter} {pathid}");
         return Ok(Some((pathid, counter)));
     }
-    log::debug!("-> None");
     Ok(None)
 }
 

@@ -4,12 +4,12 @@ use super::mark::MarkReadOperations;
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
 use super::types::{BlobTableEntry, CacheStatus, LruQueueId, Mark, QueueTableEntry};
 use crate::arena::cache::CacheReadOperations;
+use crate::arena::db::Tag;
 use crate::types::PathId;
 use crate::utils::hash;
 use crate::utils::holder::Holder;
 use crate::{RemoteAvailability, StorageError};
 use priority_queue::PriorityQueue;
-use realize_types::Arena;
 use realize_types::{ByteRange, ByteRanges, Hash};
 use redb::{ReadableTable, Table};
 use std::cmp::{Reverse, min};
@@ -91,6 +91,7 @@ pub(crate) struct Blobs {
 }
 impl Blobs {
     pub(crate) fn setup(
+        tag: Tag,
         blob_dir: &std::path::Path,
         blob_lru_queue_table: &impl redb::ReadableTable<u16, Holder<'static, QueueTableEntry>>,
     ) -> Result<Blobs, StorageError> {
@@ -102,7 +103,7 @@ impl Blobs {
         let (accessed_tx, _) = broadcast::channel(16);
         Ok(Self {
             blob_dir: blob_dir.to_path_buf(),
-            open_blobs: OpenBlobRefCounter::new(),
+            open_blobs: OpenBlobRefCounter::new(tag),
             disk_usage_tx: tx,
             _disk_usage_tx: rx,
             accessed_tx,
@@ -159,12 +160,12 @@ where
 }
 
 pub(crate) struct WritableOpenBlob<'a> {
+    tag: Tag,
     before_commit: &'a BeforeCommit,
 
     blob_table: Table<'a, PathId, Holder<'static, BlobTableEntry>>,
     blob_lru_queue_table: Table<'a, u16, Holder<'static, QueueTableEntry>>,
     subsystem: &'a Blobs,
-    arena: Arena,
 
     /// If true, an after-commit has been registered to report disk usage at
     /// the end of the transaction.
@@ -173,18 +174,18 @@ pub(crate) struct WritableOpenBlob<'a> {
 
 impl<'a> WritableOpenBlob<'a> {
     pub(crate) fn new(
+        tag: Tag,
         before_commit: &'a BeforeCommit,
         blob_table: Table<'a, PathId, Holder<'static, BlobTableEntry>>,
         blob_lru_queue_table: Table<'a, u16, Holder<'static, QueueTableEntry>>,
         subsystem: &'a Blobs,
-        arena: Arena,
     ) -> Self {
         Self {
+            tag,
             before_commit,
             blob_table,
             blob_lru_queue_table,
             subsystem,
-            arena,
             will_report_disk_usage: false,
         }
     }
@@ -470,8 +471,8 @@ impl<'a> WritableOpenBlob<'a> {
         self.add_to_queue_front(queue, pathid, &mut entry)?;
 
         log::debug!(
-            "[{arena}] Created blob {pathid} {hash} in {queue:?} at {blob_path:?} -> {entry:?}",
-            arena = self.arena
+            "[{}] Created blob {pathid} {hash} in {queue:?} at {blob_path:?} -> {entry:?}",
+            self.tag
         );
         tree.insert_and_incref(pathid, &mut self.blob_table, pathid, Holder::new(&entry)?)?;
         Ok((pathid, blob_path, entry))
@@ -680,10 +681,7 @@ impl<'a> WritableOpenBlob<'a> {
         // Only mark as verified if the hash matches
         if blob_entry.content_hash == *hash {
             blob_entry.verified = true;
-            log::debug!(
-                "[{arena}] {pathid} content verified to be {hash}",
-                arena = self.arena
-            );
+            log::debug!("[{}] {pathid} content verified to be {hash}", self.tag);
 
             self.blob_table
                 .insert(pathid, Holder::with_content(blob_entry)?)?;
@@ -752,10 +750,10 @@ impl<'a> WritableOpenBlob<'a> {
             };
 
         log::debug!(
-            "[{arena}] Cleaning up of WorkingArea with disk usage: {}, target: {}",
+            "[{}] Cleaning up of WorkingArea with disk usage: {}, target: {}",
             queue.disk_usage,
             target,
-            arena = self.arena
+            self.tag
         );
 
         let mut prev = queue.tail;
@@ -770,9 +768,9 @@ impl<'a> WritableOpenBlob<'a> {
                 continue;
             }
             log::debug!(
-                "[{arena}] Evicted blob from WorkingArea: {current_id} ({} bytes)",
+                "[{}] Evicted blob from WorkingArea: {current_id} ({} bytes)",
                 current.disk_usage,
-                arena = self.arena
+                self.tag
             );
             self.remove_from_queue_update_entry(&current, &mut queue)?;
             removed_count += 1;
@@ -786,9 +784,9 @@ impl<'a> WritableOpenBlob<'a> {
         }
 
         log::debug!(
-            "[{arena}] Evicted {removed_count} entries from WorkingArea disk usage now {} (target: {target})",
+            "[{}] Evicted {removed_count} entries from WorkingArea disk usage now {} (target: {target})",
             queue.disk_usage,
-            arena = self.arena
+            self.tag
         );
 
         if removed_count > 0 {
@@ -1475,19 +1473,26 @@ impl AsyncSeek for Blob {
 }
 
 struct OpenBlobRefCounter {
+    tag: Tag,
     counts: Mutex<HashMap<PathId, u32>>,
 }
 impl OpenBlobRefCounter {
-    fn new() -> Self {
+    fn new(tag: Tag) -> Self {
         Self {
             counts: Mutex::new(HashMap::new()),
+            tag,
         }
     }
 
     fn increment(&self, pathid: PathId) {
         let mut guard = self.counts.lock().unwrap();
         *guard.entry(pathid).or_insert(0) += 1;
-        log::trace!("Blob {} opened, ref count: {}", pathid, guard[&pathid]);
+        log::trace!(
+            "[{}] Blob {} opened, ref count: {}",
+            self.tag,
+            pathid,
+            guard[&pathid]
+        );
     }
 
     /// Decrement refcount for the given pathid.
@@ -1497,10 +1502,15 @@ impl OpenBlobRefCounter {
         let mut guard = self.counts.lock().unwrap();
         if let Some(count) = guard.get_mut(&pathid) {
             *count = count.saturating_sub(1);
-            log::trace!("Blob {} closed, ref count: {}", pathid, *count);
+            log::trace!(
+                "[{}] Blob {} closed, ref count: {}",
+                self.tag,
+                pathid,
+                *count
+            );
             if *count == 0 {
                 guard.remove(&pathid);
-                log::trace!("Blob {} removed from open blobs", pathid);
+                log::trace!("[{}] Blob {} removed from open blobs", self.tag, pathid);
                 return guard.is_empty();
             }
         }

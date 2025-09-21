@@ -28,6 +28,7 @@ tokio-util = { version = "0.7.16", features = ["compat", "io", "join-map", "rt"]
 uuid = { version = "1.18.0", features = ["std", "v7"] }
 bimap = "0.6.3"
 priority-queue = "2.5.0"
+internment = { version = "0.8.6" }
 
 [dev-dependencies]
 assert_fs = "1.1"

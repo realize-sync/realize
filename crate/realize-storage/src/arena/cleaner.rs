@@ -22,7 +22,7 @@ pub(crate) async fn run_loop(
         if let Err(err) = check_limits_async(&db, &limits, usage).await {
             log::warn!(
                 "[{}] Failed to enforce disk usage limits: {err:?}",
-                db.arena()
+                db.tag()
             )
         }
         tokio::select!(
@@ -62,7 +62,7 @@ fn check_limits(
     byte_disk_total: u64,
     byte_disk_free: u64,
 ) -> Result<(), StorageError> {
-    let arena = db.arena();
+    let tag = db.tag();
     let mut byte_limit = limits.max.as_bytes(byte_disk_total);
 
     // If leave is specified, reduce effective_limit as needed to
@@ -90,7 +90,7 @@ fn check_limits(
 
         if evictable_target < usage.evictable {
             log::debug!(
-                "[{arena}] Will cleanup {} evictable bytes out of {} to target {evictable_target} bytes",
+                "[{tag}] Will cleanup {} evictable bytes out of {} to target {evictable_target} bytes",
                 usage.evictable,
                 usage.total,
             );
@@ -103,7 +103,7 @@ fn check_limits(
                 blobs.cleanup(&mut tree, evictable_target)?;
 
                 log::info!(
-                    "[{arena}] Usage went from {usage:?} to {:?} after cleanup",
+                    "[{tag}] Usage went from {usage:?} to {:?} after cleanup",
                     blobs.disk_usage()?
                 );
             };

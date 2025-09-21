@@ -13,10 +13,10 @@ pub(crate) fn apply(
     peer: Peer,
     notification: Notification,
 ) -> Result<(), StorageError> {
-    let arena = db.arena();
-    log::trace!("[{arena}]@{peer} Notification: {notification:?}",);
+    let tag = db.tag();
+    log::trace!("[{tag}]@{peer} Notification: {notification:?}",);
     // UnrealCache::update, is responsible for dispatching properly
-    assert_eq!(arena, notification.arena());
+    assert_eq!(db.arena(), notification.arena());
 
     let txn = db.begin_write()?;
     {
@@ -94,10 +94,10 @@ pub(crate) fn apply(
                 ..
             } => {
                 if index::branch(&cache, &tree, &source, &dest, &hash, old_hash.as_ref())? {
-                    log::debug!("[{arena}] branched {source} {hash} -> {dest}");
+                    log::debug!("[{tag}] branched {source} {hash} -> {dest}");
                 } else {
                     log::debug!(
-                        "[{arena}] wrong versions; ignored:
+                        "[{tag}] wrong versions; ignored:
   branch {source} {hash} -> {dest} {old_hash:?}"
                     )
                 }
@@ -121,10 +121,10 @@ pub(crate) fn apply(
                     &hash,
                     old_hash.as_ref(),
                 )? {
-                    log::debug!("[{arena}] renamed {source} {hash} -> {dest}");
+                    log::debug!("[{tag}] renamed {source} {hash} -> {dest}");
                 } else {
                     log::debug!(
-                        "[{arena}] wrong versions; ignored:
+                        "[{tag}] wrong versions; ignored:
   rename {source} {hash} -> {dest} {old_hash:?}"
                     )
                 }

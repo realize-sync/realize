@@ -8,7 +8,7 @@ use super::types::CacheStatus;
 use crate::arena::tree::TreeReadOperations;
 use crate::types::JobId;
 use crate::{Mark, PathId, StorageError};
-use realize_types::{Arena, Hash, Path, UnixTime};
+use realize_types::{Hash, Path, UnixTime};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -100,7 +100,6 @@ pub enum JobStatus {
 }
 
 pub struct Engine {
-    arena: Arena,
     db: Arc<ArenaDatabase>,
     job_retry_strategy: Box<dyn (Fn(u32) -> Option<Duration>) + Sync + Send + 'static>,
 
@@ -115,14 +114,12 @@ pub struct Engine {
 
 impl Engine {
     pub(crate) fn new(
-        arena: Arena,
         db: Arc<ArenaDatabase>,
         job_retry_strategy: impl (Fn(u32) -> Option<Duration>) + Sync + Send + 'static,
     ) -> Arc<Engine> {
         let (failed_job_tx, _) = watch::channel(());
         let (retry_jobs_missing_peers, _) = broadcast::channel(8);
         Arc::new(Self {
-            arena,
             db,
             job_retry_strategy: Box::new(job_retry_strategy),
             failed_job_tx,
@@ -155,7 +152,7 @@ impl Engine {
 
         tokio::spawn(async move {
             if let Err(err) = this.build_jobs(tx).await {
-                log::warn!("[{}] Failed to collect jobs: {err}", this.arena)
+                log::warn!("[{}] Failed to collect jobs: {err}", this.db.tag())
             }
         });
 
@@ -170,35 +167,35 @@ impl Engine {
     ) -> Result<(), StorageError> {
         match status {
             Ok(JobStatus::Done) => {
-                log::info!("[{arena}] Job #{job_id} Done", arena = self.arena);
+                log::info!("[{}] Job #{job_id} Done", self.db.tag());
                 self.job_done(job_id)
             }
             Ok(JobStatus::Abandoned(reason)) => {
-                log::info!("[{}] Job #{job_id} Abandoned ({reason})", self.arena);
+                log::info!("[{}] Job #{job_id} Abandoned ({reason})", self.db.tag());
                 self.job_done(job_id)
             }
             Ok(JobStatus::Cancelled) => {
-                log::debug!("[{}] Job #{job_id} Cancelled", self.arena);
+                log::debug!("[{}] Job #{job_id} Cancelled", self.db.tag());
                 self.job_failed(job_id)?;
                 Ok(())
             }
             Ok(JobStatus::NoPeers) => {
                 log::info!(
                     "[{}] Job #{job_id} Peers offline; will retry after connection",
-                    self.arena
+                    self.db.tag()
                 );
                 self.job_missing_peers(job_id)
             }
             Err(err) => match self.job_failed(job_id) {
                 Ok(None) => {
-                    log::warn!("[{}] Job #{job_id} failed; giving up: {err}", self.arena);
+                    log::warn!("[{}] Job #{job_id} failed; giving up: {err}", self.db.tag());
 
                     Ok(())
                 }
                 Ok(Some(backoff_time)) => {
                     log::debug!(
                         "[{}] Job #{job_id} failed; will retry after {backoff_time:?}, in {}s: {err}",
-                        self.arena,
+                        self.db.tag(),
                         backoff_time.duration_since(UnixTime::now()).as_secs()
                     );
 
@@ -207,7 +204,7 @@ impl Engine {
                 Err(err) => {
                     log::warn!(
                         "[{}] Job #{job_id} Failed to reschedule; giving up: {err}",
-                        self.arena
+                        self.db.tag()
                     );
 
                     Err(err)
@@ -292,15 +289,11 @@ impl Engine {
             let (job, last_counter) = task::spawn_blocking({
                 let this = Arc::clone(self);
                 let start_counter = start_counter;
-                let arena = self.arena;
                 move || {
                     let (job, last_counter) = this.next_job(start_counter)?;
                     if let Some(last_counter) = last_counter
                         && last_counter > start_counter
                     {
-                        log::debug!(
-                            "[{arena}] Cleanup dirty entries [{start_counter}, {last_counter})",
-                        );
                         this.delete_range(start_counter, last_counter)?;
                     }
 
@@ -308,7 +301,7 @@ impl Engine {
                 }
             })
             .await??;
-            let arena = self.arena;
+            let tag = self.db.tag();
             if let Some(c) = last_counter {
                 start_counter = c + 1;
             }
@@ -317,7 +310,7 @@ impl Engine {
                     // Skip it for now; it'll be handled after a delay.
                     continue;
                 }
-                log::debug!("[{arena}] Job #{job_id} Pending {job:?}");
+                log::debug!("[{tag}] Job #{job_id} Pending {job:?}");
                 if tx.send((job_id, job)).await.is_err() {
                     // Broken channel; normal end of this loop
                     return Ok(());
@@ -354,7 +347,7 @@ impl Engine {
                     if let Some((job_id, job)) =
                         self.build_job_with_counter(counter).await.ok().flatten()
                     {
-                        log::debug!("[{arena}] Retry Job #{job_id}: {job:?}");
+                        log::debug!("[{tag}] Retry Job #{job_id}: {job:?}");
                         if tx.send((job_id, job)).await.is_err() {
                             return Ok(());
                         }
@@ -399,8 +392,8 @@ impl Engine {
                     }
                     Err(err) => {
                         log::warn!(
-                            "[{arena}] Job #{counter} failed to build job for pathid {pathid}: {err:?}",
-                            arena = this.arena
+                            "[{tag}] Job #{counter} failed to build job for pathid {pathid}: {err:?}",
+                            tag = this.db.tag()
                         );
                         return Ok(None);
                     }
@@ -474,40 +467,40 @@ impl Engine {
 
         if let Some(cached) = cache.file_at_pathid(pathid)? {
             let hash = cached.hash;
-            let indexed = cache.index_entry_at_pathid(pathid)?;
-            let is_indexed = indexed.is_some();
+            let indexed_hash = cache.index_entry_at_pathid(pathid)?.map(|e| e.hash);
+            let is_indexed = indexed_hash.is_some();
+
             if want_unrealize {
-                if let Some(indexed) = indexed
-                    && indexed.is_outdated_by(&hash)
-                {
-                    should_unrealize = Some(indexed.hash);
-                }
-            } else if want_realize {
-                match indexed {
-                    None => should_realize = Some((hash.clone(), None)),
-                    Some(indexed) => {
-                        if indexed.hash != hash && indexed.is_outdated_by(&hash) {
-                            should_realize = Some((hash.clone(), Some(indexed.hash)))
-                        }
+                if indexed_hash.is_some() {
+                    let available_from_peer =
+                        !cached.local || cache.remote_availability(tree, pathid, &hash)?.is_some();
+
+                    if available_from_peer {
+                        should_unrealize = indexed_hash;
                     }
                 }
-            }
-            let blob = blobs.get_with_pathid(pathid)?;
-            if let Some(blob) = &blob {
-                if blob.protected {
-                    should_unprotect_blob = want_unprotect_blob;
-                } else {
-                    should_protect_blob = want_protect_blob;
+            } else if want_realize {
+                if !is_indexed || (is_indexed && !cached.local) {
+                    should_realize = Some((hash.clone(), indexed_hash))
                 }
             }
-            if want_download
-                && blob
-                    .map(|b| b.cache_status())
-                    .unwrap_or(CacheStatus::Missing)
-                    != CacheStatus::Verified
-                && (!is_indexed || should_realize.is_some())
-            {
-                should_download = Some(hash);
+            if !cached.local {
+                let blob = blobs.get_with_pathid(pathid)?;
+                if let Some(blob) = &blob {
+                    if blob.protected {
+                        should_unprotect_blob = want_unprotect_blob;
+                    } else {
+                        should_protect_blob = want_protect_blob;
+                    }
+                }
+                if want_download
+                    && blob
+                        .map(|b| b.cache_status())
+                        .unwrap_or(CacheStatus::Missing)
+                        != CacheStatus::Verified
+                {
+                    should_download = Some(hash);
+                }
             }
         }
         if should_protect_blob {
@@ -668,7 +661,7 @@ mod tests {
                 &datadir,
             )?;
             let acache = ArenaFilesystem::new(arena, Arc::clone(&db))?;
-            let engine = Engine::new(arena, Arc::clone(&db), |attempt| {
+            let engine = Engine::new(Arc::clone(&db), |attempt| {
                 if attempt < 3 {
                     Some(Duration::from_secs(attempt as u64 * 10))
                 } else {
@@ -1086,43 +1079,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unprotect_then_unrealize() -> anyhow::Result<()> {
+    async fn unrealize() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
         let foobar = Path::parse("foo/bar")?;
 
         mark::set(&fixture.db, &foobar, Mark::Keep)?;
         fixture.add_file_to_index_with_version(&foobar, test_hash())?;
         fixture.add_file_to_cache_with_version(&foobar, test_hash())?;
-        {
-            let mut blob = fixture.acache.file_content(&foobar)?.blob().unwrap();
-            blob.update(0, b"te").await?;
-        }
 
-        // File is in the index and cache and has been partially
-        // downloaded. Going from Mark::Keep to Mark::Watch triggers
-        // the following sequence:
-        //
-        // 1. unprotect the blob
-        // 2. unrealize
+        // File is in the index. Going from Mark::Keep to Mark::Watch
+        // triggers unrealize.
         mark::set(&fixture.db, &foobar, Mark::Watch)?;
 
         let mut job_stream = fixture.engine.job_stream();
 
-        let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
+        let (_, job) = next_with_timeout(&mut job_stream).await?.unwrap();
         let pathid = fixture.pathid(&foobar)?;
-        assert_eq!(StorageJob::UnprotectBlob(pathid), job);
-        let txn = fixture.db.begin_write()?;
-        {
-            let tree = txn.read_tree()?;
-            let mut dirty = txn.write_dirty()?;
-            txn.write_blobs()?
-                .set_protected(&tree, &mut dirty, pathid, false)?;
-        }
-        txn.commit()?;
-        fixture.engine.job_finished(job_id, Ok(JobStatus::Done))?;
-
-        let (new_job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert!(new_job_id > job_id);
         assert_eq!(
             StorageJob::Unrealize {
                 pathid: pathid,

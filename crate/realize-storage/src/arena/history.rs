@@ -1,8 +1,7 @@
 use super::db::AfterCommit;
 use super::types::HistoryTableEntry;
-use crate::StorageError;
 use crate::utils::holder::Holder;
-use realize_types::Arena;
+use crate::{StorageError, arena::db::Tag};
 use realize_types::{Hash, Path};
 use redb::ReadableTable;
 use std::ops::RangeBounds;
@@ -17,7 +16,6 @@ use tokio::sync::watch;
 /// [HistoryReadOperations::history] can then be used to send
 /// up-to-date history entries to a channel.
 pub(crate) struct History {
-    arena: Arena,
     tx: watch::Sender<u64>,
 
     /// Kept to not lose history when there are no receivers.
@@ -26,13 +24,12 @@ pub(crate) struct History {
 
 impl History {
     pub(crate) fn setup(
-        arena: Arena,
         table: &impl redb::ReadableTable<u64, Holder<'static, HistoryTableEntry>>,
     ) -> Result<Self, StorageError> {
         let last_index = last_history_index(table)?;
         let (tx, rx) = watch::channel(last_index);
 
-        Ok(Self { arena, tx, _rx: rx })
+        Ok(Self { tx, _rx: rx })
     }
 
     /// Get a watch channel that reports changes (increases) of the last history index.
@@ -61,6 +58,7 @@ where
 }
 
 pub(crate) struct WritableOpenHistory<'a> {
+    tag: Tag,
     after_commit: &'a AfterCommit,
     history: &'a History,
     table: redb::Table<'a, u64, Holder<'static, HistoryTableEntry>>,
@@ -68,11 +66,13 @@ pub(crate) struct WritableOpenHistory<'a> {
 
 impl<'a> WritableOpenHistory<'a> {
     pub(crate) fn new(
+        tag: Tag,
         after_commit: &'a AfterCommit,
         history: &'a History,
         table: redb::Table<'a, u64, Holder<'static, HistoryTableEntry>>,
     ) -> Self {
         Self {
+            tag,
             after_commit,
             history,
             table,
@@ -136,7 +136,7 @@ impl<'a> WritableOpenHistory<'a> {
     pub(crate) fn report_removed(&mut self, path: &Path, hash: &Hash) -> Result<(), StorageError> {
         let index = self.allocate_history_index()?;
         let ev = HistoryTableEntry::Remove(path.clone(), hash.clone());
-        log::info!("[{}] History #{index}: {ev:?}", self.history.arena);
+        log::info!("[{}] History #{index}: {ev:?}", self.tag);
         self.table.insert(index, Holder::with_content(ev)?)?;
         Ok(())
     }
@@ -148,7 +148,7 @@ impl<'a> WritableOpenHistory<'a> {
     pub(crate) fn report_dropped(&mut self, path: &Path, hash: &Hash) -> Result<(), StorageError> {
         let index = self.allocate_history_index()?;
         let ev = HistoryTableEntry::Drop(path.clone(), hash.clone());
-        log::info!("[{}] History #{index}: {ev:?}", self.history.arena);
+        log::info!("[{}] History #{index}: {ev:?}", self.tag);
         self.table.insert(index, Holder::with_content(ev)?)?;
         Ok(())
     }
@@ -168,7 +168,7 @@ impl<'a> WritableOpenHistory<'a> {
         } else {
             HistoryTableEntry::Add(path.clone())
         };
-        log::info!("[{}] History #{index}: {ev:?}", self.history.arena);
+        log::info!("[{}] History #{index}: {ev:?}", self.tag);
         self.table.insert(index, Holder::with_content(ev)?)?;
 
         Ok(())
@@ -189,7 +189,7 @@ impl<'a> WritableOpenHistory<'a> {
             hash.clone(),
             old_hash.cloned(),
         );
-        log::info!("[{}] History #{index}: {ev:?}", self.history.arena);
+        log::info!("[{}] History #{index}: {ev:?}", self.tag);
         self.table.insert(index, Holder::with_content(ev)?)?;
 
         Ok(())
@@ -210,7 +210,7 @@ impl<'a> WritableOpenHistory<'a> {
             hash.clone(),
             old_hash.cloned(),
         );
-        log::info!("[{}] History #{index}: {ev:?}", self.history.arena);
+        log::info!("[{}] History #{index}: {ev:?}", self.tag);
         self.table.insert(index, Holder::with_content(ev)?)?;
 
         Ok(())
