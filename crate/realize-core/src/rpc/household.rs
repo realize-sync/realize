@@ -1897,17 +1897,9 @@ mod tests {
                 let a = HouseholdFixture::a();
                 let b = HouseholdFixture::b();
 
-                // Create completely different files
-                let a_content = "This is content from peer A";
-                let b_content = "This is completely different content from peer B";
-
-                let a_dir = fixture.arena_root(a);
+                let b_content = "Completely different content from peer B";
                 let b_dir = fixture.arena_root(b);
-
-                fs::write(&a_dir.join("different.txt"), a_content.as_bytes()).await?;
                 fs::write(&b_dir.join("different.txt"), b_content.as_bytes()).await?;
-
-                // Wait for the file to be available in peer A's cache
                 fixture
                     .wait_for_file_in_cache(a, "different.txt", &hash::digest(b_content.as_bytes()))
                     .await?;
@@ -1921,11 +1913,10 @@ mod tests {
                     crypto_hash_size: 8,
                 };
 
-                let local_content = fs::read(&a_dir.join("different.txt")).await?;
-                let signature = fast_rsync::Signature::calculate(&local_content, opts);
+                // Call rsync - should return a delta that transforms local_content into b_content
+                let local_content = b"Content from peer A";
+                let signature = fast_rsync::Signature::calculate(local_content, opts);
                 let sig = realize_types::Signature(signature.into_serialized());
-
-                // Call rsync - should return a delta that transforms A's content to B's content
                 let delta = household_a
                     .rsync(
                         vec![b.clone()],
@@ -1937,20 +1928,15 @@ mod tests {
                     )
                     .await?;
 
-                // Apply the delta
+                // Apply the delta to local_content, the result should be b_content.
                 let mut reconstructed = Vec::new();
                 fast_rsync::apply_limited(
-                    &local_content,
+                    local_content,
                     &delta.0,
                     &mut reconstructed,
                     b_content.len(),
                 )?;
-
-                // Should match peer B's content
                 assert_eq!(b_content.as_bytes(), reconstructed.as_slice());
-
-                // Should be different from peer A's original content
-                assert_ne!(a_content.as_bytes(), reconstructed.as_slice());
 
                 Ok::<(), anyhow::Error>(())
             })
