@@ -22,9 +22,8 @@ struct FileTableEntry {
   mtime @1: Time;
   path @2: Text;
   hash @3: Data;
-  outdatedBy @4: Data; # may be empty
-  branchedFrom @5: UInt64; # 0 for None
-  local @6: Bool;
+  branchedFrom @4: UInt64; # 0 for None
+  local @5: Bool;
 }
 
 struct PeerTableEntry {

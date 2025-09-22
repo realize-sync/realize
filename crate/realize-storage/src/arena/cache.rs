@@ -739,10 +739,10 @@ impl<'a> WritableOpenCache<'a> {
         hash: &Hash,
         old_hash: &Hash,
     ) -> Result<(), StorageError> {
-        let file_pathid = tree.setup(path)?;
+        let pathid = tree.setup(path)?;
         let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
         let mut default_modified = false;
-        if peer_file_entry(&self.table, file_pathid, None)?
+        if peer_file_entry(&self.table, pathid, None)?
             .map(|e| e.hash == *old_hash)
             .unwrap_or(true)
         {
@@ -750,10 +750,16 @@ impl<'a> WritableOpenCache<'a> {
                 "[{}]@local \"{path}\" {hash} size={size} replaces {old_hash}",
                 self.tag
             );
-            self.write_default_file_entry(tree, blobs, dirty, file_pathid, &entry)?;
             default_modified = true;
+            self.write_default_file_entry(tree, blobs, dirty, pathid, &entry)?;
+            if let Some(indexed) = indexed_entry(&self.table, pathid)?
+                && indexed.hash == *old_hash
+                && IndexedFile::from(indexed).matches_file(path.within(self.datadir()))
+            {
+                std::fs::remove_file(path.within(self.datadir()))?;
+            }
         }
-        if peer_file_entry(&self.table, file_pathid, Some(peer))?
+        if peer_file_entry(&self.table, pathid, Some(peer))?
             .map(|e| e.hash == *old_hash)
             .unwrap_or(true)
         {
@@ -761,9 +767,9 @@ impl<'a> WritableOpenCache<'a> {
                 "[{}]@{peer} \"{path}\" {hash} size={size} replaces {old_hash}",
                 self.tag
             );
-            self.write_file_entry(tree, file_pathid, peer, &entry)?;
+            self.write_file_entry(tree, pathid, peer, &entry)?;
             if !default_modified {
-                dirty.mark_dirty(file_pathid, "replace_from_peer")?;
+                dirty.mark_dirty(pathid, "replace_from_peer")?;
             }
         }
         Ok(())
@@ -959,6 +965,13 @@ impl<'a> WritableOpenCache<'a> {
                         self.tag
                     );
                     self.rm_default_file_entry(tree, blobs, dirty, pathid)?;
+
+                    if let Some(indexed) = indexed_entry(&self.table, pathid)?
+                        && e.hash == *old_hash
+                        && IndexedFile::from(indexed).matches_file(path.within(self.datadir()))
+                    {
+                        std::fs::remove_file(&path.within(self.datadir()))?;
+                    }
                 }
             }
         }
@@ -1019,13 +1032,7 @@ impl<'a> WritableOpenCache<'a> {
             return Ok(pathid);
         }
         if let Some(path) = tree.backtrack(loc.borrow())? {
-            let entry = IndexedFile {
-                hash,
-                mtime,
-                size,
-                outdated_by: None,
-            }
-            .into_file(path.clone());
+            let entry = IndexedFile { hash, mtime, size }.into_file(path.clone());
             self.write_index_entry(tree, pathid, &entry)?;
             self.write_default_file_entry(tree, blobs, dirty, pathid, &entry)?;
             history.report_added(&path, old_hash.as_ref())?;
@@ -1061,7 +1068,6 @@ impl<'a> WritableOpenCache<'a> {
             mtime: entry.mtime,
             size: entry.size,
             hash: entry.hash,
-            outdated_by: None,
         }
         .into_file(path.clone());
         let old_hash = self.indexed_hash(pathid);
@@ -1194,41 +1200,6 @@ impl<'a> WritableOpenCache<'a> {
         for (_, pathid) in children.into_iter() {
             self.remove_from_index_recursively(tree, blobs, history, dirty, pathid)?;
         }
-        Ok(())
-    }
-
-    /// Record that the given file and version has been outdated by
-    /// `new_hash`.
-    ///
-    /// Does nothing if the file is missing or if its version is not
-    /// `old_hash` or a version derived from it.
-    pub(crate) fn record_outdated<'b, L: Into<TreeLoc<'b>>>(
-        &mut self,
-        tree: &mut WritableOpenTree,
-        dirty: &mut WritableOpenDirty,
-        loc: L,
-        old_hash: &Hash,
-        new_hash: &Hash,
-    ) -> Result<(), StorageError> {
-        if let Some(pathid) = tree.resolve(loc)? {
-            if let Some(mut entry) = indexed_entry(&self.table, pathid)?
-                && entry.is_outdated_by(old_hash)
-            {
-                // Just remember that a newer version exist in a
-                // remote peer. This information is going to be used
-                // to download that newer version later on.
-                entry.outdated_by = Some(new_hash.clone());
-                log::debug!(
-                    "[{}] outdated: {} {old_hash}, new version: {new_hash})",
-                    self.tag,
-                    pathid
-                );
-
-                self.write_index_entry(tree, pathid, &entry)?;
-                dirty.mark_dirty(pathid, "outdated")?;
-            }
-        }
-
         Ok(())
     }
 
@@ -2425,6 +2396,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remove_applied_to_indexed_version() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena)?;
+        let peer1 = Peer::from("peer1");
+        let file_path = Path::parse("file.txt")?;
+
+        let childpath = fixture.datadir.child("file.txt");
+        childpath.write_str("test")?;
+        let hash = hash::digest("test");
+        let mtime = UnixTime::mtime(&childpath.metadata()?);
+        index::add_file(&fixture.db, &file_path, 4, mtime, hash.clone())?;
+
+        update::apply(
+            &fixture.db,
+            peer1,
+            Notification::Add {
+                arena: arena,
+                index: 0,
+                path: file_path.clone(),
+                mtime: test_time(),
+                size: 4,
+                hash: hash.clone(),
+            },
+        )?;
+
+        update::apply(
+            &fixture.db,
+            peer1,
+            Notification::Remove {
+                arena: arena,
+                index: 0,
+                path: file_path.clone(),
+                old_hash: hash.clone(),
+            },
+        )?;
+
+        // Both the local file and the file entry must have been removed
+        assert!(matches!(
+            fixture.file_metadata(&file_path),
+            Err(StorageError::NotFound)
+        ));
+        assert!(!childpath.exists());
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn drop_not_applied_to_tracked_version() -> anyhow::Result<()> {
         let arena = test_arena();
         let fixture = Fixture::setup_with_arena(arena)?;
@@ -3256,21 +3274,18 @@ mod tests {
             hash: hash1.clone(),
             mtime,
             size: 100,
-            outdated_by: None,
         };
 
         let indexed_file2 = IndexedFile {
             hash: hash2.clone(),
             mtime,
             size: 200,
-            outdated_by: None,
         };
 
         let indexed_file3 = IndexedFile {
             hash: hash3.clone(),
             mtime,
             size: 300,
-            outdated_by: None,
         };
 
         // Add some regular cache entries (should not appear in all_indexed)
@@ -5398,83 +5413,6 @@ mod tests {
             ],
             history_entries
         );
-
-        Ok(())
-    }
-
-    #[test]
-    fn record_outdated_updates_entry() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let mtime = UnixTime::from_secs(1234567890);
-        let path = Path::parse("foo/bar.txt")?;
-        let old_hash = Hash([0xfa; 32]);
-        let new_hash = Hash([0x07; 32]);
-
-        let txn = fixture.db.begin_write()?;
-        let mut cache = txn.write_cache()?;
-        let mut tree = txn.write_tree()?;
-        let mut blobs = txn.write_blobs()?;
-        let mut dirty = txn.write_dirty()?;
-        let mut history = txn.write_history()?;
-
-        // Add a file with the old hash
-        cache.index(
-            &mut tree,
-            &mut blobs,
-            &mut history,
-            &mut dirty,
-            &path,
-            100,
-            mtime,
-            old_hash.clone(),
-        )?;
-
-        // Record that this version is outdated by the new hash
-        cache.record_outdated(&mut tree, &mut dirty, &path, &old_hash, &new_hash)?;
-
-        // Verify the entry was updated with outdated_by field
-        let entry = cache.indexed(&tree, &path)?.unwrap();
-        assert_eq!(entry.hash, old_hash);
-        assert_eq!(entry.outdated_by, Some(new_hash));
-
-        Ok(())
-    }
-
-    #[test]
-    fn record_outdated_ignores_unrelated_files() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let mtime = UnixTime::from_secs(1234567890);
-        let path = Path::parse("foo/bar.txt")?;
-        let file_hash = Hash([0xfa; 32]);
-        let unrelated_hash = Hash([0xbb; 32]);
-        let new_hash = Hash([0x07; 32]);
-
-        let txn = fixture.db.begin_write()?;
-        let mut cache = txn.write_cache()?;
-        let mut tree = txn.write_tree()?;
-        let mut blobs = txn.write_blobs()?;
-        let mut dirty = txn.write_dirty()?;
-        let mut history = txn.write_history()?;
-
-        // Add a file with file_hash
-        cache.index(
-            &mut tree,
-            &mut blobs,
-            &mut history,
-            &mut dirty,
-            &path,
-            100,
-            mtime,
-            file_hash.clone(),
-        )?;
-
-        // Record that an unrelated hash is outdated by the new hash
-        cache.record_outdated(&mut tree, &mut dirty, &path, &unrelated_hash, &new_hash)?;
-
-        // Verify the entry was NOT updated (outdated_by should remain None)
-        let entry = cache.indexed(&tree, &path)?.unwrap();
-        assert_eq!(entry.hash, file_hash);
-        assert_eq!(entry.outdated_by, None);
 
         Ok(())
     }

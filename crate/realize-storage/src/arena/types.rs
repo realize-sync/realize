@@ -631,9 +631,6 @@ pub struct FileTableEntry {
     pub path: Path,
     /// Hash of the specific version of the content the peer has.
     pub hash: Hash,
-    /// If set, a version is known to exist that replaces the version
-    /// in this entry.
-    pub outdated_by: Option<Hash>,
     /// PathId this specific version was branched from
     pub branched_from: Option<PathId>,
     /// If true, the file is on the local disk, in the datadir.
@@ -647,20 +644,9 @@ impl FileTableEntry {
             mtime,
             path,
             hash,
-            outdated_by: None,
             branched_from: None,
             local: false,
         }
-    }
-
-    /// Return true if replacing `old_hash` makes this entry outdated.
-    pub(crate) fn is_outdated_by(&self, old_hash: &Hash) -> bool {
-        self.hash == *old_hash
-            || self
-                .outdated_by
-                .as_ref()
-                .map(|h| *h == *old_hash)
-                .unwrap_or(false)
     }
 }
 
@@ -727,28 +713,17 @@ fn fill_file_table_entry(
     builder.set_hash(&entry.hash.0);
     builder.set_branched_from(PathId::from_optional(entry.branched_from));
     builder.set_local(entry.local);
-
-    if let Some(hash) = &entry.outdated_by {
-        builder.set_outdated_by(&hash.0)
-    }
 }
 
 fn parse_file_table_entry(
     msg: cache_capnp::file_table_entry::Reader<'_>,
 ) -> Result<FileTableEntry, ByteConversionError> {
     let mtime = msg.get_mtime()?;
-    let outdated_by: &[u8] = msg.get_outdated_by()?;
-    let outdated_by = if outdated_by.is_empty() {
-        None
-    } else {
-        Some(parse_hash(outdated_by)?)
-    };
     Ok(FileTableEntry {
         size: msg.get_size(),
         mtime: UnixTime::new(mtime.get_secs(), mtime.get_nsecs()),
         path: Path::parse(msg.get_path()?.to_str()?)?,
         hash: parse_hash(msg.get_hash()?)?,
-        outdated_by,
         branched_from: PathId::as_optional(msg.get_branched_from()),
         local: msg.get_local(),
     })
@@ -922,23 +897,9 @@ pub(crate) struct IndexedFile {
     pub hash: Hash,
     pub mtime: UnixTime,
     pub size: u64,
-
-    // If set, a version is known to exist that replaces the version
-    // in this entry.
-    pub outdated_by: Option<Hash>,
 }
 
 impl IndexedFile {
-    /// Return true if replacing `old_hash` makes this entry outdated.
-    pub(crate) fn is_outdated_by(&self, old_hash: &Hash) -> bool {
-        self.hash == *old_hash
-            || self
-                .outdated_by
-                .as_ref()
-                .map(|h| *h == *old_hash)
-                .unwrap_or(false)
-    }
-
     /// Check whether `file_path` size and mtime match this entry's.
     pub(crate) fn matches_file<P: AsRef<std::path::Path>>(&self, file_path: P) -> bool {
         if let Ok(m) = file_path.as_ref().metadata()
@@ -961,7 +922,6 @@ impl IndexedFile {
             mtime: self.mtime,
             path: path,
             hash: self.hash,
-            outdated_by: self.outdated_by,
             branched_from: None,
             local: true,
         }
@@ -974,7 +934,6 @@ impl From<FileTableEntry> for IndexedFile {
             hash: value.hash,
             mtime: value.mtime,
             size: value.size,
-            outdated_by: value.outdated_by,
         }
     }
 }
@@ -985,7 +944,6 @@ impl From<&FileTableEntry> for IndexedFile {
             hash: value.hash.clone(),
             mtime: value.mtime,
             size: value.size,
-            outdated_by: value.outdated_by.clone(),
         }
     }
 }
@@ -1143,7 +1101,6 @@ mod tests {
             mtime: UnixTime::from_secs(1234567890),
             path: Path::parse("foo/bar.txt")?,
             hash: Hash([0xa1u8; 32]),
-            outdated_by: Some(Hash([3u8; 32])),
             branched_from: Some(PathId(123)),
             local: true,
         };
@@ -1163,7 +1120,6 @@ mod tests {
             mtime: UnixTime::from_secs(1234567890),
             path: Path::parse("foo/bar.txt")?,
             hash: Hash([0xa1u8; 32]),
-            outdated_by: Some(Hash([3u8; 32])),
             branched_from: None,
             local: false,
         };
@@ -1202,7 +1158,6 @@ mod tests {
             mtime: UnixTime::from_secs(1234567890),
             path: Path::parse("test/file.txt")?,
             hash: Hash([0x42u8; 32]),
-            outdated_by: None,
             branched_from: None,
             local: false,
         };

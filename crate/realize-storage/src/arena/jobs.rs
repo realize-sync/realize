@@ -1,7 +1,7 @@
 use super::db::ArenaDatabase;
 use super::engine::{Engine, StorageJob};
 use crate::arena::blob::BlobExt;
-use crate::arena::cache::{CacheExt, CacheReadOperations};
+use crate::arena::cache::CacheReadOperations;
 use crate::{JobId, JobStatus, PathId, StorageError};
 use realize_types::Hash;
 use std::fs::File;
@@ -72,11 +72,7 @@ impl StorageJobProcessor {
                 pathid,
                 indexed_hash: hash,
             } => Some(self.unrealize(pathid, hash)),
-            StorageJob::Realize {
-                pathid,
-                cached_hash,
-                indexed_hash,
-            } => Some(self.realize(pathid, cached_hash, indexed_hash)),
+            StorageJob::Realize { pathid, hash } => Some(self.realize(pathid, hash)),
             StorageJob::ProtectBlob(pathid) => Some(self.set_protected(pathid, true)),
             StorageJob::UnprotectBlob(pathid) => Some(self.set_protected(pathid, false)),
         }
@@ -171,12 +167,7 @@ impl StorageJobProcessor {
     ///
     /// A `index_hash` value of `None` means that the file must not
     /// exit. If it exists, realize gives up and returns false.
-    fn realize(
-        &self,
-        pathid: PathId,
-        cache_hash: Hash,
-        index_hash: Option<Hash>,
-    ) -> Result<JobStatus, StorageError> {
+    fn realize(&self, pathid: PathId, hash: Hash) -> Result<JobStatus, StorageError> {
         let tag = self.db.tag();
         let source: PathBuf;
         let dest: PathBuf;
@@ -190,26 +181,11 @@ impl StorageJobProcessor {
                     return Ok(JobStatus::Abandoned("cache_entry"));
                 }
             };
-            if cached.hash != cache_hash {
+            if cached.hash != hash {
                 return Ok(JobStatus::Abandoned("cache_version"));
             }
-
-            // Make sure that indexed file corresponds to index_hash.
-            let indexed_previously = cache.indexed(&tree, pathid)?;
-            match index_hash {
-                None => {
-                    if indexed_previously.is_some() {
-                        return Ok(JobStatus::Abandoned("indexed_previously"));
-                    }
-                }
-                Some(index_hash) => match &indexed_previously {
-                    None => return Ok(JobStatus::Abandoned("not_indexed")),
-                    Some(e) => {
-                        if e.hash != index_hash {
-                            return Ok(JobStatus::Abandoned("indexed_version_mismatch"));
-                        }
-                    }
-                },
+            if cached.local {
+                return Ok(JobStatus::Abandoned("already_realized"));
             }
 
             let mut blobs = txn.write_blobs()?;
@@ -217,7 +193,7 @@ impl StorageJobProcessor {
                 Some(b) => b,
                 None => return Ok(JobStatus::Abandoned("no_blob")),
             };
-            if blobinfo.hash != cache_hash {
+            if blobinfo.hash != hash {
                 return Ok(JobStatus::Abandoned("blob_version"));
             }
             if !blobinfo.verified {
@@ -228,19 +204,8 @@ impl StorageJobProcessor {
             (source, dest) =
                 cache.realize(&mut tree, &mut blobs, &mut dirty, &mut history, pathid)?;
 
-            // Make sure that dest corresponds to indexed_previously
-            // and that we're not overwriting something else.
-            match indexed_previously {
-                Some(indexed_previously) => {
-                    if !indexed_previously.matches_file(&dest) {
-                        return Ok(JobStatus::Abandoned("file_mismatch"));
-                    }
-                }
-                None => {
-                    if dest.exists() {
-                        return Ok(JobStatus::Abandoned("unexpected_file"));
-                    }
-                }
+            if dest.exists() {
+                return Ok(JobStatus::Abandoned("file_exists"));
             }
 
             // Set mtime on source (best effort)
@@ -259,7 +224,7 @@ impl StorageJobProcessor {
             std::fs::rename(&dest, &source)?;
         }
         ret?;
-        log::info!("[{tag}] Realized pathid {pathid} {cache_hash} as {dest:?}");
+        log::info!("[{tag}] Realized pathid {pathid} {hash} as {dest:?}");
 
         Ok(JobStatus::Done)
     }
@@ -268,11 +233,8 @@ impl StorageJobProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arena::cache::CacheExt;
-    use crate::arena::history::HistoryReadOperations;
     use crate::arena::index;
     use crate::arena::tree::TreeExt;
-    use crate::arena::types::HistoryTableEntry;
     use crate::arena::types::IndexedFile;
     use crate::utils::hash;
     use crate::{ArenaFilesystem, Blob, CacheStatus, Mark, Notification, PathId};
@@ -368,29 +330,6 @@ mod tests {
             Ok(())
         }
 
-        fn replace_in_cache(
-            &self,
-            path_str: &str,
-            old_hash: &Hash,
-            new_hash: &Hash,
-            size: u64,
-        ) -> anyhow::Result<()> {
-            self.cache.update(
-                Peer::from("peer"),
-                Notification::Replace {
-                    arena: self.arena,
-                    index: 1,
-                    path: Path::parse(path_str)?,
-                    mtime: test_time(),
-                    size,
-                    old_hash: old_hash.clone(),
-                    hash: new_hash.clone(),
-                },
-            )?;
-
-            Ok(())
-        }
-
         fn set_mark(&self, path: &Path, mark: Mark) -> Result<(), StorageError> {
             let txn = self.db.begin_write()?;
             {
@@ -448,18 +387,13 @@ mod tests {
             .await?
         }
 
-        async fn realize(
-            &self,
-            path: Path,
-            hash: Hash,
-            index_hash: Option<Hash>,
-        ) -> anyhow::Result<JobStatus> {
+        async fn realize(&self, path: Path, hash: Hash) -> anyhow::Result<JobStatus> {
             let tag = self.processor.db.tag();
             log::debug!("[{tag}] Realize({path}, {hash})",);
             let pathid = self.pathid(&path)?;
             let processor = Arc::clone(&self.processor);
             tokio::task::spawn_blocking(move || {
-                let status = processor.realize(pathid, hash, index_hash)?;
+                let status = processor.realize(pathid, hash)?;
 
                 log::debug!("[{tag}] -> {status:?}");
                 Ok::<JobStatus, anyhow::Error>(status)
@@ -517,46 +451,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unrealize_outdated() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let indexed_hash = fixture
-            .create_indexed_file("dir/test.txt", "foobar")
-            .await?;
-        let cached_hash = hash::digest("cached");
-        fixture.add_to_cache("dir/test.txt", &indexed_hash, 6)?;
-        fixture.replace_in_cache("dir/test.txt", &indexed_hash, &cached_hash, 8)?;
-
-        let path = Path::parse("dir/test.txt")?;
-        assert_eq!(
-            JobStatus::Done,
-            fixture
-                .unrealize(path.clone(), indexed_hash.clone())
-                .await?
-        );
-
-        let txn = fixture.db.begin_read()?;
-        let tree = txn.read_tree()?;
-        let cache = txn.read_cache()?;
-        let history = txn.read_history()?;
-        assert!(!cache.is_indexed(&tree, &path)?);
-        assert!(!fixture.file_exists("dir/test.txt"));
-
-        assert!(cache.metadata(&tree, &path)?.is_some());
-
-        // The removal must be reported as a Drop, not Remove.
-        let history_entry = history
-            .history(history.last_history_index()?..)
-            .map(|res| res.map(|(_, e)| e))
-            .collect::<Result<Vec<_>, _>>()?;
-        assert_eq!(
-            vec![HistoryTableEntry::Drop(path.clone(), indexed_hash)],
-            history_entry
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn realize_new_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let path = Path::parse("dir/test.txt")?;
@@ -573,7 +467,7 @@ mod tests {
 
         assert_eq!(
             JobStatus::Done,
-            fixture.realize(path.clone(), hash.clone(), None).await?
+            fixture.realize(path.clone(), hash.clone()).await?
         );
 
         let realpath = path.within(&fixture.root);
@@ -595,50 +489,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn realize_replaces_outdated() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let path = Path::parse("test.txt")?;
-        fixture.set_mark(&path, Mark::Own)?;
-        let pathid = fixture.pathid(&path)?;
-
-        let old_hash = hash::digest("old");
-        let new_hash = hash::digest("new!");
-        fixture.add_to_cache("test.txt", &old_hash, 3)?;
-        fixture.create_indexed_file("test.txt", "old").await?;
-        fixture.replace_in_cache("test.txt", &old_hash, &new_hash, 4)?;
-        {
-            let mut blob = fixture.cache.file_content(pathid)?.blob().unwrap();
-            blob.update(0, b"new!").await?;
-            blob.mark_verified().await?;
-        }
-
-        assert_eq!(
-            JobStatus::Done,
-            fixture
-                .realize(path.clone(), new_hash.clone(), Some(old_hash.clone()))
-                .await?
-        );
-
-        let realpath = path.within(&fixture.root);
-        assert_eq!("new!".to_string(), std::fs::read_to_string(&realpath)?);
-        assert_eq!(test_time(), UnixTime::mtime(&realpath.metadata()?));
-
-        let txn = fixture.db.begin_read()?;
-        let cache = txn.read_cache()?;
-        let tree = txn.read_tree()?;
-        let blobs = txn.read_blobs()?;
-        assert_eq!(CacheStatus::Missing, blobs.cache_status(&tree, pathid)?);
-        let indexed = cache
-            .index_entry_at_pathid(pathid)?
-            .expect("must have been indexed");
-        assert_eq!(new_hash, indexed.hash);
-        assert_eq!(test_time(), indexed.mtime);
-        assert_eq!(None, indexed.outdated_by);
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn realize_skip_wrong_version() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let path = Path::parse("test.txt")?;
@@ -655,7 +505,7 @@ mod tests {
 
         assert!(matches!(
             fixture
-                .realize(path.clone(), hash::digest("something else"), None)
+                .realize(path.clone(), hash::digest("something else"))
                 .await?,
             JobStatus::Abandoned(_)
         ));
@@ -680,7 +530,7 @@ mod tests {
 
         assert!(matches!(
             fixture
-                .realize(path.clone(), hash::digest("something else"), None)
+                .realize(path.clone(), hash::digest("something else"))
                 .await?,
             JobStatus::Abandoned(_)
         ));

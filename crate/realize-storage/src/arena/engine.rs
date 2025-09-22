@@ -58,8 +58,7 @@ pub(crate) enum StorageJob {
     /// cache to the index, currently containing nothing or `Hash`.
     Realize {
         pathid: PathId,
-        cached_hash: Hash,
-        indexed_hash: Option<Hash>,
+        hash: Hash,
     },
 
     /// Move the blob to the protected queue.
@@ -467,21 +466,14 @@ impl Engine {
 
         if let Some(cached) = cache.file_at_pathid(pathid)? {
             let hash = cached.hash;
-            let indexed_hash = cache.index_entry_at_pathid(pathid)?.map(|e| e.hash);
-            let is_indexed = indexed_hash.is_some();
 
             if want_unrealize {
-                if indexed_hash.is_some() {
-                    let available_from_peer =
-                        !cached.local || cache.remote_availability(tree, pathid, &hash)?.is_some();
-
-                    if available_from_peer {
-                        should_unrealize = indexed_hash;
-                    }
+                if cached.local {
+                    should_unrealize = Some(hash.clone());
                 }
             } else if want_realize {
-                if !is_indexed || (is_indexed && !cached.local) {
-                    should_realize = Some((hash.clone(), indexed_hash))
+                if !cached.local {
+                    should_realize = Some(hash.clone());
                 }
             }
             if !cached.local {
@@ -514,12 +506,8 @@ impl Engine {
                 return Ok(Some(StorageJob::External(Job::Download(path, hash))));
             }
         }
-        if let Some((hash, index_hash)) = should_realize {
-            return Ok(Some(StorageJob::Realize {
-                pathid,
-                cached_hash: hash,
-                indexed_hash: index_hash,
-            }));
+        if let Some(hash) = should_realize {
+            return Ok(Some(StorageJob::Realize { pathid, hash }));
         }
         if let Some(index_hash) = should_unrealize {
             return Ok(Some(StorageJob::Unrealize {
@@ -621,7 +609,6 @@ mod tests {
     use crate::arena::index;
     use crate::arena::mark;
     use crate::arena::tree::TreeLoc;
-    use crate::utils::hash;
     use crate::utils::redb_utils;
     use assert_fs::TempDir;
     use futures::StreamExt as _;
@@ -712,27 +699,6 @@ mod tests {
                 path: path.clone(),
                 old_hash: test_hash(),
             })
-        }
-
-        // A new version comes in that replaces the version in the
-        // cache/index.
-        fn replace<T>(&self, path: T, hash: Hash, old_hash: Hash) -> anyhow::Result<()>
-        where
-            T: AsRef<Path>,
-        {
-            let path = path.as_ref();
-            let notification = Notification::Replace {
-                arena: self.arena,
-                index: 1,
-                path: path.clone(),
-                mtime: UnixTime::from_secs(1234567890),
-                size: 4,
-                hash,
-                old_hash,
-            };
-            self.update_cache(notification)?;
-
-            Ok(())
         }
 
         fn add_file_to_index_with_version<T>(&self, path: T, hash: Hash) -> anyhow::Result<()>
@@ -1008,8 +974,7 @@ mod tests {
         assert_eq!(
             StorageJob::Realize {
                 pathid: fixture.pathid(&foobar)?,
-                cached_hash: test_hash(),
-                indexed_hash: None
+                hash: test_hash(),
             },
             job
         );
@@ -1069,8 +1034,7 @@ mod tests {
         assert_eq!(
             StorageJob::Realize {
                 pathid: pathid,
-                cached_hash: test_hash(),
-                indexed_hash: None
+                hash: test_hash(),
             },
             job
         );
@@ -1107,33 +1071,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drop_outdated() -> anyhow::Result<()> {
-        let fixture = EngineFixture::setup().await?;
-        let foobar = Path::parse("foo/bar")?;
-
-        let version1 = hash::digest("version1");
-        fixture.add_file_to_index_with_version(&foobar, version1.clone())?;
-        fixture.add_file_to_cache_with_version(&foobar, version1.clone())?;
-
-        let version2 = hash::digest("version2");
-        fixture.replace(&foobar, version2.clone(), version1.clone())?;
-
-        let mut job_stream = fixture.engine.job_stream();
-
-        let (_, job) = next_with_timeout(&mut job_stream).await?.unwrap();
-        let pathid = fixture.pathid(&foobar)?;
-        assert_eq!(
-            StorageJob::Unrealize {
-                pathid,
-                indexed_hash: version1
-            },
-            job
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn realize_verified_file_to_own_not_in_index() -> anyhow::Result<()> {
         let fixture = EngineFixture::setup().await?;
         let foobar = Path::parse("foo/bar")?;
@@ -1153,8 +1090,7 @@ mod tests {
         assert_eq!(
             StorageJob::Realize {
                 pathid: pathid,
-                cached_hash: test_hash(),
-                indexed_hash: None
+                hash: test_hash(),
             },
             job
         );
@@ -1186,41 +1122,6 @@ mod tests {
         fixture.add_file_to_index_with_version(&foobar, Hash([2; 32]))?;
 
         assert_eq!(None, fixture.engine.job_for_loc(&foobar).await?);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn realize_file_to_own_in_index_with_outdated_version() -> anyhow::Result<()> {
-        let fixture = EngineFixture::setup().await?;
-        let foobar = Path::parse("foo/bar")?;
-
-        mark::set_arena_mark(&fixture.db, Mark::Own)?;
-
-        // Cache and index have the same version
-        fixture.add_file_to_cache_with_version(&foobar, Hash([1; 32]))?;
-        fixture.add_file_to_index_with_version(&foobar, Hash([1; 32]))?;
-        fixture.replace(&foobar, Hash([2; 32]), Hash([1; 32]))?;
-        {
-            let mut blob = fixture.acache.file_content(&foobar)?.blob().unwrap();
-            blob.update(0, b"test").await?;
-            blob.mark_verified().await?;
-        }
-
-        let mut job_stream = fixture.engine.job_stream();
-
-        let job = next_with_timeout(&mut job_stream).await?.unwrap();
-        assert_eq!(
-            (
-                JobId(5),
-                StorageJob::Realize {
-                    pathid: fixture.pathid(&foobar)?,
-                    cached_hash: Hash([2; 32]),
-                    indexed_hash: Some(Hash([1; 32]))
-                }
-            ),
-            job
-        );
 
         Ok(())
     }

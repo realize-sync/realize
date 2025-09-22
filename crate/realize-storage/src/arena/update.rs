@@ -1,4 +1,3 @@
-use crate::arena::cache::CacheExt;
 use crate::arena::db::ArenaDatabase;
 use crate::arena::index::{self};
 use crate::{Notification, StorageError};
@@ -49,25 +48,12 @@ pub(crate) fn apply(
                 cache.notify_replaced(
                     &mut tree, &mut blobs, &mut dirty, peer, &path, mtime, size, &hash, &old_hash,
                 )?;
-
-                cache.record_outdated(&mut tree, &mut dirty, &path, &old_hash, &hash)?;
             }
 
             Notification::Remove { path, old_hash, .. } => {
                 cache.notify_dropped_or_removed(
                     &mut tree, &mut blobs, &mut dirty, peer, &path, &old_hash, false,
                 )?;
-
-                if let Some(indexed) = cache.indexed(&tree, &path)?
-                    && indexed.is_outdated_by(&old_hash)
-                    && indexed.matches_file(path.within(db.index().datadir()))
-                {
-                    // This specific version has been removed
-                    // remotely. Make sure that the file hasn't
-                    // changed since it was indexed and if it hasn't,
-                    // remove it locally as well.
-                    std::fs::remove_file(&path.within(db.index().datadir()))?;
-                }
             }
             Notification::Drop { path, old_hash, .. } => cache.notify_dropped_or_removed(
                 &mut tree, &mut blobs, &mut dirty, peer, path, &old_hash, true,

@@ -848,7 +848,6 @@ mod tests {
                 size: 4,
                 mtime,
                 hash: hash::digest("test".as_bytes()),
-                outdated_by: None,
             }),
             index::get_file_async(&fixture.db, &path).await?
         );
@@ -872,7 +871,6 @@ mod tests {
                 size: 0,
                 mtime,
                 hash: hash::digest([]),
-                outdated_by: None,
             }),
             index::get_file_async(&fixture.db, &path).await?
         );
@@ -1243,7 +1241,6 @@ mod tests {
                 size: 3,
                 mtime: UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
                 hash: hash::digest("foo".as_bytes()),
-                outdated_by: None,
             }),
             index::get_file_async(&fixture.db, &foo).await?
         );
@@ -1254,7 +1251,6 @@ mod tests {
                 size: 6,
                 mtime: UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
                 hash: hash::digest("barbar".as_bytes()),
-                outdated_by: None,
             }),
             index::get_file_async(&fixture.db, &bar).await?
         );
@@ -1534,7 +1530,6 @@ mod tests {
                 size: 4,
                 mtime,
                 hash: hash::digest("test".as_bytes()),
-                outdated_by: None,
             }),
             index::get_file_async(db, &realize_types::Path::parse("bar")?).await?
         );
