@@ -97,7 +97,7 @@ impl StorageJobProcessor {
     /// don't match `hash`.
     fn unrealize(&self, pathid: PathId, hash: Hash) -> Result<JobStatus, StorageError> {
         let realpath: PathBuf;
-        let cachepath: Option<PathBuf>;
+        let cachepath: PathBuf;
         let txn = self.db.begin_write()?;
         {
             let mut tree = txn.write_tree()?;
@@ -144,13 +144,8 @@ impl StorageJobProcessor {
         // file is moved/deleted and the database is not updated it
         // would look like the user deleted the file, which then might
         // be propagated to other peers.
-        if let Some(cachepath) = &cachepath {
-            std::fs::rename(&realpath, cachepath)?;
-            log::debug!("[{tag}] Renamed {realpath:?} to {cachepath:?}",);
-        } else {
-            std::fs::remove_file(&realpath)?;
-            log::debug!("[{tag}] Deleted {realpath:?}");
-        }
+        log::debug!("[{tag}] Rename {realpath:?} to {cachepath:?}");
+        std::fs::rename(&realpath, cachepath)?;
 
         log::info!("[{tag}] Unrealized pathid {pathid} {hash} from {realpath:?}",);
 

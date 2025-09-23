@@ -88,11 +88,8 @@ use uuid::Uuid;
 /// Used in combination with PathId to form cache table keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Layer {
-    /// The default entry, containing the selected version and its
-    /// metadata for the cache.
+    /// The default entry, containing an entry for a local file or a cached entry from one of the remote layers.
     Default,
-    /// An entry in the index layer.
-    Index,
     /// An entry that represents another peer's copy.
     Remote(Peer),
 }
@@ -101,7 +98,6 @@ impl Layer {
     pub fn peer(&self) -> Option<Peer> {
         match self {
             Layer::Default => None,
-            Layer::Index => None,
             Layer::Remote(peer) => Some(*peer),
         }
     }
@@ -125,8 +121,7 @@ impl Value for Layer {
         }
         match data.get(0) {
             Some(1) => Layer::Default,
-            Some(2) => Layer::Index,
-            Some(3) => Layer::Remote(Peer::from(str::from_utf8(&data[1..]).unwrap())),
+            Some(2) => Layer::Remote(Peer::from(str::from_utf8(&data[1..]).unwrap())),
             _ => Layer::Default,
         }
     }
@@ -139,9 +134,8 @@ impl Value for Layer {
         let mut ret = vec![];
         match value {
             Layer::Default => ret.push(1),
-            Layer::Index => ret.push(2),
             Layer::Remote(peer) => {
-                ret.push(3);
+                ret.push(2);
                 ret.extend_from_slice(peer.as_str().as_bytes());
             }
         };
@@ -355,7 +349,7 @@ pub enum HistoryTableEntry {
     Drop(realize_types::Path, Hash),
 
     /// The file was branched from another file.
-    Branch(realize_types::Path, realize_types::Path, Hash, Option<Hash>),
+    Branch(realize_types::Path, realize_types::Path, Hash),
 
     /// The file was moved from another file.
     Rename(realize_types::Path, realize_types::Path, Hash),
@@ -404,11 +398,6 @@ impl ByteConvertible<HistoryTableEntry> for HistoryTableEntry {
                     parse_path(branch_reader.get_path()?)?,
                     parse_path(branch_reader.get_dest_path()?)?,
                     parse_hash(branch_reader.get_hash()?)?,
-                    if branch_reader.get_old_hash()?.is_empty() {
-                        None
-                    } else {
-                        Some(parse_hash(branch_reader.get_old_hash()?)?)
-                    },
                 ))
             }
             history_capnp::history_table_entry::Which::Rename(rename_reader) => {
@@ -447,14 +436,11 @@ impl ByteConvertible<HistoryTableEntry> for HistoryTableEntry {
                 drop_builder.set_path(path.as_str());
                 drop_builder.set_old_hash(&old_hash.0);
             }
-            HistoryTableEntry::Branch(path, dest_path, hash, old_hash) => {
+            HistoryTableEntry::Branch(path, dest_path, hash) => {
                 let mut branch_builder = builder.init_branch();
                 branch_builder.set_path(path.as_str());
                 branch_builder.set_dest_path(dest_path.as_str());
                 branch_builder.set_hash(&hash.0);
-                if let Some(old_hash) = old_hash {
-                    branch_builder.set_old_hash(&old_hash.0);
-                }
             }
             HistoryTableEntry::Rename(path, dest_path, hash) => {
                 let mut rename_builder = builder.init_rename();
@@ -1301,18 +1287,6 @@ mod tests {
     }
 
     #[test]
-    fn convert_layer_index() -> anyhow::Result<()> {
-        let layer = Layer::Index;
-
-        // Test round-trip conversion
-        let bytes = Layer::as_bytes(&layer);
-        let converted = Layer::from_bytes(&bytes);
-        assert_eq!(layer, converted);
-
-        Ok(())
-    }
-
-    #[test]
     fn convert_layer_remote() -> anyhow::Result<()> {
         let layer = Layer::Remote(Peer::from("peer1"));
 
@@ -1348,7 +1322,6 @@ mod tests {
 
         let test_cases = vec![
             Layer::Default,
-            Layer::Index,
             Layer::Remote(Peer::from("a")),
             Layer::Remote(Peer::from("b")),
             Layer::Remote(Peer::from("z")),
@@ -1392,7 +1365,6 @@ mod tests {
         // Test that byte comparison matches object comparison for all valid layers
         let test_cases = vec![
             Layer::Default,
-            Layer::Index,
             Layer::Remote(Peer::from("a")),
             Layer::Remote(Peer::from("b")),
             Layer::Remote(Peer::from("z")),
@@ -1432,7 +1404,7 @@ mod tests {
 
         // Should be 5 bytes for Remote (1 byte + "test")
         assert_eq!(bytes.len(), 5);
-        assert_eq!(bytes[0], 3);
+        assert_eq!(bytes[0], 2);
         assert_eq!(&bytes[1..], b"test");
     }
 
@@ -1440,7 +1412,6 @@ mod tests {
     fn layer_ordering_semantics() {
         // Test that Layer ordering matches the spec
         let default = Layer::Default;
-        let index = Layer::Index;
         let remote_a = Layer::Remote(Peer::from("a"));
         let remote_b = Layer::Remote(Peer::from("b"));
         let remote_z = Layer::Remote(Peer::from("z"));
@@ -1449,12 +1420,6 @@ mod tests {
         assert!(default < remote_a);
         assert!(default < remote_b);
         assert!(default < remote_z);
-        assert!(default < index);
-
-        // Index should come before Remote
-        assert!(index < remote_a);
-        assert!(index < remote_b);
-        assert!(index < remote_z);
 
         // Remote peers should be ordered by peer name
         assert!(remote_a < remote_b);
