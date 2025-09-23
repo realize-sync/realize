@@ -247,7 +247,7 @@ impl ArenaFilesystem {
             let loc = loc.into().into_tree_loc(&txn.read_cache()?)?;
             pathid = tree.expect(loc.borrow())?;
             let cache = txn.read_cache()?;
-            if cache.file_entry_or_err(&tree, pathid)?.local {
+            if cache.file_entry_or_err(&tree, pathid)?.is_local() {
                 let path = tree.backtrack(loc)?.ok_or(StorageError::IsADirectory)?;
                 return Ok(FileContent::Local(path.within(cache.datadir())));
             }

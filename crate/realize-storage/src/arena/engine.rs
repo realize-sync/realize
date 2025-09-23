@@ -465,18 +465,19 @@ impl Engine {
         let mut should_unrealize = None;
 
         if let Some(cached) = cache.file_at_pathid(pathid)? {
-            let hash = cached.hash;
+            let hash = cached.hash.clone();
+            let is_local = cached.is_local();
 
             if want_unrealize {
-                if cached.local {
+                if is_local {
                     should_unrealize = Some(hash.clone());
                 }
             } else if want_realize {
-                if !cached.local {
+                if !is_local {
                     should_realize = Some(hash.clone());
                 }
             }
-            if !cached.local {
+            if !is_local {
                 let blob = blobs.get_with_pathid(pathid)?;
                 if let Some(blob) = &blob {
                     if blob.protected {

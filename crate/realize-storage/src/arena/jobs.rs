@@ -175,16 +175,16 @@ impl StorageJobProcessor {
         {
             let mut tree = txn.write_tree()?;
             let mut cache = txn.write_cache()?;
-            let cached = match cache.file_at_pathid(pathid)? {
+            let entry = match cache.file_at_pathid(pathid)? {
                 Some(e) => e,
                 None => {
                     return Ok(JobStatus::Abandoned("cache_entry"));
                 }
             };
-            if cached.hash != hash {
+            if entry.hash != hash {
                 return Ok(JobStatus::Abandoned("cache_version"));
             }
-            if cached.local {
+            if entry.is_local() {
                 return Ok(JobStatus::Abandoned("already_realized"));
             }
 
@@ -209,7 +209,7 @@ impl StorageJobProcessor {
             }
 
             // Set mtime on source (best effort)
-            if let Some(time) = cached.mtime.as_system_time() {
+            if let Some(time) = entry.mtime.as_system_time() {
                 let f = File::open(&source)?;
                 let _ = f.set_modified(time);
             }

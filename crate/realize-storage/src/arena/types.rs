@@ -620,6 +620,20 @@ pub struct RemoteAvailability {
     pub peers: Vec<Peer>,
 }
 
+/// Specifies the type of file entry (local, cached, or branched from another path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileEntryKind {
+    /// This is a file on the local disk, in datadir
+    Local,
+    /// This is a file from another peer. There might be a blob
+    /// associated to it which contains a local copy of the data.
+    Cached,
+    /// This is a file from another peer branched locally from
+    /// another. The file may or may not have been branched on the
+    /// local peers.
+    Branched(PathId),
+}
+
 /// An entry in the file table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileTableEntry {
@@ -629,21 +643,32 @@ pub struct FileTableEntry {
     pub mtime: UnixTime,
     /// Hash of the specific version of the content the peer has.
     pub hash: Hash,
-    /// PathId this specific version was branched from
-    pub branched_from: Option<PathId>,
-    /// If true, the file is on the local disk, in the datadir.
-    pub local: bool,
+    /// The type of file entry (local, cached, or branched from another path)
+    pub kind: FileEntryKind,
 }
 
 impl FileTableEntry {
-    pub fn new(size: u64, mtime: UnixTime, hash: Hash) -> Self {
+    pub fn new(size: u64, mtime: UnixTime, hash: Hash, kind: FileEntryKind) -> Self {
         Self {
             size,
             mtime,
             hash,
-            branched_from: None,
-            local: false,
+            kind,
         }
+    }
+
+    /// Returns true if this is a local file on disk
+    pub fn is_local(&self) -> bool {
+        matches!(self.kind, FileEntryKind::Local)
+    }
+
+    /// Returns true if this is a cached file (either Cache or Branched)
+    #[allow(dead_code)]
+    pub fn is_cached(&self) -> bool {
+        matches!(
+            self.kind,
+            FileEntryKind::Cached | FileEntryKind::Branched(_)
+        )
     }
 }
 
@@ -707,20 +732,46 @@ fn fill_file_table_entry(
     mtime.set_secs(entry.mtime.as_secs());
     mtime.set_nsecs(entry.mtime.subsec_nanos());
     builder.set_hash(&entry.hash.0);
-    builder.set_branched_from(PathId::from_optional(entry.branched_from));
-    builder.set_local(entry.local);
+
+    // Convert the new enum back to the old capnp fields for compatibility
+    match entry.kind {
+        FileEntryKind::Local => {
+            builder.set_local(true);
+            builder.set_branched_from(0);
+        }
+        FileEntryKind::Cached => {
+            builder.set_local(false);
+            builder.set_branched_from(0);
+        }
+        FileEntryKind::Branched(pathid) => {
+            builder.set_local(false);
+            builder.set_branched_from(PathId::from_optional(Some(pathid)));
+        }
+    }
 }
 
 fn parse_file_table_entry(
     msg: cache_capnp::file_table_entry::Reader<'_>,
 ) -> Result<FileTableEntry, ByteConversionError> {
     let mtime = msg.get_mtime()?;
+
+    // Convert the old capnp fields to the new enum
+    let local = msg.get_local();
+    let branched_from = PathId::as_optional(msg.get_branched_from());
+
+    let kind = if local {
+        FileEntryKind::Local
+    } else if let Some(pathid) = branched_from {
+        FileEntryKind::Branched(pathid)
+    } else {
+        FileEntryKind::Cached
+    };
+
     Ok(FileTableEntry {
         size: msg.get_size(),
         mtime: UnixTime::new(mtime.get_secs(), mtime.get_nsecs()),
         hash: parse_hash(msg.get_hash()?)?,
-        branched_from: PathId::as_optional(msg.get_branched_from()),
-        local: msg.get_local(),
+        kind,
     })
 }
 
@@ -916,8 +967,7 @@ impl IndexedFile {
             size: self.size,
             mtime: self.mtime,
             hash: self.hash,
-            branched_from: None,
-            local: true,
+            kind: FileEntryKind::Local,
         }
     }
 }
@@ -1014,6 +1064,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn convert_file_table_entry_capnp() -> anyhow::Result<()> {
+        // Test Local variant
+        let local_entry = FileTableEntry {
+            size: 100,
+            mtime: UnixTime::from_secs(1234567890),
+            hash: Hash([1u8; 32]),
+            kind: FileEntryKind::Local,
+        };
+
+        let bytes = local_entry.to_bytes()?;
+        let recovered = FileTableEntry::from_bytes(&bytes)?;
+        assert_eq!(local_entry, recovered);
+
+        // Test Cache variant
+        let cache_entry = FileTableEntry {
+            size: 200,
+            mtime: UnixTime::from_secs(1234567891),
+            hash: Hash([2u8; 32]),
+            kind: FileEntryKind::Cached,
+        };
+
+        let bytes = cache_entry.to_bytes()?;
+        let recovered = FileTableEntry::from_bytes(&bytes)?;
+        assert_eq!(cache_entry, recovered);
+
+        // Test Branched variant
+        let branched_entry = FileTableEntry {
+            size: 300,
+            mtime: UnixTime::from_secs(1234567892),
+            hash: Hash([3u8; 32]),
+            kind: FileEntryKind::Branched(PathId(42)),
+        };
+
+        let bytes = branched_entry.to_bytes()?;
+        let recovered = FileTableEntry::from_bytes(&bytes)?;
+        assert_eq!(branched_entry, recovered);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_file_entry_kind_methods() {
+        // Test Local
+        let local_entry = FileTableEntry {
+            size: 100,
+            mtime: UnixTime::from_secs(1234567890),
+            hash: Hash([1u8; 32]),
+            kind: FileEntryKind::Local,
+        };
+        assert!(local_entry.is_local());
+        assert!(!local_entry.is_cached());
+
+        // Test Cache
+        let cache_entry = FileTableEntry {
+            size: 200,
+            mtime: UnixTime::from_secs(1234567891),
+            hash: Hash([2u8; 32]),
+            kind: FileEntryKind::Cached,
+        };
+        assert!(!cache_entry.is_local());
+        assert!(cache_entry.is_cached());
+
+        // Test Branched
+        let branched_entry = FileTableEntry {
+            size: 300,
+            mtime: UnixTime::from_secs(1234567892),
+            hash: Hash([3u8; 32]),
+            kind: FileEntryKind::Branched(PathId(42)),
+        };
+        assert!(!branched_entry.is_local());
+        assert!(branched_entry.is_cached());
+    }
+
+    #[tokio::test]
     async fn convert_history_table_entry() -> anyhow::Result<()> {
         let add = HistoryTableEntry::Add(realize_types::Path::parse("foo/bar.txt")?);
         assert_eq!(
@@ -1094,8 +1218,7 @@ mod tests {
             size: 200,
             mtime: UnixTime::from_secs(1234567890),
             hash: Hash([0xa1u8; 32]),
-            branched_from: Some(PathId(123)),
-            local: true,
+            kind: FileEntryKind::Branched(PathId(123)),
         };
 
         assert_eq!(
@@ -1112,8 +1235,7 @@ mod tests {
             size: 200,
             mtime: UnixTime::from_secs(1234567890),
             hash: Hash([0xa1u8; 32]),
-            branched_from: None,
-            local: false,
+            kind: FileEntryKind::Cached,
         };
 
         let entry = CacheTableEntry::File(file_entry);
@@ -1149,8 +1271,7 @@ mod tests {
             size: 100,
             mtime: UnixTime::from_secs(1234567890),
             hash: Hash([0x42u8; 32]),
-            branched_from: None,
-            local: false,
+            kind: FileEntryKind::Cached,
         };
 
         let dir_entry = DirtableEntry {

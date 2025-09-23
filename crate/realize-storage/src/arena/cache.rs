@@ -3,8 +3,8 @@ use super::dirty::WritableOpenDirty;
 use super::index::Index;
 use super::tree::{TreeExt, TreeReadOperations, WritableOpenTree};
 use super::types::{
-    CacheTableEntry, DirtableEntry, FileMetadata, FileRealm, FileTableEntry, IndexedFile, Layer,
-    RemoteAvailability,
+    CacheTableEntry, DirtableEntry, FileEntryKind, FileMetadata, FileRealm, FileTableEntry,
+    IndexedFile, Layer, RemoteAvailability,
 };
 use crate::arena::blob::BlobReadOperations;
 use crate::arena::db::Tag;
@@ -433,7 +433,7 @@ impl<'a> WritableOpenCache<'a> {
             path,
             e.hash
         );
-        if e.local {
+        if e.is_local() {
             std::fs::remove_file(path.within(self.datadir()))?;
             self.rm_index_entry(tree, pathid)?;
         }
@@ -532,7 +532,7 @@ impl<'a> WritableOpenCache<'a> {
                 match default_entry(&self.table, dest_pathid)? {
                     None => {}
                     Some(CacheTableEntry::File(entry)) => {
-                        dest_is_local = entry.local;
+                        dest_is_local = entry.is_local();
                         old_hash = Some(entry.hash)
                     }
                     Some(CacheTableEntry::Dir(_)) => return Err(StorageError::IsADirectory),
@@ -543,7 +543,7 @@ impl<'a> WritableOpenCache<'a> {
 
                 let source_path = tree.backtrack(source)?.ok_or(StorageError::IsADirectory)?;
                 let dest_path = tree.backtrack(dest)?.ok_or(StorageError::IsADirectory)?;
-                if source_entry.local {
+                if source_entry.is_local() {
                     let source_realpath = source_path.within(self.datadir());
                     let dest_realpath = dest_path.within(self.datadir());
 
@@ -565,7 +565,7 @@ impl<'a> WritableOpenCache<'a> {
                     history.report_removed(&source_path, &source_entry.hash)?;
                 } else {
                     // (over)write new entry
-                    source_entry.branched_from = Some(source_pathid);
+                    source_entry.kind = FileEntryKind::Branched(source_pathid);
                     self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &source_entry)?;
                     if dest_is_local {
                         self.rm_index_entry(tree, dest_pathid)?;
@@ -612,7 +612,7 @@ impl<'a> WritableOpenCache<'a> {
             return Err(StorageError::AlreadyExists);
         }
 
-        if source_entry.local {
+        if source_entry.is_local() {
             // We own the source, make change on the filesystem
             std::fs::hard_link(
                 &source_path.within(self.datadir()),
@@ -640,7 +640,7 @@ impl<'a> WritableOpenCache<'a> {
             )?;
 
             // write dest in the database and optionally the filesystem
-            source_entry.branched_from = Some(source_pathid);
+            source_entry.kind = FileEntryKind::Branched(source_pathid);
             self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &source_entry)?;
         }
 
@@ -709,7 +709,7 @@ impl<'a> WritableOpenCache<'a> {
         hash: Hash,
     ) -> Result<(), StorageError> {
         let file_pathid = tree.setup(&path)?;
-        let entry = FileTableEntry::new(size, mtime, hash.clone());
+        let entry = FileTableEntry::new(size, mtime, hash.clone(), FileEntryKind::Cached);
         let mut updated_default = false;
         if peer_file_entry(&self.table, file_pathid, None)?.is_none() {
             log::debug!("[{}]@local Add \"{path}\" {hash} size={size}", self.tag);
@@ -740,7 +740,7 @@ impl<'a> WritableOpenCache<'a> {
         old_hash: &Hash,
     ) -> Result<(), StorageError> {
         let pathid = tree.setup(path)?;
-        let entry = FileTableEntry::new(size, mtime, hash.clone());
+        let entry = FileTableEntry::new(size, mtime, hash.clone(), FileEntryKind::Cached);
         let mut default_modified = false;
         if peer_file_entry(&self.table, pathid, None)?
             .map(|e| e.hash == *old_hash)
@@ -804,7 +804,7 @@ impl<'a> WritableOpenCache<'a> {
     ) -> Result<(), StorageError> {
         let file_pathid = tree.setup(&path)?;
         unmark_peer_file(&mut self.pending_catchup_table, peer, file_pathid)?;
-        let entry = FileTableEntry::new(size, mtime, hash.clone());
+        let entry = FileTableEntry::new(size, mtime, hash.clone(), FileEntryKind::Cached);
         if let Some(e) = peer_file_entry(&self.table, file_pathid, None)?
             && e.hash != hash
         {
@@ -1000,7 +1000,7 @@ impl<'a> WritableOpenCache<'a> {
         for pathid in pathids {
             self.rm_peer_file_entry(tree, pathid, peer)?;
             if let Some(entry) = self.file_at_pathid(pathid)? {
-                if !entry.local
+                if !entry.is_local()
                     && self
                         .remote_availability(tree, pathid, &entry.hash)?
                         .is_none()
@@ -1313,7 +1313,7 @@ fn file_realm<'b, L: Into<TreeLoc<'b>>>(
     loc: L,
 ) -> Result<FileRealm, StorageError> {
     let pathid = tree.expect(loc)?;
-    if default_file_entry_or_err(cache_table, pathid)?.local {
+    if default_file_entry_or_err(cache_table, pathid)?.is_local() {
         return Ok(FileRealm::Local);
     }
 
@@ -1353,7 +1353,10 @@ fn remote_availability<'b, L: Into<TreeLoc<'b>>>(
             }
         }
         if avail.is_none() {
-            next = default_file_entry(cache_table, pathid)?.and_then(|e| e.branched_from);
+            next = default_file_entry(cache_table, pathid)?.and_then(|e| match e.kind {
+                FileEntryKind::Branched(pathid) => Some(pathid),
+                _ => None,
+            });
         }
     }
     Ok(avail)
@@ -4164,7 +4167,13 @@ mod tests {
         // dest is gone, source replaces it and points to it
         assert!(cache.file_entry(&tree, &source_path)?.is_none());
         let dest_entry = cache.file_entry_or_err(&tree, &dest_path).unwrap();
-        assert_eq!(tree.resolve(&source_path)?, dest_entry.branched_from);
+        assert_eq!(
+            tree.resolve(&source_path)?,
+            match dest_entry.kind {
+                FileEntryKind::Branched(pathid) => Some(pathid),
+                _ => None,
+            }
+        );
         assert_eq!(hash, dest_entry.hash);
         assert_eq!(6, dest_entry.size);
         assert_eq!(test_time(), dest_entry.mtime);
@@ -4267,7 +4276,13 @@ mod tests {
         // dest is gone, source replaces it and points to it
         assert!(cache.file_entry(&tree, &source_path)?.is_none());
         let dest_entry = cache.file_entry_or_err(&tree, &dest_path).unwrap();
-        assert_eq!(tree.resolve(&source_path)?, dest_entry.branched_from);
+        assert_eq!(
+            tree.resolve(&source_path)?,
+            match dest_entry.kind {
+                FileEntryKind::Branched(pathid) => Some(pathid),
+                _ => None,
+            }
+        );
         assert_eq!(source_hash, dest_entry.hash);
         assert_eq!(6, dest_entry.size);
 
@@ -4341,7 +4356,7 @@ mod tests {
         assert_eq!(hash, dest_entry.hash);
         assert_eq!(12, dest_entry.size);
         assert_eq!(mtime, dest_entry.mtime);
-        assert!(dest_entry.local);
+        assert!(dest_entry.is_local());
 
         // Check dirty entries
         let dest_pathid = tree.expect(&dest_path)?;
@@ -4460,10 +4475,16 @@ mod tests {
 
         assert!(cache.file_entry(&tree, &source_path)?.is_none());
         let dest_entry = cache.file_entry_or_err(&tree, &dest_path).unwrap();
-        assert_eq!(tree.resolve(&source_path)?, dest_entry.branched_from);
+        assert_eq!(
+            tree.resolve(&source_path)?,
+            match dest_entry.kind {
+                FileEntryKind::Branched(pathid) => Some(pathid),
+                _ => None,
+            }
+        );
         assert_eq!(source_hash, dest_entry.hash);
         assert_eq!(14, dest_entry.size);
-        assert!(dest_entry.local);
+        assert!(dest_entry.is_local());
 
         assert_eq!(
             vec![
@@ -4545,10 +4566,16 @@ mod tests {
         // Source entry should be gone, dest should exist with source data and be local
         assert!(cache.file_entry(&tree, &source_path)?.is_none());
         let dest_entry = cache.file_entry_or_err(&tree, &dest_path).unwrap();
-        assert_eq!(tree.resolve(&source_path)?, dest_entry.branched_from);
+        assert_eq!(
+            tree.resolve(&source_path)?,
+            match dest_entry.kind {
+                FileEntryKind::Branched(pathid) => Some(pathid),
+                _ => None,
+            }
+        );
         assert_eq!(source_hash, dest_entry.hash);
         assert_eq!(14, dest_entry.size);
-        assert!(dest_entry.local,);
+        assert!(dest_entry.is_local());
 
         assert_eq!(
             vec![
@@ -4626,10 +4653,16 @@ mod tests {
         // Source entry should be gone, dest should exist with source data but not be local
         assert!(cache.file_entry(&tree, &source_path)?.is_none());
         let dest_entry = cache.file_entry_or_err(&tree, &dest_path).unwrap();
-        assert_eq!(tree.resolve(&source_path)?, dest_entry.branched_from);
+        assert_eq!(
+            tree.resolve(&source_path)?,
+            match dest_entry.kind {
+                FileEntryKind::Branched(pathid) => Some(pathid),
+                _ => None,
+            }
+        );
         assert_eq!(source_hash, dest_entry.hash);
         assert_eq!(21, dest_entry.size);
-        assert!(!dest_entry.local,);
+        assert!(!dest_entry.is_local());
 
         // history entry reports old hash
         let (_, history_entry) = history.history(0..).last().unwrap().unwrap();
@@ -4737,19 +4770,19 @@ mod tests {
         assert_eq!(hash1, file1_entry.hash);
         assert_eq!(5, file1_entry.size);
         assert_eq!(test_time(), file1_entry.mtime);
-        assert!(!file1_entry.local);
+        assert!(!file1_entry.is_local());
 
         let file2_entry = cache.file_entry(&tree, &moved_file2)?.unwrap();
         assert_eq!(hash2, file2_entry.hash);
         assert_eq!(5, file2_entry.size);
         assert_eq!(test_time(), file2_entry.mtime);
-        assert!(!file2_entry.local);
+        assert!(!file2_entry.is_local());
 
         let file3_entry = cache.file_entry(&tree, &moved_file3)?.unwrap();
         assert_eq!(hash3, file3_entry.hash);
         assert_eq!(4, file3_entry.size);
         assert_eq!(file3_mtime, file3_entry.mtime);
-        assert!(file3_entry.local);
+        assert!(file3_entry.is_local());
 
         let moved_file3_realpath = moved_file3.within(cache.datadir());
         assert!(moved_file3_realpath.exists());
