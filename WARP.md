@@ -16,10 +16,13 @@ brew install capnp fuse-t
 cargo build
 
 # Run all tests
-cargo test
+cargo nextest run -P ci
 
 # Run crate-specific test (Example with crate-storage; substitute as appropriate)
-cargo test -p crate-storage
+cargo nextest run -p crate-storage -P ci
+
+# Run a specific test or a subset of the tests (Example with the cache module; substitute as appropriate)
+cargo nextest run -p crate-storage cache
 
 # Format code
 cargo fmt
@@ -32,25 +35,29 @@ The project doesn't use a CHANGELOG. It relies instead on conventional
 commits to track changes. Commits that introduce backward-incompatibly
 changes are marked with an exclamation mark in their short comment.
 
+cargo nextest has two profile:
+ - the ci profile, selected with -P ci, which has 2m timeouts for tests and retries flaky tests once
+ - the default profile, which has shorter test timeouts and no retries
+
 ### Testing
 ```bash
-# Run specific test module
-cargo test test_module_name
+# Run specific test module in test_crate
+cargo nextest run -p test_crate test_module_name
 
 # Run integration tests only
-cargo test --test "*integration_test"
+cargo nextest run integration_test
 
 # Run tests with debug logging
-RUST_LOG=realize_=debug cargo test
+RUST_LOG=realize_=debug cargo next run
 
 # Run single test with full output
-cargo test test_name -- --nocapture
+cargo nextest run test_name --nocapture
 
 # Debug FUSE tests with detailed logging
-RUST_LOG=realize_=debug,fuser=debug cargo test fuse_test_name -- --nocapture
+RUST_LOG=realize_=debug,fuser=debug cargo nexttest -p realize-core fuse_test_name --nocapture
 
 # Run only FUSE tests (Linux only)
-cargo test --package realize-core fuse
+cargo nextest run -p realize-core fuse
 ```
 
 ### Executables
@@ -108,9 +115,9 @@ All network communication uses Cap'n Proto for:
 
 ### Code Quality
 - **Always run `cargo check` after every code change** - fix all errors and warnings
-- **Always run `cargo test -- --skip :slow:` after every code change** - fix all test failures
+- **Always run `cargo nextest -p crate -P ci` after every code change** - fix all test failures
 - Run `cargo fmt` before committing any Rust files
-- Use `cargo nextest` for improved test running with retries
+- Use `cargo nextest run -P ci` for improved test running with timeouts and retries
 
 ### Module Organization
 - **Never create `mod.rs` files** - use `module_name.rs` instead for better discoverability
