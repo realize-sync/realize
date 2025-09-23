@@ -72,7 +72,7 @@ pub(crate) trait CacheReadOperations {
     fn index_entry_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError>;
 
     /// Return all indexed files in the index layer
-    fn all_indexed(&self) -> impl Iterator<Item = Result<(Path, IndexedFile), StorageError>>;
+    fn all_indexed(&self) -> impl Iterator<Item = Result<(PathId, IndexedFile), StorageError>>;
 
     /// Return the datadir path.
     fn datadir(&self) -> &std::path::Path;
@@ -179,7 +179,7 @@ where
         Ok(indexed_entry(&self.table, pathid)?.map(|e| e.into()))
     }
 
-    fn all_indexed(&self) -> impl Iterator<Item = Result<(Path, IndexedFile), StorageError>> {
+    fn all_indexed(&self) -> impl Iterator<Item = Result<(PathId, IndexedFile), StorageError>> {
         AllIndexedIterator::new(&self.table)
     }
 
@@ -248,7 +248,7 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         Ok(indexed_entry(&self.table, pathid)?.map(|e| e.into()))
     }
 
-    fn all_indexed(&self) -> impl Iterator<Item = Result<(Path, IndexedFile), StorageError>> {
+    fn all_indexed(&self) -> impl Iterator<Item = Result<(PathId, IndexedFile), StorageError>> {
         AllIndexedIterator::new(&self.table)
     }
 
@@ -1443,7 +1443,7 @@ impl<'a> AllIndexedIterator<'a> {
 }
 
 impl<'a> Iterator for AllIndexedIterator<'a> {
-    type Item = Result<(Path, IndexedFile), StorageError>;
+    type Item = Result<(PathId, IndexedFile), StorageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match &mut self.iter {
@@ -1454,12 +1454,12 @@ impl<'a> Iterator for AllIndexedIterator<'a> {
                     match entry {
                         Err(err) => return Some(Err(err.into())),
                         Ok((key, value)) => {
-                            let (_, layer) = key.value();
+                            let (pathid, layer) = key.value();
                             if let Layer::Index = layer {
                                 match value.value().parse() {
                                     Err(err) => return Some(Err(StorageError::from(err))),
                                     Ok(CacheTableEntry::File(e)) => {
-                                        return Some(Ok((e.path.clone(), e.into())));
+                                        return Some(Ok((pathid, e.into())));
                                     }
                                     Ok(_) => {} // continue
                                 }
@@ -3292,58 +3292,40 @@ mod tests {
         fixture.add_to_cache(&Path::parse("regular.txt")?, 500, mtime)?;
         fixture.add_to_cache(&path1, 500, mtime)?;
 
-        // Add indexed entries
-        {
-            let txn = fixture.db.begin_write()?;
-            {
-                let mut cache = txn.write_cache()?;
-                let mut tree = txn.write_tree()?;
-                let mut blobs = txn.write_blobs()?;
-                let mut dirty = txn.write_dirty()?;
-                let mut history = txn.write_history()?;
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
 
-                for (path, indexed) in [
-                    (&path1, &indexed_file1),
-                    (&path2, &indexed_file2),
-                    (&path3, &indexed_file3),
-                ] {
-                    cache.index(
-                        &mut tree,
-                        &mut blobs,
-                        &mut history,
-                        &mut dirty,
-                        path,
-                        indexed.size,
-                        indexed.mtime,
-                        indexed.hash.clone(),
-                    )?;
-                }
-            }
-            txn.commit()?;
+        for (path, indexed) in [
+            (&path1, &indexed_file1),
+            (&path2, &indexed_file2),
+            (&path3, &indexed_file3),
+        ] {
+            cache.index(
+                &mut tree,
+                &mut blobs,
+                &mut history,
+                &mut dirty,
+                path,
+                indexed.size,
+                indexed.mtime,
+                indexed.hash.clone(),
+            )?;
         }
 
-        // Test all_indexed
-        {
-            let txn = fixture.db.begin_read()?;
-            let cache = txn.read_cache()?;
+        let got = cache
+            .all_indexed()
+            .collect::<Result<HashMap<PathId, IndexedFile>, _>>()?;
+        let expect = HashMap::from([
+            (tree.resolve(path1)?.unwrap(), indexed_file1),
+            (tree.resolve(path2)?.unwrap(), indexed_file2),
+            (tree.resolve(path3)?.unwrap(), indexed_file3),
+        ]);
 
-            let indexed_files: Result<Vec<_>, _> = cache.all_indexed().collect();
-            let indexed_files = indexed_files?;
-
-            // Should have exactly 3 entries
-            assert_eq!(indexed_files.len(), 3);
-
-            // Convert to a map for easier checking
-            let indexed_map = indexed_files.into_iter().collect::<HashMap<_, _>>();
-
-            // Verify each entry
-            assert_eq!(indexed_map.get(&path1).unwrap(), &indexed_file1);
-            assert_eq!(indexed_map.get(&path2).unwrap(), &indexed_file2);
-            assert_eq!(indexed_map.get(&path3).unwrap(), &indexed_file3);
-
-            // Verify no extra entries
-            assert_eq!(indexed_map.len(), 3);
-        }
+        assert_eq!(expect, got);
 
         Ok(())
     }

@@ -381,10 +381,13 @@ fn all_files(
 ) -> Result<(), StorageError> {
     let txn = db.begin_read()?;
     let cache = txn.read_cache()?;
+    let tree = txn.read_tree()?;
     for entry in cache.all_indexed() {
-        let (path, indexed) = entry?;
-        if let Err(_) = tx.blocking_send((path, indexed)) {
-            break;
+        let (pathid, indexed) = entry?;
+        if let Some(path) = tree.backtrack(pathid)? {
+            if let Err(_) = tx.blocking_send((path, indexed)) {
+                break;
+            }
         }
     }
 
