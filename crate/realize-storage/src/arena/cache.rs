@@ -426,19 +426,19 @@ impl<'a> WritableOpenCache<'a> {
         let loc = loc.into();
         let pathid = tree.expect(loc.borrow())?;
         let e = default_file_entry_or_err(&self.table, pathid)?;
+        let path = tree.backtrack(loc)?.ok_or(StorageError::IsADirectory)?;
         log::debug!(
             "[{}]@local Local removal of \"{}\" pathid {pathid} {}",
             self.tag,
-            e.path,
+            path,
             e.hash
         );
         if e.local {
-            let path = tree.backtrack(loc)?.ok_or(StorageError::IsADirectory)?;
             std::fs::remove_file(path.within(self.datadir()))?;
             self.rm_index_entry(tree, pathid)?;
         }
         self.rm_default_file_entry(tree, blobs, dirty, pathid)?;
-        history.report_removed(&e.path, &e.hash)?;
+        history.report_removed(&path, &e.hash)?;
 
         Ok(())
     }
@@ -553,7 +553,7 @@ impl<'a> WritableOpenCache<'a> {
                     std::fs::rename(&source_realpath, &dest_realpath)?;
 
                     // (over)write new entry in database
-                    let dest_entry = IndexedFile::from(&source_entry).into_file(dest_path.clone());
+                    let dest_entry = IndexedFile::from(&source_entry).into_file();
                     self.write_index_entry(tree, dest_pathid, &dest_entry)?;
                     self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &dest_entry)?;
 
@@ -621,7 +621,7 @@ impl<'a> WritableOpenCache<'a> {
 
             // write dest in the database
             let old_hash = default_file_entry(&self.table, dest_pathid)?.map(|e| e.hash);
-            let dest_entry = IndexedFile::from(&source_entry).into_file(dest_path.clone());
+            let dest_entry = IndexedFile::from(&source_entry).into_file();
             self.write_index_entry(tree, dest_pathid, &dest_entry)?;
             self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &dest_entry)?;
 
@@ -709,7 +709,7 @@ impl<'a> WritableOpenCache<'a> {
         hash: Hash,
     ) -> Result<(), StorageError> {
         let file_pathid = tree.setup(&path)?;
-        let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
+        let entry = FileTableEntry::new(size, mtime, hash.clone());
         let mut updated_default = false;
         if peer_file_entry(&self.table, file_pathid, None)?.is_none() {
             log::debug!("[{}]@local Add \"{path}\" {hash} size={size}", self.tag);
@@ -740,7 +740,7 @@ impl<'a> WritableOpenCache<'a> {
         old_hash: &Hash,
     ) -> Result<(), StorageError> {
         let pathid = tree.setup(path)?;
-        let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
+        let entry = FileTableEntry::new(size, mtime, hash.clone());
         let mut default_modified = false;
         if peer_file_entry(&self.table, pathid, None)?
             .map(|e| e.hash == *old_hash)
@@ -804,7 +804,7 @@ impl<'a> WritableOpenCache<'a> {
     ) -> Result<(), StorageError> {
         let file_pathid = tree.setup(&path)?;
         unmark_peer_file(&mut self.pending_catchup_table, peer, file_pathid)?;
-        let entry = FileTableEntry::new(path.clone(), size, mtime, hash.clone());
+        let entry = FileTableEntry::new(size, mtime, hash.clone());
         if let Some(e) = peer_file_entry(&self.table, file_pathid, None)?
             && e.hash != hash
         {
@@ -1032,7 +1032,7 @@ impl<'a> WritableOpenCache<'a> {
             return Ok(pathid);
         }
         if let Some(path) = tree.backtrack(loc.borrow())? {
-            let entry = IndexedFile { hash, mtime, size }.into_file(path.clone());
+            let entry = IndexedFile { hash, mtime, size }.into_file();
             self.write_index_entry(tree, pathid, &entry)?;
             self.write_default_file_entry(tree, blobs, dirty, pathid, &entry)?;
             history.report_added(&path, old_hash.as_ref())?;
@@ -1069,7 +1069,7 @@ impl<'a> WritableOpenCache<'a> {
             size: entry.size,
             hash: entry.hash,
         }
-        .into_file(path.clone());
+        .into_file();
         let old_hash = self.indexed_hash(pathid);
         self.write_index_entry(tree, pathid, &index_entry)?;
         self.write_default_file_entry(tree, blobs, dirty, pathid, &index_entry)?;
@@ -1337,16 +1337,20 @@ fn remote_availability<'b, L: Into<TreeLoc<'b>>>(
         visited.insert(pathid); // avoid loops
         for entry in find_peer_entry(cache_table, pathid, hash)? {
             let (peer, file_entry) = entry?;
-            avail
-                .get_or_insert_with(|| RemoteAvailability {
-                    arena: tree.arena(),
-                    path: file_entry.path,
-                    size: file_entry.size,
-                    hash: file_entry.hash,
-                    peers: vec![],
-                })
-                .peers
-                .push(peer);
+            if avail.is_none() {
+                if let Some(path) = tree.backtrack(pathid)? {
+                    avail = Some(RemoteAvailability {
+                        arena: tree.arena(),
+                        path,
+                        size: file_entry.size,
+                        hash: file_entry.hash,
+                        peers: vec![],
+                    });
+                }
+            }
+            if let Some(avail) = &mut avail {
+                avail.peers.push(peer);
+            }
         }
         if avail.is_none() {
             next = default_file_entry(cache_table, pathid)?.and_then(|e| e.branched_from);

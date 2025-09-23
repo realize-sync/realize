@@ -20,10 +20,9 @@ struct CacheTableEntry {
 struct FileTableEntry {
   size @0: UInt64;
   mtime @1: Time;
-  path @2: Text;
-  hash @3: Data;
-  branchedFrom @4: UInt64; # 0 for None
-  local @5: Bool;
+  hash @2: Data;
+  branchedFrom @3: UInt64; # 0 for None
+  local @4: Bool;
 }
 
 struct PeerTableEntry {

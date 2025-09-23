@@ -627,8 +627,6 @@ pub struct FileTableEntry {
     pub size: u64,
     /// The modification time of the file.
     pub mtime: UnixTime,
-    /// The path to use to fetch file content in the peer.
-    pub path: Path,
     /// Hash of the specific version of the content the peer has.
     pub hash: Hash,
     /// PathId this specific version was branched from
@@ -638,11 +636,10 @@ pub struct FileTableEntry {
 }
 
 impl FileTableEntry {
-    pub fn new(path: Path, size: u64, mtime: UnixTime, hash: Hash) -> Self {
+    pub fn new(size: u64, mtime: UnixTime, hash: Hash) -> Self {
         Self {
             size,
             mtime,
-            path,
             hash,
             branched_from: None,
             local: false,
@@ -709,7 +706,6 @@ fn fill_file_table_entry(
     let mut mtime = builder.reborrow().init_mtime();
     mtime.set_secs(entry.mtime.as_secs());
     mtime.set_nsecs(entry.mtime.subsec_nanos());
-    builder.set_path(entry.path.as_str());
     builder.set_hash(&entry.hash.0);
     builder.set_branched_from(PathId::from_optional(entry.branched_from));
     builder.set_local(entry.local);
@@ -722,7 +718,6 @@ fn parse_file_table_entry(
     Ok(FileTableEntry {
         size: msg.get_size(),
         mtime: UnixTime::new(mtime.get_secs(), mtime.get_nsecs()),
-        path: Path::parse(msg.get_path()?.to_str()?)?,
         hash: parse_hash(msg.get_hash()?)?,
         branched_from: PathId::as_optional(msg.get_branched_from()),
         local: msg.get_local(),
@@ -916,11 +911,10 @@ impl IndexedFile {
         size == self.size && mtime == self.mtime
     }
 
-    pub(crate) fn into_file(self, path: Path) -> FileTableEntry {
+    pub(crate) fn into_file(self) -> FileTableEntry {
         FileTableEntry {
             size: self.size,
             mtime: self.mtime,
-            path: path,
             hash: self.hash,
             branched_from: None,
             local: true,
@@ -1099,7 +1093,6 @@ mod tests {
         let entry = FileTableEntry {
             size: 200,
             mtime: UnixTime::from_secs(1234567890),
-            path: Path::parse("foo/bar.txt")?,
             hash: Hash([0xa1u8; 32]),
             branched_from: Some(PathId(123)),
             local: true,
@@ -1118,7 +1111,6 @@ mod tests {
         let file_entry = FileTableEntry {
             size: 200,
             mtime: UnixTime::from_secs(1234567890),
-            path: Path::parse("foo/bar.txt")?,
             hash: Hash([0xa1u8; 32]),
             branched_from: None,
             local: false,
@@ -1156,7 +1148,6 @@ mod tests {
         let file_entry = FileTableEntry {
             size: 100,
             mtime: UnixTime::from_secs(1234567890),
-            path: Path::parse("test/file.txt")?,
             hash: Hash([0x42u8; 32]),
             branched_from: None,
             local: false,
