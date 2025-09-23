@@ -575,12 +575,7 @@ impl<'a> WritableOpenCache<'a> {
                     // delete older entry
                     self.rm_default_file_entry(tree, blobs, dirty, source_pathid)?;
 
-                    history.request_rename(
-                        &source_path,
-                        &dest_path,
-                        &source_entry.hash,
-                        old_hash.as_ref(),
-                    )?;
+                    history.request_rename(&source_path, &dest_path, &source_entry.hash)?;
                 }
             }
         }
@@ -4206,7 +4201,7 @@ mod tests {
         // history entry was added
         let (_, history_entry) = history.history(0..).last().unwrap().unwrap();
         assert_eq!(
-            HistoryTableEntry::Rename(source_path, dest_path, hash, None),
+            HistoryTableEntry::Rename(source_path, dest_path, hash),
             history_entry
         );
 
@@ -4289,7 +4284,7 @@ mod tests {
         // history entry reports old hash
         let (_, history_entry) = history.history(0..).last().unwrap().unwrap();
         assert_eq!(
-            HistoryTableEntry::Rename(source_path, dest_path, source_hash, Some(dest_hash)),
+            HistoryTableEntry::Rename(source_path, dest_path, source_hash),
             history_entry
         );
 
@@ -4667,7 +4662,7 @@ mod tests {
         // history entry reports old hash
         let (_, history_entry) = history.history(0..).last().unwrap().unwrap();
         assert_eq!(
-            HistoryTableEntry::Rename(source_path, dest_path, source_hash, Some(dest_hash)),
+            HistoryTableEntry::Rename(source_path, dest_path, source_hash),
             history_entry
         );
 
@@ -4837,8 +4832,8 @@ mod tests {
 
         assert_unordered::assert_eq_unordered!(
             vec![
-                HistoryTableEntry::Rename(file1_path, moved_file1, hash1, None),
-                HistoryTableEntry::Rename(file2_path, moved_file2, hash2, None),
+                HistoryTableEntry::Rename(file1_path, moved_file1, hash1),
+                HistoryTableEntry::Rename(file2_path, moved_file2, hash2),
                 HistoryTableEntry::Add(moved_file3),
                 HistoryTableEntry::Remove(file3_path, hash3),
             ],

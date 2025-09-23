@@ -1273,11 +1273,6 @@ async fn do_notify(
                     source: parse_path(branch.get_source()?)?,
                     dest: parse_path(branch.get_dest()?)?,
                     hash: parse_hash(branch.get_hash()?)?,
-                    old_hash: if branch.has_old_hash() {
-                        Some(parse_hash(branch.get_old_hash()?)?)
-                    } else {
-                        None
-                    },
                 }
             }
             notification::Which::Rename(rename) => {
@@ -1289,11 +1284,6 @@ async fn do_notify(
                     source: parse_path(rename.get_source()?)?,
                     dest: parse_path(rename.get_dest()?)?,
                     hash: parse_hash(rename.get_hash()?)?,
-                    old_hash: if rename.has_old_hash() {
-                        Some(parse_hash(rename.get_old_hash()?)?)
-                    } else {
-                        None
-                    },
                 }
             }
         });
@@ -1408,16 +1398,12 @@ fn fill_branch(
     source: &realize_types::Path,
     dest: &realize_types::Path,
     hash: &realize_types::Hash,
-    old_hash: Option<&realize_types::Hash>,
 ) {
     builder.set_arena(arena.as_str());
     builder.set_index(index);
     builder.set_source(source.as_str());
     builder.set_dest(dest.as_str());
     builder.set_hash(&hash.0);
-    if let Some(old_hash) = old_hash {
-        builder.set_old_hash(&old_hash.0);
-    }
 }
 
 fn fill_rename(
@@ -1427,16 +1413,12 @@ fn fill_rename(
     source: &realize_types::Path,
     dest: &realize_types::Path,
     hash: &realize_types::Hash,
-    old_hash: Option<&realize_types::Hash>,
 ) {
     builder.set_arena(arena.as_str());
     builder.set_index(index);
     builder.set_source(source.as_str());
     builder.set_dest(dest.as_str());
     builder.set_hash(&hash.0);
-    if let Some(old_hash) = old_hash {
-        builder.set_old_hash(&old_hash.0);
-    }
 }
 
 fn fill_time(
@@ -1535,7 +1517,6 @@ fn fill_notification(notif: &Notification, notif_builder: notification::Builder<
             source,
             dest,
             hash,
-            old_hash,
             index,
         } => fill_branch(
             notif_builder.init_branch(),
@@ -1544,14 +1525,12 @@ fn fill_notification(notif: &Notification, notif_builder: notification::Builder<
             source,
             dest,
             hash,
-            old_hash.as_ref(),
         ),
         Notification::Rename {
             arena,
             source,
             dest,
             hash,
-            old_hash,
             index,
         } => fill_rename(
             notif_builder.init_rename(),
@@ -1560,7 +1539,6 @@ fn fill_notification(notif: &Notification, notif_builder: notification::Builder<
             source,
             dest,
             hash,
-            old_hash.as_ref(),
         ),
     }
 }

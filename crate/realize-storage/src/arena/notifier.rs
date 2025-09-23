@@ -156,7 +156,6 @@ pub enum Notification {
         source: Path,
         dest: Path,
         hash: Hash,
-        old_hash: Option<Hash>,
     },
 
     /// `source` version `hash` should be moved to `dest`,
@@ -176,7 +175,6 @@ pub enum Notification {
         source: Path,
         dest: Path,
         hash: Hash,
-        old_hash: Option<Hash>,
     },
 }
 
@@ -422,21 +420,19 @@ async fn send_notifications(
                     })
                 }
             }
-            HistoryTableEntry::Branch(source, dest, hash, old_hash) => Some(Notification::Branch {
+            HistoryTableEntry::Branch(source, dest, hash) => Some(Notification::Branch {
                 arena: db.arena(),
                 index: hist_index,
                 source,
                 dest,
                 hash,
-                old_hash,
             }),
-            HistoryTableEntry::Rename(source, dest, hash, old_hash) => Some(Notification::Rename {
+            HistoryTableEntry::Rename(source, dest, hash) => Some(Notification::Rename {
                 arena: db.arena(),
                 index: hist_index,
                 source,
                 dest,
                 hash,
-                old_hash,
             }),
         };
 
@@ -815,7 +811,6 @@ mod tests {
 
         // Create a destination file
         let dest = fixture.add("dest", "dest content").await?;
-        let dest_hash = hash::digest("dest content");
 
         // Subscribe to notifications
         let mut rx = fixture.subscribe().await?;
@@ -841,7 +836,7 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         {
             let mut history = txn.write_history()?;
-            history.request_branch(&source, &dest, &source_hash, Some(&dest_hash))?;
+            history.request_branch(&source, &dest, &source_hash)?;
         }
         txn.commit()?;
 
@@ -853,14 +848,12 @@ mod tests {
                 source: src,
                 dest: dst,
                 hash,
-                old_hash,
                 ..
             } => {
                 assert_eq!(arena, test_arena());
                 assert_eq!(src, source);
                 assert_eq!(dst, dest);
                 assert_eq!(hash, source_hash);
-                assert_eq!(old_hash, Some(dest_hash));
             }
             _ => panic!(
                 "Expected Branch notification, got {:?}",

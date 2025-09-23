@@ -180,15 +180,9 @@ impl<'a> WritableOpenHistory<'a> {
         source: &Path,
         dest: &Path,
         hash: &Hash,
-        old_hash: Option<&Hash>,
     ) -> Result<(), StorageError> {
         let index = self.allocate_history_index()?;
-        let ev = HistoryTableEntry::Branch(
-            source.clone(),
-            dest.clone(),
-            hash.clone(),
-            old_hash.cloned(),
-        );
+        let ev = HistoryTableEntry::Branch(source.clone(), dest.clone(), hash.clone());
         log::info!("[{}] History #{index}: {ev:?}", self.tag);
         self.table.insert(index, Holder::with_content(ev)?)?;
 
@@ -201,15 +195,9 @@ impl<'a> WritableOpenHistory<'a> {
         source: &Path,
         dest: &Path,
         hash: &Hash,
-        old_hash: Option<&Hash>,
     ) -> Result<(), StorageError> {
         let index = self.allocate_history_index()?;
-        let ev = HistoryTableEntry::Rename(
-            source.clone(),
-            dest.clone(),
-            hash.clone(),
-            old_hash.cloned(),
-        );
+        let ev = HistoryTableEntry::Rename(source.clone(), dest.clone(), hash.clone());
         log::info!("[{}] History #{index}: {ev:?}", self.tag);
         self.table.insert(index, Holder::with_content(ev)?)?;
 

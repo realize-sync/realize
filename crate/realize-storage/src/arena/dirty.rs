@@ -321,7 +321,7 @@ fn next_dirty(
     log_table: &impl ReadableTable<u64, PathId>,
     start_counter: u64,
 ) -> Result<Option<(PathId, u64)>, StorageError> {
-    for entry in log_table.range(start_counter..)? {
+    if let Some(entry) = (log_table.range(start_counter..)?).next() {
         let (key, value) = entry?;
         let counter = key.value();
         let pathid = value.value();

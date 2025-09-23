@@ -73,27 +73,26 @@ pub(crate) fn apply(
             }
             Notification::Connected { uuid, .. } => peers.connected(peer, uuid)?,
             Notification::Branch {
-                source,
-                dest,
-                hash,
-                old_hash,
-                ..
+                source, dest, hash, ..
             } => {
-                if index::branch(&cache, &tree, &source, &dest, &hash, old_hash.as_ref())? {
+                let mut history = txn.write_history()?;
+                if index::branch(
+                    &mut cache,
+                    &mut tree,
+                    &mut blobs,
+                    &mut history,
+                    &mut dirty,
+                    &source,
+                    &dest,
+                    &hash,
+                )? {
                     log::debug!("[{tag}] branched {source} {hash} -> {dest}");
                 } else {
-                    log::debug!(
-                        "[{tag}] wrong versions; ignored:
-  branch {source} {hash} -> {dest} {old_hash:?}"
-                    )
+                    log::debug!("[{tag}] rejected: branch {source} {hash} -> {dest}")
                 }
             }
             Notification::Rename {
-                source,
-                dest,
-                hash,
-                old_hash,
-                ..
+                source, dest, hash, ..
             } => {
                 let mut history = txn.write_history()?;
                 if index::rename(
@@ -105,13 +104,12 @@ pub(crate) fn apply(
                     &source,
                     &dest,
                     &hash,
-                    old_hash.as_ref(),
                 )? {
                     log::debug!("[{tag}] renamed {source} {hash} -> {dest}");
                 } else {
                     log::debug!(
-                        "[{tag}] wrong versions; ignored:
-  rename {source} {hash} -> {dest} {old_hash:?}"
+                        "[{tag}] rejected:
+  rename {source} {hash} -> {dest}"
                     )
                 }
             }

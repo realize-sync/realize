@@ -358,7 +358,7 @@ pub enum HistoryTableEntry {
     Branch(realize_types::Path, realize_types::Path, Hash, Option<Hash>),
 
     /// The file was moved from another file.
-    Rename(realize_types::Path, realize_types::Path, Hash, Option<Hash>),
+    Rename(realize_types::Path, realize_types::Path, Hash),
 }
 
 impl NamedType for HistoryTableEntry {
@@ -417,11 +417,6 @@ impl ByteConvertible<HistoryTableEntry> for HistoryTableEntry {
                     parse_path(rename_reader.get_path()?)?,
                     parse_path(rename_reader.get_dest_path()?)?,
                     parse_hash(rename_reader.get_hash()?)?,
-                    if rename_reader.get_old_hash()?.is_empty() {
-                        None
-                    } else {
-                        Some(parse_hash(rename_reader.get_old_hash()?)?)
-                    },
                 ))
             }
         }
@@ -461,14 +456,11 @@ impl ByteConvertible<HistoryTableEntry> for HistoryTableEntry {
                     branch_builder.set_old_hash(&old_hash.0);
                 }
             }
-            HistoryTableEntry::Rename(path, dest_path, hash, old_hash) => {
+            HistoryTableEntry::Rename(path, dest_path, hash) => {
                 let mut rename_builder = builder.init_rename();
                 rename_builder.set_path(path.as_str());
                 rename_builder.set_dest_path(dest_path.as_str());
                 rename_builder.set_hash(&hash.0);
-                if let Some(old_hash) = old_hash {
-                    rename_builder.set_old_hash(&old_hash.0);
-                }
             }
         }
 

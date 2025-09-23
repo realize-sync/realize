@@ -64,30 +64,53 @@ pub(crate) fn indexed_file_path<'b, L: Into<TreeLoc<'b>>>(
 ///
 /// Otherwise, it does nothing and returns `false`.
 pub(crate) fn branch<'b, L1: Into<TreeLoc<'b>>, L2: Into<TreeLoc<'b>>>(
-    cache: &impl CacheReadOperations,
-    tree: &impl TreeReadOperations,
+    cache: &mut WritableOpenCache,
+    tree: &mut WritableOpenTree,
+    blobs: &mut WritableOpenBlob,
+    history: &mut WritableOpenHistory,
+    dirty: &mut WritableOpenDirty,
     source: L1,
     dest: L2,
     hash: &Hash,
-    old_hash: Option<&Hash>,
 ) -> Result<bool, StorageError> {
-    let source = match tree.backtrack(source)? {
+    let source = source.into();
+    let dest = dest.into();
+    if cache.metadata(tree, dest.borrow())?.is_some() {
+        return Err(StorageError::AlreadyExists);
+    }
+    let dest_path = match tree.backtrack(dest.borrow())? {
         Some(p) => p,
         None => return Ok(false),
     };
-    let source_realpath = source.within(cache.datadir());
+    let dest_realpath = dest_path.within(cache.datadir());
+    let source_path = match tree.backtrack(source.borrow())? {
+        Some(p) => p,
+        None => return Ok(false),
+    };
+    let source_realpath = source_path.within(cache.datadir());
     if let Some(indexed) = cache.indexed(tree, source)?
         && indexed.hash == *hash
         && indexed.matches_file(&source_realpath)
     {
-        if let Some(dest_realpath) = indexed_file_path(cache, tree, dest, old_hash)? {
-            if let Some(parent) = dest_realpath.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let _ = std::fs::remove_file(&dest_realpath);
-            std::fs::hard_link(source_realpath, dest_realpath)?;
-            return Ok(true);
+        if let Some(parent) = dest_realpath.parent() {
+            std::fs::create_dir_all(parent)?;
         }
+        cache.index(
+            tree,
+            blobs,
+            history,
+            dirty,
+            dest,
+            indexed.size,
+            indexed.mtime,
+            hash.clone(),
+        )?;
+
+        if dest_realpath.exists() {
+            return Err(StorageError::AlreadyExists);
+        }
+        std::fs::hard_link(source_realpath, dest_realpath)?;
+        return Ok(true);
     }
 
     Ok(false)
@@ -112,41 +135,48 @@ pub(crate) fn rename<'b, 'c, L1: Into<TreeLoc<'b>>, L2: Into<TreeLoc<'c>>>(
     source: L1,
     dest: L2,
     hash: &Hash,
-    old_hash: Option<&Hash>,
 ) -> Result<bool, StorageError> {
-    let root = cache.datadir();
     let source = source.into();
     let dest = dest.into();
+    if cache.metadata(tree, dest.borrow())?.is_some() {
+        return Err(StorageError::AlreadyExists);
+    }
+    let dest_path = match tree.backtrack(dest.borrow())? {
+        Some(p) => p,
+        None => return Ok(false),
+    };
+    let dest_realpath = dest_path.within(cache.datadir());
     let source_path = match tree.backtrack(source.borrow())? {
         Some(p) => p,
         None => return Ok(false),
     };
-    let source_realpath = source_path.within(root);
+    let source_realpath = source_path.within(cache.datadir());
     if let Some(indexed) = cache.indexed(tree, source.borrow())?
         && indexed.hash == *hash
         && indexed.matches_file(&source_realpath)
     {
-        if let Some(dest_realpath) = indexed_file_path(cache, tree, dest.borrow(), old_hash)? {
-            if let Some(parent) = dest_realpath.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            // This makes sure the destination is added before the
-            // source is deleted, so it won't be gone entirely from
-            // peers during the transition.
-            cache.index(
-                tree,
-                blobs,
-                history,
-                dirty,
-                dest,
-                indexed.size,
-                indexed.mtime,
-                hash.clone(),
-            )?;
-            cache.remove_from_index(tree, blobs, history, dirty, source)?;
-            std::fs::rename(source_realpath, dest_realpath)?;
-            return Ok(true);
+        if let Some(parent) = dest_realpath.parent() {
+            std::fs::create_dir_all(parent)?;
         }
+        // This makes sure the destination is added before the
+        // source is deleted, so it won't be gone entirely from
+        // peers during the transition.
+        cache.index(
+            tree,
+            blobs,
+            history,
+            dirty,
+            dest,
+            indexed.size,
+            indexed.mtime,
+            hash.clone(),
+        )?;
+        cache.remove_from_index(tree, blobs, history, dirty, source)?;
+        if dest_realpath.exists() {
+            return Err(StorageError::AlreadyExists);
+        }
+        std::fs::rename(source_realpath, dest_realpath)?;
+        return Ok(true);
     }
 
     Ok(false)
@@ -509,6 +539,7 @@ mod tests {
     use assert_fs::prelude::*;
     use realize_types::Arena;
     use realize_types::Path;
+    use realize_types::Peer;
     use std::collections::HashMap;
     use std::fs;
     use std::os::unix::fs::MetadataExt;
@@ -917,7 +948,7 @@ mod tests {
     }
 
     #[test]
-    fn test_branch_function() -> anyhow::Result<()> {
+    fn branch_succeeds() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let datadir = fixture.db.index().datadir();
 
@@ -927,53 +958,62 @@ mod tests {
         let source_mtime = UnixTime::mtime(&source_path.metadata()?);
         let source_hash = hash::digest("source content");
 
-        // Create destination file on disk with different content
-        let dest_path = datadir.join("dest.txt");
-        std::fs::write(&dest_path, "dest content")?;
-        let dest_mtime = UnixTime::mtime(&dest_path.metadata()?);
-        let dest_hash = hash::digest("dest content");
-
         // Add source file to index
         let source_index_path = Path::parse("source.txt")?;
         super::add_file(
             &fixture.db,
             &source_index_path,
-            14,
+            14, // size of "source content"
             source_mtime,
             source_hash.clone(),
         )?;
 
-        // Add destination file to index
+        // Destination does not exist yet (neither in filesystem nor in cache)
         let dest_index_path = Path::parse("dest.txt")?;
-        super::add_file(
-            &fixture.db,
-            &dest_index_path,
-            12,
-            dest_mtime,
-            dest_hash.clone(),
-        )?;
-
-        // Verify both files are in the index
-        assert!(super::has_file(&fixture.db, &source_index_path)?);
-        assert!(super::has_file(&fixture.db, &dest_index_path)?);
+        assert!(!super::has_file(&fixture.db, &dest_index_path)?);
 
         // Test successful branch (create hard link)
-        let txn = fixture.db.begin_read()?;
-        let cache = txn.read_cache()?;
-        let tree = txn.read_tree()?;
+        let txn = fixture.db.begin_write()?;
+        let result = {
+            let mut cache = txn.write_cache()?;
+            let mut tree = txn.write_tree()?;
+            let mut blobs = txn.write_blobs()?;
+            let mut dirty = txn.write_dirty()?;
+            let mut history = txn.write_history()?;
 
-        let result = super::branch(
-            &cache,
-            &tree,
-            &source_index_path,
-            &dest_index_path,
-            &source_hash,
-            Some(&dest_hash), // old_hash matches current dest
-        )?;
+            super::branch(
+                &mut cache,
+                &mut tree,
+                &mut blobs,
+                &mut history,
+                &mut dirty,
+                &source_index_path,
+                &dest_index_path,
+                &source_hash,
+            )
+        }?;
 
-        assert!(result, "Branch should succeed when conditions are met");
+        assert!(
+            result,
+            "Branch should succeed when destination doesn't exist in cache"
+        );
+
+        // Commit the transaction and verify cache state
+        txn.commit()?;
+
+        // Verify destination now exists in cache after commit
+        assert!(
+            super::has_file(&fixture.db, &dest_index_path)?,
+            "Destination should be in cache after branch"
+        );
+
+        let dest_entry = super::get_file(&fixture.db, &dest_index_path)?.unwrap();
+        assert_eq!(dest_entry.hash, source_hash);
+        assert_eq!(dest_entry.size, 14);
+        assert_eq!(dest_entry.mtime, source_mtime);
 
         // Verify hard link was created by checking pathid numbers
+        let dest_path = datadir.join("dest.txt");
         let source_metadata = std::fs::metadata(source_path)?;
         let dest_metadata = std::fs::metadata(dest_path)?;
         assert_eq!(
@@ -982,55 +1022,11 @@ mod tests {
             "Files should have same pathid after hard link"
         );
 
-        // Test branch failure when source hash doesn't match
-        let wrong_hash = Hash([0x99; 32]);
-        let result = super::branch(
-            &cache,
-            &tree,
-            &source_index_path,
-            &dest_index_path,
-            &wrong_hash,
-            Some(&dest_hash),
-        )?;
-
-        assert!(!result, "Branch should fail when source hash doesn't match");
-
-        // Test branch failure when dest doesn't match old_hash
-        let result = super::branch(
-            &cache,
-            &tree,
-            &source_index_path,
-            &dest_index_path,
-            &source_hash,
-            Some(&wrong_hash), // old_hash doesn't match current dest
-        )?;
-
-        assert!(
-            !result,
-            "Branch should fail when dest doesn't match old_hash"
-        );
-
-        // Test branch failure when source doesn't exist in tree
-        let nonexistent_path = Path::parse("nonexistent.txt")?;
-        let result = super::branch(
-            &cache,
-            &tree,
-            &nonexistent_path,
-            &dest_index_path,
-            &source_hash,
-            Some(&dest_hash),
-        )?;
-
-        assert!(
-            !result,
-            "Branch should fail when source doesn't exist in tree"
-        );
-
         Ok(())
     }
 
     #[test]
-    fn rename_file() -> anyhow::Result<()> {
+    fn branch_fails_if_destination_already_exists() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let datadir = fixture.db.index().datadir();
 
@@ -1070,7 +1066,371 @@ mod tests {
         assert!(super::has_file(&fixture.db, &source_index_path)?);
         assert!(super::has_file(&fixture.db, &dest_index_path)?);
 
+        // Test branch fails when destination exists in cache
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        let result = super::branch(
+            &mut cache,
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &source_index_path,
+            &dest_index_path,
+            &source_hash,
+        );
+
+        // Assert that it returns AlreadyExists error
+        assert!(
+            matches!(result, Err(StorageError::AlreadyExists)),
+            "Branch should fail with AlreadyExists when destination exists in cache"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn branch_fails_if_source_hash_doesnt_match() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let datadir = fixture.db.index().datadir();
+
+        // Create source file on disk
+        let source_path = datadir.join("source.txt");
+        std::fs::write(&source_path, "source content")?;
+        let source_mtime = UnixTime::mtime(&source_path.metadata()?);
+        let source_hash = hash::digest("source content");
+
+        // Add source file to index
+        let source_index_path = Path::parse("source.txt")?;
+        super::add_file(
+            &fixture.db,
+            &source_index_path,
+            14,
+            source_mtime,
+            source_hash.clone(),
+        )?;
+
+        // Test branch fails when destination exists in cache
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        assert_eq!(
+            false,
+            super::branch(
+                &mut cache,
+                &mut tree,
+                &mut blobs,
+                &mut history,
+                &mut dirty,
+                &source_index_path,
+                &Path::parse("dest.txt")?,
+                &hash::digest("some other hash"),
+            )
+            .unwrap()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn branch_fails_if_source_not_found() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        // Test branch fails when destination exists in cache
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        assert_eq!(
+            false,
+            super::branch(
+                &mut cache,
+                &mut tree,
+                &mut blobs,
+                &mut history,
+                &mut dirty,
+                &Path::parse("doesnotexist")?,
+                &Path::parse("dest")?,
+                &hash::digest("some hash"),
+            )
+            .unwrap()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn branch_fails_if_destination_is_a_directory() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let datadir = fixture.db.index().datadir();
+
+        // Create source file on disk
+        let source_path = datadir.join("source.txt");
+        std::fs::write(&source_path, "source content")?;
+        let source_mtime = UnixTime::mtime(&source_path.metadata()?);
+        let source_hash = hash::digest("source content");
+
+        // Add source file to index
+        let source_index_path = Path::parse("source.txt")?;
+        super::add_file(
+            &fixture.db,
+            &source_index_path,
+            14,
+            source_mtime,
+            source_hash.clone(),
+        )?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        cache.mkdir(&mut tree, Path::parse("dir")?)?;
+
+        let result = super::branch(
+            &mut cache,
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &source_index_path,
+            &Path::parse("dir")?,
+            &source_hash,
+        );
+
+        assert!(matches!(result, Err(StorageError::AlreadyExists)),);
+
+        Ok(())
+    }
+
+    #[test]
+    fn branch_fails_if_destination_is_in_cache() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let datadir = fixture.db.index().datadir();
+
+        // Create source file on disk
+        let source_path = datadir.join("source.txt");
+        std::fs::write(&source_path, "source content")?;
+        let source_mtime = UnixTime::mtime(&source_path.metadata()?);
+        let source_hash = hash::digest("source content");
+
+        // Add source file to index
+        let source_index_path = Path::parse("source.txt")?;
+        super::add_file(
+            &fixture.db,
+            &source_index_path,
+            14,
+            source_mtime,
+            source_hash.clone(),
+        )?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        cache.notify_added(
+            &mut tree,
+            &mut blobs,
+            &mut dirty,
+            Peer::from("peer"),
+            Path::parse("dest.txt")?,
+            UnixTime::from_secs(1234567890),
+            10,
+            Hash([1u8; 32]),
+        )?;
+
+        let result = super::branch(
+            &mut cache,
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &source_index_path,
+            &Path::parse("dest.txt")?,
+            &source_hash,
+        );
+
+        assert!(matches!(result, Err(StorageError::AlreadyExists)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn branch_fails_if_destination_file_exists_but_not_yet_indexed() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let datadir = fixture.db.index().datadir();
+
+        // Create source file on disk and in cache
+        let source_path = datadir.join("source.txt");
+        std::fs::write(&source_path, "source content")?;
+        let source_mtime = UnixTime::mtime(&source_path.metadata()?);
+        let source_hash = hash::digest("source content");
+
+        let source_index_path = Path::parse("source.txt")?;
+        super::add_file(
+            &fixture.db,
+            &source_index_path,
+            14,
+            source_mtime,
+            source_hash.clone(),
+        )?;
+
+        // Create destination file on disk BUT NOT in cache
+        let dest_path = datadir.join("dest.txt");
+        std::fs::write(&dest_path, "dest content")?;
+        let dest_index_path = Path::parse("dest.txt")?;
+
+        // Verify dest is not in cache
+        assert!(!super::has_file(&fixture.db, &dest_index_path)?);
+
+        // Test branch should fail
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        assert!(matches!(
+            super::branch(
+                &mut cache,
+                &mut tree,
+                &mut blobs,
+                &mut history,
+                &mut dirty,
+                &source_index_path,
+                &dest_index_path,
+                &source_hash,
+            ),
+            Err(StorageError::AlreadyExists)
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn rename_succeeds() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let datadir = fixture.db.index().datadir();
+
+        // Create source file on disk
+        let source_realpath = datadir.join("source.txt");
+        std::fs::write(&source_realpath, "source content")?;
+        let source_mtime = UnixTime::mtime(&source_realpath.metadata()?);
+        let source_hash = hash::digest("source content");
+
+        // Add source file to index
+        let source_path = Path::parse("source.txt")?;
+        super::add_file(
+            &fixture.db,
+            &source_path,
+            14,
+            source_mtime,
+            source_hash.clone(),
+        )?;
+
+        let dest_realpath = datadir.join("dest.txt");
+        let dest_path = Path::parse("dest.txt")?;
+
         // Test successful rename
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        assert_eq!(
+            true,
+            super::rename(
+                &mut cache,
+                &mut tree,
+                &mut blobs,
+                &mut history,
+                &mut dirty,
+                &source_path,
+                &dest_path,
+                &source_hash,
+            )
+            .unwrap()
+        );
+
+        assert!(dest_realpath.exists());
+        assert!(!source_realpath.exists());
+        assert_eq!("source content", std::fs::read_to_string(&dest_realpath)?);
+
+        assert!(cache.metadata(&tree, &source_path)?.is_none());
+        assert_eq!(
+            Some(IndexedFile {
+                mtime: source_mtime,
+                hash: source_hash,
+                size: 14
+            }),
+            cache.indexed(&tree, &dest_path)?
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rename_fails_when_destination_exists() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let datadir = fixture.db.index().datadir();
+
+        // Create source file on disk
+        let source_path = datadir.join("source.txt");
+        std::fs::write(&source_path, "source content")?;
+        let source_mtime = UnixTime::mtime(&source_path.metadata()?);
+        let source_hash = hash::digest("source content");
+
+        // Create destination file on disk with different content
+        let dest_path = datadir.join("dest.txt");
+        std::fs::write(&dest_path, "dest content")?;
+        let dest_mtime = UnixTime::mtime(&dest_path.metadata()?);
+        let dest_hash = hash::digest("dest content");
+
+        // Add source file to index
+        let source_index_path = Path::parse("source.txt")?;
+        super::add_file(
+            &fixture.db,
+            &source_index_path,
+            14,
+            source_mtime,
+            source_hash.clone(),
+        )?;
+
+        // Add destination file to index
+        let dest_index_path = Path::parse("dest.txt")?;
+        super::add_file(
+            &fixture.db,
+            &dest_index_path,
+            12,
+            dest_mtime,
+            dest_hash.clone(),
+        )?;
+
+        // Verify both files are in the index
+        assert!(super::has_file(&fixture.db, &source_index_path)?);
+        assert!(super::has_file(&fixture.db, &dest_index_path)?);
+
+        // Test rename fails when destination exists in cache
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
         let mut tree = txn.write_tree()?;
@@ -1087,19 +1447,79 @@ mod tests {
             &source_index_path,
             &dest_index_path,
             &source_hash,
-            Some(&dest_hash), // old_hash matches current dest
-        )?;
+        );
 
-        assert!(result, "Rename should succeed when conditions are met");
+        assert!(
+            matches!(result, Err(StorageError::AlreadyExists)),
+            "Rename should fail with AlreadyExists when destination exists in cache"
+        );
 
-        assert!(!source_path.exists());
-        assert_eq!("source content", std::fs::read_to_string(dest_path)?);
+        // Verify original files are preserved
+        assert!(source_path.exists(), "Source file should still exist");
+        assert_eq!(
+            "dest content",
+            std::fs::read_to_string(&dest_path)?,
+            "Destination file should be unchanged"
+        );
 
         Ok(())
     }
 
     #[test]
-    fn rename_conditions_not_met() -> anyhow::Result<()> {
+    fn rename_fails_when_destination_exists_on_disk_but_not_yet_indexed() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let datadir = fixture.db.index().datadir();
+
+        // Create source file on disk and in cache
+        let source_path = datadir.join("source.txt");
+        std::fs::write(&source_path, "source content")?;
+        let source_mtime = UnixTime::mtime(&source_path.metadata()?);
+        let source_hash = hash::digest("source content");
+
+        let source_index_path = Path::parse("source.txt")?;
+        super::add_file(
+            &fixture.db,
+            &source_index_path,
+            14,
+            source_mtime,
+            source_hash.clone(),
+        )?;
+
+        // Create destination file on disk BUT NOT in cache
+        let dest_path = datadir.join("dest.txt");
+        std::fs::write(&dest_path, "dest content")?;
+        let dest_index_path = Path::parse("dest.txt")?;
+
+        // Verify dest is not in cache
+        assert!(!super::has_file(&fixture.db, &dest_index_path)?);
+
+        // Test rename should succeed (dest exists on disk but not in cache)
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        assert!(matches!(
+            super::rename(
+                &mut cache,
+                &mut tree,
+                &mut blobs,
+                &mut history,
+                &mut dirty,
+                &source_index_path,
+                &dest_index_path,
+                &source_hash,
+            ),
+            Err(StorageError::AlreadyExists)
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn rename_rejects_source() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let datadir = fixture.db.index().datadir();
 
@@ -1108,12 +1528,6 @@ mod tests {
         std::fs::write(&source_path, "source content")?;
         let source_mtime = UnixTime::mtime(&source_path.metadata()?);
         let source_hash = hash::digest("source content");
-
-        // Create destination file on disk with different content
-        let dest_path = datadir.join("dest.txt");
-        std::fs::write(&dest_path, "dest content")?;
-        let dest_mtime = UnixTime::mtime(&dest_path.metadata()?);
-        let dest_hash = hash::digest("dest content");
 
         // Add source file to index
         let source_index_path = Path::parse("source.txt")?;
@@ -1125,15 +1539,8 @@ mod tests {
             source_hash.clone(),
         )?;
 
-        // Add destination file to index
+        // Create a destination path that isn't in cache
         let dest_index_path = Path::parse("dest.txt")?;
-        super::add_file(
-            &fixture.db,
-            &dest_index_path,
-            12,
-            dest_mtime,
-            dest_hash.clone(),
-        )?;
 
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
@@ -1153,28 +1560,9 @@ mod tests {
             &source_index_path,
             &dest_index_path,
             &wrong_hash,
-            Some(&dest_hash),
         )?;
 
         assert!(!result, "Rename should fail when source hash doesn't match");
-
-        // Test rename failure when dest doesn't match old_hash
-        let result = super::rename(
-            &mut cache,
-            &mut tree,
-            &mut blobs,
-            &mut history,
-            &mut dirty,
-            &source_index_path,
-            &dest_index_path,
-            &source_hash,
-            Some(&wrong_hash), // old_hash doesn't match current dest
-        )?;
-
-        assert!(
-            !result,
-            "Rename should fail when dest doesn't match old_hash"
-        );
 
         // Test rename failure when source doesn't exist in tree
         let nonexistent_path = Path::parse("nonexistent.txt")?;
@@ -1187,7 +1575,6 @@ mod tests {
             &nonexistent_path,
             &dest_index_path,
             &source_hash,
-            Some(&dest_hash),
         )?;
 
         assert!(
