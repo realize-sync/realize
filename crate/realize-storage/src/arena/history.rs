@@ -1,5 +1,5 @@
 use super::db::AfterCommit;
-use super::types::HistoryTableEntry;
+use super::types::{HistoryTableEntry, Version};
 use crate::utils::holder::Holder;
 use crate::{StorageError, arena::db::Tag};
 use realize_types::{Hash, Path};
@@ -133,11 +133,17 @@ impl<'a> WritableOpenHistory<'a> {
     ///
     /// This tells remote peers that a file was deleted locally by the
     /// user and they should mirror this change.
-    pub(crate) fn report_removed(&mut self, path: &Path, hash: &Hash) -> Result<(), StorageError> {
-        let index = self.allocate_history_index()?;
-        let ev = HistoryTableEntry::Remove(path.clone(), hash.clone());
-        log::info!("[{}] History #{index}: {ev:?}", self.tag);
-        self.table.insert(index, Holder::with_content(ev)?)?;
+    pub(crate) fn report_removed(
+        &mut self,
+        path: &Path,
+        version: &Version,
+    ) -> Result<(), StorageError> {
+        if let Some(hash) = version.base_hash() {
+            let index = self.allocate_history_index()?;
+            let ev = HistoryTableEntry::Remove(path.clone(), hash.clone());
+            log::info!("[{}] History #{index}: {ev:?}", self.tag);
+            self.table.insert(index, Holder::with_content(ev)?)?;
+        }
         Ok(())
     }
 
@@ -145,6 +151,8 @@ impl<'a> WritableOpenHistory<'a> {
     ///
     /// This tells remote peers that a previously available version is
     /// not available anymore. Peers should not mirror this change.
+    ///
+    /// The hash must be the hash of a remote file version.
     pub(crate) fn report_dropped(&mut self, path: &Path, hash: &Hash) -> Result<(), StorageError> {
         let index = self.allocate_history_index()?;
         let ev = HistoryTableEntry::Drop(path.clone(), hash.clone());
@@ -160,10 +168,10 @@ impl<'a> WritableOpenHistory<'a> {
     pub(crate) fn report_added(
         &mut self,
         path: &Path,
-        old_hash: Option<&Hash>,
+        old_version: Option<&Version>,
     ) -> Result<(), StorageError> {
         let index = self.allocate_history_index()?;
-        let ev = if let Some(old_hash) = old_hash {
+        let ev = if let Some(old_hash) = old_version.and_then(|v| v.base_hash()) {
             HistoryTableEntry::Replace(path.clone(), old_hash.clone())
         } else {
             HistoryTableEntry::Add(path.clone())
@@ -175,6 +183,8 @@ impl<'a> WritableOpenHistory<'a> {
     }
 
     /// Ask the owner of the files to branch source to dest.
+    ///
+    /// The hash must refer to a version of a remote file.
     pub(crate) fn request_branch(
         &mut self,
         source: &Path,
@@ -190,6 +200,8 @@ impl<'a> WritableOpenHistory<'a> {
     }
 
     /// Ask the owner of the files to rename source to dest.
+    ///
+    /// The hash must refer to a version of a remote file.
     pub(crate) fn request_rename(
         &mut self,
         source: &Path,

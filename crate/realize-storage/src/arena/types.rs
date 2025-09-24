@@ -613,7 +613,7 @@ pub enum FileEntryKind {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-enum Version {
+pub enum Version {
     /// The file has unknown modifications. It hasn't been indexed and
     /// might still be in the process of being modified.
     ///
@@ -632,7 +632,7 @@ impl Version {
     /// Checks whether the given hash matches the current version.
     ///
     /// Only [Version::Indexed] will ever match.
-    fn matches_hash(&self, other: &Hash) -> bool {
+    pub fn matches_hash(&self, other: &Hash) -> bool {
         if let Version::Indexed(hash) = self {
             return *hash == *other;
         }
@@ -643,7 +643,7 @@ impl Version {
     /// Checks whether two versions match.
     ///
     /// Only [Version::Indexed] can match another version.
-    fn matches(&self, other: &Version) -> bool {
+    pub fn matches(&self, other: &Version) -> bool {
         if let (Version::Indexed(h1), Version::Indexed(h2)) = (self, other) {
             return *h1 == *h2;
         }
@@ -654,27 +654,43 @@ impl Version {
     /// Return the hash this version is based on. This is the hash of
     /// last known indexed version. Any number of modifications might
     /// have been applied since that hash was computed.
-    fn base_hash(&self) -> Option<Hash> {
+    pub fn base_hash(&self) -> Option<&Hash> {
         match self {
-            Version::Modified(Some(hash)) => Some(hash.clone()),
+            Version::Modified(Some(hash)) => Some(hash),
             Version::Modified(None) => None,
-            Version::Indexed(hash) => Some(hash.clone()),
+            Version::Indexed(hash) => Some(hash),
         }
     }
 
     /// Return the version this version is based on. This is the hash of
     /// last known indexed version. Any number of modifications might
     /// have been applied since that hash was computed.
-    fn base(&self) -> Option<Self> {
-        self.base_hash().map(|h| Self::Indexed(h))
+    pub fn base(&self) -> Option<Self> {
+        self.base_hash().map(|h| Self::Indexed(h.clone()))
     }
 
     /// Turn this version into a [Version::Modified]. This can be called after
     /// noticing a local modification to a previously indexed file.
-    fn into_modified(self) -> Version {
+    pub fn into_modified(self) -> Version {
         match self {
             Version::Modified(hash) => Version::Modified(hash),
             Version::Indexed(hash) => Version::Modified(Some(hash)),
+        }
+    }
+
+    pub fn indexed_hash(&self) -> Option<&Hash> {
+        if let Version::Indexed(hash) = self {
+            Some(hash)
+        } else {
+            None
+        }
+    }
+
+    pub fn expect_indexed(&self) -> Result<&Hash, StorageError> {
+        if let Version::Indexed(hash) = self {
+            Ok(hash)
+        } else {
+            Err(StorageError::NotIndexed)
         }
     }
 }
@@ -686,18 +702,19 @@ pub struct FileTableEntry {
     pub size: u64,
     /// The modification time of the file.
     pub mtime: UnixTime,
-    /// Hash of the specific version of the content the peer has.
-    pub hash: Hash,
+    /// Specific version of this content. Always [Version::Indexed]
+    /// for cached file.
+    pub version: Version,
     /// The type of file entry (local, cached, or branched from another path)
     pub kind: FileEntryKind,
 }
 
 impl FileTableEntry {
-    pub fn new(size: u64, mtime: UnixTime, hash: Hash, kind: FileEntryKind) -> Self {
+    pub fn new(size: u64, mtime: UnixTime, version: Version, kind: FileEntryKind) -> Self {
         Self {
             size,
             mtime,
-            hash,
+            version,
             kind,
         }
     }
@@ -776,7 +793,17 @@ fn fill_file_table_entry(
     let mut mtime = builder.reborrow().init_mtime();
     mtime.set_secs(entry.mtime.as_secs());
     mtime.set_nsecs(entry.mtime.subsec_nanos());
-    builder.set_hash(&entry.hash.0);
+    match &entry.version {
+        Version::Modified(base) => {
+            builder.set_modified(true);
+            if let Some(hash) = base {
+                builder.set_hash(&hash.0);
+            }
+        }
+        Version::Indexed(hash) => {
+            builder.set_hash(&hash.0);
+        }
+    }
 
     // Convert the new enum back to the old capnp fields for compatibility
     match entry.kind {
@@ -812,10 +839,20 @@ fn parse_file_table_entry(
         FileEntryKind::Cached
     };
 
+    let version = if msg.get_modified() {
+        Version::Modified(if msg.has_hash() {
+            Some(parse_hash(msg.get_hash()?)?)
+        } else {
+            None
+        })
+    } else {
+        Version::Indexed(parse_hash(msg.get_hash()?)?)
+    };
+
     Ok(FileTableEntry {
         size: msg.get_size(),
         mtime: UnixTime::new(mtime.get_secs(), mtime.get_nsecs()),
-        hash: parse_hash(msg.get_hash()?)?,
+        version,
         kind,
     })
 }
@@ -891,12 +928,15 @@ impl CacheTableEntry {
 pub struct FileMetadata {
     /// The size of the file in bytes.
     pub size: u64,
+
     /// The modification time of the file.
     ///
     /// This is the duration since the start of the UNIX epoch.
     pub mtime: UnixTime,
-    /// File version.
-    pub hash: Hash,
+
+    /// File version. This might not be available for local files that
+    /// aren't indexed yet.
+    pub hash: Option<Hash>,
 }
 
 /// The metadata of a directory.
@@ -985,7 +1025,7 @@ impl ByteConvertible<PeerTableEntry> for PeerTableEntry {
 /// A file entry for the index layer.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct IndexedFile {
-    pub hash: Hash,
+    pub version: Version,
     pub mtime: UnixTime,
     pub size: u64,
 }
@@ -1011,7 +1051,7 @@ impl IndexedFile {
         FileTableEntry {
             size: self.size,
             mtime: self.mtime,
-            hash: self.hash,
+            version: self.version,
             kind: FileEntryKind::Local,
         }
     }
@@ -1020,7 +1060,7 @@ impl IndexedFile {
 impl From<FileTableEntry> for IndexedFile {
     fn from(value: FileTableEntry) -> Self {
         IndexedFile {
-            hash: value.hash,
+            version: value.version,
             mtime: value.mtime,
             size: value.size,
         }
@@ -1030,7 +1070,7 @@ impl From<FileTableEntry> for IndexedFile {
 impl From<&FileTableEntry> for IndexedFile {
     fn from(value: &FileTableEntry) -> Self {
         IndexedFile {
-            hash: value.hash.clone(),
+            version: value.version.clone(),
             mtime: value.mtime,
             size: value.size,
         }
@@ -1114,7 +1154,7 @@ mod tests {
         let local_entry = FileTableEntry {
             size: 100,
             mtime: UnixTime::from_secs(1234567890),
-            hash: Hash([1u8; 32]),
+            version: Version::Indexed(Hash([1u8; 32])),
             kind: FileEntryKind::Local,
         };
 
@@ -1126,7 +1166,7 @@ mod tests {
         let cache_entry = FileTableEntry {
             size: 200,
             mtime: UnixTime::from_secs(1234567891),
-            hash: Hash([2u8; 32]),
+            version: Version::Indexed(Hash([2u8; 32])),
             kind: FileEntryKind::Cached,
         };
 
@@ -1138,7 +1178,7 @@ mod tests {
         let branched_entry = FileTableEntry {
             size: 300,
             mtime: UnixTime::from_secs(1234567892),
-            hash: Hash([3u8; 32]),
+            version: Version::Indexed(Hash([3u8; 32])),
             kind: FileEntryKind::Branched(PathId(42)),
         };
 
@@ -1155,7 +1195,7 @@ mod tests {
         let local_entry = FileTableEntry {
             size: 100,
             mtime: UnixTime::from_secs(1234567890),
-            hash: Hash([1u8; 32]),
+            version: Version::Indexed(Hash([1u8; 32])),
             kind: FileEntryKind::Local,
         };
         assert!(local_entry.is_local());
@@ -1165,7 +1205,7 @@ mod tests {
         let cache_entry = FileTableEntry {
             size: 200,
             mtime: UnixTime::from_secs(1234567891),
-            hash: Hash([2u8; 32]),
+            version: Version::Indexed(Hash([2u8; 32])),
             kind: FileEntryKind::Cached,
         };
         assert!(!cache_entry.is_local());
@@ -1175,7 +1215,7 @@ mod tests {
         let branched_entry = FileTableEntry {
             size: 300,
             mtime: UnixTime::from_secs(1234567892),
-            hash: Hash([3u8; 32]),
+            version: Version::Indexed(Hash([3u8; 32])),
             kind: FileEntryKind::Branched(PathId(42)),
         };
         assert!(!branched_entry.is_local());
@@ -1262,7 +1302,7 @@ mod tests {
         let entry = FileTableEntry {
             size: 200,
             mtime: UnixTime::from_secs(1234567890),
-            hash: Hash([0xa1u8; 32]),
+            version: Version::Indexed(Hash([0xa1u8; 32])),
             kind: FileEntryKind::Branched(PathId(123)),
         };
 
@@ -1279,7 +1319,7 @@ mod tests {
         let file_entry = FileTableEntry {
             size: 200,
             mtime: UnixTime::from_secs(1234567890),
-            hash: Hash([0xa1u8; 32]),
+            version: Version::Indexed(Hash([0xa1u8; 32])),
             kind: FileEntryKind::Cached,
         };
 
@@ -1315,7 +1355,7 @@ mod tests {
         let file_entry = FileTableEntry {
             size: 100,
             mtime: UnixTime::from_secs(1234567890),
-            hash: Hash([0x42u8; 32]),
+            version: Version::Indexed(Hash([0x42u8; 32])),
             kind: FileEntryKind::Cached,
         };
 

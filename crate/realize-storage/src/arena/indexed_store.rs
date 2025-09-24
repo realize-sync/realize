@@ -52,7 +52,7 @@ impl Reader {
             && entry.size == m.len()
             && entry.mtime == UnixTime::mtime(&m)
         {
-            Some(entry.hash)
+            entry.version.indexed_hash().cloned()
         } else {
             None
         };

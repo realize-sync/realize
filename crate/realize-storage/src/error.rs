@@ -63,6 +63,9 @@ pub enum StorageError {
 
     #[error("data not available from any peers")]
     NoPeers,
+
+    #[error("file hasn't been indexed yet")]
+    NotIndexed,
 }
 
 impl StorageError {
@@ -106,6 +109,7 @@ impl StorageError {
             StorageError::AlreadyExists => AlreadyExists,
             StorageError::DirectoryNotEmpty => DirectoryNotEmpty,
             StorageError::NoPeers => InvalidData,
+            StorageError::NotIndexed => InvalidInput,
         }
     }
 

@@ -1,5 +1,7 @@
 #![allow(dead_code)] // work in progress
 
+use crate::arena::types::Version;
+
 use super::db::ArenaDatabase;
 use super::index::{self};
 use super::types::HistoryTableEntry;
@@ -320,7 +322,10 @@ async fn catchup(
     while let Some((
         path,
         IndexedFile {
-            size, mtime, hash, ..
+            size,
+            mtime,
+            version: Version::Indexed(hash),
+            ..
         },
     )) = all_files.next().await
     {
@@ -362,17 +367,24 @@ async fn send_notifications(
         let notification = match hist_entry {
             HistoryTableEntry::Add(path) => {
                 if let Some(IndexedFile {
-                    size, mtime, hash, ..
+                    size,
+                    mtime,
+                    version,
+                    ..
                 }) = index::get_file_async(db, &path).await?
                 {
-                    Some(Notification::Add {
-                        index: hist_index,
-                        arena: db.arena(),
-                        path,
-                        size,
-                        mtime,
-                        hash,
-                    })
+                    if let Version::Indexed(hash) = version {
+                        Some(Notification::Add {
+                            index: hist_index,
+                            arena: db.arena(),
+                            path,
+                            size,
+                            mtime,
+                            hash,
+                        })
+                    } else {
+                        None
+                    }
                 } else {
                     // The file might have been removed since the
                     // history entry was added.
@@ -387,18 +399,25 @@ async fn send_notifications(
                 // entry was added.
 
                 if let Some(IndexedFile {
-                    size, mtime, hash, ..
+                    size,
+                    mtime,
+                    version,
+                    ..
                 }) = index::get_file_async(db, &path).await?
                 {
-                    Some(Notification::Replace {
-                        index: hist_index,
-                        arena: db.arena(),
-                        path,
-                        size,
-                        mtime,
-                        hash,
-                        old_hash,
-                    })
+                    if let Version::Indexed(hash) = version {
+                        Some(Notification::Replace {
+                            index: hist_index,
+                            arena: db.arena(),
+                            path,
+                            size,
+                            mtime,
+                            hash,
+                            old_hash,
+                        })
+                    } else {
+                        None
+                    }
                 } else {
                     Some(Notification::Remove {
                         index: hist_index,

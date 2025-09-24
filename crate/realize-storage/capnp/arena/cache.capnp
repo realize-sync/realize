@@ -23,6 +23,7 @@ struct FileTableEntry {
   hash @2: Data;
   branchedFrom @3: UInt64; # 0 for None
   local @4: Bool;
+  modified @5: Bool;
 }
 
 struct PeerTableEntry {

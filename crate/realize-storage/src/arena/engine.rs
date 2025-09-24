@@ -465,16 +465,16 @@ impl Engine {
         let mut should_unrealize = None;
 
         if let Some(cached) = cache.file_at_pathid(pathid)? {
-            let hash = cached.hash.clone();
+            let version = cached.version.clone();
             let is_local = cached.is_local();
 
             if want_unrealize {
                 if is_local {
-                    should_unrealize = Some(hash.clone());
+                    should_unrealize = version.indexed_hash().cloned();
                 }
             } else if want_realize {
                 if !is_local {
-                    should_realize = Some(hash.clone());
+                    should_realize = version.indexed_hash().cloned();
                 }
             }
             if !is_local {
@@ -492,7 +492,7 @@ impl Engine {
                         .unwrap_or(CacheStatus::Missing)
                         != CacheStatus::Verified
                 {
-                    should_download = Some(hash);
+                    should_download = version.indexed_hash().cloned();
                 }
             }
         }

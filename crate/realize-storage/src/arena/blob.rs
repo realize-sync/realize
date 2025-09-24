@@ -1558,6 +1558,7 @@ mod tests {
     use crate::arena::cache::CacheExt;
     use crate::arena::db::{ArenaReadTransaction, ArenaWriteTransaction};
     use crate::arena::dirty::DirtyReadOperations;
+    use crate::arena::types::Version;
     use crate::arena::update;
     use crate::utils::hash;
     use crate::{Mark, Notification, PathId};
@@ -3297,7 +3298,7 @@ mod tests {
         let cache = txn.read_cache()?;
         let tree = txn.read_tree()?;
         let indexed = cache.indexed(&tree, &path)?.unwrap();
-        assert_eq!(hash, indexed.hash);
+        assert_eq!(Version::Indexed(hash), indexed.version);
 
         Ok(())
     }

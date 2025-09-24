@@ -739,7 +739,7 @@ async fn only_regular(e: async_walkdir::DirEntry) -> async_walkdir::Filtering {
 mod tests {
     use super::*;
     use crate::arena::db::ArenaDatabase;
-    use crate::arena::types::IndexedFile;
+    use crate::arena::types::{IndexedFile, Version};
     use crate::realize_types::Arena;
     use crate::utils::hash;
     use assert_fs::TempDir;
@@ -847,7 +847,7 @@ mod tests {
             Some(IndexedFile {
                 size: 4,
                 mtime,
-                hash: hash::digest("test".as_bytes()),
+                version: Version::Indexed(hash::digest(b"test")),
             }),
             index::get_file_async(&fixture.db, &path).await?
         );
@@ -870,7 +870,7 @@ mod tests {
             Some(IndexedFile {
                 size: 0,
                 mtime,
-                hash: hash::digest([]),
+                version: Version::Indexed(hash::digest([])),
             }),
             index::get_file_async(&fixture.db, &path).await?
         );
@@ -1240,7 +1240,7 @@ mod tests {
             Some(IndexedFile {
                 size: 3,
                 mtime: UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
-                hash: hash::digest("foo".as_bytes()),
+                version: Version::Indexed(hash::digest("foo".as_bytes())),
             }),
             index::get_file_async(&fixture.db, &foo).await?
         );
@@ -1250,7 +1250,7 @@ mod tests {
             Some(IndexedFile {
                 size: 6,
                 mtime: UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
-                hash: hash::digest("barbar".as_bytes()),
+                version: Version::Indexed(hash::digest(b"barbar")),
             }),
             index::get_file_async(&fixture.db, &bar).await?
         );
@@ -1529,7 +1529,7 @@ mod tests {
             Some(IndexedFile {
                 size: 4,
                 mtime,
-                hash: hash::digest("test".as_bytes()),
+                version: Version::Indexed(hash::digest("test".as_bytes())),
             }),
             index::get_file_async(db, &realize_types::Path::parse("bar")?).await?
         );

@@ -106,7 +106,7 @@ impl StorageJobProcessor {
                 Some(v) => v,
                 None => return Ok(JobStatus::Abandoned("not_in_index")),
             };
-            if indexed.hash != hash {
+            if !indexed.version.matches_hash(&hash) {
                 return Ok(JobStatus::Abandoned("indexed_version_mismatch"));
             }
             let mut blobs = txn.write_blobs()?;
@@ -176,7 +176,7 @@ impl StorageJobProcessor {
                     return Ok(JobStatus::Abandoned("cache_entry"));
                 }
             };
-            if entry.hash != hash {
+            if !entry.version.matches_hash(&hash) {
                 return Ok(JobStatus::Abandoned("cache_version"));
             }
             if entry.is_local() {
@@ -230,7 +230,7 @@ mod tests {
     use super::*;
     use crate::arena::index;
     use crate::arena::tree::TreeExt;
-    use crate::arena::types::IndexedFile;
+    use crate::arena::types::{IndexedFile, Version};
     use crate::utils::hash;
     use crate::{ArenaFilesystem, Blob, CacheStatus, Mark, Notification, PathId};
     use assert_fs::TempDir;
@@ -293,20 +293,10 @@ mod tests {
 
             let path = Path::parse(path_str)?;
             let m = child.path().metadata()?;
-            index::add_file(
-                &self.db,
-                &path,
-                m.len(),
-                UnixTime::mtime(&m),
-                hash::digest(content),
-            )?;
-            let entry = {
-                let this = &self;
-                index::get_file(&this.db, &Path::parse(path_str)?)
-            }?
-            .expect("{path_str} indexed");
+            let hash = hash::digest(content);
+            index::add_file(&self.db, &path, m.len(), UnixTime::mtime(&m), hash.clone())?;
 
-            Ok(entry.hash)
+            Ok(hash)
         }
 
         fn add_to_cache(&self, path_str: &str, hash: &Hash, size: u64) -> anyhow::Result<()> {
@@ -477,7 +467,7 @@ mod tests {
         let indexed = cache
             .index_entry_at_pathid(pathid)?
             .expect("must have been indexed");
-        assert_eq!(hash, indexed.hash);
+        assert_eq!(Version::Indexed(hash), indexed.version);
         assert_eq!(test_time(), indexed.mtime);
 
         Ok(())

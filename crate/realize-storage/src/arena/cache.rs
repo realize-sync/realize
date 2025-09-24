@@ -11,7 +11,7 @@ use crate::arena::db::Tag;
 use crate::arena::history::WritableOpenHistory;
 use crate::arena::mark::MarkReadOperations;
 use crate::arena::tree::{self, TreeLoc};
-use crate::arena::types::DirMetadata;
+use crate::arena::types::{DirMetadata, Version};
 use crate::global::types::PathAssignment;
 use crate::types::Inode;
 use crate::utils::holder::Holder;
@@ -418,8 +418,14 @@ impl<'a> WritableOpenCache<'a> {
         loc: L,
     ) -> Result<BlobInfo, StorageError> {
         let pathid = tree.expect(loc)?;
-        let file_entry = default_file_entry_or_err(&self.table, pathid)?;
-        blobs.create(tree, marks, pathid, &file_entry.hash, file_entry.size)
+        let entry = default_file_entry_or_err(&self.table, pathid)?;
+        blobs.create(
+            tree,
+            marks,
+            pathid,
+            entry.version.expect_indexed()?,
+            entry.size,
+        )
     }
 
     /// Remove file locally, even though it might still be available in other peers.
@@ -438,10 +444,10 @@ impl<'a> WritableOpenCache<'a> {
         let e = default_file_entry_or_err(&self.table, pathid)?;
         let path = tree.backtrack(loc)?.ok_or(StorageError::IsADirectory)?;
         log::debug!(
-            "[{}]@local Local removal of \"{}\" pathid {pathid} {}",
+            "[{}]@local Local removal of \"{}\" pathid {pathid} {:?}",
             self.tag,
             path,
-            e.hash
+            e.version
         );
         if e.is_local() {
             let realpath = path.within(self.datadir());
@@ -449,7 +455,7 @@ impl<'a> WritableOpenCache<'a> {
             std::fs::remove_file(realpath)?;
         }
         self.rm_default_file_entry(tree, blobs, dirty, pathid)?;
-        history.report_removed(&path, &e.hash)?;
+        history.report_removed(&path, &e.version)?;
 
         Ok(())
     }
@@ -538,17 +544,17 @@ impl<'a> WritableOpenCache<'a> {
             }
             CacheTableEntry::File(mut source_entry) => {
                 dest_pathid = tree.setup(dest.borrow())?;
-                let mut old_hash: Option<Hash> = None;
+                let mut old_dest_version: Option<Version> = None;
                 let mut dest_is_local = false;
                 match default_entry(&self.table, dest_pathid)? {
                     None => {}
                     Some(CacheTableEntry::File(entry)) => {
                         dest_is_local = entry.is_local();
-                        old_hash = Some(entry.hash)
+                        old_dest_version = Some(entry.version)
                     }
                     Some(CacheTableEntry::Dir(_)) => return Err(StorageError::IsADirectory),
                 };
-                if old_hash.is_some() && noreplace {
+                if old_dest_version.is_some() && noreplace {
                     return Err(StorageError::AlreadyExists);
                 }
 
@@ -570,8 +576,8 @@ impl<'a> WritableOpenCache<'a> {
                     // delete older entry in database
                     self.rm_default_file_entry(tree, blobs, dirty, source_pathid)?;
 
-                    history.report_added(&dest_path, old_hash.as_ref())?;
-                    history.report_removed(&source_path, &source_entry.hash)?;
+                    history.report_added(&dest_path, old_dest_version.as_ref())?;
+                    history.report_removed(&source_path, &source_entry.version)?;
                 } else {
                     // (over)write new entry
                     source_entry.kind = FileEntryKind::Branched(source_pathid);
@@ -585,7 +591,14 @@ impl<'a> WritableOpenCache<'a> {
                     // delete older entry
                     self.rm_default_file_entry(tree, blobs, dirty, source_pathid)?;
 
-                    history.request_rename(&source_path, &dest_path, &source_entry.hash)?;
+                    if let Some(version) = old_dest_version {
+                        history.report_removed(&dest_path, &version)?;
+                    }
+                    history.request_rename(
+                        &source_path,
+                        &dest_path,
+                        source_entry.version.expect_indexed()?,
+                    )?;
                 }
             }
         }
@@ -613,7 +626,7 @@ impl<'a> WritableOpenCache<'a> {
         let dest_pathid = tree.setup(dest.borrow())?;
         let dest_path = tree.backtrack(dest)?.ok_or(StorageError::IsADirectory)?;
         check_parent_is_dir(&self.table, tree, dest_pathid)?;
-        if self.file_at_pathid(dest_pathid)?.is_some() {
+        if default_entry(&self.table, dest_pathid)?.is_some() {
             return Err(StorageError::AlreadyExists);
         }
 
@@ -625,17 +638,19 @@ impl<'a> WritableOpenCache<'a> {
             )?;
 
             // write dest in the database
-            let old_hash = default_file_entry(&self.table, dest_pathid)?.map(|e| e.hash);
             let dest_entry = IndexedFile::from(&source_entry).into_file();
             self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &dest_entry)?;
 
-            // history starts with add in case sync is interrupted
-            history.report_added(&dest_path, old_hash.as_ref())?;
+            history.report_added(&dest_path, None)?;
         } else {
             // We don't own the source, so request the owner of the
             // source to execute the branch, and simulate it in the
             // cache for now.
-            history.request_branch(&source_path, &dest_path, &source_entry.hash)?;
+            history.request_branch(
+                &source_path,
+                &dest_path,
+                source_entry.version.expect_indexed()?,
+            )?;
 
             // write dest in the database and optionally the filesystem
             source_entry.kind = FileEntryKind::Branched(source_pathid);
@@ -647,7 +662,7 @@ impl<'a> WritableOpenCache<'a> {
             FileMetadata {
                 size: source_entry.size,
                 mtime: source_entry.mtime,
-                hash: source_entry.hash,
+                hash: source_entry.version.indexed_hash().cloned(),
             },
         ))
     }
@@ -707,7 +722,12 @@ impl<'a> WritableOpenCache<'a> {
         hash: Hash,
     ) -> Result<(), StorageError> {
         let file_pathid = tree.setup(&path)?;
-        let entry = FileTableEntry::new(size, mtime, hash.clone(), FileEntryKind::Cached);
+        let entry = FileTableEntry::new(
+            size,
+            mtime,
+            Version::Indexed(hash.clone()),
+            FileEntryKind::Cached,
+        );
         let mut updated_default = false;
         if peer_file_entry(&self.table, file_pathid, None)?.is_none() {
             log::debug!("[{}]@local Add \"{path}\" {hash} size={size}", self.tag);
@@ -738,10 +758,19 @@ impl<'a> WritableOpenCache<'a> {
         old_hash: &Hash,
     ) -> Result<(), StorageError> {
         let pathid = tree.setup(path)?;
-        let entry = FileTableEntry::new(size, mtime, hash.clone(), FileEntryKind::Cached);
+        let entry = FileTableEntry::new(
+            size,
+            mtime,
+            Version::Indexed(hash.clone()),
+            FileEntryKind::Cached,
+        );
         let mut default_modified = false;
         let prev = peer_file_entry(&self.table, pathid, None)?;
-        if prev.as_ref().map(|e| e.hash == *old_hash).unwrap_or(true) {
+        if prev
+            .as_ref()
+            .map(|e| e.version.matches_hash(old_hash))
+            .unwrap_or(true)
+        {
             log::debug!(
                 "[{}]@local \"{path}\" {hash} size={size} replaces {old_hash}",
                 self.tag
@@ -758,7 +787,7 @@ impl<'a> WritableOpenCache<'a> {
             self.write_default_file_entry(tree, blobs, dirty, pathid, &entry)?;
         }
         if peer_file_entry(&self.table, pathid, Some(peer))?
-            .map(|e| e.hash == *old_hash)
+            .map(|e| e.version.matches_hash(old_hash))
             .unwrap_or(true)
         {
             log::debug!(
@@ -802,18 +831,18 @@ impl<'a> WritableOpenCache<'a> {
     ) -> Result<(), StorageError> {
         let file_pathid = tree.setup(&path)?;
         unmark_peer_file(&mut self.pending_catchup_table, peer, file_pathid)?;
-        let entry = FileTableEntry::new(size, mtime, hash.clone(), FileEntryKind::Cached);
-        if let Some(e) = peer_file_entry(&self.table, file_pathid, None)?
-            && e.hash != hash
-        {
-            self.notify_dropped_or_removed(tree, blobs, dirty, peer, &path, &e.hash, false)?;
-        }
+        let entry = FileTableEntry::new(
+            size,
+            mtime,
+            Version::Indexed(hash.clone()),
+            FileEntryKind::Cached,
+        );
         self.write_file_entry(tree, file_pathid, peer, &entry)?;
-        Ok(
-            if !peer_file_entry(&self.table, file_pathid, None)?.is_some() {
-                self.write_default_file_entry(tree, blobs, dirty, file_pathid, &entry)?;
-            },
-        )
+        if !peer_file_entry(&self.table, file_pathid, None)?.is_some() {
+            self.write_default_file_entry(tree, blobs, dirty, file_pathid, &entry)?;
+        };
+
+        Ok(())
     }
 
     /// Complete catchup for a peer.
@@ -928,7 +957,7 @@ impl<'a> WritableOpenCache<'a> {
         Ok(())
     }
 
-    /// Unlink a remove or a drop from a peer.
+    /// Process a remove or drop notification from a peer.
     pub(crate) fn notify_dropped_or_removed<T>(
         &mut self,
         tree: &mut WritableOpenTree,
@@ -945,7 +974,7 @@ impl<'a> WritableOpenCache<'a> {
         let path = path.as_ref();
         if let Some(pathid) = tree.resolve(path)? {
             if let Some(e) = peer_file_entry(&self.table, pathid, Some(peer))?
-                && e.hash == *old_hash
+                && e.version.matches_hash(old_hash)
             {
                 log::debug!(
                     "[{}]@{peer} Remove \"{path}\" pathid {pathid} {old_hash}",
@@ -956,7 +985,7 @@ impl<'a> WritableOpenCache<'a> {
             }
             if !dropped {
                 if let Some(e) = peer_file_entry(&self.table, pathid, None)?
-                    && e.hash == *old_hash
+                    && e.version.matches_hash(old_hash)
                 {
                     log::debug!(
                         "[{}]@local Remove \"{path}\" pathid {pathid} {old_hash}",
@@ -1000,7 +1029,7 @@ impl<'a> WritableOpenCache<'a> {
             if let Some(entry) = self.file_at_pathid(pathid)? {
                 if !entry.is_local()
                     && self
-                        .remote_availability(tree, pathid, &entry.hash)?
+                        .remote_availability(tree, pathid, entry.version.expect_indexed()?)?
                         .is_none()
                 {
                     // If the file has become unavailable because of
@@ -1026,10 +1055,11 @@ impl<'a> WritableOpenCache<'a> {
         let loc = loc.into();
         let pathid = tree.setup(loc.borrow())?;
         if let Some(path) = tree.backtrack(loc.borrow())? {
-            let old_hash = default_file_entry(&self.table, pathid)?.map(|e| e.hash);
-            let entry = IndexedFile { hash, mtime, size }.into_file();
+            let old_version = default_file_entry(&self.table, pathid)?.map(|e| e.version);
+            let entry =
+                FileTableEntry::new(size, mtime, Version::Indexed(hash), FileEntryKind::Local);
             self.write_default_file_entry(tree, blobs, dirty, pathid, &entry)?;
-            history.report_added(&path, old_hash.as_ref())?;
+            history.report_added(&path, old_version.as_ref())?;
         }
         Ok(pathid)
     }
@@ -1058,13 +1088,14 @@ impl<'a> WritableOpenCache<'a> {
             .prepare_export(tree, pathid)?
             .ok_or(StorageError::Unavailable)?;
         let dest = path.within(self.datadir());
-        let index_entry = IndexedFile {
-            mtime: entry.mtime,
-            size: entry.size,
-            hash: entry.hash,
-        }
-        .into_file();
-        self.write_default_file_entry(tree, blobs, dirty, pathid, &index_entry)?;
+
+        self.write_default_file_entry(
+            tree,
+            blobs,
+            dirty,
+            pathid,
+            &FileTableEntry::new(entry.size, entry.mtime, entry.version, FileEntryKind::Local),
+        )?;
         history.report_added(&path, None)?; // TODO: should it be report_available?
 
         return Ok((source, dest));
@@ -1102,24 +1133,25 @@ impl<'a> WritableOpenCache<'a> {
                 self.tag
             )));
         }
-        history.report_dropped(&path, &entry.hash)?;
+        let hash = entry.version.expect_indexed()?;
+        history.report_dropped(&path, hash)?;
 
         // The file is useful as a blob; import it
         log::debug!(
-            "[{}] Unrealize; import \"{path:?}\" {}",
+            "[{}] Unrealize; import \"{path:?}\" {:?}",
             self.tag,
-            entry.hash
+            entry.version
         );
 
         // The default entry doesn't reference the local entry
         // anymore, but rather an entry from cache. Caller should
         // have made sure it exists.
-        let (_, peer_entry) = find_peer_entry(&self.table, pathid, &entry.hash)?
+        let (_, peer_entry) = find_peer_entry(&self.table, pathid, hash)?
             .next()
             .ok_or(StorageError::NoPeers)??;
         self.write_default_file_entry(tree, blobs, dirty, pathid, &peer_entry)?;
 
-        let dest = blobs.import(tree, marks, pathid, &entry.hash, &metadata)?;
+        let dest = blobs.import(tree, marks, pathid, hash, &metadata)?;
         return Ok((source, dest));
     }
 
@@ -1140,7 +1172,7 @@ impl<'a> WritableOpenCache<'a> {
                 && entry.is_local()
             {
                 if let Some(path) = tree.backtrack(loc)? {
-                    history.report_removed(&path, &entry.hash)?;
+                    history.report_removed(&path, &entry.version)?;
                 }
                 self.rm_default_file_entry(tree, blobs, dirty, pathid)?;
                 return Ok(true);
@@ -1219,7 +1251,7 @@ fn metadata(
                 crate::arena::types::Metadata::File(crate::arena::types::FileMetadata {
                     size: file_entry.size,
                     mtime: file_entry.mtime,
-                    hash: file_entry.hash,
+                    hash: file_entry.version.indexed_hash().cloned(),
                 })
             }
             CacheTableEntry::Dir(dir_entry) => {
@@ -1271,7 +1303,7 @@ fn remote_availability<'b, L: Into<TreeLoc<'b>>>(
                         arena: tree.arena(),
                         path,
                         size: file_entry.size,
-                        hash: file_entry.hash,
+                        hash: file_entry.version.expect_indexed()?.clone(),
                         peers: vec![],
                     });
                 }
@@ -1307,7 +1339,7 @@ fn find_peer_entry(
         .filter(|e| {
             e.as_ref()
                 .ok()
-                .map(|(_, e)| e.hash == *hash)
+                .map(|(_, e)| e.version.matches_hash(hash))
                 .unwrap_or(false)
         }))
 }
@@ -2107,7 +2139,7 @@ mod tests {
 
         let metadata = fixture.file_metadata(&file_path).unwrap();
         assert_eq!(metadata.size, 200);
-        assert_eq!(metadata.hash, Hash([2u8; 32]));
+        assert_eq!(metadata.hash, Some(Hash([2u8; 32])));
         assert_eq!(metadata.mtime, test_time());
 
         let txn = fixture.db.begin_read()?;
@@ -2709,13 +2741,13 @@ mod tests {
 
             //  Replace with old_hash=1 means that hash=2 is the most
             //  recent one. This is the one chosen.
-            assert_eq!(Hash([2u8; 32]), entry.hash);
+            assert_eq!(Version::Indexed(Hash([2u8; 32])), entry.version);
             assert_eq!(200, entry.size);
             assert_eq!(later_time(), entry.mtime);
             assert_eq!(
                 vec![b],
                 cache
-                    .remote_availability(&tree, &path, &entry.hash)?
+                    .remote_availability(&tree, &path, &Hash([2u8; 32]))?
                     .unwrap()
                     .peers
             );
@@ -2757,11 +2789,11 @@ mod tests {
 
             //  Replace with old_hash=1 means that hash=2 is the most
             //  recent one. This is the one chosen.
-            assert_eq!(Hash([3u8; 32]), entry.hash);
+            assert_eq!(Version::Indexed(Hash([3u8; 32])), entry.version);
             assert_eq!(
                 vec![c],
                 cache
-                    .remote_availability(&tree, &path, &entry.hash)?
+                    .remote_availability(&tree, &path, &Hash([3u8; 32]))?
                     .unwrap()
                     .peers
             );
@@ -2773,11 +2805,11 @@ mod tests {
             let tree = txn.read_tree()?;
             let entry = cache.file_entry(&txn.read_tree()?, &path)?.unwrap();
 
-            assert_eq!(Hash([3u8; 32]), entry.hash);
+            assert_eq!(Version::Indexed(Hash([3u8; 32])), entry.version);
             assert_eq!(
                 vec![c],
                 cache
-                    .remote_availability(&tree, &path, &entry.hash)?
+                    .remote_availability(&tree, &path, &Hash([3u8; 32]))?
                     .unwrap()
                     .peers
             );
@@ -2804,11 +2836,11 @@ mod tests {
             let tree = txn.read_tree()?;
             let entry = cache.file_entry(&txn.read_tree()?, &path)?.unwrap();
 
-            assert_eq!(Hash([3u8; 32]), entry.hash);
+            assert_eq!(Version::Indexed(Hash([3u8; 32])), entry.version);
             assert_eq!(
                 vec![b, c],
                 cache
-                    .remote_availability(&tree, &path, &entry.hash)?
+                    .remote_availability(&tree, &path, &Hash([3u8; 32]))?
                     .unwrap()
                     .peers
             );
@@ -2886,11 +2918,11 @@ mod tests {
                 .unwrap();
             let entry = cache.file_at_pathid(pathid)?.unwrap();
 
-            assert_eq!(Hash([3u8; 32]), entry.hash);
+            assert_eq!(Version::Indexed(Hash([3u8; 32])), entry.version);
             assert_eq!(
                 vec![a],
                 cache
-                    .remote_availability(&tree, pathid, &entry.hash)?
+                    .remote_availability(&tree, pathid, &Hash([3u8; 32]))?
                     .unwrap()
                     .peers
             );
@@ -2929,6 +2961,7 @@ mod tests {
 
         let mtime = test_time();
 
+        log::debug!("==== ook1");
         update::apply(
             &fixture.db,
             peer1,
@@ -3017,6 +3050,7 @@ mod tests {
             },
         )?;
 
+        log::debug!("==== ook2");
         // Simulate a catchup that only reports file2 and file4.
         update::apply(
             &fixture.db,
@@ -3045,6 +3079,7 @@ mod tests {
                 hash: test_hash(),
             },
         )?;
+        log::debug!("==== ook3");
         update::apply(
             &fixture.db,
             peer1,
@@ -3053,14 +3088,16 @@ mod tests {
                 index: 0,
             },
         )?;
-
+        log::debug!("==== ook4");
         let txn = fixture.db.begin_read()?;
         let cache = txn.read_cache()?;
         let tree = txn.read_tree()?;
 
+        log::debug!("==== ook5");
         // File1 should have been deleted, since it was only on peer1,
         assert!(cache.file_entry(&tree, &file1)?.is_none());
 
+        log::debug!("==== ook6");
         assert_eq!(
             vec![peer1, peer2],
             cache
@@ -3069,6 +3106,7 @@ mod tests {
                 .peers
         );
 
+        log::debug!("==== ook7");
         assert_eq!(
             vec![peer3],
             cache
@@ -3077,6 +3115,7 @@ mod tests {
                 .peers
         );
 
+        log::debug!("==== ook8");
         assert_eq!(
             vec![peer1],
             cache
@@ -3085,6 +3124,7 @@ mod tests {
                 .peers
         );
 
+        log::debug!("==== ook9");
         Ok(())
     }
 
@@ -3195,19 +3235,19 @@ mod tests {
         let mtime = test_time();
 
         let indexed_file1 = IndexedFile {
-            hash: hash1.clone(),
+            version: Version::Indexed(hash1.clone()),
             mtime,
             size: 100,
         };
 
         let indexed_file2 = IndexedFile {
-            hash: hash2.clone(),
+            version: Version::Indexed(hash2.clone()),
             mtime,
             size: 200,
         };
 
         let indexed_file3 = IndexedFile {
-            hash: hash3.clone(),
+            version: Version::Indexed(hash3.clone()),
             mtime,
             size: 300,
         };
@@ -3236,7 +3276,7 @@ mod tests {
                 path,
                 indexed.size,
                 indexed.mtime,
-                indexed.hash.clone(),
+                indexed.version.indexed_hash().unwrap().clone(),
             )?;
         }
 
@@ -3452,7 +3492,7 @@ mod tests {
             FileMetadata {
                 size: 6,
                 mtime: test_time(),
-                hash: hash.clone(),
+                hash: Some(hash.clone()),
             },
             cache.file_metadata(&tree, &dest_path).unwrap()
         );
@@ -3548,7 +3588,7 @@ mod tests {
             FileMetadata {
                 size: 4,
                 mtime,
-                hash: hash::digest("test"),
+                hash: Some(hash::digest("test")),
             },
             cache.file_metadata(&tree, &dest_path).unwrap()
         );
@@ -3953,7 +3993,7 @@ mod tests {
             Some(crate::arena::types::Metadata::File(meta)) => {
                 assert_eq!(meta.size, 1024);
                 assert_eq!(meta.mtime, test_time());
-                assert_eq!(meta.hash, test_hash());
+                assert_eq!(meta.hash, Some(test_hash()));
             }
             Some(crate::arena::types::Metadata::Dir(_)) => {
                 panic!("Expected file metadata, got directory metadata");
@@ -4018,7 +4058,7 @@ mod tests {
             crate::arena::types::Metadata::File(meta) => {
                 assert_eq!(meta.size, 1024);
                 assert_eq!(meta.mtime, test_time());
-                assert_eq!(meta.hash, test_hash());
+                assert_eq!(meta.hash, Some(test_hash()));
             }
             crate::arena::types::Metadata::Dir(_) => {
                 panic!("Expected file metadata, got directory metadata");
@@ -4091,7 +4131,7 @@ mod tests {
                 _ => None,
             }
         );
-        assert_eq!(hash, dest_entry.hash);
+        assert_eq!(Version::Indexed(hash.clone()), dest_entry.version);
         assert_eq!(6, dest_entry.size);
         assert_eq!(test_time(), dest_entry.mtime);
 
@@ -4200,7 +4240,7 @@ mod tests {
                 _ => None,
             }
         );
-        assert_eq!(source_hash, dest_entry.hash);
+        assert_eq!(Version::Indexed(source_hash.clone()), dest_entry.version);
         assert_eq!(6, dest_entry.size);
 
         // history entry reports old hash
@@ -4270,7 +4310,7 @@ mod tests {
         // Source entry should be gone, dest should exist
         assert!(cache.file_entry(&tree, &source_path)?.is_none());
         let dest_entry = cache.file_entry_or_err(&tree, &dest_path).unwrap();
-        assert_eq!(hash, dest_entry.hash);
+        assert_eq!(Version::Indexed(hash.clone()), dest_entry.version);
         assert_eq!(12, dest_entry.size);
         assert_eq!(mtime, dest_entry.mtime);
         assert!(dest_entry.is_local());
@@ -4399,7 +4439,7 @@ mod tests {
                 _ => None,
             }
         );
-        assert_eq!(source_hash, dest_entry.hash);
+        assert_eq!(Version::Indexed(source_hash.clone()), dest_entry.version);
         assert_eq!(14, dest_entry.size);
         assert!(dest_entry.is_local());
 
@@ -4490,7 +4530,7 @@ mod tests {
                 _ => None,
             }
         );
-        assert_eq!(source_hash, dest_entry.hash);
+        assert_eq!(Version::Indexed(source_hash.clone()), dest_entry.version);
         assert_eq!(14, dest_entry.size);
         assert!(dest_entry.is_local());
 
@@ -4577,7 +4617,7 @@ mod tests {
                 _ => None,
             }
         );
-        assert_eq!(source_hash, dest_entry.hash);
+        assert_eq!(Version::Indexed(source_hash.clone()), dest_entry.version);
         assert_eq!(21, dest_entry.size);
         assert!(!dest_entry.is_local());
 
@@ -4684,19 +4724,19 @@ mod tests {
         let moved_file3 = Path::parse("dest_dir/subdir/file3.txt")?;
 
         let file1_entry = cache.file_entry(&tree, &moved_file1)?.unwrap();
-        assert_eq!(hash1, file1_entry.hash);
+        assert_eq!(Version::Indexed(hash1.clone()), file1_entry.version);
         assert_eq!(5, file1_entry.size);
         assert_eq!(test_time(), file1_entry.mtime);
         assert!(!file1_entry.is_local());
 
         let file2_entry = cache.file_entry(&tree, &moved_file2)?.unwrap();
-        assert_eq!(hash2, file2_entry.hash);
+        assert_eq!(Version::Indexed(hash2.clone()), file2_entry.version);
         assert_eq!(5, file2_entry.size);
         assert_eq!(test_time(), file2_entry.mtime);
         assert!(!file2_entry.is_local());
 
         let file3_entry = cache.file_entry(&tree, &moved_file3)?.unwrap();
-        assert_eq!(hash3, file3_entry.hash);
+        assert_eq!(Version::Indexed(hash3.clone()), file3_entry.version);
         assert_eq!(4, file3_entry.size);
         assert_eq!(file3_mtime, file3_entry.mtime);
         assert!(file3_entry.is_local());
@@ -4930,7 +4970,7 @@ mod tests {
         let entry = cache.indexed(&tree, &path)?.unwrap();
         assert_eq!(entry.size, 100);
         assert_eq!(entry.mtime, mtime);
-        assert_eq!(entry.hash, Hash([0xfa; 32]));
+        assert_eq!(entry.version, Version::Indexed(Hash([0xfa; 32])));
 
         Ok(())
     }
@@ -4974,7 +5014,7 @@ mod tests {
         let entry = cache.indexed(&tree, &path)?.unwrap();
         assert_eq!(entry.size, 200);
         assert_eq!(entry.mtime, mtime2);
-        assert_eq!(entry.hash, Hash([0x07; 32]));
+        assert_eq!(entry.version, Version::Indexed(Hash([0x07; 32])));
 
         Ok(())
     }
@@ -5035,7 +5075,7 @@ mod tests {
         let entry = cache.indexed(&tree, &path)?.unwrap();
         assert_eq!(entry.size, 100);
         assert_eq!(entry.mtime, mtime);
-        assert_eq!(entry.hash, hash);
+        assert_eq!(entry.version, Version::Indexed(hash));
 
         Ok(())
     }
@@ -5220,7 +5260,7 @@ mod tests {
 
         // Verify the file was replaced in the index
         let entry = cache.indexed(&tree, &path)?.unwrap();
-        assert_eq!(entry.hash, hash2);
+        assert_eq!(entry.version, Version::Indexed(hash2));
 
         // Verify the path was marked dirty
         let dirty_paths = dirty_paths(&dirty, &tree)?;
