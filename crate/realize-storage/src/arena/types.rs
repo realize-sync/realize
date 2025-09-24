@@ -612,6 +612,73 @@ pub enum FileEntryKind {
     Branched(PathId),
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum Version {
+    /// The file has unknown modifications. It hasn't been indexed and
+    /// might still be in the process of being modified.
+    ///
+    /// The modified file is known to be based on a previously indexed
+    /// file with the given hash. This can serve as `old_hash` to
+    /// report the file through notifications, once it is indexed.
+    ///
+    /// If no hash is available, the modified file is new.
+    Modified(Option<Hash>),
+
+    /// File content is known to match the given hash.
+    Indexed(Hash),
+}
+
+impl Version {
+    /// Checks whether the given hash matches the current version.
+    ///
+    /// Only [Version::Indexed] will ever match.
+    fn matches_hash(&self, other: &Hash) -> bool {
+        if let Version::Indexed(hash) = self {
+            return *hash == *other;
+        }
+
+        false
+    }
+
+    /// Checks whether two versions match.
+    ///
+    /// Only [Version::Indexed] can match another version.
+    fn matches(&self, other: &Version) -> bool {
+        if let (Version::Indexed(h1), Version::Indexed(h2)) = (self, other) {
+            return *h1 == *h2;
+        }
+
+        false
+    }
+
+    /// Return the hash this version is based on. This is the hash of
+    /// last known indexed version. Any number of modifications might
+    /// have been applied since that hash was computed.
+    fn base_hash(&self) -> Option<Hash> {
+        match self {
+            Version::Modified(Some(hash)) => Some(hash.clone()),
+            Version::Modified(None) => None,
+            Version::Indexed(hash) => Some(hash.clone()),
+        }
+    }
+
+    /// Return the version this version is based on. This is the hash of
+    /// last known indexed version. Any number of modifications might
+    /// have been applied since that hash was computed.
+    fn base(&self) -> Option<Self> {
+        self.base_hash().map(|h| Self::Indexed(h))
+    }
+
+    /// Turn this version into a [Version::Modified]. This can be called after
+    /// noticing a local modification to a previously indexed file.
+    fn into_modified(self) -> Version {
+        match self {
+            Version::Modified(hash) => Version::Modified(hash),
+            Version::Indexed(hash) => Version::Modified(Some(hash)),
+        }
+    }
+}
+
 /// An entry in the file table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileTableEntry {
