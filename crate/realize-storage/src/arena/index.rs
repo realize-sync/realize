@@ -229,7 +229,7 @@ pub(crate) fn has_file(
     let cache = txn.read_cache()?;
     let tree = txn.read_tree()?;
 
-    cache.is_indexed(&tree, path)
+    cache.has_local_file(&tree, path)
 }
 
 /// Check whether a given file is in the index already.
@@ -271,6 +271,41 @@ pub async fn has_matching_file_async(
     let mtime = mtime.clone();
 
     task::spawn_blocking(move || has_matching_file(&db, &path, size, mtime)).await?
+}
+
+/// Mark the file as modified, but not yet indexed.
+pub(crate) fn preindex(
+    db: &Arc<ArenaDatabase>,
+    path: &realize_types::Path,
+    size: u64,
+    mtime: UnixTime,
+) -> Result<(), StorageError> {
+    let txn = db.begin_write()?;
+    {
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut blobs = txn.write_blobs()?;
+
+        cache.preindex(&mut tree, &mut blobs, &mut dirty, path, size, mtime)?;
+    }
+
+    txn.commit()?;
+
+    Ok(())
+}
+
+pub async fn preindex_async(
+    db: &Arc<ArenaDatabase>,
+    path: &realize_types::Path,
+    size: u64,
+    mtime: UnixTime,
+) -> Result<(), StorageError> {
+    let db = Arc::clone(db);
+    let path = path.clone();
+    let mtime = mtime.clone();
+
+    task::spawn_blocking(move || preindex(&db, &path, size, mtime)).await?
 }
 
 /// Add a file entry with the given values. Replace one if it exists.

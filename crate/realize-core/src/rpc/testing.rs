@@ -186,12 +186,17 @@ impl HouseholdFixture {
         while cache.file_metadata((arena, &path)).await.is_err() && Instant::now() < deadline {
             tokio::time::sleep(delay).await;
         }
-        while cache.file_metadata((arena, &path)).await?.hash != *hash && Instant::now() < deadline
+        while !cache
+            .file_metadata((arena, &path))
+            .await?
+            .hash
+            .is_some_and(|h| h == *hash)
+            && Instant::now() < deadline
         {
             tokio::time::sleep(delay).await;
         }
         assert_eq!(
-            *hash,
+            Some(hash.clone()),
             cache.file_metadata((arena, &path)).await?.hash,
             "[arena]/{filename} {hash} never appeared the cache of {peer}"
         );

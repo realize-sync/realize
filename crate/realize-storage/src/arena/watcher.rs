@@ -672,6 +672,7 @@ impl RealWatcherWorker {
         {
             return Ok(());
         }
+        index::preindex_async(&self.db, path, size, mtime).await?;
         debouncer.spawn_limited(path.clone(), size > 0, {
             let db = self.db.clone();
             let path = path.clone();

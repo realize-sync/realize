@@ -307,7 +307,7 @@ pub(crate) trait CacheExt {
         loc: L,
     ) -> Result<Option<IndexedFile>, StorageError>;
 
-    fn is_indexed<'b, L: Into<TreeLoc<'b>>>(
+    fn has_local_file<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
@@ -367,7 +367,7 @@ impl<T: CacheReadOperations> CacheExt for T {
             Ok(None)
         }
     }
-    fn is_indexed<'b, L: Into<TreeLoc<'b>>>(
+    fn has_local_file<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
@@ -1041,6 +1041,24 @@ impl<'a> WritableOpenCache<'a> {
         Ok(())
     }
 
+    pub(crate) fn preindex<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
+        dirty: &mut WritableOpenDirty,
+        loc: L,
+        size: u64,
+        mtime: UnixTime,
+    ) -> Result<PathId, StorageError> {
+        let pathid = tree.setup(loc)?;
+        let version =
+            Version::modification_of(default_file_entry(&self.table, pathid)?.map(|e| e.version));
+
+        let entry = FileTableEntry::new(size, mtime, version, FileEntryKind::Local);
+        self.write_default_file_entry(tree, blobs, dirty, pathid, &entry)?;
+        Ok(pathid)
+    }
+
     pub(crate) fn index<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree,
@@ -1086,7 +1104,7 @@ impl<'a> WritableOpenCache<'a> {
         let entry = default_file_entry_or_err(&self.table, pathid)?;
         let source = blobs
             .prepare_export(tree, pathid)?
-            .ok_or(StorageError::Unavailable)?;
+            .ok_or(StorageError::NotFound)?;
         let dest = path.within(self.datadir());
 
         self.write_default_file_entry(
@@ -1620,6 +1638,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
+    use std::time::Duration;
     use std::u64;
 
     const TEST_TIME: u64 = 1234567890;
@@ -3428,7 +3447,7 @@ mod tests {
         cache.unlink(&mut tree, &mut blobs, &mut history, &mut dirty, &file_path)?;
 
         assert!(cache.metadata(&tree, &file_path)?.is_none());
-        assert!(!cache.is_indexed(&tree, &file_path)?);
+        assert!(!cache.has_local_file(&tree, &file_path)?);
         assert!(!childpath.exists());
 
         let (_, history_entry) = history.history(0..).last().unwrap().unwrap();
@@ -4339,11 +4358,6 @@ mod tests {
                 HistoryTableEntry::Remove(source_path, hash)
             ],
             collect_history_entries(&history, history_start)?
-                .into_iter()
-                .rev()
-                .take(2)
-                .rev()
-                .collect::<Vec<_>>()
         );
 
         Ok(())
@@ -4966,7 +4980,7 @@ mod tests {
             Hash([0xfa; 32]),
         )?;
 
-        assert!(cache.is_indexed(&tree, &path)?);
+        assert!(cache.has_local_file(&tree, &path)?);
         let entry = cache.indexed(&tree, &path)?.unwrap();
         assert_eq!(entry.size, 100);
         assert_eq!(entry.mtime, mtime);
@@ -5010,7 +5024,7 @@ mod tests {
         )?;
 
         // Verify the file was replaced
-        assert!(cache.is_indexed(&tree, &path)?);
+        assert!(cache.has_local_file(&tree, &path)?);
         let entry = cache.indexed(&tree, &path)?.unwrap();
         assert_eq!(entry.size, 200);
         assert_eq!(entry.mtime, mtime2);
@@ -5042,9 +5056,9 @@ mod tests {
             Hash([0xfa; 32]),
         )?;
 
-        assert!(cache.is_indexed(&tree, &path)?);
-        assert!(!cache.is_indexed(&tree, &Path::parse("bar.txt")?)?);
-        assert!(!cache.is_indexed(&tree, &Path::parse("other.txt")?)?);
+        assert!(cache.has_local_file(&tree, &path)?);
+        assert!(!cache.has_local_file(&tree, &Path::parse("bar.txt")?)?);
+        assert!(!cache.has_local_file(&tree, &Path::parse("other.txt")?)?);
 
         Ok(())
     }
@@ -5112,7 +5126,7 @@ mod tests {
             &path,
         )?;
 
-        assert!(!cache.is_indexed(&tree, &path)?);
+        assert!(!cache.has_local_file(&tree, &path)?);
 
         Ok(())
     }
@@ -5158,8 +5172,8 @@ mod tests {
             Path::parse("foo")?,
         )?;
 
-        assert!(!cache.is_indexed(&tree, Path::parse("foo/bar1.txt")?)?);
-        assert!(!cache.is_indexed(&tree, Path::parse("foo/bar2.txt")?)?);
+        assert!(!cache.has_local_file(&tree, Path::parse("foo/bar1.txt")?)?);
+        assert!(!cache.has_local_file(&tree, Path::parse("foo/bar2.txt")?)?);
 
         Ok(())
     }
@@ -5194,7 +5208,7 @@ mod tests {
         )?;
 
         // Verify the file was added to the index
-        assert!(cache.is_indexed(&tree, &path)?);
+        assert!(cache.has_local_file(&tree, &path)?);
 
         // Verify the path was marked dirty
         assert!(dirty_paths(&dirty, &tree)?.contains(&path));
@@ -5309,7 +5323,7 @@ mod tests {
         assert!(removed);
 
         // Verify the file was removed from the index
-        assert!(!cache.is_indexed(&tree, &path)?);
+        assert!(!cache.has_local_file(&tree, &path)?);
 
         // Verify the path was marked dirty
         assert_eq!(HashSet::from([pathid]), dirty_pathids(&dirty)?);
@@ -5374,8 +5388,8 @@ mod tests {
         )?;
 
         // Verify the files were removed from the index
-        assert!(!cache.is_indexed(&tree, &path1)?);
-        assert!(!cache.is_indexed(&tree, &path2)?);
+        assert!(!cache.has_local_file(&tree, &path1)?);
+        assert!(!cache.has_local_file(&tree, &path2)?);
 
         // Verify the paths were marked dirty
         assert_eq!(HashSet::from([pathid1, pathid2]), dirty_pathids(&dirty)?);
@@ -5388,6 +5402,221 @@ mod tests {
                 HistoryTableEntry::Remove(path2.clone(), hash2.clone()),
             ],
             history_entries
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn preindex_new_then_index() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let mtime = UnixTime::from_secs(1234567890);
+        let path = Path::parse("foo/bar.txt")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        let history_start = history_start(&history)?;
+        cache.preindex(&mut tree, &mut blobs, &mut dirty, &path, 100, mtime)?;
+        assert!(cache.has_local_file(&tree, &path)?);
+        assert_eq!(
+            FileMetadata {
+                size: 100,
+                mtime,
+                hash: None
+            },
+            cache.file_metadata(&tree, &path)?
+        );
+        assert_eq!(
+            IndexedFile {
+                size: 100,
+                mtime,
+                version: Version::Modified(None)
+            },
+            cache.indexed(&tree, &path)?.unwrap()
+        );
+        assert_eq!(0, collect_history_entries(&history, history_start)?.len());
+
+        let index_mtime = mtime.plus(Duration::from_secs(1));
+        let hash = hash::digest("test");
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &path,
+            150,
+            index_mtime,
+            hash.clone(),
+        )?;
+        assert!(cache.has_local_file(&tree, &path)?);
+        assert_eq!(
+            FileMetadata {
+                size: 150,
+                mtime: index_mtime,
+                hash: Some(hash.clone()),
+            },
+            cache.file_metadata(&tree, &path)?
+        );
+        assert_eq!(
+            IndexedFile {
+                size: 150,
+                mtime: index_mtime,
+                version: Version::Indexed(hash.clone())
+            },
+            cache.indexed(&tree, &path)?.unwrap()
+        );
+
+        assert_eq!(
+            vec![HistoryTableEntry::Add(path)],
+            collect_history_entries(&history, history_start)?
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn preindex_existing_then_reindex() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let path = Path::parse("foo/bar.txt")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        let initial_hash = hash::digest("hash1");
+        let initial_mtime = UnixTime::from_secs(1234567890);
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &path,
+            100,
+            initial_mtime,
+            initial_hash.clone(),
+        )?;
+
+        let history_start = history_start(&history)?;
+        let preindex_mtime = initial_mtime.plus(Duration::from_secs(1));
+        cache.preindex(
+            &mut tree,
+            &mut blobs,
+            &mut dirty,
+            &path,
+            200,
+            preindex_mtime,
+        )?;
+        assert_eq!(
+            FileMetadata {
+                size: 200,
+                mtime: preindex_mtime,
+                hash: None
+            },
+            cache.file_metadata(&tree, &path)?
+        );
+        assert_eq!(
+            IndexedFile {
+                size: 200,
+                mtime: preindex_mtime,
+                version: Version::Modified(Some(initial_hash.clone()))
+            },
+            cache.indexed(&tree, &path)?.unwrap()
+        );
+        assert_eq!(0, collect_history_entries(&history, history_start)?.len());
+
+        let reindex_mtime = initial_mtime.plus(Duration::from_secs(2));
+        let reindex_hash = hash::digest("hash2");
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &path,
+            300,
+            reindex_mtime,
+            reindex_hash.clone(),
+        )?;
+        assert_eq!(
+            FileMetadata {
+                size: 300,
+                mtime: reindex_mtime,
+                hash: Some(reindex_hash.clone()),
+            },
+            cache.file_metadata(&tree, &path)?
+        );
+        assert_eq!(
+            IndexedFile {
+                size: 300,
+                mtime: reindex_mtime,
+                version: Version::Indexed(reindex_hash.clone())
+            },
+            cache.indexed(&tree, &path)?.unwrap()
+        );
+
+        assert_eq!(
+            vec![HistoryTableEntry::Replace(path, initial_hash.clone())],
+            collect_history_entries(&history, history_start)?
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn preindex_existing_then_delete() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let path = Path::parse("foobar")?;
+        let childpath = fixture.datadir.child("foobar");
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        let initial_hash = hash::digest("hash1");
+        let initial_mtime = UnixTime::from_secs(1234567890);
+        childpath.write_str("hash1")?;
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &path,
+            100,
+            initial_mtime,
+            initial_hash.clone(),
+        )?;
+
+        let history_start = history_start(&history)?;
+        let preindex_mtime = initial_mtime.plus(Duration::from_secs(1));
+        childpath.write_str("hash2")?;
+        cache.preindex(
+            &mut tree,
+            &mut blobs,
+            &mut dirty,
+            &path,
+            200,
+            preindex_mtime,
+        )?;
+        assert_eq!(0, collect_history_entries(&history, history_start)?.len());
+
+        cache
+            .unlink(&mut tree, &mut blobs, &mut history, &mut dirty, &path)
+            .unwrap();
+        assert!(cache.metadata(&tree, &path).unwrap().is_none());
+        assert!(!childpath.exists());
+        assert_eq!(
+            vec![HistoryTableEntry::Remove(path, initial_hash.clone())],
+            collect_history_entries(&history, history_start)?
         );
 
         Ok(())

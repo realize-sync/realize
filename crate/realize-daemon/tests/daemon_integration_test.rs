@@ -79,8 +79,6 @@ impl Fixture {
             tempdir.child("testdir-metadata").to_path_buf(),
         ));
 
-        testdir.child("foo.txt").write_str("hello")?;
-
         let resources = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
             .join("../../resources/test");
 

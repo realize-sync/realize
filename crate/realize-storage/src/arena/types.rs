@@ -629,23 +629,23 @@ pub enum Version {
 }
 
 impl Version {
+    /// Turn the given version into a [Version::Modified]. This can be
+    /// called after noticing a local modification to a previously
+    /// indexed file.
+    pub fn modification_of(base: Option<Self>) -> Version {
+        match base {
+            None => Version::Modified(None),
+            Some(Version::Modified(hash)) => Version::Modified(hash),
+            Some(Version::Indexed(hash)) => Version::Modified(Some(hash)),
+        }
+    }
+
     /// Checks whether the given hash matches the current version.
     ///
     /// Only [Version::Indexed] will ever match.
     pub fn matches_hash(&self, other: &Hash) -> bool {
         if let Version::Indexed(hash) = self {
             return *hash == *other;
-        }
-
-        false
-    }
-
-    /// Checks whether two versions match.
-    ///
-    /// Only [Version::Indexed] can match another version.
-    pub fn matches(&self, other: &Version) -> bool {
-        if let (Version::Indexed(h1), Version::Indexed(h2)) = (self, other) {
-            return *h1 == *h2;
         }
 
         false
@@ -662,22 +662,7 @@ impl Version {
         }
     }
 
-    /// Return the version this version is based on. This is the hash of
-    /// last known indexed version. Any number of modifications might
-    /// have been applied since that hash was computed.
-    pub fn base(&self) -> Option<Self> {
-        self.base_hash().map(|h| Self::Indexed(h.clone()))
-    }
-
-    /// Turn this version into a [Version::Modified]. This can be called after
-    /// noticing a local modification to a previously indexed file.
-    pub fn into_modified(self) -> Version {
-        match self {
-            Version::Modified(hash) => Version::Modified(hash),
-            Version::Indexed(hash) => Version::Modified(Some(hash)),
-        }
-    }
-
+    /// Return the hash that the file was indexed with.
     pub fn indexed_hash(&self) -> Option<&Hash> {
         if let Version::Indexed(hash) = self {
             Some(hash)
@@ -686,6 +671,7 @@ impl Version {
         }
     }
 
+    /// Return the hash that the file was indexed with or fail with [StorageError::NotIndexed].
     pub fn expect_indexed(&self) -> Result<&Hash, StorageError> {
         if let Version::Indexed(hash) = self {
             Ok(hash)
