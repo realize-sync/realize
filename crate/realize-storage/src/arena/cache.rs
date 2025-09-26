@@ -1,6 +1,5 @@
 use super::blob::{BlobExt, BlobInfo, WritableOpenBlob};
 use super::dirty::WritableOpenDirty;
-use super::index::Index;
 use super::tree::{TreeExt, TreeReadOperations, WritableOpenTree};
 use super::types::{
     CacheTableEntry, DirtableEntry, FileEntryKind, FileMetadata, FileRealm, FileTableEntry,
@@ -90,7 +89,7 @@ where
     pathid_to_inode: PN,
     #[allow(dead_code)]
     inode_to_pathid: NP,
-    index: &'a Index,
+    cache: &'a Cache,
 }
 
 impl<'a, T, PN, NP> ReadableOpenCache<'a, T, PN, NP>
@@ -103,13 +102,13 @@ where
         table: T,
         pathid_to_inode: PN,
         inode_to_pathid: NP,
-        index: &'a Index,
+        cache: &'a Cache,
     ) -> Self {
         Self {
             table,
             pathid_to_inode,
             inode_to_pathid,
-            index,
+            cache,
         }
     }
 }
@@ -189,7 +188,7 @@ where
     }
 
     fn datadir(&self) -> &std::path::Path {
-        self.index.datadir()
+        self.cache.datadir()
     }
 }
 
@@ -263,7 +262,7 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
     }
 
     fn datadir(&self) -> &std::path::Path {
-        self.index.datadir()
+        self.cache.datadir()
     }
 }
 
@@ -387,7 +386,7 @@ pub(crate) struct WritableOpenCache<'a> {
     inode_to_pathid: Table<'a, Inode, PathId>,
     pending_catchup_table: Table<'a, (&'static str, PathId), ()>,
     tag: Tag,
-    index: &'a Index,
+    cache: &'a Cache,
 }
 
 impl<'a> WritableOpenCache<'a> {
@@ -397,7 +396,7 @@ impl<'a> WritableOpenCache<'a> {
         pathid_to_inode: Table<'a, PathId, Inode>,
         inode_to_pathid: Table<'a, Inode, PathId>,
         pending_catchup_table: Table<'a, (&'static str, PathId), ()>,
-        index: &'a Index,
+        cache: &'a Cache,
     ) -> Self {
         Self {
             table,
@@ -405,7 +404,7 @@ impl<'a> WritableOpenCache<'a> {
             inode_to_pathid,
             pending_catchup_table,
             tag,
-            index,
+            cache,
         }
     }
 
@@ -1257,26 +1256,39 @@ impl<'a> WritableOpenCache<'a> {
     }
 }
 
-/// Initialize the database. This should be called at startup, in the
-/// transaction that crates new tables.
-pub(crate) fn init(
-    cache_table: &mut redb::Table<'_, (PathId, Layer), Holder<CacheTableEntry>>,
-    root_pathid: PathId,
-) -> Result<(), StorageError> {
-    if cache_table.get((root_pathid, Layer::Default))?.is_none() {
-        // Exceptionally not using write_dir_mtime and not going
-        // through tree because , arena roots aren't refcounted by
-        // tree and are never deleted.
-        cache_table.insert(
-            (root_pathid, Layer::Default),
-            Holder::with_content(CacheTableEntry::Dir(DirtableEntry {
-                mtime: UnixTime::now(),
-            }))?,
-        )?;
-    }
-    Ok(())
+pub(crate) struct Cache {
+    datadir: PathBuf,
 }
 
+impl Cache {
+    /// Initialize the database. This should be called at startup, in the
+    /// transaction that crates new tables.
+    pub(crate) fn setup(
+        cache_table: &mut redb::Table<'_, (PathId, Layer), Holder<CacheTableEntry>>,
+        root_pathid: PathId,
+        datadir: &std::path::Path,
+    ) -> Result<Self, StorageError> {
+        if cache_table.get((root_pathid, Layer::Default))?.is_none() {
+            // Exceptionally not using write_dir_mtime and not going
+            // through tree because , arena roots aren't refcounted by
+            // tree and are never deleted.
+            cache_table.insert(
+                (root_pathid, Layer::Default),
+                Holder::with_content(CacheTableEntry::Dir(DirtableEntry {
+                    mtime: UnixTime::now(),
+                }))?,
+            )?;
+        }
+
+        Ok(Cache {
+            datadir: datadir.to_path_buf(),
+        })
+    }
+
+    pub(crate) fn datadir(&self) -> &std::path::Path {
+        &self.datadir
+    }
+}
 /// Lookup a specific name in the given directory pathid.
 fn lookup<'b, L: Into<TreeLoc<'b>>>(
     cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,

@@ -388,7 +388,7 @@ pub(crate) fn remove_file_if_missing(
     path: &realize_types::Path,
 ) -> Result<bool, StorageError> {
     let txn = db.begin_write()?;
-    if fs_utils::metadata_no_symlink_blocking(db.index().datadir(), path).is_err() {
+    if fs_utils::metadata_no_symlink_blocking(db.cache().datadir(), path).is_err() {
         {
             let mut tree = txn.write_tree()?;
             let mut blobs = txn.write_blobs()?;
@@ -619,7 +619,7 @@ mod tests {
     #[test]
     fn index_add_file_if_matches_success() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let datadir = fixture.db.index().datadir();
+        let datadir = fixture.db.cache().datadir();
         let foo = datadir.join("foo");
         fs::write(&foo, b"foo")?;
 
@@ -641,7 +641,7 @@ mod tests {
     #[test]
     fn index_add_file_if_matches_time_mismatch() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let datadir = fixture.db.index().datadir();
+        let datadir = fixture.db.cache().datadir();
         let file_path = datadir.join("foo");
         fs::write(&file_path, b"foo")?;
 
@@ -663,7 +663,7 @@ mod tests {
     #[test]
     fn index_add_file_if_matches_size_mismatch() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let datadir = fixture.db.index().datadir();
+        let datadir = fixture.db.cache().datadir();
         let file_path = datadir.join("foo");
         fs::write(&file_path, b"foo")?;
 
@@ -685,7 +685,7 @@ mod tests {
     #[test]
     fn index_add_file_if_matches_missing() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let datadir = fixture.db.index().datadir();
+        let datadir = fixture.db.cache().datadir();
         let file_path = datadir.join("foo");
         fs::write(&file_path, b"foo")?;
         let mtime = UnixTime::mtime(&file_path.metadata()?);
@@ -971,7 +971,7 @@ mod tests {
     #[test]
     fn branch_succeeds() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let datadir = fixture.db.index().datadir();
+        let datadir = fixture.db.cache().datadir();
 
         // Create source file on disk
         let source_path = datadir.join("source.txt");
@@ -1050,7 +1050,7 @@ mod tests {
     #[test]
     fn branch_fails_if_destination_already_exists() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let datadir = fixture.db.index().datadir();
+        let datadir = fixture.db.cache().datadir();
 
         // Create source file on disk
         let source_path = datadir.join("source.txt");
@@ -1119,7 +1119,7 @@ mod tests {
     #[test]
     fn branch_fails_if_source_hash_doesnt_match() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let datadir = fixture.db.index().datadir();
+        let datadir = fixture.db.cache().datadir();
 
         // Create source file on disk
         let source_path = datadir.join("source.txt");
@@ -1196,7 +1196,7 @@ mod tests {
     #[test]
     fn branch_fails_if_destination_is_a_directory() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let datadir = fixture.db.index().datadir();
+        let datadir = fixture.db.cache().datadir();
 
         // Create source file on disk
         let source_path = datadir.join("source.txt");
@@ -1242,7 +1242,7 @@ mod tests {
     #[test]
     fn branch_fails_if_destination_is_in_cache() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let datadir = fixture.db.index().datadir();
+        let datadir = fixture.db.cache().datadir();
 
         // Create source file on disk
         let source_path = datadir.join("source.txt");
@@ -1297,7 +1297,7 @@ mod tests {
     #[test]
     fn branch_fails_if_destination_file_exists_but_not_yet_indexed() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let datadir = fixture.db.index().datadir();
+        let datadir = fixture.db.cache().datadir();
 
         // Create source file on disk and in cache
         let source_path = datadir.join("source.txt");
@@ -1350,7 +1350,7 @@ mod tests {
     #[test]
     fn rename_succeeds() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let datadir = fixture.db.index().datadir();
+        let datadir = fixture.db.cache().datadir();
 
         // Create source file on disk
         let source_realpath = datadir.join("source.txt");
@@ -1414,7 +1414,7 @@ mod tests {
     #[test]
     fn rename_fails_when_destination_exists() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let datadir = fixture.db.index().datadir();
+        let datadir = fixture.db.cache().datadir();
 
         // Create source file on disk
         let source_path = datadir.join("source.txt");
@@ -1490,7 +1490,7 @@ mod tests {
     #[test]
     fn rename_fails_when_destination_exists_on_disk_but_not_yet_indexed() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let datadir = fixture.db.index().datadir();
+        let datadir = fixture.db.cache().datadir();
 
         // Create source file on disk and in cache
         let source_path = datadir.join("source.txt");
@@ -1543,7 +1543,7 @@ mod tests {
     #[test]
     fn rename_rejects_source() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let datadir = fixture.db.index().datadir();
+        let datadir = fixture.db.cache().datadir();
 
         // Create source file on disk
         let source_path = datadir.join("source.txt");

@@ -26,7 +26,7 @@ impl Reader {
             .await?
             .ok_or(StorageError::NotFound)?;
 
-        let realpath = path.within(db.index().datadir());
+        let realpath = path.within(db.cache().datadir());
         let file = File::open(realpath).await?;
         Ok(Self {
             db: Arc::clone(db),
@@ -104,7 +104,7 @@ pub(crate) async fn rsync(
         .await?
         .ok_or(StorageError::NotFound)?;
 
-    let realpath = path.within(db.index().datadir());
+    let realpath = path.within(db.cache().datadir());
     let len = range.bytecount() as usize;
     let mut data = vec![0; len];
     {

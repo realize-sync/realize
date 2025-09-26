@@ -115,7 +115,7 @@ impl RealWatcherBuilder {
 impl RealWatcher {
     /// Create a builder for configuring and spawning a RealWatcher.
     pub fn builder(db: Arc<ArenaDatabase>) -> RealWatcherBuilder {
-        let root = db.index().datadir().to_path_buf();
+        let root = db.cache().datadir().to_path_buf();
         RealWatcherBuilder::new(root, db)
     }
 
@@ -126,7 +126,7 @@ impl RealWatcher {
         debounce: Duration,
         max_parallelism: usize,
     ) -> anyhow::Result<Self> {
-        let root = fs::canonicalize(db.index().datadir()).await?;
+        let root = fs::canonicalize(db.cache().datadir()).await?;
         let tag = db.tag();
 
         let (watch_tx, watch_rx) = mpsc::channel(100);
@@ -309,7 +309,7 @@ impl RealWatcherWorker {
                 }
                 // run scan, below
             });
-            let root = self.db.index().datadir();
+            let root = self.db.cache().datadir();
             log::info!("[{tag}] Scanning {root:?}");
             if let Err(err) = self.rescan_added(&watch_tx, &mut shutdown_rx).await {
                 log::warn!("[{tag}] Scanning {root:?} for added files failed: {err}");
@@ -331,7 +331,7 @@ impl RealWatcherWorker {
         watch_tx: &mpsc::Sender<FsEvent>,
         shutdown_rx: &mut broadcast::Receiver<()>,
     ) -> anyhow::Result<()> {
-        let root = self.db.index().datadir();
+        let root = self.db.cache().datadir();
         let mut files = std::pin::pin!(index::all_files_stream(&self.db));
         loop {
             tokio::select!(
@@ -383,7 +383,7 @@ impl RealWatcherWorker {
         watch_tx: &mpsc::Sender<FsEvent>,
         shutdown_rx: &mut broadcast::Receiver<()>,
     ) -> anyhow::Result<()> {
-        let root = self.db.index().datadir();
+        let root = self.db.cache().datadir();
         let mut direntries = async_walkdir::WalkDir::new(root).filter(only_regular);
 
         loop {
@@ -475,7 +475,7 @@ impl RealWatcherWorker {
         rescan_tx: &mpsc::Sender<()>,
         debouncer: &mut DebouncerMap<Path, Result<(), StorageError>>,
     ) -> anyhow::Result<()> {
-        let root = self.db.index().datadir();
+        let root = self.db.cache().datadir();
         match ev {
             FsEvent::Removed(path) => {
                 if index::has_file_async(&self.db, &path).await? {
@@ -611,7 +611,7 @@ impl RealWatcherWorker {
         debouncer: &mut DebouncerMap<Path, Result<(), StorageError>>,
     ) -> Result<(), anyhow::Error> {
         let mut direntries =
-            async_walkdir::WalkDir::new(dirpath.within(&self.db.index().datadir()))
+            async_walkdir::WalkDir::new(dirpath.within(&self.db.cache().datadir()))
                 .filter(only_regular);
         while let Some(direntry) = direntries.next().await {
             let direntry = match direntry {
@@ -678,7 +678,7 @@ impl RealWatcherWorker {
             let path = path.clone();
             async move {
                 let hash = if size > 0 {
-                    hash::hash_file(File::open(path.within(db.index().datadir())).await?).await?
+                    hash::hash_file(File::open(path.within(db.cache().datadir())).await?).await?
                 } else {
                     hash::empty()
                 };
@@ -702,7 +702,7 @@ impl RealWatcherWorker {
         let path = path.as_ref();
         // TODO: Should this use a PathResolver? We may or may not want
         // to care about partial/full files here.
-        realize_types::Path::from_real_path_in(&path, &self.db.index().datadir())
+        realize_types::Path::from_real_path_in(&path, &self.db.cache().datadir())
     }
 }
 

@@ -1,5 +1,5 @@
 use super::blob::{BlobReadOperations, Blobs, ReadableOpenBlob, WritableOpenBlob};
-use super::cache::{self, WritableOpenCache};
+use super::cache::{self, Cache, WritableOpenCache};
 use super::dirty::{Dirty, DirtyReadOperations, ReadableOpenDirty, WritableOpenDirty};
 use super::history::{History, HistoryReadOperations, ReadableOpenHistory, WritableOpenHistory};
 use super::mark::{MarkReadOperations, ReadableOpenMark, WritableOpenMark};
@@ -11,7 +11,6 @@ use super::types::{
     PeerTableEntry, QueueTableEntry,
 };
 use crate::StorageError;
-use crate::arena::index::Index;
 use crate::types::Inode;
 use crate::utils::holder::{ByteConversionError, Holder};
 use crate::{PathId, PathIdAllocator};
@@ -178,7 +177,7 @@ struct Subsystems {
     dirty: Dirty,
     history: History,
     blobs: Blobs,
-    index: Index,
+    cache: Cache,
 }
 
 impl ArenaDatabase {
@@ -223,7 +222,7 @@ impl ArenaDatabase {
         datadir: impl AsRef<std::path::Path>,
     ) -> Result<Arc<Self>, StorageError> {
         let tree = Tree::new(arena, allocator)?;
-        let index = Index::new(datadir.as_ref());
+        let cache: Cache;
         let dirty: Dirty;
         let history: History;
         let blobs: Blobs;
@@ -257,7 +256,7 @@ impl ArenaDatabase {
             uuid = load_or_assign_uuid(&mut settings_table)?;
             tag = Tag::new(uuid, arena);
             blobs = Blobs::setup(tag, blob_dir.as_ref(), &blob_lru_queue_table)?;
-            cache::init(&mut cache_table, tree.root())?;
+            cache = Cache::setup(&mut cache_table, tree.root(), datadir.as_ref())?;
         }
         txn.commit()?;
 
@@ -270,7 +269,7 @@ impl ArenaDatabase {
                 dirty,
                 history,
                 blobs,
-                index,
+                cache,
             },
             tag,
         }))
@@ -312,9 +311,9 @@ impl ArenaDatabase {
         &self.subsystems.blobs
     }
 
-    /// Return handle on the Index subsystem.
-    pub fn index(&self) -> &Index {
-        &self.subsystems.index
+    /// Return handle on the Cache subsystem.
+    pub fn cache(&self) -> &Cache {
+        &self.subsystems.cache
     }
 
     pub fn begin_write(&self) -> Result<ArenaWriteTransaction<'_>, StorageError> {
@@ -390,23 +389,19 @@ impl<'db> ArenaWriteTransaction<'db> {
 
     #[allow(dead_code)]
     #[track_caller]
-    pub(crate) fn read_cache(
-        &self,
-    ) -> Result<impl crate::arena::cache::CacheReadOperations, StorageError> {
-        Ok(crate::arena::cache::ReadableOpenCache::new(
+    pub(crate) fn read_cache(&self) -> Result<impl cache::CacheReadOperations, StorageError> {
+        Ok(cache::ReadableOpenCache::new(
             self.inner
                 .open_table(CACHE_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
             self.inner.open_table(PATHID_TO_INODE_TABLE)?,
             self.inner.open_table(INODE_TO_PATHID_TABLE)?,
-            &self.subsystems.index,
+            &self.subsystems.cache,
         ))
     }
 
     #[track_caller]
-    pub(crate) fn write_cache(
-        &self,
-    ) -> Result<crate::arena::cache::WritableOpenCache<'_>, StorageError> {
+    pub(crate) fn write_cache(&self) -> Result<cache::WritableOpenCache<'_>, StorageError> {
         Ok(WritableOpenCache::new(
             self.tag,
             self.inner
@@ -415,7 +410,7 @@ impl<'db> ArenaWriteTransaction<'db> {
             self.inner.open_table(PATHID_TO_INODE_TABLE)?,
             self.inner.open_table(INODE_TO_PATHID_TABLE)?,
             self.inner.open_table(PENDING_CATCHUP_TABLE)?,
-            &self.subsystems.index,
+            &self.subsystems.cache,
         ))
     }
 
@@ -626,16 +621,14 @@ impl<'db> ArenaReadTransaction<'db> {
 
     #[allow(dead_code)]
     #[track_caller]
-    pub(crate) fn read_cache(
-        &self,
-    ) -> Result<impl crate::arena::cache::CacheReadOperations, StorageError> {
-        Ok(crate::arena::cache::ReadableOpenCache::new(
+    pub(crate) fn read_cache(&self) -> Result<impl cache::CacheReadOperations, StorageError> {
+        Ok(cache::ReadableOpenCache::new(
             self.inner
                 .open_table(CACHE_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
             self.inner.open_table(PATHID_TO_INODE_TABLE)?,
             self.inner.open_table(INODE_TO_PATHID_TABLE)?,
-            &self.subsystems.index,
+            &self.subsystems.cache,
         ))
     }
 
