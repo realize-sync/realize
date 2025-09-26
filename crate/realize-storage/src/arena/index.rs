@@ -5,10 +5,10 @@ use super::dirty::WritableOpenDirty;
 use super::history::{HistoryReadOperations, WritableOpenHistory};
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
 use super::types::{HistoryTableEntry, IndexedFile};
-use crate::StorageError;
 use crate::arena::blob::WritableOpenBlob;
 use crate::arena::cache::{CacheExt, CacheReadOperations, WritableOpenCache};
 use crate::utils::fs_utils;
+use crate::{StorageError, Version};
 use realize_types::{self, Hash, UnixTime};
 use std::ops::RangeBounds;
 use std::path::PathBuf;
@@ -260,9 +260,13 @@ pub(crate) fn has_matching_file(
     let txn = db.begin_read()?;
     let cache = txn.read_cache()?;
     let tree = txn.read_tree()?;
-    let ret = cache.indexed(&tree, path)?.map(|e| e.matches(size, mtime));
+    if let Some(indexed) = cache.indexed(&tree, path)? {
+        if let Version::Indexed(_) = indexed.version {
+            return Ok(indexed.matches(size, mtime));
+        }
+    }
 
-    Ok(ret.unwrap_or(false))
+    Ok(false)
 }
 
 /// Check whether a given file is in the index already with the given size and mtime.
@@ -799,6 +803,10 @@ mod tests {
             size,
             UnixTime::from_secs(1234567891)
         )?);
+
+        // always return false for modified files
+        super::preindex(&fixture.db, &path)?;
+        assert!(!super::has_matching_file(&fixture.db, &path, size, mtime)?);
 
         Ok(())
     }
