@@ -17,6 +17,8 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tokio_util::bytes::BufMut;
 
+const TTL: Duration = Duration::ZERO;
+
 /// Mount the cache as FUSE filesystem at the given mountpoint.
 pub fn export(
     fs: Arc<Filesystem>,
@@ -109,7 +111,7 @@ impl fuser::Filesystem for RealizeFs {
         self.handle.spawn(async move {
             match inner.lookup(parent, name).await {
                 Err(err) => reply.error(err.log_and_convert()),
-                Ok(attr) => reply.entry(&Duration::from_secs(1), &attr, 0),
+                Ok(attr) => reply.entry(&TTL, &attr, 0),
             }
         });
     }
@@ -126,7 +128,7 @@ impl fuser::Filesystem for RealizeFs {
         self.handle.spawn(async move {
             match inner.getattr(ino, fh).await {
                 Err(err) => reply.error(err.log_and_convert()),
-                Ok(attr) => reply.attr(&Duration::from_secs(1), &attr),
+                Ok(attr) => reply.attr(&TTL, &attr),
             }
         });
     }
@@ -164,7 +166,7 @@ impl fuser::Filesystem for RealizeFs {
             self.handle.spawn(async move {
                 match inner.truncate(ino, fh, size).await {
                     Err(err) => reply.error(err.log_and_convert()),
-                    Ok(attr) => reply.attr(&Duration::from_secs(1), &attr),
+                    Ok(attr) => reply.attr(&TTL, &attr),
                 }
             });
             return;
@@ -434,7 +436,7 @@ impl fuser::Filesystem for RealizeFs {
         self.handle.spawn(async move {
             match inner.link(ino, newparent, newname).await {
                 Err(err) => reply.error(err.log_and_convert()),
-                Ok(attr) => reply.entry(&Duration::from_secs(1), &attr, 0),
+                Ok(attr) => reply.entry(&TTL, &attr, 0),
             }
         });
     }
@@ -454,7 +456,7 @@ impl fuser::Filesystem for RealizeFs {
         self.handle.spawn(async move {
             match inner.mkdir(parent, name, mode, umask).await {
                 Err(err) => reply.error(err.log_and_convert()),
-                Ok(attr) => reply.entry(&Duration::from_secs(1), &attr, 0),
+                Ok(attr) => reply.entry(&TTL, &attr, 0),
             }
         });
     }
@@ -537,7 +539,6 @@ impl InnerRealizeFs {
     async fn lookup(&self, parent: u64, name: OsString) -> Result<fuser::FileAttr, FuseError> {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
         let (inode, metadata) = self.fs.lookup((Inode(parent), name)).await?;
-        log::debug!("=== lookup {parent} {name:?} -> {inode} {metadata:?}");
         match metadata {
             Metadata::File(file_metadata) => Ok(self.build_file_attr(inode, &file_metadata)),
             Metadata::Dir(dir_metadata) => Ok(self.build_dir_attr(inode, dir_metadata)),
@@ -582,7 +583,6 @@ impl InnerRealizeFs {
         // Note: As requested by FUSE: the above reads as much as
         // possible up to size (no short reads). Only stop if EOF is
         // reached.
-
         Ok(buffer.into_inner())
     }
 
@@ -2113,9 +2113,7 @@ mod tests {
 
                 tokio::fs::write(&file_path, "new overwritten content").await?;
 
-                log::debug!("=== rename START");
                 fs::rename(&file_path, &new_path).await?;
-                log::debug!("=== rename END");
                 tokio::time::sleep(Duration::from_secs(3)).await;
 
                 assert!(!fs::metadata(&file_path).await.is_ok());
