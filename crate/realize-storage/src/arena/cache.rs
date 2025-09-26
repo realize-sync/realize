@@ -3045,7 +3045,6 @@ mod tests {
 
         let mtime = test_time();
 
-        log::debug!("==== ook1");
         update::apply(
             &fixture.db,
             peer1,
@@ -3134,7 +3133,6 @@ mod tests {
             },
         )?;
 
-        log::debug!("==== ook2");
         // Simulate a catchup that only reports file2 and file4.
         update::apply(
             &fixture.db,
@@ -3163,7 +3161,6 @@ mod tests {
                 hash: test_hash(),
             },
         )?;
-        log::debug!("==== ook3");
         update::apply(
             &fixture.db,
             peer1,
@@ -3172,16 +3169,13 @@ mod tests {
                 index: 0,
             },
         )?;
-        log::debug!("==== ook4");
         let txn = fixture.db.begin_read()?;
         let cache = txn.read_cache()?;
         let tree = txn.read_tree()?;
 
-        log::debug!("==== ook5");
         // File1 should have been deleted, since it was only on peer1,
         assert!(cache.file_entry(&tree, &file1)?.is_none());
 
-        log::debug!("==== ook6");
         assert_eq!(
             vec![peer1, peer2],
             cache
@@ -3190,7 +3184,6 @@ mod tests {
                 .peers
         );
 
-        log::debug!("==== ook7");
         assert_eq!(
             vec![peer3],
             cache
@@ -3199,7 +3192,6 @@ mod tests {
                 .peers
         );
 
-        log::debug!("==== ook8");
         assert_eq!(
             vec![peer1],
             cache
@@ -3208,7 +3200,6 @@ mod tests {
                 .peers
         );
 
-        log::debug!("==== ook9");
         Ok(())
     }
 
