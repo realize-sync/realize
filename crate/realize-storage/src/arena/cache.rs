@@ -124,11 +124,7 @@ where
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<Option<crate::arena::types::Metadata>, StorageError> {
-        if let Some(pathid) = tree.resolve(loc)? {
-            return metadata(&self.table, pathid);
-        }
-
-        Ok(None)
+        return metadata(&self.table, tree, &self.cache.datadir, loc);
     }
 
     fn file_realm<'b, L: Into<TreeLoc<'b>>>(
@@ -155,7 +151,7 @@ where
         loc: L,
     ) -> impl Iterator<Item = Result<(String, PathId, crate::arena::types::Metadata), StorageError>>
     {
-        ReadDirIterator::new(&self.table, tree, loc)
+        ReadDirIterator::new(&self.table, tree, self.datadir(), loc)
     }
 
     fn file_at_pathid(&self, pathid: PathId) -> Result<Option<FileTableEntry>, StorageError> {
@@ -198,11 +194,7 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<Option<crate::arena::types::Metadata>, StorageError> {
-        if let Some(pathid) = tree.resolve(loc)? {
-            return metadata(&self.table, pathid);
-        }
-
-        Ok(None)
+        return metadata(&self.table, tree, &self.cache.datadir, loc);
     }
 
     fn file_realm<'b, L: Into<TreeLoc<'b>>>(
@@ -229,7 +221,7 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         loc: L,
     ) -> impl Iterator<Item = Result<(String, PathId, crate::arena::types::Metadata), StorageError>>
     {
-        ReadDirIterator::new(&self.table, tree, loc)
+        ReadDirIterator::new(&self.table, tree, self.datadir(), loc)
     }
 
     fn file_at_pathid(&self, pathid: PathId) -> Result<Option<FileTableEntry>, StorageError> {
@@ -1284,33 +1276,53 @@ impl Cache {
         &self.datadir
     }
 }
+
 /// Lookup a specific name in the given directory pathid.
 fn lookup<'b, L: Into<TreeLoc<'b>>>(
     cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
     tree: &impl TreeReadOperations,
+    datadir: &std::path::Path,
     loc: L,
 ) -> Result<(PathId, crate::arena::types::Metadata), StorageError> {
     let pathid = tree.expect(loc)?;
-    let metadata = metadata(cache_table, pathid)?.ok_or(StorageError::NotFound)?;
+    let metadata = metadata(cache_table, tree, datadir, pathid)?.ok_or(StorageError::NotFound)?;
 
     return Ok((pathid, metadata));
 }
 
 /// Get metadata for a file or directory.
-fn metadata(
+fn metadata<'b, L: Into<TreeLoc<'b>>>(
     cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
-    pathid: PathId,
+    tree: &impl TreeReadOperations,
+    datadir: &std::path::Path,
+    loc: L,
 ) -> Result<Option<crate::arena::types::Metadata>, StorageError> {
-    if let Some(e) = cache_table.get((pathid, Layer::Default))? {
-        Ok(Some(match e.value().parse()? {
-            CacheTableEntry::File(file_entry) => {
-                crate::arena::types::Metadata::File(file_entry.into())
+    let loc = loc.into();
+    if let Some(pathid) = tree.resolve(loc.borrow())? {
+        if let Some(e) = cache_table.get((pathid, Layer::Default))? {
+            match e.value().parse()? {
+                CacheTableEntry::File(file_entry) => {
+                    if file_entry.is_local() {
+                        if let Some(path) = tree.backtrack(loc)? {
+                            if let Ok(m) = path.within(datadir).metadata() {
+                                return Ok(Some(crate::arena::types::Metadata::File(
+                                    FileMetadata::merged(&file_entry, &m),
+                                )));
+                            } else {
+                                return Ok(None);
+                            }
+                        }
+                    }
+                    return Ok(Some(crate::arena::types::Metadata::File(file_entry.into())));
+                }
+                CacheTableEntry::Dir(dir_entry) => {
+                    return Ok(Some(crate::arena::types::Metadata::Dir(dir_entry.into())));
+                }
             }
-            CacheTableEntry::Dir(dir_entry) => crate::arena::types::Metadata::Dir(dir_entry.into()),
-        }))
-    } else {
-        Ok(None)
+        }
     }
+
+    Ok(None)
 }
 
 fn file_realm<'b, L: Into<TreeLoc<'b>>>(
@@ -1391,23 +1403,33 @@ fn find_peer_entry(
         }))
 }
 
-struct ReadDirIterator<'a, 'b, T> {
+struct ReadDirIterator<'a, 'b, T, Tr>
+where
+    T: ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
+    Tr: TreeReadOperations,
+{
     table: &'a T,
+    tree: &'b Tr,
+    datadir: &'a std::path::Path,
     iter: tree::ReadDirIterator<'b>,
 }
 
-impl<'a, 'b, T> ReadDirIterator<'a, 'b, T>
+impl<'a, 'b, T, Tr> ReadDirIterator<'a, 'b, T, Tr>
 where
     T: ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
+    Tr: TreeReadOperations,
 {
     fn new<'l, L: Into<TreeLoc<'l>>>(
         table: &'a T,
-        tree: &'b impl TreeReadOperations,
+        tree: &'b Tr,
+        datadir: &'a std::path::Path,
         loc: L,
     ) -> Self {
         ReadDirIterator {
             table,
-            iter: match lookup(table, tree, loc) {
+            tree,
+            datadir,
+            iter: match lookup(table, tree, datadir, loc) {
                 Err(err) => tree::ReadDirIterator::failed(err),
                 Ok((pathid, crate::arena::types::Metadata::Dir(_))) => tree.readdir_pathid(pathid),
                 Ok(_) => tree::ReadDirIterator::failed(StorageError::NotADirectory),
@@ -1416,9 +1438,10 @@ where
     }
 }
 
-impl<'a, 'b, T> Iterator for ReadDirIterator<'a, 'b, T>
+impl<'a, 'b, T, Tr> Iterator for ReadDirIterator<'a, 'b, T, Tr>
 where
     T: ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
+    Tr: TreeReadOperations,
 {
     type Item = Result<(String, PathId, crate::arena::types::Metadata), StorageError>;
 
@@ -1427,7 +1450,7 @@ where
             match entry {
                 Err(err) => return Some(Err(err)),
                 Ok((name, pathid)) => {
-                    match metadata(self.table, pathid) {
+                    match metadata(self.table, self.tree, self.datadir, pathid) {
                         Err(err) => return Some(Err(err)),
                         Ok(Some(metadata)) => return Some(Ok((name, pathid, metadata))),
                         Ok(None) => {} // not in the cache; skip

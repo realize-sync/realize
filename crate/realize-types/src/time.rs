@@ -36,7 +36,7 @@ impl UnixTime {
         UnixTime::new(secs, 0)
     }
 
-    fn from_system_time(time: SystemTime) -> Result<Self, SystemTimeError> {
+    pub fn from_system_time(time: SystemTime) -> Result<Self, SystemTimeError> {
         Ok(UnixTime(time.duration_since(SystemTime::UNIX_EPOCH)?))
     }
 

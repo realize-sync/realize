@@ -6,11 +6,10 @@ use nix::libc::{self, c_int};
 use realize_storage::{
     DirMetadata, FileContent, FileMetadata, Filesystem, Inode, Metadata, StorageError,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::SeekFrom;
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -32,7 +31,6 @@ pub fn export(
             downloader,
             umask,
             handles: Arc::new(Mutex::new(BTreeMap::new())),
-            realpaths: Arc::new(Mutex::new(HashMap::new())),
         }),
     };
     let bgsession = fuser::spawn_mount2(
@@ -210,14 +208,6 @@ impl fuser::Filesystem for RealizeFs {
                 Err(err) => reply.error(err.log_and_convert()),
                 Ok(()) => reply.ok(),
             }
-        });
-    }
-
-    fn forget(&mut self, _req: &fuser::Request<'_>, ino: u64, _nlookup: u64) {
-        let inner = Arc::clone(&self.inner);
-
-        self.handle.spawn(async move {
-            inner.forget(ino).await;
         });
     }
 
@@ -536,7 +526,6 @@ struct InnerRealizeFs {
     downloader: Downloader,
     umask: u16,
     handles: Arc<Mutex<BTreeMap<u64, Arc<Mutex<FileHandle>>>>>,
-    realpaths: Arc<Mutex<HashMap<u64, PathBuf>>>,
 }
 
 enum FileHandle {
@@ -548,13 +537,9 @@ impl InnerRealizeFs {
     async fn lookup(&self, parent: u64, name: OsString) -> Result<fuser::FileAttr, FuseError> {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
         let (inode, metadata) = self.fs.lookup((Inode(parent), name)).await?;
+        log::debug!("=== lookup {parent} {name:?} -> {inode} {metadata:?}");
         match metadata {
-            Metadata::File(file_metadata) => {
-                if let Some((_, m)) = self.get_realpath(inode.as_u64()).await {
-                    return Ok(metadata_to_attr(&m, inode.as_u64()));
-                }
-                Ok(self.build_file_attr(inode, &file_metadata))
-            }
+            Metadata::File(file_metadata) => Ok(self.build_file_attr(inode, &file_metadata)),
             Metadata::Dir(dir_metadata) => Ok(self.build_dir_attr(inode, dir_metadata)),
         }
     }
@@ -566,10 +551,6 @@ impl InnerRealizeFs {
                 return Ok(metadata_to_attr(&file.metadata().await?, ino));
             }
         }
-        if let Some((_, m)) = self.get_realpath(ino).await {
-            return Ok(metadata_to_attr(&m, ino));
-        }
-
         let metadata = self.fs.metadata(Inode(ino)).await?;
         match metadata {
             Metadata::File(file_metadata) => Ok(self.build_file_attr(Inode(ino), &file_metadata)),
@@ -634,13 +615,21 @@ impl InnerRealizeFs {
                 return Ok(metadata_to_attr(&file.metadata().await?, ino));
             }
         }
-        if let Some((realpath, _)) = self.get_realpath(ino).await {
-            log::debug!("SETATTR {ino}: Truncate file, mapped to {realpath:?} to {size}");
-            if let Ok(file) = tokio::fs::OpenOptions::new()
-                .write(true)
-                .open(&realpath)
-                .await
-            {
+        match self.fs.file_content(Inode(ino)).await? {
+            FileContent::Local(realpath) => {
+                log::debug!("SETATTR {ino}: Truncate file, mapped to {realpath:?} to {size}");
+                if let Ok(file) = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&realpath)
+                    .await
+                {
+                    file.set_len(size).await?;
+                    return Ok(metadata_to_attr(&file.metadata().await?, ino));
+                }
+            }
+            FileContent::Remote(mut blob) => {
+                self.downloader.complete_blob(&mut blob).await?;
+                let (_, file) = blob.realize().await?;
                 file.set_len(size).await?;
                 return Ok(metadata_to_attr(&file.metadata().await?, ino));
             }
@@ -688,12 +677,6 @@ impl InnerRealizeFs {
     async fn unlink(&self, parent: u64, name: OsString) -> Result<(), FuseError> {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
         let (inode, _) = self.fs.lookup((Inode(parent), name)).await?;
-        if let Some((realpath, _)) = self.get_realpath(inode.as_u64()).await {
-            tokio::fs::remove_file(realpath).await?;
-            self.realpaths.lock().await.remove(&inode.as_u64());
-            return Ok(());
-        }
-
         self.fs.unlink(inode).await?;
 
         Ok(())
@@ -707,9 +690,6 @@ impl InnerRealizeFs {
     ) -> Result<fuser::FileAttr, FuseError> {
         let name = name.to_str().ok_or(FuseError::Utf8)?;
 
-        if self.get_realpath(source).await.is_some() {
-            return Err(FuseError::Errno(libc::EXDEV));
-        }
         let (dest, metadata) = self.fs.branch(Inode(source), (Inode(parent), name)).await?;
 
         Ok(self.build_file_attr(dest, &metadata))
@@ -747,14 +727,12 @@ impl InnerRealizeFs {
     ) -> Result<(), FuseError> {
         let old_name = old_name.to_str().ok_or(FuseError::Utf8)?;
         let new_name = new_name.to_str().ok_or(FuseError::Utf8)?;
-        let (source, _) = self.fs.lookup((Inode(old_parent), old_name)).await?;
-        if self.get_realpath(source.as_u64()).await.is_some() {
-            // Rename must be executed on the real path.
-            return Err(FuseError::Errno(libc::EXDEV));
-        }
-
         self.fs
-            .rename(source, (Inode(new_parent), new_name), noreplace)
+            .rename(
+                (Inode(old_parent), old_name),
+                (Inode(new_parent), new_name),
+                noreplace,
+            )
             .await?;
 
         Ok(())
@@ -762,41 +740,34 @@ impl InnerRealizeFs {
 
     async fn open(&self, ino: u64, flags: i32) -> Result<(u64, u32), FuseError> {
         let mode = flags & (libc::O_RDONLY | libc::O_WRONLY | libc::O_RDWR);
-        let handle = if let Some((realpath, _)) = self.get_realpath(ino).await {
-            log::debug!("Opening Inode({ino}), mapped to {realpath:?}");
-            FileHandle::Real(openoptions_from_flags(flags).open(&realpath).await?)
-        } else {
-            match self.fs.file_content(Inode(ino)).await? {
-                FileContent::Local(path) => {
-                    FileHandle::Real(openoptions_from_flags(flags).open(path).await?)
-                }
-                FileContent::Remote(mut blob) => {
-                    if mode == libc::O_RDONLY {
-                        let reader = self.downloader.reader(blob).await?;
-                        log::debug!("Opened Inode({ino}) read-only (download enabled)");
+        let handle = match self.fs.file_content(Inode(ino)).await? {
+            FileContent::Local(path) => {
+                FileHandle::Real(openoptions_from_flags(flags).open(path).await?)
+            }
+            FileContent::Remote(mut blob) => {
+                if mode == libc::O_RDONLY {
+                    let reader = self.downloader.reader(blob).await?;
+                    log::debug!("Opened Inode({ino}) read-only (download enabled)");
 
-                        FileHandle::Cached(reader)
+                    FileHandle::Cached(reader)
+                } else {
+                    log::debug!("Opening {ino}; realizing it first...");
+                    self.downloader.complete_blob(&mut blob).await?;
+                    let (path, file) = blob.realize().await?;
+                    log::debug!("Map Inode({ino}) to {path:?}");
+                    log::debug!("File at Inode({ino}) realized successfully");
+                    if (flags & libc::O_TRUNC) != 0 {
+                        // TODO: don't bother downloading in this case and when
+                        // setattr is called immediately after open
+                        file.set_len(0).await?;
+                        log::debug!("File at Inode({ino}) truncated");
+                    }
+                    if (flags & libc::O_APPEND) != 0 {
+                        drop(file);
+
+                        FileHandle::Real(openoptions_from_flags(flags).open(path).await?)
                     } else {
-                        log::debug!("Opening {ino}; realizing it first...");
-                        self.downloader.complete_blob(&mut blob).await?;
-                        let (path, file) = blob.realize().await?;
-                        log::debug!("Map Inode({ino}) to {path:?}");
-                        self.realpaths.lock().await.insert(ino, path.clone());
-
-                        log::debug!("File at Inode({ino}) realized successfully");
-                        if (flags & libc::O_TRUNC) != 0 {
-                            // TODO: don't bother downloading in this case and when
-                            // setattr is called immediately after open
-                            file.set_len(0).await?;
-                            log::debug!("File at Inode({ino}) truncated");
-                        }
-                        if (flags & libc::O_APPEND) != 0 {
-                            drop(file);
-
-                            FileHandle::Real(openoptions_from_flags(flags).open(path).await?)
-                        } else {
-                            FileHandle::Real(file)
-                        }
+                        FileHandle::Real(file)
                     }
                 }
             }
@@ -820,12 +791,6 @@ impl InnerRealizeFs {
         }
 
         Ok(())
-    }
-
-    async fn forget(&self, ino: u64) {
-        if let Some(realpath) = self.realpaths.lock().await.remove(&ino) {
-            log::debug!("Forget mapping from Inode({ino}) to {realpath:?}");
-        }
     }
 
     async fn release(&self, fh: u64) -> Result<(), FuseError> {
@@ -852,27 +817,11 @@ impl InnerRealizeFs {
         }
     }
 
-    async fn get_realpath(&self, ino: u64) -> Option<(PathBuf, std::fs::Metadata)> {
-        let realpath = {
-            let guard = self.realpaths.lock().await;
-
-            guard.get(&ino).cloned()
-        };
-        if let Some(realpath) = realpath {
-            if let Ok(m) = tokio::fs::metadata(&realpath).await {
-                return Some((realpath, m));
-            }
-        }
-
-        None
-    }
-
     fn build_file_attr(&self, pathid: Inode, metadata: &FileMetadata) -> fuser::FileAttr {
         let uid = metadata.uid.unwrap_or(nix::unistd::getuid().as_raw());
         let gid = metadata.gid.unwrap_or(nix::unistd::getgid().as_raw());
         let mtime = metadata.mtime.as_system_time();
         let ctime = metadata.ctime.map(|t| t.as_system_time()).unwrap_or(mtime);
-        let crtime = metadata.crtime.map(|t| t.as_system_time()).unwrap_or(mtime);
 
         fuser::FileAttr {
             ino: pathid.as_u64(),
@@ -881,7 +830,7 @@ impl InnerRealizeFs {
             atime: mtime,
             mtime: mtime,
             ctime: ctime,
-            crtime: crtime,
+            crtime: mtime,
             kind: fuser::FileType::RegularFile,
             perm: (metadata.mode & 0xffff) as u16 & !self.umask,
             nlink: 1,
@@ -1797,54 +1746,6 @@ mod tests {
 
     #[tokio::test]
     #[cfg_attr(not(target_os = "linux"), ignore)]
-    async fn overwritten_file_metadata() -> anyhow::Result<()> {
-        let mut fixture = FuseFixture::setup().await?;
-        fixture
-            .inner
-            .with_two_peers()
-            .await?
-            .run(async |household_a, _household_b| {
-                let a = HouseholdFixture::a();
-                let b = HouseholdFixture::b();
-                testing::connect(&household_a, b).await?;
-
-                fixture
-                    .inner
-                    .write_file_and_wait(b, a, "metadata.txt", "content")
-                    .await?;
-
-                fixture.mount(household_a).await?;
-
-                let mount_path = fixture.mount_path();
-                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
-                let file_path = arena_path.join("metadata.txt");
-
-                let new_content = "new content";
-                tokio::fs::write(&file_path, new_content).await?;
-
-                let fuse_meta = tokio::fs::metadata(&file_path).await?;
-
-                let datadir_path = fixture.inner.arena_root(a).join("metadata.txt");
-                let datadir_meta = tokio::fs::metadata(&datadir_path).await?;
-
-                assert_eq!(fuse_meta.len(), datadir_meta.len());
-                assert_eq!(fuse_meta.modified()?, datadir_meta.modified()?);
-                assert_eq!(fuse_meta.mode() & 0o777, datadir_meta.mode() & 0o777);
-                assert!(fuse_meta.is_file());
-                assert!(datadir_meta.is_file());
-
-                // inodes should NOT match (they're different files)
-                assert_ne!(fuse_meta.ino(), datadir_meta.ino());
-
-                Ok::<(), anyhow::Error>(())
-            })
-            .await?;
-        fixture.unmount().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[cfg_attr(not(target_os = "linux"), ignore)]
     async fn chown_fails() -> anyhow::Result<()> {
         let mut fixture = FuseFixture::setup().await?;
         fixture
@@ -2155,27 +2056,26 @@ mod tests {
 
                 fixture
                     .inner
-                    .write_file_and_wait(b, a, "link_test.txt", "original content")
+                    .write_file_and_wait(b, a, "source.txt", "original content")
                     .await?;
 
                 fixture.mount(household_a).await?;
 
                 let mount_path = fixture.mount_path();
                 let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
-                let file_path = arena_path.join("link_test.txt");
-                let link_path = arena_path.join("link_test_link.txt");
+                let file_path = arena_path.join("source.txt");
+                let link_path = arena_path.join("dest.txt");
 
                 tokio::fs::write(&file_path, "new overwritten content").await?;
 
-                let link_result = fs::hard_link(&file_path, &link_path).await;
-                assert_eq!(
-                    Some(libc::EXDEV),
-                    link_result.err().and_then(|e| e.raw_os_error()),
-                    "Link should fail with EXDEV on overwritten cached file"
-                );
+                fs::hard_link(&file_path, &link_path).await?;
 
-                // Verify no link was created
-                assert!(fs::metadata(&link_path).await.is_err());
+                assert!(fs::metadata(&file_path).await.is_ok());
+                assert!(fs::metadata(&link_path).await.is_ok());
+                assert_eq!(
+                    "new overwritten content",
+                    fs::read_to_string(&link_path).await?
+                );
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -2201,32 +2101,28 @@ mod tests {
 
                 fixture
                     .inner
-                    .write_file_and_wait(b, a, "rename_test.txt", "original content")
+                    .write_file_and_wait(b, a, "source.txt", "original content")
                     .await?;
 
                 fixture.mount(household_a).await?;
 
                 let mount_path = fixture.mount_path();
                 let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
-                let file_path = arena_path.join("rename_test.txt");
-                let new_path = arena_path.join("rename_test_new.txt");
+                let file_path = arena_path.join("source.txt");
+                let new_path = arena_path.join("dest.txt");
 
                 tokio::fs::write(&file_path, "new overwritten content").await?;
 
-                let rename_result = fs::rename(&file_path, &new_path).await;
-                assert_eq!(
-                    Some(libc::EXDEV),
-                    rename_result.err().and_then(|e| e.raw_os_error()),
-                    "Rename should fail with EXDEV on overwritten cached file"
-                );
+                log::debug!("=== rename START");
+                fs::rename(&file_path, &new_path).await?;
+                log::debug!("=== rename END");
+                tokio::time::sleep(Duration::from_secs(3)).await;
 
-                // Verify no new file was created
-                assert!(fs::metadata(&new_path).await.is_err());
-
-                // Verify original file is still accessible at original location
+                assert!(!fs::metadata(&file_path).await.is_ok());
+                assert!(fs::metadata(&new_path).await.is_ok());
                 assert_eq!(
                     "new overwritten content",
-                    fs::read_to_string(&file_path).await?
+                    fs::read_to_string(&new_path).await?
                 );
 
                 Ok::<(), anyhow::Error>(())

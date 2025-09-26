@@ -1,3 +1,6 @@
+use std::time::SystemTime;
+use std::os::unix::fs::MetadataExt;
+
 use crate::StorageError;
 use crate::types::PathId;
 use crate::utils::holder::{ByteConversionError, ByteConvertible, NamedType};
@@ -932,9 +935,6 @@ pub struct FileMetadata {
     /// For a local file, ctime reported by the filesystem.
     pub ctime: Option<UnixTime>,
 
-    /// For a local file, crtime reported by the filesystem.
-    pub crtime: Option<UnixTime>,
-
     /// UNIX file mode may include flags not supported by the cache
     /// for a local type.
     pub mode: u32,
@@ -949,6 +949,22 @@ pub struct FileMetadata {
     pub blocks: u64,
 }
 
+impl FileMetadata {
+    pub(crate) fn merged(e: &FileTableEntry, m: &std::fs::Metadata) -> Self {
+        FileMetadata {
+            size: m.len(),
+            mtime: UnixTime::mtime(&m),
+            version: e.version.clone(),
+            ctime: Some(UnixTime::from_system_time(m.created().unwrap_or(SystemTime::UNIX_EPOCH))
+                .unwrap_or(UnixTime::ZERO)),
+            mode: m.mode(),
+            uid: Some(m.uid()),
+            gid: Some(m.gid()),
+            blocks: (m.len() / 512) + if (m.len() % 512) == 0 { 0 } else { 1 },
+        }
+    }
+}
+
 impl From<&FileTableEntry> for FileMetadata {
     fn from(e: &FileTableEntry) -> Self {
         FileMetadata {
@@ -956,7 +972,6 @@ impl From<&FileTableEntry> for FileMetadata {
             mtime: e.mtime,
             version: e.version.clone(),
             ctime: None,
-            crtime: None,
             mode: 0o666,
             uid: None,
             gid: None,
