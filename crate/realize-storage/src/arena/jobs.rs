@@ -204,10 +204,8 @@ impl StorageJobProcessor {
             }
 
             // Set mtime on source (best effort)
-            if let Some(time) = entry.mtime.as_system_time() {
-                let f = File::open(&source)?;
-                let _ = f.set_modified(time);
-            }
+            let f = File::open(&source)?;
+            let _ = f.set_modified(entry.mtime.as_system_time());
         }
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;

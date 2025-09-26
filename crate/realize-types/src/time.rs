@@ -6,7 +6,9 @@ use std::{
 use time_format::TimeStampMs;
 
 /// Time as duration since the start of the UNIX epoch.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, Default,
+)]
 #[serde(transparent)]
 pub struct UnixTime(Duration);
 
@@ -39,8 +41,10 @@ impl UnixTime {
     }
 
     /// Convert to a SystemTime, if possible.
-    pub fn as_system_time(&self) -> Option<SystemTime> {
-        SystemTime::UNIX_EPOCH.checked_add(self.0)
+    pub fn as_system_time(&self) -> SystemTime {
+        SystemTime::UNIX_EPOCH
+            .checked_add(self.0)
+            .unwrap_or(SystemTime::UNIX_EPOCH)
     }
 
     /// Return duration since some other time.

@@ -8,6 +8,7 @@ use realize_network::hostport::HostPort;
 use realize_network::testing::TestingPeers;
 use realize_storage::Blob;
 use realize_storage::Storage;
+use realize_storage::Version;
 use realize_storage::config::StorageConfig;
 use realize_storage::utils::hash;
 use realize_storage::{self, Filesystem};
@@ -189,15 +190,16 @@ impl HouseholdFixture {
         while !cache
             .file_metadata((arena, &path))
             .await?
-            .hash
-            .is_some_and(|h| h == *hash)
+            .version
+            .indexed_hash()
+            .is_some_and(|h| *h == *hash)
             && Instant::now() < deadline
         {
             tokio::time::sleep(delay).await;
         }
         assert_eq!(
-            Some(hash.clone()),
-            cache.file_metadata((arena, &path)).await?.hash,
+            Version::Indexed(hash.clone()),
+            cache.file_metadata((arena, &path)).await?.version,
             "[arena]/{filename} {hash} never appeared the cache of {peer}"
         );
 

@@ -628,6 +628,12 @@ pub enum Version {
     Indexed(Hash),
 }
 
+impl Default for Version {
+    fn default() -> Self {
+        Version::Modified(None)
+    }
+}
+
 impl Version {
     /// Turn the given version into a [Version::Modified]. This can be
     /// called after noticing a local modification to a previously
@@ -910,7 +916,7 @@ impl CacheTableEntry {
 }
 
 /// The metadata of a file.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct FileMetadata {
     /// The size of the file in bytes.
     pub size: u64,
@@ -920,18 +926,96 @@ pub struct FileMetadata {
     /// This is the duration since the start of the UNIX epoch.
     pub mtime: UnixTime,
 
-    /// File version. This might not be available for local files that
-    /// aren't indexed yet.
-    pub hash: Option<Hash>,
+    /// File version in the database.
+    pub version: Version,
+
+    /// For a local file, ctime reported by the filesystem.
+    pub ctime: Option<UnixTime>,
+
+    /// For a local file, crtime reported by the filesystem.
+    pub crtime: Option<UnixTime>,
+
+    /// UNIX file mode may include flags not supported by the cache
+    /// for a local type.
+    pub mode: u32,
+
+    /// For a local file, UNIX user ID
+    pub uid: Option<u32>,
+
+    /// For a local file, UNIX group ID
+    pub gid: Option<u32>,
+
+    /// Number of blocks (512b) used by the file
+    pub blocks: u64,
+}
+
+impl From<&FileTableEntry> for FileMetadata {
+    fn from(e: &FileTableEntry) -> Self {
+        FileMetadata {
+            size: e.size,
+            mtime: e.mtime,
+            version: e.version.clone(),
+            ctime: None,
+            crtime: None,
+            mode: 0o666,
+            uid: None,
+            gid: None,
+            blocks: (e.size / 512) + if (e.size % 512) == 0 { 0 } else { 1 },
+        }
+    }
+}
+
+impl From<FileTableEntry> for FileMetadata {
+    fn from(value: FileTableEntry) -> Self {
+        FileMetadata::from(&value)
+    }
 }
 
 /// The metadata of a directory.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DirMetadata {
-    pub read_only: bool,
-
     /// The modification time of the directory.
     pub mtime: UnixTime,
+
+    /// UNIX file mode may include flags not supported by the cache
+    /// for a local dir.
+    pub mode: u32,
+
+    /// For a local dir, UNIX user ID
+    pub uid: Option<u32>,
+
+    /// For a local dir, UNIX group ID
+    pub gid: Option<u32>,
+}
+
+impl DirMetadata {
+    pub(crate) fn readonly(mtime: UnixTime) -> Self {
+        DirMetadata {
+            mtime: mtime,
+            mode: 0o555,
+            uid: None,
+            gid: None,
+        }
+    }
+    pub(crate) fn modifiable(mtime: UnixTime) -> Self {
+        DirMetadata {
+            mtime: mtime,
+            mode: 0o777,
+            uid: None,
+            gid: None,
+        }
+    }
+}
+
+impl From<&DirtableEntry> for DirMetadata {
+    fn from(e: &DirtableEntry) -> Self {
+        DirMetadata::modifiable(e.mtime)
+    }
+}
+impl From<DirtableEntry> for DirMetadata {
+    fn from(e: DirtableEntry) -> Self {
+        DirMetadata::from(&e)
+    }
 }
 
 /// Unified metadata that can represent either a file or directory.

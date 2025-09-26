@@ -104,10 +104,9 @@ impl ArenaFilesystem {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
-        Ok(DirMetadata {
-            read_only: false,
-            mtime: cache.dir_mtime(&tree, loc.into().into_tree_loc(&cache)?)?,
-        })
+        Ok(DirMetadata::modifiable(
+            cache.dir_mtime(&tree, loc.into().into_tree_loc(&cache)?)?,
+        ))
     }
 
     pub(crate) fn metadata(

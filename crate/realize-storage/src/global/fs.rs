@@ -282,12 +282,7 @@ impl Filesystem {
                         if let Some(IntermediatePath { mtime, .. }) = this.globals.get(&pathid) {
                             Ok((
                                 Inode(pathid.as_u64()),
-                                crate::arena::types::Metadata::Dir(
-                                    crate::arena::types::DirMetadata {
-                                        read_only: true, // Global directories are read-only
-                                        mtime: *mtime,
-                                    },
-                                ),
+                                crate::arena::types::Metadata::Dir(DirMetadata::readonly(*mtime)),
                             ))
                         } else {
                             Err(StorageError::NotFound)
@@ -319,10 +314,7 @@ impl Filesystem {
                 ResolvedLoc::Global(None) => Err(StorageError::NotFound),
                 ResolvedLoc::Global(Some(pathid)) => match this.globals.get(&pathid) {
                     None => Err(StorageError::NotFound),
-                    Some(IntermediatePath { mtime, .. }) => Ok(DirMetadata {
-                        read_only: true,
-                        mtime: *mtime,
-                    }),
+                    Some(IntermediatePath { mtime, .. }) => Ok(DirMetadata::readonly(*mtime)),
                 },
             }
         })
@@ -353,12 +345,7 @@ impl Filesystem {
                                 name.to_string(),
                                 // global inodes and pathids map 1:1
                                 Inode(pathid.as_u64()),
-                                crate::arena::types::Metadata::Dir(
-                                    crate::arena::types::DirMetadata {
-                                        read_only: true, // Global directories are read-only
-                                        mtime: *mtime,
-                                    },
-                                ),
+                                crate::arena::types::Metadata::Dir(DirMetadata::readonly(*mtime)),
                             )
                         })
                         .collect()),
@@ -468,12 +455,9 @@ impl Filesystem {
                 ResolvedLoc::Global(Some(pathid)) => {
                     // For global directories, we need to construct DirMetadata
                     if let Some(IntermediatePath { mtime, .. }) = this.globals.get(&pathid) {
-                        Ok(crate::arena::types::Metadata::Dir(
-                            crate::arena::types::DirMetadata {
-                                read_only: true, // Global directories are read-only
-                                mtime: *mtime,
-                            },
-                        ))
+                        Ok(crate::arena::types::Metadata::Dir(DirMetadata::readonly(
+                            *mtime,
+                        )))
                     } else {
                         Err(StorageError::NotFound)
                     }
@@ -864,7 +848,7 @@ mod tests {
         let fixture = Fixture::setup_with_arenas([]).await?;
 
         let m = fixture.fs.dir_metadata(PathId(1)).await?;
-        assert!(m.read_only);
+        assert_eq!(0o555, m.mode);
         assert_ne!(UnixTime::ZERO, m.mtime);
 
         Ok(())
@@ -876,17 +860,17 @@ mod tests {
         let fixture = Fixture::setup_with_arena(arena).await?;
 
         let root_m = fixture.fs.dir_metadata(PathId(1)).await?;
-        assert!(root_m.read_only);
+        assert_eq!(0o555, root_m.mode);
         assert_ne!(UnixTime::ZERO, root_m.mtime);
 
         let (documents, _) = fixture.fs.lookup((PathId(1), "documents")).await?;
         let documents_m = fixture.fs.dir_metadata(documents).await?;
-        assert!(documents_m.read_only);
+        assert_eq!(0o555, documents_m.mode);
         assert_ne!(UnixTime::ZERO, documents_m.mtime);
 
         let (letters, _) = fixture.fs.lookup((documents, "letters")).await?;
         let letters_m = fixture.fs.dir_metadata(letters).await?;
-        assert!(!letters_m.read_only);
+        assert_eq!(0o777, letters_m.mode); // arena root is writable
         assert_ne!(UnixTime::ZERO, letters_m.mtime);
 
         Ok(())
@@ -952,7 +936,7 @@ mod tests {
         for (name, _, metadata) in entries {
             match metadata {
                 crate::arena::types::Metadata::Dir(dir_meta) => {
-                    assert!(dir_meta.read_only);
+                    assert_eq!(0o555, dir_meta.mode);
                     assert_ne!(dir_meta.mtime, UnixTime::ZERO);
                 }
                 _ => panic!("Expected directory metadata for {}", name),
@@ -971,7 +955,7 @@ mod tests {
         for (name, _, metadata) in entries {
             match metadata {
                 crate::arena::types::Metadata::Dir(dir_meta) => {
-                    assert!(dir_meta.read_only);
+                    assert_eq!(0o555, dir_meta.mode);
                     assert_ne!(dir_meta.mtime, UnixTime::ZERO);
                 }
                 _ => panic!("Expected directory metadata for {}", name),

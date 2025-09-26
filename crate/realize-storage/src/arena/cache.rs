@@ -656,14 +656,7 @@ impl<'a> WritableOpenCache<'a> {
             self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &source_entry)?;
         }
 
-        Ok((
-            dest_pathid,
-            FileMetadata {
-                size: source_entry.size,
-                mtime: source_entry.mtime,
-                hash: source_entry.version.indexed_hash().cloned(),
-            },
-        ))
+        Ok((dest_pathid, source_entry.into()))
     }
 
     pub(crate) fn mkdir<'b, L: Into<TreeLoc<'b>>>(
@@ -682,8 +675,10 @@ impl<'a> WritableOpenCache<'a> {
         Ok((
             pathid,
             DirMetadata {
-                read_only: false,
+                mode: 0o777,
                 mtime,
+                uid: None,
+                gid: None,
             },
         ))
     }
@@ -1309,18 +1304,9 @@ fn metadata(
     if let Some(e) = cache_table.get((pathid, Layer::Default))? {
         Ok(Some(match e.value().parse()? {
             CacheTableEntry::File(file_entry) => {
-                crate::arena::types::Metadata::File(crate::arena::types::FileMetadata {
-                    size: file_entry.size,
-                    mtime: file_entry.mtime,
-                    hash: file_entry.version.indexed_hash().cloned(),
-                })
+                crate::arena::types::Metadata::File(file_entry.into())
             }
-            CacheTableEntry::Dir(dir_entry) => {
-                crate::arena::types::Metadata::Dir(crate::arena::types::DirMetadata {
-                    read_only: false, // Arena directories are writable
-                    mtime: dir_entry.mtime,
-                })
-            }
+            CacheTableEntry::Dir(dir_entry) => crate::arena::types::Metadata::Dir(dir_entry.into()),
         }))
     } else {
         Ok(None)
@@ -2214,7 +2200,7 @@ mod tests {
 
         let metadata = fixture.file_metadata(&file_path).unwrap();
         assert_eq!(metadata.size, 200);
-        assert_eq!(metadata.hash, Some(Hash([2u8; 32])));
+        assert_eq!(metadata.version, Version::Indexed(Hash([2u8; 32])));
         assert_eq!(metadata.mtime, test_time());
 
         let txn = fixture.db.begin_read()?;
@@ -3573,14 +3559,10 @@ mod tests {
         );
 
         // Dest file exists and can be downloaded from peer1, using source path
-        assert_eq!(
-            FileMetadata {
-                size: 6,
-                mtime: test_time(),
-                hash: Some(hash.clone()),
-            },
-            cache.file_metadata(&tree, &dest_path).unwrap()
-        );
+        let m = cache.file_metadata(&tree, &dest_path).unwrap();
+        assert_eq!(6, m.size);
+        assert_eq!(Version::Indexed(hash.clone()), m.version);
+
         let avail = cache
             .remote_availability(&tree, &dest_path, &hash)
             .unwrap()
@@ -3668,15 +3650,10 @@ mod tests {
             HistoryTableEntry::Add(dest_path.clone()),
             last_history_entry,
         );
-
-        assert_eq!(
-            FileMetadata {
-                size: 4,
-                mtime,
-                hash: Some(hash::digest("test")),
-            },
-            cache.file_metadata(&tree, &dest_path).unwrap()
-        );
+        let metadata = cache.file_metadata(&tree, &dest_path).unwrap();
+        assert_eq!(4, metadata.size);
+        assert_eq!(mtime, metadata.mtime);
+        assert_eq!(Version::Indexed(hash::digest("test")), metadata.version);
         assert_eq!(
             FileRealm::Local,
             cache.file_realm(&tree, &blobs, &dest_path).unwrap()
@@ -3824,7 +3801,7 @@ mod tests {
         );
 
         // Verify metadata
-        assert!(!metadata.read_only);
+        assert_eq!(0o777, metadata.mode);
         assert!(metadata.mtime > UnixTime::ZERO);
 
         // Verify directory entry exists in cache by checking dir_mtime
@@ -4078,7 +4055,7 @@ mod tests {
             Some(crate::arena::types::Metadata::File(meta)) => {
                 assert_eq!(meta.size, 1024);
                 assert_eq!(meta.mtime, test_time());
-                assert_eq!(meta.hash, Some(test_hash()));
+                assert_eq!(meta.version, Version::Indexed(test_hash()));
             }
             Some(crate::arena::types::Metadata::Dir(_)) => {
                 panic!("Expected file metadata, got directory metadata");
@@ -4092,7 +4069,7 @@ mod tests {
         let dir_metadata = cache.metadata(&tree, dir_pathid)?;
         match dir_metadata {
             Some(crate::arena::types::Metadata::Dir(meta)) => {
-                assert!(!meta.read_only); // Arena directories are writable
+                assert_eq!(0o777, meta.mode); // Arena directories are writable
                 assert!(meta.mtime >= test_time());
             }
             Some(crate::arena::types::Metadata::File(_)) => {
@@ -4143,7 +4120,7 @@ mod tests {
             crate::arena::types::Metadata::File(meta) => {
                 assert_eq!(meta.size, 1024);
                 assert_eq!(meta.mtime, test_time());
-                assert_eq!(meta.hash, Some(test_hash()));
+                assert_eq!(meta.version, Version::Indexed(test_hash()));
             }
             crate::arena::types::Metadata::Dir(_) => {
                 panic!("Expected file metadata, got directory metadata");
@@ -4153,7 +4130,7 @@ mod tests {
         // Test directory metadata through ArenaCache
         match fixture.metadata(&dir_path)? {
             crate::arena::types::Metadata::Dir(meta) => {
-                assert!(!meta.read_only); // Arena directories are writable
+                assert_eq!(0o777, meta.mode); // Arena directories are writable
                 assert!(meta.mtime >= test_time());
             }
             crate::arena::types::Metadata::File(_) => {
@@ -5541,14 +5518,6 @@ mod tests {
         cache.preindex(&mut tree, &mut blobs, &mut dirty, &path)?;
         assert!(cache.has_local_file(&tree, &path)?);
         assert_eq!(
-            FileMetadata {
-                size: 4,
-                mtime,
-                hash: None
-            },
-            cache.file_metadata(&tree, &path)?
-        );
-        assert_eq!(
             IndexedFile {
                 size: 4,
                 mtime,
@@ -5570,14 +5539,6 @@ mod tests {
             hash.clone(),
         )?;
         assert!(cache.has_local_file(&tree, &path)?);
-        assert_eq!(
-            FileMetadata {
-                size: 4,
-                mtime: mtime,
-                hash: Some(hash.clone()),
-            },
-            cache.file_metadata(&tree, &path)?
-        );
         assert_eq!(
             IndexedFile {
                 size: 4,
@@ -5627,14 +5588,6 @@ mod tests {
         let preindex_mtime = UnixTime::mtime(&childpath.metadata()?);
         cache.preindex(&mut tree, &mut blobs, &mut dirty, &path)?;
         assert_eq!(
-            FileMetadata {
-                size: 8,
-                mtime: preindex_mtime,
-                hash: None
-            },
-            cache.file_metadata(&tree, &path)?
-        );
-        assert_eq!(
             IndexedFile {
                 size: 8,
                 mtime: preindex_mtime,
@@ -5656,14 +5609,6 @@ mod tests {
             reindex_mtime,
             reindex_hash.clone(),
         )?;
-        assert_eq!(
-            FileMetadata {
-                size: 8,
-                mtime: reindex_mtime,
-                hash: Some(reindex_hash.clone()),
-            },
-            cache.file_metadata(&tree, &path)?
-        );
         assert_eq!(
             IndexedFile {
                 size: 8,

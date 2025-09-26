@@ -868,23 +868,22 @@ impl InnerRealizeFs {
     }
 
     fn build_file_attr(&self, pathid: Inode, metadata: &FileMetadata) -> fuser::FileAttr {
-        let uid = nix::unistd::getuid().as_raw();
-        let gid = nix::unistd::getgid().as_raw();
-        let mtime = metadata
-            .mtime
-            .as_system_time()
-            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let uid = metadata.uid.unwrap_or(nix::unistd::getuid().as_raw());
+        let gid = metadata.gid.unwrap_or(nix::unistd::getgid().as_raw());
+        let mtime = metadata.mtime.as_system_time();
+        let ctime = metadata.ctime.map(|t| t.as_system_time()).unwrap_or(mtime);
+        let crtime = metadata.crtime.map(|t| t.as_system_time()).unwrap_or(mtime);
 
         fuser::FileAttr {
             ino: pathid.as_u64(),
             size: metadata.size,
-            blocks: (metadata.size + 511) / 512, // Round up to block size
+            blocks: metadata.blocks,
             atime: mtime,
             mtime: mtime,
-            ctime: mtime,
-            crtime: SystemTime::UNIX_EPOCH,
+            ctime: ctime,
+            crtime: crtime,
             kind: fuser::FileType::RegularFile,
-            perm: 0o0666 & !self.umask,
+            perm: (metadata.mode & 0xffff) as u16 & !self.umask,
             nlink: 1,
             uid,
             gid,
@@ -895,12 +894,9 @@ impl InnerRealizeFs {
     }
 
     fn build_dir_attr(&self, pathid: Inode, metadata: DirMetadata) -> fuser::FileAttr {
-        let uid = nix::unistd::getuid().as_raw();
-        let gid = nix::unistd::getgid().as_raw();
-        let mtime = metadata
-            .mtime
-            .as_system_time()
-            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let uid = metadata.uid.unwrap_or(nix::unistd::getuid().as_raw());
+        let gid = metadata.gid.unwrap_or(nix::unistd::getgid().as_raw());
+        let mtime = metadata.mtime.as_system_time();
 
         fuser::FileAttr {
             ino: pathid.as_u64(),
@@ -911,7 +907,7 @@ impl InnerRealizeFs {
             ctime: mtime,
             crtime: SystemTime::UNIX_EPOCH,
             kind: fuser::FileType::Directory,
-            perm: if metadata.read_only { 0o0555 } else { 0o0777 } & !self.umask,
+            perm: (metadata.mode & 0xffff) as u16 & !self.umask,
             nlink: 1,
             uid,
             gid,
