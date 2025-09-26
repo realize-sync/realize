@@ -1030,7 +1030,10 @@ impl IndexedFile {
 
     /// Check whether `file_path` size and mtime match this entry's.
     pub(crate) fn matches(&self, size: u64, mtime: UnixTime) -> bool {
-        size == self.size && mtime == self.mtime
+        match &self.version {
+            Version::Modified(_) => true,
+            Version::Indexed(_) => size == self.size && mtime == self.mtime,
+        }
     }
 
     pub(crate) fn into_file(self) -> FileTableEntry {

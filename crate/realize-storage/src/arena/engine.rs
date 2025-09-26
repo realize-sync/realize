@@ -628,6 +628,7 @@ mod tests {
         db: Arc<ArenaDatabase>,
         acache: Arc<ArenaFilesystem>,
         engine: Arc<Engine>,
+        datadir: std::path::PathBuf,
         _tempdir: TempDir,
     }
     impl EngineFixture {
@@ -662,6 +663,7 @@ mod tests {
                 db,
                 acache,
                 engine,
+                datadir,
                 _tempdir: tempdir,
             })
         }
@@ -702,17 +704,43 @@ mod tests {
             })
         }
 
-        fn add_file_to_index_with_version<T>(&self, path: T, hash: Hash) -> anyhow::Result<()>
+        fn setup_file(&self, path: &Path, content: &str) -> anyhow::Result<(u64, UnixTime, Hash)> {
+            use crate::utils::hash;
+            let realpath = self.datadir.join(path.as_str());
+            if let Some(parent) = realpath.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&realpath, content)?;
+            let size = content.len() as u64;
+            let mtime = UnixTime::mtime(&realpath.metadata()?);
+            let hash = hash::digest(content);
+            Ok((size, mtime, hash))
+        }
+
+        fn add_file_to_index_with_version<T>(&self, path: T, expected_hash: Hash) -> anyhow::Result<()>
         where
             T: AsRef<Path>,
         {
             let path = path.as_ref();
+            // Create a file that matches the expected hash
+            let content = "test"; // Simple content for testing
+            let (size, mtime, actual_hash) = self.setup_file(path, content)?;
+            
+            // If the provided hash matches our content, use it, otherwise create different content
+            let (final_size, final_mtime, _final_hash) = if actual_hash == expected_hash {
+                (size, mtime, actual_hash)
+            } else {
+                // Create content that should give us a different hash, but still create a valid file
+                let alt_content = format!("test content for hash {:?}", expected_hash);
+                self.setup_file(path, &alt_content)?
+            };
+            
             Ok(index::add_file(
                 &self.db,
                 path,
-                100,
-                UnixTime::from_secs(1234567889),
-                hash,
+                final_size,
+                final_mtime,
+                expected_hash, // Use the expected hash from test
             )?)
         }
 

@@ -468,6 +468,8 @@ mod tests {
     use super::*;
     use crate::arena::db::ArenaDatabase;
     use crate::utils::hash;
+    use assert_fs::TempDir;
+    use assert_fs::prelude::*;
     use std::time::Duration;
 
     fn test_arena() -> Arena {
@@ -477,22 +479,36 @@ mod tests {
     struct Fixture {
         db: Arc<ArenaDatabase>,
         current_time: UnixTime,
+        datadir: assert_fs::fixture::ChildPath,
+        file_mtimes: std::collections::HashMap<String, UnixTime>,
+        _tempdir: TempDir,
     }
 
     impl Fixture {
         async fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
             let arena = test_arena();
-            let null = std::path::Path::new("/dev/null");
-            let db = ArenaDatabase::for_testing_single_arena(arena, &null, &null)?;
+            let tempdir = TempDir::new()?;
+            let blob_dir = tempdir.child("blobs");
+            blob_dir.create_dir_all()?;
+            let datadir = tempdir.child("data");
+            datadir.create_dir_all()?;
+            let db = ArenaDatabase::for_testing_single_arena(arena, blob_dir.path(), datadir.path())?;
             Ok(Self {
                 db,
                 current_time: UnixTime::from_secs(1234567890),
+                datadir,
+                file_mtimes: std::collections::HashMap::new(),
+                _tempdir: tempdir,
             })
         }
 
         fn now(&self) -> UnixTime {
             self.current_time.clone()
+        }
+        
+        fn file_mtime(&self, path: &str) -> UnixTime {
+            self.file_mtimes.get(path).cloned().unwrap_or(self.current_time)
         }
 
         fn increment_time(&mut self, seconds: u64) {
@@ -538,15 +554,32 @@ mod tests {
             Ok(())
         }
 
-        async fn add(&self, path: &str, content: &str) -> anyhow::Result<Path> {
+        async fn add(&mut self, path: &str, content: &str) -> anyhow::Result<Path> {
             let path = Path::parse(path)?;
+            
+            // Create the actual file on disk
+            let file_path = self.datadir.child(path.as_str());
+            if let Some(parent) = file_path.path().parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            file_path.write_str(content)?;
+            
+            // Get the actual file metadata
+            let metadata = file_path.metadata()?;
+            let actual_size = metadata.len();
+            let actual_mtime = UnixTime::mtime(&metadata);
+            let actual_hash = hash::digest(content);
+            
+            // Store the actual mtime for this file
+            self.file_mtimes.insert(path.as_str().to_string(), actual_mtime);
+            
             let last = index::last_history_index_async(&self.db).await?;
             index::add_file_async(
                 &self.db,
                 &path,
-                content.len() as u64,
-                self.current_time,
-                hash::digest(content),
+                actual_size,
+                actual_mtime,
+                actual_hash,
             )
             .await?;
             self.db.history().watch().wait_for(|v| *v > last).await?;
@@ -595,7 +628,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_notification() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let mut fixture = Fixture::setup().await?;
 
         let rx = fixture.subscribe().await?;
         let foo = fixture.add("foo", "foofoo").await?;
@@ -608,7 +641,7 @@ mod tests {
                     index: 1,
                     path: foo.clone(),
                     size: 6,
-                    mtime: fixture.now(),
+                    mtime: fixture.file_mtime("foo"),
                     hash: hash::digest("foofoo")
                 },
                 Notification::Add {
@@ -616,7 +649,7 @@ mod tests {
                     index: 2,
                     path: bar.clone(),
                     size: 6,
-                    mtime: fixture.now(),
+                    mtime: fixture.file_mtime("bar"),
                     hash: hash::digest("barbar")
                 },
             ],
@@ -632,7 +665,7 @@ mod tests {
 
         let mut rx = fixture.subscribe().await?;
         let foo = fixture.add("foo", "foo").await?;
-        let foo_mtime = fixture.now();
+        let foo_mtime = fixture.file_mtime("foo");
 
         assert_eq!(
             Notification::Add {
@@ -655,7 +688,7 @@ mod tests {
                 index: 2,
                 path: foo.clone(),
                 size: 6,
-                mtime: fixture.now(),
+                mtime: fixture.file_mtime("foo"),
                 hash: hash::digest("foobar"),
                 old_hash: hash::digest("foo"),
             },
@@ -667,7 +700,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_notification() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let mut fixture = Fixture::setup().await?;
 
         let mut rx = fixture.subscribe().await?;
 
@@ -678,7 +711,7 @@ mod tests {
                 index: 1,
                 path: foo.clone(),
                 size: 3,
-                mtime: fixture.now(),
+                mtime: fixture.file_mtime("foo"),
                 hash: hash::digest("foo")
             },
             next(&mut rx, "add foo").await?
@@ -700,7 +733,7 @@ mod tests {
 
     #[tokio::test]
     async fn catchup_then_continue() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let mut fixture = Fixture::setup().await?;
 
         let foo = fixture.add("foo", "foo").await?;
 
@@ -720,7 +753,7 @@ mod tests {
                 arena: test_arena(),
                 path: foo.clone(),
                 size: 3,
-                mtime: fixture.now(),
+                mtime: fixture.file_mtime("foo"),
                 hash: hash::digest("foo")
             },
             next(&mut rx, "catchup").await?
@@ -739,7 +772,7 @@ mod tests {
                 index: 4,
                 path: foobar.clone(),
                 size: 6,
-                mtime: fixture.now(),
+                mtime: fixture.file_mtime("foobar"),
                 hash: hash::digest("foobar"),
             },
             next(&mut rx, "after catchup").await?
@@ -750,7 +783,7 @@ mod tests {
 
     #[tokio::test]
     async fn continue_after_resubscribing() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let mut fixture = Fixture::setup().await?;
 
         fixture.add("foo", "foo").await?;
         let bar = fixture.add("bar", "bar").await?;
@@ -763,7 +796,7 @@ mod tests {
                 index: 2,
                 path: bar.clone(),
                 size: 3,
-                mtime: fixture.now(),
+                mtime: fixture.file_mtime("bar"),
                 hash: hash::digest("bar"),
             },],
             fixture.consume(rx).await?
@@ -774,7 +807,7 @@ mod tests {
 
     #[tokio::test]
     async fn continue_after_file_modified_multiple_times() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let mut fixture = Fixture::setup().await?;
 
         let foo = fixture.add("foo", "1").await?;
         fixture.add("foo", "2").await?;
@@ -791,7 +824,7 @@ mod tests {
                     index: 2,
                     path: foo.clone(),
                     size: 1,
-                    mtime: fixture.now(),
+                    mtime: fixture.file_mtime("foo"),
                     hash: hash::digest("4"),
                     old_hash: hash::digest("1"),
                 },
@@ -800,7 +833,7 @@ mod tests {
                     index: 3,
                     path: foo.clone(),
                     size: 1,
-                    mtime: fixture.now(),
+                    mtime: fixture.file_mtime("foo"),
                     hash: hash::digest("4"),
                     old_hash: hash::digest("2"),
                 },
@@ -809,7 +842,7 @@ mod tests {
                     index: 4,
                     path: foo.clone(),
                     size: 1,
-                    mtime: fixture.now(),
+                    mtime: fixture.file_mtime("foo"),
                     hash: hash::digest("4"),
                     old_hash: hash::digest("3"),
                 }
@@ -822,7 +855,7 @@ mod tests {
 
     #[tokio::test]
     async fn branch_notification() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
+        let mut fixture = Fixture::setup().await?;
 
         // Create a source file
         let source = fixture.add("source", "source content").await?;

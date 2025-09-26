@@ -449,11 +449,16 @@ impl<'a> WritableOpenCache<'a> {
             path,
             e.version
         );
-        if e.is_local() {
-            let realpath = path.within(self.datadir());
-            log::debug!("[{}]@local delete {realpath:?}", self.tag);
-            std::fs::remove_file(realpath)?;
+
+        // not using cleanup_local_file to delete unconditionally,
+        // even a locally-modified file as the "unlink" command comes
+        // directly from the user.
+        let realpath = path.within(self.datadir());
+        if realpath.exists() {
+            std::fs::remove_file(&realpath)?;
         }
+        log::debug!("[{}]@local delete {realpath:?}", self.tag);
+
         self.rm_default_file_entry(tree, blobs, dirty, pathid)?;
         history.report_removed(&path, &e.version)?;
 
@@ -544,17 +549,15 @@ impl<'a> WritableOpenCache<'a> {
             }
             CacheTableEntry::File(mut source_entry) => {
                 dest_pathid = tree.setup(dest.borrow())?;
-                let mut old_dest_version: Option<Version> = None;
-                let mut dest_is_local = false;
+                let mut old_dest = None;
                 match default_entry(&self.table, dest_pathid)? {
                     None => {}
                     Some(CacheTableEntry::File(entry)) => {
-                        dest_is_local = entry.is_local();
-                        old_dest_version = Some(entry.version)
+                        old_dest = Some(entry);
                     }
                     Some(CacheTableEntry::Dir(_)) => return Err(StorageError::IsADirectory),
                 };
-                if old_dest_version.is_some() && noreplace {
+                if old_dest.is_some() && noreplace {
                     return Err(StorageError::AlreadyExists);
                 }
 
@@ -570,29 +573,26 @@ impl<'a> WritableOpenCache<'a> {
                     std::fs::rename(&source_realpath, &dest_realpath)?;
 
                     // (over)write new entry in database
-                    let dest_entry = IndexedFile::from(&source_entry).into_file();
-                    self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &dest_entry)?;
+                    self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &source_entry)?;
 
                     // delete older entry in database
                     self.rm_default_file_entry(tree, blobs, dirty, source_pathid)?;
 
-                    history.report_added(&dest_path, old_dest_version.as_ref())?;
+                    history.report_added(&dest_path, old_dest.as_ref().map(|e| &e.version))?;
                     history.report_removed(&source_path, &source_entry.version)?;
                 } else {
                     // (over)write new entry
                     source_entry.kind = FileEntryKind::Branched(source_pathid);
-                    if dest_is_local {
-                        let realpath = dest_path.within(self.datadir());
-                        log::debug!("[{}]@local delete {realpath:?}", self.tag);
-                        std::fs::remove_file(realpath)?;
+                    if let Some(e) = &old_dest {
+                        self.cleanup_local_file(tree, &dest_path, e);
                     }
                     self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &source_entry)?;
 
                     // delete older entry
                     self.rm_default_file_entry(tree, blobs, dirty, source_pathid)?;
 
-                    if let Some(version) = old_dest_version {
-                        history.report_removed(&dest_path, &version)?;
+                    if let Some(e) = &old_dest {
+                        history.report_removed(&dest_path, &e.version)?;
                     }
                     history.request_rename(
                         &source_path,
@@ -776,13 +776,8 @@ impl<'a> WritableOpenCache<'a> {
                 self.tag
             );
             default_modified = true;
-            if let Some(prev) = prev
-                && prev.is_local()
-                && IndexedFile::from(prev).matches_file(path.within(self.datadir()))
-            {
-                let realpath = path.within(self.datadir());
-                log::debug!("[{}]@local delete {realpath:?}", self.tag);
-                std::fs::remove_file(realpath)?;
+            if let Some(prev) = &prev {
+                self.cleanup_local_file(tree, path, prev);
             }
             self.write_default_file_entry(tree, blobs, dirty, pathid, &entry)?;
         }
@@ -932,6 +927,30 @@ impl<'a> WritableOpenCache<'a> {
         Ok(())
     }
 
+    /// Remove any local file if it exists and matches the entry. This is best effort.
+    fn cleanup_local_file<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+        entry: &FileTableEntry,
+    ) {
+        if !entry.is_local() {
+            return;
+        }
+        let path = match tree.backtrack(loc) {
+            Ok(Some(p)) => p,
+            _ => return,
+        };
+        let realpath = path.within(self.datadir());
+        if !IndexedFile::from(entry).matches_file(&realpath) {
+            return;
+        }
+        match std::fs::remove_file(&realpath) {
+            Err(err) => log::debug!("[{}]@local delete {realpath:?} failed: {err:?}", self.tag),
+            Ok(_) => log::debug!("[{}]@local delete {realpath:?}", self.tag),
+        };
+    }
+
     /// Remove a default file entry, leaving peer entries untouched.
     fn rm_default_file_entry(
         &mut self,
@@ -1047,14 +1066,19 @@ impl<'a> WritableOpenCache<'a> {
         blobs: &mut WritableOpenBlob,
         dirty: &mut WritableOpenDirty,
         loc: L,
-        size: u64,
-        mtime: UnixTime,
     ) -> Result<PathId, StorageError> {
-        let pathid = tree.setup(loc)?;
+        let loc = loc.into();
+        let pathid = tree.setup(loc.borrow())?;
+        let path = tree.backtrack(loc)?.ok_or(StorageError::IsADirectory)?;
         let version =
             Version::modification_of(default_file_entry(&self.table, pathid)?.map(|e| e.version));
-
-        let entry = FileTableEntry::new(size, mtime, version, FileEntryKind::Local);
+        let realpath = path.within(self.datadir());
+        let m = match realpath.metadata() {
+            Ok(m) => m,
+            Err(_) => return Err(StorageError::LocalFileMismatch),
+        };
+        let entry =
+            FileTableEntry::new(m.len(), UnixTime::mtime(&m), version, FileEntryKind::Local);
         self.write_default_file_entry(tree, blobs, dirty, pathid, &entry)?;
         Ok(pathid)
     }
@@ -1074,9 +1098,16 @@ impl<'a> WritableOpenCache<'a> {
         let pathid = tree.setup(loc.borrow())?;
         if let Some(path) = tree.backtrack(loc.borrow())? {
             let old_version = default_file_entry(&self.table, pathid)?.map(|e| e.version);
-            let entry =
-                FileTableEntry::new(size, mtime, Version::Indexed(hash), FileEntryKind::Local);
-            self.write_default_file_entry(tree, blobs, dirty, pathid, &entry)?;
+            let entry = IndexedFile {
+                version: Version::Indexed(hash),
+                mtime,
+                size,
+            };
+            let realpath = path.within(self.datadir());
+            if !entry.matches_file(&realpath) {
+                return Err(StorageError::LocalFileMismatch);
+            }
+            self.write_default_file_entry(tree, blobs, dirty, pathid, &entry.into_file())?;
             history.report_added(&path, old_version.as_ref())?;
         }
         Ok(pathid)
@@ -1638,7 +1669,6 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
-    use std::time::Duration;
     use std::u64;
 
     const TEST_TIME: u64 = 1234567890;
@@ -1661,6 +1691,20 @@ mod tests {
 
     fn later_time() -> UnixTime {
         UnixTime::from_secs(TEST_TIME + 1)
+    }
+
+    /// Helper function to create a test file with specific content.
+    /// Returns (size, actual_mtime, hash) for use in index() calls.
+    fn create_test_file(
+        childpath: &ChildPath,
+        contents: &str,
+    ) -> anyhow::Result<(u64, UnixTime, Hash)> {
+        childpath.write_str(contents)?;
+        let size = contents.len() as u64;
+        let hash = hash::digest(contents);
+        let actual_mtime = UnixTime::mtime(&childpath.metadata()?);
+
+        Ok((size, actual_mtime, hash))
     }
 
     struct Fixture {
@@ -3191,6 +3235,7 @@ mod tests {
     async fn file_realm() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let testfile = Path::parse("testfile")?;
+        let childpath = fixture.datadir.child("testfile");
 
         fixture.add_to_cache(&testfile, 5, test_time())?;
 
@@ -3204,6 +3249,9 @@ mod tests {
             cache.file_realm(&tree, &blobs, &testfile)?,
         );
 
+        let contents = "testfile content for file_realm";
+        let (size, mtime, hash) = create_test_file(&childpath, contents)?;
+
         let mut history = txn.write_history()?;
         let mut dirty = txn.write_dirty()?;
         cache.index(
@@ -3212,9 +3260,9 @@ mod tests {
             &mut history,
             &mut dirty,
             &testfile,
-            5,
-            test_time(),
-            test_hash(),
+            size,
+            mtime,
+            hash,
         )?;
 
         assert_eq!(
@@ -3242,38 +3290,44 @@ mod tests {
     async fn all_indexed_with_entries() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
 
-        // Create test data
+        // Create test files with actual content
         let path1 = Path::parse("test1.txt")?;
         let path2 = Path::parse("dir/test2.txt")?;
         let path3 = Path::parse("dir/subdir/test3.txt")?;
 
-        let hash1 = Hash([0x11; 32]);
-        let hash2 = Hash([0x22; 32]);
-        let hash3 = Hash([0x33; 32]);
+        let childpath1 = fixture.datadir.child("test1.txt");
+        let childpath2 = fixture.datadir.child("dir/test2.txt");
+        let childpath3 = fixture.datadir.child("dir/subdir/test3.txt");
 
-        let mtime = test_time();
+        let contents1 = "content for test1.txt file";
+        let contents2 = "different content for test2.txt file";
+        let contents3 = "unique content for test3.txt file in subdir";
+
+        let (size1, mtime1, hash1) = create_test_file(&childpath1, contents1)?;
+        let (size2, mtime2, hash2) = create_test_file(&childpath2, contents2)?;
+        let (size3, mtime3, hash3) = create_test_file(&childpath3, contents3)?;
 
         let indexed_file1 = IndexedFile {
             version: Version::Indexed(hash1.clone()),
-            mtime,
-            size: 100,
+            mtime: mtime1,
+            size: size1,
         };
 
         let indexed_file2 = IndexedFile {
             version: Version::Indexed(hash2.clone()),
-            mtime,
-            size: 200,
+            mtime: mtime2,
+            size: size2,
         };
 
         let indexed_file3 = IndexedFile {
             version: Version::Indexed(hash3.clone()),
-            mtime,
-            size: 300,
+            mtime: mtime3,
+            size: size3,
         };
 
         // Add some regular cache entries (should not appear in all_indexed)
-        fixture.add_to_cache(&Path::parse("regular.txt")?, 500, mtime)?;
-        fixture.add_to_cache(&path1, 500, mtime)?;
+        fixture.add_to_cache(&Path::parse("regular.txt")?, 500, test_time())?;
+        fixture.add_to_cache(&path1, 500, test_time())?;
 
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
@@ -3429,13 +3483,13 @@ mod tests {
     async fn unlink_indexed() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena())?;
         let file_path = Path::parse("file.txt")?;
-        let mtime = test_time();
+        let childpath = fixture.datadir.child("file.txt");
+        childpath.write_str("test")?;
+        let mtime = UnixTime::mtime(&childpath.metadata()?);
         let hash = hash::digest("test");
 
         fixture.add_to_cache(&file_path, 100, mtime)?;
-        index::add_file(&fixture.db, &file_path, 200, mtime, hash.clone())?;
-        let childpath = fixture.datadir.child("file.txt");
-        childpath.write_str("test")?;
+        index::add_file(&fixture.db, &file_path, 4, mtime, hash.clone())?; // actual size of "test"
 
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree()?;
@@ -4960,8 +5014,12 @@ mod tests {
     #[test]
     fn index() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let mtime = UnixTime::from_secs(1234567890);
         let path = Path::parse("foo/bar.txt")?;
+        let childpath = fixture.datadir.child("foo/bar.txt");
+
+        // Create file with specific content that produces our desired hash
+        let contents = "test content for index"; // This will produce a different hash than [0xfa; 32]
+        let (size, mtime, hash) = create_test_file(&childpath, contents)?;
 
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
@@ -4975,16 +5033,16 @@ mod tests {
             &mut history,
             &mut dirty,
             &path,
-            100,
+            size,
             mtime,
-            Hash([0xfa; 32]),
+            hash.clone(),
         )?;
 
         assert!(cache.has_local_file(&tree, &path)?);
         let entry = cache.indexed(&tree, &path)?.unwrap();
-        assert_eq!(entry.size, 100);
+        assert_eq!(entry.size, size);
         assert_eq!(entry.mtime, mtime);
-        assert_eq!(entry.version, Version::Indexed(Hash([0xfa; 32])));
+        assert_eq!(entry.version, Version::Indexed(hash));
 
         Ok(())
     }
@@ -4992,9 +5050,12 @@ mod tests {
     #[test]
     fn replace_file_in_index() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let mtime1 = UnixTime::from_secs(1234567890);
-        let mtime2 = UnixTime::from_secs(1234567891);
         let path = Path::parse("foo/bar.txt")?;
+        let childpath = fixture.datadir.child("foo/bar.txt");
+
+        // Create first file
+        let contents1 = "first version";
+        let (size1, mtime1, hash1) = create_test_file(&childpath, contents1)?;
 
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
@@ -5002,33 +5063,39 @@ mod tests {
         let mut blobs = txn.write_blobs()?;
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
+
         cache.index(
             &mut tree,
             &mut blobs,
             &mut history,
             &mut dirty,
             &path,
-            100,
+            size1,
             mtime1,
-            Hash([0xfa; 32]),
+            hash1,
         )?;
+
+        // Replace with second file
+        let contents2 = "second version with different content";
+        let (size2, mtime2, hash2) = create_test_file(&childpath, contents2)?;
+
         cache.index(
             &mut tree,
             &mut blobs,
             &mut history,
             &mut dirty,
             &path,
-            200,
+            size2,
             mtime2,
-            Hash([0x07; 32]),
+            hash2.clone(),
         )?;
 
         // Verify the file was replaced
         assert!(cache.has_local_file(&tree, &path)?);
         let entry = cache.indexed(&tree, &path)?.unwrap();
-        assert_eq!(entry.size, 200);
+        assert_eq!(entry.size, size2);
         assert_eq!(entry.mtime, mtime2);
-        assert_eq!(entry.version, Version::Indexed(Hash([0x07; 32])));
+        assert_eq!(entry.version, Version::Indexed(hash2));
 
         Ok(())
     }
@@ -5036,8 +5103,12 @@ mod tests {
     #[test]
     fn is_indexed() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let mtime = UnixTime::from_secs(1234567890);
         let path = Path::parse("foo.txt")?;
+        let childpath = fixture.datadir.child("foo.txt");
+
+        // Create file
+        let contents = "content for is_indexed test";
+        let (size, mtime, hash) = create_test_file(&childpath, contents)?;
 
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
@@ -5051,9 +5122,9 @@ mod tests {
             &mut history,
             &mut dirty,
             &path,
-            100,
+            size,
             mtime,
-            Hash([0xfa; 32]),
+            hash,
         )?;
 
         assert!(cache.has_local_file(&tree, &path)?);
@@ -5066,9 +5137,13 @@ mod tests {
     #[test]
     fn indexed() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let mtime = UnixTime::from_secs(1234567890);
         let path = Path::parse("foo/bar")?;
-        let hash = Hash([0xfa; 32]);
+        let childpath = fixture.datadir.child("foo/bar");
+
+        // Create file
+        let contents = "content for indexed test";
+        let (size, mtime, hash) = create_test_file(&childpath, contents)?;
+
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
         let mut tree = txn.write_tree()?;
@@ -5081,13 +5156,13 @@ mod tests {
             &mut history,
             &mut dirty,
             &path,
-            100,
+            size,
             mtime,
             hash.clone(),
         )?;
 
         let entry = cache.indexed(&tree, &path)?.unwrap();
-        assert_eq!(entry.size, 100);
+        assert_eq!(entry.size, size);
         assert_eq!(entry.mtime, mtime);
         assert_eq!(entry.version, Version::Indexed(hash));
 
@@ -5097,8 +5172,12 @@ mod tests {
     #[test]
     fn remove_file_from_index_recursively() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let mtime = UnixTime::from_secs(1234567890);
         let path = Path::parse("foo/bar.txt")?;
+        let childpath = fixture.datadir.child("foo/bar.txt");
+
+        // Create file
+        let contents = "content for remove_file_from_index_recursively test";
+        let (size, mtime, hash) = create_test_file(&childpath, contents)?;
 
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
@@ -5113,9 +5192,9 @@ mod tests {
             &mut history,
             &mut dirty,
             &path,
-            100,
+            size,
             mtime,
-            Hash([0xfa; 32]),
+            hash,
         )?;
 
         cache.remove_from_index_recursively(
@@ -5134,7 +5213,17 @@ mod tests {
     #[test]
     fn remove_dir_from_index_recursively() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let mtime = UnixTime::from_secs(1234567890);
+
+        // Create two files in foo/ directory
+        let path1 = Path::parse("foo/bar1.txt")?;
+        let path2 = Path::parse("foo/bar2.txt")?;
+        let childpath1 = fixture.datadir.child("foo/bar1.txt");
+        let childpath2 = fixture.datadir.child("foo/bar2.txt");
+
+        let contents1 = "content for bar1.txt";
+        let contents2 = "content for bar2.txt";
+        let (size1, mtime1, hash1) = create_test_file(&childpath1, contents1)?;
+        let (size2, mtime2, hash2) = create_test_file(&childpath2, contents2)?;
 
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
@@ -5148,20 +5237,20 @@ mod tests {
             &mut blobs,
             &mut history,
             &mut dirty,
-            Path::parse("foo/bar1.txt")?,
-            100,
-            mtime,
-            Hash([0xfa; 32]),
+            path1.clone(),
+            size1,
+            mtime1,
+            hash1,
         )?;
         cache.index(
             &mut tree,
             &mut blobs,
             &mut history,
             &mut dirty,
-            Path::parse("foo/bar2.txt")?,
-            100,
-            mtime,
-            Hash([0xfa; 32]),
+            path2.clone(),
+            size2,
+            mtime2,
+            hash2,
         )?;
 
         cache.remove_from_index_recursively(
@@ -5172,8 +5261,8 @@ mod tests {
             Path::parse("foo")?,
         )?;
 
-        assert!(!cache.has_local_file(&tree, Path::parse("foo/bar1.txt")?)?);
-        assert!(!cache.has_local_file(&tree, Path::parse("foo/bar2.txt")?)?);
+        assert!(!cache.has_local_file(&tree, path1)?);
+        assert!(!cache.has_local_file(&tree, path2)?);
 
         Ok(())
     }
@@ -5181,9 +5270,12 @@ mod tests {
     #[tokio::test]
     async fn index_marks_dirty_and_adds_history() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let mtime = UnixTime::from_secs(1234567890);
         let path = Path::parse("foo/bar.txt")?;
-        let hash = Hash([0xfa; 32]);
+        let childpath = fixture.datadir.child("foo/bar.txt");
+
+        // Create file
+        let contents = "content for index_marks_dirty_and_adds_history test";
+        let (size, mtime, hash) = create_test_file(&childpath, contents)?;
 
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
@@ -5202,7 +5294,7 @@ mod tests {
             &mut history,
             &mut dirty,
             &path,
-            100,
+            size,
             mtime,
             hash.clone(),
         )?;
@@ -5229,11 +5321,12 @@ mod tests {
     #[test]
     fn replace_indexed_marks_dirty_and_adds_history() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let mtime1 = UnixTime::from_secs(1234567890);
-        let mtime2 = UnixTime::from_secs(1234567891);
         let path = Path::parse("foo/bar.txt")?;
-        let hash1 = Hash([0xfa; 32]);
-        let hash2 = Hash([0x07; 32]);
+        let childpath = fixture.datadir.child("foo/bar.txt");
+
+        // Create initial file
+        let contents1 = "initial content";
+        let (size1, mtime1, hash1) = create_test_file(&childpath, contents1)?;
 
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
@@ -5252,14 +5345,17 @@ mod tests {
             &mut history,
             &mut dirty,
             &path,
-            100,
+            size1,
             mtime1,
             hash1.clone(),
         )?;
 
         clear_dirty(&mut dirty)?;
 
-        // Replace the file
+        // Replace the file with new content
+        let contents2 = "replaced content with different data";
+        let (size2, mtime2, hash2) = create_test_file(&childpath, contents2)?;
+
         let history_start = history_start(&history)?;
         cache.index(
             &mut tree,
@@ -5267,7 +5363,7 @@ mod tests {
             &mut history,
             &mut dirty,
             &path,
-            200,
+            size2,
             mtime2,
             hash2.clone(),
         )?;
@@ -5291,9 +5387,12 @@ mod tests {
     #[test]
     fn remove_from_index_marks_dirty_and_adds_history() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let mtime = UnixTime::from_secs(1234567890);
         let path = Path::parse("foo/bar.txt")?;
-        let hash = Hash([0xfa; 32]);
+        let childpath = fixture.datadir.child("foo/bar.txt");
+
+        // Create file
+        let contents = "content for remove_from_index_marks_dirty_and_adds_history test";
+        let (size, mtime, hash) = create_test_file(&childpath, contents)?;
 
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
@@ -5309,7 +5408,7 @@ mod tests {
             &mut history,
             &mut dirty,
             &path,
-            100,
+            size,
             mtime,
             hash.clone(),
         )?;
@@ -5339,7 +5438,6 @@ mod tests {
     #[test]
     fn remove_from_index_recursively_marks_dirty_and_adds_history() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let mtime = UnixTime::from_secs(1234567890);
 
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
@@ -5351,8 +5449,13 @@ mod tests {
         // Add files in a directory
         let path1 = Path::parse("foo/bar1.txt")?;
         let path2 = Path::parse("foo/bar2.txt")?;
-        let hash1 = Hash([0xfa; 32]);
-        let hash2 = Hash([0xfb; 32]);
+        let childpath1 = fixture.datadir.child("foo/bar1.txt");
+        let childpath2 = fixture.datadir.child("foo/bar2.txt");
+
+        let contents1 = "content for bar1 in recursive test";
+        let contents2 = "content for bar2 in recursive test";
+        let (size1, mtime1, hash1) = create_test_file(&childpath1, contents1)?;
+        let (size2, mtime2, hash2) = create_test_file(&childpath2, contents2)?;
 
         let pathid1 = cache.index(
             &mut tree,
@@ -5360,8 +5463,8 @@ mod tests {
             &mut history,
             &mut dirty,
             &path1,
-            100,
-            mtime,
+            size1,
+            mtime1,
             hash1.clone(),
         )?;
         let pathid2 = cache.index(
@@ -5370,8 +5473,8 @@ mod tests {
             &mut history,
             &mut dirty,
             &path2,
-            200,
-            mtime,
+            size2,
+            mtime2,
             hash2.clone(),
         )?;
 
@@ -5410,8 +5513,8 @@ mod tests {
     #[test]
     fn preindex_new_then_index() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let mtime = UnixTime::from_secs(1234567890);
         let path = Path::parse("foo/bar.txt")?;
+        let childpath = fixture.datadir.child("foo/bar.txt");
 
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
@@ -5420,12 +5523,14 @@ mod tests {
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
 
+        childpath.write_str("test")?;
+        let mtime = UnixTime::mtime(&childpath.metadata()?);
         let history_start = history_start(&history)?;
-        cache.preindex(&mut tree, &mut blobs, &mut dirty, &path, 100, mtime)?;
+        cache.preindex(&mut tree, &mut blobs, &mut dirty, &path)?;
         assert!(cache.has_local_file(&tree, &path)?);
         assert_eq!(
             FileMetadata {
-                size: 100,
+                size: 4,
                 mtime,
                 hash: None
             },
@@ -5433,7 +5538,7 @@ mod tests {
         );
         assert_eq!(
             IndexedFile {
-                size: 100,
+                size: 4,
                 mtime,
                 version: Version::Modified(None)
             },
@@ -5441,7 +5546,6 @@ mod tests {
         );
         assert_eq!(0, collect_history_entries(&history, history_start)?.len());
 
-        let index_mtime = mtime.plus(Duration::from_secs(1));
         let hash = hash::digest("test");
         cache.index(
             &mut tree,
@@ -5449,23 +5553,23 @@ mod tests {
             &mut history,
             &mut dirty,
             &path,
-            150,
-            index_mtime,
+            4,     // actual file size
+            mtime, // actual file mtime
             hash.clone(),
         )?;
         assert!(cache.has_local_file(&tree, &path)?);
         assert_eq!(
             FileMetadata {
-                size: 150,
-                mtime: index_mtime,
+                size: 4,
+                mtime: mtime,
                 hash: Some(hash.clone()),
             },
             cache.file_metadata(&tree, &path)?
         );
         assert_eq!(
             IndexedFile {
-                size: 150,
-                mtime: index_mtime,
+                size: 4,
+                mtime: mtime,
                 version: Version::Indexed(hash.clone())
             },
             cache.indexed(&tree, &path)?.unwrap()
@@ -5483,6 +5587,7 @@ mod tests {
     fn preindex_existing_then_reindex() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let path = Path::parse("foo/bar.txt")?;
+        let childpath = fixture.datadir.child("foo/bar.txt");
 
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
@@ -5491,32 +5596,27 @@ mod tests {
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
 
-        let initial_hash = hash::digest("hash1");
-        let initial_mtime = UnixTime::from_secs(1234567890);
+        childpath.write_str("initial")?;
+        let initial_hash = hash::digest("initial");
+        let initial_mtime = UnixTime::mtime(&childpath.metadata()?);
         cache.index(
             &mut tree,
             &mut blobs,
             &mut history,
             &mut dirty,
             &path,
-            100,
+            7,
             initial_mtime,
             initial_hash.clone(),
         )?;
 
         let history_start = history_start(&history)?;
-        let preindex_mtime = initial_mtime.plus(Duration::from_secs(1));
-        cache.preindex(
-            &mut tree,
-            &mut blobs,
-            &mut dirty,
-            &path,
-            200,
-            preindex_mtime,
-        )?;
+        childpath.write_str("modified")?;
+        let preindex_mtime = UnixTime::mtime(&childpath.metadata()?);
+        cache.preindex(&mut tree, &mut blobs, &mut dirty, &path)?;
         assert_eq!(
             FileMetadata {
-                size: 200,
+                size: 8,
                 mtime: preindex_mtime,
                 hash: None
             },
@@ -5524,7 +5624,7 @@ mod tests {
         );
         assert_eq!(
             IndexedFile {
-                size: 200,
+                size: 8,
                 mtime: preindex_mtime,
                 version: Version::Modified(Some(initial_hash.clone()))
             },
@@ -5532,21 +5632,21 @@ mod tests {
         );
         assert_eq!(0, collect_history_entries(&history, history_start)?.len());
 
-        let reindex_mtime = initial_mtime.plus(Duration::from_secs(2));
-        let reindex_hash = hash::digest("hash2");
+        let reindex_mtime = preindex_mtime;
+        let reindex_hash = hash::digest("modified");
         cache.index(
             &mut tree,
             &mut blobs,
             &mut history,
             &mut dirty,
             &path,
-            300,
+            8,
             reindex_mtime,
             reindex_hash.clone(),
         )?;
         assert_eq!(
             FileMetadata {
-                size: 300,
+                size: 8,
                 mtime: reindex_mtime,
                 hash: Some(reindex_hash.clone()),
             },
@@ -5554,7 +5654,7 @@ mod tests {
         );
         assert_eq!(
             IndexedFile {
-                size: 300,
+                size: 8,
                 mtime: reindex_mtime,
                 version: Version::Indexed(reindex_hash.clone())
             },
@@ -5582,31 +5682,23 @@ mod tests {
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
 
-        let initial_hash = hash::digest("hash1");
-        let initial_mtime = UnixTime::from_secs(1234567890);
         childpath.write_str("hash1")?;
+        let initial_hash = hash::digest("hash1");
+        let initial_mtime = UnixTime::mtime(&childpath.metadata()?);
         cache.index(
             &mut tree,
             &mut blobs,
             &mut history,
             &mut dirty,
             &path,
-            100,
+            5, // actual size of "hash1"
             initial_mtime,
             initial_hash.clone(),
         )?;
 
         let history_start = history_start(&history)?;
-        let preindex_mtime = initial_mtime.plus(Duration::from_secs(1));
         childpath.write_str("hash2")?;
-        cache.preindex(
-            &mut tree,
-            &mut blobs,
-            &mut dirty,
-            &path,
-            200,
-            preindex_mtime,
-        )?;
+        cache.preindex(&mut tree, &mut blobs, &mut dirty, &path)?;
         assert_eq!(0, collect_history_entries(&history, history_start)?.len());
 
         cache

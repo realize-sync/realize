@@ -672,7 +672,7 @@ impl RealWatcherWorker {
         {
             return Ok(());
         }
-        index::preindex_async(&self.db, path, size, mtime).await?;
+        index::preindex_async(&self.db, path).await?;
         debouncer.spawn_limited(path.clone(), size > 0, {
             let db = self.db.clone();
             let path = path.clone();
@@ -746,7 +746,6 @@ mod tests {
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
-    use realize_types::Hash;
     use std::os::unix::fs::PermissionsExt as _;
     use std::time::Duration;
 
@@ -1186,17 +1185,46 @@ mod tests {
         let fixture = Fixture::setup().await?;
         let db = &fixture.db;
 
+        // Create actual files on disk and add them to index
         let foo = realize_types::Path::parse("foo")?;
         let bar = realize_types::Path::parse("a/b/c/bar")?;
-        let mtime = UnixTime::from_secs(1234567890);
-        index::add_file_async(db, &foo, 4, mtime, Hash([1; 32])).await?;
-        index::add_file_async(db, &bar, 4, mtime, Hash([2; 32])).await?;
+        let foo_child = fixture.root.child("foo");
+        foo_child.write_str("test")?;
+        let bar_child = fixture.root.child("a/b/c/bar");
+        bar_child.write_str("test")?;
 
+        // Add files to index with their real metadata
+        index::add_file_async(
+            db,
+            &foo,
+            4,
+            UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
+            hash::digest("test".as_bytes()),
+        )
+        .await?;
+        index::add_file_async(
+            db,
+            &bar,
+            4,
+            UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
+            hash::digest("test".as_bytes()),
+        )
+        .await?;
+
+        // Verify files are in index
+        assert!(index::has_file_async(db, &foo).await?);
+        assert!(index::has_file_async(db, &bar).await?);
+
+        // Delete the files from disk (simulating external deletion)
+        fs::remove_file(foo_child.path()).await?;
+        fs::remove_dir_all(fixture.root.child("a").path()).await?;
+
+        // Now run the initial scan - it should detect the files are gone and remove them
         let _watcher = fixture.scan_and_watch().await?;
 
         fixture.wait_for_history_event(4).await?;
         assert!(!index::has_file_async(db, &foo).await?);
-        assert!(!index::has_file_async(db, &foo).await?);
+        assert!(!index::has_file_async(db, &bar).await?);
 
         Ok(())
     }

@@ -1367,39 +1367,49 @@ impl Blob {
     }
 
     /// Realize the blob, that is, move the file into the data
-    /// directory, and return the file handle.
+    /// directory, and return the file handle so that the file content
+    /// can be modified.
     pub async fn realize(mut self) -> Result<(std::path::PathBuf, tokio::fs::File), StorageError> {
-        let txn = self.db.begin_write()?;
-        let source: PathBuf;
-        let dest: PathBuf;
-        {
-            let mut tree = txn.write_tree()?;
-            let mut blobs = txn.write_blobs()?;
-            let mut cache = txn.write_cache()?;
-            let mut dirty = txn.write_dirty()?;
-            let mut history = txn.write_history()?;
-            (source, dest) = cache.realize(
-                &mut tree,
-                &mut blobs,
-                &mut dirty,
-                &mut history,
-                self.info.pathid,
-            )?;
-        }
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let pathid = self.info.pathid;
+        let db = Arc::clone(&self.db);
         self.file.flush().await?;
         self.file.sync_all().await?;
-        std::fs::rename(&source, &dest)?;
-        if let Err(err) = txn.commit() {
-            let _ = std::fs::rename(&dest, &source);
-            return Err(err);
-        }
 
-        // Since Blob implements Drop, we can't just take file out.
-        // Cloning works in this case, as the first file gets dropped
-        // right after.
+        let dest = tokio::task::spawn_blocking(move || {
+            let txn = db.begin_write()?;
+            let source: PathBuf;
+            let dest: PathBuf;
+            {
+                let mut tree = txn.write_tree()?;
+                let mut blobs = txn.write_blobs()?;
+                let mut cache = txn.write_cache()?;
+                let mut dirty = txn.write_dirty()?;
+                let mut history = txn.write_history()?;
+                (source, dest) =
+                    cache.realize(&mut tree, &mut blobs, &mut dirty, &mut history, pathid)?;
+
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::rename(&source, &dest)?;
+
+                // Mark it locally modified right away, since this call is
+                // meant to prepare a file for local modifications.
+                cache.preindex(&mut tree, &mut blobs, &mut dirty, self.info.pathid)?;
+            }
+
+            if let Err(err) = txn.commit() {
+                let _ = std::fs::rename(&dest, &source);
+                return Err(err);
+            }
+
+            // Since Blob implements Drop, we can't just take file out.
+            // Cloning works in this case, as the first file gets dropped
+            // right after.
+            Ok(dest)
+        })
+        .await??;
+
         Ok((dest, self.file.try_clone().await?))
     }
 }
@@ -3293,12 +3303,12 @@ mod tests {
             (m_from_path.rdev(), m_from_path.ino())
         );
 
-        // An entry was added to the index with the old hash
+        // An entry was added to the index with the old hash as base
         let txn = fixture.begin_read()?;
         let cache = txn.read_cache()?;
         let tree = txn.read_tree()?;
         let indexed = cache.indexed(&tree, &path)?.unwrap();
-        assert_eq!(Version::Indexed(hash), indexed.version);
+        assert_eq!(Version::Modified(Some(hash)), indexed.version);
 
         Ok(())
     }

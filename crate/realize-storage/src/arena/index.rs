@@ -95,6 +95,12 @@ pub(crate) fn branch<'b, L1: Into<TreeLoc<'b>>, L2: Into<TreeLoc<'b>>>(
         if let Some(parent) = dest_realpath.parent() {
             std::fs::create_dir_all(parent)?;
         }
+
+        if dest_realpath.exists() {
+            return Err(StorageError::AlreadyExists);
+        }
+        std::fs::hard_link(source_realpath, dest_realpath)?;
+
         cache.index(
             tree,
             blobs,
@@ -106,10 +112,6 @@ pub(crate) fn branch<'b, L1: Into<TreeLoc<'b>>, L2: Into<TreeLoc<'b>>>(
             hash.clone(),
         )?;
 
-        if dest_realpath.exists() {
-            return Err(StorageError::AlreadyExists);
-        }
-        std::fs::hard_link(source_realpath, dest_realpath)?;
         return Ok(true);
     }
 
@@ -158,9 +160,16 @@ pub(crate) fn rename<'b, 'c, L1: Into<TreeLoc<'b>>, L2: Into<TreeLoc<'c>>>(
         if let Some(parent) = dest_realpath.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // This makes sure the destination is added before the
-        // source is deleted, so it won't be gone entirely from
-        // peers during the transition.
+
+        if dest_realpath.exists() {
+            return Err(StorageError::AlreadyExists);
+        }
+
+        std::fs::rename(source_realpath, dest_realpath)?;
+
+        // Add to index first, then remove. This order makes sure the
+        // destination is added before the source is deleted, so it
+        // won't be gone entirely from peers during the transition.
         cache.index(
             tree,
             blobs,
@@ -172,10 +181,7 @@ pub(crate) fn rename<'b, 'c, L1: Into<TreeLoc<'b>>, L2: Into<TreeLoc<'c>>>(
             hash.clone(),
         )?;
         cache.remove_from_index(tree, blobs, history, dirty, source)?;
-        if dest_realpath.exists() {
-            return Err(StorageError::AlreadyExists);
-        }
-        std::fs::rename(source_realpath, dest_realpath)?;
+
         return Ok(true);
     }
 
@@ -268,7 +274,6 @@ pub async fn has_matching_file_async(
 ) -> Result<bool, StorageError> {
     let db = Arc::clone(db);
     let path = path.clone();
-    let mtime = mtime.clone();
 
     task::spawn_blocking(move || has_matching_file(&db, &path, size, mtime)).await?
 }
@@ -277,8 +282,6 @@ pub async fn has_matching_file_async(
 pub(crate) fn preindex(
     db: &Arc<ArenaDatabase>,
     path: &realize_types::Path,
-    size: u64,
-    mtime: UnixTime,
 ) -> Result<(), StorageError> {
     let txn = db.begin_write()?;
     {
@@ -287,7 +290,7 @@ pub(crate) fn preindex(
         let mut dirty = txn.write_dirty()?;
         let mut blobs = txn.write_blobs()?;
 
-        cache.preindex(&mut tree, &mut blobs, &mut dirty, path, size, mtime)?;
+        cache.preindex(&mut tree, &mut blobs, &mut dirty, path)?;
     }
 
     txn.commit()?;
@@ -298,14 +301,11 @@ pub(crate) fn preindex(
 pub async fn preindex_async(
     db: &Arc<ArenaDatabase>,
     path: &realize_types::Path,
-    size: u64,
-    mtime: UnixTime,
 ) -> Result<(), StorageError> {
     let db = Arc::clone(db);
     let path = path.clone();
-    let mtime = mtime.clone();
 
-    task::spawn_blocking(move || preindex(&db, &path, size, mtime)).await?
+    task::spawn_blocking(move || preindex(&db, &path)).await?
 }
 
 /// Add a file entry with the given values. Replace one if it exists.
@@ -350,7 +350,6 @@ pub async fn add_file_async(
 ) -> Result<(), StorageError> {
     let db = Arc::clone(db);
     let path = path.clone();
-    let mtime = mtime.clone();
 
     task::spawn_blocking(move || add_file(&db, &path, size, mtime, hash)).await?
 }
@@ -363,34 +362,11 @@ pub(crate) fn add_file_if_matches(
     mtime: UnixTime,
     hash: Hash,
 ) -> Result<bool, StorageError> {
-    if let Ok(m) = path.within(db.index().datadir()).metadata()
-        && m.len() == size
-        && UnixTime::mtime(&m) == mtime
-    {
-        let txn = db.begin_write()?;
-        {
-            let mut cache = txn.write_cache()?;
-            let mut tree = txn.write_tree()?;
-            let mut blobs = txn.write_blobs()?;
-            let mut dirty = txn.write_dirty()?;
-            let mut history = txn.write_history()?;
-            cache.index(
-                &mut tree,
-                &mut blobs,
-                &mut history,
-                &mut dirty,
-                path,
-                size,
-                mtime,
-                hash,
-            )?;
-        }
-        txn.commit()?;
-
-        return Ok(true);
+    match add_file(db, path, size, mtime, hash) {
+        Ok(_) => Ok(true),
+        Err(StorageError::LocalFileMismatch) => Ok(false),
+        Err(err) => Err(err),
     }
-
-    Ok(false)
 }
 
 pub async fn add_file_if_matches_async(
@@ -402,7 +378,6 @@ pub async fn add_file_if_matches_async(
 ) -> Result<bool, StorageError> {
     let db = Arc::clone(db);
     let path = path.clone();
-    let mtime = mtime.clone();
 
     task::spawn_blocking(move || add_file_if_matches(&db, &path, size, mtime, hash)).await?
 }
@@ -572,6 +547,7 @@ mod tests {
     use crate::arena::types::Version;
     use crate::utils::hash;
     use assert_fs::TempDir;
+    use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
     use realize_types::Arena;
     use realize_types::Path;
@@ -583,6 +559,7 @@ mod tests {
 
     struct Fixture {
         db: Arc<ArenaDatabase>,
+        datadir: ChildPath,
         _tempdir: TempDir,
     }
 
@@ -595,12 +572,21 @@ mod tests {
             blob_dir.create_dir_all()?;
             let datadir = tempdir.child("data");
             datadir.create_dir_all()?;
-            let db = ArenaDatabase::for_testing_single_arena(arena, blob_dir, datadir)?;
+            let db = ArenaDatabase::for_testing_single_arena(arena, blob_dir, datadir.path())?;
 
             Ok(Self {
                 db,
+                datadir,
                 _tempdir: tempdir,
             })
+        }
+
+        fn setup_file(&self, path: &Path, content: &str) -> anyhow::Result<(u64, UnixTime, Hash)> {
+            let childpath = self.datadir.child(path.as_str());
+            childpath.write_str(content)?;
+            let m = childpath.metadata()?;
+
+            Ok((m.len(), UnixTime::mtime(&m), hash::digest(content)))
         }
     }
 
@@ -616,16 +602,16 @@ mod tests {
     #[test]
     fn index_add_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let mtime = UnixTime::from_secs(1234567890);
         let path = realize_types::Path::parse("foo/bar.txt")?;
-        super::add_file(&fixture.db, &path, 100, mtime, Hash([0xfa; 32]))?;
+        let (size, mtime, hash) = fixture.setup_file(&path, "file content")?;
+        super::add_file(&fixture.db, &path, size, mtime, hash.clone())?;
 
         // Verify the file was added
         assert!(super::has_file(&fixture.db, &path)?);
         let entry = super::get_file(&fixture.db, &path)?.unwrap();
-        assert_eq!(entry.size, 100);
+        assert_eq!(entry.size, size);
         assert_eq!(entry.mtime, mtime);
-        assert_eq!(entry.version, Version::Indexed(Hash([0xfa; 32])));
+        assert_eq!(entry.version, Version::Indexed(hash));
 
         Ok(())
     }
@@ -724,18 +710,24 @@ mod tests {
     fn index_replace_file_in_index() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
 
-        let mtime1 = UnixTime::from_secs(1234567890);
-        let mtime2 = UnixTime::from_secs(1234567891);
         let path = realize_types::Path::parse("foo/bar.txt")?;
-        super::add_file(&fixture.db, &path, 100, mtime1, Hash([0xfa; 32]))?;
-        super::add_file(&fixture.db, &path, 200, mtime2, Hash([0x07; 32]))?;
+
+        // Add first version
+        let content1 = "first version content";
+        let (size1, mtime1, hash1) = fixture.setup_file(&path, content1)?;
+        super::add_file(&fixture.db, &path, size1, mtime1, hash1)?;
+
+        // Replace with second version
+        let content2 = "second version content that is longer";
+        let (size2, mtime2, hash2) = fixture.setup_file(&path, content2)?;
+        super::add_file(&fixture.db, &path, size2, mtime2, hash2.clone())?;
 
         // Verify the file was replaced
         assert!(super::has_file(&fixture.db, &path)?);
         let entry = super::get_file(&fixture.db, &path)?.unwrap();
-        assert_eq!(entry.size, 200);
+        assert_eq!(entry.size, size2);
         assert_eq!(entry.mtime, mtime2);
-        assert_eq!(entry.version, Version::Indexed(Hash([0x07; 32])));
+        assert_eq!(entry.version, Version::Indexed(hash2));
 
         Ok(())
     }
@@ -744,9 +736,10 @@ mod tests {
     fn index_has_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
 
-        let mtime = UnixTime::from_secs(1234567890);
         let path = realize_types::Path::parse("foo.txt")?;
-        super::add_file(&fixture.db, &path, 100, mtime, Hash([0xfa; 32]))?;
+        let content = "test content";
+        let (size, mtime, hash) = fixture.setup_file(&path, content)?;
+        super::add_file(&fixture.db, &path, size, mtime, hash)?;
 
         assert!(super::has_file(&fixture.db, &path)?);
         assert!(!super::has_file(
@@ -765,13 +758,13 @@ mod tests {
     fn index_get_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
 
-        let mtime = UnixTime::from_secs(1234567890);
         let path = realize_types::Path::parse("foo/bar")?;
-        let hash = Hash([0xfa; 32]);
-        super::add_file(&fixture.db, &path, 100, mtime, hash.clone())?;
+        let content = "test content for foo/bar";
+        let (size, mtime, hash) = fixture.setup_file(&path, content)?;
+        super::add_file(&fixture.db, &path, size, mtime, hash.clone())?;
 
         let entry = super::get_file(&fixture.db, &path)?.unwrap();
-        assert_eq!(entry.size, 100);
+        assert_eq!(entry.size, size);
         assert_eq!(entry.mtime, mtime);
         assert_eq!(entry.version, Version::Indexed(hash));
 
@@ -782,22 +775,28 @@ mod tests {
     fn index_has_matching_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
 
-        let mtime = UnixTime::from_secs(1234567890);
         let path = realize_types::Path::parse("foo/bar")?;
-        super::add_file(&fixture.db, &path, 100, mtime, Hash([0xfa; 32]))?;
+        let content = "test content";
+        let (size, mtime, hash) = fixture.setup_file(&path, content)?;
+        super::add_file(&fixture.db, &path, size, mtime, hash)?;
 
-        assert!(super::has_matching_file(&fixture.db, &path, 100, mtime)?);
+        assert!(super::has_matching_file(&fixture.db, &path, size, mtime)?);
         assert!(!super::has_matching_file(
             &fixture.db,
             &realize_types::Path::parse("other")?,
-            100,
+            size,
             mtime
         )?);
-        assert!(!super::has_matching_file(&fixture.db, &path, 200, mtime)?);
         assert!(!super::has_matching_file(
             &fixture.db,
             &path,
-            100,
+            size + 100,
+            mtime
+        )?);
+        assert!(!super::has_matching_file(
+            &fixture.db,
+            &path,
+            size,
             UnixTime::from_secs(1234567891)
         )?);
 
@@ -808,9 +807,10 @@ mod tests {
     fn index_remove_file_or_dir() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
 
-        let mtime = UnixTime::from_secs(1234567890);
         let path = realize_types::Path::parse("foo/bar.txt")?;
-        super::add_file(&fixture.db, &path, 100, mtime, Hash([0xfa; 32]))?;
+        let content = "test content to remove";
+        let (size, mtime, hash) = fixture.setup_file(&path, content)?;
+        super::add_file(&fixture.db, &path, size, mtime, hash)?;
         super::remove_file_or_dir(&fixture.db, &path)?;
 
         assert!(!super::has_file(&fixture.db, &path)?);
@@ -822,11 +822,15 @@ mod tests {
     fn index_remove_file_if_missing_success() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
 
-        let mtime = UnixTime::from_secs(1234567890);
         let path = realize_types::Path::parse("bar.txt")?;
-        super::add_file(&fixture.db, &path, 100, mtime, Hash([0xfa; 32]))?;
-        assert!(super::remove_file_if_missing(&fixture.db, &path)?);
+        let content = "test content that will be missing";
+        let (size, mtime, hash) = fixture.setup_file(&path, content)?;
+        super::add_file(&fixture.db, &path, size, mtime, hash)?;
 
+        // Remove the actual file to simulate it being missing
+        std::fs::remove_file(fixture.datadir.child("bar.txt").path())?;
+
+        assert!(super::remove_file_if_missing(&fixture.db, &path)?);
         assert!(!super::has_file(&fixture.db, &path)?);
 
         Ok(())
@@ -836,14 +840,12 @@ mod tests {
     fn index_remove_file_if_missing_failure() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
 
-        let mtime = UnixTime::from_secs(1234567890);
         let path = realize_types::Path::parse("bar.txt")?;
-        super::add_file(&fixture.db, &path, 100, mtime, Hash([0xfa; 32]))?;
+        let content = "content";
+        let (size, mtime, hash) = fixture.setup_file(&path, content)?;
+        super::add_file(&fixture.db, &path, size, mtime, hash)?;
 
-        // Create the file on disk
-        let file_path = fixture.db.index().datadir().join("bar.txt");
-        std::fs::write(&file_path, "content")?;
-
+        // File still exists on disk (created by setup_file), so removal should fail
         assert!(!super::remove_file_if_missing(&fixture.db, &path)?);
         assert!(super::has_file(&fixture.db, &path)?);
 
@@ -854,59 +856,38 @@ mod tests {
     fn index_remove_dir_from_index() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
 
-        let mtime = UnixTime::from_secs(1234567890);
+        let path_a = realize_types::Path::parse("foo/a")?;
+        let path_b = realize_types::Path::parse("foo/b")?;
+        let path_c = realize_types::Path::parse("foo/c")?;
+        let path_foobar = realize_types::Path::parse("foobar")?;
 
+        let (size_a, mtime_a, hash_a) = fixture.setup_file(&path_a, "content a")?;
+        let (size_b, mtime_b, hash_b) = fixture.setup_file(&path_b, "content b")?;
+        let (size_c, mtime_c, hash_c) = fixture.setup_file(&path_c, "content c")?;
+        let (size_foobar, mtime_foobar, hash_foobar) =
+            fixture.setup_file(&path_foobar, "content foobar")?;
+
+        super::add_file(&fixture.db, &path_a, size_a, mtime_a, hash_a)?;
+        super::add_file(&fixture.db, &path_b, size_b, mtime_b, hash_b)?;
+        super::add_file(&fixture.db, &path_c, size_c, mtime_c, hash_c)?;
         super::add_file(
             &fixture.db,
-            &realize_types::Path::parse("foo/a")?,
-            100,
-            mtime,
-            Hash([1; 32]),
-        )?;
-        super::add_file(
-            &fixture.db,
-            &realize_types::Path::parse("foo/b")?,
-            100,
-            mtime,
-            Hash([2; 32]),
-        )?;
-        super::add_file(
-            &fixture.db,
-            &realize_types::Path::parse("foo/c")?,
-            100,
-            mtime,
-            Hash([3; 32]),
-        )?;
-        super::add_file(
-            &fixture.db,
-            &realize_types::Path::parse("foobar")?,
-            100,
-            mtime,
-            Hash([0x04; 32]),
+            &path_foobar,
+            size_foobar,
+            mtime_foobar,
+            hash_foobar,
         )?;
 
         // Remove the directory
         super::remove_file_or_dir(&fixture.db, &realize_types::Path::parse("foo")?)?;
 
         // Verify all files in the directory were removed
-        assert!(!super::has_file(
-            &fixture.db,
-            &realize_types::Path::parse("foo/a")?
-        )?);
-        assert!(!super::has_file(
-            &fixture.db,
-            &realize_types::Path::parse("foo/b")?
-        )?);
-        assert!(!super::has_file(
-            &fixture.db,
-            &realize_types::Path::parse("foo/c")?
-        )?);
+        assert!(!super::has_file(&fixture.db, &path_a)?);
+        assert!(!super::has_file(&fixture.db, &path_b)?);
+        assert!(!super::has_file(&fixture.db, &path_c)?);
 
         // But the file outside the directory should remain
-        assert!(super::has_file(
-            &fixture.db,
-            &realize_types::Path::parse("foobar")?
-        )?);
+        assert!(super::has_file(&fixture.db, &path_foobar)?);
 
         Ok(())
     }
@@ -915,14 +896,17 @@ mod tests {
     async fn index_all_files() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
 
-        let mtime = UnixTime::from_secs(1234567890);
         let path1 = realize_types::Path::parse("foo/a")?;
         let path2 = realize_types::Path::parse("foo/b")?;
         let path3 = realize_types::Path::parse("bar.txt")?;
 
-        super::add_file(&fixture.db, &path1, 100, mtime, Hash([1; 32]))?;
-        super::add_file(&fixture.db, &path2, 200, mtime, Hash([2; 32]))?;
-        super::add_file(&fixture.db, &path3, 300, mtime, Hash([3; 32]))?;
+        let (size1, mtime1, hash1) = fixture.setup_file(&path1, "content for a")?;
+        let (size2, mtime2, hash2) = fixture.setup_file(&path2, "content for b that is longer")?;
+        let (size3, mtime3, hash3) = fixture.setup_file(&path3, "content for bar.txt file")?;
+
+        super::add_file(&fixture.db, &path1, size1, mtime1, hash1)?;
+        super::add_file(&fixture.db, &path2, size2, mtime2, hash2)?;
+        super::add_file(&fixture.db, &path3, size3, mtime3, hash3)?;
 
         let (tx, mut rx) = mpsc::channel(10);
         let task = tokio::task::spawn_blocking({
@@ -948,14 +932,14 @@ mod tests {
     #[tokio::test]
     async fn index_watch_history() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let db = fixture.db;
 
-        let mut rx = db.history().watch();
+        let mut rx = fixture.db.history().watch();
         let initial = *rx.borrow();
 
-        let mtime = UnixTime::from_secs(1234567890);
         let path = realize_types::Path::parse("foo/bar.txt")?;
-        super::add_file(&db, &path, 100, mtime, Hash([0xfa; 32]))?;
+        let content = "test content for watch history";
+        let (size, mtime, hash) = fixture.setup_file(&path, content)?;
+        super::add_file(&fixture.db, &path, size, mtime, hash)?;
 
         // Wait for the history to be updated
         let timeout = tokio::time::Duration::from_millis(100);
@@ -973,9 +957,10 @@ mod tests {
 
         let initial = super::last_history_index(&fixture.db)?;
 
-        let mtime = UnixTime::from_secs(1234567890);
         let path = realize_types::Path::parse("foo/bar.txt")?;
-        super::add_file(&fixture.db, &path, 100, mtime, Hash([0xfa; 32]))?;
+        let content = "test content for history";
+        let (size, mtime, hash) = fixture.setup_file(&path, content)?;
+        super::add_file(&fixture.db, &path, size, mtime, hash)?;
 
         let updated = super::last_history_index(&fixture.db)?;
         assert!(updated > initial);
@@ -990,16 +975,17 @@ mod tests {
 
         // Create source file on disk
         let source_path = datadir.join("source.txt");
-        std::fs::write(&source_path, "source content")?;
+        let source_content = "source_content";
+        std::fs::write(&source_path, source_content)?;
         let source_mtime = UnixTime::mtime(&source_path.metadata()?);
-        let source_hash = hash::digest("source content");
+        let source_hash = hash::digest(source_content);
 
         // Add source file to index
         let source_index_path = Path::parse("source.txt")?;
         super::add_file(
             &fixture.db,
             &source_index_path,
-            14, // size of "source content"
+            source_content.len() as u64, // size of "source content"
             source_mtime,
             source_hash.clone(),
         )?;
@@ -1045,7 +1031,7 @@ mod tests {
 
         let dest_entry = super::get_file(&fixture.db, &dest_index_path)?.unwrap();
         assert_eq!(dest_entry.version, Version::Indexed(source_hash));
-        assert_eq!(dest_entry.size, 14);
+        assert_eq!(dest_entry.size, source_content.len() as u64);
         assert_eq!(dest_entry.mtime, source_mtime);
 
         // Verify hard link was created by checking pathid numbers
@@ -1083,7 +1069,7 @@ mod tests {
         super::add_file(
             &fixture.db,
             &source_index_path,
-            14,
+            "source content".len() as u64,
             source_mtime,
             source_hash.clone(),
         )?;
@@ -1093,7 +1079,7 @@ mod tests {
         super::add_file(
             &fixture.db,
             &dest_index_path,
-            12,
+            "dest content".len() as u64,
             dest_mtime,
             dest_hash.clone(),
         )?;
@@ -1146,7 +1132,7 @@ mod tests {
         super::add_file(
             &fixture.db,
             &source_index_path,
-            14,
+            "source content".len() as u64,
             source_mtime,
             source_hash.clone(),
         )?;
@@ -1223,7 +1209,7 @@ mod tests {
         super::add_file(
             &fixture.db,
             &source_index_path,
-            14,
+            "source content".len() as u64,
             source_mtime,
             source_hash.clone(),
         )?;
@@ -1269,7 +1255,7 @@ mod tests {
         super::add_file(
             &fixture.db,
             &source_index_path,
-            14,
+            "source content".len() as u64,
             source_mtime,
             source_hash.clone(),
         )?;
@@ -1377,7 +1363,7 @@ mod tests {
         super::add_file(
             &fixture.db,
             &source_path,
-            14,
+            "source content".len() as u64,
             source_mtime,
             source_hash.clone(),
         )?;
@@ -1417,7 +1403,7 @@ mod tests {
             Some(IndexedFile {
                 mtime: source_mtime,
                 version: Version::Indexed(source_hash),
-                size: 14
+                size: "source content".len() as u64
             }),
             cache.indexed(&tree, &dest_path)?
         );
@@ -1447,7 +1433,7 @@ mod tests {
         super::add_file(
             &fixture.db,
             &source_index_path,
-            14,
+            "source content".len() as u64,
             source_mtime,
             source_hash.clone(),
         )?;
@@ -1457,7 +1443,7 @@ mod tests {
         super::add_file(
             &fixture.db,
             &dest_index_path,
-            12,
+            "dest content".len() as u64,
             dest_mtime,
             dest_hash.clone(),
         )?;
@@ -1516,7 +1502,7 @@ mod tests {
         super::add_file(
             &fixture.db,
             &source_index_path,
-            14,
+            "source content".len() as u64,
             source_mtime,
             source_hash.clone(),
         )?;
@@ -1570,7 +1556,7 @@ mod tests {
         super::add_file(
             &fixture.db,
             &source_index_path,
-            14,
+            "source content".len() as u64,
             source_mtime,
             source_hash.clone(),
         )?;

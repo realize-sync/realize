@@ -249,7 +249,8 @@ impl ArenaFilesystem {
             let cache = txn.read_cache()?;
             if cache.file_entry_or_err(&tree, pathid)?.is_local() {
                 let path = tree.backtrack(loc)?.ok_or(StorageError::IsADirectory)?;
-                return Ok(FileContent::Local(path.within(cache.datadir())));
+                let realpath = path.within(cache.datadir());
+                return Ok(FileContent::Local(realpath));
             }
             let blobs = txn.read_blobs()?;
             if let Some(info) = blobs.get_with_pathid(pathid)? {

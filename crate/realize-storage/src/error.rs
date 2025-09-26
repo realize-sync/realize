@@ -66,6 +66,9 @@ pub enum StorageError {
 
     #[error("file hasn't been indexed yet")]
     NotIndexed,
+
+    #[error("local file metadata not as expected")]
+    LocalFileMismatch,
 }
 
 impl StorageError {
@@ -110,6 +113,7 @@ impl StorageError {
             StorageError::DirectoryNotEmpty => DirectoryNotEmpty,
             StorageError::NoPeers => InvalidData,
             StorageError::NotIndexed => InvalidInput,
+            StorageError::LocalFileMismatch => NotFound,
         }
     }
 
