@@ -618,19 +618,21 @@ impl InnerRealizeFs {
         match self.fs.file_content(Inode(ino)).await? {
             FileContent::Local(realpath) => {
                 log::debug!("SETATTR {ino}: Truncate file, mapped to {realpath:?} to {size}");
-                if let Ok(file) = tokio::fs::OpenOptions::new()
+                if let Ok(mut file) = tokio::fs::OpenOptions::new()
                     .write(true)
                     .open(&realpath)
                     .await
                 {
                     file.set_len(size).await?;
+                    file.flush().await?;
                     return Ok(metadata_to_attr(&file.metadata().await?, ino));
                 }
             }
             FileContent::Remote(mut blob) => {
                 self.downloader.complete_blob(&mut blob).await?;
-                let (_, file) = blob.realize().await?;
+                let (_, mut file) = blob.realize().await?;
                 file.set_len(size).await?;
+                file.flush().await?;
                 return Ok(metadata_to_attr(&file.metadata().await?, ino));
             }
         }
