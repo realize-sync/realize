@@ -1835,7 +1835,10 @@ mod tests {
 
                 let current_uid = nix::unistd::getuid();
                 let current_gid = nix::unistd::getgid();
+                #[cfg(target_os = "linux")]
                 let mut groups = nix::unistd::getgroups()?;
+                #[cfg(not(target_os = "linux"))]
+                let mut groups = vec![]; // no getgroups on macos
                 groups.retain(|gid| *gid != current_gid);
                 let othergroup = groups.into_iter().next();
 
