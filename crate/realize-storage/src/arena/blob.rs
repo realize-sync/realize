@@ -1386,17 +1386,19 @@ impl Blob {
                 let mut cache = txn.write_cache()?;
                 let mut dirty = txn.write_dirty()?;
                 let mut history = txn.write_history()?;
-                (source, dest) =
-                    cache.realize(&mut tree, &mut blobs, &mut dirty, &mut history, pathid)?;
+                (source, dest) = cache.realize(
+                    &mut tree,
+                    &mut blobs,
+                    &mut dirty,
+                    &mut history,
+                    pathid,
+                    true,
+                )?;
 
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::rename(&source, &dest)?;
-
-                // Mark it locally modified right away, since this call is
-                // meant to prepare a file for local modifications.
-                cache.preindex(&mut tree, &mut blobs, &mut dirty, self.info.pathid)?;
             }
 
             if let Err(err) = txn.commit() {

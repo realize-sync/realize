@@ -198,8 +198,14 @@ impl StorageJobProcessor {
             }
             let mut history = txn.write_history()?;
             let mut dirty = txn.write_dirty()?;
-            (source, dest) =
-                cache.realize(&mut tree, &mut blobs, &mut dirty, &mut history, pathid)?;
+            (source, dest) = cache.realize(
+                &mut tree,
+                &mut blobs,
+                &mut dirty,
+                &mut history,
+                pathid,
+                false,
+            )?;
 
             if dest.exists() {
                 return Ok(JobStatus::Abandoned("file_exists"));
