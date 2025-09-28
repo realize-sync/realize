@@ -521,6 +521,37 @@ impl fuser::Filesystem for RealizeFs {
             }
         });
     }
+
+    /// Create and open a file.
+    /// If the file does not exist, first create it with the specified mode, and then
+    /// open it. Open flags (with the exception of O_NOCTTY) are available in flags.
+    /// Filesystem may store an arbitrary file handle (pointer, index, etc) in fh,
+    /// and use this in other all other file operations (read, write, flush, release,
+    /// fsync). There are also some flags (direct_io, keep_cache) which the
+    /// filesystem may set, to change the way the file is opened. See fuse_file_info
+    /// structure in <fuse_common.h> for more details. If this method is not
+    /// implemented or under Linux kernel versions earlier than 2.6.15, the mknod()
+    /// and open() methods will be called instead.
+    fn create(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+        reply: fuser::ReplyCreate,
+    ) {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_owned();
+
+        self.handle.spawn(async move {
+            match inner.create(parent, name, mode, umask, flags).await {
+                Err(err) => reply.error(err.log_and_convert()),
+                Ok((attr, fh)) => reply.created(&TTL, &attr, 0, fh, 0),
+            }
+        });
+    }
 }
 
 struct InnerRealizeFs {
@@ -774,12 +805,30 @@ impl InnerRealizeFs {
                 }
             }
         };
-        let mut handles = self.handles.lock().await;
-        let fh = handles.last_key_value().map(|(k, _)| *k + 1).unwrap_or(1);
+        let fh = self.store_handle(handle).await;
         log::debug!("Opened file Inode({ino}) as FH#{fh}");
-        handles.insert(fh, Arc::new(Mutex::new(handle)));
 
         return Ok((fh, 0));
+    }
+
+    async fn create(
+        &self,
+        parent: u64,
+        name: OsString,
+        mode: u32,
+        _umask: u32,
+        flags: i32,
+    ) -> Result<(fuser::FileAttr, u64), FuseError> {
+        let name = name.to_str().ok_or(FuseError::Utf8)?;
+        log::debug!("CREATE parent={parent} name={name} mode={mode:o} flags={flags:#x}");
+
+        let options = openoptions_from_flags(flags);
+        let (inode, file) = self.fs.create(options, (Inode(parent), name)).await?;
+        let attr = metadata_to_attr(&file.metadata().await?, inode.as_u64());
+        let fh = self.store_handle(FileHandle::Real(file)).await;
+        log::debug!("Created and opened Inode({inode}) in FH#{fh}",);
+
+        Ok((attr, fh))
     }
 
     async fn flush(&self, fh: u64) -> Result<(), FuseError> {
@@ -817,6 +866,14 @@ impl InnerRealizeFs {
             None => Err(FuseError::Errno(libc::EBADF)),
             Some(h) => Ok(Arc::clone(h)),
         }
+    }
+
+    /// Store a [FileHandle] and return its unique ID.
+    async fn store_handle(&self, handle: FileHandle) -> u64 {
+        let mut handles = self.handles.lock().await;
+        let fh = handles.last_key_value().map(|(k, _)| *k + 1).unwrap_or(1);
+        handles.insert(fh, Arc::new(Mutex::new(handle)));
+        fh
     }
 
     fn build_file_attr(&self, pathid: Inode, metadata: &FileMetadata) -> fuser::FileAttr {
@@ -2124,6 +2181,166 @@ mod tests {
                     "new overwritten content",
                     fs::read_to_string(&new_path).await?
                 );
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn create_file() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let _a = HouseholdFixture::a();
+                let _b = HouseholdFixture::b();
+
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                let file_path = arena_path.join("new_file.txt");
+
+                // Create a new file using spawn_blocking to test the FUSE create syscall
+                tokio::task::spawn_blocking({
+                    let file_path = file_path.clone();
+                    move || {
+                        let mut file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .write(true)
+                            .read(true)
+                            .open(&file_path)?;
+                        file.write_all(b"Hello, created file!")?;
+                        file.flush()?;
+                        drop(file);
+                        Ok::<(), std::io::Error>(())
+                    }
+                })
+                .await??;
+
+                // Just check that we can read the content back - simplify first
+                let content = fs::read_to_string(&file_path).await?;
+                assert_eq!("Hello, created file!", content);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn create_file_already_exists() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+
+                // First create a file
+                fixture
+                    .inner
+                    .write_file_and_wait(b, a, "existing_file.txt", "original content")
+                    .await?;
+
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                let file_path = arena_path.join("existing_file.txt");
+
+                // Try to create the same file with O_CREAT|O_EXCL should fail
+                let result = tokio::task::spawn_blocking({
+                    let file_path = file_path.clone();
+                    move || {
+                        std::fs::OpenOptions::new()
+                            .create_new(true)
+                            .write(true)
+                            .open(&file_path)
+                    }
+                })
+                .await?;
+
+                assert!(result.is_err());
+                assert_eq!(
+                    std::io::ErrorKind::AlreadyExists,
+                    result.err().unwrap().kind()
+                );
+
+                // Original content should still be there
+                let content = fs::read_to_string(&file_path).await?;
+                assert_eq!("original content", content);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn create_file_in_subdir() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let _a = HouseholdFixture::a();
+                let _b = HouseholdFixture::b();
+
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                let subdir_path = arena_path.join("subdir");
+
+                // Create the subdirectory first using FUSE mkdir
+                tokio::fs::create_dir(&subdir_path).await?;
+
+                // Verify directory was created
+                let dir_attr = fs::metadata(&subdir_path).await?;
+                assert!(dir_attr.is_dir());
+
+                let file_path = subdir_path.join("subfile.txt");
+
+                // Create a new file in the subdirectory using spawn_blocking
+                tokio::task::spawn_blocking({
+                    let file_path = file_path.clone();
+                    move || {
+                        let mut file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .write(true)
+                            .read(true)
+                            .open(&file_path)?;
+                        file.write_all(b"subdir content")?;
+                        file.flush()?;
+                        drop(file);
+                        Ok::<(), std::io::Error>(())
+                    }
+                })
+                .await??;
+
+                // Check that we can read the content back
+                let content = fs::read_to_string(&file_path).await?;
+                assert_eq!("subdir content", content);
 
                 Ok::<(), anyhow::Error>(())
             })

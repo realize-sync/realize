@@ -6,6 +6,7 @@ use super::tree::TreeExt;
 use super::types::FileMetadata;
 use super::update;
 use crate::arena::notifier::{Notification, Progress};
+use crate::arena::tree::TreeReadOperations;
 use crate::arena::types::DirMetadata;
 use crate::global::fs::FileContent;
 use crate::types::Inode;
@@ -13,6 +14,7 @@ use crate::{Blob, FileRealm};
 use crate::{PathId, StorageError};
 use realize_types::{Arena, Path, Peer};
 use std::sync::Arc;
+use tokio::runtime::Handle;
 
 // TreeLoc is necessary to call ArenaCache methods
 pub(crate) use super::tree::TreeLoc;
@@ -163,6 +165,59 @@ impl ArenaFilesystem {
         txn.commit()?;
 
         Ok(())
+    }
+
+    /// Create a local file with the given options.
+    ///
+    /// This call takes care of immediately registering the new file as modified.
+    pub(crate) fn create(
+        &self,
+        mut options: tokio::fs::OpenOptions,
+        loc: impl Into<ArenaFsLoc>,
+    ) -> Result<(Inode, tokio::fs::File), StorageError> {
+        let txn = self.db.begin_write()?;
+        let file = {
+            let mut tree = txn.write_tree()?;
+            let mut blobs = txn.write_blobs()?;
+            let mut dirty = txn.write_dirty()?;
+            let mut cache = txn.write_cache()?;
+
+            let loc = loc.into().into_tree_loc(&cache)?;
+            let pathid = tree.setup(loc.borrow())?;
+            let path = tree
+                .backtrack(loc.borrow())?
+                .ok_or(StorageError::AlreadyExists)?;
+
+            // Parent must exist in the cache, but might not exist on
+            // the filesystem.
+            if let Some(parent) = tree.parent(pathid)? {
+                match cache.metadata(&tree, parent)? {
+                    Some(crate::arena::types::Metadata::Dir(_)) => {}
+                    Some(crate::arena::types::Metadata::File(_)) => {
+                        return Err(StorageError::NotADirectory);
+                    }
+                    None => {
+                        return Err(StorageError::NotFound);
+                    }
+                }
+            }
+            let realpath = path.within(cache.datadir());
+            if let Some(parent) = realpath.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            // Create the file
+            options.create(true);
+            let file = Handle::current().block_on(options.open(realpath))?;
+
+            // Store it as modified file; don't add history entry yet.
+            cache.preindex(&mut tree, &mut blobs, &mut dirty, pathid)?;
+
+            (cache.map_to_inode(pathid)?, file)
+        };
+        txn.commit()?;
+
+        Ok(file)
     }
 
     pub(crate) fn branch(

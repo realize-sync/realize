@@ -579,6 +579,23 @@ impl Filesystem {
         })
         .await?
     }
+
+    /// Create a file at the given path in the specified arena with the given options.
+    pub async fn create<L: Into<FsLoc>>(
+        self: &Arc<Self>,
+        options: tokio::fs::OpenOptions,
+        loc: L,
+    ) -> Result<(Inode, tokio::fs::File), StorageError> {
+        let loc = loc.into();
+        let this = Arc::clone(self);
+
+        task::spawn_blocking(move || {
+            let (fs, loc) = this.resolve_arena_loc(loc)?;
+
+            fs.create(options, loc)
+        })
+        .await?
+    }
 }
 
 /// A location within the Filesystem.
