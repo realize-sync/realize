@@ -1033,7 +1033,7 @@ fn metadata_to_attr(m: &std::fs::Metadata, ino: u64) -> fuser::FileAttr {
         mtime: m.modified().unwrap_or(SystemTime::UNIX_EPOCH),
         ctime: SystemTime::UNIX_EPOCH + Duration::from_secs(m.ctime() as u64),
         crtime: m.created().unwrap_or(SystemTime::UNIX_EPOCH),
-        kind: match (m.mode() as u32) & (libc::S_IFMT as u32) {
+        kind: match (m.mode() as libc::mode_t) & libc::S_IFMT {
             libc::S_IFIFO => FileType::NamedPipe,
             libc::S_IFCHR => FileType::CharDevice,
             libc::S_IFBLK => FileType::BlockDevice,
