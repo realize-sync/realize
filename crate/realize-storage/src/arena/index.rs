@@ -5,10 +5,10 @@ use super::dirty::WritableOpenDirty;
 use super::history::{HistoryReadOperations, WritableOpenHistory};
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
 use super::types::{HistoryTableEntry, IndexedFile};
+use crate::StorageError;
 use crate::arena::blob::WritableOpenBlob;
 use crate::arena::cache::{CacheExt, CacheReadOperations, WritableOpenCache};
 use crate::utils::fs_utils;
-use crate::{StorageError, Version};
 use realize_types::{self, Hash, UnixTime};
 use std::ops::RangeBounds;
 use std::path::PathBuf;
@@ -248,38 +248,6 @@ where
     let path = path.clone();
 
     task::spawn_blocking(move || has_file(&db, &path)).await?
-}
-
-/// Check whether a given file is in the index with the given size and mtime.
-pub(crate) fn has_matching_file(
-    db: &Arc<ArenaDatabase>,
-    path: &realize_types::Path,
-    size: u64,
-    mtime: UnixTime,
-) -> Result<bool, StorageError> {
-    let txn = db.begin_read()?;
-    let cache = txn.read_cache()?;
-    let tree = txn.read_tree()?;
-    if let Some(indexed) = cache.indexed(&tree, path)? {
-        if let Version::Indexed(_) = indexed.version {
-            return Ok(indexed.matches(size, mtime));
-        }
-    }
-
-    Ok(false)
-}
-
-/// Check whether a given file is in the index already with the given size and mtime.
-pub async fn has_matching_file_async(
-    db: &Arc<ArenaDatabase>,
-    path: &realize_types::Path,
-    size: u64,
-    mtime: UnixTime,
-) -> Result<bool, StorageError> {
-    let db = Arc::clone(db);
-    let path = path.clone();
-
-    task::spawn_blocking(move || has_matching_file(&db, &path, size, mtime)).await?
 }
 
 /// Mark the file as modified, but not yet indexed.
@@ -771,42 +739,6 @@ mod tests {
         assert_eq!(entry.size, size);
         assert_eq!(entry.mtime, mtime);
         assert_eq!(entry.version, Version::Indexed(hash));
-
-        Ok(())
-    }
-
-    #[test]
-    fn index_has_matching_file() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-
-        let path = realize_types::Path::parse("foo/bar")?;
-        let content = "test content";
-        let (size, mtime, hash) = fixture.setup_file(&path, content)?;
-        super::add_file(&fixture.db, &path, size, mtime, hash)?;
-
-        assert!(super::has_matching_file(&fixture.db, &path, size, mtime)?);
-        assert!(!super::has_matching_file(
-            &fixture.db,
-            &realize_types::Path::parse("other")?,
-            size,
-            mtime
-        )?);
-        assert!(!super::has_matching_file(
-            &fixture.db,
-            &path,
-            size + 100,
-            mtime
-        )?);
-        assert!(!super::has_matching_file(
-            &fixture.db,
-            &path,
-            size,
-            UnixTime::from_secs(1234567891)
-        )?);
-
-        // always return false for modified files
-        super::preindex(&fixture.db, &path)?;
-        assert!(!super::has_matching_file(&fixture.db, &path, size, mtime)?);
 
         Ok(())
     }

@@ -2,14 +2,14 @@
 
 use super::db::ArenaDatabase;
 use super::index;
-use crate::StorageError;
+use crate::arena::cache::CacheExt;
 use crate::utils::debouncer::DebouncerMap;
 use crate::utils::{fs_utils, hash};
+use crate::{StorageError, Version};
 use futures::StreamExt as _;
 use notify::event::{CreateKind, MetadataKind, ModifyKind};
 use notify::{Event, EventKind, RecommendedWatcher, Watcher as _};
 use realize_types::{self, Path, UnixTime};
-use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt as _;
 use std::sync::Arc;
 use std::time::Duration;
@@ -523,7 +523,7 @@ impl RealWatcherWorker {
                     // started, so there's no point in creating an
                     // entry; we'll get a Modify event soon enough.
                     if m.nlink() > 1 || m.len() == 0 {
-                        self.file_created_or_modified(path, &m, debouncer).await?;
+                        self.file_created_or_modified(path, debouncer).await?;
                     }
                 }
             }
@@ -542,7 +542,7 @@ impl RealWatcherWorker {
                         Ok(m) => {
                             // Possibly moved to; add or update
                             if m.is_file() {
-                                self.file_created_or_modified(path, &m, debouncer).await?;
+                                self.file_created_or_modified(path, debouncer).await?;
                             } else if m.is_dir() {
                                 self.dir_created_or_modified(path, debouncer).await?;
                             }
@@ -576,7 +576,7 @@ impl RealWatcherWorker {
                         } else {
                             if file_is_readable(&path.within(root)).await {
                                 // Might have just become accessible.
-                                self.file_created_or_modified(path, &m, debouncer).await?;
+                                self.file_created_or_modified(path, debouncer).await?;
                             } else {
                                 // Might have just become inaccessible
                                 self.file_or_dir_removed(path).await?;
@@ -590,7 +590,7 @@ impl RealWatcherWorker {
                 let m = fs_utils::metadata_no_symlink(root, path).await?;
                 if m.is_file() {
                     // This event only matters if it's a file.
-                    self.file_created_or_modified(path, &m, debouncer).await?;
+                    self.file_created_or_modified(path, debouncer).await?;
                 }
             }
             FsEvent::Rescan => {
@@ -641,14 +641,7 @@ impl RealWatcherWorker {
                 }
             };
 
-            let m = match direntry.metadata().await {
-                Ok(m) => m,
-                Err(_) => {
-                    continue;
-                }
-            };
-
-            if let Err(err) = self.file_created_or_modified(&path, &m, debouncer).await {
+            if let Err(err) = self.file_created_or_modified(&path, debouncer).await {
                 log::debug!("[{}] Failed to add \"{path}\": {err}", self.db.tag());
             }
         }
@@ -659,39 +652,75 @@ impl RealWatcherWorker {
     async fn file_created_or_modified(
         &self,
         path: &Path,
-        m: &Metadata,
         debouncer: &mut DebouncerMap<Path, Result<(), StorageError>>,
     ) -> Result<(), anyhow::Error> {
         if path.matches_any(&self.exclude) {
             return Ok(());
         }
 
-        let mtime = UnixTime::mtime(m);
-        let size = m.len();
-        if index::has_matching_file_async(&self.db, path, size, mtime)
-            .await
-            .unwrap_or(false)
-        {
-            return Ok(());
-        }
-        index::preindex_async(&self.db, path).await?;
-        debouncer.spawn_limited(path.clone(), size > 0, {
-            let db = self.db.clone();
+        let (reindex, size, mtime) = tokio::task::spawn_blocking({
             let path = path.clone();
-            async move {
-                let hash = if size > 0 {
-                    hash::hash_file(File::open(path.within(db.cache().datadir())).await?).await?
-                } else {
-                    hash::empty()
-                };
-                let tag = db.tag();
-                log::info!("[{tag}] Hashed: \"{path}\" {hash} size={size}");
-                if !index::add_file_if_matches_async(&db, &path, size, mtime, hash).await? {
-                    log::debug!("[{tag}] Mismatch; Skipped adding \"{path}\"",);
+            let db = Arc::clone(&self.db);
+
+            move || {
+                let txn = db.begin_write()?;
+                let m = path.within(db.cache().datadir()).metadata()?;
+                let mtime = UnixTime::mtime(&m);
+                let size = m.len();
+                {
+                    let mut cache = txn.write_cache()?;
+                    let mut tree = txn.write_tree()?;
+                    let mut dirty = txn.write_dirty()?;
+                    let mut blobs = txn.write_blobs()?;
+                    let tag = db.tag();
+                    match cache.indexed(&tree, &path)? {
+                        Some(indexed) => {
+                            let v = &indexed.version;
+                            match v {
+                                Version::Indexed(_) => {
+                                    if indexed.matches(size, mtime) {
+                                        log::info!("[{tag}] No changes: \"{path}\" {v:?}",);
+                                        return Ok((false, size, mtime));
+                                    }
+                                    log::info!("[{tag}] File modified; rehash: \"{path}\" {v:?}",);
+                                    cache.preindex(&mut tree, &mut blobs, &mut dirty, &path)?;
+                                }
+                                Version::Modified(_) => {
+                                    log::info!("[{tag}] File modified; rehash: \"{path}\" {v:?}",);
+                                }
+                            }
+                        }
+                        None => {
+                            log::info!("[{tag}] File create; hashing: \"{path}\"",);
+                            cache.preindex(&mut tree, &mut blobs, &mut dirty, &path)?;
+                        }
+                    }
                 }
-                Ok(())
+                txn.commit()?;
+                Ok::<_, StorageError>((true, size, mtime))
             }
-        });
+        })
+        .await??;
+        if reindex {
+            debouncer.spawn_limited(path.clone(), size > 0, {
+                let db = self.db.clone();
+                let path = path.clone();
+                async move {
+                    let hash = if size > 0 {
+                        hash::hash_file(File::open(path.within(db.cache().datadir())).await?)
+                            .await?
+                    } else {
+                        hash::empty()
+                    };
+                    let tag = db.tag();
+                    log::info!("[{tag}] Hashed: \"{path}\" {hash} size={size}");
+                    if !index::add_file_if_matches_async(&db, &path, size, mtime, hash).await? {
+                        log::debug!("[{tag}] Mismatch; Skipped adding \"{path}\"",);
+                    }
+                    Ok(())
+                }
+            });
+        }
 
         Ok(())
     }
@@ -702,8 +731,6 @@ impl RealWatcherWorker {
         P: AsRef<std::path::Path>,
     {
         let path = path.as_ref();
-        // TODO: Should this use a PathResolver? We may or may not want
-        // to care about partial/full files here.
         realize_types::Path::from_real_path_in(&path, &self.db.cache().datadir())
     }
 }
@@ -894,7 +921,12 @@ mod tests {
         foobar.write_str("boo")?;
         let mtime = UnixTime::mtime(&fs::metadata(foobar.path()).await?);
         fixture.wait_for_history_event(2).await?;
-        assert!(index::has_matching_file_async(&fixture.db, &path, 3, mtime).await?);
+        assert!(
+            index::get_file_async(&fixture.db, &path)
+                .await?
+                .unwrap()
+                .matches(3, mtime)
+        );
 
         Ok(())
     }
