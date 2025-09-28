@@ -1059,16 +1059,28 @@ impl<'a> WritableOpenCache<'a> {
         let loc = loc.into();
         let pathid = tree.setup(loc.borrow())?;
         let path = tree.backtrack(loc)?.ok_or(StorageError::IsADirectory)?;
-        let version =
-            Version::modification_of(default_file_entry(&self.table, pathid)?.map(|e| e.version));
+        let original = default_file_entry(&self.table, pathid)?.map(|e| e.version);
+        if matches!(original, Some(Version::Modified(_))) {
+            // nothing to do
+            return Ok(pathid);
+        }
         let realpath = path.within(self.datadir());
         let m = match realpath.metadata() {
             Ok(m) => m,
             Err(_) => return Err(StorageError::LocalFileMismatch),
         };
-        let entry =
-            FileTableEntry::new(m.len(), UnixTime::mtime(&m), version, FileEntryKind::Local);
+        let entry = FileTableEntry::new(
+            m.len(),
+            UnixTime::mtime(&m),
+            Version::modification_of(original),
+            FileEntryKind::Local,
+        );
         self.write_default_file_entry(tree, blobs, dirty, pathid, &entry)?;
+        log::debug!(
+            "[{}]@local record modified \"{path}\" {:?}",
+            self.tag,
+            entry.version
+        );
         Ok(pathid)
     }
 
@@ -1114,6 +1126,7 @@ impl<'a> WritableOpenCache<'a> {
         dirty: &mut WritableOpenDirty,
         history: &mut WritableOpenHistory,
         loc: L,
+        modified: bool,
     ) -> Result<(PathBuf, PathBuf), StorageError> {
         let loc = loc.into();
         let pathid = tree.expect(loc.borrow())?;
@@ -1132,9 +1145,21 @@ impl<'a> WritableOpenCache<'a> {
             blobs,
             dirty,
             pathid,
-            &FileTableEntry::new(entry.size, entry.mtime, entry.version, FileEntryKind::Local),
+            &FileTableEntry::new(
+                entry.size,
+                entry.mtime,
+                if modified {
+                    Version::modification_of(Some(entry.version))
+                } else {
+                    entry.version
+                },
+                FileEntryKind::Local,
+            ),
         )?;
-        history.report_added(&path, None)?; // TODO: should it be report_available?
+        if !modified {
+            // TODO: should it be report_available?
+            history.report_added(&path, None)?;
+        }
 
         return Ok((source, dest));
     }
