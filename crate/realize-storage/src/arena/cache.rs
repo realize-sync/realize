@@ -14,6 +14,7 @@ use crate::arena::types::{DirMetadata, Version};
 use crate::global::types::PathAssignment;
 use crate::types::Inode;
 use crate::utils::holder::Holder;
+use crate::utils::inhibit::{self, Inhibit};
 use crate::{PathId, StorageError};
 use realize_types::{Hash, Path, Peer, UnixTime};
 use redb::{ReadableTable, Table};
@@ -379,6 +380,7 @@ pub(crate) struct WritableOpenCache<'a> {
     pending_catchup_table: Table<'a, (&'static str, PathId), ()>,
     tag: Tag,
     cache: &'a Cache,
+    _guard: inhibit::Guard,
 }
 
 impl<'a> WritableOpenCache<'a> {
@@ -397,6 +399,7 @@ impl<'a> WritableOpenCache<'a> {
             pending_catchup_table,
             tag,
             cache,
+            _guard: cache.inhibit_watcher(),
         }
     }
 
@@ -1245,6 +1248,7 @@ impl<'a> WritableOpenCache<'a> {
 
 pub(crate) struct Cache {
     datadir: PathBuf,
+    inhibit_watcher: Inhibit,
 }
 
 impl Cache {
@@ -1269,11 +1273,26 @@ impl Cache {
 
         Ok(Cache {
             datadir: datadir.to_path_buf(),
+            inhibit_watcher: Inhibit::new(),
         })
     }
 
     pub(crate) fn datadir(&self) -> &std::path::Path {
         &self.datadir
+    }
+
+    /// Return a barrier the file watcher should check before
+    /// processing a filesystem change.
+    ///
+    /// This is used to prevent the watcher from running until all
+    /// filesystem changes tied to a transactions have been executed.
+    pub(crate) fn watcher_barrier(&self) -> inhibit::Barrier {
+        self.inhibit_watcher.barrier()
+    }
+
+    /// Prevent the watcher from running.
+    pub(crate) fn inhibit_watcher(&self) -> inhibit::Guard {
+        self.inhibit_watcher.inhibit()
     }
 }
 

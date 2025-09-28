@@ -445,6 +445,7 @@ impl RealWatcherWorker {
         mut shutdown_rx: broadcast::Receiver<()>,
     ) {
         let tag = self.db.tag();
+        let mut barrier = self.db.cache().watcher_barrier();
         let mut debouncer = DebouncerMap::new(debounce, max_parallelism);
         loop {
             tokio::select!(
@@ -456,6 +457,7 @@ impl RealWatcherWorker {
                         None =>{ break; }
                         Some(ev) =>{
                             log::debug!("[{tag}] {ev:?}");
+                            barrier.allow().await;
                             if let Err(err) = self.handle_event(&ev, &rescan_tx, &mut debouncer).await {
                                 log::warn!("[{tag}] Handling of {ev:?} failed: {err}");
                             }

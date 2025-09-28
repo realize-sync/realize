@@ -1370,6 +1370,7 @@ impl Blob {
     /// directory, and return the file handle so that the file content
     /// can be modified.
     pub async fn realize(mut self) -> Result<(std::path::PathBuf, tokio::fs::File), StorageError> {
+        let _guard = self.db.cache().inhibit_watcher();
         let pathid = self.info.pathid;
         let db = Arc::clone(&self.db);
         self.file.flush().await?;

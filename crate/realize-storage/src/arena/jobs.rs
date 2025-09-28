@@ -98,6 +98,7 @@ impl StorageJobProcessor {
     fn unrealize(&self, pathid: PathId, hash: Hash) -> Result<JobStatus, StorageError> {
         let realpath: PathBuf;
         let cachepath: PathBuf;
+        let _guard = self.db.cache().inhibit_watcher();
         let txn = self.db.begin_write()?;
         {
             let mut tree = txn.write_tree()?;
@@ -166,6 +167,7 @@ impl StorageJobProcessor {
         let tag = self.db.tag();
         let source: PathBuf;
         let dest: PathBuf;
+        let _guard = self.db.cache().inhibit_watcher();
         let txn = self.db.begin_write()?;
         {
             let mut tree = txn.write_tree()?;
