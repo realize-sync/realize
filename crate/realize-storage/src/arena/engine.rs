@@ -468,13 +468,15 @@ impl Engine {
             let version = cached.version.clone();
             let is_local = cached.is_local();
 
-            if want_unrealize {
-                if is_local {
-                    should_unrealize = version.indexed_hash().cloned();
+            if let Some(hash) = version.indexed_hash() {
+                if want_unrealize
+                    && is_local
+                    && cache.remote_availability(tree, pathid, hash)?.is_some()
+                {
+                    should_unrealize = Some(hash.clone());
                 }
-            } else if want_realize {
-                if !is_local {
-                    should_realize = version.indexed_hash().cloned();
+                if want_realize && !is_local {
+                    should_realize = Some(hash.clone());
                 }
             }
             if !is_local {
@@ -717,7 +719,11 @@ mod tests {
             Ok((size, mtime, hash))
         }
 
-        fn add_file_to_index_with_version<T>(&self, path: T, expected_hash: Hash) -> anyhow::Result<()>
+        fn add_file_to_index_with_version<T>(
+            &self,
+            path: T,
+            expected_hash: Hash,
+        ) -> anyhow::Result<()>
         where
             T: AsRef<Path>,
         {
@@ -725,7 +731,7 @@ mod tests {
             // Create a file that matches the expected hash
             let content = "test"; // Simple content for testing
             let (size, mtime, actual_hash) = self.setup_file(path, content)?;
-            
+
             // If the provided hash matches our content, use it, otherwise create different content
             let (final_size, final_mtime, _final_hash) = if actual_hash == expected_hash {
                 (size, mtime, actual_hash)
@@ -734,7 +740,7 @@ mod tests {
                 let alt_content = format!("test content for hash {:?}", expected_hash);
                 self.setup_file(path, &alt_content)?
             };
-            
+
             Ok(index::add_file(
                 &self.db,
                 path,
