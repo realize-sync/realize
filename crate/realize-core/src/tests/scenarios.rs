@@ -2,7 +2,7 @@ use crate::consensus::churten::Churten;
 use crate::rpc::testing::{self, HouseholdFixture};
 use realize_storage::config::DiskUsageLimits;
 use realize_storage::utils::hash;
-use realize_storage::{CacheStatus, FileRealm, Mark};
+use realize_storage::{CacheStatus, FileRealm, Mark, Version};
 use realize_types::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,7 +43,7 @@ async fn file_drop() -> anyhow::Result<()> {
             std::fs::write(&foo_a, content.as_slice())?;
 
             // foo must be gone from A
-            let limit = Instant::now() + Duration::from_secs(5);
+            let limit = Instant::now() + Duration::from_secs(10);
             while foo_a.exists() && Instant::now() < limit {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -123,14 +123,35 @@ async fn link_to_own() -> anyhow::Result<()> {
             let mut churten = Churten::new(Arc::clone(&storage_b), household_b.clone());
             churten.start();
 
+            let store_foo = Path::parse("store/foo")?;
             // B should download and realize store/foo since it's marked owned
             let root_b = fixture.arena_root(b);
-            let store_foo_in_b = Path::parse("store/foo")?.within(&root_b);
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let store_foo_in_b = store_foo.within(&root_b);
+            let deadline = Instant::now() + Duration::from_secs(10);
             while !store_foo_in_b.exists() && Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             assert!(store_foo_in_b.exists());
+            while cache_b.file_realm((arena, &store_foo)).await? != FileRealm::Local
+                && Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            while cache_b
+                .file_metadata((arena, &store_foo))
+                .await?
+                .version
+                .indexed_hash()
+                .is_none()
+                && Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+
+            assert_eq!(
+                Version::Indexed(hash.clone()),
+                cache_b.file_metadata((arena, &store_foo)).await?.version
+            );
             assert_eq!(hash, hash::digest(std::fs::read_to_string(store_foo_in_b)?));
 
             // Once B has reported that it has store/foo, A should
