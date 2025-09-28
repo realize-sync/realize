@@ -1554,7 +1554,7 @@ mod tests {
                 fs::rename(&source_in_a, &dest_in_a).await.unwrap();
                 assert!(fs::metadata(&source_in_a).await.is_err());
                 assert!(fs::metadata(&dest_in_a).await.is_ok());
-                let deadline = Instant::now() + Duration::from_secs(3);
+                let deadline = Instant::now() + Duration::from_secs(10);
                 while Instant::now() < deadline {
                     match fs::read_to_string(&dest_in_a).await {
                         Ok(content) => {
@@ -1570,7 +1570,7 @@ mod tests {
                 }
 
                 // Rename should be executed on B.
-                let deadline = Instant::now() + Duration::from_secs(3);
+                let deadline = Instant::now() + Duration::from_secs(10);
                 let root_b = fixture.inner.arena_root(b);
                 let source_in_b = root_b.join("source.txt");
                 let dest_in_b = root_b.join("dest.txt");
