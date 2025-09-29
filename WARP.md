@@ -133,10 +133,10 @@ All network communication uses Cap'n Proto for:
 
 ### FUSE Testing Requirements
 **When testing FUSE filesystem operations:**
-- **Never use synchronous I/O** on FUSE mountpoints - it will hang in single-threaded test environments
-- **Always use `tokio::fs::*`** functions when accessing files through FUSE
-- **Avoid manual file handle management** - use `tokio::fs::write()` instead of opening/writing/closing manually
-- **Use `tokio::task::spawn_blocking`** for system calls like `chown()` that must be synchronous
+- **Use `tokio::fs::*`** functions when accessing files through FUSE when possible, otherwise, work from inside spawn_blocking
+- **Never work with file handles outside of spawn_blocking** - use `tokio::fs::write()` instead of opening/writing/closing manually when possible, otherwise use inside of spawn_blocking calls
+- **Never use synchronous I/O outside of spawn_blocking** on FUSE mountpoints - it will hang in single-threaded test environments
+- **Use `tokio::task::spawn_blocking`** for working with file handles or system calls like `chown()` that must be synchronous
 - **Always drop/close file handles** before attempting to unmount FUSE filesystems
 - **Use timeout wrappers** for potentially blocking operations: `tokio::time::timeout(Duration::from_secs(30), operation)`
 - **Test both FUSE mountpoint and underlying datadir** to verify writes are properly persisted
