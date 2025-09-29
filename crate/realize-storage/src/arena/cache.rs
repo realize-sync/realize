@@ -134,7 +134,7 @@ where
         blobs: &impl BlobReadOperations,
         loc: L,
     ) -> Result<FileRealm, StorageError> {
-        file_realm(&self.table, tree, blobs, loc)
+        file_realm(&self.table, tree, blobs, &self.cache.datadir, loc)
     }
 
     fn remote_availability<'b, L: Into<TreeLoc<'b>>>(
@@ -204,7 +204,7 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         blobs: &impl BlobReadOperations,
         loc: L,
     ) -> Result<FileRealm, StorageError> {
-        file_realm(&self.table, tree, blobs, loc)
+        file_realm(&self.table, tree, blobs, &self.cache.datadir, loc)
     }
 
     fn remote_availability<'b, L: Into<TreeLoc<'b>>>(
@@ -1373,11 +1373,17 @@ fn file_realm<'b, L: Into<TreeLoc<'b>>>(
     cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
     tree: &impl TreeReadOperations,
     blobs: &impl BlobReadOperations,
+    datadir: &std::path::Path,
     loc: L,
 ) -> Result<FileRealm, StorageError> {
-    let pathid = tree.expect(loc)?;
+    let loc = loc.into();
+    let pathid = tree.expect(loc.borrow())?;
     if default_file_entry_or_err(cache_table, pathid)?.is_local() {
-        return Ok(FileRealm::Local);
+        return Ok(FileRealm::Local(
+            tree.backtrack(loc)?
+                .ok_or(StorageError::IsADirectory)?
+                .within(datadir),
+        ));
     }
 
     Ok(FileRealm::Remote(blobs.cache_status(tree, pathid)?))
@@ -3322,7 +3328,7 @@ mod tests {
         )?;
 
         assert_eq!(
-            FileRealm::Local,
+            FileRealm::Local(childpath.to_path_buf()),
             cache.file_realm(&tree, &blobs, &testfile)?,
         );
 
@@ -3712,10 +3718,10 @@ mod tests {
         assert_eq!(4, metadata.size);
         assert_eq!(mtime, metadata.mtime);
         assert_eq!(Version::Indexed(hash::digest("test")), metadata.version);
-        assert_eq!(
-            FileRealm::Local,
-            cache.file_realm(&tree, &blobs, &dest_path).unwrap()
-        );
+        assert!(matches!(
+            cache.file_realm(&tree, &blobs, &dest_path).unwrap(),
+            FileRealm::Local(_)
+        ),);
 
         Ok(())
     }

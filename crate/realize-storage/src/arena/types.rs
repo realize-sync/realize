@@ -1,5 +1,6 @@
-use std::time::SystemTime;
 use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
+use std::time::SystemTime;
 
 use crate::StorageError;
 use crate::types::PathId;
@@ -47,20 +48,35 @@ mod engine_capnp {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum FileRealm {
     /// File is available as a regular file on the local filesystem
-    Local,
+    Local(PathBuf),
     /// File is remote. Its content may have been cached.
     Remote(CacheStatus),
 }
 
 impl FileRealm {
+    pub fn is_local(&self) -> bool {
+        matches!(self, FileRealm::Local(_))
+    }
+
+    pub fn is_remote(&self) -> bool {
+        !self.is_local()
+    }
+
     /// Return true if the file can be accessed without
     /// connecting to another host.
     pub fn is_available_offline(&self) -> bool {
         match self {
-            FileRealm::Local => true,
+            FileRealm::Local(_) => true,
             FileRealm::Remote(CacheStatus::Complete) => true,
             FileRealm::Remote(CacheStatus::Verified) => true,
             _ => false,
+        }
+    }
+
+    pub fn path(&self) -> Option<&std::path::Path> {
+        match self {
+            FileRealm::Local(path) => Some(path.as_path()),
+            FileRealm::Remote(_) => None,
         }
     }
 }
@@ -955,8 +971,10 @@ impl FileMetadata {
             size: m.len(),
             mtime: UnixTime::mtime(&m),
             version: e.version.clone(),
-            ctime: Some(UnixTime::from_system_time(m.created().unwrap_or(SystemTime::UNIX_EPOCH))
-                .unwrap_or(UnixTime::ZERO)),
+            ctime: Some(
+                UnixTime::from_system_time(m.created().unwrap_or(SystemTime::UNIX_EPOCH))
+                    .unwrap_or(UnixTime::ZERO),
+            ),
             mode: m.mode(),
             uid: Some(m.uid()),
             gid: Some(m.gid()),

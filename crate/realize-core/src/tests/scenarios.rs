@@ -132,7 +132,7 @@ async fn link_to_own() -> anyhow::Result<()> {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             assert!(store_foo_in_b.exists());
-            while cache_b.file_realm((arena, &store_foo)).await? != FileRealm::Local
+            while cache_b.file_realm((arena, &store_foo)).await?.is_remote()
                 && Instant::now() < deadline
             {
                 tokio::time::sleep(Duration::from_millis(100)).await;

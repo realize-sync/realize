@@ -3,15 +3,17 @@ use crate::fs::downloader::{Download, Downloader};
 use crate::rpc::HouseholdOperationError;
 use fuser::{FileType, MountOption};
 use nix::libc::{self, c_int};
+use nix::sys::{stat, time::TimeSpec};
+use nix::unistd::{Gid, Uid};
 use realize_storage::{
-    DirMetadata, FileContent, FileMetadata, Filesystem, Inode, Metadata, StorageError,
+    DirMetadata, FileContent, FileMetadata, FileRealm, Filesystem, Inode, Metadata, StorageError,
 };
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::SeekFrom;
 use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
@@ -136,45 +138,35 @@ impl fuser::Filesystem for RealizeFs {
     /// Set file attributes.
     fn setattr(
         &mut self,
-        req: &fuser::Request<'_>,
+        _req: &fuser::Request<'_>,
         ino: u64,
-        _mode: Option<u32>,
+        mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
-        _ctime: Option<SystemTime>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
+        ctime: Option<SystemTime>,
         fh: Option<u64>,
-        _crtime: Option<SystemTime>,
-        _chgtime: Option<SystemTime>,
-        _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
+        crtime: Option<SystemTime>,
+        chgtime: Option<SystemTime>,
+        bkuptime: Option<SystemTime>,
+        flags: Option<u32>,
         reply: fuser::ReplyAttr,
     ) {
-        if uid.is_some_and(|uid| uid != nix::unistd::getuid().as_raw())
-            || gid.is_some_and(|gid| gid != nix::unistd::getgid().as_raw())
-        {
-            log::debug!("SETATTR Inode({ino}): cannot change uid or gid");
-            reply.error(libc::EPERM);
-            return;
-        }
-
-        if let Some(size) = size {
-            let inner = Arc::clone(&self.inner);
-
-            self.handle.spawn(async move {
-                match inner.truncate(ino, fh, size).await {
-                    Err(err) => reply.error(err.log_and_convert()),
-                    Ok(attr) => reply.attr(&TTL, &attr),
-                }
-            });
-            return;
-        }
-
-        // Ignore the rest
-        log::debug!("SETATTR {ino}: ignore");
-        self.getattr(req, ino, fh, reply)
+        let inner = Arc::clone(&self.inner);
+        self.handle.spawn(async move {
+            match inner
+                .setattr(
+                    ino, mode, uid, gid, size, atime, mtime, ctime, fh, crtime, chgtime, bkuptime,
+                    flags,
+                )
+                .await
+            {
+                Err(err) => reply.error(err.log_and_convert()),
+                Ok(attr) => reply.attr(&TTL, &attr),
+            }
+        });
     }
 
     fn readlink(&mut self, _req: &fuser::Request<'_>, ino: u64, reply: fuser::ReplyData) {
@@ -631,19 +623,105 @@ impl InnerRealizeFs {
         }
     }
 
-    async fn truncate(
+    async fn setattr(
         &self,
         ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<SystemTime>,
         fh: Option<u64>,
-        size: u64,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<u32>,
     ) -> Result<fuser::FileAttr, FuseError> {
+        if let Some(size) = size {
+            // truncate is called first because it'll move the file
+            // from the remote to the local realm, if needed, which
+            // allows other attributes to be set.
+            self.truncate(ino, fh, size).await?;
+        }
+        match self.fs.file_realm(Inode(ino)).await? {
+            FileRealm::Remote(_) => {
+                if uid.is_some_and(|uid| uid != nix::unistd::getuid().as_raw())
+                    || gid.is_some_and(|gid| gid != nix::unistd::getgid().as_raw())
+                {
+                    log::debug!(
+                        "SETATTR Inode({ino})@remote: cannot change uid or gid of remote file"
+                    );
+                    return Err(FuseError::Errno(libc::EPERM));
+                }
+
+                // Ignore the rest
+                log::debug!("SETATTR Inode({ino})@remote: ignored");
+            }
+            FileRealm::Local(path) => {
+                log::debug!("SETATTR Inode({ino})@remote: change {path:?}");
+                if mode.is_some()
+                    || uid.is_some()
+                    || gid.is_some()
+                    || atime.is_some()
+                    || mtime.is_some()
+                {
+                    tokio::task::spawn_blocking(move || {
+                        let fd = nix::fcntl::open(
+                            &path,
+                            nix::fcntl::OFlag::O_WRONLY,
+                            stat::Mode::empty(),
+                        )?;
+                        if let Some(mode) = mode {
+                            let mode = stat::Mode::from_bits_truncate(mode);
+                            log::debug!("SETATTR Inode({ino})@remote: set mode=0o{:o} {mode:?}", mode.bits());
+                            nix::sys::stat::fchmod(&fd, mode)?;
+                        }
+                        if uid.is_some() || gid.is_some() {
+                            let uid_val = uid.map(Uid::from_raw);
+                            let gid_val = gid.map(Gid::from_raw);
+                            log::debug!(
+                                "SETATTR Inode({ino})@remote: set ownership {uid_val:?}:{gid_val:?}"
+                            );
+                            nix::unistd::fchown(&fd, uid_val, gid_val)?;
+                        }
+                        if atime.is_some() || mtime.is_some() {
+                            let atime_spec = atime
+                                .map(Self::time_or_now_to_timespec)
+                                .unwrap_or_else(Self::timespec_unchanged);
+                            let mtime_spec = mtime
+                                .map(Self::time_or_now_to_timespec)
+                                .unwrap_or_else(Self::timespec_unchanged);
+
+                            log::debug!(
+                                "SETATTR Inode({ino})@remote: set atime={atime_spec:?} mtime={mtime_spec:?}"
+                            );
+
+                            stat::futimens(&fd, &atime_spec, &mtime_spec)?;
+                        }
+
+                        Ok::<(), FuseError>(())
+                    })
+                    .await??;
+                }
+
+                // Note: ctime, crtime, chgtime, bkuptime, flags are
+                // not supported/ignored as they are macOS-specific
+            }
+        }
+
+        self.getattr(ino, fh).await
+    }
+
+    async fn truncate(&self, ino: u64, fh: Option<u64>, size: u64) -> Result<(), FuseError> {
         if let Some(fh) = fh {
             let handle = self.get_handle(fh).await?;
             if let FileHandle::Real(file) = &mut *handle.lock().await {
                 file.set_len(size).await?;
                 log::debug!("SETATTR {ino}: Truncate file FH#{fh} to {size}");
 
-                return Ok(metadata_to_attr(&file.metadata().await?, ino));
+                return Ok(());
             }
         }
         match self.fs.file_content(Inode(ino)).await? {
@@ -656,7 +734,7 @@ impl InnerRealizeFs {
                 {
                     file.set_len(size).await?;
                     file.flush().await?;
-                    return Ok(metadata_to_attr(&file.metadata().await?, ino));
+                    return Ok(());
                 }
             }
             FileContent::Remote(mut blob) => {
@@ -664,7 +742,7 @@ impl InnerRealizeFs {
                 let (_, mut file) = blob.realize().await?;
                 file.set_len(size).await?;
                 file.flush().await?;
-                return Ok(metadata_to_attr(&file.metadata().await?, ino));
+                return Ok(());
             }
         }
 
@@ -924,6 +1002,29 @@ impl InnerRealizeFs {
             flags: 0,
         }
     }
+
+    /// Convert fuser::TimeOrNow to nix::sys::time::TimeSpec
+    fn time_or_now_to_timespec(time_or_now: fuser::TimeOrNow) -> TimeSpec {
+        match time_or_now {
+            fuser::TimeOrNow::SpecificTime(system_time) => {
+                let duration = system_time
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or(Duration::ZERO);
+                TimeSpec::from(duration)
+            }
+            fuser::TimeOrNow::Now => {
+                let duration = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or(Duration::ZERO);
+                TimeSpec::from(duration)
+            }
+        }
+    }
+
+    /// Create a timespec that means "do not change"
+    fn timespec_unchanged() -> TimeSpec {
+        TimeSpec::UTIME_OMIT
+    }
 }
 
 fn openoptions_from_flags(flags: i32) -> tokio::fs::OpenOptions {
@@ -955,6 +1056,9 @@ enum FuseError {
 
     #[error("errno {0}")]
     Errno(c_int),
+
+    #[error("tokio runtime error {0}")]
+    Join(#[from] tokio::task::JoinError),
 }
 
 impl FuseError {
@@ -966,6 +1070,7 @@ impl FuseError {
             FuseError::Io(ioerr) => io_errno(ioerr.kind()),
             FuseError::Errno(errno) => *errno,
             FuseError::Rpc(err) => io_errno(err.io_kind()),
+            FuseError::Join(_) => libc::EIO,
         }
     }
 
@@ -976,6 +1081,12 @@ impl FuseError {
         log::debug!("FUSE operation error: {self:?} -> {errno}");
 
         errno
+    }
+}
+
+impl From<nix::errno::Errno> for FuseError {
+    fn from(value: nix::errno::Errno) -> Self {
+        FuseError::Errno(value as c_int)
     }
 }
 
@@ -1057,6 +1168,7 @@ fn metadata_to_attr(m: &std::fs::Metadata, ino: u64) -> fuser::FileAttr {
 mod tests {
     use super::*;
     use crate::rpc::testing::{self, HouseholdFixture};
+    use nix::fcntl::AT_FDCWD;
     use realize_storage::utils::hash;
     use std::io::Write;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -1829,9 +1941,9 @@ mod tests {
 
                 let mount_path = fixture.mount_path();
                 let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
-                let modified_path = arena_path.join("modified");
-                let unmodified_path = arena_path.join("unmodified");
-                tokio::fs::write(&modified_path, "modified").await.unwrap();
+                let local_path = arena_path.join("modified");
+                let remote_path = arena_path.join("unmodified");
+                tokio::fs::write(&local_path, "modified").await.unwrap();
 
                 let current_uid = nix::unistd::getuid();
                 let current_gid = nix::unistd::getgid();
@@ -1842,11 +1954,7 @@ mod tests {
                 groups.retain(|gid| *gid != current_gid);
                 let othergroup = groups.into_iter().next();
 
-                // We test chown against the following files:
-                //  - unmodified, a cached file.
-                //  - modified, locally modified file, stored in
-                //    datadir, that's accessed through FUSE.
-                for path in [&modified_path, &unmodified_path] {
+                for path in [&local_path, &remote_path] {
                     // no-op chown succeeds
                     tokio::task::spawn_blocking({
                         let path = path.clone();
@@ -1854,37 +1962,27 @@ mod tests {
                     })
                     .await?
                     .expect("chown {path:?}");
+                }
 
-                    // modified chown fails (changing groups would
-                    // normally be allowed, but realize doesn't allow
-                    // it)
-                    if let Some(othergroup) = othergroup {
-                        assert_eq!(
-                            tokio::task::spawn_blocking({
-                                let path = path.clone();
-                                move || {
-                                    nix::unistd::chown(&path, Some(current_uid), Some(othergroup))
-                                }
-                            })
-                            .await?,
-                            Err(nix::errno::Errno::EPERM)
-                        )
-                    }
-                    // modified chown fails (changing uid would normally be disallowed)
+                // Realize doesn't allow changing groups on remote files
+                if let Some(othergroup) = othergroup {
                     assert_eq!(
                         tokio::task::spawn_blocking({
-                            let path = path.clone();
-                            move || {
-                                nix::unistd::chown(
-                                    &path,
-                                    Some(nix::unistd::Uid::from_raw(current_uid.as_raw() + 1)),
-                                    None,
-                                )
-                            }
+                            let path = remote_path.clone();
+                            move || nix::unistd::chown(&path, Some(current_uid), Some(othergroup))
                         })
                         .await?,
                         Err(nix::errno::Errno::EPERM)
-                    );
+                    )
+                }
+
+                // Changing groups on local files is allowed
+                if let Some(othergroup) = othergroup {
+                    tokio::task::spawn_blocking({
+                        let path = local_path.clone();
+                        move || nix::unistd::chown(&path, Some(current_uid), Some(othergroup))
+                    })
+                    .await??;
                 }
 
                 Ok::<(), anyhow::Error>(())
@@ -2293,6 +2391,169 @@ mod tests {
             .await?;
         fixture.unmount().await?;
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn setattr_chmod_local_file() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                let file_path = arena_path.join("chmod_test.txt");
+
+                // Create a new file to make it local
+                tokio::fs::write(&file_path, "test content").await?;
+
+                // Verify initial permissions
+                let initial_meta = tokio::fs::metadata(&file_path).await?;
+                let initial_mode = initial_meta.permissions().mode() & 0o777;
+                assert!((initial_mode & 0o777) != 0o750);
+
+                // Change permissions
+                let new_perms = std::fs::Permissions::from_mode(0o750);
+                tokio::fs::set_permissions(&file_path, new_perms).await?;
+
+                // Check permissions via FUSE mountpoint
+                let fuse_meta = tokio::fs::metadata(&file_path).await?;
+                let expected_mode = 0o750;
+                assert_eq!(expected_mode, fuse_meta.permissions().mode() & 0o777);
+
+                // Check permissions in underlying datadir
+                let datadir_path = fixture.inner.arena_root(a).join("chmod_test.txt");
+                let datadir_meta = tokio::fs::metadata(&datadir_path).await?;
+                assert_eq!(expected_mode, datadir_meta.permissions().mode() & 0o777);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn setattr_chown_local_file() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                let file_path = arena_path.join("chown_test.txt");
+
+                // Create a new file to make it local
+                tokio::fs::write(&file_path, "test content").await?;
+
+                let current_uid = nix::unistd::getuid();
+                let current_gid = nix::unistd::getgid();
+
+                // No-op chown should succeed
+                tokio::task::spawn_blocking({
+                    let path = file_path.clone();
+                    move || nix::unistd::chown(&path, Some(current_uid), Some(current_gid))
+                })
+                .await?
+                .expect("chown with same uid/gid should succeed");
+
+                // Verify ownership via FUSE mountpoint
+                let fuse_meta = tokio::fs::metadata(&file_path).await?;
+                assert_eq!(current_uid.as_raw(), fuse_meta.uid());
+                assert_eq!(current_gid.as_raw(), fuse_meta.gid());
+
+                // Verify ownership in underlying datadir
+                let datadir_path = fixture.inner.arena_root(a).join("chown_test.txt");
+                let datadir_meta = tokio::fs::metadata(&datadir_path).await?;
+                assert_eq!(current_uid.as_raw(), datadir_meta.uid());
+                assert_eq!(current_gid.as_raw(), datadir_meta.gid());
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn setattr_utimens_local_file() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                let file_path = arena_path.join("utimens_test.txt");
+
+                // Create a new file to make it local
+                tokio::fs::write(&file_path, "test content").await?;
+
+                // Wait a bit to ensure different timestamps
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                // Set specific timestamps using nix directly
+                let target_time =
+                    SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1234567890);
+                let target_timespec =
+                    TimeSpec::from(target_time.duration_since(SystemTime::UNIX_EPOCH).unwrap());
+
+                tokio::task::spawn_blocking({
+                    let path = file_path.clone();
+                    let atime_spec = target_timespec.clone();
+                    let mtime_spec = target_timespec.clone();
+                    move || {
+                        stat::utimensat(
+                            AT_FDCWD,
+                            &path,
+                            &atime_spec,
+                            &mtime_spec,
+                            stat::UtimensatFlags::FollowSymlink,
+                        )
+                    }
+                })
+                .await?
+                .expect("utimensat should succeed");
+
+                // Check timestamps via FUSE mountpoint
+                let fuse_meta = tokio::fs::metadata(&file_path).await?;
+                let fuse_mtime = fuse_meta.modified()?;
+                let fuse_mtime_secs = fuse_mtime.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+                assert_eq!(1234567890, fuse_mtime_secs);
+
+                // Check timestamps in underlying datadir
+                let datadir_path = fixture.inner.arena_root(a).join("utimens_test.txt");
+                let datadir_meta = tokio::fs::metadata(&datadir_path).await?;
+                let datadir_mtime = datadir_meta.modified()?;
+                let datadir_mtime_secs = datadir_mtime
+                    .duration_since(SystemTime::UNIX_EPOCH)?
+                    .as_secs();
+                assert_eq!(1234567890, datadir_mtime_secs);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
         Ok(())
     }
 
