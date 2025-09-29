@@ -146,21 +146,21 @@ impl fuser::Filesystem for RealizeFs {
         size: Option<u64>,
         atime: Option<fuser::TimeOrNow>,
         mtime: Option<fuser::TimeOrNow>,
-        ctime: Option<SystemTime>,
+        _ctime: Option<SystemTime>,
         fh: Option<u64>,
-        crtime: Option<SystemTime>,
-        chgtime: Option<SystemTime>,
-        bkuptime: Option<SystemTime>,
-        flags: Option<u32>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<u32>,
         reply: fuser::ReplyAttr,
     ) {
+        // Note: ctime, crtime, chgtime, bkuptime, flags are
+        // not supported/ignored for now as they are macOS-specific
+
         let inner = Arc::clone(&self.inner);
         self.handle.spawn(async move {
             match inner
-                .setattr(
-                    ino, mode, uid, gid, size, atime, mtime, ctime, fh, crtime, chgtime, bkuptime,
-                    flags,
-                )
+                .setattr(ino, mode, uid, gid, size, atime, mtime, fh)
                 .await
             {
                 Err(err) => reply.error(err.log_and_convert()),
@@ -632,12 +632,7 @@ impl InnerRealizeFs {
         size: Option<u64>,
         atime: Option<fuser::TimeOrNow>,
         mtime: Option<fuser::TimeOrNow>,
-        _ctime: Option<SystemTime>,
         fh: Option<u64>,
-        _crtime: Option<SystemTime>,
-        _chgtime: Option<SystemTime>,
-        _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
     ) -> Result<fuser::FileAttr, FuseError> {
         if let Some(size) = size {
             // truncate is called first because it'll move the file
@@ -668,6 +663,7 @@ impl InnerRealizeFs {
                     || mtime.is_some()
                 {
                     tokio::task::spawn_blocking(move || {
+                        // TODO: reuse FH if available
                         let fd = nix::fcntl::open(
                             &path,
                             nix::fcntl::OFlag::O_WRONLY,
@@ -705,9 +701,6 @@ impl InnerRealizeFs {
                     })
                     .await??;
                 }
-
-                // Note: ctime, crtime, chgtime, bkuptime, flags are
-                // not supported/ignored as they are macOS-specific
             }
         }
 
@@ -727,15 +720,13 @@ impl InnerRealizeFs {
         match self.fs.file_content(Inode(ino)).await? {
             FileContent::Local(realpath) => {
                 log::debug!("SETATTR {ino}: Truncate file, mapped to {realpath:?} to {size}");
-                if let Ok(mut file) = tokio::fs::OpenOptions::new()
+                let mut file = tokio::fs::OpenOptions::new()
                     .write(true)
                     .open(&realpath)
-                    .await
-                {
-                    file.set_len(size).await?;
-                    file.flush().await?;
-                    return Ok(());
-                }
+                    .await?;
+                file.set_len(size).await?;
+                file.flush().await?;
+                return Ok(());
             }
             FileContent::Remote(mut blob) => {
                 self.downloader.complete_blob(&mut blob).await?;
@@ -745,8 +736,6 @@ impl InnerRealizeFs {
                 return Ok(());
             }
         }
-
-        return Err(FuseError::Errno(libc::EBADF));
     }
 
     async fn readdir(
