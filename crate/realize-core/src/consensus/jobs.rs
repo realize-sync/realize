@@ -81,7 +81,7 @@ pub(crate) async fn download(
             return verify(household, job_id, blob, avail, progress, shutdown).await;
         }
 
-        CacheStatus::Missing | CacheStatus::Partial => {
+        CacheStatus::Missing | CacheStatus::Partial(_, _) => {
             let avail = match blob.remote_availability().await? {
                 Some(a) => a,
                 None => {

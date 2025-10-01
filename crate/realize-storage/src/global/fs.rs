@@ -6,7 +6,7 @@ use crate::arena::types::{DirMetadata, FileRealm};
 use crate::global::db::GlobalWriteTransaction;
 use crate::global::types::PathTableEntry;
 use crate::utils::holder::Holder;
-use crate::{Blob, FileMetadata, Inode, PathId, StorageError};
+use crate::{Blob, FileMetadata, Inode, Mark, PathId, StorageError};
 use realize_types::{Arena, Path, Peer, UnixTime};
 use redb::ReadableTable;
 use std::collections::HashMap;
@@ -593,6 +593,22 @@ impl Filesystem {
             let (fs, loc) = this.resolve_arena_loc(loc)?;
 
             fs.create(options, loc)
+        })
+        .await?
+    }
+
+    /// Return the mark value and whether it was set directly on this inode
+    pub async fn get_mark<L: Into<FsLoc>>(
+        self: &Arc<Self>,
+        loc: L,
+    ) -> Result<(Mark, bool), StorageError> {
+        let loc = loc.into();
+        let this = Arc::clone(self);
+
+        task::spawn_blocking(move || {
+            let (fs, loc) = this.resolve_arena_loc(loc)?;
+
+            fs.get_mark(loc)
         })
         .await?
     }

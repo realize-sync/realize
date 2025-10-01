@@ -6,7 +6,8 @@ use nix::libc::{self, c_int};
 use nix::sys::{stat, time::TimeSpec};
 use nix::unistd::{Gid, Uid};
 use realize_storage::{
-    DirMetadata, FileContent, FileMetadata, FileRealm, Filesystem, Inode, Metadata, StorageError,
+    CacheStatus, DirMetadata, FileContent, FileMetadata, FileRealm, Filesystem, Inode, Metadata,
+    StorageError, Version,
 };
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -20,6 +21,9 @@ use tokio::sync::Mutex;
 use tokio_util::bytes::BufMut;
 
 const TTL: Duration = Duration::ZERO;
+const XATTR_MARK: &str = "realize.mark";
+const XATTR_STATUS: &str = "realize.status";
+const XATTR_VERSION: &str = "realize.version";
 
 /// Mount the cache as FUSE filesystem at the given mountpoint.
 pub fn export(
@@ -333,13 +337,24 @@ impl fuser::Filesystem for RealizeFs {
         size: u32,
         reply: fuser::ReplyXattr,
     ) {
-        log::debug!(
-            "[Not Implemented] getxattr(ino: {:#x?}, name: {:?}, size: {})",
-            ino,
-            name,
-            size
-        );
-        reply.error(libc::ENOSYS);
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_owned();
+
+        self.handle.spawn(async move {
+            match inner.getxattr(ino, name).await {
+                Err(err) => reply.error(err.log_and_convert()),
+                Ok(val) => {
+                    let val = val.as_bytes();
+                    if size == 0 {
+                        reply.size(val.len() as u32);
+                    } else if size <= (val.len() as u32) {
+                        reply.data(val);
+                    } else {
+                        reply.error(libc::ERANGE);
+                    }
+                }
+            }
+        });
     }
 
     fn listxattr(
@@ -349,12 +364,27 @@ impl fuser::Filesystem for RealizeFs {
         size: u32,
         reply: fuser::ReplyXattr,
     ) {
-        log::debug!(
-            "[Not Implemented] listxattr(ino: {:#x?}, size: {})",
-            ino,
-            size
-        );
-        reply.error(libc::ENOSYS);
+        let inner = Arc::clone(&self.inner);
+        self.handle.spawn(async move {
+            match inner.listxattr(ino).await {
+                Err(err) => reply.error(err.log_and_convert()),
+                Ok(names) => {
+                    let mut bytes = names.join("\0").into_bytes();
+                    if !bytes.is_empty() {
+                        bytes.push(0);
+                    }
+                    if size == 0 {
+                        log::debug!("listxattr returns size");
+                        reply.size(bytes.len() as u32);
+                    } else if size <= (bytes.len() as u32) {
+                        log::debug!("listxattr returns data: {bytes:?}");
+                        reply.data(bytes.as_slice());
+                    } else {
+                        reply.error(libc::ERANGE);
+                    }
+                }
+            }
+        });
     }
 
     fn removexattr(
@@ -580,6 +610,49 @@ impl InnerRealizeFs {
             Metadata::File(file_metadata) => Ok(self.build_file_attr(Inode(ino), &file_metadata)),
             Metadata::Dir(dir_metadata) => Ok(self.build_dir_attr(Inode(ino), dir_metadata)),
         }
+    }
+
+    async fn listxattr(&self, ino: u64) -> Result<Vec<&'static str>, FuseError> {
+        if let Metadata::File(_) = self.fs.metadata(Inode(ino)).await? {
+            return Ok(vec![XATTR_MARK, XATTR_STATUS, XATTR_VERSION]);
+        }
+
+        Ok(vec![XATTR_MARK])
+    }
+
+    async fn getxattr(&self, ino: u64, name: OsString) -> Result<String, FuseError> {
+        if name == XATTR_MARK {
+            let (mark, direct) = self.fs.get_mark(Inode(ino)).await?;
+            if direct {
+                return Ok(mark.to_string());
+            }
+            return Ok(format!("{} (derived)", mark));
+        }
+
+        if name == XATTR_STATUS {
+            return Ok(match self.fs.file_realm(Inode(ino)).await? {
+                FileRealm::Local(_) => "local 100%".to_string(),
+                FileRealm::Remote(CacheStatus::Missing) => "remote 0%".to_string(),
+                FileRealm::Remote(CacheStatus::Complete) => "remote 100%".to_string(),
+                FileRealm::Remote(CacheStatus::Verified) => "remote 100% verified".to_string(),
+                FileRealm::Remote(CacheStatus::Partial(size, available_ranges)) => {
+                    format!(
+                        "remote {:0.0}%",
+                        (available_ranges.bytecount() as f64) / (size as f64) * 100.0
+                    )
+                }
+            });
+        }
+
+        if name == XATTR_VERSION {
+            let m = self.fs.file_metadata(Inode(ino)).await?;
+            return Ok(match m.version {
+                Version::Modified(_) => "modified".to_string(),
+                Version::Indexed(hash) => hash.to_string(),
+            });
+        }
+
+        Err(FuseError::Errno(libc::ENODATA))
     }
 
     async fn read(&self, fh: u64, offset: i64, size: u32) -> Result<Vec<u8>, FuseError> {
@@ -901,7 +974,9 @@ impl InnerRealizeFs {
     async fn flush(&self, fh: u64) -> Result<(), FuseError> {
         let handle = self.get_handle(fh).await?;
         match &mut *handle.lock().await {
-            FileHandle::Cached(_) => {}
+            FileHandle::Cached(blob) => {
+                blob.update_db().await?;
+            }
             FileHandle::Real(file) => {
                 log::debug!("Flush FH#{fh}");
                 file.flush().await?;
@@ -1158,8 +1233,9 @@ mod tests {
     use super::*;
     use crate::rpc::testing::{self, HouseholdFixture};
     use nix::fcntl::AT_FDCWD;
+    use realize_storage::Mark;
     use realize_storage::utils::hash;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::PathBuf;
     use std::time::Instant;
@@ -1241,6 +1317,38 @@ mod tests {
                 handle.join_blocking();
             }
         }
+    }
+
+    // Helper functions for xattr operations. Returns FuseError to
+    // make it easier to test I/O error codes than anyhow::Error.
+    async fn getxattr<P: AsRef<std::path::Path>>(
+        path: P,
+        name: &str,
+    ) -> Result<Option<String>, FuseError> {
+        let path = path.as_ref().to_path_buf();
+        let name = name.to_string();
+
+        tokio::task::spawn_blocking(move || match xattr::get(&path, &name)? {
+            Some(data) => Ok(Some(String::from_utf8(data).unwrap())),
+            None => Ok(None),
+        })
+        .await?
+    }
+
+    // Helper functions for xattr operations. Returns FuseError to
+    // make it easier to test I/O error codes than anyhow::Error.
+    async fn listxattr<P: AsRef<std::path::Path>>(path: P) -> Result<Vec<String>, FuseError> {
+        let path = path.as_ref().to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            let list = xattr::list(&path)?;
+            let attrs: Vec<String> = list
+                .map(|name| name.to_string_lossy().to_string())
+                .collect();
+            log::debug!("xattr::list({:?}) returned: {:?}", path, attrs);
+            Ok(attrs)
+        })
+        .await?
     }
 
     #[tokio::test]
@@ -2594,6 +2702,276 @@ mod tests {
                 // Check that we can read the content back
                 let content = fs::read_to_string(&file_path).await?;
                 assert_eq!("subdir content", content);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn list_file_and_dir_xattrs() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+
+                fixture
+                    .inner
+                    .write_file_and_wait(b, a, "foo/bar", "test")
+                    .await?;
+
+                fixture.mount(household_a).await?;
+
+                let mount_path = fixture.mount_path();
+                let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                let file_path = arena_path.join("foo/bar");
+                let dir_path = arena_path.join("foo");
+
+                assert_eq!(
+                    vec!["realize.mark".to_string(),],
+                    listxattr(&dir_path).await.unwrap()
+                );
+                assert_eq!(
+                    vec![
+                        "realize.mark".to_string(),
+                        "realize.status".to_string(),
+                        "realize.version".to_string()
+                    ],
+                    listxattr(&file_path).await.unwrap()
+                );
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn get_mark_xattrs() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                let arena = HouseholdFixture::test_arena();
+
+                fixture
+                    .inner
+                    .write_file_and_wait(b, a, "foo/bar", "test")
+                    .await?;
+
+                fixture.mount(household_a).await?;
+
+                let mountpoint = fixture.mount_path();
+                let datadir = mountpoint.join(HouseholdFixture::test_arena().as_str());
+                let file_path = realize_types::Path::parse("foo/bar")?;
+                let dir_path = realize_types::Path::parse("foo")?;
+                let file_realpath = file_path.within(&datadir);
+                let dir_realpath = dir_path.within(&datadir);
+
+                assert_eq!(
+                    Some("watch (derived)".to_string()),
+                    getxattr(&dir_realpath, "realize.mark").await.unwrap()
+                );
+                assert_eq!(
+                    Some("watch (derived)".to_string()),
+                    getxattr(&file_realpath, "realize.mark").await.unwrap()
+                );
+
+                let storage = fixture.inner.storage(a)?;
+                storage.set_mark(arena, &dir_path, Mark::Keep).await?;
+
+                assert_eq!(
+                    Some("keep".to_string()),
+                    getxattr(&dir_realpath, "realize.mark").await.unwrap()
+                );
+                assert_eq!(
+                    Some("keep (derived)".to_string()),
+                    getxattr(&file_realpath, "realize.mark").await.unwrap()
+                );
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn get_version_xattrs() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+
+                let (file_path, hash) = fixture
+                    .inner
+                    .write_file_and_wait(b, a, "foo/bar", "test")
+                    .await?;
+
+                fixture.mount(household_a).await?;
+
+                let mountpoint = fixture.mount_path();
+                let datadir = mountpoint.join(HouseholdFixture::test_arena().as_str());
+                let file_realpath = file_path.within(&datadir);
+                let dir_realpath = datadir.join("foo");
+
+                assert_eq!(
+                    Some(hash.to_string()),
+                    getxattr(&file_realpath, "realize.version").await.unwrap()
+                );
+                tokio::fs::write(&file_realpath, "overwrite").await?;
+
+                // Depending on how fast this is executed, the local
+                // file may or may not have been re-hashed yet.
+                let got = getxattr(&file_realpath, "realize.version")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    got == "modified" || got == hash::digest("overwrite").to_string(),
+                    "version: '{got}'"
+                );
+
+                assert_eq!(
+                    Some(libc::EISDIR),
+                    getxattr(&dir_realpath, "realize.version")
+                        .await
+                        .err()
+                        .map(|e| e.errno())
+                );
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn get_status_xattr() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                let arena = HouseholdFixture::test_arena();
+
+                let data = "x".to_string().repeat(32 * 1024);
+                let (file_path, _) = fixture
+                    .inner
+                    .write_file_and_wait(b, a, "foo/bar", &data)
+                    .await?;
+
+                fixture.mount(household_a).await?;
+
+                let mountpoint = fixture.mount_path();
+                let datadir = mountpoint.join(HouseholdFixture::test_arena().as_str());
+                let file_realpath = file_path.within(&datadir);
+                let dir_realpath = datadir.join("foo");
+
+                assert_eq!(
+                    Some(libc::EISDIR),
+                    getxattr(&dir_realpath, "realize.version")
+                        .await
+                        .err()
+                        .map(|e| e.errno())
+                );
+
+                assert_eq!(
+                    Some("remote 0%".to_string()),
+                    getxattr(&file_realpath, "realize.status").await.unwrap()
+                );
+
+                // read a part of the file, so it'll be incomplete
+                tokio::task::spawn_blocking({
+                    let file_realpath = file_realpath.clone();
+                    move || {
+                        let mut file = std::fs::File::open(&file_realpath)?;
+                        let mut buf = [1; 10];
+                        file.read(&mut buf)?;
+                        Ok::<(), std::io::Error>(())
+                    }
+                })
+                .await??;
+
+                assert_eq!(
+                    Some("remote 75%".to_string()),
+                    getxattr(&file_realpath, "realize.status").await.unwrap()
+                );
+
+                // download the whole of the file
+                tokio::fs::read(&file_realpath).await?;
+
+                assert_eq!(
+                    Some("remote 100%".to_string()),
+                    getxattr(&file_realpath, "realize.status").await.unwrap()
+                );
+
+                fixture
+                    .inner
+                    .cache(a)?
+                    .file_content((arena, &file_path))
+                    .await?
+                    .blob()
+                    .unwrap()
+                    .mark_verified()
+                    .await?;
+
+                assert_eq!(
+                    Some("remote 100% verified".to_string()),
+                    getxattr(&file_realpath, "realize.status").await.unwrap()
+                );
+
+                let local_realpath = datadir.join("local");
+                tokio::task::spawn_blocking({
+                    let local_realpath = local_realpath.clone();
+                    move || {
+                        let mut file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .write(true)
+                            .open(&local_realpath)?;
+                        file.write_all(b"test")?;
+                        file.flush()?;
+                        drop(file);
+                        Ok::<(), std::io::Error>(())
+                    }
+                })
+                .await??;
+
+                assert_eq!(
+                    Some("local 100%".to_string()),
+                    getxattr(&local_realpath, "realize.status").await.unwrap()
+                );
 
                 Ok::<(), anyhow::Error>(())
             })

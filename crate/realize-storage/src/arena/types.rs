@@ -1,13 +1,12 @@
-use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
-use std::time::SystemTime;
-
 use crate::StorageError;
 use crate::types::PathId;
 use crate::utils::holder::{ByteConversionError, ByteConvertible, NamedType};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
 use realize_types::{self, Arena, ByteRanges, Hash, Path, Peer, UnixTime};
+use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
+use std::time::SystemTime;
 
 #[allow(dead_code)]
 #[allow(unknown_lints)]
@@ -88,7 +87,7 @@ pub enum CacheStatus {
 
     /// File is only partially available locally, and here is its size
     /// and available range.
-    Partial,
+    Partial(u64, ByteRanges),
 
     /// File is available locally, but its content hasn't been verified.
     Complete,
@@ -560,6 +559,16 @@ pub enum Mark {
     Keep,
     /// Files marked as "own" belong in the real. They should be moved into the arena root as regular files.
     Own,
+}
+
+impl std::fmt::Display for Mark {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Mark::Watch => "watch",
+            Mark::Keep => "keep",
+            Mark::Own => "own",
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

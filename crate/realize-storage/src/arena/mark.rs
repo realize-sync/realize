@@ -68,7 +68,8 @@ pub(crate) fn set_arena_mark(db: &Arc<ArenaDatabase>, mark: Mark) -> Result<(), 
 pub(crate) fn get_arena_mark(db: &Arc<ArenaDatabase>) -> Result<Mark, StorageError> {
     let txn = db.begin_read()?;
     let root = txn.read_tree()?.root();
-    let mark = txn.read_marks()?.get_at_pathid(&txn.read_tree()?, root)?;
+    let mark = txn.read_marks()?.get(&txn.read_tree()?, root)?;
+
     Ok(mark)
 }
 pub(crate) fn clear_arena_mark<'a, L: Into<TreeLoc<'a>>>(
@@ -122,7 +123,7 @@ pub(crate) trait MarkReadOperations {
         &self,
         tree: &impl TreeReadOperations,
         pathid: PathId,
-    ) -> Result<Mark, StorageError>;
+    ) -> Result<(Mark, bool), StorageError>;
 }
 
 impl<T> MarkReadOperations for ReadableOpenMark<T>
@@ -133,7 +134,7 @@ where
         &self,
         tree: &impl TreeReadOperations,
         pathid: PathId,
-    ) -> Result<Mark, StorageError> {
+    ) -> Result<(Mark, bool), StorageError> {
         get_at_pathid(&self.table, tree, pathid)
     }
 }
@@ -143,7 +144,7 @@ impl<'a> MarkReadOperations for WritableOpenMark<'a> {
         &self,
         tree: &impl TreeReadOperations,
         pathid: PathId,
-    ) -> Result<Mark, StorageError> {
+    ) -> Result<(Mark, bool), StorageError> {
         get_at_pathid(&self.table, tree, pathid)
     }
 }
@@ -160,6 +161,14 @@ pub(crate) trait MarkExt {
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<Mark, StorageError>;
+
+    /// Get the mark at the given location and whether it was set
+    /// directly (true) or is derived (false).
+    fn get_full<'a, L: Into<TreeLoc<'a>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<(Mark, bool), StorageError>;
 }
 impl<T: MarkReadOperations> MarkExt for T {
     fn get<'a, L: Into<TreeLoc<'a>>>(
@@ -167,6 +176,16 @@ impl<T: MarkReadOperations> MarkExt for T {
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<Mark, StorageError> {
+        let (mark, _) = self.get_at_pathid(tree, tree.resolve_partial(loc)?)?;
+
+        Ok(mark)
+    }
+
+    fn get_full<'a, L: Into<TreeLoc<'a>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<(Mark, bool), StorageError> {
         self.get_at_pathid(tree, tree.resolve_partial(loc)?)
     }
 }
@@ -183,7 +202,7 @@ impl<'a> WritableOpenMark<'a> {
         mark: Mark,
     ) -> Result<(), StorageError> {
         let pathid = tree.setup(loc)?;
-        let old_mark = self.get_at_pathid(tree, pathid)?;
+        let old_mark = self.get(tree, pathid)?;
         tree.insert_and_incref(
             pathid,
             &mut self.table,
@@ -227,15 +246,19 @@ fn get_at_pathid(
     mark_table: &impl ReadableTable<PathId, Holder<'static, MarkTableEntry>>,
     tree: &impl TreeReadOperations,
     pathid: PathId,
-) -> Result<Mark, StorageError> {
-    for pathid in std::iter::once(Ok(pathid)).chain(tree.ancestors(pathid)) {
+) -> Result<(Mark, bool), StorageError> {
+    if let Some(e) = mark_table.get(pathid)? {
+        return Ok((e.value().parse()?.mark, true));
+    }
+
+    for pathid in tree.ancestors(pathid) {
         let pathid = pathid?;
         if let Some(e) = mark_table.get(pathid)? {
-            return Ok(e.value().parse()?.mark);
+            return Ok((e.value().parse()?.mark, false));
         }
     }
 
-    Ok(Mark::default())
+    Ok((Mark::default(), false))
 }
 
 #[cfg(test)]

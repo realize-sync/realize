@@ -5,12 +5,13 @@ use super::peer::PeersReadOperations;
 use super::tree::TreeExt;
 use super::types::FileMetadata;
 use super::update;
+use crate::arena::mark::MarkExt;
 use crate::arena::notifier::{Notification, Progress};
 use crate::arena::tree::TreeReadOperations;
 use crate::arena::types::DirMetadata;
 use crate::global::fs::FileContent;
 use crate::types::Inode;
-use crate::{Blob, FileRealm};
+use crate::{Blob, FileRealm, Mark};
 use crate::{PathId, StorageError};
 use realize_types::{Arena, Path, Peer};
 use std::sync::Arc;
@@ -368,6 +369,19 @@ impl ArenaFilesystem {
         txn.commit()?;
 
         Ok(())
+    }
+
+    pub(crate) fn get_mark(
+        &self,
+        loc: impl Into<ArenaFsLoc>,
+    ) -> Result<(Mark, bool), StorageError> {
+        let txn = self.db.begin_read()?;
+        let tree = txn.read_tree()?;
+        let cache = txn.read_cache()?;
+        let marks = txn.read_marks()?;
+        let loc = loc.into().into_tree_loc(&cache)?;
+
+        marks.get_full(&tree, loc)
     }
 }
 

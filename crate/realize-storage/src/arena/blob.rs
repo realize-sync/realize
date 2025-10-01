@@ -1,6 +1,6 @@
 use super::db::{ArenaDatabase, BeforeCommit};
 use super::dirty::WritableOpenDirty;
-use super::mark::MarkReadOperations;
+use super::mark::{MarkExt, MarkReadOperations};
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
 use super::types::{BlobTableEntry, CacheStatus, LruQueueId, Mark, QueueTableEntry};
 use crate::arena::cache::CacheReadOperations;
@@ -285,7 +285,7 @@ impl BlobInfo {
             return CacheStatus::Missing;
         }
 
-        CacheStatus::Partial
+        CacheStatus::Partial(self.size, self.available_ranges.clone())
     }
 }
 
@@ -1033,7 +1033,7 @@ fn choose_queue(
     marks: &impl MarkReadOperations,
     pathid: PathId,
 ) -> Result<LruQueueId, StorageError> {
-    let queue = match marks.get_at_pathid(tree, pathid)? {
+    let queue = match marks.get(tree, pathid)? {
         Mark::Watch => LruQueueId::WorkingArea,
         Mark::Keep | Mark::Own => LruQueueId::Protected,
     };
@@ -2881,7 +2881,10 @@ mod tests {
         // Test local availability - should be Partial
         let availability = blobs.cache_status(&tree, &path)?;
         match availability {
-            CacheStatus::Partial => {}
+            CacheStatus::Partial(size, ranges) => {
+                assert_eq!(size, 1000);
+                assert_eq!(partial_ranges, ranges);
+            }
             _ => panic!("Expected Partial availability, got {:?}", availability),
         }
 
