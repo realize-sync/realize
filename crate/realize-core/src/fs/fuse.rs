@@ -380,6 +380,24 @@ impl fuser::Filesystem for RealizeFs {
         });
     }
 
+    fn removexattr(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_owned();
+
+        self.handle.spawn(async move {
+            match inner.setxattr(ino, name, vec![]).await {
+                Err(err) => reply.error(err.log_and_convert()),
+                Ok(()) => reply.ok(),
+            }
+        });
+    }
+
     fn listxattr(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -408,21 +426,6 @@ impl fuser::Filesystem for RealizeFs {
                 }
             }
         });
-    }
-
-    fn removexattr(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        ino: u64,
-        name: &std::ffi::OsStr,
-        reply: fuser::ReplyEmpty,
-    ) {
-        log::debug!(
-            "[Not Implemented] removexattr(ino: {:#x?}, name: {:?})",
-            ino,
-            name
-        );
-        reply.error(libc::ENOSYS);
     }
 
     fn access(&mut self, _req: &fuser::Request<'_>, ino: u64, mask: i32, reply: fuser::ReplyEmpty) {
@@ -1393,6 +1396,19 @@ mod tests {
 
         tokio::task::spawn_blocking(move || {
             xattr::set(&path, &name, value.as_bytes())?;
+            Ok(())
+        })
+        .await?
+    }
+
+    // Helper functions for xattr operations. Returns FuseError to
+    // make it easier to test I/O error codes than anyhow::Error.
+    async fn clearxattr<P: AsRef<std::path::Path>>(path: P, name: &str) -> Result<(), FuseError> {
+        let path = path.as_ref().to_path_buf();
+        let name = name.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            xattr::remove(&path, &name)?;
             Ok(())
         })
         .await?
@@ -2960,6 +2976,54 @@ mod tests {
                     Some("watch (derived)".to_string()),
                     getxattr(&dir_realpath, "realize.mark").await.unwrap()
                 );
+                assert_eq!(
+                    Some("watch (derived)".to_string()),
+                    getxattr(&file_realpath, "realize.mark").await.unwrap()
+                );
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn clear_mark_xattrs() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                let _arena = HouseholdFixture::test_arena();
+
+                fixture
+                    .inner
+                    .write_file_and_wait(b, a, "foo/bar", "test")
+                    .await?;
+
+                fixture.mount(household_a).await?;
+
+                let mountpoint = fixture.mount_path();
+                let datadir = mountpoint.join(HouseholdFixture::test_arena().as_str());
+                let file_path = realize_types::Path::parse("foo/bar")?;
+                let file_realpath = file_path.within(&datadir);
+
+                setxattr(&file_realpath, "realize.mark", "keep").await?;
+
+                assert_eq!(
+                    Some("keep".to_string()),
+                    getxattr(&file_realpath, "realize.mark").await.unwrap()
+                );
+
+                clearxattr(&file_realpath, "realize.mark").await.unwrap();
+
                 assert_eq!(
                     Some("watch (derived)".to_string()),
                     getxattr(&file_realpath, "realize.mark").await.unwrap()
