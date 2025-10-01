@@ -612,6 +612,36 @@ impl Filesystem {
         })
         .await?
     }
+
+    /// Set a mark on the specified location
+    pub async fn set_mark<L: Into<FsLoc>>(
+        self: &Arc<Self>,
+        loc: L,
+        mark: Mark,
+    ) -> Result<(), StorageError> {
+        let loc = loc.into();
+        let this = Arc::clone(self);
+
+        task::spawn_blocking(move || {
+            let (fs, loc) = this.resolve_arena_loc(loc)?;
+
+            fs.set_mark(loc, mark)
+        })
+        .await?
+    }
+
+    /// Clear a mark from the specified location
+    pub async fn clear_mark<L: Into<FsLoc>>(self: &Arc<Self>, loc: L) -> Result<(), StorageError> {
+        let loc = loc.into();
+        let this = Arc::clone(self);
+
+        task::spawn_blocking(move || {
+            let (fs, loc) = this.resolve_arena_loc(loc)?;
+
+            fs.clear_mark(loc)
+        })
+        .await?
+    }
 }
 
 /// A location within the Filesystem.

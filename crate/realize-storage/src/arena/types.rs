@@ -571,6 +571,56 @@ impl std::fmt::Display for Mark {
     }
 }
 
+impl Mark {
+    /// Parse a mark value from a string representation
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "watch" => Some(Mark::Watch),
+            "keep" => Some(Mark::Keep),
+            "own" => Some(Mark::Own),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod mark_tests {
+    use super::*;
+
+    #[test]
+    fn test_mark_parse_valid_values() {
+        assert_eq!(Mark::parse("watch"), Some(Mark::Watch));
+        assert_eq!(Mark::parse("keep"), Some(Mark::Keep));
+        assert_eq!(Mark::parse("own"), Some(Mark::Own));
+    }
+
+    #[test]
+    fn test_mark_parse_invalid_values() {
+        assert_eq!(Mark::parse(""), None);
+        assert_eq!(Mark::parse("invalid"), None);
+        assert_eq!(Mark::parse("Watch"), None); // Case sensitive
+        assert_eq!(Mark::parse("KEEP"), None);
+        assert_eq!(Mark::parse(" watch "), None); // No trimming
+    }
+
+    #[test]
+    fn test_mark_display() {
+        assert_eq!(Mark::Watch.to_string(), "watch");
+        assert_eq!(Mark::Keep.to_string(), "keep");
+        assert_eq!(Mark::Own.to_string(), "own");
+    }
+
+    #[test]
+    fn test_mark_parse_round_trip() {
+        let marks = [Mark::Watch, Mark::Keep, Mark::Own];
+        for mark in marks {
+            let str_repr = mark.to_string();
+            let parsed = Mark::parse(&str_repr);
+            assert_eq!(parsed, Some(mark));
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MarkTableEntry {
     pub mark: Mark,

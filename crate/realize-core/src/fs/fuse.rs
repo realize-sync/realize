@@ -6,8 +6,8 @@ use nix::libc::{self, c_int};
 use nix::sys::{stat, time::TimeSpec};
 use nix::unistd::{Gid, Uid};
 use realize_storage::{
-    CacheStatus, DirMetadata, FileContent, FileMetadata, FileRealm, Filesystem, Inode, Metadata,
-    StorageError, Version,
+    CacheStatus, DirMetadata, FileContent, FileMetadata, FileRealm, Filesystem, Inode, Mark,
+    Metadata, StorageError, Version,
 };
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -357,6 +357,29 @@ impl fuser::Filesystem for RealizeFs {
         });
     }
 
+    /// Set an extended attribute.
+    fn setxattr(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        name: &std::ffi::OsStr,
+        value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_owned();
+        let value = value.to_vec();
+
+        self.handle.spawn(async move {
+            match inner.setxattr(ino, name, value).await {
+                Err(err) => reply.error(err.log_and_convert()),
+                Ok(()) => reply.ok(),
+            }
+        });
+    }
+
     fn listxattr(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -653,6 +676,28 @@ impl InnerRealizeFs {
         }
 
         Err(FuseError::Errno(libc::ENODATA))
+    }
+
+    async fn setxattr(&self, ino: u64, name: OsString, value: Vec<u8>) -> Result<(), FuseError> {
+        if name == XATTR_MARK {
+            // Parse the mark value from the byte slice
+            let value_str = std::str::from_utf8(&value)
+                .map_err(|_| FuseError::Errno(libc::EINVAL))?
+                .trim();
+
+            if value_str.is_empty() {
+                // Clear the mark
+                self.fs.clear_mark(Inode(ino)).await?;
+            } else {
+                // Parse and set the mark
+                let mark = Mark::parse(value_str).ok_or(FuseError::Errno(libc::EINVAL))?;
+                self.fs.set_mark(Inode(ino), mark).await?;
+            }
+            return Ok(());
+        }
+
+        // Other attributes are not supported for setting
+        Err(FuseError::Errno(libc::ENOTSUP))
     }
 
     async fn read(&self, fh: u64, offset: i64, size: u32) -> Result<Vec<u8>, FuseError> {
@@ -1331,6 +1376,24 @@ mod tests {
         tokio::task::spawn_blocking(move || match xattr::get(&path, &name)? {
             Some(data) => Ok(Some(String::from_utf8(data).unwrap())),
             None => Ok(None),
+        })
+        .await?
+    }
+
+    // Helper functions for xattr operations. Returns FuseError to
+    // make it easier to test I/O error codes than anyhow::Error.
+    async fn setxattr<P: AsRef<std::path::Path>>(
+        path: P,
+        name: &str,
+        value: &str,
+    ) -> Result<(), FuseError> {
+        let path = path.as_ref().to_path_buf();
+        let name = name.to_string();
+        let value = value.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            xattr::set(&path, &name, value.as_bytes())?;
+            Ok(())
         })
         .await?
     }
@@ -2803,6 +2866,102 @@ mod tests {
                 );
                 assert_eq!(
                     Some("keep (derived)".to_string()),
+                    getxattr(&file_realpath, "realize.mark").await.unwrap()
+                );
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn set_mark_xattrs() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                let _arena = HouseholdFixture::test_arena();
+
+                fixture
+                    .inner
+                    .write_file_and_wait(b, a, "foo/bar", "test")
+                    .await?;
+
+                fixture.mount(household_a).await?;
+
+                let mountpoint = fixture.mount_path();
+                let datadir = mountpoint.join(HouseholdFixture::test_arena().as_str());
+                let file_path = realize_types::Path::parse("foo/bar")?;
+                let dir_path = realize_types::Path::parse("foo")?;
+                let file_realpath = file_path.within(&datadir);
+                let dir_realpath = dir_path.within(&datadir);
+
+                // Initial state should be watch (derived)
+                assert_eq!(
+                    Some("watch (derived)".to_string()),
+                    getxattr(&dir_realpath, "realize.mark").await.unwrap()
+                );
+                assert_eq!(
+                    Some("watch (derived)".to_string()),
+                    getxattr(&file_realpath, "realize.mark").await.unwrap()
+                );
+
+                // Set directory mark to keep via FUSE setxattr
+                setxattr(&dir_realpath, "realize.mark", "keep").await?;
+
+                // Directory should now be keep (direct)
+                assert_eq!(
+                    Some("keep".to_string()),
+                    getxattr(&dir_realpath, "realize.mark").await.unwrap()
+                );
+                // File should now be keep (derived)
+                assert_eq!(
+                    Some("keep (derived)".to_string()),
+                    getxattr(&file_realpath, "realize.mark").await.unwrap()
+                );
+
+                // Set file mark to own via FUSE setxattr
+                setxattr(&file_realpath, "realize.mark", "own").await?;
+
+                // File should now be own (direct)
+                assert_eq!(
+                    Some("own".to_string()),
+                    getxattr(&file_realpath, "realize.mark").await.unwrap()
+                );
+                // Directory should still be keep (direct)
+                assert_eq!(
+                    Some("keep".to_string()),
+                    getxattr(&dir_realpath, "realize.mark").await.unwrap()
+                );
+
+                // Clear file mark by setting empty value
+                setxattr(&file_realpath, "realize.mark", "").await?;
+
+                // File should now inherit from directory: keep (derived)
+                assert_eq!(
+                    Some("keep (derived)".to_string()),
+                    getxattr(&file_realpath, "realize.mark").await.unwrap()
+                );
+
+                // Clear directory mark
+                setxattr(&dir_realpath, "realize.mark", "").await?;
+
+                // Both should now be watch (derived from arena root)
+                assert_eq!(
+                    Some("watch (derived)".to_string()),
+                    getxattr(&dir_realpath, "realize.mark").await.unwrap()
+                );
+                assert_eq!(
+                    Some("watch (derived)".to_string()),
                     getxattr(&file_realpath, "realize.mark").await.unwrap()
                 );
 

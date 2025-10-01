@@ -383,6 +383,40 @@ impl ArenaFilesystem {
 
         marks.get_full(&tree, loc)
     }
+
+    pub(crate) fn set_mark(
+        &self,
+        loc: impl Into<ArenaFsLoc>,
+        mark: Mark,
+    ) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut marks = txn.write_marks()?;
+            let mut tree = txn.write_tree()?;
+            let mut dirty = txn.write_dirty()?;
+            let cache = txn.read_cache()?;
+            let loc = loc.into().into_tree_loc(&cache)?;
+
+            marks.set(&mut tree, &mut dirty, loc, mark)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn clear_mark(&self, loc: impl Into<ArenaFsLoc>) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut marks = txn.write_marks()?;
+            let mut tree = txn.write_tree()?;
+            let mut dirty = txn.write_dirty()?;
+            let cache = txn.read_cache()?;
+            let loc = loc.into().into_tree_loc(&cache)?;
+
+            marks.clear(&mut tree, &mut dirty, loc)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
 }
 
 pub(crate) enum ArenaFsLoc {
