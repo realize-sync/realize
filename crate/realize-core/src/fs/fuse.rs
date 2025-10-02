@@ -2,6 +2,7 @@
 use crate::fs::downloader::{Download, Downloader};
 use crate::rpc::HouseholdOperationError;
 use fuser::{FileType, MountOption};
+use multimap::MultiMap;
 use nix::libc::{self, c_int};
 use nix::sys::{stat, time::TimeSpec};
 use nix::unistd::{Gid, Uid};
@@ -38,7 +39,7 @@ pub fn export(
             fs,
             downloader,
             umask,
-            handles: Arc::new(Mutex::new(BTreeMap::new())),
+            handles: FHRegistry::new(),
         }),
     };
     let bgsession = fuser::spawn_mount2(
@@ -606,12 +607,85 @@ struct InnerRealizeFs {
     fs: Arc<Filesystem>,
     downloader: Downloader,
     umask: u16,
-    handles: Arc<Mutex<BTreeMap<u64, Arc<Mutex<FileHandle>>>>>,
+    handles: FHRegistry,
 }
 
 enum FileHandle {
     Cached(Download),
     Real(tokio::fs::File, FHMode),
+}
+
+/// Keeps track of open file handles.
+struct FHRegistry {
+    state: Arc<Mutex<FHRegistryState>>,
+}
+struct FHRegistryState {
+    by_fh: BTreeMap<u64, (Inode, Arc<Mutex<FileHandle>>)>,
+    by_inode: MultiMap<Inode, u64>,
+}
+
+impl FHRegistry {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(FHRegistryState {
+                by_fh: BTreeMap::new(),
+                by_inode: MultiMap::new(),
+            })),
+        }
+    }
+    async fn add(&self, ino: Inode, handle: FileHandle) -> u64 {
+        let mut this = self.state.lock().await;
+        let fh = this
+            .by_fh
+            .last_key_value()
+            .map(|(k, _)| *k + 1)
+            .unwrap_or(1);
+        this.by_fh.insert(fh, (ino, Arc::new(Mutex::new(handle))));
+        this.by_inode.insert(ino, fh);
+
+        fh
+    }
+
+    /// Gets a specific file handle.
+    async fn get(&self, fh: u64) -> Option<Arc<Mutex<FileHandle>>> {
+        self.state
+            .lock()
+            .await
+            .by_fh
+            .get(&fh)
+            .map(|(_, h)| Arc::clone(h))
+    }
+
+    async fn get_or_err(&self, fh: u64) -> Result<Arc<Mutex<FileHandle>>, FuseError> {
+        self.get(fh).await.ok_or(FuseError::Errno(libc::EBADF))
+    }
+
+    /// Gets all file handles for the given inode.
+    async fn iter_by_inode(&self, ino: Inode) -> Vec<Arc<Mutex<FileHandle>>> {
+        let this = self.state.lock().await;
+
+        this.by_inode
+            .get_vec(&ino)
+            .cloned()
+            .unwrap_or_else(|| vec![])
+            .into_iter()
+            .flat_map(|fh| this.by_fh.get(&fh).map(|(_, h)| Arc::clone(h)))
+            .collect()
+    }
+
+    /// Removes a file handle from the registry.
+    async fn remove(&self, fh: u64) -> Option<Arc<Mutex<FileHandle>>> {
+        let mut this = self.state.lock().await;
+        if let Some((ino, handle)) = this.by_fh.remove(&fh) {
+            if let Some(vec) = this.by_inode.get_vec_mut(&ino) {
+                vec.retain(|e| *e != fh);
+            }
+
+            return Some(handle);
+        }
+
+        None
+    }
 }
 
 // File mode, stored in the FileHandle.
@@ -691,7 +765,7 @@ impl InnerRealizeFs {
 
     async fn getattr(&self, ino: u64, fh: Option<u64>) -> Result<fuser::FileAttr, FuseError> {
         if let Some(fh) = fh {
-            let handle = self.get_handle(fh).await?;
+            let handle = self.handles.get_or_err(fh).await?;
             if let FileHandle::Real(file, _) = &*handle.lock().await {
                 return Ok(metadata_to_attr(&file.metadata().await?, ino));
             }
@@ -769,7 +843,7 @@ impl InnerRealizeFs {
     }
 
     async fn read(&self, fh: u64, offset: i64, size: u32) -> Result<Vec<u8>, FuseError> {
-        let handle = self.get_handle(fh).await?;
+        let handle = self.handles.get_or_err(fh).await?;
         let size = size as usize;
 
         // TODO: clarify type situation for offset. offset is i64 in
@@ -797,7 +871,7 @@ impl InnerRealizeFs {
     }
 
     async fn write(&self, fh: u64, offset: i64, data: &[u8]) -> Result<u32, FuseError> {
-        let handle = self.get_handle(fh).await?;
+        let handle = self.handles.get_or_err(fh).await?;
         let offset = offset as u64; // TODO: clarify type situation for offset.
         match &mut *handle.lock().await {
             FileHandle::Cached(_) => Err(FuseError::Errno(libc::EBADF)),
@@ -897,7 +971,7 @@ impl InnerRealizeFs {
 
     async fn truncate(&self, ino: u64, fh: Option<u64>, size: u64) -> Result<(), FuseError> {
         if let Some(fh) = fh {
-            let handle = self.get_handle(fh).await?;
+            let handle = self.handles.get_or_err(fh).await?;
             if let FileHandle::Real(file, mode) = &mut *handle.lock().await {
                 mode.check_allow_write()?;
                 file.set_len(size).await?;
@@ -906,7 +980,8 @@ impl InnerRealizeFs {
                 return Ok(());
             }
         }
-        match self.fs.file_content(Inode(ino)).await? {
+        let ino = Inode(ino);
+        match self.fs.file_content(ino).await? {
             FileContent::Local(realpath) => {
                 log::debug!("SETATTR {ino}: Truncate file, mapped to {realpath:?} to {size}");
                 let mut file = tokio::fs::OpenOptions::new()
@@ -1028,8 +1103,9 @@ impl InnerRealizeFs {
     }
 
     async fn open(&self, ino: u64, flags: i32) -> Result<(u64, u32), FuseError> {
+        let ino = Inode(ino);
         let mode = flags & (libc::O_RDONLY | libc::O_WRONLY | libc::O_RDWR);
-        let handle = match self.fs.file_content(Inode(ino)).await? {
+        let handle = match self.fs.file_content(ino).await? {
             FileContent::Local(path) => FileHandle::Real(
                 openoptions_from_flags(flags).open(path).await?,
                 FHMode::from_flags(flags),
@@ -1065,8 +1141,8 @@ impl InnerRealizeFs {
                 }
             }
         };
-        let fh = self.store_handle(handle).await;
-        log::debug!("Opened file Inode({ino}) as FH#{fh}");
+        let fh = self.handles.add(ino, handle).await;
+        log::debug!("Opened file {ino:?} as FH#{fh}");
 
         return Ok((fh, 0));
     }
@@ -1083,18 +1159,19 @@ impl InnerRealizeFs {
         log::debug!("CREATE parent={parent} name={name} mode={mode:o} flags={flags:#x}");
 
         let options = openoptions_from_flags(flags);
-        let (inode, file) = self.fs.create(options, (Inode(parent), name)).await?;
-        let attr = metadata_to_attr(&file.metadata().await?, inode.as_u64());
+        let (ino, file) = self.fs.create(options, (Inode(parent), name)).await?;
+        let attr = metadata_to_attr(&file.metadata().await?, ino.as_u64());
         let fh = self
-            .store_handle(FileHandle::Real(file, FHMode::from_flags(flags)))
+            .handles
+            .add(ino, FileHandle::Real(file, FHMode::from_flags(flags)))
             .await;
-        log::debug!("Created and opened Inode({inode}) in FH#{fh}",);
+        log::debug!("Created and opened Inode({ino}) in FH#{fh}",);
 
         Ok((attr, fh))
     }
 
     async fn flush(&self, fh: u64) -> Result<(), FuseError> {
-        let handle = self.get_handle(fh).await?;
+        let handle = self.handles.get_or_err(fh).await?;
         match &mut *handle.lock().await {
             FileHandle::Cached(blob) => {
                 blob.update_db().await?;
@@ -1111,8 +1188,7 @@ impl InnerRealizeFs {
     }
 
     async fn release(&self, fh: u64) -> Result<(), FuseError> {
-        let mut handles = self.handles.lock().await;
-        if let Some(handle) = handles.remove(&fh) {
+        if let Some(handle) = self.handles.remove(fh).await {
             match &mut *handle.lock().await {
                 FileHandle::Cached(_) => {}
                 FileHandle::Real(file, mode) => {
@@ -1125,23 +1201,6 @@ impl InnerRealizeFs {
         }
 
         Ok(())
-    }
-
-    /// Get a [FileHandle] from its ID.
-    async fn get_handle(&self, fh: u64) -> Result<Arc<Mutex<FileHandle>>, FuseError> {
-        let handles = self.handles.lock().await;
-        match handles.get(&fh) {
-            None => Err(FuseError::Errno(libc::EBADF)),
-            Some(h) => Ok(Arc::clone(h)),
-        }
-    }
-
-    /// Store a [FileHandle] and return its unique ID.
-    async fn store_handle(&self, handle: FileHandle) -> u64 {
-        let mut handles = self.handles.lock().await;
-        let fh = handles.last_key_value().map(|(k, _)| *k + 1).unwrap_or(1);
-        handles.insert(fh, Arc::new(Mutex::new(handle)));
-        fh
     }
 
     fn build_file_attr(&self, pathid: Inode, metadata: &FileMetadata) -> fuser::FileAttr {
