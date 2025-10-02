@@ -611,7 +611,72 @@ struct InnerRealizeFs {
 
 enum FileHandle {
     Cached(Download),
-    Real(tokio::fs::File),
+    Real(tokio::fs::File, FHMode),
+}
+
+// File mode, stored in the FileHandle.
+//
+// Sometimes, the underlying handle would allow operations that
+// weren't asked in FUSE open(). [FHMode] helps make sure that these
+// aren't allowed.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum FHMode {
+    Invalid,
+    ReadOnly,
+    ReadWrite,
+    WriteOnly,
+}
+
+impl FHMode {
+    fn from_flags(flags: i32) -> Self {
+        let mode = flags & (libc::O_RDONLY | libc::O_WRONLY | libc::O_RDWR);
+
+        let res = match mode {
+            libc::O_RDONLY => FHMode::ReadOnly,
+            libc::O_WRONLY => FHMode::WriteOnly,
+            libc::O_RDWR => FHMode::ReadWrite,
+            _ => {
+                log::debug!("Invalid open flags: mode={mode:o} (all flags= 0x{flags:x})");
+
+                FHMode::Invalid
+            }
+        };
+
+        res
+    }
+
+    fn allow_read(&self) -> bool {
+        match self {
+            FHMode::ReadOnly => true,
+            FHMode::ReadWrite => true,
+            FHMode::WriteOnly => false,
+            FHMode::Invalid => false,
+        }
+    }
+    fn allow_write(&self) -> bool {
+        match self {
+            FHMode::ReadOnly => false,
+            FHMode::ReadWrite => true,
+            FHMode::WriteOnly => true,
+            FHMode::Invalid => false,
+        }
+    }
+
+    fn check_allow_read(&self) -> Result<(), FuseError> {
+        if !self.allow_read() {
+            return Err(FuseError::Errno(libc::EPERM));
+        }
+
+        Ok(())
+    }
+
+    fn check_allow_write(&self) -> Result<(), FuseError> {
+        if !self.allow_write() {
+            return Err(FuseError::Errno(libc::EPERM));
+        }
+
+        Ok(())
+    }
 }
 
 impl InnerRealizeFs {
@@ -627,7 +692,7 @@ impl InnerRealizeFs {
     async fn getattr(&self, ino: u64, fh: Option<u64>) -> Result<fuser::FileAttr, FuseError> {
         if let Some(fh) = fh {
             let handle = self.get_handle(fh).await?;
-            if let FileHandle::Real(file) = &*handle.lock().await {
+            if let FileHandle::Real(file, _) = &*handle.lock().await {
                 return Ok(metadata_to_attr(&file.metadata().await?, ino));
             }
         }
@@ -715,7 +780,8 @@ impl InnerRealizeFs {
             FileHandle::Cached(reader) => {
                 reader.read_all_at(offset, &mut buffer).await?;
             }
-            FileHandle::Real(file) => {
+            FileHandle::Real(file, mode) => {
+                mode.check_allow_read()?;
                 file.seek(SeekFrom::Start(offset)).await?;
                 while buffer.has_remaining_mut() {
                     if file.read_buf(&mut buffer).await? == 0 {
@@ -735,7 +801,8 @@ impl InnerRealizeFs {
         let offset = offset as u64; // TODO: clarify type situation for offset.
         match &mut *handle.lock().await {
             FileHandle::Cached(_) => Err(FuseError::Errno(libc::EBADF)),
-            FileHandle::Real(file) => {
+            FileHandle::Real(file, mode) => {
+                mode.check_allow_write()?;
                 file.seek(SeekFrom::Start(offset)).await?;
                 file.write_all(data).await?;
 
@@ -831,7 +898,8 @@ impl InnerRealizeFs {
     async fn truncate(&self, ino: u64, fh: Option<u64>, size: u64) -> Result<(), FuseError> {
         if let Some(fh) = fh {
             let handle = self.get_handle(fh).await?;
-            if let FileHandle::Real(file) = &mut *handle.lock().await {
+            if let FileHandle::Real(file, mode) = &mut *handle.lock().await {
+                mode.check_allow_write()?;
                 file.set_len(size).await?;
                 log::debug!("SETATTR {ino}: Truncate file FH#{fh} to {size}");
 
@@ -962,9 +1030,10 @@ impl InnerRealizeFs {
     async fn open(&self, ino: u64, flags: i32) -> Result<(u64, u32), FuseError> {
         let mode = flags & (libc::O_RDONLY | libc::O_WRONLY | libc::O_RDWR);
         let handle = match self.fs.file_content(Inode(ino)).await? {
-            FileContent::Local(path) => {
-                FileHandle::Real(openoptions_from_flags(flags).open(path).await?)
-            }
+            FileContent::Local(path) => FileHandle::Real(
+                openoptions_from_flags(flags).open(path).await?,
+                FHMode::from_flags(flags),
+            ),
             FileContent::Remote(mut blob) => {
                 if mode == libc::O_RDONLY {
                     let reader = self.downloader.reader(blob).await?;
@@ -986,9 +1055,12 @@ impl InnerRealizeFs {
                     if (flags & libc::O_APPEND) != 0 {
                         drop(file);
 
-                        FileHandle::Real(openoptions_from_flags(flags).open(path).await?)
+                        FileHandle::Real(
+                            openoptions_from_flags(flags).open(path).await?,
+                            FHMode::from_flags(flags),
+                        )
                     } else {
-                        FileHandle::Real(file)
+                        FileHandle::Real(file, FHMode::from_flags(flags))
                     }
                 }
             }
@@ -1013,7 +1085,9 @@ impl InnerRealizeFs {
         let options = openoptions_from_flags(flags);
         let (inode, file) = self.fs.create(options, (Inode(parent), name)).await?;
         let attr = metadata_to_attr(&file.metadata().await?, inode.as_u64());
-        let fh = self.store_handle(FileHandle::Real(file)).await;
+        let fh = self
+            .store_handle(FileHandle::Real(file, FHMode::from_flags(flags)))
+            .await;
         log::debug!("Created and opened Inode({inode}) in FH#{fh}",);
 
         Ok((attr, fh))
@@ -1025,9 +1099,11 @@ impl InnerRealizeFs {
             FileHandle::Cached(blob) => {
                 blob.update_db().await?;
             }
-            FileHandle::Real(file) => {
-                log::debug!("Flush FH#{fh}");
-                file.flush().await?;
+            FileHandle::Real(file, mode) => {
+                if mode.allow_write() {
+                    log::debug!("Flush FH#{fh}");
+                    file.flush().await?;
+                }
             }
         }
 
@@ -1039,9 +1115,11 @@ impl InnerRealizeFs {
         if let Some(handle) = handles.remove(&fh) {
             match &mut *handle.lock().await {
                 FileHandle::Cached(_) => {}
-                FileHandle::Real(file) => {
-                    log::debug!("Flush FH#{fh}");
-                    file.flush().await?;
+                FileHandle::Real(file, mode) => {
+                    if mode.allow_write() {
+                        log::debug!("Flush FH#{fh}");
+                        file.flush().await?;
+                    }
                 }
             }
         }
