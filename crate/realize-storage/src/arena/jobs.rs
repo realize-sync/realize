@@ -453,7 +453,7 @@ mod tests {
         {
             let mut blob = fixture.cache.file_content(pathid)?.blob().unwrap();
             blob.update(0, b"test").await?;
-            blob.mark_verified().await?;
+            assert!(blob.verify().await?);
         }
 
         assert_eq!(
@@ -491,7 +491,7 @@ mod tests {
         {
             let mut blob = fixture.cache.file_content(pathid)?.blob().unwrap();
             blob.update(0, b"test").await?;
-            blob.mark_verified().await?;
+            assert!(blob.verify().await?);
         }
 
         assert!(matches!(

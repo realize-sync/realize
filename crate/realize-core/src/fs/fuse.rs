@@ -3297,15 +3297,16 @@ mod tests {
                     getxattr(&file_realpath, "realize.status").await.unwrap()
                 );
 
-                fixture
+                let verified = fixture
                     .inner
                     .cache(a)?
                     .file_content((arena, &file_path))
                     .await?
                     .blob()
                     .unwrap()
-                    .mark_verified()
+                    .verify()
                     .await?;
+                assert!(verified);
 
                 assert_eq!(
                     Some("remote 100% verified".to_string()),

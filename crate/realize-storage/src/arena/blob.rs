@@ -1210,9 +1210,16 @@ impl Blob {
 
     /// Cache data from a remote peer locally, into the blob file.
     ///
-    /// This call writes to the file and modifies the file offset.
+    /// This call writes to the file and modifies the file offset. It
+    /// does nothing if the range is already available.
     pub async fn update(&mut self, offset: u64, buf: &[u8]) -> Result<(), std::io::Error> {
         if buf.len() == 0 {
+            return Ok(());
+        }
+        let start = offset;
+        let end = start + buf.len() as u64;
+        let range = ByteRanges::single(start, end);
+        if self.info.available_ranges.intersection(&range) == range {
             return Ok(());
         }
 
@@ -1221,13 +1228,27 @@ impl Blob {
         }
         self.file.write_all(buf).await?;
 
-        let start = offset;
-        let end = start + buf.len() as u64;
         self.offset = end;
 
         let range = ByteRange::new(start, end);
         self.info.available_ranges.add(&range);
         self.pending_ranges.add(&range);
+
+        Ok(())
+    }
+
+    /// Repair the file content at [offset], without updating
+    /// available range.
+    pub async fn repair(&mut self, offset: u64, buf: &[u8]) -> Result<(), std::io::Error> {
+        if buf.len() == 0 {
+            return Ok(());
+        }
+        if offset != self.offset {
+            self.seek(SeekFrom::Start(offset)).await?;
+        }
+        self.file.write_all(buf).await?;
+
+        self.offset = offset + (buf.len() as u64);
 
         Ok(())
     }
@@ -1261,7 +1282,7 @@ impl Blob {
     /// This hashes the entire content, no matter the current offset.
     /// When this ends without errors, offset is at the end of the
     /// file.
-    pub async fn compute_hash(&mut self) -> Result<Hash, std::io::Error> {
+    async fn compute_hash(&mut self) -> Result<Hash, std::io::Error> {
         if self.offset != 0 {
             self.seek(SeekFrom::Start(0)).await?;
         }
@@ -1269,10 +1290,23 @@ impl Blob {
         hash::hash_file(self).await
     }
 
+    /// Check whether the file content matches the hash, if yes, mark
+    /// the blob as verified and return true if the file was verified.
+    pub async fn verify(&mut self) -> Result<bool, StorageError> {
+        if self.info.verified {
+            return Ok(true);
+        }
+        let hash = self.compute_hash().await?;
+        if hash != self.info.hash {
+            return Ok(false);
+        }
+
+        self.mark_verified().await?;
+        Ok(true)
+    }
+
     /// Flush and mark file content as verified on the database.
-    ///
-    /// Return true if the database was updated
-    pub async fn mark_verified(&mut self) -> Result<bool, StorageError> {
+    async fn mark_verified(&mut self) -> Result<bool, StorageError> {
         self.update_db().await?;
 
         self.info.verified = true;

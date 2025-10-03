@@ -612,6 +612,7 @@ mod tests {
     use crate::arena::index;
     use crate::arena::mark;
     use crate::arena::tree::TreeLoc;
+    use crate::utils::hash;
     use crate::utils::redb_utils;
     use assert_fs::TempDir;
     use futures::StreamExt as _;
@@ -920,11 +921,11 @@ mod tests {
         let otherfile = Path::parse("foo/other.txt")?;
 
         mark::set_arena_mark(&fixture.db, Mark::Keep)?;
-        fixture.add_file_to_cache(&barfile)?;
+        fixture.add_file_to_cache_with_version(&barfile, hash::digest("test"))?;
         {
             let mut blob = fixture.acache.file_content(&barfile)?.blob().unwrap();
             blob.update(0, b"test").await?;
-            blob.mark_verified().await?;
+            assert!(blob.verify().await?);
         }
 
         // The stream is created after downloading to be sure it sees
@@ -988,19 +989,20 @@ mod tests {
         let foobar = Path::parse("foo/bar")?;
 
         mark::set_arena_mark(&fixture.db, Mark::Own)?;
-        fixture.add_file_to_cache(&foobar)?;
+        let hash = hash::digest("test");
+        fixture.add_file_to_cache_with_version(&foobar, hash.clone())?;
 
         let mut job_stream = fixture.engine.job_stream();
 
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
         assert_eq!(
-            StorageJob::External(Job::Download(foobar.clone(), test_hash())),
+            StorageJob::External(Job::Download(foobar.clone(), hash.clone())),
             job,
         );
         {
             let mut blob = fixture.acache.file_content(&foobar)?.blob().unwrap();
             blob.update(0, b"test").await?;
-            blob.mark_verified().await?;
+            assert!(blob.verify().await?);
         }
         fixture.engine.job_finished(job_id, Ok(JobStatus::Done))?;
 
@@ -1009,7 +1011,7 @@ mod tests {
         assert_eq!(
             StorageJob::Realize {
                 pathid: fixture.pathid(&foobar)?,
-                hash: test_hash(),
+                hash,
             },
             job
         );
@@ -1022,7 +1024,8 @@ mod tests {
         let fixture = EngineFixture::setup().await?;
         let foobar = Path::parse("foo/bar")?;
 
-        fixture.add_file_to_cache(&foobar)?;
+        let hash = hash::digest("test");
+        fixture.add_file_to_cache_with_version(&foobar, hash.clone())?;
         {
             let mut blob = fixture.acache.file_content(&foobar)?.blob().unwrap();
             blob.update(0, b"te").await?;
@@ -1054,13 +1057,13 @@ mod tests {
 
         let (job_id, job) = next_with_timeout(&mut job_stream).await?.unwrap();
         assert_eq!(
-            StorageJob::External(Job::Download(foobar, test_hash())),
+            StorageJob::External(Job::Download(foobar, hash.clone())),
             job,
         );
         {
             let mut blob = Blob::open(&fixture.db, pathid)?;
             blob.update(0, b"test").await?;
-            blob.mark_verified().await?;
+            assert!(blob.verify().await?);
         }
         fixture.engine.job_finished(job_id, Ok(JobStatus::Done))?;
 
@@ -1069,7 +1072,7 @@ mod tests {
         assert_eq!(
             StorageJob::Realize {
                 pathid: pathid,
-                hash: test_hash(),
+                hash,
             },
             job
         );
@@ -1111,11 +1114,12 @@ mod tests {
         let foobar = Path::parse("foo/bar")?;
 
         mark::set_arena_mark(&fixture.db, Mark::Own)?;
-        fixture.add_file_to_cache(&foobar)?;
+        let hash = hash::digest("test");
+        fixture.add_file_to_cache_with_version(&foobar, hash.clone())?;
         {
             let mut blob = fixture.acache.file_content(&foobar)?.blob().unwrap();
             blob.update(0, b"test").await?;
-            blob.mark_verified().await?;
+            assert!(blob.verify().await?);
         }
 
         let mut job_stream = fixture.engine.job_stream();
@@ -1125,7 +1129,7 @@ mod tests {
         assert_eq!(
             StorageJob::Realize {
                 pathid: pathid,
-                hash: test_hash(),
+                hash,
             },
             job
         );

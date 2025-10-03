@@ -181,20 +181,19 @@ pub(crate) async fn verify(
     let arena = avail.arena;
     log::debug!("[{arena}] Job #{job_id} Blob complete; Verify");
     progress.update_action(JobAction::Verify);
-    let computed_hash = tokio::select!(
-    res = blob.compute_hash() => { res? },
+    let verified = tokio::select!(
+    res = blob.verify() => { res? },
     _ = shutdown.cancelled() => {
         return Ok(JobStatus::Cancelled);
     });
-    if computed_hash == *blob.hash() {
-        blob.mark_verified().await?;
-        log::debug!("[{arena}] Job #{job_id} Verified against {computed_hash}");
+    if verified {
+        log::debug!("[{arena}] Job #{job_id} Verified against {}", blob.hash());
         return Ok(JobStatus::Done);
     }
 
     // repair
     log::debug!(
-        "[{arena}] Job #{job_id} Hash mismatch (expected: {} got: {computed_hash}); Repair",
+        "[{arena}] Job #{job_id} Hash mismatch (expected: {}); Starting repair",
         blob.hash()
     );
     progress.update_action(JobAction::Repair);
@@ -224,7 +223,7 @@ pub(crate) async fn verify(
         fixed_buf.clear();
         fast_rsync::apply_limited(limited_buf, delta.0.as_slice(), &mut fixed_buf, range_len)?;
         assert_eq!(range_len, fixed_buf.len());
-        blob.update(range.start, fixed_buf.as_slice()).await?;
+        blob.repair(range.start, fixed_buf.as_slice()).await?;
 
         progress.update(range.end, size);
     }
@@ -232,20 +231,22 @@ pub(crate) async fn verify(
 
     log::debug!("[{arena}] Job #{job_id}: Repaired; Verify");
     progress.update_action(JobAction::Verify);
-    let computed_hash = tokio::select!(
-    res = blob.compute_hash() => { res? },
+    let verified = tokio::select!(
+    res = blob.verify() => { res? },
     _ = shutdown.cancelled() => {
         return Ok(JobStatus::Cancelled);
     });
-    if computed_hash != *blob.hash() {
+    if !verified {
         log::debug!(
-            "[{arena}] Job #{job_id} Inconsistent hash after repair; Giving up. Expected {}, got {computed_hash}",
+            "[{arena}] Job #{job_id} Inconsistent hash after repair; Giving up. Expected {}",
             blob.hash()
         );
         return Err(JobError::InconsistentHash);
     }
-    blob.mark_verified().await?;
-    log::debug!("[{arena}] Job #{job_id} Fixed and verified to be {computed_hash}");
+    log::debug!(
+        "[{arena}] Job #{job_id} Fixed and verified to be {}",
+        blob.hash()
+    );
 
     Ok(JobStatus::Done)
 }
@@ -1041,12 +1042,14 @@ mod tests {
                 // Fill the blob for 'large' with data. Download will
                 // have to repair it to get to the correct hash.
                 let mut blob = fixture.open_file(a, "large").await?;
-                // Same data as in the file (generated from the same seed)
-                let hash2 = write_rnd_to_blob(&mut blob, 415, 1024).await?;
-                assert_eq!(hash, hash2); // same seed,same data
                 blob.seek(SeekFrom::Start(3 * 1024)).await?;
                 // 16k of bad data.
                 write_rnd_to_blob(&mut blob, 512, 16).await?;
+
+                // Same data as in the file (generated from the same seed)
+                blob.seek(SeekFrom::Start(0)).await?;
+                let hash2 = write_rnd_to_blob(&mut blob, 415, 1024).await?;
+                assert_eq!(hash, hash2); // same seed,same data
                 blob.update_db().await?;
 
                 let mut progress = SimpleByteCountProgress::new();
