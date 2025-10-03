@@ -791,7 +791,7 @@ impl InnerRealizeFs {
                             stat::Mode::empty(),
                         )?;
                         if let Some(mode) = mode {
-                            let mode = stat::Mode::from_bits_truncate(mode);
+                            let mode = stat::Mode::from_bits_truncate(mode as libc::mode_t);
                             log::debug!("SETATTR Inode({ino})@remote: set mode=0o{:o} {mode:?}", mode.bits());
                             nix::sys::stat::fchmod(&fd, mode)?;
                         }
