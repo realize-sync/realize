@@ -271,6 +271,10 @@ impl ByteRanges {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.btree.clear()
+    }
+
     pub fn single(start: u64, end: u64) -> Self {
         let mut r = ByteRanges::new();
         if end > start {
@@ -490,6 +494,17 @@ impl ByteRanges {
         }
 
         None
+    }
+
+    /// Checks whether `range` is fully contained within this [ByteRanges].
+    pub fn contains_range(&self, range: &ByteRange) -> bool {
+        if let Some((start, Point::Start)) = self.btree.range(..=range.start).next_back() {
+            if let Some((end, Point::End)) = self.btree.range(*start + 1..).next() {
+                return *end >= range.end;
+            }
+        }
+
+        false
     }
 
     fn points(&self) -> impl Iterator<Item = (u64, Point)> {
@@ -906,6 +921,57 @@ mod byteranges_tests {
         // Test offsets after last range
         assert_eq!(multiple.containing_range(50), None); // At end of last range
         assert_eq!(multiple.containing_range(100), None); // Far after
+    }
+
+    #[test]
+    fn test_contains_range() {
+        assert_eq!(
+            true,
+            ByteRanges::single(10, 20).contains_range(&ByteRange::new(12, 18))
+        );
+        assert_eq!(
+            true,
+            ByteRanges::single(10, 20).contains_range(&ByteRange::new(10, 15))
+        );
+        assert_eq!(
+            true,
+            ByteRanges::single(10, 20).contains_range(&ByteRange::new(15, 20))
+        );
+        assert_eq!(
+            true,
+            ByteRanges::single(10, 20).contains_range(&ByteRange::new(10, 20))
+        );
+        assert_eq!(
+            false,
+            ByteRanges::single(10, 20).contains_range(&ByteRange::new(9, 15))
+        );
+        assert_eq!(
+            false,
+            ByteRanges::single(10, 20).contains_range(&ByteRange::new(15, 21))
+        );
+        assert_eq!(
+            false,
+            ByteRanges::single(10, 20).contains_range(&ByteRange::new(0, 5))
+        );
+        assert_eq!(
+            false,
+            ByteRanges::single(10, 20).contains_range(&ByteRange::new(25, 30))
+        );
+        assert_eq!(
+            false,
+            ByteRanges::single(10, 20).contains_range(&ByteRange::new(25, 30))
+        );
+        assert_eq!(
+            false,
+            // While [15,26) starts and ends within a range, it is not
+            // contained in the ByteRanges {[0, 20), [25, 30)}.
+            ByteRanges::from_ranges(vec![
+                ByteRange::new(0, 7),
+                ByteRange::new(5, 20),
+                ByteRange::new(25, 30)
+            ])
+            .contains_range(&ByteRange::new(15, 26))
+        );
     }
 
     #[test]
