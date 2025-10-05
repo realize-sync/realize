@@ -73,14 +73,13 @@ impl Downloader {
             .await?
             .ok_or(StorageError::NoPeers)?;
 
-        // TODO: check hash
         Ok(Download::new(
             self.household.clone(),
             avail.peers,
             avail.arena,
             avail.path,
             avail.size,
-            blob,
+            Some(blob),
         ))
     }
 }
@@ -105,7 +104,7 @@ pub struct Download {
     /// This should be continguous.
     ///
     buffer: VecDeque<(ByteRange, Vec<u8>)>, // TODO: consider using a Buf/BufMut
-    blob: Blob,
+    blob: Option<Blob>,
 }
 
 impl Download {
@@ -115,7 +114,7 @@ impl Download {
         arena: Arena,
         path: Path,
         size: u64,
-        blob: Blob,
+        blob: Option<Blob>,
     ) -> Self {
         Self {
             household,
@@ -124,13 +123,20 @@ impl Download {
             path,
             size,
             buffer: VecDeque::new(),
-            blob,
+            blob: blob,
         }
+    }
+
+    /// Take the blob from the downloader.
+    pub fn take_blob(&mut self) -> Option<Blob> {
+        self.blob.take()
     }
 
     /// Update local availability in the database.
     pub async fn update_db(&mut self) -> Result<(), StorageError> {
-        self.blob.update_db().await?;
+        if let Some(blob) = &mut self.blob {
+            blob.update_db().await?;
+        }
         Ok(())
     }
 
@@ -142,7 +148,10 @@ impl Download {
     ///   haven't been flushed yet.
     /// - does not include ranges written through other file handles
     pub fn available_range(&self) -> ByteRanges {
-        self.blob.available_range()
+        self.blob
+            .as_ref()
+            .map(|b| b.available_range())
+            .unwrap_or_else(|| ByteRanges::new())
     }
 
     /// Read remote peer data at the given offset.
@@ -188,16 +197,20 @@ impl Download {
             // at least partially available in memory
             return Ok(filled);
         }
-        if let Some(readable_length) = self.blob.readable_length(offset, buf.remaining_mut()) {
-            // at least partially available in the blob
-            self.blob.seek(SeekFrom::Start(offset)).await?;
-            return self.blob.read_buf(&mut buf.limit(readable_length)).await;
+        if let Some(blob) = &mut self.blob {
+            if let Some(readable_length) = blob.readable_length(offset, buf.remaining_mut()) {
+                // at least partially available in the blob
+                blob.seek(SeekFrom::Start(offset)).await?;
+                return blob.read_buf(&mut buf.limit(readable_length)).await;
+            }
         }
 
         // download into buffer, optionally store into the blob
         let ranges = self.download_range(offset, capacity).await?;
         for (range, data) in ranges {
-            let _ = self.blob.update(range.start, &data).await; // best effort
+            if let Some(blob) = &mut self.blob {
+                let _ = blob.update(range.start, &data).await; // best effort
+            }
             self.buffer.push_back((range, data));
         }
         self.buffer.make_contiguous().sort_by_key(|elt| elt.0.start);
@@ -916,6 +929,49 @@ mod tests {
                     "Already complete file",
                 )
                 .await?;
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_works_after_take_blob() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let downloader = Downloader::new(household_a);
+                let test_content = "Test content for take_blob functionality";
+
+                // Create a Download instance with a blob
+                let mut download = fixture
+                    .download_file_from_b(&downloader, "test_file.txt", test_content)
+                    .await?;
+
+                // Verify we can read from the Download initially
+                assert_eq!(test_content, read_string(0, &mut download).await?);
+
+                // Take the blob from the Download instance
+                let taken_blob = download.take_blob();
+                assert!(taken_blob.is_some(), "take_blob should return the blob");
+
+                // Verify the Download instance still works after take_blob
+                // This should work by downloading from the remote peer
+                assert_eq!(test_content, read_string(0, &mut download).await?);
+
+                // Test reading at different offsets to ensure full functionality
+                // "Test content for take_blob functionality"
+                assert_eq!(
+                    "content for take_blob functionality",
+                    read_string(5, &mut download).await?
+                );
+                assert_eq!("functionality", read_string(27, &mut download).await?);
 
                 Ok::<(), anyhow::Error>(())
             })
