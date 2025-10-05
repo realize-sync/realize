@@ -611,8 +611,14 @@ struct InnerRealizeFs {
 }
 
 enum FileHandle {
-    Cached(Download),
-    Real(tokio::fs::File, FHMode),
+    /// Handle to a remote file, which may be partially or fully cached locally.
+    ///
+    /// If FHMode allows writing, this handle will be turned into a
+    /// local one before the first write operation.
+    Remote(Download, FHMode),
+
+    /// Handle to a local file.
+    Local(tokio::fs::File, FHMode),
 }
 
 /// Keeps track of open file handles.
@@ -766,7 +772,7 @@ impl InnerRealizeFs {
     async fn getattr(&self, ino: u64, fh: Option<u64>) -> Result<fuser::FileAttr, FuseError> {
         if let Some(fh) = fh {
             let handle = self.handles.get_or_err(fh).await?;
-            if let FileHandle::Real(file, _) = &*handle.lock().await {
+            if let FileHandle::Local(file, _) = &*handle.lock().await {
                 return Ok(metadata_to_attr(&file.metadata().await?, ino));
             }
         }
@@ -851,10 +857,11 @@ impl InnerRealizeFs {
         let offset = offset as u64;
         let mut buffer = Vec::with_capacity(size).limit(size);
         match &mut *handle.lock().await {
-            FileHandle::Cached(reader) => {
+            FileHandle::Remote(reader, mode) => {
+                mode.check_allow_read()?;
                 reader.read_all_at(offset, &mut buffer).await?;
             }
-            FileHandle::Real(file, mode) => {
+            FileHandle::Local(file, mode) => {
                 mode.check_allow_read()?;
                 file.seek(SeekFrom::Start(offset)).await?;
                 while buffer.has_remaining_mut() {
@@ -873,16 +880,12 @@ impl InnerRealizeFs {
     async fn write(&self, fh: u64, offset: i64, data: &[u8]) -> Result<u32, FuseError> {
         let handle = self.handles.get_or_err(fh).await?;
         let offset = offset as u64; // TODO: clarify type situation for offset.
-        match &mut *handle.lock().await {
-            FileHandle::Cached(_) => Err(FuseError::Errno(libc::EBADF)),
-            FileHandle::Real(file, mode) => {
-                mode.check_allow_write()?;
-                file.seek(SeekFrom::Start(offset)).await?;
-                file.write_all(data).await?;
+        let mut guard = handle.lock().await;
+        let file = self.prepare_for_write(fh, &mut guard, None).await?;
+        file.seek(SeekFrom::Start(offset)).await?;
+        file.write_all(data).await?;
 
-                Ok(data.len() as u32)
-            }
-        }
+        Ok(data.len() as u32)
     }
 
     async fn setattr(
@@ -972,13 +975,12 @@ impl InnerRealizeFs {
     async fn truncate(&self, ino: u64, fh: Option<u64>, size: u64) -> Result<(), FuseError> {
         if let Some(fh) = fh {
             let handle = self.handles.get_or_err(fh).await?;
-            if let FileHandle::Real(file, mode) = &mut *handle.lock().await {
-                mode.check_allow_write()?;
-                file.set_len(size).await?;
-                log::debug!("SETATTR {ino}: Truncate file FH#{fh} to {size}");
+            let mut guard = handle.lock().await;
+            let file = self.prepare_for_write(fh, &mut guard, Some(size)).await?;
+            file.set_len(size).await?;
+            log::debug!("SETATTR {ino}: Truncate file FH#{fh} to {size}");
 
-                return Ok(());
-            }
+            return Ok(());
         }
         let ino = Inode(ino);
         match self.fs.file_content(ino).await? {
@@ -993,7 +995,9 @@ impl InnerRealizeFs {
                 return Ok(());
             }
             FileContent::Remote(mut blob) => {
-                self.downloader.complete_blob(&mut blob).await?;
+                if size > 0 {
+                    self.downloader.complete_blob(&mut blob).await?;
+                }
                 let mut file = blob.realize().await?;
                 file.set_len(size).await?;
                 file.flush().await?;
@@ -1104,31 +1108,34 @@ impl InnerRealizeFs {
 
     async fn open(&self, ino: u64, flags: i32) -> Result<(u64, u32), FuseError> {
         let ino = Inode(ino);
-        let mode = flags & (libc::O_RDONLY | libc::O_WRONLY | libc::O_RDWR);
         let handle = match self.fs.file_content(ino).await? {
-            FileContent::Local(path) => FileHandle::Real(
+            FileContent::Local(path) => FileHandle::Local(
                 openoptions_from_flags(flags).open(path).await?,
                 FHMode::from_flags(flags),
             ),
             FileContent::Remote(mut blob) => {
-                if mode == libc::O_RDONLY {
-                    let reader = self.downloader.reader(blob).await?;
-                    log::debug!("Opened Inode({ino}) read-only (download enabled)");
+                let mode = FHMode::from_flags(flags);
+                let rw_mode = flags & (libc::O_RDONLY | libc::O_WRONLY | libc::O_RDWR);
+                if (flags & (libc::O_TRUNC | libc::O_APPEND)) != 0
+                    && (rw_mode == libc::O_WRONLY || rw_mode == libc::O_RDWR)
+                {
+                    // Special cases where COW isn't available: write
+                    // with O_TRUNC and/or O_APPEND.
 
-                    FileHandle::Cached(reader)
-                } else {
-                    log::debug!("Opening {ino}; realizing it first...");
-                    self.downloader.complete_blob(&mut blob).await?;
-                    let file = blob.realize().await?;
-                    log::debug!("File at Inode({ino}) realized successfully");
-                    if (flags & libc::O_TRUNC) != 0 {
-                        // TODO: don't bother downloading in this case and when
-                        // setattr is called immediately after open
-                        file.set_len(0).await?;
-                        log::debug!("File at Inode({ino}) truncated");
+                    if (flags & libc::O_TRUNC) == 0 {
+                        self.downloader.complete_blob(&mut blob).await?;
                     }
-                    if (flags & libc::O_APPEND) != 0 {
+                    let mut file = blob.realize().await?;
+                    if (flags & libc::O_TRUNC) != 0 {
+                        file.set_len(0).await?;
+                        file.flush().await?;
+                    }
+                    let mode = FHMode::from_flags(flags);
+                    if (flags & libc::O_APPEND) == 0 {
+                        FileHandle::Local(file, mode)
+                    } else {
                         drop(file);
+
                         // The file handle is not usable in this case.
                         // Reopen the file as a local file.
                         let path = self
@@ -1137,13 +1144,13 @@ impl InnerRealizeFs {
                             .await?
                             .path()
                             .ok_or(StorageError::NotFound)?;
-                        FileHandle::Real(
-                            openoptions_from_flags(flags).open(path).await?,
-                            FHMode::from_flags(flags),
-                        )
-                    } else {
-                        FileHandle::Real(file, FHMode::from_flags(flags))
+                        FileHandle::Local(openoptions_from_flags(flags).open(path).await?, mode)
                     }
+                } else {
+                    log::debug!("Opened {ino:?} as blob with COW enabled");
+                    let reader = self.downloader.reader(blob).await?;
+
+                    FileHandle::Remote(reader, mode)
                 }
             }
         };
@@ -1169,7 +1176,7 @@ impl InnerRealizeFs {
         let attr = metadata_to_attr(&file.metadata().await?, ino.as_u64());
         let fh = self
             .handles
-            .add(ino, FileHandle::Real(file, FHMode::from_flags(flags)))
+            .add(ino, FileHandle::Local(file, FHMode::from_flags(flags)))
             .await;
         log::debug!("Created and opened Inode({ino}) in FH#{fh}",);
 
@@ -1179,10 +1186,10 @@ impl InnerRealizeFs {
     async fn flush(&self, fh: u64) -> Result<(), FuseError> {
         let handle = self.handles.get_or_err(fh).await?;
         match &mut *handle.lock().await {
-            FileHandle::Cached(blob) => {
+            FileHandle::Remote(blob, _) => {
                 blob.update_db().await?;
             }
-            FileHandle::Real(file, mode) => {
+            FileHandle::Local(file, mode) => {
                 if mode.allow_write() {
                     log::debug!("Flush FH#{fh}");
                     file.flush().await?;
@@ -1196,8 +1203,8 @@ impl InnerRealizeFs {
     async fn release(&self, fh: u64) -> Result<(), FuseError> {
         if let Some(handle) = self.handles.remove(fh).await {
             match &mut *handle.lock().await {
-                FileHandle::Cached(_) => {}
-                FileHandle::Real(file, mode) => {
+                FileHandle::Remote(_, _) => {}
+                FileHandle::Local(file, mode) => {
                     if mode.allow_write() {
                         log::debug!("Flush FH#{fh}");
                         file.flush().await?;
@@ -1207,6 +1214,37 @@ impl InnerRealizeFs {
         }
 
         Ok(())
+    }
+
+    async fn prepare_for_write<'a>(
+        &self,
+        fh: u64,
+        guard: &'a mut tokio::sync::MutexGuard<'_, FileHandle>,
+        size: Option<u64>,
+    ) -> Result<&'a mut tokio::fs::File, FuseError> {
+        if let FileHandle::Remote(reader, mode) = &mut **guard
+            && mode.allow_write()
+        {
+            log::debug!("Realizing blob in FH#{fh} COW");
+            let mut blob = reader.take_blob().unwrap();
+            if size != Some(0) {
+                // TODO: complete only partially if 0 < size < file size
+                self.downloader.complete_blob(&mut blob).await?;
+            }
+            let file = blob.realize().await?;
+            log::debug!("Blob in FH#{fh} realized successfully");
+
+            **guard = FileHandle::Local(file, mode.clone())
+        }
+
+        match &mut **guard {
+            FileHandle::Local(file, mode) => {
+                mode.check_allow_write()?;
+
+                Ok(file)
+            }
+            _ => Err(FuseError::Errno(libc::EPERM)),
+        }
     }
 
     fn build_file_attr(&self, pathid: Inode, metadata: &FileMetadata) -> fuser::FileAttr {
@@ -1426,7 +1464,7 @@ mod tests {
     use nix::fcntl::AT_FDCWD;
     use realize_storage::Mark;
     use realize_storage::utils::hash;
-    use std::io::{Read, Write};
+    use std::io::{Read, Seek, Write};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::PathBuf;
     use std::time::Instant;
@@ -3351,6 +3389,341 @@ mod tests {
             .await?;
         fixture.unmount().await?;
 
+        Ok(())
+    }
+
+    // Helper functions for testing file opening with specific flags
+    fn open_with_flags<P: AsRef<std::path::Path>>(
+        path: P,
+        flags: i32,
+    ) -> Result<std::fs::File, anyhow::Error> {
+        use std::os::unix::io::FromRawFd;
+        let path = path.as_ref();
+        let fd = unsafe {
+            libc::open(
+                std::ffi::CString::new(path.to_string_lossy().as_ref())?.as_ptr(),
+                flags,
+                0o644,
+            )
+        };
+        if fd == -1 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+
+    async fn get_file_status<P: AsRef<std::path::Path>>(path: P) -> anyhow::Result<String> {
+        match getxattr(path, "realize.status").await {
+            Ok(Some(status)) => Ok(status),
+            Ok(None) => anyhow::bail!("No realize.status xattr found"),
+            Err(e) => anyhow::bail!("Failed to read realize.status: {:?}", e),
+        }
+    }
+
+    fn assert_status_contains(status: &str, expected: &str) {
+        assert!(
+            status.contains(expected),
+            "Expected status to contain '{}', but got '{}'",
+            expected,
+            status
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn open_with_o_trunc_flag() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            fixture
+                .inner
+                .with_two_peers()
+                .await?
+                .interconnected()
+                .run(async |household_a, _household_b| {
+                    let a = HouseholdFixture::a();
+                    let b = HouseholdFixture::b();
+
+                    // Create a remote file in peer B
+                    let original_content = "hello world from remote";
+                    fixture
+                        .inner
+                        .write_file_and_wait(b, a, "trunc_test.txt", original_content)
+                        .await?;
+
+                    fixture.mount(household_a).await?;
+
+                    let mount_path = fixture.mount_path();
+                    let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                    let file_path = arena_path.join("trunc_test.txt");
+
+                    // Verify file is initially remote
+                    let initial_status = get_file_status(&file_path).await?;
+                    assert_status_contains(&initial_status, "remote");
+
+                    // Open with O_TRUNC | O_RDWR - should realize and truncate immediately
+                    let flags = libc::O_TRUNC | libc::O_RDWR;
+                    tokio::task::spawn_blocking({
+                        let file_path = file_path.clone();
+                        move || {
+                            let file = open_with_flags(&file_path, flags)?;
+                            drop(file); // Close the file
+                            Ok::<(), anyhow::Error>(())
+                        }
+                    })
+                    .await??;
+
+                    // File should now be local and empty (truncated)
+                    let size = tokio::fs::metadata(&file_path).await?.len();
+                    assert_eq!(0, size, "File should be truncated to 0 bytes");
+
+                    let final_status = get_file_status(&file_path).await?;
+                    assert_status_contains(&final_status, "local");
+
+                    // Verify datadir has the file
+                    let datadir_path = fixture.inner.arena_root(a).join("trunc_test.txt");
+                    assert!(tokio::fs::metadata(&datadir_path).await.is_ok());
+                    assert_eq!(0, tokio::fs::metadata(&datadir_path).await?.len());
+
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await?;
+            fixture.unmount().await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn open_with_o_append_flag() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            fixture
+                .inner
+                .with_two_peers()
+                .await?
+                .interconnected()
+                .run(async |household_a, _household_b| {
+                    let a = HouseholdFixture::a();
+                    let b = HouseholdFixture::b();
+
+                    // Create a remote file in peer B
+                    let original_content = "original content";
+                    fixture
+                        .inner
+                        .write_file_and_wait(b, a, "append_test.txt", original_content)
+                        .await?;
+
+                    fixture.mount(household_a).await?;
+
+                    let mount_path = fixture.mount_path();
+                    let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                    let file_path = arena_path.join("append_test.txt");
+
+                    // Verify file is initially remote
+                    let initial_status = get_file_status(&file_path).await?;
+                    assert_status_contains(&initial_status, "remote");
+
+                    // Open with O_APPEND | O_WRONLY - should realize before writing
+                    let flags = libc::O_APPEND | libc::O_WRONLY;
+                    tokio::task::spawn_blocking({
+                        let file_path = file_path.clone();
+                        move || {
+                            let mut file = open_with_flags(&file_path, flags)?;
+                            file.write_all(b" appended text")?;
+                            file.flush()?;
+                            drop(file);
+                            Ok::<(), anyhow::Error>(())
+                        }
+                    })
+                    .await??;
+
+                    // File should now be local with appended content
+                    let final_content = tokio::fs::read_to_string(&file_path).await?;
+                    assert_eq!(
+                        "original content appended text", final_content,
+                        "Content should have original plus appended text"
+                    );
+
+                    let final_status = get_file_status(&file_path).await?;
+                    assert_status_contains(&final_status, "local");
+
+                    // Verify datadir has the same content
+                    let datadir_path = fixture.inner.arena_root(a).join("append_test.txt");
+                    let datadir_content = tokio::fs::read_to_string(&datadir_path).await?;
+                    assert_eq!("original content appended text", datadir_content);
+
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await?;
+            fixture.unmount().await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn open_with_o_trunc_and_o_append_flags() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            fixture
+                .inner
+                .with_two_peers()
+                .await?
+                .interconnected()
+                .run(async |household_a, _household_b| {
+                    let a = HouseholdFixture::a();
+                    let b = HouseholdFixture::b();
+
+                    // Create a remote file in peer B
+                    let original_content = "content that will be truncated";
+                    fixture
+                        .inner
+                        .write_file_and_wait(b, a, "trunc_append_test.txt", original_content)
+                        .await?;
+
+                    fixture.mount(household_a).await?;
+
+                    let mount_path = fixture.mount_path();
+                    let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                    let file_path = arena_path.join("trunc_append_test.txt");
+
+                    // Verify file is initially remote
+                    let initial_status = get_file_status(&file_path).await?;
+                    assert_status_contains(&initial_status, "remote");
+
+                    // Open with O_TRUNC | O_APPEND | O_RDWR - should realize, truncate, then append
+                    let flags = libc::O_TRUNC | libc::O_APPEND | libc::O_RDWR;
+                    tokio::task::spawn_blocking({
+                        let file_path = file_path.clone();
+                        move || {
+                            let mut file = open_with_flags(&file_path, flags)?;
+                            file.write_all(b"new content after truncate")?;
+                            file.flush()?;
+                            drop(file);
+                            Ok::<(), anyhow::Error>(())
+                        }
+                    })
+                    .await??;
+
+                    // File should now be local with only the new content
+                    let final_content = tokio::fs::read_to_string(&file_path).await?;
+                    assert_eq!(
+                        "new content after truncate", final_content,
+                        "Content should be only the new text (original should be truncated)"
+                    );
+
+                    let final_status = get_file_status(&file_path).await?;
+                    assert_status_contains(&final_status, "local");
+
+                    // Verify datadir has the same content
+                    let datadir_path = fixture.inner.arena_root(a).join("trunc_append_test.txt");
+                    let datadir_content = tokio::fs::read_to_string(&datadir_path).await?;
+                    assert_eq!("new content after truncate", datadir_content);
+
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await?;
+            fixture.unmount().await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn copy_on_write_behavior() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            fixture
+                .inner
+                .with_two_peers()
+                .await?
+                .interconnected()
+                .run(async |household_a, _household_b| {
+                    let a = HouseholdFixture::a();
+                    let b = HouseholdFixture::b();
+
+                    // Create a remote file in peer B
+                    let original_content = "original remote content for COW test";
+                    fixture
+                        .inner
+                        .write_file_and_wait(b, a, "cow_test.txt", original_content)
+                        .await?;
+
+                    fixture.mount(household_a).await?;
+
+                    let mount_path = fixture.mount_path();
+                    let arena_path = mount_path.join(HouseholdFixture::test_arena().as_str());
+                    let file_path = arena_path.join("cow_test.txt");
+
+                    // Verify file is initially remote
+                    let initial_status = get_file_status(&file_path).await?;
+                    assert_status_contains(&initial_status, "remote");
+
+                    // Open with O_RDWR (no O_TRUNC or O_APPEND) - should enable COW
+                    let flags = libc::O_RDWR;
+                    tokio::task::spawn_blocking({
+                        let file_path = file_path.clone();
+                        move || {
+                            let mut file = open_with_flags(&file_path, flags)?;
+
+                            // Read some data - should still be remote
+                            let mut buffer = vec![0u8; 8];
+                            file.read_exact(&mut buffer)?;
+                            assert_eq!(b"original".as_slice(), &buffer);
+
+                            Ok::<(), anyhow::Error>(())
+                        }
+                    })
+                    .await??;
+
+                    // After read-only access, file should still be remote
+                    let status_after_read = get_file_status(&file_path).await?;
+                    assert_status_contains(&status_after_read, "remote");
+
+                    // Now write to the file - this should trigger COW
+                    tokio::task::spawn_blocking({
+                        let file_path = file_path.clone();
+                        move || {
+                            let mut file = open_with_flags(&file_path, flags)?;
+                            // Seek to middle and overwrite part of the content
+                            file.seek(std::io::SeekFrom::Start(9))?; // After "original "
+                            file.write_all(b"LOCAL")?;
+                            file.flush()?;
+                            drop(file);
+                            Ok::<(), anyhow::Error>(())
+                        }
+                    })
+                    .await??;
+
+                    // After write, file should be local
+                    let status_after_write = get_file_status(&file_path).await?;
+                    assert_status_contains(&status_after_write, "local");
+
+                    // Verify the merged content is correct
+                    let final_content = tokio::fs::read_to_string(&file_path).await?;
+                    assert_eq!(
+                        "original LOCALe content for COW test", final_content,
+                        "Content should be merged correctly after COW"
+                    );
+
+                    // Verify datadir has the same content
+                    let datadir_path = fixture.inner.arena_root(a).join("cow_test.txt");
+                    let datadir_content = tokio::fs::read_to_string(&datadir_path).await?;
+                    assert_eq!("original LOCALe content for COW test", datadir_content);
+
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await?;
+            fixture.unmount().await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
         Ok(())
     }
 }
